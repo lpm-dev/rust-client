@@ -304,9 +304,10 @@ pub(super) fn command_needs_global_state(cmd: &Commands) -> bool {
         // dir is always in scope; the per-subcategory form trivially is
         // too.
         Commands::Cache(args) => args.action == "clean",
-        // `doctor` reports on global state and may surface mid-tx
-        // anomalies that recovery would have already cleaned up.
-        Commands::Doctor(_) => true,
+        // Doctor is diagnostic unless the user explicitly selects one of its
+        // catalogued fixes. Pre-dispatch recovery would mutate global state
+        // before Doctor can report it and before fix consent is collected.
+        Commands::Doctor(_) => false,
         // `approve-scripts --global` reads the global
         // manifest + aggregates per-install build-state files, both
         // of which need recovery to settle first.
@@ -962,8 +963,14 @@ mod tests {
     }
 
     #[test]
-    fn predicate_true_for_doctor() {
-        assert!(command_needs_global_state(&parse(&["lpm", "doctor"])));
+    fn predicate_false_for_doctor() {
+        assert!(!command_needs_global_state(&parse(&["lpm", "doctor"])));
+        assert!(!command_needs_global_state(&parse(&[
+            "lpm", "doctor", "--all"
+        ])));
+        assert!(!command_needs_global_state(&parse(&[
+            "lpm", "doctor", "list"
+        ])));
     }
 
     #[test]

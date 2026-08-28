@@ -177,6 +177,7 @@ struct CachedToken {
     secret: SecretString,
     source: TokenSource,
     refresh_state: RefreshState,
+    storage_backend: Option<crate::AuthStorageBackend>,
 }
 
 #[derive(serde::Deserialize)]
@@ -416,6 +417,34 @@ impl SessionManager {
             .and_then(|g| g.as_ref().map(|c| c.source))
     }
 
+    pub fn diagnostic_storage_status(&self) -> crate::AuthStorageStatus {
+        if self.ensure_classified().is_err() {
+            return crate::AuthStorageStatus::none();
+        }
+        let cached = self.cached.read().ok().and_then(|guard| guard.clone());
+        let Some(cached) = cached else {
+            return crate::AuthStorageStatus::none();
+        };
+        let Some(access_or_refresh_backend) = cached.storage_backend else {
+            return crate::auth_storage_status(&self.registry_url);
+        };
+        let refresh_backend = if cached.source == TokenSource::StoredSession
+            && cached.refresh_state != RefreshState::NotRefreshable
+        {
+            crate::get_stored_credential_with_backend_result(
+                &self.registry_url,
+                crate::CredentialKind::Refresh,
+                || self.emit_auth_storage_notice(AuthStorageAccessKind::RefreshToken),
+            )
+            .ok()
+            .flatten()
+            .map(|credential| credential.backend)
+        } else {
+            None
+        };
+        crate::AuthStorageStatus::from_backends(Some(access_or_refresh_backend), refresh_backend)
+    }
+
     /// Acquire a usable bearer for the given requirement.
     ///
     /// Designed for command sites that build their own HTTP client
@@ -638,6 +667,7 @@ impl SessionManager {
                 secret,
                 source: TokenSource::StoredSession,
                 refresh_state: RefreshState::Available,
+                storage_backend: None,
             });
         }
     }
@@ -837,6 +867,7 @@ fn classify_eager_sources(explicit_flag_token: Option<String>) -> Option<CachedT
             secret: SecretString::from(tok),
             source: TokenSource::ExplicitFlag,
             refresh_state: RefreshState::NotRefreshable,
+            storage_backend: None,
         });
     }
 
@@ -852,6 +883,7 @@ fn classify_eager_sources(explicit_flag_token: Option<String>) -> Option<CachedT
             secret: SecretString::from(tok),
             source,
             refresh_state: RefreshState::NotRefreshable,
+            storage_backend: None,
         });
     }
 
@@ -876,16 +908,19 @@ fn classify_keychain_sources(
     registry_url: &str,
     mut notice: impl FnMut(AuthStorageAccessKind),
 ) -> Result<Option<CachedToken>, LpmError> {
-    if let Some(tok) = crate::get_stored_access_token_with_interaction_notice(registry_url, || {
-        notice(AuthStorageAccessKind::AccessToken);
-    })
+    if let Some(stored) = crate::get_stored_credential_with_backend_result(
+        registry_url,
+        crate::CredentialKind::Access,
+        || notice(AuthStorageAccessKind::AccessToken),
+    )
     .map_err(|error| {
         LpmError::CredentialStorage(format!("failed to read stored access credential: {error}"))
     })? {
         return Ok(Some(CachedToken {
-            secret: SecretString::from(tok),
+            secret: SecretString::from(stored.token),
             source: TokenSource::StoredSession,
             refresh_state: RefreshState::Unchecked,
+            storage_backend: Some(stored.backend),
         }));
     }
 
@@ -901,18 +936,19 @@ fn classify_keychain_sources(
     // an `IfRefreshable` source and calls `refresh_now`, which reads
     // the refresh token from disk and exchanges it. The retry then
     // attaches the rotated access token.
-    if crate::get_refresh_token_with_interaction_notice(registry_url, || {
-        notice(AuthStorageAccessKind::RefreshToken);
-    })
+    if let Some(stored) = crate::get_stored_credential_with_backend_result(
+        registry_url,
+        crate::CredentialKind::Refresh,
+        || notice(AuthStorageAccessKind::RefreshToken),
+    )
     .map_err(|error| {
         LpmError::CredentialStorage(format!("failed to read stored refresh credential: {error}"))
-    })?
-    .is_some()
-    {
+    })? {
         return Ok(Some(CachedToken {
             secret: SecretString::from(String::new()),
             source: TokenSource::StoredSession,
             refresh_state: RefreshState::Available,
+            storage_backend: Some(stored.backend),
         }));
     }
 
@@ -1251,6 +1287,7 @@ mod tests {
                 secret: SecretString::from(token.to_string()),
                 source,
                 refresh_state: RefreshState::for_source(source),
+                storage_backend: None,
             })),
             classified: AtomicBool::new(true),
             classify_lock: std::sync::Mutex::new(()),
@@ -1571,6 +1608,26 @@ mod tests {
         // Idempotent — a second call stays on the atomic-load fast path.
         let _ = mgr.current_bearer_lazy();
         assert!(mgr.classified.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn diagnostic_storage_status_reuses_the_classified_access_backend() {
+        let _env = token_classify_isolate();
+        let registry = "https://diagnostic-storage.invalid";
+        crate::set_token(registry, "stored-access").unwrap();
+        crate::set_refresh_token(registry, "stored-refresh").unwrap();
+        let manager = SessionManager::new(registry, None);
+
+        assert_eq!(
+            manager.current_source().unwrap(),
+            Some(TokenSource::StoredSession)
+        );
+        assert_eq!(
+            manager.diagnostic_storage_status(),
+            crate::AuthStorageStatus::from_backend(
+                crate::AuthStorageBackend::EncryptedFileFallback
+            )
+        );
     }
 
     #[test]
@@ -1996,6 +2053,7 @@ mod refresh_http_tests {
                 secret: SecretString::from("at-stale".to_string()),
                 source: TokenSource::StoredSession,
                 refresh_state: RefreshState::Available,
+                storage_backend: None,
             })),
             classified: AtomicBool::new(true),
             classify_lock: std::sync::Mutex::new(()),

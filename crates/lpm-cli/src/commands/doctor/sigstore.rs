@@ -3,9 +3,8 @@ use crate::doctor_catalog;
 use super::check::Check;
 
 /// Emit the doctor row for the resolved Sigstore verification posture.
-pub(super) fn check_sigstore_verify_posture() -> Check {
+pub(super) fn check_sigstore_verify_posture(cfg: &crate::commands::config::GlobalConfig) -> Check {
     use crate::provenance_fetch::{EnforceMode, EnforceModeSource};
-    let cfg = crate::commands::config::GlobalConfig::load();
     let (mode, source) = EnforceMode::resolve_from_chain(
         std::env::var("LPM_PROVENANCE_ENFORCE").ok().as_deref(),
         || cfg.get_sigstore_verify(),
@@ -60,7 +59,7 @@ mod tests {
             ("LPM_PROVENANCE_ENFORCE", std::ffi::OsString::new()),
         ]);
 
-        let c = check_sigstore_verify_posture();
+        let c = check_sigstore_verify_posture(&crate::commands::config::GlobalConfig::load());
         assert_eq!(c.code(), "sigstore_verify_enforced");
         assert!(matches!(c.severity, Severity::Pass));
         assert!(
@@ -96,7 +95,7 @@ mod tests {
             ("LPM_PROVENANCE_ENFORCE", std::ffi::OsString::new()),
         ]);
 
-        let c = check_sigstore_verify_posture();
+        let c = check_sigstore_verify_posture(&crate::commands::config::GlobalConfig::load());
         assert_eq!(
             c.code(),
             "sigstore_verify_warn_mode",
@@ -131,7 +130,7 @@ mod tests {
             ("LPM_PROVENANCE_ENFORCE", std::ffi::OsString::from("off")),
         ]);
 
-        let c = check_sigstore_verify_posture();
+        let c = check_sigstore_verify_posture(&crate::commands::config::GlobalConfig::load());
         assert_eq!(c.code(), "sigstore_verify_disabled");
         assert!(matches!(c.severity, Severity::Warn));
         assert!(

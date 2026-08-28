@@ -704,6 +704,20 @@ impl MockRegistry {
         self
     }
 
+    /// Mount a healthy endpoint whose response exceeds a diagnostic deadline.
+    pub async fn with_delayed_health(&self, delay: std::time::Duration) -> &Self {
+        Mock::given(method("GET"))
+            .and(path("/api/registry/health"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({ "status": "ok" }))
+                    .set_delay(delay),
+            )
+            .mount(&self.server)
+            .await;
+        self
+    }
+
     pub async fn with_npm_firewall_block(&self, name: &str, version: &str) -> &Self {
         Mock::given(method("POST"))
             .and(path("/api/registry/-/npm-firewall/verdicts"))

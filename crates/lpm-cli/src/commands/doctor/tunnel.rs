@@ -1,3 +1,4 @@
+#[cfg(test)]
 use std::path::Path;
 use std::time::Duration;
 
@@ -6,25 +7,26 @@ use lpm_registry::RegistryClient;
 
 use super::check::{Check, FixTarget};
 
+const TUNNEL_DIAGNOSTIC_DEADLINE: Duration = Duration::from_secs(5);
+
 /// Check tunnel domain configuration from lpm.json.
 ///
 /// Performs format validation (RFC 1035/1123 compliance, subdomain constraints,
 /// known base domain whitelist), ownership check (via registry API when authenticated),
 /// and HTTP reachability check for claimed domains.
-pub(super) async fn check_tunnel_domain(
-    project_dir: &Path,
+pub(super) async fn check_tunnel_domain_from_config(
+    config: Option<&lpm_runner::lpm_json::LpmJsonConfig>,
     client: &RegistryClient,
     is_authenticated: bool,
 ) -> Vec<Check> {
-    let config = match lpm_runner::lpm_json::read_lpm_json(project_dir) {
-        Ok(Some(c)) => c,
-        _ => return vec![],
+    let Some(config) = config else {
+        return Vec::new();
     };
-    let tunnel = match config.tunnel {
+    let tunnel = match &config.tunnel {
         Some(t) => t,
         None => return vec![],
     };
-    let domain = match tunnel.domain {
+    let domain = match &tunnel.domain {
         Some(d) => d,
         None => return vec![],
     };
@@ -132,61 +134,71 @@ pub(super) async fn check_tunnel_domain(
     }
 
     // Check if domain is claimed by this user via registry API
-    match client.tunnel_domain_lookup(&domain).await {
-        Ok(result) => {
-            let found = result["found"].as_bool().unwrap_or(false);
-            let owned = result["ownedByYou"].as_bool().unwrap_or(false);
-
-            if !found {
-                checks.push(Check::warn_with_fix_target(
-                    &doctor_catalog::TUNNEL_NOT_CLAIMED,
-                    &format!("{domain} — not claimed. Run: lpm tunnel claim {domain}"),
-                    FixTarget::TunnelDomain(domain),
-                ));
-                return checks;
-            }
-
-            if !owned {
-                checks.push(Check::warn(
-                    &doctor_catalog::TUNNEL_OWNED_BY_OTHER,
-                    &format!("{domain} — claimed by another user or org"),
-                ));
-                return checks;
-            }
-
-            // Domain is claimed and owned — check reachability
-            let reachability = check_tunnel_reachability(&domain).await;
-            match reachability {
-                TunnelReachability::Active => {
-                    checks.push(Check::pass(
-                        &doctor_catalog::TUNNEL_ACTIVE,
-                        &format!("{domain} (claimed, active)"),
-                    ));
-                }
-                TunnelReachability::Idle => {
-                    checks.push(Check::pass(
-                        &doctor_catalog::TUNNEL_IDLE,
-                        &format!("{domain} (claimed, idle)"),
-                    ));
-                }
-                TunnelReachability::Unreachable => {
-                    checks.push(Check::warn(
-                        &doctor_catalog::TUNNEL_UNREACHABLE,
-                        &format!("{domain} (claimed) — unreachable, DNS may not be configured"),
-                    ));
-                }
-            }
-        }
-        Err(_) => {
-            // API call failed — fall back to format-only validation
-            checks.push(Check::pass(
-                &doctor_catalog::TUNNEL_UNVERIFIED,
-                &format!("{domain} (configured, could not verify ownership)"),
-            ));
-        }
-    }
+    let check = tokio::time::timeout(
+        TUNNEL_DIAGNOSTIC_DEADLINE,
+        check_authenticated_tunnel(client, domain),
+    )
+    .await
+    .unwrap_or_else(|_| {
+        Check::warn(
+            &doctor_catalog::TUNNEL_UNVERIFIED,
+            &format!("{domain} (configured, ownership check exceeded the diagnostic deadline)"),
+        )
+    });
+    checks.push(check);
 
     checks
+}
+
+async fn check_authenticated_tunnel(client: &RegistryClient, domain: &str) -> Check {
+    let result = match client.diagnostic_tunnel_domain_lookup_once(domain).await {
+        Ok(result) => result,
+        Err(_) => {
+            return Check::warn(
+                &doctor_catalog::TUNNEL_UNVERIFIED,
+                &format!("{domain} (configured, could not verify ownership)"),
+            );
+        }
+    };
+    if !result["found"].as_bool().unwrap_or(false) {
+        return Check::warn_with_fix_target(
+            &doctor_catalog::TUNNEL_NOT_CLAIMED,
+            &format!("{domain} — not claimed. Run: lpm tunnel claim {domain}"),
+            FixTarget::TunnelDomain(domain.to_owned()),
+        );
+    }
+    if !result["ownedByYou"].as_bool().unwrap_or(false) {
+        return Check::warn(
+            &doctor_catalog::TUNNEL_OWNED_BY_OTHER,
+            &format!("{domain} — claimed by another user or org"),
+        );
+    }
+    match check_tunnel_reachability(domain).await {
+        TunnelReachability::Active => Check::pass(
+            &doctor_catalog::TUNNEL_ACTIVE,
+            &format!("{domain} (claimed, active)"),
+        ),
+        TunnelReachability::Idle => Check::pass(
+            &doctor_catalog::TUNNEL_IDLE,
+            &format!("{domain} (claimed, idle)"),
+        ),
+        TunnelReachability::Unreachable => Check::warn(
+            &doctor_catalog::TUNNEL_UNREACHABLE,
+            &format!("{domain} (claimed) — unreachable, DNS may not be configured"),
+        ),
+    }
+}
+
+#[cfg(test)]
+async fn check_tunnel_domain(
+    project_dir: &Path,
+    client: &RegistryClient,
+    is_authenticated: bool,
+) -> Vec<Check> {
+    let config = lpm_runner::lpm_json::read_lpm_json(project_dir)
+        .ok()
+        .flatten();
+    check_tunnel_domain_from_config(config.as_ref(), client, is_authenticated).await
 }
 
 enum TunnelReachability {
@@ -369,5 +381,45 @@ mod tests {
             "should reject trailing hyphen: {}",
             checks[0].detail
         );
+    }
+
+    #[tokio::test]
+    async fn authenticated_tunnel_lookup_obeys_the_diagnostic_deadline() {
+        use std::time::Instant;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/tunnel/domains/doctor-deadline.lpm.fyi"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({
+                        "found": true,
+                        "ownedByYou": true,
+                    }))
+                    .set_delay(Duration::from_secs(6)),
+            )
+            .mount(&server)
+            .await;
+        let client = RegistryClient::new()
+            .with_base_url(server.uri())
+            .with_token("doctor-token");
+        let config = lpm_runner::lpm_json::parse_lpm_json(
+            r#"{"tunnel":{"domain":"doctor-deadline.lpm.fyi"}}"#,
+        )
+        .unwrap();
+        let started = Instant::now();
+
+        let checks = check_tunnel_domain_from_config(Some(&config), &client, true).await;
+
+        assert!(
+            started.elapsed() < Duration::from_millis(5_750),
+            "tunnel lookup exceeded the five-second diagnostic bound: {:?}",
+            started.elapsed()
+        );
+        assert_eq!(checks.len(), 1);
+        assert_eq!(checks[0].code(), "tunnel_unverified");
+        assert!(matches!(checks[0].severity, Severity::Warn));
     }
 }

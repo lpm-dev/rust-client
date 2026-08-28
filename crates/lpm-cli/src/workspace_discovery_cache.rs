@@ -31,7 +31,8 @@ impl WorkspaceFreshnessCache {
 }
 
 struct ActiveWorkspaceContext {
-    workspace: Arc<Workspace>,
+    workspace: Option<Arc<Workspace>>,
+    scope_root: PathBuf,
     freshness_cache: Arc<WorkspaceFreshnessCache>,
 }
 
@@ -49,13 +50,39 @@ pub(crate) async fn scope<F>(
 where
     F: Future,
 {
+    let scope_root = workspace.root.clone();
+    ACTIVE_WORKSPACE
+        .scope(
+            ActiveWorkspaceContext {
+                workspace: Some(workspace),
+                scope_root,
+                freshness_cache,
+            },
+            ACTIVE_ROOT_PROVIDER_FINGERPRINT.scope(root_provider_fingerprint, future),
+        )
+        .await
+}
+
+pub(crate) async fn scope_discovery<F>(
+    start_dir: &Path,
+    workspace: Option<Arc<Workspace>>,
+    future: F,
+) -> F::Output
+where
+    F: Future,
+{
+    let scope_root = workspace.as_ref().map_or_else(
+        || start_dir.to_path_buf(),
+        |workspace| workspace.root.clone(),
+    );
     ACTIVE_WORKSPACE
         .scope(
             ActiveWorkspaceContext {
                 workspace,
-                freshness_cache,
+                scope_root,
+                freshness_cache: Arc::new(WorkspaceFreshnessCache::default()),
             },
-            ACTIVE_ROOT_PROVIDER_FINGERPRINT.scope(root_provider_fingerprint, future),
+            ACTIVE_ROOT_PROVIDER_FINGERPRINT.scope(None, future),
         )
         .await
 }
@@ -76,8 +103,13 @@ pub(crate) fn workspace_freshness_entries(
 pub(crate) fn discover_workspace(
     start_dir: &Path,
 ) -> Result<Option<Arc<Workspace>>, WorkspaceError> {
-    if let Some(cached) = active_workspace(start_dir) {
-        return Ok(Some(cached));
+    if let Ok(cached) = ACTIVE_WORKSPACE.try_with(|context| {
+        start_dir
+            .starts_with(&context.scope_root)
+            .then(|| context.workspace.clone())
+    }) && let Some(cached) = cached
+    {
+        return Ok(cached);
     }
 
     lpm_workspace::discover_workspace(start_dir).map(|workspace| workspace.map(Arc::new))
@@ -87,8 +119,9 @@ pub(crate) fn active_workspace(start_dir: &Path) -> Option<Arc<Workspace>> {
     ACTIVE_WORKSPACE
         .try_with(|context| {
             start_dir
-                .starts_with(&context.workspace.root)
-                .then(|| Arc::clone(&context.workspace))
+                .starts_with(&context.scope_root)
+                .then(|| context.workspace.clone())
+                .flatten()
         })
         .ok()
         .flatten()
@@ -235,5 +268,28 @@ mod tests {
             assert!(!Arc::ptr_eq(&first, &second));
         })
         .await;
+    }
+
+    #[tokio::test]
+    async fn scoped_absence_is_reused_after_workspace_files_appear() {
+        let directory = tempfile::tempdir().unwrap();
+
+        scope_discovery(directory.path(), None, async {
+            std::fs::write(
+                directory.path().join("package.json"),
+                r#"{"name":"root","private":true}"#,
+            )
+            .unwrap();
+            std::fs::write(
+                directory.path().join("pnpm-workspace.yaml"),
+                "packages:\n  - 'packages/*'\n",
+            )
+            .unwrap();
+
+            assert!(discover_workspace(directory.path()).unwrap().is_none());
+        })
+        .await;
+
+        assert!(discover_workspace(directory.path()).unwrap().is_some());
     }
 }

@@ -27,31 +27,18 @@ use super::check::Check;
 /// Returns an empty Vec when there are NO file:/link: deps (the
 /// common case for non-monorepo projects). The doctor output stays
 /// uncluttered.
-pub(super) fn check_local_source_paths(project_dir: &Path) -> Vec<Check> {
-    let pkg_json_path = project_dir.join("package.json");
-    let Ok(content) =
-        lpm_common::read_text_file_capped(&pkg_json_path, lpm_common::CONFIG_FILE_SIZE_CAP_BYTES)
-    else {
-        return Vec::new();
-    };
-    let Ok(pkg) = serde_json::from_str::<serde_json::Value>(&content) else {
-        return Vec::new();
-    };
-
+pub(super) fn check_local_source_paths(
+    project_dir: &Path,
+    package: &lpm_workspace::PackageJson,
+) -> Vec<Check> {
     let mut checks = Vec::new();
-    for field in [
-        "dependencies",
-        "devDependencies",
-        "peerDependencies",
-        "optionalDependencies",
+    for deps in [
+        &package.dependencies,
+        &package.dev_dependencies,
+        &package.peer_dependencies,
+        &package.optional_dependencies,
     ] {
-        let Some(deps) = pkg.get(field).and_then(|v| v.as_object()) else {
-            continue;
-        };
-        for (name, raw) in deps {
-            let Some(spec) = raw.as_str() else {
-                continue;
-            };
+        for (name, spec) in deps {
             // Classify: file: (tarball or dir), link: (dir only),
             // anything else → not our concern.
             let (kind_label, expected_dir, path_str) = if let Some(p) = spec.strip_prefix("file:") {
@@ -127,6 +114,11 @@ pub(super) fn check_local_source_paths(project_dir: &Path) -> Vec<Check> {
 mod tests {
     use super::*;
     use crate::doctor_catalog::Severity;
+
+    fn check_local_source_paths(project_dir: &Path) -> Vec<Check> {
+        let package = lpm_workspace::read_package_json(&project_dir.join("package.json")).unwrap();
+        super::check_local_source_paths(project_dir, &package)
+    }
 
     fn write_pkg_json(dir: &Path, content: &str) {
         std::fs::write(dir.join("package.json"), content).unwrap();

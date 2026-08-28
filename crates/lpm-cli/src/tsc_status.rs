@@ -12,6 +12,7 @@
 //! cannot disagree about whether a project is set up correctly. Pure
 //! disk + env reads; never spawns `tsc`.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 /// State of TypeScript for a single tsconfig-owning directory.
@@ -54,6 +55,31 @@ impl TscStatus {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn probe_with_snapshot(
+        dir: &Path,
+        system_bin: Option<&Path>,
+        in_deps: bool,
+    ) -> Self {
+        Self::probe_with_local_snapshot(find_local_tsc(dir), system_bin, in_deps)
+    }
+
+    pub(crate) fn probe_with_local_snapshot(
+        local_bin: Option<PathBuf>,
+        system_bin: Option<&Path>,
+        in_deps: bool,
+    ) -> Self {
+        let system_bin = local_bin
+            .is_none()
+            .then(|| system_bin.map(Path::to_path_buf))
+            .flatten();
+        Self {
+            local_bin,
+            system_bin,
+            in_deps,
+        }
+    }
+
     /// Some `tsc` is reachable, even if only via system `PATH`.
     pub fn runnable(&self) -> bool {
         self.local_bin.is_some() || self.system_bin.is_some()
@@ -79,10 +105,43 @@ fn find_local_tsc(dir: &Path) -> Option<PathBuf> {
     }
 }
 
+#[derive(Default)]
+pub(crate) struct LocalTscResolver {
+    by_directory: HashMap<PathBuf, Option<PathBuf>>,
+}
+
+impl LocalTscResolver {
+    pub(crate) fn find(&mut self, dir: &Path) -> Option<PathBuf> {
+        let mut visited = Vec::new();
+        let mut current = Some(dir);
+        let found = loop {
+            let Some(directory) = current else {
+                break None;
+            };
+            if let Some(cached) = self.by_directory.get(directory) {
+                break cached.clone();
+            }
+            visited.push(directory.to_path_buf());
+            let candidate = directory
+                .join("node_modules")
+                .join(".bin")
+                .join(tsc_filename());
+            if candidate.is_file() {
+                break Some(candidate);
+            }
+            current = directory.parent();
+        };
+        for directory in visited {
+            self.by_directory.insert(directory, found.clone());
+        }
+        found
+    }
+}
+
 /// Scan the system `PATH` for a `tsc` binary. Used only when no local
 /// install exists, since local always wins at runtime via the
 /// PATH-injection layer.
-fn find_system_tsc() -> Option<PathBuf> {
+pub(crate) fn find_system_tsc() -> Option<PathBuf> {
     let path = std::env::var_os("PATH")?;
     for dir in std::env::split_paths(&path) {
         let candidate = dir.join(tsc_filename());
@@ -122,7 +181,7 @@ fn typescript_declared_in_reachable_manifest(dir: &Path) -> bool {
     }
 }
 
-fn manifest_declares_typescript(pkg: &lpm_workspace::PackageJson) -> bool {
+pub(crate) fn manifest_declares_typescript(pkg: &lpm_workspace::PackageJson) -> bool {
     pkg.dependencies.contains_key("typescript")
         || pkg.dev_dependencies.contains_key("typescript")
         || pkg.peer_dependencies.contains_key("typescript")
@@ -198,6 +257,18 @@ mod tests {
         let status = TscStatus::probe(tmp.path());
         assert!(status.local_bin.is_none());
         assert!(!status.in_deps);
+    }
+
+    #[test]
+    fn snapshot_probe_reuses_the_supplied_system_binary_and_dependency_result() {
+        let tmp = TempDir::new().unwrap();
+        write_pkg(tmp.path(), r#"{"name":"x"}"#);
+        let system_tsc = tmp.path().join("system-bin/tsc");
+
+        let status = TscStatus::probe_with_snapshot(tmp.path(), Some(&system_tsc), true);
+
+        assert_eq!(status.system_bin.as_deref(), Some(system_tsc.as_path()));
+        assert!(status.in_deps);
     }
 
     #[test]

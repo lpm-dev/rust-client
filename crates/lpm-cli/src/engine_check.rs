@@ -312,16 +312,37 @@ pub(crate) fn enforce_resolved_node_requirement_for_run(
 pub(crate) fn resolve_root_node_engine_requirement(
     start_dir: &Path,
 ) -> Result<Option<RootNodeEngineRequirement>, LpmError> {
+    let global = crate::commands::config::GlobalConfig::load();
+    resolve_root_node_engine_requirement_with_global(start_dir, &global)
+}
+
+pub(crate) fn resolve_root_node_engine_requirement_with_global(
+    start_dir: &Path,
+    global: &crate::commands::config::GlobalConfig,
+) -> Result<Option<RootNodeEngineRequirement>, LpmError> {
     let Some((_, root_pkg)) = resolve_root_package(start_dir)? else {
         return Ok(None);
     };
-    let Some(required) = root_pkg.engines.get("node") else {
-        return Ok(None);
-    };
-    Ok(Some(RootNodeEngineRequirement {
-        required: required.clone(),
-        engine_strict: engine_strict_config::resolve_for_root(false, &root_pkg),
-    }))
+    Ok(resolve_root_node_engine_requirement_from_package(
+        &root_pkg, global,
+    ))
+}
+
+pub(crate) fn resolve_root_node_engine_requirement_from_package(
+    root_package: &PackageJson,
+    global: &crate::commands::config::GlobalConfig,
+) -> Option<RootNodeEngineRequirement> {
+    root_package
+        .engines
+        .get("node")
+        .map(|required| RootNodeEngineRequirement {
+            required: required.clone(),
+            engine_strict: engine_strict_config::resolve_for_root_with_global(
+                false,
+                root_package,
+                global,
+            ),
+        })
 }
 
 pub(crate) fn resolve_execution_node_engine_requirements(

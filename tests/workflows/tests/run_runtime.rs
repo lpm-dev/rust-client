@@ -886,7 +886,7 @@ fn run_validates_node_from_project_bin_before_executing_script() {
 }
 
 #[test]
-fn doctor_validates_node_from_project_bin() {
+fn doctor_ignores_node_from_project_bin_when_checking_engine_compatibility() {
     let project = node_version_project(">=18");
     install_fake_project_node(&project, "16.0.0");
     let mut command = lpm(&project);
@@ -901,15 +901,17 @@ fn doctor_validates_node_from_project_bin() {
         .as_array()
         .expect("doctor checks must be an array")
         .iter()
-        .find(|check| check["code"] == "node_engine_mismatch")
-        .unwrap_or_else(|| panic!("doctor omitted project-local Node mismatch: {json}"));
+        .find(|check| check["code"] == "node_engine_compatible")
+        .unwrap_or_else(|| panic!("doctor omitted trusted Node compatibility: {json}"));
 
-    assert_eq!(engine_check["severity"], "fail");
+    assert_eq!(engine_check["severity"], "pass");
     assert!(
-        engine_check["detail"]
-            .as_str()
-            .is_some_and(|detail| detail.contains("v16.0.0") && detail.contains(">=18")),
-        "doctor mismatch did not use the project-local Node: {engine_check}"
+        engine_check["detail"].as_str().is_some_and(|detail| {
+            detail.contains("v22.0.0")
+                && detail.contains("system PATH")
+                && !detail.contains("v16.0.0")
+        }),
+        "doctor did not ignore the project-local Node: {engine_check}"
     );
 }
 

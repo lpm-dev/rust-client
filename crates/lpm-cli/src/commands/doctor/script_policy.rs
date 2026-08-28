@@ -1,16 +1,19 @@
 use crate::doctor_catalog;
 
 use super::check::Check;
-use super::sandbox::probe_sandbox_backend;
+use super::sandbox::probe_sandbox_backend_with_global;
 
-pub(super) fn check_script_policy_surface() -> Vec<Check> {
+pub(super) fn check_script_policy_surface_with_global(
+    global: &crate::commands::config::GlobalConfig,
+    package: Option<&lpm_workspace::PackageJson>,
+) -> Vec<Check> {
     let mut out = Vec::new();
 
-    out.push(probe_sandbox_backend());
+    out.push(probe_sandbox_backend_with_global(global));
 
     // Only surface the force-security-floor kill-switch when the flag
     // is set; unset is the default and should not clutter clean output.
-    if let Some(check) = check_force_security_floor() {
+    if let Some(check) = check_force_security_floor(global, package) {
         out.push(check);
     }
 
@@ -24,13 +27,20 @@ pub(super) fn check_script_policy_surface() -> Vec<Check> {
 /// set, naming the count of suspended approvals if a project
 /// `package.json` is present — empty project or no approvals produces
 /// a no-count variant of the same message.
-fn check_force_security_floor() -> Option<Check> {
-    let global = crate::commands::config::GlobalConfig::load();
+fn check_force_security_floor(
+    global: &crate::commands::config::GlobalConfig,
+    package: Option<&lpm_workspace::PackageJson>,
+) -> Option<Check> {
     if !global.get_bool("force-security-floor").unwrap_or(false) {
         return None;
     }
 
-    let suspended_count = count_suspended_approvals_in_cwd();
+    let suspended_count = package.map(|package| {
+        package
+            .lpm
+            .as_ref()
+            .map_or(0, |config| config.trusted_dependencies.len())
+    });
 
     let detail = match suspended_count {
         None => "enabled — no `package.json` in current directory, so suspended-approval \
@@ -54,37 +64,17 @@ fn check_force_security_floor() -> Option<Check> {
     ))
 }
 
-/// Count the approval entries in the current project's
-/// `package.json > lpm > trustedDependencies`.
-///
-/// Returns `None` when `./package.json` is missing or unreadable
-/// (no project context, so the count is unknowable). Returns
-/// `Some(n)` otherwise — including `Some(0)` for a project with
-/// no approvals, which is a meaningfully different state from
-/// "no project."
-///
-/// Counts both the Legacy (`Vec<String>`) and Rich
-/// (`Map<String, TrustedDependencyBinding>`) forms, matching the
-/// check that [`crate::commands::rebuild::evaluate_trust`]
-/// performs at install time.
-fn count_suspended_approvals_in_cwd() -> Option<usize> {
-    let pkg_json = std::env::current_dir().ok()?.join("package.json");
-    let content =
-        lpm_common::read_text_file_capped(&pkg_json, lpm_common::CONFIG_FILE_SIZE_CAP_BYTES)
-            .ok()?;
-    let parsed: serde_json::Value = serde_json::from_str(&content).ok()?;
-    let trusted = parsed.get("lpm")?.get("trustedDependencies")?;
-    match trusted {
-        serde_json::Value::Array(arr) => Some(arr.len()),
-        serde_json::Value::Object(obj) => Some(obj.len()),
-        _ => Some(0),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::commands::doctor::test_support::isolated_security_env_vars;
+
+    fn check_script_policy_surface() -> Vec<Check> {
+        let global = crate::commands::config::GlobalConfig::load();
+        let project_dir = std::env::current_dir().unwrap();
+        let package = lpm_workspace::read_package_json(&project_dir.join("package.json")).ok();
+        check_script_policy_surface_with_global(&global, package.as_ref())
+    }
 
     /// `policy_scope_project_only` must stay retired even when globals
     /// are present, because global installs now honor the same policy

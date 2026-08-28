@@ -129,12 +129,28 @@ pub fn detect_node_version(project_dir: &Path) -> DetectionResult<Option<Detecte
     detect_node_version_inner(project_dir)
 }
 
+pub fn detect_node_version_with_lpm_json_spec(
+    project_dir: &Path,
+    lpm_json_spec: Option<&str>,
+) -> DetectionResult<Option<DetectedNodeVersion>> {
+    if let Some(spec) = lpm_json_spec {
+        return Ok(Some(detected_lpm_json_runtime(RuntimeKind::Node, spec)));
+    }
+    detect_node_version_files(project_dir)
+}
+
 /// Detect the required Bun version for a project.
 ///
 /// Bun is intentionally scoped to `lpm.json > runtime.bun`; `engines.bun`
 /// remains a compatibility warning, not an enforced runtime contract.
 pub fn detect_bun_version(project_dir: &Path) -> DetectionResult<Option<DetectedRuntimeVersion>> {
     detect_from_lpm_json_runtime(project_dir, RuntimeKind::Bun)
+}
+
+pub fn detect_bun_version_with_lpm_json_spec(
+    lpm_json_spec: Option<&str>,
+) -> Option<DetectedRuntimeVersion> {
+    lpm_json_spec.map(|spec| detected_lpm_json_runtime(RuntimeKind::Bun, spec))
 }
 
 /// Detect every managed runtime requirement in deterministic PATH order.
@@ -167,6 +183,10 @@ fn detect_node_version_inner(project_dir: &Path) -> DetectionResult<Option<Detec
         return Ok(Some(v));
     }
 
+    detect_node_version_files(project_dir)
+}
+
+fn detect_node_version_files(project_dir: &Path) -> DetectionResult<Option<DetectedNodeVersion>> {
     if let Some(v) = detect_from_file(project_dir, ".nvmrc", VersionSource::Nvmrc)? {
         return Ok(Some(v));
     }
@@ -176,6 +196,14 @@ fn detect_node_version_inner(project_dir: &Path) -> DetectionResult<Option<Detec
     }
 
     Ok(None)
+}
+
+fn detected_lpm_json_runtime(runtime: RuntimeKind, spec: &str) -> DetectedRuntimeVersion {
+    DetectedRuntimeVersion {
+        runtime,
+        spec: spec.to_string(),
+        source: VersionSource::LpmJson,
+    }
 }
 
 fn detect_from_lpm_json_runtime(
@@ -197,11 +225,7 @@ fn detect_from_lpm_json_runtime(
         return Ok(None);
     };
 
-    Ok(Some(DetectedRuntimeVersion {
-        runtime,
-        spec: spec.to_string(),
-        source: VersionSource::LpmJson,
-    }))
+    Ok(Some(detected_lpm_json_runtime(runtime, spec)))
 }
 
 /// Parse an .nvmrc or .node-version file content into a version spec.
@@ -280,6 +304,27 @@ mod tests {
         assert_eq!(v.runtime, RuntimeKind::Node);
         assert_eq!(v.spec, ">=22.0.0");
         assert!(matches!(v.source, VersionSource::LpmJson));
+    }
+
+    #[test]
+    fn preloaded_lpm_json_node_spec_avoids_rereading_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("lpm.json"), b"not valid json").unwrap();
+
+        let detected = detect_node_version_with_lpm_json_spec(dir.path(), Some(">=22 <24"))
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(detected.spec, ">=22 <24");
+        assert!(matches!(detected.source, VersionSource::LpmJson));
+    }
+
+    #[test]
+    fn preloaded_lpm_json_bun_spec_preserves_the_original_selector() {
+        let detected = detect_bun_version_with_lpm_json_spec(Some(">=1.2 <2")).unwrap();
+
+        assert_eq!(detected.spec, ">=1.2 <2");
+        assert!(matches!(detected.source, VersionSource::LpmJson));
     }
 
     #[test]

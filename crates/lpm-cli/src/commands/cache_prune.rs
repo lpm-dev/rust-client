@@ -161,6 +161,21 @@ pub struct PruneSummary {
     pub tombstone_sweep_error: Option<String>,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PruneStats {
+    pub link_entries_orphaned: usize,
+    pub object_entries_orphaned: usize,
+    pub analysis: PruneAnalysis,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum PruneAnalysis {
+    #[default]
+    Available,
+    RegistryMissing,
+    RegistryCorrupt(String),
+}
+
 /// Entry point for the CLI dispatcher. Resolves both virtual stores + flags,
 /// runs the algorithm under the store reader/writer lock, and emits
 /// human or JSON output.
@@ -584,6 +599,89 @@ pub fn compute_prune_plan(
     flags: &PruneFlags<'_>,
     max_age: Option<ChronoDuration>,
 ) -> Result<PruneSummary, LpmError> {
+    compute_prune(root, v2_store, flags, max_age, true, None, None).map(|(summary, _)| summary)
+}
+
+#[cfg(test)]
+pub fn compute_prune_stats(
+    root: &LpmRoot,
+    v2_store: &V2Store,
+    flags: &PruneFlags<'_>,
+    max_age: Option<ChronoDuration>,
+) -> Result<PruneStats, LpmError> {
+    compute_prune(root, v2_store, flags, max_age, false, None, None).map(|(_, stats)| stats)
+}
+
+pub fn compute_prune_stats_for_stores(
+    root: &LpmRoot,
+    stores: &[V2Store],
+) -> Result<Vec<PruneStats>, LpmError> {
+    let registry = match known_projects::try_load(&root.known_projects()) {
+        Ok(registry) => registry,
+        Err(known_projects::LoadError::NotFound) => {
+            return Ok(stores
+                .iter()
+                .map(|_| PruneStats {
+                    analysis: PruneAnalysis::RegistryMissing,
+                    ..PruneStats::default()
+                })
+                .collect());
+        }
+        Err(error) => {
+            let reason = error.to_string();
+            return Ok(stores
+                .iter()
+                .map(|_| PruneStats {
+                    analysis: PruneAnalysis::RegistryCorrupt(reason.clone()),
+                    ..PruneStats::default()
+                })
+                .collect());
+        }
+    };
+    let projects: Vec<_> = registry
+        .projects
+        .into_iter()
+        .filter_map(|entry| entry.path.exists().then_some(entry.path))
+        .collect();
+    let links_roots: Vec<_> = stores
+        .iter()
+        .map(|store| {
+            std::fs::canonicalize(store.paths().links_root())
+                .unwrap_or_else(|_| store.paths().links_root())
+        })
+        .collect();
+    let mut link_roots = vec![HashSet::new(); stores.len()];
+    for project in &projects {
+        collect_project_link_roots_for_stores(project, &links_roots, &mut link_roots);
+    }
+    let flags = PruneFlags::default();
+    stores
+        .iter()
+        .zip(link_roots)
+        .map(|(store, roots)| {
+            compute_prune(
+                root,
+                store,
+                &flags,
+                None,
+                false,
+                Some(&projects),
+                Some(roots),
+            )
+            .map(|(_, stats)| stats)
+        })
+        .collect()
+}
+
+fn compute_prune(
+    root: &LpmRoot,
+    v2_store: &V2Store,
+    flags: &PruneFlags<'_>,
+    max_age: Option<ChronoDuration>,
+    build_full_plan: bool,
+    projects_override: Option<&[PathBuf]>,
+    root_link_dirs_override: Option<HashSet<PathBuf>>,
+) -> Result<(PruneSummary, PruneStats), LpmError> {
     // ── Step 1: Collect root projects ────────────────────────────────
     let registry_path = root.known_projects();
     let mut projects: Vec<PathBuf> = Vec::new();
@@ -592,7 +690,9 @@ pub fn compute_prune_plan(
     let mut registry_missing = false;
     let mut registry_corrupt = false;
     let mut registry_corrupt_reason = String::new();
-    if let Some(explicit) = flags.project {
+    if let Some(projects_snapshot) = projects_override {
+        projects.extend_from_slice(projects_snapshot);
+    } else if let Some(explicit) = flags.project {
         // Manual repair mode: ignore the registry.
         let p = std::fs::canonicalize(explicit).map_err(|e| {
             LpmError::Io(std::io::Error::new(
@@ -650,53 +750,75 @@ pub fn compute_prune_plan(
             // [`run_locked`] will treat as tombstone-only. The
             // tombstone count is populated so dry-run still surfaces
             // the work `--apply` will do.
-            let (tombstones_pending, tombstone_count_error) =
-                count_tombstones_with_error_capture(root);
-            // Island prune is LRU + crash-recovery only (reachability-
-            // independent), so it is safe even with no usable registry.
-            let (compat_islands_total, compat_islands_orphaned) =
-                compute_compat_island_orphans(v2_store.paths().compat_root(), max_age);
-            let (build_artifacts_total, build_artifacts_orphaned) =
-                compute_build_artifact_orphans(v2_store.paths().builds_root(), max_age);
-            let bytes_freed_or_eligible = compat_islands_orphaned
-                .iter()
-                .chain(&build_artifacts_orphaned)
-                .map(|dir| dir_size(dir).unwrap_or(0))
-                .fold(0u64, u64::saturating_add);
-            return Ok(PruneSummary {
-                applied: false,
-                projects_walked: 0,
-                registry_entries_dropped: 0,
-                link_entries_total: 0,
-                link_entries_reachable: 0,
-                link_entries_orphaned: Vec::new(),
-                object_entries_total: 0,
-                object_entries_reachable: 0,
-                object_entries_orphaned: Vec::new(),
-                cas_trees_total: 0,
-                cas_tree_files_orphaned: Vec::new(),
-                cas_blobs_total: 0,
-                cas_blob_files_orphaned: Vec::new(),
-                cas_source_record_files_orphaned: Vec::new(),
-                cas_source_validation_files_orphaned: Vec::new(),
-                cas_materialized_total: 0,
-                cas_materialized_entries_orphaned: Vec::new(),
-                compat_islands_total,
-                compat_islands_orphaned,
-                build_artifacts_total,
-                build_artifacts_orphaned,
-                bytes_freed_or_eligible,
-                observed_physical_bytes_freed: None,
-                tombstones_pending,
-                tombstones_swept: 0,
-                tombstones_retained: Vec::new(),
-                tombstone_bytes_freed: 0,
-                registry_missing,
-                registry_corrupt,
-                registry_corrupt_reason,
-                tombstone_count_error,
-                tombstone_sweep_error: None,
-            });
+            let (tombstones_pending, tombstone_count_error) = if build_full_plan {
+                count_tombstones_with_error_capture(root)
+            } else {
+                (0, None)
+            };
+            let (compat_islands_total, compat_islands_orphaned) = if build_full_plan {
+                compute_compat_island_orphans(v2_store.paths().compat_root(), max_age)
+            } else {
+                (0, Vec::new())
+            };
+            let (build_artifacts_total, build_artifacts_orphaned) = if build_full_plan {
+                compute_build_artifact_orphans(v2_store.paths().builds_root(), max_age)
+            } else {
+                (0, Vec::new())
+            };
+            let bytes_freed_or_eligible = if build_full_plan {
+                compat_islands_orphaned
+                    .iter()
+                    .chain(&build_artifacts_orphaned)
+                    .map(|dir| dir_size(dir).unwrap_or(0))
+                    .fold(0u64, u64::saturating_add)
+            } else {
+                0
+            };
+            let analysis = if registry_corrupt {
+                PruneAnalysis::RegistryCorrupt(registry_corrupt_reason.clone())
+            } else {
+                PruneAnalysis::RegistryMissing
+            };
+            return Ok((
+                PruneSummary {
+                    applied: false,
+                    projects_walked: 0,
+                    registry_entries_dropped: 0,
+                    link_entries_total: 0,
+                    link_entries_reachable: 0,
+                    link_entries_orphaned: Vec::new(),
+                    object_entries_total: 0,
+                    object_entries_reachable: 0,
+                    object_entries_orphaned: Vec::new(),
+                    cas_trees_total: 0,
+                    cas_tree_files_orphaned: Vec::new(),
+                    cas_blobs_total: 0,
+                    cas_blob_files_orphaned: Vec::new(),
+                    cas_source_record_files_orphaned: Vec::new(),
+                    cas_source_validation_files_orphaned: Vec::new(),
+                    cas_materialized_total: 0,
+                    cas_materialized_entries_orphaned: Vec::new(),
+                    compat_islands_total,
+                    compat_islands_orphaned,
+                    build_artifacts_total,
+                    build_artifacts_orphaned,
+                    bytes_freed_or_eligible,
+                    observed_physical_bytes_freed: None,
+                    tombstones_pending,
+                    tombstones_swept: 0,
+                    tombstones_retained: Vec::new(),
+                    tombstone_bytes_freed: 0,
+                    registry_missing,
+                    registry_corrupt,
+                    registry_corrupt_reason,
+                    tombstone_count_error,
+                    tombstone_sweep_error: None,
+                },
+                PruneStats {
+                    analysis,
+                    ..PruneStats::default()
+                },
+            ));
         }
     }
 
@@ -704,10 +826,13 @@ pub fn compute_prune_plan(
     //         graph-keys (link entries reachable from project roots).
     let links_root_canonical = std::fs::canonicalize(v2_store.paths().links_root())
         .unwrap_or_else(|_| v2_store.paths().links_root());
-    let mut root_link_dirs: HashSet<PathBuf> = HashSet::new();
-    for project in &projects {
-        collect_project_link_roots(project, &links_root_canonical, &mut root_link_dirs);
-    }
+    let root_link_dirs = root_link_dirs_override.unwrap_or_else(|| {
+        let mut roots = HashSet::new();
+        for project in &projects {
+            collect_project_link_roots(project, &links_root_canonical, &mut roots);
+        }
+        roots
+    });
 
     // ── Step 3: BFS through link-meta sidecar `deps[].target_graph_key`
     //         to mark every reachable link entry.
@@ -723,11 +848,11 @@ pub fn compute_prune_plan(
     // symlinks at `links/<entry>` (see store.rs), so the raw path is
     // always a direct store child; the `starts_with` defence below is
     // belt-and-suspenders for any future regression.
-    let raw_entries: Vec<(PathBuf, lpm_store::v2::LinkMeta)> =
-        v2_store.iter_link_entries()?.collect();
+    let mut raw_entries = v2_store.iter_link_entries()?;
+    let (entry_capacity, _) = raw_entries.size_hint();
     let mut all_link_entries: Vec<(PathBuf, PathBuf, lpm_store::v2::LinkMeta)> =
-        Vec::with_capacity(raw_entries.len());
-    for (raw_dir, meta) in raw_entries {
+        Vec::with_capacity(entry_capacity);
+    for (raw_dir, meta) in &mut raw_entries {
         let canonical_dir = std::fs::canonicalize(&raw_dir).unwrap_or_else(|_| raw_dir.clone());
         if !canonical_dir.starts_with(&links_root_canonical) {
             tracing::warn!(
@@ -741,28 +866,32 @@ pub fn compute_prune_plan(
         all_link_entries.push((raw_dir, canonical_dir, meta));
     }
 
-    let mut by_digest: std::collections::HashMap<String, PathBuf> =
+    let mut by_digest: std::collections::HashMap<&str, usize> =
         std::collections::HashMap::with_capacity(all_link_entries.len());
-    for (_, canonical_dir, meta) in &all_link_entries {
-        by_digest.insert(meta.graph_key_digest_hex.clone(), canonical_dir.clone());
+    let mut by_path: std::collections::HashMap<&Path, usize> =
+        std::collections::HashMap::with_capacity(all_link_entries.len());
+    for (index, (_, canonical_dir, meta)) in all_link_entries.iter().enumerate() {
+        by_digest.insert(&meta.graph_key_digest_hex, index);
+        by_path.insert(canonical_dir, index);
     }
 
     let link_entries_total = all_link_entries.len();
 
-    let mut reachable: HashSet<PathBuf> = HashSet::new();
-    let mut frontier: Vec<PathBuf> = root_link_dirs.iter().cloned().collect();
-    while let Some(dir) = frontier.pop() {
-        if !reachable.insert(dir.clone()) {
+    let mut reachable = vec![false; all_link_entries.len()];
+    let mut reachable_count = 0usize;
+    let mut frontier: Vec<usize> = root_link_dirs
+        .iter()
+        .filter_map(|directory| by_path.get(directory.as_path()).copied())
+        .collect();
+    while let Some(index) = frontier.pop() {
+        if reachable[index] {
             continue;
         }
-        if let Some((_, _, meta)) = all_link_entries
-            .iter()
-            .find(|(_, canonical, _)| canonical == &dir)
-        {
-            for dep in &meta.deps {
-                if let Some(target_dir) = by_digest.get(&dep.target_graph_key) {
-                    frontier.push(target_dir.clone());
-                }
+        reachable[index] = true;
+        reachable_count += 1;
+        for dependency in &all_link_entries[index].2.deps {
+            if let Some(target_index) = by_digest.get(dependency.target_graph_key.as_str()) {
+                frontier.push(*target_index);
             }
         }
     }
@@ -773,9 +902,9 @@ pub fn compute_prune_plan(
     // in `run_locked` calls `remove_dir_all` on it directly, so the
     // canonical-form is intentionally not used for that purpose.
     let now = Utc::now();
-    let mut link_entries_orphaned = Vec::new();
-    for (raw_dir, canonical_dir, meta) in &all_link_entries {
-        if reachable.contains(canonical_dir) {
+    let mut orphan_link_indices = Vec::new();
+    for (index, (raw_dir, _, meta)) in all_link_entries.iter().enumerate() {
+        if reachable[index] {
             continue;
         }
         if let Some(max_age) = max_age {
@@ -785,8 +914,17 @@ pub fn compute_prune_plan(
                 continue;
             }
         }
-        link_entries_orphaned.push(raw_dir.clone());
+        orphan_link_indices.push(index);
     }
+
+    let link_entries_orphaned = if build_full_plan {
+        orphan_link_indices
+            .iter()
+            .map(|index| all_link_entries[*index].0.clone())
+            .collect()
+    } else {
+        Vec::new()
+    };
 
     // ── Step 5: Object orphan detection (preplan). An object is
     //         reachable iff a SURVIVING (non-orphan) link entry's
@@ -795,27 +933,37 @@ pub fn compute_prune_plan(
     //         reachable as a side effect of the orphan link entries
     //         that haven't been deleted yet, defeating prune
     //         entirely.
-    let orphan_link_set: HashSet<&PathBuf> = link_entries_orphaned.iter().collect();
-    let mut object_referenced_segments: HashSet<String> = HashSet::new();
-    for (raw_dir, _, meta) in &all_link_entries {
-        if orphan_link_set.contains(raw_dir) {
+    let mut orphan_link_set = vec![false; all_link_entries.len()];
+    for &index in &orphan_link_indices {
+        orphan_link_set[index] = true;
+    }
+    let mut object_referenced_segments: HashSet<&str> = HashSet::with_capacity(
+        all_link_entries
+            .len()
+            .saturating_sub(orphan_link_indices.len()),
+    );
+    for (index, (_, _, meta)) in all_link_entries.iter().enumerate() {
+        if orphan_link_set[index] {
             continue;
         }
         let segment = meta
             .object_path
             .strip_prefix("objects/")
             .unwrap_or(&meta.object_path)
-            .trim_end_matches('/')
-            .to_string();
+            .trim_end_matches('/');
         object_referenced_segments.insert(segment);
     }
 
     let mut object_entries_total = 0usize;
+    let mut object_entries_orphaned_count = 0usize;
     let mut object_entries_orphaned = Vec::new();
     for (object_dir, segment) in v2_store.iter_object_dirs()? {
         object_entries_total += 1;
-        if !object_referenced_segments.contains(&segment) {
-            object_entries_orphaned.push(object_dir);
+        if !object_referenced_segments.contains(segment.as_str()) {
+            object_entries_orphaned_count += 1;
+            if build_full_plan {
+                object_entries_orphaned.push(object_dir);
+            }
         }
     }
 
@@ -825,65 +973,86 @@ pub fn compute_prune_plan(
     //         recovery) always, complete islands only when `--max-age` finds
     //         their last-used sentinel stale. Absent on non-macOS (islands
     //         are a macOS clonefile feature) → the dir is missing → no-op.
-    let (compat_islands_total, compat_islands_orphaned) =
-        compute_compat_island_orphans(v2_store.paths().compat_root(), max_age);
-    let (build_artifacts_total, build_artifacts_orphaned) =
-        compute_build_artifact_orphans(v2_store.paths().builds_root(), max_age);
+    let (compat_islands_total, compat_islands_orphaned) = if build_full_plan {
+        compute_compat_island_orphans(v2_store.paths().compat_root(), max_age)
+    } else {
+        (0, Vec::new())
+    };
+    let (build_artifacts_total, build_artifacts_orphaned) = if build_full_plan {
+        compute_build_artifact_orphans(v2_store.paths().builds_root(), max_age)
+    } else {
+        (0, Vec::new())
+    };
 
     let mut bytes_freed_or_eligible = 0u64;
-    for dir in &link_entries_orphaned {
-        bytes_freed_or_eligible =
-            bytes_freed_or_eligible.saturating_add(dir_size(dir).unwrap_or(0));
-    }
-    for dir in &object_entries_orphaned {
-        bytes_freed_or_eligible =
-            bytes_freed_or_eligible.saturating_add(dir_size(dir).unwrap_or(0));
-    }
-    for dir in &compat_islands_orphaned {
-        bytes_freed_or_eligible =
-            bytes_freed_or_eligible.saturating_add(dir_size(dir).unwrap_or(0));
-    }
-    for dir in &build_artifacts_orphaned {
-        bytes_freed_or_eligible =
-            bytes_freed_or_eligible.saturating_add(dir_size(dir).unwrap_or(0));
+    if build_full_plan {
+        for dir in &link_entries_orphaned {
+            bytes_freed_or_eligible =
+                bytes_freed_or_eligible.saturating_add(dir_size(dir).unwrap_or(0));
+        }
+        for dir in &object_entries_orphaned {
+            bytes_freed_or_eligible =
+                bytes_freed_or_eligible.saturating_add(dir_size(dir).unwrap_or(0));
+        }
+        for dir in &compat_islands_orphaned {
+            bytes_freed_or_eligible =
+                bytes_freed_or_eligible.saturating_add(dir_size(dir).unwrap_or(0));
+        }
+        for dir in &build_artifacts_orphaned {
+            bytes_freed_or_eligible =
+                bytes_freed_or_eligible.saturating_add(dir_size(dir).unwrap_or(0));
+        }
     }
 
-    let (tombstones_pending, tombstone_count_error) = count_tombstones_with_error_capture(root);
+    let (tombstones_pending, tombstone_count_error) = if build_full_plan {
+        count_tombstones_with_error_capture(root)
+    } else {
+        (0, None)
+    };
 
-    Ok(PruneSummary {
-        applied: false,
-        projects_walked: projects.len(),
-        registry_entries_dropped,
-        link_entries_total,
-        link_entries_reachable: reachable.len(),
-        link_entries_orphaned,
-        object_entries_total,
-        object_entries_reachable: object_referenced_segments.len(),
-        object_entries_orphaned,
-        cas_trees_total: 0,
-        cas_tree_files_orphaned: Vec::new(),
-        cas_blobs_total: 0,
-        cas_blob_files_orphaned: Vec::new(),
-        cas_source_record_files_orphaned: Vec::new(),
-        cas_source_validation_files_orphaned: Vec::new(),
-        cas_materialized_total: 0,
-        cas_materialized_entries_orphaned: Vec::new(),
-        compat_islands_total,
-        compat_islands_orphaned,
-        build_artifacts_total,
-        build_artifacts_orphaned,
-        bytes_freed_or_eligible,
-        observed_physical_bytes_freed: None,
-        tombstones_pending,
-        tombstones_swept: 0,
-        tombstones_retained: Vec::new(),
-        tombstone_bytes_freed: 0,
-        registry_missing,
-        registry_corrupt,
-        registry_corrupt_reason,
-        tombstone_count_error,
-        tombstone_sweep_error: None,
-    })
+    let stats = PruneStats {
+        link_entries_orphaned: orphan_link_indices.len(),
+        object_entries_orphaned: object_entries_orphaned_count,
+        analysis: PruneAnalysis::Available,
+    };
+
+    Ok((
+        PruneSummary {
+            applied: false,
+            projects_walked: projects.len(),
+            registry_entries_dropped,
+            link_entries_total,
+            link_entries_reachable: reachable_count,
+            link_entries_orphaned,
+            object_entries_total,
+            object_entries_reachable: object_referenced_segments.len(),
+            object_entries_orphaned,
+            cas_trees_total: 0,
+            cas_tree_files_orphaned: Vec::new(),
+            cas_blobs_total: 0,
+            cas_blob_files_orphaned: Vec::new(),
+            cas_source_record_files_orphaned: Vec::new(),
+            cas_source_validation_files_orphaned: Vec::new(),
+            cas_materialized_total: 0,
+            cas_materialized_entries_orphaned: Vec::new(),
+            compat_islands_total,
+            compat_islands_orphaned,
+            build_artifacts_total,
+            build_artifacts_orphaned,
+            bytes_freed_or_eligible,
+            observed_physical_bytes_freed: None,
+            tombstones_pending,
+            tombstones_swept: 0,
+            tombstones_retained: Vec::new(),
+            tombstone_bytes_freed: 0,
+            registry_missing,
+            registry_corrupt,
+            registry_corrupt_reason,
+            tombstone_count_error,
+            tombstone_sweep_error: None,
+        },
+        stats,
+    ))
 }
 
 /// Count pending global-uninstall tombstones, capturing any
@@ -936,6 +1105,47 @@ fn collect_project_link_roots(
     }
 }
 
+fn collect_project_link_roots_for_stores(
+    project: &Path,
+    links_roots_canonical: &[PathBuf],
+    outputs: &mut [HashSet<PathBuf>],
+) {
+    let node_modules = project.join("node_modules");
+    let Ok(entries) = std::fs::read_dir(node_modules) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if name.starts_with('.') {
+            continue;
+        }
+        let path = entry.path();
+        if name.starts_with('@') && path.is_dir() {
+            if let Ok(scoped) = std::fs::read_dir(path) {
+                for package in scoped.flatten() {
+                    add_canonical_link_to_store(&package.path(), links_roots_canonical, outputs);
+                }
+            }
+        } else {
+            add_canonical_link_to_store(&path, links_roots_canonical, outputs);
+        }
+    }
+}
+
+fn add_canonical_link_to_store(
+    candidate: &Path,
+    links_roots_canonical: &[PathBuf],
+    outputs: &mut [HashSet<PathBuf>],
+) {
+    let Ok(canonical) = std::fs::canonicalize(candidate) else {
+        return;
+    };
+    for (links_root, output) in links_roots_canonical.iter().zip(outputs) {
+        add_canonical_if_link_descendant(&canonical, links_root, output);
+    }
+}
+
 fn add_if_link_descendant(
     candidate: &Path,
     links_root_canonical: &Path,
@@ -944,13 +1154,21 @@ fn add_if_link_descendant(
     let Ok(canonical) = std::fs::canonicalize(candidate) else {
         return;
     };
+    add_canonical_if_link_descendant(&canonical, links_root_canonical, out);
+}
+
+fn add_canonical_if_link_descendant(
+    canonical: &Path,
+    links_root_canonical: &Path,
+    out: &mut HashSet<PathBuf>,
+) {
     if !canonical.starts_with(links_root_canonical) {
         return;
     }
     // The canonical path is `<store>/links/<key>/node_modules/<pkg>/`.
     // The `links/<key>` directory itself is the link entry root —
     // strip the `node_modules/<pkg>/` tail to get there.
-    let mut walk = canonical;
+    let mut walk = canonical.to_path_buf();
     while walk.parent().is_some_and(|p| p != links_root_canonical) {
         walk.pop();
     }
@@ -1492,6 +1710,16 @@ mod tests {
         assert_eq!(summary.object_entries_total, 2);
         assert_eq!(summary.object_entries_reachable, 1);
         assert_eq!(summary.object_entries_orphaned.len(), 1);
+
+        let stats = compute_prune_stats(&root, &store, &PruneFlags::default(), None).unwrap();
+        assert_eq!(
+            stats.link_entries_orphaned,
+            summary.link_entries_orphaned.len()
+        );
+        assert_eq!(
+            stats.object_entries_orphaned,
+            summary.object_entries_orphaned.len()
+        );
     }
 
     #[test]

@@ -4,109 +4,136 @@ use crate::doctor_catalog;
 
 use super::check::Check;
 
-pub(super) fn check_lockfile_state(project_dir: &Path) -> Vec<Check> {
+pub(super) enum DiagnosticLockfile {
+    Loaded(Box<lpm_lockfile::ProjectLockfile>),
+    Missing,
+    Invalid(String),
+}
+
+impl DiagnosticLockfile {
+    pub(super) fn load(project_dir: &Path) -> Self {
+        match lpm_lockfile::Lockfile::read_for_project(project_dir) {
+            Ok(mut project) => {
+                project.content = String::new();
+                Self::Loaded(Box::new(project))
+            }
+            Err(lpm_lockfile::LockfileError::NotFound(_)) => Self::Missing,
+            Err(error) => Self::Invalid(error.to_string()),
+        }
+    }
+}
+
+pub(super) fn check_lockfile_state(lockfile: &DiagnosticLockfile) -> Vec<Check> {
     let mut checks = Vec::new();
 
-    if let Ok(project) = lpm_lockfile::Lockfile::read_for_project(project_dir) {
-        let lockfile = project.path;
-        let lockb_path = lockfile.with_extension("lockb");
-        checks.push(Check::pass(&doctor_catalog::LOCKFILE_PRESENT, "lpm.lock"));
+    match lockfile {
+        DiagnosticLockfile::Loaded(project) => {
+            let lockfile_path = &project.path;
+            let lockb_path = lockfile_path.with_extension("lockb");
+            checks.push(Check::pass(&doctor_catalog::LOCKFILE_PRESENT, "lpm.lock"));
 
-        let lockfile_data = lpm_lockfile::Lockfile::read_from_file(&lockfile).ok();
-        let binary_supported = match lockfile_data.as_ref() {
-            Some(lockfile_data) => lpm_lockfile::binary::binary_format_supports(lockfile_data),
-            None => true,
-        };
+            let binary_supported = lpm_lockfile::binary::binary_format_supports(&project.lockfile);
 
-        if lockb_path.exists() {
-            if !binary_supported {
-                checks.push(Check::warn(
+            if lockb_path.exists() {
+                if !binary_supported {
+                    checks.push(Check::warn(
                     &doctor_catalog::LOCKFILE_BINARY_STALE,
                     "lpm.lockb is stale for TOML-only lockfile metadata — run lpm install to remove",
                 ));
-                return checks;
-            }
-
-            // Binary exists — check if in sync
-            let toml_mtime = lockfile.metadata().and_then(|m| m.modified()).ok();
-            let bin_mtime = lockb_path.metadata().and_then(|m| m.modified()).ok();
-
-            let is_stale = match (toml_mtime, bin_mtime) {
-                (Some(t), Some(b)) => b < t,
-                _ => false,
-            };
-
-            if is_stale {
-                checks.push(Check::warn(
-                    &doctor_catalog::LOCKFILE_BINARY_STALE,
-                    "lpm.lockb is stale — run lpm install to regenerate",
-                ));
-            } else {
-                // Validate header
-                match lpm_lockfile::binary::BinaryLockfileReader::open(&lockb_path) {
-                    Ok(Some(_)) => checks.push(Check::pass(
-                        &doctor_catalog::LOCKFILE_BINARY_VALID,
-                        "lpm.lockb (in sync, valid)",
-                    )),
-                    Ok(None) => {} // shouldn't happen since we checked exists
-                    Err(_) => {
-                        checks.push(Check::warn(
-                            &doctor_catalog::LOCKFILE_BINARY_CORRUPT,
-                            "lpm.lockb is corrupt — run lpm install to regenerate",
-                        ));
-                    }
+                    return checks;
                 }
+
+                match lpm_lockfile::binary::BinaryLockfileReader::open(&lockb_path) {
+                    Ok(Some(reader)) => {
+                        let matches_toml = lpm_lockfile::binary::to_binary(&project.lockfile)
+                            .ok()
+                            .is_some_and(|expected| reader.matches_bytes(&expected));
+                        if matches_toml {
+                            checks.push(Check::pass(
+                                &doctor_catalog::LOCKFILE_BINARY_VALID,
+                                "lpm.lockb (in sync, valid)",
+                            ));
+                        } else {
+                            checks.push(Check::warn(
+                                &doctor_catalog::LOCKFILE_BINARY_STALE,
+                                "lpm.lockb does not match lpm.lock — run lpm install to regenerate",
+                            ));
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(_) => checks.push(Check::warn(
+                        &doctor_catalog::LOCKFILE_BINARY_CORRUPT,
+                        "lpm.lockb is corrupt — run lpm install to regenerate",
+                    )),
+                }
+            } else if binary_supported {
+                checks.push(Check::warn(
+                    &doctor_catalog::LOCKFILE_BINARY_MISSING,
+                    "lpm.lockb missing — run lpm install to generate",
+                ));
             }
-        } else if binary_supported {
-            checks.push(Check::warn(
-                &doctor_catalog::LOCKFILE_BINARY_MISSING,
-                "lpm.lockb missing — run lpm install to generate",
-            ));
         }
-    } else {
-        checks.push(Check::warn(
+        DiagnosticLockfile::Missing => checks.push(Check::warn(
             &doctor_catalog::LOCKFILE_MISSING,
             "not found — run: lpm install to generate",
-        ));
+        )),
+        DiagnosticLockfile::Invalid(error) => {
+            checks.push(Check::fail(&doctor_catalog::LOCKFILE_CORRUPT, error))
+        }
     }
 
     checks
 }
 
 /// Check .gitattributes state: exists and has lpm.lockb binary marker.
-pub(super) fn check_gitattributes_state(project_dir: &Path) -> Vec<Check> {
+pub(super) fn check_gitattributes_state(
+    project_dir: &Path,
+    lockfile: &DiagnosticLockfile,
+) -> Vec<Check> {
     let mut checks = Vec::new();
-    let Ok(project) = lpm_lockfile::Lockfile::read_for_project(project_dir) else {
+    let DiagnosticLockfile::Loaded(project) = lockfile else {
         return checks;
     };
-    let lockfile = project.path;
-    let lockb_path = lockfile.with_extension("lockb");
-    let ga_path = lockfile
+    let lockb_path = project.path.with_extension("lockb");
+    let ga_path = project
+        .path
         .parent()
         .unwrap_or(project_dir)
         .join(".gitattributes");
 
-    if lockb_path.exists() || lockfile.exists() {
-        if ga_path.exists() {
-            let ga_content =
-                lpm_common::read_text_file_capped(&ga_path, lpm_common::CONFIG_FILE_SIZE_CAP_BYTES)
-                    .unwrap_or_default();
-            if ga_content.lines().any(|l| l.trim() == "lpm.lockb binary") {
+    if lockb_path.exists() || project.path.exists() {
+        match lpm_common::read_text_file_capped_nofollow(
+            &ga_path,
+            lpm_common::CONFIG_FILE_SIZE_CAP_BYTES,
+        ) {
+            Ok(ga_content)
+                if ga_content
+                    .lines()
+                    .any(|line| line.trim() == "lpm.lockb binary") =>
+            {
                 checks.push(Check::pass(
                     &doctor_catalog::GITATTRIBUTES_LOCKB_MARKED,
                     "lpm.lockb marked as binary",
                 ));
-            } else {
+            }
+            Ok(_) => {
                 checks.push(Check::warn(
                     &doctor_catalog::GITATTRIBUTES_LOCKB_UNMARKED,
                     "lpm.lockb not marked as binary — run lpm install to fix",
                 ));
             }
-        } else {
-            checks.push(Check::warn(
-                &doctor_catalog::GITATTRIBUTES_MISSING,
-                "missing — run lpm install to create (marks lpm.lockb as binary)",
-            ));
+            Err(lpm_common::BoundedReadError::NotFound { .. }) => {
+                checks.push(Check::warn(
+                    &doctor_catalog::GITATTRIBUTES_MISSING,
+                    "missing — run lpm install to create (marks lpm.lockb as binary)",
+                ));
+            }
+            Err(error) => {
+                checks.push(Check::warn(
+                    &doctor_catalog::GITATTRIBUTES_UNREADABLE,
+                    &format!("cannot inspect safely: {error}"),
+                ));
+            }
         }
     }
 
@@ -155,69 +182,72 @@ pub(super) fn fix_gitattributes(project_dir: &Path) -> Result<(), String> {
         .map_err(|e| format!(".gitattributes update failed: {e}"))
 }
 
-/// Check if lockfile dependencies match package.json dependencies.
-///
-/// Reads dep names from package.json and checks if they all appear in lpm.lock.
-/// Detects "lockfile out of date" drift.
-pub(super) fn check_deps_in_sync(project_dir: &Path) -> Option<Check> {
-    let pkg_json_path = project_dir.join("package.json");
-    let pkg_content =
-        lpm_common::read_text_file_capped(&pkg_json_path, lpm_common::CONFIG_FILE_SIZE_CAP_BYTES)
-            .ok()?;
-    let pkg: serde_json::Value = serde_json::from_str(&pkg_content).ok()?;
-
-    let lockfile = lpm_lockfile::Lockfile::read_for_project(project_dir)
-        .ok()?
-        .lockfile;
-
-    // Collect all dep names from package.json
-    let mut declared_deps: Vec<String> = Vec::new();
-    if let Some(deps) = pkg.get("dependencies").and_then(|d| d.as_object()) {
-        for key in deps.keys() {
-            declared_deps.push(key.clone());
+pub(super) fn check_deps_in_sync(
+    package: &lpm_workspace::PackageJson,
+    lockfile: &DiagnosticLockfile,
+) -> Option<Check> {
+    let DiagnosticLockfile::Loaded(project) = lockfile else {
+        return None;
+    };
+    let expected = [
+        ("dependencies", &package.dependencies),
+        ("devDependencies", &package.dev_dependencies),
+        ("optionalDependencies", &package.optional_dependencies),
+        ("peerDependencies", &package.peer_dependencies),
+    ];
+    let Some(snapshot) = project.lockfile.importers.get(".") else {
+        if expected
+            .iter()
+            .all(|(_, dependencies)| dependencies.is_empty())
+        {
+            return Some(Check::pass(
+                &doctor_catalog::DEPS_SYNC_CLEAN,
+                "lockfile matches package.json",
+            ));
         }
-    }
-    if let Some(deps) = pkg.get("devDependencies").and_then(|d| d.as_object()) {
-        for key in deps.keys() {
-            declared_deps.push(key.clone());
-        }
-    }
+        return Some(Check::warn(
+            &doctor_catalog::DEPS_SYNC_DRIFT,
+            "lockfile has no direct-dependency importer snapshot — run: lpm install",
+        ));
+    };
+    let actual = [
+        ("dependencies", &snapshot.dependencies),
+        ("devDependencies", &snapshot.dev_dependencies),
+        ("optionalDependencies", &snapshot.optional_dependencies),
+        ("peerDependencies", &snapshot.peer_dependencies),
+    ];
+    let changed: Vec<_> = expected
+        .iter()
+        .zip(actual.iter())
+        .filter_map(|((name, expected), (_, actual))| {
+            (!maps_match(expected, actual)).then_some(*name)
+        })
+        .collect();
 
-    if declared_deps.is_empty() {
-        return None; // No deps to check
-    }
-
-    // Check which deps are missing from lockfile using proper lockfile parsing
-    let mut missing: Vec<&str> = Vec::new();
-    for dep in &declared_deps {
-        if lockfile.find_package(dep).is_none() {
-            missing.push(dep);
-        }
-    }
-
-    if missing.is_empty() {
+    if changed.is_empty() {
         Some(Check::pass(
             &doctor_catalog::DEPS_SYNC_CLEAN,
             "lockfile matches package.json",
-        ))
-    } else if missing.len() <= 3 {
-        Some(Check::warn(
-            &doctor_catalog::DEPS_SYNC_DRIFT,
-            &format!(
-                "lockfile missing: {} — run: lpm install",
-                missing.join(", ")
-            ),
         ))
     } else {
         Some(Check::warn(
             &doctor_catalog::DEPS_SYNC_DRIFT,
             &format!(
-                "{} deps not in lockfile ({}, ...) — run: lpm install",
-                missing.len(),
-                missing[..2].join(", ")
+                "lockfile importer differs in {} — run: lpm install",
+                changed.join(", ")
             ),
         ))
     }
+}
+
+fn maps_match(
+    expected: &std::collections::HashMap<String, String>,
+    actual: &std::collections::BTreeMap<String, String>,
+) -> bool {
+    expected.len() == actual.len()
+        && expected
+            .iter()
+            .all(|(name, spec)| actual.get(name) == Some(spec))
 }
 
 #[cfg(test)]
@@ -229,6 +259,21 @@ mod tests {
         let mut lockfile = lpm_lockfile::Lockfile::new();
         lockfile.metadata.lockfile_version = lpm_lockfile::LOCKFILE_VERSION_WITH_STRUCTURED_PEERS;
         lockfile
+    }
+
+    fn check_deps_in_sync_at(project_dir: &Path) -> Option<Check> {
+        let package = lpm_workspace::read_package_json(&project_dir.join("package.json")).ok()?;
+        let lockfile = DiagnosticLockfile::load(project_dir);
+        check_deps_in_sync(&package, &lockfile)
+    }
+
+    fn check_lockfile_state_at(project_dir: &Path) -> Vec<Check> {
+        check_lockfile_state(&DiagnosticLockfile::load(project_dir))
+    }
+
+    fn check_gitattributes_state_at(project_dir: &Path) -> Vec<Check> {
+        let lockfile = DiagnosticLockfile::load(project_dir);
+        check_gitattributes_state(project_dir, &lockfile)
     }
 
     #[test]
@@ -253,6 +298,16 @@ mod tests {
 
         // Create lockfile with "react" but NOT "a"
         let mut lockfile = binary_representable_lockfile();
+        lockfile.importers.insert(
+            ".".to_string(),
+            lpm_lockfile::ImporterSnapshot {
+                dependencies: std::collections::BTreeMap::from([(
+                    "react".to_string(),
+                    "18.0.0".to_string(),
+                )]),
+                ..Default::default()
+            },
+        );
         lockfile.add_package(lpm_lockfile::LockedPackage {
             instance_id: None,
             dependency_targets: std::collections::BTreeMap::new(),
@@ -280,17 +335,14 @@ mod tests {
             .write_to_file(&dir.path().join("lpm.lock"))
             .unwrap();
 
-        let result = check_deps_in_sync(dir.path());
+        let result = check_deps_in_sync_at(dir.path());
         let check = result.expect("should return a check");
         // "a" should be reported as missing — it is NOT in the lockfile
         assert!(
             matches!(check.severity, Severity::Warn),
             "dep 'a' should be missing from lockfile"
         );
-        assert!(
-            check.detail.contains("a"),
-            "detail should mention missing dep 'a'"
-        );
+        assert!(check.detail.contains("dependencies"), "{}", check.detail);
     }
 
     #[test]
@@ -309,6 +361,16 @@ mod tests {
         .unwrap();
 
         let mut lockfile = binary_representable_lockfile();
+        lockfile.importers.insert(
+            ".".to_string(),
+            lpm_lockfile::ImporterSnapshot {
+                dependencies: std::collections::BTreeMap::from([(
+                    "react".to_string(),
+                    "^18.0.0".to_string(),
+                )]),
+                ..Default::default()
+            },
+        );
         lockfile.add_package(lpm_lockfile::LockedPackage {
             instance_id: None,
             dependency_targets: std::collections::BTreeMap::new(),
@@ -336,11 +398,114 @@ mod tests {
             .write_to_file(&dir.path().join("lpm.lock"))
             .unwrap();
 
-        let result = check_deps_in_sync(dir.path());
+        let result = check_deps_in_sync_at(dir.path());
         let check = result.expect("should return a check");
         assert!(
             matches!(check.severity, Severity::Pass),
             "react should be found in lockfile"
+        );
+    }
+
+    fn write_lockfile_with_importer(
+        directory: &Path,
+        snapshot: lpm_lockfile::ImporterSnapshot,
+        packages: Vec<lpm_lockfile::LockedPackage>,
+    ) {
+        let mut lockfile = binary_representable_lockfile();
+        lockfile.importers.insert(".".to_string(), snapshot);
+        lockfile.packages = packages;
+        lockfile.write_to_file(&directory.join("lpm.lock")).unwrap();
+    }
+
+    #[test]
+    fn deps_sync_detects_changed_requested_range() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("package.json"),
+            r#"{"dependencies":{"react":"^18.0.0"}}"#,
+        )
+        .unwrap();
+        write_lockfile_with_importer(
+            dir.path(),
+            lpm_lockfile::ImporterSnapshot {
+                dependencies: std::collections::BTreeMap::from([(
+                    "react".to_string(),
+                    "^17.0.0".to_string(),
+                )]),
+                ..Default::default()
+            },
+            Vec::new(),
+        );
+
+        let check = check_deps_in_sync_at(dir.path()).expect("dependency sync check");
+        assert!(matches!(check.severity, Severity::Warn), "{}", check.detail);
+        assert!(check.detail.contains("dependencies"), "{}", check.detail);
+    }
+
+    #[test]
+    fn deps_sync_detects_removed_direct_dependency() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("package.json"), r#"{"name":"empty"}"#).unwrap();
+        write_lockfile_with_importer(
+            dir.path(),
+            lpm_lockfile::ImporterSnapshot {
+                dependencies: std::collections::BTreeMap::from([(
+                    "removed".to_string(),
+                    "^1.0.0".to_string(),
+                )]),
+                ..Default::default()
+            },
+            Vec::new(),
+        );
+
+        let check = check_deps_in_sync_at(dir.path()).expect("dependency sync check");
+        assert!(matches!(check.severity, Severity::Warn), "{}", check.detail);
+    }
+
+    #[test]
+    fn deps_sync_does_not_treat_a_transitive_package_as_a_direct_binding() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("package.json"),
+            r#"{"dependencies":{"react":"^18.0.0"}}"#,
+        )
+        .unwrap();
+        let mut transitive = binary_representable_lockfile();
+        transitive.add_package(lpm_lockfile::LockedPackage {
+            name: "react".to_string(),
+            version: "18.0.0".to_string(),
+            ..Default::default()
+        });
+        write_lockfile_with_importer(
+            dir.path(),
+            lpm_lockfile::ImporterSnapshot::default(),
+            transitive.packages,
+        );
+
+        let check = check_deps_in_sync_at(dir.path()).expect("dependency sync check");
+        assert!(matches!(check.severity, Severity::Warn), "{}", check.detail);
+    }
+
+    #[test]
+    fn deps_sync_detects_optional_dependency_drift() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("package.json"),
+            r#"{"optionalDependencies":{"fsevents":"^2.3.3"}}"#,
+        )
+        .unwrap();
+        write_lockfile_with_importer(
+            dir.path(),
+            lpm_lockfile::ImporterSnapshot::default(),
+            Vec::new(),
+        );
+
+        let check = check_deps_in_sync_at(dir.path()).expect("dependency sync check");
+        assert!(matches!(check.severity, Severity::Warn), "{}", check.detail);
+        assert!(
+            check.detail.contains("optionalDependencies"),
+            "{}",
+            check.detail
         );
     }
 
@@ -349,11 +514,26 @@ mod tests {
     #[test]
     fn lockfile_check_no_lockfile_warns() {
         let dir = tempfile::tempdir().unwrap();
-        let checks = check_lockfile_state(dir.path());
+        let checks = check_lockfile_state_at(dir.path());
         assert_eq!(checks.len(), 1);
         assert_eq!(checks[0].name(), "Lockfile");
         assert!(matches!(checks[0].severity, Severity::Warn));
         assert!(checks[0].detail.contains("not found"));
+    }
+
+    #[test]
+    fn lockfile_check_existing_corrupt_toml_is_not_reported_as_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("lpm.lock"), b"not = [valid").unwrap();
+
+        let checks = check_lockfile_state_at(dir.path());
+        assert_eq!(checks.len(), 1);
+        assert_eq!(checks[0].code(), "lockfile_corrupt");
+        assert!(
+            checks[0].detail.contains("failed to parse"),
+            "{}",
+            checks[0].detail
+        );
     }
 
     #[test]
@@ -362,7 +542,7 @@ mod tests {
         let lf = binary_representable_lockfile();
         lf.write_to_file(&dir.path().join("lpm.lock")).unwrap();
 
-        let checks = check_lockfile_state(dir.path());
+        let checks = check_lockfile_state_at(dir.path());
         assert_eq!(checks.len(), 2);
         assert_eq!(checks[0].name(), "Lockfile");
         assert!(matches!(checks[0].severity, Severity::Pass));
@@ -405,7 +585,7 @@ mod tests {
         let lf = lockfile_with_platform_metadata();
         lf.write_to_file(&dir.path().join("lpm.lock")).unwrap();
 
-        let checks = check_lockfile_state(dir.path());
+        let checks = check_lockfile_state_at(dir.path());
         assert_eq!(checks.len(), 1);
         assert_eq!(checks[0].name(), "Lockfile");
         assert!(matches!(checks[0].severity, Severity::Pass));
@@ -421,7 +601,7 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(50));
         lf.write_to_file(&dir.path().join("lpm.lock")).unwrap();
 
-        let checks = check_lockfile_state(dir.path());
+        let checks = check_lockfile_state_at(dir.path());
         assert_eq!(checks.len(), 2);
         assert_eq!(checks[1].name(), "Binary lockfile");
         assert!(matches!(checks[1].severity, Severity::Warn));
@@ -437,7 +617,7 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(50));
         lpm_lockfile::binary::write_binary(&lf, &dir.path().join("lpm.lockb")).unwrap();
 
-        let checks = check_lockfile_state(dir.path());
+        let checks = check_lockfile_state_at(dir.path());
         assert_eq!(checks.len(), 2);
         assert!(matches!(checks[0].severity, Severity::Pass));
         assert_eq!(checks[1].name(), "Binary lockfile");
@@ -446,7 +626,7 @@ mod tests {
     }
 
     #[test]
-    fn lockfile_check_stale_binary_warns() {
+    fn lockfile_check_older_binary_with_matching_contents_is_valid() {
         let dir = tempfile::tempdir().unwrap();
         let lf = binary_representable_lockfile();
         // Write binary first (older), then TOML (newer)
@@ -454,11 +634,39 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(50));
         lf.write_to_file(&dir.path().join("lpm.lock")).unwrap();
 
-        let checks = check_lockfile_state(dir.path());
+        let checks = check_lockfile_state_at(dir.path());
         assert_eq!(checks.len(), 2);
         assert_eq!(checks[1].name(), "Binary lockfile");
-        assert!(matches!(checks[1].severity, Severity::Warn));
-        assert!(checks[1].detail.contains("stale"));
+        assert!(matches!(checks[1].severity, Severity::Pass));
+        assert!(checks[1].detail.contains("in sync"));
+    }
+
+    #[test]
+    fn lockfile_check_newer_binary_with_different_contents_is_stale() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut toml_lockfile = binary_representable_lockfile();
+        toml_lockfile.add_package(lpm_lockfile::LockedPackage {
+            name: "toml-package".to_string(),
+            version: "1.0.0".to_string(),
+            ..Default::default()
+        });
+        toml_lockfile
+            .write_to_file(&dir.path().join("lpm.lock"))
+            .unwrap();
+
+        let mut binary_lockfile = binary_representable_lockfile();
+        binary_lockfile.add_package(lpm_lockfile::LockedPackage {
+            name: "other-package".to_string(),
+            version: "2.0.0".to_string(),
+            ..Default::default()
+        });
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        lpm_lockfile::binary::write_binary(&binary_lockfile, &dir.path().join("lpm.lockb"))
+            .unwrap();
+
+        let checks = check_lockfile_state_at(dir.path());
+        assert_eq!(checks.len(), 2);
+        assert_eq!(checks[1].code(), "lockfile_binary_stale");
     }
 
     #[test]
@@ -470,7 +678,7 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(50));
         std::fs::write(dir.path().join("lpm.lockb"), b"BADMxxxxxxxxxxxxxxxxx").unwrap();
 
-        let checks = check_lockfile_state(dir.path());
+        let checks = check_lockfile_state_at(dir.path());
         assert_eq!(checks.len(), 2);
         assert_eq!(checks[1].name(), "Binary lockfile");
         assert!(matches!(checks[1].severity, Severity::Warn));
@@ -483,7 +691,7 @@ mod tests {
     fn gitattributes_check_skipped_without_lockfiles() {
         let dir = tempfile::tempdir().unwrap();
         // No lpm.lock or lpm.lockb — should produce no checks
-        let checks = check_gitattributes_state(dir.path());
+        let checks = check_gitattributes_state_at(dir.path());
         assert!(checks.is_empty());
     }
 
@@ -494,7 +702,7 @@ mod tests {
         lf.write_to_file(&dir.path().join("lpm.lock")).unwrap();
         // No .gitattributes file
 
-        let checks = check_gitattributes_state(dir.path());
+        let checks = check_gitattributes_state_at(dir.path());
         assert_eq!(checks.len(), 1);
         assert!(matches!(checks[0].severity, Severity::Warn));
         assert!(checks[0].detail.contains("missing"));
@@ -507,7 +715,7 @@ mod tests {
         lf.write_to_file(&dir.path().join("lpm.lock")).unwrap();
         std::fs::write(dir.path().join(".gitattributes"), "*.png binary\n").unwrap();
 
-        let checks = check_gitattributes_state(dir.path());
+        let checks = check_gitattributes_state_at(dir.path());
         assert_eq!(checks.len(), 1);
         assert!(matches!(checks[0].severity, Severity::Warn));
         assert!(checks[0].detail.contains("not marked as binary"));
@@ -524,10 +732,49 @@ mod tests {
         )
         .unwrap();
 
-        let checks = check_gitattributes_state(dir.path());
+        let checks = check_gitattributes_state_at(dir.path());
         assert_eq!(checks.len(), 1);
         assert!(matches!(checks[0].severity, Severity::Pass));
         assert!(checks[0].detail.contains("marked as binary"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn linked_gitattributes_is_reported_as_unreadable_without_following_the_target() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let lf = binary_representable_lockfile();
+        lf.write_to_file(&dir.path().join("lpm.lock")).unwrap();
+        let target = dir.path().join("outside-gitattributes");
+        std::fs::write(&target, "lpm.lockb binary\n").unwrap();
+        symlink(&target, dir.path().join(".gitattributes")).unwrap();
+
+        let checks = check_gitattributes_state_at(dir.path());
+        assert_eq!(checks.len(), 1);
+        assert_eq!(checks[0].code(), "gitattributes_unreadable");
+        assert!(matches!(checks[0].severity, Severity::Warn));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fifo_gitattributes_is_rejected_without_waiting_for_a_writer() {
+        use std::os::unix::ffi::OsStrExt as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        binary_representable_lockfile()
+            .write_to_file(&dir.path().join("lpm.lock"))
+            .unwrap();
+        let path = dir.path().join(".gitattributes");
+        let encoded = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+        // SAFETY: `encoded` is a NUL-terminated path owned by this test.
+        assert_eq!(unsafe { libc::mkfifo(encoded.as_ptr(), 0o600) }, 0);
+        let started = std::time::Instant::now();
+
+        let checks = check_gitattributes_state_at(dir.path());
+
+        assert!(started.elapsed() < std::time::Duration::from_millis(500));
+        assert_eq!(checks[0].code(), "gitattributes_unreadable");
     }
 
     // ── Fix execution tests ─────────────────────────────────────────────

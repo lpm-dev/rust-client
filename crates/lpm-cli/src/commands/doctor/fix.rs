@@ -13,6 +13,18 @@ use super::install_fix::run_doctor_install;
 use super::lockfile::{fix_binary_lockfile, fix_gitattributes};
 
 #[derive(Default)]
+pub(super) struct FixReport {
+    pub(super) applied: Vec<String>,
+    pub(super) failed: Vec<FixFailure>,
+}
+
+#[derive(serde::Serialize)]
+pub(super) struct FixFailure {
+    action: &'static str,
+    error: String,
+}
+
+#[derive(Default)]
 struct RuntimeInstallContext {
     http_client: Option<reqwest::Client>,
     platform: Option<lpm_runtime::platform::Platform>,
@@ -47,10 +59,13 @@ pub(super) fn confirm_before_apply(
     checks: &[Check],
     json_output: bool,
     yes: bool,
-) -> Result<(), LpmError> {
+) -> Result<bool, LpmError> {
     let actions = planned_actions(checks)?;
-    if actions.is_empty() || yes {
-        return Ok(());
+    if actions.is_empty() {
+        return Ok(false);
+    }
+    if yes {
+        return Ok(true);
     }
     if json_output || !std::io::stdin().is_terminal() {
         return Err(LpmError::Script(
@@ -70,7 +85,7 @@ pub(super) fn confirm_before_apply(
         .interact()
         .map_err(crate::prompt::prompt_err)?;
     if confirmed {
-        Ok(())
+        Ok(true)
     } else {
         Err(LpmError::Script(
             "Automatic fixes were declined. No changes were made.".into(),
@@ -119,13 +134,13 @@ pub(super) async fn apply(
     client: &RegistryClient,
     project_dir: &Path,
     json_output: bool,
-) -> Vec<String> {
+) -> FixReport {
     if !json_output {
         install_ui::phase("Running auto-fix");
     }
 
-    let mut fixes_applied = Vec::new();
-    let mut install_ran = false;
+    let mut report = FixReport::default();
+    let mut attempted = HashSet::with_capacity(checks.len());
     let mut runtime_context = RuntimeInstallContext::default();
 
     for check in checks {
@@ -135,6 +150,12 @@ pub(super) async fn apply(
         let Some(action) = check.entry.auto_fix else {
             continue;
         };
+        let target = action
+            .requires_target()
+            .then_some(check.fix_target.as_ref());
+        if !attempted.insert((action, target)) {
+            continue;
+        }
 
         let result = apply_one(
             action,
@@ -142,22 +163,27 @@ pub(super) async fn apply(
             client,
             project_dir,
             json_output,
-            &mut install_ran,
             &mut runtime_context,
         )
         .await;
 
         match result {
-            Ok(Some(summary)) => fixes_applied.push(summary),
+            Ok(Some(summary)) => report.applied.push(summary),
             Ok(None) => {}
-            Err(error) => super::render_autofix_failed(action.label(), &error),
+            Err(error) => {
+                super::render_autofix_failed(action.label(), &error);
+                report.failed.push(FixFailure {
+                    action: action.label(),
+                    error: error.to_string(),
+                });
+            }
         }
     }
 
     if !json_output {
-        render_summary(&fixes_applied);
+        render_summary(&report.applied);
     }
-    fixes_applied
+    report
 }
 
 async fn apply_one(
@@ -166,7 +192,6 @@ async fn apply_one(
     client: &RegistryClient,
     project_dir: &Path,
     json_output: bool,
-    install_ran: &mut bool,
     runtime_context: &mut RuntimeInstallContext,
 ) -> Result<Option<String>, LpmError> {
     match action {
@@ -182,11 +207,9 @@ async fn apply_one(
             phase(json_output, "fixing: lpm cache prune --apply");
             prune_store().map(Some)
         }
-        DoctorFix::InstallProject if *install_ran => Ok(None),
         DoctorFix::InstallProject => {
             phase(json_output, "fixing: lpm install");
             run_doctor_install(client, project_dir).await?;
-            *install_ran = true;
             Ok(Some("lpm install".into()))
         }
         DoctorFix::ReconcileBinaryLockfile => {
@@ -417,7 +440,7 @@ mod tests {
             "offline",
         )];
 
-        confirm_before_apply(&checks, true, false).unwrap();
+        assert!(!confirm_before_apply(&checks, true, false).unwrap());
     }
 
     #[test]
@@ -427,6 +450,23 @@ mod tests {
             "missing",
         )];
 
-        confirm_before_apply(&checks, true, true).unwrap();
+        assert!(confirm_before_apply(&checks, true, true).unwrap());
+    }
+
+    #[tokio::test]
+    async fn one_failed_project_install_is_not_retried_for_duplicate_findings() {
+        let project = tempfile::tempdir().unwrap();
+        let checks = [
+            Check::fail(&doctor_catalog::NODE_MODULES_MISSING, "missing"),
+            Check::warn(&doctor_catalog::LOCKFILE_MISSING, "missing"),
+        ];
+
+        let report = apply(&checks, &RegistryClient::new(), project.path(), true).await;
+
+        assert_eq!(
+            report.failed.len(),
+            1,
+            "one planned install action must produce at most one failure"
+        );
     }
 }

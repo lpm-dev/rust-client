@@ -22,6 +22,12 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 const GITHUB_API_BASE_ENV: &str = "LPM_PLUGIN_GITHUB_API_BASE";
+const GITHUB_API_RESPONSE_CAP_BYTES: usize = 1024 * 1024;
+
+#[derive(Debug, serde::Deserialize)]
+struct GithubRelease {
+    tag_name: String,
+}
 
 /// Cached install-selection state. Each entry is the highest version
 /// we have ever **successfully verified-and-installed** via
@@ -56,22 +62,25 @@ pub async fn get_all_latest_versions() -> HashMap<String, String> {
     map
 }
 
-/// Compare two semver-like strings. Returns `true` if `a` is strictly newer than `b`.
-///
-/// Only compares numeric segments (MAJOR.MINOR.PATCH). Pre-release suffixes
-/// are ignored for simplicity — this is a best-effort comparison for plugin
-/// version selection, not a full semver resolver.
-pub(crate) fn is_newer_semver(a: &str, b: &str) -> bool {
-    let parse = |s: &str| -> Vec<u64> {
-        let version_part = s.split('-').next().unwrap_or(s);
-        version_part
-            .split('.')
-            .filter_map(|seg| seg.parse::<u64>().ok())
-            .collect()
-    };
-    let va = parse(a);
-    let vb = parse(b);
-    va > vb
+/// Compare two plugin versions. Returns `true` if `a` is strictly newer than `b`.
+/// Exact versions use npm-compatible ordering; legacy partial versions retain
+/// their component-wise ordering for cache compatibility.
+pub fn is_newer_semver(a: &str, b: &str) -> bool {
+    match (lpm_semver::Version::parse(a), lpm_semver::Version::parse(b)) {
+        (Ok(a), Ok(b)) => a > b,
+        _ => {
+            let numeric_components = |version: &str| -> Vec<u64> {
+                version
+                    .split('-')
+                    .next()
+                    .unwrap_or(version)
+                    .split('.')
+                    .filter_map(|component| component.parse().ok())
+                    .collect()
+            };
+            numeric_components(a) > numeric_components(b)
+        }
+    }
 }
 
 /// Read a cached version for a plugin.
@@ -124,8 +133,10 @@ fn read_cache() -> Result<VersionCache, LpmError> {
 }
 
 fn read_cache_at(cache_path: &Path) -> Result<VersionCache, LpmError> {
-    let content = std::fs::read_to_string(cache_path)?;
-    let cache: VersionCache = serde_json::from_str(&content)
+    let content =
+        lpm_common::read_file_capped(cache_path, lpm_common::STATE_FILE_SIZE_CAP_BYTES)
+            .map_err(|error| LpmError::Plugin(format!("failed to read version cache: {error}")))?;
+    let cache: VersionCache = serde_json::from_slice(&content)
         .map_err(|e| LpmError::Plugin(format!("failed to parse version cache: {e}")))?;
     Ok(cache)
 }
@@ -176,11 +187,23 @@ fn build_github_request(client: &reqwest::Client, url: &str) -> reqwest::Request
         .header("User-Agent", "lpm-cli")
         .header("Accept", "application/vnd.github.v3+json");
 
-    if let Some(token) = github_token() {
+    if trusted_github_api_url(url)
+        && let Some(token) = github_token()
+    {
         req = req.header("Authorization", format!("Bearer {token}"));
     }
 
     req
+}
+
+fn trusted_github_api_url(url: &str) -> bool {
+    reqwest::Url::parse(url).is_ok_and(|url| {
+        url.scheme() == "https"
+            && url.host_str() == Some("api.github.com")
+            && url.port_or_known_default() == Some(443)
+            && url.username().is_empty()
+            && url.password().is_none()
+    })
 }
 
 fn github_api_base() -> String {
@@ -219,13 +242,23 @@ fn check_rate_limit(resp: &reqwest::Response) -> Option<String> {
 /// Supports `GITHUB_TOKEN` / `GH_TOKEN` env vars for authenticated requests
 /// (5000 req/hr vs 60 unauthenticated).
 pub async fn peek_latest_from_github(def: &PluginDef) -> Result<String, String> {
-    let (owner, repo) = parse_github_owner_repo(def)?;
-    let tag_prefix = tag_prefix_for_plugin(def);
+    let client = github_client()?;
+    peek_latest_from_github_with_client(def, &client).await
+}
 
-    let client = lpm_http::client_builder()
+pub fn github_client() -> Result<reqwest::Client, String> {
+    lpm_http::client_builder()
         .timeout(std::time::Duration::from_secs(5))
         .build()
-        .map_err(|e| format!("http client error: {e}"))?;
+        .map_err(|e| format!("http client error: {e}"))
+}
+
+pub async fn peek_latest_from_github_with_client(
+    def: &PluginDef,
+    client: &reqwest::Client,
+) -> Result<String, String> {
+    let (owner, repo) = parse_github_owner_repo(def)?;
+    let tag_prefix = tag_prefix_for_plugin(def);
 
     let tag = if let Some(prefix) = tag_prefix {
         let api_url = format!(
@@ -233,7 +266,7 @@ pub async fn peek_latest_from_github(def: &PluginDef) -> Result<String, String> 
             github_api_base()
         );
 
-        let resp = build_github_request(&client, &api_url)
+        let resp = build_github_request(client, &api_url)
             .send()
             .await
             .map_err(|e| format!("github request failed: {}", lpm_http::display_error(&e)))?;
@@ -245,14 +278,11 @@ pub async fn peek_latest_from_github(def: &PluginDef) -> Result<String, String> 
             return Err(format!("github API returned {}", resp.status()));
         }
 
-        let releases: Vec<serde_json::Value> = resp
-            .json()
-            .await
-            .map_err(|e| format!("failed to parse github response: {e}"))?;
+        let releases: Vec<GithubRelease> = read_capped_github_json(resp).await?;
 
         releases
             .iter()
-            .filter_map(|r| r.get("tag_name")?.as_str())
+            .map(|release| release.tag_name.as_str())
             .find(|tag| tag.starts_with(prefix))
             .ok_or_else(|| {
                 format!("no release found with tag prefix '{prefix}' in {owner}/{repo}")
@@ -261,7 +291,7 @@ pub async fn peek_latest_from_github(def: &PluginDef) -> Result<String, String> 
     } else {
         let api_url = format!("{}/repos/{owner}/{repo}/releases/latest", github_api_base());
 
-        let resp = build_github_request(&client, &api_url)
+        let resp = build_github_request(client, &api_url)
             .send()
             .await
             .map_err(|e| format!("github request failed: {}", lpm_http::display_error(&e)))?;
@@ -273,15 +303,9 @@ pub async fn peek_latest_from_github(def: &PluginDef) -> Result<String, String> 
             return Err(format!("github API returned {}", resp.status()));
         }
 
-        let body: serde_json::Value = resp
-            .json()
-            .await
-            .map_err(|e| format!("failed to parse github response: {e}"))?;
-
-        body.get("tag_name")
-            .and_then(|v| v.as_str())
-            .ok_or("no tag_name in github release")?
-            .to_string()
+        read_capped_github_json::<GithubRelease>(resp)
+            .await?
+            .tag_name
     };
 
     let version = extract_version_from_tag(&tag);
@@ -293,6 +317,39 @@ pub async fn peek_latest_from_github(def: &PluginDef) -> Result<String, String> 
     }
 
     Ok(version)
+}
+
+async fn read_capped_github_json<T: serde::de::DeserializeOwned>(
+    mut response: reqwest::Response,
+) -> Result<T, String> {
+    if response
+        .content_length()
+        .is_some_and(|length| length > GITHUB_API_RESPONSE_CAP_BYTES as u64)
+    {
+        return Err(format!(
+            "github response exceeds {GITHUB_API_RESPONSE_CAP_BYTES} byte limit"
+        ));
+    }
+    let capacity = response
+        .content_length()
+        .and_then(|length| usize::try_from(length).ok())
+        .unwrap_or(0)
+        .min(GITHUB_API_RESPONSE_CAP_BYTES);
+    let mut body = Vec::with_capacity(capacity);
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|error| format!("failed to read github response: {error}"))?
+    {
+        if body.len().saturating_add(chunk.len()) > GITHUB_API_RESPONSE_CAP_BYTES {
+            return Err(format!(
+                "github response exceeds {GITHUB_API_RESPONSE_CAP_BYTES} byte limit"
+            ));
+        }
+        body.extend_from_slice(&chunk);
+    }
+    serde_json::from_slice(&body)
+        .map_err(|error| format!("failed to parse github response: {error}"))
 }
 
 /// Parse owner/repo from a plugin's URL template.
@@ -346,6 +403,27 @@ fn is_semver_like(s: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    async fn response_from_raw_http(
+        raw_response: Vec<u8>,
+    ) -> (reqwest::Response, tokio::task::JoinHandle<()>) {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0u8; 1024];
+            let _ = stream.read(&mut request).await;
+            stream.write_all(&raw_response).await.unwrap();
+        });
+        let response = reqwest::Client::new()
+            .get(format!("http://{address}/release"))
+            .send()
+            .await
+            .unwrap();
+        (response, server)
+    }
 
     #[test]
     fn extract_version_simple() {
@@ -417,10 +495,70 @@ mod tests {
     }
 
     #[test]
+    fn custom_github_api_origins_do_not_receive_ambient_tokens() {
+        let prior_github = std::env::var_os("GITHUB_TOKEN");
+        let prior_gh = std::env::var_os("GH_TOKEN");
+        // SAFETY: both variables are restored before the test returns.
+        unsafe {
+            std::env::set_var("GITHUB_TOKEN", "doctor-plugin-secret");
+            std::env::remove_var("GH_TOKEN");
+        }
+
+        let request = build_github_request(
+            &reqwest::Client::new(),
+            "http://127.0.0.1:43123/repos/example/tool/releases/latest",
+        )
+        .build()
+        .unwrap();
+
+        match prior_github {
+            Some(value) => unsafe { std::env::set_var("GITHUB_TOKEN", value) },
+            None => unsafe { std::env::remove_var("GITHUB_TOKEN") },
+        }
+        match prior_gh {
+            Some(value) => unsafe { std::env::set_var("GH_TOKEN", value) },
+            None => unsafe { std::env::remove_var("GH_TOKEN") },
+        }
+        assert!(
+            request
+                .headers()
+                .get(reqwest::header::AUTHORIZATION)
+                .is_none(),
+            "custom API origins must never receive ambient GitHub credentials"
+        );
+    }
+
+    #[tokio::test]
+    async fn chunked_github_response_is_rejected_at_the_body_limit() {
+        let chunk = vec![b'a'; GITHUB_API_RESPONSE_CAP_BYTES + 1];
+        let mut response = format!(
+            "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n{:X}\r\n",
+            chunk.len()
+        )
+        .into_bytes();
+        response.extend_from_slice(&chunk);
+        response.extend_from_slice(b"\r\n0\r\n\r\n");
+        let (response, server) = response_from_raw_http(response).await;
+
+        let error = read_capped_github_json::<GithubRelease>(response)
+            .await
+            .expect_err("oversized chunked body must fail");
+        server.await.unwrap();
+
+        assert!(error.contains("exceeds"), "unexpected error: {error}");
+    }
+
+    #[test]
     fn newer_semver_basic() {
         assert!(is_newer_semver("1.58.0", "1.57.0"));
         assert!(is_newer_semver("2.0.0", "1.99.99"));
         assert!(is_newer_semver("1.57.1", "1.57.0"));
+    }
+
+    #[test]
+    fn stable_plugin_release_is_newer_than_its_matching_prerelease() {
+        assert!(is_newer_semver("1.0.0", "1.0.0-alpha.1"));
+        assert!(!is_newer_semver("1.0.0-alpha.1", "1.0.0"));
     }
 
     #[test]
@@ -486,6 +624,21 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join(".version-cache.json");
         assert!(read_cache_at(&path).is_err());
+    }
+
+    #[test]
+    fn read_rejects_an_oversized_version_cache() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(".version-cache.json");
+        let file = std::fs::File::create(&path).unwrap();
+        file.set_len(lpm_common::STATE_FILE_SIZE_CAP_BYTES + 1)
+            .unwrap();
+
+        let error = read_cache_at(&path).unwrap_err().to_string();
+        assert!(
+            error.contains("exceeds") || error.contains("too large"),
+            "oversized cache must fail at the bounded-read gate: {error}"
+        );
     }
 
     #[test]

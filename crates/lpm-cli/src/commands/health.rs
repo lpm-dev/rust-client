@@ -1,7 +1,11 @@
-use crate::install_ui;
+use std::time::{Duration, Instant};
+
 use lpm_common::LpmError;
 use lpm_registry::RegistryClient;
-use std::time::Instant;
+
+use crate::install_ui;
+
+const HEALTH_DEADLINE: Duration = Duration::from_secs(5);
 
 pub async fn run(
     client: &RegistryClient,
@@ -9,36 +13,55 @@ pub async fn run(
     json_output: bool,
 ) -> Result<(), LpmError> {
     let start = Instant::now();
-    let health_result = client.health_check().await;
+    let health_result =
+        tokio::time::timeout(HEALTH_DEADLINE, client.diagnostic_health_check_once())
+            .await
+            .unwrap_or_else(|_| {
+                Err(LpmError::Network(format!(
+                    "registry health check exceeded its {}-second deadline",
+                    HEALTH_DEADLINE.as_secs()
+                )))
+            });
     let elapsed_ms = start.elapsed().as_millis() as u64;
+    let display_registry_url = install_ui::safe_url_origin(registry_url);
 
-    if json_output {
-        let healthy = health_result?;
-        let json = serde_json::json!({
-            "success": true,
-            "healthy": healthy,
-            "registry_url": registry_url,
-            "response_time_ms": elapsed_ms,
-        });
-        println!("{}", serde_json::to_string_pretty(&json).unwrap());
-    } else {
-        match health_result {
-            Ok(true) => {
-                print_health_table(registry_url, true, elapsed_ms);
+    match health_result {
+        Ok(true) => {
+            if json_output {
+                let json = serde_json::json!({
+                    "success": true,
+                    "healthy": true,
+                    "registry_url": display_registry_url,
+                    "response_time_ms": elapsed_ms,
+                });
+                let output = serde_json::to_string_pretty(&json).map_err(LpmError::Json)?;
+                println!("{output}");
+            } else {
+                print_health_table(&display_registry_url, true, elapsed_ms);
                 install_ui::done("Registry is reachable");
             }
-            Ok(false) => {
-                print_health_table(registry_url, false, elapsed_ms);
-                install_ui::warn_untrusted(&format!("Registry at {} is unreachable", registry_url));
-                return Err(LpmError::Network(format!(
-                    "registry at {registry_url} is unreachable"
-                )));
+        }
+        Ok(false) => {
+            if !json_output {
+                print_health_table(&display_registry_url, false, elapsed_ms);
+                install_ui::warn_untrusted(&format!(
+                    "Registry at {} is unreachable",
+                    display_registry_url
+                ));
             }
-            Err(error) => {
-                print_health_table(registry_url, false, elapsed_ms);
-                install_ui::warn_untrusted(&format!("Registry at {} is unreachable", registry_url));
-                return Err(error);
+            return Err(LpmError::Network(format!(
+                "registry at {display_registry_url} is unreachable"
+            )));
+        }
+        Err(error) => {
+            if !json_output {
+                print_health_table(&display_registry_url, false, elapsed_ms);
+                install_ui::warn_untrusted(&format!(
+                    "Registry at {} is unreachable",
+                    display_registry_url
+                ));
             }
+            return Err(error);
         }
     }
 

@@ -1,6 +1,52 @@
 use crate::doctor_catalog;
+use std::collections::BinaryHeap;
 
 use super::check::Check;
+
+const ISSUE_PREVIEW_LIMIT: usize = 5;
+
+#[derive(Default)]
+struct IssuePreview {
+    total: usize,
+    smallest: BinaryHeap<String>,
+}
+
+impl IssuePreview {
+    fn push(&mut self, issue: String) {
+        self.total += 1;
+        if self.smallest.len() < ISSUE_PREVIEW_LIMIT {
+            self.smallest.push(issue);
+            return;
+        }
+        if self
+            .smallest
+            .peek()
+            .is_some_and(|largest_retained| issue < *largest_retained)
+        {
+            self.smallest.pop();
+            self.smallest.push(issue);
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.total == 0
+    }
+
+    fn len(&self) -> usize {
+        self.total
+    }
+
+    fn rendered(&self, separator: &str) -> (String, String) {
+        let mut preview: Vec<_> = self.smallest.iter().cloned().collect();
+        preview.sort_unstable();
+        let more = if self.total > preview.len() {
+            format!(", +{} more", self.total - preview.len())
+        } else {
+            String::new()
+        };
+        (preview.join(separator), more)
+    }
+}
 
 // ─── global-installs health checks ─────────────────────
 
@@ -25,13 +71,9 @@ pub(super) fn check_global_installs() -> Vec<Check> {
     let mut out = Vec::new();
 
     // 14. Manifest validity.
-    out.push(check_global_manifest_validity(&root));
-
-    // The rest only make sense if the manifest read cleanly; otherwise
-    // skip to avoid cascading errors that reference a corrupt
-    // manifest's rows. The `check_global_manifest_validity` check
-    // already surfaces the read error.
-    let Ok(manifest) = lpm_global::read_for(&root) else {
+    let (manifest_validity, manifest) = load_global_manifest(&root);
+    out.push(manifest_validity);
+    let Some(manifest) = manifest else {
         return out;
     };
 
@@ -47,6 +89,8 @@ pub(super) fn check_global_installs() -> Vec<Check> {
     // symlinks, so target validation needs a format-aware parser there.
     #[cfg(unix)]
     out.push(check_global_shim_targets(&root, &manifest));
+    #[cfg(windows)]
+    out.push(check_global_shim_targets(&root, &manifest));
 
     // 17. Install-root consistency.
     out.push(check_install_root_consistency(&root, &manifest));
@@ -60,23 +104,29 @@ pub(super) fn check_global_installs() -> Vec<Check> {
     out
 }
 
-fn check_global_manifest_validity(root: &lpm_common::LpmRoot) -> Check {
+fn load_global_manifest(root: &lpm_common::LpmRoot) -> (Check, Option<lpm_global::GlobalManifest>) {
     let path = root.global_manifest();
     if !path.exists() {
-        return Check::pass(
-            &doctor_catalog::GLOBAL_MANIFEST_ABSENT,
-            "not present (no global installs yet)",
+        return (
+            Check::pass(
+                &doctor_catalog::GLOBAL_MANIFEST_ABSENT,
+                "not present (no global installs yet)",
+            ),
+            Some(lpm_global::GlobalManifest::default()),
         );
     }
     let manifest = match lpm_global::read_for(root) {
         Ok(m) => m,
         Err(e) => {
-            return Check::fail(
-                &doctor_catalog::GLOBAL_MANIFEST_CORRUPT,
-                &format!(
-                    "{}: {e}. Fix hint: inspect the file or delete it to reset the global tree.",
-                    path.display(),
+            return (
+                Check::fail(
+                    &doctor_catalog::GLOBAL_MANIFEST_CORRUPT,
+                    &format!(
+                        "{}: {e}. Fix hint: inspect the file or delete it to reset the global tree.",
+                        path.display(),
+                    ),
                 ),
+                None,
             );
         }
     };
@@ -93,13 +143,15 @@ fn check_global_manifest_validity(root: &lpm_common::LpmRoot) -> Check {
     //
     // Invariants:
     //   - every `packages.*.root` must pass `validated_install_root_relative`
+    //   - every `pending.*` root and command must pass the same validation
+    //     as active packages because recovery treats these rows as authoritative
     //   - every `aliases.<name>` must reference a package present in
     //     `packages` AND a bin declared in that package's `commands`
     //     (or the package's bin emission list — but `commands` is the
     //     post-resolution authoritative list, so we use that)
     //   - every `tombstones[]` entry must pass the same shape check
     let global_root = root.global_root();
-    let mut issues: Vec<String> = Vec::new();
+    let mut issues = IssuePreview::default();
 
     for (pkg_name, entry) in &manifest.packages {
         let root_check = if entry.source == lpm_global::PackageSource::LocalLink {
@@ -114,8 +166,53 @@ fn check_global_manifest_validity(root: &lpm_common::LpmRoot) -> Check {
                 lpm_common::sanitize_for_terminal(&entry.root),
             ));
         }
+        for command in &entry.commands {
+            if let Err(reason) = lpm_global::shim::validate_command_name(command) {
+                issues.push(format!(
+                    "package '{}': command {:?} structurally invalid ({reason})",
+                    lpm_common::sanitize_for_terminal(pkg_name),
+                    lpm_common::sanitize_for_terminal(command),
+                ));
+            }
+        }
+    }
+    for (pkg_name, entry) in &manifest.pending {
+        let root_check = if entry.source == lpm_global::PackageSource::LocalLink {
+            lpm_global::validated_local_link_root_relative(&global_root, &entry.root)
+        } else {
+            lpm_global::validated_install_root_relative(&global_root, &entry.root)
+        };
+        if let Err(reason) = root_check {
+            issues.push(format!(
+                "pending package '{}': root {:?} structurally invalid ({reason})",
+                lpm_common::sanitize_for_terminal(pkg_name),
+                lpm_common::sanitize_for_terminal(&entry.root),
+            ));
+        }
+        for command in &entry.commands {
+            if let Err(reason) = lpm_global::shim::validate_command_name(command) {
+                issues.push(format!(
+                    "pending package '{}': command {:?} structurally invalid ({reason})",
+                    lpm_common::sanitize_for_terminal(pkg_name),
+                    lpm_common::sanitize_for_terminal(command),
+                ));
+            }
+        }
     }
     for (alias_name, alias_entry) in &manifest.aliases {
+        if let Err(reason) = lpm_global::shim::validate_command_name(alias_name) {
+            issues.push(format!(
+                "alias {:?} structurally invalid ({reason})",
+                lpm_common::sanitize_for_terminal(alias_name),
+            ));
+        }
+        if let Err(reason) = lpm_global::shim::validate_command_name(&alias_entry.bin) {
+            issues.push(format!(
+                "alias '{}': bin {:?} structurally invalid ({reason})",
+                lpm_common::sanitize_for_terminal(alias_name),
+                lpm_common::sanitize_for_terminal(&alias_entry.bin),
+            ));
+        }
         let Some(owner) = manifest.packages.get(&alias_entry.package) else {
             issues.push(format!(
                 "alias '{}': package '{}' is not installed (dangling alias row)",
@@ -143,50 +240,58 @@ fn check_global_manifest_validity(root: &lpm_common::LpmRoot) -> Check {
     }
 
     if !issues.is_empty() {
-        let preview: Vec<String> = issues.iter().take(5).cloned().collect();
-        let more = if issues.len() > preview.len() {
-            format!(", +{} more", issues.len() - preview.len())
-        } else {
-            String::new()
-        };
-        return Check::fail(
-            &doctor_catalog::GLOBAL_MANIFEST_STRUCTURALLY_INVALID,
-            &format!(
-                "{}: {} structural issue{} ({}{}). Fix hint: inspect the file or hand-repair the \
-                 offending rows.",
-                path.display(),
-                issues.len(),
-                if issues.len() == 1 { "" } else { "s" },
-                preview.join("; "),
-                more,
+        let (preview, more) = issues.rendered("; ");
+        return (
+            Check::fail(
+                &doctor_catalog::GLOBAL_MANIFEST_STRUCTURALLY_INVALID,
+                &format!(
+                    "{}: {} structural issue{} ({}{}). Fix hint: inspect the file or hand-repair the \
+                     offending rows.",
+                    path.display(),
+                    issues.len(),
+                    if issues.len() == 1 { "" } else { "s" },
+                    preview,
+                    more,
+                ),
             ),
+            None,
         );
     }
 
-    Check::pass(
-        &doctor_catalog::GLOBAL_MANIFEST_VALID,
-        &format!(
-            "{} package{}, {} alias{}, {} tombstone{}",
-            manifest.packages.len(),
-            if manifest.packages.len() == 1 {
-                ""
-            } else {
-                "s"
-            },
-            manifest.aliases.len(),
-            if manifest.aliases.len() == 1 {
-                ""
-            } else {
-                "es"
-            },
-            manifest.tombstones.len(),
-            if manifest.tombstones.len() == 1 {
-                ""
-            } else {
-                "s"
-            },
+    (
+        Check::pass(
+            &doctor_catalog::GLOBAL_MANIFEST_VALID,
+            &format!(
+                "{} package{}, {} pending recovery row{}, {} alias{}, {} tombstone{}",
+                manifest.packages.len(),
+                if manifest.packages.len() == 1 {
+                    ""
+                } else {
+                    "s"
+                },
+                manifest.pending.len(),
+                if manifest.pending.len() == 1 { "" } else { "s" },
+                manifest.aliases.len(),
+                if manifest.aliases.len() == 1 {
+                    ""
+                } else {
+                    "es"
+                },
+                manifest.tombstones.len(),
+                if manifest.tombstones.len() == 1 {
+                    ""
+                } else {
+                    "s"
+                },
+            ),
         ),
+        Some(manifest),
     )
+}
+
+#[cfg(test)]
+fn check_global_manifest_validity(root: &lpm_common::LpmRoot) -> Check {
+    load_global_manifest(root).0
 }
 
 fn check_bin_dir_on_path(root: &lpm_common::LpmRoot) -> Check {
@@ -222,14 +327,14 @@ fn check_orphaned_bin_shims(
     // A shim is a file whose stem matches a package command or alias
     // name. On Windows, any member of the triple (`.cmd`, `.ps1`, no
     // suffix) counts; on Unix just the bare name.
-    let owned_names: std::collections::HashSet<String> = manifest
+    let owned_names: std::collections::HashSet<&str> = manifest
         .packages
         .values()
-        .flat_map(|e| e.commands.iter().cloned())
-        .chain(manifest.aliases.keys().cloned())
+        .flat_map(|e| e.commands.iter().map(String::as_str))
+        .chain(manifest.aliases.keys().map(String::as_str))
         .collect();
 
-    let mut orphans: Vec<String> = Vec::new();
+    let mut orphans = IssuePreview::default();
     let Ok(entries) = std::fs::read_dir(&bin_dir) else {
         return Check::warn(
             &doctor_catalog::GLOBAL_SHIMS_UNREADABLE,
@@ -238,20 +343,20 @@ fn check_orphaned_bin_shims(
     };
     for entry in entries.flatten() {
         let name_os = entry.file_name();
-        let Some(name_str) = name_os.to_str() else {
-            continue;
-        };
+        let name = name_os.to_string_lossy();
+        let name_str = name.as_ref();
         // Derive stem: strip a single known extension if present.
+        #[cfg(windows)]
         let stem = name_str
             .strip_suffix(".cmd")
             .or_else(|| name_str.strip_suffix(".ps1"))
             .unwrap_or(name_str);
+        #[cfg(not(windows))]
+        let stem = name_str;
         if !owned_names.contains(stem) {
             orphans.push(name_str.to_string());
         }
     }
-    orphans.sort();
-    orphans.dedup();
 
     if orphans.is_empty() {
         Check::pass(
@@ -264,12 +369,7 @@ fn check_orphaned_bin_shims(
             ),
         )
     } else {
-        let preview: Vec<String> = orphans.iter().take(5).cloned().collect();
-        let more = if orphans.len() > preview.len() {
-            format!(", +{} more", orphans.len() - preview.len())
-        } else {
-            String::new()
-        };
+        let (preview, more) = orphans.rendered(", ");
         Check::warn(
             &doctor_catalog::GLOBAL_SHIMS_ORPHANS,
             &format!(
@@ -279,7 +379,7 @@ fn check_orphaned_bin_shims(
                 orphans.len(),
                 if orphans.len() == 1 { "" } else { "s" },
                 bin_dir.display(),
-                preview.join(", "),
+                preview,
                 more,
             ),
         )
@@ -359,16 +459,16 @@ fn check_global_shim_targets(
         );
     }
 
-    let mut expectations: Vec<(String, std::path::PathBuf)> = Vec::new();
-    // Direct commands: bin/<cmd> → <install-root>/node_modules/.bin/<cmd>
+    let mut mismatches = IssuePreview::default();
+    let mut expectation_count = 0usize;
     for entry in manifest.packages.values() {
         let install_root = root.global_root().join(&entry.root);
         let install_bin = install_root.join("node_modules").join(".bin");
         for cmd in &entry.commands {
-            expectations.push((cmd.clone(), install_bin.join(cmd)));
+            expectation_count += 1;
+            check_unix_shim_target(&bin_dir, cmd, &install_bin.join(cmd), &mut mismatches);
         }
     }
-    // Aliases: bin/<alias_name> → <pkg's install-root>/node_modules/.bin/<alias.bin>
     for (alias_name, alias_entry) in &manifest.aliases {
         let Some(owner) = manifest.packages.get(&alias_entry.package) else {
             // Alias row pointing at a non-existent package is its own
@@ -378,72 +478,25 @@ fn check_global_shim_targets(
         };
         let install_root = root.global_root().join(&owner.root);
         let install_bin = install_root.join("node_modules").join(".bin");
-        expectations.push((alias_name.clone(), install_bin.join(&alias_entry.bin)));
-    }
-
-    let mut mismatches: Vec<String> = Vec::new();
-    for (shim_name, expected_target) in &expectations {
-        let shim_path = bin_dir.join(shim_name);
-        let meta = match std::fs::symlink_metadata(&shim_path) {
-            Ok(m) => m,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                mismatches.push(format!(
-                    "{}: shim missing (manifest expects symlink)",
-                    lpm_common::sanitize_for_terminal(shim_name)
-                ));
-                continue;
-            }
-            Err(e) => {
-                mismatches.push(format!(
-                    "{}: cannot stat ({e})",
-                    lpm_common::sanitize_for_terminal(shim_name)
-                ));
-                continue;
-            }
-        };
-        if !meta.file_type().is_symlink() {
-            mismatches.push(format!(
-                "{}: regular file at shim path (expected symlink — possible PATH hijack)",
-                lpm_common::sanitize_for_terminal(shim_name)
-            ));
-            continue;
-        }
-        match std::fs::read_link(&shim_path) {
-            Ok(actual_target) => {
-                if actual_target != *expected_target {
-                    mismatches.push(format!(
-                        "{}: symlink points at {} (expected {})",
-                        lpm_common::sanitize_for_terminal(shim_name),
-                        lpm_common::sanitize_for_terminal(&actual_target.display().to_string()),
-                        lpm_common::sanitize_for_terminal(&expected_target.display().to_string()),
-                    ));
-                }
-            }
-            Err(e) => {
-                mismatches.push(format!(
-                    "{}: readlink failed ({e})",
-                    lpm_common::sanitize_for_terminal(shim_name)
-                ));
-            }
-        }
+        expectation_count += 1;
+        check_unix_shim_target(
+            &bin_dir,
+            alias_name,
+            &install_bin.join(&alias_entry.bin),
+            &mut mismatches,
+        );
     }
 
     if mismatches.is_empty() {
         return Check::pass(
             &doctor_catalog::GLOBAL_SHIM_TARGETS_HEALTHY,
             &format!(
-                "{} owned shim{} verified (symlink + target)",
-                expectations.len(),
-                if expectations.len() == 1 { "" } else { "s" },
+                "{expectation_count} owned shim{} verified (symlink + target)",
+                if expectation_count == 1 { "" } else { "s" },
             ),
         );
     }
-    let preview: Vec<String> = mismatches.iter().take(5).cloned().collect();
-    let more = if mismatches.len() > preview.len() {
-        format!(", +{} more", mismatches.len() - preview.len())
-    } else {
-        String::new()
-    };
+    let (preview, more) = mismatches.rendered("; ");
     Check::warn(
         &doctor_catalog::GLOBAL_SHIM_TARGETS_STALE,
         &format!(
@@ -452,7 +505,140 @@ fn check_global_shim_targets(
              `~/.lpm/bin/<name>` if the mismatch is unexpected.",
             mismatches.len(),
             if mismatches.len() == 1 { "" } else { "s" },
-            preview.join("; "),
+            preview,
+            more,
+        ),
+    )
+}
+
+#[cfg(unix)]
+fn check_unix_shim_target(
+    bin_dir: &std::path::Path,
+    shim_name: &str,
+    expected_target: &std::path::Path,
+    mismatches: &mut IssuePreview,
+) {
+    let shim_path = bin_dir.join(shim_name);
+    let meta = match std::fs::symlink_metadata(&shim_path) {
+        Ok(m) => m,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            mismatches.push(format!(
+                "{}: shim missing (manifest expects symlink)",
+                lpm_common::sanitize_for_terminal(shim_name)
+            ));
+            return;
+        }
+        Err(e) => {
+            mismatches.push(format!(
+                "{}: cannot stat ({e})",
+                lpm_common::sanitize_for_terminal(shim_name)
+            ));
+            return;
+        }
+    };
+    if !meta.file_type().is_symlink() {
+        mismatches.push(format!(
+            "{}: regular file at shim path (expected symlink — possible PATH hijack)",
+            lpm_common::sanitize_for_terminal(shim_name)
+        ));
+        return;
+    }
+    match std::fs::read_link(&shim_path) {
+        Ok(actual_target) => {
+            if actual_target != expected_target {
+                mismatches.push(format!(
+                    "{}: symlink points at {} (expected {})",
+                    lpm_common::sanitize_for_terminal(shim_name),
+                    lpm_common::sanitize_for_terminal(&actual_target.display().to_string()),
+                    lpm_common::sanitize_for_terminal(&expected_target.display().to_string()),
+                ));
+            }
+        }
+        Err(e) => {
+            mismatches.push(format!(
+                "{}: readlink failed ({e})",
+                lpm_common::sanitize_for_terminal(shim_name)
+            ));
+        }
+    }
+}
+
+#[cfg(windows)]
+fn check_global_shim_targets(
+    root: &lpm_common::LpmRoot,
+    manifest: &lpm_global::GlobalManifest,
+) -> Check {
+    let bin_dir = root.bin_dir();
+    if !bin_dir.exists() {
+        return Check::pass(
+            &doctor_catalog::GLOBAL_SHIM_TARGETS_HEALTHY,
+            "bin dir does not exist yet",
+        );
+    }
+
+    let mut mismatches = IssuePreview::default();
+    let mut expectation_count = 0usize;
+    for entry in manifest.packages.values() {
+        let install_bin = root
+            .global_root()
+            .join(&entry.root)
+            .join("node_modules")
+            .join(".bin");
+        for command in &entry.commands {
+            expectation_count += 1;
+            if let Err(error) = lpm_global::shim::verify_windows_shim_triple(
+                &bin_dir,
+                command,
+                &install_bin.join(command),
+            ) {
+                mismatches.push(format!(
+                    "{}: {}",
+                    lpm_common::sanitize_for_terminal(command),
+                    lpm_common::sanitize_for_terminal(&error.to_string()),
+                ));
+            }
+        }
+    }
+    for (alias_name, alias_entry) in &manifest.aliases {
+        let Some(owner) = manifest.packages.get(&alias_entry.package) else {
+            continue;
+        };
+        let target = root
+            .global_root()
+            .join(&owner.root)
+            .join("node_modules")
+            .join(".bin")
+            .join(&alias_entry.bin);
+        expectation_count += 1;
+        if let Err(error) =
+            lpm_global::shim::verify_windows_shim_triple(&bin_dir, alias_name, &target)
+        {
+            mismatches.push(format!(
+                "{}: {}",
+                lpm_common::sanitize_for_terminal(alias_name),
+                lpm_common::sanitize_for_terminal(&error.to_string()),
+            ));
+        }
+    }
+
+    if mismatches.is_empty() {
+        return Check::pass(
+            &doctor_catalog::GLOBAL_SHIM_TARGETS_HEALTHY,
+            &format!(
+                "{} owned shim triple{} verified",
+                expectation_count,
+                if expectation_count == 1 { "" } else { "s" },
+            ),
+        );
+    }
+    let (preview, more) = mismatches.rendered("; ");
+    Check::warn(
+        &doctor_catalog::GLOBAL_SHIM_TARGETS_STALE,
+        &format!(
+            "{} shim triple{} with altered or stale content ({}{}). Fix hint: re-run `lpm install -g <pkg>` to reclaim the shim.",
+            mismatches.len(),
+            if mismatches.len() == 1 { "" } else { "s" },
+            preview,
             more,
         ),
     )
@@ -486,8 +672,8 @@ fn check_install_root_consistency(
     // — detailed diagnosis lives in `lpm install -g <pkg>`'s error
     // path, not in doctor's one-line-per-check surface.
     use lpm_global::InstallRootStatus;
-    let mut missing: Vec<String> = Vec::new();
-    let mut not_ready: Vec<(String, String)> = Vec::new();
+    let mut missing = IssuePreview::default();
+    let mut not_ready = IssuePreview::default();
     let mut registry_roots = 0usize;
     let mut local_link_roots = 0usize;
     for (name, entry) in &manifest.packages {
@@ -506,9 +692,9 @@ fn check_install_root_consistency(
                 .cloned()
                 .collect();
             if !missing_shims.is_empty() {
-                not_ready.push((
-                    name.clone(),
-                    format!("LocalLinkMissingShims({})", missing_shims.join(", ")),
+                not_ready.push(format!(
+                    "{name} [LocalLinkMissingShims({})]",
+                    missing_shims.join(", ")
                 ));
             }
             continue;
@@ -520,18 +706,16 @@ fn check_install_root_consistency(
             Err(e) => {
                 // I/O error reading the root (permissions, etc.) —
                 // treat as not-ready with the error as reason.
-                not_ready.push((name.clone(), format!("validate I/O error: {e}")));
+                not_ready.push(format!("{name} [validate I/O error: {e}]"));
                 continue;
             }
         };
         match status {
             InstallRootStatus::Ready { .. } => {} // healthy
             InstallRootStatus::RootMissing => missing.push(name.clone()),
-            other => not_ready.push((name.clone(), format!("{other:?}"))),
+            other => not_ready.push(format!("{name} [{other:?}]")),
         }
     }
-    missing.sort();
-    not_ready.sort_by(|a, b| a.0.cmp(&b.0));
 
     if missing.is_empty() && not_ready.is_empty() {
         return Check::pass(
@@ -547,27 +731,19 @@ fn check_install_root_consistency(
     }
     let mut issues: Vec<String> = Vec::new();
     if !missing.is_empty() {
-        issues.push(format!("{} missing: {}", missing.len(), missing.join(", ")));
+        let (preview, more) = missing.rendered(", ");
+        issues.push(format!("{} missing: {}{}", missing.len(), preview, more));
     }
     if !not_ready.is_empty() {
         // List a few specific reasons so the user sees WHICH check
         // (marker vs bin target vs lockfile) failed, not just
         // "not ready." Authoritative diagnosis still lives in the
         // install pipeline; doctor's job is to flag + name.
-        let preview: Vec<String> = not_ready
-            .iter()
-            .take(5)
-            .map(|(pkg, reason)| format!("{pkg} [{reason}]"))
-            .collect();
-        let more = if not_ready.len() > preview.len() {
-            format!(", +{} more", not_ready.len() - preview.len())
-        } else {
-            String::new()
-        };
+        let (preview, more) = not_ready.rendered(", ");
         issues.push(format!(
             "{} not ready: {}{}",
             not_ready.len(),
-            preview.join(", "),
+            preview,
             more,
         ));
     }
@@ -590,7 +766,7 @@ mod tests {
     use chrono::Utc;
     use lpm_common::LpmRoot;
     use lpm_global::{
-        GlobalManifest, InstallReadyMarker, PackageEntry, PackageSource, write_marker,
+        GlobalManifest, InstallReadyMarker, PackageEntry, PackageSource, PendingEntry, write_marker,
     };
 
     fn pkg_entry(rel_root: &str) -> PackageEntry {
@@ -603,6 +779,34 @@ mod tests {
             root: rel_root.into(),
             commands: vec!["bin-a".into()],
         }
+    }
+
+    fn pending_entry(rel_root: &str, commands: Vec<String>) -> PendingEntry {
+        PendingEntry {
+            saved_spec: "^1".into(),
+            resolved: "1.0.0".into(),
+            integrity: "sha512-z".into(),
+            source: PackageSource::UpstreamNpm,
+            started_at: Utc::now(),
+            root: rel_root.into(),
+            commands,
+            replaces_version: None,
+        }
+    }
+
+    #[test]
+    fn issue_preview_retains_only_the_five_lexicographically_smallest_items() {
+        let mut preview = IssuePreview::default();
+        for issue in ["z", "b", "f", "a", "d", "c", "e"] {
+            preview.push(issue.to_string());
+        }
+
+        assert_eq!(preview.len(), 7);
+        assert_eq!(preview.smallest.len(), ISSUE_PREVIEW_LIMIT);
+        assert_eq!(
+            preview.rendered(", "),
+            ("a, b, c, d, e".into(), ", +2 more".into())
+        );
     }
 
     #[test]
@@ -697,6 +901,25 @@ mod tests {
         assert!(matches!(check.severity, Severity::Warn));
         assert!(check.detail.contains("leftover-ghost"));
         assert!(check.detail.contains("Fix hint"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_shim_with_windows_suffix_is_not_misclassified_as_an_owned_bare_shim() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = LpmRoot::from_dir(tmp.path());
+        let bin_dir = root.bin_dir();
+        std::fs::create_dir_all(&bin_dir).unwrap();
+        std::fs::write(bin_dir.join("bin-a.cmd"), b"").unwrap();
+
+        let mut manifest = GlobalManifest::default();
+        manifest
+            .packages
+            .insert("pkg".into(), pkg_entry("installs/pkg@1.0.0"));
+        let check = check_orphaned_bin_shims(&root, &manifest);
+
+        assert!(matches!(check.severity, Severity::Warn));
+        assert!(check.detail.contains("bin-a.cmd"), "{}", check.detail);
     }
 
     /// The shim-target verifier passes when every owned shim points at
@@ -804,6 +1027,74 @@ mod tests {
         assert!(matches!(check.severity, Severity::Fail), "{}", check.detail);
         assert!(check.detail.contains("structurally invalid"));
         assert!(check.detail.contains("../escape"));
+    }
+
+    #[test]
+    fn check_global_installs_stops_after_a_structurally_invalid_manifest() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = LpmRoot::from_dir(tmp.path());
+        std::fs::create_dir_all(root.global_root()).unwrap();
+        let mut manifest = GlobalManifest::default();
+        let mut entry = pkg_entry("../outside");
+        entry.commands = vec!["../outside-command".into()];
+        manifest.packages.insert("evilpkg".into(), entry);
+        lpm_global::write_for(&root, &manifest).unwrap();
+        let _env =
+            crate::test_env::ScopedEnv::set([("LPM_HOME", tmp.path().as_os_str().to_os_string())]);
+
+        let checks = check_global_installs();
+
+        assert_eq!(
+            checks.len(),
+            1,
+            "invalid rows must stop downstream traversal"
+        );
+        assert_eq!(checks[0].code(), "global_manifest_structurally_invalid");
+    }
+
+    #[test]
+    fn check_global_manifest_validity_rejects_unsafe_command_and_alias_names() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = LpmRoot::from_dir(tmp.path());
+        std::fs::create_dir_all(root.global_root()).unwrap();
+        let mut manifest = GlobalManifest::default();
+        let mut entry = pkg_entry("installs/pkg@1.0.0");
+        entry.commands = vec!["../outside-command".into()];
+        manifest.packages.insert("pkg".into(), entry);
+        manifest.aliases.insert(
+            "../outside-alias".into(),
+            lpm_global::AliasEntry {
+                package: "pkg".into(),
+                bin: "../outside-command".into(),
+            },
+        );
+        lpm_global::write_for(&root, &manifest).unwrap();
+
+        let check = check_global_manifest_validity(&root);
+
+        assert!(matches!(check.severity, Severity::Fail), "{}", check.detail);
+        assert!(check.detail.contains("command"), "{}", check.detail);
+        assert!(check.detail.contains("alias"), "{}", check.detail);
+    }
+
+    #[test]
+    fn check_global_manifest_validity_rejects_unsafe_pending_roots_and_commands() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = LpmRoot::from_dir(tmp.path());
+        std::fs::create_dir_all(root.global_root()).unwrap();
+        let mut manifest = GlobalManifest::default();
+        manifest.pending.insert(
+            "pending-pkg".into(),
+            pending_entry("../outside", vec!["../outside-command".into()]),
+        );
+        lpm_global::write_for(&root, &manifest).unwrap();
+
+        let (check, loaded) = load_global_manifest(&root);
+
+        assert_eq!(check.code(), "global_manifest_structurally_invalid");
+        assert!(matches!(check.severity, Severity::Fail));
+        assert!(check.detail.contains("pending"), "{}", check.detail);
+        assert!(loaded.is_none(), "unsafe pending rows must stop traversal");
     }
 
     /// A dangling alias row must also fail the structural check.

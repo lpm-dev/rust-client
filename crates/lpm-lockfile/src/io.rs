@@ -382,34 +382,50 @@ pub fn ensure_gitattributes(project_dir: &Path) -> Result<(), LockfileError> {
     let gitattributes = project_dir.join(".gitattributes");
     let marker = "lpm.lockb binary";
 
-    if gitattributes.exists() {
-        let content = std::fs::read_to_string(&gitattributes)
-            .map_err(|e| LockfileError::Io(format!("failed to read .gitattributes: {e}")))?;
-
-        // Already has the entry
-        if content.lines().any(|line| line.trim() == marker) {
-            return Ok(());
+    let content = match std::fs::symlink_metadata(&gitattributes) {
+        Ok(metadata) => {
+            if lpm_common::is_symlink_or_junction(&metadata) || !metadata.is_file() {
+                return Err(LockfileError::Io(
+                    ".gitattributes must be a regular file, not a link or special file".into(),
+                ));
+            }
+            lpm_common::read_text_file_capped_nofollow(
+                &gitattributes,
+                lpm_common::CONFIG_FILE_SIZE_CAP_BYTES,
+            )
+            .map_err(|error| {
+                LockfileError::Io(format!("failed to read .gitattributes safely: {error}"))
+            })?
         }
-
-        // Append atomically using OpenOptions::append (no file replacement on crash)
-        use std::io::Write;
-        let mut file = std::fs::OpenOptions::new()
-            .append(true)
-            .open(&gitattributes)
-            .map_err(|e| LockfileError::Io(format!("failed to open .gitattributes: {e}")))?;
-
-        // Ensure newline before our entry if the file doesn't end with one
-        if !content.ends_with('\n') {
-            writeln!(file)
-                .map_err(|e| LockfileError::Io(format!("failed to write .gitattributes: {e}")))?;
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(error) => {
+            return Err(LockfileError::Io(format!(
+                "failed to inspect .gitattributes: {error}"
+            )));
         }
-        writeln!(file, "\n# lpm\n{marker}")
-            .map_err(|e| LockfileError::Io(format!("failed to write .gitattributes: {e}")))?;
-    } else {
-        // Create new
-        std::fs::write(&gitattributes, format!("# lpm\n{marker}\n"))
-            .map_err(|e| LockfileError::Io(format!("failed to create .gitattributes: {e}")))?;
+    };
+
+    if content.lines().any(|line| line.trim() == marker) {
+        return Ok(());
     }
+
+    let mut updated = String::with_capacity(content.len() + marker.len() + 9);
+    updated.push_str(&content);
+    if !content.is_empty() && !content.ends_with('\n') {
+        updated.push('\n');
+    }
+    if !content.is_empty() {
+        updated.push('\n');
+    }
+    updated.push_str("# lpm\n");
+    updated.push_str(marker);
+    updated.push('\n');
+
+    lpm_common::write_file_atomic(&gitattributes, updated).map_err(|error| {
+        LockfileError::Io(format!(
+            "failed to update .gitattributes atomically: {error}"
+        ))
+    })?;
 
     Ok(())
 }

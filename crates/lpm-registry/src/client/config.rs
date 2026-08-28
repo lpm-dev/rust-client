@@ -18,6 +18,30 @@ struct PreparedTlsRoots {
 }
 
 impl RegistryClient {
+    /// Return the source label for credentials this client will attach.
+    pub fn auth_source_label(&self) -> Result<Option<&'static str>, LpmError> {
+        if let Some(session) = &self.session
+            && let Some(source) = session.current_source()?
+        {
+            return Ok(Some(source.label()));
+        }
+        Ok(self
+            .token
+            .as_ref()
+            .filter(|token| !token.expose_secret().is_empty())
+            .map(|_| "configured token"))
+    }
+
+    pub fn diagnostic_auth_storage_status(
+        &self,
+        registry_url: &str,
+    ) -> lpm_auth::AuthStorageStatus {
+        self.session.as_ref().map_or_else(
+            || lpm_auth::auth_storage_status(registry_url),
+            |session| session.diagnostic_storage_status(),
+        )
+    }
+
     pub(super) fn worker_metadata_http3_enabled_from_env() -> bool {
         Self::worker_metadata_http3_enabled_for_lpm_http(std::env::var("LPM_HTTP").ok().as_deref())
     }

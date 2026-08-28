@@ -33,7 +33,7 @@ mod build_cache;
 mod hints;
 mod package_dir;
 pub(super) mod process_tree;
-mod sandbox_env;
+pub(in crate::commands) mod sandbox_env;
 mod script_execution;
 mod scripts;
 mod trust;

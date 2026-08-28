@@ -350,3 +350,29 @@ async fn empty_bearer_never_appears_on_the_wire() {
              which the server logs as a malformed-auth attempt. Got: {auth_header:?}"
     );
 }
+
+#[tokio::test]
+async fn anonymous_health_probe_does_not_forward_url_userinfo_as_basic_auth() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/registry/health"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&server)
+        .await;
+    let credentialed = server
+        .uri()
+        .replacen("://", "://doctor-user:doctor-secret@", 1);
+    let client = RegistryClient::new().with_base_url(credentialed);
+
+    assert!(client.diagnostic_health_check_once().await.unwrap());
+
+    let requests = server.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 1);
+    assert!(
+        requests[0].headers.get("authorization").is_none(),
+        "an anonymous health probe must not synthesize Basic auth from URL userinfo"
+    );
+}

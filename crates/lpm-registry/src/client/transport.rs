@@ -93,7 +93,7 @@ impl RegistryClient {
         self.send_once_preserving_status(request).await
     }
 
-    async fn send_once_preserving_status(
+    pub(super) async fn send_once_preserving_status(
         &self,
         request: reqwest::RequestBuilder,
     ) -> Result<reqwest::Response, LpmError> {
@@ -107,6 +107,29 @@ impl RegistryClient {
             .execute(request)
             .await
             .map_err(|error| LpmError::Network(lpm_http::error_chain(&error)))
+    }
+
+    /// Issue one anonymous health request without install-grade retries.
+    /// Diagnostic callers apply their own whole-operation deadline.
+    pub async fn diagnostic_health_check_once(&self) -> Result<bool, LpmError> {
+        let raw_url = format!("{}/api/registry/health", self.base_url);
+        let mut parsed = reqwest::Url::parse(&raw_url)
+            .map_err(|error| LpmError::Network(format!("invalid registry health URL: {error}")))?;
+        parsed
+            .set_username("")
+            .map_err(|_| LpmError::Network("registry health URL cannot contain userinfo".into()))?;
+        parsed
+            .set_password(None)
+            .map_err(|_| LpmError::Network("registry health URL cannot contain userinfo".into()))?;
+        let url = parsed.to_string();
+        let request = self
+            .build_get_with_posture(&url, AuthPosture::AnonymousOnly)
+            .await?;
+        Ok(self
+            .send_once_preserving_status(request)
+            .await?
+            .status()
+            .is_success())
     }
 
     /// POST JSON once, refresh on a bearer 401, then retry the operation once.

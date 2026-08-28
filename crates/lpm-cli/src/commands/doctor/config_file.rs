@@ -1,8 +1,64 @@
+use std::collections::BinaryHeap;
 use std::path::Path;
 
 use crate::doctor_catalog;
 
 use super::check::Check;
+
+const ISSUE_PREVIEW_LIMIT: usize = 5;
+
+#[derive(Default)]
+struct IssuePreview {
+    total: usize,
+    smallest: BinaryHeap<String>,
+}
+
+impl IssuePreview {
+    fn push(&mut self, issue: String) {
+        self.total += 1;
+        if self.smallest.len() < ISSUE_PREVIEW_LIMIT {
+            self.smallest.push(issue);
+        } else if self.smallest.peek().is_some_and(|largest| issue < *largest) {
+            self.smallest.pop();
+            self.smallest.push(issue);
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.total == 0
+    }
+
+    fn len(&self) -> usize {
+        self.total
+    }
+
+    fn rendered(&self) -> String {
+        let mut preview: Vec<_> = self.smallest.iter().map(String::as_str).collect();
+        preview.sort_unstable();
+        let mut rendered = preview.join("; ");
+        if self.total > preview.len() {
+            rendered.push_str(&format!("; +{} more", self.total - preview.len()));
+        }
+        rendered
+    }
+}
+
+pub(super) struct DiagnosticLpmJson {
+    pub(super) check: Option<Check>,
+    pub(super) config: Option<lpm_runner::lpm_json::LpmJsonConfig>,
+    node_spec: Option<String>,
+    bun_spec: Option<String>,
+}
+
+impl DiagnosticLpmJson {
+    pub(super) fn node_spec(&self) -> Option<&str> {
+        self.node_spec.as_deref()
+    }
+
+    pub(super) fn bun_spec(&self) -> Option<&str> {
+        self.bun_spec.as_deref()
+    }
+}
 
 /// Validate lpm.json structure and known fields.
 ///
@@ -14,19 +70,31 @@ use super::check::Check;
 /// - tools reference known managed tools
 /// - services have required command field
 /// - Falls back to serde deserialization for type-level validation
-pub(super) fn validate_lpm_json(project_dir: &Path) -> Option<Check> {
+pub(super) fn load_lpm_json(project_dir: &Path) -> DiagnosticLpmJson {
     let lpm_json_path = project_dir.join("lpm.json");
-    let content = match lpm_common::read_text_file_capped(
+    let content = match lpm_common::read_text_file_capped_nofollow(
         &lpm_json_path,
         lpm_common::CONFIG_FILE_SIZE_CAP_BYTES,
     ) {
         Ok(c) => c,
-        Err(lpm_common::BoundedReadError::NotFound { .. }) => return None,
+        Err(lpm_common::BoundedReadError::NotFound { .. }) => {
+            return DiagnosticLpmJson {
+                check: None,
+                config: None,
+                node_spec: None,
+                bun_spec: None,
+            };
+        }
         Err(e) => {
-            return Some(Check::fail(
-                &doctor_catalog::LPM_JSON_UNREADABLE,
-                &format!("cannot read: {e}"),
-            ));
+            return DiagnosticLpmJson {
+                check: Some(Check::fail(
+                    &doctor_catalog::LPM_JSON_UNREADABLE,
+                    &format!("cannot read: {e}"),
+                )),
+                config: None,
+                node_spec: None,
+                bun_spec: None,
+            };
         }
     };
 
@@ -34,24 +102,36 @@ pub(super) fn validate_lpm_json(project_dir: &Path) -> Option<Check> {
     let doc: serde_json::Value = match serde_json::from_str(&content) {
         Ok(v) => v,
         Err(e) => {
-            return Some(Check::fail(
-                &doctor_catalog::LPM_JSON_INVALID_SYNTAX,
-                &format!("invalid JSON at line {} — {}", e.line(), e),
-            ));
+            return DiagnosticLpmJson {
+                check: Some(Check::fail(
+                    &doctor_catalog::LPM_JSON_INVALID_SYNTAX,
+                    &format!("invalid JSON at line {} — {}", e.line(), e),
+                )),
+                config: None,
+                node_spec: None,
+                bun_spec: None,
+            };
         }
     };
 
     let obj = match doc.as_object() {
         Some(o) => o,
         None => {
-            return Some(Check::fail(
-                &doctor_catalog::LPM_JSON_NOT_OBJECT,
-                "must be a JSON object, not an array or primitive",
-            ));
+            return DiagnosticLpmJson {
+                check: Some(Check::fail(
+                    &doctor_catalog::LPM_JSON_NOT_OBJECT,
+                    "must be a JSON object, not an array or primitive",
+                )),
+                config: None,
+                node_spec: None,
+                bun_spec: None,
+            };
         }
     };
 
-    let mut warnings: Vec<String> = Vec::new();
+    let mut warnings = IssuePreview::default();
+    let mut node_spec = None;
+    let mut bun_spec = None;
 
     // 2. Check for unknown fields against the canonical generated contract.
     for path in lpm_runner::lpm_json::unknown_field_paths(&doc) {
@@ -67,8 +147,25 @@ pub(super) fn validate_lpm_json(project_dir: &Path) -> Option<Check> {
                         "runtime \"{rt_name}\" not yet supported (supported: \"node\", \"bun\")"
                     ));
                 }
-                if !rt_value.is_string() {
-                    warnings.push(format!("runtime.{rt_name} must be a string version spec"));
+                match rt_value.as_str() {
+                    None => {
+                        warnings.push(format!("runtime.{rt_name} must be a string version spec"))
+                    }
+                    Some(spec) if rt_name == "node" => {
+                        if let Err(error) = lpm_runtime::node::validate_version_spec(spec) {
+                            warnings.push(format!("runtime.node is invalid: {error}"));
+                        } else {
+                            node_spec = Some(spec.to_owned());
+                        }
+                    }
+                    Some(spec) if rt_name == "bun" => {
+                        if let Err(error) = lpm_runtime::bun::validate_version_spec(spec) {
+                            warnings.push(format!("runtime.bun is invalid: {error}"));
+                        } else {
+                            bun_spec = Some(spec.to_owned());
+                        }
+                    }
+                    Some(_) => {}
                 }
             }
         } else {
@@ -155,23 +252,38 @@ pub(super) fn validate_lpm_json(project_dir: &Path) -> Option<Check> {
     }
 
     // Use the actual semantic parser so Doctor agrees with command execution.
-    if let Err(e) = lpm_runner::lpm_json::read_lpm_json(project_dir) {
-        warnings.push(format!("schema error: {e}"));
-    }
+    let config = match lpm_runner::lpm_json::parse_lpm_json(&content) {
+        Ok(config) => Some(config),
+        Err(error) => {
+            warnings.push(format!("schema error: {error}"));
+            None
+        }
+    };
 
-    if warnings.is_empty() {
-        Some(Check::pass(&doctor_catalog::LPM_JSON_VALID, "valid"))
+    let check = if warnings.is_empty() {
+        Check::pass(&doctor_catalog::LPM_JSON_VALID, "valid")
     } else if warnings.len() == 1 {
-        Some(Check::warn(
+        Check::warn(
             &doctor_catalog::LPM_JSON_SCHEMA_WARNINGS,
-            &warnings[0],
-        ))
+            &warnings.rendered(),
+        )
     } else {
-        Some(Check::warn(
+        Check::warn(
             &doctor_catalog::LPM_JSON_SCHEMA_WARNINGS,
-            &format!("{} issues: {}", warnings.len(), warnings.join("; ")),
-        ))
+            &format!("{} issues: {}", warnings.len(), warnings.rendered()),
+        )
+    };
+    DiagnosticLpmJson {
+        check: Some(check),
+        config,
+        node_spec,
+        bun_spec,
     }
+}
+
+#[cfg(test)]
+fn validate_lpm_json(project_dir: &Path) -> Option<Check> {
+    load_lpm_json(project_dir).check
 }
 
 #[cfg(test)]
@@ -373,6 +485,86 @@ mod tests {
     }
 
     #[test]
+    fn validate_lpm_json_rejects_invalid_node_and_bun_selectors() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("lpm.json"),
+            r#"{"runtime":{"node":"$(whoami)","bun":"../../outside"}}"#,
+        )
+        .unwrap();
+
+        let check = validate_lpm_json(dir.path()).expect("lpm.json check");
+        assert!(matches!(check.severity, Severity::Warn));
+        assert!(
+            check.detail.contains("runtime.node is invalid"),
+            "{}",
+            check.detail
+        );
+        assert!(
+            check.detail.contains("runtime.bun is invalid"),
+            "{}",
+            check.detail
+        );
+
+        let diagnostic = load_lpm_json(dir.path());
+        assert!(
+            diagnostic.node_spec().is_none(),
+            "an invalid Node selector must not become a runtime remediation target"
+        );
+        assert!(
+            diagnostic.bun_spec().is_none(),
+            "an invalid Bun selector must not become a runtime remediation target"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn linked_lpm_json_is_reported_as_unreadable_without_following_the_target() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("outside.json");
+        std::fs::write(&target, "{}").unwrap();
+        symlink(&target, dir.path().join("lpm.json")).unwrap();
+
+        let diagnostic = load_lpm_json(dir.path());
+        let check = diagnostic.check.expect("linked lpm.json diagnostic");
+        assert_eq!(check.code(), "lpm_json_unreadable");
+        assert!(matches!(check.severity, Severity::Fail));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fifo_lpm_json_is_rejected_without_waiting_for_a_writer() {
+        use std::os::unix::ffi::OsStrExt as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("lpm.json");
+        let encoded = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+        // SAFETY: `encoded` is a NUL-terminated path owned by this test.
+        assert_eq!(unsafe { libc::mkfifo(encoded.as_ptr(), 0o600) }, 0);
+        let started = std::time::Instant::now();
+
+        let diagnostic = load_lpm_json(dir.path());
+
+        assert!(started.elapsed() < std::time::Duration::from_millis(500));
+        assert_eq!(diagnostic.check.unwrap().code(), "lpm_json_unreadable");
+    }
+
+    #[test]
+    fn validate_lpm_json_accepts_compound_node_selectors() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("lpm.json"),
+            r#"{"runtime":{"node":">=20.0.0 <23.0.0"}}"#,
+        )
+        .unwrap();
+
+        let check = validate_lpm_json(dir.path()).expect("lpm.json check");
+        assert!(matches!(check.severity, Severity::Pass), "{}", check.detail);
+    }
+
+    #[test]
     fn validate_lpm_json_tasks_string_value_warns() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(
@@ -510,5 +702,24 @@ mod tests {
             "should have 3-4 issues: {}",
             result.detail
         );
+    }
+
+    #[test]
+    fn lpm_json_issue_output_retains_only_a_bounded_preview() {
+        let dir = tempfile::tempdir().unwrap();
+        let fields: serde_json::Map<String, serde_json::Value> = (0..100)
+            .map(|index| (format!("unknown_{index:03}"), serde_json::Value::Null))
+            .collect();
+        std::fs::write(
+            dir.path().join("lpm.json"),
+            serde_json::Value::Object(fields).to_string(),
+        )
+        .unwrap();
+
+        let check = validate_lpm_json(dir.path()).unwrap();
+
+        assert!(check.detail.starts_with("100 issues:"), "{}", check.detail);
+        assert!(check.detail.contains("+95 more"), "{}", check.detail);
+        assert!(check.detail.len() < 512, "{}", check.detail.len());
     }
 }

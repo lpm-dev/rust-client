@@ -127,7 +127,15 @@ pub(crate) async fn fmt_for_doctor(project_dir: &Path) -> Result<(), LpmError> {
     let version = read_tool_version(project_dir, "biome");
     let bin = lpm_plugin::ensure_plugin("biome", version.as_deref(), true).await?;
     let biome_args = build_biome_args(&[], false);
-    run_tool_binary(&bin, &biome_args, project_dir, StdioMode::Capture)?.into_result()
+    let args: Vec<&str> = biome_args.iter().map(String::as_str).collect();
+    let (_, _, code) =
+        super::doctor::tooling::run_tool_with_timeout(&bin, &args, project_dir, None)
+            .map_err(LpmError::Script)?;
+    if code == 0 {
+        Ok(())
+    } else {
+        Err(LpmError::ExitCode(code))
+    }
 }
 
 /// Build the biome args vector — extracted so the workspace path can call it

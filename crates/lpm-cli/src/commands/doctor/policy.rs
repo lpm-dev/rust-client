@@ -2,8 +2,17 @@ use crate::commands::doctor::check::Check;
 use crate::commands::policy::{self, PolicyDiagnosticSeverity};
 use crate::doctor_catalog;
 
-pub(super) fn check_policy_extensions() -> Vec<Check> {
-    let configs = match policy::load_policy_extension_configs_checked() {
+pub(super) fn check_policy_extensions(
+    global: &crate::commands::config::GlobalConfig,
+    config_error: Option<&str>,
+) -> Vec<Check> {
+    if let Some(error) = config_error {
+        return vec![Check::fail(
+            &doctor_catalog::POLICY_EXTENSION_CONFIG_INVALID,
+            &format!("could not load policy extension config: {error}"),
+        )];
+    }
+    let configs = match policy::load_policy_extension_configs_from_global(global) {
         Ok(configs) => configs,
         Err(error) => {
             return vec![Check::fail(

@@ -54,7 +54,7 @@ const STRIPPED_ENV_SUFFIXES: &[&str] = &[
     "_CONNECTION_STRING",
 ];
 
-pub(super) fn build_sanitized_env() -> HashMap<String, String> {
+pub(in crate::commands) fn build_sanitized_env() -> HashMap<String, String> {
     let mut env: HashMap<String, String> = HashMap::new();
 
     for (key, value) in std::env::vars() {

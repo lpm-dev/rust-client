@@ -356,6 +356,18 @@ pub static AUTH_MISSING: CheckEntry = CheckEntry {
     auto_fix: None,
 };
 
+pub static AUTH_UNVERIFIED: CheckEntry = CheckEntry {
+    code: "auth_unverified",
+    name: "Authentication",
+    category: Category::Auth,
+    tier: Tier::Extended,
+    description: "A registry auth token is present, but the registry did not return an authentication decision.",
+    when_fires: "The authenticated whoami probe times out or fails for a reason other than HTTP 401 / 403.",
+    remediation: "Check registry availability and retry. Re-authenticate only when the registry explicitly rejects the token.",
+    possible_severities: &[Severity::Warn],
+    auto_fix: None,
+};
+
 pub static AUTH_STORAGE_KEYCHAIN: CheckEntry = CheckEntry {
     code: "auth_storage_keychain",
     name: "Auth storage backend",
@@ -536,6 +548,18 @@ pub static PACKAGE_JSON_MISSING: CheckEntry = CheckEntry {
     auto_fix: None,
 };
 
+pub static PACKAGE_JSON_INVALID: CheckEntry = CheckEntry {
+    code: "package_json_invalid",
+    name: "package.json",
+    category: Category::ProjectState,
+    tier: Tier::Fast,
+    description: "The project manifest exists but cannot be read as a supported package.json file.",
+    when_fires: "package.json is not a readable regular file, exceeds the configuration size cap, or contains invalid JSON/schema data.",
+    remediation: "Repair package.json, then rerun lpm doctor.",
+    possible_severities: &[Severity::Fail],
+    auto_fix: None,
+};
+
 pub static LINKER_MODE_RESOLVED: CheckEntry = CheckEntry {
     code: "linker_mode_resolved",
     name: "Linker mode",
@@ -608,6 +632,18 @@ pub static V2_STORE_ORPHANS: CheckEntry = CheckEntry {
     auto_fix: Some(DoctorFix::PruneStore),
 };
 
+pub static STORE_ORPHAN_ANALYSIS_UNAVAILABLE: CheckEntry = CheckEntry {
+    code: "store_orphan_analysis_unavailable",
+    name: "virtual store",
+    category: Category::ProjectState,
+    tier: Tier::Extended,
+    description: "Virtual-store reachability could not be established from the known-projects registry.",
+    when_fires: "The known-projects registry is missing, corrupt, or unreadable, or the store scan fails.",
+    remediation: "Repair the known-projects registry or run `lpm cache prune --project <path>` for an explicit project.",
+    possible_severities: &[Severity::Warn],
+    auto_fix: None,
+};
+
 pub static NODE_MODULES_MIXED_LAYOUT: CheckEntry = CheckEntry {
     code: "node_modules_mixed_layout",
     name: "node_modules",
@@ -678,6 +714,18 @@ pub static LOCKFILE_MISSING: CheckEntry = CheckEntry {
     remediation: "Run `lpm install` — it generates the lockfile alongside `node_modules/`.",
     possible_severities: &[Severity::Warn],
     auto_fix: Some(DoctorFix::InstallProject),
+};
+
+pub static LOCKFILE_CORRUPT: CheckEntry = CheckEntry {
+    code: "lockfile_corrupt",
+    name: "Lockfile",
+    category: Category::ProjectState,
+    tier: Tier::Fast,
+    description: "An lpm.lock file exists but cannot be read as a valid lockfile.",
+    when_fires: "The authoritative TOML lockfile is unreadable, malformed, or uses an unsupported schema.",
+    remediation: "Restore or repair lpm.lock, or regenerate it with lpm install after reviewing the dependency changes.",
+    possible_severities: &[Severity::Fail],
+    auto_fix: None,
 };
 
 pub static LOCKFILE_BINARY_VALID: CheckEntry = CheckEntry {
@@ -762,6 +810,18 @@ pub static GITATTRIBUTES_MISSING: CheckEntry = CheckEntry {
     remediation: "Run `lpm init` or add `lpm.lockb binary` to a new `.gitattributes`.",
     possible_severities: &[Severity::Warn],
     auto_fix: Some(DoctorFix::UpdateGitAttributes),
+};
+
+pub static GITATTRIBUTES_UNREADABLE: CheckEntry = CheckEntry {
+    code: "gitattributes_unreadable",
+    name: ".gitattributes",
+    category: Category::ProjectState,
+    tier: Tier::Extended,
+    description: "`.gitattributes` is not a safely readable regular UTF-8 file.",
+    when_fires: "The path is linked, special, oversized, invalid UTF-8, or unreadable.",
+    remediation: "Replace it with a regular UTF-8 file, preserve any valid rules, and add `lpm.lockb binary`.",
+    possible_severities: &[Severity::Warn],
+    auto_fix: None,
 };
 
 pub static DEPS_SYNC_CLEAN: CheckEntry = CheckEntry {
@@ -1096,7 +1156,7 @@ pub static TUNNEL_UNVERIFIED: CheckEntry = CheckEntry {
     description: "The registry request for tunnel domain ownership failed.",
     when_fires: "The registry ownership request fails.",
     remediation: "Run `lpm health`. Then run `lpm doctor` again.",
-    possible_severities: &[Severity::Pass],
+    possible_severities: &[Severity::Warn],
     auto_fix: None,
 };
 
@@ -1284,6 +1344,18 @@ pub static LINT_UNPARSEABLE: CheckEntry = CheckEntry {
     auto_fix: None,
 };
 
+pub static LINT_PROBE_FAILED: CheckEntry = CheckEntry {
+    code: "lint_probe_failed",
+    name: "Lint (oxlint)",
+    category: Category::CodeQuality,
+    tier: Tier::Extended,
+    description: "The trusted Oxlint binary could not complete the diagnostic probe.",
+    when_fires: "Oxlint cannot start, exceeds the deadline, or cannot be reaped.",
+    remediation: "Run `lpm lint` directly; reinstall Oxlint if the binary cannot start.",
+    possible_severities: &[Severity::Warn],
+    auto_fix: None,
+};
+
 pub static FMT_CLEAN: CheckEntry = CheckEntry {
     code: "fmt_clean",
     name: "Format (biome)",
@@ -1318,6 +1390,18 @@ pub static FMT_OTHER_ISSUE: CheckEntry = CheckEntry {
     remediation: "Run `lpm fmt --check` to see the raw biome output.",
     possible_severities: &[Severity::Warn],
     auto_fix: Some(DoctorFix::FormatProject),
+};
+
+pub static FMT_PROBE_FAILED: CheckEntry = CheckEntry {
+    code: "fmt_probe_failed",
+    name: "Format (biome)",
+    category: Category::CodeQuality,
+    tier: Tier::Extended,
+    description: "The trusted Biome binary could not complete the diagnostic probe.",
+    when_fires: "Biome cannot start, exceeds the deadline, or cannot be reaped.",
+    remediation: "Run `lpm fmt --check` directly; reinstall Biome if the binary cannot start.",
+    possible_severities: &[Severity::Warn],
+    auto_fix: None,
 };
 
 // ──────────────────────────────────────────────────────────────────
@@ -1388,6 +1472,18 @@ pub static PLUGIN_UPDATE_AVAILABLE: CheckEntry = CheckEntry {
     auto_fix: Some(DoctorFix::UpdatePlugin),
 };
 
+pub static PLUGIN_UPDATE_CHECK_FAILED: CheckEntry = CheckEntry {
+    code: "plugin_update_check_failed",
+    name: "Plugin",
+    category: Category::Plugin,
+    tier: Tier::Extended,
+    description: "The installed plugin is trusted, but its upstream release could not be checked.",
+    when_fires: "The bounded upstream release request fails or returns invalid release metadata.",
+    remediation: "Check GitHub connectivity or credentials, then rerun `lpm doctor --all`.",
+    possible_severities: &[Severity::Warn],
+    auto_fix: None,
+};
+
 // ──────────────────────────────────────────────────────────────────
 // Workspace
 // ──────────────────────────────────────────────────────────────────
@@ -1412,6 +1508,18 @@ pub static WORKSPACE_CYCLE: CheckEntry = CheckEntry {
     description: "A dependency cycle exists among workspace members.",
     when_fires: "Topology computation detected a cycle.",
     remediation: "Break the cycle by removing or restructuring the offending workspace dep.",
+    possible_severities: &[Severity::Fail],
+    auto_fix: None,
+};
+
+pub static WORKSPACE_DISCOVERY_FAILED: CheckEntry = CheckEntry {
+    code: "workspace_discovery_failed",
+    name: "Workspace graph",
+    category: Category::Workspace,
+    tier: Tier::Fast,
+    description: "The workspace root or one of its member manifests could not be discovered safely.",
+    when_fires: "Workspace configuration, root metadata, or a member package manifest is unreadable or malformed.",
+    remediation: "Repair the reported workspace file, then rerun lpm doctor.",
     possible_severities: &[Severity::Fail],
     auto_fix: None,
 };
@@ -1461,7 +1569,7 @@ pub static GLOBAL_MANIFEST_STRUCTURALLY_INVALID: CheckEntry = CheckEntry {
     name: "Global manifest",
     category: Category::Globals,
     tier: Tier::Extended,
-    description: "`~/.lpm/global/manifest.toml` contains an invalid package root, alias, or tombstone.",
+    description: "`~/.lpm/global/manifest.toml` contains an invalid package, pending recovery, alias, or tombstone record.",
     when_fires: "The manifest parses, but a record fails global install validation.",
     remediation: "Repair the affected records, or reinstall the affected global packages.",
     possible_severities: &[Severity::Fail],
@@ -2000,6 +2108,7 @@ pub static CLI_CATALOG: &[&CheckEntry] = &[
     &AUTH_VALID,
     &AUTH_INVALID,
     &AUTH_MISSING,
+    &AUTH_UNVERIFIED,
     &AUTH_STORAGE_KEYCHAIN,
     &AUTH_STORAGE_FALLBACK,
     &VAULT_STORAGE_KEYCHAIN,
@@ -2015,6 +2124,7 @@ pub static CLI_CATALOG: &[&CheckEntry] = &[
     // Project state
     &PACKAGE_JSON_PRESENT,
     &PACKAGE_JSON_MISSING,
+    &PACKAGE_JSON_INVALID,
     &LINKER_MODE_RESOLVED,
     &NODE_MODULES_ISOLATED_HEALTHY,
     &NODE_MODULES_HOISTED_HEALTHY,
@@ -2025,8 +2135,10 @@ pub static CLI_CATALOG: &[&CheckEntry] = &[
     &NODE_MODULES_LEGACY_LAYOUT,
     &NODE_MODULES_MISSING,
     &V2_STORE_ORPHANS,
+    &STORE_ORPHAN_ANALYSIS_UNAVAILABLE,
     &LOCKFILE_PRESENT,
     &LOCKFILE_MISSING,
+    &LOCKFILE_CORRUPT,
     &LOCKFILE_BINARY_VALID,
     &LOCKFILE_BINARY_MISSING,
     &LOCKFILE_BINARY_STALE,
@@ -2034,6 +2146,7 @@ pub static CLI_CATALOG: &[&CheckEntry] = &[
     &GITATTRIBUTES_LOCKB_MARKED,
     &GITATTRIBUTES_LOCKB_UNMARKED,
     &GITATTRIBUTES_MISSING,
+    &GITATTRIBUTES_UNREADABLE,
     &DEPS_SYNC_CLEAN,
     &DEPS_SYNC_DRIFT,
     &LOCAL_SOURCE_DIR_OK,
@@ -2080,9 +2193,11 @@ pub static CLI_CATALOG: &[&CheckEntry] = &[
     &LINT_WARNINGS,
     &LINT_ERRORS,
     &LINT_UNPARSEABLE,
+    &LINT_PROBE_FAILED,
     &FMT_CLEAN,
     &FMT_UNFORMATTED,
     &FMT_OTHER_ISSUE,
+    &FMT_PROBE_FAILED,
     // TypeScript
     &TYPESCRIPT_HEALTHY,
     &TYPESCRIPT_MISSING_FOR_TSCONFIG,
@@ -2090,9 +2205,11 @@ pub static CLI_CATALOG: &[&CheckEntry] = &[
     // Plugin
     &PLUGIN_UP_TO_DATE,
     &PLUGIN_UPDATE_AVAILABLE,
+    &PLUGIN_UPDATE_CHECK_FAILED,
     // Workspace
     &WORKSPACE_ACYCLIC,
     &WORKSPACE_CYCLE,
+    &WORKSPACE_DISCOVERY_FAILED,
     // Globals
     &GLOBAL_MANIFEST_VALID,
     &GLOBAL_MANIFEST_ABSENT,

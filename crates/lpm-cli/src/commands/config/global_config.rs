@@ -68,7 +68,6 @@ impl GlobalConfig {
     /// has a legitimate use; `#[cfg(test)]` because no production code
     /// path constructs an empty config — `load()` is the production
     /// path and a missing file already produces an empty table.
-    #[cfg(test)]
     pub(crate) fn empty() -> Self {
         Self {
             table: toml::map::Map::new(),

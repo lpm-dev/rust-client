@@ -221,6 +221,7 @@ async fn doctor_json_envelope_has_required_fields() {
     assert_json_field(&json, "failed", JsonType::Number);
     assert_json_field(&json, "warnings", JsonType::Number);
     assert_json_field(&json, "fixes_applied", JsonType::Array);
+    assert_json_field(&json, "fixes_failed", JsonType::Array);
 
     let checks = json["checks"].as_array().unwrap_or_else(|| {
         panic!("checks must be a non-null array. stderr was:\n{stderr_for_panic}",)
