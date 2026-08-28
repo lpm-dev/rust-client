@@ -454,6 +454,7 @@ pub(super) async fn run_link_and_finish(
     linker_mode: lpm_linker::LinkerMode,
     force: bool,
     workspace_member_deps: &[WorkspaceMemberLink],
+    current_lockfile_patches: &lpm_lockfile::LockfilePatches,
     // same CLI-side policy override as
     // [`run_with_options`]. Reached via the lockfile fast path when
     // `run_with_options` short-circuits resolution; both paths must
@@ -495,7 +496,8 @@ pub(super) async fn run_link_and_finish(
         .as_ref()
         .map(|l| l.patched_dependencies.clone())
         .unwrap_or_default();
-    let patch_fingerprints = compute_patch_fingerprints(&current_patches_for_link, project_dir)?;
+    let patch_fingerprints =
+        compute_patch_fingerprints(&current_patches_for_link, current_lockfile_patches)?;
 
     let source_index = source_dependency_index(&packages);
     let link_targets: Vec<LinkTarget> = packages
@@ -583,6 +585,7 @@ pub(super) async fn run_link_and_finish(
     let current_patches = current_patches_for_link;
     let applied_patches = apply_patches_for_install(
         &current_patches,
+        current_lockfile_patches,
         &link_result,
         &store,
         project_dir,

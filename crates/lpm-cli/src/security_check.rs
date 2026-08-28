@@ -585,6 +585,7 @@ fn sorted_package_labels(packages: &HashSet<String>) -> Vec<String> {
 mod tests {
     use super::*;
     use chrono::Utc;
+    use lpm_common::integrity::{HashAlgorithm, Integrity};
     use lpm_security::behavioral::manifest::ManifestTags;
     use lpm_security::behavioral::source::SourceTags;
     use lpm_security::behavioral::supply_chain::SupplyChainTags;
@@ -741,13 +742,21 @@ mod tests {
         source_sri: &str,
         analysis: &PackageAnalysis,
     ) {
-        let link_dir = lpm_store::v2::Store::from_lpm_root_for_version(lpm_root, store_version)
+        let store = lpm_store::v2::Store::from_lpm_root_for_version(lpm_root, store_version);
+        let object_dir = store.paths().object_dir(source_sri).unwrap();
+        std::fs::create_dir_all(&object_dir).unwrap();
+        behavioral::write_cached_analysis(&object_dir, analysis).unwrap();
+        std::fs::write(
+            object_dir.join("package.json"),
+            r#"{"name":"duplicate","version":"1.0.0"}"#,
+        )
+        .unwrap();
+        let link_dir = store
             .paths()
             .links_root()
             .join(format!("duplicate@1.0.0+{suffix}"));
         let package_dir = link_dir.join("node_modules").join("duplicate");
         std::fs::create_dir_all(&package_dir).unwrap();
-        behavioral::write_cached_analysis(&package_dir, analysis).unwrap();
         std::fs::write(
             package_dir.join("package.json"),
             r#"{"name":"duplicate","version":"1.0.0"}"#,
@@ -760,7 +769,7 @@ mod tests {
             name: "duplicate".to_string(),
             version: "1.0.0".to_string(),
             source_sri: source_sri.to_string(),
-            object_path: format!("objects/{source_sri}"),
+            object_path: store.paths().relative_object_path(source_sri).unwrap(),
             tree_digest: None,
             deps: Vec::new(),
             platform: Arc::new(LinkMetaPlatform {
@@ -779,11 +788,13 @@ mod tests {
     fn cached_security_lookup_distinguishes_sources_across_v2_and_v3() {
         let dir = tempfile::tempdir().unwrap();
         let lpm_root = lpm_common::LpmRoot::from_dir(dir.path());
+        let source_a = Integrity::from_bytes(HashAlgorithm::Sha512, b"source-a").to_string();
+        let source_b = Integrity::from_bytes(HashAlgorithm::Sha512, b"source-b").to_string();
         write_cached_analysis_link(
             &lpm_root,
             lpm_store::StoreVersion::V3,
             "aaaaaaaaaaaaaaaa",
-            "sha512-source-a",
+            &source_a,
             &make_analysis(
                 SourceTags {
                     eval: true,
@@ -797,7 +808,7 @@ mod tests {
             &lpm_root,
             lpm_store::StoreVersion::V2,
             "bbbbbbbbbbbbbbbb",
-            "sha512-source-b",
+            &source_b,
             &make_analysis(
                 SourceTags {
                     shell: true,
@@ -813,13 +824,13 @@ mod tests {
                 "duplicate",
                 "1.0.0",
                 "registry+https://registry.npmjs.org",
-                "sha512-source-a",
+                source_a.as_str(),
             ),
             (
                 "duplicate",
                 "1.0.0",
                 "registry+https://registry.example.com",
-                "sha512-source-b",
+                source_b.as_str(),
             ),
         ];
         let mut observed_tags = HashSet::new();

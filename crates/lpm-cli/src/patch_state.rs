@@ -218,13 +218,7 @@ pub fn compute_fingerprint(patches: &HashMap<String, PatchedDependencyEntry>) ->
 
 /// Full SHA-256 digest for a project-relative patch file.
 pub fn patch_file_sha256(project_dir: &Path, rel_path: &str) -> Result<String, LpmError> {
-    let path = project_dir.join(rel_path);
-    let bytes = std::fs::read(&path).map_err(|e| {
-        LpmError::Script(format!(
-            "patch file {rel_path} declared in lpm.patchedDependencies cannot be read: {e}"
-        ))
-    })?;
-    Ok(format!("sha256-{}", hex::encode(Sha256::digest(&bytes))))
+    crate::patch_fs::patch_artifact_sha256(project_dir, rel_path)
 }
 
 /// Build lockfile patch records from the current manifest declarations.
@@ -443,6 +437,33 @@ mod tests {
         // (m2's key isn't a valid patch key, but split_key tolerance
         // is irrelevant — the fingerprint hashes raw bytes only.)
         assert_ne!(compute_fingerprint(&m1), compute_fingerprint(&m2));
+    }
+
+    #[test]
+    fn patch_file_sha256_rejects_parent_escape() {
+        let root = tempfile::tempdir().unwrap();
+        let project = root.path().join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::write(root.path().join("outside.patch"), "secret").unwrap();
+
+        let error = patch_file_sha256(&project, "../outside.patch").unwrap_err();
+        assert!(format!("{error}").contains("project-relative"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn patch_file_sha256_rejects_symlinked_patch_file() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().unwrap();
+        let project = root.path().join("project");
+        std::fs::create_dir_all(project.join("patches")).unwrap();
+        let outside = root.path().join("outside.patch");
+        std::fs::write(&outside, "secret").unwrap();
+        symlink(&outside, project.join("patches/link.patch")).unwrap();
+
+        let error = patch_file_sha256(&project, "patches/link.patch").unwrap_err();
+        assert!(format!("{error}").contains("symbolic link"));
     }
 
     // ── Parsed entry contracts ───────────────────────────────────────

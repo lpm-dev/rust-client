@@ -1,0 +1,16 @@
+---
+source: tests/workflows/tests/patch.rs
+expression: parsed2.clone()
+---
+{
+  "success": true,
+  "name": "lodash",
+  "version": "4.17.21",
+  "key": "lodash@4.17.21",
+  "patch_file": "patches/lodash@4.17.21.patch",
+  "files_changed": 1,
+  "insertions": 1,
+  "deletions": 1,
+  "original_integrity": "[INTEGRITY]",
+  "lockfile_updated": false
+}

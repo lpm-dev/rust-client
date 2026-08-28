@@ -421,6 +421,7 @@ pub(super) struct OnlineFetchPhaseInput<'a> {
     pub(super) spec_tracker: SpeculativeKeyTracker,
     pub(super) gate_stats: Arc<GateStats>,
     pub(super) current_patches: &'a HashMap<String, PatchedDependencyEntry>,
+    pub(super) current_lockfile_patches: &'a lpm_lockfile::LockfilePatches,
     pub(super) lockfile_provenance:
         &'a std::collections::BTreeMap<String, lpm_lockfile::LockedProvenance>,
     pub(super) trust_no_downgrade: bool,
@@ -569,6 +570,7 @@ pub(super) async fn run_online_fetch_phase(
         spec_tracker,
         gate_stats,
         current_patches,
+        current_lockfile_patches,
         lockfile_provenance,
         trust_no_downgrade,
         used_lockfile,
@@ -640,7 +642,7 @@ pub(super) async fn run_online_fetch_phase(
     // Pre-compute the per-target patch fingerprint map so each `LinkTarget`
     // carries its own `Some("p-…")` when patched. v2's GraphKey folds it in,
     // splitting patched installs into project-isolated link entries.
-    let patch_fingerprints = compute_patch_fingerprints(current_patches, project_dir)?;
+    let patch_fingerprints = compute_patch_fingerprints(current_patches, current_lockfile_patches)?;
 
     // Build link targets up front so the event-driven path can start
     // per-package linking as each tarball lands.

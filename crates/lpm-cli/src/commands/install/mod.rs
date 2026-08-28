@@ -918,6 +918,7 @@ async fn run_with_options_under_store_lock(
             prior_overrides_state: prior_overrides_state.as_ref(),
             overrides_changed,
             current_patches: &current_patches,
+            current_lockfile_patches: &current_lockfile_patches,
             current_patch_fingerprint: &current_patch_fingerprint,
             prior_patch_state: prior_patch_state.as_ref(),
             patches_changed,
@@ -1205,6 +1206,7 @@ async fn run_with_options_under_store_lock(
             &workspace_member_deps,
             &catalog_resolutions,
             &current_patches,
+            &current_lockfile_patches,
             &prior_patch_state,
             &current_patch_fingerprint,
             dependency_engine_policy.as_ref(),
@@ -1414,6 +1416,7 @@ async fn run_with_options_under_store_lock(
         spec_tracker,
         gate_stats: gate_stats.clone(),
         current_patches: &current_patches,
+        current_lockfile_patches: &current_lockfile_patches,
         lockfile_provenance: &lockfile_provenance,
         trust_no_downgrade: resolver_trust_policy.is_no_downgrade(),
         used_lockfile,
@@ -1524,6 +1527,7 @@ async fn run_with_options_under_store_lock(
     // module-level comment in `patch_engine.rs` for why.
     let applied_patches = apply_patches_for_install(
         &current_patches,
+        &current_lockfile_patches,
         &link_result,
         &store,
         project_dir,

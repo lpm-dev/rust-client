@@ -35,6 +35,7 @@ mod oidc;
 mod output;
 pub mod overrides_state;
 pub mod patch_engine;
+mod patch_fs;
 pub mod patch_state;
 pub mod path_onboarding;
 pub mod precedence;

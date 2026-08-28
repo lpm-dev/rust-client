@@ -250,17 +250,19 @@ impl V2BaselineIndex {
             } = meta;
 
             let package_dir = link_dir.join("node_modules").join(&meta_name);
-            if !package_dir.exists() {
+            if !is_real_directory(&package_dir) {
                 tracing::debug!(
                     "v2 project-scoped index: skipping {}: package dir missing",
                     link_dir.display()
                 );
                 continue;
             }
-            let pristine_dir = match store_v2.paths().object_dir(&meta_sri) {
-                Ok(p) if p.exists() => p,
-                _ => package_dir.clone(),
+            let Ok(pristine_dir) = store_v2.paths().object_dir(&meta_sri) else {
+                continue;
             };
+            if !is_real_directory(&pristine_dir) {
+                continue;
+            }
             // Project-scoped: in a single project a (name, version) is
             // resolved by exactly one link entry, except the
             // multi-source-same-coords corner case (two distinct
@@ -364,13 +366,15 @@ impl V2BaselineIndex {
             for (link_dir, meta) in store_v2.iter_link_entries()? {
                 let key = (meta.name.clone(), meta.version.clone());
                 let package_dir = link_dir.join("node_modules").join(&meta.name);
-                if !package_dir.exists() {
+                if !is_real_directory(&package_dir) {
                     continue;
                 }
-                let pristine_dir = match store_v2.paths().object_dir(&meta.source_sri) {
-                    Ok(p) if p.exists() => p,
-                    _ => package_dir.clone(),
+                let Ok(pristine_dir) = store_v2.paths().object_dir(&meta.source_sri) else {
+                    continue;
                 };
+                if !is_real_directory(&pristine_dir) {
+                    continue;
+                }
                 let baseline = Arc::new(InstalledPackageBaseline {
                     package_dir,
                     pristine_dir,
@@ -674,59 +678,167 @@ pub fn find_installed_package_baseline(
     name: &str,
     version: &str,
 ) -> Result<Option<InstalledPackageBaseline>, LpmError> {
-    // Virtual stores first, default before experimental. Iterating link entries reads
-    // each sidecar `.lpm-link-meta.json`; the iterator gracefully
-    // skips malformed entries so a corrupt sibling never blocks a
-    // valid match.
-    //
-    // Collect-and-sort by link_dir path so the first match is
-    // deterministic across runs and across filesystems (read_dir
-    // order is inode-order on ext4/APFS and undefined elsewhere).
+    find_installed_package_baseline_impl(lpm_root, name, version, None, false)
+}
+
+/// Resolve a coordinate-only baseline only when one source integrity owns those coordinates.
+pub fn find_unique_installed_package_baseline(
+    lpm_root: &lpm_common::LpmRoot,
+    name: &str,
+    version: &str,
+) -> Result<Option<InstalledPackageBaseline>, LpmError> {
+    find_installed_package_baseline_impl(lpm_root, name, version, None, true)
+}
+
+/// Resolve an installed baseline while retaining source identity when an integrity is available.
+///
+/// Virtual-store directory names are filtered by package coordinates before sidecars are parsed.
+/// Among valid matching entries, the lexicographically smallest link path wins. An integrity-
+/// qualified lookup never falls back to bytes with a different source integrity.
+pub fn find_installed_package_baseline_by_identity(
+    lpm_root: &lpm_common::LpmRoot,
+    name: &str,
+    version: &str,
+    expected_integrity: Option<&str>,
+) -> Result<Option<InstalledPackageBaseline>, LpmError> {
+    find_installed_package_baseline_impl(lpm_root, name, version, expected_integrity, false)
+}
+
+fn find_installed_package_baseline_impl(
+    lpm_root: &lpm_common::LpmRoot,
+    name: &str,
+    version: &str,
+    expected_integrity: Option<&str>,
+    reject_ambiguous_identity: bool,
+) -> Result<Option<InstalledPackageBaseline>, LpmError> {
+    let safe_name = name.replace(['/', '\\'], "+");
+    let mut entry_prefix = String::with_capacity(safe_name.len() + version.len() + 2);
+    entry_prefix.push_str(&safe_name);
+    entry_prefix.push('@');
+    entry_prefix.push_str(version);
+    entry_prefix.push('+');
+
+    let ambiguous_identity_error = || {
+        LpmError::Store(format!(
+            "multiple source identities are installed for {name}@{version}; use a project lockfile that selects one source"
+        ))
+    };
+    let mut selected_across_stores: Option<InstalledPackageBaseline> = None;
     for store_version in [crate::StoreVersion::V2, crate::StoreVersion::V3] {
         let store_v2 = crate::v2::Store::from_lpm_root_for_version(lpm_root, store_version);
-        let mut entries: Vec<(PathBuf, _)> = store_v2.iter_link_entries()?.collect();
-        entries.sort_by(|a, b| a.0.cmp(&b.0));
-        for (link_dir, meta) in entries {
-            if meta.name == name && meta.version == version {
-                let package_dir = link_dir.join("node_modules").join(name);
-                if !package_dir.exists() {
+        let links_root = store_v2.paths().links_root();
+        let read_dir = match std::fs::read_dir(&links_root) {
+            Ok(read_dir) => read_dir,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                return Err(LpmError::Store(format!(
+                    "failed to enumerate virtual-store links root at {}: {error}",
+                    links_root.display()
+                )));
+            }
+        };
+        let mut selected: Option<InstalledPackageBaseline> = None;
+        let mut selected_link_dir: Option<PathBuf> = None;
+        let mut invalid_object: Option<PathBuf> = None;
+        for entry in read_dir.flatten() {
+            let entry_name = entry.file_name();
+            let Some(entry_name) = entry_name.to_str() else {
+                continue;
+            };
+            if !entry_name.starts_with(&entry_prefix) {
+                continue;
+            }
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            if file_type.is_symlink() || !file_type.is_dir() {
+                continue;
+            }
+            let link_dir = entry.path();
+            let Ok(meta) = crate::v2::LinkMeta::read_from(&link_dir) else {
+                continue;
+            };
+            if meta.name != name
+                || meta.version != version
+                || expected_integrity.is_some_and(|expected| meta.source_sri != expected)
+            {
+                continue;
+            }
+            let package_dir = link_dir.join("node_modules").join(name);
+            if !is_real_directory(&package_dir) {
+                continue;
+            }
+            let pristine_dir = match store_v2.paths().object_dir(&meta.source_sri) {
+                Ok(path) if is_real_directory(&path) => path,
+                Ok(path) => {
+                    invalid_object.get_or_insert(path);
                     continue;
                 }
-                // Derive the pristine object dir from the source SRI.
-                // Virtual stores populate link entries from an immutable
-                // source tree, so for a well-formed install the
-                // object dir is always derivable AND present on disk.
-                //
-                // **Defensive aliasing.** If `sri_to_segment` can't
-                // parse the SRI (synthetic test fixtures) or the
-                // resolved path is missing (manual pruning, partial
-                // migration), fall back to aliasing `package_dir`.
-                // Patch consumers then re-read the link entry
-                // directly — same shape as v1, where
-                // `pristine_dir == package_dir` by construction. A
-                // genuinely-corrupt v2 install fails later with a
-                // patch-engine drift error, keeping the user-facing
-                // failure mode close to the cause.
-                let pristine_dir = match store_v2.paths().object_dir(&meta.source_sri) {
-                    Ok(p) if p.exists() => p,
-                    _ => package_dir.clone(),
-                };
-                return Ok(Some(InstalledPackageBaseline {
-                    package_dir,
-                    pristine_dir,
-                    integrity: meta.source_sri,
-                    layout: PackageBaselineLayout::V2,
-                }));
+                Err(_) => {
+                    invalid_object
+                        .get_or_insert_with(|| store_v2.paths().root().join(&meta.object_path));
+                    continue;
+                }
+            };
+            if reject_ambiguous_identity
+                && selected
+                    .as_ref()
+                    .is_some_and(|current| current.integrity != meta.source_sri)
+            {
+                return Err(ambiguous_identity_error());
             }
+            if selected_link_dir
+                .as_ref()
+                .is_some_and(|current| current <= &link_dir)
+            {
+                continue;
+            }
+            selected_link_dir = Some(link_dir);
+            selected = Some(InstalledPackageBaseline {
+                package_dir,
+                pristine_dir,
+                integrity: meta.source_sri,
+                layout: PackageBaselineLayout::V2,
+            });
+        }
+        if let Some(selected) = selected {
+            if !reject_ambiguous_identity {
+                return Ok(Some(selected));
+            }
+            if selected_across_stores
+                .as_ref()
+                .is_some_and(|current| current.integrity != selected.integrity)
+            {
+                return Err(ambiguous_identity_error());
+            }
+            selected_across_stores.get_or_insert(selected);
+        }
+        if let Some(path) = invalid_object
+            && selected_across_stores.is_none()
+        {
+            return Err(LpmError::Store(format!(
+                "virtual-store baseline object is missing or unsafe at {}",
+                path.display()
+            )));
         }
     }
-    // v1 fallback — older installs, the migration grace window, or
-    // ad-hoc test fixtures that populate v1 directly.
+
     let store_v1 = PackageStore::from_root(lpm_root);
     let pkg_dir = store_v1.package_dir(name, version);
-    if pkg_dir.exists()
+    if is_real_directory(&pkg_dir)
         && let Some(integrity) = read_stored_integrity(&pkg_dir)
+        && expected_integrity.is_none_or(|expected| expected == integrity)
     {
+        if reject_ambiguous_identity
+            && selected_across_stores
+                .as_ref()
+                .is_some_and(|current| current.integrity != integrity)
+        {
+            return Err(ambiguous_identity_error());
+        }
+        if let Some(selected) = selected_across_stores {
+            return Ok(Some(selected));
+        }
         return Ok(Some(InstalledPackageBaseline {
             package_dir: pkg_dir.clone(),
             // Under v1 the store dir is pristine — patches mutate
@@ -739,7 +851,12 @@ pub fn find_installed_package_baseline(
             layout: PackageBaselineLayout::V1,
         }));
     }
-    Ok(None)
+    Ok(selected_across_stores)
+}
+
+fn is_real_directory(path: &Path) -> bool {
+    std::fs::symlink_metadata(path)
+        .is_ok_and(|metadata| metadata.is_dir() && !metadata.file_type().is_symlink())
 }
 
 #[cfg(test)]
@@ -898,6 +1015,42 @@ mod tests {
         assert_eq!(baseline.integrity, v2_sri);
     }
 
+    #[test]
+    fn unique_installed_baseline_rejects_different_identities_across_virtual_store_versions() {
+        let dir = tempfile::tempdir().unwrap();
+        let lpm_root = lpm_common::LpmRoot::from_dir(dir.path());
+        let v2 = V2Store::from_lpm_root(&lpm_root);
+        let v3 = V2Store::from_lpm_root_v3(&lpm_root);
+
+        for (store, sri) in [
+            (&v2, synthetic_sri(b"default-v2-source")),
+            (&v3, synthetic_sri(b"experimental-v3-source")),
+        ] {
+            let object_dir = write_object(
+                store,
+                &sri,
+                &[(
+                    "package.json",
+                    b"{\"name\":\"dual-source\",\"version\":\"1.0.0\"}",
+                )],
+            );
+            store
+                .populate_link_entry(LinkEntryRequest {
+                    graph_key: std::sync::Arc::new(sample_key("dual-source", "1.0.0")),
+                    source_sri: sri,
+                    object_dir,
+                    deps: vec![],
+                    platform: std::sync::Arc::new(sample_meta_platform()),
+                })
+                .unwrap();
+        }
+
+        let error =
+            find_unique_installed_package_baseline(&lpm_root, "dual-source", "1.0.0").unwrap_err();
+
+        assert!(format!("{error}").contains("multiple source identities"));
+    }
+
     /// `find_installed_package_baseline_indexed` falls through to v1
     /// when the index has no entry. Mirror of the legacy helper's
     /// fall-through path, but reachable via the per-loop O(1) form.
@@ -949,6 +1102,7 @@ mod tests {
 
         let dir = tempfile::tempdir().unwrap();
         let lpm_root = lpm_common::LpmRoot::from_dir(dir.path());
+        let store = V2Store::from_lpm_root(&lpm_root);
 
         // Seed two link entries for the same coords. Both have
         // realistic (different) graph-key dir names; both have a
@@ -962,6 +1116,15 @@ mod tests {
             (&entry_unpatched, "aaaaaaaaaaaaaaaa"),
             (&entry_patched, "bbbbbbbbbbbbbbbb"),
         ] {
+            let sri = synthetic_sri(suffix.as_bytes());
+            let object_dir = write_object(
+                &store,
+                &sri,
+                &[(
+                    "package.json",
+                    b"{\"name\":\"lodash\",\"version\":\"1.0.0\"}",
+                )],
+            );
             let pkg_dir = link_dir.join("node_modules").join("lodash");
             std::fs::create_dir_all(&pkg_dir).unwrap();
             std::fs::write(
@@ -975,8 +1138,12 @@ mod tests {
                 graph_key_digest_hex: format!("{suffix}{suffix}{suffix}{suffix}"),
                 name: "lodash".into(),
                 version: "1.0.0".into(),
-                source_sri: format!("sha512-stub-{suffix}"),
-                object_path: format!("objects/sha512-stub-{suffix}"),
+                source_sri: sri,
+                object_path: object_dir
+                    .strip_prefix(store.paths().root())
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned(),
                 tree_digest: None,
                 deps: vec![],
                 platform: std::sync::Arc::new(LinkMetaPlatform {
@@ -1045,6 +1212,16 @@ mod tests {
 
         let dir = tempfile::tempdir().unwrap();
         let lpm_root = lpm_common::LpmRoot::from_dir(dir.path());
+        let store = V2Store::from_lpm_root(&lpm_root);
+        let sri = synthetic_sri(b"baseline_index/cli-tool");
+        let object_dir = write_object(
+            &store,
+            &sri,
+            &[(
+                "package.json",
+                b"{\"name\":\"cli-tool\",\"version\":\"1.0.0\"}",
+            )],
+        );
 
         let v2_links_root = dir.path().join("store").join("v2").join("links");
         let key_dir_name = "cli-tool@1.0.0+dddddddddddddddd";
@@ -1063,8 +1240,12 @@ mod tests {
                 "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd".into(),
             name: "cli-tool".into(),
             version: "1.0.0".into(),
-            source_sri: "sha512-stub-cli-tool".into(),
-            object_path: "objects/sha512-stub-cli-tool".into(),
+            source_sri: sri,
+            object_path: object_dir
+                .strip_prefix(store.paths().root())
+                .unwrap()
+                .to_string_lossy()
+                .into_owned(),
             tree_digest: None,
             deps: vec![],
             platform: std::sync::Arc::new(LinkMetaPlatform {
@@ -1121,6 +1302,7 @@ mod tests {
 
         let dir = tempfile::tempdir().unwrap();
         let lpm_root = lpm_common::LpmRoot::from_dir(dir.path());
+        let store = V2Store::from_lpm_root(&lpm_root);
 
         let v2_links_root = dir.path().join("store").join("v2").join("links");
 
@@ -1129,6 +1311,15 @@ mod tests {
         let tslib_short = "1111111111111111";
         let tslib_full = format!("{tslib_short}{tslib_short}{tslib_short}{tslib_short}");
         let tslib_entry = v2_links_root.join(format!("tslib@2.0.0+{tslib_short}"));
+        let tslib_sri = synthetic_sri(b"baseline_index/tslib");
+        let tslib_object_dir = write_object(
+            &store,
+            &tslib_sri,
+            &[(
+                "package.json",
+                b"{\"name\":\"tslib\",\"version\":\"2.0.0\"}",
+            )],
+        );
         let tslib_pkg = tslib_entry.join("node_modules").join("tslib");
         std::fs::create_dir_all(&tslib_pkg).unwrap();
         std::fs::write(
@@ -1142,8 +1333,12 @@ mod tests {
             graph_key_digest_hex: tslib_full.clone(),
             name: "tslib".into(),
             version: "2.0.0".into(),
-            source_sri: "sha512-stub-tslib".into(),
-            object_path: "objects/sha512-stub-tslib".into(),
+            source_sri: tslib_sri,
+            object_path: tslib_object_dir
+                .strip_prefix(store.paths().root())
+                .unwrap()
+                .to_string_lossy()
+                .into_owned(),
             tree_digest: None,
             deps: vec![],
             platform: std::sync::Arc::new(LinkMetaPlatform {
@@ -1160,6 +1355,15 @@ mod tests {
         // on tslib. Its `LinkMeta.deps` carries tslib's full digest.
         let consumer_short = "2222222222222222";
         let consumer_entry = v2_links_root.join(format!("consumer@1.0.0+{consumer_short}"));
+        let consumer_sri = synthetic_sri(b"baseline_index/consumer");
+        let consumer_object_dir = write_object(
+            &store,
+            &consumer_sri,
+            &[(
+                "package.json",
+                b"{\"name\":\"consumer\",\"version\":\"1.0.0\"}",
+            )],
+        );
         let consumer_pkg = consumer_entry.join("node_modules").join("consumer");
         std::fs::create_dir_all(&consumer_pkg).unwrap();
         std::fs::write(
@@ -1175,8 +1379,12 @@ mod tests {
             ),
             name: "consumer".into(),
             version: "1.0.0".into(),
-            source_sri: "sha512-stub-consumer".into(),
-            object_path: "objects/sha512-stub-consumer".into(),
+            source_sri: consumer_sri,
+            object_path: consumer_object_dir
+                .strip_prefix(store.paths().root())
+                .unwrap()
+                .to_string_lossy()
+                .into_owned(),
             tree_digest: None,
             deps: vec![LinkMetaDep {
                 local: "tslib".into(),
@@ -1238,6 +1446,16 @@ mod tests {
 
         let dir = tempfile::tempdir().unwrap();
         let lpm_root = lpm_common::LpmRoot::from_dir(dir.path());
+        let store = V2Store::from_lpm_root(&lpm_root);
+        let sri = synthetic_sri(b"baseline_index/scoped");
+        let object_dir = write_object(
+            &store,
+            &sri,
+            &[(
+                "package.json",
+                b"{\"name\":\"@scope/pkg\",\"version\":\"1.0.0\"}",
+            )],
+        );
 
         let v2_links_root = dir.path().join("store").join("v2").join("links");
         let entry = v2_links_root.join("@scope+pkg@1.0.0+cccccccccccccccc");
@@ -1255,8 +1473,12 @@ mod tests {
                 "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc".into(),
             name: "@scope/pkg".into(),
             version: "1.0.0".into(),
-            source_sri: "sha512-stub-scoped".into(),
-            object_path: "objects/sha512-stub-scoped".into(),
+            source_sri: sri,
+            object_path: object_dir
+                .strip_prefix(store.paths().root())
+                .unwrap()
+                .to_string_lossy()
+                .into_owned(),
             tree_digest: None,
             deps: vec![],
             platform: std::sync::Arc::new(LinkMetaPlatform {

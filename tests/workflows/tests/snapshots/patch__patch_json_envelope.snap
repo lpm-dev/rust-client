@@ -1,0 +1,23 @@
+---
+source: tests/workflows/tests/patch.rs
+expression: parsed.clone()
+---
+{
+  "success": true,
+  "name": "lodash",
+  "version": "4.17.21",
+  "key": "lodash@4.17.21",
+  "staging_dir": "[STAGING]",
+  "package_dir": "[PACKAGE]",
+  "next_steps": [
+    {
+      "description": "Commit the patch after editing package_dir",
+      "command": "[COMMAND]",
+      "args": [
+        "lpm",
+        "patch-commit",
+        "[STAGING]"
+      ]
+    }
+  ]
+}
