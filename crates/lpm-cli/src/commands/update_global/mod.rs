@@ -62,6 +62,14 @@ const GLOBAL_UPDATE_PLANNING_CONCURRENCY: usize = 4;
 const GLOBAL_UPDATE_INSTALL_CONCURRENCY: usize = 4;
 const GLOBAL_UPDATE_TRANSACTION_BATCH_SIZE: usize = 16;
 
+fn bounded_install_stream<I, F>(futures: I) -> impl futures::Stream<Item = F::Output>
+where
+    I: IntoIterator<Item = F>,
+    F: std::future::Future,
+{
+    futures::stream::iter(futures).buffer_unordered(GLOBAL_UPDATE_INSTALL_CONCURRENCY)
+}
+
 fn update_failure_reason(error: &LpmError) -> String {
     let LpmError::NotFound(detail) = error else {
         return error.to_string();
@@ -772,7 +780,7 @@ async fn execute_upgrade_batch(
         }
     }
 
-    let installs = futures::stream::iter(ready.into_iter().map(|upgrade| async move {
+    let installs = bounded_install_stream(ready.into_iter().map(|upgrade| async move {
         let install_result = async {
             do_install_upgrade(
                 root,
@@ -797,8 +805,7 @@ async fn execute_upgrade_batch(
         }
         .await;
         (upgrade, install_result)
-    }))
-    .buffer_unordered(GLOBAL_UPDATE_INSTALL_CONCURRENCY);
+    }));
     futures::pin_mut!(installs);
     let mut commit_ready = Vec::with_capacity(upgrade_count);
     while let Some((upgrade, install_result)) = installs.next().await {
@@ -1168,6 +1175,73 @@ mod tests {
             vars.push(("LPM_REGISTRY_URL", Some(registry_url.into())));
         }
         crate::test_env::ScopedEnv::update(vars)
+    }
+
+    #[tokio::test]
+    async fn install_scheduler_never_exceeds_four_in_flight_upgrades() {
+        async fn wait_for_count(
+            counter: &std::sync::atomic::AtomicUsize,
+            notification: &tokio::sync::Notify,
+            expected: usize,
+        ) {
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                while counter.load(std::sync::atomic::Ordering::SeqCst) < expected {
+                    notification.notified().await;
+                }
+            })
+            .await
+            .expect("bounded install scheduler stopped making progress");
+        }
+
+        let permits = Arc::new(tokio::sync::Semaphore::new(0));
+        let current = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let maximum = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let started = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let notification = Arc::new(tokio::sync::Notify::new());
+        let future_permits = Arc::clone(&permits);
+        let future_current = Arc::clone(&current);
+        let future_maximum = Arc::clone(&maximum);
+        let future_started = Arc::clone(&started);
+        let future_notification = Arc::clone(&notification);
+        let install_futures = (0..8).map(move |_| {
+            let permits = Arc::clone(&future_permits);
+            let current = Arc::clone(&future_current);
+            let maximum = Arc::clone(&future_maximum);
+            let started = Arc::clone(&future_started);
+            let notification = Arc::clone(&future_notification);
+            async move {
+                let active = current.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                maximum.fetch_max(active, std::sync::atomic::Ordering::SeqCst);
+                started.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                notification.notify_waiters();
+                permits
+                    .acquire()
+                    .await
+                    .expect("test semaphore stays open")
+                    .forget();
+                current.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+            }
+        });
+        let scheduler = tokio::spawn(async move {
+            bounded_install_stream(install_futures)
+                .collect::<Vec<_>>()
+                .await
+        });
+
+        wait_for_count(&started, &notification, 4).await;
+        assert_eq!(started.load(std::sync::atomic::Ordering::SeqCst), 4);
+        assert_eq!(current.load(std::sync::atomic::Ordering::SeqCst), 4);
+        assert_eq!(maximum.load(std::sync::atomic::Ordering::SeqCst), 4);
+
+        permits.add_permits(4);
+        wait_for_count(&started, &notification, 8).await;
+        assert_eq!(started.load(std::sync::atomic::Ordering::SeqCst), 8);
+        assert_eq!(current.load(std::sync::atomic::Ordering::SeqCst), 4);
+        assert_eq!(maximum.load(std::sync::atomic::Ordering::SeqCst), 4);
+
+        permits.add_permits(4);
+        scheduler.await.expect("join bounded install scheduler");
+        assert_eq!(current.load(std::sync::atomic::Ordering::SeqCst), 0);
     }
 
     #[test]
