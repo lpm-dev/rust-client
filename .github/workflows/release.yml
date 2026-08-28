@@ -1349,7 +1349,7 @@ jobs:
           sigstore_bundle="staged-release/SHA256SUMS.txt.sigstore"
           integrated_time=$(jq -er 'first(.. | objects | .integratedTime? // empty)' "$sigstore_bundle")
           published_at=$(date -u -r "$integrated_time" '+%Y-%m-%dT%H:%M:%SZ')
-          printf '{"published_at":"%s"}\n' "$published_at" \
+          printf '{"tag_name":"v%s","published_at":"%s"}\n' "$version" "$published_at" \
             > "staged-release/release-v${version}.json"
 
           python3 -m http.server 8765 --bind 127.0.0.1 \
