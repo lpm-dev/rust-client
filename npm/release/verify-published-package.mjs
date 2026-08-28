@@ -477,11 +477,7 @@ function validateAttestations({
   const dependencies = build.resolvedDependencies;
   const expectedDependencyUri = `git+${RELEASE_REPOSITORY}@${expectedSourceRef}`;
   const invocationId = provenance.predicate?.runDetails?.metadata?.invocationId;
-  const invocationRun = expectedSourceRunId === "trusted" ? "([1-9]\\d*)" : `(${expectedSourceRunId})`;
-  const invocationPattern = new RegExp(
-    `^${escapeRegExp(RELEASE_REPOSITORY)}/actions/runs/${invocationRun}/attempts/([1-9]\\d*)$`,
-  );
-  const invocationMatch = typeof invocationId === "string" ? invocationId.match(invocationPattern) : null;
+  const invocation = parseGitHubInvocationId(invocationId);
   if (
     build.buildType !== RELEASE_BUILD_TYPE ||
     !eventMatches ||
@@ -492,11 +488,34 @@ function validateAttestations({
     dependencies[0]?.uri !== expectedDependencyUri ||
     dependencies[0]?.digest?.gitCommit !== expectedSourceSha ||
     provenance.predicate?.runDetails?.builder?.id !== RELEASE_BUILDER ||
-    invocationMatch === null
+    invocation === null ||
+    (expectedSourceRunId !== "trusted" && invocation.runId !== expectedSourceRunId)
   ) {
     throw new Error(`The npm provenance source does not match ${packageName}@${version}`);
   }
-  return Object.freeze({ runId: invocationMatch[1], runAttempt: invocationMatch[2] });
+  return Object.freeze(invocation);
+}
+
+function parseGitHubInvocationId(invocationId) {
+  if (typeof invocationId !== "string") {
+    return null;
+  }
+  const prefix = `${RELEASE_REPOSITORY}/actions/runs/`;
+  const separator = "/attempts/";
+  if (!invocationId.startsWith(prefix)) {
+    return null;
+  }
+  const identity = invocationId.slice(prefix.length);
+  const separatorIndex = identity.indexOf(separator);
+  if (separatorIndex < 1 || identity.indexOf(separator, separatorIndex + separator.length) !== -1) {
+    return null;
+  }
+  const runId = identity.slice(0, separatorIndex);
+  const runAttempt = identity.slice(separatorIndex + separator.length);
+  if (!/^[1-9]\d*$/.test(runId) || !/^[1-9]\d*$/.test(runAttempt)) {
+    return null;
+  }
+  return { runId, runAttempt };
 }
 
 function decodeAttestationStatement(attestation, packageName, version, expectedSha512) {
@@ -709,10 +728,6 @@ function assertLowerHex(value, length, label) {
 
 function format(value) {
   return JSON.stringify(value);
-}
-
-function escapeRegExp(value) {
-  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
 function parseArguments(argv) {
