@@ -235,6 +235,11 @@ test("release workflow smoke-tests standalone macOS bundle installation on both 
   assert.match(releaseWorkflow, /test -L "\$HOME\/.lpm\/bin\/lpm"/);
   assert.match(releaseWorkflow, /codesign --verify --strict --verbose=4/);
   assert.match(releaseWorkflow, /stapler validate/);
+  assert.match(
+    releaseWorkflow,
+    /printf '\{"tag_name":"v%s","published_at":"%s"\}\\n' "\$version" "\$published_at"/,
+    "the mocked release response must bind metadata to the requested tag",
+  );
 
   const npmSmoke = fs.readFileSync(
     path.join(repoRoot, "npm/release/smoke-install.mjs"),
