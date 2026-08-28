@@ -14,7 +14,7 @@ expression: actual
     "remediation": "Repair `~/.lpm/global/manifest.toml`, or reinstall the affected global packages."
   },
   "global_manifest_structurally_invalid": {
-    "description": "`~/.lpm/global/manifest.toml` contains an invalid package root, alias, or tombstone.",
+    "description": "`~/.lpm/global/manifest.toml` contains an invalid package, pending recovery, alias, or tombstone record.",
     "when_fires": "The manifest parses, but a record fails global install validation.",
     "remediation": "Repair the affected records, or reinstall the affected global packages."
   },

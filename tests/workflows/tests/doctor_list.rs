@@ -382,7 +382,7 @@ fn doctor_list_global_manifest_metadata_matches_toml_contract() {
         (
             "global_manifest_structurally_invalid",
             serde_json::json!({
-                "description": "`~/.lpm/global/manifest.toml` contains an invalid package root, alias, or tombstone.",
+                "description": "`~/.lpm/global/manifest.toml` contains an invalid package, pending recovery, alias, or tombstone record.",
                 "when_fires": "The manifest parses, but a record fails global install validation.",
                 "remediation": "Repair the affected records, or reinstall the affected global packages.",
             }),

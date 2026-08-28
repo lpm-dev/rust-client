@@ -7,5 +7,5 @@ expression: engine_check
   "check": "Node.js engine compatibility",
   "passed": false,
   "severity": "fail",
-  "detail": "v22.0.0 from script PATH does not satisfy package.json > engines.node ^20"
+  "detail": "v22.0.0 from system PATH does not satisfy package.json > engines.node ^20"
 }
