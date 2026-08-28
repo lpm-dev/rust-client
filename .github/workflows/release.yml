@@ -1,10 +1,6 @@
 name: Release
 
 on:
-  push:
-    tags:
-      - "v*"
-      - "!v*-*"
   schedule:
     - cron: "17 3 * * *"
   workflow_dispatch:
@@ -23,19 +19,21 @@ on:
       mode:
         description: "Release or recovery mode"
         required: true
-        default: "full"
+        default: "candidate"
         type: choice
         options:
+          - candidate
+          - promote
           - full
           - wrapper-only
           - windows-smoke-only
           - npm-publish-only
       source_run_id:
-        description: "Release run ID supplying exact npm artifacts for a targeted recovery"
+        description: "Candidate/release run ID supplying exact artifacts"
         required: false
 
 concurrency:
-  group: release-${{ (github.event_name == 'schedule' || inputs.channel == 'nightly') && 'nightly' || github.ref }}
+  group: release-${{ (github.event_name == 'schedule' || inputs.channel == 'nightly') && 'nightly' || inputs.version || github.ref }}
   cancel-in-progress: false
 
 # Jobs that publish, attest, or request an OIDC token grant those scopes locally.
@@ -88,22 +86,18 @@ jobs:
           set -euo pipefail
 
           SHOULD_RELEASE=true
-          if [ "$GITHUB_EVENT_NAME" = "push" ]; then
-            CHANNEL=stable
-            MODE=full
-            VERSION="${GITHUB_REF_NAME#v}"
-          elif [ "$GITHUB_EVENT_NAME" = "schedule" ]; then
+          if [ "$GITHUB_EVENT_NAME" = "schedule" ]; then
             CHANNEL=nightly
             MODE=full
             VERSION=
           else
             CHANNEL="${INPUT_CHANNEL:-stable}"
-            MODE="${INPUT_MODE:-full}"
+            MODE="${INPUT_MODE:-candidate}"
             VERSION="${INPUT_VERSION:-}"
           fi
 
-          if [ "$MODE" != "full" ] && [ "$GITHUB_REF" != "refs/heads/main" ]; then
-            echo "::error::Recovery workflows must run from the main branch."
+          if [ "$GITHUB_REF" != "refs/heads/main" ]; then
+            echo "::error::Release workflows must run from the main branch."
             exit 1
           fi
 
@@ -217,16 +211,26 @@ jobs:
                 exit 1
               fi
               if [ "$MODE" = "full" ]; then
-                EXPECTED_REF="refs/tags/v${VERSION}"
-                if [ "$GITHUB_REF" != "$EXPECTED_REF" ]; then
-                  echo "::error::Stable full releases must run from $EXPECTED_REF, got $GITHUB_REF."
+                echo "::error::Stable releases use candidate followed by promote; full is reserved for nightly releases."
+                exit 1
+              fi
+              if [ "$MODE" = "candidate" ]; then
+                if gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/v${VERSION}" >/dev/null 2>&1; then
+                  echo "::error::Tag v${VERSION} already exists; choose a new version before building a candidate."
                   exit 1
                 fi
+              elif [ "$MODE" = "promote" ] && [ -z "${{ inputs.source_run_id }}" ]; then
+                echo "::error::source_run_id is required when promoting a candidate."
+                exit 1
               fi
               NPM_TAG=latest
               PRERELEASE=false
               ;;
             nightly)
+              if [ "$MODE" = "candidate" ] || [ "$MODE" = "promote" ]; then
+                echo "::error::candidate and promote are stable-only modes."
+                exit 1
+              fi
               if ! printf '%s\n' "$VERSION" | grep -Eq '^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.0-nightly\.[0-9]{8}\.[1-9][0-9]*\.([0-9a-f]{7}|g0[0-9]{6})$'; then
                 echo "::error::Generated nightly version has an invalid shape: '$VERSION'."
                 exit 1
@@ -240,7 +244,7 @@ jobs:
               ;;
           esac
 
-          if [ "$MODE" = "full" ]; then
+          if [ "$MODE" = "full" ] || [ "$MODE" = "candidate" ]; then
             WORKSPACE_VERSION=$(node --input-type=module -e \
               'import { workspaceStableVersion } from "./npm/release/nightly-version.mjs"; console.log(workspaceStableVersion("."));')
             if [ "$CHANNEL" = "stable" ] && [ "$VERSION" != "$WORKSPACE_VERSION" ]; then
@@ -383,9 +387,61 @@ jobs:
       - name: Audit-scale workflow fixtures
         run: cargo nextest run --locked -P audit -p lpm-workflows --test install_realworld --run-ignored only --no-fail-fast --status-level slow --final-status-level fail
 
+  verify-candidate-source:
+    name: Reuse successful main CI verification
+    needs: release-metadata
+    if: needs.release-metadata.outputs.should_release == 'true' && needs.release-metadata.outputs.mode == 'candidate'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      actions: read
+      contents: read
+    steps:
+      - name: Require successful CI for the exact candidate commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          runs=$(gh api --method GET \
+            "repos/${GITHUB_REPOSITORY}/actions/workflows/ci.yml/runs" \
+            -f branch=main \
+            -f event=push \
+            -f head_sha="$GITHUB_SHA" \
+            -f status=success \
+            -f per_page=100)
+          count=$(printf '%s' "$runs" | jq '[.workflow_runs[] | select(
+            .head_sha == env.GITHUB_SHA and
+            .head_branch == "main" and
+            .event == "push" and
+            .status == "completed" and
+            .conclusion == "success" and
+            .head_repository.full_name == env.GITHUB_REPOSITORY
+          )] | length')
+          if [ "$count" -lt 1 ]; then
+            echo "::error::The exact candidate commit must pass the main CI workflow before release construction starts."
+            exit 1
+          fi
+          echo "Reusing successful main CI verification for $GITHUB_SHA."
+
+  release-preflight:
+    needs: release-metadata
+    if: >-
+      needs.release-metadata.outputs.should_release == 'true' &&
+      (needs.release-metadata.outputs.mode == 'candidate' || needs.release-metadata.outputs.mode == 'full')
+    uses: ./.github/workflows/release-preflight.yml
+    secrets:
+      APPLE_CLI_PROVISIONING_PROFILE_BASE64: ${{ secrets.APPLE_CLI_PROVISIONING_PROFILE_BASE64 }}
+      APPLE_DEVELOPER_ID_P12_BASE64: ${{ secrets.APPLE_DEVELOPER_ID_P12_BASE64 }}
+      APPLE_DEVELOPER_ID_P12_PASSWORD: ${{ secrets.APPLE_DEVELOPER_ID_P12_PASSWORD }}
+      APPLE_NOTARY_ISSUER_ID: ${{ secrets.APPLE_NOTARY_ISSUER_ID }}
+      APPLE_NOTARY_KEY_BASE64: ${{ secrets.APPLE_NOTARY_KEY_BASE64 }}
+      APPLE_NOTARY_KEY_ID: ${{ secrets.APPLE_NOTARY_KEY_ID }}
+
   verify-windows-filesystem:
     needs: release-metadata
-    if: needs.release-metadata.outputs.should_release == 'true' && needs.release-metadata.outputs.mode == 'full'
+    if: >-
+      needs.release-metadata.outputs.should_release == 'true' &&
+      (needs.release-metadata.outputs.mode == 'candidate' || needs.release-metadata.outputs.mode == 'full')
     uses: ./.github/workflows/windows-filesystem-gate.yml
 
   build:
@@ -393,8 +449,16 @@ jobs:
     needs:
       - release-metadata
       - verify
+      - verify-candidate-source
+      - release-preflight
       - verify-windows-filesystem
-    if: needs.release-metadata.outputs.should_release == 'true' && needs.release-metadata.outputs.mode == 'full'
+    if: >-
+      always() &&
+      needs.release-metadata.outputs.should_release == 'true' &&
+      needs.release-preflight.result == 'success' &&
+      needs.verify-windows-filesystem.result == 'success' &&
+      ((needs.release-metadata.outputs.mode == 'full' && needs.verify.result == 'success') ||
+      (needs.release-metadata.outputs.mode == 'candidate' && needs.verify-candidate-source.result == 'success'))
     runs-on: ${{ matrix.os }}
     timeout-minutes: ${{ matrix.timeout_minutes }}
     env:
@@ -451,12 +515,15 @@ jobs:
         if: matrix.target != 'x86_64-unknown-linux-musl' && matrix.portable_glibc != true
         run: cargo build --locked --release --target ${{ matrix.target }} -p lpm-cli
 
+      - name: Preserve provisioned macOS binary
+        if: runner.os == 'macOS'
+        run: cp "target/${{ matrix.target }}/release/lpm-rs" "$RUNNER_TEMP/lpm-rs-provisioned"
+
       - name: Build legacy-only macOS compatibility binary
         if: runner.os == 'macOS'
         run: >-
           cargo build --locked --release
           --target ${{ matrix.target }}
-          --target-dir target/legacy-macos-keychain
           -p lpm-cli
           --features legacy-macos-keychain
 
@@ -494,7 +561,7 @@ jobs:
       - name: Stage binary
         run: |
           if [ "${{ runner.os }}" = "macOS" ]; then
-            cp target/legacy-macos-keychain/${{ matrix.target }}/release/lpm-rs ${{ matrix.binary }}
+            cp target/${{ matrix.target }}/release/lpm-rs ${{ matrix.binary }}
           else
             cp target/${{ matrix.target }}/release/lpm-rs ${{ matrix.binary }}
           fi
@@ -565,6 +632,7 @@ jobs:
           KEYCHAIN_PASSWORD="$(uuidgen)"
           trap 'rm -f "$CERT_PATH"' EXIT
 
+          umask 077
           echo "APPLE_SIGNING_KEYCHAIN=$KEYCHAIN_PATH" >> "$GITHUB_ENV"
           echo "APPLE_KEYCHAIN_SEARCH_LIST_STATE=$KEYCHAIN_SEARCH_LIST_STATE" >> "$GITHUB_ENV"
 
@@ -606,7 +674,7 @@ jobs:
           APP_BUNDLE="$RUNNER_TEMP/${{ matrix.binary }}-bundle/LPM CLI.app"
           mkdir -p "$APP_BUNDLE/Contents/MacOS"
           cp macos/LPMCLI-Info.plist "$APP_BUNDLE/Contents/Info.plist"
-          cp "target/${{ matrix.target }}/release/lpm-rs" "$APP_BUNDLE/Contents/MacOS/lpm-rs"
+          cp "$RUNNER_TEMP/lpm-rs-provisioned" "$APP_BUNDLE/Contents/MacOS/lpm-rs"
           chmod 755 "$APP_BUNDLE/Contents/MacOS/lpm-rs"
           printf '%s' "$APPLE_CLI_PROVISIONING_PROFILE_BASE64" | base64 --decode > "$PROFILE_PATH"
           security cms -D -i "$PROFILE_PATH" > "$PROFILE_PLIST"
@@ -643,61 +711,16 @@ jobs:
           test "$SIGNED_TEAM_ID" = "$APPLE_TEAM_ID"
           test "$SIGNED_IDENTIFIER" = "$APPLE_CODESIGN_IDENTIFIER"
 
-      - name: Notarize and staple macOS artifacts
+      - name: Archive signed macOS notarization inputs
         if: runner.os == 'macOS'
-        env:
-          APPLE_NOTARY_KEY_BASE64: ${{ secrets.APPLE_NOTARY_KEY_BASE64 }}
-          APPLE_NOTARY_KEY_ID: ${{ secrets.APPLE_NOTARY_KEY_ID }}
-          APPLE_NOTARY_ISSUER_ID: ${{ secrets.APPLE_NOTARY_ISSUER_ID }}
-          APPLE_ID: ${{ secrets.APPLE_ID }}
-          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
         run: |
           set -euo pipefail
-
           APP_BUNDLE="$RUNNER_TEMP/${{ matrix.binary }}-bundle/LPM CLI.app"
-          BUNDLE_NOTARY_ZIP="$RUNNER_TEMP/${{ matrix.binary }}-bundle-notary.zip"
+          mkdir notarization-input
+          BUNDLE_NOTARY_ZIP="notarization-input/${{ matrix.binary }}-bundle-notary.zip"
           ditto -c -k --keepParent --norsrc "$APP_BUNDLE" "$BUNDLE_NOTARY_ZIP"
-          LEGACY_NOTARY_ZIP="$RUNNER_TEMP/${{ matrix.binary }}-legacy-notary.zip"
+          LEGACY_NOTARY_ZIP="notarization-input/${{ matrix.binary }}-legacy-notary.zip"
           ditto -c -k --keepParent --norsrc "${{ matrix.binary }}" "$LEGACY_NOTARY_ZIP"
-
-          if [ -n "${APPLE_NOTARY_KEY_BASE64:-}" ] || [ -n "${APPLE_NOTARY_KEY_ID:-}" ] || [ -n "${APPLE_NOTARY_ISSUER_ID:-}" ]; then
-            if [ -z "${APPLE_NOTARY_KEY_BASE64:-}" ] || [ -z "${APPLE_NOTARY_KEY_ID:-}" ] || [ -z "${APPLE_NOTARY_ISSUER_ID:-}" ]; then
-              echo "::error::Set APPLE_NOTARY_KEY_BASE64, APPLE_NOTARY_KEY_ID, and APPLE_NOTARY_ISSUER_ID together."
-              exit 1
-            fi
-
-            NOTARY_KEY_PATH="$RUNNER_TEMP/AuthKey_${APPLE_NOTARY_KEY_ID}.p8"
-            trap 'rm -f "$NOTARY_KEY_PATH"' EXIT
-            printf '%s' "$APPLE_NOTARY_KEY_BASE64" | base64 --decode > "$NOTARY_KEY_PATH"
-            chmod 600 "$NOTARY_KEY_PATH"
-
-            NOTARY_AUTH=(
-              --key "$NOTARY_KEY_PATH"
-              --key-id "$APPLE_NOTARY_KEY_ID"
-              --issuer "$APPLE_NOTARY_ISSUER_ID"
-            )
-          else
-            if [ -z "${APPLE_ID:-}" ] || [ -z "${APPLE_APP_SPECIFIC_PASSWORD:-}" ]; then
-              echo "::error::Set App Store Connect API key secrets, or set APPLE_ID and APPLE_APP_SPECIFIC_PASSWORD for notarization."
-              exit 1
-            fi
-
-            NOTARY_AUTH=(
-              --apple-id "$APPLE_ID"
-              --team-id "$APPLE_TEAM_ID"
-              --password "$APPLE_APP_SPECIFIC_PASSWORD"
-            )
-          fi
-
-          xcrun notarytool submit "$BUNDLE_NOTARY_ZIP" "${NOTARY_AUTH[@]}" --wait --timeout 30m
-          xcrun notarytool submit "$LEGACY_NOTARY_ZIP" "${NOTARY_AUTH[@]}" --wait --timeout 30m
-          xcrun stapler staple "$APP_BUNDLE"
-          xcrun stapler validate "$APP_BUNDLE"
-          codesign --verify --strict --verbose=4 "$APP_BUNDLE"
-          spctl --assess --type execute --verbose=4 "$APP_BUNDLE"
-
-          # The public ZIP must contain the stapled bundle, not the pre-staple bytes.
-          ditto -c -k --keepParent --norsrc "$APP_BUNDLE" "${{ matrix.binary }}.zip"
 
       - name: Restore Keychain search list before executing release code (macOS)
         if: runner.os == 'macOS'
@@ -714,48 +737,16 @@ jobs:
         with:
           name: ${{ matrix.binary }}
           path: ${{ matrix.binary }}
+          retention-days: 1
 
-      - name: Upload macOS bundle and compatibility artifact
+      - name: Upload immutable signed macOS notarization inputs
         if: runner.os == 'macOS'
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
         with:
-          name: ${{ matrix.binary }}
-          path: |
-            ${{ matrix.binary }}
-            ${{ matrix.binary }}.zip
-
-      - name: Execute release app bundle and compatibility binary (macOS)
-        if: runner.os == 'macOS'
-        run: |
-          set -euo pipefail
-          VERSION="${{ needs.release-metadata.outputs.version }}"
-          APP_EXECUTABLE="$RUNNER_TEMP/${{ matrix.binary }}-bundle/LPM CLI.app/Contents/MacOS/lpm-rs"
-          case "${{ matrix.target }}" in
-            aarch64-apple-darwin)
-              actual=$(arch -arm64 "$APP_EXECUTABLE" --version)
-              legacy_actual=$(arch -arm64 "./${{ matrix.binary }}" --version)
-              ;;
-            x86_64-apple-darwin)
-              actual=$(arch -x86_64 "$APP_EXECUTABLE" --version)
-              legacy_actual=$(arch -x86_64 "./${{ matrix.binary }}" --version)
-              ;;
-            *)
-              echo "::error::Unexpected macOS target ${{ matrix.target }}"
-              exit 1
-              ;;
-          esac
-          test "$actual" = "lpm $VERSION"
-          test "$legacy_actual" = "lpm $VERSION"
-          arch_name=$(file "$APP_EXECUTABLE")
-          echo "$arch_name"
-
-          raw_smoke_home="$RUNNER_TEMP/raw-keychain-home"
-          raw_smoke_project="$RUNNER_TEMP/raw-keychain-project"
-          mkdir -p "$raw_smoke_home" "$raw_smoke_project"
-          cd "$raw_smoke_project"
-          LPM_HOME="$raw_smoke_home" "$GITHUB_WORKSPACE/${{ matrix.binary }}" env set LPM_RELEASE_SMOKE=verified
-          LPM_HOME="$raw_smoke_home" "$GITHUB_WORKSPACE/${{ matrix.binary }}" env get LPM_RELEASE_SMOKE >/dev/null
-          LPM_HOME="$raw_smoke_home" "$GITHUB_WORKSPACE/${{ matrix.binary }}" env delete LPM_RELEASE_SMOKE
+          name: notarization-input-${{ matrix.binary }}
+          path: notarization-input/
+          if-no-files-found: error
+          retention-days: 1
 
       - name: Execute release binary (Linux glibc)
         if: runner.os == 'Linux' && matrix.target != 'x86_64-unknown-linux-musl'
@@ -784,13 +775,249 @@ jobs:
           fi
           exit "$cleanup_status"
 
+  notarize-macos:
+    name: Notarize ${{ matrix.target }}
+    needs:
+      - build
+      - release-metadata
+    if: >-
+      needs.release-metadata.outputs.should_release == 'true' &&
+      (needs.release-metadata.outputs.mode == 'candidate' || needs.release-metadata.outputs.mode == 'full')
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 120
+    permissions:
+      actions: read
+      contents: read
+    strategy:
+      matrix:
+        include:
+          - target: x86_64-apple-darwin
+            os: macos-15-intel
+            binary: lpm-darwin-x64
+          - target: aarch64-apple-darwin
+            os: macos-15
+            binary: lpm-darwin-arm64
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+
+      - name: Resolve exact signed notarization input
+        id: input
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          name="notarization-input-${{ matrix.binary }}"
+          exact=$(gh api --paginate --slurp \
+            "repos/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}/artifacts?per_page=100" | \
+            jq -c --arg name "$name" --arg sha "$GITHUB_SHA" --argjson run "$GITHUB_RUN_ID" \
+              '[.[].artifacts[] | select(
+                .name == $name and
+                .expired == false and
+                .workflow_run.id == $run and
+                .workflow_run.head_sha == $sha
+              )]')
+          if [ "$(printf '%s' "$exact" | jq length)" -ne 1 ]; then
+            echo "::error::Expected exactly one immutable $name artifact."
+            exit 1
+          fi
+          artifact_id=$(printf '%s' "$exact" | jq -er '.[0].id')
+          artifact_digest=$(printf '%s' "$exact" | jq -er '.[0].digest')
+          if ! [[ "$artifact_id" =~ ^[1-9][0-9]*$ ]] || \
+             ! [[ "$artifact_digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "::error::Signed notarization input has an invalid immutable identity."
+            exit 1
+          fi
+          {
+            echo "artifact_id=$artifact_id"
+            echo "artifact_digest=$artifact_digest"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Download exact signed notarization input
+        env:
+          ARTIFACT_DIGEST: ${{ steps.input.outputs.artifact_digest }}
+          ARTIFACT_ID: ${{ steps.input.outputs.artifact_id }}
+          GH_TOKEN: ${{ github.token }}
+        run: >-
+          scripts/ci/download-verified-artifact.sh
+          "$GITHUB_REPOSITORY" "$ARTIFACT_ID" "$ARTIFACT_DIGEST" notarization-input
+
+      - name: Restore latest notarization submission state
+        id: state
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          prefix="notarization-state-${{ matrix.binary }}-"
+          matches=$(gh api --paginate --slurp \
+            "repos/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}/artifacts?per_page=100" | \
+            jq -c --arg prefix "$prefix" --arg sha "$GITHUB_SHA" --argjson run "$GITHUB_RUN_ID" \
+              '[.[].artifacts[] | select(
+                (.name | startswith($prefix)) and
+                .expired == false and
+                .workflow_run.id == $run and
+                .workflow_run.head_sha == $sha
+              )] | sort_by(.created_at)')
+          count=$(printf '%s' "$matches" | jq length)
+          if [ "$count" -eq 0 ]; then
+            mkdir notarization-state
+            echo "recovered=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          artifact_id=$(printf '%s' "$matches" | jq -er 'last.id')
+          artifact_digest=$(printf '%s' "$matches" | jq -er 'last.digest')
+          scripts/ci/download-verified-artifact.sh \
+            "$GITHUB_REPOSITORY" "$artifact_id" "$artifact_digest" notarization-state
+          echo "recovered=true" >> "$GITHUB_OUTPUT"
+
+      - name: Extract and verify signed macOS inputs
+        run: |
+          set -euo pipefail
+          APP_BUNDLE="$RUNNER_TEMP/${{ matrix.binary }}-bundle/LPM CLI.app"
+          mkdir -p "$(dirname "$APP_BUNDLE")" "$RUNNER_TEMP/${{ matrix.binary }}-legacy"
+          ditto -x -k "notarization-input/${{ matrix.binary }}-bundle-notary.zip" \
+            "$(dirname "$APP_BUNDLE")"
+          ditto -x -k "notarization-input/${{ matrix.binary }}-legacy-notary.zip" \
+            "$RUNNER_TEMP/${{ matrix.binary }}-legacy"
+          cp "$RUNNER_TEMP/${{ matrix.binary }}-legacy/${{ matrix.binary }}" "${{ matrix.binary }}"
+          chmod 755 "${{ matrix.binary }}"
+          codesign --verify --strict --verbose=4 "$APP_BUNDLE"
+          codesign --verify --strict --verbose=4 "${{ matrix.binary }}"
+
+      - name: Submit macOS artifacts for notarization once
+        id: submit
+        env:
+          APPLE_NOTARY_KEY_BASE64: ${{ secrets.APPLE_NOTARY_KEY_BASE64 }}
+          APPLE_NOTARY_KEY_ID: ${{ secrets.APPLE_NOTARY_KEY_ID }}
+          APPLE_NOTARY_ISSUER_ID: ${{ secrets.APPLE_NOTARY_ISSUER_ID }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+        run: |
+          set -euo pipefail
+          if [ -n "${APPLE_NOTARY_KEY_BASE64:-}" ] || [ -n "${APPLE_NOTARY_KEY_ID:-}" ] || [ -n "${APPLE_NOTARY_ISSUER_ID:-}" ]; then
+            if [ -z "${APPLE_NOTARY_KEY_BASE64:-}" ] || [ -z "${APPLE_NOTARY_KEY_ID:-}" ] || [ -z "${APPLE_NOTARY_ISSUER_ID:-}" ]; then
+              echo "::error::Set APPLE_NOTARY_KEY_BASE64, APPLE_NOTARY_KEY_ID, and APPLE_NOTARY_ISSUER_ID together."
+              exit 1
+            fi
+            NOTARY_KEY_PATH="$RUNNER_TEMP/AuthKey_${APPLE_NOTARY_KEY_ID}.p8"
+            trap 'rm -f "$NOTARY_KEY_PATH"' EXIT
+            umask 077
+            printf '%s' "$APPLE_NOTARY_KEY_BASE64" | base64 --decode > "$NOTARY_KEY_PATH"
+            NOTARY_AUTH=(--key "$NOTARY_KEY_PATH" --key-id "$APPLE_NOTARY_KEY_ID" --issuer "$APPLE_NOTARY_ISSUER_ID")
+          else
+            if [ -z "${APPLE_ID:-}" ] || [ -z "${APPLE_APP_SPECIFIC_PASSWORD:-}" ]; then
+              echo "::error::Set App Store Connect API key secrets, or set APPLE_ID and APPLE_APP_SPECIFIC_PASSWORD."
+              exit 1
+            fi
+            NOTARY_AUTH=(--apple-id "$APPLE_ID" --team-id "$APPLE_TEAM_ID" --password "$APPLE_APP_SPECIFIC_PASSWORD")
+          fi
+          submit_status=0
+          LPM_NOTARY_MODE=submit \
+          LPM_NOTARY_STATE_PATH="notarization-state/bundle.json" \
+            scripts/ci/notarize-with-retry.sh \
+              "notarization-input/${{ matrix.binary }}-bundle-notary.zip" "${NOTARY_AUTH[@]}" || submit_status=1
+          LPM_NOTARY_MODE=submit \
+          LPM_NOTARY_STATE_PATH="notarization-state/legacy.json" \
+            scripts/ci/notarize-with-retry.sh \
+              "notarization-input/${{ matrix.binary }}-legacy-notary.zip" "${NOTARY_AUTH[@]}" || submit_status=1
+          exit "$submit_status"
+
+      - name: Persist notarization submission IDs before polling
+        if: always()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: notarization-state-${{ matrix.binary }}-${{ github.run_attempt }}
+          path: notarization-state/*.json
+          if-no-files-found: warn
+          retention-days: 1
+
+      - name: Resume polling the persisted notarization submissions
+        env:
+          APPLE_NOTARY_KEY_BASE64: ${{ secrets.APPLE_NOTARY_KEY_BASE64 }}
+          APPLE_NOTARY_KEY_ID: ${{ secrets.APPLE_NOTARY_KEY_ID }}
+          APPLE_NOTARY_ISSUER_ID: ${{ secrets.APPLE_NOTARY_ISSUER_ID }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+        run: |
+          set -euo pipefail
+          if [ -n "${APPLE_NOTARY_KEY_BASE64:-}" ]; then
+            NOTARY_KEY_PATH="$RUNNER_TEMP/AuthKey_${APPLE_NOTARY_KEY_ID}.p8"
+            trap 'rm -f "$NOTARY_KEY_PATH"' EXIT
+            umask 077
+            printf '%s' "$APPLE_NOTARY_KEY_BASE64" | base64 --decode > "$NOTARY_KEY_PATH"
+            NOTARY_AUTH=(--key "$NOTARY_KEY_PATH" --key-id "$APPLE_NOTARY_KEY_ID" --issuer "$APPLE_NOTARY_ISSUER_ID")
+          else
+            NOTARY_AUTH=(--apple-id "$APPLE_ID" --team-id "$APPLE_TEAM_ID" --password "$APPLE_APP_SPECIFIC_PASSWORD")
+          fi
+          LPM_NOTARY_MODE=poll \
+          LPM_NOTARY_STATE_PATH="notarization-state/bundle.json" \
+            scripts/ci/notarize-with-retry.sh \
+              "notarization-input/${{ matrix.binary }}-bundle-notary.zip" "${NOTARY_AUTH[@]}"
+          LPM_NOTARY_MODE=poll \
+          LPM_NOTARY_STATE_PATH="notarization-state/legacy.json" \
+            scripts/ci/notarize-with-retry.sh \
+              "notarization-input/${{ matrix.binary }}-legacy-notary.zip" "${NOTARY_AUTH[@]}"
+
+      - name: Staple validate and package notarized macOS artifacts
+        run: |
+          set -euo pipefail
+          APP_BUNDLE="$RUNNER_TEMP/${{ matrix.binary }}-bundle/LPM CLI.app"
+          xcrun stapler staple "$APP_BUNDLE"
+          xcrun stapler validate "$APP_BUNDLE"
+          codesign --verify --strict --verbose=4 "$APP_BUNDLE"
+          spctl --assess --type execute --verbose=4 "$APP_BUNDLE"
+          ditto -c -k --keepParent --norsrc "$APP_BUNDLE" "${{ matrix.binary }}.zip"
+
+      - name: Upload macOS bundle and compatibility artifact
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: ${{ matrix.binary }}
+          path: |
+            ${{ matrix.binary }}
+            ${{ matrix.binary }}.zip
+          if-no-files-found: error
+          retention-days: 1
+
+      - name: Execute notarized app bundle and compatibility binary
+        run: |
+          set -euo pipefail
+          VERSION="${{ needs.release-metadata.outputs.version }}"
+          APP_EXECUTABLE="$RUNNER_TEMP/${{ matrix.binary }}-bundle/LPM CLI.app/Contents/MacOS/lpm-rs"
+          case "${{ matrix.target }}" in
+            aarch64-apple-darwin)
+              actual=$(arch -arm64 "$APP_EXECUTABLE" --version)
+              legacy_actual=$(arch -arm64 "./${{ matrix.binary }}" --version)
+              ;;
+            x86_64-apple-darwin)
+              actual=$(arch -x86_64 "$APP_EXECUTABLE" --version)
+              legacy_actual=$(arch -x86_64 "./${{ matrix.binary }}" --version)
+              ;;
+          esac
+          test "$actual" = "lpm $VERSION"
+          test "$legacy_actual" = "lpm $VERSION"
+          file "$APP_EXECUTABLE"
+          raw_smoke_home="$RUNNER_TEMP/raw-keychain-home"
+          raw_smoke_project="$RUNNER_TEMP/raw-keychain-project"
+          mkdir -p "$raw_smoke_home" "$raw_smoke_project"
+          cd "$raw_smoke_project"
+          LPM_HOME="$raw_smoke_home" "$GITHUB_WORKSPACE/${{ matrix.binary }}" env set LPM_RELEASE_SMOKE=verified
+          LPM_HOME="$raw_smoke_home" "$GITHUB_WORKSPACE/${{ matrix.binary }}" env get LPM_RELEASE_SMOKE >/dev/null
+          LPM_HOME="$raw_smoke_home" "$GITHUB_WORKSPACE/${{ matrix.binary }}" env delete LPM_RELEASE_SMOKE
+
   build-windows:
     name: Build x86_64-pc-windows-msvc
     needs:
       - release-metadata
       - verify
+      - verify-candidate-source
+      - release-preflight
       - verify-windows-filesystem
-    if: needs.release-metadata.outputs.should_release == 'true' && needs.release-metadata.outputs.mode == 'full'
+    if: >-
+      always() &&
+      needs.release-metadata.outputs.should_release == 'true' &&
+      needs.release-preflight.result == 'success' &&
+      needs.verify-windows-filesystem.result == 'success' &&
+      ((needs.release-metadata.outputs.mode == 'full' && needs.verify.result == 'success') ||
+      (needs.release-metadata.outputs.mode == 'candidate' && needs.verify-candidate-source.result == 'success'))
     runs-on: windows-latest
     timeout-minutes: 120
     env:
@@ -840,7 +1067,9 @@ jobs:
     needs:
       - build-windows
       - release-metadata
-    if: needs.release-metadata.outputs.should_release == 'true' && needs.release-metadata.outputs.mode == 'full'
+    if: >-
+      needs.release-metadata.outputs.should_release == 'true' &&
+      (needs.release-metadata.outputs.mode == 'candidate' || needs.release-metadata.outputs.mode == 'full')
     runs-on: windows-latest
     environment: windows-signing
     timeout-minutes: 20
@@ -926,23 +1155,30 @@ jobs:
         with:
           name: lpm-win32-x64.exe
           path: lpm-win32-x64.exe
+          retention-days: 1
 
       - name: Upload helper artifact
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
         with:
           name: lpm-sandbox-helper-win32-x64.exe
           path: lpm-sandbox-helper-win32-x64.exe
+          retention-days: 1
 
   pack-npm-packages:
     name: Pack exact npm release artifacts
     needs:
       - build
+      - notarize-macos
       - sign-windows
       - release-metadata
-    if: needs.release-metadata.outputs.should_release == 'true' && needs.release-metadata.outputs.mode == 'full'
+    if: >-
+      needs.release-metadata.outputs.should_release == 'true' &&
+      (needs.release-metadata.outputs.mode == 'candidate' || needs.release-metadata.outputs.mode == 'full')
     runs-on: ubuntu-latest
     timeout-minutes: 15
     outputs:
+      artifact_digest: sha256:${{ steps.npm-artifact.outputs['artifact-digest'] }}
+      artifact_id: ${{ steps.npm-artifact.outputs['artifact-id'] }}
       version: ${{ needs.release-metadata.outputs.version }}
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
@@ -1000,21 +1236,27 @@ jobs:
             --version "${{ needs.release-metadata.outputs.version }}"
 
       - name: Upload exact npm tarballs
+        id: npm-artifact
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
         with:
           name: npm-release-packages
           path: npm-release-packages/
           if-no-files-found: error
-          retention-days: 14
+          retention-days: ${{ needs.release-metadata.outputs.mode == 'candidate' && 1 || 14 }}
 
   smoke-npm-packages:
     name: Smoke npm artifacts (${{ matrix.platform }})
     needs:
       - pack-npm-packages
       - release-metadata
-    if: needs.release-metadata.outputs.should_release == 'true' && needs.release-metadata.outputs.mode == 'full'
+    if: >-
+      needs.release-metadata.outputs.should_release == 'true' &&
+      (needs.release-metadata.outputs.mode == 'candidate' || needs.release-metadata.outputs.mode == 'full')
     runs-on: ${{ matrix.os }}
     timeout-minutes: 20
+    permissions:
+      actions: read
+      contents: read
     strategy:
       fail-fast: false
       matrix:
@@ -1041,10 +1283,14 @@ jobs:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
 
       - name: Download exact npm tarballs
-        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
-        with:
-          name: npm-release-packages
-          path: npm-release-packages
+        shell: bash
+        env:
+          ARTIFACT_DIGEST: ${{ needs.pack-npm-packages.outputs.artifact_digest }}
+          ARTIFACT_ID: ${{ needs.pack-npm-packages.outputs.artifact_id }}
+          GH_TOKEN: ${{ github.token }}
+        run: >-
+          scripts/ci/download-verified-artifact.sh
+          "$GITHUB_REPOSITORY" "$ARTIFACT_ID" "$ARTIFACT_DIGEST" npm-release-packages
 
       - name: Install Node 22
         if: matrix.alpine != true
@@ -1116,13 +1362,14 @@ jobs:
             --github-output "$GITHUB_OUTPUT"
 
       - name: Download exact npm tarballs from source release run
-        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
-        with:
-          artifact-ids: ${{ steps.source.outputs.artifact_id }}
-          path: npm-release-packages
-          repository: ${{ github.repository }}
-          run-id: ${{ inputs.source_run_id }}
-          github-token: ${{ github.token }}
+        shell: bash
+        env:
+          ARTIFACT_DIGEST: ${{ steps.source.outputs.artifact_digest }}
+          ARTIFACT_ID: ${{ steps.source.outputs.artifact_id }}
+          GH_TOKEN: ${{ github.token }}
+        run: >-
+          scripts/ci/download-verified-artifact.sh
+          "$GITHUB_REPOSITORY" "$ARTIFACT_ID" "$ARTIFACT_DIGEST" npm-release-packages
 
       - name: Pin npm used by release consumers
         run: npm install --global npm@11.12.1 --no-audit --no-fund
@@ -1140,7 +1387,9 @@ jobs:
       - build
       - release-metadata
       - smoke-npm-packages
-    if: needs.release-metadata.outputs.should_release == 'true' && needs.release-metadata.outputs.mode == 'full'
+    if: >-
+      needs.release-metadata.outputs.should_release == 'true' &&
+      (needs.release-metadata.outputs.mode == 'candidate' || needs.release-metadata.outputs.mode == 'full')
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
@@ -1150,6 +1399,9 @@ jobs:
       attestations: write
     env:
       RELEASE_TAG: ${{ needs.release-metadata.outputs.tag }}
+    outputs:
+      artifact_digest: sha256:${{ steps.github-release-artifact.outputs['artifact-digest'] }}
+      artifact_id: ${{ steps.github-release-artifact.outputs['artifact-id'] }}
     steps:
       - name: Download signed release binaries
         uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
@@ -1202,6 +1454,7 @@ jobs:
         run: cp "${{ steps.attest.outputs.bundle-path }}" binaries/SHA256SUMS.txt.sigstore
 
       - name: Remove stale draft release for the exact tag
+        if: needs.release-metadata.outputs.mode == 'full'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -1227,6 +1480,7 @@ jobs:
       # The release action retries while a new release becomes discoverable by
       # tag. Supplying one precomputed body keeps those retries idempotent.
       - name: Generate release notes
+        if: needs.release-metadata.outputs.mode == 'full'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -1239,6 +1493,7 @@ jobs:
           test -s "$RUNNER_TEMP/release-notes.md"
 
       - name: Create draft GitHub Release
+        if: needs.release-metadata.outputs.mode == 'full'
         uses: softprops/action-gh-release@7c4723f7a335432393329f8f1c564994ce50185d # v3
         with:
           tag_name: ${{ env.RELEASE_TAG }}
@@ -1253,20 +1508,27 @@ jobs:
           target_commitish: ${{ github.sha }}
 
       - name: Upload exact staged GitHub release
+        id: github-release-artifact
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
         with:
           name: staged-github-release
           path: binaries/
           if-no-files-found: error
+          retention-days: 1
 
   smoke-standalone-installer:
     name: ${{ matrix.name }}
     needs:
       - release
       - release-metadata
-    if: needs.release-metadata.outputs.should_release == 'true' && needs.release-metadata.outputs.mode == 'full'
+    if: >-
+      needs.release-metadata.outputs.should_release == 'true' &&
+      (needs.release-metadata.outputs.mode == 'candidate' || needs.release-metadata.outputs.mode == 'full')
     runs-on: ${{ matrix.os }}
     timeout-minutes: 15
+    permissions:
+      actions: read
+      contents: read
     strategy:
       fail-fast: false
       matrix:
@@ -1295,10 +1557,14 @@ jobs:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
 
       - name: Download exact staged GitHub release
-        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
-        with:
-          name: staged-github-release
-          path: staged-release
+        shell: bash
+        env:
+          ARTIFACT_DIGEST: ${{ needs.release.outputs.artifact_digest }}
+          ARTIFACT_ID: ${{ needs.release.outputs.artifact_id }}
+          GH_TOKEN: ${{ github.token }}
+        run: >-
+          scripts/ci/download-verified-artifact.sh
+          "$GITHUB_REPOSITORY" "$ARTIFACT_ID" "$ARTIFACT_DIGEST" staged-release
 
       - name: Install exact release through install.sh
         if: matrix.platform == 'linux'
@@ -1481,6 +1747,665 @@ jobs:
           /usr/bin/xcrun stapler validate "$app"
           /usr/sbin/spctl --assess --type execute --verbose=4 "$app"
 
+  seal-candidate:
+    name: Seal stable release candidate
+    needs:
+      - release
+      - release-metadata
+      - pack-npm-packages
+      - smoke-npm-packages
+      - smoke-standalone-installer
+    if: >-
+      always() &&
+      needs.release-metadata.outputs.mode == 'candidate' &&
+      needs.release.result == 'success' &&
+      needs.pack-npm-packages.result == 'success' &&
+      needs.smoke-npm-packages.result == 'success' &&
+      needs.smoke-standalone-installer.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      actions: read
+      contents: read
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+
+      - name: Download exact staged GitHub assets
+        env:
+          ARTIFACT_DIGEST: ${{ needs.release.outputs.artifact_digest }}
+          ARTIFACT_ID: ${{ needs.release.outputs.artifact_id }}
+          GH_TOKEN: ${{ github.token }}
+        run: >-
+          scripts/ci/download-verified-artifact.sh
+          "$GITHUB_REPOSITORY" "$ARTIFACT_ID" "$ARTIFACT_DIGEST" staged-github-release
+
+      - name: Download exact npm tarballs
+        env:
+          ARTIFACT_DIGEST: ${{ needs.pack-npm-packages.outputs.artifact_digest }}
+          ARTIFACT_ID: ${{ needs.pack-npm-packages.outputs.artifact_id }}
+          GH_TOKEN: ${{ github.token }}
+        run: >-
+          scripts/ci/download-verified-artifact.sh
+          "$GITHUB_REPOSITORY" "$ARTIFACT_ID" "$ARTIFACT_DIGEST" npm-release-packages
+
+      - name: Seal candidate payload and source identity
+        run: >-
+          node npm/release/seal-release-candidate.mjs
+          --github-release "$PWD/staged-github-release"
+          --npm-packages "$PWD/npm-release-packages"
+          --output "$PWD/release-candidate"
+          --repository "$GITHUB_REPOSITORY"
+          --source-sha "$GITHUB_SHA"
+          --source-run-id "$GITHUB_RUN_ID"
+          --version "${{ needs.release-metadata.outputs.version }}"
+
+      - name: Verify sealed candidate
+        run: >-
+          node npm/release/verify-release-candidate.mjs
+          --candidate "$PWD/release-candidate"
+          --repository "$GITHUB_REPOSITORY"
+          --source-sha "$GITHUB_SHA"
+          --source-run-id "$GITHUB_RUN_ID"
+          --version "${{ needs.release-metadata.outputs.version }}"
+
+      - name: Upload immutable stable candidate
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: stable-release-candidate-${{ needs.release-metadata.outputs.version }}
+          path: release-candidate/
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Record promotion instructions
+        env:
+          VERSION: ${{ needs.release-metadata.outputs.version }}
+        run: |
+          {
+            echo "## Stable release candidate is ready"
+            echo
+            echo "Candidate run ID: \`$GITHUB_RUN_ID\`"
+            echo "Source commit: \`$GITHUB_SHA\`"
+            echo
+            echo "> Keep \`main\` at this exact commit until GitHub, npm, and Homebrew promotion all succeed. Promotion and fresh-run recovery require this invariant so npm provenance stays truthful."
+            echo
+            echo "Promote with:"
+            echo '```bash'
+            echo "gh workflow run release.yml --ref main -f channel=stable -f mode=promote -f version=$VERSION -f source_run_id=$GITHUB_RUN_ID"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  prepare-promotion:
+    name: Validate and import release candidate
+    needs: release-metadata
+    if: needs.release-metadata.outputs.should_release == 'true' && needs.release-metadata.outputs.mode == 'promote'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      actions: read
+      contents: read
+    outputs:
+      artifact_digest: ${{ steps.source.outputs.artifact_digest }}
+      artifact_id: ${{ steps.source.outputs.artifact_id }}
+      github_artifact_digest: sha256:${{ steps.github-scope.outputs['artifact-digest'] }}
+      github_artifact_id: ${{ steps.github-scope.outputs['artifact-id'] }}
+      npm_artifact_digest: sha256:${{ steps.npm-scope.outputs['artifact-digest'] }}
+      npm_artifact_id: ${{ steps.npm-scope.outputs['artifact-id'] }}
+      source_sha: ${{ steps.source.outputs.source_sha }}
+      source_run_id: ${{ inputs.source_run_id }}
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+
+      - name: Validate candidate workflow and artifact identity
+        id: source
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: >-
+          node npm/release/validate-release-candidate-source.mjs
+          --repository "$GITHUB_REPOSITORY"
+          --run-id "${{ inputs.source_run_id }}"
+          --version "${{ needs.release-metadata.outputs.version }}"
+          --github-output "$GITHUB_OUTPUT"
+
+      - name: Bind promotion provenance to candidate source
+        env:
+          SOURCE_SHA: ${{ steps.source.outputs.source_sha }}
+        run: |
+          if [ "$GITHUB_REF" != refs/heads/main ] || [ "$GITHUB_SHA" != "$SOURCE_SHA" ]; then
+            echo "::error::Promotion must run from main while it still points to the exact candidate commit $SOURCE_SHA."
+            exit 1
+          fi
+
+      - name: Download exact candidate and enforce GitHub artifact digest
+        env:
+          ARTIFACT_DIGEST: ${{ steps.source.outputs.artifact_digest }}
+          ARTIFACT_ID: ${{ steps.source.outputs.artifact_id }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          scripts/ci/download-verified-artifact.sh \
+            "$GITHUB_REPOSITORY" "$ARTIFACT_ID" "$ARTIFACT_DIGEST" release-candidate
+
+      - name: Verify sealed candidate
+        run: >-
+          node npm/release/verify-release-candidate.mjs
+          --candidate "$PWD/release-candidate"
+          --repository "$GITHUB_REPOSITORY"
+          --source-sha "${{ steps.source.outputs.source_sha }}"
+          --source-run-id "${{ inputs.source_run_id }}"
+          --version "${{ needs.release-metadata.outputs.version }}"
+
+      - name: Verify exact npm package set
+        run: >-
+          node npm/release/verify-packages.mjs
+          --packages "$PWD/release-candidate/npm-release-packages"
+          --version "${{ needs.release-metadata.outputs.version }}"
+
+      - name: Split verified candidate into bounded promotion scopes
+        run: |
+          set -euo pipefail
+          mkdir promotion-github-candidate promotion-npm-candidate
+          cp release-candidate/release-candidate.json promotion-github-candidate/
+          cp release-candidate/release-candidate.json promotion-npm-candidate/
+          cp -R release-candidate/github-release promotion-github-candidate/
+          cp -R release-candidate/npm-release-packages promotion-npm-candidate/
+
+      - name: Upload verified GitHub release scope
+        id: github-scope
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: verified-promotion-github-candidate
+          path: promotion-github-candidate/
+          if-no-files-found: error
+          retention-days: 1
+
+      - name: Upload verified npm release scope
+        id: npm-scope
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: verified-promotion-npm-candidate
+          path: promotion-npm-candidate/
+          if-no-files-found: error
+          retention-days: 1
+
+  stage-promotion-release:
+    name: Attest verified stable candidate
+    needs:
+      - prepare-promotion
+      - release-metadata
+    if: needs.prepare-promotion.result == 'success' && needs.release-metadata.outputs.mode == 'promote'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      actions: read
+      attestations: write
+      contents: read
+      id-token: write
+    env:
+      SOURCE_SHA: ${{ needs.prepare-promotion.outputs.source_sha }}
+    outputs:
+      artifact_digest: sha256:${{ steps.github-assets.outputs['artifact-digest'] }}
+      artifact_id: ${{ steps.github-assets.outputs['artifact-id'] }}
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+
+      - name: Download verified candidate
+        env:
+          ARTIFACT_DIGEST: ${{ needs.prepare-promotion.outputs.github_artifact_digest }}
+          ARTIFACT_ID: ${{ needs.prepare-promotion.outputs.github_artifact_id }}
+          GH_TOKEN: ${{ github.token }}
+        run: >-
+          scripts/ci/download-verified-artifact.sh
+          "$GITHUB_REPOSITORY" "$ARTIFACT_ID" "$ARTIFACT_DIGEST" release-candidate
+
+      - name: Verify sealed candidate before attestation
+        run: >-
+          node npm/release/verify-release-candidate.mjs
+          --candidate "$PWD/release-candidate"
+          --repository "$GITHUB_REPOSITORY"
+          --scope github-release
+          --source-sha "$SOURCE_SHA"
+          --source-run-id "${{ inputs.source_run_id }}"
+          --version "${{ needs.release-metadata.outputs.version }}"
+
+      - name: Create fresh promotion-time Sigstore proof
+        id: attest
+        uses: actions/attest-build-provenance@43d14bc2b83dec42d39ecae14e916627a18bb661 # v3
+        with:
+          subject-path: release-candidate/github-release/SHA256SUMS.txt
+
+      - name: Replace candidate smoke proof with promotion proof
+        run: cp "${{ steps.attest.outputs.bundle-path }}" release-candidate/github-release/SHA256SUMS.txt.sigstore
+
+      - name: Upload promotion-time GitHub assets
+        id: github-assets
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: promotion-github-release
+          path: release-candidate/github-release/
+          if-no-files-found: error
+          retention-days: 1
+
+  publish-promotion-platform:
+    name: Publish candidate npm packages
+    needs:
+      - prepare-promotion
+      - finalize-promotion-release
+      - release-metadata
+    if: needs.finalize-promotion-release.result == 'success' && needs.release-metadata.outputs.mode == 'promote'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      actions: read
+      contents: read
+      id-token: write
+    env:
+      NPM_TAG: latest
+      SOURCE_SHA: ${{ needs.prepare-promotion.outputs.source_sha }}
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6
+        with:
+          node-version: "22"
+          registry-url: https://registry.npmjs.org
+      - name: Download verified candidate
+        env:
+          ARTIFACT_DIGEST: ${{ needs.prepare-promotion.outputs.npm_artifact_digest }}
+          ARTIFACT_ID: ${{ needs.prepare-promotion.outputs.npm_artifact_id }}
+          GH_TOKEN: ${{ github.token }}
+        run: >-
+          scripts/ci/download-verified-artifact.sh
+          "$GITHUB_REPOSITORY" "$ARTIFACT_ID" "$ARTIFACT_DIGEST" release-candidate
+
+      - name: Verify candidate and exact npm tarballs
+        run: |
+          node npm/release/verify-release-candidate.mjs \
+            --candidate "$PWD/release-candidate" \
+            --repository "$GITHUB_REPOSITORY" \
+            --scope npm-release-packages \
+            --source-sha "$SOURCE_SHA" \
+            --source-run-id "${{ inputs.source_run_id }}" \
+            --version "${{ needs.release-metadata.outputs.version }}"
+          node npm/release/verify-packages.mjs \
+            --packages "$PWD/release-candidate/npm-release-packages" \
+            --version "${{ needs.release-metadata.outputs.version }}"
+
+      - name: Install trusted-publisher npm client
+        run: |
+          npm install --global npm@11.12.1 --no-audit --no-fund
+          test "$(npm --version)" = 11.12.1
+
+      - name: Preflight every platform package
+        run: |
+          for platform in darwin-arm64 darwin-x64 linux-x64 linux-x64-musl linux-arm64 win32-x64; do
+            npm view "@lpm-registry/cli-${platform}" name --json >/dev/null || {
+              echo "::error::@lpm-registry/cli-${platform} is missing or has no trusted-publisher setup."
+              exit 1
+            }
+          done
+
+      - name: Publish exact platform tarballs
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          packages="$PWD/release-candidate/npm-release-packages"
+          manifest="$packages/release-packages.json"
+          publish_package() {
+            package=$1
+            tarball=$(jq -er --arg package "$package" '.packages[] | select(.name == $package) | .tarball' "$manifest")
+            set +e
+            npm publish "$packages/$tarball" --provenance --access public --tag "$NPM_TAG" \
+              2>&1 | tee "$RUNNER_TEMP/npm-publish.log"
+            exit_code=${PIPESTATUS[0]}
+            set -e
+            if [ "$exit_code" -ne 0 ]; then
+              if grep -q "cannot publish over the previously published" "$RUNNER_TEMP/npm-publish.log"; then
+                node npm/release/verify-published-package.mjs \
+                  --manifest "$manifest" \
+                  --package "$package" \
+                  --tag "$NPM_TAG" \
+                  --source-sha "$GITHUB_SHA" \
+                  --source-run-id trusted \
+                  --source-ref refs/heads/main \
+                  --tarball "$packages/$tarball"
+              else
+                return "$exit_code"
+              fi
+            fi
+          }
+          publish_package @lpm-registry/cli-linux-x64-musl
+          publish_package @lpm-registry/cli-darwin-arm64
+          publish_package @lpm-registry/cli-darwin-x64
+          publish_package @lpm-registry/cli-linux-x64
+          publish_package @lpm-registry/cli-linux-arm64
+          publish_package @lpm-registry/cli-win32-x64
+
+      - name: Publish exact wrapper tarball last
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          packages="$PWD/release-candidate/npm-release-packages"
+          manifest="$packages/release-packages.json"
+          tarball=$(jq -er '.packages[] | select(.name == "@lpm-registry/cli") | .tarball' "$manifest")
+          set +e
+          npm publish "$packages/$tarball" --provenance --access public --tag latest \
+            2>&1 | tee "$RUNNER_TEMP/npm-wrapper-publish.log"
+          exit_code=${PIPESTATUS[0]}
+          set -e
+          if [ "$exit_code" -ne 0 ]; then
+            if grep -q "cannot publish over the previously published" "$RUNNER_TEMP/npm-wrapper-publish.log"; then
+              node npm/release/verify-published-package.mjs \
+                --manifest "$manifest" \
+                --package @lpm-registry/cli \
+                --tag latest \
+                --source-sha "$GITHUB_SHA" \
+                --source-run-id trusted \
+                --source-ref refs/heads/main \
+                --tarball "$packages/$tarball"
+            else
+              exit "$exit_code"
+            fi
+          fi
+
+      - name: Verify published wrapper install
+        run: |
+          set -euo pipefail
+          version="${{ needs.release-metadata.outputs.version }}"
+          deadline=$((SECONDS + 300))
+          attempt=0
+          prefix=
+          cache=
+          cleanup_attempt() {
+            if [ -n "$prefix" ]; then rm -rf "$prefix"; fi
+            if [ -n "$cache" ]; then rm -rf "$cache"; fi
+            prefix=
+            cache=
+          }
+          trap cleanup_attempt EXIT
+          while [ "$SECONDS" -lt "$deadline" ]; do
+            attempt=$((attempt + 1))
+            prefix=$(mktemp -d)
+            cache=$(mktemp -d)
+            if npm install -g --prefix "$prefix" --cache "$cache" --prefer-online --no-audit --no-fund \
+                 "@lpm-registry/cli@${version}" &&
+               test "$("$prefix/bin/lpm" --version)" = "lpm $version" &&
+               "$prefix/bin/lpx" --help >/dev/null &&
+               test "$(npm view @lpm-registry/cli dist-tags.latest --cache "$cache" --prefer-online)" = "$version"; then
+              cleanup_attempt
+              exit 0
+            fi
+            cleanup_attempt
+            backoff=$((5 * (1 << (attempt - 1))))
+            if [ "$backoff" -gt 30 ]; then backoff=30; fi
+            remaining=$((deadline - SECONDS))
+            if [ "$remaining" -le 0 ]; then break; fi
+            if [ "$backoff" -gt "$remaining" ]; then backoff=$remaining; fi
+            sleep "$backoff"
+          done
+          echo "::error::Published wrapper was not installable after the 300-second propagation window."
+          exit 1
+
+  finalize-promotion-release:
+    name: Create stable tag and publish verified release
+    needs:
+      - prepare-promotion
+      - release-metadata
+      - stage-promotion-release
+    if: needs.stage-promotion-release.result == 'success' && needs.release-metadata.outputs.mode == 'promote'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      actions: read
+      contents: write
+    env:
+      RELEASE_TAG: ${{ needs.release-metadata.outputs.tag }}
+      SOURCE_SHA: ${{ needs.prepare-promotion.outputs.source_sha }}
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+
+      - name: Download sealed candidate
+        env:
+          ARTIFACT_DIGEST: ${{ needs.prepare-promotion.outputs.github_artifact_digest }}
+          ARTIFACT_ID: ${{ needs.prepare-promotion.outputs.github_artifact_id }}
+          GH_TOKEN: ${{ github.token }}
+        run: >-
+          scripts/ci/download-verified-artifact.sh
+          "$GITHUB_REPOSITORY" "$ARTIFACT_ID" "$ARTIFACT_DIGEST" release-candidate
+
+      - name: Download promotion-time GitHub assets
+        env:
+          ARTIFACT_DIGEST: ${{ needs.stage-promotion-release.outputs.artifact_digest }}
+          ARTIFACT_ID: ${{ needs.stage-promotion-release.outputs.artifact_id }}
+          GH_TOKEN: ${{ github.token }}
+        run: >-
+          scripts/ci/download-verified-artifact.sh
+          "$GITHUB_REPOSITORY" "$ARTIFACT_ID" "$ARTIFACT_DIGEST" promotion-github-release
+
+      - name: Reverify candidate and promotion asset inventory
+        run: |
+          set -euo pipefail
+          node npm/release/verify-release-candidate.mjs \
+            --candidate "$PWD/release-candidate" \
+            --repository "$GITHUB_REPOSITORY" \
+            --scope github-release \
+            --source-sha "$SOURCE_SHA" \
+            --source-run-id "${{ inputs.source_run_id }}" \
+            --version "${{ needs.release-metadata.outputs.version }}"
+          find release-candidate/github-release -maxdepth 1 -type f -printf '%f\n' | sort > "$RUNNER_TEMP/candidate-assets"
+          find promotion-github-release -maxdepth 1 -type f -printf '%f\n' | sort > "$RUNNER_TEMP/promotion-assets"
+          diff -u "$RUNNER_TEMP/candidate-assets" "$RUNNER_TEMP/promotion-assets"
+          while IFS= read -r asset; do
+            if [ "$asset" != SHA256SUMS.txt.sigstore ]; then
+              cmp "release-candidate/github-release/$asset" "promotion-github-release/$asset"
+            fi
+          done < "$RUNNER_TEMP/candidate-assets"
+          (cd promotion-github-release && sha256sum --check --strict SHA256SUMS.txt)
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+        with:
+          cosign-release: "v3.0.6"
+
+      - name: Verify promotion-time Sigstore proof
+        run: >-
+          cosign verify-blob
+          --bundle promotion-github-release/SHA256SUMS.txt.sigstore
+          --certificate-identity-regexp '^https://github\.com/lpm-dev/rust-client/\.github/workflows/release\.yml@refs/heads/main$'
+          --certificate-oidc-issuer 'https://token.actions.githubusercontent.com'
+          promotion-github-release/SHA256SUMS.txt
+
+      - name: Resolve idempotent release state
+        id: release-state
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          exact=$(gh api --paginate --slurp \
+            "repos/${GITHUB_REPOSITORY}/releases?per_page=100" | \
+            jq -c --arg tag "$RELEASE_TAG" 'add | [.[] | select(.tag_name == $tag)]')
+          count=$(printf '%s' "$exact" | jq length)
+          if [ "$count" -gt 1 ]; then
+            echo "::error::Multiple releases exist for $RELEASE_TAG."
+            exit 1
+          fi
+          if [ "$count" -eq 1 ]; then
+            draft=$(printf '%s' "$exact" | jq -r '.[0].draft')
+            if [ "$draft" = true ]; then
+              draft_id=$(printf '%s' "$exact" | jq -er '.[0].id')
+              echo "::notice::Deleting stale draft $draft_id for $RELEASE_TAG before retrying its immutable upload."
+              gh api --method DELETE "repos/${GITHUB_REPOSITORY}/releases/${draft_id}"
+            else
+              printf '%s' "$exact" | jq -e '.[0]' > "$RUNNER_TEMP/existing-release.json"
+              prerelease=$(jq -r '.prerelease' "$RUNNER_TEMP/existing-release.json")
+              if [ "$prerelease" != false ]; then
+                echo "::error::The existing $RELEASE_TAG release is marked as a prerelease."
+                exit 1
+              fi
+              published_at=$(jq -er '.published_at // error("missing published_at")' "$RUNNER_TEMP/existing-release.json")
+              jq -r '.assets[].name' "$RUNNER_TEMP/existing-release.json" | sort > "$RUNNER_TEMP/existing-assets"
+              diff -u "$RUNNER_TEMP/promotion-assets" "$RUNNER_TEMP/existing-assets"
+              mkdir existing-release
+              while IFS= read -r asset; do
+                asset_id=$(jq -er --arg asset "$asset" \
+                  '[.assets[] | select(.name == $asset)] | if length == 1 then .[0].id else error("ambiguous asset") end' \
+                  "$RUNNER_TEMP/existing-release.json")
+                gh api -H 'Accept: application/octet-stream' \
+                  "repos/${GITHUB_REPOSITORY}/releases/assets/${asset_id}" > "existing-release/$asset"
+                if [ "$asset" != SHA256SUMS.txt.sigstore ]; then
+                  cmp "promotion-github-release/$asset" "existing-release/$asset"
+                fi
+              done < "$RUNNER_TEMP/promotion-assets"
+              cosign verify-blob \
+                --bundle existing-release/SHA256SUMS.txt.sigstore \
+                --certificate-identity-regexp '^https://github\.com/lpm-dev/rust-client/\.github/workflows/release\.yml@refs/heads/main$' \
+                --certificate-oidc-issuer 'https://token.actions.githubusercontent.com' \
+                existing-release/SHA256SUMS.txt
+              integrated_time=$(jq -er 'first(.. | objects | .integratedTime? // empty)' \
+                existing-release/SHA256SUMS.txt.sigstore)
+              published_epoch=$(date -d "$published_at" +%s)
+              if [ "$integrated_time" -lt $((published_epoch - 3600)) ] || \
+                 [ "$integrated_time" -gt $((published_epoch + 86400)) ]; then
+                echo "::error::The existing Sigstore proof is outside the self-update replay window."
+                exit 1
+              fi
+              echo "publish=false" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+          fi
+          if gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${RELEASE_TAG}" >/dev/null 2>&1; then
+            echo "::error::Tag $RELEASE_TAG exists without its exact published release."
+            exit 1
+          fi
+          gh api --method POST \
+            "repos/${GITHUB_REPOSITORY}/releases/generate-notes" \
+            -f tag_name="$RELEASE_TAG" \
+            -f target_commitish="$SOURCE_SHA" \
+            --jq '.body' > "$RUNNER_TEMP/release-notes.md"
+          test -s "$RUNNER_TEMP/release-notes.md"
+          echo "publish=true" >> "$GITHUB_OUTPUT"
+
+      - name: Create draft and upload exact assets
+        if: steps.release-state.outputs.publish == 'true'
+        uses: softprops/action-gh-release@7c4723f7a335432393329f8f1c564994ce50185d # v3
+        with:
+          tag_name: ${{ env.RELEASE_TAG }}
+          files: promotion-github-release/*
+          body_path: ${{ runner.temp }}/release-notes.md
+          append_body: false
+          fail_on_unmatched_files: true
+          overwrite_files: false
+          draft: true
+          prerelease: false
+          make_latest: false
+          target_commitish: ${{ env.SOURCE_SHA }}
+
+      - name: Verify exact draft and publish stable release
+        if: steps.release-state.outputs.publish == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          exact=$(gh api --paginate --slurp \
+            "repos/${GITHUB_REPOSITORY}/releases?per_page=100" | \
+            jq -c --arg tag "$RELEASE_TAG" \
+              'add | [.[] | select(.tag_name == $tag and .draft == true)]')
+          if [ "$(printf '%s' "$exact" | jq length)" -ne 1 ]; then
+            echo "::error::Expected exactly one draft for $RELEASE_TAG after upload."
+            exit 1
+          fi
+          printf '%s' "$exact" | jq -e '.[0]' > "$RUNNER_TEMP/draft-release.json"
+          draft_target=$(jq -er '.target_commitish' "$RUNNER_TEMP/draft-release.json")
+          if [ "$draft_target" != "$SOURCE_SHA" ]; then
+            echo "::error::Draft target is $draft_target, expected immutable source $SOURCE_SHA."
+            exit 1
+          fi
+          jq -r '.assets[].name' "$RUNNER_TEMP/draft-release.json" | sort > "$RUNNER_TEMP/draft-assets"
+          diff -u "$RUNNER_TEMP/promotion-assets" "$RUNNER_TEMP/draft-assets"
+          mkdir "$RUNNER_TEMP/draft-release"
+          while IFS= read -r asset; do
+            asset_id=$(jq -er --arg asset "$asset" \
+              '[.assets[] | select(.name == $asset)] | if length == 1 then .[0].id else error("ambiguous asset") end' \
+              "$RUNNER_TEMP/draft-release.json")
+            gh api -H 'Accept: application/octet-stream' \
+              "repos/${GITHUB_REPOSITORY}/releases/assets/${asset_id}" > "$RUNNER_TEMP/draft-release/$asset"
+            cmp "promotion-github-release/$asset" "$RUNNER_TEMP/draft-release/$asset"
+          done < "$RUNNER_TEMP/promotion-assets"
+          cosign verify-blob \
+            --bundle "$RUNNER_TEMP/draft-release/SHA256SUMS.txt.sigstore" \
+            --certificate-identity-regexp '^https://github\.com/lpm-dev/rust-client/\.github/workflows/release\.yml@refs/heads/main$' \
+            --certificate-oidc-issuer 'https://token.actions.githubusercontent.com' \
+            "$RUNNER_TEMP/draft-release/SHA256SUMS.txt"
+          if gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${RELEASE_TAG}" >/dev/null 2>&1; then
+            echo "::error::Tag $RELEASE_TAG appeared while the draft was being verified; refusing to publish."
+            exit 1
+          fi
+          release_id=$(jq -er '.id' "$RUNNER_TEMP/draft-release.json")
+          gh api --method PATCH "repos/${GITHUB_REPOSITORY}/releases/${release_id}" \
+            -F draft=false \
+            -F prerelease=false \
+            -f make_latest=true >/dev/null
+
+      - name: Verify published tag and exact release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag_sha=$(gh api "repos/${GITHUB_REPOSITORY}/commits/${RELEASE_TAG}" --jq .sha)
+          test "$tag_sha" = "$SOURCE_SHA"
+          latest_tag=$(gh api "repos/${GITHUB_REPOSITORY}/releases/latest" --jq .tag_name)
+          if [ "$latest_tag" != "$RELEASE_TAG" ]; then
+            echo "::error::Latest stable release is $latest_tag, expected $RELEASE_TAG."
+            exit 1
+          fi
+          gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${RELEASE_TAG}" > "$RUNNER_TEMP/published-release.json"
+          jq -e '.draft == false and .prerelease == false and (.published_at | type == "string" and length > 0)' \
+            "$RUNNER_TEMP/published-release.json" >/dev/null
+          jq -r '.assets[].name' "$RUNNER_TEMP/published-release.json" | sort > "$RUNNER_TEMP/published-assets"
+          diff -u "$RUNNER_TEMP/promotion-assets" "$RUNNER_TEMP/published-assets"
+          rm -rf "$RUNNER_TEMP/published-release"
+          mkdir "$RUNNER_TEMP/published-release"
+          while IFS= read -r asset; do
+            asset_id=$(jq -er --arg asset "$asset" \
+              '[.assets[] | select(.name == $asset)] | if length == 1 then .[0].id else error("ambiguous asset") end' \
+              "$RUNNER_TEMP/published-release.json")
+            gh api -H 'Accept: application/octet-stream' \
+              "repos/${GITHUB_REPOSITORY}/releases/assets/${asset_id}" > "$RUNNER_TEMP/published-release/$asset"
+            if [ "$asset" != SHA256SUMS.txt.sigstore ]; then
+              cmp "promotion-github-release/$asset" "$RUNNER_TEMP/published-release/$asset"
+            fi
+          done < "$RUNNER_TEMP/promotion-assets"
+          cosign verify-blob \
+            --bundle "$RUNNER_TEMP/published-release/SHA256SUMS.txt.sigstore" \
+            --certificate-identity-regexp '^https://github\.com/lpm-dev/rust-client/\.github/workflows/release\.yml@refs/heads/main$' \
+            --certificate-oidc-issuer 'https://token.actions.githubusercontent.com' \
+            "$RUNNER_TEMP/published-release/SHA256SUMS.txt"
+          integrated_time=$(jq -er 'first(.. | objects | .integratedTime? // empty)' \
+            "$RUNNER_TEMP/published-release/SHA256SUMS.txt.sigstore")
+          published_at=$(jq -er '.published_at' "$RUNNER_TEMP/published-release.json")
+          published_epoch=$(date -d "$published_at" +%s)
+          if [ "$integrated_time" -lt $((published_epoch - 3600)) ] || \
+             [ "$integrated_time" -gt $((published_epoch + 86400)) ]; then
+            echo "::error::The published Sigstore proof is outside the self-update replay window."
+            exit 1
+          fi
+
+      - name: Record promotion recovery instructions
+        if: always()
+        env:
+          SOURCE_RUN_ID: ${{ inputs.source_run_id }}
+          VERSION: ${{ needs.release-metadata.outputs.version }}
+        run: |
+          {
+            echo "## Stable promotion recovery"
+            echo
+            echo "If a later npm or Homebrew job fails, use **Re-run failed jobs** within the one-day scoped-artifact retention window. Do not use **Re-run all jobs**."
+            echo
+            echo "A fresh promote run verifies any already-published immutable release/package before continuing, but only while \`main\` still equals the candidate source commit and the seven-day candidate artifact is retained:"
+            echo '```bash'
+            echo "gh workflow run release.yml --ref main -f channel=stable -f mode=promote -f version=$VERSION -f source_run_id=$SOURCE_RUN_ID"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
   publish-release:
     name: Publish Smoke-Verified Release
     needs:
@@ -1573,13 +2498,13 @@ jobs:
 
       - name: Download exact npm tarballs from source release run
         if: github.event_name == 'workflow_dispatch' && inputs.mode == 'npm-publish-only'
-        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
-        with:
-          artifact-ids: ${{ steps.source.outputs.artifact_id }}
-          path: npm-release-packages
-          repository: ${{ github.repository }}
-          run-id: ${{ inputs.source_run_id }}
-          github-token: ${{ github.token }}
+        env:
+          ARTIFACT_DIGEST: ${{ steps.source.outputs.artifact_digest }}
+          ARTIFACT_ID: ${{ steps.source.outputs.artifact_id }}
+          GH_TOKEN: ${{ github.token }}
+        run: >-
+          scripts/ci/download-verified-artifact.sh
+          "$GITHUB_REPOSITORY" "$ARTIFACT_ID" "$ARTIFACT_DIGEST" npm-release-packages
 
       - name: Verify recovery artifact version
         if: github.event_name == 'workflow_dispatch' && inputs.mode == 'npm-publish-only'
@@ -1728,13 +2653,13 @@ jobs:
         if: >-
           github.event_name == 'workflow_dispatch' &&
           (inputs.mode == 'npm-publish-only' || inputs.mode == 'wrapper-only')
-        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
-        with:
-          artifact-ids: ${{ steps.source.outputs.artifact_id }}
-          path: npm-release-packages
-          repository: ${{ github.repository }}
-          run-id: ${{ inputs.source_run_id }}
-          github-token: ${{ github.token }}
+        env:
+          ARTIFACT_DIGEST: ${{ steps.source.outputs.artifact_digest }}
+          ARTIFACT_ID: ${{ steps.source.outputs.artifact_id }}
+          GH_TOKEN: ${{ github.token }}
+        run: >-
+          scripts/ci/download-verified-artifact.sh
+          "$GITHUB_REPOSITORY" "$ARTIFACT_ID" "$ARTIFACT_DIGEST" npm-release-packages
 
       - name: Verify recovery artifact version
         if: >-
@@ -1867,18 +2792,23 @@ jobs:
   update-homebrew:
     name: Update Homebrew Formula
     needs:
+      - finalize-promotion-release
+      - publish-promotion-platform
       - publish-release
       - release-metadata
       - smoke-standalone-installer
     if: >-
       always() &&
-      needs.publish-release.result == 'success' &&
-      needs.smoke-standalone-installer.result == 'success' &&
       needs.release-metadata.outputs.should_release == 'true' &&
       needs.release-metadata.outputs.channel == 'stable' &&
-      needs.release-metadata.outputs.mode == 'full'
+      ((needs.release-metadata.outputs.mode == 'full' &&
+      needs.publish-release.result == 'success' &&
+      needs.smoke-standalone-installer.result == 'success') ||
+      (needs.release-metadata.outputs.mode == 'promote' &&
+      needs.finalize-promotion-release.result == 'success' &&
+      needs.publish-promotion-platform.result == 'success'))
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 15
     steps:
       - name: Install cosign
         uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
@@ -1923,17 +2853,79 @@ jobs:
           export_manifest_hash lpm-linux-x64 SHA_LINUX_X64
           echo "VERSION=${VERSION#v}" >> "$GITHUB_ENV"
 
-      - name: Update Homebrew tap
-        uses: peter-evans/repository-dispatch@28959ce8df70de7be546dd1250a005dd32156697 # v4
-        with:
-          token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
-          repository: lpm-dev/homebrew-lpm
-          event-type: update-formula
-          client-payload: |
-            {
-              "version": "${{ env.VERSION }}",
-              "sha_darwin_arm64": "${{ env.SHA_DARWIN_ARM64 }}",
-              "sha_darwin_x64": "${{ env.SHA_DARWIN_X64 }}",
-              "sha_linux_arm64": "${{ env.SHA_LINUX_ARM64 }}",
-              "sha_linux_x64": "${{ env.SHA_LINUX_X64 }}"
-            }
+      - name: Dispatch correlated Homebrew update
+        id: homebrew
+        env:
+          GH_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+        run: |
+          set -euo pipefail
+          correlation_id="rust-client-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          dispatched_at=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
+          jq -n \
+            --arg event_type update-formula \
+            --arg version "$VERSION" \
+            --arg sha_darwin_arm64 "$SHA_DARWIN_ARM64" \
+            --arg sha_darwin_x64 "$SHA_DARWIN_X64" \
+            --arg sha_linux_arm64 "$SHA_LINUX_ARM64" \
+            --arg sha_linux_x64 "$SHA_LINUX_X64" \
+            --arg correlation_id "$correlation_id" \
+            '{event_type: $event_type, client_payload: {
+              version: $version,
+              sha_darwin_arm64: $sha_darwin_arm64,
+              sha_darwin_x64: $sha_darwin_x64,
+              sha_linux_arm64: $sha_linux_arm64,
+              sha_linux_x64: $sha_linux_x64,
+              correlation_id: $correlation_id
+            }}' > "$RUNNER_TEMP/homebrew-dispatch.json"
+          gh api --method POST repos/lpm-dev/homebrew-lpm/dispatches \
+            --input "$RUNNER_TEMP/homebrew-dispatch.json"
+          {
+            echo "correlation_id=$correlation_id"
+            echo "dispatched_at=$dispatched_at"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Await correlated Homebrew workflow
+        env:
+          CORRELATION_ID: ${{ steps.homebrew.outputs.correlation_id }}
+          DISPATCHED_AT: ${{ steps.homebrew.outputs.dispatched_at }}
+          GH_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+        run: |
+          set -euo pipefail
+          run_id=
+          for _ in {1..30}; do
+            runs=$(gh api --method GET \
+              repos/lpm-dev/homebrew-lpm/actions/workflows/update-formula.yml/runs \
+              -f event=repository_dispatch -f per_page=50)
+            run_id=$(printf '%s' "$runs" | jq -r \
+              --arg correlation "$CORRELATION_ID" \
+              --arg dispatched "$DISPATCHED_AT" \
+              '[.workflow_runs[] | select(
+                .event == "repository_dispatch" and
+                .created_at >= $dispatched and
+                (.display_title | contains($correlation))
+              )] | sort_by(.created_at) | last | .id // empty')
+            if [ -n "$run_id" ]; then break; fi
+            sleep 2
+          done
+          if [ -z "$run_id" ]; then
+            echo "::error::The correlated Homebrew workflow did not start."
+            exit 1
+          fi
+
+          for _ in {1..120}; do
+            run=$(gh api "repos/lpm-dev/homebrew-lpm/actions/runs/${run_id}")
+            status=$(printf '%s' "$run" | jq -r .status)
+            if [ "$status" = completed ]; then
+              conclusion=$(printf '%s' "$run" | jq -r .conclusion)
+              url=$(printf '%s' "$run" | jq -r .html_url)
+              echo "Homebrew workflow: $url"
+              if [ "$conclusion" != success ]; then
+                echo "::error::Correlated Homebrew workflow concluded with $conclusion."
+                exit 1
+              fi
+              exit 0
+            fi
+            sleep 5
+          done
+          echo "::error::Timed out waiting for correlated Homebrew workflow ${run_id}."
+          exit 1

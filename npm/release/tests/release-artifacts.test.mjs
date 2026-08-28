@@ -136,7 +136,7 @@ test("macOS CLI releases use the shared LPM Vault Keychain access group", () => 
   assert.match(releaseWorkflow, /codesign -d --entitlements :-/);
 });
 
-test("raw macOS compatibility assets use a separate legacy-only build", () => {
+test("raw macOS compatibility assets reuse dependencies while preserving separate binaries", () => {
   const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../../..");
   const releaseWorkflow = fs.readFileSync(
     path.join(repoRoot, ".github/workflows/release.yml"),
@@ -153,15 +153,19 @@ test("raw macOS compatibility assets use a separate legacy-only build", () => {
 
   assert.match(cliManifest, /legacy-macos-keychain = \["lpm-vault\/legacy-macos-keychain"\]/);
   assert.match(vaultManifest, /legacy-macos-keychain = \[\]/);
-  assert.match(releaseWorkflow, /--target-dir target\/legacy-macos-keychain/);
+  assert.doesNotMatch(releaseWorkflow, /--target-dir target\/legacy-macos-keychain/);
+  assert.match(
+    releaseWorkflow,
+    /cp "target\/\$\{\{ matrix\.target \}\}\/release\/lpm-rs" "\$RUNNER_TEMP\/lpm-rs-provisioned"/,
+  );
   assert.match(releaseWorkflow, /--features legacy-macos-keychain/);
   assert.match(
     releaseWorkflow,
-    /cp target\/legacy-macos-keychain\/\$\{\{ matrix\.target \}\}\/release\/lpm-rs \$\{\{ matrix\.binary \}\}/,
+    /cp target\/\$\{\{ matrix\.target \}\}\/release\/lpm-rs \$\{\{ matrix\.binary \}\}/,
   );
   assert.match(
     releaseWorkflow,
-    /cp "target\/\$\{\{ matrix\.target \}\}\/release\/lpm-rs" "\$APP_BUNDLE\/Contents\/MacOS\/lpm-rs"/,
+    /cp "\$RUNNER_TEMP\/lpm-rs-provisioned" "\$APP_BUNDLE\/Contents\/MacOS\/lpm-rs"/,
   );
   assert.match(releaseWorkflow, /env set LPM_RELEASE_SMOKE=verified/);
   assert.match(releaseWorkflow, /env get LPM_RELEASE_SMOKE >\/dev\/null/);
@@ -301,16 +305,24 @@ test("release workflow grants write permissions only to jobs that use them", () 
 
   const jobs = [
     ["release-metadata", "verify", []],
-    ["verify", "verify-windows-filesystem", []],
+    ["verify", "verify-candidate-source", []],
+    ["verify-candidate-source", "release-preflight", []],
+    ["release-preflight", "verify-windows-filesystem", []],
     ["verify-windows-filesystem", "build", []],
-    ["build", "build-windows", []],
+    ["build", "notarize-macos", []],
+    ["notarize-macos", "build-windows", []],
     ["build-windows", "sign-windows", []],
     ["sign-windows", "pack-npm-packages", ["id-token"]],
     ["pack-npm-packages", "smoke-npm-packages", []],
     ["smoke-npm-packages", "smoke-windows-recovery", []],
     ["smoke-windows-recovery", "release", []],
     ["release", "smoke-standalone-installer", ["contents", "id-token", "attestations"]],
-    ["smoke-standalone-installer", "publish-release", []],
+    ["smoke-standalone-installer", "seal-candidate", []],
+    ["seal-candidate", "prepare-promotion", []],
+    ["prepare-promotion", "stage-promotion-release", []],
+    ["stage-promotion-release", "publish-promotion-platform", ["attestations", "id-token"]],
+    ["publish-promotion-platform", "finalize-promotion-release", ["id-token"]],
+    ["finalize-promotion-release", "publish-release", ["contents"]],
     ["publish-release", "publish-npm-platform", ["contents"]],
     ["publish-npm-platform", "publish-npm-wrapper", ["id-token"]],
     ["publish-npm-wrapper", "update-homebrew", ["id-token"]],
@@ -344,6 +356,8 @@ test("npm publish workflow treats release tarballs as local filesystem paths", (
   );
 
   assert.deepEqual(publishSpecs, [
+    "$packages/$tarball",
+    "$packages/$tarball",
     "./npm-release-packages/$tarball",
     "./npm-release-packages/$TARBALL",
   ]);
@@ -417,7 +431,7 @@ function assertNpmPublishRecoveryWorkflow(workflowSource) {
   assert.match(releaseWorkflow, /^\s+- npm-publish-only$/m);
   assert.match(
     releaseWorkflow,
-    /if \[ "\$MODE" != "full" \] && \[ "\$GITHUB_REF" != "refs\/heads\/main" \]; then/,
+    /if \[ "\$GITHUB_REF" != "refs\/heads\/main" \]; then/,
   );
   const platformSource = releaseJobSource(
     releaseWorkflow,
@@ -433,10 +447,10 @@ function assertNpmPublishRecoveryWorkflow(workflowSource) {
     assert.match(source, /inputs\.mode == 'npm-publish-only'/);
     assert.match(source, /node npm\/release\/validate-recovery-source\.mjs/);
     assert.match(source, /--purpose (?:npm-publish|"\$RECOVERY_PURPOSE")/);
-    assert.match(source, /artifact-ids: \$\{\{ steps\.source\.outputs\.artifact_id \}\}/);
-    assert.match(source, /run-id: \$\{\{ inputs\.source_run_id \}\}/);
-    assert.match(source, /repository: \$\{\{ github\.repository \}\}/);
-    assert.match(source, /github-token: \$\{\{ github\.token \}\}/);
+    assert.match(source, /ARTIFACT_ID: \$\{\{ steps\.source\.outputs\.artifact_id \}\}/);
+    assert.match(source, /ARTIFACT_DIGEST: \$\{\{ steps\.source\.outputs\.artifact_digest \}\}/);
+    assert.match(source, /scripts\/ci\/download-verified-artifact\.sh/);
+    assert.match(source, /GH_TOKEN: \$\{\{ github\.token \}\}/);
     assert.match(source, /test "\$ARTIFACT_VERSION" = "\$INPUT_VERSION"/);
   }
   assert.match(wrapperSource, /inputs\.mode == 'wrapper-only'/);
@@ -477,7 +491,9 @@ test("Windows artifact recovery validates the source run before selecting its ar
   const recovery = releaseWorkflow.slice(start, end);
   assert.match(recovery, /node npm\/release\/validate-recovery-source\.mjs/);
   assert.match(recovery, /--purpose windows-smoke/);
-  assert.match(recovery, /artifact-ids: \$\{\{ steps\.source\.outputs\.artifact_id \}\}/);
+  assert.match(recovery, /ARTIFACT_ID: \$\{\{ steps\.source\.outputs\.artifact_id \}\}/);
+  assert.match(recovery, /ARTIFACT_DIGEST: \$\{\{ steps\.source\.outputs\.artifact_digest \}\}/);
+  assert.match(recovery, /scripts\/ci\/download-verified-artifact\.sh/);
   assert.match(recovery, /shell: bash/);
 });
 

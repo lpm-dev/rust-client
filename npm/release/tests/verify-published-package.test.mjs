@@ -8,6 +8,7 @@ import test from "node:test";
 
 import {
   verifyLocalTarball,
+  verifyGitHubSourceRun,
   verifyNpmSignatures,
   verifyPublishedPackage,
   readManifest,
@@ -62,6 +63,143 @@ test("existing npm publication verification accepts main-branch nightly provenan
       verifySignaturesImpl: fixture.verifySignatures,
       verifyTarballImpl: fixture.verifyTarball,
     }),
+  );
+});
+
+test("existing stable promotion verification accepts manual main-branch provenance", async () => {
+  const fixture = publicationFixture({
+    provenanceEvent: "workflow_dispatch",
+    provenanceRef: "refs/heads/main",
+  });
+
+  await assert.doesNotReject(
+    verifyPublishedPackage({
+      releaseManifest: fixture.manifest,
+      packageName: PACKAGE,
+      expectedTag: "latest",
+      expectedSourceRef: "refs/heads/main",
+      expectedSourceRunId: SOURCE_RUN_ID,
+      expectedSourceSha: SOURCE_SHA,
+      fetchImpl: fixture.fetch,
+      verifySignaturesImpl: fixture.verifySignatures,
+      verifyTarballImpl: fixture.verifyTarball,
+    }),
+  );
+});
+
+test("stable promotion recovery accepts provenance from a prior trusted promotion run", async () => {
+  const fixture = publicationFixture({
+    provenanceEvent: "workflow_dispatch",
+    provenanceRef: "refs/heads/main",
+  });
+  let verifiedRun;
+
+  await verifyPublishedPackage({
+    releaseManifest: fixture.manifest,
+    packageName: PACKAGE,
+    expectedTag: "latest",
+    expectedSourceRef: "refs/heads/main",
+    expectedSourceRunId: "trusted",
+    expectedSourceSha: SOURCE_SHA,
+    fetchImpl: fixture.fetch,
+    verifySignaturesImpl: fixture.verifySignatures,
+    verifySourceRunImpl: async sourceRun => {
+      verifiedRun = sourceRun;
+    },
+    verifyTarballImpl: fixture.verifyTarball,
+  });
+
+  assert.equal(verifiedRun.runId, SOURCE_RUN_ID);
+  assert.equal(verifiedRun.runAttempt, "1");
+  assert.equal(verifiedRun.expectedSourceSha, SOURCE_SHA);
+});
+
+test("prior npm publication run verification requires the exact trusted workflow attempt", async () => {
+  const trustedRun = {
+    id: Number(SOURCE_RUN_ID),
+    run_attempt: 2,
+    path: ".github/workflows/release.yml",
+    event: "workflow_dispatch",
+    head_branch: "main",
+    head_sha: SOURCE_SHA,
+    status: "completed",
+    conclusion: "failure",
+    repository: { id: 1189082766, full_name: "lpm-dev/rust-client" },
+    head_repository: { id: 1189082766, full_name: "lpm-dev/rust-client" },
+  };
+  const fetchImpl = async () => jsonResponse(trustedRun);
+
+  await assert.doesNotReject(
+    verifyGitHubSourceRun({
+      expectedSourceSha: SOURCE_SHA,
+      fetchImpl,
+      runAttempt: "2",
+      runId: SOURCE_RUN_ID,
+      token: "token",
+    }),
+  );
+
+  trustedRun.path = ".github/workflows/other.yml";
+  await assert.rejects(
+    verifyGitHubSourceRun({
+      expectedSourceSha: SOURCE_SHA,
+      fetchImpl,
+      runAttempt: "2",
+      runId: SOURCE_RUN_ID,
+      token: "token",
+    }),
+    /not a trusted release invocation/,
+  );
+});
+
+test("fresh promotion recovery accepts an earlier trusted promotion run", async () => {
+  const fixture = publicationFixture({
+    provenanceEvent: "workflow_dispatch",
+    provenanceRef: "refs/heads/main",
+  });
+
+  await assert.doesNotReject(
+    verifyPublishedPackage({
+      releaseManifest: fixture.manifest,
+      packageName: PACKAGE,
+      expectedTag: "latest",
+      expectedSourceRef: "refs/heads/main",
+      expectedSourceRunId: "trusted",
+      expectedSourceSha: SOURCE_SHA,
+      fetchImpl: fixture.fetch,
+      verifySignaturesImpl: fixture.verifySignatures,
+      verifySourceRunImpl: async () => {},
+      verifyTarballImpl: fixture.verifyTarball,
+    }),
+  );
+});
+
+test("fresh promotion recovery rejects a malformed provenance invocation", async () => {
+  const fixture = publicationFixture({
+    provenanceEvent: "workflow_dispatch",
+    provenanceRef: "refs/heads/main",
+  });
+  const provenance = fixture.attestations.attestations.find(
+    entry => entry.predicateType === PROVENANCE_PREDICATE,
+  );
+  const statement = decodeStatement(provenance);
+  statement.predicate.runDetails.metadata.invocationId =
+    "https://github.com/other/repository/actions/runs/31438465271/attempts/1";
+  provenance.bundle.dsseEnvelope.payload = encodeStatement(statement);
+
+  await assert.rejects(
+    verifyPublishedPackage({
+      releaseManifest: fixture.manifest,
+      packageName: PACKAGE,
+      expectedTag: "latest",
+      expectedSourceRef: "refs/heads/main",
+      expectedSourceRunId: "trusted",
+      expectedSourceSha: SOURCE_SHA,
+      fetchImpl: fixture.fetch,
+      verifySignaturesImpl: fixture.verifySignatures,
+      verifyTarballImpl: fixture.verifyTarball,
+    }),
+    /provenance source does not match/,
   );
 });
 
@@ -640,6 +778,8 @@ test("publication verifier CLI accepts every workflow argument", () => {
       SOURCE_SHA,
       "--source-run-id",
       SOURCE_RUN_ID,
+      "--source-ref",
+      "refs/heads/main",
       "--tarball",
       "/definitely/missing/package.tgz",
     ],
@@ -669,6 +809,7 @@ function localTarballFixture(t) {
 
 function publicationFixture({
   tag = "latest",
+  provenanceEvent = tag === "nightly" ? "schedule" : "push",
   provenanceRef = `refs/tags/v${VERSION}`,
   provenanceRepository = "https://github.com/lpm-dev/rust-client",
 } = {}) {
@@ -726,7 +867,7 @@ function publicationFixture({
             },
             internalParameters: {
               github: {
-                event_name: tag === "nightly" ? "schedule" : "push",
+                event_name: provenanceEvent,
                 repository_id: "1189082766",
                 repository_owner_id: "261638357",
               },

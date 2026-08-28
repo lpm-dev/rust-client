@@ -1,0 +1,145 @@
+name: Release Preflight
+
+on:
+  workflow_call:
+    secrets:
+      APPLE_CLI_PROVISIONING_PROFILE_BASE64:
+        required: true
+      APPLE_DEVELOPER_ID_P12_BASE64:
+        required: true
+      APPLE_DEVELOPER_ID_P12_PASSWORD:
+        required: true
+      APPLE_NOTARY_ISSUER_ID:
+        required: true
+      APPLE_NOTARY_KEY_BASE64:
+        required: true
+      APPLE_NOTARY_KEY_ID:
+        required: true
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  contracts:
+    name: Release API and helper contracts
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6
+        with:
+          node-version: "22"
+      - name: Test release API mock contract
+        run: node --test npm/release/tests/release-api-contract.test.mjs
+      - name: Test Keychain search-list lifecycle
+        run: bash scripts/ci/test-macos-keychain-search-list.sh
+      - name: Test notarization retry and resume lifecycle
+        run: bash scripts/ci/test-notarize-with-retry.sh
+      - name: Test fail-closed artifact download lifecycle
+        run: bash scripts/ci/test-download-verified-artifact.sh
+
+  macos-signing:
+    name: macOS signing and notarization credentials
+    runs-on: macos-15
+    timeout-minutes: 10
+    env:
+      APPLE_CODESIGN_IDENTITY: "Developer ID Application: Tolga Ergin (823S8YKMRW)"
+      APPLE_CODESIGN_IDENTIFIER: dev.lpm.cli
+      APPLE_KEYCHAIN_ACCESS_GROUP: 823S8YKMRW.dev.lpm.vault.shared
+      APPLE_TEAM_ID: 823S8YKMRW
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+
+      - name: Validate signing identity and provisioning profile
+        env:
+          APPLE_CLI_PROVISIONING_PROFILE_BASE64: ${{ secrets.APPLE_CLI_PROVISIONING_PROFILE_BASE64 }}
+          APPLE_DEVELOPER_ID_P12_BASE64: ${{ secrets.APPLE_DEVELOPER_ID_P12_BASE64 }}
+          APPLE_DEVELOPER_ID_P12_PASSWORD: ${{ secrets.APPLE_DEVELOPER_ID_P12_PASSWORD }}
+        run: |
+          set -euo pipefail
+          for name in \
+            APPLE_CLI_PROVISIONING_PROFILE_BASE64 \
+            APPLE_DEVELOPER_ID_P12_BASE64 \
+            APPLE_DEVELOPER_ID_P12_PASSWORD; do
+            if [ -z "${!name:-}" ]; then
+              echo "::error::Missing release secret $name."
+              exit 1
+            fi
+          done
+
+          cert="$RUNNER_TEMP/developer-id-application.p12"
+          profile="$RUNNER_TEMP/lpm-cli.provisionprofile"
+          profile_plist="$RUNNER_TEMP/lpm-cli-profile.plist"
+          keychain="$RUNNER_TEMP/lpm-preflight.keychain-db"
+          search_state="$RUNNER_TEMP/lpm-preflight-search-list"
+          keychain_password=$(uuidgen)
+          cleanup() {
+            status=$?
+            trap - EXIT
+            set +e
+            if [ -f "$search_state" ]; then
+              scripts/ci/macos-keychain-search-list.sh restore "$search_state" || status=1
+            fi
+            if [ -e "$keychain" ]; then security delete-keychain "$keychain" || status=1; fi
+            rm -f "$cert" "$profile" "$profile_plist"
+            exit "$status"
+          }
+          trap cleanup EXIT
+
+          umask 077
+          printf '%s' "$APPLE_DEVELOPER_ID_P12_BASE64" | base64 --decode > "$cert"
+          security create-keychain -p "$keychain_password" "$keychain"
+          security set-keychain-settings -lut 600 "$keychain"
+          security unlock-keychain -p "$keychain_password" "$keychain"
+          security import "$cert" -k "$keychain" -P "$APPLE_DEVELOPER_ID_P12_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$keychain_password" "$keychain"
+          scripts/ci/macos-keychain-search-list.sh add "$keychain" "$search_state"
+          security find-identity -v -p codesigning "$keychain" | grep -F "$APPLE_CODESIGN_IDENTITY"
+
+          printf '%s' "$APPLE_CLI_PROVISIONING_PROFILE_BASE64" | base64 --decode > "$profile"
+          security cms -D -i "$profile" > "$profile_plist"
+          team_id=$(/usr/libexec/PlistBuddy -c 'Print :TeamIdentifier:0' "$profile_plist")
+          application_id=$(
+            /usr/libexec/PlistBuddy -c 'Print :Entitlements:com.apple.application-identifier' "$profile_plist" 2>/dev/null ||
+              /usr/libexec/PlistBuddy -c 'Print :Entitlements:application-identifier' "$profile_plist"
+          )
+          access_groups=$(/usr/libexec/PlistBuddy -c 'Print :Entitlements:keychain-access-groups' "$profile_plist")
+          test "$team_id" = "$APPLE_TEAM_ID"
+          test "$application_id" = "$APPLE_TEAM_ID.$APPLE_CODESIGN_IDENTIFIER"
+          printf '%s\n' "$access_groups" | awk \
+            -v exact="$APPLE_KEYCHAIN_ACCESS_GROUP" \
+            -v wildcard="$APPLE_TEAM_ID.*" \
+            '{ value = $0; gsub(/^[[:space:]]+|[[:space:]]+$/, "", value); if (value == exact || value == wildcard) found = 1 } END { exit(found ? 0 : 1) }'
+
+      - name: Validate notarization credentials
+        env:
+          APPLE_NOTARY_ISSUER_ID: ${{ secrets.APPLE_NOTARY_ISSUER_ID }}
+          APPLE_NOTARY_KEY_BASE64: ${{ secrets.APPLE_NOTARY_KEY_BASE64 }}
+          APPLE_NOTARY_KEY_ID: ${{ secrets.APPLE_NOTARY_KEY_ID }}
+        run: |
+          set -euo pipefail
+          for name in APPLE_NOTARY_ISSUER_ID APPLE_NOTARY_KEY_BASE64 APPLE_NOTARY_KEY_ID; do
+            if [ -z "${!name:-}" ]; then
+              echo "::error::Missing release secret $name."
+              exit 1
+            fi
+          done
+          key="$RUNNER_TEMP/AuthKey_${APPLE_NOTARY_KEY_ID}.p8"
+          trap 'rm -f "$key"' EXIT
+          umask 077
+          printf '%s' "$APPLE_NOTARY_KEY_BASE64" | base64 --decode > "$key"
+          chmod 600 "$key"
+          for attempt in 1 2 3; do
+            if xcrun notarytool history \
+              --key "$key" \
+              --key-id "$APPLE_NOTARY_KEY_ID" \
+              --issuer "$APPLE_NOTARY_ISSUER_ID" \
+              --output-format json > "$RUNNER_TEMP/notary-history.json"; then
+              jq -e '.history | type == "array"' "$RUNNER_TEMP/notary-history.json" >/dev/null
+              exit 0
+            fi
+            if [ "$attempt" -lt 3 ]; then sleep $((attempt * 5)); fi
+          done
+          echo "::error::Notarization credentials failed after bounded retries."
+          exit 1
