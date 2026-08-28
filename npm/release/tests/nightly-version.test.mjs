@@ -66,13 +66,15 @@ test("workspace stable version comes from Cargo workspace metadata", () => {
   assert.match(workspaceStableVersion(repoRoot), /^\d+\.\d+\.\d+$/);
 });
 
-test("scheduled nightly publishing is changed-only and preserves stable release routing", () => {
+test("scheduled nightly publishing is changed-only beside candidate-based stable routing", () => {
   const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../../..");
   const workflow = fs.readFileSync(path.join(repoRoot, ".github/workflows/release.yml"), "utf8");
 
   assert.match(workflow, /^\s+schedule:\s*$/m);
   assert.match(workflow, /^\s+- cron: "\d+ \d+ \* \* \*"\s*$/m);
-  assert.match(workflow, /^\s+- "!v\*-\*"\s*$/m);
+  assert.doesNotMatch(workflow, /^\s+tags:\s*$/m);
+  assert.match(workflow, /^\s+- candidate$/m);
+  assert.match(workflow, /^\s+- promote$/m);
   assert.match(workflow, /^\s+channel:\s*$/m);
   assert.match(workflow, /should_release: \$\{\{ steps\.metadata\.outputs\.should_release \}\}/);
   assert.match(workflow, /node npm\/release\/nightly-release-state\.mjs/);
@@ -81,10 +83,7 @@ test("scheduled nightly publishing is changed-only and preserves stable release 
     /github\.event_name == 'schedule' \|\| inputs\.channel == 'nightly'/,
   );
   assert.match(workflow, /LPM_BUILD_VERSION: \$\{\{ needs\.release-metadata\.outputs\.version \}\}/);
-  assert.equal(
-    workflow.match(/--provenance --access public --tag "\$NPM_TAG"/g)?.length,
-    2,
-  );
+  assert.ok((workflow.match(/--provenance --access public/g) ?? []).length >= 4);
   assert.match(workflow, /prerelease: \$\{\{ needs\.release-metadata\.outputs\.prerelease \}\}/);
   assert.match(workflow, /draft: true/);
   assert.match(workflow, /make_latest: false/);
@@ -94,6 +93,6 @@ test("scheduled nightly publishing is changed-only and preserves stable release 
   );
   assert.match(
     workflow,
-    /needs\.release-metadata\.outputs\.should_release == 'true' &&\s+needs\.release-metadata\.outputs\.channel == 'stable' &&\s+needs\.release-metadata\.outputs\.mode == 'full'/,
+    /needs\.release-metadata\.outputs\.mode == 'promote'.*needs\.finalize-promotion-release\.result == 'success'/s,
   );
 });

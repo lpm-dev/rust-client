@@ -34,8 +34,10 @@ const ARGUMENT_NAMES = Object.freeze([
   "tag",
   "source-sha",
   "source-run-id",
+  "source-ref",
   "tarball",
 ]);
+const REQUIRED_ARGUMENT_NAMES = Object.freeze(ARGUMENT_NAMES.filter(name => name !== "source-ref"));
 
 export async function verifyPublishedPackage({
   releaseManifest,
@@ -43,9 +45,13 @@ export async function verifyPublishedPackage({
   expectedTag,
   expectedSourceRunId,
   expectedSourceSha,
+  expectedSourceRef,
   fetchImpl = fetch,
+  githubFetchImpl = fetch,
+  githubToken = process.env.GH_TOKEN,
   tarballPath,
   verifySignaturesImpl = verifyNpmSignatures,
+  verifySourceRunImpl = verifyGitHubSourceRun,
   verifyTarballImpl = verifyLocalTarball,
 }) {
   assertPlainObject(releaseManifest, "release manifest");
@@ -54,8 +60,19 @@ export async function verifyPublishedPackage({
     throw new Error(`The npm dist-tag is not supported: ${format(expectedTag)}`);
   }
   assertLowerHex(expectedSourceSha, 40, "release source SHA");
+  const defaultSourceRef = expectedTag === "latest" ? `refs/tags/v${version}` : "refs/heads/main";
+  const sourceRef = expectedSourceRef ?? defaultSourceRef;
+  if (
+    sourceRef !== "refs/heads/main" &&
+    !(expectedTag === "latest" && sourceRef === `refs/tags/v${version}`)
+  ) {
+    throw new Error(`The release source ref is not valid: ${format(sourceRef)}`);
+  }
   const sourceRunId = String(expectedSourceRunId ?? "");
-  if (!/^[1-9]\d*$/.test(sourceRunId) || !Number.isSafeInteger(Number(sourceRunId))) {
+  if (
+    sourceRunId !== "trusted" &&
+    (!/^[1-9]\d*$/.test(sourceRunId) || !Number.isSafeInteger(Number(sourceRunId)))
+  ) {
     throw new Error("The release source run ID is not valid");
   }
   if (!Array.isArray(releaseManifest.packages)) {
@@ -92,7 +109,7 @@ export async function verifyPublishedPackage({
   });
 
   const attestations = await verifySignaturesImpl({ packageName, version });
-  validateAttestations({
+  const sourceRun = validateAttestations({
     document: attestations,
     packageName,
     version,
@@ -100,9 +117,66 @@ export async function verifyPublishedPackage({
     expectedSha512,
     expectedSourceRunId: sourceRunId,
     expectedSourceSha,
+    expectedSourceRef: sourceRef,
   });
+  if (sourceRunId === "trusted") {
+    await verifySourceRunImpl({
+      expectedSourceSha,
+      fetchImpl: githubFetchImpl,
+      runAttempt: sourceRun.runAttempt,
+      runId: sourceRun.runId,
+      token: githubToken,
+    });
+  }
 
   return Object.freeze({ packageName, version, tag: expectedTag });
+}
+
+export async function verifyGitHubSourceRun({
+  expectedSourceSha,
+  fetchImpl = fetch,
+  runAttempt,
+  runId,
+  token = process.env.GH_TOKEN,
+}) {
+  if (
+    !/^[1-9]\d*$/.test(String(runId)) ||
+    !Number.isSafeInteger(Number(runId)) ||
+    !/^[1-9]\d*$/.test(String(runAttempt)) ||
+    !Number.isSafeInteger(Number(runAttempt))
+  ) {
+    throw new Error("The attested GitHub Actions invocation is not valid");
+  }
+  assertLowerHex(expectedSourceSha, 40, "release source SHA");
+  if (typeof token !== "string" || token.length === 0) {
+    throw new Error("GH_TOKEN is required to verify a prior npm publication run");
+  }
+  const run = await registryJson(
+    fetchImpl,
+    `https://api.github.com/repos/lpm-dev/rust-client/actions/runs/${runId}/attempts/${runAttempt}`,
+    1024 * 1024,
+    "GitHub Actions source run",
+    {
+      Authorization: `Bearer ${token}`,
+      "X-GitHub-Api-Version": "2022-11-28",
+    },
+  );
+  if (
+    run?.id !== Number(runId) ||
+    run?.run_attempt !== Number(runAttempt) ||
+    run?.path !== RELEASE_WORKFLOW ||
+    run?.event !== "workflow_dispatch" ||
+    run?.head_branch !== "main" ||
+    run?.head_sha !== expectedSourceSha ||
+    run?.status !== "completed" ||
+    typeof run?.conclusion !== "string" ||
+    run.repository?.full_name !== "lpm-dev/rust-client" ||
+    String(run.repository?.id) !== RELEASE_REPOSITORY_ID ||
+    run.head_repository?.full_name !== "lpm-dev/rust-client" ||
+    String(run.head_repository?.id) !== RELEASE_REPOSITORY_ID
+  ) {
+    throw new Error("The attested npm publication run is not a trusted release invocation");
+  }
 }
 
 export function verifyLocalTarball({ tarballPath, record, packageName }) {
@@ -353,6 +427,7 @@ function validateAttestations({
   expectedSha512,
   expectedSourceRunId,
   expectedSourceSha,
+  expectedSourceRef,
 }) {
   assertPlainObject(document, `npm attestations for ${packageName}@${version}`);
   if (!Array.isArray(document.attestations)) {
@@ -385,26 +460,24 @@ function validateAttestations({
   const provenance = statements.get(PROVENANCE_PREDICATE);
   const build = provenance.predicate?.buildDefinition;
   const workflow = build?.externalParameters?.workflow;
-  const expectedRef = expectedTag === "latest" ? `refs/tags/v${version}` : "refs/heads/main";
   if (
     workflow?.repository !== RELEASE_REPOSITORY ||
     workflow?.path !== RELEASE_WORKFLOW ||
-    workflow?.ref !== expectedRef
+    workflow?.ref !== expectedSourceRef
   ) {
     throw new Error(`The npm provenance workflow does not match ${packageName}@${version}`);
   }
 
   const github = build.internalParameters?.github;
-  const eventMatches =
-    expectedTag === "latest"
-      ? github?.event_name === "push" || github?.event_name === "workflow_dispatch"
-      : github?.event_name === "schedule" || github?.event_name === "workflow_dispatch";
+  const eventMatches = expectedSourceRef === "refs/heads/main"
+    ? expectedTag === "latest"
+      ? github?.event_name === "workflow_dispatch"
+      : github?.event_name === "schedule" || github?.event_name === "workflow_dispatch"
+    : github?.event_name === "push" || github?.event_name === "workflow_dispatch";
   const dependencies = build.resolvedDependencies;
-  const expectedDependencyUri = `git+${RELEASE_REPOSITORY}@${expectedRef}`;
+  const expectedDependencyUri = `git+${RELEASE_REPOSITORY}@${expectedSourceRef}`;
   const invocationId = provenance.predicate?.runDetails?.metadata?.invocationId;
-  const invocationPattern = new RegExp(
-    `^${escapeRegExp(RELEASE_REPOSITORY)}/actions/runs/${expectedSourceRunId}/attempts/[1-9]\\d*$`,
-  );
+  const invocation = parseGitHubInvocationId(invocationId);
   if (
     build.buildType !== RELEASE_BUILD_TYPE ||
     !eventMatches ||
@@ -415,11 +488,34 @@ function validateAttestations({
     dependencies[0]?.uri !== expectedDependencyUri ||
     dependencies[0]?.digest?.gitCommit !== expectedSourceSha ||
     provenance.predicate?.runDetails?.builder?.id !== RELEASE_BUILDER ||
-    typeof invocationId !== "string" ||
-    !invocationPattern.test(invocationId)
+    invocation === null ||
+    (expectedSourceRunId !== "trusted" && invocation.runId !== expectedSourceRunId)
   ) {
     throw new Error(`The npm provenance source does not match ${packageName}@${version}`);
   }
+  return Object.freeze(invocation);
+}
+
+function parseGitHubInvocationId(invocationId) {
+  if (typeof invocationId !== "string") {
+    return null;
+  }
+  const prefix = `${RELEASE_REPOSITORY}/actions/runs/`;
+  const separator = "/attempts/";
+  if (!invocationId.startsWith(prefix)) {
+    return null;
+  }
+  const identity = invocationId.slice(prefix.length);
+  const separatorIndex = identity.indexOf(separator);
+  if (separatorIndex < 1 || identity.indexOf(separator, separatorIndex + separator.length) !== -1) {
+    return null;
+  }
+  const runId = identity.slice(0, separatorIndex);
+  const runAttempt = identity.slice(separatorIndex + separator.length);
+  if (!/^[1-9]\d*$/.test(runId) || !/^[1-9]\d*$/.test(runAttempt)) {
+    return null;
+  }
+  return { runId, runAttempt };
 }
 
 function decodeAttestationStatement(attestation, packageName, version, expectedSha512) {
@@ -464,11 +560,15 @@ function decodeAttestationStatement(attestation, packageName, version, expectedS
   return payload;
 }
 
-async function registryJson(fetchImpl, url, maximumBytes, label) {
+async function registryJson(fetchImpl, url, maximumBytes, label, extraHeaders = {}) {
   let response;
   try {
     response = await fetchImpl(url, {
-      headers: { Accept: "application/json", "User-Agent": "lpm-release-publication-verifier" },
+      headers: {
+        Accept: "application/json",
+        "User-Agent": "lpm-release-publication-verifier",
+        ...extraHeaders,
+      },
       redirect: "error",
       signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
     });
@@ -630,10 +730,6 @@ function format(value) {
   return JSON.stringify(value);
 }
 
-function escapeRegExp(value) {
-  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-}
-
 function parseArguments(argv) {
   const options = {};
   for (let index = 0; index < argv.length; index += 2) {
@@ -648,7 +744,7 @@ function parseArguments(argv) {
     }
     options[key] = value;
   }
-  for (const required of ARGUMENT_NAMES) {
+  for (const required of REQUIRED_ARGUMENT_NAMES) {
     if (!options[required]) throw new Error(`The --${required} argument is required`);
   }
   return options;
@@ -663,6 +759,7 @@ if (process.argv[1] === fileURLToPath(import.meta.url)) {
       expectedTag: options.tag,
       expectedSourceRunId: options["source-run-id"],
       expectedSourceSha: options["source-sha"],
+      expectedSourceRef: options["source-ref"],
       tarballPath: options.tarball,
     });
     console.log(`Verified existing npm publication ${result.packageName}@${result.version}`);

@@ -6,39 +6,58 @@ import { fileURLToPath } from "node:url";
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../../..");
 
-test("stable full releases require the exact tag and recreate stale drafts", () => {
+test("stable releases require candidate promotion and do not start from a tag", () => {
   const workflow = fs
     .readFileSync(path.join(repoRoot, ".github/workflows/release.yml"), "utf8")
     .replaceAll("\r\n", "\n");
   const metadataStart = workflow.indexOf("\n  release-metadata:\n");
   const metadataEnd = workflow.indexOf("\n  verify:\n", metadataStart + 1);
-  const releaseStart = workflow.indexOf("\n  release:\n");
-  const releaseEnd = workflow.indexOf("\n  smoke-standalone-installer:\n", releaseStart + 1);
+  const promotionStart = workflow.indexOf("\n  prepare-promotion:\n");
+  const promotionEnd = workflow.indexOf("\n  publish-release:\n", promotionStart + 1);
 
   assert.notEqual(metadataStart, -1, "missing release metadata job");
   assert.notEqual(metadataEnd, -1, "missing job after release metadata");
-  assert.notEqual(releaseStart, -1, "missing release job");
-  assert.notEqual(releaseEnd, -1, "missing job after release");
+  assert.notEqual(promotionStart, -1, "missing promotion preparation job");
+  assert.notEqual(promotionEnd, -1, "missing job after stable promotion jobs");
 
   const metadata = workflow.slice(metadataStart, metadataEnd);
   assert.match(
     workflow,
-    /group: release-\$\{\{ .*'nightly' \|\| github\.ref \}\}/,
-    "tag pushes and manual dispatches for the same stable ref must serialize together",
+    /group: release-\$\{\{ .*inputs\.version \|\| github\.ref \}\}/,
+    "candidate and promotion runs for a stable version must serialize together",
   );
-  assert.match(metadata, /EXPECTED_REF="refs\/tags\/v\$\{VERSION\}"/);
-  assert.match(metadata, /if \[ "\$GITHUB_REF" != "\$EXPECTED_REF" \]; then/);
+  assert.match(metadata, /Stable releases use candidate followed by promote/);
+  assert.match(metadata, /Tag v\$\{VERSION\} already exists/);
+  assert.doesNotMatch(workflow, /^\s+tags:\s*$/m);
 
-  const release = workflow.slice(releaseStart, releaseEnd);
-  assert.match(release, /^\s+overwrite_files: false$/m);
-  assert.match(release, /^\s+fail_on_unmatched_files: true$/m);
-  assert.match(release, /A published release already exists for \$RELEASE_TAG/);
-  assert.match(release, /gh api --method DELETE/);
-  assert.match(release, /Multiple stale drafts exist/);
+  const promotion = workflow.slice(promotionStart, promotionEnd);
+  assert.match(promotion, /^\s+overwrite_files: false$/m);
+  assert.match(promotion, /^\s+fail_on_unmatched_files: true$/m);
+  assert.match(promotion, /Resolve idempotent release state/);
+  assert.match(promotion, /Multiple releases exist for \$RELEASE_TAG/);
+  assert.match(promotion, /Tag \$RELEASE_TAG exists without its exact published release/);
+  assert.match(promotion, /existing \$RELEASE_TAG release is marked as a prerelease/);
+  assert.match(promotion, /missing published_at/);
+  assert.match(promotion, /releases\/latest/);
+  assert.equal(
+    [...promotion.matchAll(/gh api --paginate --slurp/g)].length,
+    2,
+    "both promotion release listings must slurp paginated JSON before filtering",
+  );
+  assert.doesNotMatch(promotion, /releases=\$\(gh api --paginate/);
+  assert.match(promotion, /^\s+draft: true$/m);
+  assert.match(promotion, /-F draft=false/);
+  assert.match(promotion, /draft_target.*SOURCE_SHA/s);
+  assert.match(promotion, /appeared while the draft was being verified/);
   assert.ok(
-    release.indexOf("Remove stale draft release for the exact tag") <
-      release.indexOf("Create draft GitHub Release"),
-    "stale draft cleanup must finish before a new draft uploads assets",
+    promotion.indexOf("Create draft and upload exact assets") <
+      promotion.indexOf("Verify exact draft and publish stable release"),
+    "release assets must be uploaded to a draft before that draft is published",
+  );
+  assert.ok(
+    promotion.indexOf("Reverify candidate and promotion asset inventory") <
+      promotion.indexOf("Create draft and upload exact assets"),
+    "candidate and release assets must be reverified before publication",
   );
 });
 
@@ -54,13 +73,15 @@ test("release inputs are uploaded before any staged binary executes natively", (
     return workflow.slice(start, end);
   };
 
-  const build = jobSource("build", "build-windows");
-  const macUpload = build.indexOf("Upload macOS bundle and compatibility artifact");
-  const macExecute = build.indexOf("Execute release app bundle and compatibility binary");
+  const build = jobSource("build", "notarize-macos");
   const linuxUpload = build.indexOf("Upload non-macOS artifact");
   const linuxExecute = build.indexOf("Execute release binary (Linux glibc)");
-  assert.ok(macUpload >= 0 && macUpload < macExecute, "macOS upload must precede execution");
   assert.ok(linuxUpload >= 0 && linuxUpload < linuxExecute, "Linux upload must precede execution");
+
+  const macos = jobSource("notarize-macos", "build-windows");
+  const macUpload = macos.indexOf("Upload macOS bundle and compatibility artifact");
+  const macExecute = macos.indexOf("Execute notarized app bundle and compatibility binary");
+  assert.ok(macUpload >= 0 && macUpload < macExecute, "macOS upload must precede execution");
 
   const windows = jobSource("build-windows", "sign-windows");
   assert.ok(
@@ -75,10 +96,10 @@ test("macOS release smoke isolates LPM state without hiding the login Keychain",
     .readFileSync(path.join(repoRoot, ".github/workflows/release.yml"), "utf8")
     .replaceAll("\r\n", "\n");
   const start = workflow.indexOf(
-    "- name: Execute release app bundle and compatibility binary (macOS)",
+    "- name: Execute notarized app bundle and compatibility binary",
   );
   const end = workflow.indexOf(
-    "- name: Execute release binary (Linux glibc)",
+    "\n  build-windows:\n",
     start + 1,
   );
 
