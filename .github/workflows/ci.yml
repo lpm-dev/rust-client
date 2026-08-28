@@ -62,6 +62,9 @@ jobs:
       - name: Test bounded APT helper
         run: bash scripts/ci/test-install-apt-packages.sh
 
+      - name: Test macOS Keychain search-list helper
+        run: bash scripts/ci/test-macos-keychain-search-list.sh
+
       - name: Install Linux keyring build deps
         run: bash scripts/ci/install-apt-packages.sh pkg-config libdbus-1-dev
 
