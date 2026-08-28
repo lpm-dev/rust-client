@@ -475,7 +475,14 @@ mod tests {
         std::fs::create_dir(dir.path().join("tool.cmd")).unwrap();
 
         let error = verify_windows_shim_triple(dir.path(), "tool", target).unwrap_err();
-        assert!(error.to_string().contains("not a safe regular file"));
+        assert!(
+            matches!(
+                &error,
+                ShimError::InvalidArtifact { path, .. }
+                    if path == &dir.path().join("tool.cmd")
+            ),
+            "unexpected error: {error}"
+        );
     }
 
     #[cfg(unix)]
