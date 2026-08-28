@@ -157,8 +157,8 @@ pub(super) fn fingerprint_json_value(
 /// shared link entry. The fix is to fold patch identity into the
 /// graph key so a patched install lands in its own dir.
 ///
-/// **Hash inputs:** `sha256(patch_bytes || 0x00 || originalIntegrity || 0x01)`,
-/// truncated to 16 hex chars and prefixed `p-`. Content-derived so:
+/// **Hash inputs:** `sha256(validatedPatchSha256 || 0x00 || originalIntegrity || 0x01)`,
+/// encoded in full hex and prefixed `p-`. Content-derived so:
 /// - Two projects applying the **same** patch text against the same
 ///   pinned baseline collide on the same fingerprint and share a
 ///   single link entry (the cheap, correct case).
@@ -172,7 +172,7 @@ pub(super) fn fingerprint_json_value(
 /// at the right cause when a patch file goes missing.
 pub(super) fn compute_patch_fingerprints(
     patches: &HashMap<String, PatchedDependencyEntry>,
-    project_dir: &Path,
+    patch_records: &lpm_lockfile::LockfilePatches,
 ) -> Result<HashMap<(String, String), String>, LpmError> {
     use sha2::{Digest, Sha256};
 
@@ -187,21 +187,19 @@ pub(super) fn compute_patch_fingerprints(
     for key in sorted_keys {
         let entry = &patches[key];
         let (name, version) = patch_engine::parse_patch_key(key)?;
-        let patch_path = project_dir.join(&entry.path);
-        let patch_bytes = std::fs::read(&patch_path).map_err(|e| {
+        let record = patch_records.get(key).ok_or_else(|| {
             LpmError::Script(format!(
-                "patch file {} declared in lpm.patchedDependencies[{key}] cannot be read: {e}",
-                entry.path
+                "patch {key} has no checksum record; re-run `lpm install` to refresh lpm.lock"
             ))
         })?;
+        validate_patch_record_binding(key, entry, record)?;
         let mut hasher = Sha256::new();
-        hasher.update(&patch_bytes);
+        hasher.update(record.sha256.as_bytes());
         hasher.update(b"\x00");
         hasher.update(entry.original_integrity.as_bytes());
         hasher.update(b"\x01");
         let digest = hasher.finalize();
-        let short = &hex::encode(digest)[..16];
-        out.insert((name, version), format!("p-{short}"));
+        out.insert((name, version), format!("p-{}", hex::encode(digest)));
     }
     Ok(out)
 }
@@ -215,6 +213,7 @@ pub(super) fn compute_patch_fingerprints(
 /// persist step.
 pub(super) fn apply_patches_for_install(
     patches: &HashMap<String, PatchedDependencyEntry>,
+    patch_records: &lpm_lockfile::LockfilePatches,
     link_result: &LinkResult,
     store: &PackageStore,
     project_dir: &Path,
@@ -235,15 +234,14 @@ pub(super) fn apply_patches_for_install(
     for key in sorted_keys {
         let entry = &patches[key];
         let (name, version) = patch_engine::parse_patch_key(key)?;
-
-        // Resolve the patch file path relative to the project dir.
-        let patch_file = project_dir.join(&entry.path);
-        if !patch_file.exists() {
-            return Err(LpmError::Script(format!(
-                "patch file {} declared in lpm.patchedDependencies[{key}] does not exist",
-                entry.path
-            )));
-        }
+        let record = patch_records.get(key).ok_or_else(|| {
+            LpmError::Script(format!(
+                "patch {key} has no checksum record; re-run `lpm install` to refresh lpm.lock"
+            ))
+        })?;
+        let artifact = crate::patch_fs::load_patch_artifact(project_dir, &entry.path)?;
+        validate_apply_artifact_checksum(key, entry, &artifact, record)?;
+        let patch_file = project_dir.join(&artifact.relative_path);
 
         // Filter the linker's materialized list to physical copies of
         // this package. The linker reports every shape (isolated,
@@ -256,9 +254,10 @@ pub(super) fn apply_patches_for_install(
             .filter(|m| m.name == name && m.version == version)
             .collect();
 
-        let applied = patch_engine::apply_patch(
+        let applied = patch_engine::apply_patch_bytes(
             &locations,
             &patch_file,
+            &artifact.bytes,
             &entry.original_integrity,
             store,
             &name,
@@ -278,4 +277,134 @@ pub(super) fn apply_patches_for_install(
     }
 
     Ok(results)
+}
+
+fn validate_apply_artifact_checksum(
+    key: &str,
+    entry: &PatchedDependencyEntry,
+    artifact: &crate::patch_fs::PatchArtifact,
+    record: &lpm_lockfile::LockfilePatch,
+) -> Result<(), LpmError> {
+    validate_patch_record_binding(key, entry, record)?;
+    if artifact.sha256 == record.sha256 {
+        return Ok(());
+    }
+    Err(LpmError::Script(format!(
+        "patch file {} changed after validation; expected {}, found {}",
+        entry.path, record.sha256, artifact.sha256
+    )))
+}
+
+fn validate_patch_record_binding(
+    key: &str,
+    entry: &PatchedDependencyEntry,
+    record: &lpm_lockfile::LockfilePatch,
+) -> Result<(), LpmError> {
+    if record.path == entry.path && record.original_integrity == entry.original_integrity {
+        return Ok(());
+    }
+    Err(LpmError::Script(format!(
+        "patch checksum record for {key} does not match package.json; re-run `lpm install` to refresh lpm.lock"
+    )))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sha2::{Digest, Sha256};
+
+    fn patch_entry(path: &str) -> PatchedDependencyEntry {
+        PatchedDependencyEntry {
+            path: path.to_string(),
+            original_integrity: "sha512-baseline".to_string(),
+        }
+    }
+
+    #[test]
+    fn compute_patch_fingerprint_retains_full_sha256_digest() {
+        let project = tempfile::tempdir().unwrap();
+        std::fs::create_dir(project.path().join("patches")).unwrap();
+        let bytes = b"patch bytes";
+        std::fs::write(project.path().join("patches/pkg.patch"), bytes).unwrap();
+        let entry = patch_entry("patches/pkg.patch");
+        let patches = HashMap::from([("pkg@1.0.0".to_string(), entry.clone())]);
+        let mut hasher = Sha256::new();
+        let patch_sha256 = crate::patch_fs::sha256_bytes(bytes);
+        hasher.update(patch_sha256.as_bytes());
+        hasher.update(b"\x00");
+        hasher.update(entry.original_integrity.as_bytes());
+        hasher.update(b"\x01");
+        let expected = format!("p-{}", hex::encode(hasher.finalize()));
+
+        let records = lpm_lockfile::LockfilePatches::from([(
+            "pkg@1.0.0".to_string(),
+            lpm_lockfile::LockfilePatch {
+                path: entry.path.clone(),
+                sha256: patch_sha256,
+                original_integrity: entry.original_integrity.clone(),
+            },
+        )]);
+        let fingerprints = compute_patch_fingerprints(&patches, &records).unwrap();
+
+        assert_eq!(
+            fingerprints.get(&("pkg".to_string(), "1.0.0".to_string())),
+            Some(&expected)
+        );
+    }
+
+    #[test]
+    fn compute_patch_fingerprint_stays_bound_to_validated_patch_bytes() {
+        let project = tempfile::tempdir().unwrap();
+        std::fs::create_dir(project.path().join("patches")).unwrap();
+        let original = b"validated patch bytes";
+        let replacement = b"replacement patch bytes";
+        let entry = patch_entry("patches/pkg.patch");
+        std::fs::write(project.path().join(&entry.path), original).unwrap();
+        let patches = HashMap::from([("pkg@1.0.0".to_string(), entry.clone())]);
+        let patch_sha256 = crate::patch_fs::sha256_bytes(original);
+        let mut hasher = Sha256::new();
+        hasher.update(patch_sha256.as_bytes());
+        hasher.update(b"\x00");
+        hasher.update(entry.original_integrity.as_bytes());
+        hasher.update(b"\x01");
+        let expected = format!("p-{}", hex::encode(hasher.finalize()));
+        std::fs::write(project.path().join(&entry.path), replacement).unwrap();
+
+        let records = lpm_lockfile::LockfilePatches::from([(
+            "pkg@1.0.0".to_string(),
+            lpm_lockfile::LockfilePatch {
+                path: entry.path.clone(),
+                sha256: patch_sha256,
+                original_integrity: entry.original_integrity.clone(),
+            },
+        )]);
+        let fingerprints = compute_patch_fingerprints(&patches, &records).unwrap();
+
+        assert_eq!(
+            fingerprints.get(&("pkg".to_string(), "1.0.0".to_string())),
+            Some(&expected)
+        );
+    }
+
+    #[test]
+    fn apply_checksum_guard_rejects_patch_replaced_after_validation() {
+        let project = tempfile::tempdir().unwrap();
+        std::fs::create_dir(project.path().join("patches")).unwrap();
+        let entry = patch_entry("patches/pkg.patch");
+        std::fs::write(project.path().join(&entry.path), b"validated bytes").unwrap();
+        let validated = crate::patch_fs::load_patch_artifact(project.path(), &entry.path).unwrap();
+        let record = lpm_lockfile::LockfilePatch {
+            path: entry.path.clone(),
+            sha256: validated.sha256,
+            original_integrity: entry.original_integrity.clone(),
+        };
+        std::fs::write(project.path().join(&entry.path), b"replacement bytes").unwrap();
+        let replacement =
+            crate::patch_fs::load_patch_artifact(project.path(), &entry.path).unwrap();
+
+        let error = validate_apply_artifact_checksum("pkg@1.0.0", &entry, &replacement, &record)
+            .unwrap_err();
+
+        assert!(format!("{error}").contains("changed after validation"));
+    }
 }

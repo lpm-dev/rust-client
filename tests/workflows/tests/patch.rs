@@ -9,8 +9,8 @@
 //! - `lpm patch-commit <dir>` writes `patches/<safe_key>.patch`,
 //!   updates `package.json > lpm > patchedDependencies`, and cleans up
 //!   staging. The persisted key is always the resolved exact pin; for
-//!   scoped names the `/` is replaced with `__` in the filename only
-//!   (the manifest key keeps the real package selector).
+//!   scoped names use a readable prefix plus a full digest in the
+//!   filename (the manifest key keeps the real package selector).
 //! - Range / bare-name selectors without a lockfile error with an
 //!   actionable hint pointing at `lpm install` or an exact pin.
 //! - Dist-tags (`latest`, `next`, `beta`) are rejected — the selector
@@ -28,6 +28,7 @@
 mod support;
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use support::{TempProject, lpm_with_registry};
 
 // ─── Helpers ────────────────────────────────────────────────────────────
@@ -84,6 +85,84 @@ fn seed_store_package(
     integrity
 }
 
+fn extract_staging(project: &TempProject, selector: &str) -> PathBuf {
+    let output = lpm_with_registry(project, "http://127.0.0.1:1")
+        .args(["--json", "patch", selector])
+        .output()
+        .expect("spawn lpm patch");
+    assert!(
+        output.status.success(),
+        "patch extraction failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    PathBuf::from(value["staging_dir"].as_str().unwrap())
+}
+
+fn seed_v2_link_entry(
+    project: &TempProject,
+    link_name: &str,
+    package_name: &str,
+    version: &str,
+    integrity: &str,
+    content: &str,
+    create_object: bool,
+) {
+    use chrono::Utc;
+    use lpm_store::v2::{LINK_META_SCHEMA_VERSION, LinkMeta, LinkMetaPlatform, Store};
+
+    let store = Store::at(project.store_dir().join("v2"));
+    let link_dir = store.paths().links_root().join(link_name);
+    let package_dir = link_dir.join("node_modules").join(package_name);
+    std::fs::create_dir_all(&package_dir).unwrap();
+    std::fs::write(package_dir.join("index.js"), content).unwrap();
+    std::fs::write(
+        package_dir.join("package.json"),
+        format!(r#"{{"name":"{package_name}","version":"{version}"}}"#),
+    )
+    .unwrap();
+
+    let object_dir = store.paths().object_dir(integrity).unwrap();
+    if create_object {
+        std::fs::create_dir_all(&object_dir).unwrap();
+        std::fs::write(object_dir.join("index.js"), content).unwrap();
+        std::fs::write(
+            object_dir.join("package.json"),
+            format!(r#"{{"name":"{package_name}","version":"{version}"}}"#),
+        )
+        .unwrap();
+    }
+
+    LinkMeta {
+        schema: LINK_META_SCHEMA_VERSION,
+        graph_key: link_name.to_string(),
+        graph_key_digest_hex: link_name
+            .rsplit_once('+')
+            .map(|(_, suffix)| suffix.repeat(4))
+            .unwrap(),
+        name: package_name.to_string(),
+        version: version.to_string(),
+        source_sri: integrity.to_string(),
+        object_path: object_dir
+            .strip_prefix(store.paths().root())
+            .unwrap()
+            .to_string_lossy()
+            .into_owned(),
+        tree_digest: None,
+        deps: Vec::new(),
+        platform: Arc::new(LinkMetaPlatform {
+            os: "test".into(),
+            cpu: "test".into(),
+            libc: None,
+        }),
+        created_at: Utc::now(),
+        last_referenced_at: Utc::now(),
+    }
+    .write_to(&link_dir)
+    .unwrap();
+}
+
 // ─── `lpm patch <key>` extracts staging dir ────────────────────────────
 
 /// `lpm patch <name@version>` copies the store package into a temp
@@ -128,6 +207,12 @@ fn patch_extracts_to_temp_dir_with_breadcrumb() {
             .is_some_and(|command| command.starts_with("lpm patch-commit ")),
         "patch JSON must expose a runnable patch-commit next step: {parsed}",
     );
+    insta::assert_json_snapshot!("patch_json_envelope", parsed, {
+        ".staging_dir" => "[STAGING]",
+        ".package_dir" => "[PACKAGE]",
+        ".next_steps[0].command" => "[COMMAND]",
+        ".next_steps[0].args[2]" => "[STAGING]",
+    });
 
     let staging = PathBuf::from(
         parsed["staging_dir"]
@@ -258,6 +343,168 @@ fn patch_fails_when_package_not_in_store() {
     );
 }
 
+#[test]
+fn patch_uses_lockfile_selected_integrity_when_sources_share_coordinates() {
+    let project = TempProject::empty(r#"{"name":"patch-source-identity","version":"0.0.0"}"#);
+    let first_integrity = lpm_store::compute_sri_hash(b"first source");
+    let selected_integrity = lpm_store::compute_sri_hash(b"selected source");
+    seed_v2_link_entry(
+        &project,
+        "lodash@4.17.21+0000000000000000",
+        "lodash",
+        "4.17.21",
+        &first_integrity,
+        "first source\n",
+        true,
+    );
+    seed_v2_link_entry(
+        &project,
+        "lodash@4.17.21+ffffffffffffffff",
+        "lodash",
+        "4.17.21",
+        &selected_integrity,
+        "selected source\n",
+        true,
+    );
+
+    let mut lockfile = lpm_lockfile::Lockfile::new_with_resolver("test");
+    lockfile.add_package(lpm_lockfile::LockedPackage {
+        name: "lodash".into(),
+        version: "4.17.21".into(),
+        source: Some("registry+https://selected.example".into()),
+        integrity: Some(selected_integrity.clone()),
+        ..Default::default()
+    });
+    support::finalize_exact_lockfile_fixture(&mut lockfile, &[("lodash", "lodash", "4.17.21")]);
+    lockfile
+        .write_all(&project.path().join("lpm.lock"))
+        .unwrap();
+
+    let staging = extract_staging(&project, "lodash@4.17.21");
+    assert_eq!(
+        std::fs::read_to_string(staging.join("node_modules/lodash/index.js")).unwrap(),
+        "selected source\n"
+    );
+    let breadcrumb: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(staging.join(".lpm-patch.json")).unwrap()).unwrap();
+    assert_eq!(
+        breadcrumb["integrity"].as_str(),
+        Some(selected_integrity.as_str())
+    );
+    let _ = std::fs::remove_dir_all(staging);
+}
+
+#[test]
+fn patch_exact_pin_without_lockfile_rejects_multiple_source_identities() {
+    let project = TempProject::empty(r#"{"name":"patch-ambiguous-source","version":"0.0.0"}"#);
+    let first_integrity = lpm_store::compute_sri_hash(b"first source");
+    let second_integrity = lpm_store::compute_sri_hash(b"second source");
+    seed_v2_link_entry(
+        &project,
+        "lodash@4.17.21+0000000000000000",
+        "lodash",
+        "4.17.21",
+        &first_integrity,
+        "first source\n",
+        true,
+    );
+    seed_v2_link_entry(
+        &project,
+        "lodash@4.17.21+ffffffffffffffff",
+        "lodash",
+        "4.17.21",
+        &second_integrity,
+        "second source\n",
+        true,
+    );
+
+    let output = lpm_with_registry(&project, "http://127.0.0.1:1")
+        .args(["--json", "patch", "lodash@4.17.21"])
+        .output()
+        .expect("spawn lpm patch");
+    if output.status.success()
+        && let Ok(value) = serde_json::from_slice::<serde_json::Value>(&output.stdout)
+        && let Some(staging) = value["staging_dir"].as_str()
+    {
+        let _ = std::fs::remove_dir_all(staging);
+    }
+
+    assert!(!output.status.success());
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(combined.contains("multiple source identities"));
+}
+
+#[test]
+fn patch_rejects_virtual_store_entry_without_pristine_object_tree() {
+    let project = TempProject::empty(r#"{"name":"patch-missing-object","version":"0.0.0"}"#);
+    let integrity = lpm_store::compute_sri_hash(b"missing object");
+    seed_v2_link_entry(
+        &project,
+        "lodash@4.17.21+1111111111111111",
+        "lodash",
+        "4.17.21",
+        &integrity,
+        "mutable link bytes\n",
+        false,
+    );
+
+    let output = lpm_with_registry(&project, "http://127.0.0.1:1")
+        .args(["patch", "lodash@4.17.21"])
+        .output()
+        .expect("spawn lpm patch");
+    assert!(!output.status.success());
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(combined.contains("pristine") || combined.contains("object"));
+}
+
+#[test]
+fn patch_removes_temporary_directory_when_staging_source_exceeds_limit() {
+    let project = TempProject::empty(r#"{"name":"patch-cleanup","version":"0.0.0"}"#);
+    seed_store_package(&project, "oversized", "1.0.0", &[]);
+    let source = project
+        .store_dir()
+        .join("v1")
+        .join("oversized@1.0.0")
+        .join("oversized.bin");
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .open(&source)
+        .unwrap();
+    file.set_len(2 * 1024 * 1024 * 1024 + 1).unwrap();
+    let temp_root = project.path().join("tmp");
+    std::fs::create_dir(&temp_root).unwrap();
+
+    let output = lpm_with_registry(&project, "http://127.0.0.1:1")
+        .env("TMPDIR", &temp_root)
+        .args(["--json", "patch", "oversized@1.0.0"])
+        .output()
+        .expect("spawn lpm patch");
+
+    assert!(!output.status.success());
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(combined.contains("exceeds the 2147483648-byte limit"));
+    let leftovers: Vec<_> = std::fs::read_dir(&temp_root)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .filter(|name| name.to_string_lossy().starts_with("lpm-patch-"))
+        .collect();
+    assert!(leftovers.is_empty(), "staging leftovers: {leftovers:?}");
+}
+
 /// Range selectors require a project lockfile to resolve against.
 /// Without one, the command errors before taking the global store
 /// lock with an actionable "run `lpm install`" hint. The exact-pin
@@ -376,6 +623,9 @@ fn patch_commit_writes_patch_file_and_updates_manifest() {
         parsed2["original_integrity"].as_str(),
         Some(integrity.as_str())
     );
+    insta::assert_json_snapshot!("patch_commit_json_envelope", parsed2, {
+        ".original_integrity" => "[INTEGRITY]",
+    });
 
     // Patch file on disk + content.
     let patch_file = project.path().join("patches/lodash@4.17.21.patch");
@@ -456,6 +706,32 @@ fn patch_commit_updates_lockfile_patch_checksum_record() {
         record.sha256,
         patch_sha256(&project, "patches/lodash@4.17.21.patch")
     );
+}
+
+#[test]
+fn patch_commit_rolls_back_patch_and_manifest_when_lockfile_update_fails() {
+    let project = TempProject::empty(r#"{"name":"patch-commit-rollback","version":"0.0.0"}"#);
+    seed_store_package(&project, "lodash", "4.17.21", &[("index.js", "old\n")]);
+    let staging = extract_staging(&project, "lodash@4.17.21");
+    std::fs::write(staging.join("node_modules/lodash/index.js"), "new\n").unwrap();
+    project.write_file("lpm.lock", "not a lockfile");
+    let manifest_before = project.read_file("package.json");
+    let lockfile_before = project.read_file("lpm.lock");
+
+    let output = lpm_with_registry(&project, "http://127.0.0.1:1")
+        .args(["patch-commit", staging.to_str().unwrap()])
+        .output()
+        .expect("spawn patch-commit");
+
+    assert!(!output.status.success());
+    assert_eq!(project.read_file("package.json"), manifest_before);
+    assert_eq!(project.read_file("lpm.lock"), lockfile_before);
+    assert!(!project.file_exists("patches/lodash@4.17.21.patch"));
+    assert!(
+        staging.exists(),
+        "failed commit must preserve staging edits"
+    );
+    let _ = std::fs::remove_dir_all(staging);
 }
 
 #[test]
@@ -571,6 +847,7 @@ fn patch_remove_exact_pin_removes_manifest_entry_and_patch_file() {
         parsed["removed"][0]["deleted_patch_file"],
         serde_json::json!(true)
     );
+    insta::assert_json_snapshot!("patch_remove_json_envelope", parsed);
 
     assert!(
         !project.file_exists("patches/lodash@4.17.21.patch"),
@@ -627,6 +904,28 @@ fn patch_remove_removes_lockfile_patch_checksum_record() {
         !lockfile.patches.contains_key("lodash@4.17.21"),
         "patch-remove must delete the matching lpm.lock patch record"
     );
+}
+
+#[test]
+fn patch_remove_rolls_back_manifest_and_file_when_lockfile_update_fails() {
+    let project = TempProject::empty(
+        r#"{"name":"patch-remove-rollback","version":"0.0.0","lpm":{"patchedDependencies":{"lodash@4.17.21":{"path":"patches/lodash.patch","originalIntegrity":"sha512-fixture"}}}}"#,
+    );
+    project.write_file("patches/lodash.patch", "--- a/x\n+++ b/x\n");
+    project.write_file("lpm.lock", "not a lockfile");
+    let manifest_before = project.read_file("package.json");
+    let patch_before = project.read_file("patches/lodash.patch");
+    let lockfile_before = project.read_file("lpm.lock");
+
+    let output = lpm_with_registry(&project, "http://127.0.0.1:1")
+        .args(["patch-remove", "lodash@4.17.21"])
+        .output()
+        .expect("spawn patch-remove");
+
+    assert!(!output.status.success());
+    assert_eq!(project.read_file("package.json"), manifest_before);
+    assert_eq!(project.read_file("patches/lodash.patch"), patch_before);
+    assert_eq!(project.read_file("lpm.lock"), lockfile_before);
 }
 
 #[test]
@@ -855,8 +1154,7 @@ fn patch_remove_dry_run_keeps_manifest_entry_and_patch_file() {
 /// Scoped packages (both npm-style `@scope/name` and lpm.dev-style
 /// `@lpm.dev/owner.name`) flow through `patch-commit` correctly:
 ///
-/// 1. The on-disk filename sanitizes `/` to `__`:
-///    `patches/@posthog__nextjs-config@4.17.21.patch`.
+/// 1. The on-disk filename uses a readable prefix plus a digest so scoped keys cannot collide.
 /// 2. The `lpm.patchedDependencies` MANIFEST KEY keeps the real
 ///    package selector shape with `/`:
 ///    `"@posthog/nextjs-config@4.17.21"`.
@@ -909,16 +1207,16 @@ fn patch_commit_handles_npm_scoped_package() {
         String::from_utf8_lossy(&out2.stderr)
     );
 
-    // On-disk filename: `/` → `__`.
-    let patch_file = project
-        .path()
-        .join("patches/@posthog__nextjs-config@4.17.21.patch");
+    let parsed2: serde_json::Value =
+        serde_json::from_str(&strip_ansi(&String::from_utf8_lossy(&out2.stdout))).unwrap();
+    let patch_file_rel = parsed2["patch_file"].as_str().unwrap();
+    let patch_file = project.path().join(patch_file_rel);
     assert!(
         patch_file.exists(),
-        "patch file must be at sanitized path; expected: {patch_file:?}"
+        "patch file must be at the collision-safe path; expected: {patch_file:?}"
     );
-    // The legacy raw-slash path must NOT exist (would break the
-    // portability contract).
+    assert!(patch_file_rel.starts_with("patches/@posthog+nextjs-config@4.17.21-"));
+    assert!(patch_file_rel.ends_with(".patch"));
     assert!(
         !project
             .path()
@@ -932,13 +1230,71 @@ fn patch_commit_handles_npm_scoped_package() {
     let entry = &pkg["lpm"]["patchedDependencies"]["@posthog/nextjs-config@4.17.21"];
     assert_eq!(
         entry["path"].as_str(),
-        Some("patches/@posthog__nextjs-config@4.17.21.patch"),
-        "manifest path field must point at the sanitized filename"
+        Some(patch_file_rel),
+        "manifest path field must point at the collision-safe filename"
     );
     assert_eq!(
         entry["originalIntegrity"].as_str(),
         Some(integrity.as_str())
     );
+}
+
+#[test]
+fn patch_commit_reauthoring_scoped_key_deletes_unreferenced_prior_artifact() {
+    let project = TempProject::empty(r#"{"name":"patch-reauthor-scoped","version":"0.0.0"}"#);
+    let name = "@posthog/nextjs-config";
+    let version = "4.17.21";
+    let key = format!("{name}@{version}");
+    let integrity = seed_store_package(
+        &project,
+        name,
+        version,
+        &[("index.js", "module.exports = 'old'\n")],
+    );
+    let prior_path = "patches/@posthog__nextjs-config@4.17.21.patch";
+    project.write_file(prior_path, "prior patch\n");
+    project.write_file(
+        "package.json",
+        &serde_json::to_string_pretty(&serde_json::json!({
+            "name": "patch-reauthor-scoped",
+            "version": "0.0.0",
+            "lpm": {
+                "patchedDependencies": {
+                    key.clone(): {
+                        "path": prior_path,
+                        "originalIntegrity": integrity,
+                    }
+                }
+            }
+        }))
+        .unwrap(),
+    );
+
+    let staging = extract_staging(&project, &key);
+    std::fs::write(
+        staging.join("node_modules").join(name).join("index.js"),
+        "module.exports = 'new'\n",
+    )
+    .unwrap();
+    let output = lpm_with_registry(&project, "http://127.0.0.1:1")
+        .args(["--json", "patch-commit", staging.to_str().unwrap()])
+        .output()
+        .expect("spawn lpm patch-commit");
+
+    assert!(
+        output.status.success(),
+        "patch-commit failed: {}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let manifest: serde_json::Value =
+        serde_json::from_str(&project.read_file("package.json")).unwrap();
+    let replacement = manifest["lpm"]["patchedDependencies"][&key]["path"]
+        .as_str()
+        .unwrap();
+    assert_ne!(replacement, prior_path);
+    assert!(project.file_exists(replacement));
+    assert!(!project.file_exists(prior_path));
 }
 
 /// `@lpm.dev/owner.name` packages — the LPM canonical scoping convention
@@ -984,17 +1340,17 @@ fn patch_commit_handles_lpm_dev_scoped_package() {
         String::from_utf8_lossy(&out2.stderr)
     );
 
-    let patch_file = project
-        .path()
-        .join("patches/@lpm.dev__user.package@1.2.3.patch");
+    let parsed2: serde_json::Value =
+        serde_json::from_str(&strip_ansi(&String::from_utf8_lossy(&out2.stdout))).unwrap();
+    let patch_file_rel = parsed2["patch_file"].as_str().unwrap();
+    let patch_file = project.path().join(patch_file_rel);
     assert!(patch_file.exists(), "expected: {patch_file:?}");
+    assert!(patch_file_rel.starts_with("patches/@lpm.dev+user.package@1.2.3-"));
+    assert!(patch_file_rel.ends_with(".patch"));
 
     let pkg: serde_json::Value = serde_json::from_str(&project.read_file("package.json")).unwrap();
     let entry = &pkg["lpm"]["patchedDependencies"]["@lpm.dev/user.package@1.2.3"];
-    assert_eq!(
-        entry["path"].as_str(),
-        Some("patches/@lpm.dev__user.package@1.2.3.patch")
-    );
+    assert_eq!(entry["path"].as_str(), Some(patch_file_rel));
     assert_eq!(
         entry["originalIntegrity"].as_str(),
         Some(integrity.as_str())
@@ -1084,6 +1440,292 @@ fn patch_commit_fails_on_binary_change() {
         "error must mention 'binary'; got:\n{combined}"
     );
     let _ = std::fs::remove_dir_all(&staging);
+}
+
+#[test]
+fn patch_commit_rejects_store_drift_since_staging_was_created() {
+    let project = TempProject::empty(r#"{"name":"patch-drift","version":"0.0.0"}"#);
+    seed_store_package(
+        &project,
+        "lodash",
+        "4.17.21",
+        &[("index.js", "module.exports = 'original'\n")],
+    );
+    let staging = extract_staging(&project, "lodash@4.17.21");
+    std::fs::write(
+        staging.join("node_modules/lodash/index.js"),
+        "module.exports = 'edited'\n",
+    )
+    .unwrap();
+
+    let store_dir = project.store_dir().join("v1/lodash@4.17.21");
+    std::fs::write(
+        store_dir.join("index.js"),
+        "module.exports = 'replacement-source'\n",
+    )
+    .unwrap();
+    std::fs::write(store_dir.join(".integrity"), "sha512-replacement").unwrap();
+
+    let output = lpm_with_registry(&project, "http://127.0.0.1:1")
+        .args(["patch-commit", staging.to_str().unwrap()])
+        .output()
+        .expect("spawn lpm patch-commit");
+    assert!(!output.status.success());
+    assert!(
+        staging.exists(),
+        "failed commit must preserve staging edits"
+    );
+    assert!(!project.file_exists("patches/lodash@4.17.21.patch"));
+    assert!(
+        !project
+            .read_file("package.json")
+            .contains("patchedDependencies")
+    );
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(combined.contains("changed") || combined.contains("drift"));
+    let _ = std::fs::remove_dir_all(staging);
+}
+
+#[test]
+fn patch_commit_uses_distinct_filenames_for_distinct_scoped_keys() {
+    let project = TempProject::empty(r#"{"name":"patch-filenames","version":"0.0.0"}"#);
+    for name in ["@a/b__c", "@a__b/c"] {
+        seed_store_package(&project, name, "1.0.0", &[("index.js", "old\n")]);
+        let staging = extract_staging(&project, &format!("{name}@1.0.0"));
+        std::fs::write(
+            staging.join("node_modules").join(name).join("index.js"),
+            format!("patched {name}\n"),
+        )
+        .unwrap();
+        let output = lpm_with_registry(&project, "http://127.0.0.1:1")
+            .args(["patch-commit", staging.to_str().unwrap()])
+            .output()
+            .expect("spawn lpm patch-commit");
+        assert!(
+            output.status.success(),
+            "commit for {name} failed: {}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+    }
+
+    let manifest: serde_json::Value =
+        serde_json::from_str(&project.read_file("package.json")).unwrap();
+    let first = manifest["lpm"]["patchedDependencies"]["@a/b__c@1.0.0"]["path"]
+        .as_str()
+        .unwrap();
+    let second = manifest["lpm"]["patchedDependencies"]["@a__b/c@1.0.0"]["path"]
+        .as_str()
+        .unwrap();
+    assert_ne!(first, second);
+    assert!(project.file_exists(first));
+    assert!(project.file_exists(second));
+}
+
+#[test]
+fn patch_commit_and_remove_resolve_project_from_nested_directory() {
+    let project = TempProject::empty(r#"{"name":"patch-nested","version":"0.0.0"}"#);
+    seed_store_package(&project, "lodash", "4.17.21", &[("index.js", "old\n")]);
+    let nested = project.path().join("src/deep");
+    std::fs::create_dir_all(&nested).unwrap();
+    let staging = extract_staging(&project, "lodash@4.17.21");
+    std::fs::write(staging.join("node_modules/lodash/index.js"), "new\n").unwrap();
+
+    let commit = lpm_with_registry(&project, "http://127.0.0.1:1")
+        .current_dir(&nested)
+        .args(["patch-commit", staging.to_str().unwrap()])
+        .output()
+        .expect("spawn nested patch-commit");
+    assert!(
+        commit.status.success(),
+        "nested commit failed: {}{}",
+        String::from_utf8_lossy(&commit.stdout),
+        String::from_utf8_lossy(&commit.stderr)
+    );
+    assert!(project.file_exists("patches/lodash@4.17.21.patch"));
+
+    let remove = lpm_with_registry(&project, "http://127.0.0.1:1")
+        .current_dir(&nested)
+        .args(["patch-remove", "lodash@4.17.21"])
+        .output()
+        .expect("spawn nested patch-remove");
+    assert!(
+        remove.status.success(),
+        "nested remove failed: {}{}",
+        String::from_utf8_lossy(&remove.stdout),
+        String::from_utf8_lossy(&remove.stderr)
+    );
+    assert!(!project.file_exists("patches/lodash@4.17.21.patch"));
+}
+
+#[test]
+fn patch_commit_accepts_bom_prefixed_manifest() {
+    let project =
+        TempProject::empty("\u{feff}{\"name\":\"patch-bom-commit\",\"version\":\"0.0.0\"}");
+    seed_store_package(&project, "lodash", "4.17.21", &[("index.js", "old\n")]);
+    let staging = extract_staging(&project, "lodash@4.17.21");
+    std::fs::write(staging.join("node_modules/lodash/index.js"), "new\n").unwrap();
+
+    let output = lpm_with_registry(&project, "http://127.0.0.1:1")
+        .args(["patch-commit", staging.to_str().unwrap()])
+        .output()
+        .expect("spawn patch-commit");
+    assert!(
+        output.status.success(),
+        "BOM manifest commit failed: {}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn patch_remove_accepts_bom_prefixed_manifest() {
+    let project = TempProject::empty(concat!(
+        "\u{feff}",
+        r#"{"name":"patch-bom-remove","version":"0.0.0","lpm":{"patchedDependencies":{"lodash@4.17.21":{"path":"patches/lodash.patch","originalIntegrity":"sha512-fixture"}}}}"#
+    ));
+    project.write_file("patches/lodash.patch", "--- a/x\n+++ b/x\n");
+
+    let output = lpm_with_registry(&project, "http://127.0.0.1:1")
+        .args(["patch-remove", "lodash@4.17.21"])
+        .output()
+        .expect("spawn patch-remove");
+    assert!(
+        output.status.success(),
+        "BOM manifest remove failed: {}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn patch_remove_keeps_file_referenced_through_equivalent_relative_path() {
+    let project = TempProject::empty(
+        r#"{"name":"patch-shared-alias","version":"0.0.0","lpm":{"patchedDependencies":{"one@1.0.0":{"path":"patches/shared.patch","originalIntegrity":"sha512-one"},"two@1.0.0":{"path":"patches/./shared.patch","originalIntegrity":"sha512-two"}}}}"#,
+    );
+    project.write_file("patches/shared.patch", "--- a/x\n+++ b/x\n");
+
+    let output = lpm_with_registry(&project, "http://127.0.0.1:1")
+        .args(["patch-remove", "one@1.0.0"])
+        .output()
+        .expect("spawn patch-remove");
+    assert!(output.status.success());
+    assert!(project.file_exists("patches/shared.patch"));
+}
+
+#[test]
+fn patch_json_exposes_structured_commit_arguments_for_spaced_temp_path() {
+    let project = TempProject::empty(r#"{"name":"patch-spaced-temp","version":"0.0.0"}"#);
+    seed_store_package(&project, "lodash", "4.17.21", &[("index.js", "old\n")]);
+    let temp_root = project.path().join("temp root with spaces");
+    std::fs::create_dir_all(&temp_root).unwrap();
+
+    let output = lpm_with_registry(&project, "http://127.0.0.1:1")
+        .env("TMPDIR", &temp_root)
+        .args(["--json", "patch", "lodash@4.17.21"])
+        .output()
+        .expect("spawn lpm patch");
+    assert!(output.status.success());
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let staging = value["staging_dir"].as_str().unwrap();
+    assert_eq!(
+        value["next_steps"][0]["args"],
+        serde_json::json!(["lpm", "patch-commit", staging])
+    );
+    let _ = std::fs::remove_dir_all(staging);
+}
+
+#[test]
+fn patch_commit_rejects_tampered_breadcrumb_identity() {
+    let project = TempProject::empty(r#"{"name":"patch-breadcrumb-key","version":"0.0.0"}"#);
+    seed_store_package(&project, "lodash", "4.17.21", &[("index.js", "old\n")]);
+    let staging = extract_staging(&project, "lodash@4.17.21");
+    std::fs::write(staging.join("node_modules/lodash/index.js"), "new\n").unwrap();
+    let breadcrumb_path = staging.join(".lpm-patch.json");
+    let mut breadcrumb: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&breadcrumb_path).unwrap()).unwrap();
+    breadcrumb["key"] = serde_json::json!("other@1.0.0");
+    std::fs::write(&breadcrumb_path, serde_json::to_vec(&breadcrumb).unwrap()).unwrap();
+
+    let output = lpm_with_registry(&project, "http://127.0.0.1:1")
+        .args(["patch-commit", staging.to_str().unwrap()])
+        .output()
+        .expect("spawn patch-commit");
+    assert!(!output.status.success());
+    assert!(staging.exists());
+    assert!(!project.file_exists("patches/other@1.0.0.patch"));
+    let _ = std::fs::remove_dir_all(staging);
+}
+
+#[test]
+fn patch_commit_rejects_non_owned_staging_directory_without_deleting_it() {
+    let project = TempProject::empty(r#"{"name":"patch-cleanup-safety","version":"0.0.0"}"#);
+    let integrity = seed_store_package(&project, "lodash", "4.17.21", &[("index.js", "old\n")]);
+    let staging = project.path().join("valuable-data");
+    std::fs::create_dir_all(staging.join("node_modules/lodash")).unwrap();
+    std::fs::write(staging.join("node_modules/lodash/index.js"), "new\n").unwrap();
+    std::fs::write(staging.join("keep-me.txt"), "valuable").unwrap();
+    std::fs::write(
+        staging.join(".lpm-patch.json"),
+        serde_json::to_vec(&serde_json::json!({
+            "name": "lodash",
+            "version": "4.17.21",
+            "key": "lodash@4.17.21",
+            "integrity": integrity,
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let output = lpm_with_registry(&project, "http://127.0.0.1:1")
+        .args(["patch-commit", staging.to_str().unwrap()])
+        .output()
+        .expect("spawn patch-commit");
+    assert!(!output.status.success());
+    assert_eq!(
+        std::fs::read_to_string(staging.join("keep-me.txt")).unwrap(),
+        "valuable"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn patch_commit_rejects_symlinked_patches_directory() {
+    use std::os::unix::fs::symlink;
+
+    let project = TempProject::empty(r#"{"name":"patch-output-link","version":"0.0.0"}"#);
+    seed_store_package(&project, "lodash", "4.17.21", &[("index.js", "old\n")]);
+    let staging = extract_staging(&project, "lodash@4.17.21");
+    std::fs::write(staging.join("node_modules/lodash/index.js"), "new\n").unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    symlink(outside.path(), project.path().join("patches")).unwrap();
+
+    let output = lpm_with_registry(&project, "http://127.0.0.1:1")
+        .args(["patch-commit", staging.to_str().unwrap()])
+        .output()
+        .expect("spawn patch-commit");
+    assert!(!output.status.success());
+    assert!(!outside.path().join("lodash@4.17.21.patch").exists());
+    let _ = std::fs::remove_dir_all(staging);
+}
+
+#[test]
+fn patch_remove_refuses_to_delete_non_patch_project_file() {
+    let project = TempProject::empty(
+        r#"{"name":"patch-remove-project-file","version":"0.0.0","lpm":{"patchedDependencies":{"lodash@4.17.21":{"path":"package.json","originalIntegrity":"sha512-fixture"}}}}"#,
+    );
+    let before = project.read_file("package.json");
+
+    let output = lpm_with_registry(&project, "http://127.0.0.1:1")
+        .args(["patch-remove", "lodash@4.17.21"])
+        .output()
+        .expect("spawn patch-remove");
+    assert!(!output.status.success());
+    assert_eq!(project.read_file("package.json"), before);
 }
 
 // ─── Selector resolution (Slice A) ─────────────────────────────────────

@@ -1,0 +1,18 @@
+---
+source: tests/workflows/tests/patch.rs
+expression: parsed
+---
+{
+  "success": true,
+  "dry_run": false,
+  "keep_file": false,
+  "lockfile_updated": false,
+  "removed": [
+    {
+      "key": "lodash@4.17.21",
+      "patch_file": "patches/lodash@4.17.21.patch",
+      "deleted_patch_file": true,
+      "retained_reason": null
+    }
+  ]
+}

@@ -23,13 +23,31 @@ use crate::patch_engine::{
     GeneratedPatch, PatchSelector, STAGING_BREADCRUMB_FILE, copy_store_to_staging, generate_patch,
     parse_patch_selector, resolve_patch_selector,
 };
-use crate::patch_state;
 use lpm_common::LpmError;
 use lpm_lockfile::{Lockfile, LockfilePatch};
-use lpm_store::find_installed_package_baseline;
+use lpm_store::{
+    find_installed_package_baseline_by_identity, find_unique_installed_package_baseline,
+};
+use serde::Deserialize;
 use serde_json::json;
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
+
+#[derive(Debug)]
+struct PatchTarget {
+    name: String,
+    version: String,
+    integrity: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PatchBreadcrumb {
+    name: String,
+    version: String,
+    key: String,
+    integrity: String,
+}
 
 // ── lpm patch ────────────────────────────────────────────────────────
 
@@ -49,16 +67,11 @@ use std::path::{Component, Path, PathBuf};
 /// resolve happen in this function, lock and staging happen in
 /// `run_patch_inner` — is the contract the unit tests exercise.
 pub async fn run_patch(project_dir: &Path, input: &str, json_output: bool) -> Result<(), LpmError> {
+    let project_dir = resolve_patch_project_root(project_dir)?;
     let selector = parse_patch_selector(input)?;
-    let (name, version) = match selector {
-        PatchSelector::Exact { name, version } => (name, version),
-        PatchSelector::BareName(_) | PatchSelector::Range { .. } => {
-            let lockfile = read_lockfile_for_patch_selector(project_dir)?;
-            resolve_patch_selector(&lockfile, &selector)?
-        }
-    };
+    let target = resolve_patch_target(&project_dir, &selector)?;
     let lock_path = lpm_common::LpmRoot::from_env()?.store_lock();
-    lpm_common::with_shared_lock_async(lock_path, run_patch_inner(name, version, json_output)).await
+    lpm_common::with_shared_lock_async(lock_path, run_patch_inner(target, json_output)).await
 }
 
 /// Read the project lockfile, or surface an actionable error if the
@@ -81,20 +94,156 @@ fn read_lockfile_for_patch_selector(project_dir: &Path) -> Result<Lockfile, LpmE
     }
 }
 
-async fn run_patch_inner(name: String, version: String, json_output: bool) -> Result<(), LpmError> {
+fn resolve_patch_project_root(project_dir: &Path) -> Result<PathBuf, LpmError> {
+    if project_dir.join("package.json").is_file() {
+        return Ok(project_dir.to_path_buf());
+    }
+    lpm_workspace::find_project_root(project_dir).ok_or_else(|| {
+        LpmError::Script(format!(
+            "no package.json found in {} or its ancestors",
+            project_dir.display()
+        ))
+    })
+}
+
+fn patch_commit_command(staging_path: &Path) -> String {
+    let raw = staging_path.display().to_string();
+    let quoted = shlex::try_quote(&raw)
+        .map(|value| value.into_owned())
+        .unwrap_or(raw);
+    format!("lpm patch-commit {quoted}")
+}
+
+fn validate_owned_staging_directory(staging_dir: &Path) -> Result<PathBuf, LpmError> {
+    let metadata = std::fs::symlink_metadata(staging_dir).map_err(|error| {
+        LpmError::Script(format!(
+            "staging directory {} is unavailable: {error}",
+            staging_dir.display()
+        ))
+    })?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(LpmError::Script(format!(
+            "staging directory {} is not a real directory",
+            staging_dir.display()
+        )));
+    }
+    let canonical = staging_dir.canonicalize().map_err(LpmError::Io)?;
+    let temp_root = std::env::temp_dir().canonicalize().map_err(LpmError::Io)?;
+    let owned_name = canonical
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.starts_with("lpm-patch-"));
+    if canonical.parent() != Some(temp_root.as_path()) || !owned_name {
+        return Err(LpmError::Script(format!(
+            "refusing staging directory {} because it is not an lpm-owned direct child of {}",
+            staging_dir.display(),
+            temp_root.display()
+        )));
+    }
+    Ok(canonical)
+}
+
+fn patch_file_relative_path(name: &str, key: &str) -> String {
+    if !name.contains('/') && key.len() <= 180 {
+        return format!("patches/{key}.patch");
+    }
+    let readable: String = key
+        .chars()
+        .map(|character| match character {
+            '/' => '+',
+            character if character.is_ascii_alphanumeric() => character,
+            '@' | '.' | '_' | '-' | '+' => character,
+            _ => '-',
+        })
+        .take(120)
+        .collect();
+    let digest = crate::patch_fs::sha256_bytes(key.as_bytes());
+    format!("patches/{readable}-{}.patch", &digest["sha256-".len()..])
+}
+
+fn resolve_patch_target(
+    project_dir: &Path,
+    selector: &PatchSelector,
+) -> Result<PatchTarget, LpmError> {
+    match selector {
+        PatchSelector::Exact { name, version } => {
+            let lockfile = match Lockfile::read_for_project(project_dir) {
+                Ok(project) => Some(project.lockfile),
+                Err(lpm_lockfile::LockfileError::NotFound(_)) => None,
+                Err(error) => {
+                    return Err(LpmError::Script(format!(
+                        "failed to read project lockfile: {error}"
+                    )));
+                }
+            };
+            let integrity = lockfile
+                .as_ref()
+                .map(|lockfile| locked_integrity_for_coordinates(lockfile, name, version))
+                .transpose()?
+                .flatten();
+            Ok(PatchTarget {
+                name: name.clone(),
+                version: version.clone(),
+                integrity,
+            })
+        }
+        PatchSelector::BareName(_) | PatchSelector::Range { .. } => {
+            let lockfile = read_lockfile_for_patch_selector(project_dir)?;
+            let (name, version) = resolve_patch_selector(&lockfile, selector)?;
+            let integrity = locked_integrity_for_coordinates(&lockfile, &name, &version)?;
+            Ok(PatchTarget {
+                name,
+                version,
+                integrity,
+            })
+        }
+    }
+}
+
+fn locked_integrity_for_coordinates(
+    lockfile: &Lockfile,
+    name: &str,
+    version: &str,
+) -> Result<Option<String>, LpmError> {
+    let mut identities = BTreeSet::new();
+    for package in &lockfile.packages {
+        if package.name == name && package.version == version {
+            identities.insert((package.source.clone(), package.integrity.clone()));
+        }
+    }
+    match identities.len() {
+        0 => Ok(None),
+        1 => Ok(identities.pop_first().and_then(|(_, integrity)| integrity)),
+        _ => Err(LpmError::Script(format!(
+            "this project has multiple source identities for `{name}@{version}`; pin it to a single source before creating a patch"
+        ))),
+    }
+}
+
+async fn run_patch_inner(target: PatchTarget, json_output: bool) -> Result<(), LpmError> {
+    let PatchTarget {
+        name,
+        version,
+        integrity,
+    } = target;
     // Lookup goes
     // through `find_installed_package_baseline`, which prefers the
     // default v2, then experimental v3, and falls back to v1.
     // Pre-fix this called `store.has_package(...)` (v1-only), which
     // always returned false under virtual stores → "not in the global store".
     let lpm_root = lpm_common::LpmRoot::from_env()?;
-    let baseline =
-        find_installed_package_baseline(&lpm_root, &name, &version)?.ok_or_else(|| {
-            LpmError::Script(format!(
-                "{name}@{version} is not in the global store. \
+    let baseline = match integrity.as_deref() {
+        Some(integrity) => {
+            find_installed_package_baseline_by_identity(&lpm_root, &name, &version, Some(integrity))
+        }
+        None => find_unique_installed_package_baseline(&lpm_root, &name, &version),
+    }?
+    .ok_or_else(|| {
+        LpmError::Script(format!(
+            "{name}@{version} with the selected source identity is not in the global store. \
                  Run `lpm install {name}@{version}` first."
-            ))
-        })?;
+        ))
+    })?;
     // Seed the staging copy from
     // the PRISTINE bytes — the virtual-store object projection, or the v1 store
     // dir (which v1 patches never mutate). Reading `package_dir` on
@@ -110,7 +259,7 @@ async fn run_patch_inner(name: String, version: String, json_output: bool) -> Re
         .prefix("lpm-patch-")
         .tempdir_in(std::env::temp_dir())
         .map_err(LpmError::Io)?;
-    let staging_path = staging_root.keep();
+    let staging_path = staging_root.path().to_path_buf();
 
     let dest = staging_path.join("node_modules").join(&name);
     copy_store_to_staging(&store_path, &dest)?;
@@ -126,13 +275,14 @@ async fn run_patch_inner(name: String, version: String, json_output: bool) -> Re
         "name": name,
         "version": version,
         "key": resolved_key,
-        "store_path": store_path.display().to_string(),
+        "integrity": baseline.integrity,
     });
     std::fs::write(
         staging_path.join(STAGING_BREADCRUMB_FILE),
         serde_json::to_string_pretty(&breadcrumb).unwrap(),
     )
     .map_err(LpmError::Io)?;
+    let staging_path = staging_root.keep();
 
     if json_output {
         let payload = json!({
@@ -145,7 +295,8 @@ async fn run_patch_inner(name: String, version: String, json_output: bool) -> Re
             "next_steps": [
                 {
                     "description": "Commit the patch after editing package_dir",
-                    "command": format!("lpm patch-commit {}", staging_path.display()),
+                    "command": patch_commit_command(&staging_path),
+                    "args": ["lpm", "patch-commit", staging_path.display().to_string()],
                 },
             ],
         });
@@ -170,7 +321,7 @@ async fn run_patch_inner(name: String, version: String, json_output: bool) -> Re
         install_ui::done("Ready · edit files in the staging directory, then run:");
         install_ui::detail_line(crate::install_ui::terminal_line!(
             "  {}",
-            install_ui::yellow(&format!("lpm patch-commit {}", staging_path.display()))
+            install_ui::yellow(&patch_commit_command(&staging_path))
         ));
     }
     Ok(())
@@ -184,10 +335,11 @@ pub async fn run_patch_commit(
     staging_dir: &Path,
     json_output: bool,
 ) -> Result<(), LpmError> {
+    let project_dir = resolve_patch_project_root(project_dir)?;
     let lock_path = lpm_common::LpmRoot::from_env()?.store_lock();
     lpm_common::with_shared_lock_async(
         lock_path,
-        run_patch_commit_inner(project_dir, staging_dir, json_output),
+        run_patch_commit_inner(&project_dir, staging_dir, json_output),
     )
     .await
 }
@@ -197,66 +349,63 @@ async fn run_patch_commit_inner(
     staging_dir: &Path,
     json_output: bool,
 ) -> Result<(), LpmError> {
-    if !staging_dir.exists() {
+    let staging_dir = validate_owned_staging_directory(staging_dir)?;
+    let staging_root = crate::patch_fs::SafeRoot::open(&staging_dir)?;
+    let breadcrumb_bytes = staging_root
+        .read_regular_file(
+            Path::new(STAGING_BREADCRUMB_FILE),
+            lpm_common::STATE_FILE_SIZE_CAP_BYTES,
+        )
+        .map_err(|error| {
+            LpmError::Script(format!(
+                "{staging_dir:?} is not an lpm-patch staging dir (no .lpm-patch.json): {error}"
+            ))
+        })?;
+    let breadcrumb: PatchBreadcrumb = serde_json::from_slice(&breadcrumb_bytes).map_err(|e| {
+        LpmError::Script(format!(
+            "staging breadcrumb at {:?} is malformed: {e}",
+            staging_dir.join(STAGING_BREADCRUMB_FILE)
+        ))
+    })?;
+    Lockfile::validate_package_name_and_version(&breadcrumb.name, &breadcrumb.version)
+        .map_err(|error| LpmError::Script(format!("invalid staging identity: {error}")))?;
+    let canonical_version = lpm_semver::Version::parse(&breadcrumb.version)
+        .map_err(|error| LpmError::Script(format!("invalid staging version: {error}")))?
+        .to_string();
+    if canonical_version != breadcrumb.version {
         return Err(LpmError::Script(format!(
-            "staging directory {staging_dir:?} does not exist"
+            "staging version {:?} is not canonical; expected {canonical_version:?}",
+            breadcrumb.version
         )));
     }
+    let expected_key = format!("{}@{}", breadcrumb.name, breadcrumb.version);
+    if breadcrumb.key != expected_key {
+        return Err(LpmError::Script(format!(
+            "staging breadcrumb key {:?} does not match identity {expected_key:?}",
+            breadcrumb.key
+        )));
+    }
+    let name = breadcrumb.name.as_str();
+    let version = breadcrumb.version.as_str();
+    let key = breadcrumb.key.as_str();
 
-    // 1. Read the breadcrumb left by `lpm patch`.
-    let breadcrumb_path = staging_dir.join(STAGING_BREADCRUMB_FILE);
-    let breadcrumb_text =
-        lpm_common::read_text_file_capped(&breadcrumb_path, lpm_common::STATE_FILE_SIZE_CAP_BYTES)
-            .map_err(|e| {
-                LpmError::Script(format!(
-                    "{staging_dir:?} is not an lpm-patch staging dir (no \
-             .lpm-patch.json): {e}"
-                ))
-            })?;
-    let breadcrumb: serde_json::Value = serde_json::from_str(&breadcrumb_text).map_err(|e| {
-        LpmError::Script(format!(
-            "staging breadcrumb at {breadcrumb_path:?} is malformed: {e}"
-        ))
-    })?;
-    let name = breadcrumb["name"]
-        .as_str()
-        .ok_or_else(|| LpmError::Script("breadcrumb missing `name`".into()))?;
-    let version = breadcrumb["version"]
-        .as_str()
-        .ok_or_else(|| LpmError::Script("breadcrumb missing `version`".into()))?;
-    let key = breadcrumb["key"]
-        .as_str()
-        .ok_or_else(|| LpmError::Script("breadcrumb missing `key`".into()))?;
-
-    // 2. Locate the store baseline. We re-read it from the live store
-    // (not the breadcrumb's recorded path) so that store relocations
-    // between `patch` and `patch-commit` don't break commit.
-    // v2-aware via
-    // `find_installed_package_baseline` — same shape as
-    // `run_patch_inner` above; the integrity comes back in the same
-    // call so we no longer need a separate `read_stored_integrity`
-    // probe at step 4.
     let lpm_root = lpm_common::LpmRoot::from_env()?;
-    let baseline = find_installed_package_baseline(&lpm_root, name, version)?.ok_or_else(|| {
+    let baseline = find_installed_package_baseline_by_identity(
+        &lpm_root,
+        name,
+        version,
+        Some(&breadcrumb.integrity),
+    )?
+    .ok_or_else(|| {
         LpmError::Script(format!(
-            "{name}@{version} is no longer in the global store; \
-                 cannot generate patch baseline"
+            "the store baseline for {name}@{version} changed since this staging directory was created; preserve your edits and run `lpm patch {name}@{version}` again"
         ))
     })?;
-    // Diff against the PRISTINE
-    // bytes (`objects/<sri>/` under v2, the v1 store dir under v1) so
-    // a re-run of `lpm patch` + edit + `lpm patch-commit` against an
-    // already-patched install produces the correct delta-from-upstream
-    // patch — not a delta-from-previously-patched-state patch.
     let store_path = baseline.pristine_dir.clone();
 
-    let edited_dir = staging_dir.join("node_modules").join(name);
-    if !edited_dir.exists() {
-        return Err(LpmError::Script(format!(
-            "expected edited package at {edited_dir:?} but the directory \
-             does not exist; did you delete the staging tree?"
-        )));
-    }
+    let edited_relative = Path::new("node_modules").join(name);
+    staging_root.open_directory(&edited_relative)?;
+    let edited_dir = staging_dir.join(&edited_relative);
 
     // 3. Generate the unified diff.
     if !json_output {
@@ -289,14 +438,13 @@ async fn run_patch_commit_inner(
     // resolved in step 2's lookup, so no second probe needed.
     let integrity = baseline.integrity;
 
-    // 5. Write patches/<safe_key>.patch. Scoped names get `/` → `__`
-    //    so the file is portable across platforms.
-    let safe_key = key.replace('/', "__");
+    let patch_file_rel = patch_file_relative_path(name, key);
+    let patch_file_relative = PathBuf::from(&patch_file_rel);
     let patches_dir = project_dir.join("patches");
-    let patches_dir_existed = patches_dir.exists();
-    std::fs::create_dir_all(&patches_dir).map_err(LpmError::Io)?;
-    let patch_file_rel = format!("patches/{safe_key}.patch");
+    let patches_dir_existed = std::fs::symlink_metadata(&patches_dir)
+        .is_ok_and(|metadata| metadata.is_dir() && !metadata.file_type().is_symlink());
     let patch_file_abs = project_dir.join(&patch_file_rel);
+    let patch_sha256 = crate::patch_fs::sha256_bytes(generated.diff.as_bytes());
     let project_dirs = [project_dir.to_path_buf()];
     let mutation =
         crate::commands::install::workspace_lockfile::scope_workspace_mutation_if_present(
@@ -304,27 +452,49 @@ async fn run_patch_commit_inner(
             &project_dirs,
             async {
                 let pkg_json_path = project_dir.join("package.json");
+                let manifest_plan =
+                    plan_package_json_patch_update(project_dir, key, &patch_file_rel, &integrity)?;
                 let lockfile_path =
                     crate::commands::install::workspace_lockfile::active_lockfile_path(project_dir);
                 let lockfile_binary_path = lockfile_path.with_extension("lockb");
                 let gitattributes_path = lockfile_path.with_file_name(".gitattributes");
                 let install_hash_path = project_dir.join(".lpm").join("install-hash");
-                let transaction = crate::manifest_tx::ManifestTransaction::snapshot_install_state(
-                    &[pkg_json_path.as_path()],
-                    &[
-                        patch_file_abs.as_path(),
-                        lockfile_path.as_path(),
-                        lockfile_binary_path.as_path(),
-                        gitattributes_path.as_path(),
-                    ],
-                    &[install_hash_path.as_path()],
-                )?;
+                let mut optional_paths = Vec::with_capacity(5);
+                optional_paths.push(patch_file_abs.clone());
+                optional_paths.push(lockfile_path);
+                optional_paths.push(lockfile_binary_path);
+                optional_paths.push(gitattributes_path);
+                if let Some(obsolete) = manifest_plan.obsolete_patch.as_ref() {
+                    optional_paths.push(project_dir.join(obsolete));
+                }
+                let optional: Vec<&Path> = optional_paths.iter().map(PathBuf::as_path).collect();
+                let transaction =
+                    crate::manifest_tx::ManifestTransaction::snapshot_install_state_if_unchanged(
+                        &[(
+                            pkg_json_path.as_path(),
+                            manifest_plan.manifest_bytes.as_slice(),
+                        )],
+                        &optional,
+                        &[install_hash_path.as_path()],
+                    )?;
 
-                lpm_common::write_file_atomic(&patch_file_abs, generated.diff.as_bytes())
-                    .map_err(LpmError::Io)?;
-                update_package_json_patches(project_dir, key, &patch_file_rel, &integrity)?;
-                let lockfile_updated =
-                    upsert_lockfile_patch_record(project_dir, key, &patch_file_rel, &integrity)?;
+                let project_root = crate::patch_fs::SafeRoot::open(project_dir)?;
+                project_root.write_regular_file(
+                    &patch_file_relative,
+                    generated.diff.as_bytes(),
+                    None,
+                )?;
+                write_package_json_value(project_dir, &manifest_plan.manifest)?;
+                let lockfile_updated = upsert_lockfile_patch_record(
+                    project_dir,
+                    key,
+                    &patch_file_rel,
+                    &patch_sha256,
+                    &integrity,
+                )?;
+                if let Some(obsolete) = manifest_plan.obsolete_patch {
+                    project_root.remove_regular_file(&obsolete)?;
+                }
                 crate::commands::install::workspace_lockfile::commit_manifest_transaction(
                     transaction,
                 );
@@ -339,7 +509,7 @@ async fn run_patch_commit_inner(
 
     // 7. Clean up the staging dir on success. Best-effort — we don't
     //    fail the command if cleanup hiccups.
-    let _ = std::fs::remove_dir_all(staging_dir);
+    let _ = std::fs::remove_dir_all(&staging_dir);
 
     if json_output {
         let payload = json!({
@@ -395,42 +565,51 @@ pub async fn run_patch_remove(
     keep_file: bool,
     json_output: bool,
 ) -> Result<(), LpmError> {
+    let project_dir = resolve_patch_project_root(project_dir)?;
     let (outcome, lockfile_updated) = if dry_run {
         (
-            remove_package_json_patches(project_dir, selectors, true, keep_file)?,
+            remove_package_json_patches(&project_dir, selectors, true, keep_file)?,
             false,
         )
     } else {
         let project_dirs = [project_dir.to_path_buf()];
         crate::commands::install::workspace_lockfile::scope_workspace_mutation_if_present(
-            project_dir,
+            &project_dir,
             &project_dirs,
             async {
                 let plan =
-                    plan_package_json_patch_removal(project_dir, selectors, false, keep_file)?;
+                    plan_package_json_patch_removal(&project_dir, selectors, false, keep_file)?;
                 let pkg_json_path = project_dir.join("package.json");
                 let lockfile_path =
-                    crate::commands::install::workspace_lockfile::active_lockfile_path(project_dir);
+                    crate::commands::install::workspace_lockfile::active_lockfile_path(
+                        &project_dir,
+                    );
                 let lockfile_binary_path = lockfile_path.with_extension("lockb");
                 let gitattributes_path = lockfile_path.with_file_name(".gitattributes");
                 let install_hash_path = project_dir.join(".lpm").join("install-hash");
-                let mut optional = Vec::with_capacity(plan.files_to_delete.len() + 3);
-                optional.push(lockfile_path.as_path());
-                optional.push(lockfile_binary_path.as_path());
-                optional.push(gitattributes_path.as_path());
-                optional.extend(plan.files_to_delete.values().map(PathBuf::as_path));
-                let transaction = crate::manifest_tx::ManifestTransaction::snapshot_install_state(
-                    &[pkg_json_path.as_path()],
-                    &optional,
-                    &[install_hash_path.as_path()],
-                )?;
-                let outcome = apply_package_json_patch_removal(project_dir, plan)?;
+                let mut optional_paths = Vec::with_capacity(plan.files_to_delete.len() + 3);
+                optional_paths.push(lockfile_path);
+                optional_paths.push(lockfile_binary_path);
+                optional_paths.push(gitattributes_path);
+                optional_paths.extend(
+                    plan.files_to_delete
+                        .keys()
+                        .map(|relative| project_dir.join(relative)),
+                );
+                let optional: Vec<&Path> = optional_paths.iter().map(PathBuf::as_path).collect();
+                let transaction =
+                    crate::manifest_tx::ManifestTransaction::snapshot_install_state_if_unchanged(
+                        &[(pkg_json_path.as_path(), plan.manifest_bytes.as_slice())],
+                        &optional,
+                        &[install_hash_path.as_path()],
+                    )?;
+                let outcome = apply_package_json_patch_removal(&project_dir, plan)?;
                 let removed_keys = outcome
                     .removed
                     .iter()
                     .map(|removal| removal.key.clone())
                     .collect();
-                let lockfile_updated = remove_lockfile_patch_records(project_dir, &removed_keys)?;
+                let lockfile_updated = remove_lockfile_patch_records(&project_dir, &removed_keys)?;
                 crate::commands::install::workspace_lockfile::commit_manifest_transaction(
                     transaction,
                 );
@@ -525,7 +704,8 @@ struct PatchRemovalOutcome {
 struct PatchRemovalPlan {
     outcome: PatchRemovalOutcome,
     manifest: serde_json::Value,
-    files_to_delete: BTreeMap<String, PathBuf>,
+    manifest_bytes: Vec<u8>,
+    files_to_delete: BTreeMap<PathBuf, String>,
 }
 
 fn remove_package_json_patches(
@@ -555,9 +735,18 @@ fn plan_package_json_patch_removal(
     }
 
     let pkg_path = project_dir.join("package.json");
-    let raw = lpm_common::read_text_file_capped(&pkg_path, lpm_common::CONFIG_FILE_SIZE_CAP_BYTES)
-        .map_err(|e| LpmError::Script(format!("package.json at {pkg_path:?} unreadable: {e}")))?;
-    let mut value: serde_json::Value = serde_json::from_str(&raw)
+    let project_root = crate::patch_fs::SafeRoot::open(project_dir)?;
+    let raw_bytes = project_root
+        .read_regular_file(
+            Path::new("package.json"),
+            lpm_common::CONFIG_FILE_SIZE_CAP_BYTES,
+        )
+        .map_err(|error| {
+            LpmError::Script(format!("package.json at {pkg_path:?} unreadable: {error}"))
+        })?;
+    let raw = std::str::from_utf8(&raw_bytes)
+        .map_err(|_| LpmError::Script("package.json is not valid UTF-8".into()))?;
+    let mut value: serde_json::Value = serde_json::from_str(lpm_common::strip_utf8_bom_str(raw))
         .map_err(|e| LpmError::Script(format!("package.json malformed: {e}")))?;
 
     let patches_obj = value
@@ -574,14 +763,43 @@ fn plan_package_json_patch_removal(
         ));
     }
 
-    let mut requested = BTreeSet::new();
-    for selector in selectors {
-        requested.insert(resolve_patch_remove_selector(selector, patches_obj)?);
+    let mut normalized_paths = BTreeMap::new();
+    let mut name_to_keys = BTreeMap::<String, Vec<String>>::new();
+    for (key, entry) in patches_obj {
+        let raw_path = entry
+            .get("path")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| {
+                LpmError::Script(format!(
+                    "package.json `lpm.patchedDependencies[{key}].path` is missing or not a string"
+                ))
+            })?;
+        normalized_paths.insert(
+            key.clone(),
+            crate::patch_fs::validate_manifest_patch_path(raw_path)?,
+        );
+        let (name, _) = crate::patch_engine::parse_patch_key(key)?;
+        name_to_keys.entry(name).or_default().push(key.clone());
+    }
+    for keys in name_to_keys.values_mut() {
+        keys.sort();
     }
 
-    let remaining_file_refs = remaining_patch_file_refs(patches_obj, &requested);
+    let mut requested = BTreeSet::new();
+    for selector in selectors {
+        requested.insert(resolve_patch_remove_selector(
+            selector,
+            patches_obj,
+            &name_to_keys,
+        )?);
+    }
+
+    let remaining_file_refs: BTreeSet<&PathBuf> = normalized_paths
+        .iter()
+        .filter_map(|(key, path)| (!requested.contains(key)).then_some(path))
+        .collect();
     let mut removals = Vec::with_capacity(requested.len());
-    let mut files_to_delete = BTreeMap::<String, PathBuf>::new();
+    let mut files_to_delete = BTreeMap::<PathBuf, String>::new();
 
     for key in &requested {
         let entry = patches_obj.get(key).ok_or_else(|| {
@@ -598,19 +816,24 @@ fn plan_package_json_patch_removal(
                 ))
             })?
             .to_string();
+        let normalized_path = &normalized_paths[key];
 
         let (deleted_patch_file, retained_reason) = if dry_run {
             (false, Some("dry-run".to_string()))
         } else if keep_file {
             (false, Some("keep-file".to_string()))
-        } else if remaining_file_refs.contains(&patch_file) {
+        } else if remaining_file_refs.contains(normalized_path) {
             (false, Some("still referenced by another patch".to_string()))
         } else {
-            let safe_path = safe_project_relative_file(project_dir, &patch_file)?;
-            if safe_path.exists() {
+            if !is_patch_artifact_path(normalized_path) {
+                return Err(LpmError::Script(format!(
+                    "refusing to delete patch path {patch_file:?} outside the project patches directory; rerun with --keep-file to remove only the manifest entry"
+                )));
+            }
+            if project_root.regular_file_exists(normalized_path)? {
                 files_to_delete
-                    .entry(patch_file.clone())
-                    .or_insert(safe_path);
+                    .entry(normalized_path.clone())
+                    .or_insert_with(|| patch_file.clone());
                 (true, None)
             } else {
                 (false, Some("file already missing".to_string()))
@@ -632,6 +855,7 @@ fn plan_package_json_patch_removal(
     Ok(PatchRemovalPlan {
         outcome: PatchRemovalOutcome { removed: removals },
         manifest: value,
+        manifest_bytes: raw_bytes,
         files_to_delete,
     })
 }
@@ -640,12 +864,22 @@ fn apply_package_json_patch_removal(
     project_dir: &Path,
     plan: PatchRemovalPlan,
 ) -> Result<PatchRemovalOutcome, LpmError> {
+    let project_root = crate::patch_fs::SafeRoot::open(project_dir)?;
+    let current_manifest = project_root.read_regular_file(
+        Path::new("package.json"),
+        lpm_common::CONFIG_FILE_SIZE_CAP_BYTES,
+    )?;
+    if current_manifest != plan.manifest_bytes {
+        return Err(LpmError::Script(
+            "package.json changed after patch removal was planned; retry the command".into(),
+        ));
+    }
     write_package_json_value(project_dir, &plan.manifest)?;
 
     let mut delete_errors = Vec::new();
-    for (rel, abs) in plan.files_to_delete {
-        if let Err(e) = std::fs::remove_file(&abs) {
-            delete_errors.push(format!("{rel}: {e}"));
+    for (relative, raw) in plan.files_to_delete {
+        if let Err(error) = project_root.remove_regular_file(&relative) {
+            delete_errors.push(format!("{raw}: {error}"));
         }
     }
     if !delete_errors.is_empty() {
@@ -661,6 +895,7 @@ fn apply_package_json_patch_removal(
 fn resolve_patch_remove_selector(
     selector: &str,
     patches: &serde_json::Map<String, serde_json::Value>,
+    name_to_keys: &BTreeMap<String, Vec<String>>,
 ) -> Result<String, LpmError> {
     match parse_patch_selector(selector)? {
         PatchSelector::Exact { name, version } => {
@@ -674,24 +909,17 @@ fn resolve_patch_remove_selector(
             }
         }
         PatchSelector::BareName(name) => {
-            let mut matches = Vec::new();
-            for key in patches.keys() {
-                if let Ok((patched_name, _)) = crate::patch_engine::parse_patch_key(key)
-                    && patched_name == name
-                {
-                    matches.push(key.clone());
-                }
-            }
+            let matches = name_to_keys
+                .get(&name)
+                .map(Vec::as_slice)
+                .unwrap_or_default();
             match matches.len() {
                 0 => Err(LpmError::Script(format!("no patch entry found for {name}"))),
-                1 => Ok(matches.pop().unwrap()),
-                _ => {
-                    matches.sort();
-                    Err(LpmError::Script(format!(
-                        "patch selector {name:?} is ambiguous; specify a precise version: {}",
-                        matches.join(", ")
-                    )))
-                }
+                1 => Ok(matches[0].clone()),
+                _ => Err(LpmError::Script(format!(
+                    "patch selector {name:?} is ambiguous; specify a precise version: {}",
+                    matches.join(", ")
+                ))),
             }
         }
         PatchSelector::Range { name, range } => Err(LpmError::Script(format!(
@@ -700,48 +928,12 @@ fn resolve_patch_remove_selector(
     }
 }
 
-fn remaining_patch_file_refs(
-    patches: &serde_json::Map<String, serde_json::Value>,
-    removed_keys: &BTreeSet<String>,
-) -> BTreeSet<String> {
-    let mut refs = BTreeSet::new();
-    for (key, entry) in patches {
-        if removed_keys.contains(key) {
-            continue;
-        }
-        if let Some(path) = entry.get("path").and_then(serde_json::Value::as_str) {
-            refs.insert(path.to_string());
-        }
-    }
-    refs
-}
-
-fn safe_project_relative_file(project_dir: &Path, rel: &str) -> Result<PathBuf, LpmError> {
-    let rel_path = Path::new(rel);
-    if rel_path.is_absolute()
-        || rel_path
-            .components()
-            .any(|c| matches!(c, Component::ParentDir | Component::Prefix(_)))
-    {
-        return Err(LpmError::Script(format!(
-            "refusing to delete unsafe patch path {rel:?}; rerun with --keep-file to remove only the manifest entry"
-        )));
-    }
-
-    let path = project_dir.join(rel_path);
-    if let Some(parent) = path.parent()
-        && parent.exists()
-    {
-        let project_real = std::fs::canonicalize(project_dir).map_err(LpmError::Io)?;
-        let parent_real = std::fs::canonicalize(parent).map_err(LpmError::Io)?;
-        if !parent_real.starts_with(&project_real) {
-            return Err(LpmError::Script(format!(
-                "refusing to delete patch path {rel:?} because its parent resolves outside the project; rerun with --keep-file to remove only the manifest entry"
-            )));
-        }
-    }
-
-    Ok(path)
+fn is_patch_artifact_path(relative: &Path) -> bool {
+    let mut components = relative.components();
+    matches!(
+        (components.next(), components.next()),
+        (Some(std::path::Component::Normal(root)), Some(_)) if root == "patches"
+    )
 }
 
 fn remove_patch_entries_from_value(
@@ -775,34 +967,42 @@ fn remove_patch_entries_from_value(
     Ok(())
 }
 
-/// Inject `lpm.patchedDependencies.<key>` into `package.json` using the
-/// JSON Value mutation pattern. Same approach as `add.rs` — `serde_json`
-/// has `preserve_order` enabled at the workspace level, so existing key
-/// order is preserved.
-fn update_package_json_patches(
+struct PatchCommitManifestPlan {
+    manifest: serde_json::Value,
+    manifest_bytes: Vec<u8>,
+    obsolete_patch: Option<PathBuf>,
+}
+
+fn plan_package_json_patch_update(
     project_dir: &Path,
     key: &str,
     patch_file_rel: &str,
     integrity: &str,
-) -> Result<(), LpmError> {
+) -> Result<PatchCommitManifestPlan, LpmError> {
     let pkg_path = project_dir.join("package.json");
-    let raw = lpm_common::read_text_file_capped(&pkg_path, lpm_common::CONFIG_FILE_SIZE_CAP_BYTES)
-        .map_err(|e| LpmError::Script(format!("package.json at {pkg_path:?} unreadable: {e}")))?;
-    let mut value: serde_json::Value = serde_json::from_str(&raw)
-        .map_err(|e| LpmError::Script(format!("package.json malformed: {e}")))?;
+    let project_root = crate::patch_fs::SafeRoot::open(project_dir)?;
+    let manifest_bytes = project_root
+        .read_regular_file(
+            Path::new("package.json"),
+            lpm_common::CONFIG_FILE_SIZE_CAP_BYTES,
+        )
+        .map_err(|error| {
+            LpmError::Script(format!("package.json at {pkg_path:?} unreadable: {error}"))
+        })?;
+    let raw = std::str::from_utf8(&manifest_bytes)
+        .map_err(|_| LpmError::Script("package.json is not valid UTF-8".into()))?;
+    let mut manifest: serde_json::Value = serde_json::from_str(lpm_common::strip_utf8_bom_str(raw))
+        .map_err(|error| LpmError::Script(format!("package.json malformed: {error}")))?;
+    let new_path = crate::patch_fs::validate_manifest_patch_path(patch_file_rel)?;
 
-    // Ensure `lpm` is an object.
-    let lpm = value
+    let lpm = manifest
         .as_object_mut()
         .ok_or_else(|| LpmError::Script("package.json root is not an object".into()))?
         .entry("lpm".to_string())
         .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
-
     let lpm_obj = lpm
         .as_object_mut()
         .ok_or_else(|| LpmError::Script("package.json `lpm` is not an object".into()))?;
-
-    // Ensure `patchedDependencies` is an object.
     let patches = lpm_obj
         .entry("patchedDependencies".to_string())
         .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
@@ -810,8 +1010,34 @@ fn update_package_json_patches(
         LpmError::Script("package.json `lpm.patchedDependencies` is not an object".into())
     })?;
 
-    // Insert the new entry. We mirror the on-disk shape of
-    // PatchedDependencyEntry exactly so a re-parse roundtrips.
+    let prior_path = patches_obj
+        .get(key)
+        .and_then(|entry| entry.get("path"))
+        .and_then(serde_json::Value::as_str)
+        .map(crate::patch_fs::validate_manifest_patch_path)
+        .transpose()?;
+    let prior_path_is_shared = prior_path.as_ref().is_some_and(|prior| {
+        patches_obj.iter().any(|(other_key, entry)| {
+            other_key != key
+                && entry
+                    .get("path")
+                    .and_then(serde_json::Value::as_str)
+                    .and_then(|raw| crate::patch_fs::validate_manifest_patch_path(raw).ok())
+                    .is_some_and(|other| other == *prior)
+        })
+    });
+    let obsolete_patch = match prior_path {
+        Some(prior)
+            if prior != new_path
+                && !prior_path_is_shared
+                && is_patch_artifact_path(&prior)
+                && project_root.regular_file_exists(&prior)? =>
+        {
+            Some(prior)
+        }
+        _ => None,
+    };
+
     patches_obj.insert(
         key.to_string(),
         json!({
@@ -820,13 +1046,33 @@ fn update_package_json_patches(
         }),
     );
 
-    write_package_json_value(project_dir, &value)
+    Ok(PatchCommitManifestPlan {
+        manifest,
+        manifest_bytes,
+        obsolete_patch,
+    })
+}
+
+/// Inject `lpm.patchedDependencies.<key>` into `package.json` using the
+/// JSON Value mutation pattern. Same approach as `add.rs` — `serde_json`
+/// has `preserve_order` enabled at the workspace level, so existing key
+/// order is preserved.
+#[cfg(test)]
+fn update_package_json_patches(
+    project_dir: &Path,
+    key: &str,
+    patch_file_rel: &str,
+    integrity: &str,
+) -> Result<(), LpmError> {
+    let plan = plan_package_json_patch_update(project_dir, key, patch_file_rel, integrity)?;
+    write_package_json_value(project_dir, &plan.manifest)
 }
 
 fn upsert_lockfile_patch_record(
     project_dir: &Path,
     key: &str,
     patch_file_rel: &str,
+    patch_sha256: &str,
     integrity: &str,
 ) -> Result<bool, LpmError> {
     let mut lockfile = match crate::commands::install::workspace_lockfile::read_project(project_dir)
@@ -844,7 +1090,7 @@ fn upsert_lockfile_patch_record(
         key.to_string(),
         LockfilePatch {
             path: patch_file_rel.to_string(),
-            sha256: patch_state::patch_file_sha256(project_dir, patch_file_rel)?,
+            sha256: patch_sha256.to_string(),
             original_integrity: integrity.to_string(),
         },
     );
@@ -914,8 +1160,11 @@ fn write_package_json_value(project_dir: &Path, value: &serde_json::Value) -> Re
         output.push('\n');
     }
 
-    let pkg_path = project_dir.join("package.json");
-    lpm_common::write_file_atomic(&pkg_path, output.as_bytes()).map_err(LpmError::Io)
+    crate::patch_fs::SafeRoot::open(project_dir)?.write_regular_file(
+        Path::new("package.json"),
+        output.as_bytes(),
+        None,
+    )
 }
 
 #[cfg(test)]
@@ -1033,6 +1282,36 @@ mod tests {
             v["lpm"]["patchedDependencies"]["lodash@4.17.21"]["originalIntegrity"],
             "sha512-new"
         );
+    }
+
+    #[test]
+    fn patch_update_retains_prior_artifact_referenced_by_another_key() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("patches")).unwrap();
+        std::fs::write(dir.path().join("patches/shared.patch"), "diff").unwrap();
+        write_pkg(
+            dir.path(),
+            r#"{
+  "name": "x",
+  "lpm": {
+    "patchedDependencies": {
+      "a@1.0.0": { "path": "patches/shared.patch", "originalIntegrity": "sha512-a" },
+      "b@1.0.0": { "path": "patches/shared.patch", "originalIntegrity": "sha512-b" }
+    }
+  }
+}"#,
+        );
+
+        let plan = plan_package_json_patch_update(
+            dir.path(),
+            "a@1.0.0",
+            "patches/a@1.0.0.patch",
+            "sha512-new",
+        )
+        .unwrap();
+
+        assert!(plan.obsolete_patch.is_none());
+        assert!(dir.path().join("patches/shared.patch").exists());
     }
 
     #[test]
@@ -1215,6 +1494,44 @@ mod tests {
         assert!(format!("{err}").contains("unsafe patch path"));
         let v = read_pkg(dir.path());
         assert!(v["lpm"]["patchedDependencies"].get("a@1.0.0").is_some());
+    }
+
+    #[test]
+    fn patch_remove_aborts_when_manifest_changes_after_planning() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("patches")).unwrap();
+        std::fs::write(dir.path().join("patches/a.patch"), "diff").unwrap();
+        write_pkg(
+            dir.path(),
+            r#"{
+  "name": "x",
+  "lpm": {
+    "patchedDependencies": {
+      "a@1.0.0": { "path": "patches/a.patch", "originalIntegrity": "sha512-a" }
+    }
+  }
+}"#,
+        );
+        let plan =
+            plan_package_json_patch_removal(dir.path(), &["a@1.0.0".to_string()], false, false)
+                .unwrap();
+        let changed = r#"{
+  "name": "x",
+  "description": "concurrent edit",
+  "lpm": {
+    "patchedDependencies": {
+      "a@1.0.0": { "path": "patches/a.patch", "originalIntegrity": "sha512-a" }
+    }
+  }
+}"#;
+        write_pkg(dir.path(), changed);
+
+        assert!(apply_package_json_patch_removal(dir.path(), plan).is_err());
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("package.json")).unwrap(),
+            changed
+        );
+        assert!(dir.path().join("patches/a.patch").exists());
     }
 
     /// **Slice A structural contract.** `read_lockfile_for_patch_selector`

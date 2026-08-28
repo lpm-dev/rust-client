@@ -41,5 +41,20 @@ pub use validation::{
     ensure_project_node_modules, validate_bin_name, validate_project_node_modules,
 };
 
+/// Clone a complete directory tree with one copy-on-write filesystem operation when supported.
+/// Returns `false` when the platform or filesystem cannot provide that operation.
+#[inline]
+pub fn clone_directory_tree_cow(src: &std::path::Path, dst: &std::path::Path) -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        materialize::try_clonefile(src, dst)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (src, dst);
+        false
+    }
+}
+
 #[cfg(test)]
 mod tests;

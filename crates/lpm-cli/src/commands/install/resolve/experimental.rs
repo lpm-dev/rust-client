@@ -297,6 +297,7 @@ pub(in crate::commands::install) async fn run(
     workspace_member_deps: &[WorkspaceMemberLink],
     catalog_resolutions: &[lpm_workspace::CatalogProtocolResolution],
     current_patches: &HashMap<String, PatchedDependencyEntry>,
+    current_lockfile_patches: &lpm_lockfile::LockfilePatches,
     prior_patch_state: &Option<patch_state::PatchState>,
     current_patch_fingerprint: &str,
     dependency_engine_policy: &crate::engine_check::DependencyEnginePolicy,
@@ -316,7 +317,7 @@ pub(in crate::commands::install) async fn run(
     let metadata_queue = Arc::new(Semaphore::new(metadata_concurrency));
     let metadata_caches = MetadataCaches::new();
     let store = PackageStore::from_root(lpm_root);
-    let patch_fingerprints = compute_patch_fingerprints(current_patches, project_dir)?;
+    let patch_fingerprints = compute_patch_fingerprints(current_patches, current_lockfile_patches)?;
     let gate_stats = Arc::new(GateStats::default());
 
     let setup_ms = start.elapsed().as_millis();
@@ -722,6 +723,7 @@ pub(in crate::commands::install) async fn run(
     }
     let applied_patches = apply_patches_for_install(
         current_patches,
+        current_lockfile_patches,
         &link_result,
         &store,
         project_dir,
