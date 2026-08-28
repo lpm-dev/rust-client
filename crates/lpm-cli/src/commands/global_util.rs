@@ -12,6 +12,7 @@ pub(super) enum SyntheticProjectJsonFormat {
 }
 
 pub(super) struct InnerGlobalInstallOptions<'a> {
+    pub(super) state_root: &'a LpmRoot,
     pub(super) install_root: &'a Path,
     pub(super) package_name: &'a str,
     pub(super) package_version: &'a str,
@@ -23,6 +24,11 @@ pub(super) struct InnerGlobalInstallOptions<'a> {
     pub(super) strict_peer_dependencies_override: Option<bool>,
     pub(super) no_engine_strict: bool,
     pub(super) auto_build: bool,
+    pub(super) strict_integrity: bool,
+    pub(super) linker_override: Option<lpm_linker::LinkerMode>,
+    pub(super) advisor_override: Option<String>,
+    pub(super) strict_sandbox: bool,
+    pub(super) no_sandbox: bool,
     pub(super) script_policy_override: Option<ScriptPolicy>,
     pub(super) min_release_age_override: Option<u64>,
     pub(super) min_release_age_exclude: &'a [String],
@@ -34,8 +40,14 @@ pub(super) async fn run_inner_global_install(
     registry: &RegistryClient,
     options: InnerGlobalInstallOptions<'_>,
 ) -> Result<(), LpmError> {
-    let install_root_ext = lpm_common::as_extended_path(options.install_root);
-    std::fs::create_dir_all(&install_root_ext)?;
+    let install_leaf = options.install_root.file_name().ok_or_else(|| {
+        LpmError::Script(format!(
+            "global install root has no final path component: {}",
+            options.install_root.display()
+        ))
+    })?;
+    let installs = lpm_common::GlobalInstallsDirectory::open_or_create(options.state_root)?;
+    let install_directory = installs.open_or_create_install(install_leaf)?;
     let pkg_json_value = synthesize_pkg_json(
         options.synthetic_project_scope,
         options.trust_root,
@@ -47,7 +59,9 @@ pub(super) async fn run_inner_global_install(
         SyntheticProjectJsonFormat::Pretty => serde_json::to_string_pretty(&pkg_json_value),
     }
     .map_err(|e| LpmError::Script(format!("serializing synthetic package.json: {e}")))?;
-    std::fs::write(install_root_ext.join("package.json"), pkg_json_body)?;
+    install_directory
+        .as_dir()
+        .write("package.json", pkg_json_body.as_bytes())?;
 
     let _stdout_gag =
         crate::output::suppress_stdout(options.suppress_nested_output).map_err(LpmError::Script)?;
@@ -60,10 +74,10 @@ pub(super) async fn run_inner_global_install(
         crate::commands::install::FrozenLockfileMode::Never,
         false,
         options.allow_new,
-        false,
+        options.strict_integrity,
         options.no_engine_strict,
         options.strict_peer_dependencies_override,
-        None,
+        options.linker_override,
         crate::lpm_skills_config::LpmSkillsPreference::Disabled,
         true,
         true,
@@ -72,14 +86,14 @@ pub(super) async fn run_inner_global_install(
         None,
         None,
         options.script_policy_override,
-        None,
+        options.advisor_override,
         options.min_release_age_override,
         options.min_release_age_exclude,
         options.drift_ignore_policy,
         options.verify_policy,
         crate::commands::install::InstallOmitPolicy::default(),
-        false,
-        false,
+        options.strict_sandbox,
+        options.no_sandbox,
         false,
         false,
         false,

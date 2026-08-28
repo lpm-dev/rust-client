@@ -48,7 +48,9 @@
 
 use super::uninstall_ui;
 use chrono::Utc;
-use lpm_common::{LpmError, LpmRoot, sanitize_for_terminal, with_exclusive_lock};
+use lpm_common::{
+    GlobalInstallsDirectory, LpmError, LpmRoot, sanitize_for_terminal, with_exclusive_lock,
+};
 use lpm_global::{
     AliasEntry, GlobalManifest, IntentPayload, PackageEntry, Shim, TrustPruneEntry, TxKind,
     WalRecord, WalWriter, emit_shim, read_for, remove_shim, write_for,
@@ -119,6 +121,15 @@ fn run_under_lock(root: &LpmRoot, package: &str) -> Result<UninstallOutcome, Lpm
             )));
         }
     };
+    let install_leaf = Path::new(&active.root).file_name().ok_or_else(|| {
+        LpmError::Script(format!(
+            "uninstall of '{}' refused: install-root path {:?} has no final path component",
+            sanitize_for_terminal(package),
+            sanitize_for_terminal(&active.root),
+        ))
+    })?;
+    let installs = GlobalInstallsDirectory::open_or_create(root)?;
+    let install_directory = installs.open_install_if_exists(install_leaf)?;
     let tx_id = mk_tx_id();
 
     // ─── Step 0: compute trust prune set (M76) ─────────────────────
@@ -327,10 +338,9 @@ fn run_under_lock(root: &LpmRoot, package: &str) -> Result<UninstallOutcome, Lpm
     // ─── Step 4: delete install root (best-effort) ─────────────────
     let mut install_root_remaining = root_is_referenced;
     let mut install_root_cleanup_deferred = false;
-    let install_root_ext = lpm_common::as_extended_path(&install_root_abs);
     if !root_is_referenced
-        && install_root_ext.exists()
-        && let Err(e) = std::fs::remove_dir_all(&install_root_ext)
+        && let Some(install_directory) = install_directory
+        && let Err(e) = install_directory.remove_all()
     {
         tracing::debug!("uninstall -g: install root cleanup deferred to tombstone sweep: {e}");
         install_root_remaining = true;
@@ -513,11 +523,9 @@ fn compute_uninstall_trust_prune(
         uninstalling_version.to_string(),
     ));
 
-    // 2. Union every OTHER remaining install's lockfile-reachable
-    //    (name, version) pairs into `still_reachable`. ANY failure
-    //    here collapses to "don't prune": stale-trust is preferable
-    //    to lost-trust if a sibling lockfile is corrupt.
-    let mut still_reachable: HashSet<(String, String)> = HashSet::new();
+    // 2. Remove pairs reachable through every OTHER remaining install.
+    //    ANY failure here collapses to "don't prune": stale-trust is
+    //    preferable to lost-trust if a sibling lockfile is corrupt.
     for (other_pkg, other_entry) in &manifest.packages {
         if other_pkg == uninstalling_package {
             continue;
@@ -544,14 +552,16 @@ fn compute_uninstall_trust_prune(
             // sibling install is in an unreadable state; fail-safe.
             return Vec::new();
         };
-        still_reachable.extend(other_tree);
+        this_tree.retain(|pair| !other_tree.contains(pair));
+        if this_tree.is_empty() {
+            break;
+        }
     }
 
-    // 3. Difference. Sort for deterministic on-disk WAL Intent shape
-    //    so round-trip equality tests stay stable.
+    // 3. Sort for deterministic on-disk WAL Intent shape so round-trip
+    //    equality tests stay stable.
     let mut prune: Vec<TrustPruneEntry> = this_tree
         .into_iter()
-        .filter(|pair| !still_reachable.contains(pair))
         .map(|(name, version)| TrustPruneEntry { name, version })
         .collect();
     prune.sort_by(|a, b| {
@@ -1194,6 +1204,32 @@ mod tests {
         // is still there.
         let after = read_for(&root).unwrap();
         assert!(after.packages.contains_key("evilpkg"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn uninstall_refuses_symlinked_installs_parent_without_removing_victim_tree() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = TempDir::new().unwrap();
+        let victim = TempDir::new().unwrap();
+        let root = LpmRoot::from_dir(tmp.path());
+        let install_root = seed_active_package(&root, "pkg", &[]);
+        std::fs::remove_dir_all(&install_root).unwrap();
+        std::fs::remove_dir(root.global_installs()).unwrap();
+        let victim_install = victim.path().join("pkg@1.0.0");
+        std::fs::create_dir(&victim_install).unwrap();
+        std::fs::write(victim_install.join("sentinel"), "keep").unwrap();
+        symlink(victim.path(), root.global_installs()).unwrap();
+
+        let error = run_under_lock(&root, "pkg").unwrap_err();
+
+        assert!(error.to_string().contains("global installs directory"));
+        assert_eq!(
+            std::fs::read_to_string(victim_install.join("sentinel")).unwrap(),
+            "keep"
+        );
+        assert!(read_for(&root).unwrap().packages.contains_key("pkg"));
     }
 
     // ── M76: trust-prune reachability tests ───────────────────────

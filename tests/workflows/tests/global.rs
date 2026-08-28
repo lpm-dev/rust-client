@@ -19,10 +19,10 @@
 mod support;
 
 use chrono::{SecondsFormat, Utc};
-use lpm_global::{GlobalManifest, PackageEntry, PackageSource};
+use lpm_global::{GlobalManifest, PackageEntry, PackageSource, WalReader, WalRecord};
 use support::mock_registry::{MockRegistry, compute_integrity, make_tarball};
 use support::{TempProject, lpm, lpm_with_registry_and_npm};
-use wiremock::matchers::{method, path as wm_path};
+use wiremock::matchers::{header, method, path as wm_path};
 use wiremock::{Mock, Request, Respond, ResponseTemplate};
 
 #[derive(Clone)]
@@ -57,6 +57,72 @@ impl Respond for RecordDelayedGlobalUpdateMetadataStart {
                             "integrity": "sha512-test"
                         }
                     }
+                },
+                "time": {
+                    "1.0.0": "2025-01-01T00:00:00.000Z",
+                    "1.1.0": "2025-01-01T00:00:00.000Z"
+                }
+            }))
+    }
+}
+
+#[derive(Clone)]
+struct GlobalOutdatedMetadata;
+
+impl Respond for GlobalOutdatedMetadata {
+    fn respond(&self, request: &Request) -> ResponseTemplate {
+        let name = request.url.path().trim_start_matches('/');
+        ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "name": name,
+            "dist-tags": { "latest": "1.1.0" },
+            "versions": {
+                "1.0.0": { "name": name, "version": "1.0.0" },
+                "1.1.0": { "name": name, "version": "1.1.0" }
+            }
+        }))
+    }
+}
+
+#[derive(Clone)]
+struct RecordDelayedGlobalOutdatedReleaseTimes {
+    starts: std::sync::Arc<std::sync::Mutex<Vec<std::time::Instant>>>,
+    delay: std::time::Duration,
+}
+
+#[derive(Clone)]
+struct RecordDelayedGlobalUpdateTarballStart {
+    starts: std::sync::Arc<std::sync::Mutex<Vec<std::time::Instant>>>,
+    delay: std::time::Duration,
+    body: Vec<u8>,
+}
+
+impl Respond for RecordDelayedGlobalUpdateTarballStart {
+    fn respond(&self, _request: &Request) -> ResponseTemplate {
+        self.starts
+            .lock()
+            .expect("record global-update tarball request start")
+            .push(std::time::Instant::now());
+        ResponseTemplate::new(200)
+            .set_delay(self.delay)
+            .set_body_bytes(self.body.clone())
+    }
+}
+
+impl Respond for RecordDelayedGlobalOutdatedReleaseTimes {
+    fn respond(&self, request: &Request) -> ResponseTemplate {
+        self.starts
+            .lock()
+            .expect("record global-outdated release-time request start")
+            .push(std::time::Instant::now());
+        let name = request.url.path().trim_start_matches('/');
+        ResponseTemplate::new(200)
+            .set_delay(self.delay)
+            .set_body_json(serde_json::json!({
+                "name": name,
+                "dist-tags": { "latest": "1.1.0" },
+                "versions": {
+                    "1.0.0": { "name": name, "version": "1.0.0" },
+                    "1.1.0": { "name": name, "version": "1.1.0" }
                 },
                 "time": {
                     "1.0.0": "2025-01-01T00:00:00.000Z",
@@ -323,6 +389,101 @@ async fn global_list_outdated_human_output_uses_current_wanted_latest_bins_table
 }
 
 #[tokio::test]
+async fn global_list_outdated_json_distinguishes_wanted_from_absolute_latest() {
+    let project = TempProject::empty(r#"{"name":"global","version":"1.0.0"}"#);
+    seed_global_package(&project, "demo-cli", vec!["demo".to_string()]);
+
+    let mock = MockRegistry::start().await;
+    Mock::given(method("GET"))
+        .and(wm_path("/demo-cli"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "name": "demo-cli",
+            "dist-tags": { "latest": "2.0.0" },
+            "modified": iso8601_n_secs_ago(86_400),
+            "versions": {
+                "1.0.0": { "name": "demo-cli", "version": "1.0.0" },
+                "1.5.0": { "name": "demo-cli", "version": "1.5.0" },
+                "2.0.0": { "name": "demo-cli", "version": "2.0.0" }
+            },
+            "time": {
+                "1.0.0": iso8601_n_secs_ago(3 * 86_400),
+                "1.5.0": iso8601_n_secs_ago(2 * 86_400),
+                "2.0.0": iso8601_n_secs_ago(86_400)
+            }
+        })))
+        .mount(mock.server())
+        .await;
+
+    let output = lpm_with_registry_and_npm(&project, &mock.url())
+        .args(["--json", "global", "list", "--outdated"])
+        .output()
+        .expect("run global list --outdated --json");
+    assert!(
+        output.status.success(),
+        "global list --outdated --json must succeed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let envelope: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("valid JSON envelope");
+    assert_eq!(envelope["outdated"][0]["wanted"], "1.5.0");
+    assert_eq!(envelope["outdated"][0]["latest"], "2.0.0");
+}
+
+#[tokio::test]
+async fn global_list_outdated_reports_a_malformed_installed_version_as_unresolved() {
+    let project = TempProject::empty(r#"{"name":"global","version":"1.0.0"}"#);
+    seed_global_package(&project, "demo-cli", vec!["demo".to_string()]);
+    let root = isolated_lpm_root(&project);
+    let mut manifest = lpm_global::read_for(&root).expect("read global manifest");
+    manifest
+        .packages
+        .get_mut("demo-cli")
+        .expect("seeded package")
+        .resolved = "not-semver".to_string();
+    lpm_global::write_for(&root, &manifest).expect("write malformed version fixture");
+
+    let mock = MockRegistry::start().await;
+    Mock::given(method("GET"))
+        .and(wm_path("/demo-cli"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "name": "demo-cli",
+            "dist-tags": { "latest": "1.1.0" },
+            "versions": {
+                "1.0.0": { "name": "demo-cli", "version": "1.0.0" },
+                "1.1.0": { "name": "demo-cli", "version": "1.1.0" }
+            },
+            "time": {
+                "1.0.0": iso8601_n_secs_ago(2 * 86_400),
+                "1.1.0": iso8601_n_secs_ago(86_400)
+            }
+        })))
+        .mount(mock.server())
+        .await;
+
+    let output = lpm_with_registry_and_npm(&project, &mock.url())
+        .args(["--json", "global", "list", "--outdated"])
+        .output()
+        .expect("run global list --outdated --json");
+    assert!(
+        !output.status.success(),
+        "malformed installed versions must not be reported as up to date"
+    );
+    let envelope: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("valid JSON envelope");
+    assert_eq!(envelope["up_to_date"], serde_json::json!([]));
+    assert_eq!(envelope["unresolved"][0]["package"], "demo-cli");
+    assert!(
+        envelope["unresolved"][0]["reason"]
+            .as_str()
+            .is_some_and(
+                |reason| reason.contains("installed version") && reason.contains("not-semver")
+            ),
+        "unresolved reason must identify the malformed installed version: {envelope}"
+    );
+}
+
+#[tokio::test]
 async fn global_list_outdated_treats_fresh_latest_as_up_to_date() {
     let project = TempProject::empty(r#"{"name":"global","version":"1.0.0"}"#);
     let package = "@lpm.dev/acme.cooldown-cli";
@@ -431,6 +592,81 @@ async fn global_list_outdated_routes_upstream_npm_packages_directly_to_npm() {
     assert!(
         combined.contains("demo-cli") && combined.contains("1.5.0") && combined.contains("2.0.0"),
         "outdated table must include routed npm metadata, got:\n{combined}"
+    );
+}
+
+#[tokio::test]
+async fn global_list_outdated_hydrates_release_times_in_bounded_parallel_waves() {
+    const PACKAGE_COUNT: usize = 8;
+    let project = TempProject::empty(r#"{"name":"global","version":"1.0.0"}"#);
+    let root = isolated_lpm_root(&project);
+    let mut manifest = GlobalManifest::default();
+    for index in 0..PACKAGE_COUNT {
+        let package = format!("parallel-outdated-{index}");
+        manifest.packages.insert(
+            package.clone(),
+            PackageEntry {
+                saved_spec: "^1".to_string(),
+                resolved: "1.0.0".to_string(),
+                integrity: "sha512-test".to_string(),
+                source: PackageSource::UpstreamNpm,
+                installed_at: Utc::now(),
+                root: format!("installs/{package}@1.0.0"),
+                commands: vec![package],
+            },
+        );
+    }
+    lpm_global::write_for(&root, &manifest).expect("write parallel outdated manifest fixture");
+
+    let mock = MockRegistry::start().await;
+    Mock::given(method("GET"))
+        .and(wiremock::matchers::path_regex(
+            r"^/parallel-outdated-[0-9]+$",
+        ))
+        .and(header("accept", "application/vnd.npm.install-v1+json"))
+        .respond_with(GlobalOutdatedMetadata)
+        .mount(mock.server())
+        .await;
+    let starts = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    Mock::given(method("GET"))
+        .and(wiremock::matchers::path_regex(
+            r"^/parallel-outdated-[0-9]+$",
+        ))
+        .and(header("accept", "application/json"))
+        .respond_with(RecordDelayedGlobalOutdatedReleaseTimes {
+            starts: std::sync::Arc::clone(&starts),
+            delay: std::time::Duration::from_millis(250),
+        })
+        .mount(mock.server())
+        .await;
+
+    let output = lpm_with_registry_and_npm(&project, &mock.url())
+        .args(["--json", "global", "list", "--outdated"])
+        .output()
+        .expect("run global outdated with delayed release times");
+    assert!(
+        output.status.success(),
+        "parallel outdated check should succeed\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+
+    let starts = starts.lock().expect("read global-outdated request starts");
+    assert_eq!(starts.len(), PACKAGE_COUNT);
+    let first = *starts.iter().min().unwrap();
+    let mut offsets = starts
+        .iter()
+        .map(|start| start.duration_since(first))
+        .collect::<Vec<_>>();
+    offsets.sort();
+    assert!(offsets[3] < std::time::Duration::from_millis(150));
+    assert!(
+        offsets[4] >= std::time::Duration::from_millis(200),
+        "more than four release-time requests ran in the first wave: {offsets:?}"
+    );
+    assert!(
+        offsets[7] < std::time::Duration::from_millis(450),
+        "release-time hydration did not refill promptly: {offsets:?}"
     );
 }
 
@@ -580,6 +816,71 @@ fn global_bin_json_envelope_carries_path() {
         bin_path, expected,
         "envelope bin path must point at the isolated bin dir: {envelope}",
     );
+}
+
+#[test]
+fn global_bin_does_not_read_an_unrelated_corrupt_manifest() {
+    let project = TempProject::empty(r#"{"name":"global","version":"1.0.0"}"#);
+    let root = isolated_lpm_root(&project);
+    std::fs::create_dir_all(root.global_root()).expect("create global state directory");
+    std::fs::write(root.global_manifest(), b"this is not valid toml")
+        .expect("write corrupt global manifest");
+
+    let output = lpm(&project)
+        .args(["global", "bin"])
+        .output()
+        .expect("run global bin");
+
+    assert!(
+        output.status.success(),
+        "global bin must not depend on the manifest: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).trim(),
+        root.bin_dir().display().to_string()
+    );
+}
+
+#[test]
+fn global_install_rejects_flags_that_the_global_pipeline_cannot_honor() {
+    let project = TempProject::empty(r#"{"name":"global","version":"1.0.0"}"#);
+    let cases: &[(&[&str], &str)] = &[
+        (&["--offline"], "--offline"),
+        (&["--force"], "--force"),
+        (&["--skills"], "--skills"),
+        (&["--timing"], "--timing"),
+        (&["--audit-after-install"], "--audit-after-install"),
+        (&["--no-audit-after-install"], "--no-audit-after-install"),
+        (&["--workspace-concurrency", "2"], "--workspace-concurrency"),
+    ];
+
+    for &(flags, expected_flag) in cases {
+        let mut args = vec![
+            "--registry",
+            "http://127.0.0.1:1",
+            "--insecure",
+            "install",
+            "-g",
+            "demo-cli",
+        ];
+        args.extend_from_slice(flags);
+        let output = lpm(&project)
+            .args(args)
+            .output()
+            .unwrap_or_else(|error| panic!("run install -g {flags:?}: {error}"));
+        let combined = strip_ansi(&format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        ));
+        assert!(
+            !output.status.success()
+                && combined.contains(expected_flag)
+                && combined.contains("not supported"),
+            "install -g must reject {expected_flag} before registry access, got:\n{combined}"
+        );
+    }
 }
 
 // ─── path <pkg> (error path) ──────────────────────────────────────────
@@ -773,6 +1074,65 @@ fn global_unlink_removes_local_link_manifest_entry_and_shims() {
             artifact.display(),
         );
     }
+}
+
+#[cfg(unix)]
+#[test]
+fn global_unlink_restores_shims_when_any_shim_removal_fails() {
+    let project = TempProject::empty(r#"{"name":"global","version":"1.0.0"}"#);
+    let package_dir = project.path().join("multi-bin-tool");
+    std::fs::create_dir_all(package_dir.join("bin")).expect("create linked package dirs");
+    std::fs::write(
+        package_dir.join("package.json"),
+        r#"{
+  "name": "multi-bin-tool",
+  "version": "1.0.0",
+  "bin": {
+    "a-tool": "bin/a-tool",
+    "b-tool": "bin/b-tool"
+  }
+}"#,
+    )
+    .expect("write linked package manifest");
+    for command in ["a-tool", "b-tool"] {
+        let target = package_dir.join("bin").join(command);
+        std::fs::write(&target, "#!/bin/sh\nexit 0\n").expect("write bin target");
+        chmod_executable(&target);
+    }
+
+    let link = lpm(&project)
+        .args([
+            "global",
+            "link",
+            package_dir.to_str().expect("utf-8 temp path"),
+        ])
+        .output()
+        .expect("link local package");
+    assert!(
+        link.status.success(),
+        "global link must succeed: {}",
+        String::from_utf8_lossy(&link.stderr)
+    );
+
+    let root = isolated_lpm_root(&project);
+    let blocked_shim = root.bin_dir().join("b-tool");
+    lpm_common::remove_path_entry(&blocked_shim).expect("remove b-tool shim");
+    std::fs::create_dir(&blocked_shim).expect("replace b-tool shim with a directory");
+
+    let unlink = lpm(&project)
+        .args(["global", "unlink", "multi-bin-tool"])
+        .output()
+        .expect("run global unlink");
+    assert!(!unlink.status.success(), "sabotaged unlink must fail");
+    assert!(
+        std::fs::symlink_metadata(root.bin_dir().join("a-tool")).is_ok(),
+        "a shim removed before the failure must be restored"
+    );
+    let manifest = lpm_global::read_for(&root).expect("read global manifest after failed unlink");
+    assert!(
+        manifest.packages.contains_key("multi-bin-tool"),
+        "failed unlink must preserve the active manifest row"
+    );
 }
 
 #[test]
@@ -1305,6 +1665,126 @@ async fn bulk_global_update_plans_metadata_in_bounded_parallel_waves() {
     assert!(
         offsets[7] < std::time::Duration::from_millis(450),
         "the planner did not refill promptly for the second wave: {offsets:?}"
+    );
+}
+
+#[tokio::test]
+async fn bulk_global_update_installs_and_commits_in_bounded_parallel_batches() {
+    const PACKAGE_COUNT: usize = 8;
+    let project = TempProject::empty(r#"{"name":"global","version":"1.0.0"}"#);
+    let root = isolated_lpm_root(&project);
+    let mut manifest = GlobalManifest::default();
+    let mock = MockRegistry::start().await;
+    let starts = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+
+    for index in 0..PACKAGE_COUNT {
+        let package = format!("parallel-install-update-{index}");
+        manifest.packages.insert(
+            package.clone(),
+            PackageEntry {
+                saved_spec: "^1".to_string(),
+                resolved: "1.0.0".to_string(),
+                integrity: "sha512-old".to_string(),
+                source: PackageSource::UpstreamNpm,
+                installed_at: Utc::now(),
+                root: format!("installs/{package}@1.0.0"),
+                commands: vec![package.clone()],
+            },
+        );
+
+        let bin_path = format!("bin/{package}.js");
+        let tarball = support::mock_registry::make_tarball_from_pkg_json(
+            serde_json::json!({
+                "name": package,
+                "version": "1.1.0",
+                "bin": { package.clone(): bin_path.clone() }
+            }),
+            &[(bin_path.as_str(), b"#!/usr/bin/env node\n" as &[u8])],
+        );
+        let integrity = compute_integrity(&tarball);
+        let tarball_path = format!("/tarballs/{package}/-/{package}-1.1.0.tgz");
+        Mock::given(method("GET"))
+            .and(wm_path(format!("/{package}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "name": package,
+                "dist-tags": { "latest": "1.1.0" },
+                "versions": {
+                    "1.0.0": { "name": package, "version": "1.0.0" },
+                    "1.1.0": {
+                        "name": package,
+                        "version": "1.1.0",
+                        "bin": { package.clone(): bin_path },
+                        "dist": {
+                            "tarball": format!("{}{}", mock.url(), tarball_path),
+                            "integrity": integrity
+                        }
+                    }
+                },
+                "time": {
+                    "1.0.0": "2025-01-01T00:00:00.000Z",
+                    "1.1.0": "2025-01-01T00:00:00.000Z"
+                }
+            })))
+            .mount(mock.server())
+            .await;
+        Mock::given(method("GET"))
+            .and(wm_path(tarball_path))
+            .respond_with(RecordDelayedGlobalUpdateTarballStart {
+                starts: std::sync::Arc::clone(&starts),
+                delay: std::time::Duration::from_millis(250),
+                body: tarball,
+            })
+            .mount(mock.server())
+            .await;
+    }
+    lpm_global::write_for(&root, &manifest).expect("write bulk update fixture");
+
+    let output = lpm_with_registry_and_npm(&project, &mock.url())
+        .args(["--json", "global", "update"])
+        .output()
+        .expect("run concurrent bulk global update");
+    assert!(
+        output.status.success(),
+        "bulk global update should succeed\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+
+    let starts = starts.lock().expect("read global-update tarball starts");
+    assert_eq!(starts.len(), PACKAGE_COUNT);
+    let first = *starts.iter().min().unwrap();
+    let mut offsets = starts
+        .iter()
+        .map(|start| start.duration_since(first))
+        .collect::<Vec<_>>();
+    offsets.sort();
+    assert!(offsets[3] < std::time::Duration::from_millis(150));
+    assert!(offsets[4] >= std::time::Duration::from_millis(200));
+    assert!(offsets[7] < std::time::Duration::from_millis(450));
+    drop(starts);
+
+    let manifest = lpm_global::read_for(&root).expect("read committed bulk manifest");
+    assert!(manifest.pending.is_empty());
+    assert!(
+        manifest
+            .packages
+            .values()
+            .all(|entry| entry.resolved == "1.1.0")
+    );
+    let wal = WalReader::at(root.global_wal())
+        .scan()
+        .expect("scan bulk global-update WAL");
+    assert!(wal.is_clean());
+    assert_eq!(wal.records.len(), PACKAGE_COUNT * 2);
+    assert!(
+        wal.records[..PACKAGE_COUNT]
+            .iter()
+            .all(|record| matches!(record, WalRecord::Intent(_)))
+    );
+    assert!(
+        wal.records[PACKAGE_COUNT..]
+            .iter()
+            .all(|record| matches!(record, WalRecord::Commit { .. }))
     );
 }
 

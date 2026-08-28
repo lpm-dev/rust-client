@@ -1,8 +1,8 @@
 use chrono::Utc;
-use lpm_common::{LpmError, LpmRoot};
+use lpm_common::{GlobalInstallsDirectory, LpmError, LpmRoot};
 use lpm_global::{
-    IntentPayload, PackageEntry, PackageSource, PendingEntry, TxKind, WalRecord, WalWriter,
-    read_for, write_for,
+    GlobalManifest, IntentPayload, PackageEntry, PackageSource, PendingEntry, TxKind, WalRecord,
+    WalWriter, read_for, write_for,
 };
 use lpm_semver::Version;
 use std::path::PathBuf;
@@ -38,6 +38,43 @@ pub(super) fn prepare_upgrade_locked(
     tx_id: String,
 ) -> Result<StagedUpgrade, LpmError> {
     let mut manifest = read_for(root)?;
+    let (staged, record) = prepare_upgrade_in_manifest(root, &mut manifest, prep, tx_id)?;
+    let mut wal = WalWriter::open(root.global_wal())?;
+    wal.append(&record)?;
+    write_for(root, &manifest)?;
+    Ok(staged)
+}
+
+pub(super) fn prepare_upgrade_batch_locked(
+    root: &LpmRoot,
+    upgrades: &[(&UpgradePrep, String)],
+) -> Result<Vec<Result<StagedUpgrade, LpmError>>, LpmError> {
+    let mut manifest = read_for(root)?;
+    let mut records = Vec::with_capacity(upgrades.len());
+    let mut results = Vec::with_capacity(upgrades.len());
+    for &(prep, ref tx_id) in upgrades {
+        match prepare_upgrade_in_manifest(root, &mut manifest, prep, tx_id.clone()) {
+            Ok((staged, record)) => {
+                records.push(record);
+                results.push(Ok(staged));
+            }
+            Err(error) => results.push(Err(error)),
+        }
+    }
+    if !records.is_empty() {
+        let mut wal = WalWriter::open(root.global_wal())?;
+        wal.append_many(records.iter())?;
+        write_for(root, &manifest)?;
+    }
+    Ok(results)
+}
+
+fn prepare_upgrade_in_manifest(
+    root: &LpmRoot,
+    manifest: &mut GlobalManifest,
+    prep: &UpgradePrep,
+    tx_id: String,
+) -> Result<(StagedUpgrade, WalRecord), LpmError> {
     // Re-check active state under the lock (prior fetch was outside).
     let active = manifest.packages.get(&prep.name).ok_or_else(|| {
         LpmError::Script(format!(
@@ -79,10 +116,14 @@ pub(super) fn prepare_upgrade_locked(
     // errors when the new install root would push us over the
     // 247-char budget.
     lpm_common::check_install_path_budget(&install_root)?;
+    let install_leaf = install_root.file_name().ok_or_else(|| {
+        LpmError::Script(format!(
+            "global install root has no final path component: {}",
+            install_root.display()
+        ))
+    })?;
+    GlobalInstallsDirectory::open_or_create(root)?.open_or_create_install(install_leaf)?;
 
-    // Write Intent FIRST, then pending row. Crash between the two →
-    // recovery sees Intent without pending → Case C orphan cleanup.
-    let mut wal = WalWriter::open(root.global_wal())?;
     let new_row_json = serde_json::json!({
         "saved_spec": prep.new_saved_spec,
         "resolved": prep.new_version.to_string(),
@@ -94,7 +135,7 @@ pub(super) fn prepare_upgrade_locked(
         "commands": Vec::<String>::new(),
         "replaces_version": prep.current_version,
     });
-    wal.append(&WalRecord::Intent(Box::new(IntentPayload {
+    let record = WalRecord::Intent(Box::new(IntentPayload {
         tx_id: tx_id.clone(),
         kind: TxKind::Upgrade,
         package: prep.name.clone(),
@@ -114,7 +155,7 @@ pub(super) fn prepare_upgrade_locked(
         // Upgrade preserves trust (same package, same name@version semantics
         // through the existing trust-binding drift gate). No prune.
         uninstall_trust_prune: Vec::new(),
-    })))?;
+    }));
 
     manifest.pending.insert(
         prep.name.clone(),
@@ -129,13 +170,14 @@ pub(super) fn prepare_upgrade_locked(
             replaces_version: Some(prep.current_version.clone()),
         },
     );
-    write_for(root, &manifest)?;
-
-    Ok(StagedUpgrade {
-        tx_id,
-        install_root,
-        install_root_relative,
-    })
+    Ok((
+        StagedUpgrade {
+            tx_id,
+            install_root,
+            install_root_relative,
+        },
+        record,
+    ))
 }
 
 /// Compare the current `[packages.<pkg>]` row against the snapshot
@@ -200,6 +242,59 @@ pub(super) fn active_matches_planned_snapshot(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn prepare_upgrade_refuses_symlinked_install_root_before_writing_transaction_state() {
+        use std::os::unix::fs::symlink;
+
+        let home = tempfile::TempDir::new().unwrap();
+        let victim = tempfile::TempDir::new().unwrap();
+        let root = LpmRoot::from_dir(home.path());
+        let active = PackageEntry {
+            saved_spec: "^1".into(),
+            resolved: "1.0.0".into(),
+            integrity: "sha512-old".into(),
+            source: PackageSource::LpmDev,
+            installed_at: Utc::now(),
+            root: "installs/pkg@1.0.0".into(),
+            commands: vec![],
+        };
+        let snapshot = serde_json::json!({
+            "saved_spec": active.saved_spec,
+            "resolved": active.resolved,
+            "integrity": active.integrity,
+            "source": active.source,
+            "root": active.root,
+        });
+        let mut manifest = lpm_global::GlobalManifest::default();
+        manifest.packages.insert("pkg".into(), active);
+        write_for(&root, &manifest).unwrap();
+        std::fs::create_dir_all(root.global_installs()).unwrap();
+        std::fs::write(victim.path().join("sentinel"), "keep").unwrap();
+        symlink(victim.path(), root.install_root_for("pkg", "2.0.0")).unwrap();
+        let prep = UpgradePrep {
+            name: "pkg".into(),
+            current_version: "1.0.0".into(),
+            new_version: Version::parse("2.0.0").unwrap(),
+            new_saved_spec: "^2".into(),
+            new_integrity: "sha512-new".into(),
+            source: PackageSource::LpmDev,
+            prior_active_row_json: snapshot,
+            prior_aliases_json: serde_json::json!({}),
+        };
+
+        let error = prepare_upgrade_locked(&root, &prep, "tx-test".into()).unwrap_err();
+
+        assert!(error.to_string().contains("global install root"));
+        assert_eq!(
+            std::fs::read_to_string(victim.path().join("sentinel")).unwrap(),
+            "keep"
+        );
+        assert!(read_for(&root).unwrap().pending.is_empty());
+        assert!(!root.global_wal().exists());
+    }
+
     /// Snapshot matching is strict on the load-bearing fields.
     #[test]
     fn active_matches_planned_snapshot_passes_when_load_bearing_fields_agree() {

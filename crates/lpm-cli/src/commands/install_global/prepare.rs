@@ -1,6 +1,6 @@
 use super::resolve::ResolvedSpec;
 use chrono::Utc;
-use lpm_common::{LpmError, LpmRoot};
+use lpm_common::{GlobalInstallsDirectory, LpmError, LpmRoot};
 use lpm_global::{
     IntentPayload, PackageSource, PendingEntry, TxKind, WalRecord, WalWriter, read_for, write_for,
 };
@@ -54,6 +54,13 @@ pub(super) fn prepare_locked(
     // on POSIX; load-bearing for Windows (and for any scenario where
     // third-party tooling does not honour `\\?\` long-path prefixes).
     lpm_common::check_install_path_budget(&install_root)?;
+    let install_leaf = install_root.file_name().ok_or_else(|| {
+        LpmError::Script(format!(
+            "global install root has no final path component: {}",
+            install_root.display()
+        ))
+    })?;
+    GlobalInstallsDirectory::open_or_create(root)?.open_or_create_install(install_leaf)?;
 
     // Write Intent + pending atomically: Intent first (fsynced), then
     // pending row. Crash between the two = recovery sees Intent without
@@ -112,4 +119,38 @@ pub(super) fn prepare_locked(
         install_root,
         install_root_relative,
     })
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::symlink;
+    use tempfile::TempDir;
+
+    #[test]
+    fn prepare_refuses_symlinked_install_root_before_writing_transaction_state() {
+        let home = TempDir::new().unwrap();
+        let victim = TempDir::new().unwrap();
+        let root = LpmRoot::from_dir(home.path());
+        std::fs::create_dir_all(root.global_installs()).unwrap();
+        std::fs::write(victim.path().join("sentinel"), "keep").unwrap();
+        symlink(victim.path(), root.install_root_for("pkg", "1.0.0")).unwrap();
+        let resolved = ResolvedSpec {
+            name: "pkg".into(),
+            version: Version::parse("1.0.0").unwrap(),
+            integrity: "sha512-test".into(),
+            source: PackageSource::LpmDev,
+            saved_spec: "^1.0.0".into(),
+        };
+
+        let error = prepare_locked(&root, &resolved, "tx-test".into()).unwrap_err();
+
+        assert!(error.to_string().contains("global install root"));
+        assert_eq!(
+            std::fs::read_to_string(victim.path().join("sentinel")).unwrap(),
+            "keep"
+        );
+        assert!(read_for(&root).unwrap().pending.is_empty());
+        assert!(!root.global_wal().exists());
+    }
 }

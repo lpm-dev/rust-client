@@ -296,6 +296,7 @@ fn render_summary(fixes_applied: &[String]) {
 
 fn prune_store() -> Result<String, LpmError> {
     let root = LpmRoot::from_env()?;
+    let _global_installs = lpm_common::GlobalInstallsDirectory::open_or_create(&root)?;
     let summary = crate::commands::cache_prune::apply_for_doctor(&root)?;
     Ok(format!(
         "pruned {} store link entries and {} objects",
@@ -467,6 +468,36 @@ mod tests {
             report.failed.len(),
             1,
             "one planned install action must produce at most one failure"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn prune_store_refuses_symlinked_global_installs_parent_without_touching_target() {
+        use std::os::unix::fs::symlink;
+
+        let home = tempfile::tempdir().unwrap();
+        let victim = tempfile::tempdir().unwrap();
+        let root = LpmRoot::from_dir(home.path());
+        std::fs::create_dir_all(root.global_root()).unwrap();
+        let victim_install = victim.path().join("ghost@1.0.0");
+        std::fs::create_dir(&victim_install).unwrap();
+        std::fs::write(victim_install.join("sentinel"), "keep").unwrap();
+        symlink(victim.path(), root.global_installs()).unwrap();
+        let manifest = lpm_global::GlobalManifest {
+            tombstones: vec!["installs/ghost@1.0.0".into()],
+            ..lpm_global::GlobalManifest::default()
+        };
+        lpm_global::write_for(&root, &manifest).unwrap();
+        let _env =
+            crate::test_env::ScopedEnv::set([("LPM_HOME", home.path().as_os_str().to_os_string())]);
+
+        let error = prune_store().unwrap_err();
+
+        assert!(error.to_string().contains("global installs directory"));
+        assert_eq!(
+            std::fs::read_to_string(victim_install.join("sentinel")).unwrap(),
+            "keep"
         );
     }
 }

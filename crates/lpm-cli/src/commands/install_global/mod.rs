@@ -69,7 +69,7 @@ pub async fn run(
     )?;
     // Use the injected client so registry flags and session config
     // propagate into the inner project-shaped install.
-    let registry = client.clone_with_config();
+    let registry = client.clone_with_metadata_memory_cache();
     let release_age_policy =
         crate::release_age_selection::resolver_policy_for_project_with_excludes(
             &root.global_root(),
@@ -80,7 +80,15 @@ pub async fn run(
         )?;
 
     // ─── Pre-resolve (no lock) ─────────────────────────────────────
-    let resolved = pre_resolve(&registry, spec, &release_age_policy).await?;
+    let global_root = root.global_root();
+    let resolved = pre_resolve(
+        &registry,
+        spec,
+        &release_age_policy,
+        overrides.save_flags,
+        &global_root,
+    )
+    .await?;
     if !json_output {
         let name_safe = sanitize_for_terminal(&resolved.name);
         let version_safe = sanitize_for_terminal(&resolved.version.to_string());
@@ -353,8 +361,28 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn run_installs_cypress_subset_with_real_multiconflict_tree() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
         use wiremock::matchers::{method, path as match_path};
-        use wiremock::{Mock, MockServer, ResponseTemplate};
+        use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
+
+        #[derive(Clone)]
+        struct ChangingMetadata {
+            request_count: Arc<AtomicUsize>,
+            original: lpm_registry::PackageMetadata,
+            changed: lpm_registry::PackageMetadata,
+        }
+
+        impl Respond for ChangingMetadata {
+            fn respond(&self, _request: &Request) -> ResponseTemplate {
+                let metadata = if self.request_count.fetch_add(1, Ordering::SeqCst) == 0 {
+                    &self.original
+                } else {
+                    &self.changed
+                };
+                ResponseTemplate::new(200).set_body_json(metadata)
+            }
+        }
 
         let server = MockServer::start().await;
         let sandbox = tempfile::tempdir().unwrap();
@@ -495,8 +523,27 @@ mod tests {
         // the shared-cache + batch-metadata interplay. The install's
         // correctness is asserted by the `run(...)` return + manifest
         // shape below, not by a specific per-mock call count.
+        let mut changed_cypress_metadata = cypress_metadata.clone();
+        changed_cypress_metadata
+            .versions
+            .get_mut("15.13.1")
+            .and_then(|version| version.dist.as_mut())
+            .expect("cypress distribution metadata")
+            .integrity = Some("sha512-registry-changed-after-planning".to_string());
+        let cypress_metadata_requests = Arc::new(AtomicUsize::new(0));
+        for route in ["/cypress", "/api/registry/cypress"] {
+            Mock::given(method("GET"))
+                .and(match_path(route))
+                .respond_with(ChangingMetadata {
+                    request_count: Arc::clone(&cypress_metadata_requests),
+                    original: cypress_metadata.clone(),
+                    changed: changed_cypress_metadata.clone(),
+                })
+                .mount(&server)
+                .await;
+        }
+
         let per_package = [
-            ("cypress", &cypress_metadata),
             ("@cypress/xvfb", &xvfb_metadata),
             ("debug", &debug_metadata),
             ("chalk", &chalk_metadata),
@@ -556,7 +603,24 @@ mod tests {
         assert_eq!(entry.source, PackageSource::UpstreamNpm);
         assert_eq!(entry.commands, vec!["cypress"]);
 
+        let root_metadata_requests = cypress_metadata_requests.load(Ordering::SeqCst);
+        assert_eq!(
+            root_metadata_requests, 2,
+            "the inner resolver must reuse the pinned abbreviated metadata; only the distinct full-metadata fetch may follow"
+        );
+
         let install_root = root.install_root_for("cypress", "15.13.1");
+        let lockfile = lpm_lockfile::Lockfile::read_from_file(&install_root.join("lpm.lock"))
+            .expect("read global install lockfile");
+        let locked_root = lockfile
+            .packages
+            .iter()
+            .find(|package| package.name == "cypress" && package.version == "15.13.1")
+            .expect("root package lock row");
+        assert_eq!(
+            locked_root.integrity.as_deref(),
+            Some(entry.integrity.as_str())
+        );
         match lpm_global::validate_install_root(&install_root, Some(&["cypress".into()])).unwrap() {
             lpm_global::InstallRootStatus::Ready { commands } => {
                 assert_eq!(commands, vec!["cypress"]);

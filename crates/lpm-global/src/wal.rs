@@ -297,6 +297,33 @@ pub enum TxKind {
     Uninstall,
 }
 
+fn configure_nofollow(options: &mut std::fs::OpenOptions) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt as _;
+        use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT;
+
+        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    }
+}
+
+fn validate_regular_wal(file: &std::fs::File, path: &Path) -> std::io::Result<()> {
+    let metadata = file.metadata()?;
+    if metadata.is_file() && !lpm_common::is_symlink_or_junction(&metadata) {
+        return Ok(());
+    }
+    Err(std::io::Error::other(format!(
+        "refusing WAL path that is not a regular file: {}",
+        path.display()
+    )))
+}
+
 // ─── Writer ───────────────────────────────────────────────────────────
 
 /// Append-only writer for a WAL file at a fixed path. Each `append`
@@ -322,10 +349,15 @@ impl WalWriter {
             std::fs::create_dir_all(parent)?;
         }
         let mut open_opts = std::fs::OpenOptions::new();
-        open_opts.create(true).read(true).append(true);
+        open_opts
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false);
+        configure_nofollow(&mut open_opts);
         #[cfg(unix)]
         {
-            use std::os::unix::fs::OpenOptionsExt;
+            use std::os::unix::fs::OpenOptionsExt as _;
             // WAL records carry tx_id, install paths, and serialized
             // package metadata. Not raw secrets, but on shared hosts
             // they enumerate what tools are being installed and when
@@ -335,9 +367,7 @@ impl WalWriter {
             open_opts.mode(0o600);
         }
         let mut file = open_opts.open(&extended)?;
-        // Defensive: append mode positions writes at EOF on every write,
-        // but seek so any caller introspecting `file.stream_position()`
-        // sees a sensible value.
+        validate_regular_wal(&file, &path)?;
         file.seek(SeekFrom::End(0))?;
         Ok(WalWriter { path, file })
     }
@@ -351,43 +381,37 @@ impl WalWriter {
     /// The file is `sync_all()`-ed before return so the record is
     /// durable on platforms that honour fsync.
     pub fn append(&mut self, record: &WalRecord) -> Result<(), WalError> {
-        let payload = serde_json::to_vec(record)?;
-        if payload.len() > MAX_RECORD_PAYLOAD_BYTES {
-            return Err(WalError::PayloadTooLarge(payload.len()));
-        }
-        let len: u32 = payload
-            .len()
-            .try_into()
-            .map_err(|_| WalError::PayloadTooLarge(payload.len()))?;
-        let crc = crc32fast::hash(&payload);
+        self.append_many(std::iter::once(record))
+    }
 
-        // Build the full frame in memory so a single write() call hits
-        // the kernel — reduces (does not eliminate) torn-write risk
-        // since most kernels honour write atomicity for buffers below
-        // PIPE_BUF / page size. The recovery layer handles the
-        // remaining cases by design.
-        let mut frame = Vec::with_capacity(8 + payload.len() + 1);
-        frame.extend_from_slice(&len.to_be_bytes());
-        frame.extend_from_slice(&crc.to_be_bytes());
-        frame.extend_from_slice(&payload);
-        frame.push(RECORD_SENTINEL);
-
-        let current_len = self.file.metadata()?.len();
-        let next_len =
-            current_len
-                .checked_add(frame.len() as u64)
-                .ok_or(WalError::FileTooLarge {
-                    size: u64::MAX,
+    /// Append several framed records with one write and one durability barrier.
+    pub fn append_many<'a>(
+        &mut self,
+        records: impl IntoIterator<Item = &'a WalRecord>,
+    ) -> Result<(), WalError> {
+        let current_len = self.file.seek(SeekFrom::End(0))?;
+        let mut frames = Vec::new();
+        for record in records {
+            append_record_frame(&mut frames, record)?;
+            let next_len =
+                current_len
+                    .checked_add(frames.len() as u64)
+                    .ok_or(WalError::FileTooLarge {
+                        size: u64::MAX,
+                        cap: MAX_WAL_FILE_BYTES,
+                    })?;
+            if next_len > MAX_WAL_FILE_BYTES {
+                return Err(WalError::FileTooLarge {
+                    size: next_len,
                     cap: MAX_WAL_FILE_BYTES,
-                })?;
-        if next_len > MAX_WAL_FILE_BYTES {
-            return Err(WalError::FileTooLarge {
-                size: next_len,
-                cap: MAX_WAL_FILE_BYTES,
-            });
+                });
+            }
+        }
+        if frames.is_empty() {
+            return Ok(());
         }
 
-        self.file.write_all(&frame)?;
+        self.file.write_all(&frames)?;
         self.file.sync_all()?;
         Ok(())
     }
@@ -407,15 +431,32 @@ impl WalWriter {
 
     fn truncate_file_to(&mut self, offset: u64) -> Result<(), WalError> {
         self.file.sync_all()?;
-        // Windows append handles lack the access right required by `set_len`.
-        let truncate_handle = std::fs::OpenOptions::new()
-            .write(true)
-            .open(as_extended_path(&self.path))?;
-        truncate_handle.set_len(offset)?;
-        truncate_handle.sync_all()?;
+        self.file.set_len(offset)?;
+        self.file.sync_all()?;
         self.file.seek(SeekFrom::End(0))?;
         Ok(())
     }
+}
+
+fn append_record_frame(frame: &mut Vec<u8>, record: &WalRecord) -> Result<(), WalError> {
+    let payload = serde_json::to_vec(record)?;
+    if payload.len() > MAX_RECORD_PAYLOAD_BYTES {
+        return Err(WalError::PayloadTooLarge(payload.len()));
+    }
+    let len: u32 = payload
+        .len()
+        .try_into()
+        .map_err(|_| WalError::PayloadTooLarge(payload.len()))?;
+    let crc = crc32fast::hash(&payload);
+
+    // Keep every record independently framed inside a batch so recovery
+    // can retain complete records before a torn tail.
+    frame.reserve(8 + payload.len() + 1);
+    frame.extend_from_slice(&len.to_be_bytes());
+    frame.extend_from_slice(&crc.to_be_bytes());
+    frame.extend_from_slice(&payload);
+    frame.push(RECORD_SENTINEL);
+    Ok(())
 }
 
 // ─── Reader ───────────────────────────────────────────────────────────
@@ -496,7 +537,10 @@ impl WalReader {
     /// a missing or empty file — both are valid no-op states.
     pub fn scan(&self) -> Result<WalScan, WalError> {
         let extended = as_extended_path(&self.path);
-        let file = match std::fs::OpenOptions::new().read(true).open(&extended) {
+        let mut open_opts = std::fs::OpenOptions::new();
+        open_opts.read(true);
+        configure_nofollow(&mut open_opts);
+        let file = match open_opts.open(&extended) {
             Ok(f) => f,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 return Ok(WalScan {
@@ -508,6 +552,7 @@ impl WalReader {
             }
             Err(e) => return Err(WalError::Io(e)),
         };
+        validate_regular_wal(&file, &self.path)?;
 
         let file_len = file.metadata()?.len();
         if file_len == 0 {
@@ -671,6 +716,8 @@ fn is_known_op(op: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
+    use std::os::unix::fs::symlink;
     use tempfile::TempDir;
 
     fn intent(tx_id: &str, package: &str) -> WalRecord {
@@ -708,6 +755,63 @@ mod tests {
         assert!(!scan.has_torn_tail());
         assert!(!scan.hit_unknown_op());
         assert_eq!(scan.last_good_offset, scan.file_len);
+    }
+
+    #[test]
+    fn append_many_writes_each_record_in_order() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("wal.jsonl");
+        let records = [
+            intent("tx1", "eslint"),
+            commit("tx1"),
+            intent("tx2", "prettier"),
+        ];
+        let mut writer = WalWriter::open(&path).unwrap();
+
+        writer.append_many(records.iter()).unwrap();
+
+        let scan = WalReader::at(&path).scan().unwrap();
+        assert!(scan.is_clean());
+        assert_eq!(scan.records, records);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn writer_refuses_symlinked_wal_without_appending_to_target() {
+        let tmp = TempDir::new().unwrap();
+        let victim = tmp.path().join("victim");
+        let path = tmp.path().join("wal.jsonl");
+        std::fs::write(&victim, b"keep").unwrap();
+        symlink(&victim, &path).unwrap();
+
+        let result = WalWriter::open(&path);
+
+        assert!(result.is_err(), "writer must reject a linked WAL leaf");
+        assert_eq!(std::fs::read(&victim).unwrap(), b"keep");
+    }
+
+    #[test]
+    fn append_many_stops_consuming_records_once_wal_limit_is_exceeded() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("wal.jsonl");
+        let file = std::fs::File::create(&path).unwrap();
+        file.set_len(MAX_WAL_FILE_BYTES - 1).unwrap();
+        let record = commit("tx-over-file-limit");
+        let records = std::iter::once(&record).chain(std::iter::from_fn(|| {
+            panic!("append_many consumed a record after exceeding the WAL limit")
+        }));
+        let mut writer = WalWriter::open(&path).unwrap();
+
+        let result = writer.append_many(records);
+
+        assert!(matches!(
+            result,
+            Err(WalError::FileTooLarge { size, cap }) if size > cap && cap == MAX_WAL_FILE_BYTES
+        ));
+        assert_eq!(
+            std::fs::metadata(path).unwrap().len(),
+            MAX_WAL_FILE_BYTES - 1
+        );
     }
 
     /// Frame an arbitrary JSON payload into a well-formed WAL record
