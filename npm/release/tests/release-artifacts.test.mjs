@@ -226,6 +226,30 @@ test("macOS release workflow provisions, notarizes, staples, and executes the bu
   assert.doesNotMatch(releaseWorkflow, /--entitlements "\$APPLE_CODESIGN_ENTITLEMENTS"\s*\\\s*--sign[^\n]+\s*\\\s*"\$\{\{ matrix\.binary \}\}"/);
 });
 
+test("macOS app bundles declare and package the LPM icon", () => {
+  const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../../..");
+  const infoPlist = fs.readFileSync(path.join(repoRoot, "macos/LPMCLI-Info.plist"), "utf8");
+  const localBuild = fs.readFileSync(
+    path.join(repoRoot, "scripts/build-signed-macos.sh"),
+    "utf8",
+  );
+  const releaseWorkflow = fs.readFileSync(
+    path.join(repoRoot, ".github/workflows/release.yml"),
+    "utf8",
+  );
+
+  assert.match(
+    infoPlist,
+    /<key>CFBundleIconFile<\/key>\s*<string>LPMCLI\.icns<\/string>/,
+  );
+  assert.equal(
+    fs.readFileSync(path.join(repoRoot, "macos/LPMCLI.icns")).subarray(0, 4).toString("ascii"),
+    "icns",
+  );
+  assert.match(localBuild, /Contents\/Resources\/LPMCLI\.icns/);
+  assert.match(releaseWorkflow, /Contents\/Resources\/LPMCLI\.icns/);
+});
+
 test("release workflow smoke-tests standalone macOS bundle installation on both architectures", () => {
   const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../../..");
   const releaseWorkflow = fs.readFileSync(

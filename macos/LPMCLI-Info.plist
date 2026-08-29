@@ -6,6 +6,8 @@
 	<string>en</string>
 	<key>CFBundleExecutable</key>
 	<string>lpm-rs</string>
+	<key>CFBundleIconFile</key>
+	<string>LPMCLI.icns</string>
 	<key>CFBundleIdentifier</key>
 	<string>dev.lpm.cli</string>
 	<key>CFBundleInfoDictionaryVersion</key>

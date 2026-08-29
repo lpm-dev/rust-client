@@ -672,8 +672,9 @@ jobs:
           PROFILE_PATH="$RUNNER_TEMP/lpm-cli.provisionprofile"
           PROFILE_PLIST="$RUNNER_TEMP/lpm-cli-profile.plist"
           APP_BUNDLE="$RUNNER_TEMP/${{ matrix.binary }}-bundle/LPM CLI.app"
-          mkdir -p "$APP_BUNDLE/Contents/MacOS"
+          mkdir -p "$APP_BUNDLE/Contents/MacOS" "$APP_BUNDLE/Contents/Resources"
           cp macos/LPMCLI-Info.plist "$APP_BUNDLE/Contents/Info.plist"
+          cp macos/LPMCLI.icns "$APP_BUNDLE/Contents/Resources/LPMCLI.icns"
           cp "$RUNNER_TEMP/lpm-rs-provisioned" "$APP_BUNDLE/Contents/MacOS/lpm-rs"
           chmod 755 "$APP_BUNDLE/Contents/MacOS/lpm-rs"
           printf '%s' "$APPLE_CLI_PROVISIONING_PROFILE_BASE64" | base64 --decode > "$PROFILE_PATH"
@@ -1296,7 +1297,7 @@ jobs:
             unexpected_entries=$(
               cd "binaries/${platform}" &&
                 find 'LPM CLI.app' -print |
-                  grep -Ev '^(LPM CLI\.app|LPM CLI\.app/Contents|LPM CLI\.app/Contents/Info\.plist|LPM CLI\.app/Contents/CodeResources|LPM CLI\.app/Contents/embedded\.provisionprofile|LPM CLI\.app/Contents/MacOS|LPM CLI\.app/Contents/MacOS/lpm-rs|LPM CLI\.app/Contents/_CodeSignature|LPM CLI\.app/Contents/_CodeSignature/CodeResources)$' || true
+                  grep -Ev '^(LPM CLI\.app|LPM CLI\.app/Contents|LPM CLI\.app/Contents/Info\.plist|LPM CLI\.app/Contents/CodeResources|LPM CLI\.app/Contents/embedded\.provisionprofile|LPM CLI\.app/Contents/MacOS|LPM CLI\.app/Contents/MacOS/lpm-rs|LPM CLI\.app/Contents/Resources|LPM CLI\.app/Contents/Resources/LPMCLI\.icns|LPM CLI\.app/Contents/_CodeSignature|LPM CLI\.app/Contents/_CodeSignature/CodeResources)$' || true
             )
             if [ -n "$unexpected_entries" ]; then
               echo "::error::${archive} produced unexpected npm bundle entries:"

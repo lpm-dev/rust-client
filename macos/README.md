@@ -69,6 +69,7 @@ LPM CLI.app/
     CodeResources
     embedded.provisionprofile
     MacOS/lpm-rs
+    Resources/LPMCLI.icns
     _CodeSignature/CodeResources
 ```
 

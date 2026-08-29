@@ -153,6 +153,10 @@ function verifyPlatformSignatures({ platform, nativeRoot, wrapperRoot }) {
       "installed macOS provisioning profile",
     );
     assertRegularFile(
+      path.join(appBundle, "Contents", "Resources", "LPMCLI.icns"),
+      "installed macOS application icon",
+    );
+    assertRegularFile(
       path.join(appBundle, "Contents", "CodeResources"),
       "installed macOS notarization ticket",
     );

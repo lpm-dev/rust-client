@@ -149,13 +149,14 @@ write_release_asset() {
 
   fixture_bundle_root="$destination_dir/.bundle-fixture"
   fixture_app="$fixture_bundle_root/LPM CLI.app"
-  mkdir -p "$fixture_app/Contents/MacOS" "$fixture_app/Contents/_CodeSignature"
+  mkdir -p "$fixture_app/Contents/MacOS" "$fixture_app/Contents/Resources" "$fixture_app/Contents/_CodeSignature"
   printf '%s' "$executable_bytes" > "$fixture_app/Contents/MacOS/lpm-rs"
   chmod 755 "$fixture_app/Contents/MacOS/lpm-rs"
   printf '<plist><dict><key>CFBundleIdentifier</key><string>dev.lpm.cli</string></dict></plist>\n' \
     > "$fixture_app/Contents/Info.plist"
   printf 'fixture-profile' > "$fixture_app/Contents/embedded.provisionprofile"
   printf 'fixture-notarization-ticket' > "$fixture_app/Contents/CodeResources"
+  printf 'fixture-icon' > "$fixture_app/Contents/Resources/LPMCLI.icns"
   printf 'fixture-signature' > "$fixture_app/Contents/_CodeSignature/CodeResources"
   ditto -c -k --keepParent "$fixture_app" "$destination_dir/$RELEASE_ASSET"
   LAST_FIXTURE_EXECUTABLE="$fixture_app/Contents/MacOS/lpm-rs"

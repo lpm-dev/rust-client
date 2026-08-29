@@ -530,6 +530,7 @@ validate_macos_bundle() {
   app_label="$2"
   app_contents="$app_bundle/Contents"
   app_executable="$app_contents/MacOS/lpm-rs"
+  app_icon="$app_contents/Resources/LPMCLI.icns"
   app_profile="$app_contents/embedded.provisionprofile"
   app_signature="$app_contents/_CodeSignature/CodeResources"
   app_ticket="$app_contents/CodeResources"
@@ -538,6 +539,7 @@ validate_macos_bundle() {
     "$app_contents/Info.plist" \
     "$app_ticket" \
     "$app_executable" \
+    "$app_icon" \
     "$app_profile" \
     "$app_signature"
   do
@@ -549,7 +551,7 @@ validate_macos_bundle() {
 
   unexpected_entries=$(
     cd "$app_bundle" &&
-      find . -print | grep -Ev '^(\.|\./Contents|\./Contents/Info\.plist|\./Contents/CodeResources|\./Contents/embedded\.provisionprofile|\./Contents/MacOS|\./Contents/MacOS/lpm-rs|\./Contents/_CodeSignature|\./Contents/_CodeSignature/CodeResources)$' || true
+      find . -print | grep -Ev '^(\.|\./Contents|\./Contents/Info\.plist|\./Contents/CodeResources|\./Contents/embedded\.provisionprofile|\./Contents/MacOS|\./Contents/MacOS/lpm-rs|\./Contents/Resources|\./Contents/Resources/LPMCLI\.icns|\./Contents/_CodeSignature|\./Contents/_CodeSignature/CodeResources)$' || true
   )
   if [ -n "$unexpected_entries" ]; then
     echo "ERROR: $app_label contains unexpected entries:"
