@@ -461,6 +461,26 @@ impl ManifestTransaction {
         Ok(())
     }
 
+    pub fn snapshot_path_with_bytes_if_unchanged(
+        &mut self,
+        path: &Path,
+        original_bytes: Vec<u8>,
+    ) -> std::io::Result<()> {
+        if !FileFingerprint::from_bytes(&original_bytes).matches_path(path)? {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("{} changed since it was read", path.display()),
+            ));
+        }
+        self.snapshot_optional_path_with_bytes(path, Some(original_bytes))
+    }
+
+    pub fn invalidate_path_on_rollback(&mut self, path: PathBuf) {
+        if !self.invalidate.contains(&path) {
+            self.invalidate.push(path);
+        }
+    }
+
     pub fn snapshot_optional_path_from_file(
         &mut self,
         path: &Path,
@@ -721,6 +741,35 @@ mod tests {
         drop(tx);
 
         assert_eq!(read(&path), br#"{"name":"external-edit"}"#);
+    }
+
+    #[test]
+    fn guarded_rollback_preserves_a_file_created_after_the_transaction_removed_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        write(&path, b"original");
+
+        let mut tx = ManifestTransaction::snapshot(&[&path]).unwrap();
+        fs::remove_file(&path).unwrap();
+        tx.restore_only_if_current(&path).unwrap();
+        write(&path, b"external-edit");
+        drop(tx);
+
+        assert_eq!(read(&path), b"external-edit");
+    }
+
+    #[test]
+    fn guarded_rollback_preserves_a_missing_path_after_the_transaction_created_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+
+        let mut tx = ManifestTransaction::snapshot_install_state(&[], &[&path], &[]).unwrap();
+        write(&path, b"created-by-transaction");
+        tx.restore_only_if_current(&path).unwrap();
+        fs::remove_file(&path).unwrap();
+        drop(tx);
+
+        assert!(!path.exists());
     }
 
     #[test]
