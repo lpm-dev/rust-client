@@ -28,6 +28,8 @@ EXPECTED_BUNDLE_ID="dev.lpm.cli"
 EXPECTED_TEAM_ID="823S8YKMRW"
 EXPECTED_ACCESS_GROUP="$EXPECTED_TEAM_ID.dev.lpm.vault.shared"
 EXPECTED_PROFILE_ACCESS_GROUP="$EXPECTED_TEAM_ID.*"
+# v0.76.5 is the last signed app bundle that does not declare an icon.
+MACOS_ICON_FIRST_VERSION="v0.76.6"
 MACOS_BUNDLE=0
 LEGACY_MACOS=0
 
@@ -539,7 +541,6 @@ validate_macos_bundle() {
     "$app_contents/Info.plist" \
     "$app_ticket" \
     "$app_executable" \
-    "$app_icon" \
     "$app_profile" \
     "$app_signature"
   do
@@ -548,6 +549,22 @@ validate_macos_bundle() {
       return 1
     fi
   done
+
+  declared_icon=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIconFile' "$app_contents/Info.plist" 2>/dev/null || true)
+  icon_required=0
+  if ! version_lt "$VERSION" "$MACOS_ICON_FIRST_VERSION"; then
+    icon_required=1
+  fi
+  if [ "$icon_required" = "1" ] || [ -n "$declared_icon" ] || [ -e "$app_icon" ] || [ -L "$app_icon" ]; then
+    if [ "$declared_icon" != "LPMCLI.icns" ]; then
+      echo "ERROR: $app_label must declare LPMCLI.icns as its application icon."
+      return 1
+    fi
+    if [ ! -f "$app_icon" ] || [ -L "$app_icon" ]; then
+      echo "ERROR: $app_label is missing its declared regular icon file: $app_icon"
+      return 1
+    fi
+  fi
 
   unexpected_entries=$(
     cd "$app_bundle" &&

@@ -9,6 +9,7 @@
 #   - happy path (manifest + binary match, no cosign on PATH)
 #   - nightly channel lookup and strict stable/nightly separation
 #   - explicit LPM_INSTALL_VERSION path (no latest-release API fetch)
+#   - explicit installation of a signed pre-icon macOS bundle
 #   - manifest 404 (release predates signed-install gate)
 #   - bundle 404 (manifest present, bundle missing → fail-closed)
 #   - SHA mismatch (manifest declares one SHA, binary has another)
@@ -141,6 +142,7 @@ make_happy_fixture() {
 write_release_asset() {
   destination_dir="$1"
   executable_bytes="$2"
+  include_macos_icon="${3:-1}"
   if [ "$HOST_OS" != "Darwin" ]; then
     printf '%s' "$executable_bytes" > "$destination_dir/$RELEASE_ASSET"
     LAST_FIXTURE_EXECUTABLE="$destination_dir/$RELEASE_ASSET"
@@ -152,11 +154,18 @@ write_release_asset() {
   mkdir -p "$fixture_app/Contents/MacOS" "$fixture_app/Contents/Resources" "$fixture_app/Contents/_CodeSignature"
   printf '%s' "$executable_bytes" > "$fixture_app/Contents/MacOS/lpm-rs"
   chmod 755 "$fixture_app/Contents/MacOS/lpm-rs"
-  printf '<plist><dict><key>CFBundleIdentifier</key><string>dev.lpm.cli</string></dict></plist>\n' \
-    > "$fixture_app/Contents/Info.plist"
+  if [ "$include_macos_icon" = "1" ]; then
+    printf '<plist><dict><key>CFBundleIdentifier</key><string>dev.lpm.cli</string><key>CFBundleIconFile</key><string>LPMCLI.icns</string></dict></plist>\n' \
+      > "$fixture_app/Contents/Info.plist"
+  else
+    printf '<plist><dict><key>CFBundleIdentifier</key><string>dev.lpm.cli</string></dict></plist>\n' \
+      > "$fixture_app/Contents/Info.plist"
+  fi
   printf 'fixture-profile' > "$fixture_app/Contents/embedded.provisionprofile"
   printf 'fixture-notarization-ticket' > "$fixture_app/Contents/CodeResources"
-  printf 'fixture-icon' > "$fixture_app/Contents/Resources/LPMCLI.icns"
+  if [ "$include_macos_icon" = "1" ]; then
+    printf 'fixture-icon' > "$fixture_app/Contents/Resources/LPMCLI.icns"
+  fi
   printf 'fixture-signature' > "$fixture_app/Contents/_CodeSignature/CodeResources"
   ditto -c -k --keepParent "$fixture_app" "$destination_dir/$RELEASE_ASSET"
   LAST_FIXTURE_EXECUTABLE="$fixture_app/Contents/MacOS/lpm-rs"
@@ -593,6 +602,43 @@ echo "$RUN_OUT" | grep -q "Installing LPM CLI $LEADING_ZERO_NIGHTLY_VERSION (nig
   || fail "semver-safe leading-zero nightly version did not infer the nightly channel: $RUN_OUT"
 rm -rf "$fdir"
 pass "explicit stable and nightly versions install without latest-release API"
+
+if [ "$HOST_OS" = "Darwin" ]; then
+  fdir="$(mktemp -d)"
+  write_release_asset "$fdir" 'pre-icon-bundle-binary-bytes' 0
+  sha="$($SHA_TOOL "$fdir/$RELEASE_ASSET" | awk '{print $1}')"
+  printf '%s  %s\n' "$sha" "$RELEASE_ASSET" > "$fdir/SHA256SUMS.txt"
+  printf 'dummy-sigstore-bundle' > "$fdir/SHA256SUMS.txt.sigstore"
+  trap 'stop_server' EXIT
+  start_server "$fdir"
+  LPM_INSTALL_VERSION="v0.76.5" run_install_sh
+  unset LPM_INSTALL_VERSION
+  stop_server
+  trap - EXIT
+  [ "$RUN_RC" -eq 0 ] \
+    || fail "signed pre-icon macOS bundle failed with exit $RUN_RC; out: $RUN_OUT"
+  [ -x "$RUN_INSTALL_DIR/lpm" ] \
+    || fail "signed pre-icon macOS bundle did not install an executable"
+  rm -rf "$fdir"
+  pass "signed pre-icon macOS bundle remains installable"
+
+  fdir="$(mktemp -d)"
+  write_release_asset "$fdir" 'missing-icon-bundle-binary-bytes' 0
+  sha="$($SHA_TOOL "$fdir/$RELEASE_ASSET" | awk '{print $1}')"
+  printf '%s  %s\n' "$sha" "$RELEASE_ASSET" > "$fdir/SHA256SUMS.txt"
+  printf 'dummy-sigstore-bundle' > "$fdir/SHA256SUMS.txt.sigstore"
+  trap 'stop_server' EXIT
+  start_server "$fdir"
+  LPM_INSTALL_VERSION="v0.76.6" run_install_sh
+  unset LPM_INSTALL_VERSION
+  stop_server
+  trap - EXIT
+  [ "$RUN_RC" -ne 0 ] || fail "icon-bearing macOS release installed without its icon"
+  echo "$RUN_OUT" | grep -q "must declare LPMCLI.icns" \
+    || fail "missing icon declaration failure was unclear: $RUN_OUT"
+  rm -rf "$fdir"
+  pass "icon-bearing macOS release requires its declared icon"
+fi
 
 # ── Case 10: manifest 404 fails closed ────────────────────────
 fdir="$(mktemp -d)"
