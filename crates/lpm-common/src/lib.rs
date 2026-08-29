@@ -10,6 +10,7 @@ pub mod bounded_read;
 pub mod color;
 pub mod command_name;
 pub mod error;
+pub mod global_fs;
 pub mod integrity;
 pub mod known_projects;
 pub mod local_target;
@@ -47,6 +48,7 @@ pub use error::{
     ArtifactUnavailableErrorContext, ArtifactUnavailableKind, LpmError, ResolutionErrorContext,
     ResolutionFailureKind, TyposquatErrorContext, TyposquatErrorFinding,
 };
+pub use global_fs::{GlobalInstallDirectory, GlobalInstallsDirectory, GlobalStateDirectories};
 pub use integrity::Integrity;
 pub use local_target::{LocalScheme, LocalTarget};
 pub use lpm_json::{LpmJsonFileState, LpmJsonMutation, LpmJsonTransactionError, update_lpm_json};
@@ -65,8 +67,9 @@ pub use paths::{
     SingleFileSharedLockHandle, acquire_exclusive_lock, acquire_single_file_exclusive_lock,
     acquire_single_file_exclusive_lock_from_file, acquire_single_file_shared_lock,
     acquire_single_file_shared_lock_from_file, as_extended_path, check_install_path_budget,
-    is_local_fs, project_install_lock, project_publish_lock, try_acquire_exclusive_lock,
-    try_acquire_single_file_exclusive_lock_from_file, try_with_exclusive_lock, with_exclusive_lock,
+    is_local_fs, project_install_lock, project_publish_lock, try_acquire_capability_exclusive_lock,
+    try_acquire_exclusive_lock, try_acquire_single_file_exclusive_lock_from_file,
+    try_with_exclusive_lock, with_capability_exclusive_lock, with_exclusive_lock,
     with_exclusive_lock_async, with_project_exclusive_lock_async, with_project_shared_lock_async,
     with_shared_lock, with_shared_lock_async,
 };

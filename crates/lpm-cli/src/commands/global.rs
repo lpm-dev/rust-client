@@ -14,7 +14,7 @@ use lpm_global::{
     GlobalManifest, PackageEntry, PackageSource, Shim, artifacts_complete, emit_shim,
     find_command_collisions, remove_shim,
 };
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 const LOCAL_LINK_SPEC_PREFIX: &str = "link:";
@@ -104,14 +104,17 @@ pub async fn run(
     json_output: bool,
 ) -> Result<(), LpmError> {
     let root = LpmRoot::from_env()?;
-    let manifest = lpm_global::read_for(&root)?;
 
     match action {
         GlobalCmd::List {
             outdated: true,
             verbose,
-        } => run_list_outdated(client, &root, &manifest, verbose, json_output).await,
+        } => {
+            let manifest = lpm_global::read_for(&root)?;
+            run_list_outdated(client, &root, &manifest, verbose, json_output).await
+        }
         GlobalCmd::List { outdated, verbose } => {
+            let manifest = lpm_global::read_for(&root)?;
             run_list(&root, &manifest, outdated, verbose, json_output);
             Ok(())
         }
@@ -119,7 +122,10 @@ pub async fn run(
             run_bin(&root, json_output);
             Ok(())
         }
-        GlobalCmd::Path { package } => run_path(&root, &manifest, &package, json_output),
+        GlobalCmd::Path { package } => {
+            let manifest = lpm_global::read_for(&root)?;
+            run_path(&root, &manifest, &package, json_output)
+        }
         GlobalCmd::Link { path } => run_link(&root, path.as_deref(), json_output),
         GlobalCmd::Unlink { package } => run_unlink(&root, &package, json_output),
         // `lpm global remove` and `lpm uninstall -g` are two surfaces
@@ -144,12 +150,13 @@ fn run_list(
     verbose: bool,
     json_output: bool,
 ) {
+    let alias_commands = index_alias_commands(manifest);
     // `outdated == true` is routed through `run_list_outdated` in the
     // dispatch match — this function only sees the non-outdated path.
     if json_output {
-        emit_list_json(root, manifest, verbose);
+        emit_list_json(root, manifest, &alias_commands, verbose);
     } else {
-        emit_list_human(root, manifest, verbose);
+        emit_list_human(root, manifest, &alias_commands, verbose);
     }
 }
 
@@ -235,6 +242,7 @@ async fn run_list_outdated(
     let mut outdated: Vec<OutdatedRow> = Vec::new();
     let mut up_to_date: Vec<String> = Vec::new();
     let mut unresolved: Vec<UnresolvedRow> = Vec::new();
+    let alias_commands = index_alias_commands(manifest);
     let release_age_policy = crate::release_age_selection::resolver_policy_for_project(
         &_root.global_root(),
         None,
@@ -244,7 +252,7 @@ async fn run_list_outdated(
 
     if !lpm_names.is_empty() {
         let mut pending_names: HashSet<String> = lpm_names.iter().cloned().collect();
-        let mut stream = client
+        let stream = client
             .batch_metadata_stream(&lpm_names)
             .await
             .map_err(|error| {
@@ -252,30 +260,52 @@ async fn run_list_outdated(
                     "batch metadata fetch failed — cannot compute outdated: {error}"
                 ))
             })?;
-        while let Some((name, mut metadata)) = stream.next().await? {
+        let metadata_stream = futures::stream::unfold(Some(stream), |state| async move {
+            let mut stream = state?;
+            match stream.next().await {
+                Ok(Some(entry)) => Some((Ok(entry), Some(stream))),
+                Ok(None) => None,
+                Err(error) => Some((Err(error), None)),
+            }
+        });
+        let release_age_policy_ref = &release_age_policy;
+        let hydrated_metadata = metadata_stream
+            .map(|metadata_result| async move {
+                let (name, mut metadata) = metadata_result?;
+                let hydration_result =
+                    crate::release_age_selection::hydrate_release_times_if_needed(
+                        client,
+                        &mut metadata,
+                        release_age_policy_ref,
+                        crate::release_age_selection::ReleaseTimeMetadataSource::WorkerOnly,
+                    )
+                    .await
+                    .map(|()| metadata);
+                Ok::<_, LpmError>((name, hydration_result))
+            })
+            .buffer_unordered(GLOBAL_OUTDATED_METADATA_CONCURRENCY);
+        futures::pin_mut!(hydrated_metadata);
+        while let Some(result) = hydrated_metadata.next().await {
+            let (name, metadata_result) = result?;
             pending_names.remove(&name);
             let Some(entry) = manifest.packages.get(&name) else {
                 continue;
             };
-            if let Err(error) = crate::release_age_selection::hydrate_release_times_if_needed(
-                client,
-                &mut metadata,
-                &release_age_policy,
-                crate::release_age_selection::ReleaseTimeMetadataSource::WorkerOnly,
-            )
-            .await
-            {
-                unresolved.push(UnresolvedRow {
-                    package: name,
-                    reason: error.to_string(),
-                });
-                continue;
-            }
+            let metadata = match metadata_result {
+                Ok(metadata) => metadata,
+                Err(error) => {
+                    unresolved.push(UnresolvedRow {
+                        package: name,
+                        reason: error.to_string(),
+                    });
+                    continue;
+                }
+            };
             classify_global_outdated_entry(
                 &name,
                 entry,
                 &metadata,
-                manifest,
+                &alias_commands,
                 &release_age_policy,
                 &mut outdated,
                 &mut up_to_date,
@@ -288,14 +318,26 @@ async fn run_list_outdated(
         }));
     }
 
+    let release_age_policy_ref = &release_age_policy;
     let npm_fetches = futures::stream::iter(npm_names.into_iter().map(|name| async move {
-        let result = client.get_npm_metadata_direct(&name).await;
+        let result = async {
+            let mut metadata = client.get_npm_metadata_direct(&name).await?;
+            crate::release_age_selection::hydrate_release_times_if_needed(
+                client,
+                &mut metadata,
+                release_age_policy_ref,
+                crate::release_age_selection::ReleaseTimeMetadataSource::NpmDirect,
+            )
+            .await?;
+            Ok::<_, LpmError>(metadata)
+        }
+        .await;
         (name, result)
     }))
     .buffer_unordered(GLOBAL_OUTDATED_METADATA_CONCURRENCY);
     futures::pin_mut!(npm_fetches);
     while let Some((name, metadata_result)) = npm_fetches.next().await {
-        let mut metadata = match metadata_result {
+        let metadata = match metadata_result {
             Ok(metadata) => metadata,
             Err(error) => {
                 unresolved.push(UnresolvedRow {
@@ -305,20 +347,6 @@ async fn run_list_outdated(
                 continue;
             }
         };
-        if let Err(error) = crate::release_age_selection::hydrate_release_times_if_needed(
-            client,
-            &mut metadata,
-            &release_age_policy,
-            crate::release_age_selection::ReleaseTimeMetadataSource::NpmDirect,
-        )
-        .await
-        {
-            unresolved.push(UnresolvedRow {
-                package: name,
-                reason: error.to_string(),
-            });
-            continue;
-        }
         let entry = manifest
             .packages
             .get(&name)
@@ -327,7 +355,7 @@ async fn run_list_outdated(
             &name,
             entry,
             &metadata,
-            manifest,
+            &alias_commands,
             &release_age_policy,
             &mut outdated,
             &mut up_to_date,
@@ -354,7 +382,7 @@ fn classify_global_outdated_entry(
     name: &str,
     entry: &PackageEntry,
     metadata: &lpm_registry::PackageMetadata,
-    manifest: &GlobalManifest,
+    alias_commands: &AliasCommandIndex<'_>,
     release_age_policy: &lpm_resolver::ResolverPolicy,
     outdated: &mut Vec<OutdatedRow>,
     up_to_date: &mut Vec<String>,
@@ -386,7 +414,30 @@ fn classify_global_outdated_entry(
             return;
         }
     };
-    if !version_is_newer(&entry.resolved, &wanted) {
+    let current = match lpm_semver::Version::parse(&entry.resolved) {
+        Ok(version) => version,
+        Err(error) => {
+            unresolved.push(UnresolvedRow {
+                package: name.to_string(),
+                reason: format!(
+                    "installed version {:?} is not valid semver: {error}",
+                    entry.resolved
+                ),
+            });
+            return;
+        }
+    };
+    let candidate = match lpm_semver::Version::parse(&wanted) {
+        Ok(version) => version,
+        Err(error) => {
+            unresolved.push(UnresolvedRow {
+                package: name.to_string(),
+                reason: format!("registry selected an invalid version {wanted:?}: {error}"),
+            });
+            return;
+        }
+    };
+    if candidate <= current {
         up_to_date.push(name.to_string());
         return;
     }
@@ -397,18 +448,8 @@ fn classify_global_outdated_entry(
         wanted,
         latest,
         saved_spec: entry.saved_spec.clone(),
-        bins: enrich_commands(name, entry, manifest),
+        bins: enrich_commands(name, entry, alias_commands),
     });
-}
-
-fn version_is_newer(current: &str, candidate: &str) -> bool {
-    matches!(
-        (
-            lpm_semver::Version::parse(current),
-            lpm_semver::Version::parse(candidate)
-        ),
-        (Ok(current), Ok(candidate)) if candidate > current
-    )
 }
 
 /// One row in the `--outdated` report where the registry has a newer
@@ -499,7 +540,8 @@ fn emit_outdated_json(
             serde_json::json!({
                 "package": r.package,
                 "current": r.current,
-                "latest": r.wanted,
+                "wanted": r.wanted,
+                "latest": r.latest,
                 "saved_spec": r.saved_spec,
             })
         })
@@ -677,11 +719,16 @@ fn style_latest_version(padded_latest: &str, wanted: &str, latest: &str) -> Stri
     }
 }
 
-fn emit_list_json(root: &LpmRoot, manifest: &GlobalManifest, verbose: bool) {
+fn emit_list_json(
+    root: &LpmRoot,
+    manifest: &GlobalManifest,
+    alias_commands: &AliasCommandIndex<'_>,
+    verbose: bool,
+) {
     let entries: Vec<_> = manifest
         .packages
         .iter()
-        .map(|(name, e)| package_to_json(root, name, e, manifest, verbose))
+        .map(|(name, e)| package_to_json(root, name, e, alias_commands, verbose))
         .collect();
     let body = serde_json::json!({
         "success": true,
@@ -695,10 +742,10 @@ fn package_to_json(
     root: &LpmRoot,
     name: &str,
     entry: &PackageEntry,
-    manifest: &GlobalManifest,
+    alias_commands: &AliasCommandIndex<'_>,
     verbose: bool,
 ) -> serde_json::Value {
-    let commands = enrich_commands(name, entry, manifest);
+    let commands = enrich_commands(name, entry, alias_commands);
     let mut obj = serde_json::json!({
         "name": name,
         "version": entry.resolved,
@@ -720,7 +767,12 @@ fn package_to_json(
     obj
 }
 
-fn emit_list_human(root: &LpmRoot, manifest: &GlobalManifest, verbose: bool) {
+fn emit_list_human(
+    root: &LpmRoot,
+    manifest: &GlobalManifest,
+    alias_commands: &AliasCommandIndex<'_>,
+    verbose: bool,
+) {
     if manifest.packages.is_empty() {
         install_ui::warn("No globally-installed packages");
         if !root.global_manifest().exists() {
@@ -743,7 +795,7 @@ fn emit_list_human(root: &LpmRoot, manifest: &GlobalManifest, verbose: bool) {
         }
     );
     for (name, entry) in &manifest.packages {
-        let commands = enrich_commands(name, entry, manifest);
+        let commands = enrich_commands(name, entry, alias_commands);
         let cmds_str = if commands.is_empty() {
             "(no commands)".dimmed().to_string()
         } else {
@@ -818,12 +870,28 @@ fn emit_list_human(root: &LpmRoot, manifest: &GlobalManifest, verbose: bool) {
 /// a package's declared bin from another package. Per the plan: a
 /// package's row keeps its declared commands; aliases live in the
 /// `[aliases]` table with their owning bin.
-fn enrich_commands(pkg_name: &str, entry: &PackageEntry, manifest: &GlobalManifest) -> Vec<String> {
-    let mut out: Vec<String> = entry.commands.clone();
+type AliasCommandIndex<'a> = HashMap<&'a str, Vec<String>>;
+
+fn index_alias_commands(manifest: &GlobalManifest) -> AliasCommandIndex<'_> {
+    let mut index = HashMap::with_capacity(manifest.aliases.len());
     for (alias_name, alias_entry) in &manifest.aliases {
-        if alias_entry.package == pkg_name {
-            out.push(format!("{alias_name} (alias of {})", alias_entry.bin));
-        }
+        index
+            .entry(alias_entry.package.as_str())
+            .or_insert_with(Vec::new)
+            .push(format!("{alias_name} (alias of {})", alias_entry.bin));
+    }
+    index
+}
+
+fn enrich_commands(
+    pkg_name: &str,
+    entry: &PackageEntry,
+    alias_commands: &AliasCommandIndex<'_>,
+) -> Vec<String> {
+    let mut out: Vec<String> = entry.commands.clone();
+    if let Some(aliases) = alias_commands.get(pkg_name) {
+        out.reserve(aliases.len());
+        out.extend(aliases.iter().cloned());
     }
     out
 }
@@ -989,10 +1057,18 @@ fn run_unlink(root: &LpmRoot, package: &str, json_output: bool) -> Result<(), Lp
             })
             .collect();
         for command in &entry.commands {
-            remove_shim(&root.bin_dir(), command)?;
+            if let Err(err) = remove_shim(&root.bin_dir(), command) {
+                return Err(restore_after_unlink_shim_failure(
+                    root, package, &entry, &aliases, err,
+                ));
+            }
         }
         for (alias, _) in &aliases {
-            remove_shim(&root.bin_dir(), alias)?;
+            if let Err(err) = remove_shim(&root.bin_dir(), alias) {
+                return Err(restore_after_unlink_shim_failure(
+                    root, package, &entry, &aliases, err,
+                ));
+            }
         }
         if let Err(err) = remove_local_link_root(root, &entry.root) {
             if let Err(restore_failures) = restore_local_link_global_shims(root, &entry, &aliases) {
@@ -1024,6 +1100,27 @@ fn run_unlink(root: &LpmRoot, package: &str, json_output: bool) -> Result<(), Lp
 
     emit_unlink_success(&summary, json_output);
     Ok(())
+}
+
+fn restore_after_unlink_shim_failure(
+    root: &LpmRoot,
+    package: &str,
+    entry: &PackageEntry,
+    aliases: &[(String, String)],
+    remove_error: impl std::fmt::Display,
+) -> LpmError {
+    match restore_local_link_global_shims(root, entry, aliases) {
+        Ok(()) => LpmError::Script(format!(
+            "failed to remove a shim for '{}': {remove_error}; restored the package's shims",
+            sanitize_for_terminal(package),
+        )),
+        Err(restore_failures) => LpmError::Script(format!(
+            "failed to remove a shim for '{}': {remove_error}. Additionally, failed to restore {} shim(s): {}",
+            sanitize_for_terminal(package),
+            restore_failures.len(),
+            restore_failures.join("; "),
+        )),
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1627,7 +1724,7 @@ mod tests {
                 bin: "x".into(),
             },
         );
-        let cmds = enrich_commands("x", &entry, &m);
+        let cmds = enrich_commands("x", &entry, &index_alias_commands(&m));
         assert_eq!(cmds.len(), 2);
         assert!(cmds.iter().any(|c| c.contains("y (alias of x)")));
     }

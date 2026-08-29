@@ -8,6 +8,33 @@ pub(crate) struct LockfileRootIndex<'a> {
     lockfile: Option<&'a lpm_lockfile::Lockfile>,
     by_instance:
         std::collections::HashMap<lpm_common::PackageInstanceId, &'a lpm_lockfile::LockedPackage>,
+    by_name: std::collections::HashMap<&'a str, UniquePackage<'a>>,
+    by_name_version: std::collections::HashMap<(&'a str, &'a str), UniquePackage<'a>>,
+    by_name_version_source:
+        std::collections::HashMap<(&'a str, &'a str, Option<&'a str>), UniquePackage<'a>>,
+}
+
+#[derive(Clone, Copy)]
+enum UniquePackage<'a> {
+    One(&'a lpm_lockfile::LockedPackage),
+    Ambiguous,
+}
+
+fn insert_unique<'a, K>(
+    index: &mut std::collections::HashMap<K, UniquePackage<'a>>,
+    key: K,
+    package: &'a lpm_lockfile::LockedPackage,
+) where
+    K: std::hash::Hash + Eq,
+{
+    match index.entry(key) {
+        std::collections::hash_map::Entry::Vacant(entry) => {
+            entry.insert(UniquePackage::One(package));
+        }
+        std::collections::hash_map::Entry::Occupied(mut entry) => {
+            entry.insert(UniquePackage::Ambiguous);
+        }
+    }
 }
 
 impl<'a> LockfileRootIndex<'a> {
@@ -15,16 +42,38 @@ impl<'a> LockfileRootIndex<'a> {
         let mut by_instance = std::collections::HashMap::with_capacity(
             lockfile.map_or(0, |lockfile| lockfile.packages.len()),
         );
+        let package_count = lockfile.map_or(0, |lockfile| lockfile.packages.len());
+        let mut by_name = std::collections::HashMap::with_capacity(package_count);
+        let mut by_name_version = std::collections::HashMap::with_capacity(package_count);
+        let mut by_name_version_source = std::collections::HashMap::with_capacity(package_count);
         if let Some(lockfile) = lockfile {
             for package in &lockfile.packages {
                 if let Some(instance_id) = package.instance_id {
                     by_instance.insert(instance_id, package);
                 }
+                insert_unique(&mut by_name, package.name.as_str(), package);
+                insert_unique(
+                    &mut by_name_version,
+                    (package.name.as_str(), package.version.as_str()),
+                    package,
+                );
+                insert_unique(
+                    &mut by_name_version_source,
+                    (
+                        package.name.as_str(),
+                        package.version.as_str(),
+                        package.source.as_deref(),
+                    ),
+                    package,
+                );
             }
         }
         Self {
             lockfile,
             by_instance,
+            by_name,
+            by_name_version,
+            by_name_version_source,
         }
     }
 
@@ -35,38 +84,41 @@ impl<'a> LockfileRootIndex<'a> {
     ) -> Option<&'a lpm_lockfile::LockedPackage> {
         let lockfile = self.lockfile?;
         if let Some(root) = lockfile.root_resolutions.get(local_name) {
+            if root.package != lookup_name {
+                return None;
+            }
             if let Some(instance_id) = root.instance_id {
                 return self.by_instance.get(&instance_id).copied();
             }
-            return unique_package(lockfile, |package| {
-                package.name == root.package
-                    && package.version == root.version
-                    && root
-                        .source
-                        .as_ref()
-                        .is_none_or(|source| package.source.as_ref() == Some(source))
+            let selected = if let Some(source) = root.source.as_deref() {
+                self.by_name_version_source.get(&(
+                    root.package.as_str(),
+                    root.version.as_str(),
+                    Some(source),
+                ))
+            } else {
+                self.by_name_version
+                    .get(&(root.package.as_str(), root.version.as_str()))
+            };
+            return selected.and_then(|selected| match selected {
+                UniquePackage::One(package) => Some(*package),
+                UniquePackage::Ambiguous => None,
             });
         }
 
-        unique_package(lockfile, |package| package.name == lookup_name)
-    }
-}
-
-fn unique_package(
-    lockfile: &lpm_lockfile::Lockfile,
-    mut matches: impl FnMut(&lpm_lockfile::LockedPackage) -> bool,
-) -> Option<&lpm_lockfile::LockedPackage> {
-    let mut selected = None;
-    for package in &lockfile.packages {
-        if !matches(package) {
-            continue;
-        }
-        if selected.is_some() {
+        if lockfile.metadata.lockfile_version
+            >= lpm_lockfile::LOCKFILE_VERSION_WITH_ROOT_RESOLUTIONS
+        {
             return None;
         }
-        selected = Some(package);
+
+        self.by_name
+            .get(lookup_name)
+            .and_then(|selected| match selected {
+                UniquePackage::One(package) => Some(*package),
+                UniquePackage::Ambiguous => None,
+            })
     }
-    selected
 }
 
 pub(crate) fn read_optional_project_lockfile(
@@ -345,6 +397,121 @@ mod tests {
                 .root_package("private-tool-alias", "private-tool")
                 .and_then(|package| package.instance_id),
             Some(root_id)
+        );
+    }
+
+    #[test]
+    fn root_package_rejects_stale_canonical_target_evidence() {
+        let mut lockfile = lpm_lockfile::Lockfile::new();
+        let old_id = lpm_common::PackageInstanceId::derive(
+            "old-public-tool",
+            "1.0.0",
+            "registry+https://registry.npmjs.org",
+            "root/old-public-tool",
+        );
+        lockfile.add_package(lpm_lockfile::LockedPackage {
+            name: "old-public-tool".to_string(),
+            version: "1.0.0".to_string(),
+            source: Some("registry+https://registry.npmjs.org".to_string()),
+            instance_id: Some(old_id),
+            ..Default::default()
+        });
+        lockfile.root_resolutions.insert(
+            "tool".to_string(),
+            lpm_lockfile::LockedRootResolution {
+                instance_id: Some(old_id),
+                package: "old-public-tool".to_string(),
+                version: "1.0.0".to_string(),
+                source: Some("registry+https://registry.npmjs.org".to_string()),
+            },
+        );
+
+        assert!(
+            LockfileRootIndex::new(Some(&lockfile))
+                .root_package("tool", "@company/private-tool")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn modern_lockfile_without_an_exact_root_does_not_select_a_unique_transitive() {
+        let mut lockfile = lpm_lockfile::Lockfile::new();
+        lockfile.add_package(lpm_lockfile::LockedPackage {
+            name: "shared-name".into(),
+            version: "1.0.0".into(),
+            source: Some("registry+https://registry.npmjs.org".into()),
+            ..Default::default()
+        });
+
+        assert!(
+            LockfileRootIndex::new(Some(&lockfile))
+                .root_package("shared-name", "shared-name")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn legacy_lockfile_selects_a_unique_package_when_root_resolutions_are_unavailable() {
+        let mut lockfile = lockfile_with_source(
+            "registry+https://registry.npmjs.org",
+            Some("https://registry.npmjs.org/ms/-/ms-2.1.3.tgz"),
+        );
+        lockfile.metadata.lockfile_version =
+            lpm_lockfile::LOCKFILE_VERSION_WITH_ROOT_RESOLUTIONS - 1;
+
+        assert_eq!(
+            LockfileRootIndex::new(Some(&lockfile))
+                .root_package("ms", "ms")
+                .map(|package| package.version.as_str()),
+            Some("2.1.3")
+        );
+    }
+
+    #[test]
+    fn legacy_lockfile_with_ambiguous_packages_fails_closed() {
+        let mut lockfile = lockfile_with_source(
+            "registry+https://registry.npmjs.org",
+            Some("https://registry.npmjs.org/ms/-/ms-2.1.3.tgz"),
+        );
+        lockfile.metadata.lockfile_version =
+            lpm_lockfile::LOCKFILE_VERSION_WITH_ROOT_RESOLUTIONS - 1;
+        lockfile.add_package(lpm_lockfile::LockedPackage {
+            name: "ms".into(),
+            version: "3.0.0".into(),
+            source: Some("registry+https://registry.npmjs.org".into()),
+            ..Default::default()
+        });
+
+        assert!(
+            LockfileRootIndex::new(Some(&lockfile))
+                .root_package("ms", "ms")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn stale_root_canonical_target_does_not_authorize_a_different_lookup_name() {
+        let mut lockfile = lpm_lockfile::Lockfile::new();
+        lockfile.add_package(lpm_lockfile::LockedPackage {
+            name: "old-target".into(),
+            version: "1.0.0".into(),
+            source: Some("registry+https://registry.npmjs.org".into()),
+            ..Default::default()
+        });
+        lockfile.root_resolutions.insert(
+            "alias".into(),
+            lpm_lockfile::LockedRootResolution {
+                instance_id: None,
+                package: "old-target".into(),
+                version: "1.0.0".into(),
+                source: Some("registry+https://registry.npmjs.org".into()),
+            },
+        );
+
+        assert!(
+            LockfileRootIndex::new(Some(&lockfile))
+                .root_package("alias", "new-target")
+                .is_none()
         );
     }
 }

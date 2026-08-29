@@ -13,6 +13,7 @@ use lpm_common::color::Painted;
 use lpm_common::{LpmError, PackageName};
 use lpm_registry::PackageMetadata;
 use lpm_registry::RegistryClient;
+use lpm_resolver::specifier::Specifier;
 use lpm_semver::{Version, VersionReq};
 use std::collections::{BTreeSet, HashMap};
 use std::io::IsTerminal;
@@ -21,6 +22,9 @@ use std::sync::Arc;
 use std::time::Instant;
 
 const METADATA_PLANNING_CONCURRENCY: usize = 4;
+const MAX_METADATA_FAILURE_DETAIL_BYTES: usize = 2 * 1024;
+const MAX_METADATA_FAILURE_NAMES: usize = 8;
+const MAX_METADATA_FAILURES_MESSAGE_BYTES: usize = 16 * 1024;
 
 // ── Mode resolution ─────────────────────────────────────────────────
 
@@ -103,13 +107,34 @@ impl MetadataRoute {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum DependencyKind {
+    Runtime,
+    Development,
+    Optional,
+}
+
+impl DependencyKind {
+    fn manifest_key(self) -> &'static str {
+        match self {
+            Self::Runtime => "dependencies",
+            Self::Development => "devDependencies",
+            Self::Optional => "optionalDependencies",
+        }
+    }
+
+    fn is_dev(self) -> bool {
+        self == Self::Development
+    }
+}
+
 #[derive(Debug, Clone)]
 struct UpgradeDependency {
     name: String,
     lookup_name: String,
     range: String,
     manifest_value: String,
-    is_dev: bool,
+    dependency_kind: DependencyKind,
     route: MetadataRoute,
     manifest_spec: ManifestDependencySpec,
 }
@@ -129,7 +154,7 @@ struct EnrichedCandidate {
     current_range: String,
     new_range: String,
     to: String,
-    is_dev: bool,
+    dependency_kind: DependencyKind,
     target_kind: TargetKind,
     semver_class: SemverClass,
     has_install_scripts: bool,
@@ -172,16 +197,26 @@ pub async fn run(
             )));
         }
     };
-    let mut doc: serde_json::Value = serde_json::from_str(&original_content)
-        .map_err(|e| LpmError::Script(format!("failed to parse package.json: {e}")))?;
-
-    let pkg_typed = lpm_workspace::read_package_json(&pkg_json_path)
-        .map_err(|e| LpmError::Registry(format!("failed to read package.json: {e}")))?;
-    let patched_deps = pkg_typed
+    let mut doc: serde_json::Value =
+        serde_json::from_str(lpm_common::strip_utf8_bom_str(&original_content))
+            .map_err(|e| LpmError::Script(format!("failed to parse package.json: {e}")))?;
+    let package_json = lpm_workspace::package_json_from_value(&doc)
+        .map_err(|error| LpmError::Script(format!("failed to parse package.json: {error}")))?;
+    let patched_deps = package_json
         .lpm
         .as_ref()
-        .map(|c| c.patched_dependencies.clone())
+        .map(|config| config.patched_dependencies.clone())
         .unwrap_or_default();
+    let empty_overrides = HashMap::new();
+    let overrides = lpm_resolver::OverrideSet::parse(
+        package_json
+            .lpm
+            .as_ref()
+            .map_or(&empty_overrides, |config| &config.overrides),
+        &package_json.overrides,
+        &package_json.resolutions,
+    )
+    .map_err(|error| LpmError::Script(format!("failed to parse package overrides: {error}")))?;
 
     // Resolve mode + validate flag combinations
     let is_tty = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
@@ -201,12 +236,35 @@ pub async fn run(
     let roots = LockfileRootIndex::new(lockfile.as_ref());
 
     let mut skipped_private: Vec<String> = Vec::new();
+    let mut skipped_non_registry: Vec<String> = Vec::new();
     let all_deps = filter_requested_deps(extract_deps_from_value(&doc), requested_packages)?;
     let mut upgradeable_deps = Vec::with_capacity(all_deps.len());
-    for (name, manifest_value, is_dev) in all_deps {
+    for (name, manifest_value, dependency_kind) in all_deps {
+        let parsed_specifier = Specifier::parse(&manifest_value).map_err(|error| {
+            LpmError::Script(format!(
+                "dependency `{name}` uses invalid package specifier `{manifest_value}`: {error}"
+            ))
+        })?;
+        if manifest_value.trim_start().starts_with("jsr:")
+            || matches!(
+                parsed_specifier,
+                Specifier::Workspace(_)
+                    | Specifier::Tarball { .. }
+                    | Specifier::File { .. }
+                    | Specifier::Link { .. }
+                    | Specifier::Git { .. }
+            )
+        {
+            skipped_non_registry.push(name);
+            continue;
+        }
         let (manifest_spec, range) =
             ManifestDependencySpec::from_manifest_value(&name, &manifest_value)?;
-        let lookup_name = manifest_spec.lookup_name(&name, lockfile.as_ref());
+        let range = range.trim().to_string();
+        let lookup_name = match &manifest_spec {
+            ManifestDependencySpec::Plain => name.clone(),
+            ManifestDependencySpec::NpmAlias { target } => target.clone(),
+        };
 
         if lookup_name.starts_with("@lpm.dev/") {
             PackageName::parse(&lookup_name).map_err(|error| {
@@ -219,7 +277,7 @@ pub async fn run(
                 lookup_name,
                 range,
                 manifest_value,
-                is_dev,
+                dependency_kind,
                 route: MetadataRoute::Lpm,
                 manifest_spec,
             });
@@ -232,7 +290,7 @@ pub async fn run(
                 lookup_name,
                 range,
                 manifest_value,
-                is_dev,
+                dependency_kind,
                 route: match source {
                     NpmMetadataSource::PublicNpm => MetadataRoute::PublicNpm,
                     NpmMetadataSource::ConfiguredRegistry => MetadataRoute::ConfiguredRegistry,
@@ -245,7 +303,14 @@ pub async fn run(
         skipped_private.push(name);
     }
     skipped_private.sort();
+    skipped_non_registry.sort();
 
+    if !requested_packages.is_empty() && !skipped_non_registry.is_empty() {
+        return Err(LpmError::Script(format!(
+            "cannot upgrade requested non-registry package(s): {}. Update the local, git, tarball, workspace, or JSR spec directly in package.json.",
+            skipped_non_registry.join(", ")
+        )));
+    }
     if !requested_packages.is_empty() && !skipped_private.is_empty() {
         return Err(LpmError::Script(format!(
             "cannot upgrade requested package(s) without a recorded public npm or LPM-registry source: {}. Run `lpm install` to record sources in lpm.lock, then re-run.",
@@ -276,87 +341,106 @@ pub async fn run(
     }
 
     let planning_client_ref = &planning_client;
+    let release_age_policy_ref = &release_age_policy;
     let fetches = futures::stream::iter(jobs.into_iter().map(move |job| async move {
-        let result = fetch_metadata(planning_client_ref, job.route, &job.lookup_name).await;
+        let result = async {
+            let mut metadata =
+                fetch_metadata(planning_client_ref, job.route, &job.lookup_name).await?;
+            let release_time_source = match job.route {
+                MetadataRoute::PublicNpm => {
+                    crate::release_age_selection::ReleaseTimeMetadataSource::NpmDirect
+                }
+                MetadataRoute::Lpm | MetadataRoute::ConfiguredRegistry => {
+                    crate::release_age_selection::ReleaseTimeMetadataSource::WorkerOnly
+                }
+            };
+            crate::release_age_selection::hydrate_release_times_if_needed(
+                planning_client_ref,
+                &mut metadata,
+                release_age_policy_ref,
+                release_time_source,
+            )
+            .await?;
+            let allowed_versions = crate::release_age_selection::allowed_version_index(
+                &metadata,
+                release_age_policy_ref,
+            )?;
+            Ok::<_, LpmError>((metadata, allowed_versions))
+        }
+        .await;
         (job, result)
     }))
     .buffer_unordered(METADATA_PLANNING_CONCURRENCY);
     futures::pin_mut!(fetches);
 
     let mut candidates = Vec::with_capacity(upgradeable_deps.len());
-    let mut fetch_failures = Vec::new();
+    let mut fetch_failures: Vec<(usize, usize, String)> = Vec::new();
     while let Some((job, metadata_result)) = fetches.next().await {
-        let mut metadata = match metadata_result {
-            Ok(metadata) => metadata,
+        let (metadata, allowed_versions) = match metadata_result {
+            Ok(result) => result,
             Err(error) => {
-                for dependency_index in job.dependency_indices {
-                    let dependency = &upgradeable_deps[dependency_index];
-                    tracing::warn!(
-                        "failed to fetch metadata for {} via {}: {}",
-                        dependency.name,
-                        dependency.lookup_name,
-                        error
-                    );
-                    fetch_failures
-                        .push((dependency_index, format!("{}: {error}", dependency.name)));
-                }
+                let Some(&first_dependency_index) = job.dependency_indices.first() else {
+                    return Err(LpmError::Registry(format!(
+                        "internal upgrade planner error: metadata job for {} has no dependencies",
+                        job.lookup_name
+                    )));
+                };
+                let affected_count = job.dependency_indices.len();
+                let package_names =
+                    bounded_dependency_name_list(&job.dependency_indices, &upgradeable_deps);
+                let detail = truncate_metadata_failure_detail(&error.to_string());
+                tracing::warn!(
+                    "failed to fetch metadata for {} via {}: {}",
+                    package_names,
+                    job.lookup_name,
+                    detail
+                );
+                fetch_failures.push((
+                    first_dependency_index,
+                    affected_count,
+                    format!("{package_names}: {detail}"),
+                ));
                 continue;
             }
         };
-
-        let release_time_source = match job.route {
-            MetadataRoute::PublicNpm => {
-                crate::release_age_selection::ReleaseTimeMetadataSource::NpmDirect
-            }
-            MetadataRoute::Lpm | MetadataRoute::ConfiguredRegistry => {
-                crate::release_age_selection::ReleaseTimeMetadataSource::WorkerOnly
-            }
-        };
-        if let Err(error) = crate::release_age_selection::hydrate_release_times_if_needed(
-            &planning_client,
-            &mut metadata,
-            &release_age_policy,
-            release_time_source,
-        )
-        .await
-        {
-            for dependency_index in job.dependency_indices {
-                let dependency = &upgradeable_deps[dependency_index];
-                fetch_failures.push((dependency_index, format!("{}: {error}", dependency.name)));
-            }
-            continue;
-        }
 
         for dependency_index in job.dependency_indices {
             let dependency = &upgradeable_deps[dependency_index];
             match plan_upgrade_dependency(
                 dependency,
                 &metadata,
+                &allowed_versions,
                 mode,
                 major,
                 &release_age_policy,
                 &roots,
-                lockfile.as_ref(),
                 &patched_deps,
+                &overrides,
             ) {
                 Ok(planned) => candidates.extend(planned),
-                Err(error) => {
-                    fetch_failures.push((dependency_index, format!("{}: {error}", dependency.name)))
-                }
+                Err(error) => fetch_failures.push((
+                    dependency_index,
+                    1,
+                    format!(
+                        "{}: {}",
+                        dependency.name,
+                        truncate_metadata_failure_detail(&error.to_string())
+                    ),
+                )),
             }
         }
     }
 
     if !fetch_failures.is_empty() {
-        fetch_failures.sort_by_key(|(dependency_index, _)| *dependency_index);
-        let messages = fetch_failures
+        fetch_failures.sort_by_key(|(dependency_index, _, _)| *dependency_index);
+        let affected_count = fetch_failures
             .iter()
-            .map(|(_, message)| message.as_str())
-            .collect::<Vec<_>>();
+            .map(|(_, affected_count, _)| affected_count)
+            .sum::<usize>();
+        let messages = join_bounded_metadata_failures(&fetch_failures);
         return Err(LpmError::Registry(format!(
             "could not determine upgrade status for {} package(s): {}",
-            fetch_failures.len(),
-            messages.join("; ")
+            affected_count, messages
         )));
     }
     let fetch_errors = 0;
@@ -368,7 +452,13 @@ pub async fn run(
 
     if candidates.is_empty() {
         if json_output {
-            emit_upgrade_json(&[], dry_run, fetch_errors, &skipped_private)?;
+            emit_upgrade_json(
+                &[],
+                dry_run,
+                fetch_errors,
+                &skipped_private,
+                &skipped_non_registry,
+            )?;
         } else {
             let message = if requested_packages.is_empty() {
                 "All checked package.json dependencies are up to date"
@@ -377,6 +467,7 @@ pub async fn run(
             };
             install_ui::done_untrusted(message);
             warn_skipped_private(&skipped_private);
+            warn_skipped_non_registry(&skipped_non_registry);
         }
         return Ok(());
     }
@@ -403,7 +494,13 @@ pub async fn run(
 
     if json_output {
         if dry_run {
-            emit_upgrade_json(&deduped, true, fetch_errors, &skipped_private)?;
+            emit_upgrade_json(
+                &deduped,
+                true,
+                fetch_errors,
+                &skipped_private,
+                &skipped_non_registry,
+            )?;
             return Ok(());
         }
     } else {
@@ -413,7 +510,11 @@ pub async fn run(
             install_ui::packages_word(deduped.len())
         ));
         for u in &deduped {
-            let dev_tag = if u.is_dev { " (dev)" } else { "" };
+            let dev_tag = match u.dependency_kind {
+                DependencyKind::Development => " (dev)",
+                DependencyKind::Optional => " (optional)",
+                DependencyKind::Runtime => "",
+            };
             let glyph = format_upgrade_glyph(u.semver_class);
             let safe_name = lpm_common::sanitize_terminal_inline(&u.name);
             let safe_from = lpm_common::sanitize_terminal_inline(&u.from);
@@ -443,6 +544,7 @@ pub async fn run(
                 install_ui::packages_word(deduped.len())
             ));
             warn_skipped_private(&skipped_private);
+            warn_skipped_non_registry(&skipped_non_registry);
             return Ok(());
         }
     }
@@ -452,8 +554,9 @@ pub async fn run(
     // ── Mutate package.json ─────────────────────────────────────────
 
     apply_upgrades_to_manifest(&mut doc, &deduped)?;
-    let updated_content = serde_json::to_string_pretty(&doc)
+    let mut updated_content = serde_json::to_string_pretty(&doc)
         .map_err(|e| LpmError::Script(format!("failed to serialize package.json: {e}")))?;
+    updated_content.push('\n');
     let project_dirs = [project_dir.to_path_buf()];
     let install_result =
         crate::commands::install::workspace_lockfile::scope_workspace_mutation_if_present(
@@ -479,7 +582,7 @@ pub async fn run(
                     crate::commands::install::workspace_lockfile::active_lockfile_path(project_dir);
                 let lockfile_binary_path = lockfile_path.with_extension("lockb");
                 let install_hash_path = project_dir.join(".lpm").join("install-hash");
-                let transaction =
+                let mut transaction =
                     crate::manifest_tx::ManifestTransaction::snapshot_install_state_if_unchanged(
                         &[(pkg_json_path.as_path(), original_content.as_bytes())],
                         &[lockfile_path.as_path(), lockfile_binary_path.as_path()],
@@ -490,12 +593,19 @@ pub async fn run(
                             "package.json changed while upgrades were being planned; no changes were applied: {error}"
                         ))
                     })?;
+                transaction
+                    .restore_only_if_unchanged(&pkg_json_path, updated_content.as_bytes())
+                    .map_err(|error| {
+                        LpmError::Script(format!(
+                            "failed to protect package.json from concurrent edits: {error}"
+                        ))
+                    })?;
 
-                lpm_common::write_file_atomic(
-                    &pkg_json_path,
-                    format!("{updated_content}\n"),
-                )
-                .map_err(|e| LpmError::Script(format!("failed to write package.json: {e}")))?;
+                lpm_common::write_file_atomic(&pkg_json_path, &updated_content)
+                    .map_err(|e| LpmError::Script(format!("failed to write package.json: {e}")))?;
+
+                crate::commands::root_lifecycle::RootProjectLifecycle::load(project_dir)?
+                    .run_dev_preinstall(project_dir, json_output)?;
 
                 if !json_output {
                     install_ui::phase("Installing upgraded dependencies");
@@ -552,9 +662,12 @@ pub async fn run(
                     return Err(error);
                 }
 
-                crate::commands::install::workspace_lockfile::commit_manifest_transaction(
+                crate::commands::root_lifecycle::RootProjectLifecycle::load(project_dir)?
+                    .run_after_successful_install(project_dir, json_output)?;
+
+                crate::commands::install::workspace_lockfile::commit_manifest_transaction_checked(
                     transaction,
-                );
+                )?;
                 Ok(())
             },
         )
@@ -563,7 +676,13 @@ pub async fn run(
     install_result?;
 
     if json_output {
-        emit_upgrade_json(&deduped, false, fetch_errors, &skipped_private)?;
+        emit_upgrade_json(
+            &deduped,
+            false,
+            fetch_errors,
+            &skipped_private,
+            &skipped_non_registry,
+        )?;
     } else {
         install_ui::done("Updated package.json, lpm.lock, node_modules");
         install_ui::done_untrusted(&format!(
@@ -573,6 +692,7 @@ pub async fn run(
             install_ui::format_duration(started_at.elapsed())
         ));
         warn_skipped_private(&skipped_private);
+        warn_skipped_non_registry(&skipped_non_registry);
     }
 
     Ok(())
@@ -582,22 +702,27 @@ fn seed_selected_metadata_for_install(
     client: &RegistryClient,
     candidates: &[EnrichedCandidate],
 ) -> Result<(), LpmError> {
-    let mut metadata_by_route: HashMap<(MetadataRoute, String), PackageMetadata> =
+    let mut metadata_by_route: HashMap<(MetadataRoute, String), Arc<PackageMetadata>> =
         HashMap::with_capacity(candidates.len());
     for candidate in candidates {
         let key = (candidate.route, candidate.lookup_name.clone());
         match metadata_by_route.entry(key) {
             std::collections::hash_map::Entry::Vacant(entry) => {
-                entry.insert(candidate.selected_metadata.as_ref().clone());
+                entry.insert(Arc::clone(&candidate.selected_metadata));
             }
             std::collections::hash_map::Entry::Occupied(mut entry) => {
-                merge_selected_metadata(entry.get_mut(), &candidate.selected_metadata);
+                if !Arc::ptr_eq(entry.get(), &candidate.selected_metadata) {
+                    merge_selected_metadata(
+                        Arc::make_mut(entry.get_mut()),
+                        &candidate.selected_metadata,
+                    );
+                }
             }
         }
     }
 
     for ((route, name), metadata) in metadata_by_route {
-        if !client.seed_metadata_for_command(&name, &route.upstream_route(), Arc::new(metadata)) {
+        if !client.seed_metadata_for_command(&name, &route.upstream_route(), metadata) {
             return Err(LpmError::Registry(format!(
                 "failed to retain validated upgrade metadata for '{name}'"
             )));
@@ -661,21 +786,75 @@ async fn fetch_metadata(
     }
 }
 
+fn bounded_dependency_name_list(
+    dependency_indices: &[usize],
+    dependencies: &[UpgradeDependency],
+) -> String {
+    let shown = dependency_indices.len().min(MAX_METADATA_FAILURE_NAMES);
+    let mut names = dependency_indices[..shown]
+        .iter()
+        .map(|index| dependencies[*index].name.as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let omitted = dependency_indices.len() - shown;
+    if omitted != 0 {
+        names.push_str(&format!(", … and {omitted} more"));
+    }
+    names
+}
+
+fn truncate_metadata_failure_detail(detail: &str) -> String {
+    if detail.len() <= MAX_METADATA_FAILURE_DETAIL_BYTES {
+        return detail.to_string();
+    }
+    let mut end = MAX_METADATA_FAILURE_DETAIL_BYTES;
+    while !detail.is_char_boundary(end) {
+        end -= 1;
+    }
+    let mut truncated = String::with_capacity(end + 32);
+    truncated.push_str(&detail[..end]);
+    truncated.push_str("… [remote detail truncated]");
+    truncated
+}
+
+fn join_bounded_metadata_failures(failures: &[(usize, usize, String)]) -> String {
+    let mut joined = String::with_capacity(MAX_METADATA_FAILURES_MESSAGE_BYTES);
+    for (position, (_, _, message)) in failures.iter().enumerate() {
+        let separator_len = usize::from(position != 0) * 2;
+        if joined
+            .len()
+            .saturating_add(separator_len)
+            .saturating_add(message.len())
+            > MAX_METADATA_FAILURES_MESSAGE_BYTES.saturating_sub(64)
+        {
+            let omitted = failures.len() - position;
+            joined.push_str(&format!(
+                "; … {omitted} additional metadata failure(s) omitted"
+            ));
+            break;
+        }
+        if position != 0 {
+            joined.push_str("; ");
+        }
+        joined.push_str(message);
+    }
+    joined
+}
+
 #[allow(clippy::too_many_arguments)]
 fn plan_upgrade_dependency(
     dependency: &UpgradeDependency,
     metadata: &PackageMetadata,
+    allowed_versions: &crate::release_age_selection::AllowedVersionIndex,
     mode: ResolvedMode,
     major: bool,
     release_age_policy: &lpm_resolver::ResolverPolicy,
     roots: &LockfileRootIndex<'_>,
-    lockfile: Option<&lpm_lockfile::Lockfile>,
     patched_dependencies: &HashMap<String, lpm_workspace::PatchedDependencyEntry>,
+    overrides: &lpm_resolver::OverrideSet,
 ) -> Result<Vec<EnrichedCandidate>, LpmError> {
-    let allowed_versions =
-        crate::release_age_selection::allowed_version_index(metadata, release_age_policy)?;
-    let latest = allowed_versions.latest;
-    if !is_valid_version_string(&latest) {
+    let latest = &allowed_versions.latest;
+    if !is_valid_version_string(latest) {
         return Err(LpmError::Registry(format!(
             "registry returned invalid version string {latest:?} for '{}'",
             dependency.lookup_name
@@ -690,29 +869,59 @@ fn plan_upgrade_dependency(
 
     let build_candidate = |target_version: String,
                            new_range: String,
-                           target_kind: TargetKind|
-     -> Result<EnrichedCandidate, LpmError> {
+                           target_kind: TargetKind,
+                           required_dist_tag: Option<&str>|
+     -> Result<Option<EnrichedCandidate>, LpmError> {
+        let natural_version =
+            lpm_resolver::NpmVersion::parse(&target_version).map_err(|error| {
+                LpmError::Registry(format!(
+                    "registry selected invalid version '{}@{target_version}': {error}",
+                    metadata.name
+                ))
+            })?;
+        if overrides
+            .find_match(&dependency.lookup_name, &natural_version, None)
+            .is_some()
+        {
+            return Ok(None);
+        }
         let target = metadata.version(&target_version).ok_or_else(|| {
             LpmError::Registry(format!(
                 "registry selected missing version '{}@{target_version}'",
                 metadata.name
             ))
         })?;
-        let peer_impact = upgrade_engine::compute_peer_impact(&target.peer_dependencies, lockfile);
+        let peer_impact = upgrade_engine::compute_peer_impact(
+            &target.peer_dependencies,
+            &target.peer_dependencies_meta,
+            |peer_name| {
+                roots
+                    .root_package(peer_name, peer_name)
+                    .map(|package| package.version.as_str())
+            },
+        );
         let patch_invalidation = upgrade_engine::detect_patch_invalidation(
             patched_dependencies,
             &dependency.lookup_name,
             installed_version.unwrap_or("0.0.0"),
             &target_version,
         );
-        let selected_metadata = Arc::new(compact_metadata_for_version(metadata, &target_version)?);
-        Ok(EnrichedCandidate {
+        let selected_metadata = Arc::new(compact_metadata_for_version(
+            metadata,
+            &target_version,
+            required_dist_tag,
+        )?);
+        Ok(Some(EnrichedCandidate {
             name: dependency.name.clone(),
             from: from.clone(),
             current_range: dependency.manifest_value.clone(),
-            new_range: dependency.manifest_spec.render_new_value(&new_range),
+            new_range: if required_dist_tag.is_some() {
+                dependency.manifest_value.clone()
+            } else {
+                dependency.manifest_spec.render_new_value(&new_range)
+            },
             to: target_version.clone(),
-            is_dev: dependency.is_dev,
+            dependency_kind: dependency.dependency_kind,
             target_kind,
             semver_class: upgrade_engine::classify_semver_change(&from, &target_version),
             has_install_scripts: upgrade_engine::target_has_install_scripts(target),
@@ -721,7 +930,7 @@ fn plan_upgrade_dependency(
             lookup_name: dependency.lookup_name.clone(),
             route: dependency.route,
             selected_metadata,
-        })
+        }))
     };
 
     let mut planned = Vec::with_capacity(if mode == ResolvedMode::Interactive {
@@ -729,20 +938,34 @@ fn plan_upgrade_dependency(
     } else {
         1
     });
+    if metadata.dist_tags.contains_key(&dependency.range) {
+        let target =
+            allowed_versions.resolve_spec(metadata, &dependency.range, release_age_policy)?;
+        if installed_version.is_none_or(|installed| installed != target)
+            && let Some(candidate) = build_candidate(
+                target,
+                dependency.range.clone(),
+                TargetKind::WithinMajor,
+                Some(&dependency.range),
+            )?
+        {
+            planned.push(candidate);
+        }
+        return Ok(planned);
+    }
     match mode {
         ResolvedMode::NonInteractive => {
             let (target, new_range) = compute_upgrade(
                 &dependency.range,
                 installed_version,
-                &latest,
+                latest,
                 &allowed_versions.versions,
                 major,
             );
             if let Some(target) = target
                 && installed_version.is_none_or(|installed| installed != target)
                 && (installed_version.is_some() || dependency.range != new_range)
-            {
-                planned.push(build_candidate(
+                && let Some(candidate) = build_candidate(
                     target,
                     new_range,
                     if major {
@@ -750,44 +973,43 @@ fn plan_upgrade_dependency(
                     } else {
                         TargetKind::WithinMajor
                     },
-                )?);
+                    None,
+                )?
+            {
+                planned.push(candidate);
             }
         }
         ResolvedMode::Interactive => {
             let (within_target, within_range) = compute_upgrade(
                 &dependency.range,
                 installed_version,
-                &latest,
+                latest,
                 &allowed_versions.versions,
                 false,
             );
             let (absolute_target, absolute_range) = compute_upgrade(
                 &dependency.range,
                 installed_version,
-                &latest,
+                latest,
                 &allowed_versions.versions,
                 true,
             );
             if let Some(target) = within_target.as_ref()
                 && installed_version.is_none_or(|installed| installed != target)
                 && (installed_version.is_some() || dependency.range != within_range)
+                && let Some(candidate) =
+                    build_candidate(target.clone(), within_range, TargetKind::WithinMajor, None)?
             {
-                planned.push(build_candidate(
-                    target.clone(),
-                    within_range,
-                    TargetKind::WithinMajor,
-                )?);
+                planned.push(candidate);
             }
             if let Some(target) = absolute_target
                 && within_target.as_deref() != Some(target.as_str())
                 && installed_version.is_none_or(|installed| installed != target)
                 && (installed_version.is_some() || dependency.range != absolute_range)
+                && let Some(candidate) =
+                    build_candidate(target, absolute_range, TargetKind::AbsoluteLatest, None)?
             {
-                planned.push(build_candidate(
-                    target,
-                    absolute_range,
-                    TargetKind::AbsoluteLatest,
-                )?);
+                planned.push(candidate);
             }
         }
     }
@@ -797,6 +1019,7 @@ fn plan_upgrade_dependency(
 fn compact_metadata_for_version(
     metadata: &PackageMetadata,
     version: &str,
+    required_dist_tag: Option<&str>,
 ) -> Result<PackageMetadata, LpmError> {
     let selected = metadata.version(version).cloned().ok_or_else(|| {
         LpmError::Registry(format!(
@@ -804,8 +1027,11 @@ fn compact_metadata_for_version(
             metadata.name
         ))
     })?;
-    let mut dist_tags = HashMap::with_capacity(1);
+    let mut dist_tags = HashMap::with_capacity(1 + usize::from(required_dist_tag.is_some()));
     dist_tags.insert("latest".to_string(), version.to_string());
+    if let Some(tag) = required_dist_tag {
+        dist_tags.insert(tag.to_string(), version.to_string());
+    }
     let mut versions = HashMap::with_capacity(1);
     versions.insert(version.to_string(), selected);
     let mut time = HashMap::with_capacity(1);
@@ -832,6 +1058,7 @@ fn emit_upgrade_json(
     dry_run: bool,
     fetch_errors: usize,
     skipped_private: &[String],
+    skipped_non_registry: &[String],
 ) -> Result<(), LpmError> {
     let packages: Vec<_> = candidates.iter().map(candidate_to_json).collect();
     let mut json = serde_json::json!({
@@ -842,6 +1069,14 @@ fn emit_upgrade_json(
         "fetch_errors": fetch_errors,
     });
     attach_skipped_private(&mut json, skipped_private);
+    if !skipped_non_registry.is_empty() {
+        json.as_object_mut()
+            .expect("upgrade JSON envelope is an object")
+            .insert(
+                "skipped_non_registry".to_string(),
+                serde_json::json!(skipped_non_registry),
+            );
+    }
     let encoded = serde_json::to_string_pretty(&json).map_err(|error| {
         LpmError::Script(format!("failed to serialize upgrade result: {error}"))
     })?;
@@ -880,6 +1115,22 @@ fn warn_skipped_private(skipped_private: &[String]) {
         names.join(", "),
     ));
     install_ui::phase("run `lpm install` first to record sources in lpm.lock, then re-run.");
+}
+
+fn warn_skipped_non_registry(skipped_non_registry: &[String]) {
+    if skipped_non_registry.is_empty() {
+        return;
+    }
+
+    let names = skipped_non_registry
+        .iter()
+        .map(|name| lpm_common::sanitize_terminal_inline(name).into_owned())
+        .collect::<Vec<_>>();
+    install_ui::warn_untrusted(&format!(
+        "skipped {} non-registry package(s): {}",
+        skipped_non_registry.len(),
+        names.join(", "),
+    ));
 }
 
 // ── Interactive multiselect ─────────────────────────────────────────
@@ -943,7 +1194,7 @@ fn deduplicate_by_highest_target(mut selected: Vec<EnrichedCandidate>) -> Vec<En
         left.name
             .cmp(&right.name)
             .then_with(|| left.current_range.cmp(&right.current_range))
-            .then_with(|| left.is_dev.cmp(&right.is_dev))
+            .then_with(|| left.dependency_kind.cmp(&right.dependency_kind))
             .then_with(
                 || match (Version::parse(&left.to), Version::parse(&right.to)) {
                     (Ok(left), Ok(right)) => right.cmp(&left),
@@ -954,12 +1205,12 @@ fn deduplicate_by_highest_target(mut selected: Vec<EnrichedCandidate>) -> Vec<En
     selected.dedup_by(|next, current| {
         next.name == current.name
             && next.current_range == current.current_range
-            && next.is_dev == current.is_dev
+            && next.dependency_kind == current.dependency_kind
     });
     selected.sort_unstable_by(|left, right| {
         left.name
             .cmp(&right.name)
-            .then_with(|| left.is_dev.cmp(&right.is_dev))
+            .then_with(|| left.dependency_kind.cmp(&right.dependency_kind))
     });
     selected
 }
@@ -967,7 +1218,11 @@ fn deduplicate_by_highest_target(mut selected: Vec<EnrichedCandidate>) -> Vec<En
 // ── Formatting helpers ──────────────────────────────────────────────
 
 fn format_candidate_row_for_tui(c: &EnrichedCandidate) -> String {
-    let dev_tag = if c.is_dev { " (dev)" } else { "" };
+    let dev_tag = match c.dependency_kind {
+        DependencyKind::Development => " (dev)",
+        DependencyKind::Optional => " (optional)",
+        DependencyKind::Runtime => "",
+    };
     let class_label = format_class_label(c.semver_class);
     let kind_tag = match c.target_kind {
         TargetKind::AbsoluteLatest => " (latest)",
@@ -1043,17 +1298,24 @@ fn format_upgrade_glyph(class: SemverClass) -> String {
 }
 
 fn candidate_to_json(c: &EnrichedCandidate) -> serde_json::Value {
-    serde_json::json!({
+    let mut value = serde_json::json!({
         "name": c.name,
         "from": c.from,
         "to": c.to,
         "new_range": c.new_range,
-        "is_dev": c.is_dev,
+        "is_dev": c.dependency_kind.is_dev(),
         "semver_class": c.semver_class,
         "has_install_scripts": c.has_install_scripts,
         "peer_impact": c.peer_impact,
         "patch_invalidation": c.patch_invalidation,
-    })
+    });
+    if c.dependency_kind == DependencyKind::Optional {
+        value
+            .as_object_mut()
+            .expect("upgrade candidate JSON is an object")
+            .insert("is_optional".to_string(), serde_json::Value::Bool(true));
+    }
+    value
 }
 
 fn apply_upgrades_to_manifest(
@@ -1061,11 +1323,7 @@ fn apply_upgrades_to_manifest(
     upgrades: &[EnrichedCandidate],
 ) -> Result<(), LpmError> {
     for upgrade in upgrades {
-        let dep_key = if upgrade.is_dev {
-            "devDependencies"
-        } else {
-            "dependencies"
-        };
+        let dep_key = upgrade.dependency_kind.manifest_key();
 
         let deps = doc
             .get_mut(dep_key)
@@ -1101,20 +1359,41 @@ fn apply_upgrades_to_manifest(
 
 // ── Preserved helpers from the original upgrade.rs ──────────────────
 
-/// Extract dependencies and devDependencies from a parsed JSON Value.
-fn extract_deps_from_value(doc: &serde_json::Value) -> Vec<(String, String, bool)> {
-    let mut deps = Vec::new();
+fn extract_deps_from_value(doc: &serde_json::Value) -> Vec<(String, String, DependencyKind)> {
+    let optional = doc
+        .get("optionalDependencies")
+        .and_then(serde_json::Value::as_object);
+    let capacity = doc
+        .get("dependencies")
+        .and_then(serde_json::Value::as_object)
+        .map_or(0, serde_json::Map::len)
+        + doc
+            .get("devDependencies")
+            .and_then(serde_json::Value::as_object)
+            .map_or(0, serde_json::Map::len)
+        + optional.map_or(0, serde_json::Map::len);
+    let mut deps = Vec::with_capacity(capacity);
     if let Some(obj) = doc.get("dependencies").and_then(|d| d.as_object()) {
         for (k, v) in obj {
+            if optional.is_some_and(|optional| optional.contains_key(k)) {
+                continue;
+            }
             if let Some(range) = v.as_str() {
-                deps.push((k.clone(), range.to_string(), false));
+                deps.push((k.clone(), range.to_string(), DependencyKind::Runtime));
             }
         }
     }
     if let Some(obj) = doc.get("devDependencies").and_then(|d| d.as_object()) {
         for (k, v) in obj {
             if let Some(range) = v.as_str() {
-                deps.push((k.clone(), range.to_string(), true));
+                deps.push((k.clone(), range.to_string(), DependencyKind::Development));
+            }
+        }
+    }
+    if let Some(obj) = optional {
+        for (k, v) in obj {
+            if let Some(range) = v.as_str() {
+                deps.push((k.clone(), range.to_string(), DependencyKind::Optional));
             }
         }
     }
@@ -1122,9 +1401,9 @@ fn extract_deps_from_value(doc: &serde_json::Value) -> Vec<(String, String, bool
 }
 
 fn filter_requested_deps(
-    deps: Vec<(String, String, bool)>,
+    deps: Vec<(String, String, DependencyKind)>,
     requested_packages: &[String],
-) -> Result<Vec<(String, String, bool)>, LpmError> {
+) -> Result<Vec<(String, String, DependencyKind)>, LpmError> {
     if requested_packages.is_empty() {
         return Ok(deps);
     }
@@ -1140,7 +1419,7 @@ fn filter_requested_deps(
         .collect::<Vec<_>>();
     if !missing.is_empty() {
         return Err(LpmError::Script(format!(
-            "package(s) not found in package.json dependencies or devDependencies: {}",
+            "package(s) not found in package.json dependencies, devDependencies, or optionalDependencies: {}",
             missing.join(", ")
         )));
     }
@@ -1163,6 +1442,7 @@ fn compute_upgrade(
     major: bool,
 ) -> (Option<String>, String) {
     let simple_range = simple_version_range(current_range);
+    let requirement = VersionReq::parse(current_range).ok();
 
     if major {
         if installed_version
@@ -1177,14 +1457,27 @@ fn compute_upgrade(
         return (Some(latest.to_string()), new_range);
     }
 
-    let current_major = installed_version
-        .and_then(|version| Version::parse(version).ok())
+    let installed = installed_version.and_then(|version| Version::parse(version).ok());
+    let installed_matches_manifest = installed.as_ref().is_some_and(|version| {
+        requirement
+            .as_ref()
+            .is_none_or(|requirement| requirement.matches(version))
+    });
+    let prerelease_allowed = |version: &Version| {
+        !version.is_prerelease()
+            || requirement
+                .as_ref()
+                .is_some_and(|requirement| requirement.matches(version))
+    };
+    let current_major = installed
+        .as_ref()
+        .filter(|_| installed_matches_manifest)
         .map(|version| version.major())
         .or_else(|| {
-            let requirement = VersionReq::parse(current_range).ok()?;
+            let requirement = requirement.as_ref()?;
             available_versions
                 .iter()
-                .filter(|version| !version.is_prerelease() && requirement.matches(version))
+                .filter(|version| prerelease_allowed(version) && requirement.matches(version))
                 .max()
                 .map(|version| version.major())
         })
@@ -1201,16 +1494,19 @@ fn compute_upgrade(
         }
     };
 
-    let Some(best) = available_versions
-        .iter()
-        .rev()
-        .find(|version| version.major() == current_major && !version.is_prerelease())
-    else {
+    let Some(best) = available_versions.iter().rev().find(|version| {
+        version.major() == current_major
+            && prerelease_allowed(version)
+            && (simple_range.is_some()
+                || requirement
+                    .as_ref()
+                    .is_none_or(|requirement| requirement.matches(version)))
+    }) else {
         return (None, current_range.to_string());
     };
-    if installed_version
-        .and_then(|version| Version::parse(version).ok())
-        .is_some_and(|installed| best <= &installed)
+    if installed
+        .as_ref()
+        .is_some_and(|installed| best <= installed)
     {
         return (None, current_range.to_string());
     }
@@ -1268,22 +1564,42 @@ mod tests {
     #[test]
     fn filter_requested_deps_keeps_only_named_manifest_dependencies() {
         let deps = vec![
-            ("zod".to_string(), "^3.0.0".to_string(), false),
-            ("typescript".to_string(), "^5.0.0".to_string(), true),
-            ("react".to_string(), "^18.0.0".to_string(), false),
+            (
+                "zod".to_string(),
+                "^3.0.0".to_string(),
+                DependencyKind::Runtime,
+            ),
+            (
+                "typescript".to_string(),
+                "^5.0.0".to_string(),
+                DependencyKind::Development,
+            ),
+            (
+                "react".to_string(),
+                "^18.0.0".to_string(),
+                DependencyKind::Runtime,
+            ),
         ];
 
         let filtered = filter_requested_deps(deps, &["typescript".to_string()]).unwrap();
 
         assert_eq!(
             filtered,
-            vec![("typescript".to_string(), "^5.0.0".to_string(), true)]
+            vec![(
+                "typescript".to_string(),
+                "^5.0.0".to_string(),
+                DependencyKind::Development
+            )]
         );
     }
 
     #[test]
     fn filter_requested_deps_errors_when_package_is_not_manifest_dependency() {
-        let deps = vec![("zod".to_string(), "^3.0.0".to_string(), false)];
+        let deps = vec![(
+            "zod".to_string(),
+            "^3.0.0".to_string(),
+            DependencyKind::Runtime,
+        )];
 
         let err = filter_requested_deps(deps, &["react".to_string()]).unwrap_err();
 
@@ -1388,6 +1704,48 @@ mod tests {
         assert_eq!(
             result,
             (Some("1.9.1".to_string()), ">=1.0.0 <2.0.0".to_string())
+        );
+    }
+
+    #[test]
+    fn default_mode_respects_every_bound_in_a_complex_range() {
+        let available = parsed_versions(&["1.2.0", "1.4.0", "1.9.0"]);
+
+        let result = compute_upgrade(">=1.0.0 <1.5.0", Some("1.2.0"), "1.9.0", &available, false);
+
+        assert_eq!(
+            result,
+            (Some("1.4.0".to_string()), ">=1.0.0 <1.5.0".to_string())
+        );
+    }
+
+    #[test]
+    fn default_mode_uses_manifest_intent_when_installed_version_is_stale() {
+        let available = parsed_versions(&["1.5.0", "1.9.0", "2.0.0", "2.1.0"]);
+
+        let result = compute_upgrade("^2.0.0", Some("1.5.0"), "2.1.0", &available, false);
+
+        assert_eq!(result, (Some("2.1.0".to_string()), "^2.1.0".to_string()));
+    }
+
+    #[test]
+    fn default_mode_advances_an_explicit_prerelease_range() {
+        let available = parsed_versions(&["2.0.0-beta.1", "2.0.0-beta.2"]);
+
+        let result = compute_upgrade(
+            "^2.0.0-beta.1",
+            Some("2.0.0-beta.1"),
+            "2.0.0-beta.2",
+            &available,
+            false,
+        );
+
+        assert_eq!(
+            result,
+            (
+                Some("2.0.0-beta.2".to_string()),
+                "^2.0.0-beta.2".to_string()
+            )
         );
     }
 
@@ -1524,7 +1882,7 @@ mod tests {
             current_range: "^1.2.0".into(),
             new_range: "^1.2.4".into(),
             to: "1.2.4".into(),
-            is_dev: false,
+            dependency_kind: DependencyKind::Runtime,
             target_kind: TargetKind::WithinMajor,
             semver_class: class,
             has_install_scripts: has_scripts,
@@ -1585,7 +1943,7 @@ mod tests {
             current_range: "^3.4.0".into(),
             new_range: "^3.9.0".into(),
             to: "3.9.0".into(),
-            is_dev: false,
+            dependency_kind: DependencyKind::Runtime,
             target_kind: TargetKind::WithinMajor,
             semver_class: SemverClass::Minor,
             has_install_scripts: false,
@@ -1632,7 +1990,7 @@ mod tests {
             current_range: "^3.4.0".into(),
             new_range: "^3.9.0".into(),
             to: "3.9.0".into(),
-            is_dev: false,
+            dependency_kind: DependencyKind::Runtime,
             target_kind: TargetKind::WithinMajor,
             semver_class: SemverClass::Minor,
             has_install_scripts: false,
@@ -1668,15 +2026,23 @@ mod tests {
     fn deduplicate_keeps_identical_declarations_from_both_dependency_sections() {
         let runtime = make_candidate(SemverClass::Patch, false, true, false);
         let development = EnrichedCandidate {
-            is_dev: true,
+            dependency_kind: DependencyKind::Development,
             ..runtime.clone()
         };
 
         let deduped = deduplicate_by_highest_target(vec![runtime, development]);
 
         assert_eq!(deduped.len(), 2);
-        assert!(deduped.iter().any(|candidate| !candidate.is_dev));
-        assert!(deduped.iter().any(|candidate| candidate.is_dev));
+        assert!(
+            deduped
+                .iter()
+                .any(|candidate| candidate.dependency_kind == DependencyKind::Runtime)
+        );
+        assert!(
+            deduped
+                .iter()
+                .any(|candidate| candidate.dependency_kind == DependencyKind::Development)
+        );
     }
 
     // ── extract_deps_from_value (preserved) ─────────────────────────
@@ -1690,13 +2056,25 @@ mod tests {
         let deps = extract_deps_from_value(&doc);
         assert_eq!(deps.len(), 2);
         assert!(
-            deps.iter()
-                .any(|(n, r, d)| n == "foo" && r == "^1.0.0" && !d)
+            deps.iter().any(|(n, r, kind)| n == "foo"
+                && r == "^1.0.0"
+                && *kind == DependencyKind::Runtime)
         );
-        assert!(
-            deps.iter()
-                .any(|(n, r, d)| n == "bar" && r == "~2.0.0" && *d)
-        );
+        assert!(deps.iter().any(|(n, r, kind)| n == "bar"
+            && r == "~2.0.0"
+            && *kind == DependencyKind::Development));
+    }
+
+    #[test]
+    fn extract_deps_includes_optional_dependencies() {
+        let doc: serde_json::Value =
+            serde_json::from_str(r#"{"optionalDependencies":{"optional-pkg":"^1.0.0"}}"#).unwrap();
+
+        let deps = extract_deps_from_value(&doc);
+
+        assert!(deps.iter().any(|(name, range, kind)| name == "optional-pkg"
+            && range == "^1.0.0"
+            && *kind == DependencyKind::Optional));
     }
 
     // ── version validation (preserved) ──────────────────────────────

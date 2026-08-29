@@ -4,17 +4,56 @@ use crate::install_ui;
 use lpm_common::color::Painted;
 use serde_json::Value;
 use std::io::IsTerminal;
+use std::sync::{Mutex, OnceLock};
+
+struct StdoutSuppressionState {
+    active_leases: usize,
+    gag: Option<gag::Gag>,
+}
+
+fn stdout_suppression_state() -> &'static Mutex<StdoutSuppressionState> {
+    static STATE: OnceLock<Mutex<StdoutSuppressionState>> = OnceLock::new();
+    STATE.get_or_init(|| {
+        Mutex::new(StdoutSuppressionState {
+            active_leases: 0,
+            gag: None,
+        })
+    })
+}
+
+pub struct StdoutSuppressionLease {
+    _private: (),
+}
+
+impl Drop for StdoutSuppressionLease {
+    fn drop(&mut self) {
+        let mut state = stdout_suppression_state()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.active_leases -= 1;
+        if state.active_leases == 0 {
+            state.gag.take();
+        }
+    }
+}
 
 /// Suppress stdout for nested command execution when the outer command
 /// owns the machine-readable stdout contract.
-pub fn suppress_stdout(enabled: bool) -> Result<Option<gag::Gag>, String> {
+pub fn suppress_stdout(enabled: bool) -> Result<Option<StdoutSuppressionLease>, String> {
     if !enabled {
         return Ok(None);
     }
 
-    gag::Gag::stdout()
-        .map(Some)
-        .map_err(|error| format!("failed to suppress stdout: {error}"))
+    let mut state = stdout_suppression_state()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if state.active_leases == 0 {
+        state.gag = Some(
+            gag::Gag::stdout().map_err(|error| format!("failed to suppress stdout: {error}"))?,
+        );
+    }
+    state.active_leases += 1;
+    Ok(Some(StdoutSuppressionLease { _private: () }))
 }
 
 /// Suppress stderr for nested command execution when the outer command
@@ -170,6 +209,28 @@ fn ansi_dim(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn overlapping_stdout_suppression_leases_share_one_redirect() {
+        let first = suppress_stdout(true).expect("first suppression starts");
+        let second = suppress_stdout(true).expect("overlapping suppression shares redirect");
+
+        drop(first);
+        assert_eq!(
+            stdout_suppression_state()
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .active_leases,
+            1
+        );
+        drop(second);
+
+        let state = stdout_suppression_state()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert_eq!(state.active_leases, 0);
+        assert!(state.gag.is_none());
+    }
 
     #[test]
     fn json_answer_non_tty_matches_serde_pretty_bytes() {

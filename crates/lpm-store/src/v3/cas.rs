@@ -777,6 +777,64 @@ impl FileCas {
         Ok((record, manifest))
     }
 
+    pub(crate) fn source_record_for_prune(
+        &self,
+        object_dir: &Path,
+        source_sri: &str,
+    ) -> Result<SourceRecord, LpmError> {
+        let record = self.read_source_record(source_sri).map_err(|error| {
+            LpmError::Store(format!(
+                "failed to read v3 CAS source record for {}: {error}",
+                object_dir.display()
+            ))
+        })?;
+        let segment = object_dir.file_name().ok_or_else(|| {
+            LpmError::Store(format!(
+                "v3 CAS source object has no path segment: {}",
+                object_dir.display()
+            ))
+        })?;
+        if record.schema != CAS_SCHEMA_VERSION
+            || record.source_sri != source_sri
+            || record.object_segment != encode_os_str(segment)
+            || !valid_hex_digest(&record.tree_digest)
+        {
+            return Err(LpmError::Store(format!(
+                "invalid v3 CAS source record for {}",
+                object_dir.display()
+            )));
+        }
+        Ok(record)
+    }
+
+    pub(crate) fn manifest_for_prune(&self, digest: &str) -> Result<CasManifest, LpmError> {
+        let path = self.tree_manifest_path(digest)?;
+        let (size, fingerprint) = manifest_file_fingerprint(&path)?;
+        let manifest_bytes = read_capped(&path, MANIFEST_MAX_BYTES)?;
+        let (size_after_read, fingerprint_after_read) = manifest_file_fingerprint(&path)?;
+        if size != size_after_read || fingerprint != fingerprint_after_read {
+            return Err(LpmError::Store(format!(
+                "v3 CAS tree manifest changed while being read for {digest}"
+            )));
+        }
+        if blake3::hash(&manifest_bytes).to_hex().as_str() != digest {
+            return Err(LpmError::Store(format!(
+                "v3 CAS tree digest mismatch for {digest}"
+            )));
+        }
+        let manifest: CasManifest = rmp_serde::from_slice(&manifest_bytes).map_err(|error| {
+            LpmError::Store(format!(
+                "failed to parse v3 CAS tree manifest {digest}: {error}"
+            ))
+        })?;
+        if !validate_manifest(&manifest)? {
+            return Err(LpmError::Store(format!(
+                "invalid v3 CAS tree manifest {digest}"
+            )));
+        }
+        Ok(manifest)
+    }
+
     pub(crate) fn source_record_from_file(&self, path: &Path) -> Result<SourceRecord, LpmError> {
         let bytes = read_capped(path, SOURCE_RECORD_MAX_BYTES)?;
         let record: SourceRecord = rmp_serde::from_slice(&bytes).map_err(|error| {
@@ -1610,6 +1668,68 @@ impl FileCas {
         list_sharded_directories(&self.materialized_root)
     }
 
+    pub(crate) fn prune_tree_inventory(
+        &self,
+        live_tree_digests: &HashMap<String, bool>,
+    ) -> Result<(usize, Vec<PathBuf>), LpmError> {
+        collect_sharded_orphans(&self.trees_root, PruneInventoryKind::File, |path| {
+            let digest = sharded_digest(path, &self.trees_root, ".msgpack", "tree manifest")?;
+            Ok(live_tree_digests.contains_key(digest))
+        })
+    }
+
+    pub(crate) fn prune_blob_inventory(
+        &self,
+        live_blobs: &HashSet<PathBuf>,
+    ) -> Result<(usize, Vec<PathBuf>), LpmError> {
+        collect_sharded_orphans(&self.blobs_root, PruneInventoryKind::File, |path| {
+            Ok(live_blobs.contains(path))
+        })
+    }
+
+    pub(crate) fn prune_source_record_inventory(
+        &self,
+        live_source_digests: &HashSet<String>,
+    ) -> Result<(usize, Vec<PathBuf>), LpmError> {
+        collect_sharded_orphans(&self.sources_root, PruneInventoryKind::File, |path| {
+            let digest = sharded_digest(path, &self.sources_root, ".msgpack", "source record")?;
+            Ok(live_source_digests.contains(digest))
+        })
+    }
+
+    pub(crate) fn prune_source_validation_inventory(
+        &self,
+        live_source_digests: &HashSet<String>,
+    ) -> Result<(usize, Vec<PathBuf>), LpmError> {
+        collect_sharded_orphans(
+            &self.source_validations_root,
+            PruneInventoryKind::File,
+            |path| {
+                let digest = sharded_digest(
+                    path,
+                    &self.source_validations_root,
+                    ".msgpack",
+                    "source validation",
+                )?;
+                Ok(live_source_digests.contains(digest))
+            },
+        )
+    }
+
+    pub(crate) fn prune_materialized_inventory(
+        &self,
+        live_tree_digests: &HashMap<String, bool>,
+    ) -> Result<(usize, Vec<PathBuf>), LpmError> {
+        collect_sharded_orphans(
+            &self.materialized_root,
+            PruneInventoryKind::Directory,
+            |path| {
+                let digest = sharded_digest(path, &self.materialized_root, "", "materialized")?;
+                Ok(live_tree_digests.contains_key(digest))
+            },
+        )
+    }
+
     fn quarantine_entry(&self, path: &Path, kind: &str) -> Result<(), LpmError> {
         let file_name = path.file_name().ok_or_else(|| {
             LpmError::Store(format!(
@@ -1728,6 +1848,106 @@ fn tighten_directory_permissions(path: &Path) -> io::Result<()> {
 #[cfg(not(unix))]
 fn tighten_directory_permissions(_path: &Path) -> io::Result<()> {
     Ok(())
+}
+
+#[derive(Clone, Copy)]
+enum PruneInventoryKind {
+    File,
+    Directory,
+}
+
+fn collect_sharded_orphans(
+    root: &Path,
+    kind: PruneInventoryKind,
+    mut is_live: impl FnMut(&Path) -> Result<bool, LpmError>,
+) -> Result<(usize, Vec<PathBuf>), LpmError> {
+    ensure_cas_root_directory(root)?;
+    if !root.try_exists()? {
+        return Ok((0, Vec::new()));
+    }
+    let mut total = 0usize;
+    let mut orphaned = Vec::new();
+    for shard in fs::read_dir(root).map_err(|error| {
+        LpmError::Store(format!(
+            "failed to enumerate v3 CAS root {}: {error}",
+            root.display()
+        ))
+    })? {
+        let shard = shard.map_err(|error| {
+            LpmError::Store(format!("failed to enumerate v3 CAS shard: {error}"))
+        })?;
+        if !shard
+            .file_type()
+            .map_err(|error| LpmError::Store(format!("failed to inspect v3 CAS shard: {error}")))?
+            .is_dir()
+        {
+            return Err(LpmError::Store(format!(
+                "v3 CAS shard is not a directory at {}",
+                shard.path().display()
+            )));
+        }
+        for entry in fs::read_dir(shard.path()).map_err(|error| {
+            LpmError::Store(format!(
+                "failed to enumerate v3 CAS shard {}: {error}",
+                shard.path().display()
+            ))
+        })? {
+            let entry = entry.map_err(|error| {
+                LpmError::Store(format!("failed to enumerate v3 CAS entry: {error}"))
+            })?;
+            let file_type = entry.file_type().map_err(|error| {
+                LpmError::Store(format!(
+                    "failed to inspect v3 CAS entry {}: {error}",
+                    entry.path().display()
+                ))
+            })?;
+            let expected_type = match kind {
+                PruneInventoryKind::File => file_type.is_file(),
+                PruneInventoryKind::Directory => file_type.is_dir(),
+            };
+            if !expected_type {
+                return Err(LpmError::Store(format!(
+                    "v3 CAS entry has an invalid type at {}",
+                    entry.path().display()
+                )));
+            }
+            total = total.saturating_add(1);
+            let path = entry.path();
+            if !is_live(&path)? {
+                orphaned.push(path);
+            }
+        }
+    }
+    orphaned.sort_unstable();
+    Ok((total, orphaned))
+}
+
+fn sharded_digest<'a>(
+    path: &'a Path,
+    root: &Path,
+    suffix: &str,
+    kind: &str,
+) -> Result<&'a str, LpmError> {
+    let name = path
+        .file_name()
+        .and_then(OsStr::to_str)
+        .ok_or_else(|| LpmError::Store(format!("invalid v3 CAS {kind} path {}", path.display())))?;
+    let digest = name
+        .strip_suffix(suffix)
+        .ok_or_else(|| LpmError::Store(format!("invalid v3 CAS {kind} name {}", path.display())))?;
+    let shard = digest.get(..2).ok_or_else(|| {
+        LpmError::Store(format!("invalid v3 CAS {kind} digest {}", path.display()))
+    })?;
+    if !valid_hex_digest(digest)
+        || path.parent().and_then(Path::file_name) != Some(OsStr::new(shard))
+        || path.parent().and_then(Path::parent) != Some(root)
+    {
+        return Err(LpmError::Store(format!(
+            "invalid v3 CAS {kind} path {}",
+            path.display()
+        )));
+    }
+    Ok(digest)
 }
 
 fn list_sharded_regular_files(root: &Path) -> Result<Vec<PathBuf>, LpmError> {

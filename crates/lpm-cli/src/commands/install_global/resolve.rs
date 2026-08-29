@@ -4,8 +4,10 @@ use crate::save_spec::{
 };
 use lpm_common::LpmError;
 use lpm_global::PackageSource;
-use lpm_registry::RegistryClient;
+use lpm_registry::{RegistryClient, RouteTable};
 use lpm_semver::Version;
+use std::path::Path;
+use std::sync::Arc;
 
 #[derive(Debug, Clone)]
 pub(super) struct ResolvedSpec {
@@ -20,8 +22,13 @@ pub(super) async fn pre_resolve(
     registry: &RegistryClient,
     spec: &str,
     policy: &lpm_resolver::ResolverPolicy,
+    save_flags: SaveFlags,
+    routing_root: &Path,
 ) -> Result<ResolvedSpec, LpmError> {
     let (name, intent) = parse_user_save_intent(spec)?;
+    let route_table = RouteTable::from_env_and_filesystem(routing_root)
+        .map_err(|error| LpmError::Registry(format!("npmrc: {error}")))?;
+    let route = route_table.route_for_package(&name);
     // Dispatch by name shape: `@lpm.dev/owner.tool` goes through the
     // first-party registry path (PackageName parser); everything else
     // (`eslint`, `@types/node`, `@scope/foo`) is fetched via the npm
@@ -32,7 +39,9 @@ pub(super) async fn pre_resolve(
             .map_err(|e| LpmError::Script(format!("invalid LPM package name '{name}': {e}")))?;
         registry.get_package_metadata(&pkg_name).await?
     } else {
-        registry.get_npm_package_metadata(&name).await?
+        registry
+            .get_npm_metadata_routed(&name, route.clone())
+            .await?
     };
 
     // Pick a concrete version that satisfies `intent`.
@@ -66,12 +75,13 @@ pub(super) async fn pre_resolve(
     };
 
     // Global installs honor the same save-spec precedence as project installs.
-    let decision = decide_saved_dependency_spec(
-        &intent,
-        &version,
-        SaveFlags::default(),
-        SaveConfig::default(),
-    );
+    let decision =
+        decide_saved_dependency_spec(&intent, &version, save_flags, SaveConfig::default());
+    if !registry.seed_metadata_for_command(&name, &route, Arc::new(metadata)) {
+        return Err(LpmError::Registry(format!(
+            "failed to retain validated global-install metadata for '{name}'"
+        )));
+    }
 
     Ok(ResolvedSpec {
         name,

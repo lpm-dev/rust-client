@@ -33,9 +33,12 @@ mod rollback;
 #[cfg(test)]
 mod test_support;
 
-use self::commit::{UpgradeOutput, commit_upgrade_locked};
+use self::commit::{UpgradeOutput, commit_upgrade_batch_locked, commit_upgrade_locked};
 use self::inner::do_install_upgrade;
-use self::prepare::{UpgradePrep, active_matches_planned_snapshot, prepare_upgrade_locked};
+use self::prepare::{
+    StagedUpgrade, UpgradePrep, active_matches_planned_snapshot, prepare_upgrade_batch_locked,
+    prepare_upgrade_locked,
+};
 use super::global_util::{discover_bin_commands, mk_tx_id, pick_version_with_policy};
 use crate::save_spec::{
     SaveConfig, SaveFlags, UserSaveIntent, decide_saved_dependency_spec, parse_user_save_intent,
@@ -44,7 +47,8 @@ use crate::{install_ui, output};
 use futures::StreamExt;
 use lpm_common::color::Painted;
 use lpm_common::{
-    LpmError, LpmRoot, sanitize_for_terminal, with_exclusive_lock, with_exclusive_lock_async,
+    ExclusiveLockHandle, LpmError, LpmRoot, acquire_exclusive_lock, sanitize_for_terminal,
+    with_exclusive_lock, with_exclusive_lock_async,
 };
 use lpm_global::{
     GlobalManifest, InstallReadyMarker, PackageSource, read_for, write_for, write_marker,
@@ -55,6 +59,16 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 const GLOBAL_UPDATE_PLANNING_CONCURRENCY: usize = 4;
+const GLOBAL_UPDATE_INSTALL_CONCURRENCY: usize = 4;
+const GLOBAL_UPDATE_TRANSACTION_BATCH_SIZE: usize = 16;
+
+fn bounded_install_stream<I, F>(futures: I) -> impl futures::Stream<Item = F::Output>
+where
+    I: IntoIterator<Item = F>,
+    F: std::future::Future,
+{
+    futures::stream::iter(futures).buffer_unordered(GLOBAL_UPDATE_INSTALL_CONCURRENCY)
+}
 
 fn update_failure_reason(error: &LpmError) -> String {
     let LpmError::NotFound(detail) = error else {
@@ -178,8 +192,10 @@ pub async fn run(
         return Ok(());
     }
 
-    let mut results: Vec<UpgradeResult> = Vec::new();
-    for plan in plans {
+    let mut ordered_results: Vec<Option<UpgradeResult>> =
+        std::iter::repeat_with(|| None).take(plans.len()).collect();
+    let mut upgrades = Vec::new();
+    for (index, plan) in plans.into_iter().enumerate() {
         match plan {
             UpgradePlan::Upgrade {
                 prep,
@@ -191,19 +207,13 @@ pub async fn run(
                     &route.upstream_route(),
                     metadata,
                 ) {
-                    results.push(UpgradeResult::Failed {
+                    ordered_results[index] = Some(UpgradeResult::Failed {
                         package: prep.name.clone(),
                         reason: "failed to retain validated global-update metadata".to_string(),
                     });
                     continue;
                 }
-                match execute_upgrade(&root, &install_registry, prep, json_output).await {
-                    Ok(out) => results.push(UpgradeResult::Upgraded(out)),
-                    Err(e) => results.push(UpgradeResult::Failed {
-                        package: e.0,
-                        reason: e.1.to_string(),
-                    }),
-                }
+                upgrades.push((index, prep));
             }
             UpgradePlan::SaveSpecRewrite {
                 package,
@@ -219,26 +229,63 @@ pub async fn run(
                     &new_saved_spec,
                     &prior_snapshot,
                 ) {
-                    Ok(()) => results.push(UpgradeResult::SaveSpecRewritten {
-                        package,
-                        version,
-                        old_saved_spec,
-                        new_saved_spec,
-                    }),
-                    Err(e) => results.push(UpgradeResult::Failed {
-                        package,
-                        reason: e.to_string(),
-                    }),
+                    Ok(()) => {
+                        ordered_results[index] = Some(UpgradeResult::SaveSpecRewritten {
+                            package,
+                            version,
+                            old_saved_spec,
+                            new_saved_spec,
+                        })
+                    }
+                    Err(e) => {
+                        ordered_results[index] = Some(UpgradeResult::Failed {
+                            package,
+                            reason: e.to_string(),
+                        })
+                    }
                 }
             }
             UpgradePlan::AlreadyCurrent { package, version } => {
-                results.push(UpgradeResult::AlreadyCurrent { package, version });
+                ordered_results[index] = Some(UpgradeResult::AlreadyCurrent { package, version });
             }
             UpgradePlan::PlanError { package, reason } => {
-                results.push(UpgradeResult::Failed { package, reason });
+                ordered_results[index] = Some(UpgradeResult::Failed { package, reason });
             }
         }
     }
+
+    if upgrades.len() == 1 {
+        let (index, prep) = upgrades.pop().expect("one queued global upgrade");
+        ordered_results[index] = Some(
+            match execute_upgrade(&root, &install_registry, prep, json_output).await {
+                Ok(output) => UpgradeResult::Upgraded(output),
+                Err((package, error)) => UpgradeResult::Failed {
+                    package,
+                    reason: error.to_string(),
+                },
+            },
+        );
+    } else {
+        let mut queued_upgrades = upgrades.into_iter();
+        loop {
+            let batch = queued_upgrades
+                .by_ref()
+                .take(GLOBAL_UPDATE_TRANSACTION_BATCH_SIZE)
+                .collect::<Vec<_>>();
+            if batch.is_empty() {
+                break;
+            }
+            for (index, result) in
+                execute_upgrade_batch(&root, &install_registry, batch, true).await
+            {
+                ordered_results[index] = Some(result);
+            }
+        }
+    }
+    let results: Vec<UpgradeResult> = ordered_results
+        .into_iter()
+        .map(|result| result.expect("every global update plan produces one result"))
+        .collect();
 
     // Opportunistic tombstone sweep. Each successful
     // upgrade pushed the prior install root onto `manifest.tombstones`;
@@ -646,6 +693,173 @@ enum UpgradeResult {
     },
 }
 
+struct BatchUpgrade {
+    index: usize,
+    prep: Box<UpgradePrep>,
+    tx_id: String,
+    _inflight_lock: ExclusiveLockHandle,
+}
+
+struct PreparedBatchUpgrade {
+    index: usize,
+    prep: Box<UpgradePrep>,
+    staged: StagedUpgrade,
+    _inflight_lock: ExclusiveLockHandle,
+}
+
+async fn execute_upgrade_batch(
+    root: &LpmRoot,
+    registry: &RegistryClient,
+    upgrades: Vec<(usize, Box<UpgradePrep>)>,
+    suppress_nested_output: bool,
+) -> Vec<(usize, UpgradeResult)> {
+    let upgrade_count = upgrades.len();
+    let mut results = Vec::with_capacity(upgrade_count);
+    let mut locked = Vec::with_capacity(upgrade_count);
+    for (index, prep) in upgrades {
+        let tx_id = mk_tx_id();
+        match acquire_exclusive_lock(lpm_global::inflight_tx_lock(root, &tx_id)) {
+            Ok(inflight_lock) => locked.push(BatchUpgrade {
+                index,
+                prep,
+                tx_id,
+                _inflight_lock: inflight_lock,
+            }),
+            Err(error) => results.push((
+                index,
+                UpgradeResult::Failed {
+                    package: prep.name.clone(),
+                    reason: error.to_string(),
+                },
+            )),
+        }
+    }
+    if locked.is_empty() {
+        return results;
+    }
+
+    let prepare_inputs = locked
+        .iter()
+        .map(|upgrade| (upgrade.prep.as_ref(), upgrade.tx_id.clone()))
+        .collect::<Vec<_>>();
+    let prepared = match with_exclusive_lock(root.global_tx_lock(), || {
+        prepare_upgrade_batch_locked(root, &prepare_inputs)
+    }) {
+        Ok(prepared) => prepared,
+        Err(error) => {
+            let reason = error.to_string();
+            results.extend(locked.into_iter().map(|upgrade| {
+                (
+                    upgrade.index,
+                    UpgradeResult::Failed {
+                        package: upgrade.prep.name.clone(),
+                        reason: reason.clone(),
+                    },
+                )
+            }));
+            return results;
+        }
+    };
+
+    let mut ready = Vec::with_capacity(locked.len());
+    for (upgrade, prepared) in locked.into_iter().zip(prepared) {
+        match prepared {
+            Ok(staged) => ready.push(PreparedBatchUpgrade {
+                index: upgrade.index,
+                prep: upgrade.prep,
+                staged,
+                _inflight_lock: upgrade._inflight_lock,
+            }),
+            Err(error) => results.push((
+                upgrade.index,
+                UpgradeResult::Failed {
+                    package: upgrade.prep.name.clone(),
+                    reason: error.to_string(),
+                },
+            )),
+        }
+    }
+
+    let installs = bounded_install_stream(ready.into_iter().map(|upgrade| async move {
+        let install_result = async {
+            do_install_upgrade(
+                root,
+                registry,
+                &upgrade.prep,
+                &upgrade.staged,
+                suppress_nested_output,
+            )
+            .await?;
+            let commands = discover_bin_commands(&upgrade.staged.install_root, &upgrade.prep.name)?;
+            if commands.is_empty() {
+                return Err(LpmError::Script(format!(
+                    "package '{}' exposes no bin entries — refusing to upgrade",
+                    upgrade.prep.name
+                )));
+            }
+            write_marker(
+                &upgrade.staged.install_root,
+                &InstallReadyMarker::new(commands),
+            )?;
+            Ok(())
+        }
+        .await;
+        (upgrade, install_result)
+    }));
+    futures::pin_mut!(installs);
+    let mut commit_ready = Vec::with_capacity(upgrade_count);
+    while let Some((upgrade, install_result)) = installs.next().await {
+        match install_result {
+            Ok(()) => commit_ready.push(upgrade),
+            Err(error) => results.push((
+                upgrade.index,
+                UpgradeResult::Failed {
+                    package: upgrade.prep.name.clone(),
+                    reason: error.to_string(),
+                },
+            )),
+        }
+    }
+
+    if !commit_ready.is_empty() {
+        commit_ready.sort_by_key(|upgrade| upgrade.index);
+        let commit_inputs = commit_ready
+            .iter()
+            .map(|upgrade| (upgrade.prep.as_ref(), &upgrade.staged))
+            .collect::<Vec<_>>();
+        match with_exclusive_lock(root.global_tx_lock(), || {
+            commit_upgrade_batch_locked(root, &commit_inputs)
+        }) {
+            Ok(commit_results) => {
+                for (upgrade, commit_result) in commit_ready.into_iter().zip(commit_results) {
+                    let result = match commit_result {
+                        Ok(output) => UpgradeResult::Upgraded(output),
+                        Err(error) => UpgradeResult::Failed {
+                            package: upgrade.prep.name.clone(),
+                            reason: error.to_string(),
+                        },
+                    };
+                    results.push((upgrade.index, result));
+                }
+            }
+            Err(error) => {
+                let reason = error.to_string();
+                results.extend(commit_ready.into_iter().map(|upgrade| {
+                    (
+                        upgrade.index,
+                        UpgradeResult::Failed {
+                            package: upgrade.prep.name.clone(),
+                            reason: reason.clone(),
+                        },
+                    )
+                }));
+            }
+        }
+    }
+
+    results
+}
+
 async fn execute_upgrade(
     root: &LpmRoot,
     registry: &RegistryClient,
@@ -660,7 +874,7 @@ async fn execute_upgrade(
             prepare_upgrade_locked(root, &prep, tx_id)
         })?;
 
-        do_install_upgrade(registry, &prep, &staged, suppress_nested_output).await?;
+        do_install_upgrade(root, registry, &prep, &staged, suppress_nested_output).await?;
         let commands = discover_bin_commands(&staged.install_root, &prep.name)?;
         if commands.is_empty() {
             return Err(LpmError::Script(format!(
@@ -961,6 +1175,73 @@ mod tests {
             vars.push(("LPM_REGISTRY_URL", Some(registry_url.into())));
         }
         crate::test_env::ScopedEnv::update(vars)
+    }
+
+    #[tokio::test]
+    async fn install_scheduler_never_exceeds_four_in_flight_upgrades() {
+        async fn wait_for_count(
+            counter: &std::sync::atomic::AtomicUsize,
+            notification: &tokio::sync::Notify,
+            expected: usize,
+        ) {
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                while counter.load(std::sync::atomic::Ordering::SeqCst) < expected {
+                    notification.notified().await;
+                }
+            })
+            .await
+            .expect("bounded install scheduler stopped making progress");
+        }
+
+        let permits = Arc::new(tokio::sync::Semaphore::new(0));
+        let current = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let maximum = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let started = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let notification = Arc::new(tokio::sync::Notify::new());
+        let future_permits = Arc::clone(&permits);
+        let future_current = Arc::clone(&current);
+        let future_maximum = Arc::clone(&maximum);
+        let future_started = Arc::clone(&started);
+        let future_notification = Arc::clone(&notification);
+        let install_futures = (0..8).map(move |_| {
+            let permits = Arc::clone(&future_permits);
+            let current = Arc::clone(&future_current);
+            let maximum = Arc::clone(&future_maximum);
+            let started = Arc::clone(&future_started);
+            let notification = Arc::clone(&future_notification);
+            async move {
+                let active = current.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                maximum.fetch_max(active, std::sync::atomic::Ordering::SeqCst);
+                started.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                notification.notify_waiters();
+                permits
+                    .acquire()
+                    .await
+                    .expect("test semaphore stays open")
+                    .forget();
+                current.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+            }
+        });
+        let scheduler = tokio::spawn(async move {
+            bounded_install_stream(install_futures)
+                .collect::<Vec<_>>()
+                .await
+        });
+
+        wait_for_count(&started, &notification, 4).await;
+        assert_eq!(started.load(std::sync::atomic::Ordering::SeqCst), 4);
+        assert_eq!(current.load(std::sync::atomic::Ordering::SeqCst), 4);
+        assert_eq!(maximum.load(std::sync::atomic::Ordering::SeqCst), 4);
+
+        permits.add_permits(4);
+        wait_for_count(&started, &notification, 8).await;
+        assert_eq!(started.load(std::sync::atomic::Ordering::SeqCst), 8);
+        assert_eq!(current.load(std::sync::atomic::Ordering::SeqCst), 4);
+        assert_eq!(maximum.load(std::sync::atomic::Ordering::SeqCst), 4);
+
+        permits.add_permits(4);
+        scheduler.await.expect("join bounded install scheduler");
+        assert_eq!(current.load(std::sync::atomic::Ordering::SeqCst), 0);
     }
 
     #[test]

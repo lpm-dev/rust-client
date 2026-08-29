@@ -9,6 +9,8 @@ use crate::wal::WalReader;
 use crate::wal::{IntentPayload, OwnershipChange, TrustPruneEntry, TxKind, WalRecord, WalWriter};
 use chrono::Utc;
 use lpm_common::LpmRoot;
+#[cfg(unix)]
+use std::os::unix::fs::symlink;
 use std::path::{Path, PathBuf};
 use tempfile::TempDir;
 
@@ -118,6 +120,23 @@ fn fully_resolved_wal_compacts_to_zero() {
 }
 
 // ─── Rollback paths ────────────────────────────────────────────
+
+#[cfg(unix)]
+#[test]
+fn recovery_refuses_symlinked_wal_without_truncating_target() {
+    let tmp = TempDir::new().unwrap();
+    let victim = TempDir::new().unwrap();
+    let root = LpmRoot::from_dir(tmp.path());
+    std::fs::create_dir_all(root.global_root()).unwrap();
+    let victim_wal = victim.path().join("victim");
+    std::fs::write(&victim_wal, b"torn").unwrap();
+    symlink(&victim_wal, root.global_wal()).unwrap();
+
+    let result = recover(&root);
+
+    assert!(result.is_err(), "recovery must reject a linked WAL leaf");
+    assert_eq!(std::fs::read(&victim_wal).unwrap(), b"torn");
+}
 
 #[test]
 fn fresh_install_with_partial_root_rolls_back() {

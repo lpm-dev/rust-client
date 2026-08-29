@@ -163,10 +163,6 @@ const REVIEWED_RAW_ATOMIC_WRITERS: &[(&str, &str)] = &[
         "the persist method belongs to L4Cache and delegates to the shared secure writer",
     ),
     (
-        "crates/lpm-cli/src/commands/cache_prune.rs::remove_via_prune_tombstone",
-        "moves an orphan into a randomized tombstone before recursive deletion",
-    ),
-    (
         "crates/lpm-cli/src/commands/remove.rs::move_path",
         "moves preflight-validated project-owned entries into an exclusively created quarantine and records each move for rollback",
     ),

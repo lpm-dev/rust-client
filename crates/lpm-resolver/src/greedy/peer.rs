@@ -112,11 +112,10 @@ fn find_version_satisfying_all(
 ) -> Option<NpmVersion> {
     for v in peer_versions_by_npm_preference(info, reqs) {
         // Every requirement's range must accept this version.
-        if !reqs.iter().all(|requirement| {
-            requirement
-                .range
-                .satisfies_with_latest_bound(v, info.latest_version.as_ref())
-        }) || !version_allowed_by_policy(canonical, info, v, policy)
+        if !reqs
+            .iter()
+            .all(|requirement| info.range_satisfies(&requirement.range, v))
+            || !version_allowed_by_policy(canonical, info, v, policy)
         {
             continue;
         }
@@ -179,10 +178,7 @@ fn find_version_satisfying_most<'a>(
         let mut hits = 0usize;
         let mut misses: Vec<usize> = Vec::new();
         for &i in &required_indices {
-            if reqs[i]
-                .range
-                .satisfies_with_latest_bound(v, info.latest_version.as_ref())
-            {
+            if info.range_satisfies(&reqs[i].range, v) {
                 hits += 1;
             } else {
                 misses.push(i);
@@ -208,11 +204,8 @@ fn peer_versions_by_npm_preference<'a>(
     reqs: &'a [&PeerRequirement],
 ) -> impl Iterator<Item = &'a NpmVersion> {
     let preferred_latest = info.latest_version.as_ref().filter(|latest| {
-        reqs.iter().any(|requirement| {
-            requirement
-                .range
-                .satisfies_with_latest_bound(latest, info.latest_version.as_ref())
-        })
+        reqs.iter()
+            .any(|requirement| info.range_satisfies(&requirement.range, latest))
     });
     preferred_latest.into_iter().chain(
         info.versions
@@ -225,15 +218,16 @@ fn newest_existing_version_for_requirement(
     state: &ResolveState,
     canonical: &CanonicalKey,
     requirement: &PeerRequirement,
-    latest_version: Option<&NpmVersion>,
+    info: Option<&CachedPackageInfo>,
 ) -> Option<(NpmVersion, NodeId)> {
     let nodes = state.resolved.get(canonical)?;
     nodes
         .iter()
         .filter(|(version, _)| {
-            requirement
-                .range
-                .satisfies_with_latest_bound(version, latest_version)
+            info.map_or_else(
+                || requirement.range.satisfies(version),
+                |info| info.range_satisfies(&requirement.range, version),
+            )
         })
         .max_by(|(left, _), (right, _)| left.cmp(right))
         .map(|(version, target)| (version.clone(), *target))
@@ -536,7 +530,7 @@ where
         apply_peer_overrides(state, &canonical, &mut reqs_owned, &mut fetch_manifest).await?;
         let info = if reqs_owned
             .iter()
-            .any(|requirement| requirement.range.is_latest_tag())
+            .any(|requirement| requirement.range.dist_tag().is_some())
         {
             Some(fetch_peer_manifest(state, canonical.clone(), &mut fetch_manifest).await?)
         } else {
@@ -548,8 +542,7 @@ where
                 state,
                 &canonical,
                 requirement,
-                info.as_deref()
-                    .and_then(|info| info.latest_version.as_ref()),
+                info.as_deref(),
             ) {
                 if !requirement.optional {
                     mark_node_required_closure(state, target);

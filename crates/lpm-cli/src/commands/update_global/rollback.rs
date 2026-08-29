@@ -1,7 +1,11 @@
 use super::prepare::{StagedUpgrade, UpgradePrep};
 use chrono::Utc;
-use lpm_common::{LpmError, LpmRoot};
-use lpm_global::{GlobalManifest, Shim, WalRecord, WalWriter, emit_shim, remove_shim, write_for};
+#[cfg(test)]
+use lpm_common::LpmError;
+use lpm_common::LpmRoot;
+use lpm_global::{GlobalManifest, Shim, WalRecord, emit_shim, remove_shim};
+#[cfg(test)]
+use lpm_global::{WalWriter, write_for};
 use std::collections::{HashMap, HashSet};
 
 /// Restore shims to point at the prior install root after an upgrade
@@ -88,6 +92,7 @@ pub(super) fn restore_prior_shims_after_aborted_upgrade(
     }
 }
 
+#[cfg(test)]
 pub(super) fn rollback_aborted_upgrade(
     root: &LpmRoot,
     manifest: &mut GlobalManifest,
@@ -95,6 +100,19 @@ pub(super) fn rollback_aborted_upgrade(
     package: &str,
     reason: &str,
 ) -> Result<(), LpmError> {
+    let record = abort_upgrade_in_manifest(manifest, staged, package, reason);
+    write_for(root, manifest)?;
+    let mut wal = WalWriter::open(root.global_wal())?;
+    wal.append(&record)?;
+    Ok(())
+}
+
+pub(super) fn abort_upgrade_in_manifest(
+    manifest: &mut GlobalManifest,
+    staged: &StagedUpgrade,
+    package: &str,
+    reason: &str,
+) -> WalRecord {
     // Tombstone pattern: don't try to remove
     // the install root inline (could be locked on Windows by a tool
     // the user is running). Tombstone it for `store gc`.
@@ -111,14 +129,11 @@ pub(super) fn rollback_aborted_upgrade(
             .push(staged.install_root_relative.clone());
     }
     manifest.pending.remove(package);
-    write_for(root, manifest)?;
-    let mut wal = WalWriter::open(root.global_wal())?;
-    wal.append(&WalRecord::Abort {
+    WalRecord::Abort {
         tx_id: staged.tx_id.clone(),
         reason: format!("commit-time validation failed: {reason}"),
         aborted_at: Utc::now(),
-    })?;
-    Ok(())
+    }
 }
 
 #[cfg(all(test, unix))]

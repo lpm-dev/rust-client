@@ -7,8 +7,7 @@
 //! these helpers without needing wiremock or filesystem fixtures.
 
 use crate::patch_engine;
-use lpm_lockfile::Lockfile;
-use lpm_registry::types::VersionMetadata;
+use lpm_registry::types::{PeerDependencyMeta, VersionMetadata};
 use lpm_workspace::PatchedDependencyEntry;
 use std::cmp::Ordering;
 use std::collections::HashMap;
@@ -109,9 +108,10 @@ pub struct PeerViolation {
 ///
 /// Range parse failures are tolerated as satisfaction success so we
 /// don't block an upgrade on an unparseable peer-dep range.
-pub fn compute_peer_impact(
+pub fn compute_peer_impact<'a>(
     target_peer_deps: &HashMap<String, String>,
-    lockfile: Option<&Lockfile>,
+    target_peer_meta: &HashMap<String, PeerDependencyMeta>,
+    mut installed_version: impl FnMut(&str) -> Option<&'a str>,
 ) -> PeerImpact {
     if target_peer_deps.is_empty() {
         return PeerImpact {
@@ -121,25 +121,27 @@ pub fn compute_peer_impact(
             violations: vec![],
         };
     }
-    let mut violations: Vec<PeerViolation> = Vec::new();
-    let mut missing: Vec<String> = Vec::new();
+    let mut violations = Vec::with_capacity(target_peer_deps.len());
+    let mut missing = Vec::with_capacity(target_peer_deps.len());
     for (peer_name, want_range) in target_peer_deps {
-        let installed = lockfile
-            .and_then(|lf| lf.find_package(peer_name))
-            .map(|p| p.version.clone());
-        match installed {
+        match installed_version(peer_name) {
+            None if target_peer_meta
+                .get(peer_name)
+                .is_some_and(|meta| meta.optional) => {}
             None => missing.push(peer_name.clone()),
             Some(have) => {
-                if !range_satisfies(want_range, &have) {
+                if !range_satisfies(want_range, have) {
                     violations.push(PeerViolation {
                         name: peer_name.clone(),
-                        have,
+                        have: have.to_string(),
                         want: want_range.clone(),
                     });
                 }
             }
         }
     }
+    missing.sort_unstable();
+    violations.sort_unstable_by(|left, right| left.name.cmp(&right.name));
     let ok = violations.is_empty() && missing.is_empty();
     PeerImpact {
         ok,
@@ -226,6 +228,7 @@ pub fn default_pre_check(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use lpm_lockfile::Lockfile;
 
     // ── classify_semver_change ────────────────────────────────────────
 
@@ -369,12 +372,23 @@ mod tests {
         lf
     }
 
+    fn compute_peer_impact_from_lockfile(
+        peers: &HashMap<String, String>,
+        lockfile: Option<&Lockfile>,
+    ) -> PeerImpact {
+        compute_peer_impact(peers, &HashMap::new(), |peer_name| {
+            lockfile
+                .and_then(|lockfile| lockfile.find_package(peer_name))
+                .map(|package| package.version.as_str())
+        })
+    }
+
     #[test]
     fn peer_impact_ok_when_all_satisfied() {
         let lf = make_lockfile(&[("react", "18.2.0")]);
         let mut peers = HashMap::new();
         peers.insert("react".into(), "^18.0.0".into());
-        let impact = compute_peer_impact(&peers, Some(&lf));
+        let impact = compute_peer_impact_from_lockfile(&peers, Some(&lf));
         assert!(impact.ok);
         assert_eq!(impact.basis, "current_lockfile");
     }
@@ -384,7 +398,7 @@ mod tests {
         let lf = make_lockfile(&[]);
         let mut peers = HashMap::new();
         peers.insert("react".into(), "^18.0.0".into());
-        let impact = compute_peer_impact(&peers, Some(&lf));
+        let impact = compute_peer_impact_from_lockfile(&peers, Some(&lf));
         assert!(!impact.ok);
         assert_eq!(impact.missing, vec!["react"]);
     }
@@ -394,7 +408,7 @@ mod tests {
         let lf = make_lockfile(&[("react", "17.0.2")]);
         let mut peers = HashMap::new();
         peers.insert("react".into(), "^18.0.0".into());
-        let impact = compute_peer_impact(&peers, Some(&lf));
+        let impact = compute_peer_impact_from_lockfile(&peers, Some(&lf));
         assert!(!impact.ok);
         assert_eq!(impact.violations.len(), 1);
         assert_eq!(impact.violations[0].name, "react");
@@ -404,13 +418,14 @@ mod tests {
 
     #[test]
     fn peer_impact_ok_when_no_peers() {
-        let impact = compute_peer_impact(&HashMap::new(), Some(&make_lockfile(&[])));
+        let lockfile = make_lockfile(&[]);
+        let impact = compute_peer_impact_from_lockfile(&HashMap::new(), Some(&lockfile));
         assert!(impact.ok);
     }
 
     #[test]
     fn peer_impact_ok_when_lockfile_none_and_no_peers() {
-        let impact = compute_peer_impact(&HashMap::new(), None);
+        let impact = compute_peer_impact_from_lockfile(&HashMap::new(), None);
         assert!(impact.ok);
     }
 
@@ -418,7 +433,7 @@ mod tests {
     fn peer_impact_missing_when_no_lockfile_and_peers_declared() {
         let mut peers = HashMap::new();
         peers.insert("react".into(), "^18.0.0".into());
-        let impact = compute_peer_impact(&peers, None);
+        let impact = compute_peer_impact_from_lockfile(&peers, None);
         assert!(!impact.ok);
         assert_eq!(impact.missing, vec!["react"]);
     }
@@ -428,7 +443,7 @@ mod tests {
         let lf = make_lockfile(&[("react", "18.2.0")]);
         let mut peers = HashMap::new();
         peers.insert("react".into(), ">>=18".into()); // garbage
-        let impact = compute_peer_impact(&peers, Some(&lf));
+        let impact = compute_peer_impact_from_lockfile(&peers, Some(&lf));
         // Unparseable range → treated as satisfied
         assert!(impact.ok);
     }
@@ -436,13 +451,39 @@ mod tests {
     #[test]
     fn peer_impact_basis_is_always_current_lockfile() {
         // The basis field is always "current_lockfile".
-        let impact = compute_peer_impact(&HashMap::new(), None);
+        let impact = compute_peer_impact_from_lockfile(&HashMap::new(), None);
         assert_eq!(impact.basis, "current_lockfile");
         let lf = make_lockfile(&[("react", "17.0.0")]);
         let mut peers = HashMap::new();
         peers.insert("react".into(), "^18.0.0".into());
-        let impact = compute_peer_impact(&peers, Some(&lf));
+        let impact = compute_peer_impact_from_lockfile(&peers, Some(&lf));
         assert_eq!(impact.basis, "current_lockfile");
+    }
+
+    #[test]
+    fn peer_impact_ignores_a_missing_optional_peer() {
+        let mut peers = HashMap::new();
+        peers.insert("react".into(), "^18.0.0".into());
+        let mut peer_meta = HashMap::new();
+        peer_meta.insert("react".into(), PeerDependencyMeta { optional: true });
+
+        let impact = compute_peer_impact(&peers, &peer_meta, |_| None);
+
+        assert!(impact.ok);
+        assert!(impact.missing.is_empty());
+    }
+
+    #[test]
+    fn peer_impact_reports_an_incompatible_installed_optional_peer() {
+        let mut peers = HashMap::new();
+        peers.insert("react".into(), "^18.0.0".into());
+        let mut peer_meta = HashMap::new();
+        peer_meta.insert("react".into(), PeerDependencyMeta { optional: true });
+
+        let impact = compute_peer_impact(&peers, &peer_meta, |_| Some("17.0.2"));
+
+        assert!(!impact.ok);
+        assert_eq!(impact.violations[0].name, "react");
     }
 
     // ── detect_patch_invalidation ────────────────────────────────────

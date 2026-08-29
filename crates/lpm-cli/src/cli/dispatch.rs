@@ -21,7 +21,8 @@ use super::helpers::{
     command_needs_global_state, install_omit_policy_from_cli, maybe_emit_network_fs_warning,
     print_version_with_notice, resolve_install_project_dir, resolve_tunnel_bearer,
     should_suppress_update_banner, spawn_background_update_check, tunnel_action_requires_session,
-    validate_global_install_project_scoped_flags, validate_global_uninstall_project_scoped_flags,
+    validate_global_install_project_scoped_flags, validate_global_install_unsupported_flags,
+    validate_global_uninstall_project_scoped_flags,
 };
 
 pub(crate) fn run() -> Result<()> {
@@ -411,18 +412,23 @@ async fn async_main() -> Result<()> {
     // (`--help`, `--version`, plain project install) so path
     // construction stays side-effect-free for the common case. Idempotent
     // when no recovery is needed (empty WAL → fast no-op).
-    if command_needs_global_state(&command)
-        && let Ok(root) = lpm_common::LpmRoot::from_env()
-    {
+    let global_state_root = command_needs_global_state(&command)
+        .then(lpm_common::LpmRoot::from_env)
+        .transpose()?;
+    let _global_state_directories = global_state_root
+        .as_ref()
+        .map(lpm_common::GlobalStateDirectories::open_or_create)
+        .transpose()?;
+    if let Some(root) = global_state_root.as_ref() {
         // one-time warning when $LPM_HOME sits on
         // NFS/SMB/CIFS — advisory locks on those filesystems are
         // famously unreliable and the install transaction's atomicity
         // guarantees degrade. Suppressed by a marker file after the
         // first emission so users in CI/enterprise environments are
         // not nagged on every invocation.
-        maybe_emit_network_fs_warning(&root);
+        maybe_emit_network_fs_warning(root);
 
-        match lpm_global::recover(&root) {
+        match lpm_global::recover(root) {
             Ok(report) => {
                 if !report.skipped_due_to_lock {
                     for tx in &report.reconciled {
@@ -713,6 +719,15 @@ async fn async_main() -> Result<()> {
                     catalog.is_some(),
                     omit_policy != commands::install::InstallOmitPolicy::default(),
                 )?;
+                validate_global_install_unsupported_flags(
+                    offline,
+                    force,
+                    skills,
+                    timing,
+                    audit_after_install,
+                    no_audit_after_install,
+                    workspace_concurrency,
+                )?;
                 if frozen_lockfile || no_frozen_lockfile {
                     return Err(lpm_common::LpmError::Script(
                         "`--frozen-lockfile` and `--no-frozen-lockfile` only apply to project installs."
@@ -727,19 +742,7 @@ async fn async_main() -> Result<()> {
                     &alias,
                 )
                 .map_err(lpm_common::LpmError::Script)?;
-                let _ = (
-                    offline,
-                    force,
-                    linker,
-                    skills,
-                    no_skills,
-                    no_editor_setup,
-                    no_security_summary,
-                    exact,
-                    tilde,
-                    save_prefix,
-                    catalog,
-                ); // not wired for global install; ignored for now.
+                let _ = (no_skills, no_editor_setup, no_security_summary, catalog);
 
                 let mut overrides = build_install_global_overrides_with_excludes(
                     allow_new,
@@ -756,6 +759,19 @@ async fn async_main() -> Result<()> {
                 )?;
                 overrides.strict_peer_dependencies_override = cli_strict_peer_dependencies;
                 overrides.no_engine_strict = no_engine_strict;
+                overrides.strict_integrity = strict_integrity;
+                overrides.linker_override = linker.map(LinkerCli::into_linker_mode);
+                overrides.save_flags = save_spec::SaveFlags {
+                    exact,
+                    tilde,
+                    save_prefix: save_prefix
+                        .as_deref()
+                        .map(save_spec::SavePrefix::parse)
+                        .transpose()?,
+                };
+                overrides.advisor_override = advisor;
+                overrides.strict_sandbox = strict_sandbox || paranoid;
+                overrides.no_sandbox = no_sandbox;
 
                 return commands::install_global::run(
                     &client,
@@ -1792,25 +1808,8 @@ async fn async_main() -> Result<()> {
         }
         Commands::Security(args) => commands::security::run(&args.action, cli.json).await,
         Commands::Cache(args) => {
-            let lifecycle_args::CacheArgs {
-                action,
-                subcategory,
-                apply,
-                max_age,
-                project,
-            } = args;
-            commands::cache::run(
-                &action,
-                subcategory.as_deref(),
-                cli.json,
-                commands::cache::PruneFlags {
-                    apply,
-                    max_age: max_age.as_deref(),
-                    project: project.as_deref(),
-                },
-                client.session().cloned(),
-            )
-            .await
+            let lifecycle_args::CacheArgs { action } = args;
+            commands::cache::run(action, cli.json, client.session().cloned()).await
         }
         Commands::Store(args) => {
             let lifecycle_args::StoreArgs { action } = args;

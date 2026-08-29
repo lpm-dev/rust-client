@@ -285,7 +285,7 @@ pub(super) fn command_needs_global_state(cmd: &Commands) -> bool {
         // a crashed install gets cleaned up before uninstall sees it
         // and bails with the in-flight-install error message.
         Commands::Uninstall(args) if args.global => true,
-        // Every `lpm global *` subcommand reads at minimum the manifest.
+        // Every `lpm global *` subcommand can observe or mutate global state.
         Commands::Global(_) => true,
         // `store verify` needs the manifest settled so the walker sees
         // the right per-package state. `cache prune` covers the
@@ -298,12 +298,18 @@ pub(super) fn command_needs_global_state(cmd: &Commands) -> bool {
         // `cache prune --apply` walks every globally-installed package's
         // lockfile + sweeps deferred tombstones — the manifest must be
         // settled before either step runs.
-        Commands::Cache(args) if args.action == "prune" => true,
+        Commands::Cache(args)
+            if matches!(&args.action, commands::cache::CacheCmd::Prune { .. }) =>
+        {
+            true
+        }
         // Any `cache clean` invocation, regardless of subcategory.
         // Bare `cache clean` cleans metadata + tasks + dlx + mcp, so the dlx
         // dir is always in scope; the per-subcategory form trivially is
         // too.
-        Commands::Cache(args) => args.action == "clean",
+        Commands::Cache(args) => {
+            matches!(&args.action, commands::cache::CacheCmd::Clean { .. })
+        }
         // Doctor is diagnostic unless the user explicitly selects one of its
         // catalogued fixes. Pre-dispatch recovery would mutate global state
         // before Doctor can report it and before fix consent is collected.
@@ -431,6 +437,12 @@ pub(super) fn build_install_global_overrides_with_excludes(
         // (project-shape) chain.
         script_policy_override: Some(resolved_policy),
         auto_build,
+        strict_integrity: false,
+        linker_override: None,
+        save_flags: crate::save_spec::SaveFlags::default(),
+        advisor_override: None,
+        strict_sandbox: false,
+        no_sandbox: false,
     })
 }
 
@@ -473,6 +485,42 @@ pub(super) fn validate_global_install_project_scoped_flags(
         ));
     }
     Ok(())
+}
+
+pub(super) fn validate_global_install_unsupported_flags(
+    offline: bool,
+    force: bool,
+    skills: bool,
+    timing: bool,
+    audit_after_install: bool,
+    no_audit_after_install: bool,
+    workspace_concurrency: Option<std::num::NonZeroUsize>,
+) -> Result<(), lpm_common::LpmError> {
+    let unsupported = [
+        (offline, "--offline"),
+        (force, "--force"),
+        (skills, "--skills"),
+        (timing, "--timing"),
+        (audit_after_install, "--audit-after-install"),
+        (no_audit_after_install, "--no-audit-after-install"),
+        (workspace_concurrency.is_some(), "--workspace-concurrency"),
+    ]
+    .into_iter()
+    .filter_map(|(enabled, flag)| enabled.then_some(flag))
+    .collect::<Vec<_>>();
+    if unsupported.is_empty() {
+        return Ok(());
+    }
+    Err(lpm_common::LpmError::Script(format!(
+        "{} {} not supported by `lpm install -g`; remove {} or run a project install instead",
+        unsupported.join(", "),
+        if unsupported.len() == 1 { "is" } else { "are" },
+        if unsupported.len() == 1 {
+            "that flag"
+        } else {
+            "those flags"
+        },
+    )))
 }
 
 pub(super) fn validate_global_uninstall_project_scoped_flags(

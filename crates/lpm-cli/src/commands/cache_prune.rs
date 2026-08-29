@@ -52,8 +52,13 @@ use lpm_common::{
     LpmError, LpmRoot, known_projects, sanitize_for_terminal, with_exclusive_lock, with_shared_lock,
 };
 use lpm_store::v2::Store as V2Store;
+use serde::Serialize;
+use serde::ser::SerializeSeq;
 use std::collections::HashSet;
+use std::ffi::OsStr;
+use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use super::cache::PruneFlags;
@@ -159,6 +164,7 @@ pub struct PruneSummary {
     /// without this field the JSON envelope would look identical to a
     /// successful no-op sweep.
     pub tombstone_sweep_error: Option<String>,
+    live_graph_keys: HashSet<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -174,6 +180,34 @@ pub enum PruneAnalysis {
     Available,
     RegistryMissing,
     RegistryCorrupt(String),
+}
+
+struct PruneLinkEntry {
+    raw_dir: PathBuf,
+    graph_key_digest_hex: String,
+    dependency_graph_keys: Vec<String>,
+    object_segment: String,
+    last_referenced_at: Option<chrono::DateTime<Utc>>,
+}
+
+struct PruneDiscovery {
+    projects: Arc<[PathBuf]>,
+    root_link_dirs: Vec<HashSet<PathBuf>>,
+    registry_entries_dropped: usize,
+    analysis: PruneAnalysis,
+    tombstones_pending: usize,
+    tombstone_count_error: Option<String>,
+    #[cfg(test)]
+    project_scans: usize,
+}
+
+struct StoreDiscovery {
+    projects: Arc<[PathBuf]>,
+    root_link_dirs: HashSet<PathBuf>,
+    registry_entries_dropped: usize,
+    analysis: PruneAnalysis,
+    tombstones_pending: usize,
+    tombstone_count_error: Option<String>,
 }
 
 /// Entry point for the CLI dispatcher. Resolves both virtual stores + flags,
@@ -193,9 +227,9 @@ pub async fn run(root: &LpmRoot, json_output: bool, flags: PruneFlags<'_>) -> Re
     let summary = execute_prune(root, &flags)?;
 
     if json_output {
-        emit_json(&summary);
+        emit_json(&summary)?;
     } else {
-        emit_human(&summary, flags.apply, start.elapsed());
+        emit_human(&summary, flags.apply, start.elapsed())?;
     }
 
     if prune_had_errors(&summary) {
@@ -256,8 +290,29 @@ fn run_all_virtual_stores_locked(
         .apply
         .then(|| filesystem_available_bytes(v3_store.paths().root()))
         .flatten();
-    let v2 = run_locked(root, v2_store, flags, max_age, false)?;
-    let v3 = run_locked(root, v3_store, flags, max_age, true)?;
+    let stores = [v2_store, v3_store];
+    let discovery = discover_prune_inputs(root, &stores, flags, true)?;
+    let mut roots = discovery.root_link_dirs.into_iter();
+    let v2_roots = roots.next().expect("v2 store must have a root set");
+    let v3_roots = roots.next().expect("v3 store must have a root set");
+    debug_assert!(roots.next().is_none());
+    let common = |root_link_dirs| StoreDiscovery {
+        projects: Arc::clone(&discovery.projects),
+        root_link_dirs,
+        registry_entries_dropped: discovery.registry_entries_dropped,
+        analysis: discovery.analysis.clone(),
+        tombstones_pending: discovery.tombstones_pending,
+        tombstone_count_error: discovery.tombstone_count_error.clone(),
+    };
+    let v2 = run_locked(
+        root,
+        v2_store,
+        flags,
+        max_age,
+        false,
+        Some(common(v2_roots)),
+    )?;
+    let v3 = run_locked(root, v3_store, flags, max_age, true, Some(common(v3_roots)))?;
     let mut summary = merge_prune_summaries(v2, v3);
     summary.observed_physical_bytes_freed = free_before.and_then(|before| {
         filesystem_available_bytes(v3_store.paths().root())?.checked_sub(before)
@@ -333,6 +388,7 @@ fn merge_prune_summaries(mut left: PruneSummary, right: PruneSummary) -> PruneSu
     }
     left.tombstone_count_error = left.tombstone_count_error.or(right.tombstone_count_error);
     left.tombstone_sweep_error = left.tombstone_sweep_error.or(right.tombstone_sweep_error);
+    left.live_graph_keys.extend(right.live_graph_keys);
     left
 }
 
@@ -348,25 +404,24 @@ fn run_locked(
     flags: &PruneFlags<'_>,
     max_age: Option<ChronoDuration>,
     handle_tombstones: bool,
+    discovery: Option<StoreDiscovery>,
 ) -> Result<PruneSummary, LpmError> {
-    let mut summary = compute_prune_plan(root, v2_store, flags, max_age)?;
+    let mut summary = compute_prune(root, v2_store, flags, max_age, true, discovery)
+        .map(|(summary, _)| summary)?;
 
-    if !summary.registry_missing && !summary.registry_corrupt {
-        let objects_to_remove = summary
-            .object_entries_orphaned
-            .iter()
-            .cloned()
-            .collect::<HashSet<_>>();
-        if let Some(cas_plan) = v2_store.file_cas_prune_plan(&objects_to_remove)? {
-            summary.cas_trees_total = cas_plan.trees_total;
-            summary.cas_blobs_total = cas_plan.blobs_total;
-            summary.cas_tree_files_orphaned = cas_plan.tree_files_orphaned;
-            summary.cas_blob_files_orphaned = cas_plan.blob_files_orphaned;
-            summary.cas_source_record_files_orphaned = cas_plan.source_record_files_orphaned;
-            summary.cas_source_validation_files_orphaned =
-                cas_plan.source_validation_files_orphaned;
-            summary.cas_materialized_total = cas_plan.materialized_total;
-            summary.cas_materialized_entries_orphaned = cas_plan.materialized_entries_orphaned;
+    if !summary.registry_missing
+        && !summary.registry_corrupt
+        && let Some(cas_plan) = v2_store.file_cas_prune_plan(&summary.object_entries_orphaned)?
+    {
+        summary.cas_trees_total = cas_plan.trees_total;
+        summary.cas_blobs_total = cas_plan.blobs_total;
+        summary.cas_tree_files_orphaned = cas_plan.tree_files_orphaned;
+        summary.cas_blob_files_orphaned = cas_plan.blob_files_orphaned;
+        summary.cas_source_record_files_orphaned = cas_plan.source_record_files_orphaned;
+        summary.cas_source_validation_files_orphaned = cas_plan.source_validation_files_orphaned;
+        summary.cas_materialized_total = cas_plan.materialized_total;
+        summary.cas_materialized_entries_orphaned = cas_plan.materialized_entries_orphaned;
+        if !flags.apply {
             for path in summary
                 .cas_tree_files_orphaned
                 .iter()
@@ -387,8 +442,11 @@ fn run_locked(
     }
 
     if flags.apply {
-        let prune_tombstones = v2_store.paths().root().join(".prune-tombstones");
-        sweep_prune_tombstones(&prune_tombstones)?;
+        summary.bytes_freed_or_eligible = 0;
+        let prune_tombstone_path = v2_store.paths().root().join(".prune-tombstones");
+        let prune_tombstones = PruneTombstones::open(&prune_tombstone_path, true)?
+            .expect("creating the prune tombstone root must return an open directory");
+        prune_tombstones.sweep()?;
         // When the registry is missing OR corrupt AND no explicit
         // `--project` was given, `compute_prune_plan` skipped the
         // reachability walk and `link_entries_orphaned` /
@@ -398,25 +456,46 @@ fn run_locked(
         // of project reachability.
         if !summary.registry_missing && !summary.registry_corrupt {
             for orphan in &summary.link_entries_orphaned {
-                remove_via_prune_tombstone(orphan, &prune_tombstones)?;
+                add_removed_bytes(
+                    &mut summary.bytes_freed_or_eligible,
+                    prune_tombstones.remove(orphan)?,
+                );
             }
             for orphan in &summary.object_entries_orphaned {
-                remove_via_prune_tombstone(orphan, &prune_tombstones)?;
+                add_removed_bytes(
+                    &mut summary.bytes_freed_or_eligible,
+                    prune_tombstones.remove(orphan)?,
+                );
             }
             for source_record in &summary.cas_source_record_files_orphaned {
-                remove_via_prune_tombstone(source_record, &prune_tombstones)?;
+                add_removed_bytes(
+                    &mut summary.bytes_freed_or_eligible,
+                    prune_tombstones.remove(source_record)?,
+                );
             }
             for validation in &summary.cas_source_validation_files_orphaned {
-                remove_via_prune_tombstone(validation, &prune_tombstones)?;
+                add_removed_bytes(
+                    &mut summary.bytes_freed_or_eligible,
+                    prune_tombstones.remove(validation)?,
+                );
             }
             for entry in &summary.cas_materialized_entries_orphaned {
-                remove_via_prune_tombstone(entry, &prune_tombstones)?;
+                add_removed_bytes(
+                    &mut summary.bytes_freed_or_eligible,
+                    prune_tombstones.remove(entry)?,
+                );
             }
             for manifest in &summary.cas_tree_files_orphaned {
-                remove_via_prune_tombstone(manifest, &prune_tombstones)?;
+                add_removed_bytes(
+                    &mut summary.bytes_freed_or_eligible,
+                    prune_tombstones.remove(manifest)?,
+                );
             }
             for blob in &summary.cas_blob_files_orphaned {
-                remove_via_prune_tombstone(blob, &prune_tombstones)?;
+                add_removed_bytes(
+                    &mut summary.bytes_freed_or_eligible,
+                    prune_tombstones.remove(blob)?,
+                );
             }
         }
 
@@ -425,13 +504,19 @@ fn run_locked(
         // (never reachability), so a missing/corrupt registry can't make it
         // wrongly wipe a live island.
         for island in &summary.compat_islands_orphaned {
-            remove_via_prune_tombstone(island, &prune_tombstones)?;
+            add_removed_bytes(
+                &mut summary.bytes_freed_or_eligible,
+                prune_tombstones.remove(island)?,
+            );
         }
         for artifact in &summary.build_artifacts_orphaned {
-            remove_via_prune_tombstone(artifact, &prune_tombstones)?;
+            add_removed_bytes(
+                &mut summary.bytes_freed_or_eligible,
+                prune_tombstones.remove(artifact)?,
+            );
         }
         remove_orphaned_build_locks(v2_store)?;
-        remove_orphaned_build_entry_locks(v2_store)?;
+        remove_orphaned_build_entry_locks(v2_store, &summary.live_graph_keys)?;
 
         // Sweep deferred global-uninstall tombstones. Errors are
         // surfaced via `summary.tombstone_sweep_error` (and a
@@ -464,58 +549,130 @@ fn run_locked(
     Ok(summary)
 }
 
-fn remove_via_prune_tombstone(path: &Path, tombstone_root: &Path) -> Result<(), LpmError> {
-    use rand::RngCore;
-
-    ensure_prune_tombstone_root(tombstone_root)?;
-    let suffix = rand::thread_rng().next_u64();
-    let label = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("entry");
-    let tombstone = tombstone_root.join(format!("{label}.{suffix:016x}"));
-    match std::fs::rename(path, &tombstone) {
-        Ok(()) => remove_prune_tombstone(&tombstone),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(LpmError::Store(format!(
-            "cache prune: failed to tombstone {}: {error}",
-            path.display()
-        ))),
-    }
+fn add_removed_bytes(total: &mut u64, removed: u64) {
+    *total = total.saturating_add(removed);
 }
 
-fn ensure_prune_tombstone_root(path: &Path) -> Result<(), LpmError> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
-        let mut builder = std::fs::DirBuilder::new();
-        builder.recursive(true).mode(0o700).create(path)?;
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))?;
-    }
-    #[cfg(not(unix))]
-    std::fs::create_dir_all(path)?;
-    Ok(())
-}
-
+#[cfg(test)]
 fn sweep_prune_tombstones(tombstone_root: &Path) -> Result<(), LpmError> {
-    let entries = match std::fs::read_dir(tombstone_root) {
-        Ok(entries) => entries,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(error) => return Err(error.into()),
-    };
-    for entry in entries {
-        remove_prune_tombstone(&entry?.path())?;
+    if let Some(tombstones) = PruneTombstones::open(tombstone_root, false)? {
+        tombstones.sweep()?;
     }
     Ok(())
 }
 
-fn remove_prune_tombstone(path: &Path) -> Result<(), LpmError> {
-    let metadata = std::fs::symlink_metadata(path)?;
-    if metadata.file_type().is_dir() {
-        std::fs::remove_dir_all(path)?;
-    } else {
-        std::fs::remove_file(path)?;
+struct PruneTombstones {
+    directory: cap_std::fs::Dir,
+    path: PathBuf,
+}
+
+impl PruneTombstones {
+    fn open(path: &Path, create: bool) -> Result<Option<Self>, LpmError> {
+        let parent_path = path.parent().ok_or_else(|| {
+            LpmError::Store(format!(
+                "cache prune tombstone root has no parent: {}",
+                path.display()
+            ))
+        })?;
+        if create {
+            std::fs::create_dir_all(parent_path)?;
+        }
+        let parent =
+            match cap_std::fs::Dir::open_ambient_dir(parent_path, cap_std::ambient_authority()) {
+                Ok(parent) => parent,
+                Err(error) if !create && error.kind() == std::io::ErrorKind::NotFound => {
+                    return Ok(None);
+                }
+                Err(error) => return Err(error.into()),
+            };
+        let name = path.file_name().ok_or_else(|| {
+            LpmError::Store(format!(
+                "cache prune tombstone root has no name: {}",
+                path.display()
+            ))
+        })?;
+        let directory = if create {
+            super::cache::open_or_create_directory(
+                &parent,
+                name,
+                path,
+                "cache prune tombstone root",
+            )?
+        } else {
+            use cap_fs_ext::DirExt as _;
+
+            match parent.open_dir_nofollow(name) {
+                Ok(directory) => directory,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+                Err(error) => {
+                    return Err(LpmError::Store(format!(
+                        "refusing cache prune tombstone root at {}: {error}",
+                        path.display()
+                    )));
+                }
+            }
+        };
+        restrict_prune_tombstone_directory(&directory)?;
+        Ok(Some(Self {
+            directory,
+            path: path.to_path_buf(),
+        }))
     }
+
+    fn sweep(&self) -> Result<(), LpmError> {
+        for entry in self.directory.entries()? {
+            let entry = entry?;
+            super::cache::remove_open_entry_with_size(&self.directory, &entry.file_name())?;
+        }
+        Ok(())
+    }
+
+    fn remove(&self, path: &Path) -> Result<u64, LpmError> {
+        use rand::RngCore;
+
+        let parent_path = path.parent().ok_or_else(|| {
+            LpmError::Store(format!(
+                "cache prune target has no parent: {}",
+                path.display()
+            ))
+        })?;
+        let source_name = path.file_name().ok_or_else(|| {
+            LpmError::Store(format!(
+                "cache prune target has no name: {}",
+                path.display()
+            ))
+        })?;
+        let source_parent =
+            cap_std::fs::Dir::open_ambient_dir(parent_path, cap_std::ambient_authority())?;
+        let suffix = rand::thread_rng().next_u64();
+        let label = source_name.to_string_lossy();
+        let tombstone_name = format!("{label}.{suffix:016x}");
+        match source_parent.rename(source_name, &self.directory, OsStr::new(&tombstone_name)) {
+            Ok(()) => Ok(super::cache::remove_open_entry_with_size(
+                &self.directory,
+                OsStr::new(&tombstone_name),
+            )?
+            .unwrap_or(0)),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(0),
+            Err(error) => Err(LpmError::Store(format!(
+                "cache prune: failed to tombstone {} under {}: {error}",
+                path.display(),
+                self.path.display()
+            ))),
+        }
+    }
+}
+
+#[cfg(unix)]
+fn restrict_prune_tombstone_directory(directory: &cap_std::fs::Dir) -> Result<(), LpmError> {
+    use cap_std::fs::PermissionsExt as _;
+
+    directory.set_permissions(".", cap_std::fs::Permissions::from_mode(0o700))?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn restrict_prune_tombstone_directory(_directory: &cap_std::fs::Dir) -> Result<(), LpmError> {
     Ok(())
 }
 
@@ -541,22 +698,10 @@ fn remove_orphaned_build_locks(store: &V2Store) -> Result<(), LpmError> {
     Ok(())
 }
 
-fn remove_orphaned_build_entry_locks(store: &V2Store) -> Result<(), LpmError> {
-    let mut live_graph_keys = HashSet::new();
-    match std::fs::read_dir(store.paths().links_root()) {
-        Ok(entries) => {
-            for entry in entries.flatten() {
-                if !entry.file_type().is_ok_and(|file_type| file_type.is_dir()) {
-                    continue;
-                }
-                if let Ok(metadata) = lpm_store::v2::LinkMeta::read_from(&entry.path()) {
-                    live_graph_keys.insert(metadata.graph_key_digest_hex);
-                }
-            }
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => return Err(error.into()),
-    }
+fn remove_orphaned_build_entry_locks(
+    store: &V2Store,
+    live_graph_keys: &HashSet<String>,
+) -> Result<(), LpmError> {
     let entries = match std::fs::read_dir(store.paths().build_entry_locks_root()) {
         Ok(entries) => entries,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
@@ -593,13 +738,14 @@ fn advisory_lock_key(path: &Path) -> Option<&str> {
 /// Compute (but don't apply) the prune plan. Pulled out so unit tests
 /// exercise the algorithm against synthetic stores without touching
 /// the filesystem outside of a tempdir.
+#[cfg(test)]
 pub fn compute_prune_plan(
     root: &LpmRoot,
     v2_store: &V2Store,
     flags: &PruneFlags<'_>,
     max_age: Option<ChronoDuration>,
 ) -> Result<PruneSummary, LpmError> {
-    compute_prune(root, v2_store, flags, max_age, true, None, None).map(|(summary, _)| summary)
+    compute_prune(root, v2_store, flags, max_age, true, None).map(|(summary, _)| summary)
 }
 
 #[cfg(test)]
@@ -609,55 +755,19 @@ pub fn compute_prune_stats(
     flags: &PruneFlags<'_>,
     max_age: Option<ChronoDuration>,
 ) -> Result<PruneStats, LpmError> {
-    compute_prune(root, v2_store, flags, max_age, false, None, None).map(|(_, stats)| stats)
+    compute_prune(root, v2_store, flags, max_age, false, None).map(|(_, stats)| stats)
 }
 
 pub fn compute_prune_stats_for_stores(
     root: &LpmRoot,
     stores: &[V2Store],
 ) -> Result<Vec<PruneStats>, LpmError> {
-    let registry = match known_projects::try_load(&root.known_projects()) {
-        Ok(registry) => registry,
-        Err(known_projects::LoadError::NotFound) => {
-            return Ok(stores
-                .iter()
-                .map(|_| PruneStats {
-                    analysis: PruneAnalysis::RegistryMissing,
-                    ..PruneStats::default()
-                })
-                .collect());
-        }
-        Err(error) => {
-            let reason = error.to_string();
-            return Ok(stores
-                .iter()
-                .map(|_| PruneStats {
-                    analysis: PruneAnalysis::RegistryCorrupt(reason.clone()),
-                    ..PruneStats::default()
-                })
-                .collect());
-        }
-    };
-    let projects: Vec<_> = registry
-        .projects
-        .into_iter()
-        .filter_map(|entry| entry.path.exists().then_some(entry.path))
-        .collect();
-    let links_roots: Vec<_> = stores
-        .iter()
-        .map(|store| {
-            std::fs::canonicalize(store.paths().links_root())
-                .unwrap_or_else(|_| store.paths().links_root())
-        })
-        .collect();
-    let mut link_roots = vec![HashSet::new(); stores.len()];
-    for project in &projects {
-        collect_project_link_roots_for_stores(project, &links_roots, &mut link_roots);
-    }
     let flags = PruneFlags::default();
+    let store_refs = stores.iter().collect::<Vec<_>>();
+    let discovery = discover_prune_inputs(root, &store_refs, &flags, false)?;
     stores
         .iter()
-        .zip(link_roots)
+        .zip(discovery.root_link_dirs)
         .map(|(store, roots)| {
             compute_prune(
                 root,
@@ -665,12 +775,96 @@ pub fn compute_prune_stats_for_stores(
                 &flags,
                 None,
                 false,
-                Some(&projects),
-                Some(roots),
+                Some(StoreDiscovery {
+                    projects: Arc::clone(&discovery.projects),
+                    root_link_dirs: roots,
+                    registry_entries_dropped: discovery.registry_entries_dropped,
+                    analysis: discovery.analysis.clone(),
+                    tombstones_pending: discovery.tombstones_pending,
+                    tombstone_count_error: discovery.tombstone_count_error.clone(),
+                }),
             )
             .map(|(_, stats)| stats)
         })
         .collect()
+}
+
+fn discover_prune_inputs(
+    root: &LpmRoot,
+    stores: &[&V2Store],
+    flags: &PruneFlags<'_>,
+    count_tombstones: bool,
+) -> Result<PruneDiscovery, LpmError> {
+    let registry_path = root.known_projects();
+    let mut projects = Vec::new();
+    let mut registry_entries_dropped = 0usize;
+    let mut analysis = PruneAnalysis::Available;
+
+    if let Some(explicit) = flags.project {
+        let project = std::fs::canonicalize(explicit).map_err(|error| {
+            LpmError::Io(std::io::Error::new(
+                error.kind(),
+                format!("cache prune: --project {explicit} unreadable: {error}"),
+            ))
+        })?;
+        projects.push(project);
+    } else {
+        match known_projects::try_load(&registry_path) {
+            Ok(mut registry) => {
+                let before = registry.projects.len();
+                registry.projects.retain(|entry| entry.path.exists());
+                registry_entries_dropped = before.saturating_sub(registry.projects.len());
+                projects.reserve(registry.projects.len());
+                projects.extend(registry.projects.iter().map(|entry| entry.path.clone()));
+                if flags.apply && registry_entries_dropped > 0 {
+                    known_projects::write(&registry_path, &registry)?;
+                }
+            }
+            Err(known_projects::LoadError::NotFound) => {
+                analysis = PruneAnalysis::RegistryMissing;
+            }
+            Err(error) => {
+                analysis = PruneAnalysis::RegistryCorrupt(error.to_string());
+            }
+        }
+    }
+
+    let links_roots = stores
+        .iter()
+        .map(|store| {
+            std::fs::canonicalize(store.paths().links_root())
+                .unwrap_or_else(|_| store.paths().links_root())
+        })
+        .collect::<Vec<_>>();
+    let mut root_link_dirs = vec![HashSet::new(); stores.len()];
+    #[cfg(test)]
+    let mut project_scans = 0usize;
+    if analysis == PruneAnalysis::Available {
+        for project in &projects {
+            collect_project_link_roots_for_stores(project, &links_roots, &mut root_link_dirs);
+            #[cfg(test)]
+            {
+                project_scans = project_scans.saturating_add(1);
+            }
+        }
+    }
+
+    let (tombstones_pending, tombstone_count_error) = if count_tombstones {
+        count_tombstones_with_error_capture(root)
+    } else {
+        (0, None)
+    };
+
+    Ok(PruneDiscovery {
+        projects: projects.into(),
+        root_link_dirs,
+        registry_entries_dropped,
+        analysis,
+        tombstones_pending,
+        tombstone_count_error,
+        #[cfg(test)]
+        project_scans,
+    })
 }
 
 fn compute_prune(
@@ -679,160 +873,110 @@ fn compute_prune(
     flags: &PruneFlags<'_>,
     max_age: Option<ChronoDuration>,
     build_full_plan: bool,
-    projects_override: Option<&[PathBuf]>,
-    root_link_dirs_override: Option<HashSet<PathBuf>>,
+    discovery: Option<StoreDiscovery>,
 ) -> Result<(PruneSummary, PruneStats), LpmError> {
-    // ── Step 1: Collect root projects ────────────────────────────────
-    let registry_path = root.known_projects();
-    let mut projects: Vec<PathBuf> = Vec::new();
-    let mut registry_entries_dropped = 0usize;
-
-    let mut registry_missing = false;
-    let mut registry_corrupt = false;
-    let mut registry_corrupt_reason = String::new();
-    if let Some(projects_snapshot) = projects_override {
-        projects.extend_from_slice(projects_snapshot);
-    } else if let Some(explicit) = flags.project {
-        // Manual repair mode: ignore the registry.
-        let p = std::fs::canonicalize(explicit).map_err(|e| {
-            LpmError::Io(std::io::Error::new(
-                e.kind(),
-                format!("cache prune: --project {explicit} unreadable: {e}"),
-            ))
-        })?;
-        projects.push(p);
-    } else {
-        // Default mode, registry-backed. Dry-run must not mutate the
-        // registry — the shared store lock allows multiple readers
-        // (installs, audits, queries) to run concurrently, and a
-        // concurrent install's `register()` write could race a
-        // dry-run's `drop_missing()` rewrite and lose the freshly
-        // registered project. Read-only walk in dry-run; conditional
-        // rewrite in `--apply` (under the exclusive store lock, where
-        // installs are blocked from holding the shared half).
-        //
-        // `try_load` distinguishes missing-vs-corrupt. The lossy
-        // [`known_projects::load`] used by the install path collapses
-        // both to an empty registry — fine for installs (they degrade
-        // to "no recorded projects yet"), DANGEROUS for prune
-        // (`--apply` would treat the empty root set as authoritative
-        // and mark every link entry as orphaned). Both degraded
-        // states here skip the orphan walk; the corrupt branch also
-        // emits an actionable reason so the user knows to delete the
-        // file or pass `--project`.
-        match known_projects::try_load(&registry_path) {
-            Ok(registry) => {
-                let mut missing_count = 0usize;
-                for entry in &registry.projects {
-                    if entry.path.exists() {
-                        projects.push(entry.path.clone());
-                    } else {
-                        missing_count += 1;
-                    }
-                }
-                if flags.apply && missing_count > 0 {
-                    registry_entries_dropped = known_projects::drop_missing(&registry_path)?;
-                } else {
-                    registry_entries_dropped = missing_count;
-                }
-            }
-            Err(known_projects::LoadError::NotFound) => {
-                registry_missing = true;
-            }
-            Err(other) => {
-                registry_corrupt = true;
-                registry_corrupt_reason = other.to_string();
+    let discovery = match discovery {
+        Some(discovery) => discovery,
+        None => {
+            let stores = [v2_store];
+            let discovery = discover_prune_inputs(root, &stores, flags, build_full_plan)?;
+            let mut roots = discovery.root_link_dirs.into_iter();
+            let root_link_dirs = roots.next().expect("store must have a root set");
+            debug_assert!(roots.next().is_none());
+            StoreDiscovery {
+                projects: discovery.projects,
+                root_link_dirs,
+                registry_entries_dropped: discovery.registry_entries_dropped,
+                analysis: discovery.analysis,
+                tombstones_pending: discovery.tombstones_pending,
+                tombstone_count_error: discovery.tombstone_count_error,
             }
         }
+    };
+    let registry_missing = discovery.analysis == PruneAnalysis::RegistryMissing;
+    let registry_corrupt_reason = match &discovery.analysis {
+        PruneAnalysis::RegistryCorrupt(reason) => reason.clone(),
+        _ => String::new(),
+    };
+    let registry_corrupt = !registry_corrupt_reason.is_empty();
+    let registry_entries_dropped = discovery.registry_entries_dropped;
+    let tombstones_pending = discovery.tombstones_pending;
+    let tombstone_count_error = discovery.tombstone_count_error;
+    let projects = discovery.projects;
+    let root_link_dirs = discovery.root_link_dirs;
+    let analysis = discovery.analysis;
 
-        if registry_missing || registry_corrupt {
-            // No usable roots — return an empty plan that
-            // [`run_locked`] will treat as tombstone-only. The
-            // tombstone count is populated so dry-run still surfaces
-            // the work `--apply` will do.
-            let (tombstones_pending, tombstone_count_error) = if build_full_plan {
-                count_tombstones_with_error_capture(root)
-            } else {
-                (0, None)
-            };
-            let (compat_islands_total, compat_islands_orphaned) = if build_full_plan {
-                compute_compat_island_orphans(v2_store.paths().compat_root(), max_age)
-            } else {
-                (0, Vec::new())
-            };
-            let (build_artifacts_total, build_artifacts_orphaned) = if build_full_plan {
-                compute_build_artifact_orphans(v2_store.paths().builds_root(), max_age)
-            } else {
-                (0, Vec::new())
-            };
-            let bytes_freed_or_eligible = if build_full_plan {
-                compat_islands_orphaned
-                    .iter()
-                    .chain(&build_artifacts_orphaned)
-                    .map(|dir| dir_size(dir).unwrap_or(0))
-                    .fold(0u64, u64::saturating_add)
-            } else {
-                0
-            };
-            let analysis = if registry_corrupt {
-                PruneAnalysis::RegistryCorrupt(registry_corrupt_reason.clone())
-            } else {
-                PruneAnalysis::RegistryMissing
-            };
-            return Ok((
-                PruneSummary {
-                    applied: false,
-                    projects_walked: 0,
-                    registry_entries_dropped: 0,
-                    link_entries_total: 0,
-                    link_entries_reachable: 0,
-                    link_entries_orphaned: Vec::new(),
-                    object_entries_total: 0,
-                    object_entries_reachable: 0,
-                    object_entries_orphaned: Vec::new(),
-                    cas_trees_total: 0,
-                    cas_tree_files_orphaned: Vec::new(),
-                    cas_blobs_total: 0,
-                    cas_blob_files_orphaned: Vec::new(),
-                    cas_source_record_files_orphaned: Vec::new(),
-                    cas_source_validation_files_orphaned: Vec::new(),
-                    cas_materialized_total: 0,
-                    cas_materialized_entries_orphaned: Vec::new(),
-                    compat_islands_total,
-                    compat_islands_orphaned,
-                    build_artifacts_total,
-                    build_artifacts_orphaned,
-                    bytes_freed_or_eligible,
-                    observed_physical_bytes_freed: None,
-                    tombstones_pending,
-                    tombstones_swept: 0,
-                    tombstones_retained: Vec::new(),
-                    tombstone_bytes_freed: 0,
-                    registry_missing,
-                    registry_corrupt,
-                    registry_corrupt_reason,
-                    tombstone_count_error,
-                    tombstone_sweep_error: None,
-                },
-                PruneStats {
-                    analysis,
-                    ..PruneStats::default()
-                },
-            ));
-        }
+    if registry_missing || registry_corrupt {
+        // No usable roots — return an empty plan that
+        // [`run_locked`] will treat as tombstone-only. The
+        // tombstone count is populated so dry-run still surfaces
+        // the work `--apply` will do.
+        let (compat_islands_total, compat_islands_orphaned) = if build_full_plan {
+            compute_compat_island_orphans(v2_store.paths().compat_root(), max_age)
+        } else {
+            (0, Vec::new())
+        };
+        let (build_artifacts_total, build_artifacts_orphaned) = if build_full_plan {
+            compute_build_artifact_orphans(v2_store.paths().builds_root(), max_age)
+        } else {
+            (0, Vec::new())
+        };
+        let bytes_freed_or_eligible = if build_full_plan && !flags.apply {
+            compat_islands_orphaned
+                .iter()
+                .chain(&build_artifacts_orphaned)
+                .map(|dir| dir_size(dir).unwrap_or(0))
+                .fold(0u64, u64::saturating_add)
+        } else {
+            0
+        };
+        return Ok((
+            PruneSummary {
+                applied: false,
+                projects_walked: 0,
+                registry_entries_dropped,
+                link_entries_total: 0,
+                link_entries_reachable: 0,
+                link_entries_orphaned: Vec::new(),
+                object_entries_total: 0,
+                object_entries_reachable: 0,
+                object_entries_orphaned: Vec::new(),
+                cas_trees_total: 0,
+                cas_tree_files_orphaned: Vec::new(),
+                cas_blobs_total: 0,
+                cas_blob_files_orphaned: Vec::new(),
+                cas_source_record_files_orphaned: Vec::new(),
+                cas_source_validation_files_orphaned: Vec::new(),
+                cas_materialized_total: 0,
+                cas_materialized_entries_orphaned: Vec::new(),
+                compat_islands_total,
+                compat_islands_orphaned,
+                build_artifacts_total,
+                build_artifacts_orphaned,
+                bytes_freed_or_eligible,
+                observed_physical_bytes_freed: None,
+                tombstones_pending,
+                tombstones_swept: 0,
+                tombstones_retained: Vec::new(),
+                tombstone_bytes_freed: 0,
+                registry_missing,
+                registry_corrupt,
+                registry_corrupt_reason,
+                tombstone_count_error,
+                tombstone_sweep_error: None,
+                live_graph_keys: HashSet::new(),
+            },
+            PruneStats {
+                analysis,
+                ..PruneStats::default()
+            },
+        ));
     }
 
-    // ── Step 2: Walk each project's `node_modules/` to collect root
-    //         graph-keys (link entries reachable from project roots).
+    // ── Step 2: Use the root graph-keys discovered for all stores in
+    //         one shared project walk.
     let links_root_canonical = std::fs::canonicalize(v2_store.paths().links_root())
         .unwrap_or_else(|_| v2_store.paths().links_root());
-    let root_link_dirs = root_link_dirs_override.unwrap_or_else(|| {
-        let mut roots = HashSet::new();
-        for project in &projects {
-            collect_project_link_roots(project, &links_root_canonical, &mut roots);
-        }
-        roots
-    });
 
     // ── Step 3: BFS through link-meta sidecar `deps[].target_graph_key`
     //         to mark every reachable link entry.
@@ -850,8 +994,8 @@ fn compute_prune(
     // belt-and-suspenders for any future regression.
     let mut raw_entries = v2_store.iter_link_entries()?;
     let (entry_capacity, _) = raw_entries.size_hint();
-    let mut all_link_entries: Vec<(PathBuf, PathBuf, lpm_store::v2::LinkMeta)> =
-        Vec::with_capacity(entry_capacity);
+    let mut all_link_entries = Vec::with_capacity(entry_capacity);
+    let mut root_link_indices = Vec::with_capacity(root_link_dirs.len());
     for (raw_dir, meta) in &mut raw_entries {
         let canonical_dir = std::fs::canonicalize(&raw_dir).unwrap_or_else(|_| raw_dir.clone());
         if !canonical_dir.starts_with(&links_root_canonical) {
@@ -863,34 +1007,50 @@ fn compute_prune(
             );
             continue;
         }
-        all_link_entries.push((raw_dir, canonical_dir, meta));
+        let index = all_link_entries.len();
+        if root_link_dirs.contains(&canonical_dir) {
+            root_link_indices.push(index);
+        }
+        let sidecar_path = raw_dir.join(lpm_store::v2::LINK_META_FILENAME);
+        let last_referenced_at = max_age.map(|_| meta.effective_last_referenced_at(&sidecar_path));
+        let object_segment = meta
+            .object_path
+            .strip_prefix("objects/")
+            .unwrap_or(&meta.object_path)
+            .trim_end_matches('/')
+            .to_owned();
+        all_link_entries.push(PruneLinkEntry {
+            raw_dir,
+            graph_key_digest_hex: meta.graph_key_digest_hex,
+            dependency_graph_keys: meta
+                .deps
+                .into_iter()
+                .map(|dependency| dependency.target_graph_key)
+                .collect(),
+            object_segment,
+            last_referenced_at,
+        });
     }
 
     let mut by_digest: std::collections::HashMap<&str, usize> =
         std::collections::HashMap::with_capacity(all_link_entries.len());
-    let mut by_path: std::collections::HashMap<&Path, usize> =
-        std::collections::HashMap::with_capacity(all_link_entries.len());
-    for (index, (_, canonical_dir, meta)) in all_link_entries.iter().enumerate() {
-        by_digest.insert(&meta.graph_key_digest_hex, index);
-        by_path.insert(canonical_dir, index);
+    for (index, entry) in all_link_entries.iter().enumerate() {
+        by_digest.insert(&entry.graph_key_digest_hex, index);
     }
 
     let link_entries_total = all_link_entries.len();
 
     let mut reachable = vec![false; all_link_entries.len()];
     let mut reachable_count = 0usize;
-    let mut frontier: Vec<usize> = root_link_dirs
-        .iter()
-        .filter_map(|directory| by_path.get(directory.as_path()).copied())
-        .collect();
+    let mut frontier = root_link_indices;
     while let Some(index) = frontier.pop() {
         if reachable[index] {
             continue;
         }
         reachable[index] = true;
         reachable_count += 1;
-        for dependency in &all_link_entries[index].2.deps {
-            if let Some(target_index) = by_digest.get(dependency.target_graph_key.as_str()) {
+        for dependency in &all_link_entries[index].dependency_graph_keys {
+            if let Some(target_index) = by_digest.get(dependency.as_str()) {
                 frontier.push(*target_index);
             }
         }
@@ -903,13 +1063,14 @@ fn compute_prune(
     // canonical-form is intentionally not used for that purpose.
     let now = Utc::now();
     let mut orphan_link_indices = Vec::new();
-    for (index, (raw_dir, _, meta)) in all_link_entries.iter().enumerate() {
+    for (index, entry) in all_link_entries.iter().enumerate() {
         if reachable[index] {
             continue;
         }
         if let Some(max_age) = max_age {
-            let sidecar_path = raw_dir.join(lpm_store::v2::LINK_META_FILENAME);
-            let last_seen = meta.effective_last_referenced_at(&sidecar_path);
+            let last_seen = entry
+                .last_referenced_at
+                .expect("max-age planning stores each effective reference time");
             if (now - last_seen) < max_age {
                 continue;
             }
@@ -920,7 +1081,7 @@ fn compute_prune(
     let link_entries_orphaned = if build_full_plan {
         orphan_link_indices
             .iter()
-            .map(|index| all_link_entries[*index].0.clone())
+            .map(|index| all_link_entries[*index].raw_dir.clone())
             .collect()
     } else {
         Vec::new()
@@ -942,17 +1103,22 @@ fn compute_prune(
             .len()
             .saturating_sub(orphan_link_indices.len()),
     );
-    for (index, (_, _, meta)) in all_link_entries.iter().enumerate() {
+    for (index, entry) in all_link_entries.iter().enumerate() {
         if orphan_link_set[index] {
             continue;
         }
-        let segment = meta
-            .object_path
-            .strip_prefix("objects/")
-            .unwrap_or(&meta.object_path)
-            .trim_end_matches('/');
-        object_referenced_segments.insert(segment);
+        object_referenced_segments.insert(entry.object_segment.as_str());
     }
+    let live_graph_keys = if build_full_plan {
+        all_link_entries
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| !orphan_link_set[*index])
+            .map(|(_, entry)| entry.graph_key_digest_hex.clone())
+            .collect()
+    } else {
+        HashSet::new()
+    };
 
     let mut object_entries_total = 0usize;
     let mut object_entries_orphaned_count = 0usize;
@@ -985,7 +1151,7 @@ fn compute_prune(
     };
 
     let mut bytes_freed_or_eligible = 0u64;
-    if build_full_plan {
+    if build_full_plan && !flags.apply {
         for dir in &link_entries_orphaned {
             bytes_freed_or_eligible =
                 bytes_freed_or_eligible.saturating_add(dir_size(dir).unwrap_or(0));
@@ -1004,16 +1170,10 @@ fn compute_prune(
         }
     }
 
-    let (tombstones_pending, tombstone_count_error) = if build_full_plan {
-        count_tombstones_with_error_capture(root)
-    } else {
-        (0, None)
-    };
-
     let stats = PruneStats {
         link_entries_orphaned: orphan_link_indices.len(),
         object_entries_orphaned: object_entries_orphaned_count,
-        analysis: PruneAnalysis::Available,
+        analysis,
     };
 
     Ok((
@@ -1050,6 +1210,7 @@ fn compute_prune(
             registry_corrupt_reason,
             tombstone_count_error,
             tombstone_sweep_error: None,
+            live_graph_keys,
         },
         stats,
     ))
@@ -1070,38 +1231,6 @@ fn count_tombstones_with_error_capture(root: &LpmRoot) -> (usize, Option<String>
             );
             (0, Some(msg))
         }
-    }
-}
-
-/// Walk `<project>/node_modules/<entry>` symlinks and add any whose
-/// canonical path lies inside `links_root_canonical` to `out`. Skips
-/// dotfiles, `.bin/`, and broken symlinks.
-fn collect_project_link_roots(
-    project: &Path,
-    links_root_canonical: &Path,
-    out: &mut HashSet<PathBuf>,
-) {
-    let nm = project.join("node_modules");
-    let Ok(entries) = std::fs::read_dir(&nm) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let name = entry.file_name();
-        let name = name.to_string_lossy();
-        if name.starts_with('.') {
-            continue;
-        }
-        let path = entry.path();
-        if name.starts_with('@') && path.is_dir() {
-            // Scoped — recurse one level into `node_modules/@scope/`.
-            if let Ok(scoped) = std::fs::read_dir(&path) {
-                for s in scoped.flatten() {
-                    add_if_link_descendant(&s.path(), links_root_canonical, out);
-                }
-            }
-            continue;
-        }
-        add_if_link_descendant(&path, links_root_canonical, out);
     }
 }
 
@@ -1146,17 +1275,6 @@ fn add_canonical_link_to_store(
     }
 }
 
-fn add_if_link_descendant(
-    candidate: &Path,
-    links_root_canonical: &Path,
-    out: &mut HashSet<PathBuf>,
-) {
-    let Ok(canonical) = std::fs::canonicalize(candidate) else {
-        return;
-    };
-    add_canonical_if_link_descendant(&canonical, links_root_canonical, out);
-}
-
 fn add_canonical_if_link_descendant(
     canonical: &Path,
     links_root_canonical: &Path,
@@ -1195,10 +1313,15 @@ fn parse_duration(s: &str) -> Result<ChronoDuration, LpmError> {
             "cache prune: --max-age must be positive, got {s}"
         )));
     }
-    Ok(match unit {
-        'd' => ChronoDuration::days(num),
-        'h' => ChronoDuration::hours(num),
+    match unit {
+        'd' => ChronoDuration::try_days(num),
+        'h' => ChronoDuration::try_hours(num),
         _ => unreachable!(),
+    }
+    .ok_or_else(|| {
+        LpmError::Registry(format!(
+            "cache prune: --max-age {s} is too large to represent"
+        ))
     })
 }
 
@@ -1314,7 +1437,7 @@ fn compute_lru_artifact_orphans(
     (total, orphaned)
 }
 
-fn emit_human(summary: &PruneSummary, applied: bool, elapsed: Duration) {
+fn emit_human(summary: &PruneSummary, applied: bool, elapsed: Duration) -> Result<(), LpmError> {
     use lpm_common::format_bytes;
     let elapsed = install_ui::green(&install_ui::format_duration(elapsed));
 
@@ -1455,118 +1578,186 @@ fn emit_human(summary: &PruneSummary, applied: bool, elapsed: Duration) {
             },
         ));
     }
-    if !applied && summary.link_entries_orphaned.len() <= 20 {
-        for dir in &summary.link_entries_orphaned {
-            println!(
-                "  link orphan: {}",
-                sanitize_for_terminal(&dir.display().to_string())
-            );
-        }
-        for dir in &summary.object_entries_orphaned {
-            println!(
-                "  object orphan: {}",
-                sanitize_for_terminal(&dir.display().to_string())
-            );
-        }
-        for dir in &summary.compat_islands_orphaned {
-            println!(
-                "  compat island orphan: {}",
-                sanitize_for_terminal(&dir.display().to_string())
-            );
-        }
-        for dir in &summary.build_artifacts_orphaned {
-            println!(
-                "  build artifact orphan: {}",
-                sanitize_for_terminal(&dir.display().to_string())
-            );
-        }
+    if !applied {
+        let stdout = std::io::stdout();
+        write_human_orphan_details(summary, &mut stdout.lock())?;
     }
     if !applied {
         install_ui::done_untrusted(&format!("Done · checked cache in {elapsed}"));
     }
+    Ok(())
 }
 
-fn emit_json(summary: &PruneSummary) {
-    let json = serde_json::json!({
-        "success": !prune_had_errors(summary),
-        "applied": summary.applied,
-        "projects_walked": summary.projects_walked,
-        "registry_entries_dropped": summary.registry_entries_dropped,
-        "link_entries_total": summary.link_entries_total,
-        "link_entries_reachable": summary.link_entries_reachable,
-        "link_entries_orphaned": summary
-            .link_entries_orphaned
-            .iter()
-            .map(|p| p.display().to_string())
-            .collect::<Vec<_>>(),
-        "object_entries_total": summary.object_entries_total,
-        "object_entries_reachable": summary.object_entries_reachable,
-        "object_entries_orphaned": summary
-            .object_entries_orphaned
-            .iter()
-            .map(|p| p.display().to_string())
-            .collect::<Vec<_>>(),
-        "cas_trees_total": summary.cas_trees_total,
-        "cas_tree_files_orphaned": summary
-            .cas_tree_files_orphaned
-            .iter()
-            .map(|p| p.display().to_string())
-            .collect::<Vec<_>>(),
-        "cas_blobs_total": summary.cas_blobs_total,
-        "cas_blob_files_orphaned": summary
-            .cas_blob_files_orphaned
-            .iter()
-            .map(|p| p.display().to_string())
-            .collect::<Vec<_>>(),
-        "cas_source_record_files_orphaned": summary
-            .cas_source_record_files_orphaned
-            .iter()
-            .map(|p| p.display().to_string())
-            .collect::<Vec<_>>(),
-        "cas_source_validation_files_orphaned": summary
-            .cas_source_validation_files_orphaned
-            .iter()
-            .map(|p| p.display().to_string())
-            .collect::<Vec<_>>(),
-        "cas_materialized_total": summary.cas_materialized_total,
-        "cas_materialized_entries_orphaned": summary
-            .cas_materialized_entries_orphaned
-            .iter()
-            .map(|p| p.display().to_string())
-            .collect::<Vec<_>>(),
-        "compat_islands_total": summary.compat_islands_total,
-        "compat_islands_orphaned": summary
-            .compat_islands_orphaned
-            .iter()
-            .map(|p| p.display().to_string())
-            .collect::<Vec<_>>(),
-        "build_artifacts_total": summary.build_artifacts_total,
-        "build_artifacts_orphaned": summary
-            .build_artifacts_orphaned
-            .iter()
-            .map(|p| p.display().to_string())
-            .collect::<Vec<_>>(),
-        "bytes_freed_or_eligible": summary.bytes_freed_or_eligible,
-        "logical_bytes_freed_or_eligible": summary.bytes_freed_or_eligible,
-        "observed_physical_bytes_freed": summary.observed_physical_bytes_freed,
-        "registry_missing": summary.registry_missing,
-        "registry_corrupt": summary.registry_corrupt,
-        "registry_corrupt_reason": summary.registry_corrupt_reason,
-        "tombstones_pending": summary.tombstones_pending,
-        "tombstones_swept": summary.tombstones_swept,
-        "tombstones_retained": summary
-            .tombstones_retained
-            .iter()
-            .map(|f| serde_json::json!({
-                "relative_path": f.relative_path,
-                "reason": f.reason,
-            }))
-            .collect::<Vec<_>>(),
-        "tombstone_bytes_freed": summary.tombstone_bytes_freed,
-        "tombstone_count_error": summary.tombstone_count_error,
-        "tombstone_sweep_error": summary.tombstone_sweep_error,
-    });
-    println!("{}", serde_json::to_string_pretty(&json).unwrap());
+const HUMAN_ORPHAN_DETAIL_LIMIT: usize = 20;
+
+fn write_human_orphan_details(
+    summary: &PruneSummary,
+    writer: &mut impl Write,
+) -> Result<(), LpmError> {
+    let groups = [
+        ("link orphan", summary.link_entries_orphaned.as_slice()),
+        ("object orphan", summary.object_entries_orphaned.as_slice()),
+        (
+            "compat island orphan",
+            summary.compat_islands_orphaned.as_slice(),
+        ),
+        (
+            "build artifact orphan",
+            summary.build_artifacts_orphaned.as_slice(),
+        ),
+    ];
+    let total = groups
+        .iter()
+        .map(|(_, paths)| paths.len())
+        .fold(0usize, usize::saturating_add);
+    let mut remaining = HUMAN_ORPHAN_DETAIL_LIMIT;
+    for (label, paths) in groups {
+        for path in paths.iter().take(remaining) {
+            writeln!(
+                writer,
+                "  {label}: {}",
+                sanitize_for_terminal(&path.display().to_string())
+            )?;
+        }
+        remaining = remaining.saturating_sub(paths.len());
+        if remaining == 0 {
+            break;
+        }
+    }
+    if total > HUMAN_ORPHAN_DETAIL_LIMIT {
+        writeln!(
+            writer,
+            "  ... {} additional orphan path(s) omitted",
+            total - HUMAN_ORPHAN_DETAIL_LIMIT
+        )?;
+    }
+    Ok(())
+}
+
+#[derive(Clone, Copy)]
+struct JsonPaths<'a>(&'a [PathBuf]);
+
+impl Serialize for JsonPaths<'_> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        let mut sequence = serializer.serialize_seq(Some(self.0.len()))?;
+        for path in self.0 {
+            sequence.serialize_element(path.to_string_lossy().as_ref())?;
+        }
+        sequence.end()
+    }
+}
+
+#[derive(Serialize)]
+struct JsonSweepFailure<'a> {
+    relative_path: &'a str,
+    reason: &'a str,
+}
+
+struct JsonSweepFailures<'a>(&'a [lpm_global::SweepFailure]);
+
+impl Serialize for JsonSweepFailures<'_> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        let mut sequence = serializer.serialize_seq(Some(self.0.len()))?;
+        for failure in self.0 {
+            sequence.serialize_element(&JsonSweepFailure {
+                relative_path: &failure.relative_path,
+                reason: &failure.reason,
+            })?;
+        }
+        sequence.end()
+    }
+}
+
+#[derive(Serialize)]
+struct PruneJson<'a> {
+    success: bool,
+    applied: bool,
+    projects_walked: usize,
+    registry_entries_dropped: usize,
+    link_entries_total: usize,
+    link_entries_reachable: usize,
+    link_entries_orphaned: JsonPaths<'a>,
+    object_entries_total: usize,
+    object_entries_reachable: usize,
+    object_entries_orphaned: JsonPaths<'a>,
+    cas_trees_total: usize,
+    cas_tree_files_orphaned: JsonPaths<'a>,
+    cas_blobs_total: usize,
+    cas_blob_files_orphaned: JsonPaths<'a>,
+    cas_source_record_files_orphaned: JsonPaths<'a>,
+    cas_source_validation_files_orphaned: JsonPaths<'a>,
+    cas_materialized_total: usize,
+    cas_materialized_entries_orphaned: JsonPaths<'a>,
+    compat_islands_total: usize,
+    compat_islands_orphaned: JsonPaths<'a>,
+    build_artifacts_total: usize,
+    build_artifacts_orphaned: JsonPaths<'a>,
+    bytes_freed_or_eligible: u64,
+    logical_bytes_freed_or_eligible: u64,
+    observed_physical_bytes_freed: Option<u64>,
+    registry_missing: bool,
+    registry_corrupt: bool,
+    registry_corrupt_reason: &'a str,
+    tombstones_pending: usize,
+    tombstones_swept: usize,
+    tombstones_retained: JsonSweepFailures<'a>,
+    tombstone_bytes_freed: u64,
+    tombstone_count_error: Option<&'a str>,
+    tombstone_sweep_error: Option<&'a str>,
+}
+
+fn emit_json(summary: &PruneSummary) -> Result<(), LpmError> {
+    let output = PruneJson {
+        success: !prune_had_errors(summary),
+        applied: summary.applied,
+        projects_walked: summary.projects_walked,
+        registry_entries_dropped: summary.registry_entries_dropped,
+        link_entries_total: summary.link_entries_total,
+        link_entries_reachable: summary.link_entries_reachable,
+        link_entries_orphaned: JsonPaths(&summary.link_entries_orphaned),
+        object_entries_total: summary.object_entries_total,
+        object_entries_reachable: summary.object_entries_reachable,
+        object_entries_orphaned: JsonPaths(&summary.object_entries_orphaned),
+        cas_trees_total: summary.cas_trees_total,
+        cas_tree_files_orphaned: JsonPaths(&summary.cas_tree_files_orphaned),
+        cas_blobs_total: summary.cas_blobs_total,
+        cas_blob_files_orphaned: JsonPaths(&summary.cas_blob_files_orphaned),
+        cas_source_record_files_orphaned: JsonPaths(&summary.cas_source_record_files_orphaned),
+        cas_source_validation_files_orphaned: JsonPaths(
+            &summary.cas_source_validation_files_orphaned,
+        ),
+        cas_materialized_total: summary.cas_materialized_total,
+        cas_materialized_entries_orphaned: JsonPaths(&summary.cas_materialized_entries_orphaned),
+        compat_islands_total: summary.compat_islands_total,
+        compat_islands_orphaned: JsonPaths(&summary.compat_islands_orphaned),
+        build_artifacts_total: summary.build_artifacts_total,
+        build_artifacts_orphaned: JsonPaths(&summary.build_artifacts_orphaned),
+        bytes_freed_or_eligible: summary.bytes_freed_or_eligible,
+        logical_bytes_freed_or_eligible: summary.bytes_freed_or_eligible,
+        observed_physical_bytes_freed: summary.observed_physical_bytes_freed,
+        registry_missing: summary.registry_missing,
+        registry_corrupt: summary.registry_corrupt,
+        registry_corrupt_reason: &summary.registry_corrupt_reason,
+        tombstones_pending: summary.tombstones_pending,
+        tombstones_swept: summary.tombstones_swept,
+        tombstones_retained: JsonSweepFailures(&summary.tombstones_retained),
+        tombstone_bytes_freed: summary.tombstone_bytes_freed,
+        tombstone_count_error: summary.tombstone_count_error.as_deref(),
+        tombstone_sweep_error: summary.tombstone_sweep_error.as_deref(),
+    };
+    let stdout = std::io::stdout();
+    let mut stdout = stdout.lock();
+    serde_json::to_writer_pretty(&mut stdout, &output).map_err(|error| {
+        LpmError::Store(format!("failed to serialize cache prune output: {error}"))
+    })?;
+    stdout.write_all(b"\n")?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1762,6 +1953,45 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
+    fn shared_discovery_scans_each_project_once_for_v2_and_v3() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = LpmRoot::from_dir(dir.path().join("lpm-home"));
+        let v2 = V2Store::from_lpm_root_for_version(&root, lpm_store::StoreVersion::V2);
+        let v3 = V2Store::from_lpm_root_for_version(&root, lpm_store::StoreVersion::V3);
+        let project = dir.path().join("project");
+
+        for (store, package, seed) in [
+            (&v2, "v2-live", b"discovery/v2".as_slice()),
+            (&v3, "v3-live", b"discovery/v3".as_slice()),
+        ] {
+            let source_sri = synthetic_sri(seed);
+            write_object(store, &source_sri);
+            let key = key_for(package, "1.0.0");
+            store
+                .populate_link_entry(LinkEntryRequest {
+                    graph_key: Arc::clone(&key),
+                    source_sri: source_sri.clone(),
+                    object_dir: store.paths().object_dir(&source_sri).unwrap(),
+                    deps: Vec::new(),
+                    platform: Arc::new(sample_meta_platform()),
+                })
+                .unwrap();
+            synthesize_project(&project, store, &[(package, key)]);
+        }
+        known_projects::register(&root.known_projects(), &project).unwrap();
+
+        let stores = [&v2, &v3];
+        let discovery =
+            discover_prune_inputs(&root, &stores, &PruneFlags::default(), true).unwrap();
+
+        assert_eq!(discovery.project_scans, 1);
+        assert_eq!(discovery.root_link_dirs.len(), 2);
+        assert_eq!(discovery.root_link_dirs[0].len(), 1);
+        assert_eq!(discovery.root_link_dirs[1].len(), 1);
+    }
+
+    #[test]
     fn prune_tombstone_sweep_removes_crash_leftovers() {
         let dir = tempfile::tempdir().unwrap();
         let tombstones = dir.path().join(".prune-tombstones");
@@ -1772,6 +2002,59 @@ mod tests {
         sweep_prune_tombstones(&tombstones).unwrap();
 
         assert!(tombstones.read_dir().unwrap().next().is_none());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn prune_tombstone_sweep_rejects_a_linked_root_without_touching_its_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let victim = dir.path().join("victim");
+        let sentinel = victim.join("nested").join("keep.txt");
+        std::fs::create_dir_all(sentinel.parent().unwrap()).unwrap();
+        std::fs::write(&sentinel, b"keep").unwrap();
+        let tombstones = dir.path().join(".prune-tombstones");
+        std::os::unix::fs::symlink(&victim, &tombstones).unwrap();
+
+        let error = sweep_prune_tombstones(&tombstones)
+            .expect_err("a linked prune tombstone root must be rejected");
+
+        assert!(
+            error.to_string().contains("tombstone"),
+            "error should identify the rejected tombstone root: {error}",
+        );
+        assert_eq!(std::fs::read(&sentinel).unwrap(), b"keep");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn prune_tombstone_sweep_unlinks_linked_entries_without_touching_targets() {
+        let dir = tempfile::tempdir().unwrap();
+        let victim = dir.path().join("victim");
+        let sentinel = victim.join("nested").join("keep.txt");
+        std::fs::create_dir_all(sentinel.parent().unwrap()).unwrap();
+        std::fs::write(&sentinel, b"keep").unwrap();
+        let tombstones = dir.path().join(".prune-tombstones");
+        std::fs::create_dir_all(&tombstones).unwrap();
+        let linked_entry = tombstones.join("linked-entry.0000000000000001");
+        std::os::unix::fs::symlink(&victim, &linked_entry).unwrap();
+
+        sweep_prune_tombstones(&tombstones).unwrap();
+
+        assert!(!linked_entry.exists());
+        assert_eq!(std::fs::read(&sentinel).unwrap(), b"keep");
+    }
+
+    #[test]
+    fn prune_max_age_rejects_values_that_exceed_chronos_range() {
+        for value in ["9223372036854775807d", "9223372036854775807h"] {
+            let error =
+                parse_duration(value).expect_err("an overflowing duration must return an error");
+
+            assert!(
+                error.to_string().contains("too large"),
+                "overflow should produce a useful validation error: {error}",
+            );
+        }
     }
 
     #[test]
@@ -1883,6 +2166,7 @@ mod tests {
             },
             None,
             true,
+            None,
         )
         .unwrap();
 
@@ -1942,13 +2226,11 @@ mod tests {
         std::fs::create_dir_all(&link_dir).unwrap();
         std::fs::write(
             link_dir.join(lpm_store::v2::LINK_META_FILENAME),
-            format!(
-                r#"{{"schema":1,"graph_key":"example@1.0.0+bbbbbbbbbbbbbbbb","graph_key_digest_hex":"{live_key}","name":"example","version":"1.0.0","source_sri":"sha512-example","object_path":"objects/sha512-example","deps":[],"platform":{{"os":"darwin","cpu":"arm64","libc":null}},"created_at":"2026-01-01T00:00:00Z","last_referenced_at":"2026-01-01T00:00:00Z"}}"#
-            ),
+            b"not parsed during cleanup",
         )
         .unwrap();
 
-        remove_orphaned_build_entry_locks(&store).unwrap();
+        remove_orphaned_build_entry_locks(&store, &HashSet::from([live_key])).unwrap();
 
         assert!(!orphan_lock.exists());
         assert!(!std::fs::exists(format!("{}.writer-intent", orphan_lock.display())).unwrap());
@@ -1956,6 +2238,24 @@ mod tests {
         assert!(live_lock.exists());
         assert!(std::fs::exists(format!("{}.writer-intent", live_lock.display())).unwrap());
         assert!(std::fs::exists(format!("{}.writer-queue", live_lock.display())).unwrap());
+    }
+
+    #[test]
+    fn missing_build_entry_lock_root_does_not_read_link_sidecars() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = LpmRoot::from_dir(tmp.path());
+        let store = V2Store::from_lpm_root(&root);
+        let link_dir = store.paths().links_root().join("malformed");
+        std::fs::create_dir_all(&link_dir).unwrap();
+        std::fs::write(
+            link_dir.join(lpm_store::v2::LINK_META_FILENAME),
+            b"not valid json",
+        )
+        .unwrap();
+
+        remove_orphaned_build_entry_locks(&store, &HashSet::new()).unwrap();
+
+        assert!(!store.paths().build_entry_locks_root().exists());
     }
 
     #[test]
@@ -2258,7 +2558,7 @@ mod tests {
             apply: true,
             ..PruneFlags::default()
         };
-        let summary = run_locked(&root, &store, &flags, None, true).unwrap();
+        let summary = run_locked(&root, &store, &flags, None, true, None).unwrap();
 
         assert_eq!(
             summary.tombstones_swept, 0,
@@ -2300,6 +2600,46 @@ mod tests {
             cleaned.contains("installs/evil-pkg@1.0.0"),
             "printable prefix must survive the scrub, got {cleaned:?}"
         );
+    }
+
+    #[test]
+    fn human_orphan_details_use_one_combined_output_budget() {
+        let summary = PruneSummary {
+            link_entries_orphaned: (0..10)
+                .map(|index| PathBuf::from(format!("link-{index}")))
+                .collect(),
+            object_entries_orphaned: (0..10)
+                .map(|index| PathBuf::from(format!("object-{index}")))
+                .collect(),
+            compat_islands_orphaned: (0..7)
+                .map(|index| PathBuf::from(format!("compat-{index}")))
+                .collect(),
+            ..PruneSummary::default()
+        };
+        let mut output = Vec::new();
+
+        write_human_orphan_details(&summary, &mut output).unwrap();
+
+        let output = String::from_utf8(output).unwrap();
+        assert_eq!(output.lines().count(), HUMAN_ORPHAN_DETAIL_LIMIT + 1);
+        assert_eq!(output.matches("link orphan:").count(), 10);
+        assert_eq!(output.matches("object orphan:").count(), 10);
+        assert!(!output.contains("compat island orphan:"));
+        assert!(output.contains("7 additional orphan path(s) omitted"));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn json_paths_preserve_lossy_non_utf8_path_rendering_without_owned_path_vectors() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let paths = vec![PathBuf::from(std::ffi::OsString::from_vec(vec![
+            b'b', b'a', b'd', 0xff,
+        ]))];
+
+        let value = serde_json::to_value(JsonPaths(&paths)).unwrap();
+
+        assert_eq!(value, serde_json::json!(["bad�"]));
     }
 
     /// Avoid an `unused` warning on `HashMap` + `DateTime` re-exports

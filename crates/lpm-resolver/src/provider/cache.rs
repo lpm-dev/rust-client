@@ -88,6 +88,13 @@ pub(crate) fn merge_cached_package_info(
         .latest_version
         .clone()
         .or_else(|| existing.latest_version.clone());
+    let mut dist_tags = existing.dist_tags().clone();
+    dist_tags.extend(
+        incoming
+            .dist_tags()
+            .iter()
+            .map(|(tag, version)| (tag.clone(), version.clone())),
+    );
     let mut versions = Vec::with_capacity(existing.versions.len() + incoming.versions.len());
     versions.extend(existing.versions.iter().cloned());
     versions.extend(incoming.versions.iter().cloned());
@@ -103,6 +110,7 @@ pub(crate) fn merge_cached_package_info(
         latest_version,
         versions.len(),
     );
+    builder.set_dist_tags(dist_tags);
     for version in versions {
         let existing_manifest = existing.manifest_version_owned_for(&version);
         let incoming_manifest = incoming.manifest_version_owned_for(&version);
@@ -489,16 +497,14 @@ impl LpmDependencyProvider {
         if let Some(cached) = self.range_cache.lock().get(&key) {
             return cached.clone();
         }
-        let latest_version = if npm_range.is_latest_tag() {
+        let tagged_version = npm_range.dist_tag().and_then(|tag| {
             let canonical = CanonicalKey::from(pkg);
             self.cache
                 .get(&canonical)
-                .and_then(|info| info.latest_version.clone())
-        } else {
-            None
-        };
+                .and_then(|info| info.dist_tag_version(tag).cloned())
+        });
         let computed =
-            npm_range.to_pubgrub_ranges_with_latest_bound(available, latest_version.as_ref());
+            npm_range.to_pubgrub_ranges_with_dist_tag(available, tagged_version.as_ref());
         self.range_cache.lock().insert(key, computed.clone());
         computed
     }

@@ -10,7 +10,7 @@
 mod support;
 
 use support::mock_registry::{MockRegistry, compute_integrity, make_tarball};
-use support::{TempProject, lpm, lpm_with_registry_and_npm};
+use support::{TempProject, lpm, lpm_spawnable_with_registry, lpm_with_registry_and_npm};
 use wiremock::matchers::{method, path as wiremock_path, query_param};
 use wiremock::{Mock, Request, Respond, ResponseTemplate};
 
@@ -78,6 +78,24 @@ impl Respond for SequentialUpgradeMetadata {
         } else {
             ResponseTemplate::new(200).set_body_json(metadata)
         }
+    }
+}
+
+#[derive(Clone)]
+struct MarkDelayedUpgradeTarball {
+    marker: std::path::PathBuf,
+    body: Option<Vec<u8>>,
+    delay: std::time::Duration,
+}
+
+impl Respond for MarkDelayedUpgradeTarball {
+    fn respond(&self, _request: &Request) -> ResponseTemplate {
+        std::fs::write(&self.marker, b"requested").expect("write delayed tarball marker");
+        let response = match &self.body {
+            Some(body) => ResponseTemplate::new(200).set_body_bytes(body.clone()),
+            None => ResponseTemplate::new(404).set_body_string("missing tarball"),
+        };
+        response.set_delay(self.delay)
     }
 }
 
@@ -496,6 +514,386 @@ async fn upgrade_targeted_npm_alias_uses_canonical_source_and_preserves_alias_sp
         .find(|package| package.name == "strip-ansi")
         .expect("lockfile must record the canonical alias target");
     assert_eq!(entry.version, "6.1.0");
+}
+
+#[tokio::test]
+async fn upgrade_never_routes_non_registry_manifest_protocols_to_a_registry() {
+    for (index, spec) in [
+        "workspace:*",
+        "file:../local-package",
+        "link:../local-package",
+        "git+https://example.invalid/repository.git#main",
+        "https://example.invalid/package.tgz",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let package = format!("@lpm.dev/acme.local{index}");
+        let project = TempProject::empty(&format!(
+            r#"{{"name":"local-upgrade","version":"1.0.0","dependencies":{{"{package}":"{spec}"}}}}"#
+        ));
+        let mut lockfile = lpm_lockfile::Lockfile::new();
+        lockfile.add_package(lpm_lockfile::LockedPackage {
+            name: package.clone(),
+            version: "1.0.0".to_string(),
+            source: Some("registry+https://lpm.dev".to_string()),
+            ..Default::default()
+        });
+        support::finalize_exact_lockfile_fixture(
+            &mut lockfile,
+            &[(package.as_str(), package.as_str(), "1.0.0")],
+        );
+        lockfile
+            .write_to_file(&project.path().join("lpm.lock"))
+            .expect("write stale registry lockfile");
+
+        let mock = MockRegistry::start().await;
+        let output = lpm_with_registry_and_npm(&project, &mock.url())
+            .args(["upgrade", "-y", "--dry-run", "--json"])
+            .output()
+            .expect("run non-registry upgrade plan");
+
+        assert!(
+            output.status.success(),
+            "{spec} must be skipped without a registry request\nstdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            mock.server()
+                .received_requests()
+                .await
+                .expect("read registry requests")
+                .is_empty(),
+            "{spec} unexpectedly reached a registry"
+        );
+    }
+}
+
+#[tokio::test]
+async fn upgrade_rejects_stale_alias_route_evidence_before_any_registry_request() {
+    for manifest_spec in ["^2.0.0", "npm:@company/private-tool@^2.0.0"] {
+        let project = TempProject::empty(&format!(
+            r#"{{"name":"stale-alias","version":"1.0.0","dependencies":{{"tool":"{manifest_spec}"}}}}"#
+        ));
+        let mut lockfile = lpm_lockfile::Lockfile::new();
+        lockfile
+            .root_aliases
+            .insert("tool".to_string(), "old-public-tool".to_string());
+        lockfile.add_package(lpm_lockfile::LockedPackage {
+            name: "old-public-tool".to_string(),
+            version: "1.0.0".to_string(),
+            source: Some("registry+https://registry.npmjs.org".to_string()),
+            ..Default::default()
+        });
+        support::finalize_exact_lockfile_fixture(
+            &mut lockfile,
+            &[("tool", "old-public-tool", "1.0.0")],
+        );
+        lockfile
+            .write_to_file(&project.path().join("lpm.lock"))
+            .expect("write stale alias lockfile");
+
+        let mock = MockRegistry::start().await;
+        let output = lpm_with_registry_and_npm(&project, &mock.url())
+            .args(["upgrade", "tool", "-y", "--dry-run", "--json"])
+            .output()
+            .expect("run stale alias upgrade");
+
+        assert!(!output.status.success());
+        assert!(
+            mock.server()
+                .received_requests()
+                .await
+                .expect("read registry requests")
+                .is_empty(),
+            "stale alias evidence must not authorize any current package lookup"
+        );
+    }
+}
+
+async fn run_tagged_upgrade_case(
+    package: &str,
+    manifest_spec: &str,
+    tag: &str,
+    installed: &str,
+    target: &str,
+    latest: &str,
+) -> (serde_json::Value, lpm_lockfile::Lockfile) {
+    let project = TempProject::empty(&format!(
+        r#"{{"name":"tagged-upgrade","version":"1.0.0","dependencies":{{"{package}":"{manifest_spec}"}}}}"#
+    ));
+    let mut lockfile = lpm_lockfile::Lockfile::new();
+    lockfile.add_package(lpm_lockfile::LockedPackage {
+        name: package.to_string(),
+        version: installed.to_string(),
+        source: Some("registry+https://registry.npmjs.org".to_string()),
+        ..Default::default()
+    });
+    support::finalize_exact_lockfile_fixture(&mut lockfile, &[(package, package, installed)]);
+    lockfile
+        .write_to_file(&project.path().join("lpm.lock"))
+        .expect("write tagged dependency lockfile");
+
+    let mock = MockRegistry::start().await;
+    let tarball = make_tarball(package, target);
+    let integrity = compute_integrity(&tarball);
+    let tarball_path = MockRegistry::tarball_path(package, target);
+    Mock::given(method("GET"))
+        .and(wiremock_path(format!("/{package}")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "name": package,
+            "dist-tags": { "latest": latest, (tag): target },
+            "versions": {
+                (installed): { "name": package, "version": installed },
+                (target): {
+                    "name": package,
+                    "version": target,
+                    "dist": {
+                        "tarball": format!("{}{}", mock.url(), tarball_path),
+                        "integrity": integrity,
+                    }
+                },
+                (latest): { "name": package, "version": latest }
+            },
+            "time": {
+                (installed): "2025-01-01T00:00:00.000Z",
+                (target): "2025-01-02T00:00:00.000Z",
+                (latest): "2025-01-03T00:00:00.000Z"
+            }
+        })))
+        .mount(mock.server())
+        .await;
+    Mock::given(method("GET"))
+        .and(wiremock_path(tarball_path))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(tarball))
+        .mount(mock.server())
+        .await;
+
+    let output = lpm_with_registry_and_npm(&project, &mock.url())
+        .args(["upgrade", "-y"])
+        .output()
+        .expect("run tagged dependency upgrade");
+    assert!(
+        output.status.success(),
+        "tag {tag} should upgrade to its mapped version\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let manifest = serde_json::from_str(&project.read_file("package.json"))
+        .expect("read tagged dependency manifest");
+    let lockfile = lpm_lockfile::Lockfile::read_from_file(&project.path().join("lpm.lock"))
+        .expect("read tagged dependency lockfile");
+    (manifest, lockfile)
+}
+
+#[tokio::test]
+async fn upgrade_preserves_custom_stable_and_prerelease_dist_tags() {
+    for (index, tag, installed, target, latest) in [
+        (0, "legacy", "1.2.0", "1.3.0", "2.0.0"),
+        (1, "next", "2.0.0-beta.1", "2.0.0-beta.2", "2.0.0"),
+    ] {
+        let package = format!("tagged-upgrade-{index}");
+        let (manifest, lockfile) =
+            run_tagged_upgrade_case(&package, tag, tag, installed, target, latest).await;
+
+        assert_eq!(manifest["dependencies"][&package], serde_json::json!(tag));
+        assert_eq!(
+            lockfile
+                .root_resolutions
+                .get(&package)
+                .expect("tagged root resolution")
+                .version,
+            target
+        );
+    }
+}
+
+#[tokio::test]
+async fn upgrade_accepts_surrounding_whitespace_in_a_custom_dist_tag() {
+    let package = "tagged-upgrade-whitespace";
+    let manifest_spec = "  legacy  ";
+    let (manifest, lockfile) =
+        run_tagged_upgrade_case(package, manifest_spec, "legacy", "1.2.0", "1.3.0", "2.0.0").await;
+
+    assert_eq!(
+        manifest["dependencies"][package],
+        serde_json::json!(manifest_spec)
+    );
+    assert_eq!(
+        lockfile
+            .root_resolutions
+            .get(package)
+            .expect("tagged root resolution")
+            .version,
+        "1.3.0"
+    );
+}
+
+#[tokio::test]
+async fn upgrade_peer_preview_ignores_a_missing_optional_peer() {
+    let package = "@lpm.dev/acme.optional-peer-preview";
+    let project = TempProject::empty("");
+    seed_pinned_dep(&project, package, "^1.0.0", "1.0.0");
+    let mock = MockRegistry::start().await;
+    Mock::given(method("GET"))
+        .and(wiremock_path(format!("/api/registry/{package}")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "name": package,
+            "dist-tags": { "latest": "1.1.0" },
+            "versions": {
+                "1.0.0": { "name": package, "version": "1.0.0" },
+                "1.1.0": {
+                    "name": package,
+                    "version": "1.1.0",
+                    "peerDependencies": { "react": "^18.0.0" },
+                    "peerDependenciesMeta": { "react": { "optional": true } }
+                }
+            },
+            "time": {
+                "1.0.0": "2025-01-01T00:00:00.000Z",
+                "1.1.0": "2025-01-02T00:00:00.000Z"
+            }
+        })))
+        .mount(mock.server())
+        .await;
+
+    let output = lpm_with_registry_and_npm(&project, &mock.url())
+        .args(["upgrade", "-y", "--dry-run", "--json"])
+        .output()
+        .expect("run optional peer preview");
+    assert!(
+        output.status.success(),
+        "optional peer preview should succeed\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let envelope: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(envelope["packages"][0]["peer_impact"]["ok"], true);
+    assert!(
+        envelope["packages"][0]["peer_impact"]["missing"]
+            .as_array()
+            .is_none_or(Vec::is_empty)
+    );
+}
+
+#[tokio::test]
+async fn upgrade_peer_preview_uses_the_exact_root_provider_instance() {
+    let package = "@lpm.dev/acme.root-peer-preview";
+    let project = TempProject::empty(&format!(
+        r#"{{"name":"root-peer-preview","version":"1.0.0","dependencies":{{"{package}":"^1.0.0","react":"^18.0.0"}}}}"#
+    ));
+    let mut lockfile = lpm_lockfile::Lockfile::new();
+    for (name, version, source) in [
+        (package, "1.0.0", "registry+https://lpm.dev"),
+        ("react", "17.0.2", "registry+https://registry.npmjs.org"),
+        ("react", "18.2.0", "registry+https://registry.npmjs.org"),
+        ("react", "19.0.0", "registry+https://registry.npmjs.org"),
+    ] {
+        lockfile.add_package(lpm_lockfile::LockedPackage {
+            name: name.to_string(),
+            version: version.to_string(),
+            source: Some(source.to_string()),
+            dependencies: if name == package {
+                vec!["react-17@17.0.2".to_string(), "react-19@19.0.0".to_string()]
+            } else {
+                Vec::new()
+            },
+            alias_dependencies: if name == package {
+                vec![
+                    ["react-17".to_string(), "react".to_string()],
+                    ["react-19".to_string(), "react".to_string()],
+                ]
+            } else {
+                Vec::new()
+            },
+            ..Default::default()
+        });
+    }
+    support::finalize_exact_lockfile_fixture(
+        &mut lockfile,
+        &[(package, package, "1.0.0"), ("react", "react", "18.2.0")],
+    );
+    lockfile
+        .write_to_file(&project.path().join("lpm.lock"))
+        .expect("write duplicate peer lockfile");
+    let mock = MockRegistry::start().await;
+    Mock::given(method("GET"))
+        .and(wiremock_path(format!("/api/registry/{package}")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "name": package,
+            "dist-tags": { "latest": "1.1.0" },
+            "versions": {
+                "1.0.0": { "name": package, "version": "1.0.0" },
+                "1.1.0": {
+                    "name": package,
+                    "version": "1.1.0",
+                    "peerDependencies": { "react": "^18.0.0" }
+                }
+            },
+            "time": {
+                "1.0.0": "2025-01-01T00:00:00.000Z",
+                "1.1.0": "2025-01-02T00:00:00.000Z"
+            }
+        })))
+        .mount(mock.server())
+        .await;
+
+    let output = lpm_with_registry_and_npm(&project, &mock.url())
+        .args(["upgrade", package, "-y", "--dry-run", "--json"])
+        .output()
+        .expect("run exact root peer preview");
+    assert!(
+        output.status.success(),
+        "root peer preview should succeed\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let envelope: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(envelope["packages"][0]["peer_impact"]["ok"], true);
+}
+
+#[tokio::test]
+async fn upgrade_runs_root_project_lifecycle_scripts_around_install() {
+    let project = TempProject::empty("");
+    let mock = setup_up7_successful_upgrade_fixture(&project, UP7_MINOR, false).await;
+    let mut manifest: serde_json::Value =
+        serde_json::from_str(&project.read_file("package.json")).unwrap();
+    manifest["scripts"] = serde_json::json!({
+        "pnpm:devPreinstall": "node record-upgrade-lifecycle.js pnpm:devPreinstall",
+        "postprepare": "node record-upgrade-lifecycle.js postprepare"
+    });
+    project.write_file(
+        "package.json",
+        &serde_json::to_string_pretty(&manifest).unwrap(),
+    );
+    project.write_file(
+        "record-upgrade-lifecycle.js",
+        &format!(
+            r#"const fs = require('fs');
+const phase = process.argv[2];
+const installed = fs.existsSync('node_modules/{UP7_PKG}/package.json') ? 'installed' : 'missing';
+fs.appendFileSync('upgrade-lifecycle.log', `${{phase}}:${{installed}}\n`);
+"#
+        ),
+    );
+
+    let output = lpm_with_registry_and_npm(&project, &mock.url())
+        .args(["upgrade", "-y"])
+        .output()
+        .expect("run upgrade with root lifecycle scripts");
+
+    assert!(
+        output.status.success(),
+        "upgrade with root lifecycle scripts should succeed\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        project.read_file("upgrade-lifecycle.log"),
+        "pnpm:devPreinstall:missing\npostprepare:installed\n"
+    );
 }
 
 #[tokio::test]
@@ -1397,6 +1795,30 @@ async fn upgrade_rewrites_minified_manifest_json() {
     assert_eq!(entry.version, "2.0.0");
 }
 
+#[tokio::test]
+async fn upgrade_accepts_a_utf8_bom_package_manifest() {
+    let pkg = "@lpm.dev/owner.bom-upgrade";
+    let project = TempProject::empty("");
+    seed_pinned_dep(&project, pkg, "^1.0.0", "1.0.0");
+    let manifest = project.read_file("package.json");
+    project.write_file("package.json", &format!("\u{feff}{manifest}"));
+
+    let mock = MockRegistry::start().await;
+    mount_lpm_pkg(&mock, pkg, "2.0.0").await;
+
+    let output = lpm_with_registry_and_npm(&project, &mock.url())
+        .args(["upgrade", "-y", "--major", "--dry-run", "--json"])
+        .output()
+        .expect("run upgrade with a BOM manifest");
+
+    assert!(
+        output.status.success(),
+        "BOM manifest upgrade should succeed\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
 // ─── JSON contract ──────────────────────────────────────────────────────
 
 #[tokio::test]
@@ -1687,6 +2109,75 @@ async fn setup_up7_failed_install_fixture(project: &TempProject) -> MockRegistry
     mock
 }
 
+async fn setup_up7_delayed_install_fixture(
+    project: &TempProject,
+    marker: &std::path::Path,
+    fail_target_tarball: bool,
+) -> MockRegistry {
+    up7_write_manifest(project, &up7_manifest_with_dependency("^1.2.0", false));
+    up7_write_lockfile(project, &[(UP7_PKG, UP7_CURRENT)]);
+    let mock = MockRegistry::start().await;
+    let current_tarball = make_tarball(UP7_PKG, UP7_CURRENT);
+    let target_tarball = make_tarball(UP7_PKG, UP7_MINOR);
+    let versions = vec![
+        VersionFixture {
+            version: UP7_CURRENT,
+            dependencies: serde_json::json!({}),
+            peer_dependencies: serde_json::Value::Null,
+            lifecycle_scripts: None,
+            tarball: current_tarball.clone(),
+        },
+        VersionFixture {
+            version: UP7_MINOR,
+            dependencies: serde_json::json!({}),
+            peer_dependencies: serde_json::Value::Null,
+            lifecycle_scripts: None,
+            tarball: target_tarball.clone(),
+        },
+    ];
+    let metadata = up7_metadata(&mock.url(), UP7_PKG, UP7_MINOR, &versions);
+    Mock::given(method("GET"))
+        .and(wiremock_path(format!("/api/registry/{UP7_PKG}")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(metadata.clone()))
+        .mount(mock.server())
+        .await;
+    Mock::given(method("POST"))
+        .and(wiremock_path("/api/registry/batch-metadata"))
+        .respond_with(ResponseTemplate::new(200).set_body_json({
+            let mut packages = serde_json::Map::new();
+            packages.insert(UP7_PKG.to_string(), metadata);
+            serde_json::json!({ "packages": packages })
+        }))
+        .mount(mock.server())
+        .await;
+    Mock::given(method("GET"))
+        .and(wiremock_path(up7_tarball_path(UP7_PKG, UP7_CURRENT)))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(current_tarball))
+        .mount(mock.server())
+        .await;
+    Mock::given(method("GET"))
+        .and(wiremock_path(up7_tarball_path(UP7_PKG, UP7_MINOR)))
+        .respond_with(MarkDelayedUpgradeTarball {
+            marker: marker.to_path_buf(),
+            body: (!fail_target_tarball).then_some(target_tarball),
+            delay: std::time::Duration::from_millis(750),
+        })
+        .mount(mock.server())
+        .await;
+    mock
+}
+
+fn wait_for_upgrade_tarball_request(marker: &std::path::Path) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !marker.exists() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "timed out waiting for delayed upgrade tarball request"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
 // ─── Tests ──────────────────────────────────────────────────────────────
 
 #[tokio::test]
@@ -1707,6 +2198,164 @@ async fn upgrade_json_emits_one_document_after_successful_install() {
 
     let envelope = parse_stdout_json(&out.stdout, &out.stderr);
     assert_eq!(envelope["upgraded"], serde_json::json!(1));
+}
+
+#[tokio::test]
+async fn upgrade_rejects_a_manifest_edit_during_install_and_rolls_back_install_state() {
+    let project = TempProject::empty("");
+    let marker = project.path().join("target-tarball.requested");
+    let mock = setup_up7_delayed_install_fixture(&project, &marker, false).await;
+    let original_lockfile = project.read_file("lpm.lock");
+    let external_manifest = r#"{"name":"external-edit","version":"1.0.0"}"#;
+    let mut command = lpm_spawnable_with_registry(&project, &mock.url());
+    command.args(["upgrade", "-y"]);
+    let child = command.spawn().expect("spawn delayed successful upgrade");
+
+    wait_for_upgrade_tarball_request(&marker);
+    project.write_file("package.json", external_manifest);
+    let output = child
+        .wait_with_output()
+        .expect("wait for delayed successful upgrade");
+
+    assert!(
+        !output.status.success(),
+        "upgrade must reject a manifest edit made during installation\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(project.read_file("package.json"), external_manifest);
+    assert_eq!(project.read_file("lpm.lock"), original_lockfile);
+    assert!(!project.file_exists(".lpm/install-hash"));
+}
+
+#[tokio::test]
+async fn failed_upgrade_does_not_overwrite_a_manifest_edit_made_during_install() {
+    let project = TempProject::empty("");
+    let marker = project.path().join("target-tarball.requested");
+    let mock = setup_up7_delayed_install_fixture(&project, &marker, true).await;
+    let external_manifest = r#"{"name":"external-edit","version":"1.0.0"}"#;
+    let mut command = lpm_spawnable_with_registry(&project, &mock.url());
+    command.args(["upgrade", "-y"]);
+    let child = command.spawn().expect("spawn delayed failing upgrade");
+
+    wait_for_upgrade_tarball_request(&marker);
+    project.write_file("package.json", external_manifest);
+    let output = child
+        .wait_with_output()
+        .expect("wait for delayed failing upgrade");
+
+    assert!(
+        !output.status.success(),
+        "upgrade fixture should fail after the manifest edit"
+    );
+    assert_eq!(project.read_file("package.json"), external_manifest);
+}
+
+#[tokio::test]
+async fn upgrade_respects_a_direct_dependency_override_that_pins_the_installed_version() {
+    let project = TempProject::empty("");
+    let mock = setup_up7_successful_upgrade_fixture(&project, UP7_MINOR, false).await;
+    let mut manifest = up7_manifest_with_dependency("^1.2.0", false);
+    manifest["overrides"] = serde_json::json!({ UP7_PKG: UP7_CURRENT });
+    up7_write_manifest(&project, &manifest);
+    up7_write_lockfile(&project, &[(UP7_PKG, UP7_CURRENT)]);
+    let original_manifest = project.read_file("package.json");
+
+    let output = lpm_with_registry_and_npm(&project, &mock.url())
+        .args(["upgrade", "-y", "--json"])
+        .output()
+        .expect("run upgrade with a direct dependency override");
+
+    assert!(
+        output.status.success(),
+        "override-controlled upgrade should succeed without an impossible plan\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let envelope = parse_stdout_json(&output.stdout, &output.stderr);
+    assert_eq!(envelope["upgraded"], 0);
+    assert_eq!(project.read_file("package.json"), original_manifest);
+    let lockfile = lpm_lockfile::Lockfile::read_from_file(&project.path().join("lpm.lock"))
+        .expect("read override-controlled lockfile");
+    assert_eq!(
+        lockfile
+            .find_package(UP7_PKG)
+            .map(|package| package.version.as_str()),
+        Some(UP7_CURRENT)
+    );
+}
+
+#[tokio::test]
+async fn upgrade_bounds_and_deduplicates_remote_metadata_failure_details() {
+    let canonical = "@lpm.dev/acme.failure-budget";
+    let dependencies = (0..32)
+        .map(|index| {
+            (
+                format!("failure-alias-{index}"),
+                serde_json::Value::String(format!("npm:{canonical}@^1.0.0")),
+            )
+        })
+        .collect::<serde_json::Map<_, _>>();
+    let project = TempProject::empty(
+        &serde_json::to_string(&serde_json::json!({
+            "name": "upgrade-failure-budget",
+            "version": "1.0.0",
+            "dependencies": dependencies
+        }))
+        .unwrap(),
+    );
+    let mock = MockRegistry::start().await;
+    Mock::given(method("GET"))
+        .and(wiremock_path(format!("/api/registry/{canonical}")))
+        .respond_with(ResponseTemplate::new(404).set_body_string("x".repeat(1024 * 1024)))
+        .mount(mock.server())
+        .await;
+
+    let output = lpm_with_registry_and_npm(&project, &mock.url())
+        .args(["upgrade", "-y", "--json"])
+        .output()
+        .expect("run upgrade with a large shared metadata failure");
+
+    assert!(!output.status.success());
+    assert!(
+        output.stderr.len() < 32 * 1024,
+        "one shared remote failure must not expand into {} bytes of diagnostics",
+        output.stderr.len()
+    );
+}
+
+#[tokio::test]
+async fn upgrade_updates_an_installed_optional_dependency_in_its_original_section() {
+    let project = TempProject::empty("");
+    let mock = setup_up7_successful_upgrade_fixture(&project, UP7_MINOR, false).await;
+    up7_write_manifest(
+        &project,
+        &serde_json::json!({
+            "name": "optional-upgrade",
+            "version": "1.0.0",
+            "optionalDependencies": { UP7_PKG: "^1.2.0" }
+        }),
+    );
+    up7_write_lockfile(&project, &[(UP7_PKG, UP7_CURRENT)]);
+
+    let output = lpm_with_registry_and_npm(&project, &mock.url())
+        .args(["upgrade", "-y", "--json"])
+        .output()
+        .expect("upgrade an optional dependency");
+
+    assert!(
+        output.status.success(),
+        "optional dependency upgrade should succeed\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let manifest: serde_json::Value =
+        serde_json::from_str(&project.read_file("package.json")).unwrap();
+    assert_eq!(
+        manifest["optionalDependencies"][UP7_PKG],
+        serde_json::json!("^1.3.0")
+    );
+    assert!(manifest.get("dependencies").is_none());
 }
 
 #[tokio::test]

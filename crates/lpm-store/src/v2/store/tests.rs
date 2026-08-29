@@ -2967,15 +2967,62 @@ fn v3_prune_keeps_a_blob_until_its_last_source_is_removed() {
         .find(|path| path.metadata().is_ok_and(|metadata| metadata.len() == 6))
         .unwrap();
 
-    let first_only = std::collections::HashSet::from([first.clone()]);
+    let first_only = vec![first.clone()];
     let plan = store.file_cas_prune_plan(&first_only).unwrap().unwrap();
     assert!(!plan.blob_files_orphaned.contains(&shared_blob));
     assert_eq!(plan.source_validation_files_orphaned.len(), 1);
 
-    let both = std::collections::HashSet::from([first, second]);
+    let both = vec![first, second];
     let plan = store.file_cas_prune_plan(&both).unwrap().unwrap();
     assert!(plan.blob_files_orphaned.contains(&shared_blob));
     assert_eq!(plan.source_validation_files_orphaned.len(), 2);
+}
+
+#[test]
+fn v3_prune_streaming_inventories_preserve_totals_and_sorted_orphans() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::at_v3(dir.path());
+    let first_tarball = build_test_tarball(&[
+        (
+            "package.json",
+            b"{\"name\":\"stream-a\",\"version\":\"1.0.0\"}",
+        ),
+        ("a.js", b"alpha"),
+    ]);
+    let second_tarball = build_test_tarball(&[
+        (
+            "package.json",
+            b"{\"name\":\"stream-b\",\"version\":\"1.0.0\"}",
+        ),
+        ("b.js", b"beta"),
+    ]);
+    let (first, _, _) = store
+        .extract_object_from_bytes(&first_tarball, None)
+        .unwrap();
+    let (second, _, _) = store
+        .extract_object_from_bytes(&second_tarball, None)
+        .unwrap();
+
+    let plan = store
+        .file_cas_prune_plan(&[first, second])
+        .unwrap()
+        .unwrap();
+
+    assert_eq!(plan.tree_files_orphaned.len(), plan.trees_total);
+    assert_eq!(plan.blob_files_orphaned.len(), plan.blobs_total);
+    assert_eq!(
+        plan.materialized_entries_orphaned.len(),
+        plan.materialized_total
+    );
+    for paths in [
+        &plan.tree_files_orphaned,
+        &plan.blob_files_orphaned,
+        &plan.source_record_files_orphaned,
+        &plan.source_validation_files_orphaned,
+        &plan.materialized_entries_orphaned,
+    ] {
+        assert!(paths.windows(2).all(|pair| pair[0] <= pair[1]));
+    }
 }
 
 #[test]
@@ -3005,9 +3052,7 @@ fn v3_prune_refuses_to_plan_when_a_live_manifest_is_malformed() {
         .unwrap();
     std::fs::write(manifest, b"malformed").unwrap();
 
-    let error = store
-        .file_cas_prune_plan(&std::collections::HashSet::new())
-        .unwrap_err();
+    let error = store.file_cas_prune_plan(&[]).unwrap_err();
 
     assert!(error.to_string().contains("tree digest mismatch"));
     assert!(object_dir.is_dir());
@@ -3037,13 +3082,10 @@ fn v3_prune_marks_materialized_cache_orphan_after_source_removal() {
         })
         .unwrap();
 
-    let live = store
-        .file_cas_prune_plan(&std::collections::HashSet::new())
-        .unwrap()
-        .unwrap();
+    let live = store.file_cas_prune_plan(&[]).unwrap().unwrap();
     assert!(live.materialized_entries_orphaned.is_empty());
 
-    let removed = std::collections::HashSet::from([object_dir]);
+    let removed = vec![object_dir];
     let orphaned = store.file_cas_prune_plan(&removed).unwrap().unwrap();
     assert_eq!(orphaned.materialized_entries_orphaned.len(), 1);
 }

@@ -1,9 +1,9 @@
 use super::prepare::{StagedUpgrade, UpgradePrep};
-use super::rollback::{restore_prior_shims_after_aborted_upgrade, rollback_aborted_upgrade};
+use super::rollback::{abort_upgrade_in_manifest, restore_prior_shims_after_aborted_upgrade};
 use chrono::Utc;
 use lpm_common::{LpmError, LpmRoot};
 use lpm_global::{
-    CommandCollision, InstallRootStatus, PackageEntry, Shim, WalRecord, WalWriter,
+    CommandCollision, GlobalManifest, InstallRootStatus, PackageEntry, Shim, WalRecord, WalWriter,
     artifacts_complete, emit_shim, find_command_collisions, read_for, validate_install_root,
     write_for,
 };
@@ -18,13 +18,84 @@ pub(super) struct UpgradeOutput {
     pub(super) commands: Vec<String>,
 }
 
+struct UpgradeCommitError {
+    error: Box<LpmError>,
+    wal_record: Option<WalRecord>,
+}
+
+impl From<LpmError> for UpgradeCommitError {
+    fn from(error: LpmError) -> Self {
+        Self {
+            error: Box::new(error),
+            wal_record: None,
+        }
+    }
+}
+
 pub(super) fn commit_upgrade_locked(
     root: &LpmRoot,
     prep: &UpgradePrep,
     staged: &StagedUpgrade,
 ) -> Result<UpgradeOutput, LpmError> {
     let mut manifest = read_for(root)?;
+    match apply_upgrade_commit(root, &mut manifest, prep, staged) {
+        Ok((output, record)) => {
+            persist_upgrade_commit_records(root, &manifest, std::slice::from_ref(&record))?;
+            Ok(output)
+        }
+        Err(error) => {
+            if let Some(record) = error.wal_record.as_ref() {
+                persist_upgrade_commit_records(root, &manifest, std::slice::from_ref(record))?;
+            }
+            Err(*error.error)
+        }
+    }
+}
 
+pub(super) fn commit_upgrade_batch_locked(
+    root: &LpmRoot,
+    upgrades: &[(&UpgradePrep, &StagedUpgrade)],
+) -> Result<Vec<Result<UpgradeOutput, LpmError>>, LpmError> {
+    let mut manifest = read_for(root)?;
+    let mut records = Vec::with_capacity(upgrades.len());
+    let mut results = Vec::with_capacity(upgrades.len());
+    for &(prep, staged) in upgrades {
+        match apply_upgrade_commit(root, &mut manifest, prep, staged) {
+            Ok((output, record)) => {
+                records.push(record);
+                results.push(Ok(output));
+            }
+            Err(error) => {
+                if let Some(record) = error.wal_record {
+                    records.push(record);
+                }
+                results.push(Err(*error.error));
+            }
+        }
+    }
+    if !records.is_empty() {
+        persist_upgrade_commit_records(root, &manifest, &records)?;
+    }
+    Ok(results)
+}
+
+fn persist_upgrade_commit_records(
+    root: &LpmRoot,
+    manifest: &GlobalManifest,
+    records: &[WalRecord],
+) -> Result<(), LpmError> {
+    write_for(root, manifest)?;
+    let mut wal = WalWriter::open(root.global_wal())?;
+    wal.append_many(records.iter())?;
+    Ok(())
+}
+
+fn apply_upgrade_commit(
+    root: &LpmRoot,
+    manifest: &mut GlobalManifest,
+    prep: &UpgradePrep,
+    staged: &StagedUpgrade,
+) -> Result<(UpgradeOutput, WalRecord), UpgradeCommitError> {
     let status = validate_install_root(&staged.install_root, None)?;
     let marker_commands = match status {
         InstallRootStatus::Ready { commands } => commands,
@@ -33,7 +104,8 @@ pub(super) fn commit_upgrade_locked(
                 "install root for '{}' failed validation: {other:?}. Recovery will reconcile \
                  on next `lpm` invocation.",
                 prep.name
-            )));
+            ))
+            .into());
         }
     };
 
@@ -78,8 +150,11 @@ pub(super) fn commit_upgrade_locked(
                 .collect::<Vec<_>>()
                 .join(", ")
         );
-        rollback_aborted_upgrade(root, &mut manifest, staged, &prep.name, &detail)?;
-        return Err(LpmError::Script(detail));
+        let wal_record = abort_upgrade_in_manifest(manifest, staged, &prep.name, &detail);
+        return Err(UpgradeCommitError {
+            error: Box::new(LpmError::Script(detail)),
+            wal_record: Some(wal_record),
+        });
     }
 
     let final_commands: Vec<String> = marker_commands
@@ -100,36 +175,34 @@ pub(super) fn commit_upgrade_locked(
     // that owns the same PATH name — the aliased-away bin won't be on
     // PATH after this commit.
     let collisions: Vec<CommandCollision> =
-        find_command_collisions(&manifest, &prep.name, &final_commands);
+        find_command_collisions(manifest, &prep.name, &final_commands);
     if !collisions.is_empty() {
         // Inline rollback: drop pending row, tombstone new install
         // root (recovery sweep will retry the actual delete), write
         // WAL Abort. Manifest stays at the pre-upgrade state.
-        rollback_aborted_upgrade(
-            root,
-            &mut manifest,
-            staged,
-            &prep.name,
-            &format!(
-                "command collision with another package: {}",
-                collisions
-                    .iter()
-                    .map(|c| format!("{} (owned by {})", c.command, c.current_owner))
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            ),
-        )?;
-        return Err(LpmError::Script(format!(
-            "upgrade of '{}' would conflict with another globally-installed package's \
-             commands: {}. The pre-upgrade install is unchanged. Resolve the conflict (uninstall \
-             the other package or use --alias to remap the command name) and retry.",
-            prep.name,
+        let rollback_reason = format!(
+            "command collision with another package: {}",
             collisions
                 .iter()
-                .map(|c| c.command.as_str())
+                .map(|c| format!("{} (owned by {})", c.command, c.current_owner))
                 .collect::<Vec<_>>()
                 .join(", ")
-        )));
+        );
+        let wal_record = abort_upgrade_in_manifest(manifest, staged, &prep.name, &rollback_reason);
+        return Err(UpgradeCommitError {
+            error: Box::new(LpmError::Script(format!(
+                "upgrade of '{}' would conflict with another globally-installed package's \
+             commands: {}. The pre-upgrade install is unchanged. Resolve the conflict (uninstall \
+             the other package or use --alias to remap the command name) and retry.",
+                prep.name,
+                collisions
+                    .iter()
+                    .map(|c| c.command.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ))),
+            wal_record: Some(wal_record),
+        });
     }
 
     // Atomic shim swap: emit_shim's tempfile-rename swaps existing
@@ -149,7 +222,8 @@ pub(super) fn commit_upgrade_locked(
                 command_name: cmd.clone(),
                 target,
             },
-        )?;
+        )
+        .map_err(LpmError::from)?;
         emitted_shims.push(cmd.clone());
     }
     // Re-emit each prior alias against the new install root so the
@@ -163,7 +237,8 @@ pub(super) fn commit_upgrade_locked(
                 command_name: alias_name.clone(),
                 target,
             },
-        )?;
+        )
+        .map_err(LpmError::from)?;
         emitted_shims.push(alias_name.clone());
     }
 
@@ -201,10 +276,13 @@ pub(super) fn commit_upgrade_locked(
                 restore_failures.join("; ")
             );
             tracing::warn!("update -g rollback: deferring '{}': {combined}", prep.name);
-            return Err(LpmError::Script(combined));
+            return Err(LpmError::Script(combined).into());
         }
-        rollback_aborted_upgrade(root, &mut manifest, staged, &prep.name, &detail)?;
-        return Err(LpmError::Script(detail));
+        let wal_record = abort_upgrade_in_manifest(manifest, staged, &prep.name, &detail);
+        return Err(UpgradeCommitError {
+            error: Box::new(LpmError::Script(detail)),
+            wal_record: Some(wal_record),
+        });
     }
 
     // Flip [pending] → [packages]. Tombstone the OLD install root
@@ -239,22 +317,21 @@ pub(super) fn commit_upgrade_locked(
     // referencing the same package + bin still resolve correctly now
     // that `packages[prep.name].root` points at the new install root.
 
-    // Persist BEFORE WAL Commit (manifest-before-commit ordering invariant).
-    write_for(root, &manifest)?;
-
-    let mut wal = WalWriter::open(root.global_wal())?;
-    wal.append(&WalRecord::Commit {
+    let record = WalRecord::Commit {
         tx_id: staged.tx_id.clone(),
         committed_at: Utc::now(),
-    })?;
+    };
 
-    Ok(UpgradeOutput {
-        name: prep.name.clone(),
-        from_version: prep.current_version.clone(),
-        to_version: prep.new_version.to_string(),
-        saved_spec: prep.new_saved_spec.clone(),
-        commands: final_commands,
-    })
+    Ok((
+        UpgradeOutput {
+            name: prep.name.clone(),
+            from_version: prep.current_version.clone(),
+            to_version: prep.new_version.to_string(),
+            saved_spec: prep.new_saved_spec.clone(),
+            commands: final_commands,
+        },
+        record,
+    ))
 }
 
 #[cfg(all(test, unix))]
