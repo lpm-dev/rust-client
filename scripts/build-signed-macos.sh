@@ -4,7 +4,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd -P)"
 ENTITLEMENTS="$REPO_ROOT/macos/lpm.entitlements"
-INFO_PLIST="$REPO_ROOT/macos/LPMCLI-Info.plist"
+APP_ASSEMBLER="$REPO_ROOT/scripts/assemble-macos-app.sh"
 SIGNING_IDENTITY="${LPM_SIGNING_IDENTITY:-Developer ID Application: Tolga Ergin (823S8YKMRW)}"
 PROVISIONING_PROFILE="${LPM_CLI_PROVISIONING_PROFILE:-}"
 EXPECTED_TEAM_ID="823S8YKMRW"
@@ -114,10 +114,7 @@ fi
 BINARY="$TARGET_PROFILE_ROOT/lpm-rs"
 APP_BUNDLE="$TARGET_PROFILE_ROOT/LPM CLI.app"
 STAGING_DIR="$(mktemp -d "$TARGET_PROFILE_ROOT/.lpm-cli-app.XXXXXX")"
-mkdir -p "$STAGING_DIR/Contents/MacOS"
-cp "$INFO_PLIST" "$STAGING_DIR/Contents/Info.plist"
-cp "$BINARY" "$STAGING_DIR/Contents/MacOS/lpm-rs"
-cp "$PROVISIONING_PROFILE" "$STAGING_DIR/Contents/embedded.provisionprofile"
+"$APP_ASSEMBLER" "$BINARY" "$STAGING_DIR" "$PROVISIONING_PROFILE"
 
 codesign --force --options runtime "$TIMESTAMP_ARGUMENT" \
 	--entitlements "$ENTITLEMENTS" \

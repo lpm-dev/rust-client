@@ -58,6 +58,20 @@ identity from Apple team `823S8YKMRW` is configured with that profile.
 Contributors without that signing identity can use the debug-only file backend
 with `LPM_FORCE_FILE_VAULT=1`. It is isolated from the production Keychain.
 
+## Icon asset
+
+`assets/lpm-icon.svg` is the canonical blue CLI icon. Regenerate and validate
+the macOS asset with the system image tools:
+
+```bash
+./scripts/generate-macos-icon.sh
+./scripts/validate-macos-icon.sh
+```
+
+The app assembly helper runs the validator before it copies the icon into the
+bundle. Pull-request CI assembles the unsigned app with the same helper that the
+signed release and local development paths use.
+
 ## Release layout
 
 The release workflow creates this bundle:
@@ -69,6 +83,7 @@ LPM CLI.app/
     CodeResources
     embedded.provisionprofile
     MacOS/lpm-rs
+    Resources/LPMCLI.icns
     _CodeSignature/CodeResources
 ```
 

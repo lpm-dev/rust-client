@@ -165,7 +165,7 @@ test("raw macOS compatibility assets reuse dependencies while preserving separat
   );
   assert.match(
     releaseWorkflow,
-    /cp "\$RUNNER_TEMP\/lpm-rs-provisioned" "\$APP_BUNDLE\/Contents\/MacOS\/lpm-rs"/,
+    /scripts\/assemble-macos-app\.sh" \s*\\\s*"\$RUNNER_TEMP\/lpm-rs-provisioned" \s*\\\s*"\$APP_BUNDLE"/,
   );
   assert.match(releaseWorkflow, /env set LPM_RELEASE_SMOKE=verified/);
   assert.match(releaseWorkflow, /env get LPM_RELEASE_SMOKE >\/dev\/null/);
@@ -222,8 +222,58 @@ test("macOS release workflow provisions, notarizes, staples, and executes the bu
   );
   assert.match(releaseWorkflow, /unzip -q "\$archive" -d "binaries\/\$\{platform\}" -x '\*\/\._\*'/);
   assert.match(releaseWorkflow, /LPM CLI\.app\/Contents\/MacOS\/lpm-rs/);
-  assert.match(localBuild, /Contents\/embedded\.provisionprofile/);
+  assert.match(
+    localBuild,
+    /"\$APP_ASSEMBLER" "\$BINARY" "\$STAGING_DIR" "\$PROVISIONING_PROFILE"/,
+  );
   assert.doesNotMatch(releaseWorkflow, /--entitlements "\$APPLE_CODESIGN_ENTITLEMENTS"\s*\\\s*--sign[^\n]+\s*\\\s*"\$\{\{ matrix\.binary \}\}"/);
+});
+
+test("macOS app bundles declare and package the LPM icon", () => {
+  const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../../..");
+  const infoPlist = fs.readFileSync(path.join(repoRoot, "macos/LPMCLI-Info.plist"), "utf8");
+  const localBuild = fs.readFileSync(
+    path.join(repoRoot, "scripts/build-signed-macos.sh"),
+    "utf8",
+  );
+  const releaseWorkflow = fs.readFileSync(
+    path.join(repoRoot, ".github/workflows/release.yml"),
+    "utf8",
+  );
+  const appAssembler = fs.readFileSync(
+    path.join(repoRoot, "scripts/assemble-macos-app.sh"),
+    "utf8",
+  );
+  const iconGenerator = fs.readFileSync(
+    path.join(repoRoot, "scripts/generate-macos-icon.sh"),
+    "utf8",
+  );
+  const iconValidator = fs.readFileSync(
+    path.join(repoRoot, "scripts/validate-macos-icon.sh"),
+    "utf8",
+  );
+  const ciWorkflow = fs.readFileSync(
+    path.join(repoRoot, ".github/workflows/ci.yml"),
+    "utf8",
+  );
+
+  assert.match(
+    infoPlist,
+    /<key>CFBundleIconFile<\/key>\s*<string>LPMCLI\.icns<\/string>/,
+  );
+  assert.equal(
+    fs.readFileSync(path.join(repoRoot, "macos/LPMCLI.icns")).subarray(0, 4).toString("ascii"),
+    "icns",
+  );
+  assert.match(localBuild, /assemble-macos-app\.sh/);
+  assert.match(releaseWorkflow, /scripts\/assemble-macos-app\.sh/);
+  assert.match(ciWorkflow, /scripts\/assemble-macos-app\.sh/);
+  assert.match(appAssembler, /Contents\/Resources\/LPMCLI\.icns/);
+  assert.match(appAssembler, /validate-macos-icon\.sh/);
+  assert.match(iconGenerator, /assets\/lpm-icon\.svg/);
+  assert.match(iconGenerator, /iconutil --convert icns/);
+  assert.match(iconValidator, /iconutil --convert iconset/);
+  assert.match(iconValidator, /must contain exactly 10 icon representations/);
 });
 
 test("release workflow smoke-tests standalone macOS bundle installation on both architectures", () => {

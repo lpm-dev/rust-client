@@ -28,6 +28,8 @@ EXPECTED_BUNDLE_ID="dev.lpm.cli"
 EXPECTED_TEAM_ID="823S8YKMRW"
 EXPECTED_ACCESS_GROUP="$EXPECTED_TEAM_ID.dev.lpm.vault.shared"
 EXPECTED_PROFILE_ACCESS_GROUP="$EXPECTED_TEAM_ID.*"
+# v0.76.5 is the last signed app bundle that does not declare an icon.
+MACOS_ICON_FIRST_VERSION="v0.76.6"
 MACOS_BUNDLE=0
 LEGACY_MACOS=0
 
@@ -530,6 +532,7 @@ validate_macos_bundle() {
   app_label="$2"
   app_contents="$app_bundle/Contents"
   app_executable="$app_contents/MacOS/lpm-rs"
+  app_icon="$app_contents/Resources/LPMCLI.icns"
   app_profile="$app_contents/embedded.provisionprofile"
   app_signature="$app_contents/_CodeSignature/CodeResources"
   app_ticket="$app_contents/CodeResources"
@@ -547,9 +550,25 @@ validate_macos_bundle() {
     fi
   done
 
+  declared_icon=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIconFile' "$app_contents/Info.plist" 2>/dev/null || true)
+  icon_required=0
+  if ! version_lt "$VERSION" "$MACOS_ICON_FIRST_VERSION"; then
+    icon_required=1
+  fi
+  if [ "$icon_required" = "1" ] || [ -n "$declared_icon" ] || [ -e "$app_icon" ] || [ -L "$app_icon" ]; then
+    if [ "$declared_icon" != "LPMCLI.icns" ]; then
+      echo "ERROR: $app_label must declare LPMCLI.icns as its application icon."
+      return 1
+    fi
+    if [ ! -f "$app_icon" ] || [ -L "$app_icon" ]; then
+      echo "ERROR: $app_label is missing its declared regular icon file: $app_icon"
+      return 1
+    fi
+  fi
+
   unexpected_entries=$(
     cd "$app_bundle" &&
-      find . -print | grep -Ev '^(\.|\./Contents|\./Contents/Info\.plist|\./Contents/CodeResources|\./Contents/embedded\.provisionprofile|\./Contents/MacOS|\./Contents/MacOS/lpm-rs|\./Contents/_CodeSignature|\./Contents/_CodeSignature/CodeResources)$' || true
+      find . -print | grep -Ev '^(\.|\./Contents|\./Contents/Info\.plist|\./Contents/CodeResources|\./Contents/embedded\.provisionprofile|\./Contents/MacOS|\./Contents/MacOS/lpm-rs|\./Contents/Resources|\./Contents/Resources/LPMCLI\.icns|\./Contents/_CodeSignature|\./Contents/_CodeSignature/CodeResources)$' || true
   )
   if [ -n "$unexpected_entries" ]; then
     echo "ERROR: $app_label contains unexpected entries:"

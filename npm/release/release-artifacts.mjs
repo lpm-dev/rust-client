@@ -132,6 +132,7 @@ function macOSPlatformPackage(key, cpu) {
       Object.freeze({ path: "LPM CLI.app/Contents/CodeResources", mode: 0o644 }),
       Object.freeze({ path: "LPM CLI.app/Contents/embedded.provisionprofile", mode: 0o644 }),
       Object.freeze({ path: "LPM CLI.app/Contents/MacOS/lpm-rs", mode: 0o755 }),
+      Object.freeze({ path: "LPM CLI.app/Contents/Resources/LPMCLI.icns", mode: 0o644 }),
       Object.freeze({ path: "LPM CLI.app/Contents/_CodeSignature/CodeResources", mode: 0o644 }),
     ],
   );

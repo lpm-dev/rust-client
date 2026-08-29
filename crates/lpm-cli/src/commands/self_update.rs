@@ -2209,18 +2209,20 @@ const MACOS_EXPECTED_ACCESS_GROUP: &str = "823S8YKMRW.dev.lpm.vault.shared";
 #[cfg(target_os = "macos")]
 const MACOS_EXPECTED_PROFILE_ACCESS_GROUP: &str = "823S8YKMRW.*";
 #[cfg(any(target_os = "macos", test))]
-const MACOS_REQUIRED_BUNDLE_FILES: [&str; 5] = [
+const MACOS_REQUIRED_BUNDLE_FILES: [&str; 6] = [
     "LPM CLI.app/Contents/Info.plist",
     "LPM CLI.app/Contents/CodeResources",
     "LPM CLI.app/Contents/embedded.provisionprofile",
     "LPM CLI.app/Contents/MacOS/lpm-rs",
+    "LPM CLI.app/Contents/Resources/LPMCLI.icns",
     "LPM CLI.app/Contents/_CodeSignature/CodeResources",
 ];
 #[cfg(any(target_os = "macos", test))]
-const MACOS_ALLOWED_BUNDLE_DIRECTORIES: [&str; 4] = [
+const MACOS_ALLOWED_BUNDLE_DIRECTORIES: [&str; 5] = [
     "LPM CLI.app",
     "LPM CLI.app/Contents",
     "LPM CLI.app/Contents/MacOS",
+    "LPM CLI.app/Contents/Resources",
     "LPM CLI.app/Contents/_CodeSignature",
 ];
 
@@ -2533,6 +2535,7 @@ fn validate_macos_app_inventory(app_bundle: &Path) -> Result<(), LpmError> {
     let expected_directories = [
         PathBuf::from("Contents"),
         PathBuf::from("Contents/MacOS"),
+        PathBuf::from("Contents/Resources"),
         PathBuf::from("Contents/_CodeSignature"),
     ]
     .into_iter()
@@ -2542,6 +2545,7 @@ fn validate_macos_app_inventory(app_bundle: &Path) -> Result<(), LpmError> {
         PathBuf::from("Contents/CodeResources"),
         PathBuf::from("Contents/embedded.provisionprofile"),
         PathBuf::from("Contents/MacOS/lpm-rs"),
+        PathBuf::from("Contents/Resources/LPMCLI.icns"),
         PathBuf::from("Contents/_CodeSignature/CodeResources"),
     ]
     .into_iter()
@@ -3478,6 +3482,10 @@ mod tests {
                 (
                     "LPM CLI.app/Contents/embedded.provisionprofile",
                     b"profile".as_slice(),
+                ),
+                (
+                    "LPM CLI.app/Contents/Resources/LPMCLI.icns",
+                    b"icon".as_slice(),
                 ),
                 ("LPM CLI.app/Contents/MacOS/lpm-rs", b"binary".as_slice()),
                 (

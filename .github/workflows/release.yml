@@ -672,10 +672,6 @@ jobs:
           PROFILE_PATH="$RUNNER_TEMP/lpm-cli.provisionprofile"
           PROFILE_PLIST="$RUNNER_TEMP/lpm-cli-profile.plist"
           APP_BUNDLE="$RUNNER_TEMP/${{ matrix.binary }}-bundle/LPM CLI.app"
-          mkdir -p "$APP_BUNDLE/Contents/MacOS"
-          cp macos/LPMCLI-Info.plist "$APP_BUNDLE/Contents/Info.plist"
-          cp "$RUNNER_TEMP/lpm-rs-provisioned" "$APP_BUNDLE/Contents/MacOS/lpm-rs"
-          chmod 755 "$APP_BUNDLE/Contents/MacOS/lpm-rs"
           printf '%s' "$APPLE_CLI_PROVISIONING_PROFILE_BASE64" | base64 --decode > "$PROFILE_PATH"
           security cms -D -i "$PROFILE_PATH" > "$PROFILE_PLIST"
 
@@ -691,7 +687,10 @@ jobs:
             -v exact="$APPLE_KEYCHAIN_ACCESS_GROUP" \
             -v wildcard="$APPLE_TEAM_ID.*" \
             '{ value = $0; gsub(/^[[:space:]]+|[[:space:]]+$/, "", value); if (value == exact || value == wildcard) found = 1 } END { exit(found ? 0 : 1) }'
-          cp "$PROFILE_PATH" "$APP_BUNDLE/Contents/embedded.provisionprofile"
+          "$GITHUB_WORKSPACE/scripts/assemble-macos-app.sh" \
+            "$RUNNER_TEMP/lpm-rs-provisioned" \
+            "$APP_BUNDLE" \
+            "$PROFILE_PATH"
 
           codesign --force --timestamp --options runtime \
             --keychain "$APPLE_SIGNING_KEYCHAIN" \
@@ -1296,7 +1295,7 @@ jobs:
             unexpected_entries=$(
               cd "binaries/${platform}" &&
                 find 'LPM CLI.app' -print |
-                  grep -Ev '^(LPM CLI\.app|LPM CLI\.app/Contents|LPM CLI\.app/Contents/Info\.plist|LPM CLI\.app/Contents/CodeResources|LPM CLI\.app/Contents/embedded\.provisionprofile|LPM CLI\.app/Contents/MacOS|LPM CLI\.app/Contents/MacOS/lpm-rs|LPM CLI\.app/Contents/_CodeSignature|LPM CLI\.app/Contents/_CodeSignature/CodeResources)$' || true
+                  grep -Ev '^(LPM CLI\.app|LPM CLI\.app/Contents|LPM CLI\.app/Contents/Info\.plist|LPM CLI\.app/Contents/CodeResources|LPM CLI\.app/Contents/embedded\.provisionprofile|LPM CLI\.app/Contents/MacOS|LPM CLI\.app/Contents/MacOS/lpm-rs|LPM CLI\.app/Contents/Resources|LPM CLI\.app/Contents/Resources/LPMCLI\.icns|LPM CLI\.app/Contents/_CodeSignature|LPM CLI\.app/Contents/_CodeSignature/CodeResources)$' || true
             )
             if [ -n "$unexpected_entries" ]; then
               echo "::error::${archive} produced unexpected npm bundle entries:"
