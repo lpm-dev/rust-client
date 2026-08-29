@@ -966,6 +966,97 @@ pub(super) async fn resolve_lpm_install_preflight(
     }
 }
 
+struct RoutedSwiftPackage {
+    name: lpm_common::PackageName,
+    version: String,
+    metadata: lpm_registry::VersionMetadata,
+    requirement: crate::swift_manifest::SwiftRequirement,
+}
+
+enum RoutedExplicitPackage {
+    JavaScript(String),
+    Swift(Box<RoutedSwiftPackage>),
+}
+
+enum SwiftInstallLocation {
+    Spm { manifest_path: PathBuf },
+    Xcode { xcodeproj_path: PathBuf },
+}
+
+fn selected_swift_install_locations(
+    member_manifests: &[PathBuf],
+) -> Result<Vec<SwiftInstallLocation>, LpmError> {
+    let locations = member_manifests
+        .iter()
+        .map(|package_json| {
+            let root = crate::commands::install_targets::install_root_for(package_json);
+            let manifest_path = root.join("Package.swift");
+            if manifest_path.is_file() {
+                return Ok(Some(SwiftInstallLocation::Spm { manifest_path }));
+            }
+            crate::xcode_project::find_xcodeproj_in_directory(root).map(|project| {
+                project.map(|xcodeproj_path| SwiftInstallLocation::Xcode { xcodeproj_path })
+            })
+        })
+        .collect::<Result<Vec<_>, LpmError>>()?;
+    Ok(locations.into_iter().flatten().collect())
+}
+
+async fn route_explicit_packages(
+    client: &RegistryClient,
+    packages: &[String],
+    save_flags: crate::save_spec::SaveFlags,
+) -> Result<(Vec<String>, Vec<RoutedSwiftPackage>), LpmError> {
+    use futures::{StreamExt as _, TryStreamExt as _};
+
+    let concurrency = packages.len().clamp(1, 8);
+    let mut routed = futures::stream::iter(packages.iter().cloned().enumerate())
+        .map(|(index, spec)| async move {
+            let (name, intent) = crate::save_spec::parse_user_save_intent(&spec)?;
+            if !name.starts_with("@lpm.dev/") {
+                return Ok::<_, LpmError>((index, RoutedExplicitPackage::JavaScript(spec)));
+            }
+            let package_name = lpm_common::PackageName::parse(&name)?;
+            let range = intent_to_range_string(&intent);
+            let (metadata, resolved_version) =
+                resolve_lpm_install_preflight(client, &package_name, &range).await?;
+            let version_metadata = metadata.version(&resolved_version).ok_or_else(|| {
+                LpmError::NotFound(format!(
+                    "version {resolved_version} not found for {}",
+                    package_name.scoped()
+                ))
+            })?;
+            if version_metadata.effective_ecosystem() != "swift" {
+                return Ok((index, RoutedExplicitPackage::JavaScript(spec)));
+            }
+            let requirement =
+                swift_requirement_from_intent(&intent, &resolved_version, save_flags)?;
+            Ok((
+                index,
+                RoutedExplicitPackage::Swift(Box::new(RoutedSwiftPackage {
+                    name: package_name,
+                    version: resolved_version,
+                    metadata: version_metadata.clone(),
+                    requirement,
+                })),
+            ))
+        })
+        .buffer_unordered(concurrency)
+        .try_collect::<Vec<_>>()
+        .await?;
+    routed.sort_unstable_by_key(|(index, _)| *index);
+
+    let mut javascript = Vec::with_capacity(routed.len());
+    let mut swift = Vec::new();
+    for (_, package) in routed {
+        match package {
+            RoutedExplicitPackage::JavaScript(spec) => javascript.push(spec),
+            RoutedExplicitPackage::Swift(package) => swift.push(*package),
+        }
+    }
+    Ok((javascript, swift))
+}
+
 /// Install specific packages: add them to package.json then run full install.
 /// For Swift packages (ecosystem=swift), uses SE-0292 registry mode instead.
 ///
@@ -1035,178 +1126,254 @@ pub async fn run_add_packages(
 
     // First pass: check if any LPM packages are Swift ecosystem
     // Route Swift packages to SE-0292 registry mode
-    let mut js_packages = Vec::new();
+    let (js_packages, swift_packages) =
+        route_explicit_packages(client, &packages, save_flags).await?;
 
-    for spec in &packages {
-        let (name, intent) = crate::save_spec::parse_user_save_intent(spec)?;
-        let range = intent_to_range_string(&intent);
-
-        if name.starts_with("@lpm.dev/") {
-            let pkg_name = lpm_common::PackageName::parse(&name)?;
-            let (metadata, resolved_ver) =
-                resolve_lpm_install_preflight(client, &pkg_name, &range).await?;
-            let ver_meta = metadata.version(&resolved_ver).ok_or_else(|| {
-                LpmError::NotFound(format!("version {resolved_ver} not found for {name}"))
-            })?;
-
-            if ver_meta.effective_ecosystem() == "swift" {
-                // SE-0292 registry mode
-                run_swift_install(
-                    project_dir,
-                    &pkg_name,
-                    &resolved_ver,
-                    ver_meta,
-                    SwiftInstallOptions {
-                        yes,
-                        json_output,
-                        audit_after_install,
-                        registry_url: client.base_url(),
-                        session: client.session().map(|session| session.as_ref()),
-                    },
-                )
-                .await?;
-                continue;
+    let mutation = async {
+        let mut swift_transaction = None;
+        let swift_report = if swift_packages.is_empty() {
+            None
+        } else {
+            let manifest_path = crate::swift_manifest::find_package_swift(project_dir);
+            let xcodeproj_path = crate::xcode_project::find_xcodeproj(project_dir)?;
+            let mut required_paths = Vec::new();
+            let mut optional_paths = Vec::new();
+            let mut rollback_dirs = Vec::new();
+            if let Some(manifest) = manifest_path.as_ref() {
+                required_paths.push(manifest.clone());
+                optional_paths.push(manifest.with_file_name("Package.resolved"));
+            } else if let Some(xcodeproj) = xcodeproj_path.as_ref() {
+                let pbxproj = xcodeproj.join("project.pbxproj");
+                required_paths.push(pbxproj.clone());
+                optional_paths.push(pbxproj.with_extension("pbxproj.lpm-backup"));
+                let project_root = xcodeproj.parent().unwrap_or(project_dir);
+                let wrapper_root = project_root.join(crate::swift_manifest::LPM_DEPS_REL_PATH);
+                optional_paths.push(wrapper_root.join("Package.swift"));
+                optional_paths.push(wrapper_root.join("Package.resolved"));
+                optional_paths.push(wrapper_root.join("Sources/LPMDependencies/Exports.swift"));
+                rollback_dirs.extend([
+                    wrapper_root.join("Sources/LPMDependencies"),
+                    wrapper_root.join("Sources"),
+                    wrapper_root.clone(),
+                    project_root.join("Packages"),
+                ]);
+            } else {
+                return Err(LpmError::Registry(
+                    "No Package.swift or .xcodeproj found. Initialize a Swift project first."
+                        .into(),
+                ));
             }
+            let required_refs = required_paths
+                .iter()
+                .map(PathBuf::as_path)
+                .collect::<Vec<_>>();
+            let optional_refs = optional_paths
+                .iter()
+                .map(PathBuf::as_path)
+                .collect::<Vec<_>>();
+            let mut transaction = crate::manifest_tx::ManifestTransaction::snapshot_install_state(
+                &required_refs,
+                &optional_refs,
+                &[],
+            )?;
+            transaction.remove_dirs_on_rollback(rollback_dirs);
+            let requests = swift_packages
+                .iter()
+                .map(|package| SwiftInstallRequest {
+                    name: &package.name,
+                    version: &package.version,
+                    ver_meta: &package.metadata,
+                    requirement: package.requirement.clone(),
+                })
+                .collect::<Vec<_>>();
+            let report = run_swift_install_batch(
+                project_dir,
+                &requests,
+                SwiftInstallOptions {
+                    yes,
+                    json_output,
+                    audit_after_install,
+                    registry_url: client.base_url(),
+                    session: client.session().map(|session| session.as_ref()),
+                },
+            )
+            .await?;
+
+            swift_transaction = Some(transaction);
+            Some(report)
+        };
+
+        if js_packages.is_empty() {
+            if let Some(transaction) = swift_transaction.take() {
+                workspace_lockfile::commit_manifest_transaction(transaction);
+            }
+            if json_output && let Some(report) = &swift_report {
+                report_capture::emit_install_json(report);
+            }
+            return Ok(());
         }
 
-        js_packages.push(spec.clone());
-    }
+        // ── stage → install → finalize, wrapped in a transaction
+        // that covers the FULL install state surface. Invariant:
+        // snapshot the manifest AND the lockfile so a failed install rolls
+        // both back together, and invalidate `.lpm/install-hash` so the next
+        // install re-resolves and reconciles `node_modules/` (which we don't
+        // snapshot — too large). ──────────────────────────────────────────
+        let pkg_json_path = project_dir.join("package.json");
+        let lockfile_path = project_dir.join(lpm_lockfile::LOCKFILE_NAME);
+        let lockfile_bin_path = lockfile_path.with_extension("lockb");
+        let install_hash_path = project_dir.join(".lpm").join("install-hash");
+        let pnpm_workspace_path = project_dir.join("pnpm-workspace.yaml");
 
-    // If all packages were Swift, we're done
-    if js_packages.is_empty() {
-        return Ok(());
-    }
-
-    // ── stage → install → finalize, wrapped in a transaction
-    // that covers the FULL install state surface. Invariant:
-    // snapshot the manifest AND the lockfile so a failed install rolls
-    // both back together, and invalidate `.lpm/install-hash` so the next
-    // install re-resolves and reconciles `node_modules/` (which we don't
-    // snapshot — too large). ──────────────────────────────────────────
-    let pkg_json_path = project_dir.join("package.json");
-    let lockfile_path = project_dir.join(lpm_lockfile::LOCKFILE_NAME);
-    let lockfile_bin_path = lockfile_path.with_extension("lockb");
-    let install_hash_path = project_dir.join(".lpm").join("install-hash");
-    let pnpm_workspace_path = project_dir.join("pnpm-workspace.yaml");
-
-    // ** fix.** Wrap the entire snapshot → stage → install
-    // → finalize → commit window in a per-project exclusive lock so
-    // concurrent `lpm install <pkg>` invocations on the same project
-    // serialize. Previously, both processes would snapshot the same
-    // pre-edit `package.json`, both stage their own dep on top, and
-    // the second-to-commit silently overwrote the first's edits
-    // (data-loss-grade). The lock is per-project (no cross-project
-    // contention) and held across all `?` early-exits via the async
-    // block's return.
-    //
-    // `run_with_options` (called below) does NOT acquire this lock
-    // itself — wrapping it would deadlock when called from inside
-    // this block. The lock surface is the OUTER transaction; the
-    // inner install pipeline runs under the assumption that the
-    // caller has serialized the snapshot+commit window.
-    workspace_lockfile::with_project_install_lock(project_dir, async {
-        // 1. Snapshot the install state surface. Manifest is required (must
-        // exist by precondition); lockfile + binary lockfile are optional
-        // (absent on a fresh project); install-hash is invalidate-only
-        // (cache file, deleted on rollback regardless of pre-state).
-        let optional_refs = [
-            lockfile_path.as_path(),
-            lockfile_bin_path.as_path(),
-            pnpm_workspace_path.as_path(),
-        ];
-        let tx = crate::manifest_tx::ManifestTransaction::snapshot_install_state(
-            &[&pkg_json_path],
-            &optional_refs,
-            &[&install_hash_path],
-        )?;
-        maybe_test_panic("after-snapshot");
-
-        // 2. Stage the new entries. Explicit specs land verbatim; bare/dist-tag
-        // entries get a `*` placeholder that finalize will replace using the
-        // save policy (resolved version + flags + config).
+        // ** fix.** Wrap the entire snapshot → stage → install
+        // → finalize → commit window in a per-project exclusive lock so
+        // concurrent `lpm install <pkg>` invocations on the same project
+        // serialize. Previously, both processes would snapshot the same
+        // pre-edit `package.json`, both stage their own dep on top, and
+        // the second-to-commit silently overwrote the first's edits
+        // (data-loss-grade). The lock is per-project (no cross-project
+        // contention) and held across all `?` early-exits via the async
+        // block's return.
         //
-        // Step 6: load `./lpm.toml` (project) merged with
-        // `~/.lpm/config.toml` (global) for the persistent save-policy
-        // keys. CLI flags still beat config inside `decide_saved_dependency_spec`.
-        let save_config = crate::save_config::SaveConfigLoader::load_for_project(project_dir)?;
-        let catalog_policy = catalog_save_policy_for_project(project_dir, catalog_name_override)?;
-        let staged =
-            stage_packages_to_manifest(&pkg_json_path, &js_packages, save_dev, save_flags)?;
-        let route_table = load_install_route_table(project_dir, client)?;
-        pin_staged_dist_tags_for_resolution(client, &route_table, &staged).await?;
-        preflight_catalog_policy_rejection(client, &route_table, &staged, &catalog_policy).await?;
-        maybe_test_panic("after-stage");
+        // `run_with_options` (called below) does NOT acquire this lock
+        // itself — wrapping it would deadlock when called from inside
+        // this block. The lock surface is the OUTER transaction; the
+        // inner install pipeline runs under the assumption that the
+        // caller has serialized the snapshot+commit window.
+        let javascript_capture = json_output.then(report_capture::new_capture);
+        let javascript_install = async {
+            // 1. Snapshot the install state surface. Manifest is required (must
+            // exist by precondition); lockfile + binary lockfile are optional
+            // (absent on a fresh project); install-hash is invalidate-only
+            // (cache file, deleted on rollback regardless of pre-state).
+            let optional_refs = [
+                lockfile_path.as_path(),
+                lockfile_bin_path.as_path(),
+                pnpm_workspace_path.as_path(),
+            ];
+            let tx = crate::manifest_tx::ManifestTransaction::snapshot_install_state(
+                &[&pkg_json_path],
+                &optional_refs,
+                &[&install_hash_path],
+            )?;
+            maybe_test_panic("after-snapshot");
 
-        // 3. Run the full install pipeline, capturing the direct-dep version
-        // map via the out-param. If anything fails, the `?`
-        // returns early — `tx` drops without `commit()` and the manifest
-        // snaps back to its pre-stage state. The placeholder never survives.
-        // We intentionally keep any existing lockfile on disk so the
-        // pipeline can diff against the pre-install direct graph. The warm
-        // fast-path validator below now rejects stale lockfiles whose kept
-        // entries no longer satisfy the staged manifest, so keeping the file
-        // does not suppress a needed re-resolve.
-        let mut direct_versions: HashMap<String, lpm_semver::Version> = HashMap::new();
-        run_with_options_with_lpm_root(
-            client,
-            project_dir,
-            json_output,
-            false, // offline
-            FrozenLockfileMode::Never,
-            force,
-            allow_new,
-            false, // strict_integrity — internal call, no flag
-            no_engine_strict,
-            strict_peer_dependencies_override,
-            None, // linker_override
-            lpm_skills_preference,
-            false, // no_editor_setup
-            false, // no_security_summary
-            false, // auto_build
-            None,  // target_set: legacy single-project path
-            Some(&mut direct_versions),
-            Some(js_packages.len()),
-            script_policy_override,
-            advisor_override,
-            min_release_age_override,
-            min_release_age_exclude,
-            drift_ignore_policy,
-            verify_policy,
-            omit_policy,
-            strict_sandbox,
-            no_sandbox,
-            verbose,
-            audit_after_install,
-            timing,
-            &[],
-            true,
-            false,
-            Some(route_table),
-            lpm_common::LpmRoot::from_env()?,
-        )
-        .await?;
-        maybe_test_panic("after-install");
+            // 2. Stage the new entries. Explicit specs land verbatim; bare/dist-tag
+            // entries get a `*` placeholder that finalize will replace using the
+            // save policy (resolved version + flags + config).
+            //
+            // Step 6: load `./lpm.toml` (project) merged with
+            // `~/.lpm/config.toml` (global) for the persistent save-policy
+            // keys. CLI flags still beat config inside `decide_saved_dependency_spec`.
+            let save_config = crate::save_config::SaveConfigLoader::load_for_project(project_dir)?;
+            let catalog_policy =
+                catalog_save_policy_for_project(project_dir, catalog_name_override)?;
+            let staged =
+                stage_packages_to_manifest(&pkg_json_path, &js_packages, save_dev, save_flags)?;
+            let route_table = load_install_route_table(project_dir, client)?;
+            pin_staged_dist_tags_for_resolution(client, &route_table, &staged).await?;
+            preflight_catalog_policy_rejection(client, &route_table, &staged, &catalog_policy)
+                .await?;
+            maybe_test_panic("after-stage");
 
-        // 5. Finalize the manifest using the resolved direct-dep versions
-        // from the resolver. No-op if stage produced no placeholders.
-        finalize_packages_in_manifest_with_catalog_policy(
-            &staged,
-            &direct_versions,
-            save_flags,
-            save_config,
-            &catalog_policy,
-        )?;
-        maybe_test_panic("after-finalize");
+            // 3. Run the full install pipeline, capturing the direct-dep version
+            // map via the out-param. If anything fails, the `?`
+            // returns early — `tx` drops without `commit()` and the manifest
+            // snaps back to its pre-stage state. The placeholder never survives.
+            // We intentionally keep any existing lockfile on disk so the
+            // pipeline can diff against the pre-install direct graph. The warm
+            // fast-path validator below now rejects stale lockfiles whose kept
+            // entries no longer satisfy the staged manifest, so keeping the file
+            // does not suppress a needed re-resolve.
+            let mut direct_versions: HashMap<String, lpm_semver::Version> = HashMap::new();
+            run_with_options_with_lpm_root(
+                client,
+                project_dir,
+                json_output,
+                false, // offline
+                FrozenLockfileMode::Never,
+                force,
+                allow_new,
+                false, // strict_integrity — internal call, no flag
+                no_engine_strict,
+                strict_peer_dependencies_override,
+                None, // linker_override
+                lpm_skills_preference,
+                false, // no_editor_setup
+                false, // no_security_summary
+                false, // auto_build
+                None,  // target_set: legacy single-project path
+                Some(&mut direct_versions),
+                Some(js_packages.len()),
+                script_policy_override,
+                advisor_override,
+                min_release_age_override,
+                min_release_age_exclude,
+                drift_ignore_policy,
+                verify_policy,
+                omit_policy,
+                strict_sandbox,
+                no_sandbox,
+                verbose,
+                audit_after_install,
+                timing,
+                &[],
+                true,
+                false,
+                Some(route_table),
+                lpm_common::LpmRoot::from_env()?,
+            )
+            .await?;
+            maybe_test_panic("after-install");
 
-        cleanup_unused_catalogs_after_install(project_dir)?;
-        reconcile_finalized_add_install_state(project_dir)?;
+            // 5. Finalize the manifest using the resolved direct-dep versions
+            // from the resolver. No-op if stage produced no placeholders.
+            finalize_packages_in_manifest_with_catalog_policy(
+                &staged,
+                &direct_versions,
+                save_flags,
+                save_config,
+                &catalog_policy,
+            )?;
+            maybe_test_panic("after-finalize");
 
-        // 6. All steps succeeded — commit the transaction so the manifest
-        // edits persist.
-        tx.commit();
+            cleanup_unused_catalogs_after_install(project_dir)?;
+            reconcile_finalized_add_install_state(project_dir)?;
+
+            // 6. All steps succeeded — commit the transaction so the manifest
+            // edits persist.
+            tx.commit();
+            Ok::<(), LpmError>(())
+        };
+        let javascript_result: Result<(), LpmError> =
+            if let Some(capture) = javascript_capture.as_ref() {
+                report_capture::scope(Arc::clone(capture), javascript_install).await
+            } else {
+                javascript_install.await
+            };
+        javascript_result?;
+        if let Some(transaction) = swift_transaction.take() {
+            workspace_lockfile::commit_manifest_transaction(transaction);
+        }
+
+        if json_output {
+            let javascript_report = javascript_capture.as_ref().and_then(report_capture::take);
+            let report = match (swift_report, javascript_report) {
+                (Some(swift), Some(javascript)) => serde_json::json!({
+                    "success": true,
+                    "swift": swift,
+                    "javascript": javascript,
+                }),
+                (Some(swift), None) => swift,
+                (None, Some(javascript)) => javascript,
+                (None, None) => serde_json::json!({"success": true}),
+            };
+            report_capture::emit_install_json(&report);
+        }
         Ok(())
-    })
-    .await
+    };
+
+    workspace_lockfile::scope_member_project_mutation(project_dir, mutation).await
 }
 
 /// workspace-aware install entry point.
@@ -1328,28 +1495,8 @@ pub async fn run_install_filtered_add(
         json_output,
     )?;
     let requested_packages = reviewed.specs;
-    let mut js_packages = Vec::with_capacity(requested_packages.len());
-    let mut swift_packages = Vec::new();
-    for spec in &requested_packages {
-        let (name, intent) = crate::save_spec::parse_user_save_intent(spec)?;
-        if name.starts_with("@lpm.dev/") {
-            let package_name = lpm_common::PackageName::parse(&name)?;
-            let range = intent_to_range_string(&intent);
-            let (metadata, resolved_version) =
-                resolve_lpm_install_preflight(client, &package_name, &range).await?;
-            let version_metadata = metadata.version(&resolved_version).ok_or_else(|| {
-                LpmError::NotFound(format!(
-                    "version {resolved_version} not found for {}",
-                    package_name.scoped()
-                ))
-            })?;
-            if version_metadata.effective_ecosystem() == "swift" {
-                swift_packages.push((package_name, resolved_version, version_metadata.clone()));
-                continue;
-            }
-        }
-        js_packages.push(spec.clone());
-    }
+    let (js_packages, swift_packages) =
+        route_explicit_packages(client, &requested_packages, save_flags).await?;
 
     // 3. Multi-member confirmation prompt.
     //
@@ -1380,17 +1527,10 @@ pub async fn run_install_filtered_add(
 
     let requires_workspace_lockfile = !js_packages.is_empty();
     let mutation = async {
-        let swift_manifests = targets
-            .member_manifests
-            .iter()
-            .map(|manifest| {
-                crate::commands::install_targets::install_root_for(manifest).join("Package.swift")
-            })
-            .filter(|manifest| manifest.is_file())
-            .collect::<Vec<_>>();
-        if !swift_packages.is_empty() && swift_manifests.is_empty() {
+        let swift_locations = selected_swift_install_locations(&targets.member_manifests)?;
+        if !swift_packages.is_empty() && swift_locations.is_empty() {
             return Err(LpmError::Registry(
-            "the selected workspace targets do not contain a Package.swift for the requested Swift package"
+            "the selected workspace targets do not contain a Package.swift or .xcodeproj for the requested Swift package"
                 .into(),
         ));
         }
@@ -1398,61 +1538,108 @@ pub async fn run_install_filtered_add(
         let mut swift_transaction = if swift_packages.is_empty() {
             None
         } else {
-            let required = swift_manifests
-                .iter()
-                .map(PathBuf::as_path)
-                .collect::<Vec<_>>();
-            let swift_lockfiles = swift_manifests
-                .iter()
-                .map(|manifest| manifest.with_file_name("Package.resolved"))
-                .collect::<Vec<_>>();
-            let optional = swift_lockfiles
-                .iter()
-                .map(PathBuf::as_path)
-                .collect::<Vec<_>>();
-            Some(
-                crate::manifest_tx::ManifestTransaction::snapshot_install_state(
-                    &required,
-                    &optional,
-                    &[],
-                )?,
-            )
-        };
-        for manifest_path in &swift_manifests {
-            let manifest_dir = manifest_path.parent().ok_or_else(|| {
-                LpmError::Registry(format!(
-                    "selected Swift manifest has no parent directory: {}",
-                    manifest_path.display()
-                ))
-            })?;
-            for (package_name, version, version_metadata) in &swift_packages {
-                let identifier = crate::swift_manifest::lpm_to_se0292_id(package_name);
-                let product_name = version_metadata
-                    .swift_product_name()
-                    .unwrap_or(&package_name.name);
-                run_swift_install_spm(
-                    manifest_dir,
-                    manifest_path,
-                    package_name,
-                    version,
-                    version_metadata,
-                    &identifier,
-                    product_name,
-                    SwiftInstallOptions {
-                        yes,
-                        json_output,
-                        audit_after_install,
-                        registry_url: client.base_url(),
-                        session: client.session().map(|session| session.as_ref()),
-                    },
-                )
-                .await?;
+            let mut required_paths = Vec::new();
+            let mut optional_paths = Vec::new();
+            let mut rollback_dirs = Vec::new();
+            for location in &swift_locations {
+                match location {
+                    SwiftInstallLocation::Spm { manifest_path } => {
+                        required_paths.push(manifest_path.clone());
+                        optional_paths.push(manifest_path.with_file_name("Package.resolved"));
+                    }
+                    SwiftInstallLocation::Xcode { xcodeproj_path } => {
+                        let pbxproj = xcodeproj_path.join("project.pbxproj");
+                        required_paths.push(pbxproj.clone());
+                        optional_paths.push(pbxproj.with_extension("pbxproj.lpm-backup"));
+                        let project_root = xcodeproj_path.parent().unwrap_or(cwd);
+                        let wrapper_root =
+                            project_root.join(crate::swift_manifest::LPM_DEPS_REL_PATH);
+                        optional_paths.extend([
+                            wrapper_root.join("Package.swift"),
+                            wrapper_root.join("Package.resolved"),
+                            wrapper_root.join("Sources/LPMDependencies/Exports.swift"),
+                        ]);
+                        rollback_dirs.extend([
+                            wrapper_root.join("Sources/LPMDependencies"),
+                            wrapper_root.join("Sources"),
+                            wrapper_root,
+                            project_root.join("Packages"),
+                        ]);
+                    }
+                }
             }
+            required_paths.sort();
+            required_paths.dedup();
+            optional_paths.sort();
+            optional_paths.dedup();
+            let required = required_paths
+                .iter()
+                .map(PathBuf::as_path)
+                .collect::<Vec<_>>();
+            let optional = optional_paths
+                .iter()
+                .map(PathBuf::as_path)
+                .collect::<Vec<_>>();
+            let mut transaction = crate::manifest_tx::ManifestTransaction::snapshot_install_state(
+                &required,
+                &optional,
+                &[],
+            )?;
+            transaction.remove_dirs_on_rollback(rollback_dirs);
+            Some(transaction)
+        };
+        let requests = swift_packages
+            .iter()
+            .map(|package| SwiftInstallRequest {
+                name: &package.name,
+                version: &package.version,
+                ver_meta: &package.metadata,
+                requirement: package.requirement.clone(),
+            })
+            .collect::<Vec<_>>();
+        let options = SwiftInstallOptions {
+            yes,
+            json_output,
+            audit_after_install,
+            registry_url: client.base_url(),
+            session: client.session().map(|session| session.as_ref()),
+        };
+        let mut swift_reports = Vec::with_capacity(swift_locations.len());
+        for location in &swift_locations {
+            let report = match location {
+                SwiftInstallLocation::Spm { manifest_path } => {
+                    let manifest_dir = manifest_path.parent().ok_or_else(|| {
+                        LpmError::Registry(format!(
+                            "selected Swift manifest has no parent directory: {}",
+                            manifest_path.display()
+                        ))
+                    })?;
+                    run_swift_install_spm_batch(manifest_dir, manifest_path, &requests, options)
+                        .await?
+                }
+                SwiftInstallLocation::Xcode { xcodeproj_path } => {
+                    let project_root = xcodeproj_path.parent().unwrap_or(cwd);
+                    run_swift_install_xcode_batch(project_root, xcodeproj_path, &requests, options)
+                        .await?
+                }
+            };
+            swift_reports.push(report);
         }
 
         if js_packages.is_empty() {
             if let Some(transaction) = swift_transaction.take() {
                 workspace_lockfile::commit_manifest_transaction(transaction);
+            }
+            if json_output {
+                let report = if swift_reports.len() == 1 {
+                    swift_reports.remove(0)
+                } else {
+                    serde_json::json!({
+                        "success": true,
+                        "targets": swift_reports,
+                    })
+                };
+                report_capture::emit_install_json(&report);
             }
             return Ok(());
         }
@@ -1562,6 +1749,7 @@ pub async fn run_install_filtered_add(
         // processes targeting overlapping member sets. The workspace-root lock
         // avoids that deadlock and uses the same `.install.lock` name as the
         // single-project path.
+        let mut javascript_reports = Vec::new();
         let js_result = async {
             let tx = crate::manifest_tx::ManifestTransaction::snapshot_install_state(
                 &required_refs,
@@ -1624,7 +1812,8 @@ pub async fn run_install_filtered_add(
                 // warm fast-path validator rejects projections that no longer
                 // satisfy the staged manifest.
                 let mut direct_versions: HashMap<String, lpm_semver::Version> = HashMap::new();
-                let result = run_with_options_with_lpm_root(
+                let capture = json_output.then(report_capture::new_capture);
+                let install = run_with_options_with_lpm_root(
                     client,
                     install_root,
                     json_output,
@@ -1673,8 +1862,12 @@ pub async fn run_install_filtered_add(
                     false,
                     Some(route_table.clone()),
                     lpm_root.clone(),
-                )
-                .await;
+                );
+                let result = if let Some(capture) = capture.as_ref() {
+                    report_capture::scope(Arc::clone(capture), install).await
+                } else {
+                    install.await
+                };
 
                 if let Err(e) = result {
                     // Abort on first failure. Half-installed multi-member states
@@ -1683,6 +1876,9 @@ pub async fn run_install_filtered_add(
                     // manifests when we drop without commit.
                     last_err = Some(e);
                     break;
+                }
+                if let Some(report) = capture.as_ref().and_then(report_capture::take) {
+                    javascript_reports.push(report);
                 }
 
                 // (d) Finalize this member's manifest using the direct-dep
@@ -1719,6 +1915,13 @@ pub async fn run_install_filtered_add(
             && let Some(transaction) = swift_transaction.take()
         {
             workspace_lockfile::commit_manifest_transaction(transaction);
+        }
+        if js_result.is_ok() && json_output {
+            report_capture::emit_install_json(&serde_json::json!({
+                "success": true,
+                "swift": swift_reports,
+                "javascript": javascript_reports,
+            }));
         }
         js_result
     };

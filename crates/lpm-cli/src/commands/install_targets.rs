@@ -537,6 +537,29 @@ mod tests {
         assert!(targets.member_manifests[0].ends_with("packages/foo/package.json"));
     }
 
+    #[test]
+    fn workspace_no_flags_chooses_the_deepest_containing_member() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_workspace(
+            tmp.path(),
+            &[
+                ("parent", "packages/parent"),
+                ("nested", "packages/parent/examples/nested"),
+            ],
+        );
+        let cwd = tmp.path().join("packages/parent/examples/nested/Sources");
+        fs::create_dir_all(&cwd).unwrap();
+
+        let targets = resolve_install_targets(&cwd, &[], false, true).unwrap();
+
+        assert_eq!(targets.member_manifests.len(), 1);
+        assert!(
+            targets.member_manifests[0].ends_with("packages/parent/examples/nested/package.json"),
+            "resolved the wrong containing member: {:?}",
+            targets.member_manifests
+        );
+    }
+
     // ── Decision matrix cell 8: workspace, no flags, at root, with packages ──
 
     #[test]

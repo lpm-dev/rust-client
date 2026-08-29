@@ -3,9 +3,80 @@ fn main() {
     let _program = args.next();
     let command = args.next();
     let action = args.next();
+    let command_name = match (command.as_deref(), action.as_deref()) {
+        (Some(command), Some(action)) => format!("{command} {action}"),
+        (Some(command), None) => command.to_string(),
+        _ => String::new(),
+    };
+
+    if let Ok(path) = std::env::var("LPM_TEST_SWIFT_COMMAND_LOG") {
+        use std::io::Write as _;
+        let mut log = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .expect("open Swift command log");
+        writeln!(log, "{command_name}").expect("append Swift command log");
+    }
+    if let Ok(path) = std::env::var("LPM_TEST_SWIFT_ENV_CAPTURE") {
+        const SENSITIVE: &[&str] = &[
+            "LPM_TOKEN",
+            "GITHUB_TOKEN",
+            "AWS_SECRET_ACCESS_KEY",
+            "ACTIONS_ID_TOKEN_REQUEST_TOKEN",
+            "LD_LIBRARY_PATH",
+            "DYLD_LIBRARY_PATH",
+        ];
+        use std::io::Write as _;
+        let mut capture = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .expect("open Swift environment capture");
+        for key in SENSITIVE {
+            writeln!(
+                capture,
+                "{command_name}\t{key}\t{}",
+                std::env::var_os(key).is_some()
+            )
+            .expect("append Swift environment capture");
+        }
+    }
 
     match (command.as_deref(), action.as_deref()) {
         (Some("package"), Some("dump-package")) => {
+            if let (Ok(path), Ok(process_id)) = (
+                std::env::var("LPM_TEST_SWIFT_INTERVAL_LOG"),
+                std::env::var("LPM_TEST_SWIFT_PROCESS_ID"),
+            ) {
+                use std::io::Write as _;
+                let mut log = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&path)
+                    .expect("open Swift interval log");
+                writeln!(log, "{process_id}:start").expect("append Swift interval start");
+                drop(log);
+                let delay = std::env::var("LPM_TEST_SWIFT_DUMP_DELAY_MS")
+                    .ok()
+                    .and_then(|value| value.parse::<u64>().ok())
+                    .unwrap_or(0);
+                std::thread::sleep(std::time::Duration::from_millis(delay));
+                let mut log = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(path)
+                    .expect("reopen Swift interval log");
+                writeln!(log, "{process_id}:end").expect("append Swift interval end");
+            }
+            let exit_code = std::env::var("LPM_TEST_SWIFT_DUMP_EXIT_CODE")
+                .ok()
+                .and_then(|value| value.parse::<i32>().ok())
+                .unwrap_or(0);
+            if exit_code != 0 {
+                eprintln!("configured dump-package failure");
+                std::process::exit(exit_code);
+            }
             let manifest = std::env::var("LPM_TEST_SWIFT_DUMP_PACKAGE")
                 .expect("LPM_TEST_SWIFT_DUMP_PACKAGE must be set");
             println!("{manifest}");

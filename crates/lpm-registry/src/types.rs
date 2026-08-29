@@ -631,14 +631,21 @@ impl VersionMetadata {
 
     /// Returns the first library product name from Swift metadata.
     pub fn swift_product_name(&self) -> Option<&str> {
-        let meta = self.swift_meta.as_ref()?;
-        meta.products
-            .iter()
-            .find(|p| {
-                // Skip executables — prefer library products
-                p.product_type.as_ref().and_then(|t| t.as_str()) != Some("executable")
-            })
-            .map(|p| p.name.as_str())
+        self.swift_library_product()
+            .map(|product| product.name.as_str())
+    }
+
+    pub fn swift_library_product(&self) -> Option<&SwiftProduct> {
+        self.swift_meta.as_ref()?.products.iter().find(|product| {
+            let Some(product_type) = product.product_type.as_ref() else {
+                return false;
+            };
+            !product.targets.is_empty()
+                && (product_type.as_str() == Some("library")
+                    || product_type
+                        .as_object()
+                        .is_some_and(|object| object.contains_key("library")))
+        })
     }
 
     /// Returns true if this version has any security concerns.
@@ -1634,6 +1641,45 @@ mod tests {
         };
         let serialized = serde_json::to_value(current).unwrap();
         assert!(serialized.get("deprecated").is_none());
+    }
+
+    #[test]
+    fn swift_library_product_skips_non_importable_and_non_library_products() {
+        let metadata: VersionMetadata = serde_json::from_value(serde_json::json!({
+            "name": "swift-package",
+            "version": "1.0.0",
+            "_swiftMeta": {
+                "products": [
+                    {"name": "Tool", "type": "executable", "targets": ["Tool"]},
+                    {"name": "EmptyLibrary", "type": "library", "targets": []},
+                    {"name": "ConsumerKit", "type": {"library": ["automatic"]}, "targets": ["ConsumerCore"]}
+                ]
+            }
+        }))
+        .unwrap();
+
+        let product = metadata
+            .swift_library_product()
+            .expect("an importable library product must be selected");
+        assert_eq!(product.name, "ConsumerKit");
+        assert_eq!(product.targets, ["ConsumerCore"]);
+    }
+
+    #[test]
+    fn swift_library_product_rejects_missing_or_empty_library_metadata() {
+        let metadata: VersionMetadata = serde_json::from_value(serde_json::json!({
+            "name": "swift-package",
+            "version": "1.0.0",
+            "_swiftMeta": {
+                "products": [
+                    {"name": "Untyped", "targets": ["Untyped"]},
+                    {"name": "EmptyLibrary", "type": "library", "targets": []}
+                ]
+            }
+        }))
+        .unwrap();
+
+        assert!(metadata.swift_library_product().is_none());
     }
 
     // ── DistInfo round-trip with + without provenance fields ──────

@@ -7,7 +7,11 @@
 //! - Run `swift package resolve`
 
 use lpm_common::{LpmError, PackageName};
+use std::ffi::OsStr;
+use std::io::Read as _;
 use std::path::{Path, PathBuf};
+
+const SWIFT_PROCESS_OUTPUT_LIMIT: usize = lpm_common::CONFIG_FILE_SIZE_CAP_BYTES as usize;
 
 /// Convert an LPM package name to an SE-0292 registry identifier.
 ///
@@ -39,14 +43,11 @@ pub fn find_package_swift(dir: &Path) -> Option<PathBuf> {
 /// Get non-test target names from the current SPM package.
 /// Runs `swift package dump-package` and parses the JSON output.
 pub fn get_spm_targets(project_dir: &Path) -> Result<Vec<String>, LpmError> {
-    // pipe stderr so diagnostics are available in error messages
-    let output = std::process::Command::new("swift")
+    let mut command = swift_command();
+    command
         .args(["package", "dump-package"])
-        .current_dir(project_dir)
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .output()
-        .map_err(|e| LpmError::Registry(format!("failed to run swift: {e}")))?;
+        .current_dir(project_dir);
+    let output = run_bounded_swift_output(command, "swift package dump-package")?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -65,7 +66,12 @@ pub fn get_spm_targets(project_dir: &Path) -> Result<Vec<String>, LpmError> {
         .map(|targets| {
             targets
                 .iter()
-                .filter(|t| t.get("type").and_then(|v| v.as_str()) != Some("test"))
+                .filter(|target| {
+                    matches!(
+                        target.get("type").and_then(|value| value.as_str()),
+                        Some("regular" | "executable" | "macro")
+                    )
+                })
                 .filter_map(|t| t.get("name").and_then(|n| n.as_str()).map(String::from))
                 .collect()
         })
@@ -77,6 +83,49 @@ pub fn get_spm_targets(project_dir: &Path) -> Result<Vec<String>, LpmError> {
 /// Result of editing a Package.swift manifest.
 pub struct ManifestEdit {
     pub already_exists: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum SwiftRequirement {
+    UpToNextMajor(String),
+    UpToNextMinor { lower: String, upper: String },
+    Exact(String),
+}
+
+impl SwiftRequirement {
+    fn render(&self, se0292_id: &str) -> String {
+        match self {
+            Self::UpToNextMajor(version) => {
+                format!(".package(id: \"{se0292_id}\", from: \"{version}\")")
+            }
+            Self::UpToNextMinor { lower, upper } => {
+                format!(".package(id: \"{se0292_id}\", \"{lower}\"..<\"{upper}\")")
+            }
+            Self::Exact(version) => {
+                format!(".package(id: \"{se0292_id}\", exact: \"{version}\")")
+            }
+        }
+    }
+
+    fn version(&self) -> &str {
+        match self {
+            Self::UpToNextMajor(version) | Self::Exact(version) => version,
+            Self::UpToNextMinor { lower, .. } => lower,
+        }
+    }
+}
+
+pub struct RegistryDependency<'a> {
+    pub se0292_id: &'a str,
+    pub requirement: SwiftRequirement,
+    pub product_name: &'a str,
+    pub module_names: &'a [String],
+}
+
+#[derive(Debug, Default)]
+pub struct ManifestRemoval {
+    pub removed: bool,
+    pub product_names: Vec<String>,
 }
 
 /// Validate that a string value is safe to interpolate into Package.swift.
@@ -91,6 +140,624 @@ fn validate_manifest_value(value: &str, label: &str) -> Result<(), LpmError> {
     Ok(())
 }
 
+fn validate_registry_identity(value: &str) -> Result<(), LpmError> {
+    if value.is_empty()
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+    {
+        return Err(LpmError::Registry(format!(
+            "Invalid registry identity: {value:?}"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_swift_module_name(value: &str) -> Result<(), LpmError> {
+    let mut bytes = value.bytes();
+    let Some(first) = bytes.next() else {
+        return Err(LpmError::Registry(
+            "Invalid Swift module name: empty".into(),
+        ));
+    };
+    if !(first.is_ascii_alphabetic() || first == b'_')
+        || !bytes.all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+    {
+        return Err(LpmError::Registry(format!(
+            "Invalid Swift module name: {value:?}"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_regular_single_link_file(
+    path: &Path,
+    label: &str,
+) -> Result<std::fs::Metadata, LpmError> {
+    let metadata = std::fs::symlink_metadata(path)
+        .map_err(|error| LpmError::Registry(format!("failed to inspect {label}: {error}")))?;
+    if lpm_common::is_symlink_or_junction(&metadata) || !metadata.is_file() {
+        return Err(LpmError::Registry(format!(
+            "refusing {label} that is not a regular file: {}",
+            path.display()
+        )));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        if metadata.nlink() != 1 {
+            return Err(LpmError::Registry(format!(
+                "refusing hard-linked {label}: {}",
+                path.display()
+            )));
+        }
+    }
+    Ok(metadata)
+}
+
+fn read_managed_text(path: &Path, label: &str) -> Result<String, LpmError> {
+    let metadata = validate_regular_single_link_file(path, label)?;
+    if metadata.len() > lpm_common::CONFIG_FILE_SIZE_CAP_BYTES {
+        return Err(LpmError::Registry(format!(
+            "{label} exceeds the {} byte input limit: {}",
+            lpm_common::CONFIG_FILE_SIZE_CAP_BYTES,
+            path.display()
+        )));
+    }
+    lpm_common::read_text_file_capped(path, lpm_common::CONFIG_FILE_SIZE_CAP_BYTES)
+        .map_err(|error| LpmError::Registry(format!("failed to read {label}: {error}")))
+}
+
+fn write_managed_text(path: &Path, label: &str, content: &str) -> Result<(), LpmError> {
+    if path.exists() {
+        validate_regular_single_link_file(path, label)?;
+    }
+    lpm_common::write_file_atomic(path, content)
+        .map_err(|error| LpmError::Registry(format!("failed to write {label}: {error}")))
+}
+
+fn replace_managed_text(
+    path: &Path,
+    label: &str,
+    expected: &str,
+    content: &str,
+) -> Result<(), LpmError> {
+    let current = read_managed_text(path, label)?;
+    if current != expected {
+        return Err(LpmError::Registry(format!(
+            "{label} changed during the operation: {}",
+            path.display()
+        )));
+    }
+    write_managed_text(path, label, content)
+}
+
+fn ensure_real_directory(path: &Path, label: &str) -> Result<(), LpmError> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) => {
+            if lpm_common::is_symlink_or_junction(&metadata) || !metadata.is_dir() {
+                return Err(LpmError::Registry(format!(
+                    "refusing {label} that is not a real directory: {}",
+                    path.display()
+                )));
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            std::fs::create_dir(path).map_err(|error| {
+                LpmError::Registry(format!(
+                    "failed to create {label} {}: {error}",
+                    path.display()
+                ))
+            })?;
+        }
+        Err(error) => {
+            return Err(LpmError::Registry(format!(
+                "failed to inspect {label} {}: {error}",
+                path.display()
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn sensitive_swift_environment_key(key: &OsStr) -> bool {
+    let key = key.to_string_lossy().to_ascii_uppercase();
+    key == "LPM_TOKEN"
+        || key == "NPM_TOKEN"
+        || key == "NODE_AUTH_TOKEN"
+        || key == "GITHUB_TOKEN"
+        || key == "GH_TOKEN"
+        || key == "AWS_ACCESS_KEY_ID"
+        || key == "AWS_SECRET_ACCESS_KEY"
+        || key == "AWS_SESSION_TOKEN"
+        || key == "GOOGLE_APPLICATION_CREDENTIALS"
+        || key == "ACTIONS_ID_TOKEN_REQUEST_TOKEN"
+        || key == "ACTIONS_ID_TOKEN_REQUEST_URL"
+        || key == "CI_JOB_JWT"
+        || key == "CI_JOB_JWT_V2"
+        || key == "LD_PRELOAD"
+        || key == "LD_LIBRARY_PATH"
+        || key.starts_with("DYLD_")
+        || key.ends_with("_TOKEN")
+        || key.ends_with("_SECRET")
+        || key.ends_with("_PASSWORD")
+        || key.ends_with("_CREDENTIAL")
+}
+
+pub(crate) fn sanitize_swift_environment(command: &mut std::process::Command) {
+    for (key, _) in std::env::vars_os() {
+        if sensitive_swift_environment_key(&key) {
+            command.env_remove(key);
+        }
+    }
+}
+
+pub(crate) fn swift_command() -> std::process::Command {
+    let mut command = std::process::Command::new("swift");
+    sanitize_swift_environment(&mut command);
+    command
+}
+
+struct BoundedOutput {
+    status: std::process::ExitStatus,
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+}
+
+fn read_bounded_pipe(
+    mut pipe: impl std::io::Read,
+    limit: usize,
+) -> std::io::Result<(Vec<u8>, bool)> {
+    let mut bytes = Vec::with_capacity(limit.min(64 * 1024));
+    pipe.by_ref()
+        .take(limit as u64 + 1)
+        .read_to_end(&mut bytes)?;
+    let exceeded = bytes.len() > limit;
+    if exceeded {
+        bytes.truncate(limit);
+    }
+    Ok((bytes, exceeded))
+}
+
+fn run_bounded_swift_output(
+    mut command: std::process::Command,
+    display_name: &str,
+) -> Result<BoundedOutput, LpmError> {
+    command
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    let mut child = command
+        .spawn()
+        .map_err(|error| LpmError::Registry(format!("failed to run {display_name}: {error}")))?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| LpmError::Registry(format!("failed to capture {display_name} stdout")))?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| LpmError::Registry(format!("failed to capture {display_name} stderr")))?;
+    let stdout_reader =
+        std::thread::spawn(move || read_bounded_pipe(stdout, SWIFT_PROCESS_OUTPUT_LIMIT));
+    let stderr_reader =
+        std::thread::spawn(move || read_bounded_pipe(stderr, SWIFT_PROCESS_OUTPUT_LIMIT));
+    let status = child.wait().map_err(|error| {
+        LpmError::Registry(format!("failed to wait for {display_name}: {error}"))
+    })?;
+    let (stdout, stdout_exceeded) = stdout_reader
+        .join()
+        .map_err(|_| LpmError::Registry(format!("{display_name} stdout reader panicked")))?
+        .map_err(|error| {
+            LpmError::Registry(format!("failed to read {display_name} stdout: {error}"))
+        })?;
+    let (stderr, stderr_exceeded) = stderr_reader
+        .join()
+        .map_err(|_| LpmError::Registry(format!("{display_name} stderr reader panicked")))?
+        .map_err(|error| {
+            LpmError::Registry(format!("failed to read {display_name} stderr: {error}"))
+        })?;
+    if stdout_exceeded || stderr_exceeded {
+        return Err(LpmError::Registry(format!(
+            "{display_name} output exceeded the {} byte limit",
+            SWIFT_PROCESS_OUTPUT_LIMIT
+        )));
+    }
+    Ok(BoundedOutput {
+        status,
+        stdout,
+        stderr,
+    })
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ArgumentArray {
+    open: usize,
+    close: usize,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct CallSpan {
+    start: usize,
+    open: usize,
+    close: usize,
+}
+
+fn skip_non_code(bytes: &[u8], mut index: usize) -> usize {
+    match bytes.get(index) {
+        Some(b'"') => {
+            index += 1;
+            while index < bytes.len() {
+                match bytes[index] {
+                    b'\\' => index = (index + 2).min(bytes.len()),
+                    b'"' => return index + 1,
+                    _ => index += 1,
+                }
+            }
+            index
+        }
+        Some(b'/') if bytes.get(index + 1) == Some(&b'/') => {
+            index += 2;
+            while index < bytes.len() && bytes[index] != b'\n' {
+                index += 1;
+            }
+            index
+        }
+        Some(b'/') if bytes.get(index + 1) == Some(&b'*') => {
+            index += 2;
+            let mut depth = 1usize;
+            while index + 1 < bytes.len() {
+                if bytes[index] == b'/' && bytes[index + 1] == b'*' {
+                    depth += 1;
+                    index += 2;
+                } else if bytes[index] == b'*' && bytes[index + 1] == b'/' {
+                    depth -= 1;
+                    index += 2;
+                    if depth == 0 {
+                        return index;
+                    }
+                } else {
+                    index += 1;
+                }
+            }
+            bytes.len()
+        }
+        _ => index + 1,
+    }
+}
+
+fn skip_space_and_comments(content: &str, mut index: usize, end: usize) -> usize {
+    let bytes = content.as_bytes();
+    while index < end {
+        if bytes[index].is_ascii_whitespace() {
+            index += 1;
+        } else if bytes[index] == b'/' && matches!(bytes.get(index + 1), Some(b'/' | b'*')) {
+            index = skip_non_code(bytes, index);
+        } else {
+            break;
+        }
+    }
+    index
+}
+
+fn identifier_end(bytes: &[u8], mut index: usize, end: usize) -> usize {
+    while index < end && (bytes[index].is_ascii_alphanumeric() || bytes[index] == b'_') {
+        index += 1;
+    }
+    index
+}
+
+fn find_package_call(content: &str) -> Option<(usize, usize)> {
+    let bytes = content.as_bytes();
+    let mut index = 0usize;
+    while index < bytes.len() {
+        if bytes[index] == b'"'
+            || (bytes[index] == b'/' && matches!(bytes.get(index + 1), Some(b'/' | b'*')))
+        {
+            index = skip_non_code(bytes, index);
+            continue;
+        }
+        if bytes[index..].starts_with(b"Package")
+            && (index == 0
+                || !(bytes[index - 1].is_ascii_alphanumeric() || bytes[index - 1] == b'_'))
+        {
+            let after = index + "Package".len();
+            if after == bytes.len()
+                || !(bytes[after].is_ascii_alphanumeric() || bytes[after] == b'_')
+            {
+                let open = skip_space_and_comments(content, after, bytes.len());
+                if bytes.get(open) == Some(&b'(') {
+                    return find_matching_paren(content, open).map(|close| (open, close));
+                }
+            }
+        }
+        index += 1;
+    }
+    None
+}
+
+fn find_direct_argument_array(
+    content: &str,
+    call_open: usize,
+    call_close: usize,
+    label: &str,
+) -> Option<ArgumentArray> {
+    let bytes = content.as_bytes();
+    let mut index = call_open + 1;
+    let mut paren_depth = 0usize;
+    let mut bracket_depth = 0usize;
+    let mut brace_depth = 0usize;
+    while index < call_close {
+        if bytes[index] == b'"'
+            || (bytes[index] == b'/' && matches!(bytes.get(index + 1), Some(b'/' | b'*')))
+        {
+            index = skip_non_code(bytes, index);
+            continue;
+        }
+        if paren_depth == 0
+            && bracket_depth == 0
+            && brace_depth == 0
+            && (bytes[index].is_ascii_alphabetic() || bytes[index] == b'_')
+        {
+            let word_end = identifier_end(bytes, index, call_close);
+            if &content[index..word_end] == label {
+                let colon = skip_space_and_comments(content, word_end, call_close);
+                if bytes.get(colon) == Some(&b':') {
+                    let open = skip_space_and_comments(content, colon + 1, call_close);
+                    if bytes.get(open) == Some(&b'[') {
+                        let close = find_matching_bracket(content, open)?;
+                        if close < call_close {
+                            return Some(ArgumentArray { open, close });
+                        }
+                    }
+                }
+            }
+            index = word_end;
+            continue;
+        }
+        match bytes[index] {
+            b'(' => paren_depth += 1,
+            b')' if paren_depth > 0 => paren_depth -= 1,
+            b'[' => bracket_depth += 1,
+            b']' if bracket_depth > 0 => bracket_depth -= 1,
+            b'{' => brace_depth += 1,
+            b'}' if brace_depth > 0 => brace_depth -= 1,
+            _ => {}
+        }
+        index += 1;
+    }
+    None
+}
+
+fn find_direct_argument_label(
+    content: &str,
+    call_open: usize,
+    call_close: usize,
+    label: &str,
+) -> Option<usize> {
+    let bytes = content.as_bytes();
+    let mut index = call_open + 1;
+    let mut paren_depth = 0usize;
+    let mut bracket_depth = 0usize;
+    let mut brace_depth = 0usize;
+    while index < call_close {
+        if bytes[index] == b'"'
+            || (bytes[index] == b'/' && matches!(bytes.get(index + 1), Some(b'/' | b'*')))
+        {
+            index = skip_non_code(bytes, index);
+            continue;
+        }
+        if paren_depth == 0
+            && bracket_depth == 0
+            && brace_depth == 0
+            && (bytes[index].is_ascii_alphabetic() || bytes[index] == b'_')
+        {
+            let word_end = identifier_end(bytes, index, call_close);
+            if &content[index..word_end] == label {
+                let colon = skip_space_and_comments(content, word_end, call_close);
+                if bytes.get(colon) == Some(&b':') {
+                    return Some(index);
+                }
+            }
+            index = word_end;
+            continue;
+        }
+        match bytes[index] {
+            b'(' => paren_depth += 1,
+            b')' if paren_depth > 0 => paren_depth -= 1,
+            b'[' => bracket_depth += 1,
+            b']' if bracket_depth > 0 => bracket_depth -= 1,
+            b'{' => brace_depth += 1,
+            b'}' if brace_depth > 0 => brace_depth -= 1,
+            _ => {}
+        }
+        index += 1;
+    }
+    None
+}
+
+fn find_package_argument_array(content: &str, label: &str) -> Option<ArgumentArray> {
+    let (open, close) = find_package_call(content)?;
+    find_direct_argument_array(content, open, close, label)
+}
+
+fn parse_string_literal(content: &str, start: usize, end: usize) -> Option<(String, usize)> {
+    let bytes = content.as_bytes();
+    if bytes.get(start) != Some(&b'"') {
+        return None;
+    }
+    let mut value = String::new();
+    let mut index = start + 1;
+    while index < end {
+        match bytes[index] {
+            b'"' => return Some((value, index + 1)),
+            b'\\' => {
+                index += 1;
+                let escaped = *bytes.get(index)?;
+                match escaped {
+                    b'"' => value.push('"'),
+                    b'\\' => value.push('\\'),
+                    b'n' => value.push('\n'),
+                    b'r' => value.push('\r'),
+                    b't' => value.push('\t'),
+                    _ => return None,
+                }
+                index += 1;
+            }
+            byte if byte.is_ascii() => {
+                value.push(byte as char);
+                index += 1;
+            }
+            _ => {
+                let character = content[index..].chars().next()?;
+                value.push(character);
+                index += character.len_utf8();
+            }
+        }
+    }
+    None
+}
+
+fn find_direct_string_argument(
+    content: &str,
+    call_open: usize,
+    call_close: usize,
+    label: &str,
+) -> Option<String> {
+    let bytes = content.as_bytes();
+    let mut index = call_open + 1;
+    let mut paren_depth = 0usize;
+    let mut bracket_depth = 0usize;
+    let mut brace_depth = 0usize;
+    while index < call_close {
+        if bytes[index] == b'"'
+            || (bytes[index] == b'/' && matches!(bytes.get(index + 1), Some(b'/' | b'*')))
+        {
+            index = skip_non_code(bytes, index);
+            continue;
+        }
+        if paren_depth == 0
+            && bracket_depth == 0
+            && brace_depth == 0
+            && (bytes[index].is_ascii_alphabetic() || bytes[index] == b'_')
+        {
+            let word_end = identifier_end(bytes, index, call_close);
+            if &content[index..word_end] == label {
+                let colon = skip_space_and_comments(content, word_end, call_close);
+                if bytes.get(colon) == Some(&b':') {
+                    let value_start = skip_space_and_comments(content, colon + 1, call_close);
+                    return parse_string_literal(content, value_start, call_close)
+                        .map(|(value, _)| value);
+                }
+            }
+            index = word_end;
+            continue;
+        }
+        match bytes[index] {
+            b'(' => paren_depth += 1,
+            b')' if paren_depth > 0 => paren_depth -= 1,
+            b'[' => bracket_depth += 1,
+            b']' if bracket_depth > 0 => bracket_depth -= 1,
+            b'{' => brace_depth += 1,
+            b'}' if brace_depth > 0 => brace_depth -= 1,
+            _ => {}
+        }
+        index += 1;
+    }
+    None
+}
+
+fn direct_calls_in_array(content: &str, array: ArgumentArray) -> Vec<CallSpan> {
+    let bytes = content.as_bytes();
+    let mut calls = Vec::new();
+    let mut index = array.open + 1;
+    let mut bracket_depth = 0usize;
+    let mut brace_depth = 0usize;
+    while index < array.close {
+        if bytes[index] == b'"'
+            || (bytes[index] == b'/' && matches!(bytes.get(index + 1), Some(b'/' | b'*')))
+        {
+            index = skip_non_code(bytes, index);
+            continue;
+        }
+        if bracket_depth == 0 && brace_depth == 0 && bytes[index] == b'.' {
+            let name_start = index + 1;
+            let name_end = identifier_end(bytes, name_start, array.close);
+            let open = skip_space_and_comments(content, name_end, array.close);
+            if bytes.get(open) == Some(&b'(')
+                && let Some(close) = find_matching_paren(content, open)
+                && close < array.close
+            {
+                calls.push(CallSpan {
+                    start: index,
+                    open,
+                    close,
+                });
+                index = close + 1;
+                continue;
+            }
+        }
+        match bytes[index] {
+            b'[' => bracket_depth += 1,
+            b']' if bracket_depth > 0 => bracket_depth -= 1,
+            b'{' => brace_depth += 1,
+            b'}' if brace_depth > 0 => brace_depth -= 1,
+            _ => {}
+        }
+        index += 1;
+    }
+    calls
+}
+
+fn target_call(content: &str, target_name: &str) -> Option<CallSpan> {
+    let targets = find_package_argument_array(content, "targets")?;
+    direct_calls_in_array(content, targets)
+        .into_iter()
+        .find(|call| {
+            find_direct_string_argument(content, call.open, call.close, "name").as_deref()
+                == Some(target_name)
+        })
+}
+
+fn replacement(content: &str, start: usize, end: usize, value: &str) -> String {
+    let mut updated = String::with_capacity(content.len() - (end - start) + value.len());
+    updated.push_str(&content[..start]);
+    updated.push_str(value);
+    updated.push_str(&content[end..]);
+    updated
+}
+
+fn call_removal_span(content: &str, array: ArgumentArray, call: CallSpan) -> (usize, usize) {
+    let bytes = content.as_bytes();
+    let line_start = content[..call.start]
+        .rfind('\n')
+        .map_or(array.open + 1, |i| i + 1);
+    let line_end = content[call.close + 1..array.close]
+        .find('\n')
+        .map_or(array.close, |offset| call.close + 1 + offset + 1);
+    let before_on_line = content[line_start..call.start].trim();
+    let after_on_line = content[call.close + 1..line_end]
+        .trim()
+        .trim_start_matches(',')
+        .trim();
+    if before_on_line.is_empty() && after_on_line.is_empty() {
+        return (line_start, line_end);
+    }
+
+    let mut end = call.close + 1;
+    end = skip_space_and_comments(content, end, array.close);
+    if bytes.get(end) == Some(&b',') {
+        return (call.start, end + 1);
+    }
+    let mut start = call.start;
+    while start > array.open + 1 && bytes[start - 1].is_ascii_whitespace() {
+        start -= 1;
+    }
+    if start > array.open + 1 && bytes[start - 1] == b',' {
+        start -= 1;
+    }
+    (start, call.close + 1)
+}
+
 /// Add an SE-0292 registry dependency to Package.swift.
 ///
 /// Inserts:
@@ -98,47 +765,174 @@ fn validate_manifest_value(value: &str, label: &str) -> Result<(), LpmError> {
 /// 2. `.product(name: "ProductName", package: "lpmdev.owner_pkg")` into target dependencies
 ///
 /// Idempotent — skips if the dependency already exists.
-pub fn add_registry_dependency(
+#[cfg(test)]
+fn add_registry_dependency(
     manifest_path: &Path,
     se0292_id: &str,
     version: &str,
     product_name: &str,
     target_name: &str,
 ) -> Result<ManifestEdit, LpmError> {
-    // validate inputs before interpolation
-    validate_manifest_value(version, "version")?;
-    validate_manifest_value(product_name, "product_name")?;
+    reconcile_registry_dependencies(
+        manifest_path,
+        target_name,
+        &[RegistryDependency {
+            se0292_id,
+            requirement: SwiftRequirement::UpToNextMajor(version.to_string()),
+            product_name,
+            module_names: &[],
+        }],
+    )
+    .map(|mut edits| edits.remove(0))
+}
 
-    let content = std::fs::read_to_string(manifest_path)
-        .map_err(|e| LpmError::Registry(format!("failed to read Package.swift: {e}")))?;
+pub fn reconcile_registry_dependencies(
+    manifest_path: &Path,
+    target_name: &str,
+    dependencies: &[RegistryDependency<'_>],
+) -> Result<Vec<ManifestEdit>, LpmError> {
+    for dependency in dependencies {
+        validate_registry_identity(dependency.se0292_id)?;
+        validate_manifest_value(dependency.requirement.version(), "version")?;
+        validate_manifest_value(dependency.product_name, "product_name")?;
+    }
+    let mut content = read_managed_text(manifest_path, "Package.swift")?;
+    let original_content = content.clone();
+    let mut edits = Vec::with_capacity(dependencies.len());
 
-    // Check if dependency already exists
-    if content.contains(&format!("\"{}\"", se0292_id)) {
-        return Ok(ManifestEdit {
-            already_exists: true,
+    for dependency in dependencies {
+        let before_dependency = content.clone();
+        let desired_dependency = dependency.requirement.render(dependency.se0292_id);
+        let existing_dependency =
+            find_package_argument_array(&content, "dependencies").and_then(|array| {
+                direct_calls_in_array(&content, array)
+                    .into_iter()
+                    .find(|call| {
+                        find_direct_string_argument(&content, call.open, call.close, "id")
+                            .as_deref()
+                            == Some(dependency.se0292_id)
+                    })
+            });
+        if let Some(call) = existing_dependency {
+            if content[call.start..=call.close].trim() != desired_dependency {
+                content = replacement(&content, call.start, call.close + 1, &desired_dependency);
+            }
+        } else {
+            content =
+                insert_into_dependencies_array(&content, &desired_dependency, Some("targets:"))?;
+        }
+
+        let desired_product = format!(
+            ".product(name: \"{}\", package: \"{}\")",
+            dependency.product_name, dependency.se0292_id
+        );
+        let target = target_call(&content, target_name).ok_or_else(|| {
+            LpmError::Registry(format!(
+                "Could not find target '{target_name}' in Package.swift"
+            ))
+        })?;
+        let existing_product =
+            find_direct_argument_array(&content, target.open, target.close, "dependencies")
+                .and_then(|array| {
+                    direct_calls_in_array(&content, array)
+                        .into_iter()
+                        .find(|call| {
+                            find_direct_string_argument(&content, call.open, call.close, "package")
+                                .as_deref()
+                                == Some(dependency.se0292_id)
+                        })
+                });
+        if let Some(call) = existing_product {
+            if content[call.start..=call.close].trim() != desired_product {
+                content = replacement(&content, call.start, call.close + 1, &desired_product);
+            }
+        } else {
+            content = insert_into_target_deps(&content, target_name, &desired_product)?;
+        }
+        edits.push(ManifestEdit {
+            already_exists: content == before_dependency,
         });
     }
 
-    let dep_entry = format!(".package(id: \"{}\", from: \"{}\")", se0292_id, version);
-    let product_entry = format!(
-        ".product(name: \"{}\", package: \"{}\")",
-        product_name, se0292_id
-    );
+    if edits.iter().any(|edit| !edit.already_exists) {
+        replace_managed_text(manifest_path, "Package.swift", &original_content, &content)?;
+    }
+    Ok(edits)
+}
 
-    // Step 1: Insert package dependency into top-level dependencies array.
-    // pass Some("targets:") so we only find the top-level dependencies array,
-    // not a target-level dependencies array.
-    let content = insert_into_dependencies_array(&content, &dep_entry, Some("targets:"))?;
+pub fn remove_registry_dependencies(
+    manifest_path: &Path,
+    se0292_ids: &[String],
+) -> Result<Vec<ManifestRemoval>, LpmError> {
+    let mut content = read_managed_text(manifest_path, "Package.swift")?;
+    let original = content.clone();
+    let mut removals = Vec::with_capacity(se0292_ids.len());
 
-    // Step 2: Insert product into the target's dependencies array.
-    let content = insert_into_target_deps(&content, target_name, &product_entry)?;
+    for se0292_id in se0292_ids {
+        validate_registry_identity(se0292_id)?;
+        let mut removal = ManifestRemoval::default();
+        loop {
+            let Some(array) = find_package_argument_array(&content, "dependencies") else {
+                break;
+            };
+            let Some(call) = direct_calls_in_array(&content, array)
+                .into_iter()
+                .find(|call| {
+                    find_direct_string_argument(&content, call.open, call.close, "id").as_deref()
+                        == Some(se0292_id)
+                })
+            else {
+                break;
+            };
+            let (start, end) = call_removal_span(&content, array, call);
+            content = replacement(&content, start, end, "");
+            removal.removed = true;
+        }
 
-    std::fs::write(manifest_path, &content)
-        .map_err(|e| LpmError::Registry(format!("failed to write Package.swift: {e}")))?;
+        loop {
+            let Some(targets) = find_package_argument_array(&content, "targets") else {
+                break;
+            };
+            let mut matching = None;
+            for target in direct_calls_in_array(&content, targets) {
+                let Some(dependencies) =
+                    find_direct_argument_array(&content, target.open, target.close, "dependencies")
+                else {
+                    continue;
+                };
+                if let Some(product) = direct_calls_in_array(&content, dependencies)
+                    .into_iter()
+                    .find(|call| {
+                        find_direct_string_argument(&content, call.open, call.close, "package")
+                            .as_deref()
+                            == Some(se0292_id)
+                    })
+                {
+                    matching = Some((dependencies, product));
+                    break;
+                }
+            }
+            let Some((dependencies, product)) = matching else {
+                break;
+            };
+            if let Some(name) =
+                find_direct_string_argument(&content, product.open, product.close, "name")
+            {
+                removal.product_names.push(name);
+            }
+            let (start, end) = call_removal_span(&content, dependencies, product);
+            content = replacement(&content, start, end, "");
+            removal.removed = true;
+        }
+        removal.product_names.sort();
+        removal.product_names.dedup();
+        removals.push(removal);
+    }
 
-    Ok(ManifestEdit {
-        already_exists: false,
-    })
+    if content != original {
+        replace_managed_text(manifest_path, "Package.swift", &original, &content)?;
+    }
+    Ok(removals)
 }
 
 /// Insert an entry into the top-level `dependencies: [...]` array.
@@ -148,51 +942,39 @@ fn insert_into_dependencies_array(
     entry: &str,
     before_keyword: Option<&str>,
 ) -> Result<String, LpmError> {
-    let search_limit = before_keyword
-        .and_then(|kw| content.find(kw))
-        .unwrap_or(content.len());
+    let _ = before_keyword;
+    let (package_open, package_close) = find_package_call(content)
+        .ok_or_else(|| LpmError::Registry("Could not find Package(...) in Package.swift".into()))?;
 
-    // Find `dependencies: [` before the limit
-    let deps_start = match content[..search_limit].find("dependencies:") {
-        Some(pos) => pos,
-        None => {
-            // No top-level `dependencies:` array exists — insert one before the keyword.
-            // This handles Swift 6.3+ manifests where `swift package init` omits the array.
-            if let Some(kw) = before_keyword
-                && let Some(kw_pos) = content.find(kw)
-            {
-                let kw_indent = get_line_indent(content, kw_pos);
-                let entry_indent = indent_one_level(&kw_indent);
-                let new_deps = format!(
-                    "{}dependencies: [\n{}{},\n{}],\n",
-                    kw_indent, entry_indent, entry, kw_indent
-                );
-                // Insert the new dependencies array on a new line before the keyword line.
-                // content[line_start..] already includes the keyword's own indentation,
-                // so we don't append kw_indent again.
-                let line_start = content[..kw_pos].rfind('\n').map_or(kw_pos, |i| i + 1);
-                let mut new_content = String::with_capacity(content.len() + new_deps.len() + 10);
-                new_content.push_str(&content[..line_start]);
-                new_content.push_str(&new_deps);
-                new_content.push_str(&content[line_start..]);
-                return Ok(new_content);
+    let (bracket_start, close_pos) =
+        match find_direct_argument_array(content, package_open, package_close, "dependencies") {
+            Some(array) => (array.open, array.close),
+            None => {
+                if let Some(kw_pos) =
+                    find_direct_argument_label(content, package_open, package_close, "targets")
+                {
+                    let kw_indent = get_line_indent(content, kw_pos);
+                    let entry_indent = indent_one_level(&kw_indent);
+                    let new_deps = format!(
+                        "{}dependencies: [\n{}{},\n{}],\n",
+                        kw_indent, entry_indent, entry, kw_indent
+                    );
+                    // Insert the new dependencies array on a new line before the keyword line.
+                    // content[line_start..] already includes the keyword's own indentation,
+                    // so we don't append kw_indent again.
+                    let line_start = content[..kw_pos].rfind('\n').map_or(kw_pos, |i| i + 1);
+                    let mut new_content =
+                        String::with_capacity(content.len() + new_deps.len() + 10);
+                    new_content.push_str(&content[..line_start]);
+                    new_content.push_str(&new_deps);
+                    new_content.push_str(&content[line_start..]);
+                    return Ok(new_content);
+                }
+                return Err(LpmError::Registry(
+                    "Could not find 'dependencies:' in Package.swift".into(),
+                ));
             }
-            return Err(LpmError::Registry(
-                "Could not find 'dependencies:' in Package.swift".into(),
-            ));
-        }
-    };
-
-    // Find the opening bracket
-    let bracket_start = content[deps_start..]
-        .find('[')
-        .map(|i| deps_start + i)
-        .ok_or_else(|| LpmError::Registry("Malformed dependencies block".into()))?;
-
-    // Find the matching closing bracket
-    let close_pos = find_matching_bracket(content, bracket_start).ok_or_else(|| {
-        LpmError::Registry("Could not find closing bracket for dependencies".into())
-    })?;
+        };
 
     // Detect indentation from existing entries or derive from context
     let indent = detect_indent(content, bracket_start, close_pos);
@@ -255,88 +1037,39 @@ fn insert_into_target_deps(
     target_name: &str,
     entry: &str,
 ) -> Result<String, LpmError> {
-    // Find the target declaration -- must be inside the targets array, not the Package name.
-    let target_pattern = format!("name: \"{}\"", target_name);
-    let targets_section = content
-        .find("targets:")
-        .ok_or_else(|| LpmError::Registry("Could not find 'targets:' in Package.swift".into()))?;
-
-    // Search for the target name AFTER the targets: keyword
-    let target_pos = content[targets_section..]
-        .find(&target_pattern)
-        .map(|i| targets_section + i)
-        .ok_or_else(|| {
-            LpmError::Registry(format!(
-                "Could not find target '{}' in Package.swift",
-                target_name
-            ))
-        })?;
-
-    // find the enclosing target call boundary using paren matching.
-    // Walk backwards from target_pos to find the opening `(` of `.target(` or `.executableTarget(`.
-    let target_call_open = content[..target_pos].rfind('(').ok_or_else(|| {
+    let target = target_call(content, target_name).ok_or_else(|| {
         LpmError::Registry(format!(
-            "Could not find opening '(' for target '{}'",
-            target_name
+            "Could not find target '{target_name}' in Package.swift"
         ))
     })?;
-
-    // Find the matching closing `)` to bound our search for `dependencies:`.
-    let target_call_close = find_matching_paren(content, target_call_open).ok_or_else(|| {
-        LpmError::Registry(format!(
-            "Could not find closing ')' for target '{}'",
-            target_name
-        ))
-    })?;
-
+    let target_call_open = target.open;
+    let target_call_close = target.close;
     // Search for `dependencies:` only within this target's scope
-    let target_scope = &content[target_pos..target_call_close];
-    let deps_offset = target_scope.find("dependencies:");
-
-    let (bracket_start, close_pos) = if let Some(offset) = deps_offset {
-        let deps_start = target_pos + offset;
-        let bs = content[deps_start..]
-            .find('[')
-            .map(|i| deps_start + i)
-            .ok_or_else(|| LpmError::Registry("Malformed target dependencies block".into()))?;
-        let cp = find_matching_bracket(content, bs).ok_or_else(|| {
-            LpmError::Registry("Could not find closing bracket for target dependencies".into())
-        })?;
-        (bs, cp)
+    let (bracket_start, close_pos) = if let Some(array) =
+        find_direct_argument_array(content, target_call_open, target_call_close, "dependencies")
+    {
+        (array.open, array.close)
     } else {
-        // Target has no dependencies array -- insert one.
-        let name_end = target_pos + target_pattern.len();
-        // Find the next comma or end of arguments after the name
-        let after_name = &content[name_end..target_call_close];
-        let (insert_after, needs_leading_comma) = if let Some(comma_pos) = after_name.find(',') {
-            (name_end + comma_pos + 1, false)
-        } else {
-            // No comma after the name — we need to add one as separator
-            (name_end, true)
-        };
-
-        // Detect the indent for the target's arguments.
-        // `target_indent` is the indent of the `name:` line (same level as `dependencies:`).
-        // Entry indent is one unit deeper — detect the unit from surrounding context.
-        let target_indent = get_line_indent(content, target_pos);
+        let target_indent =
+            indent_one_level_from_context(content, &get_line_indent(content, target_call_open));
         let entry_indent = indent_one_level_from_context(content, &target_indent);
-        let leading_comma = if needs_leading_comma { "," } else { "" };
+        let arguments = content[target_call_open + 1..target_call_close].trim_end();
+        let leading_comma = if arguments.is_empty() || arguments.ends_with(',') {
+            ""
+        } else {
+            ","
+        };
         let new_deps = format!(
             "{}\n{}dependencies: [\n{}{},\n{}]",
             leading_comma, target_indent, entry_indent, entry, target_indent
         );
-
-        // Check if we need a trailing comma for subsequent arguments
-        let rest_trimmed = content[insert_after..target_call_close].trim();
-        let needs_trailing_comma = !rest_trimmed.is_empty();
-
         let mut new_content = String::with_capacity(content.len() + new_deps.len() + 10);
-        new_content.push_str(&content[..insert_after]);
+        let trailing_whitespace_start = content[..target_call_close]
+            .rfind(|character: char| !character.is_whitespace())
+            .map_or(target_call_open + 1, |position| position + 1);
+        new_content.push_str(&content[..trailing_whitespace_start]);
         new_content.push_str(&new_deps);
-        if needs_trailing_comma {
-            new_content.push(',');
-        }
-        new_content.push_str(&content[insert_after..]);
+        new_content.push_str(&content[trailing_whitespace_start..]);
         return Ok(new_content);
     };
 
@@ -573,7 +1306,7 @@ fn get_line_indent(content: &str, pos: usize) -> String {
 
 /// Run `swift package resolve` in the given directory.
 pub fn run_swift_resolve(project_dir: &Path) -> Result<(), LpmError> {
-    let status = std::process::Command::new("swift")
+    let status = swift_command()
         .args(["package", "resolve"])
         .current_dir(project_dir)
         .stdout(std::process::Stdio::inherit())
@@ -601,8 +1334,12 @@ pub const LPM_DEPS_PACKAGE_NAME: &str = "LPMDependencies";
 /// Relative path from the project root to the wrapper package.
 pub const LPM_DEPS_REL_PATH: &str = "Packages/LPMDependencies";
 
+const LPM_DEPS_EXPORTS_HEADER: &str = "// Managed by lpm — do not edit manually.\n\
+// Re-exports all LPM dependencies so they are importable from any target.\n";
+
 /// Result of ensuring the wrapper package exists.
 pub struct WrapperPackageResult {
+    #[cfg(test)]
     pub created: bool,
     pub manifest_path: PathBuf,
 }
@@ -612,20 +1349,34 @@ pub struct WrapperPackageResult {
 /// If it doesn't exist yet, scaffolds the directory structure with Package.swift and Exports.swift.
 /// If it already exists, returns the existing manifest path.
 pub fn ensure_wrapper_package(project_dir: &Path) -> Result<WrapperPackageResult, LpmError> {
-    let pkg_dir = project_dir.join(LPM_DEPS_REL_PATH);
+    let packages_dir = project_dir.join("Packages");
+    ensure_real_directory(&packages_dir, "Swift packages directory")?;
+    let pkg_dir = packages_dir.join(LPM_DEPS_PACKAGE_NAME);
+    ensure_real_directory(&pkg_dir, "LPMDependencies package directory")?;
     let manifest_path = pkg_dir.join("Package.swift");
+    let sources_root = pkg_dir.join("Sources");
+    ensure_real_directory(&sources_root, "LPMDependencies sources directory")?;
+    let sources_dir = sources_root.join(LPM_DEPS_PACKAGE_NAME);
+    ensure_real_directory(&sources_dir, "LPMDependencies module directory")?;
+    let exports_path = sources_dir.join("Exports.swift");
 
     if manifest_path.exists() {
+        validate_regular_single_link_file(&manifest_path, "LPMDependencies Package.swift")?;
+        if exports_path.exists() {
+            read_managed_text(&exports_path, "LPMDependencies Exports.swift")?;
+        } else {
+            write_managed_text(
+                &exports_path,
+                "LPMDependencies Exports.swift",
+                LPM_DEPS_EXPORTS_HEADER,
+            )?;
+        }
         return Ok(WrapperPackageResult {
+            #[cfg(test)]
             created: false,
             manifest_path,
         });
     }
-
-    // Create directory structure
-    let sources_dir = pkg_dir.join("Sources").join(LPM_DEPS_PACKAGE_NAME);
-    std::fs::create_dir_all(&sources_dir)
-        .map_err(|e| LpmError::Registry(format!("failed to create {}: {e}", pkg_dir.display())))?;
 
     // Write Package.swift
     // Note: the template uses multi-line arrays and avoids `targets:` inside product
@@ -654,16 +1405,17 @@ let package = Package(
     ]
 )
 "#;
-    std::fs::write(&manifest_path, manifest)
-        .map_err(|e| LpmError::Registry(format!("failed to write Package.swift: {e}")))?;
+    write_managed_text(&manifest_path, "LPMDependencies Package.swift", manifest)?;
 
     // Write Exports.swift — re-exports are added by add_wrapper_dependency()
-    let exports = "// Managed by lpm — do not edit manually.\n\
-                   // Re-exports all LPM dependencies so they are importable from any target.\n";
-    std::fs::write(sources_dir.join("Exports.swift"), exports)
-        .map_err(|e| LpmError::Registry(format!("failed to write Exports.swift: {e}")))?;
+    write_managed_text(
+        &exports_path,
+        "LPMDependencies Exports.swift",
+        LPM_DEPS_EXPORTS_HEADER,
+    )?;
 
     Ok(WrapperPackageResult {
+        #[cfg(test)]
         created: true,
         manifest_path,
     })
@@ -675,64 +1427,121 @@ let package = Package(
 /// the wrapper template has inline `targets:` inside `.library(targets: [...])` which
 /// would confuse the `Some("targets:")` search. Since the wrapper Package.swift is
 /// generated by us, the first `dependencies:` array IS the top-level one.
-pub fn add_wrapper_dependency(
+#[cfg(test)]
+fn add_wrapper_dependency(
     manifest_path: &Path,
     se0292_id: &str,
     version: &str,
     product_name: &str,
 ) -> Result<ManifestEdit, LpmError> {
-    validate_manifest_value(version, "version")?;
-    validate_manifest_value(product_name, "product_name")?;
+    let modules = vec![product_name.to_string()];
+    reconcile_wrapper_dependencies(
+        manifest_path,
+        &[RegistryDependency {
+            se0292_id,
+            requirement: SwiftRequirement::UpToNextMajor(version.to_string()),
+            product_name,
+            module_names: &modules,
+        }],
+    )
+    .map(|mut edits| edits.remove(0))
+}
 
-    let content = std::fs::read_to_string(manifest_path)
-        .map_err(|e| LpmError::Registry(format!("failed to read Package.swift: {e}")))?;
-
-    // Check if dependency already exists
-    if content.contains(&format!("\"{}\"", se0292_id)) {
-        return Ok(ManifestEdit {
-            already_exists: true,
-        });
+pub fn reconcile_wrapper_dependencies(
+    manifest_path: &Path,
+    dependencies: &[RegistryDependency<'_>],
+) -> Result<Vec<ManifestEdit>, LpmError> {
+    for dependency in dependencies {
+        for module_name in dependency.module_names {
+            validate_swift_module_name(module_name)?;
+        }
     }
-
-    let dep_entry = format!(".package(id: \"{}\", from: \"{}\")", se0292_id, version);
-    let product_entry = format!(
-        ".product(name: \"{}\", package: \"{}\")",
-        product_name, se0292_id
-    );
-
-    // Insert into top-level dependencies — use None as before_keyword since we
-    // control the template and the first `dependencies:` IS the top-level one.
-    let content = insert_into_dependencies_array(&content, &dep_entry, None)?;
-
-    // Insert product into the LPMDependencies target's dependencies array
-    let content = insert_into_target_deps(&content, LPM_DEPS_PACKAGE_NAME, &product_entry)?;
-
-    std::fs::write(manifest_path, &content)
-        .map_err(|e| LpmError::Registry(format!("failed to write Package.swift: {e}")))?;
-
-    // Add @_exported import to Exports.swift so the module is importable from
-    // any target that links LPMDependencies (explicit re-export, not relying on
-    // Xcode build system behavior).
     let exports_path = manifest_path
         .parent()
-        .unwrap()
+        .ok_or_else(|| LpmError::Registry("wrapper manifest has no parent directory".into()))?
         .join("Sources")
         .join(LPM_DEPS_PACKAGE_NAME)
         .join("Exports.swift");
-    if exports_path.exists() {
-        let exports_content = std::fs::read_to_string(&exports_path)
-            .map_err(|e| LpmError::Registry(format!("failed to read Exports.swift: {e}")))?;
-        let import_line = format!("@_exported import {}", product_name);
-        if !exports_content.contains(&import_line) {
-            let updated = format!("{}{}\n", exports_content, import_line);
-            std::fs::write(&exports_path, updated)
-                .map_err(|e| LpmError::Registry(format!("failed to write Exports.swift: {e}")))?;
+    let mut exports = read_managed_text(&exports_path, "LPMDependencies Exports.swift")?;
+    let original_exports = exports.clone();
+    let mut edits =
+        reconcile_registry_dependencies(manifest_path, LPM_DEPS_PACKAGE_NAME, dependencies)?;
+    for (dependency, edit) in dependencies.iter().zip(&mut edits) {
+        for module_name in dependency.module_names {
+            let import_line = format!(
+                "@_exported import {module_name} // lpm:{}",
+                dependency.se0292_id
+            );
+            let already_present = exports.lines().any(|line| line.trim() == import_line);
+            if !already_present {
+                exports.reserve(import_line.len() + 1);
+                exports.push_str(&import_line);
+                exports.push('\n');
+                edit.already_exists = false;
+            }
         }
     }
+    if exports != original_exports {
+        replace_managed_text(
+            &exports_path,
+            "LPMDependencies Exports.swift",
+            &original_exports,
+            &exports,
+        )?;
+    }
+    Ok(edits)
+}
 
-    Ok(ManifestEdit {
-        already_exists: false,
-    })
+pub fn remove_wrapper_dependencies(
+    manifest_path: &Path,
+    se0292_ids: &[String],
+) -> Result<Vec<ManifestRemoval>, LpmError> {
+    let exports_path = manifest_path
+        .parent()
+        .ok_or_else(|| LpmError::Registry("wrapper manifest has no parent directory".into()))?
+        .join("Sources")
+        .join(LPM_DEPS_PACKAGE_NAME)
+        .join("Exports.swift");
+    let exports = match exports_path.symlink_metadata() {
+        Ok(_) => Some(read_managed_text(
+            &exports_path,
+            "LPMDependencies Exports.swift",
+        )?),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => {
+            return Err(LpmError::Registry(format!(
+                "failed to inspect LPMDependencies Exports.swift: {error}"
+            )));
+        }
+    };
+    let removals = remove_registry_dependencies(manifest_path, se0292_ids)?;
+    if let Some(exports) = exports {
+        let mut updated = String::with_capacity(exports.len());
+        for line in exports.lines() {
+            let tagged = se0292_ids
+                .iter()
+                .any(|identity| line.trim_end().ends_with(&format!("// lpm:{identity}")));
+            let legacy = removals.iter().any(|removal| {
+                removal
+                    .product_names
+                    .iter()
+                    .any(|product| line.trim() == format!("@_exported import {product}"))
+            });
+            if !tagged && !legacy {
+                updated.push_str(line);
+                updated.push('\n');
+            }
+        }
+        if updated != exports {
+            replace_managed_text(
+                &exports_path,
+                "LPMDependencies Exports.swift",
+                &exports,
+                &updated,
+            )?;
+        }
+    }
+    Ok(removals)
 }
 
 #[cfg(test)]
@@ -1411,5 +2220,376 @@ let package = Package(
             exports.contains("@_exported import Haptic"),
             "should contain @_exported import Haptic"
         );
+    }
+
+    #[test]
+    fn registry_dependency_is_inserted_after_products_with_nested_targets() {
+        let directory = tempfile::tempdir().unwrap();
+        let manifest_path = directory.path().join("Package.swift");
+        std::fs::write(
+            &manifest_path,
+            r#"// swift-tools-version: 5.9
+import PackageDescription
+
+let package = Package(
+    name: "Conventional",
+    products: [
+        .library(name: "Conventional", targets: ["Conventional"]),
+    ],
+    dependencies: [],
+    targets: [
+        .target(name: "Conventional", dependencies: []),
+    ]
+)
+"#,
+        )
+        .unwrap();
+
+        add_registry_dependency(
+            &manifest_path,
+            "lpmdev.acme_swift-logger",
+            "1.0.0",
+            "SwiftLogger",
+            "Conventional",
+        )
+        .unwrap();
+
+        let updated = std::fs::read_to_string(manifest_path).unwrap();
+        assert_eq!(
+            updated.matches("dependencies: [").count(),
+            2,
+            "install must reuse the top-level and target dependency arrays without creating a nested third array:\n{updated}"
+        );
+    }
+
+    #[test]
+    fn registry_dependency_comment_does_not_count_as_an_installation() {
+        let directory = tempfile::tempdir().unwrap();
+        let manifest_path = directory.path().join("Package.swift");
+        std::fs::write(
+            &manifest_path,
+            r#"// swift-tools-version: 5.9
+import PackageDescription
+// Documentation mentions "lpmdev.acme_swift-logger".
+let package = Package(
+    name: "App",
+    dependencies: [],
+    targets: [.target(name: "App", dependencies: [])]
+)
+"#,
+        )
+        .unwrap();
+
+        let edit = add_registry_dependency(
+            &manifest_path,
+            "lpmdev.acme_swift-logger",
+            "1.0.0",
+            "SwiftLogger",
+            "App",
+        )
+        .unwrap();
+
+        assert!(!edit.already_exists);
+        let updated = std::fs::read_to_string(manifest_path).unwrap();
+        assert!(updated.contains(".package(id: \"lpmdev.acme_swift-logger\", from: \"1.0.0\")"));
+    }
+
+    #[test]
+    fn registry_dependency_reconciles_a_missing_target_product() {
+        let directory = tempfile::tempdir().unwrap();
+        let manifest_path = directory.path().join("Package.swift");
+        std::fs::write(
+            &manifest_path,
+            r#"// swift-tools-version: 5.9
+import PackageDescription
+let package = Package(
+    name: "App",
+    dependencies: [.package(id: "lpmdev.acme_swift-logger", from: "1.0.0")],
+    targets: [.target(name: "App", dependencies: [])]
+)
+"#,
+        )
+        .unwrap();
+
+        let edit = add_registry_dependency(
+            &manifest_path,
+            "lpmdev.acme_swift-logger",
+            "1.0.0",
+            "SwiftLogger",
+            "App",
+        )
+        .unwrap();
+
+        assert!(!edit.already_exists);
+        let updated = std::fs::read_to_string(manifest_path).unwrap();
+        assert!(
+            updated
+                .contains(".product(name: \"SwiftLogger\", package: \"lpmdev.acme_swift-logger\")")
+        );
+    }
+
+    #[test]
+    fn registry_dependency_updates_an_existing_version_requirement() {
+        let directory = tempfile::tempdir().unwrap();
+        let manifest_path = directory.path().join("Package.swift");
+        std::fs::write(
+            &manifest_path,
+            r#"// swift-tools-version: 5.9
+import PackageDescription
+let package = Package(
+    name: "App",
+    dependencies: [.package(id: "lpmdev.acme_swift-logger", from: "1.0.0")],
+    targets: [.target(name: "App", dependencies: [.product(name: "SwiftLogger", package: "lpmdev.acme_swift-logger")])]
+)
+"#,
+        )
+        .unwrap();
+
+        let edit = add_registry_dependency(
+            &manifest_path,
+            "lpmdev.acme_swift-logger",
+            "2.0.0",
+            "SwiftLogger",
+            "App",
+        )
+        .unwrap();
+
+        assert!(!edit.already_exists);
+        let updated = std::fs::read_to_string(manifest_path).unwrap();
+        assert!(updated.contains("from: \"2.0.0\""));
+        assert!(!updated.contains("from: \"1.0.0\""));
+    }
+
+    #[test]
+    fn wrapper_dependency_rejects_a_source_injecting_module_name_before_mutation() {
+        let directory = tempfile::tempdir().unwrap();
+        let wrapper = ensure_wrapper_package(directory.path()).unwrap();
+        let manifest_before = std::fs::read(&wrapper.manifest_path).unwrap();
+        let exports_path = wrapper
+            .manifest_path
+            .parent()
+            .unwrap()
+            .join("Sources/LPMDependencies/Exports.swift");
+        let exports_before = std::fs::read(&exports_path).unwrap();
+
+        let error = add_wrapper_dependency(
+            &wrapper.manifest_path,
+            "lpmdev.acme_swift-logger",
+            "1.0.0",
+            "SwiftLogger; @_exported import Foundation",
+        )
+        .err()
+        .expect("source-injecting module metadata must be rejected");
+
+        assert!(error.to_string().contains("module"));
+        assert_eq!(
+            std::fs::read(wrapper.manifest_path).unwrap(),
+            manifest_before
+        );
+        assert_eq!(std::fs::read(exports_path).unwrap(), exports_before);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn registry_dependency_rejects_a_linked_manifest_without_touching_its_target() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::tempdir().unwrap();
+        let outside = directory.path().join("outside.swift");
+        let manifest_path = directory.path().join("Package.swift");
+        let original = b"outside sentinel\n";
+        std::fs::write(&outside, original).unwrap();
+        symlink(&outside, &manifest_path).unwrap();
+
+        let result = add_registry_dependency(
+            &manifest_path,
+            "lpmdev.acme_swift-logger",
+            "1.0.0",
+            "SwiftLogger",
+            "App",
+        );
+
+        assert!(result.is_err());
+        assert_eq!(std::fs::read(outside).unwrap(), original);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn registry_dependency_rejects_a_hard_linked_manifest_without_touching_its_peer() {
+        let directory = tempfile::tempdir().unwrap();
+        let outside = directory.path().join("outside.swift");
+        let manifest_path = directory.path().join("Package.swift");
+        let original = r#"// swift-tools-version: 5.9
+import PackageDescription
+let package = Package(name: "App", dependencies: [], targets: [.target(name: "App")])
+"#;
+        std::fs::write(&outside, original).unwrap();
+        std::fs::hard_link(&outside, &manifest_path).unwrap();
+
+        let result = add_registry_dependency(
+            &manifest_path,
+            "lpmdev.acme_swift-logger",
+            "1.0.0",
+            "SwiftLogger",
+            "App",
+        );
+
+        assert!(result.is_err());
+        assert_eq!(std::fs::read_to_string(outside).unwrap(), original);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn wrapper_creation_rejects_a_linked_packages_directory() {
+        use std::os::unix::fs::symlink;
+
+        let project = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        symlink(outside.path(), project.path().join("Packages")).unwrap();
+
+        let result = ensure_wrapper_package(project.path());
+
+        assert!(result.is_err());
+        assert!(
+            !outside
+                .path()
+                .join("LPMDependencies/Package.swift")
+                .exists()
+        );
+    }
+
+    #[test]
+    fn registry_dependency_rejects_an_oversized_manifest_before_parsing() {
+        use std::io::{Seek as _, SeekFrom, Write as _};
+
+        let directory = tempfile::tempdir().unwrap();
+        let manifest_path = directory.path().join("Package.swift");
+        let mut file = std::fs::File::create(&manifest_path).unwrap();
+        file.set_len(lpm_common::CONFIG_FILE_SIZE_CAP_BYTES + 1)
+            .unwrap();
+        file.seek(SeekFrom::Start(0)).unwrap();
+        file.write_all(b"// oversized").unwrap();
+
+        let error = add_registry_dependency(
+            &manifest_path,
+            "lpmdev.acme_swift-logger",
+            "1.0.0",
+            "SwiftLogger",
+            "App",
+        )
+        .err()
+        .expect("oversized manifests must be rejected");
+
+        assert!(error.to_string().contains("limit"));
+    }
+
+    #[test]
+    fn existing_wrapper_repairs_a_missing_exports_file() {
+        let directory = tempfile::tempdir().unwrap();
+        let wrapper = ensure_wrapper_package(directory.path()).unwrap();
+        let exports = wrapper
+            .manifest_path
+            .parent()
+            .unwrap()
+            .join("Sources/LPMDependencies/Exports.swift");
+        std::fs::remove_file(&exports).unwrap();
+
+        ensure_wrapper_package(directory.path()).unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(exports).unwrap(),
+            LPM_DEPS_EXPORTS_HEADER
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn existing_wrapper_rejects_a_linked_exports_file_before_manifest_mutation() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::tempdir().unwrap();
+        let outside = directory.path().join("outside.swift");
+        std::fs::write(&outside, "outside sentinel\n").unwrap();
+        let wrapper = ensure_wrapper_package(directory.path()).unwrap();
+        let manifest_before = std::fs::read(&wrapper.manifest_path).unwrap();
+        let exports = wrapper
+            .manifest_path
+            .parent()
+            .unwrap()
+            .join("Sources/LPMDependencies/Exports.swift");
+        std::fs::remove_file(&exports).unwrap();
+        symlink(&outside, &exports).unwrap();
+
+        let error = ensure_wrapper_package(directory.path())
+            .err()
+            .expect("linked wrapper exports must be rejected");
+
+        assert!(error.to_string().contains("regular file"));
+        assert_eq!(
+            std::fs::read(wrapper.manifest_path).unwrap(),
+            manifest_before
+        );
+        assert_eq!(
+            std::fs::read_to_string(outside).unwrap(),
+            "outside sentinel\n"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn wrapper_uninstall_rejects_linked_exports_before_manifest_mutation() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::tempdir().unwrap();
+        let wrapper = ensure_wrapper_package(directory.path()).unwrap();
+        add_wrapper_dependency(
+            &wrapper.manifest_path,
+            "lpmdev.acme_swift-logger",
+            "1.0.0",
+            "SwiftLogger",
+        )
+        .unwrap();
+        let manifest_before = std::fs::read(&wrapper.manifest_path).unwrap();
+        let exports = wrapper
+            .manifest_path
+            .parent()
+            .unwrap()
+            .join("Sources/LPMDependencies/Exports.swift");
+        let outside = directory.path().join("outside.swift");
+        std::fs::write(&outside, "outside sentinel\n").unwrap();
+        std::fs::remove_file(&exports).unwrap();
+        symlink(&outside, &exports).unwrap();
+
+        let error = remove_wrapper_dependencies(
+            &wrapper.manifest_path,
+            &["lpmdev.acme_swift-logger".into()],
+        )
+        .expect_err("linked wrapper exports must be rejected during uninstall");
+
+        assert!(error.to_string().contains("regular file"));
+        assert_eq!(
+            std::fs::read(wrapper.manifest_path).unwrap(),
+            manifest_before
+        );
+        assert_eq!(
+            std::fs::read_to_string(outside).unwrap(),
+            "outside sentinel\n"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bounded_swift_output_rejects_oversized_stdout() {
+        let mut command = std::process::Command::new("sh");
+        command.args([
+            "-c",
+            &format!("yes x | head -c {}", SWIFT_PROCESS_OUTPUT_LIMIT + 1),
+        ]);
+
+        let error = run_bounded_swift_output(command, "swift package dump-package")
+            .err()
+            .expect("oversized child output must be rejected");
+
+        assert!(error.to_string().contains("output exceeded"));
     }
 }

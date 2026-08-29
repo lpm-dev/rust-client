@@ -11,7 +11,7 @@ mod support;
 
 use support::auth_state::seed_sessions;
 use support::mock_registry::{MockRegistry, make_tarball};
-use support::{TempProject, lpm, lpm_with_registry};
+use support::{TempProject, lpm, lpm_spawnable_with_registry, lpm_with_registry};
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, ResponseTemplate};
 
@@ -40,8 +40,90 @@ let package = Package(
     project
 }
 
+fn write_xcode_project(project: &TempProject, root: &str, project_name: &str) {
+    let path = if root.is_empty() {
+        format!("{project_name}.xcodeproj/project.pbxproj")
+    } else {
+        format!("{root}/{project_name}.xcodeproj/project.pbxproj")
+    };
+    project.write_file(
+        &path,
+        &format!(
+            r#"// !$*UTF8*$!
+{{
+	archiveVersion = 1;
+	objects = {{
+/* Begin PBXBuildFile section */
+/* End PBXBuildFile section */
+/* Begin PBXFrameworksBuildPhase section */
+		AAAAAAAAAAAAAAAAAAAAAAAA /* Frameworks */ = {{
+			isa = PBXFrameworksBuildPhase;
+			files = (
+			);
+		}};
+/* End PBXFrameworksBuildPhase section */
+/* Begin PBXGroup section */
+		BBBBBBBBBBBBBBBBBBBBBBBB = {{
+			isa = PBXGroup;
+			children = (
+			);
+			sourceTree = "<group>";
+		}};
+/* End PBXGroup section */
+/* Begin PBXNativeTarget section */
+		CCCCCCCCCCCCCCCCCCCCCCCC /* {project_name} */ = {{
+			isa = PBXNativeTarget;
+			buildPhases = (
+				AAAAAAAAAAAAAAAAAAAAAAAA /* Frameworks */,
+			);
+			dependencies = (
+			);
+			name = {project_name};
+			productName = {project_name};
+			productType = "com.apple.product-type.application";
+		}};
+/* End PBXNativeTarget section */
+/* Begin PBXProject section */
+		DDDDDDDDDDDDDDDDDDDDDDDD /* Project object */ = {{
+			isa = PBXProject;
+			mainGroup = BBBBBBBBBBBBBBBBBBBBBBBB;
+			targets = (
+				CCCCCCCCCCCCCCCCCCCCCCCC /* {project_name} */,
+			);
+		}};
+/* End PBXProject section */
+	}};
+	rootObject = DDDDDDDDDDDDDDDDDDDDDDDD /* Project object */;
+}}
+"#
+        ),
+    );
+}
+
 async fn mount_swift_package(mock: &MockRegistry) -> Vec<u8> {
     mount_swift_package_with_security_metadata(mock, None, None).await
+}
+
+async fn mount_named_swift_package(
+    mock: &MockRegistry,
+    package: &str,
+    version: &str,
+    product: &str,
+    modules: &[&str],
+) {
+    let tarball = b"unused swift package tarball";
+    let mut metadata = mock.package_metadata(package, version, tarball);
+    let version_metadata = &mut metadata["versions"][version];
+    version_metadata["_ecosystem"] = serde_json::json!("swift");
+    version_metadata["_swiftMeta"] = serde_json::json!({
+        "products": [{
+            "name": product,
+            "type": {"library": ["automatic"]},
+            "targets": modules
+        }]
+    });
+    mock.with_package_metadata(package, version, tarball, metadata)
+        .await;
 }
 
 async fn mount_swift_package_with_audit_findings(mock: &MockRegistry) -> Vec<u8> {
@@ -127,8 +209,8 @@ fn configure_existing_registry(project: &TempProject, registry_url: &str, cert: 
             "security": {
                 "default": {
                     "signing": {
-                        "onUnsigned": "warn",
-                        "onUntrustedCertificate": "warn"
+                        "onUnsigned": "error",
+                        "onUntrustedCertificate": "error"
                     }
                 },
                 "scopeOverrides": {
@@ -156,6 +238,36 @@ fn configure_fake_swift(
     targets: &[&str],
     resolve_exit_code: i32,
 ) {
+    let (path, dump_package) = fake_swift_configuration(project, targets);
+    command
+        .env("PATH", path)
+        .env("LPM_TEST_SWIFT_DUMP_PACKAGE", dump_package)
+        .env(
+            "LPM_TEST_SWIFT_RESOLVE_EXIT_CODE",
+            resolve_exit_code.to_string(),
+        );
+}
+
+fn configure_spawnable_fake_swift(
+    command: &mut std::process::Command,
+    project: &TempProject,
+    targets: &[&str],
+    resolve_exit_code: i32,
+) {
+    let (path, dump_package) = fake_swift_configuration(project, targets);
+    command
+        .env("PATH", path)
+        .env("LPM_TEST_SWIFT_DUMP_PACKAGE", dump_package)
+        .env(
+            "LPM_TEST_SWIFT_RESOLVE_EXIT_CODE",
+            resolve_exit_code.to_string(),
+        );
+}
+
+fn fake_swift_configuration(
+    project: &TempProject,
+    targets: &[&str],
+) -> (std::ffi::OsString, String) {
     let bin_dir = project.home().join("fake-swift-bin");
     std::fs::create_dir_all(&bin_dir).expect("create fake Swift bin directory");
     let target_values: Vec<_> = targets
@@ -171,13 +283,7 @@ fn configure_fake_swift(
     let existing_path = std::env::var_os("PATH").unwrap_or_default();
     let paths = std::iter::once(bin_dir).chain(std::env::split_paths(&existing_path));
     let path = std::env::join_paths(paths).expect("construct PATH with fake Swift");
-    command
-        .env("PATH", path)
-        .env("LPM_TEST_SWIFT_DUMP_PACKAGE", dump_package)
-        .env(
-            "LPM_TEST_SWIFT_RESOLVE_EXIT_CODE",
-            resolve_exit_code.to_string(),
-        );
+    (path, dump_package)
 }
 
 fn configure_fake_swift_lockfile_write(command: &mut assert_cmd::Command, content: &str) {
@@ -186,6 +292,17 @@ fn configure_fake_swift_lockfile_write(command: &mut assert_cmd::Command, conten
 
 fn configure_fake_swift_login_capture(command: &mut assert_cmd::Command, path: &std::path::Path) {
     command.env("LPM_TEST_SWIFT_LOGIN_ARGS_PATH", path);
+}
+
+fn configure_fake_swift_command_log(command: &mut assert_cmd::Command, path: &std::path::Path) {
+    command.env("LPM_TEST_SWIFT_COMMAND_LOG", path);
+}
+
+fn configure_fake_swift_environment_capture(
+    command: &mut assert_cmd::Command,
+    path: &std::path::Path,
+) {
+    command.env("LPM_TEST_SWIFT_ENV_CAPTURE", path);
 }
 
 fn fake_swift_executable_name(windows: bool) -> &'static str {
@@ -917,6 +1034,7 @@ async fn mixed_swift_and_javascript_request_routes_each_ecosystem_to_its_manifes
     let output = command
         .current_dir(project.path().join("packages/swift-member"))
         .args([
+            "--json",
             "install",
             "--yes",
             "--no-security-summary",
@@ -933,6 +1051,17 @@ async fn mixed_swift_and_javascript_request_routes_each_ecosystem_to_its_manifes
         "mixed workspace install should succeed:\n{}",
         combined_output(&output)
     );
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout)
+        .expect("mixed Swift and JavaScript install must emit one JSON document");
+    assert_eq!(json["success"], true);
+    assert_eq!(json["swift"].as_array().map(Vec::len), Some(1));
+    assert_eq!(json["swift"][0]["package"], SWIFT_PACKAGE);
+    assert_eq!(
+        json["swift"][0]["packages"].as_array().map(Vec::len),
+        Some(1)
+    );
+    assert_eq!(json["javascript"].as_array().map(Vec::len), Some(1));
+    assert!(json["javascript"][0].is_object());
     assert!(
         project
             .read_file("packages/swift-member/Package.swift")
@@ -1057,6 +1186,576 @@ async fn later_javascript_failure_removes_package_resolved_created_by_swift() {
     assert!(
         !project.file_exists(lockfile_path),
         "Package.resolved created by Swift must be removed when the later JavaScript leg fails"
+    );
+}
+
+#[tokio::test]
+async fn standalone_swift_resolve_failure_restores_manifest_and_lockfile() {
+    let mock = MockRegistry::start().await;
+    let cert = mount_swift_package(&mock).await;
+    let project = swift_project();
+    configure_existing_registry(&project, &mock.url(), &cert);
+    let original_manifest = project.read_file("Package.swift");
+    let original_lockfile = r#"{"version":2,"pins":[{"identity":"original"}]}"#;
+    project.write_file("Package.resolved", original_lockfile);
+
+    let mut command = lpm_with_registry(&project, &mock.url());
+    configure_fake_swift(&mut command, &project, &["FirstTarget"], 19);
+    configure_fake_swift_lockfile_write(
+        &mut command,
+        r#"{"version":2,"pins":[{"identity":"rewritten"}]}"#,
+    );
+    let output = command
+        .args(["install", "--yes", SWIFT_PACKAGE])
+        .output()
+        .expect("run failing standalone Swift install");
+
+    assert!(!output.status.success());
+    assert_eq!(project.read_file("Package.swift"), original_manifest);
+    assert_eq!(project.read_file("Package.resolved"), original_lockfile);
+}
+
+#[tokio::test]
+async fn standalone_mixed_failure_restores_swift_manifest_and_created_lockfile() {
+    const JS_PACKAGE: &str = "@lpm.dev/acme.unfetchable-standalone";
+
+    let mock = MockRegistry::start().await;
+    let cert = mount_swift_package(&mock).await;
+    mock.with_full_package_metadata(
+        JS_PACKAGE,
+        "1.0.0",
+        &[("1.0.0", serde_json::json!({}), None)],
+    )
+    .await;
+    let project = swift_project();
+    configure_existing_registry(&project, &mock.url(), &cert);
+    let original_manifest = project.read_file("Package.swift");
+
+    let mut command = lpm_with_registry(&project, &mock.url());
+    configure_fake_swift(&mut command, &project, &["FirstTarget"], 0);
+    configure_fake_swift_lockfile_write(
+        &mut command,
+        r#"{"version":2,"pins":[{"identity":"created"}]}"#,
+    );
+    let output = command
+        .args([
+            "install",
+            "--yes",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+            SWIFT_PACKAGE,
+            JS_PACKAGE,
+        ])
+        .output()
+        .expect("run failing standalone mixed install");
+
+    assert!(!output.status.success(), "{}", combined_output(&output));
+    assert_eq!(project.read_file("Package.swift"), original_manifest);
+    assert!(!project.file_exists("Package.resolved"));
+}
+
+#[tokio::test]
+async fn swift_dump_package_failure_is_reported_without_becoming_no_targets() {
+    let mock = MockRegistry::start().await;
+    let cert = mount_swift_package(&mock).await;
+    let project = swift_project();
+    configure_existing_registry(&project, &mock.url(), &cert);
+
+    let mut command = lpm_with_registry(&project, &mock.url());
+    configure_fake_swift(&mut command, &project, &["FirstTarget"], 0);
+    command.env("LPM_TEST_SWIFT_DUMP_EXIT_CODE", "23");
+    let output = command
+        .args(["install", "--yes", SWIFT_PACKAGE])
+        .output()
+        .expect("run Swift install with failing dump-package");
+    let combined = combined_output(&output);
+
+    assert!(!output.status.success());
+    assert!(
+        combined.contains("configured dump-package failure"),
+        "the original Swift diagnostic must be preserved:\n{combined}"
+    );
+    assert!(!combined.contains("No non-test targets found"));
+}
+
+#[tokio::test]
+async fn swift_subprocesses_do_not_inherit_tokens_or_loader_injection() {
+    let mock = MockRegistry::start().await;
+    let cert = mount_swift_package(&mock).await;
+    let project = swift_project();
+    configure_existing_registry(&project, &mock.url(), &cert);
+    let capture = project.path().join("swift-environment.log");
+
+    let mut command = lpm_with_registry(&project, &mock.url());
+    configure_fake_swift(&mut command, &project, &["FirstTarget"], 0);
+    configure_fake_swift_environment_capture(&mut command, &capture);
+    command
+        .env("LPM_TOKEN", "lpm-secret")
+        .env("GITHUB_TOKEN", "github-secret")
+        .env("AWS_SECRET_ACCESS_KEY", "aws-secret")
+        .env("ACTIONS_ID_TOKEN_REQUEST_TOKEN", "oidc-secret")
+        .env("LD_LIBRARY_PATH", "/tmp/untrusted")
+        .env("DYLD_LIBRARY_PATH", "/tmp/untrusted");
+    let output = command
+        .args(["--json", "install", "--yes", SWIFT_PACKAGE])
+        .output()
+        .expect("run Swift install with sensitive parent environment");
+
+    assert!(output.status.success(), "{}", combined_output(&output));
+    let captured = std::fs::read_to_string(capture).expect("read Swift environment capture");
+    assert!(
+        captured.lines().all(|line| line.ends_with("\tfalse")),
+        "Swift inherited sensitive environment entries:\n{captured}"
+    );
+}
+
+#[tokio::test]
+async fn swift_batch_dumps_and_resolves_each_manifest_once_and_emits_one_json_document() {
+    const SECOND_PACKAGE: &str = "@lpm.dev/acme.swift-metrics";
+
+    let mock = MockRegistry::start().await;
+    let cert = mount_swift_package(&mock).await;
+    mount_named_swift_package(
+        &mock,
+        SECOND_PACKAGE,
+        "1.0.0",
+        "SwiftMetrics",
+        &["MetricsCore"],
+    )
+    .await;
+    let project = swift_project();
+    configure_existing_registry(&project, &mock.url(), &cert);
+    let command_log = project.path().join("swift-commands.log");
+
+    let mut command = lpm_with_registry(&project, &mock.url());
+    configure_fake_swift(&mut command, &project, &["FirstTarget"], 0);
+    configure_fake_swift_command_log(&mut command, &command_log);
+    let output = command
+        .args(["--json", "install", "--yes", SWIFT_PACKAGE, SECOND_PACKAGE])
+        .output()
+        .expect("run batched Swift install");
+
+    assert!(output.status.success(), "{}", combined_output(&output));
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout)
+        .unwrap_or_else(|error| panic!("Swift batch must emit one JSON document: {error}"));
+    assert_eq!(json["packages"].as_array().map(Vec::len), Some(2));
+    insta::assert_json_snapshot!(json, @r###"
+    {
+      "success": true,
+      "mode": "registry",
+      "packages": [
+        {
+          "package": "@lpm.dev/acme.swift-logger",
+          "version": "1.0.0",
+          "mode": "registry",
+          "se0292_id": "lpmdev.acme_swift-logger",
+          "product_name": "SwiftLogger",
+          "modules": [
+            "SwiftLogger"
+          ],
+          "target": "FirstTarget",
+          "already_existed": false
+        },
+        {
+          "package": "@lpm.dev/acme.swift-metrics",
+          "version": "1.0.0",
+          "mode": "registry",
+          "se0292_id": "lpmdev.acme_swift-metrics",
+          "product_name": "SwiftMetrics",
+          "modules": [
+            "MetricsCore"
+          ],
+          "target": "FirstTarget",
+          "already_existed": false
+        }
+      ],
+      "registry_setup": {
+        "scope": "retained",
+        "signing_certificate": "retained",
+        "signing_trust": "retained"
+      }
+    }
+    "###);
+    let commands = std::fs::read_to_string(command_log).expect("read Swift command log");
+    assert_eq!(
+        commands
+            .lines()
+            .filter(|command| *command == "package dump-package")
+            .count(),
+        1,
+        "{commands}"
+    );
+    assert_eq!(
+        commands
+            .lines()
+            .filter(|command| *command == "package resolve")
+            .count(),
+        1,
+        "{commands}"
+    );
+}
+
+#[tokio::test]
+async fn concurrent_swift_installs_serialize_manifest_mutation_and_preserve_both_packages() {
+    const SECOND_PACKAGE: &str = "@lpm.dev/acme.swift-metrics";
+
+    let mock = MockRegistry::start().await;
+    let cert = mount_swift_package(&mock).await;
+    mount_named_swift_package(
+        &mock,
+        SECOND_PACKAGE,
+        "1.0.0",
+        "SwiftMetrics",
+        &["MetricsCore"],
+    )
+    .await;
+    let project = swift_project();
+    configure_existing_registry(&project, &mock.url(), &cert);
+    let interval_log = project.path().join("swift-intervals.log");
+
+    let mut first = lpm_spawnable_with_registry(&project, &mock.url());
+    configure_spawnable_fake_swift(&mut first, &project, &["FirstTarget"], 0);
+    first
+        .env("LPM_TEST_SWIFT_INTERVAL_LOG", &interval_log)
+        .env("LPM_TEST_SWIFT_PROCESS_ID", "first")
+        .env("LPM_TEST_SWIFT_DUMP_DELAY_MS", "300")
+        .args(["install", "--yes", SWIFT_PACKAGE]);
+
+    let mut second = lpm_spawnable_with_registry(&project, &mock.url());
+    configure_spawnable_fake_swift(&mut second, &project, &["FirstTarget"], 0);
+    second
+        .env("LPM_TEST_SWIFT_INTERVAL_LOG", &interval_log)
+        .env("LPM_TEST_SWIFT_PROCESS_ID", "second")
+        .env("LPM_TEST_SWIFT_DUMP_DELAY_MS", "300")
+        .args(["install", "--yes", SECOND_PACKAGE]);
+
+    let first = first.spawn().expect("spawn first Swift install");
+    std::thread::sleep(std::time::Duration::from_millis(40));
+    let second = second.spawn().expect("spawn second Swift install");
+    let first_output = first
+        .wait_with_output()
+        .expect("wait for first Swift install");
+    let second_output = second
+        .wait_with_output()
+        .expect("wait for second Swift install");
+
+    assert!(
+        first_output.status.success(),
+        "{}",
+        combined_output(&first_output)
+    );
+    assert!(
+        second_output.status.success(),
+        "{}",
+        combined_output(&second_output)
+    );
+    let intervals = std::fs::read_to_string(interval_log).expect("read Swift interval log");
+    let events = intervals.lines().collect::<Vec<_>>();
+    assert!(
+        matches!(
+            events.as_slice(),
+            ["first:start", "first:end", "second:start", "second:end"]
+                | ["second:start", "second:end", "first:start", "first:end"]
+        ),
+        "Swift dump-package executions overlapped outside the project lock:\n{intervals}"
+    );
+    let manifest = project.read_file("Package.swift");
+    assert!(manifest.contains("lpmdev.acme_swift-logger"), "{manifest}");
+    assert!(manifest.contains("lpmdev.acme_swift-metrics"), "{manifest}");
+}
+
+#[tokio::test]
+async fn swift_install_excludes_binary_system_and_test_targets() {
+    let mock = MockRegistry::start().await;
+    let cert = mount_swift_package(&mock).await;
+    let project = swift_project();
+    configure_existing_registry(&project, &mock.url(), &cert);
+
+    let mut command = lpm_with_registry(&project, &mock.url());
+    configure_fake_swift(&mut command, &project, &["placeholder"], 0);
+    command.env(
+        "LPM_TEST_SWIFT_DUMP_PACKAGE",
+        serde_json::json!({
+            "targets": [
+                {"name": "BinaryArtifact", "type": "binary"},
+                {"name": "SystemLibrary", "type": "system"},
+                {"name": "Tests", "type": "test"},
+                {"name": "FirstTarget", "type": "regular"}
+            ]
+        })
+        .to_string(),
+    );
+    let output = command
+        .args(["--json", "install", "--yes", SWIFT_PACKAGE])
+        .output()
+        .expect("run Swift install with mixed target kinds");
+
+    assert!(output.status.success(), "{}", combined_output(&output));
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(json["target"], "FirstTarget");
+}
+
+#[tokio::test]
+async fn exact_swift_install_writes_an_exact_requirement() {
+    let mock = MockRegistry::start().await;
+    let cert = mount_swift_package(&mock).await;
+    let project = swift_project();
+    configure_existing_registry(&project, &mock.url(), &cert);
+
+    let mut command = lpm_with_registry(&project, &mock.url());
+    configure_fake_swift(&mut command, &project, &["FirstTarget"], 0);
+    let exact_spec = format!("{SWIFT_PACKAGE}@{SWIFT_VERSION}");
+    let output = command
+        .args(["install", "--yes", &exact_spec])
+        .output()
+        .expect("run exact Swift install");
+
+    assert!(output.status.success(), "{}", combined_output(&output));
+    let manifest = project.read_file("Package.swift");
+    assert!(
+        manifest.contains(&format!(
+            ".package(id: \"lpmdev.acme_swift-logger\", exact: \"{SWIFT_VERSION}\")"
+        )),
+        "{manifest}"
+    );
+}
+
+#[tokio::test]
+async fn swift_uninstall_removes_manifest_entries_and_resolves_once() {
+    let mock = MockRegistry::start().await;
+    let project = swift_project();
+    project.write_file(
+        "Package.swift",
+        r#"// swift-tools-version: 5.9
+import PackageDescription
+let package = Package(
+    name: "SwiftApp",
+    dependencies: [.package(id: "lpmdev.acme_swift-logger", from: "1.0.0")],
+    targets: [.target(name: "FirstTarget", dependencies: [.product(name: "SwiftLogger", package: "lpmdev.acme_swift-logger")])]
+)
+"#,
+    );
+    let command_log = project.path().join("swift-uninstall-commands.log");
+
+    let mut command = lpm_with_registry(&project, &mock.url());
+    configure_fake_swift(&mut command, &project, &["FirstTarget"], 0);
+    configure_fake_swift_command_log(&mut command, &command_log);
+    let output = command
+        .args(["--json", "uninstall", SWIFT_PACKAGE])
+        .output()
+        .expect("run Swift uninstall");
+
+    assert!(output.status.success(), "{}", combined_output(&output));
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(json["removed"], serde_json::json!([SWIFT_PACKAGE]));
+    let manifest = project.read_file("Package.swift");
+    assert!(!manifest.contains("lpmdev.acme_swift-logger"), "{manifest}");
+    let commands = std::fs::read_to_string(command_log).expect("read Swift command log");
+    assert_eq!(
+        commands
+            .lines()
+            .filter(|command| *command == "package resolve")
+            .count(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn failed_swift_uninstall_restores_manifest_and_lockfile() {
+    let mock = MockRegistry::start().await;
+    let project = swift_project();
+    project.write_file(
+        "Package.swift",
+        r#"// swift-tools-version: 5.9
+import PackageDescription
+let package = Package(
+    name: "SwiftApp",
+    dependencies: [.package(id: "lpmdev.acme_swift-logger", from: "1.0.0")],
+    targets: [.target(name: "FirstTarget", dependencies: [.product(name: "SwiftLogger", package: "lpmdev.acme_swift-logger")])]
+)
+"#,
+    );
+    let original_manifest = project.read_file("Package.swift");
+    let original_lockfile = r#"{"version":2,"pins":[{"identity":"original"}]}"#;
+    project.write_file("Package.resolved", original_lockfile);
+
+    let mut command = lpm_with_registry(&project, &mock.url());
+    configure_fake_swift(&mut command, &project, &["FirstTarget"], 31);
+    configure_fake_swift_lockfile_write(
+        &mut command,
+        r#"{"version":2,"pins":[{"identity":"rewritten"}]}"#,
+    );
+    let output = command
+        .args(["uninstall", SWIFT_PACKAGE])
+        .output()
+        .expect("run failing Swift uninstall");
+
+    assert!(!output.status.success());
+    assert_eq!(project.read_file("Package.swift"), original_manifest);
+    assert_eq!(project.read_file("Package.resolved"), original_lockfile);
+}
+
+#[tokio::test]
+async fn xcode_install_reexports_declared_modules_instead_of_the_product_name() {
+    const PACKAGE: &str = "@lpm.dev/acme.consumer-kit";
+
+    let mock = MockRegistry::start().await;
+    let cert = mount_swift_package(&mock).await;
+    mount_named_swift_package(&mock, PACKAGE, "1.0.0", "ConsumerKit", &["ActualModule"]).await;
+    let project = TempProject::empty(r#"{"name":"xcode-app","version":"1.0.0"}"#);
+    write_xcode_project(&project, "", "MyApp");
+    configure_existing_registry(&project, &mock.url(), &cert);
+
+    let mut command = lpm_with_registry(&project, &mock.url());
+    configure_fake_swift(&mut command, &project, &["unused"], 0);
+    let output = command
+        .args(["--json", "install", "--yes", PACKAGE])
+        .output()
+        .expect("run Xcode Swift install");
+
+    assert!(output.status.success(), "{}", combined_output(&output));
+    let exports =
+        project.read_file("Packages/LPMDependencies/Sources/LPMDependencies/Exports.swift");
+    assert!(
+        exports.contains("@_exported import ActualModule"),
+        "{exports}"
+    );
+    assert!(
+        !exports.contains("@_exported import ConsumerKit"),
+        "{exports}"
+    );
+}
+
+#[tokio::test]
+async fn failed_xcode_install_restores_project_and_removes_created_wrapper() {
+    let mock = MockRegistry::start().await;
+    let cert = mount_swift_package(&mock).await;
+    let project = TempProject::empty(r#"{"name":"xcode-app","version":"1.0.0"}"#);
+    write_xcode_project(&project, "", "MyApp");
+    configure_existing_registry(&project, &mock.url(), &cert);
+    let pbxproj = "MyApp.xcodeproj/project.pbxproj";
+    let original = project.read_file(pbxproj);
+
+    let mut command = lpm_with_registry(&project, &mock.url());
+    configure_fake_swift(&mut command, &project, &["unused"], 37);
+    let output = command
+        .args(["install", "--yes", SWIFT_PACKAGE])
+        .output()
+        .expect("run failing Xcode Swift install");
+
+    assert!(!output.status.success());
+    assert_eq!(project.read_file(pbxproj), original);
+    assert!(!project.file_exists("MyApp.xcodeproj/project.pbxproj.lpm-backup"));
+    assert!(!project.file_exists("Packages/LPMDependencies/Package.swift"));
+}
+
+#[tokio::test]
+async fn failed_xcode_uninstall_restores_wrapper_exports_and_lockfile() {
+    let mock = MockRegistry::start().await;
+    let cert = mount_swift_package(&mock).await;
+    let project = TempProject::empty(r#"{"name":"xcode-app","version":"1.0.0"}"#);
+    write_xcode_project(&project, "", "MyApp");
+    configure_existing_registry(&project, &mock.url(), &cert);
+
+    let mut install = lpm_with_registry(&project, &mock.url());
+    configure_fake_swift(&mut install, &project, &["unused"], 0);
+    let install_output = install
+        .args(["install", "--yes", SWIFT_PACKAGE])
+        .output()
+        .expect("install Xcode Swift package");
+    assert!(
+        install_output.status.success(),
+        "{}",
+        combined_output(&install_output)
+    );
+
+    let wrapper_manifest = "Packages/LPMDependencies/Package.swift";
+    let exports = "Packages/LPMDependencies/Sources/LPMDependencies/Exports.swift";
+    let original_manifest = project.read_file(wrapper_manifest);
+    let original_exports = project.read_file(exports);
+    let original_lockfile = r#"{"version":2,"pins":[{"identity":"original"}]}"#;
+    project.write_file(
+        "Packages/LPMDependencies/Package.resolved",
+        original_lockfile,
+    );
+
+    let mut uninstall = lpm_with_registry(&project, &mock.url());
+    configure_fake_swift(&mut uninstall, &project, &["unused"], 43);
+    configure_fake_swift_lockfile_write(
+        &mut uninstall,
+        r#"{"version":2,"pins":[{"identity":"rewritten"}]}"#,
+    );
+    let uninstall_output = uninstall
+        .args(["uninstall", SWIFT_PACKAGE])
+        .output()
+        .expect("run failing Xcode Swift uninstall");
+
+    assert!(!uninstall_output.status.success());
+    assert_eq!(project.read_file(wrapper_manifest), original_manifest);
+    assert_eq!(project.read_file(exports), original_exports);
+    assert_eq!(
+        project.read_file("Packages/LPMDependencies/Package.resolved"),
+        original_lockfile
+    );
+}
+
+#[tokio::test]
+async fn filtered_workspace_xcode_install_and_uninstall_round_trip_the_wrapper() {
+    let mock = MockRegistry::start().await;
+    let cert = mount_swift_package(&mock).await;
+    let project = swift_workspace();
+    std::fs::remove_file(project.path().join("packages/swift-member/Package.swift")).unwrap();
+    write_xcode_project(&project, "packages/swift-member", "SwiftMember");
+    configure_existing_registry(&project, &mock.url(), &cert);
+
+    let mut install = lpm_with_registry(&project, &mock.url());
+    configure_fake_swift(&mut install, &project, &["unused"], 0);
+    let install_output = install
+        .args([
+            "--json",
+            "install",
+            "--yes",
+            "--filter",
+            "swift-member",
+            SWIFT_PACKAGE,
+        ])
+        .output()
+        .expect("run filtered Xcode install");
+    assert!(
+        install_output.status.success(),
+        "{}",
+        combined_output(&install_output)
+    );
+    let wrapper_manifest = "packages/swift-member/Packages/LPMDependencies/Package.swift";
+    assert!(
+        project
+            .read_file(wrapper_manifest)
+            .contains("lpmdev.acme_swift-logger")
+    );
+    assert!(!project.file_exists("Packages/LPMDependencies/Package.swift"));
+
+    let mut uninstall = lpm_with_registry(&project, &mock.url());
+    configure_fake_swift(&mut uninstall, &project, &["unused"], 0);
+    let uninstall_output = uninstall
+        .args([
+            "--json",
+            "uninstall",
+            "--filter",
+            "swift-member",
+            SWIFT_PACKAGE,
+        ])
+        .output()
+        .expect("run filtered Xcode uninstall");
+    assert!(
+        uninstall_output.status.success(),
+        "{}",
+        combined_output(&uninstall_output)
+    );
+    assert!(
+        !project
+            .read_file(wrapper_manifest)
+            .contains("lpmdev.acme_swift-logger")
     );
 }
 
