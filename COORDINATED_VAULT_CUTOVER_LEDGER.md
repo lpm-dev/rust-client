@@ -4,6 +4,8 @@ Concept branch: `codex/coordinated-vault-rust-cutover`
 
 Implementation commit: `a66ff0e9`
 
+Concept pull request: [lpm-dev/rust-client#671](https://github.com/lpm-dev/rust-client/pull/671)
+
 Related merged pull requests:
 
 - App: [lpm-dev/lpm-vault#17](https://github.com/lpm-dev/lpm-vault/pull/17)
@@ -11,7 +13,7 @@ Related merged pull requests:
 
 | ID | Source | Category | Location | Claim | Evidence | Disposition | Coverage | Commit | PR status |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| COR-007B / SEC-SYNC-001B-RUST | correctness audit and security audit | Correctness and security | `crates/lpm-vault/src/sync/{envelope,http,personal,org}.rs` | The Rust client verified the response HMAC but did not bind a successful personal or organization response to one request, vault, scope, crypto version, or payload digest. It also did not send the protocol-v2 request nonce required for strict server interoperability. | Before the production change, focused regressions failed because the client emitted no nonce and accepted signed cross-vault, replayed-nonce, scope, canonical organization slug, envelope-version, server-version, non-positive-version, payload-digest, partial-payload, and crypto-downgrade substitutions. The shared implementation now generates 32 random bytes as 43-character unpadded base64url, preserves the 10 MiB body cap and HMAC verification, deserializes each success once, and validates every binding before decryption or success return. | Verified | Cross-language payload-digest fixture; nonce wire-format and header capture; personal and organization success envelopes; substitution, replay, downgrade, missing-binding, partial-payload, migration, HMAC, and bounded-response regressions | `a66ff0e9` | Pending concept PR |
+| COR-007B / SEC-SYNC-001B-RUST | correctness audit and security audit | Correctness and security | `crates/lpm-vault/src/sync/{envelope,http,personal,org}.rs` | The Rust client verified the response HMAC but did not bind a successful personal or organization response to one request, vault, scope, crypto version, or payload digest. It also did not send the protocol-v2 request nonce required for strict server interoperability. | Before the production change, focused regressions failed because the client emitted no nonce and accepted signed cross-vault, replayed-nonce, scope, canonical organization slug, envelope-version, server-version, non-positive-version, payload-digest, partial-payload, and crypto-downgrade substitutions. The shared implementation now generates 32 random bytes as 43-character unpadded base64url, preserves the 10 MiB body cap and HMAC verification, deserializes each success once, and validates every binding before decryption or success return. | Verified | Cross-language payload-digest fixture; nonce wire-format and header capture; personal and organization success envelopes; substitution, replay, downgrade, missing-binding, partial-payload, migration, HMAC, and bounded-response regressions | `a66ff0e9` | Included in [#671](https://github.com/lpm-dev/rust-client/pull/671) |
 
 ## Performance analysis
 
