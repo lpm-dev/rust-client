@@ -24,17 +24,6 @@ impl ManifestDependencySpec {
         Ok((Self::Plain, value.to_string()))
     }
 
-    pub(crate) fn lookup_name(
-        &self,
-        manifest_name: &str,
-        _lockfile: Option<&lpm_lockfile::Lockfile>,
-    ) -> String {
-        match self {
-            Self::NpmAlias { target } => target.clone(),
-            Self::Plain => manifest_name.to_string(),
-        }
-    }
-
     pub(crate) fn render_new_value(&self, new_range: &str) -> String {
         match self {
             Self::Plain => new_range.to_string(),
