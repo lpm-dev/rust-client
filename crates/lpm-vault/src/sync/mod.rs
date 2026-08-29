@@ -9,9 +9,15 @@
 //! snapshots the signature header, and verifies before any caller-side
 //! parsing or decryption. Error responses (non-2xx) are not signed and
 //! are returned unverified for the caller to format.
+//!
+//! Personal and organization sync requests also carry a fresh 32-byte
+//! request nonce. Successful protocol-v2 envelopes must bind that nonce,
+//! the vault identity, scope, crypto version, server version, and any
+//! encrypted payload before the response reaches decryption or a caller.
 
 mod audit;
 mod ci;
+mod envelope;
 mod http;
 mod org;
 mod pairing;
@@ -98,7 +104,127 @@ pub(crate) mod test_support {
     #[cfg(debug_assertions)]
     use crate::signature;
     #[cfg(debug_assertions)]
-    use wiremock::ResponseTemplate;
+    use sha2::{Digest, Sha256};
+    #[cfg(debug_assertions)]
+    use wiremock::{Request, Respond, ResponseTemplate};
+
+    #[cfg(debug_assertions)]
+    const TEST_REQUEST_NONCE_HEADER: &str = "x-lpm-vault-request-nonce";
+
+    #[cfg(debug_assertions)]
+    #[derive(Clone)]
+    pub(crate) enum TestSyncScope {
+        Personal,
+        Organization(String),
+    }
+
+    #[cfg(debug_assertions)]
+    #[derive(Clone)]
+    pub(crate) struct SignedSyncResponse {
+        body: serde_json::Value,
+        auth_token: String,
+        vault_id: String,
+        scope: TestSyncScope,
+        mutate: Option<fn(&mut serde_json::Value)>,
+    }
+
+    #[cfg(debug_assertions)]
+    impl Respond for SignedSyncResponse {
+        fn respond(&self, request: &Request) -> ResponseTemplate {
+            let nonce = request
+                .headers
+                .get(TEST_REQUEST_NONCE_HEADER)
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or_default();
+            let mut body = self.body.clone();
+            let object = body
+                .as_object_mut()
+                .expect("test sync response body must be a JSON object");
+            let version = object
+                .get("version")
+                .and_then(serde_json::Value::as_i64)
+                .expect("test sync response must include an integer version");
+            object.insert("vaultId".into(), self.vault_id.clone().into());
+            object.insert("envelopeVersion".into(), 2.into());
+            object.insert("serverVersion".into(), version.into());
+            object.insert("requestNonce".into(), nonce.into());
+            object
+                .entry("cryptoVersion")
+                .or_insert_with(|| serde_json::Value::from(2));
+            match &self.scope {
+                TestSyncScope::Personal => {
+                    object.insert("scope".into(), "personal".into());
+                }
+                TestSyncScope::Organization(slug) => {
+                    object.insert("scope".into(), "organization".into());
+                    object.insert("organizationSlug".into(), slug.clone().into());
+                }
+            }
+            if let (Some(encrypted_blob), Some(wrapped_key)) = (
+                object
+                    .get("encryptedBlob")
+                    .and_then(serde_json::Value::as_str),
+                object.get("wrappedKey").and_then(serde_json::Value::as_str),
+            ) {
+                let digest = test_sync_payload_digest(encrypted_blob, wrapped_key);
+                object.insert("payloadDigest".into(), digest.into());
+            }
+            if let Some(mutate) = self.mutate {
+                mutate(&mut body);
+            }
+
+            let body_string =
+                serde_json::to_string(&body).expect("test sync response should serialize");
+            let signature = signature::sign_body(body_string.as_bytes(), &self.auth_token);
+            ResponseTemplate::new(200)
+                .insert_header("Content-Type", "application/json")
+                .insert_header(signature::SIGNATURE_HEADER, signature.as_str())
+                .set_body_string(body_string)
+        }
+    }
+
+    #[cfg(debug_assertions)]
+    fn test_sync_payload_digest(encrypted_blob: &str, wrapped_key: &str) -> String {
+        let mut hash = Sha256::new();
+        hash.update(b"lpm-vault-payload\0");
+        for value in [encrypted_blob, wrapped_key] {
+            let bytes = value.as_bytes();
+            let length = u32::try_from(bytes.len()).expect("test payload field should fit in u32");
+            hash.update(length.to_be_bytes());
+            hash.update(bytes);
+        }
+        hex::encode(hash.finalize())
+    }
+
+    #[cfg(debug_assertions)]
+    pub(crate) fn signed_sync_ok_response(
+        body: serde_json::Value,
+        auth_token: &str,
+        vault_id: &str,
+        scope: TestSyncScope,
+    ) -> SignedSyncResponse {
+        SignedSyncResponse {
+            body,
+            auth_token: auth_token.to_owned(),
+            vault_id: vault_id.to_owned(),
+            scope,
+            mutate: None,
+        }
+    }
+
+    #[cfg(debug_assertions)]
+    pub(crate) fn signed_sync_ok_response_with(
+        body: serde_json::Value,
+        auth_token: &str,
+        vault_id: &str,
+        scope: TestSyncScope,
+        mutate: fn(&mut serde_json::Value),
+    ) -> SignedSyncResponse {
+        SignedSyncResponse {
+            mutate: Some(mutate),
+            ..signed_sync_ok_response(body, auth_token, vault_id, scope)
+        }
+    }
 
     /// Acquire the crate-wide env-mutation lock so this module's
     /// tests serialise with `crypto::tests` and the top-level

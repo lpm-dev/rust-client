@@ -1,9 +1,10 @@
 use std::collections::HashMap;
 
 use super::SyncError;
+use super::envelope::SyncScope;
 use super::http::{
-    read_capped_error_text, read_verified_response, sync_http_client_builder, sync_request_timeout,
-    url_path_segment,
+    SyncHttpResponse, read_capped_error_text, send_authenticated_sync_request,
+    sync_http_client_builder, sync_request_timeout, url_path_segment,
 };
 use crate::crypto;
 
@@ -217,33 +218,39 @@ pub async fn push_raw(
         }
     }
 
-    let response = client
-        .post(&url)
-        .bearer_auth(auth_token)
-        .json(&body)
-        .send()
-        .await
-        .map_err(super::http::network_error)?;
+    let response = send_authenticated_sync_request(
+        client.post(&url).bearer_auth(auth_token).json(&body),
+        auth_token,
+        vault_id,
+        SyncScope::Personal,
+    )
+    .await?;
+    let result = match response {
+        SyncHttpResponse::Success(result) => result,
+        SyncHttpResponse::Error { status, body } => {
+            if let Ok(result) = serde_json::from_slice::<PushResponse>(&body) {
+                return Err(SyncError::http(status, format_push_error(&result, status)));
+            }
 
-    let (status, body) = read_verified_response(response, auth_token).await?;
-    if !status.is_success() {
-        if let Ok(result) = serde_json::from_slice::<PushResponse>(&body) {
-            return Err(SyncError::http(status, format_push_error(&result, status)));
+            let message = std::str::from_utf8(&body).unwrap_or("").trim();
+            let message = if message.is_empty() {
+                format!("server error: {status}")
+            } else {
+                message.to_string()
+            };
+            return Err(SyncError::http(status, message));
         }
+    };
 
-        let message = std::str::from_utf8(&body).unwrap_or("").trim();
-        let message = if message.is_empty() {
-            format!("server error: {status}")
-        } else {
-            message.to_string()
-        };
-        return Err(SyncError::http(status, message));
-    }
-
-    let result: PushResponse =
-        serde_json::from_slice(&body).map_err(|e| format!("response parse error: {e}"))?;
-
-    Ok(result)
+    Ok(PushResponse {
+        version: result.version,
+        content_key_version: result.content_key_version,
+        status: result.status,
+        error: result.error,
+        code: result.code,
+        server_version: result.server_version,
+        hint: result.hint,
+    })
 }
 
 /// Pull a vault from the cloud (personal sync).
@@ -261,24 +268,23 @@ pub async fn pull(
         url_path_segment(vault_id)
     );
 
-    let response = client
-        .get(&url)
-        .bearer_auth(auth_token)
-        .send()
-        .await
-        .map_err(super::http::network_error)?;
-
-    let (status, body) = read_verified_response(response, auth_token).await?;
-    if !status.is_success() {
-        let message = serde_json::from_slice::<PullResponse>(&body)
-            .ok()
-            .and_then(|result| result.error)
-            .unwrap_or_else(|| format!("server error: {status}"));
-        return Err(SyncError::http(status, message));
-    }
-
-    let result: PullResponse =
-        serde_json::from_slice(&body).map_err(|e| format!("response parse error: {e}"))?;
+    let result = match send_authenticated_sync_request(
+        client.get(&url).bearer_auth(auth_token),
+        auth_token,
+        vault_id,
+        SyncScope::Personal,
+    )
+    .await?
+    {
+        SyncHttpResponse::Success(result) => result,
+        SyncHttpResponse::Error { status, body } => {
+            let message = serde_json::from_slice::<PullResponse>(&body)
+                .ok()
+                .and_then(|result| result.error)
+                .unwrap_or_else(|| format!("server error: {status}"));
+            return Err(SyncError::http(status, message));
+        }
+    };
 
     let encrypted_blob = result
         .encrypted_blob
@@ -360,24 +366,23 @@ async fn pull_raw_with_migration(
         url_path_segment(vault_id)
     );
 
-    let response = client
-        .get(&url)
-        .bearer_auth(auth_token)
-        .send()
-        .await
-        .map_err(super::http::network_error)?;
-
-    let (status, body) = read_verified_response(response, auth_token).await?;
-    if !status.is_success() {
-        let message = serde_json::from_slice::<PullResponse>(&body)
-            .ok()
-            .and_then(|result| result.error)
-            .unwrap_or_else(|| format!("server error: {status}"));
-        return Err(SyncError::http(status, message));
-    }
-
-    let result: PullResponse =
-        serde_json::from_slice(&body).map_err(|e| format!("response parse error: {e}"))?;
+    let result = match send_authenticated_sync_request(
+        client.get(&url).bearer_auth(auth_token),
+        auth_token,
+        vault_id,
+        SyncScope::Personal,
+    )
+    .await?
+    {
+        SyncHttpResponse::Success(result) => result,
+        SyncHttpResponse::Error { status, body } => {
+            let message = serde_json::from_slice::<PullResponse>(&body)
+                .ok()
+                .and_then(|result| result.error)
+                .unwrap_or_else(|| format!("server error: {status}"));
+            return Err(SyncError::http(status, message));
+        }
+    };
 
     let encrypted_blob = result
         .encrypted_blob
@@ -460,46 +465,35 @@ async fn attempt_legacy_reencrypt_push(
         "expectedVersion": version,
     });
 
-    let response = match client
-        .post(&url)
-        .bearer_auth(auth_token)
-        .json(&body)
-        .send()
-        .await
+    let response = match send_authenticated_sync_request(
+        client.post(&url).bearer_auth(auth_token).json(&body),
+        auth_token,
+        vault_id,
+        SyncScope::Personal,
+    )
+    .await
     {
         Ok(response) => response,
-        Err(e) => {
-            tracing::warn!(
-                "legacy vault migration: re-push response was ambiguous for vault {vault_id}: {}",
-                lpm_http::display_error(&e)
-            );
-            return recover_personal_version(&client, &url, auth_token, vault_id, version).await;
-        }
-    };
-
-    let status = response.status();
-    if !status.is_success() {
-        tracing::warn!(
-            "legacy vault migration: re-push returned {status} for vault {vault_id} \
-             (will retry on next successful pull)"
-        );
-        return version;
-    }
-
-    let body = match read_verified_response(response, auth_token).await {
-        Ok((_, body)) => body,
         Err(error) => {
             tracing::warn!(
-                "legacy vault migration: could not verify the success response for vault \
-                 {vault_id}: {error}"
+                "legacy vault migration: re-push response was ambiguous for vault {vault_id}: \
+                 {error}"
             );
             return recover_personal_version(&client, &url, auth_token, vault_id, version).await;
         }
     };
-    match serde_json::from_slice::<PushResponse>(&body)
-        .ok()
-        .and_then(|result| result.version)
-    {
+
+    let result = match response {
+        SyncHttpResponse::Success(result) => result,
+        SyncHttpResponse::Error { status, .. } => {
+            tracing::warn!(
+                "legacy vault migration: re-push returned {status} for vault {vault_id} \
+                 (will retry on next successful pull)"
+            );
+            return version;
+        }
+    };
+    match result.version {
         Some(committed_version) if committed_version > version => committed_version,
         _ => {
             tracing::warn!(
@@ -519,21 +513,23 @@ async fn recover_personal_version(
     fallback: i32,
 ) -> i32 {
     let recovered = async {
-        let response = client
-            .get(url)
-            .bearer_auth(auth_token)
-            .send()
-            .await
-            .map_err(super::http::network_error)?;
-        let (status, body) = read_verified_response(response, auth_token).await?;
-        if !status.is_success() {
-            return Err(SyncError::http(
-                status,
-                "version recovery returned a non-success response".to_owned(),
-            ));
-        }
-        serde_json::from_slice::<PullResponse>(&body)
-            .map_err(|error| SyncError::from(format!("response parse error: {error}")))?
+        let result = match send_authenticated_sync_request(
+            client.get(url).bearer_auth(auth_token),
+            auth_token,
+            vault_id,
+            SyncScope::Personal,
+        )
+        .await?
+        {
+            SyncHttpResponse::Success(result) => result,
+            SyncHttpResponse::Error { status, .. } => {
+                return Err(SyncError::http(
+                    status,
+                    "version recovery returned a non-success response".to_owned(),
+                ));
+            }
+        };
+        result
             .version
             .ok_or_else(|| SyncError::from("version recovery response omitted the version"))
     }
@@ -594,13 +590,77 @@ mod tests {
     #[cfg(debug_assertions)]
     use crate::sync::test_support::IsolatedVaultKeyEnv;
     #[cfg(debug_assertions)]
-    use crate::sync::test_support::{env_lock_guard, signed_ok_response};
+    use crate::sync::test_support::{
+        SignedSyncResponse, TestSyncScope, env_lock_guard, signed_ok_response,
+        signed_sync_ok_response, signed_sync_ok_response_with,
+    };
     #[cfg(debug_assertions)]
     use std::sync::{Arc, Mutex as StdMutex};
     use wiremock::matchers::{header, method, path, query_param, query_param_is_missing};
     use wiremock::{Mock, MockServer, ResponseTemplate};
     #[cfg(debug_assertions)]
     use wiremock::{Request, Respond};
+
+    #[cfg(debug_assertions)]
+    type EnvelopeMutator = fn(&mut serde_json::Value);
+
+    #[cfg(debug_assertions)]
+    fn substitute_vault_id(body: &mut serde_json::Value) {
+        body["vaultId"] = "vault-other".into();
+    }
+
+    #[cfg(debug_assertions)]
+    fn replay_request_nonce(body: &mut serde_json::Value) {
+        body["requestNonce"] = "A".repeat(43).into();
+    }
+
+    #[cfg(debug_assertions)]
+    fn substitute_scope(body: &mut serde_json::Value) {
+        body["scope"] = "organization".into();
+        body["organizationSlug"] = "acme".into();
+    }
+
+    #[cfg(debug_assertions)]
+    fn remove_envelope_version(body: &mut serde_json::Value) {
+        body.as_object_mut()
+            .expect("test envelope should be an object")
+            .remove("envelopeVersion");
+    }
+
+    #[cfg(debug_assertions)]
+    fn remove_server_version(body: &mut serde_json::Value) {
+        body.as_object_mut()
+            .expect("test envelope should be an object")
+            .remove("serverVersion");
+    }
+
+    #[cfg(debug_assertions)]
+    fn substitute_server_version(body: &mut serde_json::Value) {
+        body["serverVersion"] = 6.into();
+    }
+
+    #[cfg(debug_assertions)]
+    fn clear_version(body: &mut serde_json::Value) {
+        body["version"] = 0.into();
+        body["serverVersion"] = 0.into();
+    }
+
+    #[cfg(debug_assertions)]
+    fn substitute_payload_digest(body: &mut serde_json::Value) {
+        body["payloadDigest"] = "0".repeat(64).into();
+    }
+
+    #[cfg(debug_assertions)]
+    fn remove_payload_digest(body: &mut serde_json::Value) {
+        body.as_object_mut()
+            .expect("test envelope should be an object")
+            .remove("payloadDigest");
+    }
+
+    #[cfg(debug_assertions)]
+    fn downgrade_crypto_version(body: &mut serde_json::Value) {
+        body["cryptoVersion"] = 1.into();
+    }
 
     #[tokio::test]
     async fn list_remote_collects_all_cursor_pages() {
@@ -657,8 +717,13 @@ mod tests {
         let secrets_json = r#"{"DATABASE_URL":"postgres://legacy"}"#;
         let legacy_wrapping_key = crypto::derive_legacy_wrapping_key(auth_token);
         let aes_key = crypto::generate_aes_key();
-        let encrypted_blob =
-            crypto::encrypt(&aes_key, secrets_json.as_bytes()).expect("encrypt legacy blob");
+        let encrypted_blob = crypto::encrypt_vault_payload(
+            &aes_key,
+            secrets_json.as_bytes(),
+            crypto::VaultScope::Personal,
+            "vault-legacy",
+        )
+        .expect("encrypt protocol-v2 blob under the legacy wrapping key");
         let wrapped_key =
             crypto::wrap_key(&legacy_wrapping_key, &aes_key).expect("wrap aes under legacy key");
 
@@ -667,13 +732,16 @@ mod tests {
         Mock::given(method("GET"))
             .and(path("/api/vaults/vault-legacy/sync"))
             .and(header("authorization", &*format!("Bearer {auth_token}")))
-            .respond_with(signed_ok_response(
+            .respond_with(signed_sync_ok_response(
                 serde_json::json!({
                     "encryptedBlob": encrypted_blob,
                     "wrappedKey": wrapped_key,
-                    "version": 9
+                    "version": 9,
+                    "cryptoVersion": 2,
                 }),
                 auth_token,
+                "vault-legacy",
+                TestSyncScope::Personal,
             ))
             .expect(1)
             .mount(&server)
@@ -685,18 +753,12 @@ mod tests {
         #[derive(Clone)]
         struct CountingMigrationResponder {
             hits: Arc<StdMutex<u32>>,
-            auth_token: &'static str,
+            response: SignedSyncResponse,
         }
         impl Respond for CountingMigrationResponder {
-            fn respond(&self, _request: &Request) -> ResponseTemplate {
+            fn respond(&self, request: &Request) -> ResponseTemplate {
                 *self.hits.lock().unwrap() += 1;
-                let body = serde_json::json!({ "version": 10, "status": "ok" });
-                let body_str = serde_json::to_string(&body).expect("serialize");
-                let sig = signature::sign_body(body_str.as_bytes(), self.auth_token);
-                ResponseTemplate::new(200)
-                    .insert_header("Content-Type", "application/json")
-                    .insert_header(signature::SIGNATURE_HEADER, sig.as_str())
-                    .set_body_string(body_str)
+                self.response.respond(request)
             }
         }
 
@@ -704,7 +766,16 @@ mod tests {
             .and(path("/api/vaults/vault-legacy/sync"))
             .respond_with(CountingMigrationResponder {
                 hits: hits_for_responder,
-                auth_token,
+                response: signed_sync_ok_response(
+                    serde_json::json!({
+                        "version": 10,
+                        "cryptoVersion": 2,
+                        "status": "synced",
+                    }),
+                    auth_token,
+                    "vault-legacy",
+                    TestSyncScope::Personal,
+                ),
             })
             .expect(1)
             .mount(&server)
@@ -752,9 +823,14 @@ mod tests {
             .await;
         Mock::given(method("GET"))
             .and(path("/api/vaults/vault-ambiguous/sync"))
-            .respond_with(signed_ok_response(
-                serde_json::json!({ "version": 10 }),
+            .respond_with(signed_sync_ok_response(
+                serde_json::json!({
+                    "version": 10,
+                    "cryptoVersion": 2,
+                }),
                 auth_token,
+                "vault-ambiguous",
+                TestSyncScope::Personal,
             ))
             .expect(1)
             .mount(&server)
@@ -786,8 +862,13 @@ mod tests {
         let secrets_json = r#"{"API_KEY":"legacy-value"}"#;
         let legacy_wrapping_key = crypto::derive_legacy_wrapping_key(auth_token);
         let aes_key = crypto::generate_aes_key();
-        let encrypted_blob =
-            crypto::encrypt(&aes_key, secrets_json.as_bytes()).expect("encrypt legacy blob");
+        let encrypted_blob = crypto::encrypt_vault_payload(
+            &aes_key,
+            secrets_json.as_bytes(),
+            crypto::VaultScope::Personal,
+            "vault-legacy-fail",
+        )
+        .expect("encrypt protocol-v2 blob under the legacy wrapping key");
         let wrapped_key =
             crypto::wrap_key(&legacy_wrapping_key, &aes_key).expect("wrap aes under legacy key");
 
@@ -796,13 +877,16 @@ mod tests {
         Mock::given(method("GET"))
             .and(path("/api/vaults/vault-legacy-fail/sync"))
             .and(header("authorization", &*format!("Bearer {auth_token}")))
-            .respond_with(signed_ok_response(
+            .respond_with(signed_sync_ok_response(
                 serde_json::json!({
                     "encryptedBlob": encrypted_blob,
                     "wrappedKey": wrapped_key,
-                    "version": 1
+                    "version": 1,
+                    "cryptoVersion": 2,
                 }),
                 auth_token,
+                "vault-legacy-fail",
+                TestSyncScope::Personal,
             ))
             .expect(1)
             .mount(&server)
@@ -1061,7 +1145,7 @@ mod tests {
         Mock::given(method("GET"))
             .and(path("/api/vaults/vault-123/sync"))
             .and(header("authorization", "Bearer auth-token"))
-            .respond_with(signed_ok_response(
+            .respond_with(signed_sync_ok_response(
                 serde_json::json!({
                     "encryptedBlob": encrypted_blob,
                     "wrappedKey": wrapped_key,
@@ -1069,6 +1153,8 @@ mod tests {
                     "cryptoVersion": crypto::CURRENT_CRYPTO_VERSION
                 }),
                 "auth-token",
+                "vault-123",
+                TestSyncScope::Personal,
             ))
             .expect(1)
             .mount(&server)
@@ -1298,5 +1384,141 @@ mod tests {
                 .contains("Hint: Run `lpm env pull` then retry the push."),
             "hint must be appended so the user gets the remediation in one shot: {err}"
         );
+    }
+
+    #[cfg(debug_assertions)]
+    #[tokio::test]
+    async fn pull_raw_sends_a_32_byte_unpadded_base64url_request_nonce() {
+        let _guard = env_lock_guard();
+        let _isolated = IsolatedVaultKeyEnv::new();
+        let server = MockServer::start().await;
+        let (encrypted_blob, wrapped_key) =
+            crypto::encrypt_vault_for_sync(r#"{"API_KEY":"secret"}"#, "vault-envelope")
+                .expect("encrypt authenticated sync fixture");
+
+        Mock::given(method("GET"))
+            .and(path("/api/vaults/vault-envelope/sync"))
+            .respond_with(signed_sync_ok_response(
+                serde_json::json!({
+                    "encryptedBlob": encrypted_blob,
+                    "wrappedKey": wrapped_key,
+                    "version": 7,
+                    "cryptoVersion": 2,
+                }),
+                "auth-token",
+                "vault-envelope",
+                TestSyncScope::Personal,
+            ))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        pull_raw_for_rotation(&server.uri(), "auth-token", "vault-envelope")
+            .await
+            .expect("valid authenticated envelope should decrypt");
+
+        let requests = server
+            .received_requests()
+            .await
+            .expect("record authenticated sync request");
+        let nonce = requests[0]
+            .headers
+            .get("x-lpm-vault-request-nonce")
+            .and_then(|value| value.to_str().ok())
+            .expect("authenticated sync request should include a nonce");
+        assert!(
+            nonce.len() == 43
+                && nonce
+                    .bytes()
+                    .all(|byte| { byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_') }),
+            "nonce must encode 32 random bytes as unpadded base64url: {nonce}"
+        );
+    }
+
+    #[cfg(debug_assertions)]
+    #[tokio::test]
+    async fn pull_raw_rejects_signed_envelopes_with_invalid_request_bindings() {
+        let _guard = env_lock_guard();
+        let _isolated = IsolatedVaultKeyEnv::new();
+        let (encrypted_blob, wrapped_key) =
+            crypto::encrypt_vault_for_sync(r#"{"API_KEY":"secret"}"#, "vault-envelope")
+                .expect("encrypt authenticated sync fixture");
+        let invalid_envelopes: [(&str, EnvelopeMutator); 9] = [
+            ("cross-vault substitution", substitute_vault_id),
+            ("replayed request nonce", replay_request_nonce),
+            ("scope substitution", substitute_scope),
+            ("missing envelope version", remove_envelope_version),
+            ("missing server version", remove_server_version),
+            ("server version substitution", substitute_server_version),
+            ("non-positive version", clear_version),
+            ("payload digest substitution", substitute_payload_digest),
+            ("partial payload tuple", remove_payload_digest),
+        ];
+
+        for (name, mutate) in invalid_envelopes {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/api/vaults/vault-envelope/sync"))
+                .respond_with(signed_sync_ok_response_with(
+                    serde_json::json!({
+                        "encryptedBlob": encrypted_blob.clone(),
+                        "wrappedKey": wrapped_key.clone(),
+                        "version": 7,
+                        "cryptoVersion": 2,
+                    }),
+                    "auth-token",
+                    "vault-envelope",
+                    TestSyncScope::Personal,
+                    mutate,
+                ))
+                .expect(1)
+                .mount(&server)
+                .await;
+
+            let result = pull_raw_for_rotation(&server.uri(), "auth-token", "vault-envelope").await;
+
+            assert!(
+                result.is_err(),
+                "client accepted invalid authenticated sync envelope: {name}"
+            );
+        }
+    }
+
+    #[cfg(debug_assertions)]
+    #[tokio::test]
+    async fn push_raw_rejects_a_signed_crypto_version_downgrade() {
+        let _guard = env_lock_guard();
+        let _isolated = IsolatedVaultKeyEnv::new();
+        let server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/api/vaults/vault-envelope/sync"))
+            .respond_with(signed_sync_ok_response_with(
+                serde_json::json!({
+                    "version": 8,
+                    "cryptoVersion": 2,
+                    "status": "synced",
+                }),
+                "auth-token",
+                "vault-envelope",
+                TestSyncScope::Personal,
+                downgrade_crypto_version,
+            ))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let result = push_raw(
+            &server.uri(),
+            "auth-token",
+            "vault-envelope",
+            r#"{"API_KEY":"secret"}"#,
+            Some(7),
+            false,
+            None,
+        )
+        .await;
+
+        assert!(result.is_err(), "client accepted a signed crypto downgrade");
     }
 }
