@@ -739,6 +739,85 @@ jobs:
           path: ${{ matrix.binary }}
           retention-days: 1
 
+      - name: Build scheduled acceptance binary
+        if: github.event_name == 'schedule' && matrix.target == 'x86_64-unknown-linux-gnu'
+        run: |
+          set -euo pipefail
+          docker run --rm \
+            --user "$(id -u):$(id -g)" \
+            --mount "type=bind,source=$PWD,target=/work" \
+            --mount "type=bind,source=$HOME/.cargo,target=/cargo" \
+            --mount "type=bind,source=$HOME/.rustup,target=/rustup,readonly" \
+            --workdir /work \
+            --env CARGO_HOME=/cargo \
+            --env CARGO_INCREMENTAL \
+            --env HOME=/tmp/lpm-home \
+            --env LPM_BUILD_VERSION \
+            --env RUSTUP_HOME=/rustup \
+            --env RUST_TOOLCHAIN \
+            "${{ matrix.build_image }}" \
+            bash -ceu '
+              export PATH="/cargo/bin:$PATH"
+              cargo "+${RUST_TOOLCHAIN}" build \
+                --locked \
+                --release \
+                --target "${{ matrix.target }}" \
+                -p lpm-cli \
+                --features portable-linux,acceptance-test-hooks
+            '
+
+          bundle="$RUNNER_TEMP/lpm-linux-x64-acceptance"
+          mkdir "$bundle"
+          install -m 0755 \
+            "target/${{ matrix.target }}/release/lpm-rs" \
+            "$bundle/lpm-rs"
+          binary_sha256=$(sha256sum "$bundle/lpm-rs" | awk '{print $1}')
+          jq -n \
+            --arg artifactName "lpm-linux-x64-acceptance" \
+            --arg event "$GITHUB_EVENT_NAME" \
+            --arg ref "$GITHUB_REF" \
+            --arg repository "$GITHUB_REPOSITORY" \
+            --arg sha "$GITHUB_SHA" \
+            --arg target "${{ matrix.target }}" \
+            --arg version "$LPM_BUILD_VERSION" \
+            --arg binarySha256 "$binary_sha256" \
+            --argjson runId "$GITHUB_RUN_ID" \
+            --argjson runAttempt "$GITHUB_RUN_ATTEMPT" \
+            '{
+              schemaVersion: 1,
+              repository: $repository,
+              workflow: ".github/workflows/release.yml",
+              event: $event,
+              ref: $ref,
+              sha: $sha,
+              runId: $runId,
+              runAttempt: $runAttempt,
+              artifactName: $artifactName,
+              version: $version,
+              binary: {
+                path: "lpm-rs",
+                target: $target,
+                features: ["acceptance-test-hooks", "portable-linux"],
+                sha256: $binarySha256
+              }
+            }' > "$bundle/manifest.json"
+          (
+            cd "$bundle"
+            sha256sum lpm-rs manifest.json > SHA256SUMS.txt
+          )
+          actual=$("$bundle/lpm-rs" --version)
+          test "$actual" = "lpm $LPM_BUILD_VERSION"
+
+      - name: Upload scheduled acceptance artifact
+        if: github.event_name == 'schedule' && matrix.target == 'x86_64-unknown-linux-gnu'
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: lpm-linux-x64-acceptance
+          path: ${{ runner.temp }}/lpm-linux-x64-acceptance/
+          if-no-files-found: error
+          retention-days: 30
+          compression-level: 0
+
       - name: Upload immutable signed macOS notarization inputs
         if: runner.os == 'macOS'
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
