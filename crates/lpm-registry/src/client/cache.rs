@@ -8,10 +8,9 @@ pub(super) const METADATA_CACHE_TTL: std::time::Duration = std::time::Duration::
 /// documented above the magic constant); but a same-user process that
 /// can plant a multi-GB file there would force every fresh-path read
 /// to allocate it before serde even noticed the bytes were nonsense.
-/// 100 MB matches the on-the-wire `MAX_METADATA_BYTES` cap so a
-/// legitimate worst-case packument always round-trips through the
-/// cache, while pathological files collapse to a cache miss before
-/// any decode work happens.
+/// This ceiling remains wider than the on-the-wire metadata cap so existing
+/// cache entries continue to decode after a transport-limit reduction, while
+/// pathological files collapse to a cache miss before any decode work happens.
 pub(super) const METADATA_CACHE_FILE_CAP: u64 = 100 * 1024 * 1024;
 const METADATA_CACHE_ETAG_LINE_CAP: u64 = 8 * 1024;
 pub(super) const MAX_PENDING_METADATA_CACHE_BYTES: usize = 128 * 1024 * 1024;

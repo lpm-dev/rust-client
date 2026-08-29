@@ -106,6 +106,12 @@ impl<'a> LockfileRootIndex<'a> {
             });
         }
 
+        if lockfile.metadata.lockfile_version
+            >= lpm_lockfile::LOCKFILE_VERSION_WITH_ROOT_RESOLUTIONS
+        {
+            return None;
+        }
+
         self.by_name
             .get(lookup_name)
             .and_then(|selected| match selected {
@@ -423,6 +429,88 @@ mod tests {
         assert!(
             LockfileRootIndex::new(Some(&lockfile))
                 .root_package("tool", "@company/private-tool")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn modern_lockfile_without_an_exact_root_does_not_select_a_unique_transitive() {
+        let mut lockfile = lpm_lockfile::Lockfile::new();
+        lockfile.add_package(lpm_lockfile::LockedPackage {
+            name: "shared-name".into(),
+            version: "1.0.0".into(),
+            source: Some("registry+https://registry.npmjs.org".into()),
+            ..Default::default()
+        });
+
+        assert!(
+            LockfileRootIndex::new(Some(&lockfile))
+                .root_package("shared-name", "shared-name")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn legacy_lockfile_selects_a_unique_package_when_root_resolutions_are_unavailable() {
+        let mut lockfile = lockfile_with_source(
+            "registry+https://registry.npmjs.org",
+            Some("https://registry.npmjs.org/ms/-/ms-2.1.3.tgz"),
+        );
+        lockfile.metadata.lockfile_version =
+            lpm_lockfile::LOCKFILE_VERSION_WITH_ROOT_RESOLUTIONS - 1;
+
+        assert_eq!(
+            LockfileRootIndex::new(Some(&lockfile))
+                .root_package("ms", "ms")
+                .map(|package| package.version.as_str()),
+            Some("2.1.3")
+        );
+    }
+
+    #[test]
+    fn legacy_lockfile_with_ambiguous_packages_fails_closed() {
+        let mut lockfile = lockfile_with_source(
+            "registry+https://registry.npmjs.org",
+            Some("https://registry.npmjs.org/ms/-/ms-2.1.3.tgz"),
+        );
+        lockfile.metadata.lockfile_version =
+            lpm_lockfile::LOCKFILE_VERSION_WITH_ROOT_RESOLUTIONS - 1;
+        lockfile.add_package(lpm_lockfile::LockedPackage {
+            name: "ms".into(),
+            version: "3.0.0".into(),
+            source: Some("registry+https://registry.npmjs.org".into()),
+            ..Default::default()
+        });
+
+        assert!(
+            LockfileRootIndex::new(Some(&lockfile))
+                .root_package("ms", "ms")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn stale_root_canonical_target_does_not_authorize_a_different_lookup_name() {
+        let mut lockfile = lpm_lockfile::Lockfile::new();
+        lockfile.add_package(lpm_lockfile::LockedPackage {
+            name: "old-target".into(),
+            version: "1.0.0".into(),
+            source: Some("registry+https://registry.npmjs.org".into()),
+            ..Default::default()
+        });
+        lockfile.root_resolutions.insert(
+            "alias".into(),
+            lpm_lockfile::LockedRootResolution {
+                instance_id: None,
+                package: "old-target".into(),
+                version: "1.0.0".into(),
+                source: Some("registry+https://registry.npmjs.org".into()),
+            },
+        );
+
+        assert!(
+            LockfileRootIndex::new(Some(&lockfile))
+                .root_package("alias", "new-target")
                 .is_none()
         );
     }
