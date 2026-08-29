@@ -85,6 +85,10 @@ pub(crate) struct PublishArgs {
     #[arg(long, short = 'y')]
     pub(crate) yes: bool,
 
+    /// Do not run package publish lifecycle scripts.
+    #[arg(long = "ignore-scripts")]
+    pub(crate) ignore_scripts: bool,
+
     /// Generate and require Sigstore provenance (CI with OIDC only). Fails if provenance cannot be produced.
     #[arg(long, conflicts_with_all = ["no_provenance", "provenance_file"])]
     pub(crate) provenance: bool,
@@ -102,7 +106,7 @@ pub(crate) struct PublishArgs {
     pub(crate) provenance_file: Option<std::path::PathBuf>,
 
     /// Minimum quality score required to publish (0-100).
-    #[arg(long)]
+    #[arg(long, value_parser = clap::value_parser!(u32).range(..=100))]
     pub(crate) min_score: Option<u32>,
 
     /// Skip pre-publish secret scanning (not recommended).
@@ -278,7 +282,7 @@ pub(crate) enum StageCommands {
         provenance_file: Option<std::path::PathBuf>,
 
         /// Minimum quality score required to stage (0-100).
-        #[arg(long)]
+        #[arg(long, value_parser = clap::value_parser!(u32).range(..=100))]
         min_score: Option<u32>,
 
         /// Skip pre-publish secret scanning.
@@ -288,6 +292,10 @@ pub(crate) enum StageCommands {
         /// Skip confirmation prompt.
         #[arg(long, short = 'y')]
         yes: bool,
+
+        /// Do not run package pack lifecycle scripts.
+        #[arg(long = "ignore-scripts")]
+        ignore_scripts: bool,
 
         /// Override the npm registry URL.
         #[arg(long = "npm-registry", value_name = "URL")]

@@ -611,35 +611,41 @@ fn validate_npm_version_document_identity(
     Ok(())
 }
 
+#[derive(Debug, serde::Deserialize)]
+pub(crate) struct NpmVersionPolicyMetadata {
+    name: Option<String>,
+    versions: Option<std::collections::HashMap<String, NpmVersionPolicyVersion>>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct NpmVersionPolicyVersion {
+    name: Option<String>,
+    version: Option<String>,
+    deprecated: Option<serde_json::Value>,
+}
+
 pub(crate) fn enforce_npm_version_policy(
-    metadata: &serde_json::Value,
+    metadata: &NpmVersionPolicyMetadata,
     npm_name: &str,
     version: &str,
     tag_explicit: bool,
 ) -> Result<(), LpmError> {
     let actual_name = metadata
-        .get("name")
-        .and_then(serde_json::Value::as_str)
+        .name
+        .as_deref()
         .ok_or_else(|| LpmError::Registry("npm metadata is missing package identity".into()))?;
     if actual_name != npm_name {
         return Err(unexpected_npm_metadata_identity(npm_name, actual_name));
     }
-    let versions = metadata
-        .get("versions")
-        .and_then(serde_json::Value::as_object)
-        .ok_or_else(|| {
-            LpmError::Registry(format!(
-                "npm metadata for {npm_name} is missing published versions"
-            ))
-        })?;
+    let versions = metadata.versions.as_ref().ok_or_else(|| {
+        LpmError::Registry(format!(
+            "npm metadata for {npm_name} is missing published versions"
+        ))
+    })?;
 
     if let Some(version_metadata) = versions.get(version) {
-        let actual_version_name = version_metadata
-            .get("name")
-            .and_then(serde_json::Value::as_str);
-        let actual_version = version_metadata
-            .get("version")
-            .and_then(serde_json::Value::as_str);
+        let actual_version_name = version_metadata.name.as_deref();
+        let actual_version = version_metadata.version.as_deref();
         if actual_version_name != Some(npm_name) || actual_version != Some(version) {
             return Err(LpmError::Registry(format!(
                 "npm metadata returned an unexpected version identity for {npm_name}@{version}"
@@ -665,7 +671,8 @@ pub(crate) fn enforce_npm_version_policy(
             .iter()
             .filter(|(_, data)| {
                 !data
-                    .get("deprecated")
+                    .deprecated
+                    .as_ref()
                     .is_some_and(serde_json::Value::is_string)
             })
             .filter_map(|(published_version, _)| lpm_semver::Version::parse(published_version).ok())
@@ -769,7 +776,6 @@ pub(crate) async fn publish_to_npm_with_clients(
 
 pub(crate) struct NpmPublishClients {
     request: reqwest::Client,
-    web_auth: reqwest::Client,
 }
 
 pub(crate) fn build_npm_publish_clients() -> Result<NpmPublishClients, LpmError> {
@@ -866,9 +872,9 @@ async fn publish_to_npm_impl(
         &owned_clients
     };
     let client = &clients.request;
-    let web_auth_client = &clients.web_auth;
 
     let encoded_name = urlencoding::encode(npm_name);
+    let registry_url = registry_url.trim_end_matches('/');
     let url = format!("{registry_url}/{encoded_name}");
 
     // Pre-emptive OTP prompt if configured
@@ -896,7 +902,7 @@ async fn publish_to_npm_impl(
     // OTP required? (A4)
     if status == reqwest::StatusCode::UNAUTHORIZED {
         let body = response_json_or_empty(response).await?;
-        if let Some(challenge) = web_auth::parse_web_auth_challenge_from_body(&body) {
+        if let Some(challenge) = web_auth::parse_web_auth_challenge_from_body(&body, registry_url) {
             if !can_handle_interactive_challenge(json_output, yes, runtime) {
                 return Err(LpmError::Registry(
                     "npm requires browser authentication to finish publishing, but this command is running in non-interactive mode. Re-run in a TTY or use an automation token.".into(),
@@ -904,7 +910,6 @@ async fn publish_to_npm_impl(
             }
 
             let otp = web_auth::complete_web_auth_challenge(
-                web_auth_client,
                 &challenge,
                 "publish",
                 json_output,
@@ -921,7 +926,7 @@ async fn publish_to_npm_impl(
                 .await
                 .map_err(|e| LpmError::Registry(format!("npm publish retry failed: {e}")))?;
 
-            return handle_npm_response(retry_response, npm_name, version, start).await;
+            return handle_npm_response(retry_response, token, npm_name, version, start).await;
         }
 
         if is_otp_required(status, &headers) {
@@ -947,15 +952,15 @@ async fn publish_to_npm_impl(
                 .await
                 .map_err(|e| LpmError::Registry(format!("npm publish retry failed: {e}")))?;
 
-            return handle_npm_response(retry_response, npm_name, version, start).await;
+            return handle_npm_response(retry_response, token, npm_name, version, start).await;
         }
 
         return Ok(handle_npm_response_body(
-            status, body, npm_name, version, start,
+            status, body, token, npm_name, version, start,
         ));
     }
 
-    handle_npm_response(response, npm_name, version, start).await
+    handle_npm_response(response, token, npm_name, version, start).await
 }
 
 fn build_npm_publish_clients_with_timeout(
@@ -977,12 +982,7 @@ fn build_npm_publish_clients_with_timeout(
         .user_agent(format!("lpm-rs/{}", crate::build_version::version()))
         .build()
         .map_err(|e| LpmError::Registry(format!("failed to create HTTP client: {e}")))?;
-    let web_auth = lpm_http::client_builder()
-        .timeout(timeout)
-        .user_agent(format!("lpm-rs/{}", crate::build_version::version()))
-        .build()
-        .map_err(|e| LpmError::Registry(format!("failed to create HTTP client: {e}")))?;
-    Ok(NpmPublishClients { request, web_auth })
+    Ok(NpmPublishClients { request })
 }
 
 fn npm_publish_request(
@@ -1014,6 +1014,7 @@ async fn execute_npm_publish_request(
 /// Handle npm publish response, mapping HTTP status codes to clear errors.
 async fn handle_npm_response(
     response: reqwest::Response,
+    token: &str,
     npm_name: &str,
     version: &str,
     start: std::time::Instant,
@@ -1022,13 +1023,14 @@ async fn handle_npm_response(
     let body = response_json_or_empty(response).await?;
 
     Ok(handle_npm_response_body(
-        status, body, npm_name, version, start,
+        status, body, token, npm_name, version, start,
     ))
 }
 
 fn handle_npm_response_body(
     status: reqwest::StatusCode,
     body: serde_json::Value,
+    token: &str,
     npm_name: &str,
     version: &str,
     start: std::time::Instant,
@@ -1036,6 +1038,7 @@ fn handle_npm_response_body(
     let duration = start.elapsed();
 
     let error_msg = body.get("error").and_then(|e| e.as_str()).unwrap_or("");
+    let error_msg = lpm_common::redact_exact_secret(error_msg, token);
 
     if status.is_success() {
         return NpmPublishResult {
@@ -1439,6 +1442,51 @@ mod tests {
                 .and_then(|value| value.to_str().ok()),
             Some(web_auth::NPM_COMMAND_PUBLISH)
         );
+    }
+
+    #[tokio::test]
+    async fn publish_to_npm_redacts_a_registry_reflection_of_its_bearer() {
+        let token = "npm-publish-reflection-secret";
+        let server = MockServer::start().await;
+        Mock::given(method("PUT"))
+            .and(path("/plain-pkg"))
+            .respond_with(ResponseTemplate::new(400).set_body_json(serde_json::json!({
+                "error": format!("submitted bearer was {token}"),
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let tarball = Arc::new(b"fake-tarball".to_vec());
+        let hashes = crate::commands::publish_common::compute_hashes(&tarball);
+
+        let result = publish_to_npm_impl(
+            token,
+            "plain-pkg",
+            "1.0.0",
+            &serde_json::json!({ "name": "plain-pkg", "version": "1.0.0" }),
+            &tarball,
+            &hashes,
+            None,
+            "public",
+            "latest",
+            &server.uri(),
+            false,
+            false,
+            false,
+            NpmPublishRuntime::test(),
+            None,
+        )
+        .await
+        .expect("registry rejection is represented in the publish result");
+        let error = result
+            .error
+            .expect("registry rejection must include an error");
+
+        assert!(
+            !error.contains(token),
+            "reflected bearer leaked through the error: {error}"
+        );
+        assert!(error.contains("<redacted>"));
     }
 
     #[tokio::test]

@@ -1,5 +1,6 @@
 mod support;
 
+use base64::Engine as _;
 use support::assertions::parse_json_output;
 use support::{
     LOCK_CONTENTION_MARKER_ENV, TempProject, lpm, lpm_spawnable, lpm_with_registry,
@@ -400,6 +401,38 @@ async fn mount_lpm_metadata_versions(server: &MockServer, name: &str, versions: 
         .expect(1)
         .mount(server)
         .await;
+}
+
+fn extract_release_upload_tarball(request: &wiremock::Request) -> Vec<u8> {
+    let payload: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+    let attachment = payload["_attachments"]
+        .as_object()
+        .and_then(|attachments| attachments.values().next())
+        .expect("release publish payload must contain a tarball attachment");
+    base64::engine::general_purpose::STANDARD
+        .decode(
+            attachment["data"]
+                .as_str()
+                .expect("release tarball attachment must be base64 text"),
+        )
+        .expect("release tarball attachment must decode")
+}
+
+fn release_uploaded_file_paths(tarball_data: &[u8]) -> Vec<String> {
+    let decoder = flate2::read::GzDecoder::new(tarball_data);
+    let mut archive = tar::Archive::new(decoder);
+    archive
+        .entries()
+        .expect("release tarball must list entries")
+        .map(|entry| {
+            entry
+                .expect("release tarball entry must read")
+                .path()
+                .expect("release tarball entry path must read")
+                .to_string_lossy()
+                .into_owned()
+        })
+        .collect()
 }
 
 #[test]
@@ -3258,6 +3291,65 @@ async fn release_publish_refuses_catalog_drift_between_member_uploads() {
 }
 
 #[tokio::test]
+async fn release_publish_reuses_one_lpm_whoami_for_shared_auth_members() {
+    let project = TempProject::empty(
+        r#"{"name":"root","private":true,"version":"0.0.0","workspaces":["packages/*"]}"#,
+    );
+    for package in ["@lpm.dev/acme.alpha", "@lpm.dev/acme.beta"] {
+        let member = package.rsplit('.').next().expect("member name");
+        project.write_file(
+            &format!("packages/{member}/package.json"),
+            &format!(r#"{{"name":"{package}","version":"1.0.0"}}"#),
+        );
+    }
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/registry/-/package/publish-preflight"))
+        .respond_with(AvailableLpmPublishPreflight)
+        .expect(2)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/registry/-/whoami"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "username": "test@example.com",
+            "profile_username": "acme",
+            "email": "test@example.com",
+            "plan_tier": "pro",
+            "mfa_enabled": false,
+            "has_pool_access": true,
+            "usage": { "storage_bytes": 0, "private_packages": 0 },
+            "limits": { "storageBytes": 1_000_000, "privatePackages": 100 },
+            "organizations": []
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("PUT"))
+        .and(path_regex("/api/registry/.*"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "success": true,
+            "message": "Package published"
+        })))
+        .expect(2)
+        .mount(&server)
+        .await;
+
+    let output = lpm_with_registry(&project, &server.uri())
+        .args(["release", "publish", "--all", "--lpm", "--yes", "--json"])
+        .output()
+        .expect("publish two release members with shared registry authentication");
+
+    assert!(
+        output.status.success(),
+        "release publish failed\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    server.verify().await;
+}
+
+#[tokio::test]
 async fn release_publish_reports_completed_and_unattempted_packages_after_failure() {
     let project = TempProject::empty(
         r#"{"name":"root","private":true,"version":"0.0.0","workspaces":["packages/*"]}"#,
@@ -3349,4 +3441,361 @@ async fn release_publish_reports_completed_and_unattempted_packages_after_failur
       "warning": "Publishing is not transactional. Successful uploads were not rolled back; retry only failed and not-attempted packages."
     }
     "###);
+}
+
+#[tokio::test]
+async fn release_publish_uses_each_members_publish_config_directory() {
+    let project = TempProject::empty(
+        r#"{"name":"root","private":true,"version":"0.0.0","workspaces":["packages/*"]}"#,
+    );
+    project.write_file(
+        "packages/projected/package.json",
+        r#"{
+          "name":"@lpm.dev/acme.projected",
+          "version":"1.0.0",
+          "publishConfig":{"directory":"dist"},
+          "files":["root-only.js"]
+        }"#,
+    );
+    project.write_file(
+        "packages/projected/root-only.js",
+        "module.exports = 'root';\n",
+    );
+    project.write_file(
+        "packages/projected/dist/package.json",
+        r#"{
+          "name":"@lpm.dev/acme.projected",
+          "version":"1.0.0",
+          "description":"release projection",
+          "files":["projected.js"]
+        }"#,
+    );
+    project.write_file(
+        "packages/projected/dist/projected.js",
+        "module.exports = 'projected';\n",
+    );
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/registry/-/package/publish-preflight"))
+        .respond_with(AvailableLpmPublishPreflight)
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/registry/-/whoami"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "username": "test@example.com",
+            "profile_username": "acme",
+            "email": "test@example.com",
+            "plan_tier": "pro",
+            "mfa_enabled": false,
+            "has_pool_access": true,
+            "usage": { "storage_bytes": 0, "private_packages": 0 },
+            "limits": { "storageBytes": 1_000_000, "privatePackages": 100 },
+            "organizations": []
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("PUT"))
+        .and(path_regex("/api/registry/.*"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "success": true,
+            "message": "Package published"
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let output = lpm_with_registry(&project, &server.uri())
+        .args(["release", "publish", "--all", "--lpm", "--yes", "--json"])
+        .output()
+        .expect("publish a projected release member");
+
+    assert!(
+        output.status.success(),
+        "release publish failed\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let requests = server.received_requests().await.unwrap();
+    let upload = requests
+        .iter()
+        .find(|request| request.method.as_str() == "PUT")
+        .expect("release publish must upload the member");
+    let paths = release_uploaded_file_paths(&extract_release_upload_tarball(upload));
+    assert!(paths.iter().any(|path| path == "package/projected.js"));
+    assert!(
+        !paths.iter().any(|path| path == "package/root-only.js"),
+        "release publish leaked the source package into the projected artifact: {paths:?}"
+    );
+}
+
+#[tokio::test]
+async fn release_publish_runs_each_lifecycle_phase_once_in_npm_order() {
+    let project = TempProject::empty(
+        r#"{"name":"root","private":true,"version":"0.0.0","workspaces":["packages/*"]}"#,
+    );
+    project.write_file(
+        "packages/member/package.json",
+        r#"{
+          "name":"@lpm.dev/acme.lifecycle",
+          "version":"1.0.0",
+          "scripts":{
+            "prepublishOnly":"node record-lifecycle.js prepublishOnly",
+            "prepack":"node record-lifecycle.js prepack",
+            "prepare":"node record-lifecycle.js prepare",
+            "postpack":"node record-lifecycle.js postpack",
+            "publish":"node record-lifecycle.js publish",
+            "postpublish":"node record-lifecycle.js postpublish"
+          }
+        }"#,
+    );
+    project.write_file(
+        "packages/member/record-lifecycle.js",
+        "require('fs').appendFileSync('lifecycle.log', process.argv[2] + '\\n')\n",
+    );
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/registry/-/package/publish-preflight"))
+        .respond_with(AvailableLpmPublishPreflight)
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let output = lpm_with_registry(&project, &server.uri())
+        .args([
+            "release",
+            "publish",
+            "--all",
+            "--lpm",
+            "--dry-run",
+            "--yes",
+            "--json",
+        ])
+        .output()
+        .expect("run release publish lifecycle");
+
+    assert!(
+        output.status.success(),
+        "release lifecycle failed\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    assert_eq!(
+        project.read_file("packages/member/lifecycle.log"),
+        "prepublishOnly\nprepack\nprepare\npostpack\npublish\npostpublish\n"
+    );
+}
+
+#[tokio::test]
+async fn release_publish_ignore_scripts_skips_every_lifecycle_phase() {
+    let project = TempProject::empty(
+        r#"{"name":"root","private":true,"version":"0.0.0","workspaces":["packages/*"]}"#,
+    );
+    project.write_file(
+        "packages/member/package.json",
+        r#"{
+          "name":"@lpm.dev/acme.ignore-lifecycle",
+          "version":"1.0.0",
+          "scripts":{"prepack":"node write-marker.js","postpublish":"node write-marker.js"}
+        }"#,
+    );
+    project.write_file(
+        "packages/member/write-marker.js",
+        "require('fs').writeFileSync('lifecycle-ran', 'yes')\n",
+    );
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/registry/-/package/publish-preflight"))
+        .respond_with(AvailableLpmPublishPreflight)
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let output = lpm_with_registry(&project, &server.uri())
+        .args([
+            "release",
+            "publish",
+            "--all",
+            "--lpm",
+            "--dry-run",
+            "--ignore-scripts",
+            "--json",
+        ])
+        .output()
+        .expect("run release publish with lifecycle scripts disabled");
+
+    assert!(output.status.success(), "{output:?}");
+    assert!(
+        !project
+            .path()
+            .join("packages/member/lifecycle-ran")
+            .exists()
+    );
+}
+
+#[tokio::test]
+async fn release_publish_preserves_successful_upload_when_postpublish_fails() {
+    let project = TempProject::empty(
+        r#"{"name":"root","private":true,"version":"0.0.0","workspaces":["packages/*"]}"#,
+    );
+    project.write_file(
+        "packages/member/package.json",
+        r#"{
+          "name":"@lpm.dev/acme.postpublish-failure",
+          "version":"1.0.0",
+          "scripts":{"postpublish":"node -e \"process.exit(17)\""}
+        }"#,
+    );
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/registry/-/package/publish-preflight"))
+        .respond_with(AvailableLpmPublishPreflight)
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/registry/-/whoami"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "username": "test@example.com",
+            "profile_username": "acme",
+            "email": "test@example.com",
+            "plan_tier": "pro",
+            "mfa_enabled": false,
+            "has_pool_access": true,
+            "usage": { "storage_bytes": 0, "private_packages": 0 },
+            "limits": { "storageBytes": 1_000_000, "privatePackages": 100 },
+            "organizations": []
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("PUT"))
+        .and(path_regex("/api/registry/.*"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "success": true,
+            "message": "Package published"
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let output = lpm_with_registry(&project, &server.uri())
+        .args(["release", "publish", "--all", "--lpm", "--yes", "--json"])
+        .output()
+        .expect("publish before a failing release postpublish lifecycle");
+
+    assert!(
+        !output.status.success(),
+        "postpublish failure must fail the command"
+    );
+    let json = parse_json_output(&output.stdout);
+    assert_eq!(json["results"][0]["status"], "failed");
+    assert_eq!(json["results"][0]["targets"][0]["success"], true);
+    assert!(
+        json["results"][0]["error"]
+            .as_str()
+            .is_some_and(|error| error.contains("postpublish")),
+        "the lifecycle failure must remain separate from the successful upload: {json}"
+    );
+    assert!(
+        json["warning"]
+            .as_str()
+            .is_some_and(|warning| warning.contains("Successful uploads were not rolled back")),
+        "the retry warning must acknowledge the completed upload: {json}"
+    );
+}
+
+#[tokio::test]
+async fn release_publish_holds_the_exclusive_install_lock_through_upload() {
+    let project = TempProject::empty(
+        r#"{"name":"root","private":true,"version":"0.0.0","workspaces":["packages/*"]}"#,
+    );
+    project.write_file(
+        "packages/member/package.json",
+        r#"{"name":"@lpm.dev/acme.release-lock","version":"1.0.0"}"#,
+    );
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/registry/-/package/publish-preflight"))
+        .respond_with(AvailableLpmPublishPreflight)
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/registry/-/whoami"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "username": "test@example.com",
+            "profile_username": "acme",
+            "email": "test@example.com",
+            "plan_tier": "pro",
+            "mfa_enabled": false,
+            "has_pool_access": true,
+            "usage": { "storage_bytes": 0, "private_packages": 0 },
+            "limits": { "storageBytes": 1_000_000, "privatePackages": 100 },
+            "organizations": []
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("PUT"))
+        .and(path_regex("/api/registry/.*"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_delay(std::time::Duration::from_secs(3))
+                .set_body_json(serde_json::json!({
+                    "success": true,
+                    "message": "Package published"
+                })),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let mut command = lpm_spawnable(&project);
+    command
+        .env("LPM_REGISTRY_URL", server.uri())
+        .args(["release", "publish", "--all", "--lpm", "--yes", "--json"]);
+    let mut child = command.spawn().expect("spawn delayed release publish");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let upload_started = server
+            .received_requests()
+            .await
+            .expect("read mock requests")
+            .iter()
+            .any(|request| request.method.as_str() == "PUT");
+        if upload_started {
+            break;
+        }
+        if let Some(status) = child.try_wait().expect("inspect delayed release publish") {
+            panic!("release publish exited with {status} before uploading");
+        }
+        if std::time::Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("release publish did not begin uploading within 10 seconds");
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+
+    let install_lock = lpm_common::project_install_lock(project.path());
+    let available_during_upload = lpm_common::try_acquire_exclusive_lock(&install_lock)
+        .expect("probe release install lock")
+        .is_some();
+    let output = child
+        .wait_with_output()
+        .expect("finish delayed release publish");
+
+    assert!(
+        output.status.success(),
+        "release publish failed\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    assert!(
+        !available_during_upload,
+        "release publish must keep the install lock while holding the publication lock"
+    );
 }

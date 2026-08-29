@@ -10,6 +10,7 @@ use lpm_registry::RegistryClient;
 use lpm_semver::VersionBump;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 #[cfg(any(debug_assertions, feature = "acceptance-test-hooks"))]
 const RELEASE_WORKSPACE_DISCOVERY_MARKER_ENV: &str =
@@ -31,6 +32,7 @@ pub(crate) struct ReleaseSelection {
 pub(crate) struct ReleasePublishOptions {
     pub(crate) dry_run: bool,
     pub(crate) yes: bool,
+    pub(crate) ignore_scripts: bool,
     pub(crate) otp: Option<String>,
     pub(crate) min_score: Option<u32>,
     pub(crate) allow_secrets: bool,
@@ -47,6 +49,7 @@ pub(crate) struct ReleasePublishOptions {
 struct ReleasePublishMember {
     path: PathBuf,
     intent: publish::PublishIntent,
+    publish_lifecycle: Option<Arc<publish::PublishLifecycle>>,
 }
 
 struct ReleasePublishWorkspace {
@@ -276,48 +279,45 @@ pub(crate) async fn publish(
         &initial_root.path,
     )?;
     let publication_lock_directory = lock_directory.try_clone()?;
-    let member_lock_directory = lock_directory.try_clone()?;
-    let plan = plan_release_publish_under_workspace_lock(
-        &project_dir,
-        selection,
-        options,
-        initial_root.try_clone()?,
-        allowed_manifests,
-    );
-    let members = if options.dry_run {
+    let transaction = async move {
+        let members = plan_release_publish_under_workspace_lock(
+            &project_dir,
+            selection,
+            options,
+            json_output,
+            initial_root.try_clone()?,
+            allowed_manifests,
+        )
+        .await?;
+        lpm_common::with_project_exclusive_lock_async(
+            publication_lock_directory,
+            lpm_common::ProjectLockKind::Publish,
+            publish_intent_members(client, initial_root, members, options, json_output),
+        )
+        .await
+    };
+    if options.dry_run {
         lpm_common::with_project_shared_lock_async(
             lock_directory,
             lpm_common::ProjectLockKind::Install,
-            plan,
+            transaction,
         )
-        .await?
+        .await
     } else {
         lpm_common::with_project_exclusive_lock_async(
             lock_directory,
             lpm_common::ProjectLockKind::Install,
-            plan,
+            transaction,
         )
-        .await?
-    };
-    lpm_common::with_project_exclusive_lock_async(
-        publication_lock_directory,
-        lpm_common::ProjectLockKind::Publish,
-        publish_intent_members(
-            client,
-            initial_root,
-            member_lock_directory,
-            members,
-            options,
-            json_output,
-        ),
-    )
-    .await
+        .await
+    }
 }
 
 async fn plan_release_publish_under_workspace_lock(
     project_dir: &Path,
     selection: &ReleaseSelection,
     options: &ReleasePublishOptions,
+    json_output: bool,
     initial_root: SelectedReleaseWorkspaceRoot,
     allowed_manifests: Vec<PathBuf>,
 ) -> Result<Vec<ReleasePublishMember>, LpmError> {
@@ -334,12 +334,51 @@ async fn plan_release_publish_under_workspace_lock(
             &allowed_manifests,
         )?;
     }
-    let workspace = initial_root.discover(project_dir)?;
+    let mut workspace = initial_root.discover(project_dir)?;
     let (graph, selected) = resolve_workspace_selection_for(&workspace, selection)?;
     release_plan::validate_workspace_internal_ranges(&workspace)?;
     let selected = release_plan::ensure_unique_selection(&selected);
     let selected_set: HashSet<usize> = selected.iter().copied().collect();
-    let publish_order = release_plan::sorted_selected_indices(&graph, &selected_set)?;
+    let mut publish_order = release_plan::sorted_selected_indices(&graph, &selected_set)?;
+    let planned_paths: HashSet<PathBuf> = publish_order
+        .iter()
+        .map(|index| workspace.members[*index].path.clone())
+        .collect();
+    let mut lifecycles = HashMap::with_capacity(publish_order.len());
+    let mut has_lifecycle = false;
+    for index in &publish_order {
+        let member_path = &workspace.members[*index].path;
+        let lifecycle = publish::PublishLifecycle::load_for_publish(
+            member_path,
+            options.yes,
+            options.ignore_scripts,
+            json_output,
+        )?
+        .map(Arc::new);
+        if let Some(lifecycle) = &lifecycle {
+            lifecycle.run_before_pack(member_path, json_output)?;
+            has_lifecycle = true;
+        }
+        lifecycles.insert(member_path.clone(), lifecycle);
+    }
+    if has_lifecycle {
+        workspace = initial_root.discover(project_dir)?;
+        release_plan::validate_workspace_internal_ranges(&workspace)?;
+        let (graph, selected) = resolve_workspace_selection_for(&workspace, selection)?;
+        let selected = release_plan::ensure_unique_selection(&selected);
+        let selected_set: HashSet<usize> = selected.iter().copied().collect();
+        publish_order = release_plan::sorted_selected_indices(&graph, &selected_set)?;
+        let current_paths: HashSet<PathBuf> = publish_order
+            .iter()
+            .map(|index| workspace.members[*index].path.clone())
+            .collect();
+        if current_paths != planned_paths {
+            return Err(LpmError::Registry(
+                "release workspace selection changed while running publish lifecycle scripts; retry the command"
+                    .into(),
+            ));
+        }
+    }
     let mut members = Vec::with_capacity(publish_order.len());
     for idx in publish_order {
         let member = &workspace.members[idx];
@@ -369,6 +408,7 @@ async fn plan_release_publish_under_workspace_lock(
         members.push(ReleasePublishMember {
             path: member.path.clone(),
             intent,
+            publish_lifecycle: lifecycles.remove(&member.path).unwrap_or(None),
         });
     }
     Ok(members)
@@ -377,7 +417,6 @@ async fn plan_release_publish_under_workspace_lock(
 async fn publish_intent_members(
     client: &RegistryClient,
     initial_root: SelectedReleaseWorkspaceRoot,
-    install_lock: lpm_common::ProjectLockDirectory,
     members: Vec<ReleasePublishMember>,
     options: &ReleasePublishOptions,
     json_output: bool,
@@ -396,26 +435,14 @@ async fn publish_intent_members(
         !options.dry_run,
     )?;
     let already_published = preflight_publish_members(client, &members, &publish_clients).await?;
-    let workspace = refresh_release_publish_workspace(
-        &initial_root,
-        install_lock.try_clone()?,
-        &members,
-        options.dry_run,
-    )
-    .await?;
+    let workspace = refresh_release_publish_workspace(&initial_root, &members)?;
 
     for (index, (member, is_published)) in members.iter().zip(&already_published).enumerate() {
         let name = member.intent.package_name().to_string();
         let version = member.intent.package_version().to_string();
         if *is_published {
-            if let Err(error) = validate_release_publish_member(
-                &initial_root,
-                &workspace,
-                install_lock.try_clone()?,
-                member,
-                options,
-            )
-            .await
+            if let Err(error) =
+                validate_release_publish_member(&initial_root, &workspace, member, options)
             {
                 let error_summary = release_publish_error_summary(&error);
                 append_failed_and_unattempted_results(
@@ -444,7 +471,6 @@ async fn publish_intent_members(
         let prepared = match prepare_release_publish_member(
             &initial_root,
             &workspace,
-            install_lock.try_clone()?,
             member,
             options,
             json_output,
@@ -467,13 +493,31 @@ async fn publish_intent_members(
         };
 
         if options.dry_run {
+            let lifecycle_result = member
+                .publish_lifecycle
+                .as_ref()
+                .map_or(Ok(()), |lifecycle| {
+                    lifecycle.run_after_publish(&member.path, json_output)
+                });
+            drop(prepared);
+            if let Err(error) = lifecycle_result {
+                let error_summary = release_publish_error_summary(&error);
+                append_failed_and_unattempted_results(
+                    &mut results,
+                    member,
+                    &members[index + 1..],
+                    &error_summary,
+                    &[],
+                );
+                emit_release_publish_results(&results, members.len(), options, json_output, false)?;
+                return Err(LpmError::ExitCode(1));
+            }
             results.push(serde_json::json!({
                 "name": name,
                 "version": version,
                 "path": member.path,
                 "status": "planned",
             }));
-            drop(prepared);
             continue;
         }
 
@@ -482,11 +526,12 @@ async fn publish_intent_members(
         match publish_result {
             Ok(report) if report.success => {}
             Ok(report) => {
+                let failure_summary = report.failure_summary();
                 append_failed_and_unattempted_results(
                     &mut results,
                     member,
                     &members[index + 1..],
-                    "one or more publish targets failed",
+                    &failure_summary,
                     &report.results,
                 );
                 emit_release_publish_results(&results, members.len(), options, json_output, false)?;
@@ -563,12 +608,14 @@ fn emit_release_publish_results(
     json_output: bool,
     success: bool,
 ) -> Result<(), LpmError> {
-    let published = results
-        .iter()
-        .filter(|result| result["status"] == "published")
-        .count();
+    let uploaded = results.iter().any(|result| {
+        result["status"] == "published"
+            || result["targets"]
+                .as_array()
+                .is_some_and(|targets| targets.iter().any(|target| target["success"] == true))
+    });
     let warning = (!success).then_some({
-        if published > 0 {
+        if uploaded {
             "Publishing is not transactional. Successful uploads were not rolled back; retry only failed and not-attempted packages."
         } else {
             "Publishing stopped before all selected packages were processed; retry failed and not-attempted packages."
@@ -605,46 +652,27 @@ fn emit_release_publish_results(
     Ok(())
 }
 
-async fn refresh_release_publish_workspace(
+fn refresh_release_publish_workspace(
     initial_root: &SelectedReleaseWorkspaceRoot,
-    install_lock: lpm_common::ProjectLockDirectory,
     members: &[ReleasePublishMember],
-    dry_run: bool,
 ) -> Result<ReleasePublishWorkspace, LpmError> {
-    let refresh = async {
-        initial_root.validate_named_path()?;
-        let workspace = initial_root.discover(&initial_root.path)?;
-        release_plan::validate_workspace_internal_ranges(&workspace)?;
-        let current_member_paths: HashSet<&Path> = workspace
-            .members
-            .iter()
-            .map(|member| member.path.as_path())
-            .collect();
-        for member in members {
-            if !current_member_paths.contains(member.path.as_path()) {
-                return Err(LpmError::Registry(format!(
-                    "{} changed after release publish preflight; retry the command",
-                    member.path.display()
-                )));
-            }
+    initial_root.validate_named_path()?;
+    let workspace = initial_root.discover(&initial_root.path)?;
+    release_plan::validate_workspace_internal_ranges(&workspace)?;
+    let current_member_paths: HashSet<&Path> = workspace
+        .members
+        .iter()
+        .map(|member| member.path.as_path())
+        .collect();
+    for member in members {
+        if !current_member_paths.contains(member.path.as_path()) {
+            return Err(LpmError::Registry(format!(
+                "{} changed after release publish preflight; retry the command",
+                member.path.display()
+            )));
         }
-        ReleasePublishWorkspace::from_snapshot(workspace, initial_root)
-    };
-    if dry_run {
-        lpm_common::with_project_shared_lock_async(
-            install_lock,
-            lpm_common::ProjectLockKind::Install,
-            refresh,
-        )
-        .await
-    } else {
-        lpm_common::with_project_exclusive_lock_async(
-            install_lock,
-            lpm_common::ProjectLockKind::Install,
-            refresh,
-        )
-        .await
     }
+    ReleasePublishWorkspace::from_snapshot(workspace, initial_root)
 }
 
 fn current_release_publish_projection(
@@ -668,7 +696,8 @@ fn current_release_publish_projection(
             ))
         })?;
     let source = publish::PublishSource::from_open_directory(member.path.clone(), directory)?;
-    let publish_manifest = publish::read_publish_manifest_from_source(source)?;
+    let publish_manifest =
+        publish::select_publish_projection(publish::read_publish_manifest_from_source(source)?)?;
     let projection_context = lpm_workspace::PublishProjectionContext::new(
         &workspace.member_paths_by_name,
         &workspace.member_paths,
@@ -687,96 +716,66 @@ fn current_release_publish_projection(
     Ok((projection, publish_manifest))
 }
 
-async fn validate_release_publish_member(
+fn validate_release_publish_member(
     initial_root: &SelectedReleaseWorkspaceRoot,
     workspace: &ReleasePublishWorkspace,
-    install_lock: lpm_common::ProjectLockDirectory,
     member: &ReleasePublishMember,
     options: &ReleasePublishOptions,
 ) -> Result<(), LpmError> {
-    let validate = async {
-        let (projection, publish_manifest) =
-            current_release_publish_projection(initial_root, workspace, member, !options.dry_run)?;
-        publish::validate_intent_with_workspace_lock_held(
-            &member.path,
-            &publish_manifest,
-            &projection,
-            &member.intent,
-            options.npm,
-            options.lpm,
-            options.github,
-            options.gitlab,
-            options.publish_registry.as_deref(),
-        )
-    };
-    if options.dry_run {
-        lpm_common::with_project_shared_lock_async(
-            install_lock,
-            lpm_common::ProjectLockKind::Install,
-            validate,
-        )
-        .await
-    } else {
-        lpm_common::with_project_exclusive_lock_async(
-            install_lock,
-            lpm_common::ProjectLockKind::Install,
-            validate,
-        )
-        .await
-    }
+    let (projection, publish_manifest) =
+        current_release_publish_projection(initial_root, workspace, member, !options.dry_run)?;
+    publish::validate_intent_with_workspace_lock_held(
+        &member.path,
+        &publish_manifest,
+        &projection,
+        &member.intent,
+        options.npm,
+        options.lpm,
+        options.github,
+        options.gitlab,
+        options.publish_registry.as_deref(),
+    )
 }
 
 async fn prepare_release_publish_member(
     initial_root: &SelectedReleaseWorkspaceRoot,
     workspace: &ReleasePublishWorkspace,
-    install_lock: lpm_common::ProjectLockDirectory,
     member: &ReleasePublishMember,
     options: &ReleasePublishOptions,
     json_output: bool,
 ) -> Result<publish::PreparedPublish, LpmError> {
-    let prepare = async {
-        let (projection, publish_manifest) =
-            current_release_publish_projection(initial_root, workspace, member, !options.dry_run)?;
-        publish::prepare_intent_with_workspace_lock_held(
-            &member.path,
-            publish_manifest,
-            &projection,
-            &member.intent,
-            options.dry_run,
-            false,
-            false,
-            None,
-            options.otp.as_deref(),
-            options.yes || json_output,
-            json_output,
-            options.min_score,
-            options.allow_secrets,
-            options.npm,
-            options.lpm,
-            options.github,
-            options.gitlab,
-            options.publish_registry.as_deref(),
-            options.provenance,
-            options.no_provenance,
-            options.provenance_file.as_deref(),
-        )
-        .await
-    };
-    if options.dry_run {
-        lpm_common::with_project_shared_lock_async(
-            install_lock,
-            lpm_common::ProjectLockKind::Install,
-            prepare,
-        )
-        .await
-    } else {
-        lpm_common::with_project_exclusive_lock_async(
-            install_lock,
-            lpm_common::ProjectLockKind::Install,
-            prepare,
-        )
-        .await
-    }
+    let (projection, publish_manifest) =
+        current_release_publish_projection(initial_root, workspace, member, !options.dry_run)?;
+    let prepared = publish::prepare_intent_with_workspace_lock_held(
+        &member.path,
+        publish_manifest,
+        &projection,
+        &member.intent,
+        options.dry_run,
+        false,
+        false,
+        None,
+        options.otp.as_deref(),
+        options.yes || json_output,
+        json_output,
+        options.min_score,
+        options.allow_secrets,
+        options.npm,
+        options.lpm,
+        options.github,
+        options.gitlab,
+        options.publish_registry.as_deref(),
+        options.provenance,
+        options.no_provenance,
+        options.provenance_file.as_deref(),
+    )
+    .await?;
+    publish::finish_release_publish_preparation(
+        prepared,
+        member.publish_lifecycle.as_ref().map(Arc::clone),
+        &member.path,
+        json_output,
+    )
 }
 
 const RELEASE_PREFLIGHT_CONCURRENCY: usize = 4;

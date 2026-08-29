@@ -730,6 +730,17 @@ fn resolve_targets_rejects_http_cli_registry_url() {
 }
 
 #[test]
+fn resolve_targets_accepts_ipv6_loopback_http_registry_urls() {
+    let targets = resolve_targets(false, false, false, false, Some("http://[::1]:4873"), None)
+        .expect("IPv6 loopback registries must be available for local publishing");
+
+    assert_eq!(
+        targets,
+        vec![PublishTarget::Custom("http://[::1]:4873".into())]
+    );
+}
+
+#[test]
 fn resolve_targets_deduplicates() {
     let config = lpm_json::PublishConfig {
         registries: vec!["npm".into(), "npm".into(), "lpm".into()],
@@ -1385,6 +1396,23 @@ fn deduplicate_custom_urls_by_value() {
     assert_eq!(deduped.len(), 2);
     assert_eq!(deduped[0].key(), "https://a.com");
     assert_eq!(deduped[1].key(), "https://b.com");
+}
+
+#[test]
+fn deduplicate_custom_urls_by_normalized_publication_endpoint() {
+    let targets = vec![
+        PublishTarget::Custom("https://REGISTRY.example.test:443/npm/".into()),
+        PublishTarget::Custom("https://registry.example.test/npm".into()),
+    ];
+
+    let deduped = deduplicate_targets(targets);
+
+    assert_eq!(
+        deduped,
+        vec![PublishTarget::Custom(
+            "https://REGISTRY.example.test:443/npm/".into()
+        )]
+    );
 }
 
 // ─── Orchestration: provenance hash binding ──────────────────

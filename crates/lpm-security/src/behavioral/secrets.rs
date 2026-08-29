@@ -8,7 +8,7 @@
 //! Pattern matching uses `RegexSet` (compiled once, thread-safe) for
 //! linear-time multi-pattern scanning against untrusted input.
 
-use regex::RegexSet;
+use regex::bytes::RegexSet;
 use serde::{Deserialize, Serialize};
 use std::sync::OnceLock;
 
@@ -348,7 +348,7 @@ fn secret_regex_set() -> &'static RegexSet {
 /// (NOT comment-stripped — secrets can appear in comments too, and we want to catch them).
 /// At most [`SECRET_SCAN_MAX_FINDINGS`] matches are retained.
 pub fn scan_content(content: &str, file_path: &str) -> Vec<SecretMatch> {
-    scan_content_bounded(content, file_path, SECRET_SCAN_MAX_FINDINGS).0
+    scan_content_bounded(content.as_bytes(), file_path, SECRET_SCAN_MAX_FINDINGS).0
 }
 
 /// Check if a filename is a blocked .env or credentials file.
@@ -420,9 +420,6 @@ fn scan_file_content_after_file_charge(
         return result;
     }
 
-    let Ok(content) = std::str::from_utf8(content) else {
-        return result;
-    };
     let (matches, exceeded) = scan_content_bounded(content, file_path, budget.remaining_findings);
     budget.consume_findings(matches.len());
     result.matches = matches;
@@ -435,45 +432,48 @@ fn scan_file_content_after_file_charge(
 }
 
 fn is_scannable_file(file_path: &str) -> bool {
+    const SCANNABLE_EXTENSIONS: &[&str] = &[
+        "js", "mjs", "cjs", "ts", "mts", "cts", "jsx", "tsx", "json", "yml", "yaml", "toml", "env",
+        "cfg", "conf", "ini", "sh", "bash", "zsh", "py", "rb", "rs", "go", "java", "kt", "swift",
+        "md", "txt", "xml", "pem",
+    ];
+
     let path = std::path::Path::new(file_path);
     let ext = path
         .extension()
         .and_then(|extension| extension.to_str())
         .unwrap_or("");
-    matches!(
-        ext,
-        "js" | "mjs"
-            | "cjs"
-            | "ts"
-            | "mts"
-            | "cts"
-            | "jsx"
-            | "tsx"
-            | "json"
-            | "yml"
-            | "yaml"
-            | "toml"
-            | "env"
-            | "cfg"
-            | "conf"
-            | "ini"
-            | "sh"
-            | "bash"
-            | "zsh"
-            | "py"
-            | "rb"
-            | "rs"
-            | "go"
-            | "java"
-            | "kt"
-            | "swift"
-            | "md"
-            | "txt"
-            | "xml"
-            | "pem"
-    ) || file_path.starts_with(".env")
-        || file_path.ends_with("rc")
-        || file_path.ends_with(".npmrc")
+    SCANNABLE_EXTENSIONS
+        .iter()
+        .any(|candidate| ext.eq_ignore_ascii_case(candidate))
+        || file_path.split(['/', '\\']).any(|component| {
+            [
+                "private",
+                "secrets",
+                ".secrets",
+                "credentials",
+                ".credentials",
+            ]
+            .iter()
+            .any(|sensitive| component.eq_ignore_ascii_case(sensitive))
+        })
+        || file_path
+            .get(..4)
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case(".env"))
+        || file_path
+            .get(file_path.len().saturating_sub(2)..)
+            .is_some_and(|suffix| suffix.eq_ignore_ascii_case("rc"))
+        || file_path
+            .get(file_path.len().saturating_sub(6)..)
+            .is_some_and(|suffix| suffix.eq_ignore_ascii_case(".npmrc"))
+}
+
+/// Return whether secret detection needs the file contents for this path.
+///
+/// Blocked filenames remain detectable without reading their contents because
+/// [`scan_file_content_with_budget`] reports them from the path alone.
+pub fn file_content_requires_scan(file_path: &str) -> bool {
+    is_scannable_file(file_path)
 }
 
 /// Scan all files in a directory for secrets and blocked files.
@@ -543,14 +543,14 @@ pub fn scan_directory_with_budget(
 }
 
 fn scan_content_bounded(
-    content: &str,
+    content: &[u8],
     file_path: &str,
     maximum_findings: usize,
 ) -> (Vec<SecretMatch>, bool) {
     let set = secret_regex_set();
     let mut matches = Vec::with_capacity(maximum_findings.min(16));
 
-    for (line_index, line) in content.lines().enumerate() {
+    for (line_index, line) in content.split(|byte| *byte == b'\n').enumerate() {
         for pattern_index in set.matches(line).into_iter() {
             if matches.len() == maximum_findings {
                 return (matches, true);
@@ -767,6 +767,48 @@ mod tests {
 
         assert_eq!(result.matches.len(), 1);
         assert_eq!(result.matches[0].pattern_name, "stripe_live_secret");
+        assert_eq!(result.files_scanned, 1);
+    }
+
+    #[test]
+    fn scan_file_content_matches_supported_extensions_case_insensitively() {
+        let secret = format!("token=npm_{}", "A".repeat(36));
+
+        let result = scan_file_content(secret.as_bytes(), "CONFIG.JSON");
+
+        assert_eq!(result.matches.len(), 1);
+        assert_eq!(result.matches[0].pattern_name, "npm_token");
+        assert_eq!(result.files_scanned, 1);
+    }
+
+    #[test]
+    fn scan_file_content_scans_unknown_extensions_inside_sensitive_directories() {
+        let secret = format!("token=npm_{}", "S".repeat(36));
+
+        for path in [
+            "private/export.dat",
+            "secrets/export.dat",
+            ".secrets/export.dat",
+            "credentials/export.dat",
+            ".credentials/export.dat",
+        ] {
+            let result = scan_file_content(secret.as_bytes(), path);
+
+            assert_eq!(result.matches.len(), 1, "secret was not detected in {path}");
+            assert_eq!(result.matches[0].pattern_name, "npm_token");
+            assert_eq!(result.files_scanned, 1);
+        }
+    }
+
+    #[test]
+    fn scan_file_content_detects_ascii_secrets_around_invalid_utf8() {
+        let mut content = vec![0xff, b'\n'];
+        content.extend_from_slice(format!("token=npm_{}", "B".repeat(36)).as_bytes());
+
+        let result = scan_file_content(&content, "config.json");
+
+        assert_eq!(result.matches.len(), 1);
+        assert_eq!(result.matches[0].pattern_name, "npm_token");
         assert_eq!(result.files_scanned, 1);
     }
 

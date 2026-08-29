@@ -56,16 +56,13 @@ fn write_authored_skill(cwd: &std::path::Path) {
     .unwrap();
 }
 
-fn spawn_publish(cwd: &std::path::Path, registry: &str, args: &[&str]) -> Output {
+fn lpm_command(cwd: &std::path::Path) -> Command {
     let exe = env!("CARGO_BIN_EXE_lpm-rs");
-    let mut argv: Vec<&str> = vec!["publish"];
-    argv.extend_from_slice(args);
-    argv.extend(["--registry", registry]);
     let home = cwd.join(".home");
     let lpm_home = home.join(".lpm");
+    let mut command = Command::new(exe);
 
-    Command::new(exe)
-        .args(&argv)
+    command
         .current_dir(cwd)
         .env("HOME", &home)
         .env("LPM_HOME", &lpm_home)
@@ -86,11 +83,34 @@ fn spawn_publish(cwd: &std::path::Path, registry: &str, args: &[&str]) -> Output
         .env_remove("LPM_GITLAB_OIDC_TOKEN")
         .env_remove("SIGSTORE_ID_TOKEN")
         .env_remove("LPM_TOKEN")
-        .env_remove("RUST_LOG")
+        .env_remove("NPM_TOKEN")
+        .env_remove("RUST_LOG");
+    command
+}
+
+fn spawn_publish(cwd: &std::path::Path, registry: &str, args: &[&str]) -> Output {
+    let mut argv: Vec<&str> = vec!["publish"];
+    argv.extend_from_slice(args);
+    argv.extend(["--registry", registry]);
+
+    lpm_command(cwd)
+        .args(&argv)
+        .env("LPM_OIDC_TOKEN", SUPPLIED_JWT)
         .output()
         .expect("failed to spawn lpm-rs")
-    // Note: NPM_TOKEN deliberately not stripped — non-LPM targets need their
-    // own auth, but the test never asks them to actually publish.
+}
+
+fn store_custom_registry_token(cwd: &std::path::Path, registry: &str, token: &str) {
+    let output = lpm_command(cwd)
+        .args(["login", "--login-registry", registry, "--token", token])
+        .output()
+        .expect("failed to store custom registry token");
+    assert!(
+        output.status.success(),
+        "custom registry login failed:\nstdout={}\nstderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 #[tokio::test]
@@ -176,6 +196,7 @@ async fn publish_dry_run_lpm_target_exchange_includes_package_field() {
 #[tokio::test]
 async fn multi_target_dry_run_changes_only_the_resolved_lpm_name() {
     const RESOLVED_NAME: &str = "@lpm.dev/owner.resolved-publish-name";
+    const NPM_TOKEN: &str = "npm-preflight-token";
     let server = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/api/registry/-/token/oidc"))
@@ -205,6 +226,13 @@ async fn multi_target_dry_run_changes_only_the_resolved_lpm_name() {
         .expect(1)
         .mount(&server)
         .await;
+    Mock::given(method("GET"))
+        .and(path("/source-package"))
+        .and(header("authorization", format!("Bearer {NPM_TOKEN}")))
+        .respond_with(ResponseTemplate::new(404))
+        .expect(1)
+        .mount(&server)
+        .await;
 
     let tmp = tempfile::tempdir().unwrap();
     write_minimal_project(tmp.path());
@@ -215,9 +243,13 @@ async fn multi_target_dry_run_changes_only_the_resolved_lpm_name() {
     .unwrap();
     fs::write(
         tmp.path().join("lpm.json"),
-        format!(r#"{{"publish":{{"lpm":{{"name":"{RESOLVED_NAME}"}}}}}}"#),
+        format!(
+            r#"{{"publish":{{"lpm":{{"name":"{RESOLVED_NAME}"}},"npm":{{"registry":"{}"}}}}}}"#,
+            server.uri()
+        ),
     )
     .unwrap();
+    store_custom_registry_token(tmp.path(), &server.uri(), NPM_TOKEN);
     let output = spawn_publish(
         tmp.path(),
         &server.uri(),

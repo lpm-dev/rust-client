@@ -1893,6 +1893,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "ferralk-glob"
+version = "0.6.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "72964633e2b5abd33e990cbd304dc8d1148de317a68f86c57d29bff6cf035184"
+dependencies = [
+ "memchr",
+]
+
+[[package]]
 name = "ff"
 version = "0.13.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3352,10 +3361,12 @@ dependencies = [
  "diffy",
  "dirs",
  "ecdsa",
+ "ferralk-glob",
  "flate2",
  "futures",
  "gag",
  "glob",
+ "globset",
  "hex",
  "hmac",
  "ignore",
@@ -4168,9 +4179,9 @@ checksum = "4facc753ae494aeb6e3c22f839b158aebd4f9270f55cd3c79906c45476c47ab4"
 
 [[package]]
 name = "memchr"
-version = "2.8.1"
+version = "2.8.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6b947ae49db0d222b1dbc6b113ce7248a3fc3a6ca21b696717bfc000ba4484d8"
+checksum = "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
 
 [[package]]
 name = "memmap2"

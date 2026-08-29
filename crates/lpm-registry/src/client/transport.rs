@@ -1,5 +1,21 @@
 use super::*;
 
+pub(super) enum PublishSafeResponse {
+    Response(reqwest::Response),
+    Recovered(serde_json::Value),
+}
+
+enum PublishReconciliation {
+    Missing,
+    Matched(serde_json::Value),
+}
+
+fn ambiguous_publish_reconciliation_error(error: LpmError) -> LpmError {
+    LpmError::Registry(format!(
+        "publish outcome is ambiguous and could not be reconciled: {error}. Inspect the registry before retrying"
+    ))
+}
+
 /// Maximum number of retries for transient failures.
 pub(super) const MAX_RETRIES: u32 = 3;
 
@@ -340,16 +356,17 @@ impl RegistryClient {
 
     /// Send a publish request with safe retry logic (S4).
     ///
-    /// Unlike `send_with_retry`, this does NOT retry on HTTP 500 because
-    /// the server may have stored the version before returning an error.
-    /// On 500: checks if the version already exists — if so, treats as success.
-    /// Only retries on: 502, 503, 504 (gateway errors) and network failures.
+    /// Unlike `send_with_retry`, this reconciles every ambiguous response
+    /// against the exact artifact integrity before it can replay the body.
     pub(super) async fn send_publish_safe<F>(
         &self,
         mut request_factory: F,
         payload: &lpm_http::ReplayableRequestBody,
+        bearer: Option<&str>,
         encoded_name: &str,
-    ) -> Result<reqwest::Response, LpmError>
+        published_version: &str,
+        published_integrity: &str,
+    ) -> Result<PublishSafeResponse, LpmError>
     where
         F: FnMut() -> Result<reqwest::RequestBuilder, LpmError>,
     {
@@ -369,47 +386,42 @@ impl RegistryClient {
                     let status = response.status().as_u16();
 
                     match status {
-                        200..=299 | 304 => return Ok(response),
+                        200..=299 | 304 => return Ok(PublishSafeResponse::Response(response)),
 
                         // Non-retryable client errors — fail immediately
                         401 => return Err(LpmError::AuthRequired),
                         403 => {
-                            let body = read_capped_error_text(response).await;
+                            let body = read_publish_error_text(response, bearer).await;
                             return Err(forbidden_error_from_body(body));
                         }
                         404 => {
-                            let body = read_capped_error_text(response).await;
+                            let body = read_publish_error_text(response, bearer).await;
                             return Err(LpmError::NotFound(body));
                         }
 
                         // S4: 500 — do NOT retry. Server may have stored the version.
                         // Check if the version now exists on the registry.
                         500 => {
-                            let body_text = read_capped_error_text(response).await;
+                            let body_text = read_publish_error_text(response, bearer).await;
                             tracing::warn!("publish got HTTP 500 — checking if version was stored");
 
-                            // Check if the version exists by GETting the package
-                            let check_url =
-                                format!("{}/api/registry/{}", self.base_url, encoded_name);
-                            // `build_get` is fallible here; on cert load
-                            // failure for the recovery probe origin,
-                            // we can't verify whether the publish
-                            // succeeded server-side. Treat as not-OK
-                            // (don't fall through to the retry-as-success
-                            // branch) and let the outer loop continue.
-                            let probe = match self.build_get(&check_url).await {
-                                Ok(req) => self.send_with_retry(req).await,
-                                Err(_) => Err(LpmError::Network(
-                                    "publish recovery probe failed to build (TLS)".into(),
-                                )),
-                            };
-                            if let Ok(check_resp) = probe
-                                && check_resp.status().is_success()
+                            match self
+                                .reconcile_publish_artifact(
+                                    encoded_name,
+                                    published_version,
+                                    published_integrity,
+                                )
+                                .await
+                                .map_err(ambiguous_publish_reconciliation_error)?
                             {
-                                // Version was stored despite the 500 — treat as success.
-                                // Return a synthetic success response.
-                                tracing::info!("version exists after 500 — treating as success");
-                                return Ok(check_resp);
+                                PublishReconciliation::Matched(metadata) => {
+                                    tracing::info!(
+                                        version = published_version,
+                                        "published artifact integrity matched after HTTP 500"
+                                    );
+                                    return Ok(PublishSafeResponse::Recovered(metadata));
+                                }
+                                PublishReconciliation::Missing => {}
                             }
 
                             return Err(LpmError::Http {
@@ -437,11 +449,30 @@ impl RegistryClient {
 
                         // Retryable gateway errors only (NOT 500)
                         502..=504 => {
-                            let body = read_capped_error_text(response).await;
+                            let body = read_publish_error_text(response, bearer).await;
                             last_error = Some(LpmError::Http {
                                 status,
                                 message: body,
                             });
+                            match self
+                                .reconcile_publish_artifact(
+                                    encoded_name,
+                                    published_version,
+                                    published_integrity,
+                                )
+                                .await
+                                .map_err(ambiguous_publish_reconciliation_error)?
+                            {
+                                PublishReconciliation::Matched(metadata) => {
+                                    tracing::info!(
+                                        version = published_version,
+                                        status,
+                                        "published artifact integrity matched after gateway error"
+                                    );
+                                    return Ok(PublishSafeResponse::Recovered(metadata));
+                                }
+                                PublishReconciliation::Missing => {}
+                            }
                             if attempt < MAX_RETRIES {
                                 let delay = backoff_delay(attempt);
                                 tokio::time::sleep(delay).await;
@@ -451,7 +482,7 @@ impl RegistryClient {
 
                         // Other errors — fail immediately
                         _ => {
-                            let body = read_capped_error_text(response).await;
+                            let body = read_publish_error_text(response, bearer).await;
                             return Err(LpmError::Http {
                                 status,
                                 message: body,
@@ -461,10 +492,29 @@ impl RegistryClient {
                 }
                 Err(lpm_http::ReplayableRequestError::Client(error)) => return Err(error),
                 Err(lpm_http::ReplayableRequestError::Request(error)) => {
-                    // Network-level errors are retryable
                     last_error = Some(LpmError::Network(
                         lpm_http::display_error(&error).to_string(),
                     ));
+                    match self
+                        .reconcile_publish_artifact(
+                            encoded_name,
+                            published_version,
+                            published_integrity,
+                        )
+                        .await
+                    {
+                        Ok(PublishReconciliation::Matched(metadata)) => {
+                            tracing::info!(
+                                version = published_version,
+                                "published artifact integrity matched after network error"
+                            );
+                            return Ok(PublishSafeResponse::Recovered(metadata));
+                        }
+                        Ok(PublishReconciliation::Missing) => {}
+                        Err(probe_error) => {
+                            return Err(ambiguous_publish_reconciliation_error(probe_error));
+                        }
+                    }
                     if attempt < MAX_RETRIES {
                         let delay = backoff_delay(attempt);
                         tokio::time::sleep(delay).await;
@@ -476,6 +526,50 @@ impl RegistryClient {
         }
 
         Err(last_error.unwrap_or_else(|| LpmError::Network("publish failed after retries".into())))
+    }
+
+    async fn reconcile_publish_artifact(
+        &self,
+        encoded_name: &str,
+        published_version: &str,
+        published_integrity: &str,
+    ) -> Result<PublishReconciliation, LpmError> {
+        let check_url = format!("{}/api/registry/{}", self.base_url, encoded_name);
+        let request = self.build_get(&check_url).await.map_err(|error| {
+            LpmError::Registry(format!(
+                "publish recovery probe could not be built: {error}"
+            ))
+        })?;
+        let response = match self.send_with_retry(request).await {
+            Ok(response) => response,
+            Err(LpmError::NotFound(_)) => return Ok(PublishReconciliation::Missing),
+            Err(error) => {
+                return Err(LpmError::Registry(format!(
+                    "publish recovery probe failed: {error}"
+                )));
+            }
+        };
+        let metadata =
+            parse_capped_api_json::<serde_json::Value>(response, "publish recovery metadata")
+                .await?;
+        let Some(version) = metadata
+            .get("versions")
+            .and_then(serde_json::Value::as_object)
+            .and_then(|versions| versions.get(published_version))
+        else {
+            return Ok(PublishReconciliation::Missing);
+        };
+        let stored_integrity = version
+            .get("dist")
+            .and_then(|dist| dist.get("integrity"))
+            .and_then(serde_json::Value::as_str);
+        if stored_integrity == Some(published_integrity) {
+            return Ok(PublishReconciliation::Matched(metadata));
+        }
+        Err(LpmError::Registry(format!(
+            "version {published_version} exists after an ambiguous publish response, but its stored integrity {} does not match the attempted artifact integrity {published_integrity}; inspect the registry before retrying",
+            stored_integrity.unwrap_or("<missing>")
+        )))
     }
 
     /// Send a request with retry logic for transient failures.
@@ -633,6 +727,14 @@ impl RegistryClient {
         }
 
         Err(last_error.unwrap_or_else(|| LpmError::Network("request failed after retries".into())))
+    }
+}
+
+async fn read_publish_error_text(response: reqwest::Response, bearer: Option<&str>) -> String {
+    let body = read_capped_error_text(response).await;
+    match bearer {
+        Some(secret) => lpm_common::redact_exact_secret(&body, secret).into_owned(),
+        None => body,
     }
 }
 

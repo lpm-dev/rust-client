@@ -8,6 +8,33 @@ use support::{TempProject, lpm};
 use wiremock::matchers::{header, method, path, query_param};
 use wiremock::{Mock, ResponseTemplate};
 
+#[test]
+fn stage_publish_rejects_minimum_quality_score_outside_the_percentage_range() {
+    let project = TempProject::empty(
+        r#"{
+  "name": "stage-invalid-minimum-score",
+  "version": "1.0.0",
+  "main": "index.js"
+}"#,
+    );
+    project.write_file("index.js", "module.exports = {};\n");
+
+    let output = lpm(&project)
+        .args(["stage", "publish", "--dry-run", "--min-score", "101"])
+        .output()
+        .expect("run stage publish with an invalid minimum score");
+
+    assert!(
+        !output.status.success(),
+        "stage scores above 100 must be rejected",
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("invalid value") && stderr.contains("0..=100"),
+        "the parser error must state the percentage bound: {output:?}",
+    );
+}
+
 const STAGE_ID: &str = "123e4567-e89b-12d3-a456-426614174000";
 const NPM_TOKEN: &str = "stage-token";
 const NPM_ID_TOKEN: &str = "stage-oidc-id-token";
@@ -68,6 +95,143 @@ async fn stage_publish_posts_rewritten_payload_to_npm_stage_endpoint() {
         .expect("tarball data must decode");
     let manifest = extract_package_json(&tarball);
     assert_eq!(manifest["name"], serde_json::json!("@scope/staged-pkg"));
+}
+
+#[tokio::test]
+async fn stage_publish_uses_publish_config_directory_as_the_artifact_root() {
+    let mock = MockRegistry::start().await;
+    mount_package_metadata(
+        &mock,
+        "@scope/projected-stage-pkg",
+        serde_json::json!({"0.9.0": {}}),
+    )
+    .await;
+    mount_stage_publish(&mock, "@scope/projected-stage-pkg").await;
+    let project = TempProject::empty(
+        r#"{
+  "name": "@scope/stage-source-pkg",
+  "version": "1.0.0",
+  "publishConfig": {"directory": "dist"}
+}"#,
+    );
+    project.write_file("root-only.js", "module.exports = 'root';\n");
+    project.write_file(
+        "dist/package.json",
+        r#"{
+  "name": "@scope/projected-stage-pkg",
+  "version": "1.0.0",
+  "main": "index.js",
+  "license": "MIT"
+}"#,
+    );
+    project.write_file("dist/index.js", "module.exports = 'projected';\n");
+
+    let output = lpm(&project)
+        .env("NPM_TOKEN", NPM_TOKEN)
+        .args(["stage", "publish", "--yes", "--npm-registry", &mock.url()])
+        .output()
+        .expect("stage the projected package directory");
+
+    assert!(output.status.success(), "{output:?}");
+    let payload = recorded_stage_publish_payload(&mock).await;
+    let attachment = payload["_attachments"]
+        .as_object()
+        .and_then(|attachments| attachments.values().next())
+        .expect("stage payload must contain a tarball attachment");
+    let tarball = BASE64
+        .decode(
+            attachment["data"]
+                .as_str()
+                .expect("tarball data must be text"),
+        )
+        .expect("tarball data must decode");
+    let manifest = extract_package_json(&tarball);
+    assert_eq!(manifest["name"], "@scope/projected-stage-pkg");
+}
+
+#[tokio::test]
+async fn stage_publish_runs_only_pack_lifecycle_phases_in_npm_order() {
+    let mock = MockRegistry::start().await;
+    mount_package_metadata(
+        &mock,
+        "@scope/stage-lifecycle-pkg",
+        serde_json::json!({"0.9.0": {}}),
+    )
+    .await;
+    mount_stage_publish(&mock, "@scope/stage-lifecycle-pkg").await;
+    let project = TempProject::empty(
+        r#"{
+  "name": "@scope/stage-lifecycle-pkg",
+  "version": "1.0.0",
+  "main": "index.js",
+  "license": "MIT",
+  "scripts": {
+    "prepublishOnly": "node record-lifecycle.js prepublishOnly",
+    "prepack": "node record-lifecycle.js prepack",
+    "prepare": "node record-lifecycle.js prepare",
+    "postpack": "node record-lifecycle.js postpack",
+    "publish": "node record-lifecycle.js publish",
+    "postpublish": "node record-lifecycle.js postpublish"
+  }
+}"#,
+    );
+    project.write_file("index.js", "module.exports = {};\n");
+    project.write_file(
+        "record-lifecycle.js",
+        "require('fs').appendFileSync('lifecycle.log', process.argv[2] + '\\n')\n",
+    );
+
+    let output = lpm(&project)
+        .env("NPM_TOKEN", NPM_TOKEN)
+        .args(["stage", "publish", "--yes", "--npm-registry", &mock.url()])
+        .output()
+        .expect("stage a package with lifecycle scripts");
+
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(
+        project.read_file("lifecycle.log"),
+        "prepublishOnly\nprepack\nprepare\npostpack\n",
+    );
+}
+
+#[tokio::test]
+async fn stage_publish_ignore_scripts_skips_pack_lifecycle_phases() {
+    let mock = MockRegistry::start().await;
+    mount_package_metadata(
+        &mock,
+        "@scope/stage-ignore-lifecycle",
+        serde_json::json!({"0.9.0": {}}),
+    )
+    .await;
+    mount_stage_publish(&mock, "@scope/stage-ignore-lifecycle").await;
+    let project = TempProject::empty(
+        r#"{
+  "name": "@scope/stage-ignore-lifecycle",
+  "version": "1.0.0",
+  "main": "index.js",
+  "scripts": {"prepack": "node write-marker.js"}
+}"#,
+    );
+    project.write_file("index.js", "module.exports = {};\n");
+    project.write_file(
+        "write-marker.js",
+        "require('fs').writeFileSync('lifecycle-ran', 'yes')\n",
+    );
+
+    let output = lpm(&project)
+        .env("NPM_TOKEN", NPM_TOKEN)
+        .args([
+            "stage",
+            "publish",
+            "--ignore-scripts",
+            "--npm-registry",
+            &mock.url(),
+        ])
+        .output()
+        .expect("stage a package with lifecycle scripts disabled");
+
+    assert!(output.status.success(), "{output:?}");
+    assert!(!project.path().join("lifecycle-ran").exists());
 }
 
 #[tokio::test]

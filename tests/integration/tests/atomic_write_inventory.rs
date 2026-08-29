@@ -183,6 +183,10 @@ const REVIEWED_RAW_ATOMIC_WRITERS: &[(&str, &str)] = &[
         "restores complete project-owned paths from the transaction's exclusively created rollback directory",
     ),
     (
+        "crates/lpm-cli/src/commands/npm_stage.rs::download_staged_package",
+        "streams into an exclusively created same-directory NamedTempFile, syncs and validates it, then publishes with persist_noclobber",
+    ),
+    (
         "crates/lpm-cli/src/commands/rebuild/build_cache/toolchain_snapshot.rs::write_snapshot",
         "NamedTempFile exclusively creates a randomized sibling before persist",
     ),

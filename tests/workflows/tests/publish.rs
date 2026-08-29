@@ -202,6 +202,441 @@ async fn publish_dry_run_with_authored_skills_leaves_project_files_unchanged() {
     );
 }
 
+#[tokio::test]
+async fn publish_npm_dry_run_checks_the_remote_version_without_uploading() {
+    const PACKAGE: &str = "npm-dry-run-preflight";
+    let mock = MockRegistry::start().await;
+    Mock::given(method("GET"))
+        .and(path(format!("/{PACKAGE}")))
+        .and(header(
+            "authorization",
+            format!("Bearer {CUSTOM_REGISTRY_TOKEN}"),
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "name": PACKAGE,
+            "dist-tags": {"latest": "1.0.0"},
+            "versions": {"1.0.0": {"name": PACKAGE, "version": "1.0.0"}}
+        })))
+        .expect(1)
+        .mount(mock.server())
+        .await;
+    let project = TempProject::empty(&format!(
+        r#"{{
+  "name": "{PACKAGE}",
+  "version": "1.0.0",
+  "description": "npm dry-run remote preflight fixture",
+  "main": "index.js",
+  "license": "MIT"
+}}"#,
+    ));
+    project.write_file("index.js", "module.exports = {};");
+    project.write_file(
+        "lpm.json",
+        &format!(r#"{{"publish":{{"npm":{{"registry":"{}"}}}}}}"#, mock.url()),
+    );
+    let login = lpm(&project)
+        .args([
+            "--json",
+            "login",
+            "--login-registry",
+            &mock.url(),
+            "--token",
+            CUSTOM_REGISTRY_TOKEN,
+        ])
+        .output()
+        .expect("store the custom registry token");
+    assert!(login.status.success(), "{login:?}");
+
+    let output = lpm(&project)
+        .args(["publish", "--npm", "--dry-run", "--yes"])
+        .output()
+        .expect("run npm publish dry-run");
+
+    assert!(
+        !output.status.success(),
+        "dry-run must reject a version that already exists remotely",
+    );
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    assert!(
+        combined.contains("1.0.0") && combined.contains("already exists"),
+        "dry-run must report the remote version conflict: {combined}",
+    );
+    let requests = mock.server().received_requests().await.unwrap();
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|request| request.method.as_str() == "PUT")
+            .count(),
+        0,
+        "dry-run must never upload",
+    );
+}
+
+#[tokio::test]
+async fn publish_dry_run_executes_publish_lifecycle_scripts_in_npm_order() {
+    let mock = MockRegistry::start().await;
+    let project = TempProject::empty(
+        r#"{
+  "name": "@lpm.dev/testuser.publish-lifecycle",
+  "version": "1.0.0",
+  "description": "Publish lifecycle ordering fixture",
+  "main": "index.js",
+  "license": "MIT",
+  "scripts": {
+    "prepublishOnly": "node record-lifecycle.js prepublishOnly",
+    "prepack": "node record-lifecycle.js prepack",
+    "prepare": "node record-lifecycle.js prepare",
+    "postpack": "node record-lifecycle.js postpack",
+    "publish": "node record-lifecycle.js publish",
+    "postpublish": "node record-lifecycle.js postpublish"
+  }
+}"#,
+    );
+    project.write_file("index.js", "module.exports = {};\n");
+    project.write_file(
+        "record-lifecycle.js",
+        "require('fs').appendFileSync('lifecycle.log', process.argv[2] + '\\n')\n",
+    );
+
+    let output = lpm_with_registry(&project, &mock.url())
+        .args([
+            "publish",
+            "--dry-run",
+            "--yes",
+            "--token",
+            "test-token-123",
+            "--lpm",
+        ])
+        .output()
+        .expect("run publish dry-run with lifecycle scripts");
+
+    assert!(
+        output.status.success(),
+        "publish dry-run failed\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    assert_eq!(
+        project.read_file("lifecycle.log"),
+        "prepublishOnly\nprepack\nprepare\npostpack\npublish\npostpublish\n",
+    );
+}
+
+#[tokio::test]
+async fn successful_publish_executes_publish_lifecycle_scripts_in_npm_order() {
+    let mock = MockRegistry::start().await;
+    mock.with_publish_endpoint().await;
+    mock.with_whoami("testuser", "test@example.com").await;
+    let project = TempProject::empty(
+        r#"{
+  "name": "@lpm.dev/testuser.successful-publish-lifecycle",
+  "version": "1.0.0",
+  "description": "Successful publish lifecycle ordering fixture",
+  "main": "index.js",
+  "license": "MIT",
+  "scripts": {
+    "prepublishOnly": "node record-lifecycle.js prepublishOnly",
+    "prepack": "node record-lifecycle.js prepack",
+    "prepare": "node record-lifecycle.js prepare",
+    "postpack": "node record-lifecycle.js postpack",
+    "publish": "node record-lifecycle.js publish",
+    "postpublish": "node record-lifecycle.js postpublish"
+  }
+}"#,
+    );
+    project.write_file("index.js", "module.exports = {};\n");
+    project.write_file(
+        "record-lifecycle.js",
+        "require('fs').appendFileSync('lifecycle.log', process.argv[2] + '\\n')\n",
+    );
+
+    let output = lpm_with_registry(&project, &mock.url())
+        .args(["publish", "--yes", "--token", "test-token-123", "--lpm"])
+        .output()
+        .expect("run successful publish with lifecycle scripts");
+
+    assert!(
+        output.status.success(),
+        "publish failed\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    assert_eq!(
+        project.read_file("lifecycle.log"),
+        "prepublishOnly\nprepack\nprepare\npostpack\npublish\npostpublish\n",
+    );
+}
+
+#[tokio::test]
+async fn failing_prepack_lifecycle_stops_publish_before_upload() {
+    let mock = MockRegistry::start().await;
+    let project = TempProject::empty(
+        r#"{
+  "name": "@lpm.dev/testuser.failing-publish-lifecycle",
+  "version": "1.0.0",
+  "description": "Failing publish lifecycle fixture",
+  "main": "index.js",
+  "license": "MIT",
+  "scripts": {
+    "prepublishOnly": "node record-lifecycle.js prepublishOnly",
+    "prepack": "node record-lifecycle.js prepack --fail",
+    "postpack": "node record-lifecycle.js postpack",
+    "publish": "node record-lifecycle.js publish"
+  }
+}"#,
+    );
+    project.write_file("index.js", "module.exports = {};\n");
+    project.write_file(
+        "record-lifecycle.js",
+        "require('fs').appendFileSync('lifecycle.log', process.argv[2] + '\\n'); if (process.argv[3] === '--fail') process.exit(17);\n",
+    );
+
+    let output = lpm_with_registry(&project, &mock.url())
+        .args(["publish", "--yes", "--token", "test-token-123", "--lpm"])
+        .output()
+        .expect("run publish with a failing prepack lifecycle");
+
+    assert!(
+        !output.status.success(),
+        "failing prepack must fail publish"
+    );
+    assert_eq!(
+        project.read_file("lifecycle.log"),
+        "prepublishOnly\nprepack\n",
+    );
+    assert!(
+        mock.server()
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .all(|request| request.method.as_str() != "PUT"),
+        "publish must not upload after a failed prepack lifecycle",
+    );
+}
+
+#[tokio::test]
+async fn publish_json_refuses_lifecycle_scripts_without_an_explicit_choice() {
+    let mock = MockRegistry::start().await;
+    let project = TempProject::empty(
+        r#"{
+  "name": "@lpm.dev/testuser.publish-lifecycle-consent",
+  "version": "1.0.0",
+  "main": "index.js",
+  "scripts": {"prepack": "node write-marker.js"}
+}"#,
+    );
+    project.write_file("index.js", "module.exports = {};\n");
+    project.write_file(
+        "write-marker.js",
+        "require('fs').writeFileSync('lifecycle-ran', 'yes')\n",
+    );
+
+    let output = lpm_with_registry(&project, &mock.url())
+        .args([
+            "--json",
+            "publish",
+            "--dry-run",
+            "--token",
+            "test-token-123",
+            "--lpm",
+        ])
+        .output()
+        .expect("run non-interactive publish with lifecycle scripts");
+
+    assert!(
+        !output.status.success(),
+        "explicit consent must be required"
+    );
+    assert!(
+        !project.path().join("lifecycle-ran").exists(),
+        "no lifecycle script may run before consent",
+    );
+    let envelope = parse_json_output(&output.stdout);
+    let error = envelope["error"].as_str().unwrap_or_default();
+    assert!(
+        error.contains("--yes") && error.contains("--ignore-scripts"),
+        "the error must explain both explicit choices: {envelope}",
+    );
+}
+
+#[tokio::test]
+async fn publish_ignore_scripts_skips_every_publish_lifecycle_phase() {
+    let mock = MockRegistry::start().await;
+    let project = TempProject::empty(
+        r#"{
+  "name": "@lpm.dev/testuser.publish-ignore-lifecycle",
+  "version": "1.0.0",
+  "main": "index.js",
+  "scripts": {
+    "prepack": "node write-marker.js",
+    "postpublish": "node write-marker.js"
+  }
+}"#,
+    );
+    project.write_file("index.js", "module.exports = {};\n");
+    project.write_file(
+        "write-marker.js",
+        "require('fs').writeFileSync('lifecycle-ran', 'yes')\n",
+    );
+
+    let output = lpm_with_registry(&project, &mock.url())
+        .args([
+            "--json",
+            "publish",
+            "--dry-run",
+            "--ignore-scripts",
+            "--token",
+            "test-token-123",
+            "--lpm",
+        ])
+        .output()
+        .expect("run publish with lifecycle scripts disabled");
+
+    assert!(output.status.success(), "{output:?}");
+    assert!(
+        !project.path().join("lifecycle-ran").exists(),
+        "--ignore-scripts must suppress every lifecycle phase",
+    );
+}
+
+#[tokio::test]
+async fn publish_lifecycle_does_not_receive_dotenv_or_ambient_secrets() {
+    let mock = MockRegistry::start().await;
+    let project = TempProject::empty(
+        r#"{
+  "name": "@lpm.dev/testuser.publish-lifecycle-env",
+  "version": "1.0.0",
+  "main": "index.js",
+  "scripts": {"prepack": "node record-env.js"}
+}"#,
+    );
+    project.write_file("index.js", "module.exports = {};\n");
+    project.write_file(".env", "PUBLISH_DOTENV_SECRET=dotenv-secret\n");
+    project.write_file(
+        "record-env.js",
+        concat!(
+            "const fs = require('fs');\n",
+            "fs.writeFileSync('lifecycle-env', [\n",
+            "  process.env.PUBLISH_DOTENV_SECRET || 'absent',\n",
+            "  process.env.PUBLISH_AMBIENT_SECRET || 'absent'\n",
+            "].join('|'));\n",
+        ),
+    );
+
+    let output = lpm_with_registry(&project, &mock.url())
+        .env("PUBLISH_AMBIENT_SECRET", "ambient-secret")
+        .args([
+            "publish",
+            "--dry-run",
+            "--yes",
+            "--token",
+            "test-token-123",
+            "--lpm",
+        ])
+        .output()
+        .expect("run publish lifecycle with ambient secrets configured");
+
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(project.read_file("lifecycle-env"), "absent|absent");
+}
+
+#[tokio::test]
+async fn publish_lifecycle_cannot_write_outside_the_publish_project() {
+    let mock = MockRegistry::start().await;
+    let outside = tempfile::tempdir().unwrap();
+    let outside_marker = outside.path().join("lifecycle-escape");
+    let project = TempProject::empty(
+        r#"{
+  "name": "@lpm.dev/testuser.publish-lifecycle-containment",
+  "version": "1.0.0",
+  "main": "index.js",
+  "scripts": {"prepack": "node write-outside.js"}
+}"#,
+    );
+    project.write_file("index.js", "module.exports = {};\n");
+    project.write_file(
+        "write-outside.js",
+        &format!(
+            "require('fs').writeFileSync({}, 'escaped')\n",
+            serde_json::to_string(&outside_marker).unwrap(),
+        ),
+    );
+
+    let output = lpm_with_registry(&project, &mock.url())
+        .args([
+            "publish",
+            "--dry-run",
+            "--yes",
+            "--token",
+            "test-token-123",
+            "--lpm",
+        ])
+        .output()
+        .expect("run contained publish lifecycle");
+
+    assert!(
+        !output.status.success(),
+        "an external write must fail the script"
+    );
+    assert!(
+        !outside_marker.exists(),
+        "the lifecycle sandbox must deny writes outside the publish project",
+    );
+}
+
+#[tokio::test]
+async fn publish_json_preserves_successful_upload_results_when_postpublish_fails() {
+    let mock = MockRegistry::start().await;
+    mock.with_publish_endpoint().await;
+    mock.with_whoami("testuser", "test@example.com").await;
+    let project = TempProject::empty(
+        r#"{
+  "name": "@lpm.dev/testuser.postpublish-failure-result",
+  "version": "1.0.0",
+  "main": "index.js",
+  "scripts": {"postpublish": "node -e \"process.exit(17)\""}
+}"#,
+    );
+    project.write_file("index.js", "module.exports = {};\n");
+
+    let output = lpm_with_registry(&project, &mock.url())
+        .args([
+            "--json",
+            "publish",
+            "--yes",
+            "--token",
+            "test-token-123",
+            "--lpm",
+        ])
+        .output()
+        .expect("publish before a failing postpublish lifecycle");
+
+    assert!(
+        !output.status.success(),
+        "postpublish failure must fail the command"
+    );
+    let envelope = parse_json_output(&output.stdout);
+    assert_eq!(envelope["success"], serde_json::json!(false));
+    assert_eq!(envelope["results"][0]["success"], serde_json::json!(true));
+    assert!(
+        envelope["lifecycle_error"]
+            .as_str()
+            .is_some_and(|error| error.contains("postpublish")),
+        "the lifecycle failure must be separate from upload success: {envelope}",
+    );
+    assert!(
+        envelope["retry_warning"]
+            .as_str()
+            .is_some_and(|warning| warning.contains("already exist")),
+        "automation must be warned not to retry the uploaded version: {envelope}",
+    );
+}
+
 #[test]
 fn publish_check_with_authored_skills_leaves_project_files_unchanged() {
     let project = authored_skills_project("@lpm.dev/testuser.read-only-check");
@@ -357,7 +792,7 @@ fn publish_blocks_gitignored_secret_when_files_explicitly_selects_it() {
     );
 
     let output = lpm(&project)
-        .args(["publish", "--dry-run", "--yes", "--npm"])
+        .args(["publish", "--check", "--npm"])
         .output()
         .expect("run publish with selected gitignored secret");
 
@@ -388,7 +823,7 @@ fn publish_ignores_secret_outside_final_tarball_file_set() {
     );
 
     let output = lpm(&project)
-        .args(["publish", "--dry-run", "--yes", "--npm"])
+        .args(["publish", "--check", "--npm"])
         .output()
         .expect("run publish with an unselected secret");
 
@@ -444,7 +879,7 @@ fn publish_allow_secrets_bypasses_selected_file_scan() {
     );
 
     let output = lpm(&project)
-        .args(["publish", "--dry-run", "--yes", "--npm", "--allow-secrets"])
+        .args(["publish", "--check", "--npm", "--allow-secrets"])
         .output()
         .expect("run publish with allow-secrets");
 
@@ -487,6 +922,39 @@ fn publish_scans_manifest_bytes_after_lpm_target_name_rewrite() {
     assert!(
         stderr.contains("stripe_live_secret"),
         "the final rewritten manifest secret must be reported:\n{stderr}"
+    );
+}
+
+#[test]
+fn publish_reuses_the_base_secret_scan_for_unchanged_renamed_target_files() {
+    let project = TempProject::empty(
+        r#"{
+  "name": "source-package",
+  "version": "1.0.0",
+  "files": ["index.js"]
+}"#,
+    );
+    project.write_file(
+        "index.js",
+        r#"const password = "not-a-real-renamed-target-secret";"#,
+    );
+    project.write_file(
+        "lpm.json",
+        r#"{"publish":{"lpm":{"name":"@lpm.dev/testuser.renamed-base-scan"}}}"#,
+    );
+
+    let output = lpm(&project)
+        .args(["publish", "--dry-run", "--yes", "--lpm"])
+        .output()
+        .expect("run renamed publish with a secret in an unchanged file");
+
+    assert!(
+        !output.status.success(),
+        "an unchanged-file secret from the base scan must block a renamed target",
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("generic_password"),
+        "the reused base scan must report the unchanged-file secret: {output:?}",
     );
 }
 
@@ -896,6 +1364,135 @@ fn publish_check_rejects_private_package() {
 }
 
 #[test]
+fn publish_check_rejects_a_non_boolean_private_marker() {
+    assert_npm_publish_check_rejected(
+        r#"{
+  "name": "malformed-private-package",
+  "version": "1.0.0",
+  "private": "false",
+  "main": "index.js"
+}"#,
+        None,
+        "private",
+    );
+}
+
+#[test]
+fn publish_check_rejects_non_string_dependency_ranges() {
+    assert_npm_publish_check_rejected(
+        r#"{
+  "name": "malformed-dependency-range",
+  "version": "1.0.0",
+  "dependencies": {"left-pad": {"version": "1.0.0"}},
+  "main": "index.js"
+}"#,
+        None,
+        "dependencies",
+    );
+}
+
+#[test]
+fn publish_rejects_minimum_quality_score_outside_the_percentage_range() {
+    let project = TempProject::empty(
+        r#"{
+  "name": "@lpm.dev/testuser.invalid-minimum-score",
+  "version": "1.0.0",
+  "main": "index.js"
+}"#,
+    );
+    project.write_file("index.js", "module.exports = {};");
+
+    let output = lpm(&project)
+        .args(["publish", "--check", "--lpm", "--min-score", "101"])
+        .output()
+        .expect("run publish with an invalid minimum score");
+
+    assert!(
+        !output.status.success(),
+        "scores above 100 must be rejected"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("invalid value") && stderr.contains("0..=100"),
+        "the parser error must state the percentage bound: {output:?}",
+    );
+}
+
+#[test]
+fn publish_rejects_minimum_quality_score_without_an_lpm_target() {
+    let project = TempProject::empty(
+        r#"{
+  "name": "npm-only-minimum-score",
+  "version": "1.0.0",
+  "main": "index.js"
+}"#,
+    );
+    project.write_file("index.js", "module.exports = {};");
+
+    let output = lpm(&project)
+        .args(["publish", "--check", "--npm", "--min-score", "0"])
+        .output()
+        .expect("run npm-only publish with a minimum score");
+
+    assert!(
+        !output.status.success(),
+        "npm-only publish must not silently ignore --min-score",
+    );
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    assert!(
+        combined.contains("--min-score") && combined.contains("LPM"),
+        "the error must explain which target enforces the score: {combined}",
+    );
+}
+
+#[test]
+fn publish_rejects_a_catalog_dependency_without_a_matching_catalog_entry() {
+    let project = TempProject::empty(
+        r#"{
+  "name": "missing-publish-catalog-workspace",
+  "version": "1.0.0",
+  "private": true
+}"#,
+    );
+    project.write_file("pnpm-workspace.yaml", "packages:\n  - packages/*\n");
+    project.write_file(
+        "packages/lib/package.json",
+        r#"{
+  "name": "missing-publish-catalog-entry",
+  "version": "1.0.0",
+  "dependencies": {"left-pad": "catalog:"},
+  "main": "index.js"
+}"#,
+    );
+    project.write_file("packages/lib/index.js", "module.exports = {};");
+
+    let mut command = lpm(&project);
+    command.current_dir(project.path().join("packages/lib"));
+    let output = command
+        .args(["publish", "--check", "--npm"])
+        .output()
+        .expect("run publish check with an unresolved catalog dependency");
+
+    assert!(
+        !output.status.success(),
+        "publish must not upload unresolved catalog protocol references",
+    );
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    assert!(
+        combined.contains("catalog") && combined.contains("left-pad"),
+        "the error must identify the missing catalog dependency: {combined}",
+    );
+}
+
+#[test]
 fn publish_check_rejects_restricted_unscoped_npm_package() {
     assert_npm_publish_check_rejected(
         r#"{
@@ -1099,8 +1696,558 @@ async fn publish_to_mock_registry_succeeds() {
     );
 }
 
+#[cfg(unix)]
 #[tokio::test]
-async fn publish_releases_the_install_lock_before_uploading() {
+async fn publish_preserves_authored_executable_bits_in_the_uploaded_tarball() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let mock = MockRegistry::start().await;
+    mock.with_publish_endpoint().await;
+    mock.with_whoami("testuser", "test@example.com").await;
+    let project = TempProject::empty(
+        r#"{
+  "name": "@lpm.dev/testuser.executable-mode",
+  "version": "1.0.0",
+  "description": "Executable mode publish fixture",
+  "bin": {"mode-check": "bin/mode-check"},
+  "files": ["bin/mode-check", "lib/data.txt"],
+  "license": "MIT"
+}"#,
+    );
+    project.write_file("bin/mode-check", "#!/bin/sh\nexit 0\n");
+    project.write_file("lib/data.txt", "ordinary package data\n");
+    std::fs::set_permissions(
+        project.path().join("bin/mode-check"),
+        std::fs::Permissions::from_mode(0o755),
+    )
+    .expect("mark authored binary executable");
+    std::fs::set_permissions(
+        project.path().join("lib/data.txt"),
+        std::fs::Permissions::from_mode(0o666),
+    )
+    .expect("mark authored data file writable");
+
+    let output = lpm_with_registry(&project, &mock.url())
+        .args(["publish", "--yes", "--token", "test-token-123", "--lpm"])
+        .output()
+        .expect("publish a package with an executable");
+
+    assert!(
+        output.status.success(),
+        "publish failed\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let requests = mock.server().received_requests().await.unwrap();
+    let upload = requests
+        .iter()
+        .find(|request| request.method.as_str() == "PUT")
+        .expect("publish must upload a tarball");
+    let tarball_data = extract_lpm_upload_tarball(upload);
+    assert_eq!(
+        extract_uploaded_file_mode(&tarball_data, "package/bin/mode-check") & 0o777,
+        0o755,
+        "the uploaded binary must retain its authored execute bits",
+    );
+    assert_eq!(
+        extract_uploaded_file_mode(&tarball_data, "package/lib/data.txt") & 0o777,
+        0o644,
+        "the uploaded data file must not retain group or world write bits",
+    );
+}
+
+#[tokio::test]
+async fn publish_quality_metadata_uses_the_detected_ecosystem() {
+    let mock = MockRegistry::start().await;
+    mock.with_publish_endpoint().await;
+    mock.with_whoami("testuser", "test@example.com").await;
+    let project = TempProject::empty(
+        r#"{
+  "name": "@lpm.dev/testuser.quality-ecosystem",
+  "version": "1.0.0",
+  "description": "Quality ecosystem publish fixture",
+  "main": "index.py",
+  "license": "MIT"
+}"#,
+    );
+    project.write_file("index.py", "VALUE = 1\n");
+    project.write_file("README.md", "# Quality ecosystem\n");
+    project.write_file("lpm.config.json", r#"{"ecosystem":"swift"}"#);
+
+    let output = lpm_with_registry(&project, &mock.url())
+        .args(["publish", "--yes", "--token", "test-token-123", "--lpm"])
+        .output()
+        .expect("publish a non-JavaScript package");
+
+    assert!(
+        output.status.success(),
+        "publish failed\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let requests = mock.server().received_requests().await.unwrap();
+    let upload = requests
+        .iter()
+        .find(|request| request.method.as_str() == "PUT")
+        .expect("publish must upload package metadata");
+    let payload: serde_json::Value = serde_json::from_slice(&upload.body).unwrap();
+    assert_eq!(
+        payload["versions"]["1.0.0"]["_qualityMeta"]["ecosystem"],
+        serde_json::json!("swift"),
+    );
+}
+
+#[tokio::test]
+async fn publish_applies_nested_npmignore_without_a_root_ignore_file() {
+    let mock = MockRegistry::start().await;
+    mock.with_publish_endpoint().await;
+    mock.with_whoami("testuser", "test@example.com").await;
+    let project = TempProject::empty(
+        r#"{
+  "name": "@lpm.dev/testuser.nested-ignore",
+  "version": "1.0.0",
+  "description": "Nested ignore publish fixture",
+  "main": "index.js",
+  "license": "MIT"
+}"#,
+    );
+    project.write_file("index.js", "module.exports = {};");
+    project.write_file("nested/.npmignore", "excluded.js\n");
+    project.write_file("nested/included.js", "module.exports = 'included';\n");
+    project.write_file("nested/excluded.js", "module.exports = 'excluded';\n");
+
+    let output = lpm_with_registry(&project, &mock.url())
+        .args(["publish", "--yes", "--token", "test-token-123", "--lpm"])
+        .output()
+        .expect("publish a package with only a nested ignore file");
+
+    assert!(output.status.success(), "{output:?}");
+    let requests = mock.server().received_requests().await.unwrap();
+    let upload = requests
+        .iter()
+        .find(|request| request.method.as_str() == "PUT")
+        .expect("publish must upload a tarball");
+    let paths = uploaded_file_paths(&extract_lpm_upload_tarball(upload));
+    assert!(
+        paths
+            .iter()
+            .any(|path| path == "package/nested/included.js")
+    );
+    assert!(
+        !paths
+            .iter()
+            .any(|path| path == "package/nested/excluded.js"),
+        "the nested .npmignore must exclude its matching file: {paths:?}",
+    );
+}
+
+#[tokio::test]
+async fn publish_uses_publish_config_directory_as_the_artifact_root() {
+    let mock = MockRegistry::start().await;
+    mock.with_publish_endpoint().await;
+    mock.with_whoami("testuser", "test@example.com").await;
+    let project = TempProject::empty(
+        r#"{
+  "name": "@lpm.dev/testuser.publish-projection",
+  "version": "1.0.0",
+  "description": "Source package outside the publish projection",
+  "main": "root-only.js",
+  "files": ["root-only.js"],
+  "publishConfig": {"directory": "dist"},
+  "license": "MIT"
+}"#,
+    );
+    project.write_file("root-only.js", "module.exports = 'root';\n");
+    project.write_file(
+        "dist/package.json",
+        r#"{
+  "name": "@lpm.dev/testuser.publish-projection",
+  "version": "1.0.0",
+  "description": "Projected publish package",
+  "main": "projected.js",
+  "files": ["projected.js"],
+  "license": "MIT"
+}"#,
+    );
+    project.write_file("dist/projected.js", "module.exports = 'projected';\n");
+
+    let output = lpm_with_registry(&project, &mock.url())
+        .args(["publish", "--yes", "--token", "test-token-123", "--lpm"])
+        .output()
+        .expect("publish a projected package directory");
+
+    assert!(output.status.success(), "{output:?}");
+    let requests = mock.server().received_requests().await.unwrap();
+    let upload = requests
+        .iter()
+        .find(|request| request.method.as_str() == "PUT")
+        .expect("publish must upload a tarball");
+    let tarball = extract_lpm_upload_tarball(upload);
+    let paths = uploaded_file_paths(&tarball);
+    assert!(paths.iter().any(|path| path == "package/projected.js"));
+    assert!(
+        !paths.iter().any(|path| path == "package/root-only.js"),
+        "the source package must not leak into the projection: {paths:?}",
+    );
+    let manifest = extract_uploaded_package_json(&tarball);
+    assert_eq!(manifest["description"], "Projected publish package");
+}
+
+#[tokio::test]
+async fn publish_projection_uses_root_lpm_configuration_and_packages_projection_lpm_json() {
+    let mock = MockRegistry::start().await;
+    mock.with_publish_endpoint().await;
+    mock.with_whoami("testuser", "test@example.com").await;
+    let project = TempProject::empty(
+        r#"{
+  "name": "@lpm.dev/testuser.publish-projection-source",
+  "version": "1.0.0",
+  "publishConfig": {"directory": "dist"}
+}"#,
+    );
+    project.write_file(
+        "lpm.json",
+        r#"{"publish":{"lpm":{"name":"@lpm.dev/testuser.publish-projection-target"}}}"#,
+    );
+    project.write_file(
+        "dist/package.json",
+        r#"{
+  "name": "@lpm.dev/testuser.publish-projection-artifact",
+  "version": "1.0.0",
+  "main": "index.js",
+  "license": "MIT"
+}"#,
+    );
+    project.write_file(
+        "dist/lpm.json",
+        r#"{"publish":{"lpm":{"name":"@lpm.dev/testuser.projection-local-setting"}}}"#,
+    );
+    project.write_file("dist/index.js", "module.exports = 'projected';\n");
+
+    let output = lpm_with_registry(&project, &mock.url())
+        .args(["publish", "--yes", "--token", "test-token-123"])
+        .output()
+        .expect("publish a projection with separate root and artifact lpm.json files");
+
+    assert!(output.status.success(), "{output:?}");
+    let requests = mock.server().received_requests().await.unwrap();
+    let upload = requests
+        .iter()
+        .find(|request| request.method.as_str() == "PUT")
+        .expect("publish must upload the projected artifact");
+    let payload: serde_json::Value = serde_json::from_slice(&upload.body).unwrap();
+    assert!(
+        payload["versions"]["1.0.0"]["name"]
+            .as_str()
+            .is_some_and(|name| name == "@lpm.dev/testuser.publish-projection-target"),
+        "root lpm.json must remain authoritative for target naming: {payload}",
+    );
+    let tarball = extract_lpm_upload_tarball(upload);
+    assert_eq!(
+        extract_uploaded_file(&tarball, "package/lpm.json"),
+        br#"{"publish":{"lpm":{"name":"@lpm.dev/testuser.projection-local-setting"}}}"#,
+        "the artifact must contain the projection-local lpm.json",
+    );
+}
+
+#[test]
+fn publish_projection_resolves_root_provenance_file_against_the_source_package() {
+    let project = TempProject::empty(
+        r#"{
+  "name": "projected-provenance-source",
+  "version": "1.0.0",
+  "publishConfig": {
+    "directory": "dist",
+    "provenance-file": "bundle.sigstore"
+  }
+}"#,
+    );
+    project.write_file("bundle.sigstore", "not valid provenance json");
+    project.write_file(
+        "dist/package.json",
+        r#"{
+  "name": "projected-provenance-artifact",
+  "version": "1.0.0",
+  "main": "index.js"
+}"#,
+    );
+    project.write_file("dist/index.js", "module.exports = {};\n");
+
+    let output = lpm(&project)
+        .args(["--json", "publish", "--check", "--npm"])
+        .output()
+        .expect("check projection provenance selected by the source manifest");
+
+    assert!(
+        !output.status.success(),
+        "invalid root provenance must fail"
+    );
+    let envelope = parse_json_output(&output.stdout);
+    assert!(
+        envelope["error"]
+            .as_str()
+            .is_some_and(|error| error.contains("invalid provenance file")),
+        "root-relative provenance must be loaded before check succeeds: {envelope}",
+    );
+}
+
+#[test]
+fn publish_projection_keeps_root_provenance_generation_configuration() {
+    let project = TempProject::empty(
+        r#"{
+  "name": "@test/projected-provenance-source",
+  "version": "1.0.0",
+  "publishConfig": {
+    "directory": "dist",
+    "provenance": true
+  }
+}"#,
+    );
+    project.write_file("lpm.json", r#"{"publish":{"npm":{"access":"restricted"}}}"#);
+    project.write_file(
+        "dist/package.json",
+        r#"{
+  "name": "@test/projected-provenance-artifact",
+  "version": "1.0.0",
+  "main": "index.js",
+  "publishConfig": {"provenance": false}
+}"#,
+    );
+    project.write_file("dist/index.js", "module.exports = {};\n");
+
+    let output = lpm(&project)
+        .args(["--json", "publish", "--check", "--npm"])
+        .output()
+        .expect("check projected package with root provenance generation");
+
+    assert!(
+        !output.status.success(),
+        "root provenance configuration must remain authoritative",
+    );
+    let envelope = parse_json_output(&output.stdout);
+    assert!(
+        envelope["error"]
+            .as_str()
+            .is_some_and(|error| error.contains("npm provenance requires public access")),
+        "root provenance generation must be validated against root target configuration: {envelope}",
+    );
+}
+
+#[test]
+fn publish_rejects_an_absolute_publish_config_directory() {
+    let project = TempProject::empty(
+        r#"{
+  "name": "absolute-publish-projection",
+  "version": "1.0.0",
+  "publishConfig": {"directory": "/tmp/outside"}
+}"#,
+    );
+
+    let output = lpm(&project)
+        .args(["publish", "--check", "--lpm"])
+        .output()
+        .expect("check an absolute publish projection");
+
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("inside the package directory"),
+        "unexpected projection error: {output:?}",
+    );
+}
+
+#[test]
+fn publish_rejects_a_parent_traversing_publish_config_directory() {
+    let project = TempProject::empty(
+        r#"{
+  "name": "parent-publish-projection",
+  "version": "1.0.0",
+  "publishConfig": {"directory": "../outside"}
+}"#,
+    );
+
+    let output = lpm(&project)
+        .args(["publish", "--check", "--lpm"])
+        .output()
+        .expect("check a parent-traversing publish projection");
+
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("inside the package directory"),
+        "unexpected projection error: {output:?}",
+    );
+}
+
+#[test]
+fn publish_rejects_a_projection_without_package_json() {
+    let project = TempProject::empty(
+        r#"{
+  "name": "missing-manifest-publish-projection",
+  "version": "1.0.0",
+  "publishConfig": {"directory": "dist"}
+}"#,
+    );
+    std::fs::create_dir(project.path().join("dist")).unwrap();
+
+    let output = lpm(&project)
+        .args(["publish", "--check", "--lpm"])
+        .output()
+        .expect("check a projection without package.json");
+
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("package.json"),
+        "unexpected projection error: {output:?}",
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn publish_rejects_a_symlinked_publish_config_directory() {
+    let project = TempProject::empty(
+        r#"{
+  "name": "symlinked-publish-projection",
+  "version": "1.0.0",
+  "publishConfig": {"directory": "dist"}
+}"#,
+    );
+    let outside = tempfile::tempdir().unwrap();
+    std::fs::write(
+        outside.path().join("package.json"),
+        r#"{"name":"outside-projection","version":"1.0.0"}"#,
+    )
+    .unwrap();
+    std::os::unix::fs::symlink(outside.path(), project.path().join("dist")).unwrap();
+
+    let output = lpm(&project)
+        .args(["publish", "--check", "--lpm"])
+        .output()
+        .expect("check a symlinked publish projection");
+
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("safe directory"),
+        "unexpected projection error: {output:?}",
+    );
+}
+
+#[tokio::test]
+async fn publish_implicit_file_set_keeps_runtime_directories_named_private() {
+    let mock = MockRegistry::start().await;
+    mock.with_publish_endpoint().await;
+    mock.with_whoami("testuser", "test@example.com").await;
+    let project = TempProject::empty(
+        r#"{
+  "name": "@lpm.dev/testuser.private-runtime",
+  "version": "1.0.0",
+  "description": "Runtime private directory publish fixture",
+  "main": "index.js",
+  "license": "MIT"
+}"#,
+    );
+    project.write_file(
+        "index.js",
+        "module.exports = require('./private/runtime');\n",
+    );
+    project.write_file("private/runtime.js", "module.exports = 'runtime';\n");
+
+    let output = lpm_with_registry(&project, &mock.url())
+        .args(["publish", "--yes", "--token", "test-token-123", "--lpm"])
+        .output()
+        .expect("publish a package with a private runtime directory");
+
+    assert!(output.status.success(), "{output:?}");
+    let requests = mock.server().received_requests().await.unwrap();
+    let upload = requests
+        .iter()
+        .find(|request| request.method.as_str() == "PUT")
+        .expect("publish must upload a tarball");
+    let paths = uploaded_file_paths(&extract_lpm_upload_tarball(upload));
+    assert!(
+        paths
+            .iter()
+            .any(|path| path == "package/private/runtime.js"),
+        "an ordinary runtime directory must not be silently excluded: {paths:?}",
+    );
+}
+
+#[tokio::test]
+async fn publish_always_includes_readme_and_license_filename_variants() {
+    let mock = MockRegistry::start().await;
+    mock.with_publish_endpoint().await;
+    mock.with_whoami("testuser", "test@example.com").await;
+    let project = TempProject::empty(
+        r#"{
+  "name": "@lpm.dev/testuser.required-doc-variants",
+  "version": "1.0.0",
+  "description": "Required documentation variants fixture",
+  "main": "index.js",
+  "files": ["index.js"],
+  "license": "MIT"
+}"#,
+    );
+    project.write_file("index.js", "module.exports = {};\n");
+    project.write_file("ReadMe.rst", "Required README variant\n");
+    project.write_file("LICENCE.txt", "Required licence variant\n");
+
+    let output = lpm_with_registry(&project, &mock.url())
+        .args(["publish", "--yes", "--token", "test-token-123", "--lpm"])
+        .output()
+        .expect("publish required documentation variants");
+
+    assert!(output.status.success(), "{output:?}");
+    let requests = mock.server().received_requests().await.unwrap();
+    let upload = requests
+        .iter()
+        .find(|request| request.method.as_str() == "PUT")
+        .expect("publish must upload a tarball");
+    let payload: serde_json::Value =
+        serde_json::from_slice(&upload.body).expect("publish request body must be valid JSON");
+    assert_eq!(
+        payload["readme"], "Required README variant\n",
+        "the always-included README variant must also populate registry metadata",
+    );
+    let paths = uploaded_file_paths(&extract_lpm_upload_tarball(upload));
+    assert!(paths.iter().any(|path| path == "package/ReadMe.rst"));
+    assert!(paths.iter().any(|path| path == "package/LICENCE.txt"));
+}
+
+#[tokio::test]
+async fn publish_files_patterns_support_npm_brace_alternatives() {
+    let mock = MockRegistry::start().await;
+    mock.with_publish_endpoint().await;
+    mock.with_whoami("testuser", "test@example.com").await;
+    let project = TempProject::empty(
+        r#"{
+  "name": "@lpm.dev/testuser.brace-files",
+  "version": "1.0.0",
+  "description": "npm brace pattern publish fixture",
+  "files": ["dist/*.{js,ts}"],
+  "license": "MIT"
+}"#,
+    );
+    project.write_file("dist/index.js", "module.exports = {};\n");
+    project.write_file("dist/index.ts", "export const value = 1;\n");
+    project.write_file("dist/index.css", "body {}\n");
+
+    let output = lpm_with_registry(&project, &mock.url())
+        .args(["publish", "--yes", "--token", "test-token-123", "--lpm"])
+        .output()
+        .expect("publish files selected by a brace pattern");
+
+    assert!(output.status.success(), "{output:?}");
+    let requests = mock.server().received_requests().await.unwrap();
+    let upload = requests
+        .iter()
+        .find(|request| request.method.as_str() == "PUT")
+        .expect("publish must upload a tarball");
+    let paths = uploaded_file_paths(&extract_lpm_upload_tarball(upload));
+    assert!(paths.iter().any(|path| path == "package/dist/index.js"));
+    assert!(paths.iter().any(|path| path == "package/dist/index.ts"));
+    assert!(!paths.iter().any(|path| path == "package/dist/index.css"));
+}
+
+#[tokio::test]
+async fn publish_holds_the_exclusive_install_lock_through_upload_and_lifecycle_completion() {
     let mock = MockRegistry::start().await;
     mock.with_whoami("testuser", "test@example.com").await;
     Mock::given(method("PUT"))
@@ -1167,8 +2314,8 @@ async fn publish_releases_the_install_lock_before_uploading() {
         String::from_utf8_lossy(&output.stderr),
     );
     assert!(
-        available_during_upload,
-        "the project install lock must not cover network upload time"
+        !available_during_upload,
+        "publish lifecycle state must remain exclusively locked until the transaction completes"
     );
 }
 
@@ -1816,6 +2963,67 @@ catalog:
         ),
         (Some("^2.1.3"), Some("^2.1.3"))
     );
+}
+
+#[tokio::test]
+async fn publish_npm_trims_a_trailing_registry_slash_before_building_the_put_path() {
+    const PACKAGE: &str = "trailing-registry-slash";
+    let mock = MockRegistry::start().await;
+    Mock::given(method("PUT"))
+        .and(path(format!("/{PACKAGE}")))
+        .and(header(
+            "authorization",
+            format!("Bearer {CUSTOM_REGISTRY_TOKEN}"),
+        ))
+        .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({})))
+        .expect(1)
+        .mount(mock.server())
+        .await;
+    let registry = format!("{}/", mock.url());
+    let project = TempProject::empty(&format!(
+        r#"{{
+  "name": "{PACKAGE}",
+  "version": "1.0.0",
+  "description": "Trailing registry slash fixture",
+  "main": "index.js",
+  "license": "MIT"
+}}"#,
+    ));
+    project.write_file("index.js", "module.exports = {};");
+    project.write_file(
+        "lpm.json",
+        &format!(r#"{{"publish":{{"npm":{{"registry":"{registry}"}}}}}}"#),
+    );
+    let login = lpm(&project)
+        .args([
+            "--json",
+            "login",
+            "--login-registry",
+            &registry,
+            "--token",
+            CUSTOM_REGISTRY_TOKEN,
+        ])
+        .output()
+        .expect("store a trailing-slash registry token");
+    assert!(login.status.success(), "{login:?}");
+
+    let output = lpm(&project)
+        .args(["--json", "publish", "--npm", "--yes"])
+        .output()
+        .expect("publish to a registry configured with a trailing slash");
+
+    assert!(
+        output.status.success(),
+        "publish failed\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let requests = mock.server().received_requests().await.unwrap();
+    let upload = requests
+        .iter()
+        .find(|request| request.method.as_str() == "PUT")
+        .expect("npm publish must send one PUT");
+    assert_eq!(upload.url.path(), format!("/{PACKAGE}"));
 }
 
 #[tokio::test]
@@ -2714,8 +3922,19 @@ fn publish_multi_target_flags_accepted() {
     );
 }
 
-#[test]
-fn publish_custom_registry_dry_run_json_redacts_registry_path() {
+#[tokio::test]
+async fn publish_custom_registry_dry_run_json_redacts_registry_path() {
+    let mock = MockRegistry::start().await;
+    Mock::given(method("GET"))
+        .and(path("/npm/private/custom-publish-pkg"))
+        .and(header(
+            "authorization",
+            format!("Bearer {CUSTOM_REGISTRY_TOKEN}"),
+        ))
+        .respond_with(ResponseTemplate::new(404))
+        .expect(1)
+        .mount(mock.server())
+        .await;
     let project = TempProject::empty(
         r#"{
         "name": "custom-publish-pkg",
@@ -2728,12 +3947,24 @@ fn publish_custom_registry_dry_run_json_redacts_registry_path() {
 
     project.write_file("index.js", "module.exports = {}");
 
-    let registry_url = "https://packages.example.test/npm";
+    let registry_url = format!("{}/npm/private", mock.url());
+    let login = lpm(&project)
+        .args([
+            "--json",
+            "login",
+            "--login-registry",
+            &registry_url,
+            "--token",
+            CUSTOM_REGISTRY_TOKEN,
+        ])
+        .output()
+        .expect("store the custom registry token");
+    assert!(login.status.success(), "{login:?}");
     let output = lpm(&project)
         .args([
             "publish",
             "--publish-registry",
-            registry_url,
+            &registry_url,
             "--dry-run",
             "--yes",
             "--json",
@@ -2762,10 +3993,7 @@ fn publish_custom_registry_dry_run_json_redacts_registry_path() {
         .as_array()
         .expect("targets must be an array");
     assert_eq!(targets.len(), 1, "custom dry-run should resolve one target");
-    assert_eq!(
-        targets[0]["registry"],
-        serde_json::json!("https://packages.example.test")
-    );
+    assert_eq!(targets[0]["registry"], serde_json::json!(mock.url()));
     assert_eq!(targets[0]["name"], serde_json::json!("custom-publish-pkg"));
 }
 
@@ -2820,11 +4048,12 @@ fn publish_custom_registry_dry_run_rejects_http_cli_url() {
 // ─── --github / --gitlab provider flags ───────────────────────────────
 //
 // The github/gitlab targets eventually hit GitHub Packages and GitLab
-// Packages. Workflow tests cover the dry-run plan envelope only (the
-// target enum is resolved without doing any network).
+// Packages. Check-mode workflow tests cover target resolution without
+// contacting those external registries; dry-run remote preflight is covered
+// with deterministic npm-compatible mocks above.
 
 #[test]
-fn publish_github_dry_run_resolves_github_target_in_json_envelope() {
+fn publish_github_check_resolves_github_target_in_json_envelope() {
     let project = TempProject::empty(
         r#"{
         "name": "@my-org/gh-pkg",
@@ -2837,13 +4066,13 @@ fn publish_github_dry_run_resolves_github_target_in_json_envelope() {
     project.write_file("index.js", "module.exports = {}");
 
     let output = lpm(&project)
-        .args(["--json", "publish", "--dry-run", "--yes", "--github"])
+        .args(["--json", "publish", "--check", "--github"])
         .output()
-        .expect("failed to run lpm publish --github --dry-run");
+        .expect("failed to run lpm publish --github --check");
 
     assert!(
         output.status.success(),
-        "publish --github --dry-run --json must succeed\nstderr: {}",
+        "publish --github --check --json must succeed\nstderr: {}",
         String::from_utf8_lossy(&output.stderr),
     );
 
@@ -2851,7 +4080,7 @@ fn publish_github_dry_run_resolves_github_target_in_json_envelope() {
     let envelope: serde_json::Value = serde_json::from_str(&stdout)
         .unwrap_or_else(|e| panic!("publish --json must be valid JSON: {e}\n---\n{stdout}"));
 
-    assert_eq!(envelope["dry_run"], serde_json::json!(true));
+    assert_eq!(envelope["check"], serde_json::json!(true));
     let targets = envelope["targets"]
         .as_array()
         .expect("targets must be an array");
@@ -2864,7 +4093,7 @@ fn publish_github_dry_run_resolves_github_target_in_json_envelope() {
 }
 
 #[test]
-fn publish_gitlab_dry_run_resolves_gitlab_target_in_json_envelope() {
+fn publish_gitlab_check_resolves_gitlab_target_in_json_envelope() {
     let project = TempProject::empty(
         r#"{
         "name": "@my-org/gl-pkg",
@@ -2884,13 +4113,13 @@ fn publish_gitlab_dry_run_resolves_gitlab_target_in_json_envelope() {
     );
 
     let output = lpm(&project)
-        .args(["--json", "publish", "--dry-run", "--yes", "--gitlab"])
+        .args(["--json", "publish", "--check", "--gitlab"])
         .output()
-        .expect("failed to run lpm publish --gitlab --dry-run");
+        .expect("failed to run lpm publish --gitlab --check");
 
     assert!(
         output.status.success(),
-        "publish --gitlab --dry-run --json must succeed\nstderr: {}",
+        "publish --gitlab --check --json must succeed\nstderr: {}",
         String::from_utf8_lossy(&output.stderr),
     );
 
@@ -2910,7 +4139,7 @@ fn publish_gitlab_dry_run_resolves_gitlab_target_in_json_envelope() {
 }
 
 #[test]
-fn publish_npm_dry_run_resolves_npm_target_in_json_envelope() {
+fn publish_npm_check_resolves_npm_target_in_json_envelope() {
     let project = TempProject::empty(
         r#"{
         "name": "@my-org/npm-pkg",
@@ -2923,13 +4152,13 @@ fn publish_npm_dry_run_resolves_npm_target_in_json_envelope() {
     project.write_file("index.js", "module.exports = {}");
 
     let output = lpm(&project)
-        .args(["--json", "publish", "--dry-run", "--yes", "--npm"])
+        .args(["--json", "publish", "--check", "--npm"])
         .output()
-        .expect("failed to run lpm publish --npm --dry-run");
+        .expect("failed to run lpm publish --npm --check");
 
     assert!(
         output.status.success(),
-        "publish --npm --dry-run --json must succeed\nstderr: {}",
+        "publish --npm --check --json must succeed\nstderr: {}",
         String::from_utf8_lossy(&output.stderr),
     );
 
@@ -2937,7 +4166,7 @@ fn publish_npm_dry_run_resolves_npm_target_in_json_envelope() {
     let envelope: serde_json::Value = serde_json::from_str(&stdout)
         .unwrap_or_else(|e| panic!("publish --json must be valid JSON: {e}\n---\n{stdout}"));
 
-    assert_eq!(envelope["dry_run"], serde_json::json!(true));
+    assert_eq!(envelope["check"], serde_json::json!(true));
     let targets = envelope["targets"]
         .as_array()
         .expect("targets must be an array");
@@ -2950,7 +4179,7 @@ fn publish_npm_dry_run_resolves_npm_target_in_json_envelope() {
 }
 
 #[test]
-fn publish_github_and_gitlab_together_yields_two_targets() {
+fn publish_github_and_gitlab_check_yields_two_targets() {
     let project = TempProject::empty(
         r#"{
         "name": "@my-org/multi-pkg",
@@ -2967,21 +4196,11 @@ fn publish_github_and_gitlab_together_yields_two_targets() {
     );
 
     let output = lpm(&project)
-        .args([
-            "--json",
-            "publish",
-            "--dry-run",
-            "--yes",
-            "--github",
-            "--gitlab",
-        ])
+        .args(["--json", "publish", "--check", "--github", "--gitlab"])
         .output()
-        .expect("failed to run lpm publish --github --gitlab --dry-run");
+        .expect("failed to run lpm publish --github --gitlab --check");
 
-    assert!(
-        output.status.success(),
-        "multi-provider dry-run must succeed"
-    );
+    assert!(output.status.success(), "multi-provider check must succeed");
 
     let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
     let envelope: serde_json::Value = serde_json::from_str(&stdout).unwrap();
@@ -3001,6 +4220,62 @@ fn publish_github_and_gitlab_together_yields_two_targets() {
 fn extract_uploaded_package_json(tarball_data: &[u8]) -> serde_json::Value {
     let content = extract_uploaded_file(tarball_data, "package/package.json");
     serde_json::from_slice(&content).expect("published package.json must parse")
+}
+
+fn extract_lpm_upload_tarball(request: &wiremock::Request) -> Vec<u8> {
+    let payload: serde_json::Value =
+        serde_json::from_slice(&request.body).expect("publish request body must be valid JSON");
+    let attachment = payload["_attachments"]
+        .as_object()
+        .and_then(|attachments| attachments.values().next())
+        .expect("publish payload must contain a tarball attachment");
+    BASE64
+        .decode(
+            attachment["data"]
+                .as_str()
+                .expect("tarball attachment must be base64 text"),
+        )
+        .expect("tarball attachment must decode")
+}
+
+fn uploaded_file_paths(tarball_data: &[u8]) -> Vec<String> {
+    let decoder = flate2::read::GzDecoder::new(tarball_data);
+    let mut archive = tar::Archive::new(decoder);
+    archive
+        .entries()
+        .expect("published tarball must list entries")
+        .map(|entry| {
+            entry
+                .expect("published tarball entry must read")
+                .path()
+                .expect("published tarball entry path must read")
+                .to_string_lossy()
+                .into_owned()
+        })
+        .collect()
+}
+
+fn extract_uploaded_file_mode(tarball_data: &[u8], expected_path: &str) -> u32 {
+    let decoder = flate2::read::GzDecoder::new(tarball_data);
+    let mut archive = tar::Archive::new(decoder);
+    for entry in archive
+        .entries()
+        .expect("published tarball must list entries")
+    {
+        let entry = entry.expect("published tarball entry must read");
+        if entry
+            .path()
+            .expect("published tarball entry path must read")
+            .to_string_lossy()
+            == expected_path
+        {
+            return entry
+                .header()
+                .mode()
+                .expect("published tarball entry mode must read");
+        }
+    }
+    panic!("published tarball missing {expected_path}");
 }
 
 fn extract_uploaded_file(tarball_data: &[u8], expected_path: &str) -> Vec<u8> {

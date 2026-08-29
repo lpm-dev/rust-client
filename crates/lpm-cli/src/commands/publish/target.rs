@@ -53,12 +53,9 @@ pub fn resolve_targets(
                 "npm" => targets.push(PublishTarget::Npm),
                 "github" => targets.push(PublishTarget::GitHub),
                 "gitlab" => targets.push(PublishTarget::GitLab),
-                url if url.starts_with("https://") => {
+                url if url.starts_with("https://") || url.starts_with("http://") => {
                     validate_custom_publish_registry_url(url, "publish.registries")?;
                     targets.push(PublishTarget::Custom(url.to_string()));
-                }
-                url if url.starts_with("http://") => {
-                    validate_custom_publish_registry_url(url, "publish.registries")?;
                 }
                 other => unknown.push(other.to_string()),
             }
@@ -105,7 +102,9 @@ pub(super) fn validate_custom_publish_registry_url(
             "{source}: custom publish registry URL must not contain a query or fragment: \"{safe_url}\""
         )));
     }
-    if parsed.scheme() != "https" {
+    let is_loopback_http =
+        parsed.scheme() == "http" && parsed.host_str().is_some_and(lpm_common::is_loopback_host);
+    if parsed.scheme() != "https" && !is_loopback_http {
         return Err(LpmError::Registry(format!(
             "{source}: refusing non-HTTPS URL \"{safe_url}\" — publish requires HTTPS"
         )));
@@ -142,6 +141,60 @@ pub(super) fn deduplicate_targets(targets: Vec<PublishTarget>) -> Vec<PublishTar
     let mut seen = HashSet::new();
     targets
         .into_iter()
-        .filter(|t| seen.insert(t.key()))
+        .filter(|target| seen.insert(publish_target_identity(target)))
         .collect()
+}
+
+fn publish_target_identity(target: &PublishTarget) -> String {
+    let PublishTarget::Custom(registry_url) = target else {
+        return target.key();
+    };
+    normalized_custom_publish_endpoint(registry_url).unwrap_or_else(|| registry_url.clone())
+}
+
+fn normalized_custom_publish_endpoint(registry_url: &str) -> Option<String> {
+    let mut parsed = reqwest::Url::parse(registry_url).ok()?;
+    let path = canonicalize_publish_endpoint_path(parsed.path());
+    let path = path.trim_end_matches('/');
+    parsed.set_path(if path.is_empty() { "/" } else { path });
+    Some(parsed.as_str().trim_end_matches('/').to_string())
+}
+
+fn canonicalize_publish_endpoint_path(path: &str) -> String {
+    let bytes = path.as_bytes();
+    let mut normalized = String::with_capacity(path.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%'
+            && index + 2 < bytes.len()
+            && let (Some(high), Some(low)) = (
+                publish_endpoint_hex_value(bytes[index + 1]),
+                publish_endpoint_hex_value(bytes[index + 2]),
+            )
+        {
+            let decoded = (high << 4) | low;
+            if decoded.is_ascii_alphanumeric() || matches!(decoded, b'-' | b'.' | b'_' | b'~') {
+                normalized.push(char::from(decoded));
+            } else {
+                const HEX: &[u8; 16] = b"0123456789ABCDEF";
+                normalized.push('%');
+                normalized.push(char::from(HEX[usize::from(high)]));
+                normalized.push(char::from(HEX[usize::from(low)]));
+            }
+            index += 3;
+            continue;
+        }
+        normalized.push(char::from(bytes[index]));
+        index += 1;
+    }
+    normalized
+}
+
+fn publish_endpoint_hex_value(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
 }

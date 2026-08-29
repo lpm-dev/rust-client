@@ -553,11 +553,207 @@ async fn publish_package_treats_500_with_existing_version_as_success() {
 
     let payload = replayable_json(&serde_json::json!({ "name": encoded_name }));
     let result = client
-        .publish_package(encoded_name, &payload, None, 0)
+        .publish_package(encoded_name, "1.0.0", "sha512-test", &payload, None, 0)
         .await
         .expect("publish should succeed when version exists after 500");
 
     assert_eq!(result["name"], encoded_name);
+}
+
+#[tokio::test]
+async fn publish_package_does_not_treat_a_different_existing_version_as_success() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    let (client, _tmp) = client_with_mock_server(&server.uri());
+    let encoded_name = "@lpm.dev/test.publish-version-mismatch";
+
+    Mock::given(method("PUT"))
+        .respond_with(ResponseTemplate::new(500).set_body_string("publish boom"))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/registry/@lpm.dev/test.publish-version-mismatch"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string(test_metadata_json_with_version(encoded_name, "0.9.0")),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let payload = replayable_json(&serde_json::json!({ "name": encoded_name }));
+    let result = client
+        .publish_package(encoded_name, "1.0.0", "sha512-test", &payload, None, 0)
+        .await;
+
+    assert!(matches!(
+        result,
+        Err(LpmError::Http { status: 500, message }) if message == "publish boom"
+    ));
+}
+
+#[tokio::test]
+async fn publish_package_rejects_500_recovery_when_the_stored_integrity_differs() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    let (client, _tmp) = client_with_mock_server(&server.uri());
+    let encoded_name = "@lpm.dev/test.publish-integrity-mismatch";
+
+    Mock::given(method("PUT"))
+        .respond_with(ResponseTemplate::new(500).set_body_string("publish boom"))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(
+            "/api/registry/@lpm.dev/test.publish-integrity-mismatch",
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "name": encoded_name,
+            "versions": {
+                "1.0.0": {
+                    "name": encoded_name,
+                    "version": "1.0.0",
+                    "dist": {"integrity": "sha512-stored-other-artifact"}
+                }
+            }
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let payload = replayable_json(&serde_json::json!({
+        "name": encoded_name,
+        "versions": {
+            "1.0.0": {
+                "dist": {"integrity": "sha512-attempted-artifact"}
+            }
+        }
+    }));
+    let result = client
+        .publish_package(
+            encoded_name,
+            "1.0.0",
+            "sha512-attempted-artifact",
+            &payload,
+            None,
+            0,
+        )
+        .await;
+
+    assert!(
+        matches!(result, Err(LpmError::Registry(ref message)) if message.contains("integrity") && message.contains("does not match")),
+        "mismatched stored content must not be reported as this publish's success: {result:?}",
+    );
+}
+
+#[tokio::test]
+async fn publish_package_reconciles_a_committed_503_before_replaying_the_put() {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
+
+    #[derive(Clone)]
+    struct CommittedThenConflict {
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl Respond for CommittedThenConflict {
+        fn respond(&self, _request: &Request) -> ResponseTemplate {
+            if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                ResponseTemplate::new(503).set_body_string("stored before gateway failure")
+            } else {
+                ResponseTemplate::new(409).set_body_string("version already exists")
+            }
+        }
+    }
+
+    let server = MockServer::start().await;
+    let (client, _tmp) = client_with_mock_server(&server.uri());
+    let encoded_name = "@lpm.dev/test.publish-committed-503";
+    let calls = Arc::new(AtomicUsize::new(0));
+
+    Mock::given(method("PUT"))
+        .and(path("/api/registry/@lpm.dev/test.publish-committed-503"))
+        .respond_with(CommittedThenConflict {
+            calls: Arc::clone(&calls),
+        })
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/registry/@lpm.dev/test.publish-committed-503"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(test_metadata_json(encoded_name)))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let payload = replayable_json(&serde_json::json!({
+        "name": encoded_name,
+        "versions": {
+            "1.0.0": {"dist": {"integrity": "sha512-test"}}
+        }
+    }));
+    let result = client
+        .publish_package(encoded_name, "1.0.0", "sha512-test", &payload, None, 0)
+        .await
+        .expect("the committed upload must be reconciled as success");
+
+    assert_eq!(result["name"], encoded_name);
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "a committed ambiguous response must not replay the publish body",
+    );
+}
+
+#[tokio::test]
+async fn publish_package_warns_before_retry_when_a_503_recovery_probe_fails() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    let (client, _tmp) = client_with_mock_server(&server.uri());
+    let encoded_name = "@lpm.dev/test.publish-ambiguous-probe-failure";
+
+    Mock::given(method("PUT"))
+        .and(path(
+            "/api/registry/@lpm.dev/test.publish-ambiguous-probe-failure",
+        ))
+        .respond_with(ResponseTemplate::new(503).set_body_string("gateway lost the response"))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(
+            "/api/registry/@lpm.dev/test.publish-ambiguous-probe-failure",
+        ))
+        .respond_with(ResponseTemplate::new(401))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let payload = replayable_json(&serde_json::json!({
+        "name": encoded_name,
+        "versions": {
+            "1.0.0": {"dist": {"integrity": "sha512-test"}}
+        }
+    }));
+    let result = client
+        .publish_package(encoded_name, "1.0.0", "sha512-test", &payload, None, 0)
+        .await;
+
+    assert!(
+        matches!(result, Err(LpmError::Registry(ref message)) if message.contains("ambiguous") && message.contains("Inspect the registry before retrying")),
+        "an unreconciled ambiguous publish must warn against a blind retry: {result:?}",
+    );
 }
 
 #[tokio::test]
@@ -608,7 +804,14 @@ async fn publish_package_replays_the_exact_body_after_gateway_failure() {
         .await;
 
     let result = client
-        .publish_package(encoded_name, &payload, Some("123456"), 6)
+        .publish_package(
+            encoded_name,
+            "1.0.0",
+            "sha512-test",
+            &payload,
+            Some("123456"),
+            6,
+        )
         .await
         .expect("publish should succeed after the gateway retry");
 
@@ -637,6 +840,48 @@ async fn publish_package_replays_the_exact_body_after_gateway_failure() {
             Some("123456")
         );
     }
+}
+
+#[tokio::test]
+async fn publish_package_redacts_a_registry_reflection_of_its_bearer() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let token = "lpm-publish-reflection-secret";
+    let server = MockServer::start().await;
+    let client = RegistryClient::new()
+        .with_base_url(server.uri())
+        .with_token(token);
+    Mock::given(method("PUT"))
+        .and(path("/api/registry/@lpm.dev/test.reflection"))
+        .respond_with(
+            ResponseTemplate::new(403).set_body_string(format!("submitted bearer was {token}")),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    let payload = replayable_json(&serde_json::json!({
+        "name": "@lpm.dev/test.reflection"
+    }));
+
+    let error = client
+        .publish_package(
+            "@lpm.dev/test.reflection",
+            "1.0.0",
+            "sha512-test",
+            &payload,
+            None,
+            0,
+        )
+        .await
+        .expect_err("registry rejection must remain an error")
+        .to_string();
+
+    assert!(
+        !error.contains(token),
+        "reflected bearer leaked through the error: {error}"
+    );
+    assert!(error.contains("<redacted>"));
 }
 
 #[tokio::test]
@@ -677,7 +922,14 @@ async fn publish_package_replays_put_body_and_length_across_same_origin_307() {
         .await;
 
     let result = client
-        .publish_package(encoded_name, &payload, Some("123456"), 8)
+        .publish_package(
+            encoded_name,
+            "1.0.0",
+            "sha512-test",
+            &payload,
+            Some("123456"),
+            8,
+        )
         .await
         .expect("same-origin 307 should replay the publish request");
 
@@ -716,7 +968,14 @@ async fn publish_package_strips_bearer_and_otp_across_cross_origin_303() {
     let result = RegistryClient::new()
         .with_base_url(redirector.uri())
         .with_token("publish-token")
-        .publish_package("@lpm.dev/test.cross-origin", &payload, Some("123456"), 0)
+        .publish_package(
+            "@lpm.dev/test.cross-origin",
+            "1.0.0",
+            "sha512-test",
+            &payload,
+            Some("123456"),
+            0,
+        )
         .await
         .expect("cross-origin 303 should complete without forwarding credentials");
 
@@ -779,7 +1038,7 @@ async fn publish_package_returns_http_500_when_version_missing_after_500() {
 
     let payload = replayable_json(&serde_json::json!({ "name": encoded_name }));
     let result = client
-        .publish_package(encoded_name, &payload, None, 0)
+        .publish_package(encoded_name, "1.0.0", "sha512-test", &payload, None, 0)
         .await;
 
     assert!(matches!(

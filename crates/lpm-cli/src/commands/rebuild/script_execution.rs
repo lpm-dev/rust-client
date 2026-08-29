@@ -71,8 +71,9 @@ pub(super) fn execute_script(
         store_root,
         home_dir,
         tmpdir,
+        lpm_sandbox::SandboxStdio::Inherit,
     )?;
-    let output_readers = spawn_sanitized_output_readers(&mut child);
+    let output_readers = spawn_sanitized_output_readers(&mut child, false);
 
     let output = wait_with_timeout(child, timeout);
     output_readers.finish_and_join();
@@ -161,6 +162,7 @@ pub(super) fn spawn_lifecycle_child(
     store_root: &Path,
     home_dir: &Path,
     tmpdir: &Path,
+    stdin: lpm_sandbox::SandboxStdio,
 ) -> Result<std::process::Child, String> {
     use lpm_sandbox::{SandboxSpec, SandboxStdio, SandboxedCommand, new_for_platform_with_options};
 
@@ -195,7 +197,7 @@ pub(super) fn spawn_lifecycle_child(
         .envs_cleared(envs.iter().map(|(k, v)| (k.clone(), v.clone())));
     sbcmd.stdout = SandboxStdio::Piped;
     sbcmd.stderr = SandboxStdio::Piped;
-    sbcmd.stdin = SandboxStdio::Inherit;
+    sbcmd.stdin = stdin;
 
     sandbox
         .spawn(sbcmd)
@@ -220,12 +222,16 @@ impl OutputReaders {
     }
 }
 
-fn spawn_sanitized_output_readers(child: &mut Child) -> OutputReaders {
+fn spawn_sanitized_output_readers(child: &mut Child, stdout_to_stderr: bool) -> OutputReaders {
     let process_finished = Arc::new(AtomicBool::new(false));
     let stdout = child.stdout.take().map(|stdout| {
         let process_finished = Arc::clone(&process_finished);
         std::thread::spawn(move || {
-            copy_sanitized_output(stdout, std::io::stdout(), &process_finished)
+            if stdout_to_stderr {
+                copy_sanitized_output(stdout, std::io::stderr(), &process_finished)
+            } else {
+                copy_sanitized_output(stdout, std::io::stdout(), &process_finished)
+            }
         })
     });
     let stderr = child.stderr.take().map(|stderr| {
@@ -238,6 +244,49 @@ fn spawn_sanitized_output_readers(child: &mut Child) -> OutputReaders {
         stdout,
         stderr,
         process_finished,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(in crate::commands) fn execute_publish_lifecycle_script(
+    cmd: &str,
+    package_name: &str,
+    package_version: &str,
+    project_dir: &Path,
+    envs: &[(String, String)],
+    store_root: &Path,
+    home_dir: &Path,
+    tmpdir: &Path,
+    timeout: Duration,
+) -> Result<(), String> {
+    let sandbox_options = lpm_sandbox::SandboxOptions {
+        allow_degraded: false,
+        deny_outbound_network: true,
+        build_cache_isolation: true,
+    };
+    let mut child = spawn_lifecycle_child(
+        cmd,
+        package_name,
+        package_version,
+        project_dir,
+        project_dir,
+        envs,
+        SandboxMode::Enforce,
+        &sandbox_options,
+        &[],
+        &[],
+        store_root,
+        home_dir,
+        tmpdir,
+        lpm_sandbox::SandboxStdio::Null,
+    )?;
+    let output_readers = spawn_sanitized_output_readers(&mut child, true);
+    let output = wait_with_timeout(child, &timeout);
+    output_readers.finish_and_join();
+    match output {
+        Ok(status) if status.success() => Ok(()),
+        Ok(status) => Err(format!("exit code {}", status.code().unwrap_or(-1))),
+        Err(error) => Err(error),
     }
 }
 
@@ -481,7 +530,7 @@ time.sleep(4)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         let mut child = command.spawn().unwrap();
-        let output_readers = spawn_sanitized_output_readers(&mut child);
+        let output_readers = spawn_sanitized_output_readers(&mut child, false);
 
         let daemon_pid = wait_for_daemon_pid(&pid_file);
         let _daemon_guard = ProcessGuard(daemon_pid);
@@ -518,7 +567,7 @@ time.sleep(4)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         let mut child = command.spawn().unwrap();
-        let output_readers = spawn_sanitized_output_readers(&mut child);
+        let output_readers = spawn_sanitized_output_readers(&mut child, false);
         let daemon_pid = wait_for_daemon_pid(&pid_file);
         let _daemon_guard = ProcessGuard(daemon_pid);
 
@@ -590,7 +639,10 @@ fn find_env_case_insensitive<'a>(
 /// produce a malformed PATH (`node_modules\.bin:<parent-path>`),
 /// rendering local shims invisible to scripts even though the
 /// sandbox itself was working correctly.
-pub(super) fn build_lifecycle_path(project_dir: &Path, parent_path: Option<&str>) -> String {
+pub(in crate::commands) fn build_lifecycle_path(
+    project_dir: &Path,
+    parent_path: Option<&str>,
+) -> String {
     let bin_dir = project_dir.join("node_modules").join(".bin");
     #[cfg(unix)]
     {

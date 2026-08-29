@@ -40,7 +40,6 @@ pub async fn run_npm(token: Option<String>, json_output: bool) -> Result<(), Lpm
     let client = npm_web_auth_client()?;
     let challenge = web_auth::fetch_npm_web_login_challenge(&client, NPM_REGISTRY_URL).await?;
     let token = web_auth::complete_web_auth_challenge(
-        &client,
         &challenge,
         "log in",
         json_output,
@@ -391,6 +390,7 @@ fn print_success_json(
 
 fn npm_web_auth_client() -> Result<reqwest::Client, LpmError> {
     lpm_http::client_builder()
+        .redirect(reqwest::redirect::Policy::none())
         .user_agent(format!("lpm-rs/{}", crate::build_version::version()))
         .build()
         .map_err(|e| LpmError::Registry(format!("failed to create HTTP client: {e}")))

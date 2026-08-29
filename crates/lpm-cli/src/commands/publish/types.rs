@@ -195,6 +195,7 @@ pub struct PublishResult {
 /// Local package artifact prepared for publish-like uploads.
 pub(crate) struct PublishProject {
     pub(crate) source_dir: std::sync::Arc<cap_std::fs::Dir>,
+    pub(crate) publish_control: Option<PublishControl>,
     pub(crate) pkg_json: serde_json::Value,
     pub(crate) name: String,
     pub(crate) version: String,
@@ -208,6 +209,11 @@ pub(crate) struct PublishProject {
     pub(crate) lpm_config: Option<serde_json::Value>,
     pub(crate) detected_ecosystem: String,
     pub(crate) swift_manifest: Option<serde_json::Value>,
+}
+
+pub(crate) struct PublishControl {
+    pub(crate) source_dir: std::sync::Arc<cap_std::fs::Dir>,
+    pub(crate) pkg_json: serde_json::Value,
 }
 
 #[derive(Clone)]

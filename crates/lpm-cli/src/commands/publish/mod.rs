@@ -1,3 +1,4 @@
+mod lifecycle;
 mod npm_artifact;
 mod orchestrator;
 mod output;
@@ -13,16 +14,18 @@ mod upload_lpm;
 mod version_data;
 mod wait;
 
+pub(crate) use lifecycle::PublishLifecycle;
 pub(crate) use npm_artifact::prepare_npm_target_artifact;
 pub use orchestrator::run;
 pub(crate) use orchestrator::{
     PreparedPublish, PublishExecutionReport, PublishIntent, PublishTargetPreflight,
-    ReleasePublishClients, execute_prepared_for_release, plan_publish_intent_from_source,
-    prepare_intent_with_workspace_lock_held, validate_intent_with_workspace_lock_held,
+    ReleasePublishClients, execute_prepared_for_release, finish_release_publish_preparation,
+    plan_publish_intent_from_source, prepare_intent_with_workspace_lock_held,
+    validate_intent_with_workspace_lock_held, with_publish_install_lock_for_project,
 };
 pub(crate) use prepare::{
     PublishManifest, PublishSource, prepare_publish_project, read_publish_manifest_from_source,
-    validate_publish_tarball_size,
+    select_publish_projection, validate_publish_tarball_size, validate_publish_version,
 };
 pub(crate) use provenance::{
     ProvenanceRequest, materialize_provenance_request,

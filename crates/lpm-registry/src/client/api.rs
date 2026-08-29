@@ -371,6 +371,8 @@ impl RegistryClient {
     pub async fn publish_package(
         &self,
         encoded_name: &str,
+        published_version: &str,
+        published_integrity: &str,
         payload: &lpm_http::ReplayableRequestBody,
         otp: Option<&str>,
         tarball_size_bytes: usize,
@@ -381,11 +383,7 @@ impl RegistryClient {
         let tarball_mb = tarball_size_bytes as u64 / (1024 * 1024);
         let timeout_secs = std::cmp::min(60 + tarball_mb * 2, 600);
         let timeout = Duration::from_secs(timeout_secs);
-        let publish_client = lpm_http::client_builder()
-            .timeout(timeout)
-            .user_agent(format!("lpm-rs/{}", env!("CARGO_PKG_VERSION")))
-            .build()
-            .map_err(|e| LpmError::Network(format!("failed to build publish client: {e}")))?;
+        let publish_client = self.http.for_url_no_build(&url).clone();
 
         self.execute_with_recovery(AuthPosture::AuthRequired, || async {
             let bearer = self.current_bearer(AuthPosture::AuthRequired)?;
@@ -410,12 +408,20 @@ impl RegistryClient {
                         Ok(request)
                     },
                     payload,
+                    bearer.as_deref(),
                     encoded_name,
+                    published_version,
+                    published_integrity,
                 )
                 .await?;
-            let status = response.status();
-            let body: serde_json::Value =
-                parse_capped_api_json(response, "publish response").await?;
+            let (status, body) = match response {
+                PublishSafeResponse::Response(response) => {
+                    let status = response.status();
+                    let body = parse_capped_api_json(response, "publish response").await?;
+                    (status, body)
+                }
+                PublishSafeResponse::Recovered(body) => (reqwest::StatusCode::OK, body),
+            };
 
             if status.is_success() {
                 Ok(body)
