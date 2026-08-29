@@ -335,7 +335,8 @@ impl DependencyProvider for LpmDependencyProvider {
                     )));
                 }
 
-                let npm_range = NpmRange::parse(&range_str).map_err(ProviderError::InvalidRange)?;
+                let npm_range = NpmRange::parse_registry_spec(&range_str)
+                    .map_err(ProviderError::InvalidRange)?;
                 let pkg = ResolverPackage::from_dep_name(&target_name);
                 if let Err(error) = self.ensure_cached_for_range(&pkg, &npm_range) {
                     if edge_is_optional {
@@ -549,7 +550,7 @@ impl DependencyProvider for LpmDependencyProvider {
             // Other failure shapes (network blips, npm registry 5xx,
             // platform-incompatible) keep the silent debug behavior —
             // they're expected and noisy.
-            let npm_range = match NpmRange::parse(dep_range_str) {
+            let npm_range = match NpmRange::parse_registry_spec(dep_range_str) {
                 Ok(r) => r,
                 Err(e) => {
                     let detail = format!("invalid range for {pkg}@{dep_range_str}: {e}");

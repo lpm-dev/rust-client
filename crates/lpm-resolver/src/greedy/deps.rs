@@ -75,7 +75,7 @@ pub(super) fn enqueue_child_deps(
                 });
             }
 
-            let range = match NpmRange::parse(range_str) {
+            let range = match NpmRange::parse_registry_spec(range_str) {
                 Ok(r) => r,
                 Err(e) => {
                     let detail = format!("invalid range for {local_name}@{range_str}: {e}");
@@ -159,7 +159,7 @@ pub(super) fn enqueue_child_deps(
             // `target` so the resolver consults the correct manifest.
             let canonical = CanonicalKey::from_dep_name(peer.alias.unwrap_or(peer_name));
 
-            let range = match NpmRange::parse(peer_range_str) {
+            let range = match NpmRange::parse_registry_spec(peer_range_str) {
                 Ok(r) => r,
                 Err(e) => {
                     if !peer.optional {

@@ -1289,13 +1289,12 @@ fn cached_info_satisfies_peer_requirements(
     reqs: &[&PeerRequirement],
 ) -> bool {
     info.versions.iter().any(|version| {
-        reqs.iter().all(|req| {
-            req.range
-                .satisfies_with_latest_bound(version, info.latest_version.as_ref())
-        }) && (!info.has_platform_metadata()
-            || info
-                .platform_is_compatible(&version.to_string())
-                .unwrap_or(true))
+        reqs.iter()
+            .all(|req| info.range_satisfies(&req.range, version))
+            && (!info.has_platform_metadata()
+                || info
+                    .platform_is_compatible(&version.to_string())
+                    .unwrap_or(true))
     })
 }
 

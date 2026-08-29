@@ -170,7 +170,7 @@ pub(super) fn mark_node_required_closure(state: &mut ResolveState, node_id: Node
 fn newest_satisfying_root_node(
     state: &ResolveState,
     edge: &Edge,
-    latest_version: Option<&NpmVersion>,
+    info: &CachedPackageInfo,
 ) -> Option<NodeId> {
     state
         .nodes
@@ -180,11 +180,8 @@ fn newest_satisfying_root_node(
         .filter(|(local_name, _)| state.root_deps.contains_key(local_name))
         .filter_map(|(_, id)| {
             let node = state.nodes.get(*id as usize)?;
-            (node.canonical == edge.canonical
-                && edge
-                    .range
-                    .satisfies_with_latest_bound(&node.version, latest_version))
-            .then_some((&node.version, *id))
+            (node.canonical == edge.canonical && info.range_satisfies(&edge.range, &node.version))
+                .then_some((&node.version, *id))
         })
         .max_by(|(left, _), (right, _)| left.cmp(right))
         .map(|(_, id)| id)
@@ -291,7 +288,7 @@ fn process_edge_inner(
     let root_id = if must_exact_match {
         None
     } else {
-        newest_satisfying_root_node(state, edge, info.latest_version.as_ref())
+        newest_satisfying_root_node(state, edge, info)
     };
     let existing_id = root_id.or_else(|| {
         state.resolved.get(&edge.canonical).and_then(|nodes| {

@@ -65,6 +65,7 @@ pub struct CachedPackageInfo {
     pub platform_metadata_complete: bool,
     pub latest_version: Option<NpmVersion>,
     pub versions: Arc<[NpmVersion]>,
+    dist_tags: Arc<HashMap<String, NpmVersion>>,
     core: Arc<ManifestCore>,
     release: Arc<ReleaseOverlay>,
     platform: Arc<PlatformOverlay>,
@@ -177,6 +178,7 @@ pub(super) struct ManifestCacheBuilder {
     workspace_versions: HashSet<NpmVersion>,
     platform_metadata_complete: bool,
     latest_version: Option<NpmVersion>,
+    dist_tags: HashMap<String, NpmVersion>,
     strings: StringPoolBuilder,
     versions: Vec<StagedVersion>,
     dependencies: Vec<DependencyRecord>,
@@ -446,6 +448,7 @@ impl CachedPackageInfo {
             platform_metadata_complete: false,
             latest_version: None,
             versions: Arc::from([]),
+            dist_tags: Arc::new(HashMap::new()),
             core: Arc::new(ManifestCore::empty()),
             release: Arc::new(ReleaseOverlay::default()),
             platform: Arc::new(PlatformOverlay::default()),
@@ -605,6 +608,29 @@ impl CachedPackageInfo {
         let version = self.core.version_id(version)? as u32;
         find_version_record(&self.trust, version, |record| record.version)
             .map(|record| record.evidence)
+    }
+
+    #[inline]
+    pub fn dist_tag_version(&self, tag: &str) -> Option<&NpmVersion> {
+        if tag == "latest" {
+            self.latest_version.as_ref()
+        } else {
+            self.dist_tags.get(tag)
+        }
+    }
+
+    pub(super) fn dist_tags(&self) -> &HashMap<String, NpmVersion> {
+        &self.dist_tags
+    }
+
+    #[inline]
+    pub fn tagged_version_for_range(&self, range: &NpmRange) -> Option<&NpmVersion> {
+        range.dist_tag().and_then(|tag| self.dist_tag_version(tag))
+    }
+
+    #[inline]
+    pub fn range_satisfies(&self, range: &NpmRange, version: &NpmVersion) -> bool {
+        range.satisfies_with_dist_tag(version, self.tagged_version_for_range(range))
     }
 
     pub fn dist(&self, version: &str) -> Option<CachedDistInfo> {
@@ -860,15 +886,16 @@ impl CachedPackageInfo {
             return !self.versions.contains(&exact);
         }
         !self.covered_ranges.contains(range.raw())
-            || !self.versions.iter().any(|version| {
-                range.satisfies_with_latest_bound(version, self.latest_version.as_ref())
-            })
+            || !self
+                .versions
+                .iter()
+                .any(|version| self.range_satisfies(range, version))
     }
 
     pub fn workspace_version_satisfies(&self, range: &NpmRange) -> bool {
         self.workspace_versions
             .iter()
-            .any(|version| range.satisfies_with_latest_bound(version, self.latest_version.as_ref()))
+            .any(|version| self.range_satisfies(range, version))
     }
 
     pub fn needs_trust_metadata(&self, policy: &ResolverPolicy) -> bool {
@@ -932,6 +959,10 @@ impl ManifestCacheBuilder {
         latest_version: Option<NpmVersion>,
         version_capacity: usize,
     ) -> Self {
+        let mut dist_tags = HashMap::with_capacity(usize::from(latest_version.is_some()));
+        if let Some(latest) = latest_version.as_ref() {
+            dist_tags.insert("latest".to_string(), latest.clone());
+        }
         Self {
             modified,
             trust_metadata_complete,
@@ -940,12 +971,17 @@ impl ManifestCacheBuilder {
             workspace_versions,
             platform_metadata_complete,
             latest_version,
+            dist_tags,
             strings: StringPoolBuilder::default(),
             versions: Vec::with_capacity(version_capacity),
             dependencies: Vec::new(),
             peers: Vec::new(),
             signatures: Vec::new(),
         }
+    }
+
+    pub(super) fn set_dist_tags(&mut self, dist_tags: HashMap<String, NpmVersion>) {
+        self.dist_tags = dist_tags;
     }
 
     pub(super) fn push(&mut self, mut manifest: ManifestVersion) {
@@ -1068,6 +1104,7 @@ impl ManifestCacheBuilder {
             platform_metadata_complete: self.platform_metadata_complete,
             latest_version: self.latest_version,
             versions: Arc::from(versions),
+            dist_tags: Arc::new(self.dist_tags),
             core: Arc::new(ManifestCore {
                 strings: pool,
                 versions: version_records.into_boxed_slice(),

@@ -66,6 +66,15 @@ fn parse_metadata_to_cache_info_inner(
     let latest_version = metadata
         .latest_version_tag()
         .and_then(|version| NpmVersion::parse(version).ok());
+    let dist_tags = metadata
+        .dist_tags
+        .iter()
+        .filter_map(|(tag, version)| {
+            NpmVersion::parse(version)
+                .ok()
+                .map(|version| (tag.clone(), version))
+        })
+        .collect();
     let projected_versions = metadata
         .versions
         .iter()
@@ -73,6 +82,7 @@ fn parse_metadata_to_cache_info_inner(
     parse_projected_metadata(
         metadata.modified.clone(),
         latest_version,
+        dist_tags,
         ReleaseTimes::Borrowed(&metadata.time),
         projected_versions,
         version_count,
@@ -93,10 +103,19 @@ fn parse_owned_metadata_to_cache_info_inner(
         .and_then(|version| NpmVersion::parse(version).ok());
     let lpm_registry::PackageMetadata {
         modified,
+        dist_tags,
         versions,
         time,
         ..
     } = metadata;
+    let dist_tags = dist_tags
+        .into_iter()
+        .filter_map(|(tag, version)| {
+            NpmVersion::parse(&version)
+                .ok()
+                .map(|version| (tag, version))
+        })
+        .collect();
     let version_count = versions.len();
     let projected_versions = versions
         .into_iter()
@@ -104,6 +123,7 @@ fn parse_owned_metadata_to_cache_info_inner(
     parse_projected_metadata(
         modified,
         latest_version,
+        dist_tags,
         ReleaseTimes::Owned(time),
         projected_versions,
         version_count,
@@ -236,6 +256,7 @@ impl ReleaseTimes<'_> {
 fn parse_projected_metadata(
     modified: Option<String>,
     latest_version: Option<NpmVersion>,
+    dist_tags: HashMap<String, NpmVersion>,
     mut release_times: ReleaseTimes<'_>,
     projected_versions: impl Iterator<Item = ProjectedVersion>,
     version_count: usize,
@@ -253,6 +274,7 @@ fn parse_projected_metadata(
         latest_version,
         version_count,
     );
+    builder.set_dist_tags(dist_tags);
 
     // Helper: normalize a `(local_name, raw_range)` dep declaration through
     // the alias rewrite. Returns `(inner_range_string, target_name_if_alias)`.

@@ -172,7 +172,7 @@ where
                 if dependency.bundled
                     || dependency.optional
                     || super::version::is_workspace_specifier(dependency.range)
-                    || NpmRange::parse(dependency.range).is_err()
+                    || NpmRange::parse_registry_spec(dependency.range).is_err()
                 {
                     return None;
                 }
@@ -195,7 +195,7 @@ where
             if super::version::is_workspace_specifier(range_str) {
                 continue;
             }
-            let Ok(range) = NpmRange::parse(range_str) else {
+            let Ok(range) = NpmRange::parse_registry_spec(range_str) else {
                 continue;
             };
             let child_canonical =

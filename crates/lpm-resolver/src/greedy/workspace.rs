@@ -662,7 +662,7 @@ fn project_peer_context(
                 let peer_name = peer.name;
                 let raw_range = peer.range;
                 let target = peer.alias.unwrap_or(peer_name);
-                let range = NpmRange::parse(raw_range).map_err(|error| {
+                let range = NpmRange::parse_registry_spec(raw_range).map_err(|error| {
                     ResolveError::Internal(format!(
                         "failed to parse peer range {raw_range:?} for {target}: {error}"
                     ))
@@ -679,16 +679,13 @@ fn project_peer_context(
                 else {
                     return Ok(PeerProjectionOutcome::RequiresIsolatedResolution);
                 };
-                let latest_version = union
-                    .cache
-                    .get(&CanonicalKey::from_dep_name(target))
-                    .and_then(|info| info.latest_version.as_ref());
+                let target_info = union.cache.get(&CanonicalKey::from_dep_name(target));
                 if let Some((version, target_id)) = newest_included_provider(
                     included,
                     &union.packages,
                     target,
                     &range,
-                    latest_version,
+                    target_info.map(Arc::as_ref),
                 ) {
                     bindings.entry(index).or_default().push((
                         lpm_common::PeerEdge::registry(peer_name, target, version),
@@ -886,14 +883,17 @@ fn newest_included_provider(
     packages: &[ResolvedPackage],
     canonical: &str,
     range: &NpmRange,
-    latest_version: Option<&crate::NpmVersion>,
+    info: Option<&CachedPackageInfo>,
 ) -> Option<(String, ResolutionNodeId)> {
     included
         .iter()
         .filter_map(|index| {
             let package = &packages[*index];
             (package.package.canonical_name() == canonical
-                && range.satisfies_with_latest_bound(&package.version, latest_version))
+                && info.map_or_else(
+                    || range.satisfies(&package.version),
+                    |info| info.range_satisfies(range, &package.version),
+                ))
             .then_some((&package.version, package.resolution_id))
         })
         .max_by(|(left, _), (right, _)| left.cmp(right))
@@ -910,11 +910,9 @@ fn select_union_peer_candidate<'a>(
     let info = cache.get(&canonical_key)?;
     let mut best = None::<(crate::NpmVersion, usize, Vec<usize>)>;
     let preferred_latest = info.latest_version.as_ref().filter(|latest| {
-        requirements.iter().any(|requirement| {
-            requirement
-                .2
-                .satisfies_with_latest_bound(latest, info.latest_version.as_ref())
-        })
+        requirements
+            .iter()
+            .any(|requirement| info.range_satisfies(&requirement.2, latest))
     });
     for candidate in preferred_latest.into_iter().chain(
         info.versions
@@ -934,10 +932,7 @@ fn select_union_peer_candidate<'a>(
             .iter()
             .enumerate()
             .filter_map(|(index, requirement)| {
-                (!requirement
-                    .2
-                    .satisfies_with_latest_bound(candidate, info.latest_version.as_ref()))
-                .then_some(index)
+                (!info.range_satisfies(&requirement.2, candidate)).then_some(index)
             })
             .collect::<Vec<_>>();
         let hits = requirements.len().saturating_sub(misses.len());
