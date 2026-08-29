@@ -30,6 +30,28 @@ fn created_file(content: &[u8]) -> serde_json::Value {
     })
 }
 
+fn write_materialized_package_skill(
+    project: &TempProject,
+    package: &str,
+    skill: &str,
+    content: &str,
+) {
+    let directory = format!(".lpm/skills/{package}");
+    project.write_file(&format!("{directory}/{skill}.md"), content);
+    project.write_file(
+        &format!("{directory}/.lpm-package-skills.json"),
+        &serde_json::to_string_pretty(&json!({
+            "schema_version": 1,
+            "package": package,
+            "version": "1.0.0",
+            "skills": {
+                skill: hex::encode(Sha256::digest(content.as_bytes()))
+            }
+        }))
+        .unwrap(),
+    );
+}
+
 fn make_source_pkg_tarball(
     name: &str,
     version: &str,
@@ -59,7 +81,7 @@ fn make_source_pkg_tarball(
 #[test]
 fn remove_json_cleans_source_package_paths_and_editor_links() {
     let project = TempProject::empty(r#"{"name":"remove-test","version":"1.0.0"}"#);
-    project.write_file(".lpm/skills/owner.widget/build.md", "# Widget skill\n");
+    write_materialized_package_skill(&project, "owner.widget", "build", "# Widget skill\n");
     project.write_file(
         "components/widget/index.ts",
         "export const widget = true;\n",
@@ -97,7 +119,11 @@ fn remove_json_cleans_source_package_paths_and_editor_links() {
     assert_eq!(envelope["package"], serde_json::json!("owner.widget"));
     assert_eq!(
         envelope["removed"],
-        serde_json::json!(["components/widget/index.ts", ".lpm/skills/owner.widget/"])
+        serde_json::json!([
+            "components/widget/index.ts",
+            ".lpm/skills/owner.widget/",
+            ".cursor/rules/owner.widget--build.md"
+        ])
     );
 
     insta::assert_json_snapshot!("remove_json_envelope_cleans_source_package_paths", envelope);
@@ -119,7 +145,7 @@ fn remove_json_cleans_source_package_paths_and_editor_links() {
 #[test]
 fn remove_human_output_uses_slim_done_line_and_stderr_only_paths() {
     let project = TempProject::empty(r#"{"name":"remove-test","version":"1.0.0"}"#);
-    project.write_file(".lpm/skills/owner.widget/build.md", "# Widget skill\n");
+    write_materialized_package_skill(&project, "owner.widget", "build", "# Widget skill\n");
     project.write_file(
         "components/widget/index.ts",
         "export const widget = true;\n",
@@ -163,11 +189,12 @@ fn remove_human_output_uses_slim_done_line_and_stderr_only_paths() {
     assert!(
         stderr.contains("- .lpm/skills/owner.widget/")
             && stderr.contains("- components/widget/index.ts")
-            && stderr.contains("✓ Cleaned empty directories"),
-        "remove should report removed paths and directory cleanup on stderr, got:\n{stderr}"
+            && stderr.contains("- .cursor/rules/owner.widget--build.md")
+            && stderr.contains("✓ Removed package skill directory"),
+        "remove should report every removed path on stderr, got:\n{stderr}"
     );
     assert!(
-        stderr.contains("✓ Done · removed 2 files in "),
+        stderr.contains("✓ Done · removed 3 paths in "),
         "remove should use the timed slim terminus, got:\n{stderr}"
     );
     assert!(
@@ -941,4 +968,186 @@ fn remove_rejects_a_workspace_that_appears_while_waiting_for_the_lock() {
     assert!(!output.status.success());
     assert!(project.file_exists("tracked.ts"));
     assert!(project.file_exists(".lpm/added-sources.json"));
+}
+
+#[tokio::test]
+async fn remove_lower_create_owner_before_upper_overwrite_preserves_complete_cleanup() {
+    let mock = MockRegistry::start().await;
+    for (package, content) in [("source-a", b"lower\n"), ("source-b", b"upper\n")] {
+        let tarball = make_source_pkg_tarball(
+            package,
+            "1.0.0",
+            json!({"ecosystem": "js", "files": [{"src": "Source.ts"}]}),
+            &[("Source.ts", content)],
+        );
+        mock.with_package(package, "1.0.0", &tarball).await;
+    }
+    let project = TempProject::empty(r#"{"name":"host","version":"1.0.0"}"#);
+    for package in ["source-a", "source-b"] {
+        lpm_with_registry(&project, &mock.url())
+            .args([
+                "add",
+                package,
+                "--yes",
+                "--force",
+                "--path",
+                "custom",
+                "--no-install-deps",
+                "--no-skills",
+            ])
+            .assert()
+            .success();
+    }
+
+    lpm(&project)
+        .args(["remove", "source-a"])
+        .assert()
+        .success();
+    lpm(&project)
+        .args(["remove", "source-b"])
+        .assert()
+        .success();
+
+    assert!(!project.file_exists("custom/Source.ts"));
+    assert!(!project.file_exists(".lpm/added-sources.json"));
+}
+
+#[tokio::test]
+async fn remove_lower_overwrite_owner_before_upper_overwrite_restores_original_content() {
+    let mock = MockRegistry::start().await;
+    for (package, content) in [("source-a", b"lower\n"), ("source-b", b"upper\n")] {
+        let tarball = make_source_pkg_tarball(
+            package,
+            "1.0.0",
+            json!({"ecosystem": "js", "files": [{"src": "Source.ts"}]}),
+            &[("Source.ts", content)],
+        );
+        mock.with_package(package, "1.0.0", &tarball).await;
+    }
+    let project = TempProject::empty(r#"{"name":"host","version":"1.0.0"}"#);
+    project.write_file("custom/Source.ts", "original\n");
+    for package in ["source-a", "source-b"] {
+        lpm_with_registry(&project, &mock.url())
+            .args([
+                "add",
+                package,
+                "--yes",
+                "--force",
+                "--path",
+                "custom",
+                "--no-install-deps",
+                "--no-skills",
+            ])
+            .assert()
+            .success();
+    }
+
+    lpm(&project)
+        .args(["remove", "source-a"])
+        .assert()
+        .success();
+    lpm(&project)
+        .args(["remove", "source-b"])
+        .assert()
+        .success();
+
+    assert_eq!(project.read_file("custom/Source.ts"), "original\n");
+    assert!(!project.file_exists(".lpm/added-sources.json"));
+}
+
+#[test]
+fn remove_owned_dependency_invalidates_the_install_hash() {
+    let project =
+        TempProject::empty(r#"{"name":"host","version":"1.0.0","dependencies":{"dep":"^1.0.0"}}"#);
+    project.write_file(".lpm/install-hash", "stale\n");
+    write_source_state(
+        &project,
+        json!({
+            "source-pkg": {"dependencies": {"dep": {
+                "spec": "^1.0.0", "section": "dependencies", "inserted": true
+            }}}
+        }),
+    );
+
+    lpm(&project)
+        .args(["remove", "source-pkg"])
+        .assert()
+        .success();
+
+    assert!(!project.file_exists(".lpm/install-hash"));
+}
+
+#[test]
+fn remove_rejects_a_package_skill_directory_with_untracked_content() {
+    let project = TempProject::empty(r#"{"name":"host","version":"1.0.0"}"#);
+    write_materialized_package_skill(&project, "owner.widget", "guide", "managed\n");
+    project.write_file(".lpm/skills/owner.widget/user-notes.md", "user\n");
+    write_source_state(
+        &project,
+        json!({
+            "@lpm.dev/owner.widget": {"skillPackageShort": "owner.widget"}
+        }),
+    );
+
+    let output = lpm(&project)
+        .args(["remove", "owner.widget"])
+        .output()
+        .expect("remove package with mixed skill ownership");
+
+    assert!(!output.status.success());
+    assert_eq!(
+        project.read_file(".lpm/skills/owner.widget/user-notes.md"),
+        "user\n"
+    );
+    assert!(project.file_exists(".lpm/added-sources.json"));
+}
+
+#[test]
+fn remove_deletes_only_editor_links_declared_by_the_package_skill_manifest() {
+    let project = TempProject::empty(r#"{"name":"host","version":"1.0.0"}"#);
+    write_materialized_package_skill(&project, "owner.widget", "guide", "managed\n");
+    project.write_file(".cursor/rules/owner.widget--guide.md", "managed link\n");
+    project.write_file(
+        ".cursor/rules/owner.widget--user-notes.md",
+        "untracked user link\n",
+    );
+    write_source_state(
+        &project,
+        json!({
+            "@lpm.dev/owner.widget": {"skillPackageShort": "owner.widget"}
+        }),
+    );
+
+    lpm(&project)
+        .args(["remove", "owner.widget"])
+        .assert()
+        .success();
+
+    assert!(!project.file_exists(".cursor/rules/owner.widget--guide.md"));
+    assert_eq!(
+        project.read_file(".cursor/rules/owner.widget--user-notes.md"),
+        "untracked user link\n"
+    );
+}
+
+#[test]
+fn remove_preserves_a_preexisting_directory_after_its_last_managed_file_is_deleted() {
+    let project = TempProject::empty(r#"{"name":"host","version":"1.0.0"}"#);
+    std::fs::create_dir_all(project.path().join("custom/preexisting")).unwrap();
+    project.write_file("custom/preexisting/Source.ts", "managed\n");
+    write_source_state(
+        &project,
+        json!({
+            "source-pkg": {"files": {
+                "custom/preexisting/Source.ts": created_file(b"managed\n")
+            }}
+        }),
+    );
+
+    lpm(&project)
+        .args(["remove", "source-pkg"])
+        .assert()
+        .success();
+
+    assert!(project.path().join("custom/preexisting").is_dir());
 }

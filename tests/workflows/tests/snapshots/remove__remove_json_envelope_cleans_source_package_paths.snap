@@ -8,6 +8,7 @@ expression: envelope
   "package": "owner.widget",
   "removed": [
     "components/widget/index.ts",
-    ".lpm/skills/owner.widget/"
+    ".lpm/skills/owner.widget/",
+    ".cursor/rules/owner.widget--build.md"
   ]
 }

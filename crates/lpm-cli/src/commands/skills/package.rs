@@ -9,6 +9,7 @@ use std::path::{Path, PathBuf};
 pub(super) const MANIFEST_FILE: &str = ".lpm-package-skills.json";
 pub(super) const MANIFEST_VERSION: u32 = 1;
 pub(super) const MAX_MANIFEST_SIZE: u64 = 64 * 1024;
+const MAX_MATERIALIZED_SKILL_SIZE: u64 = 1024 * 1024;
 
 #[derive(Debug, Serialize, Deserialize)]
 pub(super) struct PackageSkillsManifest {
@@ -165,10 +166,13 @@ pub(super) fn read_manifest(directory: &Path, expected_package: &str) -> Package
 }
 
 pub(crate) fn is_materialized_directory(directory: &Path) -> bool {
-    let Some(package) = directory.file_name().and_then(|name| name.to_str()) else {
-        return false;
-    };
-    materialized_directory_complete(directory, package)
+    materialized_skill_names(directory).is_some()
+}
+
+pub(crate) fn materialized_skill_names(directory: &Path) -> Option<Vec<String>> {
+    let package = directory.file_name().and_then(|name| name.to_str())?;
+    materialized_directory_manifest(directory, package)
+        .map(|manifest| manifest.skills.into_keys().collect())
 }
 
 pub(crate) fn acquire_mutation_lock(
@@ -208,26 +212,29 @@ pub(crate) fn materialization_complete(project_dir: &Path, package_json: &str) -
 
 fn package_materialization_complete(project_dir: &Path, package: &str) -> bool {
     let directory = project_dir.join(".lpm").join("skills").join(package);
-    materialized_directory_complete(&directory, package)
+    materialized_directory_manifest(&directory, package).is_some()
 }
 
-fn materialized_directory_complete(directory: &Path, package: &str) -> bool {
+fn materialized_directory_manifest(
+    directory: &Path,
+    package: &str,
+) -> Option<PackageSkillsManifest> {
     let Ok(metadata) = std::fs::symlink_metadata(directory) else {
-        return false;
+        return None;
     };
     if metadata.file_type().is_symlink() || !metadata.is_dir() {
-        return false;
+        return None;
     }
     let PackageManifestStatus::Valid(manifest) = read_manifest(directory, package) else {
-        return false;
+        return None;
     };
     let Ok(entries) = std::fs::read_dir(directory) else {
-        return false;
+        return None;
     };
     let mut seen = BTreeSet::new();
     for entry in entries {
         let Ok(entry) = entry else {
-            return false;
+            return None;
         };
         let name = entry.file_name();
         if name == MANIFEST_FILE {
@@ -235,29 +242,26 @@ fn materialized_directory_complete(directory: &Path, package: &str) -> bool {
         }
         let path = entry.path();
         let Ok(metadata) = std::fs::symlink_metadata(&path) else {
-            return false;
+            return None;
         };
         if metadata.file_type().is_symlink() || !metadata.is_file() {
-            return false;
+            return None;
         }
         if path.extension().is_none_or(|extension| extension != "md") {
-            return false;
+            return None;
         }
-        let Some(skill_name) = path.file_stem().and_then(|name| name.to_str()) else {
-            return false;
+        let skill_name = path.file_stem().and_then(|name| name.to_str())?;
+        let expected_digest = manifest.skills.get(skill_name)?;
+        let Ok(content) = lpm_common::read_text_file_capped(&path, MAX_MATERIALIZED_SKILL_SIZE)
+        else {
+            return None;
         };
-        let Some(expected_digest) = manifest.skills.get(skill_name) else {
-            return false;
-        };
-        let Ok(content) = std::fs::read(&path) else {
-            return false;
-        };
-        if digest(&content) != *expected_digest {
-            return false;
+        if digest(content.as_bytes()) != *expected_digest {
+            return None;
         }
         seen.insert(skill_name.to_string());
     }
-    seen.len() == manifest.skills.len()
+    (seen.len() == manifest.skills.len()).then_some(manifest)
 }
 
 struct ValidatedEntry<'a> {
