@@ -40,6 +40,31 @@ impl PubgrubEnvGuard {
         Self { prior }
     }
 }
+
+struct GreedyEnvGuard {
+    prior: Option<std::ffi::OsString>,
+}
+
+impl GreedyEnvGuard {
+    fn new() -> Self {
+        let prior = std::env::var_os("LPM_RESOLVER");
+        // SAFETY: caller holds env_lock(), which serializes environment mutation.
+        unsafe { std::env::remove_var("LPM_RESOLVER") };
+        Self { prior }
+    }
+}
+
+impl Drop for GreedyEnvGuard {
+    fn drop(&mut self) {
+        // SAFETY: caller still holds env_lock(), which serializes environment mutation.
+        unsafe {
+            match &self.prior {
+                Some(value) => std::env::set_var("LPM_RESOLVER", value),
+                None => std::env::remove_var("LPM_RESOLVER"),
+            }
+        }
+    }
+}
 impl Drop for PubgrubEnvGuard {
     fn drop(&mut self) {
         // SAFETY: still inside the env_lock-protected section.
@@ -485,6 +510,73 @@ fn make_package_metadata(name: &str, versions: Vec<VersionMetadata>) -> PackageM
         latest_version: Some(latest_version),
         ecosystem: None,
     }
+}
+
+#[tokio::test]
+async fn greedy_resolves_custom_root_dist_tag_to_its_exact_version() {
+    let _lock = env_lock().lock().await;
+    let _env = GreedyEnvGuard::new();
+    let mut metadata = make_package_metadata(
+        "tagged-upgrade",
+        vec![
+            make_version_metadata("tagged-upgrade", "1.0.0", vec![], vec![], vec![], vec![]),
+            make_version_metadata("tagged-upgrade", "2.0.0", vec![], vec![], vec![], vec![]),
+        ],
+    );
+    metadata
+        .dist_tags
+        .insert("legacy".to_string(), "1.0.0".to_string());
+
+    let result = resolve_with_prefetch(
+        Arc::new(lpm_registry::RegistryClient::new().with_base_url("http://127.0.0.1:9")),
+        HashMap::from([("tagged-upgrade".to_string(), "legacy".to_string())]),
+        OverrideSet::empty(),
+        Some(HashMap::from([("tagged-upgrade".to_string(), metadata)])),
+    )
+    .await
+    .expect("the greedy resolver must resolve custom root dist-tags");
+
+    assert_eq!(result.packages.len(), 1);
+    assert_eq!(result.packages[0].version.to_string(), "1.0.0");
+}
+
+#[tokio::test]
+async fn pubgrub_resolves_custom_root_dist_tag_to_prerelease_version() {
+    let _lock = env_lock().lock().await;
+    let _env = PubgrubEnvGuard::new();
+    let mut metadata = make_package_metadata(
+        "tagged-preview",
+        vec![
+            make_version_metadata("tagged-preview", "2.0.0", vec![], vec![], vec![], vec![]),
+            make_version_metadata(
+                "tagged-preview",
+                "3.0.0-beta.1",
+                vec![],
+                vec![],
+                vec![],
+                vec![],
+            ),
+        ],
+    );
+    metadata
+        .dist_tags
+        .insert("latest".to_string(), "2.0.0".to_string());
+    metadata
+        .dist_tags
+        .insert("preview".to_string(), "3.0.0-beta.1".to_string());
+    metadata.latest_version = Some("2.0.0".to_string());
+
+    let result = resolve_with_prefetch(
+        Arc::new(lpm_registry::RegistryClient::new().with_base_url("http://127.0.0.1:9")),
+        HashMap::from([("tagged-preview".to_string(), "preview".to_string())]),
+        OverrideSet::empty(),
+        Some(HashMap::from([("tagged-preview".to_string(), metadata)])),
+    )
+    .await
+    .expect("the PubGrub resolver must resolve custom root dist-tags");
+
+    assert_eq!(result.packages.len(), 1);
+    assert_eq!(result.packages[0].version.to_string(), "3.0.0-beta.1");
 }
 
 #[tokio::test]

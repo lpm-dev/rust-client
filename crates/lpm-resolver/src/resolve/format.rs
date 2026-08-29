@@ -239,13 +239,12 @@ fn validate_selected_dependency_skips(
         }
 
         let recovered = selected.get(&skipped.child).is_some_and(|child| {
-            let Ok(range) = NpmRange::parse(&skipped.requested) else {
+            let Ok(range) = NpmRange::parse_registry_spec(&skipped.requested) else {
                 return false;
             };
-            let latest = cache
+            cache
                 .get(&CanonicalKey::from(&skipped.child))
-                .and_then(|info| info.latest_version.as_ref());
-            range.satisfies_with_latest_bound(&child.version, latest)
+                .is_some_and(|info| info.range_satisfies(&range, &child.version))
         });
         if recovered {
             continue;

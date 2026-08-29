@@ -639,12 +639,19 @@ impl RegistryClient {
 /// Parse `Retry-After` header from a 429 response.
 /// Returns seconds to wait. Falls back to 1 second if header is missing/unparseable.
 pub(super) fn parse_retry_after(response: &reqwest::Response) -> u64 {
-    response
-        .headers()
-        .get("retry-after")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|s| s.parse::<u64>().ok())
+    parse_retry_after_header(
+        response
+            .headers()
+            .get("retry-after")
+            .and_then(|v| v.to_str().ok()),
+    )
+}
+
+fn parse_retry_after_header(value: Option<&str>) -> u64 {
+    value
+        .and_then(|value| value.parse::<u64>().ok())
         .unwrap_or(1)
+        .min(RETRY_MAX_DELAY.as_secs())
 }
 
 /// Exponential backoff with capped delay.
@@ -754,5 +761,13 @@ mod tests {
         let _env = ScopedEnv::set(&[("LPM_RETRY_BACKOFF_MS_OVERRIDE", "10")]);
 
         assert_eq!(backoff_override(), Some(Duration::from_millis(10)));
+    }
+
+    #[test]
+    fn retry_after_seconds_are_capped_to_the_transport_backoff_limit() {
+        assert_eq!(
+            parse_retry_after_header(Some("315360000")),
+            RETRY_MAX_DELAY.as_secs()
+        );
     }
 }

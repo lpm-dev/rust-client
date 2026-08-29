@@ -113,14 +113,15 @@ pub(super) fn versions_by_npm_preference<'a>(
     info: &'a CachedPackageInfo,
     range: &'a NpmRange,
 ) -> impl Iterator<Item = &'a NpmVersion> {
-    let preferred_latest = info
-        .latest_version
-        .as_ref()
-        .filter(|latest| range.satisfies_with_latest_bound(latest, info.latest_version.as_ref()));
-    preferred_latest
+    let preferred_version = range.dist_tag().map_or_else(
+        || info.latest_version.as_ref(),
+        |_| info.tagged_version_for_range(range),
+    );
+    let preferred_version =
+        preferred_version.filter(|version| info.range_satisfies(range, version));
+    preferred_version
         .into_iter()
         .chain(info.versions.iter().filter(move |version| {
-            preferred_latest != Some(*version)
-                && range.satisfies_with_latest_bound(version, info.latest_version.as_ref())
+            preferred_version != Some(*version) && info.range_satisfies(range, version)
         }))
 }

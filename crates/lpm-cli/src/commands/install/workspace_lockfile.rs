@@ -578,7 +578,7 @@ where
                     .await?;
                     let remove_legacy_importers =
                         coordinator.commit(std::slice::from_ref(&importer))?;
-                    commit_pending_manifest_transactions();
+                    commit_pending_manifest_transactions()?;
                     Ok::<_, LpmError>((result, remove_legacy_importers))
                 },
             )
@@ -715,7 +715,7 @@ where
                 async {
                     let result = future.await?;
                     let remove_legacy_importers = coordinator.commit(&required_importers)?;
-                    commit_pending_manifest_transactions();
+                    commit_pending_manifest_transactions()?;
                     Ok::<(T, bool), LpmError>((result, remove_legacy_importers))
                 },
             )
@@ -759,7 +759,33 @@ pub(crate) fn commit_manifest_transaction(transaction: crate::manifest_tx::Manif
     }
 }
 
-fn commit_pending_manifest_transactions() {
+pub(crate) fn commit_manifest_transaction_checked(
+    transaction: crate::manifest_tx::ManifestTransaction,
+) -> Result<(), LpmError> {
+    let mut transaction = Some(transaction);
+    let staged = ACTIVE_TRANSACTION
+        .try_with(|workspace| {
+            if let Some(transaction) = transaction.take() {
+                workspace
+                    .manifest_transactions
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .push(transaction);
+            }
+        })
+        .is_ok();
+    if !staged && let Some(transaction) = transaction {
+        transaction.verify_guarded_paths().map_err(|error| {
+            LpmError::Script(format!(
+                "project manifest changed while installing upgraded dependencies: {error}"
+            ))
+        })?;
+        transaction.commit();
+    }
+    Ok(())
+}
+
+fn commit_pending_manifest_transactions() -> Result<(), LpmError> {
     ACTIVE_TRANSACTION.with(|workspace| {
         let transactions = std::mem::take(
             &mut *workspace
@@ -767,10 +793,18 @@ fn commit_pending_manifest_transactions() {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner),
         );
+        for transaction in &transactions {
+            transaction.verify_guarded_paths().map_err(|error| {
+                LpmError::Script(format!(
+                    "project manifest changed while installing upgraded dependencies: {error}"
+                ))
+            })?;
+        }
         for transaction in transactions {
             transaction.commit();
         }
-    });
+        Ok(())
+    })
 }
 
 pub(super) fn importer_key(root: &Path, target: &Path) -> Result<String, LpmError> {

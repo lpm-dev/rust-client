@@ -692,7 +692,7 @@ impl ResolveState {
                      https://github.com/lpm-dev/rust-client/issues"
                 )));
             }
-            let range = NpmRange::parse(&effective_range).map_err(|e| {
+            let range = NpmRange::parse_registry_spec(&effective_range).map_err(|e| {
                 ResolveError::Internal(format!("failed to parse range for root dep {name}: {e}"))
             })?;
             self.task_queue.push_back(Edge {

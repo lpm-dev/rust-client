@@ -25,7 +25,7 @@ use version_ranges::Ranges;
 pub struct NpmRange {
     raw: String,
     parsed: node_semver::Range,
-    latest_tag: bool,
+    dist_tag: Option<String>,
 }
 
 impl NpmRange {
@@ -35,23 +35,35 @@ impl NpmRange {
             return Ok(NpmRange {
                 raw: "*".to_string(),
                 parsed: node_semver::Range::any(),
-                latest_tag: false,
+                dist_tag: None,
             });
         }
         if trimmed == "latest" {
             return Ok(NpmRange {
                 raw: "latest".to_string(),
                 parsed: node_semver::Range::any(),
-                latest_tag: true,
+                dist_tag: Some("latest".to_string()),
             });
         }
         let parsed = lpm_semver::parse_node_semver_range(trimmed)
-            .map_err(|e| format!("invalid range '{input}': {e}"))?;
+            .map_err(|error| format!("invalid range '{input}': {error}"))?;
         Ok(NpmRange {
             raw: trimmed.to_string(),
             parsed,
-            latest_tag: false,
+            dist_tag: None,
         })
+    }
+
+    pub fn parse_registry_spec(input: &str) -> Result<Self, String> {
+        match Self::parse(input) {
+            Ok(range) => Ok(range),
+            Err(_) if is_valid_dist_tag(input.trim()) => Ok(Self {
+                raw: input.trim().to_string(),
+                parsed: node_semver::Range::any(),
+                dist_tag: Some(input.trim().to_string()),
+            }),
+            Err(error) => Err(error),
+        }
     }
 
     /// Check if a version satisfies this range.
@@ -59,13 +71,18 @@ impl NpmRange {
         self.parsed.satisfies(version.as_inner())
     }
 
-    pub fn satisfies_with_latest_bound(
+    pub fn satisfies_with_dist_tag(
         &self,
         version: &NpmVersion,
-        latest_version: Option<&NpmVersion>,
+        tagged_version: Option<&NpmVersion>,
     ) -> bool {
-        self.satisfies(version)
-            && (!self.latest_tag || latest_version.is_none_or(|latest| version <= latest))
+        match self.dist_tag.as_deref() {
+            None => self.satisfies(version),
+            Some("latest") => {
+                self.satisfies(version) && tagged_version.is_none_or(|latest| version <= latest)
+            }
+            Some(_) => tagged_version == Some(version),
+        }
     }
 
     /// Given a list of all available versions, return a `Ranges<NpmVersion>`
@@ -74,13 +91,13 @@ impl NpmRange {
     /// This converts the predicate-based npm range into PubGrub's interval-based
     /// `Ranges` by building intervals around matching versions.
     pub fn to_pubgrub_ranges(&self, available_versions: &[NpmVersion]) -> Ranges<NpmVersion> {
-        self.to_pubgrub_ranges_with_latest_bound(available_versions, None)
+        self.to_pubgrub_ranges_with_dist_tag(available_versions, None)
     }
 
-    pub fn to_pubgrub_ranges_with_latest_bound(
+    pub fn to_pubgrub_ranges_with_dist_tag(
         &self,
         available_versions: &[NpmVersion],
-        latest_version: Option<&NpmVersion>,
+        tagged_version: Option<&NpmVersion>,
     ) -> Ranges<NpmVersion> {
         if self.raw == "*" {
             return Ranges::full();
@@ -105,7 +122,7 @@ impl NpmRange {
         available_versions
             .iter()
             .rev()
-            .filter(|version| self.satisfies_with_latest_bound(version, latest_version))
+            .filter(|version| self.satisfies_with_dist_tag(version, tagged_version))
             .map(|v| (Included(v.clone()), Included(v.clone())))
             .collect()
     }
@@ -137,13 +154,31 @@ impl NpmRange {
     }
 
     pub fn is_latest_tag(&self) -> bool {
-        self.latest_tag
+        self.dist_tag.as_deref() == Some("latest")
+    }
+
+    pub fn dist_tag(&self) -> Option<&str> {
+        self.dist_tag.as_deref()
     }
 
     pub fn exact_version(&self) -> Option<NpmVersion> {
+        if self.dist_tag.is_some() {
+            return None;
+        }
         let raw = self.raw.strip_prefix('=').unwrap_or(&self.raw);
         NpmVersion::parse(raw).ok()
     }
+}
+
+fn is_valid_dist_tag(value: &str) -> bool {
+    !value.is_empty()
+        && value.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric()
+                || matches!(
+                    byte,
+                    b'-' | b'_' | b'.' | b'!' | b'~' | b'*' | b'\'' | b'(' | b')'
+                )
+        })
 }
 
 /// Parsed npm-alias declaration.
@@ -320,11 +355,27 @@ mod tests {
         let r = NpmRange::parse("latest").unwrap();
         let avail = versions(&["3.0.0", "3.1.0", "4.0.0"]);
         let latest = v("3.1.0");
-        let ranges = r.to_pubgrub_ranges_with_latest_bound(&avail, Some(&latest));
+        let ranges = r.to_pubgrub_ranges_with_dist_tag(&avail, Some(&latest));
 
         assert!(ranges.contains(&v("3.0.0")));
         assert!(ranges.contains(&v("3.1.0")));
         assert!(!ranges.contains(&v("4.0.0")));
+    }
+
+    #[test]
+    fn custom_dist_tag_is_only_accepted_as_a_registry_spec() {
+        assert!(NpmRange::parse("legacy").is_err());
+        let range = NpmRange::parse_registry_spec("legacy").expect("valid custom dist-tag");
+        let tagged = v("1.2.3");
+
+        assert_eq!(range.dist_tag(), Some("legacy"));
+        assert!(range.satisfies_with_dist_tag(&tagged, Some(&tagged)));
+        assert!(!range.satisfies_with_dist_tag(&v("2.0.0"), Some(&tagged)));
+    }
+
+    #[test]
+    fn registry_spec_rejects_non_url_safe_malformed_range() {
+        assert!(NpmRange::parse_registry_spec("~X0^.00").is_err());
     }
 
     #[test]

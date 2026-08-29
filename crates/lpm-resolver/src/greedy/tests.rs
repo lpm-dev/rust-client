@@ -2304,7 +2304,7 @@ fn enqueue_child_deps_rejects_workspace_edge_for_unmarked_selected_version() {
 
 #[test]
 fn enqueue_child_deps_rejects_invalid_required_range() {
-    let info = mk_info(&[("1.0.0")], &[("malformed-child", "not-a-range")]);
+    let info = mk_info(&[("1.0.0")], &[("malformed-child", "~X0^.00")]);
     let mut state = ResolveState::new(HashMap::new(), OverrideSet::empty());
     state.nodes.push(ResolvedNodeBuilder {
         canonical: CanonicalKey::npm("parent"),
@@ -2325,7 +2325,7 @@ fn enqueue_child_deps_rejects_invalid_required_range() {
     let message = error.to_string();
     assert!(message.contains("parent@1.0.0"));
     assert!(message.contains("malformed-child"));
-    assert!(message.contains("not-a-range"));
+    assert!(message.contains("~X0^.00"));
 }
 
 #[test]
@@ -2627,7 +2627,7 @@ fn peer_collection_rejects_invalid_required_range() {
     let info = mk_info_with_peers(
         &["1.0.0"],
         &[],
-        &[("good-peer", "^1.0.0"), ("bad-peer", "this-is-not-semver")],
+        &[("good-peer", "^1.0.0"), ("bad-peer", "~X0^.00")],
         &[],
     );
     let mut state = ResolveState::new(HashMap::new(), OverrideSet::empty());
@@ -2650,12 +2650,7 @@ fn peer_collection_rejects_invalid_required_range() {
 
 #[test]
 fn peer_collection_skips_invalid_optional_range() {
-    let info = mk_info_with_peers(
-        &["1.0.0"],
-        &[],
-        &[("bad-peer", "this-is-not-semver")],
-        &["bad-peer"],
-    );
+    let info = mk_info_with_peers(&["1.0.0"], &[], &[("bad-peer", "~X0^.00")], &["bad-peer"]);
     let state = enqueue_for_parent(CanonicalKey::npm("parent"), &info);
     assert!(state.peer_requirements.is_empty());
 }
