@@ -175,13 +175,19 @@ pub(super) fn resolve_safe_dest_validate(
 
     // Refuse to overwrite/follow an existing symlink at the
     // destination itself. `symlink_metadata` does NOT follow links.
-    if let Ok(meta) = std::fs::symlink_metadata(&dest)
-        && lpm_common::is_symlink_or_junction(&meta)
-    {
-        return Err(LpmError::Registry(format!(
-            "destination '{}' is a symlink; refusing to write through it",
-            dest.display()
-        )));
+    if let Ok(metadata) = std::fs::symlink_metadata(&dest) {
+        if lpm_common::is_symlink_or_junction(&metadata) {
+            return Err(LpmError::Registry(format!(
+                "destination '{}' is a symlink; refusing to write through it",
+                dest.display()
+            )));
+        }
+        if !metadata.is_file() {
+            return Err(LpmError::Registry(format!(
+                "destination '{}' is not a regular file",
+                dest.display()
+            )));
+        }
     }
 
     let parent = dest.parent().ok_or_else(|| {

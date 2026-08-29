@@ -777,7 +777,7 @@ pub(crate) fn commit_manifest_transaction_checked(
     if !staged && let Some(transaction) = transaction {
         transaction.verify_guarded_paths().map_err(|error| {
             LpmError::Script(format!(
-                "project manifest changed while installing upgraded dependencies: {error}"
+                "project files changed during the transaction: {error}"
             ))
         })?;
         transaction.commit();
@@ -796,7 +796,7 @@ fn commit_pending_manifest_transactions() -> Result<(), LpmError> {
         for transaction in &transactions {
             transaction.verify_guarded_paths().map_err(|error| {
                 LpmError::Script(format!(
-                    "project manifest changed while installing upgraded dependencies: {error}"
+                    "project files changed during the transaction: {error}"
                 ))
             })?;
         }

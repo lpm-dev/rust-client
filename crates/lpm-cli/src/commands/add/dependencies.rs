@@ -298,6 +298,7 @@ pub(super) async fn handle_dependencies(
     no_engine_strict: bool,
     install_lpm_skills: bool,
     effective_pm: &str,
+    transaction: &mut crate::manifest_tx::ManifestTransaction,
 ) -> Result<DependencyOutcome, LpmError> {
     if entries.is_empty() {
         return Ok(DependencyOutcome {
@@ -372,7 +373,7 @@ pub(super) async fn handle_dependencies(
         })?;
         Ok::<_, LpmError>((name.to_string(), version))
     })
-    .buffered(METADATA_CONCURRENCY)
+    .buffer_unordered(METADATA_CONCURRENCY)
     .try_collect::<Vec<_>>()
     .await?;
     let resolved = HashMap::from_iter(resolved_pairs);
@@ -492,6 +493,13 @@ pub(super) async fn handle_dependencies(
             .map_err(|e| LpmError::Registry(format!("failed to serialize package.json: {e}")))?;
         lpm_common::write_file_atomic(&pkg_json_path, format!("{updated}\n"))
             .map_err(|e| LpmError::Registry(format!("failed to write package.json: {e}")))?;
+        transaction
+            .restore_only_if_current(&pkg_json_path)
+            .map_err(|error| {
+                LpmError::Registry(format!(
+                    "failed to protect package.json from concurrent edits: {error}"
+                ))
+            })?;
     }
 
     // Dispatch to the selected package manager. EVERY failure path

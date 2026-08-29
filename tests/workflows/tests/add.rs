@@ -33,6 +33,48 @@ use support::{
     wait_for_lock_contention, write_lpm_proxy_npmrc, write_npm_firewall_global_config,
 };
 
+fn wait_for_child_exit(
+    child: &mut std::process::Child,
+    timeout: std::time::Duration,
+) -> Option<std::process::ExitStatus> {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        match child.try_wait().expect("inspect child process") {
+            Some(status) => return Some(status),
+            None if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            None => return None,
+        }
+    }
+}
+
+async fn mount_swift_source_package(
+    mock: &MockRegistry,
+    name: &str,
+    latest: &str,
+    versions: &[(&str, serde_json::Value, &str)],
+) {
+    let mut mounted = Vec::with_capacity(versions.len());
+    for (version, dependencies, source) in versions {
+        let tarball = make_source_pkg_tarball(
+            name,
+            version,
+            json!({
+                "ecosystem": "swift",
+                "files": [{
+                    "src": "Source.swift",
+                    "dest": format!("{}-{version}.swift", name.rsplit('/').next().unwrap_or(name))
+                }]
+            }),
+            &[("Source.swift", source.as_bytes())],
+        );
+        mounted.push((*version, dependencies.clone(), Some(tarball)));
+    }
+    mock.mount_full_package_metadata_routes(name, latest, &mounted)
+        .await;
+}
+
 /// Assemble a source-package tarball: `lpm.config.json` at the root
 /// (which makes `lpm add` treat the package as a source delivery) plus
 /// any extra source files. The shape mirrors what `make_tarball_from_pkg_json`
@@ -1957,6 +1999,14 @@ async fn add_package_skill_fetch_failure_is_nonfatal_and_json_stays_valid() {
             .is_some_and(|warnings| !warnings.is_empty())
     );
     assert!(project.file_exists("components/Widget.ts"));
+    let state: serde_json::Value =
+        serde_json::from_str(&project.read_file(".lpm/added-sources.json")).unwrap();
+    assert!(
+        state["packages"][package]
+            .get("skillPackageShort")
+            .is_none(),
+        "failed skill materialization must not be recorded as removable provenance"
+    );
 }
 
 #[tokio::test]
@@ -2907,4 +2957,511 @@ async fn add_refuses_a_linked_project_lpm_directory() {
     assert!(!output.status.success());
     assert!(!project.file_exists("components/Source.ts"));
     assert!(std::fs::read_dir(outside.path()).unwrap().next().is_none());
+}
+
+#[tokio::test]
+async fn forced_readd_preserves_the_original_pre_delivery_backup() {
+    let mock = MockRegistry::start().await;
+    let package = "forced-readd-original-backup";
+    let first = make_source_pkg_tarball(
+        package,
+        "1.0.0",
+        json!({"ecosystem": "js", "files": [{"src": "Source.ts"}]}),
+        &[("Source.ts", b"export const version = 1;\n")],
+    );
+    let second = make_source_pkg_tarball(
+        package,
+        "2.0.0",
+        json!({"ecosystem": "js", "files": [{"src": "Source.ts"}]}),
+        &[("Source.ts", b"export const version = 2;\n")],
+    );
+    mock.mount_full_package_metadata_routes(
+        package,
+        "2.0.0",
+        &[
+            ("1.0.0", json!({}), Some(first)),
+            ("2.0.0", json!({}), Some(second)),
+        ],
+    )
+    .await;
+    let project = TempProject::empty(r#"{"name":"host","version":"1.0.0"}"#);
+    project.write_file("components/Source.ts", "original project bytes\n");
+
+    lpm_with_registry(&project, &mock.url())
+        .args([
+            "add",
+            &format!("{package}@1.0.0"),
+            "--yes",
+            "--force",
+            "--no-install-deps",
+            "--no-skills",
+        ])
+        .assert()
+        .success();
+    project.write_file("components/Source.ts", "user edit between deliveries\n");
+    lpm_with_registry(&project, &mock.url())
+        .args([
+            "add",
+            &format!("{package}@2.0.0"),
+            "--yes",
+            "--force",
+            "--no-install-deps",
+            "--no-skills",
+        ])
+        .assert()
+        .success();
+    support::lpm(&project)
+        .args(["remove", package])
+        .assert()
+        .success();
+
+    assert_eq!(
+        project.read_file("components/Source.ts"),
+        "original project bytes\n"
+    );
+}
+
+#[tokio::test]
+async fn readd_retains_lower_file_ownership_while_an_overwrite_owner_remains() {
+    let mock = MockRegistry::start().await;
+    let lower = "lower-shared-file-owner";
+    let upper = "upper-shared-file-owner";
+    let lower_first = make_source_pkg_tarball(
+        lower,
+        "1.0.0",
+        json!({"ecosystem": "js", "files": [{"src": "Shared.ts"}]}),
+        &[("Shared.ts", b"export const owner = 'lower';\n")],
+    );
+    let lower_second = make_source_pkg_tarball(
+        lower,
+        "2.0.0",
+        json!({"ecosystem": "js", "files": [{"src": "Other.ts"}]}),
+        &[("Other.ts", b"export const other = true;\n")],
+    );
+    let upper_tarball = make_source_pkg_tarball(
+        upper,
+        "1.0.0",
+        json!({"ecosystem": "js", "files": [{"src": "Shared.ts"}]}),
+        &[("Shared.ts", b"export const owner = 'upper';\n")],
+    );
+    mock.mount_full_package_metadata_routes(
+        lower,
+        "2.0.0",
+        &[
+            ("1.0.0", json!({}), Some(lower_first)),
+            ("2.0.0", json!({}), Some(lower_second)),
+        ],
+    )
+    .await;
+    mock.with_package(upper, "1.0.0", &upper_tarball).await;
+    let project = TempProject::empty(r#"{"name":"host","version":"1.0.0"}"#);
+
+    for (spec, force) in [
+        (format!("{lower}@1.0.0"), false),
+        (format!("{upper}@1.0.0"), true),
+        (format!("{lower}@2.0.0"), false),
+    ] {
+        let mut command = lpm_with_registry(&project, &mock.url());
+        command.args(["add", &spec, "--yes", "--no-install-deps", "--no-skills"]);
+        if force {
+            command.arg("--force");
+        }
+        command.assert().success();
+    }
+
+    let state: serde_json::Value =
+        serde_json::from_str(&project.read_file(".lpm/added-sources.json")).unwrap();
+    assert!(
+        state["packages"][lower]["files"]
+            .get("components/Shared.ts")
+            .is_some(),
+        "lower ownership must remain until the upper overwrite is unwound"
+    );
+}
+
+#[tokio::test]
+async fn managed_upgrade_dry_run_reports_the_real_overwrite_action() {
+    let mock = MockRegistry::start().await;
+    let package = "managed-dry-run-upgrade";
+    let first = make_source_pkg_tarball(
+        package,
+        "1.0.0",
+        json!({"ecosystem": "js", "files": [{"src": "Source.ts"}]}),
+        &[("Source.ts", b"export const version = 1;\n")],
+    );
+    let second = make_source_pkg_tarball(
+        package,
+        "2.0.0",
+        json!({"ecosystem": "js", "files": [{"src": "Source.ts"}]}),
+        &[("Source.ts", b"export const version = 2;\n")],
+    );
+    mock.mount_full_package_metadata_routes(
+        package,
+        "2.0.0",
+        &[
+            ("1.0.0", json!({}), Some(first)),
+            ("2.0.0", json!({}), Some(second)),
+        ],
+    )
+    .await;
+    let project = TempProject::empty(r#"{"name":"host","version":"1.0.0"}"#);
+    lpm_with_registry(&project, &mock.url())
+        .args([
+            "add",
+            &format!("{package}@1.0.0"),
+            "--yes",
+            "--no-install-deps",
+            "--no-skills",
+        ])
+        .assert()
+        .success();
+
+    let output = lpm_with_registry(&project, &mock.url())
+        .args([
+            "add",
+            &format!("{package}@2.0.0"),
+            "--yes",
+            "--json",
+            "--dry-run",
+            "--no-install-deps",
+            "--no-skills",
+        ])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let body: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(body["files"][0]["action"], "overwrite");
+}
+
+#[tokio::test]
+async fn add_rejects_an_existing_directory_at_a_file_destination() {
+    let mock = MockRegistry::start().await;
+    let package = "directory-file-conflict-source";
+    let tarball = make_source_pkg_tarball(
+        package,
+        "1.0.0",
+        json!({"ecosystem": "js", "files": [{"src": "Source.bin"}]}),
+        &[("Source.bin", b"binary source payload")],
+    );
+    mock.with_package(package, "1.0.0", &tarball).await;
+    let project = TempProject::empty(r#"{"name":"host","version":"1.0.0"}"#);
+    std::fs::create_dir_all(project.path().join("components/Source.bin")).unwrap();
+
+    let output = lpm_with_registry(&project, &mock.url())
+        .args(["add", package, "--yes", "--no-install-deps", "--no-skills"])
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    assert!(project.path().join("components/Source.bin").is_dir());
+    assert!(!project.file_exists(".lpm/added-sources.json"));
+}
+
+#[tokio::test]
+async fn add_rechecks_engine_constraints_after_waiting_for_the_project_lock() {
+    let mock = MockRegistry::start().await;
+    let package = "locked-engine-preflight-source";
+    let tarball = make_source_pkg_tarball(
+        package,
+        "1.0.0",
+        json!({"ecosystem": "js", "files": [{"src": "Source.ts"}]}),
+        &[("Source.ts", b"export const source = true;\n")],
+    );
+    mock.with_package(package, "1.0.0", &tarball).await;
+    let project =
+        TempProject::empty(r#"{"name":"host","version":"1.0.0","lpm":{"engineStrict":true}}"#);
+    let transaction_lock =
+        lpm_common::acquire_exclusive_lock(lpm_common::project_install_lock(project.path()))
+            .expect("hold project install lock");
+    let lock_path = lpm_common::project_install_lock(project.path());
+    let marker_path = project.home().join("add-engine-lock-contention");
+    let mut command = lpm_spawnable_with_registry(&project, &mock.url());
+    command.env(LOCK_CONTENTION_MARKER_ENV, &marker_path);
+    command.args(["add", package, "--yes", "--no-install-deps", "--no-skills"]);
+    let mut child = command.spawn().expect("spawn contending add");
+
+    wait_for_lock_contention(&mut child, &marker_path, &lock_path);
+    project.write_file(
+        "package.json",
+        r#"{"name":"host","version":"1.0.0","engines":{"node":">=999.0.0"},"lpm":{"engineStrict":true}}"#,
+    );
+    drop(transaction_lock);
+    let output = child.wait_with_output().expect("finish contending add");
+
+    assert!(!output.status.success());
+    assert!(!project.file_exists("components/Source.ts"));
+    assert!(!project.file_exists(".lpm/added-sources.json"));
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn add_rollback_preserves_a_manifest_edit_made_during_dependency_install() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let mock = MockRegistry::start().await;
+    let package = "concurrent-manifest-rollback-source";
+    let dependency = "concurrent-manifest-leaf";
+    let tarball = make_source_pkg_tarball(
+        package,
+        "1.0.0",
+        json!({
+            "ecosystem": "js",
+            "configSchema": {"enabled": {"type": "boolean", "required": true, "default": true}},
+            "dependencies": {"enabled": {"true": [format!("{dependency}@1.0.0")] }},
+            "files": [{"src": "Source.ts"}]
+        }),
+        &[("Source.ts", b"export const source = true;\n")],
+    );
+    mock.with_package(package, "1.0.0", &tarball).await;
+    let project = TempProject::empty(r#"{"name":"host","version":"1.0.0","dependencies":{}}"#);
+    let bin_dir = project.home().join("fake-package-manager-bin");
+    std::fs::create_dir_all(&bin_dir).unwrap();
+    let npm = bin_dir.join("npm");
+    std::fs::write(
+        &npm,
+        "#!/bin/sh\n: > \"$LPM_FAKE_PM_STARTED\"\nwhile [ ! -e \"$LPM_FAKE_PM_RELEASE\" ]; do sleep 0.02; done\nexit 23\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&npm, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let started = project.home().join("fake-pm-started");
+    let release = project.home().join("fake-pm-release");
+    let existing_path = std::env::var_os("PATH").unwrap_or_default();
+    let path =
+        std::env::join_paths(std::iter::once(bin_dir).chain(std::env::split_paths(&existing_path)))
+            .unwrap();
+    let mut command = lpm_spawnable_with_registry(&project, &mock.url());
+    command
+        .env("PATH", path)
+        .env("LPM_FAKE_PM_STARTED", &started)
+        .env("LPM_FAKE_PM_RELEASE", &release)
+        .args(["add", package, "--yes", "--pm", "npm", "--no-skills"]);
+    let child = command
+        .spawn()
+        .expect("spawn add with failing package manager");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !started.exists() && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert!(started.exists(), "fake package manager was not invoked");
+    let external_edit =
+        r#"{"name":"host","version":"1.0.0","description":"concurrent editor change"}"#;
+    project.write_file("package.json", external_edit);
+    std::fs::write(&release, b"release").unwrap();
+    let output = child.wait_with_output().expect("finish failed add");
+
+    assert!(!output.status.success());
+    assert_eq!(project.read_file("package.json"), external_edit);
+}
+
+#[tokio::test]
+async fn co_tracked_dependency_does_not_block_the_inserting_owners_upgrade() {
+    let mock = MockRegistry::start().await;
+    let owner = "dependency-upgrade-owner";
+    let observer = "dependency-upgrade-observer";
+    let dependency = "co-tracked-upgrade-leaf";
+    let source = |package: &str, version: &str, dependency_version: &str, destination: &str| {
+        make_source_pkg_tarball(
+            package,
+            version,
+            json!({
+                "ecosystem": "js",
+                "configSchema": {"enabled": {"type": "boolean", "required": true, "default": true}},
+                "dependencies": {"enabled": {"true": [format!("{dependency}@{dependency_version}")] }},
+                "files": [{"src": "Source.ts", "dest": destination}]
+            }),
+            &[("Source.ts", b"export const source = true;\n")],
+        )
+    };
+    let owner_v1 = source(owner, "1.0.0", "1.0.0", "Owner.ts");
+    let owner_v2 = source(owner, "2.0.0", "2.0.0", "Owner.ts");
+    let observer_v1 = source(observer, "1.0.0", "1.0.0", "Observer.ts");
+    let owner_metadata = mock
+        .mount_full_package_metadata_routes(
+            owner,
+            "2.0.0",
+            &[
+                ("1.0.0", json!({}), Some(owner_v1)),
+                ("2.0.0", json!({}), Some(owner_v2)),
+            ],
+        )
+        .await;
+    let observer_metadata = mock
+        .mount_full_package_metadata_routes(
+            observer,
+            "1.0.0",
+            &[("1.0.0", json!({}), Some(observer_v1))],
+        )
+        .await;
+    let dependency_v1 =
+        make_tarball_from_pkg_json(json!({"name": dependency, "version": "1.0.0"}), &[]);
+    let dependency_v2 =
+        make_tarball_from_pkg_json(json!({"name": dependency, "version": "2.0.0"}), &[]);
+    let dependency_metadata = mock
+        .mount_full_package_metadata_routes(
+            dependency,
+            "2.0.0",
+            &[
+                ("1.0.0", json!({}), Some(dependency_v1)),
+                ("2.0.0", json!({}), Some(dependency_v2)),
+            ],
+        )
+        .await;
+    mock.with_batch_metadata(vec![owner_metadata, observer_metadata, dependency_metadata])
+        .await;
+    let project = TempProject::empty(r#"{"name":"host","version":"1.0.0","dependencies":{}}"#);
+
+    for spec in [
+        format!("{owner}@1.0.0"),
+        format!("{observer}@1.0.0"),
+        format!("{owner}@2.0.0"),
+    ] {
+        lpm_with_registry(&project, &mock.url())
+            .args(["add", &spec, "--yes", "--no-skills", "--no-editor-setup"])
+            .assert()
+            .success();
+    }
+
+    let manifest: serde_json::Value =
+        serde_json::from_str(&project.read_file("package.json")).unwrap();
+    assert_eq!(manifest["dependencies"][dependency], "2.0.0");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn identical_managed_readd_does_not_replace_the_destination_file() {
+    use std::os::unix::fs::MetadataExt as _;
+
+    let mock = MockRegistry::start().await;
+    let package = "identical-managed-readd";
+    let tarball = make_source_pkg_tarball(
+        package,
+        "1.0.0",
+        json!({"ecosystem": "js", "files": [{"src": "Source.ts"}]}),
+        &[("Source.ts", b"export const stable = true;\n")],
+    );
+    mock.with_package(package, "1.0.0", &tarball).await;
+    let project = TempProject::empty(r#"{"name":"host","version":"1.0.0"}"#);
+    lpm_with_registry(&project, &mock.url())
+        .args(["add", package, "--yes", "--no-install-deps", "--no-skills"])
+        .assert()
+        .success();
+    let destination = project.path().join("components/Source.ts");
+    let inode_before = std::fs::metadata(&destination).unwrap().ino();
+
+    lpm_with_registry(&project, &mock.url())
+        .args(["add", package, "--yes", "--no-install-deps", "--no-skills"])
+        .assert()
+        .success();
+
+    assert_eq!(std::fs::metadata(destination).unwrap().ino(), inode_before);
+}
+
+#[tokio::test]
+async fn swift_dependency_range_selects_a_matching_version() {
+    let mock = MockRegistry::start().await;
+    let root = "@lpm.dev/swift.root-range";
+    let dependency = "@lpm.dev/swift.child-range";
+    mount_swift_source_package(
+        &mock,
+        root,
+        "1.0.0",
+        &[("1.0.0", json!({dependency: "^1.0.0"}), "root\n")],
+    )
+    .await;
+    mount_swift_source_package(
+        &mock,
+        dependency,
+        "2.0.0",
+        &[
+            ("1.5.0", json!({}), "selected v1\n"),
+            ("2.0.0", json!({}), "latest v2\n"),
+        ],
+    )
+    .await;
+    let project = TempProject::empty(r#"{"name":"host","version":"1.0.0"}"#);
+
+    lpm_with_registry(&project, &mock.url())
+        .args(["add", root, "--yes", "--no-install-deps", "--no-skills"])
+        .assert()
+        .success();
+
+    assert_eq!(
+        project.read_file("Sources/swift.child-range-1.5.0.swift"),
+        "selected v1\n"
+    );
+    assert!(!project.file_exists("Sources/swift.child-range-2.0.0.swift"));
+}
+
+#[tokio::test]
+async fn swift_recursive_json_emits_one_complete_document() {
+    let mock = MockRegistry::start().await;
+    let root = "@lpm.dev/swift.root-json";
+    let dependency = "@lpm.dev/swift.child-json";
+    mount_swift_source_package(
+        &mock,
+        root,
+        "1.0.0",
+        &[("1.0.0", json!({dependency: "1.0.0"}), "root\n")],
+    )
+    .await;
+    mount_swift_source_package(
+        &mock,
+        dependency,
+        "1.0.0",
+        &[("1.0.0", json!({}), "child\n")],
+    )
+    .await;
+    let project = TempProject::empty(r#"{"name":"host","version":"1.0.0"}"#);
+
+    let output = lpm_with_registry(&project, &mock.url())
+        .args([
+            "add",
+            root,
+            "--yes",
+            "--json",
+            "--no-install-deps",
+            "--no-skills",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    let body: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(body["package"]["name"], root);
+}
+
+#[tokio::test]
+async fn swift_dependency_cycle_terminates_after_each_package_is_added_once() {
+    let mock = MockRegistry::start().await;
+    let root = "@lpm.dev/swift.cycle-root";
+    let dependency = "@lpm.dev/swift.cycle-child";
+    mount_swift_source_package(
+        &mock,
+        root,
+        "1.0.0",
+        &[("1.0.0", json!({dependency: "1.0.0"}), "root\n")],
+    )
+    .await;
+    mount_swift_source_package(
+        &mock,
+        dependency,
+        "1.0.0",
+        &[("1.0.0", json!({root: "1.0.0"}), "child\n")],
+    )
+    .await;
+    let project = TempProject::empty(r#"{"name":"host","version":"1.0.0"}"#);
+    let mut command = lpm_spawnable_with_registry(&project, &mock.url());
+    command
+        .args(["add", root, "--yes", "--no-install-deps", "--no-skills"])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    let mut child = command.spawn().expect("spawn cyclic Swift add");
+
+    let status = wait_for_child_exit(&mut child, std::time::Duration::from_secs(3));
+    if status.is_none() {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    assert!(status.is_some_and(|status| status.success()));
 }

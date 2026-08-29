@@ -38,13 +38,13 @@ use project::{
 use serde::ser::SerializeSeq;
 use serde::{Serialize, Serializer};
 use source::{
-    collect_source_with_fallback, filter_config_files, is_runtime_source_text_file,
-    json_value_to_config_string, read_lpm_config, resolve_noninteractive_required_config,
+    collect_source_with_fallback, filter_config_files, json_value_to_config_string,
+    read_lpm_config, read_runtime_source_text, resolve_noninteractive_required_config,
     validate_declared_config_values,
 };
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use swift::handle_swift_lpm_deps;
+use swift::{SwiftTraversal, handle_swift_lpm_deps};
 use target::{AddTarget, resolve_add_target};
 
 #[derive(Serialize)]
@@ -166,6 +166,65 @@ fn missing_path_directories(project_dir: &Path, path: &Path) -> Vec<PathBuf> {
     missing
 }
 
+type PreservedFileProvenance = (
+    crate::added_sources_state::AddedSourceFileAction,
+    Option<PathBuf>,
+    Option<String>,
+    Option<u32>,
+);
+
+fn validate_previous_file_provenance(
+    project_dir: &Path,
+    package: &str,
+    manifest_path: &Path,
+    previous: &crate::added_sources_state::AddedSourceFile,
+) -> Result<PreservedFileProvenance, LpmError> {
+    let action = previous.action.ok_or_else(|| {
+        LpmError::Registry(format!(
+            "source state for '{}' has no delivery action",
+            manifest_path.display()
+        ))
+    })?;
+    match action {
+        crate::added_sources_state::AddedSourceFileAction::Create => {
+            if previous.backup_path.is_some()
+                || previous.backup_digest.is_some()
+                || previous.backup_mode.is_some()
+            {
+                return Err(LpmError::Registry(format!(
+                    "source state for '{}' has backup metadata without overwrite ownership",
+                    manifest_path.display()
+                )));
+            }
+            Ok((action, None, None, None))
+        }
+        crate::added_sources_state::AddedSourceFileAction::Overwrite => {
+            let recorded_backup = previous.backup_path.as_deref().ok_or_else(|| {
+                LpmError::Registry(format!(
+                    "source state for '{}' is missing its overwrite backup",
+                    manifest_path.display()
+                ))
+            })?;
+            let backup_path = crate::added_sources_state::validate_recorded_backup_path(
+                package,
+                manifest_path,
+                recorded_backup,
+            )?;
+            crate::added_sources_state::validate_existing_backup(
+                project_dir,
+                &backup_path,
+                previous.backup_digest.as_deref(),
+            )?;
+            Ok((
+                action,
+                Some(backup_path),
+                previous.backup_digest.clone(),
+                previous.backup_mode,
+            ))
+        }
+    }
+}
+
 fn reconcile_stale_source_files(
     project_dir: &Path,
     package: &str,
@@ -178,14 +237,19 @@ fn reconcile_stale_source_files(
     let Some(previous) = previous else {
         return Ok(());
     };
+    let owned_by_other = state
+        .packages
+        .values()
+        .flat_map(|record| record.files.keys())
+        .filter(|path| previous.files.contains_key(*path))
+        .collect::<HashSet<_>>();
 
     for (manifest_path, file) in &previous.files {
         if declared.contains(manifest_path) {
             continue;
         }
-        if state.packages.iter().any(|(other_package, record)| {
-            other_package != package && record.files.contains_key(manifest_path)
-        }) {
+        if owned_by_other.contains(manifest_path) {
+            tracked_files.push((manifest_path.clone(), file.clone()));
             continue;
         }
 
@@ -214,6 +278,9 @@ fn reconcile_stale_source_files(
                     .snapshot_optional_path(&destination)
                     .map_err(LpmError::Io)?;
                 std::fs::remove_file(&destination).map_err(LpmError::Io)?;
+                transaction
+                    .restore_only_if_current(&destination)
+                    .map_err(LpmError::Io)?;
             }
             (Some(crate::added_sources_state::AddedSourceFileAction::Create), false) => {}
             (Some(crate::added_sources_state::AddedSourceFileAction::Overwrite), true) => {
@@ -240,7 +307,13 @@ fn reconcile_stale_source_files(
                     .snapshot_optional_path(&backup)
                     .map_err(LpmError::Io)?;
                 crate::added_sources_state::copy_file_atomic_with_digest(&backup, &destination)?;
+                transaction
+                    .restore_only_if_current(&destination)
+                    .map_err(LpmError::Io)?;
                 std::fs::remove_file(&backup).map_err(LpmError::Io)?;
+                transaction
+                    .restore_only_if_current(&backup)
+                    .map_err(LpmError::Io)?;
             }
             (Some(crate::added_sources_state::AddedSourceFileAction::Overwrite), false) => {
                 let recorded_backup = file.backup_path.as_deref().ok_or_else(|| {
@@ -266,7 +339,13 @@ fn reconcile_stale_source_files(
                     .snapshot_optional_path(&backup)
                     .map_err(LpmError::Io)?;
                 crate::added_sources_state::copy_file_atomic_with_digest(&backup, &destination)?;
+                transaction
+                    .restore_only_if_current(&destination)
+                    .map_err(LpmError::Io)?;
                 std::fs::remove_file(&backup).map_err(LpmError::Io)?;
+                transaction
+                    .restore_only_if_current(&backup)
+                    .map_err(LpmError::Io)?;
             }
             (None, _) => tracked_files.push((manifest_path.clone(), file.clone())),
         }
@@ -276,38 +355,53 @@ fn reconcile_stale_source_files(
 
 fn reconcile_stale_dependencies(
     project_dir: &Path,
-    package: &str,
     state: &mut crate::added_sources_state::AddedSourcesState,
     previous: Option<&crate::added_sources_state::AddedSourceRecord>,
     desired: &HashSet<&str>,
+    transaction: &mut crate::manifest_tx::ManifestTransaction,
 ) -> Result<bool, LpmError> {
     let Some(previous) = previous else {
         return Ok(false);
     };
-    for (name, dependency) in previous
+    let stale_names = previous
+        .dependencies
+        .iter()
+        .filter(|(name, dependency)| dependency.inserted && !desired.contains(name.as_str()))
+        .map(|(name, _)| name.as_str())
+        .collect::<HashSet<_>>();
+    let mut replacement_owners = HashMap::<String, String>::with_capacity(stale_names.len());
+    let mut inserted_elsewhere = HashSet::<String>::with_capacity(stale_names.len());
+    for (other_package, record) in &state.packages {
+        for (name, candidate) in &record.dependencies {
+            if !stale_names.contains(name.as_str()) {
+                continue;
+            }
+            if candidate.inserted {
+                inserted_elsewhere.insert(name.clone());
+            }
+            let previous_dependency = &previous.dependencies[name];
+            if candidate.spec == previous_dependency.spec
+                && candidate.section == previous_dependency.section
+            {
+                replacement_owners
+                    .entry(name.clone())
+                    .or_insert_with(|| other_package.clone());
+            }
+        }
+    }
+    for (name, _) in previous
         .dependencies
         .iter()
         .filter(|(name, dependency)| dependency.inserted && !desired.contains(name.as_str()))
     {
-        let replacement_owner = state.packages.iter().find_map(|(other_package, record)| {
-            if other_package == package {
-                return None;
-            }
-            record
-                .dependencies
-                .get(name)
-                .filter(|candidate| {
-                    candidate.spec == dependency.spec && candidate.section == dependency.section
-                })
-                .map(|_| other_package.clone())
-        });
-        if let Some(replacement_owner) = replacement_owner
+        if let Some(replacement_owner) = replacement_owners.get(name)
             && let Some(replacement) = state
                 .packages
-                .get_mut(&replacement_owner)
+                .get_mut(replacement_owner)
                 .and_then(|record| record.dependencies.get_mut(name))
         {
             replacement.inserted = true;
+            inserted_elsewhere.insert(name.clone());
         }
     }
     let stale = previous
@@ -316,9 +410,7 @@ fn reconcile_stale_dependencies(
         .filter(|(name, dependency)| {
             dependency.inserted
                 && !desired.contains(name.as_str())
-                && !state.packages.iter().any(|(other_package, record)| {
-                    other_package != package && record.dependencies.contains_key(name.as_str())
-                })
+                && !inserted_elsewhere.contains(name.as_str())
         })
         .collect::<Vec<_>>();
     if stale.is_empty() {
@@ -353,23 +445,34 @@ fn reconcile_stale_dependencies(
         })?;
         body.push(b'\n');
         lpm_common::write_file_atomic(&manifest_path, body).map_err(LpmError::Io)?;
+        transaction
+            .restore_only_if_current(&manifest_path)
+            .map_err(LpmError::Io)?;
     }
     Ok(changed)
 }
 
 fn exclusively_owned_dependencies(
-    package: &str,
     state: &crate::added_sources_state::AddedSourcesState,
     previous: Option<&crate::added_sources_state::AddedSourceRecord>,
 ) -> HashMap<String, crate::added_sources_state::AddedSourceDependency> {
-    previous
-        .into_iter()
+    let Some(previous) = previous else {
+        return HashMap::new();
+    };
+    let inserted_elsewhere = state
+        .packages
+        .values()
         .flat_map(|record| &record.dependencies)
         .filter(|(name, dependency)| {
-            dependency.inserted
-                && !state.packages.iter().any(|(other_package, record)| {
-                    other_package != package && record.dependencies.contains_key(name.as_str())
-                })
+            dependency.inserted && previous.dependencies.contains_key(name.as_str())
+        })
+        .map(|(name, _)| name.as_str())
+        .collect::<HashSet<_>>();
+    previous
+        .dependencies
+        .iter()
+        .filter(|(name, dependency)| {
+            dependency.inserted && !inserted_elsewhere.contains(name.as_str())
         })
         .map(|(name, dependency)| (name.clone(), dependency.clone()))
         .collect()
@@ -397,8 +500,11 @@ pub async fn run(
     alias_override: Option<&str>,
     swift_target: Option<&str>,
 ) -> Result<(), LpmError> {
-    crate::commands::install::workspace_lockfile::scope_member_install(
-        project_dir,
+    let mut swift_traversal = SwiftTraversal::default();
+    let operation = async {
+        if !dry_run {
+            crate::engine_check::enforce(project_dir, no_engine_strict, json_output)?;
+        }
         run_locked(
             client,
             project_dir,
@@ -415,9 +521,12 @@ pub async fn run(
             pm,
             alias_override,
             swift_target,
-        ),
-    )
-    .await
+            &mut swift_traversal,
+            true,
+        )
+        .await
+    };
+    crate::commands::install::workspace_lockfile::scope_member_install(project_dir, operation).await
 }
 
 #[expect(
@@ -440,6 +549,8 @@ async fn run_locked(
     pm: &str,
     alias_override: Option<&str>,
     swift_target: Option<&str>,
+    swift_traversal: &mut SwiftTraversal,
+    emit_output: bool,
 ) -> Result<(), LpmError> {
     let add_started = std::time::Instant::now();
     let is_tty = std::io::IsTerminal::is_terminal(&std::io::stdin());
@@ -550,6 +661,9 @@ async fn run_locked(
             &resolver_policy,
         )?
     };
+    if !swift_traversal.record_resolution(&target.json_name(), &version)? {
+        return Ok(());
+    }
 
     let ver_meta = metadata
         .version(&version)
@@ -1039,7 +1153,7 @@ async fn run_locked(
         })?;
     tx.remove_dirs_on_rollback(rollback_dirs);
     let package_state_key = target.json_name();
-    let previous_package_record = added_sources_state.package(&package_state_key).cloned();
+    let previous_package_record = added_sources_state.take_package(&package_state_key);
 
     std::fs::create_dir_all(&target_dir)?;
     let target_root_canonical = target_dir.canonicalize().map_err(|e| {
@@ -1101,29 +1215,30 @@ async fn run_locked(
     for ((src_rel, dest_rel), dest_path) in files.iter().zip(final_dest_paths.iter()) {
         let src_path = temp_dir.path().join(src_rel);
 
-        let content = if is_runtime_source_text_file(&src_path) {
-            std::fs::read_to_string(&src_path).ok()
-        } else {
-            None
-        };
-        if lpm_config.is_none()
-            && let Some(text) = content.as_deref()
-        {
-            collected_external_imports.extend(crate::import_rewriter::collect_bare_specifiers(
-                text,
-                author_alias.as_deref(),
-            ));
-        }
+        let content = read_runtime_source_text(&src_path)?;
         let rewritten = content.as_deref().and_then(|text| {
-            crate::import_rewriter::rewrite_imports_indexed(
-                text,
-                src_rel,
-                dest_rel,
-                author_alias.as_deref(),
-                buyer_alias.as_deref(),
-                &src_to_dest,
-                &dest_files,
-            )
+            if lpm_config.is_none() {
+                crate::import_rewriter::rewrite_imports_indexed_collecting_bare(
+                    text,
+                    src_rel,
+                    dest_rel,
+                    author_alias.as_deref(),
+                    buyer_alias.as_deref(),
+                    &src_to_dest,
+                    &dest_files,
+                    &mut collected_external_imports,
+                )
+            } else {
+                crate::import_rewriter::rewrite_imports_indexed(
+                    text,
+                    src_rel,
+                    dest_rel,
+                    author_alias.as_deref(),
+                    buyer_alias.as_deref(),
+                    &src_to_dest,
+                    &dest_files,
+                )
+            }
         });
 
         let final_content = rewritten.as_deref().or(content.as_deref());
@@ -1142,6 +1257,29 @@ async fn run_locked(
             previous.installed_digest.as_ref() == current_digest.as_ref()
                 && previous.action.is_some()
         });
+
+        if previous_is_current {
+            let incoming_digest = if let Some(text) = final_content {
+                crate::added_sources_state::digest_bytes(text.as_bytes())
+            } else {
+                crate::added_sources_state::digest_file(&src_path)?
+            };
+            let previous = previous_file.as_ref().expect("checked above");
+            if previous.installed_digest.as_deref() == Some(incoming_digest.as_str()) {
+                validate_previous_file_provenance(
+                    project_dir,
+                    &package_state_key,
+                    &manifest_path,
+                    previous,
+                )?;
+                let mut tracked = previous.clone();
+                tracked.source = Some(PathBuf::from(src_rel));
+                tracked_files.push((manifest_path, tracked));
+                skipped += 1;
+                file_actions.push((src_rel.as_str(), dest_rel.as_str(), "skip"));
+                continue;
+            }
+        }
 
         // Check for conflicts using diff-aware resolution
         if dest_existed && !previous_is_current {
@@ -1166,45 +1304,18 @@ async fn run_locked(
         }
 
         let (source_action, backup_path, backup_digest, backup_mode, destination_snapshot) =
-            if dest_existed && previous_is_current {
-                let previous = previous_file.as_ref().expect("checked above");
-                if previous.action
-                    == Some(crate::added_sources_state::AddedSourceFileAction::Overwrite)
-                {
-                    let recorded_backup = previous.backup_path.as_ref().ok_or_else(|| {
-                        LpmError::Registry(format!(
-                            "source state for '{}' is missing its overwrite backup",
-                            manifest_path.display()
-                        ))
-                    })?;
-                    let backup_path = crate::added_sources_state::validate_recorded_backup_path(
+            if let Some(previous) = previous_file
+                .as_ref()
+                .filter(|previous| previous.action.is_some())
+            {
+                let (action, backup_path, backup_digest, backup_mode) =
+                    validate_previous_file_provenance(
+                        project_dir,
                         &package_state_key,
                         &manifest_path,
-                        recorded_backup,
+                        previous,
                     )?;
-                    crate::added_sources_state::validate_existing_backup(
-                        project_dir,
-                        &backup_path,
-                        previous.backup_digest.as_deref(),
-                    )?;
-                }
-                (
-                    previous.action.expect("checked above"),
-                    previous
-                        .backup_path
-                        .as_deref()
-                        .map(|recorded| {
-                            crate::added_sources_state::validate_recorded_backup_path(
-                                &package_state_key,
-                                &manifest_path,
-                                recorded,
-                            )
-                        })
-                        .transpose()?,
-                    previous.backup_digest.clone(),
-                    previous.backup_mode,
-                    None,
-                )
+                (action, backup_path, backup_digest, backup_mode, None)
             } else if dest_existed {
                 let backup_path = crate::added_sources_state::backup_path_for_file(
                     &package_state_key,
@@ -1221,6 +1332,8 @@ async fn run_locked(
                     })?;
                 let written_backup =
                     crate::added_sources_state::write_backup(project_dir, &backup_path, dest_path)?;
+                tx.restore_only_if_current(&absolute_backup)
+                    .map_err(LpmError::Io)?;
                 let destination_snapshot =
                     std::fs::File::open(&absolute_backup).map_err(LpmError::Io)?;
                 (
@@ -1230,41 +1343,14 @@ async fn run_locked(
                     written_backup.original_mode,
                     Some(destination_snapshot),
                 )
-            } else if previous_file.as_ref().is_some_and(|previous| {
-                previous.action
-                    == Some(crate::added_sources_state::AddedSourceFileAction::Overwrite)
-            }) {
-                let previous = previous_file.as_ref().expect("checked above");
-                let recorded_backup = previous.backup_path.as_ref().ok_or_else(|| {
-                    LpmError::Registry(format!(
-                        "source state for '{}' is missing its overwrite backup",
-                        manifest_path.display()
-                    ))
-                })?;
-                let backup_path = crate::added_sources_state::validate_recorded_backup_path(
-                    &package_state_key,
-                    &manifest_path,
-                    recorded_backup,
-                )?;
-                crate::added_sources_state::validate_existing_backup(
-                    project_dir,
-                    &backup_path,
-                    previous.backup_digest.as_deref(),
-                )?;
-                (
-                    crate::added_sources_state::AddedSourceFileAction::Overwrite,
-                    Some(backup_path),
-                    previous.backup_digest.clone(),
-                    previous.backup_mode,
-                    None,
-                )
             } else {
-                if previous_file
-                    .as_ref()
-                    .is_some_and(|previous| previous.backup_path.is_some())
-                {
+                if previous_file.as_ref().is_some_and(|previous| {
+                    previous.backup_path.is_some()
+                        || previous.backup_digest.is_some()
+                        || previous.backup_mode.is_some()
+                }) {
                     return Err(LpmError::Registry(format!(
-                        "source state for '{}' has a backup without overwrite ownership",
+                        "source state for '{}' has backup metadata without overwrite ownership",
                         manifest_path.display()
                     )));
                 }
@@ -1294,6 +1380,8 @@ async fn run_locked(
         } else {
             crate::added_sources_state::copy_file_atomic_with_digest(&src_path, dest_path)?
         };
+        tx.restore_only_if_current(dest_path)
+            .map_err(LpmError::Io)?;
         copied += 1;
         tracked_files.push((
             manifest_path,
@@ -1343,20 +1431,17 @@ async fn run_locked(
         .iter()
         .map(|(name, _)| name.as_str())
         .collect();
-    let exclusively_owned_dependencies = exclusively_owned_dependencies(
-        &package_state_key,
-        &added_sources_state,
-        previous_package_record.as_ref(),
-    );
+    let exclusively_owned_dependencies =
+        exclusively_owned_dependencies(&added_sources_state, previous_package_record.as_ref());
     let removed_stale_dependencies = if no_install_deps {
         false
     } else {
         reconcile_stale_dependencies(
             project_dir,
-            &package_state_key,
             &mut added_sources_state,
             previous_package_record.as_ref(),
             &desired_dependency_names,
+            &mut tx,
         )?
     };
 
@@ -1385,6 +1470,7 @@ async fn run_locked(
             no_engine_strict,
             !no_skills,
             &effective_pm,
+            &mut tx,
         )
         .await?
     } else if !no_install_deps && lpm_config.is_none() {
@@ -1454,10 +1540,9 @@ async fn run_locked(
     // Persist exact source-delivery outputs so `lpm remove` can reverse the
     // add precisely for npm/private-registry packages and custom `--path`
     // installs, instead of guessing from a fixed directory list.
-    let tracked_skill_short = match (&target, no_skills) {
-        (AddTarget::Lpm(pkg), false) => Some(pkg.short()),
-        _ => None,
-    };
+    let tracked_skill_short = previous_package_record
+        .as_ref()
+        .and_then(|record| record.skill_package_short.as_deref());
     let tracked_dependencies = (!no_install_deps && lpm_config.is_some()).then(|| {
         dependency_outcome
             .requirements
@@ -1478,9 +1563,62 @@ async fn run_locked(
         &package_state_key,
         tracked_files,
         tracked_dependencies,
-        tracked_skill_short.as_deref(),
+        tracked_skill_short,
     );
     crate::added_sources_state::write_state(project_dir, &added_sources_state)?;
+    tx.restore_only_if_current(&added_sources_state_path)
+        .map_err(LpmError::Io)?;
+
+    if !no_skills && let AddTarget::Lpm(pkg) = &target {
+        let short_name = pkg.short();
+        let skills_result = async {
+            let response = client.get_skills(&short_name, Some(&version)).await?;
+            let result = crate::commands::skills::package::materialize(
+                project_dir,
+                &short_name,
+                Some(&version),
+                &response.skills,
+            )?;
+            crate::commands::install::ensure_skills_gitignore(project_dir);
+            Ok::<_, LpmError>(result.installed)
+        }
+        .await;
+        match skills_result {
+            Ok(installed) => {
+                added_sources_state
+                    .record_package_skill_materialization(&package_state_key, &short_name);
+                let provenance_result =
+                    crate::added_sources_state::write_state(project_dir, &added_sources_state)
+                        .and_then(|()| {
+                            tx.restore_only_if_current(&added_sources_state_path)
+                                .map_err(LpmError::Io)
+                        });
+                if let Err(error) = provenance_result {
+                    let warning = format!(
+                        "package skills for {short_name} were materialized, but their cleanup provenance could not be recorded: {error}"
+                    );
+                    if !json_output {
+                        output::warn(&warning);
+                    }
+                    swift_traversal.push_warning(warning);
+                } else if !json_output {
+                    output::info(&format!(
+                        "Materialized {installed} package-published skill(s) for {}",
+                        lpm_common::sanitize_terminal_inline(&short_name)
+                    ));
+                }
+            }
+            Err(error) => {
+                let warning = format!(
+                    "source files were added, but package skills for {short_name} could not be materialized: {error}"
+                );
+                if !json_output {
+                    output::warn(&warning);
+                }
+                swift_traversal.push_warning(warning);
+            }
+        }
+    }
 
     // Commit the rollback transaction.
     //
@@ -1495,10 +1633,9 @@ async fn run_locked(
     // If the outer tx stayed open across that boundary, a recursive
     // failure could roll back the root package's already-applied
     // mutations while leaving the recursive `lpm add`'s side effects
-    // intact — a worse split-brain than no rollback at all. Output and
-    // skills are intentionally outside the tx for
-    // the same reason: each owns a separate, narrower contract.
-    crate::commands::install::workspace_lockfile::commit_manifest_transaction(tx);
+    // intact — a worse split-brain than no rollback at all. Output is
+    // intentionally outside the tx because it owns a separate contract.
+    crate::commands::install::workspace_lockfile::commit_manifest_transaction_checked(tx)?;
 
     // For Swift, handle recursive LPM dependencies.
     if ecosystem == "swift" {
@@ -1515,45 +1652,13 @@ async fn run_locked(
             no_editor_setup,
             no_engine_strict,
             pm,
+            swift_traversal,
         )
         .await?;
     }
 
-    let mut warnings = Vec::new();
-    if !no_skills && let AddTarget::Lpm(pkg) = &target {
-        let short_name = pkg.short();
-        let skills_result = async {
-            let response = client.get_skills(&short_name, Some(&version)).await?;
-            let result = crate::commands::skills::package::materialize(
-                project_dir,
-                &short_name,
-                Some(&version),
-                &response.skills,
-            )?;
-            crate::commands::install::ensure_skills_gitignore(project_dir);
-            Ok::<_, LpmError>(result.installed)
-        }
-        .await;
-        match skills_result {
-            Ok(installed) if !json_output => output::info(&format!(
-                "Materialized {installed} package-published skill(s) for {}",
-                lpm_common::sanitize_terminal_inline(&short_name)
-            )),
-            Ok(_) => {}
-            Err(error) => {
-                let warning = format!(
-                    "source files were added, but package skills for {short_name} could not be materialized: {error}"
-                );
-                if !json_output {
-                    output::warn(&warning);
-                }
-                warnings.push(warning);
-            }
-        }
-    }
-
     // Output.
-    if json_output {
+    if json_output && emit_output {
         let output = AddJsonOutput {
             success: true,
             package: AddJsonPackage {
@@ -1573,7 +1678,7 @@ async fn run_locked(
             external_imports: &external_imports,
             config: &inline_config,
             alias: &buyer_alias,
-            warnings: &warnings,
+            warnings: swift_traversal.warnings(),
             errors: &[],
             firewall: firewall_json,
         };
@@ -1584,7 +1689,7 @@ async fn run_locked(
         })?;
         use std::io::Write as _;
         stdout.write_all(b"\n").map_err(LpmError::Io)?;
-    } else {
+    } else if !json_output {
         if ver_meta.has_security_issues() {
             print_security_warnings(&target.display(), &version, &ver_meta);
         }

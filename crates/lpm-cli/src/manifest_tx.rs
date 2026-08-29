@@ -80,24 +80,50 @@ pub struct ManifestTransaction {
 struct SnapshotEntry {
     path: PathBuf,
     original: Option<SnapshotContent>,
-    restore_guard: Option<FileFingerprint>,
+    restore_guard: Option<PathFingerprint>,
+}
+
+#[derive(Clone, Copy)]
+enum PathFingerprint {
+    Missing,
+    File(FileFingerprint),
+}
+
+impl PathFingerprint {
+    fn from_path(path: &Path) -> std::io::Result<Self> {
+        FileFingerprint::from_path(path).map(|fingerprint| match fingerprint {
+            Some(fingerprint) => Self::File(fingerprint),
+            None => Self::Missing,
+        })
+    }
+
+    fn matches_path(self, path: &Path) -> std::io::Result<bool> {
+        match self {
+            Self::Missing => match std::fs::symlink_metadata(path) {
+                Ok(_) => Ok(false),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(true),
+                Err(error) => Err(error),
+            },
+            Self::File(expected) => expected.matches_path(path),
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
 struct FileFingerprint {
-    len: usize,
+    len: u64,
     sha256: [u8; 32],
 }
 
 impl FileFingerprint {
     fn from_bytes(bytes: &[u8]) -> Self {
         Self {
-            len: bytes.len(),
+            len: bytes.len() as u64,
             sha256: Sha256::digest(bytes).into(),
         }
     }
 
-    fn matches_path(self, path: &Path) -> std::io::Result<bool> {
+    fn from_path(path: &Path) -> std::io::Result<Option<Self>> {
         let mut options = std::fs::OpenOptions::new();
         options.read(true);
         #[cfg(unix)]
@@ -113,15 +139,18 @@ impl FileFingerprint {
         }
         let mut file = match options.open(path) {
             Ok(file) => file,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(error) => return Err(error),
         };
         let metadata = file.metadata()?;
         if lpm_common::is_symlink_or_junction(&metadata) || !metadata.is_file() {
-            return Ok(false);
-        }
-        if metadata.len() != self.len as u64 {
-            return Ok(false);
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "refusing transaction guard path that is not a regular file: {}",
+                    path.display()
+                ),
+            ));
         }
         let mut sha256 = Sha256::new();
         let mut buffer = [0_u8; 64 * 1024];
@@ -132,7 +161,15 @@ impl FileFingerprint {
             }
             sha256.update(&buffer[..read]);
         }
-        Ok(<[u8; 32]>::from(sha256.finalize()) == self.sha256)
+        Ok(Some(Self {
+            len: metadata.len(),
+            sha256: sha256.finalize().into(),
+        }))
+    }
+
+    fn matches_path(self, path: &Path) -> std::io::Result<bool> {
+        Ok(Self::from_path(path)?
+            .is_some_and(|current| current.len == self.len && current.sha256 == self.sha256))
     }
 }
 
@@ -462,7 +499,25 @@ impl ManifestTransaction {
                     format!("transaction does not snapshot {}", path.display()),
                 )
             })?;
-        entry.restore_guard = Some(FileFingerprint::from_bytes(expected_current_bytes));
+        entry.restore_guard = Some(PathFingerprint::File(FileFingerprint::from_bytes(
+            expected_current_bytes,
+        )));
+        Ok(())
+    }
+
+    pub fn restore_only_if_current(&mut self, path: &Path) -> std::io::Result<()> {
+        let current = PathFingerprint::from_path(path)?;
+        let entry = self
+            .snapshots
+            .iter_mut()
+            .find(|entry| entry.path == path)
+            .ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    format!("transaction does not snapshot {}", path.display()),
+                )
+            })?;
+        entry.restore_guard = Some(current);
         Ok(())
     }
 
@@ -697,6 +752,34 @@ mod tests {
         write(&path, &staged);
 
         assert!(tx.verify_guarded_paths().is_ok());
+    }
+
+    #[test]
+    fn guarded_rollback_removes_a_file_created_by_the_transaction() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("created.json");
+
+        let mut tx = ManifestTransaction::snapshot_install_state(&[], &[&path], &[]).unwrap();
+        write(&path, b"transaction output");
+        tx.restore_only_if_current(&path).unwrap();
+        drop(tx);
+
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn guarded_rollback_preserves_a_file_created_after_expected_removal() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("created.json");
+        write(&path, b"original");
+
+        let mut tx = ManifestTransaction::snapshot(&[&path]).unwrap();
+        fs::remove_file(&path).unwrap();
+        tx.restore_only_if_current(&path).unwrap();
+        write(&path, b"external replacement");
+        drop(tx);
+
+        assert_eq!(read(&path), b"external replacement");
     }
 
     #[test]

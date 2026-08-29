@@ -1304,6 +1304,24 @@ async fn routed_npm_file_spool_refuses_unconfigured_tarball_origin_before_reques
     );
 }
 
+#[test]
+fn configured_origin_rejection_redacts_url_credentials_and_resource_details() {
+    let client = RegistryClient::new()
+        .with_base_url("https://lpm.dev")
+        .with_npm_registry_url("https://registry.npmjs.org");
+    let error = client
+        .ensure_configured_tarball_origin(
+            "https://user:secret@attacker.example/private/archive.tgz?token=query-secret",
+        )
+        .unwrap_err()
+        .to_string();
+
+    assert!(error.contains("https://attacker.example"));
+    for secret in ["user", "secret", "private", "archive.tgz", "query-secret"] {
+        assert!(!error.contains(secret), "error leaked {secret:?}: {error}");
+    }
+}
+
 #[tokio::test]
 async fn routed_npm_tarball_streaming_does_not_attach_lpm_bearer() {
     use std::sync::{

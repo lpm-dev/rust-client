@@ -45,12 +45,34 @@ pub(super) fn handle_dry_run(
     planned_dependency_count: usize,
 ) -> Result<(), LpmError> {
     let mut file_actions = Vec::with_capacity(files.len());
+    let state = crate::added_sources_state::load_state_with_snapshot(project_dir)?.0;
+    let package_name = add_target.json_name();
+    let previous = state.package(&package_name);
 
     for (_src_rel, dest_rel) in files {
         let dest_target = target_dir.join(dest_rel);
         let exists = dest_target.exists();
+        let manifest_path =
+            crate::added_sources_state::manifest_path_for_file(project_dir, &dest_target);
+        let managed = if exists {
+            previous
+                .and_then(|record| record.files.get(&manifest_path))
+                .filter(|file| file.action.is_some())
+                .is_some_and(|file| {
+                    file.installed_digest.as_deref()
+                        == crate::added_sources_state::digest_file(&dest_target)
+                            .ok()
+                            .as_deref()
+                })
+        } else {
+            false
+        };
         let action = if exists {
-            if force { "overwrite" } else { "skip" }
+            if managed || force {
+                "overwrite"
+            } else {
+                "skip"
+            }
         } else {
             "create"
         };
