@@ -1,13 +1,12 @@
 use super::*;
 
 /// Hard cap on the number of bytes we will buffer from a single metadata
-/// response body. Real packuments — even for the largest npm packages
-/// like `react` or `lodash` — top out at ~10-20 MB; LPM requests the
-/// abbreviated packument format (`application/vnd.npm.install-v1+json`)
-/// which trims further. 32 MiB leaves headroom above those responses while
-/// keeping a four-request metadata lane below 128 MiB of body buffers.
-pub(super) const MAX_METADATA_BYTES: usize = 32 * 1024 * 1024;
-const _: () = assert!(MAX_METADATA_BYTES <= 32 * 1024 * 1024);
+/// response body. LPM requests the abbreviated packument format
+/// (`application/vnd.npm.install-v1+json`), but npm-compatible proxies can
+/// reserialize packuments above 32 MiB. 64 MiB preserves growth headroom while
+/// keeping a four-request metadata lane below 256 MiB of body buffers.
+pub(super) const MAX_METADATA_BYTES: usize = 64 * 1024 * 1024;
+const _: () = assert!(MAX_METADATA_BYTES <= 64 * 1024 * 1024);
 /// Exact npm version documents contain one manifest rather than package
 /// history. Keep their widened concurrency lane under a tighter memory cap.
 pub(super) const MAX_VERSION_METADATA_BYTES: usize = 4 * 1024 * 1024;
