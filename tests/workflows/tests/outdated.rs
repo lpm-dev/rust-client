@@ -46,6 +46,35 @@ impl Respond for RecordDelayedOutdatedMetadataStart {
     }
 }
 
+#[derive(Clone)]
+struct RecordDelayedOutdatedReleaseTimesStart {
+    starts: std::sync::Arc<std::sync::Mutex<Vec<std::time::Instant>>>,
+    delay: std::time::Duration,
+}
+
+impl Respond for RecordDelayedOutdatedReleaseTimesStart {
+    fn respond(&self, request: &Request) -> ResponseTemplate {
+        self.starts
+            .lock()
+            .expect("record outdated release-time request start")
+            .push(std::time::Instant::now());
+        let name = request
+            .url
+            .path()
+            .strip_prefix("/api/registry/")
+            .unwrap_or_default();
+        ResponseTemplate::new(200)
+            .set_delay(self.delay)
+            .set_body_json(serde_json::json!({
+                "name": name,
+                "time": {
+                    "1.0.0": "2025-01-01T00:00:00.000Z",
+                    "1.1.0": "2025-01-01T00:00:00.000Z"
+                }
+            }))
+    }
+}
+
 fn iso8601_n_secs_ago(n_secs: i64) -> String {
     use chrono::SecondsFormat;
     let dt = chrono::Utc::now() - chrono::Duration::seconds(n_secs);
@@ -670,6 +699,7 @@ async fn outdated_skips_private_named_packages_without_npm_public_source() {
         "private-named dep must not be folded into outdated count; got envelope: {envelope:#}"
     );
     assert_eq!(envelope["skipped_private"], serde_json::json!(["ms"]));
+    assert_eq!(envelope["skipped_private_count"], serde_json::json!(1));
     assert!(
         envelope["skipped_private_reason"].is_string(),
         "skipped_private_reason must surface the explanation to operators"
@@ -701,6 +731,13 @@ async fn outdated_metadata_lookup_failure_exits_nonzero_in_json_mode() {
     let envelope: serde_json::Value =
         serde_json::from_slice(&out.stdout).expect("valid JSON failure envelope");
     assert_eq!(envelope["success"], serde_json::json!(false));
+    assert_eq!(envelope["error_code"], serde_json::json!("registry"));
+    assert!(
+        envelope["error"]
+            .as_str()
+            .is_some_and(|message| message.contains("could not check 1 package")),
+        "failure envelope must include stable error identity: {envelope:#}",
+    );
     assert_eq!(envelope["unresolved_count"], serde_json::json!(1));
     assert_eq!(envelope["unresolved"][0]["name"], serde_json::json!(pkg));
 }
@@ -939,6 +976,591 @@ async fn outdated_rejects_a_latest_tag_that_points_to_a_missing_version() {
             .is_some_and(|reason| reason.contains("points to missing version '2.0.0'")),
         "failure should identify the dangling tag: {envelope:#}",
     );
+}
+
+#[tokio::test]
+async fn outdated_reports_a_removed_exact_pin_as_unresolved() {
+    let package = "@lpm.dev/owner.removed-pin";
+    let project = TempProject::empty(&format!(
+        r#"{{"name":"removed-pin","version":"1.0.0","dependencies":{{"{package}":"1.0.0"}}}}"#,
+    ));
+    write_minimal_lockfile(&project, package, "1.0.0");
+
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path(format!("/api/registry/{package}")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "name": package,
+            "dist-tags": { "latest": "2.0.0" },
+            "versions": {
+                "2.0.0": { "name": package, "version": "2.0.0" }
+            },
+            "time": { "2.0.0": "2025-01-01T00:00:00.000Z" }
+        })))
+        .mount(&server)
+        .await;
+
+    let out = lpm_with_registry_and_npm(&project, &server.uri())
+        .args(["outdated", "--json"])
+        .output()
+        .expect("spawn outdated for removed exact pin");
+    assert!(
+        !out.status.success(),
+        "a removed exact pin must not produce a clean report\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+    let envelope: serde_json::Value =
+        serde_json::from_slice(&out.stdout).expect("valid outdated failure envelope");
+    assert!(
+        envelope["unresolved"][0]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("no version") && reason.contains("1.0.0")),
+        "failure should identify the removed exact pin: {envelope:#}",
+    );
+}
+
+#[tokio::test]
+async fn outdated_reports_a_missing_installed_root_as_unresolved() {
+    let package = "@lpm.dev/owner.missing-root";
+    let project = TempProject::empty(&format!(
+        r#"{{"name":"missing-root","version":"1.0.0","dependencies":{{"{package}":"^1.0.0"}}}}"#,
+    ));
+
+    let mock = MockRegistry::start().await;
+    mount_lpm_package_latest(&mock, package, "1.1.0").await;
+
+    let out = lpm_with_registry_and_npm(&project, &mock.url())
+        .args(["outdated", "--json"])
+        .output()
+        .expect("spawn outdated without an installed root");
+    assert!(
+        !out.status.success(),
+        "a missing installed root must not be reported as up to date\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+    let envelope: serde_json::Value =
+        serde_json::from_slice(&out.stdout).expect("valid outdated failure envelope");
+    assert!(
+        envelope["unresolved"][0]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("installed root")),
+        "failure should identify the missing installed root: {envelope:#}",
+    );
+}
+
+#[tokio::test]
+async fn outdated_includes_optional_dependencies() {
+    let package = "@lpm.dev/owner.optional-outdated";
+    let project = TempProject::empty(&format!(
+        r#"{{"name":"optional-outdated","version":"1.0.0","optionalDependencies":{{"{package}":"^1.0.0"}}}}"#,
+    ));
+    write_minimal_lockfile(&project, package, "1.0.0");
+
+    let mock = MockRegistry::start().await;
+    mock.with_full_package_metadata(
+        package,
+        "1.1.0",
+        &[
+            (
+                "1.0.0",
+                serde_json::json!({}),
+                Some(make_tarball(package, "1.0.0")),
+            ),
+            (
+                "1.1.0",
+                serde_json::json!({}),
+                Some(make_tarball(package, "1.1.0")),
+            ),
+        ],
+    )
+    .await;
+
+    let out = lpm_with_registry_and_npm(&project, &mock.url())
+        .args(["outdated", "--json"])
+        .output()
+        .expect("spawn outdated for an optional dependency");
+    assert!(
+        out.status.success(),
+        "optional dependency lookup must succeed\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+    let envelope: serde_json::Value =
+        serde_json::from_slice(&out.stdout).expect("valid outdated envelope");
+    assert_eq!(
+        envelope["packages"][0],
+        serde_json::json!({
+            "name": package,
+            "current": "1.0.0",
+            "wanted": "1.1.0",
+            "wanted_range": "^1.0.0",
+            "latest": "1.1.0",
+            "section": "optionalDependencies",
+            "outdated": true,
+        }),
+    );
+}
+
+#[tokio::test]
+async fn outdated_never_queries_registries_for_non_registry_dependencies() {
+    let dependencies = serde_json::json!({
+        "@lpm.dev/owner.local-file": "file:../local-file",
+        "@lpm.dev/owner.local-link": "link:../local-link",
+        "@lpm.dev/owner.local-workspace": "workspace:^",
+        "@lpm.dev/owner.local-git": "git+https://example.invalid/repository.git#main",
+        "@lpm.dev/owner.local-tarball": "https://example.invalid/package.tgz",
+        "@lpm.dev/owner.local-jsr": "jsr:@scope/package@^1.0.0"
+    });
+    let project = TempProject::empty(
+        &serde_json::to_string(&serde_json::json!({
+            "name": "non-registry-outdated",
+            "version": "1.0.0",
+            "dependencies": dependencies,
+        }))
+        .expect("serialize non-registry manifest"),
+    );
+
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path_regex(r"^/api/registry/.*$"))
+        .respond_with(ResponseTemplate::new(500))
+        .mount(&server)
+        .await;
+
+    let out = lpm_with_registry_and_npm(&project, &server.uri())
+        .args(["outdated", "--json"])
+        .output()
+        .expect("spawn outdated for non-registry dependencies");
+    assert!(
+        out.status.success(),
+        "non-registry dependencies should be skipped\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+    let envelope: serde_json::Value =
+        serde_json::from_slice(&out.stdout).expect("valid outdated envelope");
+    assert_eq!(envelope["packages"], serde_json::json!([]));
+    assert_eq!(
+        envelope["skipped_non_registry"],
+        serde_json::json!([
+            "@lpm.dev/owner.local-file",
+            "@lpm.dev/owner.local-git",
+            "@lpm.dev/owner.local-jsr",
+            "@lpm.dev/owner.local-link",
+            "@lpm.dev/owner.local-tarball",
+            "@lpm.dev/owner.local-workspace"
+        ]),
+    );
+    assert_eq!(envelope["skipped_non_registry_count"], serde_json::json!(6));
+    let requests = server
+        .received_requests()
+        .await
+        .expect("wiremock recorded requests");
+    assert!(
+        requests.is_empty(),
+        "non-registry dependencies reached a registry: {requests:?}",
+    );
+}
+
+#[tokio::test]
+async fn outdated_uses_optional_dependency_precedence_for_duplicate_names() {
+    let package = "@lpm.dev/owner.section-precedence";
+    let project = TempProject::empty(&format!(
+        r#"{{"name":"section-precedence","version":"1.0.0","dependencies":{{"{package}":"^1.0.0"}},"devDependencies":{{"{package}":"^2.0.0"}},"optionalDependencies":{{"{package}":"^3.0.0"}}}}"#,
+    ));
+    write_minimal_lockfile(&project, package, "3.0.0");
+
+    let mock = MockRegistry::start().await;
+    mock.with_full_package_metadata(
+        package,
+        "3.1.0",
+        &[
+            (
+                "1.1.0",
+                serde_json::json!({}),
+                Some(make_tarball(package, "1.1.0")),
+            ),
+            (
+                "2.1.0",
+                serde_json::json!({}),
+                Some(make_tarball(package, "2.1.0")),
+            ),
+            (
+                "3.0.0",
+                serde_json::json!({}),
+                Some(make_tarball(package, "3.0.0")),
+            ),
+            (
+                "3.1.0",
+                serde_json::json!({}),
+                Some(make_tarball(package, "3.1.0")),
+            ),
+        ],
+    )
+    .await;
+
+    let out = lpm_with_registry_and_npm(&project, &mock.url())
+        .args(["outdated", "--json"])
+        .output()
+        .expect("spawn outdated for duplicate dependency sections");
+    assert!(
+        out.status.success(),
+        "duplicate-section lookup must succeed\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+    let envelope: serde_json::Value =
+        serde_json::from_slice(&out.stdout).expect("valid outdated envelope");
+    assert_eq!(envelope["count"], serde_json::json!(1));
+    assert_eq!(
+        envelope["packages"][0],
+        serde_json::json!({
+            "name": package,
+            "current": "3.0.0",
+            "wanted": "3.1.0",
+            "wanted_range": "^3.0.0",
+            "latest": "3.1.0",
+            "section": "optionalDependencies",
+            "outdated": true,
+        }),
+    );
+}
+
+#[tokio::test]
+async fn outdated_resolves_catalog_protocol_before_selecting_wanted_version() {
+    let package = "@lpm.dev/owner.catalog-outdated";
+    let project = TempProject::empty(&format!(
+        r#"{{"name":"catalog-outdated","version":"1.0.0","dependencies":{{"{package}":"catalog:"}},"catalogs":{{"default":{{"{package}":"^1.0.0"}}}}}}"#,
+    ));
+    write_minimal_lockfile(&project, package, "1.0.0");
+
+    let mock = MockRegistry::start().await;
+    mock.with_full_package_metadata(
+        package,
+        "2.0.0",
+        &[
+            (
+                "1.0.0",
+                serde_json::json!({}),
+                Some(make_tarball(package, "1.0.0")),
+            ),
+            (
+                "1.5.0",
+                serde_json::json!({}),
+                Some(make_tarball(package, "1.5.0")),
+            ),
+            (
+                "2.0.0",
+                serde_json::json!({}),
+                Some(make_tarball(package, "2.0.0")),
+            ),
+        ],
+    )
+    .await;
+
+    let out = lpm_with_registry_and_npm(&project, &mock.url())
+        .args(["outdated", "--json"])
+        .output()
+        .expect("spawn outdated for catalog protocol dependency");
+    assert!(
+        out.status.success(),
+        "catalog dependency lookup must succeed\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+    let envelope: serde_json::Value =
+        serde_json::from_slice(&out.stdout).expect("valid outdated envelope");
+    assert_eq!(envelope["packages"][0]["wanted"], "1.5.0");
+    assert_eq!(envelope["packages"][0]["wanted_range"], "catalog:");
+}
+
+#[tokio::test]
+async fn outdated_rejects_stale_alias_route_evidence_before_any_registry_request() {
+    let local_name = "private-alias";
+    let private_target = "@company/private-new";
+    let project = TempProject::empty(&format!(
+        r#"{{"name":"stale-alias-outdated","version":"1.0.0","dependencies":{{"{local_name}":"npm:{private_target}@^1.0.0"}}}}"#,
+    ));
+    let mut lockfile = lpm_lockfile::Lockfile::new();
+    lockfile
+        .root_aliases
+        .insert(local_name.to_string(), "public-old".to_string());
+    lockfile.add_package(lpm_lockfile::LockedPackage {
+        name: "public-old".to_string(),
+        version: "1.0.0".to_string(),
+        source: Some("registry+https://registry.npmjs.org".to_string()),
+        ..Default::default()
+    });
+    support::finalize_exact_lockfile_fixture(&mut lockfile, &[(local_name, "public-old", "1.0.0")]);
+    lockfile
+        .write_to_file(&project.path().join("lpm.lock"))
+        .expect("write stale alias lockfile");
+
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path_regex(r".*"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "name": private_target,
+            "dist-tags": { "latest": "1.1.0" },
+            "versions": {
+                "1.0.0": { "name": private_target, "version": "1.0.0" },
+                "1.1.0": { "name": private_target, "version": "1.1.0" }
+            },
+            "time": {
+                "1.0.0": "2025-01-01T00:00:00.000Z",
+                "1.1.0": "2025-01-01T00:00:00.000Z"
+            }
+        })))
+        .mount(&server)
+        .await;
+
+    let out = lpm_with_registry_and_npm(&project, &server.uri())
+        .args(["outdated", "--json"])
+        .output()
+        .expect("spawn outdated with stale alias route evidence");
+    assert!(
+        out.status.success(),
+        "stale route evidence should be skipped safely\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+    let envelope: serde_json::Value =
+        serde_json::from_slice(&out.stdout).expect("valid outdated envelope");
+    assert_eq!(envelope["packages"], serde_json::json!([]));
+    assert_eq!(envelope["skipped_private"], serde_json::json!([local_name]));
+    let requests = server
+        .received_requests()
+        .await
+        .expect("wiremock recorded requests");
+    assert!(
+        requests.is_empty(),
+        "stale public route evidence leaked the private alias target: {requests:?}",
+    );
+}
+
+#[tokio::test]
+async fn outdated_rejects_path_confusing_alias_targets_before_any_request() {
+    let local_name = "route-confusion";
+    let project = TempProject::empty(&format!(
+        r#"{{"name":"route-confusion-outdated","version":"1.0.0","dependencies":{{"{local_name}":"npm:../account/probe?source=outdated@*"}}}}"#,
+    ));
+    let mut lockfile = lpm_lockfile::Lockfile::new();
+    lockfile.add_package(lpm_lockfile::LockedPackage {
+        name: "safe-public".to_string(),
+        version: "1.0.0".to_string(),
+        source: Some("registry+https://registry.npmjs.org".to_string()),
+        ..Default::default()
+    });
+    support::finalize_exact_lockfile_fixture(
+        &mut lockfile,
+        &[(local_name, "safe-public", "1.0.0")],
+    );
+    lockfile
+        .write_to_file(&project.path().join("lpm.lock"))
+        .expect("write route-confusion lockfile");
+
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path_regex(r".*"))
+        .respond_with(ResponseTemplate::new(500))
+        .mount(&server)
+        .await;
+
+    let out = lpm_with_registry_and_npm(&project, &server.uri())
+        .args(["outdated", "--json"])
+        .output()
+        .expect("spawn outdated with path-confusing alias target");
+    assert!(
+        !out.status.success(),
+        "path-confusing alias targets must be rejected",
+    );
+    let envelope: serde_json::Value =
+        serde_json::from_slice(&out.stdout).expect("valid outdated error envelope");
+    assert!(
+        envelope["error"]
+            .as_str()
+            .is_some_and(|error| error.contains("invalid npm dependency name")),
+        "error should identify invalid npm identity: {envelope:#}",
+    );
+    let requests = server
+        .received_requests()
+        .await
+        .expect("wiremock recorded requests");
+    assert!(
+        requests.is_empty(),
+        "path-confusing alias target reached a registry: {requests:?}",
+    );
+}
+
+#[tokio::test]
+async fn outdated_human_failure_does_not_claim_every_dependency_is_up_to_date() {
+    let package = "@lpm.dev/owner.unresolved-human";
+    let project = TempProject::empty(&format!(
+        r#"{{"name":"unresolved-human","version":"1.0.0","dependencies":{{"{package}":"^1.0.0"}}}}"#,
+    ));
+    write_minimal_lockfile(&project, package, "1.0.0");
+
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path(format!("/api/registry/{package}")))
+        .respond_with(ResponseTemplate::new(404))
+        .mount(&server)
+        .await;
+
+    let out = lpm_with_registry_and_npm(&project, &server.uri())
+        .arg("outdated")
+        .output()
+        .expect("spawn human outdated with unresolved metadata");
+    assert!(!out.status.success(), "unresolved metadata must fail");
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        !combined.contains("up to date"),
+        "a failed check must not claim clean status: {combined}",
+    );
+    assert!(
+        !combined.contains("Found 0 outdated packages"),
+        "a failed check must not print a successful zero-result completion: {combined}",
+    );
+}
+
+#[tokio::test]
+async fn outdated_hydrates_release_times_in_bounded_parallel_waves() {
+    const PACKAGE_COUNT: usize = 8;
+    let mut manifest_dependencies = serde_json::Map::with_capacity(PACKAGE_COUNT);
+    let mut lockfile =
+        String::from("[metadata]\nlockfile-version = 2\nresolved-with = \"greedy-fusion\"\n");
+    for index in 0..PACKAGE_COUNT {
+        let name = format!("@lpm.dev/owner.hydration-wave-{index}");
+        manifest_dependencies.insert(name.clone(), serde_json::json!("^1.0.0"));
+        lockfile.push_str(&format!(
+            "\n[[packages]]\nname = \"{name}\"\nversion = \"1.0.0\"\nsource = \"registry+https://lpm.dev\"\n"
+        ));
+    }
+    let project = TempProject::empty(
+        &serde_json::to_string(&serde_json::json!({
+            "name": "hydration-wave-outdated",
+            "version": "1.0.0",
+            "dependencies": manifest_dependencies,
+            "lpm": { "minimumReleaseAge": 86_400 },
+        }))
+        .expect("serialize hydration-wave manifest"),
+    );
+    project.write_file("lpm.lock", &lockfile);
+
+    let server = MockServer::start().await;
+    for index in 0..PACKAGE_COUNT {
+        let name = format!("@lpm.dev/owner.hydration-wave-{index}");
+        Mock::given(method("GET"))
+            .and(path(format!("/api/registry/{name}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "name": name,
+                "dist-tags": { "latest": "1.1.0" },
+                "modified": "2026-08-29T00:00:00.000Z",
+                "versions": {
+                    "1.0.0": { "name": name, "version": "1.0.0" },
+                    "1.1.0": { "name": name, "version": "1.1.0" }
+                }
+            })))
+            .with_priority(2)
+            .expect(1)
+            .mount(&server)
+            .await;
+    }
+    let starts = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    Mock::given(method("GET"))
+        .and(path_regex(
+            r"^/api/registry/@lpm\.dev/owner\.hydration-wave-[0-9]+$",
+        ))
+        .and(query_param("release_times", "1"))
+        .respond_with(RecordDelayedOutdatedReleaseTimesStart {
+            starts: std::sync::Arc::clone(&starts),
+            delay: std::time::Duration::from_millis(250),
+        })
+        .with_priority(1)
+        .expect(PACKAGE_COUNT as u64)
+        .mount(&server)
+        .await;
+
+    let out = lpm_with_registry_and_npm(&project, &server.uri())
+        .args(["outdated", "--json"])
+        .output()
+        .expect("spawn outdated hydration wave check");
+    assert!(
+        out.status.success(),
+        "bounded hydration check should succeed\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+    let starts = starts.lock().expect("read release-time request starts");
+    assert_eq!(starts.len(), PACKAGE_COUNT);
+    let first = *starts.iter().min().expect("at least one hydration start");
+    let mut offsets = starts
+        .iter()
+        .map(|start| start.duration_since(first))
+        .collect::<Vec<_>>();
+    offsets.sort();
+    assert!(
+        offsets[3] < std::time::Duration::from_millis(150),
+        "the first four hydration slots did not start together: {offsets:?}",
+    );
+    assert!(
+        offsets[4] >= std::time::Duration::from_millis(200),
+        "more than four hydration requests ran in the first wave: {offsets:?}",
+    );
+    assert!(
+        offsets[7] < std::time::Duration::from_millis(450),
+        "the hydration scheduler did not refill promptly: {offsets:?}",
+    );
+}
+
+#[tokio::test]
+async fn outdated_bounds_one_shared_metadata_failure_across_many_aliases() {
+    const ALIAS_COUNT: usize = 32;
+    let target = "@lpm.dev/owner.shared-outdated-error";
+    let dependencies = (0..ALIAS_COUNT)
+        .map(|index| {
+            (
+                format!("shared-error-alias-{index}"),
+                serde_json::json!(format!("npm:{target}@^1.0.0")),
+            )
+        })
+        .collect::<serde_json::Map<_, _>>();
+    let project = TempProject::empty(
+        &serde_json::to_string(&serde_json::json!({
+            "name": "shared-error-outdated",
+            "version": "1.0.0",
+            "dependencies": dependencies,
+        }))
+        .expect("serialize shared-error manifest"),
+    );
+
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path(format!("/api/registry/{target}")))
+        .respond_with(ResponseTemplate::new(400).set_body_string("x".repeat(1024 * 1024)))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let out = lpm_with_registry_and_npm(&project, &server.uri())
+        .args(["outdated", "--json"])
+        .output()
+        .expect("spawn outdated with shared metadata error");
+    assert!(!out.status.success(), "shared metadata error must fail");
+    assert!(
+        out.stdout.len() < 128 * 1024,
+        "one remote error expanded to {} bytes",
+        out.stdout.len(),
+    );
+    let envelope: serde_json::Value =
+        serde_json::from_slice(&out.stdout).expect("valid bounded failure envelope");
+    assert_eq!(envelope["unresolved_count"], serde_json::json!(ALIAS_COUNT));
 }
 
 #[tokio::test]

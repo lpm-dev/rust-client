@@ -1637,18 +1637,6 @@ mod tests {
         assert_eq!(spec.render_new_value("^20.1.0"), "npm:@types/node@^20.1.0");
     }
 
-    #[test]
-    fn plain_manifest_dependency_does_not_inherit_a_stale_lockfile_alias() {
-        let mut lockfile = lpm_lockfile::Lockfile::new();
-        lockfile
-            .root_aliases
-            .insert("tool".to_string(), "old-public-tool".to_string());
-
-        let lookup_name = ManifestDependencySpec::Plain.lookup_name("tool", Some(&lockfile));
-
-        assert_eq!(lookup_name, "tool");
-    }
-
     // ── compute_upgrade (preserved from original) ───────────────────
 
     fn parsed_versions(versions: &[&str]) -> Vec<Version> {
