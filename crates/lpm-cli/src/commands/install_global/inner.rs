@@ -23,6 +23,12 @@ pub struct InstallGlobalOverrides {
     pub verify_policy: crate::provenance_fetch::VerifyPolicy,
     pub script_policy_override: Option<crate::script_policy_config::ScriptPolicy>,
     pub auto_build: bool,
+    pub strict_integrity: bool,
+    pub linker_override: Option<lpm_linker::LinkerMode>,
+    pub save_flags: crate::save_spec::SaveFlags,
+    pub advisor_override: Option<String>,
+    pub strict_sandbox: bool,
+    pub no_sandbox: bool,
 }
 
 pub(super) async fn do_install(
@@ -36,6 +42,7 @@ pub(super) async fn do_install(
     run_inner_global_install(
         registry,
         InnerGlobalInstallOptions {
+            state_root: root,
             install_root: &prep.install_root,
             package_name: &prep.name,
             package_version: &version,
@@ -47,6 +54,11 @@ pub(super) async fn do_install(
             strict_peer_dependencies_override: overrides.strict_peer_dependencies_override,
             no_engine_strict: overrides.no_engine_strict,
             auto_build: overrides.auto_build,
+            strict_integrity: overrides.strict_integrity,
+            linker_override: overrides.linker_override,
+            advisor_override: overrides.advisor_override.clone(),
+            strict_sandbox: overrides.strict_sandbox,
+            no_sandbox: overrides.no_sandbox,
             script_policy_override: overrides.script_policy_override,
             min_release_age_override: overrides.min_release_age_override,
             min_release_age_exclude: &overrides.min_release_age_exclude,

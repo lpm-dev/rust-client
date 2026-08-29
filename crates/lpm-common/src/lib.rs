@@ -10,6 +10,7 @@ pub mod bounded_read;
 pub mod color;
 pub mod command_name;
 pub mod error;
+pub mod global_fs;
 pub mod integrity;
 pub mod known_projects;
 pub mod local_target;
@@ -47,6 +48,7 @@ pub use error::{
     ArtifactUnavailableErrorContext, ArtifactUnavailableKind, LpmError, ResolutionErrorContext,
     ResolutionFailureKind, TyposquatErrorContext, TyposquatErrorFinding,
 };
+pub use global_fs::{GlobalInstallDirectory, GlobalInstallsDirectory, GlobalStateDirectories};
 pub use integrity::Integrity;
 pub use local_target::{LocalScheme, LocalTarget};
 pub use lpm_json::{LpmJsonFileState, LpmJsonMutation, LpmJsonTransactionError, update_lpm_json};

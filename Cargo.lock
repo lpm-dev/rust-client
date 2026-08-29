@@ -3530,6 +3530,7 @@ version = "0.76.5"
 dependencies = [
  "chrono",
  "crc32fast",
+ "libc",
  "lpm-common",
  "lpm-lockfile",
  "serde",

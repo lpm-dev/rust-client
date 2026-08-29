@@ -388,6 +388,42 @@ async fn cli_install_global_json_emits_single_result_document() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn cli_install_global_exact_persists_the_resolved_version_without_a_prefix() {
+    let server = MockServer::start().await;
+    common::mount_mock_registry(
+        &server,
+        &[MockPackage {
+            name: "exact-tool",
+            versions: vec![MockPackageVersion {
+                version: "1.2.3",
+                dependencies: Vec::new(),
+                bins: vec![("exact-tool", "bin/exact-tool.js")],
+            }],
+        }],
+    )
+    .await;
+
+    let sandbox = TempDir::new().unwrap();
+    let cwd = sandbox.path().join("workspace");
+    let lpm_home = sandbox.path().join("lpm-home");
+    std::fs::create_dir_all(&cwd).unwrap();
+    std::fs::create_dir_all(&lpm_home).unwrap();
+    let root = LpmRoot::from_dir(&lpm_home);
+
+    let (status, stdout, stderr) = common::run_lpm(
+        &cwd,
+        &lpm_home,
+        Some(&server.uri()),
+        &["install", "-g", "exact-tool", "--exact"],
+    );
+    assert!(
+        status.success(),
+        "install -g --exact failed. stdout={stdout} stderr={stderr}"
+    );
+    assert_eq!(read_package_row(&root, "exact-tool").saved_spec, "1.2.3");
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn cli_install_global_rejects_invalid_declared_bin_without_pending_state() {
     let server = MockServer::start().await;
     common::mount_mock_registry(

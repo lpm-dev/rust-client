@@ -2,10 +2,11 @@ use super::super::global_util::{
     InnerGlobalInstallOptions, SyntheticProjectJsonFormat, run_inner_global_install,
 };
 use super::prepare::{StagedUpgrade, UpgradePrep};
-use lpm_common::LpmError;
+use lpm_common::{LpmError, LpmRoot};
 use lpm_registry::RegistryClient;
 
 pub(super) async fn do_install_upgrade(
+    root: &LpmRoot,
     registry: &RegistryClient,
     prep: &UpgradePrep,
     staged: &StagedUpgrade,
@@ -15,6 +16,7 @@ pub(super) async fn do_install_upgrade(
     run_inner_global_install(
         registry,
         InnerGlobalInstallOptions {
+            state_root: root,
             install_root: &staged.install_root,
             package_name: &prep.name,
             package_version: &new_version,
@@ -26,6 +28,11 @@ pub(super) async fn do_install_upgrade(
             strict_peer_dependencies_override: None,
             no_engine_strict: false,
             auto_build: false,
+            strict_integrity: false,
+            linker_override: None,
+            advisor_override: None,
+            strict_sandbox: false,
+            no_sandbox: false,
             script_policy_override: None,
             min_release_age_override: None,
             min_release_age_exclude: &[],
