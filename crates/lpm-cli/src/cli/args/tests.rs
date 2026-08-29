@@ -573,6 +573,30 @@ fn release_publish_otp_flag_parses_for_non_interactive_lpm_publish() {
 }
 
 #[test]
+fn release_publish_min_score_rejects_values_above_one_hundred() {
+    let error =
+        match Cli::try_parse_from(["lpm", "release", "publish", "--all", "--min-score", "101"]) {
+            Ok(_) => panic!("release publish must enforce the documented score range"),
+            Err(error) => error,
+        };
+
+    assert!(error.to_string().contains("100"));
+}
+
+#[test]
+fn release_publish_ignore_scripts_flag_parses() {
+    let cli = Cli::try_parse_from(["lpm", "release", "publish", "--all", "--ignore-scripts"])
+        .expect("release publish must expose the lifecycle escape hatch");
+
+    match cli.command {
+        Some(Commands::Release(super::release::ReleaseArgs {
+            command: super::release::ReleaseCommands::Publish { ignore_scripts, .. },
+        })) => assert!(ignore_scripts),
+        _ => panic!("expected release publish command"),
+    }
+}
+
+#[test]
 fn stage_publish_provenance_file_flag_parses() {
     let cli = Cli::try_parse_from([
         "lpm",

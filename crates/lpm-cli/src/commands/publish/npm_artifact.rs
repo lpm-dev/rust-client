@@ -315,12 +315,17 @@ fn validate_identity_matches_predicate(
     statement: &serde_json::Value,
     verified: &crate::sigstore_verify::VerifiedProvenance,
 ) -> Result<(), LpmError> {
-    let Some(publisher) = verified.snapshot.publisher.as_deref() else {
-        return Ok(());
-    };
-    let Some(repo) = publisher.strip_prefix("github:") else {
-        return Ok(());
-    };
+    let publisher = verified.snapshot.publisher.as_deref().ok_or_else(|| {
+        LpmError::Registry(
+            "provenance signing identity is not supported and cannot be bound to the statement"
+                .into(),
+        )
+    })?;
+    let repo = publisher.strip_prefix("github:").ok_or_else(|| {
+        LpmError::Registry(format!(
+            "provenance signing identity {publisher:?} is not supported and cannot be bound to the statement"
+        ))
+    })?;
     let expected_repository = normalize_source_repository(&format!("https://github.com/{repo}"));
     let actual_repository = source_repository_from_statement(statement)
         .map(normalize_source_repository)
@@ -595,6 +600,30 @@ mod tests {
         let err = validate_identity_matches_predicate(&statement, &verified).unwrap_err();
 
         assert!(err.to_string().contains("does not match signing identity"));
+    }
+
+    #[test]
+    fn validate_identity_matches_predicate_rejects_an_unrecognized_signer() {
+        let statement = slsa_v0_2_statement_with_subject("pkg:npm/pkg@1.0.0", "abc123");
+        let verified = crate::sigstore_verify::VerifiedProvenance {
+            snapshot: lpm_workspace::ProvenanceSnapshot {
+                present: true,
+                publisher: None,
+                workflow_path: None,
+                workflow_ref: None,
+                attestation_cert_sha256: Some("sha256-test".into()),
+            },
+            statement: statement.clone(),
+            integrated_time: std::time::SystemTime::UNIX_EPOCH,
+            leaf_cert_sha256: "sha256-test".into(),
+            log_id: "log".into(),
+            log_index: 1,
+        };
+
+        let error = validate_identity_matches_predicate(&statement, &verified)
+            .expect_err("an identity that cannot be bound to the statement must fail closed");
+
+        assert!(error.to_string().contains("signing identity"));
     }
 
     #[test]

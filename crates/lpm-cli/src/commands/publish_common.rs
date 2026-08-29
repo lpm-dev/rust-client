@@ -21,16 +21,115 @@ pub struct TarballFile {
 }
 
 struct TarballCandidate {
-    source_path: PathBuf,
+    source_path: Option<PathBuf>,
     source_root: Arc<TarballSourceRoot>,
     archive_path: String,
     expected_content_sha256: Option<[u8; 32]>,
+    secret_scan_completed: bool,
+}
+
+impl TarballCandidate {
+    #[inline]
+    fn source_path(&self) -> &Path {
+        self.source_path
+            .as_deref()
+            .unwrap_or_else(|| Path::new(&self.archive_path))
+    }
 }
 
 struct TarballSourceRoot {
     path: PathBuf,
     directory: Option<Dir>,
     identity: Option<DirectoryIdentity>,
+}
+
+struct TarballSourceCursor {
+    source_root: Option<Arc<TarballSourceRoot>>,
+    root_directory: Option<Dir>,
+    parent_directories: Vec<(std::ffi::OsString, Dir)>,
+    #[cfg(test)]
+    parent_open_count: usize,
+}
+
+impl TarballSourceCursor {
+    fn new() -> Self {
+        Self {
+            source_root: None,
+            root_directory: None,
+            parent_directories: Vec::new(),
+            #[cfg(test)]
+            parent_open_count: 0,
+        }
+    }
+
+    fn open_file(
+        &mut self,
+        source_root: &Arc<TarballSourceRoot>,
+        relative_path: &Path,
+        archive_path: &str,
+    ) -> Result<(std::fs::File, u64), LpmError> {
+        if relative_path.is_absolute()
+            || !relative_path
+                .components()
+                .all(|component| matches!(component, std::path::Component::Normal(_)))
+        {
+            return Err(unsafe_publish_file_error(archive_path));
+        }
+        let file_name = relative_path
+            .file_name()
+            .ok_or_else(|| unsafe_publish_file_error(archive_path))?;
+
+        if !self
+            .source_root
+            .as_ref()
+            .is_some_and(|current| Arc::ptr_eq(current, source_root))
+        {
+            self.parent_directories.clear();
+            self.root_directory = Some(source_root.open_directory()?);
+            self.source_root = Some(Arc::clone(source_root));
+        }
+
+        let parent = relative_path.parent().unwrap_or_else(|| Path::new(""));
+        let common_depth = parent
+            .components()
+            .zip(&self.parent_directories)
+            .take_while(|(component, (opened_name, _))| component.as_os_str() == opened_name)
+            .count();
+        self.parent_directories.truncate(common_depth);
+
+        let mut walked = PathBuf::with_capacity(parent.as_os_str().as_encoded_bytes().len());
+        for (name, _) in &self.parent_directories {
+            walked.push(name);
+        }
+        for component in parent.components().skip(common_depth) {
+            let name = component.as_os_str();
+            walked.push(name);
+            let directory = self
+                .parent_directories
+                .last()
+                .map(|(_, directory)| directory)
+                .or(self.root_directory.as_ref())
+                .ok_or_else(|| {
+                    LpmError::Registry("publish source root was unavailable while packing".into())
+                })?;
+            let child = open_cap_directory_entry(directory, name, &walked)?;
+            self.parent_directories.push((name.to_os_string(), child));
+            #[cfg(test)]
+            {
+                self.parent_open_count += 1;
+            }
+        }
+
+        let directory = self
+            .parent_directories
+            .last()
+            .map(|(_, directory)| directory)
+            .or(self.root_directory.as_ref())
+            .ok_or_else(|| {
+                LpmError::Registry("publish source root was unavailable while packing".into())
+            })?;
+        open_tarball_source_file(directory, Path::new(file_name), archive_path)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -43,6 +142,7 @@ enum DirectoryIdentity {
 
 pub(crate) struct PreparedTarball {
     pub(crate) data: Vec<u8>,
+    pub(crate) hashes: TarballHashes,
     pub(crate) files: Vec<TarballFile>,
     pub(crate) secret_scan: Option<lpm_security::behavioral::secrets::SecretScanResult>,
     pub(crate) readme: Option<String>,
@@ -52,11 +152,28 @@ pub(crate) struct RewrittenTarball {
     file: std::sync::Mutex<tempfile::NamedTempFile>,
     len: usize,
     pub(crate) hashes: std::sync::Arc<TarballHashes>,
-    pub(crate) package_json_size: u64,
+    pub(crate) package_json_size: Option<u64>,
     pub(crate) secret_scan: Option<lpm_security::behavioral::secrets::SecretScanResult>,
 }
 
 impl RewrittenTarball {
+    pub(crate) fn spool_base(
+        data: &[u8],
+        hashes: std::sync::Arc<TarballHashes>,
+    ) -> Result<Self, LpmError> {
+        use std::io::Write as _;
+
+        let mut file = tempfile::NamedTempFile::new().map_err(LpmError::Io)?;
+        file.write_all(data).map_err(LpmError::Io)?;
+        Ok(Self {
+            file: std::sync::Mutex::new(file),
+            len: data.len(),
+            hashes,
+            package_json_size: None,
+            secret_scan: None,
+        })
+    }
+
     pub(crate) fn len(&self) -> usize {
         self.len
     }
@@ -128,6 +245,7 @@ pub struct TarballHashes {
 }
 
 /// Compute SHA-1 and SHA-512 hashes for tarball data.
+#[cfg(test)]
 pub fn compute_hashes(tarball_data: &[u8]) -> TarballHashes {
     use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
     use sha2::{Digest, Sha512};
@@ -170,18 +288,28 @@ fn read_readme_from_source_root(source_dir: &Dir) -> Option<String> {
     ];
 
     for name in candidates {
-        let Ok((file, _)) = open_tarball_source_file(source_dir, Path::new(name), name) else {
+        let Ok((file, size)) = open_tarball_source_file(source_dir, Path::new(name), name) else {
             continue;
         };
-        if let Ok(Some(content)) = read_readme_content(file) {
+        if let Ok(Some(content)) = read_readme_content(file, Some(size)) {
             return Some(content);
         }
     }
     None
 }
 
-fn read_readme_content(reader: impl Read) -> std::io::Result<Option<String>> {
-    let mut bytes = Vec::with_capacity(MAX_README_BYTES + 1);
+fn read_readme_content(
+    reader: impl Read,
+    size_hint: Option<u64>,
+) -> std::io::Result<Option<String>> {
+    const DEFAULT_README_CAPACITY: usize = 8 * 1024;
+
+    let capacity = size_hint
+        .and_then(|size| usize::try_from(size).ok())
+        .map_or(DEFAULT_README_CAPACITY, |size| {
+            size.min(MAX_README_BYTES + 1)
+        });
+    let mut bytes = Vec::with_capacity(capacity);
     reader
         .take((MAX_README_BYTES + 1) as u64)
         .read_to_end(&mut bytes)?;
@@ -203,17 +331,23 @@ fn read_readme_content(reader: impl Read) -> std::io::Result<Option<String>> {
 }
 
 fn readme_priority(path: &str) -> Option<usize> {
-    [
-        "README.md",
-        "readme.md",
-        "Readme.md",
-        "README",
-        "readme",
-        "README.txt",
-        "README.markdown",
-    ]
-    .iter()
-    .position(|candidate| path == *candidate)
+    if path.contains(['/', '\\']) {
+        return None;
+    }
+    let (base, extension) = path
+        .split_once('.')
+        .map_or((path, None), |(base, extension)| (base, Some(extension)));
+    if !base.eq_ignore_ascii_case("readme") {
+        return None;
+    }
+    match extension {
+        None => Some(1),
+        Some(extension) if extension.eq_ignore_ascii_case("md") => Some(0),
+        Some(extension) if extension.eq_ignore_ascii_case("txt") => Some(2),
+        Some(extension) if extension.eq_ignore_ascii_case("markdown") => Some(3),
+        Some(extension) if !extension.is_empty() && !extension.ends_with(['~', '$']) => Some(4),
+        Some(_) => None,
+    }
 }
 
 fn is_authored_skill_namespace(path: &str) -> bool {
@@ -255,6 +389,8 @@ pub(crate) const MAX_COMPRESSED_TARBALL_BYTES: u64 = 500 * 1024 * 1024;
 pub(crate) const MAX_PUBLISH_ARCHIVE_ENTRIES: usize = 100_000;
 
 pub(crate) const MAX_PUBLISH_ARCHIVE_PATH_DEPTH: usize = 256;
+const TAR_ROOT_COMPONENTS: usize = 1;
+const TAR_ROOT_PREFIX_BYTES: usize = "package/".len();
 
 fn publish_tar_read_limits() -> lpm_extractor::TarArchiveLimits {
     lpm_extractor::TarArchiveLimits {
@@ -278,6 +414,7 @@ fn publish_tar_read_limits_with_entry_limit(max_entries: usize) -> lpm_extractor
 /// generated artifact / mistakenly-committed binary. Rejected
 /// incrementally so we don't `fs::read` the whole file before noticing.
 const MAX_TARBALL_FILE_BYTES: u64 = 200 * 1024 * 1024;
+const LARGE_SECRET_SCAN_PRESCAN_BYTES: u64 = 8 * 1024 * 1024;
 
 /// Create a gzipped tarball from the project directory.
 ///
@@ -424,10 +561,11 @@ fn prepare_tarball_with_source_root_and_open_hook(
         push_tarball_candidate(
             &mut candidates,
             TarballCandidate {
-                source_path: PathBuf::from(&file.path),
+                source_path: None,
                 source_root: Arc::clone(&project_source_root),
                 archive_path: file.path,
                 expected_content_sha256: None,
+                secret_scan_completed: false,
             },
         )?;
     }
@@ -439,10 +577,11 @@ fn prepare_tarball_with_source_root_and_open_hook(
         push_tarball_candidate(
             &mut candidates,
             TarballCandidate {
-                source_path: PathBuf::from("package.json"),
+                source_path: None,
                 source_root: Arc::clone(&project_source_root),
                 archive_path: "package.json".to_string(),
                 expected_content_sha256: None,
+                secret_scan_completed: false,
             },
         )?;
     }
@@ -451,14 +590,15 @@ fn prepare_tarball_with_source_root_and_open_hook(
         .iter()
         .filter(|retained| retained.include_if_missing)
     {
-        let source_path = validate_content_override_path(retained.path)?;
+        validate_content_override_path(retained.path)?;
         push_tarball_candidate(
             &mut candidates,
             TarballCandidate {
-                source_path,
+                source_path: None,
                 source_root: Arc::clone(&project_source_root),
                 archive_path: retained.path.to_string(),
                 expected_content_sha256: None,
+                secret_scan_completed: false,
             },
         )?;
     }
@@ -477,13 +617,15 @@ fn prepare_tarball_with_source_root_and_open_hook(
                     .any(|skill| skill.path == candidate.archive_path)
         });
         for skill in validated_authored_skills {
+            validate_content_override_path(skill.path)?;
             push_tarball_candidate(
                 &mut candidates,
                 TarballCandidate {
-                    source_path: validate_content_override_path(skill.path)?,
+                    source_path: None,
                     source_root: Arc::clone(&project_source_root),
                     archive_path: skill.path.to_string(),
                     expected_content_sha256: None,
+                    secret_scan_completed: false,
                 },
             )?;
         }
@@ -528,21 +670,49 @@ fn prepare_tarball_with_source_root_and_open_hook(
             scan.matches.append(&mut file_scan.matches);
             scan.files_scanned += file_scan.files_scanned;
         }
+
+        let mut source_cursor = TarballSourceCursor::new();
+        for candidate in &mut candidates {
+            if !lpm_security::behavioral::secrets::file_content_requires_scan(
+                &candidate.archive_path,
+            ) || options.package_json_content.is_some()
+                && candidate.archive_path == "package.json"
+                || options
+                    .content_overrides
+                    .iter()
+                    .chain(validated_authored_skills)
+                    .any(|content| content.path == candidate.archive_path)
+            {
+                continue;
+            }
+            let (opened_file, opened_size) = source_cursor.open_file(
+                &candidate.source_root,
+                candidate.source_path(),
+                &candidate.archive_path,
+            )?;
+            if opened_size <= LARGE_SECRET_SCAN_PRESCAN_BYTES {
+                continue;
+            }
+            let content =
+                read_opened_tarball_file(opened_file, opened_size, &candidate.archive_path)?;
+            let mut file_scan = lpm_security::behavioral::secrets::scan_file_content_with_budget(
+                &content,
+                &candidate.archive_path,
+                budget,
+            );
+            ensure_publish_secret_scan_complete(&file_scan)?;
+            scan.matches.append(&mut file_scan.matches);
+            scan.files_scanned += file_scan.files_scanned;
+            use sha2::Digest as _;
+            candidate.expected_content_sha256 = Some(sha2::Sha256::digest(&content).into());
+            candidate.secret_scan_completed = true;
+        }
     }
-    let (gzipped, ()) = write_gzipped_tar(max_archive_bytes, |builder| {
-        let mut open_source_root: Option<(Arc<TarballSourceRoot>, Dir)> = None;
+    let (gzipped, (), hashes) = write_gzipped_tar(max_archive_bytes, |builder| {
+        let mut source_cursor = TarballSourceCursor::new();
 
         for candidate in candidates {
             before_candidate_open(&candidate.archive_path);
-            if !open_source_root
-                .as_ref()
-                .is_some_and(|(source, _)| Arc::ptr_eq(source, &candidate.source_root))
-            {
-                open_source_root = Some((
-                    Arc::clone(&candidate.source_root),
-                    candidate.source_root.open_directory()?,
-                ));
-            }
             let root_manifest_override = options
                 .package_json_content
                 .filter(|_| candidate.archive_path == "package.json");
@@ -556,26 +726,87 @@ fn prepare_tarball_with_source_root_and_open_hook(
             let opened = if override_content.is_some() {
                 None
             } else {
-                let source_dir = &open_source_root
-                    .as_ref()
-                    .ok_or_else(|| {
-                        LpmError::Registry(
-                            "publish source root was unavailable while packing".into(),
-                        )
-                    })?
-                    .1;
-                Some(open_tarball_source_file(
-                    source_dir,
-                    &candidate.source_path,
+                Some(source_cursor.open_file(
+                    &candidate.source_root,
+                    candidate.source_path(),
                     &candidate.archive_path,
                 )?)
             };
+            let archive_mode = opened
+                .as_ref()
+                .map_or(0o644, |(file, _)| publish_file_mode(file).unwrap_or(0o644));
             let file_size = override_content.map_or_else(
                 || opened.as_ref().map_or(0, |(_, size)| *size),
                 |content| content.len() as u64,
             );
             if file_size > MAX_TARBALL_FILE_BYTES {
                 return Err(publish_file_too_large(&candidate.archive_path, file_size));
+            }
+
+            let stream_without_buffering = override_content.is_none()
+                && readme_priority(&candidate.archive_path).is_none()
+                && secret_scan.as_ref().is_none_or(|_| {
+                    candidate.secret_scan_completed
+                        || !lpm_security::behavioral::secrets::file_content_requires_scan(
+                            &candidate.archive_path,
+                        )
+                });
+            if stream_without_buffering {
+                let (mut opened_file, opened_size) = opened.ok_or_else(|| {
+                    LpmError::Registry(format!(
+                        "publish source file was unavailable while packing `{}`",
+                        candidate.archive_path
+                    ))
+                })?;
+                accumulated = accumulated.saturating_add(opened_size);
+                if accumulated > MAX_UNCOMPRESSED_TARBALL_BYTES {
+                    return Err(LpmError::Registry(format!(
+                        "uncompressed tarball payload would exceed {} bytes (already at {} after `{}`) — \
+                         reduce the publish set or split the package",
+                        MAX_UNCOMPRESSED_TARBALL_BYTES, accumulated, candidate.archive_path,
+                    )));
+                }
+
+                let mut header = tar::Header::new_gnu();
+                header.set_size(opened_size);
+                header.set_mode(archive_mode);
+                header.set_cksum();
+                let tar_path = format!("package/{}", candidate.archive_path);
+                let mut reader = OptionalSha256Reader::new(
+                    (&mut opened_file).take(opened_size),
+                    candidate.expected_content_sha256.is_some(),
+                );
+                builder
+                    .append_data(&mut header, &tar_path, &mut reader)
+                    .map_err(LpmError::Io)?;
+                let actual_content_sha256 = reader.finish();
+                if candidate.expected_content_sha256.is_some()
+                    && actual_content_sha256 != candidate.expected_content_sha256
+                {
+                    return Err(unsafe_publish_file_error(&candidate.archive_path));
+                }
+                if opened_file.metadata().map_err(LpmError::Io)?.len() != opened_size {
+                    return Err(unsafe_publish_file_error(&candidate.archive_path));
+                }
+                if !candidate.secret_scan_completed
+                    && let Some((scan, budget)) =
+                        secret_scan.as_mut().zip(secret_scan_budget.as_mut())
+                {
+                    let mut file_scan =
+                        lpm_security::behavioral::secrets::scan_file_content_with_budget(
+                            &[],
+                            &candidate.archive_path,
+                            budget,
+                        );
+                    ensure_publish_secret_scan_complete(&file_scan)?;
+                    scan.matches.append(&mut file_scan.matches);
+                    scan.files_scanned += file_scan.files_scanned;
+                }
+                files.push(TarballFile {
+                    path: candidate.archive_path,
+                    size: opened_size,
+                });
+                continue;
             }
 
             let content = override_content.map_or_else(
@@ -606,7 +837,7 @@ fn prepare_tarball_with_source_root_and_open_hook(
                 && readme
                     .as_ref()
                     .is_none_or(|(current_priority, _)| priority < *current_priority)
-                && let Ok(Some(content)) = read_readme_content(content.as_ref())
+                && let Ok(Some(content)) = read_readme_content(content.as_ref(), Some(actual_size))
             {
                 readme = Some((priority, content));
             }
@@ -622,7 +853,7 @@ fn prepare_tarball_with_source_root_and_open_hook(
 
             let mut header = tar::Header::new_gnu();
             header.set_size(actual_size);
-            header.set_mode(0o644);
+            header.set_mode(archive_mode);
             header.set_cksum();
 
             // npm tarballs have a `package/` prefix
@@ -653,6 +884,7 @@ fn prepare_tarball_with_source_root_and_open_hook(
 
     Ok(PreparedTarball {
         data: gzipped,
+        hashes,
         files,
         secret_scan,
         readme: readme.map(|(_, content)| content),
@@ -729,6 +961,40 @@ struct HashingWriter<W> {
     written: u64,
 }
 
+struct OptionalSha256Reader<R> {
+    inner: R,
+    hasher: Option<sha2::Sha256>,
+}
+
+impl<R> OptionalSha256Reader<R> {
+    fn new(inner: R, enabled: bool) -> Self {
+        use sha2::Digest as _;
+
+        Self {
+            inner,
+            hasher: enabled.then(sha2::Sha256::new),
+        }
+    }
+
+    fn finish(self) -> Option<[u8; 32]> {
+        use sha2::Digest as _;
+
+        self.hasher.map(|hasher| hasher.finalize().into())
+    }
+}
+
+impl<R: std::io::Read> std::io::Read for OptionalSha256Reader<R> {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        use sha2::Digest as _;
+
+        let read = self.inner.read(buffer)?;
+        if let Some(hasher) = &mut self.hasher {
+            hasher.update(&buffer[..read]);
+        }
+        Ok(read)
+    }
+}
+
 impl<W> HashingWriter<W> {
     fn new(inner: W) -> Self {
         use sha1::Digest as _;
@@ -774,8 +1040,10 @@ type PublishTarBuilder<'a, W> = tar::Builder<ArchiveSizeWriter<&'a mut PublishGz
 
 fn write_gzipped_tar<T>(
     max_archive_bytes: u64,
-    write_entries: impl FnOnce(&mut PublishTarBuilder<'_, Vec<u8>>) -> Result<T, LpmError>,
-) -> Result<(Vec<u8>, T), LpmError> {
+    write_entries: impl FnOnce(
+        &mut PublishTarBuilder<'_, HashingWriter<Vec<u8>>>,
+    ) -> Result<T, LpmError>,
+) -> Result<(Vec<u8>, T, TarballHashes), LpmError> {
     write_gzipped_tar_with_limits(
         max_archive_bytes,
         MAX_COMPRESSED_TARBALL_BYTES,
@@ -786,14 +1054,19 @@ fn write_gzipped_tar<T>(
 fn write_gzipped_tar_with_limits<T>(
     max_archive_bytes: u64,
     max_compressed_bytes: u64,
-    write_entries: impl FnOnce(&mut PublishTarBuilder<'_, Vec<u8>>) -> Result<T, LpmError>,
-) -> Result<(Vec<u8>, T), LpmError> {
-    write_gzipped_tar_to(
-        Vec::with_capacity(64 * 1024),
+    write_entries: impl FnOnce(
+        &mut PublishTarBuilder<'_, HashingWriter<Vec<u8>>>,
+    ) -> Result<T, LpmError>,
+) -> Result<(Vec<u8>, T, TarballHashes), LpmError> {
+    let output = HashingWriter::new(Vec::with_capacity(64 * 1024));
+    let (output, result) = write_gzipped_tar_to(
+        output,
         max_archive_bytes,
         max_compressed_bytes,
         write_entries,
-    )
+    )?;
+    let (data, hashes, _) = output.finish();
+    Ok((data, result, hashes))
 }
 
 fn write_gzipped_tar_to<W, T>(
@@ -929,6 +1202,24 @@ pub(crate) fn open_tarball_source_file(
     Err(unsafe_publish_file_error(archive_path))
 }
 
+#[cfg(unix)]
+fn publish_file_mode(file: &std::fs::File) -> std::io::Result<u32> {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    file.metadata().map(|metadata| {
+        if metadata.permissions().mode() & 0o111 == 0 {
+            0o644
+        } else {
+            0o755
+        }
+    })
+}
+
+#[cfg(not(unix))]
+fn publish_file_mode(_file: &std::fs::File) -> std::io::Result<u32> {
+    Ok(0o644)
+}
+
 fn read_opened_tarball_file(
     mut file: std::fs::File,
     expected_size: u64,
@@ -992,7 +1283,7 @@ fn publish_file_too_large(archive_path: &str, size: u64) -> LpmError {
     ))
 }
 
-fn validate_content_override_path(path: &str) -> Result<PathBuf, LpmError> {
+fn validate_content_override_path(path: &str) -> Result<(), LpmError> {
     if path.is_empty() || path.contains('\\') {
         return Err(unsafe_publish_file_error(path));
     }
@@ -1006,7 +1297,7 @@ fn validate_content_override_path(path: &str) -> Result<PathBuf, LpmError> {
     {
         return Err(unsafe_publish_file_error(path));
     }
-    Ok(relative)
+    Ok(())
 }
 
 #[cfg(windows)]
@@ -1135,46 +1426,36 @@ fn collect_package_files(
     }
 
     if let Some(files_arr) = pkg_json.get("files").and_then(|f| f.as_array()) {
-        for raw_pattern in files_arr.iter().filter_map(serde_json::Value::as_str) {
-            let pattern = PublishFilesPattern::parse(raw_pattern)?;
-            if pattern.segments.is_empty() {
-                collect_cap_directory(
-                    source_dir,
-                    Path::new(""),
-                    restrict_authored_skills,
-                    &mut result,
-                )?;
-            } else {
-                collect_explicit_pattern(
-                    source_dir,
-                    Path::new(""),
-                    &pattern.segments,
-                    0,
-                    restrict_authored_skills,
-                    &mut result,
-                )?;
-            }
-        }
+        let matcher = PublishFilesMatcher::parse(files_arr)?;
+        collect_explicit_matches(
+            source_dir,
+            Path::new(""),
+            &matcher,
+            restrict_authored_skills,
+            &mut result,
+        )?;
     } else {
         collect_all_files(source_dir, restrict_authored_skills, &mut result)?;
     }
     collect_required_manifest_files(source_dir, pkg_json, restrict_authored_skills, &mut result)?;
 
-    for extra in [
-        "README.md",
-        "readme.md",
-        "LICENSE",
-        "LICENSE.md",
-        "CHANGELOG.md",
-    ] {
-        if let Some(metadata) = safe_cap_metadata(source_dir, Path::new(extra))?
+    for entry in source_dir.entries()? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let display_name = name.to_string_lossy();
+        if !is_npm_always_included_root_file(&display_name) {
+            continue;
+        }
+        if let Some(metadata) = safe_cap_metadata(source_dir, Path::new(&name))?
             && metadata.is_file()
-            && !result.iter().any(|f| f.path.eq_ignore_ascii_case(extra))
+            && !result
+                .iter()
+                .any(|file| file.path.eq_ignore_ascii_case(&display_name))
         {
             push_tarball_file(
                 &mut result,
                 TarballFile {
-                    path: extra.to_string(),
+                    path: display_name.into_owned(),
                     size: metadata.len(),
                 },
             )?;
@@ -1183,10 +1464,23 @@ fn collect_package_files(
 
     result.retain(|file| !is_npm_strict_exclusion(&file.path));
 
-    let mut seen = std::collections::HashSet::new();
-    result.retain(|f| seen.insert(f.path.clone()));
+    result.sort_unstable_by(|left, right| left.path.cmp(&right.path));
+    result.dedup_by(|left, right| left.path == right.path);
 
     Ok(result)
+}
+
+fn is_npm_always_included_root_file(name: &str) -> bool {
+    let (base, extension) = name
+        .split_once('.')
+        .map_or((name, None), |(base, extension)| (base, Some(extension)));
+    if !["readme", "copying", "license", "licence"]
+        .iter()
+        .any(|candidate| base.eq_ignore_ascii_case(candidate))
+    {
+        return false;
+    }
+    extension.is_none_or(|extension| !extension.is_empty() && !extension.ends_with(['~', '$']))
 }
 
 fn push_tarball_file(result: &mut Vec<TarballFile>, file: TarballFile) -> Result<(), LpmError> {
@@ -1201,9 +1495,6 @@ fn push_tarball_file(result: &mut Vec<TarballFile>, file: TarballFile) -> Result
 }
 
 fn validate_publish_archive_path(path: &Path) -> Result<(), LpmError> {
-    const TAR_ROOT_COMPONENTS: usize = 1;
-    const TAR_ROOT_PREFIX_BYTES: usize = "package/".len();
-
     let depth = path
         .components()
         .count()
@@ -1229,46 +1520,184 @@ fn validate_publish_archive_path(path: &Path) -> Result<(), LpmError> {
     Ok(())
 }
 
-enum PublishPatternSegment {
-    Recursive,
-    Literal(String),
-    Glob(glob::Pattern),
+fn publish_archive_directory_can_contain_file(path: &Path) -> bool {
+    let minimum_file_depth = path
+        .components()
+        .count()
+        .saturating_add(TAR_ROOT_COMPONENTS)
+        .saturating_add(1);
+    let separator_bytes = usize::from(!path.as_os_str().is_empty());
+    let minimum_file_bytes = path
+        .as_os_str()
+        .as_encoded_bytes()
+        .len()
+        .saturating_add(TAR_ROOT_PREFIX_BYTES)
+        .saturating_add(separator_bytes)
+        .saturating_add(1);
+    minimum_file_depth <= MAX_PUBLISH_ARCHIVE_PATH_DEPTH
+        && minimum_file_bytes <= lpm_extractor::DEFAULT_MAX_ARCHIVE_PATH_BYTES
 }
 
-struct PublishFilesPattern {
-    segments: Vec<PublishPatternSegment>,
+struct PublishFilesMatcher {
+    rules: Vec<PublishFilesRule>,
+    traversal_roots: Vec<String>,
 }
 
-impl PublishFilesPattern {
-    fn parse(raw: &str) -> Result<Self, LpmError> {
-        let normalized = raw.replace('\\', "/");
-        if normalized.starts_with('/') {
+struct PublishFilesRule {
+    include: bool,
+    patterns: [ferralk_glob::Pattern; 2],
+}
+
+impl PublishFilesMatcher {
+    fn parse(files: &[serde_json::Value]) -> Result<Self, LpmError> {
+        let mut rules = Vec::with_capacity(files.len());
+        let mut traversal_roots = Vec::with_capacity(files.len());
+        for raw in files.iter().filter_map(serde_json::Value::as_str) {
+            let (include, pattern) = parse_publish_files_rule(raw);
+            let normalized = normalize_publish_files_pattern(pattern)?;
+            let normalized = if normalized.is_empty() {
+                "**".to_string()
+            } else {
+                normalized
+            };
+            let match_base = !normalized.contains('/');
+            let matching_pattern = if match_base {
+                format!("**/{normalized}")
+            } else {
+                normalized.clone()
+            };
+            if include {
+                let traversal_root = if match_base {
+                    String::new()
+                } else {
+                    publish_pattern_traversal_root(&normalized)
+                };
+                traversal_roots.push(traversal_root.to_ascii_lowercase());
+            }
+            let descendants = format!("{matching_pattern}/**");
+            rules.push(PublishFilesRule {
+                include,
+                patterns: [
+                    compile_publish_files_pattern(&matching_pattern, raw)?,
+                    compile_publish_files_pattern(&descendants, raw)?,
+                ],
+            });
+        }
+        traversal_roots.sort();
+        traversal_roots.dedup();
+        if traversal_roots.iter().any(String::is_empty) {
+            traversal_roots.clear();
+            traversal_roots.push(String::new());
+        }
+        Ok(Self {
+            rules,
+            traversal_roots,
+        })
+    }
+
+    #[inline]
+    fn is_match_portable(&self, path: &str) -> bool {
+        self.rules
+            .iter()
+            .rev()
+            .find(|rule| {
+                rule.patterns
+                    .iter()
+                    .any(|pattern| pattern.is_match_glob_path(path.as_bytes()))
+            })
+            .is_some_and(|rule| rule.include)
+    }
+
+    #[inline]
+    fn can_match_descendant(&self, directory: &Path) -> bool {
+        if self.traversal_roots.first().is_some_and(String::is_empty) {
+            return true;
+        }
+        let directory = portable_relative(directory).to_ascii_lowercase();
+        self.traversal_roots.iter().any(|root| {
+            root.is_empty()
+                || portable_path_starts_with(&directory, root)
+                || portable_path_starts_with(root, &directory)
+        })
+    }
+}
+
+fn parse_publish_files_rule(raw: &str) -> (bool, &str) {
+    let mut include = true;
+    let mut pattern = raw;
+    while let Some(remainder) = pattern.strip_prefix('!') {
+        if remainder.starts_with('(') {
+            break;
+        }
+        include = !include;
+        pattern = remainder;
+    }
+    (include, pattern)
+}
+
+fn publish_pattern_traversal_root(pattern: &str) -> String {
+    let mut root = String::new();
+    for segment in pattern.split('/') {
+        if segment
+            .as_bytes()
+            .iter()
+            .any(|byte| matches!(byte, b'*' | b'?' | b'[' | b'{' | b'('))
+        {
+            break;
+        }
+        if !root.is_empty() {
+            root.push('/');
+        }
+        root.push_str(segment);
+    }
+    root
+}
+
+fn portable_path_starts_with(path: &str, prefix: &str) -> bool {
+    path == prefix
+        || path
+            .strip_prefix(prefix)
+            .is_some_and(|remainder| remainder.starts_with('/'))
+}
+
+fn normalize_publish_files_pattern(raw: &str) -> Result<String, LpmError> {
+    let normalized = raw.replace('\\', "/");
+    if normalized.starts_with('/') {
+        return Err(unsafe_publish_files_pattern(raw));
+    }
+    let mut result = String::with_capacity(normalized.len());
+    for segment in normalized.split('/') {
+        if segment.is_empty() || segment == "." {
+            continue;
+        }
+        if segment == ".." {
             return Err(unsafe_publish_files_pattern(raw));
         }
-        let mut segments = Vec::new();
-        for segment in normalized.split('/') {
-            if segment.is_empty() || segment == "." {
-                continue;
-            }
-            if segment == ".." {
-                return Err(unsafe_publish_files_pattern(raw));
-            }
-            if segment == "**" {
-                segments.push(PublishPatternSegment::Recursive);
-            } else if segment
-                .bytes()
-                .any(|byte| matches!(byte, b'*' | b'?' | b'['))
-            {
-                match glob::Pattern::new(segment) {
-                    Ok(pattern) => segments.push(PublishPatternSegment::Glob(pattern)),
-                    Err(_) => segments.push(PublishPatternSegment::Literal(segment.to_string())),
-                }
-            } else {
-                segments.push(PublishPatternSegment::Literal(segment.to_string()));
-            }
+        if !result.is_empty() {
+            result.push('/');
         }
-        Ok(Self { segments })
+        result.push_str(segment);
     }
+    Ok(result)
+}
+
+fn compile_publish_files_pattern(
+    pattern: &str,
+    original: &str,
+) -> Result<ferralk_glob::Pattern, LpmError> {
+    let options = ferralk_glob::PatternOptions::default()
+        .braces(true)
+        .recursive_double_star(true)
+        .extglob(true)
+        .match_hidden(true)
+        .case_insensitive(true)
+        .escape(false);
+    ferralk_glob::Pattern::compile(pattern.as_bytes(), options).map_err(|error| {
+        LpmError::Registry(format!(
+            "invalid package.json `files` pattern {}: {error}",
+            lpm_common::sanitize_terminal_inline(original)
+        ))
+    })
 }
 
 fn unsafe_publish_files_pattern(pattern: &str) -> LpmError {
@@ -1278,151 +1707,50 @@ fn unsafe_publish_files_pattern(pattern: &str) -> LpmError {
     ))
 }
 
-fn collect_explicit_pattern(
+fn collect_explicit_matches(
     directory: &Dir,
     relative_dir: &Path,
-    segments: &[PublishPatternSegment],
-    index: usize,
+    matcher: &PublishFilesMatcher,
     restrict_authored_skills: bool,
     result: &mut Vec<TarballFile>,
 ) -> Result<(), LpmError> {
     validate_publish_archive_path(relative_dir)?;
-    let Some(segment) = segments.get(index) else {
-        return collect_cap_directory(directory, relative_dir, restrict_authored_skills, result);
-    };
-    if matches!(segment, PublishPatternSegment::Recursive) {
-        if index + 1 == segments.len() {
-            return collect_cap_directory(
-                directory,
-                relative_dir,
-                restrict_authored_skills,
-                result,
-            );
+    for entry in directory.entries()? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let relative = relative_dir.join(&name);
+        if restrict_authored_skills && is_authored_skill_namespace_path(&relative) {
+            continue;
         }
-        collect_explicit_pattern(
-            directory,
-            relative_dir,
-            segments,
-            index + 1,
-            restrict_authored_skills,
-            result,
-        )?;
-        for entry in directory.entries()? {
-            let entry = entry?;
-            let name = entry.file_name();
-            let relative = relative_dir.join(&name);
-            let Some(metadata) = safe_cap_metadata(directory, Path::new(&name))? else {
-                continue;
-            };
-            if !metadata.is_dir() || is_npm_strict_exclusion(&portable_relative(&relative)) {
-                continue;
+        let Some(metadata) = safe_cap_metadata(directory, Path::new(&name))? else {
+            continue;
+        };
+        let archive_path = portable_relative(&relative);
+        if is_npm_strict_exclusion(&archive_path) {
+            continue;
+        }
+        if metadata.is_file() {
+            if archive_path != "package.json" && matcher.is_match_portable(&archive_path) {
+                push_tarball_file(
+                    result,
+                    TarballFile {
+                        path: archive_path,
+                        size: metadata.len(),
+                    },
+                )?;
             }
-            if restrict_authored_skills && is_authored_skill_namespace_path(&relative) {
-                continue;
-            }
+        } else if metadata.is_dir()
+            && publish_archive_directory_can_contain_file(&relative)
+            && matcher.can_match_descendant(&relative)
+        {
             let child = open_cap_directory_entry(directory, &name, &relative)?;
             if is_materialized_package_skill_directory(&relative, &child)? {
                 continue;
             }
-            collect_explicit_pattern(
-                &child,
-                &relative,
-                segments,
-                index,
-                restrict_authored_skills,
-                result,
-            )?;
+            collect_explicit_matches(&child, &relative, matcher, restrict_authored_skills, result)?;
         }
-        return Ok(());
     }
-
-    match segment {
-        PublishPatternSegment::Literal(name) => collect_pattern_entry(
-            directory,
-            relative_dir,
-            name.as_ref(),
-            segments,
-            index,
-            restrict_authored_skills,
-            result,
-        ),
-        PublishPatternSegment::Glob(pattern) => {
-            for entry in directory.entries()? {
-                let entry = entry?;
-                let name = entry.file_name();
-                if !pattern.matches(&name.to_string_lossy()) {
-                    continue;
-                }
-                collect_pattern_entry(
-                    directory,
-                    relative_dir,
-                    Path::new(&name),
-                    segments,
-                    index,
-                    restrict_authored_skills,
-                    result,
-                )?;
-            }
-            Ok(())
-        }
-        PublishPatternSegment::Recursive => Err(LpmError::Registry(
-            "invalid recursive publish pattern state".into(),
-        )),
-    }
-}
-
-fn collect_pattern_entry(
-    directory: &Dir,
-    relative_dir: &Path,
-    name: &Path,
-    segments: &[PublishPatternSegment],
-    index: usize,
-    restrict_authored_skills: bool,
-    result: &mut Vec<TarballFile>,
-) -> Result<(), LpmError> {
-    let Some(metadata) = safe_cap_metadata(directory, name)? else {
-        return Ok(());
-    };
-    let relative = relative_dir.join(name);
-    if restrict_authored_skills && is_authored_skill_namespace_path(&relative) {
-        return Ok(());
-    }
-    let archive_path = portable_relative(&relative);
-    if is_npm_strict_exclusion(&archive_path) {
-        return Ok(());
-    }
-    let last = index + 1 == segments.len();
-    if metadata.is_file() {
-        if last && archive_path != "package.json" {
-            push_tarball_file(
-                result,
-                TarballFile {
-                    path: archive_path,
-                    size: metadata.len(),
-                },
-            )?;
-        }
-        return Ok(());
-    }
-    if !metadata.is_dir() {
-        return Ok(());
-    }
-    let child = open_cap_directory_entry(directory, name.as_os_str(), &relative)?;
-    if is_materialized_package_skill_directory(&relative, &child)? {
-        return Ok(());
-    }
-    if last {
-        collect_cap_directory(&child, &relative, restrict_authored_skills, result)
-    } else {
-        collect_explicit_pattern(
-            &child,
-            &relative,
-            segments,
-            index + 1,
-            restrict_authored_skills,
-            result,
-        )
-    }
+    Ok(())
 }
 
 fn collect_required_manifest_files(
@@ -1569,24 +1897,7 @@ fn collect_cap_directory(
 }
 
 /// Security-sensitive defaults applied in addition to project ignore rules.
-const IGNORE_DIRS: &[&str] = &[
-    "node_modules",
-    ".git",
-    ".svn",
-    ".hg",
-    "coverage",
-    ".nyc_output",
-    ".cache",
-    ".next",
-    ".nuxt",
-    "private",
-    "secrets",
-    ".secrets",
-    "credentials",
-    ".credentials",
-    ".vscode",
-    ".idea",
-];
+const IGNORE_DIRS: &[&str] = &["node_modules", ".git", ".svn", ".hg", "CVS"];
 
 const IGNORE_FILES: &[&str] = &[
     ".gitignore",
@@ -1636,16 +1947,8 @@ fn collect_all_files(
     restrict_authored_skills: bool,
     result: &mut Vec<TarballFile>,
 ) -> Result<(), LpmError> {
-    let ignore_file = preferred_ignore_file(source_dir)?;
     let mut matchers = Vec::new();
-    collect_implicit_directory(
-        source_dir,
-        Path::new(""),
-        ignore_file,
-        &mut matchers,
-        0,
-        result,
-    )?;
+    collect_implicit_directory(source_dir, Path::new(""), &mut matchers, 0, result)?;
     if !restrict_authored_skills {
         collect_implicit_lpm_files(source_dir, result)?;
     }
@@ -1690,13 +1993,12 @@ fn collect_implicit_lpm_files(
 fn collect_implicit_directory(
     directory: &Dir,
     relative_dir: &Path,
-    ignore_file: Option<&str>,
     matchers: &mut Vec<ignore::gitignore::Gitignore>,
     depth: usize,
     result: &mut Vec<TarballFile>,
 ) -> Result<(), LpmError> {
     validate_publish_archive_path(relative_dir)?;
-    let matcher = ignore_file
+    let matcher = preferred_ignore_file(directory)?
         .map(|name| load_cap_ignore(directory, relative_dir, name))
         .transpose()?
         .flatten();
@@ -1724,14 +2026,7 @@ fn collect_implicit_directory(
                 continue;
             }
             let child = open_cap_directory_entry(directory, &name, &relative)?;
-            collect_implicit_directory(
-                &child,
-                &relative,
-                ignore_file,
-                matchers,
-                depth + 1,
-                result,
-            )?;
+            collect_implicit_directory(&child, &relative, matchers, depth + 1, result)?;
         } else if metadata.is_file()
             && !contains_ascii_case_insensitive(IGNORE_FILES, &display_name)
         {
@@ -2468,11 +2763,12 @@ fn collect_bundle_tree(
             push_tarball_candidate(
                 result,
                 TarballCandidate {
-                    source_path: relative.clone(),
+                    source_path: Some(relative.clone()),
                     source_root: Arc::clone(source_root),
                     archive_path: format!("{archive_root}/{portable}"),
                     expected_content_sha256: (relative == Path::new("package.json"))
                         .then_some(*manifest_sha256),
+                    secret_scan_completed: false,
                 },
             )?;
         }
@@ -2530,6 +2826,19 @@ pub(crate) fn rewrite_tarball_name_for_publish(
                 publish_tar_read_limits(),
                 |mut entry| {
                     let path = entry.path().to_string_lossy().to_string();
+                    let scan_path = path.strip_prefix("package/").unwrap_or(&path);
+
+                    if path != "package/package.json" {
+                        let size = entry.header().size().map_err(LpmError::Io)?;
+                        let mut header = tar::Header::new_gnu();
+                        header.set_size(size);
+                        header.set_mode(entry.header().mode().unwrap_or(0o644));
+                        header.set_cksum();
+                        builder
+                            .append_data(&mut header, &path, &mut entry)
+                            .map_err(LpmError::Io)?;
+                        return Ok(std::ops::ControlFlow::<()>::Continue(()));
+                    }
 
                     let mut content = Vec::new();
                     entry.read_to_end(&mut content).map_err(LpmError::Io)?;
@@ -2561,7 +2870,6 @@ pub(crate) fn rewrite_tarball_name_for_publish(
                     if let Some((scan, budget)) =
                         secret_scan.as_mut().zip(secret_scan_budget.as_mut())
                     {
-                        let scan_path = path.strip_prefix("package/").unwrap_or(&path);
                         let mut file_scan =
                             lpm_security::behavioral::secrets::scan_file_content_with_budget(
                                 &content, scan_path, budget,
@@ -2587,22 +2895,38 @@ pub(crate) fn rewrite_tarball_name_for_publish(
         file: std::sync::Mutex::new(file),
         len,
         hashes: std::sync::Arc::new(hashes),
-        package_json_size,
+        package_json_size: Some(package_json_size),
         secret_scan,
     }))
 }
 
+#[cfg(test)]
 pub(crate) fn rewrite_workspace_deps_in_package_json(
     package_json_content: &[u8],
     workspace: &lpm_workspace::Workspace,
 ) -> Result<Option<Vec<u8>>, LpmError> {
-    if !package_json_requires_workspace_projection(package_json_content) {
+    let Ok(mut pkg) = serde_json::from_slice::<serde_json::Value>(package_json_content) else {
+        return Ok(None);
+    };
+    if !rewrite_workspace_deps_in_package_json_value(&mut pkg, workspace)? {
         return Ok(None);
     }
 
-    let Ok(mut pkg) = serde_json::from_slice::<serde_json::Value>(package_json_content) else {
-        return Ok(Some(package_json_content.to_vec()));
-    };
+    serde_json::to_vec_pretty(&pkg).map(Some).map_err(|error| {
+        LpmError::Registry(format!(
+            "failed to serialize rewritten package.json: {error}"
+        ))
+    })
+}
+
+pub(crate) fn rewrite_workspace_deps_in_package_json_value(
+    pkg: &mut serde_json::Value,
+    workspace: &lpm_workspace::Workspace,
+) -> Result<bool, LpmError> {
+    if !package_json_value_requires_workspace_projection(pkg) {
+        return Ok(false);
+    }
+
     let dep_fields = [
         "dependencies",
         "devDependencies",
@@ -2614,10 +2938,16 @@ pub(crate) fn rewrite_workspace_deps_in_package_json(
         let Some(deps_obj) = pkg.get(field).and_then(serde_json::Value::as_object) else {
             continue;
         };
-        let mut deps_map: std::collections::HashMap<String, String> = deps_obj
-            .iter()
-            .map(|(name, value)| (name.clone(), value.as_str().unwrap_or("*").to_string()))
-            .collect();
+        let mut deps_map = std::collections::HashMap::with_capacity(deps_obj.len());
+        for (name, value) in deps_obj {
+            let range = value.as_str().ok_or_else(|| {
+                LpmError::Registry(format!(
+                    "package.json \"{field}\" range for \"{}\" must be a string",
+                    lpm_common::sanitize_terminal_inline(name),
+                ))
+            })?;
+            deps_map.insert(name.clone(), range.to_string());
+        }
 
         lpm_workspace::resolve_workspace_protocol(&mut deps_map, workspace).map_err(|error| {
             LpmError::Registry(format!(
@@ -2625,17 +2955,12 @@ pub(crate) fn rewrite_workspace_deps_in_package_json(
             ))
         })?;
 
-        if !workspace.root_package.catalogs.is_empty() {
-            lpm_workspace::resolve_catalog_protocol(
-                &mut deps_map,
-                &workspace.root_package.catalogs,
-            )
+        lpm_workspace::resolve_catalog_protocol(&mut deps_map, &workspace.root_package.catalogs)
             .map_err(|error| {
                 LpmError::Registry(format!(
                     "failed to resolve catalog: protocol in {field}: {error}"
                 ))
             })?;
-        }
 
         let mut resolved_deps = serde_json::Map::with_capacity(deps_obj.len());
         for name in deps_obj.keys() {
@@ -2646,20 +2971,35 @@ pub(crate) fn rewrite_workspace_deps_in_package_json(
         pkg[field] = serde_json::Value::Object(resolved_deps);
     }
 
-    serde_json::to_vec_pretty(&pkg).map(Some).map_err(|error| {
-        LpmError::Registry(format!(
-            "failed to serialize rewritten package.json: {error}"
-        ))
-    })
+    Ok(true)
 }
 
+#[cfg(test)]
 pub(crate) fn package_json_requires_workspace_projection(content: &[u8]) -> bool {
-    const WORKSPACE: &[u8] = b"\"workspace:";
-    const CATALOG: &[u8] = b"\"catalog:";
-    content
-        .windows(WORKSPACE.len())
-        .any(|bytes| bytes == WORKSPACE)
-        || content.windows(CATALOG.len()).any(|bytes| bytes == CATALOG)
+    let Ok(package_json) = serde_json::from_slice::<serde_json::Value>(content) else {
+        return true;
+    };
+    package_json_value_requires_workspace_projection(&package_json)
+}
+
+pub(crate) fn package_json_value_requires_workspace_projection(
+    package_json: &serde_json::Value,
+) -> bool {
+    [
+        "dependencies",
+        "devDependencies",
+        "peerDependencies",
+        "optionalDependencies",
+    ]
+    .iter()
+    .filter_map(|field| {
+        package_json
+            .get(field)
+            .and_then(serde_json::Value::as_object)
+    })
+    .flat_map(|dependencies| dependencies.values())
+    .filter_map(serde_json::Value::as_str)
+    .any(|value| value.starts_with("workspace:") || value.starts_with("catalog:"))
 }
 
 /// Rewrite `workspace:` and `catalog:` protocol references in the tarball's `package.json`.
@@ -2700,7 +3040,7 @@ pub fn rewrite_workspace_deps_in_tarball(
         return Ok(tarball_data.to_vec());
     };
 
-    let (gzipped, ()) = write_gzipped_tar(MAX_UNCOMPRESSED_TARBALL_BYTES, |builder| {
+    let (gzipped, (), _) = write_gzipped_tar(MAX_UNCOMPRESSED_TARBALL_BYTES, |builder| {
         lpm_extractor::visit_tar_archive(
             GzDecoder::new(tarball_data),
             publish_tar_read_limits(),
@@ -2821,15 +3161,23 @@ pub(crate) fn prepare_json_publish_body(
         )
         .map_err(LpmError::Io)?
     } else {
-        let mut suffix = Vec::with_capacity(64);
-        write_json_publish_payload_suffix(&mut suffix, tarball_data.len(), None)?;
-        lpm_http::ReplayableRequestBody::from_base64_json_parts(
-            prefix,
-            std::sync::Arc::clone(tarball_data),
-            suffix,
-        )
-        .map_err(LpmError::Io)?
+        return prepare_base64_json_publish_body(prefix, tarball_data);
     };
+    Ok(PreparedPublishBody { body })
+}
+
+pub(crate) fn prepare_base64_json_publish_body(
+    prefix: Vec<u8>,
+    tarball_data: &std::sync::Arc<Vec<u8>>,
+) -> Result<PreparedPublishBody, LpmError> {
+    let mut suffix = Vec::with_capacity(64);
+    write_json_publish_payload_suffix(&mut suffix, tarball_data.len(), None)?;
+    let body = lpm_http::ReplayableRequestBody::from_base64_json_parts(
+        prefix,
+        std::sync::Arc::clone(tarball_data),
+        suffix,
+    )
+    .map_err(LpmError::Io)?;
     Ok(PreparedPublishBody { body })
 }
 
@@ -3163,16 +3511,6 @@ mod tests {
             .collect()
     }
 
-    #[cfg(unix)]
-    fn open_descriptor_count() -> usize {
-        let path = if cfg!(target_os = "linux") {
-            "/proc/self/fd"
-        } else {
-            "/dev/fd"
-        };
-        std::fs::read_dir(path).unwrap().count()
-    }
-
     #[test]
     fn compute_hashes_correct() {
         let data = b"hello world";
@@ -3182,6 +3520,119 @@ mod tests {
         assert_eq!(hashes.shasum, "2aae6c35c94fcfb415dbe95f408b9ce91ee846ed");
         // SHA-512 integrity must start with sha512-
         assert!(hashes.integrity.starts_with("sha512-"));
+    }
+
+    #[test]
+    fn prepared_tarball_streaming_hashes_match_the_final_archive_bytes() {
+        let project = tempfile::tempdir().unwrap();
+        let manifest = serde_json::json!({
+            "name": "streaming-hashes",
+            "version": "1.0.0",
+            "files": ["index.js"],
+        });
+        std::fs::write(project.path().join("package.json"), manifest.to_string()).unwrap();
+        std::fs::write(project.path().join("index.js"), "module.exports = true;").unwrap();
+
+        let prepared =
+            prepare_tarball(project.path(), &manifest, TarballOptions::default()).unwrap();
+
+        assert_eq!(prepared.hashes, compute_hashes(&prepared.data));
+    }
+
+    #[test]
+    fn source_cursor_reuses_open_parent_directories_across_sorted_files() {
+        let project = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(project.path().join("nested/deeper")).unwrap();
+        std::fs::write(project.path().join("nested/a.bin"), b"a").unwrap();
+        std::fs::write(project.path().join("nested/deeper/b.bin"), b"b").unwrap();
+        std::fs::write(project.path().join("nested/z.bin"), b"z").unwrap();
+        let canonical_project = project.path().canonicalize().unwrap();
+        let directory = open_tarball_source_root(&canonical_project).unwrap();
+        let source_root = Arc::new(TarballSourceRoot {
+            path: canonical_project,
+            directory: Some(directory),
+            identity: None,
+        });
+        let mut cursor = TarballSourceCursor::new();
+
+        for path in ["nested/a.bin", "nested/deeper/b.bin", "nested/z.bin"] {
+            let (mut file, size) = cursor
+                .open_file(&source_root, Path::new(path), path)
+                .unwrap();
+            let mut content = Vec::with_capacity(size as usize);
+            file.read_to_end(&mut content).unwrap();
+            assert_eq!(content.len() as u64, size);
+        }
+
+        assert_eq!(cursor.parent_open_count, 2);
+    }
+
+    #[test]
+    fn initial_tarball_streaming_preserves_non_scannable_binary_bytes() {
+        let project = tempfile::tempdir().unwrap();
+        let manifest = serde_json::json!({
+            "name": "streamed-binary",
+            "version": "1.0.0",
+            "files": ["payload.bin"],
+        });
+        let payload: Vec<u8> = (0_u8..=u8::MAX).cycle().take(128 * 1024).collect();
+        std::fs::write(
+            project.path().join("package.json"),
+            serde_json::to_vec(&manifest).unwrap(),
+        )
+        .unwrap();
+        std::fs::write(project.path().join("payload.bin"), &payload).unwrap();
+
+        let prepared = prepare_tarball(
+            project.path(),
+            &manifest,
+            TarballOptions {
+                scan_secrets: true,
+                ..TarballOptions::default()
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            tarball_contents(&prepared.data)["package/payload.bin"],
+            payload
+        );
+        assert!(!prepared.secret_scan.unwrap().has_secrets());
+    }
+
+    #[test]
+    fn target_name_rewrite_streaming_preserves_non_scannable_binary_bytes() {
+        let project = tempfile::tempdir().unwrap();
+        let manifest = serde_json::json!({
+            "name": "original-binary-name",
+            "version": "1.0.0",
+            "files": ["payload.bin"],
+        });
+        let payload: Vec<u8> = (0_u8..=u8::MAX).rev().cycle().take(128 * 1024).collect();
+        std::fs::write(
+            project.path().join("package.json"),
+            serde_json::to_vec(&manifest).unwrap(),
+        )
+        .unwrap();
+        std::fs::write(project.path().join("payload.bin"), &payload).unwrap();
+        let prepared =
+            prepare_tarball(project.path(), &manifest, TarballOptions::default()).unwrap();
+
+        let rewritten = rewrite_tarball_name_for_publish(
+            &prepared.data,
+            "original-binary-name",
+            "rewritten-binary-name",
+            true,
+        )
+        .unwrap()
+        .unwrap();
+        let rewritten_data = rewritten.read_data().unwrap();
+
+        assert_eq!(
+            tarball_contents(&rewritten_data)["package/payload.bin"],
+            payload
+        );
+        assert!(!rewritten.secret_scan.unwrap().has_secrets());
     }
 
     #[test]
@@ -3214,9 +3665,12 @@ mod tests {
             }
         }
 
-        let content = read_readme_content(ErrorsAfterPrefix {
-            remaining: MAX_README_BYTES + 1,
-        })
+        let content = read_readme_content(
+            ErrorsAfterPrefix {
+                remaining: MAX_README_BYTES + 1,
+            },
+            None,
+        )
         .unwrap()
         .unwrap();
 
@@ -3257,6 +3711,212 @@ mod tests {
         let paths: Vec<&str> = files.iter().map(|f| f.path.as_str()).collect();
         assert!(paths.contains(&"package.json"));
         assert!(paths.contains(&"index.js"));
+    }
+
+    #[test]
+    fn overlapping_publish_file_patterns_produce_one_union_without_duplicates() {
+        let project = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(project.path().join("dist/nested")).unwrap();
+        for path in ["dist/a.js", "dist/b.ts", "dist/nested/c.js"] {
+            std::fs::write(project.path().join(path), path).unwrap();
+        }
+        std::fs::write(project.path().join("outside.js"), "outside").unwrap();
+        let manifest = serde_json::json!({
+            "name": "overlapping-patterns",
+            "version": "1.0.0",
+            "files": ["dist/**", "dist/**/*.js", "dist/{a,b}.{js,ts}"],
+        });
+        std::fs::write(
+            project.path().join("package.json"),
+            serde_json::to_vec(&manifest).unwrap(),
+        )
+        .unwrap();
+
+        let prepared =
+            prepare_tarball(project.path(), &manifest, TarballOptions::default()).unwrap();
+        let paths: Vec<_> = prepared
+            .files
+            .iter()
+            .map(|file| file.path.as_str())
+            .collect();
+
+        assert_eq!(paths.iter().filter(|path| **path == "dist/a.js").count(), 1,);
+        assert!(paths.contains(&"dist/b.ts"));
+        assert!(paths.contains(&"dist/nested/c.js"));
+        assert!(!paths.contains(&"outside.js"));
+    }
+
+    #[test]
+    fn explicit_publish_does_not_traverse_unmatched_trees_beyond_archive_depth() {
+        let project = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(project.path().join("dist")).unwrap();
+        std::fs::write(project.path().join("dist/index.js"), "export default 1;").unwrap();
+        let mut excluded = project.path().join("excluded");
+        for _ in 0..MAX_PUBLISH_ARCHIVE_PATH_DEPTH {
+            excluded.push("a");
+        }
+        std::fs::create_dir_all(excluded).unwrap();
+        let manifest = serde_json::json!({
+            "name": "narrow-files-pattern",
+            "version": "1.0.0",
+            "files": ["dist"],
+        });
+        std::fs::write(
+            project.path().join("package.json"),
+            serde_json::to_vec(&manifest).unwrap(),
+        )
+        .unwrap();
+
+        let prepared =
+            prepare_tarball(project.path(), &manifest, TarballOptions::default()).unwrap();
+
+        assert!(
+            prepared
+                .files
+                .iter()
+                .any(|file| file.path == "dist/index.js")
+        );
+        assert!(
+            prepared
+                .files
+                .iter()
+                .all(|file| !file.path.starts_with("excluded/"))
+        );
+    }
+
+    #[test]
+    fn publish_files_supports_npm_extglob_alternatives() {
+        let project = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(project.path().join("dist")).unwrap();
+        std::fs::write(project.path().join("dist/index.js"), "export default 1;").unwrap();
+        std::fs::write(project.path().join("dist/private.js"), "not selected").unwrap();
+        let manifest = serde_json::json!({
+            "name": "extglob-files",
+            "version": "1.0.0",
+            "files": ["dist/@(index|main).js"],
+        });
+        std::fs::write(
+            project.path().join("package.json"),
+            serde_json::to_vec(&manifest).unwrap(),
+        )
+        .unwrap();
+
+        let prepared =
+            prepare_tarball(project.path(), &manifest, TarballOptions::default()).unwrap();
+
+        assert!(
+            prepared
+                .files
+                .iter()
+                .any(|file| file.path == "dist/index.js"),
+            "the extglob-selected file was omitted"
+        );
+        assert!(
+            prepared
+                .files
+                .iter()
+                .all(|file| file.path != "dist/private.js"),
+            "the extglob matched an unlisted alternative"
+        );
+    }
+
+    #[test]
+    fn publish_files_applies_later_negated_patterns() {
+        let project = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(project.path().join("lib")).unwrap();
+        std::fs::write(project.path().join("lib/public.js"), "public").unwrap();
+        std::fs::write(project.path().join("lib/private.js"), "private").unwrap();
+        let manifest = serde_json::json!({
+            "name": "negated-files",
+            "version": "1.0.0",
+            "files": ["lib/**", "!lib/private.js"],
+        });
+        std::fs::write(
+            project.path().join("package.json"),
+            serde_json::to_vec(&manifest).unwrap(),
+        )
+        .unwrap();
+
+        let prepared =
+            prepare_tarball(project.path(), &manifest, TarballOptions::default()).unwrap();
+
+        assert!(
+            prepared
+                .files
+                .iter()
+                .any(|file| file.path == "lib/public.js")
+        );
+        assert!(
+            prepared
+                .files
+                .iter()
+                .all(|file| file.path != "lib/private.js")
+        );
+    }
+
+    #[test]
+    fn publish_files_matches_paths_case_insensitively() {
+        let project = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(project.path().join("Dist")).unwrap();
+        std::fs::write(project.path().join("Dist/Index.JS"), "selected").unwrap();
+        let manifest = serde_json::json!({
+            "name": "case-insensitive-files",
+            "version": "1.0.0",
+            "files": ["dist/index.js"],
+        });
+        std::fs::write(
+            project.path().join("package.json"),
+            serde_json::to_vec(&manifest).unwrap(),
+        )
+        .unwrap();
+
+        let prepared =
+            prepare_tarball(project.path(), &manifest, TarballOptions::default()).unwrap();
+
+        assert!(
+            prepared
+                .files
+                .iter()
+                .any(|file| file.path == "Dist/Index.JS")
+        );
+    }
+
+    #[test]
+    fn publish_files_matches_basename_patterns_at_any_depth() {
+        let project = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(project.path().join("nested/deeper")).unwrap();
+        std::fs::write(project.path().join("nested/deeper/index.js"), "selected").unwrap();
+        std::fs::write(
+            project.path().join("nested/deeper/index.ts"),
+            "not selected",
+        )
+        .unwrap();
+        let manifest = serde_json::json!({
+            "name": "match-base-files",
+            "version": "1.0.0",
+            "files": ["*.js"],
+        });
+        std::fs::write(
+            project.path().join("package.json"),
+            serde_json::to_vec(&manifest).unwrap(),
+        )
+        .unwrap();
+
+        let prepared =
+            prepare_tarball(project.path(), &manifest, TarballOptions::default()).unwrap();
+
+        assert!(
+            prepared
+                .files
+                .iter()
+                .any(|file| file.path == "nested/deeper/index.js")
+        );
+        assert!(
+            prepared
+                .files
+                .iter()
+                .all(|file| file.path != "nested/deeper/index.ts")
+        );
     }
 
     #[test]
@@ -4608,9 +5268,8 @@ mod tests {
         assert_eq!(archive["package/node_modules/bar/index.js"], b"bar");
     }
 
-    #[cfg(unix)]
     #[test]
-    fn bundled_dependency_collection_keeps_open_descriptors_bounded() {
+    fn bundled_dependency_candidates_do_not_retain_open_directories() {
         let dir = tempfile::tempdir().unwrap();
         let project = dir.path();
         let node_modules = project.join("node_modules");
@@ -4640,21 +5299,18 @@ mod tests {
             .unwrap();
             std::fs::write(package.join("index.js"), name).unwrap();
         }
-        let baseline = open_descriptor_count();
-        let observed = std::cell::Cell::new(None);
+        let canonical_project = project.canonicalize().unwrap();
+        let source_dir = open_tarball_source_root(&canonical_project).unwrap();
+        let mut candidates = Vec::new();
+        collect_bundled_dependencies(&source_dir, &manifest, &canonical_project, &mut candidates)
+            .unwrap();
 
-        prepare_tarball_with_open_hook(project, &manifest, TarballOptions::default(), |_| {
-            if observed.get().is_none() {
-                observed.set(Some(open_descriptor_count()));
-            }
-        })
-        .unwrap();
-
-        let observed = observed.get().unwrap();
+        assert!(!candidates.is_empty());
         assert!(
-            observed <= baseline + 16,
-            "bundle discovery retained {} extra descriptors",
-            observed.saturating_sub(baseline)
+            candidates
+                .iter()
+                .all(|candidate| candidate.source_root.directory.is_none()),
+            "bundled candidates must reopen identity-checked roots on demand",
         );
     }
 
@@ -5218,6 +5874,82 @@ mod tests {
         assert!(
             error.to_string().contains("10000 finding limit"),
             "unexpected publish scan error: {error}"
+        );
+    }
+
+    #[test]
+    fn large_scannable_files_are_prescanned_for_secrets() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path();
+        let manifest = serde_json::json!({
+            "name": "large-secret-prescan",
+            "version": "1.0.0",
+            "files": ["bundle.js"]
+        });
+        std::fs::write(
+            project.join("package.json"),
+            serde_json::to_vec(&manifest).unwrap(),
+        )
+        .unwrap();
+        let mut content = vec![b'x'; LARGE_SECRET_SCAN_PRESCAN_BYTES as usize + 1];
+        content.extend_from_slice(b"\nsk_live_FAKEFAKEFAKEFAKEFAKE\n");
+        std::fs::write(project.join("bundle.js"), content).unwrap();
+
+        let prepared = prepare_tarball(
+            project,
+            &manifest,
+            TarballOptions {
+                scan_secrets: true,
+                ..TarballOptions::default()
+            },
+        )
+        .unwrap();
+        let scan = prepared.secret_scan.unwrap();
+
+        assert!(
+            scan.matches
+                .iter()
+                .any(|finding| finding.pattern_name == "stripe_live_secret"),
+            "the large-file prescan must retain secret findings: {scan:?}",
+        );
+    }
+
+    #[test]
+    fn large_prescanned_files_cannot_change_before_archive_streaming() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path();
+        let manifest = serde_json::json!({
+            "name": "large-secret-prescan-race",
+            "version": "1.0.0",
+            "files": ["bundle.js"]
+        });
+        std::fs::write(
+            project.join("package.json"),
+            serde_json::to_vec(&manifest).unwrap(),
+        )
+        .unwrap();
+        let content_len = LARGE_SECRET_SCAN_PRESCAN_BYTES as usize + 1;
+        std::fs::write(project.join("bundle.js"), vec![b'x'; content_len]).unwrap();
+
+        let error = prepare_tarball_with_open_hook(
+            project,
+            &manifest,
+            TarballOptions {
+                scan_secrets: true,
+                ..TarballOptions::default()
+            },
+            |archive_path| {
+                if archive_path == "bundle.js" {
+                    std::fs::write(project.join("bundle.js"), vec![b'y'; content_len]).unwrap();
+                }
+            },
+        )
+        .err()
+        .expect("a file changed after its secret prescan must be rejected");
+
+        assert!(
+            error.to_string().contains("changed or became unsafe"),
+            "unexpected large-file mutation error: {error}",
         );
     }
 
@@ -6148,6 +6880,38 @@ mod tests {
             tarball_data, result,
             "no workspace: or catalog: deps → tarball should be unchanged"
         );
+    }
+
+    #[test]
+    fn workspace_projection_prescan_ignores_protocol_text_outside_dependency_fields() {
+        let content = br#"{
+            "name": "protocol-text-is-not-a-dependency",
+            "description": "catalog:metadata",
+            "scripts": {"explain": "printf workspace:metadata"},
+            "dependencies": {"real-dependency": "^1.0.0"}
+        }"#;
+
+        assert!(!package_json_requires_workspace_projection(content));
+    }
+
+    #[test]
+    fn workspace_projection_detects_an_escaped_protocol_letter() {
+        let content = br#"{
+            "name": "escaped-workspace-protocol",
+            "dependencies": {"workspace-member": "\u0077orkspace:*"}
+        }"#;
+
+        assert!(package_json_requires_workspace_projection(content));
+    }
+
+    #[test]
+    fn workspace_projection_detects_an_escaped_protocol_colon() {
+        let content = br#"{
+            "name": "escaped-catalog-protocol",
+            "dependencies": {"catalog-member": "catalog\u003a"}
+        }"#;
+
+        assert!(package_json_requires_workspace_projection(content));
     }
 
     #[test]

@@ -78,7 +78,7 @@ impl Drop for TemporaryAppContainerProfile {
 fn minimal_argv<'a>() -> Vec<&'a str> {
     vec![
         "--protocol-version",
-        "1",
+        "2",
         "--appcontainer-name",
         TEST_APPCONTAINER_NAME,
         "--stdio-stdin",
@@ -146,7 +146,7 @@ fn helper_rejects_missing_appcontainer_name() {
     // MissingFlag branch end-to-end.
     let argv = vec![
         "--protocol-version",
-        "1",
+        "2",
         "--stdio-stdin",
         "null",
         "--stdio-stdout",
@@ -237,7 +237,7 @@ fn helper_supports_concurrent_first_use_and_deletes_temporary_appcontainer_profi
                 .map_err(|error| format!("locate built helper: {error}"))?;
             command.args([
                 "--protocol-version",
-                "1",
+                "2",
                 "--appcontainer-name",
                 appcontainer_name.as_str(),
                 "--stdio-stdin",

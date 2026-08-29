@@ -1371,6 +1371,7 @@ async fn async_main() -> Result<()> {
                 wait_timeout,
                 otp,
                 yes,
+                ignore_scripts,
                 provenance,
                 min_score,
                 allow_secrets,
@@ -1401,6 +1402,7 @@ async fn async_main() -> Result<()> {
                 wait_timeout,
                 otp.as_deref(),
                 yes,
+                ignore_scripts,
                 cli.json,
                 min_score,
                 allow_secrets,
@@ -1455,6 +1457,7 @@ async fn async_main() -> Result<()> {
                     selection,
                     dry_run,
                     yes,
+                    ignore_scripts,
                     otp,
                     min_score,
                     allow_secrets,
@@ -1476,6 +1479,7 @@ async fn async_main() -> Result<()> {
                     let options = commands::release::ReleasePublishOptions {
                         dry_run,
                         yes,
+                        ignore_scripts,
                         otp,
                         min_score,
                         allow_secrets,
@@ -1516,6 +1520,7 @@ async fn async_main() -> Result<()> {
                     min_score,
                     allow_secrets,
                     yes,
+                    ignore_scripts,
                     npm_registry,
                 } => {
                     commands::stage::publish_current_project(
@@ -1530,6 +1535,7 @@ async fn async_main() -> Result<()> {
                             min_score,
                             allow_secrets,
                             yes,
+                            ignore_scripts,
                             npm_registry: npm_registry.as_deref(),
                             json_output: cli.json,
                         },

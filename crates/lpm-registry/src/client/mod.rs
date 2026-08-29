@@ -73,6 +73,7 @@ use self::body::{
 use self::http::{CONNECT_TIMEOUT, READ_TIMEOUT, build_per_origin_http_client};
 use self::state::{CacheContent, CacheValidator, CachedClient, TlsMaterialBudget};
 use self::state::{LazyIdentityCert, LazyIdentityMaterial, MAX_NPMRC_TLS_CLIENT_SETS};
+use self::transport::PublishSafeResponse;
 use self::url_gate::validate_pem_root;
 
 #[cfg(test)]

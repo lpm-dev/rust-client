@@ -112,6 +112,8 @@ zip = { workspace = true }
 
 # File collection
 glob = { workspace = true }
+globset = { workspace = true }
+ferralk-glob = { workspace = true }
 ignore = { workspace = true }
 pathdiff = { workspace = true }
 

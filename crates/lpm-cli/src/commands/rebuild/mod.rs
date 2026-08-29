@@ -52,6 +52,9 @@ pub use self::hints::{all_scripted_packages_trusted, show_install_build_hint};
 use self::package_dir::prepare_live_package_dir;
 use self::sandbox_env::build_sanitized_env;
 use self::script_execution::execute_script;
+pub(in crate::commands) use self::script_execution::{
+    build_lifecycle_path as publish_lifecycle_path, execute_publish_lifecycle_script,
+};
 #[cfg(test)]
 use self::scripts::toposort_packages;
 use self::scripts::{

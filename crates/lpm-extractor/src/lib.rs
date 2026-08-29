@@ -34,6 +34,8 @@ pub struct TarArchiveLimits {
     pub max_metadata_entries: usize,
     /// Maximum declared size of one non-metadata entry.
     pub max_entry_bytes: u64,
+    /// Maximum aggregate declared size of all non-metadata entries.
+    pub max_total_entry_bytes: u64,
     /// Maximum number of components in an entry path or link target.
     pub max_path_depth: usize,
     /// Maximum encoded length of an entry path or link target.
@@ -49,6 +51,7 @@ impl TarArchiveLimits {
             max_entries,
             max_metadata_entries: max_entries,
             max_entry_bytes: u64::MAX,
+            max_total_entry_bytes: u64::MAX,
             max_path_depth: DEFAULT_MAX_ARCHIVE_PATH_DEPTH,
             max_path_bytes: DEFAULT_MAX_ARCHIVE_PATH_BYTES,
             max_metadata_bytes: DEFAULT_MAX_TAR_METADATA_BYTES,
@@ -144,6 +147,7 @@ where
     let mut has_local_pax = false;
     let mut entries_seen = 0usize;
     let mut metadata_entries_seen = 0usize;
+    let mut total_entry_bytes = 0_u64;
     let mut stopped = None;
 
     {
@@ -223,6 +227,15 @@ where
                 return Err(LpmError::Registry(format!(
                     "file too large in tar archive: {effective_size} bytes exceeds per-entry cap of {} bytes",
                     limits.max_entry_bytes
+                )));
+            }
+            total_entry_bytes = total_entry_bytes
+                .checked_add(effective_size)
+                .ok_or_else(|| LpmError::Registry("tar archive entry size overflow".into()))?;
+            if total_entry_bytes > limits.max_total_entry_bytes {
+                return Err(LpmError::Registry(format!(
+                    "tar archive exceeds aggregate payload cap of {} bytes",
+                    limits.max_total_entry_bytes
                 )));
             }
             if effective_size != header_size {
@@ -2643,6 +2656,38 @@ mod tests {
         assert!(
             error.to_string().contains("nesting"),
             "expected trailing nesting-depth error, got: {error}"
+        );
+    }
+
+    #[test]
+    fn visit_tar_archive_rejects_entries_above_the_aggregate_payload_limit() {
+        let mut tar_data = Vec::new();
+        {
+            let mut builder = tar::Builder::new(&mut tar_data);
+            for (path, content) in [("package/a", b"abc"), ("package/b", b"def")] {
+                let mut header = tar::Header::new_gnu();
+                header.set_size(content.len() as u64);
+                header.set_mode(0o644);
+                header.set_cksum();
+                builder
+                    .append_data(&mut header, path, content.as_slice())
+                    .unwrap();
+            }
+            builder.finish().unwrap();
+        }
+        let limits = TarArchiveLimits {
+            max_total_entry_bytes: 5,
+            ..TarArchiveLimits::new(2)
+        };
+
+        let error = visit_tar_archive(tar_data.as_slice(), limits, |_| {
+            Ok(ControlFlow::<()>::Continue(()))
+        })
+        .expect_err("aggregate declared payload must remain bounded");
+
+        assert!(
+            error.to_string().contains("aggregate payload cap"),
+            "expected aggregate payload error, got: {error}"
         );
     }
 

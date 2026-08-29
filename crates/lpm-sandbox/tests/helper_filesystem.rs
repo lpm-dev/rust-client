@@ -29,7 +29,7 @@ const TEST_APPCONTAINER_NAME: &str = "LpmSandboxHelperIntegrationTest";
 fn helper_argv_base() -> Vec<String> {
     vec![
         "--protocol-version".into(),
-        "1".into(),
+        "2".into(),
         "--appcontainer-name".into(),
         TEST_APPCONTAINER_NAME.into(),
         "--stdio-stdin".into(),
@@ -153,6 +153,85 @@ fn helper_readable_dir_grant_lets_lifecycle_child_read_preexisting_file() {
     assert!(
         stdout.contains("secret-content"),
         "lifecycle child must have read the seeded content under the readable-dir grant; got: {stdout}",
+    );
+}
+
+#[test]
+fn helper_secret_read_deny_overrides_broad_read_and_does_not_leave_a_stale_deny() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let target = tmp.path().join(".env");
+    fs::write(&target, "protected-content").expect("seed protected file");
+
+    let mut denied_argv = helper_argv_base();
+    denied_argv.extend([
+        "--readable-dir".into(),
+        tmp.path().to_string_lossy().into_owned(),
+        "--secret-read-deny".into(),
+        target.to_string_lossy().into_owned(),
+        "--".into(),
+        r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe".into(),
+        "-NoProfile".into(),
+        "-NonInteractive".into(),
+        "-Command".into(),
+        ps_read_file(&target.to_string_lossy()),
+    ]);
+    let denied = Command::cargo_bin("lpm-sandbox-helper")
+        .expect("locate helper")
+        .args(&denied_argv)
+        .output()
+        .expect("spawn helper with secret denial");
+    let denied_output = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&denied.stdout),
+        String::from_utf8_lossy(&denied.stderr)
+    );
+    assert!(
+        !denied.status.success(),
+        "secret ACL protection must override the broad project read grant; status: {:?}\noutput: {}",
+        denied.status,
+        denied_output
+    );
+    assert!(
+        !denied_output.contains("protected-content"),
+        "the lifecycle child exposed the protected secret: {denied_output}"
+    );
+    assert!(
+        denied_output.contains("Access to the path")
+            || denied_output.contains("UnauthorizedAccessException")
+            || denied_output.contains("access is denied")
+            || denied_output.contains("Access is denied")
+            || denied_output.contains("PermissionDenied"),
+        "expected an access-denied signal from the lifecycle child: {denied_output}"
+    );
+    assert_eq!(
+        fs::read_to_string(&target).expect("the host user must retain access to the secret"),
+        "protected-content"
+    );
+
+    let mut allowed_argv = helper_argv_base();
+    allowed_argv.extend([
+        "--readable-dir".into(),
+        tmp.path().to_string_lossy().into_owned(),
+        "--".into(),
+        r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe".into(),
+        "-NoProfile".into(),
+        "-NonInteractive".into(),
+        "-Command".into(),
+        ps_read_file(&target.to_string_lossy()),
+    ]);
+    let allowed = Command::cargo_bin("lpm-sandbox-helper")
+        .expect("locate helper")
+        .args(&allowed_argv)
+        .output()
+        .expect("spawn helper after removing secret denial");
+    assert!(
+        allowed.status.success(),
+        "a later broad grant must replace the stable AppContainer SID's stale explicit deny; stderr: {}",
+        String::from_utf8_lossy(&allowed.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&allowed.stdout).contains("protected-content"),
+        "the later allow must restore reads after the denial is no longer requested"
     );
 }
 

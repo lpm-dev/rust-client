@@ -66,6 +66,7 @@ pub(crate) struct ReleasePublishClients {
     npm_oidc: Option<reqwest::Client>,
     registry_provider_jwt: tokio::sync::OnceCell<String>,
     npm_provider_jwt: tokio::sync::OnceCell<oidc::NpmTrustedPublishJwt>,
+    lpm_whoami: tokio::sync::OnceCell<lpm_registry::WhoamiResponse>,
     npm_publish: Option<publish_npm::NpmPublishClients>,
 }
 
@@ -94,6 +95,7 @@ impl ReleasePublishClients {
             npm_oidc,
             registry_provider_jwt: tokio::sync::OnceCell::new(),
             npm_provider_jwt: tokio::sync::OnceCell::new(),
+            lpm_whoami: tokio::sync::OnceCell::new(),
             npm_publish,
         })
     }
@@ -168,6 +170,8 @@ pub(crate) struct PreparedPublish {
     precomputed_npm_artifacts: HashMap<String, NpmTargetArtifact>,
     quality_result: Option<crate::quality::QualityResult>,
     npm_version_preflighted: bool,
+    publish_lifecycle: Option<std::sync::Arc<super::lifecycle::PublishLifecycle>>,
+    publish_lifecycle_dir: PathBuf,
 }
 
 pub(crate) struct PublishExecutionReport {
@@ -176,6 +180,7 @@ pub(crate) struct PublishExecutionReport {
     json_output: bool,
     any_upload_failed: bool,
     any_publication_failed: bool,
+    lifecycle_error: Option<String>,
 }
 
 impl PublishExecutionReport {
@@ -186,6 +191,7 @@ impl PublishExecutionReport {
             json_output,
             any_upload_failed: false,
             any_publication_failed: false,
+            lifecycle_error: None,
         }
     }
 
@@ -193,7 +199,7 @@ impl PublishExecutionReport {
         if self.success {
             return Ok(());
         }
-        if self.json_output {
+        if self.json_output || self.lifecycle_error.is_some() {
             Err(LpmError::ExitCode(1))
         } else if self.any_upload_failed {
             Err(LpmError::Registry(
@@ -207,6 +213,19 @@ impl PublishExecutionReport {
         } else {
             Ok(())
         }
+    }
+
+    pub(crate) fn failure_summary(&self) -> String {
+        if let Some(error) = &self.lifecycle_error {
+            return lpm_common::sanitize_terminal_inline(error).into_owned();
+        }
+        if self.any_upload_failed {
+            return "one or more publish targets failed".into();
+        }
+        if self.any_publication_failed {
+            return "the upload succeeded, but LPM.dev Registry publication was not confirmed; do not publish the same version again".into();
+        }
+        "publish failed".into()
     }
 }
 
@@ -428,7 +447,8 @@ pub(crate) fn plan_publish_intent_from_source(
     cli_gitlab: bool,
     cli_registry: Option<&str>,
 ) -> Result<PublishIntent, LpmError> {
-    let manifest = read_publish_manifest_from_source(source)?;
+    let manifest =
+        super::prepare::select_publish_projection(read_publish_manifest_from_source(source)?)?;
     publish_intent_from_manifest(
         &manifest,
         workspace,
@@ -531,11 +551,16 @@ fn projected_manifest_fingerprint(
     workspace: &lpm_workspace::Workspace,
 ) -> Result<[u8; 32], LpmError> {
     let source = manifest.package_json_content.as_bytes();
-    let projected = publish_common::rewrite_workspace_deps_in_package_json(source, workspace)?;
-    Ok(match projected {
-        Some(bytes) => Sha256::digest(bytes).into(),
-        None => Sha256::digest(source).into(),
-    })
+    let mut projected = manifest.pkg_json.clone();
+    if !publish_common::rewrite_workspace_deps_in_package_json_value(&mut projected, workspace)? {
+        return Ok(Sha256::digest(source).into());
+    }
+    let projected = serde_json::to_vec_pretty(&projected).map_err(|error| {
+        LpmError::Registry(format!(
+            "failed to fingerprint projected package.json: {error}"
+        ))
+    })?;
+    Ok(Sha256::digest(projected).into())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -576,6 +601,7 @@ pub async fn run(
     wait_timeout_seconds: Option<u64>,
     otp: Option<&str>,
     yes: bool,
+    ignore_scripts: bool,
     json_output: bool,
     min_score: Option<u32>,
     allow_secrets: bool,
@@ -634,6 +660,7 @@ pub async fn run(
             wait_timeout_seconds,
             otp,
             yes,
+            ignore_scripts,
             json_output,
             min_score,
             allow_secrets,
@@ -650,15 +677,18 @@ pub async fn run(
     };
     let lock_directory = open_publish_lock_directory(&transaction_root)?;
     let publication_lock_directory = lock_directory.try_clone()?;
-    let prepared =
-        with_publish_install_lock(lock_directory, dry_run || check_only, prepare).await?;
-    if check_only {
-        return execute_prepared(client, prepared).await;
-    }
-    with_publish_publication_lock(
-        publication_lock_directory,
-        execute_prepared(client, prepared),
-    )
+    with_publish_install_lock(lock_directory, check_only, async {
+        let prepared = prepare.await?;
+        if check_only {
+            execute_prepared(client, prepared).await
+        } else {
+            with_publish_publication_lock(
+                publication_lock_directory,
+                execute_prepared(client, prepared),
+            )
+            .await
+        }
+    })
     .await
 }
 
@@ -702,6 +732,21 @@ async fn with_publish_publication_lock<R>(
         lpm_common::ProjectLockKind::Publish,
         body,
     )
+    .await
+}
+
+pub(crate) async fn with_publish_install_lock_for_project<R>(
+    project_dir: &Path,
+    shared: bool,
+    body: impl std::future::Future<Output = Result<R, LpmError>>,
+) -> Result<R, LpmError> {
+    let publish_source = PublishSource::open(project_dir)?;
+    let transaction_root = select_publish_transaction_root(project_dir, &publish_source)?;
+    let lock_directory = open_publish_lock_directory(&transaction_root)?;
+    with_publish_install_lock(lock_directory, shared, async {
+        ensure_publish_transaction_root_unchanged(project_dir, &publish_source, &transaction_root)?;
+        body.await
+    })
     .await
 }
 
@@ -754,6 +799,7 @@ pub(crate) async fn prepare_with_workspace_lock_held(
     wait_timeout_seconds: Option<u64>,
     otp: Option<&str>,
     yes: bool,
+    ignore_scripts: bool,
     json_output: bool,
     min_score: Option<u32>,
     allow_secrets: bool,
@@ -766,9 +812,24 @@ pub(crate) async fn prepare_with_workspace_lock_held(
     no_provenance: bool,
     provenance_file: Option<&Path>,
 ) -> Result<PreparedPublish, LpmError> {
-    let publish_manifest = read_publish_manifest_from_source(publish_source)?;
+    let publish_lifecycle = if check_only {
+        None
+    } else {
+        super::lifecycle::PublishLifecycle::load_for_publish(
+            project_dir,
+            yes,
+            ignore_scripts,
+            json_output,
+        )?
+    };
+    if let Some(lifecycle) = &publish_lifecycle {
+        lifecycle.run_before_pack(project_dir, json_output)?;
+    }
+    let publish_manifest = super::prepare::select_publish_projection(
+        read_publish_manifest_from_source(publish_source)?,
+    )?;
     let workspace = super::prepare::discover_workspace_for_publish(project_dir, &publish_manifest)?;
-    prepare_publish_manifest_with_workspace_lock_held(
+    let mut prepared = prepare_publish_manifest_with_workspace_lock_held(
         project_dir,
         publish_manifest,
         workspace.as_ref(),
@@ -791,7 +852,26 @@ pub(crate) async fn prepare_with_workspace_lock_held(
         provenance_file,
         false,
     )
-    .await
+    .await?;
+    if let Some(lifecycle) = &publish_lifecycle {
+        lifecycle.run_after_pack(project_dir, json_output)?;
+    }
+    prepared.publish_lifecycle = publish_lifecycle.map(std::sync::Arc::new);
+    Ok(prepared)
+}
+
+pub(crate) fn finish_release_publish_preparation(
+    mut prepared: PreparedPublish,
+    publish_lifecycle: Option<std::sync::Arc<super::lifecycle::PublishLifecycle>>,
+    project_dir: &Path,
+    json_output: bool,
+) -> Result<PreparedPublish, LpmError> {
+    if let Some(lifecycle) = &publish_lifecycle {
+        lifecycle.run_after_pack(project_dir, json_output)?;
+    }
+    prepared.publish_lifecycle = publish_lifecycle;
+    prepared.publish_lifecycle_dir = project_dir.to_path_buf();
+    Ok(prepared)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -916,6 +996,12 @@ async fn prepare_publish_manifest_with_workspace_lock_held(
     )?;
 
     let targets_lpm = targets.contains(&PublishTarget::Lpm);
+    if min_score.is_some() && !targets_lpm {
+        return Err(LpmError::Registry(
+            "--min-score requires publishing to the LPM registry, which runs the quality gate"
+                .into(),
+        ));
+    }
     if wait_for_publication && !targets_lpm {
         return Err(LpmError::Registry(
             "--wait requires publishing to the LPM registry".into(),
@@ -977,6 +1063,7 @@ async fn prepare_publish_manifest_with_workspace_lock_held(
 
     let PublishProject {
         source_dir,
+        publish_control,
         pkg_json,
         name,
         version,
@@ -1002,10 +1089,15 @@ async fn prepare_publish_manifest_with_workspace_lock_held(
     let github_config = publish_config_ref.and_then(|p| p.github.as_ref());
     let gitlab_config = publish_config_ref.and_then(|p| p.gitlab.as_ref());
 
+    let (provenance_source, provenance_pkg_json) = publish_control
+        .as_ref()
+        .map_or((&source_dir, &pkg_json), |control| {
+            (&control.source_dir, &control.pkg_json)
+        });
     let provenance_request = resolve_provenance_request_from_project_source(
         project_dir,
-        &source_dir,
-        &pkg_json,
+        provenance_source,
+        provenance_pkg_json,
         provenance_flag,
         no_provenance,
         provenance_file,
@@ -1034,7 +1126,7 @@ async fn prepare_publish_manifest_with_workspace_lock_held(
         }
     }
 
-    let rewritten_tarballs = prepare_rewritten_target_tarballs(
+    let mut rewritten_tarballs = prepare_rewritten_target_tarballs(
         &targets,
         &target_names,
         &name,
@@ -1062,21 +1154,39 @@ async fn prepare_publish_manifest_with_workspace_lock_held(
     })
     .await?;
 
-    let mut final_secret_scans = Vec::with_capacity(targets.len());
+    let mut final_secret_scans = Vec::with_capacity(targets.len().saturating_add(1));
     if !allow_secrets {
+        let base_secret_scan = secret_scan.as_ref().ok_or_else(|| {
+            LpmError::Registry("base publish artifact was prepared without a secret scan".into())
+        })?;
+        final_secret_scans.push(base_secret_scan);
         for target in &targets {
             let target_name = target_names.get(&target.key()).ok_or_else(|| {
                 LpmError::Registry(format!("no name resolved for {}", target.display_name()))
             })?;
-            final_secret_scans.push(target_secret_scan(
-                target_name,
-                &name,
-                secret_scan.as_ref(),
-                &rewritten_tarballs,
-            )?);
+            if target_name != &name {
+                let rewritten_secret_scan = rewritten_tarballs
+                    .get(target_name)
+                    .and_then(|tarball| tarball.secret_scan.as_ref())
+                    .ok_or_else(|| {
+                        LpmError::Registry(format!(
+                            "rewritten publish artifact for {target_name} was prepared without a secret scan"
+                        ))
+                    })?;
+                final_secret_scans.push(rewritten_secret_scan);
+            }
         }
     }
     run_publish_secret_scan(final_secret_scans, json_output, allow_secrets)?;
+
+    let tarball_data = release_or_spool_base_tarball(
+        &targets,
+        &target_names,
+        &name,
+        tarball_data,
+        std::sync::Arc::clone(&tarball_hashes),
+        &mut rewritten_tarballs,
+    )?;
 
     // Quality checks are required only for the LPM target.
     let quality_result = if targets_lpm {
@@ -1128,6 +1238,8 @@ async fn prepare_publish_manifest_with_workspace_lock_held(
         precomputed_npm_artifacts,
         quality_result,
         npm_version_preflighted,
+        publish_lifecycle: None,
+        publish_lifecycle_dir: project_dir.to_path_buf(),
     })
 }
 
@@ -1186,6 +1298,8 @@ async fn execute_prepared_inner(
         mut precomputed_npm_artifacts,
         quality_result,
         npm_version_preflighted,
+        publish_lifecycle,
+        publish_lifecycle_dir,
     } = prepared;
     let publish_config = publish_config.as_ref();
     let npm_config = publish_config.and_then(|config| config.npm.as_ref());
@@ -1215,49 +1329,52 @@ async fn execute_prepared_inner(
     // can't live in main.rs.
     //
     let mut oidc_token_for_wait = None;
+    let using_registry_oidc = targets_lpm && !check_only && oidc::registry_exchange_jwt_available();
     let oidc_swapped_client;
-    let client: &RegistryClient =
-        if targets_lpm && !check_only && oidc::registry_exchange_jwt_available() {
-            let resolved_lpm_name = target_names.get("lpm").ok_or_else(|| {
-                LpmError::Registry("no resolved LPM.dev package name for OIDC exchange".into())
-            })?;
-            let oidc_token = if let Some(release_clients) =
-                release_clients.filter(|clients| clients.registry_oidc.is_some())
-            {
-                release_clients
-                    .exchange_registry_publish_token(
-                        client.base_url(),
-                        resolved_lpm_name,
-                        publication_wait_timeout,
-                    )
-                    .await
-            } else {
-                oidc::exchange_publish_oidc_token(
+    let client: &RegistryClient = if using_registry_oidc {
+        let resolved_lpm_name = target_names.get("lpm").ok_or_else(|| {
+            LpmError::Registry("no resolved LPM.dev package name for OIDC exchange".into())
+        })?;
+        let oidc_token = if let Some(release_clients) =
+            release_clients.filter(|clients| clients.registry_oidc.is_some())
+        {
+            release_clients
+                .exchange_registry_publish_token(
                     client.base_url(),
                     resolved_lpm_name,
                     publication_wait_timeout,
                 )
                 .await
-            }
-            .map_err(|error| {
-                LpmError::Registry(format!(
-                    "Trusted Publisher exchange failed for {resolved_lpm_name}: {error}"
-                ))
-            })?;
-            if let Some(timeout) = publication_wait_timeout {
-                oidc_token.publication_status_token_for_wait(timeout)?;
-                oidc_token_for_wait = Some(oidc_token.clone());
-            }
-            oidc_swapped_client = client
-                .clone_with_config()
-                .with_token_override(oidc_token.token);
-            if !json_output {
-                install_ui::phase("Using OIDC-exchanged session token for LPM publish");
-            }
-            &oidc_swapped_client
         } else {
-            client
-        };
+            oidc::exchange_publish_oidc_token(
+                client.base_url(),
+                resolved_lpm_name,
+                publication_wait_timeout,
+            )
+            .await
+        }
+        .map_err(|error| {
+            LpmError::Registry(format!(
+                "Trusted Publisher exchange failed for {resolved_lpm_name}: {error}"
+            ))
+        })?;
+        if let Some(timeout) = publication_wait_timeout {
+            oidc_token.publication_status_token_for_wait(timeout)?;
+            oidc_token_for_wait = Some(oidc_token.clone());
+        }
+        oidc_swapped_client = client
+            .clone_with_config()
+            .with_token_override(oidc_token.token);
+        if !json_output {
+            install_ui::phase("Using OIDC-exchanged session token for LPM publish");
+        }
+        &oidc_swapped_client
+    } else {
+        client
+    };
+    let lpm_whoami_cache = release_clients
+        .filter(|_| !using_registry_oidc)
+        .map(|clients| &clients.lpm_whoami);
 
     // Skills staleness check is an LPM network read, so skip it in --check.
     //
@@ -1316,6 +1433,53 @@ async fn execute_prepared_inner(
                         "LPM.dev publish preflight failed for {resolved_lpm_name}@{version}: {error}"
                     ))
                 })?;
+        }
+        if !npm_version_preflighted && targets.iter().any(is_npm_compatible_target) {
+            let preflight_client = release_clients
+                .and_then(|clients| clients.npm_preflight.clone())
+                .map_or_else(publish_npm::build_npm_publish_preflight_client, Ok)?;
+            for target in targets
+                .iter()
+                .filter(|target| is_npm_compatible_target(target))
+            {
+                let target_name = target_names.get(&target.key()).ok_or_else(|| {
+                    LpmError::Registry(format!("no name resolved for {}", target.display_name()))
+                })?;
+                let endpoint = resolve_npm_compatible_publish_endpoint(target, publish_config)?
+                    .ok_or_else(|| {
+                        LpmError::Registry(format!(
+                            "no npm-compatible endpoint resolved for {}",
+                            target.display_name()
+                        ))
+                    })?;
+                let credential = resolve_npm_target_credential(
+                    target,
+                    target_name,
+                    &endpoint.registry_url,
+                    release_clients,
+                )
+                .await?;
+                if matches!(
+                    publish_npm::preflight_npm_publish_version_with_client(
+                        &preflight_client,
+                        &credential.token,
+                        target_name,
+                        &version,
+                        endpoint.tag_explicit,
+                        &endpoint.registry_url,
+                    )
+                    .await?,
+                    publish_npm::NpmPublishVersionPreflight::AlreadyPublished
+                ) {
+                    return Err(LpmError::Registry(format!(
+                        "version {version} already exists on {} for {target_name}",
+                        target.display_name()
+                    )));
+                }
+            }
+        }
+        if let Some(lifecycle) = &publish_lifecycle {
+            lifecycle.run_after_publish(&publish_lifecycle_dir, json_output)?;
         }
         if emit_summary && json_output {
             let json = serde_json::json!({
@@ -1481,6 +1645,7 @@ async fn execute_prepared_inner(
                         json_output,
                         &detected_ecosystem,
                         &swift_manifest,
+                        lpm_whoami_cache,
                     )
                     .await?;
                     drop(upload_spinner);
@@ -1877,7 +2042,18 @@ async fn execute_prepared_inner(
                 .as_ref()
                 .is_some_and(|wait| !wait.success)
     });
-    let command_failed = any_failed || any_publication_failed;
+    let upload_or_publication_failed = any_failed || any_publication_failed;
+    let lifecycle_error = if upload_or_publication_failed {
+        None
+    } else if let Some(lifecycle) = &publish_lifecycle {
+        lifecycle
+            .run_after_publish(&publish_lifecycle_dir, json_output)
+            .err()
+            .map(|error| error.to_string())
+    } else {
+        None
+    };
+    let command_failed = upload_or_publication_failed || lifecycle_error.is_some();
     let succeeded = results.iter().filter(|r| r.success).count();
     let lpm_publication_status = results
         .iter()
@@ -1885,11 +2061,26 @@ async fn execute_prepared_inner(
         .and_then(|result| result.publication_status.as_ref());
 
     if emit_summary && json_output {
-        let json = serde_json::json!({
+        let mut json = serde_json::json!({
             "success": !command_failed,
             "results": results.iter().map(publish_result_json).collect::<Vec<_>>(),
         });
+        if let Some(error) = &lifecycle_error {
+            json["lifecycle_error"] = serde_json::Value::String(error.clone());
+            json["retry_warning"] = serde_json::Value::String(
+                "The upload succeeded and this package version may already exist; inspect the registry before retrying."
+                    .into(),
+            );
+        }
         println!("{}", serde_json::to_string_pretty(&json).unwrap());
+    } else if emit_summary && let Some(error) = &lifecycle_error {
+        install_ui::warn_untrusted(&format!(
+            "Upload succeeded, but a publish lifecycle script failed: {}",
+            lpm_common::sanitize_terminal_inline(error)
+        ));
+        install_ui::warn(
+            "This package version may already exist; inspect the registry before retrying.",
+        );
     } else if emit_summary && targets.len() > 1 && any_failed {
         install_ui::warn_line(format_multi_publish_partial_summary(
             succeeded,
@@ -1927,6 +2118,7 @@ async fn execute_prepared_inner(
         json_output,
         any_upload_failed: any_failed,
         any_publication_failed,
+        lifecycle_error,
     })
 }
 
@@ -1963,6 +2155,37 @@ fn prepare_rewritten_target_tarballs(
     Ok(rewritten_tarballs)
 }
 
+fn release_or_spool_base_tarball(
+    targets: &[PublishTarget],
+    target_names: &HashMap<String, String>,
+    package_json_name: &str,
+    tarball_data: std::sync::Arc<Vec<u8>>,
+    tarball_hashes: std::sync::Arc<publish_common::TarballHashes>,
+    rewritten_tarballs: &mut HashMap<String, publish_common::RewrittenTarball>,
+) -> Result<std::sync::Arc<Vec<u8>>, LpmError> {
+    let uses_original = targets.iter().any(|target| {
+        target_names
+            .get(&target.key())
+            .is_some_and(|target_name| target_name == package_json_name)
+    });
+    if !uses_original {
+        return Ok(std::sync::Arc::new(Vec::new()));
+    }
+    let uses_rewrite = targets.iter().any(|target| {
+        target_names
+            .get(&target.key())
+            .is_some_and(|target_name| target_name != package_json_name)
+    });
+    if !uses_rewrite {
+        return Ok(tarball_data);
+    }
+    rewritten_tarballs.insert(
+        package_json_name.to_string(),
+        publish_common::RewrittenTarball::spool_base(&tarball_data, tarball_hashes)?,
+    );
+    Ok(std::sync::Arc::new(Vec::new()))
+}
+
 #[derive(Clone, Copy)]
 enum TargetTarballData<'a> {
     Base(&'a std::sync::Arc<Vec<u8>>),
@@ -1991,7 +2214,7 @@ fn target_tarball<'a>(
     base_tarball_hashes: &'a std::sync::Arc<publish_common::TarballHashes>,
     rewritten_tarballs: &'a HashMap<String, publish_common::RewrittenTarball>,
 ) -> Result<TargetTarball<'a>, LpmError> {
-    if target_name == package_json_name {
+    if target_name == package_json_name && !base_tarball_data.is_empty() {
         return Ok(TargetTarball {
             data: TargetTarballData::Base(base_tarball_data),
             hashes: base_tarball_hashes,
@@ -2003,33 +2226,13 @@ fn target_tarball<'a>(
         .map(|tarball| TargetTarball {
             data: TargetTarballData::Rewritten(tarball),
             hashes: &tarball.hashes,
-            package_json_size: Some(tarball.package_json_size),
+            package_json_size: tarball.package_json_size,
         })
         .ok_or_else(|| {
             LpmError::Registry(format!(
                 "missing prepared tarball for renamed package {target_name}"
             ))
         })
-}
-
-fn target_secret_scan<'a>(
-    target_name: &str,
-    package_json_name: &str,
-    base_secret_scan: Option<&'a lpm_security::behavioral::secrets::SecretScanResult>,
-    rewritten_tarballs: &'a HashMap<String, publish_common::RewrittenTarball>,
-) -> Result<&'a lpm_security::behavioral::secrets::SecretScanResult, LpmError> {
-    let scan = if target_name == package_json_name {
-        base_secret_scan
-    } else {
-        rewritten_tarballs
-            .get(target_name)
-            .and_then(|tarball| tarball.secret_scan.as_ref())
-    };
-    scan.ok_or_else(|| {
-        LpmError::Registry(format!(
-            "publish artifact for {target_name} was prepared without a secret scan"
-        ))
-    })
 }
 
 async fn precompute_file_provenance_artifacts(
@@ -2490,7 +2693,9 @@ mod transaction_root_tests {
 
 #[cfg(test)]
 mod rewritten_tarball_tests {
-    use super::{HashMap, PublishTarget, prepare_rewritten_target_tarballs};
+    use super::{
+        HashMap, PublishTarget, prepare_rewritten_target_tarballs, release_or_spool_base_tarball,
+    };
     use std::io::Write as _;
 
     fn package_tarball(name: &str) -> Vec<u8> {
@@ -2529,6 +2734,83 @@ mod rewritten_tarball_tests {
             .sum();
 
         assert_eq!(resident_bytes, 0);
+    }
+
+    #[test]
+    fn renamed_only_targets_release_the_resident_base_archive() {
+        let targets = [PublishTarget::Npm, PublishTarget::GitHub];
+        let target_names = HashMap::from([
+            ("npm".to_string(), "npm-name".to_string()),
+            ("github".to_string(), "@owner/github-name".to_string()),
+        ]);
+        let base = std::sync::Arc::new(package_tarball("source-name"));
+
+        let hashes = std::sync::Arc::new(crate::commands::publish_common::compute_hashes(&base));
+        let mut rewritten =
+            prepare_rewritten_target_tarballs(&targets, &target_names, "source-name", &base, false)
+                .unwrap();
+        let released = release_or_spool_base_tarball(
+            &targets,
+            &target_names,
+            "source-name",
+            base,
+            hashes,
+            &mut rewritten,
+        )
+        .unwrap();
+
+        assert!(released.is_empty());
+    }
+
+    #[test]
+    fn an_original_name_target_retains_the_resident_base_archive() {
+        let targets = [PublishTarget::Lpm];
+        let target_names = HashMap::from([("lpm".to_string(), "source-name".to_string())]);
+        let base = std::sync::Arc::new(vec![7_u8; 1024]);
+
+        let hashes = std::sync::Arc::new(crate::commands::publish_common::compute_hashes(&base));
+        let mut rewritten = HashMap::new();
+        let retained = release_or_spool_base_tarball(
+            &targets,
+            &target_names,
+            "source-name",
+            base,
+            hashes,
+            &mut rewritten,
+        )
+        .unwrap();
+
+        assert_eq!(retained.len(), 1024);
+    }
+
+    #[test]
+    fn mixed_original_and_renamed_targets_spool_the_base_archive() {
+        let targets = [PublishTarget::Lpm, PublishTarget::Npm];
+        let target_names = HashMap::from([
+            ("lpm".to_string(), "source-name".to_string()),
+            ("npm".to_string(), "npm-name".to_string()),
+        ]);
+        let base = std::sync::Arc::new(package_tarball("source-name"));
+        let hashes = std::sync::Arc::new(crate::commands::publish_common::compute_hashes(&base));
+        let mut rewritten =
+            prepare_rewritten_target_tarballs(&targets, &target_names, "source-name", &base, false)
+                .unwrap();
+
+        let released = release_or_spool_base_tarball(
+            &targets,
+            &target_names,
+            "source-name",
+            base,
+            hashes,
+            &mut rewritten,
+        )
+        .unwrap();
+
+        assert!(released.is_empty());
+        assert_eq!(
+            rewritten["source-name"].read_data().unwrap(),
+            package_tarball("source-name")
+        );
     }
 
     #[test]

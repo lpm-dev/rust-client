@@ -1,4 +1,4 @@
-use super::types::PublishProject;
+use super::types::{PublishControl, PublishProject};
 use crate::commands::publish_common;
 use cap_fs_ext::{FollowSymlinks, OpenOptionsFollowExt as _, OpenOptionsSyncExt as _};
 use lpm_common::LpmError;
@@ -21,6 +21,7 @@ pub(crate) struct PublishManifest {
     pub(crate) name: String,
     pub(crate) version: String,
     pub(crate) publish_config: Option<lpm_json::PublishConfig>,
+    pub(crate) publish_control: Option<PublishControl>,
 }
 
 impl PublishManifest {
@@ -102,11 +103,15 @@ pub(crate) fn prepare_publish_project(
     project_dir: &Path,
     scan_secrets: bool,
 ) -> Result<PublishProject, LpmError> {
-    let manifest = read_publish_manifest(project_dir)?;
+    let manifest = select_publish_projection(read_publish_manifest(project_dir)?)?;
     let workspace = discover_workspace_for_publish(project_dir, &manifest)?;
+    let artifact_root = manifest
+        .package_json_path
+        .parent()
+        .ok_or_else(|| publish_project_changed_error(&manifest.package_json_path))?;
     let validation = crate::commands::skills::author::validate_publish_directory(
         &manifest.package_json_parent,
-        project_dir,
+        artifact_root,
     )?;
     if !validation.security_issues.is_empty() {
         return Err(LpmError::Registry(
@@ -131,9 +136,7 @@ pub(super) fn discover_workspace_for_publish(
     _project_dir: &Path,
     manifest: &PublishManifest,
 ) -> Result<Option<lpm_workspace::Workspace>, LpmError> {
-    if !publish_common::package_json_requires_workspace_projection(
-        manifest.package_json_content.as_bytes(),
-    ) {
+    if !publish_common::package_json_value_requires_workspace_projection(&manifest.pkg_json) {
         return Ok(None);
     }
     let project_dir = manifest
@@ -212,6 +215,7 @@ pub(crate) fn read_publish_manifest_from_source(
     )?;
     let pkg_json: serde_json::Value =
         serde_json::from_str(&content).map_err(|e| LpmError::Registry(e.to_string()))?;
+    validate_publish_dependency_fields(&pkg_json)?;
 
     let name = pkg_json
         .get("name")
@@ -229,10 +233,18 @@ pub(crate) fn read_publish_manifest_from_source(
             "package.json \"version\" must be a valid semantic version (got \"{version}\"): {error}"
         ))
     })?;
-    if pkg_json.get("private").and_then(serde_json::Value::as_bool) == Some(true) {
-        return Err(LpmError::Registry(
-            "package.json is marked as private; remove \"private\": true before publishing".into(),
-        ));
+    if let Some(private) = pkg_json.get("private") {
+        let Some(private) = private.as_bool() else {
+            return Err(LpmError::Registry(
+                "package.json \"private\" must be a boolean when present".into(),
+            ));
+        };
+        if private {
+            return Err(LpmError::Registry(
+                "package.json is marked as private; remove \"private\": true before publishing"
+                    .into(),
+            ));
+        }
     }
 
     let lpm_json_content = read_optional_publish_text(
@@ -257,7 +269,97 @@ pub(crate) fn read_publish_manifest_from_source(
         name,
         version,
         publish_config,
+        publish_control: None,
     })
+}
+
+pub(crate) fn select_publish_projection(
+    source_manifest: PublishManifest,
+) -> Result<PublishManifest, LpmError> {
+    let Some(publish_config) = source_manifest.pkg_json.get("publishConfig") else {
+        return Ok(source_manifest);
+    };
+    let Some(publish_config) = publish_config.as_object() else {
+        return Err(LpmError::Registry(
+            "package.json \"publishConfig\" must be an object".into(),
+        ));
+    };
+    let Some(directory) = publish_config.get("directory") else {
+        return Ok(source_manifest);
+    };
+    let Some(directory) = directory.as_str() else {
+        return Err(LpmError::Registry(
+            "package.json \"publishConfig.directory\" must be a string".into(),
+        ));
+    };
+    let relative = Path::new(directory);
+    if directory.is_empty()
+        || relative.is_absolute()
+        || relative.components().any(|component| {
+            matches!(
+                component,
+                std::path::Component::ParentDir
+                    | std::path::Component::RootDir
+                    | std::path::Component::Prefix(_)
+            )
+        })
+    {
+        return Err(LpmError::Registry(format!(
+            "package.json publishConfig.directory must be a non-empty path inside the package directory (got \"{}\")",
+            lpm_common::sanitize_terminal_inline(directory),
+        )));
+    }
+
+    let source_root = source_manifest
+        .package_json_path
+        .parent()
+        .ok_or_else(|| LpmError::Registry("publish package root changed".into()))?;
+    let projection_path = source_root.join(relative);
+    let projection_directory = publish_common::open_cap_directory_path(
+        &source_manifest.package_json_parent,
+        relative,
+    )?
+    .ok_or_else(|| {
+        LpmError::Registry(format!(
+            "package.json publishConfig.directory does not exist or is not a safe directory: {}",
+            projection_path.display(),
+        ))
+    })?;
+    let projection_path = projection_path.canonicalize().map_err(LpmError::Io)?;
+    let projection_source =
+        PublishSource::from_open_directory(projection_path, projection_directory)?;
+    let mut projected = read_publish_manifest_from_source(projection_source)?;
+    projected.publish_config = source_manifest.publish_config;
+    projected.publish_control = Some(PublishControl {
+        source_dir: source_manifest.package_json_parent,
+        pkg_json: source_manifest.pkg_json,
+    });
+    Ok(projected)
+}
+
+fn validate_publish_dependency_fields(pkg_json: &serde_json::Value) -> Result<(), LpmError> {
+    for field in [
+        "dependencies",
+        "devDependencies",
+        "peerDependencies",
+        "optionalDependencies",
+    ] {
+        let Some(dependencies) = pkg_json.get(field) else {
+            continue;
+        };
+        let Some(dependencies) = dependencies.as_object() else {
+            return Err(LpmError::Registry(format!(
+                "package.json \"{field}\" must be an object of package names to string ranges"
+            )));
+        };
+        if let Some((name, _)) = dependencies.iter().find(|(_, range)| !range.is_string()) {
+            return Err(LpmError::Registry(format!(
+                "package.json \"{field}\" range for \"{}\" must be a string",
+                lpm_common::sanitize_terminal_inline(name),
+            )));
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -271,7 +373,7 @@ fn read_publish_manifest_with_selection_hook(
     read_publish_manifest_from_source(selected)
 }
 
-fn validate_publish_version(version: &str) -> Result<lpm_semver::Version, &'static str> {
+pub(crate) fn validate_publish_version(version: &str) -> Result<lpm_semver::Version, &'static str> {
     let (without_build, build) = version
         .split_once('+')
         .map_or((version, None), |(base, build)| (base, Some(build)));
@@ -368,27 +470,23 @@ fn prepare_publish_project_from_manifest_with_hook(
         name,
         version,
         publish_config,
+        publish_control,
     } = manifest;
     let mut prepared_package_json =
         package_json_override.unwrap_or_else(|| package_json_content.into_bytes());
-    if publish_common::package_json_requires_workspace_projection(&prepared_package_json) {
+    if publish_common::package_json_value_requires_workspace_projection(&pkg_json) {
         let workspace = workspace.ok_or_else(|| {
             LpmError::Registry(
                 "package.json uses workspace: or catalog: dependencies outside a workspace"
                     .to_string(),
             )
         })?;
-        if let Some(rewritten) = publish_common::rewrite_workspace_deps_in_package_json(
-            &prepared_package_json,
-            workspace,
-        )? {
-            prepared_package_json = rewritten;
-            pkg_json = serde_json::from_slice(&prepared_package_json).map_err(|error| {
-                LpmError::Registry(format!(
-                    "failed to parse projected package.json while preparing publish metadata: {error}"
-                ))
-            })?;
-        }
+        publish_common::rewrite_workspace_deps_in_package_json_value(&mut pkg_json, workspace)?;
+        prepared_package_json = serde_json::to_vec_pretty(&pkg_json).map_err(|error| {
+            LpmError::Registry(format!(
+                "failed to serialize projected package.json while preparing publish metadata: {error}"
+            ))
+        })?;
     }
 
     let lpm_config_content = read_optional_lpm_config_from_source_root(
@@ -465,7 +563,7 @@ fn prepare_publish_project_from_manifest_with_hook(
         &project_root,
     )?;
     let tarball_data = std::sync::Arc::new(prepared_tarball.data);
-    let tarball_hashes = std::sync::Arc::new(publish_common::compute_hashes(&tarball_data));
+    let tarball_hashes = std::sync::Arc::new(prepared_tarball.hashes);
     let tarball_size = tarball_data.len();
     let readme = prepared_tarball.readme;
     validate_publish_tarball_size(tarball_size)?;
@@ -485,6 +583,7 @@ fn prepare_publish_project_from_manifest_with_hook(
 
     Ok(PublishProject {
         source_dir: package_json_parent,
+        publish_control,
         pkg_json,
         name,
         version,
@@ -754,14 +853,84 @@ fn dump_swift_manifest_from_publish_artifact_with_command(
         Ok(std::ops::ControlFlow::<()>::Continue(()))
     })
     .ok()?;
-    let mut command = std::process::Command::new(program);
-    command
-        .args(["package", "dump-package"])
+    #[cfg(not(test))]
+    let sandbox_program = program.to_owned();
+    #[cfg(test)]
+    let sandbox_program = stage_swift_manifest_test_program(program, &package_root)?;
+    let sandbox_home = snapshot.path().join("home");
+    let sandbox_cache = snapshot.path().join("cache");
+    let sandbox_store = snapshot.path().join("store");
+    let swiftpm_module_cache = sandbox_cache.join("swiftpm-module-cache");
+    let clang_module_cache = sandbox_cache.join("clang-module-cache");
+    for directory in [
+        &sandbox_home,
+        &sandbox_cache,
+        &sandbox_store,
+        &swiftpm_module_cache,
+        &clang_module_cache,
+    ] {
+        std::fs::create_dir_all(directory).ok()?;
+    }
+    let spec = lpm_sandbox::SandboxSpec {
+        package_dir: package_root.clone(),
+        project_dir: package_root.clone(),
+        package_name: "swift-publish-inspection".into(),
+        package_version: "0.0.0".into(),
+        store_root: sandbox_store,
+        home_dir: sandbox_home.clone(),
+        tmpdir: sandbox_cache.clone(),
+        secret_read_allow: Vec::new(),
+        extra_write_dirs: Vec::new(),
+    };
+    let options = lpm_sandbox::SandboxOptions {
+        deny_outbound_network: true,
+        build_cache_isolation: true,
+        ..lpm_sandbox::SandboxOptions::default()
+    };
+    let sandbox = lpm_sandbox::new_for_platform_with_options(
+        spec,
+        lpm_sandbox::SandboxMode::Enforce,
+        options,
+    )
+    .ok()?;
+    if sandbox.posture() != lpm_sandbox::SandboxPosture::Strict {
+        return None;
+    }
+    let environment = [
+        (
+            std::ffi::OsString::from("PATH"),
+            std::ffi::OsString::from(swift_manifest_tool_path()),
+        ),
+        (
+            std::ffi::OsString::from("HOME"),
+            sandbox_home.as_os_str().to_owned(),
+        ),
+        (
+            std::ffi::OsString::from("TMPDIR"),
+            sandbox_cache.as_os_str().to_owned(),
+        ),
+        (
+            std::ffi::OsString::from("XDG_CACHE_HOME"),
+            sandbox_cache.as_os_str().to_owned(),
+        ),
+        (
+            std::ffi::OsString::from("SWIFTPM_MODULECACHE_OVERRIDE"),
+            swiftpm_module_cache.as_os_str().to_owned(),
+        ),
+        (
+            std::ffi::OsString::from("CLANG_MODULE_CACHE_PATH"),
+            clang_module_cache.as_os_str().to_owned(),
+        ),
+    ];
+    let mut command = lpm_sandbox::SandboxedCommand::new(sandbox_program)
+        .arg("package")
+        .arg("dump-package")
         .current_dir(package_root)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped());
-    let mut child = lpm_sandbox::spawn_tracked_command(&mut command).ok()?;
+        .envs_cleared(environment);
+    command.stdin = lpm_sandbox::SandboxStdio::Null;
+    command.stdout = lpm_sandbox::SandboxStdio::Piped;
+    command.stderr = lpm_sandbox::SandboxStdio::Piped;
+    let mut child = sandbox.spawn(command).ok()?;
     let Some(stdout) = child.stdout.take() else {
         terminate_swift_manifest_child(&mut child);
         return None;
@@ -808,6 +977,35 @@ fn dump_swift_manifest_from_publish_artifact_with_command(
         return None;
     }
     serde_json::from_slice::<serde_json::Value>(&stdout).ok()
+}
+
+fn swift_manifest_tool_path() -> &'static str {
+    #[cfg(target_os = "windows")]
+    {
+        r"C:\Windows\System32;C:\Program Files\Swift\Toolchains\0.0.0+Asserts\usr\bin"
+    }
+    #[cfg(target_os = "macos")]
+    {
+        "/usr/bin:/bin:/usr/sbin:/sbin"
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    {
+        "/usr/local/swift/usr/bin:/usr/local/bin:/usr/bin:/bin"
+    }
+}
+
+#[cfg(test)]
+fn stage_swift_manifest_test_program(
+    program: &std::ffi::OsStr,
+    package_root: &Path,
+) -> Option<std::ffi::OsString> {
+    let source = Path::new(program);
+    if !source.is_absolute() {
+        return Some(program.to_owned());
+    }
+    let destination = package_root.join(".lpm-swift-manifest-inspector");
+    std::fs::copy(source, &destination).ok()?;
+    Some(destination.into_os_string())
 }
 
 fn spawn_bounded_swift_output_reader(
@@ -1448,6 +1646,83 @@ mod tests {
             .to_string();
 
         assert!(error.contains("skills validation failed"), "{error}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn swift_manifest_inspection_does_not_inherit_the_publish_process_environment() {
+        let fixture = swift_fixture_tarball();
+        let directory = tempfile::tempdir().unwrap();
+        let executable = directory.path().join("swift-environment");
+        write_executable(
+            &executable,
+            "#!/bin/sh\nprintf '{\"description\":\"%s\"}' \"$HOME\"\n",
+        );
+        let ambient_home = std::env::var("HOME").unwrap();
+
+        let manifest = dump_swift_manifest_from_publish_artifact_with_command(
+            &fixture,
+            executable.as_os_str(),
+            std::time::Duration::from_secs(1),
+            128,
+        )
+        .unwrap();
+
+        assert_ne!(
+            manifest
+                .get("description")
+                .and_then(serde_json::Value::as_str),
+            Some(ambient_home.as_str())
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn swift_manifest_inspection_cannot_read_files_outside_the_publish_snapshot() {
+        let fixture = swift_fixture_tarball();
+        let directory = tempfile::tempdir().unwrap();
+        let secret = directory.path().join("ambient-secret.txt");
+        std::fs::write(&secret, "must-not-be-readable").unwrap();
+        let executable = directory.path().join("swift-filesystem");
+        write_executable(
+            &executable,
+            &format!(
+                "#!/bin/sh\nset -eu\nsecret=$(cat '{}')\nprintf '{{\"description\":\"%s\"}}' \"$secret\"\n",
+                secret.display()
+            ),
+        );
+
+        let manifest = dump_swift_manifest_from_publish_artifact_with_command(
+            &fixture,
+            executable.as_os_str(),
+            std::time::Duration::from_secs(1),
+            128,
+        );
+
+        assert!(manifest.is_none());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn swift_manifest_inspection_cannot_open_network_connections() {
+        let fixture = swift_fixture_tarball();
+        let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let directory = tempfile::tempdir().unwrap();
+        let executable = directory.path().join("swift-network");
+        write_executable(
+            &executable,
+            &format!("#!/bin/sh\nset -eu\n/usr/bin/nc -z -w 1 127.0.0.1 {port}\nprintf '{{}}'\n"),
+        );
+
+        let manifest = dump_swift_manifest_from_publish_artifact_with_command(
+            &fixture,
+            executable.as_os_str(),
+            std::time::Duration::from_secs(2),
+            128,
+        );
+
+        assert!(manifest.is_none());
     }
 
     #[cfg(unix)]

@@ -14,6 +14,7 @@ pub(crate) struct StagePublishOptions<'a> {
     pub(crate) min_score: Option<u32>,
     pub(crate) allow_secrets: bool,
     pub(crate) yes: bool,
+    pub(crate) ignore_scripts: bool,
     pub(crate) npm_registry: Option<&'a str>,
     pub(crate) json_output: bool,
 }
@@ -22,8 +23,32 @@ pub(crate) async fn publish_current_project(
     project_dir: &Path,
     options: StagePublishOptions<'_>,
 ) -> Result<(), LpmError> {
+    publish::with_publish_install_lock_for_project(
+        project_dir,
+        false,
+        publish_current_project_locked(project_dir, options),
+    )
+    .await
+}
+
+async fn publish_current_project_locked(
+    project_dir: &Path,
+    options: StagePublishOptions<'_>,
+) -> Result<(), LpmError> {
     let started_at = std::time::Instant::now();
-    let prepared = publish::prepare_publish_project(project_dir, !options.allow_secrets)?;
+    let publish_lifecycle = publish::PublishLifecycle::load_for_stage(
+        project_dir,
+        options.yes,
+        options.ignore_scripts,
+        options.json_output,
+    )?;
+    if let Some(lifecycle) = &publish_lifecycle {
+        lifecycle.run_before_pack(project_dir, options.json_output)?;
+    }
+    let mut prepared = publish::prepare_publish_project(project_dir, !options.allow_secrets)?;
+    if let Some(lifecycle) = &publish_lifecycle {
+        lifecycle.run_after_pack(project_dir, options.json_output)?;
+    }
     let npm_config = prepared
         .publish_config
         .as_ref()
@@ -43,19 +68,20 @@ pub(crate) async fn publish_current_project(
     let final_tarball_hashes = rewritten_tarball
         .as_ref()
         .map_or(&prepared.tarball_hashes, |tarball| &tarball.hashes);
-    let final_secret_scan = rewritten_tarball
-        .as_ref()
-        .map_or(prepared.secret_scan.as_ref(), |tarball| {
-            tarball.secret_scan.as_ref()
-        });
     let registry =
         npm_stage::resolve_npm_stage_registry_with_source(npm_config, options.npm_registry)?;
     let access = resolve_stage_access(options.access, &npm_name, npm_config)?;
     let (tag, tag_explicit) = resolve_stage_tag(options.tag, npm_config);
+    let (provenance_source, provenance_pkg_json) = prepared
+        .publish_control
+        .as_ref()
+        .map_or((&prepared.source_dir, &prepared.pkg_json), |control| {
+            (&control.source_dir, &control.pkg_json)
+        });
     let provenance_request = publish::resolve_provenance_request_from_project_source(
         project_dir,
-        &prepared.source_dir,
-        &prepared.pkg_json,
+        provenance_source,
+        provenance_pkg_json,
         options.provenance,
         options.no_provenance,
         options.provenance_file,
@@ -92,8 +118,21 @@ pub(crate) async fn publish_current_project(
         None
     };
 
+    let mut final_secret_scans = Vec::with_capacity(2);
+    if !options.allow_secrets {
+        final_secret_scans.push(prepared.secret_scan.as_ref().ok_or_else(|| {
+            LpmError::Registry("base stage artifact was prepared without a secret scan".into())
+        })?);
+        if let Some(rewritten) = &rewritten_tarball {
+            final_secret_scans.push(rewritten.secret_scan.as_ref().ok_or_else(|| {
+                LpmError::Registry(
+                    "rewritten stage artifact was prepared without a secret scan".into(),
+                )
+            })?);
+        }
+    }
     publish::run_publish_secret_scan(
-        final_secret_scan.into_iter(),
+        final_secret_scans,
         options.json_output,
         options.allow_secrets,
     )?;
@@ -178,6 +217,9 @@ pub(crate) async fn publish_current_project(
         })
         .await?
     };
+    if rewritten_tarball.is_some() {
+        prepared.tarball_data = std::sync::Arc::new(Vec::new());
+    }
     let final_tarball_data = rewritten_tarball.as_ref().map_or_else(
         || Ok(std::sync::Arc::clone(&prepared.tarball_data)),
         |tarball| tarball.read_data().map(std::sync::Arc::new),
@@ -477,6 +519,10 @@ fn print_json(value: serde_json::Value) {
 mod tests {
     use super::*;
 
+    fn version_policy_metadata(value: serde_json::Value) -> publish_npm::NpmVersionPolicyMetadata {
+        serde_json::from_value(value).unwrap()
+    }
+
     #[test]
     fn resolve_stage_tag_treats_config_tag_as_explicit() {
         let config = NpmPublishConfig {
@@ -491,10 +537,10 @@ mod tests {
 
     #[test]
     fn enforce_stage_version_policy_blocks_duplicate_published_version() {
-        let metadata = serde_json::json!({
+        let metadata = version_policy_metadata(serde_json::json!({
             "name": "pkg",
             "versions": { "1.0.0": { "name": "pkg", "version": "1.0.0" } }
-        });
+        }));
         let err = publish_npm::enforce_npm_version_policy(&metadata, "pkg", "1.0.0", false)
             .unwrap_err()
             .to_string();
@@ -503,10 +549,10 @@ mod tests {
 
     #[test]
     fn enforce_stage_version_policy_requires_explicit_tag_for_prerelease() {
-        let metadata = serde_json::json!({
+        let metadata = version_policy_metadata(serde_json::json!({
             "name": "pkg",
             "versions": { "1.0.0": { "name": "pkg", "version": "1.0.0" } }
-        });
+        }));
         let err = publish_npm::enforce_npm_version_policy(&metadata, "pkg", "1.1.0-beta.1", false)
             .unwrap_err()
             .to_string();
@@ -515,10 +561,10 @@ mod tests {
 
     #[test]
     fn enforce_stage_version_policy_blocks_implicit_latest_for_lower_version() {
-        let metadata = serde_json::json!({
+        let metadata = version_policy_metadata(serde_json::json!({
             "name": "pkg",
             "versions": { "2.0.0": { "name": "pkg", "version": "2.0.0" } }
-        });
+        }));
         let err = publish_npm::enforce_npm_version_policy(&metadata, "pkg", "1.9.0", false)
             .unwrap_err()
             .to_string();
@@ -527,19 +573,19 @@ mod tests {
 
     #[test]
     fn enforce_stage_version_policy_allows_lower_version_with_explicit_tag() {
-        let metadata = serde_json::json!({
+        let metadata = version_policy_metadata(serde_json::json!({
             "name": "pkg",
             "versions": { "2.0.0": { "name": "pkg", "version": "2.0.0" } }
-        });
+        }));
         assert!(publish_npm::enforce_npm_version_policy(&metadata, "pkg", "1.9.0", true).is_ok());
     }
 
     #[test]
     fn enforce_stage_version_policy_rejects_mismatched_package_identity() {
-        let metadata = serde_json::json!({
+        let metadata = version_policy_metadata(serde_json::json!({
             "name": "different-package",
             "versions": {}
-        });
+        }));
 
         let error = publish_npm::enforce_npm_version_policy(&metadata, "pkg", "1.0.0", false)
             .unwrap_err()

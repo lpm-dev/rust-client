@@ -40,13 +40,12 @@ use std::path::PathBuf;
 /// Bumping this constant requires coordinated work on both the
 /// parent serializer ([`crate`]-side `AppContainerSandbox::spawn`)
 /// and the helper-side parser; during development the only
-/// valid value is `1`.
-pub const PROTOCOL_VERSION: u32 = 1;
+/// valid value is `2`.
+pub const PROTOCOL_VERSION: u32 = 2;
 
-/// Stable AppContainer profile name reused across every lpm install
-/// on the host. A single name → a single derived SID → idempotent
-/// DACL grants on the allow-set dirs. A per-project name would
-/// accumulate dead ACEs forever.
+/// Prefix for production AppContainer profile names. Each lifecycle
+/// invocation appends a unique suffix, preventing one script run from
+/// inheriting DACL grants made for an earlier project.
 pub const APPCONTAINER_NAME: &str = "LpmSandboxLifecycleChild";
 
 /// How the helper should configure the lifecycle child's stdio
@@ -107,9 +106,12 @@ pub struct HelperArgs {
     /// without touching AppContainer state.
     pub protocol_version: u32,
     /// AppContainer profile name (`--appcontainer-name`). Always
-    /// [`APPCONTAINER_NAME`] in production; an argv flag for
-    /// future-proofing + testability.
+    /// a per-invocation name derived from [`APPCONTAINER_NAME`] in
+    /// production; an argv flag for future-proofing + testability.
     pub appcontainer_name: String,
+    /// Delete the AppContainer profile when the helper finishes.
+    /// Production enables this for its per-invocation profile.
+    pub delete_appcontainer_profile: bool,
     /// Directories to grant the AppContainer SID *read* on (RXA)
     /// via DACL ACEs. Mirrors the cross-platform "reads broad"
     /// contract — see [`crate`]-side `readable_allow_set`.
@@ -132,9 +134,12 @@ pub struct HelperArgs {
     /// surface than a hard `lpm.exe` spawn failure that lists a
     /// Win32 error code.
     pub best_effort_readable_dirs: Vec<PathBuf>,
-    /// Directories to grant *read + write + execute* on. DACLs are
-    /// additive, so an entry that appears in both lists ends up RW.
+    /// Directories to grant *read + write + execute* on. Writable
+    /// grants run after readable grants so an overlapping path keeps RW.
     pub writable_dirs: Vec<PathBuf>,
+    /// Existing project secret files whose read access must be
+    /// denied after the broad directory grants are applied.
+    pub secret_read_denied_paths: Vec<PathBuf>,
     /// Lifecycle child's working directory. `None` means inherit
     /// the helper's CWD.
     pub working_dir: Option<PathBuf>,
@@ -238,9 +243,11 @@ pub enum ParseError {
 /// |------|-------|------------|
 /// | `--protocol-version` | u32 (must equal [`PROTOCOL_VERSION`]) | required, once |
 /// | `--appcontainer-name` | non-empty string | required, once |
+/// | `--delete-appcontainer-profile` | (flag) | optional |
 /// | `--readable-dir` | absolute path | zero+ (strict — root-grant failure is fatal) |
 /// | `--readable-dir-best-effort` | absolute path | zero+ (root-grant failure logs WARN + continues) |
 /// | `--writable-dir` | absolute path | zero+ |
+/// | `--secret-read-deny` | absolute path | zero+ |
 /// | `--working-dir` | absolute path | optional, once |
 /// | `--env-clear` | (flag) | optional |
 /// | `--env` | `KEY=VALUE` string | zero+ |
@@ -260,9 +267,11 @@ where
     let mut it = args.into_iter();
     let mut protocol_version: Option<u32> = None;
     let mut appcontainer_name: Option<String> = None;
+    let mut delete_appcontainer_profile = false;
     let mut readable_dirs: Vec<PathBuf> = Vec::new();
     let mut best_effort_readable_dirs: Vec<PathBuf> = Vec::new();
     let mut writable_dirs: Vec<PathBuf> = Vec::new();
+    let mut secret_read_denied_paths: Vec<PathBuf> = Vec::new();
     let mut working_dir: Option<PathBuf> = None;
     let mut env_clear = false;
     let mut envs: Vec<OsString> = Vec::new();
@@ -317,6 +326,9 @@ where
                     .to_owned();
                 appcontainer_name = Some(s);
             }
+            "--delete-appcontainer-profile" => {
+                delete_appcontainer_profile = true;
+            }
             "--readable-dir" => {
                 let raw = next_value(&mut it, "--readable-dir")?;
                 readable_dirs.push(PathBuf::from(raw));
@@ -328,6 +340,10 @@ where
             "--writable-dir" => {
                 let raw = next_value(&mut it, "--writable-dir")?;
                 writable_dirs.push(PathBuf::from(raw));
+            }
+            "--secret-read-deny" => {
+                let raw = next_value(&mut it, "--secret-read-deny")?;
+                secret_read_denied_paths.push(PathBuf::from(raw));
             }
             "--working-dir" => {
                 let raw = next_value(&mut it, "--working-dir")?;
@@ -387,9 +403,11 @@ where
     Ok(HelperArgs {
         protocol_version,
         appcontainer_name,
+        delete_appcontainer_profile,
         readable_dirs,
         best_effort_readable_dirs,
         writable_dirs,
+        secret_read_denied_paths,
         working_dir,
         env_clear,
         envs,
@@ -474,7 +492,7 @@ mod tests {
     fn minimal_required_flags() -> Vec<&'static str> {
         vec![
             "--protocol-version",
-            "1",
+            "2",
             "--appcontainer-name",
             "LpmSandboxLifecycleChild",
             "--stdio-stdin",
@@ -494,6 +512,7 @@ mod tests {
         let parsed = parse_argv(argv).expect("minimal argv must parse");
         assert_eq!(parsed.protocol_version, PROTOCOL_VERSION);
         assert_eq!(parsed.appcontainer_name, APPCONTAINER_NAME);
+        assert!(!parsed.delete_appcontainer_profile);
         assert_eq!(parsed.stdio_stdin, StdioMode::Null);
         assert_eq!(parsed.stdio_stdout, StdioMode::Inherit);
         assert_eq!(parsed.stdio_stderr, StdioMode::Inherit);
@@ -505,6 +524,7 @@ mod tests {
         assert!(parsed.readable_dirs.is_empty());
         assert!(parsed.best_effort_readable_dirs.is_empty());
         assert!(parsed.writable_dirs.is_empty());
+        assert!(parsed.secret_read_denied_paths.is_empty());
         assert!(parsed.envs.is_empty());
         assert!(!parsed.env_clear);
         assert!(!parsed.grant_internet_client);
@@ -579,6 +599,32 @@ mod tests {
     }
 
     #[test]
+    fn parse_argv_accepts_repeated_secret_read_denials() {
+        let mut parts = minimal_required_flags();
+        parts.splice(
+            10..10,
+            [
+                "--secret-read-deny",
+                "C:/projects/p/.env",
+                "--secret-read-deny",
+                "C:/projects/p/deploy.pem",
+            ]
+            .iter()
+            .copied(),
+        );
+
+        let parsed = parse_argv(make_argv(&parts))
+            .expect("secret denial paths must round-trip through argv");
+        assert_eq!(
+            parsed.secret_read_denied_paths,
+            vec![
+                PathBuf::from("C:/projects/p/.env"),
+                PathBuf::from("C:/projects/p/deploy.pem"),
+            ]
+        );
+    }
+
+    #[test]
     fn parse_argv_collects_env_entries_preserving_value_equals_signs() {
         let mut parts = minimal_required_flags();
         parts.splice(
@@ -595,15 +641,22 @@ mod tests {
     }
 
     #[test]
-    fn parse_argv_treats_env_clear_and_grant_internet_client_as_boolean_flags() {
+    fn parse_argv_treats_boolean_flags_as_boolean_flags() {
         let mut parts = minimal_required_flags();
         parts.splice(
             10..10,
-            ["--env-clear", "--grant-internet-client"].iter().copied(),
+            [
+                "--env-clear",
+                "--grant-internet-client",
+                "--delete-appcontainer-profile",
+            ]
+            .iter()
+            .copied(),
         );
         let parsed = parse_argv(make_argv(&parts)).expect("argv must parse");
         assert!(parsed.env_clear);
         assert!(parsed.grant_internet_client);
+        assert!(parsed.delete_appcontainer_profile);
     }
 
     #[test]
@@ -721,7 +774,7 @@ mod tests {
         // Drop --stdio-stderr + its value; keep stdin + stdout.
         let parts: Vec<&str> = vec![
             "--protocol-version",
-            "1",
+            "2",
             "--appcontainer-name",
             "LpmSandboxLifecycleChild",
             "--stdio-stdin",
@@ -739,7 +792,7 @@ mod tests {
     fn parse_argv_requires_appcontainer_name() {
         let parts: Vec<&str> = vec![
             "--protocol-version",
-            "1",
+            "2",
             "--stdio-stdin",
             "null",
             "--stdio-stdout",

@@ -254,6 +254,15 @@ pub fn lpm_registry_url_is_accepted(url: &str) -> bool {
     is_loopback_host(host)
 }
 
+/// Redacts an exact credential value from untrusted text without allocating
+/// when the value is empty or absent.
+pub fn redact_exact_secret<'a>(text: &'a str, secret: &str) -> std::borrow::Cow<'a, str> {
+    if secret.is_empty() || !text.contains(secret) {
+        return std::borrow::Cow::Borrowed(text);
+    }
+    std::borrow::Cow::Owned(text.replace(secret, "<redacted>"))
+}
+
 pub fn safe_url_origin(raw: &str) -> String {
     let Some((scheme, rest)) = raw.split_once("://") else {
         return "remote-url".to_string();

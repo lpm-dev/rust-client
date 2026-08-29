@@ -1,11 +1,12 @@
-//! Shared secret-file path catalog consumed by both Seatbelt
-//! (macOS) and the Linux user-namespace bind-mount overlay.
+//! Shared secret-file path catalog consumed by Seatbelt (macOS),
+//! the Linux user-namespace bind-mount overlay, and Windows
+//! AppContainer DACL policy.
 //!
 //! Single source of truth so a new entry in one backend can't drift
 //! out of sync with the other. Previously each backend kept its own
 //! private const list and a `cfg(target_os = "macos")` symmetry test
 //! caught drift only on macOS hosts; centralising the lists makes
-//! the invariant a type-system one (both backends import the same
+//! the invariant a type-system one (all backends import the same
 //! `&'static [&'static str]` and any add lands in both places).
 //!
 //! The lists describe paths LIFECYCLE SCRIPTS may not read despite
@@ -20,6 +21,10 @@
 //!   stats / walks the project tree and produces a list of
 //!   existing-file paths; the child pre_exec then bind-mounts
 //!   `/dev/null` over each.
+//! - **Windows**: the same enumerator removes the AppContainer SID's
+//!   grants from each secret and blocks inheritance of the broad
+//!   project read grant while the child runs, then restores the
+//!   original DACL.
 //!
 //! Per-user / per-project `script-read-allow` overrides are
 //! applied at consumption time by each backend.
@@ -70,9 +75,8 @@ pub(crate) const SECRET_LITERAL_PATHS: &[&str] = &[
 ];
 
 /// Project-relative subdirs whose `file-read*` is denied wholesale.
-/// macOS uses a single `(subpath ...)` rule per entry; Linux walks
-/// inside (depth-capped) and bind-mounts /dev/null over each
-/// regular file found.
+/// macOS uses a single `(subpath ...)` rule per entry. Linux and
+/// Windows walk inside with a depth cap and protect each regular file.
 pub(crate) const SECRET_SUBPATH_DIRS: &[&str] = &[
     ".ssh",
     ".aws",
@@ -89,8 +93,8 @@ pub(crate) const SECRET_SUBPATH_DIRS: &[&str] = &[
 ///
 /// macOS converts each suffix into an SBPL regex
 /// (`/.*<escaped-ext>$`) anchored at the canonicalized project_dir
-/// prefix. Linux matches the raw encoded filename bytes during its
-/// bounded, pruned project walk.
+/// prefix. Linux and Windows match the raw encoded filename bytes
+/// during the bounded, pruned project walk.
 ///
 /// Each entry starts with `.` and may contain multiple dots
 /// (`.tfvars.json` is one entry, not `.json`). The macOS regex

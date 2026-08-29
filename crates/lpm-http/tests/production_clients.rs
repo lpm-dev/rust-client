@@ -370,7 +370,7 @@ fn security_sensitive_client_paths_keep_shared_builders() {
     assert_body_contains(
         &registry_api,
         "pub async fn publish_package(",
-        "lpm_http::client_builder()",
+        "self.http.for_url_no_build(&url)",
     );
 
     let vault = read_workspace_source("crates/lpm-vault/src/sync/http.rs");

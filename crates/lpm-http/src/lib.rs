@@ -302,6 +302,7 @@ pub enum ReplayableRequestError<E> {
     HttpsDowngrade,
     CleartextNonLoopback,
     UnsupportedRedirectScheme,
+    CrossOriginBodyReplay,
 }
 
 impl<E> ReplayableRequestError<E> {
@@ -326,6 +327,8 @@ impl<E: fmt::Display> fmt::Display for ReplayableRequestError<E> {
             Self::UnsupportedRedirectScheme => {
                 formatter.write_str("refused redirect to unsupported URL scheme")
             }
+            Self::CrossOriginBodyReplay => formatter
+                .write_str("refused cross-origin redirect that would replay a request body"),
         }
     }
 }
@@ -343,7 +346,8 @@ where
             | Self::Timeout
             | Self::HttpsDowngrade
             | Self::CleartextNonLoopback
-            | Self::UnsupportedRedirectScheme => None,
+            | Self::UnsupportedRedirectScheme
+            | Self::CrossOriginBodyReplay => None,
         }
     }
 }
@@ -467,8 +471,11 @@ where
                 }
             });
         }
-        if !same_origin(&url, &next_url)
-            || authorization_allowed.is_some_and(|allowed| !allowed(&next_url))
+        let next_is_same_origin = same_origin(&url, &next_url);
+        if next_has_body && !next_is_same_origin {
+            return Err(ReplayableRequestError::CrossOriginBodyReplay);
+        }
+        if !next_is_same_origin || authorization_allowed.is_some_and(|allowed| !allowed(&next_url))
         {
             remove_cross_origin_credentials(&mut headers);
         }
@@ -1199,52 +1206,53 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cross_origin_307_replays_body_without_forwarding_credentials() {
+    async fn cross_origin_redirects_never_replay_a_request_body() {
         use wiremock::matchers::{method, path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
-        let target = MockServer::start().await;
-        Mock::given(method("PUT"))
-            .and(path("/capture"))
-            .respond_with(ResponseTemplate::new(200))
-            .expect(1)
-            .mount(&target)
-            .await;
-        let redirector = MockServer::start().await;
-        Mock::given(method("PUT"))
-            .and(path("/initial"))
-            .respond_with(
-                ResponseTemplate::new(307)
-                    .insert_header("location", format!("{}/capture", target.uri())),
-            )
-            .expect(1)
-            .mount(&redirector)
-            .await;
-        let client = reqwest::Client::builder()
-            .redirect(Policy::none())
-            .build()
-            .unwrap();
-        let body = ReplayableRequestBody::from_bytes(b"exact-body".to_vec());
-        let request = client
-            .put(format!("{}/initial", redirector.uri()))
-            .header(CONTENT_TYPE, "application/json")
-            .header(AUTHORIZATION, "Bearer secret")
-            .header("x-otp", "123456")
-            .header("npm-otp", "654321")
-            .body(body.body())
-            .build()
-            .unwrap();
+        for status in [301, 302, 307, 308] {
+            let target = MockServer::start().await;
+            Mock::given(method("PUT"))
+                .and(path("/capture"))
+                .respond_with(ResponseTemplate::new(200))
+                .expect(0)
+                .mount(&target)
+                .await;
+            let redirector = MockServer::start().await;
+            Mock::given(method("PUT"))
+                .and(path("/initial"))
+                .respond_with(
+                    ResponseTemplate::new(status)
+                        .insert_header("location", format!("{}/capture", target.uri())),
+                )
+                .expect(1)
+                .mount(&redirector)
+                .await;
+            let client = reqwest::Client::builder()
+                .redirect(Policy::none())
+                .build()
+                .unwrap();
+            let body = ReplayableRequestBody::from_bytes(b"confidential-publish-body".to_vec());
+            let request = client
+                .put(format!("{}/initial", redirector.uri()))
+                .header(CONTENT_TYPE, "application/json")
+                .header(AUTHORIZATION, "Bearer secret")
+                .header("x-otp", "123456")
+                .header("npm-otp", "654321")
+                .body(body.body())
+                .build()
+                .unwrap();
 
-        send_with_replayable_redirects(&client, request, Some(&body))
-            .await
-            .unwrap();
+            let error = send_with_replayable_redirects(&client, request, Some(&body))
+                .await
+                .expect_err("a confidential body must not cross an origin boundary");
 
-        let requests = target.received_requests().await.unwrap();
-        let redirected = requests.first().unwrap();
-        assert_eq!(redirected.body, b"exact-body");
-        assert!(redirected.headers.get(AUTHORIZATION).is_none());
-        assert!(redirected.headers.get("x-otp").is_none());
-        assert!(redirected.headers.get("npm-otp").is_none());
+            assert!(
+                error.to_string().contains("cross-origin"),
+                "unexpected redirect error for HTTP {status}: {error}"
+            );
+            assert!(target.received_requests().await.unwrap().is_empty());
+        }
     }
 
     #[tokio::test]

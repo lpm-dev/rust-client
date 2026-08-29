@@ -389,7 +389,7 @@ async fn manual_redirect_dispatch_reselects_the_client_for_each_origin() {
     }
 
     let target = MockServer::start().await;
-    Mock::given(method("PUT"))
+    Mock::given(method("GET"))
         .and(path("/capture"))
         .and(header("x-manual-origin", "target"))
         .respond_with(ResponseTemplate::new(200))
@@ -397,7 +397,7 @@ async fn manual_redirect_dispatch_reselects_the_client_for_each_origin() {
         .mount(&target)
         .await;
     let source = MockServer::start().await;
-    Mock::given(method("PUT"))
+    Mock::given(method("GET"))
         .and(path("/initial"))
         .and(header("x-manual-origin", "source"))
         .respond_with(
@@ -428,17 +428,12 @@ async fn manual_redirect_dispatch_reselects_the_client_for_each_origin() {
         tls_material_budget: Arc::new(TlsMaterialBudget::new(0).expect("zero TLS budget")),
         per_origin_identity_certs: HashMap::new(),
     };
-    let body = lpm_http::ReplayableRequestBody::from_bytes(b"body".to_vec());
-    let mut request = reqwest::Request::new(
-        reqwest::Method::PUT,
+    let request = reqwest::Request::new(
+        reqwest::Method::GET,
         reqwest::Url::parse(&format!("{}/initial", source.uri())).unwrap(),
     );
-    request.headers_mut().insert(
-        reqwest::header::CONTENT_TYPE,
-        reqwest::header::HeaderValue::from_static("application/json"),
-    );
 
-    let response = lpm_http::send_with_replayable_redirects(&clients, request, Some(&body))
+    let response = lpm_http::send_with_replayable_redirects(&clients, request, None)
         .await
         .expect("redirect should use each origin's manual client");
 

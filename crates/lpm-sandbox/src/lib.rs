@@ -158,25 +158,25 @@ mod landlock_rules;
 mod posture_decision;
 
 // Shared secret-file path catalog consumed by the Seatbelt
-// (macOS) deny renderer AND the Linux bind-mount overlay
-// enumerator. Single source of truth — `mod secret_paths;` makes
-// drift a type-system error. Gated on macOS + Linux + non-Windows
-// tests (Windows currently has no overlay layer; the const lists
-// would be dead code there).
+// (macOS) deny renderer, Linux bind-mount overlay enumerator, and
+// Windows AppContainer DACL-deny enumerator. Single source of truth
+// makes drift a type-system error.
 #[cfg(any(
     target_os = "macos",
     target_os = "linux",
+    target_os = "windows",
     all(test, not(target_os = "windows"))
 ))]
 mod secret_paths;
 
-// Linux secret-file overlay (bind-mounts /dev/null over secret
-// paths under project_dir). Same gate shape as `landlock_rules`:
-// Linux production + every non-Windows test build, so macOS unit
-// tests exercise the enumerator. The `apply_secret_overlay_in_child`
-// AS-safe hook + the `SecretOverlaySpec::build` constructor are
-// `target_os = "linux"`-gated inside the module.
-#[cfg(any(target_os = "linux", all(test, not(target_os = "windows"))))]
+// Shared project-secret enumerator plus the Linux bind-mount overlay.
+// Windows production consumes only `enumerate_project_secrets`; the
+// mount implementation remains Linux-gated inside the module.
+#[cfg(any(
+    target_os = "linux",
+    target_os = "windows",
+    all(test, not(target_os = "windows"))
+))]
 mod linux_secret_overlay;
 
 pub mod config;
@@ -915,17 +915,16 @@ pub fn spawn_tracked_command(
 ) -> Result<std::process::Child, SandboxError> {
     #[cfg(target_os = "windows")]
     {
-        return windows::spawn_tracked_command(command);
-    }
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt;
-        command.process_group(0);
+        windows::spawn_tracked_command(command)
     }
 
     #[cfg(not(target_os = "windows"))]
     {
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            command.process_group(0);
+        }
         command.spawn().map_err(|error| SandboxError::SpawnFailed {
             reason: error.to_string(),
         })

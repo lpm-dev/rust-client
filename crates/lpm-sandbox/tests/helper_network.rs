@@ -45,7 +45,7 @@ const TEST_APPCONTAINER_NAME: &str = "LpmSandboxHelperIntegrationTest";
 fn minimal_argv(grant_internet: bool) -> Vec<&'static str> {
     let mut v = vec![
         "--protocol-version",
-        "1",
+        "2",
         "--appcontainer-name",
         TEST_APPCONTAINER_NAME,
         "--stdio-stdin",

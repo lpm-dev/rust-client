@@ -85,12 +85,16 @@ pub(crate) enum ReleaseCommands {
         #[arg(long, short = 'y')]
         yes: bool,
 
+        /// Do not run package publish lifecycle scripts.
+        #[arg(long = "ignore-scripts")]
+        ignore_scripts: bool,
+
         /// Six-digit authenticator code for MFA-protected LPM publishes.
         #[arg(long, value_name = "CODE")]
         otp: Option<String>,
 
         /// Minimum quality score required to publish (0-100).
-        #[arg(long)]
+        #[arg(long, value_parser = clap::value_parser!(u32).range(..=100))]
         min_score: Option<u32>,
 
         /// Skip pre-publish secret scanning (not recommended).

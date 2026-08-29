@@ -39,12 +39,28 @@ use std::os::windows::process::CommandExt;
 use std::path::PathBuf;
 use std::process::{Child, Command};
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::helper_protocol::{APPCONTAINER_NAME, PROTOCOL_VERSION, StdioMode};
 use crate::{
     Sandbox, SandboxError, SandboxMode, SandboxOptions, SandboxPosture, SandboxSpec, SandboxStdio,
     SandboxedCommand,
 };
+
+static APPCONTAINER_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+fn appcontainer_name_for_invocation() -> String {
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos() as u64;
+    let sequence = APPCONTAINER_SEQUENCE.fetch_add(1, Ordering::Relaxed) as u32;
+    format!(
+        "{APPCONTAINER_NAME}-{:08x}{timestamp:016x}{sequence:08x}",
+        std::process::id()
+    )
+}
 
 // ── Backend struct ───────────────────────────────────────────────────
 
@@ -153,6 +169,13 @@ impl Sandbox for AppContainerSandbox {
         for (index, path) in self.spec.extra_write_dirs.iter().enumerate() {
             crate::config::revalidate_effective_write_dir(path, index)?;
         }
+        let secret_read_denied_paths = crate::linux_secret_overlay::enumerate_project_secrets(
+            &self.spec.project_dir,
+            &self.spec.secret_read_allow,
+        )
+        .map_err(|error| SandboxError::InvalidSpec {
+            reason: format!("AppContainer secret-read policy preparation failed: {error}"),
+        })?;
 
         let mut helper_cmd = Command::new(&self.helper_path);
 
@@ -162,7 +185,10 @@ impl Sandbox for AppContainerSandbox {
         helper_cmd
             .arg("--protocol-version")
             .arg(PROTOCOL_VERSION.to_string());
-        helper_cmd.arg("--appcontainer-name").arg(APPCONTAINER_NAME);
+        helper_cmd
+            .arg("--appcontainer-name")
+            .arg(appcontainer_name_for_invocation())
+            .arg("--delete-appcontainer-profile");
 
         // Broad-read grants (the cross-platform "reads broad"
         // contract). The helper applies DACL R+X ACEs on these.
@@ -194,11 +220,13 @@ impl Sandbox for AppContainerSandbox {
         for dir in tool_dirs_needing_explicit_grant(&cmd) {
             helper_cmd.arg("--readable-dir-best-effort").arg(dir);
         }
-        // Narrow-write grants (mirrors + the macOS/Linux
-        // backends' writable-set). DACLs are additive, so an entry
-        // appearing in both lists ends up R+W+X — fine.
+        // Narrow-write grants mirror the macOS/Linux writable set.
+        // The helper applies these after reads so overlaps keep R+W+X.
         for dir in crate::windows::writable_allow_set(&self.spec) {
             helper_cmd.arg("--writable-dir").arg(dir);
+        }
+        for path in secret_read_denied_paths {
+            helper_cmd.arg("--secret-read-deny").arg(path);
         }
 
         if let Some(dir) = &cmd.current_dir {
@@ -729,6 +757,16 @@ mod tests {
                 "allow_degraded={ag} should not affect AppContainer posture",
             );
         }
+    }
+
+    #[test]
+    fn appcontainer_profile_names_are_unique_and_within_windows_limit() {
+        let first = appcontainer_name_for_invocation();
+        let second = appcontainer_name_for_invocation();
+
+        assert_ne!(first, second);
+        assert!(first.starts_with(APPCONTAINER_NAME));
+        assert!(first.len() <= 64, "AppContainer profile name was {first:?}");
     }
 
     #[test]

@@ -14,6 +14,7 @@ fuzz_target!(|data: &[u8]| {
         max_entries: 32,
         max_metadata_entries: 32,
         max_entry_bytes: 64 * 1024,
+        max_total_entry_bytes: 256 * 1024,
         max_path_depth: 32,
         max_path_bytes: 4 * 1024,
         max_metadata_bytes: 4 * 1024,
