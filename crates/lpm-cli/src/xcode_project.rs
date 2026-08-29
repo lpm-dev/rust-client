@@ -17,32 +17,109 @@ pub struct XcodeLinkResult {
     pub target_name: String,
 }
 
+fn read_pbxproj(path: &Path) -> Result<String, LpmError> {
+    let metadata = path.symlink_metadata().map_err(|error| {
+        LpmError::Registry(format!("failed to inspect project.pbxproj: {error}"))
+    })?;
+    if lpm_common::is_symlink_or_junction(&metadata) || !metadata.is_file() {
+        return Err(LpmError::Registry(format!(
+            "refusing project.pbxproj that is not a regular file: {}",
+            path.display()
+        )));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        if metadata.nlink() != 1 {
+            return Err(LpmError::Registry(format!(
+                "refusing hard-linked project.pbxproj: {}",
+                path.display()
+            )));
+        }
+    }
+    lpm_common::read_text_file_capped(path, lpm_common::CONFIG_FILE_SIZE_CAP_BYTES)
+        .map_err(|error| LpmError::Registry(format!("failed to read project.pbxproj: {error}")))
+}
+
 /// Walk up from `dir` to find a `.xcodeproj` directory.
 /// Stops if `Package.swift` is found first (that means SPM project, not Xcode app).
 /// Returns the path to the `.xcodeproj` directory.
-pub fn find_xcodeproj(dir: &Path) -> Option<PathBuf> {
+pub fn find_xcodeproj(dir: &Path) -> Result<Option<PathBuf>, LpmError> {
     let mut current = dir.to_path_buf();
     loop {
         // If Package.swift exists here, this is an SPM project — stop looking for xcodeproj
         if current.join("Package.swift").exists() {
-            return None;
+            return Ok(None);
         }
 
-        // Look for .xcodeproj in this directory
-        if let Ok(entries) = std::fs::read_dir(&current) {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if path.is_dir()
-                    && let Some(ext) = path.extension()
-                    && ext == "xcodeproj"
-                {
-                    return Some(path);
-                }
-            }
+        if let Some(project) = find_xcodeproj_in_directory(&current)? {
+            return Ok(Some(project));
         }
 
         if !current.pop() {
-            return None;
+            return Ok(None);
+        }
+    }
+}
+
+pub fn find_xcodeproj_in_directory(directory: &Path) -> Result<Option<PathBuf>, LpmError> {
+    let entries = std::fs::read_dir(directory).map_err(|error| {
+        LpmError::Registry(format!(
+            "failed to inspect Xcode projects in {}: {error}",
+            directory.display()
+        ))
+    })?;
+    let mut projects = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(|error| {
+            LpmError::Registry(format!(
+                "failed to inspect an Xcode project entry in {}: {error}",
+                directory.display()
+            ))
+        })?;
+        let path = entry.path();
+        if path.extension() != Some(std::ffi::OsStr::new("xcodeproj")) {
+            continue;
+        }
+        let metadata = path.symlink_metadata().map_err(|error| {
+            LpmError::Registry(format!(
+                "failed to inspect Xcode project {}: {error}",
+                path.display()
+            ))
+        })?;
+        if lpm_common::is_symlink_or_junction(&metadata) || !metadata.is_dir() {
+            return Err(LpmError::Registry(format!(
+                "refusing .xcodeproj that is not a real directory: {}",
+                path.display()
+            )));
+        }
+        projects.push(path);
+    }
+    projects.sort();
+    match projects.as_slice() {
+        [] => Ok(None),
+        [project] => Ok(Some(project.clone())),
+        _ => {
+            let directory_name = directory.file_name();
+            if let Some(project) = projects
+                .iter()
+                .find(|project| project.file_stem() == directory_name)
+            {
+                return Ok(Some(project.clone()));
+            }
+            let names = projects
+                .into_iter()
+                .filter_map(|project| {
+                    project
+                        .file_name()
+                        .map(|name| name.to_string_lossy().into_owned())
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            Err(LpmError::Registry(format!(
+                "multiple Xcode projects found in {} ({names}); rename the intended project to match the directory",
+                directory.display()
+            )))
         }
     }
 }
@@ -67,36 +144,37 @@ pub fn link_local_package(
         )));
     }
 
-    let content = std::fs::read_to_string(&pbxproj)
-        .map_err(|e| LpmError::Registry(format!("failed to read project.pbxproj: {e}")))?;
+    let content = read_pbxproj(&pbxproj)?;
+    let project_name = xcodeproj_path
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .unwrap_or("project");
 
-    // Check if already linked
     let existing_ref = find_existing_local_pkg_ref(&content, local_pkg_rel_path);
     let existing_product = find_existing_product_dep(&content, product_name);
+    let (target_id, target_name) = find_main_app_target_for_project(&content, project_name)
+        .ok_or_else(|| {
+            LpmError::Registry(format!(
+                "No unambiguous app target found in {project_name}.xcodeproj. \
+                 Name one application target '{project_name}' or keep a single app target."
+            ))
+        })?;
 
-    if existing_ref.is_some() && existing_product.is_some() {
-        // Find target name for the result
-        let target_name =
-            find_main_app_target(&content).map_or_else(|| "Unknown".to_string(), |(_, name)| name);
-
-        return Ok(XcodeLinkResult {
-            package_ref_added: false,
-            _already_linked: true,
-            target_name,
-        });
+    match (existing_ref, existing_product) {
+        (Some(_), Some(_)) => {
+            return Ok(XcodeLinkResult {
+                package_ref_added: false,
+                _already_linked: true,
+                target_name,
+            });
+        }
+        (Some(_), None) | (None, Some(_)) => {
+            return Err(LpmError::Registry(format!(
+                "incomplete LPMDependencies link in {project_name}.xcodeproj; restore project.pbxproj.lpm-backup or remove the stale package entries"
+            )));
+        }
+        (None, None) => {}
     }
-
-    // Find the main app target
-    let (target_id, target_name) = find_main_app_target(&content).ok_or_else(|| {
-        let proj_name = xcodeproj_path
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .unwrap_or("project");
-        LpmError::Registry(format!(
-            "No app target found in {proj_name}.xcodeproj. \
-			 LPM requires an app target (not a framework or test target)."
-        ))
-    })?;
 
     // Find the Frameworks build phase for this target
     let frameworks_phase_id = find_frameworks_phase(&content, &target_id).ok_or_else(|| {
@@ -113,7 +191,7 @@ pub fn link_local_package(
     // Back up pbxproj before first modification
     let backup_path = pbxproj.with_extension("pbxproj.lpm-backup");
     if !backup_path.exists() {
-        std::fs::copy(&pbxproj, &backup_path)
+        lpm_common::write_file_atomic(&backup_path, content.as_bytes())
             .map_err(|e| LpmError::Registry(format!("failed to back up project.pbxproj: {e}")))?;
     }
 
@@ -130,7 +208,7 @@ pub fn link_local_package(
     )?;
 
     // Atomic write
-    write_pbxproj_atomic(&pbxproj, &edited)?;
+    write_pbxproj_atomic(&pbxproj, &content, &edited)?;
 
     Ok(XcodeLinkResult {
         package_ref_added: true,
@@ -202,12 +280,15 @@ fn find_existing_product_dep(content: &str, product_name: &str) -> Option<String
 
 /// Find the main app target (productType = "com.apple.product-type.application").
 /// Returns (object_id, target_name).
-fn find_main_app_target(content: &str) -> Option<(String, String)> {
-    let section_start = content.find("/* Begin PBXNativeTarget section */")?;
-    let section_end = content.find("/* End PBXNativeTarget section */")?;
+fn find_app_targets(content: &str) -> Vec<(String, String)> {
+    let Some(section_start) = content.find("/* Begin PBXNativeTarget section */") else {
+        return Vec::new();
+    };
+    let Some(section_end) = content.find("/* End PBXNativeTarget section */") else {
+        return Vec::new();
+    };
     let section = &content[section_start..section_end];
-
-    // Find targets with application product type
+    let mut targets = Vec::new();
     let mut current_id = String::new();
     let mut current_name = String::new();
 
@@ -229,11 +310,20 @@ fn find_main_app_target(content: &str) -> Option<(String, String)> {
             && trimmed.contains("com.apple.product-type.application")
             && !current_id.is_empty()
         {
-            return Some((current_id, current_name));
+            targets.push((current_id.clone(), current_name.clone()));
         }
     }
+    targets
+}
 
-    None
+fn find_main_app_target_for_project(content: &str, project_name: &str) -> Option<(String, String)> {
+    let mut targets = find_app_targets(content);
+    if targets.len() == 1 {
+        return targets.pop();
+    }
+    targets
+        .into_iter()
+        .find(|(_, target_name)| target_name == project_name)
 }
 
 /// Find the PBXFrameworksBuildPhase ID referenced by the given target.
@@ -564,7 +654,18 @@ fn find_block_end(content: &str) -> Option<usize> {
 }
 
 /// Write pbxproj content atomically.
-fn write_pbxproj_atomic(pbxproj_path: &Path, content: &str) -> Result<(), LpmError> {
+fn write_pbxproj_atomic(
+    pbxproj_path: &Path,
+    expected: &str,
+    content: &str,
+) -> Result<(), LpmError> {
+    let current = read_pbxproj(pbxproj_path)?;
+    if current != expected {
+        return Err(LpmError::Registry(format!(
+            "project.pbxproj changed during install: {}",
+            pbxproj_path.display()
+        )));
+    }
     lpm_common::write_file_atomic(pbxproj_path, content)
         .map_err(|e| LpmError::Registry(format!("failed to write pbxproj: {e}")))
 }
@@ -572,6 +673,27 @@ fn write_pbxproj_atomic(pbxproj_path: &Path, content: &str) -> Result<(), LpmErr
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn write_xcodeproj(directory: &Path, project_name: &str, content: &str) -> PathBuf {
+        let xcodeproj = directory.join(format!("{project_name}.xcodeproj"));
+        std::fs::create_dir(&xcodeproj).unwrap();
+        std::fs::write(xcodeproj.join("project.pbxproj"), content).unwrap();
+        xcodeproj
+    }
+
+    fn with_second_app_target(content: &str, target_name: &str) -> String {
+        let target = content
+            .split("/* Begin PBXNativeTarget section */")
+            .nth(1)
+            .and_then(|section| section.split("/* End PBXNativeTarget section */").next())
+            .expect("sample target section")
+            .replace("284E0D1F2F5F71880018579D", "111111111111111111111111")
+            .replace("MyApp", target_name);
+        content.replace(
+            "/* End PBXNativeTarget section */",
+            &format!("{target}/* End PBXNativeTarget section */"),
+        )
+    }
 
     const SAMPLE_PBXPROJ: &str = r#"// !$*UTF8*$!
 {
@@ -702,7 +824,7 @@ mod tests {
 
     #[test]
     fn find_main_app_target_selects_application() {
-        let result = find_main_app_target(SAMPLE_PBXPROJ);
+        let result = find_main_app_target_for_project(SAMPLE_PBXPROJ, "MyApp");
         assert!(result.is_some());
         let (id, name) = result.unwrap();
         assert_eq!(id, "284E0D1F2F5F71880018579D");
@@ -715,8 +837,181 @@ mod tests {
             "com.apple.product-type.application",
             "com.apple.product-type.bundle.unit-test",
         );
-        let result = find_main_app_target(&with_test);
+        let result = find_main_app_target_for_project(&with_test, "MyApp");
         assert!(result.is_none());
+    }
+
+    #[test]
+    fn main_app_target_prefers_the_project_named_application() {
+        let with_two_apps = with_second_app_target(SAMPLE_PBXPROJ, "Secondary");
+
+        let result = find_main_app_target_for_project(&with_two_apps, "MyApp").unwrap();
+        assert_eq!(result.0, "284E0D1F2F5F71880018579D");
+        assert_eq!(result.1, "MyApp");
+    }
+
+    #[test]
+    fn xcode_project_discovery_prefers_the_directory_named_project() {
+        let directory = tempfile::tempdir().unwrap();
+        let project_dir = directory.path().join("MyApp");
+        std::fs::create_dir(&project_dir).unwrap();
+        std::fs::create_dir(project_dir.join("Other.xcodeproj")).unwrap();
+        std::fs::create_dir(project_dir.join("MyApp.xcodeproj")).unwrap();
+
+        assert_eq!(
+            find_xcodeproj(&project_dir).unwrap(),
+            Some(project_dir.join("MyApp.xcodeproj"))
+        );
+    }
+
+    #[test]
+    fn xcode_project_discovery_rejects_unmatched_ambiguity() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::create_dir(directory.path().join("First.xcodeproj")).unwrap();
+        std::fs::create_dir(directory.path().join("Second.xcodeproj")).unwrap();
+
+        let error = find_xcodeproj(directory.path()).unwrap_err();
+
+        assert!(error.to_string().contains("multiple Xcode projects"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn xcode_project_discovery_rejects_a_linked_project_directory() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        symlink(outside.path(), directory.path().join("Linked.xcodeproj")).unwrap();
+
+        let error = find_xcodeproj_in_directory(directory.path()).unwrap_err();
+
+        assert!(error.to_string().contains("not a real directory"));
+    }
+
+    #[test]
+    fn existing_xcode_link_rejects_ambiguous_app_targets() {
+        let directory = tempfile::tempdir().unwrap();
+        let linked = insert_full_package_link(
+            SAMPLE_PBXPROJ,
+            "Packages/LPMDependencies",
+            "LPMDependencies",
+            "284E0D1F2F5F71880018579D",
+            "284E0D1D2F5F71880018579D",
+            "AAAAAAAAAAAAAAAAAAAAAAAA",
+            "BBBBBBBBBBBBBBBBBBBBBBBB",
+            "CCCCCCCCCCCCCCCCCCCCCCCC",
+        )
+        .unwrap();
+        let ambiguous = with_second_app_target(&linked, "Secondary");
+        let xcodeproj = write_xcodeproj(directory.path(), "Unmatched", &ambiguous);
+
+        let error = link_local_package(&xcodeproj, "LPMDependencies", "Packages/LPMDependencies")
+            .err()
+            .expect("ambiguous app targets must be rejected");
+
+        assert!(error.to_string().contains("No unambiguous app target"));
+    }
+
+    #[test]
+    fn xcode_link_rejects_partial_preexisting_entries() {
+        let directory = tempfile::tempdir().unwrap();
+        let linked = insert_full_package_link(
+            SAMPLE_PBXPROJ,
+            "Packages/LPMDependencies",
+            "LPMDependencies",
+            "284E0D1F2F5F71880018579D",
+            "284E0D1D2F5F71880018579D",
+            "AAAAAAAAAAAAAAAAAAAAAAAA",
+            "BBBBBBBBBBBBBBBBBBBBBBBB",
+            "CCCCCCCCCCCCCCCCCCCCCCCC",
+        )
+        .unwrap();
+        let section_start = linked
+            .find("/* Begin XCSwiftPackageProductDependency section */")
+            .unwrap();
+        let section_end = linked
+            .find("/* End XCSwiftPackageProductDependency section */")
+            .unwrap()
+            + "/* End XCSwiftPackageProductDependency section */".len();
+        let partial = format!("{}{}", &linked[..section_start], &linked[section_end..]);
+        let xcodeproj = write_xcodeproj(directory.path(), "MyApp", &partial);
+
+        let error = link_local_package(&xcodeproj, "LPMDependencies", "Packages/LPMDependencies")
+            .err()
+            .expect("partial Xcode links must be rejected");
+
+        assert!(
+            error
+                .to_string()
+                .contains("incomplete LPMDependencies link")
+        );
+    }
+
+    #[test]
+    fn xcode_link_rejects_an_oversized_project_before_parsing() {
+        let directory = tempfile::tempdir().unwrap();
+        let xcodeproj = directory.path().join("MyApp.xcodeproj");
+        std::fs::create_dir(&xcodeproj).unwrap();
+        let pbxproj = xcodeproj.join("project.pbxproj");
+        let file = std::fs::File::create(&pbxproj).unwrap();
+        file.set_len(lpm_common::CONFIG_FILE_SIZE_CAP_BYTES + 1)
+            .unwrap();
+
+        let error = link_local_package(&xcodeproj, "LPMDependencies", "Packages/LPMDependencies")
+            .err()
+            .expect("oversized pbxproj input must be rejected");
+
+        assert!(error.to_string().contains("limit"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn xcode_link_rejects_a_linked_project_file_without_touching_its_target() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::tempdir().unwrap();
+        let outside = directory.path().join("outside.pbxproj");
+        std::fs::write(&outside, SAMPLE_PBXPROJ).unwrap();
+        let xcodeproj = directory.path().join("MyApp.xcodeproj");
+        std::fs::create_dir(&xcodeproj).unwrap();
+        symlink(&outside, xcodeproj.join("project.pbxproj")).unwrap();
+
+        let result = link_local_package(&xcodeproj, "LPMDependencies", "Packages/LPMDependencies");
+
+        assert!(result.is_err());
+        assert_eq!(std::fs::read_to_string(outside).unwrap(), SAMPLE_PBXPROJ);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn xcode_link_rejects_a_hard_linked_project_file_without_touching_its_peer() {
+        let directory = tempfile::tempdir().unwrap();
+        let outside = directory.path().join("outside.pbxproj");
+        std::fs::write(&outside, SAMPLE_PBXPROJ).unwrap();
+        let xcodeproj = directory.path().join("MyApp.xcodeproj");
+        std::fs::create_dir(&xcodeproj).unwrap();
+        std::fs::hard_link(&outside, xcodeproj.join("project.pbxproj")).unwrap();
+
+        let result = link_local_package(&xcodeproj, "LPMDependencies", "Packages/LPMDependencies");
+
+        assert!(result.is_err());
+        assert_eq!(std::fs::read_to_string(outside).unwrap(), SAMPLE_PBXPROJ);
+    }
+
+    #[test]
+    fn pbxproj_write_rejects_a_concurrent_change() {
+        let directory = tempfile::tempdir().unwrap();
+        let pbxproj = directory.path().join("project.pbxproj");
+        std::fs::write(&pbxproj, "new editor content").unwrap();
+
+        let error = write_pbxproj_atomic(&pbxproj, "previous content", "lpm edit").unwrap_err();
+
+        assert!(error.to_string().contains("changed during install"));
+        assert_eq!(
+            std::fs::read_to_string(pbxproj).unwrap(),
+            "new editor content"
+        );
     }
 
     #[test]

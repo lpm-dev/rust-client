@@ -776,6 +776,95 @@ fn uninstall_selected_targets(
     })
 }
 
+#[derive(Clone)]
+struct SwiftUninstallProject {
+    manifest_path: PathBuf,
+    resolve_dir: PathBuf,
+    wrapper: bool,
+}
+
+fn swift_uninstall_projects(member_roots: &[PathBuf]) -> Vec<SwiftUninstallProject> {
+    let mut projects = Vec::new();
+    for root in member_roots {
+        let manifest_path = root.join("Package.swift");
+        if manifest_path.is_file() {
+            projects.push(SwiftUninstallProject {
+                manifest_path,
+                resolve_dir: root.clone(),
+                wrapper: false,
+            });
+            continue;
+        }
+        let wrapper_manifest = root
+            .join(crate::swift_manifest::LPM_DEPS_REL_PATH)
+            .join("Package.swift");
+        if wrapper_manifest.is_file() {
+            projects.push(SwiftUninstallProject {
+                resolve_dir: wrapper_manifest.parent().unwrap_or(root).to_path_buf(),
+                manifest_path: wrapper_manifest,
+                wrapper: true,
+            });
+        }
+    }
+    projects
+}
+
+fn swift_uninstall_identities(packages: &[String]) -> Vec<(usize, String)> {
+    packages
+        .iter()
+        .enumerate()
+        .filter_map(|(index, package)| {
+            package
+                .starts_with("@lpm.dev/")
+                .then(|| lpm_common::PackageName::parse(package).ok())
+                .flatten()
+                .map(|name| (index, crate::swift_manifest::lpm_to_se0292_id(&name)))
+        })
+        .collect()
+}
+
+fn uninstall_swift_packages(
+    projects: &[SwiftUninstallProject],
+    packages: &[String],
+) -> Result<Vec<String>, LpmError> {
+    let identities = swift_uninstall_identities(packages);
+    if identities.is_empty() {
+        return Ok(Vec::new());
+    }
+    let identity_values = identities
+        .iter()
+        .map(|(_, identity)| identity.clone())
+        .collect::<Vec<_>>();
+    let mut removed_indexes = HashSet::new();
+    for project in projects {
+        let removals = if project.wrapper {
+            crate::swift_manifest::remove_wrapper_dependencies(
+                &project.manifest_path,
+                &identity_values,
+            )?
+        } else {
+            crate::swift_manifest::remove_registry_dependencies(
+                &project.manifest_path,
+                &identity_values,
+            )?
+        };
+        if removals.iter().any(|removal| removal.removed) {
+            crate::swift_manifest::run_swift_resolve(&project.resolve_dir)?;
+        }
+        for ((package_index, _), removal) in identities.iter().zip(removals) {
+            if removal.removed {
+                removed_indexes.insert(*package_index);
+            }
+        }
+    }
+    let mut removed = removed_indexes
+        .into_iter()
+        .map(|index| packages[index].clone())
+        .collect::<Vec<_>>();
+    removed.sort();
+    Ok(removed)
+}
+
 #[allow(clippy::too_many_arguments)]
 pub async fn run(
     _client: &RegistryClient,
@@ -861,11 +950,6 @@ pub async fn run(
         .iter()
         .map(|manifest| crate::commands::install_targets::install_root_for(manifest).to_path_buf())
         .collect::<Vec<_>>();
-    let manifest_refs = targets
-        .member_manifests
-        .iter()
-        .map(PathBuf::as_path)
-        .collect::<Vec<_>>();
     let install_hash_paths = member_roots
         .iter()
         .map(|root| root.join(".lpm").join("install-hash"))
@@ -874,16 +958,58 @@ pub async fn run(
         .iter()
         .map(PathBuf::as_path)
         .collect::<Vec<_>>();
+    let swift_projects = swift_uninstall_projects(&member_roots);
+    let mut required_paths = targets.member_manifests.clone();
+    let mut optional_paths = Vec::with_capacity(swift_projects.len());
+    for project in &swift_projects {
+        required_paths.push(project.manifest_path.clone());
+        if project.wrapper {
+            let exports = project
+                .manifest_path
+                .parent()
+                .unwrap_or(&project.resolve_dir)
+                .join("Sources/LPMDependencies/Exports.swift");
+            if exports.exists() {
+                required_paths.push(exports);
+            }
+        }
+        optional_paths.push(project.resolve_dir.join("Package.resolved"));
+    }
+    required_paths.sort();
+    required_paths.dedup();
+    optional_paths.sort();
+    optional_paths.dedup();
+    let required_refs = required_paths
+        .iter()
+        .map(PathBuf::as_path)
+        .collect::<Vec<_>>();
+    let optional_refs = optional_paths
+        .iter()
+        .map(PathBuf::as_path)
+        .collect::<Vec<_>>();
 
     let result =
         workspace_lockfile::scope_workspace_mutation_if_present(cwd, &member_roots, async {
             let transaction = crate::manifest_tx::ManifestTransaction::snapshot_install_state(
-                &manifest_refs,
-                &[],
+                &required_refs,
+                &optional_refs,
                 &install_hash_refs,
             )?;
-            let result =
+            let mut result =
                 uninstall_selected_targets(&targets.member_manifests, packages, json_output)?;
+            result
+                .removed
+                .extend(uninstall_swift_packages(&swift_projects, packages)?);
+            result.removed.sort();
+            result.removed.dedup();
+            let removed = result
+                .removed
+                .iter()
+                .map(String::as_str)
+                .collect::<HashSet<_>>();
+            result
+                .not_found
+                .retain(|package| !removed.contains(package.as_str()));
             workspace_lockfile::commit_manifest_transaction(transaction);
             Ok(result)
         })

@@ -9,374 +9,282 @@ pub(super) struct SwiftInstallOptions<'a> {
     pub(super) session: Option<&'a lpm_auth::SessionManager>,
 }
 
-/// Install a Swift package via SE-0292 registry: edit Package.swift + resolve.
-pub(super) async fn run_swift_install(
+pub(super) struct SwiftInstallRequest<'a> {
+    pub(super) name: &'a lpm_common::PackageName,
+    pub(super) version: &'a str,
+    pub(super) ver_meta: &'a lpm_registry::VersionMetadata,
+    pub(super) requirement: crate::swift_manifest::SwiftRequirement,
+}
+
+struct PreparedSwiftInstall<'a> {
+    request: &'a SwiftInstallRequest<'a>,
+    se0292_id: String,
+    product: &'a lpm_registry::SwiftProduct,
+}
+
+fn prepare_swift_installs<'a>(
+    requests: &'a [SwiftInstallRequest<'a>],
+) -> Result<Vec<PreparedSwiftInstall<'a>>, LpmError> {
+    requests
+        .iter()
+        .map(|request| {
+            let product = request.ver_meta.swift_library_product().ok_or_else(|| {
+                LpmError::Registry(format!(
+                    "{}@{} does not publish a Swift library product",
+                    request.name.scoped(),
+                    request.version
+                ))
+            })?;
+            if product.targets.is_empty() {
+                return Err(LpmError::Registry(format!(
+                    "Swift library product '{}' for {}@{} does not declare an importable module",
+                    product.name,
+                    request.name.scoped(),
+                    request.version
+                )));
+            }
+            Ok(PreparedSwiftInstall {
+                request,
+                se0292_id: crate::swift_manifest::lpm_to_se0292_id(request.name),
+                product,
+            })
+        })
+        .collect()
+}
+
+pub(super) async fn run_swift_install_batch(
     project_dir: &Path,
-    name: &lpm_common::PackageName,
-    version: &str,
-    ver_meta: &lpm_registry::VersionMetadata,
+    requests: &[SwiftInstallRequest<'_>],
     options: SwiftInstallOptions<'_>,
-) -> Result<(), LpmError> {
-    use crate::swift_manifest;
-    use crate::xcode_project;
-
-    let se0292_id = swift_manifest::lpm_to_se0292_id(name);
-    let product_name = ver_meta.swift_product_name().unwrap_or_else(|| &name.name);
-
-    // Detect project type: SPM (Package.swift) vs Xcode (.xcodeproj)
-    let manifest_path = swift_manifest::find_package_swift(project_dir);
-    let xcodeproj_path = xcode_project::find_xcodeproj(project_dir);
-
+) -> Result<serde_json::Value, LpmError> {
+    if requests.is_empty() {
+        return Ok(serde_json::json!({"packages": []}));
+    }
+    let manifest_path = crate::swift_manifest::find_package_swift(project_dir);
+    let xcodeproj_path = crate::xcode_project::find_xcodeproj(project_dir)?;
     match (manifest_path, xcodeproj_path) {
-        // Both exist or only SPM → use existing SPM flow
         (Some(manifest), _) => {
-            run_swift_install_spm(
-                project_dir,
-                &manifest,
-                name,
-                version,
-                ver_meta,
-                &se0292_id,
-                product_name,
-                options,
-            )
-            .await
+            run_swift_install_spm_batch(project_dir, &manifest, requests, options).await
         }
-        // Only Xcode project → new Xcode wrapper flow
         (None, Some(xcodeproj)) => {
-            run_swift_install_xcode(
-                project_dir,
-                &xcodeproj,
-                name,
-                version,
-                ver_meta,
-                &se0292_id,
-                product_name,
-                options,
-            )
-            .await
+            run_swift_install_xcode_batch(project_dir, &xcodeproj, requests, options).await
         }
-        // Neither
         (None, None) => Err(LpmError::Registry(
             "No Package.swift or .xcodeproj found. Initialize a Swift project first.".into(),
         )),
     }
 }
 
-/// Install a Swift package into an SPM project.
-#[allow(clippy::too_many_arguments)]
-pub(super) async fn run_swift_install_spm(
+pub(super) async fn run_swift_install_spm_batch(
     project_dir: &Path,
     manifest_path: &Path,
-    name: &lpm_common::PackageName,
-    version: &str,
-    ver_meta: &lpm_registry::VersionMetadata,
-    se0292_id: &str,
-    product_name: &str,
+    requests: &[SwiftInstallRequest<'_>],
     options: SwiftInstallOptions<'_>,
-) -> Result<(), LpmError> {
-    use crate::swift_manifest;
-
-    let SwiftInstallOptions {
-        yes,
-        json_output,
-        audit_after_install,
-        registry_url,
-        session,
-    } = options;
-
+) -> Result<serde_json::Value, LpmError> {
+    let prepared = prepare_swift_installs(requests)?;
     let manifest_dir = manifest_path.parent().unwrap_or(project_dir);
+    let targets = crate::swift_manifest::get_spm_targets(manifest_dir)?;
+    let target_name = select_spm_target(&targets, options.yes)?;
+    let dependencies = prepared
+        .iter()
+        .map(|package| crate::swift_manifest::RegistryDependency {
+            se0292_id: &package.se0292_id,
+            requirement: package.request.requirement.clone(),
+            product_name: &package.product.name,
+            module_names: &package.product.targets,
+        })
+        .collect::<Vec<_>>();
+    let edits = crate::swift_manifest::reconcile_registry_dependencies(
+        manifest_path,
+        &target_name,
+        &dependencies,
+    )?;
+    finish_swift_batch(manifest_dir, &prepared, &edits, &target_name, None, options).await
+}
 
-    if !json_output {
-        output::info_line(crate::install_ui::terminal_line!(
-            "Installing {} via SE-0292 registry → {}",
-            install_ui::bold(&name.scoped()),
-            install_ui::dim(se0292_id),
-        ));
-    }
-
-    // Detect targets
-    let targets = swift_manifest::get_spm_targets(manifest_dir).unwrap_or_default();
-    let target_name = match targets.as_slice() {
-        [] => {
-            return Err(LpmError::Registry(
-                "No non-test targets found in Package.swift.".into(),
-            ));
-        }
-        [target] => target.clone(),
-        [first, ..] if yes => first.clone(),
+fn select_spm_target(targets: &[String], yes: bool) -> Result<String, LpmError> {
+    match targets {
+        [] => Err(LpmError::Registry(
+            "No non-test targets found in Package.swift (binary and system targets cannot consume package products).".into(),
+        )),
+        [target] => Ok(target.clone()),
+        [first, ..] if yes => Ok(first.clone()),
         _ => {
-            let mut sel = cliclack::select("Which target should use this dependency?");
-            for (i, target) in targets.iter().enumerate() {
-                sel = sel.item(
+            let mut selection = cliclack::select("Which target should use this dependency?");
+            for (index, target) in targets.iter().enumerate() {
+                selection = selection.item(
                     target.clone(),
                     lpm_common::sanitize_terminal_inline(target).into_owned(),
                     "",
                 );
-                if i == 0 {
-                    sel = sel.initial_value(target.clone());
+                if index == 0 {
+                    selection = selection.initial_value(target.clone());
                 }
             }
-            sel.interact()
-                .map_err(|e| LpmError::Registry(format!("prompt failed: {e}")))?
+            selection
+                .interact()
+                .map_err(|error| LpmError::Registry(format!("prompt failed: {error}")))
         }
-    };
-
-    // Edit Package.swift
-    let edit = swift_manifest::add_registry_dependency(
-        manifest_path,
-        se0292_id,
-        version,
-        product_name,
-        &target_name,
-    )?;
-
-    if edit.already_exists {
-        if !json_output {
-            output::info_line(crate::install_ui::terminal_line!(
-                "{} is already in Package.swift",
-                install_ui::dim(se0292_id)
-            ));
-        }
-    } else if !json_output {
-        output::success_line(crate::install_ui::terminal_line!(
-            "Added .package(id: \"{}\", from: \"{}\")",
-            se0292_id,
-            version
-        ));
-        output::success_line(crate::install_ui::terminal_line!(
-            "Added .product(name: \"{}\") to target {}",
-            product_name,
-            install_ui::bold(&target_name)
-        ));
     }
-
-    // Resolve
-    let registry_setup = if !edit.already_exists {
-        // Auto-configure registry scope if needed
-        let setup = crate::commands::swift_registry::ensure_configured(
-            session,
-            registry_url,
-            manifest_dir,
-            json_output,
-        )
-        .await?;
-
-        if !json_output {
-            output::info("Resolving Swift packages...");
-        }
-        swift_manifest::run_swift_resolve(manifest_dir)?;
-        Some(setup)
-    } else {
-        None
-    };
-
-    let audit_summary = audit_after_install.then(|| {
-        crate::commands::audit::summarize_registry_install(&name.scoped(), version, ver_meta)
-    });
-
-    // Output
-    if json_output {
-        let mut json = serde_json::json!({
-            "package": name.scoped(),
-            "version": version,
-            "mode": "registry",
-            "se0292_id": se0292_id,
-            "product_name": product_name,
-            "target": target_name,
-            "already_existed": edit.already_exists,
-        });
-        if let Some(setup) = registry_setup {
-            json["registry_setup"] = setup.to_json();
-        }
-        if let Some(summary) = &audit_summary {
-            json["audit_summary"] =
-                serde_json::to_value(summary).unwrap_or(serde_json::Value::Null);
-        }
-        println!("{}", serde_json::to_string_pretty(&json).unwrap());
-    } else if !edit.already_exists {
-        println!();
-        output::success_line(crate::install_ui::terminal_line!(
-            "Installed {}@{} via SE-0292 registry",
-            install_ui::bold(&name.scoped()),
-            version,
-        ));
-        println!(
-            "  import {} // in your Swift code",
-            install_ui::bold(product_name)
-        );
-    }
-
-    // Security check
-    if ver_meta.has_security_issues() && !json_output {
-        crate::commands::add::print_install_security_warnings(&name.scoped(), version, ver_meta);
-    }
-    if !json_output && let Some(summary) = &audit_summary {
-        crate::commands::audit::print_install_summary(summary, false);
-    }
-
-    if !json_output && !edit.already_exists {
-        println!();
-    }
-
-    Ok(())
 }
 
-/// Install a Swift package into an Xcode app project via local wrapper package.
-#[allow(clippy::too_many_arguments)]
-pub(super) async fn run_swift_install_xcode(
+pub(super) async fn run_swift_install_xcode_batch(
     project_dir: &Path,
     xcodeproj_path: &Path,
-    name: &lpm_common::PackageName,
-    version: &str,
-    ver_meta: &lpm_registry::VersionMetadata,
-    se0292_id: &str,
-    product_name: &str,
+    requests: &[SwiftInstallRequest<'_>],
     options: SwiftInstallOptions<'_>,
-) -> Result<(), LpmError> {
-    use crate::swift_manifest;
-    use crate::xcode_project;
-
-    let SwiftInstallOptions {
-        json_output,
-        audit_after_install,
-        registry_url,
-        session,
-        ..
-    } = options;
-
-    // Resolve the project root (xcodeproj's parent)
+) -> Result<serde_json::Value, LpmError> {
+    let prepared = prepare_swift_installs(requests)?;
     let project_root = xcodeproj_path.parent().unwrap_or(project_dir);
-
-    if !json_output {
-        output::info_line(crate::install_ui::terminal_line!(
-            "Installing {} via SE-0292 registry → {} (Xcode project)",
-            install_ui::bold(&name.scoped()),
-            install_ui::dim(se0292_id),
-        ));
-    }
-
-    // Step 1: Ensure LPMDependencies wrapper package exists
-    let wrapper = swift_manifest::ensure_wrapper_package(project_root)?;
-    if wrapper.created && !json_output {
-        output::success("Created Packages/LPMDependencies/ wrapper package");
-    }
-
-    // Step 2: Add the registry dependency to the wrapper Package.swift
-    let edit = swift_manifest::add_wrapper_dependency(
+    let wrapper = crate::swift_manifest::ensure_wrapper_package(project_root)?;
+    let dependencies = prepared
+        .iter()
+        .map(|package| crate::swift_manifest::RegistryDependency {
+            se0292_id: &package.se0292_id,
+            requirement: package.request.requirement.clone(),
+            product_name: &package.product.name,
+            module_names: &package.product.targets,
+        })
+        .collect::<Vec<_>>();
+    let edits = crate::swift_manifest::reconcile_wrapper_dependencies(
         &wrapper.manifest_path,
-        se0292_id,
-        version,
-        product_name,
+        &dependencies,
     )?;
-
-    if edit.already_exists {
-        if !json_output {
-            output::info_line(crate::install_ui::terminal_line!(
-                "{} is already installed",
-                install_ui::dim(se0292_id)
-            ));
-        }
-    } else if !json_output {
-        output::success_line(crate::install_ui::terminal_line!(
-            "Added .package(id: \"{}\", from: \"{}\")",
-            se0292_id,
-            version,
-        ));
-    }
-
-    // Step 3: Link to Xcode project (pbxproj editing — first install only)
-    let link_result = xcode_project::link_local_package(
+    let link_result = crate::xcode_project::link_local_package(
         xcodeproj_path,
-        swift_manifest::LPM_DEPS_PACKAGE_NAME,
-        swift_manifest::LPM_DEPS_REL_PATH,
+        crate::swift_manifest::LPM_DEPS_PACKAGE_NAME,
+        crate::swift_manifest::LPM_DEPS_REL_PATH,
     )?;
-
-    if link_result.package_ref_added && !json_output {
-        output::success_line(crate::install_ui::terminal_line!(
-            "Linked LPMDependencies to Xcode target {}",
-            install_ui::bold(&link_result.target_name),
-        ));
+    let wrapper_dir = wrapper.manifest_path.parent().unwrap_or(project_root);
+    let report = finish_swift_batch(
+        wrapper_dir,
+        &prepared,
+        &edits,
+        &link_result.target_name,
+        Some(&link_result),
+        options,
+    )
+    .await?;
+    if link_result.package_ref_added && !options.json_output {
+        output::warn("If Xcode is open, close and reopen the project to pick up changes.");
     }
+    Ok(report)
+}
 
-    // Step 4: Resolve Swift packages
-    let registry_setup = if !edit.already_exists {
-        // Auto-configure registry scope if needed
-        let wrapper_dir = wrapper.manifest_path.parent().unwrap_or(project_root);
+async fn finish_swift_batch(
+    resolve_dir: &Path,
+    packages: &[PreparedSwiftInstall<'_>],
+    edits: &[crate::swift_manifest::ManifestEdit],
+    target_name: &str,
+    xcode_link: Option<&crate::xcode_project::XcodeLinkResult>,
+    options: SwiftInstallOptions<'_>,
+) -> Result<serde_json::Value, LpmError> {
+    let changed = edits.iter().any(|edit| !edit.already_exists)
+        || xcode_link.is_some_and(|link| link.package_ref_added);
+    let registry_setup = if changed {
         let setup = crate::commands::swift_registry::ensure_configured(
-            session,
-            registry_url,
-            wrapper_dir,
-            json_output,
+            options.session,
+            options.registry_url,
+            resolve_dir,
+            options.json_output,
         )
         .await?;
-
-        if !json_output {
+        if !options.json_output {
             output::info("Resolving Swift packages...");
         }
-        swift_manifest::run_swift_resolve(wrapper_dir)?;
+        crate::swift_manifest::run_swift_resolve(resolve_dir)?;
         Some(setup)
     } else {
         None
     };
 
-    let audit_summary = audit_after_install.then(|| {
-        crate::commands::audit::summarize_registry_install(&name.scoped(), version, ver_meta)
-    });
+    let package_reports = packages
+        .iter()
+        .zip(edits)
+        .map(|(package, edit)| {
+            let audit_summary = options.audit_after_install.then(|| {
+                crate::commands::audit::summarize_registry_install(
+                    &package.request.name.scoped(),
+                    package.request.version,
+                    package.request.ver_meta,
+                )
+            });
+            let mut report = serde_json::json!({
+                "package": package.request.name.scoped(),
+                "version": package.request.version,
+                "mode": "registry",
+                "se0292_id": package.se0292_id,
+                "product_name": package.product.name,
+                "modules": package.product.targets,
+                "target": target_name,
+                "already_existed": edit.already_exists,
+            });
+            if let Some(summary) = audit_summary {
+                report["audit_summary"] =
+                    serde_json::to_value(summary).unwrap_or(serde_json::Value::Null);
+            }
+            report
+        })
+        .collect::<Vec<_>>();
 
-    // Step 5: Output
-    if json_output {
-        let mut json = serde_json::json!({
-            "package": name.scoped(),
-            "version": version,
+    if !options.json_output {
+        for (package, edit) in packages.iter().zip(edits) {
+            if edit.already_exists {
+                output::info_line(crate::install_ui::terminal_line!(
+                    "{} is already installed",
+                    install_ui::dim(&package.se0292_id)
+                ));
+                continue;
+            }
+            output::success_line(crate::install_ui::terminal_line!(
+                "Installed {}@{} via SE-0292 registry",
+                install_ui::bold(&package.request.name.scoped()),
+                package.request.version,
+            ));
+            output::success_line(crate::install_ui::terminal_line!(
+                "Added {} to target {}",
+                install_ui::bold(&package.product.name),
+                install_ui::bold(target_name),
+            ));
+            for module in &package.product.targets {
+                println!("  import {}", install_ui::bold(module));
+            }
+            if package.request.ver_meta.has_security_issues() {
+                crate::commands::add::print_install_security_warnings(
+                    &package.request.name.scoped(),
+                    package.request.version,
+                    package.request.ver_meta,
+                );
+            }
+            if options.audit_after_install {
+                let summary = crate::commands::audit::summarize_registry_install(
+                    &package.request.name.scoped(),
+                    package.request.version,
+                    package.request.ver_meta,
+                );
+                crate::commands::audit::print_install_summary(&summary, false);
+            }
+        }
+    }
+
+    let mut report = if package_reports.len() == 1 {
+        package_reports[0].clone()
+    } else {
+        serde_json::json!({
+            "success": true,
             "mode": "registry",
-            "project_type": "xcode",
-            "se0292_id": se0292_id,
-            "product_name": product_name,
-            "wrapper_package": "Packages/LPMDependencies",
-            "xcode_target": link_result.target_name,
-            "already_existed": edit.already_exists,
-        });
-        if let Some(setup) = registry_setup {
-            json["registry_setup"] = setup.to_json();
-        }
-        if let Some(summary) = &audit_summary {
-            json["audit_summary"] =
-                serde_json::to_value(summary).unwrap_or(serde_json::Value::Null);
-        }
-        println!("{}", serde_json::to_string_pretty(&json).unwrap());
-    } else if !edit.already_exists {
-        println!();
-        output::success_line(crate::install_ui::terminal_line!(
-            "Installed {}@{} via SE-0292 registry",
-            install_ui::bold(&name.scoped()),
-            version,
-        ));
-        println!(
-            "  import {} // in your Swift code",
-            install_ui::bold(product_name)
-        );
+        })
+    };
+    report["packages"] = serde_json::Value::Array(package_reports);
+    if let Some(setup) = registry_setup {
+        report["registry_setup"] = setup.to_json();
     }
-
-    // Security check
-    if ver_meta.has_security_issues() && !json_output {
-        crate::commands::add::print_install_security_warnings(&name.scoped(), version, ver_meta);
+    if let Some(link) = xcode_link {
+        report["project_type"] = serde_json::json!("xcode");
+        report["wrapper_package"] = serde_json::json!("Packages/LPMDependencies");
+        report["xcode_target"] = serde_json::json!(link.target_name);
     }
-    if !json_output && let Some(summary) = &audit_summary {
-        crate::commands::audit::print_install_summary(summary, false);
-    }
-
-    // Xcode warning (first link only)
-    if link_result.package_ref_added && !json_output {
-        println!();
-        output::warn("If Xcode is open, close and reopen the project to pick up changes.");
-    }
-
-    if !json_output && !edit.already_exists {
-        println!();
-    }
-
-    Ok(())
+    Ok(report)
 }
 
 // the legacy `parse_package_spec` was deleted. Its replacement
@@ -401,6 +309,45 @@ pub(super) fn intent_to_range_string(intent: &crate::save_spec::UserSaveIntent) 
         | UserSaveIntent::DistTag(s)
         | UserSaveIntent::Workspace(s) => s.clone(),
     }
+}
+
+pub(super) fn swift_requirement_from_intent(
+    intent: &crate::save_spec::UserSaveIntent,
+    resolved_version: &str,
+    save_flags: crate::save_spec::SaveFlags,
+) -> Result<crate::swift_manifest::SwiftRequirement, LpmError> {
+    use crate::save_spec::{SavePrefix, UserSaveIntent};
+    use crate::swift_manifest::SwiftRequirement;
+
+    let parsed = lpm_semver::Version::parse(resolved_version)?;
+    let exact = matches!(intent, UserSaveIntent::Exact(_))
+        || (!matches!(intent, UserSaveIntent::Range(_) | UserSaveIntent::Wildcard)
+            && (save_flags.exact
+                || save_flags.save_prefix == Some(SavePrefix::Empty)
+                || parsed.is_prerelease()));
+    if exact {
+        return Ok(SwiftRequirement::Exact(resolved_version.to_string()));
+    }
+
+    let tilde = matches!(intent, UserSaveIntent::Range(range) if range.starts_with('~'))
+        || (!matches!(intent, UserSaveIntent::Range(_) | UserSaveIntent::Wildcard)
+            && (save_flags.tilde || save_flags.save_prefix == Some(SavePrefix::Tilde)));
+    if tilde {
+        return Ok(SwiftRequirement::UpToNextMinor {
+            lower: resolved_version.to_string(),
+            upper: format!("{}.{}.0", parsed.major(), parsed.minor().saturating_add(1)),
+        });
+    }
+
+    if matches!(intent, UserSaveIntent::Range(range) if !range.starts_with('^'))
+        || matches!(intent, UserSaveIntent::Wildcard)
+    {
+        return Ok(SwiftRequirement::Exact(resolved_version.to_string()));
+    }
+
+    Ok(SwiftRequirement::UpToNextMajor(
+        resolved_version.to_string(),
+    ))
 }
 
 /// Resolve the user-specified version range against a package's available versions.
@@ -456,5 +403,57 @@ pub(super) fn resolve_version_from_spec<'a>(
                 .collect::<Vec<_>>()
                 .join(", ")
         ))),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::save_spec::{SaveFlags, SavePrefix, UserSaveIntent};
+    use crate::swift_manifest::SwiftRequirement;
+
+    #[test]
+    fn explicit_swift_version_uses_an_exact_requirement() {
+        let requirement = swift_requirement_from_intent(
+            &UserSaveIntent::Exact("1.2.3".into()),
+            "1.2.3",
+            SaveFlags::default(),
+        )
+        .unwrap();
+
+        assert_eq!(requirement, SwiftRequirement::Exact("1.2.3".into()));
+    }
+
+    #[test]
+    fn swift_tilde_flag_uses_a_next_minor_requirement() {
+        let requirement = swift_requirement_from_intent(
+            &UserSaveIntent::Bare,
+            "1.2.3",
+            SaveFlags {
+                save_prefix: Some(SavePrefix::Tilde),
+                ..SaveFlags::default()
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            requirement,
+            SwiftRequirement::UpToNextMinor {
+                lower: "1.2.3".into(),
+                upper: "1.3.0".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn swift_prerelease_dist_tag_is_pinned_exactly() {
+        let requirement = swift_requirement_from_intent(
+            &UserSaveIntent::DistTag("beta".into()),
+            "2.0.0-beta.1",
+            SaveFlags::default(),
+        )
+        .unwrap();
+
+        assert_eq!(requirement, SwiftRequirement::Exact("2.0.0-beta.1".into()));
     }
 }

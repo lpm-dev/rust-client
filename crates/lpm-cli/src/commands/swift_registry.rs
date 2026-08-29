@@ -4,6 +4,12 @@ use lpm_common::LpmError;
 use std::path::Path;
 use x509_parser::prelude::{FromDer, X509Certificate};
 
+fn swift_command() -> tokio::process::Command {
+    let mut command = tokio::process::Command::new("swift");
+    crate::swift_manifest::sanitize_swift_environment(command.as_std_mut());
+    command
+}
+
 async fn resolve_lpm_bearer_optional(
     session: &lpm_auth::SessionManager,
 ) -> Result<Option<String>, LpmError> {
@@ -69,7 +75,7 @@ async fn run_swift_login(
         ))
     })?;
 
-    let mut command = tokio::process::Command::new("swift");
+    let mut command = swift_command();
     command
         .args([
             "package-registry",
@@ -256,14 +262,14 @@ pub async fn run(
     // When json_output is true, suppress subprocess stdout/stderr
     // to avoid interleaving with our JSON output.
     let step1_result = if json_output {
-        tokio::process::Command::new("swift")
+        swift_command()
             .args(&args)
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::piped())
             .status()
             .await
     } else {
-        tokio::process::Command::new("swift")
+        swift_command()
             .args(&args)
             .stdout(std::process::Stdio::inherit())
             .stderr(std::process::Stdio::inherit())
@@ -465,7 +471,7 @@ pub async fn ensure_configured(
         }
         args.push(swift_registry_url.clone());
 
-        let status = tokio::process::Command::new("swift")
+        let status = swift_command()
             .args(&args)
             .current_dir(package_dir)
             .stdout(std::process::Stdio::null())
@@ -687,9 +693,8 @@ async fn install_signing_certificate(
 ///
 /// Two distinct concerns this function addresses:
 ///
-/// 1. The registries.json `security.default.signing` defaults so SPM has a
-///    base policy (warn on unsigned, warn on untrusted-cert) rather than the
-///    SPM default of strict.
+/// 1. The registries.json `security.default.signing` defaults stay strict for
+///    every registry. LPM never weakens unrelated registry scopes.
 /// 2. A scope override pinning `lpmdev` to `onUntrustedCertificate = "silentAllow"`.
 ///    LPM's signing cert is a self-signed, non-CA, code-signing-only cert; SPM
 ///    rejects it as a trust root because trust roots must have
@@ -810,10 +815,7 @@ fn ensure_json_object(
 }
 
 fn default_signing_policy_is_secure(value: Option<&serde_json::Value>) -> bool {
-    matches!(
-        value.and_then(serde_json::Value::as_str),
-        Some("warn" | "error")
-    )
+    value.and_then(serde_json::Value::as_str) == Some("error")
 }
 
 fn repair_default_signing_policy(
@@ -823,7 +825,7 @@ fn repair_default_signing_policy(
     if !default_signing_policy_is_secure(signing.get(key)) {
         signing.insert(
             key.to_string(),
-            serde_json::Value::String("warn".to_string()),
+            serde_json::Value::String("error".to_string()),
         );
     }
 }
@@ -977,8 +979,8 @@ mod tests {
             "security": {
                 "default": {
                     "signing": {
-                        "onUnsigned": "warn",
-                        "onUntrustedCertificate": "warn"
+                        "onUnsigned": "error",
+                        "onUntrustedCertificate": "error"
                     }
                 },
                 "scopeOverrides": {
@@ -1027,10 +1029,10 @@ if [ "$1" = "package-registry" ] && [ "$2" = "set" ]; then
 fi
 if [ "$1" = "package-registry" ] && [ "$2" = "login" ]; then
   shift 2
-  if [ -n "$LPM_TEST_SWIFT_LOGIN_OUTPUT_MODES" ]; then
+  if [ -e "$HOME/swift-login-output-modes" ]; then
     if [ /dev/fd/1 -ef /dev/null ]; then stdout_mode="null"; else stdout_mode="live"; fi
     if [ /dev/fd/2 -ef /dev/null ]; then stderr_mode="null"; else stderr_mode="live"; fi
-    printf '%s/%s\n' "$stdout_mode" "$stderr_mode" >> "$LPM_TEST_SWIFT_LOGIN_OUTPUT_MODES"
+    printf '%s/%s\n' "$stdout_mode" "$stderr_mode" >> "$HOME/swift-login-output-modes"
   fi
   token=""
   while [ "$#" -gt 0 ]; do
@@ -1046,8 +1048,8 @@ if [ "$1" = "package-registry" ] && [ "$2" = "login" ]; then
     fi
     shift
   done
-  printf '%s\n' "$token" >> "$LPM_TEST_SWIFT_LOGIN_TOKENS"
-  if [ "$token" = "$LPM_TEST_SWIFT_REJECT_TOKEN" ]; then
+  printf '%s\n' "$token" >> "$HOME/swift-login-tokens"
+  if [ "$token" = "rejected-access" ]; then
     exit 1
   fi
   exit 0
@@ -1137,6 +1139,7 @@ exit 64
         let home = TempDir::new().expect("create isolated home");
         let login_tokens = home.path().join("swift-login-tokens");
         let output_modes = home.path().join("swift-login-output-modes");
+        fs::write(&output_modes, []).expect("create Swift login output mode log");
         let path = fake_swift_path(home.path());
         let _environment = crate::test_env::ScopedEnv::update([
             ("HOME", Some(home.path().as_os_str().to_owned())),
@@ -1478,7 +1481,7 @@ exit 64
             .as_object_mut()
             .unwrap()
             .entry("onUnsigned")
-            .or_insert_with(|| serde_json::Value::String("warn".into()));
+            .or_insert_with(|| serde_json::Value::String("error".into()));
 
         let scope_overrides = security
             .as_object_mut()
@@ -1510,7 +1513,7 @@ exit 64
         // Default signing policy added
         assert_eq!(
             config["security"]["default"]["signing"]["onUnsigned"].as_str(),
-            Some("warn")
+            Some("error")
         );
 
         // Scope override for lpmdev added
@@ -1932,7 +1935,7 @@ exit 64
         assert!(signing_trust_is_valid(&repaired));
         assert_eq!(
             repaired["security"]["default"]["signing"]["onUnsigned"],
-            "warn"
+            "error"
         );
     }
 
