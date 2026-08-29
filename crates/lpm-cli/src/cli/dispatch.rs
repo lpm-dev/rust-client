@@ -1808,25 +1808,8 @@ async fn async_main() -> Result<()> {
         }
         Commands::Security(args) => commands::security::run(&args.action, cli.json).await,
         Commands::Cache(args) => {
-            let lifecycle_args::CacheArgs {
-                action,
-                subcategory,
-                apply,
-                max_age,
-                project,
-            } = args;
-            commands::cache::run(
-                &action,
-                subcategory.as_deref(),
-                cli.json,
-                commands::cache::PruneFlags {
-                    apply,
-                    max_age: max_age.as_deref(),
-                    project: project.as_deref(),
-                },
-                client.session().cloned(),
-            )
-            .await
+            let lifecycle_args::CacheArgs { action } = args;
+            commands::cache::run(action, cli.json, client.session().cloned()).await
         }
         Commands::Store(args) => {
             let lifecycle_args::StoreArgs { action } = args;

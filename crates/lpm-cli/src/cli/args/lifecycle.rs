@@ -696,29 +696,8 @@ pub(crate) struct InitArgs {
 
 #[derive(Args)]
 pub(crate) struct CacheArgs {
-    /// Action: clean, path, status, prune.
-    pub(crate) action: String,
-
-    /// Optional subcategory: metadata, tasks, dlx, or mcp.
-    /// When omitted, `clean` clears all four and `path` prints the
-    /// cache root. Ignored by `prune`.
-    pub(crate) subcategory: Option<String>,
-
-    /// `prune` only: actually remove orphan entries and sweep
-    /// pending global-install tombstones. Default is dry-run.
-    #[arg(long)]
-    pub(crate) apply: bool,
-
-    /// `prune` only: filter to entries whose `last_referenced_at`
-    /// is older than this duration (`30d`, `24h`, etc.).
-    #[arg(long)]
-    pub(crate) max_age: Option<String>,
-
-    /// `prune` only: manual repair mode. Walk only this project's
-    /// `node_modules/` to collect roots; ignore the registry. Use
-    /// when the registry is corrupt or after a machine restore.
-    #[arg(long, value_name = "PATH")]
-    pub(crate) project: Option<String>,
+    #[command(subcommand)]
+    pub(crate) action: crate::commands::cache::CacheCmd,
 }
 
 #[derive(Args)]

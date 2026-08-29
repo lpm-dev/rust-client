@@ -525,14 +525,14 @@ impl ProjectLockKind {
 
 struct CapabilityLockFileSource {
     directory: cap_std::fs::Dir,
-    data_name: &'static OsStr,
+    data_name: OsString,
     display_path: PathBuf,
 }
 
 impl CapabilityLockFileSource {
     fn new(directory: ProjectLockDirectory, kind: ProjectLockKind) -> Self {
-        let data_name = kind.file_name();
-        let display_path = directory.display.join(data_name);
+        let data_name = kind.file_name().to_os_string();
+        let display_path = directory.display.join(&data_name);
         Self {
             directory: directory.directory,
             data_name,
@@ -540,11 +540,23 @@ impl CapabilityLockFileSource {
         }
     }
 
+    fn from_directory(
+        directory: &cap_std::fs::Dir,
+        display_directory: &Path,
+        data_name: &OsStr,
+    ) -> Result<Self, LpmError> {
+        Ok(Self {
+            directory: directory.try_clone().map_err(LpmError::Io)?,
+            data_name: data_name.to_os_string(),
+            display_path: display_directory.join(data_name),
+        })
+    }
+
     fn component_name(&self, component: LockFileComponent) -> OsString {
         match component {
-            LockFileComponent::Data => self.data_name.to_os_string(),
-            LockFileComponent::WriterIntent => derived_lock_name(self.data_name, "writer-intent"),
-            LockFileComponent::WriterQueue => derived_lock_name(self.data_name, "writer-queue"),
+            LockFileComponent::Data => self.data_name.clone(),
+            LockFileComponent::WriterIntent => derived_lock_name(&self.data_name, "writer-intent"),
+            LockFileComponent::WriterQueue => derived_lock_name(&self.data_name, "writer-queue"),
         }
     }
 }
@@ -1076,6 +1088,22 @@ where
     body()
 }
 
+/// Run `body` under a writer-preferred exclusive lock rooted at an open directory.
+/// Lock components are opened without following final-component links.
+pub fn with_capability_exclusive_lock<F, R>(
+    directory: &cap_std::fs::Dir,
+    display_directory: &Path,
+    lock_name: &OsStr,
+    body: F,
+) -> Result<R, LpmError>
+where
+    F: FnOnce() -> Result<R, LpmError>,
+{
+    let source = CapabilityLockFileSource::from_directory(directory, display_directory, lock_name)?;
+    let _handle = acquire_exclusive_from_source(&source, default_wait_hint)?;
+    body()
+}
+
 /// Acquire and return an exclusive advisory lock handle.
 ///
 /// The caller controls the critical-section lifetime by retaining the returned
@@ -1156,32 +1184,47 @@ pub fn try_acquire_single_file_exclusive_lock_from_file(
 pub fn try_acquire_exclusive_lock(
     lock_path: impl AsRef<Path>,
 ) -> Result<Option<ExclusiveLockHandle>, LpmError> {
-    let data_path = lock_path.as_ref();
-    let intent_path = writer_intent_path_for(data_path);
-    let queue_path = writer_queue_path_for(data_path);
+    let source = AmbientLockFileSource {
+        data_path: lock_path.as_ref(),
+    };
+    try_acquire_exclusive_from_source(&source)
+}
 
-    let queue_file = open_lock_file(&queue_path)?;
+/// Try to acquire a writer-preferred exclusive lock through an open directory.
+pub fn try_acquire_capability_exclusive_lock(
+    directory: &cap_std::fs::Dir,
+    display_directory: &Path,
+    lock_name: &OsStr,
+) -> Result<Option<ExclusiveLockHandle>, LpmError> {
+    let source = CapabilityLockFileSource::from_directory(directory, display_directory, lock_name)?;
+    try_acquire_exclusive_from_source(&source)
+}
+
+fn try_acquire_exclusive_from_source(
+    source: &impl LockFileSource,
+) -> Result<Option<ExclusiveLockHandle>, LpmError> {
+    let queue_file = source.open(LockFileComponent::WriterQueue)?;
     let mut queue_rw = fd_lock::RwLock::new(queue_file);
     if !try_acquire(&mut queue_rw, LockMode::Shared)? {
-        if let Some(callback) = test_lock_contention_callback(data_path) {
+        if let Some(callback) = test_lock_contention_callback(source.display_path()) {
             callback();
         }
         return Ok(None);
     }
 
-    let intent_file = open_lock_file(&intent_path)?;
+    let intent_file = source.open(LockFileComponent::WriterIntent)?;
     let mut intent_rw = fd_lock::RwLock::new(intent_file);
     if !try_acquire(&mut intent_rw, LockMode::Exclusive)? {
-        if let Some(callback) = test_lock_contention_callback(data_path) {
+        if let Some(callback) = test_lock_contention_callback(source.display_path()) {
             callback();
         }
         return Ok(None);
     }
 
-    let data_file = open_lock_file(data_path)?;
+    let data_file = source.open(LockFileComponent::Data)?;
     let mut data_rw = fd_lock::RwLock::new(data_file);
     if !try_acquire(&mut data_rw, LockMode::Exclusive)? {
-        if let Some(callback) = test_lock_contention_callback(data_path) {
+        if let Some(callback) = test_lock_contention_callback(source.display_path()) {
             callback();
         }
         return Ok(None);
