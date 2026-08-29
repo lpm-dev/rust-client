@@ -34,6 +34,19 @@ impl<'de> serde::Deserialize<'de> for ParseThread {
     }
 }
 
+#[test]
+fn metadata_response_cap_has_headroom_for_large_proxy_packuments() {
+    const LARGE_PROXY_PACKUMENT_BYTES: usize = 42 * 1024 * 1024;
+    const MINIMUM_GROWTH_HEADROOM_BYTES: usize = 16 * 1024 * 1024;
+
+    const {
+        assert!(
+            MAX_METADATA_BYTES >= LARGE_PROXY_PACKUMENT_BYTES + MINIMUM_GROWTH_HEADROOM_BYTES,
+            "metadata cap must accept a large proxy packument with growth headroom"
+        );
+    }
+}
+
 #[tokio::test]
 async fn parse_capped_metadata_rejects_declared_oversized_content_length() {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
