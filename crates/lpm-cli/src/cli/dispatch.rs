@@ -1344,15 +1344,6 @@ async fn async_main() -> Result<()> {
             let config = commands::config::GlobalConfig::load_checked()?;
             let no_skills = !lpm_skills_config::LpmSkillsPreference::from_cli(skills, no_skills)
                 .resolve(&config)?;
-            // engines.* preflight: run BEFORE add mutates package.json
-            // so a constraint violation can't leave the project
-            // half-modified. Skip in --dry-run since nothing is
-            // written. Tolerates the no-`package.json` directory by
-            // returning Ok early — that's the supported plain source
-            // copy flow.
-            if !dry_run {
-                engine_check::enforce(&cwd, no_engine_strict, cli.json)?;
-            }
             commands::add::run(
                 &client,
                 &cwd,

@@ -1,6 +1,8 @@
 use lpm_common::LpmError;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
+
+const RUNTIME_SOURCE_TEXT_SIZE_CAP_BYTES: u64 = 64 * 1024 * 1024;
 
 pub(super) fn is_runtime_source_text_file(path: &Path) -> bool {
     let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
@@ -17,6 +19,17 @@ pub(super) fn is_runtime_source_text_file(path: &Path) -> bool {
         path.extension().and_then(|e| e.to_str()).unwrap_or(""),
         "js" | "jsx" | "ts" | "tsx" | "mjs" | "cjs" | "mts" | "cts"
     )
+}
+
+pub(super) fn read_runtime_source_text(path: &Path) -> Result<Option<String>, LpmError> {
+    if !is_runtime_source_text_file(path) {
+        return Ok(None);
+    }
+    match lpm_common::read_text_file_capped(path, RUNTIME_SOURCE_TEXT_SIZE_CAP_BYTES) {
+        Ok(content) => Ok(Some(content)),
+        Err(lpm_common::BoundedReadError::InvalidUtf8 { .. }) => Ok(None),
+        Err(error) => Err(error.into()),
+    }
 }
 
 /// Read lpm.config.json from extracted package.
@@ -286,11 +299,6 @@ pub(super) fn filter_config_files(
     Ok(result)
 }
 
-struct IndexedSourceFile {
-    absolute: PathBuf,
-    logical: String,
-}
-
 fn normalize_logical_path(path: &str) -> String {
     path.replace('\\', "/")
 }
@@ -317,11 +325,11 @@ fn validate_source_selector(pattern: &str) -> Result<(), LpmError> {
     Ok(())
 }
 
-fn index_source_files(extract_dir: &Path) -> Result<Vec<IndexedSourceFile>, LpmError> {
+fn index_source_files(extract_dir: &Path) -> Result<BTreeMap<String, PathBuf>, LpmError> {
     fn visit(
         extract_dir: &Path,
         dir: &Path,
-        files: &mut Vec<IndexedSourceFile>,
+        files: &mut BTreeMap<String, PathBuf>,
     ) -> Result<(), LpmError> {
         let mut entries = std::fs::read_dir(dir)?.collect::<Result<Vec<_>, _>>()?;
         entries.sort_unstable_by_key(std::fs::DirEntry::file_name);
@@ -337,38 +345,34 @@ fn index_source_files(extract_dir: &Path) -> Result<Vec<IndexedSourceFile>, LpmE
                 && let Ok(relative) = path.strip_prefix(extract_dir)
             {
                 let logical = normalize_logical_path(&relative.to_string_lossy());
-                files.push(IndexedSourceFile {
-                    absolute: path,
-                    logical,
-                });
+                files.insert(logical, path);
             }
         }
         Ok(())
     }
 
-    let mut files = Vec::new();
+    let mut files = BTreeMap::new();
     visit(extract_dir, extract_dir, &mut files)?;
     Ok(files)
 }
 
 fn expand_src_pattern<'a>(
-    files: &'a [IndexedSourceFile],
+    files: &'a BTreeMap<String, PathBuf>,
     pattern: &str,
 ) -> Vec<(&'a Path, String)> {
     if !pattern.contains('*') {
         return files
-            .iter()
-            .filter(|file| file.logical == pattern)
-            .map(|file| (file.absolute.as_path(), file.logical.clone()))
-            .collect();
+            .get_key_value(pattern)
+            .map(|(logical, absolute)| vec![(absolute.as_path(), logical.clone())])
+            .unwrap_or_default();
     }
 
     if let Some(base) = pattern.strip_suffix("/**") {
         let prefix = format!("{}/", base.trim_end_matches('/'));
         return files
-            .iter()
-            .filter(|file| file.logical.starts_with(&prefix))
-            .map(|file| (file.absolute.as_path(), file.logical.clone()))
+            .range(prefix.clone()..)
+            .take_while(|(logical, _)| logical.starts_with(&prefix))
+            .map(|(logical, absolute)| (absolute.as_path(), logical.clone()))
             .collect();
     }
 
@@ -380,16 +384,19 @@ fn expand_src_pattern<'a>(
     };
 
     if file_part.contains('*') {
+        let prefix = if dir_part == "." {
+            String::new()
+        } else {
+            format!("{dir_part}/")
+        };
         return files
-            .iter()
-            .filter(|file| {
-                let (file_dir, name) = file
-                    .logical
-                    .rsplit_once('/')
-                    .map_or((".", file.logical.as_str()), |(dir, name)| (dir, name));
-                file_dir == dir_part && glob_simple_match(file_part, name)
+            .range(prefix.clone()..)
+            .take_while(|(logical, _)| prefix.is_empty() || logical.starts_with(&prefix))
+            .filter(|(logical, _)| {
+                let name = logical.strip_prefix(&prefix).unwrap_or(logical);
+                !name.contains('/') && glob_simple_match(file_part, name)
             })
-            .map(|file| (file.absolute.as_path(), file.logical.clone()))
+            .map(|(logical, absolute)| (absolute.as_path(), logical.clone()))
             .collect();
     }
 
@@ -431,16 +438,15 @@ fn glob_simple_match(pattern: &str, name: &str) -> bool {
 pub(super) fn collect_source_with_fallback(
     extract_dir: &Path,
 ) -> Result<Vec<(String, String)>, LpmError> {
-    // Check package.json for lpm.source field (legacy packages)
     let pkg_json_path = extract_dir.join("package.json");
     if let Ok(content) =
         lpm_common::read_text_file_capped(&pkg_json_path, lpm_common::CONFIG_FILE_SIZE_CAP_BYTES)
         && let Ok(doc) = serde_json::from_str::<serde_json::Value>(&content)
-        && let Some(source_dir) = doc
-            .get("lpm")
-            .and_then(|l| l.get("source"))
-            .and_then(|s| s.as_str())
+        && let Some(source) = doc.get("lpm").and_then(|lpm| lpm.get("source"))
     {
+        let source_dir = source.as_str().ok_or_else(|| {
+            LpmError::Registry("package.json lpm.source must be a string".to_string())
+        })?;
         validate_source_selector(source_dir)?;
         let source_path = extract_dir.join(source_dir);
         let source_path = source_path.canonicalize().map_err(|error| {
@@ -455,10 +461,8 @@ pub(super) fn collect_source_with_fallback(
         if source_path.is_dir() {
             let mut files = Vec::new();
             collect_dir_no_skip(&source_path, &extract_canonical, &source_path, &mut files)?;
-            if !files.is_empty() {
-                files.sort_unstable_by(|left, right| left.0.cmp(&right.0));
-                return Ok(files);
-            }
+            files.sort_unstable_by(|left, right| left.0.cmp(&right.0));
+            return Ok(files);
         } else if source_path.is_file() {
             // Single file source
             let name = source_path
@@ -471,9 +475,11 @@ pub(super) fn collect_source_with_fallback(
                 .map_err(|_| LpmError::Registry("lpm.source escaped extraction".into()))?;
             return Ok(vec![(src, name)]);
         }
+        return Err(LpmError::Registry(format!(
+            "lpm.source '{source_dir}' is not a regular file or directory"
+        )));
     }
 
-    // Fall back to collecting all source files
     collect_all_source_files(extract_dir)
 }
 
@@ -560,6 +566,28 @@ mod tests {
     }
 
     #[test]
+    fn oversized_runtime_source_is_rejected_before_whole_file_allocation() {
+        let extract = tempfile::tempdir().unwrap();
+        let path = extract.path().join("generated.ts");
+        let file = std::fs::File::create(&path).unwrap();
+        file.set_len(RUNTIME_SOURCE_TEXT_SIZE_CAP_BYTES + 1)
+            .unwrap();
+
+        let error = read_runtime_source_text(&path).unwrap_err();
+
+        assert!(error.to_string().contains("exceeds"));
+    }
+
+    #[test]
+    fn non_utf8_runtime_source_uses_binary_copy_path() {
+        let extract = tempfile::tempdir().unwrap();
+        let path = extract.path().join("generated.js");
+        std::fs::write(&path, [0xff, 0xfe]).unwrap();
+
+        assert_eq!(read_runtime_source_text(&path).unwrap(), None);
+    }
+
+    #[test]
     fn fallback_source_collection_is_lexically_ordered() {
         let extract = tempfile::tempdir().unwrap();
         std::fs::write(extract.path().join("z.ts"), "z").unwrap();
@@ -576,6 +604,37 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert_eq!(paths, ["a-dir/c.ts", "a.ts", "z-dir/b.ts", "z.ts"]);
+    }
+
+    #[test]
+    fn legacy_source_rejects_a_non_string_selector_instead_of_falling_back() {
+        let extract = tempfile::tempdir().unwrap();
+        std::fs::write(
+            extract.path().join("package.json"),
+            r#"{"lpm":{"source":42}}"#,
+        )
+        .unwrap();
+        std::fs::write(extract.path().join("unrelated.ts"), "unrelated").unwrap();
+
+        let error = collect_source_with_fallback(extract.path()).unwrap_err();
+
+        assert!(error.to_string().contains("lpm.source"));
+    }
+
+    #[test]
+    fn legacy_source_empty_directory_does_not_fall_back_to_unrelated_files() {
+        let extract = tempfile::tempdir().unwrap();
+        std::fs::create_dir(extract.path().join("declared")).unwrap();
+        std::fs::write(
+            extract.path().join("package.json"),
+            r#"{"lpm":{"source":"declared"}}"#,
+        )
+        .unwrap();
+        std::fs::write(extract.path().join("unrelated.ts"), "unrelated").unwrap();
+
+        let files = collect_source_with_fallback(extract.path()).unwrap();
+
+        assert!(files.is_empty());
     }
 
     #[test]

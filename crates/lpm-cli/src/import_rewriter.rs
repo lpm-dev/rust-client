@@ -84,6 +84,58 @@ pub fn rewrite_imports_indexed(
     src_to_dest: &HashMap<&str, &str>,
     dest_files: &HashSet<&str>,
 ) -> Option<String> {
+    rewrite_imports_indexed_inner(
+        content,
+        file_src_path,
+        file_dest_path,
+        author_alias,
+        buyer_alias,
+        src_to_dest,
+        dest_files,
+        None,
+    )
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "rewriting and import collection share explicit path and alias indexes"
+)]
+pub fn rewrite_imports_indexed_collecting_bare(
+    content: &str,
+    file_src_path: &str,
+    file_dest_path: &str,
+    author_alias: Option<&str>,
+    buyer_alias: Option<&str>,
+    src_to_dest: &HashMap<&str, &str>,
+    dest_files: &HashSet<&str>,
+    bare_specifiers: &mut HashSet<String>,
+) -> Option<String> {
+    rewrite_imports_indexed_inner(
+        content,
+        file_src_path,
+        file_dest_path,
+        author_alias,
+        buyer_alias,
+        src_to_dest,
+        dest_files,
+        Some(bare_specifiers),
+    )
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "rewriting and import collection share explicit path and alias indexes"
+)]
+fn rewrite_imports_indexed_inner(
+    content: &str,
+    file_src_path: &str,
+    file_dest_path: &str,
+    author_alias: Option<&str>,
+    buyer_alias: Option<&str>,
+    src_to_dest: &HashMap<&str, &str>,
+    dest_files: &HashSet<&str>,
+    mut bare_specifiers: Option<&mut HashSet<String>>,
+) -> Option<String> {
     let file_src_path = normalize_separators(file_src_path);
     let file_dest_path = normalize_separators(file_dest_path);
     let file_src_dir = dirname(&file_src_path);
@@ -92,6 +144,11 @@ pub fn rewrite_imports_indexed(
     let mut replacements = Vec::new();
     visit_code_specifier_ranges(content, |range| {
         let specifier = &content[range.clone()];
+        if classify_specifier(specifier, author_alias) == SpecifierKind::Bare
+            && let Some(bare_specifiers) = bare_specifiers.as_deref_mut()
+        {
+            bare_specifiers.insert(specifier.to_string());
+        }
         if let Some(new_specifier) = resolve_and_rewrite(
             specifier,
             &file_src_dir,
@@ -203,6 +260,7 @@ fn resolve_and_rewrite(
 }
 
 /// Collects bare imports using the same lexer and classifier as rewriting.
+#[cfg(test)]
 pub fn collect_bare_specifiers(content: &str, author_alias: Option<&str>) -> HashSet<String> {
     let mut bare = HashSet::new();
     visit_code_specifier_ranges(content, |range| {
@@ -828,6 +886,32 @@ import Foo from "../components/Foo";
         assert!(bare.contains("@radix-ui/react-slot"));
         assert!(!bare.contains("./utils"));
         assert!(!bare.contains("../components/Foo"));
+    }
+
+    #[test]
+    fn rewrite_and_bare_import_collection_share_one_lexical_pass() {
+        let src_to_dest = HashMap::from([("lib.ts", "moved/lib.ts")]);
+        let dest_files = HashSet::from(["moved/lib.ts"]);
+        let mut bare = HashSet::new();
+        let content = r#"import React from "react"; import { lib } from "@/lib";"#;
+
+        let rewritten = rewrite_imports_indexed_collecting_bare(
+            content,
+            "entry.ts",
+            "moved/entry.ts",
+            Some("@/"),
+            Some("#/"),
+            &src_to_dest,
+            &dest_files,
+            &mut bare,
+        )
+        .unwrap();
+
+        assert_eq!(bare, HashSet::from(["react".to_string()]));
+        assert_eq!(
+            rewritten,
+            r##"import React from "react"; import { lib } from "#/moved/lib";"##
+        );
     }
 
     #[test]

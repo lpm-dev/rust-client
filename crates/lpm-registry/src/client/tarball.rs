@@ -445,7 +445,8 @@ impl RegistryClient {
         } else {
             Err(LpmError::Registry(format!(
                 "tarball URL refused — fresh dist.tarball origin is not in the configured \
-                 set (likely poisoned mirror or metadata tamper): {url}"
+                 set (likely poisoned mirror or metadata tamper): {}",
+                lpm_common::safe_url_origin(url)
             )))
         }
     }

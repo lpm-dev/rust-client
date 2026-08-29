@@ -109,6 +109,18 @@ impl AddedSourcesState {
         self.packages.remove(package)
     }
 
+    pub fn record_package_skill_materialization(
+        &mut self,
+        package: &str,
+        skill_package_short: &str,
+    ) -> bool {
+        let Some(record) = self.packages.get_mut(package) else {
+            return false;
+        };
+        record.skill_package_short = Some(skill_package_short.to_string());
+        true
+    }
+
     pub fn record_package_delivery(
         &mut self,
         package: &str,
@@ -584,6 +596,12 @@ pub fn write_state(project_dir: &Path, state: &AddedSourcesState) -> Result<(), 
         LpmError::Registry(format!("failed to serialize added-sources state: {error}"))
     })?;
     body.push(b'\n');
+    if body.len() as u64 > lpm_common::STATE_FILE_SIZE_CAP_BYTES {
+        return Err(LpmError::Registry(format!(
+            "added-source state exceeds the {} byte size limit",
+            lpm_common::STATE_FILE_SIZE_CAP_BYTES
+        )));
+    }
     lpm_common::write_file_atomic_with_options(
         &path,
         body,
@@ -688,6 +706,23 @@ mod tests {
 
         write_state(dir.path(), &AddedSourcesState::default()).unwrap();
 
+        assert!(!state_path(dir.path()).exists());
+    }
+
+    #[test]
+    fn write_state_rejects_output_larger_than_the_read_cap() {
+        let dir = tempdir().unwrap();
+        let mut state = AddedSourcesState::default();
+        state.record_package_delivery(
+            &"p".repeat(usize::try_from(lpm_common::STATE_FILE_SIZE_CAP_BYTES).unwrap() + 1),
+            std::iter::empty(),
+            None,
+            None,
+        );
+
+        let error = write_state(dir.path(), &state).unwrap_err();
+
+        assert!(error.to_string().contains("size limit"));
         assert!(!state_path(dir.path()).exists());
     }
 
