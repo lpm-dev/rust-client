@@ -781,6 +781,16 @@ fn apply_lpm_env<S: LpmEnvSink>(cmd: &mut S, project: &TempProject) {
     cmd.remove_env("SIGSTORE_ID_TOKEN");
     cmd.remove_env("CI_JOB_JWT");
     cmd.remove_env("CI_JOB_JWT_V2");
+    cmd.remove_env("LPM_INTERNAL_TEST_SIGSTORE_FULCIO_URL");
+    cmd.remove_env("LPM_INTERNAL_TEST_SIGSTORE_REKOR_URL");
+    cmd.remove_env("HTTP_PROXY");
+    cmd.remove_env("HTTPS_PROXY");
+    cmd.remove_env("ALL_PROXY");
+    cmd.remove_env("NO_PROXY");
+    cmd.remove_env("http_proxy");
+    cmd.remove_env("https_proxy");
+    cmd.remove_env("all_proxy");
+    cmd.remove_env("no_proxy");
 
     // Force file-backed auth storage so workflow tests never touch the OS keychain.
     cmd.set_env("LPM_FORCE_FILE_AUTH", OsStr::new("1"));

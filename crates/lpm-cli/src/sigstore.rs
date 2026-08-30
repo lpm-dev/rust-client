@@ -38,9 +38,7 @@ const SIGSTORE_RESPONSE_CAP_BYTES: usize = 1024 * 1024;
 pub(crate) const SIGSTORE_BUNDLE_MEDIA_TYPE: &str =
     "application/vnd.dev.sigstore.bundle+json;version=0.2";
 
-#[cfg(feature = "internal-test-sigstore-mock")]
 const INTERNAL_TEST_SIGSTORE_FULCIO_URL_ENV: &str = "LPM_INTERNAL_TEST_SIGSTORE_FULCIO_URL";
-#[cfg(feature = "internal-test-sigstore-mock")]
 const INTERNAL_TEST_SIGSTORE_REKOR_URL_ENV: &str = "LPM_INTERNAL_TEST_SIGSTORE_REKOR_URL";
 
 /// Sigstore service endpoints.
@@ -71,31 +69,47 @@ impl SigstoreEndpoints {
         Self { fulcio, rekor }
     }
 
-    #[cfg(feature = "internal-test-sigstore-mock")]
     fn from_internal_test_env() -> Result<Option<Self>, LpmError> {
         let fulcio = std::env::var_os(INTERNAL_TEST_SIGSTORE_FULCIO_URL_ENV);
         let rekor = std::env::var_os(INTERNAL_TEST_SIGSTORE_REKOR_URL_ENV);
-        match (fulcio, rekor) {
-            (None, None) => Ok(None),
-            (Some(fulcio), Some(rekor)) => Ok(Some(Self {
-                fulcio: validate_internal_test_sigstore_endpoint(
-                    INTERNAL_TEST_SIGSTORE_FULCIO_URL_ENV,
-                    fulcio,
-                )?,
-                rekor: validate_internal_test_sigstore_endpoint(
-                    INTERNAL_TEST_SIGSTORE_REKOR_URL_ENV,
-                    rekor,
-                )?,
-            })),
-            _ => Err(LpmError::Registry(format!(
-                "{INTERNAL_TEST_SIGSTORE_FULCIO_URL_ENV} and \
-                 {INTERNAL_TEST_SIGSTORE_REKOR_URL_ENV} must be set together"
-            ))),
+
+        #[cfg(not(feature = "internal-test-sigstore-mock"))]
+        {
+            if fulcio.is_some() || rekor.is_some() {
+                return Err(LpmError::Registry(format!(
+                    "{INTERNAL_TEST_SIGSTORE_FULCIO_URL_ENV} and \
+                     {INTERNAL_TEST_SIGSTORE_REKOR_URL_ENV} are reserved for hermetic workflow \
+                     tests; this lpm-rs binary was built without the \
+                     internal-test-sigstore-mock feature"
+                )));
+            }
+            Ok(None)
+        }
+
+        #[cfg(feature = "internal-test-sigstore-mock")]
+        {
+            match (fulcio, rekor) {
+                (None, None) => Ok(None),
+                (Some(fulcio), Some(rekor)) => Ok(Some(Self {
+                    fulcio: validate_internal_test_sigstore_endpoint(
+                        INTERNAL_TEST_SIGSTORE_FULCIO_URL_ENV,
+                        fulcio,
+                    )?,
+                    rekor: validate_internal_test_sigstore_endpoint(
+                        INTERNAL_TEST_SIGSTORE_REKOR_URL_ENV,
+                        rekor,
+                    )?,
+                })),
+                _ => Err(LpmError::Registry(format!(
+                    "{INTERNAL_TEST_SIGSTORE_FULCIO_URL_ENV} and \
+                     {INTERNAL_TEST_SIGSTORE_REKOR_URL_ENV} must be set together"
+                ))),
+            }
         }
     }
 }
 
-#[cfg(feature = "internal-test-sigstore-mock")]
+#[cfg(any(test, feature = "internal-test-sigstore-mock"))]
 fn validate_internal_test_sigstore_endpoint(
     env_name: &str,
     raw_value: std::ffi::OsString,
@@ -123,16 +137,21 @@ fn validate_internal_test_sigstore_endpoint(
     let host = url
         .host_str()
         .ok_or_else(|| LpmError::Registry(format!("{env_name} must include a loopback host")))?;
-    let loopback = host.eq_ignore_ascii_case("localhost")
-        || host
-            .parse::<std::net::IpAddr>()
-            .is_ok_and(|addr| addr.is_loopback());
+    let loopback = parse_numeric_ip_host(host).is_some_and(|addr| addr.is_loopback());
     if !loopback {
         return Err(LpmError::Registry(format!(
-            "{env_name} must point at localhost, 127.0.0.1, or ::1"
+            "{env_name} must point at a numeric loopback IP address such as 127.0.0.1 or ::1"
         )));
     }
     Ok(raw.trim_end_matches('/').to_string())
+}
+
+fn parse_numeric_ip_host(host: &str) -> Option<std::net::IpAddr> {
+    host.parse().ok().or_else(|| {
+        host.strip_prefix('[')
+            .and_then(|host| host.strip_suffix(']'))
+            .and_then(|host| host.parse().ok())
+    })
 }
 
 /// Build the HTTP client used for every Fulcio / Rekor exchange.
@@ -152,10 +171,20 @@ fn validate_internal_test_sigstore_endpoint(
 /// it. Explicitly refusing redirects closes the bounce-and-capture
 /// arm. A legitimate Fulcio rotation would be announced as a new
 /// constant + code release, not a transparent redirect.
-fn sigstore_http_client() -> Result<reqwest::Client, LpmError> {
-    reqwest::Client::builder()
+fn sigstore_http_client(endpoint_url: &str) -> Result<reqwest::Client, LpmError> {
+    let builder = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(SIGSTORE_HTTP_TIMEOUT_SECS))
-        .redirect(reqwest::redirect::Policy::none())
+        .redirect(reqwest::redirect::Policy::none());
+    let builder = if reqwest::Url::parse(endpoint_url)
+        .ok()
+        .and_then(|url| url.host_str().and_then(parse_numeric_ip_host))
+        .is_some_and(|addr| addr.is_loopback())
+    {
+        builder.no_proxy()
+    } else {
+        builder
+    };
+    builder
         .build()
         .map_err(|e| LpmError::Registry(format!("failed to build Sigstore HTTP client: {e}")))
 }
@@ -463,11 +492,8 @@ pub async fn sign_and_record(
     oidc_token: &str,
     slsa_statement_json: &[u8],
 ) -> Result<SigstoreBundle, LpmError> {
-    #[cfg(feature = "internal-test-sigstore-mock")]
     let endpoints =
         SigstoreEndpoints::from_internal_test_env()?.unwrap_or_else(SigstoreEndpoints::production);
-    #[cfg(not(feature = "internal-test-sigstore-mock"))]
-    let endpoints = SigstoreEndpoints::production();
 
     sign_and_record_with_endpoints(oidc_token, slsa_statement_json, &endpoints).await
 }
@@ -559,7 +585,7 @@ async fn fulcio_get_certificate(
     public_key_pem: &str,
     proof_b64: &str,
 ) -> Result<(String, Vec<Vec<u8>>), LpmError> {
-    let client = sigstore_http_client()?;
+    let client = sigstore_http_client(fulcio_url)?;
 
     let body = serde_json::json!({
         "credentials": {
@@ -700,7 +726,7 @@ async fn rekor_upload(
     envelope: &DsseEnvelope,
     cert_pem: &str,
 ) -> Result<TlogEntry, LpmError> {
-    let client = sigstore_http_client()?;
+    let client = sigstore_http_client(rekor_url)?;
 
     use sha2::{Digest, Sha256};
 
@@ -1185,7 +1211,6 @@ mod tests {
         assert_eq!(json["signatures"][0]["sig"], "c2lnbmF0dXJl");
     }
 
-    #[cfg(feature = "internal-test-sigstore-mock")]
     #[test]
     fn internal_test_sigstore_endpoint_accepts_loopback_http_origin() {
         let endpoint = validate_internal_test_sigstore_endpoint(
@@ -1196,7 +1221,26 @@ mod tests {
         assert_eq!(endpoint, "http://127.0.0.1:12345");
     }
 
-    #[cfg(feature = "internal-test-sigstore-mock")]
+    #[test]
+    fn internal_test_sigstore_endpoint_accepts_ipv6_loopback_http_origin() {
+        let endpoint = validate_internal_test_sigstore_endpoint(
+            "LPM_INTERNAL_TEST_SIGSTORE_FULCIO_URL",
+            "http://[::1]:12345/".into(),
+        )
+        .expect("IPv6 loopback http endpoint must be accepted");
+        assert_eq!(endpoint, "http://[::1]:12345");
+    }
+
+    #[test]
+    fn internal_test_sigstore_endpoint_rejects_localhost_hostname() {
+        let err = validate_internal_test_sigstore_endpoint(
+            "LPM_INTERNAL_TEST_SIGSTORE_FULCIO_URL",
+            "http://localhost:12345".into(),
+        )
+        .expect_err("hostnames must not cross the numeric loopback boundary");
+        assert!(format!("{err}").contains("numeric loopback"), "got: {err}");
+    }
+
     #[test]
     fn internal_test_sigstore_endpoint_rejects_non_loopback_host() {
         let err = validate_internal_test_sigstore_endpoint(
@@ -1204,7 +1248,7 @@ mod tests {
             "http://fulcio.sigstore.dev".into(),
         )
         .expect_err("non-loopback endpoint must be rejected");
-        assert!(format!("{err}").contains("localhost"), "got: {err}");
+        assert!(format!("{err}").contains("numeric loopback"), "got: {err}");
     }
 
     #[cfg(feature = "internal-test-sigstore-mock")]
@@ -1224,6 +1268,46 @@ mod tests {
         assert!(
             format!("{err}").contains("must be set together"),
             "got: {err}"
+        );
+    }
+
+    #[cfg(not(feature = "internal-test-sigstore-mock"))]
+    #[tokio::test]
+    async fn default_build_rejects_reserved_fulcio_endpoint_before_token_parsing() {
+        let _env = crate::test_env::ScopedEnv::update([
+            (
+                "LPM_INTERNAL_TEST_SIGSTORE_FULCIO_URL",
+                Some("http://127.0.0.1:1234".into()),
+            ),
+            ("LPM_INTERNAL_TEST_SIGSTORE_REKOR_URL", None),
+        ]);
+        let err = match sign_and_record("not-a-jwt", b"{}").await {
+            Ok(_) => panic!("a normal binary must reject reserved test endpoints"),
+            Err(err) => err,
+        };
+        assert!(
+            format!("{err}").contains("internal-test-sigstore-mock"),
+            "reserved endpoint must fail before token parsing, got: {err}"
+        );
+    }
+
+    #[cfg(not(feature = "internal-test-sigstore-mock"))]
+    #[tokio::test]
+    async fn default_build_rejects_reserved_rekor_endpoint_before_token_parsing() {
+        let _env = crate::test_env::ScopedEnv::update([
+            ("LPM_INTERNAL_TEST_SIGSTORE_FULCIO_URL", None),
+            (
+                "LPM_INTERNAL_TEST_SIGSTORE_REKOR_URL",
+                Some("http://127.0.0.1:1234".into()),
+            ),
+        ]);
+        let err = match sign_and_record("not-a-jwt", b"{}").await {
+            Ok(_) => panic!("a normal binary must reject reserved test endpoints"),
+            Err(err) => err,
+        };
+        assert!(
+            format!("{err}").contains("internal-test-sigstore-mock"),
+            "reserved endpoint must fail before token parsing, got: {err}"
         );
     }
 
@@ -1257,6 +1341,47 @@ mod tests {
     }
 
     // ─── Fulcio response parsing ──────────────────────────────────
+
+    #[tokio::test]
+    async fn numeric_loopback_sigstore_request_bypasses_proxy_environment() {
+        let origin = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(match_path("/api/v2/signingCert"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(
+                PEM_CERT_LEAF.as_bytes().to_vec(),
+                "application/pem-certificate-chain",
+            ))
+            .expect(1)
+            .mount(&origin)
+            .await;
+        let proxy = MockServer::start().await;
+        let proxy_url = std::ffi::OsString::from(proxy.uri());
+        let _env = crate::test_env::ScopedEnv::update([
+            ("HTTP_PROXY", Some(proxy_url.clone())),
+            ("HTTPS_PROXY", Some(proxy_url.clone())),
+            ("ALL_PROXY", Some(proxy_url.clone())),
+            ("http_proxy", Some(proxy_url.clone())),
+            ("https_proxy", Some(proxy_url.clone())),
+            ("all_proxy", Some(proxy_url)),
+            ("NO_PROXY", None),
+            ("no_proxy", None),
+        ]);
+
+        let result = fulcio_get_certificate(&origin.uri(), "tok", "key-pem", "proof").await;
+
+        assert!(
+            result.is_ok(),
+            "loopback request used the proxy: {result:?}"
+        );
+        let proxy_requests = proxy
+            .received_requests()
+            .await
+            .expect("proxy request log must be available");
+        assert!(
+            proxy_requests.is_empty(),
+            "loopback request reached the configured proxy"
+        );
+    }
 
     #[tokio::test]
     async fn fulcio_parses_pem_chain_single_cert() {
