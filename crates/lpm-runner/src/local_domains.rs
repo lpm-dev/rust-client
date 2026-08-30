@@ -276,12 +276,17 @@ fn managed_hosts_block_id(project_dir: &Path) -> String {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_nanos();
-    let owner = format!("{}:{created_at}:{sequence}", std::process::id());
-    format!(
-        "project-{}-lease-{}",
-        crate::dlx::deterministic_hash(&project_dir.to_string_lossy()),
-        crate::dlx::deterministic_hash(&owner),
-    )
+    let owner_pid = std::process::id();
+    let owner = format!("{owner_pid}:{created_at}:{sequence}");
+    let project_hash = crate::dlx::deterministic_hash(&project_dir.to_string_lossy());
+    let lease_hash = crate::dlx::deterministic_hash(&owner);
+    match crate::ports::process_identity_for_pid(owner_pid) {
+        Some(identity) => format!(
+            "project-{project_hash}-owner-{owner_pid}-{}-lease-{lease_hash}",
+            crate::dlx::deterministic_hash(identity.as_str()),
+        ),
+        None => format!("project-{project_hash}-lease-{lease_hash}"),
+    }
 }
 
 fn hosts_backup_path() -> Result<PathBuf, String> {
@@ -298,7 +303,8 @@ fn upsert_managed_hosts_file_block(
 ) -> Result<bool, String> {
     with_hosts_file_lock(path, || {
         let current = read_hosts_file(path)?;
-        let next = upsert_managed_hosts_block(&current, block_id, hosts);
+        let reconciled = remove_stale_managed_hosts_blocks(&current)?;
+        let next = upsert_managed_hosts_block(&reconciled, block_id, hosts);
         if current == next {
             return Ok(false);
         }
@@ -315,7 +321,8 @@ fn upsert_managed_hosts_file_block_without_backup(
 ) -> Result<bool, String> {
     with_hosts_file_lock(path, || {
         let current = read_hosts_file(path)?;
-        let next = upsert_managed_hosts_block(&current, block_id, hosts);
+        let reconciled = remove_stale_managed_hosts_blocks(&current)?;
+        let next = upsert_managed_hosts_block(&reconciled, block_id, hosts);
         if current == next {
             return Ok(false);
         }
@@ -530,6 +537,68 @@ fn remove_all_managed_hosts_blocks_with_newline(
         rendered.push_str(newline);
     }
     Ok((rendered, removed))
+}
+
+fn remove_stale_managed_hosts_blocks(content: &str) -> Result<String, String> {
+    remove_stale_managed_hosts_blocks_with(content, crate::ports::process_identity_for_pid)
+}
+
+fn remove_stale_managed_hosts_blocks_with(
+    content: &str,
+    mut process_identity: impl FnMut(u32) -> Option<crate::ports::ProcessIdentity>,
+) -> Result<String, String> {
+    let newline = preferred_newline(content);
+    let mut out = Vec::new();
+    let mut managed_block = None::<(&str, bool)>;
+
+    for line in content.lines() {
+        if let Some((block_id, stale)) = managed_block {
+            if line == managed_hosts_end(block_id) {
+                if !stale {
+                    out.push(line);
+                }
+                managed_block = None;
+            } else if !stale {
+                out.push(line);
+            }
+            continue;
+        }
+
+        let Some(block_id) = parse_managed_hosts_begin(line) else {
+            out.push(line);
+            continue;
+        };
+        let stale = parse_managed_hosts_owner(block_id).is_some_and(|(pid, expected_identity)| {
+            process_identity(pid).is_none_or(|identity| {
+                crate::dlx::deterministic_hash(identity.as_str()) != expected_identity
+            })
+        });
+        if !stale {
+            out.push(line);
+        } else if out.last().is_some_and(|previous| previous.is_empty()) {
+            out.pop();
+        }
+        managed_block = Some((block_id, stale));
+    }
+
+    if let Some((block_id, _)) = managed_block {
+        return Err(format!(
+            "hosts file contains unterminated LPM managed block `{block_id}`"
+        ));
+    }
+
+    let mut rendered = out.join(newline);
+    if !rendered.is_empty() {
+        rendered.push_str(newline);
+    }
+    Ok(rendered)
+}
+
+fn parse_managed_hosts_owner(block_id: &str) -> Option<(u32, &str)> {
+    let (_, owner_and_lease) = block_id.split_once("-owner-")?;
+    let (owner, _) = owner_and_lease.rsplit_once("-lease-")?;
+    let (pid, identity) = owner.split_once('-')?;
+    Some((pid.parse().ok()?, identity))
 }
 
 fn render_managed_hosts_block(block_id: &str, hosts: &[String], newline: &str) -> String {
@@ -991,6 +1060,31 @@ mod tests {
         assert_eq!(content, "127.0.0.1 localhost\n");
         let backup = std::fs::read_to_string(&backup_path).unwrap();
         assert_eq!(backup, "127.0.0.1 localhost\n");
+    }
+
+    #[test]
+    fn applying_a_hosts_lease_removes_a_dead_owner_block() {
+        let dir = tempfile::tempdir().unwrap();
+        let hosts_path = dir.path().join("hosts");
+        let stale_block_id = "project-abc-owner-4294967294-deadbeef-lease-old";
+        std::fs::write(
+            &hosts_path,
+            render_managed_hosts_block(stale_block_id, &["stale.test".to_string()], "\n"),
+        )
+        .unwrap();
+        let plan = HostsFilePlan {
+            path: hosts_path.clone(),
+            backup_path: dir.path().join("hosts.bak"),
+            block_id: "project-current".to_string(),
+            hosts: vec!["current.test".to_string()],
+        };
+
+        let lease = apply_hosts_file_plan(&plan).unwrap();
+
+        let content = std::fs::read_to_string(&hosts_path).unwrap();
+        assert!(!content.contains(stale_block_id), "got {content}");
+        assert!(content.contains("127.0.0.1 current.test"));
+        lease.release().unwrap();
     }
 
     #[test]

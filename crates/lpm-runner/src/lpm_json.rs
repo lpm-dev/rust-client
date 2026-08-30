@@ -18,6 +18,8 @@ use std::path::Path;
 use std::sync::LazyLock;
 
 const LPM_JSON_SCHEMA_URL: &str = "https://cli.lpm.dev/schemas/lpm.json";
+pub const MAX_DEV_SERVICES: usize = 256;
+pub const MAX_READY_TIMEOUT_SECS: u64 = 60 * 60;
 
 /// Configuration from `lpm.json`.
 #[derive(Debug, Clone, Default, Deserialize, schemars::JsonSchema)]
@@ -138,7 +140,7 @@ where
 }
 
 /// Cloud sync metadata maintained by `lpm env`.
-#[derive(Debug, Clone, Default, Deserialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
 #[schemars(deny_unknown_fields)]
 pub struct VaultSyncConfig {
@@ -367,7 +369,7 @@ pub struct GitlabPublishConfig {
 }
 
 /// Configuration for a dev service in `lpm.json`.
-#[derive(Debug, Clone, Default, Deserialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, Deserialize, schemars::JsonSchema)]
 #[schemars(deny_unknown_fields)]
 pub struct ServiceConfig {
     /// Shell command to run.
@@ -412,6 +414,24 @@ pub struct ServiceConfig {
     /// Working directory relative to project root.
     #[serde(default)]
     pub cwd: Option<String>,
+}
+
+impl Default for ServiceConfig {
+    fn default() -> Self {
+        Self {
+            command: String::new(),
+            port: None,
+            depends_on: Vec::new(),
+            ready_port: None,
+            ready_url: None,
+            ready_timeout: default_ready_timeout(),
+            env: HashMap::new(),
+            restart: false,
+            primary: false,
+            host: None,
+            cwd: None,
+        }
+    }
 }
 
 fn default_ready_timeout() -> u64 {
@@ -723,9 +743,89 @@ pub fn parse_lpm_json(content: &str) -> Result<LpmJsonConfig, String> {
 
     validated_cert_extra_permitted_dns(&config)?;
 
+    validate_dev_services(&config.services)?;
+
     validate_and_normalize_local_domain_hosts(&mut config)?;
 
     Ok(config)
+}
+
+fn validate_dev_services(services: &HashMap<String, ServiceConfig>) -> Result<(), String> {
+    if services.len() > MAX_DEV_SERVICES {
+        return Err(format!(
+            "invalid lpm.json data: services supports at most {MAX_DEV_SERVICES} services, got {}",
+            services.len()
+        ));
+    }
+
+    let mut env_prefixes = HashMap::<String, String>::with_capacity(services.len());
+    let mut names: Vec<&String> = services.keys().collect();
+    names.sort_unstable();
+    for name in names {
+        validate_service_name(name)?;
+        let service = &services[name];
+        if service.command.trim().is_empty() {
+            return Err(format!(
+                "invalid lpm.json data: services.{name}.command must not be empty"
+            ));
+        }
+        for (field, port) in [("port", service.port), ("readyPort", service.ready_port)] {
+            if port == Some(0) {
+                return Err(format!(
+                    "invalid lpm.json data: services.{name}.{field} must be between 1 and 65535"
+                ));
+            }
+        }
+        if service.ready_timeout > MAX_READY_TIMEOUT_SECS {
+            return Err(format!(
+                "invalid lpm.json data: services.{name}.readyTimeout must not exceed {MAX_READY_TIMEOUT_SECS} seconds"
+            ));
+        }
+        if let Some(url) = service.ready_url.as_deref() {
+            crate::ready::validate_ready_url(url).map_err(|error| {
+                format!("invalid lpm.json data: services.{name}.readyUrl: {error}")
+            })?;
+        }
+
+        let prefix = service_env_prefix(name);
+        if let Some(existing) = env_prefixes.insert(prefix.clone(), name.clone()) {
+            return Err(format!(
+                "invalid lpm.json data: services {existing:?} and {name:?} produce the same peer environment prefix {prefix:?}; rename one service"
+            ));
+        }
+    }
+
+    crate::service_graph::topological_sort(services)
+        .map(|_| ())
+        .map_err(|error| format!("invalid lpm.json data: services: {error}"))
+}
+
+fn validate_service_name(name: &str) -> Result<(), String> {
+    let valid = !name.is_empty()
+        && name.len() <= 64
+        && name
+            .bytes()
+            .next()
+            .is_some_and(|byte| byte.is_ascii_alphabetic())
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'));
+    if valid {
+        Ok(())
+    } else {
+        Err(format!(
+            "invalid lpm.json data: service name {name:?} must be 1-64 ASCII letters, digits, hyphens, or underscores and start with an ASCII letter"
+        ))
+    }
+}
+
+fn service_env_prefix(name: &str) -> String {
+    name.bytes()
+        .map(|byte| match byte {
+            b'-' | b'_' => '_',
+            byte => byte.to_ascii_uppercase() as char,
+        })
+        .collect()
 }
 
 fn validate_task_cache_globs(config: &LpmJsonConfig) -> Result<(), String> {
@@ -1378,6 +1478,130 @@ mod tests {
         assert!(!web.primary);
         assert_eq!(web.ready_timeout, 30);
         assert_eq!(web.effective_ready_port(), None);
+    }
+
+    #[test]
+    fn service_config_default_uses_the_documented_readiness_timeout() {
+        assert_eq!(ServiceConfig::default().ready_timeout, 30);
+    }
+
+    #[test]
+    fn read_lpm_json_rejects_empty_service_commands() {
+        let error = parse_lpm_json(r#"{"services":{"web":{"command":"  \t "}}}"#).unwrap_err();
+
+        assert!(error.contains("services.web.command"), "{error}");
+        assert!(error.contains("must not be empty"), "{error}");
+    }
+
+    #[test]
+    fn read_lpm_json_rejects_zero_service_ports() {
+        for field in ["port", "readyPort"] {
+            let input =
+                format!(r#"{{"services":{{"web":{{"command":"node server.js","{field}":0}}}}}}"#);
+            let error = parse_lpm_json(&input).unwrap_err();
+
+            assert!(error.contains(&format!("services.web.{field}")), "{error}");
+            assert!(error.contains("between 1 and 65535"), "{error}");
+        }
+    }
+
+    #[test]
+    fn read_lpm_json_rejects_excessive_readiness_timeouts() {
+        let error = parse_lpm_json(
+            r#"{"services":{"web":{"command":"node server.js","readyTimeout":3601}}}"#,
+        )
+        .unwrap_err();
+
+        assert!(error.contains("services.web.readyTimeout"), "{error}");
+        assert!(error.contains("3600"), "{error}");
+    }
+
+    #[test]
+    fn read_lpm_json_rejects_non_local_or_unsupported_readiness_urls() {
+        for ready_url in [
+            "https://localhost:3000/health",
+            "http://metadata.internal/health",
+            "not-a-url",
+        ] {
+            let input = serde_json::json!({
+                "services": {
+                    "web": {
+                        "command": "node server.js",
+                        "readyUrl": ready_url
+                    }
+                }
+            });
+            let error = parse_lpm_json(&input.to_string()).unwrap_err();
+
+            assert!(error.contains("services.web.readyUrl"), "{error}");
+        }
+    }
+
+    #[test]
+    fn read_lpm_json_rejects_service_dependency_cycles() {
+        let error = parse_lpm_json(
+            r#"{
+                "services": {
+                    "api": {"command":"node api.js", "dependsOn":["web"]},
+                    "web": {"command":"node web.js", "dependsOn":["api"]}
+                }
+            }"#,
+        )
+        .unwrap_err();
+
+        assert!(error.contains("circular dependency"), "{error}");
+    }
+
+    #[test]
+    fn read_lpm_json_rejects_missing_service_dependencies() {
+        let error =
+            parse_lpm_json(r#"{"services":{"api":{"command":"node api.js","dependsOn":["db"]}}}"#)
+                .unwrap_err();
+
+        assert!(error.contains("not defined in services"), "{error}");
+    }
+
+    #[test]
+    fn read_lpm_json_rejects_peer_environment_prefix_collisions() {
+        for (first, second) in [("api-v2", "api_v2"), ("api", "API")] {
+            let input = serde_json::json!({
+                "services": {
+                    first: {"command": "node first.js"},
+                    second: {"command": "node second.js"}
+                }
+            });
+            let error = parse_lpm_json(&input.to_string()).unwrap_err();
+
+            assert!(error.contains("environment prefix"), "{error}");
+            assert!(error.contains(first), "{error}");
+            assert!(error.contains(second), "{error}");
+        }
+    }
+
+    #[test]
+    fn read_lpm_json_rejects_service_names_that_cannot_form_portable_env_keys() {
+        let error =
+            parse_lpm_json(r#"{"services":{"1api":{"command":"node server.js"}}}"#).unwrap_err();
+
+        assert!(error.contains("service name"), "{error}");
+        assert!(error.contains("start with an ASCII letter"), "{error}");
+    }
+
+    #[test]
+    fn read_lpm_json_rejects_excessive_service_fanout() {
+        let services = (0..257)
+            .map(|index| {
+                (
+                    format!("service-{index}"),
+                    serde_json::json!({"command": "node server.js"}),
+                )
+            })
+            .collect::<serde_json::Map<_, _>>();
+        let input = serde_json::json!({"services": services});
+
+        let error = parse_lpm_json(&input.to_string()).unwrap_err();
+
+        assert!(error.contains("at most 256 services"), "{error}");
     }
 
     #[test]

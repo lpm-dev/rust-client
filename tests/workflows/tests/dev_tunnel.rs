@@ -132,6 +132,116 @@ server.listen(Number(process.env.PORT), "127.0.0.1", () => {
 }
 
 #[test]
+fn dev_fails_when_a_ready_service_exits_nonzero() {
+    let project = TempProject::empty(r#"{"name":"dev-exit","version":"1.0.0"}"#);
+    project.write_file(
+        "exit-after-ready.js",
+        "setTimeout(() => process.exit(23), 350);\n",
+    );
+    project.write_file(
+        "stay-alive.js",
+        "setTimeout(() => process.exit(0), 10000);\n",
+    );
+    project.write_file(
+        "lpm.json",
+        r#"{
+            "services": {
+                "worker": {
+                    "command": "node exit-after-ready.js"
+                },
+                "independent": {
+                    "command": "node stay-alive.js"
+                }
+            }
+        }"#,
+    );
+
+    let started = std::time::Instant::now();
+    let output = lpm(&project)
+        .args(["dev", "--no-open", "--no-install"])
+        .output()
+        .expect("failed to run lpm dev service-exit fixture");
+
+    assert!(
+        !output.status.success(),
+        "lpm dev must fail when a ready service exits nonzero; stderr:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("worker"),
+        "failure must name the service: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(10),
+        "a terminal service failure must promptly stop independent services"
+    );
+}
+
+#[test]
+fn dev_rejects_an_invalid_service_cwd_before_starting_any_service() {
+    let project = TempProject::empty(r#"{"name":"dev-cwd","version":"1.0.0"}"#);
+    project.write_file(
+        "lpm.json",
+        r#"{
+            "services": {
+                "a-marker": {
+                    "command": "touch service-started; sleep 1"
+                },
+                "z-invalid": {
+                    "command": "node server.js",
+                    "cwd": "missing-directory"
+                }
+            }
+        }"#,
+    );
+
+    let output = lpm(&project)
+        .args(["dev", "--no-open", "--no-install"])
+        .output()
+        .expect("failed to run invalid-cwd fixture");
+
+    assert!(!output.status.success());
+    assert!(
+        !project.path().join("service-started").exists(),
+        "no service may start before every configured cwd passes preflight"
+    );
+}
+
+#[test]
+fn dev_rejects_a_missing_script_before_proxy_or_hosts_file_side_effects() {
+    let project = TempProject::empty(r#"{"name":"dev-preflight","version":"1.0.0"}"#);
+    let hosts_path = project.path().join("hosts");
+    fs::write(&hosts_path, "127.0.0.1 localhost\n").unwrap();
+    project.write_file(
+        "lpm.json",
+        r#"{
+            "proxy": {
+                "host": "app.test",
+                "port": 19443,
+                "httpRedirect": false
+            }
+        }"#,
+    );
+
+    let output = lpm(&project)
+        .env("LPM_HOSTS_FILE", &hosts_path)
+        .args(["dev", "--no-open", "--no-install", "--yes"])
+        .output()
+        .expect("failed to run missing-script preflight fixture");
+
+    assert!(!output.status.success());
+    assert_eq!(
+        fs::read_to_string(&hosts_path).unwrap(),
+        "127.0.0.1 localhost\n"
+    );
+    assert!(
+        !project.home().join(".lpm/proxy.json").exists(),
+        "proxy startup must not precede single-script validation"
+    );
+}
+
+#[test]
 fn dev_restart_republishes_the_active_session_with_the_new_listener_owner() {
     let project = TempProject::empty(r#"{"name":"dev-restart","version":"1.0.0"}"#);
     project.write_file(

@@ -18,6 +18,8 @@ use std::sync::Arc;
 use std::sync::mpsc;
 use std::time::Duration;
 
+const MAX_EVENTS_PER_TICK: usize = 256;
+
 pub use app::{DashboardApp, ServiceState, ServiceStatus, Tab};
 pub use log_buffer::LogBuffer;
 
@@ -59,7 +61,7 @@ fn apply_dashboard_event(
 ) -> io::Result<DashboardFlow> {
     match event {
         DashboardEvent::ServiceLog { index, line } => {
-            app.push_log(index, &line);
+            app.push_log_owned(index, line);
         }
         DashboardEvent::StatusChange { index, status } => {
             if index < app.services.len() {
@@ -74,6 +76,22 @@ fn apply_dashboard_event(
         }
         DashboardEvent::FatalError(error) => return Err(io::Error::other(error)),
         DashboardEvent::Shutdown => return Ok(DashboardFlow::Stop),
+    }
+    Ok(DashboardFlow::Continue)
+}
+
+fn drain_dashboard_events(
+    app: &mut DashboardApp,
+    event_rx: &mpsc::Receiver<DashboardEvent>,
+) -> io::Result<DashboardFlow> {
+    for _ in 0..MAX_EVENTS_PER_TICK {
+        let event = match event_rx.try_recv() {
+            Ok(event) => event,
+            Err(mpsc::TryRecvError::Empty | mpsc::TryRecvError::Disconnected) => break,
+        };
+        if apply_dashboard_event(app, event)? == DashboardFlow::Stop {
+            return Ok(DashboardFlow::Stop);
+        }
     }
     Ok(DashboardFlow::Continue)
 }
@@ -197,10 +215,8 @@ pub fn run_dashboard(
         }
 
         // Drain service events
-        while let Ok(event) = event_rx.try_recv() {
-            if apply_dashboard_event(&mut app, event)? == DashboardFlow::Stop {
-                return Ok(DashboardCommand::StopAll);
-            }
+        if drain_dashboard_events(&mut app, &event_rx)? == DashboardFlow::Stop {
+            return Ok(DashboardCommand::StopAll);
         }
     }
 }
@@ -216,5 +232,27 @@ mod tests {
         let flow = apply_dashboard_event(&mut app, DashboardEvent::Shutdown).unwrap();
 
         assert_eq!(flow, DashboardFlow::Stop);
+    }
+
+    #[test]
+    fn one_dashboard_tick_processes_a_bounded_event_batch() {
+        let mut app = DashboardApp::new(Vec::new());
+        let (tx, rx) = mpsc::channel();
+        for _ in 0..=MAX_EVENTS_PER_TICK {
+            tx.send(DashboardEvent::PortAssigned {
+                service: "missing".to_string(),
+                port: 3000,
+            })
+            .unwrap();
+        }
+
+        assert_eq!(
+            drain_dashboard_events(&mut app, &rx).unwrap(),
+            DashboardFlow::Continue
+        );
+        assert!(
+            rx.try_recv().is_ok(),
+            "one event must remain for the next tick"
+        );
     }
 }

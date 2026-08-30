@@ -1001,7 +1001,15 @@ async fn prepare_service_runtime_hints(
     root_hint: &lpm_runner::bin_path::ManagedRuntimeHint,
 ) -> Result<HashMap<String, lpm_runner::bin_path::ManagedRuntimeHint>, LpmError> {
     let mut hints = HashMap::with_capacity(services.len());
+    let mut hints_by_directory = HashMap::with_capacity(services.len());
     let mut node_versions = lpm_runtime::effective::PathNodeVersionCache::default();
+    let project_root = project_dir.canonicalize().map_err(|error| {
+        LpmError::Script(format!(
+            "resolve dev project directory {}: {error}",
+            project_dir.display()
+        ))
+    })?;
+    hints_by_directory.insert(project_root.clone(), root_hint.clone());
     let mut ordered_names: Vec<_> = services.keys().cloned().collect();
     ordered_names.sort_unstable();
     for name in ordered_names {
@@ -1012,18 +1020,29 @@ async fn prepare_service_runtime_hints(
             .map(|cwd| lpm_runner::orchestrator::safe_resolve_cwd(project_dir, cwd))
             .transpose()
             .map_err(|error| LpmError::Script(format!("service '{name}': {error}")))?
-            .unwrap_or_else(|| project_dir.to_path_buf());
-        let selectors = lpm_runtime::detect::detect_runtime_versions(&service_dir)?;
-        let hint = if service_dir == project_dir || selectors.is_empty() {
-            root_hint.clone()
+            .unwrap_or_else(|| project_root.clone());
+        let hint = if let Some(hint) = hints_by_directory.get(&service_dir) {
+            hint.clone()
         } else {
-            let selected_runtimes: Vec<_> =
-                selectors.iter().map(|selector| selector.runtime).collect();
-            super::run::ensure_detected_runtimes(selectors)
-                .await
-                .inherit_unselected_from(root_hint, &selected_runtimes)
+            let selectors = lpm_runtime::detect::detect_runtime_versions(&service_dir)?;
+            let hint = if selectors.is_empty() {
+                root_hint.clone()
+            } else {
+                let selected_runtimes: Vec<_> =
+                    selectors.iter().map(|selector| selector.runtime).collect();
+                super::run::ensure_detected_runtimes(selectors)
+                    .await
+                    .inherit_unselected_from(root_hint, &selected_runtimes)
+            };
+            super::run::validate_runtime_with_cache(
+                &service_dir,
+                &hint,
+                false,
+                &mut node_versions,
+            )?;
+            hints_by_directory.insert(service_dir, hint.clone());
+            hint
         };
-        super::run::validate_runtime_with_cache(&service_dir, &hint, false, &mut node_versions)?;
         hints.insert(name, hint);
     }
     Ok(hints)
@@ -1195,9 +1214,11 @@ pub async fn run(
                 lpm_runner::service_graph::primary_service_name(&config.services)
                     .map_err(LpmError::Script)?
                     .map(str::to_string);
-            let active_services =
-                lpm_runner::service_graph::select_active_services(&config.services, extra_args)
-                    .map_err(LpmError::Script)?;
+            let active_services = lpm_runner::service_graph::select_active_services_ref(
+                &config.services,
+                extra_args,
+            )
+            .map_err(LpmError::Script)?;
             let active_primary = lpm_runner::service_graph::primary_service_name(&active_services)
                 .map_err(LpmError::Script)?
                 .map(str::to_string);
@@ -1222,11 +1243,26 @@ pub async fn run(
                         .to_string(),
                 ));
             }
-            config.services = active_services;
+            if let std::borrow::Cow::Owned(active_services) = active_services {
+                config.services = active_services;
+            }
             Ok(config)
         })
-        .transpose()?;
+        .transpose()?
+        .map(Arc::new);
+    if let Some(config) = lpm_config.as_ref() {
+        preflight_service_directories(project_dir, &config.services)?;
+    }
     let has_services = lpm_config.as_ref().is_some_and(|c| !c.services.is_empty());
+    let single_dev_command = if has_services {
+        None
+    } else {
+        Some(lpm_runner::script::script_command_with_config(
+            project_dir,
+            "dev",
+            lpm_config.as_deref(),
+        )?)
+    };
     let requested_port = port;
     let port = resolve_dev_port(port, has_services);
 
@@ -1240,21 +1276,24 @@ pub async fn run(
 
     let local_domain_hostnames = lpm_config
         .as_ref()
-        .map(lpm_runner::local_domains::configured_hostnames)
+        .map(|config| lpm_runner::local_domains::configured_hostnames(config))
         .unwrap_or_default();
     let cert_extra_permitted_dns = lpm_config
         .as_ref()
-        .map(lpm_runner::lpm_json::validated_cert_extra_permitted_dns)
+        .map(|config| lpm_runner::lpm_json::validated_cert_extra_permitted_dns(config))
         .transpose()
         .map_err(LpmError::Script)?
         .map(|entries| lpm_cert::name_constraints::dns_subtrees_from_entries(&entries))
         .unwrap_or_default();
     let startup_proxy_lines = lpm_config
         .as_ref()
-        .map(startup_proxy_lines_from_config)
+        .map(|config| startup_proxy_lines_from_config(config))
         .unwrap_or_default();
     if !local_domain_hostnames.is_empty() {
-        ensure_local_proxy_running(project_dir).await?;
+        let config = lpm_config.as_ref().ok_or_else(|| {
+            LpmError::Script("local domains require an lpm.json configuration".to_string())
+        })?;
+        ensure_local_proxy_running(project_dir, config).await?;
     }
 
     // ── Collect startup info for banner ─────────────────────────────
@@ -1318,7 +1357,7 @@ pub async fn run(
             let dir = env_dir.clone();
             tokio::task::spawn_blocking(move || auto_copy_env_example(&dir))
                 .await
-                .unwrap_or(None)
+                .map_err(|error| LpmError::Script(format!(".env setup task panicked: {error}")))?
         },
         async {
             if https || !local_domain_hostnames_for_cert.is_empty() {
@@ -1363,7 +1402,7 @@ pub async fn run(
 
     // Process parallel results
     startup.deps_status = install_result?;
-    startup.env_status = env_result;
+    startup.env_status = env_result?;
     let script_path =
         lpm_runner::bin_path::build_path_with_bins_pre_resolved(project_dir, &runtime_hint)?;
     let effective_node = lpm_runtime::effective::resolve_node_on_path_with_fingerprint(
@@ -2121,13 +2160,14 @@ pub async fn run(
                 LpmError::Script("dashboard command controller was not initialized".to_string())
             })?;
             let project_dir_owned = project_dir.to_path_buf();
-            let services_owned = services.clone();
+            let orchestrator_config = Arc::clone(config);
             let dashboard_terminal_tx = dashboard_event_tx.clone();
             let orch_handle = std::thread::spawn(move || {
                 run_dashboard_orchestrator(dashboard_terminal_tx, || {
-                    lpm_runner::orchestrator::run_services(
+                    lpm_runner::orchestrator::run_services_with_config(
                         &project_dir_owned,
-                        &services_owned,
+                        &orchestrator_config.services,
+                        Some(&orchestrator_config),
                         options,
                     )
                 })
@@ -2178,7 +2218,12 @@ pub async fn run(
             .await;
         }
 
-        let result = lpm_runner::orchestrator::run_services(project_dir, services, options);
+        let result = lpm_runner::orchestrator::run_services_with_config(
+            project_dir,
+            services,
+            Some(config.as_ref()),
+            options,
+        );
         let tunnel_shutdown_result =
             stop_multi_service_tunnel(tunnel_handle, tunnel_shutdown_boundary.as_ref()).await;
         let result = combine_tunnel_cleanup_results(result, tunnel_shutdown_result);
@@ -2196,6 +2241,9 @@ pub async fn run(
 
     // ── Single service: start dev server ────────────────────────────
     let proxy_lease = Arc::new(tokio::sync::Mutex::new(None));
+    let dev_command = single_dev_command.ok_or_else(|| {
+        LpmError::Script("single-service dev command was not prepared".to_string())
+    })?;
     let hosts_file_lease = prepare_local_hosts_file(project_dir, &local_domain_hostnames, yes)?;
     let mut script_env = extra_env.clone();
     let child_requested_port = requested_port.filter(|_| !https);
@@ -2207,10 +2255,9 @@ pub async fn run(
     upsert_extra_env(&mut script_env, "PORT", child_port_hint.to_string());
     let mut script_args = extra_args.to_vec();
     if let Some(requested_port) = child_requested_port {
-        let command = lpm_runner::script::script_command(project_dir, "dev")?;
         script_args.extend(lpm_cert::framework::explicit_port_args_for_command(
             project_dir,
-            &command,
+            &dev_command,
             requested_port,
         ));
     }
@@ -2219,17 +2266,19 @@ pub async fn run(
     let script_project_dir = project_dir.to_path_buf();
     let script_env_mode = env_mode.map(str::to_string);
     let script_runtime_hint = runtime_hint.clone();
+    let script_config = lpm_config.clone();
     let startup_started = std::time::Instant::now();
     let script_stop_requested = Arc::new(AtomicBool::new(false));
     let script_stop_for_runner = Arc::clone(&script_stop_requested);
     let script_tunnel_shutdown_slot = Arc::clone(&single_tunnel_shutdown_slot);
     let mut script_handle = tokio::task::spawn_blocking(move || {
-        lpm_runner::script::run_dev_script_with_envs(
+        lpm_runner::script::run_dev_script_with_envs_and_config(
             &script_project_dir,
             &script_args,
             script_env_mode.as_deref(),
             &script_env,
             &script_runtime_hint,
+            script_config.as_deref(),
             lpm_runner::script::DevScriptEndpointOptions {
                 requested_port: child_requested_port,
                 stop_requested: script_stop_for_runner,
@@ -2425,6 +2474,28 @@ pub async fn run(
     combine_tunnel_cleanup_results(result, inspector_result)
 }
 
+fn preflight_service_directories(
+    project_dir: &Path,
+    services: &HashMap<String, lpm_runner::lpm_json::ServiceConfig>,
+) -> Result<(), LpmError> {
+    let mut names: Vec<&String> = services.keys().collect();
+    names.sort_unstable();
+    for name in names {
+        let Some(cwd) = services[name].cwd.as_deref() else {
+            continue;
+        };
+        let resolved = lpm_runner::orchestrator::safe_resolve_cwd(project_dir, cwd)
+            .map_err(|error| LpmError::Script(format!("service '{name}': {error}")))?;
+        if !resolved.is_dir() {
+            return Err(LpmError::Script(format!(
+                "service '{name}' cwd '{}' is not an existing directory",
+                resolved.display()
+            )));
+        }
+    }
+    Ok(())
+}
+
 fn startup_proxy_lines_from_config(
     config: &lpm_runner::lpm_json::LpmJsonConfig,
 ) -> Vec<StartupProxyLine> {
@@ -2529,6 +2600,7 @@ fn build_dashboard_services(
     config: &lpm_runner::lpm_json::LpmJsonConfig,
 ) -> Result<Vec<lpm_dashboard::ServiceState>, LpmError> {
     dashboard_service_names(&config.services).map(|service_names| {
+        let per_service_log_bytes = (16 * 1024 * 1024) / service_names.len().max(1);
         service_names
             .into_iter()
             .map(|name| {
@@ -2538,7 +2610,7 @@ fn build_dashboard_services(
                     name,
                     port: service.port,
                     status: lpm_dashboard::ServiceStatus::Starting,
-                    logs: lpm_dashboard::LogBuffer::with_limits(5000, 16 * 1024 * 1024),
+                    logs: lpm_dashboard::LogBuffer::with_limits(5000, per_service_log_bytes),
                 }
             })
             .collect()
@@ -2576,13 +2648,17 @@ fn push_startup_proxy_line(lines: &mut Vec<StartupProxyLine>, host: &str, servic
     });
 }
 
-async fn ensure_local_proxy_running(project_dir: &Path) -> Result<(), LpmError> {
+async fn ensure_local_proxy_running(
+    project_dir: &Path,
+    config: &lpm_runner::lpm_json::LpmJsonConfig,
+) -> Result<(), LpmError> {
     let status = match lpm_proxy::status().await {
         Ok(status) if status.running => status,
         Ok(_) => {
-            let start = crate::commands::proxy::ensure_detached_started_for_project(project_dir)
-                .await
-                .map_err(|err| {
+            let start =
+                crate::commands::proxy::ensure_detached_started_for_config(project_dir, config)
+                    .await
+                    .map_err(|err| {
                     LpmError::Script(format!(
                         "local proxy auto-start failed: {err}. Start it with `{}` before using `host` in lpm.json.",
                         local_proxy_https_start_command()
@@ -2600,19 +2676,56 @@ async fn ensure_local_proxy_running(project_dir: &Path) -> Result<(), LpmError> 
         }
     };
 
-    if status.running && status.tls_addr.is_some() {
-        return Ok(());
+    validate_local_proxy_listener_contract(config, &status).map_err(|error| {
+        LpmError::Script(format!(
+            "local proxy listener contract does not match lpm.json: {error}. Restart it with `{}` before using `host` in lpm.json.",
+            local_proxy_https_start_command()
+        ))
+    })
+}
+
+fn validate_local_proxy_listener_contract(
+    config: &lpm_runner::lpm_json::LpmJsonConfig,
+    status: &lpm_proxy::ProxyStatus,
+) -> Result<(), String> {
+    if !status.running {
+        return Err("local proxy is not running".to_string());
+    }
+    let tls_addr = status
+        .tls_addr
+        .as_deref()
+        .ok_or_else(|| "local proxy is not listening for HTTPS".to_string())?;
+    let actual_tls_port = tls_addr
+        .parse::<std::net::SocketAddr>()
+        .map_err(|_| format!("local proxy reported an invalid HTTPS listener `{tls_addr}`"))?
+        .port();
+    let proxy = config.proxy.as_ref();
+    let expected_tls_port = proxy.and_then(|proxy| proxy.port).unwrap_or(443);
+    if expected_tls_port != 443 && actual_tls_port != expected_tls_port {
+        return Err(format!(
+            "expected HTTPS port {expected_tls_port}, but the running proxy listens on {actual_tls_port}"
+        ));
     }
 
-    let listener_hint = if status.http_addr.is_some() {
-        " A plain HTTP listener is not enough for the HTTPS local-domain front door."
-    } else {
-        ""
-    };
-    Err(LpmError::Script(format!(
-        "local proxy is running without an HTTPS listener.{listener_hint} Restart it with `{}` before using `host` in lpm.json.",
-        local_proxy_https_start_command()
-    )))
+    let redirect_expected = proxy.and_then(|proxy| proxy.http_redirect).unwrap_or(true);
+    let redirect_active = status.http_redirect_addr.is_some();
+    if redirect_expected != redirect_active {
+        let expected = if redirect_expected {
+            "enabled"
+        } else {
+            "disabled"
+        };
+        let actual = if redirect_active {
+            "enabled"
+        } else {
+            "disabled"
+        };
+        return Err(format!(
+            "expected the HTTP redirect listener to be {expected}, but it is {actual}"
+        ));
+    }
+
+    Ok(())
 }
 
 fn prepare_local_hosts_file(
@@ -3520,59 +3633,76 @@ fn normalize_script_binary_name(word: &str) -> Option<String> {
 /// and the copy, potentially clobbering the other process's file.
 ///
 /// Returns a status string for the startup banner, or None if no .env.example.
-fn auto_copy_env_example(project_dir: &std::path::Path) -> Option<String> {
-    use std::fs::OpenOptions;
-    use std::io;
+fn auto_copy_env_example(project_dir: &std::path::Path) -> Result<Option<String>, LpmError> {
+    use std::io::{ErrorKind, Write};
 
     let env_file = project_dir.join(".env");
     let example_file = project_dir.join(".env.example");
 
-    if !example_file.exists() {
-        return None;
+    let source_metadata = match std::fs::symlink_metadata(&example_file) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(LpmError::Script(format!(
+                "inspect {}: {error}",
+                example_file.display()
+            )));
+        }
+    };
+    if source_metadata.file_type().is_symlink() || !source_metadata.is_file() {
+        return Err(LpmError::Script(format!(
+            "refusing to copy {} because it is not a regular file",
+            example_file.display()
+        )));
     }
 
-    match OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&env_file)
+    let (contents, _opened_metadata) = lpm_common::read_regular_file_capped_with_metadata(
+        &example_file,
+        lpm_common::CONFIG_FILE_SIZE_CAP_BYTES,
+    )
+    .map_err(|error| LpmError::Script(error.to_string()))?;
+    #[cfg(unix)]
     {
-        Ok(mut dest) => {
-            // File created atomically — now copy contents from .env.example
-            match std::fs::File::open(&example_file) {
-                Ok(mut src) => {
-                    if let Err(e) = io::copy(&mut src, &mut dest) {
-                        dev_ui::warn(&format!(
-                            "Created .env but failed to copy from .env.example: {e}"
-                        ));
-                        dev_ui::hint_line("Fill in .env manually or delete it and retry.");
-                        return Some("created (copy failed, fill manually)".to_string());
-                    }
-                }
-                Err(e) => {
-                    dev_ui::warn(&format!(
-                        "Created .env but could not read .env.example: {e}"
-                    ));
-                    dev_ui::hint_line("Fill in .env manually.");
-                    return Some("created (empty, could not read .env.example)".to_string());
-                }
-            }
+        use std::os::unix::fs::MetadataExt;
+        if _opened_metadata.dev() != source_metadata.dev()
+            || _opened_metadata.ino() != source_metadata.ino()
+        {
+            return Err(LpmError::Script(format!(
+                "{} changed while it was being opened; retry lpm dev",
+                example_file.display()
+            )));
+        }
+    }
+
+    let mut temporary = tempfile::NamedTempFile::new_in(project_dir).map_err(LpmError::Io)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        temporary
+            .as_file()
+            .set_permissions(std::fs::Permissions::from_mode(0o600))
+            .map_err(LpmError::Io)?;
+    }
+    temporary.write_all(&contents).map_err(LpmError::Io)?;
+    temporary.as_file().sync_all().map_err(LpmError::Io)?;
+    match temporary.persist_noclobber(&env_file) {
+        Ok(_) => {
             dev_ui::warn("No .env file found. Created from .env.example");
             dev_ui::hint_line("Review .env and fill in missing values");
             dev_ui::trusted_hint_line(install_ui::terminal_line!(
                 "Or use {} to store secrets in the vault",
                 install_ui::yellow("lpm env vars set"),
             ));
-            Some("created from .env.example".to_string())
+            Ok(Some("created from .env.example".to_string()))
         }
-        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
-            // .env already exists
-            Some(".env loaded".to_string())
+        Err(error) if error.error.kind() == ErrorKind::AlreadyExists => {
+            Ok(Some(".env loaded".to_string()))
         }
-        Err(e) => {
-            dev_ui::warn(&format!("Could not create .env file: {e}"));
-            dev_ui::hint_line("Create it manually or check directory permissions.");
-            None
-        }
+        Err(error) => Err(LpmError::Script(format!(
+            "create {}: {}",
+            env_file.display(),
+            error.error
+        ))),
     }
 }
 
@@ -3963,39 +4093,48 @@ async fn start_ca_cert_server(ca_cert_data: Vec<u8>) -> Result<u16, LpmError> {
         .local_addr()
         .map_err(|error| LpmError::Network(format!("read CA bootstrap address: {error}")))?
         .port();
-    tokio::spawn(serve_ca_cert(listener, ca_cert_data));
+    tokio::spawn(serve_ca_cert(listener, Arc::<[u8]>::from(ca_cert_data)));
     Ok(port)
 }
 
-async fn serve_ca_cert(listener: tokio::net::TcpListener, ca_cert_data: Vec<u8>) {
+async fn serve_ca_cert(listener: tokio::net::TcpListener, ca_cert_data: Arc<[u8]>) {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+    const CONNECTION_LIMIT: usize = 16;
+    const IO_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+    let permits = Arc::new(tokio::sync::Semaphore::new(CONNECTION_LIMIT));
     loop {
         let (mut stream, _) = match listener.accept().await {
             Ok(conn) => conn,
             Err(_) => break,
         };
+        let Ok(permit) = Arc::clone(&permits).try_acquire_owned() else {
+            continue;
+        };
 
-        let cert_data = ca_cert_data.clone();
+        let cert_data = Arc::clone(&ca_cert_data);
         tokio::spawn(async move {
-            // Read the request (we don't need to parse it, just drain the headers)
-            let mut buf = [0u8; 4096];
-            let _ = stream.read(&mut buf).await;
-
-            let response = format!(
-                "HTTP/1.1 200 OK\r\n\
-                 Content-Type: application/x-pem-file\r\n\
-                 Content-Disposition: attachment; filename=\"lpm-ca.pem\"\r\n\
-                 Content-Length: {}\r\n\
-                 Cache-Control: no-store\r\n\
-                 Connection: close\r\n\
-                 \r\n",
-                cert_data.len()
-            );
-
-            let _ = stream.write_all(response.as_bytes()).await;
-            let _ = stream.write_all(&cert_data).await;
-            let _ = stream.flush().await;
+            let _permit = permit;
+            let request = async {
+                let mut buf = [0u8; 4096];
+                if stream.read(&mut buf).await? == 0 {
+                    return Ok::<(), std::io::Error>(());
+                }
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\n\
+                     Content-Type: application/x-pem-file\r\n\
+                     Content-Disposition: attachment; filename=\"lpm-ca.pem\"\r\n\
+                     Content-Length: {}\r\n\
+                     Cache-Control: no-store\r\n\
+                     Connection: close\r\n\
+                     \r\n",
+                    cert_data.len()
+                );
+                stream.write_all(response.as_bytes()).await?;
+                stream.write_all(&cert_data).await?;
+                stream.flush().await
+            };
+            let _ = tokio::time::timeout(IO_TIMEOUT, request).await;
         });
     }
 }
@@ -4052,6 +4191,134 @@ mod tests {
             .unwrap();
         assert_eq!(stopped, lpm_proxy::ProxyResponse::Stopped);
         server.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn mobile_ca_bootstrap_drops_an_idle_connection() {
+        use tokio::io::AsyncReadExt;
+
+        let port = start_ca_cert_server(b"test certificate".to_vec())
+            .await
+            .unwrap();
+        let mut stream = tokio::net::TcpStream::connect((Ipv4Addr::LOCALHOST, port))
+            .await
+            .unwrap();
+        let mut byte = [0u8; 1];
+
+        let read = tokio::time::timeout(std::time::Duration::from_secs(3), stream.read(&mut byte))
+            .await
+            .expect("idle bootstrap connection must be closed within the timeout")
+            .unwrap();
+
+        assert_eq!(read, 0);
+    }
+
+    #[test]
+    fn local_proxy_rejects_a_high_tls_port_that_differs_from_lpm_json() {
+        let config = lpm_runner::lpm_json::LpmJsonConfig {
+            proxy: Some(lpm_runner::lpm_json::ProxyConfig {
+                host: Some("app.localhost".to_string()),
+                port: Some(9443),
+                http_redirect: Some(false),
+            }),
+            ..Default::default()
+        };
+        let status = lpm_proxy::ProxyStatus {
+            running: true,
+            pid: Some(42),
+            http_addr: None,
+            http_redirect_addr: None,
+            tls_addr: Some("127.0.0.1:10443".to_string()),
+            routes: Vec::new(),
+            stale: false,
+            state_error: None,
+        };
+
+        let error = validate_local_proxy_listener_contract(&config, &status).unwrap_err();
+
+        assert!(error.contains("9443"), "got {error}");
+        assert!(error.contains("10443"), "got {error}");
+    }
+
+    #[test]
+    fn local_proxy_rejects_a_nonstandard_privileged_tls_port_mismatch() {
+        let config = lpm_runner::lpm_json::LpmJsonConfig {
+            proxy: Some(lpm_runner::lpm_json::ProxyConfig {
+                host: Some("app.localhost".to_string()),
+                port: Some(444),
+                http_redirect: Some(false),
+            }),
+            ..Default::default()
+        };
+        let status = lpm_proxy::ProxyStatus {
+            running: true,
+            pid: Some(42),
+            http_addr: None,
+            http_redirect_addr: None,
+            tls_addr: Some("127.0.0.1:10443".to_string()),
+            routes: Vec::new(),
+            stale: false,
+            state_error: None,
+        };
+
+        let error = validate_local_proxy_listener_contract(&config, &status).unwrap_err();
+
+        assert!(error.contains("444"), "got {error}");
+        assert!(error.contains("10443"), "got {error}");
+    }
+
+    #[test]
+    fn local_proxy_rejects_a_redirect_listener_disabled_by_lpm_json() {
+        let config = lpm_runner::lpm_json::LpmJsonConfig {
+            proxy: Some(lpm_runner::lpm_json::ProxyConfig {
+                host: Some("app.localhost".to_string()),
+                port: Some(9443),
+                http_redirect: Some(false),
+            }),
+            ..Default::default()
+        };
+        let status = lpm_proxy::ProxyStatus {
+            running: true,
+            pid: Some(42),
+            http_addr: None,
+            http_redirect_addr: Some("127.0.0.1:8080".to_string()),
+            tls_addr: Some("127.0.0.1:9443".to_string()),
+            routes: Vec::new(),
+            stale: false,
+            state_error: None,
+        };
+
+        let error = validate_local_proxy_listener_contract(&config, &status).unwrap_err();
+
+        assert!(error.contains("redirect"), "got {error}");
+        assert!(error.contains("disabled"), "got {error}");
+    }
+
+    #[test]
+    fn local_proxy_allows_a_forwarded_backend_for_privileged_tls_and_redirect_ports() {
+        let config = lpm_runner::lpm_json::LpmJsonConfig {
+            services: HashMap::from([(
+                "web".to_string(),
+                lpm_runner::lpm_json::ServiceConfig {
+                    command: "node server.js".to_string(),
+                    host: Some("web.localhost".to_string()),
+                    ..Default::default()
+                },
+            )]),
+            ..Default::default()
+        };
+        let status = lpm_proxy::ProxyStatus {
+            running: true,
+            pid: Some(42),
+            http_addr: None,
+            http_redirect_addr: Some("127.0.0.1:9080".to_string()),
+            tls_addr: Some("127.0.0.1:9443".to_string()),
+            routes: Vec::new(),
+            stale: false,
+            state_error: None,
+        };
+
+        validate_local_proxy_listener_contract(&config, &status).unwrap();
     }
 
     fn remove_staged_dev_session(root: &lpm_common::LpmRoot) {
@@ -5194,7 +5461,7 @@ mod tests {
         let example = dir.path().join(".env.example");
         fs::write(&example, "KEY=value\n").unwrap();
 
-        auto_copy_env_example(dir.path());
+        auto_copy_env_example(dir.path()).unwrap();
 
         let env_content = fs::read_to_string(dir.path().join(".env")).unwrap();
         assert_eq!(env_content, "KEY=value\n");
@@ -5206,7 +5473,7 @@ mod tests {
         fs::write(dir.path().join(".env"), "EXISTING=yes\n").unwrap();
         fs::write(dir.path().join(".env.example"), "KEY=value\n").unwrap();
 
-        auto_copy_env_example(dir.path());
+        auto_copy_env_example(dir.path()).unwrap();
 
         let env_content = fs::read_to_string(dir.path().join(".env")).unwrap();
         assert_eq!(env_content, "EXISTING=yes\n"); // Not overwritten
@@ -5215,8 +5482,87 @@ mod tests {
     #[test]
     fn auto_copy_env_example_no_example_file() {
         let dir = TempDir::new().unwrap();
-        auto_copy_env_example(dir.path());
+        auto_copy_env_example(dir.path()).unwrap();
         assert!(!dir.path().join(".env").exists()); // Nothing created
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn auto_copy_env_example_rejects_a_symlink_outside_the_project() {
+        use std::os::unix::fs::symlink;
+
+        let dir = TempDir::new().unwrap();
+        let outside = tempfile::NamedTempFile::new().unwrap();
+        fs::write(outside.path(), "EXFILTRATED=value\n").unwrap();
+        symlink(outside.path(), dir.path().join(".env.example")).unwrap();
+
+        let result = auto_copy_env_example(dir.path());
+
+        assert!(result.is_err(), "outside symlink must be rejected");
+        assert!(!dir.path().join(".env").exists());
+    }
+
+    #[test]
+    fn auto_copy_env_example_rejects_oversized_input_without_a_partial_env() {
+        let dir = TempDir::new().unwrap();
+        fs::write(
+            dir.path().join(".env.example"),
+            vec![b'x'; lpm_common::CONFIG_FILE_SIZE_CAP_BYTES as usize + 1],
+        )
+        .unwrap();
+
+        let result = auto_copy_env_example(dir.path());
+
+        assert!(result.is_err(), "oversized .env.example must be rejected");
+        assert!(!dir.path().join(".env").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn auto_copy_env_example_creates_a_private_env_file() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = TempDir::new().unwrap();
+        fs::write(dir.path().join(".env.example"), "SECRET=value\n").unwrap();
+
+        auto_copy_env_example(dir.path()).unwrap();
+
+        let mode = fs::metadata(dir.path().join(".env"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600);
+    }
+
+    #[test]
+    fn dashboard_service_logs_share_one_global_memory_budget() {
+        let services = ["api", "web", "worker"]
+            .into_iter()
+            .map(|name| {
+                (
+                    name.to_string(),
+                    lpm_runner::lpm_json::ServiceConfig {
+                        command: "node server.js".to_string(),
+                        ..Default::default()
+                    },
+                )
+            })
+            .collect();
+        let config = lpm_runner::lpm_json::LpmJsonConfig {
+            services,
+            ..Default::default()
+        };
+        let mut dashboard_services = build_dashboard_services(&config).unwrap();
+        for service in &mut dashboard_services {
+            service.logs.push("x".repeat(6 * 1024 * 1024));
+        }
+
+        let retained: usize = dashboard_services
+            .iter()
+            .map(|service| service.logs.retained_bytes())
+            .sum();
+        assert!(retained <= 16 * 1024 * 1024, "retained {retained} bytes");
     }
 
     #[test]
@@ -5268,7 +5614,7 @@ mod tests {
         let example = dir.path().join(".env.example");
         fs::write(&example, "KEY=value\n").unwrap();
 
-        let status = auto_copy_env_example(dir.path());
+        let status = auto_copy_env_example(dir.path()).unwrap();
         assert_eq!(status, Some("created from .env.example".to_string()));
     }
 
@@ -5278,7 +5624,7 @@ mod tests {
         fs::write(dir.path().join(".env"), "EXISTING=yes\n").unwrap();
         fs::write(dir.path().join(".env.example"), "KEY=value\n").unwrap();
 
-        let status = auto_copy_env_example(dir.path());
+        let status = auto_copy_env_example(dir.path()).unwrap();
         assert_eq!(status, Some(".env loaded".to_string()));
     }
 
@@ -5596,7 +5942,7 @@ mod tests {
     #[test]
     fn auto_copy_env_example_no_example_returns_none() {
         let dir = TempDir::new().unwrap();
-        let status = auto_copy_env_example(dir.path());
+        let status = auto_copy_env_example(dir.path()).unwrap();
         assert_eq!(status, None);
     }
 

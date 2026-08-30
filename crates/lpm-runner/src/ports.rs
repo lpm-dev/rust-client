@@ -576,6 +576,12 @@ pub(crate) fn list_listening_ports_for_pids_until(
 #[serde(transparent)]
 pub struct ProcessIdentity(String);
 
+impl ProcessIdentity {
+    pub(crate) fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct DescendantProcessSnapshot {
     identities: HashMap<u32, Option<ProcessIdentity>>,

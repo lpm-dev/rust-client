@@ -6,6 +6,7 @@
 //! Delegates to [`crate::dag`] for the generic topological sort algorithm.
 
 use crate::lpm_json::ServiceConfig;
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 
 /// Convert services to a generic node → deps map for the DAG solver.
@@ -53,8 +54,15 @@ pub fn select_active_services(
     services: &HashMap<String, ServiceConfig>,
     filters: &[String],
 ) -> Result<HashMap<String, ServiceConfig>, String> {
+    select_active_services_ref(services, filters).map(Cow::into_owned)
+}
+
+pub fn select_active_services_ref<'a>(
+    services: &'a HashMap<String, ServiceConfig>,
+    filters: &[String],
+) -> Result<Cow<'a, HashMap<String, ServiceConfig>>, String> {
     if filters.is_empty() {
-        return Ok(services.clone());
+        return Ok(Cow::Borrowed(services));
     }
 
     let mut active = HashMap::new();
@@ -73,7 +81,7 @@ pub fn select_active_services(
             }
         }
     }
-    Ok(active)
+    Ok(Cow::Owned(active))
 }
 
 /// Return the explicit primary service, or the only service when it is implicit.
@@ -210,6 +218,15 @@ mod tests {
         let mut names: Vec<_> = active.keys().map(String::as_str).collect();
         names.sort_unstable();
         assert_eq!(names, vec!["api", "db", "web"]);
+    }
+
+    #[test]
+    fn selecting_without_filters_borrows_the_existing_service_map() {
+        let services = HashMap::from([("web".to_string(), svc("next dev", &[]))]);
+
+        let selected = select_active_services_ref(&services, &[]).unwrap();
+
+        assert!(matches!(selected, Cow::Borrowed(_)));
     }
 
     #[test]

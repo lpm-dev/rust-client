@@ -23,13 +23,8 @@ pub(crate) fn wait_for_port_until(
     mut should_cancel: impl FnMut() -> bool,
 ) -> Result<Duration, String> {
     let start = Instant::now();
-    wait_for_port_until_deadline(
-        port,
-        start,
-        start + Duration::from_secs(timeout_secs),
-        timeout_secs,
-        &mut should_cancel,
-    )
+    let deadline = deadline_from_timeout(start, timeout_secs)?;
+    wait_for_port_until_deadline(port, start, deadline, timeout_secs, &mut should_cancel)
 }
 
 pub(crate) fn wait_for_port_until_deadline(
@@ -105,13 +100,14 @@ pub(crate) fn wait_for_url_until(
     mut should_cancel: impl FnMut() -> bool,
 ) -> Result<Duration, String> {
     let start = Instant::now();
-    wait_for_url_until_deadline(
-        url,
-        start,
-        start + Duration::from_secs(timeout_secs),
-        timeout_secs,
-        &mut should_cancel,
-    )
+    let deadline = deadline_from_timeout(start, timeout_secs)?;
+    wait_for_url_until_deadline(url, start, deadline, timeout_secs, &mut should_cancel)
+}
+
+pub(crate) fn deadline_from_timeout(start: Instant, timeout_secs: u64) -> Result<Instant, String> {
+    start
+        .checked_add(Duration::from_secs(timeout_secs))
+        .ok_or_else(|| format!("readiness timeout is too large: {timeout_secs}s"))
 }
 
 pub(crate) fn wait_for_url_until_deadline(
@@ -121,28 +117,7 @@ pub(crate) fn wait_for_url_until_deadline(
     timeout_secs: u64,
     mut should_cancel: impl FnMut() -> bool,
 ) -> Result<Duration, String> {
-    // Reject HTTPS URLs early with a clear message instead of a confusing TCP error
-    if url.starts_with("https://") {
-        return Err(format!(
-            "HTTPS readiness checks are not supported. \
-			 Use an HTTP URL for \"readyUrl\" in lpm.json, or configure your \
-			 service to expose an HTTP health endpoint.\n\
-			 \n\
-			 Got: {url}"
-        ));
-    }
-
-    // Reject non-localhost URLs to prevent SSRF: a malicious lpm.json could
-    // use readyUrl to probe internal network services.
-    if !is_localhost_url(url) {
-        return Err(format!(
-            "readyUrl must point to localhost for security. \
-			 Non-local URLs are rejected to prevent SSRF attacks.\n\
-			 \n\
-			 Got: {url}\n\
-			 Use: http://localhost:<port>/health or http://127.0.0.1:<port>/health"
-        ));
-    }
+    validate_ready_url(url)?;
 
     let poll_interval = Duration::from_millis(500);
 
@@ -176,6 +151,41 @@ pub(crate) fn wait_for_url_until_deadline(
             }
         }
     }
+}
+
+pub(crate) fn validate_ready_url(url: &str) -> Result<(), String> {
+    if url
+        .get(..8)
+        .is_some_and(|scheme| scheme.eq_ignore_ascii_case("https://"))
+    {
+        return Err(format!(
+            "HTTPS readiness checks are not supported. Use an HTTP URL for \"readyUrl\" in lpm.json. Got: {url}"
+        ));
+    }
+    if !is_localhost_url(url) {
+        return Err(format!(
+            "readyUrl must point to localhost over HTTP. Got: {url}. Use http://localhost:<port>/health or http://127.0.0.1:<port>/health"
+        ));
+    }
+
+    let without_scheme = url
+        .get(..7)
+        .filter(|scheme| scheme.eq_ignore_ascii_case("http://"))
+        .map_or(url, |_| &url[7..]);
+    let (host_port, path) = without_scheme
+        .find('/')
+        .map_or((without_scheme, "/"), |index| {
+            (&without_scheme[..index], &without_scheme[index..])
+        });
+    local_http_addresses(host_port).map(|_| ())?;
+    if path.len() > MAX_HTTP_REQUEST_TARGET_BYTES
+        || path
+            .bytes()
+            .any(|byte| byte.is_ascii_control() || byte == b' ')
+    {
+        return Err("invalid readyUrl: request target contains unsafe characters".to_string());
+    }
+    Ok(())
 }
 
 fn sleep_until_cancelled(duration: Duration, should_cancel: &mut impl FnMut() -> bool) -> bool {
@@ -389,6 +399,20 @@ mod tests {
     use std::net::TcpListener;
     use std::sync::mpsc;
     use std::thread;
+
+    #[test]
+    fn wait_for_port_rejects_a_timeout_that_cannot_fit_in_an_instant() {
+        let (result_tx, result_rx) = mpsc::channel();
+        thread::spawn(move || {
+            let _ = result_tx.send(wait_for_port(1, u64::MAX));
+        });
+        let result = result_rx
+            .recv_timeout(Duration::from_millis(100))
+            .expect("an unrepresentable timeout must be rejected immediately");
+        let error = result.unwrap_err();
+
+        assert!(error.contains("timeout is too large"), "got {error}");
+    }
 
     #[test]
     fn wait_for_port_succeeds_when_listening() {

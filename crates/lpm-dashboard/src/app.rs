@@ -152,9 +152,13 @@ impl DashboardApp {
     }
 
     pub fn push_log(&mut self, service_index: usize, line: &str) {
+        self.push_log_owned(service_index, line.to_string());
+    }
+
+    pub fn push_log_owned(&mut self, service_index: usize, line: String) {
         if let Some(svc) = self.services.get_mut(service_index) {
             let was_at_bottom = self.scroll_offset == 0;
-            svc.logs.push(line.to_string());
+            svc.logs.push(line);
             // If buffer overflowed and we were scrolled up, clamp offset
             if !was_at_bottom && service_index == self.selected_service {
                 let max = svc.logs.len().saturating_sub(1);

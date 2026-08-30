@@ -156,11 +156,25 @@ pub fn detect_bun_version_with_lpm_json_spec(
 /// Detect every managed runtime requirement in deterministic PATH order.
 /// Missing files are skipped; any other read failure stops detection.
 pub fn detect_runtime_versions(project_dir: &Path) -> DetectionResult<Vec<DetectedRuntimeVersion>> {
+    let (node_spec, bun_spec) = read_lpm_json_runtime_specs(project_dir)?;
+    detect_runtime_versions_with_lpm_json_specs(
+        project_dir,
+        node_spec.as_deref(),
+        bun_spec.as_deref(),
+    )
+}
+
+/// Detect managed runtime requirements using `lpm.json` selectors that the caller already parsed.
+pub fn detect_runtime_versions_with_lpm_json_specs(
+    project_dir: &Path,
+    node_spec: Option<&str>,
+    bun_spec: Option<&str>,
+) -> DetectionResult<Vec<DetectedRuntimeVersion>> {
     let mut detected = Vec::with_capacity(2);
-    if let Some(node) = detect_node_version(project_dir)? {
+    if let Some(node) = detect_node_version_with_lpm_json_spec(project_dir, node_spec)? {
         detected.push(node);
     }
-    if let Some(bun) = detect_bun_version(project_dir)? {
+    if let Some(bun) = detect_bun_version_with_lpm_json_spec(bun_spec) {
         detected.push(bun);
     }
     Ok(detected)
@@ -226,6 +240,26 @@ fn detect_from_lpm_json_runtime(
     };
 
     Ok(Some(detected_lpm_json_runtime(runtime, spec)))
+}
+
+fn read_lpm_json_runtime_specs(
+    project_dir: &Path,
+) -> DetectionResult<(Option<String>, Option<String>)> {
+    let path = project_dir.join("lpm.json");
+    let Some(content) = read_optional_runtime_config(&path)? else {
+        return Ok((None, None));
+    };
+    let Ok(doc) = serde_json::from_str::<serde_json::Value>(&content) else {
+        return Ok((None, None));
+    };
+    let runtime = doc.get("runtime");
+    let spec = |kind: RuntimeKind| {
+        runtime
+            .and_then(|config| config.get(kind.as_str()))
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string)
+    };
+    Ok((spec(RuntimeKind::Node), spec(RuntimeKind::Bun)))
 }
 
 /// Parse an .nvmrc or .node-version file content into a version spec.
@@ -371,6 +405,24 @@ mod tests {
         let versions = detect_runtime_versions(dir.path()).unwrap();
         let kinds: Vec<RuntimeKind> = versions.iter().map(|v| v.runtime).collect();
         assert_eq!(kinds, vec![RuntimeKind::Node, RuntimeKind::Bun]);
+    }
+
+    #[test]
+    fn preloaded_runtime_specs_do_not_reread_lpm_json() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("lpm.json"), b"not valid json").unwrap();
+
+        let versions =
+            detect_runtime_versions_with_lpm_json_specs(dir.path(), Some("22"), Some("1.3.14"))
+                .unwrap();
+
+        assert_eq!(
+            versions
+                .iter()
+                .map(|version| (version.runtime, version.spec.as_str()))
+                .collect::<Vec<_>>(),
+            vec![(RuntimeKind::Node, "22"), (RuntimeKind::Bun, "1.3.14")]
+        );
     }
 
     #[test]
