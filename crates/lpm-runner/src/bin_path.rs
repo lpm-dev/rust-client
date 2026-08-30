@@ -4,6 +4,7 @@
 //! supporting monorepo layouts where workspace root also has a `.bin` dir.
 
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 /// Discover all `node_modules/.bin` directories from `start_dir` upward.
 ///
@@ -37,6 +38,48 @@ pub fn find_bin_dirs(start_dir: &Path) -> Vec<PathBuf> {
     }
 
     bin_dirs
+}
+
+/// Discover `node_modules/.bin` directories without walking above `boundary`.
+///
+/// The boundary must be `start_dir` or one of its ancestors. This is the
+/// appropriate lookup for commands that already know their selected project
+/// or workspace root and must not execute binaries from an unrelated parent.
+pub fn find_bin_dirs_bounded(
+    start_dir: &Path,
+    boundary: &Path,
+) -> Result<Vec<PathBuf>, lpm_common::LpmError> {
+    if !start_dir.starts_with(boundary) {
+        return Err(lpm_common::LpmError::Script(format!(
+            "binary lookup boundary {} is not an ancestor of {}",
+            boundary.display(),
+            start_dir.display()
+        )));
+    }
+
+    let mut bin_dirs = Vec::new();
+    let mut current = start_dir.to_path_buf();
+    loop {
+        let mut bin_dir = PathBuf::with_capacity(current.as_os_str().len() + 18);
+        bin_dir.push(&current);
+        bin_dir.push("node_modules");
+        bin_dir.push(".bin");
+        if bin_dir.is_dir() {
+            bin_dirs.push(bin_dir);
+        }
+
+        if current == boundary {
+            break;
+        }
+        if !current.pop() {
+            return Err(lpm_common::LpmError::Script(format!(
+                "binary lookup escaped its boundary at {}",
+                boundary.display()
+            )));
+        }
+    }
+
+    Ok(bin_dirs)
 }
 
 /// Check if a directory is a workspace root (has workspaces config).
@@ -78,6 +121,81 @@ pub enum ManagedRuntimeHint {
     Resolved(Vec<ManagedRuntimeBin>),
     Absent,
     Unknown,
+}
+
+/// Per-command cache of installed managed runtimes used while building child PATH values.
+#[derive(Debug, Default)]
+pub struct ManagedRuntimeInventory {
+    node: OnceLock<Result<Vec<String>, String>>,
+    bun: OnceLock<Result<Vec<String>, String>>,
+}
+
+impl ManagedRuntimeInventory {
+    /// Resolve the managed-runtime PATH hint for one project without rescanning inventories.
+    pub fn resolve_for_project(
+        &self,
+        project_dir: &Path,
+    ) -> Result<ManagedRuntimeHint, lpm_common::LpmError> {
+        let detected = lpm_runtime::detect::detect_runtime_versions(project_dir)?;
+        let mut bins = Vec::with_capacity(detected.len());
+        for runtime in detected {
+            if !runtime.is_runtime_selector() {
+                continue;
+            }
+            let installed = self.installed(runtime.runtime)?;
+            let matched = match runtime.runtime {
+                lpm_runtime::detect::RuntimeKind::Node => {
+                    lpm_runtime::node::find_matching_installed(&runtime.spec, installed)
+                }
+                lpm_runtime::detect::RuntimeKind::Bun => {
+                    lpm_runtime::bun::find_matching_installed(&runtime.spec, installed)
+                }
+            };
+            let Some(version) = matched else {
+                continue;
+            };
+            let bin_dir = match runtime.runtime {
+                lpm_runtime::detect::RuntimeKind::Node => {
+                    lpm_runtime::node::node_bin_dir(&version)?
+                }
+                lpm_runtime::detect::RuntimeKind::Bun => lpm_runtime::bun::bun_bin_dir(&version)?,
+            };
+            bins.push(ManagedRuntimeBin {
+                runtime: runtime.runtime,
+                version,
+                bin_dir,
+            });
+        }
+        if bins.is_empty() {
+            Ok(ManagedRuntimeHint::Absent)
+        } else {
+            Ok(ManagedRuntimeHint::Resolved(bins))
+        }
+    }
+
+    fn installed(
+        &self,
+        runtime: lpm_runtime::detect::RuntimeKind,
+    ) -> Result<&[String], lpm_common::LpmError> {
+        match runtime {
+            lpm_runtime::detect::RuntimeKind::Node => {
+                cached_installed_versions(&self.node, lpm_runtime::node::list_installed)
+            }
+            lpm_runtime::detect::RuntimeKind::Bun => {
+                cached_installed_versions(&self.bun, lpm_runtime::bun::list_installed)
+            }
+        }
+    }
+}
+
+fn cached_installed_versions(
+    cache: &OnceLock<Result<Vec<String>, String>>,
+    load: impl FnOnce() -> Result<Vec<String>, lpm_common::LpmError>,
+) -> Result<&[String], lpm_common::LpmError> {
+    cache
+        .get_or_init(|| load().map_err(|error| error.to_string()))
+        .as_deref()
+        .map_err(|error| lpm_common::LpmError::Script(error.clone()))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -189,6 +307,24 @@ pub fn build_path_with_bins_pre_resolved(
     hint: &ManagedRuntimeHint,
 ) -> lpm_runtime::detect::DetectionResult<String> {
     let bin_dirs = find_bin_dirs(start_dir);
+    build_path_from_bin_dirs(start_dir, &bin_dirs, hint)
+}
+
+/// Build a PATH whose project-local binary lookup cannot escape `boundary`.
+pub fn build_path_with_bins_bounded(
+    start_dir: &Path,
+    boundary: &Path,
+    hint: &ManagedRuntimeHint,
+) -> Result<String, lpm_common::LpmError> {
+    let bin_dirs = find_bin_dirs_bounded(start_dir, boundary)?;
+    build_path_from_bin_dirs(start_dir, &bin_dirs, hint).map_err(Into::into)
+}
+
+pub(crate) fn build_path_from_bin_dirs(
+    start_dir: &Path,
+    bin_dirs: &[PathBuf],
+    hint: &ManagedRuntimeHint,
+) -> lpm_runtime::detect::DetectionResult<String> {
     let existing_path = std::env::var("PATH").unwrap_or_default();
     let separator = if cfg!(windows) { ";" } else { ":" };
 
@@ -291,6 +427,39 @@ mod tests {
         let dirs = find_bin_dirs(dir.path());
         assert_eq!(dirs.len(), 1);
         assert_eq!(dirs[0], bin);
+    }
+
+    #[test]
+    fn bounded_bin_discovery_does_not_escape_selected_project() {
+        let root = tempfile::tempdir().unwrap();
+        let project = root.path().join("project");
+        fs::create_dir_all(&project).unwrap();
+        fs::create_dir_all(root.path().join("node_modules/.bin")).unwrap();
+
+        let dirs = find_bin_dirs_bounded(&project, &project).unwrap();
+
+        assert!(dirs.is_empty());
+    }
+
+    #[test]
+    fn installed_runtime_inventory_loads_each_family_once() {
+        let cache = OnceLock::new();
+        let calls = std::cell::Cell::new(0);
+
+        let first = cached_installed_versions(&cache, || {
+            calls.set(calls.get() + 1);
+            Ok(vec!["22.12.0".to_string()])
+        })
+        .unwrap();
+        let second = cached_installed_versions(&cache, || {
+            calls.set(calls.get() + 1);
+            Ok(vec!["23.0.0".to_string()])
+        })
+        .unwrap();
+
+        assert_eq!(calls.get(), 1);
+        assert_eq!(first, ["22.12.0"]);
+        assert_eq!(second, ["22.12.0"]);
     }
 
     #[test]

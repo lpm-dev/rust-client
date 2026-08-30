@@ -212,7 +212,7 @@ fn windows_first_command_word(script_cmd: &str) -> Option<&str> {
 /// split into argv by the user's shell) and must not re-introduce
 /// metacharacter semantics — otherwise `lpm run x -- "; rm -rf ~"`
 /// detonates inside `sh -c`.
-fn assemble_shell_command(
+pub fn assemble_shell_command(
     script_cmd: &str,
     extra_args: &[String],
     project_dir: &Path,
@@ -947,6 +947,48 @@ pub fn build_local_bin_command(
 ) -> Result<Command, LpmError> {
     let bin_path = resolve_local_bin_path(project_dir, command_name)?;
     let path = bin_path::build_path_with_bins_pre_resolved(project_dir, bin_hint)?;
+    build_configured_local_bin_command(
+        project_dir,
+        bin_path,
+        extra_args,
+        env_mode,
+        no_env_check,
+        path,
+    )
+}
+
+/// Build a direct process command for a project-local binary without allowing
+/// binary or PATH discovery above `boundary`.
+pub fn build_local_bin_command_bounded(
+    project_dir: &Path,
+    boundary: &Path,
+    command_name: &str,
+    extra_args: &[String],
+    env_mode: Option<&str>,
+    no_env_check: bool,
+    bin_hint: &ManagedRuntimeHint,
+) -> Result<Command, LpmError> {
+    let bin_dirs = bin_path::find_bin_dirs_bounded(project_dir, boundary)?;
+    let bin_path = resolve_local_bin_path_from_dirs(command_name, &bin_dirs)?;
+    let path = bin_path::build_path_from_bin_dirs(project_dir, &bin_dirs, bin_hint)?;
+    build_configured_local_bin_command(
+        project_dir,
+        bin_path,
+        extra_args,
+        env_mode,
+        no_env_check,
+        path,
+    )
+}
+
+fn build_configured_local_bin_command(
+    project_dir: &Path,
+    bin_path: PathBuf,
+    extra_args: &[String],
+    env_mode: Option<&str>,
+    no_env_check: bool,
+    path: String,
+) -> Result<Command, LpmError> {
     let env_vars =
         dotenv::load_project_env_with_schema_validation(project_dir, env_mode, !no_env_check)?;
 
@@ -1015,8 +1057,26 @@ fn resolve_local_bin_path(project_dir: &Path, command_name: &str) -> Result<Path
     }
 
     let bin_dirs = bin_path::find_bin_dirs(project_dir);
+    resolve_local_bin_path_from_dirs(command_name, &bin_dirs)
+}
+
+fn resolve_local_bin_path_from_dirs(
+    command_name: &str,
+    bin_dirs: &[PathBuf],
+) -> Result<PathBuf, LpmError> {
+    if command_name.trim().is_empty() {
+        return Err(LpmError::Script(
+            "`lpm exec` requires a project-local binary name".into(),
+        ));
+    }
+    if is_path_like_command(command_name) {
+        return Err(LpmError::Script(format!(
+            "`lpm exec` runs project-local binaries, not file paths. Use `lpm {command_name}` to run a JS/TS source file directly."
+        )));
+    }
+
     let candidate_names = local_bin_candidate_names(command_name);
-    for bin_dir in &bin_dirs {
+    for bin_dir in bin_dirs {
         for candidate_name in &candidate_names {
             let candidate = bin_dir.join(candidate_name);
             if is_executable_file(&candidate) {
