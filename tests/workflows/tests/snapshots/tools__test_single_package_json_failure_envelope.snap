@@ -1,0 +1,22 @@
+---
+source: tests/workflows/tests/tools.rs
+assertion_line: 1033
+expression: envelope
+---
+{
+  "success": false,
+  "packages": 1,
+  "succeeded": 0,
+  "failed": 1,
+  "duration_ms": 0,
+  "members": [
+    {
+      "name": "json-test-failure",
+      "success": false,
+      "exit_code": 3,
+      "duration_ms": 0,
+      "stdout": "child stdout\n",
+      "stderr": "child stderr\n"
+    }
+  ]
+}

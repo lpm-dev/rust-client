@@ -627,7 +627,7 @@ pub fn spawn_shell_capture(cmd: &ShellCommand) -> Result<CapturedOutput, LpmErro
     let mut command = shell_process(cmd.command)?;
     command
         .current_dir(cmd.cwd)
-        .stdin(Stdio::inherit())
+        .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
 
@@ -638,9 +638,23 @@ pub fn spawn_shell_capture(cmd: &ShellCommand) -> Result<CapturedOutput, LpmErro
     }
     command.env("PATH", cmd.path);
 
+    spawn_command_capture(command, cmd.command)
+}
+
+/// Spawn a configured direct command with null stdin and bounded captured
+/// stdout/stderr.
+pub fn spawn_command_capture(
+    mut command: Command,
+    display_name: &str,
+) -> Result<CapturedOutput, LpmError> {
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+
     let mut child = command
         .spawn()
-        .map_err(|e| LpmError::Script(format!("failed to execute '{}': {e}", cmd.command)))?;
+        .map_err(|e| LpmError::Script(format!("failed to execute '{display_name}': {e}")))?;
 
     // Manual piped reads (rather than `Command::output()`) so the
     // accumulator can apply MAX_CAPTURED_STREAM_BYTES during read —
@@ -659,7 +673,7 @@ pub fn spawn_shell_capture(cmd: &ShellCommand) -> Result<CapturedOutput, LpmErro
 
     let status = child
         .wait()
-        .map_err(|e| LpmError::Script(format!("failed to wait for '{}': {e}", cmd.command)))?;
+        .map_err(|e| LpmError::Script(format!("failed to wait for '{display_name}': {e}")))?;
 
     let stdout = stdout_handle.join().unwrap_or_default();
     let stderr = stderr_handle.join().unwrap_or_default();
@@ -746,7 +760,7 @@ pub fn spawn_shell_prefixed(
     reason = "the Windows implementation can fail while resolving the system shell"
 )]
 pub(crate) fn shell_process(command: &str) -> Result<Command, LpmError> {
-    let mut process = Command::new("sh");
+    let mut process = Command::new("/bin/sh");
     process.arg("-c").arg(command);
     Ok(process)
 }
@@ -818,6 +832,14 @@ mod tests {
 
         assert!(status.success());
         assert_eq!(exit_code(&status), 0);
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn shell_process_uses_absolute_system_shell() {
+        let process = shell_process("exit 0").unwrap();
+
+        assert_eq!(process.get_program(), std::ffi::OsStr::new("/bin/sh"));
     }
 
     #[test]

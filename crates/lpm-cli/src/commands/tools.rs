@@ -1,9 +1,12 @@
 use super::tools_ui;
 use crate::{CheckEngine, install_ui};
+use futures::stream::{FuturesUnordered, StreamExt};
 use lpm_common::LpmError;
+use std::collections::{HashSet, VecDeque};
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::Arc;
 
 /// Maximum size for captured workspace stdout/stderr before truncation.
 /// Mirrors the `MAX_CAPTURED_OUTPUT` constant in `commands::run` so chatty
@@ -69,6 +72,44 @@ impl WorkspaceConcurrency {
 struct Captured {
     stdout: String,
     stderr: String,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RunnerTool {
+    Test,
+    Bench,
+}
+
+impl RunnerTool {
+    fn from_label(label: &str) -> Result<Self, LpmError> {
+        match label {
+            "test" => Ok(Self::Test),
+            "bench" => Ok(Self::Bench),
+            _ => Err(LpmError::Script(format!("unknown runner tool: {label}"))),
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Test => "test",
+            Self::Bench => "bench",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum RunnerInvocation {
+    LocalBin {
+        name: &'static str,
+        base_args: Vec<String>,
+    },
+    PackageScript(String),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct DetectedRunner {
+    label: &'static str,
+    invocation: RunnerInvocation,
 }
 
 /// Run `lpm lint` — delegates to oxlint via plugin system.
@@ -242,89 +283,19 @@ fn check_preflight(project_dir: &Path, engine: CheckEngine) -> Result<(), LpmErr
 
 /// Run `lpm test` — auto-detects test runner and delegates.
 pub async fn test(project_dir: &Path, args: &[String], json_output: bool) -> Result<(), LpmError> {
-    let (runner_name, runner_cmd) = detect_test_runner(project_dir)?;
-    let runner_cmd = adjust_test_runner_for_watch(&runner_name, runner_cmd, args);
-
-    if !json_output {
-        tools_ui::detected_test_runner(&runner_name);
-    }
-
-    let path = lpm_runner::bin_path::build_path_with_bins(project_dir)?;
-    let env_vars = lpm_runner::dotenv::load_env_files(project_dir, None)?;
-
-    let full_cmd = if args.is_empty() {
-        runner_cmd
-    } else {
-        build_safe_command(&runner_name, &runner_cmd, args)
-    };
-
-    let start = std::time::Instant::now();
-    let status = lpm_runner::shell::spawn_shell(&lpm_runner::shell::ShellCommand {
-        command: &full_cmd,
-        cwd: project_dir,
-        path: &path,
-        envs: &env_vars,
-    })?;
-
-    if !status.success() {
-        let code = lpm_runner::shell::exit_code(&status);
-        if !json_output {
-            tools_ui::failed("test", code);
-        }
-        return Err(LpmError::ExitCode(code));
-    }
-
-    if !json_output {
-        tools_ui::done_test(start.elapsed());
-    }
-
-    Ok(())
+    run_single_runner(RunnerTool::Test, project_dir, args, json_output).await
 }
 
 /// Run `lpm bench` — auto-detects benchmark runner and delegates.
 pub async fn bench(project_dir: &Path, args: &[String], json_output: bool) -> Result<(), LpmError> {
-    let (runner_name, cmd) = detect_bench_runner(project_dir)?;
-
-    if !json_output {
-        tools_ui::detected_bench_runner(&runner_name);
-    }
-
-    let path = lpm_runner::bin_path::build_path_with_bins(project_dir)?;
-    let env_vars = lpm_runner::dotenv::load_env_files(project_dir, None)?;
-
-    let full_cmd = if args.is_empty() {
-        cmd
-    } else {
-        build_safe_command(&runner_name, &cmd, args)
-    };
-
-    let start = std::time::Instant::now();
-    let status = lpm_runner::shell::spawn_shell(&lpm_runner::shell::ShellCommand {
-        command: &full_cmd,
-        cwd: project_dir,
-        path: &path,
-        envs: &env_vars,
-    })?;
-
-    if !status.success() {
-        let code = lpm_runner::shell::exit_code(&status);
-        if !json_output {
-            tools_ui::failed("bench", code);
-        }
-        return Err(LpmError::ExitCode(code));
-    }
-
-    if !json_output {
-        tools_ui::done_bench(start.elapsed());
-    }
-
-    Ok(())
+    run_single_runner(RunnerTool::Bench, project_dir, args, json_output).await
 }
 
 /// Auto-detect the benchmark runner from package.json. Extracted from the
 /// inline match in `bench()` so the workspace orchestrator can reuse it
 /// per-member without duplicating the priority logic.
-fn detect_bench_runner(project_dir: &Path) -> Result<(String, String), LpmError> {
+#[cfg(test)]
+fn detect_bench_runner(project_dir: &Path) -> Result<DetectedRunner, LpmError> {
     let pkg_json_path = project_dir.join("package.json");
     if !pkg_json_path.exists() {
         return Err(LpmError::Script("no package.json found".into()));
@@ -333,16 +304,269 @@ fn detect_bench_runner(project_dir: &Path) -> Result<(String, String), LpmError>
     let pkg = lpm_workspace::read_package_json(&pkg_json_path)
         .map_err(|e| LpmError::Script(format!("{e}")))?;
 
-    if pkg.dependencies.contains_key("vitest") || pkg.dev_dependencies.contains_key("vitest") {
-        return Ok(("vitest".to_string(), "vitest bench".to_string()));
+    detect_bench_runner_from_package(&pkg)
+}
+
+async fn run_single_runner(
+    tool: RunnerTool,
+    project_dir: &Path,
+    args: &[String],
+    json_output: bool,
+) -> Result<(), LpmError> {
+    let pkg_json_path = project_dir.join("package.json");
+    if !pkg_json_path.is_file() {
+        return Err(LpmError::Script("no package.json found".into()));
     }
-    if let Some(bench_script) = pkg.scripts.get("bench") {
-        return Ok(("scripts.bench".to_string(), bench_script.clone()));
+    let package = lpm_workspace::read_package_json(&pkg_json_path)
+        .map_err(|error| LpmError::Script(error.to_string()))?;
+    let runner = match tool {
+        RunnerTool::Test => detect_test_runner_from_package(&package),
+        RunnerTool::Bench => detect_bench_runner_from_package(&package),
+    }?;
+
+    if !json_output {
+        match tool {
+            RunnerTool::Test => tools_ui::detected_test_runner(runner.label),
+            RunnerTool::Bench => tools_ui::detected_bench_runner(runner.label),
+        }
     }
 
+    let boundary = runner_boundary(project_dir)?;
+    let project_dir = project_dir.to_path_buf();
+    let member_name = package.name.unwrap_or_else(|| {
+        project_dir.file_name().map_or_else(
+            || "<project>".into(),
+            |name| name.to_string_lossy().into_owned(),
+        )
+    });
+    let args: Arc<[String]> = args.to_vec().into();
+    let start = std::time::Instant::now();
+    let stdio = if json_output {
+        StdioMode::Capture
+    } else {
+        StdioMode::Inherit
+    };
+    let runtime_inventory = lpm_runner::bin_path::ManagedRuntimeInventory::default();
+    let outcome = tokio::task::spawn_blocking(move || {
+        execute_runner(
+            &project_dir,
+            &boundary,
+            &runner,
+            &args,
+            stdio,
+            &runtime_inventory,
+        )
+    })
+    .await
+    .map_err(|error| {
+        LpmError::Script(format!("{0} runner task panicked: {error}", tool.label()))
+    })?;
+    let elapsed = start.elapsed();
+    let result = outcome.as_result();
+
+    if json_output {
+        let success = outcome.success();
+        let member = member_result(member_name, outcome, elapsed);
+        emit_envelope(
+            std::slice::from_ref(&member),
+            1,
+            usize::from(success),
+            usize::from(!success),
+            elapsed,
+        );
+    } else if outcome.success() {
+        match tool {
+            RunnerTool::Test => tools_ui::done_test(elapsed),
+            RunnerTool::Bench => tools_ui::done_bench(elapsed),
+        }
+    } else if let Some(code) = outcome.exit_code {
+        tools_ui::failed(tool.label(), code);
+    }
+
+    result
+}
+
+fn runner_boundary(project_dir: &Path) -> Result<PathBuf, LpmError> {
+    lpm_workspace::find_workspace_root(project_dir)
+        .map(|root| root.unwrap_or_else(|| project_dir.to_path_buf()))
+        .map_err(|error| LpmError::Script(format!("workspace error: {error}")))
+}
+
+fn detect_test_runner_from_package(
+    package: &lpm_workspace::PackageJson,
+) -> Result<DetectedRunner, LpmError> {
+    for (name, base_args) in [
+        ("vitest", vec!["run".to_string()]),
+        ("jest", Vec::new()),
+        ("mocha", Vec::new()),
+    ] {
+        if package.dependencies.contains_key(name) || package.dev_dependencies.contains_key(name) {
+            return Ok(DetectedRunner {
+                label: name,
+                invocation: RunnerInvocation::LocalBin { name, base_args },
+            });
+        }
+    }
+    if let Some(script) = package.scripts.get("test") {
+        return Ok(DetectedRunner {
+            label: "scripts.test",
+            invocation: RunnerInvocation::PackageScript(script.clone()),
+        });
+    }
+    Err(LpmError::Script(
+        "no test runner found. Install vitest/jest/mocha or add a 'test' script to package.json"
+            .into(),
+    ))
+}
+
+fn detect_bench_runner_from_package(
+    package: &lpm_workspace::PackageJson,
+) -> Result<DetectedRunner, LpmError> {
+    if package.dependencies.contains_key("vitest")
+        || package.dev_dependencies.contains_key("vitest")
+    {
+        return Ok(DetectedRunner {
+            label: "vitest",
+            invocation: RunnerInvocation::LocalBin {
+                name: "vitest",
+                base_args: vec!["bench".to_string()],
+            },
+        });
+    }
+    if let Some(script) = package.scripts.get("bench") {
+        return Ok(DetectedRunner {
+            label: "scripts.bench",
+            invocation: RunnerInvocation::PackageScript(script.clone()),
+        });
+    }
     Err(LpmError::Script(
         "no benchmark runner found. Install vitest or add a 'bench' script to package.json".into(),
     ))
+}
+
+fn execute_runner(
+    project_dir: &Path,
+    boundary: &Path,
+    runner: &DetectedRunner,
+    forwarded_args: &[String],
+    stdio: StdioMode,
+    runtime_inventory: &lpm_runner::bin_path::ManagedRuntimeInventory,
+) -> ToolOutcome {
+    let result = runtime_inventory
+        .resolve_for_project(project_dir)
+        .and_then(|runtime_hint| match &runner.invocation {
+            RunnerInvocation::LocalBin { name, base_args } => execute_local_runner(
+                project_dir,
+                boundary,
+                name,
+                base_args,
+                forwarded_args,
+                stdio,
+                &runtime_hint,
+            ),
+            RunnerInvocation::PackageScript(script) => execute_package_script(
+                project_dir,
+                boundary,
+                script,
+                forwarded_args,
+                stdio,
+                &runtime_hint,
+            ),
+        });
+    result.unwrap_or_else(|error| ToolOutcome {
+        error: Some(error.to_string()),
+        ..Default::default()
+    })
+}
+
+fn execute_local_runner(
+    project_dir: &Path,
+    boundary: &Path,
+    name: &str,
+    base_args: &[String],
+    forwarded_args: &[String],
+    stdio: StdioMode,
+    runtime_hint: &lpm_runner::bin_path::ManagedRuntimeHint,
+) -> Result<ToolOutcome, LpmError> {
+    let args = local_runner_args(name, base_args, forwarded_args);
+
+    let mut command = lpm_runner::script::build_local_bin_command_bounded(
+        project_dir,
+        boundary,
+        name,
+        &args,
+        None,
+        false,
+        runtime_hint,
+    )?;
+    let mut outcome = ToolOutcome::default();
+    match stdio {
+        StdioMode::Inherit => {
+            let status = command.status().map_err(|error| {
+                LpmError::Script(format!("failed to execute '{name}': {error}"))
+            })?;
+            outcome.exit_code = Some(lpm_runner::shell::exit_code(&status));
+        }
+        StdioMode::Capture => {
+            let captured = lpm_runner::shell::spawn_command_capture(command, name)?;
+            outcome.exit_code = Some(lpm_runner::shell::exit_code(&captured.status));
+            outcome.captured = Captured {
+                stdout: captured.stdout,
+                stderr: captured.stderr,
+            };
+        }
+    }
+    Ok(outcome)
+}
+
+fn local_runner_args(name: &str, base_args: &[String], forwarded_args: &[String]) -> Vec<String> {
+    let drop_vitest_run = name == "vitest"
+        && base_args.len() == 1
+        && base_args[0] == "run"
+        && args_imply_watch(forwarded_args);
+    let mut args = Vec::with_capacity(base_args.len() + forwarded_args.len());
+    if !drop_vitest_run {
+        args.extend_from_slice(base_args);
+    }
+    args.extend_from_slice(forwarded_args);
+    args
+}
+
+fn execute_package_script(
+    project_dir: &Path,
+    boundary: &Path,
+    script: &str,
+    forwarded_args: &[String],
+    stdio: StdioMode,
+    runtime_hint: &lpm_runner::bin_path::ManagedRuntimeHint,
+) -> Result<ToolOutcome, LpmError> {
+    let path =
+        lpm_runner::bin_path::build_path_with_bins_bounded(project_dir, boundary, runtime_hint)?;
+    let env_vars = lpm_runner::dotenv::load_env_files(project_dir, None)?;
+    let command =
+        lpm_runner::script::assemble_shell_command(script, forwarded_args, project_dir, &path)?;
+    let shell_command = lpm_runner::shell::ShellCommand {
+        command: &command,
+        cwd: project_dir,
+        path: &path,
+        envs: &env_vars,
+    };
+    let mut outcome = ToolOutcome::default();
+    match stdio {
+        StdioMode::Inherit => {
+            let status = lpm_runner::shell::spawn_shell(&shell_command)?;
+            outcome.exit_code = Some(lpm_runner::shell::exit_code(&status));
+        }
+        StdioMode::Capture => {
+            let captured = lpm_runner::shell::spawn_shell_capture(&shell_command)?;
+            outcome.exit_code = Some(lpm_runner::shell::exit_code(&captured.status));
+            outcome.captured = Captured {
+                stdout: captured.stdout,
+                stderr: captured.stderr,
+            };
+        }
+    }
+    Ok(outcome)
 }
 
 // --- Helpers ---
@@ -379,11 +603,9 @@ impl ToolOutcome {
         matches!(self.exit_code, Some(0)) && self.error.is_none()
     }
 
-    /// Convert into a `Result` for single-package callers that just want the
-    /// exit-code propagated.
-    fn into_result(self) -> Result<(), LpmError> {
-        if let Some(error) = self.error {
-            return Err(LpmError::Script(error));
+    fn as_result(&self) -> Result<(), LpmError> {
+        if let Some(error) = &self.error {
+            return Err(LpmError::Script(error.clone()));
         }
         match self.exit_code {
             Some(0) => Ok(()),
@@ -392,6 +614,12 @@ impl ToolOutcome {
                 "tool exited without an exit code".to_string(),
             )),
         }
+    }
+
+    /// Convert into a `Result` for single-package callers that just want the
+    /// exit-code propagated.
+    fn into_result(self) -> Result<(), LpmError> {
+        self.as_result()
     }
 }
 
@@ -548,39 +776,21 @@ fn apply_stdio(cmd: &mut Command, stdio: StdioMode) {
     }
 }
 
-/// Shell-escape a single argument to prevent injection.
-fn shell_escape(arg: &str) -> String {
-    format!("'{}'", arg.replace('\'', "'\\''"))
-}
-
 /// Returns `true` if the forwarded args contain a watch-mode opt-in.
 fn args_imply_watch(args: &[String]) -> bool {
-    args.iter()
-        .any(|a| a == "--watch" || a.starts_with("--watch=") || a == "-w")
-}
-
-/// Rewrite the auto-detected test runner command when the forwarded args ask
-/// for watch mode. Vitest's `run` subcommand silently drops `--watch`; drop
-/// the `run` so the resulting invocation is `vitest --watch`. Other runners
-/// accept `--watch` natively against their bare command.
-fn adjust_test_runner_for_watch(runner_name: &str, base_cmd: String, args: &[String]) -> String {
-    if runner_name == "vitest" && args_imply_watch(args) {
-        return "vitest".into();
-    }
-    base_cmd
-}
-
-/// Build a shell command string with safely escaped extra arguments.
-fn build_safe_command(_runner_name: &str, base_cmd: &str, args: &[String]) -> String {
-    if args.is_empty() {
-        return base_cmd.to_string();
-    }
-    let escaped: Vec<String> = args.iter().map(|a| shell_escape(a)).collect();
-    format!("{} {}", base_cmd, escaped.join(" "))
+    args.iter().any(|arg| {
+        if arg == "--watch" || arg == "-w" {
+            return true;
+        }
+        arg.strip_prefix("--watch=").is_some_and(|value| {
+            !matches!(value.to_ascii_lowercase().as_str(), "false" | "0" | "off")
+        })
+    })
 }
 
 /// Auto-detect the test runner from package.json devDependencies.
-fn detect_test_runner(project_dir: &Path) -> Result<(String, String), LpmError> {
+#[cfg(test)]
+fn detect_test_runner(project_dir: &Path) -> Result<DetectedRunner, LpmError> {
     let pkg_json_path = project_dir.join("package.json");
     if !pkg_json_path.exists() {
         return Err(LpmError::Script("no package.json found".into()));
@@ -589,30 +799,7 @@ fn detect_test_runner(project_dir: &Path) -> Result<(String, String), LpmError> 
     let pkg = lpm_workspace::read_package_json(&pkg_json_path)
         .map_err(|e| LpmError::Script(format!("{e}")))?;
 
-    let all_deps: Vec<&String> = pkg
-        .dependencies
-        .keys()
-        .chain(pkg.dev_dependencies.keys())
-        .collect();
-
-    if all_deps.iter().any(|d| d.as_str() == "vitest") {
-        return Ok(("vitest".into(), "vitest run".into()));
-    }
-    if all_deps.iter().any(|d| d.as_str() == "jest") {
-        return Ok(("jest".into(), "jest".into()));
-    }
-    if all_deps.iter().any(|d| d.as_str() == "mocha") {
-        return Ok(("mocha".into(), "mocha".into()));
-    }
-
-    if let Some(test_script) = pkg.scripts.get("test") {
-        return Ok(("scripts.test".into(), test_script.clone()));
-    }
-
-    Err(LpmError::Script(
-        "no test runner found. Install vitest/jest/mocha or add a 'test' script to package.json"
-            .into(),
-    ))
+    detect_test_runner_from_package(&pkg)
 }
 
 // --- Workspace orchestration ---
@@ -659,9 +846,6 @@ pub async fn tool_workspace(
         })?;
 
     let ws_graph = lpm_task::graph::WorkspaceGraph::from_workspace(&workspace);
-    let levels = ws_graph
-        .topological_levels()
-        .map_err(|e| LpmError::Script(e.to_string()))?;
     let workspace_concurrency = workspace_concurrency.resolve(&workspace.root)?;
 
     let target_set = crate::workspace_select::select_workspace_target_set(
@@ -730,6 +914,27 @@ pub async fn tool_workspace(
         return Ok(());
     }
 
+    let runner_tasks = RunnerTool::from_label(tool).ok().map(|runner_tool| {
+        let boundary = Arc::new(workspace.root.clone());
+        let runtime_inventory = Arc::new(lpm_runner::bin_path::ManagedRuntimeInventory::default());
+        workspace
+            .members
+            .iter()
+            .map(|member| {
+                let runner = match runner_tool {
+                    RunnerTool::Test => detect_test_runner_from_package(&member.package),
+                    RunnerTool::Bench => detect_bench_runner_from_package(&member.package),
+                }
+                .map_err(|error| error.to_string());
+                RunnerTask {
+                    boundary: Arc::clone(&boundary),
+                    runner,
+                    runtime_inventory: Arc::clone(&runtime_inventory),
+                }
+            })
+            .collect::<Vec<_>>()
+    });
+
     // Pre-resolve plugin once at root for lint/fmt — covers the homogeneous
     // cold-cache race where N parallel members would all call ensure_plugin
     // for the same version. Per-member calls below reuse this binary if the
@@ -779,33 +984,20 @@ pub async fn tool_workspace(
     };
 
     let start = std::time::Instant::now();
-    let mut member_results: Vec<MemberResult> = Vec::with_capacity(target_set.len());
-
-    for level in &levels {
-        let level_targets: Vec<usize> = level
-            .iter()
-            .filter(|i| target_set.contains(i))
-            .copied()
-            .collect();
-
-        if level_targets.is_empty() {
-            continue;
-        }
-
-        let level_outcomes = run_level(
-            &ws_graph,
-            &level_targets,
-            tool,
-            args,
-            check,
-            check_engine,
-            stdio,
-            &root_pin,
-            workspace_concurrency,
-        )
-        .await;
-        member_results.extend(level_outcomes);
-    }
+    let shared_args: Arc<[String]> = args.to_vec().into();
+    let member_results = run_selected_members(
+        &ws_graph,
+        &target_set,
+        tool,
+        shared_args,
+        check,
+        check_engine,
+        stdio,
+        &root_pin,
+        runner_tasks.as_deref(),
+        workspace_concurrency,
+    )
+    .await?;
 
     let elapsed = start.elapsed();
     let succeeded = member_results.iter().filter(|r| r.success).count();
@@ -879,80 +1071,161 @@ struct MemberResult {
     error: Option<String>,
 }
 
-/// Run all members in a single topological level. Within a level, members are
-/// independent; callers decide the workspace concurrency cap.
-#[allow(clippy::too_many_arguments)]
-async fn run_level(
+#[derive(Clone)]
+struct RunnerTask {
+    boundary: Arc<PathBuf>,
+    runner: Result<DetectedRunner, String>,
+    runtime_inventory: Arc<lpm_runner::bin_path::ManagedRuntimeInventory>,
+}
+
+fn member_result(name: String, outcome: ToolOutcome, elapsed: std::time::Duration) -> MemberResult {
+    let success = outcome.success();
+    MemberResult {
+        name,
+        success,
+        exit_code: outcome.exit_code,
+        duration_ms: elapsed.as_millis() as u64,
+        captured: if success {
+            Captured::default()
+        } else {
+            outcome.captured
+        },
+        error: outcome.error,
+    }
+}
+
+fn selected_schedule_state(
     ws_graph: &lpm_task::graph::WorkspaceGraph,
-    level_targets: &[usize],
+    target_set: &HashSet<usize>,
+) -> Result<(Vec<usize>, VecDeque<usize>), LpmError> {
+    let mut initial_unmet = vec![0; ws_graph.len()];
+    let mut ready = VecDeque::new();
+    for &index in target_set {
+        initial_unmet[index] = ws_graph.edges[index]
+            .iter()
+            .filter(|dependency| target_set.contains(dependency))
+            .count();
+        if initial_unmet[index] == 0 {
+            ready.push_back(index);
+        }
+    }
+
+    let mut remaining = initial_unmet.clone();
+    let mut preflight = ready.clone();
+    let mut processed = 0;
+    while let Some(index) = preflight.pop_front() {
+        processed += 1;
+        for &dependent in &ws_graph.reverse_edges[index] {
+            if !target_set.contains(&dependent) {
+                continue;
+            }
+            remaining[dependent] -= 1;
+            if remaining[dependent] == 0 {
+                preflight.push_back(dependent);
+            }
+        }
+    }
+    if processed != target_set.len() {
+        let mut blocked = target_set
+            .iter()
+            .filter(|index| remaining[**index] > 0)
+            .map(|index| ws_graph.members[*index].name.as_str())
+            .collect::<Vec<_>>();
+        blocked.sort_unstable();
+        return Err(LpmError::Script(format!(
+            "dependency cycle detected in selected workspace packages: {}",
+            blocked.join(", ")
+        )));
+    }
+
+    let mut ready = ready.into_iter().collect::<Vec<_>>();
+    ready.sort_unstable();
+    Ok((initial_unmet, ready.into()))
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_selected_members(
+    ws_graph: &lpm_task::graph::WorkspaceGraph,
+    target_set: &HashSet<usize>,
     tool: &str,
-    args: &[String],
+    args: Arc<[String]>,
     check: bool,
     check_engine: Option<CheckEngine>,
     stdio: StdioMode,
     root_pin: &Option<(String, Option<String>, PathBuf)>,
+    runner_tasks: Option<&[RunnerTask]>,
     workspace_concurrency: usize,
-) -> Vec<MemberResult> {
-    if level_targets.len() == 1 {
-        let idx = level_targets[0];
-        let result = run_one_member(
-            &ws_graph.members[idx].path,
-            &ws_graph.members[idx].name,
-            tool,
-            args,
-            check,
-            check_engine,
-            stdio,
-            root_pin,
-        )
-        .await;
-        return vec![result];
-    }
+) -> Result<Vec<MemberResult>, LpmError> {
+    let (mut unmet, mut ready) = selected_schedule_state(ws_graph, target_set)?;
+    let mut in_flight = FuturesUnordered::new();
+    let mut indexed_results = Vec::with_capacity(target_set.len());
 
-    let mut all_results: Vec<MemberResult> = Vec::with_capacity(level_targets.len());
-
-    for chunk in level_targets.chunks(workspace_concurrency) {
-        let mut chunk_futs = Vec::with_capacity(chunk.len());
-        for &idx in chunk {
-            let member_dir = ws_graph.members[idx].path.clone();
-            let member_name = ws_graph.members[idx].name.clone();
-            let tool_owned = tool.to_string();
-            let args_owned: Vec<String> = args.to_vec();
-            let root_pin_clone = root_pin
-                .as_ref()
-                .map(|(name, ver, bin)| (name.clone(), ver.clone(), bin.clone()));
-
-            chunk_futs.push(tokio::spawn(async move {
-                run_one_member(
-                    &member_dir,
-                    &member_name,
-                    &tool_owned,
-                    &args_owned,
-                    check,
-                    check_engine,
-                    stdio,
-                    &root_pin_clone,
-                )
-                .await
-            }));
+    loop {
+        while in_flight.len() < workspace_concurrency {
+            let Some(index) = ready.pop_front() else {
+                break;
+            };
+            in_flight.push(run_indexed_member(
+                index,
+                ws_graph,
+                tool,
+                Arc::clone(&args),
+                check,
+                check_engine,
+                stdio,
+                root_pin,
+                runner_tasks.and_then(|tasks| tasks.get(index)).cloned(),
+            ));
         }
 
-        for fut in chunk_futs {
-            match fut.await {
-                Ok(r) => all_results.push(r),
-                Err(join_err) => all_results.push(MemberResult {
-                    name: "<unknown>".into(),
-                    success: false,
-                    exit_code: None,
-                    duration_ms: 0,
-                    captured: Captured::default(),
-                    error: Some(format!("workspace task panicked: {join_err}")),
-                }),
+        let Some((index, result)) = in_flight.next().await else {
+            break;
+        };
+        indexed_results.push((index, result));
+        for &dependent in &ws_graph.reverse_edges[index] {
+            if !target_set.contains(&dependent) {
+                continue;
+            }
+            unmet[dependent] -= 1;
+            if unmet[dependent] == 0 {
+                ready.push_back(dependent);
             }
         }
     }
 
-    all_results
+    indexed_results.sort_unstable_by_key(|(index, _)| *index);
+    Ok(indexed_results
+        .into_iter()
+        .map(|(_, result)| result)
+        .collect())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_indexed_member(
+    index: usize,
+    ws_graph: &lpm_task::graph::WorkspaceGraph,
+    tool: &str,
+    args: Arc<[String]>,
+    check: bool,
+    check_engine: Option<CheckEngine>,
+    stdio: StdioMode,
+    root_pin: &Option<(String, Option<String>, PathBuf)>,
+    runner_task: Option<RunnerTask>,
+) -> (usize, MemberResult) {
+    let member = &ws_graph.members[index];
+    let result = run_one_member(
+        &member.path,
+        &member.name,
+        tool,
+        args,
+        check,
+        check_engine,
+        stdio,
+        root_pin,
+        runner_task,
+    )
+    .await;
+    (index, result)
 }
 
 /// Execute one member's tool invocation and convert into a `MemberResult`.
@@ -961,11 +1234,12 @@ async fn run_one_member(
     member_dir: &Path,
     member_name: &str,
     tool: &str,
-    args: &[String],
+    args: Arc<[String]>,
     check: bool,
     check_engine: Option<CheckEngine>,
     stdio: StdioMode,
     root_pin: &Option<(String, Option<String>, PathBuf)>,
+    runner_task: Option<RunnerTask>,
 ) -> MemberResult {
     let start = std::time::Instant::now();
 
@@ -978,11 +1252,11 @@ async fn run_one_member(
     }
 
     let outcome_result = match tool {
-        "lint" => run_lint_member(member_dir, args, stdio, root_pin).await,
-        "fmt" => run_fmt_member(member_dir, args, check, stdio, root_pin).await,
+        "lint" => run_lint_member(member_dir, &args, stdio, root_pin).await,
+        "fmt" => run_fmt_member(member_dir, &args, check, stdio, root_pin).await,
         "check" => Ok(run_check_engine(
             member_dir,
-            args,
+            &args,
             check_engine.unwrap_or(CheckEngine::Tsc),
             stdio,
         )
@@ -991,20 +1265,20 @@ async fn run_one_member(
             error: Some(e.to_string()),
             ..Default::default()
         })),
-        "test" | "bench" => Ok(run_test_or_bench_member(member_dir, tool, args, stdio)),
+        "test" | "bench" => Ok(run_runner_member(member_dir, args, stdio, runner_task).await),
         _ => Err(LpmError::Script(format!("unknown tool: {tool}"))),
     };
 
-    let duration_ms = start.elapsed().as_millis() as u64;
-
-    let (success, exit_code, captured, error) = match outcome_result {
-        Ok(outcome) => {
-            let success = outcome.success();
-            let captured = outcome.captured;
-            (success, outcome.exit_code, captured, outcome.error)
-        }
-        Err(e) => (false, None, Captured::default(), Some(e.to_string())),
+    let outcome = match outcome_result {
+        Ok(outcome) => outcome,
+        Err(error) => ToolOutcome {
+            error: Some(error.to_string()),
+            ..Default::default()
+        },
     };
+    let success = outcome.success();
+    let exit_code = outcome.exit_code;
+    let error = outcome.error.clone();
 
     if matches!(stdio, StdioMode::Inherit) && !success {
         if let Some(code) = exit_code {
@@ -1014,14 +1288,41 @@ async fn run_one_member(
         }
     }
 
-    MemberResult {
-        name: member_name.to_string(),
-        success,
-        exit_code,
-        duration_ms,
-        captured,
-        error,
-    }
+    member_result(member_name.to_string(), outcome, start.elapsed())
+}
+
+async fn run_runner_member(
+    member_dir: &Path,
+    args: Arc<[String]>,
+    stdio: StdioMode,
+    runner_task: Option<RunnerTask>,
+) -> ToolOutcome {
+    let Some(task) = runner_task else {
+        return ToolOutcome {
+            error: Some("runner metadata was not prepared for workspace member".into()),
+            ..Default::default()
+        };
+    };
+    let member_dir = member_dir.to_path_buf();
+    tokio::task::spawn_blocking(move || match task.runner {
+        Ok(runner) => execute_runner(
+            &member_dir,
+            &task.boundary,
+            &runner,
+            &args,
+            stdio,
+            &task.runtime_inventory,
+        ),
+        Err(error) => ToolOutcome {
+            error: Some(error),
+            ..Default::default()
+        },
+    })
+    .await
+    .unwrap_or_else(|error| ToolOutcome {
+        error: Some(format!("workspace runner task panicked: {error}")),
+        ..Default::default()
+    })
 }
 
 async fn run_lint_member(
@@ -1044,106 +1345,6 @@ async fn run_fmt_member(
     let bin = resolve_member_plugin(member_dir, "biome", root_pin).await?;
     let biome_args = build_biome_args(args, check);
     run_tool_binary(&bin, &biome_args, member_dir, stdio)
-}
-
-/// Per-member callback for `lpm test` / `lpm bench` workspace mode.
-///
-/// Detection runs per member because workspace members may install different
-/// runners (one vitest, another jest). A detection failure becomes a per-
-/// member `ToolOutcome` with `exit_code: None` + an `error` string —
-/// matching the workspace JSON envelope contract for spawn / config /
-/// detection failures. The orchestrator never aborts on one member's missing
-/// runner; the envelope still lists every targeted member.
-fn run_test_or_bench_member(
-    member_dir: &Path,
-    tool: &str,
-    args: &[String],
-    stdio: StdioMode,
-) -> ToolOutcome {
-    let detection = match tool {
-        "test" => detect_test_runner(member_dir),
-        "bench" => detect_bench_runner(member_dir),
-        _ => Err(LpmError::Script(format!("unknown runner tool: {tool}"))),
-    };
-
-    let (runner_name, base_cmd) = match detection {
-        Ok(pair) => pair,
-        Err(e) => {
-            return ToolOutcome {
-                error: Some(e.to_string()),
-                ..Default::default()
-            };
-        }
-    };
-
-    // `test` adjusts `vitest run` → `vitest` when --watch is forwarded; `bench`
-    // never needs the rewrite because vitest's `bench` subcommand respects
-    // `--watch` directly. The workspace dispatcher rejects --watch before this
-    // point, so the rewrite is a no-op here in practice — kept for symmetry
-    // with the single-package path so the helper is independently safe.
-    let base_cmd = if tool == "test" {
-        adjust_test_runner_for_watch(&runner_name, base_cmd, args)
-    } else {
-        base_cmd
-    };
-
-    let full_cmd = if args.is_empty() {
-        base_cmd
-    } else {
-        build_safe_command(&runner_name, &base_cmd, args)
-    };
-
-    let path = match lpm_runner::bin_path::build_path_with_bins(member_dir) {
-        Ok(path) => path,
-        Err(error) => {
-            return ToolOutcome {
-                error: Some(error.to_string()),
-                ..Default::default()
-            };
-        }
-    };
-    let env_vars = match lpm_runner::dotenv::load_env_files(member_dir, None) {
-        Ok(env_vars) => env_vars,
-        Err(error) => {
-            return ToolOutcome {
-                error: Some(error.to_string()),
-                ..Default::default()
-            };
-        }
-    };
-    let shell_cmd = lpm_runner::shell::ShellCommand {
-        command: &full_cmd,
-        cwd: member_dir,
-        path: &path,
-        envs: &env_vars,
-    };
-
-    let mut outcome = ToolOutcome::default();
-
-    match stdio {
-        StdioMode::Inherit => match lpm_runner::shell::spawn_shell(&shell_cmd) {
-            Ok(status) => {
-                outcome.exit_code = Some(lpm_runner::shell::exit_code(&status));
-            }
-            Err(e) => {
-                outcome.error = Some(e.to_string());
-            }
-        },
-        StdioMode::Capture => match lpm_runner::shell::spawn_shell_capture(&shell_cmd) {
-            Ok(captured) => {
-                outcome.exit_code = Some(lpm_runner::shell::exit_code(&captured.status));
-                outcome.captured = Captured {
-                    stdout: captured.stdout,
-                    stderr: captured.stderr,
-                };
-            }
-            Err(e) => {
-                outcome.error = Some(e.to_string());
-            }
-        },
-    }
-
-    outcome
 }
 
 /// Top-level dispatcher for `lpm test` and `lpm bench`. Owns the workspace-
@@ -1407,46 +1608,6 @@ fn format_member_failure(member_name: &str, reason: &str) -> install_ui::Termina
 mod tests {
     use super::*;
 
-    // --- shell escaping ---
-
-    #[test]
-    fn shell_escape_plain_arg() {
-        assert_eq!(shell_escape("--verbose"), "'--verbose'");
-    }
-
-    #[test]
-    fn shell_escape_prevents_injection_semicolon() {
-        let escaped = shell_escape("; rm -rf /");
-        assert_eq!(escaped, "'; rm -rf /'");
-        assert!(escaped.starts_with('\''));
-        assert!(escaped.ends_with('\''));
-    }
-
-    #[test]
-    fn shell_escape_prevents_injection_subshell() {
-        assert_eq!(shell_escape("$(whoami)"), "'$(whoami)'");
-    }
-
-    #[test]
-    fn shell_escape_prevents_backtick_injection() {
-        assert_eq!(shell_escape("`whoami`"), "'`whoami`'");
-    }
-
-    #[test]
-    fn shell_escape_handles_embedded_single_quotes() {
-        assert_eq!(shell_escape("it's"), "'it'\\''s'");
-    }
-
-    #[test]
-    fn build_safe_command_escapes_all_args() {
-        let cmd = build_safe_command(
-            "vitest",
-            "vitest run",
-            &["--reporter".to_string(), "; echo pwned".to_string()],
-        );
-        assert_eq!(cmd, "vitest run '--reporter' '; echo pwned'");
-    }
-
     #[test]
     fn prewarm_failure_formats_as_slim_failure_with_reason_detail() {
         let lines = format_prewarm_failure("lint", "download failed");
@@ -1471,11 +1632,6 @@ mod tests {
             console::strip_ansi_codes(&format_member_failure("web", "exit 1")).into_owned(),
             "  ✗ web: exit 1"
         );
-    }
-
-    #[test]
-    fn build_safe_command_no_args() {
-        assert_eq!(build_safe_command("jest", "jest", &[]), "jest");
     }
 
     // --- check preflight argument parsing ---
@@ -1547,41 +1703,36 @@ mod tests {
     }
 
     #[test]
-    fn adjust_test_runner_drops_run_for_vitest_watch() {
-        let cmd = adjust_test_runner_for_watch("vitest", "vitest run".into(), &["--watch".into()]);
-        assert_eq!(cmd, "vitest");
+    fn args_imply_watch_rejects_explicit_false_values() {
+        for value in ["--watch=false", "--watch=0", "--watch=off"] {
+            assert!(!args_imply_watch(&[value.into()]));
+        }
     }
 
     #[test]
-    fn adjust_test_runner_keeps_run_for_vitest_without_watch() {
-        let cmd = adjust_test_runner_for_watch(
+    fn local_runner_args_drop_vitest_run_for_watch() {
+        let args = local_runner_args(
             "vitest",
-            "vitest run".into(),
-            &["--reporter=verbose".into()],
+            &["run".into()],
+            &["--watch".into(), "; inert".into()],
         );
-        assert_eq!(cmd, "vitest run");
+        assert_eq!(args, vec!["--watch", "; inert"]);
     }
 
     #[test]
-    fn adjust_test_runner_does_not_touch_jest_or_mocha() {
+    fn local_runner_args_keep_vitest_run_without_watch() {
         assert_eq!(
-            adjust_test_runner_for_watch("jest", "jest".into(), &["--watch".into()]),
-            "jest"
-        );
-        assert_eq!(
-            adjust_test_runner_for_watch("mocha", "mocha".into(), &["--watch".into()]),
-            "mocha"
+            local_runner_args("vitest", &["run".into()], &["--reporter=verbose".into()]),
+            vec!["run", "--reporter=verbose"]
         );
     }
 
     #[test]
-    fn adjust_test_runner_does_not_touch_user_scripts() {
-        let cmd = adjust_test_runner_for_watch(
-            "scripts.test",
-            "vitest run --reporter=verbose".into(),
-            &["--watch".into()],
+    fn local_runner_args_do_not_rewrite_other_runners() {
+        assert_eq!(
+            local_runner_args("jest", &[], &["--watch".into()]),
+            vec!["--watch"]
         );
-        assert_eq!(cmd, "vitest run --reporter=verbose");
     }
 
     #[test]
@@ -1809,9 +1960,15 @@ mod tests {
             dir.path(),
             r#"{"name":"test","devDependencies":{"vitest":"^1.0","jest":"^29.0"}}"#,
         );
-        let (name, cmd) = detect_test_runner(dir.path()).unwrap();
-        assert_eq!(name, "vitest");
-        assert_eq!(cmd, "vitest run");
+        let runner = detect_test_runner(dir.path()).unwrap();
+        assert_eq!(runner.label, "vitest");
+        assert_eq!(
+            runner.invocation,
+            RunnerInvocation::LocalBin {
+                name: "vitest",
+                base_args: vec!["run".into()]
+            }
+        );
     }
 
     #[test]
@@ -1821,9 +1978,15 @@ mod tests {
             dir.path(),
             r#"{"name":"test","devDependencies":{"jest":"^29.0"}}"#,
         );
-        let (name, cmd) = detect_test_runner(dir.path()).unwrap();
-        assert_eq!(name, "jest");
-        assert_eq!(cmd, "jest");
+        let runner = detect_test_runner(dir.path()).unwrap();
+        assert_eq!(runner.label, "jest");
+        assert_eq!(
+            runner.invocation,
+            RunnerInvocation::LocalBin {
+                name: "jest",
+                base_args: Vec::new()
+            }
+        );
     }
 
     #[test]
@@ -1833,9 +1996,15 @@ mod tests {
             dir.path(),
             r#"{"name":"test","devDependencies":{"mocha":"^10.0"}}"#,
         );
-        let (name, cmd) = detect_test_runner(dir.path()).unwrap();
-        assert_eq!(name, "mocha");
-        assert_eq!(cmd, "mocha");
+        let runner = detect_test_runner(dir.path()).unwrap();
+        assert_eq!(runner.label, "mocha");
+        assert_eq!(
+            runner.invocation,
+            RunnerInvocation::LocalBin {
+                name: "mocha",
+                base_args: Vec::new()
+            }
+        );
     }
 
     #[test]
@@ -1845,9 +2014,12 @@ mod tests {
             dir.path(),
             r#"{"name":"test","scripts":{"test":"node test.js"}}"#,
         );
-        let (name, cmd) = detect_test_runner(dir.path()).unwrap();
-        assert_eq!(name, "scripts.test");
-        assert_eq!(cmd, "node test.js");
+        let runner = detect_test_runner(dir.path()).unwrap();
+        assert_eq!(runner.label, "scripts.test");
+        assert_eq!(
+            runner.invocation,
+            RunnerInvocation::PackageScript("node test.js".into())
+        );
     }
 
     #[test]
@@ -1857,8 +2029,7 @@ mod tests {
             dir.path(),
             r#"{"name":"test","dependencies":{"vitest":"^1.0"}}"#,
         );
-        let (name, _) = detect_test_runner(dir.path()).unwrap();
-        assert_eq!(name, "vitest");
+        assert_eq!(detect_test_runner(dir.path()).unwrap().label, "vitest");
     }
 
     #[test]
@@ -1885,9 +2056,15 @@ mod tests {
             dir.path(),
             r#"{"name":"bench","devDependencies":{"vitest":"^1.0"},"scripts":{"bench":"node bench.js"}}"#,
         );
-        let (name, cmd) = detect_bench_runner(dir.path()).unwrap();
-        assert_eq!(name, "vitest");
-        assert_eq!(cmd, "vitest bench");
+        let runner = detect_bench_runner(dir.path()).unwrap();
+        assert_eq!(runner.label, "vitest");
+        assert_eq!(
+            runner.invocation,
+            RunnerInvocation::LocalBin {
+                name: "vitest",
+                base_args: vec!["bench".into()]
+            }
+        );
     }
 
     #[test]
@@ -1897,9 +2074,12 @@ mod tests {
             dir.path(),
             r#"{"name":"bench","scripts":{"bench":"node bench.js"}}"#,
         );
-        let (name, cmd) = detect_bench_runner(dir.path()).unwrap();
-        assert_eq!(name, "scripts.bench");
-        assert_eq!(cmd, "node bench.js");
+        let runner = detect_bench_runner(dir.path()).unwrap();
+        assert_eq!(runner.label, "scripts.bench");
+        assert_eq!(
+            runner.invocation,
+            RunnerInvocation::PackageScript("node bench.js".into())
+        );
     }
 
     #[test]
@@ -1909,9 +2089,15 @@ mod tests {
             dir.path(),
             r#"{"name":"bench","dependencies":{"vitest":"^1.0"}}"#,
         );
-        let (name, cmd) = detect_bench_runner(dir.path()).unwrap();
-        assert_eq!(name, "vitest");
-        assert_eq!(cmd, "vitest bench");
+        let runner = detect_bench_runner(dir.path()).unwrap();
+        assert_eq!(runner.label, "vitest");
+        assert_eq!(
+            runner.invocation,
+            RunnerInvocation::LocalBin {
+                name: "vitest",
+                base_args: vec!["bench".into()]
+            }
+        );
     }
 
     #[test]

@@ -12,7 +12,7 @@ mod support;
 use std::os::unix::fs::PermissionsExt;
 
 use support::assertions::parse_json_output;
-use support::{TempProject, lpm};
+use support::{TempProject, lpm, lpm_spawnable};
 
 #[cfg(unix)]
 const WORKSPACE_MEMBERS: [&str; 3] = ["packages/utils", "packages/core", "packages/app"];
@@ -977,6 +977,160 @@ fn test_single_package_reports_slim_runner_and_timed_completion() {
 }
 
 #[test]
+fn test_single_package_json_owns_the_success_envelope() {
+    let project = TempProject::empty(
+        r#"{
+            "name": "json-test-runner",
+            "version": "1.0.0",
+            "scripts": { "test": "echo child-forged-json" }
+        }"#,
+    );
+
+    let output = lpm(&project)
+        .args(["--json", "test"])
+        .output()
+        .expect("run a single-package test under JSON mode");
+
+    assert!(output.status.success());
+    let mut envelope: serde_json::Value = serde_json::from_slice(&output.stdout)
+        .expect("single-package test output must be one LPM-owned JSON document");
+    assert_eq!(envelope["success"], true);
+    assert_eq!(envelope["packages"], 1);
+    assert_eq!(envelope["members"][0]["name"], "json-test-runner");
+    assert!(envelope["members"][0].get("stdout").is_none());
+    envelope["duration_ms"] = serde_json::json!(0);
+    envelope["members"][0]["duration_ms"] = serde_json::json!(0);
+    insta::assert_json_snapshot!("test_single_package_json_success_envelope", envelope);
+}
+
+#[cfg(unix)]
+#[test]
+fn test_single_package_json_owns_the_failure_envelope() {
+    let project = TempProject::empty(
+        r#"{
+            "name": "json-test-failure",
+            "version": "1.0.0",
+            "scripts": {
+                "test": "printf 'child stdout\\n'; printf 'child stderr\\n' >&2; exit 3"
+            }
+        }"#,
+    );
+
+    let output = lpm(&project)
+        .args(["--json", "test"])
+        .output()
+        .expect("run a failing single-package test under JSON mode");
+
+    assert!(!output.status.success());
+    let mut envelope: serde_json::Value = serde_json::from_slice(&output.stdout)
+        .expect("single-package test failure must be one LPM-owned JSON document");
+    assert_eq!(envelope["success"], false);
+    assert_eq!(envelope["members"][0]["exit_code"], 3);
+    assert_eq!(envelope["members"][0]["stdout"], "child stdout\n");
+    assert_eq!(envelope["members"][0]["stderr"], "child stderr\n");
+    envelope["duration_ms"] = serde_json::json!(0);
+    envelope["members"][0]["duration_ms"] = serde_json::json!(0);
+    insta::assert_json_snapshot!("test_single_package_json_failure_envelope", envelope);
+}
+
+#[cfg(unix)]
+#[test]
+fn test_uses_the_system_shell_even_when_project_bin_contains_sh() {
+    let project = TempProject::empty(
+        r#"{
+            "name": "trusted-test-shell",
+            "version": "1.0.0",
+            "scripts": { "test": "echo test-ok" }
+        }"#,
+    );
+    let hijack_marker = project.path().join("shell-hijacked");
+    write_unix_executable(
+        &project.path().join("node_modules/.bin/sh"),
+        &format!(
+            "#!/bin/sh\nprintf hijacked > '{}'\nexec /bin/sh \"$@\"\n",
+            hijack_marker.display()
+        ),
+    );
+
+    let output = lpm(&project)
+        .args(["test"])
+        .output()
+        .expect("run test with a project-local sh binary");
+
+    assert!(
+        output.status.success(),
+        "benign test script must still succeed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        !hijack_marker.exists(),
+        "project .bin/sh must not become the interpreter"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn test_runner_resolution_does_not_escape_to_an_ancestor_project() {
+    let project = TempProject::empty(r#"{"name":"attacker-parent","version":"1.0.0"}"#);
+    let victim = project.path().join("victim");
+    std::fs::create_dir_all(&victim).expect("create victim project");
+    std::fs::write(
+        victim.join("package.json"),
+        r#"{
+            "name": "victim",
+            "version": "1.0.0",
+            "devDependencies": { "vitest": "1.0.0" }
+        }"#,
+    )
+    .expect("write victim manifest");
+    let marker = project.path().join("ancestor-runner-executed");
+    write_unix_executable(
+        &project.path().join("node_modules/.bin/vitest"),
+        &format!("#!/bin/sh\nprintf executed > '{}'\n", marker.display()),
+    );
+
+    let output = lpm(&project)
+        .current_dir(&victim)
+        .args(["test"])
+        .output()
+        .expect("run test from a standalone nested project");
+
+    assert!(!output.status.success());
+    assert!(
+        !marker.exists(),
+        "runner lookup must not execute an ancestor project's binary"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("vitest") && stderr.contains("install"));
+}
+
+#[test]
+fn test_from_nested_directory_uses_the_nearest_project_root() {
+    let project = TempProject::empty(
+        r#"{
+            "name": "nested-test-project",
+            "version": "1.0.0",
+            "scripts": { "test": "echo nested-test-ok" }
+        }"#,
+    );
+    let nested = project.path().join("src/deep");
+    std::fs::create_dir_all(&nested).expect("create nested project directory");
+
+    let output = lpm(&project)
+        .current_dir(&nested)
+        .args(["test"])
+        .output()
+        .expect("run test from a nested directory");
+
+    assert!(
+        output.status.success(),
+        "nested test invocation must find the project root: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("nested-test-ok"));
+}
+
+#[test]
 fn bench_single_package_reports_slim_completion_with_elapsed_time() {
     let project = TempProject::empty(
         r#"{
@@ -1147,6 +1301,223 @@ fn test_multi_member_watch_is_rejected_with_count() {
     assert!(
         stderr.contains("--filter"),
         "reject must point at narrowing the filter, got:\n{stderr}"
+    );
+}
+
+#[test]
+fn test_watch_false_runs_all_selected_members_once() {
+    let project = TempProject::empty(
+        r#"{
+            "name": "watch-false-workspace",
+            "version": "1.0.0",
+            "private": true,
+            "workspaces": ["packages/*"]
+        }"#,
+    );
+    for name in ["a", "b"] {
+        project.write_file(
+            &format!("packages/{name}/package.json"),
+            &format!(
+                r#"{{"name":"{name}","version":"1.0.0","scripts":{{"test":"echo {name}-ok"}}}}"#
+            ),
+        );
+    }
+
+    let output = lpm(&project)
+        .args(["test", "--all", "--watch=false"])
+        .output()
+        .expect("run workspace tests with watch explicitly disabled");
+
+    assert!(
+        output.status.success(),
+        "--watch=false must not enter watcher routing: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("a-ok") && stdout.contains("b-ok"));
+}
+
+#[test]
+fn test_filtered_independent_member_ignores_unselected_workspace_cycle() {
+    let project = TempProject::empty(
+        r#"{
+            "name": "cycle-workspace",
+            "version": "1.0.0",
+            "private": true,
+            "workspaces": ["packages/*"]
+        }"#,
+    );
+    project.write_file(
+        "packages/a/package.json",
+        r#"{"name":"a","version":"1.0.0","dependencies":{"b":"workspace:*"}}"#,
+    );
+    project.write_file(
+        "packages/b/package.json",
+        r#"{"name":"b","version":"1.0.0","dependencies":{"a":"workspace:*"}}"#,
+    );
+    project.write_file(
+        "packages/c/package.json",
+        r#"{"name":"c","version":"1.0.0","scripts":{"test":"echo selected-c"}}"#,
+    );
+
+    let output = lpm(&project)
+        .args(["test", "--filter", "c"])
+        .output()
+        .expect("run an independent member beside an unselected cycle");
+
+    assert!(
+        output.status.success(),
+        "unselected workspace cycles must not block a filtered member: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("selected-c"));
+}
+
+#[cfg(unix)]
+#[test]
+fn test_workspace_json_workers_do_not_read_shared_stdin() {
+    use std::io::Write;
+    use std::process::Stdio;
+
+    let project = TempProject::empty(
+        r#"{
+            "name": "stdin-workspace",
+            "version": "1.0.0",
+            "private": true,
+            "workspaces": ["packages/*"]
+        }"#,
+    );
+    for name in ["a", "b"] {
+        project.write_file(
+            &format!("packages/{name}/package.json"),
+            &format!(
+                r#"{{"name":"{name}","version":"1.0.0","scripts":{{"test":"if IFS= read -r value; then printf 'unexpected stdin: %s\\n' \"$value\" >&2; exit 9; fi"}}}}"#
+            ),
+        );
+    }
+
+    let mut child = lpm_spawnable(&project)
+        .args(["--json", "test", "--all"])
+        .stdin(Stdio::piped())
+        .spawn()
+        .expect("start workspace test with piped stdin");
+    child
+        .stdin
+        .take()
+        .expect("open child stdin")
+        .write_all(b"sentinel-input\n")
+        .expect("write piped stdin");
+    let output = child.wait_with_output().expect("wait for workspace test");
+
+    assert!(
+        output.status.success(),
+        "captured workers must receive null stdin: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let envelope: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("parse workspace test JSON");
+    assert_eq!(envelope["succeeded"], 2);
+}
+
+#[cfg(unix)]
+fn warm_lpm_binary(project: &TempProject) {
+    let output = lpm(project)
+        .arg("--version")
+        .output()
+        .expect("warm lpm binary before timing");
+    assert!(
+        output.status.success(),
+        "lpm warm gate failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn test_workspace_releases_dependent_when_its_own_prerequisite_finishes() {
+    let project = TempProject::empty(
+        r#"{
+            "name": "ready-queue-workspace",
+            "version": "1.0.0",
+            "private": true,
+            "workspaces": ["packages/*"]
+        }"#,
+    );
+    let marker = project.path().join("dependent-started");
+    project.write_file(
+        "packages/a-slow/package.json",
+        &format!(
+            r#"{{"name":"a-slow","version":"1.0.0","scripts":{{"test":"i=0; while [ ! -f '{}' ] && [ $i -lt 100 ]; do sleep 0.02; i=$((i + 1)); done; test -f '{}'"}}}}"#,
+            marker.display(),
+            marker.display()
+        ),
+    );
+    project.write_file(
+        "packages/b-fast/package.json",
+        r#"{"name":"b-fast","version":"1.0.0","scripts":{"test":"sleep 0.05"}}"#,
+    );
+    project.write_file(
+        "packages/c-dependent/package.json",
+        &format!(
+            r#"{{"name":"c-dependent","version":"1.0.0","dependencies":{{"b-fast":"workspace:*"}},"scripts":{{"test":": > '{}'"}}}}"#,
+            marker.display()
+        ),
+    );
+
+    warm_lpm_binary(&project);
+    let started = std::time::Instant::now();
+    let output = lpm(&project)
+        .args(["test", "--all", "--workspace-concurrency", "2"])
+        .output()
+        .expect("run dependency-aware ready queue");
+
+    assert!(
+        output.status.success(),
+        "dependent must start before an unrelated slow root finishes: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        started.elapsed() < std::time::Duration::from_millis(1200),
+        "per-level barriers delayed a ready dependent for {:?}",
+        started.elapsed()
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn test_workspace_process_waits_do_not_block_tokio_workers() {
+    let project = TempProject::empty(
+        r#"{
+            "name": "blocking-worker-workspace",
+            "version": "1.0.0",
+            "private": true,
+            "workspaces": ["packages/*"]
+        }"#,
+    );
+    for name in ["a", "b", "c", "d"] {
+        project.write_file(
+            &format!("packages/{name}/package.json"),
+            &format!(r#"{{"name":"{name}","version":"1.0.0","scripts":{{"test":"sleep 0.3"}}}}"#),
+        );
+    }
+
+    warm_lpm_binary(&project);
+    let started = std::time::Instant::now();
+    let output = lpm(&project)
+        .env("TOKIO_WORKER_THREADS", "1")
+        .args(["test", "--all", "--workspace-concurrency", "4"])
+        .output()
+        .expect("run test processes with one Tokio worker");
+
+    assert!(
+        output.status.success(),
+        "blocking runner tasks must succeed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        started.elapsed() < std::time::Duration::from_millis(900),
+        "subprocess waits serialized on a Tokio worker for {:?}",
+        started.elapsed()
     );
 }
 

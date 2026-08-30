@@ -1,0 +1,20 @@
+---
+source: tests/workflows/tests/tools.rs
+assertion_line: 1003
+expression: envelope
+---
+{
+  "success": true,
+  "packages": 1,
+  "succeeded": 1,
+  "failed": 0,
+  "duration_ms": 0,
+  "members": [
+    {
+      "name": "json-test-runner",
+      "success": true,
+      "exit_code": 0,
+      "duration_ms": 0
+    }
+  ]
+}

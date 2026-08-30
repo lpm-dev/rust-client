@@ -2579,9 +2579,10 @@ async fn async_main() -> Result<()> {
                 args,
             } = args;
             let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
-            tool_pin_validation::warn_unsupported_tool_pins_once(&cwd);
+            let project_dir = lpm_workspace::find_project_root(&cwd).unwrap_or(cwd);
+            tool_pin_validation::warn_unsupported_tool_pins_once(&project_dir);
             commands::tools::dispatch_test_or_bench(
-                &cwd,
+                &project_dir,
                 "test",
                 &args,
                 all,
@@ -2611,9 +2612,10 @@ async fn async_main() -> Result<()> {
                 args,
             } = args;
             let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
-            tool_pin_validation::warn_unsupported_tool_pins_once(&cwd);
+            let project_dir = lpm_workspace::find_project_root(&cwd).unwrap_or(cwd);
+            tool_pin_validation::warn_unsupported_tool_pins_once(&project_dir);
             commands::tools::dispatch_test_or_bench(
-                &cwd,
+                &project_dir,
                 "bench",
                 &args,
                 all,
