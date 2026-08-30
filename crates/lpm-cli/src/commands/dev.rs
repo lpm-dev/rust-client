@@ -2694,35 +2694,40 @@ fn validate_local_proxy_listener_contract(
     let tls_addr = status
         .tls_addr
         .as_deref()
-        .ok_or_else(|| "local proxy is not listening for HTTPS".to_string())?;
-    let actual_tls_port = tls_addr
+        .ok_or_else(|| "local proxy is running without an HTTPS listener".to_string())?;
+    let socket_addr = tls_addr.strip_prefix("https://").unwrap_or(tls_addr);
+    let actual_tls_port = socket_addr
         .parse::<std::net::SocketAddr>()
         .map_err(|_| format!("local proxy reported an invalid HTTPS listener `{tls_addr}`"))?
         .port();
     let proxy = config.proxy.as_ref();
-    let expected_tls_port = proxy.and_then(|proxy| proxy.port).unwrap_or(443);
-    if expected_tls_port != 443 && actual_tls_port != expected_tls_port {
+    if let Some(expected_tls_port) = proxy.and_then(|proxy| proxy.port)
+        && expected_tls_port != 0
+        && expected_tls_port != 443
+        && actual_tls_port != expected_tls_port
+    {
         return Err(format!(
             "expected HTTPS port {expected_tls_port}, but the running proxy listens on {actual_tls_port}"
         ));
     }
 
-    let redirect_expected = proxy.and_then(|proxy| proxy.http_redirect).unwrap_or(true);
-    let redirect_active = status.http_redirect_addr.is_some();
-    if redirect_expected != redirect_active {
-        let expected = if redirect_expected {
-            "enabled"
-        } else {
-            "disabled"
-        };
-        let actual = if redirect_active {
-            "enabled"
-        } else {
-            "disabled"
-        };
-        return Err(format!(
-            "expected the HTTP redirect listener to be {expected}, but it is {actual}"
-        ));
+    if let Some(redirect_expected) = proxy.and_then(|proxy| proxy.http_redirect) {
+        let redirect_active = status.http_redirect_addr.is_some();
+        if redirect_expected != redirect_active {
+            let expected = if redirect_expected {
+                "enabled"
+            } else {
+                "disabled"
+            };
+            let actual = if redirect_active {
+                "enabled"
+            } else {
+                "disabled"
+            };
+            return Err(format!(
+                "expected the HTTP redirect listener to be {expected}, but it is {actual}"
+            ));
+        }
     }
 
     Ok(())
@@ -4238,6 +4243,78 @@ mod tests {
 
         assert!(error.contains("9443"), "got {error}");
         assert!(error.contains("10443"), "got {error}");
+    }
+
+    #[test]
+    fn local_proxy_accepts_scheme_qualified_tls_listener_status() {
+        let config = lpm_runner::lpm_json::LpmJsonConfig {
+            proxy: Some(lpm_runner::lpm_json::ProxyConfig {
+                host: Some("app.localhost".to_string()),
+                port: Some(9443),
+                http_redirect: Some(false),
+            }),
+            ..Default::default()
+        };
+        let status = lpm_proxy::ProxyStatus {
+            running: true,
+            pid: Some(42),
+            http_addr: None,
+            http_redirect_addr: None,
+            tls_addr: Some("https://127.0.0.1:9443".to_string()),
+            routes: Vec::new(),
+            stale: false,
+            state_error: None,
+        };
+
+        validate_local_proxy_listener_contract(&config, &status).unwrap();
+    }
+
+    #[test]
+    fn local_proxy_accepts_an_assigned_port_for_an_ephemeral_tls_request() {
+        let config = lpm_runner::lpm_json::LpmJsonConfig {
+            proxy: Some(lpm_runner::lpm_json::ProxyConfig {
+                host: Some("app.localhost".to_string()),
+                port: Some(0),
+                http_redirect: Some(false),
+            }),
+            ..Default::default()
+        };
+        let status = lpm_proxy::ProxyStatus {
+            running: true,
+            pid: Some(42),
+            http_addr: None,
+            http_redirect_addr: None,
+            tls_addr: Some("127.0.0.1:10443".to_string()),
+            routes: Vec::new(),
+            stale: false,
+            state_error: None,
+        };
+
+        validate_local_proxy_listener_contract(&config, &status).unwrap();
+    }
+
+    #[test]
+    fn local_proxy_accepts_a_disabled_redirect_when_lpm_json_does_not_specify_one() {
+        let config = lpm_runner::lpm_json::LpmJsonConfig {
+            proxy: Some(lpm_runner::lpm_json::ProxyConfig {
+                host: Some("app.localhost".to_string()),
+                port: Some(9443),
+                http_redirect: None,
+            }),
+            ..Default::default()
+        };
+        let status = lpm_proxy::ProxyStatus {
+            running: true,
+            pid: Some(42),
+            http_addr: None,
+            http_redirect_addr: None,
+            tls_addr: Some("127.0.0.1:9443".to_string()),
+            routes: Vec::new(),
+            stale: false,
+            state_error: None,
+        };
+
+        validate_local_proxy_listener_contract(&config, &status).unwrap();
     }
 
     #[test]
