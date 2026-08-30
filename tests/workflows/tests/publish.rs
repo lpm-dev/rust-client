@@ -505,7 +505,7 @@ async fn publish_ignore_scripts_skips_every_publish_lifecycle_phase() {
 }
 
 #[tokio::test]
-async fn publish_lifecycle_does_not_receive_dotenv_or_ambient_secrets() {
+async fn publish_lifecycle_does_not_receive_ambient_secrets() {
     let mock = MockRegistry::start().await;
     let project = TempProject::empty(
         r#"{
@@ -516,15 +516,14 @@ async fn publish_lifecycle_does_not_receive_dotenv_or_ambient_secrets() {
 }"#,
     );
     project.write_file("index.js", "module.exports = {};\n");
-    project.write_file(".env", "PUBLISH_DOTENV_SECRET=dotenv-secret\n");
     project.write_file(
         "record-env.js",
         concat!(
             "const fs = require('fs');\n",
-            "fs.writeFileSync('lifecycle-env', [\n",
-            "  process.env.PUBLISH_DOTENV_SECRET || 'absent',\n",
+            "fs.writeFileSync(\n",
+            "  'lifecycle-env',\n",
             "  process.env.PUBLISH_AMBIENT_SECRET || 'absent'\n",
-            "].join('|'));\n",
+            ");\n",
         ),
     );
 
@@ -542,7 +541,84 @@ async fn publish_lifecycle_does_not_receive_dotenv_or_ambient_secrets() {
         .expect("run publish lifecycle with ambient secrets configured");
 
     assert!(output.status.success(), "{output:?}");
-    assert_eq!(project.read_file("lifecycle-env"), "absent|absent");
+    assert_eq!(project.read_file("lifecycle-env"), "absent");
+}
+
+#[tokio::test]
+async fn publish_lifecycle_masks_dotenv_or_fails_closed_before_execution() {
+    let mock = MockRegistry::start().await;
+    let project = TempProject::empty(
+        r#"{
+  "name": "@lpm.dev/testuser.publish-lifecycle-dotenv",
+  "version": "1.0.0",
+  "main": "index.js",
+  "scripts": {"prepack": "node record-dotenv.js"}
+}"#,
+    );
+    project.write_file("index.js", "module.exports = {};\n");
+    project.write_file(".env", "PUBLISH_DOTENV_SECRET=dotenv-secret\n");
+    project.write_file(
+        "record-dotenv.js",
+        concat!(
+            "const fs = require('fs');\n",
+            "fs.writeFileSync('lifecycle-started', 'started');\n",
+            "let result;\n",
+            "try {\n",
+            "  const value = fs.readFileSync('.env', 'utf8');\n",
+            "  result = value.length === 0 ? 'empty' : value;\n",
+            "} catch {\n",
+            "  result = 'denied';\n",
+            "}\n",
+            "fs.writeFileSync('lifecycle-dotenv', result);\n",
+        ),
+    );
+
+    let output = lpm_with_registry(&project, &mock.url())
+        .args([
+            "publish",
+            "--dry-run",
+            "--yes",
+            "--token",
+            "test-token-123",
+            "--lpm",
+        ])
+        .output()
+        .expect("run publish lifecycle with a protected dotenv file");
+
+    if !output.status.success() {
+        #[cfg(target_os = "linux")]
+        {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(
+                stderr.contains(concat!(
+                    "failed to spawn: failed to spawn sandboxed child: ",
+                    "lpm-sandbox spawn failed: Operation not permitted (os error 1)",
+                )),
+                "Linux publish may fail only when the enforcing sandbox refuses to spawn: \
+                 {output:?}",
+            );
+            assert!(
+                !project.file_exists("lifecycle-started"),
+                "a fail-closed sandbox spawn must not execute the lifecycle script",
+            );
+            return;
+        }
+
+        #[cfg(not(target_os = "linux"))]
+        panic!("publish lifecycle with a protected dotenv file failed: {output:?}");
+    }
+
+    let observed = project.read_file("lifecycle-dotenv");
+    #[cfg(target_os = "linux")]
+    assert_eq!(
+        observed, "empty",
+        "the Linux secret overlay must replace dotenv contents with an empty file",
+    );
+    #[cfg(not(target_os = "linux"))]
+    assert!(
+        matches!(observed.as_str(), "denied" | "empty"),
+        "publish lifecycle read protected dotenv contents: {observed:?}",
+    );
 }
 
 #[tokio::test]
