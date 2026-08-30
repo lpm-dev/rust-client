@@ -1,5 +1,10 @@
-use crate::signature;
 use futures::StreamExt;
+
+use super::SyncError;
+use super::envelope::{
+    AuthenticatedSyncResponse, REQUEST_NONCE_HEADER, SyncScope, generate_request_nonce,
+};
+use crate::signature;
 
 /// Hard cap on a single vault-sync response body. Encrypted envelopes
 /// are small (kilobytes); a multi-MB cap leaves multiple orders of
@@ -77,6 +82,37 @@ pub(super) async fn read_verified_response(
     }
 
     Ok((status, body))
+}
+
+pub(super) enum SyncHttpResponse {
+    Success(Box<AuthenticatedSyncResponse>),
+    Error {
+        status: reqwest::StatusCode,
+        body: Vec<u8>,
+    },
+}
+
+pub(super) async fn send_authenticated_sync_request(
+    request: reqwest::RequestBuilder,
+    auth_token: &str,
+    vault_id: &str,
+    scope: SyncScope<'_>,
+) -> Result<SyncHttpResponse, SyncError> {
+    let request_nonce = generate_request_nonce()?;
+    let response = request
+        .header(REQUEST_NONCE_HEADER, &request_nonce)
+        .send()
+        .await
+        .map_err(network_error)?;
+    let (status, body) = read_verified_response(response, auth_token).await?;
+    if !status.is_success() {
+        return Ok(SyncHttpResponse::Error { status, body });
+    }
+
+    let response: AuthenticatedSyncResponse =
+        serde_json::from_slice(&body).map_err(|error| format!("response parse error: {error}"))?;
+    response.validate(vault_id, scope, &request_nonce)?;
+    Ok(SyncHttpResponse::Success(Box::new(response)))
 }
 
 pub(super) fn sync_request_timeout(default: std::time::Duration) -> std::time::Duration {

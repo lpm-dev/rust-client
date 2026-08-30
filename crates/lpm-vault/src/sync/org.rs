@@ -1,14 +1,13 @@
 use super::SyncError;
-use super::http::{read_verified_response, sync_http_client_builder, url_path_segment};
+use super::envelope::SyncScope;
+use super::http::{
+    SyncHttpResponse, send_authenticated_sync_request, sync_http_client_builder, url_path_segment,
+};
 use super::personal::{
     PushMetadata, PushResponse, RemoteVault, format_push_error, list_remote_from_url,
 };
 use super::public_key::{MemberPublicKey, get_org_member_key_access, public_key_fingerprint};
 use crate::crypto;
-
-fn legacy_crypto_version() -> i32 {
-    1
-}
 
 /// Decrypted organization env payload and its remote concurrency epochs.
 #[derive(Debug)]
@@ -96,66 +95,78 @@ async fn pull_org_with_content_key(
         url_path_segment(vault_id)
     );
 
-    let response = client
-        .get(&url)
-        .bearer_auth(auth_token)
-        .timeout(std::time::Duration::from_secs(30))
-        .send()
-        .await
-        .map_err(super::http::network_error)?;
+    let data = match send_authenticated_sync_request(
+        client
+            .get(&url)
+            .bearer_auth(auth_token)
+            .timeout(std::time::Duration::from_secs(30)),
+        auth_token,
+        vault_id,
+        SyncScope::Organization(org_slug),
+    )
+    .await?
+    {
+        SyncHttpResponse::Success(data) => data,
+        SyncHttpResponse::Error { status, body } => {
+            let message = std::str::from_utf8(&body).unwrap_or("");
+            return Err(SyncError::http(status, format!("server error: {message}")));
+        }
+    };
 
-    let (status, body) = read_verified_response(response, auth_token).await?;
-    if !status.is_success() {
-        let message = std::str::from_utf8(&body).unwrap_or("");
-        return Err(SyncError::http(status, format!("server error: {message}")));
-    }
-
-    #[derive(serde::Deserialize)]
-    #[serde(rename_all = "camelCase")]
-    struct PullOrgResponse {
-        encrypted_blob: String,
-        wrapped_key: String,
-        version: i32,
-        #[serde(default = "legacy_crypto_version")]
-        crypto_version: i32,
-        content_key_version: i32,
-        recipient_public_key_version: i32,
-        recipient_public_key_fingerprint: String,
-    }
-
-    let data: PullOrgResponse =
-        serde_json::from_slice(&body).map_err(|e| format!("parse error: {e}"))?;
+    let encrypted_blob = data
+        .encrypted_blob
+        .as_deref()
+        .ok_or("organization env response omitted encrypted data")?;
+    let wrapped_key = data
+        .wrapped_key
+        .as_deref()
+        .ok_or("organization env response omitted the wrapped key")?;
+    let version = data
+        .version
+        .ok_or("organization env response omitted the vault version")?;
+    let crypto_version = data
+        .crypto_version
+        .ok_or("organization env response omitted the crypto version")?;
+    let content_key_version = data
+        .content_key_version
+        .ok_or("organization env response omitted the content-key version")?;
+    let recipient_public_key_version = data
+        .recipient_public_key_version
+        .ok_or("organization env response omitted the recipient key version")?;
+    let recipient_public_key_fingerprint = data
+        .recipient_public_key_fingerprint
+        .as_deref()
+        .ok_or("organization env response omitted the recipient key fingerprint")?;
 
     let local_public_key =
         x25519_dalek::PublicKey::from(&x25519_dalek::StaticSecret::from(*private_key));
     let local_fingerprint = public_key_fingerprint(local_public_key.as_bytes());
-    if data.recipient_public_key_fingerprint != local_fingerprint {
+    if recipient_public_key_fingerprint != local_fingerprint {
         return Err(
             "organization env wrap targets a different local sharing-key fingerprint; rotate or restore the correct sharing key before retrying"
                 .into(),
         );
     }
-    if data.version <= 0 || data.content_key_version <= 0 || data.recipient_public_key_version <= 0
-    {
+    if content_key_version <= 0 || recipient_public_key_version <= 0 {
         return Err("organization env response contains an invalid key/version binding".into());
     }
 
     // Unwrap AES key with our X25519 private key, then decrypt
-    let content_key = crypto::unwrap_key_from_sender(&data.wrapped_key, private_key)?;
+    let content_key = crypto::unwrap_key_from_sender(wrapped_key, private_key)?;
     let plaintext = crypto::decrypt_vault_payload(
         &content_key,
-        &data.encrypted_blob,
+        encrypted_blob,
         crypto::VaultScope::Organization(org_slug),
         vault_id,
-        data.crypto_version,
+        crypto_version,
     )?;
     let json = String::from_utf8(plaintext).map_err(|e| format!("utf8 error: {e}"))?;
 
     Ok(DecryptedOrgVault {
         pulled: PulledOrgVault {
             raw_json: json,
-            version: data.version,
-            content_key_version: data.content_key_version,
+            version,
+            content_key_version,
         },
         content_key,
     })
@@ -293,28 +304,37 @@ async fn post_org_update(
         }
     }
 
-    let response = client
-        .post(&url)
-        .bearer_auth(auth_token)
-        .json(&body)
-        .timeout(std::time::Duration::from_secs(30))
-        .send()
-        .await
-        .map_err(super::http::network_error)?;
+    let result = match send_authenticated_sync_request(
+        client
+            .post(&url)
+            .bearer_auth(auth_token)
+            .json(&body)
+            .timeout(std::time::Duration::from_secs(30)),
+        auth_token,
+        request.vault_id,
+        SyncScope::Organization(request.org_slug),
+    )
+    .await?
+    {
+        SyncHttpResponse::Success(result) => result,
+        SyncHttpResponse::Error { status, body } => {
+            let message = serde_json::from_slice::<PushResponse>(&body).map_or_else(
+                |_| format!("server error: {status}"),
+                |result| format_push_error(&result, status),
+            );
+            return Err(SyncError::http(status, message));
+        }
+    };
 
-    let (status, body) = read_verified_response(response, auth_token).await?;
-    if !status.is_success() {
-        let message = serde_json::from_slice::<PushResponse>(&body).map_or_else(
-            |_| format!("server error: {status}"),
-            |result| format_push_error(&result, status),
-        );
-        return Err(SyncError::http(status, message));
-    }
-
-    let result: PushResponse =
-        serde_json::from_slice(&body).map_err(|e| format!("response parse error: {e}"))?;
-
-    Ok(result)
+    Ok(PushResponse {
+        version: result.version,
+        content_key_version: result.content_key_version,
+        status: result.status,
+        error: result.error,
+        code: result.code,
+        server_version: result.server_version,
+        hint: result.hint,
+    })
 }
 
 fn select_members_with_keys(members: &[MemberPublicKey]) -> Result<Vec<&MemberPublicKey>, String> {
@@ -429,9 +449,10 @@ fn wrap_keys_for_members(
 mod tests {
     use super::*;
     #[cfg(debug_assertions)]
-    use crate::signature;
-    #[cfg(debug_assertions)]
-    use crate::sync::test_support::{env_lock_guard, signed_ok_response};
+    use crate::sync::test_support::{
+        SignedSyncResponse, TestSyncScope, env_lock_guard, signed_sync_ok_response,
+        signed_sync_ok_response_with,
+    };
     use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
     use sha2::{Digest, Sha256};
     #[cfg(debug_assertions)]
@@ -440,6 +461,11 @@ mod tests {
     use wiremock::matchers::{header, method, path};
     #[cfg(debug_assertions)]
     use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
+
+    #[cfg(debug_assertions)]
+    fn substitute_organization_slug(body: &mut serde_json::Value) {
+        body["organizationSlug"] = "other-org".into();
+    }
 
     fn registered_member(
         user_id: &str,
@@ -461,6 +487,8 @@ mod tests {
     fn encrypted_org_pull_body(
         private_key: &[u8; 32],
         payload: &str,
+        org_slug: &str,
+        vault_id: &str,
         version: i32,
         content_key_version: i32,
         fingerprint: String,
@@ -469,11 +497,17 @@ mod tests {
             x25519_dalek::PublicKey::from(&x25519_dalek::StaticSecret::from(*private_key));
         let content_key = crypto::generate_aes_key();
         serde_json::json!({
-            "encryptedBlob": crypto::encrypt(&content_key, payload.as_bytes())
+            "encryptedBlob": crypto::encrypt_vault_payload(
+                &content_key,
+                payload.as_bytes(),
+                crypto::VaultScope::Organization(org_slug),
+                vault_id,
+            )
                 .expect("encrypt org pull fixture"),
             "wrappedKey": crypto::wrap_key_for_recipient(&content_key, public_key.as_bytes())
                 .expect("wrap org pull fixture key"),
             "version": version,
+            "cryptoVersion": 2,
             "contentKeyVersion": content_key_version,
             "recipientPublicKeyVersion": 4,
             "recipientPublicKeyFingerprint": fingerprint,
@@ -489,6 +523,8 @@ mod tests {
         let body = encrypted_org_pull_body(
             &private_key,
             r#"{"environments":{"default":{"TOKEN":"secret"}}}"#,
+            "acme",
+            "vault-1",
             8,
             3,
             public_key_fingerprint(public_key.as_bytes()),
@@ -496,7 +532,12 @@ mod tests {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path("/api/orgs/acme/vaults/vault-1"))
-            .respond_with(signed_ok_response(body, "auth-token"))
+            .respond_with(signed_sync_ok_response(
+                body,
+                "auth-token",
+                "vault-1",
+                TestSyncScope::Organization("acme".into()),
+            ))
             .expect(1)
             .mount(&server)
             .await;
@@ -515,14 +556,80 @@ mod tests {
 
     #[cfg(debug_assertions)]
     #[tokio::test]
+    async fn pull_org_rejects_a_signed_canonical_slug_substitution() {
+        let private_key = [21u8; 32];
+        let public_key =
+            x25519_dalek::PublicKey::from(&x25519_dalek::StaticSecret::from(private_key));
+        let content_key = crypto::generate_aes_key();
+        let encrypted_blob = crypto::encrypt_vault_payload(
+            &content_key,
+            br#"{"TOKEN":"secret"}"#,
+            crypto::VaultScope::Organization("acme"),
+            "vault-envelope",
+        )
+        .expect("encrypt organization envelope fixture");
+        let wrapped_key = crypto::wrap_key_for_recipient(&content_key, public_key.as_bytes())
+            .expect("wrap organization envelope fixture key");
+        let server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/api/orgs/acme/vaults/vault-envelope"))
+            .respond_with(signed_sync_ok_response_with(
+                serde_json::json!({
+                    "encryptedBlob": encrypted_blob,
+                    "wrappedKey": wrapped_key,
+                    "version": 4,
+                    "cryptoVersion": 2,
+                    "contentKeyVersion": 3,
+                    "recipientPublicKeyVersion": 4,
+                    "recipientPublicKeyFingerprint": public_key_fingerprint(public_key.as_bytes()),
+                }),
+                "auth-token",
+                "vault-envelope",
+                TestSyncScope::Organization("acme".into()),
+                substitute_organization_slug,
+            ))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let result = pull_org(
+            &server.uri(),
+            "auth-token",
+            "acme",
+            "vault-envelope",
+            &private_key,
+        )
+        .await;
+
+        assert!(
+            result.is_err(),
+            "client accepted a signed envelope for another canonical organization slug"
+        );
+    }
+
+    #[cfg(debug_assertions)]
+    #[tokio::test]
     async fn pull_org_rejects_wrap_for_different_recipient_fingerprint() {
         let private_key = [12u8; 32];
-        let body =
-            encrypted_org_pull_body(&private_key, r#"{"TOKEN":"secret"}"#, 2, 1, "a".repeat(64));
+        let body = encrypted_org_pull_body(
+            &private_key,
+            r#"{"TOKEN":"secret"}"#,
+            "acme",
+            "vault-2",
+            2,
+            1,
+            "a".repeat(64),
+        );
         let server = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path("/api/orgs/acme/vaults/vault-2"))
-            .respond_with(signed_ok_response(body, "auth-token"))
+            .respond_with(signed_sync_ok_response(
+                body,
+                "auth-token",
+                "vault-2",
+                TestSyncScope::Organization("acme".into()),
+            ))
             .expect(1)
             .mount(&server)
             .await;
@@ -547,6 +654,8 @@ mod tests {
         let body = encrypted_org_pull_body(
             &private_key,
             r#"{"TOKEN":"secret"}"#,
+            "acme",
+            "vault-3",
             2,
             0,
             public_key_fingerprint(public_key.as_bytes()),
@@ -554,7 +663,12 @@ mod tests {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path("/api/orgs/acme/vaults/vault-3"))
-            .respond_with(signed_ok_response(body, "auth-token"))
+            .respond_with(signed_sync_ok_response(
+                body,
+                "auth-token",
+                "vault-3",
+                TestSyncScope::Organization("acme".into()),
+            ))
             .expect(1)
             .mount(&server)
             .await;
@@ -575,7 +689,7 @@ mod tests {
         #[derive(Clone)]
         struct CapturePushResponder {
             body: Arc<StdMutex<Option<String>>>,
-            auth_token: &'static str,
+            response: SignedSyncResponse,
         }
 
         impl Respond for CapturePushResponder {
@@ -583,17 +697,7 @@ mod tests {
                 let body = String::from_utf8(request.body.clone())
                     .expect("push_org_with_keys request body should be valid utf-8 json");
                 *self.body.lock().unwrap() = Some(body);
-                let response_body = serde_json::json!({
-                    "version": 8,
-                    "status": "ok"
-                });
-                let body_str =
-                    serde_json::to_string(&response_body).expect("response body should serialize");
-                let sig = signature::sign_body(body_str.as_bytes(), self.auth_token);
-                ResponseTemplate::new(200)
-                    .insert_header("Content-Type", "application/json")
-                    .insert_header(signature::SIGNATURE_HEADER, sig.as_str())
-                    .set_body_string(body_str)
+                self.response.respond(request)
             }
         }
 
@@ -630,7 +734,16 @@ mod tests {
             .and(header("authorization", "Bearer auth-token"))
             .respond_with(CapturePushResponder {
                 body: Arc::clone(&captured_body),
-                auth_token: "auth-token",
+                response: signed_sync_ok_response(
+                    serde_json::json!({
+                        "version": 8,
+                        "cryptoVersion": 2,
+                        "status": "synced",
+                    }),
+                    "auth-token",
+                    "vault-123",
+                    TestSyncScope::Organization("acme".into()),
+                ),
             })
             .expect(1)
             .mount(&server)
@@ -675,7 +788,7 @@ mod tests {
         #[derive(Clone)]
         struct CapturePushResponder {
             body: Arc<StdMutex<Option<String>>>,
-            auth_token: &'static str,
+            response: SignedSyncResponse,
         }
 
         impl Respond for CapturePushResponder {
@@ -683,17 +796,7 @@ mod tests {
                 let body = String::from_utf8(request.body.clone())
                     .expect("organization update body should be valid JSON");
                 *self.body.lock().unwrap() = Some(body);
-                let response_body = serde_json::json!({
-                    "version": 8,
-                    "contentKeyVersion": 3,
-                    "status": "synced"
-                });
-                let body_str = serde_json::to_string(&response_body).expect("serialize response");
-                let signature = signature::sign_body(body_str.as_bytes(), self.auth_token);
-                ResponseTemplate::new(200)
-                    .insert_header("Content-Type", "application/json")
-                    .insert_header(signature::SIGNATURE_HEADER, signature.as_str())
-                    .set_body_string(body_str)
+                self.response.respond(request)
             }
         }
 
@@ -704,11 +807,17 @@ mod tests {
             x25519_dalek::PublicKey::from(&x25519_dalek::StaticSecret::from(private_key));
         let content_key = [17u8; 32];
         let current_body = serde_json::json!({
-            "encryptedBlob": crypto::encrypt(&content_key, br#"{"environments":{"default":{"OLD":"value"}}}"#)
+            "encryptedBlob": crypto::encrypt_vault_payload(
+                &content_key,
+                br#"{"environments":{"default":{"OLD":"value"}}}"#,
+                crypto::VaultScope::Organization("acme"),
+                "vault-maintainer",
+            )
                 .expect("encrypt current payload"),
             "wrappedKey": crypto::wrap_key_for_recipient(&content_key, public_key.as_bytes())
                 .expect("wrap current content key"),
             "version": 7,
+            "cryptoVersion": 2,
             "contentKeyVersion": 3,
             "recipientPublicKeyVersion": 4,
             "recipientPublicKeyFingerprint": public_key_fingerprint(public_key.as_bytes()),
@@ -726,7 +835,12 @@ mod tests {
             .await;
         Mock::given(method("GET"))
             .and(path("/api/orgs/acme/vaults/vault-maintainer"))
-            .respond_with(signed_ok_response(current_body, "auth-token"))
+            .respond_with(signed_sync_ok_response(
+                current_body,
+                "auth-token",
+                "vault-maintainer",
+                TestSyncScope::Organization("acme".into()),
+            ))
             .expect(1)
             .mount(&server)
             .await;
@@ -734,7 +848,17 @@ mod tests {
             .and(path("/api/orgs/acme/vaults/vault-maintainer"))
             .respond_with(CapturePushResponder {
                 body: Arc::clone(&captured_body),
-                auth_token: "auth-token",
+                response: signed_sync_ok_response(
+                    serde_json::json!({
+                        "version": 8,
+                        "contentKeyVersion": 3,
+                        "cryptoVersion": 2,
+                        "status": "synced",
+                    }),
+                    "auth-token",
+                    "vault-maintainer",
+                    TestSyncScope::Organization("acme".into()),
+                ),
             })
             .expect(1)
             .mount(&server)
@@ -805,7 +929,7 @@ mod tests {
             #[derive(Clone)]
             struct CapturePushResponder {
                 body: Arc<StdMutex<Option<String>>>,
-                auth_token: &'static str,
+                response: SignedSyncResponse,
             }
 
             impl Respond for CapturePushResponder {
@@ -813,16 +937,7 @@ mod tests {
                     let body = String::from_utf8(request.body.clone())
                         .expect("push request body must be valid utf-8");
                     *self.body.lock().unwrap() = Some(body);
-                    let response_body = serde_json::json!({
-                        "version": 4,
-                        "status": "ok"
-                    });
-                    let body_str = serde_json::to_string(&response_body).expect("serialize");
-                    let sig = signature::sign_body(body_str.as_bytes(), self.auth_token);
-                    ResponseTemplate::new(200)
-                        .insert_header("Content-Type", "application/json")
-                        .insert_header(signature::SIGNATURE_HEADER, sig.as_str())
-                        .set_body_string(body_str)
+                    self.response.respond(request)
                 }
             }
 
@@ -850,7 +965,16 @@ mod tests {
                 .and(path("/api/orgs/acme/vaults/vault-meta"))
                 .respond_with(CapturePushResponder {
                     body: Arc::clone(&captured_body),
-                    auth_token: "auth-token",
+                    response: signed_sync_ok_response(
+                        serde_json::json!({
+                            "version": 4,
+                            "cryptoVersion": 2,
+                            "status": "synced",
+                        }),
+                        "auth-token",
+                        "vault-meta",
+                        TestSyncScope::Organization("acme".into()),
+                    ),
                 })
                 .expect(1)
                 .mount(&server)
@@ -946,23 +1070,14 @@ mod tests {
             #[derive(Clone)]
             struct CapturePushResponder {
                 body: Arc<StdMutex<Option<String>>>,
-                auth_token: &'static str,
+                response: SignedSyncResponse,
             }
 
             impl Respond for CapturePushResponder {
                 fn respond(&self, request: &Request) -> ResponseTemplate {
                     let body = String::from_utf8(request.body.clone()).expect("push body utf-8");
                     *self.body.lock().unwrap() = Some(body);
-                    let response_body = serde_json::json!({
-                        "version": 1,
-                        "status": "ok"
-                    });
-                    let body_str = serde_json::to_string(&response_body).expect("serialize");
-                    let sig = signature::sign_body(body_str.as_bytes(), self.auth_token);
-                    ResponseTemplate::new(200)
-                        .insert_header("Content-Type", "application/json")
-                        .insert_header(signature::SIGNATURE_HEADER, sig.as_str())
-                        .set_body_string(body_str)
+                    self.response.respond(request)
                 }
             }
 
@@ -989,7 +1104,16 @@ mod tests {
                 .and(path("/api/orgs/acme/vaults/vault-no-meta"))
                 .respond_with(CapturePushResponder {
                     body: Arc::clone(&captured_body),
-                    auth_token: "auth-token",
+                    response: signed_sync_ok_response(
+                        serde_json::json!({
+                            "version": 1,
+                            "cryptoVersion": 2,
+                            "status": "synced",
+                        }),
+                        "auth-token",
+                        "vault-no-meta",
+                        TestSyncScope::Organization("acme".into()),
+                    ),
                 })
                 .expect(1)
                 .mount(&server)

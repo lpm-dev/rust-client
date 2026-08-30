@@ -14,7 +14,9 @@ use support::auth_state::{
     SessionSeed, credentials_path, read_credentials, read_expiry_metadata, seed_sessions,
     token_expiry_path,
 };
-use support::mock_registry::{MockRegistry, TEST_OIDC_POLICY_ID};
+use support::mock_registry::{
+    MockRegistry, TEST_OIDC_POLICY_ID, TestSyncScope, signed_sync_response,
+};
 use support::{TempProject, lpm, write_private_file};
 use wiremock::matchers::{header, method, path};
 use wiremock::{Mock, ResponseTemplate};
@@ -75,15 +77,6 @@ fn parse_clean_json_stdout(output: &std::process::Output) -> serde_json::Value {
     parse_json_output(&output.stdout)
 }
 
-fn signed_env_response(body: serde_json::Value, auth_token: &str) -> ResponseTemplate {
-    let body = serde_json::to_string(&body).expect("serialize signed env response");
-    let signature = lpm_vault::signature::sign_body(body.as_bytes(), auth_token);
-    ResponseTemplate::new(200)
-        .insert_header("Content-Type", "application/json")
-        .insert_header(lpm_vault::signature::SIGNATURE_HEADER, signature.as_str())
-        .set_body_string(body)
-}
-
 fn seed_org_sharing_key(project: &TempProject) -> ([u8; 32], [u8; 32], String, String) {
     let (private_key, public_key) = lpm_vault::crypto::generate_x25519_keypair();
     let lpm_dir = project.home().join(".lpm");
@@ -128,8 +121,13 @@ async fn mount_org_rotation_pull(
 ) -> [u8; 32] {
     let plaintext = serde_json::to_vec(fixture.payload).expect("serialize org env payload");
     let content_key = lpm_vault::crypto::generate_aes_key();
-    let encrypted_blob =
-        lpm_vault::crypto::encrypt(&content_key, &plaintext).expect("encrypt org env payload");
+    let encrypted_blob = lpm_vault::crypto::encrypt_vault_payload(
+        &content_key,
+        &plaintext,
+        lpm_vault::crypto::VaultScope::Organization(fixture.org_slug),
+        fixture.vault_id,
+    )
+    .expect("encrypt org env payload");
     let wrapped_key = lpm_vault::crypto::wrap_key_for_recipient(&content_key, fixture.public_key)
         .expect("wrap org content key");
     let body = serde_json::json!({
@@ -152,7 +150,12 @@ async fn mount_org_rotation_pull(
             "authorization",
             format!("Bearer {}", fixture.auth_token),
         ))
-        .respond_with(signed_env_response(body, fixture.auth_token))
+        .respond_with(signed_sync_response(
+            body,
+            fixture.auth_token,
+            fixture.vault_id,
+            TestSyncScope::Organization(fixture.org_slug.to_owned()),
+        ))
         .expect(1)
         .mount(mock.server())
         .await;
@@ -195,7 +198,12 @@ async fn mount_org_rotation_push(
     Mock::given(method("POST"))
         .and(path(format!("/api/orgs/{org_slug}/vaults/{vault_id}")))
         .and(header("authorization", format!("Bearer {auth_token}")))
-        .respond_with(signed_env_response(response, auth_token))
+        .respond_with(signed_sync_response(
+            response,
+            auth_token,
+            vault_id,
+            TestSyncScope::Organization(org_slug.to_owned()),
+        ))
         .expect(1)
         .mount(mock.server())
         .await;
