@@ -17,6 +17,28 @@ enum UseRequest {
 struct InstalledRuntime {
     runtime: RuntimeKind,
     version: String,
+    status: InstallStatus,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum InstallStatus {
+    Installed,
+    AlreadyInstalled,
+}
+
+impl InstallStatus {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Installed => "installed",
+            Self::AlreadyInstalled => "already_installed",
+        }
+    }
+}
+
+struct PinOutcome {
+    version: String,
+    installed: bool,
+    warning: Option<String>,
 }
 
 pub async fn run_cli(
@@ -31,7 +53,32 @@ pub async fn run_cli(
         UseRequest::InstallAndPin(spec) => {
             let installed = install_runtime(spec.as_str(), json_output).await?;
             let exact_spec = format!("{}@{}", installed.runtime.as_str(), installed.version);
-            run("pin", Some(exact_spec.as_str()), project_dir, json_output).await
+            let pin = match pin_runtime(exact_spec.as_str(), project_dir, Some(&installed.version))
+            {
+                Ok(pin) => pin,
+                Err(error) if json_output => {
+                    println!(
+                        "{}",
+                        serde_json::json!({
+                            "success": false,
+                            "status": "installed_not_pinned",
+                            "runtime": installed.runtime.as_str(),
+                            "version": installed.version,
+                            "error_code": error.error_code(),
+                            "error": error.to_string(),
+                        })
+                    );
+                    return Err(LpmError::ExitCode(1));
+                }
+                Err(error) => return Err(error),
+            };
+
+            if json_output {
+                print_install_and_pin_json(&installed, &pin);
+            } else {
+                print_pin_human(installed.runtime, &pin.version, pin.warning.as_deref());
+            }
+            Ok(())
         }
         UseRequest::Pin(spec) => run("pin", Some(spec.as_str()), project_dir, json_output).await,
         UseRequest::Remove(spec) => {
@@ -126,7 +173,18 @@ pub async fn run(
             let spec = spec.ok_or_else(|| {
                 LpmError::Script("missing version spec. Usage: lpm use node@22".into())
             })?;
-            let _ = install_runtime(spec, json_output).await?;
+            let installed = install_runtime(spec, json_output).await?;
+            if json_output {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "success": true,
+                        "status": installed.status.as_str(),
+                        "runtime": installed.runtime.as_str(),
+                        "version": installed.version,
+                    })
+                );
+            }
         }
 
         "remove" | "rm" | "uninstall" => {
@@ -155,13 +213,13 @@ pub async fn run(
                 )));
             }
 
-            for version in &removed_versions {
-                uninstall_runtime(runtime, version)?;
-            }
-
             let pin_warning = read_pinned_runtime_version(project_dir, runtime)?.filter(|pinned| {
                 find_matching_installed(runtime, pinned, &removed_versions).is_some()
             });
+
+            for version in &removed_versions {
+                uninstall_runtime(runtime, version)?;
+            }
 
             if json_output {
                 let mut envelope = serde_json::json!({
@@ -240,38 +298,26 @@ pub async fn run(
             let spec = spec.ok_or_else(|| {
                 LpmError::Script("missing version. Usage: lpm use pin node@22.5.0".into())
             })?;
-
-            let (runtime, version_spec) = parse_runtime_spec(spec)?;
-            validate_runtime_spec(runtime, &version_spec)?;
-
-            let pinned_version = resolve_pinned_runtime_version(runtime, &version_spec);
-
-            // Warn if the version is not currently installed
-            if !json_output && !is_installed(runtime, &pinned_version) {
-                use_ui::warn(&format!(
-                    "{}@{} is not currently installed. Run `lpm use {}@{}` to install it",
-                    runtime.as_str(),
-                    version_spec,
-                    runtime.as_str(),
-                    version_spec
-                ));
-            }
-
-            write_runtime_pin(project_dir, runtime, &pinned_version)?;
+            let (runtime, _) = parse_runtime_spec(spec)?;
+            let pin = pin_runtime(spec, project_dir, None)?;
 
             if json_output {
                 let mut pinned = serde_json::Map::new();
                 pinned.insert(
                     runtime.as_str().to_string(),
-                    serde_json::Value::String(pinned_version),
+                    serde_json::Value::String(pin.version.clone()),
                 );
-                println!("{}", serde_json::json!({"success": true, "pinned": pinned}));
+                let mut envelope = serde_json::json!({
+                    "success": true,
+                    "pinned": pinned,
+                    "installed": pin.installed,
+                });
+                if let Some(warning) = pin.warning {
+                    envelope["warning"] = serde_json::Value::String(warning);
+                }
+                println!("{envelope}");
             } else {
-                use_ui::done_line(crate::install_ui::terminal_line!(
-                    "Pinned {}@{} in lpm.json",
-                    runtime.as_str(),
-                    install_ui::yellow(&pinned_version)
-                ));
+                print_pin_human(runtime, &pin.version, pin.warning.as_deref());
             }
         }
 
@@ -289,6 +335,17 @@ async fn install_runtime(spec: &str, json_output: bool) -> Result<InstalledRunti
     let install_start = std::time::Instant::now();
     let (runtime, version_spec) = parse_runtime_spec(spec)?;
     validate_runtime_spec(runtime, &version_spec)?;
+
+    if let Some(version) = exact_installed_version(runtime, &version_spec) {
+        if !json_output {
+            print_already_installed(runtime, &version);
+        }
+        return Ok(InstalledRuntime {
+            runtime,
+            version,
+            status: InstallStatus::AlreadyInstalled,
+        });
+    }
 
     let http_client = lpm_http::client_builder()
         .timeout(std::time::Duration::from_secs(60))
@@ -318,8 +375,14 @@ async fn install_runtime(spec: &str, json_output: bool) -> Result<InstalledRunti
             }
 
             if lpm_runtime::node::is_installed(&version) {
-                print_already_installed(runtime, &version, json_output);
-                return Ok(InstalledRuntime { runtime, version });
+                if !json_output {
+                    print_already_installed(runtime, &version);
+                }
+                return Ok(InstalledRuntime {
+                    runtime,
+                    version,
+                    status: InstallStatus::AlreadyInstalled,
+                });
             }
 
             let report = install_runtime_with_spinner(runtime, &version, json_output, || {
@@ -348,8 +411,14 @@ async fn install_runtime(spec: &str, json_output: bool) -> Result<InstalledRunti
             }
 
             if lpm_runtime::bun::is_installed(&version) {
-                print_already_installed(runtime, &version, json_output);
-                return Ok(InstalledRuntime { runtime, version });
+                if !json_output {
+                    print_already_installed(runtime, &version);
+                }
+                return Ok(InstalledRuntime {
+                    runtime,
+                    version,
+                    status: InstallStatus::AlreadyInstalled,
+                });
             }
 
             let asset = release.asset_for_platform(&platform).ok_or_else(|| {
@@ -369,12 +438,7 @@ async fn install_runtime(spec: &str, json_output: bool) -> Result<InstalledRunti
         }
     };
 
-    if json_output {
-        println!(
-            "{}",
-            serde_json::json!({"success": true, "status": "installed", "runtime": runtime.as_str(), "version": installed})
-        );
-    } else {
+    if !json_output {
         use_ui::done(&format!("Extracted {}", runtime.display_name()));
         use_ui::done(&format!("Linked {}", runtime.display_name()));
         let duration = install_ui::format_duration(install_start.elapsed());
@@ -391,6 +455,7 @@ async fn install_runtime(spec: &str, json_output: bool) -> Result<InstalledRunti
     Ok(InstalledRuntime {
         runtime,
         version: installed,
+        status: InstallStatus::Installed,
     })
 }
 
@@ -507,19 +572,84 @@ fn validate_runtime_spec(runtime: RuntimeKind, version_spec: &str) -> Result<(),
     }
 }
 
-fn print_already_installed(runtime: RuntimeKind, version: &str, json_output: bool) {
-    if json_output {
-        println!(
-            "{}",
-            serde_json::json!({"success": true, "status": "already_installed", "runtime": runtime.as_str(), "version": version})
-        );
-    } else {
-        use_ui::done_line(crate::install_ui::terminal_line!(
-            "{} {} already installed",
-            runtime.display_name(),
-            install_ui::yellow(version)
-        ));
+fn print_already_installed(runtime: RuntimeKind, version: &str) {
+    use_ui::done_line(crate::install_ui::terminal_line!(
+        "{} {} already installed",
+        runtime.display_name(),
+        install_ui::yellow(version)
+    ));
+}
+
+fn print_install_and_pin_json(installed: &InstalledRuntime, pin: &PinOutcome) {
+    let mut pinned = serde_json::Map::new();
+    pinned.insert(
+        installed.runtime.as_str().to_string(),
+        serde_json::Value::String(pin.version.clone()),
+    );
+    println!(
+        "{}",
+        serde_json::json!({
+            "success": true,
+            "status": installed.status.as_str(),
+            "runtime": installed.runtime.as_str(),
+            "version": installed.version,
+            "pinned": pinned,
+        })
+    );
+}
+
+fn print_pin_human(runtime: RuntimeKind, version: &str, warning: Option<&str>) {
+    if let Some(warning) = warning {
+        use_ui::warn(warning);
     }
+    use_ui::done_line(crate::install_ui::terminal_line!(
+        "Pinned {}@{} in lpm.json",
+        runtime.as_str(),
+        install_ui::yellow(version)
+    ));
+}
+
+fn pin_runtime(
+    spec: &str,
+    project_dir: &std::path::Path,
+    known_installed_exact: Option<&str>,
+) -> Result<PinOutcome, LpmError> {
+    let (runtime, version_spec) = parse_runtime_spec(spec)?;
+    validate_runtime_spec(runtime, &version_spec)?;
+    let pinned_version = known_installed_exact.map_or_else(
+        || resolve_pinned_runtime_version(runtime, &version_spec),
+        str::to_string,
+    );
+    let installed = known_installed_exact.is_some() || is_installed(runtime, &pinned_version);
+    let warning = (!installed).then(|| {
+        format!(
+            "{}@{} is not currently installed. Run `lpm use {}@{}` to install it",
+            runtime.as_str(),
+            version_spec,
+            runtime.as_str(),
+            version_spec
+        )
+    });
+    write_runtime_pin(project_dir, runtime, &pinned_version)?;
+    Ok(PinOutcome {
+        version: pinned_version,
+        installed,
+        warning,
+    })
+}
+
+fn exact_installed_version(runtime: RuntimeKind, version_spec: &str) -> Option<String> {
+    let parsed = match runtime {
+        RuntimeKind::Node => {
+            lpm_semver::Version::parse(version_spec.strip_prefix('v').unwrap_or(version_spec))
+        }
+        RuntimeKind::Bun => {
+            let normalized = lpm_runtime::bun::normalize_spec(version_spec);
+            lpm_semver::Version::parse(normalized)
+        }
+    };
+    let version = parsed.ok()?.to_string();
+    is_installed(runtime, &version).then_some(version)
 }
 
 fn select_pinned_runtime_version(
@@ -548,7 +678,7 @@ fn matching_installed_versions(
             .strip_prefix('v')
             .unwrap_or(version_spec)
             .to_string(),
-        RuntimeKind::Bun => lpm_runtime::bun::normalize_spec(version_spec),
+        RuntimeKind::Bun => lpm_runtime::bun::normalize_spec(version_spec).to_string(),
     };
 
     if spec.eq_ignore_ascii_case("lts") || spec.eq_ignore_ascii_case("latest") {
@@ -563,7 +693,7 @@ fn matching_installed_versions(
         let Ok(req) = lpm_semver::VersionReq::parse(&spec) else {
             return Vec::new();
         };
-        let mut matches: Vec<String> = installed
+        let matches: Vec<String> = installed
             .iter()
             .filter(|version| {
                 lpm_semver::Version::parse(version)
@@ -572,7 +702,6 @@ fn matching_installed_versions(
             })
             .cloned()
             .collect();
-        sort_versions_desc(&mut matches);
         return matches;
     }
 
@@ -581,13 +710,11 @@ fn matching_installed_versions(
     }
 
     let prefix = format!("{spec}.");
-    let mut matches: Vec<String> = installed
+    installed
         .iter()
         .filter(|version| version.starts_with(&prefix) || version.as_str() == spec)
         .cloned()
-        .collect();
-    sort_versions_desc(&mut matches);
-    matches
+        .collect()
 }
 
 fn is_range_spec(spec: &str) -> bool {
@@ -598,15 +725,6 @@ fn is_range_spec(spec: &str) -> bool {
         || spec.contains('|')
         || spec.contains('*')
         || spec.split_whitespace().count() > 1
-}
-
-fn sort_versions_desc(versions: &mut [String]) {
-    versions.sort_by(
-        |a, b| match (lpm_semver::Version::parse(a), lpm_semver::Version::parse(b)) {
-            (Ok(a), Ok(b)) => b.cmp(&a),
-            _ => b.cmp(a),
-        },
-    );
 }
 
 fn find_matching_installed(
@@ -819,32 +937,24 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let lpm_json_path = dir.path().join("lpm.json");
 
-        // Simulate the atomic write path from the pin logic
-        let mut config = serde_json::json!({});
-        config["runtime"] = serde_json::json!({});
-        config["runtime"]["node"] = serde_json::Value::String("22.5.0".to_string());
+        write_runtime_pin(dir.path(), RuntimeKind::Node, "22.5.0").unwrap();
 
-        let content = serde_json::to_string_pretty(&config).unwrap() + "\n";
-
-        let tmp_path = lpm_json_path.with_extension("json.tmp");
-        std::fs::write(&tmp_path, &content).unwrap();
-        std::fs::rename(&tmp_path, &lpm_json_path).unwrap();
-
-        // Verify content is correct
         let written = std::fs::read_to_string(&lpm_json_path).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&written).unwrap();
         assert_eq!(parsed["runtime"]["node"], "22.5.0");
-
-        // Verify trailing newline
         assert!(
             written.ends_with('\n'),
             "lpm.json must end with a trailing newline"
         );
-
-        // Verify no temp file remains
+        let entries: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert!(entries.contains(&std::ffi::OsString::from("lpm.json")));
         assert!(
-            !tmp_path.exists(),
-            "temporary .json.tmp file should not remain after atomic rename"
+            entries
+                .iter()
+                .all(|name| !name.to_string_lossy().contains("tmp"))
         );
     }
 
@@ -853,7 +963,6 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let lpm_json_path = dir.path().join("lpm.json");
 
-        // Pre-existing lpm.json with other fields
         let existing = serde_json::json!({
             "name": "my-project",
             "runtime": { "node": "20.0.0" }
@@ -864,15 +973,7 @@ mod tests {
         )
         .unwrap();
 
-        // Simulate pin update
-        let mut config: serde_json::Value =
-            serde_json::from_str(&std::fs::read_to_string(&lpm_json_path).unwrap()).unwrap();
-        config["runtime"]["node"] = serde_json::Value::String("22.5.0".to_string());
-
-        let content = serde_json::to_string_pretty(&config).unwrap() + "\n";
-        let tmp_path = lpm_json_path.with_extension("json.tmp");
-        std::fs::write(&tmp_path, &content).unwrap();
-        std::fs::rename(&tmp_path, &lpm_json_path).unwrap();
+        write_runtime_pin(dir.path(), RuntimeKind::Node, "22.5.0").unwrap();
 
         let written = std::fs::read_to_string(&lpm_json_path).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&written).unwrap();

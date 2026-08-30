@@ -1,0 +1,12 @@
+---
+source: tests/workflows/tests/use.rs
+expression: envelope
+---
+{
+  "success": true,
+  "pinned": {
+    "node": "99.0.0"
+  },
+  "installed": false,
+  "warning": "node@99.0.0 is not currently installed. Run `lpm use node@99.0.0` to install it"
+}

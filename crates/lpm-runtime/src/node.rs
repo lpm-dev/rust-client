@@ -18,7 +18,7 @@ pub struct NodeRelease {
     /// Whether this is an LTS release
     pub lts: LtsField,
     /// Optional distribution base URL override used by tests and mirrors.
-    #[serde(default)]
+    #[serde(skip)]
     pub dist_base_url: Option<String>,
 }
 
@@ -52,9 +52,15 @@ impl NodeRelease {
         self.version.strip_prefix('v').unwrap_or(&self.version)
     }
 
+    fn has_valid_version(&self) -> bool {
+        validate_exact_version(self.version_bare()).is_ok()
+    }
+
     fn dist_base_url(&self) -> String {
-        self.dist_base_url
+        std::env::var("LPM_NODE_DIST_BASE_URL")
+            .ok()
             .as_deref()
+            .or(self.dist_base_url.as_deref())
             .unwrap_or(NODE_DIST_BASE_URL)
             .trim_end_matches('/')
             .to_string()
@@ -63,27 +69,54 @@ impl NodeRelease {
     /// Download URL for this release on the given platform.
     ///
     /// e.g., `https://nodejs.org/dist/v22.5.0/node-v22.5.0-darwin-arm64.tar.gz`
-    pub fn download_url(&self, platform: &Platform) -> String {
+    pub fn download_url(&self, platform: &Platform) -> Result<reqwest::Url, LpmError> {
         let ext = if platform.os == "win" {
             "zip"
         } else {
             "tar.gz"
         };
         let dist_base_url = self.dist_base_url();
-        format!(
+        parse_runtime_download_url(&format!(
             "{dist_base_url}/{}/node-{}-{}.{ext}",
             self.version,
             self.version,
             platform.node_suffix(),
-        )
+        ))
     }
 
     /// Expected SHA256 checksums URL.
     ///
     /// e.g., `https://nodejs.org/dist/v22.5.0/SHASUMS256.txt`
-    pub fn shasums_url(&self) -> String {
-        format!("{}/{}/SHASUMS256.txt", self.dist_base_url(), self.version)
+    pub fn shasums_url(&self) -> Result<reqwest::Url, LpmError> {
+        parse_runtime_download_url(&format!(
+            "{}/{}/SHASUMS256.txt",
+            self.dist_base_url(),
+            self.version
+        ))
     }
+}
+
+fn parse_runtime_download_url(raw: &str) -> Result<reqwest::Url, LpmError> {
+    let url = reqwest::Url::parse(raw)
+        .map_err(|error| LpmError::Network(format!("invalid runtime download URL: {error}")))?;
+    let loopback_http = url.scheme() == "http"
+        && url.host_str().is_some_and(|host| {
+            host.eq_ignore_ascii_case("localhost")
+                || host
+                    .parse::<std::net::IpAddr>()
+                    .is_ok_and(|address| address.is_loopback())
+        });
+    if url.scheme() != "https" && !loopback_http {
+        return Err(LpmError::Network(format!(
+            "runtime download URL must use HTTPS: {url}"
+        )));
+    }
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err(LpmError::Network(
+            "runtime download URL must not contain credentials".into(),
+        ));
+    }
+    Ok(url)
 }
 
 /// Base directory for LPM runtime storage.
@@ -95,7 +128,17 @@ pub fn runtimes_dir() -> Result<PathBuf, LpmError> {
 ///
 /// Returns `~/.lpm/runtimes/node/{version}/`
 pub fn node_version_dir(version: &str) -> Result<PathBuf, LpmError> {
+    validate_exact_version(version)?;
     Ok(runtimes_dir()?.join("node").join(version))
+}
+
+pub(crate) fn validate_exact_version(version: &str) -> Result<(), LpmError> {
+    lpm_semver::Version::parse(version).map_err(|_| {
+        LpmError::Script(format!(
+            "invalid managed runtime version '{version}': expected an exact semantic version"
+        ))
+    })?;
+    Ok(())
 }
 
 /// Path to the `node` binary for a specific installed version.
@@ -120,25 +163,62 @@ pub fn node_bin_dir(version: &str) -> Result<PathBuf, LpmError> {
 
 /// Check if a Node.js version is installed.
 pub fn is_installed(version: &str) -> bool {
-    node_binary_path(version).is_ok_and(|p| p.exists())
+    node_binary_path(version).is_ok_and(|path| is_executable_file(&path))
+}
+
+pub(crate) fn is_executable_file(path: &std::path::Path) -> bool {
+    let Ok(metadata) = std::fs::symlink_metadata(path) else {
+        return false;
+    };
+    if !metadata.is_file() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        metadata.permissions().mode() & 0o111 != 0
+    }
+    #[cfg(not(unix))]
+    {
+        true
+    }
 }
 
 /// List all installed Node.js versions.
 pub fn list_installed() -> Result<Vec<String>, LpmError> {
     let node_dir = runtimes_dir()?.join("node");
-    if !node_dir.exists() {
-        return Ok(vec![]);
-    }
+    let entries = match std::fs::read_dir(&node_dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error.into()),
+    };
 
     let mut versions = Vec::new();
-    for entry in std::fs::read_dir(&node_dir)? {
+    let mut binary_path = PathBuf::with_capacity(node_dir.as_os_str().len() + 64);
+    for entry in entries {
         let entry = entry?;
-        if entry.path().is_dir() {
-            let name = entry.file_name().to_string_lossy().to_string();
-            // Verify it actually has a node binary
-            if is_installed(&name) {
-                versions.push(name);
-            }
+        if !entry.file_type()?.is_dir() {
+            continue;
+        }
+        let name = entry.file_name();
+        let Some(version) = name.to_str() else {
+            continue;
+        };
+        if validate_exact_version(version).is_err() {
+            continue;
+        }
+        binary_path.clear();
+        binary_path.push(&node_dir);
+        binary_path.push(&name);
+        if cfg!(windows) {
+            binary_path.push("node.exe");
+        } else {
+            binary_path.push("bin");
+            binary_path.push("node");
+        }
+        if is_executable_file(&binary_path) {
+            versions.push(version.to_string());
         }
     }
 
@@ -191,19 +271,18 @@ pub async fn fetch_index(client: &reqwest::Client) -> Result<Vec<NodeRelease>, L
         });
     }
 
-    let body = resp
-        .text()
+    let body = lpm_http::read_body_capped(resp, lpm_common::STATE_FILE_SIZE_CAP_BYTES as usize)
         .await
         .map_err(|e| LpmError::Network(format!("failed to read node index body: {e}")))?;
 
-    let releases: Vec<NodeRelease> = serde_json::from_str(&body)
+    let releases: Vec<NodeRelease> = serde_json::from_slice(&body)
         .map_err(|e| LpmError::Script(format!("failed to parse node index: {e}")))?;
 
     // Cache it without exposing a truncate-then-write window.
     if let Some(parent) = cache_path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
-    let _ = download::write_restricted_file(&cache_path, body.as_bytes());
+    let _ = download::write_restricted_file(&cache_path, &body);
 
     Ok(releases)
 }
@@ -249,22 +328,27 @@ pub fn resolve_version(releases: &[NodeRelease], spec: &str) -> Option<NodeRelea
 
     // "lts" -> latest LTS
     if spec.eq_ignore_ascii_case("lts") {
-        return releases.iter().find(|r| r.lts.is_lts()).cloned();
+        return releases
+            .iter()
+            .find(|release| release.lts.is_lts() && release.has_valid_version())
+            .cloned();
     }
 
     // "latest" -> latest release
     if spec.eq_ignore_ascii_case("latest") {
-        return releases.first().cloned();
+        return releases
+            .iter()
+            .find(|release| release.has_valid_version())
+            .cloned();
     }
 
     // Exact match: "22.5.0"
-    let exact_target = if spec.starts_with('v') {
-        spec.to_string()
-    } else {
-        format!("v{spec}")
-    };
+    let exact_target = format!("v{spec}");
 
-    if let Some(r) = releases.iter().find(|r| r.version == exact_target) {
+    if let Some(r) = releases
+        .iter()
+        .find(|release| release.version == exact_target && release.has_valid_version())
+    {
         return Some(r.clone());
     }
 
@@ -272,7 +356,10 @@ pub fn resolve_version(releases: &[NodeRelease], spec: &str) -> Option<NodeRelea
     let prefix = format!("v{spec}.");
     releases
         .iter()
-        .find(|r| r.version.starts_with(&prefix) || r.version == format!("v{spec}"))
+        .find(|release| {
+            release.has_valid_version()
+                && (release.version.starts_with(&prefix) || release.version == exact_target)
+        })
         .cloned()
 }
 
@@ -310,21 +397,7 @@ pub fn find_matching_installed(spec: &str, installed: &[String]) -> Option<Strin
     // 2. Range match for explicit semver requirements.
     if is_range_spec(spec) {
         let req = lpm_semver::VersionReq::parse(spec).ok()?;
-        let mut matches: Vec<&String> = installed
-            .iter()
-            .filter(|v| {
-                lpm_semver::Version::parse(v)
-                    .ok()
-                    .is_some_and(|version| req.matches(&version))
-            })
-            .collect();
-
-        if !matches.is_empty() {
-            matches.sort_by(|a, b| compare_versions(b, a));
-            return Some(matches[0].clone());
-        }
-
-        return None;
+        return highest_matching_installed(installed, |_, version| req.matches(version));
     }
 
     // 3. Full semver specs are exact requirements. If the exact match wasn't found,
@@ -335,17 +408,23 @@ pub fn find_matching_installed(spec: &str, installed: &[String]) -> Option<Strin
 
     // 4. Prefix match for partial versions (e.g., "22" or "22.5").
     let prefix = format!("{spec}.");
-    let mut matches: Vec<&String> = installed
+    highest_matching_installed(installed, |raw, _| raw.starts_with(&prefix))
+}
+
+fn highest_matching_installed<F>(installed: &[String], matches: F) -> Option<String>
+where
+    F: Fn(&str, &lpm_semver::Version) -> bool,
+{
+    installed
         .iter()
-        .filter(|v| v.starts_with(&prefix))
-        .collect();
-
-    if !matches.is_empty() {
-        matches.sort_by(|a, b| compare_versions(b, a)); // descending
-        return Some(matches[0].clone());
-    }
-
-    None
+        .filter_map(|version| {
+            lpm_semver::Version::parse(version)
+                .ok()
+                .map(|parsed| (version, parsed))
+        })
+        .filter(|(raw, parsed)| matches(raw, parsed))
+        .max_by(|(_, a), (_, b)| a.cmp(b))
+        .map(|(version, _)| version.clone())
 }
 
 fn is_range_spec(spec: &str) -> bool {
@@ -418,6 +497,53 @@ mod tests {
         let releases = sample_releases();
         let r = resolve_version(&releases, "22").unwrap();
         assert_eq!(r.version, "v22.5.0"); // latest 22.x
+    }
+
+    #[test]
+    fn resolve_version_rejects_remote_release_with_path_like_version() {
+        let releases = vec![NodeRelease {
+            version: "v../../outside".into(),
+            date: "2026-08-30".into(),
+            lts: LtsField::Bool(false),
+            dist_base_url: None,
+        }];
+
+        assert!(resolve_version(&releases, "latest").is_none());
+    }
+
+    #[test]
+    fn node_version_dir_rejects_non_semver_path_component() {
+        let error = node_version_dir("../outside").expect_err("path-like version must be rejected");
+
+        assert!(error.to_string().contains("runtime version"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn executable_file_rejects_symbolic_links() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+
+        let directory = tempfile::tempdir().unwrap();
+        let target = directory.path().join("target");
+        let link = directory.path().join("node");
+        std::fs::write(&target, "executable").unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o755)).unwrap();
+        symlink(&target, &link).unwrap();
+
+        assert!(!is_executable_file(&link));
+    }
+
+    #[test]
+    fn remote_index_cannot_override_the_node_distribution_origin() {
+        let release: NodeRelease = serde_json::from_value(serde_json::json!({
+            "version": "v22.12.0",
+            "date": "2026-08-30",
+            "lts": false,
+            "dist_base_url": "https://attacker.example/node"
+        }))
+        .unwrap();
+
+        assert_eq!(release.dist_base_url.as_deref(), None);
     }
 
     #[test]
@@ -515,9 +641,9 @@ mod tests {
             os: "darwin",
             arch: "arm64",
         };
-        let url = r.download_url(&p);
+        let url = r.download_url(&p).unwrap();
         assert_eq!(
-            url,
+            url.as_str(),
             "https://nodejs.org/dist/v22.5.0/node-v22.5.0-darwin-arm64.tar.gz"
         );
     }
@@ -534,9 +660,10 @@ mod tests {
             os: "win",
             arch: "x64",
         };
-        let url = r.download_url(&p);
+        let url = r.download_url(&p).unwrap();
         assert_eq!(
-            url, "https://nodejs.org/dist/v22.5.0/node-v22.5.0-win-x64.zip",
+            url.as_str(),
+            "https://nodejs.org/dist/v22.5.0/node-v22.5.0-win-x64.zip",
             "Windows download URL must use .zip, not .tar.gz"
         );
     }
@@ -553,9 +680,9 @@ mod tests {
             os: "linux",
             arch: "x64",
         };
-        let url = r.download_url(&p);
+        let url = r.download_url(&p).unwrap();
         assert_eq!(
-            url,
+            url.as_str(),
             "https://nodejs.org/dist/v20.18.0/node-v20.18.0-linux-x64.tar.gz"
         );
     }
@@ -574,11 +701,11 @@ mod tests {
         };
 
         assert_eq!(
-            r.download_url(&p),
+            r.download_url(&p).unwrap().as_str(),
             "http://127.0.0.1:4010/node-dist/v22.12.0/node-v22.12.0-darwin-arm64.tar.gz"
         );
         assert_eq!(
-            r.shasums_url(),
+            r.shasums_url().unwrap().as_str(),
             "http://127.0.0.1:4010/node-dist/v22.12.0/SHASUMS256.txt"
         );
     }

@@ -2047,7 +2047,8 @@ async fn async_main() -> Result<()> {
                 remove,
             } = args;
             let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
-            commands::r#use::run_cli(&args, list, pin, remove, &cwd, cli.json).await
+            let project_dir = lpm_workspace::find_project_root(&cwd).unwrap_or(cwd);
+            commands::r#use::run_cli(&args, list, pin, remove, &project_dir, cli.json).await
         },
         Commands::Env(args) => {
             let network_args::EnvArgs {
