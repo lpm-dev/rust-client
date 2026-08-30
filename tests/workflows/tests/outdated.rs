@@ -1454,6 +1454,7 @@ async fn outdated_hydrates_release_times_in_bounded_parallel_waves() {
     project.write_file("lpm.lock", &lockfile);
 
     let server = MockServer::start().await;
+    let recent_modified = iso8601_n_secs_ago(60);
     for index in 0..PACKAGE_COUNT {
         let name = format!("@lpm.dev/owner.hydration-wave-{index}");
         Mock::given(method("GET"))
@@ -1461,7 +1462,7 @@ async fn outdated_hydrates_release_times_in_bounded_parallel_waves() {
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "name": name,
                 "dist-tags": { "latest": "1.1.0" },
-                "modified": "2026-08-29T00:00:00.000Z",
+                "modified": recent_modified.as_str(),
                 "versions": {
                     "1.0.0": { "name": name, "version": "1.0.0" },
                     "1.1.0": { "name": name, "version": "1.1.0" }
