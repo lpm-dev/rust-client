@@ -286,11 +286,11 @@ async fn run_start_detached(
     Ok(())
 }
 
-pub(crate) async fn ensure_detached_started_for_project(
+pub(crate) async fn ensure_detached_started_for_config(
     project_dir: &Path,
+    config: &lpm_json::LpmJsonConfig,
 ) -> Result<DetachedProxyStart, LpmError> {
-    let options = resolve_start_options(project_dir, None, None, None)?;
-    ensure_detached_started_with_options(project_dir, options).await
+    ensure_detached_started_with_options(project_dir, start_options_from_config(config)).await
 }
 
 async fn ensure_detached_started_with_options(
@@ -450,8 +450,12 @@ pub(super) fn resolve_start_options(
     let Some(config) = lpm_json::read_lpm_json(project_dir).map_err(LpmError::Script)? else {
         return Ok(lpm_proxy::ProxyDaemonOptions::default());
     };
-    if lpm_runner::local_domains::configured_hostnames(&config).is_empty() {
-        return Ok(lpm_proxy::ProxyDaemonOptions::default());
+    Ok(start_options_from_config(&config))
+}
+
+fn start_options_from_config(config: &lpm_json::LpmJsonConfig) -> lpm_proxy::ProxyDaemonOptions {
+    if lpm_runner::local_domains::configured_hostnames(config).is_empty() {
+        return lpm_proxy::ProxyDaemonOptions::default();
     }
 
     let proxy = config.proxy.as_ref();
@@ -461,11 +465,11 @@ pub(super) fn resolve_start_options(
         .unwrap_or(true)
         .then_some(80);
 
-    Ok(lpm_proxy::ProxyDaemonOptions {
+    lpm_proxy::ProxyDaemonOptions {
         http_port: None,
         http_redirect_port,
         tls_port,
-    })
+    }
 }
 
 async fn run_stop(json_output: bool) -> Result<(), LpmError> {

@@ -29,7 +29,11 @@ impl LogBuffer {
     }
 
     pub fn push(&mut self, line: String) {
-        let clean = lpm_common::sanitize_terminal_inline(&line).into_owned();
+        let clean = if line.chars().any(char::is_control) {
+            lpm_common::sanitize_terminal_inline(&line).into_owned()
+        } else {
+            line
+        };
         let line_bytes = clean.capacity();
         if line_bytes > self.max_bytes {
             self.dropped_lines = self.dropped_lines.saturating_add(1);
@@ -189,6 +193,15 @@ mod tests {
 
         let lines: Vec<&str> = buf.lines().collect();
         assert_eq!(lines, vec!["safe tail end"]);
+    }
+
+    #[test]
+    fn push_sanitizes_c1_terminal_controls_without_an_escape_prefix() {
+        let mut buffer = LogBuffer::new(1);
+
+        buffer.push("safe\u{009b}31munsafe".to_string());
+
+        assert_eq!(buffer.lines().collect::<Vec<_>>(), vec!["safeunsafe"]);
     }
 
     #[test]

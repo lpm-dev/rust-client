@@ -219,6 +219,7 @@ const MAX_RESTART_ATTEMPTS: u32 = 10;
 /// Prevents immediately failing processes from being marked Ready before the first exit poll.
 const NO_READINESS_GRACE: Duration = Duration::from_millis(100);
 const MAX_SERVICE_LOG_LINE_BYTES: usize = 64 * 1024;
+const MAX_PENDING_ENDPOINT_CANDIDATES: usize = 64;
 struct CommandBridge {
     controller: OrchestratorCommandController,
     stop: Arc<AtomicU8>,
@@ -512,7 +513,7 @@ fn wait_for_initial_service_readiness(
     mut should_cancel: impl FnMut() -> bool,
 ) -> Result<InitialServiceReadiness, String> {
     let started = std::time::Instant::now();
-    let deadline = started + Duration::from_secs(options.timeout_secs);
+    let deadline = ready::deadline_from_timeout(started, options.timeout_secs)?;
     let endpoint = if let Some(port) = options.assigned_port {
         crate::dev_endpoint::resolve_spawned_endpoint_until(
             options.service_dir,
@@ -571,7 +572,41 @@ fn wait_for_initial_service_readiness(
 }
 
 fn service_ready_port(config: &ServiceConfig, assigned_port: Option<u16>) -> Option<u16> {
-    config.ready_port.or(assigned_port).or(config.port)
+    match config.ready_port {
+        Some(ready_port) if config.port == Some(ready_port) => assigned_port.or(Some(ready_port)),
+        Some(ready_port) => Some(ready_port),
+        None => assigned_port.or(config.port),
+    }
+}
+
+fn service_ready_url(config: &ServiceConfig, assigned_port: Option<u16>) -> Option<String> {
+    let url = config.ready_url.as_deref()?;
+    let (Some(configured_port), Some(assigned_port)) = (config.port, assigned_port) else {
+        return Some(url.to_string());
+    };
+    if configured_port == assigned_port {
+        return Some(url.to_string());
+    }
+
+    let scheme_end = url.find("://").map(|index| index + 3)?;
+    let authority_end = url[scheme_end..]
+        .find('/')
+        .map_or(url.len(), |index| scheme_end + index);
+    let authority = &url[scheme_end..authority_end];
+    let port_separator = if authority.starts_with('[') {
+        authority.rfind("]:").map(|index| index + 1)
+    } else {
+        authority.rfind(':')
+    }?;
+    if authority[port_separator + 1..].parse::<u16>().ok()? != configured_port {
+        return Some(url.to_string());
+    }
+
+    let mut remapped = String::with_capacity(url.len() + 5);
+    remapped.push_str(&url[..scheme_end + port_separator + 1]);
+    remapped.push_str(&assigned_port.to_string());
+    remapped.push_str(&url[authority_end..]);
+    Some(remapped)
 }
 
 fn command_with_managed_port(command: &str, cwd: &Path, port: Option<u16>) -> String {
@@ -751,13 +786,23 @@ fn assign_service_ports(
 pub fn run_services(
     project_dir: &Path,
     services: &HashMap<String, ServiceConfig>,
+    options: OrchestratorOptions,
+) -> Result<(), LpmError> {
+    let config = crate::lpm_json::read_lpm_json(project_dir).map_err(LpmError::Script)?;
+    run_services_with_config(project_dir, services, config.as_ref(), options)
+}
+
+pub fn run_services_with_config(
+    project_dir: &Path,
+    services: &HashMap<String, ServiceConfig>,
+    config: Option<&crate::lpm_json::LpmJsonConfig>,
     mut options: OrchestratorOptions,
 ) -> Result<(), LpmError> {
     if services.is_empty() {
         return Ok(());
     }
 
-    let active_services = service_graph::select_active_services(services, &options.filter)
+    let active_services = service_graph::select_active_services_ref(services, &options.filter)
         .map_err(LpmError::Script)?;
     let primary_service = primary_service_name(&active_services)?;
     if options.manage_primary_endpoint && primary_service.is_none() {
@@ -768,7 +813,7 @@ pub fn run_services(
     }
 
     // Validate dependsOn references before sorting
-    for (name, config) in &active_services {
+    for (name, config) in active_services.iter() {
         for dep in &config.depends_on {
             if dep.trim().is_empty() {
                 return Err(LpmError::Script(format!(
@@ -820,7 +865,12 @@ pub fn run_services(
     let cross_env = ports::build_cross_service_env(&port_map, options.https);
 
     // Load .env files + vault + validate schema (unified loader)
-    let dotenv = crate::script::load_script_env(project_dir, "dev", options.env_mode.as_deref())?;
+    let dotenv = crate::script::load_script_env_with_config(
+        project_dir,
+        "dev",
+        options.env_mode.as_deref(),
+        config,
+    )?;
 
     // Assign colors
     let service_names: Vec<String> = groups.iter().flatten().cloned().collect();
@@ -981,7 +1031,10 @@ pub fn run_services(
                 let service_index = service_names.iter().position(|n| n == name).unwrap_or(0);
 
                 // Spawn output readers in background threads
-                let (endpoint_tx, endpoint_rx) = std::sync::mpsc::channel();
+                let (endpoint_tx, endpoint_rx) =
+                    std::sync::mpsc::sync_channel(MAX_PENDING_ENDPOINT_CANDIDATES);
+                let endpoint_candidates = EndpointCandidateSink::new(endpoint_tx);
+                let readiness_candidates = endpoint_candidates.clone();
                 spawn_output_readers(
                     child_stdout,
                     child_stderr,
@@ -991,13 +1044,13 @@ pub fn run_services(
                         service_index,
                         shutdown_state: &shutdown_state,
                         event_tx: &options.event_tx,
-                        endpoint_tx: Some(endpoint_tx),
+                        endpoint_candidates: Some(endpoint_candidates),
                     },
                 );
 
                 // Wait for readiness (in a background thread)
                 let ready_port = service_ready_port(config, port_map.get(name).copied());
-                let ready_url = config.ready_url.clone();
+                let ready_url = service_ready_url(config, assigned_port);
                 let timeout = config.ready_timeout;
                 let readiness_requires_running_process =
                     assigned_port.is_some() || ready_url.is_some() || ready_port.is_some();
@@ -1010,7 +1063,7 @@ pub fn run_services(
                 let readiness_command_controller = command_bridge.controller().clone();
 
                 let handle = std::thread::spawn(move || {
-                    wait_for_initial_service_readiness(
+                    let result = wait_for_initial_service_readiness(
                         InitialReadinessOptions {
                             service_dir: &service_dir,
                             root_pid: child_pid,
@@ -1038,7 +1091,9 @@ pub fn run_services(
                                 && service_exit_status(&readiness_children, &readiness_name)
                                     .is_some()
                         },
-                    )
+                    );
+                    readiness_candidates.deactivate();
+                    result
                 });
 
                 handles.push((name.clone(), handle));
@@ -1188,7 +1243,7 @@ pub fn run_services(
 
         recovery::supervise_services(recovery::RecoveryContext {
             project_dir,
-            active_services: &active_services,
+            active_services: active_services.as_ref(),
             groups: &groups,
             service_runtime_hints: &options.service_runtime_hints,
             dotenv: &dotenv,
@@ -1258,7 +1313,37 @@ struct OutputReaderOptions<'a> {
     service_index: usize,
     shutdown_state: &'a Arc<AtomicU8>,
     event_tx: &'a Option<std::sync::mpsc::SyncSender<OrchestratorEvent>>,
-    endpoint_tx: Option<std::sync::mpsc::Sender<LocalTarget>>,
+    endpoint_candidates: Option<EndpointCandidateSink>,
+}
+
+#[derive(Clone)]
+struct EndpointCandidateSink {
+    sender: std::sync::mpsc::SyncSender<LocalTarget>,
+    active: Arc<AtomicBool>,
+}
+
+impl EndpointCandidateSink {
+    fn new(sender: std::sync::mpsc::SyncSender<LocalTarget>) -> Self {
+        Self {
+            sender,
+            active: Arc::new(AtomicBool::new(true)),
+        }
+    }
+
+    fn deactivate(&self) {
+        self.active.store(false, Ordering::Release);
+    }
+
+    fn send_line_candidates(&self, line: &str) {
+        if !self.active.load(Ordering::Acquire) || !line.contains("://") {
+            return;
+        }
+        for target in crate::dev_endpoint::parse_local_targets(line) {
+            if self.sender.try_send(target).is_err() {
+                break;
+            }
+        }
+    }
 }
 
 fn spawn_output_readers(
@@ -1272,9 +1357,9 @@ fn spawn_output_readers(
         service_index,
         shutdown_state,
         event_tx,
-        endpoint_tx,
+        endpoint_candidates,
     } = options;
-    let stderr_endpoint_tx = endpoint_tx.clone();
+    let stderr_endpoint_candidates = endpoint_candidates.clone();
     // stdout reader
     {
         let name = name.to_string();
@@ -1285,10 +1370,8 @@ fn spawn_output_readers(
         std::thread::spawn(move || {
             if let Some(stdout) = stdout {
                 drain_service_output(stdout, &shutdown_ref, |line| {
-                    if let Some(ref tx) = endpoint_tx {
-                        for target in crate::dev_endpoint::parse_local_targets(line) {
-                            let _ = tx.send(target);
-                        }
+                    if let Some(ref candidates) = endpoint_candidates {
+                        candidates.send_line_candidates(line);
                     }
                     let safe_name = sanitize_terminal_inline(&name);
                     let safe_line = sanitize_terminal_inline(line);
@@ -1315,10 +1398,8 @@ fn spawn_output_readers(
         std::thread::spawn(move || {
             if let Some(stderr) = stderr {
                 drain_service_output(stderr, &shutdown_ref, |line| {
-                    if let Some(ref tx) = stderr_endpoint_tx {
-                        for target in crate::dev_endpoint::parse_local_targets(line) {
-                            let _ = tx.send(target);
-                        }
+                    if let Some(ref candidates) = stderr_endpoint_candidates {
+                        candidates.send_line_candidates(line);
                     }
                     let safe_name = sanitize_terminal_inline(&name);
                     let safe_line = sanitize_terminal_inline(line);
@@ -1843,6 +1924,48 @@ mod tests {
     }
 
     #[test]
+    fn service_ready_port_tracks_a_reassigned_configured_port() {
+        let config = ServiceConfig {
+            command: "node server.js".to_string(),
+            port: Some(3000),
+            ready_port: Some(3000),
+            ..Default::default()
+        };
+
+        assert_eq!(service_ready_port(&config, Some(3001)), Some(3001));
+    }
+
+    #[test]
+    fn service_ready_url_tracks_a_reassigned_configured_port() {
+        let config = ServiceConfig {
+            command: "node server.js".to_string(),
+            port: Some(3000),
+            ready_url: Some("http://127.0.0.1:3000/health?full=1".to_string()),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            service_ready_url(&config, Some(3001)).as_deref(),
+            Some("http://127.0.0.1:3001/health?full=1")
+        );
+    }
+
+    #[test]
+    fn service_ready_url_keeps_an_independent_health_port() {
+        let config = ServiceConfig {
+            command: "node server.js".to_string(),
+            port: Some(3000),
+            ready_url: Some("http://localhost:8080/health".to_string()),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            service_ready_url(&config, Some(3001)).as_deref(),
+            Some("http://localhost:8080/health")
+        );
+    }
+
+    #[test]
     fn vite_service_command_receives_the_managed_port_strictly() {
         let dir = tempfile::TempDir::new().unwrap();
         std::fs::write(
@@ -2104,7 +2227,7 @@ mod tests {
                 service_index: 0,
                 shutdown_state: &shutdown,
                 event_tx: &Some(tx),
-                endpoint_tx: None,
+                endpoint_candidates: None,
             },
         );
 

@@ -973,6 +973,12 @@ server.listen(port, '127.0.0.1', () => {
 
 #[test]
 fn dev_readiness_timeout_stops_before_starting_dependents() {
+    let readiness_listener =
+        TcpListener::bind("127.0.0.1:0").expect("reserve non-responsive readiness port");
+    let readiness_port = readiness_listener
+        .local_addr()
+        .expect("read non-responsive readiness port")
+        .port();
     let project = TempProject::empty(
         r#"{
             "name": "dev-readiness-timeout",
@@ -981,19 +987,21 @@ fn dev_readiness_timeout_stops_before_starting_dependents() {
     );
     project.write_file(
         "lpm.json",
-        r#"{
-            "services": {
-                "db": {
+        &format!(
+            r#"{{
+            "services": {{
+                "db": {{
                     "command": "node slow-service.js",
-                    "readyUrl": "http://127.0.0.1:0/health",
+                    "readyUrl": "http://127.0.0.1:{readiness_port}/health",
                     "readyTimeout": 1
-                },
-                "api": {
+                }},
+                "api": {{
                     "command": "node dependent.js",
                     "dependsOn": ["db"]
-                }
-            }
-        }"#,
+                }}
+            }}
+        }}"#
+        ),
     );
     project.write_file("slow-service.js", "setTimeout(() => {}, 2500);\n");
     project.write_file(
@@ -1019,7 +1027,9 @@ fn dev_readiness_timeout_stops_before_starting_dependents() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
         stderr.contains("service 'db' failed readiness")
-            && stderr.contains("timed out waiting for http://127.0.0.1:0/health (1s)"),
+            && stderr.contains(&format!(
+                "timed out waiting for http://127.0.0.1:{readiness_port}/health (1s)"
+            )),
         "error must identify the service and readiness target\nstderr:\n{stderr}"
     );
 }
@@ -1033,6 +1043,12 @@ fn multi_service_readiness_failure_stops_descendant_processes() {
         .expect("read descendant port")
         .port();
     drop(descendant_listener);
+    let readiness_listener =
+        TcpListener::bind("127.0.0.1:0").expect("reserve non-responsive readiness port");
+    let readiness_port = readiness_listener
+        .local_addr()
+        .expect("read non-responsive readiness port")
+        .port();
     let project = TempProject::empty(r#"{"name":"descendant-cleanup","version":"1.0.0"}"#);
     project.write_file(
         "lpm.json",
@@ -1041,7 +1057,7 @@ fn multi_service_readiness_failure_stops_descendant_processes() {
                 "services":{{
                     "api":{{
                         "command":"node descendant.js {descendant_port} & sleep 30",
-                        "readyUrl":"http://127.0.0.1:0/health",
+                        "readyUrl":"http://127.0.0.1:{readiness_port}/health",
                         "readyTimeout":1
                     }},
                     "worker":{{"command":"sleep 30"}}

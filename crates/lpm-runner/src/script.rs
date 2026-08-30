@@ -356,9 +356,30 @@ pub fn run_dev_script_with_envs(
     bin_hint: &ManagedRuntimeHint,
     endpoint_options: DevScriptEndpointOptions,
 ) -> Result<(), LpmError> {
-    let (script_cmd, scripts) = resolve_script_command(project_dir, "dev")?;
+    let config = lpm_json::read_lpm_json(project_dir).map_err(LpmError::Script)?;
+    run_dev_script_with_envs_and_config(
+        project_dir,
+        extra_args,
+        env_mode,
+        extra_envs,
+        bin_hint,
+        config.as_ref(),
+        endpoint_options,
+    )
+}
+
+pub fn run_dev_script_with_envs_and_config(
+    project_dir: &Path,
+    extra_args: &[String],
+    env_mode: Option<&str>,
+    extra_envs: &[(String, String)],
+    bin_hint: &ManagedRuntimeHint,
+    config: Option<&lpm_json::LpmJsonConfig>,
+    endpoint_options: DevScriptEndpointOptions,
+) -> Result<(), LpmError> {
+    let (script_cmd, scripts) = resolve_script_command_with_config(project_dir, "dev", config)?;
     let path = bin_path::build_path_with_bins_pre_resolved(project_dir, bin_hint)?;
-    let loaded = resolve_and_load_env(project_dir, "dev", env_mode)?;
+    let loaded = resolve_and_load_env_with_config(project_dir, "dev", env_mode, config)?;
     print_env_context(&loaded);
     let mut env_vars = loaded.vars;
     for (key, value) in extra_envs {
@@ -1218,13 +1239,12 @@ fn resolve_and_load_env_with_config(
 ) -> Result<LoadedEnv, LpmError> {
     // Determine the canonical env name via the resolver.
     // Priority: 1. explicit --env flag  2. lpm.json script mapping  3. None
-    let (env_name, alias, source) = if let Some(m) = explicit_mode {
+    let (resolved, source) = if let Some(m) = explicit_mode {
         let resolved = match config {
             Some(c) => lpm_env::resolver::resolve(m, &c.env, c.environments.as_ref()),
             None => lpm_env::resolver::resolve(m, &Default::default(), None),
         };
-        let alias = resolved.alias.clone();
-        (Some(resolved.canonical), alias, "--env flag")
+        (Some(resolved), "--env flag")
     } else if let Some(task_mode) = config
         .and_then(|config| config.tasks.get(script_name))
         .and_then(|task| task.env.as_deref())
@@ -1232,39 +1252,26 @@ fn resolve_and_load_env_with_config(
         let config = config.expect("task mode requires lpm.json");
         let resolved =
             lpm_env::resolver::resolve(task_mode, &config.env, config.environments.as_ref());
-        let alias = resolved.alias.clone();
-        (Some(resolved.canonical), alias, "lpm.json task")
+        (Some(resolved), "lpm.json task")
     } else {
         match config.and_then(|c| {
             lpm_env::resolver::resolve_from_script(script_name, &c.env, c.environments.as_ref())
         }) {
-            Some(r) => {
-                let alias = r.alias.clone();
-                (Some(r.canonical), alias, "lpm.json")
-            }
-            None => (None, None, "default"),
+            Some(resolved) => (Some(resolved), "lpm.json"),
+            None => (None, "default"),
         }
     };
-
-    // Count vault secrets for this environment
-    let vault_count = match &env_name {
-        Some(name) => lpm_vault::try_get_all_env(project_dir, name)
-            .map_err(LpmError::EnvValidation)?
-            .len(),
-        None => lpm_vault::try_get_all(project_dir)
-            .map_err(LpmError::EnvValidation)?
-            .len(),
-    };
-
-    // Delegate to the unified loader (handles inheritance, vault, schema validation)
-    let vars = dotenv::load_project_env_with_config(project_dir, env_name.as_deref(), config)?;
+    let env_name = resolved.as_ref().map(|env| env.canonical.as_str());
+    let file_path = resolved.as_ref().and_then(|env| env.file_path.as_deref());
+    let loaded =
+        dotenv::load_project_env_details_with_config(project_dir, env_name, file_path, config)?;
 
     Ok(LoadedEnv {
-        vars,
-        env_name,
-        alias,
+        vars: loaded.vars,
+        env_name: env_name.map(str::to_string),
+        alias: resolved.and_then(|env| env.alias),
         source,
-        vault_count,
+        vault_count: loaded.vault_count,
     })
 }
 
@@ -1296,6 +1303,14 @@ pub fn script_command(project_dir: &Path, script_name: &str) -> Result<String, L
     resolve_script_command(project_dir, script_name).map(|(command, _)| command)
 }
 
+pub fn script_command_with_config(
+    project_dir: &Path,
+    script_name: &str,
+    config: Option<&lpm_json::LpmJsonConfig>,
+) -> Result<String, LpmError> {
+    resolve_script_command_with_config(project_dir, script_name, config).map(|(command, _)| command)
+}
+
 /// Resolve a script command from package.json or lpm.json tasks.
 ///
 /// Lookup order:
@@ -1306,6 +1321,15 @@ pub fn script_command(project_dir: &Path, script_name: &str) -> Result<String, L
 fn resolve_script_command(
     project_dir: &Path,
     script_name: &str,
+) -> Result<(String, HashMap<String, String>), LpmError> {
+    let config = lpm_json::read_lpm_json(project_dir).map_err(LpmError::Script)?;
+    resolve_script_command_with_config(project_dir, script_name, config.as_ref())
+}
+
+fn resolve_script_command_with_config(
+    project_dir: &Path,
+    script_name: &str,
+    lpm_config: Option<&lpm_json::LpmJsonConfig>,
 ) -> Result<(String, HashMap<String, String>), LpmError> {
     let pkg_json_path = project_dir.join("package.json");
 
@@ -1325,8 +1349,7 @@ fn resolve_script_command(
         return Ok((cmd.clone(), pkg.scripts.clone()));
     }
 
-    let lpm_config = lpm_json::read_lpm_json(project_dir).map_err(LpmError::Script)?;
-    if let Some(config) = &lpm_config {
+    if let Some(config) = lpm_config {
         for (task_name, task_config) in &config.tasks {
             if task_name == script_name
                 && let Some(cmd) = &task_config.command
@@ -1796,6 +1819,42 @@ mod tests {
 
         let result = run_script(dir.path(), "check-env", &[], Some("staging"), &Unknown);
         assert!(result.is_ok(), "--env=staging should load .env.staging");
+    }
+
+    #[test]
+    fn script_env_mapping_loads_the_exact_configured_file_path() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir_all(dir.path().join("config")).unwrap();
+        fs::write(
+            dir.path().join("config/dev.env"),
+            "LPM_EXACT_ENV_MAPPING_TEST=from-configured-path\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join(".env.dev"),
+            "LPM_EXACT_ENV_MAPPING_TEST=from-derived-path\n",
+        )
+        .unwrap();
+        let config = lpm_json::parse_lpm_json(r#"{"env":{"dev":"config/dev.env"}}"#).unwrap();
+
+        let loaded = load_script_env_with_config(dir.path(), "dev", None, Some(&config)).unwrap();
+
+        assert_eq!(
+            loaded.get("LPM_EXACT_ENV_MAPPING_TEST").map(String::as_str),
+            Some("from-configured-path")
+        );
+    }
+
+    #[test]
+    fn script_command_with_config_does_not_reread_lpm_json() {
+        let dir = tempfile::tempdir().unwrap();
+        let config =
+            lpm_json::parse_lpm_json(r#"{"tasks":{"dev":{"command":"echo configured"}}}"#).unwrap();
+        fs::write(dir.path().join("lpm.json"), "{").unwrap();
+
+        let command = script_command_with_config(dir.path(), "dev", Some(&config)).unwrap();
+
+        assert_eq!(command, "echo configured");
     }
 
     #[test]

@@ -187,6 +187,10 @@ const REVIEWED_RAW_ATOMIC_WRITERS: &[(&str, &str)] = &[
         "streams into an exclusively created same-directory NamedTempFile, syncs and validates it, then publishes with persist_noclobber",
     ),
     (
+        "crates/lpm-cli/src/commands/dev.rs::auto_copy_env_example",
+        "publishes an exclusively created same-directory NamedTempFile with persist_noclobber so a concurrent .env creator always wins",
+    ),
+    (
         "crates/lpm-cli/src/commands/rebuild/build_cache/toolchain_snapshot.rs::write_snapshot",
         "NamedTempFile exclusively creates a randomized sibling before persist",
     ),

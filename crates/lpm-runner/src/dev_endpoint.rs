@@ -9,6 +9,8 @@ use std::sync::mpsc::{Receiver, RecvTimeoutError};
 use std::time::{Duration, Instant};
 
 pub(crate) const ENDPOINT_DISCOVERY_CANCELLED: &str = "endpoint discovery cancelled";
+const MAX_ADVERTISED_TARGETS: usize = 64;
+const MAX_CANDIDATES_PER_POLL: usize = 64;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 /// Child-owned local endpoint discovered during dev-server startup.
@@ -100,7 +102,7 @@ pub(crate) fn resolve_spawned_endpoint_until(
             return Err(endpoint_timeout_error(requested_port, &last_owned));
         }
         match candidates.recv_timeout(remaining.min(Duration::from_millis(75))) {
-            Ok(candidate) => push_unique_target(&mut advertised, candidate),
+            Ok(candidate) => push_recent_target(&mut advertised, candidate),
             Err(RecvTimeoutError::Timeout) => {}
             Err(RecvTimeoutError::Disconnected) => {
                 if should_cancel() {
@@ -108,8 +110,11 @@ pub(crate) fn resolve_spawned_endpoint_until(
                 }
             }
         }
-        while let Ok(candidate) = candidates.try_recv() {
-            push_unique_target(&mut advertised, candidate);
+        for _ in 1..MAX_CANDIDATES_PER_POLL {
+            let Ok(candidate) = candidates.try_recv() else {
+                break;
+            };
+            push_recent_target(&mut advertised, candidate);
         }
 
         let Some(owned) = owned_listeners_for_process_tree(
@@ -478,6 +483,21 @@ fn loopback_targets_from(
         .collect()
 }
 
+fn push_recent_target(targets: &mut Vec<LocalTarget>, candidate: LocalTarget) {
+    if let Some(existing) = targets.iter_mut().find(|target| {
+        target.scheme == candidate.scheme
+            && target.address == candidate.address
+            && target.port == candidate.port
+    }) {
+        *existing = candidate;
+        return;
+    }
+    if targets.len() == MAX_ADVERTISED_TARGETS {
+        targets.remove(0);
+    }
+    targets.push(candidate);
+}
+
 fn push_unique_target(targets: &mut Vec<LocalTarget>, candidate: LocalTarget) {
     if !targets.contains(&candidate) {
         targets.push(candidate);
@@ -587,6 +607,28 @@ mod tests {
     fn rejects_external_and_credentialed_urls() {
         assert!(parse_local_targets("https://example.com:8443/").is_empty());
         assert!(parse_local_targets("http://user@localhost:3000/").is_empty());
+    }
+
+    #[test]
+    fn advertised_targets_coalesce_paths_and_keep_a_fixed_recent_window() {
+        let mut targets = Vec::new();
+        let mut first = LocalTarget::loopback(LocalScheme::Http, 3000);
+        first.base_path = "/first".to_string();
+        push_recent_target(&mut targets, first);
+        let mut replacement = LocalTarget::loopback(LocalScheme::Http, 3000);
+        replacement.base_path = "/replacement".to_string();
+        push_recent_target(&mut targets, replacement);
+
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].base_path, "/replacement");
+
+        for port in 3001..=3064 {
+            push_recent_target(&mut targets, LocalTarget::loopback(LocalScheme::Http, port));
+        }
+
+        assert_eq!(targets.len(), MAX_ADVERTISED_TARGETS);
+        assert!(targets.iter().all(|target| target.port != 3000));
+        assert!(targets.iter().any(|target| target.port == 3064));
     }
 
     #[test]

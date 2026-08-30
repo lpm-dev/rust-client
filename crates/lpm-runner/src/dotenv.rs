@@ -71,12 +71,14 @@ pub fn load_project_env_with_schema_validation(
     validate_schema: bool,
 ) -> Result<HashMap<String, String>, LpmError> {
     let lpm_config = lpm_json::read_lpm_json(project_dir).map_err(LpmError::EnvValidation)?;
-    load_project_env_with_config_and_schema_validation(
+    load_project_env_details_with_config_and_schema_validation(
         project_dir,
         env_name,
+        None,
         lpm_config.as_ref(),
         validate_schema,
     )
+    .map(|loaded| loaded.vars)
 }
 
 /// Load the project environment using a configuration that the caller already parsed.
@@ -85,20 +87,43 @@ pub fn load_project_env_with_config(
     env_name: Option<&str>,
     lpm_config: Option<&lpm_json::LpmJsonConfig>,
 ) -> Result<HashMap<String, String>, LpmError> {
-    load_project_env_with_config_and_schema_validation(
+    load_project_env_details_with_config_and_schema_validation(
         project_dir,
         env_name,
+        None,
+        lpm_config,
+        !crate::script::should_skip_env_validation(),
+    )
+    .map(|loaded| loaded.vars)
+}
+
+pub(crate) struct LoadedProjectEnv {
+    pub(crate) vars: HashMap<String, String>,
+    pub(crate) vault_count: usize,
+}
+
+pub(crate) fn load_project_env_details_with_config(
+    project_dir: &Path,
+    env_name: Option<&str>,
+    configured_file_path: Option<&str>,
+    lpm_config: Option<&lpm_json::LpmJsonConfig>,
+) -> Result<LoadedProjectEnv, LpmError> {
+    load_project_env_details_with_config_and_schema_validation(
+        project_dir,
+        env_name,
+        configured_file_path,
         lpm_config,
         !crate::script::should_skip_env_validation(),
     )
 }
 
-fn load_project_env_with_config_and_schema_validation(
+fn load_project_env_details_with_config_and_schema_validation(
     project_dir: &Path,
     env_name: Option<&str>,
+    configured_file_path: Option<&str>,
     lpm_config: Option<&lpm_json::LpmJsonConfig>,
     validate_schema: bool,
-) -> Result<HashMap<String, String>, LpmError> {
+) -> Result<LoadedProjectEnv, LpmError> {
     // Validate env name to prevent path traversal
     let env_name = env_name.filter(|m| {
         if !m.is_empty()
@@ -141,6 +166,8 @@ fn load_project_env_with_config_and_schema_validation(
                 return Err(LpmError::EnvValidation(e));
             }
         }
+    } else if let Some(file_path) = configured_file_path {
+        load_env_from_configured_path(project_dir, file_path)?
     } else {
         // Standard loading (no environments config or no env name)
         load_env_files(project_dir, env_name)?
@@ -167,8 +194,9 @@ fn load_project_env_with_config_and_schema_validation(
         lpm_vault::try_get_all(project_dir).map_err(LpmError::EnvValidation)?
     };
 
-    if !vault_vars.is_empty() {
-        tracing::debug!("loaded {} env var(s) from vault", vault_vars.len());
+    let vault_count = vault_vars.len();
+    if vault_count > 0 {
+        tracing::debug!("loaded {vault_count} env var(s) from vault");
         loaded.extend(vault_vars);
     }
 
@@ -190,7 +218,10 @@ fn load_project_env_with_config_and_schema_validation(
 
     remove_dangerous_env_vars(&mut loaded, "project env");
 
-    Ok(loaded)
+    Ok(LoadedProjectEnv {
+        vars: loaded,
+        vault_count,
+    })
 }
 
 /// Parse a `.env` file into a key-value map.
@@ -367,6 +398,24 @@ pub fn load_env_from_chain(
 
     remove_dangerous_env_vars(&mut merged, ".env file");
 
+    Ok(merged)
+}
+
+fn load_env_from_configured_path(
+    project_dir: &Path,
+    file_path: &str,
+) -> Result<HashMap<String, String>, LpmError> {
+    let mut merged = HashMap::new();
+    for path in [
+        ".env".to_string(),
+        ".env.local".to_string(),
+        file_path.to_string(),
+        format!("{file_path}.local"),
+    ] {
+        merge_env_file(&mut merged, &contained_env_file_path(project_dir, &path)?)?;
+    }
+    merged.retain(|key, _| std::env::var(key).is_err());
+    remove_dangerous_env_vars(&mut merged, ".env file");
     Ok(merged)
 }
 

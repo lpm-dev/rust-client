@@ -2844,12 +2844,20 @@ async fn async_main() -> Result<()> {
             } = args;
             lpm_runner::script::set_skip_env_validation(no_env_check);
             let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
-            // Runtime config must fail closed before tunnel auth or any child process starts.
-            let detected_runtimes = lpm_runtime::detect::detect_runtime_versions(&cwd)?;
-
-            // Read lpm.json for auto-detection
             let lpm_config = lpm_runner::lpm_json::read_lpm_json(&cwd)
                 .map_err(lpm_common::LpmError::Script)?;
+            let runtime_spec = |runtime| {
+                lpm_config
+                    .as_ref()
+                    .and_then(|config| config.runtime.get(runtime))
+                    .map(String::as_str)
+            };
+            let detected_runtimes =
+                lpm_runtime::detect::detect_runtime_versions_with_lpm_json_specs(
+                    &cwd,
+                    runtime_spec("node"),
+                    runtime_spec("bun"),
+                )?;
 
             // Auto-detect tunnel from lpm.json if not explicitly set.
             // Track the source for the startup banner.
