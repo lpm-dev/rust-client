@@ -390,7 +390,7 @@ fn clean_lookup_spec(runtime: detect::RuntimeKind, spec: &str) -> String {
             .trim_start_matches("~")
             .trim_start_matches('>')
             .to_string(),
-        detect::RuntimeKind::Bun => bun::normalize_spec(spec),
+        detect::RuntimeKind::Bun => bun::normalize_spec(spec).to_string(),
     }
 }
 

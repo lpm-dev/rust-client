@@ -264,6 +264,7 @@ async fn concurrent_projects_share_one_managed_node_install() {
     let archive = fake_node_archive(&platform, "99.0.0");
     let digest = format!("{:x}", Sha256::digest(&archive));
     let archive_name = format!("node-v99.0.0-{}.tar.gz", platform.node_suffix());
+    let dist_base_url = server.uri();
     let runtimes_dir = project.home().join(".lpm/runtimes");
     std::fs::create_dir_all(runtimes_dir.join("node/.99.0.0-installing-stale")).unwrap();
     std::fs::write(
@@ -272,7 +273,6 @@ async fn concurrent_projects_share_one_managed_node_install() {
             "version": "v99.0.0",
             "date": "2099-01-01",
             "lts": false,
-            "dist_base_url": server.uri(),
         }])
         .to_string(),
     )
@@ -296,9 +296,15 @@ async fn concurrent_projects_share_one_managed_node_install() {
         .await;
 
     let mut first = lpm_spawnable(&project);
-    first.current_dir(&first_dir).args(["run", "version"]);
+    first
+        .current_dir(&first_dir)
+        .env("LPM_NODE_DIST_BASE_URL", &dist_base_url)
+        .args(["run", "version"]);
     let mut second = lpm_spawnable(&project);
-    second.current_dir(&second_dir).args(["run", "version"]);
+    second
+        .current_dir(&second_dir)
+        .env("LPM_NODE_DIST_BASE_URL", &dist_base_url)
+        .args(["run", "version"]);
     let first_child = first.spawn().expect("start first runtime install");
     let second_child = second.spawn().expect("start second runtime install");
     let first_output = first_child.wait_with_output().expect("wait for first run");

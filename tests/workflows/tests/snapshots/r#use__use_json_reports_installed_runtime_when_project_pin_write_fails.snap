@@ -1,0 +1,12 @@
+---
+source: tests/workflows/tests/use.rs
+expression: envelope
+---
+{
+  "success": false,
+  "status": "installed_not_pinned",
+  "runtime": "node",
+  "version": "22.12.0",
+  "error_code": "script",
+  "error": "script error: failed to parse lpm.json: key must be a string at line 1 column 3"
+}

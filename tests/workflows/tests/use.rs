@@ -28,7 +28,9 @@ fn seed_installed_node(project: &TempProject, version: &str) {
         .join(version)
         .join("bin");
     std::fs::create_dir_all(&bin_dir).expect("failed to create runtime bin dir");
-    std::fs::write(bin_dir.join("node"), "").expect("failed to seed node binary");
+    let binary = bin_dir.join(if cfg!(windows) { "node.exe" } else { "node" });
+    std::fs::write(&binary, "").expect("failed to seed node binary");
+    make_executable(&binary);
 }
 
 fn seed_installed_bun(project: &TempProject, version: &str) {
@@ -41,7 +43,19 @@ fn seed_installed_bun(project: &TempProject, version: &str) {
         .join("bin");
     std::fs::create_dir_all(&bin_dir).expect("failed to create Bun runtime bin dir");
     let binary = if cfg!(windows) { "bun.exe" } else { "bun" };
-    std::fs::write(bin_dir.join(binary), "").expect("failed to seed Bun binary");
+    let binary = bin_dir.join(binary);
+    std::fs::write(&binary, "").expect("failed to seed Bun binary");
+    make_executable(&binary);
+}
+
+fn make_executable(path: &std::path::Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755))
+            .expect("failed to make runtime binary executable");
+    }
 }
 
 #[cfg(unix)]
@@ -451,18 +465,102 @@ fn use_install_without_runtime_prefix_fails_with_usage() {
         .output()
         .expect("failed to run lpm use i (no spec)");
 
-    // `i` is parsed as a spec, not as an action, so this routes through
-    // the install action with spec="i". Either: clap rejects, or the
-    // runtime parser fails. Both are acceptable; assert non-zero exit.
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        assert!(
-            !stderr.is_empty() || !String::from_utf8_lossy(&output.stdout).is_empty(),
-            "must emit a diagnostic, got stdout: {} / stderr: {}",
-            String::from_utf8_lossy(&output.stdout),
-            stderr,
-        );
-    }
+    assert!(
+        !output.status.success(),
+        "lpm use i without a spec must exit non-zero"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !stderr.is_empty() || !String::from_utf8_lossy(&output.stdout).is_empty(),
+        "must emit a diagnostic, got stdout: {} / stderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        stderr,
+    );
+}
+
+#[test]
+fn use_exact_installed_node_succeeds_without_release_metadata() {
+    let project = TempProject::empty(r#"{"name":"use-offline-node","version":"1.0.0"}"#);
+    seed_installed_node(&project, "22.12.0");
+
+    let output = lpm(&project)
+        .env("HTTPS_PROXY", "http://127.0.0.1:9")
+        .env("https_proxy", "http://127.0.0.1:9")
+        .env("NO_PROXY", "")
+        .env("no_proxy", "")
+        .args(["use", "node@22.12.0"])
+        .output()
+        .expect("run exact installed Node selection offline");
+
+    assert!(
+        output.status.success(),
+        "exact installed Node must not require release metadata\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    assert_eq!(lpm_json_runtime(&project, "node"), "22.12.0");
+}
+
+#[test]
+fn use_exact_installed_bun_succeeds_without_release_metadata() {
+    let project = TempProject::empty(r#"{"name":"use-offline-bun","version":"1.0.0"}"#);
+    seed_installed_bun(&project, "1.3.14");
+
+    let output = lpm(&project)
+        .env("HTTPS_PROXY", "http://127.0.0.1:9")
+        .env("https_proxy", "http://127.0.0.1:9")
+        .env("NO_PROXY", "")
+        .env("no_proxy", "")
+        .args(["use", "bun@1.3.14"])
+        .output()
+        .expect("run exact installed Bun selection offline");
+
+    assert!(
+        output.status.success(),
+        "exact installed Bun must not require release metadata\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    assert_eq!(lpm_json_runtime(&project, "bun"), "1.3.14");
+}
+
+#[cfg(unix)]
+#[test]
+fn use_list_excludes_non_executable_runtime_files() {
+    let project = TempProject::empty(r#"{"name":"use-corrupt-runtime","version":"1.0.0"}"#);
+    let binary = managed_node_dir(&project, "22.12.0").join("bin/node");
+    std::fs::create_dir_all(binary.parent().unwrap()).expect("create corrupt runtime directory");
+    std::fs::write(&binary, "not executable").expect("seed non-executable runtime file");
+
+    let output = lpm(&project)
+        .args(["--json", "use", "--list", "node"])
+        .output()
+        .expect("list runtimes with a non-executable binary");
+
+    assert!(output.status.success());
+    let envelope: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("list output must be JSON");
+    assert_eq!(envelope["versions"], serde_json::json!([]));
+}
+
+#[test]
+fn use_list_excludes_directories_at_runtime_binary_paths() {
+    let project = TempProject::empty(r#"{"name":"use-corrupt-runtime","version":"1.0.0"}"#);
+    let binary_name = if cfg!(windows) { "node.exe" } else { "node" };
+    let binary = managed_node_dir(&project, "22.12.0")
+        .join("bin")
+        .join(binary_name);
+    std::fs::create_dir_all(&binary).expect("seed directory at runtime binary path");
+
+    let output = lpm(&project)
+        .args(["--json", "use", "--list", "node"])
+        .output()
+        .expect("list runtimes with a directory at the binary path");
+
+    assert!(output.status.success());
+    let envelope: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("list output must be JSON");
+    assert_eq!(envelope["versions"], serde_json::json!([]));
 }
 
 /// `lpm --json use --pin` without a spec must surface the missing-spec
@@ -623,6 +721,10 @@ async fn use_install_node_supported_specs_install_and_pin_from_mocked_dist() {
         );
 
         let output = lpm(&project)
+            .env(
+                "LPM_NODE_DIST_BASE_URL",
+                format!("{}/node-dist", server.uri()),
+            )
             .args(["use", spec])
             .output()
             .unwrap_or_else(|e| panic!("failed to run lpm use {spec}: {e}"));
@@ -709,6 +811,7 @@ async fn use_install_node_json_emits_installed_envelope_from_mocked_dist() {
     );
 
     let output = lpm(&project)
+        .env("LPM_NODE_DIST_BASE_URL", base_url)
         .args(["--json", "use", "node@22.12.0"])
         .output()
         .expect("failed to run lpm --json use node@22.12.0");
@@ -719,28 +822,94 @@ async fn use_install_node_json_emits_installed_envelope_from_mocked_dist() {
         String::from_utf8_lossy(&output.stderr),
     );
 
-    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
-    let envelopes: Vec<serde_json::Value> = stdout
-        .lines()
-        .filter(|line| !line.trim().is_empty())
-        .map(|line| {
-            serde_json::from_str(line).unwrap_or_else(|e| {
-                panic!("--json use node@22.12.0 must emit one JSON envelope per line: {e}\n---\n{stdout}")
-            })
-        })
-        .collect();
-    assert_eq!(
-        envelopes.len(),
-        2,
-        "install+pin path should emit two JSON envelopes"
+    let envelope: serde_json::Value =
+        serde_json::from_slice(&output.stdout).unwrap_or_else(|error| {
+            panic!("install-and-pin output must be one JSON document: {error}")
+        });
+    assert_eq!(envelope["success"], serde_json::json!(true));
+    assert_eq!(envelope["status"], serde_json::json!("installed"));
+    assert_eq!(envelope["runtime"], serde_json::json!("node"));
+    assert_eq!(envelope["version"], serde_json::json!("22.12.0"));
+    assert_eq!(envelope["pinned"]["node"], serde_json::json!("22.12.0"));
+    insta::assert_json_snapshot!(
+        "use_install_node_json_emits_one_install_and_pin_envelope",
+        envelope
     );
-    assert_eq!(envelopes[0]["success"], serde_json::json!(true));
-    assert_eq!(envelopes[0]["status"], serde_json::json!("installed"));
-    assert_eq!(envelopes[0]["runtime"], serde_json::json!("node"));
-    assert_eq!(envelopes[0]["version"], serde_json::json!("22.12.0"));
-    assert_eq!(envelopes[1]["success"], serde_json::json!(true));
-    assert_eq!(envelopes[1]["pinned"]["node"], serde_json::json!("22.12.0"));
     assert!(managed_node_dir(&project, version).exists());
+}
+
+#[test]
+fn use_exact_installed_node_json_emits_one_install_and_pin_envelope() {
+    let project = TempProject::empty(r#"{"name":"use-json-installed","version":"1.0.0"}"#);
+    seed_installed_node(&project, "22.12.0");
+
+    let output = lpm(&project)
+        .args(["--json", "use", "node@22.12.0"])
+        .output()
+        .expect("select an exact installed Node under JSON mode");
+
+    assert!(output.status.success());
+    let envelope: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("use output must be one JSON document");
+    assert_eq!(envelope["status"], "already_installed");
+    assert_eq!(envelope["pinned"]["node"], "22.12.0");
+    insta::assert_json_snapshot!(
+        "use_exact_installed_node_json_emits_one_install_and_pin_envelope",
+        envelope
+    );
+}
+
+#[tokio::test]
+async fn use_json_reports_installed_runtime_when_project_pin_write_fails() {
+    let server = MockServer::start().await;
+    let version = "22.12.0";
+    let archive_name = current_node_archive_name(version);
+    let archive_bytes = make_node_runtime_archive(version);
+    let archive_sha = sha256_hex(&archive_bytes);
+    let base_url = format!("{}/node-dist", server.uri());
+
+    Mock::given(method("GET"))
+        .and(path(format!("/node-dist/v{version}/{archive_name}")))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(archive_bytes))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(format!("/node-dist/v{version}/SHASUMS256.txt")))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_string(format!("{archive_sha}  {archive_name}\n")),
+        )
+        .mount(&server)
+        .await;
+
+    let project = TempProject::empty(r#"{"name":"use-json-pin-failure","version":"1.0.0"}"#);
+    write_node_index_cache(
+        &project,
+        &serde_json::to_string(&serde_json::json!([{
+            "version": format!("v{version}"),
+            "date": "2026-04-15",
+            "lts": "Jod"
+        }]))
+        .unwrap(),
+    );
+    project.write_file("lpm.json", "{ malformed");
+
+    let output = lpm(&project)
+        .env("LPM_NODE_DIST_BASE_URL", base_url)
+        .args(["--json", "use", "node@22.12.0"])
+        .output()
+        .expect("install Node when the project pin write fails");
+
+    assert!(!output.status.success());
+    let envelope: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("failure output must be one JSON document");
+    assert_eq!(envelope["success"], false);
+    assert_eq!(envelope["status"], "installed_not_pinned");
+    assert_eq!(envelope["version"], version);
+    assert!(managed_node_dir(&project, version).exists());
+    insta::assert_json_snapshot!(
+        "use_json_reports_installed_runtime_when_project_pin_write_fails",
+        envelope
+    );
 }
 
 #[test]
@@ -1258,6 +1427,68 @@ fn use_remove_warns_when_project_pin_still_matches_removed_runtime() {
         stderr.contains("lpm.json still pins node@20"),
         "remove must warn when the project pin would auto-reinstall the deleted runtime, got:\n{stderr}"
     );
+}
+
+#[test]
+fn use_remove_rejects_malformed_project_config_before_deleting_runtime() {
+    let project = TempProject::empty(r#"{"name":"use-remove-preflight","version":"1.0.0"}"#);
+    seed_installed_node(&project, "20.18.0");
+    project.write_file("lpm.json", "{ malformed");
+
+    let output = lpm(&project)
+        .args(["use", "remove", "node@20.18.0"])
+        .output()
+        .expect("remove runtime with malformed project config");
+
+    assert!(!output.status.success());
+    assert!(
+        managed_node_dir(&project, "20.18.0").exists(),
+        "remove must not mutate runtime state before its config preflight succeeds"
+    );
+}
+
+#[test]
+fn use_json_pin_reports_when_the_runtime_is_not_installed() {
+    let project = TempProject::empty(r#"{"name":"use-json-pin-warning","version":"1.0.0"}"#);
+
+    let output = lpm(&project)
+        .args(["--json", "use", "--pin", "node@99.0.0"])
+        .output()
+        .expect("pin unavailable Node under JSON mode");
+
+    assert!(output.status.success());
+    let envelope: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("pin output must be JSON");
+    assert_eq!(envelope["success"], serde_json::json!(true));
+    assert_eq!(envelope["installed"], serde_json::json!(false));
+    assert!(
+        envelope["warning"]
+            .as_str()
+            .is_some_and(|warning| warning.contains("not currently installed"))
+    );
+    insta::assert_json_snapshot!("use_json_pin_reports_unavailable_runtime", envelope);
+}
+
+#[test]
+fn use_pin_from_nested_directory_updates_the_nearest_project_root() {
+    let project = TempProject::empty(r#"{"name":"use-nested-pin","version":"1.0.0"}"#);
+    seed_installed_node(&project, "22.12.0");
+    let nested = project.path().join("src/deep");
+    std::fs::create_dir_all(&nested).expect("create nested project directory");
+
+    let output = lpm(&project)
+        .current_dir(&nested)
+        .args(["use", "--pin", "node@22.12.0"])
+        .output()
+        .expect("pin runtime from a nested directory");
+
+    assert!(
+        output.status.success(),
+        "nested pin must succeed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(lpm_json_runtime(&project, "node"), "22.12.0");
+    assert!(!nested.join("lpm.json").exists());
 }
 
 #[test]

@@ -45,7 +45,10 @@ impl BunRelease {
     pub fn shasums_url(&self) -> Option<&str> {
         self.assets
             .iter()
-            .find(|asset| asset.name == "SHASUMS256.txt")
+            .find(|asset| {
+                asset.name == "SHASUMS256.txt"
+                    && is_allowed_bun_download_url(&asset.browser_download_url)
+            })
             .map(|asset| asset.browser_download_url.as_str())
     }
 
@@ -54,13 +57,39 @@ impl BunRelease {
         let expected = format!("bun-{}.zip", platform.bun_suffix());
         self.assets
             .iter()
-            .find(|asset| asset.name == expected)
+            .find(|asset| {
+                asset.name == expected && is_allowed_bun_download_url(&asset.browser_download_url)
+            })
             .cloned()
     }
 }
 
+fn is_allowed_bun_download_url(raw: &str) -> bool {
+    let Ok(url) = reqwest::Url::parse(raw) else {
+        return false;
+    };
+    if !url.username().is_empty() || url.password().is_some() {
+        return false;
+    }
+    let loopback = url.host_str().is_some_and(|host| {
+        host.eq_ignore_ascii_case("localhost")
+            || host
+                .parse::<std::net::IpAddr>()
+                .is_ok_and(|address| address.is_loopback())
+    });
+    if loopback {
+        return matches!(url.scheme(), "http" | "https");
+    }
+    url.scheme() == "https"
+        && url
+            .host_str()
+            .is_some_and(|host| host.eq_ignore_ascii_case("github.com"))
+        && url.path().starts_with("/oven-sh/bun/releases/download/")
+}
+
 /// Directory for a specific installed Bun version.
 pub fn bun_version_dir(version: &str) -> Result<PathBuf, LpmError> {
+    node::validate_exact_version(version)?;
     Ok(node::runtimes_dir()?.join("bun").join(version))
 }
 
@@ -77,24 +106,39 @@ pub fn bun_bin_dir(version: &str) -> Result<PathBuf, LpmError> {
 
 /// Check if a Bun version is installed.
 pub fn is_installed(version: &str) -> bool {
-    bun_binary_path(version).is_ok_and(|path| path.exists())
+    bun_binary_path(version).is_ok_and(|path| node::is_executable_file(&path))
 }
 
 /// List all installed Bun versions.
 pub fn list_installed() -> Result<Vec<String>, LpmError> {
     let bun_dir = node::runtimes_dir()?.join("bun");
-    if !bun_dir.exists() {
-        return Ok(Vec::new());
-    }
+    let entries = match std::fs::read_dir(&bun_dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error.into()),
+    };
 
     let mut versions = Vec::new();
-    for entry in std::fs::read_dir(&bun_dir)? {
+    let mut binary_path = PathBuf::with_capacity(bun_dir.as_os_str().len() + 64);
+    for entry in entries {
         let entry = entry?;
-        if entry.path().is_dir() {
-            let name = entry.file_name().to_string_lossy().to_string();
-            if is_installed(&name) {
-                versions.push(name);
-            }
+        if !entry.file_type()?.is_dir() {
+            continue;
+        }
+        let name = entry.file_name();
+        let Some(version) = name.to_str() else {
+            continue;
+        };
+        if node::validate_exact_version(version).is_err() {
+            continue;
+        }
+        binary_path.clear();
+        binary_path.push(&bun_dir);
+        binary_path.push(&name);
+        binary_path.push("bin");
+        binary_path.push(if cfg!(windows) { "bun.exe" } else { "bun" });
+        if node::is_executable_file(&binary_path) {
+            versions.push(version.to_string());
         }
     }
 
@@ -151,19 +195,18 @@ pub async fn fetch_releases(client: &reqwest::Client) -> Result<Vec<BunRelease>,
         });
     }
 
-    let body = resp
-        .text()
+    let body = lpm_http::read_body_capped(resp, lpm_common::STATE_FILE_SIZE_CAP_BYTES as usize)
         .await
         .map_err(|e| LpmError::Network(format!("failed to read bun releases body: {e}")))?;
 
-    let mut releases: Vec<BunRelease> = serde_json::from_str(&body)
+    let mut releases: Vec<BunRelease> = serde_json::from_slice(&body)
         .map_err(|e| LpmError::Script(format!("failed to parse Bun releases: {e}")))?;
     releases.sort_by(|a, b| node::compare_versions(b.version_bare(), a.version_bare()));
 
     if let Some(parent) = cache_path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
-    let _ = download::write_restricted_file(&cache_path, body.as_bytes());
+    let _ = download::write_restricted_file(&cache_path, &body);
 
     Ok(releases)
 }
@@ -187,39 +230,38 @@ pub fn resolve_version(
 ) -> Result<Option<BunRelease>, LpmError> {
     validate_version_spec(spec)?;
     let spec = normalize_spec(spec);
-    let candidates: Vec<&BunRelease> = releases
-        .iter()
-        .filter(|release| !release.draft && !release.prerelease)
-        .collect();
+    let candidates = || {
+        releases.iter().filter(|release| {
+            !release.draft
+                && !release.prerelease
+                && node::validate_exact_version(release.version_bare()).is_ok()
+        })
+    };
 
     if spec.eq_ignore_ascii_case("latest") {
-        return Ok(candidates.into_iter().next().cloned());
+        return Ok(candidates().next().cloned());
     }
 
-    if let Some(release) = candidates
-        .iter()
-        .copied()
-        .find(|release| release.version_bare() == spec)
-    {
+    if let Some(release) = candidates().find(|release| release.version_bare() == spec) {
         return Ok(Some(release.clone()));
     }
 
-    if is_range_spec(&spec) {
-        let req = lpm_semver::VersionReq::parse(&spec)
+    if is_range_spec(spec) {
+        let req = lpm_semver::VersionReq::parse(spec)
             .map_err(|e| LpmError::Script(format!("invalid Bun version range '{spec}': {e}")))?;
-        return Ok(best_release_match(candidates, |release| {
+        return Ok(best_release_match(candidates(), |release| {
             lpm_semver::Version::parse(release.version_bare())
                 .ok()
                 .is_some_and(|version| req.matches(&version))
         }));
     }
 
-    if lpm_semver::Version::parse(&spec).is_ok() {
+    if lpm_semver::Version::parse(spec).is_ok() {
         return Ok(None);
     }
 
     let prefix = format!("{spec}.");
-    Ok(best_release_match(candidates, |release| {
+    Ok(best_release_match(candidates(), |release| {
         release.version_bare().starts_with(&prefix) || release.version_bare() == spec
     }))
 }
@@ -233,9 +275,7 @@ pub fn find_matching_installed(spec: &str, installed: &[String]) -> Option<Strin
     }
 
     if normalized.eq_ignore_ascii_case("latest") {
-        let mut versions: Vec<String> = installed.to_vec();
-        versions.sort_by(|a, b| node::compare_versions(b, a));
-        return versions.into_iter().next();
+        return highest_matching_installed(installed, |_, _| true);
     }
 
     if let Some(version) = installed
@@ -245,31 +285,17 @@ pub fn find_matching_installed(spec: &str, installed: &[String]) -> Option<Strin
         return Some(version.clone());
     }
 
-    if is_range_spec(&normalized) {
-        let req = lpm_semver::VersionReq::parse(&normalized).ok()?;
-        let mut matches: Vec<&String> = installed
-            .iter()
-            .filter(|version| {
-                lpm_semver::Version::parse(version)
-                    .ok()
-                    .is_some_and(|parsed| req.matches(&parsed))
-            })
-            .collect();
-        matches.sort_by(|a, b| node::compare_versions(b, a));
-        return matches.first().map(|version| (*version).clone());
+    if is_range_spec(normalized) {
+        let req = lpm_semver::VersionReq::parse(normalized).ok()?;
+        return highest_matching_installed(installed, |_, version| req.matches(version));
     }
 
-    if lpm_semver::Version::parse(&normalized).is_ok() {
+    if lpm_semver::Version::parse(normalized).is_ok() {
         return None;
     }
 
     let prefix = format!("{normalized}.");
-    let mut matches: Vec<&String> = installed
-        .iter()
-        .filter(|version| version.starts_with(&prefix) || version.as_str() == normalized)
-        .collect();
-    matches.sort_by(|a, b| node::compare_versions(b, a));
-    matches.first().map(|version| (*version).clone())
+    highest_matching_installed(installed, |raw, _| raw.starts_with(&prefix))
 }
 
 /// Remove an installed Bun version.
@@ -281,7 +307,10 @@ pub fn uninstall(version: &str) -> Result<(), LpmError> {
     Ok(())
 }
 
-fn best_release_match<F>(candidates: Vec<&BunRelease>, matches: F) -> Option<BunRelease>
+fn best_release_match<'a, F>(
+    candidates: impl Iterator<Item = &'a BunRelease>,
+    matches: F,
+) -> Option<BunRelease>
 where
     F: Fn(&BunRelease) -> bool,
 {
@@ -292,8 +321,24 @@ where
         .cloned()
 }
 
-pub fn normalize_spec(spec: &str) -> String {
-    normalize_bun_version_label(spec.trim()).to_string()
+fn highest_matching_installed<F>(installed: &[String], matches: F) -> Option<String>
+where
+    F: Fn(&str, &lpm_semver::Version) -> bool,
+{
+    installed
+        .iter()
+        .filter_map(|version| {
+            lpm_semver::Version::parse(version)
+                .ok()
+                .map(|parsed| (version, parsed))
+        })
+        .filter(|(raw, parsed)| matches(raw, parsed))
+        .max_by(|(_, a), (_, b)| a.cmp(b))
+        .map(|(version, _)| version.clone())
+}
+
+pub fn normalize_spec(spec: &str) -> &str {
+    normalize_bun_version_label(spec.trim())
 }
 
 fn normalize_bun_version_label(label: &str) -> &str {
@@ -320,7 +365,9 @@ mod tests {
     fn asset(name: &str) -> BunAsset {
         BunAsset {
             name: name.into(),
-            browser_download_url: format!("https://example.test/{name}"),
+            browser_download_url: format!(
+                "https://github.com/oven-sh/bun/releases/download/bun-v1.3.14/{name}"
+            ),
             digest: Some("sha256:abc".into()),
         }
     }
@@ -405,6 +452,53 @@ mod tests {
                 .contains("Bun does not publish an LTS channel"),
             "unexpected error: {err}"
         );
+    }
+
+    #[test]
+    fn resolve_version_rejects_remote_release_with_path_like_version() {
+        let releases = vec![release("../../outside")];
+
+        assert!(resolve_version(&releases, "latest").unwrap().is_none());
+    }
+
+    #[test]
+    fn bun_version_dir_rejects_non_semver_path_component() {
+        let error = bun_version_dir("../outside").expect_err("path-like version must be rejected");
+
+        assert!(error.to_string().contains("runtime version"));
+    }
+
+    #[test]
+    fn release_selection_rejects_assets_outside_the_official_download_origin() {
+        let platform = Platform::current().unwrap();
+        let expected = format!("bun-{}.zip", platform.bun_suffix());
+        let mut release = release("1.3.14");
+        release.assets = vec![BunAsset {
+            name: expected,
+            browser_download_url: "https://attacker.example/bun.zip".into(),
+            digest: Some(
+                "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".into(),
+            ),
+        }];
+
+        assert!(release.asset_for_platform(&platform).is_none());
+    }
+
+    #[test]
+    fn release_selection_rejects_cleartext_asset_urls() {
+        let platform = Platform::current().unwrap();
+        let expected = format!("bun-{}.zip", platform.bun_suffix());
+        let mut release = release("1.3.14");
+        release.assets = vec![BunAsset {
+            name: expected,
+            browser_download_url:
+                "http://github.com/oven-sh/bun/releases/download/bun-v1.3.14/bun.zip".into(),
+            digest: Some(
+                "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".into(),
+            ),
+        }];
+
+        assert!(release.asset_for_platform(&platform).is_none());
     }
 
     #[test]

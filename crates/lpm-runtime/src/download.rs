@@ -150,11 +150,11 @@ pub async fn install_node_with_report(
         .ok_or_else(|| LpmError::Script("invalid runtime path".into()))?;
     remove_stale_runtime_staging_dirs(parent, version)?;
 
-    let url = release.download_url(platform);
+    let url = release.download_url(platform)?;
     tracing::debug!("downloading node {version} from {url}");
 
     // Download
-    let resp = client.get(&url).send().await.map_err(|e| {
+    let resp = client.get(url.clone()).send().await.map_err(|e| {
         LpmError::Network(format!(
             "failed to download node {version}: {}",
             lpm_http::display_error(&e)
@@ -856,10 +856,10 @@ async fn verify_checksum(
     platform: &Platform,
     data: &[u8],
 ) -> Result<String, LpmError> {
-    let shasums_url = release.shasums_url();
+    let shasums_url = release.shasums_url()?;
 
     let resp = client
-        .get(&shasums_url)
+        .get(shasums_url.clone())
         .timeout(std::time::Duration::from_secs(10))
         .send()
         .await
@@ -877,10 +877,11 @@ async fn verify_checksum(
         )));
     }
 
-    let body = resp
-        .text()
+    let body = lpm_http::read_body_capped(resp, 1024 * 1024)
         .await
         .map_err(|e| LpmError::Network(format!("failed to read SHASUMS256: {e}")))?;
+    let body = std::str::from_utf8(&body)
+        .map_err(|e| LpmError::Network(format!("SHASUMS256 is not valid UTF-8: {e}")))?;
 
     // Find the expected hash for our platform's archive
     let ext = if platform.os == "win" {
@@ -960,11 +961,12 @@ async fn verify_bun_checksum(
             )));
         }
 
-        let body = resp
-            .text()
+        let body = lpm_http::read_body_capped(resp, 1024 * 1024)
             .await
             .map_err(|e| LpmError::Network(format!("failed to read Bun SHASUMS256: {e}")))?;
-        let expected_hash = checksum_from_shasums(&body, &asset.name).ok_or_else(|| {
+        let body = std::str::from_utf8(&body)
+            .map_err(|e| LpmError::Network(format!("Bun SHASUMS256 is not valid UTF-8: {e}")))?;
+        let expected_hash = checksum_from_shasums(body, &asset.name).ok_or_else(|| {
             LpmError::Network(format!(
                 "checksum not found for {} in Bun SHASUMS256",
                 asset.name
