@@ -1,7 +1,7 @@
 use crate::install_ui;
 use lpm_common::LpmError;
 use lpm_runner::lpm_json;
-use lpm_runner::ports::{self, ListeningPort};
+use lpm_runner::ports::{self, ListeningPort, ProcessIdentity};
 use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap};
 use std::io::IsTerminal as _;
@@ -46,6 +46,7 @@ enum KillTarget {
 #[derive(Debug, Clone)]
 struct KillCandidate {
     pid: u32,
+    identity: ProcessIdentity,
     process: Option<String>,
     ports: Vec<u16>,
 }
@@ -592,7 +593,7 @@ fn run_kill_pid(pid: u32, json_output: bool) -> Result<(), LpmError> {
 }
 
 fn run_kill_range(start: u16, end: u16, json_output: bool, yes: bool) -> Result<(), LpmError> {
-    let candidates = kill_candidates_for_range(start, end);
+    let candidates = kill_candidates_for_range(start, end)?;
     if candidates.is_empty() {
         if json_output {
             println!(
@@ -612,10 +613,17 @@ fn run_kill_range(start: u16, end: u16, json_output: bool, yes: bool) -> Result<
 
     confirm_range_kill(start, end, &candidates, json_output, yes)?;
 
+    let still_owned =
+        ports::kill_pids_if_identities_own_ports(candidates.iter().map(|candidate| {
+            (
+                candidate.pid,
+                &candidate.identity,
+                candidate.ports.as_slice(),
+            )
+        }))
+        .map_err(LpmError::Script)?;
     let mut killed = Vec::new();
-    for candidate in candidates {
-        let still_owned_ports = ports::kill_pid_if_owns_ports(candidate.pid, &candidate.ports)
-            .map_err(LpmError::Script)?;
+    for (candidate, still_owned_ports) in candidates.into_iter().zip(still_owned) {
         if still_owned_ports.is_empty() {
             continue;
         }
@@ -650,16 +658,22 @@ fn run_kill_range(start: u16, end: u16, json_output: bool, yes: bool) -> Result<
     Ok(())
 }
 
-fn kill_candidates_for_range(start: u16, end: u16) -> Vec<KillCandidate> {
-    kill_candidates_from_rows(ports::list_listening_ports(), start, end)
+fn kill_candidates_for_range(start: u16, end: u16) -> Result<Vec<KillCandidate>, LpmError> {
+    kill_candidates_from_rows(
+        ports::list_listening_ports(),
+        start,
+        end,
+        ports::process_identity_for_pid,
+    )
 }
 
 fn kill_candidates_from_rows(
     rows: impl IntoIterator<Item = ListeningPort>,
     start: u16,
     end: u16,
-) -> Vec<KillCandidate> {
-    let mut by_pid: BTreeMap<u32, KillCandidate> = BTreeMap::new();
+    mut process_identity: impl FnMut(u32) -> Option<ProcessIdentity>,
+) -> Result<Vec<KillCandidate>, LpmError> {
+    let mut by_pid: BTreeMap<u32, (Option<String>, Vec<u16>)> = BTreeMap::new();
     for row in rows
         .into_iter()
         .filter(|row| row.port >= start && row.port <= end)
@@ -667,19 +681,32 @@ fn kill_candidates_from_rows(
         let Some(pid) = row.pid else {
             continue;
         };
-        let entry = by_pid.entry(pid).or_insert_with(|| KillCandidate {
-            pid,
-            process: row.process.clone(),
-            ports: Vec::new(),
-        });
-        if !entry.ports.contains(&row.port) {
-            entry.ports.push(row.port);
-        }
-        if entry.process.is_none() {
-            entry.process = row.process;
+        let entry = by_pid
+            .entry(pid)
+            .or_insert_with(|| (row.process.clone(), Vec::new()));
+        entry.1.push(row.port);
+        if entry.0.is_none() {
+            entry.0 = row.process;
         }
     }
-    by_pid.into_values().collect()
+    by_pid
+        .into_iter()
+        .map(|(pid, (process, mut ports))| {
+            let identity = process_identity(pid).ok_or_else(|| {
+                LpmError::Script(format!(
+                    "cannot verify the identity of PID {pid} before range-kill confirmation"
+                ))
+            })?;
+            ports.sort_unstable();
+            ports.dedup();
+            Ok(KillCandidate {
+                pid,
+                identity,
+                process,
+                ports,
+            })
+        })
+        .collect()
 }
 
 fn confirm_range_kill(
@@ -791,6 +818,8 @@ mod tests {
 
     #[test]
     fn range_kill_candidates_dedupe_ports_by_pid() {
+        let identity =
+            ports::process_identity_for_pid(std::process::id()).expect("current process identity");
         let candidates = kill_candidates_from_rows(
             [
                 listening_port(3000, Some(42), Some("node")),
@@ -801,12 +830,32 @@ mod tests {
             ],
             3000,
             3010,
-        );
+            |_| Some(identity.clone()),
+        )
+        .unwrap();
 
         assert_eq!(candidates.len(), 1);
         assert_eq!(candidates[0].pid, 42);
+        assert_eq!(candidates[0].identity, identity);
         assert_eq!(candidates[0].process.as_deref(), Some("node"));
         assert_eq!(candidates[0].ports, vec![3000, 3001]);
+    }
+
+    #[test]
+    fn range_kill_candidates_fail_closed_without_a_process_identity() {
+        let error = kill_candidates_from_rows(
+            [listening_port(3000, Some(42), Some("node"))],
+            3000,
+            3010,
+            |_| None,
+        )
+        .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("cannot verify the identity of PID 42")
+        );
     }
 
     #[test]

@@ -29,7 +29,7 @@ mod support;
 use serde_json::json;
 use support::mock_registry::{MockRegistry, compute_integrity, make_tarball_from_pkg_json};
 use support::{
-    LOCK_CONTENTION_MARKER_ENV, TempProject, lpm_spawnable_with_registry, lpm_with_registry,
+    LOCK_CONTENTION_MARKER_ENV, TempProject, lpm, lpm_spawnable_with_registry, lpm_with_registry,
     wait_for_lock_contention, write_lpm_proxy_npmrc, write_npm_firewall_global_config,
 };
 
@@ -2041,7 +2041,7 @@ async fn add_records_installed_digest_and_original_backup_for_forced_overwrite()
     let state: serde_json::Value =
         serde_json::from_str(&project.read_file(".lpm/added-sources.json")).unwrap();
     let file = &state["packages"][package]["files"]["components/Source.ts"];
-    assert_eq!(state["schema_version"], 2);
+    assert_eq!(state["schema_version"], 3);
     assert_eq!(file["action"], "overwrite");
     assert_eq!(
         file["installed_digest"],
@@ -2375,6 +2375,272 @@ async fn add_new_version_removes_unchanged_outputs_dropped_by_the_package() {
     let files = state["packages"][package]["files"].as_object().unwrap();
     assert!(!files.contains_key("components/Old.ts"));
     assert!(files.contains_key("components/New.ts"));
+}
+
+#[tokio::test]
+async fn add_new_version_prunes_empty_directories_owned_only_by_dropped_outputs() {
+    let mock = MockRegistry::start().await;
+    let package = "versioned-directory-source";
+    let first = make_source_pkg_tarball(
+        package,
+        "1.0.0",
+        json!({
+            "ecosystem": "js",
+            "files": [{"src": "Old.ts", "dest": "legacy/nested/Old.ts"}]
+        }),
+        &[("Old.ts", b"export const old = true;\n")],
+    );
+    let second = make_source_pkg_tarball(
+        package,
+        "2.0.0",
+        json!({
+            "ecosystem": "js",
+            "files": [{"src": "New.ts", "dest": "current/New.ts"}]
+        }),
+        &[("New.ts", b"export const new = true;\n")],
+    );
+    mock.mount_full_package_metadata_routes(
+        package,
+        "2.0.0",
+        &[
+            ("1.0.0", json!({}), Some(first)),
+            ("2.0.0", json!({}), Some(second)),
+        ],
+    )
+    .await;
+    let project = TempProject::empty(r#"{"name":"host","version":"1.0.0"}"#);
+
+    for spec in [format!("{package}@1.0.0"), format!("{package}@2.0.0")] {
+        lpm_with_registry(&project, &mock.url())
+            .args(["add", &spec, "--yes", "--no-install-deps", "--no-skills"])
+            .assert()
+            .success();
+    }
+
+    assert!(!project.path().join("components/legacy").exists());
+    assert!(project.file_exists("components/current/New.ts"));
+    let state: serde_json::Value =
+        serde_json::from_str(&project.read_file(".lpm/added-sources.json")).unwrap();
+    assert_eq!(
+        state["packages"][package]["createdDirectories"],
+        json!(["components", "components/current"])
+    );
+}
+
+#[tokio::test]
+async fn add_new_version_prunes_owned_directories_after_the_dropped_output_was_removed() {
+    let mock = MockRegistry::start().await;
+    let package = "versioned-missing-output-directory-source";
+    let first = make_source_pkg_tarball(
+        package,
+        "1.0.0",
+        json!({
+            "ecosystem": "js",
+            "files": [{"src": "Old.ts", "dest": "legacy/nested/Old.ts"}]
+        }),
+        &[("Old.ts", b"export const old = true;\n")],
+    );
+    let second = make_source_pkg_tarball(
+        package,
+        "2.0.0",
+        json!({
+            "ecosystem": "js",
+            "files": [{"src": "New.ts", "dest": "current/New.ts"}]
+        }),
+        &[("New.ts", b"export const new = true;\n")],
+    );
+    mock.mount_full_package_metadata_routes(
+        package,
+        "2.0.0",
+        &[
+            ("1.0.0", json!({}), Some(first)),
+            ("2.0.0", json!({}), Some(second)),
+        ],
+    )
+    .await;
+    let project = TempProject::empty(r#"{"name":"host","version":"1.0.0"}"#);
+
+    lpm_with_registry(&project, &mock.url())
+        .args([
+            "add",
+            &format!("{package}@1.0.0"),
+            "--yes",
+            "--no-install-deps",
+            "--no-skills",
+        ])
+        .assert()
+        .success();
+    std::fs::remove_file(project.path().join("components/legacy/nested/Old.ts")).unwrap();
+
+    lpm_with_registry(&project, &mock.url())
+        .args([
+            "add",
+            &format!("{package}@2.0.0"),
+            "--yes",
+            "--no-install-deps",
+            "--no-skills",
+        ])
+        .assert()
+        .success();
+
+    assert!(!project.path().join("components/legacy").exists());
+    assert!(project.file_exists("components/current/New.ts"));
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn add_new_version_rolls_back_when_stale_directory_cleanup_fails_and_succeeds_on_retry() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let mock = MockRegistry::start().await;
+    let package = "versioned-cleanup-retry-source";
+    let first = make_source_pkg_tarball(
+        package,
+        "1.0.0",
+        json!({
+            "ecosystem": "js",
+            "files": [{"src": "Old.ts", "dest": "legacy/nested/Old.ts"}]
+        }),
+        &[("Old.ts", b"export const old = true;\n")],
+    );
+    let second = make_source_pkg_tarball(
+        package,
+        "2.0.0",
+        json!({
+            "ecosystem": "js",
+            "files": [{"src": "New.ts", "dest": "current/New.ts"}]
+        }),
+        &[("New.ts", b"export const new = true;\n")],
+    );
+    mock.mount_full_package_metadata_routes(
+        package,
+        "2.0.0",
+        &[
+            ("1.0.0", json!({}), Some(first)),
+            ("2.0.0", json!({}), Some(second)),
+        ],
+    )
+    .await;
+    let project = TempProject::empty(r#"{"name":"host","version":"1.0.0"}"#);
+    let first_spec = format!("{package}@1.0.0");
+
+    lpm_with_registry(&project, &mock.url())
+        .args([
+            "add",
+            &first_spec,
+            "--yes",
+            "--no-install-deps",
+            "--no-skills",
+        ])
+        .assert()
+        .success();
+    let state_before = project.read_file(".lpm/added-sources.json");
+    let legacy = project.path().join("components/legacy");
+    std::fs::set_permissions(&legacy, std::fs::Permissions::from_mode(0o555)).unwrap();
+
+    let second_spec = format!("{package}@2.0.0");
+    let failed = lpm_with_registry(&project, &mock.url())
+        .args([
+            "add",
+            &second_spec,
+            "--yes",
+            "--no-install-deps",
+            "--no-skills",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(!failed.status.success());
+    assert!(project.file_exists("components/legacy/nested/Old.ts"));
+    assert!(!project.file_exists("components/current/New.ts"));
+    assert_eq!(project.read_file(".lpm/added-sources.json"), state_before);
+
+    std::fs::set_permissions(&legacy, std::fs::Permissions::from_mode(0o755)).unwrap();
+    lpm_with_registry(&project, &mock.url())
+        .args([
+            "add",
+            &second_spec,
+            "--yes",
+            "--no-install-deps",
+            "--no-skills",
+        ])
+        .assert()
+        .success();
+
+    assert!(!legacy.exists());
+    assert!(project.file_exists("components/current/New.ts"));
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn add_and_remove_prune_canonical_directories_created_through_an_internal_link() {
+    let mock = MockRegistry::start().await;
+    let package = "linked-canonical-directory-source";
+    let tarball = make_source_pkg_tarball(
+        package,
+        "1.0.0",
+        json!({
+            "ecosystem": "js",
+            "files": [{"src": "Source.ts", "dest": "nested/Source.ts"}]
+        }),
+        &[("Source.ts", b"export const source = true;\n")],
+    );
+    mock.with_package(package, "1.0.0", &tarball).await;
+    let project = TempProject::empty(r#"{"name":"host","version":"1.0.0"}"#);
+    std::fs::create_dir_all(project.path().join("components/real")).unwrap();
+    std::os::unix::fs::symlink("real", project.path().join("components/alias")).unwrap();
+
+    lpm_with_registry(&project, &mock.url())
+        .args([
+            "add",
+            package,
+            "--path",
+            "components/alias",
+            "--yes",
+            "--no-install-deps",
+            "--no-skills",
+        ])
+        .assert()
+        .success();
+    assert!(project.file_exists("components/real/nested/Source.ts"));
+
+    lpm(&project).args(["remove", package]).assert().success();
+
+    assert!(!project.path().join("components/real/nested").exists());
+    assert!(project.path().join("components/alias").is_symlink());
+    assert!(project.path().join("components/real").is_dir());
+}
+
+#[tokio::test]
+async fn add_does_not_record_preexisting_destination_directories_as_owned() {
+    let mock = MockRegistry::start().await;
+    let package = "preexisting-directory-source";
+    let tarball = make_source_pkg_tarball(
+        package,
+        "1.0.0",
+        json!({
+            "ecosystem": "js",
+            "files": [{"src": "Source.ts", "dest": "nested/Source.ts"}]
+        }),
+        &[("Source.ts", b"export const source = true;\n")],
+    );
+    mock.with_package(package, "1.0.0", &tarball).await;
+    let project = TempProject::empty(r#"{"name":"host","version":"1.0.0"}"#);
+    std::fs::create_dir_all(project.path().join("components/nested")).unwrap();
+
+    lpm_with_registry(&project, &mock.url())
+        .args(["add", package, "--yes", "--no-install-deps", "--no-skills"])
+        .assert()
+        .success();
+
+    let state: serde_json::Value =
+        serde_json::from_str(&project.read_file(".lpm/added-sources.json")).unwrap();
+    assert!(
+        state["packages"][package]
+            .get("createdDirectories")
+            .is_none(),
+        "pre-existing directories must not become package-owned deletion authority"
+    );
 }
 
 #[tokio::test]

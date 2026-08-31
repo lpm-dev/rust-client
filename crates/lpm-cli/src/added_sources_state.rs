@@ -3,11 +3,11 @@
 use lpm_common::LpmError;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::io::{BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 
-pub const SCHEMA_VERSION: u32 = 2;
+pub const SCHEMA_VERSION: u32 = 3;
 pub const FILENAME: &str = "added-sources.json";
 const BACKUP_DIRECTORY: &str = "added-source-backups";
 
@@ -31,6 +31,12 @@ impl Default for AddedSourcesState {
 pub struct AddedSourceRecord {
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub files: BTreeMap<PathBuf, AddedSourceFile>,
+    #[serde(
+        default,
+        rename = "createdDirectories",
+        skip_serializing_if = "BTreeSet::is_empty"
+    )]
+    pub created_directories: BTreeSet<PathBuf>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub dependencies: BTreeMap<String, AddedSourceDependency>,
     #[serde(
@@ -125,12 +131,14 @@ impl AddedSourcesState {
         &mut self,
         package: &str,
         files: impl IntoIterator<Item = (PathBuf, AddedSourceFile)>,
+        created_directories: impl IntoIterator<Item = PathBuf>,
         dependencies: Option<Vec<(String, AddedSourceDependency)>>,
         skill_package_short: Option<&str>,
     ) {
         self.schema_version = SCHEMA_VERSION;
         let entry = self.packages.entry(package.to_string()).or_default();
         entry.files = files.into_iter().collect();
+        entry.created_directories = created_directories.into_iter().collect();
         if let Some(dependencies) = dependencies {
             entry.dependencies = dependencies
                 .into_iter()
@@ -498,6 +506,47 @@ pub fn resolve_tracked_manifest_path_from_root(
     Ok(destination)
 }
 
+pub fn resolve_tracked_directory_path_from_root(
+    canonical_project: &Path,
+    manifest_path: &Path,
+) -> Result<PathBuf, LpmError> {
+    if manifest_path.as_os_str().is_empty()
+        || manifest_path.is_absolute()
+        || !manifest_path
+            .components()
+            .all(|component| matches!(component, std::path::Component::Normal(_)))
+    {
+        return Err(LpmError::Registry(format!(
+            "added-source state contains an unsafe directory path: {}",
+            manifest_path.display()
+        )));
+    }
+    if manifest_path.components().next().is_some_and(|component| {
+        matches!(component, std::path::Component::Normal(name) if name.eq_ignore_ascii_case(".lpm"))
+    }) {
+        return Err(LpmError::Registry(format!(
+            "added-source state cannot own the reserved .lpm directory: {}",
+            manifest_path.display()
+        )));
+    }
+
+    Ok(canonical_project.join(manifest_path))
+}
+
+pub fn tracked_file_ancestor_directories<'a>(
+    files: impl IntoIterator<Item = &'a Path>,
+) -> HashSet<PathBuf> {
+    let mut ancestors = HashSet::new();
+    for file in files {
+        let mut parent = file.parent();
+        while let Some(directory) = parent.filter(|directory| !directory.as_os_str().is_empty()) {
+            ancestors.insert(directory.to_path_buf());
+            parent = directory.parent();
+        }
+    }
+    ancestors
+}
+
 pub fn display_manifest_path(path: &Path) -> String {
     path.display().to_string()
 }
@@ -560,6 +609,7 @@ fn parse_state(path: &Path, bytes: &[u8]) -> Result<AddedSourcesState, LpmError>
                     package,
                     AddedSourceRecord {
                         files,
+                        created_directories: BTreeSet::new(),
                         dependencies: BTreeMap::new(),
                         skill_package_short: record.skill_package_short,
                     },
@@ -572,8 +622,15 @@ fn parse_state(path: &Path, bytes: &[u8]) -> Result<AddedSourcesState, LpmError>
         });
     }
 
-    serde_json::from_slice(bytes)
-        .map_err(|error| LpmError::Registry(format!("failed to parse {}: {error}", path.display())))
+    let mut state: AddedSourcesState = serde_json::from_slice(bytes).map_err(|error| {
+        LpmError::Registry(format!("failed to parse {}: {error}", path.display()))
+    })?;
+    if header.schema_version < 3 {
+        for record in state.packages.values_mut() {
+            record.created_directories.clear();
+        }
+    }
+    Ok(state)
 }
 
 pub fn write_state(project_dir: &Path, state: &AddedSourcesState) -> Result<(), LpmError> {
@@ -636,6 +693,7 @@ mod tests {
                 PathBuf::from("custom/widgets/Foo.tsx"),
                 created_file("Foo.tsx", "sha256-test"),
             )],
+            [PathBuf::from("custom"), PathBuf::from("custom/widgets")],
             None,
             None,
         );
@@ -649,6 +707,10 @@ mod tests {
             record
                 .files
                 .contains_key(Path::new("custom/widgets/Foo.tsx"))
+        );
+        assert_eq!(
+            record.created_directories,
+            BTreeSet::from([PathBuf::from("custom"), PathBuf::from("custom/widgets")])
         );
     }
 
@@ -668,6 +730,41 @@ mod tests {
         assert_eq!(state.schema_version, SCHEMA_VERSION);
         assert!(file.installed_digest.is_none());
         assert!(file.action.is_none());
+    }
+
+    #[test]
+    fn version_two_records_load_without_directory_ownership() {
+        let dir = tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".lpm")).unwrap();
+        std::fs::write(
+            state_path(dir.path()),
+            r#"{"schema_version":2,"packages":{"source-pkg":{"files":{"custom/Foo.tsx":{"installed_digest":"sha256-test","action":"create"}},"createdDirectories":["custom"]}}}"#,
+        )
+        .unwrap();
+
+        let state = load_state_with_snapshot(dir.path()).unwrap().0;
+        let record = state.package("source-pkg").unwrap();
+
+        assert_eq!(state.schema_version, 2);
+        assert!(
+            record.created_directories.is_empty(),
+            "schema-v2 input must not acquire schema-v3 deletion authority"
+        );
+        assert!(record.files.contains_key(Path::new("custom/Foo.tsx")));
+    }
+
+    #[test]
+    fn tracked_file_ancestor_directories_deduplicates_large_shared_prefixes() {
+        let files: Vec<PathBuf> = (0..10_000)
+            .map(|index| PathBuf::from(format!("components/generated/nested/file-{index}.ts")))
+            .collect();
+
+        let ancestors = tracked_file_ancestor_directories(files.iter().map(PathBuf::as_path));
+
+        assert_eq!(ancestors.len(), 3);
+        assert!(ancestors.contains(Path::new("components")));
+        assert!(ancestors.contains(Path::new("components/generated")));
+        assert!(ancestors.contains(Path::new("components/generated/nested")));
     }
 
     #[test]
@@ -699,6 +796,7 @@ mod tests {
                 PathBuf::from("Foo.tsx"),
                 created_file("Foo.tsx", "sha256-test"),
             )],
+            std::iter::empty(),
             None,
             None,
         );
@@ -715,6 +813,7 @@ mod tests {
         let mut state = AddedSourcesState::default();
         state.record_package_delivery(
             &"p".repeat(usize::try_from(lpm_common::STATE_FILE_SIZE_CAP_BYTES).unwrap() + 1),
+            std::iter::empty(),
             std::iter::empty(),
             None,
             None,
@@ -739,6 +838,7 @@ mod tests {
                 PathBuf::from("Foo.tsx"),
                 created_file("Foo.tsx", "sha256-test"),
             )],
+            std::iter::empty(),
             None,
             None,
         );

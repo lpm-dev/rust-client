@@ -28,8 +28,8 @@ use display::{
 use lpm_common::LpmError;
 use lpm_registry::{RegistryClient, RouteTable};
 use paths::{
-    portable_destination_identity, prepare_safe_dest_parent, resolve_safe_dest_validate,
-    validate_extracted_paths, validate_source_delivery_namespace,
+    CreatedDirectoryRollback, portable_destination_identity, prepare_safe_dest_parent_tracked,
+    resolve_safe_dest_validate, validate_extracted_paths, validate_source_delivery_namespace,
 };
 use project::{
     detect_buyer_alias, detect_default_install_dir, detect_framework, detect_package_manager,
@@ -42,7 +42,7 @@ use source::{
     read_lpm_config, read_runtime_source_text, resolve_noninteractive_required_config,
     validate_declared_config_values,
 };
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use swift::{SwiftTraversal, handle_swift_lpm_deps};
 use target::{AddTarget, resolve_add_target};
@@ -129,28 +129,6 @@ fn validate_destination_plan(
     Ok(destinations)
 }
 
-fn missing_destination_directories(
-    project_dir: &Path,
-    target_dir: &Path,
-    files: &[(String, String)],
-) -> Vec<PathBuf> {
-    let mut missing = HashSet::new();
-    let parents = std::iter::once(target_dir.to_path_buf()).chain(files.iter().filter_map(
-        |(_, destination)| target_dir.join(destination).parent().map(Path::to_path_buf),
-    ));
-    for mut directory in parents {
-        while directory.starts_with(project_dir) && directory != project_dir && !directory.exists()
-        {
-            missing.insert(directory.clone());
-            let Some(parent) = directory.parent() else {
-                break;
-            };
-            directory = parent.to_path_buf();
-        }
-    }
-    missing.into_iter().collect()
-}
-
 fn missing_path_directories(project_dir: &Path, path: &Path) -> Vec<PathBuf> {
     let mut missing = Vec::new();
     let Some(mut directory) = path.parent() else {
@@ -233,9 +211,9 @@ fn reconcile_stale_source_files(
     declared: &HashSet<PathBuf>,
     transaction: &mut crate::manifest_tx::ManifestTransaction,
     tracked_files: &mut Vec<(PathBuf, crate::added_sources_state::AddedSourceFile)>,
-) -> Result<(), LpmError> {
+) -> Result<Vec<PathBuf>, LpmError> {
     let Some(previous) = previous else {
-        return Ok(());
+        return Ok(Vec::new());
     };
     let owned_by_other = state
         .packages
@@ -244,6 +222,7 @@ fn reconcile_stale_source_files(
         .filter(|path| previous.files.contains_key(*path))
         .collect::<HashSet<_>>();
 
+    let mut reconciled = Vec::new();
     for (manifest_path, file) in &previous.files {
         if declared.contains(manifest_path) {
             continue;
@@ -281,8 +260,11 @@ fn reconcile_stale_source_files(
                 transaction
                     .restore_only_if_current(&destination)
                     .map_err(LpmError::Io)?;
+                reconciled.push(manifest_path.clone());
             }
-            (Some(crate::added_sources_state::AddedSourceFileAction::Create), false) => {}
+            (Some(crate::added_sources_state::AddedSourceFileAction::Create), false) => {
+                reconciled.push(manifest_path.clone());
+            }
             (Some(crate::added_sources_state::AddedSourceFileAction::Overwrite), true) => {
                 let recorded_backup = file.backup_path.as_deref().ok_or_else(|| {
                     LpmError::Registry(format!(
@@ -314,6 +296,7 @@ fn reconcile_stale_source_files(
                 transaction
                     .restore_only_if_current(&backup)
                     .map_err(LpmError::Io)?;
+                reconciled.push(manifest_path.clone());
             }
             (Some(crate::added_sources_state::AddedSourceFileAction::Overwrite), false) => {
                 let recorded_backup = file.backup_path.as_deref().ok_or_else(|| {
@@ -346,11 +329,12 @@ fn reconcile_stale_source_files(
                 transaction
                     .restore_only_if_current(&backup)
                     .map_err(LpmError::Io)?;
+                reconciled.push(manifest_path.clone());
             }
             (None, _) => tracked_files.push((manifest_path.clone(), file.clone())),
         }
     }
-    Ok(())
+    Ok(reconciled)
 }
 
 fn reconcile_stale_dependencies(
@@ -1111,7 +1095,7 @@ async fn run_locked(
     let mut file_actions: Vec<(&str, &str, &'static str)> = Vec::with_capacity(files.len());
     let mut tracked_files = Vec::with_capacity(files.len());
     let mut collected_external_imports = HashSet::new();
-    let rollback_dirs = missing_destination_directories(project_dir, &target_dir, &files);
+    let mut created_directories_this_run = BTreeSet::new();
 
     let pkg_json_path = project_dir.join("package.json");
     let lpm_lock_path =
@@ -1151,48 +1135,80 @@ async fn run_locked(
                 added_sources_state_path.display()
             ))
         })?;
-    tx.remove_dirs_on_rollback(rollback_dirs);
     let package_state_key = target.json_name();
     let previous_package_record = added_sources_state.take_package(&package_state_key);
+    let mut created_directories = previous_package_record
+        .as_ref()
+        .map(|record| record.created_directories.clone())
+        .unwrap_or_default();
 
-    std::fs::create_dir_all(&target_dir)?;
-    let target_root_canonical = target_dir.canonicalize().map_err(|e| {
-        LpmError::Registry(format!(
-            "could not canonicalize target directory '{}': {e}",
-            target_dir.display()
-        ))
-    })?;
-    let mut canonical_parents = HashMap::<PathBuf, PathBuf>::new();
-    let final_dest_paths: Vec<PathBuf> = validate_destination_plan(
-        &project_root_canonical,
-        &target_root_canonical,
-        &target_dir,
-        &files,
-    )?
-    .into_iter()
-    .map(|validated| {
-        let parent = validated.parent().ok_or_else(|| {
-            LpmError::Registry(format!(
-                "destination '{}' has no parent",
-                validated.display()
-            ))
-        })?;
-        let parent_canonical = if let Some(canonical) = canonical_parents.get(parent) {
-            canonical.clone()
-        } else {
-            let canonical = prepare_safe_dest_parent(parent, &target_root_canonical)?;
-            canonical_parents.insert(parent.to_path_buf(), canonical.clone());
-            canonical
-        };
-        let file_name = validated.file_name().ok_or_else(|| {
-            LpmError::Registry(format!(
-                "destination '{}' has no file name",
-                validated.display()
-            ))
-        })?;
-        Ok::<PathBuf, LpmError>(parent_canonical.join(file_name))
-    })
-    .collect::<Result<Vec<_>, _>>()?;
+    let mut created_directory_rollback = CreatedDirectoryRollback::new(&project_root_canonical)?;
+    let prepared_destinations = (|| {
+        let target_root_canonical = prepare_safe_dest_parent_tracked(
+            &target_dir,
+            &project_root_canonical,
+            &mut created_directory_rollback,
+            |directory| {
+                created_directories_this_run.insert(
+                    crate::added_sources_state::manifest_path_for_file(project_dir, directory),
+                );
+            },
+        )?;
+        let mut canonical_parents = HashMap::<PathBuf, PathBuf>::new();
+        let final_dest_paths = validate_destination_plan(
+            &project_root_canonical,
+            &target_root_canonical,
+            &target_dir,
+            &files,
+        )?
+        .into_iter()
+        .map(|validated| {
+            let parent = validated.parent().ok_or_else(|| {
+                LpmError::Registry(format!(
+                    "destination '{}' has no parent",
+                    validated.display()
+                ))
+            })?;
+            let parent_canonical = if let Some(canonical) = canonical_parents.get(parent) {
+                canonical.clone()
+            } else {
+                let canonical = prepare_safe_dest_parent_tracked(
+                    parent,
+                    &target_root_canonical,
+                    &mut created_directory_rollback,
+                    |directory| {
+                        created_directories_this_run.insert(
+                            crate::added_sources_state::manifest_path_for_file(
+                                project_dir,
+                                directory,
+                            ),
+                        );
+                    },
+                )?;
+                canonical_parents.insert(parent.to_path_buf(), canonical.clone());
+                canonical
+            };
+            let file_name = validated.file_name().ok_or_else(|| {
+                LpmError::Registry(format!(
+                    "destination '{}' has no file name",
+                    validated.display()
+                ))
+            })?;
+            Ok::<PathBuf, LpmError>(parent_canonical.join(file_name))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+        Ok::<_, LpmError>((target_root_canonical, final_dest_paths))
+    })();
+    let (_, final_dest_paths) = match prepared_destinations {
+        Ok(prepared) => prepared,
+        Err(error) => {
+            created_directory_rollback.rollback_best_effort();
+            return Err(error);
+        }
+    };
+    if !created_directory_rollback.is_empty() {
+        tx.on_rollback_cleanup(move || created_directory_rollback.rollback_best_effort());
+    }
 
     let mut final_identities = HashSet::with_capacity(final_dest_paths.len());
     for destination in &final_dest_paths {
@@ -1417,7 +1433,7 @@ async fn run_locked(
         }
     }
 
-    reconcile_stale_source_files(
+    let reconciled_stale_files = reconcile_stale_source_files(
         project_dir,
         &package_state_key,
         &added_sources_state,
@@ -1559,9 +1575,46 @@ async fn run_locked(
             })
             .collect()
     });
+    let tracked_ancestors = crate::added_sources_state::tracked_file_ancestor_directories(
+        tracked_files.iter().map(|(path, _)| path.as_path()),
+    );
+    let reconciled_ancestors = crate::added_sources_state::tracked_file_ancestor_directories(
+        reconciled_stale_files.iter().map(PathBuf::as_path),
+    );
+    let mut stale_owned_directories = Vec::new();
+    if let Some(previous) = previous_package_record.as_ref() {
+        let mut descendant_owners = HashMap::<PathBuf, String>::new();
+        for (package, record) in &added_sources_state.packages {
+            for ancestor in crate::added_sources_state::tracked_file_ancestor_directories(
+                record.files.keys().map(PathBuf::as_path),
+            ) {
+                descendant_owners
+                    .entry(ancestor)
+                    .or_insert_with(|| package.clone());
+            }
+        }
+        for directory in &previous.created_directories {
+            if tracked_ancestors.contains(directory) {
+                continue;
+            }
+            if let Some(owner) = descendant_owners.get(directory) {
+                added_sources_state
+                    .packages
+                    .get_mut(owner)
+                    .expect("descendant owner was indexed above")
+                    .created_directories
+                    .insert(directory.clone());
+            } else if reconciled_ancestors.contains(directory) {
+                stale_owned_directories.push(directory.clone());
+            }
+        }
+    }
+    created_directories.extend(created_directories_this_run);
+    created_directories.retain(|directory| tracked_ancestors.contains(directory));
     added_sources_state.record_package_delivery(
         &package_state_key,
         tracked_files,
+        created_directories,
         tracked_dependencies,
         tracked_skill_short,
     );
@@ -1619,6 +1672,12 @@ async fn run_locked(
             }
         }
     }
+
+    let stale_directory_cleanup = crate::commands::remove::prune_owned_empty_directories(
+        &project_root_canonical,
+        stale_owned_directories,
+    )?;
+    stale_directory_cleanup.stage_in(&mut tx);
 
     // Commit the rollback transaction.
     //

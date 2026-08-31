@@ -435,35 +435,72 @@ where
     cleanup_endpoint_process_group(root_pid);
     let _ = resolver_handle.join();
     let owner = resolved_owner.lock().ok().and_then(|owner| owner.clone());
-    if let Some(owner) = owner
-        && let Some(owner_pid) = owner.owner_pid
-        && owner_pid != root_pid
-    {
-        #[cfg(not(windows))]
-        if let Some(owner_identity) = owner.owner_identity.as_ref() {
-            let _ = crate::ports::kill_pid_if_identity_owns_ports(
-                owner_pid,
-                owner_identity,
-                &[owner.target.port],
-            );
-        }
-        #[cfg(windows)]
-        let _ = crate::ports::kill_pid_if_owns_ports(owner_pid, &[owner.target.port]);
-    }
+    #[cfg(not(windows))]
+    let owner_cleanup_result = cleanup_verified_endpoint_owner_with(
+        owner.as_ref(),
+        root_pid,
+        |owner_pid, owner_identity, port| {
+            crate::ports::kill_pid_if_identity_owns_ports(owner_pid, owner_identity, &[port])
+                .map(|_| ())
+        },
+    );
+    #[cfg(windows)]
+    let owner_cleanup_result = cleanup_verified_endpoint_owner_with(
+        owner.as_ref(),
+        root_pid,
+        |owner_pid, owner_identity, port| {
+            crate::ports::kill_pid_if_identity_owns_ports(owner_pid, owner_identity, &[port])
+                .map(|_| ())
+        },
+    );
     let _ = stdout_handle.join();
     let _ = stderr_handle.join();
-    compose_shell_and_shutdown_result(status_result, shutdown_result)
+    compose_shell_and_shutdown_result(status_result, shutdown_result, owner_cleanup_result)
+}
+
+fn cleanup_verified_endpoint_owner_with(
+    owner: Option<&DevEndpoint>,
+    root_pid: u32,
+    mut cleanup: impl FnMut(u32, &crate::ports::ProcessIdentity, u16) -> Result<(), String>,
+) -> Result<(), LpmError> {
+    let Some(owner) = owner else {
+        return Ok(());
+    };
+    let Some(owner_pid) = owner.owner_pid else {
+        return Ok(());
+    };
+    if owner_pid == root_pid {
+        return Ok(());
+    }
+    let owner_identity = owner.owner_identity.as_ref().ok_or_else(|| {
+        LpmError::Script(format!(
+            "failed to stop verified endpoint owner PID {owner_pid}: process identity is unavailable"
+        ))
+    })?;
+    cleanup(owner_pid, owner_identity, owner.target.port).map_err(|error| {
+        LpmError::Script(format!(
+            "failed to stop verified endpoint owner PID {owner_pid}: {error}"
+        ))
+    })
 }
 
 fn compose_shell_and_shutdown_result(
     status_result: Result<ExitStatus, LpmError>,
     shutdown_result: Result<(), LpmError>,
+    owner_cleanup_result: Result<(), LpmError>,
 ) -> Result<ExitStatus, LpmError> {
-    match (status_result, shutdown_result) {
+    let status_result = match (status_result, shutdown_result) {
         (Ok(status), Ok(())) => Ok(status),
         (Err(error), Ok(())) | (Ok(_), Err(error)) => Err(error),
         (Err(primary), Err(shutdown)) => Err(LpmError::Script(format!(
             "{primary}; shutdown boundary also failed: {shutdown}"
+        ))),
+    };
+    match (status_result, owner_cleanup_result) {
+        (Ok(status), Ok(())) => Ok(status),
+        (Err(error), Ok(())) | (Ok(_), Err(error)) => Err(error),
+        (Err(primary), Err(owner_cleanup)) => Err(LpmError::Script(format!(
+            "{primary}; verified endpoint owner cleanup also failed: {owner_cleanup}"
         ))),
     }
 }
@@ -1205,6 +1242,9 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn endpoint_aware_shell_invokes_the_shutdown_boundary_before_child_cleanup() {
+        if !crate::ports::identity_bound_process_termination_available() {
+            return;
+        }
         let dir = tempfile::tempdir().unwrap();
         let path = std::env::var("PATH").unwrap_or_default();
         let envs = empty_envs();
@@ -1225,10 +1265,7 @@ mod tests {
 
         let result = spawn_shell_with_endpoint(
             &ShellCommand {
-                command: &format!(
-                    "touch '{}'; while :; do sleep 1; done",
-                    started_path.display()
-                ),
+                command: &format!("sleep 30 & touch '{}'; wait", started_path.display()),
                 cwd: dir.path(),
                 path: &path,
                 envs: &envs,
@@ -1243,7 +1280,15 @@ mod tests {
         );
         controller.join().unwrap();
 
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         assert!(result.is_ok(), "endpoint runner failed: {result:?}");
+        #[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("could not safely terminate 1 descendant process")
+        );
         assert!(
             shutdown_boundary_ran.load(std::sync::atomic::Ordering::Acquire),
             "child cleanup started without acknowledging the shutdown boundary"
@@ -1300,6 +1345,72 @@ mod tests {
 
         assert!(message.contains("injected endpoint process-tree termination failure"));
         assert!(message.contains("injected shutdown boundary failure"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn endpoint_aware_shell_preserves_verified_owner_cleanup_failures() {
+        let status = Command::new("true").status().unwrap();
+
+        let error = compose_shell_and_shutdown_result(
+            Ok(status),
+            Ok(()),
+            Err(LpmError::Script(
+                "injected verified owner cleanup failure".to_string(),
+            )),
+        )
+        .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("injected verified owner cleanup failure")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn verified_out_of_tree_owner_cleanup_failure_is_returned() {
+        let mut owner_process = Command::new("sleep").arg("30").spawn().unwrap();
+        let owner_pid = owner_process.id();
+        let endpoint = DevEndpoint {
+            target: lpm_common::LocalTarget::loopback(lpm_common::LocalScheme::Http, 3_000),
+            service: None,
+            owner_pid: Some(owner_pid),
+            owner_identity: crate::ports::process_identity_for_pid(owner_pid),
+        };
+
+        let error = cleanup_verified_endpoint_owner_with(
+            Some(&endpoint),
+            owner_pid.saturating_add(1),
+            |_, _, _| Err("atomic signalling unavailable".to_string()),
+        )
+        .unwrap_err();
+        let _ = owner_process.kill();
+        let _ = owner_process.wait();
+
+        assert!(error.to_string().contains("atomic signalling unavailable"));
+    }
+
+    #[test]
+    fn verified_out_of_tree_owner_without_identity_fails_closed() {
+        let endpoint = DevEndpoint {
+            target: lpm_common::LocalTarget::loopback(lpm_common::LocalScheme::Http, 3_000),
+            service: None,
+            owner_pid: Some(42),
+            owner_identity: None,
+        };
+
+        let error = cleanup_verified_endpoint_owner_with(Some(&endpoint), 41, |_, _, _| {
+            panic!("cleanup ran without a captured process identity")
+        })
+        .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("process identity is unavailable")
+        );
     }
 
     #[test]

@@ -609,13 +609,18 @@ fn service_ready_url(config: &ServiceConfig, assigned_port: Option<u16>) -> Opti
     Some(remapped)
 }
 
-fn command_with_managed_port(command: &str, cwd: &Path, port: Option<u16>) -> String {
+fn command_with_managed_port(
+    command: &str,
+    planner: Option<&lpm_cert::framework::CommandPortPlanner>,
+    port: Option<u16>,
+) -> Result<String, String> {
     let Some(port) = port else {
-        return command.to_string();
+        return Ok(command.to_string());
     };
-    let args = lpm_cert::framework::explicit_port_args_for_command(cwd, command, port);
+    let planner = planner.ok_or_else(|| "managed port planner is unavailable".to_string())?;
+    let args = planner.managed_port_args(command, port)?;
     if args.is_empty() {
-        return command.to_string();
+        return Ok(command.to_string());
     }
 
     let separator = if lpm_cert::framework::npm_script_requires_argument_separator(command) {
@@ -629,7 +634,448 @@ fn command_with_managed_port(command: &str, cwd: &Path, port: Option<u16>) -> St
     managed.push_str(command);
     managed.push_str(separator);
     managed.push_str(&args.join(" "));
-    managed
+    Ok(managed)
+}
+
+#[cfg(test)]
+fn command_with_managed_port_from_cwd(
+    command: &str,
+    cwd: &Path,
+    port: Option<u16>,
+) -> Result<String, String> {
+    let planner = port.map(|_| lpm_cert::framework::CommandPortPlanner::load(cwd));
+    command_with_managed_port(command, planner.as_ref(), port)
+}
+
+fn service_working_directories(
+    project_dir: &Path,
+    services: &HashMap<String, ServiceConfig>,
+) -> Result<HashMap<String, PathBuf>, LpmError> {
+    service_working_directories_with(project_dir, services, |directory| {
+        directory
+            .canonicalize()
+            .unwrap_or_else(|_| directory.to_path_buf())
+    })
+}
+
+fn service_working_directories_with(
+    project_dir: &Path,
+    services: &HashMap<String, ServiceConfig>,
+    mut resolve_default: impl FnMut(&Path) -> PathBuf,
+) -> Result<HashMap<String, PathBuf>, LpmError> {
+    let mut service_cwds = HashMap::with_capacity(services.len());
+    let mut default_cwd = None;
+    for (name, config) in services {
+        let cwd = if let Some(subdirectory) = &config.cwd {
+            safe_resolve_cwd(project_dir, subdirectory)
+                .map_err(|error| LpmError::Script(format!("service '{name}': {error}")))?
+        } else {
+            default_cwd
+                .get_or_insert_with(|| resolve_default(project_dir))
+                .clone()
+        };
+        service_cwds.insert(name.clone(), cwd);
+    }
+    Ok(service_cwds)
+}
+
+fn revalidate_service_cwd(project_dir: &Path, cached_cwd: &Path) -> Result<PathBuf, String> {
+    let project_canonical = project_dir
+        .canonicalize()
+        .map_err(|error| format!("could not revalidate the project directory: {error}"))?;
+    let current_cwd = cached_cwd
+        .canonicalize()
+        .map_err(|error| format!("could not revalidate the service directory: {error}"))?;
+    if current_cwd != cached_cwd || !current_cwd.starts_with(&project_canonical) {
+        return Err(format!(
+            "service directory '{}' changed or resolves outside project '{}'",
+            cached_cwd.display(),
+            project_canonical.display()
+        ));
+    }
+    Ok(current_cwd)
+}
+
+struct ServicePath {
+    value: String,
+    #[cfg(any(unix, windows))]
+    absolute_project_bins: Vec<PathBuf>,
+}
+
+fn service_path_for_cwd(
+    cwd: &Path,
+    runtime_hint: &crate::bin_path::ManagedRuntimeHint,
+) -> lpm_runtime::detect::DetectionResult<ServicePath> {
+    let discovered_bins = crate::bin_path::find_bin_dirs(cwd);
+    let mut path_bins = Vec::with_capacity(discovered_bins.len());
+    #[cfg(any(unix, windows))]
+    let mut absolute_project_bins = Vec::with_capacity(discovered_bins.len());
+    for bin in discovered_bins {
+        if let Ok(relative) = bin.strip_prefix(cwd) {
+            path_bins.push(relative.to_path_buf());
+        } else {
+            // Ancestor entries stay absolute so reparenting the retained cwd cannot retarget `..`.
+            #[cfg(any(unix, windows))]
+            absolute_project_bins.push(bin.clone());
+            path_bins.push(bin);
+        }
+    }
+    let value = crate::bin_path::build_path_from_bin_dirs(cwd, &path_bins, runtime_hint)?;
+    Ok(ServicePath {
+        value,
+        #[cfg(any(unix, windows))]
+        absolute_project_bins,
+    })
+}
+
+#[cfg(unix)]
+struct UnixPathIdentity {
+    path: std::ffi::CString,
+    device: i128,
+    inode: i128,
+}
+
+#[cfg(unix)]
+impl UnixPathIdentity {
+    fn capture(path: &Path) -> std::io::Result<Self> {
+        use std::os::unix::ffi::OsStrExt as _;
+        use std::os::unix::fs::MetadataExt as _;
+
+        let encoded = std::ffi::CString::new(path.as_os_str().as_bytes()).map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "project bin directory contains an embedded NUL byte",
+            )
+        })?;
+        let metadata = std::fs::metadata(path)?;
+        Ok(Self {
+            path: encoded,
+            device: i128::from(metadata.dev()),
+            inode: i128::from(metadata.ino()),
+        })
+    }
+
+    fn still_matches(&self) -> bool {
+        let mut metadata = std::mem::MaybeUninit::<libc::stat>::uninit();
+        let result = unsafe {
+            // SAFETY: `path` is NUL-terminated and `metadata` points to writable storage.
+            libc::stat(self.path.as_ptr(), metadata.as_mut_ptr())
+        };
+        if result != 0 {
+            return false;
+        }
+        let metadata = unsafe {
+            // SAFETY: A successful `stat` initialized the complete structure.
+            metadata.assume_init()
+        };
+        i128::from(metadata.st_dev) == self.device && i128::from(metadata.st_ino) == self.inode
+    }
+}
+
+#[cfg(unix)]
+fn open_service_cwd_for_spawn(path: &Path) -> std::io::Result<std::fs::File> {
+    use std::ffi::CString;
+    use std::os::fd::FromRawFd as _;
+    use std::os::unix::ffi::OsStrExt as _;
+
+    let path = CString::new(path.as_os_str().as_bytes()).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "service directory contains an embedded NUL byte",
+        )
+    })?;
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    let access_mode = libc::O_PATH;
+    #[cfg(any(
+        target_vendor = "apple",
+        target_os = "freebsd",
+        target_os = "netbsd",
+        target_os = "solaris",
+        target_os = "illumos",
+        target_os = "aix"
+    ))]
+    let access_mode = libc::O_SEARCH;
+    #[cfg(not(any(
+        target_os = "linux",
+        target_os = "android",
+        target_vendor = "apple",
+        target_os = "freebsd",
+        target_os = "netbsd",
+        target_os = "solaris",
+        target_os = "illumos",
+        target_os = "aix"
+    )))]
+    let access_mode = libc::O_RDONLY;
+    let descriptor = unsafe {
+        // SAFETY: `path` is NUL-terminated and the flags do not require a mode argument.
+        libc::open(
+            path.as_ptr(),
+            access_mode | libc::O_CLOEXEC | libc::O_DIRECTORY | libc::O_NOFOLLOW,
+        )
+    };
+    if descriptor < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(unsafe {
+        // SAFETY: `descriptor` is a newly owned file descriptor from a successful `open`.
+        std::fs::File::from_raw_fd(descriptor)
+    })
+}
+
+#[cfg(windows)]
+fn windows_service_cwd_access_mode() -> u32 {
+    use windows_sys::Win32::Storage::FileSystem::{FILE_READ_ATTRIBUTES, SYNCHRONIZE};
+
+    FILE_READ_ATTRIBUTES | SYNCHRONIZE
+}
+
+#[cfg(windows)]
+fn open_windows_service_directory(path: &Path) -> std::io::Result<std::fs::File> {
+    use windows_sys::Win32::Storage::FileSystem::{FILE_SHARE_READ, FILE_SHARE_WRITE};
+
+    open_windows_service_directory_with_share(path, FILE_SHARE_READ | FILE_SHARE_WRITE)
+}
+
+#[cfg(windows)]
+fn open_windows_service_directory_with_share(
+    path: &Path,
+    share_mode: u32,
+) -> std::io::Result<std::fs::File> {
+    use std::os::windows::fs::{MetadataExt as _, OpenOptionsExt as _};
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
+    };
+
+    let directory = std::fs::OpenOptions::new()
+        .access_mode(windows_service_cwd_access_mode())
+        .share_mode(share_mode)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)?;
+    let metadata = directory.metadata()?;
+    if !metadata.is_dir() || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+        return Err(std::io::Error::other(format!(
+            "service directory component '{}' is linked or not a directory",
+            path.display()
+        )));
+    }
+    Ok(directory)
+}
+
+#[cfg(windows)]
+fn windows_directory_identity(directory: &std::fs::File) -> std::io::Result<(u32, u64)> {
+    use std::os::windows::io::AsRawHandle as _;
+    use windows_sys::Win32::Foundation::HANDLE;
+    use windows_sys::Win32::Storage::FileSystem::{
+        BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle,
+    };
+
+    let mut information = BY_HANDLE_FILE_INFORMATION::default();
+    let result = unsafe {
+        // SAFETY: `directory` owns a valid handle and `information` is writable.
+        GetFileInformationByHandle(
+            directory.as_raw_handle() as HANDLE,
+            std::ptr::addr_of_mut!(information),
+        )
+    };
+    if result == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let file_index =
+        (u64::from(information.nFileIndexHigh) << 32) | u64::from(information.nFileIndexLow);
+    Ok((information.dwVolumeSerialNumber, file_index))
+}
+
+#[cfg(windows)]
+struct WindowsDirectoryGuardExpectation<'a> {
+    path: &'a Path,
+    identity: (u32, u64),
+}
+
+#[cfg(windows)]
+fn capture_windows_service_directory_expectations<'a>(
+    cwd: &'a Path,
+    absolute_project_bins: &'a [PathBuf],
+) -> std::io::Result<Vec<WindowsDirectoryGuardExpectation<'a>>> {
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+    };
+
+    let mut seen = HashSet::new();
+    let mut expectations = Vec::new();
+    for protected_path in std::iter::once(cwd).chain(absolute_project_bins.iter().map(Path::new)) {
+        let mut components = protected_path
+            .ancestors()
+            .filter(|component| !component.as_os_str().is_empty())
+            .collect::<Vec<_>>();
+        components.reverse();
+        for component in components {
+            if !seen.insert(component) {
+                continue;
+            }
+            let expected = open_windows_service_directory_with_share(
+                component,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            )?;
+            expectations.push(WindowsDirectoryGuardExpectation {
+                path: component,
+                identity: windows_directory_identity(&expected)?,
+            });
+        }
+    }
+    Ok(expectations)
+}
+
+#[cfg(windows)]
+fn retain_windows_service_directories(
+    expectations: &[WindowsDirectoryGuardExpectation<'_>],
+) -> std::io::Result<Vec<std::fs::File>> {
+    let mut guards = Vec::with_capacity(expectations.len());
+    for expectation in expectations {
+        let guard = open_windows_service_directory(expectation.path)?;
+        if windows_directory_identity(&guard)? != expectation.identity {
+            return Err(std::io::Error::other(format!(
+                "service directory component '{}' changed while retaining it",
+                expectation.path.display()
+            )));
+        }
+        guards.push(guard);
+    }
+    for (expectation, guard) in expectations.iter().zip(&guards) {
+        let current = open_windows_service_directory(expectation.path)?;
+        if windows_directory_identity(guard)? != windows_directory_identity(&current)? {
+            return Err(std::io::Error::other(format!(
+                "service directory component '{}' changed during retention",
+                expectation.path.display()
+            )));
+        }
+    }
+    Ok(guards)
+}
+
+fn spawn_service_command_with(
+    command: &mut Command,
+    project_dir: &Path,
+    cached_cwd: &Path,
+    service_path: &ServicePath,
+    before_spawn: impl FnMut() -> std::io::Result<()>,
+) -> std::io::Result<Child> {
+    spawn_service_command_with_hooks(
+        command,
+        project_dir,
+        cached_cwd,
+        service_path,
+        || Ok(()),
+        before_spawn,
+    )
+}
+
+fn spawn_service_command_with_hooks(
+    command: &mut Command,
+    project_dir: &Path,
+    cached_cwd: &Path,
+    service_path: &ServicePath,
+    mut before_retain: impl FnMut() -> std::io::Result<()>,
+    mut before_spawn: impl FnMut() -> std::io::Result<()>,
+) -> std::io::Result<Child> {
+    let cwd = revalidate_service_cwd(project_dir, cached_cwd).map_err(std::io::Error::other)?;
+    #[cfg(windows)]
+    let directory_expectations = {
+        let expectations = capture_windows_service_directory_expectations(
+            &cwd,
+            &service_path.absolute_project_bins,
+        )?;
+        if revalidate_service_cwd(project_dir, cached_cwd).as_deref() != Ok(cwd.as_path()) {
+            return Err(std::io::Error::other(
+                "service directory changed while recording path identities",
+            ));
+        }
+        expectations
+    };
+    before_retain()?;
+    command.env("PATH", &service_path.value);
+
+    #[cfg(unix)]
+    {
+        use std::os::fd::AsRawFd as _;
+        use std::os::unix::fs::MetadataExt as _;
+        use std::os::unix::process::CommandExt as _;
+
+        let expected = std::fs::metadata(&cwd)?;
+        let directory = open_service_cwd_for_spawn(&cwd)?;
+        let opened = directory.metadata()?;
+        if (expected.dev(), expected.ino()) != (opened.dev(), opened.ino())
+            || revalidate_service_cwd(project_dir, cached_cwd).as_deref() != Ok(cwd.as_path())
+        {
+            return Err(std::io::Error::other(
+                "service directory changed while retaining it for process creation",
+            ));
+        }
+        let absolute_bin_identities = service_path
+            .absolute_project_bins
+            .iter()
+            .map(|path| UnixPathIdentity::capture(path))
+            .collect::<std::io::Result<Vec<_>>>()?;
+        unsafe {
+            // SAFETY: `fchdir` and `stat` are async-signal-safe. The captured directory remains
+            // open in the child until this pre-exec closure completes.
+            command.pre_exec(move || {
+                if libc::fchdir(directory.as_raw_fd()) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                if !absolute_bin_identities
+                    .iter()
+                    .all(UnixPathIdentity::still_matches)
+                {
+                    return Err(std::io::Error::from_raw_os_error(libc::ESTALE));
+                }
+                Ok(())
+            });
+        }
+    }
+
+    #[cfg(windows)]
+    let directory_guards = {
+        let guards = retain_windows_service_directories(&directory_expectations)?;
+        if revalidate_service_cwd(project_dir, cached_cwd).as_deref() != Ok(cwd.as_path()) {
+            return Err(std::io::Error::other(
+                "service directory changed while retaining it for process creation",
+            ));
+        }
+        command.current_dir(&cwd);
+        guards
+    };
+
+    #[cfg(not(any(unix, windows)))]
+    command.current_dir(&cwd);
+    before_spawn()?;
+    let child = command.spawn();
+    #[cfg(windows)]
+    drop(directory_guards);
+    child
+}
+
+fn service_command_port_planners(
+    service_cwds: &HashMap<String, PathBuf>,
+    port_map: &ServicePortMap,
+) -> HashMap<PathBuf, lpm_cert::framework::CommandPortPlanner> {
+    service_command_port_planners_with(service_cwds, port_map, |cwd| {
+        lpm_cert::framework::CommandPortPlanner::load(cwd)
+    })
+}
+
+fn service_command_port_planners_with(
+    service_cwds: &HashMap<String, PathBuf>,
+    port_map: &ServicePortMap,
+    mut load_planner: impl FnMut(&Path) -> lpm_cert::framework::CommandPortPlanner,
+) -> HashMap<PathBuf, lpm_cert::framework::CommandPortPlanner> {
+    let mut planners = HashMap::with_capacity(port_map.len());
+    for name in port_map.keys() {
+        let cwd = &service_cwds[name];
+        if !planners.contains_key(cwd) {
+            planners.insert(cwd.clone(), load_planner(cwd));
+        }
+    }
+    planners
 }
 
 fn port_conflict_reason(port: u16, reserved_ports: &HashMap<u16, String>) -> Option<String> {
@@ -838,6 +1284,8 @@ pub fn run_services_with_config(
         }
     }
 
+    let service_cwds = service_working_directories(project_dir, active_services.as_ref())?;
+
     // Topological sort
     let groups = service_graph::topological_sort(&active_services).map_err(LpmError::Script)?;
 
@@ -856,6 +1304,7 @@ pub fn run_services_with_config(
     )?;
     drop(port_allocation);
     let _port_leases = port_leases;
+    let command_port_planners = service_command_port_planners(&service_cwds, &port_map);
 
     if let Some(ref callback) = options.on_ports_assigned {
         callback(&port_map)?;
@@ -989,38 +1438,38 @@ pub fn run_services_with_config(
                 }
 
                 // Resolve working directory with path traversal protection
-                let cwd = if let Some(ref sub) = config.cwd {
-                    safe_resolve_cwd(project_dir, sub)
-                        .map_err(|e| LpmError::Script(format!("service '{name}': {e}")))?
-                } else {
-                    project_dir.to_path_buf()
-                };
-                let service_command =
-                    command_with_managed_port(&config.command, &cwd, port_map.get(name).copied());
+                let cwd = service_cwds[name].clone();
+                let service_command = command_with_managed_port(
+                    &config.command,
+                    command_port_planners.get(&cwd),
+                    port_map.get(name).copied(),
+                )
+                .map_err(|error| LpmError::Script(format!("service '{name}': {error}")))?;
                 let service_runtime_hint = options
                     .service_runtime_hints
                     .get(name)
                     .unwrap_or(&crate::bin_path::ManagedRuntimeHint::Unknown);
-                let service_path =
-                    crate::bin_path::build_path_with_bins_pre_resolved(&cwd, service_runtime_hint)?;
+                let service_path = service_path_for_cwd(&cwd, service_runtime_hint)?;
                 let assigned_port = port_map.get(name).copied();
                 // Spawn the service process
                 let mut cmd = crate::shell::shell_process(&service_command)?;
-                cmd.current_dir(&cwd)
-                    .stdout(Stdio::piped())
-                    .stderr(Stdio::piped());
+                cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
                 isolate_service_process_tree(&mut cmd);
                 crate::shell::strip_inherited_env_hooks(&mut cmd);
-                cmd.envs(&env).env("PATH", &service_path);
+                cmd.envs(&env);
 
                 // Inject extra envs from HTTPS/tunnel/network setup (safe, no global mutation)
                 for (key, value) in &options.extra_envs {
                     cmd.env(key, value);
                 }
 
-                let mut child = cmd.spawn().map_err(|e| {
-                    LpmError::Script(format!("failed to start service '{name}': {e}"))
-                })?;
+                let mut child =
+                    spawn_service_command_with(&mut cmd, project_dir, &cwd, &service_path, || {
+                        Ok(())
+                    })
+                    .map_err(|e| {
+                        LpmError::Script(format!("failed to start service '{name}': {e}"))
+                    })?;
                 let child_pid = child.id();
                 let child_stdout = child.stdout.take();
                 let child_stderr = child.stderr.take();
@@ -1244,6 +1693,7 @@ pub fn run_services_with_config(
         recovery::supervise_services(recovery::RecoveryContext {
             project_dir,
             active_services: active_services.as_ref(),
+            service_cwds: &service_cwds,
             groups: &groups,
             service_runtime_hints: &options.service_runtime_hints,
             dotenv: &dotenv,
@@ -1847,6 +2297,294 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn service_spawn_keeps_the_validated_cwd_after_path_replacement() {
+        let project = tempfile::tempdir().unwrap();
+        let service = project.path().join("service");
+        let displaced = project.path().join("displaced-service");
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::create_dir(&service).unwrap();
+        let cached_cwd = service.canonicalize().unwrap();
+        let service_path =
+            service_path_for_cwd(&cached_cwd, &crate::bin_path::ManagedRuntimeHint::Absent)
+                .unwrap();
+        let mut command = Command::new("/bin/pwd");
+        command.stdout(Stdio::piped());
+
+        let child = spawn_service_command_with(
+            &mut command,
+            project.path(),
+            &cached_cwd,
+            &service_path,
+            || {
+                std::fs::rename(&service, &displaced)?;
+                std::os::unix::fs::symlink(outside.path(), &service)
+            },
+        )
+        .unwrap();
+        let output = child.wait_with_output().unwrap();
+        let spawned_cwd = PathBuf::from(String::from_utf8(output.stdout).unwrap().trim());
+
+        assert_eq!(spawned_cwd, displaced.canonicalize().unwrap());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn service_spawn_accepts_a_search_only_working_directory() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let project = tempfile::tempdir().unwrap();
+        let service = project.path().join("service");
+        std::fs::create_dir(&service).unwrap();
+        let cached_cwd = service.canonicalize().unwrap();
+        let service_path =
+            service_path_for_cwd(&cached_cwd, &crate::bin_path::ManagedRuntimeHint::Absent)
+                .unwrap();
+        std::fs::set_permissions(&service, std::fs::Permissions::from_mode(0o111)).unwrap();
+        let mut command = Command::new("/bin/pwd");
+        command.stdout(Stdio::piped());
+
+        let spawned = spawn_service_command_with(
+            &mut command,
+            project.path(),
+            &cached_cwd,
+            &service_path,
+            || Ok(()),
+        );
+        std::fs::set_permissions(&service, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let output = spawned.unwrap().wait_with_output().unwrap();
+
+        assert!(output.status.success());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn service_spawn_keeps_cwd_local_path_bound_after_path_replacement() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let project = tempfile::tempdir().unwrap();
+        let service = project.path().join("service");
+        let displaced = project.path().join("displaced-service");
+        let outside = tempfile::tempdir().unwrap();
+        let service_bin = service.join("node_modules/.bin");
+        let outside_bin = outside.path().join("node_modules/.bin");
+        std::fs::create_dir_all(&service_bin).unwrap();
+        std::fs::create_dir_all(&outside_bin).unwrap();
+        for (bin, output) in [(&service_bin, "original"), (&outside_bin, "outside")] {
+            let tool = bin.join("cwd-tool");
+            std::fs::write(&tool, format!("#!/bin/sh\nprintf '%s\\n' '{output}'\n")).unwrap();
+            std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let cached_cwd = service.canonicalize().unwrap();
+        let service_path =
+            service_path_for_cwd(&cached_cwd, &crate::bin_path::ManagedRuntimeHint::Absent)
+                .unwrap();
+        let mut command = crate::shell::shell_process("cwd-tool").unwrap();
+        command.stdout(Stdio::piped());
+
+        let child = spawn_service_command_with(
+            &mut command,
+            project.path(),
+            &cached_cwd,
+            &service_path,
+            || {
+                std::fs::rename(&service, &displaced)?;
+                std::os::unix::fs::symlink(outside.path(), &service)
+            },
+        )
+        .unwrap();
+        let output = child.wait_with_output().unwrap();
+
+        assert_eq!(String::from_utf8(output.stdout).unwrap(), "original\n");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn service_spawn_keeps_workspace_path_bound_after_cwd_is_reparented() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let project = tempfile::tempdir().unwrap();
+        let service = project.path().join("packages/service");
+        let project_bin = project.path().join("node_modules/.bin");
+        let outside = tempfile::tempdir().unwrap();
+        let displaced_parent = outside.path().join("packages");
+        let displaced_service = displaced_parent.join("service");
+        let outside_bin = outside.path().join("node_modules/.bin");
+        std::fs::create_dir_all(&service).unwrap();
+        std::fs::create_dir_all(&project_bin).unwrap();
+        std::fs::create_dir_all(&displaced_parent).unwrap();
+        std::fs::create_dir_all(&outside_bin).unwrap();
+        std::fs::write(
+            project.path().join("package.json"),
+            r#"{"private":true,"workspaces":["packages/*"]}"#,
+        )
+        .unwrap();
+        for (bin, output) in [(&project_bin, "original"), (&outside_bin, "outside")] {
+            let tool = bin.join("workspace-tool");
+            std::fs::write(&tool, format!("#!/bin/sh\nprintf '%s\\n' '{output}'\n")).unwrap();
+            std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let cached_cwd = service.canonicalize().unwrap();
+        let service_path =
+            service_path_for_cwd(&cached_cwd, &crate::bin_path::ManagedRuntimeHint::Absent)
+                .unwrap();
+        let mut command = crate::shell::shell_process("workspace-tool").unwrap();
+        command.stdout(Stdio::piped());
+
+        let child = spawn_service_command_with(
+            &mut command,
+            project.path(),
+            &cached_cwd,
+            &service_path,
+            || std::fs::rename(&service, &displaced_service),
+        )
+        .unwrap();
+        let output = child.wait_with_output().unwrap();
+
+        assert_eq!(String::from_utf8(output.stdout).unwrap(), "original\n");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn service_spawn_rejects_workspace_path_replacement_before_exec() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let base = tempfile::tempdir().unwrap();
+        let project = base.path().join("project");
+        let displaced_project = base.path().join("displaced-project");
+        let service = project.join("packages/service");
+        let project_bin = project.join("node_modules/.bin");
+        std::fs::create_dir_all(&service).unwrap();
+        std::fs::create_dir_all(&project_bin).unwrap();
+        std::fs::write(
+            project.join("package.json"),
+            r#"{"private":true,"workspaces":["packages/*"]}"#,
+        )
+        .unwrap();
+        let original_tool = project_bin.join("workspace-tool");
+        std::fs::write(&original_tool, "#!/bin/sh\nprintf 'original\\n'\n").unwrap();
+        std::fs::set_permissions(&original_tool, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let cached_cwd = service.canonicalize().unwrap();
+        let service_path =
+            service_path_for_cwd(&cached_cwd, &crate::bin_path::ManagedRuntimeHint::Absent)
+                .unwrap();
+        let mut command = crate::shell::shell_process("workspace-tool").unwrap();
+
+        let spawned =
+            spawn_service_command_with(&mut command, &project, &cached_cwd, &service_path, || {
+                std::fs::rename(&project, &displaced_project)?;
+                let replacement_service = project.join("packages/service");
+                let replacement_bin = project.join("node_modules/.bin");
+                std::fs::create_dir_all(&replacement_service)?;
+                std::fs::create_dir_all(&replacement_bin)?;
+                let replacement_tool = replacement_bin.join("workspace-tool");
+                std::fs::write(&replacement_tool, "#!/bin/sh\nprintf 'outside\\n'\n")?;
+                std::fs::set_permissions(replacement_tool, std::fs::Permissions::from_mode(0o700))
+            });
+
+        assert!(spawned.is_err());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn service_cwd_guard_does_not_request_generic_read_access() {
+        use windows_sys::Win32::Foundation::GENERIC_READ;
+        use windows_sys::Win32::Storage::FileSystem::{FILE_READ_ATTRIBUTES, SYNCHRONIZE};
+
+        let access = windows_service_cwd_access_mode();
+
+        assert_eq!(access, FILE_READ_ATTRIBUTES | SYNCHRONIZE);
+        assert_eq!(access & GENERIC_READ, 0);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn service_spawn_rejects_an_intermediate_junction_replacement() {
+        let project = tempfile::tempdir().unwrap();
+        let original_parent = project.path().join("nested");
+        let service = original_parent.join("service");
+        let displaced_parent = project.path().join("displaced-nested");
+        let outside = tempfile::tempdir().unwrap();
+        let outside_parent = outside.path().join("nested");
+        std::fs::create_dir_all(&service).unwrap();
+        std::fs::create_dir_all(outside_parent.join("service")).unwrap();
+        let cached_cwd = service.canonicalize().unwrap();
+        let service_path =
+            service_path_for_cwd(&cached_cwd, &crate::bin_path::ManagedRuntimeHint::Absent)
+                .unwrap();
+        let mut command = Command::new("cmd");
+        command.args(["/C", "cd"]);
+
+        let spawned = spawn_service_command_with_hooks(
+            &mut command,
+            project.path(),
+            &cached_cwd,
+            &service_path,
+            || {
+                std::fs::rename(&original_parent, &displaced_parent)?;
+                let output = Command::new("cmd")
+                    .args(["/C", "mklink", "/J"])
+                    .arg(&original_parent)
+                    .arg(&outside_parent)
+                    .output()?;
+                if output.status.success() {
+                    Ok(())
+                } else {
+                    Err(std::io::Error::other(
+                        String::from_utf8_lossy(&output.stderr).into_owned(),
+                    ))
+                }
+            },
+            || Ok(()),
+        );
+
+        assert!(spawned.is_err());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn service_spawn_rejects_a_replaced_parent_when_the_exact_cwd_moves_back() {
+        let project = tempfile::tempdir().unwrap();
+        let original_parent = project.path().join("nested");
+        let service = original_parent.join("service");
+        let original_bin = original_parent.join("node_modules/.bin");
+        let displaced_parent = project.path().join("displaced-nested");
+        std::fs::create_dir_all(&service).unwrap();
+        std::fs::create_dir_all(&original_bin).unwrap();
+        std::fs::write(
+            original_bin.join("workspace-tool.cmd"),
+            "@echo original\r\n",
+        )
+        .unwrap();
+        let cached_cwd = service.canonicalize().unwrap();
+        let service_path =
+            service_path_for_cwd(&cached_cwd, &crate::bin_path::ManagedRuntimeHint::Absent)
+                .unwrap();
+        let mut command = crate::shell::shell_process("workspace-tool").unwrap();
+
+        let spawned = spawn_service_command_with_hooks(
+            &mut command,
+            project.path(),
+            &cached_cwd,
+            &service_path,
+            || {
+                std::fs::rename(&original_parent, &displaced_parent)?;
+                std::fs::create_dir_all(&original_parent)?;
+                std::fs::rename(displaced_parent.join("service"), &service)?;
+                let replacement_bin = original_parent.join("node_modules/.bin");
+                std::fs::create_dir_all(&replacement_bin)?;
+                std::fs::write(
+                    replacement_bin.join("workspace-tool.cmd"),
+                    "@echo outside\r\n",
+                )
+            },
+            || Ok(()),
+        );
+
+        assert!(spawned.is_err());
+    }
+
     #[test]
     fn validates_depends_on_missing_service() {
         let mut services = HashMap::new();
@@ -1975,9 +2713,82 @@ mod tests {
         .unwrap();
 
         assert_eq!(
-            command_with_managed_port("vite", dir.path(), Some(5174)),
+            command_with_managed_port_from_cwd("vite", dir.path(), Some(5174)).unwrap(),
             "vite --port 5174 --strictPort"
         );
+    }
+
+    #[test]
+    fn services_in_the_same_directory_share_one_command_port_planner() {
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            dir.path().join("package.json"),
+            r#"{"scripts":{"web":"vite","api":"node api.js"},"devDependencies":{"vite":"^7.0.0"}}"#,
+        )
+        .unwrap();
+        let web = ServiceConfig {
+            command: "npm run web".to_string(),
+            ..Default::default()
+        };
+        let api = ServiceConfig {
+            command: "npm run api".to_string(),
+            ..Default::default()
+        };
+        let services = HashMap::from([("web".to_string(), web), ("api".to_string(), api)]);
+        let loads = std::cell::Cell::new(0);
+
+        let service_cwds = service_working_directories(dir.path(), &services).unwrap();
+        let port_map = HashMap::from([("web".to_string(), 5174), ("api".to_string(), 4000)]);
+        let planners = service_command_port_planners_with(&service_cwds, &port_map, |cwd| {
+            loads.set(loads.get() + 1);
+            lpm_cert::framework::CommandPortPlanner::load(cwd)
+        });
+
+        assert_eq!(loads.get(), 1);
+        assert_eq!(planners.len(), 1);
+        assert_eq!(service_cwds["web"], service_cwds["api"]);
+    }
+
+    #[test]
+    fn portless_services_do_not_load_command_port_planners() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let services = HashMap::from([(
+            "worker".to_string(),
+            ServiceConfig {
+                command: "node worker.js".to_string(),
+                ..Default::default()
+            },
+        )]);
+        let service_cwds = service_working_directories(dir.path(), &services).unwrap();
+        let loads = std::cell::Cell::new(0);
+
+        let planners = service_command_port_planners_with(&service_cwds, &HashMap::new(), |cwd| {
+            loads.set(loads.get() + 1);
+            lpm_cert::framework::CommandPortPlanner::load(cwd)
+        });
+
+        assert!(planners.is_empty());
+        assert_eq!(loads.get(), 0);
+    }
+
+    #[test]
+    fn root_services_share_one_default_cwd_resolution() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let services = HashMap::from([
+            ("web".to_string(), ServiceConfig::default()),
+            ("api".to_string(), ServiceConfig::default()),
+            ("worker".to_string(), ServiceConfig::default()),
+        ]);
+        let resolutions = std::cell::Cell::new(0);
+
+        let service_cwds = service_working_directories_with(dir.path(), &services, |directory| {
+            resolutions.set(resolutions.get() + 1);
+            directory.canonicalize().unwrap()
+        })
+        .unwrap();
+
+        assert_eq!(service_cwds.len(), 3);
+        assert_eq!(resolutions.get(), 1);
     }
 
     #[test]
@@ -1990,7 +2801,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(
-            command_with_managed_port("npm run dev", dir.path(), Some(5174)),
+            command_with_managed_port_from_cwd("npm run dev", dir.path(), Some(5174)).unwrap(),
             "npm run dev -- --port 5174 --strictPort"
         );
     }
@@ -2008,12 +2819,37 @@ mod tests {
         .unwrap();
 
         assert_eq!(
-            command_with_managed_port("node api.js", dir.path(), Some(4000)),
+            command_with_managed_port_from_cwd("node api.js", dir.path(), Some(4000)).unwrap(),
             "node api.js"
         );
         assert_eq!(
-            command_with_managed_port("npm run api", dir.path(), Some(4000)),
+            command_with_managed_port_from_cwd("npm run api", dir.path(), Some(4000)).unwrap(),
             "npm run api"
+        );
+    }
+
+    #[test]
+    fn generic_service_commands_keep_unrelated_short_p_options() {
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            dir.path().join("package.json"),
+            r#"{"scripts":{"api":"node api.js"}}"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            command_with_managed_port_from_cwd("node api.js -production", dir.path(), Some(4000))
+                .unwrap(),
+            "node api.js -production"
+        );
+        assert_eq!(
+            command_with_managed_port_from_cwd(
+                "npm run api -- -p preview",
+                dir.path(),
+                Some(4000),
+            )
+                .unwrap(),
+            "npm run api -- -p preview"
         );
     }
 
@@ -2370,11 +3206,17 @@ mod tests {
         .unwrap();
 
         assert_eq!(
-            command_with_managed_port("FOO=1 npm run dev", dir.path(), Some(5174)),
+            command_with_managed_port_from_cwd("FOO=1 npm run dev", dir.path(), Some(5174))
+                .unwrap(),
             "FOO=1 npm run dev -- --port 5174 --strictPort"
         );
         assert_eq!(
-            command_with_managed_port("cross-env FOO=1 npm run dev", dir.path(), Some(5174)),
+            command_with_managed_port_from_cwd(
+                "cross-env FOO=1 npm run dev",
+                dir.path(),
+                Some(5174),
+            )
+            .unwrap(),
             "cross-env FOO=1 npm run dev -- --port 5174 --strictPort"
         );
     }

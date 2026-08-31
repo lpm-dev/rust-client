@@ -7,6 +7,30 @@ use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use support::{TempProject, lpm};
 
+#[cfg(any(unix, windows))]
+struct KillOnDropChild(Option<Child>);
+
+#[cfg(any(unix, windows))]
+impl KillOnDropChild {
+    fn new(child: Child) -> Self {
+        Self(Some(child))
+    }
+
+    fn child_mut(&mut self) -> &mut Child {
+        self.0.as_mut().expect("child should be available")
+    }
+}
+
+#[cfg(any(unix, windows))]
+impl Drop for KillOnDropChild {
+    fn drop(&mut self) {
+        if let Some(mut child) = self.0.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
 fn bind_ephemeral_port() -> (u16, TcpListener) {
     let listener = TcpListener::bind("127.0.0.1:0").expect("failed to bind an ephemeral test port");
     let port = listener
@@ -305,23 +329,22 @@ process.on('SIGTERM', () => server.close(() => process.exit(0)));
 setInterval(() => {}, 1000);
 "#,
     );
-    let mut child = Command::new("node")
-        .arg("listener.js")
-        .current_dir(project.path())
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("spawn project listener");
-    let busy_port = wait_for_listener_port(&project, &mut child);
+    let mut child = KillOnDropChild::new(
+        Command::new("node")
+            .arg("listener.js")
+            .current_dir(project.path())
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn project listener"),
+    );
+    let busy_port = wait_for_listener_port(&project, child.child_mut());
 
     let output = lpm(&project)
         .args(["ports", "--json"])
         .output()
         .expect("failed to run lpm ports --json");
-    let _ = child.kill();
-    let _ = child.wait();
-
     assert!(
         output.status.success(),
         "lpm ports --json fallback failed:\nstdout: {}\nstderr: {}",
@@ -572,7 +595,10 @@ fn ports_kill_range_json_without_yes_requires_confirmation_before_killing() {
 #[cfg(any(unix, windows))]
 #[test]
 fn ports_kill_range_json_with_yes_terminates_live_listener_process() {
-    if !ports_discovery_available() || !node_available() {
+    if !ports_discovery_available()
+        || !node_available()
+        || !lpm_runner::ports::identity_bound_process_termination_available()
+    {
         return;
     }
 
@@ -591,27 +617,25 @@ process.on('SIGTERM', () => server.close(() => process.exit(0)));
 setInterval(() => {}, 1000);
 "#,
     );
-    let mut child = Command::new("node")
-        .arg("listener.js")
-        .current_dir(project.path())
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("spawn range-kill listener");
-    let child_pid = child.id();
-    let busy_port = wait_for_listener_port(&project, &mut child);
+    let mut child = KillOnDropChild::new(
+        Command::new("node")
+            .arg("listener.js")
+            .current_dir(project.path())
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn range-kill listener"),
+    );
+    let child_pid = child.child_mut().id();
+    let busy_port = wait_for_listener_port(&project, child.child_mut());
     let range = format!("{busy_port}-{busy_port}");
 
     let output = lpm(&project)
         .args(["ports", "kill", &range, "--yes", "--json"])
         .output()
         .expect("failed to run lpm ports kill <range> --yes --json");
-    let child_exited = wait_for_child_exit(&mut child);
-    if !child_exited {
-        let _ = child.kill();
-        let _ = child.wait();
-    }
+    let child_exited = wait_for_child_exit(child.child_mut());
 
     assert!(
         output.status.success(),
@@ -643,6 +667,116 @@ setInterval(() => {}, 1000);
                     .is_some_and(|ports| ports.contains(&serde_json::json!(busy_port)))
         }),
         "live range kill must report the child PID and port, got:\n{stdout}"
+    );
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn ports_kill_direct_terminates_the_listener_without_killing_a_connected_client() {
+    if !ports_discovery_available()
+        || !node_available()
+        || !lpm_runner::ports::identity_bound_process_termination_available()
+    {
+        return;
+    }
+
+    let project = TempProject::empty(r#"{"name":"ports-test","version":"1.0.0"}"#);
+    let port = reserve_then_release_port();
+    project.write_file(
+        "listener.js",
+        r#"
+const fs = require('fs');
+const net = require('net');
+
+const port = Number(process.argv[2]);
+const server = net.createServer(() => {});
+server.listen(port, '127.0.0.1', () => {
+  fs.writeFileSync('listener-port.txt', String(server.address().port));
+});
+process.on('SIGTERM', () => {
+  server.close();
+  process.exit(0);
+});
+setInterval(() => {}, 1000);
+"#,
+    );
+    project.write_file(
+        "client.js",
+        r#"
+const fs = require('fs');
+const net = require('net');
+
+const port = Number(process.argv[2]);
+function connect() {
+  const socket = net.connect(port, '127.0.0.1');
+  socket.once('connect', () => fs.writeFileSync('client-connected', 'ready'));
+  socket.once('error', () => setTimeout(connect, 20));
+}
+connect();
+setInterval(() => {}, 1000);
+"#,
+    );
+
+    let mut client = KillOnDropChild::new(
+        Command::new("node")
+            .args(["client.js", &port.to_string()])
+            .current_dir(project.path())
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn connected client"),
+    );
+    let mut listener = KillOnDropChild::new(
+        Command::new("node")
+            .args(["listener.js", &port.to_string()])
+            .current_dir(project.path())
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn direct-kill listener"),
+    );
+    assert_eq!(wait_for_listener_port(&project, listener.child_mut()), port);
+    let connected_path = project.path().join("client-connected");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !connected_path.exists() && std::time::Instant::now() < deadline {
+        assert!(
+            client
+                .child_mut()
+                .try_wait()
+                .expect("poll connected client")
+                .is_none(),
+            "connected client exited before establishing its socket"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert!(
+        connected_path.exists(),
+        "client did not connect to listener"
+    );
+
+    let output = lpm(&project)
+        .args(["ports", "kill", &port.to_string(), "--json"])
+        .output()
+        .expect("failed to run lpm ports kill <port> --json");
+    let listener_exited = wait_for_child_exit(listener.child_mut());
+    let client_alive = client
+        .child_mut()
+        .try_wait()
+        .expect("poll connected client")
+        .is_none();
+
+    assert!(
+        output.status.success(),
+        "lpm ports kill live listener failed:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    assert!(listener_exited, "direct port kill left the listener alive");
+    assert!(
+        client_alive,
+        "direct port kill terminated a connected client"
     );
 }
 
