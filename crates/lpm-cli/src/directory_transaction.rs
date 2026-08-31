@@ -189,6 +189,10 @@ fn private_parent_has_extended_acl(parent: &Dir) -> std::io::Result<bool> {
 }
 
 #[cfg(all(unix, not(target_os = "macos")))]
+#[expect(
+    clippy::unnecessary_wraps,
+    reason = "keeps the ACL probe signature consistent with the fallible macOS implementation"
+)]
 fn private_parent_has_extended_acl(_parent: &Dir) -> std::io::Result<bool> {
     Ok(false)
 }
