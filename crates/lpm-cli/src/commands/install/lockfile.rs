@@ -2255,6 +2255,7 @@ pub(super) fn filter_optional_packages_for_install(
             }
         });
         if !detached.is_empty() {
+            package.optional = false;
             detached_root_links.push((
                 package.instance_id,
                 package.name.clone(),

@@ -871,6 +871,7 @@ fn optional_filter_restores_ambient_root_to_its_exact_contextual_instance() {
     let mut ambient_runtime = filter_fixture_package("runtime", source, Some("runtime"), false);
     ambient_runtime.instance_id = Some(ambient_runtime_id);
     ambient_runtime.is_direct = false;
+    ambient_runtime.optional = true;
     let mut packages = vec![first_runtime, consumer, ambient_runtime];
 
     filter_optional_packages_for_install(&mut packages, &HashSet::new(), &["runtime".to_string()]);
