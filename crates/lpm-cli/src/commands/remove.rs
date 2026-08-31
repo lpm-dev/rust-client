@@ -2077,6 +2077,7 @@ fn restore_directory_security(
 fn snapshot_unix_directory_acl(directory: &Dir) -> std::io::Result<UnixDirectoryAcl> {
     use std::os::fd::AsRawFd as _;
 
+    let directory = open_linux_xattr_directory(directory)?;
     Ok(UnixDirectoryAcl {
         access: read_linux_xattr(directory.as_raw_fd(), c"system.posix_acl_access")?,
         default: read_linux_xattr(directory.as_raw_fd(), c"system.posix_acl_default")?,
@@ -2087,6 +2088,7 @@ fn snapshot_unix_directory_acl(directory: &Dir) -> std::io::Result<UnixDirectory
 fn restore_unix_directory_acl(directory: &Dir, acl: &UnixDirectoryAcl) -> std::io::Result<()> {
     use std::os::fd::AsRawFd as _;
 
+    let directory = open_linux_xattr_directory(directory)?;
     write_linux_xattr(
         directory.as_raw_fd(),
         c"system.posix_acl_access",
@@ -2097,6 +2099,17 @@ fn restore_unix_directory_acl(directory: &Dir, acl: &UnixDirectoryAcl) -> std::i
         c"system.posix_acl_default",
         acl.default.as_deref(),
     )
+}
+
+#[cfg(target_os = "linux")]
+fn open_linux_xattr_directory(directory: &Dir) -> std::io::Result<std::os::fd::OwnedFd> {
+    rustix::fs::openat(
+        directory,
+        c".",
+        rustix::fs::OFlags::RDONLY | rustix::fs::OFlags::DIRECTORY | rustix::fs::OFlags::CLOEXEC,
+        rustix::fs::Mode::empty(),
+    )
+    .map_err(Into::into)
 }
 
 #[cfg(target_os = "linux")]
