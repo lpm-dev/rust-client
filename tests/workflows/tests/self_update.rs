@@ -8,8 +8,99 @@
 
 mod support;
 
+#[cfg(unix)]
+use std::process::{Child, Command, Output};
 use std::time::{SystemTime, UNIX_EPOCH};
 use support::{TempProject, lpm, lpm_from_path, lpm_spawnable_from_path};
+
+#[cfg(unix)]
+struct KillOnDropChild {
+    child: Option<Child>,
+    release_on_drop: Option<std::path::PathBuf>,
+}
+
+#[cfg(unix)]
+impl KillOnDropChild {
+    fn new(child: Child) -> Self {
+        Self {
+            child: Some(child),
+            release_on_drop: None,
+        }
+    }
+
+    fn with_release_on_drop(child: Child, release_on_drop: std::path::PathBuf) -> Self {
+        Self {
+            child: Some(child),
+            release_on_drop: Some(release_on_drop),
+        }
+    }
+
+    fn child_mut(&mut self) -> &mut Child {
+        self.child.as_mut().expect("child should be available")
+    }
+
+    fn release(&self) -> std::io::Result<()> {
+        let release = self
+            .release_on_drop
+            .as_ref()
+            .expect("child should own a release barrier");
+        std::fs::write(release, b"release\n")
+    }
+
+    fn wait_with_output(&mut self) -> std::io::Result<Output> {
+        self.child
+            .take()
+            .expect("child should be available")
+            .wait_with_output()
+    }
+}
+
+#[cfg(unix)]
+impl Drop for KillOnDropChild {
+    fn drop(&mut self) {
+        if let Some(release) = self.release_on_drop.as_ref() {
+            let _ = std::fs::write(release, b"release\n");
+        }
+        if let Some(mut child) = self.child.take() {
+            if self.release_on_drop.is_some() {
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+                while std::time::Instant::now() < deadline {
+                    if child.try_wait().ok().flatten().is_some() {
+                        let _ = child.wait();
+                        return;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+            }
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn release_on_drop_child_unblocks_and_reaps_a_waiting_process() {
+    let directory = tempfile::tempdir().unwrap();
+    let release = directory.path().join("release");
+    let finished = directory.path().join("finished");
+    let child = Command::new("sh")
+        .args([
+            "-c",
+            "while [ ! -f \"$1\" ]; do /bin/sleep 0.01; done; : > \"$2\"",
+            "release-on-drop-child",
+        ])
+        .arg(&release)
+        .arg(&finished)
+        .spawn()
+        .unwrap();
+
+    {
+        let _child = KillOnDropChild::with_release_on_drop(child, release);
+    }
+
+    assert!(finished.is_file());
+}
 
 fn now_secs() -> u64 {
     SystemTime::now()
@@ -885,14 +976,16 @@ fn concurrent_self_updates_serialize_the_manager_mutation_window() {
     symlink(&installation, bin.join("lpm")).expect("link manager-owned launcher");
     let critical = project.home().join("manager-critical");
     let overlap = project.home().join("manager-overlap");
+    let release = project.home().join("manager-release");
     let manager = bin.join("npm");
     std::fs::write(
         &manager,
         format!(
-            "#!/bin/sh\nif [ \"$*\" = 'prefix --global' ]; then printf '%s\\n' '{}'; exit 0; fi\nif ! /bin/mkdir '{}'; then : > '{}'; exit 0; fi\n/bin/sleep 2\n/bin/rmdir '{}'\n",
+            "#!/bin/sh\nif [ \"$*\" = 'prefix --global' ]; then printf '%s\\n' '{}'; exit 0; fi\nif ! /bin/mkdir '{}'; then : > '{}'; exit 0; fi\nattempts=0\nwhile [ ! -f '{}' ]; do\n  attempts=$((attempts + 1))\n  if [ \"$attempts\" -ge 2400 ]; then exit 70; fi\n  /bin/sleep 0.05\ndone\n/bin/rmdir '{}'\n",
             project.home().display(),
             critical.display(),
             overlap.display(),
+            release.display(),
             critical.display(),
         ),
     )
@@ -905,33 +998,79 @@ fn concurrent_self_updates_serialize_the_manager_mutation_window() {
     let mut second = lpm_spawnable_from_path(&project, &installation);
     second.arg("self-update").env("PATH", &bin);
 
-    let first = first.spawn().expect("start first self-update");
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let mut first = KillOnDropChild::with_release_on_drop(
+        first.spawn().expect("start first self-update"),
+        release,
+    );
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
     while !critical.exists() {
+        if let Some(status) = first
+            .child_mut()
+            .try_wait()
+            .expect("poll first self-update")
+        {
+            let output = first
+                .wait_with_output()
+                .expect("collect early first self-update output");
+            panic!(
+                "first self-update exited before entering the manager mutation window with {status}\nstdout: {}\nstderr: {}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr),
+            );
+        }
         assert!(
             std::time::Instant::now() < deadline,
             "first self-update did not enter the manager mutation window"
         );
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
-    let second_started = std::time::Instant::now();
+    let mut second = KillOnDropChild::new(second.spawn().expect("start second self-update"));
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+    loop {
+        if second
+            .child_mut()
+            .try_wait()
+            .expect("poll second self-update")
+            .is_some()
+        {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "contending self-update waited for the active manager operation"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert!(
+        critical.exists(),
+        "contending self-update did not refuse before the active manager operation finished"
+    );
     let second = second
-        .spawn()
-        .expect("start second self-update")
         .wait_with_output()
-        .expect("wait for second self-update");
-    let second_elapsed = second_started.elapsed();
+        .expect("collect second self-update output");
+    first.release().expect("release first manager operation");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+    loop {
+        if first
+            .child_mut()
+            .try_wait()
+            .expect("poll first self-update after manager release")
+            .is_some()
+        {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "first self-update did not exit after releasing the manager operation"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
     let first = first
         .wait_with_output()
         .expect("wait for first self-update");
 
     assert!(!first.status.success());
     assert!(!second.status.success());
-    assert!(
-        second_elapsed < std::time::Duration::from_secs(1),
-        "a contending self-update must refuse promptly instead of waiting for the full manager operation; elapsed {second_elapsed:?}\nsecond stderr: {}",
-        String::from_utf8_lossy(&second.stderr),
-    );
     assert!(
         String::from_utf8_lossy(&second.stderr).contains("another self-update operation"),
         "contending self-update must explain why it refused\nsecond stderr: {}",

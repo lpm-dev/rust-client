@@ -74,6 +74,8 @@ pub struct ManifestTransaction {
     /// Cache files where stale data is worse than no data.
     invalidate: Vec<PathBuf>,
     rollback_dirs: Vec<PathBuf>,
+    rollback_actions: Vec<Box<dyn FnOnce() + Send>>,
+    rollback_cleanup_actions: Vec<Box<dyn FnOnce() + Send>>,
     committed: bool,
 }
 
@@ -374,6 +376,8 @@ impl ManifestTransaction {
             in_memory_snapshot_bytes,
             invalidate,
             rollback_dirs: Vec::new(),
+            rollback_actions: Vec::new(),
+            rollback_cleanup_actions: Vec::new(),
             committed: false,
         })
     }
@@ -398,6 +402,8 @@ impl ManifestTransaction {
             in_memory_snapshot_bytes,
             invalidate: invalidate.iter().map(|p| p.to_path_buf()).collect(),
             rollback_dirs: Vec::new(),
+            rollback_actions: Vec::new(),
+            rollback_cleanup_actions: Vec::new(),
             committed: false,
         })
     }
@@ -558,14 +564,14 @@ impl ManifestTransaction {
 
     pub fn remove_dirs_on_rollback(&mut self, directories: impl IntoIterator<Item = PathBuf>) {
         self.rollback_dirs.extend(directories);
-        self.rollback_dirs.sort_unstable_by(|left, right| {
-            right
-                .components()
-                .count()
-                .cmp(&left.components().count())
-                .then_with(|| right.cmp(left))
-        });
-        self.rollback_dirs.dedup();
+    }
+
+    pub fn on_rollback(&mut self, action: impl FnOnce() + Send + 'static) {
+        self.rollback_actions.push(Box::new(action));
+    }
+
+    pub fn on_rollback_cleanup(&mut self, action: impl FnOnce() + Send + 'static) {
+        self.rollback_cleanup_actions.push(Box::new(action));
     }
 
     /// Mark the transaction as successful. The `Drop` impl will not
@@ -580,6 +586,12 @@ impl Drop for ManifestTransaction {
     fn drop(&mut self) {
         if self.committed {
             return;
+        }
+
+        for action in self.rollback_actions.drain(..).rev() {
+            if std::panic::catch_unwind(std::panic::AssertUnwindSafe(action)).is_err() {
+                tracing::error!("manifest transaction rollback action panicked");
+            }
         }
 
         // (1) Restore snapshotted paths.
@@ -643,6 +655,14 @@ impl Drop for ManifestTransaction {
             }
         }
 
+        self.rollback_dirs.sort_unstable_by(|left, right| {
+            right
+                .components()
+                .count()
+                .cmp(&left.components().count())
+                .then_with(|| right.cmp(left))
+        });
+        self.rollback_dirs.dedup();
         for path in &self.rollback_dirs {
             match std::fs::remove_dir(path) {
                 Ok(()) => {}
@@ -657,6 +677,12 @@ impl Drop for ManifestTransaction {
                         path.display()
                     );
                 }
+            }
+        }
+
+        for action in self.rollback_cleanup_actions.drain(..).rev() {
+            if std::panic::catch_unwind(std::panic::AssertUnwindSafe(action)).is_err() {
+                tracing::error!("manifest transaction rollback cleanup action panicked");
             }
         }
     }
@@ -1102,5 +1128,17 @@ mod tests {
         drop(transaction);
 
         assert_eq!(read(&path), original);
+    }
+
+    #[test]
+    fn rollback_directory_registration_defers_normalization_until_rollback() {
+        let directory = PathBuf::from("nested/directory");
+        let mut transaction = ManifestTransaction::snapshot_install_state(&[], &[], &[]).unwrap();
+
+        transaction.remove_dirs_on_rollback([directory.clone()]);
+        transaction.remove_dirs_on_rollback([directory]);
+
+        assert_eq!(transaction.rollback_dirs.len(), 2);
+        transaction.commit();
     }
 }

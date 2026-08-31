@@ -2,6 +2,8 @@ use crate::added_sources_state::{
     AddedSourceFile, AddedSourceFileAction, AddedSourceRecord, AddedSourcesState,
 };
 use crate::install_ui;
+use cap_fs_ext::DirExt as _;
+use cap_std::fs::Dir;
 use lpm_common::LpmError;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -10,6 +12,8 @@ use std::ffi::OsString;
 use std::io::{Read as _, Write as _};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
+
+use crate::directory_transaction::directory_identity;
 
 fn manifest_lookup_keys(package: &str) -> Vec<String> {
     let mut keys = vec![package.to_string()];
@@ -1079,6 +1083,1467 @@ fn apply_planned_file_removal(
     ))
 }
 
+fn plan_owned_directory_cleanup(
+    canonical_project: &Path,
+    record: &AddedSourceRecord,
+    remaining_state: &mut AddedSourcesState,
+    removable_files: &HashSet<PathBuf>,
+) -> Result<Vec<PathBuf>, LpmError> {
+    let still_owned: HashSet<PathBuf> = remaining_state
+        .packages
+        .values()
+        .flat_map(|candidate| candidate.created_directories.iter().cloned())
+        .collect();
+    let tracked_ancestors = crate::added_sources_state::tracked_file_ancestor_directories(
+        record.files.keys().map(PathBuf::as_path),
+    );
+    let removable_ancestors = crate::added_sources_state::tracked_file_ancestor_directories(
+        removable_files.iter().map(PathBuf::as_path),
+    );
+    let mut descendant_owners = HashMap::<PathBuf, String>::new();
+    for (package, candidate) in &remaining_state.packages {
+        for ancestor in crate::added_sources_state::tracked_file_ancestor_directories(
+            candidate.files.keys().map(PathBuf::as_path),
+        ) {
+            descendant_owners
+                .entry(ancestor)
+                .or_insert_with(|| package.clone());
+        }
+    }
+    let mut directories = Vec::with_capacity(record.created_directories.len());
+    for directory in &record.created_directories {
+        if still_owned.contains(directory) {
+            continue;
+        }
+        if !tracked_ancestors.contains(directory) {
+            return Err(LpmError::Registry(format!(
+                "added-source owned directory '{}' is not an ancestor of a tracked file",
+                directory.display()
+            )));
+        }
+        crate::added_sources_state::resolve_tracked_directory_path_from_root(
+            canonical_project,
+            directory,
+        )?;
+        if let Some(owner) = descendant_owners.get(directory) {
+            remaining_state
+                .packages
+                .get_mut(owner)
+                .expect("descendant owner was indexed above")
+                .created_directories
+                .insert(directory.clone());
+        } else if removable_ancestors.contains(directory) {
+            directories.push(directory.clone());
+        }
+    }
+    validate_owned_directory_tree(canonical_project, &owned_directory_tree(&directories)?)?;
+    Ok(directories)
+}
+
+#[derive(Default)]
+struct OwnedDirectoryTree {
+    nodes: Vec<OwnedDirectoryNode>,
+    roots: Vec<usize>,
+}
+
+struct OwnedDirectoryNode {
+    relative: PathBuf,
+    name: OsString,
+    parent: Option<usize>,
+    children: Vec<usize>,
+    owned: bool,
+    removed_security: Option<DirectorySecurity>,
+}
+
+#[cfg(unix)]
+struct DirectorySecurity {
+    mode: u32,
+    acl: UnixDirectoryAcl,
+}
+
+#[cfg(target_os = "linux")]
+struct UnixDirectoryAcl {
+    access: Option<Vec<u8>>,
+    default: Option<Vec<u8>>,
+}
+
+#[cfg(target_os = "macos")]
+struct UnixDirectoryAcl(Option<Vec<u8>>);
+
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
+struct UnixDirectoryAcl;
+
+#[cfg(windows)]
+struct DirectorySecurity {
+    dacl: windows_directory_security::DirectoryDacl,
+}
+
+#[cfg(not(any(unix, windows)))]
+struct DirectorySecurity;
+
+pub(crate) struct OwnedDirectoryCleanup {
+    removed: usize,
+    rollback: Option<OwnedDirectoryRollback>,
+}
+
+struct OwnedDirectoryRollback {
+    canonical_project: PathBuf,
+    tree: OwnedDirectoryTree,
+}
+
+impl OwnedDirectoryCleanup {
+    pub(crate) fn removed(&self) -> usize {
+        self.removed
+    }
+
+    pub(crate) fn stage_in(mut self, transaction: &mut crate::manifest_tx::ManifestTransaction) {
+        let rollback = self
+            .rollback
+            .take()
+            .expect("active directory cleanup owns rollback state");
+        transaction.on_rollback(move || rollback.restore_best_effort());
+    }
+
+    pub(crate) fn commit(mut self) {
+        self.rollback.take();
+    }
+}
+
+impl Drop for OwnedDirectoryCleanup {
+    fn drop(&mut self) {
+        if let Some(rollback) = self.rollback.take() {
+            rollback.restore_best_effort();
+        }
+    }
+}
+
+impl OwnedDirectoryRollback {
+    fn restore(&self) -> Result<(), LpmError> {
+        let root = open_removal_root_directory(&self.canonical_project)?;
+        restore_pruned_directories(&root, &self.tree)
+    }
+
+    fn restore_best_effort(self) {
+        if let Err(error) = self.restore() {
+            tracing::error!("owned-directory rollback was incomplete: {error}");
+        }
+    }
+}
+
+fn owned_directory_tree(directories: &[PathBuf]) -> Result<OwnedDirectoryTree, LpmError> {
+    let mut tree = OwnedDirectoryTree::default();
+    let mut indices = HashMap::<PathBuf, usize>::new();
+    for directory in directories {
+        let mut relative = PathBuf::new();
+        let mut parent = None;
+        for component in directory.components() {
+            let std::path::Component::Normal(name) = component else {
+                return Err(LpmError::Registry(format!(
+                    "source removal directory path is unsafe: {}",
+                    directory.display()
+                )));
+            };
+            relative.push(name);
+            let index = if let Some(&index) = indices.get(&relative) {
+                index
+            } else {
+                let index = tree.nodes.len();
+                tree.nodes.push(OwnedDirectoryNode {
+                    relative: relative.clone(),
+                    name: name.to_os_string(),
+                    parent,
+                    children: Vec::new(),
+                    owned: false,
+                    removed_security: None,
+                });
+                if let Some(parent) = parent {
+                    tree.nodes[parent].children.push(index);
+                } else {
+                    tree.roots.push(index);
+                }
+                indices.insert(relative.clone(), index);
+                index
+            };
+            parent = Some(index);
+        }
+        let Some(index) = parent else {
+            return Err(LpmError::Registry(
+                "source removal directory path is empty".to_string(),
+            ));
+        };
+        tree.nodes[index].owned = true;
+    }
+    let names = tree
+        .nodes
+        .iter()
+        .map(|node| node.name.clone())
+        .collect::<Vec<_>>();
+    tree.roots
+        .sort_unstable_by(|left, right| names[*left].cmp(&names[*right]));
+    for node in &mut tree.nodes {
+        node.children
+            .sort_unstable_by(|left, right| names[*left].cmp(&names[*right]));
+    }
+    Ok(tree)
+}
+
+fn validate_owned_directory_tree(
+    canonical_project: &Path,
+    tree: &OwnedDirectoryTree,
+) -> Result<(), LpmError> {
+    let root = open_removal_root_directory(canonical_project)?;
+    validate_owned_directory_children(&root, tree)
+}
+
+fn validate_owned_directory_children(
+    root: &Dir,
+    tree: &OwnedDirectoryTree,
+) -> Result<(), LpmError> {
+    for &root_index in &tree.roots {
+        let Some(mut current) = open_owned_directory_child(root, &tree.nodes[root_index])? else {
+            continue;
+        };
+        let mut skipped_depth = 0usize;
+        for operation in owned_directory_traversal(tree, root_index) {
+            if skipped_depth != 0 {
+                match operation {
+                    OwnedDirectoryTraversal::Down(_) => skipped_depth += 1,
+                    OwnedDirectoryTraversal::Up(_) => skipped_depth -= 1,
+                }
+                continue;
+            }
+            match operation {
+                OwnedDirectoryTraversal::Down(child) => {
+                    let Some(opened) = open_owned_directory_child(&current, &tree.nodes[child])?
+                    else {
+                        skipped_depth = 1;
+                        continue;
+                    };
+                    current = opened;
+                }
+                OwnedDirectoryTraversal::Up(_) => {
+                    current = current
+                        .open_parent_dir(cap_std::ambient_authority())
+                        .map_err(LpmError::Io)?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn open_owned_directory_child(
+    parent: &Dir,
+    node: &OwnedDirectoryNode,
+) -> Result<Option<Dir>, LpmError> {
+    let child = match open_owned_directory_component(parent, &node.name) {
+        Ok(child) => child,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(LpmError::Registry(format!(
+                "added-source owned directory is linked or not a directory: {}: {error}",
+                node.relative.display()
+            )));
+        }
+    };
+    let metadata = child.dir_metadata().map_err(LpmError::Io)?;
+    if !metadata.is_dir() || cap_metadata_is_link_or_reparse(&metadata) {
+        return Err(LpmError::Registry(format!(
+            "added-source owned directory is linked or not a directory: {}",
+            node.relative.display()
+        )));
+    }
+    Ok(Some(child))
+}
+
+#[cfg(not(windows))]
+fn open_owned_directory_component(parent: &Dir, name: &std::ffi::OsStr) -> std::io::Result<Dir> {
+    #[cfg(test)]
+    OWNED_DIRECTORY_COMPONENT_OPENS.with(|opens| opens.set(opens.get() + 1));
+    parent.open_dir_nofollow(name)
+}
+
+#[cfg(windows)]
+fn open_owned_directory_component(parent: &Dir, name: &std::ffi::OsStr) -> std::io::Result<Dir> {
+    use cap_fs_ext::{FollowSymlinks, OpenOptionsFollowExt as _, OpenOptionsMaybeDirExt as _};
+    use cap_std::fs::{OpenOptions, OpenOptionsExt as _};
+    use windows_sys::Win32::Foundation::GENERIC_READ;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_DELETE,
+        FILE_SHARE_READ, FILE_SHARE_WRITE,
+    };
+
+    #[cfg(test)]
+    OWNED_DIRECTORY_COMPONENT_OPENS.with(|opens| opens.set(opens.get() + 1));
+    let mut options = OpenOptions::new();
+    options
+        .access_mode(GENERIC_READ)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+        .follow(FollowSymlinks::No)
+        .maybe_dir(true);
+    parent
+        .open_with(name, &options)
+        .map(|file| Dir::from_std_file(file.into_std()))
+}
+
+#[cfg(test)]
+thread_local! {
+    static OWNED_DIRECTORY_COMPONENT_OPENS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[derive(Clone, Copy)]
+enum OwnedDirectoryTraversal {
+    Down(usize),
+    Up(usize),
+}
+
+fn owned_directory_traversal(
+    tree: &OwnedDirectoryTree,
+    root_index: usize,
+) -> Vec<OwnedDirectoryTraversal> {
+    let mut traversal = Vec::with_capacity(tree.nodes[root_index].children.len().saturating_mul(2));
+    let mut pending = vec![(root_index, 0usize)];
+    while let Some((index, next_child)) = pending.last_mut() {
+        if let Some(&child) = tree.nodes[*index].children.get(*next_child) {
+            *next_child += 1;
+            traversal.push(OwnedDirectoryTraversal::Down(child));
+            pending.push((child, 0));
+        } else {
+            let (completed, _) = pending.pop().expect("pending traversal frame");
+            if !pending.is_empty() {
+                traversal.push(OwnedDirectoryTraversal::Up(completed));
+            }
+        }
+    }
+    traversal
+}
+
+pub(crate) fn prune_owned_empty_directories(
+    canonical_project: &Path,
+    directories: Vec<PathBuf>,
+) -> Result<OwnedDirectoryCleanup, LpmError> {
+    prune_owned_empty_directories_with(
+        canonical_project,
+        directories,
+        |_parent, _name, _directory| Ok(()),
+        |_| {},
+    )
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum PruneDirectoryOperation {
+    Quarantine,
+    SecuritySnapshot,
+    StagedDirectoryDelete,
+    RestoreHandleClone,
+    PrivateDirectoryDelete,
+}
+
+fn prune_owned_empty_directories_with(
+    canonical_project: &Path,
+    directories: Vec<PathBuf>,
+    mut remove_directory: impl FnMut(&Dir, &std::ffi::OsStr, &Path) -> std::io::Result<()>,
+    on_restore_operation: impl FnMut(RestoreDirectoryOperation),
+) -> Result<OwnedDirectoryCleanup, LpmError> {
+    prune_owned_empty_directories_with_operations(
+        canonical_project,
+        directories,
+        |operation, parent, name, directory| {
+            if operation == PruneDirectoryOperation::Quarantine {
+                remove_directory(parent, name, directory)
+            } else {
+                Ok(())
+            }
+        },
+        on_restore_operation,
+    )
+}
+
+fn prune_owned_empty_directories_with_operations(
+    canonical_project: &Path,
+    directories: Vec<PathBuf>,
+    mut on_prune_operation: impl FnMut(
+        PruneDirectoryOperation,
+        &Dir,
+        &std::ffi::OsStr,
+        &Path,
+    ) -> std::io::Result<()>,
+    mut on_restore_operation: impl FnMut(RestoreDirectoryOperation),
+) -> Result<OwnedDirectoryCleanup, LpmError> {
+    let mut tree = owned_directory_tree(&directories)?;
+    let root = open_removal_root_directory(canonical_project)?;
+    validate_owned_directory_children(&root, &tree)?;
+    match prune_owned_directory_children(&root, &mut tree, &mut on_prune_operation) {
+        Ok(removed) => Ok(OwnedDirectoryCleanup {
+            removed,
+            rollback: Some(OwnedDirectoryRollback {
+                canonical_project: canonical_project.to_path_buf(),
+                tree,
+            }),
+        }),
+        Err(error) => {
+            restore_pruned_directories_with(&root, &tree, &mut on_restore_operation).map_err(
+                |rollback_error| {
+                    LpmError::Registry(format!(
+                        "owned-directory cleanup failed ({error}) and its directory rollback was incomplete: {rollback_error}"
+                    ))
+                },
+            )?;
+            Err(LpmError::Registry(format!(
+                "owned-directory cleanup failed and was rolled back: {error}"
+            )))
+        }
+    }
+}
+
+fn prune_owned_directory_children(
+    root: &Dir,
+    tree: &mut OwnedDirectoryTree,
+    on_operation: &mut impl FnMut(
+        PruneDirectoryOperation,
+        &Dir,
+        &std::ffi::OsStr,
+        &Path,
+    ) -> std::io::Result<()>,
+) -> Result<usize, LpmError> {
+    let mut removed = 0;
+    let mut parent_identities = vec![None; tree.nodes.len()];
+    for root_index in tree.roots.clone() {
+        let Some(mut current) = open_owned_directory_child(root, &tree.nodes[root_index])? else {
+            continue;
+        };
+        let mut skipped_depth = 0usize;
+        for operation in owned_directory_traversal(tree, root_index) {
+            if skipped_depth != 0 {
+                match operation {
+                    OwnedDirectoryTraversal::Down(_) => skipped_depth += 1,
+                    OwnedDirectoryTraversal::Up(_) => skipped_depth -= 1,
+                }
+                continue;
+            }
+            match operation {
+                OwnedDirectoryTraversal::Down(child) => {
+                    let parent_identity = directory_identity(&current).map_err(LpmError::Io)?;
+                    let Some(opened) = open_owned_directory_child(&current, &tree.nodes[child])?
+                    else {
+                        skipped_depth = 1;
+                        continue;
+                    };
+                    parent_identities[child] = Some(parent_identity);
+                    current = opened;
+                }
+                OwnedDirectoryTraversal::Up(child) => {
+                    let parent = current
+                        .open_parent_dir(cap_std::ambient_authority())
+                        .map_err(LpmError::Io)?;
+                    if parent_identities[child].as_ref()
+                        != Some(&directory_identity(&parent).map_err(LpmError::Io)?)
+                    {
+                        return Err(LpmError::Registry(format!(
+                            "owned directory parent changed during cleanup: {}",
+                            tree.nodes[child].relative.display()
+                        )));
+                    }
+                    if quarantine_and_prune_owned_directory(
+                        &parent,
+                        current,
+                        &mut tree.nodes[child],
+                        on_operation,
+                    )? {
+                        removed += 1;
+                    }
+                    current = parent;
+                }
+            }
+        }
+        if quarantine_and_prune_owned_directory(
+            root,
+            current,
+            &mut tree.nodes[root_index],
+            on_operation,
+        )? {
+            removed += 1;
+        }
+    }
+    Ok(removed)
+}
+
+fn quarantine_and_prune_owned_directory(
+    parent: &Dir,
+    opened: Dir,
+    node: &mut OwnedDirectoryNode,
+    on_operation: &mut impl FnMut(
+        PruneDirectoryOperation,
+        &Dir,
+        &std::ffi::OsStr,
+        &Path,
+    ) -> std::io::Result<()>,
+) -> Result<bool, LpmError> {
+    if !node.owned {
+        return Ok(false);
+    }
+    let expected_identity = directory_identity(&opened).map_err(LpmError::Io)?;
+    let (private_name, private_directory) = crate::directory_transaction::create_private_directory(
+        parent, "prune",
+    )
+    .map_err(|error| {
+        LpmError::Registry(format!(
+            "could not stage owned directory '{}': {error}",
+            node.relative.display()
+        ))
+    })?;
+    if let Err(error) = on_operation(
+        PruneDirectoryOperation::Quarantine,
+        parent,
+        &node.name,
+        &node.relative,
+    ) {
+        let failure = LpmError::Registry(format!(
+            "could not prune owned directory '{}': {error}",
+            node.relative.display()
+        ));
+        return Err(discard_private_prune_directory_after_failure(
+            private_directory,
+            node,
+            failure,
+        ));
+    }
+    if let Err(error) = parent.rename(
+        &node.name,
+        &private_directory,
+        std::ffi::OsStr::new("directory"),
+    ) {
+        let cleanup = discard_private_prune_directory(private_directory, node);
+        if error.kind() == std::io::ErrorKind::NotFound {
+            cleanup?;
+            return Ok(false);
+        }
+        let failure = LpmError::Registry(format!(
+            "could not quarantine owned directory '{}': {error}",
+            node.relative.display()
+        ));
+        return match cleanup {
+            Ok(()) => Err(failure),
+            Err(cleanup_error) => Err(LpmError::Registry(format!(
+                "{failure}; discarding its private prune directory also failed: {cleanup_error}"
+            ))),
+        };
+    }
+    let quarantined = match crate::directory_transaction::open_directory_for_publication(
+        &private_directory,
+        std::ffi::OsStr::new("directory"),
+    ) {
+        Ok(directory) => directory,
+        Err(error) => {
+            drop(opened);
+            restore_quarantined_owned_entry(parent, &private_name, private_directory, None, node)?;
+            tracing::debug!(
+                path = %node.relative.display(),
+                "preserved a linked or non-directory replacement during owned-directory cleanup: {error}"
+            );
+            return Ok(false);
+        }
+    };
+    let same_identity = directory_identity(&quarantined)
+        .map(|identity| identity == expected_identity)
+        .unwrap_or(false);
+    let empty = quarantined
+        .entries()
+        .and_then(|mut entries| entries.next().transpose().map(|entry| entry.is_none()))
+        .unwrap_or(false);
+    if !same_identity || !empty {
+        drop(opened);
+        restore_quarantined_owned_entry(
+            parent,
+            &private_name,
+            private_directory,
+            Some(quarantined),
+            node,
+        )?;
+        return Ok(false);
+    }
+    if let Err(error) = on_operation(
+        PruneDirectoryOperation::SecuritySnapshot,
+        parent,
+        &node.name,
+        &node.relative,
+    ) {
+        drop(opened);
+        return Err(restore_owned_entry_after_prune_failure(
+            parent,
+            &private_name,
+            private_directory,
+            quarantined,
+            node,
+            LpmError::Registry(format!(
+                "could not snapshot security for owned directory '{}': {error}",
+                node.relative.display()
+            )),
+        ));
+    }
+    let security = match snapshot_directory_security(&quarantined) {
+        Ok(security) => security,
+        Err(error) => {
+            drop(opened);
+            return Err(restore_owned_entry_after_prune_failure(
+                parent,
+                &private_name,
+                private_directory,
+                quarantined,
+                node,
+                error,
+            ));
+        }
+    };
+    drop(opened);
+    if let Err(error) = on_operation(
+        PruneDirectoryOperation::StagedDirectoryDelete,
+        parent,
+        &node.name,
+        &node.relative,
+    ) {
+        return Err(restore_owned_entry_after_prune_failure(
+            parent,
+            &private_name,
+            private_directory,
+            quarantined,
+            node,
+            LpmError::Registry(format!(
+                "could not prune quarantined owned directory '{}': {error}",
+                node.relative.display()
+            )),
+        ));
+    }
+    let restore_handle = match on_operation(
+        PruneDirectoryOperation::RestoreHandleClone,
+        parent,
+        &node.name,
+        &node.relative,
+    )
+    .and_then(|()| quarantined.try_clone())
+    {
+        Ok(handle) => handle,
+        Err(error) => {
+            return Err(restore_owned_entry_after_prune_failure(
+                parent,
+                &private_name,
+                private_directory,
+                quarantined,
+                node,
+                LpmError::Registry(format!(
+                    "could not retain quarantined owned directory '{}': {error}",
+                    node.relative.display()
+                )),
+            ));
+        }
+    };
+    if let Err(error) = crate::directory_transaction::discard_private_directory(quarantined) {
+        return Err(restore_owned_entry_after_prune_failure(
+            parent,
+            &private_name,
+            private_directory,
+            restore_handle,
+            node,
+            LpmError::Registry(format!(
+                "could not prune quarantined owned directory '{}': {error}",
+                node.relative.display()
+            )),
+        ));
+    }
+    drop(restore_handle);
+    node.removed_security = Some(security);
+    if let Err(error) = on_operation(
+        PruneDirectoryOperation::PrivateDirectoryDelete,
+        parent,
+        &node.name,
+        &node.relative,
+    ) {
+        let failure = LpmError::Registry(format!(
+            "could not discard private prune directory for '{}': {error}",
+            node.relative.display()
+        ));
+        return Err(discard_private_prune_directory_after_failure(
+            private_directory,
+            node,
+            failure,
+        ));
+    }
+    discard_private_prune_directory(private_directory, node)?;
+    Ok(true)
+}
+
+fn discard_private_prune_directory(
+    directory: Dir,
+    node: &OwnedDirectoryNode,
+) -> Result<(), LpmError> {
+    crate::directory_transaction::discard_private_directory(directory).map_err(|error| {
+        LpmError::Registry(format!(
+            "could not discard private prune directory for '{}': {error}",
+            node.relative.display()
+        ))
+    })
+}
+
+fn discard_private_prune_directory_after_failure(
+    directory: Dir,
+    node: &OwnedDirectoryNode,
+    failure: LpmError,
+) -> LpmError {
+    match discard_private_prune_directory(directory, node) {
+        Ok(()) => failure,
+        Err(cleanup_error) => LpmError::Registry(format!(
+            "{failure}; discarding its private prune directory also failed: {cleanup_error}"
+        )),
+    }
+}
+
+fn restore_owned_entry_after_prune_failure(
+    parent: &Dir,
+    private_name: &std::ffi::OsStr,
+    private_directory: Dir,
+    quarantined: Dir,
+    node: &OwnedDirectoryNode,
+    failure: LpmError,
+) -> LpmError {
+    match restore_quarantined_owned_entry(
+        parent,
+        private_name,
+        private_directory,
+        Some(quarantined),
+        node,
+    ) {
+        Ok(()) => failure,
+        Err(rollback_error) => LpmError::Registry(format!(
+            "{failure}; restoring the quarantined owned directory also failed: {rollback_error}"
+        )),
+    }
+}
+
+fn restore_quarantined_owned_entry(
+    parent: &Dir,
+    private_name: &std::ffi::OsStr,
+    private_directory: Dir,
+    quarantined: Option<Dir>,
+    node: &OwnedDirectoryNode,
+) -> Result<(), LpmError> {
+    let publication = if let Some(quarantined) = quarantined.as_ref() {
+        crate::directory_transaction::publish_directory_noreplace(
+            &private_directory,
+            quarantined,
+            std::ffi::OsStr::new("directory"),
+            parent,
+            &node.name,
+        )
+    } else {
+        crate::directory_transaction::publish_entry_noreplace(
+            &private_directory,
+            std::ffi::OsStr::new("directory"),
+            parent,
+            &node.name,
+        )
+    };
+    publication.map_err(|error| {
+        LpmError::Registry(format!(
+            "could not restore quarantined replacement for '{}': {error}",
+            node.relative.display()
+        ))
+    })?;
+    drop(quarantined);
+    let _ = private_name;
+    discard_private_prune_directory(private_directory, node)
+}
+
+#[derive(Clone, Copy)]
+enum RestoreDirectoryOperation {
+    Open,
+    Create,
+    BeforePublish,
+}
+
+fn restore_pruned_directories(root: &Dir, tree: &OwnedDirectoryTree) -> Result<(), LpmError> {
+    restore_pruned_directories_with(root, tree, &mut |_| {})
+}
+
+fn restore_pruned_directories_with(
+    root: &Dir,
+    tree: &OwnedDirectoryTree,
+    on_operation: &mut impl FnMut(RestoreDirectoryOperation),
+) -> Result<(), LpmError> {
+    let mut errors = Vec::new();
+    let mut parent_identities = vec![None; tree.nodes.len()];
+    for &root_index in &tree.roots {
+        let Some(mut current) = restore_or_open_owned_directory(
+            root,
+            &tree.nodes[root_index],
+            on_operation,
+            &mut errors,
+        ) else {
+            continue;
+        };
+        let mut skipped_depth = 0usize;
+        for operation in owned_directory_traversal(tree, root_index) {
+            if skipped_depth != 0 {
+                match operation {
+                    OwnedDirectoryTraversal::Down(_) => skipped_depth += 1,
+                    OwnedDirectoryTraversal::Up(_) => skipped_depth -= 1,
+                }
+                continue;
+            }
+            match operation {
+                OwnedDirectoryTraversal::Down(child) => {
+                    let parent_identity = match directory_identity(&current) {
+                        Ok(identity) => identity,
+                        Err(error) => {
+                            errors.push(format!(
+                                "could not identify {}: {error}",
+                                tree.nodes[child].relative.display()
+                            ));
+                            skipped_depth = 1;
+                            continue;
+                        }
+                    };
+                    let Some(opened) = restore_or_open_owned_directory(
+                        &current,
+                        &tree.nodes[child],
+                        on_operation,
+                        &mut errors,
+                    ) else {
+                        skipped_depth = 1;
+                        continue;
+                    };
+                    parent_identities[child] = Some(parent_identity);
+                    current = opened;
+                }
+                OwnedDirectoryTraversal::Up(child) => {
+                    debug_assert!(tree.nodes[child].parent.is_some());
+                    let parent = match current.open_parent_dir(cap_std::ambient_authority()) {
+                        Ok(parent) => parent,
+                        Err(error) => {
+                            errors.push(format!(
+                                "could not ascend from {}: {error}",
+                                tree.nodes[child].relative.display()
+                            ));
+                            break;
+                        }
+                    };
+                    match directory_identity(&parent) {
+                        Ok(identity) if parent_identities[child].as_ref() == Some(&identity) => {
+                            current = parent;
+                        }
+                        Ok(_) => {
+                            errors.push(format!(
+                                "preserved a branch whose parent changed during rollback: {}",
+                                tree.nodes[child].relative.display()
+                            ));
+                            break;
+                        }
+                        Err(error) => {
+                            errors.push(format!(
+                                "could not identify the parent of {}: {error}",
+                                tree.nodes[child].relative.display()
+                            ));
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(LpmError::Registry(format!(
+            "owned-directory rollback was incomplete: {}",
+            errors.join(", ")
+        )))
+    }
+}
+
+fn restore_or_open_owned_directory(
+    parent: &Dir,
+    node: &OwnedDirectoryNode,
+    on_operation: &mut impl FnMut(RestoreDirectoryOperation),
+    errors: &mut Vec<String>,
+) -> Option<Dir> {
+    if node.removed_security.is_some() {
+        on_operation(RestoreDirectoryOperation::Open);
+    }
+    match open_owned_directory_component(parent, &node.name) {
+        Ok(directory) => {
+            if node.removed_security.is_some() {
+                errors.push(format!(
+                    "preserved concurrently recreated directory {}",
+                    node.relative.display()
+                ));
+                None
+            } else {
+                Some(directory)
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let Some(security) = node.removed_security.as_ref() else {
+                errors.push(format!(
+                    "could not open unpruned ancestor {}",
+                    node.relative.display()
+                ));
+                return None;
+            };
+            on_operation(RestoreDirectoryOperation::Create);
+            let (private_name, child) =
+                match crate::directory_transaction::create_private_directory(parent, "restore") {
+                    Ok(created) => created,
+                    Err(error) => {
+                        errors.push(format!(
+                            "could not stage {}: {error}",
+                            node.relative.display()
+                        ));
+                        return None;
+                    }
+                };
+            if let Err(error) = restore_directory_security(&child, security) {
+                errors.push(format!(
+                    "could not restore security for {}: {error}",
+                    node.relative.display()
+                ));
+                discard_private_restore_directory(child, &node.relative, errors);
+                return None;
+            }
+            on_operation(RestoreDirectoryOperation::BeforePublish);
+            if let Err(error) = crate::directory_transaction::publish_directory_noreplace(
+                parent,
+                &child,
+                &private_name,
+                parent,
+                &node.name,
+            ) {
+                errors.push(format!(
+                    "preserved concurrently recreated directory {}: {error}",
+                    node.relative.display()
+                ));
+                discard_private_restore_directory(child, &node.relative, errors);
+                None
+            } else {
+                Some(child)
+            }
+        }
+        Err(error) => {
+            errors.push(format!(
+                "could not open {}: {error}",
+                node.relative.display()
+            ));
+            None
+        }
+    }
+}
+
+fn discard_private_restore_directory(
+    directory: Dir,
+    display_path: &Path,
+    errors: &mut Vec<String>,
+) {
+    if let Err(error) = crate::directory_transaction::discard_private_directory(directory) {
+        errors.push(format!(
+            "could not discard private rollback directory for {}: {error}",
+            display_path.display()
+        ));
+    }
+}
+
+#[cfg(unix)]
+fn snapshot_directory_security(directory: &Dir) -> Result<DirectorySecurity, LpmError> {
+    use cap_std::fs::PermissionsExt as _;
+
+    Ok(DirectorySecurity {
+        mode: directory.dir_metadata()?.permissions().mode() & 0o7777,
+        acl: snapshot_unix_directory_acl(directory)?,
+    })
+}
+
+#[cfg(unix)]
+fn restore_directory_security(
+    directory: &Dir,
+    security: &DirectorySecurity,
+) -> Result<(), LpmError> {
+    use cap_std::fs::PermissionsExt as _;
+
+    directory
+        .set_permissions(".", cap_std::fs::Permissions::from_mode(security.mode))
+        .map_err(LpmError::Io)?;
+    restore_unix_directory_acl(directory, &security.acl).map_err(LpmError::Io)
+}
+
+#[cfg(target_os = "linux")]
+fn snapshot_unix_directory_acl(directory: &Dir) -> std::io::Result<UnixDirectoryAcl> {
+    use std::os::fd::AsRawFd as _;
+
+    let directory = open_linux_xattr_directory(directory)?;
+    Ok(UnixDirectoryAcl {
+        access: read_linux_xattr(directory.as_raw_fd(), c"system.posix_acl_access")?,
+        default: read_linux_xattr(directory.as_raw_fd(), c"system.posix_acl_default")?,
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn restore_unix_directory_acl(directory: &Dir, acl: &UnixDirectoryAcl) -> std::io::Result<()> {
+    use std::os::fd::AsRawFd as _;
+
+    let directory = open_linux_xattr_directory(directory)?;
+    write_linux_xattr(
+        directory.as_raw_fd(),
+        c"system.posix_acl_access",
+        acl.access.as_deref(),
+    )?;
+    write_linux_xattr(
+        directory.as_raw_fd(),
+        c"system.posix_acl_default",
+        acl.default.as_deref(),
+    )
+}
+
+#[cfg(target_os = "linux")]
+fn open_linux_xattr_directory(directory: &Dir) -> std::io::Result<std::os::fd::OwnedFd> {
+    rustix::fs::openat(
+        directory,
+        c".",
+        rustix::fs::OFlags::RDONLY | rustix::fs::OFlags::DIRECTORY | rustix::fs::OFlags::CLOEXEC,
+        rustix::fs::Mode::empty(),
+    )
+    .map_err(Into::into)
+}
+
+#[cfg(target_os = "linux")]
+fn read_linux_xattr(
+    fd: std::os::fd::RawFd,
+    name: &std::ffi::CStr,
+) -> std::io::Result<Option<Vec<u8>>> {
+    // SAFETY: `name` is NUL-terminated and the null buffer requests the exact value length.
+    let length = unsafe { libc::fgetxattr(fd, name.as_ptr(), std::ptr::null_mut(), 0) };
+    if length < 0 {
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() == Some(libc::ENODATA) {
+            return Ok(None);
+        }
+        return Err(error);
+    }
+    let mut value = vec![0; length as usize];
+    // SAFETY: `value` owns a writable allocation of the length returned by `fgetxattr`.
+    let read =
+        unsafe { libc::fgetxattr(fd, name.as_ptr(), value.as_mut_ptr().cast(), value.len()) };
+    if read < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    value.truncate(read as usize);
+    Ok(Some(value))
+}
+
+#[cfg(target_os = "linux")]
+fn write_linux_xattr(
+    fd: std::os::fd::RawFd,
+    name: &std::ffi::CStr,
+    value: Option<&[u8]>,
+) -> std::io::Result<()> {
+    let status = if let Some(value) = value {
+        // SAFETY: `name` and `value` remain valid for the duration of the syscall.
+        unsafe { libc::fsetxattr(fd, name.as_ptr(), value.as_ptr().cast(), value.len(), 0) }
+    } else {
+        // SAFETY: `name` is a valid NUL-terminated extended-attribute name.
+        unsafe { libc::fremovexattr(fd, name.as_ptr()) }
+    };
+    if status == 0 {
+        return Ok(());
+    }
+    let error = std::io::Error::last_os_error();
+    if value.is_none() && error.raw_os_error() == Some(libc::ENODATA) {
+        Ok(())
+    } else {
+        Err(error)
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn snapshot_unix_directory_acl(directory: &Dir) -> std::io::Result<UnixDirectoryAcl> {
+    use std::os::fd::AsRawFd as _;
+
+    macos_directory_acl::snapshot(directory.as_raw_fd()).map(UnixDirectoryAcl)
+}
+
+#[cfg(target_os = "macos")]
+fn restore_unix_directory_acl(directory: &Dir, acl: &UnixDirectoryAcl) -> std::io::Result<()> {
+    use std::os::fd::AsRawFd as _;
+
+    macos_directory_acl::restore(directory.as_raw_fd(), acl.0.as_deref())
+}
+
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
+fn snapshot_unix_directory_acl(_directory: &Dir) -> std::io::Result<UnixDirectoryAcl> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "full directory ACL snapshots are unavailable on this platform",
+    ))
+}
+
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
+fn restore_unix_directory_acl(_directory: &Dir, _acl: &UnixDirectoryAcl) -> std::io::Result<()> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "full directory ACL restoration is unavailable on this platform",
+    ))
+}
+
+#[cfg(target_os = "macos")]
+mod macos_directory_acl {
+    use std::ffi::c_void;
+
+    const ACL_TYPE_EXTENDED: libc::c_int = 0x0000_0100;
+
+    struct Acl(*mut c_void);
+
+    impl Drop for Acl {
+        fn drop(&mut self) {
+            // SAFETY: every `Acl` is constructed from an ACL API that transfers ownership.
+            unsafe {
+                let _ = acl_free(self.0);
+            }
+        }
+    }
+
+    pub(super) fn snapshot(fd: libc::c_int) -> std::io::Result<Option<Vec<u8>>> {
+        // SAFETY: `fd` references an open directory for the duration of this call.
+        let acl = Acl(unsafe { acl_get_fd_np(fd, ACL_TYPE_EXTENDED) });
+        if acl.0.is_null() {
+            let error = std::io::Error::last_os_error();
+            if error.raw_os_error() == Some(libc::ENOENT) {
+                return Ok(None);
+            }
+            return Err(error);
+        }
+        let mut entry = std::ptr::null_mut();
+        // SAFETY: `acl.0` is a valid ACL object and `entry` points to writable storage.
+        if unsafe { acl_get_entry(acl.0, 0, &mut entry) } != 0 {
+            let error = std::io::Error::last_os_error();
+            if error.raw_os_error() == Some(libc::EINVAL) {
+                return Ok(None);
+            }
+            return Err(error);
+        }
+        // SAFETY: `acl.0` remains owned and valid until this function returns.
+        let size = unsafe { acl_size(acl.0) };
+        if size < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let mut bytes = vec![0; size as usize];
+        // SAFETY: the destination allocation has exactly the size reported by `acl_size`.
+        let copied = unsafe { acl_copy_ext(bytes.as_mut_ptr().cast(), acl.0, size) };
+        if copied < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        bytes.truncate(copied as usize);
+        Ok(Some(bytes))
+    }
+
+    pub(super) fn restore(fd: libc::c_int, bytes: Option<&[u8]>) -> std::io::Result<()> {
+        let Some(bytes) = bytes else {
+            // SAFETY: `fd` references the recreated directory for the duration of this call.
+            let status = unsafe { acl_delete_fd_np(fd, ACL_TYPE_EXTENDED) };
+            if status == 0 {
+                return Ok(());
+            }
+            let error = std::io::Error::last_os_error();
+            return if matches!(error.raw_os_error(), Some(libc::ENOENT | libc::ENOTSUP)) {
+                Ok(())
+            } else {
+                Err(error)
+            };
+        };
+        // SAFETY: `bytes` contains the complete external representation returned by `acl_copy_ext`.
+        let acl = Acl(unsafe { acl_copy_int(bytes.as_ptr().cast()) });
+        if acl.0.is_null() {
+            return Err(std::io::Error::last_os_error());
+        }
+        // SAFETY: `fd` and `acl.0` remain valid for the duration of the call.
+        let status = unsafe { acl_set_fd_np(fd, acl.0, ACL_TYPE_EXTENDED) };
+        if status == 0 {
+            Ok(())
+        } else {
+            Err(std::io::Error::last_os_error())
+        }
+    }
+
+    unsafe extern "C" {
+        fn acl_free(object: *mut c_void) -> libc::c_int;
+        fn acl_delete_fd_np(fd: libc::c_int, acl_type: libc::c_int) -> libc::c_int;
+        fn acl_get_entry(
+            acl: *mut c_void,
+            entry_id: libc::c_int,
+            entry: *mut *mut c_void,
+        ) -> libc::c_int;
+        fn acl_get_fd_np(fd: libc::c_int, acl_type: libc::c_int) -> *mut c_void;
+        fn acl_set_fd_np(fd: libc::c_int, acl: *mut c_void, acl_type: libc::c_int) -> libc::c_int;
+        fn acl_size(acl: *mut c_void) -> libc::ssize_t;
+        fn acl_copy_ext(
+            buffer: *mut c_void,
+            acl: *mut c_void,
+            size: libc::ssize_t,
+        ) -> libc::ssize_t;
+        fn acl_copy_int(buffer: *const c_void) -> *mut c_void;
+    }
+}
+
+#[cfg(windows)]
+fn snapshot_directory_security(directory: &Dir) -> Result<DirectorySecurity, LpmError> {
+    Ok(DirectorySecurity {
+        dacl: windows_directory_security::snapshot(directory)?,
+    })
+}
+
+#[cfg(windows)]
+fn restore_directory_security(
+    directory: &Dir,
+    security: &DirectorySecurity,
+) -> Result<(), LpmError> {
+    windows_directory_security::restore(directory, &security.dacl).map_err(LpmError::Io)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn snapshot_directory_security(_directory: &Dir) -> Result<DirectorySecurity, LpmError> {
+    Ok(DirectorySecurity)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn restore_directory_security(
+    _directory: &Dir,
+    _security: &DirectorySecurity,
+) -> Result<(), LpmError> {
+    Ok(())
+}
+
+#[cfg(windows)]
+mod windows_directory_security {
+    use std::os::windows::io::AsRawHandle as _;
+    use std::ptr::null_mut;
+
+    use cap_fs_ext::{FollowSymlinks, OpenOptionsFollowExt as _, OsMetadataExt as _};
+    use cap_std::fs::{Dir, OpenOptions, OpenOptionsExt as _};
+    use windows_sys::Wdk::Storage::FileSystem::NtSetSecurityObject;
+    use windows_sys::Win32::Foundation::{ERROR_SUCCESS, HANDLE, LocalFree, RtlNtStatusToDosError};
+    use windows_sys::Win32::Security::Authorization::{
+        ConvertSecurityDescriptorToStringSecurityDescriptorW,
+        ConvertStringSecurityDescriptorToSecurityDescriptorW, GetSecurityInfo, SDDL_REVISION_1,
+        SE_FILE_OBJECT,
+    };
+    use windows_sys::Win32::Security::{
+        DACL_SECURITY_INFORMATION, GetSecurityDescriptorControl,
+        PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, SE_DACL_PROTECTED,
+        UNPROTECTED_DACL_SECURITY_INFORMATION,
+    };
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS, FILE_SHARE_DELETE,
+        FILE_SHARE_READ, FILE_SHARE_WRITE, READ_CONTROL, WRITE_DAC,
+    };
+
+    pub(super) struct DirectoryDacl {
+        sddl: String,
+        protected: bool,
+    }
+
+    struct LocalSecurityDescriptor(PSECURITY_DESCRIPTOR);
+
+    impl Drop for LocalSecurityDescriptor {
+        fn drop(&mut self) {
+            // SAFETY: the Win32 security APIs allocated this descriptor with `LocalAlloc`.
+            unsafe {
+                let _ = LocalFree(self.0.cast());
+            }
+        }
+    }
+
+    pub(super) fn snapshot(directory: &Dir) -> std::io::Result<DirectoryDacl> {
+        let handle = open_security_handle(directory, READ_CONTROL)?;
+        let mut descriptor = null_mut();
+        // SAFETY: the handle remains open and the initialized output receives a LocalFree-owned
+        // descriptor on success.
+        let status = unsafe {
+            GetSecurityInfo(
+                handle.as_raw_handle().cast(),
+                SE_FILE_OBJECT,
+                DACL_SECURITY_INFORMATION,
+                null_mut(),
+                null_mut(),
+                null_mut(),
+                null_mut(),
+                &mut descriptor,
+            )
+        };
+        if status != ERROR_SUCCESS {
+            return Err(std::io::Error::from_raw_os_error(status as i32));
+        }
+        let descriptor = LocalSecurityDescriptor(descriptor);
+        let mut control = 0;
+        let mut revision = 0;
+        // SAFETY: `descriptor` owns a valid security descriptor and both outputs are initialized.
+        if unsafe { GetSecurityDescriptorControl(descriptor.0, &mut control, &mut revision) } == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let mut text = null_mut();
+        let mut text_len = 0;
+        // SAFETY: the descriptor remains valid and the output allocation is released below.
+        if unsafe {
+            ConvertSecurityDescriptorToStringSecurityDescriptorW(
+                descriptor.0,
+                SDDL_REVISION_1,
+                DACL_SECURITY_INFORMATION,
+                &mut text,
+                &mut text_len,
+            )
+        } == 0
+        {
+            return Err(std::io::Error::last_os_error());
+        }
+        // SAFETY: successful conversion returned `text_len` initialized UTF-16 code units.
+        let sddl = String::from_utf16_lossy(unsafe {
+            std::slice::from_raw_parts(text, text_len as usize)
+        });
+        // SAFETY: the conversion API allocated `text`; it is released exactly once here.
+        unsafe {
+            let _ = LocalFree(text.cast());
+        }
+        Ok(DirectoryDacl {
+            sddl,
+            protected: control & SE_DACL_PROTECTED != 0,
+        })
+    }
+
+    pub(super) fn restore(directory: &Dir, dacl: &DirectoryDacl) -> std::io::Result<()> {
+        let handle = open_security_handle(directory, READ_CONTROL | WRITE_DAC)?;
+        apply_sddl(handle.as_raw_handle().cast(), &dacl.sddl, dacl.protected)
+    }
+
+    fn open_security_handle(
+        directory: &Dir,
+        access_mode: u32,
+    ) -> std::io::Result<cap_std::fs::File> {
+        let mut options = OpenOptions::new();
+        options
+            .access_mode(access_mode)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+            .follow(FollowSymlinks::No);
+        let file = directory.open_with(".", &options)?;
+        let metadata = file.metadata()?;
+        if !metadata.is_dir() || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return Err(std::io::Error::other(
+                "owned-directory rollback handle is linked or not a directory",
+            ));
+        }
+        Ok(file)
+    }
+
+    fn apply_sddl(handle: HANDLE, sddl: &str, protected: bool) -> std::io::Result<()> {
+        let encoded = sddl
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect::<Vec<_>>();
+        let mut descriptor = null_mut();
+        // SAFETY: `encoded` is NUL-terminated and the output becomes LocalFree-owned on success.
+        if unsafe {
+            ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                encoded.as_ptr(),
+                SDDL_REVISION_1,
+                &mut descriptor,
+                null_mut(),
+            )
+        } == 0
+        {
+            return Err(std::io::Error::last_os_error());
+        }
+        let descriptor = LocalSecurityDescriptor(descriptor);
+        let security_information = DACL_SECURITY_INFORMATION
+            | if protected {
+                PROTECTED_DACL_SECURITY_INFORMATION
+            } else {
+                UNPROTECTED_DACL_SECURITY_INFORMATION
+            };
+        // SAFETY: the handle has WRITE_DAC and the converted descriptor remains valid.
+        let status = unsafe { NtSetSecurityObject(handle, security_information, descriptor.0) };
+        if status == 0 {
+            Ok(())
+        } else {
+            // SAFETY: `status` is the NTSTATUS produced by `NtSetSecurityObject`.
+            let error = unsafe { RtlNtStatusToDosError(status) };
+            Err(std::io::Error::from_raw_os_error(error as i32))
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn apply_test_dacl(directory: &Dir) -> std::io::Result<()> {
+        let handle = open_security_handle(directory, READ_CONTROL | WRITE_DAC)?;
+        apply_sddl(
+            handle.as_raw_handle().cast(),
+            "D:(A;OICI;GR;;;WD)(A;OICI;FA;;;OW)(A;OICI;FA;;;SY)",
+            false,
+        )
+    }
+
+    #[cfg(test)]
+    pub(super) fn test_sddl(directory: &Dir) -> std::io::Result<String> {
+        snapshot(directory).map(|snapshot| snapshot.sddl)
+    }
+}
+
+#[cfg(unix)]
+fn open_removal_root_directory(path: &Path) -> Result<Dir, LpmError> {
+    use std::os::unix::fs::OpenOptionsExt as _;
+
+    let mut options = std::fs::OpenOptions::new();
+    options
+        .read(true)
+        .custom_flags(libc::O_CLOEXEC | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    options
+        .open(path)
+        .map(Dir::from_std_file)
+        .map_err(LpmError::Io)
+}
+
+#[cfg(windows)]
+fn open_removal_root_directory(path: &Path) -> Result<Dir, LpmError> {
+    use std::os::windows::fs::{MetadataExt as _, OpenOptionsExt as _};
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
+    };
+
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)
+        .map_err(LpmError::Io)?;
+    let metadata = file.metadata().map_err(LpmError::Io)?;
+    if !metadata.is_dir() || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+        return Err(LpmError::Registry(format!(
+            "source removal project root is linked or not a directory: {}",
+            path.display()
+        )));
+    }
+    Ok(Dir::from_std_file(file))
+}
+
+#[cfg(not(any(unix, windows)))]
+fn open_removal_root_directory(path: &Path) -> Result<Dir, LpmError> {
+    Dir::open_ambient_dir(path, cap_std::ambient_authority()).map_err(LpmError::Io)
+}
+
+#[cfg(not(windows))]
+fn cap_metadata_is_link_or_reparse(metadata: &cap_std::fs::Metadata) -> bool {
+    metadata.is_symlink()
+}
+
+#[cfg(windows)]
+fn cap_metadata_is_link_or_reparse(metadata: &cap_std::fs::Metadata) -> bool {
+    use cap_std::fs::MetadataExt as _;
+
+    metadata.file_attributes() & 0x400 != 0
+}
+
 struct DependencyUpdatePlan {
     original: Vec<u8>,
     body: Vec<u8>,
@@ -1203,6 +2668,7 @@ struct LockedRemoveResult {
     removed: Vec<String>,
     preserved: Vec<String>,
     dependencies_removed: Vec<String>,
+    cleaned_directories: usize,
 }
 
 impl LockedRemoveResult {
@@ -1211,6 +2677,7 @@ impl LockedRemoveResult {
             removed: Vec::new(),
             preserved: Vec::new(),
             dependencies_removed: Vec::new(),
+            cleaned_directories: 0,
         }
     }
 }
@@ -1305,11 +2772,26 @@ async fn run_locked(project_dir: &Path, package: &str) -> Result<LockedRemoveRes
         } else {
             (None, None, Vec::new())
         };
+    let removable_files: HashSet<PathBuf> = file_removals
+        .iter()
+        .map(|planned| planned.manifest_path.clone())
+        .collect();
     if !retained.files.is_empty() {
+        let retained_ancestors = crate::added_sources_state::tracked_file_ancestor_directories(
+            retained.files.keys().map(PathBuf::as_path),
+        );
+        retained.created_directories = record
+            .created_directories
+            .iter()
+            .filter(|directory| retained_ancestors.contains(*directory))
+            .cloned()
+            .collect();
         retained.dependencies.clear();
         retained.skill_package_short = None;
         state.packages.insert(package_key.clone(), retained);
     }
+    let owned_directory_cleanup =
+        plan_owned_directory_cleanup(&canonical_project, &record, &mut state, &removable_files)?;
 
     let mut removal_transaction = RemovalTransaction::new(project_dir)?;
     let editor_link_count = skill_plan
@@ -1416,12 +2898,18 @@ async fn run_locked(project_dir: &Path, package: &str) -> Result<LockedRemoveRes
         .verify_guarded_paths()
         .map_err(|error| LpmError::Registry(error.to_string()))?;
 
+    let directory_cleanup =
+        prune_owned_empty_directories(&canonical_project, owned_directory_cleanup)?;
+    let cleaned_directories = directory_cleanup.removed();
+
     manifest_transaction.commit();
     removal_transaction.commit();
+    directory_cleanup.commit();
     Ok(LockedRemoveResult {
         removed,
         preserved,
         dependencies_removed,
+        cleaned_directories,
     })
 }
 
@@ -1435,6 +2923,7 @@ fn render_result(
         removed,
         preserved,
         dependencies_removed,
+        cleaned_directories,
     } = result;
     if json_output {
         let stdout = std::io::stdout();
@@ -1484,6 +2973,9 @@ fn render_result(
             install_ui::green(&dependencies_removed.len().to_string())
         ));
     }
+    if cleaned_directories > 0 {
+        install_ui::done("Cleaned empty directories");
+    }
     if removed.iter().any(|path| path.ends_with('/')) {
         install_ui::done("Removed package skill directory");
     }
@@ -1524,6 +3016,623 @@ mod tests {
             validate_file_record(project.path(), "source-pkg", &manifest_path, &file).unwrap_err();
 
         assert!(error.to_string().contains("invalid backup mode"));
+    }
+
+    #[test]
+    fn owned_directory_cleanup_rolls_back_partial_pruning_before_a_successful_retry() {
+        #[cfg(unix)]
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let project = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(project.path().join("legacy/nested")).unwrap();
+        #[cfg(unix)]
+        std::fs::set_permissions(
+            project.path().join("legacy/nested"),
+            std::fs::Permissions::from_mode(0o711),
+        )
+        .unwrap();
+        let canonical_project = project.path().canonicalize().unwrap();
+        #[cfg(windows)]
+        let original_dacl = {
+            let root = open_removal_root_directory(&canonical_project).unwrap();
+            let legacy = root.open_dir_nofollow("legacy").unwrap();
+            let nested = legacy.open_dir_nofollow("nested").unwrap();
+            windows_directory_security::apply_test_dacl(&nested).unwrap();
+            windows_directory_security::test_sddl(&nested).unwrap()
+        };
+        let directories = vec![PathBuf::from("legacy"), PathBuf::from("legacy/nested")];
+
+        let result = prune_owned_empty_directories_with(
+            &canonical_project,
+            directories.clone(),
+            |_parent, _name, directory| {
+                if directory == Path::new("legacy") {
+                    return Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied));
+                }
+                Ok(())
+            },
+            |_| {},
+        );
+        let error = match result {
+            Err(error) => error,
+            Ok(cleanup) => {
+                cleanup.commit();
+                panic!("injected prune failure unexpectedly succeeded");
+            }
+        };
+
+        assert!(error.to_string().contains("was rolled back"));
+        assert!(project.path().join("legacy/nested").is_dir());
+        #[cfg(unix)]
+        assert_eq!(
+            std::fs::metadata(project.path().join("legacy/nested"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o7777,
+            0o711
+        );
+        #[cfg(windows)]
+        {
+            let root = open_removal_root_directory(&canonical_project).unwrap();
+            let legacy = root.open_dir_nofollow("legacy").unwrap();
+            let nested = legacy.open_dir_nofollow("nested").unwrap();
+            assert_eq!(
+                windows_directory_security::test_sddl(&nested).unwrap(),
+                original_dacl
+            );
+        }
+        let cleanup = prune_owned_empty_directories(&canonical_project, directories).unwrap();
+        assert_eq!(cleanup.removed(), 2);
+        cleanup.commit();
+        assert!(!project.path().join("legacy").exists());
+    }
+
+    #[test]
+    fn owned_directory_cleanup_restores_siblings_when_security_snapshot_fails() {
+        let project = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(project.path().join("root/a")).unwrap();
+        std::fs::create_dir_all(project.path().join("root/z")).unwrap();
+        let canonical_project = project.path().canonicalize().unwrap();
+
+        let result = prune_owned_empty_directories_with_operations(
+            &canonical_project,
+            vec![PathBuf::from("root/a"), PathBuf::from("root/z")],
+            |operation, _parent, _name, directory| {
+                if operation == PruneDirectoryOperation::SecuritySnapshot
+                    && directory == Path::new("root/z")
+                {
+                    return Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied));
+                }
+                Ok(())
+            },
+            |_| {},
+        );
+
+        assert!(result.is_err());
+        assert!(project.path().join("root/a").is_dir());
+        assert!(project.path().join("root/z").is_dir());
+        assert!(private_prune_paths(project.path().join("root")).is_empty());
+    }
+
+    #[test]
+    fn owned_directory_cleanup_restores_content_added_before_staged_delete() {
+        let project = tempfile::tempdir().unwrap();
+        std::fs::create_dir(project.path().join("legacy")).unwrap();
+        let canonical_project = project.path().canonicalize().unwrap();
+
+        let result = prune_owned_empty_directories_with_operations(
+            &canonical_project,
+            vec![PathBuf::from("legacy")],
+            |operation, _parent, _name, _directory| {
+                if operation == PruneDirectoryOperation::StagedDirectoryDelete {
+                    let private = private_prune_paths(project.path())
+                        .into_iter()
+                        .next()
+                        .expect("private prune directory");
+                    std::fs::write(private.join("directory/late.txt"), b"late content\n")?;
+                }
+                Ok(())
+            },
+            |_| {},
+        );
+
+        assert!(result.is_err());
+        assert_eq!(
+            std::fs::read(project.path().join("legacy/late.txt")).unwrap(),
+            b"late content\n"
+        );
+        assert!(private_prune_paths(project.path()).is_empty());
+    }
+
+    #[test]
+    fn owned_directory_cleanup_restores_after_restore_handle_clone_fails() {
+        let project = tempfile::tempdir().unwrap();
+        std::fs::create_dir(project.path().join("legacy")).unwrap();
+        let canonical_project = project.path().canonicalize().unwrap();
+
+        let result = prune_owned_empty_directories_with_operations(
+            &canonical_project,
+            vec![PathBuf::from("legacy")],
+            |operation, _parent, _name, _directory| {
+                if operation == PruneDirectoryOperation::RestoreHandleClone {
+                    return Err(std::io::Error::other("injected handle clone failure"));
+                }
+                Ok(())
+            },
+            |_| {},
+        );
+
+        assert!(result.is_err());
+        assert!(project.path().join("legacy").is_dir());
+        assert!(private_prune_paths(project.path()).is_empty());
+    }
+
+    #[test]
+    fn owned_directory_cleanup_restores_after_private_wrapper_cleanup_fails() {
+        let project = tempfile::tempdir().unwrap();
+        std::fs::create_dir(project.path().join("legacy")).unwrap();
+        let canonical_project = project.path().canonicalize().unwrap();
+
+        let result = prune_owned_empty_directories_with_operations(
+            &canonical_project,
+            vec![PathBuf::from("legacy")],
+            |operation, _parent, _name, _directory| {
+                if operation == PruneDirectoryOperation::PrivateDirectoryDelete {
+                    return Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied));
+                }
+                Ok(())
+            },
+            |_| {},
+        );
+
+        assert!(result.is_err());
+        assert!(project.path().join("legacy").is_dir());
+        assert!(private_prune_paths(project.path()).is_empty());
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn owned_directory_cleanup_preserves_a_replacement_private_wrapper() {
+        let project = tempfile::tempdir().unwrap();
+        std::fs::create_dir(project.path().join("legacy")).unwrap();
+        let canonical_project = project.path().canonicalize().unwrap();
+        let displaced = project.path().join("displaced-private-wrapper");
+        let mut replacement_path = None;
+        let mut replacement_identity = None;
+
+        let cleanup = prune_owned_empty_directories_with_operations(
+            &canonical_project,
+            vec![PathBuf::from("legacy")],
+            |operation, _parent, _name, _directory| {
+                if operation == PruneDirectoryOperation::PrivateDirectoryDelete {
+                    let private = private_prune_paths(project.path())
+                        .into_iter()
+                        .next()
+                        .expect("private prune directory");
+                    std::fs::rename(&private, &displaced)?;
+                    std::fs::create_dir(&private)?;
+                    replacement_identity = Some(test_directory_identity(&private));
+                    replacement_path = Some(private);
+                }
+                Ok(())
+            },
+            |_| {},
+        )
+        .unwrap();
+
+        let replacement_path = replacement_path.expect("replacement private wrapper path");
+        assert_eq!(
+            test_directory_identity(&replacement_path),
+            replacement_identity.expect("replacement private wrapper identity")
+        );
+        assert!(!displaced.exists(), "original private wrapper was orphaned");
+        cleanup.commit();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn owned_directory_cleanup_prunes_an_empty_directory_on_windows() {
+        let project = tempfile::tempdir().unwrap();
+        std::fs::create_dir(project.path().join("legacy")).unwrap();
+        let canonical_project = project.path().canonicalize().unwrap();
+
+        let cleanup =
+            prune_owned_empty_directories(&canonical_project, vec![PathBuf::from("legacy")])
+                .unwrap();
+
+        assert_eq!(cleanup.removed(), 1);
+        assert!(!project.path().join("legacy").exists());
+        drop(cleanup);
+        assert!(project.path().join("legacy").is_dir());
+    }
+
+    fn private_prune_paths(parent: impl AsRef<Path>) -> Vec<PathBuf> {
+        std::fs::read_dir(parent)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".lpm-prune-")
+            })
+            .map(|entry| entry.path())
+            .collect()
+    }
+
+    #[test]
+    fn owned_directory_rollback_restores_a_deep_tree_in_one_traversal() {
+        let project = tempfile::tempdir().unwrap();
+        let canonical_project = project.path().canonicalize().unwrap();
+        let mut directory = PathBuf::new();
+        let mut directories = Vec::with_capacity(64);
+        for index in 0..64 {
+            directory.push(format!("level-{index}"));
+            directories.push(directory.clone());
+        }
+        std::fs::create_dir_all(project.path().join(&directory)).unwrap();
+        let mut opens = 0;
+        let mut creates = 0;
+
+        let result = prune_owned_empty_directories_with(
+            &canonical_project,
+            directories,
+            |_parent, _name, directory| {
+                if directory == Path::new("level-0") {
+                    return Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied));
+                }
+                Ok(())
+            },
+            |operation| match operation {
+                RestoreDirectoryOperation::Open => opens += 1,
+                RestoreDirectoryOperation::Create => creates += 1,
+                RestoreDirectoryOperation::BeforePublish => {}
+            },
+        );
+
+        let error = match result {
+            Err(error) => error,
+            Ok(cleanup) => {
+                cleanup.commit();
+                panic!("injected prune failure unexpectedly succeeded");
+            }
+        };
+        assert_eq!(creates, 63);
+        assert!(opens <= 128, "rollback performed {opens} directory opens");
+        assert!(
+            project.path().join(directory).is_dir(),
+            "rollback error: {error}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn owned_directory_cleanup_uses_bounded_handles_for_a_deep_tree() {
+        const HELPER_ENV: &str = "LPM_TEST_DEEP_OWNED_DIRECTORY_HANDLES";
+        if std::env::var_os(HELPER_ENV).is_some() {
+            let limit = libc::rlimit {
+                rlim_cur: 32,
+                rlim_max: 32,
+            };
+            // SAFETY: this isolated helper process intentionally lowers only
+            // its own descriptor limit before creating any worker threads.
+            assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &limit) }, 0);
+
+            let project = tempfile::tempdir().unwrap();
+            let canonical_project = project.path().canonicalize().unwrap();
+            let mut deepest = PathBuf::new();
+            let mut directories = Vec::with_capacity(128);
+            for _ in 0..128 {
+                deepest.push("d");
+                directories.push(deepest.clone());
+            }
+            std::fs::create_dir_all(project.path().join(&deepest)).unwrap();
+
+            let cleanup = prune_owned_empty_directories(&canonical_project, directories).unwrap();
+            assert_eq!(cleanup.removed(), 128);
+            drop(cleanup);
+            assert!(project.path().join(deepest).is_dir());
+            return;
+        }
+
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "commands::remove::tests::owned_directory_cleanup_uses_bounded_handles_for_a_deep_tree",
+                "--nocapture",
+            ])
+            .env(HELPER_ENV, "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "bounded-handle helper failed\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    fn owned_directory_cleanup_opens_deep_paths_linearly() {
+        let project = tempfile::tempdir().unwrap();
+        let canonical_project = project.path().canonicalize().unwrap();
+        let mut deepest = PathBuf::new();
+        let mut directories = Vec::with_capacity(128);
+        for _ in 0..128 {
+            deepest.push("d");
+            directories.push(deepest.clone());
+        }
+        std::fs::create_dir_all(project.path().join(&deepest)).unwrap();
+        OWNED_DIRECTORY_COMPONENT_OPENS.with(|opens| opens.set(0));
+
+        let cleanup = prune_owned_empty_directories(&canonical_project, directories).unwrap();
+        drop(cleanup);
+        let opens = OWNED_DIRECTORY_COMPONENT_OPENS.with(std::cell::Cell::get);
+
+        assert!(
+            opens <= 512,
+            "deep prune and rollback performed {opens} component opens"
+        );
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn owned_directory_prune_preserves_a_replacement_swapped_before_removal() {
+        let project = tempfile::tempdir().unwrap();
+        let nested = project.path().join("legacy/nested");
+        let displaced = project.path().join("displaced-nested");
+        std::fs::create_dir_all(&nested).unwrap();
+        let canonical_project = project.path().canonicalize().unwrap();
+        let mut replacement_identity = None;
+
+        let cleanup = prune_owned_empty_directories_with(
+            &canonical_project,
+            vec![PathBuf::from("legacy/nested")],
+            |_parent, _name, _| {
+                std::fs::rename(&nested, &displaced)?;
+                std::fs::create_dir(&nested)?;
+                replacement_identity = Some(test_directory_identity(&nested));
+                Ok(())
+            },
+            |_| {},
+        )
+        .unwrap();
+
+        assert_eq!(
+            test_directory_identity(&nested),
+            replacement_identity.expect("replacement directory identity"),
+            "prune deleted the concurrently created replacement"
+        );
+        assert!(displaced.is_dir());
+        cleanup.commit();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn owned_directory_rollback_restores_extended_acl() {
+        let project = tempfile::tempdir().unwrap();
+        let nested = project.path().join("legacy/nested");
+        std::fs::create_dir_all(&nested).unwrap();
+        let status = std::process::Command::new("chmod")
+            .args(["+a", "everyone allow read"])
+            .arg(&nested)
+            .status()
+            .unwrap();
+        assert!(status.success(), "failed to apply the test ACL");
+        let original_acl = macos_acl_text(&nested);
+        let canonical_project = project.path().canonicalize().unwrap();
+
+        let result = prune_owned_empty_directories_with(
+            &canonical_project,
+            vec![PathBuf::from("legacy"), PathBuf::from("legacy/nested")],
+            |_parent, _name, directory| {
+                if directory == Path::new("legacy") {
+                    return Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied));
+                }
+                Ok(())
+            },
+            |_| {},
+        );
+
+        assert!(result.is_err());
+        assert_eq!(macos_acl_text(&nested), original_acl);
+    }
+
+    #[cfg(target_os = "macos")]
+    fn macos_acl_text(path: &Path) -> String {
+        let output = std::process::Command::new("ls")
+            .args(["-lde"])
+            .arg(path)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "failed to read the test ACL");
+        String::from_utf8(output.stdout)
+            .unwrap()
+            .lines()
+            .skip(1)
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn owned_directory_rollback_preserves_a_concurrently_recreated_ancestor() {
+        #[cfg(unix)]
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let project = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(project.path().join("legacy/nested")).unwrap();
+        let canonical_project = project.path().canonicalize().unwrap();
+        let cleanup = prune_owned_empty_directories(
+            &canonical_project,
+            vec![PathBuf::from("legacy"), PathBuf::from("legacy/nested")],
+        )
+        .unwrap();
+        let replacement = project.path().join("legacy");
+        std::fs::create_dir(&replacement).unwrap();
+        std::fs::write(replacement.join("replacement.txt"), b"replacement\n").unwrap();
+        #[cfg(unix)]
+        std::fs::set_permissions(&replacement, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        drop(cleanup);
+
+        assert!(replacement.join("replacement.txt").is_file());
+        assert!(!replacement.join("nested").exists());
+        #[cfg(unix)]
+        assert_eq!(
+            std::fs::metadata(&replacement)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o7777,
+            0o700
+        );
+    }
+
+    #[test]
+    fn owned_directory_rollback_preserves_a_concurrently_recreated_leaf() {
+        #[cfg(unix)]
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let project = tempfile::tempdir().unwrap();
+        let nested = project.path().join("legacy/nested");
+        std::fs::create_dir_all(&nested).unwrap();
+        #[cfg(unix)]
+        std::fs::set_permissions(&nested, std::fs::Permissions::from_mode(0o711)).unwrap();
+        let canonical_project = project.path().canonicalize().unwrap();
+        let cleanup =
+            prune_owned_empty_directories(&canonical_project, vec![PathBuf::from("legacy/nested")])
+                .unwrap();
+        std::fs::create_dir(&nested).unwrap();
+        std::fs::write(nested.join("replacement.txt"), b"replacement\n").unwrap();
+        #[cfg(unix)]
+        std::fs::set_permissions(&nested, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        drop(cleanup);
+
+        assert!(nested.join("replacement.txt").is_file());
+        #[cfg(unix)]
+        assert_eq!(
+            std::fs::metadata(&nested).unwrap().permissions().mode() & 0o7777,
+            0o700
+        );
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn owned_directory_rollback_does_not_replace_a_directory_created_before_publish() {
+        let project = tempfile::tempdir().unwrap();
+        let branch = project.path().join("root/branch");
+        std::fs::create_dir_all(&branch).unwrap();
+        let canonical_project = project.path().canonicalize().unwrap();
+        let mut replacement_created = false;
+        let mut replacement_identity = None;
+
+        let result = prune_owned_empty_directories_with(
+            &canonical_project,
+            vec![PathBuf::from("root"), PathBuf::from("root/branch")],
+            |_parent, _name, directory| {
+                if directory == Path::new("root") {
+                    return Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied));
+                }
+                Ok(())
+            },
+            |operation| {
+                if matches!(operation, RestoreDirectoryOperation::BeforePublish)
+                    && !replacement_created
+                {
+                    std::fs::create_dir(&branch).unwrap();
+                    replacement_identity = Some(test_directory_identity(&branch));
+                    replacement_created = true;
+                }
+            },
+        );
+
+        let error = match result {
+            Err(error) => error,
+            Ok(cleanup) => {
+                cleanup.commit();
+                panic!("injected prune failure unexpectedly succeeded");
+            }
+        };
+        assert_eq!(
+            test_directory_identity(&branch),
+            replacement_identity.expect("replacement directory identity"),
+            "rollback replaced the concurrently created empty directory: {error}"
+        );
+    }
+
+    #[cfg(any(unix, windows))]
+    fn test_directory_identity(path: &Path) -> crate::directory_transaction::DirectoryIdentity {
+        let directory = Dir::open_ambient_dir(path, cap_std::ambient_authority()).unwrap();
+        directory_identity(&directory).unwrap()
+    }
+
+    #[test]
+    fn owned_directory_rollback_restores_siblings_after_a_recreated_branch() {
+        let project = tempfile::tempdir().unwrap();
+        let recreated = project.path().join("root/a");
+        let restored = project.path().join("root/z");
+        std::fs::create_dir_all(&recreated).unwrap();
+        std::fs::create_dir_all(&restored).unwrap();
+        let canonical_project = project.path().canonicalize().unwrap();
+        let mut replacement_created = false;
+
+        let result = prune_owned_empty_directories_with(
+            &canonical_project,
+            vec![
+                PathBuf::from("root"),
+                PathBuf::from("root/a"),
+                PathBuf::from("root/z"),
+            ],
+            |_parent, _name, directory| {
+                if directory == Path::new("root") {
+                    return Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied));
+                }
+                Ok(())
+            },
+            |operation| {
+                if matches!(operation, RestoreDirectoryOperation::BeforePublish)
+                    && !replacement_created
+                {
+                    std::fs::create_dir(&recreated).unwrap();
+                    std::fs::write(recreated.join("replacement.txt"), b"replacement\n").unwrap();
+                    replacement_created = true;
+                }
+            },
+        );
+
+        let error = match result {
+            Err(error) => error,
+            Ok(cleanup) => {
+                cleanup.commit();
+                panic!("injected prune failure unexpectedly succeeded");
+            }
+        };
+        assert!(
+            recreated.join("replacement.txt").is_file(),
+            "rollback error: {error}"
+        );
+        assert!(restored.is_dir(), "rollback error: {error}");
+    }
+
+    #[test]
+    fn staged_directory_cleanup_rolls_back_with_the_manifest_transaction() {
+        let project = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(project.path().join("legacy/nested")).unwrap();
+        let canonical_project = project.path().canonicalize().unwrap();
+        let cleanup = prune_owned_empty_directories(
+            &canonical_project,
+            vec![PathBuf::from("legacy"), PathBuf::from("legacy/nested")],
+        )
+        .unwrap();
+        let mut transaction =
+            crate::manifest_tx::ManifestTransaction::snapshot_install_state(&[], &[], &[]).unwrap();
+
+        cleanup.stage_in(&mut transaction);
+        drop(transaction);
+
+        assert!(project.path().join("legacy/nested").is_dir());
     }
 
     #[test]

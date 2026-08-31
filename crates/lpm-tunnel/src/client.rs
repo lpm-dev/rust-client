@@ -229,6 +229,15 @@ fn relay_code_retry_class(code: &str) -> Option<RetryClass> {
     }
 }
 
+fn classify_relay_message_error(message: &str, code: Option<&str>) -> TunnelConnectError {
+    let message = format!("relay error: {message}");
+    match code.and_then(relay_code_retry_class) {
+        Some(RetryClass::Permanent) => TunnelConnectError::permanent(message),
+        Some(RetryClass::AuthRejected) => TunnelConnectError::auth_rejected(message),
+        Some(RetryClass::Transient) | None => TunnelConnectError::transient(message),
+    }
+}
+
 fn classify_relay_rejection(status: u16, body: &[u8]) -> TunnelConnectError {
     let payload = serde_json::from_slice::<RelayRejectionBody>(body).ok();
     let code = payload.as_ref().and_then(|value| value.code.as_deref());
@@ -2422,11 +2431,12 @@ async fn try_connect_with_token(
                             ServerMessage::UsageNotice { usage } => {
                                 on_usage(&usage, false);
                             }
-                            ServerMessage::Error { message, .. } => {
+                            ServerMessage::Error { message, code } => {
                                 tracing::error!("relay error: {message}");
-                                return Err(TunnelConnectError::transient(format!(
-                                    "relay error: {message}"
-                                )));
+                                return Err(classify_relay_message_error(
+                                    &message,
+                                    code.as_deref(),
+                                ));
                             }
                             _ => {
                                 tracing::debug!("unhandled message type");
@@ -2940,6 +2950,27 @@ mod tests {
         );
         assert_eq!(
             classify_relay_rejection(503, br#"{"error":"Unavailable"}"#).retry_class,
+            RetryClass::Transient
+        );
+    }
+
+    #[test]
+    fn active_relay_errors_preserve_their_retry_classification() {
+        assert_eq!(
+            classify_relay_message_error("upgrade required", Some("plan_required")).retry_class,
+            RetryClass::Permanent
+        );
+        assert_eq!(
+            classify_relay_message_error("session expired", Some("auth_failed")).retry_class,
+            RetryClass::AuthRejected
+        );
+        assert_eq!(
+            classify_relay_message_error("relay unavailable", Some("quota_unavailable"))
+                .retry_class,
+            RetryClass::Transient
+        );
+        assert_eq!(
+            classify_relay_message_error("unknown", Some("new_error_code")).retry_class,
             RetryClass::Transient
         );
     }

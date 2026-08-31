@@ -1051,6 +1051,54 @@ fn sequential_run_preserves_the_requested_order_for_independent_scripts() {
     );
 }
 
+#[test]
+fn sequential_run_reports_environment_validation_details_before_spawn() {
+    let project = TempProject::empty(
+        r#"{
+            "name": "sequential-env-validation",
+            "version": "1.0.0"
+        }"#,
+    );
+    project.write_file(
+        "lpm.json",
+        r#"{
+            "tasks": {
+                "deploy": {
+                    "command": "node deploy.js"
+                }
+            },
+            "envSchema": {
+                "vars": {
+                    "DATABASE_URL": { "required": true },
+                    "STRIPE_KEY": { "required": true }
+                }
+            }
+        }"#,
+    );
+    project.write_file(
+        "deploy.js",
+        "require('fs').writeFileSync('spawned.txt', 'yes');",
+    );
+
+    let output = lpm(&project)
+        .args(["run", "--env=preview", "deploy"])
+        .output()
+        .expect("run a task blocked by environment validation");
+
+    assert!(!output.status.success(), "missing required env must fail");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("environment validation failed")
+            && stderr.contains("DATABASE_URL: missing (required)")
+            && stderr.contains("STRIPE_KEY: missing (required)"),
+        "sequential task failure must preserve validation details:\n{stderr}"
+    );
+    assert!(
+        !project.file_exists("spawned.txt"),
+        "task spawned before environment validation completed"
+    );
+}
+
 // ─── Env Loading ─────────────────────────────────────────────────
 
 #[test]

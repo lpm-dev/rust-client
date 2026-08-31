@@ -16,12 +16,19 @@
 mod support;
 
 use futures_util::SinkExt;
+use std::collections::VecDeque;
 use std::fs;
+use std::io::{Read, Write as _};
+use std::net::TcpListener;
+use std::path::Path;
+use std::process::Stdio;
 use std::time::{Duration, Instant};
 use support::auth_state::{SessionSeed, seed_sessions};
 use support::{TempProject, lpm, lpm_spawnable};
 use tokio_tungstenite::tungstenite::Message;
 use wiremock::{Mock, MockServer, ResponseTemplate, matchers::any};
+
+const MAX_CAPTURED_STREAM_BYTES: usize = 256 * 1024;
 
 fn captured_webhook(
     id: &str,
@@ -47,6 +54,287 @@ fn captured_webhook(
         signature_diagnostic: None,
         auto_acked: false,
     }
+}
+
+fn command_output_with_deadline(
+    mut command: std::process::Command,
+    timeout: Duration,
+) -> std::process::Output {
+    configure_bounded_command(&mut command);
+    command.stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut child = command.spawn().expect("spawn bounded workflow command");
+    let stdout = child.stdout.take().expect("bounded stdout pipe");
+    let stderr = child.stderr.take().expect("bounded stderr pipe");
+    let stdout_capture = std::thread::spawn(move || read_bounded_stream(stdout, "stdout"));
+    let stderr_capture = std::thread::spawn(move || read_bounded_stream(stderr, "stderr"));
+    let deadline = Instant::now() + timeout;
+    let (status, timed_out) = loop {
+        if child
+            .try_wait()
+            .expect("poll bounded workflow command")
+            .is_some()
+        {
+            break (cleanup_bounded_command(&mut child), false);
+        }
+        if Instant::now() >= deadline {
+            break (cleanup_bounded_command(&mut child), true);
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    let stdout = stdout_capture
+        .join()
+        .expect("bounded stdout reader thread")
+        .expect("read bounded stdout");
+    let stderr = stderr_capture
+        .join()
+        .expect("bounded stderr reader thread")
+        .expect("read bounded stderr");
+    if timed_out {
+        panic!(
+            "workflow command exceeded {timeout:?}\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&stdout),
+            String::from_utf8_lossy(&stderr)
+        );
+    }
+    std::process::Output {
+        status,
+        stdout,
+        stderr,
+    }
+}
+
+#[cfg(unix)]
+fn configure_bounded_command(command: &mut std::process::Command) {
+    use std::os::unix::process::CommandExt as _;
+
+    command.process_group(0);
+}
+
+#[cfg(not(unix))]
+fn configure_bounded_command(_command: &mut std::process::Command) {}
+
+#[cfg(unix)]
+fn cleanup_bounded_command(child: &mut std::process::Child) -> std::process::ExitStatus {
+    let process_group = libc::pid_t::try_from(child.id()).expect("bounded child PID fits pid_t");
+    // SAFETY: the child was placed in a dedicated process group before spawn;
+    // a negative PID targets that owned group without dereferencing memory.
+    unsafe {
+        libc::kill(-process_group, libc::SIGKILL);
+    }
+    child.wait().expect("reap bounded workflow command")
+}
+
+#[cfg(not(unix))]
+fn cleanup_bounded_command(child: &mut std::process::Child) -> std::process::ExitStatus {
+    lpm_runner::ports::terminate_child_process_tree(child)
+        .expect("terminate bounded workflow process tree")
+}
+
+fn read_bounded_stream(mut reader: impl Read, stream: &str) -> std::io::Result<Vec<u8>> {
+    let retained_head = MAX_CAPTURED_STREAM_BYTES / 2;
+    let retained_tail = MAX_CAPTURED_STREAM_BYTES - retained_head;
+    let mut head = Vec::with_capacity(retained_head);
+    let mut tail = VecDeque::with_capacity(retained_tail);
+    let mut total = 0u64;
+    let mut buffer = [0u8; 64 * 1024];
+    loop {
+        let read = reader.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        total = total.saturating_add(read as u64);
+        let mut chunk = &buffer[..read];
+        if head.len() < retained_head {
+            let head_bytes = (retained_head - head.len()).min(chunk.len());
+            head.extend_from_slice(&chunk[..head_bytes]);
+            chunk = &chunk[head_bytes..];
+        }
+        tail.extend(chunk.iter().copied());
+        let overflow = tail.len().saturating_sub(retained_tail);
+        if overflow != 0 {
+            tail.drain(..overflow);
+        }
+    }
+    if total <= MAX_CAPTURED_STREAM_BYTES as u64 {
+        head.extend(tail);
+        return Ok(head);
+    }
+
+    let omitted = total - MAX_CAPTURED_STREAM_BYTES as u64;
+    let marker = format!("\n<{stream} truncated: omitted {omitted} bytes>\n");
+    let mut output = Vec::with_capacity(MAX_CAPTURED_STREAM_BYTES + marker.len());
+    output.extend_from_slice(&head);
+    output.extend_from_slice(marker.as_bytes());
+    output.extend(tail);
+    Ok(output)
+}
+
+#[test]
+fn deadline_helper_drains_output_while_the_child_is_running() {
+    let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+    command
+        .args([
+            "--exact",
+            "emit_large_output_for_deadline_helper",
+            "--nocapture",
+        ])
+        .env("LPM_TEST_EMIT_LARGE_DEADLINE_OUTPUT", "1")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    let output = command_output_with_deadline(command, Duration::from_secs(10));
+
+    assert!(output.status.success());
+    assert!(output.stdout.len() <= MAX_CAPTURED_STREAM_BYTES + 128);
+    assert!(output.stderr.len() <= MAX_CAPTURED_STREAM_BYTES + 128);
+    assert!(
+        output
+            .stdout
+            .windows(b"<stdout truncated:".len())
+            .any(|window| window == b"<stdout truncated:")
+    );
+    assert!(
+        output
+            .stderr
+            .windows(b"<stderr truncated:".len())
+            .any(|window| window == b"<stderr truncated:")
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn deadline_helper_does_not_spool_output_to_unbounded_files() {
+    use std::os::unix::process::CommandExt as _;
+
+    let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+    command
+        .args([
+            "--exact",
+            "emit_large_output_for_deadline_helper",
+            "--nocapture",
+        ])
+        .env("LPM_TEST_EMIT_LARGE_DEADLINE_OUTPUT", "1");
+    unsafe {
+        command.pre_exec(|| {
+            let limit = libc::rlimit {
+                rlim_cur: (MAX_CAPTURED_STREAM_BYTES * 2) as libc::rlim_t,
+                rlim_max: (MAX_CAPTURED_STREAM_BYTES * 2) as libc::rlim_t,
+            };
+            if libc::setrlimit(libc::RLIMIT_FSIZE, &limit) == 0 {
+                Ok(())
+            } else {
+                Err(std::io::Error::last_os_error())
+            }
+        });
+    }
+
+    let output = command_output_with_deadline(command, Duration::from_secs(10));
+
+    assert!(output.status.success());
+}
+
+#[test]
+fn emit_large_output_for_deadline_helper() {
+    if std::env::var_os("LPM_TEST_EMIT_LARGE_DEADLINE_OUTPUT").is_none() {
+        return;
+    }
+    let bytes = vec![b'x'; 2 * 1024 * 1024];
+    std::io::stdout().write_all(&bytes).unwrap();
+    std::io::stderr().write_all(&bytes).unwrap();
+}
+
+#[test]
+fn deadline_helper_cleans_a_descendant_that_inherits_output_handles() {
+    let fixture = tempfile::tempdir().unwrap();
+    let pid_file = fixture.path().join("descendant.pid");
+    let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+    command
+        .args([
+            "--exact",
+            "spawn_inherited_pipe_holder_for_deadline_helper",
+            "--nocapture",
+        ])
+        .env("LPM_TEST_SPAWN_INHERITED_PIPE_HOLDER", "1")
+        .env("LPM_TEST_DESCENDANT_PID_FILE", &pid_file)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let started = Instant::now();
+
+    let output = command_output_with_deadline(command, Duration::from_secs(2));
+    let descendant_pid = std::fs::read_to_string(&pid_file)
+        .unwrap()
+        .trim()
+        .parse::<u32>()
+        .unwrap();
+    let cleanup_deadline = Instant::now() + Duration::from_secs(1);
+    while lpm_runner::ports::process_is_running(descendant_pid) && Instant::now() < cleanup_deadline
+    {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    assert!(output.status.success());
+    assert!(started.elapsed() < Duration::from_secs(2));
+    assert!(!lpm_runner::ports::process_is_running(descendant_pid));
+}
+
+#[test]
+#[expect(
+    clippy::zombie_processes,
+    reason = "the fixture must orphan a short-lived descendant that retains the inherited pipes"
+)]
+fn spawn_inherited_pipe_holder_for_deadline_helper() {
+    if std::env::var_os("LPM_TEST_SPAWN_INHERITED_PIPE_HOLDER").is_none() {
+        return;
+    }
+    let pid_file = std::env::var_os("LPM_TEST_DESCENDANT_PID_FILE").unwrap();
+    std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "hold_inherited_pipes_for_deadline_helper",
+            "--nocapture",
+        ])
+        .env("LPM_TEST_HOLD_INHERITED_PIPES", "1")
+        .env("LPM_TEST_DESCENDANT_PID_FILE", &pid_file)
+        .spawn()
+        .unwrap();
+    let pid_file = Path::new(&pid_file);
+    let deadline = Instant::now() + Duration::from_secs(1);
+    while !pid_file.is_file() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(pid_file.is_file());
+}
+
+#[test]
+fn hold_inherited_pipes_for_deadline_helper() {
+    if std::env::var_os("LPM_TEST_HOLD_INHERITED_PIPES").is_some() {
+        let pid_file = std::env::var_os("LPM_TEST_DESCENDANT_PID_FILE").unwrap();
+        std::fs::write(pid_file, std::process::id().to_string()).unwrap();
+        std::thread::sleep(Duration::from_secs(30));
+    }
+}
+
+async fn finish_bounded_tunnel_workflow(
+    output_task: tokio::task::JoinHandle<std::process::Output>,
+    mut relay_task: tokio::task::JoinHandle<()>,
+) -> std::process::Output {
+    let output = match output_task.await {
+        Ok(output) => output,
+        Err(error) => {
+            relay_task.abort();
+            let _ = relay_task.await;
+            panic!("bounded tunnel command task failed: {error}");
+        }
+    };
+    match tokio::time::timeout(Duration::from_secs(2), &mut relay_task).await {
+        Ok(result) => result.expect("local relay task failed"),
+        Err(_) => {
+            relay_task.abort();
+            let _ = relay_task.await;
+            panic!("local relay task did not finish after the tunnel command exited");
+        }
+    }
+    output
 }
 
 // ─── dev: --help dispatches and exits cleanly ─────────────────────────
@@ -128,6 +416,426 @@ server.listen(Number(process.env.PORT), "127.0.0.1", () => {
             && !stderr.contains("▲")
             && !stderr.contains("│"),
         "nested install chatter and legacy glyphs must be absent from dev stderr, got:\n{stderr}"
+    );
+}
+
+#[test]
+fn dev_generic_script_accepts_an_unrelated_compact_short_p_option() {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("reserve generic dev port");
+    let port = listener.local_addr().unwrap().port();
+    drop(listener);
+    let project = TempProject::empty(
+        r#"{"name":"generic-short-p","version":"1.0.0","scripts":{"dev":"node server.js -production"}}"#,
+    );
+    project.write_file(
+        "server.js",
+        r#"
+const http = require('node:http');
+const server = http.createServer((_request, response) => response.end('ok'));
+server.listen(Number(process.env.PORT), '127.0.0.1', () => {
+  setTimeout(() => server.close(), 100);
+});
+"#,
+    );
+    let mut command = lpm_spawnable(&project);
+    command.args([
+        "dev",
+        "--port",
+        &port.to_string(),
+        "--no-install",
+        "--no-open",
+        "--no-dashboard",
+    ]);
+
+    let output = command_output_with_deadline(command, Duration::from_secs(10));
+
+    assert!(
+        output.status.success(),
+        "generic dev command failed:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn dev_wrapped_generic_service_accepts_an_unrelated_separated_short_p_option() {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("reserve wrapped service port");
+    let port = listener.local_addr().unwrap().port();
+    drop(listener);
+    let project = TempProject::empty(
+        r#"{"name":"wrapped-generic-short-p","version":"1.0.0","scripts":{"api":"node server.js"}}"#,
+    );
+    project.write_file(
+        "server.js",
+        r#"
+const http = require('node:http');
+const server = http.createServer((_request, response) => response.end('ok'));
+server.listen(Number(process.env.PORT), '127.0.0.1', () => {
+  setTimeout(() => server.close(), 1500);
+});
+"#,
+    );
+    project.write_file(
+        "lpm.json",
+        &format!(
+            r#"{{"services":{{"api":{{"command":"npm run api -- -p preview","port":{port},"primary":true}}}}}}"#
+        ),
+    );
+    let mut command = lpm_spawnable(&project);
+    command.args(["dev", "--no-install", "--no-open", "--no-dashboard"]);
+
+    let output = command_output_with_deadline(command, Duration::from_secs(10));
+
+    assert!(
+        output.status.success(),
+        "wrapped generic service failed:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn dev_generic_script_rejects_a_conflicting_long_port_option_before_spawning() {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("reserve managed dev port");
+    let port = listener.local_addr().unwrap().port();
+    drop(listener);
+    let project = TempProject::empty(
+        r#"{"name":"generic-long-port","version":"1.0.0","scripts":{"dev":"node server.js --port 4321"}}"#,
+    );
+    project.write_file(
+        "server.js",
+        "require('node:fs').writeFileSync('started', 'yes');",
+    );
+    let mut command = lpm_spawnable(&project);
+    command.args([
+        "dev",
+        "--port",
+        &port.to_string(),
+        "--no-install",
+        "--no-open",
+        "--no-dashboard",
+    ]);
+
+    let output = command_output_with_deadline(command, Duration::from_secs(10));
+
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("conflicts with managed port"));
+    assert!(!project.path().join("started").exists());
+}
+
+#[test]
+fn dev_wrapped_generic_service_rejects_a_conflicting_long_port_option_before_spawning() {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("reserve managed service port");
+    let port = listener.local_addr().unwrap().port();
+    drop(listener);
+    let project = TempProject::empty(
+        r#"{"name":"wrapped-generic-long-port","version":"1.0.0","scripts":{"api":"node server.js"}}"#,
+    );
+    project.write_file(
+        "server.js",
+        "require('node:fs').writeFileSync('started', 'yes');",
+    );
+    project.write_file(
+        "lpm.json",
+        &format!(
+            r#"{{"services":{{"api":{{"command":"npm run api -- --port=4321","port":{port},"primary":true}}}}}}"#
+        ),
+    );
+    let mut command = lpm_spawnable(&project);
+    command.args(["dev", "--no-install", "--no-open", "--no-dashboard"]);
+
+    let output = command_output_with_deadline(command, Duration::from_secs(10));
+
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("conflicts with managed port"));
+    assert!(!project.path().join("started").exists());
+}
+
+#[test]
+fn dev_tunnel_propagates_an_explicit_inspector_port_bind_failure() {
+    let occupied_inspector = TcpListener::bind("127.0.0.1:0").expect("occupy inspector port");
+    let inspector_port = occupied_inspector
+        .local_addr()
+        .expect("read occupied inspector port")
+        .port();
+    let child_listener = TcpListener::bind("127.0.0.1:0").expect("reserve child server port");
+    let child_port = child_listener
+        .local_addr()
+        .expect("read child server port")
+        .port();
+    drop(child_listener);
+
+    let project = TempProject::empty(
+        r#"{"name":"dev-tunnel-bind-failure","version":"1.0.0","scripts":{"dev":"node server.js"}}"#,
+    );
+    project.write_file(
+        "server.js",
+        r#"
+const http = require('http');
+const server = http.createServer((_request, response) => response.end('ok'));
+server.listen(Number(process.env.PORT), '127.0.0.1', () => {
+  console.log(`Local: http://localhost:${process.env.PORT}/`);
+  setTimeout(() => server.close(), 750);
+});
+"#,
+    );
+
+    let output = lpm(&project)
+        .env("LPM_TUNNEL_RELAY", "ws://127.0.0.1:9/connect")
+        .args([
+            "--token",
+            "workflow-token",
+            "dev",
+            "--tunnel",
+            "--inspect-port",
+            &inspector_port.to_string(),
+            "--no-install",
+            "--no-open",
+            "--no-dashboard",
+            "--port",
+            &child_port.to_string(),
+        ])
+        .output()
+        .expect("run dev with an occupied explicit inspector port");
+
+    assert!(
+        !output.status.success(),
+        "fatal tunnel startup errors must determine the dev exit status\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains(&format!(
+            "inspector port {inspector_port} is already in use"
+        )),
+        "dev must report the occupied inspector port\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn dev_tunnel_rejects_an_inspector_port_equal_to_the_dev_port_before_spawning() {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("reserve shared port");
+    let port = listener.local_addr().unwrap().port();
+    drop(listener);
+    let project = TempProject::empty(
+        r#"{"name":"dev-tunnel-same-port","version":"1.0.0","scripts":{"dev":"node server.js"}}"#,
+    );
+    project.write_file(
+        "server.js",
+        "require('node:fs').writeFileSync('child-started', 'yes'); setInterval(() => {}, 1000);\n",
+    );
+    let mut command = lpm_spawnable(&project);
+    command
+        .env("LPM_TUNNEL_RELAY", "ws://127.0.0.1:9/connect")
+        .args([
+            "--token",
+            "workflow-token",
+            "dev",
+            "--tunnel",
+            "--inspect-port",
+            &port.to_string(),
+            "--port",
+            &port.to_string(),
+            "--no-install",
+            "--no-open",
+            "--no-dashboard",
+        ]);
+
+    let output = command_output_with_deadline(command, Duration::from_secs(5));
+
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("conflicts with the dev port"));
+    assert!(!project.file_exists("child-started"));
+}
+
+#[test]
+fn dev_tunnel_rejects_a_configured_service_inspector_port_before_spawning() {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("reserve service port");
+    let port = listener.local_addr().unwrap().port();
+    drop(listener);
+    let project = TempProject::empty(r#"{"name":"dev-tunnel-service-port","version":"1.0.0"}"#);
+    project.write_file(
+        "lpm.json",
+        &format!(
+            r#"{{"services":{{"web":{{"command":"node -e \"require('node:fs').writeFileSync('child-started','yes')\"","port":{port},"primary":true}}}}}}"#
+        ),
+    );
+    let mut command = lpm_spawnable(&project);
+    command
+        .env("LPM_TUNNEL_RELAY", "ws://127.0.0.1:9/connect")
+        .args([
+            "--token",
+            "workflow-token",
+            "dev",
+            "--tunnel",
+            "--inspect-port",
+            &port.to_string(),
+            "--no-install",
+            "--no-open",
+            "--no-dashboard",
+        ]);
+
+    let output = command_output_with_deadline(command, Duration::from_secs(5));
+
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("configured service 'web'"));
+    assert!(!project.file_exists("child-started"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn dev_tunnel_stops_a_long_running_server_when_the_relay_fails() {
+    let relay = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let relay_url = format!("ws://{}/connect", relay.local_addr().unwrap());
+    let relay_task = tokio::spawn(async move {
+        tokio::time::timeout(Duration::from_secs(8), async {
+            let (socket, _) = relay.accept().await.unwrap();
+            let mut websocket = tokio_tungstenite::accept_async(socket).await.unwrap();
+            websocket
+                .send(Message::Text(
+                    serde_json::json!({
+                        "type": "error",
+                        "message": "the account plan does not permit this tunnel",
+                        "code": "plan_required"
+                    })
+                    .to_string(),
+                ))
+                .await
+                .unwrap();
+            websocket.close(None).await.unwrap();
+        })
+        .await
+        .expect("terminal-failure tunnel relay handshake timed out");
+    });
+    let child_listener = TcpListener::bind("127.0.0.1:0").expect("reserve child port");
+    let child_port = child_listener.local_addr().unwrap().port();
+    drop(child_listener);
+    let output_task = tokio::task::spawn_blocking(move || {
+        let project = TempProject::empty(
+            r#"{"name":"dev-tunnel-relay-failure","version":"1.0.0","scripts":{"dev":"node server.js"}}"#,
+        );
+        project.write_file(
+            "server.js",
+            r#"
+const http = require('node:http');
+const server = http.createServer((_request, response) => response.end('ok'));
+server.listen(Number(process.env.PORT), '127.0.0.1', () => {
+  console.log(`Local: http://localhost:${process.env.PORT}/`);
+});
+setInterval(() => {}, 1000);
+"#,
+        );
+        let mut command = lpm_spawnable(&project);
+        command.env("LPM_TUNNEL_RELAY", relay_url).args([
+            "--token",
+            "workflow-token",
+            "dev",
+            "--tunnel",
+            "--no-inspect",
+            "--port",
+            &child_port.to_string(),
+            "--no-install",
+            "--no-open",
+            "--no-dashboard",
+        ]);
+        command_output_with_deadline(command, Duration::from_secs(12))
+    });
+    let started = Instant::now();
+
+    let output = finish_bounded_tunnel_workflow(output_task, relay_task).await;
+
+    assert!(!output.status.success());
+    assert!(started.elapsed() < Duration::from_secs(10));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("Tunnel failed"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn multi_service_dev_stops_when_the_tunnel_fails_after_readiness() {
+    let relay = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let relay_url = format!("ws://{}/connect", relay.local_addr().unwrap());
+    let relay_task = tokio::spawn(async move {
+        tokio::time::timeout(Duration::from_secs(8), async {
+            let (socket, _) = relay.accept().await.unwrap();
+            let mut websocket = tokio_tungstenite::accept_async(socket).await.unwrap();
+            websocket
+                .send(Message::Text(
+                    serde_json::json!({
+                        "type": "hello",
+                        "subdomain": "multi-ready.lpm.test",
+                        "tunnel_url": "https://multi-ready.lpm.test",
+                        "session_id": "session-multi-ready",
+                        "plan": "free",
+                        "base_domain": "lpm.test",
+                        "domain_kind": "random"
+                    })
+                    .to_string(),
+                ))
+                .await
+                .unwrap();
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            websocket
+                .send(Message::Text(
+                    serde_json::json!({
+                        "type": "error",
+                        "message": "relay failed after all services became ready",
+                        "code": "plan_required"
+                    })
+                    .to_string(),
+                ))
+                .await
+                .unwrap();
+            websocket.close(None).await.unwrap();
+        })
+        .await
+        .expect("post-readiness tunnel relay workflow timed out");
+    });
+    let output_task = tokio::task::spawn_blocking(move || {
+        let project =
+            TempProject::empty(r#"{"name":"multi-service-tunnel-failure","version":"1.0.0"}"#);
+        project.write_file(
+            "web.js",
+            r#"
+const http = require('node:http');
+const server = http.createServer((_request, response) => response.end('ok'));
+server.listen(Number(process.env.PORT), '127.0.0.1');
+setInterval(() => {}, 1000);
+"#,
+        );
+        project.write_file("worker.js", "setInterval(() => {}, 1000);\n");
+        project.write_file(
+            "lpm.json",
+            r#"{
+                "services": {
+                    "web": {
+                        "command": "node web.js",
+                        "primary": true,
+                        "readyTimeout": 5
+                    },
+                    "worker": {
+                        "command": "node worker.js"
+                    }
+                }
+            }"#,
+        );
+        let mut command = lpm_spawnable(&project);
+        command.env("LPM_TUNNEL_RELAY", relay_url).args([
+            "--token",
+            "workflow-token",
+            "dev",
+            "--tunnel",
+            "--no-inspect",
+            "--no-install",
+            "--no-open",
+            "--no-dashboard",
+        ]);
+        command_output_with_deadline(command, Duration::from_secs(12))
+    });
+    let started = Instant::now();
+
+    let output = finish_bounded_tunnel_workflow(output_task, relay_task).await;
+
+    assert!(!output.status.success());
+    assert!(started.elapsed() < Duration::from_secs(10));
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("relay failed after all services became ready")
     );
 }
 
@@ -414,44 +1122,44 @@ async fn tunnel_start_under_json_emits_pretty_success_contract_on_stdout() {
     let relay = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let relay_url = format!("ws://{}/connect", relay.local_addr().unwrap());
     let relay_task = tokio::spawn(async move {
-        let (socket, _) = relay.accept().await.unwrap();
-        let mut websocket = tokio_tungstenite::accept_async(socket).await.unwrap();
-        websocket
-            .send(Message::Text(
-                serde_json::json!({
-                    "type": "hello",
-                    "subdomain": "review-test.lpm.test",
-                    "tunnel_url": "https://review-test.lpm.test",
-                    "session_id": "session-review-test",
-                    "plan": "free",
-                    "base_domain": "lpm.test",
-                    "domain_kind": "random"
-                })
-                .to_string(),
-            ))
-            .await
-            .unwrap();
-        websocket.close(None).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(8), async {
+            let (socket, _) = relay.accept().await.unwrap();
+            let mut websocket = tokio_tungstenite::accept_async(socket).await.unwrap();
+            websocket
+                .send(Message::Text(
+                    serde_json::json!({
+                        "type": "hello",
+                        "subdomain": "review-test.lpm.test",
+                        "tunnel_url": "https://review-test.lpm.test",
+                        "session_id": "session-review-test",
+                        "plan": "free",
+                        "base_domain": "lpm.test",
+                        "domain_kind": "random"
+                    })
+                    .to_string(),
+                ))
+                .await
+                .unwrap();
+            websocket.close(None).await.unwrap();
+        })
+        .await
+        .expect("JSON tunnel relay handshake timed out");
     });
 
-    let output = tokio::task::spawn_blocking(move || {
+    let output_task = tokio::task::spawn_blocking(move || {
         let project = TempProject::empty(r#"{"name":"tunnel","version":"1.0.0"}"#);
-        lpm(&project)
-            .env("LPM_TUNNEL_RELAY", relay_url)
-            .args([
-                "--token",
-                "workflow-token",
-                "--json",
-                "tunnel",
-                "5173",
-                "--no-inspect",
-            ])
-            .output()
-            .expect("failed to run lpm --json tunnel 5173")
-    })
-    .await
-    .unwrap();
-    relay_task.await.unwrap();
+        let mut command = lpm_spawnable(&project);
+        command.env("LPM_TUNNEL_RELAY", relay_url).args([
+            "--token",
+            "workflow-token",
+            "--json",
+            "tunnel",
+            "5173",
+            "--no-inspect",
+        ]);
+        command_output_with_deadline(command, Duration::from_secs(12))
+    });
+    let output = finish_bounded_tunnel_workflow(output_task, relay_task).await;
 
     assert!(
         output.status.success(),
@@ -484,6 +1192,64 @@ async fn tunnel_start_under_json_emits_pretty_success_contract_on_stdout() {
       "auto_ack": false
     }
     "#);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tunnel_start_warns_that_capture_history_persists_sensitive_request_data() {
+    let relay = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let relay_url = format!("ws://{}/connect", relay.local_addr().unwrap());
+    let relay_task = tokio::spawn(async move {
+        tokio::time::timeout(Duration::from_secs(8), async {
+            let (socket, _) = relay.accept().await.unwrap();
+            let mut websocket = tokio_tungstenite::accept_async(socket).await.unwrap();
+            websocket
+                .send(Message::Text(
+                    serde_json::json!({
+                        "type": "hello",
+                        "subdomain": "capture-warning.lpm.test",
+                        "tunnel_url": "https://capture-warning.lpm.test",
+                        "session_id": "session-capture-warning",
+                        "plan": "free",
+                        "base_domain": "lpm.test",
+                        "domain_kind": "random"
+                    })
+                    .to_string(),
+                ))
+                .await
+                .unwrap();
+            websocket.close(None).await.unwrap();
+        })
+        .await
+        .expect("capture-warning tunnel relay handshake timed out");
+    });
+
+    let output_task = tokio::task::spawn_blocking(move || {
+        let project = TempProject::empty(r#"{"name":"tunnel","version":"1.0.0"}"#);
+        let mut command = lpm_spawnable(&project);
+        command.env("LPM_TUNNEL_RELAY", relay_url).args([
+            "--token",
+            "workflow-token",
+            "tunnel",
+            "5173",
+            "--no-inspect",
+        ]);
+        command_output_with_deadline(command, Duration::from_secs(12))
+    });
+    let output = finish_bounded_tunnel_workflow(output_task, relay_task).await;
+
+    assert!(
+        output.status.success(),
+        "tunnel command failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("tunnel webhook capture persists full request/response bodies and headers")
+            && stderr.contains(".lpm/inspector.db")
+            && stderr.contains("mode 0600 on Unix")
+            && stderr.contains("project ACLs on Windows"),
+        "human tunnel startup must disclose capture persistence:\n{stderr}"
+    );
 }
 
 #[test]

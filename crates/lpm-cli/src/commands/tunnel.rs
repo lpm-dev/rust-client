@@ -97,6 +97,7 @@ pub async fn run(
                 session_name,
                 Some(&effective_relay_url),
                 token_provider,
+                !json_output,
                 None,
             )
             .await
@@ -125,6 +126,7 @@ pub async fn run(
                     session_name,
                     Some(&effective_relay_url),
                     token_provider,
+                    !json_output,
                     None,
                 )
                 .await;
@@ -357,6 +359,7 @@ pub(crate) async fn run_start(
     session_name: Option<&str>,
     relay_url: Option<&str>,
     token_provider: Option<lpm_tunnel::client::TunnelTokenProvider>,
+    show_capture_warning: bool,
     shutdown: Option<tokio::sync::oneshot::Receiver<()>>,
 ) -> Result<(), LpmError> {
     let token = token.ok_or_else(|| {
@@ -395,6 +398,7 @@ pub(crate) async fn run_start(
     let inspector_db = open_inspector_db(project_dir)?;
     let inspector_state =
         lpm_inspect::state::InspectorState::with_db_for_target(local_target.clone(), inspector_db);
+    warn_capture_persistence(show_capture_warning);
     let inspector_handle = if no_inspect {
         None
     } else {
@@ -648,6 +652,24 @@ pub(crate) async fn run_start(
             tracing::warn!("tunnel capture cleanup failed: {cleanup_error}");
             Err(primary)
         }
+    }
+}
+
+pub(crate) fn warn_capture_persistence(show_human_warning: bool) {
+    tracing::warn!(
+        target: "lpm_cli::tunnel",
+        "tunnel webhook capture persists full request/response bodies and headers \
+         (incl. Authorization, Cookie, *-Signature) in .lpm/inspector.db — the \
+         database uses mode 0600 on Unix and inherits project ACLs on Windows; \
+         it survives commits / backups / IDE indexing. \
+         Add `.lpm/inspector.db*` to .gitignore if you haven't already."
+    );
+    if show_human_warning {
+        install_ui::warn(
+            "tunnel webhook capture persists full request/response bodies and headers \
+             in .lpm/inspector.db (mode 0600 on Unix; project ACLs on Windows). \
+             Add `.lpm/inspector.db*` to .gitignore.",
+        );
     }
 }
 

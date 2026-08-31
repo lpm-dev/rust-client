@@ -4,8 +4,8 @@ use super::cache::{
     resolve_task_dependency_identities, try_cache_hit_with_context, try_cache_store_with_context,
 };
 use super::format::{
-    TaskResult, TaskRunReport, print_captured_stderr, print_captured_stdout, print_json_summary,
-    print_results_summary, print_task_result,
+    TaskResult, TaskRunReport, format_run_failure_detail, print_captured_stderr,
+    print_captured_stdout, print_json_summary, print_results_summary, print_task_result,
 };
 use super::task::{is_meta_task, run_task, run_task_captured};
 use crate::install_ui;
@@ -189,7 +189,8 @@ pub(super) fn run_tasks_sequential(
                 });
                 print_task_result(results.last().unwrap());
             }
-            Err(_) => {
+            Err(error) => {
+                install_ui::detail_line(format_run_failure_detail(script, &error));
                 results.push(TaskResult {
                     name: script.clone(),
                     success: false,

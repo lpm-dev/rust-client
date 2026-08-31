@@ -2,9 +2,9 @@ use super::{
     AllReadyCallback, EndpointChangedCallback, InitialReadinessOptions, InitialServiceReadiness,
     MAX_RESTART_ATTEMPTS, OrchestratorCommand, OrchestratorCommandController, OrchestratorEvent,
     OutputReaderOptions, RED, RESET, ServiceEndpointMap, ServicePortMap, ServiceStatus, YELLOW,
-    command_with_managed_port, invoke_all_ready_callback, send_status, service_ready_port,
-    spawn_output_readers, terminate_service_tree, ui_readiness_timing, ui_service_note,
-    ui_service_status, wait_for_initial_service_readiness,
+    invoke_all_ready_callback, send_status, service_ready_port, spawn_output_readers,
+    terminate_service_tree, ui_readiness_timing, ui_service_note, ui_service_status,
+    wait_for_initial_service_readiness,
 };
 use crate::dev_endpoint::DevEndpoint;
 use crate::lpm_json::ServiceConfig;
@@ -12,7 +12,7 @@ use crate::service_graph;
 use lpm_common::{LpmError, sanitize_terminal_inline};
 use parking_lot::Mutex;
 use std::collections::{HashMap, HashSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Child, ExitStatus, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, Ordering};
@@ -148,6 +148,7 @@ impl ServiceRuntimeState {
 pub(super) struct RecoveryContext<'a> {
     pub(super) project_dir: &'a Path,
     pub(super) active_services: &'a HashMap<String, ServiceConfig>,
+    pub(super) service_cwds: &'a HashMap<String, PathBuf>,
     pub(super) groups: &'a [Vec<String>],
     pub(super) service_runtime_hints: &'a HashMap<String, crate::bin_path::ManagedRuntimeHint>,
     pub(super) dotenv: &'a HashMap<String, String>,
@@ -656,6 +657,19 @@ struct RestartJob {
     readiness: std::thread::JoinHandle<Result<InitialServiceReadiness, String>>,
 }
 
+fn restart_command_with_managed_port(
+    command: &str,
+    cwd: &Path,
+    port: Option<u16>,
+) -> Result<String, String> {
+    let planner = port.map(|_| lpm_cert::framework::CommandPortPlanner::load(cwd));
+    super::command_with_managed_port(command, planner.as_ref(), port)
+}
+
+fn revalidate_restart_cwd(project_dir: &Path, cached_cwd: &Path) -> Result<PathBuf, String> {
+    super::revalidate_service_cwd(project_dir, cached_cwd)
+}
+
 fn start_restart_service(
     context: &RecoveryContext<'_>,
     states: &mut HashMap<String, ServiceRuntimeState>,
@@ -675,16 +689,12 @@ fn start_restart_service(
         ServiceStatus::Starting,
     );
 
-    let cwd = if let Some(subdirectory) = &config.cwd {
-        match super::safe_resolve_cwd(context.project_dir, subdirectory) {
-            Ok(path) => path,
-            Err(error) => {
-                report_restart_failure(context, states, name, &error.to_string(), false);
-                return None;
-            }
+    let cwd = match revalidate_restart_cwd(context.project_dir, context.service_cwds.get(name)?) {
+        Ok(cwd) => cwd,
+        Err(error) => {
+            report_restart_failure(context, states, name, &error, false);
+            return None;
         }
-    } else {
-        context.project_dir.to_path_buf()
     };
 
     let mut env = context.dotenv.clone();
@@ -696,20 +706,28 @@ fn start_restart_service(
         env.insert("PORT".to_string(), port.to_string());
     }
 
-    let service_command =
-        command_with_managed_port(&config.command, &cwd, context.port_map.get(name).copied());
+    let service_command = match restart_command_with_managed_port(
+        &config.command,
+        &cwd,
+        context.port_map.get(name).copied(),
+    ) {
+        Ok(command) => command,
+        Err(error) => {
+            report_restart_failure(context, states, name, &error, false);
+            return None;
+        }
+    };
     let service_runtime_hint = context
         .service_runtime_hints
         .get(name)
         .unwrap_or(&crate::bin_path::ManagedRuntimeHint::Unknown);
-    let service_path =
-        match crate::bin_path::build_path_with_bins_pre_resolved(&cwd, service_runtime_hint) {
-            Ok(path) => path,
-            Err(error) => {
-                report_restart_failure(context, states, name, &error.to_string(), false);
-                return None;
-            }
-        };
+    let service_path = match super::service_path_for_cwd(&cwd, service_runtime_hint) {
+        Ok(path) => path,
+        Err(error) => {
+            report_restart_failure(context, states, name, &error.to_string(), false);
+            return None;
+        }
+    };
     let assigned_port = context.port_map.get(name).copied();
     let mut command = match crate::shell::shell_process(&service_command) {
         Ok(command) => command,
@@ -718,18 +736,21 @@ fn start_restart_service(
             return None;
         }
     };
-    command
-        .current_dir(&cwd)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+    command.stdout(Stdio::piped()).stderr(Stdio::piped());
     super::isolate_service_process_tree(&mut command);
     crate::shell::strip_inherited_env_hooks(&mut command);
-    command.envs(&env).env("PATH", service_path);
+    command.envs(&env);
     for (key, value) in context.extra_envs {
         command.env(key, value);
     }
 
-    let mut new_child = match command.spawn() {
+    let mut new_child = match super::spawn_service_command_with(
+        &mut command,
+        context.project_dir,
+        &cwd,
+        &service_path,
+        || Ok(()),
+    ) {
         Ok(child) => child,
         Err(error) => {
             report_restart_failure(context, states, name, &error.to_string(), false);
@@ -1059,6 +1080,48 @@ mod tests {
                 attempt: 1
             }
         );
+    }
+
+    #[test]
+    fn restart_command_reloads_a_manifest_changed_to_vite() {
+        let project = tempfile::tempdir().unwrap();
+        std::fs::write(
+            project.path().join("package.json"),
+            r#"{"scripts":{"dev":"node server.js"}}"#,
+        )
+        .unwrap();
+        let cached = lpm_cert::framework::CommandPortPlanner::load(project.path());
+        assert_eq!(
+            super::super::command_with_managed_port("npm run dev", Some(&cached), Some(5_174))
+                .unwrap(),
+            "npm run dev"
+        );
+        std::fs::write(
+            project.path().join("package.json"),
+            r#"{"scripts":{"dev":"vite"},"devDependencies":{"vite":"^7.0.0"}}"#,
+        )
+        .unwrap();
+
+        let command =
+            restart_command_with_managed_port("npm run dev", project.path(), Some(5_174)).unwrap();
+
+        assert_eq!(command, "npm run dev -- --port 5174 --strictPort");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn restart_cwd_rejects_a_cached_service_path_replaced_by_an_external_symlink() {
+        let project = tempfile::tempdir().unwrap();
+        let service = project.path().join("service");
+        std::fs::create_dir(&service).unwrap();
+        let cached_cwd = service.canonicalize().unwrap();
+        std::fs::rename(&service, project.path().join("displaced-service")).unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(outside.path(), &service).unwrap();
+
+        let result = revalidate_restart_cwd(project.path(), &cached_cwd);
+
+        assert!(result.is_err(), "restart accepted an out-of-project cwd");
     }
 
     #[test]

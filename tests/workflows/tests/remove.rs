@@ -23,6 +23,17 @@ fn write_source_state(project: &TempProject, packages: serde_json::Value) {
     );
 }
 
+fn write_source_state_v3(project: &TempProject, packages: serde_json::Value) {
+    project.write_file(
+        ".lpm/added-sources.json",
+        &serde_json::to_string_pretty(&json!({
+            "schema_version": 3,
+            "packages": packages,
+        }))
+        .unwrap(),
+    );
+}
+
 fn created_file(content: &[u8]) -> serde_json::Value {
     json!({
         "installed_digest": digest(content),
@@ -309,6 +320,10 @@ async fn remove_reverses_manifest_tracked_custom_path_add_for_bare_package() {
         !project.file_exists("custom/widgets/Foo.tsx"),
         "remove must delete the manifest-tracked custom path file"
     );
+    assert!(
+        !project.path().join("custom/widgets").exists() && !project.path().join("custom").exists(),
+        "remove must prune only the empty directories created by the matching add"
+    );
 }
 
 #[test]
@@ -357,6 +372,202 @@ fn remove_rejects_an_absolute_tracked_path_without_deleting_outside_the_project(
 
     assert!(!output.status.success());
     assert_eq!(std::fs::read(&outside_file).unwrap(), b"outside\n");
+}
+
+#[test]
+fn remove_rejects_forged_directory_ownership_before_mutating_files() {
+    let project = TempProject::empty(r#"{"name":"host","version":"1.0.0"}"#);
+    project.write_file("managed/Source.ts", "managed\n");
+    std::fs::create_dir(project.path().join("user-owned")).unwrap();
+    project.write_file(
+        ".lpm/added-sources.json",
+        &serde_json::to_string_pretty(&json!({
+            "schema_version": 3,
+            "packages": {
+                "source-pkg": {
+                    "files": {
+                        "managed/Source.ts": created_file(b"managed\n")
+                    },
+                    "createdDirectories": ["managed", "user-owned"]
+                }
+            }
+        }))
+        .unwrap(),
+    );
+    let state_before = project.read_file(".lpm/added-sources.json");
+
+    let output = lpm(&project)
+        .args(["remove", "source-pkg"])
+        .output()
+        .expect("remove with forged directory ownership");
+
+    assert!(!output.status.success());
+    assert_eq!(project.read_file("managed/Source.ts"), "managed\n");
+    assert!(project.path().join("user-owned").is_dir());
+    assert_eq!(project.read_file(".lpm/added-sources.json"), state_before);
+}
+
+#[test]
+fn remove_preserves_an_owned_directory_when_its_tracked_descendant_is_already_missing() {
+    let project = TempProject::empty(r#"{"name":"host","version":"1.0.0"}"#);
+    std::fs::create_dir(project.path().join("user-owned")).unwrap();
+    write_source_state_v3(
+        &project,
+        json!({
+            "source-pkg": {
+                "files": {
+                    "user-owned/missing.ts": created_file(b"managed\n")
+                },
+                "createdDirectories": ["user-owned"]
+            }
+        }),
+    );
+
+    lpm(&project)
+        .args(["remove", "source-pkg"])
+        .assert()
+        .success();
+
+    assert!(project.path().join("user-owned").is_dir());
+}
+
+#[cfg(unix)]
+#[test]
+fn remove_rolls_back_when_owned_directory_cleanup_fails_and_succeeds_on_retry() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let project = TempProject::empty(r#"{"name":"host","version":"1.0.0"}"#);
+    project.write_file("legacy/nested/Source.ts", "managed\n");
+    write_source_state_v3(
+        &project,
+        json!({
+            "source-pkg": {
+                "files": {
+                    "legacy/nested/Source.ts": created_file(b"managed\n")
+                },
+                "createdDirectories": ["legacy", "legacy/nested"]
+            }
+        }),
+    );
+    let state_before = project.read_file(".lpm/added-sources.json");
+    let legacy = project.path().join("legacy");
+    std::fs::set_permissions(&legacy, std::fs::Permissions::from_mode(0o555)).unwrap();
+
+    let first = lpm(&project)
+        .args(["remove", "source-pkg"])
+        .output()
+        .expect("remove while the owned parent is not writable");
+
+    assert!(!first.status.success());
+    assert_eq!(project.read_file("legacy/nested/Source.ts"), "managed\n");
+    assert_eq!(project.read_file(".lpm/added-sources.json"), state_before);
+
+    std::fs::set_permissions(&legacy, std::fs::Permissions::from_mode(0o755)).unwrap();
+    lpm(&project)
+        .args(["remove", "source-pkg"])
+        .assert()
+        .success();
+
+    assert!(!legacy.exists());
+    assert!(!project.path().join(".lpm/added-sources.json").exists());
+}
+
+#[test]
+fn remove_transfers_shared_directory_ownership_before_the_original_owner() {
+    let project = TempProject::empty(r#"{"name":"host","version":"1.0.0"}"#);
+    project.write_file("shared/nested/value.ts", "shared\n");
+    write_source_state_v3(
+        &project,
+        json!({
+            "source-a": {
+                "files": {"shared/nested/value.ts": created_file(b"shared\n")},
+                "createdDirectories": ["shared", "shared/nested"]
+            },
+            "source-b": {
+                "files": {"shared/nested/value.ts": created_file(b"shared\n")}
+            }
+        }),
+    );
+
+    lpm(&project)
+        .args(["remove", "source-a"])
+        .assert()
+        .success();
+    let state: serde_json::Value =
+        serde_json::from_str(&project.read_file(".lpm/added-sources.json")).unwrap();
+    assert_eq!(
+        state["packages"]["source-b"]["createdDirectories"],
+        json!(["shared", "shared/nested"])
+    );
+
+    lpm(&project)
+        .args(["remove", "source-b"])
+        .assert()
+        .success();
+    assert!(!project.path().join("shared").exists());
+}
+
+#[test]
+fn remove_cleans_shared_directories_when_the_non_owner_is_removed_first() {
+    let project = TempProject::empty(r#"{"name":"host","version":"1.0.0"}"#);
+    project.write_file("shared/nested/value.ts", "shared\n");
+    write_source_state_v3(
+        &project,
+        json!({
+            "source-a": {
+                "files": {"shared/nested/value.ts": created_file(b"shared\n")},
+                "createdDirectories": ["shared", "shared/nested"]
+            },
+            "source-b": {
+                "files": {"shared/nested/value.ts": created_file(b"shared\n")}
+            }
+        }),
+    );
+
+    lpm(&project)
+        .args(["remove", "source-b"])
+        .assert()
+        .success();
+    assert!(project.file_exists("shared/nested/value.ts"));
+
+    lpm(&project)
+        .args(["remove", "source-a"])
+        .assert()
+        .success();
+    assert!(!project.path().join("shared").exists());
+}
+
+#[test]
+fn remove_retained_files_keep_only_their_relevant_directory_ownership() {
+    let project = TempProject::empty(r#"{"name":"host","version":"1.0.0"}"#);
+    project.write_file("owned/kept/user-edited.ts", "user edit\n");
+    project.write_file("owned/removed/managed.ts", "managed\n");
+    write_source_state_v3(
+        &project,
+        json!({
+            "source-pkg": {
+                "files": {
+                    "owned/kept/user-edited.ts": created_file(b"original managed\n"),
+                    "owned/removed/managed.ts": created_file(b"managed\n")
+                },
+                "createdDirectories": ["owned", "owned/kept", "owned/removed"]
+            }
+        }),
+    );
+
+    lpm(&project)
+        .args(["remove", "source-pkg"])
+        .assert()
+        .success();
+
+    let state: serde_json::Value =
+        serde_json::from_str(&project.read_file(".lpm/added-sources.json")).unwrap();
+    assert_eq!(
+        state["packages"]["source-pkg"]["createdDirectories"],
+        json!(["owned", "owned/kept"])
+    );
+    assert!(project.file_exists("owned/kept/user-edited.ts"));
+    assert!(!project.path().join("owned/removed").exists());
 }
 
 #[cfg(unix)]

@@ -1171,7 +1171,31 @@ fn format_cert_prompt_field(label: &'static str, value: &str) -> install_ui::Ter
 /// fails loudly on `AddrInUse`. `None` auto-picks a free ephemeral port.
 /// `no_inspect` skips the inspector entirely. All three are no-ops when
 /// `tunnel` is false.
-#[allow(clippy::too_many_arguments)]
+fn single_service_managed_port_args(
+    project_dir: &Path,
+    command: &str,
+    port: u16,
+) -> Result<Vec<String>, LpmError> {
+    single_service_managed_port_args_with(
+        project_dir,
+        command,
+        port,
+        lpm_cert::framework::CommandPortPlanner::load,
+    )
+}
+
+fn single_service_managed_port_args_with(
+    project_dir: &Path,
+    command: &str,
+    port: u16,
+    load_planner: impl FnOnce(&Path) -> lpm_cert::framework::CommandPortPlanner,
+) -> Result<Vec<String>, LpmError> {
+    load_planner(project_dir)
+        .managed_port_args(command, port)
+        .map_err(LpmError::Script)
+}
+
+#[expect(clippy::too_many_arguments)]
 pub async fn run(
     client: &lpm_registry::RegistryClient,
     project_dir: &Path,
@@ -1254,6 +1278,11 @@ pub async fn run(
         preflight_service_directories(project_dir, &config.services)?;
     }
     let has_services = lpm_config.as_ref().is_some_and(|c| !c.services.is_empty());
+    let orchestrator_command_controller = lpm_config.as_ref().and_then(|config| {
+        (has_services && (dashboard || tunnel)).then(|| {
+            lpm_runner::orchestrator::OrchestratorCommandController::new(config.services.len())
+        })
+    });
     let single_dev_command = if has_services {
         None
     } else {
@@ -1265,6 +1294,12 @@ pub async fn run(
     };
     let requested_port = port;
     let port = resolve_dev_port(port, has_services);
+    if tunnel
+        && !no_inspect
+        && let Some(inspect_port) = inspect_port
+    {
+        preflight_explicit_inspector_port(inspect_port, port, lpm_config.as_deref())?;
+    }
 
     // Warn about privileged ports that may require elevated permissions
     if is_privileged_port(port) {
@@ -1471,7 +1506,7 @@ pub async fn run(
     };
 
     // ── Tunnel setup ───────────────────────────────────────────────────
-    let mut tunnel_handle: Option<tokio::task::JoinHandle<()>> = None;
+    let mut tunnel_handle: Option<tokio::task::JoinHandle<Result<(), LpmError>>> = None;
     let mut tunnel_shutdown_boundary: Option<TunnelShutdownBoundary> = None;
     let single_tunnel_shutdown_slot = Arc::new(Mutex::new(None::<TunnelShutdownBoundary>));
     let mut capture_consumer_handle: Option<tokio::task::JoinHandle<()>> = None;
@@ -1544,19 +1579,7 @@ pub async fn run(
         let (webhook_tx, mut webhook_rx) =
             tokio::sync::mpsc::channel::<lpm_tunnel::client::CapturedWebhookEvent>(64);
 
-        tracing::warn!(
-            target: "lpm_cli::dev",
-            "tunnel webhook capture persists full request/response bodies and headers \
-             (incl. Authorization, Cookie, *-Signature) in .lpm/inspector.db — the \
-             database is 0o600 locally but survives commits / backups / IDE indexing. \
-             Add `.lpm/inspector.db*` to .gitignore if you haven't already."
-        );
-        if !quiet {
-            dev_ui::warn(
-                "tunnel webhook capture persists full request/response bodies and headers \
-                 in .lpm/inspector.db. Add `.lpm/inspector.db*` to .gitignore.",
-            );
-        }
+        crate::commands::tunnel::warn_capture_persistence(!quiet);
 
         // Dashboard webhook channel: when --dashboard is active, webhooks are
         // forwarded to the dashboard TUI via a std::sync channel.
@@ -1655,17 +1678,18 @@ pub async fn run(
         let usage_for_connect = latest_usage.clone();
         let usage_for_notices = latest_usage;
         let (shutdown_boundary, mut shutdown_rx, tunnel_completion) = TunnelShutdownBoundary::new();
+        let tunnel_failure_controller = orchestrator_command_controller.clone();
         tunnel_shutdown_boundary = Some(shutdown_boundary);
         tunnel_handle = Some(tokio::spawn(async move {
             let _tunnel_completion = tunnel_completion;
             let local_target = tokio::select! {
                 target = target_rx => {
                     let Ok(target) = target else {
-                        return;
+                        return Ok(());
                     };
                     target
                 }
-                _ = &mut shutdown_rx => return,
+                _ = &mut shutdown_rx => return Ok(()),
             };
             let local_target_url = local_target.url();
             options_clone.local_target = local_target.clone();
@@ -1722,7 +1746,7 @@ pub async fn run(
                     connect.await
                 },
             };
-            if let Err(error) = result {
+            if let Err(error) = &result {
                 if let Some(sender) = tunnel_ready_tx
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -1731,7 +1755,11 @@ pub async fn run(
                     let _ = sender.send(Err::<TunnelReadyPublication, String>(error.to_string()));
                 }
                 show_tunnel_notice(&format!("Tunnel failed: {error}"));
+                if let Some(controller) = tunnel_failure_controller.as_ref() {
+                    controller.send(lpm_runner::orchestrator::OrchestratorCommand::StopAll);
+                }
             }
+            result
         }));
     }
 
@@ -1836,9 +1864,6 @@ pub async fn run(
             });
             orch_tx
         });
-
-        let orchestrator_command_controller = dashboard
-            .then(|| lpm_runner::orchestrator::OrchestratorCommandController::new(services.len()));
 
         let proxy_lease = Arc::new(tokio::sync::Mutex::new(None));
         let dashboard_ports_tx = dashboard_event_tx.clone();
@@ -2247,19 +2272,24 @@ pub async fn run(
     let hosts_file_lease = prepare_local_hosts_file(project_dir, &local_domain_hostnames, yes)?;
     let mut script_env = extra_env.clone();
     let child_requested_port = requested_port.filter(|_| !https);
+    let explicit_inspector_port = if tunnel && !no_inspect {
+        inspect_port
+    } else {
+        None
+    };
     let child_port_hint = if https {
-        find_internal_dev_port(port)?
+        find_internal_dev_port_excluding(port, explicit_inspector_port)?
     } else {
         port
     };
     upsert_extra_env(&mut script_env, "PORT", child_port_hint.to_string());
     let mut script_args = extra_args.to_vec();
     if let Some(requested_port) = child_requested_port {
-        script_args.extend(lpm_cert::framework::explicit_port_args_for_command(
+        script_args.extend(single_service_managed_port_args(
             project_dir,
             &dev_command,
             requested_port,
-        ));
+        )?);
     }
 
     let (endpoint_tx, endpoint_rx) = tokio::sync::oneshot::channel();
@@ -2381,12 +2411,14 @@ pub async fn run(
                         None,
                         Some(&tunnel_relay_url),
                         tunnel_token_provider,
+                        !quiet,
                         Some(shutdown_rx),
                     )
                     .await;
-                    if let Err(error) = result {
+                    if let Err(error) = &result {
                         show_tunnel_notice(&format!("Tunnel failed: {error}"));
                     }
+                    result
                 }));
             }
             if let Some(network_port) = active_frontends.network_port {
@@ -2457,11 +2489,41 @@ pub async fn run(
         }
     };
 
-    let script_result = script_handle
-        .await
-        .map_err(|error| LpmError::Script(format!("dev script task panicked: {error}")))?;
-    let tunnel_shutdown_result =
-        shutdown_spawned_tunnel(tunnel_handle, tunnel_shutdown_boundary.as_ref()).await;
+    let (script_result, tunnel_shutdown_result) =
+        if let Some(mut active_tunnel_handle) = tunnel_handle.take() {
+            tokio::select! {
+                script_join = &mut script_handle => {
+                    let script_result = script_join.map_err(|error| {
+                        LpmError::Script(format!("dev script task panicked: {error}"))
+                    })?;
+                    let tunnel_result = shutdown_spawned_tunnel(
+                        Some(active_tunnel_handle),
+                        tunnel_shutdown_boundary.as_ref(),
+                    )
+                    .await;
+                    (script_result, tunnel_result)
+                }
+                tunnel_join = &mut active_tunnel_handle => {
+                    let tunnel_result = match tunnel_join {
+                        Ok(result) => result,
+                        Err(error) if error.is_cancelled() => Ok(()),
+                        Err(error) => Err(LpmError::Tunnel(format!(
+                            "tunnel task failed: {error}"
+                        ))),
+                    };
+                    script_stop_requested.store(true, Ordering::Release);
+                    let script_result = script_handle.await.map_err(|error| {
+                        LpmError::Script(format!("dev script task panicked: {error}"))
+                    })?;
+                    (script_result, tunnel_result)
+                }
+            }
+        } else {
+            let script_result = script_handle
+                .await
+                .map_err(|error| LpmError::Script(format!("dev script task panicked: {error}")))?;
+            (script_result, Ok(()))
+        };
     drop(frontends);
     drop(dev_session_lease);
     let result = release_proxy_lease_after(script_result, &proxy_lease).await;
@@ -2494,6 +2556,63 @@ fn preflight_service_directories(
         }
     }
     Ok(())
+}
+
+fn preflight_explicit_inspector_port(
+    port: u16,
+    dev_port: u16,
+    config: Option<&lpm_runner::lpm_json::LpmJsonConfig>,
+) -> Result<(), LpmError> {
+    if port == dev_port {
+        return Err(LpmError::Tunnel(format!(
+            "inspector port {port} conflicts with the dev port. Pass `--inspect-port <N>` to choose another."
+        )));
+    }
+    if let Some(config) = config {
+        let mut service_names: Vec<_> = config.services.keys().collect();
+        service_names.sort_unstable();
+        for name in service_names {
+            let service = &config.services[name];
+            if service.port == Some(port) {
+                return Err(LpmError::Tunnel(format!(
+                    "inspector port {port} conflicts with configured service '{name}'. Pass `--inspect-port <N>` to choose another."
+                )));
+            }
+            if service.ready_port == Some(port) {
+                return Err(LpmError::Tunnel(format!(
+                    "inspector port {port} conflicts with the readiness port for configured service '{name}'. Pass `--inspect-port <N>` to choose another."
+                )));
+            }
+        }
+        if let Some(proxy) = config.proxy.as_ref() {
+            let proxy_port = proxy.port.unwrap_or(443);
+            if port == proxy_port {
+                return Err(LpmError::Tunnel(format!(
+                    "inspector port {port} conflicts with the configured HTTPS proxy. Pass `--inspect-port <N>` to choose another."
+                )));
+            }
+            if proxy.http_redirect.unwrap_or(true) && port == 80 {
+                return Err(LpmError::Tunnel(
+                    "inspector port 80 conflicts with the configured HTTP redirect listener. Pass `--inspect-port <N>` to choose another."
+                        .to_string(),
+                ));
+            }
+        }
+    }
+    match std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port)) {
+        Ok(listener) => {
+            drop(listener);
+            Ok(())
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::AddrInUse => {
+            Err(LpmError::Tunnel(format!(
+                "inspector port {port} is already in use. Pass `--inspect-port <N>` to choose another, or omit the flag to auto-pick a free port."
+            )))
+        }
+        Err(error) => Err(LpmError::Tunnel(format!(
+            "failed to preflight inspector port {port}: {error}"
+        ))),
+    }
 }
 
 fn startup_proxy_lines_from_config(
@@ -2996,7 +3115,7 @@ async fn release_proxy_lease_after(
 }
 
 async fn shutdown_spawned_tunnel(
-    tunnel_handle: Option<tokio::task::JoinHandle<()>>,
+    tunnel_handle: Option<tokio::task::JoinHandle<Result<(), LpmError>>>,
     shutdown_boundary: Option<&TunnelShutdownBoundary>,
 ) -> Result<(), LpmError> {
     stop_multi_service_tunnel(tunnel_handle, shutdown_boundary).await
@@ -3021,7 +3140,7 @@ async fn wait_for_tunnel_readiness<T>(
 }
 
 async fn stop_multi_service_tunnel(
-    tunnel_handle: Option<tokio::task::JoinHandle<()>>,
+    tunnel_handle: Option<tokio::task::JoinHandle<Result<(), LpmError>>>,
     shutdown_boundary: Option<&TunnelShutdownBoundary>,
 ) -> Result<(), LpmError> {
     let request_result = match shutdown_boundary {
@@ -3031,7 +3150,8 @@ async fn stop_multi_service_tunnel(
     let task_result = match tunnel_handle {
         Some(mut handle) => {
             match tokio::time::timeout(std::time::Duration::from_secs(5), &mut handle).await {
-                Ok(Ok(())) => Ok(()),
+                Ok(Ok(Ok(()))) => Ok(()),
+                Ok(Ok(Err(error))) => Err(error),
                 Ok(Err(error)) if error.is_cancelled() => Ok(()),
                 Ok(Err(error)) => Err(LpmError::Tunnel(format!(
                     "tunnel task failed during shutdown: {error}"
@@ -3042,7 +3162,10 @@ async fn stop_multi_service_tunnel(
                     let timeout_error =
                         LpmError::Tunnel("tunnel did not stop within 5 seconds".to_string());
                     match join_result {
-                        Ok(()) => Err(timeout_error),
+                        Ok(Ok(())) => Err(timeout_error),
+                        Ok(Err(error)) => Err(LpmError::Tunnel(format!(
+                            "{timeout_error}; tunnel task also failed: {error}"
+                        ))),
                         Err(error) if error.is_cancelled() => Err(timeout_error),
                         Err(error) => Err(LpmError::Tunnel(format!(
                             "{timeout_error}; aborting the tunnel task also failed: {error}"
@@ -3058,7 +3181,7 @@ async fn stop_multi_service_tunnel(
 
 async fn cleanup_failed_multi_service_preparation(
     error: LpmError,
-    tunnel_handle: Option<tokio::task::JoinHandle<()>>,
+    tunnel_handle: Option<tokio::task::JoinHandle<Result<(), LpmError>>>,
     shutdown_boundary: Option<&TunnelShutdownBoundary>,
     capture_consumer_handle: Option<tokio::task::JoinHandle<()>>,
     inspector_state: Option<lpm_inspect::state::InspectorState>,
@@ -3775,11 +3898,24 @@ fn resolve_dev_port(requested: Option<u16>, has_services: bool) -> u16 {
     lpm_runner::ports::find_available_port(3000).unwrap_or(3000)
 }
 
-fn find_internal_dev_port(public_port: u16) -> Result<u16, LpmError> {
+fn find_internal_dev_port_excluding(
+    public_port: u16,
+    excluded_port: Option<u16>,
+) -> Result<u16, LpmError> {
+    let find_candidate = |start| {
+        let mut start = start;
+        loop {
+            let port = lpm_runner::ports::find_available_port(start)?;
+            if port != public_port && Some(port) != excluded_port {
+                return Some(port);
+            }
+            start = port.checked_add(1)?;
+        }
+    };
     public_port
         .checked_add(1)
-        .and_then(lpm_runner::ports::find_available_port)
-        .or_else(|| lpm_runner::ports::find_available_port(3000))
+        .and_then(find_candidate)
+        .or_else(|| find_candidate(3000))
         .ok_or_else(|| LpmError::Script("no available internal dev-server port found".to_string()))
 }
 
@@ -4151,6 +4287,49 @@ mod tests {
     use std::collections::HashMap;
     use std::fs;
     use tempfile::TempDir;
+
+    #[test]
+    fn internal_dev_port_excludes_the_explicit_inspector_port() {
+        let (public_port, inspector_port) = (30_000..60_000)
+            .find_map(|public_port| {
+                let public =
+                    std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, public_port))
+                        .ok()?;
+                let inspector_port = public_port.checked_add(1)?;
+                let inspector =
+                    std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, inspector_port))
+                        .ok()?;
+                drop(inspector);
+                drop(public);
+                Some((public_port, inspector_port))
+            })
+            .expect("two consecutive test ports");
+
+        let selected = find_internal_dev_port_excluding(public_port, Some(inspector_port)).unwrap();
+
+        assert_ne!(selected, inspector_port);
+    }
+
+    #[test]
+    fn single_service_port_planning_loads_the_manifest_once() {
+        let project = tempfile::tempdir().unwrap();
+        std::fs::write(
+            project.path().join("package.json"),
+            r#"{"devDependencies":{"vite":"^7.0.0"}}"#,
+        )
+        .unwrap();
+        let loads = std::cell::Cell::new(0);
+
+        let args =
+            single_service_managed_port_args_with(project.path(), "vite", 5174, |directory| {
+                loads.set(loads.get() + 1);
+                lpm_cert::framework::CommandPortPlanner::load(directory)
+            })
+            .unwrap();
+
+        assert_eq!(args, ["--port", "5174", "--strictPort"]);
+        assert_eq!(loads.get(), 1);
+    }
 
     #[cfg(unix)]
     async fn start_proxy_test_upstream(response: &'static str) -> u16 {
