@@ -11170,6 +11170,79 @@ async fn install_prod_omits_dev_dependencies_from_disk_but_keeps_lockfile_entrie
 }
 
 #[tokio::test]
+async fn frozen_offline_combined_omit_retains_required_ambient_peer_for_production_dependency() {
+    let mock = MockRegistry::start().await;
+    mock.with_manifest_package(
+        serde_json::json!({
+            "name": "prod-peer-host",
+            "version": "1.0.0",
+            "peerDependencies": { "prod-peer-provider": "1.0.0" }
+        }),
+        &[],
+    )
+    .await;
+    for package in ["prod-peer-provider", "dev-only", "optional-only"] {
+        mock.with_manifest_package(
+            serde_json::json!({ "name": package, "version": "1.0.0" }),
+            &[],
+        )
+        .await;
+    }
+
+    let project = TempProject::empty(
+        r#"{
+        "name": "offline-combined-omit-peer",
+        "version": "1.0.0",
+        "dependencies": { "prod-peer-host": "1.0.0" },
+        "devDependencies": { "dev-only": "1.0.0" },
+        "optionalDependencies": { "optional-only": "1.0.0" }
+    }"#,
+    );
+
+    lpm_with_registry(&project, &mock.url())
+        .args([
+            "install",
+            "--prod",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .assert()
+        .success();
+    assertions::assert_in_node_modules(project.path(), "prod-peer-provider");
+
+    std::fs::remove_dir_all(project.path().join("node_modules"))
+        .expect("remove node_modules before frozen offline replay");
+    lpm_with_registry(&project, &mock.url())
+        .args([
+            "install",
+            "--offline",
+            "--frozen-lockfile",
+            "--omit=dev,optional",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .assert()
+        .success();
+
+    assertions::assert_in_node_modules(project.path(), "prod-peer-host");
+    assert!(
+        project
+            .path()
+            .join("node_modules/prod-peer-provider/package.json")
+            .exists(),
+        "frozen offline combined omission must preserve the production host's required ambient peer\nlockfile:\n{}",
+        project.read_file("lpm.lock")
+    );
+    assert!(
+        !project.path().join("node_modules/dev-only").exists()
+            && !project.path().join("node_modules/optional-only").exists(),
+        "combined omission must remove only the dev and optional roots"
+    );
+}
+
+#[tokio::test]
 async fn install_omit_dev_after_full_install_does_not_use_up_to_date_fast_path() {
     let mock = MockRegistry::start().await;
     let prod_tarball = make_tarball("prod-only", "1.0.0");
