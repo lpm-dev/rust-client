@@ -3562,20 +3562,10 @@ mod tests {
         );
     }
 
-    #[cfg(unix)]
-    fn test_directory_identity(path: &Path) -> (u64, u64) {
-        use std::os::unix::fs::MetadataExt as _;
-
-        let metadata = std::fs::metadata(path).unwrap();
-        (metadata.dev(), metadata.ino())
-    }
-
-    #[cfg(windows)]
-    fn test_directory_identity(path: &Path) -> (Option<u32>, Option<u64>) {
-        use std::os::windows::fs::MetadataExt as _;
-
-        let metadata = std::fs::metadata(path).unwrap();
-        (metadata.volume_serial_number(), metadata.file_index())
+    #[cfg(any(unix, windows))]
+    fn test_directory_identity(path: &Path) -> crate::directory_transaction::DirectoryIdentity {
+        let directory = Dir::open_ambient_dir(path, cap_std::ambient_authority()).unwrap();
+        directory_identity(&directory).unwrap()
     }
 
     #[test]

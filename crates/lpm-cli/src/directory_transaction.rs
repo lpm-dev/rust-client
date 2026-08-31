@@ -1,23 +1,24 @@
+#[cfg(not(windows))]
 use cap_fs_ext::DirExt as _;
 use cap_std::fs::Dir;
 use std::ffi::{OsStr, OsString};
 
 #[cfg(unix)]
-#[derive(Clone, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct DirectoryIdentity {
     device: u64,
     inode: u64,
 }
 
 #[cfg(windows)]
-#[derive(Clone, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct DirectoryIdentity {
     volume: u32,
     file_index: u64,
 }
 
 #[cfg(not(any(unix, windows)))]
-#[derive(Clone, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct DirectoryIdentity;
 
 #[cfg(unix)]
