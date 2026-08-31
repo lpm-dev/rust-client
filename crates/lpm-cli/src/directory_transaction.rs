@@ -12,8 +12,8 @@ pub(crate) struct DirectoryIdentity {
 #[cfg(windows)]
 #[derive(Clone, Eq, PartialEq)]
 pub(crate) struct DirectoryIdentity {
-    volume: Option<u32>,
-    file_index: Option<u64>,
+    volume: u32,
+    file_index: u64,
 }
 
 #[cfg(not(any(unix, windows)))]
@@ -33,25 +33,40 @@ pub(crate) fn directory_identity(directory: &Dir) -> std::io::Result<DirectoryId
 
 #[cfg(windows)]
 pub(crate) fn directory_identity(directory: &Dir) -> std::io::Result<DirectoryIdentity> {
-    use cap_std::fs::MetadataExt as _;
+    use std::os::windows::io::AsRawHandle as _;
+    use windows_sys::Win32::Storage::FileSystem::{
+        BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle,
+    };
 
-    let metadata = directory.dir_metadata()?;
-    let (volume, file_index) =
-        windows_directory_identity_fields(metadata.volume_serial_number(), metadata.file_index())?;
+    let mut information = BY_HANDLE_FILE_INFORMATION::default();
+    let result = unsafe {
+        // SAFETY: `directory` owns a valid handle and `information` is writable.
+        GetFileInformationByHandle(
+            directory.as_raw_handle(),
+            std::ptr::addr_of_mut!(information),
+        )
+    };
+    if result == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let (volume, file_index) = windows_directory_identity_fields(
+        information.dwVolumeSerialNumber,
+        information.nFileIndexHigh,
+        information.nFileIndexLow,
+    );
     Ok(DirectoryIdentity { volume, file_index })
 }
 
 #[cfg(any(test, windows))]
 fn windows_directory_identity_fields(
-    volume: Option<u32>,
-    file_index: Option<u64>,
-) -> std::io::Result<(Option<u32>, Option<u64>)> {
-    if volume.is_none() || file_index.is_none() {
-        return Err(std::io::Error::other(
-            "stable Windows directory identity is unavailable",
-        ));
-    }
-    Ok((volume, file_index))
+    volume: u32,
+    file_index_high: u32,
+    file_index_low: u32,
+) -> (u32, u64) {
+    (
+        volume,
+        (u64::from(file_index_high) << 32) | u64::from(file_index_low),
+    )
 }
 
 #[cfg(not(any(unix, windows)))]
@@ -207,15 +222,16 @@ fn create_and_open_private_directory(parent: &Dir, name: &OsStr) -> std::io::Res
         FILE_CREATE, FILE_DIRECTORY_FILE, FILE_SYNCHRONOUS_IO_NONALERT, NtCreateFile,
     };
     use windows_sys::Win32::Foundation::{
-        DELETE, GENERIC_READ, GENERIC_WRITE, HANDLE, LocalFree, OBJ_CASE_INSENSITIVE,
-        RtlNtStatusToDosError, SYNCHRONIZE, UNICODE_STRING,
+        GENERIC_READ, GENERIC_WRITE, HANDLE, LocalFree, OBJ_CASE_INSENSITIVE,
+        RtlNtStatusToDosError, UNICODE_STRING,
     };
     use windows_sys::Win32::Security::Authorization::{
         ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
     };
     use windows_sys::Win32::Security::{PSECURITY_DESCRIPTOR, SECURITY_DESCRIPTOR};
     use windows_sys::Win32::Storage::FileSystem::{
-        FILE_ATTRIBUTE_NORMAL, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+        DELETE, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+        SYNCHRONIZE,
     };
     use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
 
@@ -577,10 +593,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn windows_directory_identity_rejects_unavailable_fields() {
-        assert!(windows_directory_identity_fields(None, None).is_err());
-        assert!(windows_directory_identity_fields(Some(7), None).is_err());
-        assert!(windows_directory_identity_fields(None, Some(11)).is_err());
+    fn windows_directory_identity_combines_the_full_file_index() {
+        assert_eq!(
+            windows_directory_identity_fields(7, 0x1122_3344, 0x5566_7788),
+            (7, 0x1122_3344_5566_7788)
+        );
     }
 
     #[cfg(any(unix, windows))]
