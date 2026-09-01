@@ -456,7 +456,8 @@ jobs:
       - release-preflight
       - verify-windows-filesystem
     if: >-
-      always() &&
+      !cancelled() &&
+      needs.release-metadata.result == 'success' &&
       needs.release-metadata.outputs.should_release == 'true' &&
       needs.release-preflight.result == 'success' &&
       needs.verify-windows-filesystem.result == 'success' &&
@@ -862,6 +863,9 @@ jobs:
       - build
       - release-metadata
     if: >-
+      !cancelled() &&
+      needs.build.result == 'success' &&
+      needs.release-metadata.result == 'success' &&
       needs.release-metadata.outputs.should_release == 'true' &&
       (needs.release-metadata.outputs.mode == 'candidate' || needs.release-metadata.outputs.mode == 'full')
     runs-on: ${{ matrix.os }}
@@ -1093,7 +1097,8 @@ jobs:
       - release-preflight
       - verify-windows-filesystem
     if: >-
-      always() &&
+      !cancelled() &&
+      needs.release-metadata.result == 'success' &&
       needs.release-metadata.outputs.should_release == 'true' &&
       needs.release-preflight.result == 'success' &&
       needs.verify-windows-filesystem.result == 'success' &&
@@ -1149,6 +1154,9 @@ jobs:
       - build-windows
       - release-metadata
     if: >-
+      !cancelled() &&
+      needs.build-windows.result == 'success' &&
+      needs.release-metadata.result == 'success' &&
       needs.release-metadata.outputs.should_release == 'true' &&
       (needs.release-metadata.outputs.mode == 'candidate' || needs.release-metadata.outputs.mode == 'full')
     runs-on: windows-latest
@@ -1253,6 +1261,11 @@ jobs:
       - sign-windows
       - release-metadata
     if: >-
+      !cancelled() &&
+      needs.build.result == 'success' &&
+      needs.notarize-macos.result == 'success' &&
+      needs.sign-windows.result == 'success' &&
+      needs.release-metadata.result == 'success' &&
       needs.release-metadata.outputs.should_release == 'true' &&
       (needs.release-metadata.outputs.mode == 'candidate' || needs.release-metadata.outputs.mode == 'full')
     runs-on: ubuntu-latest
@@ -1331,6 +1344,9 @@ jobs:
       - pack-npm-packages
       - release-metadata
     if: >-
+      !cancelled() &&
+      needs.pack-npm-packages.result == 'success' &&
+      needs.release-metadata.result == 'success' &&
       needs.release-metadata.outputs.should_release == 'true' &&
       (needs.release-metadata.outputs.mode == 'candidate' || needs.release-metadata.outputs.mode == 'full')
     runs-on: ${{ matrix.os }}
@@ -1469,6 +1485,10 @@ jobs:
       - release-metadata
       - smoke-npm-packages
     if: >-
+      !cancelled() &&
+      needs.build.result == 'success' &&
+      needs.release-metadata.result == 'success' &&
+      needs.smoke-npm-packages.result == 'success' &&
       needs.release-metadata.outputs.should_release == 'true' &&
       (needs.release-metadata.outputs.mode == 'candidate' || needs.release-metadata.outputs.mode == 'full')
     runs-on: ubuntu-latest
@@ -1603,6 +1623,9 @@ jobs:
       - release
       - release-metadata
     if: >-
+      !cancelled() &&
+      needs.release.result == 'success' &&
+      needs.release-metadata.result == 'success' &&
       needs.release-metadata.outputs.should_release == 'true' &&
       (needs.release-metadata.outputs.mode == 'candidate' || needs.release-metadata.outputs.mode == 'full')
     runs-on: ${{ matrix.os }}
