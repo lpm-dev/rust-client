@@ -70,6 +70,7 @@ impl RegistryClient {
         Self::deserialize_cached_metadata_as(data)
     }
 
+    #[cfg(test)]
     pub(super) fn deserialize_cached_metadata_as<T: serde::de::DeserializeOwned>(
         data: &[u8],
     ) -> Option<T> {
@@ -409,9 +410,11 @@ impl RegistryClient {
             pending_cache_write_bytes: Arc::new(tokio::sync::Semaphore::new(
                 super::cache::MAX_PENDING_METADATA_CACHE_BYTES,
             )),
+            metadata_cache_mutations: Arc::new(std::sync::Mutex::new(HashMap::new())),
             metadata_memory_cache: None,
             release_time_memory_cache: None,
             metadata_route_overrides: None,
+            metadata_command_cache_policies: None,
             synchronous_cache_writes: false,
             allow_insecure: false,
             session: None,
@@ -882,9 +885,14 @@ impl RegistryClient {
             // queued by ANY clone of this client.
             pending_cache_writes: Arc::clone(&self.pending_cache_writes),
             pending_cache_write_bytes: Arc::clone(&self.pending_cache_write_bytes),
+            metadata_cache_mutations: Arc::clone(&self.metadata_cache_mutations),
             metadata_memory_cache: self.metadata_memory_cache.as_ref().map(Arc::clone),
             release_time_memory_cache: self.release_time_memory_cache.as_ref().map(Arc::clone),
             metadata_route_overrides: self.metadata_route_overrides.as_ref().map(Arc::clone),
+            metadata_command_cache_policies: self
+                .metadata_command_cache_policies
+                .as_ref()
+                .map(Arc::clone),
             synchronous_cache_writes: self.synchronous_cache_writes,
             allow_insecure: self.allow_insecure,
             session: self.session.clone(),
@@ -906,6 +914,8 @@ impl RegistryClient {
         client.metadata_memory_cache = Some(Arc::new(std::sync::Mutex::new(HashMap::new())));
         client.release_time_memory_cache = Some(Arc::new(std::sync::Mutex::new(HashMap::new())));
         client.metadata_route_overrides = Some(Arc::new(std::sync::Mutex::new(HashMap::new())));
+        client.metadata_command_cache_policies =
+            Some(Arc::new(std::sync::Mutex::new(HashMap::new())));
         client
     }
 
@@ -915,6 +925,7 @@ impl RegistryClient {
         self.metadata_memory_cache = None;
         self.release_time_memory_cache = None;
         self.metadata_route_overrides = None;
+        self.metadata_command_cache_policies = None;
         self
     }
 

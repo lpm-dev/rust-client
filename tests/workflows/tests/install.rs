@@ -15418,6 +15418,275 @@ async fn recursive_fresh_resolution_matches_metadata_cache_warm_resolution() {
     );
 }
 
+#[tokio::test]
+async fn legacy_metadata_cache_schema_cannot_change_install_lockfile() {
+    use sha2::{Digest as _, Sha256};
+
+    fn project_fixture() -> TempProject {
+        TempProject::empty(
+            r#"{
+  "name": "legacy-metadata-cache-schema",
+  "version": "1.0.0",
+  "dependencies": { "metadata-schema-package": "1.0.0" }
+}"#,
+        )
+    }
+
+    fn install(project: &TempProject, registry_url: &str) -> std::process::Output {
+        lpm_with_registry(project, registry_url)
+            .args([
+                "install",
+                "--policy",
+                "deny",
+                "--no-security-summary",
+                "--no-skills",
+                "--no-editor-setup",
+            ])
+            .output()
+            .expect("run metadata-schema install")
+    }
+
+    let mock = MockRegistry::start().await;
+    let registry_url = mock.url();
+    let package_name = "metadata-schema-package";
+    let version = "1.0.0";
+    let etag = "\"metadata-schema-v1\"";
+    let unpacked_size = 4096;
+    let tarball = make_tarball(package_name, version);
+    let integrity = compute_integrity(&tarball);
+    let current_metadata = serde_json::json!({
+        "name": package_name,
+        "dist-tags": { "latest": version },
+        "versions": {
+            version: {
+                "name": package_name,
+                "version": version,
+                "dist": {
+                    "tarball": mock.tarball_url(package_name, version),
+                    "integrity": integrity,
+                    "unpackedSize": unpacked_size
+                },
+                "dependencies": {}
+            }
+        },
+        "time": { version: "2025-01-01T00:00:00.000Z" }
+    });
+    let mut legacy_metadata = current_metadata.clone();
+    legacy_metadata["versions"][version]["dist"]
+        .as_object_mut()
+        .expect("legacy dist metadata must be an object")
+        .remove("unpackedSize");
+
+    mock.with_batch_metadata(Vec::new()).await;
+    let current_metadata_for_response = current_metadata.clone();
+    Mock::given(method("GET"))
+        .and(path(format!("/api/registry/{package_name}")))
+        .respond_with(move |request: &wiremock::Request| {
+            if request.headers.get("if-none-match").is_some() {
+                return ResponseTemplate::new(304);
+            }
+            ResponseTemplate::new(200)
+                .set_body_json(&current_metadata_for_response)
+                .append_header("etag", etag)
+                .append_header("cache-control", "max-age=300")
+        })
+        .expect(2)
+        .mount(mock.server())
+        .await;
+    Mock::given(method("GET"))
+        .and(path(MockRegistry::tarball_path(package_name, version)))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_bytes(tarball)
+                .insert_header("content-type", "application/octet-stream"),
+        )
+        .expect(2)
+        .mount(mock.server())
+        .await;
+
+    let clean = project_fixture();
+    let legacy = project_fixture();
+    let cache_key = format!(
+        "npm-worker:{}:{registry_url}:anon:{package_name}",
+        registry_url.len()
+    );
+    let mut cache_path_hash = Sha256::new();
+    cache_path_hash.update(cache_key.as_bytes());
+    let cache_filename = format!("{:x}", cache_path_hash.finalize());
+    let cache_dir = legacy.cache_dir().join("metadata");
+    std::fs::create_dir_all(&cache_dir).expect("create legacy metadata cache directory");
+    let cache_path = cache_dir.join(&cache_filename[..16]);
+    let mut cache_entry = format!("LPM-MD-V3\n{etag}\n").into_bytes();
+    cache_entry.extend(
+        rmp_serde::to_vec_named(&legacy_metadata).expect("serialize legacy metadata payload"),
+    );
+    std::fs::write(&cache_path, cache_entry).expect("write legacy metadata cache entry");
+    std::fs::File::options()
+        .write(true)
+        .open(&cache_path)
+        .expect("open legacy metadata cache entry")
+        .set_times(
+            std::fs::FileTimes::new()
+                .set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(600)),
+        )
+        .expect("expire legacy metadata cache entry");
+
+    let clean_output = install(&clean, &registry_url);
+    assert!(
+        clean_output.status.success(),
+        "clean-cache install failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&clean_output.stdout),
+        String::from_utf8_lossy(&clean_output.stderr)
+    );
+    let legacy_output = install(&legacy, &registry_url);
+    assert!(
+        legacy_output.status.success(),
+        "legacy-cache install failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&legacy_output.stdout),
+        String::from_utf8_lossy(&legacy_output.stderr)
+    );
+
+    let clean_lockfile =
+        std::fs::read(clean.path().join("lpm.lock")).expect("read clean-cache install lockfile");
+    let legacy_lockfile =
+        std::fs::read(legacy.path().join("lpm.lock")).expect("read legacy-cache install lockfile");
+    assert_eq!(
+        legacy_lockfile, clean_lockfile,
+        "schema-old metadata cache state must not change lockfile bytes"
+    );
+    let parsed = lpm_lockfile::Lockfile::read_for_project(legacy.path())
+        .expect("read legacy-cache lockfile")
+        .lockfile;
+    assert_eq!(
+        parsed.packages[0]
+            .unpacked_size
+            .map(std::num::NonZeroU64::get),
+        Some(unpacked_size)
+    );
+}
+
+#[tokio::test]
+async fn forced_resolution_preserves_prior_unpacked_size_for_same_registry_artifact() {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+
+    let mock = MockRegistry::start().await;
+    let package_name = "stable-unpacked-size";
+    let version = "1.0.0";
+    let unpacked_size = 8192;
+    let tarball = make_tarball(package_name, version);
+    let integrity = compute_integrity(&tarball);
+    let metadata_with_size = serde_json::json!({
+        "name": package_name,
+        "dist-tags": { "latest": version },
+        "versions": {
+            version: {
+                "name": package_name,
+                "version": version,
+                "dist": {
+                    "tarball": mock.tarball_url(package_name, version),
+                    "integrity": integrity,
+                    "unpackedSize": unpacked_size
+                },
+                "dependencies": {}
+            }
+        },
+        "time": { version: "2025-01-01T00:00:00.000Z" }
+    });
+    let mut metadata_without_size = metadata_with_size.clone();
+    metadata_without_size["versions"][version]["dist"]
+        .as_object_mut()
+        .expect("dist metadata must be an object")
+        .remove("unpackedSize");
+
+    mock.with_batch_metadata(Vec::new()).await;
+    let response_index = Arc::new(AtomicUsize::new(0));
+    let response_index_for_request = Arc::clone(&response_index);
+    Mock::given(method("GET"))
+        .and(path(format!("/api/registry/{package_name}")))
+        .respond_with(move |_request: &wiremock::Request| {
+            let body = if response_index_for_request.fetch_add(1, Ordering::SeqCst) == 0 {
+                &metadata_with_size
+            } else {
+                &metadata_without_size
+            };
+            ResponseTemplate::new(200)
+                .set_body_json(body)
+                .append_header("cache-control", "no-store")
+        })
+        .expect(2)
+        .mount(mock.server())
+        .await;
+    Mock::given(method("GET"))
+        .and(path(MockRegistry::tarball_path(package_name, version)))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_bytes(tarball)
+                .insert_header("content-type", "application/octet-stream"),
+        )
+        .mount(mock.server())
+        .await;
+
+    let project = TempProject::empty(
+        r#"{
+  "name": "stable-unpacked-size-project",
+  "version": "1.0.0",
+  "dependencies": { "stable-unpacked-size": "1.0.0" }
+}"#,
+    );
+    let first = lpm_with_registry(&project, &mock.url())
+        .args([
+            "install",
+            "--policy",
+            "deny",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .output()
+        .expect("run initial unpacked-size install");
+    assert!(
+        first.status.success(),
+        "initial unpacked-size install failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&first.stdout),
+        String::from_utf8_lossy(&first.stderr)
+    );
+
+    let second = lpm_with_registry(&project, &mock.url())
+        .args([
+            "install",
+            "--force",
+            "--policy",
+            "deny",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .output()
+        .expect("run forced unpacked-size install");
+    assert!(
+        second.status.success(),
+        "forced unpacked-size install failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&second.stdout),
+        String::from_utf8_lossy(&second.stderr)
+    );
+
+    let lockfile = lpm_lockfile::Lockfile::read_for_project(project.path())
+        .expect("read forced-resolution lockfile")
+        .lockfile;
+    let package = lockfile
+        .packages
+        .iter()
+        .find(|package| package.name == package_name)
+        .expect("stable artifact must be present in the lockfile");
+    assert_eq!(
+        package.unpacked_size.map(std::num::NonZeroU64::get),
+        Some(unpacked_size)
+    );
+}
+
 /// `lpm install --offline` re-runs the workspace-member BFS expansion
 /// rather than skipping it — pre-fix the offline branch handed the
 /// extracted top-level slice straight to `run_link_and_finish` and the

@@ -1,10 +1,23 @@
 use super::*;
 
-pub(super) type MetadataMemoryCache = Arc<std::sync::Mutex<HashMap<String, Arc<PackageMetadata>>>>;
+pub(super) struct MetadataMemoryEntry<T> {
+    pub(super) value: Arc<T>,
+    pub(super) expires_at: std::time::Instant,
+}
+
+pub(super) type MetadataMemoryCache =
+    Arc<std::sync::Mutex<HashMap<String, MetadataMemoryEntry<PackageMetadata>>>>;
 pub(super) type ReleaseTimeMemoryCache =
-    Arc<std::sync::Mutex<HashMap<String, Arc<ReleaseTimeMetadata>>>>;
+    Arc<std::sync::Mutex<HashMap<String, MetadataMemoryEntry<ReleaseTimeMetadata>>>>;
 pub(super) type MetadataRouteOverrides =
     Arc<std::sync::Mutex<HashMap<String, crate::route::RouteMode>>>;
+#[derive(Clone, Copy)]
+pub(super) enum MetadataCommandCachePolicy {
+    StoreUntil(std::time::Instant),
+    NoStore,
+}
+pub(super) type MetadataCommandCachePolicies =
+    Arc<std::sync::Mutex<HashMap<String, MetadataCommandCachePolicy>>>;
 pub(super) const MAX_NPMRC_TLS_CLIENT_SETS: usize = 64;
 const HTTP_CLIENTS_PER_TLS_SET: u64 = 3;
 
@@ -303,9 +316,10 @@ pub struct TimedReleaseTimeMetadata {
 }
 
 /// Magic-verified cache content: ETag + raw data bytes ready for deserialization.
+#[cfg(test)]
 pub(super) struct CacheContent {
-    #[cfg(test)]
     pub(super) etag: Option<String>,
+    pub(super) fresh_for: std::time::Duration,
     pub(super) data: Vec<u8>,
 }
 
@@ -313,6 +327,17 @@ pub(super) struct CacheContent {
 pub(super) struct CacheValidator {
     pub(super) etag: Option<String>,
     pub(super) age_seconds: Option<u64>,
+}
+
+pub(super) struct MetadataCacheEntry<T> {
+    pub(super) value: T,
+    pub(super) etag: Option<String>,
+    pub(super) remaining_freshness: std::time::Duration,
+}
+
+pub(super) struct MetadataCacheMutation {
+    pub(super) revision: std::sync::atomic::AtomicU64,
+    pub(super) operation: std::sync::Mutex<()>,
 }
 
 /// Observability for [`RegistryClient::parallel_fetch_npm_manifests`].
@@ -359,6 +384,8 @@ pub struct RegistryClient {
     /// Cache writes are best-effort and are skipped when a cold metadata
     /// burst would exceed this bound.
     pub(super) pending_cache_write_bytes: Arc<tokio::sync::Semaphore>,
+    pub(super) metadata_cache_mutations:
+        Arc<std::sync::Mutex<HashMap<std::path::PathBuf, Arc<MetadataCacheMutation>>>>,
     /// Optional command-scoped immutable packument cache. Recursive
     /// workspace installs enable it on client clones so independent
     /// importer resolvers can reuse one parsed registry response without
@@ -366,6 +393,7 @@ pub struct RegistryClient {
     pub(super) metadata_memory_cache: Option<MetadataMemoryCache>,
     pub(super) release_time_memory_cache: Option<ReleaseTimeMemoryCache>,
     pub(super) metadata_route_overrides: Option<MetadataRouteOverrides>,
+    pub(super) metadata_command_cache_policies: Option<MetadataCommandCachePolicies>,
     /// When set, `write_metadata_cache` runs the file write inline on the
     /// calling thread instead of spawning it onto
     /// `tokio::task::spawn_blocking`. Used by mock-server tests where

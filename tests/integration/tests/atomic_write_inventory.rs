@@ -271,6 +271,10 @@ const REVIEWED_RAW_ATOMIC_WRITERS: &[(&str, &str)] = &[
         "publishes an engine directory created under the engine installation lock",
     ),
     (
+        "crates/lpm-registry/src/client/cache.rs::write_metadata_cache_file",
+        "exclusively creates new entries and replaces existing entries from a randomized same-directory NamedTempFile while holding the per-path operation lock",
+    ),
+    (
         "crates/lpm-runner/src/dlx.rs::migrate_legacy_dlx_cache",
         "moves existing package directories during a cache-layout migration",
     ),

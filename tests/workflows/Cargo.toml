@@ -62,6 +62,7 @@ base64 = { workspace = true }
 rand = { workspace = true }
 scrypt = { workspace = true }
 sha2 = "0.10"
+rmp-serde = { workspace = true }
 p256 = { workspace = true }
 hex = { workspace = true }
 hmac = { workspace = true }

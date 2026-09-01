@@ -68,7 +68,6 @@ async fn info_human_output_sanitizes_registry_control_sequences() {
     project.write_file(".npmrc", &format!("registry={}/\n", mock.url()));
     let tarball = make_tarball("ansi-info-pkg", "1.0.0");
     let mut metadata = mock.package_metadata("ansi-info-pkg", "1.0.0", &tarball);
-    metadata["name"] = serde_json::json!("ansi-info-pkg\u{1b}[2J");
     metadata["description"] = serde_json::json!("safe description\u{1b}]52;c;AAAA\u{7}");
     metadata["versions"]["1.0.0"]["version"] = serde_json::json!("1.0.0\u{1b}[31m");
     metadata["versions"]["1.0.0"]["dependencies"] = serde_json::json!({

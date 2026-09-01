@@ -10,6 +10,8 @@ FAKE_LPM="$TMP_DIR/fake-lpm"
 ARGS_FILE="$TMP_DIR/args.txt"
 ENV_FILE="$TMP_DIR/env.txt"
 CWD_FILE="$TMP_DIR/cwd.txt"
+VALIDATOR_FILE="$TMP_DIR/validators.txt"
+STALE_FILE="$TMP_DIR/stale.txt"
 
 cat > "$FAKE_LPM" <<'SH'
 #!/bin/bash
@@ -18,6 +20,27 @@ printf '%s\n' "$*" >> "$LPM_TEST_ARGS_FILE"
 printf 'HOME=%s\nLPM_HOME=%s\nLPM_NPM_ROUTE=%s\nLPM_STORE_VERSION=%s\n' \
   "$HOME" "$LPM_HOME" "$LPM_NPM_ROUTE" "$LPM_STORE_VERSION" >> "$LPM_TEST_ENV_FILE"
 pwd >> "$LPM_TEST_CWD_FILE"
+cache_dir="$LPM_HOME/cache/metadata"
+if [[ -d "$cache_dir" ]]; then
+	for cache_entry in "$cache_dir"/*; do
+		if [[ -f "$cache_entry" ]]; then
+			sed -n '3p' "$cache_entry" >> "$LPM_TEST_VALIDATOR_FILE"
+			if [[ "$(sed -n '3p' "$cache_entry")" == '"lpm-local-stale-bench"' ]]; then
+				python3 - "$cache_entry" "$LPM_TEST_STALE_FILE" <<'PY'
+import pathlib
+import sys
+
+if pathlib.Path(sys.argv[1]).stat().st_mtime < 978307200:
+    pathlib.Path(sys.argv[2]).write_text("stale\n", encoding="utf-8")
+PY
+			fi
+		fi
+	done
+fi
+mkdir -p "$cache_dir"
+if ! find "$cache_dir" -maxdepth 1 -type f | grep -q .; then
+	printf 'LPM-MD-V4\n300\n"local-install-etag"\npayload' > "$cache_dir/entry"
+fi
 cat <<'JSON'
 {
   "success": true,
@@ -45,6 +68,8 @@ export LPM_BIN="$FAKE_LPM"
 export LPM_TEST_ARGS_FILE="$ARGS_FILE"
 export LPM_TEST_ENV_FILE="$ENV_FILE"
 export LPM_TEST_CWD_FILE="$CWD_FILE"
+export LPM_TEST_VALIDATOR_FILE="$VALIDATOR_FILE"
+export LPM_TEST_STALE_FILE="$STALE_FILE"
 
 RUNS=1 \
 BENCH_WORK_DIR="$TMP_DIR/work" \
@@ -71,6 +96,8 @@ grep -Fq "HOME=$TMP_DIR/work/" "$ENV_FILE"
 grep -Fq "LPM_HOME=$TMP_DIR/work/" "$ENV_FILE"
 grep -Fq "$TMP_DIR/work/" "$CWD_FILE"
 grep -Fq '/project' "$CWD_FILE"
+grep -Fxq '"lpm-local-stale-bench"' "$VALIDATOR_FILE"
+grep -Fxq 'stale' "$STALE_FILE"
 
 if grep -Fxq "HOME=$HOME" "$ENV_FILE"; then
 	echo "local install bench leaked the real HOME" >&2

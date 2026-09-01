@@ -137,24 +137,40 @@ make_cache_stale() {
 poison_metadata_etags() {
 	python3 - "$HOME_DIR/.lpm/cache/metadata" <<'PY'
 import pathlib
+import os
+import re
 import sys
 
 cache_dir = pathlib.Path(sys.argv[1])
 if not cache_dir.exists():
     raise SystemExit(0)
 
-magic = b"LPM-MD-V3\n"
 for path in cache_dir.iterdir():
     if not path.is_file():
         continue
     content = path.read_bytes()
-    if not content.startswith(magic):
+    magic_end = content.find(b"\n")
+    if magic_end < 0:
         continue
-    rest = content[len(magic):]
-    newline = rest.find(b"\n")
-    if newline < 0:
+    magic = content[:magic_end + 1]
+    match = re.fullmatch(rb"LPM-MD-V([0-9]+)\n", magic)
+    if match is None:
         continue
-    path.write_bytes(magic + b'"lpm-local-stale-bench"\n' + rest[newline + 1:])
+    rest = content[magic_end + 1:]
+    if int(match.group(1)) >= 4:
+        freshness_end = rest.find(b"\n")
+        if freshness_end < 0:
+            continue
+        prefix = magic + rest[:freshness_end + 1]
+        rest = rest[freshness_end + 1:]
+    else:
+        prefix = magic
+    etag_end = rest.find(b"\n")
+    if etag_end < 0:
+        continue
+    timestamps = path.stat()
+    path.write_bytes(prefix + b'"lpm-local-stale-bench"\n' + rest[etag_end + 1:])
+    os.utime(path, ns=(timestamps.st_atime_ns, timestamps.st_mtime_ns))
 PY
 }
 

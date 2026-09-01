@@ -79,6 +79,7 @@ impl<'de> serde::Deserialize<'de> for LenientJsonBatchPackages {
 struct NdjsonBatchEntryStream {
     response: reqwest::Response,
     cache_entries: bool,
+    cache_directive: MetadataCacheDirective,
     cache_principal: String,
     allowed_names: Option<std::collections::HashSet<String>>,
     buffer: Vec<u8>,
@@ -107,9 +108,11 @@ impl NdjsonBatchEntryStream {
                 "NDJSON batch: declared body length {declared} exceeds cap {MAX_METADATA_BYTES}"
             )));
         }
+        let cache_directive = RegistryClient::metadata_cache_directive(response.headers());
         Ok(Self {
             response,
             cache_entries,
+            cache_directive,
             cache_principal,
             allowed_names,
             buffer: Vec::new(),
@@ -265,7 +268,12 @@ impl NdjsonBatchEntryStream {
             let cache_key =
                 client.batch_metadata_cache_key_for_principal(&name, &self.cache_principal);
             let write_start = std::time::Instant::now();
-            client.write_metadata_cache(&cache_key, &meta, None);
+            client.write_metadata_cache_with_directive(
+                &cache_key,
+                &meta,
+                None,
+                self.cache_directive,
+            );
             self.cache_write_ns += write_start.elapsed().as_nanos();
         }
         self.received += 1;
@@ -698,11 +706,11 @@ impl RegistryClient {
         &self,
         name: &str,
         metadata_cache_key: &str,
-    ) -> Option<ReleaseTimeMetadata> {
-        let (cached, _etag) = self
-            .read_metadata_cache_as_async::<ReleaseTimeMetadata>(metadata_cache_key)
+    ) -> Option<MetadataCacheEntry<ReleaseTimeMetadata>> {
+        let cached = self
+            .read_metadata_cache_entry_as_async::<ReleaseTimeMetadata>(metadata_cache_key)
             .await?;
-        (cached.matches_package(name) && !cached.time.is_empty()).then_some(cached)
+        (cached.value.matches_package(name) && !cached.value.time.is_empty()).then_some(cached)
     }
 
     async fn send_package_metadata_request(
@@ -757,7 +765,7 @@ impl RegistryClient {
         namespace: &str,
         name: &str,
         use_validator: bool,
-    ) -> Result<(reqwest::Response, String), LpmError> {
+    ) -> Result<(reqwest::Response, String, Option<CacheValidator>), LpmError> {
         self.execute_with_recovery(AuthPosture::AuthRequired, || async {
             let bearer = self.current_bearer(AuthPosture::AuthRequired)?;
             let cache_key = self.metadata_cache_key_for_origin(
@@ -777,7 +785,7 @@ impl RegistryClient {
             }
             let request = Self::apply_cached_etag(request, cache_validator.as_ref());
             let response = self.send_package_metadata_request(request).await?;
-            Ok((response, cache_key))
+            Ok((response, cache_key, cache_validator))
         })
         .await
     }
@@ -806,24 +814,71 @@ impl RegistryClient {
         )
     }
 
-    async fn cached_metadata_after_304_as<T>(&self, cache_key: &str) -> Option<T>
+    async fn cached_metadata_after_304_as<T, F>(
+        &self,
+        cache_key: &str,
+        response: &reqwest::Response,
+        validator: Option<&CacheValidator>,
+        is_valid: F,
+    ) -> Option<MetadataCacheEntry<T>>
     where
-        T: serde::de::DeserializeOwned + Send + 'static,
+        T: serde::de::DeserializeOwned + serde::Serialize + Send + 'static,
+        F: FnOnce(&T) -> bool,
     {
+        let validator_etag = validator?.etag.as_deref()?;
         let path = self.cache_path(cache_key)?;
-        tokio::task::spawn_blocking(move || {
-            let content = Self::read_cache_content_path(&path)?;
-            let meta = Self::deserialize_cached_metadata_as::<T>(&content.data)?;
-            let _ = filetime::set_file_mtime(&path, filetime::FileTime::now());
-            Some(meta)
+        let (value, cached_etag, cached_fresh_for) = tokio::task::spawn_blocking(move || {
+            Self::read_stale_metadata_cache_path_as::<T>(&path)
         })
         .await
         .ok()
-        .flatten()
+        .flatten()?;
+        if cached_etag.as_deref() != Some(validator_etag) {
+            return None;
+        }
+        if !is_valid(&value) {
+            self.invalidate_metadata_cache_key(cache_key);
+            return None;
+        }
+        let directive = match Self::metadata_cache_directive(response.headers()) {
+            MetadataCacheDirective::Unspecified => MetadataCacheDirective::Store {
+                fresh_for: cached_fresh_for,
+            },
+            directive => directive,
+        };
+        let response_etag = Self::response_etag(response);
+        let effective_etag = response_etag.as_deref().or(cached_etag.as_deref());
+        let can_refresh_in_place = matches!(
+            directive,
+            MetadataCacheDirective::Store { fresh_for }
+                if fresh_for == cached_fresh_for
+                    && effective_etag == cached_etag.as_deref()
+        );
+        let remaining_freshness = if can_refresh_in_place {
+            self.refresh_metadata_cache_freshness(cache_key, cached_fresh_for)
+        } else {
+            self.write_metadata_cache_with_directive(cache_key, &value, effective_etag, directive)
+        }
+        .unwrap_or_default();
+        Some(MetadataCacheEntry {
+            value,
+            etag: response_etag.or(cached_etag),
+            remaining_freshness,
+        })
     }
 
-    async fn cached_metadata_after_304(&self, cache_key: &str) -> Option<PackageMetadata> {
-        self.cached_metadata_after_304_as(cache_key).await
+    async fn cached_metadata_after_304<F>(
+        &self,
+        cache_key: &str,
+        response: &reqwest::Response,
+        validator: Option<&CacheValidator>,
+        is_valid: F,
+    ) -> Option<MetadataCacheEntry<PackageMetadata>>
+    where
+        F: FnOnce(&PackageMetadata) -> bool,
+    {
+        self.cached_metadata_after_304_as(cache_key, response, validator, is_valid)
+            .await
     }
 
     /// Fetch metadata for multiple packages in a single HTTP request.
@@ -1188,6 +1243,7 @@ impl RegistryClient {
         cache_principal: &str,
         allowed_names: Option<&std::collections::HashSet<String>>,
     ) -> Result<std::collections::HashMap<String, PackageMetadata>, LpmError> {
+        let cache_directive = Self::metadata_cache_directive(response.headers());
         let response: JsonBatchResponse = parse_capped_metadata(response, "batch metadata").await?;
         let packages = response
             .packages
@@ -1207,7 +1263,7 @@ impl RegistryClient {
 
             if cache_entries {
                 let cache_key = self.batch_metadata_cache_key_for_principal(&name, cache_principal);
-                self.write_metadata_cache(&cache_key, &meta, None);
+                self.write_metadata_cache_with_directive(&cache_key, &meta, None, cache_directive);
             }
             map.insert(name, meta);
         }
@@ -1355,13 +1411,19 @@ impl RegistryClient {
                     {
                         timings.not_modified = true;
                         let cache_304_start = std::time::Instant::now();
-                        if let Some(meta) = self.cached_metadata_after_304(&attempt_cache_key).await
-                            && batch_metadata_entry_matches_name(scoped_ref, &meta)
+                        if let Some(cached) = self
+                            .cached_metadata_after_304(
+                                &attempt_cache_key,
+                                &response,
+                                cache_validator.as_ref(),
+                                |metadata| batch_metadata_entry_matches_name(scoped_ref, metadata),
+                            )
+                            .await
                         {
                             timings.cache_after_304_ms = cache_304_start.elapsed().as_millis();
                             tracing::debug!("metadata cache revalidated (304): {}", name.scoped());
                             return Ok(TimedPackageMetadata {
-                                metadata: meta,
+                                metadata: cached.value,
                                 timings,
                             });
                         }
@@ -1382,11 +1444,8 @@ impl RegistryClient {
                             .saturating_add(retry_http_start.elapsed().as_millis());
                     }
 
-                    let etag = response
-                        .headers()
-                        .get("etag")
-                        .and_then(|v| v.to_str().ok())
-                        .map(|s| s.to_string());
+                    let etag = Self::response_etag(&response);
+                    let cache_directive = Self::metadata_cache_directive(response.headers());
 
                     let (metadata, body_timings) =
                         parse_capped_metadata_with_timing::<PackageMetadata>(
@@ -1404,7 +1463,12 @@ impl RegistryClient {
                     timings.body_bytes = body_timings.body_bytes;
 
                     let cache_write_start = std::time::Instant::now();
-                    self.write_metadata_cache(&attempt_cache_key, &metadata, etag.as_deref());
+                    self.write_metadata_cache_with_directive(
+                        &attempt_cache_key,
+                        &metadata,
+                        etag.as_deref(),
+                        cache_directive,
+                    );
                     timings.cache_write_dispatch_ms = cache_write_start.elapsed().as_millis();
                     Ok(TimedPackageMetadata { metadata, timings })
                 }
@@ -1465,15 +1529,21 @@ impl RegistryClient {
             .send_worker_metadata_get_scoped(&proxy_url, None, "npm-worker", name, true)
             .await
         {
-            Ok((mut response, mut response_cache_key)) => {
+            Ok((mut response, mut response_cache_key, response_cache_validator)) => {
                 if response.status() == reqwest::StatusCode::NOT_MODIFIED {
-                    if let Some(meta) = self.cached_metadata_after_304(&response_cache_key).await
-                        && batch_metadata_entry_matches_name(name, &meta)
+                    if let Some(cached) = self
+                        .cached_metadata_after_304(
+                            &response_cache_key,
+                            &response,
+                            response_cache_validator.as_ref(),
+                            |metadata| batch_metadata_entry_matches_name(name, metadata),
+                        )
+                        .await
                     {
                         tracing::debug!("metadata cache revalidated (304): npm:{name}");
-                        return finish!(Ok(meta));
+                        return finish!(Ok(cached.value));
                     }
-                    (response, response_cache_key) = self
+                    (response, response_cache_key, _) = self
                         .send_worker_metadata_get_scoped(
                             &proxy_url,
                             None,
@@ -1486,6 +1556,7 @@ impl RegistryClient {
 
                 if response.status().is_success() {
                     let etag = Self::response_etag(&response);
+                    let cache_directive = Self::metadata_cache_directive(response.headers());
 
                     if let Ok(metadata) = parse_capped_metadata::<PackageMetadata>(
                         response,
@@ -1502,7 +1573,12 @@ impl RegistryClient {
                             Err(error) => return finish!(Err(error)),
                         };
                         tracing::debug!("fetched {name} via LPM upstream proxy");
-                        self.write_metadata_cache(&response_cache_key, &metadata, etag.as_deref());
+                        self.write_metadata_cache_with_directive(
+                            &response_cache_key,
+                            &metadata,
+                            etag.as_deref(),
+                            cache_directive,
+                        );
                         return finish!(Ok(metadata));
                     }
                 }
@@ -1545,11 +1621,17 @@ impl RegistryClient {
             Err(e) => return finish!(Err(e)),
         };
         if response.status() == reqwest::StatusCode::NOT_MODIFIED {
-            if let Some(metadata) = self.cached_metadata_after_304(&direct_cache_key).await
-                && batch_metadata_entry_matches_name(name, &metadata)
+            if let Some(cached) = self
+                .cached_metadata_after_304(
+                    &direct_cache_key,
+                    &response,
+                    direct_cache_validator.as_ref(),
+                    |metadata| batch_metadata_entry_matches_name(name, metadata),
+                )
+                .await
             {
                 tracing::debug!("metadata cache revalidated (direct fallback 304): npm:{name}");
-                return finish!(Ok(metadata));
+                return finish!(Ok(cached.value));
             }
             response = match self
                 .send_package_metadata_request(
@@ -1566,6 +1648,7 @@ impl RegistryClient {
             };
         }
         let etag = Self::response_etag(&response);
+        let cache_directive = Self::metadata_cache_directive(response.headers());
         let metadata_res = parse_capped_metadata::<PackageMetadata>(
             response,
             &format!("get_npm_package_metadata (direct) {name}"),
@@ -1580,7 +1663,12 @@ impl RegistryClient {
                 Ok(metadata) => metadata,
                 Err(error) => return finish!(Err(error)),
             };
-        self.write_metadata_cache(&direct_cache_key, &metadata, etag.as_deref());
+        self.write_metadata_cache_with_directive(
+            &direct_cache_key,
+            &metadata,
+            etag.as_deref(),
+            cache_directive,
+        );
         finish!(Ok(metadata))
     }
 
@@ -1640,16 +1728,22 @@ impl RegistryClient {
 
         let cache_read_start = std::time::Instant::now();
         if cache_policy == MetadataCachePolicy::UseFresh
-            && let Some((cached, _etag)) = self.read_metadata_cache_async(&cache_key).await
-            && batch_metadata_entry_matches_name(name, &cached)
+            && let Some(cached) = self
+                .read_metadata_cache_entry_as_async::<PackageMetadata>(&cache_key)
+                .await
+            && batch_metadata_entry_matches_name(name, &cached.value)
         {
             timings.cache_read_ms = cache_read_start.elapsed().as_millis();
             timings.cache_hit = true;
             crate::timing::record_metadata_cache_hit();
             tracing::debug!("metadata cache hit (direct): npm:{name}");
-            self.remember_metadata_for_command(&memory_cache_key, &cached);
+            self.remember_metadata_for_command(
+                &memory_cache_key,
+                &cached.value,
+                cached.remaining_freshness,
+            );
             return Ok(TimedPackageMetadata {
-                metadata: cached,
+                metadata: cached.value,
                 timings,
             });
         }
@@ -1670,17 +1764,23 @@ impl RegistryClient {
         }
         let coalesced_read_start = std::time::Instant::now();
         if cache_policy == MetadataCachePolicy::UseFresh
-            && let Some((cached, _etag)) = self.read_metadata_cache_async(&cache_key).await
-            && batch_metadata_entry_matches_name(name, &cached)
+            && let Some(cached) = self
+                .read_metadata_cache_entry_as_async::<PackageMetadata>(&cache_key)
+                .await
+            && batch_metadata_entry_matches_name(name, &cached.value)
         {
             timings.cache_read_ms = timings
                 .cache_read_ms
                 .saturating_add(coalesced_read_start.elapsed().as_millis());
             timings.cache_hit = true;
             tracing::debug!("metadata cache hit (direct, coalesced): npm:{name}");
-            self.remember_metadata_for_command(&memory_cache_key, &cached);
+            self.remember_metadata_for_command(
+                &memory_cache_key,
+                &cached.value,
+                cached.remaining_freshness,
+            );
             return Ok(TimedPackageMetadata {
-                metadata: cached,
+                metadata: cached.value,
                 timings,
             });
         }
@@ -1728,13 +1828,26 @@ impl RegistryClient {
         if response.status() == reqwest::StatusCode::NOT_MODIFIED {
             timings.not_modified = true;
             let cache_304_start = std::time::Instant::now();
-            if let Some(metadata) = self.cached_metadata_after_304(&cache_key).await
-                && batch_metadata_entry_matches_name(name, &metadata)
+            if let Some(cached) = self
+                .cached_metadata_after_304(
+                    &cache_key,
+                    &response,
+                    cache_validator.as_ref(),
+                    |metadata| batch_metadata_entry_matches_name(name, metadata),
+                )
+                .await
             {
                 timings.cache_after_304_ms = cache_304_start.elapsed().as_millis();
                 tracing::debug!("metadata cache revalidated (direct 304): npm:{name}");
-                self.remember_metadata_for_command(&memory_cache_key, &metadata);
-                return finish!(Ok(TimedPackageMetadata { metadata, timings }));
+                self.remember_metadata_for_command(
+                    &memory_cache_key,
+                    &cached.value,
+                    cached.remaining_freshness,
+                );
+                return finish!(Ok(TimedPackageMetadata {
+                    metadata: cached.value,
+                    timings,
+                }));
             }
             timings.cache_after_304_ms = cache_304_start.elapsed().as_millis();
             timings.not_modified = false;
@@ -1758,6 +1871,7 @@ impl RegistryClient {
             };
         }
         let etag = Self::response_etag(&response);
+        let cache_directive = Self::metadata_cache_directive(response.headers());
         let (metadata, body_timings) = match parse_capped_metadata_with_timing::<PackageMetadata>(
             response,
             &format!("get_npm_metadata_direct {name}"),
@@ -1776,9 +1890,18 @@ impl RegistryClient {
         timings.json_decode_ms = body_timings.json_parse_ms;
         timings.body_bytes = body_timings.body_bytes;
         let cache_write_start = std::time::Instant::now();
-        self.write_metadata_cache(&cache_key, &metadata, etag.as_deref());
+        self.write_metadata_cache_with_directive(
+            &cache_key,
+            &metadata,
+            etag.as_deref(),
+            cache_directive,
+        );
         timings.cache_write_dispatch_ms = cache_write_start.elapsed().as_millis();
-        self.remember_metadata_for_command(&memory_cache_key, &metadata);
+        self.remember_metadata_for_command(
+            &memory_cache_key,
+            &metadata,
+            cache_directive.local_freshness().unwrap_or_default(),
+        );
         finish!(Ok(TimedPackageMetadata { metadata, timings }))
     }
 
@@ -1866,17 +1989,23 @@ impl RegistryClient {
         if response.status() == reqwest::StatusCode::NOT_MODIFIED {
             timings.not_modified = true;
             let cache_304_start = std::time::Instant::now();
-            if let Some(metadata) = self.cached_metadata_after_304(&cache_key).await {
+            if let Some(cached) = self
+                .cached_metadata_after_304(
+                    &cache_key,
+                    &response,
+                    cache_validator.as_ref(),
+                    |metadata| package_metadata_matches_version_doc(name, version, metadata),
+                )
+                .await
+            {
                 timings.cache_after_304_ms = cache_304_start.elapsed().as_millis();
-                if package_metadata_matches_version_doc(name, version, &metadata) {
-                    tracing::debug!(
-                        "metadata cache revalidated (direct version 304): npm:{name}@{version}"
-                    );
-                    return finish!(Ok(TimedPackageMetadata { metadata, timings }));
-                }
                 tracing::debug!(
-                    "metadata cache mismatch after direct version 304: npm:{name}@{version}; refetching"
+                    "metadata cache revalidated (direct version 304): npm:{name}@{version}"
                 );
+                return finish!(Ok(TimedPackageMetadata {
+                    metadata: cached.value,
+                    timings,
+                }));
             }
             timings.cache_after_304_ms = cache_304_start.elapsed().as_millis();
             let req = self
@@ -1897,6 +2026,7 @@ impl RegistryClient {
             };
         }
         let etag = Self::response_etag(&response);
+        let cache_directive = Self::metadata_cache_directive(response.headers());
         let (version_metadata, body_timings) =
             match parse_capped_metadata_with_timing_limit::<VersionMetadata>(
                 response,
@@ -1916,7 +2046,12 @@ impl RegistryClient {
             Err(e) => return finish!(Err(e)),
         };
         let cache_write_start = std::time::Instant::now();
-        self.write_metadata_cache(&cache_key, &metadata, etag.as_deref());
+        self.write_metadata_cache_with_directive(
+            &cache_key,
+            &metadata,
+            etag.as_deref(),
+            cache_directive,
+        );
         timings.cache_write_dispatch_ms = cache_write_start.elapsed().as_millis();
         finish!(Ok(TimedPackageMetadata { metadata, timings }))
     }
@@ -1959,16 +2094,22 @@ impl RegistryClient {
             )
             .await
         {
-            Ok((mut response, mut response_cache_key))
+            Ok((mut response, mut response_cache_key, response_cache_validator))
                 if response.status() == reqwest::StatusCode::NOT_MODIFIED =>
             {
-                if let Some(metadata) = self.cached_metadata_after_304(&response_cache_key).await
-                    && batch_metadata_entry_matches_name(name, &metadata)
+                if let Some(cached) = self
+                    .cached_metadata_after_304(
+                        &response_cache_key,
+                        &response,
+                        response_cache_validator.as_ref(),
+                        |metadata| batch_metadata_entry_matches_name(name, metadata),
+                    )
+                    .await
                 {
                     tracing::debug!("metadata cache revalidated (full proxy 304): npm:{name}");
-                    return finish!(Ok(metadata));
+                    return finish!(Ok(cached.value));
                 }
-                (response, response_cache_key) = self
+                (response, response_cache_key, _) = self
                     .send_worker_metadata_get_scoped(
                         &proxy_url,
                         Some("application/json"),
@@ -1982,6 +2123,7 @@ impl RegistryClient {
                     })?;
                 if response.status().is_success() {
                     let etag = Self::response_etag(&response);
+                    let cache_directive = Self::metadata_cache_directive(response.headers());
                     if let Ok(metadata) = parse_capped_metadata::<PackageMetadata>(
                         response,
                         &format!("get_npm_package_metadata_full (proxy) {name}"),
@@ -1996,13 +2138,19 @@ impl RegistryClient {
                             Ok(metadata) => metadata,
                             Err(error) => return finish!(Err(error)),
                         };
-                        self.write_metadata_cache(&response_cache_key, &metadata, etag.as_deref());
+                        self.write_metadata_cache_with_directive(
+                            &response_cache_key,
+                            &metadata,
+                            etag.as_deref(),
+                            cache_directive,
+                        );
                         return finish!(Ok(metadata));
                     }
                 }
             }
-            Ok((response, response_cache_key)) if response.status().is_success() => {
+            Ok((response, response_cache_key, _)) if response.status().is_success() => {
                 let etag = Self::response_etag(&response);
+                let cache_directive = Self::metadata_cache_directive(response.headers());
                 if let Ok(metadata) = parse_capped_metadata::<PackageMetadata>(
                     response,
                     &format!("get_npm_package_metadata_full (proxy) {name}"),
@@ -2017,7 +2165,12 @@ impl RegistryClient {
                         Ok(metadata) => metadata,
                         Err(error) => return finish!(Err(error)),
                     };
-                    self.write_metadata_cache(&response_cache_key, &metadata, etag.as_deref());
+                    self.write_metadata_cache_with_directive(
+                        &response_cache_key,
+                        &metadata,
+                        etag.as_deref(),
+                        cache_directive,
+                    );
                     return finish!(Ok(metadata));
                 }
             }
@@ -2047,13 +2200,19 @@ impl RegistryClient {
             Err(e) => return finish!(Err(e)),
         };
         if response.status() == reqwest::StatusCode::NOT_MODIFIED {
-            if let Some(metadata) = self.cached_metadata_after_304(&direct_cache_key).await
-                && batch_metadata_entry_matches_name(name, &metadata)
+            if let Some(cached) = self
+                .cached_metadata_after_304(
+                    &direct_cache_key,
+                    &response,
+                    direct_cache_validator.as_ref(),
+                    |metadata| batch_metadata_entry_matches_name(name, metadata),
+                )
+                .await
             {
                 tracing::debug!(
                     "metadata cache revalidated (full direct fallback 304): npm:{name}"
                 );
-                return finish!(Ok(metadata));
+                return finish!(Ok(cached.value));
             }
             response = match self
                 .send_package_metadata_request(
@@ -2070,6 +2229,7 @@ impl RegistryClient {
             };
         }
         let etag = Self::response_etag(&response);
+        let cache_directive = Self::metadata_cache_directive(response.headers());
         let metadata = match parse_capped_metadata::<PackageMetadata>(
             response,
             &format!("get_npm_package_metadata_full (direct) {name}"),
@@ -2084,7 +2244,12 @@ impl RegistryClient {
                 Ok(metadata) => metadata,
                 Err(error) => return finish!(Err(error)),
             };
-        self.write_metadata_cache(&direct_cache_key, &metadata, etag.as_deref());
+        self.write_metadata_cache_with_directive(
+            &direct_cache_key,
+            &metadata,
+            etag.as_deref(),
+            cache_directive,
+        );
         finish!(Ok(metadata))
     }
 
@@ -2151,11 +2316,17 @@ impl RegistryClient {
             Err(e) => return finish!(Err(e)),
         };
         if use_cache && response.status() == reqwest::StatusCode::NOT_MODIFIED {
-            if let Some(metadata) = self.cached_metadata_after_304(&cache_key).await
-                && batch_metadata_entry_matches_name(name, &metadata)
+            if let Some(cached) = self
+                .cached_metadata_after_304(
+                    &cache_key,
+                    &response,
+                    cache_validator.as_ref(),
+                    |metadata| batch_metadata_entry_matches_name(name, metadata),
+                )
+                .await
             {
                 tracing::debug!("metadata cache revalidated (direct full 304): npm:{name}");
-                return finish!(Ok(metadata));
+                return finish!(Ok(cached.value));
             }
             response = match self
                 .send_package_metadata_request(
@@ -2172,6 +2343,7 @@ impl RegistryClient {
             };
         }
         let etag = Self::response_etag(&response);
+        let cache_directive = Self::metadata_cache_directive(response.headers());
         let metadata = match parse_capped_metadata::<PackageMetadata>(
             response,
             &format!("get_npm_metadata_direct_full {name}"),
@@ -2186,7 +2358,12 @@ impl RegistryClient {
                 Ok(metadata) => metadata,
                 Err(error) => return finish!(Err(error)),
             };
-        self.write_metadata_cache(&cache_key, &metadata, etag.as_deref());
+        self.write_metadata_cache_with_directive(
+            &cache_key,
+            &metadata,
+            etag.as_deref(),
+            cache_directive,
+        );
         finish!(Ok(metadata))
     }
 
@@ -2241,7 +2418,7 @@ impl RegistryClient {
         }
 
         let proxy_url = format!("{}/api/registry/{}", self.base_url, name);
-        let (mut response, mut response_cache_key) = match self
+        let (mut response, mut response_cache_key, response_cache_validator) = match self
             .send_worker_metadata_get_scoped(&proxy_url, None, "npm-worker", name, true)
             .await
         {
@@ -2249,13 +2426,19 @@ impl RegistryClient {
             Err(err) => return finish!(Err(err)),
         };
         if response.status() == reqwest::StatusCode::NOT_MODIFIED {
-            if let Some(meta) = self.cached_metadata_after_304(&response_cache_key).await
-                && batch_metadata_entry_matches_name(name, &meta)
+            if let Some(cached) = self
+                .cached_metadata_after_304(
+                    &response_cache_key,
+                    &response,
+                    response_cache_validator.as_ref(),
+                    |metadata| batch_metadata_entry_matches_name(name, metadata),
+                )
+                .await
             {
                 tracing::debug!("metadata cache revalidated (proxy-only 304): npm:{name}");
-                return finish!(Ok(meta));
+                return finish!(Ok(cached.value));
             }
-            (response, response_cache_key) = match self
+            (response, response_cache_key, _) = match self
                 .send_worker_metadata_get_scoped(&proxy_url, None, "npm-worker", name, false)
                 .await
             {
@@ -2269,6 +2452,7 @@ impl RegistryClient {
             .get("etag")
             .and_then(|value| value.to_str().ok())
             .map(str::to_string);
+        let cache_directive = Self::metadata_cache_directive(response.headers());
         let metadata = match parse_capped_metadata::<PackageMetadata>(
             response,
             &format!("get_npm_package_metadata_proxy_only {name}"),
@@ -2283,7 +2467,12 @@ impl RegistryClient {
                 Ok(metadata) => metadata,
                 Err(error) => return finish!(Err(error)),
             };
-        self.write_metadata_cache(&response_cache_key, &metadata, etag.as_deref());
+        self.write_metadata_cache_with_directive(
+            &response_cache_key,
+            &metadata,
+            etag.as_deref(),
+            cache_directive,
+        );
         finish!(Ok(metadata))
     }
 
@@ -2484,7 +2673,7 @@ impl RegistryClient {
             .await
         {
             crate::timing::record_metadata_cache_hit();
-            return Ok(cached);
+            return Ok(cached.value);
         }
         crate::timing::record_metadata_cache_miss();
 
@@ -2508,16 +2697,20 @@ impl RegistryClient {
             )
             .await
         {
-            Ok((mut response, mut response_cache_key)) => {
+            Ok((mut response, mut response_cache_key, response_cache_validator)) => {
                 if response.status() == reqwest::StatusCode::NOT_MODIFIED {
-                    if let Some(metadata) = self
-                        .cached_metadata_after_304_as::<ReleaseTimeMetadata>(&response_cache_key)
+                    if let Some(cached) = self
+                        .cached_metadata_after_304_as::<ReleaseTimeMetadata, _>(
+                            &response_cache_key,
+                            &response,
+                            response_cache_validator.as_ref(),
+                            |metadata| metadata.matches_package(name),
+                        )
                         .await
-                        && metadata.matches_package(name)
                     {
-                        return finish!(Ok(metadata));
+                        return finish!(Ok(cached.value));
                     }
-                    (response, response_cache_key) = self
+                    (response, response_cache_key, _) = self
                         .send_worker_metadata_get_scoped(
                             &proxy_url,
                             Some("application/json"),
@@ -2530,6 +2723,7 @@ impl RegistryClient {
 
                 if response.status().is_success() {
                     let etag = Self::response_etag(&response);
+                    let cache_directive = Self::metadata_cache_directive(response.headers());
                     if let Ok(metadata) = parse_capped_metadata::<ReleaseTimeMetadata>(
                         response,
                         &format!("get_npm_package_release_times_full (proxy) {name}"),
@@ -2538,10 +2732,11 @@ impl RegistryClient {
                     {
                         let metadata = Self::validate_release_time_metadata(name, metadata)?;
                         if !metadata.time.is_empty() {
-                            self.write_metadata_cache(
+                            self.write_metadata_cache_with_directive(
                                 &response_cache_key,
                                 &metadata,
                                 etag.as_deref(),
+                                cache_directive,
                             );
                             return finish!(Ok(metadata));
                         }
@@ -2600,33 +2795,41 @@ impl RegistryClient {
         }
         if use_cache {
             let cache_read_start = std::time::Instant::now();
-            if let Some((cached, _etag)) = self
-                .read_metadata_cache_as_async::<ReleaseTimeMetadata>(&cache_key)
+            if let Some(cached) = self
+                .read_metadata_cache_entry_as_async::<ReleaseTimeMetadata>(&cache_key)
                 .await
-                && cached.matches_package(name)
+                && cached.value.matches_package(name)
             {
                 timings.cache_read_ms = cache_read_start.elapsed().as_millis();
                 timings.cache_hit = true;
                 crate::timing::record_metadata_cache_hit();
-                self.remember_release_times_for_command(&memory_cache_key, &cached);
+                self.remember_release_times_for_command(
+                    &memory_cache_key,
+                    &cached.value,
+                    cached.remaining_freshness,
+                );
                 return Ok(TimedReleaseTimeMetadata {
-                    metadata: cached,
+                    metadata: cached.value,
                     timings,
                 });
             }
             let full_cache_key = self.npm_direct_full_metadata_cache_key(name);
-            if let Some((cached, _etag)) = self
-                .read_metadata_cache_as_async::<ReleaseTimeMetadata>(&full_cache_key)
+            if let Some(cached) = self
+                .read_metadata_cache_entry_as_async::<ReleaseTimeMetadata>(&full_cache_key)
                 .await
-                && cached.matches_package(name)
-                && !cached.time.is_empty()
+                && cached.value.matches_package(name)
+                && !cached.value.time.is_empty()
             {
                 timings.cache_read_ms = cache_read_start.elapsed().as_millis();
                 timings.cache_hit = true;
                 crate::timing::record_metadata_cache_hit();
-                self.remember_release_times_for_command(&memory_cache_key, &cached);
+                self.remember_release_times_for_command(
+                    &memory_cache_key,
+                    &cached.value,
+                    cached.remaining_freshness,
+                );
                 return Ok(TimedReleaseTimeMetadata {
-                    metadata: cached,
+                    metadata: cached.value,
                     timings,
                 });
             }
@@ -2638,9 +2841,13 @@ impl RegistryClient {
                 timings.cache_read_ms = cache_read_start.elapsed().as_millis();
                 timings.cache_hit = true;
                 crate::timing::record_metadata_cache_hit();
-                self.remember_release_times_for_command(&memory_cache_key, &cached);
+                self.remember_release_times_for_command(
+                    &memory_cache_key,
+                    &cached.value,
+                    cached.remaining_freshness,
+                );
                 return Ok(TimedReleaseTimeMetadata {
-                    metadata: cached,
+                    metadata: cached.value,
                     timings,
                 });
             }
@@ -2658,18 +2865,22 @@ impl RegistryClient {
         }
         if use_cache {
             let coalesced_read_start = std::time::Instant::now();
-            if let Some((cached, _etag)) = self
-                .read_metadata_cache_as_async::<ReleaseTimeMetadata>(&cache_key)
+            if let Some(cached) = self
+                .read_metadata_cache_entry_as_async::<ReleaseTimeMetadata>(&cache_key)
                 .await
-                && cached.matches_package(name)
+                && cached.value.matches_package(name)
             {
                 timings.cache_read_ms = timings
                     .cache_read_ms
                     .saturating_add(coalesced_read_start.elapsed().as_millis());
                 timings.cache_hit = true;
-                self.remember_release_times_for_command(&memory_cache_key, &cached);
+                self.remember_release_times_for_command(
+                    &memory_cache_key,
+                    &cached.value,
+                    cached.remaining_freshness,
+                );
                 return Ok(TimedReleaseTimeMetadata {
-                    metadata: cached,
+                    metadata: cached.value,
                     timings,
                 });
             }
@@ -2713,14 +2924,25 @@ impl RegistryClient {
         if use_cache && response.status() == reqwest::StatusCode::NOT_MODIFIED {
             timings.not_modified = true;
             let cache_304_start = std::time::Instant::now();
-            if let Some(metadata) = self
-                .cached_metadata_after_304_as::<ReleaseTimeMetadata>(&cache_key)
+            if let Some(cached) = self
+                .cached_metadata_after_304_as::<ReleaseTimeMetadata, _>(
+                    &cache_key,
+                    &response,
+                    cache_validator.as_ref(),
+                    |metadata| metadata.matches_package(name),
+                )
                 .await
-                && metadata.matches_package(name)
             {
                 timings.cache_after_304_ms = cache_304_start.elapsed().as_millis();
-                self.remember_release_times_for_command(&memory_cache_key, &metadata);
-                return finish!(Ok(TimedReleaseTimeMetadata { metadata, timings }));
+                self.remember_release_times_for_command(
+                    &memory_cache_key,
+                    &cached.value,
+                    cached.remaining_freshness,
+                );
+                return finish!(Ok(TimedReleaseTimeMetadata {
+                    metadata: cached.value,
+                    timings,
+                }));
             }
             timings.cache_after_304_ms = cache_304_start.elapsed().as_millis();
             let retry_http_start = std::time::Instant::now();
@@ -2744,6 +2966,7 @@ impl RegistryClient {
             };
         }
         let etag = Self::response_etag(&response);
+        let cache_directive = Self::metadata_cache_directive(response.headers());
         let (metadata, body_timings) =
             match parse_capped_metadata_with_timing::<ReleaseTimeMetadata>(
                 response,
@@ -2762,9 +2985,18 @@ impl RegistryClient {
             Err(err) => return finish!(Err(err)),
         };
         let cache_write_start = std::time::Instant::now();
-        self.write_metadata_cache(&cache_key, &metadata, etag.as_deref());
+        self.write_metadata_cache_with_directive(
+            &cache_key,
+            &metadata,
+            etag.as_deref(),
+            cache_directive,
+        );
         timings.cache_write_dispatch_ms = cache_write_start.elapsed().as_millis();
-        self.remember_release_times_for_command(&memory_cache_key, &metadata);
+        self.remember_release_times_for_command(
+            &memory_cache_key,
+            &metadata,
+            cache_directive.local_freshness().unwrap_or_default(),
+        );
         finish!(Ok(TimedReleaseTimeMetadata { metadata, timings }))
     }
 
@@ -2787,25 +3019,33 @@ impl RegistryClient {
             return Ok(cached);
         }
 
-        if let Some((cached, _etag)) = self
-            .read_metadata_cache_as_async::<ReleaseTimeMetadata>(&cache_key)
+        if let Some(cached) = self
+            .read_metadata_cache_entry_as_async::<ReleaseTimeMetadata>(&cache_key)
             .await
-            && cached.matches_package(name)
+            && cached.value.matches_package(name)
         {
             crate::timing::record_metadata_cache_hit();
-            self.remember_release_times_for_command(&memory_cache_key, &cached);
-            return Ok(cached);
+            self.remember_release_times_for_command(
+                &memory_cache_key,
+                &cached.value,
+                cached.remaining_freshness,
+            );
+            return Ok(cached.value);
         }
         let full_cache_key = format!("npm-full:{principal}:{url}");
-        if let Some((cached, _etag)) = self
-            .read_metadata_cache_as_async::<ReleaseTimeMetadata>(&full_cache_key)
+        if let Some(cached) = self
+            .read_metadata_cache_entry_as_async::<ReleaseTimeMetadata>(&full_cache_key)
             .await
-            && cached.matches_package(name)
-            && !cached.time.is_empty()
+            && cached.value.matches_package(name)
+            && !cached.value.time.is_empty()
         {
             crate::timing::record_metadata_cache_hit();
-            self.remember_release_times_for_command(&memory_cache_key, &cached);
-            return Ok(cached);
+            self.remember_release_times_for_command(
+                &memory_cache_key,
+                &cached.value,
+                cached.remaining_freshness,
+            );
+            return Ok(cached.value);
         }
         crate::timing::record_metadata_cache_miss();
 
@@ -2813,13 +3053,17 @@ impl RegistryClient {
         if let Some(cached) = self.read_release_time_memory_cache(&memory_cache_key) {
             return Ok(cached);
         }
-        if let Some((cached, _etag)) = self
-            .read_metadata_cache_as_async::<ReleaseTimeMetadata>(&cache_key)
+        if let Some(cached) = self
+            .read_metadata_cache_entry_as_async::<ReleaseTimeMetadata>(&cache_key)
             .await
-            && cached.matches_package(name)
+            && cached.value.matches_package(name)
         {
-            self.remember_release_times_for_command(&memory_cache_key, &cached);
-            return Ok(cached);
+            self.remember_release_times_for_command(
+                &memory_cache_key,
+                &cached.value,
+                cached.remaining_freshness,
+            );
+            return Ok(cached.value);
         }
 
         let cache_validator = self.read_cache_validator(&cache_key);
@@ -2848,13 +3092,21 @@ impl RegistryClient {
             Err(err) => return finish!(Err(err)),
         };
         if response.status() == reqwest::StatusCode::NOT_MODIFIED {
-            if let Some(metadata) = self
-                .cached_metadata_after_304_as::<ReleaseTimeMetadata>(&cache_key)
+            if let Some(cached) = self
+                .cached_metadata_after_304_as::<ReleaseTimeMetadata, _>(
+                    &cache_key,
+                    &response,
+                    cache_validator.as_ref(),
+                    |metadata| metadata.matches_package(name),
+                )
                 .await
-                && metadata.matches_package(name)
             {
-                self.remember_release_times_for_command(&memory_cache_key, &metadata);
-                return finish!(Ok(metadata));
+                self.remember_release_times_for_command(
+                    &memory_cache_key,
+                    &cached.value,
+                    cached.remaining_freshness,
+                );
+                return finish!(Ok(cached.value));
             }
             let req = self
                 .http
@@ -2872,6 +3124,7 @@ impl RegistryClient {
             };
         }
         let etag = Self::response_etag(&response);
+        let cache_directive = Self::metadata_cache_directive(response.headers());
         let metadata = match parse_capped_metadata::<ReleaseTimeMetadata>(
             response,
             &format!("get_npm_release_times_from_full {name} @ {base_url}"),
@@ -2885,8 +3138,17 @@ impl RegistryClient {
             Ok(metadata) => metadata,
             Err(err) => return finish!(Err(err)),
         };
-        self.write_metadata_cache(&cache_key, &metadata, etag.as_deref());
-        self.remember_release_times_for_command(&memory_cache_key, &metadata);
+        self.write_metadata_cache_with_directive(
+            &cache_key,
+            &metadata,
+            etag.as_deref(),
+            cache_directive,
+        );
+        self.remember_release_times_for_command(
+            &memory_cache_key,
+            &metadata,
+            cache_directive.local_freshness().unwrap_or_default(),
+        );
         finish!(Ok(metadata))
     }
 
@@ -3054,29 +3316,41 @@ impl RegistryClient {
         if cache_policy == MetadataCachePolicy::UseFresh
             && let Some(cached) = self.read_metadata_memory_cache(&memory_cache_key)
         {
-            timings.cache_read_ms = memory_read_start.elapsed().as_millis();
-            timings.cache_hit = true;
-            crate::timing::record_metadata_cache_hit();
-            return Ok(TimedPackageMetadata {
-                metadata: cached,
-                timings,
-            });
+            if batch_metadata_entry_matches_name(name, &cached) {
+                timings.cache_read_ms = memory_read_start.elapsed().as_millis();
+                timings.cache_hit = true;
+                crate::timing::record_metadata_cache_hit();
+                return Ok(TimedPackageMetadata {
+                    metadata: cached,
+                    timings,
+                });
+            }
+            self.forget_metadata_for_command(&memory_cache_key);
         }
 
         // Tier 1: TTL+magic cache hit.
         let cache_read_start = std::time::Instant::now();
         if cache_policy == MetadataCachePolicy::UseFresh
-            && let Some((cached, _etag)) = self.read_metadata_cache_async(&cache_key).await
+            && let Some(cached) = self
+                .read_metadata_cache_entry_as_async::<PackageMetadata>(&cache_key)
+                .await
         {
-            timings.cache_read_ms = cache_read_start.elapsed().as_millis();
-            timings.cache_hit = true;
-            crate::timing::record_metadata_cache_hit();
-            tracing::debug!("metadata cache hit (custom)");
-            self.remember_metadata_for_command(&memory_cache_key, &cached);
-            return Ok(TimedPackageMetadata {
-                metadata: cached,
-                timings,
-            });
+            if batch_metadata_entry_matches_name(name, &cached.value) {
+                timings.cache_read_ms = cache_read_start.elapsed().as_millis();
+                timings.cache_hit = true;
+                crate::timing::record_metadata_cache_hit();
+                tracing::debug!("metadata cache hit (custom)");
+                self.remember_metadata_for_command(
+                    &memory_cache_key,
+                    &cached.value,
+                    cached.remaining_freshness,
+                );
+                return Ok(TimedPackageMetadata {
+                    metadata: cached.value,
+                    timings,
+                });
+            }
+            self.invalidate_metadata_cache_key(&cache_key);
         }
         timings.cache_read_ms = cache_read_start.elapsed().as_millis();
         crate::timing::record_metadata_cache_miss();
@@ -3085,27 +3359,39 @@ impl RegistryClient {
         if cache_policy == MetadataCachePolicy::UseFresh
             && let Some(cached) = self.read_metadata_memory_cache(&memory_cache_key)
         {
-            timings.cache_hit = true;
-            tracing::debug!("metadata memory cache hit (custom, coalesced)");
-            return Ok(TimedPackageMetadata {
-                metadata: cached,
-                timings,
-            });
+            if batch_metadata_entry_matches_name(name, &cached) {
+                timings.cache_hit = true;
+                tracing::debug!("metadata memory cache hit (custom, coalesced)");
+                return Ok(TimedPackageMetadata {
+                    metadata: cached,
+                    timings,
+                });
+            }
+            self.forget_metadata_for_command(&memory_cache_key);
         }
         let coalesced_read_start = std::time::Instant::now();
         if cache_policy == MetadataCachePolicy::UseFresh
-            && let Some((cached, _etag)) = self.read_metadata_cache_async(&cache_key).await
+            && let Some(cached) = self
+                .read_metadata_cache_entry_as_async::<PackageMetadata>(&cache_key)
+                .await
         {
-            timings.cache_read_ms = timings
-                .cache_read_ms
-                .saturating_add(coalesced_read_start.elapsed().as_millis());
-            timings.cache_hit = true;
-            tracing::debug!("metadata cache hit (custom, coalesced)");
-            self.remember_metadata_for_command(&memory_cache_key, &cached);
-            return Ok(TimedPackageMetadata {
-                metadata: cached,
-                timings,
-            });
+            if batch_metadata_entry_matches_name(name, &cached.value) {
+                timings.cache_read_ms = timings
+                    .cache_read_ms
+                    .saturating_add(coalesced_read_start.elapsed().as_millis());
+                timings.cache_hit = true;
+                tracing::debug!("metadata cache hit (custom, coalesced)");
+                self.remember_metadata_for_command(
+                    &memory_cache_key,
+                    &cached.value,
+                    cached.remaining_freshness,
+                );
+                return Ok(TimedPackageMetadata {
+                    metadata: cached.value,
+                    timings,
+                });
+            }
+            self.invalidate_metadata_cache_key(&cache_key);
         }
         timings.cache_read_ms = timings
             .cache_read_ms
@@ -3152,11 +3438,26 @@ impl RegistryClient {
         if response.status() == reqwest::StatusCode::NOT_MODIFIED {
             timings.not_modified = true;
             let cache_304_start = std::time::Instant::now();
-            if let Some(metadata) = self.cached_metadata_after_304(&cache_key).await {
+            if let Some(cached) = self
+                .cached_metadata_after_304(
+                    &cache_key,
+                    &response,
+                    cache_validator.as_ref(),
+                    |metadata| batch_metadata_entry_matches_name(name, metadata),
+                )
+                .await
+            {
                 timings.cache_after_304_ms = cache_304_start.elapsed().as_millis();
                 tracing::debug!("metadata cache revalidated (custom 304)");
-                self.remember_metadata_for_command(&memory_cache_key, &metadata);
-                return finish!(Ok(TimedPackageMetadata { metadata, timings }));
+                self.remember_metadata_for_command(
+                    &memory_cache_key,
+                    &cached.value,
+                    cached.remaining_freshness,
+                );
+                return finish!(Ok(TimedPackageMetadata {
+                    metadata: cached.value,
+                    timings,
+                }));
             }
             timings.cache_after_304_ms = cache_304_start.elapsed().as_millis();
             timings.not_modified = false;
@@ -3182,6 +3483,7 @@ impl RegistryClient {
             };
         }
         let etag = Self::response_etag(&response);
+        let cache_directive = Self::metadata_cache_directive(response.headers());
         let (metadata, body_timings) = match parse_capped_metadata_with_timing::<PackageMetadata>(
             response,
             &format!("get_npm_metadata_from {name} @ {base_url}"),
@@ -3191,13 +3493,27 @@ impl RegistryClient {
             Ok(m) => m,
             Err(e) => return finish!(Err(e)),
         };
+        let metadata =
+            match Self::validate_package_metadata_identity(name, metadata, "custom npm registry") {
+                Ok(metadata) => metadata,
+                Err(error) => return finish!(Err(error)),
+            };
         timings.body_read_ms = body_timings.body_read_ms;
         timings.json_decode_ms = body_timings.json_parse_ms;
         timings.body_bytes = body_timings.body_bytes;
         let cache_write_start = std::time::Instant::now();
-        self.write_metadata_cache(&cache_key, &metadata, etag.as_deref());
+        self.write_metadata_cache_with_directive(
+            &cache_key,
+            &metadata,
+            etag.as_deref(),
+            cache_directive,
+        );
         timings.cache_write_dispatch_ms = cache_write_start.elapsed().as_millis();
-        self.remember_metadata_for_command(&memory_cache_key, &metadata);
+        self.remember_metadata_for_command(
+            &memory_cache_key,
+            &metadata,
+            cache_directive.local_freshness().unwrap_or_default(),
+        );
         finish!(Ok(TimedPackageMetadata { metadata, timings }))
     }
 
@@ -3217,9 +3533,12 @@ impl RegistryClient {
         );
 
         if let Some((cached, _etag)) = self.read_metadata_cache_async(&cache_key).await {
-            crate::timing::record_metadata_cache_hit();
-            tracing::debug!("metadata cache hit (custom full)");
-            return Ok(cached);
+            if batch_metadata_entry_matches_name(name, &cached) {
+                crate::timing::record_metadata_cache_hit();
+                tracing::debug!("metadata cache hit (custom full)");
+                return Ok(cached);
+            }
+            self.invalidate_metadata_cache_key(&cache_key);
         }
         crate::timing::record_metadata_cache_miss();
 
@@ -3249,9 +3568,17 @@ impl RegistryClient {
             Err(e) => return finish!(Err(e)),
         };
         if response.status() == reqwest::StatusCode::NOT_MODIFIED {
-            if let Some(metadata) = self.cached_metadata_after_304(&cache_key).await {
+            if let Some(cached) = self
+                .cached_metadata_after_304(
+                    &cache_key,
+                    &response,
+                    cache_validator.as_ref(),
+                    |metadata| batch_metadata_entry_matches_name(name, metadata),
+                )
+                .await
+            {
                 tracing::debug!("metadata cache revalidated (custom full 304)");
-                return finish!(Ok(metadata));
+                return finish!(Ok(cached.value));
             }
             let req = self
                 .http
@@ -3269,6 +3596,7 @@ impl RegistryClient {
             };
         }
         let etag = Self::response_etag(&response);
+        let cache_directive = Self::metadata_cache_directive(response.headers());
         let metadata = match parse_capped_metadata::<PackageMetadata>(
             response,
             &format!("get_npm_metadata_from_full {name} @ {base_url}"),
@@ -3278,7 +3606,17 @@ impl RegistryClient {
             Ok(m) => m,
             Err(e) => return finish!(Err(e)),
         };
-        self.write_metadata_cache(&cache_key, &metadata, etag.as_deref());
+        let metadata =
+            match Self::validate_package_metadata_identity(name, metadata, "custom npm registry") {
+                Ok(metadata) => metadata,
+                Err(error) => return finish!(Err(error)),
+            };
+        self.write_metadata_cache_with_directive(
+            &cache_key,
+            &metadata,
+            etag.as_deref(),
+            cache_directive,
+        );
         finish!(Ok(metadata))
     }
 
