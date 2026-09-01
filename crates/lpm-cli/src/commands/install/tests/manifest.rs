@@ -551,6 +551,25 @@ fn reconcile_finalized_add_rebuilds_complete_importer_after_catalog_cleanup() {
     );
 
     let mut lockfile = lpm_lockfile::Lockfile::new();
+    let source = "registry+https://registry.npmjs.org";
+    let used_instance_id =
+        lpm_common::PackageInstanceId::derive("used", "1.0.0", source, "root/used");
+    lockfile.add_package(lpm_lockfile::LockedPackage {
+        instance_id: Some(used_instance_id),
+        name: "used".to_string(),
+        version: "1.0.0".to_string(),
+        source: Some(source.to_string()),
+        ..Default::default()
+    });
+    lockfile.root_resolutions.insert(
+        "used".to_string(),
+        lpm_lockfile::LockedRootResolution {
+            instance_id: Some(used_instance_id),
+            package: "used".to_string(),
+            version: "1.0.0".to_string(),
+            source: Some(source.to_string()),
+        },
+    );
     lockfile.importers.insert(
         ".".to_string(),
         lpm_lockfile::ImporterSnapshot {
@@ -598,6 +617,20 @@ fn reconcile_finalized_add_rebuilds_complete_importer_after_catalog_cleanup() {
     reconcile_finalized_add_install_state(dir.path()).unwrap();
 
     let reconciled = lpm_lockfile::Lockfile::read_from_file(&lockfile_path).unwrap();
+    assert_eq!(
+        reconciled.catalogs,
+        std::collections::BTreeMap::from([(
+            "default".to_string(),
+            std::collections::BTreeMap::from([(
+                "used".to_string(),
+                lpm_lockfile::CatalogSnapshotEntry {
+                    specifier: "^1.0.0".to_string(),
+                    version: "1.0.0".to_string(),
+                    reference: "catalog:".to_string(),
+                },
+            )]),
+        )])
+    );
     let importer = reconciled.importers.get(".").unwrap();
     assert_eq!(
         importer.catalogs,

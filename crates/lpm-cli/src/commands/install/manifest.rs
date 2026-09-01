@@ -1972,9 +1972,19 @@ pub(super) fn reconcile_finalized_add_install_state(project_dir: &Path) -> Resul
         .get(".")
         .and_then(|importer| importer.auto_install_peers)
         .unwrap_or(true);
-    let importer = finalized_importer_snapshot(project_dir, &package, auto_install_peers)?;
+    let workspace = lpm_workspace::discover_workspace(project_dir).map_err(|e| {
+        LpmError::Registry(format!(
+            "failed to rediscover workspace after finalizing package.json: {e}"
+        ))
+    })?;
+    let catalogs = workspace.as_ref().map_or(&package.catalogs, |workspace| {
+        &workspace.root_package.catalogs
+    });
+    let catalogs_changed =
+        reconcile_finalized_dependency_catalog_snapshots(&package, catalogs, &mut lockfile)?;
+    let importer = finalized_importer_snapshot(&package, catalogs, auto_install_peers)?;
 
-    if lockfile.importers.get(".") == Some(&importer) {
+    if !catalogs_changed && lockfile.importers.get(".") == Some(&importer) {
         return Ok(());
     }
 
@@ -1988,19 +1998,66 @@ pub(super) fn reconcile_finalized_add_install_state(project_dir: &Path) -> Resul
     super::state::refresh_post_install_hash_after_manifest_finalize(project_dir)
 }
 
-fn finalized_importer_snapshot(
-    project_dir: &Path,
+fn reconcile_finalized_dependency_catalog_snapshots(
     package: &lpm_workspace::PackageJson,
+    catalogs: &HashMap<String, HashMap<String, String>>,
+    lockfile: &mut lpm_lockfile::Lockfile,
+) -> Result<bool, LpmError> {
+    let mut dependencies = manifest_install_deps(package);
+    let resolutions = lpm_workspace::resolve_catalog_protocol(&mut dependencies, catalogs)
+        .map_err(catalog_protocol_error_to_lpm)?;
+    let mut changed = false;
+
+    for resolution in resolutions {
+        let root = lockfile
+            .root_resolutions
+            .get(&resolution.package_name)
+            .ok_or_else(|| {
+                LpmError::Registry(format!(
+                    "catalog snapshot: finalized dependency `{}` has no exact root resolution",
+                    resolution.package_name
+                ))
+            })?;
+        let resolved_version = lpm_semver::Version::parse(&root.version).map_err(|e| {
+            LpmError::Registry(format!(
+                "catalog snapshot: resolved version `{}` for `{}` did not parse as semver: {e}",
+                root.version, resolution.package_name
+            ))
+        })?;
+        if !catalog_range_matches_resolved(
+            &resolution.package_name,
+            &resolution.specifier,
+            &resolved_version,
+        )? {
+            return Err(LpmError::Registry(format!(
+                "catalog snapshot: resolved {}@{} does not satisfy finalized catalog range {}",
+                resolution.package_name, root.version, resolution.specifier
+            )));
+        }
+
+        let snapshot = lpm_lockfile::CatalogSnapshotEntry {
+            specifier: resolution.specifier,
+            version: root.version.clone(),
+            reference: resolution.reference,
+        };
+        let catalog = lockfile
+            .catalogs
+            .entry(resolution.catalog_name)
+            .or_default();
+        if catalog.get(&resolution.package_name) != Some(&snapshot) {
+            catalog.insert(resolution.package_name, snapshot);
+            changed = true;
+        }
+    }
+
+    Ok(changed)
+}
+
+fn finalized_importer_snapshot(
+    package: &lpm_workspace::PackageJson,
+    catalogs: &HashMap<String, HashMap<String, String>>,
     auto_install_peers: bool,
 ) -> Result<lpm_lockfile::ImporterSnapshot, LpmError> {
-    let workspace = lpm_workspace::discover_workspace(project_dir).map_err(|e| {
-        LpmError::Registry(format!(
-            "failed to rediscover workspace after finalizing package.json: {e}"
-        ))
-    })?;
-    let catalogs = workspace.as_ref().map_or(&package.catalogs, |workspace| {
-        &workspace.root_package.catalogs
-    });
     let raw_lpm_overrides = package
         .lpm
         .as_ref()

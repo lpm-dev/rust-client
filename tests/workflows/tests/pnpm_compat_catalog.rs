@@ -119,6 +119,38 @@ async fn install_catalog_flag_saves_default_catalog_reference_when_catalog_range
 }
 
 #[tokio::test]
+async fn install_catalog_flag_persists_snapshot_for_immediate_resolved_inspection() {
+    let mock = MockRegistry::start().await;
+    mount_is_positive_versions(&mock).await;
+
+    let project = catalog_project_without_mode("^2.0.0");
+
+    let install_output = run_install(&project, &mock, &["--catalog", "is-positive"]);
+    let install_text = output_text(&install_output);
+    assert!(
+        install_output.status.success(),
+        "install --catalog must succeed before resolved inspection\n{install_text}"
+    );
+
+    let output = lpm(&project)
+        .args(["--json", "catalog", "show", "--resolved"])
+        .output()
+        .expect("inspect the catalog snapshot immediately after install --catalog");
+    let text = output_text(&output);
+
+    assert!(
+        output.status.success(),
+        "install --catalog must persist the snapshot needed by catalog show --resolved\n{text}"
+    );
+    let envelope: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("catalog show output is valid JSON");
+    assert_eq!(envelope["count"], serde_json::json!(1));
+    assert_eq!(envelope["entries"][0]["package"], "is-positive");
+    assert_eq!(envelope["entries"][0]["version"], "2.0.0");
+    assert_eq!(envelope["entries"][0]["reference"], "catalog:");
+}
+
+#[tokio::test]
 async fn install_named_catalog_flag_saves_named_catalog_reference_when_catalog_range_matches() {
     let mock = MockRegistry::start().await;
     mount_is_positive_versions(&mock).await;
