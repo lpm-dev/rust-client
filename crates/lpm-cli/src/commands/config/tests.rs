@@ -1,7 +1,8 @@
 use super::wizards::{
     CAUTIOUS_RELEASE_AGE_SECS, DEFAULT_RELEASE_AGE_SECS, FIREWALL_ENFORCE_HINT,
     FIREWALL_MONITOR_HINT, FIREWALL_OFF_HINT, FIREWALL_WIZARD_PROMPT, INTEGRITY_SOURCE_HINT,
-    INTEGRITY_TREE_HINT, INTEGRITY_WIZARD_PROMPT, persist_firewall_policy_profile_in_config_value,
+    INTEGRITY_TREE_HINT, INTEGRITY_WIZARD_PROMPT, ReleaseAgeSelection,
+    persist_firewall_policy_profile_in_config_value, persist_release_age_selection,
     persist_script_policy, read_firewall_mode, read_integrity_policy, read_release_age_override,
     read_sandbox_mode, read_sigstore_availability, read_sigstore_scope, read_sigstore_verify,
     read_typosquat_guard_override, release_age_initial_choice,
@@ -126,6 +127,11 @@ fn integrity_wizard_copy_uses_store_object_language() {
             "stricter; rehash expanded files to detect local store tampering/corruption",
         )
     );
+}
+
+#[test]
+fn release_age_guided_menu_uses_the_grouped_configuration_label() {
+    assert_eq!(RELEASE_AGE_GUIDED_MENU_LABEL, "Release age configuration");
 }
 
 #[test]
@@ -826,6 +832,35 @@ async fn release_age_wizard_preserves_unrelated_keys() {
     assert_eq!(
         table.get(RELEASE_AGE_KEY).and_then(|v| v.as_str()),
         Some("43200"),
+    );
+}
+
+#[tokio::test]
+async fn grouped_release_age_save_persists_scope_and_minimum_age_together() {
+    let (_dir, path, _env) = tmp_config();
+    std::fs::write(&path, "registry = \"https://example.test\"\n").unwrap();
+
+    persist_release_age_selection(
+        &path,
+        ReleaseAgeSelection::Seconds(CAUTIOUS_RELEASE_AGE_SECS),
+        Some(crate::release_age_config::ReleaseAgePolicy::Strict),
+        false,
+        "lpm config release-age --set 3d",
+    )
+    .await
+    .unwrap();
+
+    let cfg = read_config(&path).unwrap();
+    let table = cfg.as_table().unwrap();
+    assert_eq!(
+        (
+            table.get(RELEASE_AGE_KEY).and_then(toml::Value::as_str),
+            table
+                .get(RELEASE_AGE_POLICY_KEY)
+                .and_then(toml::Value::as_str),
+            table.get("registry").and_then(toml::Value::as_str),
+        ),
+        (Some("259200"), Some("strict"), Some("https://example.test"),)
     );
 }
 

@@ -29,17 +29,18 @@ use io::{
     redact_config_json_value, remove_config_value_at_path,
 };
 use wizards::{
-    FIREWALL_GUIDED_MENU_LABEL, INTEGRITY_GUIDED_MENU_LABEL, INTEGRITY_KEY, RELEASE_AGE_KEY,
-    RELEASE_AGE_POLICY_KEY, SANDBOX_MODE_VALUES, SCRIPT_POLICY_KEY, SCRIPT_POLICY_VALUES,
-    SIGNATURES_KEY, SIGSTORE_AVAILABILITY_VALUES, SIGSTORE_SCOPE_VALUES, SIGSTORE_VERIFY_VALUES,
-    TRIAGE_ADVISOR_KEY, TRIAGE_ADVISOR_VALUES, TRUST_POLICY_VALUES, apply_firewall_mode,
-    apply_sandbox_mode, apply_sigstore_assignment, format_bool_enabled,
-    format_current_firewall_mode, format_current_integrity_policy, format_current_lpm_skills,
-    format_current_release_age, format_current_typosquat_guard, parse_config_bool,
-    parse_firewall_mode_selection, parse_integrity_policy_selection, parse_sigstore_assignment,
-    parse_typosquat_guard_selection, read_string_value, reject_looser_typosquat_guard_write,
-    run_firewall_wizard, run_integrity_wizard, run_lpm_dev_wizard, run_lpm_insights_wizard,
-    run_lpm_skills_wizard, run_release_age_policy_wizard, run_release_age_wizard,
+    FIREWALL_GUIDED_MENU_LABEL, INTEGRITY_GUIDED_MENU_LABEL, INTEGRITY_KEY,
+    RELEASE_AGE_GUIDED_MENU_LABEL, RELEASE_AGE_KEY, RELEASE_AGE_POLICY_KEY, SANDBOX_MODE_VALUES,
+    SCRIPT_POLICY_KEY, SCRIPT_POLICY_VALUES, SIGNATURES_KEY, SIGSTORE_AVAILABILITY_VALUES,
+    SIGSTORE_SCOPE_VALUES, SIGSTORE_VERIFY_VALUES, TRIAGE_ADVISOR_KEY, TRIAGE_ADVISOR_VALUES,
+    TRUST_POLICY_VALUES, apply_firewall_mode, apply_sandbox_mode, apply_sigstore_assignment,
+    format_bool_enabled, format_current_firewall_mode, format_current_integrity_policy,
+    format_current_lpm_skills, format_current_release_age, format_current_typosquat_guard,
+    parse_config_bool, parse_firewall_mode_selection, parse_integrity_policy_selection,
+    parse_sigstore_assignment, parse_typosquat_guard_selection, read_string_value,
+    reject_looser_typosquat_guard_write, run_firewall_wizard, run_integrity_wizard,
+    run_lpm_dev_wizard, run_lpm_insights_wizard, run_lpm_skills_wizard,
+    run_release_age_configuration_wizard, run_release_age_policy_wizard, run_release_age_wizard,
     run_sandbox_wizard, run_scripts_wizard, run_signatures_wizard, run_sigstore_wizard,
     run_source_analysis_wizard, run_triage_wizard, run_trust_policy_wizard, run_typosquat_wizard,
     validate_trust_policy_value,
@@ -102,6 +103,7 @@ fn generic_set_target(key: &str) -> GenericSetTarget {
 /// - `lpm config release-age` owns `minimum-release-age-secs = <seconds>`
 ///   via human-friendly duration inputs.
 /// - `lpm config release-age-policy` owns `release-age-policy = direct | strict`.
+///   Bare `lpm config` groups both settings in one editor.
 /// - `lpm config release-age-exclude` owns the user-wide package exclusion list.
 /// - `lpm config lpm-skills` owns `auto-install-lpm-skills = true | false`
 ///   for package-published skills from `@lpm.dev/*` packages.
@@ -679,14 +681,12 @@ async fn run_guided_config_menu(
                 format!("current: {}", summary.integrity_mode),
             )
             .item(
-                "release-age",
-                "Minimum release age",
-                format!("current: {}", summary.release_age),
-            )
-            .item(
-                "release-age-policy",
-                "Release-age scope",
-                format!("current: {}", summary.release_age_policy),
+                "release-age-configuration",
+                RELEASE_AGE_GUIDED_MENU_LABEL,
+                format!(
+                    "scope={}, minimum={}",
+                    summary.release_age_policy, summary.release_age
+                ),
             )
             .item(
                 "source-analysis",
@@ -718,8 +718,9 @@ async fn run_guided_config_menu(
             "typosquat" => run_typosquat_wizard(config_path, None, false).await?,
             "firewall" => run_firewall_wizard(config_path, None, false).await?,
             "integrity" => run_integrity_wizard(config_path, None, false).await?,
-            "release-age" => run_release_age_wizard(config_path, None, false).await?,
-            "release-age-policy" => run_release_age_policy_wizard(config_path, None, false).await?,
+            "release-age-configuration" => {
+                run_release_age_configuration_wizard(config_path).await?
+            }
             "source-analysis" => run_source_analysis_wizard(config_path, None, false).await?,
             "lpm-dev" => run_lpm_dev_wizard(config_path, None, false).await?,
             "done" => return Ok(()),

@@ -1,7 +1,7 @@
 use super::prelude::*;
-use console::{Key, Term, measure_text_width};
+use console::{Key, Term};
 use lpm_registry::client::{NpmFirewallPolicyAction, NpmFirewallPolicyProfile};
-use std::io::{self, Write};
+use std::io;
 
 pub(in crate::commands::config) const FIREWALL_GUIDED_MENU_LABEL: &str = "Firewall for npm";
 pub(in crate::commands::config) const FIREWALL_WIZARD_PROMPT: &str =
@@ -531,18 +531,9 @@ fn run_firewall_policy_editor(
     term: &mut Term,
     initial_profile: NpmFirewallPolicyProfile,
 ) -> io::Result<NpmFirewallPolicyProfile> {
-    if !term.is_term() {
-        return Err(io::ErrorKind::NotConnected.into());
-    }
-
-    term.hide_cursor()?;
-    let result = interact_firewall_policy_editor(term, initial_profile);
-    let show_cursor_result = term.show_cursor();
-    match (result, show_cursor_result) {
-        (Ok(profile), Ok(())) => Ok(profile),
-        (Err(error), _) => Err(error),
-        (Ok(_), Err(error)) => Err(error),
-    }
+    super::editor::run(term, |term| {
+        interact_firewall_policy_editor(term, initial_profile)
+    })
 }
 
 fn interact_firewall_policy_editor(
@@ -555,12 +546,7 @@ fn interact_firewall_policy_editor(
 
     loop {
         let frame = format_firewall_policy_editor_frame(&rows, cursor);
-        if previous_line_count > 0 {
-            term.clear_last_lines(previous_line_count)?;
-        }
-        term.write_all(frame.as_bytes())?;
-        term.flush()?;
-        previous_line_count = rendered_line_count(&frame, usize::from(term.size().1).max(1));
+        super::editor::draw_frame(term, &frame, &mut previous_line_count)?;
 
         match term.read_key()? {
             Key::ArrowUp | Key::Char('k') => {
@@ -665,17 +651,6 @@ fn policy_action_label(action: NpmFirewallPolicyAction) -> &'static str {
         NpmFirewallPolicyAction::Warn => "Warn only",
         NpmFirewallPolicyAction::Allow => "Allow",
     }
-}
-
-fn rendered_line_count(frame: &str, terminal_width: usize) -> usize {
-    let terminal_width = terminal_width.max(1);
-    frame
-        .lines()
-        .map(|line| {
-            let width = measure_text_width(line);
-            width.saturating_sub(1) / terminal_width + 1
-        })
-        .sum()
 }
 
 #[cfg(test)]

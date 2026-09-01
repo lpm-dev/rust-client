@@ -1,4 +1,5 @@
 mod common;
+mod editor;
 mod firewall;
 mod integrity;
 mod lpm_dev;
@@ -69,10 +70,12 @@ pub(in crate::commands::config) use lpm_skills::{
 pub(in crate::commands::config) use release_age::read_release_age_override;
 #[cfg(test)]
 pub(in crate::commands::config) use release_age::{
-    CAUTIOUS_RELEASE_AGE_SECS, DEFAULT_RELEASE_AGE_SECS, release_age_initial_choice,
+    CAUTIOUS_RELEASE_AGE_SECS, DEFAULT_RELEASE_AGE_SECS, ReleaseAgeSelection,
+    persist_release_age_selection, release_age_initial_choice,
 };
 pub(in crate::commands::config) use release_age::{
-    RELEASE_AGE_KEY, RELEASE_AGE_POLICY_KEY, format_current_release_age,
+    RELEASE_AGE_GUIDED_MENU_LABEL, RELEASE_AGE_KEY, RELEASE_AGE_POLICY_KEY,
+    format_current_release_age, run_release_age_configuration_wizard,
     run_release_age_policy_wizard, run_release_age_wizard,
 };
 #[cfg(test)]

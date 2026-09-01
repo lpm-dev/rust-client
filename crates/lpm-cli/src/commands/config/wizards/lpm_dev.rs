@@ -3,8 +3,8 @@ use crate::lpm_insights_config::FETCH_LPM_SECURITY_INSIGHTS_KEY;
 use crate::lpm_skills_config::{
     AUTO_INSTALL_LPM_SKILLS_KEY, LEGACY_NO_SKILLS_KEY, LpmSkillsPreference,
 };
-use console::{Key, Term, measure_text_width};
-use std::io::{self, Write};
+use console::{Key, Term};
+use std::io;
 
 const LPM_DEV_EDITOR_PROMPT: &str = "LPM.dev settings";
 const LPM_DEV_EDITOR_HELP: &str = "Use ↑/↓ to move, ←/→ to change, Enter to save, Esc to cancel.";
@@ -123,17 +123,7 @@ async fn persist_lpm_dev_settings(
 }
 
 fn run_lpm_dev_editor(term: &mut Term, initial: LpmDevSettings) -> io::Result<LpmDevSettings> {
-    if !term.is_term() {
-        return Err(io::ErrorKind::NotConnected.into());
-    }
-    term.hide_cursor()?;
-    let result = interact_lpm_dev_editor(term, initial);
-    let show_cursor_result = term.show_cursor();
-    match (result, show_cursor_result) {
-        (Ok(settings), Ok(())) => Ok(settings),
-        (Err(error), _) => Err(error),
-        (Ok(_), Err(error)) => Err(error),
-    }
+    super::editor::run(term, |term| interact_lpm_dev_editor(term, initial))
 }
 
 fn interact_lpm_dev_editor(
@@ -144,12 +134,7 @@ fn interact_lpm_dev_editor(
     let mut previous_line_count = 0;
     loop {
         let frame = format_lpm_dev_editor_frame(settings, cursor);
-        if previous_line_count > 0 {
-            term.clear_last_lines(previous_line_count)?;
-        }
-        term.write_all(frame.as_bytes())?;
-        term.flush()?;
-        previous_line_count = rendered_line_count(&frame, usize::from(term.size().1).max(1));
+        super::editor::draw_frame(term, &frame, &mut previous_line_count)?;
 
         match term.read_key()? {
             Key::ArrowUp | Key::ArrowDown | Key::Char('j') | Key::Char('k') => cursor ^= 1,
@@ -213,17 +198,6 @@ fn format_bool_options(enabled: bool) -> String {
     } else {
         format!("○ Enabled  {} {}", "●".cyan(), "Disabled".bold())
     }
-}
-
-fn rendered_line_count(frame: &str, terminal_width: usize) -> usize {
-    let terminal_width = terminal_width.max(1);
-    frame
-        .lines()
-        .map(|line| {
-            let width = measure_text_width(line);
-            width.saturating_sub(1) / terminal_width + 1
-        })
-        .sum()
 }
 
 #[cfg(test)]
