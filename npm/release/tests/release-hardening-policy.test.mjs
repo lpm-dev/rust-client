@@ -10,6 +10,57 @@ function read(relative) {
   return fs.readFileSync(path.join(repoRoot, relative), "utf8").replaceAll("\r\n", "\n");
 }
 
+function jobSource(workflow, job, nextJob) {
+  const start = workflow.indexOf(`\n  ${job}:\n`);
+  const end = workflow.indexOf(`\n  ${nextJob}:\n`, start + 1);
+  assert.notEqual(start, -1, `missing ${job} job`);
+  assert.notEqual(end, -1, `missing ${nextJob} job after ${job}`);
+  return workflow.slice(start, end);
+}
+
+test("nightly and candidate construction survives the unused verification branch being skipped", () => {
+  const workflow = read(".github/workflows/release.yml");
+  const constructionJobs = [
+    ["build", "notarize-macos", ["release-metadata", "release-preflight", "verify-windows-filesystem"]],
+    ["notarize-macos", "build-windows", ["build", "release-metadata"]],
+    ["build-windows", "sign-windows", ["release-metadata", "release-preflight", "verify-windows-filesystem"]],
+    ["sign-windows", "pack-npm-packages", ["build-windows", "release-metadata"]],
+    ["pack-npm-packages", "smoke-npm-packages", ["build", "notarize-macos", "sign-windows", "release-metadata"]],
+    ["smoke-npm-packages", "smoke-windows-recovery", ["pack-npm-packages", "release-metadata"]],
+    ["release", "smoke-standalone-installer", ["build", "smoke-npm-packages", "release-metadata"]],
+    ["smoke-standalone-installer", "seal-candidate", ["release", "release-metadata"]],
+  ];
+
+  for (const [job, nextJob, requiredJobs] of constructionJobs) {
+    const source = jobSource(workflow, job, nextJob);
+    assert.match(
+      source,
+      /if: >-\n\s+(?:always\(\)|!cancelled\(\)) &&/,
+      `${job} must override the implicit skipped-ancestor status check`,
+    );
+    for (const requiredJob of requiredJobs) {
+      assert.match(
+        source,
+        new RegExp(`needs\\.${requiredJob}\\.result == 'success'`),
+        `${job} must fail closed unless ${requiredJob} succeeds`,
+      );
+    }
+  }
+
+  for (const job of ["build", "build-windows"]) {
+    const source = jobSource(
+      workflow,
+      job,
+      job === "build" ? "notarize-macos" : "sign-windows",
+    );
+    assert.match(source, /mode == 'full' && needs\.verify\.result == 'success'/);
+    assert.match(
+      source,
+      /mode == 'candidate' && needs\.verify-candidate-source\.result == 'success'/,
+    );
+  }
+});
+
 test("stable releases build a candidate before promotion creates the tag", () => {
   const workflow = read(".github/workflows/release.yml");
   const downloader = read("scripts/ci/download-verified-artifact.sh");
