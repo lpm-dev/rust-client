@@ -792,6 +792,83 @@ async fn batch_metadata_json_keeps_valid_entries_when_some_are_malformed() {
 }
 
 #[tokio::test]
+async fn batch_metadata_json_no_store_response_does_not_persist_entries() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    let (client, _tmp) = client_with_mock_server(&server.uri());
+    let package_name = "json-no-store";
+    let metadata: serde_json::Value =
+        serde_json::from_str(&test_metadata_json(package_name)).unwrap();
+
+    Mock::given(method("POST"))
+        .and(path("/api/registry/batch-metadata"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .append_header("content-type", "application/json")
+                .append_header("cache-control", "no-store")
+                .set_body_json(serde_json::json!({
+                    "packages": { package_name: metadata }
+                })),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let result = client
+        .batch_metadata(&[package_name.to_string()])
+        .await
+        .unwrap();
+
+    assert!(result.contains_key(package_name));
+    assert!(
+        client
+            .read_metadata_cache(&client.npm_worker_metadata_cache_key(package_name).unwrap())
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn batch_metadata_ndjson_no_store_response_does_not_persist_entries() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    let (client, _tmp) = client_with_mock_server(&server.uri());
+    let package_name = "ndjson-no-store";
+    let metadata: serde_json::Value =
+        serde_json::from_str(&test_metadata_json(package_name)).unwrap();
+    let body = format!(
+        "{}\n",
+        serde_json::json!({"name": package_name, "metadata": metadata})
+    );
+
+    Mock::given(method("POST"))
+        .and(path("/api/registry/batch-metadata"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .append_header("cache-control", "no-store")
+                .set_body_raw(body, "application/x-ndjson"),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let result = client
+        .batch_metadata(&[package_name.to_string()])
+        .await
+        .unwrap();
+
+    assert!(result.contains_key(package_name));
+    assert!(
+        client
+            .read_metadata_cache(&client.npm_worker_metadata_cache_key(package_name).unwrap())
+            .is_none()
+    );
+}
+
+#[tokio::test]
 async fn non_deep_json_batch_ignores_and_does_not_cache_unrequested_packages() {
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};

@@ -257,10 +257,16 @@ fn fresh_resolved_lockfile(
     lockfile.metadata.auto_isolated_peer_conflicts = input.auto_isolated_peer_conflicts;
 
     let persisted_packages = input.packages_for_lockfile;
+    let prior_lockfile = workspace_lockfile::read_full_shared(input.lockfile_path).ok();
+    let prior_unpacked_sizes = prior_lockfile.as_ref().map_or_else(HashMap::new, |prior| {
+        index_prior_unpacked_sizes(&prior.packages)
+    });
 
     for package in persisted_packages {
         verify_local_manifest_fingerprint(input.project_dir, package)?;
-        lockfile.add_package(locked_package_from_install_package(package));
+        let mut locked_package = locked_package_from_install_package(package);
+        preserve_prior_unpacked_size(&mut locked_package, &prior_unpacked_sizes);
+        lockfile.add_package(locked_package);
     }
 
     lockfile.root_aliases = root_aliases_for_lockfile(persisted_packages, input.deps);
@@ -376,6 +382,129 @@ pub(super) fn locked_package_from_install_package(
         peers: Vec::new(),
         peer_edges,
         tarball,
+    }
+}
+
+type RegistryArtifactIdentity<'a> = (&'a str, &'a str, &'a str, &'a str, &'a str);
+
+fn registry_artifact_identity(
+    package: &lpm_lockfile::LockedPackage,
+) -> Option<RegistryArtifactIdentity<'_>> {
+    let source = package
+        .source
+        .as_deref()
+        .filter(|source| source.starts_with("registry+") && !source.is_empty())?;
+    let integrity = package
+        .integrity
+        .as_deref()
+        .filter(|integrity| !integrity.is_empty())?;
+    let tarball = package
+        .tarball
+        .as_deref()
+        .filter(|tarball| !tarball.is_empty())?;
+    Some((
+        package.name.as_str(),
+        package.version.as_str(),
+        source,
+        integrity,
+        tarball,
+    ))
+}
+
+fn index_prior_unpacked_sizes(
+    prior_packages: &[lpm_lockfile::LockedPackage],
+) -> HashMap<RegistryArtifactIdentity<'_>, std::num::NonZeroU64> {
+    let mut sizes = HashMap::with_capacity(prior_packages.len());
+    for package in prior_packages {
+        if let (Some(identity), Some(unpacked_size)) =
+            (registry_artifact_identity(package), package.unpacked_size)
+        {
+            sizes.entry(identity).or_insert(unpacked_size);
+        }
+    }
+    sizes
+}
+
+fn preserve_prior_unpacked_size(
+    package: &mut lpm_lockfile::LockedPackage,
+    prior_unpacked_sizes: &HashMap<RegistryArtifactIdentity<'_>, std::num::NonZeroU64>,
+) {
+    if package.unpacked_size.is_some() {
+        return;
+    }
+    package.unpacked_size = registry_artifact_identity(package)
+        .and_then(|identity| prior_unpacked_sizes.get(&identity).copied());
+}
+
+#[cfg(test)]
+mod unpacked_size_preservation_tests {
+    use super::*;
+
+    fn registry_package(unpacked_size: Option<u64>) -> lpm_lockfile::LockedPackage {
+        lpm_lockfile::LockedPackage {
+            name: "stable-artifact".to_string(),
+            version: "1.2.3".to_string(),
+            source: Some("registry+https://registry.npmjs.org".to_string()),
+            integrity: Some("sha512-stable".to_string()),
+            unpacked_size: unpacked_size.and_then(std::num::NonZeroU64::new),
+            tarball: Some(
+                "https://registry.npmjs.org/stable-artifact/-/stable-artifact-1.2.3.tgz"
+                    .to_string(),
+            ),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn prior_unpacked_size_is_preserved_for_the_same_registry_artifact() {
+        let prior = registry_package(Some(4096));
+        let prior_unpacked_sizes = index_prior_unpacked_sizes(std::slice::from_ref(&prior));
+        let mut current = registry_package(None);
+
+        preserve_prior_unpacked_size(&mut current, &prior_unpacked_sizes);
+
+        assert_eq!(
+            current.unpacked_size.map(std::num::NonZeroU64::get),
+            Some(4096)
+        );
+    }
+
+    #[test]
+    fn current_unpacked_size_wins_over_the_prior_hint() {
+        let prior = registry_package(Some(4096));
+        let prior_unpacked_sizes = index_prior_unpacked_sizes(std::slice::from_ref(&prior));
+        let mut current = registry_package(Some(8192));
+
+        preserve_prior_unpacked_size(&mut current, &prior_unpacked_sizes);
+
+        assert_eq!(
+            current.unpacked_size.map(std::num::NonZeroU64::get),
+            Some(8192)
+        );
+    }
+
+    #[test]
+    fn prior_unpacked_size_is_not_preserved_when_artifact_identity_changes() {
+        for mutate in [
+            |package: &mut lpm_lockfile::LockedPackage| {
+                package.integrity = Some("sha512-different".to_string());
+            },
+            |package: &mut lpm_lockfile::LockedPackage| {
+                package.source = Some("registry+https://registry.example.test".to_string());
+            },
+            |package: &mut lpm_lockfile::LockedPackage| {
+                package.tarball = Some("https://registry.example.test/different.tgz".to_string());
+            },
+        ] {
+            let prior = registry_package(Some(4096));
+            let prior_unpacked_sizes = index_prior_unpacked_sizes(std::slice::from_ref(&prior));
+            let mut current = registry_package(None);
+            mutate(&mut current);
+
+            preserve_prior_unpacked_size(&mut current, &prior_unpacked_sizes);
+
+            assert_eq!(current.unpacked_size, None);
+        }
     }
 }
 

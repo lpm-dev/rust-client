@@ -129,6 +129,7 @@ fn read_cache_content_returns_etag_and_data() {
     assert!(content.is_some(), "cache content should be present");
     let content = content.unwrap();
     assert_eq!(content.etag.as_deref(), Some("W/\"xyz789\""));
+    assert_eq!(content.fresh_for, METADATA_CACHE_TTL);
     // Verify the data can be deserialized
     let deserialized: PackageMetadata = rmp_serde::from_slice(&content.data)
         .or_else(|_| serde_json::from_slice(&content.data))
@@ -145,6 +146,7 @@ fn read_cache_validator_returns_etag_without_deserializing_payload() {
 
     let mut content = Vec::new();
     content.extend_from_slice(METADATA_CACHE_MAGIC);
+    content.extend_from_slice(b"300\n");
     content.extend_from_slice(b"W/\"validator\"");
     content.push(b'\n');
     content.extend_from_slice(b"not-valid-metadata");
@@ -600,6 +602,491 @@ async fn direct_npm_metadata_etag_304_revalidation_refreshes_cache() {
             .is_some(),
         "304 should refresh cache freshness for the next TTL read"
     );
+}
+
+#[tokio::test]
+async fn legacy_schema_cache_never_supplies_a_validator_to_current_metadata_fetches() {
+    use sha2::{Digest as _, Sha256};
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    let tmp = tempfile::tempdir().expect("failed to create temp dir");
+    let mut client = RegistryClient::new()
+        .with_npm_registry_url(server.uri())
+        .with_synchronous_cache_writes(true);
+    client.cache_dir = Some(tmp.path().to_path_buf());
+
+    let npm_name = "legacy-schema-package";
+    let cache_key = client.npm_direct_metadata_cache_key(npm_name);
+    let mut hasher = Sha256::new();
+    hasher.update(cache_key.as_bytes());
+    let legacy_cache_path = tmp.path().join(&format!("{:x}", hasher.finalize())[..16]);
+    let legacy_payload = rmp_serde::to_vec_named(&serde_json::json!({
+        "name": npm_name,
+        "dist-tags": { "latest": "1.0.0" },
+        "versions": {
+            "1.0.0": {
+                "name": npm_name,
+                "version": "1.0.0",
+                "dist": {
+                    "tarball": "https://example.com/legacy-schema-package-1.0.0.tgz",
+                    "integrity": "sha512-current-artifact"
+                }
+            }
+        }
+    }))
+    .expect("serialize legacy cache payload");
+    let mut legacy_entry = b"LPM-MD-V3\n\"legacy-etag\"\n".to_vec();
+    legacy_entry.extend_from_slice(&legacy_payload);
+    std::fs::write(&legacy_cache_path, legacy_entry).expect("seed legacy cache entry");
+    let stale = filetime::FileTime::from_unix_time(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64
+            - 600,
+        0,
+    );
+    filetime::set_file_mtime(&legacy_cache_path, stale).expect("expire legacy cache entry");
+
+    let conditional_requests = Arc::new(AtomicUsize::new(0));
+    let conditional_requests_for_responder = Arc::clone(&conditional_requests);
+    Mock::given(method("GET"))
+        .and(path("/legacy-schema-package"))
+        .respond_with(move |request: &wiremock::Request| {
+            if request.headers.get("if-none-match").is_some() {
+                conditional_requests_for_responder.fetch_add(1, Ordering::SeqCst);
+                return ResponseTemplate::new(304);
+            }
+            ResponseTemplate::new(200)
+                .set_body_json(serde_json::json!({
+                    "name": npm_name,
+                    "dist-tags": { "latest": "1.0.0" },
+                    "versions": {
+                        "1.0.0": {
+                            "name": npm_name,
+                            "version": "1.0.0",
+                            "dist": {
+                                "tarball": "https://example.com/legacy-schema-package-1.0.0.tgz",
+                                "integrity": "sha512-current-artifact",
+                                "unpackedSize": 4096
+                            }
+                        }
+                    }
+                }))
+                .append_header("ETag", "\"legacy-etag\"")
+        })
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let metadata = client
+        .get_npm_metadata_direct(npm_name)
+        .await
+        .expect("current metadata fetch should replace the legacy representation");
+
+    assert_eq!(conditional_requests.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        metadata.versions["1.0.0"]
+            .dist
+            .as_ref()
+            .and_then(|dist| dist.unpacked_size)
+            .map(std::num::NonZeroU64::get),
+        Some(4096)
+    );
+}
+
+#[test]
+fn legacy_schema_file_never_suppresses_current_batch_prefetch() {
+    use sha2::{Digest as _, Sha256};
+
+    let tmp = tempfile::tempdir().expect("failed to create temp dir");
+    let mut client = RegistryClient::new();
+    client.cache_dir = Some(tmp.path().to_path_buf());
+    let package_name = "legacy-batch-prefetch";
+    let cache_key = client.batch_metadata_cache_key(package_name).unwrap();
+    let mut hasher = Sha256::new();
+    hasher.update(cache_key.as_bytes());
+    let legacy_cache_path = tmp.path().join(&format!("{:x}", hasher.finalize())[..16]);
+    std::fs::write(&legacy_cache_path, b"LPM-MD-V3\n\nlegacy").unwrap();
+    filetime::set_file_mtime(
+        &legacy_cache_path,
+        filetime::FileTime::from_system_time(
+            std::time::SystemTime::now() + std::time::Duration::from_secs(300),
+        ),
+    )
+    .unwrap();
+
+    assert!(
+        !client.is_metadata_fresh(package_name),
+        "legacy schema files must not suppress a current-schema batch request"
+    );
+}
+
+#[tokio::test]
+async fn no_store_metadata_is_fetched_again_instead_of_entering_disk_or_memory_cache() {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    let tmp = tempfile::tempdir().expect("failed to create temp dir");
+    let mut base = RegistryClient::new()
+        .with_npm_registry_url(server.uri())
+        .with_synchronous_cache_writes(true);
+    base.cache_dir = Some(tmp.path().to_path_buf());
+    let client = base.clone_with_metadata_memory_cache();
+    let npm_name = "no-store-package";
+    let request_count = Arc::new(AtomicUsize::new(0));
+    let request_count_for_responder = Arc::clone(&request_count);
+
+    Mock::given(method("GET"))
+        .and(path("/no-store-package"))
+        .respond_with(move |_request: &wiremock::Request| {
+            let version = request_count_for_responder.fetch_add(1, Ordering::SeqCst) + 1;
+            ResponseTemplate::new(200)
+                .set_body_string(test_metadata_json_with_version(
+                    npm_name,
+                    &format!("{version}.0.0"),
+                ))
+                .append_header("Cache-Control", "no-store")
+        })
+        .expect(2)
+        .mount(&server)
+        .await;
+
+    let first = client.get_npm_metadata_direct(npm_name).await.unwrap();
+    let second = client.get_npm_metadata_direct(npm_name).await.unwrap();
+
+    assert_eq!(first.latest_version.as_deref(), Some("1.0.0"));
+    assert_eq!(second.latest_version.as_deref(), Some("2.0.0"));
+    assert_eq!(request_count.load(Ordering::SeqCst), 2);
+    assert!(
+        !client
+            .cache_path(&client.npm_direct_metadata_cache_key(npm_name))
+            .unwrap()
+            .exists(),
+        "no-store response must not persist a metadata cache file"
+    );
+}
+
+#[tokio::test]
+async fn no_cache_metadata_is_conditionally_revalidated_on_the_next_read() {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    let tmp = tempfile::tempdir().expect("failed to create temp dir");
+    let mut client = RegistryClient::new()
+        .with_npm_registry_url(server.uri())
+        .with_synchronous_cache_writes(true);
+    client.cache_dir = Some(tmp.path().to_path_buf());
+    let npm_name = "no-cache-package";
+    let request_count = Arc::new(AtomicUsize::new(0));
+    let request_count_for_responder = Arc::clone(&request_count);
+
+    Mock::given(method("GET"))
+        .and(path("/no-cache-package"))
+        .respond_with(move |request: &wiremock::Request| {
+            let attempt = request_count_for_responder.fetch_add(1, Ordering::SeqCst);
+            if attempt == 0 {
+                return ResponseTemplate::new(200)
+                    .set_body_string(test_metadata_json(npm_name))
+                    .append_header("ETag", "\"no-cache-v1\"")
+                    .append_header("Cache-Control", "no-cache");
+            }
+            assert_eq!(
+                request
+                    .headers
+                    .get("if-none-match")
+                    .and_then(|value| value.to_str().ok()),
+                Some("\"no-cache-v1\"")
+            );
+            ResponseTemplate::new(304).append_header("Cache-Control", "no-cache")
+        })
+        .expect(2)
+        .mount(&server)
+        .await;
+
+    client.get_npm_metadata_direct(npm_name).await.unwrap();
+    client.get_npm_metadata_direct(npm_name).await.unwrap();
+
+    assert_eq!(request_count.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn response_age_does_not_shorten_the_bounded_local_freshness_window() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    let tmp = tempfile::tempdir().expect("failed to create temp dir");
+    let mut client = RegistryClient::new()
+        .with_npm_registry_url(server.uri())
+        .with_synchronous_cache_writes(true);
+    client.cache_dir = Some(tmp.path().to_path_buf());
+    let npm_name = "ignore-response-age";
+
+    Mock::given(method("GET"))
+        .and(path("/ignore-response-age"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string(test_metadata_json(npm_name))
+                .append_header("Cache-Control", "max-age=60")
+                .append_header("Age", "3600"),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    client.get_npm_metadata_direct(npm_name).await.unwrap();
+    client.get_npm_metadata_direct(npm_name).await.unwrap();
+
+    let cache_key = client.npm_direct_metadata_cache_key(npm_name);
+    let content = client
+        .read_cache_content(&cache_key)
+        .expect("max-age response should be cached");
+    assert_eq!(content.fresh_for, std::time::Duration::from_secs(60));
+}
+
+#[tokio::test]
+async fn not_modified_response_replaces_etag_and_freshness_policy() {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    let tmp = tempfile::tempdir().expect("failed to create temp dir");
+    let mut client = RegistryClient::new()
+        .with_npm_registry_url(server.uri())
+        .with_synchronous_cache_writes(true);
+    client.cache_dir = Some(tmp.path().to_path_buf());
+    let npm_name = "replace-304-policy";
+    let request_count = Arc::new(AtomicUsize::new(0));
+    let request_count_for_responder = Arc::clone(&request_count);
+
+    Mock::given(method("GET"))
+        .and(path("/replace-304-policy"))
+        .respond_with(move |request: &wiremock::Request| {
+            if request_count_for_responder.fetch_add(1, Ordering::SeqCst) == 0 {
+                return ResponseTemplate::new(200)
+                    .set_body_string(test_metadata_json(npm_name))
+                    .append_header("ETag", "\"v1\"")
+                    .append_header("Cache-Control", "no-cache");
+            }
+            assert_eq!(
+                request
+                    .headers
+                    .get("if-none-match")
+                    .and_then(|value| value.to_str().ok()),
+                Some("\"v1\"")
+            );
+            ResponseTemplate::new(304)
+                .append_header("ETag", "\"v2\"")
+                .append_header("Cache-Control", "max-age=120")
+        })
+        .expect(2)
+        .mount(&server)
+        .await;
+
+    client.get_npm_metadata_direct(npm_name).await.unwrap();
+    client.get_npm_metadata_direct(npm_name).await.unwrap();
+    client.get_npm_metadata_direct(npm_name).await.unwrap();
+
+    let cache_key = client.npm_direct_metadata_cache_key(npm_name);
+    let content = client
+        .read_cache_content(&cache_key)
+        .expect("304 should preserve the cached body");
+    assert_eq!(content.etag.as_deref(), Some("\"v2\""));
+    assert_eq!(content.fresh_for, std::time::Duration::from_secs(120));
+    assert_eq!(request_count.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn custom_registry_rejects_and_does_not_cache_mismatched_package_identity() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    let tmp = tempfile::tempdir().expect("failed to create temp dir");
+    let mut client = RegistryClient::new().with_synchronous_cache_writes(true);
+    client.cache_dir = Some(tmp.path().to_path_buf());
+    let requested_name = "requested-custom-package";
+
+    Mock::given(method("GET"))
+        .and(path("/requested-custom-package"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string(test_metadata_json("different-custom-package")),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let result = client
+        .get_npm_metadata_from(&server.uri(), requested_name, None)
+        .await;
+
+    assert!(
+        matches!(result, Err(LpmError::Registry(message)) if message.contains("unexpected package"))
+    );
+    let url = format!("{}/{requested_name}", server.uri());
+    let cache_key = format!(
+        "npm:{}:{url}",
+        principal_fingerprint(None, client.http.identity_fp_for_url(&url))
+    );
+    assert!(
+        !client.cache_path(&cache_key).unwrap().exists(),
+        "identity-mismatched metadata must not enter the cache"
+    );
+}
+
+#[tokio::test]
+async fn no_store_invalidation_wins_over_an_older_queued_cache_write() {
+    let tmp = tempfile::tempdir().expect("failed to create temp dir");
+    let mut client = RegistryClient::new();
+    client.cache_dir = Some(tmp.path().to_path_buf());
+    let key = "queued-write-then-no-store";
+    let metadata = test_metadata("queued-write-then-no-store");
+
+    client.write_metadata_cache(key, &metadata, Some("\"old\""));
+    client.write_metadata_cache_with_directive(
+        key,
+        &metadata,
+        Some("\"new\""),
+        MetadataCacheDirective::NoStore,
+    );
+    client.flush_pending_cache_writes().await;
+
+    assert!(!client.cache_path(key).unwrap().exists());
+}
+
+#[tokio::test]
+async fn newest_queued_cache_write_wins_even_if_workers_complete_out_of_order() {
+    let tmp = tempfile::tempdir().expect("failed to create temp dir");
+    let mut client = RegistryClient::new();
+    client.cache_dir = Some(tmp.path().to_path_buf());
+    let key = "ordered-queued-writes";
+    let older = test_metadata("older-value");
+    let newer = test_metadata("newer-value");
+
+    client.write_metadata_cache(key, &older, Some("\"old\""));
+    client.write_metadata_cache(key, &newer, Some("\"new\""));
+    client.flush_pending_cache_writes().await;
+
+    let (cached, etag) = client
+        .read_metadata_cache(key)
+        .expect("newest queued write should persist");
+    assert_eq!(cached.name, "newer-value");
+    assert_eq!(etag.as_deref(), Some("\"new\""));
+}
+
+#[tokio::test]
+async fn unsolicited_304_without_a_sent_validator_is_retried_unconditionally() {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    let tmp = tempfile::tempdir().expect("failed to create temp dir");
+    let mut client = RegistryClient::new()
+        .with_npm_registry_url(server.uri())
+        .with_synchronous_cache_writes(true);
+    client.cache_dir = Some(tmp.path().to_path_buf());
+    let npm_name = "unsolicited-304";
+    let cache_key = client.npm_direct_metadata_cache_key(npm_name);
+    let cached: PackageMetadata =
+        serde_json::from_str(&test_metadata_json_with_version(npm_name, "1.0.0")).unwrap();
+    client.write_metadata_cache(&cache_key, &cached, None);
+    expire_cache_entry(&client, &cache_key);
+
+    let request_count = Arc::new(AtomicUsize::new(0));
+    let request_count_for_responder = Arc::clone(&request_count);
+    Mock::given(method("GET"))
+        .and(path("/unsolicited-304"))
+        .respond_with(move |request: &wiremock::Request| {
+            assert!(request.headers.get("if-none-match").is_none());
+            if request_count_for_responder.fetch_add(1, Ordering::SeqCst) == 0 {
+                ResponseTemplate::new(304)
+            } else {
+                ResponseTemplate::new(200)
+                    .set_body_string(test_metadata_json_with_version(npm_name, "2.0.0"))
+            }
+        })
+        .expect(2)
+        .mount(&server)
+        .await;
+
+    let refreshed = client.get_npm_metadata_direct(npm_name).await.unwrap();
+
+    assert_eq!(refreshed.latest_version.as_deref(), Some("2.0.0"));
+    assert_eq!(request_count.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn explicit_revalidation_replaces_stale_command_memory_metadata() {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    let tmp = tempfile::tempdir().expect("failed to create temp dir");
+    let mut base = RegistryClient::new()
+        .with_npm_registry_url(server.uri())
+        .with_synchronous_cache_writes(true);
+    base.cache_dir = Some(tmp.path().to_path_buf());
+    let client = base.clone_with_metadata_memory_cache();
+    let npm_name = "replace-command-memory";
+    let request_count = Arc::new(AtomicUsize::new(0));
+    let request_count_for_responder = Arc::clone(&request_count);
+
+    Mock::given(method("GET"))
+        .and(path("/replace-command-memory"))
+        .respond_with(move |_request: &wiremock::Request| {
+            let attempt = request_count_for_responder.fetch_add(1, Ordering::SeqCst);
+            let version = if attempt == 0 { "1.0.0" } else { "2.0.0" };
+            ResponseTemplate::new(200)
+                .set_body_string(test_metadata_json_with_version(npm_name, version))
+                .append_header("ETag", format!("\"v{}\"", attempt + 1))
+        })
+        .expect(2)
+        .mount(&server)
+        .await;
+
+    let initial = client.get_npm_metadata_direct(npm_name).await.unwrap();
+    let revalidated = client
+        .revalidate_npm_metadata_direct_with_timings(npm_name)
+        .await
+        .unwrap();
+    let after_revalidation = client.get_npm_metadata_direct(npm_name).await.unwrap();
+
+    assert_eq!(initial.latest_version.as_deref(), Some("1.0.0"));
+    assert_eq!(
+        revalidated.metadata.latest_version.as_deref(),
+        Some("2.0.0")
+    );
+    assert_eq!(after_revalidation.latest_version.as_deref(), Some("2.0.0"));
 }
 
 #[tokio::test]
@@ -1116,6 +1603,7 @@ async fn direct_npm_304_with_undecodable_cached_payload_refetches_without_valida
         .expect("cache path should exist");
     let mut corrupted_content = Vec::new();
     corrupted_content.extend_from_slice(METADATA_CACHE_MAGIC);
+    corrupted_content.extend_from_slice(b"300\n");
     corrupted_content.extend_from_slice(b"\"direct-v1\"");
     corrupted_content.push(b'\n');
     corrupted_content.extend_from_slice(b"not-valid-metadata");
@@ -1346,6 +1834,7 @@ async fn custom_metadata_304_with_lost_cached_body_refetches_with_auth_without_v
         .expect("custom metadata cache path should exist");
     let mut validator_only = Vec::new();
     validator_only.extend_from_slice(METADATA_CACHE_MAGIC);
+    validator_only.extend_from_slice(b"300\n");
     validator_only.extend_from_slice(b"\"custom-v1\"");
     validator_only.push(b'\n');
     validator_only.extend_from_slice(b"lost-cache-body");
@@ -1432,6 +1921,7 @@ async fn etag_304_with_undecodable_cached_payload_refetches_lpm_metadata() {
     let corrupted_data = b"not-valid-metadata";
     let mut corrupted_content = Vec::new();
     corrupted_content.extend_from_slice(METADATA_CACHE_MAGIC);
+    corrupted_content.extend_from_slice(b"300\n");
     corrupted_content.extend_from_slice(b"\"v1\"");
     corrupted_content.push(b'\n');
     corrupted_content.extend_from_slice(corrupted_data);
@@ -1542,6 +2032,7 @@ async fn npm_etag_304_with_undecodable_cached_payload_refetches_proxy_metadata()
     let corrupted_data = b"not-valid-npm-metadata";
     let mut corrupted_content = Vec::new();
     corrupted_content.extend_from_slice(METADATA_CACHE_MAGIC);
+    corrupted_content.extend_from_slice(b"300\n");
     corrupted_content.extend_from_slice(b"\"npm-v1\"");
     corrupted_content.push(b'\n');
     corrupted_content.extend_from_slice(corrupted_data);
@@ -2154,7 +2645,7 @@ fn oversized_metadata_cache_file_collapses_to_miss() {
     // magic byte — we want to prove the size check fires before
     // the magic comparison.
     let mut padding = METADATA_CACHE_MAGIC.to_vec();
-    padding.extend(b"\n"); // empty ETag line
+    padding.extend(b"300\n\n");
     padding.resize((METADATA_CACHE_FILE_CAP + 1024) as usize, b'x');
     std::fs::write(&cache_file, &padding).expect("rewrite cache file oversized");
 

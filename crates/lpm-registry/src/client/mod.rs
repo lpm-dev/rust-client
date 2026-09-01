@@ -70,8 +70,14 @@ use self::body::{
     parse_capped_api_json_with_timing, parse_capped_metadata, parse_capped_metadata_with_timing,
     parse_capped_metadata_with_timing_limit, read_capped_error_text,
 };
+use self::cache::MetadataCacheDirective;
 use self::http::{CONNECT_TIMEOUT, READ_TIMEOUT, build_per_origin_http_client};
-use self::state::{CacheContent, CacheValidator, CachedClient, TlsMaterialBudget};
+#[cfg(test)]
+use self::state::CacheContent;
+use self::state::{
+    CacheValidator, CachedClient, MetadataCacheEntry, MetadataCacheMutation,
+    MetadataCommandCachePolicy, MetadataMemoryEntry, TlsMaterialBudget,
+};
 use self::state::{LazyIdentityCert, LazyIdentityMaterial, MAX_NPMRC_TLS_CLIENT_SETS};
 use self::transport::PublishSafeResponse;
 use self::url_gate::validate_pem_root;
@@ -79,7 +85,7 @@ use self::url_gate::validate_pem_root;
 #[cfg(test)]
 use self::body::MAX_API_RESPONSE_BYTES;
 #[cfg(test)]
-use self::cache::{METADATA_CACHE_FILE_CAP, METADATA_CACHE_MAGIC};
+use self::cache::{METADATA_CACHE_FILE_CAP, METADATA_CACHE_MAGIC, METADATA_CACHE_TTL};
 #[cfg(test)]
 use self::tarball::{flush_tarball_file, write_tarball_chunk};
 #[cfg(test)]
