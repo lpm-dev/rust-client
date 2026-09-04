@@ -216,7 +216,7 @@ test("macOS release workflow provisions, notarizes, staples, and executes the bu
   assert.match(releaseWorkflow, /xcrun stapler staple/);
   assert.match(releaseWorkflow, /xcrun stapler validate/);
   assert.equal(
-    [...releaseWorkflow.matchAll(/ditto -c -k --keepParent --norsrc/g)].length,
+    [...releaseWorkflow.matchAll(/ditto -c -k (?:--keepParent )?--norsrc/g)].length,
     3,
     "every public or notarization ZIP must exclude AppleDouble metadata",
   );
@@ -227,6 +227,41 @@ test("macOS release workflow provisions, notarizes, staples, and executes the bu
     /"\$APP_ASSEMBLER" "\$BINARY" "\$STAGING_DIR" "\$PROVISIONING_PROFILE"/,
   );
   assert.doesNotMatch(releaseWorkflow, /--entitlements "\$APPLE_CODESIGN_ENTITLEMENTS"\s*\\\s*--sign[^\n]+\s*\\\s*"\$\{\{ matrix\.binary \}\}"/);
+});
+
+test("standalone macOS notarization archive extracts the binary from its root", () => {
+  const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../../..");
+  const releaseWorkflow = fs.readFileSync(
+    path.join(repoRoot, ".github/workflows/release.yml"),
+    "utf8",
+  );
+  const archiveStart = releaseWorkflow.indexOf("- name: Archive signed macOS notarization inputs");
+  const archiveEnd = releaseWorkflow.indexOf(
+    "- name: Restore Keychain search list before executing release code (macOS)",
+    archiveStart,
+  );
+  const extractStart = releaseWorkflow.indexOf("- name: Extract and verify signed macOS inputs");
+  const extractEnd = releaseWorkflow.indexOf(
+    "- name: Submit macOS artifacts for notarization once",
+    extractStart,
+  );
+
+  assert.notEqual(archiveStart, -1, "missing macOS notarization archive step");
+  assert.ok(archiveEnd > archiveStart, "missing step after macOS notarization archive");
+  assert.notEqual(extractStart, -1, "missing macOS notarization extraction step");
+  assert.ok(extractEnd > extractStart, "missing step after macOS notarization extraction");
+
+  const archive = releaseWorkflow.slice(archiveStart, archiveEnd);
+  const extract = releaseWorkflow.slice(extractStart, extractEnd);
+  assert.match(
+    archive,
+    /ditto -c -k --norsrc "\$\{\{ matrix\.binary \}\}" "\$LEGACY_NOTARY_ZIP"/,
+    "the standalone file must not use --keepParent, which adds its enclosing directory",
+  );
+  assert.match(
+    extract,
+    /cp "\$RUNNER_TEMP\/\$\{\{ matrix\.binary \}\}-legacy\/\$\{\{ matrix\.binary \}\}" "\$\{\{ matrix\.binary \}\}"/,
+  );
 });
 
 test("macOS app bundles declare and package the LPM icon", () => {

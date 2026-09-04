@@ -723,7 +723,7 @@ jobs:
           BUNDLE_NOTARY_ZIP="notarization-input/${{ matrix.binary }}-bundle-notary.zip"
           ditto -c -k --keepParent --norsrc "$APP_BUNDLE" "$BUNDLE_NOTARY_ZIP"
           LEGACY_NOTARY_ZIP="notarization-input/${{ matrix.binary }}-legacy-notary.zip"
-          ditto -c -k --keepParent --norsrc "${{ matrix.binary }}" "$LEGACY_NOTARY_ZIP"
+          ditto -c -k --norsrc "${{ matrix.binary }}" "$LEGACY_NOTARY_ZIP"
 
       - name: Restore Keychain search list before executing release code (macOS)
         if: runner.os == 'macOS'
