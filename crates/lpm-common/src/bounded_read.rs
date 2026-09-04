@@ -1,4 +1,6 @@
 use std::fs::{File, Metadata};
+#[cfg(debug_assertions)]
+use std::io::Write as _;
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 
@@ -314,6 +316,8 @@ fn read_opened_file_capped<R: Read>(
     limit: u64,
     estimated_len: u64,
 ) -> Result<Vec<u8>, BoundedReadError> {
+    #[cfg(debug_assertions)]
+    record_manifest_read_for_test(path);
     let read_limit = limit.checked_add(1).ok_or_else(|| BoundedReadError::Io {
         path: path.to_path_buf(),
         source: io::Error::new(io::ErrorKind::InvalidInput, "file size limit is too large"),
@@ -346,6 +350,24 @@ fn read_opened_file_capped<R: Read>(
         });
     }
     Ok(bytes)
+}
+
+#[cfg(debug_assertions)]
+fn record_manifest_read_for_test(path: &Path) {
+    if path.file_name() != Some(std::ffi::OsStr::new("lpm.json")) {
+        return;
+    }
+    let Some(log_path) = std::env::var_os("LPM_TEST_MANIFEST_READ_LOG") else {
+        return;
+    };
+    let Ok(mut log) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(log_path)
+    else {
+        return;
+    };
+    let _ = writeln!(log, "{}", path.display());
 }
 
 #[cfg(not(windows))]

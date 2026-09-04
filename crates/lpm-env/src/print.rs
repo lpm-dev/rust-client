@@ -2,7 +2,9 @@
 //!
 //! Supports multiple output formats for piping into other tools and CI systems.
 
-use std::collections::BTreeMap;
+use std::fmt::Write as _;
+
+use serde::ser::SerializeMap as _;
 
 /// POSIX env var name validation: first char `[A-Za-z_]`, rest
 /// `[A-Za-z0-9_]`, non-empty. The same shape NodeJS / dotenv parsers
@@ -75,7 +77,7 @@ pub fn format_env(
 ) -> String {
     // Sort for deterministic output; invalid keys are filtered here so
     // every downstream `format_*` helper sees a sanitized map.
-    let sorted: BTreeMap<&str, &str> = vars
+    let mut sorted: Vec<(&str, &str)> = vars
         .iter()
         .filter(|(k, _)| {
             if is_valid_env_var_name(k) {
@@ -90,6 +92,7 @@ pub fn format_env(
         })
         .map(|(k, v)| (k.as_str(), v.as_str()))
         .collect();
+    sorted.sort_unstable_by(|left, right| left.0.cmp(right.0));
 
     match format {
         PrintFormat::Shell => format_shell(&sorted),
@@ -100,56 +103,71 @@ pub fn format_env(
     }
 }
 
-fn format_shell(vars: &BTreeMap<&str, &str>) -> String {
-    vars.iter()
-        .map(|(k, v)| format!("export {k}={}", shell_quote(v)))
-        .collect::<Vec<_>>()
-        .join("\n")
+fn format_shell(vars: &[(&str, &str)]) -> String {
+    let mut output = String::with_capacity(output_capacity(vars, 9));
+    for (key, value) in vars {
+        start_line(&mut output);
+        output.push_str("export ");
+        output.push_str(key);
+        output.push('=');
+        push_shell_quoted(&mut output, value);
+    }
+    output
 }
 
-fn format_dotenv(vars: &BTreeMap<&str, &str>) -> String {
-    vars.iter()
-        .map(|(k, v)| {
-            // M39: newline injection — a vault value containing
-            // `\n` would, pre-fix, emit multiple physical dotenv
-            // lines, letting an attacker who controls one env var
-            // value set additional keys. Quote-and-escape `\n` /
-            // `\r` so the value stays a single dotenv assignment.
-            let needs_quote = v.contains(' ')
-                || v.contains('"')
-                || v.contains('\'')
-                || v.contains('#')
-                || v.contains('\n')
-                || v.contains('\r');
-            if needs_quote {
-                let escaped = v
-                    .replace('\\', "\\\\")
-                    .replace('"', "\\\"")
-                    .replace('\n', "\\n")
-                    .replace('\r', "\\r");
-                format!("{k}=\"{escaped}\"")
-            } else {
-                format!("{k}={v}")
+fn format_dotenv(vars: &[(&str, &str)]) -> String {
+    let mut output = String::with_capacity(output_capacity(vars, 4));
+    for (key, value) in vars {
+        start_line(&mut output);
+        output.push_str(key);
+        output.push('=');
+        let needs_quote = value.contains(' ')
+            || value.contains('\t')
+            || value.contains('"')
+            || value.contains('\'')
+            || value.contains('#')
+            || value.contains('\n')
+            || value.contains('\r');
+        if needs_quote {
+            output.push('"');
+            for character in value.chars() {
+                match character {
+                    '\\' => output.push_str("\\\\"),
+                    '"' => output.push_str("\\\""),
+                    '\n' => output.push_str("\\n"),
+                    '\r' => output.push_str("\\r"),
+                    '\t' => output.push_str("\\t"),
+                    other => output.push(other),
+                }
             }
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
+            output.push('"');
+        } else {
+            output.push_str(value);
+        }
+    }
+    output
 }
 
-fn format_json(vars: &BTreeMap<&str, &str>) -> String {
-    let map: serde_json::Map<String, serde_json::Value> = vars
-        .iter()
-        .map(|(k, v)| {
-            (
-                (*k).to_string(),
-                serde_json::Value::String((*v).to_string()),
-            )
-        })
-        .collect();
-    serde_json::to_string_pretty(&serde_json::Value::Object(map)).unwrap_or_default()
+struct BorrowedSortedMap<'a>(&'a [(&'a str, &'a str)]);
+
+impl serde::Serialize for BorrowedSortedMap<'_> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        let mut map = serializer.serialize_map(Some(self.0.len()))?;
+        for (key, value) in self.0 {
+            map.serialize_entry(key, value)?;
+        }
+        map.end()
+    }
 }
 
-fn format_docker(vars: &BTreeMap<&str, &str>) -> String {
+fn format_json(vars: &[(&str, &str)]) -> String {
+    serde_json::to_string_pretty(&BorrowedSortedMap(vars)).unwrap_or_default()
+}
+
+fn format_docker(vars: &[(&str, &str)]) -> String {
     // M39: Docker --env-file format does NOT support escaped newlines
     // or multiline values. Refuse to emit values that contain `\n`/`\r`
     // so an attacker who controls a vault value cannot smuggle extra
@@ -157,25 +175,28 @@ fn format_docker(vars: &BTreeMap<&str, &str>) -> String {
     // Refusing (with an empty assignment) is safer than silent
     // truncation — the consuming pipeline sees the value go missing
     // and fails loudly rather than silently honouring injected vars.
-    vars.iter()
-        .map(|(k, v)| {
-            if v.contains('\n') || v.contains('\r') {
-                format!(
-                    "# {k}: value contains newline — refused (would inject extra env-file lines)"
-                )
-            } else {
-                format!("{k}={v}")
-            }
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
+    let mut output = String::with_capacity(output_capacity(vars, 4));
+    for (key, value) in vars {
+        start_line(&mut output);
+        if value.contains('\n') || value.contains('\r') {
+            let _ = write!(
+                output,
+                "# {key}: value contains newline — refused (would inject extra env-file lines)"
+            );
+        } else {
+            output.push_str(key);
+            output.push('=');
+            output.push_str(value);
+        }
+    }
+    output
 }
 
 fn format_github_actions(
-    vars: &BTreeMap<&str, &str>,
+    vars: &[(&str, &str)],
     secrets: &std::collections::HashSet<String>,
 ) -> String {
-    let mut lines = Vec::new();
+    let mut output = String::with_capacity(output_capacity(vars, 48));
 
     // M39: multiline values must use the GHA `<<EOF` env-file form,
     // not `echo "KEY=value"` which would emit multiple physical lines
@@ -183,20 +204,24 @@ fn format_github_actions(
     // vars. `::add-mask::` similarly does NOT support newlines —
     // refuse to mask multiline secrets (the unmasked value would leak
     // in logs, which is worse than refusing the secret entirely).
-    for (k, v) in vars {
-        if secrets.contains(*k) {
-            if v.contains('\n') || v.contains('\r') {
-                lines.push(format!(
-                    "# {k}: multiline secret — refused (::add-mask:: does not support newlines)"
-                ));
+    for (key, value) in vars {
+        if secrets.contains(*key) {
+            start_line(&mut output);
+            if value.contains('\n') || value.contains('\r') {
+                let _ = write!(
+                    output,
+                    "# {key}: multiline secret — refused (::add-mask:: does not support newlines)"
+                );
             } else {
-                lines.push(format!("::add-mask::{v}"));
+                output.push_str("::add-mask::");
+                output.push_str(value);
             }
         }
     }
 
-    for (k, v) in vars {
-        if v.contains('\n') || v.contains('\r') {
+    for (key, value) in vars {
+        start_line(&mut output);
+        if value.contains('\n') || value.contains('\r') {
             // GHA multiline assignment shape:
             //   {KEY}<<__LPM_EOF__
             //   value-with-newlines
@@ -205,42 +230,78 @@ fn format_github_actions(
             // long random-ish constant rather than user input so a
             // crafted value can't terminate the heredoc early.
             const DELIM: &str = "__LPM_GHA_EOF__";
-            if v.contains(DELIM) {
-                lines.push(format!(
-                    "# {k}: value contains internal delimiter — refused (would close the heredoc early)"
-                ));
+            if value.contains(DELIM) {
+                let _ = write!(
+                    output,
+                    "# {key}: value contains internal delimiter — refused (would close the heredoc early)"
+                );
             } else {
-                lines.push(format!(
-                    "{{ echo {key_delim}; echo {value}; echo '{DELIM}'; }} >> \"$GITHUB_ENV\"",
-                    key_delim = shell_quote(&format!("{k}<<{DELIM}")),
-                    value = shell_quote(v),
-                ));
+                output.push_str("{ echo '");
+                output.push_str(key);
+                output.push_str("<<");
+                output.push_str(DELIM);
+                output.push_str("'; echo ");
+                push_shell_quoted(&mut output, value);
+                output.push_str("; echo '");
+                output.push_str(DELIM);
+                output.push_str("'; } >> \"$GITHUB_ENV\"");
             }
         } else {
-            lines.push(format!(
-                "echo {} >> \"$GITHUB_ENV\"",
-                shell_quote(&format!("{k}={v}"))
-            ));
+            output.push_str("echo '");
+            output.push_str(key);
+            output.push('=');
+            push_single_quoted_contents(&mut output, value);
+            output.push_str("' >> \"$GITHUB_ENV\"");
         }
     }
 
-    lines.join("\n")
+    output
 }
 
 /// Shell-quote a value: wrap in single quotes, escape existing single quotes.
+#[cfg(test)]
 fn shell_quote(value: &str) -> String {
-    if value.is_empty() {
-        return "''".to_string();
-    }
-    // If the value contains no special characters, return as-is
-    if value
-        .chars()
-        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '/' | ':' | '@'))
+    let mut output = String::with_capacity(value.len().saturating_add(2));
+    push_shell_quoted(&mut output, value);
+    output
+}
+
+fn push_shell_quoted(output: &mut String, value: &str) {
+    if !value.is_empty()
+        && value
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '/' | ':' | '@'))
     {
-        return value.to_string();
+        output.push_str(value);
+        return;
     }
-    // Wrap in single quotes, escape any existing single quotes
-    format!("'{}'", value.replace('\'', "'\\''"))
+    output.push('\'');
+    push_single_quoted_contents(output, value);
+    output.push('\'');
+}
+
+fn push_single_quoted_contents(output: &mut String, value: &str) {
+    let mut remainder = value;
+    while let Some(index) = remainder.find('\'') {
+        output.push_str(&remainder[..index]);
+        output.push_str("'\\''");
+        remainder = &remainder[index + 1..];
+    }
+    output.push_str(remainder);
+}
+
+fn start_line(output: &mut String) {
+    if !output.is_empty() {
+        output.push('\n');
+    }
+}
+
+fn output_capacity(vars: &[(&str, &str)], overhead_per_entry: usize) -> usize {
+    vars.iter().fold(0usize, |size, (key, value)| {
+        size.saturating_add(key.len())
+            .saturating_add(value.len())
+            .saturating_add(overhead_per_entry)
+    })
 }
 
 #[cfg(test)]
@@ -363,6 +424,15 @@ mod tests {
         let vars = make_vars(&[("VAL", "say \"hello\"")]);
         let output = format_env(&vars, PrintFormat::Dotenv, &HashSet::new());
         assert!(output.contains(r#"VAL="say \"hello\"""#));
+    }
+
+    #[test]
+    fn dotenv_escapes_control_whitespace_without_splitting_assignments() {
+        let vars = make_vars(&[("VAL", "\tleft\rright\nend\t")]);
+        let output = format_env(&vars, PrintFormat::Dotenv, &HashSet::new());
+
+        assert_eq!(output, r#"VAL="\tleft\rright\nend\t""#);
+        assert_eq!(output.lines().count(), 1);
     }
 
     #[test]

@@ -421,6 +421,21 @@ pub static VAULT_STORAGE_NATIVE: CheckEntry = CheckEntry {
     auto_fix: None,
 };
 
+pub static VAULT_STORAGE_NATIVE_WITH_FALLBACK: CheckEntry = CheckEntry {
+    code: "vault_storage_native_with_fallback",
+    name: "Vault storage backend",
+    category: Category::Auth,
+    tier: Tier::Fast,
+    description: "The vault data key is available from the OS secure store, but the older \
+         on-disk fallback key is still present and can decrypt the same local vault blobs.",
+    when_fires: "Running on Linux or Windows after native-key promotion could not remove the \
+         encrypted-file fallback key.",
+    remediation: "Check ownership and permissions for ~/.lpm, then run a vault command again so \
+         LPM CLI can remove ~/.lpm/.vault-fallback-key after verifying the native key.",
+    possible_severities: &[Severity::Warn],
+    auto_fix: None,
+};
+
 pub static VAULT_STORAGE_FALLBACK: CheckEntry = CheckEntry {
     code: "vault_storage_fallback",
     name: "Vault storage backend",
@@ -2113,6 +2128,7 @@ pub static CLI_CATALOG: &[&CheckEntry] = &[
     &AUTH_STORAGE_FALLBACK,
     &VAULT_STORAGE_KEYCHAIN,
     &VAULT_STORAGE_NATIVE,
+    &VAULT_STORAGE_NATIVE_WITH_FALLBACK,
     &VAULT_STORAGE_FALLBACK,
     &VAULT_STORAGE_UNAVAILABLE,
     // Policy extensions

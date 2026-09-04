@@ -414,14 +414,18 @@ impl GitHubActionsClient {
     async fn list_variables(&self) -> Result<HashMap<String, PlatformVariable>, LpmError> {
         let mut result = HashMap::new();
         let mut expected_total = None;
+        let mut response_budget = super::super::response::PlatformResponseBudget::new();
         let variables_url = self.variables_url()?;
         for page in 1..=GITHUB_MAX_PAGES {
             let url = format!("{}?per_page={GITHUB_PAGE_SIZE}&page={page}", variables_url);
-            let data: ActionsVariableList = self.get_json("variable list", &url).await?;
+            let data: ActionsVariableList = self
+                .get_json_with_budget("variable list", &url, &mut response_budget)
+                .await?;
             validate_page_total(data.total_count, expected_total, "variables")?;
             expected_total = Some(data.total_count);
             for variable in data.variables {
                 validate_value_name(&variable.name)?;
+                validate_value_size(&variable.name, &variable.value)?;
                 if result.contains_key(&variable.name) {
                     return Err(LpmError::Script(format!(
                         "GitHub returned duplicate Actions variable {}",
@@ -452,10 +456,13 @@ impl GitHubActionsClient {
     async fn list_secret_names(&self) -> Result<HashSet<String>, LpmError> {
         let mut result = HashSet::new();
         let mut expected_total = None;
+        let mut response_budget = super::super::response::PlatformResponseBudget::new();
         let secrets_url = self.secrets_url()?;
         for page in 1..=GITHUB_MAX_PAGES {
             let url = format!("{}?per_page={GITHUB_PAGE_SIZE}&page={page}", secrets_url);
-            let data: ActionsSecretList = self.get_json("secret list", &url).await?;
+            let data: ActionsSecretList = self
+                .get_json_with_budget("secret list", &url, &mut response_budget)
+                .await?;
             validate_page_total(data.total_count, expected_total, "secrets")?;
             expected_total = Some(data.total_count);
             for secret in data.secrets {
@@ -583,6 +590,20 @@ impl GitHubActionsClient {
         operation: &str,
         url: &str,
     ) -> Result<T, LpmError> {
+        self.get_json_with_budget(
+            operation,
+            url,
+            &mut super::super::response::PlatformResponseBudget::new(),
+        )
+        .await
+    }
+
+    async fn get_json_with_budget<T: serde::de::DeserializeOwned>(
+        &self,
+        operation: &str,
+        url: &str,
+        response_budget: &mut super::super::response::PlatformResponseBudget,
+    ) -> Result<T, LpmError> {
         let response = self
             .request(reqwest::Method::GET, url)
             .send()
@@ -593,7 +614,8 @@ impl GitHubActionsClient {
                     lpm_http::display_error(&error)
                 ))
             })?;
-        let (status, body) = read_platform_response(response).await?;
+        let (status, body) =
+            super::read_platform_response_with_budget(response, response_budget).await?;
         if !status.is_success() {
             return Err(github_api_error(operation, status, &body));
         }
@@ -781,6 +803,15 @@ fn validate_value_name(name: &str) -> Result<(), LpmError> {
     if !valid_length || !valid_first || !valid_rest || name.starts_with("GITHUB_") {
         return Err(LpmError::Script(format!(
             "invalid GitHub Actions value name '{name}'; use canonical uppercase letters, digits, and underscores, do not start with a digit, and do not use the GITHUB_ prefix"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_value_size(name: &str, value: &str) -> Result<(), LpmError> {
+    if value.len() > GITHUB_VALUE_MAX_BYTES {
+        return Err(LpmError::Script(format!(
+            "GitHub Actions value {name} exceeds the {GITHUB_VALUE_MAX_BYTES}-byte limit"
         )));
     }
     Ok(())
@@ -1341,6 +1372,41 @@ mod tests {
             .expect_err("unbounded pagination must fail closed");
 
         assert!(error.to_string().contains("more than 20 pages"));
+    }
+
+    #[tokio::test]
+    async fn oversized_remote_variable_value_fails_closed() {
+        let server = MockServer::start().await;
+        let _env = acceptance_env(&server, "github-oversized-remote-value");
+        Mock::given(method("GET"))
+            .and(path("/repos/lpm-dev/example"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(repository_response(123, "lpm-dev/example")),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/repos/lpm-dev/example/actions/variables"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "total_count": 1,
+                "variables": [{
+                    "name": "OVERSIZED_VALUE",
+                    "value": "x".repeat(GITHUB_VALUE_MAX_BYTES + 1)
+                }]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client = GitHubActionsClient::new("github-token".into(), config(None)).expect("client");
+
+        let error = client
+            .list()
+            .await
+            .expect_err("an oversized remote value must fail closed");
+
+        assert!(error.to_string().contains("exceeds the 49152-byte limit"));
     }
 
     #[tokio::test]

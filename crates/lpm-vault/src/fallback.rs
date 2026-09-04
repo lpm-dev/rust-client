@@ -11,7 +11,7 @@
 
 use aes_gcm::{
     Aes256Gcm, KeyInit,
-    aead::{Aead, generic_array::GenericArray},
+    aead::{AeadInPlace, generic_array::GenericArray},
 };
 use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
 use rand::RngCore;
@@ -156,6 +156,14 @@ fn fallback_key_exists(
         .is_some())
 }
 
+fn remove_fallback_key(
+    directory: &crate::storage_transaction::VaultStorageDirectory,
+) -> Result<(), String> {
+    directory
+        .remove_file_durable(FALLBACK_KEY_FILE, "vault fallback key")
+        .map(|_| ())
+}
+
 fn read_fallback_key(
     directory: &crate::storage_transaction::VaultStorageDirectory,
 ) -> Result<Option<String>, String> {
@@ -292,13 +300,14 @@ fn load_data_key_with_store_unlocked(
 
     match read_native_data_key(store) {
         Ok(Some(key)) => {
-            if let Some(file_key) = read_file_data_key(directory)?
-                && file_key.bytes != key.bytes
-            {
-                return Err(
-                    "native and file-fallback vault data keys conflict; both were preserved"
-                        .to_owned(),
-                );
+            if let Some(file_key) = read_file_data_key(directory)? {
+                if file_key.bytes != key.bytes {
+                    return Err(
+                        "native and file-fallback vault data keys conflict; both were preserved"
+                            .to_owned(),
+                    );
+                }
+                remove_fallback_key(directory)?;
             }
             return Ok(key);
         }
@@ -323,6 +332,7 @@ fn load_data_key_with_store_unlocked(
                             .to_owned(),
                     );
                 }
+                remove_fallback_key(directory)?;
                 Ok(DataKey {
                     bytes: file_key.bytes,
                     source: DataKeySource::Native,
@@ -369,7 +379,11 @@ fn storage_backend_status_unlocked(
 
     let store = KeyringNativeDataKeyStore;
     match read_native_data_key(&store) {
-        Ok(Some(_)) => crate::VaultStorageBackend::NativeProtected,
+        Ok(Some(_)) => match fallback_key_exists(directory) {
+            Ok(true) => crate::VaultStorageBackend::NativeProtectedWithFallback,
+            Ok(false) => crate::VaultStorageBackend::NativeProtected,
+            Err(message) => crate::VaultStorageBackend::Unavailable { message },
+        },
         Ok(None) => {
             if fallback_key_exists(directory).unwrap_or(false) {
                 return crate::VaultStorageBackend::FileFallback;
@@ -430,19 +444,28 @@ fn encrypt_with_store_unlocked(
     rand::thread_rng().fill_bytes(&mut iv);
     let nonce = GenericArray::from_slice(&iv);
 
-    let ciphertext = cipher
-        .encrypt(nonce, plaintext.as_bytes())
+    let mut encrypted = plaintext.as_bytes().to_vec();
+    let auth_tag = cipher
+        .encrypt_in_place_detached(nonce, b"", &mut encrypted)
         .map_err(|e| format!("encryption error: {e}"))?;
 
-    let tag_start = ciphertext.len() - 16;
-    let (encrypted, auth_tag) = ciphertext.split_at(tag_start);
+    let encoded_capacity = padded_base64_len(iv.len())
+        .and_then(|size| size.checked_add(1))
+        .and_then(|size| size.checked_add(padded_base64_len(auth_tag.len())?))
+        .and_then(|size| size.checked_add(1))
+        .and_then(|size| size.checked_add(padded_base64_len(encrypted.len())?))
+        .ok_or_else(|| "encrypted vault size overflow".to_owned())?;
+    let mut encoded = String::with_capacity(encoded_capacity);
+    BASE64.encode_string(iv, &mut encoded);
+    encoded.push(':');
+    BASE64.encode_string(auth_tag, &mut encoded);
+    encoded.push(':');
+    BASE64.encode_string(encrypted, &mut encoded);
+    Ok(encoded)
+}
 
-    Ok(format!(
-        "{}:{}:{}",
-        BASE64.encode(iv),
-        BASE64.encode(auth_tag),
-        BASE64.encode(encrypted)
-    ))
+fn padded_base64_len(input_len: usize) -> Option<usize> {
+    input_len.checked_add(2)?.checked_div(3)?.checked_mul(4)
 }
 
 #[cfg(test)]
@@ -462,23 +485,32 @@ fn decrypt_with_store_unlocked(
     encoded: &str,
     store: &dyn NativeDataKeyStore,
 ) -> Result<String, String> {
-    let parts: Vec<&str> = encoded.split(':').collect();
-    if parts.len() != 3 {
-        return Err("invalid encrypted format".to_string());
-    }
+    let (iv_encoded, remainder) = encoded
+        .split_once(':')
+        .ok_or_else(|| "invalid encrypted format".to_owned())?;
+    let (tag_encoded, encrypted_encoded) = remainder
+        .split_once(':')
+        .filter(|(_, encrypted)| !encrypted.contains(':'))
+        .ok_or_else(|| "invalid encrypted format".to_owned())?;
 
     let iv = BASE64
-        .decode(parts[0])
+        .decode(iv_encoded)
         .map_err(|e| format!("iv decode: {e}"))?;
     let auth_tag = BASE64
-        .decode(parts[1])
+        .decode(tag_encoded)
         .map_err(|e| format!("tag decode: {e}"))?;
-    let encrypted = BASE64
-        .decode(parts[2])
+    let mut encrypted = BASE64
+        .decode(encrypted_encoded)
         .map_err(|e| format!("data decode: {e}"))?;
 
     if iv.len() != 12 {
         return Err(format!("incompatible IV size: {} bytes", iv.len()));
+    }
+    if auth_tag.len() != 16 {
+        return Err(format!(
+            "incompatible authentication tag size: {} bytes",
+            auth_tag.len()
+        ));
     }
 
     let data_key = load_data_key_with_store_unlocked(directory, store)?;
@@ -486,14 +518,16 @@ fn decrypt_with_store_unlocked(
         .map_err(|e| format!("cipher init error: {e}"))?;
 
     let nonce = GenericArray::from_slice(&iv);
-    let mut combined = encrypted;
-    combined.extend_from_slice(&auth_tag);
-
-    let plaintext = cipher
-        .decrypt(nonce, combined.as_slice())
+    cipher
+        .decrypt_in_place_detached(
+            nonce,
+            b"",
+            &mut encrypted,
+            GenericArray::from_slice(&auth_tag),
+        )
         .map_err(|_| "decryption failed (wrong key or corrupted data)".to_string())?;
 
-    String::from_utf8(plaintext).map_err(|e| format!("utf8 error: {e}"))
+    String::from_utf8(encrypted).map_err(|e| format!("utf8 error: {e}"))
 }
 
 /// Internal format for multi-environment vault storage.
@@ -501,6 +535,11 @@ fn decrypt_with_store_unlocked(
 struct VaultData {
     #[serde(default)]
     environments: EnvironmentMap,
+}
+
+#[derive(serde::Serialize)]
+struct BorrowedVaultData<'a> {
+    environments: &'a EnvironmentMap,
 }
 
 /// Read vault secrets for a specific environment.
@@ -532,7 +571,7 @@ fn read_vault_file_env_unlocked(
     if let Ok(data) = serde_json::from_str::<VaultData>(&json)
         && !data.environments.is_empty()
     {
-        return Ok(data.environments.get(env).cloned());
+        return Ok(take_environment(data.environments, env));
     }
 
     // Fall back to old flat format (auto-migrate: treat as "default")
@@ -541,6 +580,10 @@ fn read_vault_file_env_unlocked(
     }
 
     Ok(None)
+}
+
+fn take_environment(mut environments: EnvironmentMap, env: &str) -> Option<SecretMap> {
+    environments.remove(env)
 }
 
 /// Read all environments from encrypted file.
@@ -554,11 +597,22 @@ pub(crate) fn read_all_environments_unlocked(
     directory: &crate::storage_transaction::VaultStorageDirectory,
     vault_id: &str,
 ) -> Result<Option<EnvironmentMap>, String> {
+    read_all_environments_with_digest_unlocked(directory, vault_id)
+        .map(|(environments, _)| environments)
+}
+
+pub(crate) fn read_all_environments_with_digest_unlocked(
+    directory: &crate::storage_transaction::VaultStorageDirectory,
+    vault_id: &str,
+) -> Result<(Option<EnvironmentMap>, Option<[u8; 32]>), String> {
+    use sha2::Digest as _;
+
     let vaults = directory.open_or_create_directory("vaults")?;
     let name = vault_file_name(vault_id);
     let Some(content) = vaults.read_owner_only_file(&name, "encrypted vault")? else {
-        return Ok(None);
+        return Ok((None, None));
     };
+    let digest = sha2::Sha256::digest(&content).into();
     let encoded = std::str::from_utf8(&content).map_err(|_| {
         format!(
             "encrypted vault {} is not valid UTF-8",
@@ -571,17 +625,30 @@ pub(crate) fn read_all_environments_unlocked(
     if let Ok(data) = serde_json::from_str::<VaultData>(&json)
         && !data.environments.is_empty()
     {
-        return Ok(Some(data.environments));
+        return Ok((Some(data.environments), Some(digest)));
     }
 
     // Fall back to old flat format → wrap as "default"
     if let Ok(flat) = serde_json::from_str::<HashMap<String, String>>(&json) {
         let mut envs = HashMap::new();
         envs.insert("default".to_string(), flat);
-        return Ok(Some(envs));
+        return Ok((Some(envs), Some(digest)));
     }
 
-    Ok(None)
+    Ok((None, Some(digest)))
+}
+
+pub(crate) fn vault_payload_digest_unlocked(
+    directory: &crate::storage_transaction::VaultStorageDirectory,
+    vault_id: &str,
+) -> Result<Option<[u8; 32]>, String> {
+    use sha2::Digest as _;
+
+    let vaults = directory.open_or_create_directory("vaults")?;
+    let name = vault_file_name(vault_id);
+    vaults
+        .read_owner_only_file(&name, "encrypted vault")
+        .map(|content| content.map(|content| sha2::Sha256::digest(content).into()))
 }
 
 /// Write vault secrets to encrypted file (specific environment).
@@ -600,9 +667,7 @@ pub(crate) fn write_all_environments_unlocked(
     vault_id: &str,
     environments: &EnvironmentMap,
 ) -> Result<(), String> {
-    let data = VaultData {
-        environments: environments.clone(),
-    };
+    let data = BorrowedVaultData { environments };
     let json =
         serde_json::to_string(&data).map_err(|e| format!("failed to serialize secrets: {e}"))?;
     let encrypted = encrypt_with_store_unlocked(directory, &json, &KeyringNativeDataKeyStore)?;
@@ -660,6 +725,20 @@ mod tests {
     use super::*;
     use std::cell::{Cell, RefCell};
     use std::path::Path;
+
+    #[test]
+    fn selected_environment_transfers_owned_secret_values() {
+        let value = "secret-value".to_owned();
+        let value_pointer = value.as_ptr();
+        let environments = HashMap::from([(
+            "default".to_owned(),
+            HashMap::from([("TOKEN".to_owned(), value)]),
+        )]);
+
+        let selected = take_environment(environments, "default").unwrap();
+
+        assert_eq!(selected["TOKEN"].as_ptr(), value_pointer);
+    }
 
     #[derive(Default)]
     struct FakeNativeDataKeyStore {
@@ -889,7 +968,7 @@ mod tests {
     }
 
     #[test]
-    fn data_key_promotes_existing_file_key_and_preserves_compatibility_copy() {
+    fn data_key_promotes_existing_file_key_and_removes_fallback_copy() {
         with_temp_vault_home(|_| {
             let file_key = with_storage_directory(get_or_create_file_data_key);
             assert!(with_storage_directory(fallback_key_exists));
@@ -899,7 +978,7 @@ mod tests {
 
             assert_eq!(promoted.bytes, file_key.bytes);
             assert_eq!(promoted.source, DataKeySource::Native);
-            assert!(with_storage_directory(fallback_key_exists));
+            assert!(!with_storage_directory(fallback_key_exists));
             assert_eq!(
                 decode_native_data_key(
                     store
@@ -916,7 +995,7 @@ mod tests {
 
     #[cfg(debug_assertions)]
     #[test]
-    fn data_key_decrypts_existing_file_blob_after_promotion_without_reencrypting() {
+    fn data_key_decrypts_existing_file_blob_after_promotion_without_file_fallback() {
         with_temp_vault_home(|_| {
             let store = FakeNativeDataKeyStore::default();
             unsafe {
@@ -932,7 +1011,7 @@ mod tests {
             let decrypted = decrypt_with_store(&encrypted, &store).expect("decrypt after promote");
 
             assert_eq!(decrypted, r#"{"API_KEY":"from-file"}"#);
-            assert!(with_storage_directory(fallback_key_exists));
+            assert!(!with_storage_directory(fallback_key_exists));
             assert!(store.key.borrow().is_some());
         });
     }
@@ -977,7 +1056,7 @@ mod tests {
 
     #[cfg(debug_assertions)]
     #[test]
-    fn storage_backend_reports_native_when_native_key_exists_with_stale_file_key() {
+    fn storage_backend_does_not_report_native_protection_with_stale_file_key() {
         with_temp_vault_home(|_| {
             let native_key = [7u8; 32];
             with_storage_directory(get_or_create_file_data_key);
@@ -988,7 +1067,7 @@ mod tests {
 
             assert_eq!(
                 storage_backend_status(),
-                crate::VaultStorageBackend::NativeProtected
+                crate::VaultStorageBackend::NativeProtectedWithFallback
             );
         });
     }

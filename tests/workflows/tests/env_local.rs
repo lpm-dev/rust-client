@@ -237,7 +237,9 @@ fn env_ls_human_renders_sync_columns_and_active_environment_footer() {
         .assert()
         .success();
 
+    let manifest_read_log = project.path().join("env-ls-manifest-reads.log");
     let out = lpm(&project)
+        .env("LPM_TEST_MANIFEST_READ_LOG", &manifest_read_log)
         .args(["env", "ls"])
         .output()
         .expect("failed to run lpm env ls");
@@ -279,6 +281,14 @@ fn env_ls_human_renders_sync_columns_and_active_environment_footer() {
     assert!(stdout.contains("2026-05-31T08:00:00Z"));
     assert!(stdout.contains("Active environment: default"));
     assert!(stdout.contains("Use lpm env list --env <name> to inspect secrets."));
+    assert_eq!(
+        std::fs::read_to_string(manifest_read_log)
+            .expect("read env-ls manifest access log")
+            .lines()
+            .count(),
+        1,
+        "env ls needs one validated manifest snapshot",
+    );
 
     let json_out = lpm(&project)
         .args(["--json", "env", "ls"])
@@ -660,7 +670,9 @@ fn env_diff_local_vs_local_reports_added_removed_and_changed_keys() {
         .assert()
         .success();
 
+    let manifest_read_log = project.path().join("env-diff-manifest-reads.log");
     let output = lpm(&project)
+        .env("LPM_TEST_MANIFEST_READ_LOG", &manifest_read_log)
         .args(["env", "diff", "a", "b"])
         .output()
         .expect("failed to run lpm env diff a b");
@@ -681,6 +693,14 @@ fn env_diff_local_vs_local_reports_added_removed_and_changed_keys() {
     assert!(
         combined.contains("FOO") && combined.contains("BAR"),
         "diff must mention both A-only and B-only keys, got:\n{combined}",
+    );
+    assert_eq!(
+        std::fs::read_to_string(manifest_read_log)
+            .expect("read env-diff manifest access log")
+            .lines()
+            .count(),
+        1,
+        "local env diff needs one validated manifest snapshot",
     );
 }
 

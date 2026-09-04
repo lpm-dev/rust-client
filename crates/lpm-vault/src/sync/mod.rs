@@ -23,6 +23,7 @@ mod org;
 mod pairing;
 mod personal;
 mod public_key;
+mod recipient_set;
 mod step_up;
 
 /// Error returned by authenticated env API operations.
@@ -30,7 +31,13 @@ mod step_up;
 pub enum SyncError {
     /// The server returned a non-success HTTP response.
     #[error("{message}")]
-    Http { status: u16, message: String },
+    Http {
+        status: u16,
+        code: Option<String>,
+        organization_id: Option<String>,
+        caller_user_id: Option<String>,
+        message: String,
+    },
     /// The server accepted the bearer but rejected a credential submitted by
     /// the operation itself.
     #[error("{message}")]
@@ -46,9 +53,53 @@ impl SyncError {
         matches!(self, Self::Http { status: 401, .. })
     }
 
+    /// Return whether the server supplied an exact structured HTTP error code.
+    pub fn has_http_code(&self, status: u16, code: &str) -> bool {
+        matches!(
+            self,
+            Self::Http {
+                status: actual_status,
+                code: Some(actual_code),
+                ..
+            } if *actual_status == status && actual_code == code
+        )
+    }
+
+    pub fn org_member_rewrap_identity(&self) -> Option<(&str, &str)> {
+        match self {
+            Self::Http {
+                status: 403,
+                code: Some(code),
+                organization_id: Some(organization_id),
+                caller_user_id: Some(caller_user_id),
+                ..
+            } if code == "vault_member_needs_rewrap" => Some((organization_id, caller_user_id)),
+            _ => None,
+        }
+    }
+
     pub(crate) fn http(status: reqwest::StatusCode, message: String) -> Self {
         Self::Http {
             status: status.as_u16(),
+            code: None,
+            organization_id: None,
+            caller_user_id: None,
+            message,
+        }
+    }
+
+    pub(crate) fn http_with_rewrap_identity(
+        status: reqwest::StatusCode,
+        code: Option<String>,
+        organization_id: Option<String>,
+        caller_user_id: Option<String>,
+        message: String,
+    ) -> Self {
+        Self::Http {
+            status: status.as_u16(),
+            code,
+            organization_id,
+            caller_user_id,
             message,
         }
     }
@@ -76,23 +127,30 @@ impl From<&str> for SyncError {
 pub use audit::{AuditEntry, AuditResponse, get_audit_log};
 pub use ci::{CiPullResponse, ci_pull, upload_escrow_key};
 pub use org::{
-    OrgPushRequest, PulledOrgVault, list_org_vaults, pull_org, push_org, push_org_with_keys,
+    OrgPushRequest, PulledOrgVault, list_org_vaults, org_version_preflight_bound_to_principal,
+    pull_org, pull_org_bound_to_principal, pull_org_with_scoped_key_bound_to_principal, push_org,
+    push_org_with_access, push_org_with_keys, push_org_with_keys_and_access,
 };
 pub use pairing::{
     PairingSession, approve_pairing, approve_pairing_legacy, get_pairing_session, stage_pairing,
     unpair_all,
 };
 pub use personal::{
-    ListVaultsResponse, PullResponse, PushMetadata, PushResponse, RemoteVault, list_remote, pull,
-    pull_env, pull_raw, pull_raw_for_rotation, push, push_raw,
+    ListVaultsResponse, PersonalPushOptions, PullResponse, PulledPersonalVault, PushMetadata,
+    PushResponse, RemoteVault, RemoteVaultRevision, list_remote, personal_version_preflight, pull,
+    pull_bound_to_principal, pull_env, pull_env_bound_to_principal, pull_raw, pull_raw_bound,
+    pull_raw_bound_to_principal, pull_raw_for_rotation, pull_raw_for_rotation_bound,
+    pull_raw_for_rotation_bound_to_principal, push, push_raw, push_raw_with_options,
 };
 pub use public_key::{
-    LocalPublicKeyState, MemberPublicKey, OrgMemberKeyAccess, PendingPublicKey,
-    PublicKeyRegistrationState, SharingKeyRotationLock, UploadPublicKeyResponse,
-    classify_public_key_state, create_pending_x25519_keypair, discard_pending_x25519_keypair,
-    get_my_public_key, get_org_member_key_access, get_org_member_keys,
-    promote_pending_x25519_keypair, read_pending_x25519_keypair,
-    try_acquire_sharing_key_rotation_lock, upload_public_key,
+    LocalPublicKeyState, MemberPublicKey, MyPublicKeyState, OrgMemberKeyAccess, PendingPublicKey,
+    PublicKeyRegistrationState, SharingKeyRotationLock, SharingKeyScope, UploadPublicKeyResponse,
+    classify_public_key_state, classify_public_key_state_from_member_access,
+    create_pending_x25519_keypair, discard_pending_x25519_keypair, get_my_public_key,
+    get_my_public_key_state, get_org_member_key_access, get_org_member_keys,
+    promote_pending_x25519_keypair, read_pending_x25519_keypair, resolve_local_public_key_state,
+    resolve_public_key_state_from_member_access, try_acquire_sharing_key_rotation_lock,
+    upload_public_key, upload_public_key_for_org,
 };
 pub use step_up::{
     CLI_STEP_UP_HEADER_NAME, CliStepUpCredential, CliStepUpPolicy, discover_cli_step_up_policy,
@@ -150,13 +208,19 @@ pub(crate) mod test_support {
             object.insert("requestNonce".into(), nonce.into());
             object
                 .entry("cryptoVersion")
-                .or_insert_with(|| serde_json::Value::from(2));
+                .or_insert_with(|| serde_json::Value::from(crate::crypto::CURRENT_CRYPTO_VERSION));
             match &self.scope {
                 TestSyncScope::Personal => {
                     object.insert("scope".into(), "personal".into());
+                    object.insert("principalId".into(), "personal-test-principal".into());
                 }
                 TestSyncScope::Organization(slug) => {
                     object.insert("scope".into(), "organization".into());
+                    object.insert("callerUserId".into(), "organization-test-caller".into());
+                    object.insert(
+                        "principalId".into(),
+                        "00000000-0000-4000-8000-000000000001".into(),
+                    );
                     object.insert("organizationSlug".into(), slug.clone().into());
                 }
             }

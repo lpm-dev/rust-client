@@ -5,6 +5,23 @@ const GITHUB_API_VERSION: &str = "2022-11-28";
 const GITHUB_OIDC_USER_AGENT: &str = "lpm-env-oidc";
 const OIDC_POLICY_ID_ENV: &str = "LPM_OIDC_POLICY_ID";
 
+fn build_oidc_exchange_body(
+    oidc_token: &str,
+    vault_id: &str,
+    env_mode: Option<&str>,
+    policy_id: &str,
+) -> serde_json::Value {
+    let mut body = serde_json::json!({
+        "oidcToken": oidc_token,
+        "vaultId": vault_id,
+        "policyId": policy_id,
+    });
+    if let Some(env_mode) = env_mode {
+        body["env"] = serde_json::Value::String(env_mode.to_owned());
+    }
+    body
+}
+
 struct GitHubRepositoryIdentity {
     id: String,
     full_name: String,
@@ -699,12 +716,12 @@ pub(super) async fn vars_oidc_pull(
         .map_err(|error| LpmError::Network(format!("failed to build HTTP client: {error}")))?;
     let exchange_response = client
         .post(format!("{registry_url}/api/vault/oidc"))
-        .json(&serde_json::json!({
-            "oidcToken": oidc_token,
-            "vaultId": vault_id,
-            "env": env_mode,
-            "policyId": policy_id,
-        }))
+        .json(&build_oidc_exchange_body(
+            &oidc_token,
+            &vault_id,
+            env_mode,
+            &policy_id,
+        ))
         .timeout(std::time::Duration::from_secs(30))
         .send()
         .await
@@ -739,49 +756,11 @@ pub(super) async fn vars_oidc_pull(
         .map_err(LpmError::Script)?;
 
     if let Some(file) = output_file {
-        // Write .env file with KEY=VALUE pairs
-        let mut content =
-            format!("# LPM vault secrets (env: {env_name})\n# Pulled via OIDC CI escrow\n");
+        let content = format_oidc_dotenv(&vars, &env_name);
         let mut keys: Vec<&String> = vars.keys().collect();
         keys.sort();
-        for key in &keys {
-            let value = &vars[*key];
-            // Quote values that contain spaces, newlines, or special chars
-            if value.contains(' ')
-                || value.contains('\n')
-                || value.contains('#')
-                || value.contains('"')
-            {
-                let escaped = value.replace('\\', "\\\\").replace('"', "\\\"");
-                content.push_str(&format!("{key}=\"{escaped}\"\n"));
-            } else {
-                content.push_str(&format!("{key}={value}\n"));
-            }
-        }
-
-        std::fs::write(file, &content)
+        write_oidc_dotenv_file(std::path::Path::new(file), &content)
             .map_err(|e| LpmError::Script(format!("failed to write {file}: {e}")))?;
-
-        // Restrict to owner-only on Unix. The default umask leaves
-        // dotenv files at 0o644 on most distros, which means any
-        // concurrent CI build step running as a different uid
-        // (sidecar containers, sibling daemons, shared runners) can
-        // read the plaintext secrets escrowed here. Best-effort: on
-        // filesystems without POSIX modes the chmod is a no-op, but
-        // the call is still cheap and the failure path is just a
-        // tracing::warn — never blocks the user's pipeline.
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let perms = std::fs::Permissions::from_mode(0o600);
-            if let Err(e) = std::fs::set_permissions(file, perms) {
-                tracing::warn!(
-                    path = %file,
-                    error = %e,
-                    "failed to set 0o600 on env-pull dotenv file; secret may be readable by other local uids",
-                );
-            }
-        }
 
         if !json_output {
             output::success_line(install_ui::terminal_line!(
@@ -807,6 +786,41 @@ pub(super) async fn vars_oidc_pull(
     }
 
     Ok(())
+}
+
+fn format_oidc_dotenv(vars: &std::collections::HashMap<String, String>, env_name: &str) -> String {
+    let mut content =
+        format!("# LPM vault secrets (env: {env_name})\n# Pulled via OIDC CI escrow\n");
+    content.push_str(&lpm_env::format_env(
+        vars,
+        lpm_env::PrintFormat::Dotenv,
+        &std::collections::HashSet::new(),
+    ));
+    if !vars.is_empty() {
+        content.push('\n');
+    }
+    content
+}
+
+fn write_oidc_dotenv_file_with(
+    path: &std::path::Path,
+    write: impl FnOnce(&mut std::fs::File) -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    lpm_common::write_file_atomic_with(
+        path,
+        lpm_common::AtomicWriteOptions::new()
+            .unix_mode(0o600)
+            .sync_file(),
+        write,
+    )
+}
+
+fn write_oidc_dotenv_file(path: &std::path::Path, content: &str) -> std::io::Result<()> {
+    use std::io::Write as _;
+
+    write_oidc_dotenv_file_with(path, |destination| {
+        destination.write_all(content.as_bytes())
+    })
 }
 
 fn resolve_oidc_pull_vault_id(project_dir: &std::path::Path) -> Result<String, LpmError> {
@@ -921,7 +935,81 @@ fn build_oidc_pull_error_message(error: &str, hint: &str, code: &str) -> String 
 
 #[cfg(test)]
 mod oidc_error_hint_tests {
-    use super::build_oidc_pull_error_message;
+    use std::collections::{HashMap, HashSet};
+    use std::io::Write as _;
+
+    use super::{
+        build_oidc_exchange_body, build_oidc_pull_error_message, format_oidc_dotenv,
+        write_oidc_dotenv_file_with,
+    };
+
+    #[test]
+    fn default_exchange_request_omits_the_optional_environment() {
+        let body = build_oidc_exchange_body(
+            "oidc-token",
+            "vault-id",
+            None,
+            "00000000-0000-4000-8000-000000000001",
+        );
+
+        assert!(!body.as_object().unwrap().contains_key("env"));
+    }
+
+    #[test]
+    fn oidc_dotenv_output_round_trips_every_supported_value_character() {
+        let vars = HashMap::from([
+            ("TAB".to_owned(), "\tleading and trailing\t".to_owned()),
+            ("CR".to_owned(), "left\rright".to_owned()),
+            ("LF".to_owned(), "left\nright".to_owned()),
+            (
+                "QUOTES".to_owned(),
+                "say \"hello\" and 'goodbye'".to_owned(),
+            ),
+            ("SLASH".to_owned(), r"C:\vault\secret".to_owned()),
+            ("DOLLAR".to_owned(), "$TOKEN".to_owned()),
+            ("BACKTICK".to_owned(), "`command`".to_owned()),
+        ]);
+
+        let output = format_oidc_dotenv(&vars, "production");
+        let parsed = lpm_runner::dotenv::parse_env_str(&output);
+
+        assert_eq!(parsed, vars);
+        assert_eq!(
+            lpm_env::format_env(&vars, lpm_env::PrintFormat::Dotenv, &HashSet::new()),
+            output.lines().skip(2).collect::<Vec<_>>().join("\n")
+        );
+    }
+
+    #[test]
+    fn oidc_dotenv_write_failure_preserves_the_existing_output() {
+        let directory = tempfile::tempdir().unwrap();
+        let output = directory.path().join("secrets.env");
+        std::fs::write(&output, b"ORIGINAL=secret\n").unwrap();
+
+        let error = write_oidc_dotenv_file_with(&output, |destination| {
+            destination.write_all(b"PARTIAL=")?;
+            Err(std::io::Error::other("injected write failure"))
+        })
+        .unwrap_err();
+
+        assert_eq!(error.kind(), std::io::ErrorKind::Other);
+        assert_eq!(std::fs::read(&output).unwrap(), b"ORIGINAL=secret\n");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn oidc_dotenv_output_is_owner_only() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let directory = tempfile::tempdir().unwrap();
+        let output = directory.path().join("secrets.env");
+        super::write_oidc_dotenv_file(&output, "TOKEN=secret\n").unwrap();
+
+        assert_eq!(
+            std::fs::metadata(output).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+    }
 
     #[test]
     fn server_hint_takes_precedence_over_code_mapping() {

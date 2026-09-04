@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use super::SyncError;
-use super::http::{read_capped_error_text, sync_http_client_builder, url_path_segment};
+use super::http::{read_capped_error_text, read_capped_json, sync_http_client, url_path_segment};
 
 /// Response from the CI pull endpoint (server-side decrypted secrets).
 #[derive(serde::Deserialize)]
@@ -20,9 +20,7 @@ pub async fn ci_pull(
     vault_id: &str,
     env: Option<&str>,
 ) -> Result<(HashMap<String, String>, String), String> {
-    let client = sync_http_client_builder()
-        .build()
-        .map_err(|e| format!("failed to build http client: {e}"))?;
+    let client = sync_http_client().map_err(|error| error.to_string())?;
     let mut url = format!(
         "{registry_url}/api/vaults/{}/ci-pull",
         url_path_segment(vault_id)
@@ -41,10 +39,7 @@ pub async fn ci_pull(
         .map_err(super::http::network_error)?;
 
     let status = response.status();
-    let result: CiPullResponse = response
-        .json()
-        .await
-        .map_err(|e| format!("response parse error: {e}"))?;
+    let result: CiPullResponse = read_capped_json(response).await?;
 
     if !status.is_success() {
         return Err(result
@@ -68,9 +63,7 @@ pub async fn upload_escrow_key(
     vault_id: &str,
     wrapping_key_hex: &str,
 ) -> Result<(), SyncError> {
-    let client = sync_http_client_builder()
-        .build()
-        .map_err(|e| format!("failed to build http client: {e}"))?;
+    let client = sync_http_client()?;
     let url = format!("{registry_url}/api/vault/oidc/escrow");
 
     let body = serde_json::json!({
@@ -110,6 +103,39 @@ mod tests {
     use super::*;
     use wiremock::matchers::{header, method, path, query_param};
     use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    #[tokio::test]
+    async fn ci_pull_rejects_an_oversized_declared_response() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let declared_length = crate::sync::http::MAX_VAULT_RESPONSE_BYTES + 1;
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0u8; 1024];
+            let _ = socket.read(&mut request).await;
+            socket
+                .write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {declared_length}\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n"
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+        });
+
+        let error = ci_pull(&format!("http://{addr}"), "oidc-token", "vault-123", None)
+            .await
+            .expect_err("an oversized CI response must be rejected");
+
+        assert!(
+            error.contains("response too large"),
+            "unexpected error: {error}"
+        );
+    }
 
     #[tokio::test]
     async fn ci_pull_returns_vars_and_requested_env() {

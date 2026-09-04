@@ -209,6 +209,15 @@ pub fn list_all(
     environments: Option<&EnvironmentsConfig>,
     vault_envs: &HashMap<String, HashMap<String, String>>,
 ) -> Vec<ResolvedEnv> {
+    list_all_from_vault_names(env_map, environments, vault_envs.keys().map(String::as_str))
+}
+
+/// List all configured environments plus an inventory of vault environment names.
+pub fn list_all_from_vault_names<'a>(
+    env_map: &HashMap<String, String>,
+    environments: Option<&EnvironmentsConfig>,
+    vault_environment_names: impl IntoIterator<Item = &'a str>,
+) -> Vec<ResolvedEnv> {
     let mut canonical_names = HashSet::new();
     let mut result = Vec::new();
 
@@ -248,22 +257,22 @@ pub fn list_all(
     // From vault — check each key against the canonical set.
     // DON'T call resolve() for unrecognized keys — that would canonicalize
     // "dev" → "development" and hide the legacy storage key.
-    let mut sorted_vault: Vec<_> = vault_envs.keys().collect();
-    sorted_vault.sort();
+    let mut sorted_vault: Vec<_> = vault_environment_names.into_iter().collect();
+    sorted_vault.sort_unstable();
     for vault_key in sorted_vault {
         if canonical_names.contains(vault_key) {
             // Already listed from config. Mark source as Vault.
-            if let Some(entry) = result.iter_mut().find(|e| e.canonical == *vault_key)
+            if let Some(entry) = result.iter_mut().find(|e| e.canonical == vault_key)
                 && entry.source == EnvSource::Config
             {
                 entry.source = EnvSource::Vault;
             }
         } else {
             // Vault key doesn't match any canonical name — surface as Legacy.
-            canonical_names.insert(vault_key.clone());
+            canonical_names.insert(vault_key.to_owned());
             result.push(ResolvedEnv {
-                canonical: vault_key.clone(),
-                storage_key: vault_key.clone(),
+                canonical: vault_key.to_owned(),
+                storage_key: vault_key.to_owned(),
                 alias: None,
                 file_path: None,
                 source: EnvSource::Legacy,

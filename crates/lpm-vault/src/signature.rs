@@ -3,8 +3,8 @@
 //! The server signs successful vault sync responses with HMAC-SHA256, using
 //! `SHA-256(auth_token)` as the key, and ships the base64-encoded signature
 //! in the `X-LPM-Signature` header. The CLI verifies the signature before
-//! parsing the body — so a tampered or replayed response never reaches the
-//! decryption path.
+//! parsing the body. This detects passive cache corruption and responses
+//! produced with a different bearer token.
 //!
 //! ## Why HMAC, not a public/private key
 //!
@@ -17,11 +17,12 @@
 //! ## What the AEAD already covers
 //!
 //! The encrypted blob is authenticated by AES-GCM, so confidentiality and
-//! blob-integrity are not affected by a missing/invalid signature. The
-//! HMAC adds tamper detection over the *response envelope*: `version`,
-//! `wrappedKey`, `vaultId`, `status`, and metadata. A TLS-terminating
-//! intermediary or a compromised CDN cache cannot forge a successful
-//! response without the auth token.
+//! blob integrity are not affected by a missing or invalid signature. The
+//! HMAC adds integrity over the *response envelope*: `version`, `wrappedKey`,
+//! `vaultId`, `status`, and metadata. It does not authenticate against an
+//! active TLS terminator because that intermediary also observes the bearer
+//! token and can derive the same HMAC key. Durable local revision floors
+//! prevent such an intermediary from rolling an existing checkout backward.
 
 use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
 use hmac::{Hmac, Mac};

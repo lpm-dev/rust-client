@@ -344,6 +344,9 @@ impl VercelClient {
         let project = urlencoding::encode(&self.config.project_id);
         let mut variables = HashMap::new();
         let mut cursor: Option<String> = None;
+        let mut seen_cursors = HashSet::new();
+        let mut response_budget = super::response::PlatformResponseBudget::new();
+        let mut received_items = 0usize;
 
         for page in 0..20 {
             let mut params = vec![("decrypt", "true".to_string())];
@@ -367,12 +370,19 @@ impl VercelClient {
                         lpm_http::display_error(&error)
                     ))
                 })?;
-            let (status, body) = read_platform_response(response).await?;
+            let (status, body) =
+                read_platform_response_with_budget(response, &mut response_budget).await?;
             if !status.is_success() {
                 return Err(vercel_api_error("list", status, &body));
             }
             let data: VercelListResponse = serde_json::from_slice(&body)
                 .map_err(|error| LpmError::Script(format!("invalid Vercel response: {error}")))?;
+            received_items = received_items.saturating_add(data.envs.len());
+            if received_items > 10_000 {
+                return Err(LpmError::Script(
+                    "Vercel returned more than 10000 env values; refusing an unbounded sync".into(),
+                ));
+            }
             let selected_targets = self.selected_targets().into_iter().collect::<HashSet<_>>();
             for variable in data.envs {
                 if is_vercel_managed_variable(&variable.key) {
@@ -419,13 +429,19 @@ impl VercelClient {
                 );
             }
 
-            cursor = data
+            let next_cursor = data
                 .pagination
                 .and_then(|pagination| pagination.next)
                 .and_then(json_scalar_string);
-            if cursor.is_none() {
+            let Some(next_cursor) = next_cursor else {
                 return Ok(variables);
+            };
+            if !seen_cursors.insert(next_cursor.clone()) {
+                return Err(LpmError::Script(
+                    "Vercel repeated an env pagination cursor; refusing a pagination cycle".into(),
+                ));
             }
+            cursor = Some(next_cursor);
             if page == 19 {
                 return Err(LpmError::Script(
                     "Vercel returned more than 20 pages of env values; refusing an unbounded sync"
@@ -933,6 +949,15 @@ async fn read_platform_response(
 ) -> Result<(reqwest::StatusCode, Vec<u8>), LpmError> {
     let status = response.status();
     let body = super::response::read_capped_platform_body(response).await?;
+    Ok((status, body))
+}
+
+async fn read_platform_response_with_budget(
+    response: reqwest::Response,
+    budget: &mut super::response::PlatformResponseBudget,
+) -> Result<(reqwest::StatusCode, Vec<u8>), LpmError> {
+    let status = response.status();
+    let body = super::response::read_capped_platform_body_with_budget(response, budget).await?;
     Ok((status, body))
 }
 
@@ -2273,6 +2298,28 @@ mod tests {
             .expect_err("unreadable final state must suppress exact mutation counts");
 
         assert!(matches!(error, PlatformApplyError::Untracked(_)));
+    }
+
+    #[tokio::test]
+    async fn vercel_repeated_pagination_cursor_fails_closed() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v10/projects/test-project/env"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "envs": [],
+                "pagination": { "next": "same-cursor" }
+            })))
+            .expect(2)
+            .mount(&server)
+            .await;
+        let client = vercel_client_at(server.uri());
+
+        let error = client
+            .list()
+            .await
+            .expect_err("a repeated Vercel cursor must fail closed");
+
+        assert!(error.to_string().contains("pagination cursor"));
     }
 
     #[test]

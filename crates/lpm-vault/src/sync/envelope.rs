@@ -16,6 +16,12 @@ pub(super) enum SyncScope<'a> {
     Organization(&'a str),
 }
 
+#[derive(Clone, Copy)]
+pub(super) enum SyncEnvelopePolicy {
+    Pull,
+    CurrentOnly,
+}
+
 #[derive(Debug, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(super) struct AuthenticatedSyncResponse {
@@ -26,6 +32,8 @@ pub(super) struct AuthenticatedSyncResponse {
     pub(super) crypto_version: Option<i32>,
     pub(super) envelope_version: Option<i32>,
     pub(super) scope: Option<String>,
+    pub(super) principal_id: Option<String>,
+    pub(super) caller_user_id: Option<String>,
     pub(super) organization_slug: Option<String>,
     pub(super) request_nonce: Option<String>,
     pub(super) payload_digest: Option<String>,
@@ -45,6 +53,7 @@ impl AuthenticatedSyncResponse {
         expected_vault_id: &str,
         expected_scope: SyncScope<'_>,
         expected_request_nonce: &str,
+        policy: SyncEnvelopePolicy,
     ) -> Result<(), String> {
         if self.envelope_version != Some(ENVELOPE_VERSION) {
             return Err("authenticated sync envelope version is missing or unsupported".into());
@@ -52,11 +61,28 @@ impl AuthenticatedSyncResponse {
         if self.vault_id.as_deref() != Some(expected_vault_id) {
             return Err("authenticated sync envelope is bound to a different vault".into());
         }
-        if self.crypto_version != Some(crypto::CURRENT_CRYPTO_VERSION) {
-            return Err("authenticated sync envelope has an unsupported crypto version".into());
-        }
         if self.request_nonce.as_deref() != Some(expected_request_nonce) {
             return Err("authenticated sync envelope does not match the request nonce".into());
+        }
+        if self
+            .principal_id
+            .as_deref()
+            .is_none_or(|principal_id| principal_id.is_empty() || principal_id.len() > 128)
+        {
+            return Err("authenticated sync envelope omitted a valid principal ID".into());
+        }
+        match policy {
+            SyncEnvelopePolicy::Pull
+                if self.crypto_version != Some(crypto::CURRENT_CRYPTO_VERSION) =>
+            {
+                return Err("authenticated sync envelope has an unsupported crypto version".into());
+            }
+            SyncEnvelopePolicy::CurrentOnly
+                if self.crypto_version != Some(crypto::CURRENT_CRYPTO_VERSION) =>
+            {
+                return Err("authenticated sync envelope has an unsupported crypto version".into());
+            }
+            _ => {}
         }
 
         let version = self
@@ -85,24 +111,46 @@ impl AuthenticatedSyncResponse {
                         "authenticated sync envelope has a mismatched organization scope".into(),
                     );
                 }
+                if matches!(policy, SyncEnvelopePolicy::Pull)
+                    && self.caller_user_id.as_deref().is_none_or(|caller_user_id| {
+                        caller_user_id.is_empty()
+                            || caller_user_id.len() > 256
+                            || caller_user_id.chars().any(char::is_control)
+                    })
+                {
+                    return Err(
+                        "authenticated organization pull omitted the caller identity".into(),
+                    );
+                }
             }
         }
 
-        match (
+        let has_payload = match (
             self.encrypted_blob.as_deref(),
             self.wrapped_key.as_deref(),
             self.payload_digest.as_deref(),
         ) {
-            (None, None, None) => Ok(()),
+            (None, None, None) => false,
             (Some(encrypted_blob), Some(wrapped_key), Some(payload_digest)) => {
                 let expected_digest = vault_payload_digest(encrypted_blob, wrapped_key)?;
-                if payload_digest == expected_digest {
-                    Ok(())
-                } else {
-                    Err("authenticated sync envelope payload digest does not match".into())
+                if payload_digest != expected_digest {
+                    return Err("authenticated sync envelope payload digest does not match".into());
                 }
+                true
             }
-            _ => Err("authenticated sync envelope has an incomplete payload binding".into()),
+            _ => {
+                return Err("authenticated sync envelope has an incomplete payload binding".into());
+            }
+        };
+
+        match (policy, has_payload) {
+            (SyncEnvelopePolicy::Pull, true) | (SyncEnvelopePolicy::CurrentOnly, false) => Ok(()),
+            (SyncEnvelopePolicy::Pull, false) => {
+                Err("authenticated pull envelope omitted its payload binding".into())
+            }
+            (SyncEnvelopePolicy::CurrentOnly, true) => {
+                Err("authenticated write or version envelope included an unexpected payload".into())
+            }
         }
     }
 }
@@ -159,6 +207,82 @@ mod tests {
                 && nonce
                     .bytes()
                     .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+        );
+    }
+
+    #[test]
+    fn authenticated_pull_envelope_rejects_protocol_v2_payload() {
+        let encrypted_blob = "ciphertext";
+        let wrapped_key = "wrapped";
+        let response = AuthenticatedSyncResponse {
+            vault_id: Some("vault-123".to_owned()),
+            encrypted_blob: Some(encrypted_blob.to_owned()),
+            wrapped_key: Some(wrapped_key.to_owned()),
+            version: Some(42),
+            crypto_version: Some(2),
+            envelope_version: Some(ENVELOPE_VERSION),
+            scope: Some("personal".to_owned()),
+            principal_id: Some("user-123".to_owned()),
+            caller_user_id: None,
+            organization_slug: None,
+            request_nonce: Some("nonce".to_owned()),
+            payload_digest: Some(vault_payload_digest(encrypted_blob, wrapped_key).unwrap()),
+            content_key_version: None,
+            recipient_public_key_version: None,
+            recipient_public_key_fingerprint: None,
+            status: Some("ok".to_owned()),
+            error: None,
+            code: None,
+            server_version: Some(42),
+            hint: None,
+        };
+
+        let error = response
+            .validate(
+                "vault-123",
+                SyncScope::Personal,
+                "nonce",
+                SyncEnvelopePolicy::Pull,
+            )
+            .expect_err("network pulls must reject revision-unbound protocol v2 ciphertext");
+
+        assert!(error.contains("unsupported crypto version"), "{error}");
+    }
+
+    #[test]
+    fn authenticated_push_envelope_still_rejects_protocol_v2() {
+        let response = AuthenticatedSyncResponse {
+            vault_id: Some("vault-123".to_owned()),
+            encrypted_blob: None,
+            wrapped_key: None,
+            version: Some(42),
+            crypto_version: Some(2),
+            envelope_version: Some(ENVELOPE_VERSION),
+            scope: Some("personal".to_owned()),
+            principal_id: None,
+            caller_user_id: None,
+            organization_slug: None,
+            request_nonce: Some("nonce".to_owned()),
+            payload_digest: None,
+            content_key_version: None,
+            recipient_public_key_version: None,
+            recipient_public_key_fingerprint: None,
+            status: Some("ok".to_owned()),
+            error: None,
+            code: None,
+            server_version: Some(42),
+            hint: None,
+        };
+
+        assert!(
+            response
+                .validate(
+                    "vault-123",
+                    SyncScope::Personal,
+                    "nonce",
+                    SyncEnvelopePolicy::CurrentOnly,
+                )
+                .is_err()
         );
     }
 }

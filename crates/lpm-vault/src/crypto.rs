@@ -8,12 +8,10 @@
 //! - Both encrypted blob and wrapped key stored on server
 //! - On pull: load wrapping key → unwrap AES key → decrypt
 //!
-//! ## Legacy migration
-//! - Old versions derived wrapping key from `SHA256("lpm-vault-wrap:" + auth_token)`
-//! - On decrypt failure with the stored key, the legacy key is tried as a fallback
-//! - If the legacy key works, the caller (`pull` / `pull_raw`) re-encrypts with
-//!   the stored key and pushes back on the same call, converging without user action.
-//!   Migration push is best-effort: failures are logged and retried on the next pull.
+//! ## Legacy recovery
+//! - Old versions derived wrapping keys from `SHA256("lpm-vault-wrap:" + auth_token)`.
+//! - Authenticated network sync rejects those revision-unbound payloads.
+//! - The legacy primitives remain available only for explicit offline recovery tooling.
 //!
 //! ## Org sync
 //! - X25519 keypairs per user
@@ -22,7 +20,7 @@
 
 use aes_gcm::{
     Aes256Gcm, KeyInit,
-    aead::{Aead, Payload, generic_array::GenericArray},
+    aead::{AeadInPlace, generic_array::GenericArray},
 };
 use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
 use hkdf::Hkdf;
@@ -36,9 +34,11 @@ const VAULT_KEY_SERVICE: &str = "dev.lpm.vault-key";
 /// Keyring account name for the vault wrapping key.
 const VAULT_KEY_ACCOUNT: &str = "wrapping-key";
 
-/// Current encrypted vault payload protocol. Version 1 has no associated
-/// data; version 2 binds ciphertext to its personal or organization context.
-pub const CURRENT_CRYPTO_VERSION: i32 = 2;
+/// Current encrypted vault payload protocol. Version 3 binds ciphertext to
+/// its ownership context and committed server revision.
+pub const CURRENT_CRYPTO_VERSION: i32 = 3;
+
+const CONTEXT_BOUND_CRYPTO_VERSION: i32 = 2;
 
 const SYNC_AAD_DOMAIN: &[u8] = b"lpm-vault-sync";
 
@@ -262,17 +262,8 @@ fn get_or_create_wrapping_key_file(
 
 /// Legacy: derive a wrapping key from the auth token.
 ///
-/// Kept only for migration — old vaults may have keys wrapped with this.
+/// Kept only for explicit offline recovery — old vaults may have keys wrapped with this.
 /// New code should use [`get_or_create_wrapping_key`] instead.
-///
-/// M12: this derivation has no forward secrecy. A stale bearer token
-/// captured by any side channel (process argv, log scrape, keychain
-/// leak) decrypts every pre-migration vault blob that bearer ever
-/// wrapped. The migration path in [`decrypt_vault_from_sync`] re-
-/// encrypts under the stored wrapping key on next push, but until
-/// that push runs the legacy blob remains decryptable. Operators
-/// should rotate any stored bearer that has been observed by other
-/// processes and re-push the vault.
 pub fn derive_legacy_wrapping_key(auth_token: &str) -> [u8; 32] {
     let mut hasher = Sha256::new();
     hasher.update(b"lpm-vault-wrap:");
@@ -288,6 +279,16 @@ pub fn generate_aes_key() -> [u8; 32] {
     let mut key = [0u8; 32];
     rand::thread_rng().fill_bytes(&mut key);
     key
+}
+
+pub fn next_sync_revision(previous: Option<i32>) -> Result<i32, String> {
+    let previous = previous.unwrap_or(0);
+    if previous < 0 {
+        return Err("vault revision cannot be negative".to_string());
+    }
+    previous
+        .checked_add(1)
+        .ok_or_else(|| "vault revision overflow".to_string())
 }
 
 /// Encrypt plaintext with AES-256-GCM.
@@ -311,21 +312,26 @@ fn encrypt_with_associated_data(
     let mut iv = [0u8; 12];
     rand::thread_rng().fill_bytes(&mut iv);
     let nonce = GenericArray::from_slice(&iv);
-    let ciphertext = cipher
-        .encrypt(
-            nonce,
-            Payload {
-                msg: plaintext,
-                aad: associated_data,
-            },
-        )
+    let mut ciphertext = Vec::with_capacity(plaintext.len().saturating_add(16));
+    ciphertext.extend_from_slice(plaintext);
+    cipher
+        .encrypt_in_place(nonce, associated_data, &mut ciphertext)
         .map_err(|e| format!("encrypt: {e}"))?;
 
-    Ok(format!(
-        "{}:{}",
-        BASE64.encode(iv),
-        BASE64.encode(&ciphertext)
-    ))
+    let iv_length = base64::encoded_len(iv.len(), true)
+        .ok_or_else(|| "encrypted IV is too large to encode".to_owned())?;
+    let ciphertext_length = base64::encoded_len(ciphertext.len(), true)
+        .ok_or_else(|| "encrypted payload is too large to encode".to_owned())?;
+    let mut encoded = String::with_capacity(
+        iv_length
+            .checked_add(1)
+            .and_then(|length| length.checked_add(ciphertext_length))
+            .ok_or_else(|| "encrypted payload is too large to encode".to_owned())?,
+    );
+    BASE64.encode_string(iv, &mut encoded);
+    encoded.push(':');
+    BASE64.encode_string(&ciphertext, &mut encoded);
+    Ok(encoded)
 }
 
 fn decrypt_with_associated_data(
@@ -333,16 +339,15 @@ fn decrypt_with_associated_data(
     encoded: &str,
     associated_data: &[u8],
 ) -> Result<Vec<u8>, String> {
-    let parts: Vec<&str> = encoded.splitn(2, ':').collect();
-    if parts.len() != 2 {
-        return Err("invalid encrypted format".to_string());
-    }
+    let (encoded_iv, encoded_ciphertext) = encoded
+        .split_once(':')
+        .ok_or_else(|| "invalid encrypted format".to_owned())?;
 
     let iv = BASE64
-        .decode(parts[0])
+        .decode(encoded_iv)
         .map_err(|e| format!("iv decode: {e}"))?;
-    let ciphertext = BASE64
-        .decode(parts[1])
+    let mut ciphertext = BASE64
+        .decode(encoded_ciphertext)
         .map_err(|e| format!("data decode: {e}"))?;
 
     if iv.len() != 12 {
@@ -353,28 +358,52 @@ fn decrypt_with_associated_data(
     let nonce = GenericArray::from_slice(&iv);
 
     cipher
-        .decrypt(
-            nonce,
-            Payload {
-                msg: ciphertext.as_slice(),
-                aad: associated_data,
-            },
-        )
-        .map_err(|_| "decryption failed (wrong key or corrupted)".to_string())
+        .decrypt_in_place(nonce, associated_data, &mut ciphertext)
+        .map_err(|_| "decryption failed (wrong key or corrupted)".to_string())?;
+    Ok(ciphertext)
 }
 
 /// Construct the canonical binary associated data for a vault payload.
 pub fn sync_associated_data(
     scope: VaultScope<'_>,
+    principal_id: &str,
     vault_id: &str,
+    revision: i32,
     crypto_version: i32,
 ) -> Result<Vec<u8>, String> {
-    if crypto_version != CURRENT_CRYPTO_VERSION {
+    if !matches!(
+        crypto_version,
+        CONTEXT_BOUND_CRYPTO_VERSION | CURRENT_CRYPTO_VERSION
+    ) {
         return Err(format!(
             "unsupported vault crypto version: {crypto_version}"
         ));
     }
+    let revision = if crypto_version == CURRENT_CRYPTO_VERSION {
+        Some(
+            u64::try_from(revision)
+                .ok()
+                .filter(|revision| *revision > 0)
+                .ok_or_else(|| "vault revision must be positive".to_string())?,
+        )
+    } else {
+        None
+    };
 
+    let principal_id = if crypto_version == CURRENT_CRYPTO_VERSION {
+        if principal_id.is_empty() {
+            return Err("vault principal ID cannot be empty".to_string());
+        }
+        Some(principal_id.as_bytes())
+    } else {
+        None
+    };
+    let principal_id_len = principal_id
+        .map(|value| {
+            u32::try_from(value.len())
+                .map_err(|_| "vault principal ID is too long for sync encryption".to_string())
+        })
+        .transpose()?;
     let vault_id = vault_id.as_bytes();
     let vault_id_len = u32::try_from(vault_id.len())
         .map_err(|_| "vault ID is too long for sync encryption".to_string())?;
@@ -386,27 +415,51 @@ pub fn sync_associated_data(
         .map_err(|_| "organization slug is too long for sync encryption".to_string())?;
 
     let mut aad = Vec::with_capacity(
-        SYNC_AAD_DOMAIN.len() + 1 + 4 + 1 + 4 + vault_id.len() + 4 + org_slug.len(),
+        SYNC_AAD_DOMAIN.len()
+            + 1
+            + 4
+            + 1
+            + principal_id.map_or(0, |value| 4 + value.len())
+            + 4
+            + vault_id.len()
+            + 4
+            + org_slug.len()
+            + if revision.is_some() { 8 } else { 0 },
     );
     aad.extend_from_slice(SYNC_AAD_DOMAIN);
     aad.push(0);
     aad.extend_from_slice(&(crypto_version as u32).to_be_bytes());
     aad.push(scope_byte);
+    if let (Some(principal_id), Some(principal_id_len)) = (principal_id, principal_id_len) {
+        aad.extend_from_slice(&principal_id_len.to_be_bytes());
+        aad.extend_from_slice(principal_id);
+    }
     aad.extend_from_slice(&vault_id_len.to_be_bytes());
     aad.extend_from_slice(vault_id);
     aad.extend_from_slice(&org_slug_len.to_be_bytes());
     aad.extend_from_slice(org_slug);
+    if let Some(revision) = revision {
+        aad.extend_from_slice(&revision.to_be_bytes());
+    }
     Ok(aad)
 }
 
-/// Encrypt a vault content payload using protocol v2 associated data.
+/// Encrypt a vault content payload using versioned associated data.
 pub fn encrypt_vault_payload(
     key: &[u8; 32],
     plaintext: &[u8],
     scope: VaultScope<'_>,
+    principal_id: &str,
     vault_id: &str,
+    revision: i32,
 ) -> Result<String, String> {
-    let aad = sync_associated_data(scope, vault_id, CURRENT_CRYPTO_VERSION)?;
+    let aad = sync_associated_data(
+        scope,
+        principal_id,
+        vault_id,
+        revision,
+        CURRENT_CRYPTO_VERSION,
+    )?;
     encrypt_with_associated_data(key, plaintext, &aad)
 }
 
@@ -416,13 +469,16 @@ pub fn decrypt_vault_payload(
     key: &[u8; 32],
     encoded: &str,
     scope: VaultScope<'_>,
+    principal_id: &str,
     vault_id: &str,
+    revision: i32,
     crypto_version: i32,
 ) -> Result<Vec<u8>, String> {
     match crypto_version {
         1 => decrypt(key, encoded),
-        CURRENT_CRYPTO_VERSION => {
-            let aad = sync_associated_data(scope, vault_id, crypto_version)?;
+        CONTEXT_BOUND_CRYPTO_VERSION | CURRENT_CRYPTO_VERSION => {
+            let aad =
+                sync_associated_data(scope, principal_id, vault_id, revision, crypto_version)?;
             decrypt_with_associated_data(key, encoded, &aad)
         }
         _ => Err(format!(
@@ -456,7 +512,9 @@ pub fn unwrap_key(wrapping_key: &[u8; 32], wrapped: &str) -> Result<[u8; 32], St
 /// Uses the stored wrapping key (keyring or file), independent of auth token.
 pub fn encrypt_vault_for_sync(
     secrets_json: &str,
+    principal_id: &str,
     vault_id: &str,
+    revision: i32,
 ) -> Result<(String, String), String> {
     let aes_key = generate_aes_key();
     let wrapping_key = get_or_create_wrapping_key()?;
@@ -465,7 +523,9 @@ pub fn encrypt_vault_for_sync(
         &aes_key,
         secrets_json.as_bytes(),
         VaultScope::Personal,
+        principal_id,
         vault_id,
+        revision,
     )?;
     let wrapped_key = wrap_key(&wrapping_key, &aes_key)?;
 
@@ -474,77 +534,35 @@ pub fn encrypt_vault_for_sync(
 
 /// Decrypt vault secrets JSON from sync.
 ///
-/// Tries the stored wrapping key first. On failure, falls back to the legacy
-/// token-derived key for migration. If the legacy key works, returns the
-/// decrypted data (the caller should re-encrypt and re-push with the new key).
+/// Authenticated sync accepts only the current revision-bound protocol and the
+/// stable stored wrapping key.
 pub fn decrypt_vault_from_sync(
-    auth_token: &str,
     encrypted_blob: &str,
     wrapped_key: &str,
+    principal_id: &str,
     vault_id: &str,
+    revision: i32,
     crypto_version: i32,
-) -> Result<DecryptResult, String> {
-    if !matches!(crypto_version, 1 | CURRENT_CRYPTO_VERSION) {
+) -> Result<String, String> {
+    if crypto_version != CURRENT_CRYPTO_VERSION {
         return Err(format!(
             "unsupported vault crypto version: {crypto_version}"
         ));
     }
 
-    // Try new stored wrapping key first
-    if let Ok(wrapping_key) = get_or_create_wrapping_key()
-        && let Ok(aes_key) = unwrap_key(&wrapping_key, wrapped_key)
-    {
-        let plaintext = decrypt_vault_payload(
-            &aes_key,
-            encrypted_blob,
-            VaultScope::Personal,
-            vault_id,
-            crypto_version,
-        )?;
-        let text = String::from_utf8(plaintext).map_err(|e| format!("utf8 error: {e}"))?;
-        return Ok(DecryptResult {
-            plaintext: text,
-            needs_reencrypt: crypto_version == 1,
-        });
-    }
-
-    // Fall back to legacy token-derived key
-    let legacy_key = derive_legacy_wrapping_key(auth_token);
-    let aes_key = unwrap_key(&legacy_key, wrapped_key)
-        .map_err(|_| "decryption failed with both new and legacy keys".to_string())?;
+    let wrapping_key = get_or_create_wrapping_key()?;
+    let aes_key = unwrap_key(&wrapping_key, wrapped_key)
+        .map_err(|_| "decryption failed with stored wrapping key".to_owned())?;
     let plaintext = decrypt_vault_payload(
         &aes_key,
         encrypted_blob,
         VaultScope::Personal,
+        principal_id,
         vault_id,
+        revision,
         crypto_version,
     )?;
-    let text = String::from_utf8(plaintext).map_err(|e| format!("utf8 error: {e}"))?;
-
-    // M12: a legacy decryption succeeded — the blob was wrapped with
-    // SHA256("lpm-vault-wrap:" + auth_token), which has no forward
-    // secrecy. Surface the posture loudly so an operator scanning
-    // logs sees the migration window and rotates the bearer if it
-    // has been exposed anywhere (process argv pre-H4, CI log leak,
-    // backup), in addition to the implicit re-encrypt that happens
-    // on the next push.
-    tracing::warn!(
-        "vault decrypted with legacy token-derived key (no forward secrecy) — re-encrypting under stored key on next push. If the bearer that decrypted this blob has been exposed to other processes / logs / backups, rotate it before any peer can capture the same blob.",
-    );
-
-    Ok(DecryptResult {
-        plaintext: text,
-        needs_reencrypt: true,
-    })
-}
-
-/// Result of vault decryption, indicating whether migration is needed.
-pub struct DecryptResult {
-    /// The decrypted plaintext.
-    pub plaintext: String,
-    /// If true, the vault used either the legacy token-derived wrapping key
-    /// or an unbound protocol-v1 payload and should be re-encrypted.
-    pub needs_reencrypt: bool,
+    String::from_utf8(plaintext).map_err(|e| format!("utf8 error: {e}"))
 }
 
 // ── X25519 Org Sync ───────────────────────────────────────────────
@@ -574,6 +592,16 @@ fn derive_org_wrapping_key(shared_secret: &[u8; 32]) -> [u8; 32] {
     okm
 }
 
+pub(crate) fn validate_contributory_x25519_public_key(public_key: &[u8; 32]) -> Result<(), String> {
+    let test_secret = X25519Secret::from([0x42; 32]);
+    let shared = test_secret.diffie_hellman(&X25519PublicKey::from(*public_key));
+    if shared.was_contributory() {
+        Ok(())
+    } else {
+        Err("X25519 public key is non-contributory".to_owned())
+    }
+}
+
 /// Wrap an AES-256 key for a specific recipient using ECIES-like scheme.
 ///
 /// 1. Generate ephemeral X25519 keypair
@@ -595,6 +623,9 @@ pub fn wrap_key_for_recipient(
     // ECDH → shared secret
     let recipient_pk = X25519PublicKey::from(*recipient_public);
     let shared = ephemeral_secret.diffie_hellman(&recipient_pk);
+    if !shared.was_contributory() {
+        return Err("recipient X25519 public key is non-contributory".to_owned());
+    }
 
     // Derive wrapping key via HKDF
     let wrapping_key = derive_org_wrapping_key(shared.as_bytes());
@@ -637,6 +668,9 @@ pub fn unwrap_key_from_sender(wrapped: &str, private_key: &[u8; 32]) -> Result<[
     let my_secret = X25519Secret::from(*private_key);
     let their_public = X25519PublicKey::from(eph_pub);
     let shared = my_secret.diffie_hellman(&their_public);
+    if !shared.was_contributory() {
+        return Err("sender X25519 public key is non-contributory".to_owned());
+    }
 
     // Derive wrapping key via HKDF
     let wrapping_key = derive_org_wrapping_key(shared.as_bytes());
@@ -988,11 +1022,30 @@ mod tests {
     }
 
     #[test]
+    fn protocol_v3_aad_matches_cross_language_organization_vector() {
+        let aad = sync_associated_data(
+            VaultScope::Organization("acme"),
+            "00000000-0000-4000-8000-000000000002",
+            "vault-123",
+            42,
+            CURRENT_CRYPTO_VERSION,
+        )
+        .unwrap();
+
+        assert_eq!(
+            hex::encode(aad),
+            "6c706d2d7661756c742d73796e630000000003020000002430303030303030302d303030302d343030302d383030302d303030303030303030303032000000097661756c742d3132330000000461636d65000000000000002a"
+        );
+    }
+
+    #[test]
     fn protocol_v2_aad_matches_cross_language_organization_vector() {
         let aad = sync_associated_data(
             VaultScope::Organization("acme"),
+            "ignored-legacy-principal",
             "vault-123",
-            CURRENT_CRYPTO_VERSION,
+            42,
+            2,
         )
         .unwrap();
 
@@ -1003,13 +1056,34 @@ mod tests {
     }
 
     #[test]
-    fn protocol_v2_rejects_payload_copied_to_another_vault_id() {
+    fn decrypts_genuine_protocol_v2_organization_fixture() {
+        let key = [7u8; 32];
+        let encrypted = "AAECAwQFBgcICQoL:Y6O9P1ZMl2tNkIn5hTkPg8xKhKxl9uKHropxD+YNLHW+9WfVwQ==";
+
+        let plaintext = decrypt_vault_payload(
+            &key,
+            encrypted,
+            VaultScope::Organization("acme"),
+            "ignored-legacy-principal",
+            "vault-123",
+            42,
+            2,
+        )
+        .unwrap();
+
+        assert_eq!(plaintext, br#"{"TOKEN":"legacy-v2"}"#);
+    }
+
+    #[test]
+    fn protocol_v3_rejects_payload_copied_to_another_vault_id() {
         let key = generate_aes_key();
         let encrypted = encrypt_vault_payload(
             &key,
             br#"{"TOKEN":"secret"}"#,
             VaultScope::Personal,
+            "user-1",
             "vault-a",
+            1,
         )
         .unwrap();
 
@@ -1018,7 +1092,63 @@ mod tests {
                 &key,
                 &encrypted,
                 VaultScope::Personal,
+                "user-1",
                 "vault-b",
+                1,
+                CURRENT_CRYPTO_VERSION,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn protocol_v3_rejects_payload_copied_to_another_principal() {
+        let key = generate_aes_key();
+        let encrypted = encrypt_vault_payload(
+            &key,
+            br#"{"TOKEN":"secret"}"#,
+            VaultScope::Personal,
+            "user-a",
+            "vault-a",
+            1,
+        )
+        .unwrap();
+
+        assert!(
+            decrypt_vault_payload(
+                &key,
+                &encrypted,
+                VaultScope::Personal,
+                "user-b",
+                "vault-a",
+                1,
+                CURRENT_CRYPTO_VERSION,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn same_vault_ciphertext_cannot_be_replayed_under_a_newer_revision() {
+        let key = generate_aes_key();
+        let encrypted_at_revision_one = encrypt_vault_payload(
+            &key,
+            br#"{"TOKEN":"old"}"#,
+            VaultScope::Personal,
+            "user-1",
+            "vault-a",
+            1,
+        )
+        .unwrap();
+
+        assert!(
+            decrypt_vault_payload(
+                &key,
+                &encrypted_at_revision_one,
+                VaultScope::Personal,
+                "user-1",
+                "vault-a",
+                2,
                 CURRENT_CRYPTO_VERSION,
             )
             .is_err()
@@ -1034,12 +1164,14 @@ mod tests {
             &key,
             &legacy,
             VaultScope::Personal,
+            "user-1",
             "vault-a",
+            1,
             CURRENT_CRYPTO_VERSION + 1,
         )
         .unwrap_err();
 
-        assert_eq!(error, "unsupported vault crypto version: 3");
+        assert_eq!(error, "unsupported vault crypto version: 4");
     }
 
     #[test]
@@ -1115,27 +1247,23 @@ mod tests {
 
         let secrets = r#"{"DB_HOST":"localhost","API_KEY":"sk-123"}"#;
 
-        let (blob, wrapped) = encrypt_vault_for_sync(secrets, "vault-123").unwrap();
-        // auth_token is passed for legacy fallback but shouldn't be needed
+        let (blob, wrapped) = encrypt_vault_for_sync(secrets, "user-123", "vault-123", 1).unwrap();
         let result = decrypt_vault_from_sync(
-            "any_token",
             &blob,
             &wrapped,
+            "user-123",
             "vault-123",
+            1,
             CURRENT_CRYPTO_VERSION,
         )
         .unwrap();
 
-        assert_eq!(result.plaintext, secrets);
-        assert!(
-            !result.needs_reencrypt,
-            "should not need re-encrypt with new key"
-        );
+        assert_eq!(result, secrets);
     }
 
     #[cfg(debug_assertions)]
     #[test]
-    fn vault_sync_legacy_migration() {
+    fn network_sync_decryptor_rejects_legacy_payload() {
         let _env = IsolatedVaultEnv::new();
 
         // Simulate a vault encrypted with the old token-derived key
@@ -1147,15 +1275,61 @@ mod tests {
         let encrypted_blob = encrypt(&aes_key, secrets.as_bytes()).unwrap();
         let wrapped_key = wrap_key(&legacy_key, &aes_key).unwrap();
 
-        // Decrypt should fall back to legacy and flag re-encrypt
-        let result =
-            decrypt_vault_from_sync(token, &encrypted_blob, &wrapped_key, "legacy-vault", 1)
-                .unwrap();
-        assert_eq!(result.plaintext, secrets);
+        let error = decrypt_vault_from_sync(
+            &encrypted_blob,
+            &wrapped_key,
+            "user-legacy",
+            "legacy-vault",
+            1,
+            1,
+        )
+        .expect_err("network sync must reject revision-unbound legacy ciphertext");
+
         assert!(
-            result.needs_reencrypt,
-            "legacy-decrypted vault should need re-encrypt"
+            error.contains("unsupported vault crypto version"),
+            "{error}"
         );
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    fn bearer_wrapped_context_bound_payloads_are_rejected() {
+        let _env = IsolatedVaultEnv::new();
+
+        let token = "lpm_bearer_token";
+        let vault_id = "vault-context-bound";
+        let revision = 7;
+        let plaintext = br#"{"SECRET":"value"}"#;
+        let legacy_key = derive_legacy_wrapping_key(token);
+        let aes_key = generate_aes_key();
+        let wrapped_key = wrap_key(&legacy_key, &aes_key).unwrap();
+
+        for crypto_version in [CONTEXT_BOUND_CRYPTO_VERSION, CURRENT_CRYPTO_VERSION] {
+            let associated_data = sync_associated_data(
+                VaultScope::Personal,
+                "user-context-bound",
+                vault_id,
+                revision,
+                crypto_version,
+            )
+            .unwrap();
+            let encrypted_blob =
+                encrypt_with_associated_data(&aes_key, plaintext, &associated_data).unwrap();
+
+            let result = decrypt_vault_from_sync(
+                &encrypted_blob,
+                &wrapped_key,
+                "user-context-bound",
+                vault_id,
+                revision,
+                crypto_version,
+            );
+
+            assert!(
+                result.is_err(),
+                "crypto v{crypto_version} accepted a bearer-token-wrapped content key"
+            );
+        }
     }
 
     #[cfg(debug_assertions)]
@@ -1165,20 +1339,19 @@ mod tests {
 
         // Encrypt with new stored key
         let secrets = r#"{"KEY":"value"}"#;
-        let (blob, wrapped) = encrypt_vault_for_sync(secrets, "vault-rotation").unwrap();
+        let (blob, wrapped) =
+            encrypt_vault_for_sync(secrets, "user-rotation", "vault-rotation", 1).unwrap();
 
-        // Decrypt with a completely different "token" — should still work
-        // because the new key is token-independent
         let result = decrypt_vault_from_sync(
-            "completely_different_token",
             &blob,
             &wrapped,
+            "user-rotation",
             "vault-rotation",
+            1,
             CURRENT_CRYPTO_VERSION,
         )
         .unwrap();
-        assert_eq!(result.plaintext, secrets);
-        assert!(!result.needs_reencrypt);
+        assert_eq!(result, secrets);
     }
 
     #[test]
@@ -1226,6 +1399,26 @@ mod tests {
 
         let wrapped = wrap_key_for_recipient(&aes_key, &recipient_pub).unwrap();
         assert!(unwrap_key_from_sender(&wrapped, &wrong_priv).is_err());
+    }
+
+    #[test]
+    fn x25519_wrap_rejects_non_contributory_recipient() {
+        let aes_key = generate_aes_key();
+        assert!(wrap_key_for_recipient(&aes_key, &[0; 32]).is_err());
+    }
+
+    #[test]
+    fn x25519_unwrap_rejects_non_contributory_sender() {
+        let aes_key = generate_aes_key();
+        let wrapping_key = derive_org_wrapping_key(&[0; 32]);
+        let wrapped = format!(
+            "{}:{}",
+            BASE64.encode([0; 32]),
+            encrypt(&wrapping_key, &aes_key).unwrap()
+        );
+        let (private_key, _) = generate_x25519_keypair();
+
+        assert!(unwrap_key_from_sender(&wrapped, &private_key).is_err());
     }
 
     #[test]

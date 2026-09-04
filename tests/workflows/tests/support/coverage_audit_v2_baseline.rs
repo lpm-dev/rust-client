@@ -147,7 +147,7 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
     // ── id 2: lpm search <query> ──
     SurfaceV2 {
         id: 2,
-        scenarios: 3,
+        scenarios: 4,
         failure_modes_tested: &[
             "no-matches warn and exit zero",
             "long-description truncation in human output",
@@ -2271,10 +2271,12 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
     // ── id 103: lpm env share ──
     SurfaceV2 {
         id: 103,
-        scenarios: 2,
+        scenarios: 3,
         failure_modes_tested: &[
-            "share --force fails before vault or network access",
-            "share --force under --json emits error envelope on stdout",
+            "share --force requires a bound organization before network access",
+            "share --force unbound error uses the JSON envelope",
+            "share --force recreates only a missing bound organization env",
+            "share --force refuses an existing bound organization env without upload",
         ],
         failure_modes_known: &[
             "empty vault refusal under --json",

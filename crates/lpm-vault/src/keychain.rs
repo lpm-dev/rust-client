@@ -35,6 +35,11 @@ struct EnvironmentsWrapper {
     environments: EnvironmentMap,
 }
 
+#[derive(serde::Serialize)]
+struct BorrowedEnvironmentsWrapper<'a> {
+    environments: &'a EnvironmentMap,
+}
+
 pub fn read_vault(vault_id: &str) -> Option<SecretMap> {
     try_read_vault(vault_id).ok().flatten()
 }
@@ -57,7 +62,7 @@ fn try_read_vault_env_unlocked(vault_id: &str, env: &str) -> Result<Option<Secre
     };
 
     if let Ok(wrapper) = serde_json::from_str::<EnvironmentsWrapper>(&json) {
-        return Ok(wrapper.environments.get(env).cloned());
+        return Ok(take_environment(wrapper.environments, env));
     }
 
     match serde_json::from_str::<SecretMap>(&json) {
@@ -65,6 +70,10 @@ fn try_read_vault_env_unlocked(vault_id: &str, env: &str) -> Result<Option<Secre
         Ok(_) => Ok(None),
         Err(error) => Err(format!("vault keychain data is not valid JSON: {error}")),
     }
+}
+
+fn take_environment(mut environments: EnvironmentMap, env: &str) -> Option<SecretMap> {
+    environments.remove(env)
 }
 
 pub fn read_all_environments(vault_id: &str) -> Option<EnvironmentMap> {
@@ -78,21 +87,37 @@ pub fn try_read_all_environments(vault_id: &str) -> Result<Option<EnvironmentMap
 pub(crate) fn try_read_all_environments_unlocked(
     vault_id: &str,
 ) -> Result<Option<EnvironmentMap>, String> {
+    try_read_all_environments_with_digest_unlocked(vault_id).map(|(environments, _)| environments)
+}
+
+pub(crate) fn try_read_all_environments_with_digest_unlocked(
+    vault_id: &str,
+) -> Result<(Option<EnvironmentMap>, Option<[u8; 32]>), String> {
+    use sha2::Digest as _;
+
     let Some(json) = try_read_keychain_password(SERVICE, vault_id)? else {
-        return Ok(None);
+        return Ok((None, None));
     };
+    let digest = sha2::Sha256::digest(json.as_bytes()).into();
 
     if let Ok(wrapper) = serde_json::from_str::<EnvironmentsWrapper>(&json) {
-        return Ok(Some(wrapper.environments));
+        return Ok((Some(wrapper.environments), Some(digest)));
     }
 
     if let Ok(flat) = serde_json::from_str::<SecretMap>(&json) {
         let mut environments = HashMap::with_capacity(1);
         environments.insert("default".to_owned(), flat);
-        return Ok(Some(environments));
+        return Ok((Some(environments), Some(digest)));
     }
 
     Err("vault keychain data is not a valid vault payload".to_owned())
+}
+
+pub(crate) fn vault_payload_digest_unlocked(vault_id: &str) -> Result<Option<[u8; 32]>, String> {
+    use sha2::Digest as _;
+
+    try_read_keychain_password(SERVICE, vault_id)
+        .map(|json| json.map(|json| sha2::Sha256::digest(json.as_bytes()).into()))
 }
 
 pub fn write_vault(
@@ -121,9 +146,7 @@ pub(crate) fn write_all_environments_unlocked(
     project_path: &str,
     environments: &EnvironmentMap,
 ) -> Result<(), String> {
-    let wrapper = EnvironmentsWrapper {
-        environments: environments.clone(),
-    };
+    let wrapper = BorrowedEnvironmentsWrapper { environments };
     let data = serde_json::to_string(&wrapper)
         .map_err(|error| format!("failed to serialize environments: {error}"))?;
     warn_if_large(data.len());
@@ -182,13 +205,19 @@ fn save_vault_data_unlocked(
     project_path: &str,
     data: &str,
 ) -> Result<(), String> {
-    let previous_data = try_read_keychain_password(SERVICE, vault_id)?;
-    let previous_index = try_read_index_unlocked()?;
+    let mut index = try_read_index_unlocked()?;
+    let index_changed =
+        add_index_entry_if_missing(&mut index, vault_id, project_name, project_path);
+    let previous_data = if index_changed {
+        try_read_keychain_password(SERVICE, vault_id)?
+    } else {
+        None
+    };
 
     write_keychain_password(SERVICE, vault_id, data)?;
-
-    let mut index = previous_index;
-    add_index_entry_if_missing(&mut index, vault_id, project_name, project_path);
+    if !index_changed {
+        return Ok(());
+    }
 
     if let Err(index_error) = write_index_unlocked(&index) {
         let rollback = match previous_data {
@@ -211,13 +240,16 @@ fn add_index_entry_if_missing(
     vault_id: &str,
     project_name: &str,
     project_path: &str,
-) {
+) -> bool {
     if index.iter().all(|entry| entry.id != vault_id) {
         index.push(IndexEntry {
             id: vault_id.to_owned(),
             name: project_name.to_owned(),
             path: project_path.to_owned(),
         });
+        true
+    } else {
+        false
     }
 }
 
@@ -257,22 +289,22 @@ pub fn read_x25519_private_key() -> Option<[u8; 32]> {
 }
 
 pub fn try_read_x25519_private_key() -> Result<Option<[u8; 32]>, String> {
-    with_keychain_transaction(try_read_x25519_private_key_unlocked)
+    with_keychain_transaction(|| try_read_x25519_private_key_for_account_unlocked(X25519_ACCOUNT))
 }
 
-fn try_read_x25519_private_key_unlocked() -> Result<Option<[u8; 32]>, String> {
-    let Some(encoded) = try_read_keychain_password(SERVICE, X25519_ACCOUNT)? else {
+fn try_read_x25519_private_key_for_account_unlocked(
+    account: &str,
+) -> Result<Option<[u8; 32]>, String> {
+    let Some(encoded) = try_read_keychain_password(SERVICE, account)? else {
         return Ok(None);
     };
-    let bytes = base64::Engine::decode(
-        &base64::engine::general_purpose::STANDARD,
-        encoded.as_bytes(),
-    )
-    .map_err(|_| "vault X25519 key is not valid base64".to_owned())?;
-    let key: [u8; 32] = bytes
-        .try_into()
-        .map_err(|_| "vault X25519 key must contain exactly 32 bytes".to_owned())?;
-    Ok(Some(key))
+    decode_x25519_private_key(&encoded).map(Some)
+}
+
+pub(crate) fn try_read_x25519_private_key_for_account(
+    account: &str,
+) -> Result<Option<[u8; 32]>, String> {
+    with_keychain_transaction(|| try_read_x25519_private_key_for_account_unlocked(account))
 }
 
 pub fn write_x25519_private_key(private_key: &[u8; 32]) -> Result<(), String> {
@@ -281,6 +313,15 @@ pub fn write_x25519_private_key(private_key: &[u8; 32]) -> Result<(), String> {
 
 fn write_x25519_private_key_unlocked(private_key: &[u8; 32]) -> Result<(), String> {
     write_x25519_private_key_for_account_unlocked(X25519_ACCOUNT, private_key)
+}
+
+pub(crate) fn write_x25519_private_key_for_account(
+    account: &str,
+    private_key: &[u8; 32],
+) -> Result<(), String> {
+    with_keychain_transaction(|| {
+        write_x25519_private_key_for_account_unlocked(account, private_key)
+    })
 }
 
 fn write_x25519_private_key_for_account_unlocked(
@@ -292,16 +333,21 @@ fn write_x25519_private_key_for_account_unlocked(
 }
 
 pub fn get_or_create_x25519_keypair() -> Result<([u8; 32], [u8; 32]), String> {
+    get_or_create_x25519_keypair_for_account(X25519_ACCOUNT)
+}
+
+pub(crate) fn get_or_create_x25519_keypair_for_account(
+    account: &str,
+) -> Result<([u8; 32], [u8; 32]), String> {
     with_keychain_transaction(|| {
-        if let Some(private) = try_read_x25519_private_key_unlocked()? {
+        if let Some(private) = try_read_x25519_private_key_for_account_unlocked(account)? {
             let public = crate::crypto::x25519_public_from_private(&private);
             return Ok((private, public));
         }
 
         let (candidate, _) = crate::crypto::generate_x25519_keypair();
         let encoded = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, candidate);
-        let stored =
-            crate::macos_keychain::get_or_insert_string(SERVICE, X25519_ACCOUNT, &encoded)?;
+        let stored = crate::macos_keychain::get_or_insert_string(SERVICE, account, &encoded)?;
         let private = decode_x25519_private_key(&stored)?;
         let public = crate::crypto::x25519_public_from_private(&private);
         Ok((private, public))
@@ -313,38 +359,28 @@ pub fn delete_x25519_keypair() -> Result<(), String> {
 }
 
 pub(crate) fn read_pending_x25519_private_key() -> Result<Option<[u8; 32]>, String> {
-    with_keychain_transaction(|| {
-        let Some(encoded) = try_read_keychain_password(SERVICE, X25519_PENDING_ACCOUNT)? else {
-            return Ok(None);
-        };
-        decode_x25519_private_key(&encoded).map(Some)
-    })
+    try_read_x25519_private_key_for_account(X25519_PENDING_ACCOUNT)
 }
 
-pub(crate) fn write_pending_x25519_private_key(private_key: &[u8; 32]) -> Result<(), String> {
+pub(crate) fn promote_x25519_private_key_accounts(
+    pending_account: &str,
+    live_account: &str,
+) -> Result<(), String> {
     with_keychain_transaction(|| {
-        write_x25519_private_key_for_account_unlocked(X25519_PENDING_ACCOUNT, private_key)
-    })
-}
-
-pub(crate) fn promote_pending_x25519_private_key() -> Result<(), String> {
-    with_keychain_transaction(|| {
-        let encoded = try_read_keychain_password(SERVICE, X25519_PENDING_ACCOUNT)?
+        let encoded = try_read_keychain_password(SERVICE, pending_account)?
             .ok_or_else(|| "no pending key to promote".to_owned())?;
         decode_x25519_private_key(&encoded)?;
-        write_keychain_password(SERVICE, X25519_ACCOUNT, &encoded)?;
-        let verified = try_read_keychain_password(SERVICE, X25519_ACCOUNT)?;
+        write_keychain_password(SERVICE, live_account, &encoded)?;
+        let verified = try_read_keychain_password(SERVICE, live_account)?;
         if verified.as_deref() != Some(encoded.as_str()) {
             return Err("live X25519 Keychain promotion verification failed".to_owned());
         }
-        delete_keychain_password(SERVICE, X25519_PENDING_ACCOUNT).map(|_| ())
+        delete_keychain_password(SERVICE, pending_account).map(|_| ())
     })
 }
 
-pub(crate) fn delete_pending_x25519_private_key() -> Result<(), String> {
-    with_keychain_transaction(|| {
-        delete_keychain_password(SERVICE, X25519_PENDING_ACCOUNT).map(|_| ())
-    })
+pub(crate) fn delete_x25519_private_key_for_account(account: &str) -> Result<(), String> {
+    with_keychain_transaction(|| delete_keychain_password(SERVICE, account).map(|_| ()))
 }
 
 fn decode_x25519_private_key(encoded: &str) -> Result<[u8; 32], String> {
@@ -398,6 +434,20 @@ mod tests {
     }
 
     #[test]
+    fn selected_environment_transfers_owned_secret_values() {
+        let value = "secret-value".to_owned();
+        let value_pointer = value.as_ptr();
+        let environments = HashMap::from([(
+            "default".to_owned(),
+            HashMap::from([("TOKEN".to_owned(), value)]),
+        )]);
+
+        let selected = take_environment(environments, "default").unwrap();
+
+        assert_eq!(selected["TOKEN"].as_ptr(), value_pointer);
+    }
+
+    #[test]
     fn shared_access_group_matches_the_native_app_contract() {
         assert_eq!(
             crate::macos_keychain::SHARED_ACCESS_GROUP,
@@ -421,9 +471,24 @@ mod tests {
             path: "/original/project/path".to_owned(),
         }];
 
-        add_index_entry_if_missing(&mut index, "vault-id", "directory-name", "/cli/path");
+        assert!(!add_index_entry_if_missing(
+            &mut index,
+            "vault-id",
+            "directory-name",
+            "/cli/path",
+        ));
 
         assert_eq!(index[0].name, "Vault project name");
         assert_eq!(index[0].path, "/original/project/path");
+    }
+
+    #[test]
+    fn cli_write_marks_a_new_vault_index_entry_as_changed() {
+        let mut index = Vec::new();
+
+        let changed =
+            add_index_entry_if_missing(&mut index, "vault-id", "directory-name", "/cli/path");
+
+        assert!(changed);
     }
 }

@@ -45,6 +45,8 @@
 use std::path::PathBuf;
 use std::process::Command;
 
+use jsonschema::Validator;
+
 const SKIP_SENTINEL: &str = "skip";
 
 /// Search strategy for the synced schemas dir.
@@ -206,4 +208,80 @@ fn lpm_json_schema_in_sync_with_public_copy() {
 #[test]
 fn lpm_config_schema_in_sync_with_public_copy() {
     assert_in_sync("lpm.config.json");
+}
+
+fn lpm_json_validator() -> Validator {
+    Validator::new(&lpm_runner::lpm_json::generate_schema())
+        .expect("generated lpm.json schema must compile")
+}
+
+#[test]
+fn lpm_json_schema_rejects_malformed_sync_authority_metadata() {
+    let validator = lpm_json_validator();
+    for document in [
+        serde_json::json!({"vaultSync": {"personalBinding": 17}}),
+        serde_json::json!({"vaultSync": {"orgBindings": {"acme": "account-1"}}}),
+        serde_json::json!({"vaultSync": {"authorityCheckpoints": {"personal": 5}}}),
+        serde_json::json!({
+            "vaultSync": {
+                "authorityCheckpoints": {
+                    "personal": {
+                        "https://lpm.dev": {
+                            "account-1": {"version": 0},
+                        },
+                    },
+                },
+            },
+        }),
+    ] {
+        assert!(
+            !validator.is_valid(&document),
+            "published schema accepted malformed sync authority metadata: {document}",
+        );
+    }
+}
+
+#[test]
+fn lpm_json_schema_accepts_valid_sync_authority_metadata() {
+    let validator = lpm_json_validator();
+    let document = serde_json::json!({
+        "vaultSync": {
+            "personalVersion": 7,
+            "personalBinding": {
+                "registryUrl": "https://lpm.dev",
+                "principalId": "account-1",
+            },
+            "orgBindings": {
+                "acme": {
+                    "registryUrl": "https://lpm.dev",
+                    "principalId": "11111111-1111-4111-8111-111111111111",
+                },
+            },
+            "authorityCheckpoints": {
+                "personal": {
+                    "https://lpm.dev": {
+                        "account-1": {
+                            "version": 7,
+                            "syncedAt": "2026-09-04T00:00:00Z",
+                        },
+                    },
+                },
+                "organizations": {
+                    "acme": {
+                        "https://lpm.dev": {
+                            "11111111-1111-4111-8111-111111111111": {
+                                "version": 3,
+                                "syncedAt": "2026-09-04T00:00:00Z",
+                            },
+                        },
+                    },
+                },
+            },
+        },
+    });
+
+    assert!(
+        validator.is_valid(&document),
+        "published schema rejected valid sync authority metadata",
+    );
 }

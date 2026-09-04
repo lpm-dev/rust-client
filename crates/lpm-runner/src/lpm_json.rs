@@ -34,6 +34,10 @@ pub struct LpmJsonConfig {
     #[serde(default)]
     pub vault: Option<String>,
 
+    /// Optional display name used by vault sync when package.json has no name.
+    #[serde(default)]
+    pub name: Option<String>,
+
     /// Project-local cloud sync metadata maintained by `lpm env`.
     #[serde(default, rename = "vaultSync")]
     pub vault_sync: Option<VaultSyncConfig>,
@@ -140,7 +144,7 @@ where
 }
 
 /// Cloud sync metadata maintained by `lpm env`.
-#[derive(Debug, Clone, Deserialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
 #[schemars(deny_unknown_fields)]
 pub struct VaultSyncConfig {
@@ -155,6 +159,83 @@ pub struct VaultSyncConfig {
 
     #[serde(default)]
     pub org_synced_at: HashMap<String, String>,
+
+    #[serde(default)]
+    pub personal_binding: Option<VaultSyncPrincipalBinding>,
+
+    #[serde(default)]
+    #[schemars(extend(
+        "maxProperties" = 64,
+        "propertyNames" = {"type": "string", "minLength": 1, "maxLength": 128}
+    ))]
+    pub org_bindings: Option<HashMap<String, VaultSyncPrincipalBinding>>,
+
+    #[serde(default)]
+    pub authority_checkpoints: Option<VaultSyncAuthorityCheckpoints>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct VaultSyncPrincipalBinding {
+    #[schemars(
+        length(min = 1, max = 2048),
+        extend("format" = "uri", "pattern" = "^https?://")
+    )]
+    pub registry_url: String,
+
+    #[schemars(length(min = 1, max = 128))]
+    pub principal_id: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct VaultSyncAuthorityCheckpoint {
+    #[schemars(range(min = 1, max = 2_147_483_647))]
+    pub version: i32,
+
+    #[serde(default)]
+    pub synced_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(transparent)]
+pub struct VaultSyncPrincipalCheckpoints(
+    #[schemars(extend(
+        "maxProperties" = 64,
+        "propertyNames" = {"type": "string", "minLength": 1, "maxLength": 128}
+    ))]
+    pub HashMap<String, VaultSyncAuthorityCheckpoint>,
+);
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(transparent)]
+pub struct VaultSyncRegistryCheckpoints(
+    #[schemars(extend(
+        "maxProperties" = 64,
+        "propertyNames" = {
+            "type": "string",
+            "format": "uri",
+            "minLength": 1,
+            "maxLength": 2048,
+            "pattern": "^https?://"
+        }
+    ))]
+    pub HashMap<String, VaultSyncPrincipalCheckpoints>,
+);
+
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+#[schemars(deny_unknown_fields)]
+pub struct VaultSyncAuthorityCheckpoints {
+    #[serde(default)]
+    pub personal: VaultSyncRegistryCheckpoints,
+
+    #[serde(default)]
+    #[schemars(extend(
+        "maxProperties" = 64,
+        "propertyNames" = {"type": "string", "minLength": 1, "maxLength": 128}
+    ))]
+    pub organizations: HashMap<String, VaultSyncRegistryCheckpoints>,
 }
 
 /// Hosted cache configuration in `lpm.json`.

@@ -249,15 +249,13 @@ pub fn parse_env_str(content: &str) -> HashMap<String, String> {
     let content = content.strip_prefix('\u{feff}').unwrap_or(content);
 
     let mut vars = HashMap::new();
-    let lines: Vec<&str> = content.lines().collect();
-    let mut i = 0;
+    let mut lines = content.lines();
 
-    while i < lines.len() {
-        let trimmed = lines[i].trim();
+    while let Some(line) = lines.next() {
+        let trimmed = line.trim();
 
         // Skip empty lines and comments
         if trimmed.is_empty() || trimmed.starts_with('#') {
-            i += 1;
             continue;
         }
 
@@ -267,15 +265,11 @@ pub fn parse_env_str(content: &str) -> HashMap<String, String> {
         // Find the first `=` separator
         let eq_pos = match trimmed.find('=') {
             Some(pos) => pos,
-            None => {
-                i += 1;
-                continue;
-            }
+            None => continue,
         };
 
         let key = trimmed[..eq_pos].trim().to_string();
         if key.is_empty() {
-            i += 1;
             continue;
         }
 
@@ -283,25 +277,20 @@ pub fn parse_env_str(content: &str) -> HashMap<String, String> {
 
         // Check for multiline double-quoted value: starts with `"` but doesn't end with `"`
         if raw_value.starts_with('"') && !(raw_value.len() >= 2 && raw_value.ends_with('"')) {
-            // Multiline: collect lines until we find a closing `"`
-            let mut parts = vec![&raw_value[1..]]; // Strip leading quote
-            i += 1;
-            while i < lines.len() {
-                let line = lines[i];
+            let mut value = String::with_capacity(raw_value.len());
+            value.push_str(&raw_value[1..]);
+            for line in lines.by_ref() {
+                value.push('\n');
                 if let Some(stripped) = line.strip_suffix('"') {
-                    parts.push(stripped);
-                    i += 1;
+                    value.push_str(stripped);
                     break;
                 }
-                parts.push(line);
-                i += 1;
+                value.push_str(line);
             }
-            // If we hit EOF without closing quote, join everything we have
-            vars.insert(key, parts.join("\n"));
+            vars.insert(key, value);
         } else {
             let value = unquote(raw_value);
             vars.insert(key, value);
-            i += 1;
         }
     }
 
@@ -314,9 +303,30 @@ pub fn parse_env_str(content: &str) -> HashMap<String, String> {
 /// - `'hello world'` → `hello world`
 /// - `hello world` → `hello world` (no change)
 fn unquote(s: &str) -> String {
-    if s.len() >= 2
-        && ((s.starts_with('"') && s.ends_with('"')) || (s.starts_with('\'') && s.ends_with('\'')))
-    {
+    if s.len() >= 2 && s.starts_with('"') && s.ends_with('"') {
+        let mut value = String::with_capacity(s.len() - 2);
+        let mut chars = s[1..s.len() - 1].chars();
+        while let Some(character) = chars.next() {
+            if character != '\\' {
+                value.push(character);
+                continue;
+            }
+            match chars.next() {
+                Some('n') => value.push('\n'),
+                Some('r') => value.push('\r'),
+                Some('t') => value.push('\t'),
+                Some('"') => value.push('"'),
+                Some('\\') => value.push('\\'),
+                Some(other) => {
+                    value.push('\\');
+                    value.push(other);
+                }
+                None => value.push('\\'),
+            }
+        }
+        return value;
+    }
+    if s.len() >= 2 && s.starts_with('\'') && s.ends_with('\'') {
         return s[1..s.len() - 1].to_string();
     }
     s.to_string()
@@ -492,6 +502,16 @@ mod tests {
     fn parse_double_quoted() {
         let vars = parse_env_str(r#"KEY="hello world""#);
         assert_eq!(vars.get("KEY").unwrap(), "hello world");
+    }
+
+    #[test]
+    fn parse_double_quoted_value_decodes_canonical_escapes() {
+        let vars = parse_env_str(r#"KEY="tab\tcr\rlf\nquote\"slash\\unknown\q""#);
+
+        assert_eq!(
+            vars.get("KEY").unwrap(),
+            "tab\tcr\rlf\nquote\"slash\\unknown\\q"
+        );
     }
 
     #[test]

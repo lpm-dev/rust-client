@@ -73,10 +73,7 @@ pub async fn run(
             return rotation::env_rotate_sharing_key(client, &args, json_output).await;
         }
         "list-remote" | "ls-remote" => {
-            let org_flag = args
-                .iter()
-                .position(|a| *a == "--org")
-                .and_then(|i| args.get(i + 1).copied());
+            let org_flag = remote::parse_list_remote_org_slug(&args)?;
             return remote::vars_list_remote(client, org_flag, json_output).await;
         }
         "diff" => return remote::vars_diff(client, &args[1..], project_dir, json_output).await,

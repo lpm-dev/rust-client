@@ -1,5 +1,5 @@
 use super::SyncError;
-use super::http::{read_capped_error_text, sync_http_client_builder};
+use super::http::{read_capped_error_text, read_capped_json, sync_http_client};
 
 /// HTTP header the server expects the CLI step-up proof JWT in. Mirrors
 /// `CLI_STEP_UP_HEADER_NAME` exported from the dashboard's
@@ -46,9 +46,7 @@ pub async fn discover_cli_step_up_policy(
     registry_url: &str,
     auth_token: &str,
 ) -> Result<CliStepUpPolicy, SyncError> {
-    let client = sync_http_client_builder()
-        .build()
-        .map_err(|e| format!("failed to build http client: {e}"))?;
+    let client = sync_http_client()?;
     let url = format!("{registry_url}/api/auth/cli-step-up");
 
     let response = client
@@ -68,10 +66,7 @@ pub async fn discover_cli_step_up_policy(
         ));
     }
 
-    Ok(response
-        .json::<CliStepUpPolicy>()
-        .await
-        .map_err(|e| format!("parse error: {e}"))?)
+    Ok(read_capped_json::<CliStepUpPolicy>(response).await?)
 }
 
 /// Successful mint response from `POST /api/auth/cli-step-up`.
@@ -97,9 +92,7 @@ pub async fn mint_cli_step_up_proof(
     scope: &str,
     credential: &CliStepUpCredential<'_>,
 ) -> Result<String, SyncError> {
-    let client = sync_http_client_builder()
-        .build()
-        .map_err(|e| format!("failed to build http client: {e}"))?;
+    let client = sync_http_client()?;
     let url = format!("{registry_url}/api/auth/cli-step-up");
 
     let body = match credential {
@@ -143,10 +136,7 @@ pub async fn mint_cli_step_up_proof(
         });
     }
 
-    let parsed = response
-        .json::<MintCliStepUpResponse>()
-        .await
-        .map_err(|e| format!("parse error: {e}"))?;
+    let parsed = read_capped_json::<MintCliStepUpResponse>(response).await?;
     if parsed.ok != Some(true) {
         return Err(SyncError::from(
             "step-up mint: server returned ok=false on 2xx response (unexpected)",

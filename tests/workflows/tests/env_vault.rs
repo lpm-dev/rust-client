@@ -12,16 +12,65 @@ use sha2::{Digest, Sha256};
 use support::assertions::parse_json_output;
 use support::auth_state::{
     SessionSeed, credentials_path, read_credentials, read_expiry_metadata, seed_sessions,
-    token_expiry_path,
+    token_expiry_path, write_credentials_store,
 };
 use support::mock_registry::{
-    MockRegistry, TEST_OIDC_POLICY_ID, TestSyncScope, signed_sync_response,
+    MockRegistry, PersonalPullFailureFixture, SignedSyncResponse, TEST_OIDC_POLICY_ID,
+    TestSyncScope, signed_sync_response,
 };
 use support::{TempProject, lpm, write_private_file};
-use wiremock::matchers::{header, method, path};
-use wiremock::{Mock, ResponseTemplate};
+use wiremock::matchers::{header, method, path, query_param};
+use wiremock::{Mock, Request, Respond, ResponseTemplate};
 
 const TEST_OIDC_POLICY_ID_2: &str = "22222222-2222-4222-8222-222222222222";
+
+struct ManifestReplacingSignedResponse {
+    manifest_path: std::path::PathBuf,
+    replacement: String,
+    response: SignedSyncResponse,
+}
+
+impl Respond for ManifestReplacingSignedResponse {
+    fn respond(&self, request: &Request) -> ResponseTemplate {
+        std::fs::write(&self.manifest_path, &self.replacement)
+            .expect("replace lpm.json before returning the remote response");
+        self.response.respond(request)
+    }
+}
+
+struct ManifestReplacingResponse {
+    manifest_path: std::path::PathBuf,
+    replacement: String,
+    response: ResponseTemplate,
+}
+
+impl Respond for ManifestReplacingResponse {
+    fn respond(&self, _request: &Request) -> ResponseTemplate {
+        std::fs::write(&self.manifest_path, &self.replacement)
+            .expect("replace lpm.json before returning the remote response");
+        self.response.clone()
+    }
+}
+
+struct CredentialsReplacingResponse {
+    home: std::path::PathBuf,
+    registry_url: String,
+    replacement_token: String,
+    response: ResponseTemplate,
+}
+
+impl Respond for CredentialsReplacingResponse {
+    fn respond(&self, _request: &Request) -> ResponseTemplate {
+        write_credentials_store(
+            &self.home,
+            &serde_json::json!({
+                (&self.registry_url): &self.replacement_token,
+                (format!("refresh:{}", self.registry_url)): "org-share-refresh-token",
+            }),
+        );
+        self.response.clone()
+    }
+}
 
 fn doctor_check<'a>(json: &'a serde_json::Value, code: &str) -> &'a serde_json::Value {
     json["checks"]
@@ -87,23 +136,6 @@ fn seed_org_sharing_key(project: &TempProject) -> ([u8; 32], [u8; 32], String, S
     (private_key, public_key, public_key_base64, fingerprint)
 }
 
-async fn mount_current_org_sharing_key(
-    mock: &MockRegistry,
-    auth_token: &str,
-    public_key_base64: &str,
-) {
-    Mock::given(method("GET"))
-        .and(path("/api/users/me/public-key"))
-        .and(header("authorization", format!("Bearer {auth_token}")))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-            "publicKey": public_key_base64,
-            "publicKeyVersion": 4,
-        })))
-        .expect(1)
-        .mount(mock.server())
-        .await;
-}
-
 struct OrgRotationPullFixture<'a> {
     auth_token: &'a str,
     org_slug: &'a str,
@@ -125,7 +157,9 @@ async fn mount_org_rotation_pull(
         &content_key,
         &plaintext,
         lpm_vault::crypto::VaultScope::Organization(fixture.org_slug),
+        "00000000-0000-4000-8000-000000000001",
         fixture.vault_id,
+        fixture.version,
     )
     .expect("encrypt org env payload");
     let wrapped_key = lpm_vault::crypto::wrap_key_for_recipient(&content_key, fixture.public_key)
@@ -135,7 +169,7 @@ async fn mount_org_rotation_pull(
         "encryptedBlob": encrypted_blob,
         "wrappedKey": wrapped_key,
         "version": fixture.version,
-        "cryptoVersion": 1,
+        "cryptoVersion": lpm_vault::crypto::CURRENT_CRYPTO_VERSION,
         "contentKeyVersion": fixture.content_key_version,
         "recipientPublicKeyVersion": 4,
         "recipientPublicKeyFingerprint": fixture.recipient_fingerprint,
@@ -173,16 +207,27 @@ async fn mount_org_member_keys(
     Mock::given(method("GET"))
         .and(path(format!("/api/orgs/{org_slug}/members/public-keys")))
         .and(header("authorization", format!("Bearer {auth_token}")))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
-            {
-                "userId": "11111111-1111-4111-8111-111111111111",
-                "role": "owner",
-                "publicKey": public_key_base64,
-                "publicKeyVersion": 4,
-                "publicKeyFingerprint": fingerprint,
-                "hasPublicKey": true,
-            }
-        ])))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header(
+                    "X-LPM-Organization-ID",
+                    "00000000-0000-4000-8000-000000000001",
+                )
+                .insert_header(
+                    "X-LPM-Caller-User-ID",
+                    "11111111-1111-4111-8111-111111111111",
+                )
+                .set_body_json(serde_json::json!([
+                    {
+                        "userId": "11111111-1111-4111-8111-111111111111",
+                        "role": "owner",
+                        "publicKey": public_key_base64,
+                        "publicKeyVersion": 4,
+                        "publicKeyFingerprint": fingerprint,
+                        "hasPublicKey": true,
+                    }
+                ])),
+        )
         .expect(1)
         .mount(mock.server())
         .await;
@@ -220,6 +265,50 @@ struct PreparedOrgRotation {
     previous_content_key: [u8; 32],
 }
 
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AcceptedRecipientSet<'a> {
+    schema_version: u32,
+    scope: AcceptedRecipientScope<'a>,
+    recipients: [AcceptedRecipient<'a>; 1],
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AcceptedRecipientScope<'a> {
+    registry_url: &'a str,
+    organization_id: &'static str,
+    organization_slug: &'static str,
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AcceptedRecipient<'a> {
+    user_id: &'static str,
+    public_key_version: i32,
+    public_key_fingerprint: &'a str,
+}
+
+fn org_rotation_recipient_acceptance(mock: &MockRegistry, fingerprint: &str) -> String {
+    let registry_url = mock.url();
+    let recipient_set = AcceptedRecipientSet {
+        schema_version: 2,
+        scope: AcceptedRecipientScope {
+            registry_url: &registry_url,
+            organization_id: "00000000-0000-4000-8000-000000000001",
+            organization_slug: ORG_ROTATION_SLUG,
+        },
+        recipients: [AcceptedRecipient {
+            user_id: "11111111-1111-4111-8111-111111111111",
+            public_key_version: 4,
+            public_key_fingerprint: fingerprint,
+        }],
+    };
+    hex::encode(Sha256::digest(
+        serde_json::to_vec(&recipient_set).expect("serialize accepted recipient set"),
+    ))
+}
+
 async fn prepare_org_rotation(
     project: &TempProject,
     mock: &MockRegistry,
@@ -241,7 +330,6 @@ async fn prepare_org_rotation(
         }],
     );
     let (private_key, public_key, public_key_base64, fingerprint) = seed_org_sharing_key(project);
-    mount_current_org_sharing_key(mock, ORG_ROTATION_TOKEN, &public_key_base64).await;
     let recipient_fingerprint = if stale_recipient_fingerprint {
         "a".repeat(64)
     } else {
@@ -451,8 +539,10 @@ async fn env_log_refreshes_a_rejected_stored_access_token_before_reading_audit_e
         .mount(mock.server())
         .await;
 
+    let manifest_read_log = project.path().join("env-log-manifest-reads.log");
     let output = lpm(&project)
         .env("LPM_REGISTRY_URL", mock.url())
+        .env("LPM_TEST_MANIFEST_READ_LOG", &manifest_read_log)
         .args(["--json", "env", "log"])
         .output()
         .expect("run env log with a refreshable session");
@@ -462,6 +552,14 @@ async fn env_log_refreshes_a_rejected_stored_access_token_before_reading_audit_e
         "env log did not recover the rejected access token:\nstdout: {}\nstderr: {}",
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr),
+    );
+    assert_eq!(
+        std::fs::read_to_string(manifest_read_log)
+            .expect("read env-log manifest access log")
+            .lines()
+            .count(),
+        1,
+        "env log needs one validated command snapshot",
     );
 }
 
@@ -910,7 +1008,13 @@ async fn env_pull_overwrites_local_state_with_remote_environments() {
         }),
     );
 
-    mock.with_personal_pull(
+    let wrapping_key = [0x52; 32];
+    let data_key = [0x53; 32];
+    write_private_file(
+        &project.home().join(".lpm").join(".vault-key"),
+        hex::encode(wrapping_key),
+    );
+    mock.with_personal_pull_keys(
         vault_id,
         "session-access-token",
         serde_json::json!({
@@ -924,6 +1028,8 @@ async fn env_pull_overwrites_local_state_with_remote_environments() {
                 }
             }
         }),
+        &wrapping_key,
+        &data_key,
         7,
     )
     .await;
@@ -996,8 +1102,158 @@ async fn env_pull_overwrites_local_state_with_remote_environments() {
     assert_eq!(synced_config["vault"].as_str(), Some(vault_id));
     assert_eq!(
         synced_config["vaultSync"]["personalVersion"].as_i64(),
-        Some(8)
+        Some(7)
     );
+}
+
+#[tokio::test]
+async fn env_pull_joined_org_selector_never_falls_back_to_personal_scope() {
+    let project = TempProject::empty(r#"{"name":"vault-pull-org-scope-test","version":"1.0.0"}"#);
+    let mock = MockRegistry::start().await;
+    let vault_id = "vault-pull-org-scope";
+
+    seed_sessions(
+        project.home(),
+        &[SessionSeed {
+            registry_url: &mock.url(),
+            access_token: Some("session-access-token"),
+            refresh_token: Some("refresh-token"),
+            session_access_expires_at: Some("2030-01-01T00:00:00Z"),
+        }],
+    );
+    project.write_file(
+        "lpm.json",
+        &serde_json::json!({ "vault": vault_id }).to_string(),
+    );
+    write_file_backed_vault(
+        project.home(),
+        vault_id,
+        serde_json::json!({
+            "environments": {
+                "default": { "KEEP": "local" }
+            }
+        }),
+    );
+
+    let wrapping_key = [0x62; 32];
+    write_private_file(
+        &project.home().join(".lpm").join(".vault-key"),
+        hex::encode(wrapping_key),
+    );
+
+    let pull = lpm(&project)
+        .env("LPM_REGISTRY_URL", mock.url())
+        .args(["env", "pull", "--org=acme", "--yes"])
+        .output()
+        .expect("failed to run organization-scoped env pull");
+
+    assert!(
+        !pull.status.success(),
+        "an organization-scoped pull unexpectedly used personal data:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&pull.stdout),
+        String::from_utf8_lossy(&pull.stderr),
+    );
+    let requests = mock.server().received_requests().await.unwrap();
+    assert!(
+        requests
+            .iter()
+            .all(|request| request.url.path() != format!("/api/vaults/{vault_id}/sync")),
+        "organization selector reached the personal sync endpoint: {requests:?}"
+    );
+
+    let local = lpm(&project)
+        .args(["--json", "env", "list", "--reveal"])
+        .output()
+        .expect("failed to read local env after rejected organization pull");
+    assert_eq!(
+        parse_json_output(&local.stdout),
+        serde_json::json!({ "KEEP": "local" })
+    );
+}
+
+#[tokio::test]
+async fn env_pull_rejects_a_different_bound_account_before_local_overwrite() {
+    let project = TempProject::empty(r#"{"name":"pull-account-binding","version":"1.0.0"}"#);
+    let mock = MockRegistry::start().await;
+    let vault_id = "vault-account-binding";
+    seed_sessions(
+        project.home(),
+        &[SessionSeed {
+            registry_url: &mock.url(),
+            access_token: Some("session-access-token"),
+            refresh_token: Some("refresh-token"),
+            session_access_expires_at: Some("2030-01-01T00:00:00Z"),
+        }],
+    );
+    project.write_file(
+        "lpm.json",
+        &serde_json::json!({
+            "vault": vault_id,
+            "vaultSync": {
+                "personalVersion": 7,
+                "personalBinding": {
+                    "registryUrl": mock.url(),
+                    "principalId": "account-a"
+                }
+            }
+        })
+        .to_string(),
+    );
+    write_file_backed_vault(
+        project.home(),
+        vault_id,
+        serde_json::json!({
+            "environments": {
+                "default": {"ORIGINAL": "local"}
+            }
+        }),
+    );
+    let vault_path = project
+        .home()
+        .join(".lpm")
+        .join("vaults")
+        .join(format!("{vault_id}.enc"));
+    let before_vault = std::fs::read(&vault_path).expect("read local vault before pull");
+    let before_manifest = project.read_file("lpm.json");
+
+    Mock::given(method("GET"))
+        .and(path(format!("/api/vaults/{vault_id}/sync")))
+        .and(header("authorization", "Bearer session-access-token"))
+        .respond_with(signed_sync_response(
+            serde_json::json!({
+                "encryptedBlob": "invalid-ciphertext",
+                "wrappedKey": "invalid-wrapped-key",
+                "version": 8,
+                "cryptoVersion": lpm_vault::crypto::CURRENT_CRYPTO_VERSION,
+                "principalId": "account-b"
+            }),
+            "session-access-token",
+            vault_id,
+            TestSyncScope::Personal,
+        ))
+        .expect(1)
+        .mount(mock.server())
+        .await;
+
+    let output = lpm(&project)
+        .env("LPM_REGISTRY_URL", mock.url())
+        .args(["--json", "env", "pull", "--yes"])
+        .output()
+        .expect("run pull under a different account");
+
+    assert!(!output.status.success());
+    let error = parse_json_output(&output.stdout);
+    assert!(
+        error["error"]
+            .as_str()
+            .is_some_and(|message| message.contains("different account")),
+        "unexpected error: {error}"
+    );
+    assert_eq!(
+        std::fs::read(&vault_path).expect("read local vault after rejected pull"),
+        before_vault,
+    );
+    assert_eq!(project.read_file("lpm.json"), before_manifest);
 }
 
 #[tokio::test]
@@ -1650,6 +1906,8 @@ async fn env_pull_oidc_writes_env_file_with_sorted_and_quoted_values() {
             "Z_LAST": "plain",
             "API_KEY": "secret value",
             "MULTILINE": "line1\nline2",
+            "CONTROL_WHITESPACE": "\tleft\rright\t",
+            "QUOTED": "say \"hello\" from `LPM` with $TOKEN and C:\\vault",
         }),
     )
     .await;
@@ -1681,7 +1939,15 @@ async fn env_pull_oidc_writes_env_file_with_sorted_and_quoted_values() {
 
     assert!(written.contains("# LPM vault secrets (env: preview)"));
     assert!(written.contains("API_KEY=\"secret value\""));
-    assert!(written.contains("MULTILINE=\"line1\nline2\""));
+    assert!(written.contains("MULTILINE=\"line1\\nline2\""));
+    let parsed = lpm_runner::dotenv::parse_env_str(&written);
+    assert_eq!(parsed["API_KEY"], "secret value");
+    assert_eq!(parsed["MULTILINE"], "line1\nline2");
+    assert_eq!(parsed["CONTROL_WHITESPACE"], "\tleft\rright\t");
+    assert_eq!(
+        parsed["QUOTED"],
+        "say \"hello\" from `LPM` with $TOKEN and C:\\vault"
+    );
 
     let api_key_index = written
         .find("API_KEY=")
@@ -1763,10 +2029,15 @@ async fn env_pull_oidc_environment_vault_id_overrides_local_vault() {
         .args(["--json", "env", "pull", "--oidc"])
         .output()
         .expect("failed to run OIDC pull with vault override");
+    let requests = mock.server().received_requests().await.unwrap();
+    let request_bodies = requests
+        .iter()
+        .map(|request| String::from_utf8_lossy(&request.body).into_owned())
+        .collect::<Vec<_>>();
 
     assert!(
         output.status.success(),
-        "OIDC pull did not use the environment vault override:\nstdout: {}\nstderr: {}",
+        "OIDC pull did not use the environment vault override:\nstdout: {}\nstderr: {}\nrequests: {request_bodies:?}",
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr),
     );
@@ -2995,6 +3266,220 @@ async fn env_oidc_allow_github_rejects_malformed_repository_ids_before_network()
 }
 
 #[tokio::test]
+async fn env_push_uses_bound_checkpoint_without_a_version_preflight() {
+    let project = TempProject::empty(r#"{"name":"push-bound","version":"1.0.0"}"#);
+    let mock = MockRegistry::start().await;
+    let registry_url = mock.url();
+    let vault_id = "vault-push-bound";
+    project.write_file(
+        "lpm.json",
+        &serde_json::json!({
+            "vault": vault_id,
+            "vaultSync": {
+                "personalVersion": 7,
+                "personalBinding": {
+                    "registryUrl": registry_url,
+                    "principalId": "account-1",
+                },
+            },
+        })
+        .to_string(),
+    );
+    write_file_backed_vault(
+        project.home(),
+        vault_id,
+        serde_json::json!({"environments": {"default": {"API_KEY": "secret"}}}),
+    );
+    write_private_file(
+        &project.home().join(".lpm").join(".vault-key"),
+        hex::encode([0x31; 32]),
+    );
+    seed_sessions(
+        project.home(),
+        &[SessionSeed {
+            registry_url: &registry_url,
+            access_token: Some("session-access-token"),
+            refresh_token: Some("refresh-token"),
+            session_access_expires_at: Some("2030-01-01T00:00:00Z"),
+        }],
+    );
+
+    Mock::given(method("GET"))
+        .and(path(format!("/api/vaults/{vault_id}/sync")))
+        .and(query_param("versionOnly", "true"))
+        .respond_with(signed_sync_response(
+            serde_json::json!({"version": 7}),
+            "session-access-token",
+            vault_id,
+            TestSyncScope::Personal,
+        ))
+        .mount(mock.server())
+        .await;
+    Mock::given(method("POST"))
+        .and(path(format!("/api/vaults/{vault_id}/sync")))
+        .respond_with(signed_sync_response(
+            serde_json::json!({"version": 8, "status": "synced"}),
+            "session-access-token",
+            vault_id,
+            TestSyncScope::Personal,
+        ))
+        .expect(1)
+        .mount(mock.server())
+        .await;
+
+    let manifest_read_log = project.path().join("manifest-reads.log");
+
+    let output = lpm(&project)
+        .env("LPM_REGISTRY_URL", &registry_url)
+        .env("LPM_TEST_MANIFEST_READ_LOG", &manifest_read_log)
+        .args(["--json", "env", "push", "--yes"])
+        .output()
+        .expect("run bound personal push");
+
+    assert!(
+        output.status.success(),
+        "push failed:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let requests = mock.server().received_requests().await.unwrap();
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|request| {
+                request.method.as_str() == "GET"
+                    && request
+                        .url
+                        .query_pairs()
+                        .any(|(key, value)| key == "versionOnly" && value == "true")
+            })
+            .count(),
+        0,
+        "a durable principal-bound checkpoint must avoid the version preflight",
+    );
+    let push = requests
+        .iter()
+        .find(|request| request.method.as_str() == "POST")
+        .expect("personal push request");
+    let body: serde_json::Value = serde_json::from_slice(&push.body).unwrap();
+    assert_eq!(body["expectedVersion"], 7);
+    assert_eq!(body["expectedPrincipalId"], "account-1");
+    let manifest_read_count = std::fs::read_to_string(&manifest_read_log)
+        .expect("read manifest access log")
+        .lines()
+        .count();
+    assert_eq!(
+        manifest_read_count, 3,
+        "one command snapshot, one fresh mutation-boundary check, and one guarded metadata commit are sufficient",
+    );
+}
+
+#[tokio::test]
+async fn env_force_push_recreates_a_deleted_bound_vault_above_its_checkpoint() {
+    let project = TempProject::empty(r#"{"name":"push-recreated","version":"1.0.0"}"#);
+    let mock = MockRegistry::start().await;
+    let registry_url = mock.url();
+    let vault_id = "vault-push-recreated";
+    project.write_file(
+        "lpm.json",
+        &serde_json::json!({
+            "vault": vault_id,
+            "vaultSync": {
+                "personalVersion": 5,
+                "personalBinding": {
+                    "registryUrl": registry_url,
+                    "principalId": "account-1",
+                },
+                "authorityCheckpoints": {
+                    "personal": {
+                        registry_url.clone(): {
+                            "account-1": {
+                                "version": 5,
+                                "syncedAt": "2026-09-04T00:00:00Z",
+                            },
+                        },
+                    },
+                },
+            },
+        })
+        .to_string(),
+    );
+    write_file_backed_vault(
+        project.home(),
+        vault_id,
+        serde_json::json!({"environments": {"default": {"API_KEY": "secret"}}}),
+    );
+    write_private_file(
+        &project.home().join(".lpm").join(".vault-key"),
+        hex::encode([0x32; 32]),
+    );
+    seed_sessions(
+        project.home(),
+        &[SessionSeed {
+            registry_url: &registry_url,
+            access_token: Some("session-access-token"),
+            refresh_token: Some("refresh-token"),
+            session_access_expires_at: Some("2030-01-01T00:00:00Z"),
+        }],
+    );
+
+    Mock::given(method("GET"))
+        .and(path(format!("/api/vaults/{vault_id}/sync")))
+        .and(query_param("versionOnly", "true"))
+        .respond_with(
+            ResponseTemplate::new(404)
+                .set_body_json(serde_json::json!({"error": "Vault not found"})),
+        )
+        .expect(1)
+        .mount(mock.server())
+        .await;
+    Mock::given(method("POST"))
+        .and(path(format!("/api/vaults/{vault_id}/sync")))
+        .respond_with(signed_sync_response(
+            serde_json::json!({"version": 6, "status": "synced", "principalId": "account-1"}),
+            "session-access-token",
+            vault_id,
+            TestSyncScope::Personal,
+        ))
+        .expect(1)
+        .mount(mock.server())
+        .await;
+
+    let output = lpm(&project)
+        .env("LPM_REGISTRY_URL", &registry_url)
+        .args(["--json", "env", "push", "--yes", "--force"])
+        .output()
+        .expect("run forced personal recreation");
+
+    assert!(
+        output.status.success(),
+        "force recreation failed after the remote commit:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    assert_eq!(
+        lpm_vault::vault_id::read_personal_sync_version_for_principal(
+            project.path(),
+            lpm_vault::vault_id::SyncPrincipal {
+                registry_url: &registry_url,
+                principal_id: "account-1",
+            },
+        ),
+        Some(6),
+    );
+    let requests = mock.server().received_requests().await.unwrap();
+    let push = requests
+        .iter()
+        .find(|request| request.method.as_str() == "POST")
+        .expect("personal recreation request");
+    let body: serde_json::Value = serde_json::from_slice(&push.body).unwrap();
+    assert_eq!(body["expectedVersion"], 5);
+    assert_eq!(body["expectedPrincipalId"], "account-1");
+    assert_eq!(body["ciphertextRevision"], 6);
+    assert_eq!(body["recreateMissing"], true);
+}
+
+#[tokio::test]
 async fn env_rotate_key_preserves_complete_named_remote_payload_with_cas() {
     let project = TempProject::empty(r#"{"name":"rotate-key","version":"1.0.0"}"#);
     let mock = MockRegistry::start().await;
@@ -3042,8 +3527,10 @@ async fn env_rotate_key_preserves_complete_named_remote_payload_with_cas() {
     )
     .await;
 
+    let manifest_read_log = project.path().join("personal-rotation-manifest-reads.log");
     let output = lpm(&project)
         .env("LPM_REGISTRY_URL", mock.url())
+        .env("LPM_TEST_MANIFEST_READ_LOG", &manifest_read_log)
         .args(["--json", "env", "rotate-key"])
         .output()
         .expect("run env rotate-key");
@@ -3061,6 +3548,13 @@ async fn env_rotate_key_preserves_complete_named_remote_payload_with_cas() {
         json["environments"],
         serde_json::json!(["default", "production", "staging"])
     );
+    let manifest_reads = std::fs::read_to_string(manifest_read_log)
+        .expect("read personal-rotation manifest access log");
+    assert_eq!(
+        manifest_reads.lines().count(),
+        3,
+        "rotation needs one command snapshot, one mutation-boundary check, and one guarded metadata commit:\n{manifest_reads}",
+    );
     assert!(!String::from_utf8_lossy(&output.stdout).contains("remote-only"));
 
     let requests = mock.server().received_requests().await.unwrap();
@@ -3075,7 +3569,23 @@ async fn env_rotate_key_preserves_complete_named_remote_payload_with_cas() {
     );
     let push = pushes[0];
     let body: serde_json::Value = serde_json::from_slice(&push.body).unwrap();
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|request| {
+                request.method.as_str() == "GET"
+                    && request
+                        .url
+                        .query_pairs()
+                        .any(|(key, value)| key == "versionOnly" && value == "true")
+            })
+            .count(),
+        0,
+        "the signed rotation pull must supply the principal and version preconditions",
+    );
     assert_eq!(body["expectedVersion"], 7);
+    assert_eq!(body["expectedPrincipalId"], "account-1");
+    assert_eq!(body["ciphertextRevision"], 8);
     assert_eq!(
         body["cryptoVersion"],
         lpm_vault::crypto::CURRENT_CRYPTO_VERSION
@@ -3093,7 +3603,9 @@ async fn env_rotate_key_preserves_complete_named_remote_payload_with_cas() {
         &rotated_data_key,
         body["encryptedBlob"].as_str().expect("encrypted blob"),
         lpm_vault::crypto::VaultScope::Personal,
+        "account-1",
         "vault-rotate-123",
+        8,
         lpm_vault::crypto::CURRENT_CRYPTO_VERSION,
     )
     .expect("decrypt rotated payload");
@@ -3115,6 +3627,98 @@ async fn env_rotate_key_preserves_complete_named_remote_payload_with_cas() {
     assert_eq!(
         persisted_wrapping_key, original_wrapping_key,
         "data-key rotation must preserve the shared wrapping key used by browser and CI escrow"
+    );
+}
+
+#[tokio::test]
+async fn env_rotate_key_rejects_a_replaced_manifest_before_the_remote_write() {
+    let project = TempProject::empty(r#"{"name":"rotate-replaced","version":"1.0.0"}"#);
+    let mock = MockRegistry::start().await;
+    let registry_url = mock.url();
+    let vault_id = "vault-rotate-replaced";
+    project.write_file("lpm.json", &format!(r#"{{"vault":"{vault_id}"}}"#));
+    seed_sessions(
+        project.home(),
+        &[SessionSeed {
+            registry_url: &registry_url,
+            access_token: Some("rotation-replaced-token"),
+            refresh_token: Some("rotation-replaced-refresh"),
+            session_access_expires_at: Some("2030-01-01T00:00:00Z"),
+        }],
+    );
+    let wrapping_key = [0x41; 32];
+    write_private_file(
+        &project.home().join(".lpm").join(".vault-key"),
+        hex::encode(wrapping_key),
+    );
+    let data_key = [0x42; 32];
+    let plaintext = serde_json::to_vec(&serde_json::json!({
+        "environments": {"default": {"API_KEY": "remote"}},
+    }))
+    .expect("serialize rotation payload");
+    let encrypted_blob = lpm_vault::crypto::encrypt_vault_payload(
+        &data_key,
+        &plaintext,
+        lpm_vault::crypto::VaultScope::Personal,
+        "account-1",
+        vault_id,
+        7,
+    )
+    .expect("encrypt rotation payload");
+    let wrapped_key =
+        lpm_vault::crypto::wrap_key(&wrapping_key, &data_key).expect("wrap rotation payload key");
+    let signed_response = signed_sync_response(
+        serde_json::json!({
+            "encryptedBlob": encrypted_blob,
+            "wrappedKey": wrapped_key,
+            "version": 7,
+            "cryptoVersion": lpm_vault::crypto::CURRENT_CRYPTO_VERSION,
+        }),
+        "rotation-replaced-token",
+        vault_id,
+        TestSyncScope::Personal,
+    );
+    Mock::given(method("GET"))
+        .and(path(format!("/api/vaults/{vault_id}/sync")))
+        .and(header("authorization", "Bearer rotation-replaced-token"))
+        .respond_with(ManifestReplacingSignedResponse {
+            manifest_path: project.path().join("lpm.json"),
+            replacement: r#"{"vault":"another-vault"}"#.to_owned(),
+            response: signed_response,
+        })
+        .expect(1)
+        .mount(mock.server())
+        .await;
+    Mock::given(method("POST"))
+        .and(path(format!("/api/vaults/{vault_id}/sync")))
+        .respond_with(ResponseTemplate::new(500))
+        .expect(0)
+        .mount(mock.server())
+        .await;
+
+    let output = lpm(&project)
+        .env("LPM_REGISTRY_URL", &registry_url)
+        .args(["--json", "env", "rotate-key"])
+        .output()
+        .expect("run rotation while lpm.json is replaced");
+
+    assert!(!output.status.success());
+    let error = parse_clean_json_stdout(&output);
+    assert!(
+        error["error"]
+            .as_str()
+            .is_some_and(|message| message.contains("changed to another vault")),
+        "unexpected error: {error}",
+    );
+    assert_eq!(
+        mock.server()
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .filter(|request| request.method.as_str() == "POST")
+            .count(),
+        0,
     );
 }
 
@@ -3176,18 +3780,20 @@ async fn env_rotate_key_version_conflict_preserves_local_key_and_version_metadat
         std::fs::set_permissions(&wrapping_key_path, std::fs::Permissions::from_mode(0o600))
             .expect("restrict wrapping key");
     }
-    mock.with_personal_pull_failure(
-        "vault-rotate-conflict-123",
-        "session-access-token",
-        serde_json::json!({
+    mock.with_personal_pull_failure(PersonalPullFailureFixture {
+        vault_id: "vault-rotate-conflict-123",
+        bearer_token: "session-access-token",
+        payload: serde_json::json!({
             "environments": {
                 "default": {"API_KEY": "remote"}
             }
         }),
-        7,
-        409,
-        "vault version conflict",
-    )
+        wrapping_key: &wrapping_key,
+        data_key: &[0x34; 32],
+        version: 7,
+        status: 409,
+        error: "vault version conflict",
+    })
     .await;
 
     let output = lpm(&project)
@@ -3239,7 +3845,7 @@ async fn env_rotate_key_encryption_failure_does_not_push_or_update_local_metadat
         std::fs::set_permissions(&wrapping_key_path, std::fs::Permissions::from_mode(0o600))
             .expect("restrict wrapping key");
     }
-    mock.with_personal_pull(
+    mock.with_personal_pull_keys(
         "vault-rotate-encrypt-123",
         "session-access-token",
         serde_json::json!({
@@ -3247,6 +3853,8 @@ async fn env_rotate_key_encryption_failure_does_not_push_or_update_local_metadat
                 "default": {"API_KEY": "remote"}
             }
         }),
+        &wrapping_key,
+        &[0x45; 32],
         7,
     )
     .await;
@@ -3302,6 +3910,7 @@ async fn env_rotate_key_org_reencrypts_complete_payload_and_advances_content_key
         "schema": {"version": 2},
     });
     let prepared = prepare_org_rotation(&project, &mock, &payload, false, true).await;
+    let recipient_acceptance = org_rotation_recipient_acceptance(&mock, &prepared.fingerprint);
     mount_org_rotation_push(
         &mock,
         ORG_ROTATION_TOKEN,
@@ -3315,9 +3924,19 @@ async fn env_rotate_key_org_reencrypts_complete_payload_and_advances_content_key
     )
     .await;
 
+    let manifest_read_log = project.path().join("org-rotation-manifest-reads.log");
     let output = lpm(&project)
         .env("LPM_REGISTRY_URL", mock.url())
-        .args(["--json", "env", "rotate-key", "--org", ORG_ROTATION_SLUG])
+        .env("LPM_TEST_MANIFEST_READ_LOG", &manifest_read_log)
+        .args([
+            "--json",
+            "env",
+            "rotate-key",
+            "--org",
+            ORG_ROTATION_SLUG,
+            "--accept-recipient-keys",
+            &recipient_acceptance,
+        ])
         .output()
         .expect("run organization content-key rotation");
 
@@ -3337,8 +3956,24 @@ async fn env_rotate_key_org_reencrypts_complete_payload_and_advances_content_key
         lpm_vault::vault_id::read_org_sync_version(project.path(), ORG_ROTATION_SLUG),
         Some(9),
     );
+    assert_eq!(
+        std::fs::read_to_string(manifest_read_log)
+            .expect("read organization-rotation manifest access log")
+            .lines()
+            .count(),
+        3,
+        "organization rotation needs one command snapshot, one mutation-boundary check, and one guarded metadata commit",
+    );
 
     let requests = mock.server().received_requests().await.unwrap();
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|request| request.url.path() == "/api/users/me/public-key")
+            .count(),
+        0,
+        "steady-state organization rotation must use the signed pull binding without a public-key preflight",
+    );
     let push = requests
         .iter()
         .find(|request| request.method.as_str() == "POST")
@@ -3346,6 +3981,7 @@ async fn env_rotate_key_org_reencrypts_complete_payload_and_advances_content_key
     let body: serde_json::Value =
         serde_json::from_slice(&push.body).expect("organization push body must be JSON");
     assert_eq!(body["expectedVersion"], 8);
+    assert_eq!(body["ciphertextRevision"], 9);
     assert_eq!(
         body["cryptoVersion"],
         lpm_vault::crypto::CURRENT_CRYPTO_VERSION
@@ -3368,7 +4004,9 @@ async fn env_rotate_key_org_reencrypts_complete_payload_and_advances_content_key
             .as_str()
             .expect("rotation push must contain ciphertext"),
         lpm_vault::crypto::VaultScope::Organization(ORG_ROTATION_SLUG),
+        "00000000-0000-4000-8000-000000000001",
         ORG_ROTATION_VAULT_ID,
+        9,
         lpm_vault::crypto::CURRENT_CRYPTO_VERSION,
     )
     .expect("decrypt rotated organization payload");
@@ -3394,7 +4032,8 @@ async fn env_rotate_key_org_version_conflict_preserves_local_sync_version() {
     let payload = serde_json::json!({
         "environments": {"default": {"API_KEY": "remote"}},
     });
-    prepare_org_rotation(&project, &mock, &payload, false, true).await;
+    let prepared = prepare_org_rotation(&project, &mock, &payload, false, true).await;
+    let recipient_acceptance = org_rotation_recipient_acceptance(&mock, &prepared.fingerprint);
     lpm_vault::vault_id::write_org_sync_version(project.path(), ORG_ROTATION_SLUG, 7)
         .expect("seed prior organization sync version");
     Mock::given(method("POST"))
@@ -3412,7 +4051,15 @@ async fn env_rotate_key_org_version_conflict_preserves_local_sync_version() {
 
     let output = lpm(&project)
         .env("LPM_REGISTRY_URL", mock.url())
-        .args(["--json", "env", "rotate-key", "--org", ORG_ROTATION_SLUG])
+        .args([
+            "--json",
+            "env",
+            "rotate-key",
+            "--org",
+            ORG_ROTATION_SLUG,
+            "--accept-recipient-keys",
+            &recipient_acceptance,
+        ])
         .output()
         .expect("run conflicting organization rotation");
 
@@ -3472,7 +4119,8 @@ async fn env_rotate_key_org_rejects_response_without_content_key_epoch() {
     let project = TempProject::empty(r#"{"name":"org-rotate-missing-epoch","version":"1.0.0"}"#);
     let mock = MockRegistry::start().await;
     let payload = serde_json::json!({"environments": {"default": {"API_KEY": "remote"}}});
-    prepare_org_rotation(&project, &mock, &payload, false, true).await;
+    let prepared = prepare_org_rotation(&project, &mock, &payload, false, true).await;
+    let recipient_acceptance = org_rotation_recipient_acceptance(&mock, &prepared.fingerprint);
     mount_org_rotation_push(
         &mock,
         ORG_ROTATION_TOKEN,
@@ -3484,7 +4132,15 @@ async fn env_rotate_key_org_rejects_response_without_content_key_epoch() {
 
     let output = lpm(&project)
         .env("LPM_REGISTRY_URL", mock.url())
-        .args(["--json", "env", "rotate-key", "--org", ORG_ROTATION_SLUG])
+        .args([
+            "--json",
+            "env",
+            "rotate-key",
+            "--org",
+            ORG_ROTATION_SLUG,
+            "--accept-recipient-keys",
+            &recipient_acceptance,
+        ])
         .output()
         .expect("run organization rotation with incomplete response");
 
@@ -3506,7 +4162,8 @@ async fn env_rotate_key_org_rejects_response_with_unchanged_content_key_epoch() 
     let project = TempProject::empty(r#"{"name":"org-rotate-static-epoch","version":"1.0.0"}"#);
     let mock = MockRegistry::start().await;
     let payload = serde_json::json!({"environments": {"default": {"API_KEY": "remote"}}});
-    prepare_org_rotation(&project, &mock, &payload, false, true).await;
+    let prepared = prepare_org_rotation(&project, &mock, &payload, false, true).await;
+    let recipient_acceptance = org_rotation_recipient_acceptance(&mock, &prepared.fingerprint);
     mount_org_rotation_push(
         &mock,
         ORG_ROTATION_TOKEN,
@@ -3522,7 +4179,15 @@ async fn env_rotate_key_org_rejects_response_with_unchanged_content_key_epoch() 
 
     let output = lpm(&project)
         .env("LPM_REGISTRY_URL", mock.url())
-        .args(["--json", "env", "rotate-key", "--org", ORG_ROTATION_SLUG])
+        .args([
+            "--json",
+            "env",
+            "rotate-key",
+            "--org",
+            ORG_ROTATION_SLUG,
+            "--accept-recipient-keys",
+            &recipient_acceptance,
+        ])
         .output()
         .expect("run organization rotation with unchanged content-key epoch");
 
@@ -4651,18 +5316,9 @@ async fn env_oidc_allow_canonicalizes_env_aliases_before_storing_policy() {
 }
 
 #[tokio::test]
-async fn env_share_refuses_force_flag_with_actionable_remediation() {
-    // The share command never implemented --force — before this commit
-    // the CLI silently dropped the flag and re-sent the same request,
-    // so a user trying to resolve an org-vault version conflict with
-    // --force was lied to by the UX. The server-side org 409 hints no
-    // longer mention --force either; this assertion locks in the
-    // matching CLI refusal so the two surfaces stay in sync.
-    //
-    // The rejection fires before any vault / network state is touched,
-    // so the test does not need a configured vault, mock registry, or
-    // session seed — the CLI must refuse at flag parse time.
+async fn env_share_force_requires_a_bound_organization_before_network_access() {
     let project = TempProject::empty(r#"{"name":"share-force-refusal","version":"1.0.0"}"#);
+    project.write_file("lpm.json", r#"{"vault":"vault-unbound-force"}"#);
 
     let output = lpm(&project)
         .args(["env", "share", "--org", "acme", "--force"])
@@ -4671,7 +5327,7 @@ async fn env_share_refuses_force_flag_with_actionable_remediation() {
 
     assert!(
         !output.status.success(),
-        "share --force must fail with a non-zero exit:\nstdout: {}\nstderr: {}",
+        "unbound share --force must fail with a non-zero exit:\nstdout: {}\nstderr: {}",
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr),
     );
@@ -4681,14 +5337,7 @@ async fn env_share_refuses_force_flag_with_actionable_remediation() {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr),
     );
-    assert!(
-        combined.contains("`lpm env share --force` is not supported"),
-        "expected the explicit refusal sentence; got: {combined}"
-    );
-    assert!(
-        combined.contains("lpm env pull --org"),
-        "expected the pull-then-retry remediation hint; got: {combined}"
-    );
+    assert!(combined.contains("previously bound to this checkout"));
 }
 
 #[tokio::test]
@@ -4738,6 +5387,7 @@ async fn env_share_rejects_semantically_invalid_lpm_json_before_registering_a_sh
 #[tokio::test]
 async fn env_share_force_under_json_emits_error_envelope_on_stdout() {
     let project = TempProject::empty(r#"{"name":"share-force-json","version":"1.0.0"}"#);
+    project.write_file("lpm.json", r#"{"vault":"vault-unbound-force-json"}"#);
 
     let output = lpm(&project)
         .args(["--json", "env", "share", "--org", "acme", "--force"])
@@ -4755,8 +5405,724 @@ async fn env_share_force_under_json_emits_error_envelope_on_stdout() {
     assert_eq!(json["success"], false);
     assert_eq!(json["error_code"], "script");
     let error = json["error"].as_str().expect("error should be a string");
-    assert!(error.contains("`lpm env share --force` is not supported"));
-    assert!(error.contains("lpm env pull --org"));
+    assert!(error.contains("previously bound to this checkout"));
+}
+
+#[tokio::test]
+async fn env_share_force_recreates_only_a_missing_bound_organization_vault() {
+    let project = TempProject::empty(r#"{"name":"share-recreated","version":"1.0.0"}"#);
+    let mock = MockRegistry::start().await;
+    let registry_url = mock.url();
+    let auth_token = "org-share-recreate-token";
+    let vault_id = "vault-org-share-recreated";
+    let organization_id = "00000000-0000-4000-8000-000000000001";
+    let (_, public_key_b64, fingerprint) =
+        prepare_org_share_project(&project, &mock, auth_token, vault_id);
+    project.write_file(
+        "lpm.json",
+        &serde_json::json!({
+            "vault": vault_id,
+            "vaultSync": {
+                "orgVersions": {
+                    (ORG_ROTATION_SLUG): 5,
+                    "other": 9,
+                },
+                "orgBindings": {
+                    (ORG_ROTATION_SLUG): {
+                        "registryUrl": registry_url,
+                        "principalId": organization_id,
+                    },
+                    "other": {
+                        "registryUrl": "https://registry.example",
+                        "principalId": "00000000-0000-4000-8000-000000000009",
+                    },
+                },
+                "authorityCheckpoints": {
+                    "organizations": {
+                        (ORG_ROTATION_SLUG): {
+                            (registry_url.clone()): {
+                                (organization_id): {
+                                    "version": 5,
+                                    "syncedAt": "2026-09-04T00:00:00Z",
+                                },
+                            },
+                        },
+                        "other": {
+                            "https://registry.example": {
+                                "00000000-0000-4000-8000-000000000009": {
+                                    "version": 9,
+                                    "syncedAt": "2026-09-04T00:01:00Z",
+                                },
+                            },
+                        },
+                    },
+                },
+            },
+        })
+        .to_string(),
+    );
+    mount_org_member_keys(
+        &mock,
+        auth_token,
+        ORG_ROTATION_SLUG,
+        &public_key_b64,
+        &fingerprint,
+    )
+    .await;
+    Mock::given(method("GET"))
+        .and(path(format!(
+            "/api/orgs/{ORG_ROTATION_SLUG}/vaults/{vault_id}"
+        )))
+        .and(header("authorization", format!("Bearer {auth_token}")))
+        .respond_with(
+            ResponseTemplate::new(404)
+                .set_body_json(serde_json::json!({ "error": "Vault not found" })),
+        )
+        .expect(1)
+        .mount(mock.server())
+        .await;
+    Mock::given(method("POST"))
+        .and(path(format!(
+            "/api/orgs/{ORG_ROTATION_SLUG}/vaults/{vault_id}"
+        )))
+        .and(header("authorization", format!("Bearer {auth_token}")))
+        .respond_with(signed_sync_response(
+            serde_json::json!({
+                "status": "shared",
+                "version": 6,
+                "principalId": organization_id,
+            }),
+            auth_token,
+            vault_id,
+            TestSyncScope::Organization(ORG_ROTATION_SLUG.to_owned()),
+        ))
+        .expect(1)
+        .mount(mock.server())
+        .await;
+    let acceptance = org_rotation_recipient_acceptance(&mock, &fingerprint);
+
+    let output = lpm(&project)
+        .env("LPM_REGISTRY_URL", &registry_url)
+        .args([
+            "--json",
+            "env",
+            "share",
+            "--org",
+            ORG_ROTATION_SLUG,
+            "--force",
+            "--accept-recipient-keys",
+            &acceptance,
+        ])
+        .output()
+        .expect("run forced organization recreation");
+
+    assert!(
+        output.status.success(),
+        "organization recreation failed:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    assert_eq!(
+        lpm_vault::vault_id::read_org_sync_version_for_principal(
+            project.path(),
+            ORG_ROTATION_SLUG,
+            lpm_vault::vault_id::SyncPrincipal {
+                registry_url: &registry_url,
+                principal_id: organization_id,
+            },
+        ),
+        Some(6),
+    );
+    assert_eq!(
+        lpm_vault::vault_id::read_org_sync_version_for_principal(
+            project.path(),
+            "other",
+            lpm_vault::vault_id::SyncPrincipal {
+                registry_url: "https://registry.example",
+                principal_id: "00000000-0000-4000-8000-000000000009",
+            },
+        ),
+        Some(9),
+    );
+    let requests = mock.server().received_requests().await.unwrap();
+    let push = requests
+        .iter()
+        .find(|request| request.method.as_str() == "POST")
+        .expect("organization recreation request");
+    let body: serde_json::Value = serde_json::from_slice(&push.body).unwrap();
+    assert_eq!(body["ciphertextRevision"], 6);
+    assert_eq!(body["expectedVersion"], 5);
+    assert_eq!(body["recreateMissing"], true);
+    assert_eq!(body["expectedOrganizationId"], organization_id);
+}
+
+#[tokio::test]
+async fn env_share_force_refuses_an_existing_bound_organization_vault_without_uploading() {
+    let project = TempProject::empty(r#"{"name":"share-existing","version":"1.0.0"}"#);
+    let mock = MockRegistry::start().await;
+    let registry_url = mock.url();
+    let auth_token = "org-share-existing-token";
+    let vault_id = "vault-org-share-existing";
+    let organization_id = "00000000-0000-4000-8000-000000000001";
+    let (_, public_key_b64, fingerprint) =
+        prepare_org_share_project(&project, &mock, auth_token, vault_id);
+    project.write_file(
+        "lpm.json",
+        &serde_json::json!({
+            "vault": vault_id,
+            "vaultSync": {
+                "orgVersions": {
+                    (ORG_ROTATION_SLUG): 5,
+                },
+                "orgBindings": {
+                    (ORG_ROTATION_SLUG): {
+                        "registryUrl": registry_url,
+                        "principalId": organization_id,
+                    },
+                },
+                "authorityCheckpoints": {
+                    "organizations": {
+                        (ORG_ROTATION_SLUG): {
+                            (registry_url.clone()): {
+                                (organization_id): {
+                                    "version": 5,
+                                    "syncedAt": "2026-09-04T00:00:00Z",
+                                },
+                            },
+                        },
+                    },
+                },
+            },
+        })
+        .to_string(),
+    );
+    mount_org_member_keys(
+        &mock,
+        auth_token,
+        ORG_ROTATION_SLUG,
+        &public_key_b64,
+        &fingerprint,
+    )
+    .await;
+    Mock::given(method("GET"))
+        .and(path(format!(
+            "/api/orgs/{ORG_ROTATION_SLUG}/vaults/{vault_id}"
+        )))
+        .and(query_param("versionOnly", "true"))
+        .and(header("authorization", format!("Bearer {auth_token}")))
+        .respond_with(signed_sync_response(
+            serde_json::json!({ "version": 5 }),
+            auth_token,
+            vault_id,
+            TestSyncScope::Organization(ORG_ROTATION_SLUG.to_owned()),
+        ))
+        .expect(1)
+        .mount(mock.server())
+        .await;
+    Mock::given(method("POST"))
+        .and(path(format!(
+            "/api/orgs/{ORG_ROTATION_SLUG}/vaults/{vault_id}"
+        )))
+        .respond_with(ResponseTemplate::new(500))
+        .expect(0)
+        .mount(mock.server())
+        .await;
+
+    let output = lpm(&project)
+        .env("LPM_REGISTRY_URL", &registry_url)
+        .args([
+            "--json",
+            "env",
+            "share",
+            "--org",
+            ORG_ROTATION_SLUG,
+            "--force",
+        ])
+        .output()
+        .expect("run forced organization share against an existing remote");
+
+    assert!(!output.status.success());
+    let error = parse_clean_json_stdout(&output);
+    assert!(
+        error["error"]
+            .as_str()
+            .is_some_and(|message| message.contains("still exists at revision 5")),
+        "unexpected error: {error}",
+    );
+    assert_eq!(
+        lpm_vault::vault_id::read_org_sync_version_for_principal(
+            project.path(),
+            ORG_ROTATION_SLUG,
+            lpm_vault::vault_id::SyncPrincipal {
+                registry_url: &registry_url,
+                principal_id: organization_id,
+            },
+        ),
+        Some(5),
+    );
+    assert_eq!(
+        mock.server()
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .filter(|request| request.method.as_str() == "POST")
+            .count(),
+        0,
+    );
+}
+
+fn prepare_org_share_project(
+    project: &TempProject,
+    mock: &MockRegistry,
+    auth_token: &str,
+    vault_id: &str,
+) -> ([u8; 32], String, String) {
+    project.write_file("lpm.json", &format!(r#"{{"vault":"{vault_id}"}}"#));
+    write_file_backed_vault(
+        project.home(),
+        vault_id,
+        serde_json::json!({
+            "environments": {
+                "default": {"SHARE_ME": "value"}
+            }
+        }),
+    );
+    seed_sessions(
+        project.home(),
+        &[SessionSeed {
+            registry_url: &mock.url(),
+            access_token: Some(auth_token),
+            refresh_token: Some("org-share-refresh-token"),
+            session_access_expires_at: Some("2030-01-01T00:00:00Z"),
+        }],
+    );
+    let (private_key, _, public_key_b64, fingerprint) = seed_org_sharing_key(project);
+    (private_key, public_key_b64, fingerprint)
+}
+
+#[tokio::test]
+async fn env_share_uses_one_caller_bound_member_inventory_without_a_public_key_preflight() {
+    let project = TempProject::empty(r#"{"name":"org-share","version":"1.0.0"}"#);
+    let mock = MockRegistry::start().await;
+    let auth_token = "org-share-session-token";
+    let vault_id = "vault-org-share-123";
+    let (_, public_key_b64, fingerprint) =
+        prepare_org_share_project(&project, &mock, auth_token, vault_id);
+    mount_org_member_keys(
+        &mock,
+        auth_token,
+        ORG_ROTATION_SLUG,
+        &public_key_b64,
+        &fingerprint,
+    )
+    .await;
+    Mock::given(method("POST"))
+        .and(path(format!(
+            "/api/orgs/{ORG_ROTATION_SLUG}/vaults/{vault_id}"
+        )))
+        .and(header("authorization", format!("Bearer {auth_token}")))
+        .respond_with(signed_sync_response(
+            serde_json::json!({"status": "shared", "version": 1}),
+            auth_token,
+            vault_id,
+            TestSyncScope::Organization(ORG_ROTATION_SLUG.to_owned()),
+        ))
+        .expect(1)
+        .mount(mock.server())
+        .await;
+    let acceptance = org_rotation_recipient_acceptance(&mock, &fingerprint);
+
+    let manifest_read_log = project.path().join("org-share-manifest-reads.log");
+    let output = lpm(&project)
+        .env("LPM_REGISTRY_URL", mock.url())
+        .env("LPM_TEST_MANIFEST_READ_LOG", &manifest_read_log)
+        .args([
+            "--json",
+            "env",
+            "share",
+            "--org",
+            ORG_ROTATION_SLUG,
+            "--accept-recipient-keys",
+            &acceptance,
+        ])
+        .output()
+        .expect("run organization share");
+
+    assert!(
+        output.status.success(),
+        "organization share failed:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let requests = mock.server().received_requests().await.unwrap();
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|request| request.url.path().ends_with("/members/public-keys"))
+            .count(),
+        1,
+    );
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|request| request.url.path() == "/api/users/me/public-key")
+            .count(),
+        0,
+    );
+    assert_eq!(
+        std::fs::read_to_string(manifest_read_log)
+            .expect("read organization-share manifest access log")
+            .lines()
+            .count(),
+        3,
+        "organization share needs one command snapshot, one mutation-boundary check, and one guarded metadata commit",
+    );
+}
+
+#[tokio::test]
+async fn env_share_rejects_a_changed_manifest_principal_before_the_remote_write() {
+    let project = TempProject::empty(r#"{"name":"org-share-rebound","version":"1.0.0"}"#);
+    let mock = MockRegistry::start().await;
+    let registry_url = mock.url();
+    let auth_token = "org-share-rebound-token";
+    let vault_id = "vault-org-share-rebound";
+    let (_, public_key_b64, fingerprint) =
+        prepare_org_share_project(&project, &mock, auth_token, vault_id);
+    let replacement = serde_json::json!({
+        "vault": vault_id,
+        "vaultSync": {
+            "orgBindings": {
+                (ORG_ROTATION_SLUG): {
+                    "registryUrl": registry_url,
+                    "principalId": "another-organization",
+                },
+            },
+        },
+    })
+    .to_string();
+    let member_response = ResponseTemplate::new(200)
+        .insert_header(
+            "X-LPM-Organization-ID",
+            "00000000-0000-4000-8000-000000000001",
+        )
+        .insert_header(
+            "X-LPM-Caller-User-ID",
+            "11111111-1111-4111-8111-111111111111",
+        )
+        .set_body_json(serde_json::json!([{
+            "userId": "11111111-1111-4111-8111-111111111111",
+            "role": "owner",
+            "publicKey": public_key_b64,
+            "publicKeyVersion": 4,
+            "publicKeyFingerprint": fingerprint,
+            "hasPublicKey": true,
+        }]));
+    Mock::given(method("GET"))
+        .and(path(format!(
+            "/api/orgs/{ORG_ROTATION_SLUG}/members/public-keys"
+        )))
+        .and(header("authorization", format!("Bearer {auth_token}")))
+        .respond_with(ManifestReplacingResponse {
+            manifest_path: project.path().join("lpm.json"),
+            replacement,
+            response: member_response,
+        })
+        .expect(1)
+        .mount(mock.server())
+        .await;
+    Mock::given(method("POST"))
+        .and(path(format!(
+            "/api/orgs/{ORG_ROTATION_SLUG}/vaults/{vault_id}"
+        )))
+        .respond_with(ResponseTemplate::new(500))
+        .expect(0)
+        .mount(mock.server())
+        .await;
+
+    let output = lpm(&project)
+        .env("LPM_REGISTRY_URL", &registry_url)
+        .args(["--json", "env", "share", "--org", ORG_ROTATION_SLUG])
+        .output()
+        .expect("run organization share while its manifest binding changes");
+
+    assert!(!output.status.success());
+    let error = parse_clean_json_stdout(&output);
+    assert!(
+        error["error"]
+            .as_str()
+            .is_some_and(|message| message.contains("manifest principal changed")),
+        "unexpected error: {error}",
+    );
+    assert_eq!(
+        mock.server()
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .filter(|request| request.method.as_str() == "POST")
+            .count(),
+        0,
+    );
+}
+
+#[tokio::test]
+async fn env_share_refuses_a_changed_authenticated_caller_key_without_uploading() {
+    let project = TempProject::empty(r#"{"name":"org-share-mismatch","version":"1.0.0"}"#);
+    let mock = MockRegistry::start().await;
+    let auth_token = "org-share-mismatch-token";
+    let vault_id = "vault-org-share-mismatch-123";
+    prepare_org_share_project(&project, &mock, auth_token, vault_id);
+    let (_, changed_public_key) = lpm_vault::crypto::generate_x25519_keypair();
+    let changed_public_key_b64 = BASE64.encode(changed_public_key);
+    let changed_fingerprint = hex::encode(Sha256::digest(changed_public_key));
+    mount_org_member_keys(
+        &mock,
+        auth_token,
+        ORG_ROTATION_SLUG,
+        &changed_public_key_b64,
+        &changed_fingerprint,
+    )
+    .await;
+
+    let output = lpm(&project)
+        .env("LPM_REGISTRY_URL", mock.url())
+        .args(["--json", "env", "share", "--org", ORG_ROTATION_SLUG])
+        .output()
+        .expect("run organization share with changed caller key");
+
+    assert!(!output.status.success());
+    let error = parse_clean_json_stdout(&output);
+    assert!(
+        error["error"]
+            .as_str()
+            .is_some_and(|message| message.contains("does NOT match the key on the server"))
+    );
+    let requests = mock.server().received_requests().await.unwrap();
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|request| request.url.path().ends_with("/members/public-keys"))
+            .count(),
+        1,
+    );
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|request| request.url.path() == "/api/users/me/public-key")
+            .count(),
+        0,
+    );
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|request| request.method.as_str() == "POST")
+            .count(),
+        0,
+    );
+}
+
+#[tokio::test]
+async fn env_share_keeps_prepared_member_access_on_one_captured_session() {
+    let project = TempProject::empty(r#"{"name":"org-share-switch","version":"1.0.0"}"#);
+    let mock = MockRegistry::start().await;
+    let registry_url = mock.url();
+    let initial_token = "org-share-caller-a-token";
+    let replacement_token = "org-share-caller-b-token";
+    let vault_id = "vault-org-share-switch-123";
+    let (_, public_key_b64, fingerprint) =
+        prepare_org_share_project(&project, &mock, initial_token, vault_id);
+    Mock::given(method("GET"))
+        .and(path(format!(
+            "/api/orgs/{ORG_ROTATION_SLUG}/members/public-keys"
+        )))
+        .and(header("authorization", format!("Bearer {initial_token}")))
+        .respond_with(CredentialsReplacingResponse {
+            home: project.home().to_path_buf(),
+            registry_url: registry_url.clone(),
+            replacement_token: replacement_token.to_owned(),
+            response: ResponseTemplate::new(200)
+                .insert_header(
+                    "X-LPM-Organization-ID",
+                    "00000000-0000-4000-8000-000000000001",
+                )
+                .insert_header(
+                    "X-LPM-Caller-User-ID",
+                    "11111111-1111-4111-8111-111111111111",
+                )
+                .set_body_json(serde_json::json!([{
+                    "userId": "11111111-1111-4111-8111-111111111111",
+                    "role": "owner",
+                    "publicKey": public_key_b64,
+                    "publicKeyVersion": 4,
+                    "publicKeyFingerprint": fingerprint,
+                    "hasPublicKey": true,
+                }])),
+        })
+        .expect(1)
+        .mount(mock.server())
+        .await;
+    Mock::given(method("POST"))
+        .and(path(format!(
+            "/api/orgs/{ORG_ROTATION_SLUG}/vaults/{vault_id}"
+        )))
+        .and(header("authorization", format!("Bearer {initial_token}")))
+        .respond_with(signed_sync_response(
+            serde_json::json!({"status": "shared", "version": 1}),
+            initial_token,
+            vault_id,
+            TestSyncScope::Organization(ORG_ROTATION_SLUG.to_owned()),
+        ))
+        .expect(1)
+        .mount(mock.server())
+        .await;
+    let acceptance = org_rotation_recipient_acceptance(&mock, &fingerprint);
+
+    let output = lpm(&project)
+        .env("LPM_REGISTRY_URL", &registry_url)
+        .args([
+            "--json",
+            "env",
+            "share",
+            "--org",
+            ORG_ROTATION_SLUG,
+            "--accept-recipient-keys",
+            &acceptance,
+        ])
+        .output()
+        .expect("run organization share while the stored caller changes");
+
+    assert!(
+        output.status.success(),
+        "organization share changed its captured session:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let requests = mock.server().received_requests().await.unwrap();
+    let push = requests
+        .iter()
+        .find(|request| request.method.as_str() == "POST")
+        .expect("organization share must reach the authoritative caller check");
+    let body: serde_json::Value =
+        serde_json::from_slice(&push.body).expect("parse organization share request");
+    assert_eq!(
+        body["expectedCallerUserId"],
+        "11111111-1111-4111-8111-111111111111"
+    );
+}
+
+#[tokio::test]
+async fn env_share_propagates_member_inventory_errors_without_fallback_requests() {
+    let project = TempProject::empty(r#"{"name":"org-share-server-error","version":"1.0.0"}"#);
+    let mock = MockRegistry::start().await;
+    let auth_token = "org-share-server-error-token";
+    let vault_id = "vault-org-share-server-error-123";
+    prepare_org_share_project(&project, &mock, auth_token, vault_id);
+    Mock::given(method("GET"))
+        .and(path(format!(
+            "/api/orgs/{ORG_ROTATION_SLUG}/members/public-keys"
+        )))
+        .and(header("authorization", format!("Bearer {auth_token}")))
+        .respond_with(ResponseTemplate::new(503).set_body_string("temporarily unavailable"))
+        .expect(1)
+        .mount(mock.server())
+        .await;
+
+    let output = lpm(&project)
+        .env("LPM_REGISTRY_URL", mock.url())
+        .args(["--json", "env", "share", "--org", ORG_ROTATION_SLUG])
+        .output()
+        .expect("run organization share during member inventory outage");
+
+    assert!(!output.status.success());
+    let error = parse_clean_json_stdout(&output);
+    assert!(
+        error["error"]
+            .as_str()
+            .is_some_and(|message| message.contains("503"))
+    );
+    let requests = mock.server().received_requests().await.unwrap();
+    assert_eq!(requests.len(), 1);
+    assert!(requests[0].url.path().ends_with("/members/public-keys"));
+}
+
+#[tokio::test]
+async fn env_pull_rejects_an_org_slug_rebound_after_the_rewrap_response() {
+    let project = TempProject::empty(r#"{"name":"org-pull-rebind","version":"1.0.0"}"#);
+    let mock = MockRegistry::start().await;
+    let auth_token = "org-pull-rebind-token";
+    let vault_id = "vault-org-pull-rebind-123";
+    let (_, public_key_b64, fingerprint) =
+        prepare_org_share_project(&project, &mock, auth_token, vault_id);
+    Mock::given(method("GET"))
+        .and(path(format!(
+            "/api/orgs/{ORG_ROTATION_SLUG}/vaults/{vault_id}"
+        )))
+        .and(header("authorization", format!("Bearer {auth_token}")))
+        .respond_with(ResponseTemplate::new(403).set_body_json(serde_json::json!({
+            "error": "Member needs rewrap",
+            "code": "vault_member_needs_rewrap",
+            "organizationId": "00000000-0000-4000-8000-000000000001",
+            "callerUserId": "11111111-1111-4111-8111-111111111111",
+        })))
+        .expect(1)
+        .mount(mock.server())
+        .await;
+    Mock::given(method("GET"))
+        .and(path(format!(
+            "/api/orgs/{ORG_ROTATION_SLUG}/members/public-keys"
+        )))
+        .and(header("authorization", format!("Bearer {auth_token}")))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header(
+                    "X-LPM-Organization-ID",
+                    "00000000-0000-4000-8000-000000000002",
+                )
+                .insert_header(
+                    "X-LPM-Caller-User-ID",
+                    "11111111-1111-4111-8111-111111111111",
+                )
+                .set_body_json(serde_json::json!([{
+                    "userId": "11111111-1111-4111-8111-111111111111",
+                    "role": "owner",
+                    "publicKey": public_key_b64,
+                    "publicKeyVersion": 4,
+                    "publicKeyFingerprint": fingerprint,
+                    "hasPublicKey": true,
+                }])),
+        )
+        .expect(1)
+        .mount(mock.server())
+        .await;
+
+    let output = lpm(&project)
+        .env("LPM_REGISTRY_URL", mock.url())
+        .args(["--json", "env", "pull", "--org", ORG_ROTATION_SLUG])
+        .output()
+        .expect("run organization pull across a slug rebound");
+
+    assert!(!output.status.success());
+    let error = parse_clean_json_stdout(&output);
+    assert!(
+        error["error"]
+            .as_str()
+            .is_some_and(|message| message.contains("organization identity changed"))
+    );
+    let requests = mock.server().received_requests().await.unwrap();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|request| request.url.path() == "/api/users/me/public-key")
+            .count(),
+        0,
+    );
+    assert!(
+        requests
+            .iter()
+            .all(|request| request.method.as_str() == "GET")
+    );
 }
 
 #[tokio::test]

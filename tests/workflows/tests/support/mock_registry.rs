@@ -12,7 +12,10 @@ use std::io::Write;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use wiremock::matchers::{body_string_contains, header, method, path, path_regex, query_param};
+use wiremock::matchers::{
+    body_json, body_string_contains, header, method, path, path_regex, query_param,
+    query_param_is_missing,
+};
 use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
 
 pub const TEST_OIDC_POLICY_ID: &str = "11111111-1111-4111-8111-111111111111";
@@ -53,17 +56,23 @@ impl Respond for SignedSyncResponse {
         object.insert("envelopeVersion".into(), 2.into());
         object.insert("serverVersion".into(), version.into());
         object.insert("requestNonce".into(), request_nonce.into());
-        object.insert(
-            "cryptoVersion".into(),
-            lpm_vault::crypto::CURRENT_CRYPTO_VERSION.into(),
-        );
+        object
+            .entry("cryptoVersion")
+            .or_insert_with(|| lpm_vault::crypto::CURRENT_CRYPTO_VERSION.into());
         match &self.scope {
             TestSyncScope::Personal => {
                 object.insert("scope".into(), "personal".into());
+                object
+                    .entry("principalId")
+                    .or_insert_with(|| "account-1".into());
             }
             TestSyncScope::Organization(slug) => {
                 object.insert("scope".into(), "organization".into());
+                object.insert("callerUserId".into(), "organization-test-caller".into());
                 object.insert("organizationSlug".into(), slug.clone().into());
+                object
+                    .entry("principalId")
+                    .or_insert_with(|| "00000000-0000-4000-8000-000000000001".into());
             }
         }
         if let (Some(encrypted_blob), Some(wrapped_key)) = (
@@ -124,6 +133,22 @@ pub struct MockRegistry {
 
 struct JsonResponseSequence {
     bodies: Arc<Mutex<VecDeque<serde_json::Value>>>,
+}
+
+struct PersonalPullRevision {
+    version: i32,
+    crypto_version: i32,
+}
+
+pub struct PersonalPullFailureFixture<'a> {
+    pub vault_id: &'a str,
+    pub bearer_token: &'a str,
+    pub payload: serde_json::Value,
+    pub wrapping_key: &'a [u8; 32],
+    pub data_key: &'a [u8; 32],
+    pub version: i32,
+    pub status: u16,
+    pub error: &'a str,
 }
 
 struct JsonResponseAndCreateDirectory {
@@ -1286,26 +1311,24 @@ impl MockRegistry {
         policy_id: &str,
         lpm_token: &str,
     ) -> &Self {
-        let mut mock = Mock::given(method("POST"))
-            .and(path("/api/vault/oidc"))
-            .and(body_string_contains(format!(
-                "\"oidcToken\":\"{oidc_token}\""
-            )))
-            .and(body_string_contains(format!("\"vaultId\":\"{vault_id}\"")))
-            .and(body_string_contains(format!(
-                "\"policyId\":\"{policy_id}\""
-            )));
-
+        let mut expected_body = serde_json::json!({
+            "oidcToken": oidc_token,
+            "vaultId": vault_id,
+            "policyId": policy_id,
+        });
         if let Some(env_name) = env_name {
-            mock = mock.and(body_string_contains(format!("\"env\":\"{env_name}\"")));
+            expected_body["env"] = serde_json::Value::String(env_name.to_owned());
         }
 
-        mock.respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-            "token": lpm_token,
-        })))
-        .expect(1)
-        .mount(&self.server)
-        .await;
+        Mock::given(method("POST"))
+            .and(path("/api/vault/oidc"))
+            .and(body_json(expected_body))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "token": lpm_token,
+            })))
+            .expect(1)
+            .mount(&self.server)
+            .await;
         self
     }
 
@@ -1319,19 +1342,13 @@ impl MockRegistry {
         error: &str,
         hint: Option<&str>,
     ) -> &Self {
-        let mut mock = Mock::given(method("POST"))
-            .and(path("/api/vault/oidc"))
-            .and(body_string_contains(format!(
-                "\"oidcToken\":\"{oidc_token}\""
-            )))
-            .and(body_string_contains(format!("\"vaultId\":\"{vault_id}\"")))
-            .and(body_string_contains(format!(
-                "\"policyId\":\"{}\"",
-                TEST_OIDC_POLICY_ID
-            )));
-
+        let mut expected_body = serde_json::json!({
+            "oidcToken": oidc_token,
+            "vaultId": vault_id,
+            "policyId": TEST_OIDC_POLICY_ID,
+        });
         if let Some(env_name) = env_name {
-            mock = mock.and(body_string_contains(format!("\"env\":\"{env_name}\"")));
+            expected_body["env"] = serde_json::Value::String(env_name.to_owned());
         }
 
         let mut body = serde_json::json!({
@@ -1341,7 +1358,10 @@ impl MockRegistry {
             body["hint"] = serde_json::Value::String(hint.to_string());
         }
 
-        mock.respond_with(ResponseTemplate::new(status_code).set_body_json(body))
+        Mock::given(method("POST"))
+            .and(path("/api/vault/oidc"))
+            .and(body_json(expected_body))
+            .respond_with(ResponseTemplate::new(status_code).set_body_json(body))
             .expect(1)
             .mount(&self.server)
             .await;
@@ -1413,42 +1433,6 @@ impl MockRegistry {
         self
     }
 
-    /// Mount a successful personal sync pull endpoint.
-    ///
-    /// The payload uses protocol-v2 associated-data encryption with the legacy
-    /// token-derived wrapping key. This lets workflow tests exercise the
-    /// migration path without sharing a local wrapping-key file between the
-    /// test process and the CLI subprocess.
-    pub async fn with_personal_pull(
-        &self,
-        vault_id: &str,
-        bearer_token: &str,
-        payload: serde_json::Value,
-        version: i32,
-    ) -> &Self {
-        let plaintext = serde_json::to_string(&payload).expect("failed to serialize vault payload");
-        let aes_key = lpm_vault::crypto::generate_aes_key();
-        let wrapping_key = lpm_vault::crypto::derive_legacy_wrapping_key(bearer_token);
-        let encrypted_blob = lpm_vault::crypto::encrypt_vault_payload(
-            &aes_key,
-            plaintext.as_bytes(),
-            lpm_vault::crypto::VaultScope::Personal,
-            vault_id,
-        )
-        .expect("failed to encrypt vault payload");
-        let wrapped_key = lpm_vault::crypto::wrap_key(&wrapping_key, &aes_key)
-            .expect("failed to wrap vault payload key");
-        self.mount_personal_pull(
-            vault_id,
-            bearer_token,
-            encrypted_blob,
-            wrapped_key,
-            version,
-            None,
-        )
-        .await
-    }
-
     pub async fn with_personal_pull_keys(
         &self,
         vault_id: &str,
@@ -1463,7 +1447,9 @@ impl MockRegistry {
             data_key,
             plaintext.as_bytes(),
             lpm_vault::crypto::VaultScope::Personal,
+            "account-1",
             vault_id,
+            version,
         )
         .expect("failed to encrypt vault payload");
         let wrapped_key = lpm_vault::crypto::wrap_key(wrapping_key, data_key)
@@ -1473,7 +1459,10 @@ impl MockRegistry {
             bearer_token,
             encrypted_blob,
             wrapped_key,
-            version,
+            PersonalPullRevision {
+                version,
+                crypto_version: lpm_vault::crypto::CURRENT_CRYPTO_VERSION,
+            },
             None,
         )
         .await
@@ -1481,31 +1470,39 @@ impl MockRegistry {
 
     pub async fn with_personal_pull_failure(
         &self,
-        vault_id: &str,
-        bearer_token: &str,
-        payload: serde_json::Value,
-        version: i32,
-        status: u16,
-        error: &str,
+        fixture: PersonalPullFailureFixture<'_>,
     ) -> &Self {
+        let PersonalPullFailureFixture {
+            vault_id,
+            bearer_token,
+            payload,
+            wrapping_key,
+            data_key,
+            version,
+            status,
+            error,
+        } = fixture;
         let plaintext = serde_json::to_string(&payload).expect("failed to serialize vault payload");
-        let data_key = lpm_vault::crypto::generate_aes_key();
-        let wrapping_key = lpm_vault::crypto::derive_legacy_wrapping_key(bearer_token);
         let encrypted_blob = lpm_vault::crypto::encrypt_vault_payload(
-            &data_key,
+            data_key,
             plaintext.as_bytes(),
             lpm_vault::crypto::VaultScope::Personal,
+            "account-1",
             vault_id,
+            version,
         )
         .expect("failed to encrypt vault payload");
-        let wrapped_key = lpm_vault::crypto::wrap_key(&wrapping_key, &data_key)
+        let wrapped_key = lpm_vault::crypto::wrap_key(wrapping_key, data_key)
             .expect("failed to wrap vault payload key");
         self.mount_personal_pull(
             vault_id,
             bearer_token,
             encrypted_blob,
             wrapped_key,
-            version,
+            PersonalPullRevision {
+                version,
+                crypto_version: lpm_vault::crypto::CURRENT_CRYPTO_VERSION,
+            },
             Some((status, error.to_string())),
         )
         .await
@@ -1517,9 +1514,13 @@ impl MockRegistry {
         bearer_token: &str,
         encrypted_blob: String,
         wrapped_key: String,
-        version: i32,
+        revision: PersonalPullRevision,
         push_failure: Option<(u16, String)>,
     ) -> &Self {
+        let PersonalPullRevision {
+            version,
+            crypto_version,
+        } = revision;
         // Successful sync endpoints echo the request nonce in a signed v2
         // envelope. Both GET and POST mocks use the shared responder so the
         // workflow harness mirrors the real origin's trust boundary.
@@ -1528,6 +1529,7 @@ impl MockRegistry {
             "encryptedBlob": encrypted_blob,
             "wrappedKey": wrapped_key,
             "version": version,
+            "cryptoVersion": crypto_version,
             }),
             bearer_token,
             vault_id,
@@ -1537,8 +1539,22 @@ impl MockRegistry {
         Mock::given(method("GET"))
             .and(path(format!("/api/vaults/{vault_id}/sync")))
             .and(header("authorization", format!("Bearer {bearer_token}")))
+            .and(query_param_is_missing("versionOnly"))
             .respond_with(pull_response)
             .expect(1)
+            .mount(&self.server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path(format!("/api/vaults/{vault_id}/sync")))
+            .and(header("authorization", format!("Bearer {bearer_token}")))
+            .and(query_param("versionOnly", "true"))
+            .respond_with(signed_sync_response(
+                serde_json::json!({ "version": version }),
+                bearer_token,
+                vault_id,
+                TestSyncScope::Personal,
+            ))
             .mount(&self.server)
             .await;
 
@@ -1604,10 +1620,26 @@ impl MockRegistry {
     /// HOMEs need the same wrapping key. Set `LPM_FORCE_FILE_VAULT=1`
     /// on each `lpm` invocation and pre-write the same hex-encoded
     /// 32-byte key to `<HOME>/.lpm/.vault-key` on both machines.
-    pub async fn with_stateful_personal_sync(&self, vault_id: &str, bearer_token: &str) -> &Self {
+    pub async fn with_stateful_personal_sync(
+        &self,
+        vault_id: &str,
+        bearer_token: &str,
+        principal_id: &str,
+    ) -> &Self {
         let state: Arc<Mutex<Option<StoredSyncBlob>>> = Arc::new(Mutex::new(None));
         let vault_id_owned = vault_id.to_string();
         let bearer_owned = bearer_token.to_string();
+        let principal_owned = principal_id.to_string();
+
+        Mock::given(method("GET"))
+            .and(path("/api/user/me"))
+            .and(header("authorization", format!("Bearer {bearer_token}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": principal_id,
+            })))
+            .expect(1)
+            .mount(&self.server)
+            .await;
 
         // GET responder — looks up state, returns blob if present.
         let get_state = Arc::clone(&state);
@@ -1620,6 +1652,7 @@ impl MockRegistry {
                 state: get_state,
                 vault_id: get_vault,
                 bearer_token: get_bearer,
+                principal_id: principal_owned.clone(),
             })
             .mount(&self.server)
             .await;
@@ -1632,6 +1665,7 @@ impl MockRegistry {
                 state: Arc::clone(&state),
                 bearer_token: bearer_owned,
                 vault_id: vault_id_owned,
+                principal_id: principal_owned,
             })
             .mount(&self.server)
             .await;
@@ -3379,6 +3413,7 @@ struct StatefulSyncGetResponder {
     state: Arc<Mutex<Option<StoredSyncBlob>>>,
     vault_id: String,
     bearer_token: String,
+    principal_id: String,
 }
 
 impl Respond for StatefulSyncGetResponder {
@@ -3388,6 +3423,27 @@ impl Respond for StatefulSyncGetResponder {
             .lock()
             .expect("StatefulSyncGetResponder mutex poisoned")
             .clone();
+        if request
+            .url
+            .query_pairs()
+            .any(|(key, value)| key == "versionOnly" && value == "true")
+        {
+            let Some(blob) = stored.as_ref() else {
+                return ResponseTemplate::new(404)
+                    .insert_header("Content-Type", "application/json")
+                    .set_body_string(r#"{"error":"Vault not found"}"#);
+            };
+            return signed_sync_response(
+                serde_json::json!({
+                    "version": blob.version,
+                    "principalId": self.principal_id,
+                }),
+                &self.bearer_token,
+                &self.vault_id,
+                TestSyncScope::Personal,
+            )
+            .respond(request);
+        }
         let Some(blob) = stored else {
             // No prior POST — represent as 404 so the CLI surfaces a
             // "vault has no payload yet" error rather than silently
@@ -3401,6 +3457,7 @@ impl Respond for StatefulSyncGetResponder {
                 "encryptedBlob": blob.encrypted_blob,
                 "wrappedKey": blob.wrapped_key,
                 "version": blob.version,
+                "principalId": self.principal_id,
             }),
             &self.bearer_token,
             &self.vault_id,
@@ -3414,6 +3471,7 @@ struct StatefulSyncPostResponder {
     state: Arc<Mutex<Option<StoredSyncBlob>>>,
     bearer_token: String,
     vault_id: String,
+    principal_id: String,
 }
 
 impl Respond for StatefulSyncPostResponder {
@@ -3438,6 +3496,18 @@ impl Respond for StatefulSyncPostResponder {
             .and_then(serde_json::Value::as_i64)
             .and_then(|version| i32::try_from(version).ok())
             .unwrap_or(1);
+        let ciphertext_revision = body_value
+            .get("ciphertextRevision")
+            .and_then(serde_json::Value::as_i64)
+            .and_then(|revision| i32::try_from(revision).ok());
+        if body_value
+            .get("expectedPrincipalId")
+            .and_then(serde_json::Value::as_str)
+            != Some(self.principal_id.as_str())
+        {
+            return ResponseTemplate::new(409)
+                .set_body_string(r#"{"error":"stateful sync POST: principal mismatch"}"#);
+        }
         let (Some(encrypted_blob), Some(wrapped_key)) = (encrypted_blob, wrapped_key) else {
             return ResponseTemplate::new(400).set_body_string(
                 r#"{"error":"stateful sync POST: missing encryptedBlob or wrappedKey"}"#,
@@ -3456,6 +3526,12 @@ impl Respond for StatefulSyncPostResponder {
             .lock()
             .expect("StatefulSyncPostResponder mutex poisoned");
         let new_version = guard.as_ref().map_or(1, |b| b.version + 1);
+        if crypto_version == lpm_vault::crypto::CURRENT_CRYPTO_VERSION
+            && ciphertext_revision != Some(new_version)
+        {
+            return ResponseTemplate::new(409)
+                .set_body_string(r#"{"error":"stateful sync POST: ciphertextRevision mismatch"}"#);
+        }
         *guard = Some(StoredSyncBlob {
             encrypted_blob,
             wrapped_key,
@@ -3468,6 +3544,7 @@ impl Respond for StatefulSyncPostResponder {
             serde_json::json!({
                 "status": "updated",
                 "version": new_version,
+                "principalId": self.principal_id,
             }),
             &self.bearer_token,
             &self.vault_id,

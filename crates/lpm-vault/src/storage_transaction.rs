@@ -189,6 +189,7 @@ impl VaultStorageDirectory {
         label: &str,
     ) -> Result<(), String> {
         validate_name(OsStr::new(name))?;
+        validate_contents_size(contents, label)?;
         lpm_common::write_file_atomic_in_dir_with(
             &self.directory,
             OsStr::new(name),
@@ -205,6 +206,34 @@ impl VaultStorageDirectory {
         .map_err(|error| format!("failed to write {label}: {error}"))
     }
 
+    pub(crate) fn write_owner_only_file_durable(
+        &self,
+        name: &str,
+        contents: &[u8],
+        label: &str,
+    ) -> Result<(), String> {
+        self.write_owner_only_file(name, contents, label)?;
+        self.sync_directory(label)
+    }
+
+    fn sync_directory(&self, label: &str) -> Result<(), String> {
+        #[cfg(unix)]
+        {
+            let mut options = OpenOptions::new();
+            options.read(true).follow(FollowSymlinks::No);
+            let directory = self
+                .directory
+                .open_with(".", &options)
+                .map_err(|error| format!("failed to open protected vault directory: {error}"))?;
+            directory
+                .sync_all()
+                .map_err(|error| format!("failed to persist {label}: {error}"))?;
+        }
+        #[cfg(not(unix))]
+        let _ = label;
+        Ok(())
+    }
+
     pub(crate) fn create_owner_only_file(
         &self,
         name: &str,
@@ -212,6 +241,7 @@ impl VaultStorageDirectory {
         label: &str,
     ) -> Result<bool, String> {
         validate_name(OsStr::new(name))?;
+        validate_contents_size(contents, label)?;
         let mut options = OpenOptions::new();
         options
             .read(true)
@@ -252,6 +282,14 @@ impl VaultStorageDirectory {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
             Err(error) => Err(format!("failed to remove {label}: {error}")),
         }
+    }
+
+    pub(crate) fn remove_file_durable(&self, name: &str, label: &str) -> Result<bool, String> {
+        let removed = self.remove_file(name, label)?;
+        if removed {
+            self.sync_directory(label)?;
+        }
+        Ok(removed)
     }
 
     pub(crate) fn display_path(&self, name: &str) -> PathBuf {
@@ -357,6 +395,14 @@ fn validate_name(name: &OsStr) -> Result<(), String> {
         "vault storage name must be one file or directory component: {}",
         path.display()
     ))
+}
+
+fn validate_contents_size(contents: &[u8], label: &str) -> Result<(), String> {
+    let limit = lpm_common::STATE_FILE_SIZE_CAP_BYTES as usize;
+    if contents.len() > limit {
+        return Err(format!("{label} exceeds the {limit}-byte limit"));
+    }
+    Ok(())
 }
 
 #[cfg(not(windows))]

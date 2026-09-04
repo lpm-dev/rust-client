@@ -1,6 +1,7 @@
 use super::SyncError;
-use super::http::{read_capped_error_text, sync_http_client_builder, url_path_segment};
+use super::http::{read_capped_error_text, read_capped_json, sync_http_client, url_path_segment};
 use super::step_up::CLI_STEP_UP_HEADER_NAME;
+use sha2::Digest as _;
 
 /// Server response from `POST /api/users/me/public-key`.
 ///
@@ -48,14 +49,74 @@ pub struct UploadPublicKeyResponse {
 pub async fn upload_public_key(
     registry_url: &str,
     auth_token: &str,
+    expected_principal_id: &str,
     public_key_b64: &str,
     step_up_proof: Option<&str>,
 ) -> Result<UploadPublicKeyResponse, SyncError> {
-    let client = sync_http_client_builder()
-        .build()
-        .map_err(|e| format!("failed to build http client: {e}"))?;
+    let client = sync_http_client()?;
+    let response = upload_public_key_with_client(
+        client,
+        registry_url,
+        auth_token,
+        expected_principal_id,
+        public_key_b64,
+        step_up_proof,
+    )
+    .await?;
+    let authoritative =
+        get_my_public_key_state_with_client(client, registry_url, auth_token).await?;
+    if authoritative.principal_id != expected_principal_id
+        || authoritative.public_key_b64.as_deref() != Some(public_key_b64)
+    {
+        return Err("server did not confirm the uploaded sharing key".into());
+    }
+    Ok(response)
+}
+
+pub async fn upload_public_key_for_org(
+    registry_url: &str,
+    auth_token: &str,
+    org_slug: &str,
+    expected_principal_id: &str,
+    public_key_b64: &str,
+    step_up_proof: &str,
+) -> Result<OrgMemberKeyAccess, SyncError> {
+    let client = sync_http_client()?;
+    upload_public_key_with_client(
+        client,
+        registry_url,
+        auth_token,
+        expected_principal_id,
+        public_key_b64,
+        Some(step_up_proof),
+    )
+    .await?;
+    let access =
+        get_org_member_key_access_with_client(client, registry_url, auth_token, org_slug).await?;
+    if access.caller_user_id != expected_principal_id {
+        return Err("organization member inventory changed the authenticated caller".into());
+    }
+    if authenticated_caller_public_key(&access)?.as_deref() != Some(public_key_b64) {
+        return Err(
+            "organization member inventory did not confirm the uploaded sharing key".into(),
+        );
+    }
+    Ok(access)
+}
+
+async fn upload_public_key_with_client(
+    client: &reqwest::Client,
+    registry_url: &str,
+    auth_token: &str,
+    expected_principal_id: &str,
+    public_key_b64: &str,
+    step_up_proof: Option<&str>,
+) -> Result<UploadPublicKeyResponse, SyncError> {
     let url = format!("{registry_url}/api/users/me/public-key");
-    let body = serde_json::json!({"publicKey": public_key_b64});
+    let body = serde_json::json!({
+        "publicKey": public_key_b64,
+        "expectedPrincipalId": expected_principal_id,
+    });
 
     let mut request = client
         .post(&url)
@@ -76,14 +137,7 @@ pub async fn upload_public_key(
             format!("failed to upload public key: {body}"),
         ));
     }
-
-    // `response.json()` would happily Err if the body isn't JSON. Old
-    // servers reliably return JSON; the explicit error keeps the
-    // message tight for any future server that 2xxes with HTML.
-    Ok(response
-        .json::<UploadPublicKeyResponse>()
-        .await
-        .map_err(|e| format!("parse error: {e}"))?)
+    Ok(read_capped_json::<UploadPublicKeyResponse>(response).await?)
 }
 
 /// Check if the user's public key is already on the server.
@@ -108,9 +162,33 @@ pub async fn get_my_public_key(
     registry_url: &str,
     auth_token: &str,
 ) -> Result<Option<String>, SyncError> {
-    let client = sync_http_client_builder()
-        .build()
-        .map_err(|e| format!("failed to build http client: {e}"))?;
+    let client = sync_http_client()?;
+    Ok(
+        get_my_public_key_state_with_client(client, registry_url, auth_token)
+            .await?
+            .public_key_b64,
+    )
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MyPublicKeyState {
+    pub principal_id: String,
+    pub public_key_b64: Option<String>,
+}
+
+pub async fn get_my_public_key_state(
+    registry_url: &str,
+    auth_token: &str,
+) -> Result<MyPublicKeyState, SyncError> {
+    let client = sync_http_client()?;
+    get_my_public_key_state_with_client(client, registry_url, auth_token).await
+}
+
+async fn get_my_public_key_state_with_client(
+    client: &reqwest::Client,
+    registry_url: &str,
+    auth_token: &str,
+) -> Result<MyPublicKeyState, SyncError> {
     let url = format!("{registry_url}/api/users/me/public-key");
 
     let response = client
@@ -130,15 +208,24 @@ pub async fn get_my_public_key(
         ));
     }
 
-    let data: serde_json::Value = response
-        .json()
-        .await
-        .map_err(|e| format!("parse error: {e}"))?;
+    let data: serde_json::Value = read_capped_json(response).await?;
 
-    Ok(data
-        .get("publicKey")
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string()))
+    let principal_id = data
+        .get("principalId")
+        .and_then(|value| value.as_str())
+        .filter(|value| {
+            !value.is_empty() && value.len() <= 256 && !value.chars().any(char::is_control)
+        })
+        .ok_or("public-key response omitted the authenticated principal ID")?;
+    let public_key_b64 = match data.get("publicKey") {
+        None | Some(serde_json::Value::Null) => None,
+        Some(serde_json::Value::String(value)) => Some(value.clone()),
+        Some(_) => return Err("public-key response returned an invalid public key".into()),
+    };
+    Ok(MyPublicKeyState {
+        principal_id: principal_id.to_owned(),
+        public_key_b64,
+    })
 }
 
 /// Locally-resolved sharing keypair material. The private half stays
@@ -152,6 +239,84 @@ pub struct LocalPublicKeyState {
     pub private_key: [u8; 32],
     /// Standard Base64 encoding of the matching X25519 public key.
     pub public_key_b64: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SharingKeyScope {
+    registry_url: String,
+    principal_id: String,
+    storage_digest: String,
+}
+
+impl SharingKeyScope {
+    pub fn new(registry_url: &str, principal_id: &str) -> Result<Self, String> {
+        if principal_id.is_empty()
+            || principal_id.len() > 256
+            || principal_id.chars().any(char::is_control)
+        {
+            return Err("invalid authenticated caller identity".to_owned());
+        }
+        let registry_url = canonical_registry_url(registry_url)?;
+        let mut digest = sha2::Sha256::new();
+        for component in [registry_url.as_bytes(), principal_id.as_bytes()] {
+            digest.update((component.len() as u64).to_be_bytes());
+            digest.update(component);
+        }
+        Ok(Self {
+            registry_url,
+            principal_id: principal_id.to_owned(),
+            storage_digest: hex::encode(digest.finalize()),
+        })
+    }
+
+    pub fn principal_id(&self) -> &str {
+        &self.principal_id
+    }
+
+    pub fn registry_url(&self) -> &str {
+        &self.registry_url
+    }
+
+    fn live_file_name(&self) -> String {
+        format!(".x25519-key-v2-{}", self.storage_digest)
+    }
+
+    fn pending_file_name(&self) -> String {
+        format!(".x25519-key-v2-{}.pending", self.storage_digest)
+    }
+
+    fn rotation_lock_file_name(&self) -> String {
+        format!(".x25519-key-v2-{}.rotation.lock", self.storage_digest)
+    }
+
+    fn live_keychain_account(&self) -> String {
+        format!("__x25519_private_key__.v2.{}", self.storage_digest)
+    }
+
+    fn pending_keychain_account(&self) -> String {
+        format!("__x25519_private_key__.v2.{}.pending", self.storage_digest)
+    }
+}
+
+pub(super) fn canonical_registry_url(registry_url: &str) -> Result<String, String> {
+    let mut parsed = reqwest::Url::parse(registry_url)
+        .map_err(|error| format!("invalid registry URL for sharing key: {error}"))?;
+    if !matches!(parsed.scheme(), "http" | "https")
+        || parsed.host_str().is_none()
+        || !parsed.username().is_empty()
+        || parsed.password().is_some()
+        || parsed.query().is_some()
+        || parsed.fragment().is_some()
+    {
+        return Err("invalid registry URL for sharing key".to_owned());
+    }
+    let normalized_path = parsed.path().trim_end_matches('/').to_owned();
+    parsed.set_path(if normalized_path.is_empty() {
+        "/"
+    } else {
+        &normalized_path
+    });
+    Ok(parsed.as_str().trim_end_matches('/').to_owned())
 }
 
 impl std::fmt::Debug for LocalPublicKeyState {
@@ -212,10 +377,11 @@ pub async fn classify_public_key_state(
     registry_url: &str,
     auth_token: &str,
 ) -> Result<PublicKeyRegistrationState, SyncError> {
-    let local = load_local_public_key_state()?;
-    let server_key = get_my_public_key(registry_url, auth_token).await?;
+    let server = get_my_public_key_state(registry_url, auth_token).await?;
+    let scope = SharingKeyScope::new(registry_url, &server.principal_id)?;
+    let local = resolve_local_public_key_state(&scope, server.public_key_b64.as_deref())?;
 
-    match server_key {
+    match server.public_key_b64 {
         None => Ok(PublicKeyRegistrationState::NeedsInitialSet(local)),
         Some(server) if server == local.public_key_b64 => {
             Ok(PublicKeyRegistrationState::Matches(local))
@@ -228,25 +394,105 @@ pub async fn classify_public_key_state(
 }
 
 /// Load the local X25519 keypair, creating one if absent.
-fn load_local_public_key_state() -> Result<LocalPublicKeyState, String> {
-    #[cfg(target_os = "macos")]
-    let (private_key, public) = if force_file_x25519_keypair() {
-        crate::storage_transaction::with_vault_transaction(
-            get_or_create_file_backed_x25519_keypair,
-        )?
-    } else {
-        crate::keychain::get_or_create_x25519_keypair()?
-    };
-    #[cfg(not(target_os = "macos"))]
-    let (private_key, public) = crate::storage_transaction::with_vault_transaction(
-        get_or_create_file_backed_x25519_keypair,
-    )?;
+enum LegacyKeyExpectation<'a> {
+    None,
+    PublicKey(&'a str),
+    Fingerprint(&'a str),
+}
 
-    let public_key_b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, public);
-    Ok(LocalPublicKeyState {
-        private_key,
-        public_key_b64,
+impl LegacyKeyExpectation<'_> {
+    fn matches(&self, public_key: &[u8; 32]) -> bool {
+        match self {
+            Self::None => false,
+            Self::PublicKey(expected) => {
+                base64::Engine::encode(&base64::engine::general_purpose::STANDARD, public_key)
+                    == *expected
+            }
+            Self::Fingerprint(expected) => public_key_fingerprint(public_key) == *expected,
+        }
+    }
+}
+
+pub fn resolve_local_public_key_state(
+    scope: &SharingKeyScope,
+    server_public_key_b64: Option<&str>,
+) -> Result<LocalPublicKeyState, String> {
+    let expectation =
+        server_public_key_b64.map_or(LegacyKeyExpectation::None, LegacyKeyExpectation::PublicKey);
+    resolve_local_public_key_state_matching(scope, expectation)
+}
+
+pub(super) fn resolve_local_public_key_state_for_fingerprint(
+    scope: &SharingKeyScope,
+    server_public_key_fingerprint: &str,
+) -> Result<LocalPublicKeyState, String> {
+    resolve_local_public_key_state_matching(
+        scope,
+        LegacyKeyExpectation::Fingerprint(server_public_key_fingerprint),
+    )
+}
+
+fn resolve_local_public_key_state_matching(
+    scope: &SharingKeyScope,
+    legacy_expectation: LegacyKeyExpectation<'_>,
+) -> Result<LocalPublicKeyState, String> {
+    #[cfg(target_os = "macos")]
+    if !force_file_x25519_keypair() {
+        return crate::storage_transaction::with_vault_transaction(|_| {
+            let scoped_account = scope.live_keychain_account();
+            if let Some(private_key) =
+                crate::keychain::try_read_x25519_private_key_for_account(&scoped_account)?
+            {
+                return Ok(local_public_key_state(private_key));
+            }
+            if !matches!(legacy_expectation, LegacyKeyExpectation::None)
+                && let Some(legacy_private_key) = crate::keychain::try_read_x25519_private_key()?
+            {
+                let legacy_public_key =
+                    crate::crypto::x25519_public_from_private(&legacy_private_key);
+                if legacy_expectation.matches(&legacy_public_key) {
+                    crate::keychain::write_x25519_private_key_for_account(
+                        &scoped_account,
+                        &legacy_private_key,
+                    )?;
+                    return Ok(local_public_key_state(legacy_private_key));
+                }
+            }
+            let (private_key, _) =
+                crate::keychain::get_or_create_x25519_keypair_for_account(&scoped_account)?;
+            Ok(local_public_key_state(private_key))
+        });
+    }
+
+    crate::storage_transaction::with_vault_transaction(|directory| {
+        let scoped_file = scope.live_file_name();
+        if let Some(private_key) = read_private_key_file(directory, &scoped_file, "X25519")? {
+            return Ok(local_public_key_state(private_key));
+        }
+        if !matches!(legacy_expectation, LegacyKeyExpectation::None)
+            && let Some(legacy_private_key) =
+                read_private_key_file(directory, LEGACY_LIVE_X25519_KEY_FILE, "legacy X25519")?
+        {
+            let legacy_public_key = crate::crypto::x25519_public_from_private(&legacy_private_key);
+            if legacy_expectation.matches(&legacy_public_key) {
+                write_private_key_file(directory, &scoped_file, &legacy_private_key, "X25519")?;
+                return Ok(local_public_key_state(legacy_private_key));
+            }
+        }
+        let (private_key, _) = get_or_create_file_backed_x25519_keypair(directory, &scoped_file)?;
+        Ok(local_public_key_state(private_key))
     })
+}
+
+fn local_public_key_state(private_key: [u8; 32]) -> LocalPublicKeyState {
+    let public_key = crate::crypto::x25519_public_from_private(&private_key);
+    LocalPublicKeyState {
+        private_key,
+        public_key_b64: base64::Engine::encode(
+            &base64::engine::general_purpose::STANDARD,
+            public_key,
+        ),
+    }
 }
 
 /// Pending sharing-keypair lifecycle helpers used by the
@@ -290,25 +536,24 @@ impl std::fmt::Debug for PendingPublicKey {
     }
 }
 
-#[cfg(test)]
-fn pending_x25519_key_path() -> Result<std::path::PathBuf, String> {
+#[cfg(all(test, debug_assertions))]
+fn pending_x25519_key_path(scope: &SharingKeyScope) -> Result<std::path::PathBuf, String> {
     Ok(crate::lpm_home_dir()
         .ok_or("no home directory")?
         .join(".lpm")
-        .join(".x25519_key.pending"))
+        .join(scope.pending_file_name()))
 }
 
-#[cfg(test)]
-fn live_x25519_key_path() -> Result<std::path::PathBuf, String> {
+#[cfg(all(test, debug_assertions))]
+fn live_x25519_key_path(scope: &SharingKeyScope) -> Result<std::path::PathBuf, String> {
     Ok(crate::lpm_home_dir()
         .ok_or("no home directory")?
         .join(".lpm")
-        .join(".x25519_key"))
+        .join(scope.live_file_name()))
 }
 
-const PENDING_X25519_KEY_FILE: &str = ".x25519_key.pending";
-const LIVE_X25519_KEY_FILE: &str = ".x25519_key";
-const X25519_ROTATION_LOCK_FILE: &str = ".x25519-rotation.lock";
+const LEGACY_PENDING_X25519_KEY_FILE: &str = ".x25519_key.pending";
+const LEGACY_LIVE_X25519_KEY_FILE: &str = ".x25519_key";
 
 /// Process-wide and cross-process exclusion for one complete sharing-key
 /// rotation, including the remote upload and local promotion phases.
@@ -320,9 +565,11 @@ pub struct SharingKeyRotationLock {
 ///
 /// A second command fails immediately instead of waiting and accidentally
 /// performing another rotation after the first command completes.
-pub fn try_acquire_sharing_key_rotation_lock() -> Result<Option<SharingKeyRotationLock>, String> {
+pub fn try_acquire_sharing_key_rotation_lock(
+    scope: &SharingKeyScope,
+) -> Result<Option<SharingKeyRotationLock>, String> {
     crate::storage_transaction::try_acquire_named_lock(
-        X25519_ROTATION_LOCK_FILE,
+        &scope.rotation_lock_file_name(),
         "sharing-key rotation lock",
     )
     .map(|handle| handle.map(|_handle| SharingKeyRotationLock { _handle }))
@@ -333,17 +580,25 @@ pub fn try_acquire_sharing_key_rotation_lock() -> Result<Option<SharingKeyRotati
 /// the caller's `rotate-sharing-key` flow has already verified the
 /// pending state via [`read_pending_x25519_keypair`] and confirmed it's
 /// safe to overwrite (stale orphan from a failed prior attempt).
-pub fn create_pending_x25519_keypair() -> Result<PendingPublicKey, String> {
+pub fn create_pending_x25519_keypair(scope: &SharingKeyScope) -> Result<PendingPublicKey, String> {
     let (private_key, public_key) = crate::crypto::generate_x25519_keypair();
 
     #[cfg(target_os = "macos")]
     if !force_file_x25519_keypair() {
-        crate::keychain::write_pending_x25519_private_key(&private_key)?;
+        crate::keychain::write_x25519_private_key_for_account(
+            &scope.pending_keychain_account(),
+            &private_key,
+        )?;
         return Ok(pending_public_key(private_key, public_key));
     }
 
     crate::storage_transaction::with_vault_transaction(|directory| {
-        write_private_key_file(directory, PENDING_X25519_KEY_FILE, &private_key, "pending")
+        write_private_key_file(
+            directory,
+            &scope.pending_file_name(),
+            &private_key,
+            "pending",
+        )
     })?;
     Ok(pending_public_key(private_key, public_key))
 }
@@ -352,18 +607,57 @@ pub fn create_pending_x25519_keypair() -> Result<PendingPublicKey, String> {
 /// pending slot exists (the steady state). Used on every
 /// `rotate-sharing-key` invocation to detect crash-interrupted prior
 /// rotations.
-pub fn read_pending_x25519_keypair() -> Result<Option<PendingPublicKey>, String> {
+pub fn read_pending_x25519_keypair(
+    scope: &SharingKeyScope,
+    server_public_key_b64: Option<&str>,
+) -> Result<Option<PendingPublicKey>, String> {
     #[cfg(target_os = "macos")]
     if !force_file_x25519_keypair() {
-        return Ok(crate::keychain::read_pending_x25519_private_key()?
-            .map(pending_public_key_from_private));
+        return crate::storage_transaction::with_vault_transaction(|_| {
+            let scoped_account = scope.pending_keychain_account();
+            if let Some(private_key) =
+                crate::keychain::try_read_x25519_private_key_for_account(&scoped_account)?
+            {
+                return Ok(Some(pending_public_key_from_private(private_key)));
+            }
+            let Some(expected) = server_public_key_b64 else {
+                return Ok(None);
+            };
+            let Some(legacy_private_key) = crate::keychain::read_pending_x25519_private_key()?
+            else {
+                return Ok(None);
+            };
+            let legacy = pending_public_key_from_private(legacy_private_key);
+            if legacy.public_key_b64 != expected {
+                return Ok(None);
+            }
+            crate::keychain::write_x25519_private_key_for_account(
+                &scoped_account,
+                &legacy.private_key,
+            )?;
+            Ok(Some(legacy))
+        });
     }
 
     crate::storage_transaction::with_vault_transaction(|directory| {
-        Ok(
-            read_private_key_file(directory, PENDING_X25519_KEY_FILE, "pending")?
-                .map(pending_public_key_from_private),
-        )
+        let scoped_file = scope.pending_file_name();
+        if let Some(private_key) = read_private_key_file(directory, &scoped_file, "pending")? {
+            return Ok(Some(pending_public_key_from_private(private_key)));
+        }
+        let Some(expected) = server_public_key_b64 else {
+            return Ok(None);
+        };
+        let Some(legacy_private_key) =
+            read_private_key_file(directory, LEGACY_PENDING_X25519_KEY_FILE, "legacy pending")?
+        else {
+            return Ok(None);
+        };
+        let legacy = pending_public_key_from_private(legacy_private_key);
+        if legacy.public_key_b64 != expected {
+            return Ok(None);
+        }
+        write_private_key_file(directory, &scoped_file, &legacy.private_key, "pending")?;
+        Ok(Some(legacy))
     })
 }
 
@@ -372,17 +666,21 @@ pub fn read_pending_x25519_keypair() -> Result<Option<PendingPublicKey>, String>
 /// A crash before the live write leaves pending state for recovery. A crash
 /// after the live write leaves two identical copies, so repeating promotion is
 /// safe. On macOS both accounts remain in the shared Data Protection Keychain.
-pub fn promote_pending_x25519_keypair() -> Result<(), String> {
+pub fn promote_pending_x25519_keypair(scope: &SharingKeyScope) -> Result<(), String> {
     #[cfg(target_os = "macos")]
     if !force_file_x25519_keypair() {
-        return crate::keychain::promote_pending_x25519_private_key();
+        return crate::keychain::promote_x25519_private_key_accounts(
+            &scope.pending_keychain_account(),
+            &scope.live_keychain_account(),
+        );
     }
 
     crate::storage_transaction::with_vault_transaction(|directory| {
-        let pending = read_private_key_file(directory, PENDING_X25519_KEY_FILE, "pending")?
+        let pending_file = scope.pending_file_name();
+        let pending = read_private_key_file(directory, &pending_file, "pending")?
             .ok_or("no pending key to promote")?;
-        write_private_key_file(directory, LIVE_X25519_KEY_FILE, &pending, "live")?;
-        directory.remove_file(PENDING_X25519_KEY_FILE, "pending X25519 key")?;
+        write_private_key_file(directory, &scope.live_file_name(), &pending, "live")?;
+        directory.remove_file(&pending_file, "pending X25519 key")?;
         Ok(())
     })
 }
@@ -390,14 +688,16 @@ pub fn promote_pending_x25519_keypair() -> Result<(), String> {
 /// Delete the pending slot without promoting. Called when the prior
 /// upload failed before commit (pending key doesn't match server's
 /// current key), or after a successful promotion.
-pub fn discard_pending_x25519_keypair() -> Result<(), String> {
+pub fn discard_pending_x25519_keypair(scope: &SharingKeyScope) -> Result<(), String> {
     #[cfg(target_os = "macos")]
     if !force_file_x25519_keypair() {
-        return crate::keychain::delete_pending_x25519_private_key();
+        return crate::keychain::delete_x25519_private_key_for_account(
+            &scope.pending_keychain_account(),
+        );
     }
 
     crate::storage_transaction::with_vault_transaction(|directory| {
-        directory.remove_file(PENDING_X25519_KEY_FILE, "pending X25519 key")?;
+        directory.remove_file(&scope.pending_file_name(), "pending X25519 key")?;
         Ok(())
     })
 }
@@ -415,7 +715,12 @@ pub struct MemberPublicKey {
 }
 
 /// Organization member keys together with the caller's key-management capability.
+#[derive(Debug)]
 pub struct OrgMemberKeyAccess {
+    /// Immutable organization identity asserted by the registry.
+    pub organization_id: String,
+    /// Authenticated user identity asserted independently of the member payload.
+    pub caller_user_id: String,
     /// Current organization members and their registered sharing keys.
     pub members: Vec<MemberPublicKey>,
     /// Whether the caller may replace the organization content-key wraps.
@@ -427,6 +732,66 @@ pub fn public_key_fingerprint(public_key: &[u8; 32]) -> String {
     use sha2::{Digest, Sha256};
 
     hex::encode(Sha256::digest(public_key))
+}
+
+/// Classify the local sharing key against the authenticated caller's inventory row.
+pub fn classify_public_key_state_from_member_access(
+    local: LocalPublicKeyState,
+    access: &OrgMemberKeyAccess,
+) -> Result<PublicKeyRegistrationState, SyncError> {
+    match authenticated_caller_public_key(access)? {
+        None => Ok(PublicKeyRegistrationState::NeedsInitialSet(local)),
+        Some(caller_public_key_b64) if caller_public_key_b64 == local.public_key_b64 => {
+            Ok(PublicKeyRegistrationState::Matches(local))
+        }
+        Some(server_public_key_b64) => Ok(PublicKeyRegistrationState::RotationRequired {
+            local,
+            server_public_key_b64,
+        }),
+    }
+}
+
+pub fn resolve_public_key_state_from_member_access(
+    registry_url: &str,
+    access: &OrgMemberKeyAccess,
+) -> Result<PublicKeyRegistrationState, SyncError> {
+    let server_public_key = authenticated_caller_public_key(access)?;
+    let scope = SharingKeyScope::new(registry_url, &access.caller_user_id)?;
+    let local = resolve_local_public_key_state(&scope, server_public_key.as_deref())?;
+    classify_public_key_state_from_member_access(local, access)
+}
+
+fn authenticated_caller_public_key(
+    access: &OrgMemberKeyAccess,
+) -> Result<Option<String>, SyncError> {
+    let mut caller_entries = access
+        .members
+        .iter()
+        .filter(|member| member.user_id == access.caller_user_id);
+    let caller = caller_entries
+        .next()
+        .ok_or("organization member inventory omitted the authenticated caller")?;
+    if caller_entries.next().is_some() {
+        return Err("organization member inventory duplicated the authenticated caller".into());
+    }
+
+    if !caller.has_public_key {
+        if caller.public_key.is_some()
+            || caller.public_key_version.is_some()
+            || caller.public_key_fingerprint.is_some()
+        {
+            return Err("authenticated caller has an inconsistent public-key binding".into());
+        }
+        return Ok(None);
+    }
+
+    let prepared = super::recipient_set::prepare_recipients(&[caller])
+        .map_err(|error| SyncError::from(format!("invalid authenticated caller key: {error}")))?;
+    let caller_public_key_b64 = base64::Engine::encode(
+        &base64::engine::general_purpose::STANDARD,
+        prepared[0].public_key,
+    );
+    Ok(Some(caller_public_key_b64))
 }
 
 /// Fetch all org members' public keys.
@@ -448,9 +813,16 @@ pub async fn get_org_member_key_access(
     auth_token: &str,
     org_slug: &str,
 ) -> Result<OrgMemberKeyAccess, SyncError> {
-    let client = sync_http_client_builder()
-        .build()
-        .map_err(|e| format!("failed to build http client: {e}"))?;
+    let client = sync_http_client()?;
+    get_org_member_key_access_with_client(client, registry_url, auth_token, org_slug).await
+}
+
+pub(super) async fn get_org_member_key_access_with_client(
+    client: &reqwest::Client,
+    registry_url: &str,
+    auth_token: &str,
+    org_slug: &str,
+) -> Result<OrgMemberKeyAccess, SyncError> {
     let url = format!(
         "{registry_url}/api/orgs/{}/members/public-keys",
         url_path_segment(org_slug)
@@ -469,10 +841,33 @@ pub async fn get_org_member_key_access(
         let body = read_capped_error_text(response).await;
         return Err(SyncError::http(
             status,
-            format!("failed to fetch member keys: {body}"),
+            format!("failed to fetch member keys: {status}: {body}"),
         ));
     }
 
+    let organization_id = response
+        .headers()
+        .get("X-LPM-Organization-ID")
+        .ok_or("missing organization identity header")?
+        .to_str()
+        .map_err(|_| "invalid organization identity header")?;
+    if !is_canonical_organization_id(organization_id) {
+        return Err(SyncError::from("invalid organization identity header"));
+    }
+    let organization_id = organization_id.to_owned();
+    let caller_user_id = response
+        .headers()
+        .get("X-LPM-Caller-User-ID")
+        .ok_or("missing caller identity header")?
+        .to_str()
+        .map_err(|_| "invalid caller identity header")?;
+    if caller_user_id.is_empty()
+        || caller_user_id.len() > 256
+        || caller_user_id.chars().any(char::is_control)
+    {
+        return Err(SyncError::from("invalid caller identity header"));
+    }
+    let caller_user_id = caller_user_id.to_owned();
     let can_replace_wrapped_keys = match response
         .headers()
         .get("X-LPM-Org-Wrapped-Keys-Write")
@@ -488,15 +883,22 @@ pub async fn get_org_member_key_access(
             ));
         }
     };
-    let members = response
-        .json()
-        .await
-        .map_err(|e| format!("parse error: {e}"))?;
+    let members = read_capped_json(response).await?;
 
     Ok(OrgMemberKeyAccess {
+        organization_id,
+        caller_user_id,
         members,
         can_replace_wrapped_keys,
     })
+}
+
+pub(super) fn is_canonical_organization_id(value: &str) -> bool {
+    value.len() == 36
+        && value.bytes().enumerate().all(|(index, byte)| match index {
+            8 | 13 | 18 | 23 => byte == b'-',
+            _ => byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte),
+        })
 }
 
 /// Honoured only on macOS — the keychain backend is the default there
@@ -517,17 +919,18 @@ fn force_file_x25519_keypair() -> bool {
 
 fn get_or_create_file_backed_x25519_keypair(
     directory: &crate::storage_transaction::VaultStorageDirectory,
+    file_name: &str,
 ) -> Result<([u8; 32], [u8; 32]), String> {
-    if let Some(private_key) = read_private_key_file(directory, LIVE_X25519_KEY_FILE, "X25519")? {
+    if let Some(private_key) = read_private_key_file(directory, file_name, "X25519")? {
         let public_key = crate::crypto::x25519_public_from_private(&private_key);
         return Ok((private_key, public_key));
     }
 
     let (candidate, public_key) = crate::crypto::generate_x25519_keypair();
-    if directory.create_owner_only_file(LIVE_X25519_KEY_FILE, &candidate, "X25519 key")? {
+    if directory.create_owner_only_file(file_name, &candidate, "X25519 key")? {
         return Ok((candidate, public_key));
     }
-    let private_key = read_private_key_file(directory, LIVE_X25519_KEY_FILE, "X25519")?
+    let private_key = read_private_key_file(directory, file_name, "X25519")?
         .ok_or("X25519 key was created concurrently but could not be read")?;
     let public_key = crate::crypto::x25519_public_from_private(&private_key);
     Ok((private_key, public_key))
@@ -583,7 +986,8 @@ mod tests {
     #[cfg(debug_assertions)]
     use crate::sync::test_support::IsolatedVaultKeyEnv;
     use crate::sync::test_support::env_lock_guard;
-    use wiremock::matchers::{method, path};
+    use base64::Engine;
+    use wiremock::matchers::{body_json, method, path};
     use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
 
     #[cfg(all(target_os = "macos", not(debug_assertions)))]
@@ -635,6 +1039,7 @@ mod tests {
         Mock::given(method("GET"))
             .and(path("/api/users/me/public-key"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "principalId": "caller",
                 "publicKey": "abc=",
                 "createdAt": null,
                 "updatedAt": null,
@@ -656,6 +1061,7 @@ mod tests {
         Mock::given(method("GET"))
             .and(path("/api/users/me/public-key"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "principalId": "caller",
                 "publicKey": null,
                 "createdAt": null,
                 "updatedAt": null,
@@ -668,6 +1074,212 @@ mod tests {
             .await
             .expect("null publicKey is the explicit 'no key' signal");
         assert!(key.is_none());
+    }
+
+    #[tokio::test]
+    async fn get_org_member_keys_requires_an_immutable_organization_identity() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/api/orgs/acme/members/public-keys"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("X-LPM-Org-Wrapped-Keys-Write", "allowed")
+                    .set_body_json(serde_json::json!([])),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let error = get_org_member_key_access(&server.uri(), "token", "acme")
+            .await
+            .expect_err("an unscoped organization member response must fail closed");
+
+        assert!(error.to_string().contains("organization identity header"));
+    }
+
+    #[tokio::test]
+    async fn get_org_member_keys_requires_an_authenticated_caller_identity() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/api/orgs/acme/members/public-keys"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header(
+                        "X-LPM-Organization-ID",
+                        "00000000-0000-4000-8000-000000000001",
+                    )
+                    .insert_header("X-LPM-Org-Wrapped-Keys-Write", "allowed")
+                    .set_body_json(serde_json::json!([])),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let error = get_org_member_key_access(&server.uri(), "token", "acme")
+            .await
+            .expect_err("an organization member response without its caller must fail closed");
+
+        assert!(error.to_string().contains("caller identity header"));
+    }
+
+    fn member_with_key(user_id: &str, public_key: [u8; 32]) -> MemberPublicKey {
+        MemberPublicKey {
+            user_id: user_id.to_owned(),
+            role: "member".to_owned(),
+            public_key: Some(base64::engine::general_purpose::STANDARD.encode(public_key)),
+            public_key_version: Some(1),
+            public_key_fingerprint: Some(public_key_fingerprint(&public_key)),
+            has_public_key: true,
+        }
+    }
+
+    fn member_without_key(user_id: &str) -> MemberPublicKey {
+        MemberPublicKey {
+            user_id: user_id.to_owned(),
+            role: "member".to_owned(),
+            public_key: None,
+            public_key_version: None,
+            public_key_fingerprint: None,
+            has_public_key: false,
+        }
+    }
+
+    fn member_access(caller_user_id: &str, members: Vec<MemberPublicKey>) -> OrgMemberKeyAccess {
+        OrgMemberKeyAccess {
+            organization_id: "00000000-0000-4000-8000-000000000001".to_owned(),
+            caller_user_id: caller_user_id.to_owned(),
+            members,
+            can_replace_wrapped_keys: true,
+        }
+    }
+
+    fn local_state(private_key: [u8; 32]) -> LocalPublicKeyState {
+        let public_key = crate::crypto::x25519_public_from_private(&private_key);
+        LocalPublicKeyState {
+            private_key,
+            public_key_b64: base64::engine::general_purpose::STANDARD.encode(public_key),
+        }
+    }
+
+    #[test]
+    fn member_access_classifier_matches_the_authenticated_caller_key() {
+        let local = local_state([7; 32]);
+        let public_key = crate::crypto::x25519_public_from_private(&local.private_key);
+        let access = member_access("caller", vec![member_with_key("caller", public_key)]);
+
+        let state = classify_public_key_state_from_member_access(local.clone(), &access)
+            .expect("valid caller binding must classify");
+
+        assert_eq!(state, PublicKeyRegistrationState::Matches(local));
+    }
+
+    #[test]
+    fn member_access_classifier_requires_an_initial_set_for_an_empty_caller_binding() {
+        let local = local_state([7; 32]);
+        let access = member_access("caller", vec![member_without_key("caller")]);
+
+        let state = classify_public_key_state_from_member_access(local.clone(), &access)
+            .expect("empty caller binding must classify");
+
+        assert_eq!(state, PublicKeyRegistrationState::NeedsInitialSet(local));
+    }
+
+    #[test]
+    fn member_access_classifier_requires_rotation_for_a_changed_caller_key() {
+        let local = local_state([7; 32]);
+        let server_public_key = crate::crypto::x25519_public_from_private(&[9; 32]);
+        let access = member_access("caller", vec![member_with_key("caller", server_public_key)]);
+
+        let state = classify_public_key_state_from_member_access(local.clone(), &access)
+            .expect("changed caller binding must classify");
+
+        assert_eq!(
+            state,
+            PublicKeyRegistrationState::RotationRequired {
+                local,
+                server_public_key_b64: base64::engine::general_purpose::STANDARD
+                    .encode(server_public_key),
+            }
+        );
+    }
+
+    #[test]
+    fn member_access_classifier_rejects_a_missing_caller_row() {
+        let error = classify_public_key_state_from_member_access(
+            local_state([7; 32]),
+            &member_access("caller", vec![member_without_key("other")]),
+        )
+        .expect_err("the authenticated caller must be present");
+
+        assert!(
+            error
+                .to_string()
+                .contains("omitted the authenticated caller")
+        );
+    }
+
+    #[test]
+    fn member_access_classifier_rejects_duplicate_caller_rows() {
+        let error = classify_public_key_state_from_member_access(
+            local_state([7; 32]),
+            &member_access(
+                "caller",
+                vec![member_without_key("caller"), member_without_key("caller")],
+            ),
+        )
+        .expect_err("the authenticated caller must be unique");
+
+        assert!(
+            error
+                .to_string()
+                .contains("duplicated the authenticated caller")
+        );
+    }
+
+    #[test]
+    fn member_access_classifier_does_not_identify_the_caller_by_key_bytes() {
+        let local = local_state([7; 32]);
+        let local_public_key = crate::crypto::x25519_public_from_private(&local.private_key);
+        let caller_public_key = crate::crypto::x25519_public_from_private(&[9; 32]);
+        let access = member_access(
+            "caller",
+            vec![
+                member_with_key("other", local_public_key),
+                member_with_key("caller", caller_public_key),
+            ],
+        );
+
+        let state = classify_public_key_state_from_member_access(local.clone(), &access)
+            .expect("caller identity must control selection");
+
+        assert_eq!(
+            state,
+            PublicKeyRegistrationState::RotationRequired {
+                local,
+                server_public_key_b64: base64::engine::general_purpose::STANDARD
+                    .encode(caller_public_key),
+            }
+        );
+    }
+
+    #[test]
+    fn member_access_classifier_rejects_a_malformed_caller_binding() {
+        let mut caller = member_without_key("caller");
+        caller.public_key = Some(base64::engine::general_purpose::STANDARD.encode([1; 32]));
+
+        let error = classify_public_key_state_from_member_access(
+            local_state([7; 32]),
+            &member_access("caller", vec![caller]),
+        )
+        .expect_err("inconsistent caller binding must fail closed");
+
+        assert!(
+            error
+                .to_string()
+                .contains("inconsistent public-key binding")
+        );
     }
 
     #[tokio::test]
@@ -705,18 +1317,36 @@ mod tests {
 
         Mock::given(method("POST"))
             .and(path("/api/users/me/public-key"))
+            .and(body_json(serde_json::json!({
+                "expectedPrincipalId": "caller",
+                "publicKey": "abc=",
+            })))
             .respond_with(CaptureResponder {
                 captured: captured_for_responder,
             })
             .expect(2)
             .mount(&server)
             .await;
+        Mock::given(method("GET"))
+            .and(path("/api/users/me/public-key"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "principalId": "caller",
+                "publicKey": "abc=",
+            })))
+            .expect(2)
+            .mount(&server)
+            .await;
 
         // With a proof — header must be present and match.
-        let result_with =
-            upload_public_key(&server.uri(), "auth-token", "abc=", Some("proof-jwt-here"))
-                .await
-                .expect("happy path with proof");
+        let result_with = upload_public_key(
+            &server.uri(),
+            "auth-token",
+            "caller",
+            "abc=",
+            Some("proof-jwt-here"),
+        )
+        .await
+        .expect("happy path with proof");
         assert_eq!(result_with.status.as_deref(), Some("set"));
         assert_eq!(result_with.ok, Some(true));
         assert_eq!(
@@ -725,7 +1355,7 @@ mod tests {
         );
 
         // Without a proof — header must be absent.
-        upload_public_key(&server.uri(), "auth-token", "abc=", None)
+        upload_public_key(&server.uri(), "auth-token", "caller", "abc=", None)
             .await
             .expect("no-proof call still completes against this mock");
 
@@ -755,7 +1385,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let err = upload_public_key(&server.uri(), "token", "abc=", None)
+        let err = upload_public_key(&server.uri(), "token", "caller", "abc=", None)
             .await
             .expect_err("403 must propagate as Err");
         assert!(
@@ -765,19 +1395,228 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn upload_public_key_rejects_ambiguous_success_when_authoritative_key_differs() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/api/users/me/public-key"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/users/me/public-key"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "principalId": "caller",
+                "publicKey": "old-key=",
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let result =
+            upload_public_key(&server.uri(), "token", "caller", "new-key=", Some("proof")).await;
+
+        assert!(
+            matches!(result, Err(error) if error.to_string().contains("did not confirm")),
+            "a mismatched authoritative key must keep pending local key material"
+        );
+    }
+
+    #[tokio::test]
+    async fn upload_public_key_rejects_a_principal_change_after_the_write() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/api/users/me/public-key"))
+            .and(body_json(serde_json::json!({
+                "expectedPrincipalId": "caller",
+                "publicKey": "new-key=",
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "status": "set",
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/users/me/public-key"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "principalId": "other-caller",
+                "publicKey": "new-key=",
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let error = upload_public_key(&server.uri(), "token", "caller", "new-key=", Some("proof"))
+            .await
+            .expect_err("a response for another principal must not confirm the upload");
+
+        assert!(error.to_string().contains("did not confirm"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn upload_public_key_accepts_legacy_success_after_authoritative_confirmation() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/api/users/me/public-key"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({ "status": "saved" })),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/users/me/public-key"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "principalId": "caller",
+                "publicKey": "new-key=",
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let result = upload_public_key(&server.uri(), "token", "caller", "new-key=", Some("proof"))
+            .await
+            .expect("matching authoritative key should confirm legacy success");
+
+        assert_eq!(result.status.as_deref(), Some("saved"));
+    }
+
+    #[tokio::test]
+    async fn org_registration_confirms_the_uploaded_key_from_one_refetched_member_inventory() {
+        let local = local_state([7; 32]);
+        let public_key = crate::crypto::x25519_public_from_private(&local.private_key);
+        let server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/api/users/me/public-key"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "status": "set",
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/orgs/acme/members/public-keys"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header(
+                        "X-LPM-Organization-ID",
+                        "00000000-0000-4000-8000-000000000001",
+                    )
+                    .insert_header("X-LPM-Caller-User-ID", "caller")
+                    .set_body_json(serde_json::json!([{
+                        "userId": "caller",
+                        "role": "member",
+                        "publicKey": base64::engine::general_purpose::STANDARD.encode(public_key),
+                        "publicKeyVersion": 1,
+                        "publicKeyFingerprint": public_key_fingerprint(&public_key),
+                        "hasPublicKey": true,
+                    }])),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/users/me/public-key"))
+            .respond_with(ResponseTemplate::new(500))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let access = upload_public_key_for_org(
+            &server.uri(),
+            "token",
+            "acme",
+            "caller",
+            &local.public_key_b64,
+            "proof",
+        )
+        .await
+        .expect("the member inventory must confirm the uploaded key");
+
+        assert_eq!(
+            classify_public_key_state_from_member_access(local.clone(), &access)
+                .expect("refetched caller binding must classify"),
+            PublicKeyRegistrationState::Matches(local),
+        );
+    }
+
+    #[tokio::test]
+    async fn org_registration_rejects_a_changed_authenticated_caller() {
+        let local = local_state([7; 32]);
+        let public_key = crate::crypto::x25519_public_from_private(&local.private_key);
+        let server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/api/users/me/public-key"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "status": "set",
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/orgs/acme/members/public-keys"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header(
+                        "X-LPM-Organization-ID",
+                        "00000000-0000-4000-8000-000000000001",
+                    )
+                    .insert_header("X-LPM-Caller-User-ID", "other-caller")
+                    .set_body_json(serde_json::json!([{
+                        "userId": "other-caller",
+                        "role": "member",
+                        "publicKey": base64::engine::general_purpose::STANDARD.encode(public_key),
+                        "publicKeyVersion": 1,
+                        "publicKeyFingerprint": public_key_fingerprint(&public_key),
+                        "hasPublicKey": true,
+                    }])),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let error = upload_public_key_for_org(
+            &server.uri(),
+            "token",
+            "acme",
+            "caller",
+            &local.public_key_b64,
+            "proof",
+        )
+        .await
+        .expect_err("a caller change after upload must fail closed");
+
+        assert!(
+            error.to_string().contains("authenticated caller"),
+            "{error}"
+        );
+    }
+
     #[cfg(debug_assertions)]
     #[tokio::test]
     async fn classify_public_key_state_matches_when_server_key_equals_local() {
         let _guard = env_lock_guard();
         let _isolated = IsolatedVaultKeyEnv::new();
+        let server = MockServer::start().await;
 
         // Pre-warm the local keypair so we know its public form.
-        let local = load_local_public_key_state().expect("load local keypair");
+        let scope = SharingKeyScope::new(&server.uri(), "caller").expect("sharing key scope");
+        let local = resolve_local_public_key_state(&scope, None).expect("load local keypair");
 
-        let server = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path("/api/users/me/public-key"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "principalId": "caller",
                 "publicKey": local.public_key_b64.clone(),
             })))
             .expect(1)
@@ -805,6 +1644,7 @@ mod tests {
         Mock::given(method("GET"))
             .and(path("/api/users/me/public-key"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "principalId": "caller",
                 "publicKey": null,
             })))
             .expect(1)
@@ -835,6 +1675,7 @@ mod tests {
         Mock::given(method("GET"))
             .and(path("/api/users/me/public-key"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "principalId": "caller",
                 "publicKey": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
             })))
             .expect(1)
@@ -889,19 +1730,21 @@ mod tests {
         // live slot with the pending bytes and clears the pending file.
         let _guard = env_lock_guard();
         let _isolated = IsolatedVaultKeyEnv::new();
+        let scope =
+            SharingKeyScope::new("https://registry.example", "caller").expect("sharing key scope");
 
         // No pending at first.
         assert!(
-            read_pending_x25519_keypair()
+            read_pending_x25519_keypair(&scope, None)
                 .expect("read pending")
                 .is_none(),
             "fresh HOME should have no pending key"
         );
 
         // Create — pending file now exists, live slot still untouched.
-        let pending = create_pending_x25519_keypair().expect("create pending");
-        let pending_path = pending_x25519_key_path().expect("path");
-        let live_path = live_x25519_key_path().expect("path");
+        let pending = create_pending_x25519_keypair(&scope).expect("create pending");
+        let pending_path = pending_x25519_key_path(&scope).expect("path");
+        let live_path = live_x25519_key_path(&scope).expect("path");
         assert!(pending_path.exists(), "create must persist the pending key");
         assert!(
             !live_path.exists(),
@@ -909,13 +1752,13 @@ mod tests {
         );
 
         // Read returns the same key bytes.
-        let read_back = read_pending_x25519_keypair()
+        let read_back = read_pending_x25519_keypair(&scope, Some(&pending.public_key_b64))
             .expect("read pending")
             .expect("pending should be present");
         assert_eq!(read_back.public_key_b64, pending.public_key_b64);
 
         // Promote — live slot now holds the pending bytes; pending is gone.
-        promote_pending_x25519_keypair().expect("promote");
+        promote_pending_x25519_keypair(&scope).expect("promote");
         assert!(live_path.exists(), "live slot must be present post-promote");
         assert!(
             !pending_path.exists(),
@@ -924,9 +1767,8 @@ mod tests {
         let live_bytes = std::fs::read(&live_path).expect("read live");
         assert_eq!(live_bytes, &pending.private_key);
 
-        // Subsequent classify-equivalent: load_local_public_key_state
-        // should see the new live key.
-        let live = load_local_public_key_state().expect("load live");
+        let live = resolve_local_public_key_state(&scope, Some(&pending.public_key_b64))
+            .expect("load live");
         assert_eq!(live.public_key_b64, pending.public_key_b64);
     }
 
@@ -935,22 +1777,25 @@ mod tests {
     fn pending_key_discard_removes_orphan_without_touching_live() {
         let _guard = env_lock_guard();
         let _isolated = IsolatedVaultKeyEnv::new();
+        let scope =
+            SharingKeyScope::new("https://registry.example", "caller").expect("sharing key scope");
 
         // Pre-seed a live key.
-        let live = load_local_public_key_state().expect("seed live");
-        let live_path = live_x25519_key_path().expect("path");
+        let live = resolve_local_public_key_state(&scope, None).expect("seed live");
+        let live_path = live_x25519_key_path(&scope).expect("path");
         assert!(live_path.exists());
 
         // Create + discard pending.
-        let _ = create_pending_x25519_keypair().expect("create pending");
-        let pending_path = pending_x25519_key_path().expect("path");
+        let _ = create_pending_x25519_keypair(&scope).expect("create pending");
+        let pending_path = pending_x25519_key_path(&scope).expect("path");
         assert!(pending_path.exists());
 
-        discard_pending_x25519_keypair().expect("discard");
+        discard_pending_x25519_keypair(&scope).expect("discard");
         assert!(!pending_path.exists());
         assert!(live_path.exists(), "discard must NOT touch live");
         // Live key bytes unchanged.
-        let live_after = load_local_public_key_state().expect("load live");
+        let live_after =
+            resolve_local_public_key_state(&scope, Some(&live.public_key_b64)).expect("load live");
         assert_eq!(live_after.public_key_b64, live.public_key_b64);
     }
 
@@ -959,8 +1804,10 @@ mod tests {
     fn pending_key_promote_when_no_pending_is_explicit_error() {
         let _guard = env_lock_guard();
         let _isolated = IsolatedVaultKeyEnv::new();
+        let scope =
+            SharingKeyScope::new("https://registry.example", "caller").expect("sharing key scope");
 
-        let err = promote_pending_x25519_keypair()
+        let err = promote_pending_x25519_keypair(&scope)
             .expect_err("promote with no pending must Err, not silently succeed");
         assert!(err.contains("no pending"), "got: {err}");
     }
@@ -970,14 +1817,155 @@ mod tests {
     fn sharing_key_rotation_lock_rejects_a_concurrent_command() {
         let _guard = env_lock_guard();
         let _env = IsolatedVaultKeyEnv::new();
-        let first = try_acquire_sharing_key_rotation_lock()
+        let scope =
+            SharingKeyScope::new("https://registry.example", "caller").expect("sharing key scope");
+        let other_scope = SharingKeyScope::new("https://registry.example", "other-caller")
+            .expect("other sharing key scope");
+        let first = try_acquire_sharing_key_rotation_lock(&scope)
             .expect("acquire first rotation lock")
             .expect("first rotation lock should be available");
 
-        let second = try_acquire_sharing_key_rotation_lock().expect("probe second rotation lock");
+        let second =
+            try_acquire_sharing_key_rotation_lock(&scope).expect("probe second rotation lock");
+        let independent = try_acquire_sharing_key_rotation_lock(&other_scope)
+            .expect("probe independent rotation lock");
 
         assert!(second.is_none());
+        assert!(independent.is_some());
         drop(first);
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    fn matching_legacy_live_key_is_adopted_into_the_authenticated_scope() {
+        let _guard = env_lock_guard();
+        let _env = IsolatedVaultKeyEnv::new();
+        let legacy_private_key = [7; 32];
+        let legacy_public_key = crate::crypto::x25519_public_from_private(&legacy_private_key);
+        let legacy_public_key_b64 =
+            base64::engine::general_purpose::STANDARD.encode(legacy_public_key);
+        crate::storage_transaction::with_vault_transaction(|directory| {
+            write_private_key_file(
+                directory,
+                LEGACY_LIVE_X25519_KEY_FILE,
+                &legacy_private_key,
+                "legacy X25519",
+            )
+        })
+        .expect("seed legacy sharing key");
+        let scope =
+            SharingKeyScope::new("https://registry.example", "caller").expect("sharing key scope");
+
+        let resolved = resolve_local_public_key_state(&scope, Some(&legacy_public_key_b64))
+            .expect("adopt matching legacy key");
+
+        assert_eq!(resolved.private_key, legacy_private_key);
+        assert_eq!(
+            std::fs::read(live_x25519_key_path(&scope).expect("scoped live path"))
+                .expect("read adopted scoped key"),
+            legacy_private_key,
+        );
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    fn mismatched_legacy_live_key_is_not_adopted() {
+        let _guard = env_lock_guard();
+        let _env = IsolatedVaultKeyEnv::new();
+        let legacy_private_key = [7; 32];
+        let server_public_key = crate::crypto::x25519_public_from_private(&[9; 32]);
+        let server_public_key_b64 =
+            base64::engine::general_purpose::STANDARD.encode(server_public_key);
+        crate::storage_transaction::with_vault_transaction(|directory| {
+            write_private_key_file(
+                directory,
+                LEGACY_LIVE_X25519_KEY_FILE,
+                &legacy_private_key,
+                "legacy X25519",
+            )
+        })
+        .expect("seed legacy sharing key");
+        let scope =
+            SharingKeyScope::new("https://registry.example", "caller").expect("sharing key scope");
+
+        let resolved = resolve_local_public_key_state(&scope, Some(&server_public_key_b64))
+            .expect("create scoped key without adopting the mismatch");
+
+        assert_ne!(resolved.private_key, legacy_private_key);
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    fn legacy_pending_key_is_adopted_only_for_a_matching_server_key() {
+        let _guard = env_lock_guard();
+        let _env = IsolatedVaultKeyEnv::new();
+        let legacy_private_key = [7; 32];
+        let legacy_public_key = crate::crypto::x25519_public_from_private(&legacy_private_key);
+        let legacy_public_key_b64 =
+            base64::engine::general_purpose::STANDARD.encode(legacy_public_key);
+        let other_public_key = crate::crypto::x25519_public_from_private(&[9; 32]);
+        let other_public_key_b64 =
+            base64::engine::general_purpose::STANDARD.encode(other_public_key);
+        crate::storage_transaction::with_vault_transaction(|directory| {
+            write_private_key_file(
+                directory,
+                LEGACY_PENDING_X25519_KEY_FILE,
+                &legacy_private_key,
+                "legacy pending",
+            )
+        })
+        .expect("seed legacy pending key");
+        let matching_scope = SharingKeyScope::new("https://registry.example", "caller")
+            .expect("matching sharing key scope");
+        let mismatched_scope = SharingKeyScope::new("https://registry.example", "other-caller")
+            .expect("mismatched sharing key scope");
+
+        let adopted = read_pending_x25519_keypair(&matching_scope, Some(&legacy_public_key_b64))
+            .expect("read matching legacy pending key")
+            .expect("matching legacy pending key must be adopted");
+        let rejected = read_pending_x25519_keypair(&mismatched_scope, Some(&other_public_key_b64))
+            .expect("probe mismatched legacy pending key");
+
+        assert_eq!(adopted.private_key, legacy_private_key);
+        assert!(rejected.is_none());
+        assert!(
+            !pending_x25519_key_path(&mismatched_scope)
+                .expect("mismatched pending path")
+                .exists()
+        );
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    fn sharing_keys_are_isolated_by_registry_and_authenticated_principal() {
+        let _guard = env_lock_guard();
+        let _env = IsolatedVaultKeyEnv::new();
+        let first_scope =
+            SharingKeyScope::new("https://registry-a.example", "user-1").expect("first scope");
+        let other_registry = SharingKeyScope::new("https://registry-b.example", "user-1")
+            .expect("other Registry scope");
+        let other_principal = SharingKeyScope::new("https://registry-a.example", "user-2")
+            .expect("other principal scope");
+
+        let first = resolve_local_public_key_state(&first_scope, None).expect("first key");
+        let second =
+            resolve_local_public_key_state(&other_registry, None).expect("other Registry key");
+        let third =
+            resolve_local_public_key_state(&other_principal, None).expect("other principal key");
+
+        assert_ne!(first.public_key_b64, second.public_key_b64);
+        assert_ne!(first.public_key_b64, third.public_key_b64);
+    }
+
+    #[test]
+    fn sharing_key_rotation_account_matches_the_swift_client() {
+        let scope =
+            SharingKeyScope::new("https://registry.example/", "user-1").expect("sharing key scope");
+
+        assert_eq!(
+            scope.live_keychain_account(),
+            "__x25519_private_key__.v2.5a12911fb761923d976c0aa9f51355a7a8b1c31b06d152393eec5ab45357e666"
+        );
     }
 
     #[test]
