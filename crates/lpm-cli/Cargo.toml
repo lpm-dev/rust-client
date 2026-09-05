@@ -73,7 +73,6 @@ wait-timeout = "0.2"
 
 # Auth / secure storage
 aes-gcm = { workspace = true }
-scrypt = { workspace = true }
 rand = { workspace = true }
 dirs = { workspace = true }
 
@@ -227,9 +226,6 @@ acceptance-test-hooks = [
 	"lpm-auth/acceptance-test-hooks",
 	"lpm-vault/acceptance-test-hooks",
 ]
-# Temporary raw macOS updater bridge for pre-app-bundle installations.
-legacy-macos-keychain = ["lpm-vault/legacy-macos-keychain"]
-
 [dependencies.dhat]
 version = "0.3"
 optional = true
@@ -242,6 +238,7 @@ optional = true
 wiremock = "0.6"
 assert_cmd = "2"
 insta = { version = "1", features = ["json"] }
+lpm-vault = { workspace = true, features = ["acceptance-test-hooks"] }
 
 # Phase 46 P4 Chunk 2: generate synthetic x509 certs with URI SANs in
 # unit tests so the SAN-extractor is exercised against deterministic

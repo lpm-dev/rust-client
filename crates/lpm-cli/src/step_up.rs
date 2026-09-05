@@ -45,7 +45,6 @@ pub async fn request_cli_step_up_proof(
 
     let policy = crate::commands::env::auth::execute_sync_with_bearer(
         client,
-        lpm_auth::AuthRequirement::TokenRequired,
         |registry_url, auth_token| async move {
             discover_cli_step_up_policy(&registry_url, &auth_token).await
         },
@@ -64,7 +63,6 @@ pub async fn request_cli_step_up_proof(
 
             crate::commands::env::auth::execute_sync_with_bearer(
                 client,
-                lpm_auth::AuthRequirement::TokenRequired,
                 |registry_url, auth_token| {
                     let password = password.clone();
                     async move {
@@ -109,7 +107,6 @@ pub async fn request_cli_step_up_proof(
 
             crate::commands::env::auth::execute_sync_with_bearer(
                 client,
-                lpm_auth::AuthRequirement::TokenRequired,
                 |registry_url, auth_token| {
                     let password = password.clone();
                     let code = code.clone();

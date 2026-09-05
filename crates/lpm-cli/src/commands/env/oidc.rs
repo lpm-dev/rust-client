@@ -318,6 +318,17 @@ pub(super) async fn vars_oidc_allow(
         envs = canonical_envs;
     }
 
+    let manifest = super::sync_payload::CloudManifestSnapshot::read(project_dir)?;
+    let expected_principal_id = manifest
+        .vault
+        .personal_expected_principal_for_registry(registry_client.base_url())
+        .map_err(LpmError::Script)?
+        .ok_or_else(|| {
+            LpmError::Script(
+                "this checkout has no authenticated personal binding; push or pull the env project before configuring OIDC"
+                    .into(),
+            )
+        })?;
     let vault_id =
         lpm_vault::vault_id::get_or_create_vault_id(project_dir).map_err(LpmError::Script)?;
     let mut policy_body = serde_json::json!({
@@ -329,41 +340,37 @@ pub(super) async fn vars_oidc_allow(
         "allowedWorkflows": workflows,
         "allowedEvents": events,
         "allowForks": allow_forks,
+        "expectedPrincipalId": expected_principal_id,
     });
     if let Some(repository_id) = &repository_id {
         policy_body["repositoryId"] = serde_json::Value::String(repository_id.clone());
     }
-    let result = super::auth::execute_lpm_with_bearer(
-        registry_client,
-        lpm_auth::AuthRequirement::TokenRequired,
-        |registry_url, auth_token| {
+    let result =
+        super::auth::execute_lpm_with_bearer(registry_client, |registry_url, auth_token| {
             let policy_body = policy_body.clone();
             async move { create_oidc_policy(&registry_url, &auth_token, &policy_body).await }
-        },
-    )
-    .await?;
+        })
+        .await?;
     let policy_id = policy_id_from_response(&result)?;
 
     let wrapping_key = lpm_vault::crypto::get_or_create_wrapping_key()
         .map_err(|error| oidc_escrow_setup_error("retrieving the local wrapping key", &error))?;
     let wrapping_key_hex = hex::encode(wrapping_key);
-    super::auth::execute_sync_with_bearer(
-        registry_client,
-        lpm_auth::AuthRequirement::TokenRequired,
-        |registry_url, auth_token| {
-            let vault_id = vault_id.clone();
-            let wrapping_key_hex = wrapping_key_hex.clone();
-            async move {
-                lpm_vault::sync::upload_escrow_key(
-                    &registry_url,
-                    &auth_token,
-                    &vault_id,
-                    &wrapping_key_hex,
-                )
-                .await
-            }
-        },
-    )
+    super::auth::execute_sync_with_bearer(registry_client, |registry_url, auth_token| {
+        let vault_id = vault_id.clone();
+        let wrapping_key_hex = wrapping_key_hex.clone();
+        let expected_principal_id = expected_principal_id.clone();
+        async move {
+            lpm_vault::sync::upload_escrow_key(
+                &registry_url,
+                &auth_token,
+                &vault_id,
+                &wrapping_key_hex,
+                &expected_principal_id,
+            )
+            .await
+        }
+    })
     .await
     .map_err(|error| oidc_escrow_setup_error("uploading the wrapping key", &error.to_string()))?;
 
@@ -565,15 +572,12 @@ pub(super) async fn vars_oidc_list(
 ) -> Result<(), LpmError> {
     let vault_id = lpm_vault::vault_id::read_vault_id(project_dir)
         .ok_or_else(|| LpmError::Script("no vault configured".into()))?;
-    let result = super::auth::execute_lpm_with_bearer(
-        registry_client,
-        lpm_auth::AuthRequirement::TokenRequired,
-        |registry_url, auth_token| {
+    let result =
+        super::auth::execute_lpm_with_bearer(registry_client, |registry_url, auth_token| {
             let vault_id = vault_id.clone();
             async move { list_oidc_policies(&registry_url, &auth_token, &vault_id).await }
-        },
-    )
-    .await?;
+        })
+        .await?;
     let policies = result["policies"]
         .as_array()
         .ok_or_else(|| LpmError::Script("invalid OIDC policy list response".into()))?;
@@ -678,6 +682,8 @@ pub(super) async fn vars_oidc_pull(
     project_dir: &std::path::Path,
     json_output: bool,
 ) -> Result<(), LpmError> {
+    registry_client.validate_base_url()?;
+
     let vault_id = resolve_oidc_pull_vault_id(project_dir)?;
 
     let registry_url = registry_client.base_url().to_owned();
@@ -940,8 +946,42 @@ mod oidc_error_hint_tests {
 
     use super::{
         build_oidc_exchange_body, build_oidc_pull_error_message, format_oidc_dotenv,
-        write_oidc_dotenv_file_with,
+        vars_oidc_pull, write_oidc_dotenv_file_with,
     };
+
+    #[tokio::test]
+    async fn oidc_pull_rejects_cleartext_non_loopback_registry_before_local_resolution() {
+        let project = tempfile::tempdir().unwrap();
+        let client = lpm_registry::RegistryClient::new().with_base_url("http://192.0.2.1:3000");
+
+        let error = vars_oidc_pull(&client, &[], project.path(), false)
+            .await
+            .expect_err("cleartext non-loopback Registry must be rejected");
+
+        let message = error.to_string();
+        assert!(message.contains("HTTPS"), "unexpected error: {message}");
+        assert!(
+            !message.contains("no vault configured"),
+            "transport validation must run before vault resolution: {message}"
+        );
+    }
+
+    #[test]
+    fn oidc_pull_transport_accepts_secure_loopback_and_explicitly_insecure_registries() {
+        let clients = [
+            lpm_registry::RegistryClient::new().with_base_url("https://registry.example"),
+            lpm_registry::RegistryClient::new().with_base_url("http://127.0.0.1:3000"),
+            lpm_registry::RegistryClient::new()
+                .with_base_url("http://registry.example")
+                .with_insecure(true),
+        ];
+
+        for client in clients {
+            client
+                .validate_base_url()
+                .expect("OIDC pull transport should accept this Registry URL");
+        }
+    }
 
     #[test]
     fn default_exchange_request_omits_the_optional_environment() {

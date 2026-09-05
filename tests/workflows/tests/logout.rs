@@ -147,7 +147,10 @@ async fn logout_json_fails_when_lpm_token_remains_in_the_process_environment() {
 async fn logout_revoke_uses_the_stored_session_when_lpm_token_is_active() {
     let project = TempProject::empty(r#"{"name":"logout-mixed-auth","version":"1.0.0"}"#);
     let mock = MockRegistry::start().await;
-    mock.with_revoke_all_pairings_for("stored-access").await;
+    mock.with_current_principal("stored-access", "account-1", 1)
+        .await;
+    mock.with_revoke_all_pairings_for_principal_status("stored-access", "account-1", 200, 1)
+        .await;
     mock.with_revoke_token("stored-access").await;
     seed_sessions(
         project.home(),
@@ -203,7 +206,9 @@ async fn logout_revoke_refreshes_stale_stored_access_without_expiry_metadata() {
         1,
     )
     .await;
-    mock.with_revoke_all_pairings_for_status("rotated-access", 200, 1)
+    mock.with_current_principal("rotated-access", "account-1", 1)
+        .await;
+    mock.with_revoke_all_pairings_for_principal_status("rotated-access", "account-1", 200, 1)
         .await;
     mock.with_revoke_token("rotated-access").await;
     seed_sessions(
@@ -248,6 +253,7 @@ async fn logout_revoke_refreshes_stale_stored_access_without_expiry_metadata() {
         paths,
         vec![
             "/api/cli/refresh",
+            "/api/users/me/public-key",
             "/api/vault/pair/revoke-all",
             "/api/cli/revoke",
         ],
@@ -259,8 +265,18 @@ async fn logout_revoke_refreshes_stale_stored_access_without_expiry_metadata() {
 async fn logout_revoke_reports_when_stored_session_presence_cannot_be_determined() {
     let project = TempProject::empty(r#"{"name":"logout-presence-failure","version":"1.0.0"}"#);
     let mock = MockRegistry::start().await;
-    std::fs::create_dir_all(credentials_path(project.home()))
-        .expect("create unreadable credential store shape");
+    seed_sessions(
+        project.home(),
+        &[SessionSeed {
+            registry_url: &mock.url(),
+            access_token: Some("access-primary"),
+            refresh_token: Some("refresh-primary"),
+            session_access_expires_at: Some("2030-01-01T00:00:00Z"),
+        }],
+    );
+    let credentials = credentials_path(project.home());
+    std::fs::remove_file(&credentials).expect("replace authoritative credential store");
+    std::fs::create_dir(&credentials).expect("create unreadable credential store shape");
 
     let output = lpm_with_registry(&project, &mock.url())
         .args(["--json", "logout", "--revoke"])
@@ -297,7 +313,10 @@ async fn logout_revoke_reports_when_stored_session_presence_cannot_be_determined
 async fn logout_revoke_human_output_uses_slim_phase_then_done() {
     let project = TempProject::empty(r#"{"name":"logout","version":"1.0.0"}"#);
     let mock = MockRegistry::start().await;
-    mock.with_revoke_all_pairings().await;
+    mock.with_current_principal("access-primary", "account-1", 1)
+        .await;
+    mock.with_revoke_all_pairings_for_principal_status("access-primary", "account-1", 200, 1)
+        .await;
     mock.with_revoke_token("access-primary").await;
 
     seed_sessions(
@@ -352,7 +371,11 @@ async fn logout_revoke_human_output_uses_slim_phase_then_done() {
         .collect();
     assert_eq!(
         paths,
-        vec!["/api/vault/pair/revoke-all", "/api/cli/revoke"],
+        vec![
+            "/api/users/me/public-key",
+            "/api/vault/pair/revoke-all",
+            "/api/cli/revoke",
+        ],
         "pairings must be revoked before the session bearer"
     );
 }
@@ -361,7 +384,10 @@ async fn logout_revoke_human_output_uses_slim_phase_then_done() {
 async fn logout_revoke_json_remote_failure_is_nonzero_but_clears_local_once() {
     let project = TempProject::empty(r#"{"name":"logout","version":"1.0.0"}"#);
     let mock = MockRegistry::start().await;
-    mock.with_revoke_all_pairings_status(503).await;
+    mock.with_current_principal("access-primary", "account-1", 1)
+        .await;
+    mock.with_revoke_all_pairings_for_principal_status("access-primary", "account-1", 503, 1)
+        .await;
     mock.with_revoke_token("access-primary").await;
     seed_sessions(
         project.home(),
@@ -398,7 +424,10 @@ async fn logout_all_revoke_remote_failure_still_clears_every_local_registry_cred
     let project = TempProject::empty(r#"{"name":"logout","version":"1.0.0"}"#);
     let mock = MockRegistry::start().await;
     let custom_registry = "https://packages.example.internal/npm";
-    mock.with_revoke_all_pairings_status(503).await;
+    mock.with_current_principal("access-primary", "account-1", 1)
+        .await;
+    mock.with_revoke_all_pairings_for_principal_status("access-primary", "account-1", 503, 1)
+        .await;
     mock.with_revoke_token("access-primary").await;
 
     seed_sessions(

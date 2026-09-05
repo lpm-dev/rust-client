@@ -1372,6 +1372,7 @@ dependencies = [
  "cfg-if",
  "cpufeatures 0.2.17",
  "curve25519-dalek-derive",
+ "digest 0.10.7",
  "fiat-crypto",
  "rustc_version",
  "subtle",
@@ -1707,6 +1708,30 @@ dependencies = [
  "rfc6979",
  "signature",
  "spki",
+]
+
+[[package]]
+name = "ed25519"
+version = "2.2.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "115531babc129696a58c64a4fef0a8bf9e9698629fb97e9e40767d235cfbcd53"
+dependencies = [
+ "pkcs8",
+ "signature",
+]
+
+[[package]]
+name = "ed25519-dalek"
+version = "2.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "70e796c081cee67dc755e1a36a0a172b897fab85fc3f6bc48307991f64e4eca9"
+dependencies = [
+ "curve25519-dalek",
+ "ed25519",
+ "serde",
+ "sha2",
+ "subtle",
+ "zeroize",
 ]
 
 [[package]]
@@ -3295,7 +3320,6 @@ dependencies = [
  "objc2-local-authentication",
  "rand 0.8.6",
  "reqwest",
- "scrypt",
  "secrecy",
  "security-framework 3.7.0",
  "serde",
@@ -3424,7 +3448,6 @@ dependencies = [
  "reqwest",
  "rustix",
  "same-file",
- "scrypt",
  "secrecy",
  "serde",
  "serde_json",
@@ -4016,13 +4039,14 @@ dependencies = [
  "base64",
  "cap-fs-ext",
  "cap-std",
+ "chrono",
  "core-foundation 0.10.1",
  "dirs",
+ "ed25519-dalek",
  "elliptic-curve",
  "futures",
  "hex",
  "hkdf",
- "hmac",
  "keyring",
  "libc",
  "lpm-common",
@@ -4030,7 +4054,6 @@ dependencies = [
  "p256",
  "rand 0.8.6",
  "reqwest",
- "scrypt",
  "security-framework 3.7.0",
  "security-framework-sys",
  "serde",
@@ -4079,7 +4102,6 @@ dependencies = [
  "rcgen",
  "reqwest",
  "rmp-serde",
- "scrypt",
  "serde",
  "serde_json",
  "sha2",
@@ -5130,17 +5152,6 @@ dependencies = [
  "redox_syscall",
  "smallvec",
  "windows-link",
-]
-
-[[package]]
-name = "password-hash"
-version = "0.5.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "346f04948ba92c43e8469c1ee6736c7563d71012b17d40745260fe106aac2166"
-dependencies = [
- "base64ct",
- "rand_core 0.6.4",
- "subtle",
 ]
 
 [[package]]
@@ -6332,7 +6343,6 @@ version = "0.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0516a385866c09368f0b5bcd1caff3366aace790fcd46e2bb032697bb172fd1f"
 dependencies = [
- "password-hash",
  "pbkdf2",
  "salsa20",
  "sha2",

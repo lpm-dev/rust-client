@@ -27,13 +27,11 @@ pub(super) async fn env_rotate_key(
         .ok_or_else(|| LpmError::Script("no vault configured".into()))?;
     let expected_principal_id = manifest
         .vault
-        .personal_sync_principal_for_registry(client.base_url())
+        .personal_expected_principal_for_registry(client.base_url())
         .map_err(LpmError::Script)?;
 
-    let (pulled, pulled_registry_url) = super::auth::execute_sync_with_bearer(
-        client,
-        lpm_auth::AuthRequirement::TokenRequired,
-        |registry_url, auth_token| {
+    let (pulled, pulled_registry_url) =
+        super::auth::execute_sync_with_bearer(client, |registry_url, auth_token| {
             let vault_id = vault_id.clone();
             let expected_principal_id = expected_principal_id.clone();
             async move {
@@ -46,9 +44,8 @@ pub(super) async fn env_rotate_key(
                 .await?;
                 Ok((pulled, registry_url))
             }
-        },
-    )
-    .await?;
+        })
+        .await?;
     let environment_names =
         validate_rotation_payload(&pulled.raw_json).map_err(LpmError::Script)?;
     let raw_json = std::sync::Arc::new(pulled.raw_json);
@@ -60,10 +57,8 @@ pub(super) async fn env_rotate_key(
         output::info("rotating vault encryption key...");
     }
 
-    let (result, registry_url) = super::auth::execute_sync_with_bearer(
-        client,
-        lpm_auth::AuthRequirement::TokenRequired,
-        |registry_url, auth_token| {
+    let (result, registry_url) =
+        super::auth::execute_sync_with_bearer(client, |registry_url, auth_token| {
             let vault_id = vault_id.clone();
             let raw_json = std::sync::Arc::clone(&raw_json);
             let pulled_registry_url = pulled_registry_url.clone();
@@ -102,9 +97,8 @@ pub(super) async fn env_rotate_key(
                 }
                 Ok((result, registry_url))
             }
-        },
-    )
-    .await?;
+        })
+        .await?;
 
     let version = result
         .version
@@ -249,10 +243,8 @@ async fn env_rotate_org_key(
         output::info("rotating organization env encryption key...");
     }
 
-    let (result, registry_url) = super::auth::execute_sync_with_bearer(
-        client,
-        lpm_auth::AuthRequirement::TokenRequired,
-        |registry_url, auth_token| {
+    let (result, registry_url) =
+        super::auth::execute_sync_with_bearer(client, |registry_url, auth_token| {
             let vault_id = vault_id.clone();
             let raw_json = std::sync::Arc::clone(&raw_json);
             let pulled_registry_url = pulled_registry_url.clone();
@@ -300,9 +292,8 @@ async fn env_rotate_org_key(
                 .await?;
                 Ok((result, registry_url))
             }
-        },
-    )
-    .await?;
+        })
+        .await?;
     let version = result
         .version
         .ok_or_else(|| LpmError::Script("rotation response omitted the new version".into()))?;
@@ -407,7 +398,6 @@ impl<'de> serde::de::Visitor<'de> for RotationPayloadVisitor {
         A: serde::de::MapAccess<'de>,
     {
         let mut environment_names = None;
-        let mut legacy_contains_non_string = false;
         while let Some(key) = map.next_key::<String>()? {
             if key == "environments" {
                 if environment_names.is_some() {
@@ -416,8 +406,10 @@ impl<'de> serde::de::Visitor<'de> for RotationPayloadVisitor {
                     ));
                 }
                 environment_names = Some(map.next_value::<RotationEnvironments>()?.names);
-            } else if !map.next_value::<DiscardedValueKind>()?.is_string {
-                legacy_contains_non_string = true;
+            } else {
+                return Err(serde::de::Error::custom(format!(
+                    "rotation payload: remote vault payload contains unknown field {key:?}"
+                )));
             }
         }
         if let Some(mut names) = environment_names {
@@ -427,14 +419,9 @@ impl<'de> serde::de::Visitor<'de> for RotationPayloadVisitor {
                 environment_names: names,
             });
         }
-        if legacy_contains_non_string {
-            return Err(serde::de::Error::custom(
-                "rotation payload: legacy flat remote vault payload contains a non-string secret value",
-            ));
-        }
-        Ok(RotationPayload {
-            environment_names: vec!["default".to_string()],
-        })
+        Err(serde::de::Error::custom(
+            "rotation payload: remote vault payload must contain environments",
+        ))
     }
 
     fn visit_bool<E>(self, _value: bool) -> Result<Self::Value, E>
@@ -767,84 +754,6 @@ impl<'de> serde::de::Visitor<'de> for RotationSecretValueVisitor<'_> {
     }
 }
 
-struct DiscardedValueKind {
-    is_string: bool,
-}
-
-impl<'de> serde::Deserialize<'de> for DiscardedValueKind {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        deserializer.deserialize_any(DiscardedValueKindVisitor)
-    }
-}
-
-struct DiscardedValueKindVisitor;
-
-impl<'de> serde::de::Visitor<'de> for DiscardedValueKindVisitor {
-    type Value = DiscardedValueKind;
-
-    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str("any JSON value")
-    }
-
-    fn visit_borrowed_str<E>(self, _value: &'de str) -> Result<Self::Value, E> {
-        Ok(DiscardedValueKind { is_string: true })
-    }
-
-    fn visit_str<E>(self, _value: &str) -> Result<Self::Value, E> {
-        Ok(DiscardedValueKind { is_string: true })
-    }
-
-    fn visit_string<E>(self, _value: String) -> Result<Self::Value, E> {
-        Ok(DiscardedValueKind { is_string: true })
-    }
-
-    fn visit_bool<E>(self, _value: bool) -> Result<Self::Value, E> {
-        Ok(DiscardedValueKind { is_string: false })
-    }
-
-    fn visit_i64<E>(self, _value: i64) -> Result<Self::Value, E> {
-        Ok(DiscardedValueKind { is_string: false })
-    }
-
-    fn visit_u64<E>(self, _value: u64) -> Result<Self::Value, E> {
-        Ok(DiscardedValueKind { is_string: false })
-    }
-
-    fn visit_f64<E>(self, _value: f64) -> Result<Self::Value, E> {
-        Ok(DiscardedValueKind { is_string: false })
-    }
-
-    fn visit_unit<E>(self) -> Result<Self::Value, E> {
-        Ok(DiscardedValueKind { is_string: false })
-    }
-
-    fn visit_none<E>(self) -> Result<Self::Value, E> {
-        Ok(DiscardedValueKind { is_string: false })
-    }
-
-    fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
-    where
-        A: serde::de::SeqAccess<'de>,
-    {
-        while sequence.next_element::<serde::de::IgnoredAny>()?.is_some() {}
-        Ok(DiscardedValueKind { is_string: false })
-    }
-
-    fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
-    where
-        A: serde::de::MapAccess<'de>,
-    {
-        while map
-            .next_entry::<serde::de::IgnoredAny, serde::de::IgnoredAny>()?
-            .is_some()
-        {}
-        Ok(DiscardedValueKind { is_string: false })
-    }
-}
-
 pub(super) async fn sharing_key_and_member_access_for_org_op(
     client: &lpm_registry::RegistryClient,
     org_slug: &str,
@@ -852,17 +761,14 @@ pub(super) async fn sharing_key_and_member_access_for_org_op(
 ) -> Result<([u8; 32], lpm_vault::sync::OrgMemberKeyAccess), LpmError> {
     use lpm_vault::sync::PublicKeyRegistrationState;
 
-    let (access, registry_url) = super::auth::execute_sync_with_bearer(
-        client,
-        lpm_auth::AuthRequirement::TokenRequired,
-        |registry_url, auth_token| async move {
+    let (access, registry_url) =
+        super::auth::execute_sync_with_bearer(client, |registry_url, auth_token| async move {
             let access =
                 lpm_vault::sync::get_org_member_key_access(&registry_url, &auth_token, org_slug)
                     .await?;
             Ok((access, registry_url))
-        },
-    )
-    .await?;
+        })
+        .await?;
     let state =
         lpm_vault::sync::resolve_public_key_state_from_member_access(&registry_url, &access)
             .map_err(|error| LpmError::Script(error.to_string()))?;
@@ -903,10 +809,8 @@ async fn register_missing_sharing_key_for_org(
          password (and authenticator code, if enrolled) to authorize the write."
     ));
     let proof = crate::step_up::request_cli_step_up_proof(client, "vault:public-key:set").await?;
-    let (refreshed_access, refreshed_registry_url) = super::auth::execute_sync_with_bearer(
-        client,
-        lpm_auth::AuthRequirement::TokenRequired,
-        |registry_url, auth_token| {
+    let (refreshed_access, refreshed_registry_url) =
+        super::auth::execute_sync_with_bearer(client, |registry_url, auth_token| {
             let public_key = local.public_key_b64.clone();
             let proof = proof.clone();
             let expected_principal_id = initial_access.caller_user_id.clone();
@@ -922,9 +826,8 @@ async fn register_missing_sharing_key_for_org(
                 .await?;
                 Ok((access, registry_url))
             }
-        },
-    )
-    .await?;
+        })
+        .await?;
     if refreshed_registry_url != initial_registry_url {
         return Err(LpmError::Script(
             "the active registry changed during sharing-key registration; retry the command".into(),
@@ -1018,40 +921,36 @@ pub(super) async fn pull_org_with_local_key_first(
     use lpm_vault::sync::PublicKeyRegistrationState;
 
     let expected_principal_id = expected_principal_id.map(str::to_owned);
-    let initial = super::auth::execute_sync_with_bearer(
-        client,
-        lpm_auth::AuthRequirement::TokenRequired,
-        |registry_url, auth_token| {
-            let vault_id = vault_id.to_owned();
-            let expected_principal_id = expected_principal_id.clone();
-            async move {
-                match lpm_vault::sync::pull_org_with_scoped_key_bound_to_principal(
-                    &registry_url,
-                    &auth_token,
-                    org_slug,
-                    &vault_id,
-                    expected_principal_id.as_deref(),
-                )
-                .await
-                {
-                    Ok(pulled) => Ok(OrgPullAttempt::Pulled(pulled, registry_url)),
-                    Err(error) => {
-                        if let Some((organization_id, caller_user_id)) =
-                            error.org_member_rewrap_identity()
-                        {
-                            Ok(OrgPullAttempt::MemberNeedsRewrap {
-                                organization_id: organization_id.to_owned(),
-                                caller_user_id: caller_user_id.to_owned(),
-                                registry_url,
-                            })
-                        } else {
-                            Err(error)
-                        }
+    let initial = super::auth::execute_sync_with_bearer(client, |registry_url, auth_token| {
+        let vault_id = vault_id.to_owned();
+        let expected_principal_id = expected_principal_id.clone();
+        async move {
+            match lpm_vault::sync::pull_org_with_scoped_key_bound_to_principal(
+                &registry_url,
+                &auth_token,
+                org_slug,
+                &vault_id,
+                expected_principal_id.as_deref(),
+            )
+            .await
+            {
+                Ok(pulled) => Ok(OrgPullAttempt::Pulled(pulled, registry_url)),
+                Err(error) => {
+                    if let Some((organization_id, caller_user_id)) =
+                        error.org_member_rewrap_identity()
+                    {
+                        Ok(OrgPullAttempt::MemberNeedsRewrap {
+                            organization_id: organization_id.to_owned(),
+                            caller_user_id: caller_user_id.to_owned(),
+                            registry_url,
+                        })
+                    } else {
+                        Err(error)
                     }
                 }
             }
-        },
-    )
+        }
+    })
     .await?;
 
     let (initial_organization_id, initial_caller_user_id, initial_registry_url) = match initial {
@@ -1063,17 +962,14 @@ pub(super) async fn pull_org_with_local_key_first(
         } => (organization_id, caller_user_id, registry_url),
     };
 
-    let (access, access_registry_url) = super::auth::execute_sync_with_bearer(
-        client,
-        lpm_auth::AuthRequirement::TokenRequired,
-        |registry_url, auth_token| async move {
+    let (access, access_registry_url) =
+        super::auth::execute_sync_with_bearer(client, |registry_url, auth_token| async move {
             let access =
                 lpm_vault::sync::get_org_member_key_access(&registry_url, &auth_token, org_slug)
                     .await?;
             Ok((access, registry_url))
-        },
-    )
-    .await?;
+        })
+        .await?;
     if access_registry_url != initial_registry_url {
         return Err(LpmError::Script(
             "the active registry changed during sharing-key recovery; retry the command".into(),
@@ -1112,25 +1008,21 @@ pub(super) async fn pull_org_with_local_key_first(
     let expected_organization_id = initial_organization_id;
     let expected_organization_id_for_pull = expected_organization_id.clone();
 
-    let result = super::auth::execute_sync_with_bearer(
-        client,
-        lpm_auth::AuthRequirement::TokenRequired,
-        |registry_url, auth_token| {
-            let vault_id = vault_id.to_owned();
-            let expected_organization_id = expected_organization_id_for_pull.clone();
-            async move {
-                let pulled = lpm_vault::sync::pull_org_with_scoped_key_bound_to_principal(
-                    &registry_url,
-                    &auth_token,
-                    org_slug,
-                    &vault_id,
-                    Some(&expected_organization_id),
-                )
-                .await?;
-                Ok((pulled, registry_url))
-            }
-        },
-    )
+    let result = super::auth::execute_sync_with_bearer(client, |registry_url, auth_token| {
+        let vault_id = vault_id.to_owned();
+        let expected_organization_id = expected_organization_id_for_pull.clone();
+        async move {
+            let pulled = lpm_vault::sync::pull_org_with_scoped_key_bound_to_principal(
+                &registry_url,
+                &auth_token,
+                org_slug,
+                &vault_id,
+                Some(&expected_organization_id),
+            )
+            .await?;
+            Ok((pulled, registry_url))
+        }
+    })
     .await?;
     ensure_pulled_organization_identity(&expected_organization_id, &result.0)?;
     Ok(result)
@@ -1158,16 +1050,13 @@ pub(super) async fn env_rotate_sharing_key(
         ));
     }
 
-    let (server_key, registry_url) = super::auth::execute_sync_with_bearer(
-        client,
-        lpm_auth::AuthRequirement::TokenRequired,
-        |registry_url, auth_token| async move {
+    let (server_key, registry_url) =
+        super::auth::execute_sync_with_bearer(client, |registry_url, auth_token| async move {
             let state =
                 lpm_vault::sync::get_my_public_key_state(&registry_url, &auth_token).await?;
             Ok((state, registry_url))
-        },
-    )
-    .await?;
+        })
+        .await?;
     let key_scope = lpm_vault::sync::SharingKeyScope::new(&registry_url, &server_key.principal_id)
         .map_err(LpmError::Script)?;
     let _rotation_lock = lpm_vault::sync::try_acquire_sharing_key_rotation_lock(&key_scope)
@@ -1182,11 +1071,8 @@ pub(super) async fn env_rotate_sharing_key(
     // Crash recovery — if a pending key exists and matches the server,
     // the previous run committed the server side but didn't promote
     // locally. Promote and return; no second rotation needed.
-    if let Some(pending) = lpm_vault::sync::read_pending_x25519_keypair(
-        &key_scope,
-        server_key.public_key_b64.as_deref(),
-    )
-    .map_err(LpmError::Script)?
+    if let Some(pending) =
+        lpm_vault::sync::read_pending_x25519_keypair(&key_scope).map_err(LpmError::Script)?
     {
         if server_key.public_key_b64.as_deref() == Some(&pending.public_key_b64) {
             lpm_vault::sync::promote_pending_x25519_keypair(&key_scope)
@@ -1256,31 +1142,27 @@ pub(super) async fn env_rotate_sharing_key(
     let expected_principal_id = server_key.principal_id.clone();
 
     output::info("uploading new sharing key...");
-    let response = super::auth::execute_sync_with_bearer(
-        client,
-        lpm_auth::AuthRequirement::TokenRequired,
-        |registry_url, auth_token| {
-            let public_key = pending.public_key_b64.clone();
-            let proof = proof.clone();
-            let expected_registry_url = expected_registry_url.clone();
-            let expected_principal_id = expected_principal_id.clone();
-            async move {
-                if registry_url != expected_registry_url {
-                    return Err(lpm_vault::sync::SyncError::from(
-                        "the active registry changed during sharing-key rotation",
-                    ));
-                }
-                lpm_vault::sync::upload_public_key(
-                    &registry_url,
-                    &auth_token,
-                    &expected_principal_id,
-                    &public_key,
-                    Some(&proof),
-                )
-                .await
+    let response = super::auth::execute_sync_with_bearer(client, |registry_url, auth_token| {
+        let public_key = pending.public_key_b64.clone();
+        let proof = proof.clone();
+        let expected_registry_url = expected_registry_url.clone();
+        let expected_principal_id = expected_principal_id.clone();
+        async move {
+            if registry_url != expected_registry_url {
+                return Err(lpm_vault::sync::SyncError::from(
+                    "the active registry changed during sharing-key rotation",
+                ));
             }
-        },
-    )
+            lpm_vault::sync::upload_public_key(
+                &registry_url,
+                &auth_token,
+                &expected_principal_id,
+                &public_key,
+                Some(&proof),
+            )
+            .await
+        }
+    })
     .await;
 
     let response = match response {
@@ -1419,9 +1301,16 @@ mod tests {
             .unwrap(),
             ["dev", "production"]
         );
+    }
+
+    #[test]
+    fn rotation_payload_streaming_validation_rejects_retired_flat_payload() {
+        let error = validate_rotation_payload(r#"{"TOKEN":"secret","ESCAPED":"line\nvalue"}"#)
+            .expect_err("retired flat payloads must not remain executable");
+
         assert_eq!(
-            validate_rotation_payload(r#"{"TOKEN":"secret","ESCAPED":"line\nvalue"}"#).unwrap(),
-            ["default"]
+            error,
+            "remote vault payload contains unknown field \"TOKEN\""
         );
     }
 
@@ -1447,7 +1336,7 @@ mod tests {
             ),
             (
                 r#"{"TOKEN":false}"#,
-                "legacy flat remote vault payload contains a non-string secret value",
+                "remote vault payload contains unknown field \"TOKEN\"",
             ),
         ] {
             let error = validate_rotation_payload(payload).expect_err("shape must be rejected");
@@ -1470,8 +1359,10 @@ mod tests {
 
     #[test]
     fn rotation_payload_streaming_validation_rejects_trailing_json() {
-        let error = validate_rotation_payload(r#"{"TOKEN":"secret"}{"TOKEN":"other"}"#)
-            .expect_err("a second JSON value must be rejected");
+        let error = validate_rotation_payload(
+            r#"{"environments":{"production":{"TOKEN":"secret"}}}{"environments":{"production":{"TOKEN":"other"}}}"#,
+        )
+        .expect_err("a second JSON value must be rejected");
 
         assert!(
             error.starts_with("remote vault payload is not valid JSON: trailing characters"),

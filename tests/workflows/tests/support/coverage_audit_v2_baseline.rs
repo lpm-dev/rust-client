@@ -161,7 +161,7 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
             "search across paginated result sets",
         ],
         json_contract_depth: JsonContractDepth::InstaSnapshot,
-        scenarios_by_file: &[("tests/workflows/tests/search.rs", 3)],
+        scenarios_by_file: &[("tests/workflows/tests/search.rs", 4)],
         last_audited_at: "2026-05-14",
     },
     // ── id 3: lpm quality <pkg> ──
@@ -2285,7 +2285,7 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
             "sharing-key rotation-required refusal",
         ],
         json_contract_depth: JsonContractDepth::SemanticAsserts,
-        scenarios_by_file: &[("tests/workflows/tests/env_vault.rs", 2)],
+        scenarios_by_file: &[("tests/workflows/tests/env_vault.rs", 3)],
         last_audited_at: "2026-06-11",
     },
     // ── id 104: lpm env pair ──

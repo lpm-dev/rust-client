@@ -2,7 +2,7 @@
 //! `lib.rs`, `keychain.rs`, and the `sync/` modules.
 //!
 //! Several test helpers mutate process-wide env vars (`HOME`,
-//! `LPM_FORCE_FILE_VAULT`, `LPM_TEST_FAST_SCRYPT`,
+//! `LPM_FORCE_FILE_VAULT`,
 //! `LPM_TEST_SYNC_TIMEOUT_MS`) inside
 //! `unsafe { std::env::set_var(...) }` blocks. Because the env table
 //! is process-global, every such mutation must be serialised across

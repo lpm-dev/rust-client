@@ -442,7 +442,7 @@ pub static VAULT_STORAGE_FALLBACK: CheckEntry = CheckEntry {
     category: Category::Auth,
     tier: Tier::Fast,
     description: "Vault secrets are encrypted with an on-disk key file (~/.lpm/.vault-fallback-key, \
-         0600) using AES-256-GCM + scrypt. The fallback path is correct cryptographically, \
+         0600) using a random 256-bit key and AES-256-GCM. The fallback path is correct cryptographically, \
          but any process running as your user can read the key file and decrypt the vault — \
          there is no per-app ACL the way macOS Keychain provides. This is a documented \
          platform limitation, not a bug.",
@@ -462,7 +462,7 @@ pub static VAULT_STORAGE_UNAVAILABLE: CheckEntry = CheckEntry {
     category: Category::Auth,
     tier: Tier::Fast,
     description: "Encrypted vault files exist locally, but LPM CLI cannot access either the OS-protected \
-         vault data key or the legacy encrypted-file fallback key.",
+         vault data key or the encrypted-file fallback key.",
     when_fires: "Running on Linux or Windows with local vault blobs present and no usable local \
          data-key source.",
     remediation: "Unlock Secret Service/Credential Manager, repair the OS secure store, or restore \

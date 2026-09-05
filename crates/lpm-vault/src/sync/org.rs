@@ -8,14 +8,16 @@ use super::personal::{
 };
 use super::public_key::{
     MemberPublicKey, SharingKeyScope, get_org_member_key_access_with_client,
-    public_key_fingerprint, resolve_local_public_key_state_for_fingerprint,
+    public_key_fingerprint, resolve_local_public_key_state,
 };
 #[cfg(all(test, debug_assertions))]
 use super::recipient_set::acceptance_digest;
-use super::recipient_set::{PreparedRecipient, enforce_recipient_trust, prepare_recipients};
+#[cfg(test)]
+use super::recipient_set::prepare_recipients;
+use super::recipient_set::{
+    PreparedRecipient, enforce_recipient_trust, prepare_authenticated_recipients,
+};
 use crate::crypto;
-
-const MAX_ORG_VAULT_SHARE_MEMBERS: usize = 10_000;
 
 const fn is_false(value: &bool) -> bool {
     !*value
@@ -34,8 +36,13 @@ pub struct PulledOrgVault {
     pub caller_user_id: String,
 }
 
-struct DecryptedOrgVault {
-    pulled: PulledOrgVault,
+struct AuthenticatedOrgVaultKey {
+    encrypted_blob: String,
+    version: i32,
+    crypto_version: i32,
+    content_key_version: i32,
+    principal_id: String,
+    caller_user_id: String,
     content_key: [u8; 32],
 }
 
@@ -120,10 +127,9 @@ pub async fn org_version_preflight_bound_to_principal(
             .get(url)
             .bearer_auth(auth_token)
             .timeout(std::time::Duration::from_secs(30)),
-        auth_token,
         vault_id,
         SyncScope::Organization(org_slug),
-        SyncEnvelopePolicy::CurrentOnly,
+        SyncEnvelopePolicy::Inspect,
     )
     .await?
     {
@@ -142,16 +148,12 @@ pub async fn org_version_preflight_bound_to_principal(
                 "organization env version response omitted the vault version",
             )?))
         }
-        SyncHttpResponse::Error { status, body } => {
-            let parsed = serde_json::from_slice::<OrgPullError>(&body).ok();
-            if status == reqwest::StatusCode::NOT_FOUND
-                && parsed.as_ref().and_then(|error| error.error.as_deref())
-                    == Some("Vault not found")
-            {
+        SyncHttpResponse::Error { status, response } => {
+            if status == reqwest::StatusCode::NOT_FOUND && response.outcome == "missing" {
                 return Ok(None);
             }
-            let message = parsed
-                .and_then(|error| error.error)
+            let message = response
+                .error
                 .unwrap_or_else(|| format!("server error: {status}"));
             Err(SyncError::http(status, message))
         }
@@ -188,7 +190,7 @@ pub async fn pull_org_bound_to_principal(
     expected_principal_id: Option<&str>,
 ) -> Result<PulledOrgVault, SyncError> {
     let client = sync_http_client()?;
-    Ok(pull_org_with_content_key(
+    pull_org_with_content_key(
         client,
         registry_url,
         auth_token,
@@ -197,8 +199,7 @@ pub async fn pull_org_bound_to_principal(
         Some(private_key),
         expected_principal_id,
     )
-    .await?
-    .pulled)
+    .await
 }
 
 pub async fn pull_org_with_scoped_key_bound_to_principal(
@@ -209,7 +210,7 @@ pub async fn pull_org_with_scoped_key_bound_to_principal(
     expected_principal_id: Option<&str>,
 ) -> Result<PulledOrgVault, SyncError> {
     let client = sync_http_client()?;
-    Ok(pull_org_with_content_key(
+    pull_org_with_content_key(
         client,
         registry_url,
         auth_token,
@@ -218,8 +219,7 @@ pub async fn pull_org_with_scoped_key_bound_to_principal(
         None,
         expected_principal_id,
     )
-    .await?
-    .pulled)
+    .await
 }
 
 async fn pull_org_with_content_key(
@@ -230,7 +230,46 @@ async fn pull_org_with_content_key(
     vault_id: &str,
     private_key: Option<&[u8; 32]>,
     expected_principal_id: Option<&str>,
-) -> Result<DecryptedOrgVault, SyncError> {
+) -> Result<PulledOrgVault, SyncError> {
+    let current = fetch_org_with_content_key(
+        client,
+        registry_url,
+        auth_token,
+        org_slug,
+        vault_id,
+        private_key,
+        expected_principal_id,
+    )
+    .await?;
+    let plaintext = crypto::decrypt_vault_payload(
+        &current.content_key,
+        &current.encrypted_blob,
+        crypto::VaultScope::Organization(org_slug),
+        &current.principal_id,
+        vault_id,
+        current.version,
+        current.crypto_version,
+    )?;
+    let json = String::from_utf8(plaintext).map_err(|e| format!("utf8 error: {e}"))?;
+
+    Ok(PulledOrgVault {
+        raw_json: json,
+        version: current.version,
+        content_key_version: current.content_key_version,
+        principal_id: current.principal_id,
+        caller_user_id: current.caller_user_id,
+    })
+}
+
+async fn fetch_org_with_content_key(
+    client: &reqwest::Client,
+    registry_url: &str,
+    auth_token: &str,
+    org_slug: &str,
+    vault_id: &str,
+    private_key: Option<&[u8; 32]>,
+    expected_principal_id: Option<&str>,
+) -> Result<AuthenticatedOrgVaultKey, SyncError> {
     let url = format!(
         "{registry_url}/api/orgs/{}/vaults/{}",
         url_path_segment(org_slug),
@@ -242,7 +281,6 @@ async fn pull_org_with_content_key(
             .get(&url)
             .bearer_auth(auth_token)
             .timeout(std::time::Duration::from_secs(30)),
-        auth_token,
         vault_id,
         SyncScope::Organization(org_slug),
         SyncEnvelopePolicy::Pull,
@@ -250,38 +288,31 @@ async fn pull_org_with_content_key(
     .await?
     {
         SyncHttpResponse::Success(data) => data,
-        SyncHttpResponse::Error { status, body } => {
-            let message = std::str::from_utf8(&body).unwrap_or("");
-            let parsed = serde_json::from_slice::<OrgPullError>(&body).ok();
-            let code = parsed.as_ref().and_then(|error| error.code.clone());
-            let rewrap_identity = parsed.as_ref().and_then(|error| {
-                let organization_id = error.organization_id.as_deref()?;
-                let caller_user_id = error.caller_user_id.as_deref()?;
-                if error.code.as_deref() == Some("vault_member_needs_rewrap")
-                    && super::public_key::is_canonical_organization_id(organization_id)
-                    && !caller_user_id.is_empty()
-                    && caller_user_id.len() <= 256
-                    && !caller_user_id.chars().any(char::is_control)
-                {
-                    Some((organization_id.to_owned(), caller_user_id.to_owned()))
-                } else {
-                    None
-                }
-            });
+        SyncHttpResponse::Error { status, response } => {
+            let code = response.code.clone();
+            let rewrap_identity = (code.as_deref() == Some("vault_member_needs_rewrap"))
+                .then(|| {
+                    Some((
+                        response.principal_id.clone()?,
+                        response.caller_user_id.clone()?,
+                    ))
+                })
+                .flatten();
             let (organization_id, caller_user_id) = rewrap_identity.unzip();
             return Err(SyncError::http_with_rewrap_identity(
                 status,
                 code,
                 organization_id,
                 caller_user_id,
-                format!("server error: {message}"),
+                response
+                    .error
+                    .unwrap_or_else(|| format!("server error: {status}")),
             ));
         }
     };
 
     let principal_id = data
         .principal_id
-        .as_deref()
         .ok_or("organization env response omitted the principal ID")?;
     if expected_principal_id.is_some_and(|expected| expected != principal_id) {
         return Err(
@@ -291,11 +322,9 @@ async fn pull_org_with_content_key(
     }
     let encrypted_blob = data
         .encrypted_blob
-        .as_deref()
         .ok_or("organization env response omitted encrypted data")?;
     let wrapped_key = data
         .wrapped_key
-        .as_deref()
         .ok_or("organization env response omitted the wrapped key")?;
     let version = data
         .version
@@ -311,18 +340,13 @@ async fn pull_org_with_content_key(
         .ok_or("organization env response omitted the recipient key version")?;
     let recipient_public_key_fingerprint = data
         .recipient_public_key_fingerprint
-        .as_deref()
         .ok_or("organization env response omitted the recipient key fingerprint")?;
     let caller_user_id = data
         .caller_user_id
-        .as_deref()
         .ok_or("organization env response omitted the authenticated caller ID")?;
     let scoped_local_key = if private_key.is_none() {
-        let scope = SharingKeyScope::new(registry_url, caller_user_id)?;
-        Some(resolve_local_public_key_state_for_fingerprint(
-            &scope,
-            recipient_public_key_fingerprint,
-        )?)
+        let scope = SharingKeyScope::new(registry_url, &caller_user_id)?;
+        Some(resolve_local_public_key_state(&scope)?)
     } else {
         None
     };
@@ -344,37 +368,17 @@ async fn pull_org_with_content_key(
     }
 
     // Unwrap AES key with our X25519 private key, then decrypt
-    let content_key = crypto::unwrap_key_from_sender(wrapped_key, private_key)?;
-    let plaintext = crypto::decrypt_vault_payload(
-        &content_key,
+    let content_key = crypto::unwrap_key_from_sender(&wrapped_key, private_key)?;
+
+    Ok(AuthenticatedOrgVaultKey {
         encrypted_blob,
-        crypto::VaultScope::Organization(org_slug),
-        principal_id,
-        vault_id,
         version,
         crypto_version,
-    )?;
-    let json = String::from_utf8(plaintext).map_err(|e| format!("utf8 error: {e}"))?;
-
-    Ok(DecryptedOrgVault {
-        pulled: PulledOrgVault {
-            raw_json: json,
-            version,
-            content_key_version,
-            principal_id: principal_id.to_owned(),
-            caller_user_id: caller_user_id.to_owned(),
-        },
+        content_key_version,
+        principal_id,
+        caller_user_id,
         content_key,
     })
-}
-
-#[derive(serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct OrgPullError {
-    error: Option<String>,
-    code: Option<String>,
-    organization_id: Option<String>,
-    caller_user_id: Option<String>,
 }
 
 /// Push an organization env project while preserving the caller's key-management boundary.
@@ -442,7 +446,7 @@ async fn push_org_with_member_access_boundary(
     let expected_version = request.expected_version.ok_or_else(|| {
         "organization maintainers must pull the current env project before updating it".to_string()
     })?;
-    let current = pull_org_with_content_key(
+    let current = fetch_org_with_content_key(
         client,
         registry_url,
         auth_token,
@@ -452,19 +456,28 @@ async fn push_org_with_member_access_boundary(
         Some(&access.organization_id),
     )
     .await?;
-    if current.pulled.principal_id != access.organization_id {
+    if current.principal_id != access.organization_id {
         return Err("organization principal changed during env update; fetch current organization access and retry".into());
     }
-    if current.pulled.caller_user_id != access.caller_user_id {
+    if current.caller_user_id != access.caller_user_id {
         return Err("authenticated caller changed during env update; fetch current organization access and retry".into());
     }
-    if current.pulled.version != expected_version {
+    if current.version != expected_version {
         return Err(format!(
             "organization env version changed from {expected_version} to {}; pull and retry",
-            current.pulled.version
+            current.version
         )
         .into());
     }
+    crypto::authenticate_vault_payload(
+        &current.content_key,
+        &current.encrypted_blob,
+        crypto::VaultScope::Organization(request.org_slug),
+        &current.principal_id,
+        request.vault_id,
+        current.version,
+        current.crypto_version,
+    )?;
     let target_revision = crypto::next_sync_revision(Some(expected_version))?;
     let encrypted_blob = crypto::encrypt_vault_payload(
         &current.content_key,
@@ -543,8 +556,9 @@ async fn push_org_with_member_access(
     caller_user_id: &str,
     members: &[MemberPublicKey],
 ) -> Result<PushResponse, SyncError> {
-    let members_with_keys = select_members_with_keys(members)?;
-    let recipients = prepare_recipients(&members_with_keys)?;
+    const MAX_RECREATION_ATTEMPTS: usize = 3;
+
+    let recipients = prepare_authenticated_recipients(members)?;
     enforce_recipient_trust(
         registry_url,
         organization_id,
@@ -552,33 +566,73 @@ async fn push_org_with_member_access(
         &recipients,
         request.recipient_set_acceptance,
     )?;
-    let target_revision = crypto::next_sync_revision(request.expected_version)?;
-
+    let retained_floor = request.expected_version;
+    let mut expected_version = request.expected_version;
+    let attempt_limit = if request.recreate_missing {
+        MAX_RECREATION_ATTEMPTS
+    } else {
+        1
+    };
     let aes_key = crypto::generate_aes_key();
-    let encrypted_blob = crypto::encrypt_vault_payload(
-        &aes_key,
-        request.secrets_json.as_bytes(),
-        crypto::VaultScope::Organization(request.org_slug),
-        organization_id,
-        request.vault_id,
-        target_revision,
-    )?;
-
     let wrapped_keys = wrap_keys_for_members(&aes_key, &recipients)?;
 
-    post_org_update(
-        client,
-        registry_url,
-        auth_token,
-        PreparedOrgUpdate {
-            request,
+    for attempt in 0..attempt_limit {
+        let attempt_request = OrgPushRequest {
+            expected_version,
+            ..request
+        };
+        let target_revision = crypto::next_sync_revision(expected_version)?;
+        let encrypted_blob = crypto::encrypt_vault_payload(
+            &aes_key,
+            request.secrets_json.as_bytes(),
+            crypto::VaultScope::Organization(request.org_slug),
             organization_id,
-            caller_user_id,
-            encrypted_blob,
-            wrapped_keys: Some(wrapped_keys),
-        },
-    )
-    .await
+            request.vault_id,
+            target_revision,
+        )?;
+
+        match post_org_update(
+            client,
+            registry_url,
+            auth_token,
+            PreparedOrgUpdate {
+                request: attempt_request,
+                organization_id,
+                caller_user_id,
+                encrypted_blob,
+                wrapped_keys: Some(&wrapped_keys),
+            },
+        )
+        .await
+        {
+            Ok(result) => return Ok(result),
+            Err(error) if request.recreate_missing => {
+                let Some(server_floor) = error.recreation_conflict_floor() else {
+                    return Err(error);
+                };
+                if let Some(retained_floor) = retained_floor
+                    && server_floor < retained_floor
+                {
+                    return Err(format!(
+                        "cloud env version {server_floor} is older than the durable local version {retained_floor}"
+                    )
+                    .into());
+                }
+                if attempt + 1 == attempt_limit {
+                    return Err(SyncError::http(
+                        reqwest::StatusCode::CONFLICT,
+                        format!(
+                            "organization env recreation could not acquire a stable cloud revision after {attempt_limit} attempts; retry when concurrent writes stop"
+                        ),
+                    ));
+                }
+                expected_version = Some(server_floor);
+            }
+            Err(error) => return Err(error),
+        }
+    }
+
+    Err("organization env recreation exhausted its bounded conflict retries".into())
 }
 
 struct PreparedOrgUpdate<'request, 'identity, 'recipient> {
@@ -586,7 +640,7 @@ struct PreparedOrgUpdate<'request, 'identity, 'recipient> {
     organization_id: &'identity str,
     caller_user_id: &'identity str,
     encrypted_blob: String,
-    wrapped_keys: Option<Vec<WrappedMemberKey<'recipient>>>,
+    wrapped_keys: Option<&'recipient [WrappedMemberKey<'recipient>]>,
 }
 
 async fn post_org_update(
@@ -615,7 +669,7 @@ async fn post_org_update(
         expected_caller_user_id: caller_user_id,
         crypto_version: crypto::CURRENT_CRYPTO_VERSION,
         ciphertext_revision: target_revision,
-        wrapped_keys: wrapped_keys.as_deref(),
+        wrapped_keys,
         expected_version: request.expected_version,
         force: request.recreate_missing,
         recreate_missing: request.recreate_missing,
@@ -629,20 +683,31 @@ async fn post_org_update(
             .bearer_auth(auth_token)
             .json(&body)
             .timeout(std::time::Duration::from_secs(30)),
-        auth_token,
         request.vault_id,
         SyncScope::Organization(request.org_slug),
-        SyncEnvelopePolicy::CurrentOnly,
+        SyncEnvelopePolicy::Write,
     )
     .await?
     {
         SyncHttpResponse::Success(result) => result,
-        SyncHttpResponse::Error { status, body } => {
-            let message = serde_json::from_slice::<PushResponse>(&body).map_or_else(
-                |_| format!("server error: {status}"),
-                |result| format_push_error(&result, status),
-            );
-            return Err(SyncError::http(status, message));
+        SyncHttpResponse::Error { status, response } => {
+            let result = PushResponse {
+                version: response.version,
+                principal_id: response.principal_id,
+                content_key_version: response.content_key_version,
+                status: response.status,
+                error: response.error,
+                code: response.code,
+                server_version: response.server_version,
+                hint: response.hint,
+            };
+            let message = format_push_error(&result, status);
+            return Err(SyncError::http_with_sync_conflict(
+                status,
+                result.code,
+                result.server_version,
+                message,
+            ));
         }
     };
     if result.version != Some(target_revision) {
@@ -662,44 +727,6 @@ async fn post_org_update(
         server_version: result.server_version,
         hint: result.hint,
     })
-}
-
-fn select_members_with_keys(members: &[MemberPublicKey]) -> Result<Vec<&MemberPublicKey>, String> {
-    if members.len() > MAX_ORG_VAULT_SHARE_MEMBERS {
-        return Err("organization vault sharing exceeds the 10,000-member limit".to_owned());
-    }
-
-    let mut members_with_keys = Vec::with_capacity(members.len());
-    for member in members {
-        if !member.has_public_key {
-            if member.public_key.is_some()
-                || member.public_key_version.is_some()
-                || member.public_key_fingerprint.is_some()
-            {
-                return Err(format!(
-                    "inconsistent public-key state for organization member {}",
-                    member.user_id
-                ));
-            }
-            continue;
-        }
-        if member.public_key.is_none()
-            || member.public_key_version.is_none()
-            || member.public_key_fingerprint.is_none()
-        {
-            return Err(format!(
-                "organization member {} has an incomplete public-key binding",
-                member.user_id
-            ));
-        }
-        members_with_keys.push(member);
-    }
-
-    if members_with_keys.is_empty() {
-        return Err("no org members have registered public keys. Each member needs to run `lpm env share --org <slug>` once to generate their keypair.".into());
-    }
-
-    Ok(members_with_keys)
 }
 
 fn wrap_keys_for_members<'recipient>(
@@ -744,7 +771,8 @@ mod tests {
     const TEST_ORGANIZATION_ID: &str = "00000000-0000-4000-8000-000000000001";
     #[cfg(debug_assertions)]
     use crate::sync::test_support::{
-        IsolatedVaultKeyEnv, SignedSyncResponse, TestSyncScope, env_lock_guard,
+        IsolatedVaultKeyEnv, SignedEnvelopeResponse, SignedSyncResponse, TestSyncScope,
+        env_lock_guard, signed_envelope_response, signed_envelope_response_with,
         signed_sync_ok_response, signed_sync_ok_response_with,
     };
     use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
@@ -759,34 +787,73 @@ mod tests {
 
     #[cfg(debug_assertions)]
     fn substitute_organization_slug(body: &mut serde_json::Value) {
-        body["organizationSlug"] = "other-org".into();
+        body["binding"]["organizationSlug"] = "other-org".into();
     }
 
     #[cfg(debug_assertions)]
     fn substitute_organization_principal(body: &mut serde_json::Value) {
-        body["principalId"] = "00000000-0000-4000-8000-000000000002".into();
+        body["binding"]["principalId"] = "00000000-0000-4000-8000-000000000002".into();
     }
 
     #[cfg(debug_assertions)]
     fn substitute_caller_user(body: &mut serde_json::Value) {
-        body["callerUserId"] = "other-caller".into();
+        body["binding"]["callerUserId"] = "other-caller".into();
     }
 
     #[cfg(debug_assertions)]
     fn set_maintainer_caller_user(body: &mut serde_json::Value) {
-        body["callerUserId"] = "user-maintainer".into();
+        body["binding"]["callerUserId"] = "user-maintainer".into();
     }
 
     #[cfg(debug_assertions)]
     fn remove_caller_user(body: &mut serde_json::Value) {
-        body.as_object_mut()
-            .expect("signed response must be an object")
+        body["binding"]
+            .as_object_mut()
+            .expect("signed binding must be an object")
             .remove("callerUserId");
     }
 
     #[cfg(debug_assertions)]
     fn invalidate_caller_user(body: &mut serde_json::Value) {
-        body["callerUserId"] = "caller\nsubstitution".into();
+        body["binding"]["callerUserId"] = "caller\nsubstitution".into();
+    }
+
+    #[cfg(debug_assertions)]
+    fn organization_binding(vault_id: &str, caller_user_id: &str) -> serde_json::Value {
+        serde_json::json!({
+            "scope": "organization",
+            "principalId": TEST_ORGANIZATION_ID,
+            "callerUserId": caller_user_id,
+            "organizationSlug": "acme",
+            "vaultId": vault_id,
+        })
+    }
+
+    #[cfg(debug_assertions)]
+    fn signed_member_inventory(
+        caller_user_id: &str,
+        can_replace_wrapped_keys: bool,
+        members: serde_json::Value,
+    ) -> crate::sync::test_support::SignedEnvelopeResponse {
+        signed_envelope_response(
+            200,
+            "organization.memberKeys.read",
+            "current",
+            serde_json::json!({
+                "scope": "organization",
+                "principalId": TEST_ORGANIZATION_ID,
+                "callerUserId": caller_user_id,
+                "organizationSlug": "acme",
+            }),
+            serde_json::json!({
+                "capability": if can_replace_wrapped_keys {
+                    "replaceWrappedKeysAllowed"
+                } else {
+                    "replaceWrappedKeysForbidden"
+                },
+                "members": members,
+            }),
+        )
     }
 
     fn registered_member(
@@ -795,14 +862,7 @@ mod tests {
         public_key: [u8; 32],
         public_key_version: i32,
     ) -> MemberPublicKey {
-        MemberPublicKey {
-            user_id: user_id.into(),
-            role: role.into(),
-            public_key: Some(BASE64.encode(public_key)),
-            public_key_version: Some(public_key_version),
-            public_key_fingerprint: Some(public_key_fingerprint(&public_key)),
-            has_public_key: true,
-        }
+        MemberPublicKey::with_test_key(user_id, role, public_key, public_key_version)
     }
 
     #[cfg(debug_assertions)]
@@ -819,7 +879,7 @@ mod tests {
                     "cryptoVersion": crypto::CURRENT_CRYPTO_VERSION,
                     "contentKeyVersion": 1,
                     "recipientPublicKeyVersion": 1,
-                    "recipientPublicKeyFingerprint": "not-the-local-key",
+                    "recipientPublicKeyFingerprint": "a".repeat(64),
                 }),
                 "auth-token",
                 "vault-principal",
@@ -927,7 +987,7 @@ mod tests {
         let server = MockServer::start().await;
         let scope = SharingKeyScope::new(&server.uri(), "organization-test-caller")
             .expect("sharing key scope");
-        let local = crate::sync::public_key::resolve_local_public_key_state(&scope, None)
+        let local = crate::sync::public_key::resolve_local_public_key_state(&scope)
             .expect("create scoped sharing key");
         let public_key =
             x25519_dalek::PublicKey::from(&x25519_dalek::StaticSecret::from(local.private_key));
@@ -974,7 +1034,7 @@ mod tests {
         let server = MockServer::start().await;
         let scope = SharingKeyScope::new(&server.uri(), "organization-test-caller")
             .expect("sharing key scope");
-        let local = crate::sync::public_key::resolve_local_public_key_state(&scope, None)
+        let local = crate::sync::public_key::resolve_local_public_key_state(&scope)
             .expect("create scoped sharing key");
         let public_key =
             x25519_dalek::PublicKey::from(&x25519_dalek::StaticSecret::from(local.private_key));
@@ -1063,7 +1123,11 @@ mod tests {
             .await
             .expect_err("an invalid signed caller identity must fail closed");
 
-            assert!(error.to_string().contains("caller identity"), "{error}");
+            let message = error.to_string();
+            assert!(
+                message.contains("callerUserId") || message.contains("caller user ID"),
+                "{error}"
+            );
         }
     }
 
@@ -1073,12 +1137,16 @@ mod tests {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path("/api/orgs/acme/vaults/vault-rewrap"))
-            .respond_with(ResponseTemplate::new(403).set_body_json(serde_json::json!({
-                "error": "Member needs rewrap",
-                "code": "vault_member_needs_rewrap",
-                "organizationId": "00000000-0000-4000-8000-000000000001",
-                "callerUserId": "11111111-1111-4111-8111-111111111111",
-            })))
+            .respond_with(signed_envelope_response(
+                403,
+                "vault.pull",
+                "memberRewrapRequired",
+                organization_binding("vault-rewrap", "11111111-1111-4111-8111-111111111111"),
+                serde_json::json!({
+                    "revision": 7,
+                    "contentKeyVersion": 3,
+                }),
+            ))
             .expect(1)
             .mount(&server)
             .await;
@@ -1109,10 +1177,17 @@ mod tests {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path("/api/orgs/acme/vaults/vault-rewrap"))
-            .respond_with(ResponseTemplate::new(403).set_body_json(serde_json::json!({
-                "error": "Member needs rewrap",
-                "code": "vault_member_needs_rewrap",
-            })))
+            .respond_with(signed_envelope_response_with(
+                403,
+                "vault.pull",
+                "memberRewrapRequired",
+                organization_binding("vault-rewrap", "user-caller"),
+                serde_json::json!({
+                    "revision": 7,
+                    "contentKeyVersion": 3,
+                }),
+                remove_caller_user,
+            ))
             .expect(1)
             .mount(&server)
             .await;
@@ -1127,7 +1202,7 @@ mod tests {
         .await
         .expect_err("unbound member rewrap response must fail closed");
 
-        assert!(error.has_http_code(403, "vault_member_needs_rewrap"));
+        assert!(!error.has_http_code(403, "vault_member_needs_rewrap"));
         assert_eq!(error.org_member_rewrap_identity(), None);
     }
 
@@ -1285,7 +1360,7 @@ mod tests {
 
         assert_eq!(
             error.to_string(),
-            "organization env response contains an invalid key/version binding"
+            "authenticated sync envelope requires a valid content key version"
         );
     }
 
@@ -1307,6 +1382,8 @@ mod tests {
             }
         }
 
+        let _guard = env_lock_guard();
+        let _isolated = IsolatedVaultKeyEnv::new();
         let server = MockServer::start().await;
         let captured_body = Arc::new(StdMutex::new(None));
         let (_, member_public_key) = crypto::generate_x25519_keypair();
@@ -1315,27 +1392,27 @@ mod tests {
         Mock::given(method("GET"))
             .and(path("/api/orgs/acme/members/public-keys"))
             .and(header("authorization", "Bearer auth-token"))
-            .respond_with(
-                ResponseTemplate::new(200)
-                    .insert_header("X-LPM-Organization-ID", TEST_ORGANIZATION_ID)
-                    .insert_header("X-LPM-Caller-User-ID", "user-keyed")
-                    .set_body_json(serde_json::json!([
-                        {
-                            "userId": "user-keyed",
-                            "role": "admin",
+            .respond_with(signed_member_inventory(
+                "user-keyed",
+                true,
+                serde_json::json!([
+                    {
+                        "userId": "user-keyed",
+                        "role": "admin",
+                        "sharingKey": {
+                            "algorithm": "X25519",
                             "publicKey": BASE64.encode(member_public_key),
-                            "publicKeyVersion": 7,
-                            "publicKeyFingerprint": member_fingerprint,
-                            "hasPublicKey": true
-                        },
-                        {
-                            "userId": "user-missing",
-                            "role": "developer",
-                            "publicKey": null,
-                            "hasPublicKey": false
+                            "version": 7,
+                            "fingerprint": member_fingerprint,
                         }
-                    ])),
-            )
+                    },
+                    {
+                        "userId": "user-missing",
+                        "role": "developer",
+                        "sharingKey": null,
+                    }
+                ]),
+            ))
             .expect(1)
             .mount(&server)
             .await;
@@ -1382,6 +1459,200 @@ mod tests {
 
     #[cfg(debug_assertions)]
     #[tokio::test]
+    async fn maintainer_push_rejects_a_wrapped_key_from_another_ciphertext() {
+        let server = MockServer::start().await;
+        let private_key = [43_u8; 32];
+        let public_key =
+            x25519_dalek::PublicKey::from(&x25519_dalek::StaticSecret::from(private_key));
+        let ciphertext_key = [19_u8; 32];
+        let substituted_key = [23_u8; 32];
+        let encrypted_blob = crypto::encrypt_vault_payload(
+            &ciphertext_key,
+            br#"{"environments":{"default":{"OLD":"value"}}}"#,
+            crypto::VaultScope::Organization("acme"),
+            TEST_ORGANIZATION_ID,
+            "vault-maintainer",
+            7,
+        )
+        .expect("encrypt current payload");
+        let current_body = serde_json::json!({
+            "encryptedBlob": encrypted_blob,
+            "wrappedKey": crypto::wrap_key_for_recipient(
+                &substituted_key,
+                public_key.as_bytes(),
+            )
+            .expect("wrap substituted content key"),
+            "version": 7,
+            "cryptoVersion": crypto::CURRENT_CRYPTO_VERSION,
+            "contentKeyVersion": 3,
+            "recipientPublicKeyVersion": 4,
+            "recipientPublicKeyFingerprint": public_key_fingerprint(public_key.as_bytes()),
+        });
+
+        Mock::given(method("GET"))
+            .and(path("/api/orgs/acme/members/public-keys"))
+            .respond_with(signed_member_inventory(
+                "user-maintainer",
+                false,
+                serde_json::json!([{
+                    "userId": "user-maintainer",
+                    "role": "maintainer",
+                    "sharingKey": null,
+                }]),
+            ))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/orgs/acme/vaults/vault-maintainer"))
+            .respond_with(signed_sync_ok_response_with(
+                current_body,
+                "auth-token",
+                "vault-maintainer",
+                TestSyncScope::Organization("acme".into()),
+                set_maintainer_caller_user,
+            ))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/orgs/acme/vaults/vault-maintainer"))
+            .respond_with(signed_sync_ok_response(
+                serde_json::json!({
+                    "version": 8,
+                    "contentKeyVersion": 3,
+                    "cryptoVersion": crypto::CURRENT_CRYPTO_VERSION,
+                    "status": "synced",
+                }),
+                "auth-token",
+                "vault-maintainer",
+                TestSyncScope::Organization("acme".into()),
+            ))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let error = push_org(
+            &server.uri(),
+            "auth-token",
+            OrgPushRequest {
+                org_slug: "acme",
+                vault_id: "vault-maintainer",
+                secrets_json: r#"{"environments":{"default":{"NEW":"value"}}}"#,
+                expected_version: Some(7),
+                recreate_missing: false,
+                metadata: None,
+                recipient_set_acceptance: None,
+            },
+            &private_key,
+        )
+        .await
+        .expect_err("a substituted content key must fail before upload");
+
+        assert!(error.to_string().contains("decryption failed"), "{error}");
+    }
+
+    #[cfg(debug_assertions)]
+    #[tokio::test]
+    async fn recreated_org_vault_retries_from_the_retained_server_floor() {
+        #[derive(Clone)]
+        struct ConflictThenSuccess {
+            attempts: Arc<std::sync::atomic::AtomicUsize>,
+            bodies: Arc<StdMutex<Vec<serde_json::Value>>>,
+            conflict: SignedEnvelopeResponse,
+            success: SignedSyncResponse,
+        }
+
+        impl Respond for ConflictThenSuccess {
+            fn respond(&self, request: &Request) -> ResponseTemplate {
+                self.bodies.lock().unwrap().push(
+                    serde_json::from_slice(&request.body).expect("org push body must be JSON"),
+                );
+                let attempt = self
+                    .attempts
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if attempt == 0 {
+                    return self.conflict.respond(request);
+                }
+                self.success.respond(request)
+            }
+        }
+
+        let _guard = env_lock_guard();
+        let _isolated = IsolatedVaultKeyEnv::new();
+        let server = MockServer::start().await;
+        let (_, member_public_key) = crypto::generate_x25519_keypair();
+        let recipient = registered_member("user-admin", "admin", member_public_key, 1);
+        let prepared = prepare_recipients(&[&recipient]).expect("prepare recipient");
+        let acceptance = acceptance_digest(&server.uri(), TEST_ORGANIZATION_ID, "acme", &prepared)
+            .expect("compute recipient acceptance");
+        let bodies = Arc::new(StdMutex::new(Vec::new()));
+        Mock::given(method("POST"))
+            .and(path("/api/orgs/acme/vaults/vault-recreate"))
+            .and(header("authorization", "Bearer auth-token"))
+            .respond_with(ConflictThenSuccess {
+                attempts: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                bodies: Arc::clone(&bodies),
+                conflict: signed_envelope_response(
+                    409,
+                    "vault.write",
+                    "revisionConflict",
+                    organization_binding("vault-recreate", "user-admin"),
+                    serde_json::json!({ "currentRevision": 7 }),
+                ),
+                success: signed_sync_ok_response(
+                    serde_json::json!({
+                        "version": 8,
+                        "cryptoVersion": crypto::CURRENT_CRYPTO_VERSION,
+                        "contentKeyVersion": 1,
+                        "status": "synced",
+                    }),
+                    "auth-token",
+                    "vault-recreate",
+                    TestSyncScope::Organization("acme".into()),
+                ),
+            })
+            .expect(2)
+            .mount(&server)
+            .await;
+        let access = super::super::public_key::OrgMemberKeyAccess {
+            organization_id: TEST_ORGANIZATION_ID.to_owned(),
+            caller_user_id: "user-admin".to_owned(),
+            members: vec![recipient],
+            can_replace_wrapped_keys: true,
+        };
+
+        let result = push_org_with_access(
+            &server.uri(),
+            "auth-token",
+            OrgPushRequest {
+                org_slug: "acme",
+                vault_id: "vault-recreate",
+                secrets_json: r#"{"environments":{"default":{"TOKEN":"secret"}}}"#,
+                expected_version: Some(5),
+                recreate_missing: true,
+                metadata: None,
+                recipient_set_acceptance: Some(&acceptance),
+            },
+            &[41_u8; 32],
+            &access,
+        )
+        .await
+        .expect("recreation must retry from the retained server floor");
+
+        assert_eq!(result.version, Some(8));
+        let bodies = bodies.lock().unwrap();
+        assert_eq!(bodies.len(), 2);
+        assert_eq!(bodies[0]["expectedVersion"], 5);
+        assert_eq!(bodies[0]["ciphertextRevision"], 6);
+        assert_eq!(bodies[1]["expectedVersion"], 7);
+        assert_eq!(bodies[1]["ciphertextRevision"], 8);
+        assert_ne!(bodies[0]["encryptedBlob"], bodies[1]["encryptedBlob"]);
+        assert_eq!(bodies[0]["wrappedKeys"], bodies[1]["wrappedKeys"]);
+    }
+
+    #[cfg(debug_assertions)]
+    #[tokio::test]
     async fn push_org_preserves_wrapped_keys_when_caller_cannot_replace_them() {
         #[derive(Clone)]
         struct CapturePushResponder {
@@ -1404,16 +1675,17 @@ mod tests {
         let public_key =
             x25519_dalek::PublicKey::from(&x25519_dalek::StaticSecret::from(private_key));
         let content_key = [17u8; 32];
+        let encrypted_blob = crypto::encrypt_vault_payload(
+            &content_key,
+            br#"{"environments":{"default":{"OLD":"value"}}}"#,
+            crypto::VaultScope::Organization("acme"),
+            TEST_ORGANIZATION_ID,
+            "vault-maintainer",
+            7,
+        )
+        .expect("encrypt current payload");
         let current_body = serde_json::json!({
-            "encryptedBlob": crypto::encrypt_vault_payload(
-                &content_key,
-                br#"{"environments":{"default":{"OLD":"value"}}}"#,
-                crypto::VaultScope::Organization("acme"),
-                TEST_ORGANIZATION_ID,
-                "vault-maintainer",
-                7,
-            )
-                .expect("encrypt current payload"),
+            "encryptedBlob": encrypted_blob,
             "wrappedKey": crypto::wrap_key_for_recipient(&content_key, public_key.as_bytes())
                 .expect("wrap current content key"),
             "version": 7,
@@ -1425,13 +1697,15 @@ mod tests {
 
         Mock::given(method("GET"))
             .and(path("/api/orgs/acme/members/public-keys"))
-            .respond_with(
-                ResponseTemplate::new(200)
-                    .insert_header("X-LPM-Organization-ID", TEST_ORGANIZATION_ID)
-                    .insert_header("X-LPM-Caller-User-ID", "user-maintainer")
-                    .insert_header("X-LPM-Org-Wrapped-Keys-Write", "forbidden")
-                    .set_body_json(serde_json::json!([])),
-            )
+            .respond_with(signed_member_inventory(
+                "user-maintainer",
+                false,
+                serde_json::json!([{
+                    "userId": "user-maintainer",
+                    "role": "maintainer",
+                    "sharingKey": null,
+                }]),
+            ))
             .expect(1)
             .mount(&server)
             .await;
@@ -1656,21 +1930,20 @@ mod tests {
 
             Mock::given(method("GET"))
                 .and(path("/api/orgs/acme/members/public-keys"))
-                .respond_with(
-                    ResponseTemplate::new(200)
-                        .insert_header("X-LPM-Organization-ID", TEST_ORGANIZATION_ID)
-                        .insert_header("X-LPM-Caller-User-ID", "user-1")
-                        .set_body_json(serde_json::json!([
-                            {
-                                "userId": "user-1",
-                                "role": "admin",
-                                "publicKey": BASE64.encode(member_public_key),
-                                "publicKeyVersion": 1,
-                                "publicKeyFingerprint": public_key_fingerprint(&member_public_key),
-                                "hasPublicKey": true
-                            }
-                        ])),
-                )
+                .respond_with(signed_member_inventory(
+                    "user-1",
+                    true,
+                    serde_json::json!([{
+                        "userId": "user-1",
+                        "role": "admin",
+                        "sharingKey": {
+                            "algorithm": "X25519",
+                            "publicKey": BASE64.encode(member_public_key),
+                            "version": 1,
+                            "fingerprint": public_key_fingerprint(&member_public_key),
+                        }
+                    }]),
+                ))
                 .expect(1)
                 .mount(&server)
                 .await;
@@ -1683,6 +1956,7 @@ mod tests {
                         serde_json::json!({
                             "version": 4,
                             "cryptoVersion": crypto::CURRENT_CRYPTO_VERSION,
+                            "contentKeyVersion": 1,
                             "status": "synced",
                         }),
                         "auth-token",
@@ -1815,21 +2089,20 @@ mod tests {
 
             Mock::given(method("GET"))
                 .and(path("/api/orgs/acme/members/public-keys"))
-                .respond_with(
-                    ResponseTemplate::new(200)
-                        .insert_header("X-LPM-Organization-ID", TEST_ORGANIZATION_ID)
-                        .insert_header("X-LPM-Caller-User-ID", "user-1")
-                        .set_body_json(serde_json::json!([
-                            {
-                                "userId": "user-1",
-                                "role": "admin",
-                                "publicKey": BASE64.encode(member_public_key),
-                                "publicKeyVersion": 1,
-                                "publicKeyFingerprint": public_key_fingerprint(&member_public_key),
-                                "hasPublicKey": true
-                            }
-                        ])),
-                )
+                .respond_with(signed_member_inventory(
+                    "user-1",
+                    true,
+                    serde_json::json!([{
+                        "userId": "user-1",
+                        "role": "admin",
+                        "sharingKey": {
+                            "algorithm": "X25519",
+                            "publicKey": BASE64.encode(member_public_key),
+                            "version": 1,
+                            "fingerprint": public_key_fingerprint(&member_public_key),
+                        }
+                    }]),
+                ))
                 .mount(&server)
                 .await;
 
@@ -1841,6 +2114,7 @@ mod tests {
                         serde_json::json!({
                             "version": 1,
                             "cryptoVersion": crypto::CURRENT_CRYPTO_VERSION,
+                            "contentKeyVersion": 1,
                             "status": "synced",
                         }),
                         "auth-token",
@@ -1900,38 +2174,25 @@ mod tests {
     #[test]
     fn wrap_keys_for_members_rejects_malformed_public_key_length() {
         let short_key = BASE64.encode([9u8; 31]);
-        let member = MemberPublicKey {
-            user_id: "user-short".into(),
-            role: "admin".into(),
-            public_key: Some(short_key),
-            public_key_version: Some(1),
-            public_key_fingerprint: Some("a".repeat(64)),
-            has_public_key: true,
-        };
-
-        let result = prepare_recipients(&[&member]);
+        let result = super::super::public_key::ValidatedSharingKey::from_authenticated(
+            short_key,
+            1,
+            "a".repeat(64),
+        );
 
         assert!(matches!(
             result,
-            Err(message)
-                if message == "invalid public key for user user-short: expected 32 bytes, got 31"
+            Err(message) if message == "authenticated response has an invalid sharing public key"
         ));
     }
 
     #[test]
     fn recipient_selection_rejects_more_than_ten_thousand_members() {
         let members = (0..=10_000)
-            .map(|index| MemberPublicKey {
-                user_id: format!("member-{index}"),
-                role: "member".to_owned(),
-                public_key: None,
-                public_key_version: None,
-                public_key_fingerprint: None,
-                has_public_key: false,
-            })
+            .map(|index| MemberPublicKey::without_test_key(format!("member-{index}"), "member"))
             .collect::<Vec<_>>();
 
-        let error = select_members_with_keys(&members).unwrap_err();
+        let error = prepare_authenticated_recipients(&members).unwrap_err();
 
         assert!(error.contains("10,000-member limit"));
     }
@@ -1944,7 +2205,7 @@ mod tests {
         let member_a = registered_member("user-a", "admin", public_a, 3);
         let member_b = registered_member("user-b", "developer", public_b, 5);
 
-        let recipients = prepare_recipients(&[&member_a, &member_b])
+        let recipients = super::super::recipient_set::prepare_recipients(&[&member_a, &member_b])
             .expect("valid recipients should prepare successfully");
         let result = wrap_keys_for_members(&aes_key, &recipients)
             .expect("valid member keys should wrap successfully");
@@ -1974,30 +2235,51 @@ mod tests {
         );
     }
 
+    #[cfg(debug_assertions)]
     #[test]
-    fn select_members_with_keys_skips_members_without_registered_keys() {
+    fn authenticated_sharing_keys_are_validated_once_through_trust_and_wrapping() {
+        let _guard = env_lock_guard();
+        let _isolated = IsolatedVaultKeyEnv::new();
+        super::super::public_key::reset_validated_sharing_key_count();
+        let aes_key = crypto::generate_aes_key();
+        let (_, public_a) = crypto::generate_x25519_keypair();
+        let (_, public_b) = crypto::generate_x25519_keypair();
+        let members = [
+            registered_member("user-a", "admin", public_a, 3),
+            registered_member("user-b", "developer", public_b, 5),
+        ];
+
+        let recipients =
+            prepare_authenticated_recipients(&members).expect("prepare authenticated recipients");
+        let registry_url = "https://registry.example";
+        let acceptance = acceptance_digest(registry_url, TEST_ORGANIZATION_ID, "acme", &recipients)
+            .expect("compute recipient acceptance");
+        enforce_recipient_trust(
+            registry_url,
+            TEST_ORGANIZATION_ID,
+            "acme",
+            &recipients,
+            Some(&acceptance),
+        )
+        .expect("persist authenticated recipient trust");
+        wrap_keys_for_members(&aes_key, &recipients).expect("wrap for authenticated recipients");
+
+        assert_eq!(
+            super::super::public_key::validated_sharing_key_count(),
+            members.len()
+        );
+    }
+
+    #[test]
+    fn authenticated_recipient_preparation_skips_members_without_registered_keys() {
         let aes_key = crypto::generate_aes_key();
         let (_, public_key) = crypto::generate_x25519_keypair();
         let member_with_key = registered_member("user-keyed", "admin", public_key, 1);
-        let member_without_key = MemberPublicKey {
-            user_id: "user-missing".into(),
-            role: "developer".into(),
-            public_key: None,
-            public_key_version: None,
-            public_key_fingerprint: None,
-            has_public_key: false,
-        };
+        let member_without_key = MemberPublicKey::without_test_key("user-missing", "developer");
 
-        let members = [member_without_key, member_with_key];
-
-        let selected = select_members_with_keys(&members)
-            .expect("at least one keyed member should keep org sharing enabled");
-
-        assert_eq!(selected.len(), 1);
-        assert_eq!(selected[0].user_id, "user-keyed");
-
-        let recipients =
-            prepare_recipients(&selected).expect("selected recipients should validate");
+        let members = [member_with_key, member_without_key];
+        let recipients = prepare_authenticated_recipients(&members)
+            .expect("authenticated inventory should prepare directly");
         let wrapped = wrap_keys_for_members(&aes_key, &recipients)
             .expect("only the keyed member should receive a wrapped AES key");
 
@@ -2007,23 +2289,33 @@ mod tests {
     }
 
     #[test]
-    fn select_members_with_keys_rejects_incomplete_registered_member_binding() {
-        let member = MemberPublicKey {
-            user_id: "user-incomplete".into(),
-            role: "developer".into(),
-            public_key: Some(BASE64.encode([7u8; 32])),
-            public_key_version: None,
-            public_key_fingerprint: None,
-            has_public_key: true,
-        };
+    fn authenticated_recipient_preparation_reserves_only_for_registered_keys() {
+        let (_, public_key) = crypto::generate_x25519_keypair();
+        let mut members = (0..9_999)
+            .map(|index| {
+                MemberPublicKey::without_test_key(format!("member-{index:05}"), "developer")
+            })
+            .collect::<Vec<_>>();
+        members.push(registered_member("member-09999", "admin", public_key, 1));
 
-        let error =
-            select_members_with_keys(&[member]).expect_err("incomplete bindings must fail closed");
+        let recipients = prepare_authenticated_recipients(&members)
+            .expect("sparse authenticated inventory should prepare");
 
-        assert_eq!(
-            error,
-            "organization member user-incomplete has an incomplete public-key binding"
-        );
+        assert_eq!(recipients.len(), 1);
+        assert_eq!(recipients.capacity(), 1);
+    }
+
+    #[test]
+    fn validated_sharing_key_rejects_a_nonpositive_version() {
+        let public_key = crate::crypto::x25519_public_from_private(&[7u8; 32]);
+        let error = super::super::public_key::ValidatedSharingKey::from_authenticated(
+            BASE64.encode(public_key),
+            0,
+            public_key_fingerprint(&public_key),
+        )
+        .expect_err("a nonpositive key version must fail closed");
+
+        assert!(error.contains("positive integer"));
     }
 
     #[test]

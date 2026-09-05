@@ -1,0 +1,30 @@
+{
+  "schemaVersion": 1,
+  "records": [
+    {
+      "account": "__vault_project_index_marker__",
+      "value": "{\"schemaVersion\":3,\"storageId\":\"01234567-89ab-cdef-0123-456789abcdef\",\"activeShards\":[42],\"writableShard\":42}"
+    },
+    {
+      "account": "__vault_project_metadata__:01234567-89ab-cdef-0123-456789abcdef:dmF1bHQtaWQ",
+      "value": "{\"schemaVersion\":3,\"storageId\":\"01234567-89ab-cdef-0123-456789abcdef\",\"id\":\"vault-id\",\"name\":\"Shared Project\",\"path\":\"/workspace/shared\",\"discoveryShard\":42,\"environmentSummaries\":[{\"name\":\"default\",\"keyCount\":1},{\"name\":\"production\",\"keyCount\":2}]}"
+    },
+    {
+      "account": "__vault_project_discovery__:01234567-89ab-cdef-0123-456789abcdef:02a",
+      "value": "{\"schemaVersion\":3,\"storageId\":\"01234567-89ab-cdef-0123-456789abcdef\",\"shard\":42,\"ids\":[\"vault-id\"]}"
+    },
+    {
+      "account": "vault-id",
+      "value": "{\"environments\":{\"default\":{\"TOKEN\":\"secret\"},\"production\":{\"API_KEY\":\"one\",\"URL\":\"two\"}}}"
+    }
+  ],
+  "project": {
+    "id": "vault-id",
+    "name": "Shared Project",
+    "path": "/workspace/shared",
+    "environmentSummaries": [
+      { "name": "default", "keyCount": 1 },
+      { "name": "production", "keyCount": 2 }
+    ]
+  }
+}

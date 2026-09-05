@@ -6,17 +6,17 @@ enum PushTarget {
 }
 
 fn parse_push_target(args: &[&str]) -> Result<PushTarget, LpmError> {
+    const PLATFORM_USAGE: &str = "usage: lpm env push --to <platform> [--org <org-slug>] [--env <environment>] [--clean] [--yes]";
     let command_args = args.get(1..).unwrap_or_default();
     let platform_selected = command_args
         .iter()
         .any(|argument| *argument == "--to" || argument.starts_with("--to="));
     if platform_selected {
-        if command_args.iter().any(|argument| {
-            *argument == "--org"
-                || argument.starts_with("--org=")
-                || *argument == "--oidc"
-                || argument.starts_with("--from")
-        }) {
+        super::platform::validate_platform_push_arguments(command_args, PLATFORM_USAGE)?;
+        if command_args
+            .iter()
+            .any(|argument| *argument == "--oidc" || argument.starts_with("--from"))
+        {
             return Err(LpmError::Script(
                 "platform push cannot be combined with another cloud scope selector".into(),
             ));
@@ -64,16 +64,12 @@ pub(super) async fn vars_push(
     }
 
     let config = manifest.config;
-    let empty_env_map = HashMap::new();
-    let env_map = config.as_ref().map_or(&empty_env_map, |c| &c.env);
-    let environments = config.as_ref().and_then(|c| c.environments.as_ref());
-    let non_empty_envs =
-        super::sync_payload::build_sync_environments(all_envs, env_map, environments);
+    let non_empty_envs = super::sync_payload::build_sync_environments(all_envs);
 
     let project_name = manifest.vault.project_name(project_dir);
     let expected_principal_id = manifest
         .vault
-        .personal_sync_principal_for_registry(client.base_url())
+        .personal_expected_principal_for_registry(client.base_url())
         .map_err(LpmError::Script)?;
 
     // Confirmation prompt
@@ -114,7 +110,6 @@ pub(super) async fn vars_push(
     let project_dir = project_dir.to_path_buf();
     let (result, registry_url) = super::auth::execute_sync_with_bearer(
         client,
-        lpm_auth::AuthRequirement::TokenRequired,
         |registry_url, auth_token| {
             let project_name = project_name.clone();
             let schema_value = std::sync::Arc::clone(&schema_value);
@@ -129,13 +124,15 @@ pub(super) async fn vars_push(
                     &registry_url,
                     expected_principal_id.as_deref(),
                 )?;
-                let expected_version = if let Some(expected_principal_id) = expected_principal_id.as_deref() {
+                let sync_principal_id = current_manifest
+                    .personal_sync_principal_for_registry(&registry_url)?;
+                let expected_version = if let Some(sync_principal_id) = sync_principal_id.as_deref() {
                     Some(
                         current_manifest
                             .personal_sync_version_for_principal(
                             lpm_vault::vault_id::SyncPrincipal {
                                 registry_url: &registry_url,
-                                principal_id: expected_principal_id,
+                                principal_id: sync_principal_id,
                             },
                         )
                             .ok_or_else(|| {
@@ -225,10 +222,20 @@ mod tests {
     #[test]
     fn push_rejects_conflicting_platform_scope_selectors() {
         for args in [
-            &["push", "--to=vercel", "--org=acme"][..],
             &["push", "--to", "vercel", "--oidc"][..],
+            &["push", "--to", "vercel", "--orgg", "acme", "--yes"][..],
+            &["push", "--to", "vercel", "stray"][..],
+            &["push", "--to", "vercel", "--to", "railway"][..],
         ] {
             assert!(parse_push_target(args).is_err(), "accepted {args:?}");
         }
+    }
+
+    #[test]
+    fn platform_push_accepts_an_explicit_organization_scope() {
+        let target = parse_push_target(&["push", "--to=vercel", "--org=acme"])
+            .expect("platform organization scope should parse");
+
+        assert!(matches!(target, PushTarget::Platform));
     }
 }

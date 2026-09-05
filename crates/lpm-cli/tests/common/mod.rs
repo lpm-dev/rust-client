@@ -46,8 +46,7 @@ use std::process::{Command, ExitStatus};
 use wiremock::matchers::{method, path as match_path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
-const TEST_AUTH_ENCRYPTION_KEY: &str =
-    "cli-binary-test-auth-key-0123456789abcdefghijklmnopqrstuvwxyz";
+const TEST_AUTH_ENCRYPTION_KEY: [u8; 32] = [0x4b; 32];
 
 #[derive(Clone)]
 pub struct MockPackageVersion {
@@ -129,7 +128,6 @@ pub fn lpm_command_with_env(
         .env("LPM_NO_UPDATE_CHECK", "1")
         .env("LPM_DISABLE_TELEMETRY", "1")
         .env("LPM_FORCE_FILE_AUTH", "1")
-        .env("LPM_TEST_FAST_SCRYPT", "1")
         .env("LPM_FORCE_FILE_VAULT", "1")
         .env("LPM_DISABLE_HOST_CLI_AUTH", "1")
         .env(
@@ -198,14 +196,14 @@ pub fn parse_json_stdout(stdout: &str) -> serde_json::Value {
 pub fn seed_lpm_token(home: &Path, registry_url: &str, token: &str) {
     let lpm_dir = home.join(".lpm");
     std::fs::create_dir_all(&lpm_dir).expect("create test auth directory");
-    std::fs::write(lpm_dir.join(".key"), TEST_AUTH_ENCRYPTION_KEY).expect("write test auth key");
-    std::fs::write(lpm_dir.join(".salt"), [7_u8; 32]).expect("write test auth salt");
+    std::fs::write(
+        lpm_dir.join(".key"),
+        format!("raw:{}", hex::encode(TEST_AUTH_ENCRYPTION_KEY)),
+    )
+    .expect("write test auth key");
 
-    let mut hasher = sha2::Sha256::new();
-    hasher.update(TEST_AUTH_ENCRYPTION_KEY.as_bytes());
-    hasher.update([7_u8; 32]);
-    let key = hasher.finalize();
-    let cipher = Aes256Gcm::new_from_slice(&key).expect("initialize test auth cipher");
+    let cipher =
+        Aes256Gcm::new_from_slice(&TEST_AUTH_ENCRYPTION_KEY).expect("initialize test auth cipher");
 
     let mut iv = [0_u8; 12];
     rand::thread_rng().fill_bytes(&mut iv);
@@ -223,6 +221,27 @@ pub fn seed_lpm_token(home: &Path, registry_url: &str, token: &str) {
         base64::engine::general_purpose::STANDARD.encode(encrypted),
     );
     std::fs::write(lpm_dir.join(".credentials"), encoded).expect("write test credential");
+
+    let mut credential_id = sha2::Sha256::new();
+    credential_id.update(b"access");
+    credential_id.update([0]);
+    credential_id.update(registry_url.as_bytes());
+    std::fs::write(
+        lpm_dir.join(".credential-authority.json"),
+        serde_json::to_vec(&serde_json::json!({
+            "version": 1,
+            "credentials": {
+                hex::encode(credential_id.finalize()): {
+                    "state": "active",
+                    "backend": "encrypted_file_fallback",
+                    "credential_digest": hex::encode(sha2::Sha256::digest(token.as_bytes())),
+                    "stale_file_cleanup_pending": false,
+                },
+            },
+        }))
+        .expect("serialize test credential authority"),
+    )
+    .expect("write test credential authority");
 }
 
 /// Path component for the mock-registry tarball route.

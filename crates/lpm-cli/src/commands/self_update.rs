@@ -158,10 +158,7 @@ pub async fn run(
         );
     }
 
-    let bundle_migration_needed =
-        macos_raw_standalone_requires_bundle_migration(&current_executable, &account_home);
-    if !should_install_update(current, &latest, channel, target_channel) && !bundle_migration_needed
-    {
+    if !should_install_update(current, &latest, channel, target_channel) {
         if json_output {
             let json = serde_json::json!({
                 "success": true,
@@ -2251,10 +2248,9 @@ fn macos_standalone_layout_for(
     let lpm_link = install_root.join("bin/lpm");
     let lpx_link = install_root.join("bin/lpx");
     let internal_executable = app_bundle.join(MACOS_INTERNAL_EXECUTABLE);
-    if current_executable != lpm_link && current_executable != internal_executable {
+    if current_executable != internal_executable {
         return Err(LpmError::SelfUpdate(format!(
-            "macOS standalone bundle migration supports only {} and {}; reinstall with https://github.com/lpm-dev/rust-client/blob/main/install.sh",
-            lpm_link.display(),
+            "macOS standalone updates require execution from {}; reinstall with https://github.com/lpm-dev/rust-client/blob/main/install.sh",
             internal_executable.display()
         )));
     }
@@ -2264,68 +2260,6 @@ fn macos_standalone_layout_for(
         lpm_link,
         lpx_link,
     })
-}
-
-#[cfg(target_os = "macos")]
-fn macos_raw_standalone_requires_bundle_migration(
-    current_executable: &Path,
-    account_home: &Path,
-) -> bool {
-    macos_standalone_layout_for(current_executable, account_home)
-        .is_ok_and(|layout| current_executable == layout.lpm_link)
-}
-
-#[cfg(not(target_os = "macos"))]
-fn macos_raw_standalone_requires_bundle_migration(
-    _current_executable: &Path,
-    _account_home: &Path,
-) -> bool {
-    false
-}
-
-#[cfg(target_os = "macos")]
-pub(crate) async fn migrate_raw_standalone_bundle_if_needed() -> Result<Option<PathBuf>, LpmError> {
-    let account_home = canonical_account_home()?;
-    let current_executable = canonical_current_executable()?;
-    if !macos_raw_standalone_requires_bundle_migration(&current_executable, &account_home) {
-        return Ok(None);
-    }
-
-    let layout = macos_standalone_layout_for(&current_executable, &account_home)?;
-    run(false, false, None).await?;
-
-    let internal_executable = layout.app_bundle.join(MACOS_INTERNAL_EXECUTABLE);
-    validate_macos_app_bundle(&layout.app_bundle)?;
-    let expected_executable = std::fs::canonicalize(&internal_executable).map_err(LpmError::Io)?;
-    let invoked_as_lpx = std::env::args_os()
-        .next()
-        .as_deref()
-        .and_then(|argument| Path::new(argument).file_name())
-        .is_some_and(|name| name == "lpx");
-    let launcher = if invoked_as_lpx {
-        layout.lpx_link
-    } else {
-        layout.lpm_link
-    };
-    if std::fs::canonicalize(&launcher).map_err(LpmError::Io)? != expected_executable {
-        return Err(LpmError::SelfUpdate(format!(
-            "migrated macOS launcher does not resolve to the signed app bundle: {}",
-            launcher.display()
-        )));
-    }
-    Ok(Some(launcher))
-}
-
-#[cfg(target_os = "macos")]
-pub(crate) fn reexec_migrated_macos_bundle(launcher: &Path) -> Result<(), LpmError> {
-    use std::os::unix::process::CommandExt as _;
-
-    let error = std::process::Command::new(launcher)
-        .args(std::env::args_os().skip(1))
-        .exec();
-    Err(LpmError::SelfUpdate(format!(
-        "could not restart LPM from the signed macOS app bundle: {error}"
-    )))
 }
 
 #[cfg(target_os = "macos")]
@@ -3507,20 +3441,17 @@ mod tests {
     }
 
     #[test]
-    fn macos_standalone_layout_accepts_raw_migration_and_bundle_execution_paths() {
+    fn macos_standalone_layout_accepts_only_bundle_execution_path() {
         let home = Path::new("/Users/alice");
         let root = home.join(".lpm");
         let expected_app = root.join("libexec/LPM CLI.app");
-        for current in [
-            root.join("bin/lpm"),
-            expected_app.join("Contents/MacOS/lpm-rs"),
-        ] {
-            let layout = macos_standalone_layout_for(&current, home).unwrap();
-            assert_eq!(layout.app_bundle, expected_app);
-            assert_eq!(layout.lpm_link, root.join("bin/lpm"));
-            assert_eq!(layout.lpx_link, root.join("bin/lpx"));
-        }
+        let current = expected_app.join("Contents/MacOS/lpm-rs");
+        let layout = macos_standalone_layout_for(&current, home).unwrap();
+        assert_eq!(layout.app_bundle, expected_app);
+        assert_eq!(layout.lpm_link, root.join("bin/lpm"));
+        assert_eq!(layout.lpx_link, root.join("bin/lpx"));
 
+        assert!(macos_standalone_layout_for(&root.join("bin/lpm"), home).is_err());
         assert!(macos_standalone_layout_for(Path::new("/usr/local/bin/lpm"), home).is_err());
     }
 

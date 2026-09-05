@@ -1399,6 +1399,14 @@ mod tests {
             .expect(1)
             .mount(&server)
             .await;
+        Mock::given(method("GET"))
+            .and(path("/repos/lpm-dev/example/actions/secrets"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "total_count": 0,
+                "secrets": []
+            })))
+            .mount(&server)
+            .await;
         let client = GitHubActionsClient::new("github-token".into(), config(None)).expect("client");
 
         let error = client
@@ -1406,7 +1414,10 @@ mod tests {
             .await
             .expect_err("an oversized remote value must fail closed");
 
-        assert!(error.to_string().contains("exceeds the 49152-byte limit"));
+        assert!(
+            error.to_string().contains("exceeds the 49152-byte limit"),
+            "{error}"
+        );
     }
 
     #[tokio::test]

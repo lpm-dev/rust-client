@@ -283,10 +283,9 @@ async fn read_current_push_version(
             .get(format!("{sync_url}?versionOnly=true"))
             .bearer_auth(auth_token)
             .timeout(sync_request_timeout(std::time::Duration::from_secs(30))),
-        auth_token,
         vault_id,
         SyncScope::Personal,
-        SyncEnvelopePolicy::CurrentOnly,
+        SyncEnvelopePolicy::Inspect,
     )
     .await?
     {
@@ -298,14 +297,13 @@ async fn read_current_push_version(
                 .principal_id
                 .ok_or("version preflight response omitted the principal ID")?,
         })),
-        SyncHttpResponse::Error { status, body } => {
-            let message = serde_json::from_slice::<PullResponse>(&body)
-                .ok()
-                .and_then(|result| result.error)
-                .unwrap_or_else(|| format!("server error: {status}"));
-            if status == reqwest::StatusCode::NOT_FOUND && message == "Vault not found" {
+        SyncHttpResponse::Error { status, response } => {
+            if status == reqwest::StatusCode::NOT_FOUND && response.outcome == "missing" {
                 Ok(None)
             } else {
+                let message = response
+                    .error
+                    .unwrap_or_else(|| format!("server error: {status}"));
                 Err(SyncError::http(status, message))
             }
         }
@@ -390,6 +388,15 @@ pub async fn push_raw_with_options(
                 None => stable_principal_id = Some(remote.principal_id.clone()),
                 _ => {}
             }
+            if let Some(durable_version) = options.expected_version
+                && remote.version < durable_version
+            {
+                return Err(format!(
+                    "cloud env version {} is older than the durable local version {durable_version}",
+                    remote.version
+                )
+                .into());
+            }
         }
 
         if stable_principal_id.is_none() {
@@ -432,10 +439,9 @@ pub async fn push_raw_with_options(
                 .bearer_auth(auth_token)
                 .json(&body)
                 .timeout(sync_request_timeout(std::time::Duration::from_secs(30))),
-            auth_token,
             vault_id,
             SyncScope::Personal,
-            SyncEnvelopePolicy::CurrentOnly,
+            SyncEnvelopePolicy::Write,
         )
         .await?
         {
@@ -460,47 +466,55 @@ pub async fn push_raw_with_options(
                     hint: result.hint,
                 });
             }
-            SyncHttpResponse::Error { status, body } => {
-                if let Ok(result) = serde_json::from_slice::<PushResponse>(&body) {
-                    let retryable_conflict = status == reqwest::StatusCode::CONFLICT
-                        && matches!(
-                            result.code.as_deref(),
-                            Some(
-                                "vault_version_conflict"
-                                    | "vault_expected_version_required"
-                                    | "vault_ciphertext_revision_mismatch"
-                                    | "vault_creation_conflict"
-                                    | "vault_recreation_intent_required"
-                            )
-                        );
-                    if options.force && retryable_conflict {
-                        if preflight.is_none()
-                            && let Some(server_version) = result.server_version
-                            && server_version > 0
-                        {
-                            forced_recreation_floor = Some(server_version);
-                        }
-                        if attempt + 1 < attempt_limit {
-                            continue;
-                        }
-                        return Err(SyncError::http(
-                            status,
-                            format!(
-                                "force push could not acquire a stable cloud revision after \
-                                 {attempt_limit} attempts; retry when concurrent writes stop"
-                            ),
-                        ));
-                    }
-                    return Err(SyncError::http(status, format_push_error(&result, status)));
-                }
-
-                let message = std::str::from_utf8(&body).unwrap_or("").trim();
-                let message = if message.is_empty() {
-                    format!("server error: {status}")
-                } else {
-                    message.to_string()
+            SyncHttpResponse::Error { status, response } => {
+                let result = PushResponse {
+                    version: response.version,
+                    principal_id: response.principal_id,
+                    content_key_version: response.content_key_version,
+                    status: response.status,
+                    error: response.error,
+                    code: response.code,
+                    server_version: response.server_version,
+                    hint: response.hint,
                 };
-                return Err(SyncError::http(status, message));
+                let retryable_conflict = status == reqwest::StatusCode::CONFLICT
+                    && matches!(
+                        result.code.as_deref(),
+                        Some(
+                            "vault_version_conflict"
+                                | "vault_expected_version_required"
+                                | "vault_ciphertext_revision_mismatch"
+                                | "vault_creation_conflict"
+                                | "vault_recreation_intent_required"
+                        )
+                    );
+                if options.force && retryable_conflict {
+                    if preflight.is_none()
+                        && let Some(server_version) = result.server_version
+                        && server_version > 0
+                    {
+                        if let Some(retained_floor) = forced_recreation_floor
+                            && server_version < retained_floor
+                        {
+                            return Err(format!(
+                                "cloud env version {server_version} is older than the durable local version {retained_floor}"
+                            )
+                            .into());
+                        }
+                        forced_recreation_floor = Some(server_version);
+                    }
+                    if attempt + 1 < attempt_limit {
+                        continue;
+                    }
+                    return Err(SyncError::http(
+                        status,
+                        format!(
+                            "force push could not acquire a stable cloud revision after \
+                             {attempt_limit} attempts; retry when concurrent writes stop"
+                        ),
+                    ));
+                }
+                return Err(SyncError::http(status, format_push_error(&result, status)));
             }
         }
     }
@@ -534,7 +548,6 @@ pub async fn pull_bound_to_principal(
             .get(&url)
             .bearer_auth(auth_token)
             .timeout(sync_request_timeout(std::time::Duration::from_secs(30))),
-        auth_token,
         vault_id,
         SyncScope::Personal,
         SyncEnvelopePolicy::Pull,
@@ -542,10 +555,9 @@ pub async fn pull_bound_to_principal(
     .await?
     {
         SyncHttpResponse::Success(result) => result,
-        SyncHttpResponse::Error { status, body } => {
-            let message = serde_json::from_slice::<PullResponse>(&body)
-                .ok()
-                .and_then(|result| result.error)
+        SyncHttpResponse::Error { status, response } => {
+            let message = response
+                .error
                 .unwrap_or_else(|| format!("server error: {status}"));
             return Err(SyncError::http(status, message));
         }
@@ -560,8 +572,12 @@ pub async fn pull_bound_to_principal(
         .encrypted_blob
         .ok_or("server returned no encrypted data")?;
     let wrapped_key = result.wrapped_key.ok_or("server returned no wrapped key")?;
-    let version = result.version.unwrap_or(0);
-    let crypto_version = result.crypto_version.unwrap_or(1);
+    let version = result
+        .version
+        .ok_or("server returned no authenticated revision")?;
+    let crypto_version = result
+        .crypto_version
+        .ok_or("server returned no authenticated crypto version")?;
 
     let result = crypto::decrypt_vault_from_sync(
         &encrypted_blob,
@@ -571,20 +587,10 @@ pub async fn pull_bound_to_principal(
         version,
         crypto_version,
     )?;
-    let secrets_json = &result;
-
-    // Try environments format first: {"environments": {"default": {...}, "live": {...}}}
-    if let Ok(wrapper) = serde_json::from_str::<
-        HashMap<String, HashMap<String, HashMap<String, String>>>,
-    >(secrets_json)
-        && let Some(default) = take_environment(wrapper, "default")
-    {
-        return Ok((default, version));
-    }
-
-    // Fall back to flat format: {"KEY": "VALUE"}
-    let secrets: HashMap<String, String> = serde_json::from_str(secrets_json)
-        .map_err(|e| format!("failed to parse decrypted secrets: {e}"))?;
+    let secrets = crate::selected_environment::parse(&result, "default")
+        .map_err(|error| format!("failed to parse decrypted secrets: {error}"))?
+        .into_selected()
+        .unwrap_or_default();
 
     Ok((secrets, version))
 }
@@ -669,7 +675,6 @@ async fn pull_raw_authenticated(
             .get(&url)
             .bearer_auth(auth_token)
             .timeout(sync_request_timeout(std::time::Duration::from_secs(30))),
-        auth_token,
         vault_id,
         SyncScope::Personal,
         SyncEnvelopePolicy::Pull,
@@ -677,10 +682,9 @@ async fn pull_raw_authenticated(
     .await?
     {
         SyncHttpResponse::Success(result) => result,
-        SyncHttpResponse::Error { status, body } => {
-            let message = serde_json::from_slice::<PullResponse>(&body)
-                .ok()
-                .and_then(|result| result.error)
+        SyncHttpResponse::Error { status, response } => {
+            let message = response
+                .error
                 .unwrap_or_else(|| format!("server error: {status}"));
             return Err(SyncError::http(status, message));
         }
@@ -691,11 +695,15 @@ async fn pull_raw_authenticated(
         .encrypted_blob
         .ok_or("server returned no encrypted data")?;
     let wrapped_key = result.wrapped_key.ok_or("server returned no wrapped key")?;
-    let version = result.version.unwrap_or(0);
+    let version = result
+        .version
+        .ok_or("server returned no authenticated revision")?;
     let principal_id = result
         .principal_id
         .ok_or("server returned no authenticated principal ID")?;
-    let crypto_version = result.crypto_version.unwrap_or(1);
+    let crypto_version = result
+        .crypto_version
+        .ok_or("server returned no authenticated crypto version")?;
 
     let result = crypto::decrypt_vault_from_sync(
         &encrypted_blob,
@@ -717,8 +725,7 @@ async fn pull_raw_authenticated(
 ///
 /// Unlike [`pull`] which always returns "default", this extracts the
 /// requested environment from the multi-env payload. Returns an empty
-/// map if the requested env doesn't exist in the cloud vault. Falls
-/// back to flat format parsing for legacy single-env vaults.
+/// map if the requested env doesn't exist in the cloud vault.
 pub async fn pull_env(
     registry_url: &str,
     auth_token: &str,
@@ -741,21 +748,10 @@ pub async fn pull_env_bound_to_principal(
     let raw_json = pulled.raw_json;
     let version = pulled.version;
 
-    // Try multi-env format: {"environments": {"default": {...}, "staging": {...}}}
-    if let Ok(wrapper) =
-        serde_json::from_str::<HashMap<String, HashMap<String, HashMap<String, String>>>>(&raw_json)
-        && let Some(secrets) = take_environment(wrapper, env_name)
-    {
-        return Ok((secrets, version));
-    }
-
-    // Flat format: {"KEY": "VALUE"} — only valid for "default"
-    if env_name != "default" {
-        return Ok((HashMap::new(), version));
-    }
-
-    let secrets: HashMap<String, String> = serde_json::from_str(&raw_json)
-        .map_err(|e| format!("failed to parse decrypted secrets: {e}"))?;
+    let secrets = crate::selected_environment::parse(&raw_json, env_name)
+        .map_err(|error| format!("failed to parse decrypted secrets: {error}"))?
+        .into_selected()
+        .unwrap_or_default();
     Ok((secrets, version))
 }
 
@@ -776,6 +772,7 @@ fn validate_expected_principal(
     Ok(())
 }
 
+#[cfg(test)]
 fn take_environment(
     mut wrapper: HashMap<String, HashMap<String, HashMap<String, String>>>,
     env_name: &str,
@@ -795,7 +792,8 @@ mod tests {
     use crate::sync::test_support::IsolatedVaultKeyEnv;
     #[cfg(debug_assertions)]
     use crate::sync::test_support::{
-        SignedSyncResponse, TestSyncScope, env_lock_guard, signed_ok_response,
+        SignedEnvelopeResponse, SignedSyncResponse, TestSyncScope, env_lock_guard,
+        signed_envelope_response, signed_envelope_response_with, signed_ok_response,
         signed_sync_ok_response, signed_sync_ok_response_with,
     };
     #[cfg(debug_assertions)]
@@ -809,8 +807,18 @@ mod tests {
     type EnvelopeMutator = fn(&mut serde_json::Value);
 
     #[cfg(debug_assertions)]
+    fn personal_binding(vault_id: &str) -> serde_json::Value {
+        serde_json::json!({
+            "scope": "personal",
+            "principalId": "personal-test-principal",
+            "callerUserId": "personal-test-principal",
+            "vaultId": vault_id,
+        })
+    }
+
+    #[cfg(debug_assertions)]
     fn substitute_vault_id(body: &mut serde_json::Value) {
-        body["vaultId"] = "vault-other".into();
+        body["binding"]["vaultId"] = "vault-other".into();
     }
 
     #[cfg(debug_assertions)]
@@ -820,8 +828,13 @@ mod tests {
 
     #[cfg(debug_assertions)]
     fn substitute_scope(body: &mut serde_json::Value) {
-        body["scope"] = "organization".into();
-        body["organizationSlug"] = "acme".into();
+        body["binding"] = serde_json::json!({
+            "scope": "organization",
+            "principalId": "00000000-0000-4000-8000-000000000001",
+            "callerUserId": "caller",
+            "organizationSlug": "acme",
+            "vaultId": "vault-envelope",
+        });
     }
 
     #[cfg(debug_assertions)]
@@ -833,37 +846,25 @@ mod tests {
 
     #[cfg(debug_assertions)]
     fn remove_server_version(body: &mut serde_json::Value) {
-        body.as_object_mut()
-            .expect("test envelope should be an object")
-            .remove("serverVersion");
+        body["data"]
+            .as_object_mut()
+            .expect("test envelope data should be an object")
+            .remove("revision");
     }
 
     #[cfg(debug_assertions)]
     fn substitute_server_version(body: &mut serde_json::Value) {
-        body["serverVersion"] = 6.into();
+        body["data"]["revision"] = 6.into();
     }
 
     #[cfg(debug_assertions)]
     fn clear_version(body: &mut serde_json::Value) {
-        body["version"] = 0.into();
-        body["serverVersion"] = 0.into();
-    }
-
-    #[cfg(debug_assertions)]
-    fn substitute_payload_digest(body: &mut serde_json::Value) {
-        body["payloadDigest"] = "0".repeat(64).into();
-    }
-
-    #[cfg(debug_assertions)]
-    fn remove_payload_digest(body: &mut serde_json::Value) {
-        body.as_object_mut()
-            .expect("test envelope should be an object")
-            .remove("payloadDigest");
+        body["data"]["revision"] = 0.into();
     }
 
     #[cfg(debug_assertions)]
     fn downgrade_crypto_version(body: &mut serde_json::Value) {
-        body["cryptoVersion"] = 1.into();
+        body["data"]["cryptoVersion"] = 1.into();
     }
 
     #[tokio::test]
@@ -1047,15 +1048,14 @@ mod tests {
         let _guard = env_lock_guard();
         let _isolated = IsolatedVaultKeyEnv::new();
 
-        // Encrypt a genuine protocol-v1 blob under the legacy auth-token-derived key.
         let auth_token = "auth-token";
         let secrets_json = r#"{"DATABASE_URL":"postgres://legacy"}"#;
-        let legacy_wrapping_key = crypto::derive_legacy_wrapping_key(auth_token);
+        let retired_wrapping_key = [0x31; 32];
         let aes_key = crypto::generate_aes_key();
-        let encrypted_blob = crypto::encrypt(&aes_key, secrets_json.as_bytes())
-            .expect("encrypt protocol-v1 blob under the legacy wrapping key");
-        let wrapped_key =
-            crypto::wrap_key(&legacy_wrapping_key, &aes_key).expect("wrap aes under legacy key");
+        let encrypted_blob =
+            crypto::encrypt(&aes_key, secrets_json.as_bytes()).expect("encrypt retired payload");
+        let wrapped_key = crypto::wrap_key(&retired_wrapping_key, &aes_key)
+            .expect("wrap key for retired payload");
 
         let server = MockServer::start().await;
 
@@ -1161,67 +1161,22 @@ mod tests {
 
     #[cfg(debug_assertions)]
     #[tokio::test]
-    async fn pull_rejects_protocol_v1_before_a_failed_migration_write() {
-        let _guard = env_lock_guard();
-        let _isolated = IsolatedVaultKeyEnv::new();
-
-        let auth_token = "auth-token";
-        let secrets_json = r#"{"API_KEY":"legacy-value"}"#;
-        let legacy_wrapping_key = crypto::derive_legacy_wrapping_key(auth_token);
-        let aes_key = crypto::generate_aes_key();
-        let encrypted_blob = crypto::encrypt(&aes_key, secrets_json.as_bytes())
-            .expect("encrypt protocol-v1 blob under the legacy wrapping key");
-        let wrapped_key =
-            crypto::wrap_key(&legacy_wrapping_key, &aes_key).expect("wrap aes under legacy key");
-
-        let server = MockServer::start().await;
-
-        Mock::given(method("GET"))
-            .and(path("/api/vaults/vault-legacy-fail/sync"))
-            .and(header("authorization", &*format!("Bearer {auth_token}")))
-            .respond_with(signed_sync_ok_response(
-                serde_json::json!({
-                    "encryptedBlob": encrypted_blob,
-                    "wrappedKey": wrapped_key,
-                    "version": 1,
-                    "cryptoVersion": 1,
-                }),
-                auth_token,
-                "vault-legacy-fail",
-                TestSyncScope::Personal,
-            ))
-            .expect(1)
-            .mount(&server)
-            .await;
-
-        Mock::given(method("POST"))
-            .and(path("/api/vaults/vault-legacy-fail/sync"))
-            .respond_with(ResponseTemplate::new(500).set_body_string("internal error"))
-            .expect(0)
-            .mount(&server)
-            .await;
-
-        let error = pull(&server.uri(), auth_token, "vault-legacy-fail")
-            .await
-            .expect_err("network pulls must reject revision-unbound protocol v1 ciphertext");
-
-        assert!(
-            error.to_string().contains("unsupported crypto version"),
-            "{error}"
-        );
-    }
-
-    #[cfg(debug_assertions)]
-    #[tokio::test]
-    async fn push_raw_returns_plain_text_conflict_body_on_non_json_error() {
+    async fn push_raw_rejects_a_signed_non_json_conflict_body() {
         let _guard = env_lock_guard();
         let _isolated = IsolatedVaultKeyEnv::new();
         let server = MockServer::start().await;
+        let body = "vault version conflict";
+        let (key_id, response_signature) = signature::sign_response_for_test(409, body.as_bytes());
 
         Mock::given(method("POST"))
             .and(path("/api/vaults/vault-123/sync"))
             .and(header("authorization", "Bearer auth-token"))
-            .respond_with(ResponseTemplate::new(409).set_body_string("vault version conflict"))
+            .respond_with(
+                ResponseTemplate::new(409)
+                    .insert_header(signature::KEY_ID_HEADER, key_id.as_str())
+                    .insert_header(signature::SIGNATURE_HEADER, response_signature.as_str())
+                    .set_body_string(body),
+            )
             .expect(1)
             .mount(&server)
             .await;
@@ -1240,7 +1195,11 @@ mod tests {
         )
         .await;
 
-        assert!(matches!(result, Err(message) if message.to_string() == "vault version conflict"));
+        let error = result.expect_err("a non-envelope conflict must fail closed");
+        assert!(
+            error.to_string().contains("response parse error"),
+            "{error}"
+        );
     }
 
     #[cfg(debug_assertions)]
@@ -1325,6 +1284,55 @@ mod tests {
 
     #[cfg(debug_assertions)]
     #[tokio::test]
+    async fn bound_force_push_rejects_a_remote_revision_below_the_durable_checkpoint() {
+        let _guard = env_lock_guard();
+        let _isolated = IsolatedVaultKeyEnv::new();
+        let server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/api/vaults/vault-rollback/sync"))
+            .and(query_param("versionOnly", "true"))
+            .respond_with(signed_sync_ok_response(
+                serde_json::json!({ "version": 4 }),
+                "auth-token",
+                "vault-rollback",
+                TestSyncScope::Personal,
+            ))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/vaults/vault-rollback/sync"))
+            .respond_with(ResponseTemplate::new(500))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let error = push_raw_with_options(
+            &server.uri(),
+            "auth-token",
+            "vault-rollback",
+            r#"{"API_KEY":"secret"}"#,
+            PersonalPushOptions {
+                expected_version: Some(5),
+                expected_principal_id: Some("personal-test-principal"),
+                force: true,
+                metadata: None,
+            },
+        )
+        .await
+        .expect_err("force push must reject a remote rollback before posting ciphertext");
+
+        assert!(
+            error
+                .to_string()
+                .contains("older than the durable local version 5"),
+            "{error}"
+        );
+    }
+
+    #[cfg(debug_assertions)]
+    #[tokio::test]
     async fn force_push_repreflights_and_reencrypts_after_a_version_race() {
         use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -1348,17 +1356,14 @@ mod tests {
         struct RacingPushResponder {
             calls: Arc<AtomicUsize>,
             second_body: Arc<StdMutex<Option<serde_json::Value>>>,
+            conflict: SignedEnvelopeResponse,
             success: SignedSyncResponse,
         }
 
         impl Respond for RacingPushResponder {
             fn respond(&self, request: &Request) -> ResponseTemplate {
                 if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
-                    return ResponseTemplate::new(409).set_body_json(serde_json::json!({
-                        "error": "Version conflict",
-                        "code": "vault_version_conflict",
-                        "serverVersion": 6,
-                    }));
+                    return self.conflict.respond(request);
                 }
                 let body = serde_json::from_slice(&request.body)
                     .expect("retried force push body should be valid JSON");
@@ -1400,6 +1405,13 @@ mod tests {
             .respond_with(RacingPushResponder {
                 calls: Arc::clone(&push_calls),
                 second_body: Arc::clone(&second_body),
+                conflict: signed_envelope_response(
+                    409,
+                    "vault.write",
+                    "revisionConflict",
+                    personal_binding("vault-force-race"),
+                    serde_json::json!({ "currentRevision": 6 }),
+                ),
                 success: signed_sync_ok_response(
                     serde_json::json!({
                         "version": 7,
@@ -1448,10 +1460,7 @@ mod tests {
         Mock::given(method("GET"))
             .and(path("/api/vaults/vault-force/sync"))
             .and(query_param("versionOnly", "true"))
-            .respond_with(
-                ResponseTemplate::new(404)
-                    .set_body_json(serde_json::json!({ "error": "route missing" })),
-            )
+            .respond_with(ResponseTemplate::new(404).set_body_string("route missing"))
             .expect(1)
             .mount(&server)
             .await;
@@ -1466,7 +1475,8 @@ mod tests {
         )
         .await;
 
-        assert!(matches!(result, Err(error) if error.to_string() == "route missing"));
+        let error = result.expect_err("an unsigned preflight rejection must fail closed");
+        assert!(error.to_string().contains(signature::SIGNATURE_HEADER));
         assert_eq!(
             server
                 .received_requests()
@@ -1505,10 +1515,13 @@ mod tests {
         Mock::given(method("GET"))
             .and(path("/api/vaults/vault-force-new/sync"))
             .and(query_param("versionOnly", "true"))
-            .respond_with(
-                ResponseTemplate::new(404)
-                    .set_body_json(serde_json::json!({ "error": "Vault not found" })),
-            )
+            .respond_with(signed_envelope_response(
+                404,
+                "vault.inspect",
+                "missing",
+                personal_binding("vault-force-new"),
+                serde_json::json!({ "retainedRevision": 0 }),
+            ))
             .expect(1)
             .mount(&server)
             .await;
@@ -1585,10 +1598,13 @@ mod tests {
         Mock::given(method("GET"))
             .and(path("/api/vaults/vault-force-bound/sync"))
             .and(query_param("versionOnly", "true"))
-            .respond_with(
-                ResponseTemplate::new(404)
-                    .set_body_json(serde_json::json!({ "error": "Vault not found" })),
-            )
+            .respond_with(signed_envelope_response(
+                404,
+                "vault.inspect",
+                "missing",
+                personal_binding("vault-force-bound"),
+                serde_json::json!({ "retainedRevision": 0 }),
+            ))
             .expect(1)
             .mount(&server)
             .await;
@@ -1607,7 +1623,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let result = push_raw_with_options(
+        push_raw_with_options(
             &server.uri(),
             "auth-token",
             "vault-force-bound",
@@ -1666,7 +1682,7 @@ mod tests {
     }
 
     /// Tampered or replayed responses (correct shape, wrong signature) must be
-    /// rejected before any parsing. A successful-looking body that fails HMAC
+    /// rejected before any parsing. A successful-looking body that fails
     /// verification cannot reach the decryption path.
     #[tokio::test]
     async fn pull_rejects_tampered_body_with_mismatched_signature() {
@@ -1679,10 +1695,9 @@ mod tests {
             "wrappedKey": "ignored",
             "version": 1
         });
-        let original_sig = signature::sign_body(
-            serde_json::to_string(&original_body).unwrap().as_bytes(),
-            "auth-token",
-        );
+        let original_body = serde_json::to_string(&original_body).unwrap();
+        let (key_id, original_signature) =
+            signature::sign_response_for_test(200, original_body.as_bytes());
 
         let tampered_body = serde_json::json!({
             "encryptedBlob": "ignored",
@@ -1697,7 +1712,8 @@ mod tests {
             .respond_with(
                 ResponseTemplate::new(200)
                     .insert_header("Content-Type", "application/json")
-                    .insert_header(signature::SIGNATURE_HEADER, original_sig.as_str())
+                    .insert_header(signature::KEY_ID_HEADER, key_id.as_str())
+                    .insert_header(signature::SIGNATURE_HEADER, original_signature.as_str())
                     .set_body_string(tampered_body_str),
             )
             .mount(&server)
@@ -1712,19 +1728,13 @@ mod tests {
         );
     }
 
-    /// Non-2xx responses are NOT signed by the server, so verification must
-    /// not run on them — error formatting from the body proceeds normally.
-    /// This guards against a regression where the helper accidentally
-    /// requires a signature on every response.
     #[cfg(debug_assertions)]
     #[tokio::test]
-    async fn push_does_not_require_signature_on_error_responses() {
+    async fn push_rejects_unsigned_error_responses() {
         let _guard = env_lock_guard();
         let _isolated = IsolatedVaultKeyEnv::new();
         let server = MockServer::start().await;
 
-        // 409 conflict body, no X-LPM-Signature — origin sends this shape
-        // for vault_version_conflict (NextResponse.json, not signed).
         Mock::given(method("POST"))
             .and(path("/api/vaults/vault-123/sync"))
             .and(header("authorization", "Bearer auth-token"))
@@ -1752,8 +1762,50 @@ mod tests {
         )
         .await;
 
-        let err = result.expect_err("push should surface the conflict error");
-        assert_eq!(err.to_string(), "Version conflict");
+        let error = result.expect_err("unsigned conflict state must fail closed");
+        assert!(error.to_string().contains(signature::SIGNATURE_HEADER));
+    }
+
+    #[cfg(debug_assertions)]
+    #[tokio::test]
+    async fn push_rejects_a_replayed_signed_unauthorized_response() {
+        let _guard = env_lock_guard();
+        let _isolated = IsolatedVaultKeyEnv::new();
+        let server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/api/vaults/vault-123/sync"))
+            .respond_with(signed_envelope_response_with(
+                401,
+                "vault.write",
+                "rejected",
+                personal_binding("vault-123"),
+                serde_json::json!({
+                    "code": "authentication_required",
+                    "message": "Authentication is required",
+                }),
+                replay_request_nonce,
+            ))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let error = push_raw_with_options(
+            &server.uri(),
+            "auth-token",
+            "vault-123",
+            r#"{"K":"v"}"#,
+            PersonalPushOptions {
+                expected_version: Some(3),
+                expected_principal_id: Some("personal-test-principal"),
+                force: false,
+                metadata: None,
+            },
+        )
+        .await
+        .expect_err("a signed unauthorized response from another request must fail closed");
+
+        assert!(error.to_string().contains("request nonce"), "{error}");
     }
 
     /// Push success path must verify the signature before returning the
@@ -1820,7 +1872,7 @@ mod tests {
 
     #[cfg(debug_assertions)]
     #[tokio::test]
-    async fn pull_env_returns_empty_for_non_default_legacy_flat_vault() {
+    async fn pull_env_rejects_a_retired_flat_vault_payload() {
         let _guard = env_lock_guard();
 
         // Hermetic env: force file-backed wrapping key + isolated HOME so
@@ -1861,14 +1913,53 @@ mod tests {
             .mount(&server)
             .await;
 
-        let (secrets, version) = pull_env(&server.uri(), "auth-token", "vault-123", "staging")
+        let error = pull_env(&server.uri(), "auth-token", "vault-123", "staging")
             .await
-            .expect("non-default env lookup should not fail for legacy flat vaults");
+            .expect_err("retired flat vault payloads must fail closed");
 
-        assert_eq!(version, 7);
         assert!(
-            secrets.is_empty(),
-            "legacy flat vaults should only resolve the default env"
+            error.to_string().contains("unknown field `API_KEY`"),
+            "{error}"
+        );
+    }
+
+    #[cfg(debug_assertions)]
+    #[tokio::test]
+    async fn pull_env_rejects_malformed_unselected_environment() {
+        let _guard = env_lock_guard();
+        let _vault_env = IsolatedVaultKeyEnv::new();
+        let server = MockServer::start().await;
+        let secrets_json = r#"{"environments":{"default":{"BROKEN":1},"staging":{"TOKEN":"ok"}}}"#;
+        let (encrypted_blob, wrapped_key) =
+            crypto::encrypt_vault_for_sync(secrets_json, "personal-test-principal", "vault-123", 8)
+                .expect("vault payload should encrypt");
+
+        Mock::given(method("GET"))
+            .and(path("/api/vaults/vault-123/sync"))
+            .and(header("authorization", "Bearer auth-token"))
+            .respond_with(signed_sync_ok_response(
+                serde_json::json!({
+                    "encryptedBlob": encrypted_blob,
+                    "wrappedKey": wrapped_key,
+                    "version": 8,
+                    "cryptoVersion": crypto::CURRENT_CRYPTO_VERSION
+                }),
+                "auth-token",
+                "vault-123",
+                TestSyncScope::Personal,
+            ))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let error = pull_env(&server.uri(), "auth-token", "vault-123", "staging")
+            .await
+            .expect_err("malformed authenticated payloads must fail environment pulls");
+
+        assert!(
+            error
+                .to_string()
+                .contains("failed to parse decrypted secrets")
         );
     }
 
@@ -2110,34 +2201,20 @@ mod tests {
 
     #[cfg(debug_assertions)]
     #[tokio::test]
-    async fn push_raw_surfaces_expected_version_required_hint_on_409() {
-        // Pins the wire-level contract between the server's
-        // vault_expected_version_required response and what the CLI surface
-        // sees. Old clients that omit expectedVersion against an existing
-        // row now get a 409 from the server with both an error sentence and
-        // a hint; this test asserts both make it through into the Err string
-        // the command layer renders.
+    async fn push_raw_maps_the_signed_expected_revision_outcome_on_conflict() {
         let _guard = env_lock_guard();
         let _isolated = IsolatedVaultKeyEnv::new();
 
         let server = MockServer::start().await;
-        let response_body = serde_json::json!({
-            "error": "Vault exists on the server. Pull first then push with the synced version, or pass --force to overwrite.",
-            "code": "vault_expected_version_required",
-            "serverVersion": 7,
-            "hint": "Run `lpm env pull` then retry the push.",
-        });
-        let body_str = serde_json::to_string(&response_body).expect("serialize");
-        let sig = signature::sign_body(body_str.as_bytes(), "auth-token");
-
         Mock::given(method("POST"))
             .and(path("/api/vaults/vault-1/sync"))
-            .respond_with(
-                ResponseTemplate::new(409)
-                    .set_body_string(body_str)
-                    .insert_header("content-type", "application/json")
-                    .insert_header("x-lpm-vault-signature", sig.as_str()),
-            )
+            .respond_with(signed_envelope_response(
+                409,
+                "vault.write",
+                "expectedRevisionRequired",
+                personal_binding("vault-1"),
+                serde_json::json!({ "currentRevision": 7 }),
+            ))
             .expect(1)
             .mount(&server)
             .await;
@@ -2158,13 +2235,9 @@ mod tests {
         .expect_err("server 409 must propagate as Err");
 
         assert!(
-            err.to_string().contains("Vault exists on the server"),
-            "error sentence must be preserved: {err}"
-        );
-        assert!(
             err.to_string()
-                .contains("Hint: Run `lpm env pull` then retry the push."),
-            "hint must be appended so the user gets the remediation in one shot: {err}"
+                .contains("current vault revision is required"),
+            "the authenticated outcome must map to an actionable error: {err}"
         );
     }
 
@@ -2233,7 +2306,7 @@ mod tests {
             7,
         )
         .expect("encrypt authenticated sync fixture");
-        let invalid_envelopes: [(&str, EnvelopeMutator); 9] = [
+        let invalid_envelopes: [(&str, EnvelopeMutator); 7] = [
             ("cross-vault substitution", substitute_vault_id),
             ("replayed request nonce", replay_request_nonce),
             ("scope substitution", substitute_scope),
@@ -2241,8 +2314,6 @@ mod tests {
             ("missing server version", remove_server_version),
             ("server version substitution", substitute_server_version),
             ("non-positive version", clear_version),
-            ("payload digest substitution", substitute_payload_digest),
-            ("partial payload tuple", remove_payload_digest),
         ];
 
         for (name, mutate) in invalid_envelopes {

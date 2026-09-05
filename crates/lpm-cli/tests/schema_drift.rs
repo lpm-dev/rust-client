@@ -216,10 +216,61 @@ fn lpm_json_validator() -> Validator {
 }
 
 #[test]
+fn lpm_json_schema_does_not_advertise_an_invalid_checkpoint_default() {
+    let schema = lpm_runner::lpm_json::generate_schema();
+    let synced_at = &schema["$defs"]["VaultSyncAuthorityCheckpoint"]["properties"]["syncedAt"];
+
+    assert!(
+        synced_at.get("default").is_none(),
+        "optional syncedAt must not advertise a default rejected by its own string type: {synced_at}",
+    );
+}
+
+#[test]
+fn lpm_json_schema_accepts_checkpoint_without_synced_at() {
+    let validator = lpm_json_validator();
+    let document = serde_json::json!({
+        "vaultSync": {
+            "authorityCheckpoints": {
+                "personal": {
+                    "https://lpm.dev": {
+                        "account-1": {"version": 1},
+                    },
+                },
+            },
+        },
+    });
+
+    assert!(
+        validator.is_valid(&document),
+        "published schema must accept an optional omitted syncedAt field",
+    );
+}
+
+#[test]
 fn lpm_json_schema_rejects_malformed_sync_authority_metadata() {
     let validator = lpm_json_validator();
     for document in [
+        serde_json::json!({
+            "vaultSync": {
+                "personalBinding": {
+                    "registryUrl": "https://lpm.dev",
+                    "principalId": "account-1",
+                },
+            },
+        }),
+        serde_json::json!({
+            "vaultSync": {
+                "orgBindings": {
+                    "acme": {
+                        "registryUrl": "https://lpm.dev",
+                        "principalId": "11111111-1111-4111-8111-111111111111",
+                    },
+                },
+            },
+        }),
         serde_json::json!({"vaultSync": {"personalBinding": 17}}),
+        serde_json::json!({"vaultSync": {"personalPlatformBindings": {"https://lpm.dev": 17}}}),
         serde_json::json!({"vaultSync": {"orgBindings": {"acme": "account-1"}}}),
         serde_json::json!({"vaultSync": {"authorityCheckpoints": {"personal": 5}}}),
         serde_json::json!({
@@ -233,6 +284,34 @@ fn lpm_json_schema_rejects_malformed_sync_authority_metadata() {
                 },
             },
         }),
+        serde_json::json!({
+            "vaultSync": {
+                "authorityCheckpoints": {
+                    "personal": {
+                        "https://lpm.dev": {
+                            "account-1": {"version": 1, "syncedAt": null},
+                        },
+                    },
+                },
+            },
+        }),
+        serde_json::json!({
+            "vaultSync": {
+                "personalBinding": {
+                    "registryUrl": "https://lpm.dev",
+                    "principalId": "account-1\u{0000}substitute",
+                },
+            },
+        }),
+        serde_json::json!({
+            "vaultSync": {
+                "authorityCheckpoints": {
+                    "organizations": {
+                        "acme\u{0085}substitute": {},
+                    },
+                },
+            },
+        }),
     ] {
         assert!(
             !validator.is_valid(&document),
@@ -242,19 +321,113 @@ fn lpm_json_schema_rejects_malformed_sync_authority_metadata() {
 }
 
 #[test]
+fn lpm_json_schema_documents_runtime_only_sync_authority_constraints() {
+    let validator = lpm_json_validator();
+    let noncanonical_registry = serde_json::json!({
+        "vaultSync": {
+            "authorityCheckpoints": {
+                "personal": {
+                    "https://LPM.dev/": {
+                        "account-1": {"version": 1},
+                    },
+                },
+            },
+        },
+    });
+    assert!(validator.is_valid(&noncanonical_registry));
+    let manifest =
+        lpm_vault::vault_id::VaultManifestSnapshot::parse(&noncanonical_registry.to_string())
+            .expect("schema-valid metadata should deserialize");
+    assert!(
+        manifest
+            .personal_sync_principal_for_registry("https://lpm.dev")
+            .is_err(),
+        "runtime must enforce canonical Registry property names",
+    );
+
+    let multibyte_principal = "é".repeat(65);
+    let oversized_principal = serde_json::json!({
+        "vaultSync": {
+            "authorityCheckpoints": {
+                "personal": {
+                    "https://lpm.dev": {
+                        multibyte_principal: {"version": 1},
+                    },
+                },
+            },
+        },
+    });
+    assert!(validator.is_valid(&oversized_principal));
+    let manifest =
+        lpm_vault::vault_id::VaultManifestSnapshot::parse(&oversized_principal.to_string())
+            .expect("schema-valid metadata should deserialize");
+    assert!(
+        manifest
+            .personal_sync_principal_for_registry("https://lpm.dev")
+            .is_err(),
+        "runtime must enforce the principal ID UTF-8 byte limit",
+    );
+
+    let multibyte_organization = "é".repeat(65);
+    let oversized_organization = serde_json::json!({
+        "vaultSync": {
+            "authorityCheckpoints": {
+                "organizations": {
+                    (&multibyte_organization): {},
+                },
+            },
+        },
+    });
+    assert!(validator.is_valid(&oversized_organization));
+    let manifest =
+        lpm_vault::vault_id::VaultManifestSnapshot::parse(&oversized_organization.to_string())
+            .expect("schema-valid metadata should deserialize");
+    assert!(
+        manifest
+            .org_sync_principal_for_registry(&multibyte_organization, "https://lpm.dev",)
+            .is_err(),
+        "runtime must enforce the organization slug UTF-8 byte limit",
+    );
+
+    let principals = (0..33)
+        .map(|index| {
+            (
+                format!("account-{index}"),
+                serde_json::json!({"version": 1}),
+            )
+        })
+        .collect::<serde_json::Map<_, _>>();
+    let global_capacity = serde_json::json!({
+        "vaultSync": {
+            "authorityCheckpoints": {
+                "personal": {
+                    "https://one.example": principals,
+                    "https://two.example": principals,
+                },
+            },
+        },
+    });
+    assert!(validator.is_valid(&global_capacity));
+    let manifest = lpm_vault::vault_id::VaultManifestSnapshot::parse(&global_capacity.to_string())
+        .expect("schema-valid metadata should deserialize");
+    assert!(
+        manifest
+            .personal_sync_principal_for_registry("https://one.example")
+            .is_err(),
+        "runtime must enforce the global authority-checkpoint leaf limit",
+    );
+}
+
+#[test]
 fn lpm_json_schema_accepts_valid_sync_authority_metadata() {
     let validator = lpm_json_validator();
     let document = serde_json::json!({
         "vaultSync": {
             "personalVersion": 7,
-            "personalBinding": {
-                "registryUrl": "https://lpm.dev",
-                "principalId": "account-1",
-            },
-            "orgBindings": {
-                "acme": {
+            "personalPlatformBindings": {
+                "https://lpm.dev": {
                     "registryUrl": "https://lpm.dev",
-                    "principalId": "11111111-1111-4111-8111-111111111111",
+                    "principalId": "account-1",
                 },
             },
             "authorityCheckpoints": {

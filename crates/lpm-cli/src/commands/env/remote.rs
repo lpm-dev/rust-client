@@ -1,5 +1,8 @@
 use super::prelude::*;
 
+type SharedEnvironment = std::sync::Arc<HashMap<String, String>>;
+type LocalDiffPair = (SharedEnvironment, SharedEnvironment);
+
 pub(super) async fn env_log(
     client: &lpm_registry::RegistryClient,
     project_dir: &std::path::Path,
@@ -13,17 +16,14 @@ pub(super) async fn env_log(
         .map(str::to_owned)
         .ok_or_else(|| LpmError::Script("no vault configured".into()))?;
 
-    let result = super::auth::execute_sync_with_bearer(
-        client,
-        lpm_auth::AuthRequirement::TokenRequired,
-        |registry_url, auth_token| {
+    let result =
+        super::auth::execute_sync_with_bearer(client, |registry_url, auth_token| {
             let vault_id = vault_id.clone();
             async move {
                 lpm_vault::sync::get_audit_log(&registry_url, &auth_token, &vault_id, None).await
             }
-        },
-    )
-    .await?;
+        })
+        .await?;
 
     let entries = result.entries.unwrap_or_default();
 
@@ -179,11 +179,7 @@ pub(super) async fn env_share(
     let member_access = std::sync::Arc::new(member_access);
 
     let config = manifest.config;
-    let empty_env_map = HashMap::new();
-    let env_map = config.as_ref().map_or(&empty_env_map, |c| &c.env);
-    let environments = config.as_ref().and_then(|c| c.environments.as_ref());
-    let non_empty_envs =
-        super::sync_payload::build_sync_environments(all_envs, env_map, environments);
+    let non_empty_envs = super::sync_payload::build_sync_environments(all_envs);
     let secrets_json = std::sync::Arc::new({
         let mut wrapper = std::collections::HashMap::new();
         wrapper.insert("environments".to_string(), non_empty_envs);
@@ -209,7 +205,6 @@ pub(super) async fn env_share(
 
     let (result, registry_url, organization_id) = super::auth::execute_sync_with_bearer(
         client,
-        lpm_auth::AuthRequirement::TokenRequired,
         |registry_url, auth_token| {
             let project_name = project_name.clone();
             let schema_value = std::sync::Arc::clone(&schema_value);
@@ -235,11 +230,11 @@ pub(super) async fn env_share(
                     },
                 );
                 let expected_version = if recreate_missing {
-                    if checkpoint_version.is_none() {
-                        return Err(lpm_vault::sync::SyncError::from(
+                    let checkpoint_version = checkpoint_version.ok_or_else(|| {
+                        lpm_vault::sync::SyncError::from(
                             "`lpm env share --force` requires a durable revision checkpoint for the bound organization env",
-                        ));
-                    }
+                        )
+                    })?;
                     let remote_version =
                         lpm_vault::sync::org_version_preflight_bound_to_principal(
                             &registry_url,
@@ -250,11 +245,16 @@ pub(super) async fn env_share(
                         )
                         .await?;
                     if let Some(remote_version) = remote_version {
+                        if remote_version < checkpoint_version {
+                            return Err(lpm_vault::sync::SyncError::from(format!(
+                                "cloud env version {remote_version} is older than the durable local version {checkpoint_version}"
+                            )));
+                        }
                         return Err(lpm_vault::sync::SyncError::from(format!(
                             "organization env still exists at revision {remote_version}; `lpm env share --force` recreates only a deleted remote. Run `lpm env pull --org {org_slug}` before sharing"
                         )));
                     }
-                    checkpoint_version
+                    Some(checkpoint_version)
                 } else {
                     checkpoint_version
                 };
@@ -354,14 +354,11 @@ pub(super) async fn vars_list_remote(
 ) -> Result<(), LpmError> {
     if let Some(slug) = org_slug {
         // List org vaults
-        let vaults = super::auth::execute_sync_with_bearer(
-            client,
-            lpm_auth::AuthRequirement::TokenRequired,
-            |registry_url, auth_token| async move {
+        let vaults =
+            super::auth::execute_sync_with_bearer(client, |registry_url, auth_token| async move {
                 lpm_vault::sync::list_org_vaults(&registry_url, &auth_token, slug).await
-            },
-        )
-        .await?;
+            })
+            .await?;
 
         if json_output {
             let json: Vec<serde_json::Value> = vaults
@@ -423,14 +420,11 @@ pub(super) async fn vars_list_remote(
     }
 
     // Personal vaults
-    let vaults = super::auth::execute_sync_with_bearer(
-        client,
-        lpm_auth::AuthRequirement::TokenRequired,
-        |registry_url, auth_token| async move {
+    let vaults =
+        super::auth::execute_sync_with_bearer(client, |registry_url, auth_token| async move {
             lpm_vault::sync::list_remote(&registry_url, &auth_token).await
-        },
-    )
-    .await?;
+        })
+        .await?;
 
     if json_output {
         let json: Vec<serde_json::Value> = vaults
@@ -487,6 +481,20 @@ pub(super) async fn vars_list_remote(
 ///   lpm env diff                     — local default vs cloud
 ///   lpm env diff staging             — local staging vs cloud staging
 ///   lpm env diff staging production  — two local environments
+fn take_local_diff_pair(
+    mut environments: HashMap<String, HashMap<String, String>>,
+    left_storage_key: &str,
+    right_storage_key: &str,
+) -> LocalDiffPair {
+    let left = std::sync::Arc::new(environments.remove(left_storage_key).unwrap_or_default());
+    let right = if left_storage_key == right_storage_key {
+        std::sync::Arc::clone(&left)
+    } else {
+        std::sync::Arc::new(environments.remove(right_storage_key).unwrap_or_default())
+    };
+    (left, right)
+}
+
 pub(super) async fn vars_diff(
     client: &lpm_registry::RegistryClient,
     args: &[&str],
@@ -508,21 +516,16 @@ pub(super) async fn vars_diff(
         // Compare two local environments — resolve aliases to canonical names
         let resolved_a = lpm_env::resolver::resolve(args[0], env_map, environments);
         let resolved_b = lpm_env::resolver::resolve(args[1], env_map, environments);
-        let mut local_environments = match vault_id.as_deref() {
+        let local_environments = match vault_id.as_deref() {
             Some(vault_id) => lpm_vault::try_get_all_environments_for_vault_id(vault_id)
                 .map_err(LpmError::Script)?,
             None => HashMap::new(),
         };
-        let a = local_environments
-            .remove(&resolved_a.storage_key)
-            .unwrap_or_default();
-        let b = if resolved_a.storage_key == resolved_b.storage_key {
-            a.clone()
-        } else {
-            local_environments
-                .remove(&resolved_b.storage_key)
-                .unwrap_or_default()
-        };
+        let (a, b) = take_local_diff_pair(
+            local_environments,
+            &resolved_a.storage_key,
+            &resolved_b.storage_key,
+        );
         (
             format!("{} (local)", resolved_a.canonical),
             a,
@@ -540,12 +543,10 @@ pub(super) async fn vars_diff(
         let canonical = resolved.canonical.clone();
         let expected_principal_id = manifest
             .vault
-            .personal_sync_principal_for_registry(client.base_url())
+            .personal_expected_principal_for_registry(client.base_url())
             .map_err(LpmError::Script)?;
-        let (remote, _version) = super::auth::execute_sync_with_bearer(
-            client,
-            lpm_auth::AuthRequirement::TokenRequired,
-            |registry_url, auth_token| {
+        let (remote, _version) =
+            super::auth::execute_sync_with_bearer(client, |registry_url, auth_token| {
                 let vault_id = vault_id.to_owned();
                 let canonical = canonical.clone();
                 let expected_principal_id = expected_principal_id.clone();
@@ -559,15 +560,14 @@ pub(super) async fn vars_diff(
                     )
                     .await
                 }
-            },
-        )
-        .await?;
+            })
+            .await?;
 
         (
             format!("{} (local)", resolved.canonical),
-            local,
+            std::sync::Arc::new(local),
             format!("{} (cloud)", resolved.canonical),
-            remote,
+            std::sync::Arc::new(remote),
         )
     } else {
         // Default: local default vs cloud
@@ -578,12 +578,10 @@ pub(super) async fn vars_diff(
             .map_err(LpmError::Script)?;
         let expected_principal_id = manifest
             .vault
-            .personal_sync_principal_for_registry(client.base_url())
+            .personal_expected_principal_for_registry(client.base_url())
             .map_err(LpmError::Script)?;
-        let (remote, _version) = super::auth::execute_sync_with_bearer(
-            client,
-            lpm_auth::AuthRequirement::TokenRequired,
-            |registry_url, auth_token| {
+        let (remote, _version) =
+            super::auth::execute_sync_with_bearer(client, |registry_url, auth_token| {
                 let vault_id = vault_id.to_owned();
                 let expected_principal_id = expected_principal_id.clone();
                 async move {
@@ -595,15 +593,14 @@ pub(super) async fn vars_diff(
                     )
                     .await
                 }
-            },
-        )
-        .await?;
+            })
+            .await?;
 
         (
             "default (local)".into(),
-            local,
+            std::sync::Arc::new(local),
             "default (cloud)".into(),
-            remote,
+            std::sync::Arc::new(remote),
         )
     };
 
@@ -719,7 +716,23 @@ pub(super) async fn vars_diff(
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_list_remote_org_slug, parse_recipient_set_acceptance, parse_share_org_slug};
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    use super::{
+        parse_list_remote_org_slug, parse_recipient_set_acceptance, parse_share_org_slug,
+        take_local_diff_pair,
+    };
+
+    #[test]
+    fn same_storage_key_diff_reuses_the_secret_map_allocation() {
+        let secrets = HashMap::from([("TOKEN".to_owned(), "x".repeat(1024))]);
+        let environments = HashMap::from([("production".to_owned(), secrets)]);
+
+        let (left, right) = take_local_diff_pair(environments, "production", "production");
+
+        assert!(Arc::ptr_eq(&left, &right));
+    }
 
     #[test]
     fn recipient_acceptance_parser_accepts_an_exact_digest() {

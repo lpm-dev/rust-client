@@ -244,19 +244,18 @@ pub(super) async fn env_pair(
     }
 
     output::info("fetching pairing session...");
+    let expected_principal_id =
+        super::auth::execute_sync_with_bearer(client, |registry_url, auth_token| async move {
+            lpm_vault::sync::get_my_public_key_state(&registry_url, &auth_token).await
+        })
+        .await?
+        .principal_id;
 
-    let session =
-        super::auth::execute_sync_with_bearer(
-            client,
-            lpm_auth::AuthRequirement::SessionRequired,
-            |registry_url, auth_token| {
-                let code = parsed.code.clone();
-                async move {
-                    lpm_vault::sync::get_pairing_session(&registry_url, &auth_token, &code).await
-                }
-            },
-        )
-        .await?;
+    let session = super::auth::execute_sync_with_bearer(client, |registry_url, auth_token| {
+        let code = parsed.code.clone();
+        async move { lpm_vault::sync::get_pairing_session(&registry_url, &auth_token, &code).await }
+    })
+    .await?;
 
     if session.status != "pending" {
         return Err(LpmError::Script(format!(
@@ -270,106 +269,55 @@ pub(super) async fn env_pair(
         .clone()
         .ok_or_else(|| LpmError::Script("server did not return browser public key".into()))?;
 
-    let protocol_version = session.protocol_version.unwrap_or(1);
-    match protocol_version {
-        1 => {
-            let view = PairConfirmationView::new(
-                &parsed.code,
-                &browser_pub_b64,
-                lpm_vault::crypto::legacy_pairing_match_number(&parsed.code, &browser_pub_b64),
-                &session,
-            );
-            print_pair_confirmation(&view);
-            confirm_pairing(&parsed)?;
-
-            let wrapping_key =
-                lpm_vault::crypto::get_or_create_wrapping_key().map_err(LpmError::Script)?;
-            let (encrypted, ephemeral) =
-                lpm_vault::crypto::p256_pair_wrap_key(&wrapping_key, &browser_pub_b64)
-                    .map_err(LpmError::Script)?;
-            super::auth::execute_sync_with_bearer(
-                client,
-                lpm_auth::AuthRequirement::SessionRequired,
-                |registry_url, auth_token| {
-                    let code = parsed.code.clone();
-                    let encrypted = encrypted.clone();
-                    let ephemeral = ephemeral.clone();
-                    async move {
-                        lpm_vault::sync::approve_pairing_legacy(
-                            &registry_url,
-                            &auth_token,
-                            &code,
-                            &encrypted,
-                            &ephemeral,
-                        )
-                        .await
-                    }
-                },
+    let exchange = lpm_vault::crypto::P256PairingKeyExchange::new(&browser_pub_b64)
+        .map_err(LpmError::Script)?;
+    let ephemeral = exchange.ephemeral_public_key_b64().to_string();
+    super::auth::execute_sync_with_bearer(client, |registry_url, auth_token| {
+        let code = parsed.code.clone();
+        let expected_principal_id = expected_principal_id.clone();
+        let ephemeral = ephemeral.clone();
+        async move {
+            lpm_vault::sync::stage_pairing(
+                &registry_url,
+                &auth_token,
+                &code,
+                &expected_principal_id,
+                &ephemeral,
             )
-            .await?;
+            .await
         }
-        2 => {
-            let exchange = lpm_vault::crypto::P256PairingKeyExchange::new(&browser_pub_b64)
-                .map_err(LpmError::Script)?;
-            let ephemeral = exchange.ephemeral_public_key_b64().to_string();
-            super::auth::execute_sync_with_bearer(
-                client,
-                lpm_auth::AuthRequirement::SessionRequired,
-                |registry_url, auth_token| {
-                    let code = parsed.code.clone();
-                    let ephemeral = ephemeral.clone();
-                    async move {
-                        lpm_vault::sync::stage_pairing(
-                            &registry_url,
-                            &auth_token,
-                            &code,
-                            &ephemeral,
-                        )
-                        .await
-                    }
-                },
-            )
-            .await?;
+    })
+    .await?;
 
-            let view = PairConfirmationView::new(
-                &parsed.code,
-                &browser_pub_b64,
-                exchange.short_authentication_string(&parsed.code),
-                &session,
-            );
-            print_pair_confirmation(&view);
-            confirm_pairing(&parsed)?;
+    let view = PairConfirmationView::new(
+        &parsed.code,
+        &browser_pub_b64,
+        exchange.short_authentication_string(&parsed.code),
+        &session,
+    );
+    print_pair_confirmation(&view);
+    confirm_pairing(&parsed)?;
 
-            let wrapping_key =
-                lpm_vault::crypto::get_or_create_wrapping_key().map_err(LpmError::Script)?;
-            let encrypted = exchange.wrap_key(&wrapping_key).map_err(LpmError::Script)?;
-            super::auth::execute_sync_with_bearer(
-                client,
-                lpm_auth::AuthRequirement::SessionRequired,
-                |registry_url, auth_token| {
-                    let code = parsed.code.clone();
-                    let encrypted = encrypted.clone();
-                    let ephemeral = ephemeral.clone();
-                    async move {
-                        lpm_vault::sync::approve_pairing(
-                            &registry_url,
-                            &auth_token,
-                            &code,
-                            &encrypted,
-                            &ephemeral,
-                        )
-                        .await
-                    }
-                },
+    let wrapping_key = lpm_vault::crypto::get_or_create_wrapping_key().map_err(LpmError::Script)?;
+    let encrypted = exchange.wrap_key(&wrapping_key).map_err(LpmError::Script)?;
+    super::auth::execute_sync_with_bearer(client, |registry_url, auth_token| {
+        let code = parsed.code.clone();
+        let expected_principal_id = expected_principal_id.clone();
+        let encrypted = encrypted.clone();
+        let ephemeral = ephemeral.clone();
+        async move {
+            lpm_vault::sync::approve_pairing(
+                &registry_url,
+                &auth_token,
+                &code,
+                &expected_principal_id,
+                &encrypted,
+                &ephemeral,
             )
-            .await?;
+            .await
         }
-        version => {
-            return Err(LpmError::Script(format!(
-                "pairing protocol {version} is not supported by this CLI. Upgrade LPM and try again."
-            )));
-        }
-    }
+    })
+    .await?;
 
     if json_output {
         println!(
@@ -405,14 +353,19 @@ pub(super) async fn env_unpair(
     json_output: bool,
 ) -> Result<(), LpmError> {
     output::info("revoking all browser pairings...");
+    let expected_principal_id =
+        super::auth::execute_sync_with_bearer(client, |registry_url, auth_token| async move {
+            lpm_vault::sync::get_my_public_key_state(&registry_url, &auth_token).await
+        })
+        .await?
+        .principal_id;
 
-    super::auth::execute_sync_with_bearer(
-        client,
-        lpm_auth::AuthRequirement::SessionRequired,
-        |registry_url, auth_token| async move {
-            lpm_vault::sync::unpair_all(&registry_url, &auth_token).await
-        },
-    )
+    super::auth::execute_sync_with_bearer(client, |registry_url, auth_token| {
+        let expected_principal_id = expected_principal_id.clone();
+        async move {
+            lpm_vault::sync::unpair_all(&registry_url, &auth_token, &expected_principal_id).await
+        }
+    })
     .await?;
 
     if json_output {
@@ -554,7 +507,7 @@ mod tests {
         let pub_b64 = BASE64.encode([0xAAu8; 65]);
         let session = lpm_vault::sync::PairingSession {
             status: "pending".into(),
-            protocol_version: Some(2),
+            protocol_version: 3,
             browser_public_key: Some(pub_b64.clone()),
             device_label: Some("Safari on iOS".into()),
             created_at: Some("2026-05-20T12:34:56Z".into()),
@@ -575,7 +528,7 @@ mod tests {
         let pub_b64 = BASE64.encode([0u8; 65]);
         let session = lpm_vault::sync::PairingSession {
             status: "pending".into(),
-            protocol_version: Some(2),
+            protocol_version: 3,
             browser_public_key: Some(pub_b64.clone()),
             device_label: Some("Chrome\x1b[2J\x07".into()),
             created_at: None,
@@ -600,7 +553,7 @@ mod tests {
         let pub_b64 = BASE64.encode([0u8; 65]);
         let session = lpm_vault::sync::PairingSession {
             status: "pending".into(),
-            protocol_version: Some(2),
+            protocol_version: 3,
             browser_public_key: Some(pub_b64.clone()),
             device_label: None,
             created_at: Some("2026-05-20T12:34:56Z\x1b[2A\x1b[2K".into()),

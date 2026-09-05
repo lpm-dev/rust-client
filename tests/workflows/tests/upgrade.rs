@@ -178,7 +178,6 @@ fn upgrade_without_package_json_fails_clearly() {
         .env("LPM_NO_UPDATE_CHECK", "1")
         .env("LPM_DISABLE_TELEMETRY", "1")
         .env("LPM_FORCE_FILE_AUTH", "1")
-        .env("LPM_TEST_FAST_SCRYPT", "1")
         .env("LPM_FORCE_FILE_VAULT", "1")
         .env("LPM_DISABLE_HOST_CLI_AUTH", "1")
         .env(

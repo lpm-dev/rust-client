@@ -69,7 +69,7 @@ pub async fn run(
         {
             Ok(_) => {
                 let revocation_client = client.clone_with_session_only(stored_session);
-                match revocation_client.revoke_all_pairings().await {
+                match revoke_pairings(&revocation_client).await {
                     Ok(()) => {
                         pairings_revoked = true;
                         if !json_output {
@@ -227,6 +227,25 @@ pub async fn run(
     } else {
         Err(LpmError::ExitCode(1))
     }
+}
+
+async fn revoke_pairings(client: &RegistryClient) -> Result<(), LpmError> {
+    let expected_principal_id = crate::commands::env::auth::execute_sync_with_bearer(
+        client,
+        |registry_url, auth_token| async move {
+            lpm_vault::sync::get_my_public_key_state(&registry_url, &auth_token).await
+        },
+    )
+    .await?
+    .principal_id;
+
+    crate::commands::env::auth::execute_sync_with_bearer(client, |registry_url, auth_token| {
+        let expected_principal_id = expected_principal_id.clone();
+        async move {
+            lpm_vault::sync::unpair_all(&registry_url, &auth_token, &expected_principal_id).await
+        }
+    })
+    .await
 }
 
 fn record_local_clear(

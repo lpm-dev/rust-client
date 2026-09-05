@@ -1117,7 +1117,7 @@ async fn flow_env_push_pull_cross_machine_round_trip() {
             &[SessionSeed {
                 registry_url: &mock.url(),
                 access_token: Some(BEARER),
-                refresh_token: None,
+                refresh_token: Some("flow-refresh-cross-machine"),
                 session_access_expires_at: Some("2099-01-01T00:00:00Z"),
             }],
         );

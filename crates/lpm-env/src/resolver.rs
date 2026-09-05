@@ -15,18 +15,16 @@
 //! 4. Otherwise → use input as-is (custom environment)
 
 use crate::EnvironmentsConfig;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 /// A resolved environment identity used consistently across CLI, vault, runner, and sync.
 #[derive(Debug, Clone)]
 pub struct ResolvedEnv {
     /// The canonical name — the intended identity for this environment.
-    /// Derived from config or, for legacy/unknown keys, identical to `storage_key`.
+    /// Derived from config or identical to `storage_key` for custom environments.
     pub canonical: String,
 
-    /// The actual key used in vault storage. Usually equals `canonical`,
-    /// but differs for legacy entries (e.g., vault has `"dev"` while canonical
-    /// is `"development"`).
+    /// The canonical key used in vault storage.
     pub storage_key: String,
 
     /// The user-facing alias from `lpm.json` `env` keys, if any.
@@ -47,11 +45,8 @@ pub struct ResolvedEnv {
 pub enum EnvSource {
     /// From `lpm.json` `env` or `environments` config.
     Config,
-    /// From vault storage, matching a known canonical name.
+    /// From current vault storage, whether configured or custom.
     Vault,
-    /// From vault storage, NOT matching any canonical name from config.
-    /// These are legacy keys that should be migrated.
-    Legacy,
 }
 
 /// Extract the env mode from a `.env.{mode}` filename.
@@ -63,6 +58,24 @@ pub enum EnvSource {
 /// ```
 pub fn extract_mode_from_env_path(env_path: &str) -> Option<&str> {
     env_path.strip_prefix(".env.")
+}
+
+/// Resolve only the canonical name without constructing display metadata.
+///
+/// This is the batch-friendly projection for callers that do not need alias,
+/// path, source, or sensitivity fields.
+pub fn resolve_canonical_name<'a>(
+    input: &'a str,
+    env_map: &'a HashMap<String, String>,
+    environments: Option<&EnvironmentsConfig>,
+) -> &'a str {
+    if environments.is_some_and(|values| values.envs.contains_key(input)) {
+        return input;
+    }
+    env_map
+        .get(input)
+        .and_then(|file_path| extract_mode_from_env_path(file_path))
+        .unwrap_or(input)
 }
 
 /// Validate an environment name for use as a vault key.
@@ -200,10 +213,8 @@ pub fn resolve_from_script(
 
 /// List all known environments from config + vault.
 ///
-/// Vault keys that match a known canonical name are merged (`source: Vault`).
-/// Vault keys that DON'T match any canonical are surfaced as separate entries
-/// with `source: Legacy`. These represent stored secrets under a raw key
-/// that the resolver doesn't recognize. They are **never** collapsed or hidden.
+/// Vault keys that match a configured canonical name are merged. Valid custom
+/// environment identities are surfaced as current vault entries.
 pub fn list_all(
     env_map: &HashMap<String, String>,
     environments: Option<&EnvironmentsConfig>,
@@ -218,11 +229,22 @@ pub fn list_all_from_vault_names<'a>(
     environments: Option<&EnvironmentsConfig>,
     vault_environment_names: impl IntoIterator<Item = &'a str>,
 ) -> Vec<ResolvedEnv> {
-    let mut canonical_names = HashSet::new();
-    let mut result = Vec::new();
+    list_all_from_vault_names_inner(env_map, environments, vault_environment_names, || {})
+}
 
-    // Always include "default" first
-    canonical_names.insert("default".to_string());
+fn list_all_from_vault_names_inner<'a>(
+    env_map: &HashMap<String, String>,
+    environments: Option<&EnvironmentsConfig>,
+    vault_environment_names: impl IntoIterator<Item = &'a str>,
+    mut observe_vault_index_lookup: impl FnMut(),
+) -> Vec<ResolvedEnv> {
+    let configured_capacity = 1usize
+        .saturating_add(env_map.len())
+        .saturating_add(environments.map_or(0, |values| values.envs.len()));
+    let mut canonical_indexes = HashMap::with_capacity(configured_capacity);
+    let mut result = Vec::with_capacity(configured_capacity);
+
+    canonical_indexes.insert("default".to_string(), 0);
     result.push(ResolvedEnv {
         canonical: "default".to_string(),
         storage_key: "default".to_string(),
@@ -232,50 +254,80 @@ pub fn list_all_from_vault_names<'a>(
         sensitive: false,
     });
 
-    // From lpm.json `env` mapping (canonical = extracted mode)
     let mut sorted_env: Vec<_> = env_map.iter().collect();
     sorted_env.sort_by_key(|(alias, _)| alias.as_str());
-    for (_, file_path) in &sorted_env {
-        if let Some(mode) = extract_mode_from_env_path(file_path)
-            && canonical_names.insert(mode.to_string())
-        {
-            result.push(resolve(mode, env_map, environments));
+    let mut aliases_by_mode = HashMap::with_capacity(sorted_env.len());
+    for (alias, file_path) in &sorted_env {
+        if let Some(mode) = extract_mode_from_env_path(file_path) {
+            aliases_by_mode
+                .entry(mode)
+                .or_insert((alias.as_str(), file_path.as_str()));
         }
     }
 
-    // From `environments` config
+    let configured_entry = |canonical: &str| {
+        if let Some(definition) = environments.and_then(|values| values.envs.get(canonical)) {
+            return ResolvedEnv {
+                canonical: canonical.to_owned(),
+                storage_key: canonical.to_owned(),
+                alias: aliases_by_mode
+                    .get(canonical)
+                    .map(|(alias, _)| (*alias).to_owned()),
+                file_path: definition.file().map(str::to_owned),
+                source: EnvSource::Config,
+                sensitive: is_sensitive_by_name(canonical),
+            };
+        }
+        let alias = aliases_by_mode.get(canonical);
+        ResolvedEnv {
+            canonical: canonical.to_owned(),
+            storage_key: canonical.to_owned(),
+            alias: alias.map(|(value, _)| (*value).to_owned()),
+            file_path: alias.map(|(_, value)| (*value).to_owned()),
+            source: EnvSource::Config,
+            sensitive: is_sensitive_by_name(canonical),
+        }
+    };
+
+    for (_, file_path) in &sorted_env {
+        if let Some(mode) = extract_mode_from_env_path(file_path)
+            && !canonical_indexes.contains_key(mode)
+        {
+            canonical_indexes.insert(mode.to_owned(), result.len());
+            result.push(configured_entry(mode));
+        }
+    }
+
     if let Some(envs) = environments {
         let mut sorted_names: Vec<_> = envs.envs.keys().collect();
         sorted_names.sort();
         for name in sorted_names {
-            if canonical_names.insert(name.clone()) {
-                result.push(resolve(name, env_map, environments));
+            if !canonical_indexes.contains_key(name) {
+                canonical_indexes.insert(name.clone(), result.len());
+                result.push(configured_entry(name));
             }
         }
     }
 
-    // From vault — check each key against the canonical set.
-    // DON'T call resolve() for unrecognized keys — that would canonicalize
-    // "dev" → "development" and hide the legacy storage key.
     let mut sorted_vault: Vec<_> = vault_environment_names.into_iter().collect();
     sorted_vault.sort_unstable();
+    result.reserve(sorted_vault.len());
+    canonical_indexes.reserve(sorted_vault.len());
     for vault_key in sorted_vault {
-        if canonical_names.contains(vault_key) {
-            // Already listed from config. Mark source as Vault.
-            if let Some(entry) = result.iter_mut().find(|e| e.canonical == vault_key)
-                && entry.source == EnvSource::Config
-            {
+        observe_vault_index_lookup();
+        if let Some(&index) = canonical_indexes.get(vault_key) {
+            let entry = &mut result[index];
+            if entry.source == EnvSource::Config {
                 entry.source = EnvSource::Vault;
             }
         } else {
-            // Vault key doesn't match any canonical name — surface as Legacy.
-            canonical_names.insert(vault_key.to_owned());
+            canonical_indexes.insert(vault_key.to_owned(), result.len());
             result.push(ResolvedEnv {
                 canonical: vault_key.to_owned(),
                 storage_key: vault_key.to_owned(),
                 alias: None,
                 file_path: None,
-                source: EnvSource::Legacy,
+                source: EnvSource::Vault,
                 sensitive: is_sensitive_by_name(vault_key),
             });
         }
@@ -526,22 +578,20 @@ mod tests {
     }
 
     #[test]
-    fn list_all_legacy_vault_key_surfaces_separately() {
+    fn list_all_surfaces_custom_vault_keys_as_current_state() {
         let env_map = make_env_map();
         let mut vault = HashMap::new();
-        // "dev" is a legacy key — config maps "dev" alias → canonical "development"
         vault.insert("dev".into(), HashMap::new());
         vault.insert("development".into(), HashMap::new());
 
         let list = list_all(&env_map, None, &vault);
 
         let names: Vec<&str> = list.iter().map(|e| e.canonical.as_str()).collect();
-        // Should have both "development" (canonical) and "dev" (legacy)
         assert!(names.contains(&"development"));
         assert!(names.contains(&"dev"));
 
-        let legacy = list.iter().find(|e| e.storage_key == "dev").unwrap();
-        assert_eq!(legacy.source, EnvSource::Legacy);
+        let custom = list.iter().find(|e| e.storage_key == "dev").unwrap();
+        assert_eq!(custom.source, EnvSource::Vault);
 
         let canonical = list.iter().find(|e| e.canonical == "development").unwrap();
         assert_eq!(canonical.source, EnvSource::Vault);
@@ -570,5 +620,51 @@ mod tests {
         assert!(prod.sensitive);
         let dev = list.iter().find(|e| e.canonical == "development").unwrap();
         assert!(!dev.sensitive);
+    }
+
+    #[test]
+    fn list_all_large_overlap_uses_one_index_lookup_per_vault_name() {
+        let size = 10_000usize;
+        let env_map: HashMap<_, _> = (0..size)
+            .map(|index| (format!("alias-{index:05}"), format!(".env.mode-{index:05}")))
+            .collect();
+        let vault_names: Vec<_> = (0..size).map(|index| format!("mode-{index:05}")).collect();
+        let mut vault_index_lookups = 0usize;
+
+        let result = list_all_from_vault_names_inner(
+            &env_map,
+            None,
+            vault_names.iter().map(String::as_str),
+            || vault_index_lookups += 1,
+        );
+
+        assert_eq!(result.len(), size + 1);
+        assert_eq!(vault_index_lookups, size);
+        assert!(
+            result
+                .iter()
+                .skip(1)
+                .all(|entry| entry.source == EnvSource::Vault)
+        );
+    }
+
+    #[test]
+    #[ignore = "manual deterministic performance harness"]
+    fn list_all_large_overlap_benchmark() {
+        for size in [5_000usize, 10_000] {
+            let env_map: HashMap<_, _> = (0..size)
+                .map(|index| (format!("alias-{index:05}"), format!(".env.mode-{index:05}")))
+                .collect();
+            let vault_names: Vec<_> = (0..size).map(|index| format!("mode-{index:05}")).collect();
+            let started = std::time::Instant::now();
+            let result = std::hint::black_box(list_all_from_vault_names(
+                &env_map,
+                None,
+                vault_names.iter().map(String::as_str),
+            ));
+            let elapsed = started.elapsed();
+            assert_eq!(result.len(), size + 1);
+            eprintln!("list_all size={size} elapsed_ns={}", elapsed.as_nanos());
+        }
     }
 }

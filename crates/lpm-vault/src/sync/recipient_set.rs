@@ -1,10 +1,8 @@
-use base64::Engine as _;
 use sha2::{Digest as _, Sha256};
 
-use super::public_key::{MemberPublicKey, public_key_fingerprint};
-use crate::crypto;
+use super::public_key::MemberPublicKey;
 
-const RECIPIENT_SET_SCHEMA_VERSION: u32 = 2;
+const MAX_ORGANIZATION_RECIPIENTS: usize = 10_000;
 
 #[cfg(test)]
 thread_local! {
@@ -22,7 +20,6 @@ struct RecipientTrustScope {
 #[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 struct TrustedRecipientSet {
-    schema_version: u32,
     scope: RecipientTrustScope,
     recipients: Vec<RecipientBinding>,
 }
@@ -41,53 +38,13 @@ pub(super) struct PreparedRecipient {
     pub(super) public_key: [u8; 32],
 }
 
+#[cfg(test)]
 pub(super) fn prepare_recipients(
     members: &[&MemberPublicKey],
 ) -> Result<Vec<PreparedRecipient>, String> {
     let mut recipients = Vec::with_capacity(members.len());
     for member in members {
-        if member.user_id.is_empty() {
-            return Err("organization recipient user ID cannot be empty".to_owned());
-        }
-        let encoded = member
-            .public_key
-            .as_deref()
-            .ok_or_else(|| format!("missing public key for user {}", member.user_id))?;
-        let decoded = base64::engine::general_purpose::STANDARD
-            .decode(encoded)
-            .map_err(|error| format!("invalid public key for user {}: {error}", member.user_id))?;
-        let public_key: [u8; 32] = decoded.try_into().map_err(|decoded: Vec<u8>| {
-            format!(
-                "invalid public key for user {}: expected 32 bytes, got {}",
-                member.user_id,
-                decoded.len()
-            )
-        })?;
-        crypto::validate_contributory_x25519_public_key(&public_key)
-            .map_err(|error| format!("invalid public key for user {}: {error}", member.user_id))?;
-        let fingerprint = public_key_fingerprint(&public_key);
-        let expected_fingerprint = member
-            .public_key_fingerprint
-            .as_deref()
-            .ok_or_else(|| format!("missing public-key fingerprint for user {}", member.user_id))?;
-        if fingerprint != expected_fingerprint {
-            return Err(format!(
-                "public-key fingerprint mismatch for organization member {}",
-                member.user_id
-            ));
-        }
-        let public_key_version = member
-            .public_key_version
-            .filter(|version| *version > 0)
-            .ok_or_else(|| format!("invalid public-key version for user {}", member.user_id))?;
-        recipients.push(PreparedRecipient {
-            binding: RecipientBinding {
-                user_id: member.user_id.clone(),
-                public_key_version,
-                public_key_fingerprint: fingerprint,
-            },
-            public_key,
-        });
+        recipients.push(prepare_recipient(member)?);
     }
 
     recipients.sort_unstable_by(|left, right| left.binding.user_id.cmp(&right.binding.user_id));
@@ -101,6 +58,54 @@ pub(super) fn prepare_recipients(
         ));
     }
     Ok(recipients)
+}
+
+pub(super) fn prepare_authenticated_recipients(
+    members: &[MemberPublicKey],
+) -> Result<Vec<PreparedRecipient>, String> {
+    if members.len() > MAX_ORGANIZATION_RECIPIENTS {
+        return Err("organization vault sharing exceeds the 10,000-member limit".to_owned());
+    }
+
+    let keyed_member_count = members
+        .iter()
+        .filter(|member| member.sharing_key().is_some())
+        .count();
+    let mut recipients = Vec::with_capacity(keyed_member_count);
+    let mut previous_user_id: Option<&str> = None;
+    for member in members {
+        if member.user_id.is_empty()
+            || previous_user_id.is_some_and(|previous| previous >= member.user_id.as_str())
+        {
+            return Err("authenticated organization members are not uniquely ordered".to_owned());
+        }
+        previous_user_id = Some(&member.user_id);
+        if member.sharing_key().is_some() {
+            recipients.push(prepare_recipient(member)?);
+        }
+    }
+
+    if recipients.is_empty() {
+        return Err("no org members have registered public keys. Each member needs to run `lpm env share --org <slug>` once to generate their keypair.".to_owned());
+    }
+    Ok(recipients)
+}
+
+fn prepare_recipient(member: &MemberPublicKey) -> Result<PreparedRecipient, String> {
+    if member.user_id.is_empty() {
+        return Err("organization recipient user ID cannot be empty".to_owned());
+    }
+    let sharing_key = member
+        .sharing_key()
+        .ok_or_else(|| format!("missing public key for user {}", member.user_id))?;
+    Ok(PreparedRecipient {
+        binding: RecipientBinding {
+            user_id: member.user_id.clone(),
+            public_key_version: sharing_key.version(),
+            public_key_fingerprint: sharing_key.fingerprint().to_owned(),
+        },
+        public_key: *sharing_key.raw_public_key(),
+    })
 }
 
 pub(super) fn enforce_recipient_trust(
@@ -125,7 +130,7 @@ pub(super) fn enforce_recipient_trust(
     })
 }
 
-#[cfg(all(test, debug_assertions))]
+#[cfg(test)]
 pub(super) fn acceptance_digest(
     registry_url: &str,
     organization_id: &str,
@@ -205,7 +210,6 @@ fn proposed_recipient_set(
     recipients: &[PreparedRecipient],
 ) -> TrustedRecipientSet {
     TrustedRecipientSet {
-        schema_version: RECIPIENT_SET_SCHEMA_VERSION,
         scope: scope.clone(),
         recipients: recipients
             .iter()
@@ -241,12 +245,6 @@ fn parse_stored_recipient_set(
 ) -> Result<TrustedRecipientSet, String> {
     let trusted: TrustedRecipientSet = serde_json::from_slice(bytes)
         .map_err(|error| format!("trusted recipient set is malformed: {error}"))?;
-    if trusted.schema_version != RECIPIENT_SET_SCHEMA_VERSION {
-        return Err(format!(
-            "unsupported trusted recipient-set schema version: {}",
-            trusted.schema_version
-        ));
-    }
     if trusted.scope != *expected_scope {
         return Err("trusted recipient set belongs to another organization".to_owned());
     }
@@ -282,10 +280,7 @@ fn recipient_set_file_name(scope: &RecipientTrustScope) -> String {
         digest.update((component.len() as u64).to_be_bytes());
         digest.update(component);
     }
-    format!(
-        ".org-recipient-set-v2-{}.json",
-        hex::encode(digest.finalize())
-    )
+    format!(".org-recipient-set-{}.json", hex::encode(digest.finalize()))
 }
 
 impl RecipientTrustScope {
@@ -331,14 +326,7 @@ mod tests {
     }
 
     fn member(user_id: &str, public_key: [u8; 32], version: i32) -> MemberPublicKey {
-        MemberPublicKey {
-            user_id: user_id.to_owned(),
-            role: "member".to_owned(),
-            public_key: Some(base64::engine::general_purpose::STANDARD.encode(public_key)),
-            public_key_version: Some(version),
-            public_key_fingerprint: Some(public_key_fingerprint(&public_key)),
-            has_public_key: true,
-        }
+        MemberPublicKey::with_test_key(user_id, "member", public_key, version)
     }
 
     fn proposal(
@@ -564,10 +552,12 @@ mod tests {
             key[0] = 1;
             key
         }] {
-            let member = member("low-order", public_key, 1);
-
-            let error = prepare_recipients(&[&member])
-                .expect_err("low-order recipient keys must fail before trust persistence");
+            let error = crate::sync::public_key::ValidatedSharingKey::from_authenticated(
+                base64::Engine::encode(&base64::engine::general_purpose::STANDARD, public_key),
+                1,
+                crate::sync::public_key::public_key_fingerprint(&public_key),
+            )
+            .expect_err("low-order recipient keys must fail before trust persistence");
 
             assert!(error.contains("non-contributory"), "{error}");
         }

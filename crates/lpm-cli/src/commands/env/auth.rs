@@ -19,34 +19,7 @@ fn login_required(error: LpmError) -> LpmError {
     }
 }
 
-/// Resolve the current LPM bearer for a direct env API client.
-pub(super) async fn resolve_lpm_bearer(client: &RegistryClient) -> Result<String, LpmError> {
-    resolve_bearer(client, AuthRequirement::TokenRequired)
-        .await
-        .map_err(login_required)
-}
-
-async fn resolve_required_bearer(
-    client: &RegistryClient,
-    requirement: AuthRequirement,
-) -> Result<String, LpmError> {
-    match requirement {
-        AuthRequirement::TokenRequired => resolve_lpm_bearer(client).await,
-        AuthRequirement::SessionRequired => resolve_session_bearer(client).await,
-        AuthRequirement::AnonymousAllowed => resolve_bearer(client, requirement).await,
-    }
-}
-
-/// Vault-pairing variant that requires a real interactive login (not
-/// `LPM_TOKEN`/`--token`/CI/legacy tokens). `SessionRequired` posture
-/// maps directly to "source is `StoredSession`".
-///
-/// Distinguishes two failure modes so the user gets actionable text:
-/// - **No session at all** (post-logout, never-logged-in): "not
-///   logged in. Run `lpm login` first" — same message as
-///   `resolve_lpm_bearer`.
-/// - **Has a non-session token** (`LPM_TOKEN` / `--token` / CI /
-///   legacy stored): the upgrade-to-session message.
+/// Resolve the refresh-backed interactive session required by env APIs.
 pub(super) async fn resolve_session_bearer(client: &RegistryClient) -> Result<String, LpmError> {
     let Some(session) = client.session() else {
         return Err(login_required(LpmError::AuthRequired));
@@ -59,8 +32,8 @@ pub(super) async fn resolve_session_bearer(client: &RegistryClient) -> Result<St
                 .is_some_and(|source| !source.is_session_backed());
             if has_non_session_source {
                 Err(LpmError::Script(
-                    "your current login uses a legacy token that doesn't support vault pairing.\n  \
-                     Run `lpm logout` then `lpm login` to upgrade to a session-based login."
+                    "your current credential is not an interactive session.\n  \
+                     Run `lpm logout` then `lpm login` to authenticate."
                         .into(),
                 ))
             } else {
@@ -81,18 +54,18 @@ fn sync_error(error: lpm_vault::sync::SyncError) -> LpmError {
 
 pub(crate) async fn execute_sync_with_bearer<T, F, Fut>(
     client: &RegistryClient,
-    requirement: AuthRequirement,
     operation: F,
 ) -> Result<T, LpmError>
 where
     F: Fn(String, String) -> Fut,
     Fut: std::future::Future<Output = Result<T, lpm_vault::sync::SyncError>>,
 {
+    client.validate_base_url()?;
     let session = client
         .session()
         .ok_or_else(|| login_required(LpmError::AuthRequired))?;
     let registry_url = client.base_url().to_owned();
-    let bearer = resolve_required_bearer(client, requirement).await?;
+    let bearer = resolve_session_bearer(client).await?;
 
     match operation(registry_url.clone(), bearer).await {
         Err(error) if error.is_unauthorized() => {
@@ -104,7 +77,7 @@ where
             }
 
             session.refresh_now().await.map_err(login_required)?;
-            let bearer = resolve_required_bearer(client, requirement).await?;
+            let bearer = resolve_session_bearer(client).await?;
             operation(registry_url, bearer).await.map_err(sync_error)
         }
         result => result.map_err(sync_error),
@@ -113,18 +86,18 @@ where
 
 pub(crate) async fn execute_lpm_with_bearer<T, F, Fut>(
     client: &RegistryClient,
-    requirement: AuthRequirement,
     operation: F,
 ) -> Result<T, LpmError>
 where
     F: Fn(String, String) -> Fut,
     Fut: std::future::Future<Output = Result<T, LpmError>>,
 {
+    client.validate_base_url()?;
     let session = client
         .session()
         .ok_or_else(|| login_required(LpmError::AuthRequired))?;
     let registry_url = client.base_url().to_owned();
-    let bearer = resolve_required_bearer(client, requirement).await?;
+    let bearer = resolve_session_bearer(client).await?;
 
     match operation(registry_url.clone(), bearer).await {
         Err(error @ LpmError::AuthRequired) => {
@@ -136,7 +109,7 @@ where
             }
 
             session.refresh_now().await.map_err(login_required)?;
-            let bearer = resolve_required_bearer(client, requirement).await?;
+            let bearer = resolve_session_bearer(client).await?;
             operation(registry_url, bearer)
                 .await
                 .map_err(login_required)
@@ -154,6 +127,134 @@ mod tests {
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     use super::*;
+
+    #[tokio::test]
+    async fn sync_operation_rejects_insecure_registry_before_exposing_bearer() {
+        let home = tempfile::tempdir().expect("create isolated home");
+        let _environment = crate::test_env::ScopedEnv::update([
+            ("HOME", Some(home.path().as_os_str().to_owned())),
+            ("LPM_TOKEN", Some("sensitive-token".into())),
+        ]);
+        let registry_url = "http://registry.example";
+        let session = Arc::new(lpm_auth::SessionManager::new(registry_url, None));
+        let client = RegistryClient::new()
+            .with_base_url(registry_url)
+            .with_session(session);
+        let calls = Arc::new(AtomicUsize::new(0));
+
+        let result = execute_sync_with_bearer(&client, {
+            let calls = Arc::clone(&calls);
+            move |_registry_url, _auth_token| {
+                calls.fetch_add(1, Ordering::SeqCst);
+                async { Ok::<_, lpm_vault::sync::SyncError>(()) }
+            }
+        })
+        .await;
+
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert!(
+            result
+                .expect_err("insecure registry must fail before the operation")
+                .to_string()
+                .contains("uses insecure transport")
+        );
+    }
+
+    #[tokio::test]
+    async fn lpm_operation_rejects_insecure_registry_before_exposing_bearer() {
+        let home = tempfile::tempdir().expect("create isolated home");
+        let _environment = crate::test_env::ScopedEnv::update([
+            ("HOME", Some(home.path().as_os_str().to_owned())),
+            ("LPM_TOKEN", Some("sensitive-token".into())),
+        ]);
+        let registry_url = "http://registry.example";
+        let session = Arc::new(lpm_auth::SessionManager::new(registry_url, None));
+        let client = RegistryClient::new()
+            .with_base_url(registry_url)
+            .with_session(session);
+        let calls = Arc::new(AtomicUsize::new(0));
+
+        let result = execute_lpm_with_bearer(&client, {
+            let calls = Arc::clone(&calls);
+            move |_registry_url, _auth_token| {
+                calls.fetch_add(1, Ordering::SeqCst);
+                async { Ok::<_, LpmError>(()) }
+            }
+        })
+        .await;
+
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert!(
+            result
+                .expect_err("insecure registry must fail before the operation")
+                .to_string()
+                .contains("uses insecure transport")
+        );
+    }
+
+    #[tokio::test]
+    async fn sync_operation_rejects_standalone_token_before_https_invocation() {
+        let home = tempfile::tempdir().expect("create isolated home");
+        let _environment = crate::test_env::ScopedEnv::update([
+            ("HOME", Some(home.path().as_os_str().to_owned())),
+            ("LPM_TOKEN", Some("standalone-token".into())),
+        ]);
+        let registry_url = "https://registry.example";
+        let session = Arc::new(lpm_auth::SessionManager::new(registry_url, None));
+        let client = RegistryClient::new()
+            .with_base_url(registry_url)
+            .with_session(session);
+        let calls = Arc::new(AtomicUsize::new(0));
+
+        let result = execute_sync_with_bearer(&client, {
+            let calls = Arc::clone(&calls);
+            move |_registry_url, _auth_token| {
+                calls.fetch_add(1, Ordering::SeqCst);
+                async { Ok::<_, lpm_vault::sync::SyncError>(()) }
+            }
+        })
+        .await;
+
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert!(
+            result
+                .expect_err("a standalone token must not authorize an env operation")
+                .to_string()
+                .contains("not an interactive session")
+        );
+    }
+
+    #[tokio::test]
+    async fn lpm_operation_rejects_standalone_token_before_https_invocation() {
+        let home = tempfile::tempdir().expect("create isolated home");
+        let _environment = crate::test_env::ScopedEnv::update([
+            ("HOME", Some(home.path().as_os_str().to_owned())),
+            ("LPM_TOKEN", Some("standalone-token".into())),
+        ]);
+        let registry_url = "https://registry.example";
+        let session = Arc::new(lpm_auth::SessionManager::new(registry_url, None));
+        let client = RegistryClient::new()
+            .with_base_url(registry_url)
+            .with_session(session);
+        let calls = Arc::new(AtomicUsize::new(0));
+
+        let result = execute_lpm_with_bearer(&client, {
+            let calls = Arc::clone(&calls);
+            move |_registry_url, _auth_token| {
+                calls.fetch_add(1, Ordering::SeqCst);
+                async { Ok::<_, LpmError>(()) }
+            }
+        })
+        .await;
+
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert!(
+            result
+                .expect_err("a standalone token must not authorize an env operation")
+                .to_string()
+                .contains("not an interactive session")
+        );
+    }
 
     #[tokio::test]
     async fn wrong_step_up_credential_is_not_retried_as_a_stale_bearer() {
@@ -197,7 +298,7 @@ mod tests {
             .with_session(session);
         let calls = Arc::new(AtomicUsize::new(0));
 
-        let result = execute_sync_with_bearer(&client, AuthRequirement::TokenRequired, {
+        let result = execute_sync_with_bearer(&client, {
             let calls = Arc::clone(&calls);
             move |registry_url, auth_token| {
                 calls.fetch_add(1, Ordering::SeqCst);

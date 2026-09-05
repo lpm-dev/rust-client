@@ -90,6 +90,38 @@ impl VaultManifestSnapshot {
         active_principal_for_registry(sync, SyncVersionTarget::Personal, registry_url)
     }
 
+    pub fn personal_platform_principal_for_registry(
+        &self,
+        registry_url: &str,
+    ) -> Result<Option<String>, String> {
+        let Some(sync) = self.sync_object() else {
+            return Ok(None);
+        };
+        personal_platform_principal_for_registry(sync, registry_url)
+    }
+
+    pub fn personal_expected_principal_for_registry(
+        &self,
+        registry_url: &str,
+    ) -> Result<Option<String>, String> {
+        let Some(sync) = self.sync_object() else {
+            return Ok(None);
+        };
+        let cloud = active_principal_for_registry(sync, SyncVersionTarget::Personal, registry_url)?;
+        let platform = personal_platform_principal_for_registry(sync, registry_url)?;
+        if cloud
+            .as_ref()
+            .zip(platform.as_ref())
+            .is_some_and(|(cloud, platform)| cloud != platform)
+        {
+            return Err(
+                "this env checkout records different personal cloud and platform accounts for the same Registry; use a separate checkout"
+                    .to_owned(),
+            );
+        }
+        Ok(cloud.or(platform))
+    }
+
     pub fn org_sync_principal_for_registry(
         &self,
         org_slug: &str,
@@ -107,17 +139,7 @@ impl VaultManifestSnapshot {
 
     pub fn personal_sync_version_for_principal(&self, principal: SyncPrincipal<'_>) -> Option<i32> {
         let sync = self.sync_object()?;
-        if let Some(version) =
-            authority_checkpoint_version(sync, SyncVersionTarget::Personal, principal).ok()?
-        {
-            return Some(version);
-        }
-        if !stored_sync_principal_matches(sync.get("personalBinding"), principal).ok()? {
-            return None;
-        }
-        sync.get("personalVersion")
-            .and_then(serde_json::Value::as_i64)
-            .and_then(|version| i32::try_from(version).ok())
+        authority_checkpoint_version(sync, SyncVersionTarget::Personal, principal).ok()?
     }
 
     pub fn org_sync_version_for_principal(
@@ -126,21 +148,8 @@ impl VaultManifestSnapshot {
         principal: SyncPrincipal<'_>,
     ) -> Option<i32> {
         let sync = self.sync_object()?;
-        if let Some(version) =
-            authority_checkpoint_version(sync, SyncVersionTarget::Organization(org_slug), principal)
-                .ok()?
-        {
-            return Some(version);
-        }
-        let binding = sync.get("orgBindings")?.as_object()?.get(org_slug);
-        if !stored_sync_principal_matches(binding, principal).ok()? {
-            return None;
-        }
-        sync.get("orgVersions")?
-            .as_object()?
-            .get(org_slug)
-            .and_then(serde_json::Value::as_i64)
-            .and_then(|version| i32::try_from(version).ok())
+        authority_checkpoint_version(sync, SyncVersionTarget::Organization(org_slug), principal)
+            .ok()?
     }
 
     pub fn sync_summary(&self) -> VaultSyncSummary {
@@ -170,13 +179,6 @@ pub struct SyncPrincipal<'a> {
 pub(crate) enum SyncVersionTarget<'a> {
     Personal,
     Organization(&'a str),
-}
-
-#[derive(Clone, Copy)]
-enum AuthorityCheckpointWritePolicy {
-    RejectRollback,
-    PreserveFloor,
-    ResetAfterRemoteRecreation,
 }
 
 /// Read the vault ID from lpm.json, or generate one if it doesn't exist.
@@ -245,7 +247,7 @@ pub fn read_vault_id(project_dir: &Path) -> Option<String> {
 /// and absolute Windows drive letters. Standard UUIDs and slug-shaped
 /// IDs (alnum + `-` + `_`) pass.
 pub fn is_safe_vault_id(id: &str) -> bool {
-    if id.is_empty() || id.len() > 128 {
+    if id.is_empty() || id.len() > 128 || id.starts_with("__") {
         return false;
     }
     if id == "." || id == ".." {
@@ -284,17 +286,7 @@ pub fn read_personal_sync_version_for_principal(
 ) -> Option<i32> {
     let (_, config) = read_lpm_json_value(project_dir).ok()??;
     let sync = config.get("vaultSync")?.as_object()?;
-    if let Some(version) =
-        authority_checkpoint_version(sync, SyncVersionTarget::Personal, principal).ok()?
-    {
-        return Some(version);
-    }
-    if !stored_sync_principal_matches(sync.get("personalBinding"), principal).ok()? {
-        return None;
-    }
-    sync.get("personalVersion")
-        .and_then(serde_json::Value::as_i64)
-        .and_then(|version| i32::try_from(version).ok())
+    authority_checkpoint_version(sync, SyncVersionTarget::Personal, principal).ok()?
 }
 
 pub fn read_personal_sync_principal_for_registry(
@@ -311,6 +303,68 @@ pub fn read_personal_sync_principal_for_registry(
         return Ok(None);
     };
     active_principal_for_registry(sync, SyncVersionTarget::Personal, registry_url)
+}
+
+pub fn read_personal_platform_principal_for_registry(
+    project_dir: &Path,
+    registry_url: &str,
+) -> Result<Option<String>, String> {
+    let Some((_, config)) = read_lpm_json_value(project_dir)? else {
+        return Ok(None);
+    };
+    let Some(sync) = config
+        .get("vaultSync")
+        .and_then(serde_json::Value::as_object)
+    else {
+        return Ok(None);
+    };
+    personal_platform_principal_for_registry(sync, registry_url)
+}
+
+pub fn pin_personal_platform_principal_if_vault_matches(
+    project_dir: &Path,
+    expected_vault_id: &str,
+    principal: SyncPrincipal<'_>,
+) -> Result<(), String> {
+    validate_vault_id(expected_vault_id)?;
+    validate_sync_principal(principal)?;
+    let registry_url = canonical_registry_url(principal.registry_url)?;
+    lpm_common::update_lpm_json(project_dir, |root, _| {
+        if root.get("vault").and_then(serde_json::Value::as_str) != Some(expected_vault_id) {
+            return Err(
+                "the project vault ID changed while the platform identity was in flight".to_owned(),
+            );
+        }
+        let sync = object_entry(root, "vaultSync")?;
+        if let Some(sync_principal) =
+            active_principal_for_registry(sync, SyncVersionTarget::Personal, &registry_url)?
+            && sync_principal != principal.principal_id
+        {
+            return Err(
+                "this env checkout is bound to a different personal cloud account for this Registry; use a separate checkout when switching accounts"
+                    .to_owned(),
+            );
+        }
+        if let Some(current) = personal_platform_principal_for_registry(sync, &registry_url)? {
+            if current != principal.principal_id {
+                return Err(
+                    "this env checkout is bound to a different personal platform account for this Registry; use a separate checkout when switching accounts"
+                        .to_owned(),
+                );
+            }
+            return Ok(lpm_common::LpmJsonMutation::Unchanged(()));
+        }
+        let bindings = object_entry(sync, PERSONAL_PLATFORM_BINDINGS_FIELD)?;
+        if bindings.len() >= MAX_PERSONAL_PLATFORM_BINDINGS {
+            return Err(format!(
+                "lpm.json vaultSync reached the {MAX_PERSONAL_PLATFORM_BINDINGS}-platform binding limit"
+            ));
+        }
+        bindings.insert(registry_url, sync_principal_value(principal)?);
+        Ok(lpm_common::LpmJsonMutation::Changed(()))
+    })
+    .map(|_| ())
+    .map_err(|error| error.to_string())
 }
 
 pub fn read_personal_sync_synced_at(project_dir: &Path) -> Option<String> {
@@ -352,22 +406,6 @@ pub fn write_personal_sync_version_for_principal_if_vault_matches(
     )
 }
 
-/// Persist the first revision of a recreated personal cloud env for its retained principal.
-pub fn write_recreated_personal_sync_version_for_principal_if_vault_matches(
-    project_dir: &Path,
-    expected_vault_id: &str,
-    version: i32,
-    principal: SyncPrincipal<'_>,
-) -> Result<(), String> {
-    write_recreated_sync_version_for_principal_if_vault_matches(
-        project_dir,
-        expected_vault_id,
-        SyncVersionTarget::Personal,
-        version,
-        principal,
-    )
-}
-
 pub fn write_personal_sync_version_for_principal_at(
     project_dir: &Path,
     version: i32,
@@ -377,12 +415,9 @@ pub fn write_personal_sync_version_for_principal_at(
     validate_sync_principal(principal)?;
     lpm_common::update_lpm_json(project_dir, |root, _| {
         let sync = object_entry(root, "vaultSync")?;
-        let unbound_floor = legacy_unbound_floor(sync, SyncVersionTarget::Personal)?;
-        migrate_legacy_authority_checkpoints(sync)?;
         reject_sync_principal_conflict(sync, SyncVersionTarget::Personal, principal)?;
         let current =
-            authority_checkpoint_floor(sync, SyncVersionTarget::Personal, principal.registry_url)?
-                .or(unbound_floor);
+            authority_checkpoint_floor(sync, SyncVersionTarget::Personal, principal.registry_url)?;
         reject_sync_version_rollback(current, version)?;
         upsert_authority_checkpoint(
             sync,
@@ -390,14 +425,12 @@ pub fn write_personal_sync_version_for_principal_at(
             principal,
             version,
             synced_at,
-            AuthorityCheckpointWritePolicy::RejectRollback,
         )?;
         sync.insert("personalVersion".into(), serde_json::json!(version));
         sync.insert(
             "personalSyncedAt".into(),
             serde_json::json!(synced_at.to_string()),
         );
-        sync.insert("personalBinding".into(), sync_principal_value(principal)?);
         Ok(lpm_common::LpmJsonMutation::Changed(()))
     })
     .map(|_| ())
@@ -445,21 +478,7 @@ pub fn read_org_sync_version_for_principal(
 ) -> Option<i32> {
     let (_, config) = read_lpm_json_value(project_dir).ok()??;
     let sync = config.get("vaultSync")?.as_object()?;
-    if let Some(version) =
-        authority_checkpoint_version(sync, SyncVersionTarget::Organization(org_slug), principal)
-            .ok()?
-    {
-        return Some(version);
-    }
-    let binding = sync.get("orgBindings")?.as_object()?.get(org_slug);
-    if !stored_sync_principal_matches(binding, principal).ok()? {
-        return None;
-    }
-    sync.get("orgVersions")?
-        .as_object()?
-        .get(org_slug)
-        .and_then(serde_json::Value::as_i64)
-        .and_then(|version| i32::try_from(version).ok())
+    authority_checkpoint_version(sync, SyncVersionTarget::Organization(org_slug), principal).ok()?
 }
 
 pub fn read_org_sync_principal_for_registry(
@@ -535,23 +554,6 @@ pub fn write_org_sync_version_for_principal_if_vault_matches(
     )
 }
 
-/// Persist the first revision of a recreated organization cloud env for its retained principal.
-pub fn write_recreated_org_sync_version_for_principal_if_vault_matches(
-    project_dir: &Path,
-    expected_vault_id: &str,
-    org_slug: &str,
-    version: i32,
-    principal: SyncPrincipal<'_>,
-) -> Result<(), String> {
-    write_recreated_sync_version_for_principal_if_vault_matches(
-        project_dir,
-        expected_vault_id,
-        SyncVersionTarget::Organization(org_slug),
-        version,
-        principal,
-    )
-}
-
 pub fn write_org_sync_version_for_principal_at(
     project_dir: &Path,
     org_slug: &str,
@@ -563,26 +565,14 @@ pub fn write_org_sync_version_for_principal_at(
     lpm_common::update_lpm_json(project_dir, |root, _| {
         let sync = object_entry(root, "vaultSync")?;
         let target = SyncVersionTarget::Organization(org_slug);
-        let unbound_floor = legacy_unbound_floor(sync, target)?;
-        migrate_legacy_authority_checkpoints(sync)?;
         reject_sync_principal_conflict(sync, target, principal)?;
-        let current =
-            authority_checkpoint_floor(sync, target, principal.registry_url)?.or(unbound_floor);
+        let current = authority_checkpoint_floor(sync, target, principal.registry_url)?;
         reject_sync_version_rollback(current, version)?;
-        upsert_authority_checkpoint(
-            sync,
-            target,
-            principal,
-            version,
-            synced_at,
-            AuthorityCheckpointWritePolicy::RejectRollback,
-        )?;
+        upsert_authority_checkpoint(sync, target, principal, version, synced_at)?;
         let org_versions = object_entry(sync, "orgVersions")?;
         org_versions.insert(org_slug.to_string(), serde_json::json!(version));
         object_entry(sync, "orgSyncedAt")?
             .insert(org_slug.to_string(), serde_json::json!(synced_at));
-        object_entry(sync, "orgBindings")?
-            .insert(org_slug.to_string(), sync_principal_value(principal)?);
         Ok(lpm_common::LpmJsonMutation::Changed(()))
     })
     .map(|_| ())
@@ -652,63 +642,12 @@ fn sync_principal_value(principal: SyncPrincipal<'_>) -> Result<serde_json::Valu
     }))
 }
 
-fn stored_sync_principal_matches(
-    value: Option<&serde_json::Value>,
-    principal: SyncPrincipal<'_>,
-) -> Result<bool, String> {
-    let Some(value) = value.filter(|value| !value.is_null()) else {
-        return Ok(false);
-    };
-    let object = value
-        .as_object()
-        .ok_or("lpm.json vaultSync principal binding must be an object")?;
-    let registry_url = object
-        .get("registryUrl")
-        .and_then(serde_json::Value::as_str)
-        .ok_or("lpm.json vaultSync principal binding registryUrl must be a string")?;
-    let principal_id = object
-        .get("principalId")
-        .and_then(serde_json::Value::as_str)
-        .ok_or("lpm.json vaultSync principal binding principalId must be a string")?;
-    Ok(
-        canonical_registry_url(registry_url)? == canonical_registry_url(principal.registry_url)?
-            && principal_id == principal.principal_id,
-    )
-}
-
-fn active_sync_binding(
-    sync: &serde_json::Map<String, serde_json::Value>,
-    target: SyncVersionTarget<'_>,
-) -> Result<Option<(String, String)>, String> {
-    let binding = match target {
-        SyncVersionTarget::Personal => sync.get("personalBinding"),
-        SyncVersionTarget::Organization(slug) => sync
-            .get("orgBindings")
-            .filter(|value| !value.is_null())
-            .map(|value| {
-                value
-                    .as_object()
-                    .ok_or("lpm.json vaultSync orgBindings must be an object")
-            })
-            .transpose()?
-            .and_then(|bindings| bindings.get(slug)),
-    };
-    binding
-        .filter(|value| !value.is_null())
-        .map(parse_stored_sync_principal)
-        .transpose()
-}
-
 fn active_principal_for_registry(
     sync: &serde_json::Map<String, serde_json::Value>,
     target: SyncVersionTarget<'_>,
     registry_url: &str,
 ) -> Result<Option<String>, String> {
     let expected_registry = canonical_registry_url(registry_url)?;
-    let active_principal =
-        active_sync_binding(sync, target)?.and_then(|(stored_registry, principal_id)| {
-            (stored_registry == expected_registry).then_some(principal_id)
-        });
     validate_authority_checkpoints(sync)?;
     let checkpoint_principals = sync
         .get(AUTHORITY_CHECKPOINTS_FIELD)
@@ -728,17 +667,7 @@ fn active_principal_for_registry(
         Some(principals) => principals.keys().next().cloned(),
         None => None,
     };
-    if active_principal
-        .as_ref()
-        .zip(checkpoint_principal.as_ref())
-        .is_some_and(|(active, checkpoint)| active != checkpoint)
-    {
-        return Err(
-            "this env checkout records different accounts for the same Registry and scope; use a separate checkout"
-                .to_owned(),
-        );
-    }
-    Ok(active_principal.or(checkpoint_principal))
+    Ok(checkpoint_principal)
 }
 
 fn reject_sync_principal_conflict(
@@ -746,6 +675,16 @@ fn reject_sync_principal_conflict(
     target: SyncVersionTarget<'_>,
     principal: SyncPrincipal<'_>,
 ) -> Result<(), String> {
+    if matches!(target, SyncVersionTarget::Personal)
+        && let Some(platform_principal) =
+            personal_platform_principal_for_registry(sync, principal.registry_url)?
+        && platform_principal != principal.principal_id
+    {
+        return Err(
+            "this env checkout is bound to a different personal platform account for this Registry; use a separate checkout when switching accounts"
+                .to_owned(),
+        );
+    }
     let Some(active_principal) =
         active_principal_for_registry(sync, target, principal.registry_url)?
     else {
@@ -760,10 +699,47 @@ fn reject_sync_principal_conflict(
 	)
 }
 
+const MAX_PERSONAL_PLATFORM_BINDINGS: usize = 64;
+const PERSONAL_PLATFORM_BINDINGS_FIELD: &str = "personalPlatformBindings";
 const MAX_SYNC_AUTHORITY_CHECKPOINTS: usize = 64;
 const AUTHORITY_CHECKPOINTS_FIELD: &str = "authorityCheckpoints";
 const PERSONAL_AUTHORITY_CHECKPOINTS_FIELD: &str = "personal";
 const ORGANIZATION_AUTHORITY_CHECKPOINTS_FIELD: &str = "organizations";
+
+fn personal_platform_principal_for_registry(
+    sync: &serde_json::Map<String, serde_json::Value>,
+    registry_url: &str,
+) -> Result<Option<String>, String> {
+    let expected_registry = canonical_registry_url(registry_url)?;
+    let Some(value) = sync
+        .get(PERSONAL_PLATFORM_BINDINGS_FIELD)
+        .filter(|value| !value.is_null())
+    else {
+        return Ok(None);
+    };
+    let bindings = value
+        .as_object()
+        .ok_or("lpm.json vaultSync personalPlatformBindings must be an object")?;
+    if bindings.len() > MAX_PERSONAL_PLATFORM_BINDINGS {
+        return Err(format!(
+            "lpm.json vaultSync exceeds the {MAX_PERSONAL_PLATFORM_BINDINGS}-platform binding limit"
+        ));
+    }
+    let mut expected_principal = None;
+    for (registry_url, binding) in bindings {
+        let canonical_key = canonical_registry_url(registry_url)?;
+        let (bound_registry, principal_id) = parse_stored_sync_principal(binding)?;
+        if canonical_key != *registry_url || bound_registry != canonical_key {
+            return Err(
+                "lpm.json vaultSync personal platform binding Registry is inconsistent".to_owned(),
+            );
+        }
+        if canonical_key == expected_registry {
+            expected_principal = Some(principal_id);
+        }
+    }
+    Ok(expected_principal)
+}
 
 fn validate_checkpoint_organization_slug(slug: &str) -> Result<(), String> {
     if slug.is_empty() || slug.len() > 128 || slug.chars().any(char::is_control) {
@@ -973,7 +949,6 @@ fn upsert_authority_checkpoint(
     principal: SyncPrincipal<'_>,
     version: i32,
     synced_at: &str,
-    policy: AuthorityCheckpointWritePolicy,
 ) -> Result<(), String> {
     validate_sync_principal(principal)?;
     if version <= 0 {
@@ -992,13 +967,7 @@ fn upsert_authority_checkpoint(
             optional_sync_version(checkpoint.get("version"), "authority checkpoint version")?
                 .ok_or("lpm.json vaultSync authority checkpoint version is required")?;
         if version < current {
-            match policy {
-                AuthorityCheckpointWritePolicy::RejectRollback => {
-                    return reject_sync_version_rollback(Some(current), version);
-                }
-                AuthorityCheckpointWritePolicy::PreserveFloor => return Ok(()),
-                AuthorityCheckpointWritePolicy::ResetAfterRemoteRecreation => {}
-            }
+            return reject_sync_version_rollback(Some(current), version);
         }
         checkpoint.insert("version".to_owned(), serde_json::json!(version));
         checkpoint.insert("syncedAt".to_owned(), serde_json::json!(synced_at));
@@ -1041,112 +1010,6 @@ fn parse_stored_sync_principal(value: &serde_json::Value) -> Result<(String, Str
     ))
 }
 
-fn migrate_legacy_authority_checkpoints(
-    sync: &mut serde_json::Map<String, serde_json::Value>,
-) -> Result<(), String> {
-    let mut legacy = Vec::new();
-    if let Some(binding) = sync.get("personalBinding").filter(|value| !value.is_null())
-        && let Some(version) =
-            optional_sync_version(sync.get("personalVersion"), "personalVersion")?
-    {
-        let (registry_url, principal_id) = parse_stored_sync_principal(binding)?;
-        let synced_at = sync
-            .get("personalSyncedAt")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or_default()
-            .to_owned();
-        legacy.push((None, registry_url, principal_id, version, synced_at));
-    }
-    if let Some(bindings_value) = sync.get("orgBindings").filter(|value| !value.is_null()) {
-        let bindings = bindings_value
-            .as_object()
-            .ok_or("lpm.json vaultSync orgBindings must be an object")?;
-        for (slug, binding) in bindings {
-            let Some(version) = sync
-                .get("orgVersions")
-                .and_then(serde_json::Value::as_object)
-                .map(|versions| optional_sync_version(versions.get(slug), "orgVersions entry"))
-                .transpose()?
-                .flatten()
-            else {
-                continue;
-            };
-            let (registry_url, principal_id) = parse_stored_sync_principal(binding)?;
-            let synced_at = sync
-                .get("orgSyncedAt")
-                .and_then(serde_json::Value::as_object)
-                .and_then(|entries| entries.get(slug))
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or_default()
-                .to_owned();
-            legacy.push((
-                Some(slug.to_owned()),
-                registry_url,
-                principal_id,
-                version,
-                synced_at,
-            ));
-        }
-    }
-
-    for (org_slug, registry_url, principal_id, version, synced_at) in legacy {
-        let target = org_slug
-            .as_deref()
-            .map_or(SyncVersionTarget::Personal, SyncVersionTarget::Organization);
-        upsert_authority_checkpoint(
-            sync,
-            target,
-            SyncPrincipal {
-                registry_url: &registry_url,
-                principal_id: &principal_id,
-            },
-            version,
-            &synced_at,
-            AuthorityCheckpointWritePolicy::PreserveFloor,
-        )?;
-    }
-    Ok(())
-}
-
-fn legacy_unbound_floor(
-    sync: &serde_json::Map<String, serde_json::Value>,
-    target: SyncVersionTarget<'_>,
-) -> Result<Option<i32>, String> {
-    match target {
-        SyncVersionTarget::Personal => {
-            if sync
-                .get("personalBinding")
-                .is_some_and(|value| !value.is_null())
-            {
-                return Ok(None);
-            }
-            optional_sync_version(sync.get("personalVersion"), "personalVersion")
-        }
-        SyncVersionTarget::Organization(slug) => {
-            let binding = match sync.get("orgBindings").filter(|value| !value.is_null()) {
-                Some(value) => Some(
-                    value
-                        .as_object()
-                        .ok_or("lpm.json vaultSync orgBindings must be an object")?
-                        .get(slug),
-                ),
-                None => None,
-            }
-            .flatten();
-            if binding.is_some_and(|value| !value.is_null()) {
-                return Ok(None);
-            }
-            let version = sync
-                .get("orgVersions")
-                .and_then(serde_json::Value::as_object)
-                .map(|versions| optional_sync_version(versions.get(slug), "orgVersions entry"))
-                .transpose()?
-                .flatten();
-            Ok(version)
-        }
-    }
-}
-
 pub(crate) fn commit_sync_version_if_vault_matches(
     project_dir: &Path,
     expected_vault_id: &str,
@@ -1183,66 +1046,6 @@ pub(crate) fn commit_sync_version_for_principal_if_vault_matches(
     )
 }
 
-fn write_recreated_sync_version_for_principal_if_vault_matches(
-    project_dir: &Path,
-    expected_vault_id: &str,
-    target: SyncVersionTarget<'_>,
-    version: i32,
-    principal: SyncPrincipal<'_>,
-) -> Result<(), String> {
-    validate_vault_id(expected_vault_id)?;
-    validate_sync_principal(principal)?;
-    let synced_at = rfc3339_now();
-    lpm_common::update_lpm_json(project_dir, |root, _| {
-        if root.get("vault").and_then(serde_json::Value::as_str) != Some(expected_vault_id) {
-            return Err(
-                "the project vault ID changed while the cloud operation was in flight".to_owned(),
-            );
-        }
-
-        let sync = object_entry(root, "vaultSync")?;
-        migrate_legacy_authority_checkpoints(sync)?;
-        if active_principal_for_registry(sync, target, principal.registry_url)?.as_deref()
-            != Some(principal.principal_id)
-        {
-            return Err(
-                "a recreated cloud env can reset only the retained checkpoint for its bound principal"
-                    .to_owned(),
-            );
-        }
-        upsert_authority_checkpoint(
-            sync,
-            target,
-            principal,
-            version,
-            &synced_at,
-            AuthorityCheckpointWritePolicy::ResetAfterRemoteRecreation,
-        )?;
-
-        match target {
-            SyncVersionTarget::Personal => {
-                sync.insert("personalVersion".to_owned(), serde_json::json!(version));
-                sync.insert(
-                    "personalSyncedAt".to_owned(),
-                    serde_json::json!(synced_at),
-                );
-                sync.insert("personalBinding".to_owned(), sync_principal_value(principal)?);
-            }
-            SyncVersionTarget::Organization(slug) => {
-                object_entry(sync, "orgVersions")?
-                    .insert(slug.to_owned(), serde_json::json!(version));
-                object_entry(sync, "orgSyncedAt")?
-                    .insert(slug.to_owned(), serde_json::json!(synced_at));
-                object_entry(sync, "orgBindings")?
-                    .insert(slug.to_owned(), sync_principal_value(principal)?);
-            }
-        }
-        Ok(lpm_common::LpmJsonMutation::Changed(()))
-    })
-    .map(|_| ())
-    .map_err(|error| error.to_string())
-}
-
 fn commit_sync_version_if_vault_matches_inner(
     project_dir: &Path,
     expected_vault_id: &str,
@@ -1267,10 +1070,8 @@ fn commit_sync_version_if_vault_matches_inner(
         previous_sync = Some(root.get("vaultSync").cloned());
         let sync = object_entry(root, "vaultSync")?;
         let current_version = if let Some(principal) = principal {
-            let unbound_floor = legacy_unbound_floor(sync, target)?;
-            migrate_legacy_authority_checkpoints(sync)?;
             reject_sync_principal_conflict(sync, target, principal)?;
-            authority_checkpoint_floor(sync, target, principal.registry_url)?.or(unbound_floor)
+            authority_checkpoint_floor(sync, target, principal.registry_url)?
         } else {
             match target {
                 SyncVersionTarget::Personal => {
@@ -1284,14 +1085,7 @@ fn commit_sync_version_if_vault_matches_inner(
         };
         reject_sync_version_rollback(current_version, version)?;
         if let Some(principal) = principal {
-            upsert_authority_checkpoint(
-                sync,
-                target,
-                principal,
-                version,
-                &synced_at,
-                AuthorityCheckpointWritePolicy::RejectRollback,
-            )?;
+            upsert_authority_checkpoint(sync, target, principal, version, &synced_at)?;
         }
         match target {
             SyncVersionTarget::Personal => {
@@ -1300,19 +1094,12 @@ fn commit_sync_version_if_vault_matches_inner(
                     "personalSyncedAt".into(),
                     serde_json::json!(synced_at.clone()),
                 );
-                if let Some(principal) = principal {
-                    sync.insert("personalBinding".into(), sync_principal_value(principal)?);
-                }
             }
             SyncVersionTarget::Organization(slug) => {
                 object_entry(sync, "orgVersions")?
                     .insert(slug.to_owned(), serde_json::json!(version));
                 object_entry(sync, "orgSyncedAt")?
                     .insert(slug.to_owned(), serde_json::json!(synced_at.clone()));
-                if let Some(principal) = principal {
-                    object_entry(sync, "orgBindings")?
-                        .insert(slug.to_owned(), sync_principal_value(principal)?);
-                }
             }
         }
         committed_sync = Some(root.get("vaultSync").cloned());
@@ -1870,11 +1657,16 @@ mod tests {
     }
 
     #[test]
-    fn scoped_personal_floor_migrates_legacy_fail_closed_and_retains_authorities() {
+    fn scoped_personal_floor_uses_only_current_authority_checkpoints() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(
             dir.path().join("lpm.json"),
-            r#"{"vault":"vault-123","vaultSync":{"personalVersion":99}}"#,
+            r#"{
+                "vault": "vault-123",
+                "vaultSync": {
+                    "personalVersion": 99
+                }
+            }"#,
         )
         .unwrap();
         let account_a = SyncPrincipal {
@@ -1886,18 +1678,16 @@ mod tests {
             read_personal_sync_version_for_principal(dir.path(), account_a),
             None
         );
-        let before_legacy_rollback = std::fs::read(dir.path().join("lpm.json")).unwrap();
-        let legacy_error = write_personal_sync_version_for_principal_at(
+        write_personal_sync_version_for_principal_at(
             dir.path(),
             4,
             account_a,
             "2026-09-03T12:00:00Z",
         )
-        .expect_err("unbound legacy metadata must remain a fail-closed rollback floor");
-        assert!(legacy_error.contains("older"), "{legacy_error}");
+        .expect("an unbound summary version must not participate in the current checkpoint floor");
         assert_eq!(
-            std::fs::read(dir.path().join("lpm.json")).unwrap(),
-            before_legacy_rollback,
+            read_personal_sync_version_for_principal(dir.path(), account_a),
+            Some(4)
         );
         write_personal_sync_version_for_principal_at(
             dir.path(),
@@ -1997,6 +1787,96 @@ mod tests {
     }
 
     #[test]
+    fn personal_authority_checkpoint_ignores_unbound_summary_version() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("lpm.json"),
+            r#"{
+                "vault": "vault-123",
+                "vaultSync": {
+                    "personalVersion": 99,
+                    "authorityCheckpoints": {
+                        "personal": {
+                            "https://lpm.dev": {
+                                "user-a": { "version": 4 }
+                            }
+                        }
+                    }
+                }
+            }"#,
+        )
+        .unwrap();
+        write_personal_sync_version_for_principal_at(
+            dir.path(),
+            5,
+            SyncPrincipal {
+                registry_url: "https://lpm.dev",
+                principal_id: "user-a",
+            },
+            "2026-09-04T12:00:00Z",
+        )
+        .expect("only the principal-bound checkpoint is an authoritative rollback floor");
+
+        assert_eq!(
+            read_personal_sync_version_for_principal(
+                dir.path(),
+                SyncPrincipal {
+                    registry_url: "https://lpm.dev",
+                    principal_id: "user-a",
+                }
+            ),
+            Some(5)
+        );
+    }
+
+    #[test]
+    fn organization_authority_checkpoint_ignores_unbound_summary_version() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("lpm.json"),
+            r#"{
+                "vault": "vault-123",
+                "vaultSync": {
+                    "orgVersions": { "acme": 99 },
+                    "authorityCheckpoints": {
+                        "organizations": {
+                            "acme": {
+                                "https://lpm.dev": {
+                                    "organization-a": { "version": 4 }
+                                }
+                            }
+                        }
+                    }
+                }
+            }"#,
+        )
+        .unwrap();
+        write_org_sync_version_for_principal_at(
+            dir.path(),
+            "acme",
+            5,
+            SyncPrincipal {
+                registry_url: "https://lpm.dev",
+                principal_id: "organization-a",
+            },
+            "2026-09-04T12:00:00Z",
+        )
+        .expect("only the principal-bound checkpoint is an authoritative rollback floor");
+
+        assert_eq!(
+            read_org_sync_version_for_principal(
+                dir.path(),
+                "acme",
+                SyncPrincipal {
+                    registry_url: "https://lpm.dev",
+                    principal_id: "organization-a",
+                }
+            ),
+            Some(5)
+        );
+    }
+
+    #[test]
     fn conflicting_personal_checkpoint_principals_fail_closed() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(
@@ -2005,10 +1885,6 @@ mod tests {
                 "vault": "vault-123",
                 "vaultSync": {
                     "personalVersion": 2,
-                    "personalBinding": {
-                        "registryUrl": "https://lpm.dev",
-                        "principalId": "user-b"
-                    },
                     "authorityCheckpoints": {
                         "personal": {
                             "https://lpm.dev": {
@@ -2092,6 +1968,174 @@ mod tests {
         .expect_err("a Registry detour must not permit personal principal substitution");
 
         assert!(error.contains("different account"), "{error}");
+        assert_eq!(std::fs::read(dir.path().join("lpm.json")).unwrap(), before);
+    }
+
+    #[test]
+    fn personal_platform_principal_pin_does_not_fabricate_a_sync_revision() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("lpm.json"), r#"{"vault":"vault-123"}"#).unwrap();
+        let principal = SyncPrincipal {
+            registry_url: "https://lpm.dev",
+            principal_id: "account-a",
+        };
+
+        pin_personal_platform_principal_if_vault_matches(dir.path(), "vault-123", principal)
+            .unwrap();
+
+        assert_eq!(
+            read_personal_platform_principal_for_registry(dir.path(), principal.registry_url)
+                .unwrap()
+                .as_deref(),
+            Some(principal.principal_id),
+        );
+        assert_eq!(read_personal_sync_version(dir.path()), None);
+    }
+
+    #[test]
+    fn personal_expected_principal_uses_a_platform_binding_without_a_sync_revision() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("lpm.json"), r#"{"vault":"vault-123"}"#).unwrap();
+        let principal = SyncPrincipal {
+            registry_url: "https://lpm.dev",
+            principal_id: "account-a",
+        };
+        pin_personal_platform_principal_if_vault_matches(dir.path(), "vault-123", principal)
+            .unwrap();
+        let manifest = VaultManifestSnapshot::read(dir.path()).unwrap();
+
+        assert_eq!(
+            manifest
+                .personal_expected_principal_for_registry(principal.registry_url)
+                .unwrap()
+                .as_deref(),
+            Some(principal.principal_id),
+        );
+        assert_eq!(
+            manifest.personal_sync_version_for_principal(principal),
+            None
+        );
+    }
+
+    #[test]
+    fn personal_platform_principal_pin_rejects_account_substitution() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("lpm.json"), r#"{"vault":"vault-123"}"#).unwrap();
+        pin_personal_platform_principal_if_vault_matches(
+            dir.path(),
+            "vault-123",
+            SyncPrincipal {
+                registry_url: "https://lpm.dev",
+                principal_id: "account-a",
+            },
+        )
+        .unwrap();
+        let before = std::fs::read(dir.path().join("lpm.json")).unwrap();
+
+        let error = pin_personal_platform_principal_if_vault_matches(
+            dir.path(),
+            "vault-123",
+            SyncPrincipal {
+                registry_url: "https://lpm.dev",
+                principal_id: "account-b",
+            },
+        )
+        .expect_err("a different account must not replace the platform binding");
+
+        assert!(
+            error.contains("different personal platform account"),
+            "{error}"
+        );
+        assert_eq!(std::fs::read(dir.path().join("lpm.json")).unwrap(), before);
+    }
+
+    #[test]
+    fn personal_platform_principal_pin_rejects_a_replaced_vault() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("lpm.json"),
+            r#"{"vault":"replacement-vault"}"#,
+        )
+        .unwrap();
+        let before = std::fs::read(dir.path().join("lpm.json")).unwrap();
+
+        let error = pin_personal_platform_principal_if_vault_matches(
+            dir.path(),
+            "expected-vault",
+            SyncPrincipal {
+                registry_url: "https://lpm.dev",
+                principal_id: "account-a",
+            },
+        )
+        .expect_err("the binding must stay attached to the captured vault ID");
+
+        assert!(error.contains("vault ID changed"), "{error}");
+        assert_eq!(std::fs::read(dir.path().join("lpm.json")).unwrap(), before);
+    }
+
+    #[test]
+    fn personal_platform_pin_rejects_a_different_cloud_principal() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("lpm.json"), r#"{"vault":"vault-123"}"#).unwrap();
+        write_personal_sync_version_for_principal_at(
+            dir.path(),
+            1,
+            SyncPrincipal {
+                registry_url: "https://lpm.dev",
+                principal_id: "cloud-account-a",
+            },
+            "2026-09-04T12:00:00Z",
+        )
+        .unwrap();
+        let before = std::fs::read(dir.path().join("lpm.json")).unwrap();
+
+        let error = pin_personal_platform_principal_if_vault_matches(
+            dir.path(),
+            "vault-123",
+            SyncPrincipal {
+                registry_url: "https://lpm.dev",
+                principal_id: "platform-account-b",
+            },
+        )
+        .expect_err("platform identity must agree with the cloud identity");
+
+        assert!(
+            error.contains("different personal cloud account"),
+            "{error}"
+        );
+        assert_eq!(std::fs::read(dir.path().join("lpm.json")).unwrap(), before);
+    }
+
+    #[test]
+    fn personal_cloud_write_rejects_a_different_platform_principal() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("lpm.json"), r#"{"vault":"vault-123"}"#).unwrap();
+        pin_personal_platform_principal_if_vault_matches(
+            dir.path(),
+            "vault-123",
+            SyncPrincipal {
+                registry_url: "https://lpm.dev",
+                principal_id: "platform-account-b",
+            },
+        )
+        .unwrap();
+        let before = std::fs::read(dir.path().join("lpm.json")).unwrap();
+
+        let error = write_personal_sync_version_for_principal_at(
+            dir.path(),
+            1,
+            SyncPrincipal {
+                registry_url: "https://lpm.dev",
+                principal_id: "cloud-account-a",
+            },
+            "2026-09-04T12:00:00Z",
+        )
+        .expect_err("cloud identity must agree with the platform identity");
+
+        assert!(
+            error.contains("different personal platform account"),
+            "{error}"
+        );
         assert_eq!(std::fs::read(dir.path().join("lpm.json")).unwrap(), before);
     }
 
@@ -2305,12 +2349,6 @@ mod tests {
                 "vault": "vault-123",
                 "vaultSync": {
                     "orgVersions": { "acme": 2 },
-                    "orgBindings": {
-                        "acme": {
-                            "registryUrl": "https://lpm.dev",
-                            "principalId": "org-current"
-                        }
-                    },
                     "authorityCheckpoints": {
                         "organizations": {
                             "acme": {
@@ -2374,6 +2412,8 @@ mod tests {
     #[test]
     fn is_safe_vault_id_rejects_path_traversal_and_separators() {
         assert!(!is_safe_vault_id(""));
+        assert!(!is_safe_vault_id("__vault_project_index_marker__"));
+        assert!(!is_safe_vault_id("__reserved"));
         assert!(!is_safe_vault_id("."));
         assert!(!is_safe_vault_id(".."));
         assert!(!is_safe_vault_id("../escape"));

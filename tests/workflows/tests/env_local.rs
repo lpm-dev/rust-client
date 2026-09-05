@@ -367,6 +367,38 @@ fn env_set_with_env_flag_scopes_to_named_environment() {
     );
 }
 
+#[test]
+fn env_ls_treats_a_valid_unconfigured_environment_as_current_vault_state() {
+    let project = TempProject::empty(r#"{"name":"env-custom","version":"1.0.0"}"#);
+
+    lpm(&project)
+        .args(["env", "set", "--env=preview", "API_URL=preview-url"])
+        .assert()
+        .success();
+
+    let human = lpm(&project)
+        .args(["env", "ls"])
+        .output()
+        .expect("list custom environment");
+    assert!(human.status.success());
+    let human_stdout = String::from_utf8_lossy(&human.stdout);
+    assert!(human_stdout.contains("preview"));
+    assert!(!human_stdout.to_ascii_lowercase().contains("legacy"));
+
+    let json = lpm(&project)
+        .args(["--json", "env", "ls"])
+        .output()
+        .expect("list custom environment as JSON");
+    assert!(json.status.success());
+    let envelope: serde_json::Value =
+        serde_json::from_slice(&json.stdout).expect("env ls JSON must be one document");
+    let preview = envelope["environments"]
+        .as_array()
+        .and_then(|rows| rows.iter().find(|row| row["environment"] == "preview"))
+        .expect("custom environment must be present");
+    assert_eq!(preview["source"], "Vault");
+}
+
 // ─── init (explicit `lpm env init` action) ─────────────────────────────
 
 #[test]
@@ -404,10 +436,11 @@ fn env_init_under_json_emits_envelope_with_environments_and_results_arrays() {
 fn env_init_configured_alias_and_path_cannot_inject_terminal_rows() {
     let project = TempProject::empty(r#"{"name":"env-init-test","version":"1.0.0"}"#);
     let hostile = "safe\nFORGED\rrewritten\u{8}\u{1b}]52;c;AAAA\u{7}\u{0090}hidden\u{009c}end";
-    project.write_file(
-        "lpm.json",
-        &serde_json::json!({ "env": { "dev": format!(".env.{hostile}") } }).to_string(),
-    );
+    let env = serde_json::Map::from_iter([(
+        hostile.to_owned(),
+        serde_json::Value::String(".env.safe".to_owned()),
+    )]);
+    project.write_file("lpm.json", &serde_json::json!({ "env": env }).to_string());
 
     let output = lpm(&project)
         .args(["env", "init"])
@@ -432,6 +465,26 @@ fn env_init_configured_alias_and_path_cannot_inject_terminal_rows() {
             "env init output retained {attacker_fragment:?}: {rendered:?}",
         );
     }
+}
+
+#[test]
+fn env_init_rejects_an_invalid_configured_environment_without_mutating_the_manifest() {
+    let project = TempProject::empty(r#"{"name":"env-init-invalid","version":"1.0.0"}"#);
+    let manifest = serde_json::json!({
+        "env": {
+            "dev": ".env.invalid\nname"
+        }
+    })
+    .to_string();
+    project.write_file("lpm.json", &manifest);
+
+    let output = lpm(&project)
+        .args(["--json", "env", "init"])
+        .output()
+        .expect("failed to run lpm env init");
+
+    assert!(!output.status.success(), "invalid env init must fail");
+    assert_eq!(project.read_file("lpm.json"), manifest);
 }
 
 // ─── pair / unpair (auth-error envelope path only) ─────────────────────

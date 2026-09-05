@@ -21,10 +21,11 @@ fn parse_pull_target<'a>(args: &'a [&str]) -> Result<PullTarget<'a>, LpmError> {
         .iter()
         .any(|argument| *argument == "--org" || argument.starts_with("--org="));
 
-    if usize::from(platform_selected) + usize::from(oidc_selected) + usize::from(org_selected) > 1 {
+    if oidc_selected && (platform_selected || org_selected) {
         return Err(LpmError::Script(USAGE.into()));
     }
     if platform_selected {
+        super::platform::validate_platform_pull_arguments(command_args, USAGE)?;
         return Ok(PullTarget::Platform);
     }
     if oidc_selected {
@@ -196,13 +197,11 @@ pub(super) async fn vars_pull(
     }
     let expected_principal_id = manifest
         .vault
-        .personal_sync_principal_for_registry(client.base_url())
+        .personal_expected_principal_for_registry(client.base_url())
         .map_err(LpmError::Script)?;
 
-    let (pulled, registry_url) = super::auth::execute_sync_with_bearer(
-        client,
-        lpm_auth::AuthRequirement::TokenRequired,
-        |registry_url, auth_token| {
+    let (pulled, registry_url) =
+        super::auth::execute_sync_with_bearer(client, |registry_url, auth_token| {
             let vault_id = vault_id.clone();
             let expected_principal_id = expected_principal_id.clone();
             async move {
@@ -215,9 +214,8 @@ pub(super) async fn vars_pull(
                 .await?;
                 Ok((pulled, registry_url))
             }
-        },
-    )
-    .await?;
+        })
+        .await?;
 
     let remote_envs =
         super::sync_payload::parse_remote_pull_payload_for_overwrite(&pulled.raw_json)
@@ -302,10 +300,20 @@ mod tests {
     fn pull_target_rejects_conflicting_scope_selectors() {
         for args in [
             &["pull", "--org=acme", "--oidc"][..],
-            &["pull", "--org", "acme", "--from=vercel"][..],
             &["pull", "--oidc", "--from", "vercel"][..],
+            &["pull", "--from", "vercel", "--orgg", "acme", "--yes"][..],
+            &["pull", "--from", "vercel", "stray"][..],
+            &["pull", "--from", "vercel", "--from", "railway"][..],
         ] {
             assert!(parse_pull_target(args).is_err(), "accepted {args:?}");
         }
+    }
+
+    #[test]
+    fn platform_pull_accepts_an_explicit_organization_scope() {
+        let target = parse_pull_target(&["pull", "--from=vercel", "--org=acme"])
+            .expect("platform organization scope should parse");
+
+        assert!(matches!(target, PullTarget::Platform));
     }
 }

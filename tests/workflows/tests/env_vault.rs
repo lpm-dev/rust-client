@@ -4,7 +4,7 @@ mod support;
 
 use aes_gcm::{
     Aes256Gcm, KeyInit,
-    aead::{Aead, generic_array::GenericArray},
+    aead::{AeadInPlace, generic_array::GenericArray},
 };
 use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
 use p256::SecretKey as P256SecretKey;
@@ -16,13 +16,65 @@ use support::auth_state::{
 };
 use support::mock_registry::{
     MockRegistry, PersonalPullFailureFixture, SignedSyncResponse, TEST_OIDC_POLICY_ID,
-    TestSyncScope, signed_sync_response,
+    TestSyncScope, signed_personal_missing_response, signed_sync_response,
 };
 use support::{TempProject, lpm, write_private_file};
 use wiremock::matchers::{header, method, path, query_param};
 use wiremock::{Mock, Request, Respond, ResponseTemplate};
 
 const TEST_OIDC_POLICY_ID_2: &str = "22222222-2222-4222-8222-222222222222";
+
+fn write_personal_bound_manifest(project: &TempProject, registry_url: &str, vault_id: &str) {
+    project.write_file(
+        "lpm.json",
+        &personal_bound_manifest(registry_url, vault_id).to_string(),
+    );
+}
+
+fn personal_bound_manifest(registry_url: &str, vault_id: &str) -> serde_json::Value {
+    serde_json::json!({
+        "vault": vault_id,
+        "vaultSync": {
+            "authorityCheckpoints": {
+                "personal": {
+                    registry_url: {
+                        "account-1": {
+                            "version": 1,
+                            "syncedAt": "2026-09-05T00:00:00Z",
+                        },
+                    },
+                },
+            },
+        },
+    })
+}
+
+#[test]
+fn env_oidc_allow_without_a_personal_binding_does_not_create_a_vault_manifest() {
+    let project = TempProject::empty(r#"{"name":"vault-oidc-unbound","version":"1.0.0"}"#);
+    let manifest_path = project.path().join("lpm.json");
+
+    let output = lpm(&project)
+        .args([
+            "env",
+            "oidc",
+            "allow",
+            "--provider=github",
+            "--repo=acme/repo",
+            "--repository-id=987654321",
+            "--env=production",
+            "--workflow=.github/workflows/deploy.yml",
+        ])
+        .output()
+        .expect("run OIDC policy creation without a personal binding");
+
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("no authenticated personal binding"));
+    assert!(
+        !manifest_path.exists(),
+        "a rejected OIDC policy command must not create lpm.json"
+    );
+}
 
 struct ManifestReplacingSignedResponse {
     manifest_path: std::path::PathBuf,
@@ -41,14 +93,14 @@ impl Respond for ManifestReplacingSignedResponse {
 struct ManifestReplacingResponse {
     manifest_path: std::path::PathBuf,
     replacement: String,
-    response: ResponseTemplate,
+    response: SignedMemberInventoryResponse,
 }
 
 impl Respond for ManifestReplacingResponse {
-    fn respond(&self, _request: &Request) -> ResponseTemplate {
+    fn respond(&self, request: &Request) -> ResponseTemplate {
         std::fs::write(&self.manifest_path, &self.replacement)
             .expect("replace lpm.json before returning the remote response");
-        self.response.clone()
+        self.response.respond(request)
     }
 }
 
@@ -56,11 +108,11 @@ struct CredentialsReplacingResponse {
     home: std::path::PathBuf,
     registry_url: String,
     replacement_token: String,
-    response: ResponseTemplate,
+    response: SignedMemberInventoryResponse,
 }
 
 impl Respond for CredentialsReplacingResponse {
-    fn respond(&self, _request: &Request) -> ResponseTemplate {
+    fn respond(&self, request: &Request) -> ResponseTemplate {
         write_credentials_store(
             &self.home,
             &serde_json::json!({
@@ -68,7 +120,258 @@ impl Respond for CredentialsReplacingResponse {
                 (format!("refresh:{}", self.registry_url)): "org-share-refresh-token",
             }),
         );
-        self.response.clone()
+        self.response.respond(request)
+    }
+}
+
+#[derive(Clone)]
+struct SignedMemberInventoryResponse {
+    org_slug: String,
+    organization_id: String,
+    public_key_base64: String,
+    fingerprint: String,
+}
+
+impl Respond for SignedMemberInventoryResponse {
+    fn respond(&self, request: &Request) -> ResponseTemplate {
+        let request_nonce = request
+            .headers
+            .get("x-lpm-vault-request-nonce")
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default();
+        let body = serde_json::to_string(&serde_json::json!({
+            "envelopeVersion": 3,
+            "operation": "organization.memberKeys.read",
+            "outcome": "current",
+            "requestNonce": request_nonce,
+            "binding": {
+                "scope": "organization",
+                "principalId": self.organization_id,
+                "callerUserId": "11111111-1111-4111-8111-111111111111",
+                "organizationSlug": self.org_slug,
+            },
+            "data": {
+                "capability": "replaceWrappedKeysAllowed",
+                "members": [{
+                    "userId": "11111111-1111-4111-8111-111111111111",
+                    "role": "owner",
+                    "sharingKey": {
+                        "algorithm": "X25519",
+                        "publicKey": self.public_key_base64,
+                        "version": 4,
+                        "fingerprint": self.fingerprint,
+                    },
+                }],
+            },
+        }))
+        .expect("member inventory response must serialize");
+        let (key_id, signature) =
+            lpm_vault::signature::sign_response_for_test(200, body.as_bytes());
+        ResponseTemplate::new(200)
+            .insert_header("Content-Type", "application/json")
+            .insert_header(lpm_vault::signature::KEY_ID_HEADER, key_id.as_str())
+            .insert_header(lpm_vault::signature::SIGNATURE_HEADER, signature.as_str())
+            .set_body_string(body)
+    }
+}
+
+fn signed_member_inventory_response(
+    org_slug: &str,
+    public_key_base64: &str,
+    fingerprint: &str,
+) -> SignedMemberInventoryResponse {
+    SignedMemberInventoryResponse {
+        org_slug: org_slug.to_owned(),
+        organization_id: "00000000-0000-4000-8000-000000000001".to_owned(),
+        public_key_base64: public_key_base64.to_owned(),
+        fingerprint: fingerprint.to_owned(),
+    }
+}
+
+fn signed_member_inventory_response_for_organization(
+    org_slug: &str,
+    organization_id: &str,
+    public_key_base64: &str,
+    fingerprint: &str,
+) -> SignedMemberInventoryResponse {
+    SignedMemberInventoryResponse {
+        org_slug: org_slug.to_owned(),
+        organization_id: organization_id.to_owned(),
+        public_key_base64: public_key_base64.to_owned(),
+        fingerprint: fingerprint.to_owned(),
+    }
+}
+
+#[derive(Clone)]
+struct SignedRejectedMemberInventoryResponse {
+    org_slug: String,
+    status: u16,
+    code: String,
+    message: String,
+}
+
+#[derive(Clone)]
+struct SignedMissingOrgVaultResponse {
+    org_slug: String,
+    vault_id: String,
+    retained_revision: i32,
+}
+
+#[derive(Clone)]
+struct SignedOrgRevisionConflictResponse {
+    org_slug: String,
+    vault_id: String,
+    current_revision: i32,
+}
+
+#[derive(Clone)]
+struct SignedOrgMemberRewrapResponse {
+    org_slug: String,
+    vault_id: String,
+}
+
+impl Respond for SignedOrgMemberRewrapResponse {
+    fn respond(&self, request: &Request) -> ResponseTemplate {
+        let request_nonce = request
+            .headers
+            .get("x-lpm-vault-request-nonce")
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default();
+        let body = serde_json::to_string(&serde_json::json!({
+            "envelopeVersion": 3,
+            "operation": "vault.pull",
+            "outcome": "memberRewrapRequired",
+            "requestNonce": request_nonce,
+            "binding": {
+                "scope": "organization",
+                "principalId": "00000000-0000-4000-8000-000000000001",
+                "callerUserId": "11111111-1111-4111-8111-111111111111",
+                "organizationSlug": self.org_slug,
+                "vaultId": self.vault_id,
+            },
+            "data": {
+                "revision": 8,
+                "contentKeyVersion": 3,
+            },
+        }))
+        .expect("organization rewrap response must serialize");
+        let (key_id, signature) =
+            lpm_vault::signature::sign_response_for_test(403, body.as_bytes());
+        ResponseTemplate::new(403)
+            .insert_header("Content-Type", "application/json")
+            .insert_header(lpm_vault::signature::KEY_ID_HEADER, key_id.as_str())
+            .insert_header(lpm_vault::signature::SIGNATURE_HEADER, signature.as_str())
+            .set_body_string(body)
+    }
+}
+
+impl Respond for SignedOrgRevisionConflictResponse {
+    fn respond(&self, request: &Request) -> ResponseTemplate {
+        let request_nonce = request
+            .headers
+            .get("x-lpm-vault-request-nonce")
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default();
+        let body = serde_json::to_string(&serde_json::json!({
+            "envelopeVersion": 3,
+            "operation": "vault.write",
+            "outcome": "revisionConflict",
+            "requestNonce": request_nonce,
+            "binding": {
+                "scope": "organization",
+                "principalId": "00000000-0000-4000-8000-000000000001",
+                "callerUserId": "11111111-1111-4111-8111-111111111111",
+                "organizationSlug": self.org_slug,
+                "vaultId": self.vault_id,
+            },
+            "data": {
+                "currentRevision": self.current_revision,
+            },
+        }))
+        .expect("organization revision conflict must serialize");
+        let (key_id, signature) =
+            lpm_vault::signature::sign_response_for_test(409, body.as_bytes());
+        ResponseTemplate::new(409)
+            .insert_header("Content-Type", "application/json")
+            .insert_header(lpm_vault::signature::KEY_ID_HEADER, key_id.as_str())
+            .insert_header(lpm_vault::signature::SIGNATURE_HEADER, signature.as_str())
+            .set_body_string(body)
+    }
+}
+
+impl Respond for SignedMissingOrgVaultResponse {
+    fn respond(&self, request: &Request) -> ResponseTemplate {
+        let request_nonce = request
+            .headers
+            .get("x-lpm-vault-request-nonce")
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default();
+        let operation = if request
+            .url
+            .query_pairs()
+            .any(|(key, value)| key == "versionOnly" && value == "true")
+        {
+            "vault.inspect"
+        } else {
+            "vault.pull"
+        };
+        let body = serde_json::to_string(&serde_json::json!({
+            "envelopeVersion": 3,
+            "operation": operation,
+            "outcome": "missing",
+            "requestNonce": request_nonce,
+            "binding": {
+                "scope": "organization",
+                "principalId": "00000000-0000-4000-8000-000000000001",
+                "callerUserId": "11111111-1111-4111-8111-111111111111",
+                "organizationSlug": self.org_slug,
+                "vaultId": self.vault_id,
+            },
+            "data": {
+                "retainedRevision": self.retained_revision,
+            },
+        }))
+        .expect("missing organization vault response must serialize");
+        let (key_id, signature) =
+            lpm_vault::signature::sign_response_for_test(404, body.as_bytes());
+        ResponseTemplate::new(404)
+            .insert_header("Content-Type", "application/json")
+            .insert_header(lpm_vault::signature::KEY_ID_HEADER, key_id.as_str())
+            .insert_header(lpm_vault::signature::SIGNATURE_HEADER, signature.as_str())
+            .set_body_string(body)
+    }
+}
+
+impl Respond for SignedRejectedMemberInventoryResponse {
+    fn respond(&self, request: &Request) -> ResponseTemplate {
+        let request_nonce = request
+            .headers
+            .get("x-lpm-vault-request-nonce")
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default();
+        let body = serde_json::to_string(&serde_json::json!({
+            "envelopeVersion": 3,
+            "operation": "organization.memberKeys.read",
+            "outcome": "rejected",
+            "requestNonce": request_nonce,
+            "binding": {
+                "scope": "account",
+                "principalId": "11111111-1111-4111-8111-111111111111",
+                "organizationSlug": self.org_slug,
+            },
+            "data": {
+                "code": self.code,
+                "message": self.message,
+            },
+        }))
+        .expect("member inventory rejection must serialize");
+        let (key_id, signature) =
+            lpm_vault::signature::sign_response_for_test(self.status, body.as_bytes());
+        ResponseTemplate::new(self.status)
+            .insert_header("Content-Type", "application/json")
+            .insert_header(lpm_vault::signature::KEY_ID_HEADER, key_id.as_str())
+            .insert_header(lpm_vault::signature::SIGNATURE_HEADER, signature.as_str())
+            .set_body_string(body)
     }
 }
 
@@ -86,26 +389,27 @@ fn write_file_backed_vault(home: &std::path::Path, vault_id: &str, payload: serd
     let vaults_dir = lpm_dir.join("vaults");
     std::fs::create_dir_all(&vaults_dir).expect("failed to create test vault directory");
 
-    let fallback_key = "workflow-test-fallback-key-workflow-test-fallback-key-123456";
-    let salt = [0x42u8; 32];
-    write_private_file(&lpm_dir.join(".vault-fallback-key"), fallback_key);
-    write_private_file(&lpm_dir.join(".vault-salt"), salt);
-
-    let params = scrypt::Params::new(10, 8, 1, 32).expect("invalid test scrypt params");
-    let mut derived_key = [0u8; 32];
-    scrypt::scrypt(fallback_key.as_bytes(), &salt, &params, &mut derived_key)
-        .expect("failed to derive fallback vault key");
+    let data_key = [0x42u8; 32];
+    write_private_file(
+        &lpm_dir.join(".vault-fallback-key"),
+        format!("raw:{}", hex::encode(data_key)),
+    );
 
     let plaintext =
         serde_json::to_string(&payload).expect("failed to serialize local vault payload");
-    let cipher = Aes256Gcm::new_from_slice(&derived_key).expect("failed to create vault cipher");
+    let cipher = Aes256Gcm::new_from_slice(&data_key).expect("failed to create vault cipher");
     let iv = [0x11u8; 12];
     let nonce = GenericArray::from_slice(&iv);
-    let ciphertext = cipher
-        .encrypt(nonce, plaintext.as_bytes())
+    let vault_id_bytes = vault_id.as_bytes();
+    let vault_id_length = u32::try_from(vault_id_bytes.len()).expect("test vault ID length");
+    let mut associated_data = Vec::with_capacity(20 + vault_id_bytes.len());
+    associated_data.extend_from_slice(b"lpm-vault-local\x01");
+    associated_data.extend_from_slice(&vault_id_length.to_be_bytes());
+    associated_data.extend_from_slice(vault_id_bytes);
+    let mut encrypted = plaintext.into_bytes();
+    let auth_tag = cipher
+        .encrypt_in_place_detached(nonce, &associated_data, &mut encrypted)
         .expect("failed to encrypt local vault payload");
-    let tag_start = ciphertext.len() - 16;
-    let (encrypted, auth_tag) = ciphertext.split_at(tag_start);
     let encoded = format!(
         "{}:{}:{}",
         BASE64.encode(iv),
@@ -126,11 +430,28 @@ fn parse_clean_json_stdout(output: &std::process::Output) -> serde_json::Value {
     parse_json_output(&output.stdout)
 }
 
-fn seed_org_sharing_key(project: &TempProject) -> ([u8; 32], [u8; 32], String, String) {
+fn seed_org_sharing_key(
+    project: &TempProject,
+    registry_url: &str,
+) -> ([u8; 32], [u8; 32], String, String) {
     let (private_key, public_key) = lpm_vault::crypto::generate_x25519_keypair();
     let lpm_dir = project.home().join(".lpm");
     std::fs::create_dir_all(&lpm_dir).expect("create LPM home for sharing key");
-    write_private_file(&lpm_dir.join(".x25519_key"), private_key);
+    let mut scope_digest = Sha256::new();
+    for component in [
+        registry_url.trim_end_matches('/').as_bytes(),
+        b"11111111-1111-4111-8111-111111111111".as_slice(),
+    ] {
+        scope_digest.update((component.len() as u64).to_be_bytes());
+        scope_digest.update(component);
+    }
+    write_private_file(
+        &lpm_dir.join(format!(
+            ".x25519-key-{}",
+            hex::encode(scope_digest.finalize())
+        )),
+        private_key,
+    );
     let public_key_base64 = BASE64.encode(public_key);
     let fingerprint = hex::encode(Sha256::digest(public_key));
     (private_key, public_key, public_key_base64, fingerprint)
@@ -207,27 +528,11 @@ async fn mount_org_member_keys(
     Mock::given(method("GET"))
         .and(path(format!("/api/orgs/{org_slug}/members/public-keys")))
         .and(header("authorization", format!("Bearer {auth_token}")))
-        .respond_with(
-            ResponseTemplate::new(200)
-                .insert_header(
-                    "X-LPM-Organization-ID",
-                    "00000000-0000-4000-8000-000000000001",
-                )
-                .insert_header(
-                    "X-LPM-Caller-User-ID",
-                    "11111111-1111-4111-8111-111111111111",
-                )
-                .set_body_json(serde_json::json!([
-                    {
-                        "userId": "11111111-1111-4111-8111-111111111111",
-                        "role": "owner",
-                        "publicKey": public_key_base64,
-                        "publicKeyVersion": 4,
-                        "publicKeyFingerprint": fingerprint,
-                        "hasPublicKey": true,
-                    }
-                ])),
-        )
+        .respond_with(signed_member_inventory_response(
+            org_slug,
+            public_key_base64,
+            fingerprint,
+        ))
         .expect(1)
         .mount(mock.server())
         .await;
@@ -268,7 +573,6 @@ struct PreparedOrgRotation {
 #[derive(serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 struct AcceptedRecipientSet<'a> {
-    schema_version: u32,
     scope: AcceptedRecipientScope<'a>,
     recipients: [AcceptedRecipient<'a>; 1],
 }
@@ -292,7 +596,6 @@ struct AcceptedRecipient<'a> {
 fn org_rotation_recipient_acceptance(mock: &MockRegistry, fingerprint: &str) -> String {
     let registry_url = mock.url();
     let recipient_set = AcceptedRecipientSet {
-        schema_version: 2,
         scope: AcceptedRecipientScope {
             registry_url: &registry_url,
             organization_id: "00000000-0000-4000-8000-000000000001",
@@ -329,7 +632,8 @@ async fn prepare_org_rotation(
             session_access_expires_at: Some("2030-01-01T00:00:00Z"),
         }],
     );
-    let (private_key, public_key, public_key_base64, fingerprint) = seed_org_sharing_key(project);
+    let (private_key, public_key, public_key_base64, fingerprint) =
+        seed_org_sharing_key(project, &mock.url());
     let recipient_fingerprint = if stale_recipient_fingerprint {
         "a".repeat(64)
     } else {
@@ -623,7 +927,8 @@ async fn env_log_binds_the_bearer_to_the_explicit_registry_origin() {
         &[SessionSeed {
             registry_url: &selected_url,
             access_token: Some("selected-origin-token"),
-            ..Default::default()
+            refresh_token: Some("selected-origin-refresh-token"),
+            session_access_expires_at: Some("2030-01-01T00:00:00Z"),
         }],
     );
     Mock::given(method("GET"))
@@ -672,8 +977,15 @@ async fn env_unpair_refreshes_after_an_authoritative_unauthorized_response() {
             session_access_expires_at: Some("2099-01-01T00:00:00Z"),
         }],
     );
-    mock.with_revoke_all_pairings_for_status("rejected-access-token", 401, 1)
+    mock.with_current_principal("rejected-access-token", "account-1", 1)
         .await;
+    mock.with_revoke_all_pairings_for_principal_status(
+        "rejected-access-token",
+        "account-1",
+        401,
+        1,
+    )
+    .await;
     mock.with_refresh_expected(
         "refresh-token",
         "refreshed-access-token",
@@ -682,8 +994,13 @@ async fn env_unpair_refreshes_after_an_authoritative_unauthorized_response() {
         1,
     )
     .await;
-    mock.with_revoke_all_pairings_for("refreshed-access-token")
-        .await;
+    mock.with_revoke_all_pairings_for_principal_status(
+        "refreshed-access-token",
+        "account-1",
+        200,
+        1,
+    )
+    .await;
 
     let output = lpm(&project)
         .env("LPM_REGISTRY_URL", mock.url())
@@ -696,6 +1013,49 @@ async fn env_unpair_refreshes_after_an_authoritative_unauthorized_response() {
         "env unpair did not recover after 401:\nstdout: {}\nstderr: {}",
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr),
+    );
+}
+
+#[tokio::test]
+async fn env_unpair_retry_remains_bound_to_the_principal_captured_before_refresh() {
+    let project = TempProject::empty(r#"{"name":"env-unpair-account-switch","version":"1.0.0"}"#);
+    let mock = MockRegistry::start().await;
+
+    seed_sessions(
+        project.home(),
+        &[SessionSeed {
+            registry_url: &mock.url(),
+            access_token: Some("account-a-access"),
+            refresh_token: Some("account-switch-refresh"),
+            session_access_expires_at: Some("2099-01-01T00:00:00Z"),
+        }],
+    );
+    mock.with_current_principal("account-a-access", "account-a", 1)
+        .await;
+    mock.with_current_principal("account-b-access", "account-b", 0)
+        .await;
+    mock.with_revoke_all_pairings_for_principal_status("account-a-access", "account-a", 401, 1)
+        .await;
+    mock.with_refresh_expected(
+        "account-switch-refresh",
+        "account-b-access",
+        "account-b-refresh",
+        "2030-01-02T00:00:00Z",
+        1,
+    )
+    .await;
+    mock.with_revoke_all_pairings_for_principal_status("account-b-access", "account-a", 409, 1)
+        .await;
+
+    let output = lpm(&project)
+        .env("LPM_REGISTRY_URL", mock.url())
+        .args(["--json", "env", "unpair"])
+        .output()
+        .expect("run env unpair across an account-switching refresh");
+
+    assert!(
+        !output.status.success(),
+        "unpair must not retarget a retry to the refreshed account"
     );
 }
 
@@ -715,8 +1075,15 @@ async fn env_unpair_does_not_replay_or_refresh_after_a_server_error() {
         }],
     );
     let credentials_before = read_credentials(project.home());
-    mock.with_revoke_all_pairings_for_status("accepted-access-token", 503, 1)
+    mock.with_current_principal("accepted-access-token", "account-1", 1)
         .await;
+    mock.with_revoke_all_pairings_for_principal_status(
+        "accepted-access-token",
+        "account-1",
+        503,
+        1,
+    )
+    .await;
     mock.with_refresh_expected(
         "refresh-token",
         "unused-access-token",
@@ -754,6 +1121,8 @@ async fn env_pair_uppercases_code_and_approves_browser_pairing() {
             .to_encoded_point(false)
             .as_bytes(),
     );
+    mock.with_current_principal("session-access-token", "account-1", 1)
+        .await;
     mock.with_pairing_session("ABC123", "session-access-token", &browser_public_key)
         .await;
     mock.with_pairing_approval("ABC123", "session-access-token")
@@ -797,6 +1166,139 @@ async fn env_pair_uppercases_code_and_approves_browser_pairing() {
 }
 
 #[tokio::test]
+async fn env_pair_stage_retry_remains_bound_to_the_principal_captured_before_refresh() {
+    use p256::elliptic_curve::sec1::ToEncodedPoint;
+
+    let project =
+        TempProject::empty(r#"{"name":"env-pair-stage-account-switch","version":"1.0.0"}"#);
+    let mock = MockRegistry::start().await;
+    let browser_secret = P256SecretKey::random(&mut rand::thread_rng());
+    let browser_public_key = BASE64.encode(
+        browser_secret
+            .public_key()
+            .to_encoded_point(false)
+            .as_bytes(),
+    );
+
+    seed_sessions(
+        project.home(),
+        &[SessionSeed {
+            registry_url: &mock.url(),
+            access_token: Some("account-a-access"),
+            refresh_token: Some("account-switch-refresh"),
+            session_access_expires_at: Some("2099-01-01T00:00:00Z"),
+        }],
+    );
+    mock.with_current_principal("account-a-access", "account-a", 1)
+        .await;
+    mock.with_current_principal("account-b-access", "account-b", 0)
+        .await;
+    mock.with_pairing_session("STG123", "account-a-access", &browser_public_key)
+        .await;
+    mock.with_pairing_stage_for_principal_status("STG123", "account-a-access", "account-a", 401, 1)
+        .await;
+    mock.with_refresh_expected(
+        "account-switch-refresh",
+        "account-b-access",
+        "account-b-refresh",
+        "2030-01-02T00:00:00Z",
+        1,
+    )
+    .await;
+    mock.with_pairing_stage_for_principal_status("STG123", "account-b-access", "account-a", 409, 1)
+        .await;
+    mock.with_pairing_final_approval_for_principal_status(
+        "STG123",
+        "account-b-access",
+        "account-a",
+        200,
+        0,
+    )
+    .await;
+
+    let output = lpm(&project)
+        .env("LPM_REGISTRY_URL", mock.url())
+        .args(["--json", "env", "pair", "stg123", "--yes"])
+        .output()
+        .expect("run env pair stage across an account-switching refresh");
+
+    assert!(
+        !output.status.success(),
+        "pair stage must not retarget a retry to the refreshed account"
+    );
+    assert!(!project.home().join(".lpm").join(".vault-key").exists());
+}
+
+#[tokio::test]
+async fn env_pair_approval_retry_remains_bound_to_the_principal_captured_before_refresh() {
+    use p256::elliptic_curve::sec1::ToEncodedPoint;
+
+    let project =
+        TempProject::empty(r#"{"name":"env-pair-approval-account-switch","version":"1.0.0"}"#);
+    let mock = MockRegistry::start().await;
+    let browser_secret = P256SecretKey::random(&mut rand::thread_rng());
+    let browser_public_key = BASE64.encode(
+        browser_secret
+            .public_key()
+            .to_encoded_point(false)
+            .as_bytes(),
+    );
+
+    seed_sessions(
+        project.home(),
+        &[SessionSeed {
+            registry_url: &mock.url(),
+            access_token: Some("account-a-access"),
+            refresh_token: Some("account-switch-refresh"),
+            session_access_expires_at: Some("2099-01-01T00:00:00Z"),
+        }],
+    );
+    mock.with_current_principal("account-a-access", "account-a", 1)
+        .await;
+    mock.with_current_principal("account-b-access", "account-b", 0)
+        .await;
+    mock.with_pairing_session("APR123", "account-a-access", &browser_public_key)
+        .await;
+    mock.with_pairing_stage_for_principal_status("APR123", "account-a-access", "account-a", 200, 1)
+        .await;
+    mock.with_pairing_final_approval_for_principal_status(
+        "APR123",
+        "account-a-access",
+        "account-a",
+        401,
+        1,
+    )
+    .await;
+    mock.with_refresh_expected(
+        "account-switch-refresh",
+        "account-b-access",
+        "account-b-refresh",
+        "2030-01-02T00:00:00Z",
+        1,
+    )
+    .await;
+    mock.with_pairing_final_approval_for_principal_status(
+        "APR123",
+        "account-b-access",
+        "account-a",
+        409,
+        1,
+    )
+    .await;
+
+    let output = lpm(&project)
+        .env("LPM_REGISTRY_URL", mock.url())
+        .args(["--json", "env", "pair", "apr123", "--yes"])
+        .output()
+        .expect("run env pair approval across an account-switching refresh");
+
+    assert!(
+        !output.status.success(),
+        "pair approval must not retarget a retry to the refreshed account"
+    );
+}
+
+#[tokio::test]
 async fn env_pair_refuses_when_stdin_is_not_a_tty_and_yes_flag_absent() {
     use p256::elliptic_curve::sec1::ToEncodedPoint;
 
@@ -817,6 +1319,8 @@ async fn env_pair_refuses_when_stdin_is_not_a_tty_and_yes_flag_absent() {
             .to_encoded_point(false)
             .as_bytes(),
     );
+    mock.with_current_principal("session-access-token", "account-1", 0)
+        .await;
     mock.with_pairing_session_call_count("NOTTY1", "session-access-token", &browser_public_key, 0)
         .await;
     mock.with_pairing_approval_call_count("NOTTY1", "session-access-token", 0)
@@ -867,6 +1371,8 @@ async fn env_pair_with_yes_prints_browser_key_fingerprint_and_match_number_befor
             .as_bytes(),
     );
 
+    mock.with_current_principal("session-access-token", "account-1", 1)
+        .await;
     mock.with_pairing_session_with_metadata(
         "META01",
         "session-access-token",
@@ -932,17 +1438,26 @@ async fn env_pair_with_yes_prints_browser_key_fingerprint_and_match_number_befor
 }
 
 #[tokio::test]
-async fn env_unpair_requires_session_based_login() {
-    let project = TempProject::empty(r#"{"name":"vault-unpair-legacy-test","version":"1.0.0"}"#);
+async fn env_unpair_rejects_incomplete_session_credentials() {
+    let project =
+        TempProject::empty(r#"{"name":"vault-unpair-incomplete-session-test","version":"1.0.0"}"#);
     let mock = MockRegistry::start().await;
 
-    mock.with_revoke_all_pairings_expected(0).await;
+    mock.with_current_principal("incomplete-session-token", "account-1", 0)
+        .await;
+    mock.with_revoke_all_pairings_for_principal_status(
+        "incomplete-session-token",
+        "account-1",
+        200,
+        0,
+    )
+    .await;
 
     seed_sessions(
         project.home(),
         &[SessionSeed {
             registry_url: &mock.url(),
-            access_token: Some("legacy-token"),
+            access_token: Some("incomplete-session-token"),
             refresh_token: None,
             session_access_expires_at: None,
         }],
@@ -956,15 +1471,15 @@ async fn env_unpair_requires_session_based_login() {
 
     assert!(
         !output.status.success(),
-        "unpair unexpectedly succeeded for legacy token login:\nstdout: {}\nstderr: {}",
+        "unpair unexpectedly succeeded for incomplete session credentials:\nstdout: {}\nstderr: {}",
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr),
     );
 
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("legacy token") || stderr.contains("doesn't support vault operations"),
-        "expected legacy-token vault error, got stderr: {stderr}"
+        stderr.contains("not logged in"),
+        "expected incomplete-session rejection, got stderr: {stderr}"
     );
 }
 
@@ -1190,10 +1705,15 @@ async fn env_pull_rejects_a_different_bound_account_before_local_overwrite() {
         &serde_json::json!({
             "vault": vault_id,
             "vaultSync": {
-                "personalVersion": 7,
-                "personalBinding": {
-                    "registryUrl": mock.url(),
-                    "principalId": "account-a"
+                "authorityCheckpoints": {
+                    "personal": {
+                        (mock.url()): {
+                            "account-a": {
+                                "version": 7,
+                                "syncedAt": "2026-09-05T00:00:00Z",
+                            },
+                        },
+                    },
                 }
             }
         })
@@ -1330,11 +1850,14 @@ async fn env_pair_refresh_only_session_then_unpair_reuses_normalized_session() {
         1,
     )
     .await;
+    mock.with_current_principal("access-from-refresh", "account-1", 2)
+        .await;
     mock.with_pairing_session("RFH123", "access-from-refresh", &browser_public_key)
         .await;
     mock.with_pairing_approval("RFH123", "access-from-refresh")
         .await;
-    mock.with_revoke_all_pairings_expected(1).await;
+    mock.with_revoke_all_pairings_for_principal_status("access-from-refresh", "account-1", 200, 1)
+        .await;
 
     seed_sessions(
         project.home(),
@@ -1400,11 +1923,14 @@ async fn env_pair_then_logout_revoke_revokes_pairings_and_blocks_future_pairing_
             .to_encoded_point(false)
             .as_bytes(),
     );
+    mock.with_current_principal("session-access-token", "account-1", 2)
+        .await;
     mock.with_pairing_session("PAIR01", "session-access-token", &browser_public_key)
         .await;
     mock.with_pairing_approval("PAIR01", "session-access-token")
         .await;
-    mock.with_revoke_all_pairings_expected(1).await;
+    mock.with_revoke_all_pairings_for_principal_status("session-access-token", "account-1", 200, 1)
+        .await;
     mock.with_revoke_token("session-access-token").await;
 
     seed_sessions(
@@ -1522,11 +2048,14 @@ async fn env_pair_refresh_only_session_then_logout_revoke_revokes_pairings_and_b
         1,
     )
     .await;
+    mock.with_current_principal("access-from-refresh", "account-1", 2)
+        .await;
     mock.with_pairing_session("RLG123", "access-from-refresh", &browser_public_key)
         .await;
     mock.with_pairing_approval("RLG123", "access-from-refresh")
         .await;
-    mock.with_revoke_all_pairings_expected(1).await;
+    mock.with_revoke_all_pairings_for_principal_status("access-from-refresh", "account-1", 200, 1)
+        .await;
     mock.with_revoke_token("access-from-refresh").await;
 
     seed_sessions(
@@ -1633,11 +2162,14 @@ async fn env_pair_unpair_then_logout_revoke_on_refresh_backed_session_keeps_norm
         1,
     )
     .await;
+    mock.with_current_principal("access-from-refresh", "account-1", 3)
+        .await;
     mock.with_pairing_session("UPL123", "access-from-refresh", &browser_public_key)
         .await;
     mock.with_pairing_approval("UPL123", "access-from-refresh")
         .await;
-    mock.with_revoke_all_pairings_expected(2).await;
+    mock.with_revoke_all_pairings_for_principal_status("access-from-refresh", "account-1", 200, 2)
+        .await;
     mock.with_revoke_token("access-from-refresh").await;
 
     seed_sessions(
@@ -1776,11 +2308,14 @@ async fn env_pair_unpair_then_logout_all_revoke_on_refresh_backed_session_clears
         1,
     )
     .await;
+    mock.with_current_principal("access-from-refresh", "account-1", 3)
+        .await;
     mock.with_pairing_session("UAL123", "access-from-refresh", &browser_public_key)
         .await;
     mock.with_pairing_approval("UAL123", "access-from-refresh")
         .await;
-    mock.with_revoke_all_pairings_expected(2).await;
+    mock.with_revoke_all_pairings_for_principal_status("access-from-refresh", "account-1", 200, 2)
+        .await;
     mock.with_revoke_token("access-from-refresh").await;
 
     seed_sessions(
@@ -2817,6 +3352,8 @@ async fn env_pair_surfaces_expired_code_error() {
     let project = TempProject::empty(r#"{"name":"vault-pair-expired-test","version":"1.0.0"}"#);
     let mock = MockRegistry::start().await;
 
+    mock.with_current_principal("session-access-token", "account-1", 1)
+        .await;
     mock.with_pairing_session_error("EXPIRE", "session-access-token", 410, "pairing expired")
         .await;
 
@@ -2861,6 +3398,8 @@ async fn env_pair_rejects_non_pending_session_status() {
             .to_encoded_point(false)
             .as_bytes(),
     );
+    mock.with_current_principal("session-access-token", "account-1", 1)
+        .await;
     mock.with_pairing_session_status(
         "USED12",
         "session-access-token",
@@ -2902,6 +3441,8 @@ async fn env_pair_rejects_malformed_browser_key() {
         TempProject::empty(r#"{"name":"vault-pair-malformed-key-test","version":"1.0.0"}"#);
     let mock = MockRegistry::start().await;
 
+    mock.with_current_principal("session-access-token", "account-1", 1)
+        .await;
     mock.with_pairing_session("BADKEY", "session-access-token", "not-base64")
         .await;
 
@@ -2938,11 +3479,7 @@ async fn env_oidc_allow_then_list_shows_policy_and_escrow_success() {
     let project = TempProject::empty(r#"{"name":"vault-oidc-allow-list-test","version":"1.0.0"}"#);
     let mock = MockRegistry::start().await;
 
-    std::fs::write(
-        project.path().join("lpm.json"),
-        r#"{"vault":"vault-policy-123"}"#,
-    )
-    .expect("failed to write lpm.json for oidc allow/list");
+    write_personal_bound_manifest(&project, &mock.url(), "vault-policy-123");
 
     seed_sessions(
         project.home(),
@@ -3040,7 +3577,7 @@ async fn env_oidc_allow_then_list_shows_policy_and_escrow_success() {
 async fn env_oidc_allow_discovers_public_github_repository_id() {
     let project = TempProject::empty(r#"{"name":"vault-oidc-discovery","version":"1.0.0"}"#);
     let mock = MockRegistry::start().await;
-    project.write_file("lpm.json", r#"{"vault":"vault-policy-discovery"}"#);
+    write_personal_bound_manifest(&project, &mock.url(), "vault-policy-discovery");
     seed_sessions(
         project.home(),
         &[SessionSeed {
@@ -3103,7 +3640,7 @@ async fn env_oidc_allow_discovers_public_github_repository_id() {
 async fn env_oidc_allow_gitlab_uses_numeric_project_subject_without_github_fields() {
     let project = TempProject::empty(r#"{"name":"gitlab-oidc","version":"1.0.0"}"#);
     let mock = MockRegistry::start().await;
-    project.write_file("lpm.json", r#"{"vault":"vault-gitlab-123"}"#);
+    write_personal_bound_manifest(&project, &mock.url(), "vault-gitlab-123");
     seed_sessions(
         project.home(),
         &[SessionSeed {
@@ -3276,10 +3813,15 @@ async fn env_push_uses_bound_checkpoint_without_a_version_preflight() {
         &serde_json::json!({
             "vault": vault_id,
             "vaultSync": {
-                "personalVersion": 7,
-                "personalBinding": {
-                    "registryUrl": registry_url,
-                    "principalId": "account-1",
+                "authorityCheckpoints": {
+                    "personal": {
+                        (registry_url.clone()): {
+                            "account-1": {
+                                "version": 7,
+                                "syncedAt": "2026-09-05T00:00:00Z",
+                            },
+                        },
+                    },
                 },
             },
         })
@@ -3329,9 +3871,11 @@ async fn env_push_uses_bound_checkpoint_without_a_version_preflight() {
 
     let manifest_read_log = project.path().join("manifest-reads.log");
 
-    let output = lpm(&project)
+    let mut command = lpm(&project);
+    command
         .env("LPM_REGISTRY_URL", &registry_url)
-        .env("LPM_TEST_MANIFEST_READ_LOG", &manifest_read_log)
+        .env("LPM_TEST_MANIFEST_READ_LOG", &manifest_read_log);
+    let output = command
         .args(["--json", "env", "push", "--yes"])
         .output()
         .expect("run bound personal push");
@@ -3386,10 +3930,6 @@ async fn env_force_push_recreates_a_deleted_bound_vault_above_its_checkpoint() {
             "vault": vault_id,
             "vaultSync": {
                 "personalVersion": 5,
-                "personalBinding": {
-                    "registryUrl": registry_url,
-                    "principalId": "account-1",
-                },
                 "authorityCheckpoints": {
                     "personal": {
                         registry_url.clone(): {
@@ -3426,10 +3966,7 @@ async fn env_force_push_recreates_a_deleted_bound_vault_above_its_checkpoint() {
     Mock::given(method("GET"))
         .and(path(format!("/api/vaults/{vault_id}/sync")))
         .and(query_param("versionOnly", "true"))
-        .respond_with(
-            ResponseTemplate::new(404)
-                .set_body_json(serde_json::json!({"error": "Vault not found"})),
-        )
+        .respond_with(signed_personal_missing_response(vault_id, "account-1", 5))
         .expect(1)
         .mount(mock.server())
         .await;
@@ -3509,12 +4046,6 @@ async fn env_rotate_key_preserves_complete_named_remote_payload_with_cas() {
             "default": {},
             "production": {"API_KEY": "remote-only"},
             "staging": {"API_KEY": "stage"}
-        },
-        "aliases": {"prod": "production"},
-        "inheritance": {"staging": ["default"]},
-        "schema": {
-            "version": 2,
-            "envConfig": {"prod": {"canonical": "production"}}
         }
     });
     mock.with_personal_pull_keys(
@@ -3808,7 +4339,8 @@ async fn env_rotate_key_version_conflict_preserves_local_key_and_version_metadat
     assert!(
         error["error"]
             .as_str()
-            .is_some_and(|message| message.contains("vault version conflict"))
+            .is_some_and(|message| message.contains("vault version conflict")),
+        "unexpected error: {error}",
     );
     assert_eq!(
         std::fs::read_to_string(&wrapping_key_path)
@@ -3906,8 +4438,6 @@ async fn env_rotate_key_org_reencrypts_complete_payload_and_advances_content_key
             "default": {},
             "production": {"API_KEY": "remote-only"},
         },
-        "aliases": {"prod": "production"},
-        "schema": {"version": 2},
     });
     let prepared = prepare_org_rotation(&project, &mock, &payload, false, true).await;
     let recipient_acceptance = org_rotation_recipient_acceptance(&mock, &prepared.fingerprint);
@@ -4040,11 +4570,11 @@ async fn env_rotate_key_org_version_conflict_preserves_local_sync_version() {
         .and(path(format!(
             "/api/orgs/{ORG_ROTATION_SLUG}/vaults/{ORG_ROTATION_VAULT_ID}"
         )))
-        .respond_with(ResponseTemplate::new(409).set_body_json(serde_json::json!({
-            "error": "vault version conflict",
-            "code": "vault_version_conflict",
-            "serverVersion": 9,
-        })))
+        .respond_with(SignedOrgRevisionConflictResponse {
+            org_slug: ORG_ROTATION_SLUG.to_owned(),
+            vault_id: ORG_ROTATION_VAULT_ID.to_owned(),
+            current_revision: 9,
+        })
         .expect(1)
         .mount(mock.server())
         .await;
@@ -4068,7 +4598,8 @@ async fn env_rotate_key_org_version_conflict_preserves_local_sync_version() {
     assert!(
         error["error"]
             .as_str()
-            .is_some_and(|message| message.contains("vault version conflict"))
+            .is_some_and(|message| message.contains("vault changed concurrently")),
+        "unexpected error: {error}",
     );
     assert_eq!(
         lpm_vault::vault_id::read_org_sync_version(project.path(), ORG_ROTATION_SLUG),
@@ -4149,7 +4680,8 @@ async fn env_rotate_key_org_rejects_response_without_content_key_epoch() {
     assert!(
         error["error"]
             .as_str()
-            .is_some_and(|message| message.contains("omitted the new content-key version"))
+            .is_some_and(|message| message.contains("omitted the content key version")),
+        "unexpected error: {error}",
     );
     assert_eq!(
         lpm_vault::vault_id::read_org_sync_version(project.path(), ORG_ROTATION_SLUG),
@@ -4209,7 +4741,7 @@ async fn env_oidc_allow_emits_json_response() {
     let project = TempProject::empty(r#"{"name":"vault-oidc-allow-json-test","version":"1.0.0"}"#);
     let mock = MockRegistry::start().await;
 
-    project.write_file("lpm.json", r#"{"vault":"vault-policy-json-123"}"#);
+    write_personal_bound_manifest(&project, &mock.url(), "vault-policy-json-123");
 
     seed_sessions(
         project.home(),
@@ -4290,7 +4822,7 @@ async fn env_oidc_allow_rejects_missing_or_malformed_policy_id_before_escrow() {
         let project =
             TempProject::empty(r#"{"name":"vault-oidc-invalid-policy-id","version":"1.0.0"}"#);
         let mock = MockRegistry::start().await;
-        project.write_file("lpm.json", r#"{"vault":"vault-policy-invalid-id"}"#);
+        write_personal_bound_manifest(&project, &mock.url(), "vault-policy-invalid-id");
         seed_sessions(
             project.home(),
             &[SessionSeed {
@@ -4548,11 +5080,7 @@ async fn env_oidc_allow_fails_when_escrow_upload_fails() {
         TempProject::empty(r#"{"name":"vault-oidc-escrow-failure-test","version":"1.0.0"}"#);
     let mock = MockRegistry::start().await;
 
-    std::fs::write(
-        project.path().join("lpm.json"),
-        r#"{"vault":"vault-policy-456"}"#,
-    )
-    .expect("failed to write lpm.json for oidc escrow failure");
+    write_personal_bound_manifest(&project, &mock.url(), "vault-policy-456");
 
     seed_sessions(
         project.home(),
@@ -4625,7 +5153,7 @@ async fn env_oidc_allow_json_escrow_failure_emits_one_error_document() {
     let project =
         TempProject::empty(r#"{"name":"vault-oidc-escrow-json-failure-test","version":"1.0.0"}"#);
     let mock = MockRegistry::start().await;
-    project.write_file("lpm.json", r#"{"vault":"vault-policy-json-failure"}"#);
+    write_personal_bound_manifest(&project, &mock.url(), "vault-policy-json-failure");
 
     seed_sessions(
         project.home(),
@@ -4698,7 +5226,7 @@ async fn env_oidc_allow_fails_when_wrapping_key_retrieval_fails() {
     let project =
         TempProject::empty(r#"{"name":"vault-oidc-wrapping-key-failure-test","version":"1.0.0"}"#);
     let mock = MockRegistry::start().await;
-    project.write_file("lpm.json", r#"{"vault":"vault-policy-key-failure"}"#);
+    write_personal_bound_manifest(&project, &mock.url(), "vault-policy-key-failure");
 
     seed_sessions(
         project.home(),
@@ -4770,11 +5298,7 @@ async fn env_oidc_allow_and_list_on_refresh_backed_session_then_logout_all_revok
         TempProject::empty(r#"{"name":"vault-oidc-refresh-logout-all-test","version":"1.0.0"}"#);
     let mock = MockRegistry::start().await;
 
-    std::fs::write(
-        project.path().join("lpm.json"),
-        r#"{"vault":"vault-policy-refresh-logout-all-123"}"#,
-    )
-    .expect("failed to write lpm.json for refresh-backed oidc allow/list");
+    write_personal_bound_manifest(&project, &mock.url(), "vault-policy-refresh-logout-all-123");
 
     mock.with_refresh_expected(
         "refresh-seed-token",
@@ -4812,7 +5336,10 @@ async fn env_oidc_allow_and_list_on_refresh_backed_session_then_logout_all_revok
         ]),
     )
     .await;
-    mock.with_revoke_all_pairings_expected(1).await;
+    mock.with_current_principal("access-from-refresh", "account-1", 1)
+        .await;
+    mock.with_revoke_all_pairings_for_principal_status("access-from-refresh", "account-1", 200, 1)
+        .await;
     mock.with_revoke_token("access-from-refresh").await;
 
     seed_sessions(
@@ -4929,11 +5456,11 @@ async fn env_oidc_allow_escrow_failure_on_refresh_backed_session_then_logout_rev
         TempProject::empty(r#"{"name":"vault-oidc-refresh-escrow-logout-test","version":"1.0.0"}"#);
     let mock = MockRegistry::start().await;
 
-    std::fs::write(
-        project.path().join("lpm.json"),
-        r#"{"vault":"vault-policy-refresh-escrow-logout-123"}"#,
-    )
-    .expect("failed to write lpm.json for refresh-backed oidc escrow warning flow");
+    write_personal_bound_manifest(
+        &project,
+        &mock.url(),
+        "vault-policy-refresh-escrow-logout-123",
+    );
 
     mock.with_refresh_expected(
         "refresh-seed-token",
@@ -4975,7 +5502,10 @@ async fn env_oidc_allow_escrow_failure_on_refresh_backed_session_then_logout_rev
         ]),
     )
     .await;
-    mock.with_revoke_all_pairings_expected(1).await;
+    mock.with_current_principal("access-from-refresh", "account-1", 1)
+        .await;
+    mock.with_revoke_all_pairings_for_principal_status("access-from-refresh", "account-1", 200, 1)
+        .await;
     mock.with_revoke_token("access-from-refresh").await;
 
     seed_sessions(
@@ -5095,11 +5625,11 @@ async fn env_oidc_allow_escrow_failure_on_refresh_backed_session_then_logout_all
     );
     let mock = MockRegistry::start().await;
 
-    std::fs::write(
-        project.path().join("lpm.json"),
-        r#"{"vault":"vault-policy-refresh-escrow-logout-all-123"}"#,
-    )
-    .expect("failed to write lpm.json for refresh-backed oidc escrow warning logout-all flow");
+    write_personal_bound_manifest(
+        &project,
+        &mock.url(),
+        "vault-policy-refresh-escrow-logout-all-123",
+    );
 
     mock.with_refresh_expected(
         "refresh-seed-token",
@@ -5141,7 +5671,10 @@ async fn env_oidc_allow_escrow_failure_on_refresh_backed_session_then_logout_all
         ]),
     )
     .await;
-    mock.with_revoke_all_pairings_expected(1).await;
+    mock.with_current_principal("access-from-refresh", "account-1", 1)
+        .await;
+    mock.with_revoke_all_pairings_for_principal_status("access-from-refresh", "account-1", 200, 1)
+        .await;
     mock.with_revoke_token("access-from-refresh").await;
 
     seed_sessions(
@@ -5249,15 +5782,9 @@ async fn env_oidc_allow_canonicalizes_env_aliases_before_storing_policy() {
         TempProject::empty(r#"{"name":"vault-oidc-canonical-env-test","version":"1.0.0"}"#);
     let mock = MockRegistry::start().await;
 
-    project.write_file(
-        "lpm.json",
-        r#"{
-  "vault": "vault-policy-canonical-123",
-  "env": {
-    "dev": ".env.development"
-  }
-}"#,
-    );
+    let mut manifest = personal_bound_manifest(&mock.url(), "vault-policy-canonical-123");
+    manifest["env"] = serde_json::json!({ "dev": ".env.development" });
+    project.write_file("lpm.json", &manifest.to_string());
 
     seed_sessions(
         project.home(),
@@ -5427,16 +5954,6 @@ async fn env_share_force_recreates_only_a_missing_bound_organization_vault() {
                     (ORG_ROTATION_SLUG): 5,
                     "other": 9,
                 },
-                "orgBindings": {
-                    (ORG_ROTATION_SLUG): {
-                        "registryUrl": registry_url,
-                        "principalId": organization_id,
-                    },
-                    "other": {
-                        "registryUrl": "https://registry.example",
-                        "principalId": "00000000-0000-4000-8000-000000000009",
-                    },
-                },
                 "authorityCheckpoints": {
                     "organizations": {
                         (ORG_ROTATION_SLUG): {
@@ -5474,10 +5991,11 @@ async fn env_share_force_recreates_only_a_missing_bound_organization_vault() {
             "/api/orgs/{ORG_ROTATION_SLUG}/vaults/{vault_id}"
         )))
         .and(header("authorization", format!("Bearer {auth_token}")))
-        .respond_with(
-            ResponseTemplate::new(404)
-                .set_body_json(serde_json::json!({ "error": "Vault not found" })),
-        )
+        .respond_with(SignedMissingOrgVaultResponse {
+            org_slug: ORG_ROTATION_SLUG.to_owned(),
+            vault_id: vault_id.to_owned(),
+            retained_revision: 5,
+        })
         .expect(1)
         .mount(mock.server())
         .await;
@@ -5490,6 +6008,7 @@ async fn env_share_force_recreates_only_a_missing_bound_organization_vault() {
             serde_json::json!({
                 "status": "shared",
                 "version": 6,
+                "contentKeyVersion": 1,
                 "principalId": organization_id,
             }),
             auth_token,
@@ -5573,12 +6092,6 @@ async fn env_share_force_refuses_an_existing_bound_organization_vault_without_up
             "vaultSync": {
                 "orgVersions": {
                     (ORG_ROTATION_SLUG): 5,
-                },
-                "orgBindings": {
-                    (ORG_ROTATION_SLUG): {
-                        "registryUrl": registry_url,
-                        "principalId": organization_id,
-                    },
                 },
                 "authorityCheckpoints": {
                     "organizations": {
@@ -5672,6 +6185,110 @@ async fn env_share_force_refuses_an_existing_bound_organization_vault_without_up
     );
 }
 
+#[tokio::test]
+async fn env_share_force_rejects_a_remote_revision_below_the_durable_checkpoint() {
+    let project = TempProject::empty(r#"{"name":"share-rollback","version":"1.0.0"}"#);
+    let mock = MockRegistry::start().await;
+    let registry_url = mock.url();
+    let auth_token = "org-share-rollback-token";
+    let vault_id = "vault-org-share-rollback";
+    let organization_id = "00000000-0000-4000-8000-000000000001";
+    let (_, public_key_b64, fingerprint) =
+        prepare_org_share_project(&project, &mock, auth_token, vault_id);
+    project.write_file(
+        "lpm.json",
+        &serde_json::json!({
+            "vault": vault_id,
+            "vaultSync": {
+                "orgVersions": {
+                    (ORG_ROTATION_SLUG): 5,
+                },
+                "authorityCheckpoints": {
+                    "organizations": {
+                        (ORG_ROTATION_SLUG): {
+                            (registry_url.clone()): {
+                                (organization_id): {
+                                    "version": 5,
+                                    "syncedAt": "2026-09-04T00:00:00Z",
+                                },
+                            },
+                        },
+                    },
+                },
+            },
+        })
+        .to_string(),
+    );
+    mount_org_member_keys(
+        &mock,
+        auth_token,
+        ORG_ROTATION_SLUG,
+        &public_key_b64,
+        &fingerprint,
+    )
+    .await;
+    Mock::given(method("GET"))
+        .and(path(format!(
+            "/api/orgs/{ORG_ROTATION_SLUG}/vaults/{vault_id}"
+        )))
+        .and(query_param("versionOnly", "true"))
+        .and(header("authorization", format!("Bearer {auth_token}")))
+        .respond_with(signed_sync_response(
+            serde_json::json!({ "version": 4 }),
+            auth_token,
+            vault_id,
+            TestSyncScope::Organization(ORG_ROTATION_SLUG.to_owned()),
+        ))
+        .expect(1)
+        .mount(mock.server())
+        .await;
+    Mock::given(method("POST"))
+        .and(path(format!(
+            "/api/orgs/{ORG_ROTATION_SLUG}/vaults/{vault_id}"
+        )))
+        .respond_with(ResponseTemplate::new(500))
+        .expect(0)
+        .mount(mock.server())
+        .await;
+
+    let before = std::fs::read(project.path().join("lpm.json")).expect("snapshot checkpoint");
+    let output = lpm(&project)
+        .env("LPM_REGISTRY_URL", &registry_url)
+        .args([
+            "--json",
+            "env",
+            "share",
+            "--org",
+            ORG_ROTATION_SLUG,
+            "--force",
+        ])
+        .output()
+        .expect("run forced organization share against a rolled-back remote");
+
+    assert!(!output.status.success());
+    let error = parse_clean_json_stdout(&output);
+    assert!(
+        error["error"]
+            .as_str()
+            .is_some_and(|message| message.contains("older than the durable local version 5")),
+        "unexpected error: {error}",
+    );
+    assert_eq!(
+        std::fs::read(project.path().join("lpm.json")).expect("read checkpoint"),
+        before,
+    );
+    assert_eq!(
+        mock.server()
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .filter(|request| request.method.as_str() == "POST")
+            .count(),
+        0,
+    );
+}
+
 fn prepare_org_share_project(
     project: &TempProject,
     mock: &MockRegistry,
@@ -5697,7 +6314,7 @@ fn prepare_org_share_project(
             session_access_expires_at: Some("2030-01-01T00:00:00Z"),
         }],
     );
-    let (private_key, _, public_key_b64, fingerprint) = seed_org_sharing_key(project);
+    let (private_key, _, public_key_b64, fingerprint) = seed_org_sharing_key(project, &mock.url());
     (private_key, public_key_b64, fingerprint)
 }
 
@@ -5723,7 +6340,11 @@ async fn env_share_uses_one_caller_bound_member_inventory_without_a_public_key_p
         )))
         .and(header("authorization", format!("Bearer {auth_token}")))
         .respond_with(signed_sync_response(
-            serde_json::json!({"status": "shared", "version": 1}),
+            serde_json::json!({
+                "status": "shared",
+                "version": 1,
+                "contentKeyVersion": 1,
+            }),
             auth_token,
             vault_id,
             TestSyncScope::Organization(ORG_ROTATION_SLUG.to_owned()),
@@ -5792,32 +6413,23 @@ async fn env_share_rejects_a_changed_manifest_principal_before_the_remote_write(
     let replacement = serde_json::json!({
         "vault": vault_id,
         "vaultSync": {
-            "orgBindings": {
-                (ORG_ROTATION_SLUG): {
-                    "registryUrl": registry_url,
-                    "principalId": "another-organization",
+            "authorityCheckpoints": {
+                "organizations": {
+                    (ORG_ROTATION_SLUG): {
+                        (registry_url.clone()): {
+                            "00000000-0000-4000-8000-000000000002": {
+                                "version": 1,
+                                "syncedAt": "2026-09-05T00:00:00Z",
+                            },
+                        },
+                    },
                 },
             },
         },
     })
     .to_string();
-    let member_response = ResponseTemplate::new(200)
-        .insert_header(
-            "X-LPM-Organization-ID",
-            "00000000-0000-4000-8000-000000000001",
-        )
-        .insert_header(
-            "X-LPM-Caller-User-ID",
-            "11111111-1111-4111-8111-111111111111",
-        )
-        .set_body_json(serde_json::json!([{
-            "userId": "11111111-1111-4111-8111-111111111111",
-            "role": "owner",
-            "publicKey": public_key_b64,
-            "publicKeyVersion": 4,
-            "publicKeyFingerprint": fingerprint,
-            "hasPublicKey": true,
-        }]));
+    let member_response =
+        signed_member_inventory_response(ORG_ROTATION_SLUG, &public_key_b64, &fingerprint);
     Mock::given(method("GET"))
         .and(path(format!(
             "/api/orgs/{ORG_ROTATION_SLUG}/members/public-keys"
@@ -5941,23 +6553,11 @@ async fn env_share_keeps_prepared_member_access_on_one_captured_session() {
             home: project.home().to_path_buf(),
             registry_url: registry_url.clone(),
             replacement_token: replacement_token.to_owned(),
-            response: ResponseTemplate::new(200)
-                .insert_header(
-                    "X-LPM-Organization-ID",
-                    "00000000-0000-4000-8000-000000000001",
-                )
-                .insert_header(
-                    "X-LPM-Caller-User-ID",
-                    "11111111-1111-4111-8111-111111111111",
-                )
-                .set_body_json(serde_json::json!([{
-                    "userId": "11111111-1111-4111-8111-111111111111",
-                    "role": "owner",
-                    "publicKey": public_key_b64,
-                    "publicKeyVersion": 4,
-                    "publicKeyFingerprint": fingerprint,
-                    "hasPublicKey": true,
-                }])),
+            response: signed_member_inventory_response(
+                ORG_ROTATION_SLUG,
+                &public_key_b64,
+                &fingerprint,
+            ),
         })
         .expect(1)
         .mount(mock.server())
@@ -5968,7 +6568,11 @@ async fn env_share_keeps_prepared_member_access_on_one_captured_session() {
         )))
         .and(header("authorization", format!("Bearer {initial_token}")))
         .respond_with(signed_sync_response(
-            serde_json::json!({"status": "shared", "version": 1}),
+            serde_json::json!({
+                "status": "shared",
+                "version": 1,
+                "contentKeyVersion": 1,
+            }),
             initial_token,
             vault_id,
             TestSyncScope::Organization(ORG_ROTATION_SLUG.to_owned()),
@@ -6023,7 +6627,12 @@ async fn env_share_propagates_member_inventory_errors_without_fallback_requests(
             "/api/orgs/{ORG_ROTATION_SLUG}/members/public-keys"
         )))
         .and(header("authorization", format!("Bearer {auth_token}")))
-        .respond_with(ResponseTemplate::new(503).set_body_string("temporarily unavailable"))
+        .respond_with(SignedRejectedMemberInventoryResponse {
+            org_slug: ORG_ROTATION_SLUG.to_owned(),
+            status: 503,
+            code: "service_unavailable".to_owned(),
+            message: "temporarily unavailable".to_owned(),
+        })
         .expect(1)
         .mount(mock.server())
         .await;
@@ -6039,7 +6648,8 @@ async fn env_share_propagates_member_inventory_errors_without_fallback_requests(
     assert!(
         error["error"]
             .as_str()
-            .is_some_and(|message| message.contains("503"))
+            .is_some_and(|message| message.contains("503")),
+        "unexpected error: {error}",
     );
     let requests = mock.server().received_requests().await.unwrap();
     assert_eq!(requests.len(), 1);
@@ -6059,12 +6669,10 @@ async fn env_pull_rejects_an_org_slug_rebound_after_the_rewrap_response() {
             "/api/orgs/{ORG_ROTATION_SLUG}/vaults/{vault_id}"
         )))
         .and(header("authorization", format!("Bearer {auth_token}")))
-        .respond_with(ResponseTemplate::new(403).set_body_json(serde_json::json!({
-            "error": "Member needs rewrap",
-            "code": "vault_member_needs_rewrap",
-            "organizationId": "00000000-0000-4000-8000-000000000001",
-            "callerUserId": "11111111-1111-4111-8111-111111111111",
-        })))
+        .respond_with(SignedOrgMemberRewrapResponse {
+            org_slug: ORG_ROTATION_SLUG.to_owned(),
+            vault_id: vault_id.to_owned(),
+        })
         .expect(1)
         .mount(mock.server())
         .await;
@@ -6073,25 +6681,12 @@ async fn env_pull_rejects_an_org_slug_rebound_after_the_rewrap_response() {
             "/api/orgs/{ORG_ROTATION_SLUG}/members/public-keys"
         )))
         .and(header("authorization", format!("Bearer {auth_token}")))
-        .respond_with(
-            ResponseTemplate::new(200)
-                .insert_header(
-                    "X-LPM-Organization-ID",
-                    "00000000-0000-4000-8000-000000000002",
-                )
-                .insert_header(
-                    "X-LPM-Caller-User-ID",
-                    "11111111-1111-4111-8111-111111111111",
-                )
-                .set_body_json(serde_json::json!([{
-                    "userId": "11111111-1111-4111-8111-111111111111",
-                    "role": "owner",
-                    "publicKey": public_key_b64,
-                    "publicKeyVersion": 4,
-                    "publicKeyFingerprint": fingerprint,
-                    "hasPublicKey": true,
-                }])),
-        )
+        .respond_with(signed_member_inventory_response_for_organization(
+            ORG_ROTATION_SLUG,
+            "00000000-0000-4000-8000-000000000002",
+            &public_key_b64,
+            &fingerprint,
+        ))
         .expect(1)
         .mount(mock.server())
         .await;
@@ -6149,9 +6744,9 @@ async fn env_platform_json_success_paths_emit_success_envelopes() {
         "vercel",
         "project-123",
         serde_json::json!({
-            "status": "connected",
-            "platform": "vercel",
-            "projectId": "project-123",
+            "status": "created",
+            "connectionId": "10000000-0000-4000-8000-000000000001",
+            "label": "production",
         }),
     )
     .await;
@@ -6201,7 +6796,7 @@ async fn env_platform_json_success_paths_emit_success_envelopes() {
     );
     let connect_json = parse_clean_json_stdout(&connect);
     assert_eq!(connect_json["success"], true);
-    assert_eq!(connect_json["status"], "connected");
+    assert_eq!(connect_json["status"], "created");
     assert_eq!(connect_json["platform"], "vercel");
 
     let status = lpm(&project)
@@ -6224,6 +6819,72 @@ async fn env_platform_json_success_paths_emit_success_envelopes() {
 }
 
 #[tokio::test]
+async fn failed_platform_connect_keeps_the_manifest_byte_identical() {
+    let project = TempProject::empty(r#"{"name":"failed-platform-connect","version":"1.0.0"}"#);
+    let mock = MockRegistry::start().await;
+    let bearer_token = "failed-platform-connect-session-token";
+    let vault_id = "vault-failed-platform-connect-123";
+    let manifest_path = project.path().join("lpm.json");
+    project.write_file(
+        "lpm.json",
+        &format!(r#"{{"vault":"{vault_id}","name":"byte-stable"}}"#),
+    );
+    let before = std::fs::read(&manifest_path).expect("snapshot lpm.json");
+    seed_sessions(
+        project.home(),
+        &[SessionSeed {
+            registry_url: &mock.url(),
+            access_token: Some(bearer_token),
+            refresh_token: Some("failed-platform-connect-refresh-token"),
+            session_access_expires_at: Some("2030-01-01T00:00:00Z"),
+        }],
+    );
+    mock.with_platform_context_success(bearer_token, vault_id, "vercel")
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/v10/projects/project-123/env"))
+        .and(query_param("decrypt", "true"))
+        .and(header("authorization", "Bearer rejected-platform-token"))
+        .respond_with(ResponseTemplate::new(401).set_body_json(serde_json::json!({
+            "error": { "message": "invalid platform token" }
+        })))
+        .expect(1)
+        .mount(mock.server())
+        .await;
+
+    let connect = lpm(&project)
+        .env("LPM_REGISTRY_URL", mock.url())
+        .env("ACCEPTANCE_RUN_ID", "workflow-platform-connect-failure")
+        .env("LPM_ACCEPTANCE_VERCEL_API_BASE_URL", mock.url())
+        .args([
+            "--json",
+            "env",
+            "connect",
+            "vercel",
+            "--project",
+            "project-123",
+            "--token",
+            "rejected-platform-token",
+        ])
+        .output()
+        .expect("failed to run rejected lpm env connect");
+
+    assert!(!connect.status.success());
+    assert_eq!(
+        std::fs::read(&manifest_path).expect("read lpm.json after failed connect"),
+        before,
+    );
+    let manifest: serde_json::Value = serde_json::from_slice(&before).expect("parse lpm.json");
+    assert!(manifest.get("vaultSync").is_none());
+    let requests = mock.server().received_requests().await.unwrap();
+    assert!(
+        requests
+            .iter()
+            .all(|request| { request.url.path() != "/api/vault/platforms/connect" })
+    );
+}
+
+#[tokio::test]
 async fn env_coolify_platform_connect_and_status_use_direct_platform_api() {
     let project = TempProject::empty(r#"{"name":"coolify-platform","version":"1.0.0"}"#);
     let mock = MockRegistry::start().await;
@@ -6233,17 +6894,6 @@ async fn env_coolify_platform_connect_and_status_use_direct_platform_api() {
     let application_id = "application-123";
 
     project.write_file("lpm.json", &format!(r#"{{"vault":"{vault_id}"}}"#));
-    write_file_backed_vault(
-        project.home(),
-        vault_id,
-        serde_json::json!({
-            "environments": {
-                "production": {
-                    "APPLICATION_SECRET": "local-value"
-                }
-            }
-        }),
-    );
     seed_sessions(
         project.home(),
         &[SessionSeed {
@@ -6253,6 +6903,23 @@ async fn env_coolify_platform_connect_and_status_use_direct_platform_api() {
             session_access_expires_at: Some("2030-01-01T00:00:00Z"),
         }],
     );
+    let seeded = lpm(&project)
+        .args([
+            "--json",
+            "env",
+            "set",
+            "--env",
+            "production",
+            "APPLICATION_SECRET=local-value",
+        ])
+        .output()
+        .expect("failed to seed Coolify env values");
+    assert!(
+        seeded.status.success(),
+        "env set failed:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&seeded.stdout),
+        String::from_utf8_lossy(&seeded.stderr),
+    );
 
     mock.with_platform_connect_application_success(
         bearer_token,
@@ -6260,8 +6927,9 @@ async fn env_coolify_platform_connect_and_status_use_direct_platform_api() {
         "coolify",
         application_id,
         serde_json::json!({
-            "status": "connected",
-            "platform": "coolify",
+            "status": "created",
+            "connectionId": "20000000-0000-4000-8000-000000000002",
+            "label": "production",
         }),
     )
     .await;
@@ -6380,7 +7048,10 @@ async fn env_coolify_platform_connect_and_status_use_direct_platform_api() {
     assert_eq!(status_json["success"], true);
     assert_eq!(status_json["platforms"][0]["platform"], "coolify");
     assert_eq!(status_json["platforms"][0]["env"], "production");
-    assert_eq!(status_json["platforms"][0]["status"], "drifted");
+    assert_eq!(
+        status_json["platforms"][0]["status"], "drifted",
+        "{status_json}"
+    );
     insta::assert_json_snapshot!("env_coolify_status_json_envelope", status_json);
 
     let push = lpm(&project)
@@ -6434,17 +7105,6 @@ async fn env_railway_platform_connect_and_status_use_direct_graphql_api() {
     let service_id = "service-123";
 
     project.write_file("lpm.json", &format!(r#"{{"vault":"{vault_id}"}}"#));
-    write_file_backed_vault(
-        project.home(),
-        vault_id,
-        serde_json::json!({
-            "environments": {
-                "production": {
-                    "APPLICATION_SECRET": "local-value"
-                }
-            }
-        }),
-    );
     seed_sessions(
         project.home(),
         &[SessionSeed {
@@ -6454,6 +7114,23 @@ async fn env_railway_platform_connect_and_status_use_direct_graphql_api() {
             session_access_expires_at: Some("2030-01-01T00:00:00Z"),
         }],
     );
+    let seeded = lpm(&project)
+        .args([
+            "--json",
+            "env",
+            "set",
+            "--env",
+            "production",
+            "APPLICATION_SECRET=local-value",
+        ])
+        .output()
+        .expect("failed to seed Railway env values");
+    assert!(
+        seeded.status.success(),
+        "env set failed:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&seeded.stdout),
+        String::from_utf8_lossy(&seeded.stderr),
+    );
 
     mock.with_platform_connect_success(
         bearer_token,
@@ -6461,8 +7138,9 @@ async fn env_railway_platform_connect_and_status_use_direct_graphql_api() {
         "railway",
         project_id,
         serde_json::json!({
-            "status": "connected",
-            "platform": "railway",
+            "status": "created",
+            "connectionId": "30000000-0000-4000-8000-000000000003",
+            "label": "production",
         }),
     )
     .await;
@@ -6596,7 +7274,10 @@ async fn env_railway_platform_connect_and_status_use_direct_graphql_api() {
     assert_eq!(status_json["success"], true);
     assert_eq!(status_json["platforms"][0]["platform"], "railway");
     assert_eq!(status_json["platforms"][0]["env"], "production");
-    assert_eq!(status_json["platforms"][0]["status"], "drifted");
+    assert_eq!(
+        status_json["platforms"][0]["status"], "drifted",
+        "{status_json}"
+    );
     assert_eq!(status_json["platforms"][0]["changed"], 1);
     insta::assert_json_snapshot!("env_railway_status_json_envelope", status_json);
 
@@ -6693,8 +7374,9 @@ async fn env_fly_platform_connect_status_and_pull_use_write_only_app_secrets() {
         app_id,
         organization_id,
         serde_json::json!({
-            "status": "connected",
-            "platform": "fly",
+            "status": "created",
+            "connectionId": "40000000-0000-4000-8000-000000000004",
+            "label": "production",
         }),
     )
     .await;
@@ -6885,8 +7567,9 @@ async fn env_github_actions_platform_reports_names_only_and_audits_failed_pushes
         repository,
         repository_id,
         serde_json::json!({
-            "status": "connected",
-            "platform": "github-actions",
+            "status": "created",
+            "connectionId": "50000000-0000-4000-8000-000000000005",
+            "label": "production",
         }),
     )
     .await;
@@ -7050,6 +7733,7 @@ async fn env_github_actions_platform_snapshots_successful_push_and_clean() {
     let repository_id = "123456789";
     let environment = "production";
     let local_origin = "https://local.example.test";
+    let registry_url = mock.url();
 
     project.write_file(
         "lpm.json",
@@ -7061,6 +7745,14 @@ async fn env_github_actions_platform_snapshots_successful_push_and_clean() {
                         "PUBLIC_ORIGIN":{{"client":true}},
                         "API_TOKEN":{{"secret":true}}
                     }}
+                }},
+                "vaultSync":{{
+                    "personalPlatformBindings":{{
+                        "{registry_url}":{{
+                            "registryUrl":"{registry_url}",
+                            "principalId":"account-1"
+                        }}
+                    }}
                 }}
             }}"#
         ),
@@ -7068,7 +7760,7 @@ async fn env_github_actions_platform_snapshots_successful_push_and_clean() {
     seed_sessions(
         project.home(),
         &[SessionSeed {
-            registry_url: &mock.url(),
+            registry_url: &registry_url,
             access_token: Some(bearer_token),
             refresh_token: Some("github-actions-sync-refresh-token"),
             session_access_expires_at: Some("2030-01-01T00:00:00Z"),

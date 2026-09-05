@@ -3,7 +3,7 @@ source: tests/workflows/tests/env_vault.rs
 expression: connect_json
 ---
 {
-  "status": "connected",
+  "status": "created",
   "platform": "railway",
   "success": true
 }

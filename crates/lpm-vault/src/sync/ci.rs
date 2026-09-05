@@ -62,6 +62,7 @@ pub async fn upload_escrow_key(
     auth_token: &str,
     vault_id: &str,
     wrapping_key_hex: &str,
+    expected_principal_id: &str,
 ) -> Result<(), SyncError> {
     let client = sync_http_client()?;
     let url = format!("{registry_url}/api/vault/oidc/escrow");
@@ -69,6 +70,7 @@ pub async fn upload_escrow_key(
     let body = serde_json::json!({
         "vaultId": vault_id,
         "wrappingKeyHex": wrapping_key_hex,
+        "expectedPrincipalId": expected_principal_id,
     });
 
     let response = client
@@ -101,8 +103,28 @@ pub async fn upload_escrow_key(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use wiremock::matchers::{header, method, path, query_param};
+    use wiremock::matchers::{body_json, header, method, path, query_param};
     use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    #[tokio::test]
+    async fn escrow_upload_carries_the_captured_personal_principal() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/vault/oidc/escrow"))
+            .and(body_json(serde_json::json!({
+                "vaultId": "vault-123",
+                "wrappingKeyHex": "aa",
+                "expectedPrincipalId": "account-1",
+            })))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        upload_escrow_key(&server.uri(), "session", "vault-123", "aa", "account-1")
+            .await
+            .expect("escrow upload should preserve the captured principal");
+    }
 
     #[tokio::test]
     async fn ci_pull_rejects_an_oversized_declared_response() {

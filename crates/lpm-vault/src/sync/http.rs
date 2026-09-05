@@ -4,7 +4,7 @@ use std::sync::OnceLock;
 use super::SyncError;
 use super::envelope::{
     AuthenticatedSyncResponse, REQUEST_NONCE_HEADER, SyncEnvelopePolicy, SyncScope,
-    generate_request_nonce,
+    generate_request_nonce, parse_vault_response,
 };
 use crate::signature;
 
@@ -34,7 +34,7 @@ async fn read_capped_body_with_limit(
         .and_then(|value| value.parse::<u64>().ok())
         .or_else(|| response.content_length());
     if let Some(declared) = declared_length
-        && declared as usize > max_bytes
+        && declared_length_exceeds_cap_for_target(declared, max_bytes, usize::MAX as u64)
     {
         return Err(format!(
             "response too large: declared length {declared} exceeds cap {max_bytes}"
@@ -65,6 +65,14 @@ async fn read_capped_body_with_limit(
         buf.extend_from_slice(&chunk);
     }
     Ok(buf)
+}
+
+fn declared_length_exceeds_cap_for_target(
+    declared: u64,
+    max_bytes: usize,
+    target_usize_max: u64,
+) -> bool {
+    declared > target_usize_max || declared > max_bytes as u64
 }
 
 #[cfg(test)]
@@ -118,20 +126,22 @@ pub(super) async fn read_capped_error_text(response: reqwest::Response) -> Strin
     }
 }
 
-/// Read a vault sync response and verify its `X-LPM-Signature` header
-/// against the body. Only 2xx responses are signed by the server, so
-/// error responses are returned unverified for the caller to format.
+/// Read a vault sync response and verify its origin-authentication headers
+/// against the body. Unsigned unauthorized responses discard their body;
+/// every other response requires a trusted signature before parsing.
 ///
 /// Returning `(status, body)` rather than the parsed response gives every
 /// call site identical verification semantics and keeps the parse step
 /// downstream — so a failed signature can never reach decryption.
 pub(super) async fn read_verified_response(
     response: reqwest::Response,
-    auth_token: &str,
 ) -> Result<(reqwest::StatusCode, Vec<u8>), String> {
     let status = response.status();
-    // Snapshot the signature header first — body-drain consumes
-    // `self`, so we cannot read headers afterwards.
+    let key_id_header = response
+        .headers()
+        .get(signature::KEY_ID_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned);
     let signature_header = response
         .headers()
         .get(signature::SIGNATURE_HEADER)
@@ -143,11 +153,50 @@ pub(super) async fn read_verified_response(
     } else {
         MAX_VAULT_ERROR_RESPONSE_BYTES
     };
-    let body = read_capped_body_with_limit(response, max_bytes).await?;
+    #[cfg(all(debug_assertions, not(test)))]
+    let local_development =
+        signature::is_local_development_key(response.url(), key_id_header.as_deref());
+    let mut body = read_capped_body_with_limit(response, max_bytes).await?;
+    let has_signature_headers = key_id_header.is_some() || signature_header.is_some();
 
-    if status.is_success() {
-        signature::verify_response_body(&body, auth_token, signature_header.as_deref())
-            .map_err(|e| e.to_string())?;
+    if status != reqwest::StatusCode::UNAUTHORIZED || has_signature_headers {
+        #[cfg(not(test))]
+        let verification = {
+            #[cfg(debug_assertions)]
+            if local_development {
+                signature::verify_response_with_test_key(
+                    status.as_u16(),
+                    &body,
+                    key_id_header.as_deref(),
+                    signature_header.as_deref(),
+                )
+            } else {
+                signature::verify_response(
+                    status.as_u16(),
+                    &body,
+                    key_id_header.as_deref(),
+                    signature_header.as_deref(),
+                )
+            }
+            #[cfg(not(debug_assertions))]
+            signature::verify_response(
+                status.as_u16(),
+                &body,
+                key_id_header.as_deref(),
+                signature_header.as_deref(),
+            )
+        };
+        #[cfg(test)]
+        let verification = signature::verify_response_with_test_key(
+            status.as_u16(),
+            &body,
+            key_id_header.as_deref(),
+            signature_header.as_deref(),
+        );
+        verification.map_err(|error| error.to_string())?;
+    }
+    if status == reqwest::StatusCode::UNAUTHORIZED && !has_signature_headers {
+        body.clear();
     }
 
     Ok((status, body))
@@ -157,13 +206,12 @@ pub(super) enum SyncHttpResponse {
     Success(Box<AuthenticatedSyncResponse>),
     Error {
         status: reqwest::StatusCode,
-        body: Vec<u8>,
+        response: Box<AuthenticatedSyncResponse>,
     },
 }
 
 pub(super) async fn send_authenticated_sync_request(
     request: reqwest::RequestBuilder,
-    auth_token: &str,
     vault_id: &str,
     scope: SyncScope<'_>,
     policy: SyncEnvelopePolicy,
@@ -174,15 +222,23 @@ pub(super) async fn send_authenticated_sync_request(
         .send()
         .await
         .map_err(network_error)?;
-    let (status, body) = read_verified_response(response, auth_token).await?;
-    if !status.is_success() {
-        return Ok(SyncHttpResponse::Error { status, body });
+    let (status, body) = read_verified_response(response).await?;
+    if status == reqwest::StatusCode::UNAUTHORIZED && body.is_empty() {
+        return Err(SyncError::http(status, "authentication failed".into()));
     }
-
-    let response: AuthenticatedSyncResponse =
-        serde_json::from_slice(&body).map_err(|error| format!("response parse error: {error}"))?;
-    response.validate(vault_id, scope, &request_nonce, policy)?;
-    Ok(SyncHttpResponse::Success(Box::new(response)))
+    let response = Box::new(parse_vault_response(
+        &body,
+        status.as_u16(),
+        vault_id,
+        scope,
+        &request_nonce,
+        policy,
+    )?);
+    if status.is_success() {
+        Ok(SyncHttpResponse::Success(response))
+    } else {
+        Ok(SyncHttpResponse::Error { status, response })
+    }
 }
 
 pub(super) fn sync_request_timeout(default: std::time::Duration) -> std::time::Duration {
@@ -236,6 +292,17 @@ mod tests {
     #[test]
     fn vault_response_cap_covers_every_registry_accepted_request_body() {
         assert_eq!(MAX_VAULT_RESPONSE_BYTES, 16 * 1024 * 1024);
+    }
+
+    #[test]
+    fn declared_length_above_target_usize_is_rejected_before_narrowing() {
+        let first_unrepresentable_32_bit_length = u64::from(u32::MAX) + 1;
+
+        assert!(declared_length_exceeds_cap_for_target(
+            first_unrepresentable_32_bit_length,
+            MAX_VAULT_RESPONSE_BYTES,
+            u64::from(u32::MAX),
+        ));
     }
 
     /// `read_capped_body` rejects pre-stream when the server declares a
@@ -417,10 +484,54 @@ mod tests {
         let response = reqwest::get(format!("http://{addr}/"))
             .await
             .expect("connect");
-        let error = read_verified_response(response, "token")
+        let error = read_verified_response(response)
             .await
             .expect_err("oversized chunked error response must reject");
         assert!(error.contains("streamed body exceeded cap 65536"));
+    }
+
+    #[tokio::test]
+    async fn read_verified_response_rejects_an_invalid_signed_unauthorized_response() {
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let (key_id, response_signature) =
+            signature::sign_response_for_test(401, b"original unauthorized body");
+        Mock::given(wiremock::matchers::method("GET"))
+            .respond_with(
+                ResponseTemplate::new(401)
+                    .insert_header(signature::KEY_ID_HEADER, key_id.as_str())
+                    .insert_header(signature::SIGNATURE_HEADER, response_signature.as_str())
+                    .set_body_string("tampered unauthorized body"),
+            )
+            .mount(&server)
+            .await;
+
+        let response = reqwest::get(server.uri()).await.expect("request succeeds");
+        let error = read_verified_response(response)
+            .await
+            .expect_err("a signed unauthorized response must verify before use");
+
+        assert!(error.contains("does not match"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn read_verified_response_discards_an_unsigned_unauthorized_body() {
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(wiremock::matchers::method("GET"))
+            .respond_with(ResponseTemplate::new(401).set_body_string("attacker-controlled body"))
+            .mount(&server)
+            .await;
+
+        let response = reqwest::get(server.uri()).await.expect("request succeeds");
+        let (status, body) = read_verified_response(response)
+            .await
+            .expect("unsigned pre-authentication rejection is allowed");
+
+        assert_eq!(status, reqwest::StatusCode::UNAUTHORIZED);
+        assert!(body.is_empty());
     }
 
     #[cfg(not(debug_assertions))]

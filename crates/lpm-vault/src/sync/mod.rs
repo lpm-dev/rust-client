@@ -2,16 +2,13 @@
 //!
 //! Handles push/pull of encrypted vault data to/from the LPM API.
 //!
-//! Successful responses from signed vault endpoints carry an
-//! `X-LPM-Signature` header (HMAC-SHA256 over the body keyed by
-//! SHA-256 of the auth token). Every signed surface routes through
-//! the shared verified-response helper, which reads the body once,
-//! snapshots the signature header, and verifies before any caller-side
-//! parsing or decryption. Error responses (non-2xx) are not signed and
-//! are returned unverified for the caller to format.
+//! Responses from authenticated vault endpoints carry an origin-authenticated
+//! Ed25519 signature. Every signed surface routes through the shared
+//! verified-response helper, which reads the body once, snapshots the
+//! signature headers, and verifies before caller-side parsing or decryption.
 //!
 //! Personal and organization sync requests also carry a fresh 32-byte
-//! request nonce. Successful protocol-v2 envelopes must bind that nonce,
+//! request nonce. Successful authenticated envelopes must bind that nonce,
 //! the vault identity, scope, crypto version, server version, and any
 //! encrypted payload before the response reaches decryption or a caller.
 
@@ -36,6 +33,7 @@ pub enum SyncError {
         code: Option<String>,
         organization_id: Option<String>,
         caller_user_id: Option<String>,
+        server_version: Option<i32>,
         message: String,
     },
     /// The server accepted the bearer but rejected a credential submitted by
@@ -78,12 +76,35 @@ impl SyncError {
         }
     }
 
+    pub(crate) fn recreation_conflict_floor(&self) -> Option<i32> {
+        match self {
+            Self::Http {
+                status: 409,
+                code: Some(code),
+                server_version: Some(server_version),
+                ..
+            } if matches!(
+                code.as_str(),
+                "vault_version_conflict"
+                    | "vault_expected_version_required"
+                    | "vault_ciphertext_revision_mismatch"
+                    | "vault_creation_conflict"
+                    | "vault_recreation_intent_required"
+            ) && *server_version > 0 =>
+            {
+                Some(*server_version)
+            }
+            _ => None,
+        }
+    }
+
     pub(crate) fn http(status: reqwest::StatusCode, message: String) -> Self {
         Self::Http {
             status: status.as_u16(),
             code: None,
             organization_id: None,
             caller_user_id: None,
+            server_version: None,
             message,
         }
     }
@@ -100,6 +121,23 @@ impl SyncError {
             code,
             organization_id,
             caller_user_id,
+            server_version: None,
+            message,
+        }
+    }
+
+    pub(crate) fn http_with_sync_conflict(
+        status: reqwest::StatusCode,
+        code: Option<String>,
+        server_version: Option<i32>,
+        message: String,
+    ) -> Self {
+        Self::Http {
+            status: status.as_u16(),
+            code,
+            organization_id: None,
+            caller_user_id: None,
+            server_version,
             message,
         }
     }
@@ -132,8 +170,7 @@ pub use org::{
     push_org_with_access, push_org_with_keys, push_org_with_keys_and_access,
 };
 pub use pairing::{
-    PairingSession, approve_pairing, approve_pairing_legacy, get_pairing_session, stage_pairing,
-    unpair_all,
+    PairingSession, approve_pairing, get_pairing_session, stage_pairing, unpair_all,
 };
 pub use personal::{
     ListVaultsResponse, PersonalPushOptions, PullResponse, PulledPersonalVault, PushMetadata,
@@ -145,7 +182,7 @@ pub use personal::{
 pub use public_key::{
     LocalPublicKeyState, MemberPublicKey, MyPublicKeyState, OrgMemberKeyAccess, PendingPublicKey,
     PublicKeyRegistrationState, SharingKeyRotationLock, SharingKeyScope, UploadPublicKeyResponse,
-    classify_public_key_state, classify_public_key_state_from_member_access,
+    ValidatedSharingKey, classify_public_key_state, classify_public_key_state_from_member_access,
     create_pending_x25519_keypair, discard_pending_x25519_keypair, get_my_public_key,
     get_my_public_key_state, get_org_member_key_access, get_org_member_keys,
     promote_pending_x25519_keypair, read_pending_x25519_keypair, resolve_local_public_key_state,
@@ -162,7 +199,6 @@ pub(crate) mod test_support {
     #[cfg(debug_assertions)]
     use crate::signature;
     #[cfg(debug_assertions)]
-    use sha2::{Digest, Sha256};
     #[cfg(debug_assertions)]
     use wiremock::{Request, Respond, ResponseTemplate};
 
@@ -180,10 +216,83 @@ pub(crate) mod test_support {
     #[derive(Clone)]
     pub(crate) struct SignedSyncResponse {
         body: serde_json::Value,
-        auth_token: String,
         vault_id: String,
         scope: TestSyncScope,
         mutate: Option<fn(&mut serde_json::Value)>,
+    }
+
+    #[cfg(debug_assertions)]
+    #[derive(Clone)]
+    pub(crate) struct SignedEnvelopeResponse {
+        status: u16,
+        operation: &'static str,
+        outcome: &'static str,
+        binding: serde_json::Value,
+        data: serde_json::Value,
+        mutate: Option<fn(&mut serde_json::Value)>,
+    }
+
+    #[cfg(debug_assertions)]
+    impl Respond for SignedEnvelopeResponse {
+        fn respond(&self, request: &Request) -> ResponseTemplate {
+            let nonce = request
+                .headers
+                .get(TEST_REQUEST_NONCE_HEADER)
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or_default();
+            let mut body = serde_json::json!({
+                "envelopeVersion": 3,
+                "operation": self.operation,
+                "outcome": self.outcome,
+                "requestNonce": nonce,
+                "binding": self.binding,
+                "data": self.data,
+            });
+            if let Some(mutate) = self.mutate {
+                mutate(&mut body);
+            }
+            let body_string = serde_json::to_string(&body).expect("test envelope should serialize");
+            let (key_id, signature) =
+                signature::sign_response_for_test(self.status, body_string.as_bytes());
+            ResponseTemplate::new(self.status)
+                .insert_header("Content-Type", "application/json")
+                .insert_header(signature::KEY_ID_HEADER, key_id.as_str())
+                .insert_header(signature::SIGNATURE_HEADER, signature.as_str())
+                .set_body_string(body_string)
+        }
+    }
+
+    #[cfg(debug_assertions)]
+    pub(crate) fn signed_envelope_response(
+        status: u16,
+        operation: &'static str,
+        outcome: &'static str,
+        binding: serde_json::Value,
+        data: serde_json::Value,
+    ) -> SignedEnvelopeResponse {
+        SignedEnvelopeResponse {
+            status,
+            operation,
+            outcome,
+            binding,
+            data,
+            mutate: None,
+        }
+    }
+
+    #[cfg(debug_assertions)]
+    pub(crate) fn signed_envelope_response_with(
+        status: u16,
+        operation: &'static str,
+        outcome: &'static str,
+        binding: serde_json::Value,
+        data: serde_json::Value,
+        mutate: fn(&mut serde_json::Value),
+    ) -> SignedEnvelopeResponse {
+        SignedEnvelopeResponse {
+            mutate: Some(mutate),
+            ..signed_envelope_response(status, operation, outcome, binding, data)
+        }
     }
 
     #[cfg(debug_assertions)]
@@ -194,82 +303,127 @@ pub(crate) mod test_support {
                 .get(TEST_REQUEST_NONCE_HEADER)
                 .and_then(|value| value.to_str().ok())
                 .unwrap_or_default();
-            let mut body = self.body.clone();
-            let object = body
-                .as_object_mut()
+            let object = self
+                .body
+                .as_object()
                 .expect("test sync response body must be a JSON object");
-            let version = object
+            let revision = object
                 .get("version")
                 .and_then(serde_json::Value::as_i64)
                 .expect("test sync response must include an integer version");
-            object.insert("vaultId".into(), self.vault_id.clone().into());
-            object.insert("envelopeVersion".into(), 2.into());
-            object.insert("serverVersion".into(), version.into());
-            object.insert("requestNonce".into(), nonce.into());
-            object
-                .entry("cryptoVersion")
-                .or_insert_with(|| serde_json::Value::from(crate::crypto::CURRENT_CRYPTO_VERSION));
-            match &self.scope {
-                TestSyncScope::Personal => {
-                    object.insert("scope".into(), "personal".into());
-                    object.insert("principalId".into(), "personal-test-principal".into());
+            let crypto_version = object
+                .get("cryptoVersion")
+                .cloned()
+                .unwrap_or_else(|| crate::crypto::CURRENT_CRYPTO_VERSION.into());
+            let operation = if request.method.as_str() == "POST" {
+                "vault.write"
+            } else if request
+                .url
+                .query_pairs()
+                .any(|(key, value)| key == "versionOnly" && value == "true")
+            {
+                "vault.inspect"
+            } else {
+                "vault.pull"
+            };
+            let binding = match &self.scope {
+                TestSyncScope::Personal => serde_json::json!({
+                    "scope": "personal",
+                    "principalId": "personal-test-principal",
+                    "callerUserId": "personal-test-principal",
+                    "vaultId": self.vault_id,
+                }),
+                TestSyncScope::Organization(slug) => serde_json::json!({
+                    "scope": "organization",
+                    "principalId": "00000000-0000-4000-8000-000000000001",
+                    "callerUserId": "organization-test-caller",
+                    "organizationSlug": slug,
+                    "vaultId": self.vault_id,
+                }),
+            };
+            let data = match operation {
+                "vault.inspect" => serde_json::json!({
+                    "revision": revision,
+                    "cryptoVersion": crypto_version,
+                }),
+                "vault.write" => {
+                    let mut data = serde_json::json!({
+                        "revision": revision,
+                        "cryptoVersion": crypto_version,
+                        "action": object
+                            .get("status")
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or(match &self.scope {
+                                TestSyncScope::Personal => "synced",
+                                TestSyncScope::Organization(_) => "shared",
+                            }),
+                    });
+                    if let Some(content_key_version) = object.get("contentKeyVersion") {
+                        data["contentKeyVersion"] = content_key_version.clone();
+                    }
+                    data
                 }
-                TestSyncScope::Organization(slug) => {
-                    object.insert("scope".into(), "organization".into());
-                    object.insert("callerUserId".into(), "organization-test-caller".into());
-                    object.insert(
-                        "principalId".into(),
-                        "00000000-0000-4000-8000-000000000001".into(),
-                    );
-                    object.insert("organizationSlug".into(), slug.clone().into());
+                _ => {
+                    let encrypted_blob = object
+                        .get("encryptedBlob")
+                        .and_then(serde_json::Value::as_str)
+                        .expect("pull fixture must include encryptedBlob");
+                    let wrapped_key = object
+                        .get("wrappedKey")
+                        .and_then(serde_json::Value::as_str)
+                        .expect("pull fixture must include wrappedKey");
+                    let mut data = serde_json::json!({
+                        "encryptedBlob": encrypted_blob,
+                        "wrappedKey": wrapped_key,
+                        "revision": revision,
+                        "cryptoVersion": crypto_version,
+                        "updatedAt": "2026-09-05T12:00:00.000Z",
+                    });
+                    for field in [
+                        "contentKeyVersion",
+                        "recipientPublicKeyVersion",
+                        "recipientPublicKeyFingerprint",
+                    ] {
+                        if let Some(value) = object.get(field) {
+                            data[field] = value.clone();
+                        }
+                    }
+                    data
                 }
-            }
-            if let (Some(encrypted_blob), Some(wrapped_key)) = (
-                object
-                    .get("encryptedBlob")
-                    .and_then(serde_json::Value::as_str),
-                object.get("wrappedKey").and_then(serde_json::Value::as_str),
-            ) {
-                let digest = test_sync_payload_digest(encrypted_blob, wrapped_key);
-                object.insert("payloadDigest".into(), digest.into());
-            }
+            };
+            let mut body = serde_json::json!({
+                "envelopeVersion": 3,
+                "operation": operation,
+                "outcome": if operation == "vault.write" { "committed" } else { "current" },
+                "requestNonce": nonce,
+                "binding": binding,
+                "data": data,
+            });
             if let Some(mutate) = self.mutate {
                 mutate(&mut body);
             }
 
             let body_string =
                 serde_json::to_string(&body).expect("test sync response should serialize");
-            let signature = signature::sign_body(body_string.as_bytes(), &self.auth_token);
+            let (key_id, signature) =
+                signature::sign_response_for_test(200, body_string.as_bytes());
             ResponseTemplate::new(200)
                 .insert_header("Content-Type", "application/json")
+                .insert_header(signature::KEY_ID_HEADER, key_id.as_str())
                 .insert_header(signature::SIGNATURE_HEADER, signature.as_str())
                 .set_body_string(body_string)
         }
     }
 
     #[cfg(debug_assertions)]
-    fn test_sync_payload_digest(encrypted_blob: &str, wrapped_key: &str) -> String {
-        let mut hash = Sha256::new();
-        hash.update(b"lpm-vault-payload\0");
-        for value in [encrypted_blob, wrapped_key] {
-            let bytes = value.as_bytes();
-            let length = u32::try_from(bytes.len()).expect("test payload field should fit in u32");
-            hash.update(length.to_be_bytes());
-            hash.update(bytes);
-        }
-        hex::encode(hash.finalize())
-    }
-
-    #[cfg(debug_assertions)]
     pub(crate) fn signed_sync_ok_response(
         body: serde_json::Value,
-        auth_token: &str,
+        _auth_token: &str,
         vault_id: &str,
         scope: TestSyncScope,
     ) -> SignedSyncResponse {
         SignedSyncResponse {
             body,
-            auth_token: auth_token.to_owned(),
             vault_id: vault_id.to_owned(),
             scope,
             mutate: None,
@@ -303,19 +457,20 @@ pub(crate) mod test_support {
     }
 
     /// Build a 200 response that mirrors what the LPM origin actually sends
-    /// for signed vault endpoints — body bytes plus matching X-LPM-Signature
-    /// header. Tests that drive `pull*`/`push*` for `auth_token` must use
+    /// for signed vault endpoints — body bytes plus the matching Ed25519
+    /// response headers. Tests that drive `pull*`/`push*` must use
     /// this helper or the response fails verification.
     #[cfg(debug_assertions)]
     pub(crate) fn signed_ok_response(
         body: serde_json::Value,
-        auth_token: &str,
+        _auth_token: &str,
     ) -> ResponseTemplate {
         let body_str = serde_json::to_string(&body).expect("test body should serialize");
-        let sig = signature::sign_body(body_str.as_bytes(), auth_token);
+        let (key_id, signature) = signature::sign_response_for_test(200, body_str.as_bytes());
         ResponseTemplate::new(200)
             .insert_header("Content-Type", "application/json")
-            .insert_header(signature::SIGNATURE_HEADER, sig.as_str())
+            .insert_header(signature::KEY_ID_HEADER, key_id.as_str())
+            .insert_header(signature::SIGNATURE_HEADER, signature.as_str())
             .set_body_string(body_str)
     }
 

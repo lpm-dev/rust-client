@@ -19,6 +19,31 @@ struct InitActionResult {
     outcome: Option<InitActionOutcome>,
 }
 
+fn validate_configured_environment_names(
+    env_map: &HashMap<String, String>,
+    environments: Option<&lpm_env::EnvironmentsConfig>,
+) -> Result<(), LpmError> {
+    for file_path in env_map.values() {
+        if file_path == ".env" {
+            continue;
+        }
+        let canonical = lpm_env::resolver::extract_mode_from_env_path(file_path).ok_or_else(|| {
+            LpmError::Script(format!(
+                "invalid environment file mapping {file_path:?}: expected `.env` or `.env.<name>`"
+            ))
+        })?;
+        lpm_env::resolver::validate_env_name(canonical)
+            .map_err(|error| LpmError::Script(format!("invalid environment name: {error}")))?;
+    }
+    if let Some(environments) = environments {
+        for canonical in environments.envs.keys() {
+            lpm_env::resolver::validate_env_name(canonical)
+                .map_err(|error| LpmError::Script(format!("invalid environment name: {error}")))?;
+        }
+    }
+    Ok(())
+}
+
 fn perform_init_actions(
     project_dir: &std::path::Path,
     actions: &[InitAction],
@@ -81,6 +106,7 @@ pub(super) fn vars_init(
     let empty_env_map = HashMap::new();
     let env_map = config.as_ref().map_or(&empty_env_map, |c| &c.env);
     let environments = config.as_ref().and_then(|c| c.environments.as_ref());
+    validate_configured_environment_names(env_map, environments)?;
     let snapshot = lpm_vault::capture_environment_initialization_snapshot(vault_id.as_deref())
         .map_err(LpmError::Script)?;
 
@@ -447,12 +473,7 @@ pub(super) fn vars_ls(project_dir: &std::path::Path, json_output: bool) -> Resul
         };
         let updated_str = install_ui::dim(&format!("{updated_raw:<updated_width$}"));
 
-        let source_indicator = match row.source {
-            lpm_env::EnvSource::Legacy => {
-                install_ui::terminal_line!(" {}", install_ui::yellow("legacy"))
-            }
-            _ => install_ui::TerminalLine::new(""),
-        };
+        let source_indicator = install_ui::TerminalLine::new("");
 
         let var_count = install_ui::dim(&format!("{:>9}", row.var_count));
 

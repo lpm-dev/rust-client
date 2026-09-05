@@ -136,7 +136,7 @@ test("macOS CLI releases use the shared LPM Vault Keychain access group", () => 
   assert.match(releaseWorkflow, /codesign -d --entitlements :-/);
 });
 
-test("raw macOS compatibility assets reuse dependencies while preserving separate binaries", () => {
+test("macOS releases do not publish entitlement-free raw executables", () => {
   const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../../..");
   const releaseWorkflow = fs.readFileSync(
     path.join(repoRoot, ".github/workflows/release.yml"),
@@ -151,25 +151,21 @@ test("raw macOS compatibility assets reuse dependencies while preserving separat
     "utf8",
   );
 
-  assert.match(cliManifest, /legacy-macos-keychain = \["lpm-vault\/legacy-macos-keychain"\]/);
-  assert.match(vaultManifest, /legacy-macos-keychain = \[\]/);
+  assert.doesNotMatch(cliManifest, /legacy-macos-keychain/);
+  assert.doesNotMatch(vaultManifest, /legacy-macos-keychain/);
   assert.doesNotMatch(releaseWorkflow, /--target-dir target\/legacy-macos-keychain/);
   assert.match(
     releaseWorkflow,
-    /cp "target\/\$\{\{ matrix\.target \}\}\/release\/lpm-rs" "\$RUNNER_TEMP\/lpm-rs-provisioned"/,
+    /cp "target\/\$\{\{ matrix\.target \}\}\/release\/lpm-rs" "\$RUNNER_TEMP\/lpm-rs-app-bundle"/,
   );
-  assert.match(releaseWorkflow, /--features legacy-macos-keychain/);
+  assert.doesNotMatch(releaseWorkflow, /--features legacy-macos-keychain/);
+  assert.doesNotMatch(releaseWorkflow, /raw-notary|Sign raw binary|raw artifact|raw binary/i);
+  assert.doesNotMatch(releaseWorkflow, /assets\+=\(lpm-darwin-arm64 lpm-darwin-x64\)/);
   assert.match(
     releaseWorkflow,
-    /cp target\/\$\{\{ matrix\.target \}\}\/release\/lpm-rs \$\{\{ matrix\.binary \}\}/,
+    /scripts\/assemble-macos-app\.sh" \s*\\\s*"\$RUNNER_TEMP\/lpm-rs-app-bundle" \s*\\\s*"\$APP_BUNDLE"/,
   );
-  assert.match(
-    releaseWorkflow,
-    /scripts\/assemble-macos-app\.sh" \s*\\\s*"\$RUNNER_TEMP\/lpm-rs-provisioned" \s*\\\s*"\$APP_BUNDLE"/,
-  );
-  assert.match(releaseWorkflow, /env set LPM_RELEASE_SMOKE=verified/);
-  assert.match(releaseWorkflow, /env get LPM_RELEASE_SMOKE >\/dev\/null/);
-  assert.match(releaseWorkflow, /env delete LPM_RELEASE_SMOKE/);
+  assert.doesNotMatch(releaseWorkflow, /LPM_RELEASE_SMOKE/);
 });
 
 test("macOS release packaging preserves a provisioned app bundle", () => {
@@ -216,8 +212,8 @@ test("macOS release workflow provisions, notarizes, staples, and executes the bu
   assert.match(releaseWorkflow, /xcrun stapler staple/);
   assert.match(releaseWorkflow, /xcrun stapler validate/);
   assert.equal(
-    [...releaseWorkflow.matchAll(/ditto -c -k (?:--keepParent )?--norsrc/g)].length,
-    3,
+    [...releaseWorkflow.matchAll(/ditto -c -k --keepParent --norsrc/g)].length,
+    2,
     "every public or notarization ZIP must exclude AppleDouble metadata",
   );
   assert.match(releaseWorkflow, /unzip -q "\$archive" -d "binaries\/\$\{platform\}" -x '\*\/\._\*'/);
@@ -229,7 +225,7 @@ test("macOS release workflow provisions, notarizes, staples, and executes the bu
   assert.doesNotMatch(releaseWorkflow, /--entitlements "\$APPLE_CODESIGN_ENTITLEMENTS"\s*\\\s*--sign[^\n]+\s*\\\s*"\$\{\{ matrix\.binary \}\}"/);
 });
 
-test("standalone macOS notarization archive extracts the binary from its root", () => {
+test("macOS notarization preserves the provisioned app bundle during extraction", () => {
   const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../../..");
   const releaseWorkflow = fs.readFileSync(
     path.join(repoRoot, ".github/workflows/release.yml"),
@@ -255,13 +251,14 @@ test("standalone macOS notarization archive extracts the binary from its root", 
   const extract = releaseWorkflow.slice(extractStart, extractEnd);
   assert.match(
     archive,
-    /ditto -c -k --norsrc "\$\{\{ matrix\.binary \}\}" "\$LEGACY_NOTARY_ZIP"/,
-    "the standalone file must not use --keepParent, which adds its enclosing directory",
+    /ditto -c -k --keepParent --norsrc "\$APP_BUNDLE" "\$BUNDLE_NOTARY_ZIP"/,
+    "the archive must retain the app bundle directory and provisioning profile",
   );
   assert.match(
     extract,
-    /cp "\$RUNNER_TEMP\/\$\{\{ matrix\.binary \}\}-legacy\/\$\{\{ matrix\.binary \}\}" "\$\{\{ matrix\.binary \}\}"/,
+    /ditto -x -k "notarization-input\/\$\{\{ matrix\.binary \}\}-bundle-notary\.zip" \\\s*"\$\(dirname "\$APP_BUNDLE"\)"/,
   );
+  assert.doesNotMatch(releaseWorkflow, /LEGACY_NOTARY_ZIP|-legacy-notary\.zip/);
 });
 
 test("macOS app bundles declare and package the LPM icon", () => {

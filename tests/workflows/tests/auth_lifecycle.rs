@@ -8,8 +8,8 @@ mod support;
 use support::assertions::parse_json_output;
 use support::auth_state::{
     SessionSeed, credentials_path, custom_registries_path, mark_recent_token_validation,
-    read_credentials, read_expiry_metadata, seed_custom_registries, seed_sessions,
-    token_expiry_path, write_credentials_store,
+    overwrite_credentials_store_preserving_authority, read_credentials, read_expiry_metadata,
+    seed_custom_registries, seed_sessions, token_expiry_path, write_credentials_store,
 };
 use support::mock_registry::MockRegistry;
 use support::{TempProject, lpm, lpm_spawnable, lpm_with_registry};
@@ -64,8 +64,6 @@ async fn assert_targeted_builtin_logout_preserves_primary_session(
 
     mock.with_authenticated_whoami("access-primary", "testuser", "test@example.com")
         .await;
-    mock.with_revoke_all_pairings_expected(0).await;
-
     seed_sessions(
         project.home(),
         &[
@@ -519,8 +517,6 @@ async fn refresh_only_session_logout_then_startup_does_not_rehydrate_again() {
     .await;
     mock.with_authenticated_whoami("access-from-refresh", "testuser", "test@example.com")
         .await;
-    mock.with_revoke_all_pairings_expected(0).await;
-
     seed_sessions(
         project.home(),
         &[SessionSeed {
@@ -624,8 +620,6 @@ async fn refresh_only_session_logout_all_clears_everything_and_does_not_rehydrat
     .await;
     mock.with_authenticated_whoami("access-from-refresh", "testuser", "test@example.com")
         .await;
-    mock.with_revoke_all_pairings_expected(0).await;
-
     seed_sessions(
         project.home(),
         &[
@@ -738,7 +732,16 @@ async fn invalid_access_token_entry_reports_failure_and_preserves_credential_sto
         mock.url(): { "corrupt": true },
         format!("refresh:{}", mock.url()): "refresh-valid-token",
     });
-    write_credentials_store(project.home(), &original_credentials);
+    seed_sessions(
+        project.home(),
+        &[SessionSeed {
+            registry_url: &mock.url(),
+            access_token: Some("access-valid-before-corruption"),
+            refresh_token: Some("refresh-valid-token"),
+            session_access_expires_at: Some("2030-01-01T00:00:00Z"),
+        }],
+    );
+    overwrite_credentials_store_preserving_authority(project.home(), &original_credentials);
 
     let first_whoami = lpm_with_registry(&project, &mock.url())
         .args(["whoami", "--json"])
@@ -1142,8 +1145,6 @@ async fn logout_prevents_startup_session_rehydration() {
         .await;
     mock.with_authenticated_whoami("access-after-refresh", "testuser", "test@example.com")
         .await;
-    mock.with_revoke_all_pairings_expected(0).await;
-
     seed_sessions(
         project.home(),
         &[SessionSeed {
@@ -1204,8 +1205,6 @@ async fn logout_all_clears_lpm_and_external_registry_state() {
 
     mock.with_authenticated_whoami("access-before-logout-all", "testuser", "test@example.com")
         .await;
-    mock.with_revoke_all_pairings_expected(0).await;
-
     seed_sessions(
         project.home(),
         &[
@@ -1328,8 +1327,6 @@ async fn logout_npm_and_github_clear_both_targets_and_preserve_gitlab_state() {
 
     mock.with_authenticated_whoami("access-primary", "testuser", "test@example.com")
         .await;
-    mock.with_revoke_all_pairings_expected(0).await;
-
     seed_sessions(
         project.home(),
         &[
@@ -1465,8 +1462,6 @@ async fn logout_all_reports_malformed_custom_registry_tracking_after_clearing_di
 
     mock.with_authenticated_whoami("access-before-logout-all", "testuser", "test@example.com")
         .await;
-    mock.with_revoke_all_pairings_expected(0).await;
-
     seed_sessions(
         project.home(),
         &[
@@ -1546,8 +1541,6 @@ async fn logout_skips_browser_pairing_revocation_without_refresh_token() {
         TempProject::empty(r#"{"name":"auth-logout-access-only-test","version":"1.0.0"}"#);
     let mock = MockRegistry::start().await;
 
-    mock.with_revoke_all_pairings_expected(0).await;
-
     seed_sessions(
         project.home(),
         &[SessionSeed {
@@ -1582,8 +1575,6 @@ async fn logout_clears_recent_token_validation_marker() {
     let project =
         TempProject::empty(r#"{"name":"auth-logout-token-check-test","version":"1.0.0"}"#);
     let mock = MockRegistry::start().await;
-
-    mock.with_revoke_all_pairings_expected(0).await;
 
     seed_sessions(
         project.home(),

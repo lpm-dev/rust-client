@@ -2,8 +2,7 @@
 //!
 //! Linux and Windows keep vault files at `~/.lpm/vaults/{vault-id}.enc`.
 //! The encryption key is protected by the OS secure store when available,
-//! with the older scrypt-backed file key retained only as a compatibility
-//! fallback.
+//! with a random file-backed key used when the native store is unavailable.
 
 // This module is conditionally compiled (`#[cfg(not(target_os = "macos"))]` in lib.rs).
 // On macOS builds the functions appear unused, but they are active on Linux/Windows.
@@ -19,8 +18,9 @@ use std::collections::HashMap;
 
 const NATIVE_DATA_KEY_SERVICE: &str = "dev.lpm.vault-local-key";
 const NATIVE_DATA_KEY_ACCOUNT: &str = "data-key";
-const VAULT_SALT_FILE: &str = ".vault-salt";
 const FALLBACK_KEY_FILE: &str = ".vault-fallback-key";
+const FALLBACK_KEY_PREFIX: &str = "raw:";
+const LOCAL_VAULT_AAD_DOMAIN: &[u8] = b"lpm-vault-local\x01";
 
 pub(crate) type SecretMap = HashMap<String, String>;
 pub(crate) type EnvironmentMap = HashMap<String, SecretMap>;
@@ -107,16 +107,6 @@ fn debug_native_write_error() -> Option<String> {
     std::env::var("LPM_TEST_VAULT_NATIVE_KEY_WRITE_ERROR").ok()
 }
 
-fn use_fast_test_scrypt() -> bool {
-    if !cfg!(debug_assertions) && !crate::acceptance_file_storage_enabled() {
-        return false;
-    }
-    matches!(
-        std::env::var("LPM_TEST_FAST_SCRYPT").ok().as_deref(),
-        Some("1") | Some("true") | Some("TRUE")
-    )
-}
-
 fn force_file_data_key() -> bool {
     if !cfg!(debug_assertions) && !crate::acceptance_file_storage_enabled() {
         return false;
@@ -131,21 +121,15 @@ fn vault_file_name(vault_id: &str) -> String {
     format!("{vault_id}.enc")
 }
 
-fn get_or_create_salt(
-    directory: &crate::storage_transaction::VaultStorageDirectory,
-) -> Result<Vec<u8>, String> {
-    if let Some(salt) = directory.read_owner_only_file(VAULT_SALT_FILE, "vault salt")? {
-        return Ok(salt);
-    }
-
-    let mut salt = vec![0u8; 32];
-    rand::thread_rng().fill_bytes(&mut salt);
-    if directory.create_owner_only_file(VAULT_SALT_FILE, &salt, "vault salt")? {
-        return Ok(salt);
-    }
-    directory
-        .read_owner_only_file(VAULT_SALT_FILE, "vault salt")?
-        .ok_or_else(|| "vault salt was created concurrently but could not be read".to_owned())
+fn local_vault_associated_data(vault_id: &str) -> Result<Vec<u8>, String> {
+    let vault_id = vault_id.as_bytes();
+    let length = u32::try_from(vault_id.len())
+        .map_err(|_| "vault ID is too long for local encryption".to_owned())?;
+    let mut associated_data = Vec::with_capacity(LOCAL_VAULT_AAD_DOMAIN.len() + 4 + vault_id.len());
+    associated_data.extend_from_slice(LOCAL_VAULT_AAD_DOMAIN);
+    associated_data.extend_from_slice(&length.to_be_bytes());
+    associated_data.extend_from_slice(vault_id);
+    Ok(associated_data)
 }
 
 fn fallback_key_exists(
@@ -175,80 +159,74 @@ fn read_fallback_key(
         .transpose()
 }
 
-/// Create a random file-fallback encryption password.
-///
-/// The password is a 64-char random alphanumeric string stored at
-/// `~/.lpm/.vault-fallback-key` with 0o600 permissions. This path is
-/// only used when native storage is unavailable before a vault has
-/// been promoted into the OS store.
-fn create_fallback_key(
-    directory: &crate::storage_transaction::VaultStorageDirectory,
-) -> Result<String, String> {
-    use rand::Rng;
-    let key: String = rand::thread_rng()
-        .sample_iter(&rand::distributions::Alphanumeric)
-        .take(64)
-        .map(char::from)
-        .collect();
-    if directory.create_owner_only_file(FALLBACK_KEY_FILE, key.as_bytes(), "vault fallback key")? {
-        return Ok(key);
-    }
-    read_fallback_key(directory)?.ok_or_else(|| {
-        "vault fallback key was created concurrently but could not be read".to_owned()
-    })
+fn encode_fallback_key(key: &[u8; 32]) -> String {
+    format!("{FALLBACK_KEY_PREFIX}{}", hex::encode(key))
 }
 
-fn get_or_create_fallback_key(
-    directory: &crate::storage_transaction::VaultStorageDirectory,
-) -> Result<String, String> {
-    match read_fallback_key(directory)? {
-        Some(key) => Ok(key),
-        None => create_fallback_key(directory),
+fn decode_fallback_key(value: &str) -> Result<[u8; 32], String> {
+    let encoded = value
+        .strip_prefix(FALLBACK_KEY_PREFIX)
+        .ok_or_else(|| "vault fallback key has an unsupported format".to_owned())?;
+    let bytes = hex::decode(encoded)
+        .map_err(|error| format!("vault fallback key is not valid hex: {error}"))?;
+    if bytes.len() != 32 {
+        return Err(format!(
+            "vault fallback key has invalid length {} (expected 32 bytes)",
+            bytes.len()
+        ));
     }
-}
-
-fn derive_key_from_password(
-    directory: &crate::storage_transaction::VaultStorageDirectory,
-    password: &str,
-) -> Result<[u8; 32], String> {
-    let salt = get_or_create_salt(directory)?;
-    let params = if use_fast_test_scrypt() {
-        // Keep workflow tests fast when auth/vault are intentionally file-backed.
-        scrypt::Params::new(10, 8, 1, 32).map_err(|e| format!("scrypt params error: {e}"))?
-    } else {
-        // N=2^20 (1,048,576), r=8, p=4: ~200ms on modern hardware
-        scrypt::Params::new(20, 8, 4, 32).map_err(|e| format!("scrypt params error: {e}"))?
-    };
-
     let mut key = [0u8; 32];
-    scrypt::scrypt(password.as_bytes(), &salt, &params, &mut key)
-        .map_err(|e| format!("scrypt error: {e}"))?;
-
+    key.copy_from_slice(&bytes);
     Ok(key)
+}
+
+fn persist_fallback_key(
+    directory: &crate::storage_transaction::VaultStorageDirectory,
+    key: &[u8; 32],
+) -> Result<(), String> {
+    let encoded = encode_fallback_key(key);
+    directory.write_owner_only_file_durable(
+        FALLBACK_KEY_FILE,
+        encoded.as_bytes(),
+        "vault fallback key",
+    )
 }
 
 fn read_file_data_key(
     directory: &crate::storage_transaction::VaultStorageDirectory,
 ) -> Result<Option<DataKey>, String> {
-    read_fallback_key(directory)?
-        .map(|password| {
-            derive_key_from_password(directory, &password).map(|bytes| DataKey {
-                bytes,
-                source: DataKeySource::FileFallback,
-            })
-        })
-        .transpose()
+    let Some(material) = read_fallback_key(directory)? else {
+        return Ok(None);
+    };
+    Ok(Some(DataKey {
+        bytes: decode_fallback_key(&material)?,
+        source: DataKeySource::FileFallback,
+    }))
 }
 
 fn get_or_create_file_data_key(
     directory: &crate::storage_transaction::VaultStorageDirectory,
 ) -> Result<DataKey, String> {
-    let password = get_or_create_fallback_key(directory)?;
-    let bytes = derive_key_from_password(directory, &password)?;
+    if let Some(key) = read_file_data_key(directory)? {
+        return Ok(key);
+    }
+    let mut bytes = [0u8; 32];
+    rand::thread_rng().fill_bytes(&mut bytes);
+    persist_fallback_key(directory, &bytes)?;
     Ok(DataKey {
         bytes,
         source: DataKeySource::FileFallback,
     })
+}
+
+#[cfg(test)]
+pub(crate) fn profile_file_data_key_reuse() -> Result<usize, String> {
+    let first = crate::storage_transaction::with_vault_transaction(get_or_create_file_data_key)?;
+    let second = crate::storage_transaction::with_vault_transaction(get_or_create_file_data_key)?;
+    if first.bytes != second.bytes {
+        return Err("fallback data key changed between reads".to_owned());
+    }
+    Ok(usize::from(first.bytes[0]))
 }
 
 fn decode_native_data_key(hex_key: &str) -> Result<[u8; 32], String> {
@@ -420,19 +398,19 @@ fn vault_files_exist(directory: &crate::storage_transaction::VaultStorageDirecto
 }
 
 #[cfg(test)]
-fn encrypt(plaintext: &str) -> Result<String, String> {
-    encrypt_with_store(plaintext, &KeyringNativeDataKeyStore)
-}
-
-#[cfg(test)]
-fn encrypt_with_store(plaintext: &str, store: &dyn NativeDataKeyStore) -> Result<String, String> {
+fn encrypt_with_store(
+    vault_id: &str,
+    plaintext: &str,
+    store: &dyn NativeDataKeyStore,
+) -> Result<String, String> {
     crate::storage_transaction::with_vault_transaction(|directory| {
-        encrypt_with_store_unlocked(directory, plaintext, store)
+        encrypt_with_store_unlocked(directory, vault_id, plaintext, store)
     })
 }
 
 fn encrypt_with_store_unlocked(
     directory: &crate::storage_transaction::VaultStorageDirectory,
+    vault_id: &str,
     plaintext: &str,
     store: &dyn NativeDataKeyStore,
 ) -> Result<String, String> {
@@ -445,8 +423,9 @@ fn encrypt_with_store_unlocked(
     let nonce = GenericArray::from_slice(&iv);
 
     let mut encrypted = plaintext.as_bytes().to_vec();
+    let associated_data = local_vault_associated_data(vault_id)?;
     let auth_tag = cipher
-        .encrypt_in_place_detached(nonce, b"", &mut encrypted)
+        .encrypt_in_place_detached(nonce, &associated_data, &mut encrypted)
         .map_err(|e| format!("encryption error: {e}"))?;
 
     let encoded_capacity = padded_base64_len(iv.len())
@@ -470,18 +449,23 @@ fn padded_base64_len(input_len: usize) -> Option<usize> {
 
 #[cfg(test)]
 fn decrypt(encoded: &str) -> Result<String, String> {
-    decrypt_with_store(encoded, &KeyringNativeDataKeyStore)
+    decrypt_with_store("test-vault", encoded, &KeyringNativeDataKeyStore)
 }
 
 #[cfg(test)]
-fn decrypt_with_store(encoded: &str, store: &dyn NativeDataKeyStore) -> Result<String, String> {
+fn decrypt_with_store(
+    vault_id: &str,
+    encoded: &str,
+    store: &dyn NativeDataKeyStore,
+) -> Result<String, String> {
     crate::storage_transaction::with_vault_transaction(|directory| {
-        decrypt_with_store_unlocked(directory, encoded, store)
+        decrypt_with_store_unlocked(directory, vault_id, encoded, store)
     })
 }
 
 fn decrypt_with_store_unlocked(
     directory: &crate::storage_transaction::VaultStorageDirectory,
+    vault_id: &str,
     encoded: &str,
     store: &dyn NativeDataKeyStore,
 ) -> Result<String, String> {
@@ -518,10 +502,11 @@ fn decrypt_with_store_unlocked(
         .map_err(|e| format!("cipher init error: {e}"))?;
 
     let nonce = GenericArray::from_slice(&iv);
+    let associated_data = local_vault_associated_data(vault_id)?;
     cipher
         .decrypt_in_place_detached(
             nonce,
-            b"",
+            &associated_data,
             &mut encrypted,
             GenericArray::from_slice(&auth_tag),
         )
@@ -530,22 +515,19 @@ fn decrypt_with_store_unlocked(
     String::from_utf8(encrypted).map_err(|e| format!("utf8 error: {e}"))
 }
 
-/// Internal format for multi-environment vault storage.
-#[derive(serde::Serialize, serde::Deserialize)]
-struct VaultData {
-    #[serde(default)]
-    environments: EnvironmentMap,
-}
-
-#[derive(serde::Serialize)]
-struct BorrowedVaultData<'a> {
-    environments: &'a EnvironmentMap,
-}
-
 /// Read vault secrets for a specific environment.
 pub fn read_vault_file_env(vault_id: &str, env: &str) -> Result<Option<SecretMap>, String> {
     crate::storage_transaction::with_vault_transaction(|directory| {
-        read_vault_file_env_unlocked(directory, vault_id, env)
+        read_vault_file_env_unlocked(directory, vault_id, env, false)
+    })
+}
+
+pub(crate) fn read_vault_file_env_with_default_fallback(
+    vault_id: &str,
+    env: &str,
+) -> Result<Option<SecretMap>, String> {
+    crate::storage_transaction::with_vault_transaction(|directory| {
+        read_vault_file_env_unlocked(directory, vault_id, env, true)
     })
 }
 
@@ -553,6 +535,7 @@ fn read_vault_file_env_unlocked(
     directory: &crate::storage_transaction::VaultStorageDirectory,
     vault_id: &str,
     env: &str,
+    default_fallback: bool,
 ) -> Result<Option<SecretMap>, String> {
     let vaults = directory.open_or_create_directory("vaults")?;
     let name = vault_file_name(vault_id);
@@ -565,23 +548,24 @@ fn read_vault_file_env_unlocked(
             vaults.display_path(&name).display()
         )
     })?;
-    let json = decrypt_with_store_unlocked(directory, encoded.trim(), &KeyringNativeDataKeyStore)?;
+    let json = decrypt_with_store_unlocked(
+        directory,
+        vault_id,
+        encoded.trim(),
+        &KeyringNativeDataKeyStore,
+    )?;
 
-    // Try new multi-env format first
-    if let Ok(data) = serde_json::from_str::<VaultData>(&json)
-        && !data.environments.is_empty()
-    {
-        return Ok(take_environment(data.environments, env));
-    }
-
-    // Fall back to old flat format (auto-migrate: treat as "default")
-    if env == "default" {
-        return Ok(serde_json::from_str(&json).ok());
-    }
-
-    Ok(None)
+    let parsed = if default_fallback {
+        crate::selected_environment::parse_with_default_fallback(&json, env)
+    } else {
+        crate::selected_environment::parse(&json, env)
+    };
+    parsed
+        .map(crate::selected_environment::SelectedVaultPayload::into_selected)
+        .map_err(|error| format!("vault payload is invalid: {error}"))
 }
 
+#[cfg(test)]
 fn take_environment(mut environments: EnvironmentMap, env: &str) -> Option<SecretMap> {
     environments.remove(env)
 }
@@ -619,36 +603,25 @@ pub(crate) fn read_all_environments_with_digest_unlocked(
             vaults.display_path(&name).display()
         )
     })?;
-    let json = decrypt_with_store_unlocked(directory, encoded.trim(), &KeyringNativeDataKeyStore)?;
+    let json = decrypt_with_store_unlocked(
+        directory,
+        vault_id,
+        encoded.trim(),
+        &KeyringNativeDataKeyStore,
+    )?;
 
-    // Try new multi-env format
-    if let Ok(data) = serde_json::from_str::<VaultData>(&json)
-        && !data.environments.is_empty()
-    {
-        return Ok((Some(data.environments), Some(digest)));
-    }
-
-    // Fall back to old flat format → wrap as "default"
-    if let Ok(flat) = serde_json::from_str::<HashMap<String, String>>(&json) {
-        let mut envs = HashMap::new();
-        envs.insert("default".to_string(), flat);
-        return Ok((Some(envs), Some(digest)));
-    }
-
-    Ok((None, Some(digest)))
+    let environments = crate::selected_environment::parse_all(&json)
+        .map_err(|error| format!("vault payload is invalid: {error}"))?;
+    Ok((Some(environments), Some(digest)))
 }
 
 pub(crate) fn vault_payload_digest_unlocked(
     directory: &crate::storage_transaction::VaultStorageDirectory,
     vault_id: &str,
 ) -> Result<Option<[u8; 32]>, String> {
-    use sha2::Digest as _;
-
     let vaults = directory.open_or_create_directory("vaults")?;
     let name = vault_file_name(vault_id);
-    vaults
-        .read_owner_only_file(&name, "encrypted vault")
-        .map(|content| content.map(|content| sha2::Sha256::digest(content).into()))
+    vaults.sha256_owner_only_file(&name, "encrypted vault")
 }
 
 /// Write vault secrets to encrypted file (specific environment).
@@ -667,10 +640,9 @@ pub(crate) fn write_all_environments_unlocked(
     vault_id: &str,
     environments: &EnvironmentMap,
 ) -> Result<(), String> {
-    let data = BorrowedVaultData { environments };
-    let json =
-        serde_json::to_string(&data).map_err(|e| format!("failed to serialize secrets: {e}"))?;
-    let encrypted = encrypt_with_store_unlocked(directory, &json, &KeyringNativeDataKeyStore)?;
+    let json = crate::selected_environment::serialize(environments)?;
+    let encrypted =
+        encrypt_with_store_unlocked(directory, vault_id, &json, &KeyringNativeDataKeyStore)?;
     let vaults = directory.open_or_create_directory("vaults")?;
     vaults.write_owner_only_file(
         &vault_file_name(vault_id),
@@ -788,7 +760,6 @@ mod tests {
         let temp_home = tempfile::tempdir().expect("create temp HOME");
         let original_home = crate::test_env_lock::HomeEnvSnapshot::set(temp_home.path());
         let original_force_file_vault = std::env::var_os("LPM_FORCE_FILE_VAULT");
-        let original_fast_scrypt = std::env::var_os("LPM_TEST_FAST_SCRYPT");
         let original_native_read_error = std::env::var_os("LPM_TEST_VAULT_NATIVE_KEY_READ_ERROR");
         let original_native_hex = std::env::var_os("LPM_TEST_VAULT_NATIVE_KEY_HEX");
         let original_native_missing = std::env::var_os("LPM_TEST_VAULT_NATIVE_KEY_MISSING");
@@ -796,7 +767,6 @@ mod tests {
 
         unsafe {
             std::env::remove_var("LPM_FORCE_FILE_VAULT");
-            std::env::set_var("LPM_TEST_FAST_SCRYPT", "1");
             std::env::remove_var("LPM_TEST_VAULT_NATIVE_KEY_READ_ERROR");
             std::env::remove_var("LPM_TEST_VAULT_NATIVE_KEY_HEX");
             std::env::remove_var("LPM_TEST_VAULT_NATIVE_KEY_MISSING");
@@ -810,10 +780,6 @@ mod tests {
             match original_force_file_vault {
                 Some(value) => std::env::set_var("LPM_FORCE_FILE_VAULT", value),
                 None => std::env::remove_var("LPM_FORCE_FILE_VAULT"),
-            }
-            match original_fast_scrypt {
-                Some(value) => std::env::set_var("LPM_TEST_FAST_SCRYPT", value),
-                None => std::env::remove_var("LPM_TEST_FAST_SCRYPT"),
             }
             match original_native_read_error {
                 Some(value) => std::env::set_var("LPM_TEST_VAULT_NATIVE_KEY_READ_ERROR", value),
@@ -847,62 +813,24 @@ mod tests {
             .expect("open protected vault storage")
     }
 
-    #[cfg(not(debug_assertions))]
-    #[test]
-    fn fast_scrypt_env_is_ignored_in_release_builds() {
-        let _lock = crate::test_env_lock::acquire_env_lock();
-        let original_fast_scrypt = std::env::var_os("LPM_TEST_FAST_SCRYPT");
-        unsafe {
-            std::env::set_var("LPM_TEST_FAST_SCRYPT", "1");
-        }
-        let fast_scrypt = use_fast_test_scrypt();
-        unsafe {
-            match original_fast_scrypt {
-                Some(value) => std::env::set_var("LPM_TEST_FAST_SCRYPT", value),
-                None => std::env::remove_var("LPM_TEST_FAST_SCRYPT"),
-            }
-        }
-
-        assert!(!fast_scrypt);
+    fn seed_encrypted_vault(vault_id: &str, plaintext: &str) -> Vec<u8> {
+        let encoded = encrypt_with_store(vault_id, plaintext, &KeyringNativeDataKeyStore)
+            .expect("encrypt vault fixture");
+        let content = encoded.into_bytes();
+        with_storage_directory(|directory| {
+            let vaults = directory.open_or_create_directory("vaults")?;
+            vaults.write_owner_only_file(&vault_file_name(vault_id), &content, "encrypted vault")
+        });
+        content
     }
 
-    #[cfg(all(not(debug_assertions), feature = "acceptance-test-hooks"))]
-    #[test]
-    fn release_acceptance_build_allows_fast_scrypt_inside_isolated_run_home() {
-        let _lock = crate::test_env_lock::acquire_env_lock();
-        let root = tempfile::tempdir().expect("create acceptance root");
-        let run_dir = root.path().join("run");
-        let home = run_dir.join("session-home");
-        std::fs::create_dir_all(&home).expect("create acceptance home");
-        let variables = [
-            ("HOME", home.as_os_str().to_owned()),
-            ("LPM_HOME", home.join(".lpm").into_os_string()),
-            ("ACCEPTANCE_RUN_DIR", run_dir.into_os_string()),
-            ("ACCEPTANCE_RUN_ID", "release-fast-vault".into()),
-            ("LPM_ACCEPTANCE_FILE_STORAGE", "1".into()),
-            ("LPM_TEST_FAST_SCRYPT", "1".into()),
-        ];
-        let previous = variables
-            .iter()
-            .map(|(name, _)| (*name, std::env::var_os(name)))
-            .collect::<Vec<_>>();
-        unsafe {
-            for (name, value) in &variables {
-                std::env::set_var(name, value);
-            }
-        }
-
-        let fast_scrypt = use_fast_test_scrypt();
-
-        unsafe {
-            for (name, value) in previous.into_iter().rev() {
-                match value {
-                    Some(value) => std::env::set_var(name, value),
-                    None => std::env::remove_var(name),
-                }
-            }
-        }
-        assert!(fast_scrypt);
+    fn read_encrypted_vault(vault_id: &str) -> Vec<u8> {
+        with_storage_directory(|directory| {
+            let vaults = directory.open_or_create_directory("vaults")?;
+            vaults
+                .read_owner_only_file(&vault_file_name(vault_id), "encrypted vault")?
+                .ok_or_else(|| "encrypted vault fixture disappeared".to_owned())
+        })
     }
 
     #[test]
@@ -968,6 +896,34 @@ mod tests {
     }
 
     #[test]
+    fn encrypted_vault_cannot_be_substituted_for_another_vault_id() {
+        with_temp_vault_home(|_| {
+            unsafe {
+                std::env::set_var("LPM_FORCE_FILE_VAULT", "1");
+            }
+            write_vault_file(
+                "source-vault",
+                &HashMap::from([("TOKEN".to_owned(), "secret".to_owned())]),
+            )
+            .expect("write source vault");
+            let source = read_encrypted_vault("source-vault");
+            with_storage_directory(|directory| {
+                let vaults = directory.open_or_create_directory("vaults")?;
+                vaults.write_owner_only_file(
+                    &vault_file_name("target-vault"),
+                    &source,
+                    "encrypted vault",
+                )
+            });
+
+            let error = read_vault_file_env("target-vault", "default")
+                .expect_err("ciphertext must be bound to its vault ID");
+
+            assert!(error.contains("decryption failed"), "{error}");
+        });
+    }
+
+    #[test]
     fn data_key_promotes_existing_file_key_and_removes_fallback_copy() {
         with_temp_vault_home(|_| {
             let file_key = with_storage_directory(get_or_create_file_data_key);
@@ -1002,13 +958,15 @@ mod tests {
                 std::env::set_var("LPM_FORCE_FILE_VAULT", "1");
             }
             let encrypted =
-                encrypt_with_store(r#"{"API_KEY":"from-file"}"#, &store).expect("encrypt");
+                encrypt_with_store("promotion-vault", r#"{"API_KEY":"from-file"}"#, &store)
+                    .expect("encrypt");
             assert!(with_storage_directory(fallback_key_exists));
             unsafe {
                 std::env::remove_var("LPM_FORCE_FILE_VAULT");
             }
 
-            let decrypted = decrypt_with_store(&encrypted, &store).expect("decrypt after promote");
+            let decrypted = decrypt_with_store("promotion-vault", &encrypted, &store)
+                .expect("decrypt after promote");
 
             assert_eq!(decrypted, r#"{"API_KEY":"from-file"}"#);
             assert!(!with_storage_directory(fallback_key_exists));
@@ -1027,6 +985,113 @@ mod tests {
             assert_eq!(key.source, DataKeySource::FileFallback);
             assert!(with_storage_directory(fallback_key_exists));
             assert!(store.key.borrow().is_none());
+        });
+    }
+
+    #[test]
+    fn new_file_fallback_stores_a_random_raw_key() {
+        with_temp_vault_home(|_| {
+            let key = with_storage_directory(get_or_create_file_data_key);
+            let stored = with_storage_directory(|directory| {
+                read_fallback_key(directory)?.ok_or_else(|| "missing fallback key".to_owned())
+            });
+
+            assert_eq!(stored, format!("raw:{}", hex::encode(key.bytes)));
+        });
+    }
+
+    #[test]
+    fn unversioned_password_fallback_is_rejected() {
+        with_temp_vault_home(|_| {
+            with_storage_directory(|directory| {
+                assert!(directory.create_owner_only_file(
+                    FALLBACK_KEY_FILE,
+                    b"retired-password-material",
+                    "vault fallback key",
+                )?);
+                Ok(())
+            });
+
+            let error = crate::storage_transaction::with_vault_transaction(read_file_data_key)
+                .expect_err("password-derived fallback keys must not remain executable");
+
+            assert!(error.contains("unsupported format"), "{error}");
+        });
+    }
+
+    #[test]
+    fn authenticated_invalid_vault_shape_fails_targeted_reads() {
+        with_temp_vault_home(|_| {
+            unsafe {
+                std::env::set_var("LPM_FORCE_FILE_VAULT", "1");
+            }
+            seed_encrypted_vault(
+                "invalid-targeted",
+                r#"{"environments":{"default":{"TOKEN":123},"staging":{"TOKEN":"ok"}}}"#,
+            );
+
+            let error = read_vault_file_env("invalid-targeted", "staging")
+                .expect_err("invalid authenticated payloads must fail targeted reads");
+
+            assert!(error.contains("vault payload is invalid"), "{error}");
+        });
+    }
+
+    #[test]
+    fn authenticated_invalid_vault_shape_fails_all_environment_reads() {
+        with_temp_vault_home(|_| {
+            unsafe {
+                std::env::set_var("LPM_FORCE_FILE_VAULT", "1");
+            }
+            seed_encrypted_vault(
+                "invalid-all",
+                r#"{"environments":{"default":{"TOKEN":123}}}"#,
+            );
+
+            let error = read_all_environments("invalid-all")
+                .expect_err("invalid authenticated payloads must fail full reads");
+
+            assert!(error.contains("vault payload is invalid"), "{error}");
+        });
+    }
+
+    #[test]
+    fn invalid_authenticated_vault_mutation_preserves_ciphertext() {
+        with_temp_vault_home(|_| {
+            unsafe {
+                std::env::set_var("LPM_FORCE_FILE_VAULT", "1");
+            }
+            let original = seed_encrypted_vault(
+                "invalid-mutation",
+                r#"{"environments":{"default":{"TOKEN":123}}}"#,
+            );
+
+            let error = mutate_vault_file_env("invalid-mutation", "default", |secrets| {
+                secrets.insert("NEW".to_owned(), "value".to_owned());
+            })
+            .expect_err("invalid authenticated payloads must stop mutation");
+
+            assert!(error.contains("vault payload is invalid"), "{error}");
+            assert_eq!(read_encrypted_vault("invalid-mutation"), original);
+        });
+    }
+
+    #[test]
+    fn malformed_file_fallback_is_rejected() {
+        with_temp_vault_home(|_| {
+            with_storage_directory(|directory| {
+                assert!(directory.create_owner_only_file(
+                    FALLBACK_KEY_FILE,
+                    b"raw:not-a-key",
+                    "vault fallback key",
+                )?);
+                Ok(())
+            });
+
+            let error = crate::storage_transaction::with_vault_transaction(read_file_data_key)
+                .expect_err("malformed fallback key must fail closed");
+
+            assert!(error.contains("vault fallback key"), "{error}");
         });
     }
 
@@ -1073,21 +1138,25 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "scrypt N=2^20 key derivation is intentionally slow"]
     fn encrypt_decrypt_round_trip() {
-        let plaintext = r#"{"DB_HOST": "localhost", "API_KEY": "sk-123"}"#;
-        let encrypted = encrypt(plaintext).unwrap();
-        let decrypted = decrypt(&encrypted).unwrap();
-        assert_eq!(decrypted, plaintext);
+        with_temp_vault_home(|_| {
+            let store = FakeNativeDataKeyStore::default();
+            let plaintext = r#"{"DB_HOST": "localhost", "API_KEY": "sk-123"}"#;
+            let encrypted = encrypt_with_store("test-vault", plaintext, &store).unwrap();
+            let decrypted = decrypt_with_store("test-vault", &encrypted, &store).unwrap();
+            assert_eq!(decrypted, plaintext);
+        });
     }
 
     #[test]
-    #[ignore = "scrypt N=2^20 key derivation is intentionally slow"]
     fn encrypt_produces_different_output_each_time() {
-        let plaintext = "same-input";
-        let a = encrypt(plaintext).unwrap();
-        let b = encrypt(plaintext).unwrap();
-        assert_ne!(a, b); // Different IVs
+        with_temp_vault_home(|_| {
+            let store = FakeNativeDataKeyStore::default();
+            let plaintext = "same-input";
+            let a = encrypt_with_store("test-vault", plaintext, &store).unwrap();
+            let b = encrypt_with_store("test-vault", plaintext, &store).unwrap();
+            assert_ne!(a, b);
+        });
     }
 
     #[test]

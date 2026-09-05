@@ -30,10 +30,6 @@ pub enum TokenSource {
     /// token lazily. `SessionRequired` verifies refresh-token availability
     /// before accepting this source.
     StoredSession,
-    /// Loaded from local storage after refresh-token absence is confirmed
-    /// (older login, or a session whose refresh token was cleared). Cannot
-    /// be silently refreshed.
-    StoredLegacy,
     /// Issued by a CI / OIDC token exchange. Never refreshed.
     CiToken,
 }
@@ -44,10 +40,9 @@ impl TokenSource {
     pub fn refresh_policy(self) -> RefreshPolicy {
         match self {
             TokenSource::StoredSession => RefreshPolicy::IfRefreshable,
-            TokenSource::ExplicitFlag
-            | TokenSource::EnvVar
-            | TokenSource::StoredLegacy
-            | TokenSource::CiToken => RefreshPolicy::Never,
+            TokenSource::ExplicitFlag | TokenSource::EnvVar | TokenSource::CiToken => {
+                RefreshPolicy::Never
+            }
         }
     }
 
@@ -58,7 +53,7 @@ impl TokenSource {
 
     /// Whether LPM can replace this credential in its local secure storage.
     pub fn is_locally_managed(self) -> bool {
-        matches!(self, TokenSource::StoredSession | TokenSource::StoredLegacy)
+        matches!(self, TokenSource::StoredSession)
     }
 
     /// Short human-readable label for diagnostics.
@@ -67,7 +62,6 @@ impl TokenSource {
             TokenSource::ExplicitFlag => "--token",
             TokenSource::EnvVar => "LPM_TOKEN",
             TokenSource::StoredSession => "stored session",
-            TokenSource::StoredLegacy => "stored legacy token",
             TokenSource::CiToken => "CI token",
         }
     }
@@ -95,7 +89,7 @@ pub enum AuthRequirement {
     /// token is available.
     TokenRequired,
     /// Only a refresh-backed stored session satisfies this. Explicit /
-    /// env / CI / legacy tokens fail with `SessionExpired`.
+    /// env and CI tokens fail with `SessionExpired`.
     SessionRequired,
 }
 
@@ -237,10 +231,9 @@ impl RefreshState {
     fn for_source(source: TokenSource) -> Self {
         match source {
             TokenSource::StoredSession => Self::Available,
-            TokenSource::ExplicitFlag
-            | TokenSource::EnvVar
-            | TokenSource::StoredLegacy
-            | TokenSource::CiToken => Self::NotRefreshable,
+            TokenSource::ExplicitFlag | TokenSource::EnvVar | TokenSource::CiToken => {
+                Self::NotRefreshable
+            }
         }
     }
 }
@@ -350,7 +343,6 @@ impl SessionManager {
             if cached.secret.expose_secret().is_empty() {
                 *guard = None;
             } else {
-                cached.source = TokenSource::StoredLegacy;
                 cached.refresh_state = RefreshState::NotRefreshable;
             }
         }
@@ -543,7 +535,7 @@ impl SessionManager {
     ///
     /// Cached-only semantics: NEVER triggers keychain classification. When
     /// the eager path finds an env/flag token, this returns it; when it
-    /// doesn't, this returns `None` and the caller leaves the legacy
+    /// doesn't, this returns `None` and the caller leaves the
     /// `with_token` bridge empty. The session-aware request path
     /// ([`Self::current_bearer_lazy`]) is the one that actually resolves
     /// the keychain at request time.
@@ -1248,10 +1240,6 @@ mod tests {
         assert_eq!(TokenSource::EnvVar.refresh_policy(), RefreshPolicy::Never);
         assert_eq!(TokenSource::CiToken.refresh_policy(), RefreshPolicy::Never);
         assert_eq!(
-            TokenSource::StoredLegacy.refresh_policy(),
-            RefreshPolicy::Never
-        );
-        assert_eq!(
             TokenSource::StoredSession.refresh_policy(),
             RefreshPolicy::IfRefreshable
         );
@@ -1262,14 +1250,12 @@ mod tests {
         assert!(TokenSource::StoredSession.is_session_backed());
         assert!(!TokenSource::ExplicitFlag.is_session_backed());
         assert!(!TokenSource::EnvVar.is_session_backed());
-        assert!(!TokenSource::StoredLegacy.is_session_backed());
         assert!(!TokenSource::CiToken.is_session_backed());
     }
 
     #[test]
     fn locally_managed_table() {
         assert!(TokenSource::StoredSession.is_locally_managed());
-        assert!(TokenSource::StoredLegacy.is_locally_managed());
         assert!(!TokenSource::ExplicitFlag.is_locally_managed());
         assert!(!TokenSource::EnvVar.is_locally_managed());
         assert!(!TokenSource::CiToken.is_locally_managed());
@@ -1398,13 +1384,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn session_required_errs_for_legacy() {
-        let mgr = manager_with(TokenSource::StoredLegacy, "legacy-tok");
-        let res = mgr.token_for(AuthRequirement::SessionRequired).await;
-        assert!(matches!(res, Err(LpmError::SessionExpired)));
-    }
-
-    #[tokio::test]
     async fn session_required_errs_for_ci_token() {
         let mgr = manager_with(TokenSource::CiToken, "ci-tok");
         let res = mgr.token_for(AuthRequirement::SessionRequired).await;
@@ -1425,7 +1404,6 @@ mod tests {
             TokenSource::ExplicitFlag,
             TokenSource::EnvVar,
             TokenSource::StoredSession,
-            TokenSource::StoredLegacy,
             TokenSource::CiToken,
         ] {
             let mgr = manager_with(source, "tok");
@@ -1462,7 +1440,6 @@ mod tests {
             TokenSource::ExplicitFlag,
             TokenSource::EnvVar,
             TokenSource::CiToken,
-            TokenSource::StoredLegacy,
         ] {
             let mgr = manager_with(source, "tok");
             let res = mgr.refresh_now().await;
@@ -1541,7 +1518,6 @@ mod tests {
         let scoped = crate::test_env::ScopedEnv::update([
             ("HOME", Some(tempdir.path().as_os_str().to_owned())),
             ("LPM_FORCE_FILE_AUTH", Some("1".into())),
-            ("LPM_TEST_FAST_SCRYPT", Some("1".into())),
             ("LPM_TOKEN", lpm_token.map(std::ffi::OsString::from)),
             ("CI", ci),
             ("ACTIONS_ID_TOKEN_REQUEST_TOKEN", github_oidc),
@@ -1716,7 +1692,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stored_access_bearer_defers_refresh_lookup_until_session_required() {
+    async fn stored_access_without_refresh_stays_a_non_refreshable_session() {
         let _env = token_classify_isolate();
         let registry = "https://defer-refresh.invalid";
         crate::set_token(registry, "stored-access").expect("access token should store");
@@ -1736,16 +1712,16 @@ mod tests {
         assert!(matches!(result, Err(LpmError::SessionExpired)));
         assert_eq!(
             mgr.cached_source_and_refresh_state(),
-            Some((TokenSource::StoredLegacy, RefreshState::NotRefreshable)),
-            "session-required reads must downgrade stored access when no refresh token exists"
+            Some((TokenSource::StoredSession, RefreshState::NotRefreshable)),
+            "session-required reads must retain the current source while marking it non-refreshable"
         );
     }
 
     #[tokio::test]
-    async fn token_required_uses_valid_legacy_access_without_refresh_metadata() {
+    async fn token_required_uses_valid_stored_access_without_refresh_metadata() {
         let _env = token_classify_isolate();
-        let registry = "https://legacy-access.invalid";
-        crate::set_token(registry, "valid-legacy-access").expect("access token should store");
+        let registry = "https://stored-access.invalid";
+        crate::set_token(registry, "valid-stored-access").expect("access token should store");
         let manager = SessionManager::new(registry, None);
 
         let bearer = manager
@@ -1753,7 +1729,7 @@ mod tests {
             .await
             .expect("an access-only stored credential remains a valid bearer");
 
-        assert_eq!(bearer, "valid-legacy-access");
+        assert_eq!(bearer, "valid-stored-access");
     }
 
     #[tokio::test]
@@ -2007,8 +1983,6 @@ mod refresh_http_tests {
     ///   encrypted-file fallback path lands in its own directory.
     /// - `LPM_FORCE_FILE_AUTH=1`, which makes the storage layer
     ///   skip the keychain entirely.
-    /// - `LPM_TEST_FAST_SCRYPT=1`, which uses cheap scrypt params
-    ///   so encryption/decryption stays fast under nextest.
     ///
     /// `ScopedEnv` uses a global mutex internally, so concurrent
     /// tests serialize through env mutations rather than racing on
@@ -2024,7 +1998,6 @@ mod refresh_http_tests {
         let scoped = crate::test_env::ScopedEnv::set([
             ("HOME", tempdir.path().as_os_str().to_owned()),
             ("LPM_FORCE_FILE_AUTH", "1".into()),
-            ("LPM_TEST_FAST_SCRYPT", "1".into()),
         ]);
         IsolatedTestEnv {
             _tempdir: tempdir,
@@ -2198,7 +2171,6 @@ mod refresh_http_tests {
         let _env = crate::test_env::ScopedEnv::set([
             ("HOME", tempdir.path().as_os_str().to_owned()),
             ("LPM_FORCE_FILE_AUTH", "1".into()),
-            ("LPM_TEST_FAST_SCRYPT", "1".into()),
             (
                 "LPM_TEST_LOCK_CONTENTION_MARKER",
                 contention_marker.as_os_str().to_owned(),
@@ -2488,7 +2460,6 @@ mod refresh_http_tests {
         let _env = crate::test_env::ScopedEnv::set([
             ("HOME", tempdir.path().as_os_str().to_owned()),
             ("LPM_FORCE_FILE_AUTH", "1".into()),
-            ("LPM_TEST_FAST_SCRYPT", "1".into()),
             (
                 "LPM_TEST_LOCK_CONTENTION_MARKER",
                 contention_marker.as_os_str().to_owned(),

@@ -40,7 +40,7 @@ pub(super) fn fresh_personal_mutation_manifest(
 ) -> Result<lpm_vault::vault_id::VaultManifestSnapshot, String> {
     let manifest = lpm_vault::vault_id::VaultManifestSnapshot::read(project_dir)?;
     verify_fresh_vault_id(&manifest, expected_vault_id)?;
-    let current_principal = manifest.personal_sync_principal_for_registry(registry_url)?;
+    let current_principal = manifest.personal_expected_principal_for_registry(registry_url)?;
     if current_principal.as_deref() != expected_principal_id {
         return Err("the personal env manifest principal changed before the cloud write".into());
     }
@@ -79,67 +79,24 @@ fn verify_fresh_vault_id(
 }
 
 pub(super) fn build_sync_environments(
-    all_envs: HashMap<String, HashMap<String, String>>,
-    env_map: &HashMap<String, String>,
-    environments: Option<&lpm_env::EnvironmentsConfig>,
+    mut all_envs: HashMap<String, HashMap<String, String>>,
 ) -> HashMap<String, HashMap<String, String>> {
-    let mut ordered_envs: Vec<_> = all_envs
-        .into_iter()
-        .filter(|(_, secrets)| !secrets.is_empty())
-        .map(|(storage_key, secrets)| {
-            let resolved = lpm_env::resolver::resolve(&storage_key, env_map, environments);
-            let is_canonical_storage = resolved.canonical == storage_key;
-            (
-                resolved.canonical,
-                is_canonical_storage,
-                storage_key,
-                secrets,
-            )
-        })
-        .collect();
-
-    ordered_envs.sort_by(|left, right| {
-        left.0
-            .cmp(&right.0)
-            .then(left.1.cmp(&right.1))
-            .then(left.2.cmp(&right.2))
-    });
-
-    let mut canonical_envs = HashMap::new();
-    for (canonical, _is_canonical_storage, _storage_key, secrets) in ordered_envs {
-        canonical_envs
-            .entry(canonical)
-            .or_insert_with(HashMap::new)
-            .extend(secrets);
-    }
-
-    canonical_envs
+    all_envs.retain(|_, secrets| !secrets.is_empty());
+    all_envs
 }
 
 pub(super) fn parse_remote_pull_payload_for_overwrite(
     raw_json: &str,
 ) -> Result<HashMap<String, HashMap<String, String>>, String> {
     serde_json::from_str::<RemotePullPayload>(raw_json)
-        .map(take_remote_environments)
+        .map(|payload| payload.environments)
         .map_err(|_| "failed to parse pulled vault data".to_string())
 }
 
 #[derive(serde::Deserialize)]
-#[serde(untagged)]
-enum RemotePullPayload {
-    Wrapper {
-        environments: HashMap<String, HashMap<String, String>>,
-    },
-    Legacy(HashMap<String, String>),
-}
-
-fn take_remote_environments(
-    payload: RemotePullPayload,
-) -> HashMap<String, HashMap<String, String>> {
-    match payload {
-        RemotePullPayload::Wrapper { environments } => environments,
-        RemotePullPayload::Legacy(secrets) => HashMap::from([("default".to_string(), secrets)]),
-    }
+#[serde(deny_unknown_fields)]
+struct RemotePullPayload {
+    environments: HashMap<String, HashMap<String, String>>,
 }
 
 /// Read `lpm.json` for an `lpm env push` surface (personal or org).
@@ -291,6 +248,30 @@ mod tests {
     }
 
     #[test]
+    fn personal_mutation_preflight_accepts_the_pinned_platform_principal() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("lpm.json"), r#"{"vault":"vault-original"}"#)
+            .expect("seed project");
+        lpm_vault::vault_id::pin_personal_platform_principal_if_vault_matches(
+            dir.path(),
+            "vault-original",
+            lpm_vault::vault_id::SyncPrincipal {
+                registry_url: "https://lpm.dev",
+                principal_id: "account-a",
+            },
+        )
+        .expect("pin platform identity");
+
+        fresh_personal_mutation_manifest(
+            dir.path(),
+            "vault-original",
+            "https://lpm.dev",
+            Some("account-a"),
+        )
+        .expect("platform identity must bind the first cloud mutation");
+    }
+
+    #[test]
     fn organization_metadata_write_rejects_a_replacement_vault() {
         let dir = tempfile::tempdir().expect("tempdir");
         std::fs::write(dir.path().join("lpm.json"), r#"{"vault":"vault-original"}"#)
@@ -323,7 +304,7 @@ mod tests {
     }
 
     #[test]
-    fn recreated_personal_metadata_resets_the_bound_authority_checkpoint() {
+    fn personal_metadata_rejects_rollback_without_mutating_the_checkpoint() {
         let dir = tempfile::tempdir().expect("tempdir");
         std::fs::write(dir.path().join("lpm.json"), r#"{"vault":"vault-original"}"#)
             .expect("seed project");
@@ -333,17 +314,31 @@ mod tests {
         };
         lpm_vault::vault_id::write_personal_sync_version_for_principal(dir.path(), 5, principal)
             .expect("seed checkpoint");
-        persist_personal_sync_version(dir.path(), "vault-original", 1, "https://lpm.dev", "user-1")
-            .expect("a recreated response must reset its bound checkpoint");
+        let path = dir.path().join("lpm.json");
+        let before = std::fs::read(&path).expect("snapshot checkpoint");
+        let error = persist_personal_sync_version(
+            dir.path(),
+            "vault-original",
+            1,
+            "https://lpm.dev",
+            "user-1",
+        )
+        .expect_err("a stale response must not reset its bound checkpoint");
 
+        assert!(
+            error
+                .to_string()
+                .contains("older than the durable local version 5")
+        );
+        assert_eq!(std::fs::read(path).expect("read checkpoint"), before);
         assert_eq!(
             lpm_vault::vault_id::read_personal_sync_version_for_principal(dir.path(), principal),
-            Some(1),
+            Some(5),
         );
     }
 
     #[test]
-    fn recreated_organization_metadata_resets_the_bound_authority_checkpoint() {
+    fn organization_metadata_rejects_rollback_without_mutating_the_checkpoint() {
         let dir = tempfile::tempdir().expect("tempdir");
         std::fs::write(dir.path().join("lpm.json"), r#"{"vault":"vault-original"}"#)
             .expect("seed project");
@@ -353,7 +348,9 @@ mod tests {
         };
         lpm_vault::vault_id::write_org_sync_version_for_principal(dir.path(), "acme", 5, principal)
             .expect("seed checkpoint");
-        persist_org_sync_version(
+        let path = dir.path().join("lpm.json");
+        let before = std::fs::read(&path).expect("snapshot checkpoint");
+        let error = persist_org_sync_version(
             dir.path(),
             "vault-original",
             "acme",
@@ -361,11 +358,17 @@ mod tests {
             "https://lpm.dev",
             "org-1",
         )
-        .expect("a recreated response must reset its bound checkpoint");
+        .expect_err("a stale response must not reset its bound checkpoint");
 
+        assert!(
+            error
+                .to_string()
+                .contains("older than the durable local version 5")
+        );
+        assert_eq!(std::fs::read(path).expect("read checkpoint"), before);
         assert_eq!(
             lpm_vault::vault_id::read_org_sync_version_for_principal(dir.path(), "acme", principal,),
-            Some(1),
+            Some(5),
         );
     }
 
@@ -500,17 +503,14 @@ mod tests {
     }
 
     #[test]
-    fn build_sync_environments_canonicalizes_legacy_alias_keys() {
-        let mut env_map = HashMap::new();
-        env_map.insert("dev".into(), ".env.development".into());
-
+    fn build_sync_environments_preserves_custom_identity_after_alias_change() {
         let mut all_envs = HashMap::new();
         all_envs.insert(
             "dev".into(),
-            HashMap::from([(String::from("API_KEY"), String::from("legacy-secret"))]),
+            HashMap::from([(String::from("API_KEY"), String::from("current-secret"))]),
         );
 
-        let sync_envs = build_sync_environments(all_envs, &env_map, None);
+        let sync_envs = build_sync_environments(all_envs);
 
         assert_eq!(
             sync_envs.len(),
@@ -518,26 +518,23 @@ mod tests {
             "sync payload should contain exactly one environment"
         );
         assert!(
-            sync_envs.contains_key("development"),
-            "legacy alias keys should be canonicalized before sync"
+            sync_envs.contains_key("dev"),
+            "a later alias must not reinterpret an existing custom environment"
         );
         assert!(
-            !sync_envs.contains_key("dev"),
-            "legacy alias storage keys should not leak into cloud sync payloads"
+            !sync_envs.contains_key("development"),
+            "sync must preserve the environment identity stored by the current writer"
         );
     }
 
     #[test]
-    fn build_sync_environments_prefers_canonical_values_when_legacy_alias_collides() {
-        let mut env_map = HashMap::new();
-        env_map.insert("dev".into(), ".env.development".into());
-
+    fn build_sync_environments_keeps_distinct_current_environment_identities() {
         let mut all_envs = HashMap::new();
         all_envs.insert(
             "dev".into(),
             HashMap::from([
-                (String::from("SHARED"), String::from("legacy")),
-                (String::from("ONLY_LEGACY"), String::from("present")),
+                (String::from("SHARED"), String::from("custom")),
+                (String::from("ONLY_CUSTOM"), String::from("present")),
             ]),
         );
         all_envs.insert(
@@ -548,27 +545,63 @@ mod tests {
             ]),
         );
 
-        let sync_envs = build_sync_environments(all_envs, &env_map, None);
+        let sync_envs = build_sync_environments(all_envs);
+        assert_eq!(sync_envs.len(), 2);
+        let dev = sync_envs
+            .get("dev")
+            .expect("custom environment must remain");
         let development = sync_envs
             .get("development")
-            .expect("canonical environment should be present in sync payload");
-
-        assert_eq!(
-            sync_envs.len(),
-            1,
-            "legacy alias and canonical env should collapse into one sync payload entry"
-        );
-        assert_eq!(
-            development.get("SHARED").map(String::as_str),
-            Some("canonical")
-        );
-        assert_eq!(
-            development.get("ONLY_LEGACY").map(String::as_str),
-            Some("present")
-        );
+            .expect("configured environment must remain");
+        assert_eq!(dev.get("SHARED").map(String::as_str), Some("custom"));
+        assert_eq!(dev.get("ONLY_CUSTOM").map(String::as_str), Some("present"));
         assert_eq!(
             development.get("ONLY_CANONICAL").map(String::as_str),
             Some("present")
+        );
+    }
+
+    #[test]
+    fn build_sync_environments_filters_empty_entries_in_place() {
+        let environment_count = 5_000;
+        let all_envs: HashMap<_, _> = (0..environment_count)
+            .map(|index| {
+                (
+                    format!("canonical-{index}"),
+                    if index % 2 == 0 {
+                        HashMap::from([("TOKEN".to_string(), index.to_string())])
+                    } else {
+                        HashMap::new()
+                    },
+                )
+            })
+            .collect();
+
+        let sync_envs = build_sync_environments(all_envs);
+
+        assert_eq!(sync_envs.len(), environment_count / 2);
+    }
+
+    #[test]
+    #[ignore = "manual deterministic performance harness"]
+    fn build_sync_environments_large_map_benchmark() {
+        let size = 10_000;
+        let all_envs = (0..size)
+            .map(|index| {
+                (
+                    format!("mode-{index:05}"),
+                    HashMap::from([("TOKEN".to_string(), index.to_string())]),
+                )
+            })
+            .collect();
+        let started = std::time::Instant::now();
+
+        let sync_envs = std::hint::black_box(build_sync_environments(all_envs));
+
+        assert_eq!(sync_envs.len(), size);
+        eprintln!(
+            "build_sync_environments size={size} elapsed_ns={}",
+            started.elapsed().as_nanos()
         );
     }
 
@@ -621,30 +654,17 @@ mod tests {
     }
 
     #[test]
-    fn parse_remote_pull_payload_for_overwrite_wraps_flat_payload_as_default() {
+    fn parse_remote_pull_payload_for_overwrite_rejects_retired_flat_payload() {
         let raw_json = serde_json::json!({
             "KEEP": "remote",
             "REMOTE_ONLY": "fresh"
         })
         .to_string();
 
-        let parsed = parse_remote_pull_payload_for_overwrite(&raw_json).unwrap();
+        let error = parse_remote_pull_payload_for_overwrite(&raw_json)
+            .expect_err("retired flat payloads must not remain executable");
 
-        assert_eq!(parsed.len(), 1);
-        assert_eq!(
-            parsed
-                .get("default")
-                .and_then(|env| env.get("KEEP"))
-                .map(String::as_str),
-            Some("remote")
-        );
-        assert_eq!(
-            parsed
-                .get("default")
-                .and_then(|env| env.get("REMOTE_ONLY"))
-                .map(String::as_str),
-            Some("fresh")
-        );
+        assert_eq!(error, "failed to parse pulled vault data");
     }
 
     #[test]
@@ -655,9 +675,9 @@ mod tests {
             "default".to_string(),
             HashMap::from([("TOKEN".to_string(), secret)]),
         )]);
-        let wrapper = RemotePullPayload::Wrapper { environments };
+        let wrapper = RemotePullPayload { environments };
 
-        let parsed = take_remote_environments(wrapper);
+        let parsed = wrapper.environments;
 
         let moved = &parsed["default"]["TOKEN"];
         assert_eq!(moved.as_ptr(), secret_pointer);
