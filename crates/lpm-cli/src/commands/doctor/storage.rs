@@ -11,6 +11,10 @@ pub(super) fn vault_storage_check(backend: lpm_vault::VaultStorageBackend) -> Ch
             &doctor_catalog::VAULT_STORAGE_NATIVE,
             "native-protected data key",
         ),
+        lpm_vault::VaultStorageBackend::NativeProtectedWithFallback => Check::warn(
+            &doctor_catalog::VAULT_STORAGE_NATIVE_WITH_FALLBACK,
+            "native data key is present, but ~/.lpm/.vault-fallback-key still permits offline decryption",
+        ),
         lpm_vault::VaultStorageBackend::NativePreferred => Check::pass(
             &doctor_catalog::VAULT_STORAGE_NATIVE,
             "native secure store preferred for new vault data",
@@ -60,6 +64,16 @@ mod tests {
         assert_eq!(check.code(), "vault_storage_fallback");
         assert!(matches!(check.severity, Severity::Warn));
         assert!(check.detail.contains(".vault-fallback-key"));
+    }
+
+    #[test]
+    fn vault_storage_check_warns_when_native_backend_retains_fallback_key() {
+        let check =
+            vault_storage_check(lpm_vault::VaultStorageBackend::NativeProtectedWithFallback);
+
+        assert_eq!(check.code(), "vault_storage_native_with_fallback");
+        assert!(matches!(check.severity, Severity::Warn));
+        assert!(check.detail.contains("offline decryption"));
     }
 
     #[test]

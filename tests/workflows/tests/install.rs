@@ -160,7 +160,6 @@ fn install_without_package_json_fails() {
     cmd.env("LPM_NO_UPDATE_CHECK", "1");
     cmd.env("LPM_DISABLE_TELEMETRY", "1");
     cmd.env("LPM_FORCE_FILE_AUTH", "1");
-    cmd.env("LPM_TEST_FAST_SCRYPT", "1");
     cmd.env("LPM_FORCE_FILE_VAULT", "1");
     cmd.env("LPM_DISABLE_HOST_CLI_AUTH", "1");
     cmd.env(
@@ -1081,7 +1080,6 @@ async fn install_add_walks_up_to_parent_package_json() {
     cmd.env("LPM_NO_UPDATE_CHECK", "1");
     cmd.env("LPM_DISABLE_TELEMETRY", "1");
     cmd.env("LPM_FORCE_FILE_AUTH", "1");
-    cmd.env("LPM_TEST_FAST_SCRYPT", "1");
     cmd.env("LPM_FORCE_FILE_VAULT", "1");
     cmd.env("LPM_DISABLE_HOST_CLI_AUTH", "1");
     cmd.env(
@@ -1372,7 +1370,6 @@ async fn install_bare_walks_up_to_parent_package_json() {
     cmd.env("LPM_NO_UPDATE_CHECK", "1");
     cmd.env("LPM_DISABLE_TELEMETRY", "1");
     cmd.env("LPM_FORCE_FILE_AUTH", "1");
-    cmd.env("LPM_TEST_FAST_SCRYPT", "1");
     cmd.env("LPM_FORCE_FILE_VAULT", "1");
     cmd.env("LPM_DISABLE_HOST_CLI_AUTH", "1");
     cmd.env(

@@ -79,8 +79,8 @@ test("release inputs are uploaded before any staged binary executes natively", (
   assert.ok(linuxUpload >= 0 && linuxUpload < linuxExecute, "Linux upload must precede execution");
 
   const macos = jobSource("notarize-macos", "build-windows");
-  const macUpload = macos.indexOf("Upload macOS bundle and compatibility artifact");
-  const macExecute = macos.indexOf("Execute notarized app bundle and compatibility binary");
+  const macUpload = macos.indexOf("Upload macOS app bundle");
+  const macExecute = macos.indexOf("Execute notarized app bundle");
   assert.ok(macUpload >= 0 && macUpload < macExecute, "macOS upload must precede execution");
 
   const windows = jobSource("build-windows", "sign-windows");
@@ -91,13 +91,11 @@ test("release inputs are uploaded before any staged binary executes natively", (
   );
 });
 
-test("macOS release smoke isolates LPM state without hiding the login Keychain", () => {
+test("macOS release smoke executes only the provisioned app bundle", () => {
   const workflow = fs
     .readFileSync(path.join(repoRoot, ".github/workflows/release.yml"), "utf8")
     .replaceAll("\r\n", "\n");
-  const start = workflow.indexOf(
-    "- name: Execute notarized app bundle and compatibility binary",
-  );
+  const start = workflow.indexOf("- name: Execute notarized app bundle");
   const end = workflow.indexOf(
     "\n  build-windows:\n",
     start + 1,
@@ -107,8 +105,8 @@ test("macOS release smoke isolates LPM state without hiding the login Keychain",
   assert.notEqual(end, -1, "missing step after macOS release smoke");
 
   const smoke = workflow.slice(start, end);
-  assert.match(smoke, /LPM_HOME="\$raw_smoke_home"/);
-  assert.doesNotMatch(smoke, /(?:^|\s)HOME="\$raw_smoke_home"/m);
+  assert.match(smoke, /LPM CLI\.app\/Contents\/MacOS\/lpm-rs/);
+  assert.doesNotMatch(smoke, /raw_actual|\.\/\$\{\{ matrix\.binary \}\}/);
 });
 
 test("macOS release signing preserves the login Keychain search list", () => {
@@ -116,7 +114,7 @@ test("macOS release signing preserves the login Keychain search list", () => {
     .readFileSync(path.join(repoRoot, ".github/workflows/release.yml"), "utf8")
     .replaceAll("\r\n", "\n");
   const start = workflow.indexOf("- name: Import Developer ID certificate (macOS)");
-  const end = workflow.indexOf("- name: Sign legacy binary and provisioned app bundle", start + 1);
+  const end = workflow.indexOf("- name: Sign app bundle", start + 1);
 
   assert.notEqual(start, -1, "missing macOS certificate import step");
   assert.notEqual(end, -1, "missing macOS signing step after certificate import");
@@ -129,16 +127,13 @@ test("macOS release signing preserves the login Keychain search list", () => {
   );
 });
 
-test("every macOS release retains the pre-bundle standalone updater bridge", () => {
+test("macOS releases publish only provisioned app bundles", () => {
   const workflow = fs
     .readFileSync(path.join(repoRoot, ".github/workflows/release.yml"), "utf8")
     .replaceAll("\r\n", "\n");
 
   assert.doesNotMatch(workflow, /MACOS_RAW_BRIDGE_VERSION/);
-  assert.match(
-    workflow,
-    /assets\+=\(lpm-darwin-arm64 lpm-darwin-x64\)/,
-    "post-0.76 releases must checksum and publish the raw updater bridge",
-  );
-  assert.doesNotMatch(workflow, /Remove non-bridge raw macOS artifact/);
+  assert.match(workflow, /lpm-darwin-arm64\.zip lpm-darwin-x64\.zip/);
+  assert.doesNotMatch(workflow, /assets\+=\(lpm-darwin-arm64 lpm-darwin-x64\)/);
+  assert.doesNotMatch(workflow, /raw-notary|Sign raw binary|raw artifact|raw binary/i);
 });

@@ -242,9 +242,7 @@ fn active_auth_storage_status(
     };
 
     Ok(match session.current_source()? {
-        Some(auth::TokenSource::StoredSession | auth::TokenSource::StoredLegacy) => {
-            auth::auth_storage_status(session.registry_url())
-        }
+        Some(auth::TokenSource::StoredSession) => auth::auth_storage_status(session.registry_url()),
         _ => auth::AuthStorageStatus::none(),
     })
 }

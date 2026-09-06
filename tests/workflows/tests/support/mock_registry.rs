@@ -6,19 +6,21 @@
 //! tests can validate install, publish, health, and auth flows without
 //! any external network calls.
 
-use sha2::{Digest, Sha256};
 use std::collections::{HashMap, VecDeque};
 use std::io::Write;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use wiremock::matchers::{body_string_contains, header, method, path, path_regex, query_param};
-use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
+use wiremock::matchers::{
+    body_json, body_string_contains, header, method, path, path_regex, query_param,
+    query_param_is_missing,
+};
+use wiremock::{Match, Mock, MockServer, Request, Respond, ResponseTemplate};
 
 pub const TEST_OIDC_POLICY_ID: &str = "11111111-1111-4111-8111-111111111111";
 
 const VAULT_REQUEST_NONCE_HEADER: &str = "x-lpm-vault-request-nonce";
-const VAULT_PAYLOAD_DIGEST_DOMAIN: &[u8] = b"lpm-vault-payload\0";
+const PLATFORM_REQUEST_NONCE_HEADER: &str = "x-lpm-platform-request-nonce";
 
 #[derive(Clone)]
 pub enum TestSyncScope {
@@ -29,7 +31,6 @@ pub enum TestSyncScope {
 #[derive(Clone)]
 pub struct SignedSyncResponse {
     body: serde_json::Value,
-    bearer_token: String,
     vault_id: String,
     scope: TestSyncScope,
 }
@@ -41,47 +42,272 @@ impl Respond for SignedSyncResponse {
             .get(VAULT_REQUEST_NONCE_HEADER)
             .and_then(|value| value.to_str().ok())
             .unwrap_or_default();
-        let mut body = self.body.clone();
-        let object = body
-            .as_object_mut()
+        let object = self
+            .body
+            .as_object()
             .expect("signed sync response body must be a JSON object");
-        let version = object
+        let revision = object
             .get("version")
             .and_then(serde_json::Value::as_i64)
             .expect("signed sync response must include an integer version");
-        object.insert("vaultId".into(), self.vault_id.clone().into());
-        object.insert("envelopeVersion".into(), 2.into());
-        object.insert("serverVersion".into(), version.into());
-        object.insert("requestNonce".into(), request_nonce.into());
-        object.insert(
-            "cryptoVersion".into(),
-            lpm_vault::crypto::CURRENT_CRYPTO_VERSION.into(),
-        );
-        match &self.scope {
-            TestSyncScope::Personal => {
-                object.insert("scope".into(), "personal".into());
+        let crypto_version = object
+            .get("cryptoVersion")
+            .cloned()
+            .unwrap_or_else(|| lpm_vault::crypto::CURRENT_CRYPTO_VERSION.into());
+        let operation = if request.method.as_str() == "POST" {
+            "vault.write"
+        } else if request
+            .url
+            .query_pairs()
+            .any(|(key, value)| key == "versionOnly" && value == "true")
+        {
+            "vault.inspect"
+        } else {
+            "vault.pull"
+        };
+        let binding = match &self.scope {
+            TestSyncScope::Personal => serde_json::json!({
+                "scope": "personal",
+                "principalId": object
+                    .get("principalId")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("account-1"),
+                "callerUserId": object
+                    .get("principalId")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("account-1"),
+                "vaultId": self.vault_id,
+            }),
+            TestSyncScope::Organization(slug) => serde_json::json!({
+                "scope": "organization",
+                "principalId": "00000000-0000-4000-8000-000000000001",
+                "callerUserId": object
+                    .get("callerUserId")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("11111111-1111-4111-8111-111111111111"),
+                "organizationSlug": slug,
+                "vaultId": self.vault_id,
+            }),
+        };
+        let data = match operation {
+            "vault.inspect" => serde_json::json!({
+                "revision": revision,
+                "cryptoVersion": crypto_version,
+            }),
+            "vault.write" => {
+                let mut data = serde_json::json!({
+                    "revision": revision,
+                    "cryptoVersion": crypto_version,
+                    "action": object
+                        .get("status")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or(match &self.scope {
+                            TestSyncScope::Personal => "synced",
+                            TestSyncScope::Organization(_) => "shared",
+                        }),
+                });
+                if let Some(content_key_version) = object.get("contentKeyVersion") {
+                    data["contentKeyVersion"] = content_key_version.clone();
+                }
+                data
             }
-            TestSyncScope::Organization(slug) => {
-                object.insert("scope".into(), "organization".into());
-                object.insert("organizationSlug".into(), slug.clone().into());
+            _ => {
+                let mut data = serde_json::json!({
+                    "encryptedBlob": object
+                        .get("encryptedBlob")
+                        .and_then(serde_json::Value::as_str)
+                        .expect("pull fixture must include encryptedBlob"),
+                    "wrappedKey": object
+                        .get("wrappedKey")
+                        .and_then(serde_json::Value::as_str)
+                        .expect("pull fixture must include wrappedKey"),
+                    "revision": revision,
+                    "cryptoVersion": crypto_version,
+                    "updatedAt": "2026-09-05T12:00:00.000Z",
+                });
+                for field in [
+                    "contentKeyVersion",
+                    "recipientPublicKeyVersion",
+                    "recipientPublicKeyFingerprint",
+                ] {
+                    if let Some(value) = object.get(field) {
+                        data[field] = value.clone();
+                    }
+                }
+                data
             }
-        }
-        if let (Some(encrypted_blob), Some(wrapped_key)) = (
-            object
-                .get("encryptedBlob")
-                .and_then(serde_json::Value::as_str),
-            object.get("wrappedKey").and_then(serde_json::Value::as_str),
-        ) {
-            object.insert(
-                "payloadDigest".into(),
-                sync_payload_digest(encrypted_blob, wrapped_key).into(),
-            );
-        }
-
-        let body = serde_json::to_string(&body).expect("signed sync response must serialize");
-        let signature = lpm_vault::signature::sign_body(body.as_bytes(), &self.bearer_token);
+        };
+        let body = serde_json::to_string(&serde_json::json!({
+            "envelopeVersion": 3,
+            "operation": operation,
+            "outcome": if operation == "vault.write" { "committed" } else { "current" },
+            "requestNonce": request_nonce,
+            "binding": binding,
+            "data": data,
+        }))
+        .expect("signed sync response must serialize");
+        let (key_id, signature) =
+            lpm_vault::signature::sign_response_for_test(200, body.as_bytes());
         ResponseTemplate::new(200)
             .insert_header("Content-Type", "application/json")
+            .insert_header(lpm_vault::signature::KEY_ID_HEADER, key_id.as_str())
+            .insert_header(lpm_vault::signature::SIGNATURE_HEADER, signature.as_str())
+            .set_body_string(body)
+    }
+}
+
+#[derive(Clone)]
+pub struct SignedPersonalMissingResponse {
+    vault_id: String,
+    principal_id: String,
+    retained_revision: i32,
+}
+
+#[derive(Clone)]
+struct SignedSharingKeyPrincipalResponse {
+    principal_id: String,
+}
+
+impl Respond for SignedSharingKeyPrincipalResponse {
+    fn respond(&self, request: &Request) -> ResponseTemplate {
+        let request_nonce = request
+            .headers
+            .get(VAULT_REQUEST_NONCE_HEADER)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default();
+        let body = serde_json::to_string(&serde_json::json!({
+            "envelopeVersion": 3,
+            "operation": "sharingKey.read",
+            "outcome": "absent",
+            "requestNonce": request_nonce,
+            "binding": {
+                "scope": "account",
+                "principalId": self.principal_id,
+            },
+            "data": {},
+        }))
+        .expect("signed sharing-key response must serialize");
+        let (key_id, signature) =
+            lpm_vault::signature::sign_response_for_test(200, body.as_bytes());
+        ResponseTemplate::new(200)
+            .insert_header("Content-Type", "application/json")
+            .insert_header(lpm_vault::signature::KEY_ID_HEADER, key_id.as_str())
+            .insert_header(lpm_vault::signature::SIGNATURE_HEADER, signature.as_str())
+            .set_body_string(body)
+    }
+}
+
+impl Respond for SignedPersonalMissingResponse {
+    fn respond(&self, request: &Request) -> ResponseTemplate {
+        let request_nonce = request
+            .headers
+            .get(VAULT_REQUEST_NONCE_HEADER)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default();
+        let operation = if request
+            .url
+            .query_pairs()
+            .any(|(key, value)| key == "versionOnly" && value == "true")
+        {
+            "vault.inspect"
+        } else {
+            "vault.pull"
+        };
+        let body = serde_json::to_string(&serde_json::json!({
+            "envelopeVersion": 3,
+            "operation": operation,
+            "outcome": "missing",
+            "requestNonce": request_nonce,
+            "binding": {
+                "scope": "personal",
+                "principalId": self.principal_id,
+                "callerUserId": self.principal_id,
+                "vaultId": self.vault_id,
+            },
+            "data": {
+                "retainedRevision": self.retained_revision,
+            },
+        }))
+        .expect("signed missing response must serialize");
+        let (key_id, signature) =
+            lpm_vault::signature::sign_response_for_test(404, body.as_bytes());
+        ResponseTemplate::new(404)
+            .insert_header("Content-Type", "application/json")
+            .insert_header(lpm_vault::signature::KEY_ID_HEADER, key_id.as_str())
+            .insert_header(lpm_vault::signature::SIGNATURE_HEADER, signature.as_str())
+            .set_body_string(body)
+    }
+}
+
+pub fn signed_personal_missing_response(
+    vault_id: &str,
+    principal_id: &str,
+    retained_revision: i32,
+) -> SignedPersonalMissingResponse {
+    SignedPersonalMissingResponse {
+        vault_id: vault_id.to_owned(),
+        principal_id: principal_id.to_owned(),
+        retained_revision,
+    }
+}
+
+#[derive(Debug)]
+struct PlatformContextOnlyMatcher(bool);
+
+impl Match for PlatformContextOnlyMatcher {
+    fn matches(&self, request: &Request) -> bool {
+        serde_json::from_slice::<serde_json::Value>(&request.body)
+            .ok()
+            .and_then(|body| body.get("contextOnly").and_then(serde_json::Value::as_bool))
+            .unwrap_or(false)
+            == self.0
+    }
+}
+
+#[derive(Clone)]
+struct SignedPlatformResponse {
+    body: serde_json::Value,
+    vault_id: String,
+}
+
+impl Respond for SignedPlatformResponse {
+    fn respond(&self, request: &Request) -> ResponseTemplate {
+        let request_nonce = request
+            .headers
+            .get(PLATFORM_REQUEST_NONCE_HEADER)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default();
+        let request_body = serde_json::from_slice::<serde_json::Value>(&request.body)
+            .expect("platform request body must be JSON");
+        let platform = request_body
+            .get("platform")
+            .and_then(serde_json::Value::as_str);
+        let mut body = self.body.clone();
+        let object = body
+            .as_object_mut()
+            .expect("signed platform response body must be a JSON object");
+        object.insert("requestNonce".into(), request_nonce.into());
+        object.insert("vaultId".into(), self.vault_id.clone().into());
+        object.insert(
+            "platform".into(),
+            platform.map_or(serde_json::Value::Null, Into::into),
+        );
+        object.insert("scope".into(), "personal".into());
+        object.insert("principalId".into(), "account-1".into());
+        object.insert("organizationSlug".into(), serde_json::Value::Null);
+        for field in ["operation", "connectionId"] {
+            if let Some(value) = request_body.get(field) {
+                object
+                    .entry(field.to_owned())
+                    .or_insert_with(|| value.clone());
+            }
+        }
+        let body = serde_json::to_string(&body).expect("platform response must serialize");
+        let (key_id, signature) =
+            lpm_vault::signature::sign_response_for_test(200, body.as_bytes());
+        ResponseTemplate::new(200)
+            .insert_header("Content-Type", "application/json")
+            .insert_header(lpm_vault::signature::KEY_ID_HEADER, key_id.as_str())
             .insert_header(lpm_vault::signature::SIGNATURE_HEADER, signature.as_str())
             .set_body_string(body)
     }
@@ -89,28 +315,15 @@ impl Respond for SignedSyncResponse {
 
 pub fn signed_sync_response(
     body: serde_json::Value,
-    bearer_token: &str,
+    _bearer_token: &str,
     vault_id: &str,
     scope: TestSyncScope,
 ) -> SignedSyncResponse {
     SignedSyncResponse {
         body,
-        bearer_token: bearer_token.to_owned(),
         vault_id: vault_id.to_owned(),
         scope,
     }
-}
-
-fn sync_payload_digest(encrypted_blob: &str, wrapped_key: &str) -> String {
-    let mut hash = Sha256::new();
-    hash.update(VAULT_PAYLOAD_DIGEST_DOMAIN);
-    for value in [encrypted_blob, wrapped_key] {
-        let bytes = value.as_bytes();
-        let length = u32::try_from(bytes.len()).expect("test sync payload field must fit in u32");
-        hash.update(length.to_be_bytes());
-        hash.update(bytes);
-    }
-    hex::encode(hash.finalize())
 }
 
 /// A mock LPM registry server.
@@ -124,6 +337,62 @@ pub struct MockRegistry {
 
 struct JsonResponseSequence {
     bodies: Arc<Mutex<VecDeque<serde_json::Value>>>,
+}
+
+struct PersonalPullRevision {
+    version: i32,
+    crypto_version: i32,
+}
+
+pub struct PersonalPullFailureFixture<'a> {
+    pub vault_id: &'a str,
+    pub bearer_token: &'a str,
+    pub payload: serde_json::Value,
+    pub wrapping_key: &'a [u8; 32],
+    pub data_key: &'a [u8; 32],
+    pub version: i32,
+    pub status: u16,
+    pub error: &'a str,
+}
+
+struct SignedPersonalWriteRejection {
+    vault_id: String,
+    status: u16,
+    message: String,
+}
+
+impl Respond for SignedPersonalWriteRejection {
+    fn respond(&self, request: &Request) -> ResponseTemplate {
+        let request_nonce = request
+            .headers
+            .get(VAULT_REQUEST_NONCE_HEADER)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default();
+        let body = serde_json::to_string(&serde_json::json!({
+            "envelopeVersion": 3,
+            "operation": "vault.write",
+            "outcome": "rejected",
+            "requestNonce": request_nonce,
+            "binding": {
+                "scope": "personal",
+                "principalId": "account-1",
+                "callerUserId": "account-1",
+                "vaultId": self.vault_id,
+            },
+            "data": {
+                "code": "vault_version_conflict",
+                "message": self.message,
+            },
+        }))
+        .expect("personal write rejection must serialize");
+        let (key_id, signature) =
+            lpm_vault::signature::sign_response_for_test(self.status, body.as_bytes());
+        ResponseTemplate::new(self.status)
+            .insert_header("Content-Type", "application/json")
+            .insert_header(lpm_vault::signature::KEY_ID_HEADER, key_id.as_str())
+            .insert_header(lpm_vault::signature::SIGNATURE_HEADER, signature.as_str())
+            .set_body_string(body)
+    }
 }
 
 struct JsonResponseAndCreateDirectory {
@@ -1026,59 +1295,44 @@ impl MockRegistry {
         self
     }
 
-    /// Mount a successful pairing revocation endpoint.
-    pub async fn with_revoke_all_pairings(&self) -> &Self {
-        self.with_revoke_all_pairings_expected(1).await
-    }
-
-    /// Mount pairing revocation with an explicit expected call count.
-    pub async fn with_revoke_all_pairings_expected(&self, expected_calls: u64) -> &Self {
-        Mock::given(method("POST"))
-            .and(path("/api/vault/pair/revoke-all"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "success": true
-            })))
+    pub async fn with_current_principal(
+        &self,
+        bearer_token: &str,
+        principal_id: &str,
+        expected_calls: u64,
+    ) -> &Self {
+        Mock::given(method("GET"))
+            .and(path("/api/users/me/public-key"))
+            .and(header("authorization", format!("Bearer {bearer_token}")))
+            .respond_with(SignedSharingKeyPrincipalResponse {
+                principal_id: principal_id.to_owned(),
+            })
             .expect(expected_calls)
             .mount(&self.server)
             .await;
         self
     }
 
-    pub async fn with_revoke_all_pairings_for(&self, bearer_token: &str) -> &Self {
-        self.with_revoke_all_pairings_for_status(bearer_token, 200, 1)
-            .await
-    }
-
-    pub async fn with_revoke_all_pairings_for_status(
+    pub async fn with_revoke_all_pairings_for_principal_status(
         &self,
         bearer_token: &str,
+        principal_id: &str,
         status: u16,
         expected_calls: u64,
     ) -> &Self {
         let response = if status == 200 {
             serde_json::json!({ "success": true })
         } else {
-            serde_json::json!({ "error": "pairing revocation unauthorized" })
+            serde_json::json!({ "error": "pairing revocation rejected" })
         };
         Mock::given(method("POST"))
             .and(path("/api/vault/pair/revoke-all"))
             .and(header("authorization", format!("Bearer {bearer_token}")))
+            .and(body_json(serde_json::json!({
+                "expectedPrincipalId": principal_id,
+            })))
             .respond_with(ResponseTemplate::new(status).set_body_json(response))
             .expect(expected_calls)
-            .mount(&self.server)
-            .await;
-        self
-    }
-
-    pub async fn with_revoke_all_pairings_status(&self, status: u16) -> &Self {
-        Mock::given(method("POST"))
-            .and(path("/api/vault/pair/revoke-all"))
-            .respond_with(
-                ResponseTemplate::new(status).set_body_json(serde_json::json!({
-                    "error": "pairing revocation unavailable"
-                })),
-            )
-            .expect(1)
             .mount(&self.server)
             .await;
         self
@@ -1120,6 +1374,7 @@ impl MockRegistry {
             .and(header("authorization", format!("Bearer {bearer_token}")))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "status": "pending",
+                "protocolVersion": 3,
                 "browserPublicKey": browser_public_key,
             })))
             .expect(1)
@@ -1144,6 +1399,7 @@ impl MockRegistry {
             .and(header("authorization", format!("Bearer {bearer_token}")))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "status": "pending",
+                "protocolVersion": 3,
                 "browserPublicKey": browser_public_key,
             })))
             .expect(expected_calls)
@@ -1167,6 +1423,7 @@ impl MockRegistry {
     ) -> &Self {
         let mut body = serde_json::json!({
             "status": "pending",
+            "protocolVersion": 3,
             "browserPublicKey": browser_public_key,
         });
         if let Some(label) = device_label {
@@ -1198,6 +1455,7 @@ impl MockRegistry {
     ) -> &Self {
         let mut body = serde_json::json!({
             "status": status,
+            "protocolVersion": 3,
         });
         if let Some(browser_public_key) = browser_public_key {
             body["browserPublicKey"] = serde_json::Value::String(browser_public_key.to_string());
@@ -1246,14 +1504,77 @@ impl MockRegistry {
         bearer_token: &str,
         expected_calls: u64,
     ) -> &Self {
+        self.with_pairing_stage_for_principal_status(
+            code,
+            bearer_token,
+            "account-1",
+            200,
+            expected_calls,
+        )
+        .await;
+        self.with_pairing_final_approval_for_principal_status(
+            code,
+            bearer_token,
+            "account-1",
+            200,
+            expected_calls,
+        )
+        .await
+    }
+
+    pub async fn with_pairing_stage_for_principal_status(
+        &self,
+        code: &str,
+        bearer_token: &str,
+        principal_id: &str,
+        status: u16,
+        expected_calls: u64,
+    ) -> &Self {
         Mock::given(method("POST"))
             .and(path(format!("/api/vault/pair/{code}")))
             .and(header("authorization", format!("Bearer {bearer_token}")))
+            .and(body_string_contains("\"action\":\"stage\""))
+            .and(body_string_contains(format!(
+                "\"expectedPrincipalId\":\"{principal_id}\""
+            )))
+            .and(body_string_contains("ephemeralPublicKey"))
+            .respond_with(
+                ResponseTemplate::new(status).set_body_json(if status == 200 {
+                    serde_json::json!({ "status": "confirming" })
+                } else {
+                    serde_json::json!({ "error": "pairing stage rejected" })
+                }),
+            )
+            .expect(expected_calls)
+            .mount(&self.server)
+            .await;
+        self
+    }
+
+    pub async fn with_pairing_final_approval_for_principal_status(
+        &self,
+        code: &str,
+        bearer_token: &str,
+        principal_id: &str,
+        status: u16,
+        expected_calls: u64,
+    ) -> &Self {
+        Mock::given(method("POST"))
+            .and(path(format!("/api/vault/pair/{code}")))
+            .and(header("authorization", format!("Bearer {bearer_token}")))
+            .and(body_string_contains("\"action\":\"approve\""))
+            .and(body_string_contains(format!(
+                "\"expectedPrincipalId\":\"{principal_id}\""
+            )))
             .and(body_string_contains("encryptedWrappingKey"))
             .and(body_string_contains("ephemeralPublicKey"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "success": true,
-            })))
+            .respond_with(
+                ResponseTemplate::new(status).set_body_json(if status == 200 {
+                    serde_json::json!({ "success": true })
+                } else {
+                    serde_json::json!({ "error": "pairing approval rejected" })
+                }),
+            )
             .expect(expected_calls)
             .mount(&self.server)
             .await;
@@ -1286,26 +1607,24 @@ impl MockRegistry {
         policy_id: &str,
         lpm_token: &str,
     ) -> &Self {
-        let mut mock = Mock::given(method("POST"))
-            .and(path("/api/vault/oidc"))
-            .and(body_string_contains(format!(
-                "\"oidcToken\":\"{oidc_token}\""
-            )))
-            .and(body_string_contains(format!("\"vaultId\":\"{vault_id}\"")))
-            .and(body_string_contains(format!(
-                "\"policyId\":\"{policy_id}\""
-            )));
-
+        let mut expected_body = serde_json::json!({
+            "oidcToken": oidc_token,
+            "vaultId": vault_id,
+            "policyId": policy_id,
+        });
         if let Some(env_name) = env_name {
-            mock = mock.and(body_string_contains(format!("\"env\":\"{env_name}\"")));
+            expected_body["env"] = serde_json::Value::String(env_name.to_owned());
         }
 
-        mock.respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-            "token": lpm_token,
-        })))
-        .expect(1)
-        .mount(&self.server)
-        .await;
+        Mock::given(method("POST"))
+            .and(path("/api/vault/oidc"))
+            .and(body_json(expected_body))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "token": lpm_token,
+            })))
+            .expect(1)
+            .mount(&self.server)
+            .await;
         self
     }
 
@@ -1319,19 +1638,13 @@ impl MockRegistry {
         error: &str,
         hint: Option<&str>,
     ) -> &Self {
-        let mut mock = Mock::given(method("POST"))
-            .and(path("/api/vault/oidc"))
-            .and(body_string_contains(format!(
-                "\"oidcToken\":\"{oidc_token}\""
-            )))
-            .and(body_string_contains(format!("\"vaultId\":\"{vault_id}\"")))
-            .and(body_string_contains(format!(
-                "\"policyId\":\"{}\"",
-                TEST_OIDC_POLICY_ID
-            )));
-
+        let mut expected_body = serde_json::json!({
+            "oidcToken": oidc_token,
+            "vaultId": vault_id,
+            "policyId": TEST_OIDC_POLICY_ID,
+        });
         if let Some(env_name) = env_name {
-            mock = mock.and(body_string_contains(format!("\"env\":\"{env_name}\"")));
+            expected_body["env"] = serde_json::Value::String(env_name.to_owned());
         }
 
         let mut body = serde_json::json!({
@@ -1341,7 +1654,10 @@ impl MockRegistry {
             body["hint"] = serde_json::Value::String(hint.to_string());
         }
 
-        mock.respond_with(ResponseTemplate::new(status_code).set_body_json(body))
+        Mock::given(method("POST"))
+            .and(path("/api/vault/oidc"))
+            .and(body_json(expected_body))
+            .respond_with(ResponseTemplate::new(status_code).set_body_json(body))
             .expect(1)
             .mount(&self.server)
             .await;
@@ -1413,42 +1729,6 @@ impl MockRegistry {
         self
     }
 
-    /// Mount a successful personal sync pull endpoint.
-    ///
-    /// The payload uses protocol-v2 associated-data encryption with the legacy
-    /// token-derived wrapping key. This lets workflow tests exercise the
-    /// migration path without sharing a local wrapping-key file between the
-    /// test process and the CLI subprocess.
-    pub async fn with_personal_pull(
-        &self,
-        vault_id: &str,
-        bearer_token: &str,
-        payload: serde_json::Value,
-        version: i32,
-    ) -> &Self {
-        let plaintext = serde_json::to_string(&payload).expect("failed to serialize vault payload");
-        let aes_key = lpm_vault::crypto::generate_aes_key();
-        let wrapping_key = lpm_vault::crypto::derive_legacy_wrapping_key(bearer_token);
-        let encrypted_blob = lpm_vault::crypto::encrypt_vault_payload(
-            &aes_key,
-            plaintext.as_bytes(),
-            lpm_vault::crypto::VaultScope::Personal,
-            vault_id,
-        )
-        .expect("failed to encrypt vault payload");
-        let wrapped_key = lpm_vault::crypto::wrap_key(&wrapping_key, &aes_key)
-            .expect("failed to wrap vault payload key");
-        self.mount_personal_pull(
-            vault_id,
-            bearer_token,
-            encrypted_blob,
-            wrapped_key,
-            version,
-            None,
-        )
-        .await
-    }
-
     pub async fn with_personal_pull_keys(
         &self,
         vault_id: &str,
@@ -1463,7 +1743,9 @@ impl MockRegistry {
             data_key,
             plaintext.as_bytes(),
             lpm_vault::crypto::VaultScope::Personal,
+            "account-1",
             vault_id,
+            version,
         )
         .expect("failed to encrypt vault payload");
         let wrapped_key = lpm_vault::crypto::wrap_key(wrapping_key, data_key)
@@ -1473,7 +1755,10 @@ impl MockRegistry {
             bearer_token,
             encrypted_blob,
             wrapped_key,
-            version,
+            PersonalPullRevision {
+                version,
+                crypto_version: lpm_vault::crypto::CURRENT_CRYPTO_VERSION,
+            },
             None,
         )
         .await
@@ -1481,31 +1766,39 @@ impl MockRegistry {
 
     pub async fn with_personal_pull_failure(
         &self,
-        vault_id: &str,
-        bearer_token: &str,
-        payload: serde_json::Value,
-        version: i32,
-        status: u16,
-        error: &str,
+        fixture: PersonalPullFailureFixture<'_>,
     ) -> &Self {
+        let PersonalPullFailureFixture {
+            vault_id,
+            bearer_token,
+            payload,
+            wrapping_key,
+            data_key,
+            version,
+            status,
+            error,
+        } = fixture;
         let plaintext = serde_json::to_string(&payload).expect("failed to serialize vault payload");
-        let data_key = lpm_vault::crypto::generate_aes_key();
-        let wrapping_key = lpm_vault::crypto::derive_legacy_wrapping_key(bearer_token);
         let encrypted_blob = lpm_vault::crypto::encrypt_vault_payload(
-            &data_key,
+            data_key,
             plaintext.as_bytes(),
             lpm_vault::crypto::VaultScope::Personal,
+            "account-1",
             vault_id,
+            version,
         )
         .expect("failed to encrypt vault payload");
-        let wrapped_key = lpm_vault::crypto::wrap_key(&wrapping_key, &data_key)
+        let wrapped_key = lpm_vault::crypto::wrap_key(wrapping_key, data_key)
             .expect("failed to wrap vault payload key");
         self.mount_personal_pull(
             vault_id,
             bearer_token,
             encrypted_blob,
             wrapped_key,
-            version,
+            PersonalPullRevision {
+                version,
+                crypto_version: lpm_vault::crypto::CURRENT_CRYPTO_VERSION,
+            },
             Some((status, error.to_string())),
         )
         .await
@@ -1517,10 +1810,14 @@ impl MockRegistry {
         bearer_token: &str,
         encrypted_blob: String,
         wrapped_key: String,
-        version: i32,
+        revision: PersonalPullRevision,
         push_failure: Option<(u16, String)>,
     ) -> &Self {
-        // Successful sync endpoints echo the request nonce in a signed v2
+        let PersonalPullRevision {
+            version,
+            crypto_version,
+        } = revision;
+        // Successful sync endpoints echo the request nonce in a signed
         // envelope. Both GET and POST mocks use the shared responder so the
         // workflow harness mirrors the real origin's trust boundary.
         let pull_response = signed_sync_response(
@@ -1528,6 +1825,7 @@ impl MockRegistry {
             "encryptedBlob": encrypted_blob,
             "wrappedKey": wrapped_key,
             "version": version,
+            "cryptoVersion": crypto_version,
             }),
             bearer_token,
             vault_id,
@@ -1537,8 +1835,22 @@ impl MockRegistry {
         Mock::given(method("GET"))
             .and(path(format!("/api/vaults/{vault_id}/sync")))
             .and(header("authorization", format!("Bearer {bearer_token}")))
+            .and(query_param_is_missing("versionOnly"))
             .respond_with(pull_response)
             .expect(1)
+            .mount(&self.server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path(format!("/api/vaults/{vault_id}/sync")))
+            .and(header("authorization", format!("Bearer {bearer_token}")))
+            .and(query_param("versionOnly", "true"))
+            .respond_with(signed_sync_response(
+                serde_json::json!({ "version": version }),
+                bearer_token,
+                vault_id,
+                TestSyncScope::Personal,
+            ))
             .mount(&self.server)
             .await;
 
@@ -1548,10 +1860,11 @@ impl MockRegistry {
         match push_failure {
             Some((status, error)) => {
                 push_mock
-                    .respond_with(
-                        ResponseTemplate::new(status)
-                            .set_body_json(serde_json::json!({ "error": error })),
-                    )
+                    .respond_with(SignedPersonalWriteRejection {
+                        vault_id: vault_id.to_owned(),
+                        status,
+                        message: error,
+                    })
                     .mount(&self.server)
                     .await;
             }
@@ -1559,7 +1872,7 @@ impl MockRegistry {
                 push_mock
                     .respond_with(signed_sync_response(
                         serde_json::json!({
-                            "status": "updated",
+                            "status": "rotated",
                             "version": version + 1,
                         }),
                         bearer_token,
@@ -1604,10 +1917,26 @@ impl MockRegistry {
     /// HOMEs need the same wrapping key. Set `LPM_FORCE_FILE_VAULT=1`
     /// on each `lpm` invocation and pre-write the same hex-encoded
     /// 32-byte key to `<HOME>/.lpm/.vault-key` on both machines.
-    pub async fn with_stateful_personal_sync(&self, vault_id: &str, bearer_token: &str) -> &Self {
+    pub async fn with_stateful_personal_sync(
+        &self,
+        vault_id: &str,
+        bearer_token: &str,
+        principal_id: &str,
+    ) -> &Self {
         let state: Arc<Mutex<Option<StoredSyncBlob>>> = Arc::new(Mutex::new(None));
         let vault_id_owned = vault_id.to_string();
         let bearer_owned = bearer_token.to_string();
+        let principal_owned = principal_id.to_string();
+
+        Mock::given(method("GET"))
+            .and(path("/api/user/me"))
+            .and(header("authorization", format!("Bearer {bearer_token}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": principal_id,
+            })))
+            .expect(1)
+            .mount(&self.server)
+            .await;
 
         // GET responder — looks up state, returns blob if present.
         let get_state = Arc::clone(&state);
@@ -1620,6 +1949,7 @@ impl MockRegistry {
                 state: get_state,
                 vault_id: get_vault,
                 bearer_token: get_bearer,
+                principal_id: principal_owned.clone(),
             })
             .mount(&self.server)
             .await;
@@ -1632,6 +1962,7 @@ impl MockRegistry {
                 state: Arc::clone(&state),
                 bearer_token: bearer_owned,
                 vault_id: vault_id_owned,
+                principal_id: principal_owned,
             })
             .mount(&self.server)
             .await;
@@ -1669,7 +2000,10 @@ impl MockRegistry {
             .and(body_string_contains(format!("\"subject\":\"repo:{repo}\"")))
             .and(body_string_contains(format!(
                 "\"repositoryId\":\"{repository_id}\""
-            )));
+            )))
+            .and(body_string_contains(
+                "\"expectedPrincipalId\":\"account-1\"",
+            ));
 
         for branch in branches {
             mock = mock.and(body_string_contains(format!("\"{branch}\"")));
@@ -1714,7 +2048,10 @@ impl MockRegistry {
             )))
             .and(body_string_contains("\"allowedWorkflows\":[]"))
             .and(body_string_contains("\"allowedEvents\":[]"))
-            .and(body_string_contains("\"allowForks\":false"));
+            .and(body_string_contains("\"allowForks\":false"))
+            .and(body_string_contains(
+                "\"expectedPrincipalId\":\"account-1\"",
+            ));
 
         for branch in branches {
             mock = mock.and(body_string_contains(format!("\"{branch}\"")));
@@ -1763,6 +2100,8 @@ impl MockRegistry {
         project_id: &str,
         response: serde_json::Value,
     ) -> &Self {
+        self.with_platform_context_success(bearer_token, vault_id, platform)
+            .await;
         Mock::given(method("POST"))
             .and(path("/api/vault/platforms/connect"))
             .and(header("authorization", format!("Bearer {bearer_token}")))
@@ -1771,7 +2110,13 @@ impl MockRegistry {
             .and(body_string_contains(format!(
                 "\"projectId\":\"{project_id}\""
             )))
-            .respond_with(ResponseTemplate::new(200).set_body_json(response))
+            .and(body_string_contains(
+                "\"expectedPrincipalId\":\"account-1\"",
+            ))
+            .respond_with(SignedPlatformResponse {
+                body: response,
+                vault_id: vault_id.to_owned(),
+            })
             .expect(1)
             .mount(&self.server)
             .await;
@@ -1786,6 +2131,8 @@ impl MockRegistry {
         application_id: &str,
         response: serde_json::Value,
     ) -> &Self {
+        self.with_platform_context_success(bearer_token, vault_id, platform)
+            .await;
         Mock::given(method("POST"))
             .and(path("/api/vault/platforms/connect"))
             .and(header("authorization", format!("Bearer {bearer_token}")))
@@ -1794,7 +2141,13 @@ impl MockRegistry {
             .and(body_string_contains(format!(
                 "\"applicationId\":\"{application_id}\""
             )))
-            .respond_with(ResponseTemplate::new(200).set_body_json(response))
+            .and(body_string_contains(
+                "\"expectedPrincipalId\":\"account-1\"",
+            ))
+            .respond_with(SignedPlatformResponse {
+                body: response,
+                vault_id: vault_id.to_owned(),
+            })
             .expect(1)
             .mount(&self.server)
             .await;
@@ -1809,6 +2162,8 @@ impl MockRegistry {
         repository_id: &str,
         response: serde_json::Value,
     ) -> &Self {
+        self.with_platform_context_success(bearer_token, vault_id, "github-actions")
+            .await;
         Mock::given(method("POST"))
             .and(path("/api/vault/platforms/connect"))
             .and(header("authorization", format!("Bearer {bearer_token}")))
@@ -1820,7 +2175,13 @@ impl MockRegistry {
             .and(body_string_contains(format!(
                 "\"repositoryId\":\"{repository_id}\""
             )))
-            .respond_with(ResponseTemplate::new(200).set_body_json(response))
+            .and(body_string_contains(
+                "\"expectedPrincipalId\":\"account-1\"",
+            ))
+            .respond_with(SignedPlatformResponse {
+                body: response,
+                vault_id: vault_id.to_owned(),
+            })
             .expect(1)
             .mount(&self.server)
             .await;
@@ -1836,6 +2197,8 @@ impl MockRegistry {
         organization_id: &str,
         response: serde_json::Value,
     ) -> &Self {
+        self.with_platform_context_success(bearer_token, vault_id, "fly")
+            .await;
         Mock::given(method("POST"))
             .and(path("/api/vault/platforms/connect"))
             .and(header("authorization", format!("Bearer {bearer_token}")))
@@ -1846,7 +2209,13 @@ impl MockRegistry {
             .and(body_string_contains(format!(
                 "\"organizationId\":\"{organization_id}\""
             )))
-            .respond_with(ResponseTemplate::new(200).set_body_json(response))
+            .and(body_string_contains(
+                "\"expectedPrincipalId\":\"account-1\"",
+            ))
+            .respond_with(SignedPlatformResponse {
+                body: response,
+                vault_id: vault_id.to_owned(),
+            })
             .expect(1)
             .mount(&self.server)
             .await;
@@ -1870,19 +2239,38 @@ impl MockRegistry {
         response: serde_json::Value,
         expected_calls: u64,
     ) -> &Self {
-        let body = serde_json::to_string(&response).expect("platform credentials should serialize");
-        let signature = lpm_vault::signature::sign_body(body.as_bytes(), bearer_token);
         Mock::given(method("POST"))
             .and(path("/api/vault/platforms/credentials"))
             .and(header("authorization", format!("Bearer {bearer_token}")))
             .and(body_string_contains(format!("\"vaultId\":\"{vault_id}\"")))
-            .respond_with(
-                ResponseTemplate::new(200)
-                    .insert_header("content-type", "application/json")
-                    .insert_header(lpm_vault::signature::SIGNATURE_HEADER, signature.as_str())
-                    .set_body_string(body),
-            )
+            .and(PlatformContextOnlyMatcher(false))
+            .respond_with(SignedPlatformResponse {
+                body: response,
+                vault_id: vault_id.to_owned(),
+            })
             .expect(expected_calls)
+            .mount(&self.server)
+            .await;
+        self
+    }
+
+    pub async fn with_platform_context_success(
+        &self,
+        bearer_token: &str,
+        vault_id: &str,
+        platform: &str,
+    ) -> &Self {
+        Mock::given(method("POST"))
+            .and(path("/api/vault/platforms/credentials"))
+            .and(header("authorization", format!("Bearer {bearer_token}")))
+            .and(body_string_contains(format!("\"vaultId\":\"{vault_id}\"")))
+            .and(body_string_contains(format!("\"platform\":\"{platform}\"")))
+            .and(PlatformContextOnlyMatcher(true))
+            .respond_with(SignedPlatformResponse {
+                body: serde_json::json!({ "connections": [] }),
+                vault_id: vault_id.to_owned(),
+            })
+            .expect(1)
             .mount(&self.server)
             .await;
         self
@@ -2167,15 +2555,10 @@ impl MockRegistry {
         for (field, value) in expected_body_fields {
             mock = mock.and(body_string_contains(format!("\"{field}\":{value}")));
         }
-        let body = serde_json::to_string(&serde_json::json!({ "success": true }))
-            .expect("platform audit response should serialize");
-        let signature = lpm_vault::signature::sign_body(body.as_bytes(), bearer_token);
-        mock.respond_with(
-            ResponseTemplate::new(200)
-                .insert_header("content-type", "application/json")
-                .insert_header(lpm_vault::signature::SIGNATURE_HEADER, signature.as_str())
-                .set_body_string(body),
-        )
+        mock.respond_with(SignedPlatformResponse {
+            body: serde_json::json!({ "status": "recorded" }),
+            vault_id: vault_id.to_owned(),
+        })
         .expect(1)
         .mount(&self.server)
         .await;
@@ -2417,6 +2800,9 @@ impl MockRegistry {
             .and(header("authorization", format!("Bearer {bearer_token}")))
             .and(body_string_contains(format!("\"vaultId\":\"{vault_id}\"")))
             .and(body_string_contains("wrappingKeyHex"))
+            .and(body_string_contains(
+                "\"expectedPrincipalId\":\"account-1\"",
+            ))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "success": true,
             })))
@@ -2437,6 +2823,9 @@ impl MockRegistry {
             .and(path("/api/vault/oidc/escrow"))
             .and(header("authorization", format!("Bearer {bearer_token}")))
             .and(body_string_contains(format!("\"vaultId\":\"{vault_id}\"")))
+            .and(body_string_contains(
+                "\"expectedPrincipalId\":\"account-1\"",
+            ))
             .respond_with(ResponseTemplate::new(500).set_body_json(serde_json::json!({
                 "error": message,
             })))
@@ -3379,6 +3768,7 @@ struct StatefulSyncGetResponder {
     state: Arc<Mutex<Option<StoredSyncBlob>>>,
     vault_id: String,
     bearer_token: String,
+    principal_id: String,
 }
 
 impl Respond for StatefulSyncGetResponder {
@@ -3388,19 +3778,37 @@ impl Respond for StatefulSyncGetResponder {
             .lock()
             .expect("StatefulSyncGetResponder mutex poisoned")
             .clone();
+        if request
+            .url
+            .query_pairs()
+            .any(|(key, value)| key == "versionOnly" && value == "true")
+        {
+            let Some(blob) = stored.as_ref() else {
+                return signed_personal_missing_response(&self.vault_id, &self.principal_id, 0)
+                    .respond(request);
+            };
+            return signed_sync_response(
+                serde_json::json!({
+                    "version": blob.version,
+                    "principalId": self.principal_id,
+                }),
+                &self.bearer_token,
+                &self.vault_id,
+                TestSyncScope::Personal,
+            )
+            .respond(request);
+        }
         let Some(blob) = stored else {
-            // No prior POST — represent as 404 so the CLI surfaces a
-            // "vault has no payload yet" error rather than silently
-            // succeeding with an empty body.
-            return ResponseTemplate::new(404)
-                .insert_header("Content-Type", "application/json")
-                .set_body_string(r#"{"error":"vault has no synced state"}"#);
+            return signed_personal_missing_response(&self.vault_id, &self.principal_id, 0)
+                .respond(request);
         };
         signed_sync_response(
             serde_json::json!({
                 "encryptedBlob": blob.encrypted_blob,
                 "wrappedKey": blob.wrapped_key,
                 "version": blob.version,
+                "cryptoVersion": blob.crypto_version,
+                "principalId": self.principal_id,
             }),
             &self.bearer_token,
             &self.vault_id,
@@ -3414,6 +3822,7 @@ struct StatefulSyncPostResponder {
     state: Arc<Mutex<Option<StoredSyncBlob>>>,
     bearer_token: String,
     vault_id: String,
+    principal_id: String,
 }
 
 impl Respond for StatefulSyncPostResponder {
@@ -3433,20 +3842,32 @@ impl Respond for StatefulSyncPostResponder {
             .get("wrappedKey")
             .and_then(|v| v.as_str())
             .map(str::to_string);
-        let crypto_version = body_value
+        let Some(crypto_version) = body_value
             .get("cryptoVersion")
             .and_then(serde_json::Value::as_i64)
             .and_then(|version| i32::try_from(version).ok())
-            .unwrap_or(1);
+        else {
+            return ResponseTemplate::new(400)
+                .set_body_string(r#"{"error":"stateful sync POST: missing cryptoVersion"}"#);
+        };
+        let ciphertext_revision = body_value
+            .get("ciphertextRevision")
+            .and_then(serde_json::Value::as_i64)
+            .and_then(|revision| i32::try_from(revision).ok());
+        if body_value
+            .get("expectedPrincipalId")
+            .and_then(serde_json::Value::as_str)
+            != Some(self.principal_id.as_str())
+        {
+            return ResponseTemplate::new(409)
+                .set_body_string(r#"{"error":"stateful sync POST: principal mismatch"}"#);
+        }
         let (Some(encrypted_blob), Some(wrapped_key)) = (encrypted_blob, wrapped_key) else {
             return ResponseTemplate::new(400).set_body_string(
                 r#"{"error":"stateful sync POST: missing encryptedBlob or wrappedKey"}"#,
             );
         };
-        if !matches!(
-            crypto_version,
-            1 | lpm_vault::crypto::CURRENT_CRYPTO_VERSION
-        ) {
+        if crypto_version != lpm_vault::crypto::CURRENT_CRYPTO_VERSION {
             return ResponseTemplate::new(400)
                 .set_body_string(r#"{"error":"stateful sync POST: unsupported cryptoVersion"}"#);
         }
@@ -3456,6 +3877,12 @@ impl Respond for StatefulSyncPostResponder {
             .lock()
             .expect("StatefulSyncPostResponder mutex poisoned");
         let new_version = guard.as_ref().map_or(1, |b| b.version + 1);
+        if crypto_version == lpm_vault::crypto::CURRENT_CRYPTO_VERSION
+            && ciphertext_revision != Some(new_version)
+        {
+            return ResponseTemplate::new(409)
+                .set_body_string(r#"{"error":"stateful sync POST: ciphertextRevision mismatch"}"#);
+        }
         *guard = Some(StoredSyncBlob {
             encrypted_blob,
             wrapped_key,
@@ -3466,8 +3893,10 @@ impl Respond for StatefulSyncPostResponder {
 
         signed_sync_response(
             serde_json::json!({
-                "status": "updated",
+                "status": "synced",
                 "version": new_version,
+                "cryptoVersion": crypto_version,
+                "principalId": self.principal_id,
             }),
             &self.bearer_token,
             &self.vault_id,

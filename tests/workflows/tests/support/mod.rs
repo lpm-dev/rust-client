@@ -794,7 +794,6 @@ fn apply_lpm_env<S: LpmEnvSink>(cmd: &mut S, project: &TempProject) {
 
     // Force file-backed auth storage so workflow tests never touch the OS keychain.
     cmd.set_env("LPM_FORCE_FILE_AUTH", OsStr::new("1"));
-    cmd.set_env("LPM_TEST_FAST_SCRYPT", OsStr::new("1"));
     cmd.set_env("LPM_FORCE_FILE_VAULT", OsStr::new("1"));
     cmd.set_env("LPM_DISABLE_HOST_CLI_AUTH", OsStr::new("1"));
 

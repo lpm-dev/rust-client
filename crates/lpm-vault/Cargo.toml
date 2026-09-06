@@ -22,12 +22,12 @@ cap-std = "4.0.2"
 
 # Encryption
 aes-gcm = { workspace = true }
-scrypt = { workspace = true }
 base64 = { workspace = true }
+chrono = { workspace = true }
 sha2 = { workspace = true }
 x25519-dalek = { workspace = true }
+ed25519-dalek = { workspace = true }
 hkdf = { workspace = true }
-hmac = { workspace = true }
 
 # P-256 ECDH (dashboard device pairing — Web Crypto only supports P-256, not X25519)
 p256 = { workspace = true }
@@ -71,7 +71,6 @@ wiremock = "0.6"
 
 [features]
 acceptance-test-hooks = []
-legacy-macos-keychain = []
 
 [lints]
 workspace = true

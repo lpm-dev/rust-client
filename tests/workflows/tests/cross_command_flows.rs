@@ -1098,13 +1098,15 @@ async fn flow_env_push_pull_cross_machine_round_trip() {
 
     const VAULT_ID: &str = "flow-vault-cross-machine";
     const BEARER: &str = "flow-bearer-cross-machine";
+    const PRINCIPAL_ID: &str = "flow-account-cross-machine";
     const SECRET_VALUE: &str = "secret-from-machine-a-bytes";
 
     let machine_a = TempProject::empty(r#"{"name":"flow-env-machine-a","version":"0.0.0"}"#);
     let machine_b = TempProject::empty(r#"{"name":"flow-env-machine-b","version":"0.0.0"}"#);
 
     let mock = MockRegistry::start().await;
-    mock.with_stateful_personal_sync(VAULT_ID, BEARER).await;
+    mock.with_stateful_personal_sync(VAULT_ID, BEARER, PRINCIPAL_ID)
+        .await;
 
     // Seed both machines with the same paired-session shape that
     // `lpm env pair` would produce in real use — identical bearer
@@ -1115,7 +1117,7 @@ async fn flow_env_push_pull_cross_machine_round_trip() {
             &[SessionSeed {
                 registry_url: &mock.url(),
                 access_token: Some(BEARER),
-                refresh_token: None,
+                refresh_token: Some("flow-refresh-cross-machine"),
                 session_access_expires_at: Some("2099-01-01T00:00:00Z"),
             }],
         );

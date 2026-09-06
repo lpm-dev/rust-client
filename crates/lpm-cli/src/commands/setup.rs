@@ -103,9 +103,7 @@ async fn resolve_lpm_bearer(
     };
     let source = session.current_source()?;
     let storage = match source {
-        Some(lpm_auth::TokenSource::StoredSession | lpm_auth::TokenSource::StoredLegacy) => {
-            lpm_auth::auth_storage_status(registry_url)
-        }
+        Some(lpm_auth::TokenSource::StoredSession) => lpm_auth::auth_storage_status(registry_url),
         _ => lpm_auth::AuthStorageStatus::none(),
     };
     Ok(ResolvedSetupBearer {

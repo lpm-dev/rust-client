@@ -45,7 +45,7 @@ lpm-registry = { path = "../../crates/lpm-registry" }
 lpm-linker = { path = "../../crates/lpm-linker" }
 lpm-store = { path = "../../crates/lpm-store" }
 lpm-runner = { path = "../../crates/lpm-runner" }
-lpm-vault = { path = "../../crates/lpm-vault" }
+lpm-vault = { path = "../../crates/lpm-vault", features = ["acceptance-test-hooks"] }
 lpm-lockfile = { path = "../../crates/lpm-lockfile" }
 lpm-security = { path = "../../crates/lpm-security" }
 lpm-inspect = { path = "../../crates/lpm-inspect" }
@@ -60,7 +60,6 @@ toml = { workspace = true }
 aes-gcm = { workspace = true }
 base64 = { workspace = true }
 rand = { workspace = true }
-scrypt = { workspace = true }
 sha2 = "0.10"
 rmp-serde = { workspace = true }
 p256 = { workspace = true }

@@ -105,7 +105,7 @@ test("stable releases build a candidate before promotion creates the tag", () =>
   );
 });
 
-test("macOS release builds reuse dependency artifacts", () => {
+test("macOS release builds one current binary per target", () => {
   const workflow = read(".github/workflows/release.yml");
   const start = workflow.indexOf("\n  build:\n");
   const end = workflow.indexOf("\n  build-windows:\n", start + 1);
@@ -114,8 +114,10 @@ test("macOS release builds reuse dependency artifacts", () => {
   const build = workflow.slice(start, end);
 
   assert.doesNotMatch(build, /--target-dir target\/legacy-macos-keychain/);
-  assert.match(build, /Preserve provisioned macOS binary/);
-  assert.match(build, /--features legacy-macos-keychain/);
+  assert.match(build, /Preserve app-bundle macOS binary/);
+  assert.match(build, /Sign app bundle \(macOS\)/);
+  assert.doesNotMatch(build, /Sign raw binary|raw-notary/i);
+  assert.doesNotMatch(build, /--features legacy-macos-keychain/);
 });
 
 test("candidate runs require the fast macOS release preflight", () => {

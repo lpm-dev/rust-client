@@ -147,7 +147,7 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
     // ── id 2: lpm search <query> ──
     SurfaceV2 {
         id: 2,
-        scenarios: 3,
+        scenarios: 4,
         failure_modes_tested: &[
             "no-matches warn and exit zero",
             "long-description truncation in human output",
@@ -161,7 +161,7 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
             "search across paginated result sets",
         ],
         json_contract_depth: JsonContractDepth::InstaSnapshot,
-        scenarios_by_file: &[("tests/workflows/tests/search.rs", 3)],
+        scenarios_by_file: &[("tests/workflows/tests/search.rs", 4)],
         last_audited_at: "2026-05-14",
     },
     // ── id 3: lpm quality <pkg> ──
@@ -2271,10 +2271,12 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
     // ── id 103: lpm env share ──
     SurfaceV2 {
         id: 103,
-        scenarios: 2,
+        scenarios: 3,
         failure_modes_tested: &[
-            "share --force fails before vault or network access",
-            "share --force under --json emits error envelope on stdout",
+            "share --force requires a bound organization before network access",
+            "share --force unbound error uses the JSON envelope",
+            "share --force recreates only a missing bound organization env",
+            "share --force refuses an existing bound organization env without upload",
         ],
         failure_modes_known: &[
             "empty vault refusal under --json",
@@ -2283,7 +2285,7 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
             "sharing-key rotation-required refusal",
         ],
         json_contract_depth: JsonContractDepth::SemanticAsserts,
-        scenarios_by_file: &[("tests/workflows/tests/env_vault.rs", 2)],
+        scenarios_by_file: &[("tests/workflows/tests/env_vault.rs", 3)],
         last_audited_at: "2026-06-11",
     },
     // ── id 104: lpm env pair ──

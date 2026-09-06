@@ -73,10 +73,7 @@ pub async fn run(
             return rotation::env_rotate_sharing_key(client, &args, json_output).await;
         }
         "list-remote" | "ls-remote" => {
-            let org_flag = args
-                .iter()
-                .position(|a| *a == "--org")
-                .and_then(|i| args.get(i + 1).copied());
+            let org_flag = remote::parse_list_remote_org_slug(&args)?;
             return remote::vars_list_remote(client, org_flag, json_output).await;
         }
         "diff" => return remote::vars_diff(client, &args[1..], project_dir, json_output).await,
@@ -94,7 +91,10 @@ pub async fn run(
             return platform::vars_connect(client, &args[1..], project_dir, json_output).await;
         }
         "oidc" => return oidc::vars_oidc(client, &args[1..], project_dir, json_output).await,
-        "status" => return platform::vars_platform_status(client, project_dir, json_output).await,
+        "status" => {
+            return platform::vars_platform_status(client, &args[1..], project_dir, json_output)
+                .await;
+        }
         "pair" => return pairing::env_pair(client, &args[1..], json_output).await,
         "unpair" => return pairing::env_unpair(client, json_output).await,
         "init" => {
@@ -162,6 +162,21 @@ mod tests {
         assert_eq!(
             count, 0,
             "found {count} occurrence(s) of the old command surface in production code"
+        );
+    }
+
+    #[test]
+    fn env_control_plane_requires_refresh_backed_sessions() {
+        let retired_requirement = format!("AuthRequirement::{}Required", "Token");
+        let count: usize = PRODUCTION_SOURCES
+            .iter()
+            .map(|source| source.split("#[cfg(test)]").next().unwrap_or(source))
+            .map(|production_code| production_code.matches(&retired_requirement).count())
+            .sum();
+
+        assert_eq!(
+            count, 0,
+            "found {count} env control-plane call(s) that still accept non-session tokens"
         );
     }
 }

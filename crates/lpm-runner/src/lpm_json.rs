@@ -34,6 +34,10 @@ pub struct LpmJsonConfig {
     #[serde(default)]
     pub vault: Option<String>,
 
+    /// Optional display name used by vault sync when package.json has no name.
+    #[serde(default)]
+    pub name: Option<String>,
+
     /// Project-local cloud sync metadata maintained by `lpm env`.
     #[serde(default, rename = "vaultSync")]
     pub vault_sync: Option<VaultSyncConfig>,
@@ -140,8 +144,8 @@ where
 }
 
 /// Cloud sync metadata maintained by `lpm env`.
-#[derive(Debug, Clone, Deserialize, schemars::JsonSchema)]
-#[serde(rename_all = "camelCase")]
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 #[schemars(deny_unknown_fields)]
 pub struct VaultSyncConfig {
     #[serde(default)]
@@ -155,6 +159,94 @@ pub struct VaultSyncConfig {
 
     #[serde(default)]
     pub org_synced_at: HashMap<String, String>,
+
+    #[serde(default)]
+    /// Registry property names must equal their canonical runtime URL representation. The 2,048
+    /// limit is measured in UTF-8 bytes; JSON Schema can validate URI shape but not canonical form.
+    #[schemars(extend(
+        "maxProperties" = 64,
+        "propertyNames" = {"type": "string", "minLength": 1, "maxLength": 2048, "pattern": "^https?://"}
+    ))]
+    pub personal_platform_bindings: Option<HashMap<String, VaultSyncPrincipalBinding>>,
+
+    #[serde(default)]
+    pub authority_checkpoints: Option<VaultSyncAuthorityCheckpoints>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct VaultSyncPrincipalBinding {
+    /// The runtime requires a canonical HTTP(S) URL with no credentials, query, fragment, or
+    /// trailing slash. The 2,048 limit is measured in UTF-8 bytes at runtime.
+    #[schemars(
+        length(min = 1, max = 2048),
+        extend("format" = "uri", "pattern" = "^https?://")
+    )]
+    pub registry_url: String,
+
+    /// The runtime limit is 128 UTF-8 bytes, which is stricter than JSON Schema `maxLength` for
+    /// multibyte Unicode values.
+    #[schemars(
+        length(min = 1, max = 128),
+        regex(pattern = r"^[^\x00-\x1F\x7F-\x9F]+$")
+    )]
+    pub principal_id: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct VaultSyncAuthorityCheckpoint {
+    #[schemars(range(min = 1, max = 2_147_483_647))]
+    pub version: i32,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(with = "String")]
+    pub synced_at: Option<String>,
+}
+
+/// Per-principal checkpoints for one Registry. The runtime also enforces one global limit of 64
+/// checkpoint leaves across every personal and organization Registry map.
+#[derive(Debug, Clone, Default, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(transparent)]
+pub struct VaultSyncPrincipalCheckpoints(
+    #[schemars(extend(
+        "maxProperties" = 64,
+        "propertyNames" = {"type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[^\\u0000-\\u001F\\u007F-\\u009F]+$"}
+    ))]
+    pub HashMap<String, VaultSyncAuthorityCheckpoint>,
+);
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(transparent)]
+pub struct VaultSyncRegistryCheckpoints(
+    /// Registry property names must also equal their canonical runtime URL representation. JSON
+    /// Schema can validate URI shape but cannot express URL canonicalization.
+    #[schemars(extend(
+        "maxProperties" = 64,
+        "propertyNames" = {
+            "type": "string",
+            "format": "uri",
+            "minLength": 1,
+            "maxLength": 2048,
+            "pattern": "^https?://"
+        }
+    ))]
+    pub HashMap<String, VaultSyncPrincipalCheckpoints>,
+);
+
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+#[schemars(deny_unknown_fields)]
+pub struct VaultSyncAuthorityCheckpoints {
+    #[serde(default)]
+    pub personal: VaultSyncRegistryCheckpoints,
+
+    #[serde(default)]
+    #[schemars(extend(
+        "maxProperties" = 64,
+        "propertyNames" = {"type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[^\\u0000-\\u001F\\u007F-\\u009F]+$"}
+    ))]
+    pub organizations: HashMap<String, VaultSyncRegistryCheckpoints>,
 }
 
 /// Hosted cache configuration in `lpm.json`.

@@ -14,7 +14,7 @@ use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
 use rand::RngCore;
 use std::path::{Path, PathBuf};
 
-const FIXED_ENCRYPTION_KEY: &str = "workflow-test-auth-key-0123456789abcdefghijklmnopqrstuvwxyzAB";
+const FIXED_ENCRYPTION_KEY: [u8; 32] = [0x4a; 32];
 
 #[derive(Debug, Clone, Default)]
 pub struct SessionSeed<'a> {
@@ -28,7 +28,6 @@ pub fn seed_sessions(home: &Path, sessions: &[SessionSeed<'_>]) {
     let lpm_dir = lpm_dir(home);
     std::fs::create_dir_all(&lpm_dir).expect("failed to create ~/.lpm test dir");
     write_fixed_key(&lpm_dir);
-    write_fixed_salt(&lpm_dir);
 
     let mut credentials = serde_json::Map::new();
     let mut expiries = serde_json::Map::new();
@@ -63,8 +62,12 @@ pub fn seed_sessions(home: &Path, sessions: &[SessionSeed<'_>]) {
     }
 
     if !credentials.is_empty() {
-        let encrypted = encrypt_store(&serde_json::Value::Object(credentials));
+        let credential_store = serde_json::Value::Object(credentials);
+        let encrypted = encrypt_store(&credential_store);
         std::fs::write(credentials_path(home), encrypted).expect("failed to write credentials");
+        write_credential_authority(home, &credential_store);
+    } else {
+        write_credential_authority(home, &serde_json::json!({}));
     }
 
     if !expiries.is_empty() {
@@ -95,10 +98,16 @@ pub fn write_credentials_store(home: &Path, store: &serde_json::Value) {
     let lpm_dir = lpm_dir(home);
     std::fs::create_dir_all(&lpm_dir).expect("failed to create ~/.lpm test dir");
     write_fixed_key(&lpm_dir);
-    write_fixed_salt(&lpm_dir);
 
     let encrypted = encrypt_store(store);
     std::fs::write(credentials_path(home), encrypted).expect("failed to write credentials file");
+    write_credential_authority(home, store);
+}
+
+pub fn overwrite_credentials_store_preserving_authority(home: &Path, store: &serde_json::Value) {
+    let encrypted = encrypt_store(store);
+    std::fs::write(credentials_path(home), encrypted)
+        .expect("failed to overwrite credentials file");
 }
 
 pub fn read_expiry_metadata(home: &Path) -> serde_json::Value {
@@ -139,25 +148,56 @@ fn lpm_dir(home: &Path) -> PathBuf {
     home.join(".lpm")
 }
 
-fn write_fixed_key(lpm_dir: &Path) {
-    std::fs::write(lpm_dir.join(".key"), FIXED_ENCRYPTION_KEY).expect("failed to write key");
+fn write_credential_authority(home: &Path, store: &serde_json::Value) {
+    use sha2::{Digest, Sha256};
+
+    let mut credentials = serde_json::Map::new();
+    if let Some(entries) = store.as_object() {
+        for (file_key, value) in entries {
+            let Some(token) = value.as_str() else {
+                continue;
+            };
+            let (kind, registry) = file_key
+                .strip_prefix("refresh:")
+                .map_or(("access", file_key.as_str()), |registry| {
+                    ("refresh", registry)
+                });
+            let mut credential_id = Sha256::new();
+            credential_id.update(kind.as_bytes());
+            credential_id.update([0]);
+            credential_id.update(registry.as_bytes());
+            credentials.insert(
+                hex::encode(credential_id.finalize()),
+                serde_json::json!({
+                    "state": "active",
+                    "backend": "encrypted_file_fallback",
+                    "credential_digest": hex::encode(Sha256::digest(token.as_bytes())),
+                    "stale_file_cleanup_pending": false,
+                }),
+            );
+        }
+    }
+    std::fs::write(
+        lpm_dir(home).join(".credential-authority.json"),
+        serde_json::to_vec(&serde_json::json!({
+            "version": 1,
+            "credentials": credentials,
+        }))
+        .expect("failed to encode credential authority"),
+    )
+    .expect("failed to write credential authority");
 }
 
-fn write_fixed_salt(lpm_dir: &Path) {
-    std::fs::write(lpm_dir.join(".salt"), [7u8; 32]).expect("failed to write salt");
+fn write_fixed_key(lpm_dir: &Path) {
+    std::fs::write(
+        lpm_dir.join(".key"),
+        format!("raw:{}", hex::encode(FIXED_ENCRYPTION_KEY)),
+    )
+    .expect("failed to write key");
 }
 
 fn derive_key() -> [u8; 32] {
-    use sha2::{Digest, Sha256};
-
-    let mut hasher = Sha256::new();
-    hasher.update(FIXED_ENCRYPTION_KEY.as_bytes());
-    hasher.update([7u8; 32]);
-    let digest = hasher.finalize();
-
-    let mut key = [0u8; 32];
-    key.copy_from_slice(&digest);
-    key
+    FIXED_ENCRYPTION_KEY
 }
 
 fn encrypt_store(value: &serde_json::Value) -> String {

@@ -16,7 +16,6 @@ lpm-workspace = { workspace = true }
 # Secure storage primitives
 keyring = { workspace = true }
 aes-gcm = { workspace = true }
-scrypt = { workspace = true }
 rand = { workspace = true }
 base64 = { workspace = true }
 dirs = { workspace = true }

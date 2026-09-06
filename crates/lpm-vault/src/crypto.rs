@@ -8,13 +8,6 @@
 //! - Both encrypted blob and wrapped key stored on server
 //! - On pull: load wrapping key → unwrap AES key → decrypt
 //!
-//! ## Legacy migration
-//! - Old versions derived wrapping key from `SHA256("lpm-vault-wrap:" + auth_token)`
-//! - On decrypt failure with the stored key, the legacy key is tried as a fallback
-//! - If the legacy key works, the caller (`pull` / `pull_raw`) re-encrypts with
-//!   the stored key and pushes back on the same call, converging without user action.
-//!   Migration push is best-effort: failures are logged and retried on the next pull.
-//!
 //! ## Org sync
 //! - X25519 keypairs per user
 //! - AES key per vault, wrapped with each member's X25519 public key (ECIES-like)
@@ -22,7 +15,7 @@
 
 use aes_gcm::{
     Aes256Gcm, KeyInit,
-    aead::{Aead, Payload, generic_array::GenericArray},
+    aead::{AeadInPlace, generic_array::GenericArray},
 };
 use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
 use hkdf::Hkdf;
@@ -36,13 +29,13 @@ const VAULT_KEY_SERVICE: &str = "dev.lpm.vault-key";
 /// Keyring account name for the vault wrapping key.
 const VAULT_KEY_ACCOUNT: &str = "wrapping-key";
 
-/// Current encrypted vault payload protocol. Version 1 has no associated
-/// data; version 2 binds ciphertext to its personal or organization context.
-pub const CURRENT_CRYPTO_VERSION: i32 = 2;
+/// Current encrypted vault payload protocol. Version 3 binds ciphertext to
+/// its ownership context and committed server revision.
+pub const CURRENT_CRYPTO_VERSION: i32 = 3;
 
 const SYNC_AAD_DOMAIN: &[u8] = b"lpm-vault-sync";
 
-/// Ownership scope authenticated by a protocol-v2 vault payload.
+/// Ownership scope authenticated by a current vault payload.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum VaultScope<'a> {
     /// A personal vault. The organization slug is encoded as empty.
@@ -54,8 +47,8 @@ pub enum VaultScope<'a> {
 /// Get or create the vault wrapping key, independent of any auth token.
 ///
 /// All platforms serialize first-use key selection with the vault transaction
-/// lock. On macOS, shared-Keychain failures fail closed. An exact legacy file
-/// is retained during the compatibility window; divergent copies fail closed.
+/// lock. On macOS, shared-Keychain failures fail closed. Other platforms use
+/// the owner-only file fallback only when their credential service is unavailable.
 pub fn get_or_create_wrapping_key() -> Result<[u8; 32], String> {
     #[cfg(debug_assertions)]
     if let Ok(error) = std::env::var("LPM_TEST_VAULT_WRAPPING_KEY_ERROR") {
@@ -74,49 +67,40 @@ fn get_or_create_wrapping_key_unlocked(
         return get_or_create_wrapping_key_file(directory, &candidate);
     }
 
-    // macOS shared-Keychain failures are authorization or integrity errors and
-    // must fail closed. Other platforms retain their historical fallback when
-    // their credential service is unavailable.
-    let keyring_key = apply_keyring_read_policy(try_read_wrapping_key_from_keyring())?;
-    if let Some(key) = keyring_key {
-        if let Some(legacy) = read_wrapping_key_from_file(directory)?
-            && legacy != key
-        {
-            return Err(
-                "the protected and legacy-file vault wrapping keys conflict; both were preserved"
-                    .to_owned(),
-            );
-        }
-        return Ok(key);
-    }
-
-    if let Some(key) = read_wrapping_key_from_file(directory)? {
-        #[cfg(target_os = "macos")]
-        let stored = get_or_insert_wrapping_key_in_keyring(&key)?;
-
-        #[cfg(not(target_os = "macos"))]
-        let stored = store_and_read_wrapping_key_from_keyring(&key).unwrap_or(key);
-        if stored != key {
-            return Err(
-                "the protected and legacy-file vault wrapping keys conflict; both were preserved"
-                    .to_owned(),
-            );
-        }
-        return Ok(stored);
-    }
-
-    let mut candidate = [0u8; 32];
-    rand::thread_rng().fill_bytes(&mut candidate);
-
     #[cfg(target_os = "macos")]
-    return get_or_insert_wrapping_key_in_keyring(&candidate);
+    {
+        if let Some(key) = try_read_wrapping_key_from_keyring()? {
+            return Ok(key);
+        }
+        let mut candidate = [0u8; 32];
+        rand::thread_rng().fill_bytes(&mut candidate);
+        get_or_insert_wrapping_key_in_keyring(&candidate)
+    }
 
     #[cfg(not(target_os = "macos"))]
-    match store_and_read_wrapping_key_from_keyring(&candidate) {
-        Ok(stored) => Ok(stored),
-        Err(error) => {
-            tracing::debug!(%error, "system keyring write unavailable; using owner-only vault-key file");
-            get_or_create_wrapping_key_file(directory, &candidate)
+    {
+        match try_read_wrapping_key_from_keyring() {
+            Ok(Some(key)) => return Ok(key),
+            Ok(None) => {}
+            Err(error) => {
+                tracing::warn!(
+                    error = %error,
+                    "system keyring is unavailable; using the owner-only vault-key file fallback"
+                );
+                let mut candidate = [0u8; 32];
+                rand::thread_rng().fill_bytes(&mut candidate);
+                return get_or_create_wrapping_key_file(directory, &candidate);
+            }
+        }
+
+        let mut candidate = [0u8; 32];
+        rand::thread_rng().fill_bytes(&mut candidate);
+        match store_and_read_wrapping_key_from_keyring(&candidate) {
+            Ok(stored) => Ok(stored),
+            Err(error) => {
+                tracing::debug!(%error, "system keyring write unavailable; using owner-only vault-key file");
+                get_or_create_wrapping_key_file(directory, &candidate)
+            }
         }
     }
 }
@@ -130,29 +114,6 @@ fn get_or_insert_wrapping_key_in_keyring(candidate: &[u8; 32]) -> Result<[u8; 32
         &encoded,
     )?;
     decode_wrapping_key(&stored)
-}
-
-fn apply_keyring_read_policy(
-    result: Result<Option<[u8; 32]>, String>,
-) -> Result<Option<[u8; 32]>, String> {
-    apply_keyring_read_policy_for(result, cfg!(target_os = "macos"))
-}
-
-fn apply_keyring_read_policy_for(
-    result: Result<Option<[u8; 32]>, String>,
-    fail_closed: bool,
-) -> Result<Option<[u8; 32]>, String> {
-    match result {
-        Ok(key) => Ok(key),
-        Err(error) if fail_closed => Err(error),
-        Err(error) => {
-            tracing::warn!(
-                error = %error,
-                "system keyring is unavailable; trying the existing vault-key file fallback"
-            );
-            Ok(None)
-        }
-    }
 }
 
 fn force_file_wrapping_key() -> bool {
@@ -260,34 +221,21 @@ fn get_or_create_wrapping_key_file(
     })
 }
 
-/// Legacy: derive a wrapping key from the auth token.
-///
-/// Kept only for migration — old vaults may have keys wrapped with this.
-/// New code should use [`get_or_create_wrapping_key`] instead.
-///
-/// M12: this derivation has no forward secrecy. A stale bearer token
-/// captured by any side channel (process argv, log scrape, keychain
-/// leak) decrypts every pre-migration vault blob that bearer ever
-/// wrapped. The migration path in [`decrypt_vault_from_sync`] re-
-/// encrypts under the stored wrapping key on next push, but until
-/// that push runs the legacy blob remains decryptable. Operators
-/// should rotate any stored bearer that has been observed by other
-/// processes and re-push the vault.
-pub fn derive_legacy_wrapping_key(auth_token: &str) -> [u8; 32] {
-    let mut hasher = Sha256::new();
-    hasher.update(b"lpm-vault-wrap:");
-    hasher.update(auth_token.as_bytes());
-    let result = hasher.finalize();
-    let mut key = [0u8; 32];
-    key.copy_from_slice(&result);
-    key
-}
-
 /// Generate a random 256-bit AES key.
 pub fn generate_aes_key() -> [u8; 32] {
     let mut key = [0u8; 32];
     rand::thread_rng().fill_bytes(&mut key);
     key
+}
+
+pub fn next_sync_revision(previous: Option<i32>) -> Result<i32, String> {
+    let previous = previous.unwrap_or(0);
+    if previous < 0 {
+        return Err("vault revision cannot be negative".to_string());
+    }
+    previous
+        .checked_add(1)
+        .ok_or_else(|| "vault revision overflow".to_string())
 }
 
 /// Encrypt plaintext with AES-256-GCM.
@@ -311,21 +259,26 @@ fn encrypt_with_associated_data(
     let mut iv = [0u8; 12];
     rand::thread_rng().fill_bytes(&mut iv);
     let nonce = GenericArray::from_slice(&iv);
-    let ciphertext = cipher
-        .encrypt(
-            nonce,
-            Payload {
-                msg: plaintext,
-                aad: associated_data,
-            },
-        )
+    let mut ciphertext = Vec::with_capacity(plaintext.len().saturating_add(16));
+    ciphertext.extend_from_slice(plaintext);
+    cipher
+        .encrypt_in_place(nonce, associated_data, &mut ciphertext)
         .map_err(|e| format!("encrypt: {e}"))?;
 
-    Ok(format!(
-        "{}:{}",
-        BASE64.encode(iv),
-        BASE64.encode(&ciphertext)
-    ))
+    let iv_length = base64::encoded_len(iv.len(), true)
+        .ok_or_else(|| "encrypted IV is too large to encode".to_owned())?;
+    let ciphertext_length = base64::encoded_len(ciphertext.len(), true)
+        .ok_or_else(|| "encrypted payload is too large to encode".to_owned())?;
+    let mut encoded = String::with_capacity(
+        iv_length
+            .checked_add(1)
+            .and_then(|length| length.checked_add(ciphertext_length))
+            .ok_or_else(|| "encrypted payload is too large to encode".to_owned())?,
+    );
+    BASE64.encode_string(iv, &mut encoded);
+    encoded.push(':');
+    BASE64.encode_string(&ciphertext, &mut encoded);
+    Ok(encoded)
 }
 
 fn decrypt_with_associated_data(
@@ -333,16 +286,15 @@ fn decrypt_with_associated_data(
     encoded: &str,
     associated_data: &[u8],
 ) -> Result<Vec<u8>, String> {
-    let parts: Vec<&str> = encoded.splitn(2, ':').collect();
-    if parts.len() != 2 {
-        return Err("invalid encrypted format".to_string());
-    }
+    let (encoded_iv, encoded_ciphertext) = encoded
+        .split_once(':')
+        .ok_or_else(|| "invalid encrypted format".to_owned())?;
 
     let iv = BASE64
-        .decode(parts[0])
+        .decode(encoded_iv)
         .map_err(|e| format!("iv decode: {e}"))?;
-    let ciphertext = BASE64
-        .decode(parts[1])
+    let mut ciphertext = BASE64
+        .decode(encoded_ciphertext)
         .map_err(|e| format!("data decode: {e}"))?;
 
     if iv.len() != 12 {
@@ -353,20 +305,17 @@ fn decrypt_with_associated_data(
     let nonce = GenericArray::from_slice(&iv);
 
     cipher
-        .decrypt(
-            nonce,
-            Payload {
-                msg: ciphertext.as_slice(),
-                aad: associated_data,
-            },
-        )
-        .map_err(|_| "decryption failed (wrong key or corrupted)".to_string())
+        .decrypt_in_place(nonce, associated_data, &mut ciphertext)
+        .map_err(|_| "decryption failed (wrong key or corrupted)".to_string())?;
+    Ok(ciphertext)
 }
 
 /// Construct the canonical binary associated data for a vault payload.
 pub fn sync_associated_data(
     scope: VaultScope<'_>,
+    principal_id: &str,
     vault_id: &str,
+    revision: i32,
     crypto_version: i32,
 ) -> Result<Vec<u8>, String> {
     if crypto_version != CURRENT_CRYPTO_VERSION {
@@ -374,7 +323,16 @@ pub fn sync_associated_data(
             "unsupported vault crypto version: {crypto_version}"
         ));
     }
-
+    let revision = u64::try_from(revision)
+        .ok()
+        .filter(|revision| *revision > 0)
+        .ok_or_else(|| "vault revision must be positive".to_string())?;
+    if principal_id.is_empty() {
+        return Err("vault principal ID cannot be empty".to_string());
+    }
+    let principal_id = principal_id.as_bytes();
+    let principal_id_len = u32::try_from(principal_id.len())
+        .map_err(|_| "vault principal ID is too long for sync encryption".to_string())?;
     let vault_id = vault_id.as_bytes();
     let vault_id_len = u32::try_from(vault_id.len())
         .map_err(|_| "vault ID is too long for sync encryption".to_string())?;
@@ -386,49 +344,91 @@ pub fn sync_associated_data(
         .map_err(|_| "organization slug is too long for sync encryption".to_string())?;
 
     let mut aad = Vec::with_capacity(
-        SYNC_AAD_DOMAIN.len() + 1 + 4 + 1 + 4 + vault_id.len() + 4 + org_slug.len(),
+        SYNC_AAD_DOMAIN.len()
+            + 1
+            + 4
+            + 1
+            + 4
+            + principal_id.len()
+            + 4
+            + vault_id.len()
+            + 4
+            + org_slug.len()
+            + 8,
     );
     aad.extend_from_slice(SYNC_AAD_DOMAIN);
     aad.push(0);
     aad.extend_from_slice(&(crypto_version as u32).to_be_bytes());
     aad.push(scope_byte);
+    aad.extend_from_slice(&principal_id_len.to_be_bytes());
+    aad.extend_from_slice(principal_id);
     aad.extend_from_slice(&vault_id_len.to_be_bytes());
     aad.extend_from_slice(vault_id);
     aad.extend_from_slice(&org_slug_len.to_be_bytes());
     aad.extend_from_slice(org_slug);
+    aad.extend_from_slice(&revision.to_be_bytes());
     Ok(aad)
 }
 
-/// Encrypt a vault content payload using protocol v2 associated data.
+/// Encrypt a vault content payload using versioned associated data.
 pub fn encrypt_vault_payload(
     key: &[u8; 32],
     plaintext: &[u8],
     scope: VaultScope<'_>,
+    principal_id: &str,
     vault_id: &str,
+    revision: i32,
 ) -> Result<String, String> {
-    let aad = sync_associated_data(scope, vault_id, CURRENT_CRYPTO_VERSION)?;
+    let aad = sync_associated_data(
+        scope,
+        principal_id,
+        vault_id,
+        revision,
+        CURRENT_CRYPTO_VERSION,
+    )?;
     encrypt_with_associated_data(key, plaintext, &aad)
 }
 
-/// Decrypt a versioned vault content payload. Protocol v2 never falls back to
-/// the unbound v1 format when authentication fails.
+/// Decrypt a current vault content payload.
 pub fn decrypt_vault_payload(
     key: &[u8; 32],
     encoded: &str,
     scope: VaultScope<'_>,
+    principal_id: &str,
     vault_id: &str,
+    revision: i32,
     crypto_version: i32,
 ) -> Result<Vec<u8>, String> {
-    match crypto_version {
-        1 => decrypt(key, encoded),
-        CURRENT_CRYPTO_VERSION => {
-            let aad = sync_associated_data(scope, vault_id, crypto_version)?;
-            decrypt_with_associated_data(key, encoded, &aad)
-        }
-        _ => Err(format!(
+    if crypto_version != CURRENT_CRYPTO_VERSION {
+        return Err(format!(
             "unsupported vault crypto version: {crypto_version}"
-        )),
+        ));
     }
+    let aad = sync_associated_data(scope, principal_id, vault_id, revision, crypto_version)?;
+    decrypt_with_associated_data(key, encoded, &aad)
+}
+
+/// Authenticates a versioned payload without retaining its plaintext.
+pub fn authenticate_vault_payload(
+    key: &[u8; 32],
+    encoded: &str,
+    scope: VaultScope<'_>,
+    principal_id: &str,
+    vault_id: &str,
+    revision: i32,
+    crypto_version: i32,
+) -> Result<(), String> {
+    let mut plaintext = decrypt_vault_payload(
+        key,
+        encoded,
+        scope,
+        principal_id,
+        vault_id,
+        revision,
+        crypto_version,
+    )?;
+    plaintext.fill(0);
+    Ok(())
 }
 
 /// Wrap an AES key with a wrapping key (AES-256-GCM key wrap).
@@ -456,7 +456,9 @@ pub fn unwrap_key(wrapping_key: &[u8; 32], wrapped: &str) -> Result<[u8; 32], St
 /// Uses the stored wrapping key (keyring or file), independent of auth token.
 pub fn encrypt_vault_for_sync(
     secrets_json: &str,
+    principal_id: &str,
     vault_id: &str,
+    revision: i32,
 ) -> Result<(String, String), String> {
     let aes_key = generate_aes_key();
     let wrapping_key = get_or_create_wrapping_key()?;
@@ -465,7 +467,9 @@ pub fn encrypt_vault_for_sync(
         &aes_key,
         secrets_json.as_bytes(),
         VaultScope::Personal,
+        principal_id,
         vault_id,
+        revision,
     )?;
     let wrapped_key = wrap_key(&wrapping_key, &aes_key)?;
 
@@ -474,77 +478,35 @@ pub fn encrypt_vault_for_sync(
 
 /// Decrypt vault secrets JSON from sync.
 ///
-/// Tries the stored wrapping key first. On failure, falls back to the legacy
-/// token-derived key for migration. If the legacy key works, returns the
-/// decrypted data (the caller should re-encrypt and re-push with the new key).
+/// Authenticated sync accepts only the current revision-bound protocol and the
+/// stable stored wrapping key.
 pub fn decrypt_vault_from_sync(
-    auth_token: &str,
     encrypted_blob: &str,
     wrapped_key: &str,
+    principal_id: &str,
     vault_id: &str,
+    revision: i32,
     crypto_version: i32,
-) -> Result<DecryptResult, String> {
-    if !matches!(crypto_version, 1 | CURRENT_CRYPTO_VERSION) {
+) -> Result<String, String> {
+    if crypto_version != CURRENT_CRYPTO_VERSION {
         return Err(format!(
             "unsupported vault crypto version: {crypto_version}"
         ));
     }
 
-    // Try new stored wrapping key first
-    if let Ok(wrapping_key) = get_or_create_wrapping_key()
-        && let Ok(aes_key) = unwrap_key(&wrapping_key, wrapped_key)
-    {
-        let plaintext = decrypt_vault_payload(
-            &aes_key,
-            encrypted_blob,
-            VaultScope::Personal,
-            vault_id,
-            crypto_version,
-        )?;
-        let text = String::from_utf8(plaintext).map_err(|e| format!("utf8 error: {e}"))?;
-        return Ok(DecryptResult {
-            plaintext: text,
-            needs_reencrypt: crypto_version == 1,
-        });
-    }
-
-    // Fall back to legacy token-derived key
-    let legacy_key = derive_legacy_wrapping_key(auth_token);
-    let aes_key = unwrap_key(&legacy_key, wrapped_key)
-        .map_err(|_| "decryption failed with both new and legacy keys".to_string())?;
+    let wrapping_key = get_or_create_wrapping_key()?;
+    let aes_key = unwrap_key(&wrapping_key, wrapped_key)
+        .map_err(|_| "decryption failed with stored wrapping key".to_owned())?;
     let plaintext = decrypt_vault_payload(
         &aes_key,
         encrypted_blob,
         VaultScope::Personal,
+        principal_id,
         vault_id,
+        revision,
         crypto_version,
     )?;
-    let text = String::from_utf8(plaintext).map_err(|e| format!("utf8 error: {e}"))?;
-
-    // M12: a legacy decryption succeeded — the blob was wrapped with
-    // SHA256("lpm-vault-wrap:" + auth_token), which has no forward
-    // secrecy. Surface the posture loudly so an operator scanning
-    // logs sees the migration window and rotates the bearer if it
-    // has been exposed anywhere (process argv pre-H4, CI log leak,
-    // backup), in addition to the implicit re-encrypt that happens
-    // on the next push.
-    tracing::warn!(
-        "vault decrypted with legacy token-derived key (no forward secrecy) — re-encrypting under stored key on next push. If the bearer that decrypted this blob has been exposed to other processes / logs / backups, rotate it before any peer can capture the same blob.",
-    );
-
-    Ok(DecryptResult {
-        plaintext: text,
-        needs_reencrypt: true,
-    })
-}
-
-/// Result of vault decryption, indicating whether migration is needed.
-pub struct DecryptResult {
-    /// The decrypted plaintext.
-    pub plaintext: String,
-    /// If true, the vault used either the legacy token-derived wrapping key
-    /// or an unbound protocol-v1 payload and should be re-encrypted.
-    pub needs_reencrypt: bool,
+    String::from_utf8(plaintext).map_err(|e| format!("utf8 error: {e}"))
 }
 
 // ── X25519 Org Sync ───────────────────────────────────────────────
@@ -574,6 +536,16 @@ fn derive_org_wrapping_key(shared_secret: &[u8; 32]) -> [u8; 32] {
     okm
 }
 
+pub(crate) fn validate_contributory_x25519_public_key(public_key: &[u8; 32]) -> Result<(), String> {
+    let test_secret = X25519Secret::from([0x42; 32]);
+    let shared = test_secret.diffie_hellman(&X25519PublicKey::from(*public_key));
+    if shared.was_contributory() {
+        Ok(())
+    } else {
+        Err("X25519 public key is non-contributory".to_owned())
+    }
+}
+
 /// Wrap an AES-256 key for a specific recipient using ECIES-like scheme.
 ///
 /// 1. Generate ephemeral X25519 keypair
@@ -595,6 +567,9 @@ pub fn wrap_key_for_recipient(
     // ECDH → shared secret
     let recipient_pk = X25519PublicKey::from(*recipient_public);
     let shared = ephemeral_secret.diffie_hellman(&recipient_pk);
+    if !shared.was_contributory() {
+        return Err("recipient X25519 public key is non-contributory".to_owned());
+    }
 
     // Derive wrapping key via HKDF
     let wrapping_key = derive_org_wrapping_key(shared.as_bytes());
@@ -637,6 +612,9 @@ pub fn unwrap_key_from_sender(wrapped: &str, private_key: &[u8; 32]) -> Result<[
     let my_secret = X25519Secret::from(*private_key);
     let their_public = X25519PublicKey::from(eph_pub);
     let shared = my_secret.diffie_hellman(&their_public);
+    if !shared.was_contributory() {
+        return Err("sender X25519 public key is non-contributory".to_owned());
+    }
 
     // Derive wrapping key via HKDF
     let wrapping_key = derive_org_wrapping_key(shared.as_bytes());
@@ -663,7 +641,7 @@ pub fn unwrap_key_from_sender(wrapped: &str, private_key: &[u8; 32]) -> Result<[
 // while org sync continues to use X25519.
 
 const PAIRING_ENCRYPTION_INFO: &[u8] = b"lpm-dashboard-pair";
-const PAIRING_SAS_INFO: &[u8] = b"lpm-pair-sas-v2";
+const PAIRING_SAS_INFO: &[u8] = b"lpm-pair-sas-v3";
 
 /// Ephemeral P-256 exchange used by the two-phase browser pairing protocol.
 /// The same secret stages the public key, derives the displayed SAS, and
@@ -762,29 +740,6 @@ impl P256PairingKeyExchange {
     }
 }
 
-/// Compatibility wrapper for protocol-v1 servers.
-pub fn p256_pair_wrap_key(
-    wrapping_key: &[u8; 32],
-    browser_public_key_b64: &str,
-) -> Result<(String, String), String> {
-    let exchange = P256PairingKeyExchange::new(browser_public_key_b64)?;
-    let encrypted = exchange.wrap_key(wrapping_key)?;
-    Ok((encrypted, exchange.ephemeral_public_key_b64().to_string()))
-}
-
-/// Protocol-v1 compatibility SAS used when an older server omits protocol
-/// metadata.
-pub fn legacy_pairing_match_number(pairing_code: &str, browser_public_key_b64: &str) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(b"lpm-pair-sas:");
-    hasher.update(pairing_code.as_bytes());
-    hasher.update(b":");
-    hasher.update(browser_public_key_b64.as_bytes());
-    let digest = hasher.finalize();
-    let value = u16::from_be_bytes([digest[0], digest[1]]) % 100;
-    format!("{value:02}")
-}
-
 /// Short visual fingerprint of the browser's public key, computed from the
 /// bytes the CLI is about to wrap for. Returns the first eight bytes of
 /// `SHA-256(base64-decoded pubkey)` formatted as `xx:xx:xx:xx:xx:xx:xx:xx`
@@ -810,36 +765,6 @@ pub fn browser_key_fingerprint(browser_public_key_b64: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn non_macos_keyring_backend_error_keeps_the_file_wrapping_key_reachable() {
-        let file_key = [7_u8; 32];
-        let selected =
-            apply_keyring_read_policy_for(Err("credential service unavailable".into()), false)
-                .unwrap()
-                .or(Some(file_key));
-
-        assert_eq!(selected, Some(file_key));
-    }
-
-    #[test]
-    fn non_macos_malformed_keyring_value_keeps_the_file_wrapping_key_reachable() {
-        let file_key = [11_u8; 32];
-        let selected =
-            apply_keyring_read_policy_for(Err("not valid hexadecimal data".into()), false)
-                .unwrap()
-                .or(Some(file_key));
-
-        assert_eq!(selected, Some(file_key));
-    }
-
-    #[test]
-    fn macos_keyring_errors_remain_fail_closed() {
-        let error =
-            apply_keyring_read_policy_for(Err("missing entitlement".into()), true).unwrap_err();
-
-        assert_eq!(error, "missing entitlement");
-    }
 
     /// Hermetic test environment for wrapping-key tests.
     ///
@@ -988,28 +913,65 @@ mod tests {
     }
 
     #[test]
-    fn protocol_v2_aad_matches_cross_language_organization_vector() {
+    fn protocol_v3_aad_matches_cross_language_organization_vector() {
         let aad = sync_associated_data(
             VaultScope::Organization("acme"),
+            "00000000-0000-4000-8000-000000000002",
             "vault-123",
+            42,
             CURRENT_CRYPTO_VERSION,
         )
         .unwrap();
 
         assert_eq!(
             hex::encode(aad),
-            "6c706d2d7661756c742d73796e63000000000202000000097661756c742d3132330000000461636d65"
+            "6c706d2d7661756c742d73796e630000000003020000002430303030303030302d303030302d343030302d383030302d303030303030303030303032000000097661756c742d3132330000000461636d65000000000000002a"
         );
     }
 
     #[test]
-    fn protocol_v2_rejects_payload_copied_to_another_vault_id() {
+    fn retired_protocol_v2_aad_is_rejected() {
+        let error = sync_associated_data(
+            VaultScope::Organization("acme"),
+            "organization-1",
+            "vault-123",
+            42,
+            2,
+        )
+        .expect_err("protocol v2 must not remain executable");
+
+        assert_eq!(error, "unsupported vault crypto version: 2");
+    }
+
+    #[test]
+    fn retired_protocol_v2_ciphertext_is_rejected() {
+        let key = [7u8; 32];
+        let encrypted = "AAECAwQFBgcICQoL:Y6O9P1ZMl2tNkIn5hTkPg8xKhKxl9uKHropxD+YNLHW+9WfVwQ==";
+
+        let error = decrypt_vault_payload(
+            &key,
+            encrypted,
+            VaultScope::Organization("acme"),
+            "organization-1",
+            "vault-123",
+            42,
+            2,
+        )
+        .expect_err("protocol v2 must not remain decryptable");
+
+        assert_eq!(error, "unsupported vault crypto version: 2");
+    }
+
+    #[test]
+    fn protocol_v3_rejects_payload_copied_to_another_vault_id() {
         let key = generate_aes_key();
         let encrypted = encrypt_vault_payload(
             &key,
             br#"{"TOKEN":"secret"}"#,
             VaultScope::Personal,
+            "user-1",
             "vault-a",
+            1,
         )
         .unwrap();
 
@@ -1018,7 +980,63 @@ mod tests {
                 &key,
                 &encrypted,
                 VaultScope::Personal,
+                "user-1",
                 "vault-b",
+                1,
+                CURRENT_CRYPTO_VERSION,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn protocol_v3_rejects_payload_copied_to_another_principal() {
+        let key = generate_aes_key();
+        let encrypted = encrypt_vault_payload(
+            &key,
+            br#"{"TOKEN":"secret"}"#,
+            VaultScope::Personal,
+            "user-a",
+            "vault-a",
+            1,
+        )
+        .unwrap();
+
+        assert!(
+            decrypt_vault_payload(
+                &key,
+                &encrypted,
+                VaultScope::Personal,
+                "user-b",
+                "vault-a",
+                1,
+                CURRENT_CRYPTO_VERSION,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn same_vault_ciphertext_cannot_be_replayed_under_a_newer_revision() {
+        let key = generate_aes_key();
+        let encrypted_at_revision_one = encrypt_vault_payload(
+            &key,
+            br#"{"TOKEN":"old"}"#,
+            VaultScope::Personal,
+            "user-1",
+            "vault-a",
+            1,
+        )
+        .unwrap();
+
+        assert!(
+            decrypt_vault_payload(
+                &key,
+                &encrypted_at_revision_one,
+                VaultScope::Personal,
+                "user-1",
+                "vault-a",
+                2,
                 CURRENT_CRYPTO_VERSION,
             )
             .is_err()
@@ -1034,12 +1052,14 @@ mod tests {
             &key,
             &legacy,
             VaultScope::Personal,
+            "user-1",
             "vault-a",
+            1,
             CURRENT_CRYPTO_VERSION + 1,
         )
         .unwrap_err();
 
-        assert_eq!(error, "unsupported vault crypto version: 3");
+        assert_eq!(error, "unsupported vault crypto version: 4");
     }
 
     #[test]
@@ -1065,20 +1085,9 @@ mod tests {
     fn wrapping_key_independent_of_token() {
         let _env = IsolatedVaultEnv::new();
 
-        // The wrapping key comes from keyring/file storage, not from any token.
-        // Verify that two different "tokens" don't affect the stored key.
         let key1 = get_or_create_wrapping_key().unwrap();
         let key2 = get_or_create_wrapping_key().unwrap();
         assert_eq!(key1, key2, "wrapping key must be stable across calls");
-
-        // Legacy keys for different tokens should differ (proving independence)
-        let legacy_a = derive_legacy_wrapping_key("token_a");
-        let legacy_b = derive_legacy_wrapping_key("token_b");
-        assert_ne!(legacy_a, legacy_b);
-
-        // The stored key should not equal either legacy key
-        assert_ne!(key1, legacy_a);
-        assert_ne!(key1, legacy_b);
     }
 
     #[cfg(debug_assertions)]
@@ -1115,47 +1124,79 @@ mod tests {
 
         let secrets = r#"{"DB_HOST":"localhost","API_KEY":"sk-123"}"#;
 
-        let (blob, wrapped) = encrypt_vault_for_sync(secrets, "vault-123").unwrap();
-        // auth_token is passed for legacy fallback but shouldn't be needed
+        let (blob, wrapped) = encrypt_vault_for_sync(secrets, "user-123", "vault-123", 1).unwrap();
         let result = decrypt_vault_from_sync(
-            "any_token",
             &blob,
             &wrapped,
+            "user-123",
             "vault-123",
+            1,
             CURRENT_CRYPTO_VERSION,
         )
         .unwrap();
 
-        assert_eq!(result.plaintext, secrets);
+        assert_eq!(result, secrets);
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    fn network_sync_decryptor_rejects_legacy_payload() {
+        let _env = IsolatedVaultEnv::new();
+
+        let secrets = r#"{"LEGACY":"data"}"#;
+
+        let retired_wrapping_key = [0x17; 32];
+        let aes_key = generate_aes_key();
+        let encrypted_blob = encrypt(&aes_key, secrets.as_bytes()).unwrap();
+        let wrapped_key = wrap_key(&retired_wrapping_key, &aes_key).unwrap();
+
+        let error = decrypt_vault_from_sync(
+            &encrypted_blob,
+            &wrapped_key,
+            "user-legacy",
+            "legacy-vault",
+            1,
+            1,
+        )
+        .expect_err("network sync must reject revision-unbound legacy ciphertext");
+
         assert!(
-            !result.needs_reencrypt,
-            "should not need re-encrypt with new key"
+            error.contains("unsupported vault crypto version"),
+            "{error}"
         );
     }
 
     #[cfg(debug_assertions)]
     #[test]
-    fn vault_sync_legacy_migration() {
+    fn current_payload_rejects_a_content_key_wrapped_by_an_unrelated_key() {
         let _env = IsolatedVaultEnv::new();
 
-        // Simulate a vault encrypted with the old token-derived key
-        let token = "lpm_old_token_123";
-        let secrets = r#"{"LEGACY":"data"}"#;
-
-        let legacy_key = derive_legacy_wrapping_key(token);
+        let vault_id = "vault-context-bound";
+        let revision = 7;
+        let plaintext = br#"{"SECRET":"value"}"#;
+        let unrelated_wrapping_key = [0x2a; 32];
         let aes_key = generate_aes_key();
-        let encrypted_blob = encrypt(&aes_key, secrets.as_bytes()).unwrap();
-        let wrapped_key = wrap_key(&legacy_key, &aes_key).unwrap();
+        let wrapped_key = wrap_key(&unrelated_wrapping_key, &aes_key).unwrap();
+        let encrypted_blob = encrypt_vault_payload(
+            &aes_key,
+            plaintext,
+            VaultScope::Personal,
+            "user-context-bound",
+            vault_id,
+            revision,
+        )
+        .unwrap();
 
-        // Decrypt should fall back to legacy and flag re-encrypt
-        let result =
-            decrypt_vault_from_sync(token, &encrypted_blob, &wrapped_key, "legacy-vault", 1)
-                .unwrap();
-        assert_eq!(result.plaintext, secrets);
-        assert!(
-            result.needs_reencrypt,
-            "legacy-decrypted vault should need re-encrypt"
+        let result = decrypt_vault_from_sync(
+            &encrypted_blob,
+            &wrapped_key,
+            "user-context-bound",
+            vault_id,
+            revision,
+            CURRENT_CRYPTO_VERSION,
         );
+
+        assert!(result.is_err());
     }
 
     #[cfg(debug_assertions)]
@@ -1165,34 +1206,19 @@ mod tests {
 
         // Encrypt with new stored key
         let secrets = r#"{"KEY":"value"}"#;
-        let (blob, wrapped) = encrypt_vault_for_sync(secrets, "vault-rotation").unwrap();
+        let (blob, wrapped) =
+            encrypt_vault_for_sync(secrets, "user-rotation", "vault-rotation", 1).unwrap();
 
-        // Decrypt with a completely different "token" — should still work
-        // because the new key is token-independent
         let result = decrypt_vault_from_sync(
-            "completely_different_token",
             &blob,
             &wrapped,
+            "user-rotation",
             "vault-rotation",
+            1,
             CURRENT_CRYPTO_VERSION,
         )
         .unwrap();
-        assert_eq!(result.plaintext, secrets);
-        assert!(!result.needs_reencrypt);
-    }
-
-    #[test]
-    fn legacy_wrapping_key_deterministic() {
-        let a = derive_legacy_wrapping_key("lpm_abc");
-        let b = derive_legacy_wrapping_key("lpm_abc");
-        assert_eq!(a, b);
-    }
-
-    #[test]
-    fn legacy_wrapping_key_different_tokens() {
-        let a = derive_legacy_wrapping_key("lpm_abc");
-        let b = derive_legacy_wrapping_key("lpm_def");
-        assert_ne!(a, b);
+        assert_eq!(result, secrets);
     }
 
     // ── X25519 tests ──
@@ -1229,6 +1255,26 @@ mod tests {
     }
 
     #[test]
+    fn x25519_wrap_rejects_non_contributory_recipient() {
+        let aes_key = generate_aes_key();
+        assert!(wrap_key_for_recipient(&aes_key, &[0; 32]).is_err());
+    }
+
+    #[test]
+    fn x25519_unwrap_rejects_non_contributory_sender() {
+        let aes_key = generate_aes_key();
+        let wrapping_key = derive_org_wrapping_key(&[0; 32]);
+        let wrapped = format!(
+            "{}:{}",
+            BASE64.encode([0; 32]),
+            encrypt(&wrapping_key, &aes_key).unwrap()
+        );
+        let (private_key, _) = generate_x25519_keypair();
+
+        assert!(unwrap_key_from_sender(&wrapped, &private_key).is_err());
+    }
+
+    #[test]
     fn x25519_different_wrap_each_time() {
         let aes_key = generate_aes_key();
         let (_, pub_key) = generate_x25519_keypair();
@@ -1251,13 +1297,15 @@ mod tests {
         use elliptic_curve::sec1::ToEncodedPoint;
         let browser_pub_b64 = BASE64.encode(browser_public.to_encoded_point(false).as_bytes());
 
-        let (encrypted, eph_pub_b64) = p256_pair_wrap_key(&wrapping_key, &browser_pub_b64).unwrap();
+        let exchange = P256PairingKeyExchange::new(&browser_pub_b64).unwrap();
+        let encrypted = exchange.wrap_key(&wrapping_key).unwrap();
+        let eph_pub_b64 = exchange.ephemeral_public_key_b64();
 
         // Verify encrypted format: base64(iv):base64(ciphertext)
         assert!(encrypted.contains(':'));
 
         // Verify ephemeral public key is valid uncompressed P-256 (65 bytes: 04 || x || y)
-        let eph_bytes = BASE64.decode(&eph_pub_b64).unwrap();
+        let eph_bytes = BASE64.decode(eph_pub_b64).unwrap();
         assert_eq!(eph_bytes.len(), 65);
         assert_eq!(eph_bytes[0], 0x04);
     }
@@ -1276,10 +1324,12 @@ mod tests {
         let browser_pub_b64 = BASE64.encode(browser_public.to_encoded_point(false).as_bytes());
 
         // CLI wraps
-        let (encrypted, eph_pub_b64) = p256_pair_wrap_key(&wrapping_key, &browser_pub_b64).unwrap();
+        let exchange = P256PairingKeyExchange::new(&browser_pub_b64).unwrap();
+        let encrypted = exchange.wrap_key(&wrapping_key).unwrap();
+        let eph_pub_b64 = exchange.ephemeral_public_key_b64();
 
         // Browser-side: ECDH with ephemeral public key → same shared secret → same derived key
-        let eph_bytes = BASE64.decode(&eph_pub_b64).unwrap();
+        let eph_bytes = BASE64.decode(eph_pub_b64).unwrap();
         let eph_pub = p256::PublicKey::from_sec1_bytes(&eph_bytes).unwrap();
 
         let shared_secret = diffie_hellman(browser_secret.to_nonzero_scalar(), eph_pub.as_affine());
@@ -1308,14 +1358,18 @@ mod tests {
                 .as_bytes(),
         );
 
-        let (enc_a, eph_a) = p256_pair_wrap_key(&wrapping_key, &browser_pub_b64).unwrap();
-        let (enc_b, eph_b) = p256_pair_wrap_key(&wrapping_key, &browser_pub_b64).unwrap();
+        let exchange_a = P256PairingKeyExchange::new(&browser_pub_b64).unwrap();
+        let exchange_b = P256PairingKeyExchange::new(&browser_pub_b64).unwrap();
+        let enc_a = exchange_a.wrap_key(&wrapping_key).unwrap();
+        let enc_b = exchange_b.wrap_key(&wrapping_key).unwrap();
+        let eph_a = exchange_a.ephemeral_public_key_b64();
+        let eph_b = exchange_b.ephemeral_public_key_b64();
         assert_ne!(enc_a, enc_b); // Different ephemeral key each time
         assert_ne!(eph_a, eph_b);
     }
 
     #[test]
-    fn protocol_v2_pairing_sas_is_eight_grouped_digits() {
+    fn protocol_v3_pairing_sas_is_eight_grouped_digits() {
         use elliptic_curve::sec1::ToEncodedPoint;
         use p256::SecretKey as P256SecretKey;
 
@@ -1355,7 +1409,7 @@ mod tests {
     }
 
     #[test]
-    fn protocol_v2_pairing_sas_is_deterministic_for_same_exchange() {
+    fn protocol_v3_pairing_sas_is_deterministic_for_same_exchange() {
         use elliptic_curve::sec1::ToEncodedPoint;
         use p256::SecretKey as P256SecretKey;
         let browser_secret = P256SecretKey::random(&mut rand::thread_rng());
@@ -1373,7 +1427,7 @@ mod tests {
     }
 
     #[test]
-    fn protocol_v2_pairing_sas_matches_browser_web_crypto_vector() {
+    fn protocol_v3_pairing_sas_matches_browser_web_crypto_vector() {
         use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 
         let browser_public = "BHxVGUyrg6Aqn2QCLhpKWxgxAKl8Fzge710Mk4EjOXaWb+2NIrZXsDeew/kaCDoKLvQ74/ux0Jrp4ZdVoFq98Go=";
@@ -1387,11 +1441,11 @@ mod tests {
             exchange.ephemeral_public_key_b64(),
             "BMWROJBAxLxAGItA6oI/47ay4MyHaC8FRvahmthBlzyLNbhic0DB/NZyzCGIgjXhOBsBsPk0WcP2U32il8d2HZE="
         );
-        assert_eq!(exchange.short_authentication_string("ABC123"), "9190 5834");
+        assert_eq!(exchange.short_authentication_string("ABC123"), "2108 4449");
     }
 
     #[test]
-    fn protocol_v2_pairing_sas_changes_with_cli_ephemeral_secret() {
+    fn protocol_v3_pairing_sas_changes_with_cli_ephemeral_secret() {
         use elliptic_curve::sec1::ToEncodedPoint;
         use p256::SecretKey as P256SecretKey;
         let browser_secret = P256SecretKey::random(&mut rand::thread_rng());
@@ -1411,7 +1465,7 @@ mod tests {
     }
 
     #[test]
-    fn protocol_v2_pairing_sas_changes_when_code_changes() {
+    fn protocol_v3_pairing_sas_changes_when_code_changes() {
         use elliptic_curve::sec1::ToEncodedPoint;
         use p256::SecretKey as P256SecretKey;
         let browser_secret = P256SecretKey::random(&mut rand::thread_rng());
