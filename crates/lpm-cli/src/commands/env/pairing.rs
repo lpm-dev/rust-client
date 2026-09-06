@@ -54,6 +54,7 @@ fn parse_pair_args(args: &[&str]) -> Result<PairArgs, LpmError> {
 /// server-side facts that help spot a stranger's session.
 struct PairConfirmationView {
     code: String,
+    protocol_version: u8,
     fingerprint: Option<String>,
     match_number: String,
     device_label: Option<String>,
@@ -70,6 +71,7 @@ impl PairConfirmationView {
     ) -> Self {
         Self {
             code: code.to_string(),
+            protocol_version: session.protocol_version,
             fingerprint: lpm_vault::crypto::browser_key_fingerprint(browser_pub_b64),
             match_number,
             device_label: session
@@ -106,7 +108,11 @@ fn print_pair_confirmation(view: &PairConfirmationView) {
         "{}",
         install_ui::terminal_line!(
             "  {}",
-            install_ui::bold("Pair this browser for env access?")
+            install_ui::bold(if view.protocol_version == 4 {
+                "Pair this browser for organization env access?"
+            } else {
+                "Pair this browser for personal env access?"
+            })
         )
     );
     println!();
@@ -269,8 +275,12 @@ pub(super) async fn env_pair(
         .clone()
         .ok_or_else(|| LpmError::Script("server did not return browser public key".into()))?;
 
-    let exchange = lpm_vault::crypto::P256PairingKeyExchange::new(&browser_pub_b64)
-        .map_err(LpmError::Script)?;
+    let protocol_version = session.protocol_version;
+    let exchange = lpm_vault::crypto::P256PairingKeyExchange::new_for_protocol(
+        &browser_pub_b64,
+        protocol_version,
+    )
+    .map_err(LpmError::Script)?;
     let ephemeral = exchange.ephemeral_public_key_b64().to_string();
     super::auth::execute_sync_with_bearer(client, |registry_url, auth_token| {
         let code = parsed.code.clone();
@@ -280,8 +290,11 @@ pub(super) async fn env_pair(
             lpm_vault::sync::stage_pairing(
                 &registry_url,
                 &auth_token,
-                &code,
-                &expected_principal_id,
+                &lpm_vault::sync::PairingRequest {
+                    code: &code,
+                    expected_principal_id: &expected_principal_id,
+                    protocol_version,
+                },
                 &ephemeral,
             )
             .await
@@ -298,8 +311,28 @@ pub(super) async fn env_pair(
     print_pair_confirmation(&view);
     confirm_pairing(&parsed)?;
 
-    let wrapping_key = lpm_vault::crypto::get_or_create_wrapping_key().map_err(LpmError::Script)?;
-    let encrypted = exchange.wrap_key(&wrapping_key).map_err(LpmError::Script)?;
+    let mut wrapping_key = if protocol_version == 4 {
+        super::auth::execute_sync_with_bearer(client, |registry_url, auth_token| {
+            let expected_principal_id = expected_principal_id.clone();
+            async move {
+                let current = lpm_vault::sync::get_my_public_key_state(&registry_url, &auth_token).await?;
+                if current.principal_id != expected_principal_id {
+                    return Err("authenticated account changed before organization pairing".into());
+                }
+                let scope = lpm_vault::sync::SharingKeyScope::new(&registry_url, &expected_principal_id)?;
+                let local = lpm_vault::sync::resolve_local_public_key_state(&scope)?;
+                if current.public_key_b64.as_deref() != Some(local.public_key_b64.as_str()) {
+                    return Err("this device does not have the registered organization sharing key; run `lpm env pull --org <organization>` on your trusted device before pairing".into());
+                }
+                Ok(local.private_key)
+            }
+        }).await?
+    } else {
+        lpm_vault::crypto::get_or_create_wrapping_key().map_err(LpmError::Script)?
+    };
+    let encrypted = exchange.wrap_key(&wrapping_key);
+    wrapping_key.fill(0);
+    let encrypted = encrypted.map_err(LpmError::Script)?;
     super::auth::execute_sync_with_bearer(client, |registry_url, auth_token| {
         let code = parsed.code.clone();
         let expected_principal_id = expected_principal_id.clone();
@@ -309,8 +342,11 @@ pub(super) async fn env_pair(
             lpm_vault::sync::approve_pairing(
                 &registry_url,
                 &auth_token,
-                &code,
-                &expected_principal_id,
+                &lpm_vault::sync::PairingRequest {
+                    code: &code,
+                    expected_principal_id: &expected_principal_id,
+                    protocol_version,
+                },
                 &encrypted,
                 &ephemeral,
             )

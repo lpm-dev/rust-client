@@ -65,6 +65,7 @@ rmp-serde = { workspace = true }
 p256 = { workspace = true }
 hex = { workspace = true }
 hmac = { workspace = true }
+hkdf = { workspace = true }
 
 # Workflows-local copy of the `socket-probe` test bin so
 # `cargo test -p lpm-workflows` (and CI's `--workspace` run) builds it as
