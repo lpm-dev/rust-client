@@ -116,7 +116,7 @@ pub(crate) struct InstallArgs {
     /// Override the minimumReleaseAge cooldown for this install only.
     /// Accepts `<N>h` (hours), `<N>d` (days), or plain `<N>` seconds.
     /// Use `0` to disable the cooldown for this invocation; any other
-    /// value tightens or loosens the window vs. the default 24h /
+    /// value tightens or loosens the window vs. the disabled default /
     /// `package.json > lpm > minimumReleaseAge` /
     /// `~/.lpm/config.toml` key `minimum-release-age-secs`.
     ///

@@ -351,6 +351,7 @@ async fn dlx_applies_project_release_age_policy_and_guards_min_release_age_overr
     let project = TempProject::empty(
         r#"{"name":"dlx-release-age","version":"1.0.0","lpm":{"minimumReleaseAge":259200}}"#,
     );
+    support::write_signed_release_age_exclusion_posture(&project, &[]);
     let mock = MockRegistry::start().await;
     let published_at = iso8601_n_secs_ago(48 * 3600);
     mount_published_dlx_tool(&mock, "dlx-fresh-tool", "1.0.0", &published_at).await;

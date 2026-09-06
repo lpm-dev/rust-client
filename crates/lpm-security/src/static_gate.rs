@@ -2263,8 +2263,8 @@ mod tests {
     const DAY_SECS: u64 = 24 * 60 * 60;
 
     #[test]
-    fn lever4_recent_publish_stays_amber_under_default_cooldown() {
-        // Default 24h cooldown + 1h-old publish + matching identity.
+    fn lever4_recent_publish_stays_amber_under_configured_cooldown() {
+        // Configured 24h cooldown + 1h-old publish + matching identity.
         // Without the cooldown check, identity-match widened → Green
         // → script auto-ran, collapsing the script-tier review for
         // `--allow-new` users. With it, stays Amber so prompt fires.

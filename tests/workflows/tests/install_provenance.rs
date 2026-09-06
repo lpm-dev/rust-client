@@ -559,6 +559,10 @@ async fn install_legitimate_release_bump_does_not_drift() {
 async fn install_allow_new_requires_security_approval_before_drift_gate() {
     let project = TempProject::empty("");
     write_manifest_without_approval(&project);
+    support::lpm(&project)
+        .args(["config", "release-age", "--set", "1d"])
+        .assert()
+        .success();
     let mock = MockRegistry::start().await;
     mount_package_version(&mock, CANDIDATE_VERSION, AttestationShape::NoField).await;
     let out = lpm_with_registry(&project, &mock.url())

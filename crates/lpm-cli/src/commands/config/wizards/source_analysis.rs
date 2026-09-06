@@ -24,12 +24,12 @@ pub(in crate::commands::config) async fn run_source_analysis_wizard(
             .item(
                 "true",
                 "enabled",
-                "default; analyze extracted package bytes and maintain the local cache",
+                "analyze extracted package bytes and maintain the local cache",
             )
             .item(
                 "false",
                 "disabled",
-                "defer behavioral source analysis until `lpm audit`",
+                "default; defer behavioral source analysis until `lpm audit`",
             )
             .initial_value(if current { "true" } else { "false" })
             .interact()
@@ -40,7 +40,10 @@ pub(in crate::commands::config) async fn run_source_analysis_wizard(
     };
 
     update_config(config_path, |config| {
-        if !enabled && crate::security_floor::force_security_floor_enabled(config) {
+        if !enabled
+            && crate::security_floor::force_security_floor_enabled(config)
+            && crate::source_analysis_config::read_install_time_source_analysis(config)?
+        {
             return Err(crate::security_floor::security_floor_write_error(
                 INSTALL_TIME_SOURCE_ANALYSIS_KEY,
                 "false",

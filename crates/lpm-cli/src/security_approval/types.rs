@@ -165,7 +165,7 @@ fn default_firewall_mode_string() -> String {
 }
 
 fn default_install_time_source_analysis() -> bool {
-    true
+    crate::source_analysis_config::DEFAULT_INSTALL_TIME_SOURCE_ANALYSIS
 }
 
 impl Default for AuthorizedPosture {

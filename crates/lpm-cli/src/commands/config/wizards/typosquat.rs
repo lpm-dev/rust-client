@@ -29,7 +29,7 @@ impl TyposquatGuardSelection {
     }
 
     pub(crate) fn disables_guard(self) -> bool {
-        matches!(self, Self::Off)
+        matches!(self, Self::Default | Self::Off)
     }
 
     pub(crate) fn loosens(self, floor: Self) -> bool {
@@ -38,9 +38,8 @@ impl TyposquatGuardSelection {
 
     fn rank(self) -> u8 {
         match self {
-            Self::Off => 0,
-            Self::Default => 1,
-            Self::On => 2,
+            Self::Default | Self::Off => 0,
+            Self::On => 1,
         }
     }
 }
@@ -70,22 +69,22 @@ pub(in crate::commands::config) async fn run_typosquat_wizard(
         let new_value: &str = cliclack::select("How should LPM handle suspicious package names?")
             .item(
                 "default",
-                "default — enabled unless the product default changes",
-                "recommended",
+                "default — disabled unless the product default changes",
+                "follows the product default",
             )
             .item(
                 "on",
                 "on — always run the guard",
                 "ignores diagnostic env opt-outs",
             )
-            .item("off", "off — skip typosquat analysis", "NOT recommended")
+            .item("off", "off — skip typosquat analysis", "always disabled")
             .initial_value(current.as_str())
             .interact()
             .map_err(prompt_err)?;
         parse_typosquat_guard_selection(new_value)?
     };
 
-    if set.is_none() && selection.disables_guard() {
+    if set.is_none() && selection == TyposquatGuardSelection::Off {
         println!();
         println!(
             "  {}: setting typosquat-guard = {} disables suspicious-name checks for every \
@@ -175,7 +174,7 @@ pub(in crate::commands::config) fn format_current_typosquat_guard(
     current: Option<TyposquatGuardSelection>,
 ) -> String {
     match current {
-        None | Some(TyposquatGuardSelection::Default) => "default (enabled)".to_string(),
+        None | Some(TyposquatGuardSelection::Default) => "default (disabled)".to_string(),
         Some(selection) => selection.as_str().to_string(),
     }
 }

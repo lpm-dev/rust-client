@@ -130,7 +130,7 @@ fn security_status_json_defaults_to_project_target() {
     );
     assert_eq!(
         envelope["status"]["effective_floor"]["install_time_source_analysis"],
-        serde_json::json!(true)
+        serde_json::json!(false)
     );
     assert_eq!(
         envelope["status"]["floor_sources"]["install_time_source_analysis"],
@@ -196,7 +196,7 @@ fn security_status_human_reports_install_time_source_analysis_and_source() {
         .find(|line| line.contains("install-time source analysis"));
     assert!(
         source_analysis_row
-            .is_some_and(|line| { line.contains("true") && line.contains("(builtin-default)") }),
+            .is_some_and(|line| { line.contains("false") && line.contains("(builtin-default)") }),
         "security status must show the install-time source analysis value and source, got:\n{stdout}",
     );
 }

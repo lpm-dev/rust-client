@@ -223,7 +223,18 @@ fn typosquat_guard_disabled(project_dir: &Path, json_output: bool) -> Result<boo
     {
         return Ok(true);
     }
-    Ok(false)
+    if global
+        .get_value(crate::commands::config::TYPOSQUAT_GUARD_KEY)
+        .is_some()
+    {
+        return Ok(false);
+    }
+    Ok(
+        crate::security_approval::load_effective_authorized_posture()?
+            .posture
+            .typosquat_guard()
+            .disables_guard(),
+    )
 }
 
 fn typosquat_guard_env_disable_allowed(
@@ -701,8 +712,9 @@ mod tests {
         (dir, env)
     }
 
-    fn scoped_empty_lpm_home() -> (tempfile::TempDir, crate::test_env::ScopedEnv) {
+    fn scoped_enabled_lpm_home() -> (tempfile::TempDir, crate::test_env::ScopedEnv) {
         let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("config.toml"), "typosquat-guard = \"on\"\n").unwrap();
         let env = crate::test_env::ScopedEnv::update([
             ("LPM_HOME", Some(dir.path().as_os_str().to_owned())),
             (
@@ -788,7 +800,7 @@ mod tests {
     }
 
     #[test]
-    fn typosquat_guard_global_config_default_overrides_env_disable() {
+    fn typosquat_guard_global_config_default_disables_analysis() {
         let dir = tempfile::tempdir().unwrap();
         fs::write(
             dir.path().join("config.toml"),
@@ -806,7 +818,7 @@ mod tests {
         ]);
         let project = tempfile::tempdir().unwrap();
 
-        assert!(!typosquat_guard_disabled(project.path(), true).unwrap());
+        assert!(typosquat_guard_disabled(project.path(), true).unwrap());
     }
 
     #[test]
@@ -826,6 +838,7 @@ mod tests {
                 OsString::from("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
             ),
         ]);
+        approve_typosquat_guard(crate::commands::config::TyposquatGuardSelection::On);
         let project = tempfile::tempdir().unwrap();
 
         assert!(!typosquat_guard_disabled(project.path(), true).unwrap());
@@ -953,7 +966,7 @@ mod tests {
 
     #[test]
     fn guard_explicit_specs_returns_rewritten_suggestion_in_json_mode_error() {
-        let (_home, _env) = scoped_empty_lpm_home();
+        let (_home, _env) = scoped_enabled_lpm_home();
         let dir = tempfile::tempdir().unwrap();
         let specs = vec!["axois@^1".to_string()];
         let err = guard_explicit_package_specs(
@@ -999,7 +1012,7 @@ mod tests {
 
     #[test]
     fn explicit_guard_rejects_when_package_is_new_for_one_target_root() {
-        let (_home, _env) = scoped_empty_lpm_home();
+        let (_home, _env) = scoped_enabled_lpm_home();
         let root_a = tempfile::tempdir().unwrap();
         let root_b = tempfile::tempdir().unwrap();
         let mut lockfile = lpm_lockfile::Lockfile::new();
@@ -1029,7 +1042,7 @@ mod tests {
 
     #[test]
     fn explicit_guard_skips_when_package_is_locked_for_every_target_root() {
-        let (_home, _env) = scoped_empty_lpm_home();
+        let (_home, _env) = scoped_enabled_lpm_home();
         let root_a = tempfile::tempdir().unwrap();
         let root_b = tempfile::tempdir().unwrap();
         for root in [root_a.path(), root_b.path()] {
@@ -1115,7 +1128,7 @@ mod tests {
 
     #[test]
     fn manifest_guard_skips_direct_dependency_already_in_lockfile() {
-        let (_home, _env) = scoped_empty_lpm_home();
+        let (_home, _env) = scoped_enabled_lpm_home();
         let dir = tempfile::tempdir().unwrap();
         let mut lockfile = lpm_lockfile::Lockfile::new();
         lockfile.importers.insert(

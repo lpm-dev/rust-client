@@ -134,7 +134,7 @@ pub(crate) struct L3Outcome {
     #[serde(default)]
     pub(crate) age_secs: Option<u64>,
     /// Whether `cooldown_block` would have fired under the default
-    /// `SecurityPolicy::DEFAULT_MIN_RELEASE_AGE` (24h). The audit uses
+    /// `SecurityPolicy::DEFAULT_MIN_RELEASE_AGE` (0, disabled). The audit uses
     /// the default explicitly to keep numbers reproducible — users
     /// who tighten via `lpm.minimumReleaseAge` see stricter blocks
     /// than these.

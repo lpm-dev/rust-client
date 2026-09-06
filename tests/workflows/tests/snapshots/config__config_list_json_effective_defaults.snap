@@ -57,7 +57,7 @@ expression: snapshot
     },
     {
       "key": "minimum-release-age-secs",
-      "value": 86400,
+      "value": 0,
       "source": "built-in default",
       "group": "Supply-chain security"
     },
@@ -153,7 +153,7 @@ expression: snapshot
     },
     {
       "key": "install-time-source-analysis",
-      "value": true,
+      "value": false,
       "source": "built-in default",
       "group": "Supply-chain security"
     },

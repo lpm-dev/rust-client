@@ -7,9 +7,8 @@ pub(in crate::commands::config) const RELEASE_AGE_POLICY_KEY: &str =
     crate::release_age_config::GLOBAL_POLICY_KEY;
 pub(in crate::commands::config) const RELEASE_AGE_GUIDED_MENU_LABEL: &str =
     "Release age configuration";
-pub(in crate::commands::config) const DEFAULT_RELEASE_AGE_SECS: u64 =
-    crate::release_age_config::DEFAULT_MIN_RELEASE_AGE_SECS;
-pub(in crate::commands::config) const CAUTIOUS_RELEASE_AGE_SECS: u64 = 3 * DEFAULT_RELEASE_AGE_SECS;
+const DEFAULT_RELEASE_AGE_SECS: u64 = crate::release_age_config::DEFAULT_MIN_RELEASE_AGE_SECS;
+pub(in crate::commands::config) const CAUTIOUS_RELEASE_AGE_SECS: u64 = 3 * 24 * 60 * 60;
 const RELEASE_AGE_EDITOR_HELP: &str =
     "Use ↑/↓ to move, ←/→ to change, Enter to save, Esc to cancel.";
 
@@ -136,9 +135,9 @@ pub(in crate::commands::config) async fn run_release_age_wizard(
         println!("  current: {}", format_current_release_age(current).cyan());
         let preset: &str =
             cliclack::select("How long should LPM wait before allowing newly published packages?")
-                .item("default", "Default (1 day)", "recommended")
+                .item("default", "Default (off)", "no cooldown")
                 .item("cautious", "Cautious (3 days)", "stricter")
-                .item("off", "Off", "NOT recommended — disables the cooldown")
+                .item("off", "Off", "always disable the cooldown")
                 .item("custom", "Custom", "enter 12h / 7d / 0")
                 .initial_value(release_age_initial_choice(current))
                 .interact()
@@ -325,7 +324,7 @@ fn format_release_age_policy_options(
 fn format_release_age_options(choice: ReleaseAgeChoice) -> String {
     let mut rendered = String::with_capacity(130);
     for (candidate, label) in [
-        (ReleaseAgeChoice::Default, "Default (1 day) (recommended)"),
+        (ReleaseAgeChoice::Default, "Default (off)"),
         (ReleaseAgeChoice::Cautious, "Cautious (3 days)"),
         (ReleaseAgeChoice::Off, "Off"),
         (ReleaseAgeChoice::Custom, "Custom"),
@@ -536,9 +535,8 @@ pub(in crate::commands::config) fn format_release_age_cli_value(secs: u64) -> St
 
 pub(in crate::commands::config) fn format_current_release_age(current: Option<u64>) -> String {
     match current {
-        None => "default (1d)".to_string(),
+        None => "default (off)".to_string(),
         Some(0) => "off".to_string(),
-        Some(secs) if secs == DEFAULT_RELEASE_AGE_SECS => "1d (explicit override)".to_string(),
         Some(secs) => format_release_age_cli_value(secs),
     }
 }
@@ -574,7 +572,7 @@ pub(in crate::commands::config) fn announce_release_age_set(value: Option<u64>, 
     }
 
     match value {
-        None => install_ui::done("Using default minimum release age (1d)"),
+        None => install_ui::done("Using default minimum release age (off)"),
         Some(0) => install_ui::done("Set minimum release age = off"),
         Some(secs) => install_ui::done_line(crate::install_ui::terminal_line!(
             "Set minimum release age = {}",
@@ -623,7 +621,7 @@ mod tests {
         assert!(plain.contains("Release-age scope"));
         assert!(plain.contains("direct and transitive dependencies"));
         assert!(plain.contains("Minimum release age"));
-        assert!(plain.contains("● Default (1 day) (recommended)"));
+        assert!(plain.contains("● Default (off)"));
         assert!(plain.contains("○ Cautious (3 days)"));
         assert!(plain.contains("○ Off"));
         assert!(plain.contains("○ Custom"));

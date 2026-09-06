@@ -4,10 +4,41 @@ use support::assertions::parse_json_output;
 use support::mock_registry::{MockRegistry, make_tarball};
 use support::{TempProject, lpm, lpm_with_registry, write_signed_typosquat_guard_posture};
 
+fn enable_typosquat_guard(project: &TempProject) {
+    lpm(project)
+        .args(["config", "typosquat", "--set", "on"])
+        .assert()
+        .success();
+}
+
+#[tokio::test]
+async fn install_default_allows_suspicious_package_name_without_approval() {
+    let mock = MockRegistry::start().await;
+    mock.with_package("axois", "1.0.0", &make_tarball("axois", "1.0.0"))
+        .await;
+    let project = TempProject::empty(r#"{"name":"default-guard","version":"1.0.0"}"#);
+
+    lpm_with_registry(&project, &mock.url())
+        .args([
+            "install",
+            "axois",
+            "--json",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .assert()
+        .success();
+    assert!(project.file_exists("node_modules/axois/package.json"));
+    assert!(project.read_file("package.json").contains("axois"));
+}
+
 #[test]
 fn install_json_rejects_new_cli_arg_typosquat_before_manifest_mutation() {
     let project =
         TempProject::empty(r#"{"name":"typosquat-cli","version":"1.0.0","dependencies":{}}"#);
+
+    enable_typosquat_guard(&project);
 
     let output = lpm(&project)
         .args(["install", "axois", "--json"])
@@ -77,6 +108,8 @@ fn install_json_rejects_manifest_direct_typosquat_before_lockfile_write() {
         }"#,
     );
 
+    enable_typosquat_guard(&project);
+
     let output = lpm(&project)
         .args(["install", "--json"])
         .output()
@@ -107,6 +140,8 @@ async fn install_json_allows_manifest_alias_whose_local_name_resembles_target() 
             "dependencies":{"vite7":"npm:vite@1.0.0"}
         }"#,
     );
+
+    enable_typosquat_guard(&project);
 
     let output = lpm_with_registry(&project, &mock.url())
         .args([
@@ -139,6 +174,8 @@ fn install_json_rejects_manifest_alias_with_suspicious_registry_target() {
             "dependencies":{"http-client":"npm:axois@1.0.0"}
         }"#,
     );
+
+    enable_typosquat_guard(&project);
 
     let output = lpm(&project)
         .args(["install", "--json"])
@@ -211,6 +248,8 @@ fn install_json_force_floor_keeps_typosquat_guard_enabled_against_env_disable() 
     )
     .expect("seed force floor config");
 
+    enable_typosquat_guard(&project);
+
     let output = lpm(&project)
         .env("LPM_TYPOSQUAT_GUARD", "off")
         .args(["install", "--json"])
@@ -273,7 +312,7 @@ async fn install_json_global_config_can_disable_manifest_typosquat_analysis() {
 }
 
 #[test]
-fn install_json_global_config_off_requires_security_approval_without_signed_posture() {
+fn install_json_global_config_off_requires_security_approval_after_approved_enable() {
     let project = TempProject::empty(
         r#"{
             "name":"typosquat-config-unapproved",
@@ -281,6 +320,7 @@ fn install_json_global_config_off_requires_security_approval_without_signed_post
             "dependencies":{"axois":"^1.0.0"}
         }"#,
     );
+    write_signed_typosquat_guard_posture(&project, "on");
     let config_dir = project.home().join(".lpm");
     std::fs::create_dir_all(&config_dir).expect("create isolated LPM_HOME");
     std::fs::write(
@@ -317,6 +357,8 @@ async fn install_json_allows_known_legitimate_prismjs_package() {
             "dependencies":{}
         }"#,
     );
+
+    enable_typosquat_guard(&project);
 
     let output = lpm_with_registry(&project, &mock.url())
         .args([
@@ -356,6 +398,8 @@ async fn install_json_allows_exact_inquirer_package() {
         }"#,
     );
 
+    enable_typosquat_guard(&project);
+
     let output = lpm_with_registry(&project, &mock.url())
         .args([
             "install",
@@ -393,6 +437,8 @@ async fn install_json_allows_popular_clean_enquirer_package() {
             "dependencies":{}
         }"#,
     );
+
+    enable_typosquat_guard(&project);
 
     let output = lpm_with_registry(&project, &mock.url())
         .args([
@@ -436,6 +482,8 @@ async fn install_json_allows_popular_clean_chat_package() {
         }"#,
     );
 
+    enable_typosquat_guard(&project);
+
     let output = lpm_with_registry(&project, &mock.url())
         .args([
             "install",
@@ -478,6 +526,8 @@ async fn install_json_allows_legitimate_fsevents_package() {
         }"#,
     );
 
+    enable_typosquat_guard(&project);
+
     let output = lpm_with_registry(&project, &mock.url())
         .args([
             "install",
@@ -519,6 +569,8 @@ async fn install_json_allows_legitimate_short_serve_package() {
             "dependencies":{}
         }"#,
     );
+
+    enable_typosquat_guard(&project);
 
     let output = lpm_with_registry(&project, &mock.url())
         .args([
@@ -645,6 +697,8 @@ fn install_json_rejects_flag_name_after_dashdash() {
 fn add_json_rejects_new_source_package_typosquat_before_fetch() {
     let project =
         TempProject::empty(r#"{"name":"typosquat-add","version":"1.0.0","dependencies":{}}"#);
+
+    enable_typosquat_guard(&project);
 
     let output = lpm(&project)
         .args(["add", "axois", "--json"])

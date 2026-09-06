@@ -6466,7 +6466,7 @@ mod tests {
             lines[4]
         );
         assert_eq!(
-            lines[5], "a:enabled",
+            lines[5], "a:disabled",
             "line 6 must record install-time source analysis"
         );
         assert_eq!(

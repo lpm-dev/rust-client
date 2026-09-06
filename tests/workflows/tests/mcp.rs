@@ -589,6 +589,10 @@ async fn mcp_serve_ignores_workspace_lockfile_and_security_overrides() {
 #[tokio::test]
 async fn mcp_serve_runs_the_newest_release_allowed_by_the_cooldown() {
     let project = TempProject::empty(r#"{"name":"mcp","version":"1.0.0"}"#);
+    lpm(&project)
+        .args(["config", "release-age", "--set", "1d"])
+        .assert()
+        .success();
     let registry = MockRegistry::start().await;
     mount_mcp_server_versions(
         &registry,

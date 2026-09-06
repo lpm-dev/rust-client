@@ -120,8 +120,8 @@ fn authorized_posture_round_trips_through_signed_store() {
 }
 
 #[test]
-fn authorized_posture_enables_install_time_source_analysis_by_default() {
-    assert!(AuthorizedPosture::default().install_time_source_analysis());
+fn authorized_posture_disables_install_time_source_analysis_by_default() {
+    assert!(!AuthorizedPosture::default().install_time_source_analysis());
 }
 
 #[test]
@@ -163,7 +163,11 @@ fn runtime_source_analysis_disable_requires_project_unlock_when_posture_is_enabl
     std::fs::create_dir_all(&project).unwrap();
 
     with_test_env(temp.path(), || {
-        persist_authorized_posture(&AuthorizedPosture::default()).unwrap();
+        persist_authorized_posture(&AuthorizedPosture {
+            install_time_source_analysis: true,
+            ..AuthorizedPosture::default()
+        })
+        .unwrap();
         let error = ensure_runtime_install_time_source_analysis_authorized(&project, true, false)
             .unwrap_err();
 

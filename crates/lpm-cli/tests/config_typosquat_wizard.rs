@@ -35,33 +35,22 @@ fn read_lpm_config(lpm_home: &TempDir) -> String {
 }
 
 #[test]
-fn typosquat_wizard_set_off_with_json_requires_security_approval_and_does_not_persist() {
+fn typosquat_wizard_set_off_with_json_persists_without_approval_when_unset() {
     let (project, lpm_home) = isolated_project();
-
     let (status, stdout, stderr) = run_lpm(
         project.path(),
         lpm_home.path(),
         None,
         &["config", "--json", "typosquat", "--set", "off"],
     );
-
     assert!(
-        !status.success(),
-        "lpm config --json typosquat --set off must require approval;\nstdout:\n{stdout}\nstderr:\n{stderr}",
+        status.success(),
+        "default off must not require approval:\n{stdout}\n{stderr}"
     );
-
     let envelope = parse_json_stdout(&stdout);
-    assert_eq!(envelope["success"], serde_json::json!(false));
-    assert_eq!(
-        envelope["error_code"],
-        serde_json::json!("security_approval_required"),
-        "guarded weakening must use the security approval envelope; got: {envelope}",
-    );
-
-    assert!(
-        !lpm_config_path(&lpm_home).exists(),
-        "refused --set off must not create config.toml",
-    );
+    assert_eq!(envelope["success"], true);
+    assert_eq!(envelope["typosquat-guard"], "off");
+    assert!(read_lpm_config(&lpm_home).contains("typosquat-guard = \"off\""));
 }
 
 #[test]
@@ -169,29 +158,18 @@ fn typosquat_wizard_set_rejects_unknown_value_without_persisting() {
 }
 
 #[test]
-fn generic_config_set_typosquat_guard_off_with_json_requires_security_approval() {
+fn generic_config_set_typosquat_guard_off_persists_without_approval_when_unset() {
     let (project, lpm_home) = isolated_project();
-
     let (status, stdout, stderr) = run_lpm(
         project.path(),
         lpm_home.path(),
         None,
         &["config", "--json", "set", "typosquat-guard", "off"],
     );
-
     assert!(
-        !status.success(),
-        "lpm config set typosquat-guard off must require approval;\nstdout:\n{stdout}\nstderr:\n{stderr}",
+        status.success(),
+        "default off must not require approval:\n{stdout}\n{stderr}"
     );
-
-    let envelope = parse_json_stdout(&stdout);
-    assert_eq!(
-        envelope["error_code"],
-        serde_json::json!("security_approval_required"),
-        "generic setter must use the same approval boundary as the wizard; got: {envelope}",
-    );
-    assert!(
-        !lpm_config_path(&lpm_home).exists(),
-        "refused generic set must not create config.toml",
-    );
+    assert_eq!(parse_json_stdout(&stdout)["success"], true);
+    assert!(read_lpm_config(&lpm_home).contains("typosquat-guard = \"off\""));
 }

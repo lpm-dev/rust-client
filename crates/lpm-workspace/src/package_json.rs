@@ -447,7 +447,7 @@ pub struct LpmConfig {
     #[serde(default, rename = "trustedDependencies")]
     pub trusted_dependencies: TrustedDependencies,
 
-    /// Minimum release age in seconds before install is allowed (default: 86400 = 24h).
+    /// Minimum release age in seconds before install is allowed (default: 0, disabled).
     #[serde(default, rename = "minimumReleaseAge")]
     pub minimum_release_age: Option<u64>,
 

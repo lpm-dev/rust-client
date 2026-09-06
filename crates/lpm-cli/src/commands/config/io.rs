@@ -567,6 +567,7 @@ pub(super) fn guard_generic_set_against_force_floor(
         }
         INSTALL_TIME_SOURCE_ANALYSIS_KEY
             if crate::security_floor::force_security_floor_enabled(global)
+                && crate::source_analysis_config::read_install_time_source_analysis(global)?
                 && matches!(parse_config_bool(value), Ok(false)) =>
         {
             return Err(crate::security_floor::security_floor_write_error(
@@ -601,6 +602,15 @@ pub(super) fn guard_generic_delete_against_force_floor(
         TYPOSQUAT_GUARD_KEY => {
             reject_looser_typosquat_guard_write(global, TyposquatGuardSelection::Default)?
         }
+        INSTALL_TIME_SOURCE_ANALYSIS_KEY => guard_generic_set_against_force_floor(
+            global,
+            key,
+            if crate::source_analysis_config::DEFAULT_INSTALL_TIME_SOURCE_ANALYSIS {
+                "true"
+            } else {
+                "false"
+            },
+        )?,
         "force-security-floor" if crate::security_floor::force_security_floor_enabled(global) => {
             return Err(crate::security_floor::security_floor_write_error(
                 "force-security-floor",
