@@ -376,10 +376,12 @@ impl SharingKeyScope {
         format!(".x25519-key-{}.rotation.lock", self.storage_digest)
     }
 
+    #[cfg(any(target_os = "macos", test))]
     fn live_keychain_account(&self) -> String {
         format!("__x25519_private_key__.{}", self.storage_digest)
     }
 
+    #[cfg(any(target_os = "macos", test))]
     fn pending_keychain_account(&self) -> String {
         format!("__x25519_private_key__.{}.pending", self.storage_digest)
     }
@@ -2064,6 +2066,10 @@ mod tests {
         assert_eq!(
             scope.live_keychain_account(),
             "__x25519_private_key__.5a12911fb761923d976c0aa9f51355a7a8b1c31b06d152393eec5ab45357e666"
+        );
+        assert_eq!(
+            scope.pending_keychain_account(),
+            "__x25519_private_key__.5a12911fb761923d976c0aa9f51355a7a8b1c31b06d152393eec5ab45357e666.pending"
         );
     }
 
