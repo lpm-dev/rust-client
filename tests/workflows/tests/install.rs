@@ -2720,6 +2720,16 @@ async fn install_json_envelope_with_one_package_matches_snapshot() {
     assert_eq!(envelope["patches_fingerprint"], serde_json::Value::Null);
     assert_eq!(envelope["blocked_set_fingerprint"], serde_json::Value::Null);
 
+    // Prefetch can populate the store before authoritative fetch accounting.
+    let downloaded = envelope["downloaded"].as_u64().unwrap();
+    let cached = envelope["cached"].as_u64().unwrap();
+    assert_eq!(downloaded + cached, 1);
+    assert_eq!(
+        envelope["counts"]["authoritative_fetch_candidate_count"],
+        downloaded
+    );
+    assert_eq!(envelope["counts"]["store_reuse_observation_count"], cached);
+
     insta::with_settings!({
         filters => vec![
             // Mock registry URL (dynamic port) → [REGISTRY]
@@ -2734,6 +2744,10 @@ async fn install_json_envelope_with_one_package_matches_snapshot() {
             // High-variance numeric / hash fields — locking values would
             // make the snapshot a flake magnet.
             ".duration_ms" => "[DURATION]",
+            ".downloaded" => "[FETCH_CANDIDATES]",
+            ".cached" => "[STORE_REUSE]",
+            ".counts.authoritative_fetch_candidate_count" => "[FETCH_CANDIDATES]",
+            ".counts.store_reuse_observation_count" => "[STORE_REUSE]",
             ".packages[].integrity" => "[INTEGRITY]",
             ".packages[].duration_ms" => "[DURATION]",
             // Resolver-arm telemetry counters vary by route mode + arm.
