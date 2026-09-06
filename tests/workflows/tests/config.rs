@@ -165,7 +165,7 @@ fn config_lpm_insights_set_false_persists_boolean_json_contract() {
 }
 
 #[test]
-fn config_source_analysis_set_true_persists_default_security_posture() {
+fn config_source_analysis_set_true_persists_enabled_security_posture() {
     let project = TempProject::empty(r#"{"name":"config-source-analysis","version":"1.0.0"}"#);
 
     let output = lpm(&project)
@@ -194,6 +194,11 @@ fn config_source_analysis_set_true_persists_default_security_posture() {
 fn config_source_analysis_disable_requires_security_approval_in_json_mode() {
     let project = TempProject::empty(r#"{"name":"config-source-analysis","version":"1.0.0"}"#);
 
+    lpm(&project)
+        .args(["config", "source-analysis", "--set", "true"])
+        .assert()
+        .success();
+
     let output = lpm(&project)
         .args(["--json", "config", "source-analysis", "--set", "false"])
         .output()
@@ -208,7 +213,100 @@ fn config_source_analysis_disable_requires_security_approval_in_json_mode() {
                 .any(|scope| scope.as_str() == Some("source-analysis-disable"))),
         "guarded disable must request source-analysis-disable, got:\n{envelope}"
     );
-    assert!(!config_path(&project).exists());
+    assert!(
+        std::fs::read_to_string(config_path(&project))
+            .unwrap()
+            .contains("install-time-source-analysis = true")
+    );
+}
+
+#[test]
+fn config_source_analysis_delete_requires_approval_after_explicit_enable() {
+    let project = TempProject::empty(r#"{"name":"source-analysis-delete","version":"1.0.0"}"#);
+    lpm(&project)
+        .args(["config", "source-analysis", "--set", "true"])
+        .assert()
+        .success();
+
+    let output = lpm(&project)
+        .args(["--json", "config", "delete", "install-time-source-analysis"])
+        .output()
+        .unwrap();
+    let envelope = support::assertions::assert_security_approval_required(&output);
+    assert!(
+        envelope["error"]["requested_scopes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|scope| scope == "source-analysis-disable")
+    );
+    assert!(
+        std::fs::read_to_string(project.home().join(".lpm/config.toml"))
+            .unwrap()
+            .contains("install-time-source-analysis = true")
+    );
+}
+
+#[test]
+fn config_source_analysis_delete_preserves_enabled_force_floor() {
+    let project = TempProject::empty(r#"{"name":"source-analysis-floor","version":"1.0.0"}"#);
+    seed_config(
+        &project,
+        "force-security-floor = true\ninstall-time-source-analysis = true\n",
+    );
+    let output = lpm(&project)
+        .args(["--json", "config", "delete", "install-time-source-analysis"])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let envelope: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(envelope["error_code"], "security_floor");
+    assert!(
+        std::fs::read_to_string(project.home().join(".lpm/config.toml"))
+            .unwrap()
+            .contains("install-time-source-analysis = true")
+    );
+}
+
+#[test]
+fn config_source_analysis_disabled_default_remains_editable_under_force_floor() {
+    let project = TempProject::empty(r#"{"name":"source-analysis-floor","version":"1.0.0"}"#);
+    seed_config(&project, "force-security-floor = true\n");
+
+    for args in [
+        vec!["--json", "config", "source-analysis", "--set", "false"],
+        vec!["--json", "config", "delete", "install-time-source-analysis"],
+        vec![
+            "--json",
+            "config",
+            "set",
+            "install-time-source-analysis",
+            "false",
+        ],
+        vec!["--json", "config", "delete", "install-time-source-analysis"],
+    ] {
+        lpm(&project).args(args).assert().success();
+    }
+
+    let config = std::fs::read_to_string(config_path(&project)).unwrap();
+    assert!(config.contains("force-security-floor = true"));
+    assert!(!config.contains("install-time-source-analysis"));
+}
+
+#[test]
+fn config_release_age_default_reports_cooldown_is_off() {
+    let project = TempProject::empty(r#"{"name":"default-release-age","version":"1.0.0"}"#);
+    let output = lpm(&project)
+        .args(["config", "release-age", "--set", "default"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let rendered = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    assert!(rendered.contains("Using default minimum release age (off)"));
 }
 
 #[test]
@@ -1087,6 +1185,16 @@ fn config_list_json_reports_every_known_effective_key() {
     assert!(entries.iter().all(|entry| {
         entry["group"].is_string() && entry["source"].is_string() && !entry["value"].is_null()
     }));
+
+    for (key, expected) in [
+        ("minimum-release-age-secs", serde_json::json!(0)),
+        ("typosquat-guard", serde_json::json!("default")),
+        ("install-time-source-analysis", serde_json::json!(false)),
+    ] {
+        let entry = entries.iter().find(|entry| entry["key"] == key).unwrap();
+        assert_eq!(entry["value"], expected, "unexpected default for {key}");
+        assert_eq!(entry["source"], "built-in default");
+    }
 
     let mut snapshot = envelope;
     let workspace_concurrency = snapshot["entries"]

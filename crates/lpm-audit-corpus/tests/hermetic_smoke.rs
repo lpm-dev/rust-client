@@ -53,22 +53,9 @@ fn hermetic_corpus_runs_offline_and_produces_well_formed_outputs() {
         .success()
         .stdout(contains("hermetic: loaded 16 synthetic packages from"))
         .stdout(contains("wrote 16 audit records"))
-        // The hermetic fixture
-        // includes 4 delegate-to-local-file entries with matching
-        // includes 4 delegate-to-local-file entries with matching repository
-        // `publish_age_hours: 8760` (1 year, well past 24h cooldown)
-        // URLs. Of those, 3 have publish_age_hours: 8760 → identity-match
-        // `publish_age_hours: 1` (`hermetic-amber-binary-fetcher-recent`)
-        // widening fires, Amber → Green. 1 has publish_age_hours: 1 →
-        // entry stays Amber and is hard-blocked by L3 cooldown. The
-        // The distribution moves from the pre-widening baseline
-        // (green=4, amber=8, hard-block=4 = 3 reds + 1 cooldown) to
-        // to post-widening-with-cooldown (green=6, amber=6, hard-block=4 =
-        // still 3 reds + 1 cooldown). The cooldown-blocked entry's
-        // cooldown defense-in-depth refuses to widen; count is preserved.
         .stdout(contains("L1: green=6 amber=6 red=3 no-scripts=1"))
         .stdout(contains(
-            "Portable (L1-3): auto-run=6 prompt=5 hard-block=4 no-scripts=1",
+            "Portable (L1-3): auto-run=6 prompt=6 hard-block=3 no-scripts=1",
         ));
 
     // Records file: one record per fixture entry, with required

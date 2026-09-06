@@ -347,7 +347,8 @@ impl Default for InstallHashContext<'static> {
     fn default() -> Self {
         Self {
             dependency_engine_key: "none",
-            security_analysis_policy: SecurityAnalysisPolicy::Enabled,
+            security_analysis_policy:
+                crate::source_analysis_config::DEFAULT_SECURITY_ANALYSIS_POLICY,
         }
     }
 }
@@ -828,7 +829,7 @@ pub(crate) fn check_install_state_with_linker_integrity_and_dependency_engine(
         object_integrity_policy,
         dependency_engine_key,
         store_version,
-        SecurityAnalysisPolicy::Enabled,
+        crate::source_analysis_config::DEFAULT_SECURITY_ANALYSIS_POLICY,
     )
 }
 
@@ -1348,7 +1349,8 @@ pub(crate) fn write_install_hash_with_integrity_platform_and_dependency_engine(
         InstallHashWriteMetadata {
             node_runtime_fingerprint,
             binary_sidecar_expectation,
-            security_analysis_policy: SecurityAnalysisPolicy::Enabled,
+            security_analysis_policy:
+                crate::source_analysis_config::DEFAULT_SECURITY_ANALYSIS_POLICY,
         },
     )
 }
@@ -2092,7 +2094,7 @@ mod tests {
             platform_line.starts_with("p:"),
             "expected platform line, got {platform_line:?}"
         );
-        assert_eq!(lines.next(), Some("a:enabled"));
+        assert_eq!(lines.next(), Some("a:disabled"));
         assert_eq!(lines.next(), Some("e:none"));
         assert_eq!(lines.next(), Some("n:none"));
         assert_eq!(lines.next(), Some("b:not-required"));
@@ -2385,7 +2387,10 @@ mod tests {
             lpm_linker::LinkerMode::Hoisted,
             ObjectIntegrityPolicy::Source,
             &platform,
-            InstallHashContext::default(),
+            InstallHashContext {
+                security_analysis_policy: SecurityAnalysisPolicy::Enabled,
+                ..InstallHashContext::default()
+            },
         );
         let disabled = compute_install_hash_v10(
             "pkg",
@@ -2538,7 +2543,8 @@ mod tests {
             lpm_store::StoreVersion::V2,
             InstallHashContext {
                 dependency_engine_key: "1:20.0.0",
-                security_analysis_policy: SecurityAnalysisPolicy::Enabled,
+                security_analysis_policy:
+                    crate::source_analysis_config::DEFAULT_SECURITY_ANALYSIS_POLICY,
             },
         );
 

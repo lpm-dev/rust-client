@@ -282,6 +282,11 @@ async fn install_policy_extension_runs_once_when_stale_v2_analysis_cache_falls_b
         None,
     );
 
+    lpm(&project)
+        .args(["config", "source-analysis", "--set", "true"])
+        .assert()
+        .success();
+
     lpm_with_registry(&project, &mock.url())
         .env("LPM_STORE_VERSION", "v2")
         .args([

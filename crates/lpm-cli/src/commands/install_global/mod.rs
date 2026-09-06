@@ -605,8 +605,8 @@ mod tests {
 
         let root_metadata_requests = cypress_metadata_requests.load(Ordering::SeqCst);
         assert_eq!(
-            root_metadata_requests, 2,
-            "the inner resolver must reuse the pinned abbreviated metadata; only the distinct full-metadata fetch may follow"
+            root_metadata_requests, 1,
+            "the inner resolver must reuse the pinned metadata when the release cooldown is disabled"
         );
 
         let install_root = root.install_root_for("cypress", "15.13.1");

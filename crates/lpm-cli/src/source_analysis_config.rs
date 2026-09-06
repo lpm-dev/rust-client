@@ -3,10 +3,14 @@ use lpm_common::LpmError;
 use crate::commands::config::GlobalConfig;
 
 pub(crate) const INSTALL_TIME_SOURCE_ANALYSIS_KEY: &str = "install-time-source-analysis";
+pub(crate) const DEFAULT_SECURITY_ANALYSIS_POLICY: lpm_store::SecurityAnalysisPolicy =
+    lpm_store::SecurityAnalysisPolicy::Disabled;
+pub(crate) const DEFAULT_INSTALL_TIME_SOURCE_ANALYSIS: bool =
+    DEFAULT_SECURITY_ANALYSIS_POLICY.is_enabled();
 
 pub(crate) fn read_install_time_source_analysis(config: &GlobalConfig) -> Result<bool, LpmError> {
     let Some(_) = config.get_value(INSTALL_TIME_SOURCE_ANALYSIS_KEY) else {
-        return Ok(true);
+        return Ok(DEFAULT_INSTALL_TIME_SOURCE_ANALYSIS);
     };
     config.get_bool(INSTALL_TIME_SOURCE_ANALYSIS_KEY).ok_or_else(|| {
         LpmError::Registry(format!(
@@ -39,8 +43,8 @@ mod tests {
     }
 
     #[test]
-    fn source_analysis_is_enabled_when_config_is_absent() {
-        assert!(read_install_time_source_analysis(&GlobalConfig::empty()).unwrap());
+    fn source_analysis_is_disabled_when_config_is_absent() {
+        assert!(!read_install_time_source_analysis(&GlobalConfig::empty()).unwrap());
     }
 
     #[test]

@@ -544,7 +544,7 @@ fn install_rejects_malformed_global_config() {
 }
 
 #[tokio::test]
-async fn install_rejects_oversized_project_config_before_registry_access() {
+async fn install_enabled_typosquat_guard_rejects_oversized_project_config_before_registry_access() {
     let mock = MockRegistry::start().await;
     let project = TempProject::empty(
         r#"{
@@ -555,6 +555,11 @@ async fn install_rejects_oversized_project_config_before_registry_access() {
         }
     }"#,
     );
+    lpm(&project)
+        .args(["config", "typosquat", "--set", "on"])
+        .assert()
+        .success();
+
     let path = project.path().join("lpm.toml");
     write_repeated_file(
         &path,
@@ -2715,6 +2720,16 @@ async fn install_json_envelope_with_one_package_matches_snapshot() {
     assert_eq!(envelope["patches_fingerprint"], serde_json::Value::Null);
     assert_eq!(envelope["blocked_set_fingerprint"], serde_json::Value::Null);
 
+    // Prefetch can populate the store before authoritative fetch accounting.
+    let downloaded = envelope["downloaded"].as_u64().unwrap();
+    let cached = envelope["cached"].as_u64().unwrap();
+    assert_eq!(downloaded + cached, 1);
+    assert_eq!(
+        envelope["counts"]["authoritative_fetch_candidate_count"],
+        downloaded
+    );
+    assert_eq!(envelope["counts"]["store_reuse_observation_count"], cached);
+
     insta::with_settings!({
         filters => vec![
             // Mock registry URL (dynamic port) → [REGISTRY]
@@ -2729,6 +2744,10 @@ async fn install_json_envelope_with_one_package_matches_snapshot() {
             // High-variance numeric / hash fields — locking values would
             // make the snapshot a flake magnet.
             ".duration_ms" => "[DURATION]",
+            ".downloaded" => "[FETCH_CANDIDATES]",
+            ".cached" => "[STORE_REUSE]",
+            ".counts.authoritative_fetch_candidate_count" => "[FETCH_CANDIDATES]",
+            ".counts.store_reuse_observation_count" => "[STORE_REUSE]",
             ".packages[].integrity" => "[INTEGRITY]",
             ".packages[].duration_ms" => "[DURATION]",
             // Resolver-arm telemetry counters vary by route mode + arm.
@@ -5628,7 +5647,7 @@ async fn cache_prune_keeps_shared_v3_blob_until_its_last_package_reference_is_re
 }
 
 #[tokio::test]
-async fn install_reenable_source_analysis_backfills_v2_cache_without_tarball_redownload() {
+async fn install_source_analysis_defaults_off_and_opt_in_backfills_cache_without_redownload() {
     let mock = MockRegistry::start().await;
     let tarball = make_tarball_with_files(
         "source-analysis-backfill",
@@ -5648,8 +5667,6 @@ async fn install_reenable_source_analysis_backfills_v2_cache_without_tarball_red
     );
     let config_path = project.home().join(".lpm/config.toml");
     std::fs::create_dir_all(config_path.parent().unwrap()).unwrap();
-    std::fs::write(&config_path, "install-time-source-analysis = false\n").unwrap();
-    write_signed_unlock(&project, &["source-analysis-disable"]);
 
     let disabled = lpm_with_registry(&project, &mock.url())
         .env("LPM_STORE_VERSION", "v2")
@@ -6570,6 +6587,11 @@ async fn install_security_summary_ignores_forged_store_analysis_sidecars() {
     let project = TempProject::empty(
         r#"{"name":"forged-analysis-host","version":"1.0.0","dependencies":{"forged-analysis-sidecar":"1.0.0"}}"#,
     );
+
+    lpm(&project)
+        .args(["config", "source-analysis", "--set", "true"])
+        .assert()
+        .success();
 
     let first = lpm_with_registry(&project, &mock.url())
         .env("LPM_STORE_VERSION", "v2")
@@ -11678,7 +11700,7 @@ async fn install_github_dependency_at_commit_writes_replayable_lockfile_entry() 
     let object_dir = lpm_store::v2::StoreV2Paths::at(project.store_dir().join("v2"))
         .object_dir(&archive_integrity)
         .expect("Git archive integrity should address the v2 object");
-    assert!(object_dir.join(".lpm-security.json").is_file());
+    assert!(!object_dir.join(".lpm-security.json").exists());
 }
 
 #[tokio::test]
@@ -16439,6 +16461,26 @@ async fn mount_release_age_pkg_without_publish_time(mock: &MockRegistry) {
     .await;
 }
 
+#[tokio::test]
+async fn install_default_accepts_newly_published_package_without_approval() {
+    let project = TempProject::empty("");
+    write_release_age_manifest(&project, None);
+    let mock = MockRegistry::start().await;
+    mount_release_age_pkg(&mock, &iso8601_n_secs_ago(60)).await;
+
+    lpm_with_registry(&project, &mock.url())
+        .args([
+            "install",
+            "--json",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .assert()
+        .success();
+    assert!(project.file_exists(&format!("node_modules/{RELEASE_AGE_PKG}/package.json")));
+}
+
 fn release_age_lpm_config_with_policy(
     manifest_min_release_age: Option<u64>,
     excludes: &[&str],
@@ -17563,7 +17605,7 @@ async fn install_package_json_min_release_age_exclude_allows_fresh_direct_depend
     write_release_age_manifest_with_deps(
         &project,
         serde_json::json!({ RELEASE_AGE_PKG: RELEASE_AGE_VERSION }),
-        None,
+        Some(86_400),
         &[RELEASE_AGE_PKG],
     );
 
@@ -17596,7 +17638,7 @@ async fn install_package_json_version_release_age_exclude_allows_only_the_select
     write_release_age_manifest_with_deps(
         &project,
         serde_json::json!({ RELEASE_AGE_PKG: RELEASE_AGE_VERSION }),
-        None,
+        Some(86_400),
         &[&version_selector],
     );
 
@@ -17629,7 +17671,7 @@ async fn install_package_json_version_release_age_exclude_does_not_allow_another
     write_release_age_manifest_with_deps(
         &project,
         serde_json::json!({ RELEASE_AGE_PKG: RELEASE_AGE_VERSION }),
-        None,
+        Some(86_400),
         &[&other_version_selector],
     );
 
@@ -17655,7 +17697,7 @@ async fn install_package_json_scoped_wildcard_release_age_exclude_allows_package
     write_release_age_manifest_with_deps(
         &project,
         serde_json::json!({ RELEASE_AGE_PKG: RELEASE_AGE_VERSION }),
-        None,
+        Some(86_400),
         &["@lpm.dev/*"],
     );
 
@@ -17684,7 +17726,7 @@ async fn install_package_json_scoped_wildcard_release_age_exclude_allows_package
 #[tokio::test]
 async fn install_min_release_age_exclude_cli_allows_fresh_direct_dependency() {
     let project = TempProject::empty("");
-    write_release_age_manifest(&project, None);
+    write_release_age_manifest(&project, Some(86_400));
 
     let mock = MockRegistry::start().await;
     mount_release_age_pkg(&mock, &iso8601_n_secs_ago(3_600)).await;
@@ -17880,6 +17922,8 @@ async fn install_global_config_min_release_age_below_floor_requires_security_app
     write_release_age_manifest(&project, None);
     write_release_age_global_config(&project, 3_600);
 
+    support::write_signed_release_age_exclusion_posture(&project, &[]);
+
     let mock = MockRegistry::start().await;
     mount_release_age_pkg(&mock, &iso8601_n_secs_ago(1_800)).await;
 
@@ -17923,7 +17967,7 @@ async fn install_package_json_min_release_age_overrides_global_config() {
 #[tokio::test]
 async fn install_explicit_version_pin_does_not_bypass_cooldown() {
     let project = TempProject::empty("");
-    write_release_age_manifest(&project, None);
+    write_release_age_manifest(&project, Some(86_400));
 
     let mock = MockRegistry::start().await;
     mount_release_age_pkg(&mock, &iso8601_n_secs_ago(3_600)).await;

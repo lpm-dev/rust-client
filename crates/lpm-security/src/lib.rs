@@ -103,17 +103,17 @@ pub struct SecurityPolicy {
     /// [`Self::can_run_scripts`] method is preserved as a name-only
     /// fallback for manifests with the legacy `Vec<String>` form.
     pub trusted_dependencies: TrustedDependencies,
-    /// Minimum age in seconds before a release is installable (default: 86400 = 24h).
+    /// Minimum age in seconds before a release is installable (default: 0, disabled).
     /// Set to 0 to disable. Protects against compromised publish tokens being used
     /// to push malicious versions that get installed before detection.
     pub minimum_release_age_secs: u64,
 }
 
 impl SecurityPolicy {
-    /// Default minimum release age: 24 hours.
-    const DEFAULT_MIN_RELEASE_AGE: u64 = 86400;
+    /// Default minimum release age: 0 seconds, with no cooldown.
+    pub const DEFAULT_MIN_RELEASE_AGE: u64 = 0;
 
-    /// Create a default policy (nothing trusted — all scripts blocked, 24h release age).
+    /// Create a default policy with all dependency scripts blocked and no release cooldown.
     pub fn default_policy() -> Self {
         SecurityPolicy {
             trusted_dependencies: TrustedDependencies::default(),
@@ -157,7 +157,7 @@ impl SecurityPolicy {
     /// 1. CLI flag `--min-release-age=<dur>`
     /// 2. `package.json` key `lpm.minimumReleaseAge`
     /// 3. `~/.lpm/config.toml` key `minimum-release-age-secs`
-    /// 4. default 24h
+    /// 4. default 0 (disabled)
     ///
     /// That walk is the lpm-cli `ReleaseAgeResolver`'s job. This
     /// constructor keeps lpm-security free of CLI/config-file knowledge
@@ -343,6 +343,11 @@ mod tests {
         let policy = SecurityPolicy::default_policy();
         assert!(!policy.can_run_scripts("esbuild"));
         assert!(!policy.can_run_scripts("sharp"));
+    }
+
+    #[test]
+    fn default_policy_disables_release_age_cooldown() {
+        assert_eq!(SecurityPolicy::default_policy().minimum_release_age_secs, 0);
     }
 
     #[test]

@@ -73,9 +73,6 @@ fn integrity(data: &[u8]) -> String {
     format!("sha512-{}", BASE64.encode(Sha512::digest(data)))
 }
 
-/// 30 days ago — far enough back that the default 24h `minimumReleaseAge`
-/// passes. Test EXERCISES the cooldown gate (which reads metadata via
-/// the routed path post-day-4.6), it doesn't bypass it.
 fn iso8601_30_days_ago() -> String {
     (chrono::Utc::now() - chrono::Duration::days(30)).to_rfc3339_opts(SecondsFormat::Millis, true)
 }

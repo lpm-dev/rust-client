@@ -14,7 +14,7 @@
 //!    garbage value surfaces a file-pathed error rather than being
 //!    silently ignored as [`crate::commands::config::GlobalConfig::load`]
 //!    would do).
-//! 4. **Default**: 86400 (24h).
+//! 4. **Default**: 0 (disabled).
 //!
 //! `minimumReleaseAgePolicy` follows the same project/global/default
 //! tiers, using `direct` by default and `strict` for opt-in transitive
@@ -52,11 +52,9 @@ use lpm_common::{LpmError, LpmRoot};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
-/// Default cooldown window when nothing else is configured (matches
-/// [`lpm_security::SecurityPolicy::DEFAULT_MIN_RELEASE_AGE`]; copied
-/// here to keep this module self-contained and to avoid poking at
-/// lpm-security's private constant).
-pub(crate) const DEFAULT_MIN_RELEASE_AGE_SECS: u64 = 86400;
+/// Default cooldown window when nothing else is configured.
+pub(crate) const DEFAULT_MIN_RELEASE_AGE_SECS: u64 =
+    lpm_security::SecurityPolicy::DEFAULT_MIN_RELEASE_AGE;
 
 /// TOML key in `~/.lpm/config.toml` holding the global override.
 const GLOBAL_KEY: &str = "minimum-release-age-secs";
@@ -1323,7 +1321,10 @@ mod tests {
         write_global_config(home.path(), "minimum-release-age-secs = 2000\n");
 
         let result = ReleaseAgeResolver::resolve(project.path(), None, true).unwrap();
-        assert_eq!(result, 2000, "global config must override 24h default");
+        assert_eq!(
+            result, 2000,
+            "global config must override the disabled default"
+        );
     }
 
     #[test]

@@ -1,10 +1,10 @@
 use super::wizards::{
-    CAUTIOUS_RELEASE_AGE_SECS, DEFAULT_RELEASE_AGE_SECS, FIREWALL_ENFORCE_HINT,
-    FIREWALL_MONITOR_HINT, FIREWALL_OFF_HINT, FIREWALL_WIZARD_PROMPT, INTEGRITY_SOURCE_HINT,
-    INTEGRITY_TREE_HINT, INTEGRITY_WIZARD_PROMPT, ReleaseAgeSelection,
-    persist_firewall_policy_profile_in_config_value, persist_release_age_selection,
-    persist_script_policy, read_firewall_mode, read_integrity_policy, read_release_age_override,
-    read_sandbox_mode, read_sigstore_availability, read_sigstore_scope, read_sigstore_verify,
+    CAUTIOUS_RELEASE_AGE_SECS, FIREWALL_ENFORCE_HINT, FIREWALL_MONITOR_HINT, FIREWALL_OFF_HINT,
+    FIREWALL_WIZARD_PROMPT, INTEGRITY_SOURCE_HINT, INTEGRITY_TREE_HINT, INTEGRITY_WIZARD_PROMPT,
+    ReleaseAgeSelection, persist_firewall_policy_profile_in_config_value,
+    persist_release_age_selection, persist_script_policy, read_firewall_mode,
+    read_integrity_policy, read_release_age_override, read_sandbox_mode,
+    read_sigstore_availability, read_sigstore_scope, read_sigstore_verify,
     read_typosquat_guard_override, release_age_initial_choice,
 };
 use super::*;
@@ -151,12 +151,12 @@ fn guided_config_summary_uses_product_defaults_when_unset() {
             sigstore_availability: "best-effort".to_string(),
             signatures: "disabled",
             trust_policy: "off".to_string(),
-            typosquat_guard: "default (enabled)".to_string(),
+            typosquat_guard: "default (disabled)".to_string(),
             firewall_mode: "off".to_string(),
             integrity_mode: "source".to_string(),
-            release_age: "default (1d)".to_string(),
+            release_age: "default (off)".to_string(),
             release_age_policy: "direct".to_string(),
-            source_analysis: "enabled",
+            source_analysis: "disabled",
             lpm_skills: "enabled (default)",
             lpm_insights: "enabled",
         }
@@ -441,7 +441,11 @@ async fn typosquat_wizard_preserves_unrelated_keys() {
 #[tokio::test]
 async fn typosquat_wizard_rejects_off_when_force_floor_keeps_guard_enabled() {
     let (_dir, path, _env) = tmp_config();
-    std::fs::write(&path, "force-security-floor = true\n").unwrap();
+    std::fs::write(
+        &path,
+        "force-security-floor = true\ntyposquat-guard = \"on\"\n",
+    )
+    .unwrap();
 
     let err = run_typosquat_wizard(&path, Some("off"), true)
         .await
@@ -449,7 +453,10 @@ async fn typosquat_wizard_rejects_off_when_force_floor_keeps_guard_enabled() {
 
     assert_eq!(err.error_code(), "security_floor");
     assert!(err.to_string().contains(TYPOSQUAT_GUARD_KEY));
-    assert!(read_typosquat_guard_override(&path).unwrap().is_none());
+    assert_eq!(
+        read_typosquat_guard_override(&path).unwrap(),
+        Some(TyposquatGuardSelection::On)
+    );
 }
 
 #[test]
@@ -920,7 +927,7 @@ fn release_age_wizard_initial_choice_treats_explicit_one_day_as_custom() {
         "cautious"
     );
     assert_eq!(
-        release_age_initial_choice(Some(DEFAULT_RELEASE_AGE_SECS)),
+        release_age_initial_choice(Some(86_400)),
         "custom",
         "explicit 1d override must stay distinguishable from true default",
     );
@@ -1218,7 +1225,8 @@ fn guard_generic_set_rejects_disabling_force_floor_when_enabled() {
 
 #[test]
 fn guard_generic_set_rejects_case_insensitive_source_analysis_disable_under_force_floor() {
-    let config = global_config("force-security-floor = true\n");
+    let config =
+        global_config("force-security-floor = true\ninstall-time-source-analysis = true\n");
     let err =
         guard_generic_set_against_force_floor(&config, INSTALL_TIME_SOURCE_ANALYSIS_KEY, " FALSE ")
             .unwrap_err();

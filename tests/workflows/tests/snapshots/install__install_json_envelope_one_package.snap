@@ -14,8 +14,8 @@ expression: envelope
     }
   ],
   "count": 1,
-  "downloaded": 1,
-  "cached": 0,
+  "downloaded": "[FETCH_CANDIDATES]",
+  "cached": "[STORE_REUSE]",
   "linked": 1,
   "symlinked": 1,
   "used_lockfile": false,
@@ -68,8 +68,8 @@ expression: envelope
   "counts": {
     "scope": "target",
     "resolved_package_row_count": 1,
-    "authoritative_fetch_candidate_count": 1,
-    "store_reuse_observation_count": 0,
+    "authoritative_fetch_candidate_count": "[FETCH_CANDIDATES]",
+    "store_reuse_observation_count": "[STORE_REUSE]",
     "store_reuse_may_include_same_command_population": true,
     "linker_entry_created_count": 1,
     "linker_entry_reused_count": 0,

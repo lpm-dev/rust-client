@@ -486,6 +486,10 @@ async fn global_list_outdated_reports_a_malformed_installed_version_as_unresolve
 #[tokio::test]
 async fn global_list_outdated_treats_fresh_latest_as_up_to_date() {
     let project = TempProject::empty(r#"{"name":"global","version":"1.0.0"}"#);
+    lpm(&project)
+        .args(["config", "release-age", "--set", "1d"])
+        .assert()
+        .success();
     let package = "@lpm.dev/acme.cooldown-cli";
     seed_global_package_with_source(
         &project,
@@ -599,6 +603,10 @@ async fn global_list_outdated_routes_upstream_npm_packages_directly_to_npm() {
 async fn global_list_outdated_hydrates_release_times_in_bounded_parallel_waves() {
     const PACKAGE_COUNT: usize = 8;
     let project = TempProject::empty(r#"{"name":"global","version":"1.0.0"}"#);
+    lpm(&project)
+        .args(["config", "release-age", "--set", "1d"])
+        .assert()
+        .success();
     let root = isolated_lpm_root(&project);
     let mut manifest = GlobalManifest::default();
     for index in 0..PACKAGE_COUNT {
@@ -1345,6 +1353,10 @@ fn global_update_dry_run_on_empty_manifest_succeeds_without_writing_manifest() {
 #[tokio::test]
 async fn global_update_dry_run_selects_latest_mature_candidate_when_latest_is_fresh() {
     let project = TempProject::empty(r#"{"name":"global","version":"1.0.0"}"#);
+    lpm(&project)
+        .args(["config", "release-age", "--set", "1d"])
+        .assert()
+        .success();
     let package = "@lpm.dev/acme.cooldown-update";
     seed_global_package_with_source(
         &project,
@@ -1483,6 +1495,10 @@ async fn global_update_plans_upstream_npm_packages_without_contacting_the_worker
 #[tokio::test]
 async fn global_update_dry_run_rejects_exact_fresh_target() {
     let project = TempProject::empty(r#"{"name":"global","version":"1.0.0"}"#);
+    lpm(&project)
+        .args(["config", "release-age", "--set", "1d"])
+        .assert()
+        .success();
     let package = "@lpm.dev/acme.cooldown-update-exact";
     seed_global_package_with_source(
         &project,

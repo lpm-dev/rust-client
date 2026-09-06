@@ -494,7 +494,7 @@ pub async fn run(
                     }
                     INSTALL_TIME_SOURCE_ANALYSIS_KEY => {
                         crate::security_approval::authorize_persistent_install_time_source_analysis(
-                        true,
+                        crate::source_analysis_config::DEFAULT_INSTALL_TIME_SOURCE_ANALYSIS,
                         json_output,
                         &format!("lpm config delete {key}"),
                     )?;
