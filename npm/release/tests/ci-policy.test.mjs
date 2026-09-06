@@ -6,6 +6,26 @@ import { fileURLToPath } from "node:url";
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../../..");
 
+test("CI runs for pull requests targeting main and native stack branches", () => {
+  const workflow = fs
+    .readFileSync(path.join(repoRoot, ".github/workflows/ci.yml"), "utf8")
+    .replaceAll("\r\n", "\n");
+  const trigger = workflow.match(/^  pull_request:\n((?:    .*\n)*)/m)?.[1];
+
+  assert.ok(trigger, "missing pull_request trigger");
+  const branches = trigger.match(/^    branches: \[([^\]]+)\]$/m)?.[1]
+    .split(",")
+    .map((branch) => branch.trim().replace(/^["']|["']$/g, ""));
+  assert.ok(branches, "missing pull_request base branch policy");
+  for (const base of ["main", "codex/bun-converter-exit-race", "codex/organization-browser-env"]) {
+    assert.ok(
+      branches.some((pattern) => pattern === base || (pattern === "codex/**" && base.startsWith("codex/"))),
+      `CI does not run for PRs targeting ${base}`,
+    );
+  }
+  assert.match(workflow, /^  push:\n    branches: \[main\]$/m);
+});
+
 test("CI compiles experimental HTTP/3 with the required reqwest cfg", () => {
   const workflow = fs
     .readFileSync(path.join(repoRoot, ".github/workflows/ci.yml"), "utf8")

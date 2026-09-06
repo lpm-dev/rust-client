@@ -260,16 +260,18 @@ fn run_bun_converter(path: &Path, timeout: Duration) -> Result<String, LpmError>
             }
         }
         if stream_error.is_some() {
-            if let Some(status) = child.try_wait().map_err(LpmError::Io)? {
-                break status;
-            }
             break terminate_bun_converter(&mut child)?;
         }
-        if let Some(status) = child.try_wait().map_err(LpmError::Io)? {
+        // Keep the child unreaped while descendants may hold its pipes, so its
+        // process-group identifier cannot be reused before timeout cleanup.
+        if stdout_result.is_some()
+            && stderr_result.is_some()
+            && let Some(status) = child.try_wait().map_err(LpmError::Io)?
+        {
             break status;
         }
         if started.elapsed() >= timeout {
-            let _ = terminate_bun_converter(&mut child);
+            terminate_bun_converter(&mut child)?;
             stdout_reader
                 .join()
                 .map_err(|_| LpmError::Script("Bun converter stdout reader panicked".into()))?;
@@ -337,20 +339,42 @@ fn run_bun_converter(path: &Path, timeout: Duration) -> Result<String, LpmError>
 fn terminate_bun_converter(
     child: &mut std::process::Child,
 ) -> Result<std::process::ExitStatus, LpmError> {
-    #[cfg(unix)]
-    unsafe {
-        let process_group = i32::try_from(child.id())
-            .map_err(|_| LpmError::Script("Bun converter process identifier exceeds i32".into()))?;
-        if libc::kill(-process_group, libc::SIGKILL) != 0 {
-            let error = std::io::Error::last_os_error();
-            if error.kind() != std::io::ErrorKind::NotFound {
-                return Err(LpmError::Io(error));
+    terminate_bun_converter_with(child, |child| {
+        #[cfg(unix)]
+        {
+            let process_group = i32::try_from(child.id()).map_err(|_| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "Bun converter process identifier exceeds i32",
+                )
+            })?;
+            if unsafe { libc::kill(-process_group, libc::SIGKILL) } != 0 {
+                return Err(std::io::Error::last_os_error());
             }
+            Ok(())
         }
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = child.kill();
+        #[cfg(not(unix))]
+        child.kill()
+    })
+}
+
+fn terminate_bun_converter_with(
+    child: &mut std::process::Child,
+    terminate: impl FnOnce(&mut std::process::Child) -> std::io::Result<()>,
+) -> Result<std::process::ExitStatus, LpmError> {
+    if let Err(error) = terminate(child) {
+        let may_have_exited = error.kind() == std::io::ErrorKind::PermissionDenied;
+        #[cfg(unix)]
+        let may_have_exited = may_have_exited || error.raw_os_error() == Some(libc::ESRCH);
+
+        // macOS can report EPERM when the group contains only an exited child.
+        // A confirmed exit distinguishes that race from a live permission error.
+        if may_have_exited && let Some(status) = child.try_wait().map_err(LpmError::Io)? {
+            return Ok(status);
+        }
+        return Err(LpmError::Script(format!(
+            "failed to stop Bun lockfile converter: {error}"
+        )));
     }
     child.wait().map_err(LpmError::Io)
 }
@@ -646,6 +670,84 @@ mod tests {
                 let error = parse_selected(&path).unwrap_err();
 
                 assert!(error.to_string().contains("67108864-byte limit"));
+            },
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn terminating_an_exited_converter_preserves_its_exit_status() {
+        use std::os::unix::process::CommandExt as _;
+
+        let mut child = std::process::Command::new("/bin/sh")
+            .args(["-c", "exit 17"])
+            .process_group(0)
+            .spawn()
+            .expect("spawn converter process group");
+        let mut info = std::mem::MaybeUninit::<libc::siginfo_t>::uninit();
+        let wait_result = unsafe {
+            libc::waitid(
+                libc::P_PID,
+                child.id(),
+                info.as_mut_ptr(),
+                libc::WEXITED | libc::WNOWAIT,
+            )
+        };
+        assert_eq!(wait_result, 0, "observe exit without reaping the child");
+
+        let result = terminate_bun_converter(&mut child);
+        let cleanup_status = child.wait().expect("reap converter after assertion setup");
+
+        assert_eq!(
+            result.expect("collect exited converter status"),
+            cleanup_status
+        );
+        assert_eq!(cleanup_status.code(), Some(17));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_stop_permission_error_for_a_live_converter_is_reported() {
+        use std::os::unix::process::CommandExt as _;
+
+        let mut child = std::process::Command::new("/bin/sh")
+            .args(["-c", "exec sleep 30"])
+            .process_group(0)
+            .spawn()
+            .expect("spawn converter process group");
+
+        let result = terminate_bun_converter_with(&mut child, |_| {
+            Err(std::io::Error::from_raw_os_error(libc::EPERM))
+        });
+        terminate_bun_converter(&mut child).expect("clean up live converter");
+
+        let error = result.expect_err("a live child's permission error must propagate");
+        assert!(
+            error
+                .to_string()
+                .contains("failed to stop Bun lockfile converter")
+        );
+        assert!(error.to_string().contains("Operation not permitted"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn binary_converter_deadline_applies_after_parent_exit() {
+        with_fake_bun(
+            "#!/bin/sh\nprintf '{\"packages\":{}}'\nsleep 5 &\nexec /usr/bin/true\n",
+            || {
+                let input = tempfile::NamedTempFile::new().expect("converter input");
+                let started = Instant::now();
+
+                let result = run_bun_converter(input.path(), Duration::from_secs(2));
+
+                assert!(
+                    result
+                        .expect_err("an inherited open pipe must not disable the deadline")
+                        .to_string()
+                        .contains("timed out after 2 seconds")
+                );
+                assert!(started.elapsed() < Duration::from_secs(4));
             },
         );
     }
