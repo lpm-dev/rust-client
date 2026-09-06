@@ -9,8 +9,13 @@ pub const SIGNATURE_HEADER: &str = "X-LPM-Response-Signature";
 
 const SIGNATURE_VERSION: u8 = 4;
 const SIGNATURE_DOMAIN: &[u8] = b"lpm-authenticated-response\0";
-const CURRENT_KEY_ID: &str = "vault-2026-09";
+const CURRENT_KEY_ID: &str = "vault-2026-09-06";
 const CURRENT_PUBLIC_KEY: [u8; 32] = [
+    0x85, 0x86, 0x22, 0x5f, 0xd3, 0xa6, 0x3b, 0xf6, 0xd1, 0x95, 0x83, 0xee, 0x8f, 0xb1, 0xac, 0x8a,
+    0x8b, 0xd8, 0x5a, 0x4c, 0xf5, 0x6f, 0xe4, 0x12, 0x00, 0x30, 0x5f, 0xcf, 0x46, 0x1b, 0x96, 0x2a,
+];
+const PREVIOUS_KEY_ID: &str = "vault-2026-09";
+const PREVIOUS_PUBLIC_KEY: [u8; 32] = [
     0xbc, 0x44, 0xf7, 0x37, 0xb6, 0x25, 0x34, 0x24, 0x47, 0x46, 0x16, 0xd6, 0xab, 0x6e, 0x03, 0x12,
     0x77, 0x02, 0xd8, 0x06, 0x96, 0x4e, 0x96, 0x79, 0x11, 0x54, 0xf3, 0x21, 0x4f, 0x90, 0xc9, 0x1f,
 ];
@@ -97,7 +102,11 @@ pub fn verify_response(
     signature_header: Option<&str>,
 ) -> Result<(), SignatureError> {
     verify_response_with_trusted_key(status, body, key_id_header, signature_header, |key_id| {
-        (key_id == CURRENT_KEY_ID).then_some(CURRENT_PUBLIC_KEY)
+        match key_id {
+            CURRENT_KEY_ID => Some(CURRENT_PUBLIC_KEY),
+            PREVIOUS_KEY_ID => Some(PREVIOUS_PUBLIC_KEY),
+            _ => None,
+        }
     })
 }
 
@@ -171,6 +180,24 @@ mod tests {
         "ABiBKJ3ihBNVXfSmsCZEK_YdQa1Y2VQm8w3uU9apguJ3j4G1FhiHrLVjPQDLiqQUHJV_H6OIqrGWCpaRNAJ0CQ";
 
     #[test]
+    fn production_response_signature_accepts_the_deployed_key_and_binds_status_body_and_key_id() {
+        const KEY_ID: &str = "vault-2026-09-06";
+        const SIGNATURE: &str = "qHV0sHXlvnDewhvNfLUGNR09T96GC2YqkYxhy8K6JGPEOh0KOZB94jmdLodFv3WZb62yDBcExziVXge_dpuGDA";
+        let verified = verify_response(200, BODY, Some(KEY_ID), Some(SIGNATURE));
+        assert!(verified.is_ok(), "{verified:?}");
+
+        for (status, body, key_id) in [
+            (404, BODY, KEY_ID),
+            (200, b"changed".as_slice(), KEY_ID),
+            (200, BODY, "vault-2026-09"),
+        ] {
+            let error = verify_response(status, body, Some(key_id), Some(SIGNATURE))
+                .expect_err("a changed signed response must be rejected");
+            assert!(matches!(error, SignatureError::Mismatch), "{error:?}");
+        }
+    }
+
+    #[test]
     fn current_response_signature_matches_the_cross_language_fixture() {
         let verified =
             verify_response_with_test_key(200, BODY, Some(TEST_KEY_ID), Some(FIXTURE_SIGNATURE));
@@ -184,7 +211,7 @@ mod tests {
         let error = verify_response(
             200,
             BODY,
-            Some(CURRENT_KEY_ID),
+            Some(PREVIOUS_KEY_ID),
             Some(RFC_SIGNATURE_FOR_PRODUCTION_KEY_ID),
         )
         .expect_err("the production trust anchor must not use a published test private key");
