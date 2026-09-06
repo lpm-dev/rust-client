@@ -652,6 +652,8 @@ pub struct P256PairingKeyExchange {
     browser_public_bytes: Vec<u8>,
     ephemeral_public_bytes: Vec<u8>,
     ephemeral_public_key_b64: String,
+    encryption_info: &'static [u8],
+    sas_info: &'static [u8],
 }
 
 impl P256PairingKeyExchange {
@@ -663,11 +665,35 @@ impl P256PairingKeyExchange {
         )
     }
 
+    pub fn new_for_protocol(
+        browser_public_key_b64: &str,
+        protocol_version: u8,
+    ) -> Result<Self, String> {
+        Self::from_secret_for_protocol(
+            browser_public_key_b64,
+            p256::SecretKey::random(&mut rand::thread_rng()),
+            protocol_version,
+        )
+    }
+
     fn from_secret(
         browser_public_key_b64: &str,
         ephemeral_secret: p256::SecretKey,
     ) -> Result<Self, String> {
+        Self::from_secret_for_protocol(browser_public_key_b64, ephemeral_secret, 3)
+    }
+
+    fn from_secret_for_protocol(
+        browser_public_key_b64: &str,
+        ephemeral_secret: p256::SecretKey,
+        protocol_version: u8,
+    ) -> Result<Self, String> {
         use elliptic_curve::sec1::ToEncodedPoint;
+        let (encryption_info, sas_info): (&'static [u8], &'static [u8]) = match protocol_version {
+            3 => (PAIRING_ENCRYPTION_INFO, PAIRING_SAS_INFO),
+            4 => (b"lpm-dashboard-pair-org-v4", b"lpm-pair-org-sas-v4"),
+            _ => return Err("unsupported browser pairing protocol".into()),
+        };
 
         let browser_public_bytes = BASE64
             .decode(browser_public_key_b64)
@@ -687,6 +713,8 @@ impl P256PairingKeyExchange {
             browser_public_bytes,
             ephemeral_public_bytes,
             ephemeral_public_key_b64,
+            encryption_info,
+            sas_info,
         })
     }
 
@@ -707,7 +735,7 @@ impl P256PairingKeyExchange {
         let shared_secret = self.shared_secret();
         let hk = Hkdf::<Sha256>::new(Some(&[]), shared_secret.raw_secret_bytes().as_slice());
         let mut derived_key = [0u8; 32];
-        hk.expand(PAIRING_ENCRYPTION_INFO, &mut derived_key)
+        hk.expand(self.encryption_info, &mut derived_key)
             .expect("32-byte HKDF expansion is valid");
         encrypt(&derived_key, wrapping_key)
     }
@@ -716,13 +744,13 @@ impl P256PairingKeyExchange {
     /// ordered browser/CLI public keys.
     pub fn short_authentication_string(&self, pairing_code: &str) -> String {
         let mut salt = Vec::with_capacity(
-            PAIRING_SAS_INFO.len()
+            self.sas_info.len()
                 + pairing_code.len()
                 + self.browser_public_bytes.len()
                 + self.ephemeral_public_bytes.len()
                 + 3,
         );
-        salt.extend_from_slice(PAIRING_SAS_INFO);
+        salt.extend_from_slice(self.sas_info);
         salt.push(0);
         salt.extend_from_slice(pairing_code.as_bytes());
         salt.push(0);
@@ -733,7 +761,7 @@ impl P256PairingKeyExchange {
         let shared_secret = self.shared_secret();
         let hk = Hkdf::<Sha256>::new(Some(&salt), shared_secret.raw_secret_bytes().as_slice());
         let mut output = [0u8; 4];
-        hk.expand(PAIRING_SAS_INFO, &mut output)
+        hk.expand(self.sas_info, &mut output)
             .expect("4-byte HKDF expansion is valid");
         let value = u32::from_be_bytes(output) % 100_000_000;
         format!("{:04} {:04}", value / 10_000, value % 10_000)
@@ -1442,6 +1470,36 @@ mod tests {
             "BMWROJBAxLxAGItA6oI/47ay4MyHaC8FRvahmthBlzyLNbhic0DB/NZyzCGIgjXhOBsBsPk0WcP2U32il8d2HZE="
         );
         assert_eq!(exchange.short_authentication_string("ABC123"), "2108 4449");
+    }
+
+    #[test]
+    fn organization_pairing_matches_browser_domains_and_interoperability_vector() {
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        let browser_public = "BHxVGUyrg6Aqn2QCLhpKWxgxAKl8Fzge710Mk4EjOXaWb+2NIrZXsDeew/kaCDoKLvQ74/ux0Jrp4ZdVoFq98Go=";
+        let secret = URL_SAFE_NO_PAD
+            .decode("5dN15DKUl326VlUkWjxMwcreiXKehsYwgiuPDDbzr0c")
+            .unwrap();
+        let exchange = P256PairingKeyExchange::from_secret_for_protocol(
+            browser_public,
+            p256::SecretKey::from_slice(&secret).unwrap(),
+            4,
+        )
+        .unwrap();
+        assert_eq!(exchange.short_authentication_string("ABC123"), "0127 9348");
+        let wrapping_key: [u8; 32] =
+            hex::decode("ed34f44721b87876d142a4614dc866ee98778179ad61edf55734f2af0cd8aa85")
+                .unwrap()
+                .try_into()
+                .unwrap();
+        let encrypted = exchange.wrap_key(&[0x31; 32]).unwrap();
+        assert_eq!(decrypt(&wrapping_key, &encrypted).unwrap(), [0x31; 32]);
+        let personal = P256PairingKeyExchange::from_secret(
+            browser_public,
+            p256::SecretKey::from_slice(&secret).unwrap(),
+        )
+        .unwrap();
+        assert!(decrypt(&wrapping_key, &personal.wrap_key(&[0x31; 32]).unwrap()).is_err());
+        assert!(P256PairingKeyExchange::new_for_protocol(browser_public, 5).is_err());
     }
 
     #[test]

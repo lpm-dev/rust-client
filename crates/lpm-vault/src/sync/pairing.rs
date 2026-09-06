@@ -37,9 +37,9 @@ pub async fn get_pairing_session(
     }
 
     let session: PairingSession = read_capped_json(response).await?;
-    if session.protocol_version != 3 {
+    if !matches!(session.protocol_version, 3 | 4) {
         return Err(format!(
-            "pairing protocol 3 is required; server returned protocol {}",
+            "pairing protocol 3 or 4 is required; server returned protocol {}",
             session.protocol_version
         )
         .into());
@@ -47,21 +47,28 @@ pub async fn get_pairing_session(
     Ok(session)
 }
 
-/// Stage the protocol-v3 CLI public key before displaying the ECDH-derived SAS.
+/// Identity and protocol confirmed before approving a browser pairing.
+pub struct PairingRequest<'a> {
+    pub code: &'a str,
+    pub expected_principal_id: &'a str,
+    pub protocol_version: u8,
+}
+
+/// Stage the CLI public key before displaying the ECDH-derived SAS.
 pub async fn stage_pairing(
     registry_url: &str,
     auth_token: &str,
-    code: &str,
-    expected_principal_id: &str,
+    pairing: &PairingRequest<'_>,
     ephemeral_public_key: &str,
 ) -> Result<(), SyncError> {
     post_pairing(
         registry_url,
         auth_token,
-        code,
+        pairing.code,
         serde_json::json!({
             "action": "stage",
-            "expectedPrincipalId": expected_principal_id,
+            "expectedPrincipalId": pairing.expected_principal_id,
+            "protocolVersion": pairing.protocol_version,
             "ephemeralPublicKey": ephemeral_public_key,
         }),
         "staging",
@@ -69,22 +76,22 @@ pub async fn stage_pairing(
     .await
 }
 
-/// Approve a protocol-v3 pairing session after user SAS confirmation.
+/// Release encrypted key material only after user SAS confirmation.
 pub async fn approve_pairing(
     registry_url: &str,
     auth_token: &str,
-    code: &str,
-    expected_principal_id: &str,
+    pairing: &PairingRequest<'_>,
     encrypted_wrapping_key: &str,
     ephemeral_public_key: &str,
 ) -> Result<(), SyncError> {
     post_pairing(
         registry_url,
         auth_token,
-        code,
+        pairing.code,
         serde_json::json!({
             "action": "approve",
-            "expectedPrincipalId": expected_principal_id,
+            "expectedPrincipalId": pairing.expected_principal_id,
+            "protocolVersion": pairing.protocol_version,
             "encryptedWrappingKey": encrypted_wrapping_key,
             "ephemeralPublicKey": ephemeral_public_key,
         }),
@@ -269,8 +276,11 @@ mod tests {
         approve_pairing(
             &server.uri(),
             "auth-token",
-            "ABC123",
-            "user-123",
+            &PairingRequest {
+                code: "ABC123",
+                expected_principal_id: "user-123",
+                protocol_version: 3,
+            },
             "wrapped-key",
             "ephemeral-key",
         )
@@ -300,8 +310,11 @@ mod tests {
         stage_pairing(
             &server.uri(),
             "auth-token",
-            "ABC123",
-            "user-123",
+            &PairingRequest {
+                code: "ABC123",
+                expected_principal_id: "user-123",
+                protocol_version: 3,
+            },
             "ephemeral-key",
         )
         .await
@@ -377,8 +390,11 @@ mod tests {
         stage_pairing(
             &registry_url,
             "auth-token",
-            "ABC123",
-            "user-123",
+            &PairingRequest {
+                code: "ABC123",
+                expected_principal_id: "user-123",
+                protocol_version: 3,
+            },
             "ephemeral-key",
         )
         .await
@@ -386,8 +402,11 @@ mod tests {
         approve_pairing(
             &registry_url,
             "auth-token",
-            "ABC123",
-            "user-123",
+            &PairingRequest {
+                code: "ABC123",
+                expected_principal_id: "user-123",
+                protocol_version: 3,
+            },
             "wrapped-key",
             "ephemeral-key",
         )

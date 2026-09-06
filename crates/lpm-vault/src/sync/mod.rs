@@ -170,7 +170,7 @@ pub use org::{
     push_org_with_access, push_org_with_keys, push_org_with_keys_and_access,
 };
 pub use pairing::{
-    PairingSession, approve_pairing, get_pairing_session, stage_pairing, unpair_all,
+    PairingRequest, PairingSession, approve_pairing, get_pairing_session, stage_pairing, unpair_all,
 };
 pub use personal::{
     ListVaultsResponse, PersonalPushOptions, PullResponse, PulledPersonalVault, PushMetadata,

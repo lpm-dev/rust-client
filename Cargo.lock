@@ -4080,6 +4080,7 @@ dependencies = [
  "flate2",
  "futures-util",
  "hex",
+ "hkdf",
  "hmac",
  "insta",
  "libc",
