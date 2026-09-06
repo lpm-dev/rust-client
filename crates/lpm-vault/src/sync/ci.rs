@@ -100,6 +100,86 @@ pub async fn upload_escrow_key(
     Ok(())
 }
 
+/// An authenticated organization content key prepared for explicit CI decryption.
+/// Key material stays private and is cleared when this value is dropped.
+pub struct OrganizationCiEscrow {
+    pub(super) registry_url: String,
+    pub(super) org_slug: String,
+    pub(super) vault_id: String,
+    pub(super) principal_id: String,
+    pub(super) caller_user_id: String,
+    pub(super) version: i32,
+    pub(super) content_key_version: i32,
+    pub(super) content_key_hex: elliptic_curve::zeroize::Zeroizing<String>,
+}
+
+impl OrganizationCiEscrow {
+    /// Upload the key to the same registry and immutable organization that supplied it.
+    pub async fn upload(&self, auth_token: &str) -> Result<(), SyncError> {
+        #[derive(serde::Serialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Upload<'a> {
+            vault_id: &'a str,
+            org: &'a str,
+            expected_principal_id: &'a str,
+            expected_caller_user_id: &'a str,
+            expected_version: i32,
+            content_key_version: i32,
+            content_key_hex: &'a str,
+            allow_server_decryption: bool,
+        }
+        let body = Upload {
+            vault_id: &self.vault_id,
+            org: &self.org_slug,
+            expected_principal_id: &self.principal_id,
+            expected_caller_user_id: &self.caller_user_id,
+            expected_version: self.version,
+            content_key_version: self.content_key_version,
+            content_key_hex: self.content_key_hex.as_str(),
+            allow_server_decryption: true,
+        };
+        send_org_escrow_request(&self.registry_url, auth_token, reqwest::Method::POST, &body).await
+    }
+}
+
+/// Disable organization CI decryption and revoke issued project credentials.
+pub async fn disable_org_ci_escrow(
+    registry_url: &str,
+    auth_token: &str,
+    org_slug: &str,
+    vault_id: &str,
+    expected_principal_id: &str,
+) -> Result<(), SyncError> {
+    let body = serde_json::json!({ "vaultId": vault_id, "org": org_slug, "expectedPrincipalId": expected_principal_id });
+    send_org_escrow_request(registry_url, auth_token, reqwest::Method::DELETE, &body).await
+}
+
+async fn send_org_escrow_request<T: serde::Serialize + ?Sized>(
+    registry_url: &str,
+    auth_token: &str,
+    method: reqwest::Method,
+    body: &T,
+) -> Result<(), SyncError> {
+    let response = sync_http_client()?
+        .request(method, format!("{registry_url}/api/vault/oidc/escrow"))
+        .bearer_auth(auth_token)
+        .json(body)
+        .timeout(std::time::Duration::from_secs(30))
+        .send()
+        .await
+        .map_err(super::http::network_error)?;
+    let status = response.status();
+    if status.is_success() {
+        return Ok(());
+    }
+    let text = read_capped_error_text(response).await;
+    let message = serde_json::from_str::<serde_json::Value>(&text)
+        .ok()
+        .and_then(|body| body["error"].as_str().map(str::to_owned))
+        .unwrap_or_else(|| format!("organization CI request failed: {status}"));
+    Err(SyncError::http(status, message))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -1,3 +1,5 @@
+mod organization;
+
 use super::github::{github_api_url, validate_repository, validate_repository_id};
 use super::prelude::*;
 
@@ -123,16 +125,17 @@ pub(super) async fn vars_oidc(
             Ok(())
         }
         "allow" => vars_oidc_allow(client, &args[1..], project_dir, json_output).await,
-        "list" => vars_oidc_list(client, project_dir, json_output).await,
+        "list" => vars_oidc_list(client, &args[1..], project_dir, json_output).await,
+        "disable" => organization::disable(client, &args[1..], project_dir, json_output).await,
         unknown => Err(LpmError::Script(format!(
-            "unknown oidc action: '{unknown}'. Available: allow, list"
+            "unknown oidc action: '{unknown}'. Available: allow, list, disable"
         ))),
     }
 }
 
 fn print_oidc_help() {
     println!(
-        "Usage:\n  lpm env oidc allow [OPTIONS]\n  lpm env oidc list\n\n\
+        "Usage:\n  lpm env oidc allow [OPTIONS]\n  lpm env oidc list [--org=<slug>]\n  lpm env oidc disable --org=<slug>\n\n\
          Run `lpm env oidc allow --help` before updating an existing policy."
     );
 }
@@ -145,6 +148,8 @@ fn print_oidc_allow_help() {
   lpm env oidc allow --provider=gitlab --project-id=<numeric-project-id> --branch=<list> --env=<list>
 
 The CLI looks up the immutable ID for a public GitHub repository. For a private repository, set GITHUB_TOKEN or GH_TOKEN, or pass --repository-id.
+
+For organization projects, add --org=<slug> and --allow-server-decryption. An owner or admin must first share or pull the project. The server receives only this project's current content key. Key rotation disables CI access until you enable it again. Use `lpm env oidc disable --org=<slug>` to disable decryption and revoke CI credentials.
 
 This command replaces the policy's complete allowlists. Run `lpm env oidc list` first, then supply every branch, environment, workflow, and event that should remain allowed."#
     );
@@ -167,9 +172,18 @@ pub(super) async fn vars_oidc_allow(
     let mut events: Vec<String> = Vec::new();
     let mut events_supplied = false;
     let mut allow_forks = false;
+    let mut org = None;
+    let mut allow_server_decryption = false;
 
     for arg in args {
-        if let Some(v) = arg.strip_prefix("--provider=") {
+        if let Some(v) = arg.strip_prefix("--org=") {
+            organization::validate_selector(v)?;
+            if org.replace(v).is_some() {
+                return Err(LpmError::Script("supply --org only once".into()));
+            }
+        } else if *arg == "--allow-server-decryption" {
+            allow_server_decryption = true;
+        } else if let Some(v) = arg.strip_prefix("--provider=") {
             provider = v;
         } else if let Some(v) = arg.strip_prefix("--repo=") {
             repo = Some(v);
@@ -193,6 +207,15 @@ pub(super) async fn vars_oidc_allow(
                 "unknown OIDC policy argument: {arg}"
             )));
         }
+    }
+
+    if org.is_some() && !allow_server_decryption {
+        return Err(LpmError::Script("Organization CI access requires --allow-server-decryption. This shares the current project's content key with the server so authorized CI jobs can read its environments.".into()));
+    }
+    if org.is_none() && allow_server_decryption {
+        return Err(LpmError::Script(
+            "--allow-server-decryption requires --org=<slug>".into(),
+        ));
     }
 
     if envs.is_empty() {
@@ -319,18 +342,19 @@ pub(super) async fn vars_oidc_allow(
     }
 
     let manifest = super::sync_payload::CloudManifestSnapshot::read(project_dir)?;
-    let expected_principal_id = manifest
+    let expected_principal_id = if let Some(org) = org {
+        manifest.vault.org_sync_principal_for_registry(org, registry_client.base_url())
+            .map_err(LpmError::Script)?.ok_or_else(|| LpmError::Script("this checkout has no authenticated organization binding; share or pull the env project before configuring OIDC".into()))?
+    } else {
+        manifest.vault.personal_expected_principal_for_registry(registry_client.base_url())
+            .map_err(LpmError::Script)?.ok_or_else(|| LpmError::Script("this checkout has no authenticated personal binding; push or pull the env project before configuring OIDC".into()))?
+    };
+    let vault_id = manifest
         .vault
-        .personal_expected_principal_for_registry(registry_client.base_url())
+        .vault_id()
         .map_err(LpmError::Script)?
-        .ok_or_else(|| {
-            LpmError::Script(
-                "this checkout has no authenticated personal binding; push or pull the env project before configuring OIDC"
-                    .into(),
-            )
-        })?;
-    let vault_id =
-        lpm_vault::vault_id::get_or_create_vault_id(project_dir).map_err(LpmError::Script)?;
+        .ok_or_else(|| LpmError::Script("no env project configured".into()))?
+        .to_owned();
     let mut policy_body = serde_json::json!({
         "vaultId": vault_id,
         "provider": provider,
@@ -342,37 +366,66 @@ pub(super) async fn vars_oidc_allow(
         "allowForks": allow_forks,
         "expectedPrincipalId": expected_principal_id,
     });
+    if let Some(org) = org {
+        policy_body["org"] = serde_json::Value::String(org.to_owned());
+    }
     if let Some(repository_id) = &repository_id {
         policy_body["repositoryId"] = serde_json::Value::String(repository_id.clone());
     }
     let result =
         super::auth::execute_lpm_with_bearer(registry_client, |registry_url, auth_token| {
             let policy_body = policy_body.clone();
-            async move { create_oidc_policy(&registry_url, &auth_token, &policy_body).await }
+            async move {
+                if let Some(org) = org {
+                    super::sync_payload::fresh_org_mutation_manifest(
+                        project_dir,
+                        policy_body["vaultId"].as_str().unwrap_or_default(),
+                        org,
+                        &registry_url,
+                        policy_body["expectedPrincipalId"].as_str(),
+                    )
+                    .map_err(LpmError::Script)?;
+                }
+                create_oidc_policy(&registry_url, &auth_token, &policy_body).await
+            }
         })
         .await?;
     let policy_id = policy_id_from_response(&result)?;
 
-    let wrapping_key = lpm_vault::crypto::get_or_create_wrapping_key()
-        .map_err(|error| oidc_escrow_setup_error("retrieving the local wrapping key", &error))?;
-    let wrapping_key_hex = hex::encode(wrapping_key);
-    super::auth::execute_sync_with_bearer(registry_client, |registry_url, auth_token| {
-        let vault_id = vault_id.clone();
-        let wrapping_key_hex = wrapping_key_hex.clone();
-        let expected_principal_id = expected_principal_id.clone();
-        async move {
-            lpm_vault::sync::upload_escrow_key(
-                &registry_url,
-                &auth_token,
-                &vault_id,
-                &wrapping_key_hex,
-                &expected_principal_id,
-            )
-            .await
-        }
-    })
-    .await
-    .map_err(|error| oidc_escrow_setup_error("uploading the wrapping key", &error.to_string()))?;
+    if let Some(org) = org {
+        organization::enable(
+            registry_client,
+            project_dir,
+            org,
+            &vault_id,
+            &expected_principal_id,
+        )
+        .await?;
+    } else {
+        let wrapping_key = lpm_vault::crypto::get_or_create_wrapping_key().map_err(|error| {
+            oidc_escrow_setup_error("retrieving the local wrapping key", &error)
+        })?;
+        let wrapping_key_hex = hex::encode(wrapping_key);
+        super::auth::execute_sync_with_bearer(registry_client, |registry_url, auth_token| {
+            let vault_id = vault_id.clone();
+            let wrapping_key_hex = wrapping_key_hex.clone();
+            let expected_principal_id = expected_principal_id.clone();
+            async move {
+                lpm_vault::sync::upload_escrow_key(
+                    &registry_url,
+                    &auth_token,
+                    &vault_id,
+                    &wrapping_key_hex,
+                    &expected_principal_id,
+                )
+                .await
+            }
+        })
+        .await
+        .map_err(|error| {
+            oidc_escrow_setup_error("uploading the wrapping key", &error.to_string())
+        })?;
+    }
 
     if json_output {
         println!(
@@ -543,14 +596,18 @@ async fn list_oidc_policies(
     registry_url: &str,
     auth_token: &str,
     vault_id: &str,
+    org: Option<&str>,
 ) -> Result<serde_json::Value, LpmError> {
     let client = lpm_http::client_builder()
         .build()
         .map_err(|error| LpmError::Network(format!("failed to build HTTP client: {error}")))?;
-    let response = client
-        .get(format!(
-            "{registry_url}/api/vault/oidc/policies?vaultId={vault_id}"
-        ))
+    let mut request = client
+        .get(format!("{registry_url}/api/vault/oidc/policies"))
+        .query(&[("vaultId", vault_id)]);
+    if let Some(org) = org {
+        request = request.query(&[("org", org)]);
+    }
+    let response = request
         .bearer_auth(auth_token)
         .timeout(std::time::Duration::from_secs(30))
         .send()
@@ -567,15 +624,17 @@ async fn list_oidc_policies(
 /// `lpm env oidc list`
 pub(super) async fn vars_oidc_list(
     registry_client: &lpm_registry::RegistryClient,
+    args: &[&str],
     project_dir: &std::path::Path,
     json_output: bool,
 ) -> Result<(), LpmError> {
+    let org = organization::selector(args)?;
     let vault_id = lpm_vault::vault_id::read_vault_id(project_dir)
         .ok_or_else(|| LpmError::Script("no vault configured".into()))?;
     let result =
         super::auth::execute_lpm_with_bearer(registry_client, |registry_url, auth_token| {
             let vault_id = vault_id.clone();
-            async move { list_oidc_policies(&registry_url, &auth_token, &vault_id).await }
+            async move { list_oidc_policies(&registry_url, &auth_token, &vault_id, org).await }
         })
         .await?;
     let policies = result["policies"]

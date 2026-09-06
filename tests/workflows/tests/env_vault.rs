@@ -8056,3 +8056,203 @@ async fn env_rotate_sharing_key_refuses_yes_flag_explicitly() {
         "expected the explicit refusal regardless of --yes; got: {combined}"
     );
 }
+
+#[tokio::test]
+async fn env_oidc_org_allow_requires_explicit_server_decryption_before_network() {
+    let project = TempProject::empty(r#"{"name":"org-ci-consent","version":"1.0.0"}"#);
+    let mock = MockRegistry::start().await;
+    let result = lpm(&project)
+        .env("LPM_REGISTRY_URL", mock.url())
+        .args([
+            "env",
+            "oidc",
+            "allow",
+            "--org=acme",
+            "--provider=gitlab",
+            "--project-id=123",
+            "--env=production",
+        ])
+        .output()
+        .unwrap();
+    assert!(!result.status.success());
+    assert!(
+        String::from_utf8_lossy(&result.stderr).contains("--allow-server-decryption"),
+        "stdout: {} stderr: {}",
+        String::from_utf8_lossy(&result.stdout),
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert!(mock.server().received_requests().await.unwrap().is_empty());
+    assert!(!project.path().join("lpm.json").exists());
+}
+
+#[tokio::test]
+async fn env_oidc_org_allow_transfers_only_the_authenticated_project_content_key() {
+    let project = TempProject::empty(r#"{"name":"org-ci-allow","version":"1.0.0"}"#);
+    let mock = MockRegistry::start().await;
+    let vault_id = "org-ci-project";
+    let org_id = "00000000-0000-4000-8000-000000000001";
+    project.write_file(
+        "lpm.json",
+        &serde_json::json!({"vault":vault_id}).to_string(),
+    );
+    lpm_vault::vault_id::write_org_sync_version_for_principal(
+        project.path(),
+        "acme",
+        7,
+        lpm_vault::vault_id::SyncPrincipal {
+            registry_url: &mock.url(),
+            principal_id: org_id,
+        },
+    )
+    .unwrap();
+    seed_sessions(
+        project.home(),
+        &[SessionSeed {
+            registry_url: &mock.url(),
+            access_token: Some("session-access-token"),
+            refresh_token: Some("refresh"),
+            session_access_expires_at: Some("2030-01-01T00:00:00Z"),
+        }],
+    );
+    let (private_key, public_key, _, fingerprint) = seed_org_sharing_key(&project, &mock.url());
+    let content_key = mount_org_rotation_pull(
+        &mock,
+        OrgRotationPullFixture {
+            auth_token: "session-access-token",
+            org_slug: "acme",
+            vault_id,
+            payload: &serde_json::json!({"environments":{"production":{"CHECK":"fixture"}}}),
+            public_key: &public_key,
+            version: 7,
+            content_key_version: 3,
+            recipient_fingerprint: &fingerprint,
+        },
+    )
+    .await;
+    Mock::given(method("POST"))
+        .and(path("/api/vault/oidc/policies"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(serde_json::json!({"status":"ok","policyId":TEST_OIDC_POLICY_ID})),
+        )
+        .expect(1)
+        .mount(mock.server())
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/vault/oidc/escrow"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"status":"ok"})))
+        .expect(1)
+        .mount(mock.server())
+        .await;
+    let result = lpm(&project)
+        .env("LPM_REGISTRY_URL", mock.url())
+        .args([
+            "--json",
+            "env",
+            "oidc",
+            "allow",
+            "--org=acme",
+            "--allow-server-decryption",
+            "--provider=gitlab",
+            "--project-id=123",
+            "--env=production",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    insta::assert_json_snapshot!(parse_json_output(&result.stdout), @r#"
+    {
+      "status": "ok",
+      "policyId": "11111111-1111-4111-8111-111111111111"
+    }
+    "#);
+    let requests = mock.server().received_requests().await.unwrap();
+    let escrow = requests
+        .iter()
+        .find(|r| r.url.path() == "/api/vault/oidc/escrow")
+        .unwrap();
+    let body: serde_json::Value = serde_json::from_slice(&escrow.body).unwrap();
+    assert_eq!(
+        body,
+        serde_json::json!({"vaultId":vault_id,"org":"acme","expectedPrincipalId":org_id,"expectedCallerUserId":"11111111-1111-4111-8111-111111111111","expectedVersion":7,"contentKeyVersion":3,"contentKeyHex":hex::encode(content_key),"allowServerDecryption":true})
+    );
+    assert_ne!(body["contentKeyHex"], hex::encode(private_key));
+    let policy: serde_json::Value = serde_json::from_slice(
+        &requests
+            .iter()
+            .find(|r| r.url.path() == "/api/vault/oidc/policies")
+            .unwrap()
+            .body,
+    )
+    .unwrap();
+    assert_eq!(policy["org"], "acme");
+    assert_eq!(policy["expectedPrincipalId"], org_id);
+    assert!(!String::from_utf8_lossy(&result.stdout).contains(&hex::encode(content_key)));
+    assert!(!project.home().join(".lpm/.vault-key").exists());
+}
+
+#[tokio::test]
+async fn env_oidc_org_list_and_disable_preserve_the_organization_selector() {
+    let project = TempProject::empty(r#"{"name":"org-ci-controls","version":"1.0.0"}"#);
+    let mock = MockRegistry::start().await;
+    project.write_file("lpm.json", r#"{"vault":"org-ci-project"}"#);
+    let org_id = "00000000-0000-4000-8000-000000000001";
+    lpm_vault::vault_id::write_org_sync_version_for_principal(
+        project.path(),
+        "acme",
+        7,
+        lpm_vault::vault_id::SyncPrincipal {
+            registry_url: &mock.url(),
+            principal_id: org_id,
+        },
+    )
+    .unwrap();
+    seed_sessions(
+        project.home(),
+        &[SessionSeed {
+            registry_url: &mock.url(),
+            access_token: Some("session-access-token"),
+            refresh_token: Some("refresh"),
+            session_access_expires_at: Some("2030-01-01T00:00:00Z"),
+        }],
+    );
+    Mock::given(method("GET"))
+        .and(path("/api/vault/oidc/policies"))
+        .and(query_param("org", "acme"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"policies":[]})))
+        .expect(1)
+        .mount(mock.server())
+        .await;
+    Mock::given(method("DELETE")).and(path("/api/vault/oidc/escrow"))
+        .and(wiremock::matchers::body_json(serde_json::json!({"vaultId":"org-ci-project","org":"acme","expectedPrincipalId":org_id})))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"status":"disabled"}))).expect(1).mount(mock.server()).await;
+    for action in ["list", "disable"] {
+        let result = lpm(&project)
+            .env("LPM_REGISTRY_URL", mock.url())
+            .args(["--json", "env", "oidc", action, "--org=acme"])
+            .output()
+            .unwrap();
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        if action == "disable" {
+            insta::assert_json_snapshot!(parse_json_output(&result.stdout), @r#"
+            {
+              "status": "disabled"
+            }
+            "#);
+        } else {
+            insta::assert_json_snapshot!(parse_json_output(&result.stdout), @r#"
+            {
+              "policies": []
+            }
+            "#);
+        }
+    }
+}

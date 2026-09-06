@@ -163,11 +163,14 @@ impl From<&str> for SyncError {
 }
 
 pub use audit::{AuditEntry, AuditResponse, get_audit_log};
-pub use ci::{CiPullResponse, ci_pull, upload_escrow_key};
+pub use ci::{
+    CiPullResponse, OrganizationCiEscrow, ci_pull, disable_org_ci_escrow, upload_escrow_key,
+};
 pub use org::{
     OrgPushRequest, PulledOrgVault, list_org_vaults, org_version_preflight_bound_to_principal,
-    pull_org, pull_org_bound_to_principal, pull_org_with_scoped_key_bound_to_principal, push_org,
-    push_org_with_access, push_org_with_keys, push_org_with_keys_and_access,
+    prepare_org_ci_escrow, pull_org, pull_org_bound_to_principal,
+    pull_org_with_scoped_key_bound_to_principal, push_org, push_org_with_access,
+    push_org_with_keys, push_org_with_keys_and_access,
 };
 pub use pairing::{
     PairingRequest, PairingSession, approve_pairing, get_pairing_session, stage_pairing, unpair_all,

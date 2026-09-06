@@ -261,6 +261,51 @@ async fn pull_org_with_content_key(
     })
 }
 
+/// Authenticate and decrypt the current project before preparing its content key for CI.
+pub async fn prepare_org_ci_escrow(
+    registry_url: &str,
+    auth_token: &str,
+    org_slug: &str,
+    vault_id: &str,
+    expected_principal_id: &str,
+) -> Result<super::ci::OrganizationCiEscrow, SyncError> {
+    use elliptic_curve::zeroize::{Zeroize, Zeroizing};
+    let mut current = fetch_org_with_content_key(
+        sync_http_client()?,
+        registry_url,
+        auth_token,
+        org_slug,
+        vault_id,
+        None,
+        Some(expected_principal_id),
+    )
+    .await?;
+    let result = crypto::decrypt_vault_payload(
+        &current.content_key,
+        &current.encrypted_blob,
+        crypto::VaultScope::Organization(org_slug),
+        &current.principal_id,
+        vault_id,
+        current.version,
+        current.crypto_version,
+    )
+    .map(|plaintext| {
+        drop(Zeroizing::new(plaintext));
+        super::ci::OrganizationCiEscrow {
+            registry_url: registry_url.to_owned(),
+            org_slug: org_slug.to_owned(),
+            vault_id: vault_id.to_owned(),
+            principal_id: current.principal_id,
+            caller_user_id: current.caller_user_id,
+            version: current.version,
+            content_key_version: current.content_key_version,
+            content_key_hex: Zeroizing::new(hex::encode(current.content_key)),
+        }
+    });
+    current.content_key.zeroize();
+    result.map_err(SyncError::from)
+}
+
 async fn fetch_org_with_content_key(
     client: &reqwest::Client,
     registry_url: &str,
