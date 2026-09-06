@@ -4,7 +4,7 @@ on:
   push:
     branches: [main]
   pull_request:
-    branches: [main]
+    branches: [main, "codex/**"]
   # `workflow_dispatch` lets developers run the long audits on demand;
   # `schedule` catches real-world project regressions without waiting on a
   # user report. The jobs are gated to these triggers because they clone
