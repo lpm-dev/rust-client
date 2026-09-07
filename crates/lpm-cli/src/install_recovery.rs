@@ -238,7 +238,7 @@ impl Recovery {
         }
         sync_directory(&state)?;
         let lpm = self.directory.open_dir_nofollow(".lpm")?;
-        lpm.remove_dir(DIRECTORY)?;
+        state.remove_open_dir()?;
         sync_directory(&lpm)
     }
 
