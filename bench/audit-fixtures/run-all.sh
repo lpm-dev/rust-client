@@ -93,6 +93,7 @@ FIXTURES=(
 
 declare -a RESULTS=()
 declare -a FIXTURE_NAMES=()
+harness_failures=0
 
 date
 echo "[audit] running all ${#FIXTURES[@]} fixtures"
@@ -103,13 +104,16 @@ for fixture in "${FIXTURES[@]}"; do
     echo "=========================================="
     echo "  $fixture"
     echo "=========================================="
-    set +e
-    output=$("$HERE/run-audit.sh" "$fixture" 2>&1)
-    exit_code=$?
-    set -e
-    echo "$output"
-
     fixture_name="$(echo "$fixture" | tr '/' '-')"
+    mkdir -p "$HERE/results"
+    set +e
+    "$HERE/run-audit.sh" "$fixture" 2>&1 | tee "$HERE/results/$fixture_name.log"
+    audit_status=("${PIPESTATUS[@]}")
+    set -e
+    if [[ ${audit_status[0]} -ne 0 || ${audit_status[1]} -ne 0 ]]; then
+        harness_failures=$((harness_failures+1))
+    fi
+
     iso=$(ls -t "$HERE/results/$fixture_name-isolated-"*.json 2>/dev/null | head -1)
     hst=$(ls -t "$HERE/results/$fixture_name-hoisted-"*.json 2>/dev/null | head -1)
     iso_verdict=$(json_field_or_default "$iso" verdict "?")
@@ -130,6 +134,7 @@ pass_count=0
 skip_count=0
 symmetric_non_pass=0
 asymmetric_count=0
+timeout_count=0
 symmetric_issue_rows=()
 asymmetric_rows=()
 for i in "${!FIXTURE_NAMES[@]}"; do
@@ -138,6 +143,9 @@ for i in "${!FIXTURE_NAMES[@]}"; do
     hst_file=$(ls -t "$HERE/results/$fixture_name-hoisted-"*.json 2>/dev/null | head -1)
     iso_c=$(json_field_or_default "$iso_file" classification "?")
     hst_c=$(json_field_or_default "$hst_file" classification "?")
+    if [[ "$iso_c" == "install-timeout" || "$hst_c" == "install-timeout" ]]; then
+        timeout_count=$((timeout_count+1))
+    fi
     if [[ "$iso_c" == "$hst_c" ]]; then
         category_summary="$iso_c"
     else
@@ -192,11 +200,8 @@ if [[ ${#asymmetric_rows[@]} -gt 0 ]]; then
     echo
 fi
 
-# CI exit semantics: asymmetric outcomes (PASS/FAIL or FAIL/PASS) ARE
-# regressions and exit non-zero. Symmetric outcomes (both PASS or both
-# FAIL or both SKIP) are not — the audit's question is "does hoisted
-# regress vs isolated," and equal-outcome failures across modes are
-# adjacent bugs, not hoisting regressions.
+# Matching package failures are diagnostic. Deadlines and harness errors
+# cannot establish compatibility and must fail even when both modes agree.
 asymmetric=0
 for v in "${RESULTS[@]}"; do
     case "$v" in
@@ -207,6 +212,16 @@ for v in "${RESULTS[@]}"; do
 done
 
 date
+
+if [[ $harness_failures -gt 0 ]]; then
+    echo "FAIL: fixture harness failed for $harness_failures fixture(s)"
+    exit 1
+fi
+
+if [[ $timeout_count -gt 0 ]]; then
+    echo "FAIL: $timeout_count fixture(s) exceeded the install deadline"
+    exit 1
+fi
 
 if [[ $asymmetric -gt 0 ]]; then
     echo

@@ -32,6 +32,13 @@ sudo ./bench/install-audit-security-policy.sh
 LPM_AUDIT_ALLOW_NEW=1 ./bench/realworld-audit/run-all.sh
 ```
 
+## Install deadlines
+
+Install attempts use the shared [audit deadline](../audit-fixtures/README.md).
+The default is 180 seconds, with an override through `LPM_AUDIT_INSTALL_TIMEOUT_SECS`.
+An expired install deadline fails the suite even if both linker modes time out.
+Harness errors also fail the suite.
+
 ## Layout
 
 ```

@@ -109,6 +109,11 @@ jobs:
       - name: Audit harness helper tests
         run: bash bench/test-audit-install-args.sh
 
+      - name: Audit install deadline tests
+        run: |
+          python3 bench/test_audit_install_timeout.py
+          python3 bench/audit-fixtures/test_classify_result.py
+
       - name: Local install bench helper tests
         run: bash bench/test-local-install.sh
 
@@ -528,7 +533,7 @@ jobs:
     # suite catches mode-asymmetric regressions: a fix that lands and
     # accidentally breaks hoisted (or isolated) for a real-world package
     # shape. Equal-outcome failures across modes don't gate the build;
-    # only asymmetric outcomes do.
+    # asymmetric outcomes, install deadlines, and harness errors do.
     #
     # The matrix runs the suite under both the active v2 virtual store
     # backend and the explicit v1 rollback path (`LPM_STORE_VERSION=v1`).
@@ -587,6 +592,10 @@ jobs:
 
       - name: Build lpm-rs (release)
         run: cargo build --locked --release -p lpm-cli
+
+      - name: Audit install deadline tests
+        shell: bash
+        run: python3 bench/test_audit_install_timeout.py
 
       - name: Install audit security policy
         if: runner.os == 'Linux'
@@ -728,10 +737,7 @@ jobs:
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
         with:
           name: top-npm-audit-results
-          # The result JSONs land in bench/audit-fixtures/results/
-          # because run-audit.sh writes there; pick them up by their
-          # `top-npm-` filename prefix to keep artifacts focused.
-          path: bench/audit-fixtures/results/top-npm-*.json
+          path: bench/audit-fixtures/results/top-npm-*
           retention-days: 30
 
   bench:

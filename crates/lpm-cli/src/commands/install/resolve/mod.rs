@@ -10,7 +10,7 @@ mod peer;
 mod tests;
 
 pub(super) use fetch_schedule::{
-    prioritize_fetch_schedule, promote_fetch_candidate, v2_streaming_candidate_key,
+    prioritize_fetch_schedule, promote_fetch_candidate, reserve_v2_streaming_candidate,
 };
 pub(super) use metadata::{
     MetadataCaches, MetadataRequestContext, MetadataStats, metadata_for_package,

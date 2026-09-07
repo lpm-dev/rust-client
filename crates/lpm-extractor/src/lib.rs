@@ -1222,8 +1222,10 @@ where
 {
     let decoder = GzDecoder::new(reader);
     let limited = DecompressedLimitReader::new(decoder, limits.max_decompressed_stream_size());
+    // Tar headers and small files otherwise re-enter inflate for each short read.
+    let buffered = std::io::BufReader::with_capacity(64 * 1024, limited);
     extract_tar_archive_with_inspector(
-        limited,
+        buffered,
         target_dir,
         limits,
         compute_blake3,
@@ -2193,6 +2195,58 @@ mod tests {
             payload
         );
         assert_eq!(inspected, payload);
+    }
+
+    #[test]
+    fn streaming_short_reads_preserve_entries_and_digests_across_decode_buffer_boundaries() {
+        struct ShortReads<R>(R);
+        impl<R: std::io::Read> std::io::Read for ShortReads<R> {
+            fn read(&mut self, output: &mut [u8]) -> std::io::Result<usize> {
+                let len = output.len().min(7);
+                self.0.read(&mut output[..len])
+            }
+        }
+
+        let first = vec![b'a'; 65_001];
+        let second = vec![b'b'; 67_003];
+        let tgz = create_test_tarball_with_entries(&[
+            ("first.js", first.as_slice()),
+            ("second.bin", second.as_slice()),
+        ]);
+        let dir = tempfile::tempdir().unwrap();
+        let files = extract_tarball_from_reader_streaming_with_entry_digests(
+            ShortReads(tgz.as_slice()),
+            dir.path(),
+            |path, _| path == Path::new("first.js"),
+            |_| {},
+        )
+        .unwrap();
+
+        for (file, name, bytes) in [
+            (&files[0], "first.js", first),
+            (&files[1], "second.bin", second),
+        ] {
+            assert_eq!(file.relative_path, Path::new(name));
+            assert_eq!(file.blake3_digest, *blake3::hash(&bytes).as_bytes());
+            assert_eq!(std::fs::read(dir.path().join(name)).unwrap(), bytes);
+        }
+    }
+
+    #[test]
+    fn streaming_decode_buffer_drain_rejects_a_truncated_gzip_trailer() {
+        let mut tgz = create_test_tarball("index.js", b"module.exports = 1;");
+        tgz.truncate(tgz.len() - 4);
+        let dir = tempfile::tempdir().unwrap();
+
+        let result = extract_tarball_from_reader_streaming_with_entry_digests(
+            tgz.as_slice(),
+            dir.path(),
+            |_, _| false,
+            |_| {},
+        );
+
+        assert!(result.is_err());
+        assert!(!dir.path().join("index.js").exists());
     }
 
     #[test]
