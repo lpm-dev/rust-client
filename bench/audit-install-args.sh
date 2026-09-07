@@ -67,11 +67,16 @@ EOF
 lpm_audit_run_install() {
     local bin="${1:?lpm binary path required}"
     shift
+    local runner="$(dirname "${BASH_SOURCE[0]}")/run-audit-install.py"
+    if lpm_audit_is_windows && command -v cygpath &>/dev/null; then
+        runner="$(cygpath -w "$runner")"
+        bin="$(cygpath -w "$bin")"
+    fi
 
     if [[ "${#LPM_AUDIT_INSTALL_ARGS[@]}" -gt 0 ]]; then
-        "$bin" install "${LPM_AUDIT_INSTALL_ARGS[@]}" "$@"
+        python3 "$runner" "$bin" install "${LPM_AUDIT_INSTALL_ARGS[@]}" "$@"
     else
-        "$bin" install "$@"
+        python3 "$runner" "$bin" install "$@"
     fi
 }
 
@@ -127,7 +132,7 @@ lpm_audit_run_install_with_retries() {
             return 0
         fi
 
-        if (( attempt >= max_attempts )) || ! lpm_audit_install_failure_is_retryable "$tmp_out" "$tmp_err"; then
+        if [[ $rc -ne 1 ]] || (( attempt >= max_attempts )) || ! lpm_audit_install_failure_is_retryable "$tmp_out" "$tmp_err"; then
             rm -f "$tmp_out" "$tmp_err"
             return "$rc"
         fi

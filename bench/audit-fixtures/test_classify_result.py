@@ -20,6 +20,10 @@ def classify(payload):
 
 
 class ClassifyResultTest(unittest.TestCase):
+    def test_marks_install_deadlines_separately_from_registry_failures(self):
+        result = classify({"verdict": "FAIL", "install_exit": 124})
+        self.assertEqual(result["classification"], "install-timeout")
+
     def test_marks_install_engine_errors_as_runtime_mismatch(self):
         result = classify(
             {

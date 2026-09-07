@@ -76,3 +76,10 @@ packages whose real consumer contract is not a blank-project root import.
 
 Workflow-dispatch + weekly schedule only (see `.github/workflows/ci.yml`).
 Each run takes ~5–15 minutes depending on parallelism + network.
+
+## Install deadlines
+
+Install attempts use the shared [audit deadline](../audit-fixtures/README.md).
+The default is 180 seconds, with an override through `LPM_AUDIT_INSTALL_TIMEOUT_SECS`.
+An expired install deadline fails the suite even if both linker modes time out.
+Harness errors also fail the suite.
