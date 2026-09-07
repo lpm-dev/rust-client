@@ -10,6 +10,7 @@ use super::{InstallOmitPolicy, InstallPackage, LpmError, PeerWarning, install_pk
 
 pub(super) struct WorkspaceResolutionCoordinator {
     resolution_permits: Arc<Semaphore>,
+    reserved_root_permit: std::sync::Mutex<Option<OwnedSemaphorePermit>>,
     release_age_reference_unix: i64,
     target_count: usize,
     materialized: Box<[TargetCompletion]>,
@@ -38,6 +39,7 @@ impl WorkspaceResolutionCoordinator {
     ) -> Self {
         Self {
             resolution_permits: Arc::new(Semaphore::new(resolution_concurrency.max(1))),
+            reserved_root_permit: std::sync::Mutex::new(None),
             release_age_reference_unix,
             target_count,
             materialized: (0..target_count)
@@ -64,6 +66,13 @@ impl WorkspaceResolutionCoordinator {
             release_age_reference_unix,
         );
         coordinator.root_index = Some(root_index);
+        // Spawn order does not guarantee poll order. Members must not take
+        // every permit while waiting for the root's peer-provider snapshot.
+        coordinator.reserved_root_permit = std::sync::Mutex::new(Some(
+            Arc::clone(&coordinator.resolution_permits)
+                .try_acquire_owned()
+                .expect("a new workspace coordinator has a resolution permit"),
+        ));
         coordinator
     }
 
@@ -80,10 +89,21 @@ impl WorkspaceResolutionCoordinator {
     }
 
     async fn enter(self: &Arc<Self>, index: usize) -> Arc<WorkspaceResolutionTask> {
-        let resolution_permit = Arc::clone(&self.resolution_permits)
-            .acquire_owned()
-            .await
-            .expect("workspace resolution semaphore must outlive target tasks");
+        let reserved_permit = if self.root_index == Some(index) {
+            self.reserved_root_permit
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take()
+        } else {
+            None
+        };
+        let resolution_permit = match reserved_permit {
+            Some(permit) => permit,
+            None => Arc::clone(&self.resolution_permits)
+                .acquire_owned()
+                .await
+                .expect("workspace resolution semaphore must outlive target tasks"),
+        };
         Arc::new(WorkspaceResolutionTask {
             coordinator: Arc::clone(self),
             index,
@@ -2813,6 +2833,112 @@ mod tests {
 
         assert!(first.is_none());
         assert!(second.is_none());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn root_resolution_progresses_when_members_are_polled_first() {
+        let project = tempfile::tempdir().unwrap();
+        std::fs::write(project.path().join("package.json"), b"{}").unwrap();
+        for limit in 1..=3 {
+            let root_index = limit + 1;
+            let coordinator = Arc::new(WorkspaceResolutionCoordinator::new_with_root_at_unix(
+                root_index + 1,
+                limit,
+                root_index,
+                1_800_000_000,
+            ));
+            let mut members = (0..root_index)
+                .map(|index| {
+                    let coordinator = Arc::clone(&coordinator);
+                    Box::pin(scope(Arc::clone(&coordinator), index, async move {
+                        coordinator.wait_for_root_providers().await
+                    }))
+                })
+                .collect::<Vec<_>>();
+            for member in &mut members {
+                assert!(futures::poll!(member.as_mut()).is_pending());
+            }
+
+            tokio::time::timeout(
+                std::time::Duration::from_secs(1),
+                scope(Arc::clone(&coordinator), root_index, async {
+                    coordinator.publish_root_providers(RootProviderSnapshot::new(
+                        project.path(),
+                        Vec::new(),
+                        &[],
+                        InstallOmitPolicy::default(),
+                        &HashSet::new(),
+                        &HashSet::new(),
+                    ));
+                    Ok::<_, LpmError>(())
+                }),
+            )
+            .await
+            .expect("members waiting for root providers must not prevent root resolution")
+            .unwrap();
+            for member in members {
+                assert!(member.await.unwrap().is_some());
+            }
+            assert_eq!(coordinator.resolution_permits.available_permits(), limit);
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn root_reservation_counts_toward_the_resolution_limit() {
+        let coordinator = Arc::new(WorkspaceResolutionCoordinator::new_with_root_at_unix(
+            3,
+            2,
+            2,
+            1_800_000_000,
+        ));
+        let first = coordinator.enter(0).await;
+        let mut second = Box::pin(coordinator.enter(1));
+        assert!(futures::poll!(second.as_mut()).is_pending());
+        let root = coordinator.enter(2).await;
+        assert!(futures::poll!(second.as_mut()).is_pending());
+        root.finish_resolution();
+        let second = second.await;
+        assert_eq!(coordinator.resolution_permits.available_permits(), 0);
+        first.finish_resolution();
+        second.finish_resolution();
+        assert_eq!(coordinator.resolution_permits.available_permits(), 2);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn root_failure_releases_members_polled_before_the_root() {
+        let coordinator = Arc::new(WorkspaceResolutionCoordinator::new_with_root_at_unix(
+            3,
+            2,
+            2,
+            1_800_000_000,
+        ));
+        let mut members = (0..2)
+            .map(|index| {
+                let coordinator = Arc::clone(&coordinator);
+                Box::pin(scope(Arc::clone(&coordinator), index, async move {
+                    coordinator.wait_for_root_providers().await
+                }))
+            })
+            .collect::<Vec<_>>();
+        for member in &mut members {
+            assert!(futures::poll!(member.as_mut()).is_pending());
+        }
+        assert_eq!(
+            scope(Arc::clone(&coordinator), 2, async {
+                Err::<(), _>("root resolution failed")
+            })
+            .await,
+            Err("root resolution failed")
+        );
+        for member in members {
+            let error = member.await.err().expect("root failure reaches the member");
+            assert!(
+                error
+                    .to_string()
+                    .contains("workspace root resolution failed")
+            );
+        }
+        assert_eq!(coordinator.resolution_permits.available_permits(), 2);
     }
 
     #[tokio::test(flavor = "current_thread")]
