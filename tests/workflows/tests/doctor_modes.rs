@@ -477,15 +477,26 @@ async fn doctor_all_does_not_call_a_token_invalid_when_whoami_returns_500() {
 
 #[tokio::test]
 async fn doctor_all_skips_authenticated_tunnel_lookup_after_token_rejection() {
+    assert_doctor_rejected_env_token(false).await;
+}
+
+#[tokio::test]
+async fn doctor_all_explains_rejected_ci_environment_token_recovery() {
+    assert_doctor_rejected_env_token(true).await;
+}
+
+async fn assert_doctor_rejected_env_token(ci_oidc: bool) {
     let project = TempProject::empty(r#"{"name":"auth-tunnel","version":"1.0.0"}"#);
     project.write_file("lpm.json", r#"{"tunnel":{"domain":"doctor-auth.lpm.fyi"}}"#);
     let mock = support::mock_registry::MockRegistry::start().await;
     mock.with_health().await;
-    mock.with_authenticated_whoami_error("rejected-token", 401, 1)
+    mock.with_authenticated_whoami_error("rejected-token", 401, 2)
         .await;
 
     let output = lpm_with_registry(&project, &mock.url())
         .env("LPM_TOKEN", "rejected-token")
+        .env("CI", ci_oidc.to_string())
+        .env("ACTIONS_ID_TOKEN_REQUEST_TOKEN", "fixture-oidc")
         .args(["doctor", "--all", "--json"])
         .output()
         .expect("failed to run doctor with a rejected token");
@@ -497,6 +508,28 @@ async fn doctor_all_skips_authenticated_tunnel_lookup_after_token_rejection() {
         "a rejected token must not enable authenticated tunnel checks: {codes:?}"
     );
     assert!(!codes.contains("tunnel_unverified"), "{codes:?}");
+    let json = parse_json_output(&output.stdout);
+    let rejection = json["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|check| check["code"] == "auth_invalid")
+        .unwrap();
+    let detail = rejection["detail"].as_str().unwrap();
+    assert!(detail.contains("unset LPM_TOKEN"), "{detail}");
+    assert!(!detail.contains("lpm login"), "{detail}");
+    assert!(!detail.contains("rejected-token"), "{detail}");
+    let human = lpm_with_registry(&project, &mock.url())
+        .env("LPM_TOKEN", "rejected-token")
+        .env("CI", ci_oidc.to_string())
+        .env("ACTIONS_ID_TOKEN_REQUEST_TOKEN", "fixture-oidc")
+        .args(["doctor", "--all"])
+        .output()
+        .unwrap();
+    let output = String::from_utf8_lossy(&human.stdout);
+    assert!(output.contains("unset LPM_TOKEN"), "{output}");
+    assert!(!output.contains("lpm login"), "{output}");
+    assert!(!output.contains("rejected-token"), "{output}");
 }
 
 #[test]

@@ -55,7 +55,10 @@ const DIAGNOSTIC_NETWORK_DEADLINE: Duration = Duration::from_secs(5);
 enum AuthProbe {
     Missing,
     Valid(&'static str),
-    Invalid(&'static str),
+    Invalid {
+        source: &'static str,
+        recovery: &'static str,
+    },
     Unverified(String),
 }
 
@@ -823,10 +826,12 @@ async fn run_inner(
                             &format!("valid token from {source}"),
                         ));
                     }
-                    AuthProbe::Invalid(source) => infrastructure_checks.push(Check::fail(
-                        &doctor_catalog::AUTH_INVALID,
-                        &format!("token from {source} was rejected — run: lpm login"),
-                    )),
+                    AuthProbe::Invalid { source, recovery } => {
+                        infrastructure_checks.push(Check::fail(
+                            &doctor_catalog::AUTH_INVALID,
+                            &format!("token from {source} was rejected — {recovery}"),
+                        ))
+                    }
                     AuthProbe::Missing => infrastructure_checks.push(Check::fail(
                         &doctor_catalog::AUTH_MISSING,
                         "no token — run: lpm login",
@@ -1162,7 +1167,14 @@ async fn probe_auth(
     };
     match tokio::time::timeout(DIAGNOSTIC_NETWORK_DEADLINE, client.whoami()).await {
         Ok(Ok(_)) => AuthProbe::Valid(source),
-        Ok(Err(LpmError::AuthRequired | LpmError::Forbidden(_))) => AuthProbe::Invalid(source),
+        Ok(Err(LpmError::EnvTokenRejected)) => AuthProbe::Invalid {
+            source,
+            recovery: "replace LPM_TOKEN with a valid token, or unset LPM_TOKEN to use your saved login",
+        },
+        Ok(Err(LpmError::AuthRequired | LpmError::Forbidden(_))) => AuthProbe::Invalid {
+            source,
+            recovery: "run: lpm login",
+        },
         Ok(Err(error)) => AuthProbe::Unverified(format!(
             "token from {source} could not be verified: {error}"
         )),
