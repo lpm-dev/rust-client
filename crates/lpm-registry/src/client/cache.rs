@@ -1289,6 +1289,7 @@ mod metadata_cache_schema_tests {
             security_findings: _,
             quality_score: _,
             vulnerabilities: _,
+            publication_status: _,
         } = metadata;
     }
 

@@ -1669,7 +1669,7 @@ async fn execute_prepared_inner(
                             .and_then(serde_json::Value::as_str)
                             .map(str::to_string);
                         if !json_output {
-                            if let Some(url) = lpm_package_url(lpm_name) {
+                            if let Some(url) = lpm_package_url(client.base_url(), lpm_name) {
                                 publish_detail("url", install_ui::url(&url));
                             }
                             if let Some(notice) = publication_status
@@ -2581,7 +2581,7 @@ fn validate_lpm_publish_name(name: &str) -> Result<(), LpmError> {
     Ok(())
 }
 
-pub(super) fn lpm_package_url(name: &str) -> Option<String> {
+pub(super) fn lpm_package_url(registry_url: &str, name: &str) -> Option<String> {
     let package = name.strip_prefix("@lpm.dev/")?;
     let (owner, package_name) = package.split_once('.')?;
     if owner.is_empty()
@@ -2592,7 +2592,14 @@ pub(super) fn lpm_package_url(name: &str) -> Option<String> {
     {
         return None;
     }
-    Some(format!("https://lpm.dev/{package}"))
+    let registry = reqwest::Url::parse(registry_url).ok()?;
+    if !matches!(registry.scheme(), "http" | "https") {
+        return None;
+    }
+    Some(format!(
+        "{}/{package}",
+        registry.origin().ascii_serialization()
+    ))
 }
 
 #[cfg(test)]

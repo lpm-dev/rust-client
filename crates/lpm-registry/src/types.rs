@@ -71,6 +71,13 @@ pub struct VersionMetadata {
     pub name: String,
     pub version: String,
 
+    #[serde(
+        default,
+        rename = "publicationStatus",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub publication_status: Option<String>,
+
     #[serde(default)]
     pub description: Option<String>,
 

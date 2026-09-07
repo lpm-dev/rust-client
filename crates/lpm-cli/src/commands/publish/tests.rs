@@ -829,14 +829,14 @@ fn publish_tarball_size_rejects_one_byte_over_with_mib_wording() {
 #[test]
 fn lpm_package_url_preserves_the_canonical_dotted_name() {
     assert_eq!(
-        lpm_package_url("@lpm.dev/acme.widget").as_deref(),
+        lpm_package_url("https://lpm.dev", "@lpm.dev/acme.widget").as_deref(),
         Some("https://lpm.dev/acme.widget")
     );
 }
 
 #[test]
 fn lpm_package_url_rejects_malformed_names_without_panicking() {
-    assert_eq!(lpm_package_url("@lpm.dev/"), None);
+    assert_eq!(lpm_package_url("https://lpm.dev", "@lpm.dev/"), None);
 }
 
 #[test]
@@ -1510,4 +1510,23 @@ fn lpm_renamed_publish_dist_hashes_match_rewritten_tarball() {
         lpm_hashes.shasum,
         "dist.shasum must match rewritten LPM tarball"
     );
+}
+
+#[test]
+fn lpm_package_url_uses_only_the_configured_http_origin() {
+    assert_eq!(
+        lpm_package_url(
+            "http://user:password@127.0.0.1:3000/api/registry/?token=secret#fragment",
+            "@lpm.dev/acme.widget",
+        )
+        .as_deref(),
+        Some("http://127.0.0.1:3000/acme.widget")
+    );
+}
+
+#[test]
+fn lpm_package_url_rejects_invalid_registry_urls() {
+    for registry in ["not-a-url", "file:///tmp/registry"] {
+        assert_eq!(lpm_package_url(registry, "@lpm.dev/acme.widget"), None);
+    }
 }

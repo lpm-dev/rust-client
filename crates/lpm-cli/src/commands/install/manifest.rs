@@ -939,6 +939,44 @@ pub(super) async fn pin_staged_dist_tags_for_resolution(
     Ok(())
 }
 
+fn lpm_install_unavailable_error(
+    metadata: &lpm_registry::PackageMetadata,
+    scoped_name: &str,
+) -> LpmError {
+    if metadata.versions.is_empty() {
+        return LpmError::NotFound(format!("no published versions for {scoped_name}"));
+    }
+    let newest = metadata
+        .versions
+        .values()
+        .filter_map(|version| {
+            lpm_semver::Version::parse(&version.version)
+                .ok()
+                .map(|parsed| (parsed, version))
+        })
+        .max_by(|(left, _), (right, _)| left.cmp(right))
+        .map(|(_, version)| version);
+    let detail = newest.and_then(|version| {
+        let reason = match version.publication_status.as_deref()? {
+            "pending_review" => {
+                "is awaiting publication review. Wait for review to finish, then retry"
+            }
+            "manual_review" => {
+                "requires manual review. Check the publication status on the package page"
+            }
+            "processing" => "is still being prepared for installation. Wait, then retry",
+            _ => return None,
+        };
+        Some(format!(
+            "{scoped_name}@{} {reason}. No latest version is available.",
+            version.version
+        ))
+    });
+    LpmError::PublicationUnavailable(detail.unwrap_or_else(|| {
+        format!("{scoped_name} has published versions, but no latest version is available. Check the publication status on the package page.")
+    }))
+}
+
 fn resolve_lpm_install_metadata_version(
     metadata: &lpm_registry::PackageMetadata,
     package_name: &lpm_common::PackageName,
@@ -947,7 +985,7 @@ fn resolve_lpm_install_metadata_version(
     let scoped_name = package_name.scoped();
     let latest_version = metadata
         .latest_version_tag()
-        .ok_or_else(|| LpmError::NotFound(format!("no versions for {scoped_name}")))?;
+        .ok_or_else(|| lpm_install_unavailable_error(metadata, &scoped_name))?;
     let resolved_version = resolve_version_from_spec(range, metadata, latest_version)?;
     metadata.version(resolved_version).ok_or_else(|| {
         LpmError::NotFound(format!(
@@ -965,7 +1003,11 @@ pub(super) async fn resolve_lpm_install_preflight(
     let metadata = client.get_package_metadata(package_name).await?;
     match resolve_lpm_install_metadata_version(&metadata, package_name, range) {
         Ok(version) => Ok((metadata, version)),
-        Err(LpmError::NotFound(_) | LpmError::InvalidVersionRange(_)) => {
+        Err(
+            LpmError::NotFound(_)
+            | LpmError::InvalidVersionRange(_)
+            | LpmError::PublicationUnavailable(_),
+        ) => {
             let metadata = client.refetch_package_metadata(package_name).await?;
             let version = resolve_lpm_install_metadata_version(&metadata, package_name, range)?;
             Ok((metadata, version))
