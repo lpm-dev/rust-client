@@ -19,6 +19,7 @@ pub mod engine_strict_config;
 mod global_blocked_set;
 mod graph_render;
 mod import_rewriter;
+mod install_recovery;
 pub mod install_state;
 pub mod install_ui;
 pub mod intelligence;

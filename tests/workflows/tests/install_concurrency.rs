@@ -42,6 +42,286 @@ use support::mock_registry::{
 };
 use support::{TempProject, lpm, lpm_spawnable_with_registry, lpm_with_registry};
 
+async fn interrupt_new_dependency_install(
+    graceful: bool,
+) -> (TempProject, MockRegistry, Vec<u8>, Vec<u8>) {
+    let project =
+        TempProject::empty("{\n  \"name\": \"recovery-project\",\n  \"version\": \"1.0.0\"\n}\n");
+    project.write_file("source.js", "module.exports = 'keep user work'\n");
+    let original = std::fs::read(project.path().join("package.json")).unwrap();
+    let (mock, tarball) = interrupt_project_install(&project, &["recovery-pkg"], graceful).await;
+    (project, mock, tarball, original)
+}
+
+async fn interrupt_project_install(
+    project: &TempProject,
+    specs: &[&str],
+    graceful: bool,
+) -> (MockRegistry, Vec<u8>) {
+    let mock = MockRegistry::start().await;
+    let tarball = make_tarball("recovery-pkg", "1.0.0");
+    with_delayed_package(
+        &mock,
+        "recovery-pkg",
+        "1.0.0",
+        tarball.clone(),
+        Duration::from_secs(20),
+    )
+    .await;
+    let mut child = lpm_spawnable_with_registry(project, &mock.url())
+        .env("LPM_INTERNAL_TEST_NPM_REGISTRY_URL", mock.url())
+        .args(install_args_with(specs))
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        if mock
+            .server()
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .any(|request| request.url.path().ends_with(".tgz"))
+        {
+            break;
+        }
+        if Instant::now() >= deadline || child.try_wait().unwrap().is_some() {
+            let _ = child.kill();
+            let output = child.wait_with_output().unwrap();
+            panic!(
+                "install did not reach its download: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    if graceful {
+        #[cfg(unix)]
+        assert!(
+            std::process::Command::new("kill")
+                .args(["-INT", &child.id().to_string()])
+                .status()
+                .unwrap()
+                .success()
+        );
+        #[cfg(not(unix))]
+        child.kill().unwrap();
+    } else {
+        child.kill().unwrap();
+    }
+    let status = wait_with_timeout(&mut child, Duration::from_secs(10));
+    assert!(!status.success());
+    let _ = read_remaining_output(child);
+    (mock, tarball)
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn interrupted_install_ctrl_c_restores_the_manifest_before_exit() {
+    let (project, _mock, _tarball, original) = interrupt_new_dependency_install(true).await;
+    assert_eq!(
+        std::fs::read(project.path().join("package.json")).unwrap(),
+        original
+    );
+    assert_eq!(
+        project.read_file("source.js"),
+        "module.exports = 'keep user work'\n"
+    );
+    assert!(!project.path().join(".lpm/install-recovery").exists());
+}
+
+#[tokio::test]
+async fn interrupted_install_kill_retry_recovers_the_original_save_intent() {
+    let (project, mock, tarball, _original) = interrupt_new_dependency_install(false).await;
+    mock.server().reset().await;
+    mock.with_package("recovery-pkg", "1.0.0", &tarball).await;
+    lpm_with_registry(&project, &mock.url())
+        .env("LPM_INTERNAL_TEST_NPM_REGISTRY_URL", mock.url())
+        .args(install_args_with(&["recovery-pkg"]))
+        .assert()
+        .success();
+    let manifest: serde_json::Value =
+        serde_json::from_str(&project.read_file("package.json")).unwrap();
+    assert_eq!(manifest["dependencies"]["recovery-pkg"], "^1.0.0");
+    assert_eq!(
+        project.read_file("source.js"),
+        "module.exports = 'keep user work'\n"
+    );
+    assert!(
+        project
+            .path()
+            .join("node_modules/recovery-pkg/index.js")
+            .is_file()
+    );
+    assert!(!project.path().join(".lpm/install-recovery").exists());
+}
+
+#[tokio::test]
+async fn interrupted_install_recovery_preserves_later_edits_and_keeps_the_backup() {
+    let (project, mock, _tarball, original) = interrupt_new_dependency_install(false).await;
+    let edited = "{\"name\":\"user-edited-project\",\"version\":\"2.0.0\"}";
+    project.write_file("package.json", edited);
+    let output = lpm_with_registry(&project, &mock.url())
+        .env("LPM_INTERNAL_TEST_NPM_REGISTRY_URL", mock.url())
+        .args(install_args_with(&["recovery-pkg"]))
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("later edits"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(project.read_file("package.json"), edited);
+    let journal = project.path().join(".lpm/install-recovery");
+    let backup = std::fs::read_dir(&journal)
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    let record: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(backup).unwrap()).unwrap();
+    assert_eq!(record["original"].as_str().unwrap().as_bytes(), original);
+    project.write_file("package.json", std::str::from_utf8(&original).unwrap());
+    lpm_with_registry(&project, &mock.url())
+        .args(install_args_with(&[]))
+        .assert()
+        .success();
+    assert!(!journal.exists());
+}
+
+#[tokio::test]
+async fn interrupted_install_bare_retry_preserves_an_intentional_wildcard() {
+    let original =
+        r#"{"name":"wildcard-project","version":"1.0.0","dependencies":{"recovery-pkg":"*"}}"#;
+    let project = TempProject::empty(original);
+    let (mock, tarball) = interrupt_project_install(&project, &["recovery-pkg@1.0.0"], false).await;
+    mock.server().reset().await;
+    mock.with_package("recovery-pkg", "1.0.0", &tarball).await;
+    lpm_with_registry(&project, &mock.url())
+        .env("LPM_INTERNAL_TEST_NPM_REGISTRY_URL", mock.url())
+        .args(install_args_with(&[]))
+        .assert()
+        .success();
+    assert_eq!(project.read_file("package.json"), original);
+    assert!(
+        project
+            .path()
+            .join("node_modules/recovery-pkg/index.js")
+            .is_file()
+    );
+}
+
+#[tokio::test]
+async fn interrupted_install_workspace_retry_recovers_every_selected_manifest() {
+    let project = TempProject::empty(
+        r#"{"name":"recovery-workspace","version":"1.0.0","private":true,"workspaces":["packages/*"]}"#,
+    );
+    project.write_file(
+        "packages/a/package.json",
+        r#"{"name":"member-a","version":"1.0.0"}"#,
+    );
+    project.write_file(
+        "packages/b/package.json",
+        r#"{"name":"member-b","version":"1.0.0"}"#,
+    );
+    let specs = ["recovery-pkg", "--filter", "member-*"];
+    let (mock, tarball) = interrupt_project_install(&project, &specs, false).await;
+    mock.server().reset().await;
+    mock.with_package("recovery-pkg", "1.0.0", &tarball).await;
+    lpm_with_registry(&project, &mock.url())
+        .env("LPM_INTERNAL_TEST_NPM_REGISTRY_URL", mock.url())
+        .args(install_args_with(&specs))
+        .assert()
+        .success();
+    for member in ["a", "b"] {
+        let manifest: serde_json::Value =
+            serde_json::from_str(&project.read_file(&format!("packages/{member}/package.json")))
+                .unwrap();
+        assert_eq!(manifest["dependencies"]["recovery-pkg"], "^1.0.0");
+        assert!(
+            project
+                .path()
+                .join(format!(
+                    "packages/{member}/node_modules/recovery-pkg/index.js"
+                ))
+                .is_file()
+        );
+    }
+    assert!(!project.path().join(".lpm/install-recovery").exists());
+}
+
+#[tokio::test]
+async fn interrupted_install_recovery_discards_an_uncommitted_journal_temporary() {
+    let (project, mock, tarball, _original) = interrupt_new_dependency_install(false).await;
+    project.write_file(
+        ".lpm/install-recovery/.lpm-AAAAAAAAAAAAAAAA",
+        "partial write",
+    );
+    mock.server().reset().await;
+    mock.with_package("recovery-pkg", "1.0.0", &tarball).await;
+    lpm_with_registry(&project, &mock.url())
+        .env("LPM_INTERNAL_TEST_NPM_REGISTRY_URL", mock.url())
+        .args(install_args_with(&["recovery-pkg"]))
+        .assert()
+        .success();
+    let manifest: serde_json::Value =
+        serde_json::from_str(&project.read_file("package.json")).unwrap();
+    assert_eq!(manifest["dependencies"]["recovery-pkg"], "^1.0.0");
+}
+
+#[tokio::test]
+async fn interrupted_install_committed_cleanup_preserves_the_completed_manifest() {
+    let (project, mock, tarball, _original) = interrupt_new_dependency_install(false).await;
+    let directory = project.path().join(".lpm/install-recovery");
+    let record = std::fs::read_dir(&directory)
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap();
+    let name = record.file_name();
+    let bytes = std::fs::read(record.path()).unwrap();
+    mock.server().reset().await;
+    mock.with_package("recovery-pkg", "1.0.0", &tarball).await;
+    lpm_with_registry(&project, &mock.url())
+        .env("LPM_INTERNAL_TEST_NPM_REGISTRY_URL", mock.url())
+        .args(install_args_with(&["recovery-pkg"]))
+        .assert()
+        .success();
+    let completed = project.read_file("package.json");
+    std::fs::create_dir(&directory).unwrap();
+    std::fs::write(directory.join(name), bytes).unwrap();
+    std::fs::write(directory.join("committed"), "1\n").unwrap();
+    lpm_with_registry(&project, &mock.url())
+        .env("LPM_INTERNAL_TEST_NPM_REGISTRY_URL", mock.url())
+        .args(install_args_with(&[]))
+        .assert()
+        .success();
+    assert_eq!(project.read_file("package.json"), completed);
+    assert!(!directory.exists());
+}
+
+#[tokio::test]
+async fn interrupted_install_malformed_backup_stops_without_changing_the_manifest() {
+    let (project, mock, _tarball, _original) = interrupt_new_dependency_install(false).await;
+    let staged = project.read_file("package.json");
+    let directory = project.path().join(".lpm/install-recovery");
+    let record = std::fs::read_dir(&directory)
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap();
+    std::fs::write(record.path(), "{incomplete").unwrap();
+    lpm_with_registry(&project, &mock.url())
+        .env("LPM_INTERNAL_TEST_NPM_REGISTRY_URL", mock.url())
+        .args(install_args_with(&["recovery-pkg"]))
+        .assert()
+        .failure();
+    assert_eq!(project.read_file("package.json"), staged);
+    assert!(directory.exists());
+}
+
 // ─── Shared helpers ──────────────────────────────────────────────────
 
 /// Mount a package on the mock with a `set_delay` on the tarball
@@ -1129,12 +1409,11 @@ async fn install_with_metadata_404_fails_immediately_without_retry() {
 
     let project = TempProject::empty(r#"{"name":"miss-test","version":"1.0.0"}"#);
 
-    let start = Instant::now();
     let output = lpm_with_registry(&project, &mock.url())
+        .env("LPM_INTERNAL_TEST_NPM_REGISTRY_URL", mock.url())
         .args(install_args_with(&["missing-pkg@1.0.0"]))
         .output()
         .expect("run install");
-    let elapsed = start.elapsed();
 
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
@@ -1142,12 +1421,23 @@ async fn install_with_metadata_404_fails_immediately_without_retry() {
         "install of nonexistent package succeeded:\nstderr:\n{stderr}"
     );
 
-    // Non-retryable contract: under one second on a quiet runner —
-    // 1s minimum retry-backoff would already be 1s+ if a retry fired.
+    let requests = mock.server().received_requests().await.unwrap();
+    let metadata_paths: Vec<_> = requests
+        .iter()
+        .filter(|request| {
+            request.method.as_str() == "GET" && request.url.path().contains("missing-pkg")
+        })
+        .map(|request| request.url.path())
+        .collect();
     assert!(
-        elapsed < Duration::from_secs(2),
-        "404 install took {elapsed:?} — looks like retries fired \
-         on a non-retryable response.\nstderr:\n{stderr}"
+        !metadata_paths.is_empty(),
+        "the install never requested package metadata"
+    );
+    let unique: std::collections::HashSet<_> = metadata_paths.iter().copied().collect();
+    assert_eq!(
+        metadata_paths.len(),
+        unique.len(),
+        "a non-retryable metadata request was repeated: {metadata_paths:?}"
     );
 }
 

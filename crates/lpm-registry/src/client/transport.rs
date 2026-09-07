@@ -392,6 +392,23 @@ impl RegistryClient {
                         401 => return Err(LpmError::AuthRequired),
                         403 => {
                             let body = read_publish_error_text(response, bearer).await;
+                            let duplicate_message = format!(
+                                "Version {published_version} already exists. You cannot overwrite versions."
+                            );
+                            if serde_json::from_str::<serde_json::Value>(&body)
+                                .ok()
+                                .and_then(|value| {
+                                    value
+                                        .get("error")
+                                        .and_then(serde_json::Value::as_str)
+                                        .map(str::to_owned)
+                                })
+                                .is_some_and(|message| message == duplicate_message)
+                            {
+                                return Err(LpmError::Registry(format!(
+                                    "Version {published_version} already exists. Verify the existing release in the registry if an earlier publish was interrupted. To publish different contents, choose a new version."
+                                )));
+                            }
                             return Err(forbidden_error_from_body(body));
                         }
                         404 => {

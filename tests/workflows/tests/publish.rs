@@ -4384,3 +4384,30 @@ fn extract_uploaded_file(tarball_data: &[u8], expected_path: &str) -> Vec<u8> {
 
     panic!("published tarball missing {expected_path}");
 }
+
+#[tokio::test]
+async fn publish_duplicate_version_explains_the_existing_release_without_raw_json() {
+    let project = authored_skills_project("@lpm.dev/test.duplicate-recovery");
+    let mock = MockRegistry::start().await;
+    mock.with_whoami("test", "test@example.com").await;
+    Mock::given(method("PUT"))
+        .and(path_regex("/api/registry/.*"))
+        .respond_with(ResponseTemplate::new(403).set_body_json(serde_json::json!({
+            "error": "Version 1.0.0 already exists. You cannot overwrite versions."
+        })))
+        .mount(mock.server())
+        .await;
+    let output = lpm_with_registry(&project, &mock.url())
+        .args(["publish", "--json"])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let envelope: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let message = envelope["results"][0]["error"].as_str().unwrap();
+    assert!(message.contains("already exists"), "{message}");
+    assert!(message.contains("Verify"), "{message}");
+    assert!(
+        !message.contains("forbidden") && !message.contains('{'),
+        "{message}"
+    );
+}
