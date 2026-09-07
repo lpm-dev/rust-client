@@ -596,6 +596,9 @@ impl Drop for ManifestTransaction {
 
         // (1) Restore snapshotted paths.
         for entry in &mut self.snapshots {
+            if !crate::install_recovery::may_restore(&entry.path) {
+                continue;
+            }
             if let Some(expected) = entry.restore_guard {
                 match expected.matches_path(&entry.path) {
                     Ok(true) => {}

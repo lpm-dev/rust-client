@@ -167,6 +167,9 @@ fn check_fast_lane_admission(
     package_json: &str,
     json_output: bool,
 ) -> Result<FastLaneAdmission, lpm_common::LpmError> {
+    if crate::install_recovery::pending(project_dir) {
+        return Ok(FastLaneAdmission::NeedsInstallPipeline);
+    }
     let global_config = crate::commands::config::GlobalConfig::load_checked()?;
     crate::npm_firewall_config::resolve_runtime_mode(&global_config, project_dir, json_output)?;
     let policy_extension_configs =

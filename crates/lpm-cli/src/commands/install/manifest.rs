@@ -285,7 +285,7 @@ pub(crate) fn stage_packages_to_manifest(
     if doc_mutated {
         let updated =
             serde_json::to_string_pretty(&doc).map_err(|e| LpmError::Registry(e.to_string()))?;
-        lpm_common::write_file_atomic(pkg_json_path, format!("{updated}\n"))?;
+        crate::install_recovery::write_manifest(pkg_json_path, &content, format!("{updated}\n"))?;
     }
 
     Ok(StagedManifest {
@@ -674,7 +674,11 @@ pub(super) fn finalize_packages_in_manifest_with_catalog_policy(
     if doc_mutated {
         let updated =
             serde_json::to_string_pretty(&doc).map_err(|e| LpmError::Registry(e.to_string()))?;
-        lpm_common::write_file_atomic(&staged.pkg_json_path, format!("{updated}\n"))?;
+        crate::install_recovery::write_manifest(
+            &staged.pkg_json_path,
+            &content,
+            format!("{updated}\n"),
+        )?;
     }
     Ok(())
 }
@@ -927,7 +931,11 @@ pub(super) async fn pin_staged_dist_tags_for_resolution(
 
     let updated =
         serde_json::to_string_pretty(&doc).map_err(|e| LpmError::Registry(e.to_string()))?;
-    lpm_common::write_file_atomic(&staged.pkg_json_path, format!("{updated}\n"))?;
+    crate::install_recovery::write_manifest(
+        &staged.pkg_json_path,
+        &content,
+        format!("{updated}\n"),
+    )?;
     Ok(())
 }
 

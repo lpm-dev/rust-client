@@ -477,7 +477,7 @@ where
         lpm_common::ProjectLockDirectory::open_or_create(&project_directory, &canonical_root)?;
     let transaction = ACTIVE_PROJECT_INSTALL_ROOT.scope(canonical_root.clone(), async {
         crate::release_plan::ensure_no_pending_release_transaction(&canonical_root)?;
-        future.await
+        crate::install_recovery::scope(&canonical_root, project_directory, future).await
     });
     lpm_common::with_project_exclusive_lock_async(
         lock_directory,
