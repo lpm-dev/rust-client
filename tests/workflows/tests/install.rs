@@ -18,6 +18,109 @@ use support::{
 use wiremock::matchers::{header, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
+async fn assert_unavailable_publication_message(status: Option<&str>, json: bool, expected: &str) {
+    let mock = MockRegistry::start().await;
+    let name = "@lpm.dev/example.pending";
+    mock.with_package_metadata_and_tarballs(
+        name,
+        serde_json::json!({
+            "name": name,
+            "dist-tags": {},
+            "latestVersion": null,
+            "versions": {
+                "1.0.0": { "name": name, "version": "1.0.0", "publicationStatus": status }
+            }
+        }),
+        &[],
+    )
+    .await;
+    let project = TempProject::empty(r#"{"name":"publication-message","version":"1.0.0"}"#);
+    let original = project.read_file("package.json");
+    let mut command = lpm_with_registry(&project, &mock.url());
+    command.args(["install", name, "--no-skills", "--no-editor-setup"]);
+    if json {
+        command.arg("--json");
+    }
+    let output = command.output().expect("run install");
+    assert!(!output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let message = if json {
+        let envelope: serde_json::Value =
+            serde_json::from_str(&stdout).expect("JSON error envelope");
+        assert_eq!(envelope["success"], false);
+        assert_eq!(envelope["error_code"], "publication_unavailable");
+        envelope["error"]
+            .as_str()
+            .expect("error message")
+            .to_owned()
+    } else {
+        format!("{stdout}\n{stderr}")
+    };
+    assert!(
+        message.contains(expected),
+        "expected {expected:?}, got {message}"
+    );
+    assert!(
+        !message.contains("no versions for"),
+        "published version exists: {message}"
+    );
+    assert_eq!(project.read_file("package.json"), original);
+    assert!(!project.path().join("lpm.lock").exists());
+    let requests = mock
+        .server()
+        .received_requests()
+        .await
+        .expect("registry requests");
+    assert!(
+        requests
+            .iter()
+            .all(|request| !request.url.path().ends_with(".tgz"))
+    );
+}
+
+#[tokio::test]
+async fn install_publication_status_explains_pending_review() {
+    assert_unavailable_publication_message(
+        Some("pending_review"),
+        false,
+        "awaiting publication review",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn install_publication_status_explains_pending_review_in_json() {
+    assert_unavailable_publication_message(
+        Some("pending_review"),
+        true,
+        "awaiting publication review",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn install_publication_status_distinguishes_manual_review_and_processing() {
+    for (status, expected) in [
+        ("manual_review", "requires manual review"),
+        ("processing", "is still being prepared for installation"),
+    ] {
+        assert_unavailable_publication_message(Some(status), false, expected).await;
+    }
+}
+
+#[tokio::test]
+async fn install_publication_status_does_not_guess_review_for_unknown_metadata() {
+    for status in [None, Some("future_status"), Some("active")] {
+        assert_unavailable_publication_message(
+            status,
+            false,
+            "published versions, but no latest version is available",
+        )
+        .await;
+    }
+}
+
 fn read_project_lockfile(project: &TempProject, relative: &str) -> lpm_lockfile::Lockfile {
     lpm_lockfile::Lockfile::read_for_project(&project.path().join(relative))
         .unwrap_or_else(|error| panic!("read lockfile projection for {relative:?}: {error}"))

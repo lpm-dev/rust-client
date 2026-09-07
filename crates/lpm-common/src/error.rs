@@ -266,6 +266,10 @@ pub enum LpmError {
     #[diagnostic(code(lpm::registry))]
     Registry(String),
 
+    #[error("publication unavailable: {0}")]
+    #[diagnostic(code(lpm::publication_unavailable))]
+    PublicationUnavailable(String),
+
     #[error("packages were installed, but Pool attribution could not be confirmed: {reason}")]
     #[diagnostic(
         code(lpm::pool_attribution_unconfirmed),
@@ -723,6 +727,7 @@ impl LpmError {
             LpmError::InvalidVersion(_) => "invalid_version",
             LpmError::InvalidVersionRange(_) => "invalid_version_range",
             LpmError::Registry(_) => "registry",
+            LpmError::PublicationUnavailable(_) => "publication_unavailable",
             LpmError::PoolAttributionUnconfirmed { .. } => "pool_attribution_unconfirmed",
             LpmError::Resolution(_) => "resolution_failed",
             LpmError::TyposquatSuspected(_) => "typosquat_suspected",

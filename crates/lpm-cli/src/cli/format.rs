@@ -519,6 +519,9 @@ fn slim_error_lines(error: &lpm_common::LpmError) -> Vec<SlimErrorLine> {
         lpm_common::LpmError::Registry(reason) => {
             diagnostic_lines("Registry error", Some(reason), error)
         }
+        lpm_common::LpmError::PublicationUnavailable(reason) => {
+            diagnostic_lines("Publication unavailable", Some(reason), error)
+        }
         lpm_common::LpmError::PoolAttributionUnconfirmed { reason } => {
             let mut lines = vec![SlimErrorLine::Failed(install_ui::TerminalLine::new(
                 "Installed, but Pool attribution is unconfirmed",

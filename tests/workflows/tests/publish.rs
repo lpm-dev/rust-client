@@ -1757,6 +1757,10 @@ async fn publish_to_mock_registry_succeeds() {
         "expected publish success output, got:\n{combined}"
     );
     assert!(
+        combined.contains(&format!("{}/testuser.mock-publish", mock.url())),
+        "publish link must use the registry origin that accepted the package, got:\n{combined}"
+    );
+    assert!(
         combined.contains("✓ Secret scan passed")
             && combined.contains("✓ Quality score:")
             && combined.contains("› Uploading tarball to lpm.dev")

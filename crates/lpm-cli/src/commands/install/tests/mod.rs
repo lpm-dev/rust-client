@@ -150,6 +150,7 @@ fn make_metadata(versions: &[&str], latest: &str) -> lpm_registry::PackageMetada
                 security_findings: None,
                 quality_score: None,
                 vulnerabilities: None,
+                publication_status: None,
             },
         );
     }
