@@ -337,9 +337,9 @@ pub static AUTH_INVALID: CheckEntry = CheckEntry {
     name: "Authentication",
     category: Category::Auth,
     tier: Tier::Extended,
-    description: "A token is stored but the registry rejected it.",
-    when_fires: "`whoami` returned 401 / 403 against the stored token.",
-    remediation: "Re-authenticate with `lpm login`.",
+    description: "The registry rejected the selected credential.",
+    when_fires: "`whoami` returned 401 / 403 against the selected credential.",
+    remediation: "Replace or unset `LPM_TOKEN` if it supplies the token. For a rejected saved login, run `lpm login`.",
     possible_severities: &[Severity::Fail],
     auto_fix: None,
 };

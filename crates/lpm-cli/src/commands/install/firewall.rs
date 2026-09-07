@@ -704,15 +704,41 @@ async fn request_firewall_chunk(
 
 fn npm_firewall_preflight_report_error(error: LpmError) -> String {
     let error = normalize_npm_firewall_preflight_error(error);
-    format!("npm firewall verdict preflight failed in monitor mode: {error}")
+    let recovery = if matches!(error, LpmError::EnvTokenRejected) {
+        ". Replace LPM_TOKEN with a valid token, or unset LPM_TOKEN to use your saved login."
+    } else {
+        ""
+    };
+    format!("npm firewall verdict preflight failed in monitor mode: {error}{recovery}")
 }
 
 fn npm_firewall_preflight_enforce_error(error: LpmError) -> LpmError {
     match normalize_npm_firewall_preflight_error(error) {
         error @ (LpmError::AuthRequired
+        | LpmError::EnvTokenRejected
         | LpmError::SessionExpired
         | LpmError::NpmFirewallEntitlementRequired { .. }) => error,
         error => LpmError::Registry(format!("npm firewall verdict preflight failed: {error}")),
+    }
+}
+
+#[cfg(test)]
+mod error_tests {
+    use super::*;
+
+    #[test]
+    fn enforced_preflight_preserves_environment_token_recovery() {
+        assert!(matches!(
+            npm_firewall_preflight_enforce_error(LpmError::EnvTokenRejected),
+            LpmError::EnvTokenRejected
+        ));
+    }
+
+    #[test]
+    fn monitored_preflight_explains_environment_token_recovery() {
+        let warning = npm_firewall_preflight_report_error(LpmError::EnvTokenRejected);
+        assert!(warning.contains("unset LPM_TOKEN"), "{warning}");
+        assert!(!warning.contains("lpm login"), "{warning}");
     }
 }
 
