@@ -263,11 +263,13 @@ impl StringPoolBuilder {
     }
 
     fn finish(self) -> StringPool {
-        let mut ordered = self.ids.into_iter().collect::<Vec<_>>();
-        ordered.sort_unstable_by_key(|(_, id)| id.0);
+        let mut ordered = vec![String::new(); self.ids.len()];
+        for (value, id) in self.ids {
+            ordered[id.index()] = value;
+        }
         let mut data = String::with_capacity(self.total_len);
         let mut spans = Vec::with_capacity(ordered.len());
-        for (value, _) in ordered {
+        for value in ordered {
             let start = u32::try_from(data.len())
                 .expect("metadata string bytes are bounded by the response size cap");
             let len = u32::try_from(value.len())
@@ -1219,6 +1221,30 @@ fn platform_may_target_linux<'a>(os: impl Iterator<Item = &'a str>) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn finalized_string_pool_preserves_ids_duplicates_and_utf8_boundaries() {
+        let values = ["zebra", "", "résolve", "alpha", "🦀", "zebra", "alpha"];
+        let mut builder = StringPoolBuilder::default();
+        let ids: Vec<_> = values
+            .iter()
+            .map(|value| builder.intern((*value).to_owned()))
+            .collect();
+        let pool = builder.finish();
+
+        for (id, expected) in ids.iter().zip(values) {
+            assert_eq!(pool.get(*id), expected);
+        }
+        assert_eq!(ids[0], ids[5]);
+        assert_eq!(ids[3], ids[6]);
+        assert_eq!(pool.spans.len(), 5);
+        assert_eq!(pool.data.as_ref(), values[..5].concat());
+        assert_eq!(
+            pool.data.len(),
+            values[..5].iter().map(|value| value.len()).sum::<usize>()
+        );
+        assert!(StringPoolBuilder::default().finish().spans.is_empty());
+    }
 
     fn manifest(version: &str) -> ManifestVersion {
         ManifestVersion {
