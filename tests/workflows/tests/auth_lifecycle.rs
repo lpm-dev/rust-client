@@ -2305,6 +2305,15 @@ fn login_custom_registry_without_token_under_json_emits_error_envelope_on_stdout
 
 #[tokio::test]
 async fn rejected_env_token_explains_recovery_and_preserves_stored_session() {
+    assert_rejected_env_token_recovery(false).await;
+}
+
+#[tokio::test]
+async fn rejected_ci_env_token_explains_recovery_and_preserves_stored_session() {
+    assert_rejected_env_token_recovery(true).await;
+}
+
+async fn assert_rejected_env_token_recovery(ci_oidc: bool) {
     let project = TempProject::empty(r#"{"name":"env-token-recovery","version":"1.0.0"}"#);
     let mock = MockRegistry::start().await;
     mock.with_authenticated_whoami_error("rejected-env-token", 401, 2)
@@ -2323,6 +2332,8 @@ async fn rejected_env_token_explains_recovery_and_preserves_stored_session() {
     let before = read_credentials(project.home());
     let json_output = lpm_with_registry(&project, &mock.url())
         .env("LPM_TOKEN", "rejected-env-token")
+        .env("CI", ci_oidc.to_string())
+        .env("ACTIONS_ID_TOKEN_REQUEST_TOKEN", "fixture-oidc")
         .args(["whoami", "--json"])
         .output()
         .unwrap();
@@ -2338,6 +2349,8 @@ async fn rejected_env_token_explains_recovery_and_preserves_stored_session() {
     assert!(!json["next_steps"].to_string().contains("lpm login"));
     let human_output = lpm_with_registry(&project, &mock.url())
         .env("LPM_TOKEN", "rejected-env-token")
+        .env("CI", ci_oidc.to_string())
+        .env("ACTIONS_ID_TOKEN_REQUEST_TOKEN", "fixture-oidc")
         .args(["whoami"])
         .output()
         .unwrap();
