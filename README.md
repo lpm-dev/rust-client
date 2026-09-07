@@ -76,6 +76,12 @@ npm install -g @lpm-registry/cli@nightly
 curl -fsSL https://cli.lpm.dev/install | LPM_INSTALL_CHANNEL=nightly sh
 ```
 
+## Authentication recovery
+
+`LPM_TOKEN` overrides a saved login. If the registry rejects this token, replace it or unset `LPM_TOKEN` to use your saved login. The CLI preserves saved credentials. JSON output reports `env_token_rejected` with recovery guidance.
+
+See [`lpm login`](https://cli.lpm.dev/docs/infra/login) for authentication and token storage.
+
 ## Quick Links
 
 - Get Started

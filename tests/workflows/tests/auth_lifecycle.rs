@@ -2302,3 +2302,58 @@ fn login_custom_registry_without_token_under_json_emits_error_envelope_on_stdout
         "error must reference --token requirement, got: {err}",
     );
 }
+
+#[tokio::test]
+async fn rejected_env_token_explains_recovery_and_preserves_stored_session() {
+    let project = TempProject::empty(r#"{"name":"env-token-recovery","version":"1.0.0"}"#);
+    let mock = MockRegistry::start().await;
+    mock.with_authenticated_whoami_error("rejected-env-token", 401, 2)
+        .await;
+    mock.with_authenticated_whoami("stored-access", "storeduser", "user@example.test")
+        .await;
+    seed_sessions(
+        project.home(),
+        &[SessionSeed {
+            registry_url: &mock.url(),
+            access_token: Some("stored-access"),
+            refresh_token: Some("stored-refresh"),
+            session_access_expires_at: Some("2030-01-01T00:00:00Z"),
+        }],
+    );
+    let before = read_credentials(project.home());
+    let json_output = lpm_with_registry(&project, &mock.url())
+        .env("LPM_TOKEN", "rejected-env-token")
+        .args(["whoami", "--json"])
+        .output()
+        .unwrap();
+    assert!(!json_output.status.success());
+    let json = parse_json_output(&json_output.stdout);
+    assert_eq!(json["error_code"], "env_token_rejected");
+    assert!(
+        json["next_steps"][0]["description"]
+            .as_str()
+            .unwrap()
+            .contains("LPM_TOKEN")
+    );
+    assert!(!json["next_steps"].to_string().contains("lpm login"));
+    let human_output = lpm_with_registry(&project, &mock.url())
+        .env("LPM_TOKEN", "rejected-env-token")
+        .args(["whoami"])
+        .output()
+        .unwrap();
+    assert!(!human_output.status.success());
+    let diagnostic = String::from_utf8_lossy(&human_output.stderr);
+    assert!(diagnostic.contains("LPM_TOKEN"), "{diagnostic}");
+    assert!(diagnostic.contains("unset"), "{diagnostic}");
+    assert!(!diagnostic.contains("rejected-env-token"));
+    assert_eq!(read_credentials(project.home()), before);
+    let recovered = lpm_with_registry(&project, &mock.url())
+        .args(["whoami", "--json"])
+        .output()
+        .unwrap();
+    assert!(recovered.status.success());
+    assert_eq!(
+        parse_json_output(&recovered.stdout)["username"],
+        "storeduser"
+    );
+}

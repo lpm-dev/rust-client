@@ -322,6 +322,15 @@ pub enum LpmError {
     )]
     AuthRequired,
 
+    #[error("the registry rejected LPM_TOKEN; it may be expired, revoked, or invalid")]
+    #[diagnostic(
+        code(lpm::env_token_rejected),
+        help(
+            "Replace LPM_TOKEN with a valid token, or unset LPM_TOKEN to use your saved login. Your saved credentials have not been changed."
+        )
+    )]
+    EnvTokenRejected,
+
     #[error("credential storage error: {0}")]
     #[diagnostic(
         code(lpm::credential_storage),
@@ -721,6 +730,7 @@ impl LpmError {
             LpmError::Network(_) => "network",
             LpmError::Http { .. } => "http",
             LpmError::AuthRequired => "auth_required",
+            LpmError::EnvTokenRejected => "env_token_rejected",
             LpmError::CredentialStorage(_) => "credential_storage",
             LpmError::SudoNotSupported => "sudo_not_supported",
             LpmError::SessionExpired => "session_expired",

@@ -359,6 +359,9 @@ fn json_error_value(error: &lpm_common::LpmError) -> serde_json::Value {
 
 fn next_steps_for_error(error: &lpm_common::LpmError) -> Option<serde_json::Value> {
     match error {
+        lpm_common::LpmError::EnvTokenRejected => Some(serde_json::json!([{
+            "description": "Replace LPM_TOKEN with a valid token, or unset LPM_TOKEN to use your saved login. Your saved credentials have not been changed."
+        }])),
         lpm_common::LpmError::AuthRequired => Some(crate::json_contract::command_next_steps(
             "Authenticate with LPM",
             "lpm login",
@@ -575,6 +578,9 @@ fn slim_error_lines(error: &lpm_common::LpmError) -> Vec<SlimErrorLine> {
         }
         lpm_common::LpmError::AuthRequired => {
             diagnostic_lines("Authentication required", None, error)
+        }
+        lpm_common::LpmError::EnvTokenRejected => {
+            diagnostic_lines("LPM_TOKEN was rejected", None, error)
         }
         lpm_common::LpmError::CredentialStorage(reason) => {
             diagnostic_lines("Credential storage error", Some(reason), error)

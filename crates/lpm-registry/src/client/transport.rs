@@ -326,6 +326,9 @@ impl RegistryClient {
                 let Some(source) = session.current_source()? else {
                     return Err(LpmError::AuthRequired);
                 };
+                if source == lpm_auth::TokenSource::EnvVar {
+                    return Err(LpmError::EnvTokenRejected);
+                }
                 if source.refresh_policy() != RefreshPolicy::IfRefreshable {
                     return Err(LpmError::AuthRequired);
                 }
