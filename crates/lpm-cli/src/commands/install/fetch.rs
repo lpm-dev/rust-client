@@ -1927,12 +1927,17 @@ pub(super) async fn run_online_fetch_phase(
 
     let downloaded = to_download.len();
     super::resolve::prioritize_fetch_schedule(&mut to_download);
-    let v2_streaming_candidate_key = (streaming_fetch && !force)
-        .then_some(store_v2_handle.as_deref())
-        .flatten()
-        .filter(|store_v2| store_v2.supports_streamed_object_ingest())
-        .and_then(|_| super::resolve::v2_streaming_candidate_key(&to_download));
-    if let Some(candidate_key) = v2_streaming_candidate_key.as_deref() {
+    let mut v2_streaming_candidate = if streaming_fetch
+        && !force
+        && store_v2_handle
+            .as_ref()
+            .is_some_and(|store| store.supports_streamed_object_ingest())
+    {
+        super::resolve::reserve_v2_streaming_candidate(&to_download, &fetch_coord).await
+    } else {
+        None
+    };
+    if let Some((candidate_key, _)) = v2_streaming_candidate.as_ref() {
         super::resolve::promote_fetch_candidate(&mut to_download, candidate_key);
     }
     //: accumulate per-task timings across the parallel pool so we
@@ -1958,9 +1963,15 @@ pub(super) async fn run_online_fetch_phase(
         let mut handles = Vec::new();
 
         for p in to_download {
-            let is_v2_streaming_candidate = v2_streaming_candidate_key
-                .as_deref()
-                .is_some_and(|selected| selected == install_pkg_key(&p));
+            let reserved_key_guard = if v2_streaming_candidate
+                .as_ref()
+                .is_some_and(|(selected, _)| *selected == install_pkg_key(&p))
+            {
+                v2_streaming_candidate.take().map(|(_, guard)| guard)
+            } else {
+                None
+            };
+            let is_v2_streaming_candidate = reserved_key_guard.is_some();
             let sem = semaphore.clone();
             let client = arc_client.clone();
             let store_ref = store.clone();
@@ -2037,8 +2048,10 @@ pub(super) async fn run_online_fetch_phase(
                 // already fetching this key, we wait here without consuming
                 // a permit. On wake, `has_package` is true and we skip the
                 // real fetch entirely (zero bandwidth, zero CPU).
-                let key_lock = coord.lock_for(package_key.clone()).await;
-                let mut key_guard = Some(key_lock.lock_owned().await);
+                let mut key_guard = Some(match reserved_key_guard {
+                    Some(guard) => guard,
+                    None => coord.lock_for(package_key.clone()).await.lock_owned().await,
+                });
 
                 // Spawn the per-pkg link task once the tarball is in the
                 // store. Used in both the sibling-skip path and the normal
