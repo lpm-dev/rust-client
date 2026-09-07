@@ -30,11 +30,22 @@ LPM_AUDIT_ALLOW_NEW=1 ./bench/audit-fixtures/run-all.sh
 ```
 
 Outputs land in `results/<fixture>-<mode>-<timestamp>.json`.
+The same directory contains full install stdout and stderr logs.
+The suite streams fixture progress to the console and records a log for each fixture.
+
+Each install attempt has a 180-second deadline.
+`LPM_AUDIT_INSTALL_TIMEOUT_SECS` accepts an integer from 1 to 86400 to change that deadline.
+An expired deadline stops the install process tree and returns exit code 124.
+The harness preserves partial output and does not retry that attempt.
+Failed installs skip module and smoke checks.
+
+The suite classifies expired deadlines as `install-timeout` and fails even if both modes time out.
+Harness errors also fail the suite.
 
 Each result JSON also carries a typed `classification` for non-pass
 outcomes so suite summaries can distinguish runtime mismatches,
 fixture limitations, package-surface mismatches, and genuine
-unclassified failures without changing the hoisted-vs-isolated gate.
+unclassified failures.
 
 ## Pass criteria (per fixture × linker mode)
 
@@ -47,4 +58,4 @@ unclassified failures without changing the hoisted-vs-isolated gate.
 A fixture passes a linker mode iff all five hold. Any single failure logs
 the specific criterion + reason, and the summary groups symmetric
 non-pass outcomes by typed category while still failing CI only for
-mode-asymmetric regressions.
+mode-asymmetric regressions, expired deadlines, and harness errors.

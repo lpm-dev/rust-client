@@ -76,14 +76,17 @@ run_one() {
     # shellcheck disable=SC2064  # expansion at trap-install time is intentional
     trap "rm -rf '$slot_home' '$work_base'" EXIT
 
+    local runner_exit=0
     LPM_HOME="$slot_home" \
     LPM_AUDIT_WORK_BASE="$work_base" \
     bash "$HERE/../audit-fixtures/run-audit.sh" "$fixture" \
-        > "$slot_home/last.log" 2>&1 || true
+        > "$slot_home/last.log" 2>&1 || runner_exit=$?
 
     # Echo a one-line status to the parent.
     local fname
     fname="$(echo "$fixture" | tr '/' '-')"
+    mkdir -p "$RESULTS_DIR"
+    cp "$slot_home/last.log" "$RESULTS_DIR/$fname.log"
     local iso hst
     iso=$(ls -t "$RESULTS_DIR/$fname-isolated-"*.json 2>/dev/null | head -1)
     hst=$(ls -t "$RESULTS_DIR/$fname-hoisted-"*.json 2>/dev/null | head -1)
@@ -91,6 +94,7 @@ run_one() {
     iv=$([[ -f "$iso" ]] && python3 -c "import json;print(json.load(open('$iso'))['verdict'])" || echo "?")
     hv=$([[ -f "$hst" ]] && python3 -c "import json;print(json.load(open('$hst'))['verdict'])" || echo "?")
     printf "%-40s %s/%s\n" "$fixture" "$iv" "$hv"
+    return "$runner_exit"
 }
 
 export -f run_one
@@ -98,7 +102,10 @@ export HERE RESULTS_DIR
 
 # One xargs line per fixture. Each `bash -c` invocation gets its own
 # PID and therefore its own LPM_HOME / work base — see run_one.
+set +e
 printf '%s\n' "${FIXTURES[@]}" | xargs -P "$PARALLEL" -L 1 bash -c 'run_one "$0"'
+harness_exit=$?
+set -e
 
 echo
 echo
@@ -108,6 +115,7 @@ echo "############################################"
 printf "%-40s %-20s %s\n" "FIXTURE" "ISOLATED/HOISTED" "CATEGORY"
 echo "------------------------------------------------------------------"
 pass=0; mixed=0; symmetric_non_pass=0; unknown=0
+timeouts=0
 asymmetric_list=()
 symmetric_issue_rows=()
 for f in "${FIXTURES[@]}"; do
@@ -118,6 +126,9 @@ for f in "${FIXTURES[@]}"; do
     hv=$([[ -f "$hst" ]] && python3 -c "import json;print(json.load(open('$hst'))['verdict'])" || echo "?")
     ic=$([[ -f "$iso" ]] && python3 -c "import json;print(json.load(open('$iso')).get('classification','unclassified-failure'))" || echo "?")
     hc=$([[ -f "$hst" ]] && python3 -c "import json;print(json.load(open('$hst')).get('classification','unclassified-failure'))" || echo "?")
+    if [[ "$ic" == "install-timeout" || "$hc" == "install-timeout" ]]; then
+        timeouts=$((timeouts+1))
+    fi
     if [[ "$ic" == "$hc" ]]; then
         category_summary="$ic"
     else
@@ -167,6 +178,16 @@ if [[ ${#asymmetric_list[@]} -gt 0 ]]; then
 fi
 
 date
+
+if [[ $harness_exit -ne 0 ]]; then
+    echo "FAIL: fixture harness failed"
+    exit 1
+fi
+
+if [[ $timeouts -gt 0 ]]; then
+    echo "FAIL: $timeouts fixture(s) exceeded the install deadline"
+    exit 1
+fi
 
 # CI gate: asymmetric outcomes are the regression signal.
 if [[ $mixed -gt 0 ]]; then

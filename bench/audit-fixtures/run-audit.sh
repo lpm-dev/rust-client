@@ -168,6 +168,8 @@ run_mode() {
     set -e
     local e=$(now_ms)
     local install_ms=$(( (e-s)/1000000 ))
+    cp "$install_json" "$RESULTS_DIR/$FIXTURE_NAME-$mode-$TS.stdout.log"
+    cp "$install_log" "$RESULTS_DIR/$FIXTURE_NAME-$mode-$TS.stderr.log"
 
     # Top-level dep count. Match dirs AND symlinks — isolated mode puts
     # symlinks at top level (pointing into the wrappers tree), hoisted
@@ -184,6 +186,7 @@ run_mode() {
     local require_failures_file="$work/require-failures.tsv"
     : > "$require_failures_file"
     while IFS= read -r dep; do
+        [[ $install_exit -eq 0 ]] || break
         [[ -z "$dep" ]] && continue
         set +e
         local req_stderr
@@ -202,9 +205,12 @@ run_mode() {
     done < <(direct_deps)
 
     # Smoke test (if smoke.sh exists in fixture).
-    local smoke_exit=0
+    local smoke_exit=null
     local smoke_log=""
-    if [[ -x "$FIXTURE_DIR/smoke.sh" ]]; then
+    if [[ $install_exit -eq 0 ]]; then
+        smoke_exit=0
+    fi
+    if [[ $install_exit -eq 0 && -x "$FIXTURE_DIR/smoke.sh" ]]; then
         set +e
         smoke_log=$(cd "$work" && bash "$FIXTURE_DIR/smoke.sh" 2>&1)
         smoke_exit=$?
@@ -379,7 +385,7 @@ print(json.dumps({
     "top_level_dep_count": $top_count,
     "require_pass": $require_pass,
     "require_fail": $require_fail,
-    "smoke_exit": $smoke_exit,
+    "smoke_exit": json.loads("$smoke_exit"),
     "verdict": "$verdict",
     "fail_reason": $fail_reason_json,
     "classification": "$classification",
@@ -403,7 +409,7 @@ EOF
     if [[ $require_fail -gt 0 ]]; then
         printf "%b" "$require_results"
     fi
-    if [[ -x "$FIXTURE_DIR/smoke.sh" ]]; then
+    if [[ $install_exit -eq 0 && -x "$FIXTURE_DIR/smoke.sh" ]]; then
         printf "  smoke: exit=%d\n" "$smoke_exit"
         if [[ $smoke_exit -ne 0 ]]; then
             echo "$smoke_log" | sed 's/^/    /' | head -10

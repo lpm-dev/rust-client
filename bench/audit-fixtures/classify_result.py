@@ -154,6 +154,12 @@ def classify(payload):
 
     signal_text = collect_signal_text(payload)
 
+    if payload.get("install_exit") == 124:
+        return {
+            "classification": "install-timeout",
+            "classification_detail": "install exceeded the audit deadline",
+        }
+
     if payload.get("install_exit", 0) != 0:
         runtime_detail = find_first_match(signal_text, RUNTIME_MISMATCH_PATTERNS)
         if runtime_detail:

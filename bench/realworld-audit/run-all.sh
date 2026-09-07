@@ -1,8 +1,6 @@
 #!/bin/bash
 # Run every real-world project in projects.json and emit a consolidated
-# summary. CI-friendly: exits non-zero only on mode-asymmetric outcomes
-# (PASS isolated / FAIL hoisted or vice versa) — symmetric failures are
-# upstream/ecosystem incompat and don't gate the build.
+# summary.
 set -e
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -27,6 +25,7 @@ done < <(jq -r '.projects[].name' "$HERE/projects.json")
 
 declare -a RESULTS=()
 declare -a NAMES=()
+harness_failures=0
 
 date
 echo "[realworld] running ${#PROJECT_NAMES[@]} project(s)"
@@ -39,7 +38,11 @@ for name in "${PROJECT_NAMES[@]}"; do
     echo "=========================================="
     set +e
     "$HERE/run-realworld.sh" "$name"
+    runner_exit=$?
     set -e
+    if [[ $runner_exit -ne 0 ]]; then
+        harness_failures=$((harness_failures+1))
+    fi
 
     iso=$(ls -t "$HERE/results/$name-isolated-"*.json 2>/dev/null | head -1)
     hst=$(ls -t "$HERE/results/$name-hoisted-"*.json 2>/dev/null | head -1)
@@ -57,6 +60,7 @@ echo "############################################"
 printf "%-32s %-20s %s\n" "PROJECT" "ISOLATED/HOISTED" "CATEGORY"
 echo "------------------------------------------------------------------"
 pass=0; symmetric_non_pass=0; mixed=0
+timeouts=0
 symmetric_issue_rows=()
 for i in "${!NAMES[@]}"; do
     iso="$HERE/results/${NAMES[$i]}-isolated-*.json"
@@ -65,6 +69,9 @@ for i in "${!NAMES[@]}"; do
     hst_file=$(ls -t $hst 2>/dev/null | head -1)
     iso_c=$([[ -f "$iso_file" ]] && python3 -c "import json;print(json.load(open('$iso_file')).get('classification','unclassified-failure'))" || echo "?")
     hst_c=$([[ -f "$hst_file" ]] && python3 -c "import json;print(json.load(open('$hst_file')).get('classification','unclassified-failure'))" || echo "?")
+    if [[ "$iso_c" == "install-timeout" || "$hst_c" == "install-timeout" ]]; then
+        timeouts=$((timeouts+1))
+    fi
     if [[ "$iso_c" == "$hst_c" ]]; then
         category_summary="$iso_c"
     else
@@ -106,6 +113,16 @@ for category in sorted(by_category):
 fi
 
 date
+
+if [[ $harness_failures -gt 0 ]]; then
+    echo "FAIL: fixture harness failed for $harness_failures project(s)"
+    exit 1
+fi
+
+if [[ $timeouts -gt 0 ]]; then
+    echo "FAIL: $timeouts project(s) exceeded the install deadline"
+    exit 1
+fi
 
 # Mode-asymmetric outcomes are regressions. Symmetric failures are
 # adjacent issues (upstream incompat, lpm bug equally on both modes,
