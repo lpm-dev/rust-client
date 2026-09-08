@@ -79,3 +79,28 @@ pub(super) async fn report_pool_install_attribution(
             reason: error.to_string(),
         })
 }
+
+pub(super) async fn verify_lpm_install_access(
+    client: &RegistryClient,
+    packages: &[InstallPackage],
+    json_output: bool,
+) -> Result<Vec<String>, LpmError> {
+    let exact: Vec<_> = packages
+        .iter()
+        .filter(|package| {
+            lpm_common::package_name::is_lpm_package(&package.name)
+                && matches!(
+                    package.source_kind(),
+                    Ok(lpm_lockfile::Source::Registry { .. })
+                )
+        })
+        .map(|package| ManagedInstallRoot::new(&package.name, &package.version))
+        .collect();
+    let warnings = client.check_install_access(&exact).await?;
+    if !json_output {
+        for warning in &warnings {
+            output::warn(warning);
+        }
+    }
+    Ok(warnings)
+}

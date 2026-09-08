@@ -194,6 +194,7 @@ mod tests {
             summary: String::new(),
             signature_diagnostic: None,
             auto_acked: false,
+            response_body_incomplete: false,
         };
         let target = lpm_common::LocalTarget::loopback(lpm_common::LocalScheme::Https, 5173);
 
@@ -242,6 +243,7 @@ mod tests {
             summary: String::new(),
             signature_diagnostic: None,
             auto_acked: false,
+            response_body_incomplete: false,
         };
 
         let client = reqwest::Client::new();
@@ -307,6 +309,7 @@ mod tests {
             summary: String::new(),
             signature_diagnostic: None,
             auto_acked: false,
+            response_body_incomplete: false,
         };
 
         let client = reqwest::Client::new();

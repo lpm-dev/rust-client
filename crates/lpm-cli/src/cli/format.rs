@@ -519,6 +519,15 @@ fn slim_error_lines(error: &lpm_common::LpmError) -> Vec<SlimErrorLine> {
         lpm_common::LpmError::Registry(reason) => {
             diagnostic_lines("Registry error", Some(reason), error)
         }
+        lpm_common::LpmError::PackageInstallDenied {
+            package,
+            version,
+            reason,
+        } => {
+            let mut lines = diagnostic_lines("Package installation denied", Some(reason), error);
+            push_untrusted_detail(&mut lines, "package", &format!("{package}@{version}"));
+            lines
+        }
         lpm_common::LpmError::PublicationUnavailable(reason) => {
             diagnostic_lines("Publication unavailable", Some(reason), error)
         }

@@ -26,6 +26,9 @@ pub struct CapturedWebhook {
     /// `--auto-ack` is enabled and the local server is unreachable.
     #[serde(default)]
     pub auto_acked: bool,
+    /// The inspector contains only a prefix of a streamed response.
+    #[serde(default)]
+    pub response_body_incomplete: bool,
 }
 
 /// Known webhook providers.
@@ -268,6 +271,7 @@ mod tests {
             summary: String::new(),
             signature_diagnostic: None,
             auto_acked: false,
+            response_body_incomplete: false,
         };
         overrides(&mut wh);
         wh

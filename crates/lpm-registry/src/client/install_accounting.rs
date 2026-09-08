@@ -62,3 +62,89 @@ impl RegistryClient {
         Ok(())
     }
 }
+
+#[derive(serde::Deserialize)]
+struct InstallAccessResponse {
+    packages: Vec<InstallAccessDecision>,
+}
+
+#[derive(serde::Deserialize)]
+struct InstallAccessDecision {
+    name: String,
+    version: String,
+    allowed: bool,
+    reason: Option<String>,
+    deprecated: Option<String>,
+}
+
+impl RegistryClient {
+    /// Check current installation rights for every exact registry dependency.
+    /// Local artifacts and metadata never stand in for this online check.
+    pub async fn check_install_access(
+        &self,
+        packages: &[ManagedInstallRoot],
+    ) -> Result<Vec<String>, LpmError> {
+        if packages.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut packages = packages.to_vec();
+        packages.sort_unstable();
+        packages.dedup();
+        let url = format!("{}/api/registry/install-check", self.base_url);
+        let mut warnings = Vec::new();
+        for chunk in packages.chunks(200) {
+            let body = serde_json::json!({ "packages": chunk });
+            let response: InstallAccessResponse = self
+                .execute_with_recovery(AuthPosture::AuthRequired, || async {
+                    let response = self.post_json_raw(&url, &body).await?;
+                    parse_capped_api_json(response, "registry install access check").await
+                })
+                .await?;
+            let mut decisions = std::collections::BTreeMap::new();
+            for decision in response.packages {
+                if decisions
+                    .insert((decision.name.clone(), decision.version.clone()), decision)
+                    .is_some()
+                {
+                    return Err(LpmError::Registry(
+                        "Duplicate registry install access decision".into(),
+                    ));
+                }
+            }
+            if decisions.len() != chunk.len() {
+                return Err(LpmError::Registry(
+                    "Incomplete registry install access response".into(),
+                ));
+            }
+            for package in chunk {
+                let decision = decisions
+                    .remove(&(package.name.clone(), package.version.clone()))
+                    .ok_or_else(|| {
+                        LpmError::Registry(format!(
+                            "Registry did not verify {}@{}",
+                            package.name, package.version
+                        ))
+                    })?;
+                if !decision.allowed {
+                    return Err(LpmError::PackageInstallDenied {
+                        package: package.name.clone(),
+                        version: package.version.clone(),
+                        reason: decision.reason.unwrap_or_else(|| {
+                            "Package access denied or version unavailable".into()
+                        }),
+                    });
+                }
+                if let Some(message) = decision
+                    .deprecated
+                    .filter(|message| !message.trim().is_empty())
+                {
+                    warnings.push(format!(
+                        "{}@{} is deprecated: {}",
+                        package.name, package.version, message
+                    ));
+                }
+            }
+        }
+        Ok(warnings)
+    }
+}

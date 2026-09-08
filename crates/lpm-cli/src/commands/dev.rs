@@ -4697,6 +4697,7 @@ mod tests {
                 summary: "queued capture".to_string(),
                 signature_diagnostic: None,
                 auto_acked: false,
+                response_body_incomplete: false,
             })
             .await;
         let inspector = lpm_inspect::start(state.clone(), 0).await.unwrap();
@@ -6688,6 +6689,7 @@ mod tests {
             summary: "test".to_string(),
             signature_diagnostic: None,
             auto_acked: false,
+            response_body_incomplete: false,
         };
 
         // Send webhook event (same pattern as dev.rs consumer)

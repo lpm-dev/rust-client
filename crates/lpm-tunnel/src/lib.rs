@@ -141,3 +141,5 @@ pub const DEFAULT_RELAY_URL: &str = "wss://relay.lpm.fyi/connect";
 /// Known base domains for tunnel subdomains.
 /// Used for validation and backward compatibility (bare subdomain → append default).
 pub const DEFAULT_BASE_DOMAIN: &str = "lpm.fyi";
+
+mod http_stream;

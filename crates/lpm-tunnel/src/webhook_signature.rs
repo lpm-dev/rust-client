@@ -184,6 +184,7 @@ mod tests {
             summary: String::new(),
             signature_diagnostic: None,
             auto_acked: false,
+            response_body_incomplete: false,
         };
         overrides(&mut wh);
         wh

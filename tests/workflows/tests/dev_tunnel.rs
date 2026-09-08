@@ -48,6 +48,7 @@ fn captured_webhook(
         response_status: status,
         response_headers: std::collections::HashMap::new(),
         response_body: br#"{"accepted":false}"#.to_vec(),
+        response_body_incomplete: false,
         duration_ms: 18,
         provider: Some(lpm_tunnel::webhook::WebhookProvider::Stripe),
         summary: "Stripe: payment_intent.payment_failed".to_string(),

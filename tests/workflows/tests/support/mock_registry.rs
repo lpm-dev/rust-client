@@ -632,6 +632,18 @@ impl MockRegistry {
             .with_priority(u8::MAX)
             .mount(&server)
             .await;
+        Mock::given(method("POST"))
+            .and(path("/api/registry/install-check"))
+            .respond_with(|request: &Request| {
+                let body: serde_json::Value = serde_json::from_slice(&request.body).expect("install check request");
+                let packages: Vec<_> = body["packages"].as_array().expect("exact packages").iter().map(|entry| {
+                    serde_json::json!({ "name": entry["name"], "version": entry["version"], "allowed": true })
+                }).collect();
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({ "packages": packages }))
+            })
+            .with_priority(u8::MAX)
+            .mount(&server)
+            .await;
         MockRegistry {
             server,
             tarball_integrities: Arc::default(),

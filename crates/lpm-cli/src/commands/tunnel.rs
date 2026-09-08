@@ -1852,6 +1852,7 @@ mod tests {
             summary: String::new(),
             signature_diagnostic: None,
             auto_acked: false,
+            response_body_incomplete: false,
         };
 
         assert_eq!(
@@ -2121,6 +2122,7 @@ mod tests {
             summary: String::new(),
             signature_diagnostic: None,
             auto_acked: false,
+            response_body_incomplete: false,
         };
         writer.push(webhook.clone()).await;
         writer.flush().await.unwrap();

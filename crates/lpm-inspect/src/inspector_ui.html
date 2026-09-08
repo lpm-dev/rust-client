@@ -456,7 +456,7 @@ function renderDetail(d) {
 		<div class="detail-sect"><div class="detail-sect-title">Request Headers (${Object.keys(d.request_headers||{}).length})</div>${hr(d.request_headers)}</div>
 		<div class="detail-sect"><div class="detail-sect-title">Request Body (${d.request_body_size}B)</div><div class="detail-body">${esc(pb)}</div></div>
 		<div class="detail-sect"><div class="detail-sect-title">Response Headers (${Object.keys(d.response_headers||{}).length})</div>${hr(d.response_headers)}</div>
-		<div class="detail-sect"><div class="detail-sect-title">Response Body (${d.response_body_size}B)</div><div class="detail-body">${esc(pr)}</div></div>`
+		<div class="detail-sect"><div class="detail-sect-title">Response Body (${d.response_body_size}B${d.response_body_incomplete ? ", partial capture" : ""})</div><div class="detail-body">${esc(pr)}</div></div>`
 	renderTags(d.id)
 }
 function renderDiagnosis(diag) {

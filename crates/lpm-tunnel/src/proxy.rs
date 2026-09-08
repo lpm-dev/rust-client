@@ -15,6 +15,8 @@ const MAX_RESPONSE_BODY_SIZE: usize = 50 * 1024 * 1024;
 
 pub(crate) struct ForwardedResponse {
     pub(crate) message: ClientMessage,
+    pub(crate) stream_end: Option<ClientMessage>,
+    pub(crate) capture_incomplete: bool,
     pub(crate) memory_permit: Option<tokio::sync::OwnedSemaphorePermit>,
 }
 
@@ -71,12 +73,13 @@ pub async fn forward_request(
     request: &ServerMessage,
 ) -> Result<ClientMessage, LpmError> {
     Ok(
-        forward_request_inner(http_client, local_target, request, None)
+        forward_request_inner(http_client, local_target, request, None, None)
             .await?
             .message,
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn forward_request_with_memory_budget(
     http_client: &reqwest::Client,
     local_target: &lpm_common::LocalTarget,
@@ -85,6 +88,7 @@ pub(crate) async fn forward_request_with_memory_budget(
     memory_budget_permits: usize,
     memory_unit_bytes: usize,
     memory_multiplier: usize,
+    stream: Option<crate::http_stream::StreamOutput>,
 ) -> Result<ForwardedResponse, LpmError> {
     forward_request_inner(
         http_client,
@@ -96,6 +100,7 @@ pub(crate) async fn forward_request_with_memory_budget(
             memory_unit_bytes,
             memory_multiplier,
         )),
+        stream,
     )
     .await
 }
@@ -105,6 +110,7 @@ async fn forward_request_inner(
     local_target: &lpm_common::LocalTarget,
     request: &ServerMessage,
     memory_budget: Option<(Arc<tokio::sync::Semaphore>, usize, usize, usize)>,
+    stream: Option<crate::http_stream::StreamOutput>,
 ) -> Result<ForwardedResponse, LpmError> {
     crate::validate_forward_target(local_target)?;
     let (id, method, url, headers, body) = match request {
@@ -152,10 +158,13 @@ async fn forward_request_inner(
     }
 
     // Send with timeout
-    let response = builder
-        .timeout(std::time::Duration::from_secs(30))
-        .send()
+    if stream.is_none() {
+        builder = builder.timeout(std::time::Duration::from_secs(30));
+    }
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+    let response = tokio::time::timeout_at(deadline, builder.send())
         .await
+        .map_err(|_| LpmError::Tunnel("local response headers timed out".into()))?
         .map_err(|e| {
             if e.is_connect() {
                 LpmError::Tunnel(format!(
@@ -182,6 +191,33 @@ async fn forward_request_inner(
         }
     }
 
+    let is_event_stream = resp_headers.get("content-type").is_some_and(|value| {
+        value
+            .split(';')
+            .next()
+            .is_some_and(|mime| mime.trim().eq_ignore_ascii_case("text/event-stream"))
+    });
+    if is_event_stream && let Some(output) = stream {
+        let capture = output.forward(id, status, &resp_headers, response).await?;
+        return Ok(ForwardedResponse {
+            message: ClientMessage::HttpResponse {
+                id: id.clone(),
+                status,
+                headers: resp_headers,
+                body: base64::Engine::encode(
+                    &base64::engine::general_purpose::STANDARD,
+                    capture.body,
+                ),
+            },
+            stream_end: Some(ClientMessage::HttpResponseEnd {
+                id: id.clone(),
+                failed: capture.failed,
+            }),
+            capture_incomplete: capture.incomplete,
+            memory_permit: None,
+        });
+    }
+
     // Check content-length header first for early rejection of oversized responses.
     // Fall back to reading bytes and checking after for chunked/streaming responses.
     if let Some(cl) = response.content_length()
@@ -189,6 +225,8 @@ async fn forward_request_inner(
     {
         return Ok(ForwardedResponse {
             message: response_too_large(id, cl),
+            stream_end: None,
+            capture_incomplete: false,
             memory_permit: None,
         });
     }
@@ -221,15 +259,17 @@ async fn forward_request_inner(
             .min(MAX_RESPONSE_BODY_SIZE),
     );
     let mut response = response;
-    while let Some(chunk) = response
-        .chunk()
+    while let Some(chunk) = tokio::time::timeout_at(deadline, response.chunk())
         .await
+        .map_err(|_| LpmError::Tunnel("local response body timed out".into()))?
         .map_err(|e| LpmError::Tunnel(format!("failed to read response body: {e}")))?
     {
         let next_len = body_bytes.len().saturating_add(chunk.len());
         if next_len > MAX_RESPONSE_BODY_SIZE {
             return Ok(ForwardedResponse {
                 message: response_too_large(id, next_len as u64),
+                stream_end: None,
+                capture_incomplete: false,
                 memory_permit,
             });
         }
@@ -246,6 +286,8 @@ async fn forward_request_inner(
             body: body_b64,
         },
         memory_permit,
+        stream_end: None,
+        capture_incomplete: false,
     })
 }
 
@@ -494,6 +536,76 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn event_stream_chunks_and_inspector_capture_are_bounded() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0; 1024];
+            assert!(socket.read(&mut request).await.unwrap() > 0);
+            socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream; charset=utf-8\r\nContent-Length: 131072\r\n\r\n").await.unwrap();
+            socket.write_all(&vec![b'x'; 128 * 1024]).await.unwrap();
+        });
+        let (messages, mut output) = tokio::sync::mpsc::channel(1);
+        let (credits, credit_rx) = tokio::sync::mpsc::channel(1);
+        let forward = tokio::spawn(async move {
+            let request = ServerMessage::HttpRequest {
+                id: "stream".into(),
+                method: "GET".into(),
+                url: "/events".into(),
+                headers: HashMap::new(),
+                body: String::new(),
+            };
+            forward_request_inner(
+                &reqwest::Client::builder().no_proxy().build().unwrap(),
+                &lpm_common::LocalTarget::loopback(lpm_common::LocalScheme::Http, address.port()),
+                &request,
+                None,
+                Some(crate::http_stream::StreamOutput {
+                    messages,
+                    credits: credit_rx,
+                    cancel: tokio_util::sync::CancellationToken::new(),
+                }),
+            )
+            .await
+            .unwrap()
+        });
+        let mut received = 0;
+        while let Some(message) = output.recv().await {
+            match message {
+                ClientMessage::HttpResponseStart { status: 200, .. } => {}
+                ClientMessage::HttpResponseChunk { body, .. } => {
+                    let bytes =
+                        base64::Engine::decode(&base64::engine::general_purpose::STANDARD, body)
+                            .unwrap();
+                    assert!(bytes.len() <= 64 * 1024);
+                    received += bytes.len();
+                }
+                _ => panic!("unexpected stream message"),
+            }
+            credits.send(()).await.unwrap();
+        }
+        let response = forward.await.unwrap();
+        server.await.unwrap();
+        assert_eq!(received, 128 * 1024);
+        assert!(response.capture_incomplete);
+        assert!(matches!(
+            response.stream_end,
+            Some(ClientMessage::HttpResponseEnd { failed: false, .. })
+        ));
+        let ClientMessage::HttpResponse { body, .. } = response.message else {
+            panic!("missing inspector response")
+        };
+        assert_eq!(
+            base64::Engine::decode(&base64::engine::general_purpose::STANDARD, body)
+                .unwrap()
+                .len(),
+            64 * 1024
+        );
+    }
+
+    #[tokio::test]
     async fn chunked_response_stops_at_the_body_limit_without_waiting_for_eof() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -590,6 +702,7 @@ mod tests {
                 64,
                 1024 * 1024,
                 4,
+                None,
             )
             .await
         });
