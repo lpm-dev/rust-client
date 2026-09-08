@@ -224,3 +224,107 @@ async fn report_managed_pool_install_sends_one_atomic_graph_without_chunking() {
     assert_eq!(chunks.iter().map(Vec::len).collect::<Vec<_>>(), vec![401]);
     assert!(chunks.iter().flatten().map(String::as_str).is_sorted());
 }
+
+#[tokio::test]
+async fn legacy_pool_reports_cross_npm_bridges_and_bound_root_batches() {
+    use wiremock::matchers::{header, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/registry/pool/install-report"))
+        .and(header("authorization", "Bearer test-token"))
+        .respond_with(|request: &wiremock::Request| {
+            let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+            if body.get("graph").is_some() {
+                ResponseTemplate::new(400).set_body_json(
+                    serde_json::json!({"error":"Request body must contain only a roots array"}),
+                )
+            } else {
+                ResponseTemplate::new(200)
+            }
+        })
+        .expect(4)
+        .mount(&server)
+        .await;
+    let mut graph = ManagedInstallGraph {
+        roots: vec![0, 1],
+        nodes: vec![ManagedInstallNode {
+            name: "npm-bridge".into(),
+            version: "1.0.0".into(),
+            dependencies: (1..=401).collect(),
+        }],
+    };
+    graph.nodes.extend((0..401).map(|index| ManagedInstallNode {
+        name: format!("@lpm.dev/alice.root-{index:03}"),
+        version: "1.0.0".into(),
+        dependencies: vec![402],
+    }));
+    graph.nodes.push(ManagedInstallNode {
+        name: "@lpm.dev/bob.transitive".into(),
+        version: "1.0.0".into(),
+        dependencies: vec![],
+    });
+    RegistryClient::new()
+        .with_base_url(server.uri())
+        .with_token("test-token")
+        .report_managed_pool_install(&graph, ManagedInstallAccounting)
+        .await
+        .unwrap();
+    let requests = server.received_requests().await.unwrap();
+    let roots: Vec<Vec<serde_json::Value>> = requests[1..]
+        .iter()
+        .map(|r| {
+            serde_json::from_slice::<serde_json::Value>(&r.body).unwrap()["roots"]
+                .as_array()
+                .unwrap()
+                .clone()
+        })
+        .collect();
+    assert_eq!(
+        roots.iter().map(Vec::len).collect::<Vec<_>>(),
+        [200, 200, 1]
+    );
+    assert!(roots.iter().flatten().all(|root| {
+        root["name"]
+            .as_str()
+            .unwrap()
+            .starts_with("@lpm.dev/alice.root-")
+    }));
+    assert!(
+        roots
+            .iter()
+            .flatten()
+            .map(|root| root["name"].as_str().unwrap())
+            .is_sorted()
+    );
+}
+
+#[tokio::test]
+async fn pool_reports_do_not_downgrade_unrelated_rejections() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+    for (status, message) in [
+        (400, "Invalid graph"),
+        (403, "Request body must contain only a roots array"),
+        (404, "Not found"),
+    ] {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/registry/pool/install-report"))
+            .respond_with(
+                ResponseTemplate::new(status).set_body_json(serde_json::json!({"error":message})),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let graph = graph_of_roots(&[ManagedInstallRoot::new("@lpm.dev/alice.root", "1.0.0")]);
+        assert!(
+            RegistryClient::new()
+                .with_base_url(server.uri())
+                .with_token("test-token")
+                .report_managed_pool_install(&graph, ManagedInstallAccounting)
+                .await
+                .is_err()
+        );
+    }
+}

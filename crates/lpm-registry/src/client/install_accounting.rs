@@ -84,12 +84,55 @@ impl RegistryClient {
         }
         let url = format!("{}/api/registry/pool/install-report", self.base_url);
         let body = serde_json::json!({ "graph": graph });
-        self.execute_with_recovery(AuthPosture::AuthRequired, || {
-            self.post_json_raw(&url, &body)
-        })
-        .await?;
+        let result = self
+            .execute_with_recovery(AuthPosture::AuthRequired, || {
+                self.post_json_raw(&url, &body)
+            })
+            .await;
+        match result {
+            Ok(_) => return Ok(()),
+            Err(LpmError::Http {
+                status: 400,
+                ref message,
+            }) if serde_json::from_str::<serde_json::Value>(message).is_ok_and(|body| {
+                body.get("error").and_then(serde_json::Value::as_str)
+                    == Some("Request body must contain only a roots array")
+            }) => {}
+            Err(error) => return Err(error),
+        }
+        let roots = legacy_pool_roots(graph)?;
+        for chunk in roots.chunks(200) {
+            let body = serde_json::json!({ "roots": chunk });
+            self.execute_with_recovery(AuthPosture::AuthRequired, || {
+                self.post_json_raw(&url, &body)
+            })
+            .await?;
+        }
+        tracing::warn!("Registry uses legacy Pool accounting; dependency credit may be incomplete");
         Ok(())
     }
+}
+
+fn legacy_pool_roots(graph: &ManagedInstallGraph) -> Result<Vec<ManagedInstallRoot>, LpmError> {
+    let mut seen = vec![false; graph.nodes.len()];
+    let mut pending = graph.roots.clone();
+    let mut roots = std::collections::BTreeSet::new();
+    while let Some(index) = pending.pop() {
+        let node = graph.nodes.get(index).ok_or_else(|| {
+            LpmError::Registry(
+                "Installed dependency graph contains an invalid node reference".into(),
+            )
+        })?;
+        if std::mem::replace(&mut seen[index], true) {
+            continue;
+        }
+        if lpm_common::package_name::is_lpm_package(&node.name) {
+            roots.insert(ManagedInstallRoot::new(&node.name, &node.version));
+        } else {
+            pending.extend_from_slice(&node.dependencies);
+        }
+    }
+    Ok(roots.into_iter().collect())
 }
 
 #[derive(serde::Deserialize)]
