@@ -248,10 +248,15 @@ fn build_task_context(
         config_ref,
     )?;
     let inherited_env = lpm_runner::shell::inherited_child_env();
+    let cache_env = task_config
+        .cache_env
+        .as_ref()
+        .map(|names| names.iter().collect::<HashSet<_>>());
     let mut child_env = HashMap::with_capacity(inherited_env.len() + env_vars.len());
     child_env.extend(
         inherited_env
             .iter()
+            .filter(|(key, _)| cache_env.as_ref().is_none_or(|names| names.contains(key)))
             .map(|(key, value)| (key.clone(), value.clone())),
     );
     child_env.extend(

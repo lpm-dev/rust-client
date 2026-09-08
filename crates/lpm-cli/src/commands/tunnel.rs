@@ -564,7 +564,17 @@ pub(crate) async fn run_start(
             Ok(())
         },
         |msg| {
-            if !json_output {
+            if json_output {
+                let event = serde_json::json!({
+                    "schema_version": 1,
+                    "success": false,
+                    "event": "retry",
+                    "error_code": "tunnel_retry",
+                    "error": lpm_common::sanitize_terminal_inline(msg),
+                    "retrying": true,
+                });
+                println!("{event:#}");
+            } else {
                 install_ui::warn_untrusted(&lpm_common::sanitize_terminal_inline(msg));
             }
         },
