@@ -2040,14 +2040,14 @@ pub(super) fn package_platform_compatible(package: &InstallPackage) -> bool {
         .is_none_or(lpm_resolver::is_platform_compatible)
 }
 
-struct PackageTraversalIndex {
+pub(super) struct PackageTraversalIndex {
     by_instance: HashMap<lpm_common::PackageInstanceId, usize>,
     registry_by_coordinate: HashMap<String, usize>,
     source_by_wrapper: HashMap<String, usize>,
 }
 
 impl PackageTraversalIndex {
-    fn new(packages: &[InstallPackage]) -> Self {
+    pub(super) fn new(packages: &[InstallPackage]) -> Self {
         let mut by_instance = HashMap::with_capacity(packages.len());
         let mut registry_by_coordinate = HashMap::with_capacity(packages.len());
         let mut source_by_wrapper = HashMap::with_capacity(packages.len());
@@ -2074,7 +2074,7 @@ impl PackageTraversalIndex {
         }
     }
 
-    fn dependency(
+    pub(super) fn dependency(
         &self,
         package: &InstallPackage,
         local_name: &str,
@@ -2096,7 +2096,11 @@ impl PackageTraversalIndex {
             .copied()
     }
 
-    fn peer(&self, package: &InstallPackage, peer: &lpm_common::PeerEdge) -> Option<usize> {
+    pub(super) fn peer(
+        &self,
+        package: &InstallPackage,
+        peer: &lpm_common::PeerEdge,
+    ) -> Option<usize> {
         if let Some(instance_id) = package.peer_targets.get(&peer.local_name) {
             return self.by_instance.get(instance_id).copied();
         }

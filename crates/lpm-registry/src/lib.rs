@@ -14,10 +14,11 @@ pub use client::{
     BatchMetadataEntryStream, CompressedTarballSpoolReservation, DownloadedTarball, FanOutStats,
     GateDecision, MANAGED_INSTALL_ACCOUNTING_HEADER, MANAGED_INSTALL_ACCOUNTING_VERSION,
     MAX_COMPRESSED_TARBALL_SIZE, MAX_COMPRESSED_TARBALL_SPOOL_BYTES,
-    MAX_MANAGED_POOL_INSTALL_ROOTS, ManagedInstallAccounting, ManagedInstallRoot,
-    PackageMetadataFetchTimings, RegistryClient, TimedPackageMetadata, TimedReleaseTimeMetadata,
-    evaluate_cached_url, is_https_url, is_localhost_url, parse_capped_api_json,
-    reserve_compressed_tarball_spool,
+    MAX_MANAGED_POOL_INSTALL_EDGES, MAX_MANAGED_POOL_INSTALL_LPM_NODES,
+    MAX_MANAGED_POOL_INSTALL_NODES, ManagedInstallAccounting, ManagedInstallGraph,
+    ManagedInstallNode, ManagedInstallRoot, PackageMetadataFetchTimings, RegistryClient,
+    TimedPackageMetadata, TimedReleaseTimeMetadata, evaluate_cached_url, is_https_url,
+    is_localhost_url, parse_capped_api_json, reserve_compressed_tarball_spool,
 };
 pub use npmrc::{
     NpmrcConfig, OriginKey, OriginTlsOverrides, RegistryAuth, RegistryKind, RegistryTarget,

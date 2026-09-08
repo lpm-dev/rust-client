@@ -62,7 +62,7 @@ async fn mount_lpm_install_auxiliary_routes(server: &MockServer) {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn managed_install_reports_topmost_pool_roots_after_cold_and_freshness_cache_hit_runs() {
+async fn managed_install_reports_complete_graph_after_cold_and_freshness_cache_hit_runs() {
     let server = MockServer::start().await;
     common::mount_mock_registry(
         &server,
@@ -96,12 +96,14 @@ async fn managed_install_reports_topmost_pool_roots_after_cold_and_freshness_cac
     .await;
     mount_lpm_install_auxiliary_routes(&server).await;
     let expected_report = serde_json::json!({
-        "roots": [
-            {
-                "name": "@lpm.dev/alice.alpha",
-                "version": "1.0.0",
-            },
-        ],
+        "graph": {
+            "nodes": [
+                { "name": "@lpm.dev/alice.alpha", "version": "1.0.0", "dependencies": [2] },
+                { "name": "@lpm.dev/bob.beta", "version": "2.0.0", "dependencies": [] },
+                { "name": "npm-x", "version": "1.0.0", "dependencies": [1] },
+            ],
+            "roots": [0],
+        },
     });
     Mock::given(method("POST"))
         .and(match_path("/api/registry/pool/install-report"))

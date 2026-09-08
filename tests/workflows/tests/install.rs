@@ -18694,3 +18694,74 @@ fn install_silent_when_default_resolver_with_auto_install_peers_on() {
          stderr was:\n{stderr}"
     );
 }
+
+#[tokio::test]
+async fn install_reports_exact_pool_graph_and_retries_it_on_an_unchanged_project() {
+    let mock = MockRegistry::start().await;
+    let a = "@lpm.dev/alice.graph-root";
+    let b = "@lpm.dev/bob.graph-child";
+    let bridge = "graph-npm-bridge";
+    for (name, version, deps) in [
+        (a, "1.0.0", serde_json::json!({bridge: "1.0.0"})),
+        (
+            bridge,
+            "1.0.0",
+            serde_json::json!({"alias": format!("npm:{b}@2.0.0")}),
+        ),
+        (b, "2.0.0", serde_json::json!({})),
+    ] {
+        let manifest = serde_json::json!({"name": name, "version": version, "main": "index.js", "dependencies": deps});
+        let tarball = make_tarball_from_pkg_json(manifest, &[]);
+        mock.with_package_and_deps(name, version, &tarball, deps)
+            .await;
+    }
+    let project = TempProject::empty(&serde_json::json!({"name": "pool-graph-consumer", "version": "1.0.0", "dependencies": {a: "1.0.0"}}).to_string());
+    for _ in 0..2 {
+        let output = lpm_with_registry_and_npm(&project, &mock.url())
+            .env("LPM_TOKEN", "pool-graph-fixture")
+            .args([
+                "install",
+                "--no-skills",
+                "--no-editor-setup",
+                "--no-security-summary",
+                "--json",
+            ])
+            .output()
+            .expect("install graph fixture");
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            project
+                .path()
+                .join("node_modules/@lpm.dev/alice.graph-root/index.js")
+                .exists()
+        );
+    }
+    let requests = mock.server().received_requests().await.unwrap();
+    let reports: Vec<serde_json::Value> = requests
+        .iter()
+        .filter(|request| request.url.path() == "/api/registry/pool/install-report")
+        .map(|request| serde_json::from_slice(&request.body).unwrap())
+        .collect();
+    assert_eq!(reports.len(), 2);
+    assert_eq!(reports[0], reports[1]);
+    let graph = &reports[0]["graph"];
+    let nodes = graph["nodes"].as_array().expect("completed graph nodes");
+    assert_eq!(nodes.len(), 3);
+    let index = |name: &str| nodes.iter().position(|node| node["name"] == name).unwrap();
+    assert_eq!(graph["roots"], serde_json::json!([index(a)]));
+    assert_eq!(
+        nodes[index(a)]["dependencies"],
+        serde_json::json!([index(bridge)])
+    );
+    assert_eq!(
+        nodes[index(bridge)]["dependencies"],
+        serde_json::json!([index(b)])
+    );
+    assert_eq!(nodes[index(b)]["version"], "2.0.0");
+    assert!(nodes.iter().all(|node| node.get("depth").is_none()));
+}

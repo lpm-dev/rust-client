@@ -1,23 +1,32 @@
 use super::*;
 
+fn graph_of_roots(roots: &[ManagedInstallRoot]) -> ManagedInstallGraph {
+    let mut roots = roots.to_vec();
+    roots.sort_unstable();
+    roots.dedup();
+    ManagedInstallGraph {
+        roots: (0..roots.len()).collect(),
+        nodes: roots
+            .into_iter()
+            .map(|root| ManagedInstallNode {
+                name: root.name,
+                version: root.version,
+                dependencies: Vec::new(),
+            })
+            .collect(),
+    }
+}
+
 #[tokio::test]
-async fn report_managed_pool_install_posts_authenticated_exact_roots_without_depth() {
+async fn report_managed_pool_install_posts_authenticated_graph_without_depth() {
     use wiremock::matchers::{body_json, header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     let server = MockServer::start().await;
-    let expected_body = serde_json::json!({
-        "roots": [
-            {
-                "name": "@lpm.dev/alice.alpha",
-                "version": "1.0.0",
-            },
-            {
-                "name": "@lpm.dev/carol.charlie",
-                "version": "3.0.0",
-            },
-        ],
-    });
+    let expected_body = serde_json::json!({ "graph": { "roots": [0,1], "nodes": [
+        { "name": "@lpm.dev/alice.alpha", "version": "1.0.0", "dependencies": [] },
+        { "name": "@lpm.dev/carol.charlie", "version": "3.0.0", "dependencies": [] }
+    ] } });
     Mock::given(method("POST"))
         .and(path("/api/registry/pool/install-report"))
         .and(header("authorization", "Bearer test-token"))
@@ -36,7 +45,7 @@ async fn report_managed_pool_install_posts_authenticated_exact_roots_without_dep
     ];
 
     client
-        .report_managed_pool_install(&roots, ManagedInstallAccounting)
+        .report_managed_pool_install(&graph_of_roots(&roots), ManagedInstallAccounting)
         .await
         .expect("authenticated accounting report should succeed");
 }
@@ -51,7 +60,7 @@ async fn report_managed_pool_install_is_a_noop_for_empty_roots() {
         .with_token("test-token");
 
     client
-        .report_managed_pool_install(&[], ManagedInstallAccounting)
+        .report_managed_pool_install(&ManagedInstallGraph::default(), ManagedInstallAccounting)
         .await
         .expect("empty accounting roots should not require a request");
 
@@ -106,7 +115,7 @@ async fn report_managed_pool_install_retries_transient_failures_with_identical_p
     let roots = vec![ManagedInstallRoot::new("@lpm.dev/alice.alpha", "1.0.0")];
 
     client
-        .report_managed_pool_install(&roots, ManagedInstallAccounting)
+        .report_managed_pool_install(&graph_of_roots(&roots), ManagedInstallAccounting)
         .await
         .expect("transient accounting failure should be retried");
 
@@ -134,7 +143,7 @@ async fn report_managed_pool_install_stops_after_the_bounded_retry_budget() {
     let roots = vec![ManagedInstallRoot::new("@lpm.dev/alice.alpha", "1.0.0")];
 
     let result = client
-        .report_managed_pool_install(&roots, ManagedInstallAccounting)
+        .report_managed_pool_install(&graph_of_roots(&roots), ManagedInstallAccounting)
         .await;
 
     assert!(matches!(result, Err(LpmError::Http { status: 503, .. })));
@@ -159,11 +168,11 @@ async fn repeated_identical_pool_install_reports_remain_retry_safe() {
     let roots = vec![ManagedInstallRoot::new("@lpm.dev/alice.alpha", "1.0.0")];
 
     client
-        .report_managed_pool_install(&roots, ManagedInstallAccounting)
+        .report_managed_pool_install(&graph_of_roots(&roots), ManagedInstallAccounting)
         .await
         .expect("first report should succeed");
     client
-        .report_managed_pool_install(&roots, ManagedInstallAccounting)
+        .report_managed_pool_install(&graph_of_roots(&roots), ManagedInstallAccounting)
         .await
         .expect("repeated report should succeed");
 
@@ -172,7 +181,7 @@ async fn repeated_identical_pool_install_reports_remain_retry_safe() {
 }
 
 #[tokio::test]
-async fn report_managed_pool_install_sends_deterministic_bounded_chunks() {
+async fn report_managed_pool_install_sends_one_atomic_graph_without_chunking() {
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -180,7 +189,7 @@ async fn report_managed_pool_install_sends_deterministic_bounded_chunks() {
     Mock::given(method("POST"))
         .and(path("/api/registry/pool/install-report"))
         .respond_with(ResponseTemplate::new(200))
-        .expect(3)
+        .expect(1)
         .mount(&server)
         .await;
 
@@ -193,7 +202,7 @@ async fn report_managed_pool_install_sends_deterministic_bounded_chunks() {
         .collect::<Vec<_>>();
 
     client
-        .report_managed_pool_install(&roots, ManagedInstallAccounting)
+        .report_managed_pool_install(&graph_of_roots(&roots), ManagedInstallAccounting)
         .await
         .expect("bounded accounting chunks should succeed");
 
@@ -203,7 +212,7 @@ async fn report_managed_pool_install_sends_deterministic_bounded_chunks() {
         .map(|request| {
             let body: serde_json::Value =
                 serde_json::from_slice(&request.body).expect("JSON accounting body");
-            body["roots"]
+            body["graph"]["nodes"]
                 .as_array()
                 .expect("roots array")
                 .iter()
@@ -212,9 +221,6 @@ async fn report_managed_pool_install_sends_deterministic_bounded_chunks() {
         })
         .collect::<Vec<_>>();
 
-    assert_eq!(
-        chunks.iter().map(Vec::len).collect::<Vec<_>>(),
-        vec![200, 200, 1]
-    );
+    assert_eq!(chunks.iter().map(Vec::len).collect::<Vec<_>>(), vec![401]);
     assert!(chunks.iter().flatten().map(String::as_str).is_sorted());
 }
