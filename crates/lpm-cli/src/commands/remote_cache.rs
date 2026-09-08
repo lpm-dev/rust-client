@@ -408,15 +408,7 @@ impl RemoteCacheClient {
         match response.status() {
             StatusCode::OK => {}
             StatusCode::NOT_FOUND => return Ok(None),
-            StatusCode::FORBIDDEN => {
-                return Err("remote cache authorization failed; continuing without it".into());
-            }
-            status => {
-                return Err(format!(
-                    "remote cache lookup returned HTTP {}; continuing without it",
-                    status.as_u16()
-                ));
-            }
+            _ => return Err(remote_cache_http_error(response, "lookup")),
         }
 
         if let Some(length) = response.content_length()
@@ -603,14 +595,7 @@ impl RemoteCacheClient {
             return Ok(());
         }
 
-        if response.status() == StatusCode::FORBIDDEN {
-            return Err("remote cache upload was not authorized; continuing without it".into());
-        }
-
-        Err(format!(
-            "remote cache upload returned HTTP {}; continuing without it",
-            response.status().as_u16()
-        ))
+        Err(remote_cache_http_error(response, "upload"))
     }
 
     fn artifact_url(&self, key: &str) -> Result<reqwest::Url, String> {
@@ -810,10 +795,7 @@ impl RemoteCacheClient {
             })?;
 
         if !response.status().is_success() {
-            return Err(format!(
-                "remote cache status returned HTTP {}",
-                response.status().as_u16()
-            ));
+            return Err(remote_cache_http_error(response, "status"));
         }
 
         let content_length = response.content_length();
@@ -860,6 +842,45 @@ fn decode_remote_status_body(
     }
     serde_json::from_slice(&bytes)
         .map_err(|error| format!("remote cache status returned invalid JSON: {error}"))
+}
+
+fn remote_cache_http_error(response: reqwest::blocking::Response, operation: &str) -> String {
+    let status = response.status();
+    let body = if matches!(status, StatusCode::FORBIDDEN | StatusCode::PAYMENT_REQUIRED) {
+        let length = response.content_length();
+        decode_remote_status_body(response, length).ok()
+    } else {
+        None
+    };
+    let code = body
+        .as_ref()
+        .and_then(|body| body.get("code"))
+        .and_then(serde_json::Value::as_str);
+    let cache_status = body
+        .as_ref()
+        .and_then(|body| body.get("status"))
+        .and_then(serde_json::Value::as_str);
+    let detail = if status == StatusCode::PAYMENT_REQUIRED && code == Some("ORG_BILLING_LAPSED") {
+        "remote cache is unavailable because organization billing requires attention; restore the subscription".to_string()
+    } else if status == StatusCode::FORBIDDEN {
+        match cache_status {
+            Some("paused") => "remote cache is paused; check the cache settings".to_string(),
+            Some("disabled") => {
+                "remote cache is disabled; check the plan and cache settings".to_string()
+            }
+            Some("over_limit") => {
+                "remote cache quota was exceeded; free cache space or enable overage".to_string()
+            }
+            _ => "remote cache authorization failed; check the token permissions".to_string(),
+        }
+    } else {
+        format!("remote cache {operation} returned HTTP {}", status.as_u16())
+    };
+    if operation == "status" {
+        detail
+    } else {
+        format!("{detail}; continuing without it")
+    }
 }
 
 fn blocking_http_client() -> Result<Client, String> {

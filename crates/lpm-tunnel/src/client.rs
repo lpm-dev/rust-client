@@ -565,10 +565,14 @@ fn activate_local_websocket(
                         break;
                     }
                 },
-                LocalWebSocketCommand::Close { code, reason } => Message::Close(Some(CloseFrame {
-                    code: CloseCode::from(code.unwrap_or(1000)),
-                    reason: reason.unwrap_or_default().into(),
-                })),
+                LocalWebSocketCommand::Close { code, reason } => Message::Close(
+                    code.map(CloseCode::from)
+                        .filter(|code| code.is_allowed())
+                        .map(|code| CloseFrame {
+                            code,
+                            reason: reason.unwrap_or_default().into(),
+                        }),
+                ),
             };
             let send = async {
                 let mut sink = writer.lock().await;
@@ -586,6 +590,12 @@ fn activate_local_websocket(
                 Ok(Ok(())) if is_close => {
                     reason = "relay closed the WebSocket".to_string();
                     notify_relay = false;
+                    // Keep the reader alive until the peer acknowledges the close.
+                    let _ = tokio::time::timeout(
+                        std::time::Duration::from_secs(WEBSOCKET_SEND_TIMEOUT_SECS),
+                        writer_cancel.cancelled(),
+                    )
+                    .await;
                     writer_cancel.cancel();
                     break;
                 }
@@ -640,6 +650,12 @@ fn activate_local_websocket(
                 Message::Text(text) => (text.into_bytes(), false),
                 Message::Binary(bytes) => (bytes, true),
                 Message::Close(frame) => {
+                    // Tungstenite queues the reply while reading; flush before dropping either half.
+                    let _ = tokio::time::timeout(
+                        std::time::Duration::from_secs(WEBSOCKET_SEND_TIMEOUT_SECS),
+                        async { local_write.lock().await.flush().await },
+                    )
+                    .await;
                     notify_relay = false;
                     let reason = frame.as_ref().map(|frame| frame.reason.to_string());
                     let code = frame.as_ref().map(|frame| u16::from(frame.code));
@@ -4299,6 +4315,104 @@ mod tests {
         tasks.abort_all();
         while tasks.join_next().await.is_some() {}
         server.await.unwrap();
+    }
+
+    async fn assert_local_close_handshake(server_initiates: bool, code: Option<u16>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let expected = code.filter(|code| *code != 1005);
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            if server_initiates {
+                socket
+                    .send(Message::Close(expected.map(|code| CloseFrame {
+                        code: CloseCode::from(code),
+                        reason: "".into(),
+                    })))
+                    .await
+                    .unwrap();
+            }
+            let message = tokio::time::timeout(std::time::Duration::from_secs(2), socket.next())
+                .await
+                .unwrap()
+                .unwrap()
+                .expect("peer completed the close handshake");
+            assert!(
+                matches!(message, Message::Close(ref frame) if frame.as_ref().map(|frame| u16::from(frame.code)) == expected),
+                "{message:?}"
+            );
+            let _ = socket.flush().await;
+        });
+        let (socket, _) = tokio_tungstenite::connect_async(format!("ws://{address}"))
+            .await
+            .unwrap();
+        let (local_write, local_read) = socket.split();
+        let (relay_tx, _relay_rx) = tokio::sync::mpsc::channel(4);
+        let (closed_tx, mut closed_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut tasks = tokio::task::JoinSet::new();
+        let connection = activate_local_websocket(
+            &mut tasks,
+            LocalWebSocketActivation {
+                id: "close".into(),
+                generation: 1,
+                local_write,
+                local_read,
+                slot: Arc::new(tokio::sync::Semaphore::new(1))
+                    .acquire_owned()
+                    .await
+                    .unwrap(),
+                relay_tx,
+                relay_memory: Arc::new(tokio::sync::Semaphore::new(WEBSOCKET_MEMORY_PERMITS)),
+                ws_tx: None,
+                closed_tx,
+            },
+        );
+        if !server_initiates {
+            connection
+                .priority_commands
+                .send(LocalWebSocketCommand::Close { code, reason: None })
+                .await
+                .unwrap();
+        }
+        let result = server.await;
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while tasks.join_next().await.is_some() {}
+        })
+        .await
+        .expect("both local halves stop after the handshake");
+        let mut reader_closed = false;
+        while let Ok(closed) = closed_rx.try_recv() {
+            if closed.half == LocalWebSocketHalf::Reader {
+                reader_closed = closed
+                    .relay_close
+                    .as_ref()
+                    .is_some_and(|(actual, _)| *actual == expected);
+            }
+        }
+        result.unwrap();
+        assert!(reader_closed, "the local close response was lost");
+    }
+
+    #[tokio::test]
+    async fn visitor_empty_close_completes_local_handshake() {
+        assert_local_close_handshake(false, None).await;
+    }
+    #[tokio::test]
+    async fn visitor_reserved_close_code_is_sent_as_empty() {
+        assert_local_close_handshake(false, Some(1005)).await;
+    }
+    #[tokio::test]
+    async fn visitor_normal_close_completes_local_handshake() {
+        assert_local_close_handshake(false, Some(1000)).await;
+    }
+    #[tokio::test]
+    async fn server_empty_close_completes_local_handshake() {
+        assert_local_close_handshake(true, None).await;
+    }
+    #[tokio::test]
+    async fn server_normal_close_completes_local_handshake() {
+        assert_local_close_handshake(true, Some(1000)).await;
     }
 
     #[test]

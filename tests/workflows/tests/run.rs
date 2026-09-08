@@ -4811,3 +4811,68 @@ fn run_filter_typo_with_fail_flag_exits_nonzero() {
         "empty-match with --fail-if-no-match must exit non-zero"
     );
 }
+
+#[tokio::test]
+async fn run_remote_cache_explains_access_states_without_failing_local_tasks() {
+    assert_remote_cache_access_messages(false).await;
+}
+
+#[tokio::test]
+async fn run_remote_cache_upload_explains_access_states_without_failing_local_tasks() {
+    assert_remote_cache_access_messages(true).await;
+}
+
+async fn assert_remote_cache_access_messages(upload_only: bool) {
+    for (status, body, message) in [
+        (
+            403,
+            serde_json::json!({ "status": "paused" }),
+            "remote cache is paused",
+        ),
+        (
+            403,
+            serde_json::json!({ "status": "disabled" }),
+            "remote cache is disabled",
+        ),
+        (
+            402,
+            serde_json::json!({ "code": "ORG_BILLING_LAPSED", "status": "paused" }),
+            "organization billing requires attention",
+        ),
+        (
+            403,
+            serde_json::json!({ "error": "permission denied" }),
+            "remote cache authorization failed",
+        ),
+        (
+            403,
+            serde_json::json!({ "status": "paused\u{1b}[31m", "error": "unsafe-server-text" }),
+            "remote cache authorization failed",
+        ),
+    ] {
+        let registry = MockRegistry::start().await;
+        if upload_only {
+            Mock::given(method("GET"))
+                .and(path_regex(r"^/v8/artifacts/[a-fA-F0-9]+$"))
+                .respond_with(ResponseTemplate::new(404))
+                .mount(registry.server())
+                .await;
+        }
+        Mock::given(method(if upload_only { "PUT" } else { "GET" }))
+            .and(path_regex(r"^/v8/artifacts/[a-fA-F0-9]+$"))
+            .respond_with(ResponseTemplate::new(status).set_body_json(body))
+            .mount(registry.server())
+            .await;
+        let project = remote_cache_project(registry.server(), "");
+        let output = run_build_with_remote_token(&project);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(output.status.success(), "{stderr}");
+        assert!(stderr.contains(message), "expected {message}: {stderr}");
+        assert!(!stderr.contains("unsafe-server-text"));
+        if status == 402 || message.contains("paused") || message.contains("disabled") {
+            assert!(!stderr.contains("authorization failed"), "{stderr}");
+            assert!(!stderr.contains("was not authorized"), "{stderr}");
+        }
+        assert_eq!(project.read_file("dist/value.txt"), "remote-hit");
+    }
+}
