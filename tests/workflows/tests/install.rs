@@ -18765,3 +18765,61 @@ async fn install_reports_exact_pool_graph_and_retries_it_on_an_unchanged_project
     assert_eq!(nodes[index(b)]["version"], "2.0.0");
     assert!(nodes.iter().all(|node| node.get("depth").is_none()));
 }
+
+#[tokio::test]
+async fn install_retries_legacy_pool_roots_after_an_old_registry_rejects_graphs() {
+    let mock = MockRegistry::start().await;
+    let name = "@lpm.dev/alice.rollback";
+    mock.with_package(name, "1.0.0", &make_tarball(name, "1.0.0"))
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/registry/pool/install-report"))
+        .respond_with(|request: &wiremock::Request| {
+            let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+            if body.get("graph").is_some() {
+                ResponseTemplate::new(400).set_body_json(serde_json::json!({"error": "Request body must contain only a roots array"}))
+            } else {
+                assert_eq!(body, serde_json::json!({"roots": [{"name": "@lpm.dev/alice.rollback", "version": "1.0.0"}]}));
+                ResponseTemplate::new(200)
+            }
+        })
+        .mount(mock.server()).await;
+    let project = TempProject::empty(
+        &serde_json::json!({"name": "rollback-consumer", "dependencies": {name: "1.0.0"}})
+            .to_string(),
+    );
+    for _ in 0..2 {
+        let output = lpm_with_registry(&project, &mock.url())
+            .env("LPM_TOKEN", "rollback-fixture")
+            .args([
+                "install",
+                "--json",
+                "--no-skills",
+                "--no-editor-setup",
+                "--no-security-summary",
+            ])
+            .output()
+            .expect("install against older registry");
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            project
+                .path()
+                .join("node_modules/@lpm.dev/alice.rollback/index.js")
+                .exists()
+        );
+        assert!(project.path().join("lpm.lock").exists());
+        assert!(project.path().join(".lpm/install-hash").exists());
+    }
+    let requests = mock.server().received_requests().await.unwrap();
+    let reports: Vec<_> = requests
+        .iter()
+        .filter(|r| r.url.path() == "/api/registry/pool/install-report")
+        .collect();
+    assert_eq!(reports.len(), 4);
+    assert_eq!(reports[1].body, reports[3].body);
+}
