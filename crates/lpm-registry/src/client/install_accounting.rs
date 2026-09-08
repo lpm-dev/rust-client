@@ -4,18 +4,18 @@ use super::*;
 pub const MANAGED_INSTALL_ACCOUNTING_HEADER: &str = "x-lpm-install-accounting";
 /// Protocol version sent in [`MANAGED_INSTALL_ACCOUNTING_HEADER`].
 pub const MANAGED_INSTALL_ACCOUNTING_VERSION: &str = "explicit-v1";
-/// Maximum roots accepted by one managed Pool install report.
-pub const MAX_MANAGED_POOL_INSTALL_ROOTS: usize = 200;
+/// Maximum nodes accepted by one complete Pool install graph.
+pub const MAX_MANAGED_POOL_INSTALL_NODES: usize = 10_000;
+/// Maximum edges accepted by one complete Pool install graph.
+pub const MAX_MANAGED_POOL_INSTALL_EDGES: usize = 50_000;
+/// Maximum LPM package instances accepted in a single graph.
+pub const MAX_MANAGED_POOL_INSTALL_LPM_NODES: usize = 1_000;
 
 /// Typed proof that an install will submit explicit Pool attribution after linking.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct ManagedInstallAccounting;
 
-/// A resolved top-level LPM accounting root reported after a successful install.
-///
-/// Pool eligibility is intentionally absent: the Registry derives distribution
-/// and publisher access authoritatively before crediting the root or traversing
-/// its saved Pool dependency tree.
+/// An exact LPM package coordinate used for installation access checks.
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, serde::Serialize)]
 pub struct ManagedInstallRoot {
     /// Canonical LPM package name.
@@ -34,31 +34,60 @@ impl ManagedInstallRoot {
     }
 }
 
+/// The completed install graph. The registry derives attribution from its edges.
+#[derive(Clone, Debug, Default, Eq, PartialEq, serde::Serialize)]
+pub struct ManagedInstallGraph {
+    /// Installed package instances in deterministic order.
+    pub nodes: Vec<ManagedInstallNode>,
+    /// Node indices directly required by the consumer project.
+    pub roots: Vec<usize>,
+}
+
+/// One installed instance, including its resolved dependency and peer targets.
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize)]
+pub struct ManagedInstallNode {
+    /// Canonical package name, independent of a manifest-local npm alias.
+    pub name: String,
+    /// Exact installed version.
+    pub version: String,
+    /// Indices of installed dependency and peer instances.
+    pub dependencies: Vec<usize>,
+}
+
 impl RegistryClient {
-    /// Report the Pool roots of a completed managed install.
-    ///
-    /// The Registry authenticates the subscriber and derives dependency depths
-    /// from its saved package-version dependency trees.
+    /// Report a complete successful install atomically, without caller-supplied depths.
     pub async fn report_managed_pool_install(
         &self,
-        roots: &[ManagedInstallRoot],
+        graph: &ManagedInstallGraph,
         _accounting: ManagedInstallAccounting,
     ) -> Result<(), LpmError> {
-        if roots.is_empty() {
+        if graph.nodes.is_empty() {
             return Ok(());
         }
-
-        let url = format!("{}/api/registry/pool/install-report", self.base_url);
-        let mut deterministic_roots = roots.to_vec();
-        deterministic_roots.sort_unstable();
-        deterministic_roots.dedup();
-        for chunk in deterministic_roots.chunks(MAX_MANAGED_POOL_INSTALL_ROOTS) {
-            let body = serde_json::json!({ "roots": chunk });
-            self.execute_with_recovery(AuthPosture::AuthRequired, || {
-                self.post_json_raw(&url, &body)
-            })
-            .await?;
+        if graph.nodes.len() > MAX_MANAGED_POOL_INSTALL_NODES
+            || graph
+                .nodes
+                .iter()
+                .map(|node| node.dependencies.len())
+                .sum::<usize>()
+                > MAX_MANAGED_POOL_INSTALL_EDGES
+            || graph
+                .nodes
+                .iter()
+                .filter(|node| lpm_common::package_name::is_lpm_package(&node.name))
+                .count()
+                > MAX_MANAGED_POOL_INSTALL_LPM_NODES
+        {
+            return Err(LpmError::Registry(
+                "The installed dependency graph exceeds the Pool accounting limit".into(),
+            ));
         }
+        let url = format!("{}/api/registry/pool/install-report", self.base_url);
+        let body = serde_json::json!({ "graph": graph });
+        self.execute_with_recovery(AuthPosture::AuthRequired, || {
+            self.post_json_raw(&url, &body)
+        })
+        .await?;
         Ok(())
     }
 }
