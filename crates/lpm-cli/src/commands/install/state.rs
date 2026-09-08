@@ -344,6 +344,8 @@ pub(super) async fn run_install_freshness_phase(
         && source_analysis_caches_ready
         && (input.policy_extension_configs.is_empty() || fast_path_policy_extension_stats.is_some())
     {
+        let registry_warnings =
+            verify_lpm_install_access(input.client, fast_path_packages, input.json_output).await?;
         let policy_extension_stats = if let Some(stats) = fast_path_policy_extension_stats {
             stats
         } else {
@@ -379,6 +381,7 @@ pub(super) async fn run_install_freshness_phase(
                     "schema_version": crate::json_contract::INSTALL_JSON_SCHEMA_VERSION,
                     "success": true,
                     "up_to_date": true,
+                    "warnings": registry_warnings,
                     "duration_ms": total_ms as u64,
                     "counts": InstallCountSemantics {
                         resolved_package_row_count: fast_path_packages.len(),

@@ -20,6 +20,26 @@ fn isolated_project() -> (TempDir, TempDir) {
 }
 
 async fn mount_lpm_install_auxiliary_routes(server: &MockServer) {
+    Mock::given(method("POST"))
+        .and(match_path("/api/registry/install-check"))
+        .respond_with(|request: &wiremock::Request| {
+            let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+            let decisions: Vec<_> = body["packages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|package| {
+                    serde_json::json!({
+                        "name": package["name"],
+                        "version": package["version"],
+                        "allowed": true,
+                    })
+                })
+                .collect();
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({ "packages": decisions }))
+        })
+        .mount(server)
+        .await;
     Mock::given(method("GET"))
         .and(match_path("/api/registry/quality"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
@@ -239,6 +259,7 @@ async fn exhausted_reporting_returns_truthful_json_and_human_partial_success_wit
 #[tokio::test(flavor = "multi_thread")]
 async fn failed_install_never_sends_a_pool_accounting_report() {
     let server = MockServer::start().await;
+    mount_lpm_install_auxiliary_routes(&server).await;
     let package_name = "@lpm.dev/alice.alpha";
     let tarball_url = format!("{}/broken.tgz", server.uri());
     let integrity = common::sri_for(b"tarball response is never accepted");

@@ -165,6 +165,7 @@ pub fn snapshot_to_captured(export: &WebhookExport) -> CapturedWebhook {
         summary: export.summary.clone(),
         signature_diagnostic: None,
         auto_acked: false,
+        response_body_incomplete: false,
     }
 }
 
@@ -236,6 +237,7 @@ mod tests {
             summary: "Stripe: charge.succeeded".to_string(),
             signature_diagnostic: None,
             auto_acked: false,
+            response_body_incomplete: false,
         }
     }
 

@@ -372,7 +372,7 @@ impl InspectorDb {
             "SELECT id, session_id, timestamp, method, path, status, duration_ms,
                     provider, summary, signature_diagnostic,
                     request_headers, request_body, response_headers, response_body,
-                    tags, auto_acked, req_size, res_size
+                    tags, auto_acked, req_size, res_size, response_body_incomplete
              FROM requests WHERE id = ?1",
         )?;
 
@@ -404,7 +404,7 @@ impl InspectorDb {
             "SELECT id, session_id, timestamp, method, path, status, duration_ms,
                     provider, summary, signature_diagnostic,
                     request_headers, request_body, response_headers, response_body,
-                    tags, auto_acked, req_size, res_size
+                    tags, auto_acked, req_size, res_size, response_body_incomplete
              FROM requests
              ORDER BY timestamp DESC, id DESC
              LIMIT ?1 OFFSET ?2",
@@ -812,7 +812,24 @@ fn init_schema(conn: &Connection) -> Result<(), rusqlite::Error> {
              path, summary, request_body, response_body
          );",
     )?;
-    Ok(())
+    ensure_capture_schema(conn)
+}
+
+fn ensure_capture_schema(conn: &Connection) -> Result<(), rusqlite::Error> {
+    let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
+    let has_capture_flag = tx
+        .prepare("PRAGMA table_info(requests)")?
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<Result<Vec<_>, _>>()?
+        .iter()
+        .any(|name| name == "response_body_incomplete");
+    if !has_capture_flag {
+        tx.execute(
+            "ALTER TABLE requests ADD COLUMN response_body_incomplete INTEGER NOT NULL DEFAULT 0",
+            [],
+        )?;
+    }
+    tx.commit()
 }
 
 // ── Background flush task ─────────────────────────────────────────────
@@ -966,8 +983,8 @@ fn insert_request_row(
          (id, session_id, timestamp, method, path, status, duration_ms,
           provider, summary, signature_diagnostic,
           request_headers, request_body, response_headers, response_body,
-          req_size, res_size, auto_acked)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
+          req_size, res_size, auto_acked, response_body_incomplete)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)",
         params![
             webhook.id,
             session_id,
@@ -986,6 +1003,7 @@ fn insert_request_row(
             webhook.request_body.len(),
             webhook.response_body.len(),
             webhook.auto_acked,
+            webhook.response_body_incomplete,
         ],
     )?;
 
@@ -1077,6 +1095,7 @@ pub struct StoredRequestDetail {
     pub auto_acked: bool,
     pub req_size: usize,
     pub res_size: usize,
+    pub response_body_incomplete: bool,
 }
 
 fn stored_detail_from_row(row: &rusqlite::Row<'_>) -> Result<StoredRequestDetail, rusqlite::Error> {
@@ -1097,6 +1116,7 @@ fn stored_detail_from_row(row: &rusqlite::Row<'_>) -> Result<StoredRequestDetail
         response_body: row.get(13)?,
         tags: row.get(14)?,
         auto_acked: row.get(15)?,
+        response_body_incomplete: row.get(18)?,
         req_size: row.get(16)?,
         res_size: row.get(17)?,
     })
@@ -1154,6 +1174,7 @@ fn stored_detail_to_webhook(
         summary: stored.summary,
         signature_diagnostic: stored.signature_diagnostic,
         auto_acked: stored.auto_acked,
+        response_body_incomplete: stored.response_body_incomplete,
     })
 }
 
@@ -1211,6 +1232,51 @@ mod tests {
     use lpm_tunnel::webhook::WebhookProvider;
     use std::collections::HashMap;
 
+    #[test]
+    fn capture_schema_upgrade_serializes_concurrent_openers() {
+        std::thread_local! {
+            static WAITING: std::cell::RefCell<Option<std::sync::mpsc::SyncSender<()>>> = const { std::cell::RefCell::new(None) };
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("inspector.db");
+        let mut first = Connection::open(&path).unwrap();
+        first.execute_batch("PRAGMA journal_mode=WAL; CREATE TABLE requests (id TEXT PRIMARY KEY); INSERT INTO requests VALUES ('retained');").unwrap();
+        let writer = first
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .unwrap();
+        let (waiting_tx, waiting_rx) = std::sync::mpsc::sync_channel(1);
+        let second = std::thread::spawn(move || {
+            WAITING.with(|waiting| *waiting.borrow_mut() = Some(waiting_tx));
+            let conn = Connection::open(path).unwrap();
+            conn.busy_handler(Some(|attempt| {
+                WAITING.with(|waiting| {
+                    if let Some(sender) = waiting.borrow_mut().take() {
+                        sender.send(()).unwrap();
+                    }
+                });
+                std::thread::sleep(std::time::Duration::from_millis(10));
+                attempt < 200
+            }))
+            .unwrap();
+            ensure_capture_schema(&conn)
+        });
+        waiting_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        writer.execute("ALTER TABLE requests ADD COLUMN response_body_incomplete INTEGER NOT NULL DEFAULT 0", []).unwrap();
+        writer.commit().unwrap();
+        second.join().unwrap().unwrap();
+        ensure_capture_schema(&first).unwrap();
+        let retained: (String, bool) = first
+            .query_row(
+                "SELECT id, response_body_incomplete FROM requests",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(retained, ("retained".into(), false));
+    }
+
     fn make_webhook(id: &str, status: u16) -> CapturedWebhook {
         CapturedWebhook {
             id: id.to_string(),
@@ -1230,6 +1296,7 @@ mod tests {
             summary: "Stripe: charge.succeeded".to_string(),
             signature_diagnostic: None,
             auto_acked: false,
+            response_body_incomplete: false,
         }
     }
 
@@ -1767,6 +1834,7 @@ mod tests {
         );
         webhook.response_body = vec![0xfe, 3, 2, 1];
         webhook.auto_acked = true;
+        webhook.response_body_incomplete = true;
 
         {
             let writer = InspectorDb::open(project.path()).unwrap();
@@ -1782,6 +1850,7 @@ mod tests {
         assert_eq!(reopened.response_headers, webhook.response_headers);
         assert_eq!(reopened.response_body, webhook.response_body);
         assert!(reopened.auto_acked);
+        assert!(reopened.response_body_incomplete);
     }
 
     #[tokio::test]

@@ -1298,6 +1298,8 @@ async fn run_with_options_under_store_lock(
         current_importer_snapshot.workspace_root_peer_providers_fingerprint = Some(fingerprint);
     }
 
+    let registry_warnings = verify_lpm_install_access(&arc_client, &packages, json_output).await?;
+
     let policy_extension_stats = run_policy_extensions(
         &policy_extension_configs,
         project_dir,
@@ -1889,6 +1891,7 @@ async fn run_with_options_under_store_lock(
             project_dir,
             lockfile_path: &lockfile_path,
             packages: &packages,
+            registry_warnings: &registry_warnings,
             downloaded,
             cached,
             link_result: &link_result,

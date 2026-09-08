@@ -79,6 +79,8 @@ enum RelayHandshakeMessage {
         limits: Option<Box<TunnelLimitMetadata>>,
         #[serde(default)]
         usage: Option<Box<TunnelUsageMetadata>>,
+        #[serde(default)]
+        protocol: u32,
     },
     #[serde(rename = "error")]
     Error {
@@ -153,7 +155,13 @@ pub struct CapturedWebhookEvent {
     _request_memory_permit: Option<Arc<tokio::sync::OwnedSemaphorePermit>>,
 }
 
+struct ActiveHttpForward {
+    credits: tokio::sync::mpsc::Sender<()>,
+    cancel: tokio_util::sync::CancellationToken,
+}
+
 struct CompletedHttpForward {
+    id: String,
     json: String,
     permit: tokio::sync::OwnedSemaphorePermit,
     memory_permit: Option<Arc<tokio::sync::OwnedSemaphorePermit>>,
@@ -220,6 +228,7 @@ fn relay_code_retry_class(code: &str) -> Option<RetryClass> {
         | "domain_not_owned"
         | "concurrent_limit"
         | "billing_inactive"
+        | "session_expired"
         | "monthly_allowance_exhausted" => Some(RetryClass::Permanent),
         "quota_unavailable"
         | "account_unavailable"
@@ -1073,7 +1082,7 @@ fn websocket_upgrade_metadata_error(id: &str, url: &str) -> Option<&'static str>
 }
 
 /// Check if enough time has elapsed since last pong to consider the relay dead.
-fn is_pong_timed_out(last_pong: std::time::Instant) -> bool {
+fn is_pong_timed_out(last_pong: tokio::time::Instant) -> bool {
     last_pong.elapsed() > std::time::Duration::from_secs(PONG_TIMEOUT_SECS)
 }
 
@@ -1251,6 +1260,7 @@ fn bounded_websocket_upgrade_headers(
     Ok(headers)
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn forward_http_request(
     http_client: reqwest::Client,
     local_target: lpm_common::LocalTarget,
@@ -1259,6 +1269,7 @@ async fn forward_http_request(
     webhook_tx: Option<tokio::sync::mpsc::Sender<CapturedWebhookEvent>>,
     memory_budget: Arc<tokio::sync::Semaphore>,
     request_memory_permit: Option<Arc<tokio::sync::OwnedSemaphorePermit>>,
+    stream: Option<crate::http_stream::StreamOutput>,
 ) -> (
     ClientMessage,
     Option<Arc<tokio::sync::OwnedSemaphorePermit>>,
@@ -1270,6 +1281,8 @@ async fn forward_http_request(
     } else {
         HTTP_RESPONSE_ESTIMATED_OVERHEAD_MULTIPLIER - 1
     };
+    let mut stream_end = None;
+    let mut capture_incomplete = false;
     let (response, memory_permit) = match proxy::forward_request_with_memory_budget(
         &http_client,
         &local_target,
@@ -1278,10 +1291,15 @@ async fn forward_http_request(
         HTTP_RESPONSE_MEMORY_PERMITS,
         HTTP_RESPONSE_MEMORY_UNIT_BYTES,
         memory_multiplier,
+        stream,
     )
     .await
     {
-        Ok(response) => (response.message, response.memory_permit.map(Arc::new)),
+        Ok(response) => {
+            stream_end = response.stream_end;
+            capture_incomplete = response.capture_incomplete;
+            (response.message, response.memory_permit.map(Arc::new))
+        }
         Err(error) => {
             tracing::debug!("local proxy error: {error}");
             let ServerMessage::HttpRequest { ref id, .. } = server_msg else {
@@ -1325,6 +1343,7 @@ async fn forward_http_request(
             summary: String::new(),
             signature_diagnostic: None,
             auto_acked: was_auto_acked,
+            response_body_incomplete: capture_incomplete,
         };
         captured.summary = webhook::summarize_webhook(&captured);
         if captured.response_status >= 400 {
@@ -1349,7 +1368,7 @@ async fn forward_http_request(
         });
     }
 
-    (response, memory_permit)
+    (stream_end.unwrap_or(response), memory_permit)
 }
 
 // ── TOFU Certificate Pinning ──────────────────────────────────────
@@ -1731,7 +1750,7 @@ async fn try_connect_with_token(
     let connection_target = options.current_local_target();
     // Build connect URL — non-sensitive params only (token goes in Authorization header)
     let mut connect_url = format!(
-        "{}?port={}&protocol=2",
+        "{}?port={}&protocol=3",
         options.relay_url, connection_target.port
     );
     if let Some(domain) = options.resolved_domain() {
@@ -1820,7 +1839,7 @@ async fn try_connect_with_token(
         .ok_or_else(|| LpmError::Tunnel("relay closed connection before hello".into()))?
         .map_err(|e| LpmError::Tunnel(format!("failed to read server hello: {e}")))?;
 
-    let (session, initial_usage) = match server_hello {
+    let (session, initial_usage, relay_protocol) = match server_hello {
         Message::Text(text) => {
             let msg: RelayHandshakeMessage = serde_json::from_str(&text)
                 .map_err(|e| LpmError::Tunnel(format!("invalid server message: {e}")))?;
@@ -1837,6 +1856,7 @@ async fn try_connect_with_token(
                     session_max_ms,
                     limits,
                     usage,
+                    protocol,
                 } => {
                     // domain field from relay may be just the subdomain or full domain
                     // tunnel_url is always the full URL
@@ -1882,6 +1902,7 @@ async fn try_connect_with_token(
                             limits: limits.map(|value| *value),
                         },
                         usage.map(|value| *value),
+                        protocol,
                     )
                 }
                 RelayHandshakeMessage::Error { message, code } => {
@@ -1948,7 +1969,7 @@ async fn try_connect_with_token(
     ping_interval.tick().await; // Skip first immediate tick
 
     // Track last pong time for dead relay detection.
-    let mut last_pong = std::time::Instant::now();
+    let mut last_pong = tokio::time::Instant::now();
 
     // Channel for spawned WebSocket tasks to send frames back to the relay.
     // The main loop owns `write` exclusively; spawned tasks send through this channel.
@@ -1977,10 +1998,21 @@ async fn try_connect_with_token(
         tokio::sync::mpsc::channel::<CompletedWebSocketUpgrade>(MAX_CONCURRENT_WEBSOCKETS);
     let mut next_websocket_generation = 0u64;
 
+    let mut credential_renewal: Option<TunnelTokenFuture> = None;
+    let mut http_forwards: HashMap<String, ActiveHttpForward> = HashMap::new();
+    let (stream_tx, mut stream_rx) =
+        tokio::sync::mpsc::channel::<ClientMessage>(MAX_CONCURRENT_HTTP_FORWARDS);
+
     // Message loop
+    let mut connection_result = Err(TunnelConnectError::transient(
+        "Tunnel relay connection lost",
+    ));
     loop {
         tokio::select! {
-            _ = wait_for_tunnel_shutdown(options.shutdown.as_ref()) => break,
+            _ = wait_for_tunnel_shutdown(options.shutdown.as_ref()) => {
+                connection_result = Ok(());
+                break;
+            },
             // Incoming message from relay
             msg = read.next() => {
                 match msg {
@@ -1995,6 +2027,7 @@ async fn try_connect_with_token(
 
                         match server_msg {
                             ServerMessage::HttpRequest { ref id, ref url, .. } => {
+                                if http_forwards.contains_key(id) { continue; }
                                 // Validate URL before forwarding to local server
                                 if !is_safe_local_url(url) {
                                     tracing::warn!(
@@ -2101,6 +2134,7 @@ async fn try_connect_with_token(
                                                 summary: String::new(),
                                                 signature_diagnostic: None,
                                                 auto_acked: true,
+                                                response_body_incomplete: false,
                                             };
                                             captured.summary = webhook::summarize_webhook(&captured);
                                             let _ = webhook_tx.try_send(CapturedWebhookEvent {
@@ -2119,8 +2153,15 @@ async fn try_connect_with_token(
                                 let webhook_tx = options.webhook_tx.clone();
                                 let http_response_tx = http_response_tx.clone();
                                 let http_response_memory = Arc::clone(&http_response_memory);
+                                let request_id = id.clone();
+                                let cancel = tokio_util::sync::CancellationToken::new();
+                                let (credits, credit_rx) = tokio::sync::mpsc::channel(1);
+                                let stream = (relay_protocol >= 3).then(|| crate::http_stream::StreamOutput {
+                                    messages: stream_tx.clone(), credits: credit_rx, cancel: cancel.clone(),
+                                });
+                                http_forwards.insert(request_id.clone(), ActiveHttpForward { credits, cancel: cancel.clone() });
                                 task_handles.spawn(async move {
-                                    let (response, memory_permit) = forward_http_request(
+                                    let forward = forward_http_request(
                                         http_client,
                                         local_target,
                                         server_msg,
@@ -2128,8 +2169,12 @@ async fn try_connect_with_token(
                                         webhook_tx.clone(),
                                         http_response_memory,
                                         Some(request_memory_permit),
-                                    )
-                                    .await;
+                                        stream,
+                                    );
+                                    let (response, memory_permit) = tokio::select! {
+                                        result = forward => result,
+                                        _ = cancel.cancelled() => (ClientMessage::HttpResponseEnd { id: request_id.clone(), failed: true }, None),
+                                    };
                                     let json = match serde_json::to_string(&response) {
                                         Ok(json) => json,
                                         Err(error) => {
@@ -2141,12 +2186,19 @@ async fn try_connect_with_token(
                                     };
                                     let _ = http_response_tx
                                         .send(CompletedHttpForward {
+                                            id: request_id,
                                             json,
                                             permit,
                                             memory_permit,
                                         })
                                         .await;
                                 });
+                            }
+                            ServerMessage::HttpResponsePull { id } => {
+                                if let Some(forward) = http_forwards.get(&id) { let _ = forward.credits.try_send(()); }
+                            }
+                            ServerMessage::HttpCancel { id } => {
+                                if let Some(forward) = http_forwards.get(&id) { forward.cancel.cancel(); }
                             }
                             ServerMessage::WebSocketUpgrade { id, url, headers } => {
                                 if let Some(error) = websocket_upgrade_metadata_error(&id, &url) {
@@ -2440,8 +2492,21 @@ async fn try_connect_with_token(
                                     tracing::debug!("received WS close for unknown connection {id}");
                                 }
                             }
+                            ServerMessage::CredentialRefresh => {
+                                if credential_renewal.is_none()
+                                    && let Some(provider) = options.token_provider.clone()
+                                {
+                                    credential_renewal = Some(Box::pin(async move {
+                                        tokio::time::timeout(std::time::Duration::from_secs(20), provider.refresh_after_rejection())
+                                            .await.map_err(|_| LpmError::Tunnel("Credential renewal timed out".into()))?
+                                    }));
+                                }
+                            }
+                            ServerMessage::CredentialRenewed => {
+                                tracing::debug!("tunnel credential renewed without reconnecting");
+                            }
                             ServerMessage::Pong => {
-                                last_pong = std::time::Instant::now();
+                                last_pong = tokio::time::Instant::now();
                                 tracing::debug!("pong received");
                             }
                             ServerMessage::UsageNotice { usage } => {
@@ -2461,6 +2526,7 @@ async fn try_connect_with_token(
                     }
                     Some(Ok(Message::Close(_))) => {
                         tracing::info!("relay closed connection");
+                        connection_result = Ok(());
                         break;
                     }
                     Some(Err(e)) => {
@@ -2610,8 +2676,19 @@ async fn try_connect_with_token(
                 }
             }
 
+            Some(message) = stream_rx.recv() => {
+                let id = match &message {
+                    ClientMessage::HttpResponseStart { id, .. } | ClientMessage::HttpResponseChunk { id, .. } => id,
+                    _ => continue,
+                };
+                if http_forwards.get(id).is_none_or(|forward| forward.cancel.is_cancelled()) { continue; }
+                if let Ok(json) = serde_json::to_string(&message)
+                    && send_to_relay(&mut write, Message::Text(json), "send response stream").await.is_err() { break; }
+            }
             Some(response) = http_response_rx.recv() => {
-                let CompletedHttpForward { json, permit, memory_permit } = response;
+                let CompletedHttpForward { id, json, permit, memory_permit } = response;
+                let active = http_forwards.remove(&id);
+                if active.is_some_and(|forward| forward.cancel.is_cancelled()) { continue; }
                 if let Err(error) = send_to_relay(&mut write, Message::Text(json), "send message to relay").await {
                     tracing::warn!("failed to send HTTP response to relay: {error}");
                     break;
@@ -2623,6 +2700,23 @@ async fn try_connect_with_token(
             Some(result) = task_handles.join_next(), if !task_handles.is_empty() => {
                 if let Err(error) = result {
                     tracing::warn!("tunnel forwarding task failed: {error}");
+                }
+            }
+
+            renewed = async {
+                match credential_renewal.as_mut() {
+                    Some(future) => future.await,
+                    None => std::future::pending().await,
+                }
+            }, if credential_renewal.is_some() => {
+                credential_renewal = None;
+                match renewed {
+                    Ok(token) => {
+                        let message = serde_json::to_string(&ClientMessage::CredentialRenew { token })
+                            .map_err(|error| TunnelConnectError::transient(format!("Cannot encode credential renewal: {error}")))?;
+                        send_to_relay(&mut write, Message::Text(message), "renew tunnel credential").await?;
+                    }
+                    Err(error) => tracing::warn!("tunnel credential renewal failed: {error}"),
                 }
             }
 
@@ -2661,7 +2755,7 @@ async fn try_connect_with_token(
     )
     .await;
 
-    Ok(())
+    connection_result
 }
 
 #[cfg(test)]
@@ -2783,6 +2877,181 @@ mod tests {
         assert!(opts.webhook_tx.is_none());
         assert!(!opts.no_pin);
         assert!(opts.resolved_domain().is_none());
+    }
+
+    #[tokio::test]
+    async fn event_stream_delivers_before_eof_and_cancels_local_request() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let local = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = local.local_addr().unwrap().port();
+        let local_task = tokio::spawn(async move {
+            let (mut socket, _) = local.accept().await.unwrap();
+            let mut request = [0; 4096];
+            assert!(socket.read(&mut request).await.unwrap() > 0);
+            socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n9\r\ndata: 1\n\n\r\n").await.unwrap();
+            socket.read(&mut request).await.unwrap()
+        });
+        let relay = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = relay.local_addr().unwrap();
+        let mut options = TunnelOptions::new("test-token".into(), port);
+        options.relay_url = format!("ws://{address}/connect");
+        options.no_pin = true;
+        let client =
+            tokio::spawn(async move { try_connect(&options, &|_| Ok(()), &|_, _| {}).await });
+        let (socket, _) = relay.accept().await.unwrap();
+        let mut ws = tokio_tungstenite::accept_async(socket).await.unwrap();
+        for message in [
+            serde_json::json!({"type":"hello","subdomain":"stream.localhost","tunnel_url":"http://stream.localhost","session_id":"stream","protocol":3}),
+            serde_json::json!({"type":"http_request","id":"sse","method":"GET","url":"/events","headers":{},"body":""}),
+        ] {
+            ws.send(Message::Text(message.to_string())).await.unwrap();
+        }
+        let start = tokio::time::timeout(std::time::Duration::from_secs(2), ws.next()).await;
+        if start.is_err() {
+            client.abort();
+            local_task.abort();
+        }
+        let Message::Text(start) = start
+            .expect("SSE headers must arrive before EOF")
+            .unwrap()
+            .unwrap()
+        else {
+            panic!("missing headers")
+        };
+        let start: serde_json::Value = serde_json::from_str(&start).unwrap();
+        assert_eq!(start["type"], "http_response_start");
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), ws.next())
+                .await
+                .is_err(),
+            "body must wait for visitor demand"
+        );
+        ws.send(Message::Text(
+            serde_json::json!({"type":"http_response_pull","id":"sse"}).to_string(),
+        ))
+        .await
+        .unwrap();
+        let Message::Text(chunk) =
+            tokio::time::timeout(std::time::Duration::from_secs(2), ws.next())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap()
+        else {
+            panic!("missing chunk")
+        };
+        let chunk: serde_json::Value = serde_json::from_str(&chunk).unwrap();
+        assert_eq!(chunk["type"], "http_response_chunk");
+        assert_eq!(
+            base64::Engine::decode(
+                &base64::engine::general_purpose::STANDARD,
+                chunk["body"].as_str().unwrap()
+            )
+            .unwrap(),
+            b"data: 1\n\n"
+        );
+        ws.send(Message::Text(
+            serde_json::json!({"type":"http_cancel","id":"sse"}).to_string(),
+        ))
+        .await
+        .unwrap();
+        assert_eq!(
+            tokio::time::timeout(std::time::Duration::from_secs(2), local_task)
+                .await
+                .expect("visitor cancellation must close local request")
+                .unwrap(),
+            0
+        );
+        ws.close(None).await.unwrap();
+        client.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn credential_refresh_renews_the_existing_relay_connection() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let relay = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let mut websocket = tokio_tungstenite::accept_async(socket).await.unwrap();
+            for value in [
+                serde_json::json!({
+                    "type": "hello", "subdomain": "renew.localhost", "tunnel_url": "http://renew.localhost", "session_id": "original-session",
+                }),
+                serde_json::json!({"type": "credential_refresh"}),
+            ] {
+                websocket
+                    .send(Message::Text(value.to_string()))
+                    .await
+                    .unwrap();
+            }
+            let response =
+                tokio::time::timeout(std::time::Duration::from_secs(1), websocket.next()).await;
+            let _ = websocket.close(None).await;
+            response.ok().flatten().and_then(Result::ok)
+        });
+        let mut options = TunnelOptions::new("old-token".into(), 3000);
+        options.relay_url = format!("ws://{address}/connect");
+        options.no_pin = true;
+        options.token_provider = Some(TunnelTokenProvider::new(
+            || Box::pin(async { Ok("old-token".into()) }),
+            || Box::pin(async { Ok("renewed-token".into()) }),
+        ));
+        let client =
+            tokio::spawn(async move { try_connect(&options, &|_| Ok(()), &|_, _| {}).await });
+        let message = relay.await.unwrap();
+        client.await.unwrap().unwrap();
+        let Some(Message::Text(text)) = message else {
+            panic!("credential renewal was not sent on the existing connection");
+        };
+        let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(
+            value,
+            serde_json::json!({"type":"credential_renew", "token":"renewed-token"})
+        );
+    }
+
+    #[tokio::test]
+    async fn heartbeat_timeout_is_a_transient_disconnect() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (ping_tx, mut ping_rx) = tokio::sync::mpsc::unbounded_channel();
+        let relay = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let mut websocket = tokio_tungstenite::accept_async(socket).await.unwrap();
+            websocket.send(Message::Text(serde_json::json!({
+                "type": "hello", "subdomain": "heartbeat.localhost", "tunnel_url": "http://heartbeat.localhost", "session_id": "heartbeat",
+            }).to_string())).await.unwrap();
+            while websocket.next().await.is_some() {
+                let _ = ping_tx.send(());
+            }
+        });
+        let mut options = TunnelOptions::new("test-token".into(), 3000);
+        options.relay_url = format!("ws://{address}/connect");
+        options.no_pin = true;
+        let (connected_tx, mut connected_rx) = tokio::sync::mpsc::unbounded_channel();
+        let client = tokio::spawn(async move {
+            try_connect(
+                &options,
+                &|_| {
+                    connected_tx.send(()).unwrap();
+                    Ok(())
+                },
+                &|_, _| {},
+            )
+            .await
+        });
+        connected_rx.recv().await.unwrap();
+        tokio::time::pause();
+        ping_rx.recv().await.unwrap();
+        tokio::time::advance(std::time::Duration::from_secs(PONG_TIMEOUT_SECS + 1)).await;
+        let result = tokio::time::timeout(std::time::Duration::from_secs(6), client).await;
+        tokio::time::resume();
+        relay.abort();
+        let error = result
+            .expect("heartbeat timeout did not stop the dead connection")
+            .unwrap()
+            .expect_err("dead relay must trigger reconnection");
+        assert_eq!(error.retry_class, RetryClass::Transient);
     }
 
     #[tokio::test]
@@ -3452,7 +3721,7 @@ mod tests {
     #[test]
     fn pong_timeout_detection() {
         // Pong timeout should detect dead relays.
-        let now = std::time::Instant::now();
+        let now = tokio::time::Instant::now();
 
         // Just connected — should not be timed out
         assert!(!is_pong_timed_out(now));
@@ -4055,6 +4324,7 @@ mod tests {
             false,
             Some(webhook_tx),
             Arc::clone(&budget),
+            None,
             None,
         )
         .await;

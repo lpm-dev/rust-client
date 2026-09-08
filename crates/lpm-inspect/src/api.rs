@@ -715,6 +715,7 @@ pub struct RequestDetail {
     pub response_headers: std::collections::HashMap<String, String>,
     pub response_body: BodyPayload,
     pub response_body_size: usize,
+    pub response_body_incomplete: bool,
     pub tags: Vec<String>,
 }
 
@@ -835,6 +836,7 @@ impl From<lpm_tunnel::webhook::CapturedWebhook> for RequestDetail {
             response_headers: w.response_headers,
             response_body: BodyPayload::from_bytes(&w.response_body),
             response_body_size: res_size,
+            response_body_incomplete: w.response_body_incomplete,
             tags: Vec::new(),
         }
     }

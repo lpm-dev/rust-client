@@ -30,6 +30,7 @@ mod integration_tests {
             summary: "Stripe: charge.succeeded".to_string(),
             signature_diagnostic: None,
             auto_acked: false,
+            response_body_incomplete: false,
         }
     }
 

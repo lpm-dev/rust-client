@@ -266,6 +266,14 @@ pub enum LpmError {
     #[diagnostic(code(lpm::registry))]
     Registry(String),
 
+    #[error("cannot install {package}@{version}: {reason}")]
+    #[diagnostic(code(lpm::package_install_denied))]
+    PackageInstallDenied {
+        package: String,
+        version: String,
+        reason: String,
+    },
+
     #[error("publication unavailable: {0}")]
     #[diagnostic(code(lpm::publication_unavailable))]
     PublicationUnavailable(String),
@@ -727,6 +735,7 @@ impl LpmError {
             LpmError::InvalidVersion(_) => "invalid_version",
             LpmError::InvalidVersionRange(_) => "invalid_version_range",
             LpmError::Registry(_) => "registry",
+            LpmError::PackageInstallDenied { .. } => "package_install_denied",
             LpmError::PublicationUnavailable(_) => "publication_unavailable",
             LpmError::PoolAttributionUnconfirmed { .. } => "pool_attribution_unconfirmed",
             LpmError::Resolution(_) => "resolution_failed",

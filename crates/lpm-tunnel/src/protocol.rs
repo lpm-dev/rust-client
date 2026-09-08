@@ -36,6 +36,20 @@ pub enum ClientMessage {
         body: String,
     },
 
+    /// Headers for a streamed local response.
+    #[serde(rename = "http_response_start")]
+    HttpResponseStart {
+        id: String,
+        status: u16,
+        headers: HashMap<String, String>,
+    },
+    /// One demand-limited response chunk, at most 64 KiB decoded.
+    #[serde(rename = "http_response_chunk")]
+    HttpResponseChunk { id: String, body: String },
+    /// End of a streamed response; failed means the body is incomplete.
+    #[serde(rename = "http_response_end")]
+    HttpResponseEnd { id: String, failed: bool },
+
     /// WebSocket frame from local server back to the remote client.
     #[serde(rename = "ws_frame")]
     WebSocketFrame {
@@ -57,6 +71,10 @@ pub enum ClientMessage {
         /// Close reason, if provided.
         reason: Option<String>,
     },
+
+    /// Replace the credential for the existing tunnel session.
+    #[serde(rename = "credential_renew")]
+    CredentialRenew { token: String },
 
     /// Keepalive ping.
     #[serde(rename = "ping")]
@@ -113,6 +131,13 @@ pub enum ServerMessage {
         body: String,
     },
 
+    /// The visitor is ready for one response chunk.
+    #[serde(rename = "http_response_pull")]
+    HttpResponsePull { id: String },
+    /// The visitor stopped reading the response.
+    #[serde(rename = "http_cancel")]
+    HttpCancel { id: String },
+
     /// WebSocket upgrade request from a remote client.
     #[serde(rename = "ws_upgrade")]
     WebSocketUpgrade {
@@ -149,6 +174,14 @@ pub enum ServerMessage {
     /// Keepalive pong.
     #[serde(rename = "pong")]
     Pong,
+
+    /// Renew the session credential without reconnecting the relay socket.
+    #[serde(rename = "credential_refresh")]
+    CredentialRefresh,
+
+    /// The existing tunnel now uses the renewed credential.
+    #[serde(rename = "credential_renewed")]
+    CredentialRenewed,
 
     /// Error from the relay.
     #[serde(rename = "error")]
