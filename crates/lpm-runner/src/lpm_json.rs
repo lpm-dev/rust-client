@@ -565,6 +565,11 @@ pub struct TaskConfig {
     /// Env mode for this task (e.g., `"development"` → loads `.env.development`).
     #[serde(default)]
     pub env: Option<String>,
+
+    /// Inherited variable names that affect cached output. Omit to hash all inherited values.
+    /// An empty list ignores inherited values. Project-loaded env values always remain inputs.
+    #[serde(default, rename = "cacheEnv")]
+    pub cache_env: Option<Vec<String>>,
 }
 
 impl TaskConfig {

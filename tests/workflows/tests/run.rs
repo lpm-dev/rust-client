@@ -2275,6 +2275,8 @@ fn run_cache_invalidates_when_mapped_environment_changes() {
             "tasks": {
                 "build": {
                     "cache": true,
+                    "cacheEnv": [],
+                    "inputs": ["build.js"],
                     "outputs": ["dist/**"]
                 }
             }
@@ -2308,6 +2310,65 @@ console.log(process.env.BUILD_VALUE || '<unset>');"#,
         !combined.contains("restored from cache"),
         "changed mapped env restored stale output:\n{combined}"
     );
+}
+
+#[test]
+fn run_cache_env_reuses_outputs_across_ci_jobs_but_tracks_declared_inputs() {
+    let project = TempProject::empty(
+        r#"{"name":"portable-cache","version":"1.0.0","scripts":{"build":"node build.js"}}"#,
+    );
+    project.write_file("lpm.json", r#"{"tasks":{"build":{"cache":true,"cacheEnv":["BUILD_VALUE"],"inputs":["build.js"],"outputs":["dist/**"]}}}"#);
+    project.write_file("build.js", r"const fs=require('fs'); fs.mkdirSync('dist',{recursive:true}); fs.writeFileSync('dist/value.txt', process.env.BUILD_VALUE || 'unset'); fs.appendFileSync('executions.txt','run\n');");
+    lpm(&project)
+        .env("BUILD_VALUE", "first")
+        .env("CI", "false")
+        .env("GITHUB_RUN_ID", "100")
+        .args(["run", "build"])
+        .assert()
+        .success();
+    std::fs::remove_dir_all(project.path().join("dist")).unwrap();
+    lpm(&project)
+        .env("BUILD_VALUE", "first")
+        .env("CI", "true")
+        .env("GITHUB_RUN_ID", "200")
+        .args(["run", "build"])
+        .assert()
+        .success();
+    assert_eq!(project.read_file("dist/value.txt"), "first");
+    assert_eq!(project.read_file("executions.txt"), "run\n");
+    lpm(&project)
+        .env("BUILD_VALUE", "second")
+        .env("CI", "true")
+        .env("GITHUB_RUN_ID", "200")
+        .args(["run", "build"])
+        .assert()
+        .success();
+    assert_eq!(project.read_file("dist/value.txt"), "second");
+    assert_eq!(project.read_file("executions.txt"), "run\nrun\n");
+}
+
+#[test]
+fn run_cache_tracks_inherited_environment_by_default() {
+    let project = TempProject::empty(
+        r#"{"name":"default-cache-env","version":"1.0.0","scripts":{"build":"node build.js"}}"#,
+    );
+    project.write_file(
+        "lpm.json",
+        r#"{"tasks":{"build":{"cache":true,"inputs":["build.js"],"outputs":["dist/**"]}}}"#,
+    );
+    project.write_file("build.js", "const fs=require('fs'); fs.mkdirSync('dist',{recursive:true}); fs.writeFileSync('dist/value.txt',process.env.BUILD_VALUE);");
+    lpm(&project)
+        .env("BUILD_VALUE", "first")
+        .args(["run", "build"])
+        .assert()
+        .success();
+    assert_eq!(project.read_file("dist/value.txt"), "first");
+    lpm(&project)
+        .env("BUILD_VALUE", "second")
+        .args(["run", "build"])
+        .assert()
+        .success();
+    assert_eq!(project.read_file("dist/value.txt"), "second");
 }
 
 #[test]

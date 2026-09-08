@@ -1195,6 +1195,75 @@ async fn tunnel_start_under_json_emits_pretty_success_contract_on_stdout() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tunnel_json_reports_a_retry_before_a_successful_reconnection() {
+    let relay = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let relay_url = format!("ws://{}/connect", relay.local_addr().unwrap());
+    let relay_task = tokio::spawn(async move {
+        tokio::time::timeout(Duration::from_secs(12), async {
+            let (mut socket, _) = relay.accept().await.unwrap();
+            let body = r#"{"error":"Unable to initialize tunnel usage","code":"usage_unavailable"}"#;
+            tokio::io::AsyncWriteExt::write_all(&mut socket, format!("HTTP/1.1 403 Forbidden\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
+            drop(socket);
+            let (socket, _) = relay.accept().await.unwrap();
+            let mut websocket = tokio_tungstenite::accept_async(socket).await.unwrap();
+            websocket.send(Message::Text(serde_json::json!({
+                "type":"hello", "subdomain":"retry.lpm.test", "tunnel_url":"https://retry.lpm.test",
+                "session_id":"session-retry", "plan":"free", "base_domain":"lpm.test", "domain_kind":"random"
+            }).to_string())).await.unwrap();
+            websocket.close(None).await.unwrap();
+        }).await.expect("retry relay timed out");
+    });
+    let output_task = tokio::task::spawn_blocking(move || {
+        let project = TempProject::empty(r#"{"name":"tunnel","version":"1.0.0"}"#);
+        let mut command = lpm_spawnable(&project);
+        command.env("LPM_TUNNEL_RELAY", relay_url).args([
+            "--token",
+            "workflow-token",
+            "--json",
+            "tunnel",
+            "5173",
+            "--no-inspect",
+        ]);
+        command_output_with_deadline(command, Duration::from_secs(15))
+    });
+    let output = finish_bounded_tunnel_workflow(output_task, relay_task).await;
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let events: Vec<serde_json::Value> = serde_json::Deserializer::from_slice(&output.stdout)
+        .into_iter()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert_eq!(
+        events.len(),
+        2,
+        "{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    assert_eq!(events[0]["event"], "retry");
+    assert_eq!(events[0]["retrying"], true);
+    assert!(
+        events[0]["error"]
+            .as_str()
+            .unwrap()
+            .contains("usage_unavailable")
+    );
+    assert_eq!(events[1]["success"], true);
+    insta::assert_json_snapshot!(events[0], {".error" => "[retry delay and relay rejection]"}, @r#"
+    {
+      "schema_version": 1,
+      "success": false,
+      "event": "retry",
+      "error_code": "tunnel_retry",
+      "error": "[retry delay and relay rejection]",
+      "retrying": true
+    }
+    "#);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn tunnel_start_warns_that_capture_history_persists_sensitive_request_data() {
     let relay = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let relay_url = format!("ws://{}/connect", relay.local_addr().unwrap());
