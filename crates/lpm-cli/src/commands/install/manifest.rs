@@ -1241,6 +1241,7 @@ pub async fn run_add_packages(
                 &requests,
                 SwiftInstallOptions {
                     yes,
+                    force,
                     json_output,
                     audit_after_install,
                     client,
@@ -1648,6 +1649,7 @@ pub async fn run_install_filtered_add(
             .collect::<Vec<_>>();
         let options = SwiftInstallOptions {
             yes,
+            force,
             json_output,
             audit_after_install,
             client,

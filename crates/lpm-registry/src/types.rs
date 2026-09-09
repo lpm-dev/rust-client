@@ -379,7 +379,7 @@ pub struct SwiftProduct {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SwiftPlatform {
-    #[serde(default, rename = "platformName")]
+    #[serde(default, rename = "platformName", alias = "name")]
     pub platform_name: Option<String>,
 
     #[serde(default)]

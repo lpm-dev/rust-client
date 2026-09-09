@@ -1306,8 +1306,33 @@ fn get_line_indent(content: &str, pos: usize) -> String {
 
 /// Run `swift package resolve` in the given directory.
 pub fn run_swift_resolve(project_dir: &Path) -> Result<(), LpmError> {
-    let status = swift_command()
-        .args(["package", "resolve"])
+    run_swift_resolve_with_force(project_dir, false)
+}
+
+pub(crate) fn run_swift_resolve_with_force(
+    project_dir: &Path,
+    force: bool,
+) -> Result<(), LpmError> {
+    if force {
+        let status = swift_command()
+            .args(["package", "reset"])
+            .current_dir(project_dir)
+            .status()
+            .map_err(|error| {
+                LpmError::Registry(format!("Failed to reset generated Swift state: {error}"))
+            })?;
+        if !status.success() {
+            return Err(LpmError::Registry(
+                "Swift package reset failed before the forced install".into(),
+            ));
+        }
+    }
+    let mut command = swift_command();
+    command.args(["package", "resolve"]);
+    if force {
+        command.arg("--disable-dependency-cache");
+    }
+    let status = command
         .current_dir(project_dir)
         .stdout(std::process::Stdio::inherit())
         .stderr(std::process::Stdio::inherit())
@@ -1337,7 +1362,7 @@ struct ResolvedSwiftDependency {
 
 pub fn validate_swift_dependency_graph(
     project_dir: &Path,
-) -> Result<Vec<lpm_registry::ManagedInstallRoot>, LpmError> {
+) -> Result<lpm_registry::ManagedInstallGraph, LpmError> {
     let mut command = swift_command();
     command
         .args(["package", "show-dependencies", "--format", "json"])
@@ -1352,47 +1377,92 @@ pub fn validate_swift_dependency_graph(
     }
     let graph: ResolvedSwiftDependency = serde_json::from_slice(&output.stdout)
         .map_err(|error| LpmError::Registry(format!("Invalid Swift dependency graph: {error}")))?;
-    let mut pending: Vec<_> = graph.dependencies.iter().collect();
-    let mut packages = Vec::new();
+    resolved_swift_install_graph(&graph)
+}
+
+fn resolved_swift_install_graph(
+    graph: &ResolvedSwiftDependency,
+) -> Result<lpm_registry::ManagedInstallGraph, LpmError> {
+    use lpm_registry::{ManagedInstallGraph, ManagedInstallNode};
+    use std::collections::HashMap;
+    let mut result = ManagedInstallGraph::default();
+    let mut indices = HashMap::new();
+    let mut pending: Vec<(&ResolvedSwiftDependency, Option<usize>)> = graph
+        .dependencies
+        .iter()
+        .rev()
+        .map(|node| (node, None))
+        .collect();
     let mut visited = 0;
-    while let Some(dependency) = pending.pop() {
+    while let Some((dependency, parent)) = pending.pop() {
         visited += 1;
-        if visited > 10_000 {
+        if visited > lpm_registry::MAX_MANAGED_POOL_INSTALL_NODES {
             return Err(LpmError::Registry(
                 "Swift dependency graph exceeds 10000 nodes".into(),
             ));
         }
-        pending.extend(&dependency.dependencies);
-        // SwiftPM reports registry locations as identities, and Git locations as URLs.
-        if dependency.url != dependency.identity {
-            continue;
-        }
-        let Some(identifier) = dependency
+        let identity = dependency
             .identity
             .as_deref()
-            .and_then(|identity| identity.strip_prefix("lpmdev."))
-        else {
-            continue;
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| LpmError::Registry("Swift dependency has no identity".into()))?;
+        let native_identity = (dependency.url == dependency.identity)
+            .then(|| identity.strip_prefix("lpmdev."))
+            .flatten();
+        let name = if let Some(identifier) = native_identity {
+            let (owner, name) = identifier.split_once('_').ok_or_else(|| {
+                LpmError::Registry("Invalid LPM Swift dependency identity".into())
+            })?;
+            PackageName::parse(&format!("@lpm.dev/{owner}.{name}"))?.scoped()
+        } else {
+            format!("swift:{identity}")
         };
-        let (owner, name) = identifier
-            .split_once('_')
-            .ok_or_else(|| LpmError::Registry("Invalid LPM Swift dependency identity".into()))?;
-        let package = PackageName::parse(&format!("@lpm.dev/{owner}.{name}"))?;
         let version = dependency
             .version
             .as_deref()
-            .filter(|version| !version.is_empty())
-            .ok_or_else(|| {
-                LpmError::Registry("LPM Swift dependency has no resolved version".into())
-            })?;
-        packages.push(lpm_registry::ManagedInstallRoot::new(
-            package.scoped(),
-            version,
-        ));
+            .filter(|value| !value.is_empty());
+        if native_identity.is_some() && version.is_none() {
+            return Err(LpmError::Registry(
+                "LPM Swift dependency has no resolved version".into(),
+            ));
+        }
+        let version = version.unwrap_or("unspecified");
+        if name.len() > 214 || version.len() > 128 {
+            return Err(LpmError::Registry(
+                "Swift dependency identity or version exceeds the accounting limit".into(),
+            ));
+        }
+        let key = (name.clone(), version.to_owned(), dependency.url.clone());
+        let index = *indices.entry(key).or_insert_with(|| {
+            let index = result.nodes.len();
+            result.nodes.push(ManagedInstallNode {
+                name,
+                version: version.into(),
+                dependencies: Vec::new(),
+            });
+            index
+        });
+        let edges = if let Some(parent) = parent {
+            &mut result.nodes[parent].dependencies
+        } else {
+            &mut result.roots
+        };
+        edges.push(index);
+        pending.extend(
+            dependency
+                .dependencies
+                .iter()
+                .rev()
+                .map(|node| (node, Some(index))),
+        );
     }
-    packages.sort_unstable();
-    packages.dedup();
-    Ok(packages)
+    result.roots.sort_unstable();
+    result.roots.dedup();
+    for node in &mut result.nodes {
+        node.dependencies.sort_unstable();
+        node.dependencies.dedup();
+    }
+    Ok(result)
 }
 
 // ── Xcode Wrapper Package (Packages/LPMDependencies/) ──────────────────
@@ -1488,6 +1558,50 @@ let package = Package(
         created: true,
         manifest_path,
     })
+}
+
+pub(crate) fn reconcile_wrapper_platforms(
+    manifest_path: &Path,
+    platforms: &std::collections::BTreeMap<String, String>,
+) -> Result<(), LpmError> {
+    if platforms.is_empty() {
+        return Ok(());
+    }
+    let content = read_managed_text(manifest_path, "LPMDependencies Package.swift")?;
+    let (open, close) = find_package_call(&content)
+        .ok_or_else(|| LpmError::Registry("Missing wrapper Package declaration".into()))?;
+    let array = find_direct_argument_array(&content, open, close, "platforms")
+        .ok_or_else(|| LpmError::Registry("Missing managed wrapper platforms array".into()))?;
+    let mut merged = platforms.clone();
+    for call in direct_calls_in_array(&content, array) {
+        let name = content[call.start + 1..call.open].trim();
+        let value = content[call.open + 1..call.close].trim();
+        let version = if let Some(builtin) = value.strip_prefix(".v") {
+            builtin.replace('_', ".")
+        } else {
+            value.trim_matches('"').to_owned()
+        };
+        let parsed = crate::xcode_project::deployment_version(&version).ok_or_else(|| {
+            LpmError::Registry("Cannot update a nonliteral wrapper deployment target".into())
+        })?;
+        let entry = merged
+            .entry(name.to_owned())
+            .or_insert_with(|| version.clone());
+        if Some(parsed) > crate::xcode_project::deployment_version(entry) {
+            *entry = version;
+        }
+    }
+    let values = merged
+        .iter()
+        .map(|(name, version)| format!(".{name}(\"{version}\")"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let mut updated = content.clone();
+    updated.replace_range(array.open + 1..array.close, &values);
+    if updated != content {
+        write_managed_text(manifest_path, "LPMDependencies Package.swift", &updated)?;
+    }
+    Ok(())
 }
 
 /// Add an SE-0292 registry dependency to the LPMDependencies wrapper Package.swift.
@@ -1616,6 +1730,36 @@ pub fn remove_wrapper_dependencies(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn native_install_graph_merges_a_diamond_and_preserves_git_bridges() {
+        let child = serde_json::json!({"identity":"lpmdev.other_child", "url":"lpmdev.other_child", "version":"1.0.0", "dependencies":[]});
+        let graph: ResolvedSwiftDependency = serde_json::from_value(serde_json::json!({"dependencies":[
+            {"identity":"lpmdev.owner_root", "url":"lpmdev.owner_root", "version":"1.0.0", "dependencies":[child.clone(), {"identity":"bridge", "url":"https://example.com/bridge.git", "version":"1.0.0", "dependencies":[child]}]}
+        ]})).unwrap();
+        let result = resolved_swift_install_graph(&graph).unwrap();
+        assert_eq!(result.nodes.len(), 3);
+        assert_eq!(result.roots, vec![0]);
+        assert_eq!(result.nodes[0].dependencies, vec![1, 2]);
+        assert_eq!(result.nodes[2].dependencies, vec![1]);
+        assert_eq!(result.nodes[2].name, "swift:bridge");
+    }
+
+    #[test]
+    fn wrapper_platform_updates_keep_higher_existing_requirements() {
+        let dir = tempfile::tempdir().unwrap();
+        let wrapper = ensure_wrapper_package(dir.path()).unwrap();
+        let first = std::collections::BTreeMap::from([
+            ("macOS".into(), "14.0".into()),
+            ("iOS".into(), "17.0".into()),
+        ]);
+        reconcile_wrapper_platforms(&wrapper.manifest_path, &first).unwrap();
+        let second = std::collections::BTreeMap::from([("macOS".into(), "13.0".into())]);
+        reconcile_wrapper_platforms(&wrapper.manifest_path, &second).unwrap();
+        let contents = std::fs::read_to_string(wrapper.manifest_path).unwrap();
+        assert!(contents.contains(".macOS(\"14.0\")"), "{contents}");
+        assert!(contents.contains(".iOS(\"17.0\")"), "{contents}");
+    }
 
     #[test]
     fn test_lpm_to_se0292_id() {

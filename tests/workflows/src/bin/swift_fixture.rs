@@ -44,6 +44,7 @@ fn main() {
     }
 
     match (command.as_deref(), action.as_deref()) {
+        (Some("package"), Some("reset")) => {}
         (Some("package"), Some("show-dependencies")) => {
             let exit_code = std::env::var("LPM_TEST_SWIFT_GRAPH_EXIT_CODE")
                 .ok()
