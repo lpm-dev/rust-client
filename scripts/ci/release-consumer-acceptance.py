@@ -134,7 +134,9 @@ verify_version("npm-stable-version", LPM, STABLE)
 run("npm-lpx-help", [LPX, "--help"])
 state_check("after-stable-upgrade")
 if os.name == "nt":
-    run("windows-install-acls", ["powershell", "-NoProfile", "-Command", "$p = $env:npm_config_prefix; $items = @($env:USERPROFILE, (Split-Path $p), $p, (Join-Path $p 'lpm.cmd')); foreach ($item in $items) { $acl = Get-Acl -LiteralPath $item; [pscustomobject]@{Path=$item; Owner=$acl.Owner; Sddl=$acl.Sddl; Attributes=(Get-Item -LiteralPath $item).Attributes.ToString()} | ConvertTo-Json -Compress }"])
+    run("windows-install-acls", ["pwsh", "-NoProfile", "-Command", "$ErrorActionPreference = 'Stop'; $p = $env:npm_config_prefix; $items = @($env:USERPROFILE, (Split-Path $p), $p, (Join-Path $p 'lpm.cmd')); foreach ($item in $items) { $acl = Get-Acl -LiteralPath $item; [pscustomobject]@{Path=$item; Owner=$acl.Owner; Sddl=$acl.Sddl; Attributes=(Get-Item -LiteralPath $item).Attributes.ToString()} | ConvertTo-Json -Compress }"])
+    for index, location in enumerate([Path.home(), PREFIX.parent, PREFIX, LPM]):
+        run("windows-icacls-" + str(index), ["icacls", location])
 run("npm-self-update-nightly-plan", [LPM, "self-update", "--channel", "nightly", "--refresh", "--json"])
 run("npm-self-update-nightly", [LPM, "self-update", "--channel", "nightly", "--refresh"])
 verify_version("npm-nightly-version", LPM, NIGHTLY)
