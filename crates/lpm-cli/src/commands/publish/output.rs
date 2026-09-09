@@ -21,6 +21,9 @@ pub(super) fn publish_result_json(result: &PublishResult) -> serde_json::Value {
                 serde_json::Value::String(error.clone())
             }),
     );
+    if !result.warnings.is_empty() {
+        object.insert("warnings".to_string(), serde_json::json!(result.warnings));
+    }
     if let Some(auth) = result.auth {
         object.insert(
             "auth".to_string(),

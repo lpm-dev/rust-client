@@ -1701,6 +1701,17 @@ async fn execute_prepared_inner(
                             }
                         }
                         results.push(PublishResult {
+                            warnings: resp
+                                .get("warnings")
+                                .and_then(serde_json::Value::as_array)
+                                .map(|warnings| {
+                                    warnings
+                                        .iter()
+                                        .filter_map(serde_json::Value::as_str)
+                                        .map(str::to_string)
+                                        .collect()
+                                })
+                                .unwrap_or_default(),
                             target: "lpm".into(),
                             success: true,
                             error: None,
@@ -1720,6 +1731,7 @@ async fn execute_prepared_inner(
                             ));
                         }
                         results.push(PublishResult {
+                            warnings: Vec::new(),
                             target: "lpm".into(),
                             success: false,
                             error: Some(e.to_string()),
@@ -1941,6 +1953,7 @@ async fn execute_prepared_inner(
                     }
 
                     Ok(PublishResult {
+                        warnings: Vec::new(),
                         target: target.output_key(),
                         success: npm_result.success,
                         error: npm_result.error,
@@ -1968,6 +1981,7 @@ async fn execute_prepared_inner(
                             ));
                         }
                         results.push(PublishResult {
+                            warnings: Vec::new(),
                             target: target.output_key(),
                             success: false,
                             error: Some(e.to_string()),

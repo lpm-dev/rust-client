@@ -669,6 +669,21 @@ impl MockRegistry {
         self.server.uri()
     }
 
+    pub async fn with_package_skills_response(
+        &self,
+        name: &str,
+        response: serde_json::Value,
+    ) -> &Self {
+        Mock::given(method("GET"))
+            .and(path("/api/registry/skills"))
+            .and(query_param("name", name))
+            .respond_with(ResponseTemplate::new(200).set_body_json(response))
+            .expect(1)
+            .mount(&self.server)
+            .await;
+        self
+    }
+
     /// Mount the package-published skills endpoint for one LPM.dev package.
     pub async fn with_package_skills(&self, name: &str, skills: Vec<serde_json::Value>) -> &Self {
         Mock::given(method("GET"))

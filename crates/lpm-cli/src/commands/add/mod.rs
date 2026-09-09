@@ -1626,6 +1626,7 @@ async fn run_locked(
         let short_name = pkg.short();
         let skills_result = async {
             let response = client.get_skills(&short_name, Some(&version)).await?;
+            crate::commands::skills::package::validate_response(&response)?;
             let result = crate::commands::skills::package::materialize(
                 project_dir,
                 &short_name,

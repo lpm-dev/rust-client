@@ -845,6 +845,7 @@ fn pending_review_is_exposed_in_lpm_publish_result_json() {
         "publicationStatus": "pending_review"
     }));
     let result = PublishResult {
+        warnings: Vec::new(),
         target: "lpm".into(),
         success: true,
         error: None,
@@ -867,6 +868,7 @@ fn missing_publication_status_remains_absent_from_lpm_publish_result_json() {
     let publication_status =
         LpmPublicationStatus::from_registry_response(&serde_json::json!({ "success": true }));
     let result = PublishResult {
+        warnings: Vec::new(),
         target: "lpm".into(),
         success: true,
         error: None,
@@ -909,6 +911,7 @@ fn pending_and_unknown_publication_statuses_are_not_terminal_rejections() {
 #[test]
 fn unrelated_publish_result_does_not_gain_lpm_publication_status() {
     let result = PublishResult {
+        warnings: Vec::new(),
         target: "npm".into(),
         success: true,
         error: None,
@@ -987,6 +990,7 @@ fn active_publication_retains_the_normal_success_summary() {
 fn unknown_publication_status_stays_successful_without_rendering_registry_text() {
     let status = LpmPublicationStatus::from_registry_value("future\u{1b}[31mstatus");
     let result = PublishResult {
+        warnings: Vec::new(),
         target: "lpm".into(),
         success: true,
         error: None,
@@ -1091,6 +1095,7 @@ async fn publication_wait_times_out_with_the_last_observed_state() {
 #[test]
 fn publication_wait_failure_preserves_successful_upload_in_json() {
     let result = PublishResult {
+        warnings: Vec::new(),
         target: "lpm".into(),
         success: true,
         error: None,

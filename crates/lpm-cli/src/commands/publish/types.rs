@@ -182,6 +182,7 @@ impl PublicationWaitResult {
 /// Result of publishing to a single registry.
 #[derive(Debug)]
 pub struct PublishResult {
+    pub warnings: Vec<String>,
     pub target: String,
     pub success: bool,
     pub error: Option<String>,

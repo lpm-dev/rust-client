@@ -2837,3 +2837,167 @@ fn skills_unknown_action_fails_with_helpful_message() {
         "stderr must identify the invalid action and direct users to the command help, got:\n{stderr}",
     );
 }
+
+#[tokio::test]
+async fn package_skill_refresh_preserves_local_changes() {
+    for variant in ["edited", "untracked", "missing-manifest"] {
+        let project = TempProject::empty(r#"{"name":"skills","version":"1.0.0"}"#);
+        seed_materialized_package_skills(&project, "owner.package", &[("guide", "original\n")]);
+        match variant {
+            "edited" => project.write_file(".lpm/skills/owner.package/guide.md", "local edit\n"),
+            "untracked" => {
+                project.write_file(".lpm/skills/owner.package/custom.md", "user instructions\n")
+            }
+            _ => std::fs::remove_file(
+                project
+                    .path()
+                    .join(".lpm/skills/owner.package/.lpm-package-skills.json"),
+            )
+            .unwrap(),
+        }
+        let original = project.read_file(".lpm/skills/owner.package/guide.md");
+        let registry = MockRegistry::start().await;
+        registry
+            .with_package_skills(
+                "owner.package",
+                vec![package_skill("guide", "Package guide", "replacement\n")],
+            )
+            .await;
+        let output = lpm_with_registry(&project, &registry.url())
+            .args(["skills", "add", "@lpm.dev/owner.package", "--yes", "--json"])
+            .output()
+            .unwrap();
+        assert!(
+            !output.status.success(),
+            "{variant}: local changes must stop replacement"
+        );
+        assert_eq!(
+            project.read_file(".lpm/skills/owner.package/guide.md"),
+            original
+        );
+        if variant == "untracked" {
+            assert_eq!(
+                project.read_file(".lpm/skills/owner.package/custom.md"),
+                "user instructions\n"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn package_skill_add_honors_an_explicit_version() {
+    let project = TempProject::empty(r#"{"name":"skills","version":"1.0.0"}"#);
+    let registry = MockRegistry::start().await;
+    registry
+        .with_package_skills_for_version(
+            "owner.package",
+            "1.0.0",
+            vec![package_skill(
+                "old-guide",
+                "Version one guidance",
+                "version one\n",
+            )],
+        )
+        .await;
+    let output = lpm_with_registry(&project, &registry.url())
+        .args([
+            "skills",
+            "add",
+            "@lpm.dev/owner.package@1.0.0",
+            "--yes",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(project.file_exists(".lpm/skills/owner.package/old-guide.md"));
+    let manifest: serde_json::Value = serde_json::from_str(
+        &project.read_file(".lpm/skills/owner.package/.lpm-package-skills.json"),
+    )
+    .unwrap();
+    assert_eq!(manifest["version"], "1.0.0");
+}
+
+#[tokio::test]
+async fn unavailable_package_skills_do_not_erase_the_installed_set() {
+    for status in ["pending", "processing", "error", "flagged", "rejected"] {
+        let project = TempProject::empty(r#"{"name":"skills","version":"1.0.0"}"#);
+        seed_materialized_package_skills(&project, "owner.package", &[("guide", "original\n")]);
+        let registry = MockRegistry::start().await;
+        registry
+            .with_package_skills_response(
+                "owner.package",
+                serde_json::json!({
+                    "name": "owner.package", "version": "1.0.0", "available": false,
+                    "skillsStatus": status, "skillsCount": 0, "skills": []
+                }),
+            )
+            .await;
+        let output = lpm_with_registry(&project, &registry.url())
+            .args(["skills", "add", "@lpm.dev/owner.package", "--yes", "--json"])
+            .output()
+            .unwrap();
+        assert!(
+            !output.status.success(),
+            "{status} review must not report a successful empty update"
+        );
+        assert_eq!(
+            project.read_file(".lpm/skills/owner.package/guide.md"),
+            "original\n"
+        );
+        let response: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(response["success"], false);
+        assert!(response.to_string().contains("review"));
+    }
+}
+
+#[tokio::test]
+async fn partially_flagged_package_review_installs_the_approved_skills() {
+    let project = TempProject::empty(r#"{"name":"skills","version":"1.0.0"}"#);
+    let registry = MockRegistry::start().await;
+    registry
+        .with_package_skills_response(
+            "owner.package",
+            serde_json::json!({
+                "name": "owner.package", "version": "1.0.0", "available": true,
+                "skillsStatus": "flagged", "skillsCount": 1,
+                "skills": [package_skill("guide", "Approved guide", "approved guidance\n")]
+            }),
+        )
+        .await;
+    let output = lpm_with_registry(&project, &registry.url())
+        .args(["skills", "add", "@lpm.dev/owner.package", "--yes", "--json"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        project.read_file(".lpm/skills/owner.package/guide.md"),
+        "---\nname: guide\ndescription: Approved guide\n---\napproved guidance\n"
+    );
+}
+
+#[test]
+fn uninstall_preserves_locally_edited_package_skills() {
+    let project = TempProject::empty(
+        r#"{"name":"skills","version":"1.0.0","dependencies":{"@lpm.dev/owner.package":"1.0.0"}}"#,
+    );
+    seed_materialized_package_skills(&project, "owner.package", &[("guide", "original\n")]);
+    project.write_file(".lpm/skills/owner.package/guide.md", "user changes\n");
+    let output = lpm(&project)
+        .args(["uninstall", "@lpm.dev/owner.package"])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert_eq!(
+        project.read_file(".lpm/skills/owner.package/guide.md"),
+        "user changes\n"
+    );
+}

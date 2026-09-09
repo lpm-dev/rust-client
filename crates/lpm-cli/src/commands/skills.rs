@@ -405,9 +405,20 @@ async fn add_package_skills(
         ));
     }
     let name = lpm_common::PackageName::parse(package)?;
-    let response = client.get_skills(&name.short(), None).await?;
+    let version = package
+        .strip_prefix("@lpm.dev/")
+        .and_then(|spec| spec.split_once('@').map(|(_, version)| version));
+    if let Some(version) = version {
+        lpm_semver::Version::parse(version).map_err(|_| {
+            LpmError::Registry(
+                "package skills require an exact version, such as @lpm.dev/owner.package@1.0.0"
+                    .into(),
+            )
+        })?;
+    }
+    let response = client.get_skills(&name.short(), version).await?;
     let target = project_dir.join(".lpm").join("skills").join(name.short());
-    package::validate(&response.skills)?;
+    package::validate_response(&response)?;
 
     if args.list || args.dry_run {
         if json_output {

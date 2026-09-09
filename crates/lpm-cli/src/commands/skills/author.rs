@@ -627,27 +627,24 @@ mod tests {
     }
 
     #[test]
-    fn validate_directory_matches_registry_block_scalar_description_behavior() {
+    fn validate_directory_accepts_yaml_block_scalar_descriptions() {
         let project = tempfile::tempdir().unwrap();
         let skills = project.path().join(".lpm/skills");
         std::fs::create_dir_all(&skills).unwrap();
-        std::fs::write(
-            skills.join("invalid.md"),
-            format!(
-                "---\nname: invalid\ndescription: >\n  A complete package skill for validation\n---\n# Guide\n\n{}",
-                "This package guidance explains the supported workflow with concrete examples and enough detail for an agent to use it correctly."
-            ),
-        )
-        .unwrap();
+        for (name, style) in [("folded", ">"), ("literal", "|")] {
+            std::fs::write(
+                skills.join(format!("{name}.md")),
+                format!(
+                    "---\nname: {name}\ndescription: {style}\n  A complete package skill\n  for validation\n---\n# Guide\n\n{}",
+                    "This package guidance explains the supported workflow with concrete examples and enough detail for an agent to use it correctly."
+                ),
+            )
+            .unwrap();
+        }
 
         let report = validate_directory(&skills).unwrap();
 
-        assert!(
-            report
-                .errors
-                .iter()
-                .any(|error| error.contains("description too short"))
-        );
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
     }
 
     #[test]
