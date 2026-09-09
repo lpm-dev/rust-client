@@ -1,8 +1,6 @@
 name: Release upgrade compatibility
 
 on:
-  push:
-    branches: [codex/release-upgrade-recovery]
   pull_request:
     paths:
       - 'crates/lpm-auth/**'
@@ -15,6 +13,10 @@ on:
 
 permissions:
   contents: read
+
+concurrency:
+  group: release-upgrade-${{ github.ref }}
+  cancel-in-progress: true
 
 env:
   CARGO_INCREMENTAL: '0'
@@ -45,7 +47,15 @@ jobs:
         if: runner.os == 'Linux'
         run: bash scripts/ci/install-apt-packages.sh pkg-config libdbus-1-dev fish
       - name: Native auth key recovery tests
+        if: runner.os != 'Windows'
         run: cargo test --locked -p lpm-auth --lib
+      - name: Windows auth key recovery regressions
+        if: runner.os == 'Windows'
+        run: |
+          cargo test --locked -p lpm-auth --lib unavailable_keyring
+          cargo test --locked -p lpm-auth --lib conflicting_keyring_key_preserves_the_authenticated_file_key
+          cargo test --locked -p lpm-auth --lib existing_credentials_without_an_auth_key_fail_closed
+          cargo test --locked -p lpm-auth --lib lone_wrong_auth_key_does_not_claim_the_credential_store
       - name: Native updater tests
         if: always()
         run: cargo test --locked -p lpm-cli --bin lpm-rs self_update -- --test-threads=1
@@ -53,7 +63,7 @@ jobs:
         if: always() && runner.os != 'Windows'
         run: sh tests/install-sh/run.sh
       - name: Real Linux headless credential upgrade
-        if: runner.os == 'Linux'
+        if: always() && runner.os == 'Linux'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -64,7 +74,7 @@ jobs:
           chmod +x "$RUNNER_TEMP/old-cli/lpm-linux-x64"
           python3 scripts/ci/test-headless-auth-upgrade.py "$RUNNER_TEMP/old-cli/lpm-linux-x64" target/debug/lpm-rs
       - name: Validate real signed macOS releases
-        if: runner.os == 'macOS'
+        if: always() && runner.os == 'macOS'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |

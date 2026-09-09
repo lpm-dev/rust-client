@@ -293,9 +293,15 @@ run_shell_setup_tests() {
         case "$shell_name" in
           fish)
             shell_rc="$shell_home/.config/fish/config.fish"
+            # Fish's system configuration connects fish_user_paths to PATH.
             HOME="$shell_home" LPM_TEST_RC="$shell_rc" LPM_TEST_BIN="$shell_home/.lpm/bin" \
-              "$shell_bin" --no-config -c 'source "$LPM_TEST_RC"; contains -- "$LPM_TEST_BIN" $PATH' \
-              || fail "Fish did not preserve the literal installation path"
+              "$shell_bin" -c 'source "$LPM_TEST_RC"; contains -- "$LPM_TEST_BIN" $PATH' \
+              || {
+                cat "$shell_rc"
+                HOME="$shell_home" LPM_TEST_RC="$shell_rc" LPM_TEST_BIN="$shell_home/.lpm/bin" \
+                  "$shell_bin" -c 'source "$LPM_TEST_RC"; string escape -- "$LPM_TEST_BIN" $PATH'
+                fail "Fish did not preserve the literal installation path"
+              }
             ;;
           *)
             shell_rc="$shell_home/.${shell_name}rc"
