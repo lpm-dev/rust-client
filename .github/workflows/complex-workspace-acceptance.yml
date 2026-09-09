@@ -56,6 +56,7 @@ jobs:
         if: always()
         continue-on-error: true
         run: |
+          python3 -c "from pathlib import Path; import subprocess; p='tests/fixtures/complex-workspace-portable/lpm.lock'; Path(p).write_bytes(subprocess.check_output(['git','show','HEAD:'+p]))"
           binary=target/debug/lpm-rs
           if [ "$RUNNER_OS" = Windows ]; then binary="$binary.exe"; fi
           python3 scripts/ci/test-complex-workspace-consumer.py --binary "$binary" --fixture tests/fixtures/complex-workspace-portable --output "$RUNNER_TEMP/native-consumer"

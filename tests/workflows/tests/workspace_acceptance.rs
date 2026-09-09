@@ -527,6 +527,7 @@ async fn root_override_change_refreshes_unchanged_members_without_a_prior_failed
         "cleared-state",
         &[],
     ));
+    assert_eq!(runtime(&project, "app", "runtime-parent"), "2.0.0");
     assert_eq!(
         actual, "2.0.0",
         "root override change must refresh an otherwise unchanged member"
@@ -559,14 +560,14 @@ async fn named_catalog_versions_replay_without_any_peer_dependencies() {
 }
 
 #[tokio::test]
-async fn frozen_catalog_failure_preserves_the_specific_root_error() {
+async fn warm_root_completion_allows_catalog_members_to_replay() {
     let mock = standard_registry().await;
     let project = project(
         json!({"catalogs":{"default":{"runtime-core":"1.0.0"},"modern":{"runtime-core":"2.0.0"}}}),
         &[
             (
                 "old",
-                json!({"dependencies":{"runtime-core":"catalog:","runtime-plugin":"1.0.0"}}),
+                json!({"dependencies":{"runtime-core":"catalog:","runtime-plugin":"1.0.0","local-lib":"file:../../vendor/local-lib"}}),
             ),
             (
                 "new",
@@ -574,6 +575,11 @@ async fn frozen_catalog_failure_preserves_the_specific_root_error() {
             ),
         ],
     );
+    project.write_file(
+        "vendor/local-lib/package.json",
+        r#"{"name":"local-lib","version":"1.0.0","main":"index.js"}"#,
+    );
+    project.write_file("vendor/local-lib/index.js", "module.exports = 'local-ok'");
     success(&install(
         &project,
         &mock,
@@ -598,7 +604,39 @@ async fn frozen_catalog_failure_preserves_the_specific_root_error() {
     );
     assert_eq!(project.read_file("lpm.lock"), lock);
     success(&root);
+    let mutable = install(&project, &mock, "catalog-root-error", "mutable", &[]);
+    let serial = install(
+        &project,
+        &mock,
+        "catalog-root-error",
+        "serial",
+        &["--frozen-lockfile", "--workspace-concurrency", "1"],
+    );
+    success(&install(
+        &project,
+        &mock,
+        "catalog-root-error",
+        "offline",
+        &["--frozen-lockfile", "--offline"],
+    ));
+    assert_eq!(project.read_file("lpm.lock"), lock);
+    assert_eq!(runtime(&project, "old", "runtime-plugin"), "1.0.0");
+    assert_eq!(runtime(&project, "new", "runtime-plugin"), "2.0.0");
+    clear_install(&project);
+    success(&install(
+        &project,
+        &mock,
+        "catalog-root-error",
+        "clean-frozen",
+        &["--frozen-lockfile"],
+    ));
+    assert_eq!(project.read_file("lpm.lock"), lock);
+    assert_eq!(runtime(&project, "old", "runtime-plugin"), "1.0.0");
+    assert_eq!(runtime(&project, "new", "runtime-plugin"), "2.0.0");
+    assert_eq!(runtime(&project, "old", "local-lib"), "local-ok");
     success(&recursive);
+    success(&mutable);
+    success(&serial);
 }
 
 #[tokio::test]
