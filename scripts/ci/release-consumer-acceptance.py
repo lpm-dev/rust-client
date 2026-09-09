@@ -133,6 +133,8 @@ npm_install("npm-upgrade-stable", STABLE)
 verify_version("npm-stable-version", LPM, STABLE)
 run("npm-lpx-help", [LPX, "--help"])
 state_check("after-stable-upgrade")
+if os.name == "nt":
+    run("windows-install-acls", ["powershell", "-NoProfile", "-Command", "$p = $env:npm_config_prefix; $items = @($env:USERPROFILE, (Split-Path $p), $p, (Join-Path $p 'lpm.cmd')); foreach ($item in $items) { $acl = Get-Acl -LiteralPath $item; [pscustomobject]@{Path=$item; Owner=$acl.Owner; Sddl=$acl.Sddl; Attributes=(Get-Item -LiteralPath $item).Attributes.ToString()} | ConvertTo-Json -Compress }"])
 run("npm-self-update-nightly-plan", [LPM, "self-update", "--channel", "nightly", "--refresh", "--json"])
 run("npm-self-update-nightly", [LPM, "self-update", "--channel", "nightly", "--refresh"])
 verify_version("npm-nightly-version", LPM, NIGHTLY)
@@ -164,6 +166,10 @@ if os.name != "nt":
     run("shell-self-update-nightly", [standalone, "self-update", "--channel", "nightly", "--refresh", "--json"], shell_env)
     verify_version("shell-nightly-version", standalone, NIGHTLY, shell_env)
     state_check("shell-after-update", standalone, shell_env)
+    if platform.system() == "Darwin":
+        run("shell-installer-nightly-recovery", ["sh", installer], shell_env | {"LPM_INSTALL_VERSION": "v" + NIGHTLY})
+        verify_version("shell-recovered-nightly-version", standalone, NIGHTLY, shell_env)
+        state_check("shell-after-recovery", standalone, shell_env)
     run("shell-self-update-stable", [standalone, "self-update", "--channel", "stable", "--refresh", "--json"], shell_env)
     verify_version("shell-return-stable-version", standalone, STABLE, shell_env)
 
