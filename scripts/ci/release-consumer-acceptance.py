@@ -33,7 +33,8 @@ for key in list(ENV):
     if key.startswith(("LPM_", "NPM_", "npm_config_", "NODE_")):
         ENV.pop(key)
 ENV.update({"LPM_NO_UPDATE_CHECK": "1", "NO_COLOR": "1"})
-PREFIX = ROOT / "npm prefix"
+PREFIX = Path.home() / ".lpm-release-consumer" / "npm prefix"
+PREFIX.parent.mkdir(mode=0o700, exist_ok=True)
 BIN = PREFIX if os.name == "nt" else PREFIX / "bin"
 ENV["npm_config_prefix"] = str(PREFIX)
 ENV["npm_config_cache"] = str(ROOT / "npm-cache")
