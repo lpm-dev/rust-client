@@ -70,6 +70,7 @@ pub fn find_xcodeproj_in_directory(directory: &Path) -> Result<Option<PathBuf>, 
         ))
     })?;
     let mut projects = Vec::new();
+    let mut workspaces = Vec::new();
     for entry in entries {
         let entry = entry.map_err(|error| {
             LpmError::Registry(format!(
@@ -78,6 +79,10 @@ pub fn find_xcodeproj_in_directory(directory: &Path) -> Result<Option<PathBuf>, 
             ))
         })?;
         let path = entry.path();
+        if path.extension() == Some(std::ffi::OsStr::new("xcworkspace")) {
+            workspaces.push(path);
+            continue;
+        }
         if path.extension() != Some(std::ffi::OsStr::new("xcodeproj")) {
             continue;
         }
@@ -94,6 +99,22 @@ pub fn find_xcodeproj_in_directory(directory: &Path) -> Result<Option<PathBuf>, 
             )));
         }
         projects.push(path);
+    }
+    if projects.is_empty() && !workspaces.is_empty() {
+        workspaces.sort();
+        for workspace in &workspaces {
+            projects.extend(workspace_projects(workspace)?);
+        }
+        projects.sort();
+        projects.dedup();
+        if projects.len() > 1
+            && workspaces.len() == 1
+            && let Some(project) = projects
+                .iter()
+                .find(|project| project.file_stem() == workspaces[0].file_stem())
+        {
+            return Ok(Some(project.clone()));
+        }
     }
     projects.sort();
     match projects.as_slice() {
@@ -117,11 +138,110 @@ pub fn find_xcodeproj_in_directory(directory: &Path) -> Result<Option<PathBuf>, 
                 .collect::<Vec<_>>()
                 .join(", ");
             Err(LpmError::Registry(format!(
-                "multiple Xcode projects found in {} ({names}); rename the intended project to match the directory",
+                "multiple Xcode projects found in {} ({names}); run from the intended project directory or name that project to match the workspace or directory",
                 directory.display()
             )))
         }
     }
+}
+
+fn workspace_projects(workspace: &Path) -> Result<Vec<PathBuf>, LpmError> {
+    let root = workspace
+        .parent()
+        .ok_or_else(|| LpmError::Registry("Xcode workspace has no parent directory".into()))?;
+    let canonical_root = root
+        .canonicalize()
+        .map_err(|error| LpmError::Registry(error.to_string()))?;
+    validate_workspace_path(workspace, &canonical_root)?;
+    let file = workspace.join("contents.xcworkspacedata");
+    validate_workspace_path(&file, &canonical_root)?;
+    let contents = lpm_common::read_text_file_capped(&file, lpm_common::CONFIG_FILE_SIZE_CAP_BYTES)
+        .map_err(|error| LpmError::Registry(format!("Cannot read Xcode workspace: {error}")))?;
+    let document = roxmltree::Document::parse(&contents)
+        .map_err(|error| LpmError::Registry(format!("Invalid Xcode workspace: {error}")))?;
+    let mut projects = Vec::new();
+    let mut pending = vec![(document.root_element(), root.to_path_buf(), 0)];
+    let mut visited = 0;
+    while let Some((node, group, depth)) = pending.pop() {
+        visited += 1;
+        if visited > 10_000 || depth > 64 {
+            return Err(LpmError::Registry(
+                "Xcode workspace exceeds the supported size or nesting limit".into(),
+            ));
+        }
+        let location = node.attribute("location");
+        let path = match location {
+            Some(value) => {
+                let (kind, value) = value.split_once(':').unwrap_or(("group", value));
+                match kind {
+                    "group" => group.join(value),
+                    "container" => root.join(value),
+                    "absolute" => PathBuf::from(value),
+                    "self" if value.is_empty() => group.clone(),
+                    _ => {
+                        return Err(LpmError::Registry(format!(
+                            "Unsupported Xcode workspace location: {kind}"
+                        )));
+                    }
+                }
+            }
+            None => group.clone(),
+        };
+        if node.has_tag_name("FileRef")
+            && path.extension() == Some(std::ffi::OsStr::new("xcodeproj"))
+        {
+            validate_workspace_path(&path, &canonical_root)?;
+            if !path.is_dir() {
+                return Err(LpmError::Registry(
+                    "Xcode workspace project is not a directory".into(),
+                ));
+            }
+            projects.push(path);
+            continue;
+        }
+        let next_group = if node.has_tag_name("Group") {
+            path
+        } else {
+            group
+        };
+        pending.extend(
+            node.children()
+                .filter(|child| child.is_element())
+                .map(|child| (child, next_group.clone(), depth + 1)),
+        );
+    }
+    Ok(projects)
+}
+
+fn validate_workspace_path(path: &Path, root: &Path) -> Result<(), LpmError> {
+    let canonical = path.canonicalize().map_err(|error| {
+        LpmError::Registry(format!(
+            "Invalid Xcode workspace path {}: {error}",
+            path.display()
+        ))
+    })?;
+    if !canonical.starts_with(root) {
+        return Err(LpmError::Registry(format!(
+            "Xcode workspace reference leaves its directory: {}; run the install from that project's directory",
+            path.display()
+        )));
+    }
+    let mut current = path.to_path_buf();
+    loop {
+        let metadata = current
+            .symlink_metadata()
+            .map_err(|error| LpmError::Registry(error.to_string()))?;
+        if lpm_common::is_symlink_or_junction(&metadata) {
+            return Err(LpmError::Registry(format!(
+                "Refusing linked Xcode workspace path: {}",
+                current.display()
+            )));
+        }
+        if current.canonicalize().is_ok_and(|value| value == root) || !current.pop() {
+            break;
+        }
+    }
+    Ok(())
 }
 
 /// Link a local package to the Xcode project by editing project.pbxproj.
@@ -144,7 +264,8 @@ pub fn link_local_package(
         )));
     }
 
-    let content = read_pbxproj(&pbxproj)?;
+    let original = read_pbxproj(&pbxproj)?;
+    let content = repair_legacy_package_sections(&original, product_name, local_pkg_rel_path)?;
     let project_name = xcodeproj_path
         .file_stem()
         .and_then(|value| value.to_str())
@@ -162,6 +283,9 @@ pub fn link_local_package(
 
     match (existing_ref, existing_product) {
         (Some(_), Some(_)) => {
+            if content != original {
+                write_pbxproj_atomic(&pbxproj, &original, &content)?;
+            }
             return Ok(XcodeLinkResult {
                 package_ref_added: false,
                 _already_linked: true,
@@ -176,12 +300,25 @@ pub fn link_local_package(
         (None, None) => {}
     }
 
-    // Find the Frameworks build phase for this target
-    let frameworks_phase_id = find_frameworks_phase(&content, &target_id).ok_or_else(|| {
-        LpmError::Registry(format!(
-            "No Frameworks build phase found for target '{target_name}'"
-        ))
-    })?;
+    let (link_content, frameworks_phase_id) = if let Some(id) =
+        find_frameworks_phase(&content, &target_id)
+    {
+        (content.clone(), id)
+    } else {
+        let id = generate_object_id();
+        let entry = format!(
+            "\t\t{id} /* Frameworks */ = {{\n\t\t\tisa = PBXFrameworksBuildPhase;\n\t\t\tbuildActionMask = 2147483647;\n\t\t\tfiles = (\n\t\t\t);\n\t\t\trunOnlyForDeploymentPostprocessing = 0;\n\t\t}};"
+        );
+        let edited = insert_in_section_or_create(&content, "PBXFrameworksBuildPhase", &entry)?;
+        let edited = insert_or_create_array_property(
+            &edited,
+            &target_id,
+            "buildPhases",
+            &format!("\t\t\t\t{id} /* Frameworks */,"),
+            "isa",
+        )?;
+        (edited, id)
+    };
 
     // Generate object IDs
     let pkg_ref_id = generate_object_id();
@@ -197,7 +334,7 @@ pub fn link_local_package(
 
     // Apply all edits
     let edited = insert_full_package_link(
-        &content,
+        &link_content,
         local_pkg_rel_path,
         product_name,
         &target_id,
@@ -208,7 +345,7 @@ pub fn link_local_package(
     )?;
 
     // Atomic write
-    write_pbxproj_atomic(&pbxproj, &content, &edited)?;
+    write_pbxproj_atomic(&pbxproj, &original, &edited)?;
 
     Ok(XcodeLinkResult {
         package_ref_added: true,
@@ -328,22 +465,16 @@ fn find_main_app_target_for_project(content: &str, project_name: &str) -> Option
 
 /// Find the PBXFrameworksBuildPhase ID referenced by the given target.
 fn find_frameworks_phase(content: &str, target_id: &str) -> Option<String> {
-    // Find the target block
-    let target_pattern = format!("{target_id} /*");
-    let target_start = content.find(&target_pattern)?;
-
-    // Find buildPhases within this target
-    let target_section = &content[target_start..];
-    let target_end = find_block_end(target_section)?;
-    let target_block = &target_section[..target_end];
-
-    // Find the Frameworks phase ID in buildPhases
-    for line in target_block.lines() {
-        if line.contains("/* Frameworks */") {
-            return extract_object_id(line.trim());
-        }
-    }
-    None
+    let target = object_block(content, target_id)?;
+    let phases = property_value(target, "buildPhases")?;
+    phases
+        .split(|ch: char| !ch.is_ascii_hexdigit())
+        .filter(|value| value.len() == 24)
+        .find(|id| {
+            object_block(content, id).and_then(|phase| property_value(phase, "isa"))
+                == Some("PBXFrameworksBuildPhase")
+        })
+        .map(str::to_owned)
 }
 
 /// Insert all 6 pbxproj entries for a new local package link.
@@ -365,7 +496,7 @@ fn insert_full_package_link(
         "\t\t{build_file_id} /* {product_name} in Frameworks */ = \
 		 {{isa = PBXBuildFile; productRef = {product_dep_id} /* {product_name} */; }};"
     );
-    result = insert_in_section(&result, "PBXBuildFile", &build_file_entry)?;
+    result = insert_in_section_or_create(&result, "PBXBuildFile", &build_file_entry)?;
 
     // 2. PBXFrameworksBuildPhase — add build file to the Frameworks phase's files list
     result = insert_in_array_property(
@@ -449,18 +580,17 @@ fn insert_in_section_or_create(
         return insert_in_section(content, section_name, entry);
     }
 
-    // Section doesn't exist — create it before the closing `};` + `rootObject` line
-    let insert_before = content
-        .find("\trootObject = ")
-        .or_else(|| content.rfind("};"))
-        .ok_or_else(|| {
-            LpmError::Registry("Could not find insertion point for new pbxproj section".into())
-        })?;
-
-    // Find the start of the line
-    let line_start = content[..insert_before]
-        .rfind('\n')
-        .map_or(insert_before, |i| i + 1);
+    let (_, objects_end) = objects_range(content)?;
+    let line_start = if content[..objects_end]
+        .rsplit_once('\n')
+        .is_some_and(|(_, line)| line.trim().is_empty())
+    {
+        content[..objects_end]
+            .rfind('\n')
+            .map_or(objects_end, |index| index + 1)
+    } else {
+        objects_end
+    };
 
     let section_block = format!(
         "\n/* Begin {section_name} section */\n\
@@ -483,8 +613,7 @@ fn insert_in_array_property(
     value: &str,
 ) -> Result<String, LpmError> {
     // Find the object by ID
-    let obj_pattern = format!("{object_id} /*");
-    let obj_start = content.find(&obj_pattern).ok_or_else(|| {
+    let obj_start = object_definition_start(content, object_id).ok_or_else(|| {
         LpmError::Registry(format!("Could not find object {object_id} in pbxproj"))
     })?;
 
@@ -534,8 +663,7 @@ fn insert_or_create_array_property(
     insert_after_property: &str,
 ) -> Result<String, LpmError> {
     // Try to insert into existing property
-    let obj_pattern = format!("{object_id} /*");
-    let obj_start = content.find(&obj_pattern).ok_or_else(|| {
+    let obj_start = object_definition_start(content, object_id).ok_or_else(|| {
         LpmError::Registry(format!("Could not find object {object_id} in pbxproj"))
     })?;
 
@@ -626,29 +754,226 @@ fn extract_comment_name(line: &str) -> Option<String> {
     Some(line[start..end].to_string())
 }
 
-/// Find the end of a `{ ... };` block starting from the first `{`.
-fn find_block_end(content: &str) -> Option<usize> {
-    let mut depth = 0i32;
-    let mut in_string = false;
+fn object_definition_start(content: &str, object_id: &str) -> Option<usize> {
+    let mut offset = 0;
+    for line in content.split_inclusive('\n') {
+        let trimmed = line.trim_start();
+        if let Some(mut rest) = trimmed.strip_prefix(object_id) {
+            rest = rest.trim_start();
+            if rest.starts_with("/*") {
+                rest = rest.split_once("*/")?.1.trim_start();
+            }
+            if rest.starts_with("= {") {
+                return Some(offset + line.len() - trimmed.len());
+            }
+        }
+        offset += line.len();
+    }
+    None
+}
 
-    for (i, ch) in content.char_indices() {
-        match ch {
-            '"' if !in_string => in_string = true,
-            '"' if in_string => in_string = false,
-            '{' if !in_string => depth += 1,
-            '}' if !in_string => {
+fn repair_legacy_package_sections(
+    content: &str,
+    product_name: &str,
+    relative_path: &str,
+) -> Result<String, LpmError> {
+    let mut repaired = content.to_owned();
+    for section in [
+        "XCLocalSwiftPackageReference",
+        "XCSwiftPackageProductDependency",
+    ] {
+        let (_, objects_end) = objects_range(&repaired)?;
+        let begin_marker = format!("/* Begin {section} section */");
+        let end_marker = format!("/* End {section} section */");
+        let Some(begin) = repaired.find(&begin_marker) else {
+            continue;
+        };
+        if begin < objects_end {
+            continue;
+        }
+        let end = repaired[begin..]
+            .find(&end_marker)
+            .map(|offset| begin + offset + end_marker.len())
+            .ok_or_else(|| LpmError::Registry("Unclosed legacy Swift package section".into()))?;
+        let block = &repaired[begin..end];
+        let expected = if section == "XCLocalSwiftPackageReference" {
+            find_existing_local_pkg_ref(block, relative_path)
+        } else {
+            find_existing_product_dep(block, product_name)
+        };
+        if expected.is_none() {
+            return Err(LpmError::Registry("Unexpected package objects outside the Xcode objects dictionary; restore the project backup".into()));
+        }
+        let block = format!("\n{block}\n");
+        repaired.replace_range(begin..end, "");
+        repaired.insert_str(objects_end, &block);
+    }
+    Ok(repaired)
+}
+
+fn object_block<'a>(content: &'a str, id: &str) -> Option<&'a str> {
+    let start = object_definition_start(content, id)?;
+    let end = start + find_block_end(&content[start..])?;
+    Some(&content[start..end])
+}
+
+fn property_value<'a>(block: &'a str, name: &str) -> Option<&'a str> {
+    let label = format!("{name} = ");
+    let value = block.split_once(&label)?.1.split(';').next()?.trim();
+    Some(value.trim_matches('"'))
+}
+
+const DEPLOYMENT_PLATFORMS: &[(&str, &str)] = &[
+    ("MACOSX_DEPLOYMENT_TARGET", "macOS"),
+    ("IPHONEOS_DEPLOYMENT_TARGET", "iOS"),
+    ("TVOS_DEPLOYMENT_TARGET", "tvOS"),
+    ("WATCHOS_DEPLOYMENT_TARGET", "watchOS"),
+    ("XROS_DEPLOYMENT_TARGET", "visionOS"),
+];
+
+fn deployment_configurations(
+    content: &str,
+    object: &str,
+) -> std::collections::BTreeMap<String, std::collections::BTreeMap<String, String>> {
+    let mut result = std::collections::BTreeMap::new();
+    let Some(list) = object_block(content, object)
+        .and_then(|block| property_value(block, "buildConfigurationList"))
+        .and_then(|value| value.split_whitespace().next())
+        .and_then(|id| object_block(content, id))
+    else {
+        return result;
+    };
+    let Some(configs) = property_value(list, "buildConfigurations") else {
+        return result;
+    };
+    for id in configs
+        .split(|ch: char| !ch.is_ascii_hexdigit())
+        .filter(|value| value.len() == 24)
+    {
+        let Some(config) = object_block(content, id) else {
+            continue;
+        };
+        let Some(name) = property_value(config, "name") else {
+            continue;
+        };
+        let mut settings = std::collections::BTreeMap::new();
+        for (key, platform) in DEPLOYMENT_PLATFORMS {
+            if let Some(value) =
+                property_value(config, key).filter(|value| deployment_version(value).is_some())
+            {
+                settings.insert((*platform).to_owned(), value.to_owned());
+            }
+        }
+        result.insert(name.to_owned(), settings);
+    }
+    result
+}
+
+pub(crate) fn deployment_version(value: &str) -> Option<Vec<u32>> {
+    let parts = value
+        .split('.')
+        .map(str::parse)
+        .collect::<Result<Vec<u32>, _>>()
+        .ok()?;
+    (parts.len() <= 3 && !parts.is_empty() && parts[0] > 0).then_some(parts)
+}
+
+pub(crate) fn deployment_targets(
+    project: &Path,
+) -> Result<std::collections::BTreeMap<String, String>, LpmError> {
+    let content = read_pbxproj(&project.join("project.pbxproj"))?;
+    let project_name = project
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .unwrap_or("");
+    let (target, _) = find_main_app_target_for_project(&content, project_name)
+        .ok_or_else(|| LpmError::Registry("No unambiguous Xcode application target".into()))?;
+    let project_settings = find_project_object_id(&content)
+        .map(|id| deployment_configurations(&content, &id))
+        .unwrap_or_default();
+    let mut settings = deployment_configurations(&content, &target);
+    if settings.is_empty() {
+        settings = project_settings.clone();
+    }
+    let mut result = std::collections::BTreeMap::<String, String>::new();
+    for (name, target_settings) in settings {
+        let mut merged = project_settings.get(&name).cloned().unwrap_or_default();
+        merged.extend(target_settings);
+        for (platform, version) in merged {
+            let entry = result.entry(platform).or_insert_with(|| version.clone());
+            if deployment_version(&version) < deployment_version(entry) {
+                *entry = version;
+            }
+        }
+    }
+    Ok(result)
+}
+
+fn objects_range(content: &str) -> Result<(usize, usize), LpmError> {
+    let start = content
+        .find("objects = {")
+        .map(|index| index + "objects = ".len())
+        .ok_or_else(|| LpmError::Registry("Could not find pbxproj objects dictionary".into()))?;
+    let end = find_block_end(&content[start..])
+        .map(|length| start + length)
+        .ok_or_else(|| LpmError::Registry("Unclosed pbxproj objects dictionary".into()))?;
+    let close = if content.as_bytes().get(end - 1) == Some(&b';') {
+        end - 2
+    } else {
+        end - 1
+    };
+    Ok((start, close))
+}
+
+/// Find a dictionary's end without treating quoted text or comments as syntax.
+fn find_block_end(content: &str) -> Option<usize> {
+    let bytes = content.as_bytes();
+    let mut index = 0;
+    let mut depth = 0;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'"' => {
+                index += 1;
+                while index < bytes.len() {
+                    if bytes[index] == b'\\' {
+                        index += 2;
+                        continue;
+                    }
+                    if bytes[index] == b'"' {
+                        break;
+                    }
+                    index += 1;
+                }
+            }
+            b'/' if bytes.get(index + 1) == Some(&b'*') => {
+                index += 2;
+                while index + 1 < bytes.len() && &bytes[index..index + 2] != b"*/" {
+                    index += 1;
+                }
+                index += 1;
+            }
+            b'/' if bytes.get(index + 1) == Some(&b'/') => {
+                while index < bytes.len() && bytes[index] != b'\n' {
+                    index += 1;
+                }
+            }
+            b'{' => depth += 1,
+            b'}' => {
                 depth -= 1;
                 if depth == 0 {
-                    // Include the trailing `;` if present
-                    let rest = &content[i + 1..];
-                    if rest.starts_with(';') {
-                        return Some(i + 2);
-                    }
-                    return Some(i + 1);
+                    return Some(
+                        index
+                            + if bytes.get(index + 1) == Some(&b';') {
+                                2
+                            } else {
+                                1
+                            },
+                    );
                 }
             }
             _ => {}
         }
+        index += 1;
     }
     None
 }
@@ -807,6 +1132,137 @@ mod tests {
 	rootObject = 284E0D182F5F71880018579D /* Project object */;
 }
 "#;
+
+    #[test]
+    fn new_package_objects_stay_inside_the_objects_dictionary() {
+        let result = insert_full_package_link(
+            SAMPLE_PBXPROJ,
+            "Packages/LPMDependencies",
+            "LPMDependencies",
+            "284E0D1F2F5F71880018579D",
+            "284E0D1D2F5F71880018579D",
+            "AAAAAAAAAAAAAAAAAAAAAAAA",
+            "BBBBBBBBBBBBBBBBBBBBBBBB",
+            "CCCCCCCCCCCCCCCCCCCCCCCC",
+        )
+        .unwrap();
+        let start = result.find("objects = {").unwrap();
+        let end = start + find_block_end(&result[start..]).unwrap();
+        assert!(
+            result
+                .find("/* Begin XCLocalSwiftPackageReference section */")
+                .unwrap()
+                < end
+        );
+        assert!(
+            result
+                .find("/* Begin XCSwiftPackageProductDependency section */")
+                .unwrap()
+                < end
+        );
+    }
+
+    #[test]
+    fn reinstall_repairs_legacy_package_sections_outside_objects() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut broken = insert_full_package_link(
+            SAMPLE_PBXPROJ,
+            "Packages/LPMDependencies",
+            "LPMDependencies",
+            "284E0D1F2F5F71880018579D",
+            "284E0D1D2F5F71880018579D",
+            "AAAAAAAAAAAAAAAAAAAAAAAA",
+            "BBBBBBBBBBBBBBBBBBBBBBBB",
+            "CCCCCCCCCCCCCCCCCCCCCCCC",
+        )
+        .unwrap();
+        for section in [
+            "XCLocalSwiftPackageReference",
+            "XCSwiftPackageProductDependency",
+        ] {
+            let begin = broken
+                .find(&format!("/* Begin {section} section */"))
+                .unwrap();
+            let marker = format!("/* End {section} section */");
+            let end = broken.find(&marker).unwrap() + marker.len();
+            let block = broken[begin..end].to_owned();
+            broken.replace_range(begin..end, "");
+            let root = broken.find("\trootObject").unwrap();
+            broken.insert_str(root, &format!("{block}\n"));
+        }
+        let project = write_xcodeproj(dir.path(), "MyApp", &broken);
+        link_local_package(&project, "LPMDependencies", "Packages/LPMDependencies").unwrap();
+        let repaired = std::fs::read_to_string(project.join("project.pbxproj")).unwrap();
+        let start = repaired.find("objects = {").unwrap();
+        let end = start + find_block_end(&repaired[start..]).unwrap();
+        assert!(
+            repaired
+                .find("/* Begin XCLocalSwiftPackageReference section */")
+                .unwrap()
+                < end
+        );
+        let before = repaired;
+        link_local_package(&project, "LPMDependencies", "Packages/LPMDependencies").unwrap();
+        assert_eq!(
+            std::fs::read_to_string(project.join("project.pbxproj")).unwrap(),
+            before
+        );
+    }
+
+    #[test]
+    fn xcode_link_creates_a_missing_frameworks_phase() {
+        let dir = tempfile::tempdir().unwrap();
+        let start = SAMPLE_PBXPROJ
+            .find("/* Begin PBXFrameworksBuildPhase section */")
+            .unwrap();
+        let end = SAMPLE_PBXPROJ
+            .find("/* End PBXFrameworksBuildPhase section */")
+            .unwrap()
+            + "/* End PBXFrameworksBuildPhase section */".len();
+        let mut content = SAMPLE_PBXPROJ.to_owned();
+        content.replace_range(start..end, "");
+        content = content.replace("284E0D1D2F5F71880018579D /* Frameworks */,", "");
+        let project = write_xcodeproj(dir.path(), "MyApp", &content);
+        link_local_package(&project, "LPMDependencies", "Packages/LPMDependencies").unwrap();
+        let edited = std::fs::read_to_string(project.join("project.pbxproj")).unwrap();
+        assert!(find_frameworks_phase(&edited, "284E0D1F2F5F71880018579D").is_some());
+        assert!(edited.contains("isa = PBXFrameworksBuildPhase"));
+    }
+
+    #[test]
+    fn workspace_discovery_follows_nested_group_project_references() {
+        let dir = tempfile::tempdir().unwrap();
+        let nested = dir.path().join("Apps/My App");
+        std::fs::create_dir_all(&nested).unwrap();
+        let project = write_xcodeproj(&nested, "MyApp", SAMPLE_PBXPROJ);
+        let workspace = dir.path().join("MyApp.xcworkspace");
+        std::fs::create_dir(&workspace).unwrap();
+        std::fs::write(workspace.join("contents.xcworkspacedata"), r#"<?xml version="1.0"?><Workspace version="1.0"><Group location="group:Apps"><FileRef location="group:My App/MyApp.xcodeproj"/></Group></Workspace>"#).unwrap();
+        assert_eq!(find_xcodeproj(dir.path()).unwrap(), Some(project));
+    }
+
+    #[test]
+    fn workspace_discovery_rejects_references_outside_the_workspace() {
+        let dir = tempfile::tempdir().unwrap();
+        write_xcodeproj(dir.path(), "Outside", SAMPLE_PBXPROJ);
+        let root = dir.path().join("Workspace");
+        let workspace = root.join("App.xcworkspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::write(
+            workspace.join("contents.xcworkspacedata"),
+            r#"<Workspace><FileRef location="group:../Outside.xcodeproj"/></Workspace>"#,
+        )
+        .unwrap();
+        let error = find_xcodeproj(&root).unwrap_err().to_string();
+        assert!(error.contains("leaves its directory"), "{error}");
+    }
+
+    #[test]
+    fn dictionary_boundary_ignores_braces_in_comments_and_escaped_strings() {
+        let content = r#"{ /* } */ value = "quoted \" }"; child = {}; }; trailing"#;
+        let end = find_block_end(content).unwrap();
+        assert_eq!(&content[end..], " trailing");
+    }
 
     #[test]
     fn generate_object_id_format() {
@@ -1011,6 +1467,15 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(pbxproj).unwrap(),
             "new editor content"
+        );
+    }
+
+    #[test]
+    fn frameworks_phase_lookup_uses_object_type_when_comments_change() {
+        let content = SAMPLE_PBXPROJ.replace("/* Frameworks */", "/* Libraries */");
+        assert_eq!(
+            find_frameworks_phase(&content, "284E0D1F2F5F71880018579D"),
+            find_frameworks_phase(SAMPLE_PBXPROJ, "284E0D1F2F5F71880018579D")
         );
     }
 

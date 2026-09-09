@@ -2057,3 +2057,112 @@ async fn swift_resolve_failure_points_to_inherited_output_and_optional_repair() 
         "failure guidance must not present manual setup as a normal prerequisite:\n{combined}"
     );
 }
+
+#[tokio::test]
+async fn swift_install_reports_native_resolved_graph_and_retries_without_changing_the_manifest() {
+    let mock = MockRegistry::start().await;
+    let cert = mount_swift_package(&mock).await;
+    let project = swift_project();
+    configure_existing_registry(&project, &mock.url(), &cert);
+    let graph = serde_json::json!({"identity": "consumer", "dependencies": [
+        {"identity": "lpmdev.acme_swift-logger", "url": "lpmdev.acme_swift-logger", "version": "1.0.0", "dependencies": [
+            {"identity": "git-helper", "url": "https://example.com/helper.git", "version": "1.0.0", "dependencies": [
+                {"identity": "lpmdev.acme_transitive", "url": "lpmdev.acme_transitive", "version": "2.0.0", "dependencies": []}
+            ]}
+        ]}
+    ]});
+    for _ in 0..2 {
+        let mut command = lpm_with_registry(&project, &mock.url());
+        configure_fake_swift(&mut command, &project, &["FirstTarget"], 0);
+        command
+            .env("LPM_TEST_SWIFT_GRAPH", graph.to_string())
+            .args(["install", "--yes", SWIFT_PACKAGE])
+            .assert()
+            .success();
+    }
+    let requests = mock.server().received_requests().await.unwrap();
+    let reports: Vec<serde_json::Value> = requests
+        .iter()
+        .filter(|request| request.url.path() == "/api/registry/pool/install-report")
+        .map(|request| serde_json::from_slice(&request.body).unwrap())
+        .collect();
+    assert_eq!(reports.len(), 2, "{reports:?}");
+    assert_eq!(reports[0], reports[1]);
+    let graph = &reports[0]["graph"];
+    let nodes = graph["nodes"].as_array().unwrap();
+    assert_eq!(nodes.len(), 3);
+    let root = graph["roots"][0].as_u64().unwrap() as usize;
+    assert_eq!(nodes[root]["name"], SWIFT_PACKAGE);
+    let git = nodes[root]["dependencies"][0].as_u64().unwrap() as usize;
+    let child = nodes[git]["dependencies"][0].as_u64().unwrap() as usize;
+    assert_eq!(nodes[child]["name"], "@lpm.dev/acme.transitive");
+    assert_eq!(nodes[child]["version"], "2.0.0");
+}
+
+#[tokio::test]
+async fn xcode_install_configures_workspace_scope_and_uses_app_deployment_targets() {
+    let mock = MockRegistry::start().await;
+    let cert = mount_swift_package(&mock).await;
+    let project = TempProject::empty(r#"{"name":"xcode-app","version":"1.0.0"}"#);
+    write_xcode_project(&project, "", "MyApp");
+    let pbx = project.read_file("MyApp.xcodeproj/project.pbxproj");
+    project.write_file("MyApp.xcodeproj/project.pbxproj", &pbx.replace("isa = PBXNativeTarget;", "isa = PBXNativeTarget;\n            buildConfigurationList = FFFFFFFFFFFFFFFFFFFFFFFF;").replace("/* Begin PBXProject section */", r#"
+/* Begin XCConfigurationList section */
+        FFFFFFFFFFFFFFFFFFFFFFFF = {
+            isa = XCConfigurationList;
+            buildConfigurations = (EEEEEEEEEEEEEEEEEEEEEEEE);
+        };
+/* End XCConfigurationList section */
+/* Begin XCBuildConfiguration section */
+        EEEEEEEEEEEEEEEEEEEEEEEE /* Debug */ = {
+            isa = XCBuildConfiguration;
+            buildSettings = { MACOSX_DEPLOYMENT_TARGET = 13.0; IPHONEOS_DEPLOYMENT_TARGET = 16.0; };
+            name = Debug;
+        };
+/* End XCBuildConfiguration section */
+/* Begin PBXProject section */"#));
+    configure_existing_registry(&project, &mock.url(), &cert);
+    let mut command = lpm_with_registry(&project, &mock.url());
+    configure_fake_swift(&mut command, &project, &["unused"], 0);
+    command
+        .args(["install", "--yes", SWIFT_PACKAGE])
+        .assert()
+        .success();
+    let global: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(
+            project
+                .home()
+                .join(".swiftpm/configuration/registries.json"),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        global["registries"]["lpmdev"]["url"],
+        format!("{}/api/swift-registry", mock.url())
+    );
+    let wrapper = project.read_file("Packages/LPMDependencies/Package.swift");
+    assert!(wrapper.contains(".macOS(\"13.0\")"), "{wrapper}");
+    assert!(wrapper.contains(".iOS(\"16.0\")"), "{wrapper}");
+}
+
+#[tokio::test]
+async fn forced_swift_install_resets_generated_state_before_reacquiring_downloads() {
+    let mock = MockRegistry::start().await;
+    let cert = mount_swift_package(&mock).await;
+    let project = swift_project();
+    configure_existing_registry(&project, &mock.url(), &cert);
+    let log = project.path().join("swift-commands.log");
+    let mut command = lpm_with_registry(&project, &mock.url());
+    configure_fake_swift(&mut command, &project, &["FirstTarget"], 0);
+    command
+        .env("LPM_TEST_SWIFT_COMMAND_LOG", &log)
+        .args(["install", "--yes", "--force", SWIFT_PACKAGE])
+        .assert()
+        .success();
+    let commands = std::fs::read_to_string(log).unwrap();
+    let reset = commands
+        .find("package reset")
+        .expect("force must reset generated Swift state");
+    assert!(reset < commands.find("package resolve").unwrap());
+}

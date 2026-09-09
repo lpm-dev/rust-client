@@ -194,6 +194,10 @@ pub(crate) struct SwiftRegistrySetupOutcome {
 }
 
 impl SwiftRegistrySetupOutcome {
+    pub(crate) fn include_scope_repair(&mut self, repaired: bool) {
+        self.scope_repaired |= repaired;
+    }
+
     pub(crate) fn to_json(self) -> serde_json::Value {
         serde_json::json!({
             "scope": setup_action(self.scope_repaired),
@@ -512,6 +516,39 @@ pub async fn ensure_configured(
         certificate_repaired: certificate == CertOutcome::Installed,
         trust_repaired: trust == TrustOutcome::Configured,
     })
+}
+
+pub(crate) fn ensure_xcode_registry_scope(registry_url: &str) -> Result<bool, LpmError> {
+    if !lpm_common::lpm_registry_url_is_accepted(registry_url) {
+        return Err(LpmError::Registry(
+            "Xcode registry setup requires HTTPS or a loopback URL".into(),
+        ));
+    }
+    let home = dirs::home_dir().ok_or_else(|| {
+        LpmError::Registry("Could not determine the SwiftPM configuration directory".into())
+    })?;
+    let path = home.join(".swiftpm/configuration/registries.json");
+    let expected = format!("{registry_url}/api/swift-registry");
+    let text = lpm_common::read_text_file_capped(&path, lpm_common::CONFIG_FILE_SIZE_CAP_BYTES)
+        .map_err(|error| LpmError::Registry(error.to_string()))?;
+    let mut config: serde_json::Value = serde_json::from_str(&text)
+        .map_err(|error| LpmError::Registry(format!("Invalid SwiftPM configuration: {error}")))?;
+    if config["registries"]["lpmdev"]["url"] == expected {
+        return Ok(false);
+    }
+    let registries = ensure_json_object(&mut config)?
+        .entry("registries")
+        .or_insert_with(|| serde_json::json!({}));
+    let entry = ensure_json_object(registries)?
+        .entry("lpmdev")
+        .or_insert_with(|| serde_json::json!({}));
+    ensure_json_object(entry)?.insert("url".into(), serde_json::Value::String(expected));
+    let bytes = serde_json::to_vec_pretty(&config)
+        .map_err(|error| LpmError::Registry(error.to_string()))?;
+    lpm_common::write_file_atomic(&path, bytes).map_err(|error| {
+        LpmError::Registry(format!("Failed to configure Xcode registry scope: {error}"))
+    })?;
+    Ok(true)
 }
 
 /// Check whether a certificate file exists and is valid (non-empty, non-corrupted).

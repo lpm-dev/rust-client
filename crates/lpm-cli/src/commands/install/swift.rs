@@ -3,6 +3,7 @@ use super::*;
 #[derive(Clone, Copy)]
 pub(super) struct SwiftInstallOptions<'a> {
     pub(super) yes: bool,
+    pub(super) force: bool,
     pub(super) json_output: bool,
     pub(super) audit_after_install: bool,
     pub(super) client: &'a RegistryClient,
@@ -136,6 +137,37 @@ pub(super) async fn run_swift_install_xcode_batch(
     let prepared = prepare_swift_installs(requests)?;
     let project_root = xcodeproj_path.parent().unwrap_or(project_dir);
     let wrapper = crate::swift_manifest::ensure_wrapper_package(project_root)?;
+    let mut platforms = crate::xcode_project::deployment_targets(xcodeproj_path)?;
+    for request in requests {
+        if let Some(metadata) = &request.ver_meta.swift_meta {
+            for platform in &metadata.platforms {
+                let name = match platform.platform_name.as_deref() {
+                    Some("macos") => "macOS",
+                    Some("ios") => "iOS",
+                    Some("tvos") => "tvOS",
+                    Some("watchos") => "watchOS",
+                    Some("visionos") => "visionOS",
+                    _ => continue,
+                };
+                let Some(version) = platform
+                    .version
+                    .as_ref()
+                    .filter(|value| crate::xcode_project::deployment_version(value).is_some())
+                else {
+                    continue;
+                };
+                let existing = platforms
+                    .entry(name.to_owned())
+                    .or_insert_with(|| version.clone());
+                if crate::xcode_project::deployment_version(version)
+                    > crate::xcode_project::deployment_version(existing)
+                {
+                    *existing = version.clone();
+                }
+            }
+        }
+    }
+    crate::swift_manifest::reconcile_wrapper_platforms(&wrapper.manifest_path, &platforms)?;
     let dependencies = prepared
         .iter()
         .map(|package| crate::swift_manifest::RegistryDependency {
@@ -193,23 +225,43 @@ async fn finish_swift_batch(
             output::warn(&warning);
         }
     }
-    let registry_setup = crate::commands::swift_registry::ensure_configured(
+    let mut registry_setup = crate::commands::swift_registry::ensure_configured(
         options.client.session().map(|session| session.as_ref()),
         options.client.base_url(),
         resolve_dir,
         options.json_output,
     )
     .await?;
+    if xcode_link.is_some() {
+        registry_setup.include_scope_repair(
+            crate::commands::swift_registry::ensure_xcode_registry_scope(
+                options.client.base_url(),
+            )?,
+        );
+    }
     if !options.json_output {
         output::info("Resolving Swift packages...");
     }
-    crate::swift_manifest::run_swift_resolve(resolve_dir)?;
+    crate::swift_manifest::run_swift_resolve_with_force(resolve_dir, options.force)?;
     let resolved = crate::swift_manifest::validate_swift_dependency_graph(resolve_dir)?;
-    let resolved_warnings = options.client.check_install_access(&resolved).await?;
+    let coordinates = resolved
+        .nodes
+        .iter()
+        .filter(|node| lpm_common::package_name::is_lpm_package(&node.name))
+        .map(|node| lpm_registry::ManagedInstallRoot::new(&node.name, &node.version))
+        .collect::<Vec<_>>();
+    let resolved_warnings = options.client.check_install_access(&coordinates).await?;
     if !options.json_output {
         for warning in resolved_warnings {
             output::warn(&warning);
         }
+    }
+
+    if !coordinates.is_empty() {
+        options
+            .client
+            .report_managed_pool_install(&resolved, lpm_registry::ManagedInstallAccounting)
+            .await?;
     }
 
     let package_reports = packages
