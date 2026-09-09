@@ -964,3 +964,15 @@ function stagePlatformFixture(binaries, platform) {
     if (!fs.existsSync(artifact)) fs.writeFileSync(artifact, `fixture:${mapping.artifact}\n`);
   }
 }
+
+
+test("stable and nightly release notes include verified macOS bootstrap recovery", () => {
+  const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../../..");
+  const workflow = fs.readFileSync(path.join(repoRoot, ".github/workflows/release.yml"), "utf8");
+  assert.equal(workflow.split('cat npm/release/upgrade-recovery.md >> "$RUNNER_TEMP/release-notes.md"').length - 1, 2);
+  const notes = fs.readFileSync(path.join(repoRoot, "npm/release/upgrade-recovery.md"), "utf8");
+  assert.match(notes, /0\.76\.5/);
+  assert.match(notes, /https:\/\/cli\.lpm\.dev\/install \| sh/);
+  assert.match(notes, /LPM_INSTALL_CHANNEL=nightly sh/);
+  assert.doesNotMatch(notes, /LPM_INSTALL_INSECURE=1/);
+});

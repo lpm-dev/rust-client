@@ -259,6 +259,87 @@ run_install_sh() {
   RUN_INSTALL_DIR="$install_root/.lpm/bin"
 }
 
+run_shell_setup_tests() {
+  build_clean_path
+  make_happy_fixture
+  trap 'stop_server' EXIT
+  start_server "$FIXTURE_DIR"
+  shell_fixture="$(mktemp -d)"
+  case "$1" in
+    missing-fish-directory)
+      SHELL=/usr/bin/fish RUN_INSTALL_ROOT_OVERRIDE="$shell_fixture/home" run_install_sh
+      [ "$RUN_RC" -eq 0 ] || fail "Fish setup must create its directory: $RUN_OUT"
+      [ -f "$shell_fixture/home/.config/fish/config.fish" ] || fail "Fish config missing"
+      ;;
+    quoted-fish-path)
+      shell_home="$shell_fixture/fish home"
+      mkdir -p "$shell_home/.config/fish"
+      SHELL=/usr/bin/fish RUN_INSTALL_ROOT_OVERRIDE="$shell_home" run_install_sh
+      [ "$RUN_RC" -eq 0 ] || fail "Fish installation failed: $RUN_OUT"
+      grep -Fqx "fish_add_path -- '$shell_home/.lpm/bin'" "$shell_home/.config/fish/config.fish" \
+        || fail "Fish path must be one quoted argument"
+      ;;
+    literal-shell-paths)
+      for shell_name in bash zsh fish; do
+        shell_bin="$(command -v "$shell_name" || true)"
+        if [ -z "$shell_bin" ]; then
+          echo "SKIP: $shell_name is unavailable for native PATH evaluation"
+          continue
+        fi
+        shell_home="$shell_fixture/home space ' quote \\\\ slash \$dollar \$(false)"
+        mkdir -p "$shell_home/.config/fish"
+        SHELL="$shell_bin" RUN_INSTALL_ROOT_OVERRIDE="$shell_home" run_install_sh
+        [ "$RUN_RC" -eq 0 ] || fail "Special-character installation failed: $RUN_OUT"
+        case "$shell_name" in
+          fish)
+            shell_rc="$shell_home/.config/fish/config.fish"
+            # Fish's system configuration connects fish_user_paths to PATH.
+            HOME="$shell_home" LPM_TEST_RC="$shell_rc" LPM_TEST_BIN="$shell_home/.lpm/bin" \
+              "$shell_bin" -c 'source "$LPM_TEST_RC"; contains -- "$LPM_TEST_BIN" $PATH' \
+              || {
+                cat "$shell_rc"
+                HOME="$shell_home" LPM_TEST_RC="$shell_rc" LPM_TEST_BIN="$shell_home/.lpm/bin" \
+                  "$shell_bin" -c 'source "$LPM_TEST_RC"; string escape -- "$LPM_TEST_BIN" $PATH'
+                fail "Fish did not preserve the literal installation path"
+              }
+            ;;
+          *)
+            shell_rc="$shell_home/.${shell_name}rc"
+            HOME="$shell_home" LPM_TEST_RC="$shell_rc" LPM_TEST_BIN="$shell_home/.lpm/bin" \
+              "$shell_bin" -c '. "$LPM_TEST_RC"; case ":$PATH:" in *":$LPM_TEST_BIN:"*) exit 0;; *) exit 1;; esac' \
+              || fail "$shell_name did not preserve the literal installation path"
+            ;;
+        esac
+      done
+      ;;
+    repeated-path-setup)
+      for shell_name in bash zsh fish; do
+        shell_home="$shell_fixture/$shell_name"
+        mkdir -p "$shell_home/.config/fish"
+        for iteration in 1 2 3; do
+          SHELL="/usr/bin/$shell_name" RUN_INSTALL_ROOT_OVERRIDE="$shell_home" run_install_sh
+          [ "$RUN_RC" -eq 0 ] || fail "Repeated installation failed: $RUN_OUT"
+        done
+        case "$shell_name" in
+          fish) shell_rc="$shell_home/.config/fish/config.fish" ;;
+          *) shell_rc="$shell_home/.${shell_name}rc" ;;
+        esac
+        [ "$(grep -Fc "$shell_home/.lpm/bin" "$shell_rc")" -eq 1 ] \
+          || fail "Repeated installs duplicate $shell_name PATH setup"
+      done
+      ;;
+  esac
+  stop_server
+  trap - EXIT
+  rm -rf "$FIXTURE_DIR" "$CLEAN_PATH_DIR" "$shell_fixture"
+  pass "$1"
+}
+
+if [ "${1:-}" = "--shell-setup" ]; then
+  run_shell_setup_tests "$2"
+  exit 0
+fi
+
 build_clean_path
 
 # ── Case 1: syntax check ─────────────────────────────────────────
@@ -741,4 +822,8 @@ rm -rf "$fdir"
 pass "LPM_INSTALL_INSECURE=1 bypasses missing-manifest gate"
 
 echo
+for scenario in missing-fish-directory quoted-fish-path repeated-path-setup literal-shell-paths; do
+  run_shell_setup_tests "$scenario"
+done
+
 echo "All install.sh harness tests passed."

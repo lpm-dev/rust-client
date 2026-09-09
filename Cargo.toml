@@ -221,3 +221,6 @@ redundant_clone = "deny"
 map_unwrap_or = "deny"
 needless_collect = "deny"
 unnecessary_wraps = "deny"
+
+[profile.dev.package.scrypt]
+opt-level = 3
