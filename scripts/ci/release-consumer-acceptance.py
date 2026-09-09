@@ -154,7 +154,9 @@ if os.name != "nt":
     shell_env["PATH"] = str(lpm_dir / "bin") + os.pathsep + shell_env["PATH"]
     installer = ROOT / "public-install.sh"
     run("fetch-public-installer", ["curl", "-fsSL", "--max-time", "30", "https://cli.lpm.dev/install", "-o", installer])
-    run("shell-install-stable", ["sh", installer], shell_env)
+    code, _ = run("shell-install-stable", ["sh", installer], shell_env)
+    if code != 0:
+        run("shell-install-pinned-stable", ["sh", installer], shell_env | {"LPM_INSTALL_VERSION": "v" + STABLE})
     standalone = lpm_dir / "bin/lpm"
     verify_version("shell-stable-version", standalone, STABLE, shell_env)
     state_check("shell-existing-auth", standalone, shell_env)
@@ -166,6 +168,18 @@ if os.name != "nt":
 
 if platform.system() == "Darwin":
     brew_env = ENV | {"HOMEBREW_NO_AUTO_UPDATE": "1", "HOMEBREW_NO_INSTALL_CLEANUP": "1"}
+    run("brew-tap", ["brew", "tap", "lpm-dev/lpm"], brew_env, timeout=120)
+    code, tap = run("brew-tap-path", ["brew", "--repo", "lpm-dev/lpm"], brew_env)
+    if code == 0:
+        formula = Path(tap.strip()) / "Formula/lpm.rb"
+        current_formula = formula.read_bytes()
+        old_formula = urllib.request.urlopen("https://raw.githubusercontent.com/lpm-dev/homebrew-lpm/eb8d05c702a729dec50511fc0745b07b457fb888/Formula/lpm.rb", timeout=30).read()
+        try:
+            formula.write_bytes(old_formula)
+            run("brew-install-old", ["brew", "install", "lpm-dev/lpm/lpm"], brew_env, timeout=360)
+        finally:
+            formula.write_bytes(current_formula)
+        run("brew-upgrade-stable", ["brew", "upgrade", "lpm-dev/lpm/lpm"], brew_env, timeout=360)
     run("brew-install-stable", ["brew", "install", "lpm-dev/lpm/lpm"], brew_env, timeout=360)
     code, prefix = run("brew-prefix", ["brew", "--prefix", "lpm-dev/lpm/lpm"], brew_env)
     if code == 0:
