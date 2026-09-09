@@ -11,6 +11,8 @@ use lpm_common::LpmError;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+mod source;
+
 const DIRECTORY: &str = "install-recovery";
 const COMMITTED: &str = "committed";
 const RECORD_LIMIT: u64 = 32 * 1024 * 1024;
@@ -43,6 +45,7 @@ struct Recovery {
     directory: Dir,
     records: HashMap<PathBuf, Record>,
     total_bytes: usize,
+    sources: Option<source::Sources>,
 }
 
 tokio::task_local! {
@@ -164,10 +167,22 @@ impl Recovery {
         let mut names = Vec::new();
         let mut records = Vec::new();
         let mut total_bytes = 0usize;
+        let source_directory = match state.open_dir_nofollow(source::DIRECTORY) {
+            Ok(directory) => Some(directory),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+            Err(error) => return Err(error),
+        };
+        let sources = source_directory
+            .as_ref()
+            .map(source::Sources::load)
+            .transpose()?;
+        if !committed && let (Some(sources), Some(directory)) = (&sources, &source_directory) {
+            sources.validate(&self.directory, directory)?;
+        }
         for entry in state.entries()? {
             let entry = entry?;
             let name = entry.file_name();
-            if name == OsStr::new(COMMITTED) {
+            if name == OsStr::new(COMMITTED) || name == OsStr::new(source::DIRECTORY) {
                 continue;
             }
             if name
@@ -206,6 +221,9 @@ impl Recovery {
             records.push((record, parent));
         }
         if !committed {
+            if let (Some(sources), Some(directory)) = (&sources, &source_directory) {
+                sources.restore(&self.directory, directory)?;
+            }
             for (record, parent) in &records {
                 let current = read_regular(
                     parent,
@@ -229,13 +247,15 @@ impl Recovery {
                 invalidate_hash(parent)?;
             }
             invalidate_hash(&self.directory)?;
+            write_record(&state, OsStr::new(COMMITTED), b"1\n")?;
+        }
+        if let Some(directory) = source_directory {
+            source::cleanup(directory)?;
         }
         for name in names {
             state.remove_file(name)?;
         }
-        if committed {
-            state.remove_file(COMMITTED)?;
-        }
+        state.remove_file(COMMITTED)?;
         sync_directory(&state)?;
         let lpm = self.directory.open_dir_nofollow(".lpm")?;
         state.remove_open_dir()?;
@@ -310,13 +330,10 @@ impl Recovery {
     }
 
     fn finish(&mut self, success: bool) -> io::Result<()> {
-        if self.records.is_empty() {
+        if self.records.is_empty() && self.sources.is_none() {
             return Ok(());
         }
-        if success {
-            let state = self
-                .state_directory(false)?
-                .ok_or_else(|| invalid("missing install recovery directory"))?;
+        if success && let Some(state) = self.state_directory(false)? {
             write_record(&state, OsStr::new(COMMITTED), b"1\n")?;
         }
         self.recover()
@@ -359,6 +376,17 @@ pub(crate) fn may_restore(path: &Path) -> bool {
                 return false;
             };
             let canonical = parent.join(path.file_name().unwrap_or_default());
+            if canonical
+                .strip_prefix(&recovery.root)
+                .is_ok_and(|relative| {
+                    recovery
+                        .sources
+                        .as_ref()
+                        .is_some_and(|sources| sources.contains(relative))
+                })
+            {
+                return false;
+            }
             let Some(record) = canonical
                 .strip_prefix(&recovery.root)
                 .ok()
@@ -379,6 +407,104 @@ pub(crate) fn may_restore(path: &Path) -> bool {
         .unwrap_or(true)
 }
 
+pub(crate) fn enable_source_recovery() {
+    let _ = ACTIVE.try_with(|recovery| {
+        recovery
+            .borrow_mut()
+            .sources
+            .get_or_insert_with(Default::default);
+    });
+}
+
+pub(crate) fn record_source_directories(paths: &[PathBuf]) -> io::Result<()> {
+    ACTIVE
+        .try_with(|recovery| {
+            let mut recovery = recovery.borrow_mut();
+            if recovery.sources.is_none() || paths.is_empty() {
+                return Ok(());
+            }
+            let relative = paths
+                .iter()
+                .map(|path| {
+                    path.strip_prefix(&recovery.root)
+                        .map(Path::to_path_buf)
+                        .map_err(|_| invalid("source directory is outside the locked project"))
+                })
+                .collect::<io::Result<Vec<_>>>()?;
+            let state = recovery
+                .state_directory(true)?
+                .ok_or_else(|| invalid("missing recovery directory"))?;
+            let state = source::directory(&state)?;
+            recovery
+                .sources
+                .as_mut()
+                .ok_or_else(|| invalid("missing source recovery"))?
+                .record_directories(&state, &relative)
+        })
+        .unwrap_or(Ok(()))
+}
+
+pub(crate) fn write_source_with<T>(
+    path: &Path,
+    mode: Option<u32>,
+    write: impl FnOnce(&mut std::fs::File) -> io::Result<T>,
+) -> io::Result<T> {
+    let enabled = ACTIVE
+        .try_with(|recovery| recovery.borrow().sources.is_some())
+        .unwrap_or(false);
+    if !enabled {
+        let options = mode.map_or(lpm_common::AtomicWriteOptions::new(), |mode| {
+            lpm_common::AtomicWriteOptions::new().unix_mode(mode)
+        });
+        return lpm_common::write_file_atomic_with(path, options, write);
+    }
+    ACTIVE.with(|recovery| {
+        let mut recovery = recovery.borrow_mut();
+        let relative = path
+            .strip_prefix(&recovery.root)
+            .map_err(|_| invalid("source file is outside the locked project"))?
+            .to_path_buf();
+        let state = recovery
+            .state_directory(true)?
+            .ok_or_else(|| invalid("missing recovery directory"))?;
+        let state = source::directory(&state)?;
+        let Recovery {
+            directory, sources, ..
+        } = &mut *recovery;
+        sources
+            .as_mut()
+            .ok_or_else(|| invalid("missing source recovery"))?
+            .write(directory, &state, relative, mode, write)
+    })
+}
+
+pub(crate) fn remove_source(path: &Path) -> io::Result<()> {
+    let enabled = ACTIVE
+        .try_with(|recovery| recovery.borrow().sources.is_some())
+        .unwrap_or(false);
+    if !enabled {
+        return std::fs::remove_file(path);
+    }
+    ACTIVE.with(|recovery| {
+        let mut recovery = recovery.borrow_mut();
+        let relative = path
+            .strip_prefix(&recovery.root)
+            .map_err(|_| invalid("source file is outside the locked project"))?
+            .to_path_buf();
+        let state = recovery
+            .state_directory(true)?
+            .ok_or_else(|| invalid("missing recovery directory"))?;
+        let state = source::directory(&state)?;
+        let Recovery {
+            directory, sources, ..
+        } = &mut *recovery;
+        sources
+            .as_mut()
+            .ok_or_else(|| invalid("missing source recovery"))?
+            .remove(directory, &state, relative)
+    })
+}
+
 pub(crate) async fn scope<F, T>(root: &Path, directory: Dir, future: F) -> Result<T, LpmError>
 where
     F: Future<Output = Result<T, LpmError>>,
@@ -388,6 +514,7 @@ where
         directory,
         records: HashMap::new(),
         total_bytes: 0,
+        sources: None,
     };
     recovery.recover()?;
     #[cfg(unix)]

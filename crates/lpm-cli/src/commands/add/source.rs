@@ -108,7 +108,14 @@ pub(super) fn resolve_noninteractive_required_config(
                         .map(str::to_string)
                 })?
             });
-        if let Some(value) = resolved.filter(|value| !value.is_empty()) {
+        let empty_selection = field.get("type").and_then(serde_json::Value::as_str)
+            == Some("select")
+            && field
+                .get("multiSelect")
+                .and_then(serde_json::Value::as_bool)
+                == Some(true)
+            && !required;
+        if let Some(value) = resolved.filter(|value| !value.is_empty() || empty_selection) {
             values.insert(key.clone(), value);
         } else if required {
             return Err(LpmError::Registry(format!(
@@ -153,6 +160,14 @@ pub(super) fn validate_declared_config_values(
                 return Err(LpmError::Registry(format!(
                     "required configuration '{key}' cannot be empty"
                 )));
+            }
+            if field_type == "select"
+                && field
+                    .get("multiSelect")
+                    .and_then(serde_json::Value::as_bool)
+                    == Some(true)
+            {
+                continue;
             }
             unset.push(key.clone());
             continue;
@@ -268,24 +283,26 @@ pub(super) fn filter_config_files(
         let expanded = expand_src_pattern(&source_index, &src_pattern);
 
         // Compute the base directory of the src pattern (strip trailing /** or /*)
-        let pattern_base = src_pattern.trim_end_matches("/**").trim_end_matches("/*");
-
-        let multi_file = expanded.len() > 1;
+        let pattern_base = src_pattern
+            .split('/')
+            .take_while(|part| !part.contains('*'))
+            .collect::<Vec<_>>()
+            .join("/");
+        let directory_selector = src_pattern.contains('*');
         for (path, src_rel) in expanded {
             let dest_rel = if let Some(d) = &dest {
-                if d.ends_with('/') {
+                if directory_selector {
+                    let rel_from_base = src_rel
+                        .strip_prefix(&pattern_base)
+                        .and_then(|value| value.strip_prefix('/'))
+                        .unwrap_or(&src_rel);
+                    format!("{}/{}", d.trim_end_matches('/'), rel_from_base)
+                } else if d.ends_with('/') {
                     format!(
                         "{}{}",
                         d,
                         path.file_name().unwrap_or_default().to_string_lossy()
                     )
-                } else if multi_file {
-                    // Matches the JS CLI's range-target directory layout.
-                    let rel_from_base = src_rel
-                        .strip_prefix(pattern_base)
-                        .and_then(|value| value.strip_prefix('/'))
-                        .unwrap_or(&src_rel);
-                    format!("{}/{}", d.trim_end_matches('/'), rel_from_base)
                 } else {
                     d.clone()
                 }
@@ -673,6 +690,23 @@ mod tests {
 
         assert_eq!(values.get("variant").map(String::as_str), Some("a"));
         assert_eq!(values.get("features").map(String::as_str), Some("y"));
+    }
+
+    #[test]
+    fn explicit_empty_multi_selection_excludes_conditional_files() {
+        let extract = tempfile::tempdir().unwrap();
+        std::fs::write(extract.path().join("a.txt"), "a").unwrap();
+        let config = json!({"configSchema": {"features": {"type":"select", "multiSelect":true,"options":["a","b"],"default":"a"}}});
+        let mut values = HashMap::from([("features".to_string(), String::new())]);
+        resolve_noninteractive_required_config(&config, &mut values).unwrap();
+        let files = filter_config_files(
+            extract.path(),
+            &[json!({"src":"a.txt","include":"when","condition":{"features":"a"}})],
+            &values,
+        )
+        .unwrap();
+        assert!(files.is_empty());
+        assert_eq!(values.get("features"), Some(&String::new()));
     }
 
     #[test]

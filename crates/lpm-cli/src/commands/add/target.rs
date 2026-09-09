@@ -77,15 +77,14 @@ pub(super) fn resolve_add_target(spec: &str) -> Result<ResolvedAddInput, LpmErro
                     "invalid inline configuration '{param}'; expected key=value"
                 )));
             };
+            let key = decode_config_component(key)?;
+            let value = decode_config_component(value)?;
             if key.is_empty() {
                 return Err(LpmError::Registry(
                     "inline configuration keys cannot be empty".to_string(),
                 ));
             }
-            if inline_config
-                .insert(key.to_string(), value.to_string())
-                .is_some()
-            {
+            if inline_config.insert(key.clone(), value).is_some() {
                 return Err(LpmError::Registry(format!(
                     "inline configuration '{key}' was provided more than once"
                 )));
@@ -135,9 +134,49 @@ pub(super) fn resolve_add_target(spec: &str) -> Result<ResolvedAddInput, LpmErro
     Ok((target, version, inline_config))
 }
 
+fn decode_config_component(value: &str) -> Result<String, LpmError> {
+    let bytes = value.as_bytes();
+    for (index, byte) in bytes.iter().enumerate() {
+        if *byte == b'%'
+            && !bytes
+                .get(index + 1..index + 3)
+                .is_some_and(|digits| digits.iter().all(u8::is_ascii_hexdigit))
+        {
+            return Err(LpmError::Registry(
+                "inline configuration contains invalid percent encoding".into(),
+            ));
+        }
+    }
+    let form_value = value.replace('+', " ");
+    urlencoding::decode(&form_value)
+        .map(|decoded| decoded.into_owned())
+        .map_err(|_| LpmError::Registry("inline configuration must contain valid UTF-8".into()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn inline_configuration_decodes_reserved_characters_and_unicode() {
+        let (_, _, config) = resolve_add_target(
+            "@lpm.dev/owner.source?theme=a%26b%27%24%28value%29&name=caf%C3%A9+space&literal=%2526",
+        )
+        .unwrap();
+        assert_eq!(config["theme"], "a&b'$(value)");
+        assert_eq!(config["name"], "café space");
+        assert_eq!(config["literal"], "%26");
+    }
+
+    #[test]
+    fn inline_configuration_rejects_malformed_encoding_and_duplicate_decoded_keys() {
+        for query in ["x=%", "x=%2", "x=%GG", "x=%FF", "x=one&%78=two"] {
+            assert!(
+                resolve_add_target(&format!("pkg?{query}")).is_err(),
+                "accepted {query}"
+            );
+        }
+    }
 
     #[test]
     fn resolve_add_target_lpm_full_scoped() {

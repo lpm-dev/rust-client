@@ -13,12 +13,18 @@
     },
     "type": {
       "type": "string",
-      "enum": ["package", "source"],
+      "enum": [
+        "package",
+        "source"
+      ],
       "description": "Optional LPM.dev Registry classification. Only `package` and `source` are supported; when omitted, the Registry infers classification from the published contents. A valid lpm.config.json still activates LPM CLI's configured `lpm add` path, including when this field is `package`."
     },
     "ecosystem": {
       "type": "string",
-      "enum": ["js", "swift"],
+      "enum": [
+        "js",
+        "swift"
+      ],
       "default": "js",
       "description": "Target ecosystem for the source files. Drives default install directory detection (e.g., Swift uses `Sources/<target>/` or `Packages/LPMComponents/Sources/<target>/`)."
     },
@@ -54,7 +60,9 @@
         "type": "object",
         "additionalProperties": {
           "type": "array",
-          "items": { "type": "string" }
+          "items": {
+            "type": "string"
+          }
         }
       }
     }
@@ -62,7 +70,11 @@
   "$defs": {
     "configValue": {
       "description": "A leaf value for a configurable field. Native JSON booleans, numbers, and strings are all accepted; the runtime stringifies them when populating the inline-config map.",
-      "type": ["string", "boolean", "number"]
+      "type": [
+        "string",
+        "boolean",
+        "number"
+      ]
     },
     "configSchemaField": {
       "type": "object",
@@ -70,7 +82,11 @@
       "properties": {
         "type": {
           "type": "string",
-          "enum": ["string", "boolean", "select"],
+          "enum": [
+            "string",
+            "boolean",
+            "select"
+          ],
           "default": "string",
           "description": "Field input type. `string` prompts for a free-form value, `boolean` for a confirm, `select` for a single-choice or multi-select list."
         },
@@ -97,11 +113,15 @@
           "description": "List of selectable options. Only meaningful when `type` is `select`. Plain strings are accepted as a shorthand for `{value, label}` pairs where both equal the string.",
           "items": {
             "oneOf": [
-              { "type": "string" },
+              {
+                "type": "string"
+              },
               {
                 "type": "object",
                 "additionalProperties": false,
-                "required": ["value"],
+                "required": [
+                  "value"
+                ],
                 "properties": {
                   "value": {
                     "type": "string",
@@ -116,12 +136,38 @@
             ]
           }
         }
-      }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "type": {
+                "const": "select"
+              }
+            },
+            "required": [
+              "type"
+            ]
+          },
+          "then": {
+            "required": [
+              "options"
+            ],
+            "properties": {
+              "options": {
+                "minItems": 1
+              }
+            }
+          }
+        }
+      ]
     },
     "fileRule": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["src"],
+      "required": [
+        "src"
+      ],
       "properties": {
         "src": {
           "type": "string",
@@ -133,7 +179,11 @@
         },
         "include": {
           "type": "string",
-          "enum": ["always", "when", "never"],
+          "enum": [
+            "always",
+            "when",
+            "never"
+          ],
           "default": "always",
           "description": "When to include this rule. `always` (or omitted): copy unconditionally. `when`: copy only if every entry in `condition` matches the inline-config value (all-by-default if a key wasn't supplied). `never`: skip."
         },

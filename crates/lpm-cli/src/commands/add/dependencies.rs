@@ -491,7 +491,7 @@ pub(super) async fn handle_dependencies(
 
         let updated = serde_json::to_string_pretty(&doc)
             .map_err(|e| LpmError::Registry(format!("failed to serialize package.json: {e}")))?;
-        lpm_common::write_file_atomic(&pkg_json_path, format!("{updated}\n"))
+        crate::install_recovery::write_manifest(&pkg_json_path, &content, format!("{updated}\n"))
             .map_err(|e| LpmError::Registry(format!("failed to write package.json: {e}")))?;
         transaction
             .restore_only_if_current(&pkg_json_path)

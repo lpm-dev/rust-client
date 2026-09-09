@@ -33,6 +33,403 @@ use support::{
     wait_for_lock_contention, write_lpm_proxy_npmrc, write_npm_firewall_global_config,
 };
 
+#[tokio::test]
+async fn kill_during_source_copy_is_recovered_before_remove() {
+    let mock = MockRegistry::start().await;
+    let package = "partial-source-copy";
+    let names: Vec<_> = (0..300)
+        .map(|index| format!("files/{index:04}.txt"))
+        .collect();
+    let files: Vec<_> = names
+        .iter()
+        .map(|name| (name.as_str(), b"managed source".as_slice()))
+        .collect();
+    let tarball = make_source_pkg_tarball(
+        package,
+        "1.0.0",
+        json!({"files":[{"src":"files/**","dest":"output"}]}),
+        &files,
+    );
+    mock.with_package(package, "1.0.0", &tarball).await;
+    let project = TempProject::empty(r#"{"name":"host","version":"1.0.0"}"#);
+    project.write_file("keep.txt", "unrelated work");
+    let mut child = lpm_spawnable_with_registry(&project, &mock.url())
+        .args([
+            "add",
+            package,
+            "--path",
+            "vendor",
+            "--yes",
+            "--no-install-deps",
+            "--no-skills",
+        ])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    let target = project.path().join("vendor/output");
+    let mut copied = 0;
+    while std::time::Instant::now() < deadline {
+        copied = std::fs::read_dir(&target)
+            .map(|entries| entries.count())
+            .unwrap_or(0);
+        if copied >= 3 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+    }
+    child.kill().unwrap();
+    child.wait().unwrap();
+    assert!(
+        (3..300).contains(&copied),
+        "did not interrupt a partial copy: {copied}"
+    );
+    lpm(&project)
+        .args(["remove", package, "--json"])
+        .assert()
+        .success();
+    assert!(
+        !project.path().join("vendor").exists(),
+        "interrupted source files, directories, or temporaries survived recovery"
+    );
+    assert!(!project.path().join(".lpm/install-recovery").exists());
+    assert_eq!(project.read_file("keep.txt"), "unrelated work");
+}
+
+#[tokio::test]
+async fn encoded_configuration_and_empty_selection_control_files_and_dependencies() {
+    let mock = MockRegistry::start().await;
+    let package = "encoded-config-source";
+    let tarball = make_source_pkg_tarball(
+        package,
+        "1.0.0",
+        json!({
+            "configSchema": {
+                "theme": {"type":"select","options":["a&b"],"required":true},
+                "features": {"type":"select","multiSelect":true,"options":["alpha","beta"],"default":"alpha"}
+            },
+            "files": [
+                {"src":"base.txt","include":"when","condition":{"theme":"a&b"}},
+                {"src":"alpha.txt","include":"when","condition":{"features":"alpha"}}
+            ],
+            "dependencies": {"features":{"alpha":["must-not-install@1.0.0"]}}
+        }),
+        &[("base.txt", b"base"), ("alpha.txt", b"alpha")],
+    );
+    mock.with_package(package, "1.0.0", &tarball).await;
+    let project = TempProject::empty(r#"{"name":"host","version":"1.0.0"}"#);
+    let original_manifest = project.read_file("package.json");
+    lpm_with_registry(&project, &mock.url())
+        .args([
+            "add",
+            &format!("{package}?theme=a%26b&features="),
+            "--path",
+            "vendor",
+            "--yes",
+            "--no-skills",
+        ])
+        .assert()
+        .success();
+    assert_eq!(project.read_file("vendor/base.txt"), "base");
+    assert!(!project.file_exists("vendor/alpha.txt"));
+    assert_eq!(project.read_file("package.json"), original_manifest);
+}
+
+#[tokio::test]
+async fn mapped_javascript_imports_run_as_native_esm() {
+    let mock = MockRegistry::start().await;
+    let package = "mapped-esm-source";
+    let tarball = make_source_pkg_tarball(
+        package,
+        "1.0.0",
+        json!({
+            "importAlias": "@/", "files": [
+                {"src": "src/main.js", "dest": "main.js"},
+                {"src": "src/util.js", "dest": "lib/util.js"}
+            ]
+        }),
+        &[
+            (
+                "src/main.js",
+                b"import {value} from '@/src/util.js'; console.log(value + 1);",
+            ),
+            ("src/util.js", b"export const value = 41;"),
+        ],
+    );
+    mock.with_package(package, "1.0.0", &tarball).await;
+    let project = TempProject::empty(r#"{"name":"host","version":"1.0.0","type":"module"}"#);
+    lpm_with_registry(&project, &mock.url())
+        .args([
+            "add",
+            package,
+            "--path",
+            "vendor",
+            "--yes",
+            "--no-install-deps",
+            "--no-skills",
+        ])
+        .assert()
+        .success();
+    let result = std::process::Command::new("node")
+        .arg(project.path().join("vendor/main.js"))
+        .output()
+        .unwrap();
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&result.stdout).trim(), "42");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn source_delivery_preserves_executable_text_and_binary_modes() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let mock = MockRegistry::start().await;
+    let package = "executable-source";
+    let tarball = make_source_pkg_tarball(
+        package,
+        "1.0.0",
+        json!({"files": [{"src":"run.sh"}, {"src":"tool.bin"}]}),
+        &[
+            ("run.sh", b"#!/bin/sh\nexit 0\n"),
+            ("tool.bin", &[0, 0xff, 0x81]),
+        ],
+    );
+    mock.with_package(package, "1.0.0", &tarball).await;
+    let project = TempProject::empty(r#"{"name":"host","version":"1.0.0"}"#);
+    lpm_with_registry(&project, &mock.url())
+        .args([
+            "add",
+            package,
+            "--path",
+            "vendor",
+            "--yes",
+            "--no-install-deps",
+            "--no-skills",
+        ])
+        .assert()
+        .success();
+    for name in ["run.sh", "tool.bin"] {
+        assert_eq!(
+            std::fs::metadata(project.path().join("vendor").join(name))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o755,
+            "mode lost for {name}"
+        );
+    }
+    assert!(
+        std::process::Command::new(project.path().join("vendor/run.sh"))
+            .status()
+            .unwrap()
+            .success()
+    );
+}
+
+#[tokio::test]
+async fn glob_destination_stays_a_directory_when_the_package_gains_a_second_file() {
+    let mock = MockRegistry::start().await;
+    let package = "growing-glob-source";
+    let config = json!({"files": [{"src":"assets/**", "dest":"assets"}]});
+    let first =
+        make_source_pkg_tarball(package, "1.0.0", config.clone(), &[("assets/a.txt", b"a")]);
+    let second = make_source_pkg_tarball(
+        package,
+        "1.0.1",
+        config,
+        &[("assets/a.txt", b"a"), ("assets/nested/b.txt", b"b")],
+    );
+    mock.mount_full_package_metadata_routes(
+        package,
+        "1.0.1",
+        &[
+            ("1.0.0", json!({}), Some(first)),
+            ("1.0.1", json!({}), Some(second)),
+        ],
+    )
+    .await;
+    let project = TempProject::empty(r#"{"name":"host","version":"1.0.0"}"#);
+    for version in ["1.0.0", "1.0.1"] {
+        lpm_with_registry(&project, &mock.url())
+            .args([
+                "add",
+                &format!("{package}@{version}"),
+                "--path",
+                "vendor",
+                "--yes",
+                "--no-install-deps",
+                "--no-skills",
+            ])
+            .assert()
+            .success();
+        assert_eq!(project.read_file("vendor/assets/a.txt"), "a");
+    }
+    assert_eq!(project.read_file("vendor/assets/nested/b.txt"), "b");
+}
+
+#[tokio::test]
+async fn explicit_source_update_refreshes_a_warm_metadata_cache() {
+    use wiremock::{
+        Mock, ResponseTemplate,
+        matchers::{method, path},
+    };
+    let mock = MockRegistry::start().await;
+    let package = "@lpm.dev/source.fresh-update";
+    let config = json!({"files": [{"src":"value.txt"}]});
+    let first = make_source_pkg_tarball(package, "1.0.0", config.clone(), &[("value.txt", b"v1")]);
+    mock.with_package(package, "1.0.0", &first).await;
+    let project = TempProject::empty(r#"{"name":"host","version":"1.0.0"}"#);
+    lpm_with_registry(&project, &mock.url())
+        .args([
+            "add",
+            &format!("{package}@1.0.0"),
+            "--path",
+            "vendor",
+            "--yes",
+            "--no-install-deps",
+            "--no-skills",
+        ])
+        .assert()
+        .success();
+    let second = make_source_pkg_tarball(package, "1.0.1", config, &[("value.txt", b"v2")]);
+    let metadata = mock
+        .mount_full_package_metadata_routes(
+            package,
+            "1.0.1",
+            &[
+                ("1.0.0", json!({}), Some(first)),
+                ("1.0.1", json!({}), Some(second)),
+            ],
+        )
+        .await;
+    Mock::given(method("GET"))
+        .and(path(format!("/api/registry/{package}")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(metadata))
+        .with_priority(1)
+        .mount(mock.server())
+        .await;
+    lpm_with_registry(&project, &mock.url())
+        .args([
+            "add",
+            &format!("{package}@1.0.1"),
+            "--path",
+            "vendor",
+            "--yes",
+            "--no-install-deps",
+            "--no-skills",
+        ])
+        .assert()
+        .success();
+    assert_eq!(project.read_file("vendor/value.txt"), "v2");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn killed_add_retry_tracks_copies_and_restores_overwrite_backups_on_remove() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let mock = MockRegistry::start().await;
+    let package = "interrupted-source-delivery";
+    let tarball = make_source_pkg_tarball(
+        package,
+        "1.0.0",
+        json!({
+            "configSchema": {"enabled": {"type": "boolean", "default": true}},
+            "dependencies": {"enabled": {"true": ["source-leaf@1.0.0"]}},
+            "files": [{"src": "new.txt"}, {"src": "original.txt"}, {"src": "identical.txt"}]
+        }),
+        &[
+            ("new.txt", b"new source"),
+            ("original.txt", b"replacement"),
+            ("identical.txt", b"user content"),
+        ],
+    );
+    mock.with_package(package, "1.0.0", &tarball).await;
+    let project = TempProject::empty(r#"{"name":"host","version":"1.0.0"}"#);
+    project.write_file("original.txt", "original user content");
+    project.write_file("identical.txt", "user content");
+    std::fs::set_permissions(
+        project.path().join("original.txt"),
+        std::fs::Permissions::from_mode(0o700),
+    )
+    .unwrap();
+    let bin = project.home().join("fake-bin");
+    std::fs::create_dir(&bin).unwrap();
+    let npm = bin.join("npm");
+    std::fs::write(&npm, "#!/bin/sh\n: > \"$LPM_FAKE_PM_STARTED\"\nwhile [ ! -f \"$LPM_FAKE_PM_RELEASE\" ]; do sleep 0.02; done\nexit 1\n").unwrap();
+    std::fs::set_permissions(&npm, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let started = project.home().join("started");
+    let release = project.home().join("release");
+    let path = std::env::join_paths(std::iter::once(bin).chain(std::env::split_paths(
+        &std::env::var_os("PATH").unwrap_or_default(),
+    )))
+    .unwrap();
+    let mut child = lpm_spawnable_with_registry(&project, &mock.url())
+        .env("PATH", path)
+        .env("LPM_FAKE_PM_STARTED", &started)
+        .env("LPM_FAKE_PM_RELEASE", &release)
+        .args([
+            "add",
+            package,
+            "--path",
+            ".",
+            "--force",
+            "--yes",
+            "--pm",
+            "npm",
+            "--no-skills",
+        ])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    while !started.exists() && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    child.kill().unwrap();
+    child.wait().unwrap();
+    std::fs::write(release, b"release").unwrap();
+    assert!(started.exists(), "dependency installer did not start");
+    assert_eq!(project.read_file("new.txt"), "new source");
+    lpm_with_registry(&project, &mock.url())
+        .args([
+            "add",
+            package,
+            "--path",
+            ".",
+            "--force",
+            "--yes",
+            "--no-install-deps",
+            "--no-skills",
+        ])
+        .assert()
+        .success();
+    lpm(&project)
+        .args(["remove", package, "--json"])
+        .assert()
+        .success();
+    assert!(
+        !project.file_exists("new.txt"),
+        "retry lost ownership of the interrupted copy"
+    );
+    assert_eq!(project.read_file("original.txt"), "original user content");
+    assert_eq!(project.read_file("identical.txt"), "user content");
+    assert_eq!(
+        std::fs::metadata(project.path().join("original.txt"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o700
+    );
+}
+
 fn wait_for_child_exit(
     child: &mut std::process::Child,
     timeout: std::time::Duration,

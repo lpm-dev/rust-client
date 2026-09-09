@@ -518,7 +518,14 @@ fn compute_new_specifier(
     buyer_alias: Option<&str>,
     original_relative: Option<&str>,
 ) -> Option<String> {
-    let clean_path = strip_import_extension(resolved_dest_path);
+    let runtime_extension = [".js", ".mjs", ".cjs", ".json"]
+        .iter()
+        .any(|extension| resolved_dest_path.ends_with(extension));
+    let clean_path = if runtime_extension {
+        resolved_dest_path.to_string()
+    } else {
+        strip_import_extension(resolved_dest_path)
+    };
 
     if let Some(alias) = buyer_alias {
         let needs_separator = !alias.ends_with('/');
@@ -534,7 +541,9 @@ fn compute_new_specifier(
 
     if let Some(original) = original_relative {
         let original_target = normalize_path(&join_path(file_dest_dir, original));
-        if strip_import_extension(&original_target) == clean_path {
+        if original_target == clean_path
+            || (!runtime_extension && strip_import_extension(&original_target) == clean_path)
+        {
             return None;
         }
     }
