@@ -1243,8 +1243,7 @@ pub async fn run_add_packages(
                     yes,
                     json_output,
                     audit_after_install,
-                    registry_url: client.base_url(),
-                    session: client.session().map(|session| session.as_ref()),
+                    client,
                 },
             )
             .await?;
@@ -1651,8 +1650,7 @@ pub async fn run_install_filtered_add(
             yes,
             json_output,
             audit_after_install,
-            registry_url: client.base_url(),
-            session: client.session().map(|session| session.as_ref()),
+            client,
         };
         let mut swift_reports = Vec::with_capacity(swift_locations.len());
         for location in &swift_locations {

@@ -49,10 +49,11 @@ impl SeatbeltSandbox {
     ) -> Result<Self, SandboxError> {
         let deny_outbound_network = options.deny_outbound_network;
         let profile = match mode {
-            SandboxMode::Enforce => seatbelt::render_profile_with_isolation(
+            SandboxMode::Enforce => seatbelt::render_profile_with_toolchain(
                 &spec,
                 deny_outbound_network,
                 options.build_cache_isolation,
+                options.apple_developer_dir.as_deref(),
             )?,
             SandboxMode::LogOnly => seatbelt::render_logonly_profile(&spec, deny_outbound_network)?,
             // Disabled never reaches this backend — the factory in

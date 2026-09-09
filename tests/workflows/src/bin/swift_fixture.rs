@@ -44,6 +44,20 @@ fn main() {
     }
 
     match (command.as_deref(), action.as_deref()) {
+        (Some("package"), Some("show-dependencies")) => {
+            let exit_code = std::env::var("LPM_TEST_SWIFT_GRAPH_EXIT_CODE")
+                .ok()
+                .and_then(|value| value.parse::<i32>().ok())
+                .unwrap_or(0);
+            if exit_code != 0 {
+                eprintln!("requested product not found in dependency");
+            }
+            println!(
+                "{}",
+                std::env::var("LPM_TEST_SWIFT_GRAPH").unwrap_or_else(|_| "{}".into())
+            );
+            std::process::exit(exit_code);
+        }
         (Some("package"), Some("dump-package")) => {
             if let (Ok(path), Ok(process_id)) = (
                 std::env::var("LPM_TEST_SWIFT_INTERVAL_LOG"),

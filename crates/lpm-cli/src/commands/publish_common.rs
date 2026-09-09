@@ -1560,7 +1560,10 @@ impl PublishFilesMatcher {
             } else {
                 normalized
             };
-            let match_base = !normalized.contains('/');
+            let match_base = !normalized.contains('/')
+                && normalized
+                    .bytes()
+                    .any(|byte| matches!(byte, b'*' | b'?' | b'[' | b'{' | b'('));
             let matching_pattern = if match_base {
                 format!("**/{normalized}")
             } else {
@@ -3878,6 +3881,44 @@ mod tests {
                 .files
                 .iter()
                 .any(|file| file.path == "Dist/Index.JS")
+        );
+    }
+
+    #[test]
+    fn publish_files_literal_directories_do_not_select_nested_build_artifacts() {
+        let project = tempfile::tempdir().unwrap();
+        for path in [
+            "Sources/Kit/Kit.swift",
+            "Tests/KitTests/Test.swift",
+            ".build/debug/Sources/Generated.swift",
+            ".build/debug/Tests/TestRunner",
+        ] {
+            let file = project.path().join(path);
+            std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+            std::fs::write(file, "fixture").unwrap();
+        }
+        let manifest = serde_json::json!({"name": "swift-kit", "version": "1.0.0", "files": ["Sources", "Tests"]});
+        std::fs::write(project.path().join("package.json"), manifest.to_string()).unwrap();
+        let prepared =
+            prepare_tarball(project.path(), &manifest, TarballOptions::default()).unwrap();
+        assert!(
+            prepared
+                .files
+                .iter()
+                .any(|file| file.path == "Sources/Kit/Kit.swift")
+        );
+        assert!(
+            prepared
+                .files
+                .iter()
+                .any(|file| file.path == "Tests/KitTests/Test.swift")
+        );
+        assert!(
+            prepared
+                .files
+                .iter()
+                .all(|file| !file.path.starts_with(".build/")),
+            "literal directories must be relative to the package root"
         );
     }
 

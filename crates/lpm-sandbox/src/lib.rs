@@ -292,6 +292,11 @@ pub struct SandboxOptions {
     /// lifecycle-build artifact; normal lifecycle execution keeps the broader
     /// compatibility write set.
     pub build_cache_isolation: bool,
+
+    /// The selected Apple developer directory for isolated compiler execution.
+    /// Callers must discover this through the system toolchain, not package data.
+    #[cfg(target_os = "macos")]
+    pub apple_developer_dir: Option<PathBuf>,
 }
 
 impl SandboxOptions {

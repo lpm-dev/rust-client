@@ -23,6 +23,81 @@ const SIGSTORE_PEM_CERT_LEAF: &str =
 const SIGSTORE_PEM_CERT_ROOT: &str =
     "-----BEGIN CERTIFICATE-----\nZGVm\n-----END CERTIFICATE-----\n";
 
+fn native_swift_publish_project() -> TempProject {
+    let project = TempProject::empty(
+        r#"{
+        "name":"@lpm.dev/testuser.swift-native", "version":"1.0.0",
+        "description":"Native Swift manifest publication", "license":"MIT",
+        "files":["Package.swift","Sources"]
+    }"#,
+    );
+    project.write_file("Package.swift", r#"// swift-tools-version: 5.9
+import PackageDescription
+let package = Package(name: "NativeLibrary", platforms: [.macOS(.v13)], products: [.library(name: "NativeLibrary", targets: ["NativeLibrary"])], targets: [.target(name: "NativeLibrary")])
+"#);
+    project.write_file(
+        "Sources/NativeLibrary/Value.swift",
+        "public func value() -> Int { 42 }\n",
+    );
+    project
+}
+
+#[tokio::test]
+#[cfg_attr(
+    not(feature = "swift-tests"),
+    ignore = "requires native Swift toolchain"
+)]
+async fn publish_retains_products_from_native_swift_manifest_inspection() {
+    let mock = MockRegistry::start().await;
+    mock.with_publish_endpoint().await;
+    mock.with_whoami("testuser", "test@example.com").await;
+    let project = native_swift_publish_project();
+    lpm_with_registry(&project, &mock.url())
+        .args([
+            "publish",
+            "--yes",
+            "--json",
+            "--ignore-scripts",
+            "--token",
+            "test-token",
+        ])
+        .assert()
+        .success();
+    let requests = mock.server().received_requests().await.unwrap();
+    let upload = requests
+        .iter()
+        .find(|request| request.method.as_str() == "PUT")
+        .unwrap();
+    let payload: serde_json::Value = serde_json::from_slice(&upload.body).unwrap();
+    assert_eq!(
+        payload["versions"]["1.0.0"]["_swiftManifest"]["products"][0]["name"],
+        "NativeLibrary"
+    );
+}
+
+#[test]
+fn publish_check_rejects_malformed_swift_manifest() {
+    let project = native_swift_publish_project();
+    project.write_file(
+        "Package.swift",
+        "// swift-tools-version: 5.9\nthis is not valid Swift\n",
+    );
+    lpm(&project)
+        .args(["publish", "--check", "--json"])
+        .assert()
+        .failure();
+}
+
+#[test]
+fn publish_check_rejects_unsupported_swift_tools_version() {
+    let project = native_swift_publish_project();
+    project.write_file("Package.swift", "// swift-tools-version: 99.0\nimport PackageDescription\nlet package = Package(name: \"Unsupported\")\n");
+    lpm(&project)
+        .args(["publish", "--check", "--json"])
+        .assert()
+        .failure();
+}
+
 fn authored_skills_project(name: &str) -> TempProject {
     let project = TempProject::empty(&format!(
         r#"{{
@@ -1835,6 +1910,7 @@ async fn publish_preserves_authored_executable_bits_in_the_uploaded_tarball() {
     );
 }
 
+#[cfg(feature = "swift-tests")]
 #[tokio::test]
 async fn publish_quality_metadata_uses_the_detected_ecosystem() {
     let mock = MockRegistry::start().await;
@@ -1845,11 +1921,11 @@ async fn publish_quality_metadata_uses_the_detected_ecosystem() {
   "name": "@lpm.dev/testuser.quality-ecosystem",
   "version": "1.0.0",
   "description": "Quality ecosystem publish fixture",
-  "main": "index.py",
+  "main": "Package.swift",
   "license": "MIT"
 }"#,
     );
-    project.write_file("index.py", "VALUE = 1\n");
+    project.write_file("Package.swift", "// swift-tools-version: 5.9\nimport PackageDescription\nlet package = Package(name: \"QualityKit\", products: [], targets: [])\n");
     project.write_file("README.md", "# Quality ecosystem\n");
     project.write_file("lpm.config.json", r#"{"ecosystem":"swift"}"#);
 

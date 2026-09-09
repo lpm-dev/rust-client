@@ -569,7 +569,10 @@ pub(super) fn resolve_install_project_dir(
     adding_packages: bool,
     json_output: bool,
 ) -> Result<std::path::PathBuf, lpm_common::LpmError> {
-    if cwd.join("package.json").is_file() {
+    if cwd.join("package.json").is_file()
+        || cwd.join("Package.swift").is_file()
+        || crate::xcode_project::find_xcodeproj_in_directory(cwd)?.is_some()
+    {
         return Ok(cwd.to_path_buf());
     }
     if let Some(ancestor) = lpm_workspace::find_project_root(cwd) {
