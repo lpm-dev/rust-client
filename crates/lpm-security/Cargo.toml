@@ -15,6 +15,7 @@ cap-fs-ext = { workspace = true }
 cap-std = "4.0.2"
 serde = { workspace = true }
 serde_json = { workspace = true }
+serde_yaml = { workspace = true }
 strsim = { workspace = true }
 rayon = { workspace = true }
 regex = "1"

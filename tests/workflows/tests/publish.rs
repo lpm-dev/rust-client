@@ -4415,3 +4415,44 @@ async fn publish_duplicate_version_explains_the_existing_release_without_raw_jso
         "{message}"
     );
 }
+
+#[tokio::test]
+async fn publish_json_preserves_registry_skill_warnings() {
+    let mock = MockRegistry::start().await;
+    mock.with_whoami("testuser", "test@example.com").await;
+    Mock::given(method("PUT"))
+        .and(path_regex("/api/registry/.*"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "success": true,
+            "publicationStatus": "active",
+            "warnings": ["Agent Skills haven't changed since v1.0.0"],
+        })))
+        .mount(mock.server())
+        .await;
+    let project = TempProject::empty(
+        r#"{"name":"@lpm.dev/testuser.skill-warnings","version":"1.0.1","main":"index.js"}"#,
+    );
+    project.write_file("index.js", "module.exports = {};");
+    let output = lpm_with_registry(&project, &mock.url())
+        .args([
+            "publish",
+            "--yes",
+            "--token",
+            "test-token-123",
+            "--lpm",
+            "--json",
+            "--no-provenance",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let json = parse_json_output(&output.stdout);
+    assert_eq!(
+        json["results"][0]["warnings"][0],
+        "Agent Skills haven't changed since v1.0.0"
+    );
+}

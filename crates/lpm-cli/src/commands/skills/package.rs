@@ -1,5 +1,5 @@
 use lpm_common::{LpmError, PackageName};
-use lpm_registry::Skill;
+use lpm_registry::{Skill, SkillsResponse};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::borrow::Cow;
@@ -55,6 +55,13 @@ pub(crate) fn materialize(
         Err(error) => return Err(LpmError::Io(error)),
     };
 
+    if had_previous && materialized_directory_manifest(&target, &package).is_none() {
+        return Err(LpmError::Registry(format!(
+            "package skills contain local changes or an invalid manifest: {}. Back up and move this directory before retrying",
+            target.display()
+        )));
+    }
+
     let staging = tempfile::Builder::new()
         .prefix(".package-skills-stage-")
         .tempdir_in(&root)
@@ -91,8 +98,13 @@ pub(crate) fn materialize(
     }
     let staging_path = staging.keep();
     if let Err(error) = std::fs::rename(&staging_path, &target) {
-        if had_previous {
-            let _ = std::fs::rename(&backup, &target);
+        if had_previous && let Err(restore_error) = std::fs::rename(&backup, &target) {
+            let retained_backup = backup_root.keep();
+            let _ = std::fs::remove_dir_all(&staging_path);
+            return Err(LpmError::Registry(format!(
+                "failed to replace package skills: {error}; failed to restore previous skills: {restore_error}. Previous files remain in {}",
+                retained_backup.join("previous").display()
+            )));
         }
         let _ = std::fs::remove_dir_all(&staging_path);
         return Err(LpmError::Io(error));
@@ -104,6 +116,25 @@ pub(crate) fn materialize(
     })
 }
 
+pub(crate) fn validate_response(response: &SkillsResponse) -> Result<(), LpmError> {
+    if response
+        .skills_status
+        .as_deref()
+        .is_some_and(|status| !matches!(status, "approved" | "flagged"))
+        || (response.available == Some(false)
+            && (response.skills_status.as_deref() == Some("flagged")
+                || response.skills_count.unwrap_or(0) > 0
+                || !response.skills.is_empty()))
+    {
+        return Err(LpmError::Registry(format!(
+            "package skills are unavailable for {} (review status: {}). Existing skills were preserved. Retry after review completes",
+            response.name,
+            response.skills_status.as_deref().unwrap_or("unavailable")
+        )));
+    }
+    validate(&response.skills)
+}
+
 pub(crate) fn validate(skills: &[Skill]) -> Result<(), LpmError> {
     validated_entries(skills).map(|_| ())
 }
@@ -113,7 +144,7 @@ pub(crate) fn remove(project_dir: &Path, package: &str) -> Result<u64, LpmError>
     let package = PackageName::parse(package)?.short();
     let root = project_dir.join(".lpm").join("skills");
     super::path_security::ensure_contained_directory(project_dir, &root, "package skill storage")?;
-    let directory = root.join(package);
+    let directory = root.join(&package);
     let metadata = match std::fs::symlink_metadata(&directory) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
@@ -122,6 +153,12 @@ pub(crate) fn remove(project_dir: &Path, package: &str) -> Result<u64, LpmError>
     if metadata.file_type().is_symlink() || !metadata.is_dir() {
         return Err(LpmError::Registry(format!(
             "refusing to remove package skill path that is not a regular directory: {}",
+            directory.display()
+        )));
+    }
+    if materialized_directory_manifest(&directory, &package).is_none() {
+        return Err(LpmError::Registry(format!(
+            "package skills contain local changes or an invalid manifest: {}. Back up and move this directory before retrying",
             directory.display()
         )));
     }

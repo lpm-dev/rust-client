@@ -306,70 +306,110 @@ fn parse_skill_frontmatter_with_description_limits(
     };
     let body = body.to_string();
 
-    // Simple YAML parsing (key: value, with list support for globs)
-    let mut in_globs = false;
-    let mut lines = yaml_section.lines().peekable();
-    while let Some(line) = lines.next() {
-        let trimmed = line.trim();
-        if trimmed.is_empty() || trimmed.starts_with('#') {
-            continue;
-        }
-
-        if in_globs {
-            if let Some(stripped) = trimmed.strip_prefix("- ") {
-                let glob = stripped.trim().trim_matches('"').trim_matches('\'');
-                meta.globs.push(glob.to_string());
-                continue;
-            } else {
-                in_globs = false;
+    if enforce_description_limits {
+        match serde_yaml::from_str::<serde_yaml::Mapping>(yaml_section) {
+            Ok(fields) => {
+                for (key, value) in fields {
+                    match key.as_str() {
+                        Some("name" | "description" | "version") => {
+                            let key = key.as_str().expect("matched string key");
+                            if let Some(text) = value.as_str() {
+                                let text = Some(text.trim().to_string());
+                                match key {
+                                    "name" => meta.name = text,
+                                    "description" => meta.description = text,
+                                    _ => meta.version = text,
+                                }
+                            } else {
+                                errors.push(format!("{key} field must be a string"));
+                            }
+                        }
+                        Some("globs") if value.is_null() => {}
+                        Some("globs") => {
+                            if let Some(values) = value.as_sequence()
+                                && values.iter().all(|value| value.is_string())
+                            {
+                                meta.globs = values
+                                    .iter()
+                                    .map(|value| value.as_str().unwrap().to_string())
+                                    .collect();
+                            } else {
+                                errors.push("globs field must be an array of strings".to_string());
+                            }
+                        }
+                        Some("context" | "hooks") => meta.requires_claude_code = true,
+                        _ => {}
+                    }
+                }
             }
+            Err(_) => errors.push("invalid YAML frontmatter".to_string()),
         }
-
-        if let Some((key, value)) = trimmed.split_once(':') {
-            let key = key.trim();
-            let raw_value = value.trim();
-
-            if allow_description_block_scalars
-                && key == "description"
-                && let Some(style) = block_scalar_style(raw_value)
-            {
-                let parent_indent = line.len() - line.trim_start().len();
-                meta.description = Some(parse_block_scalar(&mut lines, parent_indent, style));
+    } else {
+        // Simple YAML parsing (key: value, with list support for globs)
+        let mut in_globs = false;
+        let mut lines = yaml_section.lines().peekable();
+        while let Some(line) = lines.next() {
+            let trimmed = line.trim();
+            if trimmed.is_empty() || trimmed.starts_with('#') {
                 continue;
             }
 
-            if key == "globs" {
-                if raw_value.is_empty() {
-                    in_globs = true;
-                } else if let Some(inner) = raw_value
-                    .strip_prefix('[')
-                    .and_then(|value| value.strip_suffix(']'))
-                {
-                    meta.globs.extend(
-                        inner
-                            .split(',')
-                            .map(str::trim)
-                            .map(|glob| glob.trim_matches('"').trim_matches('\''))
-                            .filter(|glob| !glob.is_empty())
-                            .map(str::to_string),
-                    );
+            if in_globs {
+                if let Some(stripped) = trimmed.strip_prefix("- ") {
+                    let glob = stripped.trim().trim_matches('"').trim_matches('\'');
+                    meta.globs.push(glob.to_string());
+                    continue;
                 } else {
-                    errors.push("globs field must be an array of strings".to_string());
+                    in_globs = false;
                 }
-                continue;
             }
 
-            let value = raw_value.trim_matches('"').trim_matches('\'');
+            if let Some((key, value)) = trimmed.split_once(':') {
+                let key = key.trim();
+                let raw_value = value.trim();
 
-            match (key, value) {
-                ("name", value) => meta.name = Some(value.to_string()),
-                ("description", value) => meta.description = Some(value.to_string()),
-                ("version", "") => {
-                    errors.push("version field must be a string".to_string());
+                if allow_description_block_scalars
+                    && key == "description"
+                    && let Some(style) = block_scalar_style(raw_value)
+                {
+                    let parent_indent = line.len() - line.trim_start().len();
+                    meta.description = Some(parse_block_scalar(&mut lines, parent_indent, style));
+                    continue;
                 }
-                ("version", value) => meta.version = Some(value.to_string()),
-                ("context" | "hooks", _) => meta.requires_claude_code = true,
-                _ => {} // ignore unknown fields
+
+                if key == "globs" {
+                    if raw_value.is_empty() {
+                        in_globs = true;
+                    } else if let Some(inner) = raw_value
+                        .strip_prefix('[')
+                        .and_then(|value| value.strip_suffix(']'))
+                    {
+                        meta.globs.extend(
+                            inner
+                                .split(',')
+                                .map(str::trim)
+                                .map(|glob| glob.trim_matches('"').trim_matches('\''))
+                                .filter(|glob| !glob.is_empty())
+                                .map(str::to_string),
+                        );
+                    } else {
+                        errors.push("globs field must be an array of strings".to_string());
+                    }
+                    continue;
+                }
+
+                let value = raw_value.trim_matches('"').trim_matches('\'');
+
+                match (key, value) {
+                    ("name", value) => meta.name = Some(value.to_string()),
+                    ("description", value) => meta.description = Some(value.to_string()),
+                    ("version", "") => {
+                        errors.push("version field must be a string".to_string());
+                    }
+                    ("version", value) => meta.version = Some(value.to_string()),
+                    ("context" | "hooks", _) => meta.requires_claude_code = true,
+                    _ => {} // ignore unknown fields
+                }
             }
         }
     }
@@ -504,6 +544,19 @@ mod tests {
     use super::*;
 
     // ── Security scanning ──────────────────────────────────────────────
+
+    #[test]
+    fn published_skills_reject_ambiguous_yaml() {
+        for yaml in [
+            "name: first\nname: second\ndescription: A sufficiently long description",
+            "name: guide\ndescription: \"An unclosed description",
+            "name: guide\ndescription: A sufficiently long description\nglobs: [\"**/*.js\", 42]",
+        ] {
+            let (_, _, errors) =
+                parse_skill_frontmatter(&format!("---\n{yaml}\n---\nSkill body.\n"));
+            assert!(!errors.is_empty(), "invalid YAML was accepted: {yaml}");
+        }
+    }
 
     #[test]
     fn detects_curl_pipe_sh() {
@@ -972,30 +1025,28 @@ console.log(x);
     }
 
     #[test]
-    fn package_folded_description_uses_registry_literal_semantics() {
+    fn package_folded_description_is_parsed_as_yaml() {
         let content = "---\nname: my-skill\ndescription: >\n  A useful skill for\n  application developers.\n---\nBody";
 
         let (meta, _, errors) = parse_skill_frontmatter(content);
 
-        assert_eq!(meta.description.as_deref(), Some(">"));
-        assert!(
-            errors
-                .iter()
-                .any(|error| error.contains("description too short"))
+        assert_eq!(
+            meta.description.as_deref(),
+            Some("A useful skill for application developers.")
         );
+        assert!(errors.is_empty(), "{errors:?}");
     }
 
     #[test]
-    fn package_literal_description_uses_registry_literal_semantics() {
+    fn package_literal_description_is_parsed_as_yaml() {
         let content = "---\nname: my-skill\ndescription: |-\n  First paragraph.\n\n  Second paragraph.\n---\nBody";
 
         let (meta, _, errors) = parse_skill_frontmatter(content);
 
-        assert_eq!(meta.description.as_deref(), Some("|-"));
-        assert!(
-            errors
-                .iter()
-                .any(|error| error.contains("description too short"))
+        assert_eq!(
+            meta.description.as_deref(),
+            Some("First paragraph.\n\nSecond paragraph.")
         );
+        assert!(errors.is_empty(), "{errors:?}");
     }
 }

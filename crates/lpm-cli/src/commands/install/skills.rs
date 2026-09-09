@@ -18,7 +18,7 @@ pub(super) async fn install_skills_for_packages(
                     .unwrap_or(&package)
                     .to_string();
                 let response = client.get_skills(&short_name, Some(&version)).await?;
-                crate::commands::skills::package::validate(&response.skills)?;
+                crate::commands::skills::package::validate_response(&response)?;
                 Ok::<_, LpmError>((short_name, version, response.skills))
             }
         })
