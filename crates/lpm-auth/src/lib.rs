@@ -2260,8 +2260,26 @@ fn select_auth_key_material(
     authenticates_credentials: impl Fn(&str) -> bool,
     remove_file_key: impl FnOnce() -> Result<(), String>,
 ) -> Result<Option<AuthKeyMaterial>, String> {
-    let keyring_value = keyring_probe?;
     let file_value = file_probe?;
+    let keyring_value = match keyring_probe {
+        Ok(value) => value,
+        Err(error) => {
+            // A keyring outage must not disable an authenticated file store. Token
+            // authority and revocation are checked separately after decryption.
+            if let Some(value) = file_value {
+                if authenticates_credentials(&value) {
+                    return Ok(Some(AuthKeyMaterial {
+                        value,
+                        #[cfg(test)]
+                        source: AuthKeySource::File,
+                    }));
+                }
+            } else if !has_credentials {
+                return Ok(None);
+            }
+            return Err(error);
+        }
+    };
     match (keyring_value, file_value) {
         (Some(keyring), Some(file)) => {
             let keyring_authenticates = authenticates_credentials(&keyring);
@@ -4451,19 +4469,62 @@ mod tests {
         let value = encode_auth_key(&key);
         let iv = [7_u8; 12];
         let cipher = Aes256Gcm::new_from_slice(&key).unwrap();
-        let payload = cipher.encrypt(GenericArray::from_slice(&iv), b"saved credential".as_slice()).unwrap();
+        let payload = cipher
+            .encrypt(
+                GenericArray::from_slice(&iv),
+                b"saved credential".as_slice(),
+            )
+            .unwrap();
         let (ciphertext, tag) = payload.split_at(payload.len() - 16);
-        let encrypted = format!("{}:{}:{}", BASE64.encode(iv), BASE64.encode(tag), BASE64.encode(ciphertext));
+        let encrypted = format!(
+            "{}:{}:{}",
+            BASE64.encode(iv),
+            BASE64.encode(tag),
+            BASE64.encode(ciphertext)
+        );
         let selected = select_auth_key_material(
             Err("Secret Service unavailable".to_owned()),
             Ok(Some(value.clone())),
             true,
-            |candidate| decode_auth_key(candidate)
-                .is_ok_and(|key| decrypt_with_key(&encrypted, &key).is_ok()),
+            |candidate| {
+                decode_auth_key(candidate)
+                    .is_ok_and(|key| decrypt_with_key(&encrypted, &key).is_ok())
+            },
             || panic!("recovery must not remove the file key"),
-        ).expect("authenticated file key must remain usable").unwrap();
+        )
+        .expect("authenticated file key must remain usable")
+        .unwrap();
         assert_eq!(selected.source, AuthKeySource::File);
         assert_eq!(selected.value, value);
+    }
+
+    #[test]
+    fn unavailable_keyring_allows_initial_file_key_creation() {
+        assert!(
+            select_auth_key_material(
+                Err("Secret Service unavailable".to_owned()),
+                Ok(None),
+                false,
+                |_| false,
+                || panic!("no key to remove"),
+            )
+            .expect("a new headless account can create a file key")
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn unavailable_keyring_rejects_a_file_key_that_cannot_decrypt_credentials() {
+        assert!(
+            select_auth_key_material(
+                Err("Secret Service unavailable".to_owned()),
+                Ok(Some("raw:wrong".to_owned())),
+                true,
+                |_| false,
+                || panic!("failed recovery must preserve key material"),
+            )
+            .is_err()
+        );
     }
 
     #[test]

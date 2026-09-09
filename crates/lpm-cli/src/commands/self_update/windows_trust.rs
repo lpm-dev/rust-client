@@ -85,6 +85,7 @@ struct SecurityContext {
     administrators: LocalAlloc,
     trusted_installer: LocalAlloc,
     creator_owner: LocalAlloc,
+    owner_rights: LocalAlloc,
 }
 
 impl SecurityContext {
@@ -97,6 +98,7 @@ impl SecurityContext {
                 "S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464",
             )?,
             creator_owner: sid_from_sddl("S-1-3-0")?,
+            owner_rights: sid_from_sddl("S-1-3-4")?,
         })
     }
 
@@ -111,8 +113,14 @@ impl SecurityContext {
     }
 
     fn write_principal_is_trusted(&self, sid: PSID, owner: PSID) -> bool {
-        // SAFETY: both SIDs borrow live security descriptors or token storage.
-        (unsafe { EqualSid(sid, owner) != 0 }) || self.matches(sid, true)
+        if sid.is_null() || !self.owner_is_trusted(owner) {
+            return false;
+        }
+        // OWNER RIGHTS grants access to the descriptor owner, whose identity
+        // must be trusted before this alias can authorize writes.
+        // SAFETY: all SIDs borrow live descriptors, token storage, or `self`.
+        (unsafe { EqualSid(sid, owner) != 0 || EqualSid(sid, self.owner_rights.0.cast()) != 0 })
+            || self.matches(sid, true)
     }
 
     fn matches(&self, sid: PSID, include_creator_owner: bool) -> bool {
@@ -579,9 +587,32 @@ mod tests {
         let owner_rights = sid_from_sddl("S-1-3-4").unwrap();
         let everyone = sid_from_sddl("S-1-1-0").unwrap();
         assert!(context.write_principal_is_trusted(owner_rights.0.cast(), context.current_user()));
-        assert!(context.write_principal_is_trusted(owner_rights.0.cast(), context.administrators.0.cast()));
+        assert!(
+            context
+                .write_principal_is_trusted(owner_rights.0.cast(), context.administrators.0.cast())
+        );
         assert!(!context.write_principal_is_trusted(owner_rights.0.cast(), everyone.0.cast()));
         assert!(!context.owner_is_trusted(owner_rights.0.cast()));
+    }
+
+    #[test]
+    fn private_account_file_with_owner_rights_acl_is_trusted() {
+        let account = tempfile::tempdir().unwrap();
+        let file = account.path().join("manager.exe");
+        std::fs::write(&file, b"").unwrap();
+        let status = std::process::Command::new("icacls")
+            .arg(&file)
+            .args([
+                "/inheritance:r",
+                "/grant:r",
+                "*S-1-3-4:F",
+                "*S-1-5-18:F",
+                "*S-1-5-32-544:F",
+            ])
+            .status()
+            .unwrap();
+        assert!(status.success());
+        assert!(path_is_private_to_account(&file, account.path()));
     }
 
     #[test]

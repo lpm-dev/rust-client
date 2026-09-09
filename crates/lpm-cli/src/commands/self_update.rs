@@ -2206,14 +2206,17 @@ const MACOS_EXPECTED_ACCESS_GROUP: &str = "823S8YKMRW.dev.lpm.vault.shared";
 #[cfg(target_os = "macos")]
 const MACOS_EXPECTED_PROFILE_ACCESS_GROUP: &str = "823S8YKMRW.*";
 #[cfg(any(target_os = "macos", test))]
-const MACOS_REQUIRED_BUNDLE_FILES: [&str; 6] = [
+const MACOS_REQUIRED_BUNDLE_FILES: [&str; 5] = [
     "LPM CLI.app/Contents/Info.plist",
     "LPM CLI.app/Contents/CodeResources",
     "LPM CLI.app/Contents/embedded.provisionprofile",
     "LPM CLI.app/Contents/MacOS/lpm-rs",
-    "LPM CLI.app/Contents/Resources/LPMCLI.icns",
     "LPM CLI.app/Contents/_CodeSignature/CodeResources",
 ];
+// Icon resources were added after the first signed app release. Code-signature
+// validation still requires any resource sealed by the downloaded app.
+#[cfg(any(target_os = "macos", test))]
+const MACOS_OPTIONAL_BUNDLE_FILES: [&str; 1] = ["LPM CLI.app/Contents/Resources/LPMCLI.icns"];
 #[cfg(any(target_os = "macos", test))]
 const MACOS_ALLOWED_BUNDLE_DIRECTORIES: [&str; 5] = [
     "LPM CLI.app",
@@ -2388,10 +2391,11 @@ fn validate_macos_bundle_zip(archive_path: &Path) -> Result<(), LpmError> {
             }
         } else if required.contains(relative) {
             seen_required.insert(relative.to_string());
-        } else if !enclosed
-            .file_name()
-            .and_then(OsStr::to_str)
-            .is_some_and(|name| name.starts_with("._"))
+        } else if !MACOS_OPTIONAL_BUNDLE_FILES.contains(&relative)
+            && !enclosed
+                .file_name()
+                .and_then(OsStr::to_str)
+                .is_some_and(|name| name.starts_with("._"))
         {
             return Err(LpmError::SelfUpdate(format!(
                 "macOS app archive contains an unexpected entry: {relative}"
@@ -2479,7 +2483,6 @@ fn validate_macos_app_inventory(app_bundle: &Path) -> Result<(), LpmError> {
         PathBuf::from("Contents/CodeResources"),
         PathBuf::from("Contents/embedded.provisionprofile"),
         PathBuf::from("Contents/MacOS/lpm-rs"),
-        PathBuf::from("Contents/Resources/LPMCLI.icns"),
         PathBuf::from("Contents/_CodeSignature/CodeResources"),
     ]
     .into_iter()
@@ -2526,7 +2529,9 @@ fn validate_macos_app_inventory(app_bundle: &Path) -> Result<(), LpmError> {
                 }
                 stack.push(path);
             } else if metadata.is_file() {
-                if !expected_files.contains(relative) {
+                if !expected_files.contains(relative)
+                    && relative != Path::new("Contents/Resources/LPMCLI.icns")
+                {
                     return Err(LpmError::SelfUpdate(format!(
                         "staged macOS app bundle contains an unexpected file: {}",
                         relative.display()
@@ -2538,7 +2543,9 @@ fn validate_macos_app_inventory(app_bundle: &Path) -> Result<(), LpmError> {
                         "staged macOS app bundle exceeds its extracted-size limit".to_string(),
                     ));
                 }
-                seen_files.insert(relative.to_path_buf());
+                if expected_files.contains(relative) {
+                    seen_files.insert(relative.to_path_buf());
+                }
             } else {
                 return Err(LpmError::SelfUpdate(format!(
                     "staged macOS app bundle contains an unsupported file type: {}",
@@ -3450,12 +3457,68 @@ mod tests {
                 if name.ends_with(".icns") {
                     continue;
                 }
-                writer.start_file(name, zip::write::SimpleFileOptions::default()).unwrap();
+                writer
+                    .start_file(name, zip::write::SimpleFileOptions::default())
+                    .unwrap();
                 writer.write_all(b"signed payload").unwrap();
             }
             writer.finish().unwrap();
         }
-        validate_macos_bundle_zip(archive.path()).expect("pre-icon signed releases remain installable");
+        validate_macos_bundle_zip(archive.path())
+            .expect("pre-icon signed releases remain installable");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "requires signed release archives in LPM_TEST_MACOS_RELEASE_ARCHIVES"]
+    fn signed_macos_releases_pass_validation_and_reject_removed_sealed_resources() {
+        let archives = std::env::var_os("LPM_TEST_MACOS_RELEASE_ARCHIVES")
+            .expect("set LPM_TEST_MACOS_RELEASE_ARCHIVES to signed release ZIP paths");
+        let archives = std::env::split_paths(&archives).collect::<Vec<_>>();
+        assert!(!archives.is_empty());
+        let installation = tempfile::tempdir().unwrap();
+        let app_parent = installation.path().join("libexec");
+        let bin = installation.path().join("bin");
+        std::fs::create_dir_all(&app_parent).unwrap();
+        std::fs::create_dir_all(&bin).unwrap();
+        let layout = MacOSStandaloneLayout {
+            app_bundle: app_parent.join(MACOS_APP_NAME),
+            app_parent,
+            lpm_link: bin.join("lpm"),
+            lpx_link: bin.join("lpx"),
+        };
+        for archive in archives.iter().chain(archives.first()) {
+            let staged = stage_macos_bundle(archive, &layout.app_parent).unwrap();
+            let output = std::process::Command::new(&staged.executable)
+                .arg("--version")
+                .output()
+                .unwrap();
+            assert!(output.status.success());
+            let output = String::from_utf8(output.stdout).unwrap();
+            let version = output.trim().strip_prefix("lpm ").unwrap();
+            install_staged_macos_bundle(&layout, staged, version).unwrap();
+            for launcher in [&layout.lpm_link, &layout.lpx_link] {
+                let output = std::process::Command::new(launcher)
+                    .arg("--version")
+                    .output()
+                    .unwrap();
+                assert!(output.status.success());
+                assert!(String::from_utf8(output.stdout).unwrap().contains(version));
+            }
+        }
+        for archive in archives {
+            let parent = tempfile::tempdir().unwrap();
+            let staged = stage_macos_bundle(&archive, parent.path())
+                .unwrap_or_else(|error| panic!("{}: {error}", archive.display()));
+            let icon = staged.app_bundle.join("Contents/Resources/LPMCLI.icns");
+            let sealed = if icon.exists() {
+                icon
+            } else {
+                staged.executable.clone()
+            };
+            std::fs::remove_file(sealed).unwrap();
+            assert!(validate_macos_app_bundle(&staged.app_bundle).is_err());
+        }
     }
 
     #[test]

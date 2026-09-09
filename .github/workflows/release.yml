@@ -1539,6 +1539,7 @@ jobs:
             -f target_commitish="$GITHUB_SHA" \
             --jq '.body' > "$RUNNER_TEMP/release-notes.md"
           test -s "$RUNNER_TEMP/release-notes.md"
+          cat npm/release/upgrade-recovery.md >> "$RUNNER_TEMP/release-notes.md"
 
       - name: Create draft GitHub Release
         if: needs.release-metadata.outputs.mode == 'full'
@@ -2267,6 +2268,7 @@ jobs:
             -f target_commitish="$SOURCE_SHA" \
             --jq '.body' > "$RUNNER_TEMP/release-notes.md"
           test -s "$RUNNER_TEMP/release-notes.md"
+          cat npm/release/upgrade-recovery.md >> "$RUNNER_TEMP/release-notes.md"
           echo "publish=true" >> "$GITHUB_OUTPUT"
 
       - name: Create draft and upload exact assets

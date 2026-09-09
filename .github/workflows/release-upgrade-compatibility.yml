@@ -52,3 +52,26 @@ jobs:
       - name: Shell installer regressions
         if: always() && runner.os != 'Windows'
         run: sh tests/install-sh/run.sh
+      - name: Real Linux headless credential upgrade
+        if: runner.os == 'Linux'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cargo build --locked -p lpm-cli
+          mkdir -p "$RUNNER_TEMP/old-cli"
+          gh release download v0.76.5 --repo lpm-dev/rust-client --dir "$RUNNER_TEMP/old-cli" --pattern lpm-linux-x64 --pattern SHA256SUMS.txt
+          (cd "$RUNNER_TEMP/old-cli" && grep '  lpm-linux-x64$' SHA256SUMS.txt | sha256sum --check)
+          chmod +x "$RUNNER_TEMP/old-cli/lpm-linux-x64"
+          python3 scripts/ci/test-headless-auth-upgrade.py "$RUNNER_TEMP/old-cli/lpm-linux-x64" target/debug/lpm-rs
+      - name: Validate real signed macOS releases
+        if: runner.os == 'macOS'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          for tag in v0.76.5 v0.77.0-nightly.20260909.177.e3196a5; do
+            mkdir -p "$RUNNER_TEMP/$tag"
+            gh release download "$tag" --repo lpm-dev/rust-client --dir "$RUNNER_TEMP/$tag" --pattern lpm-darwin-arm64.zip --pattern SHA256SUMS.txt
+            (cd "$RUNNER_TEMP/$tag" && grep '  lpm-darwin-arm64.zip$' SHA256SUMS.txt | shasum -a 256 --check)
+          done
+          export LPM_TEST_MACOS_RELEASE_ARCHIVES="$RUNNER_TEMP/v0.76.5/lpm-darwin-arm64.zip:$RUNNER_TEMP/v0.77.0-nightly.20260909.177.e3196a5/lpm-darwin-arm64.zip"
+          cargo test --locked -p lpm-cli --bin lpm-rs signed_macos_releases_pass_validation -- --ignored --nocapture

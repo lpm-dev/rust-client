@@ -279,6 +279,33 @@ run_shell_setup_tests() {
       grep -Fqx "fish_add_path -- '$shell_home/.lpm/bin'" "$shell_home/.config/fish/config.fish" \
         || fail "Fish path must be one quoted argument"
       ;;
+    literal-shell-paths)
+      for shell_name in bash zsh fish; do
+        shell_bin="$(command -v "$shell_name" || true)"
+        if [ -z "$shell_bin" ]; then
+          echo "SKIP: $shell_name is unavailable for native PATH evaluation"
+          continue
+        fi
+        shell_home="$shell_fixture/home space ' quote \\\\ slash \$dollar \$(false)"
+        mkdir -p "$shell_home/.config/fish"
+        SHELL="$shell_bin" RUN_INSTALL_ROOT_OVERRIDE="$shell_home" run_install_sh
+        [ "$RUN_RC" -eq 0 ] || fail "Special-character installation failed: $RUN_OUT"
+        case "$shell_name" in
+          fish)
+            shell_rc="$shell_home/.config/fish/config.fish"
+            HOME="$shell_home" LPM_TEST_RC="$shell_rc" LPM_TEST_BIN="$shell_home/.lpm/bin" \
+              "$shell_bin" --no-config -c 'source "$LPM_TEST_RC"; contains -- "$LPM_TEST_BIN" $PATH' \
+              || fail "Fish did not preserve the literal installation path"
+            ;;
+          *)
+            shell_rc="$shell_home/.${shell_name}rc"
+            HOME="$shell_home" LPM_TEST_RC="$shell_rc" LPM_TEST_BIN="$shell_home/.lpm/bin" \
+              "$shell_bin" -c '. "$LPM_TEST_RC"; case ":$PATH:" in *":$LPM_TEST_BIN:"*) exit 0;; *) exit 1;; esac' \
+              || fail "$shell_name did not preserve the literal installation path"
+            ;;
+        esac
+      done
+      ;;
     repeated-path-setup)
       for shell_name in bash zsh fish; do
         shell_home="$shell_fixture/$shell_name"
@@ -789,7 +816,7 @@ rm -rf "$fdir"
 pass "LPM_INSTALL_INSECURE=1 bypasses missing-manifest gate"
 
 echo
-for scenario in missing-fish-directory quoted-fish-path repeated-path-setup; do
+for scenario in missing-fish-directory quoted-fish-path repeated-path-setup literal-shell-paths; do
   run_shell_setup_tests "$scenario"
 done
 

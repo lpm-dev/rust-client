@@ -781,12 +781,20 @@ case ":$PATH:" in
 
     if [ -n "$RC" ]; then
       if [ "$SHELL_NAME" = "fish" ]; then
-        echo "fish_add_path $INSTALL_DIR" >> "$RC"
+        QUOTED_INSTALL_DIR="$(printf '%s' "$INSTALL_DIR" | sed -e 's/\\/\\\\/g' -e "s/'/\\\\'/g")"
+        PATH_LINE="fish_add_path -- '$QUOTED_INSTALL_DIR'"
       else
-        echo "export PATH=\"$INSTALL_DIR:\$PATH\"" >> "$RC"
+        QUOTED_INSTALL_DIR="$(printf '%s' "$INSTALL_DIR" | sed "s/'/'\\\\''/g")"
+        PATH_LINE="export PATH='$QUOTED_INSTALL_DIR':\"\$PATH\""
       fi
-      echo "Added $INSTALL_DIR to PATH in $RC"
-      echo "Run: source $RC (or open a new terminal)"
+      mkdir -p "$(dirname "$RC")"
+      if [ ! -f "$RC" ] || ! grep -Fqx -- "$PATH_LINE" "$RC"; then
+        printf '\n%s\n' "$PATH_LINE" >> "$RC"
+        echo "Added $INSTALL_DIR to PATH in $RC"
+      else
+        echo "PATH is already configured in $RC"
+      fi
+      echo "Open a new terminal to use lpm."
     else
       echo "Add $INSTALL_DIR to your PATH manually."
     fi
