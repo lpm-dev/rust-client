@@ -1,0 +1,73 @@
+name: Complex workspace acceptance
+
+on:
+  push:
+    branches: [codex/complex-workspace-acceptance]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_INCREMENTAL: '0'
+  CARGO_PROFILE_DEV_DEBUG: '0'
+  CARGO_PROFILE_TEST_DEBUG: '0'
+
+jobs:
+  consumer:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, windows-2025]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 35
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
+      - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9
+        with:
+          toolchain: '1.94.0'
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e
+        with:
+          node-version: '22'
+      - uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-workspace-acceptance-1.94.0-${{ hashFiles('Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-release-upgrade-1.94.0-
+      - name: Linux native dependencies
+        if: runner.os == 'Linux'
+        run: bash scripts/ci/install-apt-packages.sh pkg-config libdbus-1-dev
+      - name: Build the current CLI
+        run: cargo build --locked -p lpm-cli
+      - name: Record deterministic workspace scenarios
+        continue-on-error: true
+        env:
+          LPM_WORKSPACE_ACCEPTANCE_EVIDENCE: ${{ runner.temp }}/workspace-evidence
+        run: |
+          set -o pipefail
+          cargo test --locked -p lpm-workflows --test workspace_acceptance -- --test-threads=2 2>&1 | tee "$RUNNER_TEMP/workspace-matrix.log"
+      - name: Replay the macOS lockfile with native npm dependencies
+        if: always()
+        continue-on-error: true
+        run: |
+          binary=target/debug/lpm-rs
+          if [ "$RUNNER_OS" = Windows ]; then binary="$binary.exe"; fi
+          python3 scripts/ci/test-complex-workspace-consumer.py --binary "$binary" --fixture tests/fixtures/complex-workspace-portable --output "$RUNNER_TEMP/native-consumer"
+      - name: Archive evidence and command results
+        if: always()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f
+        with:
+          name: complex-workspace-${{ matrix.os }}
+          retention-days: 14
+          path: |
+            ${{ runner.temp }}/workspace-matrix.log
+            ${{ runner.temp }}/workspace-evidence
+            ${{ runner.temp }}/native-consumer/*.log
+            ${{ runner.temp }}/native-consumer/results.json
+            ${{ runner.temp }}/native-consumer/portable-fixture

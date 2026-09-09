@@ -1,0 +1,11 @@
+{
+  "name": "@acceptance/modern",
+  "version": "1.0.0",
+  "private": true,
+  "dependencies": {
+    "react": "catalog:modern",
+    "react-dom": "catalog:modern",
+    "rollup": "catalog:modern",
+    "is-odd": "3.0.1"
+  }
+}
