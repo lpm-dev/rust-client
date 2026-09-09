@@ -321,11 +321,7 @@ pub async fn run(
     // it needs to verify the CMS signatures attached to LPM packages.
     let cert_outcome = install_signing_certificate(&swift_registry_url, json_output, force).await?;
 
-    // Step 4: Configure signing trust policy in registries.json. Fatal
-    // on failure — without the lpmdev scope override, SPM rejects every
-    // signed LPM package as "untrusted signer" because the cert is
-    // self-signed and not a CA root.
-    let trust_outcome = configure_signing_trust(json_output)?;
+    let trust_outcome = configure_signing_trust(registry_url, json_output)?;
 
     let cert_outcome_label = match cert_outcome {
         CertOutcome::Installed => "installed",
@@ -346,10 +342,6 @@ pub async fn run(
             "signing_trust_configured": true,
             "signing_certificate_outcome": cert_outcome_label,
             "signing_trust_outcome": trust_outcome_label,
-            // Trust-model honesty: signer authentication is bypassed for
-            // the lpmdev scope (silentAllow); the trust anchor is the
-            // HTTPS connection to the LPM registry, not a cert chain.
-            // See docs/packages/swift-package-registry.mdx.
             "trust_anchor": "https",
             "signer_trust_policy": "silentAllow",
         });
@@ -513,7 +505,7 @@ pub async fn ensure_configured(
     }
 
     let certificate = install_signing_certificate(&swift_registry_url, json_output, false).await?;
-    let trust = configure_signing_trust(json_output)?;
+    let trust = configure_signing_trust(registry_url, json_output)?;
 
     Ok(SwiftRegistrySetupOutcome {
         scope_repaired: !scope_matches,
@@ -689,34 +681,24 @@ async fn install_signing_certificate(
     Ok(CertOutcome::Installed)
 }
 
-/// Configure SPM's signing trust policy in ~/.swiftpm/configuration/registries.json.
-///
-/// Two distinct concerns this function addresses:
-///
-/// 1. The registries.json `security.default.signing` defaults stay strict for
-///    every registry. LPM never weakens unrelated registry scopes.
-/// 2. A scope override pinning `lpmdev` to `onUntrustedCertificate = "silentAllow"`.
-///    LPM's signing cert is a self-signed, non-CA, code-signing-only cert; SPM
-///    rejects it as a trust root because trust roots must have
-///    basicConstraints CA=true. The override tells SPM "trust packages from
-///    the lpmdev scope without the cert being in a system trust store" —
-///    the CMS detached signature is still cryptographically verified, but
-///    signer authentication is anchored in HTTPS to lpm.dev rather than a
-///    cert chain. See docs/infra/secrets-vault.mdx and
-///    docs/packages/swift-package-registry.mdx for the trust-model rationale.
-///
-/// Idempotent — already-configured registries.json files short-circuit with
-/// `TrustOutcome::AlreadyConfigured`. Mkdir / write failures surface as
-/// `Err(LpmError::Registry(...))`; without the registries.json side, SPM
-/// would reject every signed package the cert covers, so silent failure is
-/// not an acceptable mode here.
-fn configure_signing_trust(json_output: bool) -> Result<TrustOutcome, LpmError> {
+/// Configure the registry host's HTTPS-anchored signer policy while retaining
+/// strict defaults for other registries. SwiftPM only supports signing actions
+/// in registry overrides, not scope overrides.
+fn configure_signing_trust(
+    registry_url: &str,
+    json_output: bool,
+) -> Result<TrustOutcome, LpmError> {
     let home = dirs::home_dir().ok_or_else(|| {
         LpmError::Registry(
             "could not determine home directory for SPM signing trust configuration".into(),
         )
     })?;
 
+    let registry = reqwest::Url::parse(registry_url)
+        .map_err(|error| LpmError::Registry(format!("invalid Swift registry URL: {error}")))?;
+    let registry_host = registry
+        .host_str()
+        .ok_or_else(|| LpmError::Registry("Swift registry URL must contain a host".into()))?;
     let config_path = home.join(".swiftpm/configuration/registries.json");
 
     // Read existing config or start fresh
@@ -731,8 +713,7 @@ fn configure_signing_trust(json_output: bool) -> Result<TrustOutcome, LpmError> 
         Err(error) => return Err(LpmError::Registry(error.to_string())),
     };
 
-    // Check if scope override for lpmdev is already configured
-    let already_configured = signing_trust_is_valid(&config);
+    let already_configured = signing_trust_is_valid(&config, registry_host);
 
     if already_configured {
         if !json_output {
@@ -744,6 +725,13 @@ fn configure_signing_trust(json_output: bool) -> Result<TrustOutcome, LpmError> 
     if !config.is_object() {
         config = serde_json::json!({ "version": 1 });
     }
+
+    let root = ensure_json_object(&mut config)?;
+    root.insert("version".to_string(), serde_json::json!(1));
+    ensure_json_object(
+        root.entry("registries")
+            .or_insert_with(|| serde_json::json!({})),
+    )?;
 
     // Merge security config — preserve any existing keys
     let security = ensure_json_object(&mut config)?
@@ -761,16 +749,24 @@ fn configure_signing_trust(json_output: bool) -> Result<TrustOutcome, LpmError> 
     repair_default_signing_policy(signing_obj, "onUnsigned");
     repair_default_signing_policy(signing_obj, "onUntrustedCertificate");
 
-    let scope_overrides = ensure_json_object(security)?
-        .entry("scopeOverrides")
+    if let Some(scope_signing) = security
+        .get_mut("scopeOverrides")
+        .and_then(|value| value.get_mut("lpmdev"))
+        .and_then(|value| value.get_mut("signing"))
+        .and_then(serde_json::Value::as_object_mut)
+    {
+        scope_signing.remove("onUntrustedCertificate");
+    }
+    let registry_overrides = ensure_json_object(security)?
+        .entry("registryOverrides")
         .or_insert_with(|| serde_json::json!({}));
-    let lpmdev_scope = ensure_json_object(scope_overrides)?
-        .entry("lpmdev")
+    let registry = ensure_json_object(registry_overrides)?
+        .entry(registry_host)
         .or_insert_with(|| serde_json::json!({}));
-    let scope_signing = ensure_json_object(lpmdev_scope)?
+    let registry_signing = ensure_json_object(registry)?
         .entry("signing")
         .or_insert_with(|| serde_json::json!({}));
-    ensure_json_object(scope_signing)?.insert(
+    ensure_json_object(registry_signing)?.insert(
         "onUntrustedCertificate".to_string(),
         serde_json::Value::String("silentAllow".to_string()),
     );
@@ -830,7 +826,17 @@ fn repair_default_signing_policy(
     }
 }
 
-fn signing_trust_is_valid(config: &serde_json::Value) -> bool {
+fn signing_trust_is_valid(config: &serde_json::Value, registry_host: &str) -> bool {
+    if config.get("version").and_then(serde_json::Value::as_u64) != Some(1)
+        || !config
+            .get("registries")
+            .is_some_and(serde_json::Value::is_object)
+        || config
+            .pointer("/security/scopeOverrides/lpmdev/signing/onUntrustedCertificate")
+            .is_some()
+    {
+        return false;
+    }
     let signing = config
         .get("security")
         .and_then(|security| security.get("default"))
@@ -842,8 +848,8 @@ fn signing_trust_is_valid(config: &serde_json::Value) -> bool {
             );
     let override_matches = config
         .get("security")
-        .and_then(|s| s.get("scopeOverrides"))
-        .and_then(|o| o.get("lpmdev"))
+        .and_then(|s| s.get("registryOverrides"))
+        .and_then(|o| o.get(registry_host))
         .and_then(|l| l.get("signing"))
         .and_then(|s| s.get("onUntrustedCertificate"))
         .and_then(|v| v.as_str())
@@ -976,6 +982,7 @@ mod tests {
     fn complete_signing_trust() -> serde_json::Value {
         serde_json::json!({
             "version": 1,
+            "registries": {},
             "security": {
                 "default": {
                     "signing": {
@@ -983,8 +990,8 @@ mod tests {
                         "onUntrustedCertificate": "error"
                     }
                 },
-                "scopeOverrides": {
-                    "lpmdev": {
+                "registryOverrides": {
+                    "127.0.0.1": {
                         "signing": {
                             "onUntrustedCertificate": "silentAllow"
                         }
@@ -1449,79 +1456,22 @@ exit 64
         );
     }
 
-    // configure_signing_trust tests use the real home dir, so we test the
-    // serialization/merge logic on mock JSON structures instead.
     #[test]
-    fn signing_trust_config_merges_into_existing_json() {
-        let mut config = serde_json::json!({
+    fn signing_trust_preserves_existing_authentication_configuration() {
+        let _guard = home_env_lock().blocking_lock();
+        let home = TempDir::new().unwrap();
+        let _home = HomeOverride::new(home.path());
+        let config = serde_json::json!({
             "version": 1,
             "authentication": {
                 "lpm.dev": { "loginAPIPath": "/api/swift-registry", "type": "token" }
             },
             "registries": {}
         });
-
-        // Simulate the merge logic from configure_signing_trust
-        let security = config
-            .as_object_mut()
-            .unwrap()
-            .entry("security")
-            .or_insert_with(|| serde_json::json!({}));
-        let default = security
-            .as_object_mut()
-            .unwrap()
-            .entry("default")
-            .or_insert_with(|| serde_json::json!({}));
-        let signing = default
-            .as_object_mut()
-            .unwrap()
-            .entry("signing")
-            .or_insert_with(|| serde_json::json!({}));
-        signing
-            .as_object_mut()
-            .unwrap()
-            .entry("onUnsigned")
-            .or_insert_with(|| serde_json::Value::String("error".into()));
-
-        let scope_overrides = security
-            .as_object_mut()
-            .unwrap()
-            .entry("scopeOverrides")
-            .or_insert_with(|| serde_json::json!({}));
-        let lpmdev = scope_overrides
-            .as_object_mut()
-            .unwrap()
-            .entry("lpmdev")
-            .or_insert_with(|| serde_json::json!({}));
-        let scope_signing = lpmdev
-            .as_object_mut()
-            .unwrap()
-            .entry("signing")
-            .or_insert_with(|| serde_json::json!({}));
-        scope_signing.as_object_mut().unwrap().insert(
-            "onUntrustedCertificate".into(),
-            serde_json::Value::String("silentAllow".into()),
-        );
-
-        // Existing keys preserved
-        assert_eq!(config["version"], 1);
-        assert_eq!(
-            config["authentication"]["lpm.dev"]["type"].as_str(),
-            Some("token")
-        );
-
-        // Default signing policy added
-        assert_eq!(
-            config["security"]["default"]["signing"]["onUnsigned"].as_str(),
-            Some("error")
-        );
-
-        // Scope override for lpmdev added
-        assert_eq!(
-            config["security"]["scopeOverrides"]["lpmdev"]["signing"]["onUntrustedCertificate"]
-                .as_str(),
-            Some("silentAllow")
-        );
+        let path = write_global_signing_trust(home.path(), &config);
+        configure_signing_trust("https://lpm.dev", true).unwrap();
+        let updated: serde_json::Value = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
+        assert_eq!(updated["authentication"], config["authentication"]);
     }
 
     /// First-run cert install must fail-closed when the registry returns
@@ -1697,17 +1647,18 @@ exit 64
         assert!(err.to_string().contains("503") || err.to_string().contains("not available"));
     }
 
-    /// `configure_signing_trust` writes the lpmdev silentAllow scope
+    /// `configure_signing_trust` writes the registry silentAllow
     /// override into a fresh `~/.swiftpm/configuration/registries.json`.
     /// Pin the produced shape so the trust-anchor docs and the file
     /// contents stay aligned.
     #[test]
-    fn configure_signing_trust_writes_scope_override_for_lpmdev() {
+    fn configure_signing_trust_writes_registry_override_for_lpm_host() {
         let _guard = home_env_lock().blocking_lock();
         let temp_home = TempDir::new().unwrap();
         let _home = HomeOverride::new(temp_home.path());
 
-        let outcome = configure_signing_trust(true).expect("trust config should succeed");
+        let outcome =
+            configure_signing_trust("https://lpm.dev", true).expect("trust config should succeed");
         assert_eq!(outcome, TrustOutcome::Configured);
 
         let config_path = temp_home
@@ -1716,15 +1667,16 @@ exit 64
         let content = fs::read_to_string(&config_path).expect("registries.json should be written");
         let json: serde_json::Value = serde_json::from_str(&content).unwrap();
         assert_eq!(
-            json["security"]["scopeOverrides"]["lpmdev"]["signing"]["onUntrustedCertificate"]
+            json["security"]["registryOverrides"]["lpm.dev"]["signing"]["onUntrustedCertificate"]
                 .as_str(),
             Some("silentAllow"),
-            "lpmdev scope must pin onUntrustedCertificate=silentAllow"
+            "registry host must pin onUntrustedCertificate=silentAllow"
         );
 
         // Idempotent re-run on the same registries.json reports
         // AlreadyConfigured, no rewrite.
-        let outcome2 = configure_signing_trust(true).expect("idempotent re-run should succeed");
+        let outcome2 = configure_signing_trust("https://lpm.dev", true)
+            .expect("idempotent re-run should succeed");
         assert_eq!(outcome2, TrustOutcome::AlreadyConfigured);
     }
 
@@ -1906,7 +1858,7 @@ exit 64
 
         let repaired: serde_json::Value =
             serde_json::from_slice(&fs::read(config_path).unwrap()).unwrap();
-        assert!(signing_trust_is_valid(&repaired));
+        assert!(signing_trust_is_valid(&repaired, "127.0.0.1"));
     }
 
     #[tokio::test]
@@ -1932,7 +1884,7 @@ exit 64
 
         let repaired: serde_json::Value =
             serde_json::from_slice(&fs::read(config_path).unwrap()).unwrap();
-        assert!(signing_trust_is_valid(&repaired));
+        assert!(signing_trust_is_valid(&repaired, "127.0.0.1"));
         assert_eq!(
             repaired["security"]["default"]["signing"]["onUnsigned"],
             "error"

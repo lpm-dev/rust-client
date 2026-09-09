@@ -574,7 +574,7 @@ fn prepare_publish_project_from_manifest_with_hook(
         .transpose()?;
 
     let (detected_ecosystem, swift_manifest) =
-        detect_publish_ecosystem(&tarball_data, &prepared_tarball.files, lpm_config.as_ref());
+        detect_publish_ecosystem(&tarball_data, &prepared_tarball.files, lpm_config.as_ref())?;
     validate_named_project_root(
         &project_root,
         &package_json_parent_identity,
@@ -757,7 +757,7 @@ pub(super) fn detect_publish_ecosystem(
     tarball_data: &[u8],
     tarball_files: &[publish_common::TarballFile],
     lpm_config: Option<&serde_json::Value>,
-) -> (String, Option<serde_json::Value>) {
+) -> Result<(String, Option<serde_json::Value>), LpmError> {
     let mut detected_ecosystem = "js".to_string();
     if let Some(config) = lpm_config
         && let Some(eco) = config.get("ecosystem").and_then(|v| v.as_str())
@@ -773,15 +773,17 @@ pub(super) fn detect_publish_ecosystem(
     }
 
     let swift_manifest = if detected_ecosystem == "swift" {
-        dump_swift_manifest_from_publish_artifact(tarball_data)
+        Some(dump_swift_manifest_from_publish_artifact(tarball_data)?)
     } else {
         None
     };
 
-    (detected_ecosystem, swift_manifest)
+    Ok((detected_ecosystem, swift_manifest))
 }
 
-fn dump_swift_manifest_from_publish_artifact(tarball_data: &[u8]) -> Option<serde_json::Value> {
+fn dump_swift_manifest_from_publish_artifact(
+    tarball_data: &[u8],
+) -> Result<serde_json::Value, LpmError> {
     dump_swift_manifest_from_publish_artifact_with_command(
         tarball_data,
         std::ffi::OsStr::new("swift"),
@@ -795,12 +797,12 @@ fn dump_swift_manifest_from_publish_artifact_with_command(
     program: &std::ffi::OsStr,
     timeout: std::time::Duration,
     output_limit: usize,
-) -> Option<serde_json::Value> {
+) -> Result<serde_json::Value, LpmError> {
     use std::io::Write as _;
 
-    let snapshot = tempfile::tempdir().ok()?;
+    let snapshot = tempfile::tempdir().map_err(LpmError::Io)?;
     let package_root = snapshot.path().join("package");
-    std::fs::create_dir(&package_root).ok()?;
+    std::fs::create_dir(&package_root).map_err(LpmError::Io)?;
     let decoder = flate2::read::GzDecoder::new(tarball_data);
     let archive_limits = lpm_extractor::TarArchiveLimits {
         max_entry_bytes: publish_common::MAX_UNCOMPRESSED_TARBALL_BYTES,
@@ -852,11 +854,41 @@ fn dump_swift_manifest_from_publish_artifact_with_command(
         file.flush().map_err(LpmError::Io)?;
         Ok(std::ops::ControlFlow::<()>::Continue(()))
     })
-    .ok()?;
+    .map_err(swift_inspection_error)?;
+    #[cfg(target_os = "macos")]
+    let apple_developer_dir = if program == std::ffi::OsStr::new("swift") {
+        Some(apple_swift_developer_directory()?)
+    } else {
+        None
+    };
+    #[cfg(target_os = "macos")]
+    let apple_sdk = apple_developer_dir
+        .as_ref()
+        .map(|developer_dir| {
+            let sdk = if developer_dir.ends_with("Contents/Developer") {
+                developer_dir.join("Platforms/MacOSX.platform/Developer/SDKs/MacOSX.sdk")
+            } else {
+                developer_dir.join("SDKs/MacOSX.sdk")
+            };
+            sdk.canonicalize().map_err(swift_inspection_error)
+        })
+        .transpose()?;
     #[cfg(not(test))]
     let sandbox_program = program.to_owned();
     #[cfg(test)]
-    let sandbox_program = stage_swift_manifest_test_program(program, &package_root)?;
+    let sandbox_program = stage_swift_manifest_test_program(program, &package_root)
+        .ok_or_else(|| swift_inspection_error("could not stage the test inspector"))?;
+    #[cfg(target_os = "macos")]
+    let sandbox_program = if let Some(developer_dir) = &apple_developer_dir {
+        let swift = if developer_dir.ends_with("Contents/Developer") {
+            developer_dir.join("Toolchains/XcodeDefault.xctoolchain/usr/bin/swift")
+        } else {
+            developer_dir.join("usr/bin/swift")
+        };
+        swift.into_os_string()
+    } else {
+        sandbox_program
+    };
     let sandbox_home = snapshot.path().join("home");
     let sandbox_cache = snapshot.path().join("cache");
     let sandbox_store = snapshot.path().join("store");
@@ -869,7 +901,7 @@ fn dump_swift_manifest_from_publish_artifact_with_command(
         &swiftpm_module_cache,
         &clang_module_cache,
     ] {
-        std::fs::create_dir_all(directory).ok()?;
+        std::fs::create_dir_all(directory).map_err(LpmError::Io)?;
     }
     let spec = lpm_sandbox::SandboxSpec {
         package_dir: package_root.clone(),
@@ -885,6 +917,8 @@ fn dump_swift_manifest_from_publish_artifact_with_command(
     let options = lpm_sandbox::SandboxOptions {
         deny_outbound_network: true,
         build_cache_isolation: true,
+        #[cfg(target_os = "macos")]
+        apple_developer_dir: apple_developer_dir.clone(),
         ..lpm_sandbox::SandboxOptions::default()
     };
     let sandbox = lpm_sandbox::new_for_platform_with_options(
@@ -892,9 +926,11 @@ fn dump_swift_manifest_from_publish_artifact_with_command(
         lpm_sandbox::SandboxMode::Enforce,
         options,
     )
-    .ok()?;
+    .map_err(swift_inspection_error)?;
     if sandbox.posture() != lpm_sandbox::SandboxPosture::Strict {
-        return None;
+        return Err(swift_inspection_error(
+            "strict process isolation is unavailable",
+        ));
     }
     let environment = [
         (
@@ -922,22 +958,43 @@ fn dump_swift_manifest_from_publish_artifact_with_command(
             clang_module_cache.as_os_str().to_owned(),
         ),
     ];
+    #[cfg(target_os = "macos")]
+    let environment = {
+        let mut environment = Vec::from(environment);
+        if let Some(developer_dir) = &apple_developer_dir {
+            environment.push(("DEVELOPER_DIR".into(), developer_dir.as_os_str().to_owned()));
+        }
+        if let Some(sdk) = &apple_sdk {
+            environment.push(("SDKROOT".into(), sdk.as_os_str().to_owned()));
+        }
+        environment
+    };
     let mut command = lpm_sandbox::SandboxedCommand::new(sandbox_program)
         .arg("package")
+        .arg("--disable-sandbox");
+    #[cfg(target_os = "macos")]
+    if let Some(sdk) = &apple_sdk {
+        command = command.arg("--sdk").arg(sdk);
+    }
+    command = command
         .arg("dump-package")
         .current_dir(package_root)
         .envs_cleared(environment);
     command.stdin = lpm_sandbox::SandboxStdio::Null;
     command.stdout = lpm_sandbox::SandboxStdio::Piped;
     command.stderr = lpm_sandbox::SandboxStdio::Piped;
-    let mut child = sandbox.spawn(command).ok()?;
+    let mut child = sandbox.spawn(command).map_err(swift_inspection_error)?;
     let Some(stdout) = child.stdout.take() else {
         terminate_swift_manifest_child(&mut child);
-        return None;
+        return Err(swift_inspection_error(
+            "could not capture Swift compiler output",
+        ));
     };
     let Some(stderr) = child.stderr.take() else {
         terminate_swift_manifest_child(&mut child);
-        return None;
+        return Err(swift_inspection_error(
+            "could not capture Swift compiler output",
+        ));
     };
     let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let stdout_reader = match spawn_bounded_swift_output_reader(
@@ -947,9 +1004,9 @@ fn dump_swift_manifest_from_publish_artifact_with_command(
         "lpm-swift-manifest-stdout",
     ) {
         Ok(reader) => reader,
-        Err(_) => {
+        Err(error) => {
             terminate_swift_manifest_child(&mut child);
-            return None;
+            return Err(swift_inspection_error(error));
         }
     };
     let stderr_reader = match spawn_bounded_swift_output_reader(
@@ -959,10 +1016,10 @@ fn dump_swift_manifest_from_publish_artifact_with_command(
         "lpm-swift-manifest-stderr",
     ) {
         Ok(reader) => reader,
-        Err(_) => {
+        Err(error) => {
             terminate_swift_manifest_child(&mut child);
             let _ = stdout_reader.join();
-            return None;
+            return Err(swift_inspection_error(error));
         }
     };
     let status = crate::commands::rebuild::process_tree::wait_with_timeout_or_cancel(
@@ -971,12 +1028,46 @@ fn dump_swift_manifest_from_publish_artifact_with_command(
         &cancelled,
         "Swift manifest output exceeded the configured limit",
     );
-    let stdout = stdout_reader.join().ok()?.ok()?;
-    let stderr = stderr_reader.join().ok()?.ok()?;
-    if !status.ok()?.success() || stdout.len() > output_limit || stderr.len() > output_limit {
-        return None;
+    let stdout = stdout_reader
+        .join()
+        .map_err(|_| swift_inspection_error("Swift output reader failed"))?
+        .map_err(swift_inspection_error)?;
+    let stderr = stderr_reader
+        .join()
+        .map_err(|_| swift_inspection_error("Swift diagnostic reader failed"))?
+        .map_err(swift_inspection_error)?;
+    let status = status.map_err(swift_inspection_error)?;
+    if !status.success() {
+        let diagnostic = String::from_utf8_lossy(&stderr)
+            .chars()
+            .take(4096)
+            .collect::<String>();
+        let diagnostic = lpm_common::sanitize_terminal_inline(&diagnostic);
+        return Err(swift_inspection_error(format!("{status}: {diagnostic}")));
     }
-    serde_json::from_slice::<serde_json::Value>(&stdout).ok()
+    serde_json::from_slice::<serde_json::Value>(&stdout).map_err(swift_inspection_error)
+}
+
+fn swift_inspection_error(error: impl std::fmt::Display) -> LpmError {
+    LpmError::Registry(format!(
+        "Swift manifest inspection failed: {error}. Fix Package.swift or install a compatible Swift toolchain before publishing."
+    ))
+}
+
+#[cfg(target_os = "macos")]
+fn apple_swift_developer_directory() -> Result<std::path::PathBuf, LpmError> {
+    let output = std::process::Command::new("/usr/bin/xcode-select")
+        .arg("--print-path")
+        .env_clear()
+        .output()
+        .map_err(swift_inspection_error)?;
+    if !output.status.success() {
+        return Err(swift_inspection_error(
+            "Xcode Command Line Tools are not configured",
+        ));
+    }
+    let directory = std::path::PathBuf::from(String::from_utf8_lossy(&output.stdout).trim());
+    directory.canonicalize().map_err(swift_inspection_error)
 }
 
 fn swift_manifest_tool_path() -> &'static str {
@@ -1341,7 +1432,7 @@ mod tests {
 
     #[test]
     fn ecosystem_detection_ignores_files_missing_from_the_publish_artifact() {
-        let (ecosystem, _) = detect_publish_ecosystem(&[], &[], None);
+        let (ecosystem, _) = detect_publish_ecosystem(&[], &[], None).unwrap();
 
         assert_eq!(ecosystem, "js");
     }
@@ -1699,7 +1790,7 @@ mod tests {
             128,
         );
 
-        assert!(manifest.is_none());
+        assert!(manifest.is_err());
     }
 
     #[cfg(target_os = "macos")]
@@ -1722,7 +1813,7 @@ mod tests {
             128,
         );
 
-        assert!(manifest.is_none());
+        assert!(manifest.is_err());
     }
 
     #[cfg(unix)]
@@ -1743,7 +1834,7 @@ mod tests {
             128,
         );
 
-        assert!(manifest.is_none());
+        assert!(manifest.is_err());
     }
 
     #[cfg(unix)]
@@ -1762,7 +1853,7 @@ mod tests {
             128,
         );
 
-        assert!(manifest.is_none());
+        assert!(manifest.is_err());
         assert!(started.elapsed() < std::time::Duration::from_secs(1));
     }
 
@@ -1804,7 +1895,7 @@ mod tests {
             128,
         );
 
-        assert!(manifest.is_none());
+        assert!(manifest.is_err());
         assert!(
             !marker.exists(),
             "Swift started for a rejected deep archive"

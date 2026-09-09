@@ -5,8 +5,7 @@ pub(super) struct SwiftInstallOptions<'a> {
     pub(super) yes: bool,
     pub(super) json_output: bool,
     pub(super) audit_after_install: bool,
-    pub(super) registry_url: &'a str,
-    pub(super) session: Option<&'a lpm_auth::SessionManager>,
+    pub(super) client: &'a RegistryClient,
 }
 
 pub(super) struct SwiftInstallRequest<'a> {
@@ -179,24 +178,39 @@ async fn finish_swift_batch(
     xcode_link: Option<&crate::xcode_project::XcodeLinkResult>,
     options: SwiftInstallOptions<'_>,
 ) -> Result<serde_json::Value, LpmError> {
-    let changed = edits.iter().any(|edit| !edit.already_exists)
-        || xcode_link.is_some_and(|link| link.package_ref_added);
-    let registry_setup = if changed {
-        let setup = crate::commands::swift_registry::ensure_configured(
-            options.session,
-            options.registry_url,
-            resolve_dir,
-            options.json_output,
-        )
-        .await?;
-        if !options.json_output {
-            output::info("Resolving Swift packages...");
+    let coordinates = packages
+        .iter()
+        .map(|package| {
+            lpm_registry::ManagedInstallRoot::new(
+                package.request.name.scoped(),
+                package.request.version,
+            )
+        })
+        .collect::<Vec<_>>();
+    let warnings = options.client.check_install_access(&coordinates).await?;
+    if !options.json_output {
+        for warning in warnings {
+            output::warn(&warning);
         }
-        crate::swift_manifest::run_swift_resolve(resolve_dir)?;
-        Some(setup)
-    } else {
-        None
-    };
+    }
+    let registry_setup = crate::commands::swift_registry::ensure_configured(
+        options.client.session().map(|session| session.as_ref()),
+        options.client.base_url(),
+        resolve_dir,
+        options.json_output,
+    )
+    .await?;
+    if !options.json_output {
+        output::info("Resolving Swift packages...");
+    }
+    crate::swift_manifest::run_swift_resolve(resolve_dir)?;
+    let resolved = crate::swift_manifest::validate_swift_dependency_graph(resolve_dir)?;
+    let resolved_warnings = options.client.check_install_access(&resolved).await?;
+    if !options.json_output {
+        for warning in resolved_warnings {
+            output::warn(&warning);
+        }
+    }
 
     let package_reports = packages
         .iter()
@@ -276,9 +290,7 @@ async fn finish_swift_batch(
         })
     };
     report["packages"] = serde_json::Value::Array(package_reports);
-    if let Some(setup) = registry_setup {
-        report["registry_setup"] = setup.to_json();
-    }
+    report["registry_setup"] = registry_setup.to_json();
     if let Some(link) = xcode_link {
         report["project_type"] = serde_json::json!("xcode");
         report["wrapper_package"] = serde_json::json!("Packages/LPMDependencies");

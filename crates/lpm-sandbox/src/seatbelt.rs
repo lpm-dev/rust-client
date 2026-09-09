@@ -38,6 +38,30 @@ pub(crate) fn render_profile_with_isolation(
     deny_outbound_network: bool,
     build_cache_isolation: bool,
 ) -> Result<String, SandboxError> {
+    render_profile_with_toolchain(spec, deny_outbound_network, build_cache_isolation, None)
+}
+
+pub(crate) fn render_profile_with_toolchain(
+    spec: &SandboxSpec,
+    deny_outbound_network: bool,
+    build_cache_isolation: bool,
+    apple_developer_dir: Option<&Path>,
+) -> Result<String, SandboxError> {
+    let developer_dir = apple_developer_dir
+        .map(|path| {
+            let path = canonicalize_or_passthrough(path, "apple_developer_dir")?;
+            if !path.ends_with("Contents/Developer")
+                && path != Path::new("/Library/Developer/CommandLineTools")
+            {
+                return Err(SandboxError::InvalidSpec {
+                    reason:
+                        "Apple developer directory must be an Xcode or CommandLineTools directory"
+                            .into(),
+                });
+            }
+            Ok(path)
+        })
+        .transpose()?;
     // Canonicalize base paths so Seatbelt rules match against the
     // same form the kernel uses at enforcement time. macOS symlinks
     // `/var` -> `/private/var`, `/tmp` -> `/private/tmp`, and
@@ -140,6 +164,19 @@ pub(crate) fn render_profile_with_isolation(
     out.push_str("  (subpath \"/sbin\")\n");
     out.push_str("  (subpath \"/System\")\n");
     out.push_str("  (subpath \"/Library/Developer/CommandLineTools\")\n");
+    if let Some(path) = &developer_dir {
+        out.push_str(&format!(
+            "  (subpath {})\n",
+            quoted_path(path, "apple_developer_dir")?
+        ));
+        if path.ends_with("Contents/Developer") {
+            let frameworks = path.parent().unwrap().join("SharedFrameworks");
+            out.push_str(&format!(
+                "  (subpath {})\n",
+                quoted_path(&frameworks, "Apple shared frameworks")?
+            ));
+        }
+    }
     out.push_str("  (subpath \"/Library/Preferences\")\n");
     // Apple Silicon Homebrew binaries resolve from /opt/homebrew/bin
     // into the versioned Cellar and load formula libraries through
@@ -258,6 +295,17 @@ pub(crate) fn render_profile_with_isolation(
     out.push_str("  (literal \"/usr/bin/codesign\")\n");
     out.push_str("  (subpath \"/Applications\")\n");
     out.push_str(")\n");
+    if let Some(path) = &developer_dir {
+        let compilers = if path.ends_with("Contents/Developer") {
+            path.join("Toolchains")
+        } else {
+            path.join("usr/bin")
+        };
+        out.push_str(&format!(
+            "(allow process-exec (subpath {}))\n",
+            quoted_path(&compilers, "Apple compiler directory")?
+        ));
+    }
     out.push_str("(allow signal)\n");
     // Mach lookups + sysctl reads the dynamic linker + libSystem
     // need. IOKit usage comes from libsystem (device enumeration
@@ -687,6 +735,43 @@ mod tests {
             "strict mode (`deny_outbound_network=true`) must NOT \
              contain any `(allow network*)` or narrower \
              `(allow network ...)` form: {p}"
+        );
+    }
+
+    #[test]
+    fn selected_xcode_compilers_do_not_enable_unrelated_app_execution() {
+        let selected = Path::new("/Applications/Selected Xcode.app/Contents/Developer");
+        let profile = render_profile_with_toolchain(&spec(), true, true, Some(selected)).unwrap();
+        let exception = "(allow process-exec (subpath \"/Applications/Selected Xcode.app/Contents/Developer/Toolchains\"))";
+        assert!(profile.contains(exception));
+        assert!(profile.find("(deny process-exec").unwrap() < profile.find(exception).unwrap());
+        assert!(
+            profile.contains(
+                "(subpath \"/Applications/Selected Xcode.app/Contents/SharedFrameworks\")"
+            )
+        );
+        assert!(!profile.contains("(allow network"));
+        let writes = profile
+            .split("(allow file-write*\n")
+            .nth(1)
+            .unwrap()
+            .split("\n)\n")
+            .next()
+            .unwrap();
+        assert!(!writes.contains("/Applications"));
+        assert!(!profile.contains("(allow process-exec (subpath \"/Applications\"))"));
+    }
+
+    #[test]
+    fn toolchain_exception_rejects_arbitrary_application_directories() {
+        assert!(
+            render_profile_with_toolchain(
+                &spec(),
+                true,
+                true,
+                Some(Path::new("/Applications/Other.app"))
+            )
+            .is_err()
         );
     }
 

@@ -499,6 +499,8 @@ fn merge(project: RawSandboxKeys, global: RawSandboxKeys) -> (SandboxOptions, Re
             .unwrap_or(false),
         deny_outbound_network,
         build_cache_isolation: false,
+        #[cfg(target_os = "macos")]
+        apple_developer_dir: None,
     };
     (options, resolved)
 }

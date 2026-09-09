@@ -1326,6 +1326,75 @@ pub fn run_swift_resolve(project_dir: &Path) -> Result<(), LpmError> {
     Ok(())
 }
 
+#[derive(serde::Deserialize)]
+struct ResolvedSwiftDependency {
+    identity: Option<String>,
+    url: Option<String>,
+    version: Option<String>,
+    #[serde(default)]
+    dependencies: Vec<ResolvedSwiftDependency>,
+}
+
+pub fn validate_swift_dependency_graph(
+    project_dir: &Path,
+) -> Result<Vec<lpm_registry::ManagedInstallRoot>, LpmError> {
+    let mut command = swift_command();
+    command
+        .args(["package", "show-dependencies", "--format", "json"])
+        .current_dir(project_dir);
+    let output = run_bounded_swift_output(command, "swift package show-dependencies")?;
+    if !output.status.success() {
+        let diagnostic = String::from_utf8_lossy(&output.stderr);
+        return Err(LpmError::Registry(format!(
+            "Swift dependency validation failed: {}. Check required products and dependency compatibility.",
+            lpm_common::sanitize_terminal_inline(&diagnostic),
+        )));
+    }
+    let graph: ResolvedSwiftDependency = serde_json::from_slice(&output.stdout)
+        .map_err(|error| LpmError::Registry(format!("Invalid Swift dependency graph: {error}")))?;
+    let mut pending: Vec<_> = graph.dependencies.iter().collect();
+    let mut packages = Vec::new();
+    let mut visited = 0;
+    while let Some(dependency) = pending.pop() {
+        visited += 1;
+        if visited > 10_000 {
+            return Err(LpmError::Registry(
+                "Swift dependency graph exceeds 10000 nodes".into(),
+            ));
+        }
+        pending.extend(&dependency.dependencies);
+        // SwiftPM reports registry locations as identities, and Git locations as URLs.
+        if dependency.url != dependency.identity {
+            continue;
+        }
+        let Some(identifier) = dependency
+            .identity
+            .as_deref()
+            .and_then(|identity| identity.strip_prefix("lpmdev."))
+        else {
+            continue;
+        };
+        let (owner, name) = identifier
+            .split_once('_')
+            .ok_or_else(|| LpmError::Registry("Invalid LPM Swift dependency identity".into()))?;
+        let package = PackageName::parse(&format!("@lpm.dev/{owner}.{name}"))?;
+        let version = dependency
+            .version
+            .as_deref()
+            .filter(|version| !version.is_empty())
+            .ok_or_else(|| {
+                LpmError::Registry("LPM Swift dependency has no resolved version".into())
+            })?;
+        packages.push(lpm_registry::ManagedInstallRoot::new(
+            package.scoped(),
+            version,
+        ));
+    }
+    packages.sort_unstable();
+    packages.dedup();
+    Ok(packages)
+}
+
 // ── Xcode Wrapper Package (Packages/LPMDependencies/) ──────────────────
 
 /// Directory name for the LPM dependencies wrapper package.
