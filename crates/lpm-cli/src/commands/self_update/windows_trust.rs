@@ -574,6 +574,17 @@ mod tests {
     }
 
     #[test]
+    fn owner_rights_write_access_accepts_only_a_trusted_owner() {
+        let context = SecurityContext::load().unwrap();
+        let owner_rights = sid_from_sddl("S-1-3-4").unwrap();
+        let everyone = sid_from_sddl("S-1-1-0").unwrap();
+        assert!(context.write_principal_is_trusted(owner_rights.0.cast(), context.current_user()));
+        assert!(context.write_principal_is_trusted(owner_rights.0.cast(), context.administrators.0.cast()));
+        assert!(!context.write_principal_is_trusted(owner_rights.0.cast(), everyone.0.cast()));
+        assert!(!context.owner_is_trusted(owner_rights.0.cast()));
+    }
+
+    #[test]
     fn private_account_file_is_trusted() {
         let account = tempfile::tempdir().unwrap();
         let file = account.path().join("manager.exe");

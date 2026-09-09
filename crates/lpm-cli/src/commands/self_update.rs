@@ -3441,6 +3441,24 @@ mod tests {
     }
 
     #[test]
+    fn macos_bundle_zip_accepts_the_pre_icon_signed_inventory() {
+        use std::io::Write as _;
+        let mut archive = tempfile::NamedTempFile::new().unwrap();
+        {
+            let mut writer = zip::ZipWriter::new(archive.as_file_mut());
+            for name in MACOS_REQUIRED_BUNDLE_FILES {
+                if name.ends_with(".icns") {
+                    continue;
+                }
+                writer.start_file(name, zip::write::SimpleFileOptions::default()).unwrap();
+                writer.write_all(b"signed payload").unwrap();
+            }
+            writer.finish().unwrap();
+        }
+        validate_macos_bundle_zip(archive.path()).expect("pre-icon signed releases remain installable");
+    }
+
+    #[test]
     fn macos_standalone_layout_accepts_only_bundle_execution_path() {
         let home = Path::new("/Users/alice");
         let root = home.join(".lpm");

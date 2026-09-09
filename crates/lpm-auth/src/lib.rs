@@ -4446,6 +4446,27 @@ mod tests {
     }
 
     #[test]
+    fn unavailable_keyring_preserves_authenticated_file_credentials() {
+        let key = [42_u8; 32];
+        let value = encode_auth_key(&key);
+        let iv = [7_u8; 12];
+        let cipher = Aes256Gcm::new_from_slice(&key).unwrap();
+        let payload = cipher.encrypt(GenericArray::from_slice(&iv), b"saved credential".as_slice()).unwrap();
+        let (ciphertext, tag) = payload.split_at(payload.len() - 16);
+        let encrypted = format!("{}:{}:{}", BASE64.encode(iv), BASE64.encode(tag), BASE64.encode(ciphertext));
+        let selected = select_auth_key_material(
+            Err("Secret Service unavailable".to_owned()),
+            Ok(Some(value.clone())),
+            true,
+            |candidate| decode_auth_key(candidate)
+                .is_ok_and(|key| decrypt_with_key(&encrypted, &key).is_ok()),
+            || panic!("recovery must not remove the file key"),
+        ).expect("authenticated file key must remain usable").unwrap();
+        assert_eq!(selected.source, AuthKeySource::File);
+        assert_eq!(selected.value, value);
+    }
+
+    #[test]
     fn existing_credentials_without_an_auth_key_fail_closed() {
         let result = select_auth_key_material(Ok(None), Ok(None), true, |_| false, || Ok(()));
 
