@@ -3321,7 +3321,11 @@ mod tests {
     use tempfile::tempdir;
 
     fn cargo_metadata_test_root() -> tempfile::TempDir {
-        tempfile::tempdir_in(std::env::current_dir().unwrap()).unwrap()
+        #[cfg(windows)]
+        let parent = canonical_account_home().unwrap();
+        #[cfg(not(windows))]
+        let parent = std::env::current_dir().unwrap();
+        tempfile::tempdir_in(parent).unwrap()
     }
 
     #[test]
@@ -3523,7 +3527,11 @@ mod tests {
 
     #[test]
     fn macos_standalone_layout_accepts_only_bundle_execution_path() {
-        let home = Path::new("/Users/alice");
+        let home = if cfg!(windows) {
+            Path::new(r"C:\Users\alice")
+        } else {
+            Path::new("/Users/alice")
+        };
         let root = home.join(".lpm");
         let expected_app = root.join("libexec/LPM CLI.app");
         let current = expected_app.join("Contents/MacOS/lpm-rs");
@@ -5335,10 +5343,12 @@ bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb  lpm-linux-x64
         let cmd = InstallMethod::Cargo
             .command("0.25.0", Some(source_commit))
             .unwrap();
-        assert!(
-            cmd.contains(&format!("--rev {source_commit}")),
-            "cmd: {cmd}"
-        );
+        let revision_argument = if cfg!(windows) {
+            format!("'--rev' '{source_commit}'")
+        } else {
+            format!("--rev {source_commit}")
+        };
+        assert!(cmd.contains(&revision_argument), "cmd: {cmd}");
         assert!(!cmd.contains("--tag"), "cmd: {cmd}");
         assert!(cmd.contains("--force"), "cmd: {cmd}");
     }
@@ -5438,7 +5448,11 @@ bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb  lpm-linux-x64
     fn install_method_command_homebrew_unchanged() {
         assert_eq!(
             InstallMethod::Homebrew.command("0.25.0", None).unwrap(),
-            "brew upgrade lpm"
+            if cfg!(windows) {
+                "& 'brew' 'upgrade' 'lpm'"
+            } else {
+                "brew upgrade lpm"
+            }
         );
     }
 
