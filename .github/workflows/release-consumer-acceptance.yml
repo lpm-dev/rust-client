@@ -31,4 +31,6 @@ jobs:
         if: always()
         with:
           name: release-consumer-${{ matrix.os }}
-          path: ${{ runner.temp }}/release-consumer/*.json
+          path: |
+            ${{ runner.temp }}/release-consumer/*.json
+            ${{ runner.temp }}/release-consumer/logs/*.log

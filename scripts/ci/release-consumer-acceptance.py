@@ -21,6 +21,8 @@ ROOT = Path(os.environ["LPM_RELEASE_ACCEPTANCE_OUTPUT"]).resolve()
 ROOT.mkdir(parents=True, exist_ok=True)
 LOGS = ROOT / "logs"
 LOGS.mkdir(exist_ok=True)
+WORK = ROOT / "work"
+WORK.mkdir(exist_ok=True)
 STABLE = "0.76.5"
 OLD = "0.75.0"
 NIGHTLY = "0.77.0-nightly.20260909.177.e3196a5"
@@ -60,7 +62,7 @@ def run(name, args, env=None, timeout=240, expected=0):
         command = subprocess.list2cmdline(command)
     try:
         result = subprocess.run(
-            command, env=env or ENV, cwd=ROOT, stdin=subprocess.DEVNULL,
+            command, env=env or ENV, cwd=WORK, stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
             text=True, timeout=timeout,
             shell=isinstance(command, str),
