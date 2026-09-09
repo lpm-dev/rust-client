@@ -363,22 +363,18 @@ pub fn write_backup(
     #[cfg(not(unix))]
     let original_mode = None;
     let mut hasher = Sha256::new();
-    lpm_common::write_file_atomic_with(
-        &backup_path,
-        lpm_common::AtomicWriteOptions::new().unix_mode(0o600),
-        |destination| {
-            let mut buffer = [0_u8; 64 * 1024];
-            loop {
-                let read = source.read(&mut buffer)?;
-                if read == 0 {
-                    break;
-                }
-                hasher.update(&buffer[..read]);
-                destination.write_all(&buffer[..read])?;
+    crate::install_recovery::write_source_with(&backup_path, Some(0o600), |destination| {
+        let mut buffer = [0_u8; 64 * 1024];
+        loop {
+            let read = source.read(&mut buffer)?;
+            if read == 0 {
+                break;
             }
-            Ok(())
-        },
-    )
+            hasher.update(&buffer[..read]);
+            destination.write_all(&buffer[..read])?;
+        }
+        Ok(())
+    })
     .map_err(LpmError::Io)?;
     Ok(WrittenSourceBackup {
         digest: format!("sha256-{}", hex::encode(hasher.finalize())),
@@ -405,14 +401,33 @@ pub fn digest_file(path: &Path) -> Result<String, LpmError> {
     Ok(format!("sha256-{}", hex::encode(hasher.finalize())))
 }
 
-pub fn copy_file_atomic_with_digest(source: &Path, destination: &Path) -> Result<String, LpmError> {
+pub fn source_delivery_mode(source: &Path) -> Result<Option<u32>, LpmError> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        Ok(Some(
+            std::fs::metadata(source)?.permissions().mode() & 0o777,
+        ))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = source;
+        Ok(None)
+    }
+}
+
+pub fn copy_file_atomic_with_mode(
+    source: &Path,
+    destination: &Path,
+    mode: Option<u32>,
+) -> Result<String, LpmError> {
     ensure_regular_or_missing(source, "source delivery input")?;
     let mut source = std::fs::File::open(source).map_err(LpmError::Io)?;
     let mut hasher = Sha256::new();
     let mut buffer = [0_u8; 64 * 1024];
-    lpm_common::write_file_atomic_with(
+    crate::install_recovery::write_source_with(
         destination,
-        lpm_common::AtomicWriteOptions::new(),
+        mode,
         |output| -> std::io::Result<()> {
             loop {
                 let read = source.read(&mut buffer)?;
@@ -640,7 +655,7 @@ pub fn write_state(project_dir: &Path, state: &AddedSourcesState) -> Result<(), 
             return Ok(());
         }
         ensure_regular_or_missing(&path, "added-source state")?;
-        return match std::fs::remove_file(&path) {
+        return match crate::install_recovery::remove_source(&path) {
             Ok(()) => Ok(()),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
             Err(error) => Err(LpmError::Io(error)),
@@ -659,12 +674,8 @@ pub fn write_state(project_dir: &Path, state: &AddedSourcesState) -> Result<(), 
             lpm_common::STATE_FILE_SIZE_CAP_BYTES
         )));
     }
-    lpm_common::write_file_atomic_with_options(
-        &path,
-        body,
-        lpm_common::AtomicWriteOptions::new().unix_mode(0o600),
-    )
-    .map_err(LpmError::Io)
+    crate::install_recovery::write_source_with(&path, Some(0o600), |file| file.write_all(&body))
+        .map_err(LpmError::Io)
 }
 
 #[cfg(test)]

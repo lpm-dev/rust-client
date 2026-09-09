@@ -256,7 +256,7 @@ fn reconcile_stale_source_files(
                 transaction
                     .snapshot_optional_path(&destination)
                     .map_err(LpmError::Io)?;
-                std::fs::remove_file(&destination).map_err(LpmError::Io)?;
+                crate::install_recovery::remove_source(&destination).map_err(LpmError::Io)?;
                 transaction
                     .restore_only_if_current(&destination)
                     .map_err(LpmError::Io)?;
@@ -288,11 +288,15 @@ fn reconcile_stale_source_files(
                 transaction
                     .snapshot_optional_path(&backup)
                     .map_err(LpmError::Io)?;
-                crate::added_sources_state::copy_file_atomic_with_digest(&backup, &destination)?;
+                crate::added_sources_state::copy_file_atomic_with_mode(
+                    &backup,
+                    &destination,
+                    file.backup_mode,
+                )?;
                 transaction
                     .restore_only_if_current(&destination)
                     .map_err(LpmError::Io)?;
-                std::fs::remove_file(&backup).map_err(LpmError::Io)?;
+                crate::install_recovery::remove_source(&backup).map_err(LpmError::Io)?;
                 transaction
                     .restore_only_if_current(&backup)
                     .map_err(LpmError::Io)?;
@@ -321,11 +325,15 @@ fn reconcile_stale_source_files(
                 transaction
                     .snapshot_optional_path(&backup)
                     .map_err(LpmError::Io)?;
-                crate::added_sources_state::copy_file_atomic_with_digest(&backup, &destination)?;
+                crate::added_sources_state::copy_file_atomic_with_mode(
+                    &backup,
+                    &destination,
+                    file.backup_mode,
+                )?;
                 transaction
                     .restore_only_if_current(&destination)
                     .map_err(LpmError::Io)?;
-                std::fs::remove_file(&backup).map_err(LpmError::Io)?;
+                crate::install_recovery::remove_source(&backup).map_err(LpmError::Io)?;
                 transaction
                     .restore_only_if_current(&backup)
                     .map_err(LpmError::Io)?;
@@ -428,7 +436,8 @@ fn reconcile_stale_dependencies(
             LpmError::Registry(format!("failed to serialize package.json: {error}"))
         })?;
         body.push(b'\n');
-        lpm_common::write_file_atomic(&manifest_path, body).map_err(LpmError::Io)?;
+        crate::install_recovery::write_manifest(&manifest_path, &content, body)
+            .map_err(LpmError::Io)?;
         transaction
             .restore_only_if_current(&manifest_path)
             .map_err(LpmError::Io)?;
@@ -617,7 +626,7 @@ async fn run_locked(
     //   by `@lpm.dev/` prefix in `RouteTable::route_for_package`).
     // - AddTarget::Npm → routed npm metadata via .npmrc / NpmDirect /
     //   LpmWorker per the route table.
-    let metadata = match &target {
+    let mut metadata = match &target {
         AddTarget::Lpm(pkg) => client.get_package_metadata(pkg).await?,
         AddTarget::Npm { spec } => {
             let route = route_table.route_for_package(spec);
@@ -633,6 +642,22 @@ async fn run_locked(
         false,
         json_output,
     )?;
+    if let Some(requested) = &version_spec
+        && metadata.resolve_version_spec(requested).is_err()
+    {
+        metadata = match &target {
+            AddTarget::Lpm(package) => client.refetch_package_metadata(package).await?,
+            AddTarget::Npm { spec } => {
+                let route = route_table.route_for_package(spec);
+                match &route {
+                    lpm_registry::UpstreamRoute::Custom { target, auth } => client
+                        .invalidate_custom_metadata_cache(&target.base_url, spec, auth.as_deref()),
+                    _ => client.invalidate_metadata_cache(spec),
+                }
+                client.get_npm_metadata_routed(spec, route).await?
+            }
+        };
+    }
     let version = if let Some(v) = &version_spec {
         crate::release_age_selection::resolve_version_spec_with_policy(
             &metadata,
@@ -855,7 +880,7 @@ async fn run_locked(
                     let values: Vec<String> = options.iter().map(|(v, _)| v.clone()).collect();
 
                     if multi {
-                        let mut ms = cliclack::multiselect(safe_label);
+                        let mut ms = cliclack::multiselect(safe_label).required(required);
                         for (value, label_str) in &options {
                             ms = ms.item(value.clone(), crate::prompt::untrusted(label_str), "");
                         }
@@ -1143,6 +1168,14 @@ async fn run_locked(
         .unwrap_or_default();
 
     let mut created_directory_rollback = CreatedDirectoryRollback::new(&project_root_canonical)?;
+    crate::install_recovery::enable_source_recovery();
+    let missing_directories: Vec<_> = files
+        .iter()
+        .flat_map(|(_, destination)| {
+            missing_path_directories(&project_root_canonical, &target_dir.join(destination))
+        })
+        .collect();
+    crate::install_recovery::record_source_directories(&missing_directories)?;
     let prepared_destinations = (|| {
         let target_root_canonical = prepare_safe_dest_parent_tracked(
             &target_dir,
@@ -1338,6 +1371,10 @@ async fn run_locked(
                     &manifest_path,
                 );
                 let absolute_backup = project_dir.join(&backup_path);
+                crate::install_recovery::record_source_directories(&missing_path_directories(
+                    project_dir,
+                    &absolute_backup,
+                ))?;
                 tx.remove_dirs_on_rollback(missing_path_directories(project_dir, &absolute_backup));
                 tx.snapshot_optional_path(&absolute_backup)
                     .map_err(|error| {
@@ -1390,11 +1427,20 @@ async fn run_locked(
                 dest_path.display()
             ))
         })?;
+        let source_mode = crate::added_sources_state::source_delivery_mode(&src_path)?;
         let installed_digest = if let Some(text) = final_content {
-            lpm_common::write_file_atomic(dest_path, text).map_err(LpmError::Io)?;
+            use std::io::Write as _;
+            crate::install_recovery::write_source_with(dest_path, source_mode, |file| {
+                file.write_all(text.as_bytes())
+            })
+            .map_err(LpmError::Io)?;
             crate::added_sources_state::digest_bytes(text.as_bytes())
         } else {
-            crate::added_sources_state::copy_file_atomic_with_digest(&src_path, dest_path)?
+            crate::added_sources_state::copy_file_atomic_with_mode(
+                &src_path,
+                dest_path,
+                source_mode,
+            )?
         };
         tx.restore_only_if_current(dest_path)
             .map_err(LpmError::Io)?;
@@ -1680,21 +1726,7 @@ async fn run_locked(
     )?;
     stale_directory_cleanup.stage_in(&mut tx);
 
-    // Commit the rollback transaction.
-    //
-    // File copy, dep mutation, trailing install, and the bare-imports
-    // read-only notice all completed without error, so
-    // the snapshotted bytes are stale and the project's new state is
-    // the one we want to keep.
-    //
-    // The commit lands before Swift recursion on purpose:
-    // `handle_swift_lpm_deps` recursively re-enters this function for
-    // each Swift dep, and each recursive `lpm add` opens its own tx.
-    // If the outer tx stayed open across that boundary, a recursive
-    // failure could roll back the root package's already-applied
-    // mutations while leaving the recursive `lpm add`'s side effects
-    // intact — a worse split-brain than no rollback at all. Output is
-    // intentionally outside the tx because it owns a separate contract.
+    // Source recovery remains active across recursive Swift delivery.
     crate::commands::install::workspace_lockfile::commit_manifest_transaction_checked(tx)?;
 
     // For Swift, handle recursive LPM dependencies.

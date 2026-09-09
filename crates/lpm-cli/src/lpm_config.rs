@@ -39,6 +39,19 @@ mod tests {
     use super::*;
 
     #[test]
+    fn select_fields_require_nonempty_options() {
+        for field in [r#"{"type":"select"}"#, r#"{"type":"select","options":[]}"#] {
+            assert!(
+                parse_and_validate(
+                    Path::new("lpm.config.json"),
+                    &format!(r#"{{"configSchema":{{"theme":{field}}}}}"#)
+                )
+                .is_err()
+            );
+        }
+    }
+
+    #[test]
     fn package_and_source_types_are_valid_and_type_may_be_omitted() {
         let path = Path::new("lpm.config.json");
         for document in [r#"{}"#, r#"{"type":"package"}"#, r#"{"type":"source"}"#] {
