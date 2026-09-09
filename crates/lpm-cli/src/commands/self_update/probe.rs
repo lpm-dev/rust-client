@@ -2345,9 +2345,11 @@ mod tests {
         let state = tempfile::tempdir().unwrap();
         let pid_file = state.path().join("pid");
         let marker = state.path().join("marker");
+        let resume = state.path().join("resume");
         let body = format!(
-            "printf '%s' $$ > '{}'; /bin/sleep 0.2; : > '{}'; /bin/sleep 30",
+            "printf '%s' $$ > '{}'; while [ ! -f '{}' ]; do /bin/sleep 0.01; done; : > '{}'; /bin/sleep 30",
             pid_file.display(),
+            resume.display(),
             marker.display()
         );
         let (_directory, program) = executable_script(&body);
@@ -2360,6 +2362,7 @@ mod tests {
         }
 
         let _ = run_bounded(&mut command, Duration::from_secs(2), "missing-pipe test");
+        std::fs::write(resume, b"resume after cleanup").unwrap();
         std::thread::sleep(Duration::from_millis(400));
         let reached_marker = marker.exists();
         if reached_marker

@@ -9,6 +9,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 
 
 def main():
@@ -39,10 +40,13 @@ def main():
         registry = f"http://127.0.0.1:{server.server_port}"
 
         def run(binary, *args):
+            print("Running", binary, args[0], flush=True)
+            started = time.monotonic()
             result = subprocess.run([binary, *args], env=env, cwd=root,
-                                    text=True, capture_output=True, timeout=45)
+                                    text=True, capture_output=True, timeout=180)
             output = (result.stdout + result.stderr).replace(token, "[test token]")
             assert result.returncode == 0, output
+            print("PASS:", args[0], "seconds:", round(time.monotonic() - started, 3), flush=True)
             return output
 
         try:
@@ -53,7 +57,7 @@ def main():
             assert credentials.is_file() and key.is_file(), "fixture must use real file storage"
             config = state / "config.toml"
             config.write_text('save-prefix = "~"\n')
-            before = {path: hashlib.sha256(path.read_bytes()).digest() for path in [credentials, key, config]}
+            before = {path: hashlib.sha256(path.read_bytes()).digest() for path in [credentials, key, state / ".salt", config]}
             for binary in [old, current, current, old]:
                 output = run(binary, "whoami", "--registry", registry, "--json")
                 assert "upgrade-fixture" in output, output

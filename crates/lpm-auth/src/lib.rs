@@ -50,6 +50,7 @@ use security_framework::{
 };
 
 mod credential_authority;
+mod legacy_key;
 mod session;
 pub use session::{
     AuthRequirement, AuthStorageAccessKind, RefreshPolicy, SessionManager, TokenSource,
@@ -2240,7 +2241,6 @@ fn credentials_path() -> Result<PathBuf, String> {
 
 const AUTH_KEY_PREFIX: &str = "raw:";
 
-#[cfg(test)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum AuthKeySource {
     Keyring,
@@ -2249,7 +2249,6 @@ enum AuthKeySource {
 
 struct AuthKeyMaterial {
     value: String,
-    #[cfg(test)]
     source: AuthKeySource,
 }
 
@@ -2257,7 +2256,7 @@ fn select_auth_key_material(
     keyring_probe: Result<Option<String>, String>,
     file_probe: Result<Option<String>, String>,
     has_credentials: bool,
-    authenticates_credentials: impl Fn(&str) -> bool,
+    authenticates_credentials: impl Fn(&str, AuthKeySource) -> bool,
     remove_file_key: impl FnOnce() -> Result<(), String>,
 ) -> Result<Option<AuthKeyMaterial>, String> {
     let file_value = file_probe?;
@@ -2267,10 +2266,9 @@ fn select_auth_key_material(
             // A keyring outage must not disable an authenticated file store. Token
             // authority and revocation are checked separately after decryption.
             if let Some(value) = file_value {
-                if authenticates_credentials(&value) {
+                if authenticates_credentials(&value, AuthKeySource::File) {
                     return Ok(Some(AuthKeyMaterial {
                         value,
-                        #[cfg(test)]
                         source: AuthKeySource::File,
                     }));
                 }
@@ -2282,27 +2280,24 @@ fn select_auth_key_material(
     };
     match (keyring_value, file_value) {
         (Some(keyring), Some(file)) => {
-            let keyring_authenticates = authenticates_credentials(&keyring);
-            let file_authenticates = authenticates_credentials(&file);
+            let keyring_authenticates = authenticates_credentials(&keyring, AuthKeySource::Keyring);
+            let file_authenticates = authenticates_credentials(&file, AuthKeySource::File);
             match (keyring_authenticates, file_authenticates) {
                 (true, false) => {
                     let _ = remove_file_key();
                     Ok(Some(AuthKeyMaterial {
                         value: keyring,
-                        #[cfg(test)]
                         source: AuthKeySource::Keyring,
                     }))
                 }
                 (false, true) => Ok(Some(AuthKeyMaterial {
                     value: file,
-                    #[cfg(test)]
                     source: AuthKeySource::File,
                 })),
                 (true, true) if keyring == file || !has_credentials => {
                     let _ = remove_file_key();
                     Ok(Some(AuthKeyMaterial {
                         value: keyring,
-                        #[cfg(test)]
                         source: AuthKeySource::Keyring,
                     }))
                 }
@@ -2316,17 +2311,19 @@ fn select_auth_key_material(
                 ),
             }
         }
-        (Some(value), None) if !has_credentials || authenticates_credentials(&value) => {
+        (Some(value), None)
+            if !has_credentials || authenticates_credentials(&value, AuthKeySource::Keyring) =>
+        {
             Ok(Some(AuthKeyMaterial {
                 value,
-                #[cfg(test)]
                 source: AuthKeySource::Keyring,
             }))
         }
-        (None, Some(value)) if !has_credentials || authenticates_credentials(&value) => {
+        (None, Some(value))
+            if !has_credentials || authenticates_credentials(&value, AuthKeySource::File) =>
+        {
             Ok(Some(AuthKeyMaterial {
                 value,
-                #[cfg(test)]
                 source: AuthKeySource::File,
             }))
         }
@@ -2451,8 +2448,8 @@ fn get_auth_key_material() -> Result<AuthKeyMaterial, String> {
         keyring_probe,
         Ok(file_value),
         credentials.is_some(),
-        |candidate| {
-            let Ok(key) = decode_auth_key(candidate) else {
+        |candidate, source| {
+            let Ok(key) = decode_stored_auth_key(candidate, source) else {
                 return false;
             };
             credentials
@@ -2481,14 +2478,12 @@ fn get_auth_key_material() -> Result<AuthKeyMaterial, String> {
     if keyring_ok {
         Ok(AuthKeyMaterial {
             value,
-            #[cfg(test)]
             source: AuthKeySource::Keyring,
         })
     } else {
         write_file_auth_key(&key_path, &value)?;
         Ok(AuthKeyMaterial {
             value,
-            #[cfg(test)]
             source: AuthKeySource::File,
         })
     }
@@ -2496,7 +2491,17 @@ fn get_auth_key_material() -> Result<AuthKeyMaterial, String> {
 
 fn derive_key() -> Result<[u8; 32], String> {
     let material = get_auth_key_material()?;
-    decode_auth_key(&material.value)
+    decode_stored_auth_key(&material.value, material.source)
+}
+
+fn decode_stored_auth_key(value: &str, source: AuthKeySource) -> Result<[u8; 32], String> {
+    if value.starts_with(AUTH_KEY_PREFIX) {
+        return decode_auth_key(value);
+    }
+    if source == AuthKeySource::File {
+        return legacy_key::decode(value, &lpm_dir()?);
+    }
+    Err("auth data key has an unsupported format".to_owned())
 }
 
 /// Encrypt a value with AES-256-GCM.
@@ -4449,7 +4454,7 @@ mod tests {
             Ok(Some("raw:wrong".to_owned())),
             Ok(Some("raw:authenticated".to_owned())),
             true,
-            |candidate| candidate == "raw:authenticated",
+            |candidate, _| candidate == "raw:authenticated",
             || {
                 removed.set(true);
                 Ok(())
@@ -4486,7 +4491,7 @@ mod tests {
             Err("Secret Service unavailable".to_owned()),
             Ok(Some(value.clone())),
             true,
-            |candidate| {
+            |candidate, _| {
                 decode_auth_key(candidate)
                     .is_ok_and(|key| decrypt_with_key(&encrypted, &key).is_ok())
             },
@@ -4505,7 +4510,7 @@ mod tests {
                 Err("Secret Service unavailable".to_owned()),
                 Ok(None),
                 false,
-                |_| false,
+                |_, _| false,
                 || panic!("no key to remove"),
             )
             .expect("a new headless account can create a file key")
@@ -4520,7 +4525,7 @@ mod tests {
                 Err("Secret Service unavailable".to_owned()),
                 Ok(Some("raw:wrong".to_owned())),
                 true,
-                |_| false,
+                |_, _| false,
                 || panic!("failed recovery must preserve key material"),
             )
             .is_err()
@@ -4529,7 +4534,7 @@ mod tests {
 
     #[test]
     fn existing_credentials_without_an_auth_key_fail_closed() {
-        let result = select_auth_key_material(Ok(None), Ok(None), true, |_| false, || Ok(()));
+        let result = select_auth_key_material(Ok(None), Ok(None), true, |_, _| false, || Ok(()));
 
         assert!(
             result.is_err(),
@@ -4544,7 +4549,7 @@ mod tests {
             Err("transient keyring failure".to_owned()),
             Ok(None),
             true,
-            |_| false,
+            |_, _| false,
             || {
                 removed.set(true);
                 Ok(())
@@ -4567,7 +4572,7 @@ mod tests {
             Ok(None),
             Ok(Some("raw:wrong".to_owned())),
             true,
-            |_| false,
+            |_, _| false,
             || Ok(()),
         );
 
@@ -4575,6 +4580,11 @@ mod tests {
             result.is_err(),
             "an unauthenticated candidate must fail closed"
         );
+    }
+
+    #[test]
+    fn legacy_keyring_material_cannot_enter_file_key_recovery() {
+        assert!(decode_stored_auth_key(&"a".repeat(64), AuthKeySource::Keyring).is_err());
     }
 
     #[test]

@@ -43,6 +43,7 @@ jobs:
             ~/.cargo/git
             target
           key: ${{ runner.os }}-release-upgrade-1.94.0-${{ hashFiles('Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-release-upgrade-1.94.0-
       - name: Linux native credential dependencies
         if: runner.os == 'Linux'
         run: bash scripts/ci/install-apt-packages.sh pkg-config libdbus-1-dev fish
