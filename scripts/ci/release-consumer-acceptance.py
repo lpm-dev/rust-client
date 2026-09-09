@@ -138,6 +138,9 @@ if os.name == "nt":
     for index, location in enumerate([Path.home(), PREFIX.parent, PREFIX, LPM]):
         run("windows-icacls-" + str(index), ["icacls", location])
 run("npm-self-update-nightly-plan", [LPM, "self-update", "--channel", "nightly", "--refresh", "--json"])
+if os.name == "nt":
+    run("windows-remove-owner-rights-fixture-ace", ["icacls", PREFIX.parent, "/remove:g", "*S-1-3-4", "/T"])
+    run("windows-plan-without-owner-rights-ace", [LPM, "self-update", "--channel", "nightly", "--refresh", "--json"])
 run("npm-self-update-nightly", [LPM, "self-update", "--channel", "nightly", "--refresh"])
 verify_version("npm-nightly-version", LPM, NIGHTLY)
 state_check("after-nightly-upgrade")
