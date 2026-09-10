@@ -298,10 +298,10 @@ pub(crate) fn swift_command() -> std::process::Command {
     command
 }
 
-struct BoundedOutput {
-    status: std::process::ExitStatus,
-    stdout: Vec<u8>,
-    stderr: Vec<u8>,
+pub(crate) struct BoundedOutput {
+    pub(crate) status: std::process::ExitStatus,
+    pub(crate) stdout: Vec<u8>,
+    pub(crate) stderr: Vec<u8>,
 }
 
 fn read_bounded_pipe(
@@ -319,7 +319,7 @@ fn read_bounded_pipe(
     Ok((bytes, exceeded))
 }
 
-fn run_bounded_swift_output(
+pub(crate) fn run_bounded_swift_output(
     mut command: std::process::Command,
     display_name: &str,
 ) -> Result<BoundedOutput, LpmError> {

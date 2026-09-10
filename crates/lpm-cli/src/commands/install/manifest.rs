@@ -1196,6 +1196,11 @@ pub async fn run_add_packages(
                 let pbxproj = xcodeproj.join("project.pbxproj");
                 required_paths.push(pbxproj.clone());
                 optional_paths.push(pbxproj.with_extension("pbxproj.lpm-backup"));
+                optional_paths.extend(
+                    crate::xcode_project::native::containers(project_dir, xcodeproj)?
+                        .iter()
+                        .map(|container| container.lockfile()),
+                );
                 let project_root = xcodeproj.parent().unwrap_or(project_dir);
                 let wrapper_root = project_root.join(crate::swift_manifest::LPM_DEPS_REL_PATH);
                 optional_paths.push(wrapper_root.join("Package.swift"));
@@ -1601,6 +1606,11 @@ pub async fn run_install_filtered_add(
                         let pbxproj = xcodeproj_path.join("project.pbxproj");
                         required_paths.push(pbxproj.clone());
                         optional_paths.push(pbxproj.with_extension("pbxproj.lpm-backup"));
+                        optional_paths.extend(
+                            crate::xcode_project::native::containers(cwd, xcodeproj_path)?
+                                .iter()
+                                .map(|container| container.lockfile()),
+                        );
                         let project_root = xcodeproj_path.parent().unwrap_or(cwd);
                         let wrapper_root =
                             project_root.join(crate::swift_manifest::LPM_DEPS_REL_PATH);
@@ -1668,9 +1678,7 @@ pub async fn run_install_filtered_add(
                         .await?
                 }
                 SwiftInstallLocation::Xcode { xcodeproj_path } => {
-                    let project_root = xcodeproj_path.parent().unwrap_or(cwd);
-                    run_swift_install_xcode_batch(project_root, xcodeproj_path, &requests, options)
-                        .await?
+                    run_swift_install_xcode_batch(cwd, xcodeproj_path, &requests, options).await?
                 }
             };
             swift_reports.push(report);

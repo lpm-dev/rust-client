@@ -6,6 +6,9 @@
 //! - Generating random 24-char hex object IDs
 //! - Atomic writes with backup for safety
 
+pub(crate) mod native;
+mod repair;
+
 use lpm_common::LpmError;
 use rand::Rng;
 use std::path::{Path, PathBuf};
@@ -250,7 +253,7 @@ fn validate_workspace_path(path: &Path, root: &Path) -> Result<(), LpmError> {
 /// XCSwiftPackageProductDependency, PBXBuildFile, PBXFrameworksBuildPhase,
 /// PBXProject.packageReferences, PBXNativeTarget.packageProductDependencies).
 ///
-/// On subsequent calls: detects existing entries, returns `_already_linked: true`.
+/// On subsequent calls: repairs missing target links and retains complete links.
 pub fn link_local_package(
     xcodeproj_path: &Path,
     product_name: &str,
@@ -282,13 +285,22 @@ pub fn link_local_package(
         })?;
 
     match (existing_ref, existing_product) {
-        (Some(_), Some(_)) => {
-            if content != original {
+        (Some(package), Some(product)) => {
+            let content = repair::target_link(
+                &content,
+                &target_id,
+                &package,
+                &product,
+                product_name,
+                local_pkg_rel_path,
+            )?;
+            let changed = content != original;
+            if changed {
                 write_pbxproj_atomic(&pbxproj, &original, &content)?;
             }
             return Ok(XcodeLinkResult {
                 package_ref_added: false,
-                _already_linked: true,
+                _already_linked: !changed,
                 target_name,
             });
         }
@@ -888,6 +900,17 @@ pub(crate) fn deployment_targets(
         .unwrap_or("");
     let (target, _) = find_main_app_target_for_project(&content, project_name)
         .ok_or_else(|| LpmError::Registry("No unambiguous Xcode application target".into()))?;
+    if content.contains("baseConfigurationReference")
+        || DEPLOYMENT_PLATFORMS.iter().any(|(key, _)| {
+            content
+                .lines()
+                .any(|line| line.contains(key) && (line.contains("$(") || line.contains("${")))
+        })
+    {
+        let (_, name) = find_main_app_target_for_project(&content, project_name)
+            .ok_or_else(|| LpmError::Registry("No unambiguous Xcode application target".into()))?;
+        return native::deployment_targets(project, &name);
+    }
     let project_settings = find_project_object_id(&content)
         .map(|id| deployment_configurations(&content, &id))
         .unwrap_or_default();
