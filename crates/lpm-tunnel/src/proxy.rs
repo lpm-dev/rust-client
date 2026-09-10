@@ -35,6 +35,7 @@ const ALLOWED_HEADERS: &[&str] = &[
     "pragma",
     "if-none-match",
     "if-modified-since",
+    "last-event-id",
     "range",
     "cookie",
     "authorization",
@@ -533,6 +534,65 @@ mod tests {
     #[test]
     fn max_response_body_size_is_reasonable() {
         assert_eq!(MAX_RESPONSE_BODY_SIZE, 50 * 1024 * 1024);
+    }
+
+    #[tokio::test]
+    async fn event_stream_reconnect_preserves_last_event_id() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut bytes = Vec::new();
+            let mut chunk = [0; 1024];
+            while !bytes.ends_with(b"\r\n\r\n") {
+                let count = socket.read(&mut chunk).await.unwrap();
+                assert!(count > 0);
+                bytes.extend_from_slice(&chunk[..count]);
+            }
+            let request = String::from_utf8(bytes).unwrap();
+            let resumed = request
+                .lines()
+                .any(|line| line.eq_ignore_ascii_case("last-event-id: event-1230"));
+            let body = if resumed {
+                "id: event-1231\ndata: new\n\n"
+            } else {
+                "id: event-1\ndata: old\n\n"
+            };
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\n\r\n{body}",
+                body.len()
+            );
+            socket.write_all(response.as_bytes()).await.unwrap();
+            request
+        });
+        let request = ServerMessage::HttpRequest {
+            id: "resume".into(),
+            method: "GET".into(),
+            url: "/events".into(),
+            headers: HashMap::from([("Last-Event-ID".into(), "event-1230".into())]),
+            body: String::new(),
+        };
+        let response = forward_request(
+            &reqwest::Client::builder().no_proxy().build().unwrap(),
+            &lpm_common::LocalTarget::loopback(lpm_common::LocalScheme::Http, address.port()),
+            &request,
+        )
+        .await
+        .unwrap();
+        let captured = server.await.unwrap();
+        assert!(
+            captured
+                .to_ascii_lowercase()
+                .contains("last-event-id: event-1230")
+        );
+        let ClientMessage::HttpResponse { status, body, .. } = response else {
+            panic!("expected HTTP response")
+        };
+        assert_eq!(status, 200);
+        let decoded =
+            base64::Engine::decode(&base64::engine::general_purpose::STANDARD, body).unwrap();
+        assert_eq!(decoded, b"id: event-1231\ndata: new\n\n");
     }
 
     #[tokio::test]

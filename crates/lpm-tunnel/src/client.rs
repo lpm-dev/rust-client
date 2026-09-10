@@ -109,6 +109,7 @@ enum RetryClass {
 struct TunnelConnectError {
     error: LpmError,
     retry_class: RetryClass,
+    capacity_limited: bool,
 }
 
 /// Future returned by a dynamic tunnel token callback.
@@ -172,6 +173,7 @@ impl TunnelConnectError {
         Self {
             error: LpmError::Tunnel(message.into()),
             retry_class: RetryClass::Permanent,
+            capacity_limited: false,
         }
     }
 
@@ -179,6 +181,7 @@ impl TunnelConnectError {
         Self {
             error: LpmError::Tunnel(message.into()),
             retry_class: RetryClass::Transient,
+            capacity_limited: false,
         }
     }
 
@@ -186,6 +189,7 @@ impl TunnelConnectError {
         Self {
             error: LpmError::Tunnel(message.into()),
             retry_class: RetryClass::AuthRejected,
+            capacity_limited: false,
         }
     }
 
@@ -195,7 +199,11 @@ impl TunnelConnectError {
         } else {
             RetryClass::Transient
         };
-        Self { error, retry_class }
+        Self {
+            error,
+            retry_class,
+            capacity_limited: false,
+        }
     }
 }
 
@@ -210,6 +218,7 @@ impl From<LpmError> for TunnelConnectError {
         Self {
             error,
             retry_class: RetryClass::Transient,
+            capacity_limited: false,
         }
     }
 }
@@ -268,11 +277,13 @@ fn classify_relay_rejection(status: u16, body: &[u8]) -> TunnelConnectError {
             RetryClass::Permanent
         }
     });
-    match retry_class {
+    let mut error = match retry_class {
         RetryClass::Permanent => TunnelConnectError::permanent(message),
         RetryClass::Transient => TunnelConnectError::transient(message),
         RetryClass::AuthRejected => TunnelConnectError::auth_rejected(message),
-    }
+    };
+    error.capacity_limited = code == Some("concurrent_limit");
+    error
 }
 
 fn classify_websocket_connect_error(
@@ -948,6 +959,7 @@ pub async fn connect_with_usage_fallible(
     let max_retries = 10;
     let auth_refresh_attempted = std::sync::atomic::AtomicBool::new(false);
     let mut retry_token = None;
+    let connected_once = std::sync::atomic::AtomicBool::new(false);
 
     loop {
         if options
@@ -961,7 +973,9 @@ pub async fn connect_with_usage_fallible(
         let attempt_token = retry_token.take();
         let mark_authenticated = |session: &TunnelSession| {
             auth_refresh_attempted.store(false, std::sync::atomic::Ordering::Relaxed);
-            on_connected(session)
+            on_connected(session)?;
+            connected_once.store(true, std::sync::atomic::Ordering::Relaxed);
+            Ok(())
         };
         match try_connect_with_token(
             options,
@@ -998,7 +1012,9 @@ pub async fn connect_with_usage_fallible(
                         }
                     }
                 }
-                if e.retry_class == RetryClass::Permanent {
+                let recovering_capacity =
+                    e.capacity_limited && connected_once.load(std::sync::atomic::Ordering::Relaxed);
+                if e.retry_class == RetryClass::Permanent && !recovering_capacity {
                     return Err(e.error);
                 }
                 // Reset retry counter if the connection was healthy (lasted > 60s).
@@ -1935,6 +1951,7 @@ async fn try_connect_with_token(
     on_connected(&session).map_err(|error| TunnelConnectError {
         error,
         retry_class: RetryClass::Permanent,
+        capacity_limited: false,
     })?;
     if let Some(admission) = options.forwarding_admission.as_ref() {
         tokio::select! {
@@ -1942,6 +1959,7 @@ async fn try_connect_with_token(
                 result.map_err(|error| TunnelConnectError {
                     error,
                     retry_class: RetryClass::Permanent,
+                    capacity_limited: false,
                 })?;
             }
             _ = wait_for_tunnel_shutdown(options.shutdown.as_ref()) => return Ok(()),
@@ -3190,6 +3208,98 @@ mod tests {
             .await
             .unwrap_err();
         assert!(address_error.to_string().contains("non-loopback"));
+    }
+
+    #[tokio::test]
+    async fn new_tunnel_stops_at_the_active_concurrent_limit() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let relay = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0; 4096];
+            assert!(stream.read(&mut request).await.unwrap() > 0);
+            let body = r#"{"error":"Active tunnel limit reached","code":"concurrent_limit"}"#;
+            stream.write_all(format!("HTTP/1.1 429 Too Many Requests\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
+        });
+        let mut options = TunnelOptions::new("test-token".into(), 5173);
+        options.relay_url = format!("ws://{address}/connect");
+        options.no_pin = true;
+        let error = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            connect(
+                &options,
+                |_| panic!("unexpected connection"),
+                |_| panic!("new tunnel must not retry an active cap"),
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap_err();
+        assert!(error.to_string().contains("concurrent_limit"));
+        relay.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn established_tunnel_retries_capacity_while_old_room_expires() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let relay = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let hello = serde_json::json!({
+                "type": "hello", "subdomain": "recovery.localhost",
+                "tunnel_url": "http://recovery.localhost", "session_id": "before-disconnect",
+            })
+            .to_string();
+            socket.send(Message::Text(hello.clone())).await.unwrap();
+            socket
+                .send(Message::Text(
+                    serde_json::json!({
+                        "type": "error", "code": "relay_timeout", "message": "Connection lost",
+                    })
+                    .to_string(),
+                ))
+                .await
+                .unwrap();
+            drop(socket);
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0; 4096];
+            assert!(stream.read(&mut request).await.unwrap() > 0);
+            let body = r#"{"error":"Old room still occupies capacity","code":"concurrent_limit"}"#;
+            stream.write_all(format!("HTTP/1.1 429 Too Many Requests\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len()).as_bytes()).await.unwrap();
+            drop(stream);
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            socket.send(Message::Text(hello)).await.unwrap();
+            socket.close(None).await.unwrap();
+        });
+        let mut options = TunnelOptions::new("test-token".into(), 5173);
+        options.relay_url = format!("ws://{address}/connect");
+        options.no_pin = true;
+        let count = std::sync::atomic::AtomicUsize::new(0);
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(20),
+            connect(
+                &options,
+                |_| {
+                    count.fetch_add(1, Ordering::Relaxed);
+                },
+                |_| {},
+            ),
+        )
+        .await
+        .expect("tunnel recovery timed out");
+        if result.is_err() {
+            relay.abort();
+        }
+        assert!(
+            result.is_ok(),
+            "established tunnel stopped on temporary capacity: {result:?}"
+        );
+        relay.await.unwrap();
+        assert_eq!(count.load(Ordering::Relaxed), 2);
     }
 
     #[test]
