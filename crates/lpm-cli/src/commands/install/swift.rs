@@ -16,6 +16,12 @@ pub(super) struct SwiftInstallRequest<'a> {
     pub(super) requirement: crate::swift_manifest::SwiftRequirement,
 }
 
+struct XcodeInstallContext<'a> {
+    link: &'a crate::xcode_project::XcodeLinkResult,
+    containers: &'a [crate::xcode_project::native::Container],
+    setup: crate::commands::swift_registry::SwiftRegistrySetupOutcome,
+}
+
 struct PreparedSwiftInstall<'a> {
     request: &'a SwiftInstallRequest<'a>,
     se0292_id: String,
@@ -137,6 +143,18 @@ pub(super) async fn run_swift_install_xcode_batch(
     let prepared = prepare_swift_installs(requests)?;
     let project_root = xcodeproj_path.parent().unwrap_or(project_dir);
     let wrapper = crate::swift_manifest::ensure_wrapper_package(project_root)?;
+    let wrapper_dir = wrapper.manifest_path.parent().unwrap_or(project_root);
+    let mut setup = crate::commands::swift_registry::ensure_configured(
+        options.client.session().map(|session| session.as_ref()),
+        options.client.base_url(),
+        wrapper_dir,
+        options.json_output,
+    )
+    .await?;
+    setup.include_scope_repair(
+        crate::commands::swift_registry::ensure_xcode_registry_scope(options.client.base_url())?,
+    );
+    let containers = crate::xcode_project::native::containers(project_dir, xcodeproj_path)?;
     let mut platforms = crate::xcode_project::deployment_targets(xcodeproj_path)?;
     for request in requests {
         if let Some(metadata) = &request.ver_meta.swift_meta {
@@ -192,7 +210,11 @@ pub(super) async fn run_swift_install_xcode_batch(
         &prepared,
         &edits,
         &link_result.target_name,
-        Some(&link_result),
+        Some(XcodeInstallContext {
+            link: &link_result,
+            containers: &containers,
+            setup,
+        }),
         options,
     )
     .await?;
@@ -207,7 +229,7 @@ async fn finish_swift_batch(
     packages: &[PreparedSwiftInstall<'_>],
     edits: &[crate::swift_manifest::ManifestEdit],
     target_name: &str,
-    xcode_link: Option<&crate::xcode_project::XcodeLinkResult>,
+    xcode: Option<XcodeInstallContext<'_>>,
     options: SwiftInstallOptions<'_>,
 ) -> Result<serde_json::Value, LpmError> {
     let coordinates = packages
@@ -225,24 +247,25 @@ async fn finish_swift_batch(
             output::warn(&warning);
         }
     }
-    let mut registry_setup = crate::commands::swift_registry::ensure_configured(
-        options.client.session().map(|session| session.as_ref()),
-        options.client.base_url(),
-        resolve_dir,
-        options.json_output,
-    )
-    .await?;
-    if xcode_link.is_some() {
-        registry_setup.include_scope_repair(
-            crate::commands::swift_registry::ensure_xcode_registry_scope(
+    let (xcode_link, containers, registry_setup) = match xcode {
+        Some(context) => (Some(context.link), context.containers, context.setup),
+        None => (
+            None,
+            &[][..],
+            crate::commands::swift_registry::ensure_configured(
+                options.client.session().map(|session| session.as_ref()),
                 options.client.base_url(),
-            )?,
-        );
-    }
+                resolve_dir,
+                options.json_output,
+            )
+            .await?,
+        ),
+    };
     if !options.json_output {
         output::info("Resolving Swift packages...");
     }
     crate::swift_manifest::run_swift_resolve_with_force(resolve_dir, options.force)?;
+    crate::xcode_project::native::resolve(containers)?;
     let resolved = crate::swift_manifest::validate_swift_dependency_graph(resolve_dir)?;
     let coordinates = resolved
         .nodes

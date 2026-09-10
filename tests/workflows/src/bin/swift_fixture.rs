@@ -1,4 +1,11 @@
 fn main() {
+    if std::env::args()
+        .next()
+        .is_some_and(|p| p.contains("xcodebuild"))
+    {
+        xcode();
+        return;
+    }
     let mut args = std::env::args();
     let _program = args.next();
     let command = args.next();
@@ -185,5 +192,54 @@ fn main() {
             std::process::exit(exit_code);
         }
         _ => std::process::exit(64),
+    }
+}
+
+fn xcode() {
+    use std::io::Write as _;
+    let args: Vec<_> = std::env::args().skip(1).collect();
+    if let Ok(path) = std::env::var("LPM_TEST_XCODE_LOG") {
+        writeln!(
+            std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path)
+                .unwrap(),
+            "{}",
+            serde_json::to_string(&args).unwrap()
+        )
+        .unwrap();
+    }
+    if args.iter().any(|a| a == "-list") {
+        println!(
+            "{}",
+            serde_json::json!({"workspace":{"schemes":["Custom QA"]},"project":{"schemes":["MyApp"],"configurations":["Debug","Release"]}})
+        );
+    } else if args.iter().any(|a| a == "-showBuildSettings") {
+        let config = args
+            .windows(2)
+            .find(|a| a[0] == "-configuration")
+            .map_or("Debug", |a| a[1].as_str());
+        let data: serde_json::Value = std::env::var("LPM_TEST_XCODE_SETTINGS")
+            .ok()
+            .map(|s| serde_json::from_str(&s).unwrap())
+            .unwrap_or(serde_json::json!({}));
+        println!(
+            "{}",
+            serde_json::json!([{"target":"MyApp","buildSettings":data.get(config).cloned().unwrap_or(serde_json::json!({}))}])
+        );
+    } else if args.iter().any(|a| a == "-resolvePackageDependencies") {
+        if let Ok(path) = std::env::var("LPM_TEST_XCODE_LOCKFILE") {
+            std::fs::create_dir_all(std::path::Path::new(&path).parent().unwrap()).unwrap();
+            std::fs::write(path, r#"{"version":3,"pins":[{"identity":"lpmdev.acme_swift-logger","state":{"version":"1.0.0"}}]}"#).unwrap();
+        }
+        std::process::exit(
+            std::env::var("LPM_TEST_XCODE_EXIT")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0),
+        );
+    } else {
+        std::process::exit(64);
     }
 }

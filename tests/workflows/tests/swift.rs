@@ -8,6 +8,8 @@
 //! Run with: `cargo nextest run -p lpm-workflows --features swift-tests`
 
 mod support;
+#[path = "swift/xcode.rs"]
+mod xcode;
 
 use support::auth_state::seed_sessions;
 use support::mock_registry::{MockRegistry, make_tarball};
@@ -357,6 +359,13 @@ fn fake_swift_configuration(
     let fixture = assert_cmd::cargo::cargo_bin("workflows-swift-fixture");
     std::fs::copy(fixture, &swift_path).expect("copy compiled Swift fixture");
     set_executable(&swift_path);
+    let xcode_path = bin_dir.join(if cfg!(windows) {
+        "xcodebuild.exe"
+    } else {
+        "xcodebuild"
+    });
+    std::fs::copy(&swift_path, &xcode_path).unwrap();
+    set_executable(&xcode_path);
 
     let existing_path = std::env::var_os("PATH").unwrap_or_default();
     let paths = std::iter::once(bin_dir).chain(std::env::split_paths(&existing_path));
