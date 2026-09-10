@@ -93,7 +93,7 @@ pub(crate) fn resolve_spawned_endpoint_until(
     let mut advertised = Vec::with_capacity(4);
     let mut last_owned = Vec::new();
 
-    loop {
+    'discovery: loop {
         if should_cancel() {
             return Err(ENDPOINT_DISCOVERY_CANCELLED.to_string());
         }
@@ -137,6 +137,11 @@ pub(crate) fn resolve_spawned_endpoint_until(
         last_owned = owned;
         let owned = &last_owned;
 
+        // Listener inspection can outlast stdout delivery; refresh before selecting a target.
+        if collect_pending_targets(&mut advertised, candidates) {
+            continue;
+        }
+
         for target in &advertised {
             let Some(listener) = owned
                 .iter()
@@ -163,6 +168,10 @@ pub(crate) fn resolve_spawned_endpoint_until(
             ) else {
                 continue;
             };
+            if let Ok(candidate) = candidates.try_recv() {
+                push_recent_target(&mut advertised, candidate);
+                continue 'discovery;
+            }
             if let Some(expected) = requested_port
                 && target.port != expected
             {
@@ -202,6 +211,9 @@ pub(crate) fn resolve_spawned_endpoint_until(
                         },
                     )
                 {
+                    if collect_pending_targets(&mut advertised, candidates) {
+                        continue 'discovery;
+                    }
                     return Ok(Some(DevEndpoint {
                         target,
                         service: None,
@@ -236,6 +248,9 @@ pub(crate) fn resolve_spawned_endpoint_until(
                             },
                         )
                     {
+                        if collect_pending_targets(&mut advertised, candidates) {
+                            continue 'discovery;
+                        }
                         return Ok(Some(DevEndpoint {
                             target,
                             service: None,
@@ -257,6 +272,21 @@ pub(crate) fn resolve_spawned_endpoint_until(
             return Err(endpoint_timeout_error(requested_port, owned));
         }
     }
+}
+
+fn collect_pending_targets(
+    advertised: &mut Vec<LocalTarget>,
+    candidates: &Receiver<LocalTarget>,
+) -> bool {
+    let mut received = false;
+    for _ in 0..MAX_CANDIDATES_PER_POLL {
+        let Ok(candidate) = candidates.try_recv() else {
+            break;
+        };
+        push_recent_target(advertised, candidate);
+        received = true;
+    }
+    received
 }
 
 fn endpoint_timeout_error(requested_port: Option<u16>, owned: &[ports::ListeningPort]) -> String {
@@ -680,6 +710,76 @@ mod tests {
 
         assert_eq!(result.target.address, IpAddr::V6(Ipv6Addr::LOCALHOST));
         drop(listener);
+    }
+
+    #[test]
+    fn endpoint_discovery_preserves_urls_received_while_inspecting_listeners() {
+        assert_endpoint_discovery_preserves_late_url(false, false);
+    }
+
+    #[test]
+    fn endpoint_discovery_preserves_urls_received_while_verifying_reachability() {
+        assert_endpoint_discovery_preserves_late_url(true, false);
+    }
+
+    #[test]
+    fn endpoint_discovery_refreshes_advertised_urls_during_reachability_verification() {
+        assert_endpoint_discovery_preserves_late_url(true, true);
+    }
+
+    fn assert_endpoint_discovery_preserves_late_url(
+        after_reachability: bool,
+        initially_advertised: bool,
+    ) {
+        let project = tempfile::TempDir::new().unwrap();
+        for request_port in [true, false] {
+            let listener = std::net::TcpListener::bind("[::1]:0").unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let requested_port = request_port.then_some(port);
+            let target = LocalTarget {
+                scheme: LocalScheme::Http,
+                address: IpAddr::V6(Ipv6Addr::LOCALHOST),
+                port,
+                base_path: "/app/".to_string(),
+            };
+            let (candidate_tx, candidate_rx) = std::sync::mpsc::channel();
+            if initially_advertised {
+                candidate_tx
+                    .send(target.clone().with_base_path("/before/"))
+                    .unwrap();
+            }
+            let mut pending_target = Some(target.clone());
+            let mut discovery_started = false;
+            let endpoint = resolve_spawned_endpoint_until(
+                project.path(),
+                std::process::id(),
+                None,
+                requested_port,
+                &candidate_rx,
+                Instant::now() + Duration::from_secs(5),
+                || {
+                    // The cancellation probe schedules stdout during the blocking OS checks.
+                    let deliver = if after_reachability {
+                        listener.accept().is_ok()
+                    } else {
+                        discovery_started
+                    };
+                    if deliver && let Some(target) = pending_target.take() {
+                        candidate_tx.send(target).unwrap();
+                    }
+                    discovery_started = true;
+                    false
+                },
+            )
+            .unwrap()
+            .unwrap();
+
+            assert_eq!(
+                endpoint.target, target,
+                "requested port: {requested_port:?}"
+            );
+        }
     }
 
     #[test]
