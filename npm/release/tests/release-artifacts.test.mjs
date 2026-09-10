@@ -966,6 +966,19 @@ function stagePlatformFixture(binaries, platform) {
 }
 
 
+test("release note jobs check out repository files before generating notes", () => {
+  const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../../..");
+  const workflow = fs.readFileSync(path.join(repoRoot, ".github/workflows/release.yml"), "utf8");
+  const jobs = workflow.split(/^  (?=[a-z][a-z-]+:\s*$)/m);
+  const noteJobs = jobs.filter(job => job.includes("cat npm/release/upgrade-recovery.md"));
+  assert.equal(noteJobs.length, 2);
+  for (const job of noteJobs) {
+    const checkout = job.indexOf("uses: actions/checkout@");
+    const notes = job.indexOf("cat npm/release/upgrade-recovery.md");
+    assert.ok(checkout >= 0 && checkout < notes, `${job.split("\n")[0]} must check out the notes source`);
+  }
+});
+
 test("stable and nightly release notes include verified macOS bootstrap recovery", () => {
   const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../../..");
   const workflow = fs.readFileSync(path.join(repoRoot, ".github/workflows/release.yml"), "utf8");
