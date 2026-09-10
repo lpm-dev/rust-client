@@ -102,7 +102,9 @@ pub(crate) fn resolve_spawned_endpoint_until(
             return Err(endpoint_timeout_error(requested_port, &last_owned));
         }
         match candidates.recv_timeout(remaining.min(Duration::from_millis(75))) {
-            Ok(candidate) => push_recent_target(&mut advertised, candidate),
+            Ok(candidate) => {
+                push_recent_target(&mut advertised, candidate);
+            }
             Err(RecvTimeoutError::Timeout) => {}
             Err(RecvTimeoutError::Disconnected) => {
                 if should_cancel() {
@@ -168,8 +170,8 @@ pub(crate) fn resolve_spawned_endpoint_until(
             ) else {
                 continue;
             };
-            if let Ok(candidate) = candidates.try_recv() {
-                push_recent_target(&mut advertised, candidate);
+            let target = target.clone();
+            if collect_pending_targets(&mut advertised, candidates) {
                 continue 'discovery;
             }
             if let Some(expected) = requested_port
@@ -181,7 +183,7 @@ pub(crate) fn resolve_spawned_endpoint_until(
                 ));
             }
             return Ok(Some(DevEndpoint {
-                target: target.clone(),
+                target,
                 service: None,
                 owner_pid: listener.pid,
                 owner_identity: Some(owner_identity),
@@ -278,15 +280,14 @@ fn collect_pending_targets(
     advertised: &mut Vec<LocalTarget>,
     candidates: &Receiver<LocalTarget>,
 ) -> bool {
-    let mut received = false;
+    let mut changed = false;
     for _ in 0..MAX_CANDIDATES_PER_POLL {
         let Ok(candidate) = candidates.try_recv() else {
             break;
         };
-        push_recent_target(advertised, candidate);
-        received = true;
+        changed |= push_recent_target(advertised, candidate);
     }
-    received
+    changed
 }
 
 fn endpoint_timeout_error(requested_port: Option<u16>, owned: &[ports::ListeningPort]) -> String {
@@ -513,19 +514,23 @@ fn loopback_targets_from(
         .collect()
 }
 
-fn push_recent_target(targets: &mut Vec<LocalTarget>, candidate: LocalTarget) {
+fn push_recent_target(targets: &mut Vec<LocalTarget>, candidate: LocalTarget) -> bool {
     if let Some(existing) = targets.iter_mut().find(|target| {
         target.scheme == candidate.scheme
             && target.address == candidate.address
             && target.port == candidate.port
     }) {
+        if *existing == candidate {
+            return false;
+        }
         *existing = candidate;
-        return;
+        return true;
     }
     if targets.len() == MAX_ADVERTISED_TARGETS {
         targets.remove(0);
     }
     targets.push(candidate);
+    true
 }
 
 fn push_unique_target(targets: &mut Vec<LocalTarget>, candidate: LocalTarget) {
@@ -725,6 +730,36 @@ mod tests {
     #[test]
     fn endpoint_discovery_refreshes_advertised_urls_during_reachability_verification() {
         assert_endpoint_discovery_preserves_late_url(true, true);
+    }
+
+    #[test]
+    fn repeated_advertised_urls_do_not_prevent_endpoint_discovery() {
+        let project = tempfile::TempDir::new().unwrap();
+        let listener = std::net::TcpListener::bind("[::1]:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let target = LocalTarget {
+            scheme: LocalScheme::Http,
+            address: IpAddr::V6(Ipv6Addr::LOCALHOST),
+            port,
+            base_path: "/app/".to_string(),
+        };
+        let (candidate_tx, candidate_rx) = std::sync::mpsc::channel();
+        let endpoint = resolve_spawned_endpoint_until(
+            project.path(),
+            std::process::id(),
+            None,
+            Some(port),
+            &candidate_rx,
+            Instant::now() + Duration::from_secs(5),
+            || {
+                candidate_tx.send(target.clone()).unwrap();
+                false
+            },
+        )
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(endpoint.target, target);
     }
 
     fn assert_endpoint_discovery_preserves_late_url(
