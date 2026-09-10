@@ -1,0 +1,11 @@
+{
+  "name": "@acceptance/classic",
+  "version": "1.0.0",
+  "private": true,
+  "dependencies": {
+    "react": "catalog:",
+    "react-dom": "catalog:",
+    "esbuild": "catalog:",
+    "is-odd": "3.0.1"
+  }
+}
