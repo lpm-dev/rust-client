@@ -483,6 +483,11 @@ fn collect_workspace_freshness_entries(
         &mut freshness_files,
         &mut entries,
     );
+    push_freshness_file(
+        workspace.root.join("package.json"),
+        &mut freshness_files,
+        &mut entries,
+    );
     for member in &workspace.members {
         let Ok(realpath) = member.path.canonicalize() else {
             continue;

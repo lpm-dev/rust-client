@@ -783,3 +783,45 @@ async fn removing_a_member_prunes_its_importer_on_mutable_install() {
     assert!(lock["importers"].get("packages/old").is_none());
     assert_eq!(runtime(&project, "new", "runtime-core"), "2.0.0");
 }
+
+#[tokio::test]
+async fn warm_root_preserves_registry_peer_providers_for_catalog_and_file_members() {
+    let mock = standard_registry().await;
+    let project = project(
+        json!({"dependencies":{"runtime-core":"1.0.0"},"catalogs":{"default":{"runtime-plugin":"1.0.0"}},"lpm":{"autoInstallPeers":false}}),
+        &[(
+            "app",
+            json!({"dependencies":{"runtime-plugin":"catalog:","local-helper":"file:../../vendor/local-helper"},"lpm":{"autoInstallPeers":false}}),
+        )],
+    );
+    project.write_file(
+        "vendor/local-helper/package.json",
+        r#"{"name":"local-helper","version":"1.0.0","main":"index.js"}"#,
+    );
+    project.write_file(
+        "vendor/local-helper/index.js",
+        "module.exports = 'local-ok'",
+    );
+    success(&install(
+        &project,
+        &mock,
+        "warm-root-provider",
+        "fresh",
+        &[],
+    ));
+    assert_eq!(runtime(&project, "app", "runtime-plugin"), "1.0.0");
+    let lock = project.read_file("lpm.lock");
+    for (step, args) in [
+        ("warm", vec![]),
+        ("frozen", vec!["--frozen-lockfile"]),
+        (
+            "serial",
+            vec!["--frozen-lockfile", "--workspace-concurrency", "1"],
+        ),
+    ] {
+        success(&install(&project, &mock, "warm-root-provider", step, &args));
+        assert_eq!(project.read_file("lpm.lock"), lock);
+        assert_eq!(runtime(&project, "app", "runtime-plugin"), "1.0.0");
+        assert_eq!(runtime(&project, "app", "local-helper"), "local-ok");
+    }
+}

@@ -1,8 +1,21 @@
 name: Complex workspace acceptance
 
 on:
-  push:
-    branches: [codex/complex-workspace-acceptance]
+  pull_request:
+    paths:
+      - '.github/workflows/complex-workspace-acceptance.yml'
+      - 'Cargo.lock'
+      - 'crates/lpm-cli/src/commands/install/**'
+      - 'crates/lpm-cli/src/install_state.rs'
+      - 'crates/lpm-cli/src/workspace*.rs'
+      - 'crates/lpm-resolver/**'
+      - 'crates/lpm-linker/**'
+      - 'crates/lpm-lockfile/**'
+      - 'crates/lpm-store/**'
+      - 'crates/lpm-workspace/**'
+      - 'tests/workflows/tests/workspace_acceptance.rs'
+      - 'tests/fixtures/complex-workspace-portable/**'
+      - 'scripts/ci/test-complex-workspace-consumer.py'
   workflow_dispatch:
 
 permissions:
@@ -46,7 +59,6 @@ jobs:
       - name: Build the current CLI
         run: cargo build --locked -p lpm-cli
       - name: Record deterministic workspace scenarios
-        continue-on-error: true
         env:
           LPM_WORKSPACE_ACCEPTANCE_EVIDENCE: ${{ runner.temp }}/workspace-evidence
         run: |
@@ -54,7 +66,6 @@ jobs:
           cargo test --locked -p lpm-workflows --test workspace_acceptance -- --test-threads=2 2>&1 | tee "$RUNNER_TEMP/workspace-matrix.log"
       - name: Replay the macOS lockfile with native npm dependencies
         if: always()
-        continue-on-error: true
         run: |
           python3 -c "from pathlib import Path; import subprocess; p='tests/fixtures/complex-workspace-portable/lpm.lock'; Path(p).write_bytes(subprocess.check_output(['git','show','HEAD:'+p]))"
           binary=target/debug/lpm-rs

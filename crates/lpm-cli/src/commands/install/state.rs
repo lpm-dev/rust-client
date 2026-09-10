@@ -258,7 +258,9 @@ pub(super) async fn run_install_freshness_phase(
         && input.omit_policy.is_default()
         && !input.strict_peer_dependencies
         && install_state.up_to_date
-        && compatibility_bins_ready;
+        && compatibility_bins_ready
+        // Coordinated members need the root's graph even when its files are fresh.
+        && !workspace_resolution::root_provider_snapshot_required();
     let fast_path_packages = if fast_path_base_eligible {
         let gate_stats = GateStats::default();
         let workspace = crate::workspace_discovery_cache::active_workspace(input.project_dir);

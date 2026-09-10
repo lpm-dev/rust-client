@@ -440,6 +440,16 @@ pub(super) fn active() -> bool {
     ACTIVE_TASK.try_with(|_| ()).is_ok() || ACTIVE_ROOT_PROVIDER_TASK.try_with(|_| ()).is_ok()
 }
 
+pub(super) fn root_provider_snapshot_required() -> bool {
+    ACTIVE_TASK
+        .try_with(|task| task.is_root() && !task.coordinator.root_provider_state.has_snapshot())
+        .or_else(|_| {
+            ACTIVE_ROOT_PROVIDER_TASK
+                .try_with(|task| task.is_root && !task.coordinator.has_snapshot())
+        })
+        .unwrap_or(false)
+}
+
 pub(super) fn current_unix_timestamp() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
