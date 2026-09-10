@@ -360,17 +360,24 @@ fn terminate_bun_converter(
 
 fn terminate_bun_converter_with(
     child: &mut std::process::Child,
-    terminate: impl FnOnce(&mut std::process::Child) -> std::io::Result<()>,
+    mut terminate: impl FnMut(&mut std::process::Child) -> std::io::Result<()>,
 ) -> Result<std::process::ExitStatus, LpmError> {
-    if let Err(error) = terminate(child) {
+    let started = Instant::now();
+    while let Err(error) = terminate(child) {
         let may_have_exited = error.kind() == std::io::ErrorKind::PermissionDenied;
         #[cfg(unix)]
         let may_have_exited = may_have_exited || error.raw_os_error() == Some(libc::ESRCH);
 
-        // macOS can report EPERM when the group contains only an exited child.
-        // A confirmed exit distinguishes that race from a live permission error.
-        if may_have_exited && let Some(status) = child.try_wait().map_err(LpmError::Io)? {
-            return Ok(status);
+        // macOS can reject signaling a group before its last process becomes
+        // waitable. Keep the child unreaped until its exit is confirmed.
+        if may_have_exited {
+            if let Some(status) = child.try_wait().map_err(LpmError::Io)? {
+                return Ok(status);
+            }
+            if started.elapsed() < Duration::from_millis(250) {
+                std::thread::sleep(Duration::from_millis(5));
+                continue;
+            }
         }
         return Err(LpmError::Script(format!(
             "failed to stop Bun lockfile converter: {error}"
@@ -669,7 +676,7 @@ mod tests {
 
                 let error = parse_selected(&path).unwrap_err();
 
-                assert!(error.to_string().contains("67108864-byte limit"));
+                assert!(error.to_string().contains("67108864-byte limit"), "{error}");
             },
         );
     }
@@ -703,6 +710,25 @@ mod tests {
             cleanup_status
         );
         assert_eq!(cleanup_status.code(), Some(17));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stop_permission_error_waits_for_a_converter_finishing_its_exit() {
+        use std::os::unix::process::CommandExt as _;
+
+        let mut child = std::process::Command::new("/bin/sh")
+            .args(["-c", "sleep 0.05; exit 17"])
+            .process_group(0)
+            .spawn()
+            .expect("spawn converter process group");
+        let result = terminate_bun_converter_with(&mut child, |_| {
+            Err(std::io::Error::from_raw_os_error(libc::EPERM))
+        });
+        let status = child.wait().expect("reap converter");
+
+        assert_eq!(result.expect("preserve the exit status"), status);
+        assert_eq!(status.code(), Some(17));
     }
 
     #[cfg(unix)]
