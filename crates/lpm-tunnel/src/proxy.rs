@@ -20,6 +20,47 @@ pub(crate) struct ForwardedResponse {
     pub(crate) memory_permit: Option<tokio::sync::OwnedSemaphorePermit>,
 }
 
+struct ResponseMemoryReservation {
+    budget: Arc<tokio::sync::Semaphore>,
+    total_permits: usize,
+    unit_bytes: usize,
+    multiplier: usize,
+    permit: Option<tokio::sync::OwnedSemaphorePermit>,
+}
+
+impl ResponseMemoryReservation {
+    fn try_reserve(&mut self, capacity: usize) -> Result<bool, LpmError> {
+        let needed = capacity
+            .saturating_mul(self.multiplier)
+            .div_ceil(self.unit_bytes)
+            .max(1)
+            .min(self.total_permits);
+        let held = self
+            .permit
+            .as_ref()
+            .map_or(0, |permit| permit.num_permits());
+        if needed <= held {
+            return Ok(true);
+        }
+        let additional = u32::try_from(needed - held)
+            .map_err(|_| LpmError::Tunnel("response memory budget is too large".into()))?;
+        // Waiting while retaining a partial reservation can deadlock concurrent bodies.
+        let extra = match Arc::clone(&self.budget).try_acquire_many_owned(additional) {
+            Ok(permit) => permit,
+            Err(tokio::sync::TryAcquireError::NoPermits) => return Ok(false),
+            Err(tokio::sync::TryAcquireError::Closed) => {
+                return Err(LpmError::Tunnel("response memory budget was closed".into()));
+            }
+        };
+        if let Some(permit) = &mut self.permit {
+            permit.merge(extra);
+        } else {
+            self.permit = Some(extra);
+        }
+        Ok(true)
+    }
+}
+
 /// Allowed request headers (whitelist). Only these headers are forwarded from
 /// the relay to the local dev server. Any header starting with `x-` is also
 /// allowed to support custom webhook headers.
@@ -232,33 +273,26 @@ async fn forward_request_inner(
         });
     }
 
-    let memory_permit =
-        if let Some((budget, budget_permits, unit_bytes, multiplier)) = memory_budget {
-            let raw_bytes = response
-                .content_length()
-                .and_then(|length| usize::try_from(length).ok())
-                .unwrap_or(MAX_RESPONSE_BODY_SIZE)
-                .min(MAX_RESPONSE_BODY_SIZE);
-            let estimated_bytes = raw_bytes.saturating_mul(multiplier);
-            let permits = estimated_bytes.div_ceil(unit_bytes).max(1);
-            let permits = u32::try_from(permits.min(budget_permits).max(1))
-                .map_err(|_| LpmError::Tunnel("response memory budget is too large".into()))?;
-            Some(
-                budget
-                    .acquire_many_owned(permits)
-                    .await
-                    .map_err(|_| LpmError::Tunnel("response memory budget was closed".into()))?,
-            )
-        } else {
-            None
-        };
-
-    let mut body_bytes = Vec::with_capacity(
-        response
-            .content_length()
-            .map_or(0, |length| length as usize)
-            .min(MAX_RESPONSE_BODY_SIZE),
-    );
+    let initial_capacity = response
+        .content_length()
+        .and_then(|length| usize::try_from(length).ok())
+        .unwrap_or(0)
+        .min(MAX_RESPONSE_BODY_SIZE);
+    let mut reservation = memory_budget.map(|(budget, total_permits, unit_bytes, multiplier)| {
+        ResponseMemoryReservation {
+            budget,
+            total_permits,
+            unit_bytes,
+            multiplier,
+            permit: None,
+        }
+    });
+    if let Some(reservation) = &mut reservation
+        && !reservation.try_reserve(initial_capacity)?
+    {
+        return Ok(busy_response(id));
+    }
+    let mut body_bytes = Vec::with_capacity(initial_capacity);
     let mut response = response;
     while let Some(chunk) = tokio::time::timeout_at(deadline, response.chunk())
         .await
@@ -271,8 +305,19 @@ async fn forward_request_inner(
                 message: response_too_large(id, next_len as u64),
                 stream_end: None,
                 capture_incomplete: false,
-                memory_permit,
+                memory_permit: reservation.and_then(|reservation| reservation.permit),
             });
+        }
+        if next_len > body_bytes.capacity() {
+            let capacity = next_len
+                .max(body_bytes.capacity().saturating_mul(2))
+                .min(MAX_RESPONSE_BODY_SIZE);
+            if let Some(reservation) = &mut reservation
+                && !reservation.try_reserve(capacity)?
+            {
+                return Ok(busy_response(id));
+            }
+            body_bytes.reserve_exact(capacity - body_bytes.len());
         }
         body_bytes.extend_from_slice(&chunk);
     }
@@ -286,10 +331,19 @@ async fn forward_request_inner(
             headers: resp_headers,
             body: body_b64,
         },
-        memory_permit,
+        memory_permit: reservation.and_then(|reservation| reservation.permit),
         stream_end: None,
         capture_incomplete: false,
     })
+}
+
+fn busy_response(id: &str) -> ForwardedResponse {
+    ForwardedResponse {
+        message: service_unavailable_response(id),
+        stream_end: None,
+        capture_incomplete: false,
+        memory_permit: None,
+    }
 }
 
 /// Create an HTTP response for when the local server is unreachable.
@@ -715,6 +769,135 @@ mod tests {
             response,
             ClientMessage::HttpResponse { status: 502, .. }
         ));
+    }
+
+    #[tokio::test]
+    async fn chunked_response_completes_while_another_response_holds_memory() {
+        let budget = Arc::new(tokio::sync::Semaphore::new(64));
+        let held = Arc::clone(&budget).acquire_owned().await.unwrap();
+        let response = budgeted_test_response(
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n2\r\nok\r\n0\r\n\r\n",
+            Arc::clone(&budget),
+            64,
+            1024 * 1024,
+        )
+        .await;
+        assert!(matches!(
+            response.message,
+            ClientMessage::HttpResponse { status: 200, .. }
+        ));
+        assert_eq!(budget.available_permits(), 62);
+        drop(response);
+        drop(held);
+        assert_eq!(budget.available_permits(), 64);
+    }
+
+    #[tokio::test]
+    async fn response_memory_saturation_returns_retryable_busy_without_waiting() {
+        let budget = Arc::new(tokio::sync::Semaphore::new(4));
+        let held = Arc::clone(&budget).acquire_many_owned(4).await.unwrap();
+        let response = budgeted_test_response(
+            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok",
+            Arc::clone(&budget),
+            4,
+            1024,
+        )
+        .await;
+        let ClientMessage::HttpResponse {
+            status, headers, ..
+        } = response.message
+        else {
+            panic!("expected HTTP response")
+        };
+        assert_eq!(status, 503);
+        assert_eq!(headers.get("retry-after").map(String::as_str), Some("1"));
+        drop(held);
+        assert_eq!(budget.available_permits(), 4);
+    }
+
+    #[tokio::test]
+    async fn growing_chunked_response_releases_its_reservation_when_memory_is_busy() {
+        let budget = Arc::new(tokio::sync::Semaphore::new(4));
+        let held = Arc::clone(&budget).acquire_owned().await.unwrap();
+        let response = budgeted_test_response(
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n2\r\nok\r\ne\r\n0123456789abcd\r\n0\r\n\r\n",
+            Arc::clone(&budget),
+            4,
+            4,
+        )
+        .await;
+        assert!(matches!(
+            response.message,
+            ClientMessage::HttpResponse { status: 503, .. }
+        ));
+        assert_eq!(budget.available_permits(), 3);
+        drop(held);
+        assert_eq!(budget.available_permits(), 4);
+    }
+
+    async fn budgeted_test_response(
+        raw: &'static [u8],
+        budget: Arc<tokio::sync::Semaphore>,
+        permits: usize,
+        unit_bytes: usize,
+    ) -> ForwardedResponse {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0; 1024];
+            assert!(socket.read(&mut request).await.unwrap() > 0);
+            socket.write_all(raw).await.unwrap();
+        });
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let target =
+            lpm_common::LocalTarget::loopback(lpm_common::LocalScheme::Http, address.port());
+        let request = ServerMessage::HttpRequest {
+            id: "budgeted".into(),
+            method: "GET".into(),
+            url: "/health".into(),
+            headers: HashMap::new(),
+            body: String::new(),
+        };
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            forward_request_with_memory_budget(
+                &client, &target, &request, budget, permits, unit_bytes, 4, None,
+            ),
+        )
+        .await;
+        server.await.unwrap();
+        result
+            .expect("response waited for unrelated memory reservations")
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn chunked_response_keeps_its_grown_memory_reservation_until_dropped() {
+        let budget = Arc::new(tokio::sync::Semaphore::new(4));
+        let response = budgeted_test_response(
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n2\r\nok\r\ne\r\n0123456789abcd\r\n0\r\n\r\n",
+            Arc::clone(&budget),
+            4,
+            16,
+        )
+        .await;
+        let ClientMessage::HttpResponse {
+            status, ref body, ..
+        } = response.message
+        else {
+            panic!("expected HTTP response")
+        };
+        assert_eq!(status, 200);
+        assert_eq!(
+            base64::Engine::decode(&base64::engine::general_purpose::STANDARD, body).unwrap(),
+            b"ok0123456789abcd"
+        );
+        assert_eq!(budget.available_permits(), 0);
+        drop(response);
+        assert_eq!(budget.available_permits(), 4);
     }
 
     #[tokio::test]
