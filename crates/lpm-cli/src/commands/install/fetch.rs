@@ -644,6 +644,36 @@ pub(super) async fn run_online_fetch_phase(
     // splitting patched installs into project-isolated link entries.
     let patch_fingerprints = compute_patch_fingerprints(current_patches, current_lockfile_patches)?;
 
+    if used_lockfile {
+        for package in &packages {
+            let Ok(lpm_lockfile::Source::Tarball { url }) = package.source_kind() else {
+                continue;
+            };
+            let Some(path) = url.strip_prefix("file:") else {
+                continue;
+            };
+            validate_local_tarball_raw_path(path).map_err(LpmError::Registry)?;
+            let data =
+                read_local_tarball_bounded(&project_dir.join(path), 500 * 1024 * 1024).await?;
+            let sri = package.integrity.as_deref().ok_or_else(|| {
+                LpmError::Registry(format!(
+                    "local archive {} has no locked integrity",
+                    package.name
+                ))
+            })?;
+            let integrity = lpm_common::integrity::Integrity::parse(sri)?;
+            integrity.verify(&data)?;
+            if let Some(store_v2) = store_v2_handle.as_deref() {
+                store_v2.extract_object(sri, &data)?;
+            } else {
+                let content_hash = sri_to_sha256_hex(sri).ok_or_else(|| {
+                    LpmError::Registry("local archive requires SHA-256 integrity".to_string())
+                })?;
+                store.store_local_tarball_at_cas_path(&content_hash, &data)?;
+            }
+        }
+    }
+
     // Build link targets up front so the event-driven path can start
     // per-package linking as each tarball lands.
     // `LinkTarget` fields don't depend on fetch completion — just on
@@ -937,11 +967,17 @@ pub(super) async fn run_online_fetch_phase(
             p.source_kind(),
             Ok(lpm_lockfile::Source::Directory { .. }) | Ok(lpm_lockfile::Source::Link { .. })
         );
+        let is_local_archive = matches!(
+            p.source_kind(),
+            Ok(lpm_lockfile::Source::Tarball { url }) if url.starts_with("file:")
+        );
         if is_local_source && !v2_mode {
             fetch_stage_timings.local_source_count += 1;
         }
 
-        if v2_mode && is_local_source {
+        // Local archives are materialized before this loop on fresh and locked
+        // installs, including --force; they have no remote URL to fetch.
+        if v2_mode && (is_local_source || is_local_archive) {
             let classification_start = timing_detail_start(fetch_detail_timing_enabled);
             cached += 1;
             if v2_event_driven
@@ -1127,7 +1163,8 @@ pub(super) async fn run_online_fetch_phase(
             }
         }
 
-        if !force && !v2_mode && p.store_has_source_aware(&store, project_dir) {
+        if (!force || is_local_archive) && !v2_mode && p.store_has_source_aware(&store, project_dir)
+        {
             let classification_start = timing_detail_start(fetch_detail_timing_enabled);
             cached += 1;
             fetch_stage_timings.v1_cache_hit_count += 1;

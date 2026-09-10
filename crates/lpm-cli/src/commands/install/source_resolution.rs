@@ -77,6 +77,8 @@ pub(super) struct SourceDep {
     /// directory/link target. Registry-style dependencies leave this
     /// empty and resolve through the registry package index.
     pub(super) target_source: Option<String>,
+    /// Temporary resolver alias when an archive requires a different root version.
+    pub(super) registry_root: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -745,13 +747,10 @@ pub(super) fn apply_virtual_store_migration(
 /// surface as an opaque "invalid semver range" from `node_semver`.
 ///
 /// Current limitations:
-/// - Both `Source::Tarball` arms are graph leaves — transitive deps
-///   from the embedded `package.json` are NOT yet fed back into the
-///   resolver. Real-world local tarballs (CI artifacts, single-file
-///   utility packages) are typically self-contained.
-/// - Lockfile fast-path doesn't fire when the lockfile contains
-///   non-Registry source entries — falls back to fresh-resolve.
-///   Correctness fine; warm-restart perf follow-up.
+/// - Remote tarball URLs remain graph leaves. Local archives include
+///   registry dependencies from their embedded package manifest.
+/// - Remote tarball URL entries require fresh resolution. Local archive
+///   replay checks the declared path and locked content hash.
 #[allow(clippy::too_many_arguments)]
 #[cfg(test)]
 pub(super) async fn pre_resolve_non_registry_deps(
@@ -985,7 +984,8 @@ pub(super) async fn pre_resolve_non_registry_deps_with_optional_registry_roots(
     // symlink. Empty for non-workspace projects (the / the invariant
     // checks short-circuit on empty `workspace_members`).
     let mut additional_workspace_links: Vec<WorkspaceMemberLink> = Vec::new();
-    let mut git_source_deps: HashMap<String, Vec<SourceDep>> = HashMap::new();
+    let dependency_names_before_expansion: HashSet<String> = deps.keys().cloned().collect();
+    let mut archive_source_deps: HashMap<String, Vec<SourceDep>> = HashMap::new();
     let mut resolved_git_sources = HashMap::with_capacity(git_specs.len());
 
     for (local_name, raw_spec, url, reference) in git_specs {
@@ -1038,11 +1038,11 @@ pub(super) async fn pre_resolve_non_registry_deps_with_optional_registry_roots(
                 lpm_common::sanitize_terminal_inline(&real_name),
             ));
         }
-        collect_git_source_dependencies(
+        collect_archive_source_dependencies(
             &package_dir,
             &resolved.locked_source,
             deps,
-            &mut git_source_deps,
+            &mut archive_source_deps,
             auto_install_peers,
         )?;
         resolved_git_sources.insert(raw_spec, resolved.locked_source.clone());
@@ -1225,18 +1225,17 @@ pub(super) async fn pre_resolve_non_registry_deps_with_optional_registry_roots(
                 ))
             })?;
 
-        // SHA-256 of the bytes — the CAS key for tarball-local.
-        // (Distinct from the SRI written into `.integrity` by the
-        // shared `store_at_dir` helper, which uses sha512 by default
-        // for parity with the registry/remote-tarball arms.)
-        let content_sha256_hex = {
-            use sha2::{Digest, Sha256};
-            let mut h = Sha256::new();
-            h.update(&data);
-            format!("{:x}", h.finalize())
+        let integrity = lpm_common::integrity::Integrity::from_bytes(
+            lpm_common::integrity::HashAlgorithm::Sha256,
+            &data,
+        );
+        let integrity_sri = integrity.to_string();
+        let cas_path = if let Some(store_v2) = store_v2 {
+            store_v2.extract_object(&integrity_sri, &data)?
+        } else {
+            let content_hash = hex::encode(&integrity.hash);
+            store.store_local_tarball_at_cas_path(&content_hash, &data)?
         };
-
-        let cas_path = store.store_local_tarball_at_cas_path(&content_sha256_hex, &data)?;
 
         let (real_name, real_version, node_engine) = read_pkg_json_name_version(
             &cas_path,
@@ -1262,15 +1261,13 @@ pub(super) async fn pre_resolve_non_registry_deps_with_optional_registry_roots(
         // entry remains per-consumer.
         let source = format!("tarball+file:{raw_path}");
 
-        // SRI for the lockfile `integrity` field — the actual
-        // content hash in canonical SRI form. Allows `lpm install
-        // --strict-integrity` to verify local tarballs the same way it
-        // does remote ones.
-        let integrity_sri = lpm_common::integrity::Integrity::from_bytes(
-            lpm_common::integrity::HashAlgorithm::Sha256,
-            &data,
-        )
-        .to_string();
+        collect_archive_source_dependencies(
+            &cas_path,
+            &source,
+            deps,
+            &mut archive_source_deps,
+            auto_install_peers,
+        )?;
 
         install_pkgs.push(InstallPackage {
             instance_id: None,
@@ -1292,11 +1289,7 @@ pub(super) async fn pre_resolve_non_registry_deps_with_optional_registry_roots(
             platform: None,
             node_engine,
             optional: false,
-            // tarball_url is fresh-URL writeback (registry-
-            // specific). Local tarballs have no remote URL, so leave
-            // `None`. Documented caveat: warm-restart fast-path
-            // doesn't fire for `Source::Tarball { file: }` lockfile
-            // entries.
+            // Local archives retain their file source and have no remote fetch URL.
             tarball_url: None,
             metadata_checked_for_tarball: false,
             manifest_fingerprint: None,
@@ -1580,7 +1573,6 @@ pub(super) async fn pre_resolve_non_registry_deps_with_optional_registry_roots(
     // the post-resolve fix-up at install.rs:2663+.
     //
     mark_direct_root_optionality(&mut install_pkgs, inherited_optional_registry_roots);
-    let dependency_names_before_expansion: HashSet<String> = deps.keys().cloned().collect();
     let LocalSourceExpansionResult {
         source_deps: mut source_deps_out,
         additional_workspace_links,
@@ -1594,7 +1586,7 @@ pub(super) async fn pre_resolve_non_registry_deps_with_optional_registry_roots(
         WorkspaceTransitiveMode::RootSymlinkOnly,
         auto_install_peers,
     )?;
-    source_deps_out.extend(git_source_deps);
+    source_deps_out.extend(archive_source_deps);
     let optional_registry_roots = merge_optional_registry_roots(
         &dependency_names_before_expansion,
         inherited_optional_registry_roots,
@@ -2022,13 +2014,14 @@ fn source_dep_specs_from_value(
                 optional: field == "optionalDependencies" || optional_peer,
                 auto_install: !optional_peer,
                 target_source: None,
+                registry_root: None,
             });
         }
     }
     Ok(out)
 }
 
-pub(super) fn collect_git_source_dependencies(
+pub(super) fn collect_archive_source_dependencies(
     package_dir: &Path,
     parent_source: &str,
     resolver_dependencies: &mut HashMap<String, String>,
@@ -2043,9 +2036,37 @@ pub(super) fn collect_git_source_dependencies(
             }
         }
     }
-    for spec in &specs {
+    for spec in &mut specs {
         match spec.kind {
             DepKind::Registry if spec.auto_install => {
+                if parent_source.starts_with("tarball+file:")
+                    && matches!(spec.role, SourceDepRole::Dependency)
+                    && resolver_dependencies
+                        .get(&spec.local_name)
+                        .is_some_and(|existing| existing != &spec.raw_spec)
+                {
+                    use sha2::{Digest, Sha256};
+                    let digest = Sha256::digest(
+                        format!("{parent_source}\0{}\0{}", spec.local_name, spec.raw_spec)
+                            .as_bytes(),
+                    );
+                    let base = format!("lpm-archive-{}", hex::encode(digest));
+                    let mut key = base.clone();
+                    let mut suffix = 0usize;
+                    while resolver_dependencies.contains_key(&key) {
+                        suffix += 1;
+                        key = format!("{base}-{suffix}");
+                    }
+                    let request = if lpm_resolver::ranges::parse_npm_alias(&spec.raw_spec).is_some()
+                    {
+                        spec.raw_spec.clone()
+                    } else {
+                        format!("npm:{}@{}", spec.local_name, spec.raw_spec)
+                    };
+                    resolver_dependencies.insert(key.clone(), request);
+                    spec.registry_root = Some(key);
+                    continue;
+                }
                 resolver_dependencies
                     .entry(spec.local_name.clone())
                     .or_insert_with(|| spec.raw_spec.clone());
@@ -2053,7 +2074,7 @@ pub(super) fn collect_git_source_dependencies(
             DepKind::Registry => {}
             DepKind::Workspace | DepKind::FileDir | DepKind::Link | DepKind::Git => {
                 return Err(LpmError::Registry(format!(
-                    "GitHub dependency {:?} declares unsupported nested non-registry dependency {:?} ({:?}); publish or vendor that nested source",
+                    "Archive dependency {:?} declares unsupported nested non-registry dependency {:?} ({:?}); publish or vendor that nested source",
                     parent_source, spec.local_name, spec.raw_spec
                 )));
             }
@@ -3003,6 +3024,7 @@ pub(super) fn apply_post_resolve_directory_link_fixup(
             lpm_lockfile::Source::Directory { .. }
                 | lpm_lockfile::Source::Link { .. }
                 | lpm_lockfile::Source::Git { .. }
+                | lpm_lockfile::Source::Tarball { .. }
         );
         if !is_source_backed {
             continue;
@@ -3028,7 +3050,7 @@ pub(super) fn apply_post_resolve_directory_link_fixup(
                         SourceDepRole::Dependency => {
                             let root_selection = select_local_source_registry_root(
                                 &registry_roots,
-                                &spec.local_name,
+                                spec.registry_root.as_deref().unwrap_or(&spec.local_name),
                                 lookup_name,
                                 &p.name,
                                 &p.version,
@@ -3036,8 +3058,37 @@ pub(super) fn apply_post_resolve_directory_link_fixup(
                             let version = root_selection
                                 .as_ref()
                                 .map(|(version, _)| version)
-                                .or_else(|| name_to_version.get(lookup_name));
+                                .or_else(|| {
+                                    if spec.registry_root.is_some() {
+                                        None
+                                    } else {
+                                        name_to_version.get(lookup_name)
+                                    }
+                                });
                             if let Some(version) = version {
+                                if p.source.starts_with("tarball+file:") {
+                                    let requested_range =
+                                        alias.as_ref().map_or(spec.raw_spec.as_str(), |alias| {
+                                            alias.range.as_str()
+                                        });
+                                    if let (Ok(range), Ok(resolved_version)) = (
+                                        lpm_resolver::NpmRange::parse(requested_range),
+                                        lpm_resolver::NpmVersion::parse(version),
+                                    ) && !range.satisfies(&resolved_version)
+                                    {
+                                        if spec.optional {
+                                            continue;
+                                        }
+                                        return Err(LpmError::Registry(format!(
+                                            "archive {}@{} requires {}@{}, but resolved {}",
+                                            p.name,
+                                            p.version,
+                                            spec.local_name,
+                                            requested_range,
+                                            version
+                                        )));
+                                    }
+                                }
                                 deps_out.push((spec.local_name.clone(), version.clone()));
                                 let instance_id = root_selection
                                     .as_ref()
@@ -3167,6 +3218,22 @@ pub(super) fn apply_post_resolve_directory_link_fixup(
     }
 
     apply_local_source_optionality(packages, source_deps);
+    let internal_roots: HashSet<&str> = source_deps
+        .values()
+        .flatten()
+        .filter_map(|spec| spec.registry_root.as_deref())
+        .collect();
+    if internal_roots.is_empty() {
+        return Ok(());
+    }
+    for package in packages {
+        if let Some(names) = &mut package.root_link_names {
+            names.retain(|name| !internal_roots.contains(name.as_str()));
+            if names.is_empty() {
+                package.is_direct = false;
+            }
+        }
+    }
     Ok(())
 }
 
@@ -3366,9 +3433,19 @@ fn registry_root_optionality(
                 continue;
             }
             if parent_required && !spec.optional {
-                optionality.required.insert(spec.local_name.clone());
+                optionality.required.insert(
+                    spec.registry_root
+                        .as_ref()
+                        .unwrap_or(&spec.local_name)
+                        .clone(),
+                );
             } else {
-                optionality.optional.insert(spec.local_name.clone());
+                optionality.optional.insert(
+                    spec.registry_root
+                        .as_ref()
+                        .unwrap_or(&spec.local_name)
+                        .clone(),
+                );
             }
         }
     }

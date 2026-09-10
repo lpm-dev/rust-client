@@ -2663,6 +2663,24 @@ pub(super) fn online_local_source_is_allowed(
     deps: &HashMap<String, String>,
     workspace: Option<&lpm_workspace::Workspace>,
 ) -> bool {
+    if let Some(Ok(lpm_lockfile::Source::Tarball { url })) = package.source_kind()
+        && let Some(path) = url.strip_prefix("file:")
+    {
+        if validate_local_tarball_raw_path(path).is_err()
+            || !deps.values().any(|spec| {
+                locked_source_identity_matches_requested_spec(package, spec, lockfile_dir)
+            })
+        {
+            return false;
+        }
+        let archive = lockfile_dir.join(path);
+        return std::fs::metadata(&archive)
+            .is_ok_and(|metadata| metadata.is_file() && metadata.len() <= 500 * 1024 * 1024)
+            && package.integrity.as_deref().is_some_and(|sri| {
+                lpm_common::integrity::Integrity::parse(sri)
+                    .is_ok_and(|integrity| integrity.verify_file(&archive).is_ok())
+            });
+    }
     let source_path = match package
         .source
         .as_deref()
@@ -2890,17 +2908,6 @@ fn try_lockfile_fast_path_from_rows(
     // using the same algorithm as `resolved_to_install_packages` so
     // the warm-install layout matches the fresh-install layout
     // byte-for-byte.
-    //
-    // keyed by PackageKey
-    // (name, version, source_id) to match the fresh-resolve loop's
-    // bookkeeping. This map is defensively future-proofed:
-    // the warm-install path only fires when `is_safe_source` accepts
-    // every package — and `is_safe_source` rejects `tarball+...`
-    // sources today (see [`lpm_lockfile::is_safe_source`] + the
-    // gate at ~line 4488), so any lockfile containing a tarball-URL
-    // entry falls back to fresh-resolve. Once `is_safe_source` is
-    // taught about non-Registry sources, the
-    // PackageKey-based lookups in this loop are already correct.
     //
     // Keep the raw source in this short-lived key to distinguish
     // same-version packages from different registries, tarballs, or

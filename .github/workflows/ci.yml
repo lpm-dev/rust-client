@@ -278,6 +278,9 @@ jobs:
       - name: Build workspace
         run: cargo build --workspace --locked
 
+      - name: Local package archive installs
+        run: cargo nextest run --locked -p lpm-workflows --test install_local_tarball --no-fail-fast --status-level slow --final-status-level fail
+
       - name: Install and publish interruption recovery
         run: cargo nextest run --locked -p lpm-workflows --test install_concurrency --test publish -E 'test(interrupted_install) | test(publish_duplicate_version_explains) | test(install_with_metadata_404)' --no-fail-fast --status-level slow --final-status-level fail
 
