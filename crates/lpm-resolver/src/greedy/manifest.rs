@@ -652,6 +652,41 @@ fn latest_version_from_metadata(metadata: &lpm_registry::PackageMetadata) -> Opt
         .and_then(|version| NpmVersion::parse(version).ok())
 }
 
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn refresh_missing_range(
+    edge: &Edge,
+    info: Arc<CachedPackageInfo>,
+    client: &RegistryClient,
+    route_table: &RouteTable,
+    shared_cache: &SharedCache,
+    policy: &ResolverPolicy,
+    refreshed: &mut AHashSet<CanonicalKey>,
+) -> Result<Arc<CachedPackageInfo>, ResolveError> {
+    if !info.workspace_versions.is_empty()
+        || super::version::versions_by_npm_preference(&info, &edge.range)
+            .next()
+            .is_some()
+        || !refreshed.insert(edge.canonical.clone())
+    {
+        return Ok(info);
+    }
+    let metadata = crate::provider::revalidate_metadata(client, route_table, &edge.canonical)
+        .await
+        .map_err(|error| metadata_fetch_error(&edge.canonical, error))?;
+    let fresh = Arc::new(parse_owned_metadata_to_cache_info(metadata));
+    shared_cache.insert(edge.canonical.clone(), fresh.clone());
+    ensure_policy_metadata_for_cached_manifest(
+        &edge.canonical,
+        fresh,
+        client,
+        route_table,
+        shared_cache,
+        policy,
+        lpm_registry::timing::metadata_fetch_detail_enabled(),
+    )
+    .await
+}
+
 pub(super) async fn ensure_policy_metadata_for_cached_manifest(
     canonical: &CanonicalKey,
     info: Arc<CachedPackageInfo>,

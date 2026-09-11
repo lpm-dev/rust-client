@@ -53,8 +53,9 @@ use windows_sys::Win32::Foundation::{
     HLOCAL, INVALID_HANDLE_VALUE, LocalFree, SetHandleInformation, WAIT_ABANDONED, WAIT_OBJECT_0,
 };
 use windows_sys::Win32::Security::Authorization::{
-    EXPLICIT_ACCESS_W, GetNamedSecurityInfoW, NO_MULTIPLE_TRUSTEE, SE_FILE_OBJECT, SET_ACCESS,
-    SetEntriesInAclW, SetNamedSecurityInfoW, TRUSTEE_IS_GROUP, TRUSTEE_IS_SID, TRUSTEE_W,
+    EXPLICIT_ACCESS_W, GetNamedSecurityInfoW, GetSecurityInfo, NO_MULTIPLE_TRUSTEE, SE_FILE_OBJECT,
+    SET_ACCESS, SetEntriesInAclW, SetNamedSecurityInfoW, TRUSTEE_IS_GROUP, TRUSTEE_IS_SID,
+    TRUSTEE_W,
 };
 use windows_sys::Win32::Security::Isolation::{
     CreateAppContainerProfile, DeleteAppContainerProfile, DeriveAppContainerSidFromAppContainerName,
@@ -65,11 +66,13 @@ use windows_sys::Win32::Security::{
     GetSecurityDescriptorDacl, InitializeAcl, OBJECT_INHERIT_ACE,
     PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID, SE_DACL_PROTECTED,
     SECURITY_ATTRIBUTES, SECURITY_CAPABILITIES, SID_AND_ATTRIBUTES,
-    UNPROTECTED_DACL_SECURITY_INFORMATION, WELL_KNOWN_SID_TYPE, WinCapabilityInternetClientSid,
+    UNPROTECTED_DACL_SECURITY_INFORMATION, WELL_KNOWN_SID_TYPE, WinBuiltinAnyPackageSid,
+    WinCapabilityInternetClientSid,
 };
 use windows_sys::Win32::Storage::FileSystem::{
-    CreateFileW, FILE_ATTRIBUTE_REPARSE_POINT, FILE_GENERIC_EXECUTE, FILE_GENERIC_READ,
-    FILE_GENERIC_WRITE, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
+    CreateFileW, FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS,
+    FILE_FLAG_OPEN_REPARSE_POINT, FILE_GENERIC_EXECUTE, FILE_GENERIC_READ, FILE_GENERIC_WRITE,
+    FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
 };
 use windows_sys::Win32::System::Console::{
     GetStdHandle, STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
@@ -88,6 +91,9 @@ use windows_sys::Win32::System::Threading::{
 };
 
 use crate::helper_protocol::{HelperArgs, StdioMode, split_env_entry};
+
+/// Explicit setup for Windows sandbox filesystem permissions.
+pub mod setup;
 
 /// `SE_GROUP_ENABLED` from winnt.h. The Attributes field of every
 /// `SID_AND_ATTRIBUTES` inside a `SECURITY_CAPABILITIES.Capabilities`
@@ -112,6 +118,20 @@ const PROFILE_CREATION_MUTEX_NAME: &str = r"Local\LpmSandboxAppContainerProfileC
 /// debugger.
 #[derive(Debug, thiserror::Error)]
 pub enum AppContainerError {
+    /// A required filesystem permission needs explicit administrator setup.
+    #[error(
+        "Windows sandbox permissions are missing for {path}. Preview them with `lpm doctor sandbox-setup`. Apply the preview from an administrator terminal for your normal Windows user, then retry publishing without elevation."
+    )]
+    SetupRequired {
+        /// Directory whose metadata is inaccessible to the sandbox.
+        path: PathBuf,
+    },
+    /// Explicit sandbox setup could not complete.
+    #[error("Windows sandbox setup failed: {reason}")]
+    Setup {
+        /// The failed setup operation and recovery information.
+        reason: String,
+    },
     /// `CreateMutexW` failed opening the cross-process profile creation lock.
     #[error("CreateMutexW(AppContainer profile creation) failed with Win32 error {last_error}")]
     CreateProfileMutex {
@@ -156,7 +176,7 @@ pub enum AppContainerError {
         last_error: u32,
     },
     /// Reading the existing DACL via `GetNamedSecurityInfoW` failed.
-    #[error("GetNamedSecurityInfoW({path}) failed with Win32 error {win32_error}")]
+    #[error("cannot read permissions for {path}: Win32 error {win32_error}")]
     ReadDacl {
         /// Path whose DACL we tried to read.
         path: PathBuf,
@@ -173,7 +193,7 @@ pub enum AppContainerError {
         win32_error: u32,
     },
     /// `SetNamedSecurityInfoW` failed writing the merged DACL back.
-    #[error("SetNamedSecurityInfoW({path}) failed with Win32 error {win32_error}")]
+    #[error("cannot update permissions for {path}: Win32 error {win32_error}")]
     WriteDacl {
         /// Path we tried to update.
         path: PathBuf,
@@ -233,6 +253,14 @@ pub enum AppContainerError {
         program: OsString,
         /// `GetLastError` reading.
         last_error: u32,
+    },
+    /// The shell cannot use the requested directory without changing its meaning.
+    #[error("cannot use working directory {path:?}: {source}")]
+    WorkingDirectory {
+        /// Requested working directory.
+        path: PathBuf,
+        /// Filesystem error or shell path limitation.
+        source: std::io::Error,
     },
     /// `AssignProcessToJobObject` failed (the lifecycle child is
     /// still suspended at this point, so we'll terminate it via the
@@ -611,6 +639,8 @@ pub fn run_appcontainer_spawn(args: HelperArgs) -> Result<i32, AppContainerError
         }
     }
 
+    let prepared_access = setup::prepare(&args, &sid)?;
+
     // 2. Snapshot secret DACLs, then apply this invocation's allow-set.
     //    Secret policy lands last and the snapshots are restored after exit.
     //
@@ -632,6 +662,12 @@ pub fn run_appcontainer_spawn(args: HelperArgs) -> Result<i32, AppContainerError
     // downstream with a clearer "tool not found" error than a hard
     // sandbox-setup failure would give.
     for dir in &args.best_effort_readable_dirs {
+        if dir
+            .canonicalize()
+            .is_ok_and(|path| prepared_access.configured_tools.contains(&path))
+        {
+            continue;
+        }
         grant_dacl_ace_to_tree(
             dir,
             sid.0,
@@ -676,11 +712,20 @@ pub fn run_appcontainer_spawn(args: HelperArgs) -> Result<i32, AppContainerError
         CapabilityCount: 0,
         Reserved: 0,
     };
-    let mut caps_storage: [SID_AND_ATTRIBUTES; 1];
-    if let Some(attr) = internet_attrs {
-        caps_storage = [attr];
+    let mut caps_storage = Vec::with_capacity(prepared_access.capabilities.len() + 1);
+    caps_storage.extend(
+        prepared_access
+            .capabilities
+            .iter()
+            .map(|sid| SID_AND_ATTRIBUTES {
+                Sid: sid.raw(),
+                Attributes: SE_GROUP_ENABLED,
+            }),
+    );
+    caps_storage.extend(internet_attrs);
+    if !caps_storage.is_empty() {
         sec_caps.Capabilities = caps_storage.as_mut_ptr();
-        sec_caps.CapabilityCount = 1;
+        sec_caps.CapabilityCount = caps_storage.len() as u32;
     }
 
     // 4. Allocate the attribute list and attach SECURITY_CAPABILITIES.
@@ -712,7 +757,9 @@ pub fn run_appcontainer_spawn(args: HelperArgs) -> Result<i32, AppContainerError
     let working_dir_wide = args
         .working_dir
         .as_ref()
-        .map(|p| to_wide_with_nul(p.as_os_str()));
+        .map(|path| process_working_directory(path, &args.program))
+        .transpose()?
+        .map(|path| to_wide_with_nul(path.as_os_str()));
 
     // 8. Build STARTUPINFOEXW with the attribute list + stdio handles.
     //    The base StartupInfo is the inner field; the EX wrapper
@@ -807,6 +854,8 @@ pub fn run_appcontainer_spawn(args: HelperArgs) -> Result<i32, AppContainerError
         let last = unsafe { GetLastError() };
         return Err(AppContainerError::ExitCode { last_error: last });
     }
+    // Descendants must stop before secret permissions are restored.
+    drop(job);
     for restore in secret_dacl_restores.iter_mut().rev() {
         restore.restore()?;
     }
@@ -947,10 +996,9 @@ fn build_capability_attr(
 /// mask to `root` and every existing descendant.
 ///
 /// **Reparse-point handling.** A reparse-point root
-/// (junction / symlink / mount point) is refused — `SetNamedSecurityInfoW`
-/// follows reparse points and would apply the grant to the
-/// reparse-point target, potentially outside the intended allow-set
-/// tree. Reparse-point descendants are skipped with a debug log.
+/// (junction / symlink / mount point) is refused. Reparse-point
+/// descendants are skipped so grants cannot reach targets outside the
+/// intended allow-set tree.
 ///
 /// `SET_ACCESS` replaces prior explicit entries for this SID while
 /// preserving every other trustee's ACL entries.
@@ -1006,6 +1054,10 @@ fn grant_dacl_ace_to_tree(
         return Ok(());
     }
 
+    if !strict_root && has_inheritable_appcontainer_access(root, access_mask) {
+        return Ok(());
+    }
+
     // Root-grant failure handling depends on `strict_root`:
     //
     // - **Strict (spec-derived allow-set entries):** any failure
@@ -1047,11 +1099,6 @@ fn grant_dacl_ace_to_tree(
         return Ok(());
     }
 
-    // Walk pre-existing descendants. OICI inheritance on the root
-    // covers FUTURE files created inside, but already-extracted
-    // package files (extractor wrote them with the parent's DACL)
-    // need explicit grants. Per-entry failures are logged and
-    // swallowed so a single stuck file doesn't fail the install.
     if meta.is_dir() {
         let mut stack: Vec<PathBuf> = vec![root.to_path_buf()];
         while let Some(dir) = stack.pop() {
@@ -1066,48 +1113,141 @@ fn grant_dacl_ace_to_tree(
                     continue;
                 }
             };
-            for entry in entries.flatten() {
-                let path = entry.path();
-                let m = match entry.metadata() {
-                    Ok(m) => m,
-                    Err(e) => {
-                        tracing::debug!(
-                            target: "lpm_sandbox::helper_appcontainer",
-                            "skip DACL grant on {}: metadata failed: {e}",
-                            path.display(),
-                        );
-                        continue;
-                    }
-                };
-                if is_reparse_point(&m) {
-                    tracing::debug!(
-                        target: "lpm_sandbox::helper_appcontainer",
-                        "skip reparse point {} during DACL walk \
-                         (target not granted to prevent escape outside allow-set)",
-                        path.display(),
-                    );
-                    continue;
+            use rayon::prelude::*;
+            static POOL: std::sync::OnceLock<Option<rayon::ThreadPool>> =
+                std::sync::OnceLock::new();
+            let entries = entries.flatten().collect::<Vec<_>>();
+            // The SID remains owned by the caller until all scoped pool work completes.
+            let sid_address = sid as usize;
+            let grant = |entry| grant_dacl_directory_entry(entry, sid_address as PSID, access_mask);
+            let children = if entries.len() > 1 {
+                let pool = POOL.get_or_init(|| {
+                    rayon::ThreadPoolBuilder::new()
+                        .num_threads(
+                            std::thread::available_parallelism().map_or(1, |n| n.get().min(4)),
+                        )
+                        .build()
+                        .ok()
+                });
+                match pool {
+                    Some(pool) => pool.install(|| {
+                        entries
+                            .into_par_iter()
+                            .filter_map(grant)
+                            .collect::<Vec<_>>()
+                    }),
+                    None => entries.into_iter().filter_map(grant).collect(),
                 }
-                if let Err(e) = set_dacl_ace_on(
-                    &path,
-                    sid,
-                    access_mask,
-                    OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE,
-                ) {
-                    tracing::debug!(
-                        target: "lpm_sandbox::helper_appcontainer",
-                        "skip DACL grant on {}: {e}",
-                        path.display(),
-                    );
-                }
-                if m.is_dir() {
-                    stack.push(path);
-                }
-            }
+            } else {
+                entries.into_iter().filter_map(grant).collect()
+            };
+            stack.extend(children);
         }
     }
 
     Ok(())
+}
+
+fn grant_dacl_directory_entry(
+    entry: std::fs::DirEntry,
+    sid: PSID,
+    access_mask: u32,
+) -> Option<PathBuf> {
+    let path = entry.path();
+    let metadata = match entry.metadata() {
+        Ok(metadata) => metadata,
+        Err(error) => {
+            tracing::debug!(path = %path.display(), "skip DACL metadata: {error}");
+            return None;
+        }
+    };
+    if is_reparse_point(&metadata) {
+        return None;
+    }
+    if let Err(error) = set_dacl_ace_on(
+        &path,
+        sid,
+        access_mask,
+        OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE,
+    ) {
+        tracing::debug!(path = %path.display(), "skip DACL grant: {error}");
+    }
+    metadata.is_dir().then_some(path)
+}
+
+fn has_inheritable_appcontainer_access(path: &Path, access_mask: u32) -> bool {
+    let mut sid_buffer = vec![0u8; 64];
+    let Ok(packages) = build_capability_attr(WinBuiltinAnyPackageSid, &mut sid_buffer) else {
+        return false;
+    };
+    let wide_path = to_wide_with_nul(path.as_os_str());
+    let mut dacl: *mut ACL = ptr::null_mut();
+    let mut descriptor: PSECURITY_DESCRIPTOR = ptr::null_mut();
+    // SAFETY: the terminated path and initialized out parameters live through the call.
+    let error = unsafe {
+        GetNamedSecurityInfoW(
+            wide_path.as_ptr(),
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION,
+            ptr::null_mut(),
+            ptr::null_mut(),
+            &mut dacl,
+            ptr::null_mut(),
+            &mut descriptor,
+        )
+    };
+    if error != ERROR_SUCCESS {
+        return false;
+    }
+    let _descriptor = LocalAllocGuard(descriptor as *mut _);
+    if dacl.is_null() {
+        return false;
+    }
+    let mut direct_access = 0;
+    let mut file_access = 0;
+    let mut directory_access = 0;
+    let mapping = windows_sys::Win32::Security::GENERIC_MAPPING {
+        GenericRead: FILE_GENERIC_READ,
+        GenericWrite: FILE_GENERIC_WRITE,
+        GenericExecute: FILE_GENERIC_EXECUTE,
+        GenericAll: windows_sys::Win32::Storage::FileSystem::FILE_ALL_ACCESS,
+    };
+    // SAFETY: the DACL belongs to the live security descriptor.
+    for index in 0..unsafe { (*dacl).AceCount } as u32 {
+        let mut ace: *mut std::ffi::c_void = ptr::null_mut();
+        // SAFETY: the index is bounded by the valid ACL's AceCount.
+        if unsafe { GetAce(dacl, index, &mut ace) } == 0 {
+            return false;
+        }
+        let header = ace as *const windows_sys::Win32::Security::ACE_HEADER;
+        // SAFETY: each ACE starts with a header; only allow ACEs use ACCESS_ALLOWED_ACE.
+        unsafe {
+            if (*header).AceType != ACCESS_ALLOWED_ACE_TYPE {
+                return false;
+            }
+            let allowed = ace as *const ACCESS_ALLOWED_ACE;
+            if EqualSid(ptr::addr_of!((*allowed).SidStart) as PSID, packages.Sid) == 0 {
+                continue;
+            }
+            let mut mask = (*allowed).Mask;
+            windows_sys::Win32::Security::MapGenericMask(&mut mask, &mapping);
+            let flags = (*header).AceFlags as u32;
+            if flags & windows_sys::Win32::Security::INHERIT_ONLY_ACE == 0 {
+                direct_access |= mask;
+            }
+            if flags & windows_sys::Win32::Security::NO_PROPAGATE_INHERIT_ACE == 0 {
+                if flags & OBJECT_INHERIT_ACE != 0 {
+                    file_access |= mask;
+                }
+                if flags & CONTAINER_INHERIT_ACE != 0 {
+                    directory_access |= mask;
+                }
+            }
+        }
+    }
+    [direct_access, file_access, directory_access]
+        .into_iter()
+        .all(|mask| mask & access_mask == access_mask)
 }
 
 fn protect_secret_path_from_appcontainer(path: &Path, sid: PSID) -> Result<(), AppContainerError> {
@@ -1157,6 +1297,38 @@ fn protect_secret_path_from_appcontainer(path: &Path, sid: PSID) -> Result<(), A
 
     let mut filtered_dacl = dacl_without_allowed_aces_for_sid(path, old_dacl, sid)?;
 
+    let entry = EXPLICIT_ACCESS_W {
+        grfAccessPermissions: FILE_GENERIC_READ | FILE_GENERIC_EXECUTE,
+        grfAccessMode: windows_sys::Win32::Security::Authorization::DENY_ACCESS,
+        grfInheritance: 0,
+        Trustee: TRUSTEE_W {
+            pMultipleTrustee: ptr::null_mut(),
+            MultipleTrusteeOperation: NO_MULTIPLE_TRUSTEE,
+            TrusteeForm: TRUSTEE_IS_SID,
+            TrusteeType: TRUSTEE_IS_GROUP,
+            ptstrName: sid.cast(),
+        },
+    };
+    let mut denied_dacl = ptr::null_mut();
+    // A tool capability can also grant reads. Deny the invocation SID so
+    // approved tool access cannot bypass the current project's secret policy.
+    // SAFETY: the filtered ACL and SID remain valid through the merge.
+    let merged = unsafe {
+        SetEntriesInAclW(
+            1,
+            &entry,
+            filtered_dacl.as_mut_ptr().cast(),
+            &mut denied_dacl,
+        )
+    };
+    if merged != ERROR_SUCCESS {
+        return Err(AppContainerError::MergeDacl {
+            path: path.to_path_buf(),
+            win32_error: merged,
+        });
+    }
+    let _denied_dacl = LocalAllocGuard(denied_dacl.cast());
+
     // SAFETY: the filtered ACL is initialized, valid, and lives through the call.
     let err = unsafe {
         SetNamedSecurityInfoW(
@@ -1165,7 +1337,7 @@ fn protect_secret_path_from_appcontainer(path: &Path, sid: PSID) -> Result<(), A
             DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
             ptr::null_mut(),
             ptr::null_mut(),
-            filtered_dacl.as_mut_ptr() as *mut ACL,
+            denied_dacl,
             ptr::null(),
         )
     };
@@ -1256,89 +1428,7 @@ fn set_dacl_ace_on(
     access_mask: u32,
     inheritance: u32,
 ) -> Result<(), AppContainerError> {
-    let wide_path = to_wide_with_nul(path.as_os_str());
-
-    // Build the EXPLICIT_ACCESS_W carrying the new ACE.
-    let mut trustee = TRUSTEE_W {
-        pMultipleTrustee: ptr::null_mut(),
-        MultipleTrusteeOperation: NO_MULTIPLE_TRUSTEE,
-        TrusteeForm: TRUSTEE_IS_SID,
-        TrusteeType: TRUSTEE_IS_GROUP,
-        // When TrusteeForm == TRUSTEE_IS_SID, the SDK contract is
-        // that `ptstrName` holds the SID pointer (cast). Documented
-        // pattern.
-        ptstrName: sid as *mut u16,
-    };
-    let ea = EXPLICIT_ACCESS_W {
-        grfAccessPermissions: access_mask,
-        grfAccessMode: SET_ACCESS,
-        grfInheritance: inheritance,
-        Trustee: trustee,
-    };
-    // Silence the unused-write lint — Trustee is read by the
-    // closure via `ea.Trustee` reference.
-    let _ = &mut trustee;
-
-    // Read the current DACL so we can merge instead of replace.
-    let mut old_dacl: *mut ACL = ptr::null_mut();
-    let mut sd: PSECURITY_DESCRIPTOR = ptr::null_mut();
-    // SAFETY: wide_path Vec<u16> outlives the call; out params are
-    // freshly initialized.
-    let err = unsafe {
-        GetNamedSecurityInfoW(
-            wide_path.as_ptr(),
-            SE_FILE_OBJECT,
-            DACL_SECURITY_INFORMATION,
-            ptr::null_mut(),
-            ptr::null_mut(),
-            &mut old_dacl,
-            ptr::null_mut(),
-            &mut sd,
-        )
-    };
-    if err != ERROR_SUCCESS {
-        return Err(AppContainerError::ReadDacl {
-            path: path.to_path_buf(),
-            win32_error: err,
-        });
-    }
-    let _sd_guard = LocalAllocGuard(sd as *mut _);
-
-    // Merge into a new DACL.
-    let mut new_dacl: *mut ACL = ptr::null_mut();
-    // SAFETY: `ea` is a valid EXPLICIT_ACCESS_W on this stack
-    // frame; `old_dacl` is owned by `_sd_guard`; `new_dacl` out
-    // param is freshly null.
-    let err = unsafe { SetEntriesInAclW(1, &ea, old_dacl, &mut new_dacl) };
-    if err != ERROR_SUCCESS {
-        return Err(AppContainerError::MergeDacl {
-            path: path.to_path_buf(),
-            win32_error: err,
-        });
-    }
-    let _new_dacl_guard = LocalAllocGuard(new_dacl as *mut _);
-
-    // Grants re-enable inheritance so current and future descendants receive
-    // the invocation-scoped AppContainer SID policy.
-    // SAFETY: wide_path lives; new_dacl is non-null + valid.
-    let err = unsafe {
-        SetNamedSecurityInfoW(
-            wide_path.as_ptr(),
-            SE_FILE_OBJECT,
-            DACL_SECURITY_INFORMATION | UNPROTECTED_DACL_SECURITY_INFORMATION,
-            ptr::null_mut(),
-            ptr::null_mut(),
-            new_dacl,
-            ptr::null(),
-        )
-    };
-    if err != ERROR_SUCCESS {
-        return Err(AppContainerError::WriteDacl {
-            path: path.to_path_buf(),
-            win32_error: err,
-        });
-    }
-    Ok(())
+    setup::update_ace(path, sid, Some((access_mask, inheritance)))
 }
 
 fn is_reparse_point(metadata: &std::fs::Metadata) -> bool {
@@ -1671,6 +1761,47 @@ fn build_environment_block(envs: &[OsString], env_clear: bool) -> Vec<u16> {
 
 // ── Wide-string helpers ──────────────────────────────────────────────
 
+fn process_working_directory(path: &Path, program: &OsStr) -> Result<PathBuf, AppContainerError> {
+    use std::os::windows::ffi::OsStringExt as _;
+    use std::path::{Component, Prefix};
+
+    let is_cmd = Path::new(program)
+        .file_name()
+        .and_then(OsStr::to_str)
+        .is_some_and(|name| {
+            name.eq_ignore_ascii_case("cmd.exe") || name.eq_ignore_ascii_case("cmd")
+        });
+    if !is_cmd {
+        return Ok(path.to_path_buf());
+    }
+    let Some(Component::Prefix(prefix)) = path.components().next() else {
+        return Ok(path.to_path_buf());
+    };
+    let failure = |source| AppContainerError::WorkingDirectory {
+        path: path.to_path_buf(),
+        source,
+    };
+    match prefix.kind() {
+        Prefix::Disk(_) => Ok(path.to_path_buf()),
+        Prefix::VerbatimDisk(_) => {
+            // CMD mistakes the extended drive prefix for UNC and changes to C:\Windows.
+            // Verify equivalence so stripping it cannot redirect trailing-dot or reserved paths.
+            let wide = path.as_os_str().encode_wide().collect::<Vec<_>>();
+            let ordinary = PathBuf::from(OsString::from_wide(&wide[4..]));
+            if ordinary.canonicalize().map_err(failure)? != path.canonicalize().map_err(failure)? {
+                return Err(failure(std::io::Error::other(
+                    "CMD cannot represent this directory without changing its meaning",
+                )));
+            }
+            Ok(ordinary)
+        }
+        _ => Err(failure(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "CMD requires a local drive working directory; use a local project directory",
+        ))),
+    }
+}
+
 fn str_to_wide_with_nul(s: &str) -> Vec<u16> {
     let mut v: Vec<u16> = s.encode_utf16().collect();
     v.push(0);
@@ -1689,6 +1820,25 @@ fn to_wide_with_nul(s: &OsStr) -> Vec<u16> {
 mod tests {
     use super::*;
     use windows_sys::Win32::Security::GetLengthSid;
+
+    #[test]
+    fn cmd_working_directory_rejects_paths_that_change_when_the_prefix_is_removed() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().canonicalize().unwrap();
+        let ordinary = root.join("project");
+        let extended_only = root.join("project.");
+        std::fs::create_dir(&ordinary).unwrap();
+        std::fs::create_dir(&extended_only).unwrap();
+        assert!(process_working_directory(&extended_only, OsStr::new("cmd.exe")).is_err());
+        assert_eq!(
+            process_working_directory(&extended_only, OsStr::new("node.exe")).unwrap(),
+            extended_only
+        );
+        assert!(
+            process_working_directory(Path::new(r"\\server\share\project"), OsStr::new("CMD.EXE"))
+                .is_err()
+        );
+    }
 
     #[test]
     fn quote_arg_for_cmdline_passes_simple_args_unmodified() {
@@ -1879,6 +2029,158 @@ mod tests {
     }
 
     #[test]
+    fn best_effort_dacl_grants_preserve_existing_application_package_access() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut buffer = vec![0u8; 64];
+        let packages = build_capability_attr(WinBuiltinAnyPackageSid, &mut buffer).unwrap();
+        let mask = FILE_GENERIC_READ | FILE_GENERIC_EXECUTE;
+        set_dacl_ace_on(
+            tmp.path(),
+            packages.Sid,
+            mask,
+            OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE,
+        )
+        .unwrap();
+        assert!(has_inheritable_appcontainer_access(tmp.path(), mask));
+        assert!(!has_inheritable_appcontainer_access(
+            tmp.path(),
+            mask | FILE_GENERIC_WRITE
+        ));
+        let child = tmp.path().join("child");
+        std::fs::write(&child, b"tool").unwrap();
+        let mut before = SecretDaclRestore::capture(&child).unwrap().unwrap();
+        before.active = false;
+        let sid = create_or_reuse_appcontainer_sid("LpmExistingToolAccessTest").unwrap();
+        grant_dacl_ace_to_tree(tmp.path(), sid.0, mask, false).unwrap();
+        let mut after = SecretDaclRestore::capture(&child).unwrap().unwrap();
+        after.active = false;
+        assert_eq!(before.security_descriptor, after.security_descriptor);
+    }
+
+    fn set_test_dacl(path: &Path, sddl: &str) {
+        use windows_sys::Win32::Security::Authorization::{
+            ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
+        };
+        let wide_sddl = str_to_wide_with_nul(sddl);
+        let mut descriptor = ptr::null_mut();
+        let mut dacl = ptr::null_mut();
+        let mut present = 0;
+        let mut defaulted = 0;
+        // SAFETY: the trusted SDDL and initialized out parameters live through each call.
+        unsafe {
+            assert_ne!(
+                ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                    wide_sddl.as_ptr(),
+                    SDDL_REVISION_1,
+                    &mut descriptor,
+                    ptr::null_mut(),
+                ),
+                0
+            );
+            let _descriptor = LocalAllocGuard(descriptor as *mut _);
+            assert_ne!(
+                GetSecurityDescriptorDacl(descriptor, &mut present, &mut dacl, &mut defaulted),
+                0
+            );
+            assert_ne!(present, 0);
+            assert_eq!(
+                SetNamedSecurityInfoW(
+                    to_wide_with_nul(path.as_os_str()).as_ptr(),
+                    SE_FILE_OBJECT,
+                    DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+                    ptr::null_mut(),
+                    ptr::null_mut(),
+                    dacl,
+                    ptr::null(),
+                ),
+                ERROR_SUCCESS
+            );
+        }
+    }
+
+    #[test]
+    fn best_effort_dacl_recognizes_split_generic_application_package_access() {
+        let tmp = tempfile::tempdir().unwrap();
+        set_test_dacl(
+            tmp.path(),
+            "D:P(A;OICI;FA;;;OW)(A;;0x1200a9;;;AC)(A;OICIIO;GXGR;;;AC)",
+        );
+        let mask = FILE_GENERIC_READ | FILE_GENERIC_EXECUTE;
+        assert!(has_inheritable_appcontainer_access(tmp.path(), mask));
+        assert!(!has_inheritable_appcontainer_access(
+            tmp.path(),
+            mask | FILE_GENERIC_WRITE
+        ));
+        let child = tmp.path().join("tool.txt");
+        std::fs::write(&child, b"tool").unwrap();
+        let mut before = SecretDaclRestore::capture(&child).unwrap().unwrap();
+        before.active = false;
+        let sid = create_or_reuse_appcontainer_sid("LpmSplitToolAccessTest").unwrap();
+        grant_dacl_ace_to_tree(tmp.path(), sid.0, mask, false).unwrap();
+        let mut after = SecretDaclRestore::capture(&child).unwrap().unwrap();
+        after.active = false;
+        assert_eq!(before.security_descriptor, after.security_descriptor);
+    }
+
+    #[test]
+    fn best_effort_dacl_requires_propagating_access_without_denials() {
+        let tmp = tempfile::tempdir().unwrap();
+        for sddl in [
+            "D:P(A;OICI;FA;;;OW)(A;;0x1200a9;;;AC)",
+            "D:P(A;OICI;FA;;;OW)(A;OICIIO;GXGR;;;AC)",
+            "D:P(A;OICI;FA;;;OW)(A;;0x1200a9;;;AC)(A;OICIIONP;GXGR;;;AC)",
+            "D:P(D;;GW;;;AC)(A;OICI;FA;;;OW)(A;OICI;GXGR;;;AC)",
+        ] {
+            set_test_dacl(tmp.path(), sddl);
+            assert!(
+                !has_inheritable_appcontainer_access(
+                    tmp.path(),
+                    FILE_GENERIC_READ | FILE_GENERIC_EXECUTE
+                ),
+                "{sddl}"
+            );
+        }
+    }
+
+    #[test]
+    fn dacl_grant_succeeds_while_a_directory_handle_denies_delete_sharing() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let _reader = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+            .open(tmp.path())
+            .unwrap();
+        let sid = create_or_reuse_appcontainer_sid("LpmHeldDirectoryGrantTest").unwrap();
+        grant_dacl_ace_to_tree(tmp.path(), sid.0, FILE_GENERIC_READ, true).unwrap();
+    }
+
+    #[test]
+    fn per_entry_dacl_grant_does_not_rescan_existing_descendants() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let child = tmp.path().join("child.txt");
+        std::fs::write(&child, b"content").unwrap();
+        let mut before = SecretDaclRestore::capture(&child).unwrap().unwrap();
+        before.active = false;
+        let sid = create_or_reuse_appcontainer_sid("LpmSingleEntryGrantTest").unwrap();
+        set_dacl_ace_on(
+            tmp.path(),
+            sid.0,
+            FILE_GENERIC_READ,
+            OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE,
+        )
+        .unwrap();
+        let mut after = SecretDaclRestore::capture(&child).unwrap().unwrap();
+        after.active = false;
+        assert_eq!(before.security_descriptor, after.security_descriptor);
+        grant_dacl_ace_to_tree(tmp.path(), sid.0, FILE_GENERIC_READ, true).unwrap();
+        let mut walked = SecretDaclRestore::capture(&child).unwrap().unwrap();
+        walked.active = false;
+        assert_ne!(before.security_descriptor, walked.security_descriptor);
+    }
+
+    #[test]
     fn grant_dacl_ace_to_tree_succeeds_on_regular_dir() {
         // Create a temp directory + a child file, then verify the
         // DACL grant operation succeeds. The post-condition check
@@ -1898,63 +2200,68 @@ mod tests {
         .expect("grant on regular dir must succeed");
     }
 
-    /// Pins the strict-vs-best-effort split on root-grant failure:
-    ///
-    ///   - `strict_root = true` propagates the failure as `Err`,
-    ///   - `strict_root = false` swallows it (logs WARN, returns
-    ///     `Ok`).
-    ///
-    /// A regression that silently downgrades strict allow-set
-    /// entries to best-effort would let a misconfigured install
-    /// pipeline weaken containment without surfacing the issue.
     #[test]
     fn grant_dacl_ace_to_tree_distinguishes_strict_from_best_effort_on_root_failure() {
-        // Use `C:\Windows\System32` as a guaranteed-unwritable
-        // root (owned by SYSTEM, even Administrators get an
-        // implicit "Modify" deny on the DACL itself unless they
-        // take ownership). The grant will fail with
-        // ERROR_ACCESS_DENIED for an unprivileged process.
-        let unwritable = std::path::Path::new(r"C:\Windows\System32");
-        if !unwritable.exists() {
-            // Defensive — should always exist on Windows.
-            eprintln!("skipping: System32 not at expected path");
-            return;
-        }
-        // Unique profile name so this test doesn't race against
-        // the sibling `create_or_reuse_appcontainer_sid_*` tests
-        // for `CreateAppContainerProfile`'s session-state. Cargo
-        // runs unit tests in parallel by default and a contended
-        // first call has been observed to return non-S_OK +
-        // non-ALREADY_EXISTS here.
-        let sid = create_or_reuse_appcontainer_sid("LpmHelperBestEffortRootGrantTest")
-            .expect("derive SID");
+        use windows_sys::Win32::Security::{
+            AdjustTokenPrivileges, ImpersonateSelf, RevertToSelf, SecurityImpersonation,
+            TOKEN_ADJUST_PRIVILEGES, TOKEN_QUERY,
+        };
+        use windows_sys::Win32::System::Threading::{GetCurrentThread, OpenThreadToken};
 
-        // strict_root = true: failure propagates.
-        let strict_result = grant_dacl_ace_to_tree(
-            unwritable,
-            sid.0,
-            FILE_GENERIC_READ,
-            /* strict_root */ true,
-        );
+        struct RevertImpersonation;
+        impl Drop for RevertImpersonation {
+            fn drop(&mut self) {
+                // SAFETY: this test established impersonation only on the current thread.
+                unsafe { RevertToSelf() };
+            }
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        set_test_dacl(tmp.path(), "D:P(D;;RCWD;;;WD)(A;OICI;FA;;;OW)");
+        // Hosted administrators can bypass DACLs through backup/restore privileges.
+        // Disable privileges on a private thread token without changing parallel tests.
+        unsafe {
+            // SAFETY: all handles and output pointers are valid for the synchronous calls.
+            assert_ne!(ImpersonateSelf(SecurityImpersonation), 0);
+        }
+        let _revert = RevertImpersonation;
+        let mut token = ptr::null_mut();
+        unsafe {
+            // SAFETY: this thread is impersonating; token is an initialized output slot.
+            assert_ne!(
+                OpenThreadToken(
+                    GetCurrentThread(),
+                    TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY,
+                    1,
+                    &mut token
+                ),
+                0
+            );
+        }
+        let token = HandleGuard(token);
+        unsafe {
+            // SAFETY: disable-all ignores new-state and output buffers, which are null.
+            assert_ne!(
+                AdjustTokenPrivileges(
+                    token.as_raw(),
+                    1,
+                    ptr::null(),
+                    0,
+                    ptr::null_mut(),
+                    ptr::null_mut()
+                ),
+                0
+            );
+        }
+        let sid = create_or_reuse_appcontainer_sid("LpmDeniedDaclTest").unwrap();
+        let strict = grant_dacl_ace_to_tree(tmp.path(), sid.0, FILE_GENERIC_READ, true);
         assert!(
             matches!(
-                strict_result,
-                Err(AppContainerError::WriteDacl { .. }) | Err(AppContainerError::ReadDacl { .. })
+                strict,
+                Err(AppContainerError::ReadDacl { .. }) | Err(AppContainerError::WriteDacl { .. })
             ),
-            "strict_root=true must propagate root-grant failure on an unwritable dir; got {strict_result:?}",
+            "{strict:?}"
         );
-
-        // strict_root = false: failure is swallowed; returns Ok.
-        let best_effort_result = grant_dacl_ace_to_tree(
-            unwritable,
-            sid.0,
-            FILE_GENERIC_READ,
-            /* strict_root */ false,
-        );
-        assert!(
-            best_effort_result.is_ok(),
-            "strict_root=false must swallow root-grant failure (WARN + continue); got {best_effort_result:?}",
-        );
+        grant_dacl_ace_to_tree(tmp.path(), sid.0, FILE_GENERIC_READ, false).unwrap();
     }
 
     /// Reparse-point roots must honor `strict_root` too: a junction

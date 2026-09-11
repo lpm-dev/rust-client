@@ -229,6 +229,7 @@ pub struct LpmDependencyProvider {
     /// (e.g. a future per-split platform override) can't accidentally
     /// read stale memoized Ranges from a prior pass.
     pub(super) range_cache: Mutex<HashMap<(ResolverPackage, String), Ranges<NpmVersion>>>,
+    pub(super) refreshed_metadata: Mutex<HashSet<CanonicalKey>>,
     pub(super) available_versions_cache: Mutex<HashMap<ResolverPackage, Arc<[NpmVersion]>>>,
     pub(super) include_optional_dependencies: bool,
 }

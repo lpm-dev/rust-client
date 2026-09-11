@@ -503,6 +503,9 @@ fn prepare_safe_dest_parent_with(
                         directory.display()
                     ))
                 })?;
+                // Windows directory readers deny delete sharing. Release the
+                // publication handle's DELETE access before opening the reader.
+                drop(created_child);
                 canonical_current.push(name);
                 let child = current.open_dir_nofollow(name).map_err(|error| {
                     LpmError::Registry(format!(
@@ -666,7 +669,7 @@ fn validate_quarantined_directory_branch(
                 let parent_index = directories[child]
                     .parent
                     .expect("non-root traversal node has a parent");
-                let parent = current.open_parent_dir(cap_std::ambient_authority())?;
+                let parent = crate::directory_transaction::open_directory_parent(&current)?;
                 if directory_identity(&parent)? != directories[parent_index].identity {
                     return Err(std::io::Error::other("directory parent identity changed"));
                 }
@@ -704,7 +707,7 @@ fn remove_quarantined_directory_descendants(
                 let parent_index = directories[child]
                     .parent
                     .expect("non-root traversal node has a parent");
-                let parent = current.open_parent_dir(cap_std::ambient_authority())?;
+                let parent = crate::directory_transaction::open_directory_parent(&current)?;
                 if directory_identity(&parent)? != directories[parent_index].identity {
                     return Err(std::io::Error::other("directory parent identity changed"));
                 }
@@ -1292,8 +1295,7 @@ mod tests {
             &mut rollback,
             |directory| recorded.push(directory.to_path_buf()),
             |current, name, directory| {
-                current.create_dir(name)?;
-                let created = current.open_dir_nofollow(name)?;
+                let created = create_owned_directory_noreplace(current, name)?;
                 std::fs::rename(directory, &displaced)?;
                 std::fs::create_dir(directory)?;
                 Ok(created)

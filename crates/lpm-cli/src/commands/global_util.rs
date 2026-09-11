@@ -206,7 +206,7 @@ pub(super) fn discover_materialized_bin_commands(
             tracing::warn!("global install: skipping invalid bin \"{command}\": {reason}");
             continue;
         }
-        let bin_path = bin_dir.join(&command);
+        let bin_path = lpm_global::project_command_path(&bin_dir, &command);
         if !is_materialized_bin_command(&bin_path)? {
             tracing::warn!(
                 "global install: skipping bin \"{command}\" because {} was not materialized",
@@ -293,10 +293,13 @@ fn is_materialized_bin_command(bin_path: &Path) -> Result<bool, LpmError> {
     if meta.is_symlink() && !bin_path.exists() {
         return Ok(false);
     }
+    let target_meta = std::fs::metadata(bin_path).map_err(LpmError::Io)?;
+    if !target_meta.is_file() {
+        return Ok(false);
+    }
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let target_meta = std::fs::metadata(bin_path).map_err(LpmError::Io)?;
         Ok(target_meta.permissions().mode() & 0o111 != 0)
     }
     #[cfg(not(unix))]
@@ -486,12 +489,20 @@ mod tests {
                 "good": "./bin/good.js",
                 "../escape": "./bin/escape.js",
                 "missing": "./bin/missing.js",
+                "directory": "./bin/directory.js",
             }),
         );
         let bin_dir = tmp.path().join("node_modules").join(".bin");
         std::fs::create_dir_all(&bin_dir).unwrap();
+        #[cfg(windows)]
+        let good = bin_dir.join("good.cmd");
+        #[cfg(not(windows))]
         let good = bin_dir.join("good");
         std::fs::write(&good, b"#!/bin/sh\necho ok\n").unwrap();
+        #[cfg(windows)]
+        std::fs::create_dir(bin_dir.join("directory.cmd")).unwrap();
+        #[cfg(not(windows))]
+        std::fs::create_dir(bin_dir.join("directory")).unwrap();
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;

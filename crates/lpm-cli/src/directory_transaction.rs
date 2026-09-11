@@ -215,12 +215,18 @@ fn private_parent_has_extended_acl(_parent: &Dir) -> std::io::Result<bool> {
 
 #[cfg(windows)]
 fn create_and_open_private_directory(parent: &Dir, name: &OsStr) -> std::io::Result<Dir> {
+    open_windows_directory(parent, name, true)
+}
+
+#[cfg(windows)]
+fn open_windows_directory(parent: &Dir, name: &OsStr, create: bool) -> std::io::Result<Dir> {
     use std::mem::size_of;
     use std::os::windows::ffi::OsStrExt as _;
     use std::os::windows::io::{AsRawHandle as _, FromRawHandle as _};
     use windows_sys::Wdk::Foundation::OBJECT_ATTRIBUTES;
     use windows_sys::Wdk::Storage::FileSystem::{
-        FILE_CREATE, FILE_DIRECTORY_FILE, FILE_SYNCHRONOUS_IO_NONALERT, NtCreateFile,
+        FILE_CREATE, FILE_DIRECTORY_FILE, FILE_OPEN, FILE_OPEN_REPARSE_POINT,
+        FILE_SYNCHRONOUS_IO_NONALERT, NtCreateFile,
     };
     use windows_sys::Win32::Foundation::{
         GENERIC_READ, GENERIC_WRITE, HANDLE, LocalFree, OBJ_CASE_INSENSITIVE,
@@ -247,26 +253,42 @@ fn create_and_open_private_directory(parent: &Dir, name: &OsStr) -> std::io::Res
         }
     }
 
+    let mut components = std::path::Path::new(name).components();
+    if !matches!(components.next(), Some(std::path::Component::Normal(_)))
+        || components.next().is_some()
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "transaction directory requires a single name",
+        ));
+    }
     let owner_only_sddl = "D:P(A;OICI;FA;;;OW)(A;OICI;FA;;;SY)"
         .encode_utf16()
         .chain(std::iter::once(0))
         .collect::<Vec<_>>();
     let mut security_descriptor = std::ptr::null_mut();
-    if unsafe {
-        // SAFETY: the SDDL is NUL-terminated and the output becomes LocalFree-owned on success.
-        ConvertStringSecurityDescriptorToSecurityDescriptorW(
-            owner_only_sddl.as_ptr(),
-            SDDL_REVISION_1,
-            &mut security_descriptor,
-            std::ptr::null_mut(),
-        )
-    } == 0
+    if create
+        && unsafe {
+            // SAFETY: the SDDL is NUL-terminated and the output becomes LocalFree-owned on success.
+            ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                owner_only_sddl.as_ptr(),
+                SDDL_REVISION_1,
+                &mut security_descriptor,
+                std::ptr::null_mut(),
+            )
+        } == 0
     {
         return Err(std::io::Error::last_os_error());
     }
     let security_descriptor = LocalSecurityDescriptor(security_descriptor);
 
     let mut name = name.encode_wide().collect::<Vec<_>>();
+    if name.contains(&0) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "transaction directory name contains NUL",
+        ));
+    }
     let name_bytes = name
         .len()
         .checked_mul(size_of::<u16>())
@@ -302,8 +324,8 @@ fn create_and_open_private_directory(parent: &Dir, name: &OsStr) -> std::io::Res
             std::ptr::null(),
             FILE_ATTRIBUTE_NORMAL,
             FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-            FILE_CREATE,
-            FILE_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT,
+            if create { FILE_CREATE } else { FILE_OPEN },
+            FILE_DIRECTORY_FILE | FILE_OPEN_REPARSE_POINT | FILE_SYNCHRONOUS_IO_NONALERT,
             std::ptr::null(),
             0,
         )
@@ -319,6 +341,17 @@ fn create_and_open_private_directory(parent: &Dir, name: &OsStr) -> std::io::Res
         // SAFETY: successful NtCreateFile returned a new owned directory handle.
         std::fs::File::from_raw_handle(handle.cast())
     };
+    use std::os::windows::fs::MetadataExt;
+    let metadata = file.metadata()?;
+    if !metadata.is_dir()
+        || metadata.file_attributes()
+            & windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT
+            != 0
+    {
+        return Err(std::io::Error::other(
+            "private transaction path is linked or not a directory",
+        ));
+    }
     Ok(Dir::from_std_file(file))
 }
 
@@ -337,31 +370,65 @@ pub(crate) fn open_directory_for_publication(parent: &Dir, name: &OsStr) -> std:
 
 #[cfg(windows)]
 pub(crate) fn open_directory_for_publication(parent: &Dir, name: &OsStr) -> std::io::Result<Dir> {
-    use cap_fs_ext::{
-        FollowSymlinks, OpenOptionsFollowExt as _, OpenOptionsMaybeDirExt as _, OsMetadataExt as _,
-    };
-    use cap_std::fs::{OpenOptions, OpenOptionsExt as _};
-    use windows_sys::Win32::Foundation::{GENERIC_READ, GENERIC_WRITE};
+    // cap-std removes FILE_SHARE_DELETE when it opens directories, which
+    // conflicts with the DELETE access needed by the retained rename handle.
+    open_windows_directory(parent, name, false)
+}
+
+#[cfg(windows)]
+pub(crate) fn open_directory_parent(directory: &Dir) -> std::io::Result<Dir> {
+    use std::os::windows::ffi::OsStringExt as _;
+    use std::os::windows::fs::{MetadataExt as _, OpenOptionsExt as _};
+    use std::os::windows::io::AsRawHandle as _;
     use windows_sys::Win32::Storage::FileSystem::{
-        DELETE, FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS, FILE_SHARE_DELETE,
-        FILE_SHARE_READ, FILE_SHARE_WRITE,
+        FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
+        FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, GetFinalPathNameByHandleW,
     };
 
-    let mut options = OpenOptions::new();
-    options
-        .access_mode(GENERIC_READ | GENERIC_WRITE | DELETE)
+    // NT relative opens do not resolve `..`. Match cap-std's handle-to-path
+    // parent lookup while preserving delete sharing for retained rename handles.
+    let mut path = vec![0u16; 512];
+    loop {
+        let length = unsafe {
+            // SAFETY: the directory handle is live and the buffer is writable.
+            GetFinalPathNameByHandleW(
+                directory.as_raw_handle(),
+                path.as_mut_ptr(),
+                path.len() as u32,
+                0,
+            )
+        };
+        if length == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        if length as usize >= path.len() {
+            path.resize(length as usize + 1, 0);
+            continue;
+        }
+        path.truncate(length as usize);
+        break;
+    }
+    let path = std::path::PathBuf::from(OsString::from_wide(&path));
+    let parent = path
+        .parent()
+        .ok_or_else(|| std::io::Error::other("directory has no parent"))?;
+    let file = std::fs::OpenOptions::new()
+        .read(true)
         .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
-        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
-        .follow(FollowSymlinks::No)
-        .maybe_dir(true);
-    let file = parent.open_with(name, &options)?;
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(parent)?;
     let metadata = file.metadata()?;
     if !metadata.is_dir() || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
         return Err(std::io::Error::other(
-            "private transaction path is linked or not a directory",
+            "directory parent is linked or not a directory",
         ));
     }
-    Ok(Dir::from_std_file(file.into_std()))
+    Ok(Dir::from_std_file(file))
+}
+
+#[cfg(not(windows))]
+pub(crate) fn open_directory_parent(directory: &Dir) -> std::io::Result<Dir> {
+    directory.open_parent_dir(cap_std::ambient_authority())
 }
 
 #[cfg(not(windows))]
@@ -536,7 +603,9 @@ fn publish_windows_handle_noreplace(
         .ok_or_else(|| std::io::Error::other("transaction directory name is too long"))?;
     let info_bytes = offset_of!(FILE_RENAME_INFORMATION, FileName)
         .checked_add(file_name_bytes)
-        .ok_or_else(|| std::io::Error::other("transaction rename data is too large"))?;
+        .ok_or_else(|| std::io::Error::other("transaction rename data is too large"))?
+        // NT requires the complete fixed-size record even for a one-unit filename.
+        .max(size_of::<FILE_RENAME_INFORMATION>());
     let mut storage = vec![0usize; info_bytes.div_ceil(size_of::<usize>())];
     let info = storage.as_mut_ptr().cast::<FILE_RENAME_INFORMATION>();
     let info_bytes = u32::try_from(info_bytes)
@@ -591,6 +660,52 @@ pub(crate) fn publish_directory_noreplace(
 
 #[cfg(test)]
 mod tests {
+    #[cfg(windows)]
+    #[test]
+    fn private_directory_parent_reopen_preserves_rename_sharing() {
+        use super::*;
+
+        let temporary = tempfile::tempdir().unwrap();
+        let root = Dir::open_ambient_dir(temporary.path(), cap_std::ambient_authority()).unwrap();
+        let (parent_name, parent) = create_private_directory(&root, "parent").unwrap();
+        let (_child_name, child) = create_private_directory(&parent, "child").unwrap();
+        let reopened = open_directory_parent(&child).unwrap();
+        assert_eq!(
+            directory_identity(&parent).unwrap(),
+            directory_identity(&reopened).unwrap()
+        );
+        drop(child);
+        publish_directory_noreplace(&root, &parent, &parent_name, &root, OsStr::new("renamed"))
+            .unwrap();
+        assert!(temporary.path().join("renamed").is_dir());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn private_directory_can_be_reopened_and_published_with_a_retained_handle() {
+        for final_name in ["a", "ab", "λ", "工具", "🦀", "published"] {
+            let temp = tempfile::tempdir().unwrap();
+            let parent =
+                cap_std::fs::Dir::open_ambient_dir(temp.path(), cap_std::ambient_authority())
+                    .unwrap();
+            let (name, directory) =
+                super::create_private_directory(&parent, "test-publish").unwrap();
+            let expected = super::directory_identity(&directory).unwrap();
+            super::publish_directory_noreplace(
+                &parent,
+                &directory,
+                &name,
+                &parent,
+                std::ffi::OsStr::new(final_name),
+            )
+            .unwrap();
+            let visible =
+                super::open_directory_for_publication(&parent, std::ffi::OsStr::new(final_name))
+                    .unwrap();
+            assert_eq!(super::directory_identity(&visible).unwrap(), expected);
+        }
+    }
+
     use super::*;
 
     #[test]

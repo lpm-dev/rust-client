@@ -493,6 +493,10 @@ pub async fn run(
     alias_override: Option<&str>,
     swift_target: Option<&str>,
 ) -> Result<(), LpmError> {
+    #[cfg(windows)]
+    let canonical_project = project_dir.canonicalize().map_err(LpmError::Io)?;
+    #[cfg(windows)]
+    let project_dir = canonical_project.as_path();
     let mut swift_traversal = SwiftTraversal::default();
     let operation = async {
         if !dry_run {

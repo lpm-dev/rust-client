@@ -571,12 +571,13 @@ fn replace_file(from: &Path, to: &Path) -> io::Result<()> {
         MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,
     };
 
-    fn wide(path: &Path) -> Vec<u16> {
-        path.as_os_str().encode_wide().chain(Some(0)).collect()
+    fn wide(path: &Path) -> io::Result<Vec<u16>> {
+        let path = crate::absolute_extended_path(path)?;
+        Ok(path.as_os_str().encode_wide().chain(Some(0)).collect())
     }
 
-    let from = wide(from);
-    let to = wide(to);
+    let from = wide(from)?;
+    let to = wide(to)?;
     let flags = MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH;
     for delay_ms in [0, 50, 150, 450, 1_350, 4_050] {
         if delay_ms != 0 {
@@ -869,6 +870,27 @@ mod tests {
 
         assert_eq!(fs::read(&sentinel).unwrap(), b"external");
         assert_eq!(fs::read(&destination).unwrap(), b"replacement");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn write_file_atomic_creates_and_replaces_beyond_max_path() {
+        let root = tempfile::tempdir().unwrap();
+        let root_text = root.path().to_str().unwrap();
+        let ordinary_root = root_text.strip_prefix(r"\\?\").unwrap_or(root_text);
+        let mut parent = std::path::PathBuf::from(ordinary_root);
+        while parent.as_os_str().len() < 300 {
+            parent.push("nested-directory-with-spaces ü");
+        }
+        fs::create_dir_all(&parent).unwrap();
+        let path = parent.join(".lpm-object-integrity");
+        assert!(!path.to_str().unwrap().starts_with(r"\\?\"));
+
+        write_file_atomic(&path, b"first").unwrap();
+        write_file_atomic(&path, b"replacement").unwrap();
+
+        assert_eq!(fs::read(&path).unwrap(), b"replacement");
+        assert_eq!(fs::read_dir(&parent).unwrap().count(), 1);
     }
 
     #[cfg(windows)]

@@ -216,6 +216,7 @@ pub async fn resolve_greedy_with_root_dependencies_options_and_policy(
     // peers — caught by the next iteration). Termination: both
     // task_queue and peer_requirements empty after a single pass.
     let mut tree_status_cache = super::tree_policy::TreeStatusCache::default();
+    let mut refreshed_metadata = AHashSet::new();
     loop {
         // Inner: drain task_queue exactly as before.
         while let Some(edge) = state.task_queue.pop_front() {
@@ -236,6 +237,23 @@ pub async fn resolve_greedy_with_root_dependencies_options_and_policy(
                 Ok(info) => info,
                 Err(err) => {
                     propagate_fetch_error(&edge, &err, &mut state)?;
+                    continue;
+                }
+            };
+            let info = match super::manifest::refresh_missing_range(
+                &edge,
+                info,
+                &client,
+                &route_table,
+                &shared_cache,
+                &policy,
+                &mut refreshed_metadata,
+            )
+            .await
+            {
+                Ok(info) => info,
+                Err(error) => {
+                    super::manifest::propagate_fetch_error(&edge, &error, &mut state)?;
                     continue;
                 }
             };

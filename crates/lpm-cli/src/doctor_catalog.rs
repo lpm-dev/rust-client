@@ -1772,6 +1772,18 @@ pub static GLOBAL_INSTALL_ROOTS_UNHEALTHY: CheckEntry = CheckEntry {
 // Sandbox + script policy
 // ──────────────────────────────────────────────────────────────────
 
+pub static SANDBOX_SETUP_REQUIRED: CheckEntry = CheckEntry {
+    code: "sandbox_setup_required",
+    name: "Sandbox permissions",
+    category: Category::Sandbox,
+    tier: Tier::Extended,
+    description: "Windows AppContainer scripts need directory metadata permissions that the current user cannot grant.",
+    when_fires: "A protected ancestor of the project or temporary directory has no usable sandbox metadata grant.",
+    remediation: "Preview with `lpm doctor sandbox-setup`. Include --tool-dir for protected tools. Apply from an administrator terminal for the normal user's SID, then publish without elevation.",
+    possible_severities: &[Severity::Warn],
+    auto_fix: None,
+};
+
 pub static SANDBOX_AVAILABLE: CheckEntry = CheckEntry {
     code: "sandbox_available",
     name: "Sandbox",
@@ -2247,6 +2259,7 @@ pub static CLI_CATALOG: &[&CheckEntry] = &[
     &GLOBAL_TRUSTED_DEPS_CORRUPT,
     // Sandbox + script policy
     &SANDBOX_AVAILABLE,
+    &SANDBOX_SETUP_REQUIRED,
     &SANDBOX_HELPER_MISSING,
     &SANDBOX_DEGRADED,
     &SANDBOX_DISABLED_BY_USER,

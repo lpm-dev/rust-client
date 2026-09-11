@@ -18,6 +18,263 @@ use support::{
 use wiremock::matchers::{header, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
+#[tokio::test]
+async fn global_alias_without_a_collision_runs_and_is_removed_with_its_package() {
+    let mock = MockRegistry::start().await;
+    let tarball = make_tarball_from_pkg_json(
+        serde_json::json!({"name":"alias-probe", "version":"1.0.0", "bin":{"original":"bin.js"}}),
+        &[(
+            "bin.js",
+            b"#!/usr/bin/env node\nconsole.log(process.argv[2]);\n",
+        )],
+    );
+    mock.with_package("alias-probe", "1.0.0", &tarball).await;
+    let project = TempProject::empty(r#"{"name":"consumer","version":"1.0.0"}"#);
+    project.write_file(".npmrc", &format!("registry={}/\n", mock.url()));
+    lpm_with_registry(&project, &mock.url())
+        .args([
+            "install",
+            "-g",
+            "alias-probe@1.0.0",
+            "--alias",
+            "original=renamed",
+            "--no-skills",
+            "--no-security-summary",
+        ])
+        .assert()
+        .success();
+    let bin = project.home().join(".lpm/bin");
+    let suffix = if cfg!(windows) { ".cmd" } else { "" };
+    let alias = bin.join(format!("renamed{suffix}"));
+    assert!(
+        alias.is_file(),
+        "alias was not materialized: {}",
+        alias.display()
+    );
+    assert!(!bin.join(format!("original{suffix}")).exists());
+    let output = std::process::Command::new(&alias)
+        .arg("native alias")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).trim(),
+        "native alias"
+    );
+    lpm_with_registry(&project, &mock.url())
+        .args(["uninstall", "-g", "alias-probe"])
+        .assert()
+        .success();
+    assert!(!alias.exists());
+}
+
+#[tokio::test]
+async fn install_refreshes_custom_metadata_when_requested_version_was_published_after_cache() {
+    assert_refreshes_published_version(None).await;
+}
+
+#[tokio::test]
+async fn walker_install_refreshes_a_newly_published_version() {
+    assert_refreshes_published_version(Some(("LPM_GREEDY_FUSION", "0"))).await;
+}
+
+#[tokio::test]
+async fn pubgrub_install_refreshes_a_newly_published_version() {
+    assert_refreshes_published_version(Some(("LPM_RESOLVER", "pubgrub"))).await;
+}
+
+async fn assert_refreshes_published_version(mode: Option<(&str, &str)>) {
+    let mock = MockRegistry::start().await;
+    let name = "freshly-published";
+    let first = make_tarball(name, "1.0.0");
+    mock.with_package(name, "1.0.0", &first).await;
+    let project = TempProject::empty(r#"{"name":"consumer","version":"1.0.0"}"#);
+    project.write_file(".npmrc", &format!("registry={}/\n", mock.url()));
+    lpm_with_registry(&project, &mock.url())
+        .args([
+            "install",
+            "freshly-published@1.0.0",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .assert()
+        .success();
+
+    mock.server().reset().await;
+    mock.mount_full_package_metadata_routes(
+        name,
+        "1.1.0",
+        &[
+            ("1.0.0", serde_json::json!({}), Some(first)),
+            (
+                "1.1.0",
+                serde_json::json!({}),
+                Some(make_tarball(name, "1.1.0")),
+            ),
+        ],
+    )
+    .await;
+    let mut command = lpm_with_registry(&project, &mock.url());
+    if let Some((key, value)) = mode {
+        command.env(key, value);
+    }
+    command
+        .args([
+            "install",
+            "freshly-published@1.1.0",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .assert()
+        .success();
+    let installed: serde_json::Value =
+        serde_json::from_str(&project.read_file("node_modules/freshly-published/package.json"))
+            .unwrap();
+    assert_eq!(installed["version"], "1.1.0");
+}
+
+#[tokio::test]
+async fn missing_version_refresh_is_bounded_and_preserves_the_installed_project() {
+    let mock = MockRegistry::start().await;
+    let package = "missing-new-version";
+    let tarball = make_tarball(package, "1.0.0");
+    mock.with_package(package, "1.0.0", &tarball).await;
+    let project = TempProject::empty(r#"{"name":"consumer","version":"1.0.0"}"#);
+    project.write_file(".npmrc", &format!("registry={}/\n", mock.url()));
+    lpm_with_registry(&project, &mock.url())
+        .args([
+            "install",
+            "missing-new-version@1.0.0",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .assert()
+        .success();
+    let manifest = project.read_file("package.json");
+    let lock = project.read_file("lpm.lock");
+    mock.server().reset().await;
+    mock.with_package(package, "1.0.0", &tarball).await;
+
+    lpm_with_registry(&project, &mock.url())
+        .args([
+            "install",
+            "missing-new-version@1.1.0",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .assert()
+        .failure();
+
+    let requests = mock.server().received_requests().await.unwrap();
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|request| request.url.path() == "/missing-new-version")
+            .count(),
+        1
+    );
+    assert_eq!(project.read_file("package.json"), manifest);
+    assert_eq!(project.read_file("lpm.lock"), lock);
+    assert!(
+        project
+            .read_file("node_modules/missing-new-version/package.json")
+            .contains("1.0.0")
+    );
+}
+
+#[tokio::test]
+async fn metadata_refresh_does_not_bypass_revoked_custom_registry_access() {
+    let mock = MockRegistry::start().await;
+    let package = "access-revoked";
+    mock.with_package(package, "1.0.0", &make_tarball(package, "1.0.0"))
+        .await;
+    let project = TempProject::empty(r#"{"name":"consumer","version":"1.0.0"}"#);
+    project.write_file(".npmrc", &format!("registry={}/\n", mock.url()));
+    lpm_with_registry(&project, &mock.url())
+        .args([
+            "install",
+            "access-revoked@1.0.0",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .assert()
+        .success();
+    let manifest = project.read_file("package.json");
+    let lock = project.read_file("lpm.lock");
+    mock.server().reset().await;
+    Mock::given(method("GET"))
+        .and(path("/access-revoked"))
+        .respond_with(
+            ResponseTemplate::new(403).set_body_json(serde_json::json!({"error":"access revoked"})),
+        )
+        .expect(1)
+        .mount(mock.server())
+        .await;
+
+    lpm_with_registry(&project, &mock.url())
+        .args([
+            "install",
+            "access-revoked@1.1.0",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .assert()
+        .failure();
+
+    assert_eq!(project.read_file("package.json"), manifest);
+    assert_eq!(project.read_file("lpm.lock"), lock);
+    assert!(
+        project
+            .read_file("node_modules/access-revoked/package.json")
+            .contains("1.0.0")
+    );
+}
+
+#[tokio::test]
+async fn failed_metadata_refresh_keeps_optional_dependencies_optional() {
+    for mode in [
+        None,
+        Some(("LPM_GREEDY_FUSION", "0")),
+        Some(("LPM_RESOLVER", "pubgrub")),
+    ] {
+        let mock = MockRegistry::start().await;
+        let name = "optional-refresh";
+        mock.with_package(name, "1.0.0", &make_tarball(name, "1.0.0"))
+            .await;
+        let project = TempProject::empty(r#"{"name":"consumer","version":"1.0.0"}"#);
+        project.write_file(".npmrc", &format!("registry={}/\n", mock.url()));
+        lpm_with_registry(&project, &mock.url())
+            .args([
+                "install",
+                "optional-refresh@1.0.0",
+                "--no-skills",
+                "--no-editor-setup",
+            ])
+            .assert()
+            .success();
+        project.write_file("package.json", r#"{"name":"consumer","version":"1.0.0","optionalDependencies":{"optional-refresh":"1.1.0"}}"#);
+        mock.server().reset().await;
+        let mut command = lpm_with_registry(&project, &mock.url());
+        if let Some((key, value)) = mode {
+            command.env(key, value);
+        }
+        command
+            .args(["install", "--no-skills", "--no-editor-setup"])
+            .assert()
+            .success();
+        assert!(
+            !project
+                .path()
+                .join("node_modules/optional-refresh")
+                .exists()
+        );
+    }
+}
+
 async fn assert_unavailable_publication_message(status: Option<&str>, json: bool, expected: &str) {
     let mock = MockRegistry::start().await;
     let name = "@lpm.dev/example.pending";

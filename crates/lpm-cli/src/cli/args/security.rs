@@ -158,10 +158,8 @@ pub(crate) struct DoctorArgs {
     #[arg(long)]
     pub(crate) fix: bool,
 
-    /// Skip confirmation prompts for auto-fix actions (implies --fix).
-    ///
-    /// Ignored when a subcommand is provided.
-    #[arg(long, short = 'y')]
+    /// Confirm auto-fix actions (implies --fix) or explicit sandbox-setup changes.
+    #[arg(long, short = 'y', global = true)]
     pub(crate) yes: bool,
 
     #[command(subcommand)]
@@ -276,11 +274,31 @@ pub(crate) struct VaultArgs {
     pub(crate) action: String,
 }
 
-/// Subcommands of `lpm doctor`. Currently only `list` (the inventory
-/// surface). Without a subcommand, `lpm doctor` runs the full check
-/// set against the current project.
+/// Diagnostics inventory and explicit Windows sandbox setup.
+/// Without a subcommand, run checks against the current project.
 #[derive(Subcommand)]
 pub(crate) enum DoctorAction {
+    /// Preview Windows sandbox permissions. Add --apply from an administrator terminal to grant them.
+    SandboxSetup {
+        /// Project whose parent directories need metadata and traversal access.
+        #[arg(long)]
+        project: Option<std::path::PathBuf>,
+        /// Additional directories whose ancestors need metadata access, such as a custom temp directory.
+        #[arg(long = "metadata-dir")]
+        metadata_dirs: Vec<std::path::PathBuf>,
+        /// Explicit tool directories to grant read/execute access, without write access.
+        #[arg(long = "tool-dir")]
+        tool_dirs: Vec<std::path::PathBuf>,
+        /// Target user's SID from their unelevated preview, when setup uses another account.
+        #[arg(long)]
+        user_sid: Option<String>,
+        /// Apply the previewed grants. Requires an administrator terminal and --yes in CI.
+        #[arg(long, conflicts_with = "remove")]
+        apply: bool,
+        /// Remove only the selected sandbox grants. Requires an administrator terminal.
+        #[arg(long)]
+        remove: bool,
+    },
     /// Dump the canonical catalog of every check `lpm doctor` can emit.
     ///
     /// Use `--json` for the structured form (suitable for piping into

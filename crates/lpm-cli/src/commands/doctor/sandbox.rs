@@ -137,6 +137,35 @@ pub(super) fn probe_sandbox_backend_with_global(
                      strict mode is available.",
                 );
             }
+            #[cfg(windows)]
+            if backend == "windows-appcontainer" {
+                let mut roots = vec![tmpdir];
+                if let Ok(cwd) = std::env::current_dir() {
+                    roots.push(cwd);
+                }
+                match lpm_sandbox::helper_appcontainer::setup::required_metadata_setup(&roots) {
+                    Ok(missing) if !missing.is_empty() => {
+                        return Check::warn(
+                            &doctor_catalog::SANDBOX_SETUP_REQUIRED,
+                            &format!(
+                                "Windows sandbox metadata permissions need administrator setup for {}. Run `lpm doctor sandbox-setup` from your project to preview the grants. Include --tool-dir for protected tool installations, then apply from an administrator terminal for your normal user. Publishing stays unelevated.",
+                                missing
+                                    .iter()
+                                    .map(|path| path.display().to_string())
+                                    .collect::<Vec<_>>()
+                                    .join(", ")
+                            ),
+                        );
+                    }
+                    Err(error) => {
+                        return Check::fail(
+                            &doctor_catalog::SANDBOX_PROBE_FAILED,
+                            &error.to_string(),
+                        );
+                    }
+                    _ => {}
+                }
+            }
             let lifetime_note = if os == "macos" {
                 " Detached descendants can survive completion, timeout, or cancellation on macOS."
             } else {
