@@ -1,6 +1,8 @@
 //! Per-directory capabilities for explicitly approved Windows filesystem access.
 
 use super::*;
+
+mod walk;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashSet};
@@ -252,23 +254,13 @@ fn open_permissions(
     path: &Path,
     write: bool,
 ) -> Result<(HandleGuard, Identity), AppContainerError> {
-    open_permissions_with_sharing(path, write, true)
-}
-
-fn open_permissions_with_sharing(
-    path: &Path,
-    write: bool,
-    allow_delete: bool,
-) -> Result<(HandleGuard, Identity), AppContainerError> {
     let path_wide = to_wide_with_nul(path.as_os_str());
     // SAFETY: no handle is inherited; the final component is opened without following links.
     let raw = unsafe {
         CreateFileW(
             path_wide.as_ptr(),
-            READ_CONTROL | FILE_READ_ATTRIBUTES | if write { WRITE_DAC } else { 0 }
-                // Metadata-only handles do not enforce Windows share restrictions.
-                | if allow_delete { 0 } else { windows_sys::Win32::Storage::FileSystem::FILE_READ_DATA },
-            FILE_SHARE_READ | FILE_SHARE_WRITE | if allow_delete { FILE_SHARE_DELETE } else { 0 },
+            READ_CONTROL | FILE_READ_ATTRIBUTES | if write { WRITE_DAC } else { 0 },
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
             ptr::null(),
             OPEN_EXISTING,
             FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
@@ -292,17 +284,6 @@ fn open_permissions_with_sharing(
             path: path.to_path_buf(),
         });
     }
-    if write
-        && !allow_delete
-        && info.nNumberOfLinks > 1
-        && info.dwFileAttributes & windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_DIRECTORY
-            == 0
-    {
-        return Err(failure(format!(
-            "{} has multiple hard links; approve a tool copy without hard links",
-            path.display()
-        )));
-    }
     Ok((
         handle,
         Identity {
@@ -317,18 +298,9 @@ fn grant_for(
     permission: Permission,
     user_sid: &str,
 ) -> Result<Grant, AppContainerError> {
-    let metadata = std::fs::symlink_metadata(path)
-        .map_err(|error| failure(format!("inspect {}: {error}", path.display())))?;
-    if !metadata.is_dir() || is_reparse_point(&metadata) {
-        return Err(failure(format!(
-            "{} must be an existing directory, without a link or junction",
-            path.display()
-        )));
-    }
-    let path = path
-        .canonicalize()
-        .map_err(|error| failure(format!("resolve {}: {error}", path.display())))?;
-    let (handle, identity) = open_permissions(&path, false)?;
+    let target = walk::Target::preview(path)?;
+    let path = target.canonical_directory()?;
+    let identity = target.identity;
     let mut hash = Sha256::new();
     hash.update(user_sid.as_bytes());
     hash.update([
@@ -346,7 +318,7 @@ fn grant_for(
     let capability_name = format!("lpm.filesystem.v1.{:x}", hash.finalize());
     let sid = capability_sid(&capability_name)?;
     let configured = has_grant(
-        &handle,
+        &target.handle,
         &path,
         sid.raw(),
         permission.mask(),
@@ -359,6 +331,11 @@ fn grant_for(
         identity,
         capability_name,
     })
+}
+
+/// Resolve an existing directory without following links or junctions in any component.
+pub fn canonical_directory(path: &Path) -> Result<PathBuf, AppContainerError> {
+    walk::Target::preview(path)?.canonical_directory()
 }
 
 /// Preview ancestor metadata and explicitly selected tool permissions without mutations.
@@ -635,9 +612,9 @@ fn update_open_ace(
     }
 }
 
-// Pin each ancestor without delete sharing, so an elevated path walk cannot
-// be redirected through a renamed directory or a replacement junction.
-fn pin_grant(entry: &Grant) -> Result<(Vec<HandleGuard>, HandleGuard), AppContainerError> {
+// Reject reparses during the kernel path lookup. Child traversal then uses
+// directory handles, because a pinned directory can still become a junction.
+fn pin_grant(entry: &Grant) -> Result<(Vec<walk::Target>, walk::Target), AppContainerError> {
     let mut parents = Vec::new();
     for ancestor in entry
         .path
@@ -647,10 +624,10 @@ fn pin_grant(entry: &Grant) -> Result<(Vec<HandleGuard>, HandleGuard), AppContai
         .into_iter()
         .rev()
     {
-        parents.push(open_permissions_with_sharing(ancestor, false, false)?.0);
+        parents.push(walk::Target::open(ancestor, false)?);
     }
-    let (root, identity) = open_permissions_with_sharing(&entry.path, true, false)?;
-    if identity != entry.identity {
+    let root = walk::Target::open(&entry.path, true)?;
+    if root.identity != entry.identity {
         return Err(failure(format!(
             "{} changed after the preview; create a new preview",
             entry.path.display()
@@ -677,48 +654,6 @@ fn update_pinned_ace(
     update_open_ace(handle, path, sid, value)
 }
 
-fn update_tool_children(
-    root: &Path,
-    sid: PSID,
-    value: Option<(u32, u32)>,
-) -> Result<(), AppContainerError> {
-    struct Frame {
-        entries: std::fs::ReadDir,
-        _pin: Option<HandleGuard>,
-    }
-    let read = |path: &Path| {
-        std::fs::read_dir(path)
-            .map_err(|error| failure(format!("read {}: {error}", path.display())))
-    };
-    let mut stack = vec![Frame {
-        entries: read(root)?,
-        _pin: None,
-    }];
-    while let Some(frame) = stack.last_mut() {
-        let Some(child) = frame.entries.next() else {
-            stack.pop();
-            continue;
-        };
-        let path = child.map_err(|error| failure(error.to_string()))?.path();
-        let (handle, _) = match open_permissions_with_sharing(&path, true, false) {
-            Ok(opened) => opened,
-            Err(AppContainerError::ReparsePointRoot { .. }) => continue,
-            Err(error) => return Err(error),
-        };
-        update_pinned_ace(&handle, &path, sid, value)?;
-        if std::fs::metadata(&path)
-            .map_err(|error| failure(error.to_string()))?
-            .is_dir()
-        {
-            stack.push(Frame {
-                entries: read(&path)?,
-                _pin: Some(handle),
-            });
-        }
-    }
-    Ok(())
-}
-
 /// Apply or remove only the previewed capabilities. This function never runs package scripts.
 /// A failure can leave some grants applied or removed; repeat the preview and retry.
 pub fn apply(plan: &Plan, remove: bool) -> Result<(), AppContainerError> {
@@ -740,10 +675,10 @@ pub fn apply(plan: &Plan, remove: bool) -> Result<(), AppContainerError> {
         let result = (|| {
             if entry.permission == Permission::ToolReadExecute {
                 // Re-applying also deactivates the root until the walk completes.
-                update_pinned_ace(&root, &entry.path, sid.raw(), None)?;
-                update_tool_children(&entry.path, sid.raw(), value)?;
+                update_pinned_ace(&root.handle, &entry.path, sid.raw(), None)?;
+                walk::children(&root, &entry.path, sid.raw(), value)?;
             }
-            update_pinned_ace(&root, &entry.path, sid.raw(), value)
+            update_pinned_ace(&root.handle, &entry.path, sid.raw(), value)
         })();
         result.map_err(|error: AppContainerError| failure(format!(
             "permission setup stopped at {}: {error}. Some permissions may have changed; preview and retry the same operation",
@@ -830,7 +765,10 @@ pub(super) fn prepare<'a>(
         {
             continue;
         }
-        let entry = grant_for(tool, Permission::ToolReadExecute, &user_sid)?;
+        let canonical = tool
+            .canonicalize()
+            .map_err(|error| failure(error.to_string()))?;
+        let entry = grant_for(&canonical, Permission::ToolReadExecute, &user_sid)?;
         // A tool capability can authorize reads independently of the deny
         // for this invocation's SID. Exclude both ancestors and descendants
         // of protected paths from the capability set.
@@ -971,8 +909,9 @@ mod tests {
         )
         .unwrap();
         let sid = capability_sid(&entry.capability_name).unwrap();
-        let (_parents, _root) = pin_grant(&entry).unwrap();
-        update_tool_children(
+        let (_parents, root_target) = pin_grant(&entry).unwrap();
+        walk::children(
+            &root_target,
             &entry.path,
             sid.raw(),
             Some((TOOL_ACCESS, entry.permission.inheritance())),
@@ -981,8 +920,8 @@ mod tests {
         let (file, _) = open_permissions(&secret, false).unwrap();
         assert!(!has_grant(&file, &secret, sid.raw(), TOOL_ACCESS, 0).unwrap());
         std::fs::hard_link(&secret, root.join("hardlink.txt")).unwrap();
-        let error =
-            update_tool_children(&entry.path, sid.raw(), Some((TOOL_ACCESS, 0))).unwrap_err();
+        let error = walk::children(&root_target, &entry.path, sid.raw(), Some((TOOL_ACCESS, 0)))
+            .unwrap_err();
         assert!(error.to_string().contains("multiple hard links"), "{error}");
     }
 
@@ -999,14 +938,15 @@ mod tests {
         let sid = capability_sid(&entry.capability_name).unwrap();
         let (_parents, handle) = pin_grant(&entry).unwrap();
         for _ in 0..2 {
-            update_tool_children(
+            walk::children(
+                &handle,
                 &entry.path,
                 sid.raw(),
                 Some((TOOL_ACCESS, entry.permission.inheritance())),
             )
             .unwrap();
             update_pinned_ace(
-                &handle,
+                &handle.handle,
                 &entry.path,
                 sid.raw(),
                 Some((TOOL_ACCESS, entry.permission.inheritance())),
@@ -1021,13 +961,166 @@ mod tests {
         let (file, _) = open_permissions(&file_path, false).unwrap();
         assert!(has_grant(&file, &file_path, sid.raw(), TOOL_ACCESS, 0).unwrap());
         assert!(!has_grant(&file, &file_path, sid.raw(), FILE_GENERIC_WRITE, 0).unwrap());
-        update_pinned_ace(&handle, &entry.path, sid.raw(), None).unwrap();
-        update_tool_children(&entry.path, sid.raw(), None).unwrap();
+        update_pinned_ace(&handle.handle, &entry.path, sid.raw(), None).unwrap();
+        walk::children(&handle, &entry.path, sid.raw(), None).unwrap();
         assert!(
             !grant_for(&root, Permission::ToolReadExecute, &user)
                 .unwrap()
                 .configured
         );
         assert!(!has_grant(&file, &file_path, sid.raw(), TOOL_ACCESS, 0).unwrap());
+    }
+
+    #[test]
+    fn preview_refuses_a_tool_beneath_a_junction_ancestor() {
+        let temporary = tempfile::tempdir().unwrap();
+        let outside = temporary.path().join("outside");
+        std::fs::create_dir_all(outside.join("tool")).unwrap();
+        let link = temporary.path().join("redirect");
+        let output = std::process::Command::new("cmd.exe")
+            .args(["/d", "/c", "mklink", "/J"])
+            .arg(&link)
+            .arg(&outside)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        assert!(
+            grant_for(
+                &link.join("tool"),
+                Permission::ToolReadExecute,
+                &current_user_sid().unwrap()
+            )
+            .is_err(),
+            "preview must not turn a junction path into approval of its target"
+        );
+    }
+
+    #[test]
+    fn tool_permission_walk_covers_multiple_directory_batches_and_restarts_on_removal() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().join("tool");
+        let nested = root.join("bin").join("Unicode tools λ");
+        std::fs::create_dir_all(&nested).unwrap();
+        let paths: Vec<_> = (0..700)
+            .map(|index| root.join(format!("tool-{index:04}-with-a-long-name.exe")))
+            .chain([nested.join("工具.exe")])
+            .collect();
+        for path in &paths {
+            std::fs::write(path, "tool").unwrap();
+        }
+        let entry = grant_for(
+            &root,
+            Permission::ToolReadExecute,
+            &current_user_sid().unwrap(),
+        )
+        .unwrap();
+        let sid = capability_sid(&entry.capability_name).unwrap();
+        let (_parents, target) = pin_grant(&entry).unwrap();
+        for configured in [true, false] {
+            walk::children(
+                &target,
+                &entry.path,
+                sid.raw(),
+                configured.then_some((TOOL_ACCESS, 0)),
+            )
+            .unwrap();
+            for path in &paths {
+                let (file, _) = open_permissions(path, false).unwrap();
+                assert_eq!(
+                    has_grant(&file, path, sid.raw(), TOOL_ACCESS, 0).unwrap(),
+                    configured,
+                    "{}",
+                    path.display()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn setup_does_not_grant_outside_files_after_in_place_junction_conversion() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().join("tool");
+        let outside = temporary.path().join("outside");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::create_dir(&outside).unwrap();
+        let secret = outside.join("private.txt");
+        std::fs::write(&secret, "private").unwrap();
+        let entry = grant_for(
+            &root,
+            Permission::ToolReadExecute,
+            &current_user_sid().unwrap(),
+        )
+        .unwrap();
+        let (_parents, root_target) = pin_grant(&entry).unwrap();
+        let substitute = outside
+            .canonicalize()
+            .unwrap()
+            .as_os_str()
+            .encode_wide()
+            .collect::<Vec<_>>();
+        let mut substitute = substitute;
+        substitute[1] = b'?' as u16;
+        let data_length = 8 + (substitute.len() + 2) * 2;
+        let mut data = Vec::new();
+        data.extend_from_slice(&0xa0000003u32.to_le_bytes());
+        data.extend_from_slice(&(data_length as u16).to_le_bytes());
+        data.extend_from_slice(&0u16.to_le_bytes());
+        for value in [
+            0,
+            (substitute.len() * 2) as u16,
+            ((substitute.len() + 1) * 2) as u16,
+            0,
+        ] {
+            data.extend_from_slice(&value.to_le_bytes());
+        }
+        for unit in substitute {
+            data.extend_from_slice(&unit.to_le_bytes());
+        }
+        data.extend_from_slice(&[0, 0, 0, 0]);
+        let wide = to_wide_with_nul(root.as_os_str());
+        let convert = |access| {
+            // SAFETY: the path is terminated and no handle is inherited.
+            let raw = unsafe {
+                CreateFileW(
+                    wide.as_ptr(),
+                    access,
+                    FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                    ptr::null(),
+                    OPEN_EXISTING,
+                    FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+                    ptr::null_mut(),
+                )
+            };
+            if raw == INVALID_HANDLE_VALUE {
+                return false;
+            }
+            let handle = HandleGuard(raw);
+            let mut returned = 0;
+            // SAFETY: the initialized reparse buffer and output live through the synchronous call.
+            let changed = unsafe {
+                windows_sys::Win32::System::IO::DeviceIoControl(
+                    handle.as_raw(),
+                    0x000900a4,
+                    data.as_ptr().cast(),
+                    data.len() as u32,
+                    ptr::null_mut(),
+                    0,
+                    &mut returned,
+                    ptr::null_mut(),
+                )
+            };
+            changed != 0
+        };
+        assert!(
+            convert(windows_sys::Win32::Storage::FileSystem::FILE_WRITE_ATTRIBUTES),
+            "junction conversion control must succeed"
+        );
+        let sid = capability_sid(&entry.capability_name).unwrap();
+        let _result = walk::children(&root_target, &entry.path, sid.raw(), Some((TOOL_ACCESS, 0)));
+        let (file, _) = open_permissions(&secret, false).unwrap();
+        assert!(
+            !has_grant(&file, &secret, sid.raw(), TOOL_ACCESS, 0).unwrap(),
+            "setup followed the changed directory and granted access outside the approved tree"
+        );
     }
 }

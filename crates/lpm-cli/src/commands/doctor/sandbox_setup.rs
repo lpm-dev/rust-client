@@ -42,10 +42,14 @@ pub fn run(
         let project = project.unwrap_or(&cwd);
         let current_user =
             setup::current_user_sid().map_err(|error| LpmError::Script(error.to_string()))?;
-        let canonical_project = project.canonicalize().map_err(LpmError::Io)?;
+        let canonical_project = setup::canonical_directory(project)
+            .map_err(|error| LpmError::Script(error.to_string()))?;
         let mut roots = metadata_dirs
             .iter()
-            .map(|path| path.canonicalize().map_err(LpmError::Io))
+            .map(|path| {
+                setup::canonical_directory(path)
+                    .map_err(|error| LpmError::Script(error.to_string()))
+            })
             .collect::<Result<Vec<_>, _>>()?;
         if user_sid.is_none_or(|sid| sid == current_user) {
             roots.push(std::env::temp_dir());
@@ -118,14 +122,11 @@ pub fn run(
         for root in roots.iter().skip(1) {
             apply_args.extend(["--metadata-dir".to_owned(), root.display().to_string()]);
         }
-        for tool in tools {
-            apply_args.extend([
-                "--tool-dir".to_owned(),
-                tool.canonicalize()
-                    .map_err(LpmError::Io)?
-                    .display()
-                    .to_string(),
-            ]);
+        for grant in &plan.grants {
+            if grant.permission != setup::Permission::ToolReadExecute {
+                continue;
+            }
+            apply_args.extend(["--tool-dir".to_owned(), grant.path.display().to_string()]);
         }
         apply_args.extend([
             "--user-sid".to_owned(),
