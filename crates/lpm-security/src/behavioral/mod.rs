@@ -29,6 +29,7 @@ pub mod manifest;
 pub mod secrets;
 pub mod source;
 pub mod supply_chain;
+mod syntax;
 
 use manifest::ManifestTags;
 use serde::{Deserialize, Serialize};
@@ -42,10 +43,9 @@ use supply_chain::SupplyChainTags;
 /// Current schema version for `.lpm-security.json`.
 /// Bump this when adding new tags or changing tag semantics — cached
 /// files with older versions will be automatically re-analyzed.
-pub const SCHEMA_VERSION: u32 = 5;
+pub const SCHEMA_VERSION: u32 = 6;
 
-/// Maximum file size to scan (2MB). Files larger than this are skipped.
-/// No legitimate single source file is this large — it's bundled/generated.
+/// Maximum file size for a full scan. Larger source files receive bounded samples.
 const MAX_FILE_SIZE: u64 = 2 * 1024 * 1024;
 
 /// Maximum total bytes to scan per package (50MB). Analysis aborts (with warning)
@@ -89,6 +89,12 @@ pub struct AnalysisMeta {
     /// Number of source files scanned.
     #[serde(default)]
     pub files_scanned: usize,
+    /// Source files whose syntax could not be completely analyzed.
+    #[serde(default)]
+    pub unparsed_files: usize,
+    /// Input discovery or a selected input read failed.
+    #[serde(default)]
+    pub input_incomplete: bool,
     /// Total bytes of source code scanned.
     #[serde(default)]
     pub bytes_scanned: u64,
@@ -254,6 +260,7 @@ pub fn analyze_package_from_open_dir_with_fingerprint(
             ManifestTags::default()
         }
     };
+    meta.input_incomplete = fingerprint.is_none();
     let analysis = PackageAnalysis {
         version: SCHEMA_VERSION,
         analyzed_at: chrono::Utc::now().to_rfc3339(),
@@ -762,6 +769,7 @@ pub struct FileAnalysisResult {
     pub total_code_lines: usize,
     pub total_export_count: usize,
     pub files_scanned: usize,
+    pub unparsed_files: usize,
     pub bytes_scanned: u64,
     pub oversized_source_files: Vec<OversizedSourceFileEvidence>,
 }
@@ -819,8 +827,7 @@ fn analyze_single_file(
 ///   [`PackageAnalyzer::feed_oversized_source_file`] or another bounded
 ///   sampling path instead of passing the entire file here.
 ///
-/// Pure function: no I/O, no allocations beyond the comment-stripped
-/// scratch buffer. Safe to call from any thread, no runtime needed.
+/// Pure function: no I/O; parses bounded source and reuses the comment buffer. Safe to call from any thread, no runtime needed.
 pub fn analyze_bytes(filename: &str, raw_content: &[u8]) -> FileAnalysisResult {
     let mut comment_buf = Vec::new();
     analyze_bytes_with_scratch(filename, raw_content, &mut comment_buf)
@@ -831,18 +838,16 @@ fn analyze_bytes_with_scratch(
     raw_content: &[u8],
     comment_buf: &mut Vec<u8>,
 ) -> FileAnalysisResult {
-    source::strip_comments(raw_content, comment_buf);
-    let stripped = String::from_utf8_lossy(comment_buf.as_slice());
+    let raw_text = String::from_utf8_lossy(raw_content);
+    let context = syntax::SourceContext::new(&raw_text, filename, comment_buf);
+    let stripped = context.stripped.as_ref();
 
-    let file_source_tags = source::analyze_source(&stripped);
-    let domains = supply_chain::extract_url_domains(&stripped);
-    let mut file_supply_tags = supply_chain::analyze_supply_chain_with_url_presence(
-        &stripped,
-        raw_content,
-        !domains.is_empty(),
-    );
+    let file_source_tags = source::analyze_source_context(&context);
+    let domains = supply_chain::extract_url_domains(stripped);
+    let mut file_supply_tags =
+        supply_chain::analyze_supply_chain_context(&context, raw_content, !domains.is_empty());
     file_supply_tags.minified |= supply_chain::is_minified_filename(filename);
-    let trivial = supply_chain::analyze_trivial(&stripped);
+    let trivial = supply_chain::analyze_trivial(stripped);
 
     FileAnalysisResult {
         source: file_source_tags,
@@ -851,6 +856,9 @@ fn analyze_bytes_with_scratch(
         total_code_lines: trivial.total_code_lines,
         total_export_count: trivial.export_count,
         files_scanned: 1,
+        unparsed_files: usize::from(
+            !context.complete || matches!(raw_text, std::borrow::Cow::Owned(_)),
+        ),
         bytes_scanned: raw_content.len() as u64,
         oversized_source_files: Vec::new(),
     }
@@ -1027,6 +1035,7 @@ fn accumulate_result(
     *total_code_lines += result.total_code_lines;
     *total_export_count += result.total_export_count;
     meta.files_scanned += result.files_scanned;
+    meta.unparsed_files += result.unparsed_files;
     meta.bytes_scanned += result.bytes_scanned;
     extend_oversized_source_files(
         &mut meta.oversized_source_files,
@@ -1298,6 +1307,7 @@ pub struct PackageAnalyzer {
     total_code_lines: usize,
     total_export_count: usize,
     files_scanned: usize,
+    unparsed_files: usize,
     bytes_scanned: u64,
     limit_reached: bool,
     source_scan_ns: u128,
@@ -1477,6 +1487,7 @@ impl PackageAnalyzer {
         self.total_code_lines += result.total_code_lines;
         self.total_export_count += result.total_export_count;
         self.files_scanned += result.files_scanned;
+        self.unparsed_files += result.unparsed_files;
         self.bytes_scanned += result.bytes_scanned;
         if oversized {
             self.limit_reached = true;
@@ -1498,6 +1509,8 @@ impl PackageAnalyzer {
 
         let meta = AnalysisMeta {
             files_scanned: self.files_scanned,
+            unparsed_files: self.unparsed_files,
+            input_incomplete: false,
             bytes_scanned: self.bytes_scanned,
             limit_reached: self.limit_reached,
             url_domains: self.url_domains,

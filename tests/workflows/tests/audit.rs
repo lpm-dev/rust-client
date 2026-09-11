@@ -895,6 +895,11 @@ async fn audit_info_only_dep_with_empty_osv_response_exits_zero() {
 async fn audit_pnpm_v6_discovers_populated_registry_inventory() {
     let project = TempProject::empty(r#"{"name":"pnpm-v6-audit","version":"1.0.0"}"#);
     project.write_file(
+        "node_modules/once/package.json",
+        r#"{"name":"once","version":"1.0.0","license":"MIT"}"#,
+    );
+    project.write_file("node_modules/once/index.js", "module.exports = 1;\n");
+    project.write_file(
         "pnpm-lock.yaml",
         r#"lockfileVersion: '6.0'
 packages:
@@ -2497,6 +2502,78 @@ fn seed_eval_package(project: &TempProject, name: &str) {
     );
 }
 
+#[tokio::test]
+async fn audit_missing_package_sources_report_incomplete_coverage() {
+    let project = TempProject::empty(
+        r#"{"name":"coverage-host","version":"1.0.0","dependencies":{"missing":"1.0.0"}}"#,
+    );
+    project.write_file("package-lock.json", r#"{"name":"coverage-host","lockfileVersion":3,"packages":{"":{"dependencies":{"missing":"1.0.0"}},"node_modules/missing":{"version":"1.0.0","resolved":"https://registry.npmjs.org/missing/-/missing-1.0.0.tgz"}}}"#);
+    let mock = MockRegistry::start().await;
+    mock.with_osv_querybatch(vec![vec![]]).await;
+    let output = run_audit_json(&project, &mock, &["--fail-on=all"]);
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(output.status.code(), Some(1), "{json}");
+    assert_eq!(json["success"], false);
+    assert_eq!(json["behavioral_coverage"]["complete"], false);
+    assert_eq!(json["behavioral_coverage"]["unavailable_packages"], 1);
+    insta::assert_json_snapshot!("audit_incomplete_source_coverage", json);
+    let human = run_audit(&project, &mock, &[]);
+    let text = String::from_utf8_lossy(&human.stderr);
+    assert!(text.contains("Audit incomplete"), "{text}");
+    assert!(!text.contains("No security issues found"));
+}
+
+#[tokio::test]
+async fn audit_sampled_source_reports_incomplete_coverage_even_without_findings() {
+    let project = TempProject::empty(r#"{"name":"coverage-host","version":"1.0.0"}"#);
+    let source = format!(
+        "/*{}*/\neval(input);\n/*{}*/",
+        "x".repeat(1_100_000),
+        "x".repeat(1_100_000)
+    );
+    seed_node_modules_package(&project, "oversized", &[("index.js", &source)]);
+    let mock = MockRegistry::start().await;
+    mock.with_osv_querybatch(vec![vec![]]).await;
+    for policy in ["all", "behavior", "vuln"] {
+        let output = run_audit_json(&project, &mock, &["--fail-on", policy]);
+        let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(output.status.code(), Some(1), "{json}");
+        assert_eq!(json["success"], false);
+        assert_eq!(json["behavioral_coverage"]["complete"], false);
+        assert_eq!(json["behavioral_coverage"]["partial_packages"], 1);
+        assert_eq!(
+            json["behavioral_coverage"]["packages"][0]["reason"],
+            "scan_limit_reached"
+        );
+        assert!(
+            json["behavioral_coverage"]["packages"][0]["oversized_source_files"][0]["size_bytes"]
+                .as_u64()
+                .unwrap()
+                > 2 * 1024 * 1024
+        );
+    }
+}
+
+#[tokio::test]
+async fn audit_unsupported_syntax_cannot_be_hidden_by_severity_filtering() {
+    let project = TempProject::empty(r#"{"name":"coverage-host","version":"1.0.0"}"#);
+    seed_node_modules_package(
+        &project,
+        "broken",
+        &[("index.js", "const broken = `unterminated")],
+    );
+    let mock = MockRegistry::start().await;
+    mock.with_osv_querybatch(vec![vec![]]).await;
+    let output = run_audit_json(&project, &mock, &["--level=critical", "--fail-on=vuln"]);
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(output.status.code(), Some(1), "{json}");
+    assert_eq!(
+        json["behavioral_coverage"]["packages"][0]["reason"],
+        "unsupported_source_syntax"
+    );
+    assert_eq!(json["success"], false);
+}
+
 /// Seed a node_modules package with high-confidence obfuscated source.
 fn seed_high_confidence_obfuscated_package(project: &TempProject, name: &str) {
     seed_node_modules_package(
@@ -3190,7 +3267,7 @@ async fn audit_human_output_shows_local_critical_finding_for_lpm_package() {
         "1.0.0",
         &[(
             "index.js",
-            b"while (true) { value = value.replace('a', 'b'); }\n",
+            b"if (Intl.DateTimeFormat().resolvedOptions().timeZone === 'QA/Blocked') process.exit(1);\n",
         )],
     );
     let metadata = serde_json::json!({

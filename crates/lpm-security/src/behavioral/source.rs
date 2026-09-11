@@ -79,6 +79,7 @@ const SOURCE_PATTERNS: &[(&str, &[&str])] = &[
         &[
             r#"\bfrom\s+["'].*\.node["']"#,
             r#"\brequire\s*\(\s*["'].*\.node["']\s*\)"#,
+            r#"\b(?:require\s*\(\s*|from\s+)["'](?:node-gyp|node-pre-gyp|napi)(?:-[^"']*)?["']"#,
             r"\bnode-gyp\b",
             r"\bnode-pre-gyp\b",
             r"\bnapi\b",
@@ -146,103 +147,10 @@ fn compiled_patterns() -> &'static CompiledSourcePatterns {
     })
 }
 
-/// Strip JavaScript comments from source text.
-///
-/// Handles:
-/// - `// line comments` → replaced with spaces (preserves line count)
-/// - `/* block comments */` → replaced with spaces
-/// - String literals (`"`, `'`, `` ` ``) → preserved (comments inside strings not stripped)
-///
-/// Operates on bytes for zero-copy efficiency. Returns a new Vec<u8> with
-/// comments replaced by spaces. Reuse the output buffer across calls by
-/// passing a pre-allocated Vec.
+/// Strip comments using syntax spans so literals and template expressions remain intact.
 pub fn strip_comments(input: &[u8], output: &mut Vec<u8>) {
-    output.clear();
-    output.reserve(input.len());
-
-    let len = input.len();
-    let mut i = 0;
-
-    while i < len {
-        let b = input[i];
-
-        // Check for string literals — pass through without stripping
-        if b == b'"' || b == b'\'' || b == b'`' {
-            let quote = b;
-            output.push(b);
-            i += 1;
-            while i < len {
-                let c = input[i];
-                output.push(c);
-                i += 1;
-                if c == b'\\' && i < len {
-                    // Escaped character — push it and skip
-                    output.push(input[i]);
-                    i += 1;
-                } else if c == quote {
-                    break;
-                } else if quote == b'`' && c == b'$' && i < len && input[i] == b'{' {
-                    // Template literal expression ${...} — handle nested braces
-                    output.push(input[i]);
-                    i += 1;
-                    let mut depth = 1u32;
-                    while i < len && depth > 0 {
-                        let d = input[i];
-                        output.push(d);
-                        i += 1;
-                        if d == b'{' {
-                            depth += 1;
-                        } else if d == b'}' {
-                            depth -= 1;
-                        } else if d == b'\\' && i < len {
-                            output.push(input[i]);
-                            i += 1;
-                        }
-                    }
-                }
-            }
-            continue;
-        }
-
-        // Check for comments
-        if b == b'/' && i + 1 < len {
-            let next = input[i + 1];
-
-            if next == b'/' {
-                // Line comment — skip until newline, replace with spaces
-                while i < len && input[i] != b'\n' {
-                    output.push(b' ');
-                    i += 1;
-                }
-                continue;
-            }
-
-            if next == b'*' {
-                // Block comment — skip until */, replace with spaces (preserve newlines)
-                output.push(b' ');
-                output.push(b' ');
-                i += 2;
-                while i < len {
-                    if input[i] == b'*' && i + 1 < len && input[i + 1] == b'/' {
-                        output.push(b' ');
-                        output.push(b' ');
-                        i += 2;
-                        break;
-                    }
-                    if input[i] == b'\n' {
-                        output.push(b'\n');
-                    } else {
-                        output.push(b' ');
-                    }
-                    i += 1;
-                }
-                continue;
-            }
-        }
-
-        output.push(b);
-        i += 1;
-    }
+    let input = String::from_utf8_lossy(input);
+    super::syntax::SourceContext::new(&input, "source.tsx", output);
 }
 
 /// Analyze source text (after comment stripping) for the 10 behavioral tags.
@@ -250,11 +158,19 @@ pub fn strip_comments(input: &[u8], output: &mut Vec<u8>) {
 /// Takes already-stripped source content as a string slice.
 /// Returns `SourceTags` with boolean flags for each detected capability.
 pub fn analyze_source(stripped: &str) -> SourceTags {
+    let mut buffer = Vec::new();
+    let context = super::syntax::SourceContext::new(stripped, "source.tsx", &mut buffer);
+    analyze_source_context(&context)
+}
+
+pub(super) fn analyze_source_context(context: &super::syntax::SourceContext<'_>) -> SourceTags {
     let compiled = compiled_patterns();
     let mut tags = SourceTags::default();
 
     for tag in &compiled.tags {
-        let matched = tag.regexes.iter().any(|regex| regex.is_match(stripped));
+        let matched = tag.regexes.iter().any(|regex| {
+            context.matches_with_context(regex, matches!(tag.name, "childProcess" | "shell"))
+        });
         match tag.name {
             "filesystem" => tags.filesystem = matched,
             "network" => tags.network = matched,
@@ -292,6 +208,43 @@ pub fn merge_source_tags(a: &SourceTags, b: &SourceTags) -> SourceTags {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn literal_examples_are_not_executable_capabilities() {
+        for code in [
+            r#"module.exports = "Example: eval(input)""#,
+            "module.exports = 'require(\"fs\"); fetch(input); process.env.KEY'",
+            "module.exports = `Example: eval(input)`",
+            "module.exports = /eval(input)/",
+            "const template = `text ${ \"eval(input)\" }`",
+            "const template = `text ${ /* eval(input) */ 1 }`",
+        ] {
+            assert_eq!(analyze(code), SourceTags::default(), "{code}");
+        }
+    }
+
+    #[test]
+    fn template_expressions_and_code_after_regex_literals_are_scanned() {
+        for code in [
+            "const template = `text ${ /* ignored */ eval(input) }`",
+            "const pattern = /[/*]/; module.exports = input => eval(input)",
+            "const template = `outer ${ `inner ${eval(input)}` }`",
+        ] {
+            assert!(analyze(code).eval, "{code}");
+        }
+    }
+
+    #[test]
+    fn regex_exec_is_not_a_child_process_or_shell() {
+        for code in [
+            "/pattern/.exec(input)",
+            "const pattern = /test/; pattern.exec('test')",
+        ] {
+            let tags = analyze(code);
+            assert!(!tags.child_process, "{code}");
+            assert!(!tags.shell, "{code}");
+        }
+    }
 
     fn analyze(src: &str) -> SourceTags {
         let mut buf = Vec::new();

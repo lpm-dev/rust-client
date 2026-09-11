@@ -59,7 +59,7 @@ const OBF_BUFFER_BASE64: usize = 3;
 const TELEMETRY_START: usize = 4;
 const TELEMETRY_END: usize = 12;
 const PROTESTWARE_START: usize = 12;
-const PROTESTWARE_END: usize = 16;
+const PROTESTWARE_END: usize = 14;
 
 fn supply_patterns() -> &'static [Regex] {
     static INSTANCE: OnceLock<Vec<Regex>> = OnceLock::new();
@@ -77,10 +77,8 @@ fn supply_patterns() -> &'static [Regex] {
             r#"["']countly-sdk-nodejs["']"#,
             r"\bnavigator\.sendBeacon\s*\(",
             r#"\bnew\s+Image\s*\(\s*\)\s*\.src\s*=\s*["']https?://"#,
-            r"(?:Intl\.DateTimeFormat|resolvedOptions\(\)\.(?:timeZone|locale)|os\.networkInterfaces)[\s\S]{0,200}process\.exit",
-            r"process\.exit[\s\S]{0,200}(?:Intl\.DateTimeFormat|resolvedOptions\(\)\.(?:timeZone|locale)|os\.networkInterfaces)",
-            r"for\s*\(\s*let\s+\w+\s*=.*Infinity",
-            r"while\s*\(\s*true\s*\)[\s\S]{0,50}replace",
+            r"(?:Intl\.DateTimeFormat|resolvedOptions\(\)\.(?:timeZone|locale)|os\.networkInterfaces)[\s\S]{0,200}(?:===?|!==?)[\s\S]{0,100}process\.exit",
+            r"(?:Intl\.DateTimeFormat|resolvedOptions\(\)\.(?:timeZone|locale)|os\.networkInterfaces)[\s\S]{0,200}(?:===?|!==?)[\s\S]{0,100}for\s*\(\s*let\s+\w+\s*=\s*\d+\s*;\s*\w+\s*<\s*Infinity\s*;",
         ]
         .into_iter()
         .map(|pattern| Regex::new(pattern).expect("supply-chain pattern must compile"))
@@ -96,7 +94,17 @@ struct SupplyPatternSummary {
 }
 
 fn supply_pattern_summary(stripped: &str) -> SupplyPatternSummary {
+    let mut buffer = Vec::new();
+    let context = super::syntax::SourceContext::new(stripped, "source.tsx", &mut buffer);
+    supply_pattern_summary_with_context(stripped, &context)
+}
+
+fn supply_pattern_summary_with_context(
+    stripped: &str,
+    context: &super::syntax::SourceContext<'_>,
+) -> SupplyPatternSummary {
     let patterns = supply_patterns();
+    let executable = String::from_utf8_lossy(&context.executable);
     SupplyPatternSummary {
         obfuscation: [
             patterns[OBF_HEX_ESCAPES].is_match(stripped),
@@ -109,7 +117,7 @@ fn supply_pattern_summary(stripped: &str) -> SupplyPatternSummary {
             .any(|pattern| pattern.is_match(stripped)),
         protestware: patterns[PROTESTWARE_START..PROTESTWARE_END]
             .iter()
-            .any(|pattern| pattern.is_match(stripped)),
+            .any(|pattern| pattern.is_match(&executable)),
     }
 }
 
@@ -537,7 +545,18 @@ pub(crate) fn analyze_supply_chain_with_url_presence(
     raw_content: &[u8],
     has_url_strings: bool,
 ) -> SupplyChainTags {
-    let patterns = supply_pattern_summary(stripped);
+    let mut buffer = Vec::new();
+    let context = super::syntax::SourceContext::new(stripped, "source.tsx", &mut buffer);
+    analyze_supply_chain_context(&context, raw_content, has_url_strings)
+}
+
+pub(super) fn analyze_supply_chain_context(
+    context: &super::syntax::SourceContext<'_>,
+    raw_content: &[u8],
+    has_url_strings: bool,
+) -> SupplyChainTags {
+    let stripped = &context.stripped;
+    let patterns = supply_pattern_summary_with_context(stripped, context);
     let is_minified = detect_minified(raw_content);
     let confidence = obfuscation_confidence_with_summary(stripped, is_minified, patterns);
 
@@ -577,6 +596,20 @@ pub fn merge_supply_chain_tags(a: &SupplyChainTags, b: &SupplyChainTags) -> Supp
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bounded_parser_and_normalization_loops_are_not_protestware() {
+        for code in [
+            "for (let i = 0, e = len == null ? Infinity : len; i < e; ++i) { if (!isDigit(input[i])) break; }",
+            "while (true) { const next = s.replace('aa', 'a'); if (next === s) return s; s = next; }",
+            "for (let i = 0; i < Infinity; i++) { if (done(i)) break; }",
+        ] {
+            assert!(
+                !analyze_supply_chain(code, code.as_bytes()).protestware,
+                "{code}"
+            );
+        }
+    }
 
     #[test]
     fn obfuscation_confidence_boundaries_map_to_documented_bands() {
@@ -811,9 +844,9 @@ mod tests {
     }
 
     #[test]
-    fn detect_infinite_loop_pattern() {
+    fn untargeted_infinite_loop_is_not_evidence_of_protestware() {
         let code = "for (let i = 666; i < Infinity; i++) { console.log(i) }";
-        assert!(supply_pattern_summary(code).protestware);
+        assert!(!supply_pattern_summary(code).protestware);
     }
 
     #[test]
