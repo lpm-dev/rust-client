@@ -237,9 +237,12 @@ pub enum AppContainerError {
         /// `GetLastError` reading.
         last_error: u32,
     },
+    /// The shell cannot use the requested directory without changing its meaning.
     #[error("cannot use working directory {path:?}: {source}")]
     WorkingDirectory {
+        /// Requested working directory.
         path: PathBuf,
+        /// Filesystem error or shell path limitation.
         source: std::io::Error,
     },
     /// `AssignProcessToJobObject` failed (the lifecycle child is
