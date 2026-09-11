@@ -63,7 +63,7 @@ use windows_sys::Win32::Security::Isolation::{
 use windows_sys::Win32::Security::{
     ACCESS_ALLOWED_ACE, ACL, AddAce, CONTAINER_INHERIT_ACE, CreateWellKnownSid,
     DACL_SECURITY_INFORMATION, EqualSid, GetAce, GetFileSecurityW, GetSecurityDescriptorControl,
-    GetSecurityDescriptorDacl, InitializeAcl, MAXIMUM_ALLOWED, OBJECT_INHERIT_ACE,
+    GetSecurityDescriptorDacl, InitializeAcl, OBJECT_INHERIT_ACE,
     PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID, SE_DACL_PROTECTED,
     SECURITY_ATTRIBUTES, SECURITY_CAPABILITIES, SID_AND_ATTRIBUTES,
     UNPROTECTED_DACL_SECURITY_INFORMATION, WELL_KNOWN_SID_TYPE, WinCapabilityInternetClientSid,
@@ -101,6 +101,8 @@ use crate::helper_protocol::{HelperArgs, StdioMode, split_env_entry};
 /// which we don't otherwise need; inlining the literal mirrors the
 /// `SE_GROUP_INTEGRITY` pattern in [`crate::windows`].
 const SE_GROUP_ENABLED: u32 = 0x0000_0004;
+// WinNT access-mask flag; avoids enabling SystemServices for one constant.
+const MAXIMUM_ALLOWED: u32 = 0x0200_0000;
 // WinNT's ACCESS_ALLOWED_ACE_TYPE. windows-sys exposes it through
 // SystemServices, which would otherwise add an unused feature namespace.
 const ACCESS_ALLOWED_ACE_TYPE: u8 = 0;
