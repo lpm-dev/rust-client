@@ -24,3 +24,6 @@ test-group = "verdaccio"
 [[profile.default.overrides]]
 filter = "package(lpm-workflows) & binary_id(/self_update/)"
 test-group = "self-update-processes"
+
+[profile.native-retest]
+slow-timeout = { period = "30s", terminate-after = 4 }
