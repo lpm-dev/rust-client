@@ -520,7 +520,13 @@ mod tests {
             String::from_utf8_lossy(&output.stdout).trim(),
             "hello space"
         );
-        let output = std::process::Command::new("bash")
+        let system_root = PathBuf::from(std::env::var_os("SystemRoot").unwrap());
+        let git_bash = std::env::split_paths(&std::env::var_os("PATH").unwrap())
+            .filter(|directory| !directory.starts_with(&system_root))
+            .map(|directory| directory.join("bash.exe"))
+            .find(|binary| binary.is_file())
+            .expect("Git Bash is required for the native shim regression");
+        let output = std::process::Command::new(git_bash)
             .arg(global_bin.join("tool").to_string_lossy().replace('\\', "/"))
             .arg("hello space")
             .output()

@@ -955,10 +955,9 @@ fn build_capability_attr(
 /// mask to `root` and every existing descendant.
 ///
 /// **Reparse-point handling.** A reparse-point root
-/// (junction / symlink / mount point) is refused — `SetNamedSecurityInfoW`
-/// follows reparse points and would apply the grant to the
-/// reparse-point target, potentially outside the intended allow-set
-/// tree. Reparse-point descendants are skipped with a debug log.
+/// (junction / symlink / mount point) is refused. Reparse-point
+/// descendants are skipped so grants cannot reach targets outside the
+/// intended allow-set tree.
 ///
 /// `SET_ACCESS` replaces prior explicit entries for this SID while
 /// preserving every other trustee's ACL entries.
@@ -1015,7 +1014,7 @@ fn grant_dacl_ace_to_tree(
     }
 
     if !strict_root && has_inheritable_appcontainer_access(root, access_mask) {
-        qa_trace(format_args!("existing AppContainer read access: {}", root.display()));
+        qa_trace(format_args!("existing AppContainer access: {}", root.display()));
         return Ok(());
     }
 
@@ -1061,7 +1060,6 @@ fn grant_dacl_ace_to_tree(
     }
 
     if meta.is_dir() {
-        let mut qa_entries = 0;
         let mut stack: Vec<PathBuf> = vec![root.to_path_buf()];
         while let Some(dir) = stack.pop() {
             let entries = match std::fs::read_dir(&dir) {
@@ -1077,8 +1075,6 @@ fn grant_dacl_ace_to_tree(
             };
             for entry in entries.flatten() {
                 let path = entry.path();
-                qa_entries += 1;
-                if qa_entries % 1000 == 0 { qa_trace(format_args!("tree {}: {qa_entries} entries at {}", root.display(), path.display())); }
                 let m = match entry.metadata() {
                     Ok(m) => m,
                     Err(e) => {
@@ -1149,7 +1145,15 @@ fn has_inheritable_appcontainer_access(path: &Path, access_mask: u32) -> bool {
     if dacl.is_null() {
         return false;
     }
-    let mut readable = false;
+    let mut direct_access = 0;
+    let mut file_access = 0;
+    let mut directory_access = 0;
+    let mapping = windows_sys::Win32::Security::GENERIC_MAPPING {
+        GenericRead: FILE_GENERIC_READ,
+        GenericWrite: FILE_GENERIC_WRITE,
+        GenericExecute: FILE_GENERIC_EXECUTE,
+        GenericAll: windows_sys::Win32::Storage::FileSystem::FILE_ALL_ACCESS,
+    };
     // SAFETY: the DACL belongs to the live security descriptor.
     for index in 0..unsafe { (*dacl).AceCount } as u32 {
         let mut ace: *mut std::ffi::c_void = ptr::null_mut();
@@ -1164,17 +1168,28 @@ fn has_inheritable_appcontainer_access(path: &Path, access_mask: u32) -> bool {
                 return false;
             }
             let allowed = ace as *const ACCESS_ALLOWED_ACE;
-            let required_flags = (OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE) as u8;
-            if (*header).AceFlags & required_flags == required_flags
-                && (*header).AceFlags & windows_sys::Win32::Security::INHERIT_ONLY_ACE as u8 == 0
-                && (*allowed).Mask & access_mask == access_mask
-                && EqualSid(ptr::addr_of!((*allowed).SidStart) as PSID, packages.Sid) != 0
-            {
-                readable = true;
+            if EqualSid(ptr::addr_of!((*allowed).SidStart) as PSID, packages.Sid) == 0 {
+                continue;
+            }
+            let mut mask = (*allowed).Mask;
+            windows_sys::Win32::Security::MapGenericMask(&mut mask, &mapping);
+            let flags = (*header).AceFlags as u32;
+            if flags & windows_sys::Win32::Security::INHERIT_ONLY_ACE == 0 {
+                direct_access |= mask;
+            }
+            if flags & windows_sys::Win32::Security::NO_PROPAGATE_INHERIT_ACE == 0 {
+                if flags & OBJECT_INHERIT_ACE != 0 {
+                    file_access |= mask;
+                }
+                if flags & CONTAINER_INHERIT_ACE != 0 {
+                    directory_access |= mask;
+                }
             }
         }
     }
-    readable
+    [direct_access, file_access, directory_access]
+        .into_iter()
+        .all(|mask| mask & access_mask == access_mask)
 }
 
 fn protect_secret_path_from_appcontainer(path: &Path, sid: PSID) -> Result<(), AppContainerError> {
@@ -1969,7 +1984,7 @@ mod tests {
     }
 
     #[test]
-    fn best_effort_tool_grants_preserve_existing_application_package_access() {
+    fn best_effort_dacl_grants_preserve_existing_application_package_access() {
         let tmp = tempfile::tempdir().unwrap();
         let mut buffer = vec![0u8; 64];
         let packages = build_capability_attr(WinBuiltinAnyPackageSid, &mut buffer).unwrap();
@@ -1995,6 +2010,91 @@ mod tests {
         let mut after = SecretDaclRestore::capture(&child).unwrap().unwrap();
         after.active = false;
         assert_eq!(before.security_descriptor, after.security_descriptor);
+    }
+
+    fn set_test_dacl(path: &Path, sddl: &str) {
+        use windows_sys::Win32::Security::Authorization::{
+            ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
+        };
+        let wide_sddl = str_to_wide_with_nul(sddl);
+        let mut descriptor = ptr::null_mut();
+        let mut dacl = ptr::null_mut();
+        let mut present = 0;
+        let mut defaulted = 0;
+        // SAFETY: the trusted SDDL and initialized out parameters live through each call.
+        unsafe {
+            assert_ne!(
+                ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                    wide_sddl.as_ptr(),
+                    SDDL_REVISION_1,
+                    &mut descriptor,
+                    ptr::null_mut(),
+                ),
+                0
+            );
+            let _descriptor = LocalAllocGuard(descriptor as *mut _);
+            assert_ne!(
+                GetSecurityDescriptorDacl(descriptor, &mut present, &mut dacl, &mut defaulted),
+                0
+            );
+            assert_ne!(present, 0);
+            assert_eq!(
+                SetNamedSecurityInfoW(
+                    to_wide_with_nul(path.as_os_str()).as_ptr(),
+                    SE_FILE_OBJECT,
+                    DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+                    ptr::null_mut(),
+                    ptr::null_mut(),
+                    dacl,
+                    ptr::null(),
+                ),
+                ERROR_SUCCESS
+            );
+        }
+    }
+
+    #[test]
+    fn best_effort_dacl_recognizes_split_generic_application_package_access() {
+        let tmp = tempfile::tempdir().unwrap();
+        set_test_dacl(
+            tmp.path(),
+            "D:P(A;OICI;FA;;;OW)(A;;0x1200a9;;;AC)(A;OICIIO;GXGR;;;AC)",
+        );
+        let mask = FILE_GENERIC_READ | FILE_GENERIC_EXECUTE;
+        assert!(has_inheritable_appcontainer_access(tmp.path(), mask));
+        assert!(!has_inheritable_appcontainer_access(
+            tmp.path(),
+            mask | FILE_GENERIC_WRITE
+        ));
+        let child = tmp.path().join("tool.txt");
+        std::fs::write(&child, b"tool").unwrap();
+        let mut before = SecretDaclRestore::capture(&child).unwrap().unwrap();
+        before.active = false;
+        let sid = create_or_reuse_appcontainer_sid("LpmSplitToolAccessTest").unwrap();
+        grant_dacl_ace_to_tree(tmp.path(), sid.0, mask, false).unwrap();
+        let mut after = SecretDaclRestore::capture(&child).unwrap().unwrap();
+        after.active = false;
+        assert_eq!(before.security_descriptor, after.security_descriptor);
+    }
+
+    #[test]
+    fn best_effort_dacl_requires_propagating_access_without_denials() {
+        let tmp = tempfile::tempdir().unwrap();
+        for sddl in [
+            "D:P(A;OICI;FA;;;OW)(A;;0x1200a9;;;AC)",
+            "D:P(A;OICI;FA;;;OW)(A;OICIIO;GXGR;;;AC)",
+            "D:P(A;OICI;FA;;;OW)(A;;0x1200a9;;;AC)(A;OICIIONP;GXGR;;;AC)",
+            "D:P(D;;GW;;;AC)(A;OICI;FA;;;OW)(A;OICI;GXGR;;;AC)",
+        ] {
+            set_test_dacl(tmp.path(), sddl);
+            assert!(
+                !has_inheritable_appcontainer_access(
+                    tmp.path(),
+                    FILE_GENERIC_READ | FILE_GENERIC_EXECUTE
+                ),
+                "{sddl}"
+            );
+        }
     }
 
     #[test]
