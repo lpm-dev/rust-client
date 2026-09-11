@@ -97,11 +97,14 @@ fn create_private_directory_with(
         let mut random = [0u8; 16];
         rand::rngs::OsRng.fill_bytes(&mut random);
         let name = OsString::from(format!(".lpm-{purpose}-{}", hex::encode(random)));
+        eprintln!("QA create private {name:?}");
         match create_and_open_private_directory(parent, &name) {
             Ok(directory) => {
                 let created_identity = directory_identity(&directory)?;
                 after_create(parent, &name)?;
+                eprintln!("QA open private {name:?}");
                 let visible = open_directory_for_publication(parent, &name)?;
+                eprintln!("QA opened private");
                 if directory_identity(&visible)? != created_identity {
                     return Err(std::io::Error::other(
                         "private transaction directory changed before handle verification",
@@ -495,7 +498,9 @@ pub(crate) fn publish_directory_noreplace(
     use std::os::windows::io::AsRawHandle as _;
 
     let expected_identity = directory_identity(directory)?;
+    eprintln!("QA publish directory {final_name:?}");
     publish_windows_handle_noreplace(directory.as_raw_handle(), destination_parent, final_name)?;
+    eprintln!("QA published directory");
     verify_published_directory_identity(destination_parent, final_name, &expected_identity)
 }
 

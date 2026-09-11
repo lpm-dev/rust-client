@@ -1061,6 +1061,7 @@ fn grant_dacl_ace_to_tree(
     }
 
     if meta.is_dir() {
+        let mut qa_entries = 0;
         let mut stack: Vec<PathBuf> = vec![root.to_path_buf()];
         while let Some(dir) = stack.pop() {
             let entries = match std::fs::read_dir(&dir) {
@@ -1076,6 +1077,8 @@ fn grant_dacl_ace_to_tree(
             };
             for entry in entries.flatten() {
                 let path = entry.path();
+                qa_entries += 1;
+                if qa_entries % 1000 == 0 { qa_trace(format_args!("tree {}: {qa_entries} entries at {}", root.display(), path.display())); }
                 let m = match entry.metadata() {
                     Ok(m) => m,
                     Err(e) => {

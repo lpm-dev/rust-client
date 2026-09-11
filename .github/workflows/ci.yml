@@ -36,6 +36,10 @@ jobs:
         run: |
           python -c 'import shutil; assert shutil.disk_usage(".").free >= 10*1024**3'
           cargo build --locked -p lpm-cli -p lpm-sandbox
+      - name: Inspect existing tool access
+        shell: pwsh
+        run: |
+          @('C:\Program Files\dotnet', 'C:\vcpkg') | ForEach-Object { Get-Acl -LiteralPath $_ | Format-List Path, Sddl }
       - name: Windows global forwarding regression
         continue-on-error: true
         shell: bash
