@@ -37,75 +37,12 @@ jobs:
         shell: bash
         run: |
           python -c 'import shutil; assert shutil.disk_usage(".").free >= 10*1024**3'
-          cargo build --locked -p lpm-cli -p lpm-sandbox
+          cargo build --locked -p lpm-sandbox
       - name: Cleared environment controls
         shell: pwsh
         run: ./qa-env.ps1 2>&1 | Tee-Object -FilePath qa-environment.log
-      - name: Inspect existing tool access
-        shell: pwsh
-        run: |
-          @('C:\Program Files\dotnet', 'C:\vcpkg') | ForEach-Object { Get-Acl -LiteralPath $_ | Format-List Path, Sddl }
-      - name: Windows global forwarding regression
-        continue-on-error: true
-        shell: bash
-        run: |
-          mkdir -p qa-results
-          python -c 'import shutil; assert shutil.disk_usage(".").free >= 10*1024**3'
-          cargo test --locked -p lpm-global windows_global_shims_forward_arguments_and_exit_code_to_project_shims -- --nocapture 2>&1 | tee qa-results/global-forwarding.log
-          exit "${PIPESTATUS[0]}"
-      - name: Sandbox single-entry regression
-        continue-on-error: true
-        shell: bash
-        run: |
-          python -c 'import shutil; assert shutil.disk_usage(".").free >= 10*1024**3'
-          cargo test --locked -p lpm-sandbox dacl_ -- --nocapture 2>&1 | tee qa-results/sandbox-unit.log
-          exit "${PIPESTATUS[0]}"
-      - name: Source directory handle regression
-        continue-on-error: true
-        shell: bash
-        run: |
-          python -c 'import shutil; assert shutil.disk_usage(".").free >= 10*1024**3'
-          cargo test --locked -p lpm-cli --bin lpm-rs directory_transaction -- --nocapture 2>&1 | tee qa-results/directory.log
-          exit "${PIPESTATUS[0]}"
-      - name: Helper filesystem checks
-        continue-on-error: true
-        shell: bash
-        run: |
-          python -c 'import shutil; assert shutil.disk_usage(".").free >= 10*1024**3'
-          cargo test --locked -p lpm-sandbox --test helper_filesystem -- --nocapture 2>&1 | tee qa-results/helper-filesystem.log
-          exit "${PIPESTATUS[0]}"
-      - name: Long workspace diagnostic
-        continue-on-error: true
-        shell: bash
-        run: python qa-workspace.py --binary target/debug/lpm-rs.exe --output qa-results/followup/workspace-0
-      - name: Long atomic-write baseline
-        continue-on-error: true
-        shell: bash
-        run: |
-          mkdir -p qa-results
-          python -c 'import shutil; assert shutil.disk_usage(".").free >= 10*1024**3'
-          cargo test --locked -p lpm-common write_file_atomic_creates_and_replaces_beyond_max_path -- --nocapture 2>&1 | tee qa-results/atomic.log
-          exit "${PIPESTATUS[0]}"
-      - name: Workflow baselines
-        continue-on-error: true
-        shell: bash
-        run: |
-          python -c 'import shutil; assert shutil.disk_usage(".").free >= 10*1024**3'
-          cargo nextest run --locked -P native-baseline -p lpm-workflows --test add --test publish --test install_concurrency -E 'test(publish_dry_run_executes_publish_lifecycle_scripts_in_npm_order) | test(source_add_and_remove_use_in_project_paths_on_native_platforms) | test(two_concurrent_global_installs_serialize_via_global_tx_lock)'  --no-fail-fast --status-level all --final-status-level all 2>&1 | tee qa-results/workflows.log
-          exit "${PIPESTATUS[0]}"
-      - name: Collect diagnostic output
-        if: always()
-        shell: pwsh
-        run: |
-          if (Test-Path C:\lpm-sandbox-qa.log) {
-            Get-Content C:\lpm-sandbox-qa.log
-            Copy-Item C:\lpm-sandbox-qa.log qa-results/sandbox.log
-          }
-          Get-ChildItem qa-results -Recurse -Filter '*.stderr.log' | ForEach-Object { Get-Content $_.FullName }
       - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f
         if: always()
         with:
-          name: native-regression-baseline
-          path: |
-            qa-results
-            qa-environment.log
+          name: native-environment-controls
+          path: qa-environment.log

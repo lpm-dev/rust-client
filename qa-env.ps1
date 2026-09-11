@@ -10,7 +10,7 @@ $cases = @(
 )
 $i = 0
 foreach ($keys in $cases) {
-  $arguments = @('--protocol-version','2','--appcontainer-name',('LpmEnvQA' + $PID + '-' + $i),'--delete-appcontainer-profile','--env-clear','--working-dir',$root,'--writable-dir',$root)
+  $arguments = @('--protocol-version','2','--appcontainer-name',('LpmEnvQA' + $PID + '-' + $i),'--delete-appcontainer-profile','--env-clear','--stdio-stdin','null','--stdio-stdout','inherit','--stdio-stderr','inherit','--working-dir',$root,'--writable-dir',$root)
   foreach ($key in $keys) {
     $value = [Environment]::GetEnvironmentVariable($key)
     if ($null -ne $value) {$arguments += @('--env', ($key + '=' + $value))}
