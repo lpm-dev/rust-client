@@ -55,10 +55,17 @@ jobs:
           python -c 'import shutil; assert shutil.disk_usage(".").free >= 10*1024**3'
           cargo nextest run --locked -P native-baseline -p lpm-workflows --test add --test publish --test install_concurrency -E 'test(publish_dry_run_executes_publish_lifecycle_scripts_in_npm_order)' --no-fail-fast --status-level all --final-status-level all 2>&1 | tee qa-results/workflows.log
           exit "${PIPESTATUS[0]}"
+      - name: Collect diagnostic output
+        if: always()
+        shell: pwsh
+        run: |
+          if (Test-Path C:\lpm-sandbox-qa.log) {
+            Get-Content C:\lpm-sandbox-qa.log
+            Copy-Item C:\lpm-sandbox-qa.log qa-results/sandbox.log
+          }
+          Get-ChildItem qa-results -Recurse -Filter '*.stderr.log' | ForEach-Object { Get-Content $_.FullName }
       - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f
         if: always()
         with:
           name: native-regression-baseline
-          path: |
-            qa-results
-            C:\lpm-sandbox-qa.log
+          path: qa-results
