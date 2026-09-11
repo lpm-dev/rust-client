@@ -375,6 +375,62 @@ pub(crate) fn open_directory_for_publication(parent: &Dir, name: &OsStr) -> std:
     open_windows_directory(parent, name, false)
 }
 
+#[cfg(windows)]
+pub(crate) fn open_directory_parent(directory: &Dir) -> std::io::Result<Dir> {
+    use std::os::windows::ffi::OsStringExt as _;
+    use std::os::windows::fs::{MetadataExt as _, OpenOptionsExt as _};
+    use std::os::windows::io::AsRawHandle as _;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
+        FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, GetFinalPathNameByHandleW,
+    };
+
+    // NT relative opens do not resolve `..`. Match cap-std's handle-to-path
+    // parent lookup while preserving delete sharing for retained rename handles.
+    let mut path = vec![0u16; 512];
+    loop {
+        let length = unsafe {
+            // SAFETY: the directory handle is live and the buffer is writable.
+            GetFinalPathNameByHandleW(
+                directory.as_raw_handle(),
+                path.as_mut_ptr(),
+                path.len() as u32,
+                0,
+            )
+        };
+        if length == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        if length as usize >= path.len() {
+            path.resize(length as usize + 1, 0);
+            continue;
+        }
+        path.truncate(length as usize);
+        break;
+    }
+    let path = std::path::PathBuf::from(OsString::from_wide(&path));
+    let parent = path
+        .parent()
+        .ok_or_else(|| std::io::Error::other("directory has no parent"))?;
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(parent)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_dir() || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+        return Err(std::io::Error::other(
+            "directory parent is linked or not a directory",
+        ));
+    }
+    Ok(Dir::from_std_file(file))
+}
+
+#[cfg(not(windows))]
+pub(crate) fn open_directory_parent(directory: &Dir) -> std::io::Result<Dir> {
+    directory.open_parent_dir(cap_std::ambient_authority())
+}
+
 #[cfg(not(windows))]
 pub(crate) fn discard_private_directory(directory: Dir) -> std::io::Result<()> {
     directory.remove_open_dir()
@@ -602,6 +658,24 @@ pub(crate) fn publish_directory_noreplace(
 
 #[cfg(test)]
 mod tests {
+    #[cfg(windows)]
+    #[test]
+    fn private_directory_parent_reopen_preserves_rename_sharing() {
+        use super::*;
+
+        let temporary = tempfile::tempdir().unwrap();
+        let root = Dir::open_ambient_dir(temporary.path(), cap_std::ambient_authority()).unwrap();
+        let (parent_name, parent) = create_private_directory(&root, "parent").unwrap();
+        let (_child_name, child) = create_private_directory(&parent, "child").unwrap();
+        let reopened = open_directory_parent(&child).unwrap();
+        assert_eq!(
+            directory_identity(&parent).unwrap(),
+            directory_identity(&reopened).unwrap()
+        );
+        publish_entry_noreplace(&root, &parent_name, &root, OsStr::new("renamed")).unwrap();
+        assert!(temporary.path().join("renamed").is_dir());
+    }
+
     #[cfg(windows)]
     #[test]
     fn private_directory_can_be_reopened_and_published_with_a_retained_handle() {

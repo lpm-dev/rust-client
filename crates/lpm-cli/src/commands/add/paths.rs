@@ -669,7 +669,7 @@ fn validate_quarantined_directory_branch(
                 let parent_index = directories[child]
                     .parent
                     .expect("non-root traversal node has a parent");
-                let parent = current.open_parent_dir(cap_std::ambient_authority())?;
+                let parent = crate::directory_transaction::open_directory_parent(&current)?;
                 if directory_identity(&parent)? != directories[parent_index].identity {
                     return Err(std::io::Error::other("directory parent identity changed"));
                 }
@@ -707,7 +707,7 @@ fn remove_quarantined_directory_descendants(
                 let parent_index = directories[child]
                     .parent
                     .expect("non-root traversal node has a parent");
-                let parent = current.open_parent_dir(cap_std::ambient_authority())?;
+                let parent = crate::directory_transaction::open_directory_parent(&current)?;
                 if directory_identity(&parent)? != directories[parent_index].identity {
                     return Err(std::io::Error::other("directory parent identity changed"));
                 }

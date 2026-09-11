@@ -56,25 +56,8 @@ pub(super) fn commit_locked(
         }
     };
 
-    // ─── Collision resolution ───────────────────────────────
-    //
-    // Three paths from here:
-    //
-    //   1. No collisions at all → zero work, zero delta, proceed to
-    //      the existing happy path. Shortest path.
-    //   2. Collisions AND the user supplied `--replace-bin`/`--alias`
-    //      → run the resolution planner. If the plan covers every
-    //      collision (and introduces no new alias-target collisions),
-    //      apply the delta to the manifest + emit the resolved shim
-    //      set. If the plan fails, roll back inline and surface the
-    //      planner's specific error (unknown command / residual /
-    //      alias-target conflict).
-    //   3. Collisions AND no user resolution → inline rollback + error
-    //      with the --replace-bin / --alias remediation hint.
     let observed = find_command_collisions(&manifest, &prep.name, &marker_commands);
-    let plan = if observed.is_empty() {
-        // Shortest path: no collisions → empty plan with marker_commands
-        // passing through unchanged.
+    let plan = if observed.is_empty() && resolution.is_empty() {
         ResolutionPlan {
             ownership_delta: Vec::new(),
             final_commands: marker_commands,

@@ -597,6 +597,9 @@ async fn publish_lifecycle_does_not_receive_ambient_secrets() {
         "record-env.js",
         concat!(
             "const fs = require('fs');\n",
+            "if (process.platform === 'win32' && !process.env.LOCALAPPDATA) {\n",
+            "  throw new Error('sandbox local application data directory is missing');\n",
+            "}\n",
             "fs.writeFileSync(\n",
             "  'lifecycle-env',\n",
             "  process.env.PUBLISH_AMBIENT_SECRET || 'absent'\n",

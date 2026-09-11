@@ -30,7 +30,9 @@ jobs:
             ~/.cargo/git
             target
           key: ${{ runner.os }}-native-acceptance-1940-${{ hashFiles('Cargo.lock') }}
-          restore-keys: ${{ runner.os }}-cargo-filesystem-1.94.0-
+          restore-keys: |
+            ${{ runner.os }}-native-acceptance-1940-
+            ${{ runner.os }}-cargo-filesystem-1.94.0-
       - uses: taiki-e/install-action@9c6953334daacc48e55a35db9a19c771f79ffa9d
         with:
           tool: nextest
@@ -76,7 +78,7 @@ jobs:
         shell: bash
         run: |
           python -c 'import shutil; assert shutil.disk_usage(".").free >= 10*1024**3'
-          cargo nextest run --locked -P native-retest -p lpm-workflows --test install --test add --test install_concurrency --test publish -E 'test(source_add_and_remove_use_in_project_paths_on_native_platforms) | test(install_refreshes_custom_metadata_when_requested_version_was_published_after_cache) | test(install_refreshes_a_newly_published_version) | test(missing_version_refresh_is_bounded_and_preserves_the_installed_project) | test(metadata_refresh_does_not_bypass_revoked_custom_registry_access) | test(failed_metadata_refresh_keeps_optional_dependencies_optional) | test(two_concurrent_global_installs_serialize_via_global_tx_lock) | test(publish_dry_run_executes_publish_lifecycle_scripts_in_npm_order)' --no-fail-fast --status-level all --final-status-level all 2>&1 | tee qa-results/workflows.log
+          cargo nextest run --locked -P native-retest -p lpm-workflows --test install --test add --test install_concurrency --test publish -E 'test(source_add_and_remove_use_in_project_paths_on_native_platforms) | test(install_refreshes_custom_metadata_when_requested_version_was_published_after_cache) | test(install_refreshes_a_newly_published_version) | test(missing_version_refresh_is_bounded_and_preserves_the_installed_project) | test(metadata_refresh_does_not_bypass_revoked_custom_registry_access) | test(failed_metadata_refresh_keeps_optional_dependencies_optional) | test(global_alias_without_a_collision_runs_and_is_removed_with_its_package) | test(publish_lifecycle_does_not_receive_ambient_secrets) | test(two_concurrent_global_installs_serialize_via_global_tx_lock) | test(publish_dry_run_executes_publish_lifecycle_scripts_in_npm_order)' --no-fail-fast --status-level all --final-status-level all 2>&1 | tee qa-results/workflows.log
           exit "${PIPESTATUS[0]}"
       - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f
         if: always()

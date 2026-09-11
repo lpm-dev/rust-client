@@ -3887,6 +3887,7 @@ dependencies = [
  "landlock",
  "libc",
  "lpm-common",
+ "rayon",
  "seccompiler",
  "serde_json",
  "tempfile",
