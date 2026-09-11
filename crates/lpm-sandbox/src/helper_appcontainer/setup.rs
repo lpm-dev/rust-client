@@ -1030,4 +1030,88 @@ mod tests {
         );
         assert!(!has_grant(&file, &file_path, sid.raw(), TOOL_ACCESS, 0).unwrap());
     }
+
+    #[test]
+    fn pinned_directories_refuse_in_place_junction_conversion() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().join("tool");
+        let outside = temporary.path().join("outside");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::create_dir(&outside).unwrap();
+        let entry = grant_for(
+            &root,
+            Permission::ToolReadExecute,
+            &current_user_sid().unwrap(),
+        )
+        .unwrap();
+        let _pins = pin_grant(&entry).unwrap();
+        let substitute = outside
+            .canonicalize()
+            .unwrap()
+            .as_os_str()
+            .encode_wide()
+            .collect::<Vec<_>>();
+        let mut substitute = substitute;
+        substitute[1] = b'?' as u16;
+        let data_length = 8 + (substitute.len() + 2) * 2;
+        let mut data = Vec::new();
+        data.extend_from_slice(&0xa0000003u32.to_le_bytes());
+        data.extend_from_slice(&(data_length as u16).to_le_bytes());
+        data.extend_from_slice(&0u16.to_le_bytes());
+        for value in [
+            0,
+            (substitute.len() * 2) as u16,
+            ((substitute.len() + 1) * 2) as u16,
+            0,
+        ] {
+            data.extend_from_slice(&value.to_le_bytes());
+        }
+        for unit in substitute {
+            data.extend_from_slice(&unit.to_le_bytes());
+        }
+        data.extend_from_slice(&[0, 0, 0, 0]);
+        let wide = to_wide_with_nul(root.as_os_str());
+        let convert = |access| {
+            // SAFETY: the path is terminated and no handle is inherited.
+            let raw = unsafe {
+                CreateFileW(
+                    wide.as_ptr(),
+                    access,
+                    FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                    ptr::null(),
+                    OPEN_EXISTING,
+                    FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+                    ptr::null_mut(),
+                )
+            };
+            if raw == INVALID_HANDLE_VALUE {
+                return false;
+            }
+            let handle = HandleGuard(raw);
+            let mut returned = 0;
+            // SAFETY: the initialized reparse buffer and output live through the synchronous call.
+            let changed = unsafe {
+                windows_sys::Win32::System::IO::DeviceIoControl(
+                    handle.as_raw(),
+                    0x000900a4,
+                    data.as_ptr().cast(),
+                    data.len() as u32,
+                    ptr::null_mut(),
+                    0,
+                    &mut returned,
+                    ptr::null_mut(),
+                )
+            };
+            changed != 0
+        };
+        for access in [
+            windows_sys::Win32::Foundation::GENERIC_WRITE,
+            windows_sys::Win32::Storage::FileSystem::FILE_WRITE_ATTRIBUTES,
+            0,
+        ] {
+            assert!(!convert(access), "junction conversion succeeded with access mask {access:x}");
+        }
+        drop(_pins);
+        assert!(convert(windows_sys::Win32::Foundation::GENERIC_WRITE), "unpinned junction control must succeed");
+    }
 }
