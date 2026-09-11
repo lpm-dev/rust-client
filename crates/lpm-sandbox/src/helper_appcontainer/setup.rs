@@ -298,18 +298,9 @@ fn grant_for(
     permission: Permission,
     user_sid: &str,
 ) -> Result<Grant, AppContainerError> {
-    let metadata = std::fs::symlink_metadata(path)
-        .map_err(|error| failure(format!("inspect {}: {error}", path.display())))?;
-    if !metadata.is_dir() || is_reparse_point(&metadata) {
-        return Err(failure(format!(
-            "{} must be an existing directory, without a link or junction",
-            path.display()
-        )));
-    }
-    let path = path
-        .canonicalize()
-        .map_err(|error| failure(format!("resolve {}: {error}", path.display())))?;
-    let (handle, identity) = open_permissions(&path, false)?;
+    let target = walk::Target::preview(path)?;
+    let path = target.canonical_directory()?;
+    let identity = target.identity;
     let mut hash = Sha256::new();
     hash.update(user_sid.as_bytes());
     hash.update([
@@ -327,7 +318,7 @@ fn grant_for(
     let capability_name = format!("lpm.filesystem.v1.{:x}", hash.finalize());
     let sid = capability_sid(&capability_name)?;
     let configured = has_grant(
-        &handle,
+        &target.handle,
         &path,
         sid.raw(),
         permission.mask(),
@@ -340,6 +331,11 @@ fn grant_for(
         identity,
         capability_name,
     })
+}
+
+/// Resolve an existing directory without following links or junctions in any component.
+pub fn canonical_directory(path: &Path) -> Result<PathBuf, AppContainerError> {
+    walk::Target::preview(path)?.canonical_directory()
 }
 
 /// Preview ancestor metadata and explicitly selected tool permissions without mutations.
@@ -769,7 +765,10 @@ pub(super) fn prepare<'a>(
         {
             continue;
         }
-        let entry = grant_for(tool, Permission::ToolReadExecute, &user_sid)?;
+        let canonical = tool
+            .canonicalize()
+            .map_err(|error| failure(error.to_string()))?;
+        let entry = grant_for(&canonical, Permission::ToolReadExecute, &user_sid)?;
         // A tool capability can authorize reads independently of the deny
         // for this invocation's SID. Exclude both ancestors and descendants
         // of protected paths from the capability set.
@@ -970,6 +969,71 @@ mod tests {
                 .configured
         );
         assert!(!has_grant(&file, &file_path, sid.raw(), TOOL_ACCESS, 0).unwrap());
+    }
+
+    #[test]
+    fn preview_refuses_a_tool_beneath_a_junction_ancestor() {
+        let temporary = tempfile::tempdir().unwrap();
+        let outside = temporary.path().join("outside");
+        std::fs::create_dir_all(outside.join("tool")).unwrap();
+        let link = temporary.path().join("redirect");
+        let output = std::process::Command::new("cmd.exe")
+            .args(["/d", "/c", "mklink", "/J"])
+            .arg(&link)
+            .arg(&outside)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        assert!(
+            grant_for(
+                &link.join("tool"),
+                Permission::ToolReadExecute,
+                &current_user_sid().unwrap()
+            )
+            .is_err(),
+            "preview must not turn a junction path into approval of its target"
+        );
+    }
+
+    #[test]
+    fn tool_permission_walk_covers_multiple_directory_batches_and_restarts_on_removal() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().join("tool");
+        let nested = root.join("bin").join("Unicode tools λ");
+        std::fs::create_dir_all(&nested).unwrap();
+        let paths: Vec<_> = (0..700)
+            .map(|index| root.join(format!("tool-{index:04}-with-a-long-name.exe")))
+            .chain([nested.join("工具.exe")])
+            .collect();
+        for path in &paths {
+            std::fs::write(path, "tool").unwrap();
+        }
+        let entry = grant_for(
+            &root,
+            Permission::ToolReadExecute,
+            &current_user_sid().unwrap(),
+        )
+        .unwrap();
+        let sid = capability_sid(&entry.capability_name).unwrap();
+        let (_parents, target) = pin_grant(&entry).unwrap();
+        for configured in [true, false] {
+            walk::children(
+                &target,
+                &entry.path,
+                sid.raw(),
+                configured.then_some((TOOL_ACCESS, 0)),
+            )
+            .unwrap();
+            for path in &paths {
+                let (file, _) = open_permissions(path, false).unwrap();
+                assert_eq!(
+                    has_grant(&file, path, sid.raw(), TOOL_ACCESS, 0).unwrap(),
+                    configured,
+                    "{}",
+                    path.display()
+                );
+            }
+        }
     }
 
     #[test]

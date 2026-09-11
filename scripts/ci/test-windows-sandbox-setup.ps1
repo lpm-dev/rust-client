@@ -112,18 +112,29 @@ console.log('HOOK_OK');
  if ($LASTEXITCODE -ne 0) { throw 'base setup restoration failed' }
  $registryScript = Join-Path $root 'registry.cjs'
  $registryPort = Join-Path $root 'registry-port.txt'
+ $registryUpload = Join-Path $root 'registry-upload.json'
  @'
 const fs = require('node:fs');
 const http = require('node:http');
 const server = http.createServer((req, res) => {
-  const expected = req.method === 'GET' && req.url === '/lpm-sandbox-setup-fixture'
+  const expected = req.url === '/lpm-sandbox-setup-fixture'
     && req.headers.authorization === 'Bearer publish-custom-registry-token';
-  res.writeHead(expected ? 404 : 400, {'Content-Type': 'application/json'});
+  if (expected && req.method === 'PUT') {
+    const chunks = [];
+    req.on('data', chunk => chunks.push(chunk));
+    req.on('end', () => {
+      fs.writeFileSync(process.argv[3], Buffer.concat(chunks));
+      res.writeHead(201, {'Content-Type': 'application/json'});
+      res.end(JSON.stringify({ok: true}));
+    });
+    return;
+  }
+  res.writeHead(expected && req.method === 'GET' ? 404 : 400, {'Content-Type': 'application/json'});
   res.end(JSON.stringify({error: expected ? 'not found' : 'unexpected request'}));
 });
 server.listen(0, '127.0.0.1', () => fs.writeFileSync(process.argv[2], String(server.address().port)));
 '@ | Set-Content $registryScript
- $registryProcess = Start-Process -FilePath (Join-Path $tool 'node.exe') -ArgumentList @($registryScript,$registryPort) -PassThru
+ $registryProcess = Start-Process -FilePath (Join-Path $tool 'node.exe') -ArgumentList @($registryScript,$registryPort,$registryUpload) -PassThru
  $deadline = [DateTime]::UtcNow.AddSeconds(15)
  while (!(Test-Path $registryPort) -and [DateTime]::UtcNow -lt $deadline) { Start-Sleep -Milliseconds 100 }
  if (!(Test-Path $registryPort)) { throw 'disposable registry did not start' }
@@ -148,6 +159,16 @@ fs.appendFileSync('publish-phases.txt', process.argv[2] + '\n');
  if ($publish.Code -ne 0) { throw 'standard-user publish failed' }
  $actualPhases = @(Get-Content (Join-Path $project 'publish-phases.txt'))
  if (($actualPhases -join ',') -ne ($phases -join ',')) { throw "publish hooks did not run in order: $actualPhases" }
+ if (Test-Path $registryUpload) { throw 'dry-run unexpectedly uploaded' }
+ Remove-Item (Join-Path $project 'publish-phases.txt')
+ $watch = [Diagnostics.Stopwatch]::StartNew()
+ $publish = AsUser $setup @('publish','--npm','--yes')
+ Write-Output "PUBLISH_UPLOAD_SIX_HOOKS_MS $($watch.ElapsedMilliseconds)"
+ if ($publish.Code -ne 0) { throw 'standard-user publish upload failed' }
+ $actualPhases = @(Get-Content (Join-Path $project 'publish-phases.txt'))
+ if (($actualPhases -join ',') -ne ($phases -join ',')) { throw "upload hooks did not run in order: $actualPhases" }
+ $uploaded = Get-Content -Raw $registryUpload | ConvertFrom-Json
+ if ($uploaded.name -ne 'lpm-sandbox-setup-fixture' -or !$uploaded.versions.'1.0.0' -or !$uploaded._attachments) { throw 'registry did not receive a usable package' }
  if ((Get-Content (Join-Path $project '.env')) -ne 'FAKE_TEST_SECRET=blocked') { throw 'secret restoration failed' }
  & $setup @($json.apply_args | ForEach-Object { if ($_ -eq '--apply') { '--remove' } else { $_ } }) --yes --json
  if ($LASTEXITCODE -ne 0) { throw 'administrator remove failed' }

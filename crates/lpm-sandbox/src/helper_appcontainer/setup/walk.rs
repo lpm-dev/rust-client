@@ -11,7 +11,8 @@ use windows_sys::Win32::Foundation::{
     STATUS_REPARSE_POINT_ENCOUNTERED, STATUS_STOPPED_ON_SYMLINK, UNICODE_STRING,
 };
 use windows_sys::Win32::Storage::FileSystem::{
-    FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_NORMAL, FILE_READ_DATA, SYNCHRONIZE,
+    FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_NORMAL, FILE_READ_DATA, GetFinalPathNameByHandleW,
+    SYNCHRONIZE,
 };
 use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
 
@@ -23,13 +24,59 @@ pub(super) struct Target {
 
 impl Target {
     pub(super) fn open(path: &Path, write: bool) -> Result<Self, AppContainerError> {
-        let mut name: Vec<_> = path.as_os_str().encode_wide().collect();
+        Self::open_path(path, write, true)
+    }
+
+    pub(super) fn preview(path: &Path) -> Result<Self, AppContainerError> {
+        Self::open_path(path, false, false)
+    }
+
+    fn open_path(path: &Path, write: bool, pin: bool) -> Result<Self, AppContainerError> {
+        let absolute = std::path::absolute(path)
+            .map_err(|error| failure(format!("resolve {}: {error}", path.display())))?;
+        let mut name: Vec<_> = absolute.as_os_str().encode_wide().collect();
         if !name.starts_with(&[92, 92, 63, 92]) {
-            return Err(failure("setup requires a canonical Windows path"));
+            name = if name.starts_with(&[92, 92]) {
+                r"\\?\UNC\"
+                    .encode_utf16()
+                    .chain(name.into_iter().skip(2))
+                    .collect()
+            } else {
+                r"\\?\".encode_utf16().chain(name).collect()
+            };
         }
         // The object manager uses \??\ for the Win32 extended-path prefix.
         name[1] = b'?' as u16;
-        Self::open_name(ptr::null_mut(), name, path, write)
+        Self::open_name(ptr::null_mut(), name, path, write, pin)
+    }
+
+    pub(super) fn canonical_directory(&self) -> Result<PathBuf, AppContainerError> {
+        if !self.directory {
+            return Err(failure("setup requires an existing directory"));
+        }
+        let mut name = vec![0u16; 512];
+        loop {
+            // SAFETY: the target handle is open and the UTF-16 output has the advertised size.
+            let length = unsafe {
+                GetFinalPathNameByHandleW(
+                    self.handle.as_raw(),
+                    name.as_mut_ptr(),
+                    name.len() as u32,
+                    0,
+                )
+            } as usize;
+            if length == 0 {
+                return Err(last_error("resolve a sandbox setup directory"));
+            }
+            if length < name.len() {
+                name.truncate(length);
+                return Ok(PathBuf::from(OsString::from_wide(&name)));
+            }
+            if length > 32768 {
+                return Err(failure("setup path exceeds the Windows path limit"));
+            }
+            name.resize(length + 1, 0);
+        }
     }
 
     fn child(&self, name: &OsStr, path: &Path) -> Result<Self, AppContainerError> {
@@ -44,6 +91,7 @@ impl Target {
             name.encode_wide().collect(),
             path,
             true,
+            true,
         )
     }
 
@@ -52,6 +100,7 @@ impl Target {
         mut name: Vec<u16>,
         path: &Path,
         write: bool,
+        pin: bool,
     ) -> Result<Self, AppContainerError> {
         let length = name
             .len()
@@ -83,14 +132,14 @@ impl Target {
                 &mut raw,
                 READ_CONTROL
                     | FILE_READ_ATTRIBUTES
-                    | FILE_READ_DATA
                     | SYNCHRONIZE
+                    | if pin { FILE_READ_DATA } else { 0 }
                     | if write { WRITE_DAC } else { 0 },
                 &attributes,
                 &mut io,
                 ptr::null(),
                 FILE_ATTRIBUTE_NORMAL,
-                FILE_SHARE_READ | FILE_SHARE_WRITE,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | if pin { 0 } else { FILE_SHARE_DELETE },
                 FILE_OPEN,
                 FILE_OPEN_REPARSE_POINT
                     | FILE_OPEN_FOR_BACKUP_INTENT
