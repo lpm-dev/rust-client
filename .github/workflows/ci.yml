@@ -46,4 +46,6 @@ jobs:
         if: always()
         with:
           name: native-environment-controls
-          path: qa-environment.log
+          path: |
+            qa-environment.log
+            qa-user-details.log

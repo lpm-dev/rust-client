@@ -18,6 +18,7 @@ function AsUser([string]$exe, [string[]]$arguments) {
  $out = Get-Content -Raw $stdout -ErrorAction SilentlyContinue
  $err = Get-Content -Raw $stderr -ErrorAction SilentlyContinue
  Write-Output "USER EXIT $($process.ExitCode) $out $err" | Out-Host
+ Add-Content qa-user-details.log "USER EXIT $($process.ExitCode) $out $err"
  return @{Code=$process.ExitCode; Out=$out; Err=$err}
 }
 try {
@@ -77,6 +78,10 @@ console.log('HOOK_OK');
   Write-Output "HOOK_MS $($watch.ElapsedMilliseconds)"
   if ($after.Code -ne 0 -or $after.Out -notmatch 'HOOK_OK') { throw 'standard Node hook failed' }
  }
+ & $setup apply $project $sid $project
+ if ($LASTEXITCODE -ne 0) { throw 'overlapping setup failed' }
+ $overlap = AsUser $helper ($base + @('--readable-dir-best-effort',$project,'--appcontainer-name',('LpmOverlap' + $PID),'--',(Join-Path $tool 'node.exe'),'hook.cjs'))
+ if ($overlap.Code -ne 0 -or $overlap.Out -notmatch 'HOOK_OK') { throw 'overlap boundary failed' }
  if ((Get-Content (Join-Path $project '.env')) -ne 'FAKE_TEST_SECRET=blocked') { throw 'secret restoration failed' }
  & $setup remove $project $sid $tool
  if ($LASTEXITCODE -ne 0) { throw 'administrator remove failed' }
@@ -85,7 +90,7 @@ console.log('HOOK_OK');
  Write-Output 'STANDARD_USER_SETUP_ALL_PASS'
 } finally {
  if (Test-Path $setup) {
-  & $setup remove $project $sid $tool $otherTool
+  & $setup remove $project $sid $tool $otherTool $project
  }
  Remove-LocalUser -Name $user -ErrorAction SilentlyContinue
 }
