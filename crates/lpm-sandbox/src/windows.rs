@@ -1490,6 +1490,7 @@ mod tests {
             store_root: fake_home.join(".lpm/store"),
             home_dir: fake_home,
             tmpdir: fake_tmp,
+            read_project_full: false,
             secret_read_allow: Vec::new(),
             extra_write_dirs: Vec::new(),
         }
@@ -1518,6 +1519,7 @@ mod tests {
             store_root: tmp_root.join("store"),
             home_dir,
             tmpdir,
+            read_project_full: false,
             secret_read_allow: Vec::new(),
             extra_write_dirs: Vec::new(),
         }

@@ -363,3 +363,70 @@ mod tests {
         assert_eq!(X32_SYSCALL_BIT, 0x4000_0000);
     }
 }
+
+/// Keep descendants in the process group established before the filter is installed.
+pub(crate) fn build_process_group_filter() -> Result<BpfProgram, seccompiler::Error> {
+    let mut rules = BTreeMap::new();
+    for syscall in [libc::SYS_setsid, libc::SYS_setpgid] {
+        rules.insert(syscall, Vec::new());
+        #[cfg(target_arch = "x86_64")]
+        rules.insert(X32_SYSCALL_BIT | syscall, Vec::new());
+    }
+    let filter = SeccompFilter::new(
+        rules,
+        SeccompAction::Allow,
+        SeccompAction::Errno(libc::EPERM as u32),
+        TARGET_ARCH,
+    )?;
+    Ok(filter.try_into()?)
+}
+
+#[cfg(test)]
+mod process_group_tests {
+    use super::*;
+
+    fn probe_group_change(syscall: i64, filtered: bool) {
+        let program = build_process_group_filter().unwrap();
+        // SAFETY: the fork child uses only direct syscalls and exits without
+        // running destructors. The parent waits for exactly its own child.
+        unsafe {
+            let pid = libc::fork();
+            assert!(pid >= 0);
+            if pid == 0 {
+                if filtered && seccompiler::apply_filter(&program).is_err() {
+                    libc::_exit(20);
+                }
+                let result = libc::syscall(syscall, 0, 0);
+                let error = *libc::__errno_location();
+                let expected = if filtered {
+                    result == -1 && error == libc::EPERM
+                } else {
+                    result >= 0
+                };
+                libc::_exit(if expected { 0 } else { 21 });
+            }
+            let mut status = 0;
+            assert_eq!(libc::waitpid(pid, &mut status, 0), pid);
+            assert!(
+                libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0,
+                "group syscall {syscall}, filtered={filtered}, status={status}"
+            );
+        }
+    }
+
+    #[test]
+    fn group_changes_succeed_without_filter_and_are_denied_with_filter() {
+        for syscall in [libc::SYS_setsid, libc::SYS_setpgid] {
+            probe_group_change(syscall, false);
+            probe_group_change(syscall, true);
+        }
+    }
+
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn x32_group_syscalls_cannot_bypass_the_filter() {
+        for syscall in [libc::SYS_setsid, libc::SYS_setpgid] {
+            probe_group_change(X32_SYSCALL_BIT | syscall, true);
+        }
+    }
+}

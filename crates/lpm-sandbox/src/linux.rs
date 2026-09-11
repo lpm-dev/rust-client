@@ -18,7 +18,7 @@
 //! - [`Ruleset::default`] / [`handle_access`] / [`RulesetAttr::create`] —
 //!   allocates Rust-side state, makes the `landlock_create_ruleset`
 //!   syscall to get the ruleset FD.
-//! - Per-path [`PathFd::new`] (opens `open(2)` for each allow-path)
+//! - Per-path `open(O_PATH | O_NOFOLLOW)` (opens `open(2)` for each allow-path)
 //!   and [`Ruleset::add_rule`] (feeds each `PathBeneath` through
 //!   `landlock_add_rule`). Paths that don't exist are skipped with
 //!   a `tracing::debug!` advisory — parent logging is safe.
@@ -124,8 +124,8 @@ use crate::{
     SandboxedCommand,
 };
 use landlock::{
-    ABI, Access, AccessFs, AccessNet, BitFlags, CompatLevel, Compatible, PathBeneath, PathFd,
-    Ruleset, RulesetAttr, RulesetCreated, RulesetCreatedAttr, RulesetError, RulesetStatus,
+    ABI, Access, AccessFs, AccessNet, BitFlags, CompatLevel, Compatible, PathBeneath, Ruleset,
+    RulesetAttr, RulesetCreated, RulesetCreatedAttr, RulesetError, RulesetStatus,
 };
 use std::os::unix::process::CommandExt;
 use std::process::{Child, Command, Stdio};
@@ -465,9 +465,9 @@ impl Sandbox for LandlockSandbox {
         // CString construction, and ID-map formatting never happen after
         // fork. Preparation uncertainty is fatal: treating an incomplete
         // protection set as an empty one would expose project secrets.
-        let overlay_spec = crate::linux_secret_overlay::SecretOverlaySpec::build(
-            &self.spec.project_dir,
-            &self.spec.secret_read_allow,
+        let overlay_spec = crate::linux_secret_overlay::SecretOverlaySpec::build_for_spec(
+            &self.spec,
+            self.build_cache_isolation,
         )
         .map_err(|error| SandboxError::ProfileRenderFailed {
             reason: format!("secret overlay preparation failed: {error}"),
@@ -486,6 +486,13 @@ impl Sandbox for LandlockSandbox {
         // invokes pre_exec once per spawn; the `take().ok_or(...)`
         // path below catches the hypothetical double-invocation.
         let mut ruleset_opt = Some(ruleset);
+        let process_group_filter =
+            crate::seccomp::build_process_group_filter().map_err(|error| {
+                SandboxError::ProfileRenderFailed {
+                    reason: format!("process containment filter failed: {error}"),
+                }
+            })?;
+        let mut process_filters = Some(process_group_filter);
         let mut seccomp_opt = seccomp_program;
         let mut overlay_opt = overlay_spec;
         // Strict posture promises TCP-egress denial, so the child must
@@ -553,6 +560,12 @@ impl Sandbox for LandlockSandbox {
         // lifecycle script never runs.
         unsafe {
             command.pre_exec(move || {
+                // SAFETY: this child becomes its own group leader before any
+                // inherited filter prevents group or session changes.
+                if libc::setpgid(0, 0) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+
                 // ── Layer 0: NO_NEW_PRIVS (must precede unshare) ──
                 // SAFETY: libc::prctl is async-signal-safe (single
                 // syscall). The trailing three args are ignored for
@@ -632,6 +645,12 @@ impl Sandbox for LandlockSandbox {
                 // uniformly: even if `apply_filter` returned Err
                 // and we returned EPERM below, the closure scope
                 // exit would otherwise have run `program.drop()`.
+                if let Some(group) = process_filters.take() {
+                    let group = std::mem::ManuallyDrop::new(group);
+                    if seccompiler::apply_filter(&group).is_err() {
+                        return Err(std::io::Error::from_raw_os_error(libc::EPERM));
+                    }
+                }
                 if let Some(program) = seccomp_opt.take() {
                     let program = std::mem::ManuallyDrop::new(program);
                     // `Err(_e)` discard is deliberate:
@@ -782,14 +801,23 @@ fn build_parent_side_ruleset(
     for (path, access) in
         crate::landlock_rules::describe_rules_with_isolation(spec, build_cache_isolation)
     {
-        let fd = match PathFd::new(&path) {
+        use std::os::unix::fs::OpenOptionsExt;
+        let fd = match std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_PATH | libc::O_CLOEXEC | libc::O_NOFOLLOW)
+            .open(&path)
+        {
             Ok(fd) => fd,
             Err(e) => {
                 tracing::debug!("landlock: skip {} ({e})", path.display());
                 continue;
             }
         };
-        let is_file = std::fs::metadata(&path).is_ok_and(|metadata| !metadata.is_dir());
+        let metadata = match fd.metadata() {
+            Ok(metadata) if !metadata.file_type().is_symlink() => metadata,
+            _ => continue,
+        };
+        let is_file = !metadata.is_dir();
         let access_bits = rule_access_bits(access, abi, is_file);
         ruleset = ruleset.add_rule(PathBeneath::new(fd, access_bits))?;
     }
@@ -864,6 +892,7 @@ mod tests {
             store_root: home.join(".lpm/store"),
             home_dir: home,
             tmpdir: tmp,
+            read_project_full: false,
             secret_read_allow: Vec::new(),
             extra_write_dirs: Vec::new(),
         }
@@ -1199,6 +1228,7 @@ mod tests {
             store_root: td.path().join("store"),
             home_dir: home,
             tmpdir: PathBuf::from("/tmp"),
+            read_project_full: false,
             secret_read_allow: Vec::new(),
             extra_write_dirs: Vec::new(),
         };
@@ -1252,6 +1282,7 @@ mod tests {
             store_root: td.path().join("store"),
             home_dir: home,
             tmpdir: PathBuf::from("/tmp"),
+            read_project_full: false,
             secret_read_allow: Vec::new(),
             extra_write_dirs: Vec::new(),
         };

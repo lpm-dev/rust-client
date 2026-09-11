@@ -3163,6 +3163,7 @@ mod tests {
             pass_env: ["SSH_AUTH_SOCK".to_string()].into_iter().collect(),
             read_project: ReadProjectMode::Narrow,
             sandbox_limits: Default::default(),
+            ..Default::default()
         };
 
         let blocked = compute_blocked_packages_with_metadata(

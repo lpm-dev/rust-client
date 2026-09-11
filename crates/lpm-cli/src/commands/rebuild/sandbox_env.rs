@@ -1,102 +1,105 @@
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 
-/// Env var names stripped from the lifecycle script environment.
-/// Mirrors the dotenv loader's `DENIED_ENV_VARS` so the same shape
-/// applies whether a value flowed in via parent env or via a `.env`
-/// file. `RUSTC` and `CARGO` are intentionally NOT stripped — rustup
-/// sets them to its proxy binaries.
-const STRIPPED_ENV_PATTERNS: &[&str] = &[
-    "LPM_TOKEN",
-    "NPM_TOKEN",
-    "NODE_AUTH_TOKEN",
-    "GITHUB_TOKEN",
-    "GH_TOKEN",
-    "GITLAB_TOKEN",
-    "BITBUCKET_TOKEN",
-    "AWS_SECRET_ACCESS_KEY",
-    "AWS_SESSION_TOKEN",
-    "AZURE_CLIENT_SECRET",
-    "LD_PRELOAD",
-    "LD_LIBRARY_PATH",
-    "LD_AUDIT",
-    "DYLD_INSERT_LIBRARIES",
-    "DYLD_LIBRARY_PATH",
-    "DYLD_FRAMEWORK_PATH",
-    "DYLD_FALLBACK_LIBRARY_PATH",
-    "NODE_OPTIONS",
-    "PYTHONPATH",
-    "PYTHONSTARTUP",
-    "GIT_SSH_COMMAND",
-    "BASH_ENV",
-    "ENV",
-    "PERL5OPT",
-    "PERL5LIB",
-    "RUBYOPT",
-    "RUBYLIB",
-    "RUSTC_BOOTSTRAP",
-    "RUSTC_WRAPPER",
-    "RUSTC_WORKSPACE_WRAPPER",
-    "CARGO_BUILD_RUSTC_WRAPPER",
-    "CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER",
-];
-
-/// Env var suffix patterns — any var ending with these is stripped.
-const STRIPPED_ENV_SUFFIXES: &[&str] = &[
-    "_SECRET",
-    "_PASSWORD",
-    "_KEY",
-    "_PRIVATE_KEY",
-    "_KEY_ID",
-    "_TOKEN",
-    "_URL",
-    "_URI",
-    "_DSN",
-    "_CONNECTION_STRING",
+const BASELINE_ENV: &[&str] = &[
+    "PATH",
+    "HOME",
+    "USER",
+    "LOGNAME",
+    "LANG",
+    "LC_ALL",
+    "LC_CTYPE",
+    "TERM",
+    "COLORTERM",
+    "NO_COLOR",
+    "FORCE_COLOR",
+    "CI",
+    "SYSTEMROOT",
+    "WINDIR",
+    "COMSPEC",
+    "PATHEXT",
+    "NUMBER_OF_PROCESSORS",
+    "PROCESSOR_ARCHITECTURE",
+    "PROCESSOR_IDENTIFIER",
 ];
 
 pub(in crate::commands) fn build_sanitized_env() -> HashMap<String, String> {
-    let mut env: HashMap<String, String> = HashMap::new();
+    collect_environment(std::env::vars(), &BTreeSet::new())
+}
 
-    for (key, value) in std::env::vars() {
-        // Skip explicitly blocked vars
-        let upper = key.to_ascii_uppercase();
-        if STRIPPED_ENV_PATTERNS.contains(&upper.as_str()) {
-            continue;
-        }
-
-        // Skip vars matching suffix patterns
-        if STRIPPED_ENV_SUFFIXES
-            .iter()
-            .any(|suffix| upper.ends_with(suffix))
-        {
-            continue;
-        }
-
-        env.insert(key, value);
-    }
-
-    // lifecycle scripts run with CWD = the package's directory.
-    // Nested tools (`git`, `npm`, `python`) consult package-local
-    // dotfiles by default — `<pkg>/.gitconfig`, `<pkg>/.npmrc`,
-    // `<pkg>/.netrc` — so a malicious package can plant
-    // `script-shell=/tmp/evil` or `registry=…attacker…` in a
-    // dotfile and have nested tools honour it. Neutralise the
-    // discovery path by pointing HOME / GIT_CONFIG_GLOBAL /
-    // NPM_CONFIG_GLOBALCONFIG / etc. at /dev/null on Unix (or an
-    // empty temp dir on Windows where /dev/null doesn't exist).
-    // The package's OWN scripts still run; what we suppress is the
-    // implicit "tool reads ./dotfile" surface that the package
-    // never asked for and the user never consented to.
-    #[cfg(unix)]
+pub(super) fn build_env_with_approved_names(
+    approved: &BTreeSet<String>,
+) -> Result<HashMap<String, String>, String> {
+    if let Some(name) = approved
+        .iter()
+        .find(|name| crate::capability::reserved_env_name(name))
     {
-        env.insert("GIT_CONFIG_GLOBAL".to_string(), "/dev/null".to_string());
-        env.insert("GIT_CONFIG_SYSTEM".to_string(), "/dev/null".to_string());
-        env.insert(
-            "NPM_CONFIG_GLOBALCONFIG".to_string(),
-            "/dev/null".to_string(),
-        );
-        env.insert("NPM_CONFIG_USERCONFIG".to_string(), "/dev/null".to_string());
+        return Err(format!(
+            "passEnv cannot override reserved runtime variable {name}"
+        ));
+    }
+    Ok(collect_environment(std::env::vars(), approved))
+}
+
+fn collect_environment(
+    parent: impl IntoIterator<Item = (String, String)>,
+    approved: &BTreeSet<String>,
+) -> HashMap<String, String> {
+    let mut env = HashMap::with_capacity(BASELINE_ENV.len() + approved.len());
+    for (name, value) in parent {
+        let upper = name.to_ascii_uppercase();
+        #[cfg(windows)]
+        let requested = approved.iter().any(|key| key.eq_ignore_ascii_case(&name));
+        #[cfg(not(windows))]
+        let requested = approved.contains(&name);
+        if !crate::capability::reserved_env_name(&name)
+            && (requested || BASELINE_ENV.contains(&upper.as_str()))
+        {
+            env.insert(name, value);
+        }
+    }
+    #[cfg(unix)]
+    for name in [
+        "GIT_CONFIG_GLOBAL",
+        "GIT_CONFIG_SYSTEM",
+        "NPM_CONFIG_GLOBALCONFIG",
+        "NPM_CONFIG_USERCONFIG",
+    ] {
+        env.insert(name.to_string(), "/dev/null".to_string());
+    }
+    env
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn explicit_passthrough_does_not_bypass_runtime_environment_reservations() {
+        for name in [
+            "NODE_OPTIONS",
+            "LD_PRELOAD",
+            "DYLD_INSERT_LIBRARIES",
+            "GIT_CONFIG_COUNT",
+            "TMPDIR",
+        ] {
+            let error =
+                build_env_with_approved_names(&BTreeSet::from([name.to_string()])).unwrap_err();
+            assert!(error.contains(name));
+        }
     }
 
-    env
+    #[test]
+    fn environment_names_are_exact_and_do_not_authorize_similar_secrets() {
+        let env = collect_environment(
+            [
+                ("APP_TOKEN".into(), "dummy".into()),
+                ("APP_TOKEN_OTHER".into(), "dummy".into()),
+                ("OTHER".into(), "dummy".into()),
+            ],
+            &BTreeSet::from(["APP_TOKEN".to_string()]),
+        );
+        assert_eq!(env.get("APP_TOKEN").map(String::as_str), Some("dummy"));
+        assert!(!env.contains_key("APP_TOKEN_OTHER"));
+        assert!(!env.contains_key("OTHER"));
+    }
 }

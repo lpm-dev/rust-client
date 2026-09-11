@@ -911,6 +911,7 @@ fn dump_swift_manifest_from_publish_artifact_with_command(
         store_root: sandbox_store,
         home_dir: sandbox_home.clone(),
         tmpdir: sandbox_cache.clone(),
+        read_project_full: false,
         secret_read_allow: Vec::new(),
         extra_write_dirs: Vec::new(),
     };

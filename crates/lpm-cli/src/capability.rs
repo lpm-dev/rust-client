@@ -60,6 +60,10 @@
 //! 4. NUL separator between elements within a section — same
 //!    adjacency-collision defense the behavioral-tag hash uses.
 
+mod env;
+mod paths;
+pub(crate) use env::reserved_env_name;
+
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -313,6 +317,8 @@ pub struct CapabilityDelta {
     /// [`ReadProjectMode::Full`] project reads. The floor is
     /// [`ReadProjectMode::Narrow`] so `false` means no widening.
     pub read_project_widened: bool,
+    pub read_allow: BTreeSet<String>,
+    pub write_dirs: BTreeSet<String>,
     /// Rlimit bumps, keyed by [`RlimitKey`] with the requested
     /// value + the user's currently-configured ceiling (if any).
     /// Entries appear here only when the request exceeds the
@@ -339,6 +345,8 @@ impl CapabilityDelta {
     /// `(set, bound)` pair.
     pub fn is_empty(&self) -> bool {
         self.pass_env.is_empty()
+            && self.read_allow.is_empty()
+            && self.write_dirs.is_empty()
             && !self.read_project_widened
             && self.sandbox_limits_bumps.is_empty()
     }
@@ -363,6 +371,17 @@ impl CapabilityDelta {
             out.push_str(
                 "  reads:      full project tree (source, .env, .git/config, and similar)\n",
             );
+        }
+        for (label, paths) in [
+            ("read files", &self.read_allow),
+            ("read/write dirs", &self.write_dirs),
+        ] {
+            if !paths.is_empty() {
+                out.push_str(&format!(
+                    "  {label}: {}\n",
+                    paths.iter().cloned().collect::<Vec<_>>().join(", ")
+                ));
+            }
         }
         if !self.sandbox_limits_bumps.is_empty() {
             out.push_str("  rlimits:\n");
@@ -404,6 +423,8 @@ pub struct CapabilitySet {
     pub pass_env: BTreeSet<String>,
     /// Requested project-tree read mode.
     pub read_project: ReadProjectMode,
+    pub read_allow: BTreeSet<String>,
+    pub write_dirs: BTreeSet<String>,
     /// Requested rlimit ceilings — only entries strictly above the
     /// user ceiling require approval; entries at-or-below auto-
     /// apply at enforcement time.
@@ -426,6 +447,8 @@ impl CapabilitySet {
     /// introduced in the enforcement-path sub-slice, not here.
     pub fn is_at_baseline(&self) -> bool {
         self.pass_env.is_empty()
+            && self.read_allow.is_empty()
+            && self.write_dirs.is_empty()
             && matches!(self.read_project, ReadProjectMode::Narrow)
             && self.sandbox_limits.is_empty()
     }
@@ -466,6 +489,8 @@ impl CapabilitySet {
         CapabilityDelta {
             pass_env,
             read_project_widened,
+            read_allow: self.read_allow.clone(),
+            write_dirs: self.write_dirs.clone(),
             sandbox_limits_bumps,
         }
     }
@@ -495,7 +520,7 @@ impl CapabilitySet {
     /// The function short-circuits on the first widening it finds
     /// (any single widened field is enough to require approval).
     pub fn loosens_beyond(&self, user: &UserBound) -> bool {
-        if !self.pass_env.is_empty() {
+        if !self.pass_env.is_empty() || !self.read_allow.is_empty() || !self.write_dirs.is_empty() {
             return true;
         }
         if matches!(self.read_project, ReadProjectMode::Full) {
@@ -550,7 +575,11 @@ impl CapabilitySet {
             return Ok(Self::default());
         };
 
-        let mut out = Self::default();
+        let mut out = Self {
+            read_allow: paths::parse_paths(scripts, "sandboxReadAllow", package_json)?,
+            write_dirs: paths::parse_paths(scripts, "sandboxWriteDirs", package_json)?,
+            ..Self::default()
+        };
 
         // passEnv — must be an array of strings if present.
         if let Some(pass_env) = scripts.get("passEnv") {
@@ -569,7 +598,13 @@ impl CapabilitySet {
                         field: format!("lpm.scripts.passEnv[{i}]"),
                         expected: "string".to_string(),
                     })?;
-                // BTreeSet insertion de-dups automatically.
+                if s.is_empty() || s.contains(['=', '\0']) || reserved_env_name(s) {
+                    return Err(CapabilityParseError::ShapeMismatch {
+                        path: package_json.display().to_string(),
+                        field: format!("lpm.scripts.passEnv[{i}]"),
+                        expected: "a nonempty environment name that does not override reserved runtime configuration".to_string(),
+                    });
+                }
                 out.pass_env.insert(s.to_string());
             }
         }
@@ -761,6 +796,16 @@ impl CapabilitySet {
             hasher.update([0u8]);
         }
 
+        if !self.read_allow.is_empty() || !self.write_dirs.is_empty() {
+            hasher.update(b"\x1epath_permissions\0");
+            for paths in [&self.read_allow, &self.write_dirs] {
+                for path in paths {
+                    hasher.update(path.as_bytes());
+                    hasher.update([0u8]);
+                }
+                hasher.update([0x1e]);
+            }
+        }
         let digest = hasher.finalize();
         let mut hex = String::with_capacity(7 + 64);
         hex.push_str("sha256-");
@@ -790,6 +835,7 @@ mod tests {
             pass_env: pass_env.iter().map(|s| s.to_string()).collect(),
             read_project,
             sandbox_limits: sandbox_limits.iter().copied().collect(),
+            ..Default::default()
         }
     }
 

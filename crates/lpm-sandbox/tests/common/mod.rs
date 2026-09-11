@@ -55,6 +55,7 @@ impl SandboxFixture {
             store_root: tmp.path().join("store"),
             home_dir: home,
             tmpdir: PathBuf::from("/tmp"),
+            read_project_full: false,
             secret_read_allow: Vec::new(),
             extra_write_dirs: Vec::new(),
         };
@@ -132,6 +133,7 @@ pub fn sandbox_supported(mode: SandboxMode) -> bool {
             store_root: home.clone(),
             home_dir: home,
             tmpdir: PathBuf::from("/tmp"),
+            read_project_full: false,
             secret_read_allow: Vec::new(),
             extra_write_dirs: Vec::new(),
         };

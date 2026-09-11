@@ -931,6 +931,7 @@ pub fn resolve_sandbox_read_allow(
                 ),
             });
         }
+        let canonical = validate_read_file(project_dir, &canonical)?;
         // Dedup by canonical form so `.env` from project + user
         // doesn't produce two entries in the spec. Push the
         // canonical (`./.env` → `.env`, `secrets/../foo` →
@@ -944,6 +945,47 @@ pub fn resolve_sandbox_read_allow(
     }
 
     Ok(resolved)
+}
+
+pub(crate) fn validate_read_file(project: &Path, path: &Path) -> Result<PathBuf, SandboxError> {
+    let invalid = || SandboxError::InvalidSpec {
+        reason: format!(
+            "sandboxReadAllow entry {} must name a regular file inside the project, without symlinks or reparse points",
+            path.display()
+        ),
+    };
+    let root = AuthorizedRoot::resolve(project).map_err(|_| invalid())?;
+    let suffix = root.matched_suffix(path).ok_or_else(invalid)?;
+    let name = suffix.file_name().ok_or_else(invalid)?;
+    let parent = root
+        .resolve_descendant(suffix.parent().unwrap_or_else(|| Path::new("")))
+        .map_err(|_| invalid())?;
+    let resolved = parent.join(name);
+    match std::fs::symlink_metadata(&resolved) {
+        Ok(metadata) if metadata.is_file() && !is_filesystem_indirection(&metadata) => Ok(resolved),
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(resolved),
+        _ => Err(invalid()),
+    }
+}
+
+pub(crate) fn validate_builtin_write_dirs(spec: &crate::SandboxSpec) -> Result<(), SandboxError> {
+    for (base, names) in [
+        (&spec.project_dir, ["node_modules", ".lpm", ".husky"]),
+        (&spec.home_dir, [".cache", ".node-gyp", ".npm"]),
+    ] {
+        let invalid = |name: &str| SandboxError::InvalidSpec {
+            reason: format!(
+                "sandbox writable directory {} must use real directories without symlinks or reparse points",
+                base.join(name).display()
+            ),
+        };
+        let root = AuthorizedRoot::resolve(base).map_err(|_| invalid(""))?;
+        for name in names {
+            root.resolve_descendant(Path::new(name))
+                .map_err(|_| invalid(name))?;
+        }
+    }
+    Ok(())
 }
 
 // ── Tests ─────────────────────────────────────────────────────────
@@ -1908,6 +1950,18 @@ mod tests {
     /// Missing `package.json` + empty user list → empty result, no
     /// error. Common case for projects that don't opt in.
     #[test]
+    fn read_allow_rejects_directories_including_project_root() {
+        let e = fixture("{}");
+        std::fs::create_dir(e.project.join("src")).unwrap();
+        for entry in [".", "src"] {
+            assert!(
+                resolve_sandbox_read_allow(&e.project, &[entry.to_string()], &[]).is_err(),
+                "directory {entry} must not widen reads"
+            );
+        }
+    }
+
+    #[test]
     fn read_allow_missing_package_json_and_empty_user_list() {
         let tmp = tempfile::tempdir().unwrap();
         let project = tmp.path().to_path_buf();
@@ -1922,7 +1976,8 @@ mod tests {
     fn read_allow_project_relative_entry_resolves_to_absolute() {
         let e = fixture(r#"{"lpm":{"scripts":{"sandboxReadAllow":[".env"]}}}"#);
         let v = load_sandbox_read_allow(&e.package_json, &e.project, &[]).unwrap();
-        assert_eq!(v, vec![e.project.join(".env")]);
+        let canonical_project = e.project.canonicalize().unwrap();
+        assert_eq!(v, vec![canonical_project.join(".env")]);
     }
 
     /// User config `script-read-allow = [".npmrc"]` joins to project.
@@ -1931,7 +1986,8 @@ mod tests {
         let e = fixture(r#"{}"#);
         let user = vec![".npmrc".to_string()];
         let v = load_sandbox_read_allow(&e.package_json, &e.project, &user).unwrap();
-        assert_eq!(v, vec![e.project.join(".npmrc")]);
+        let canonical_project = e.project.canonicalize().unwrap();
+        assert_eq!(v, vec![canonical_project.join(".npmrc")]);
     }
 
     /// Project + user lists are unioned. Same entry from both is
@@ -1941,15 +1997,18 @@ mod tests {
         let e = fixture(r#"{"lpm":{"scripts":{"sandboxReadAllow":[".env", ".npmrc"]}}}"#);
         let user = vec![".env".to_string(), "secrets/api.pem".to_string()];
         let v = load_sandbox_read_allow(&e.package_json, &e.project, &user).unwrap();
+        let canonical_project = e.project.canonicalize().unwrap();
         // `.env` appears in both lists — should be deduplicated.
         assert_eq!(
-            v.iter().filter(|p| p == &&e.project.join(".env")).count(),
+            v.iter()
+                .filter(|p| p == &&canonical_project.join(".env"))
+                .count(),
             1,
             ".env must be deduplicated across project + user lists: {v:?}"
         );
-        assert!(v.contains(&e.project.join(".env")));
-        assert!(v.contains(&e.project.join(".npmrc")));
-        assert!(v.contains(&e.project.join("secrets/api.pem")));
+        assert!(v.contains(&canonical_project.join(".env")));
+        assert!(v.contains(&canonical_project.join(".npmrc")));
+        assert!(v.contains(&canonical_project.join("secrets/api.pem")));
         assert_eq!(v.len(), 3);
     }
 
@@ -2056,9 +2115,10 @@ mod tests {
         let e = fixture(r#"{"lpm":{"scripts":{}}}"#);
         let user = vec![".env".to_string(), ".npmrc".to_string()];
         let v = load_sandbox_read_allow(&e.package_json, &e.project, &user).unwrap();
+        let canonical_project = e.project.canonicalize().unwrap();
         assert_eq!(v.len(), 2);
-        assert!(v.contains(&e.project.join(".env")));
-        assert!(v.contains(&e.project.join(".npmrc")));
+        assert!(v.contains(&canonical_project.join(".env")));
+        assert!(v.contains(&canonical_project.join(".npmrc")));
     }
 
     /// Order is preserved within each source (project entries
@@ -2069,13 +2129,14 @@ mod tests {
         let e = fixture(r#"{"lpm":{"scripts":{"sandboxReadAllow":["a.env","b.env"]}}}"#);
         let user = vec!["c.env".to_string(), "d.env".to_string()];
         let v = load_sandbox_read_allow(&e.package_json, &e.project, &user).unwrap();
+        let canonical_project = e.project.canonicalize().unwrap();
         assert_eq!(
             v,
             vec![
-                e.project.join("a.env"),
-                e.project.join("b.env"),
-                e.project.join("c.env"),
-                e.project.join("d.env"),
+                canonical_project.join("a.env"),
+                canonical_project.join("b.env"),
+                canonical_project.join("c.env"),
+                canonical_project.join("d.env"),
             ]
         );
     }
@@ -2086,6 +2147,7 @@ mod tests {
     fn read_allow_nested_project_path_accepted() {
         let e = fixture(r#"{"lpm":{"scripts":{"sandboxReadAllow":["services/api/.env"]}}}"#);
         let v = load_sandbox_read_allow(&e.package_json, &e.project, &[]).unwrap();
-        assert_eq!(v, vec![e.project.join("services/api/.env")]);
+        let canonical_project = e.project.canonicalize().unwrap();
+        assert_eq!(v, vec![canonical_project.join("services/api/.env")]);
     }
 }

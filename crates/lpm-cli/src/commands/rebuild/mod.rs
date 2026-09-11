@@ -50,6 +50,7 @@ use self::build_cache::{
 pub(crate) use self::hints::scriptable_package_rows;
 pub use self::hints::{all_scripted_packages_trusted, show_install_build_hint};
 use self::package_dir::prepare_live_package_dir;
+#[cfg(test)]
 use self::sandbox_env::build_sanitized_env;
 use self::script_execution::execute_script;
 pub(in crate::commands) use self::script_execution::{
@@ -243,6 +244,7 @@ async fn run_under_store_lock(
         &std::collections::HashSet<crate::triage_advisor_session::AdvisorApprovalKey>,
     >,
 ) -> Result<RebuildRunReport, LpmError> {
+    let cancelled = crate::install_recovery::cancellation_flag();
     crate::security_floor::clear_recorded_suppressions();
     // Defense-in-depth on the sandbox flag pair. The CLI boundary
     // (clap `conflicts_with_all` on `--no-sandbox` ⊥ `--strict-sandbox`
@@ -316,7 +318,7 @@ async fn run_under_store_lock(
     // declare `lpm.scripts.{passEnv, readProject, sandboxLimits}`
     // see zero behavior change.
     let requested_capabilities =
-        crate::capability::CapabilitySet::from_package_json(&project_dir.join("package.json"))
+        crate::capability::CapabilitySet::from_project(&project_dir.join("package.json"))
             .map_err(|e| LpmError::Registry(format!("{e}")))?;
     let user_bound = crate::security_approval::authorized_capability_user_bound();
 
@@ -834,6 +836,10 @@ async fn run_under_store_lock(
             strict_sandbox,
             json_output,
         )?;
+    let read_project_full = matches!(
+        requested_capabilities.read_project,
+        crate::capability::ReadProjectMode::Full
+    );
     let (sandbox_mode, scrub_env) = crate::sandbox_config::decide_runtime_sandbox_mode(
         no_sandbox,
         sandbox_log,
@@ -848,7 +854,8 @@ async fn run_under_store_lock(
     // `scrub_env=false` covers BOTH paths so the contract is
     // symmetric.
     let sanitized_env = if scrub_env {
-        build_sanitized_env()
+        sandbox_env::build_env_with_approved_names(&requested_capabilities.pass_env)
+            .map_err(LpmError::Registry)?
     } else {
         // L29: when sandbox is disabled, also emit via tracing::warn
         // so the security signal survives `--json` mode. Surfaces a
@@ -898,104 +905,36 @@ async fn run_under_store_lock(
         )
     })?;
 
-    // Read the user-global allowlist for
-    // `sandboxWriteDirs` entries. Expansion rules:
-    // - `~/...` entries are expanded to `$HOME/...`.
-    // - Entries that aren't absolute after expansion are silently
-    //   dropped (callers don't get to cross the user-config trust
-    //   boundary with relative paths; only explicit absolute roots
-    //   are meaningful here).
-    // Empty / absent → empty `Vec`. Pre-the validator
-    // skipped the allowlist intersection in this case (back-compat
-    // semantic pinned in ); flipped that to
-    // "no opt-in" so absolute `sandboxWriteDirs` entries outside
-    // `project_dir` now require an explicit covering root here.
-    let max_write_roots: Vec<PathBuf> = crate::commands::config::GlobalConfig::load()
-        .get_str_array("max-sandbox-write-roots")
-        .unwrap_or_default()
-        .into_iter()
-        .filter_map(|s| {
-            if let Some(rest) = s.strip_prefix("~/") {
-                Some(home_dir.join(rest))
-            } else if s == "~" {
-                Some(home_dir.clone())
-            } else {
-                let p = PathBuf::from(s);
-                p.is_absolute().then_some(p)
-            }
-        })
+    let extra_write_dirs: Vec<PathBuf> = requested_capabilities
+        .write_dirs
+        .iter()
+        .map(PathBuf::from)
         .collect();
-
-    let extra_write_dirs = lpm_sandbox::load_sandbox_write_dirs(
-        &project_dir.join("package.json"),
-        project_dir,
-        &max_write_roots,
-        Some(&home_dir),
-    )
-    .map_err(|e| LpmError::Registry(format!("{e}")))?;
-
-    // Per-user `[sandbox] script-read-allow` opt-in — list of
-    // project-relative paths the user has chosen to exempt from
-    // the secret-file deny list across every project they run
-    // `lpm install` in. Per-project entries (in
-    // `package.json > lpm > scripts > sandboxReadAllow`) are
-    // unioned with this list by the loader.
-    //
-    // Empty / absent → empty list; the secret-deny block applies
-    // to every match without exception. This is the safe default.
-    let script_read_allow_user: Vec<String> = crate::commands::config::GlobalConfig::load()
-        .get_str_array("script-read-allow")
-        .unwrap_or_default();
-
-    let extra_secret_read_allow = lpm_sandbox::load_sandbox_read_allow(
-        &project_dir.join("package.json"),
-        project_dir,
-        &script_read_allow_user,
-    )
-    .map_err(|e| LpmError::Registry(format!("{e}")))?;
-    // round-5 : `std::env::temp_dir()` resolves
-    // tmpdir portably — POSIX checks `TMPDIR` → falls back to `/tmp`;
-    // Windows checks `TMP` → `TEMP` → `USERPROFILE\AppData\Local\Temp`.
-    // Pre-46.2-round-5 the helper hardcoded `TMPDIR` + `/tmp` fallback,
-    // which on Windows produced a non-absolute path string (`/tmp` is
-    // relative under Windows path resolution — no drive letter, no UNC
-    // prefix). The sandbox spec validator then rejected the spec with
-    // `tmpdir must be absolute, got /tmp`, breaking every lifecycle
-    // spawn under triage / autoBuild on Windows. `std::env::temp_dir()`
-    // is what every other cross-platform tool uses for this resolution.
+    let extra_secret_read_allow: Vec<PathBuf> = requested_capabilities
+        .read_allow
+        .iter()
+        .map(PathBuf::from)
+        .collect();
     let tmpdir = std::env::temp_dir();
 
-    // Ensure the "standard" writable subpaths
-    // exist on disk before spawning scripts. Sandbox rules allow
-    // writes INSIDE `.husky`, `.lpm`, `node_modules`, `~/.cache`,
-    // `~/.node-gyp`, `~/.npm` but NOT their creation (creating
-    // `.husky` would need write on `{project}` which we don't
-    // grant). Without this, a first-time `husky install` would
-    // fail under Enforce.
-    //
-    // round-2 : thread `extra_write_dirs`
-    // through too — user-declared `sandboxWriteDirs` entries had to
-    // be pre-created for the same reason the built-ins do (creating
-    // `<project>/build-output` requires write on `<project>`, which
-    // we deliberately don't grant). Pre-46.2-round-2 this Vec was
-    // hardcoded empty, so the lib.rs::prepare_writable_dirs fix that
-    // also iterates extras was unreachable in production. The
-    // clone is intentional: extra_write_dirs is consumed per-package
-    // in the loop below, so we hand a copy to the install-wide prep
-    // step and keep the original for the per-package SandboxSpecs.
-    let prepare_spec = lpm_sandbox::SandboxSpec {
-        package_dir: project_dir.to_path_buf(), // placeholder, unused by prepare
-        project_dir: project_dir.to_path_buf(),
-        package_name: "__lpm-prepare".to_string(),
-        package_version: "0.0.0".to_string(),
-        store_root: store_root.clone(),
-        home_dir: home_dir.clone(),
-        tmpdir: tmpdir.clone(),
-        secret_read_allow: Vec::new(),
-        extra_write_dirs: extra_write_dirs.clone(),
-    };
-    lpm_sandbox::prepare_writable_dirs(&prepare_spec)
-        .map_err(|e| LpmError::Registry(format!("{e}")))?;
+    if !matches!(sandbox_mode, SandboxMode::Disabled) {
+        // Scripts can write inside approved directories, but cannot create them
+        // without write access to their parent.
+        let prepare_spec = lpm_sandbox::SandboxSpec {
+            package_dir: project_dir.to_path_buf(),
+            project_dir: project_dir.to_path_buf(),
+            package_name: "__lpm-prepare".to_string(),
+            package_version: "0.0.0".to_string(),
+            store_root: store_root.clone(),
+            home_dir: home_dir.clone(),
+            tmpdir: tmpdir.clone(),
+            read_project_full: false,
+            secret_read_allow: Vec::new(),
+            extra_write_dirs: extra_write_dirs.clone(),
+        };
+        lpm_sandbox::prepare_writable_dirs(&prepare_spec)
+            .map_err(|e| LpmError::Registry(format!("{e}")))?;
+    }
 
     let mut effective_sandbox_posture = lpm_sandbox::SandboxPosture::Disabled;
 
@@ -1029,6 +968,7 @@ async fn run_under_store_lock(
             store_root: store_root.clone(),
             home_dir: home_dir.clone(),
             tmpdir: tmpdir.clone(),
+            read_project_full: false,
             secret_read_allow: Vec::new(),
             extra_write_dirs: Vec::new(),
         };
@@ -1158,12 +1098,17 @@ async fn run_under_store_lock(
         .map_err(|error| LpmError::Registry(format!("failed to start rebuild workers: {error}")))?;
 
     for layer in &to_build_layers {
-        let layer_results = lifecycle_pool.install(|| {
+        let execute_layer = || {
+            lifecycle_pool.install(|| {
             layer
                 .par_iter()
                 .map(|pkg| {
                     let pkg = *pkg;
                     let mut result = PackageExecutionResult::default();
+                    if cancelled.load(std::sync::atomic::Ordering::Acquire) {
+                        result.failures = 1;
+                        return result;
+                    }
         let mut pkg_success = true;
 
         let key_start = std::time::Instant::now();
@@ -1519,7 +1464,9 @@ async fn run_under_store_lock(
                 project_dir,
                 &sanitized_env,
                 &timeout,
+                &cancelled,
                 sandbox_mode,
+                read_project_full,
                 &package_sandbox_options,
                 &extra_write_dirs,
                 &extra_secret_read_allow,
@@ -1556,6 +1503,7 @@ async fn run_under_store_lock(
             }
         }
 
+        if cancelled.load(std::sync::atomic::Ordering::Acquire) { pkg_success = false; }
         if pkg_success {
             if let Some(key) = build_key.as_ref() {
                 let publish_start = std::time::Instant::now();
@@ -1601,7 +1549,15 @@ async fn run_under_store_lock(
                     result
                 })
                 .collect::<Vec<_>>()
-        });
+        })
+        };
+        let layer_results = if tokio::runtime::Handle::current().runtime_flavor()
+            == tokio::runtime::RuntimeFlavor::MultiThread
+        {
+            tokio::task::block_in_place(execute_layer)
+        } else {
+            execute_layer()
+        };
         for result in layer_results {
             successes += result.successes;
             failures += result.failures;
@@ -1609,6 +1565,13 @@ async fn run_under_store_lock(
             built_packages.extend(result.built_packages);
             build_cache_metrics.merge(result.build_cache);
         }
+    }
+
+    if cancelled.load(std::sync::atomic::Ordering::Acquire) {
+        return Err(LpmError::Io(std::io::Error::new(
+            std::io::ErrorKind::Interrupted,
+            "Lifecycle scripts interrupted. Retry the install or rebuild.",
+        )));
     }
 
     // Summary

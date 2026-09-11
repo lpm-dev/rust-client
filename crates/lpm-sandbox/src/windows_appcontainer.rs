@@ -169,13 +169,17 @@ impl Sandbox for AppContainerSandbox {
         for (index, path) in self.spec.extra_write_dirs.iter().enumerate() {
             crate::config::revalidate_effective_write_dir(path, index)?;
         }
-        let secret_read_denied_paths = crate::linux_secret_overlay::enumerate_project_secrets(
-            &self.spec.project_dir,
-            &self.spec.secret_read_allow,
-        )
-        .map_err(|error| SandboxError::InvalidSpec {
-            reason: format!("AppContainer secret-read policy preparation failed: {error}"),
-        })?;
+        let secret_read_denied_paths = if self.spec.read_project_full {
+            Vec::new()
+        } else {
+            crate::linux_secret_overlay::enumerate_project_secrets(
+                &self.spec.project_dir,
+                &self.spec.secret_read_allow,
+            )
+            .map_err(|error| SandboxError::InvalidSpec {
+                reason: format!("AppContainer secret-read policy preparation failed: {error}"),
+            })?
+        };
 
         let mut helper_cmd = Command::new(&self.helper_path);
 
@@ -377,7 +381,7 @@ fn stdio_for_argv(s: SandboxStdio) -> StdioMode {
 /// overlap is fine.
 pub(crate) fn readable_allow_set(spec: &SandboxSpec) -> Vec<PathBuf> {
     let mut out = Vec::with_capacity(2);
-    out.push(spec.project_dir.clone());
+    out.extend(crate::project_reads::allowed_project_reads(spec));
     let nvm = spec.home_dir.join(".nvm").join("versions");
     out.push(nvm);
     out
@@ -728,6 +732,7 @@ mod tests {
             store_root: PathBuf::from("C:/store"),
             home_dir: PathBuf::from("C:/Users/u"),
             tmpdir: PathBuf::from("C:/Users/u/AppData/Local/Temp"),
+            read_project_full: false,
             secret_read_allow: Vec::new(),
             extra_write_dirs: Vec::new(),
         }
@@ -770,12 +775,12 @@ mod tests {
     }
 
     #[test]
-    fn readable_allow_set_contains_project_root_and_nvm_versions() {
+    fn narrow_readable_set_excludes_project_root_but_keeps_toolchains() {
         let spec = make_spec();
         let set = readable_allow_set(&spec);
         assert!(
-            set.iter().any(|p| p == &spec.project_dir),
-            "readable_allow_set must include project_dir; got: {set:?}",
+            !set.iter().any(|p| p == &spec.project_dir),
+            "narrow reads must exclude the project root; got: {set:?}",
         );
         assert!(
             set.iter()

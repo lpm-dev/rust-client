@@ -243,7 +243,7 @@ async fn run_under_store_lock(context: RunContext<'_>) -> Result<(), LpmError> {
     // match byte-for-byte. Drift in the manifest between approve
     // and install correctly invalidates the approval via the
     // 6c hash-equality rule.
-    let capability_set = crate::capability::CapabilitySet::from_package_json(&pkg_json_path)
+    let capability_set = crate::capability::CapabilitySet::from_project(&pkg_json_path)
         .map_err(|e| LpmError::Registry(format!("{e}")))?;
     let user_bound = crate::security_approval::authorized_capability_user_bound();
     // Only persist the hash when the request actually widens —

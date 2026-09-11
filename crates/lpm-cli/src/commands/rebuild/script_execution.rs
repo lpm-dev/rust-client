@@ -1,4 +1,4 @@
-use super::process_tree::wait_with_timeout;
+use super::process_tree::{wait_with_timeout, wait_with_timeout_or_cancel};
 use lpm_common::sanitize_terminal_multiline;
 use lpm_sandbox::SandboxMode;
 use std::collections::HashMap;
@@ -19,7 +19,9 @@ pub(super) fn execute_script(
     project_dir: &Path,
     env: &HashMap<String, String>,
     timeout: &Duration,
+    cancelled: &AtomicBool,
     sandbox_mode: SandboxMode,
+    read_project_full: bool,
     sandbox_options: &lpm_sandbox::SandboxOptions,
     extra_write_dirs: &[PathBuf],
     extra_secret_read_allow: &[PathBuf],
@@ -27,6 +29,9 @@ pub(super) fn execute_script(
     home_dir: &Path,
     tmpdir: &Path,
 ) -> Result<(), String> {
+    if cancelled.load(Ordering::Acquire) {
+        return Err("Lifecycle script interrupted".to_string());
+    }
     // Build the environment the same way the legacy path did: start
     // from the sanitized set, strip INIT_CWD + PATH if the caller
     // pre-set them, then append our own INIT_CWD and PATH-with-
@@ -57,6 +62,9 @@ pub(super) fn execute_script(
 
     let start = std::time::Instant::now();
 
+    if cancelled.load(Ordering::Acquire) {
+        return Err("Lifecycle script interrupted".to_string());
+    }
     let mut child = spawn_lifecycle_child(
         cmd,
         pkg_name,
@@ -65,6 +73,7 @@ pub(super) fn execute_script(
         project_dir,
         &envs,
         sandbox_mode,
+        read_project_full,
         sandbox_options,
         extra_write_dirs,
         extra_secret_read_allow,
@@ -75,11 +84,15 @@ pub(super) fn execute_script(
     )?;
     let output_readers = spawn_sanitized_output_readers(&mut child, false);
 
-    let output = wait_with_timeout(child, timeout);
+    let output =
+        wait_with_timeout_or_cancel(child, timeout, cancelled, "Lifecycle script interrupted");
     output_readers.finish_and_join();
 
     match output {
         Ok(status) => {
+            if cancelled.load(Ordering::Acquire) {
+                return Err("Lifecycle script interrupted".to_string());
+            }
             if status.success() {
                 let elapsed = start.elapsed();
                 tracing::debug!("script completed in {:.1}s", elapsed.as_secs_f64());
@@ -156,6 +169,7 @@ pub(super) fn spawn_lifecycle_child(
     project_dir: &Path,
     envs: &[(String, String)],
     sandbox_mode: SandboxMode,
+    read_project_full: bool,
     sandbox_options: &lpm_sandbox::SandboxOptions,
     extra_write_dirs: &[PathBuf],
     extra_secret_read_allow: &[PathBuf],
@@ -174,6 +188,7 @@ pub(super) fn spawn_lifecycle_child(
         store_root: store_root.to_path_buf(),
         home_dir: home_dir.to_path_buf(),
         tmpdir: tmpdir.to_path_buf(),
+        read_project_full,
         secret_read_allow: extra_secret_read_allow.to_vec(),
         extra_write_dirs: extra_write_dirs.to_vec(),
     };
@@ -274,6 +289,7 @@ pub(in crate::commands) fn execute_publish_lifecycle_script(
         project_dir,
         envs,
         SandboxMode::Enforce,
+        false,
         &sandbox_options,
         &[],
         &[],
@@ -724,5 +740,35 @@ fn windows_system_directory() -> Result<PathBuf, String> {
         }
 
         buffer.resize(written.saturating_add(1), 0);
+    }
+}
+
+#[cfg(all(test, unix))]
+mod cancellation_tests {
+    use super::*;
+
+    #[test]
+    fn already_cancelled_script_never_starts() {
+        let root = tempfile::tempdir().unwrap();
+        let result = execute_script(
+            "printf started > started.txt",
+            "cancel-probe",
+            "1.0.0",
+            root.path(),
+            root.path(),
+            &HashMap::new(),
+            &Duration::from_secs(2),
+            &AtomicBool::new(true),
+            SandboxMode::Enforce,
+            false,
+            &lpm_sandbox::SandboxOptions::default(),
+            &[PathBuf::from("invalid-relative")],
+            &[],
+            root.path(),
+            root.path(),
+            root.path(),
+        );
+        assert_eq!(result.unwrap_err(), "Lifecycle script interrupted");
+        assert!(!root.path().join("started.txt").exists());
     }
 }
