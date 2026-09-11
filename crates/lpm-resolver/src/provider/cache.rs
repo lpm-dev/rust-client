@@ -338,9 +338,36 @@ impl LpmDependencyProvider {
             .get(&key)
             .is_some_and(|info| info.needs_metadata_for_range(range));
         if needs_registry_metadata {
-            return self.direct_fetch_and_cache(package);
+            self.direct_fetch_and_cache(package)?;
+        } else {
+            self.ensure_cached(package)?;
         }
-        self.ensure_cached(package)
+        let missing = self.cache.get(&key).is_some_and(|info| {
+            info.workspace_versions.is_empty()
+                && !info
+                    .versions
+                    .iter()
+                    .any(|version| info.range_satisfies(range, version))
+        });
+        if missing && self.refreshed_metadata.lock().insert(key.clone()) {
+            let metadata = self
+                .rt
+                .block_on(super::fetch::revalidate_metadata(
+                    &self.client,
+                    &self.route_table,
+                    &key,
+                ))
+                .map_err(classify_registry_error)?;
+            self.cache.insert(
+                key.clone(),
+                Arc::new(parse_owned_metadata_to_cache_info(metadata)),
+            );
+            self.available_versions_cache
+                .lock()
+                .retain(|package, _| CanonicalKey::from(package) != key);
+            self.ensure_policy_metadata(package, &key)?;
+        }
+        Ok(())
     }
 
     fn ensure_policy_metadata(

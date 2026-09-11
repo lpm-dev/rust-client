@@ -44,7 +44,7 @@ jobs:
           node-version: "22"
 
       - name: Build Windows CLI
-        run: cargo build --locked -p lpm-cli
+        run: cargo build --locked -p lpm-cli -p lpm-sandbox
 
       - name: Windows filesystem crate tests
         run: >-
@@ -64,7 +64,10 @@ jobs:
           --no-fail-fast --status-level slow --final-status-level fail
 
       - name: Windows CLI filesystem unit tests
-        run: cargo test --locked -p lpm-cli --bin lpm-rs remove_owned_cmd_shim
+        run: |
+          cargo test --locked -p lpm-cli --bin lpm-rs remove_owned_cmd_shim
+          cargo test --locked -p lpm-cli --bin lpm-rs directory_transaction
+          cargo test --locked -p lpm-cli --bin lpm-rs commands::add::paths::tests
 
       - name: Windows install interruption recovery
         run: cargo nextest run --locked -p lpm-workflows --test install_concurrency -E 'test(interrupted_install)' --no-fail-fast --status-level slow --final-status-level fail
@@ -78,4 +81,20 @@ jobs:
           test(dlx_cache_hit_executes_cached_binary_without_extending_ttl) |
           test(uninstall_then_reinstall_same_packages_reports_only_readded_direct_deps) |
           test(uninstall_scoped_package_removes_owned_bin_shim)'
+          --no-fail-fast --status-level slow --final-status-level fail
+
+      - name: Windows source, publish, metadata refresh, and global workflows
+        timeout-minutes: 10
+        run: >-
+          cargo nextest run --locked -p lpm-workflows
+          --test add --test install --test install_concurrency --test publish
+          -E 'test(source_add_and_remove_use_in_project_paths_on_native_platforms) |
+          test(install_refreshes_custom_metadata_when_requested_version_was_published_after_cache) |
+          test(walker_install_refreshes_a_newly_published_version) |
+          test(pubgrub_install_refreshes_a_newly_published_version) |
+          test(missing_version_refresh_is_bounded_and_preserves_the_installed_project) |
+          test(metadata_refresh_does_not_bypass_revoked_custom_registry_access) |
+          test(failed_metadata_refresh_keeps_optional_dependencies_optional) |
+          test(two_concurrent_global_installs_serialize_via_global_tx_lock) |
+          test(publish_dry_run_executes_publish_lifecycle_scripts_in_npm_order)'
           --no-fail-fast --status-level slow --final-status-level fail

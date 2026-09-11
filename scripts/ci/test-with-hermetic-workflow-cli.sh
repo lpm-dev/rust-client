@@ -22,11 +22,12 @@ if [ "$*" != "build --locked -p lpm-cli --bin lpm-rs --features internal-test-si
 fi
 
 mkdir -p "$CARGO_TARGET_DIR/debug"
-cat >"$CARGO_TARGET_DIR/debug/lpm-rs" <<'BINARY'
+fixture_binary="$CARGO_TARGET_DIR/debug/lpm-rs${FIXTURE_SUFFIX:-}"
+cat >"$fixture_binary" <<'BINARY'
 #!/bin/bash
 printf 'feature-built\n'
 BINARY
-chmod +x "$CARGO_TARGET_DIR/debug/lpm-rs"
+chmod +x "$fixture_binary"
 STUB
 chmod +x "$TEST_ROOT/bin/cargo"
 
@@ -62,6 +63,22 @@ selected_binary="$(cat "$selected_binary_record")"
 if [ -e "$selected_binary" ]; then
 	echo "temporary feature binary was not removed: $selected_binary" >&2
 	exit 1
+fi
+
+output="$({
+    PATH="$TEST_ROOT/bin:$PATH" \
+        CARGO_TARGET_DIR="$TEST_ROOT/target" \
+        FIXTURE_SUFFIX=".exe" \
+        SELECTED_BINARY_RECORD="$selected_binary_record" \
+        "$WRAPPER" "$TEST_ROOT/exercise-copy"
+} 2>&1)"
+if [ "$output" != "feature-built" ] || [[ "$(cat "$selected_binary_record")" != *.exe ]]; then
+    echo "expected Windows executable path, got: $output" >&2
+    exit 1
+fi
+if [ -e "$(cat "$selected_binary_record")" ]; then
+    echo "temporary Windows binary was not removed" >&2
+    exit 1
 fi
 
 echo "hermetic workflow CLI wrapper tests passed"

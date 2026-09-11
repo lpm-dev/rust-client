@@ -571,12 +571,13 @@ fn replace_file(from: &Path, to: &Path) -> io::Result<()> {
         MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,
     };
 
-    fn wide(path: &Path) -> Vec<u16> {
-        path.as_os_str().encode_wide().chain(Some(0)).collect()
+    fn wide(path: &Path) -> io::Result<Vec<u16>> {
+        let path = crate::absolute_extended_path(path)?;
+        Ok(path.as_os_str().encode_wide().chain(Some(0)).collect())
     }
 
-    let from = wide(from);
-    let to = wide(to);
+    let from = wide(from)?;
+    let to = wide(to)?;
     let flags = MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH;
     for delay_ms in [0, 50, 150, 450, 1_350, 4_050] {
         if delay_ms != 0 {
@@ -884,7 +885,6 @@ mod tests {
         fs::create_dir_all(&parent).unwrap();
         let path = parent.join(".lpm-object-integrity");
         assert!(!path.to_str().unwrap().starts_with(r"\\?\"));
-        eprintln!("ordinary long path: {}", path.display());
 
         write_file_atomic(&path, b"first").unwrap();
         write_file_atomic(&path, b"replacement").unwrap();

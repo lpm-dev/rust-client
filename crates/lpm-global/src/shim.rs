@@ -335,7 +335,18 @@ fn atomic_replace_symlink_unix(link_path: &Path, target: &Path) -> Result<(), Sh
 
 // ─── Windows internals ────────────────────────────────────────────────
 
+fn project_command_shim(target: &str) -> Option<String> {
+    let normalized = target.replace('\\', "/");
+    let (parent, _) = normalized.rsplit_once('/')?;
+    parent
+        .ends_with("/node_modules/.bin")
+        .then(|| format!("{target}.cmd"))
+}
+
 fn cmd_template(target: &str) -> String {
+    if let Some(command) = project_command_shim(target) {
+        return format!("@\"{command}\" %*\n");
+    }
     // Mirrors lpm-linker's existing .cmd template at lib.rs:1080-1085 so
     // global shims behave the same as project node_modules/.bin shims:
     // prefer a co-located node.exe, fall back to PATH.
@@ -345,6 +356,10 @@ fn cmd_template(target: &str) -> String {
 }
 
 fn ps1_template(target: &str) -> String {
+    if let Some(command) = project_command_shim(target) {
+        let quoted = command.replace('\'', "''");
+        return format!("#!/usr/bin/env pwsh\n& '{quoted}' @args\nexit $LASTEXITCODE\n");
+    }
     // PowerShell mirror of the .cmd template. `$env:PATH` covers the
     // PATH-fallback branch since PowerShell's `&` operator resolves
     // through PATH the same way cmd.exe does.
@@ -358,6 +373,10 @@ fn ps1_template(target: &str) -> String {
 }
 
 fn bash_template(target: &str) -> String {
+    if let Some(command) = project_command_shim(target) {
+        let quoted = command.replace('\'', "'\\''");
+        return format!("#!/bin/sh\nexec '{quoted}' \"$@\"\n");
+    }
     // Mirrors npm's no-extension bash shim. Path-fallback model matches
     // the .cmd/.ps1 templates so all three artifacts behave the same.
     format!(
@@ -409,6 +428,120 @@ fn atomic_replace_file_windows(path: &Path, contents: &[u8]) -> Result<(), ShimE
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    #[cfg(unix)]
+    #[test]
+    fn bash_shim_forwards_to_the_materialized_project_command() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = TempDir::new().unwrap();
+        let project_bin = dir.path().join("project with spaces/node_modules/.bin");
+        std::fs::create_dir_all(&project_bin).unwrap();
+        let target = project_bin.join("tool.cmd");
+        std::fs::write(&target, "#!/bin/sh\nprintf '%s\\n' \"$1\"\nexit 7\n").unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let wrapper = dir.path().join("global-tool");
+        std::fs::write(
+            &wrapper,
+            bash_template(&project_bin.join("tool").to_string_lossy()),
+        )
+        .unwrap();
+        let output = std::process::Command::new("sh")
+            .arg(wrapper)
+            .arg("hello space")
+            .output()
+            .unwrap();
+        assert_eq!(
+            output.status.code(),
+            Some(7),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout).trim(),
+            "hello space"
+        );
+    }
+    #[cfg(windows)]
+    #[test]
+    fn windows_global_shims_forward_arguments_and_exit_code_to_project_shims() {
+        use std::os::windows::process::CommandExt;
+        let dir = TempDir::new().unwrap();
+        let root_text = dir.path().to_str().unwrap();
+        let root = Path::new(root_text.strip_prefix(r"\\?\").unwrap_or(root_text));
+        let project_bin = root.join("project with spaces/node_modules/.bin");
+        std::fs::create_dir_all(&project_bin).unwrap();
+        std::fs::write(project_bin.join("tool.cmd"), "@echo %~1\r\n@exit /b 7\r\n").unwrap();
+        let global_bin = root.join("global bin");
+        emit_shim(
+            &global_bin,
+            &Shim {
+                command_name: "tool".into(),
+                target: project_bin.join("tool"),
+            },
+        )
+        .unwrap();
+        let output = std::process::Command::new("cmd.exe")
+            .args(["/d", "/s", "/c"])
+            .raw_arg(format!(
+                "\"\"{}\" \"hello space\"\"",
+                global_bin.join("tool.cmd").display()
+            ))
+            .output()
+            .unwrap();
+        assert_eq!(
+            output.status.code(),
+            Some(7),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout).trim(),
+            "hello space"
+        );
+        let output = std::process::Command::new("powershell.exe")
+            .args([
+                "-NoLogo",
+                "-NoProfile",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-File",
+            ])
+            .arg(global_bin.join("tool.ps1"))
+            .arg("hello space")
+            .output()
+            .unwrap();
+        assert_eq!(
+            output.status.code(),
+            Some(7),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout).trim(),
+            "hello space"
+        );
+        let system_root = PathBuf::from(std::env::var_os("SystemRoot").unwrap());
+        let git_bash = std::env::split_paths(&std::env::var_os("PATH").unwrap())
+            .filter(|directory| !directory.starts_with(&system_root))
+            .map(|directory| directory.join("bash.exe"))
+            .find(|binary| binary.is_file())
+            .expect("Git Bash is required for the native shim regression");
+        let output = std::process::Command::new(git_bash)
+            .arg(global_bin.join("tool").to_string_lossy().replace('\\', "/"))
+            .arg("hello space")
+            .output()
+            .unwrap();
+        assert_eq!(
+            output.status.code(),
+            Some(7),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout).trim(),
+            "hello space"
+        );
+    }
 
     fn shim(name: &str, target: &str) -> Shim {
         Shim {

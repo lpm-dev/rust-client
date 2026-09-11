@@ -29,7 +29,7 @@ fi
 
 source_binary="$profile_root/lpm-rs"
 binary_name="lpm-rs"
-if [ ! -f "$source_binary" ] && [ -f "$source_binary.exe" ]; then
+if [ -f "$source_binary.exe" ]; then
 	source_binary="$source_binary.exe"
 	binary_name="lpm-rs.exe"
 fi

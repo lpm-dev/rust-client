@@ -47,10 +47,20 @@ async fn source_add_and_remove_use_in_project_paths_on_native_platforms() {
     let project = TempProject::empty(r#"{"name":"host","version":"1.0.0"}"#);
     project.write_file("keep.txt", "unrelated work");
     lpm_with_registry(&project, &mock.url())
-        .args(["add", package, "--path", "source ü space", "--yes", "--no-skills"])
+        .args([
+            "add",
+            package,
+            "--path",
+            "source ü space",
+            "--yes",
+            "--no-skills",
+        ])
         .assert()
         .success();
-    assert_eq!(project.read_file("source ü space/nested/hello.txt"), "managed source");
+    assert_eq!(
+        project.read_file("source ü space/nested/hello.txt"),
+        "managed source"
+    );
     lpm(&project).args(["remove", package]).assert().success();
     assert!(!project.file_exists("source ü space/nested/hello.txt"));
     assert_eq!(project.read_file("keep.txt"), "unrelated work");

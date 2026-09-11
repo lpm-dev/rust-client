@@ -503,6 +503,9 @@ fn prepare_safe_dest_parent_with(
                         directory.display()
                     ))
                 })?;
+                // Windows directory readers deny delete sharing. Release the
+                // publication handle's DELETE access before opening the reader.
+                drop(created_child);
                 canonical_current.push(name);
                 let child = current.open_dir_nofollow(name).map_err(|error| {
                     LpmError::Registry(format!(

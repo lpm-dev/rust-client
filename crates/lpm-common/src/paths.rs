@@ -1397,6 +1397,35 @@ pub fn as_extended_path(path: &Path) -> PathBuf {
     }
 }
 
+/// Normalize an absolute Windows path for APIs that require extended-length paths.
+#[cfg(windows)]
+pub fn absolute_extended_path(path: &Path) -> std::io::Result<PathBuf> {
+    use std::os::windows::ffi::{OsStrExt, OsStringExt};
+    use std::path::{Component, Prefix};
+
+    let absolute = std::path::absolute(path)?;
+    match absolute.components().next() {
+        Some(Component::Prefix(prefix)) => match prefix.kind() {
+            Prefix::Disk(_) => {
+                let mut extended = std::ffi::OsString::from(r"\\?\");
+                extended.push(absolute.as_os_str());
+                Ok(PathBuf::from(extended))
+            }
+            Prefix::UNC(_, _) => {
+                let mut extended = std::ffi::OsString::from(r"\\?\UNC\");
+                let remainder: Vec<u16> = absolute.as_os_str().encode_wide().skip(2).collect();
+                extended.push(std::ffi::OsString::from_wide(&remainder));
+                Ok(PathBuf::from(extended))
+            }
+            _ => Ok(absolute),
+        },
+        _ => Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "Windows path has no absolute prefix",
+        )),
+    }
+}
+
 /// Absolute-path budget for a global install root before nested
 /// `node_modules/.bin/<cmd>.cmd` traversal would push us over the legacy
 /// Win32 MAX_PATH ceiling (260). Allows 13 chars of headroom for the deepest
@@ -2492,6 +2521,45 @@ mod tests {
             readers_done.load(Ordering::SeqCst),
             3,
             "all queued readers must acquire after the writer chain drains",
+        );
+    }
+}
+
+#[cfg(all(test, windows))]
+mod extended_path_tests {
+    use super::absolute_extended_path;
+    use std::path::Path;
+
+    #[test]
+    fn extended_path_normalizes_drive_slashes_and_parent_components() {
+        assert_eq!(
+            absolute_extended_path(Path::new("C:/source/child/../file ü")).unwrap(),
+            Path::new(r"\\?\C:\source\file ü")
+        );
+    }
+
+    #[test]
+    fn extended_path_preserves_unc_share_and_existing_prefix() {
+        assert_eq!(
+            absolute_extended_path(Path::new(r"\\server\share\folder\file")).unwrap(),
+            Path::new(r"\\?\UNC\server\share\folder\file")
+        );
+        let prefixed = Path::new(r"\\?\C:\folder\file");
+        assert_eq!(absolute_extended_path(prefixed).unwrap(), prefixed);
+    }
+
+    #[test]
+    fn extended_path_preserves_unpaired_utf16_units() {
+        use std::ffi::OsString;
+        use std::os::windows::ffi::{OsStrExt, OsStringExt};
+        let mut units: Vec<u16> = r"C:\folder\".encode_utf16().collect();
+        units.push(0xd800);
+        let input = OsString::from_wide(&units);
+        let output = absolute_extended_path(Path::new(&input)).unwrap();
+        let expected: Vec<u16> = r"\\?\".encode_utf16().chain(units).collect();
+        assert_eq!(
+            output.as_os_str().encode_wide().collect::<Vec<_>>(),
+            expected
         );
     }
 }

@@ -26,7 +26,7 @@ pub mod wal;
 pub use inflight::tx_lock_path as inflight_tx_lock;
 pub use install_root::{
     InstallReadyMarker, InstallRootStatus, MARKER_SCHEMA_VERSION, MINIMAL_VALID_LOCKFILE_TOML,
-    read_marker, validate_install_root, write_marker,
+    project_command_path, read_marker, validate_install_root, write_marker,
 };
 pub use recover::{ReconciledTx, ReconciliationOutcome, RecoveryReport, UnknownOpError, recover};
 
