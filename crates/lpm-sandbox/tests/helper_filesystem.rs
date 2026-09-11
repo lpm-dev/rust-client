@@ -51,13 +51,13 @@ fn ps_write_file(target: &str) -> String {
 $ErrorActionPreference = 'Stop'
 try {{
     [System.IO.File]::WriteAllText('{}', 'lpm-sandbox-helper-write-test')
-    Write-Output 'OK'
+    [Console]::WriteLine('OK')
 }} catch {{
-    Write-Error $_
+    [Console]::Error.WriteLine($_)
     exit 1
 }}
 "#,
-        target.replace('\\', "\\\\")
+        target.replace('\'', "''")
     )
 }
 
@@ -69,14 +69,14 @@ fn ps_read_file(target: &str) -> String {
         r#"
 $ErrorActionPreference = 'Stop'
 try {{
-    $content = Get-Content -Raw '{}'
-    Write-Output $content
+    $content = [System.IO.File]::ReadAllText('{}')
+    [Console]::WriteLine($content)
 }} catch {{
-    Write-Error $_
+    [Console]::Error.WriteLine($_)
     exit 1
 }}
 "#,
-        target.replace('\\', "\\\\")
+        target.replace('\'', "''")
     )
 }
 

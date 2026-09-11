@@ -62,6 +62,13 @@ jobs:
           python -c 'import shutil; assert shutil.disk_usage(".").free >= 10*1024**3'
           cargo test --locked -p lpm-cli --bin lpm-rs directory_transaction -- --nocapture 2>&1 | tee qa-results/directory.log
           exit "${PIPESTATUS[0]}"
+      - name: Helper filesystem checks
+        continue-on-error: true
+        shell: bash
+        run: |
+          python -c 'import shutil; assert shutil.disk_usage(".").free >= 10*1024**3'
+          cargo test --locked -p lpm-sandbox --test helper_filesystem -- --nocapture 2>&1 | tee qa-results/helper-filesystem.log
+          exit "${PIPESTATUS[0]}"
       - name: Long workspace diagnostic
         continue-on-error: true
         shell: bash

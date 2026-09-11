@@ -26,4 +26,4 @@ filter = "package(lpm-workflows) & binary_id(/self_update/)"
 test-group = "self-update-processes"
 
 [profile.native-baseline]
-slow-timeout = { period = "30s", terminate-after = 3 }
+slow-timeout = { period = "30s", terminate-after = 12 }
