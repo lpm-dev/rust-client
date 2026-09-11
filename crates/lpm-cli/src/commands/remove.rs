@@ -1322,8 +1322,7 @@ fn validate_owned_directory_children(
                     current = opened;
                 }
                 OwnedDirectoryTraversal::Up(_) => {
-                    current = current
-                        .open_parent_dir(cap_std::ambient_authority())
+                    current = crate::directory_transaction::open_directory_parent(&current)
                         .map_err(LpmError::Io)?;
                 }
             }
@@ -1517,8 +1516,7 @@ fn prune_owned_directory_children(
                     current = opened;
                 }
                 OwnedDirectoryTraversal::Up(child) => {
-                    let parent = current
-                        .open_parent_dir(cap_std::ambient_authority())
+                    let parent = crate::directory_transaction::open_directory_parent(&current)
                         .map_err(LpmError::Io)?;
                     if parent_identities[child].as_ref()
                         != Some(&directory_identity(&parent).map_err(LpmError::Io)?)
@@ -1900,7 +1898,8 @@ fn restore_pruned_directories_with(
                 }
                 OwnedDirectoryTraversal::Up(child) => {
                     debug_assert!(tree.nodes[child].parent.is_some());
-                    let parent = match current.open_parent_dir(cap_std::ambient_authority()) {
+                    let parent = match crate::directory_transaction::open_directory_parent(&current)
+                    {
                         Ok(parent) => parent,
                         Err(error) => {
                             errors.push(format!(

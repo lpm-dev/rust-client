@@ -237,6 +237,14 @@ pub enum AppContainerError {
         /// `GetLastError` reading.
         last_error: u32,
     },
+    /// The shell cannot use the requested directory without changing its meaning.
+    #[error("cannot use working directory {path:?}: {source}")]
+    WorkingDirectory {
+        /// Requested working directory.
+        path: PathBuf,
+        /// Filesystem error or shell path limitation.
+        source: std::io::Error,
+    },
     /// `AssignProcessToJobObject` failed (the lifecycle child is
     /// still suspended at this point, so we'll terminate it via the
     /// process-info handle in the error path).
@@ -715,7 +723,9 @@ pub fn run_appcontainer_spawn(args: HelperArgs) -> Result<i32, AppContainerError
     let working_dir_wide = args
         .working_dir
         .as_ref()
-        .map(|p| to_wide_with_nul(p.as_os_str()));
+        .map(|path| process_working_directory(path, &args.program))
+        .transpose()?
+        .map(|path| to_wide_with_nul(path.as_os_str()));
 
     // 8. Build STARTUPINFOEXW with the attribute list + stdio handles.
     //    The base StartupInfo is the inner field; the EX wrapper
@@ -1067,48 +1077,66 @@ fn grant_dacl_ace_to_tree(
                     continue;
                 }
             };
-            for entry in entries.flatten() {
-                let path = entry.path();
-                let m = match entry.metadata() {
-                    Ok(m) => m,
-                    Err(e) => {
-                        tracing::debug!(
-                            target: "lpm_sandbox::helper_appcontainer",
-                            "skip DACL grant on {}: metadata failed: {e}",
-                            path.display(),
-                        );
-                        continue;
-                    }
-                };
-                if is_reparse_point(&m) {
-                    tracing::debug!(
-                        target: "lpm_sandbox::helper_appcontainer",
-                        "skip reparse point {} during DACL walk \
-                         (target not granted to prevent escape outside allow-set)",
-                        path.display(),
-                    );
-                    continue;
+            use rayon::prelude::*;
+            static POOL: std::sync::OnceLock<Option<rayon::ThreadPool>> =
+                std::sync::OnceLock::new();
+            let entries = entries.flatten().collect::<Vec<_>>();
+            // The SID remains owned by the caller until all scoped pool work completes.
+            let sid_address = sid as usize;
+            let grant = |entry| grant_dacl_directory_entry(entry, sid_address as PSID, access_mask);
+            let children = if entries.len() > 1 {
+                let pool = POOL.get_or_init(|| {
+                    rayon::ThreadPoolBuilder::new()
+                        .num_threads(
+                            std::thread::available_parallelism().map_or(1, |n| n.get().min(4)),
+                        )
+                        .build()
+                        .ok()
+                });
+                match pool {
+                    Some(pool) => pool.install(|| {
+                        entries
+                            .into_par_iter()
+                            .filter_map(grant)
+                            .collect::<Vec<_>>()
+                    }),
+                    None => entries.into_iter().filter_map(grant).collect(),
                 }
-                if let Err(e) = set_dacl_ace_on(
-                    &path,
-                    sid,
-                    access_mask,
-                    OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE,
-                ) {
-                    tracing::debug!(
-                        target: "lpm_sandbox::helper_appcontainer",
-                        "skip DACL grant on {}: {e}",
-                        path.display(),
-                    );
-                }
-                if m.is_dir() {
-                    stack.push(path);
-                }
-            }
+            } else {
+                entries.into_iter().filter_map(grant).collect()
+            };
+            stack.extend(children);
         }
     }
 
     Ok(())
+}
+
+fn grant_dacl_directory_entry(
+    entry: std::fs::DirEntry,
+    sid: PSID,
+    access_mask: u32,
+) -> Option<PathBuf> {
+    let path = entry.path();
+    let metadata = match entry.metadata() {
+        Ok(metadata) => metadata,
+        Err(error) => {
+            tracing::debug!(path = %path.display(), "skip DACL metadata: {error}");
+            return None;
+        }
+    };
+    if is_reparse_point(&metadata) {
+        return None;
+    }
+    if let Err(error) = set_dacl_ace_on(
+        &path,
+        sid,
+        access_mask,
+        OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE,
+    ) {
+        tracing::debug!(path = %path.display(), "skip DACL grant: {error}");
+    }
+    metadata.is_dir().then_some(path)
 }
 
 fn has_inheritable_appcontainer_access(path: &Path, access_mask: u32) -> bool {
@@ -1778,6 +1806,47 @@ fn build_environment_block(envs: &[OsString], env_clear: bool) -> Vec<u16> {
 
 // ── Wide-string helpers ──────────────────────────────────────────────
 
+fn process_working_directory(path: &Path, program: &OsStr) -> Result<PathBuf, AppContainerError> {
+    use std::os::windows::ffi::OsStringExt as _;
+    use std::path::{Component, Prefix};
+
+    let is_cmd = Path::new(program)
+        .file_name()
+        .and_then(OsStr::to_str)
+        .is_some_and(|name| {
+            name.eq_ignore_ascii_case("cmd.exe") || name.eq_ignore_ascii_case("cmd")
+        });
+    if !is_cmd {
+        return Ok(path.to_path_buf());
+    }
+    let Some(Component::Prefix(prefix)) = path.components().next() else {
+        return Ok(path.to_path_buf());
+    };
+    let failure = |source| AppContainerError::WorkingDirectory {
+        path: path.to_path_buf(),
+        source,
+    };
+    match prefix.kind() {
+        Prefix::Disk(_) => Ok(path.to_path_buf()),
+        Prefix::VerbatimDisk(_) => {
+            // CMD mistakes the extended drive prefix for UNC and changes to C:\Windows.
+            // Verify equivalence so stripping it cannot redirect trailing-dot or reserved paths.
+            let wide = path.as_os_str().encode_wide().collect::<Vec<_>>();
+            let ordinary = PathBuf::from(OsString::from_wide(&wide[4..]));
+            if ordinary.canonicalize().map_err(failure)? != path.canonicalize().map_err(failure)? {
+                return Err(failure(std::io::Error::other(
+                    "CMD cannot represent this directory without changing its meaning",
+                )));
+            }
+            Ok(ordinary)
+        }
+        _ => Err(failure(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "CMD requires a local drive working directory; use a local project directory",
+        ))),
+    }
+}
+
 fn str_to_wide_with_nul(s: &str) -> Vec<u16> {
     let mut v: Vec<u16> = s.encode_utf16().collect();
     v.push(0);
@@ -1796,6 +1865,25 @@ fn to_wide_with_nul(s: &OsStr) -> Vec<u16> {
 mod tests {
     use super::*;
     use windows_sys::Win32::Security::GetLengthSid;
+
+    #[test]
+    fn cmd_working_directory_rejects_paths_that_change_when_the_prefix_is_removed() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().canonicalize().unwrap();
+        let ordinary = root.join("project");
+        let extended_only = root.join("project.");
+        std::fs::create_dir(&ordinary).unwrap();
+        std::fs::create_dir(&extended_only).unwrap();
+        assert!(process_working_directory(&extended_only, OsStr::new("cmd.exe")).is_err());
+        assert_eq!(
+            process_working_directory(&extended_only, OsStr::new("node.exe")).unwrap(),
+            extended_only
+        );
+        assert!(
+            process_working_directory(Path::new(r"\\server\share\project"), OsStr::new("CMD.EXE"))
+                .is_err()
+        );
+    }
 
     #[test]
     fn quote_arg_for_cmdline_passes_simple_args_unmodified() {
@@ -2157,63 +2245,68 @@ mod tests {
         .expect("grant on regular dir must succeed");
     }
 
-    /// Pins the strict-vs-best-effort split on root-grant failure:
-    ///
-    ///   - `strict_root = true` propagates the failure as `Err`,
-    ///   - `strict_root = false` swallows it (logs WARN, returns
-    ///     `Ok`).
-    ///
-    /// A regression that silently downgrades strict allow-set
-    /// entries to best-effort would let a misconfigured install
-    /// pipeline weaken containment without surfacing the issue.
     #[test]
     fn grant_dacl_ace_to_tree_distinguishes_strict_from_best_effort_on_root_failure() {
-        // Use `C:\Windows\System32` as a guaranteed-unwritable
-        // root (owned by SYSTEM, even Administrators get an
-        // implicit "Modify" deny on the DACL itself unless they
-        // take ownership). The grant will fail with
-        // ERROR_ACCESS_DENIED for an unprivileged process.
-        let unwritable = std::path::Path::new(r"C:\Windows\System32");
-        if !unwritable.exists() {
-            // Defensive — should always exist on Windows.
-            eprintln!("skipping: System32 not at expected path");
-            return;
-        }
-        // Unique profile name so this test doesn't race against
-        // the sibling `create_or_reuse_appcontainer_sid_*` tests
-        // for `CreateAppContainerProfile`'s session-state. Cargo
-        // runs unit tests in parallel by default and a contended
-        // first call has been observed to return non-S_OK +
-        // non-ALREADY_EXISTS here.
-        let sid = create_or_reuse_appcontainer_sid("LpmHelperBestEffortRootGrantTest")
-            .expect("derive SID");
+        use windows_sys::Win32::Security::{
+            AdjustTokenPrivileges, ImpersonateSelf, RevertToSelf, SecurityImpersonation,
+            TOKEN_ADJUST_PRIVILEGES, TOKEN_QUERY,
+        };
+        use windows_sys::Win32::System::Threading::{GetCurrentThread, OpenThreadToken};
 
-        // strict_root = true: failure propagates.
-        let strict_result = grant_dacl_ace_to_tree(
-            unwritable,
-            sid.0,
-            FILE_GENERIC_READ,
-            /* strict_root */ true,
-        );
+        struct RevertImpersonation;
+        impl Drop for RevertImpersonation {
+            fn drop(&mut self) {
+                // SAFETY: this test established impersonation only on the current thread.
+                unsafe { RevertToSelf() };
+            }
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        set_test_dacl(tmp.path(), "D:P(D;;RCWD;;;WD)(A;OICI;FA;;;OW)");
+        // Hosted administrators can bypass DACLs through backup/restore privileges.
+        // Disable privileges on a private thread token without changing parallel tests.
+        unsafe {
+            // SAFETY: all handles and output pointers are valid for the synchronous calls.
+            assert_ne!(ImpersonateSelf(SecurityImpersonation), 0);
+        }
+        let _revert = RevertImpersonation;
+        let mut token = ptr::null_mut();
+        unsafe {
+            // SAFETY: this thread is impersonating; token is an initialized output slot.
+            assert_ne!(
+                OpenThreadToken(
+                    GetCurrentThread(),
+                    TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY,
+                    1,
+                    &mut token
+                ),
+                0
+            );
+        }
+        let token = HandleGuard(token);
+        unsafe {
+            // SAFETY: disable-all ignores new-state and output buffers, which are null.
+            assert_ne!(
+                AdjustTokenPrivileges(
+                    token.as_raw(),
+                    1,
+                    ptr::null(),
+                    0,
+                    ptr::null_mut(),
+                    ptr::null_mut()
+                ),
+                0
+            );
+        }
+        let sid = create_or_reuse_appcontainer_sid("LpmDeniedDaclTest").unwrap();
+        let strict = grant_dacl_ace_to_tree(tmp.path(), sid.0, FILE_GENERIC_READ, true);
         assert!(
             matches!(
-                strict_result,
-                Err(AppContainerError::WriteDacl { .. }) | Err(AppContainerError::ReadDacl { .. })
+                strict,
+                Err(AppContainerError::ReadDacl { .. }) | Err(AppContainerError::WriteDacl { .. })
             ),
-            "strict_root=true must propagate root-grant failure on an unwritable dir; got {strict_result:?}",
+            "{strict:?}"
         );
-
-        // strict_root = false: failure is swallowed; returns Ok.
-        let best_effort_result = grant_dacl_ace_to_tree(
-            unwritable,
-            sid.0,
-            FILE_GENERIC_READ,
-            /* strict_root */ false,
-        );
-        assert!(
-            best_effort_result.is_ok(),
-            "strict_root=false must swallow root-grant failure (WARN + continue); got {best_effort_result:?}",
-        );
+        grant_dacl_ace_to_tree(tmp.path(), sid.0, FILE_GENERIC_READ, false).unwrap();
     }
 
     /// Reparse-point roots must honor `strict_root` too: a junction

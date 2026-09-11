@@ -19,6 +19,60 @@ use wiremock::matchers::{header, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 #[tokio::test]
+async fn global_alias_without_a_collision_runs_and_is_removed_with_its_package() {
+    let mock = MockRegistry::start().await;
+    let tarball = make_tarball_from_pkg_json(
+        serde_json::json!({"name":"alias-probe", "version":"1.0.0", "bin":{"original":"bin.js"}}),
+        &[(
+            "bin.js",
+            b"#!/usr/bin/env node\nconsole.log(process.argv[2]);\n",
+        )],
+    );
+    mock.with_package("alias-probe", "1.0.0", &tarball).await;
+    let project = TempProject::empty(r#"{"name":"consumer","version":"1.0.0"}"#);
+    project.write_file(".npmrc", &format!("registry={}/\n", mock.url()));
+    lpm_with_registry(&project, &mock.url())
+        .args([
+            "install",
+            "-g",
+            "alias-probe@1.0.0",
+            "--alias",
+            "original=renamed",
+            "--no-skills",
+            "--no-security-summary",
+        ])
+        .assert()
+        .success();
+    let bin = project.home().join(".lpm/bin");
+    let suffix = if cfg!(windows) { ".cmd" } else { "" };
+    let alias = bin.join(format!("renamed{suffix}"));
+    assert!(
+        alias.is_file(),
+        "alias was not materialized: {}",
+        alias.display()
+    );
+    assert!(!bin.join(format!("original{suffix}")).exists());
+    let output = std::process::Command::new(&alias)
+        .arg("native alias")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).trim(),
+        "native alias"
+    );
+    lpm_with_registry(&project, &mock.url())
+        .args(["uninstall", "-g", "alias-probe"])
+        .assert()
+        .success();
+    assert!(!alias.exists());
+}
+
+#[tokio::test]
 async fn install_refreshes_custom_metadata_when_requested_version_was_published_after_cache() {
     assert_refreshes_published_version(None).await;
 }

@@ -270,6 +270,13 @@ impl Sandbox for AppContainerSandbox {
             .iter()
             .map(|(k, _)| k.to_string_lossy().to_ascii_lowercase())
             .collect();
+        if cmd.env_clear && !caller_keys_lower.contains("localappdata") {
+            // CreateProcessW requires LOCALAPPDATA for AppContainer startup. Use
+            // the writable runtime directory without inheriting the user's profile.
+            let mut value = OsString::from("LOCALAPPDATA=");
+            value.push(&self.spec.tmpdir);
+            helper_cmd.arg("--env").arg(value);
+        }
         match capture_msvc_env() {
             Ok(msvc_env) => {
                 for (k, v) in msvc_env {
