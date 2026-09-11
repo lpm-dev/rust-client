@@ -268,7 +268,7 @@ fn open_permissions_with_sharing(
             READ_CONTROL | FILE_READ_ATTRIBUTES | if write { WRITE_DAC } else { 0 }
                 // Metadata-only handles do not enforce Windows share restrictions.
                 | if allow_delete { 0 } else { windows_sys::Win32::Storage::FileSystem::FILE_READ_DATA },
-            FILE_SHARE_READ | FILE_SHARE_WRITE | if allow_delete { FILE_SHARE_DELETE } else { 0 },
+            FILE_SHARE_READ | if allow_delete { FILE_SHARE_WRITE | FILE_SHARE_DELETE } else { 0 },
             ptr::null(),
             OPEN_EXISTING,
             FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
@@ -1109,9 +1109,15 @@ mod tests {
             windows_sys::Win32::Storage::FileSystem::FILE_WRITE_ATTRIBUTES,
             0,
         ] {
-            assert!(!convert(access), "junction conversion succeeded with access mask {access:x}");
+            assert!(
+                !convert(access),
+                "junction conversion succeeded with access mask {access:x}"
+            );
         }
         drop(_pins);
-        assert!(convert(windows_sys::Win32::Foundation::GENERIC_WRITE), "unpinned junction control must succeed");
+        assert!(
+            convert(windows_sys::Win32::Foundation::GENERIC_WRITE),
+            "unpinned junction control must succeed"
+        );
     }
 }
