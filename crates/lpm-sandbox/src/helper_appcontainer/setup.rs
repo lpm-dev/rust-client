@@ -819,6 +819,11 @@ pub(super) fn prepare<'a>(
             access.temporary.push(path);
         }
     }
+    let protected_paths: Vec<_> = args
+        .secret_read_denied_paths
+        .iter()
+        .filter_map(|path| path.canonicalize().ok())
+        .collect();
     for tool in &args.best_effort_readable_dirs {
         if !std::fs::symlink_metadata(tool)
             .is_ok_and(|metadata| metadata.is_dir() && !is_reparse_point(&metadata))
@@ -826,7 +831,14 @@ pub(super) fn prepare<'a>(
             continue;
         }
         let entry = grant_for(tool, Permission::ToolReadExecute, &user_sid)?;
-        if entry.configured {
+        // A tool capability can authorize reads independently of the deny
+        // for this invocation's SID. Exclude both ancestors and descendants
+        // of protected paths from the capability set.
+        if entry.configured
+            && !protected_paths
+                .iter()
+                .any(|path| path.starts_with(&entry.path) || entry.path.starts_with(path))
+        {
             access.configured_tools.insert(entry.path.clone());
             access
                 .capabilities
