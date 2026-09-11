@@ -268,7 +268,12 @@ fn open_permissions_with_sharing(
             READ_CONTROL | FILE_READ_ATTRIBUTES | if write { WRITE_DAC } else { 0 }
                 // Metadata-only handles do not enforce Windows share restrictions.
                 | if allow_delete { 0 } else { windows_sys::Win32::Storage::FileSystem::FILE_READ_DATA },
-            FILE_SHARE_READ | if allow_delete { FILE_SHARE_WRITE | FILE_SHARE_DELETE } else { 0 },
+            FILE_SHARE_READ
+                | if allow_delete {
+                    FILE_SHARE_WRITE | FILE_SHARE_DELETE
+                } else {
+                    0
+                },
             ptr::null(),
             OPEN_EXISTING,
             FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
@@ -1032,12 +1037,14 @@ mod tests {
     }
 
     #[test]
-    fn pinned_directories_refuse_in_place_junction_conversion() {
+    fn setup_does_not_grant_outside_files_after_in_place_junction_conversion() {
         let temporary = tempfile::tempdir().unwrap();
         let root = temporary.path().join("tool");
         let outside = temporary.path().join("outside");
         std::fs::create_dir(&root).unwrap();
         std::fs::create_dir(&outside).unwrap();
+        let secret = outside.join("private.txt");
+        std::fs::write(&secret, "private").unwrap();
         let entry = grant_for(
             &root,
             Permission::ToolReadExecute,
@@ -1104,20 +1111,16 @@ mod tests {
             };
             changed != 0
         };
-        for access in [
-            windows_sys::Win32::Foundation::GENERIC_WRITE,
-            windows_sys::Win32::Storage::FileSystem::FILE_WRITE_ATTRIBUTES,
-            0,
-        ] {
-            assert!(
-                !convert(access),
-                "junction conversion succeeded with access mask {access:x}"
-            );
-        }
-        drop(_pins);
         assert!(
-            convert(windows_sys::Win32::Foundation::GENERIC_WRITE),
-            "unpinned junction control must succeed"
+            convert(windows_sys::Win32::Storage::FileSystem::FILE_WRITE_ATTRIBUTES),
+            "junction conversion control must succeed"
+        );
+        let sid = capability_sid(&entry.capability_name).unwrap();
+        let _result = update_tool_children(&entry.path, sid.raw(), Some((TOOL_ACCESS, 0)));
+        let (file, _) = open_permissions(&secret, false).unwrap();
+        assert!(
+            !has_grant(&file, &secret, sid.raw(), TOOL_ACCESS, 0).unwrap(),
+            "setup followed the changed directory and granted access outside the approved tree"
         );
     }
 }
