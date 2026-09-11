@@ -19,6 +19,8 @@ mod manifest;
 mod policy;
 mod runtime;
 mod sandbox;
+mod sandbox_setup;
+pub use sandbox_setup::run as sandbox_setup;
 mod script_policy;
 mod sigstore;
 mod storage;

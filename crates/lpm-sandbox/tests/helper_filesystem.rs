@@ -24,7 +24,7 @@
 use assert_cmd::Command;
 use std::fs;
 
-const TEST_APPCONTAINER_NAME: &str = "LpmSandboxHelperIntegrationTest";
+static NEXT_PROFILE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 #[test]
 fn node_can_resolve_project_paths_without_listing_or_reading_ancestors() {
@@ -123,7 +123,11 @@ fn helper_argv_base() -> Vec<String> {
         "--protocol-version".into(),
         "2".into(),
         "--appcontainer-name".into(),
-        TEST_APPCONTAINER_NAME.into(),
+        format!(
+            "LpmFilesystemTest-{}-{}",
+            std::process::id(),
+            NEXT_PROFILE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ),
         "--stdio-stdin".into(),
         "null".into(),
         "--stdio-stdout".into(),
