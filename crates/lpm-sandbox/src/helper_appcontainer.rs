@@ -237,6 +237,14 @@ pub enum AppContainerError {
         /// `GetLastError` reading.
         last_error: u32,
     },
+    /// The shell cannot use the requested directory without changing its meaning.
+    #[error("cannot use working directory {path:?}: {source}")]
+    WorkingDirectory {
+        /// Requested working directory.
+        path: PathBuf,
+        /// Filesystem error or shell path limitation.
+        source: std::io::Error,
+    },
     /// `AssignProcessToJobObject` failed (the lifecycle child is
     /// still suspended at this point, so we'll terminate it via the
     /// process-info handle in the error path).
@@ -635,15 +643,12 @@ pub fn run_appcontainer_spawn(args: HelperArgs) -> Result<i32, AppContainerError
     // downstream with a clearer "tool not found" error than a hard
     // sandbox-setup failure would give.
     for dir in &args.best_effort_readable_dirs {
-        let qa_start = std::time::Instant::now();
-        qa_trace(format_args!("tool grant start: {}", dir.display()));
         grant_dacl_ace_to_tree(
             dir,
             sid.0,
             FILE_GENERIC_READ | FILE_GENERIC_EXECUTE,
             /* strict_root */ false,
         )?;
-        qa_trace(format_args!("tool grant done: {:?}", qa_start.elapsed()));
     }
     for dir in &args.readable_dirs {
         grant_dacl_ace_to_tree(
@@ -718,7 +723,9 @@ pub fn run_appcontainer_spawn(args: HelperArgs) -> Result<i32, AppContainerError
     let working_dir_wide = args
         .working_dir
         .as_ref()
-        .map(|p| to_wide_with_nul(p.as_os_str()));
+        .map(|path| process_working_directory(path, &args.program))
+        .transpose()?
+        .map(|path| to_wide_with_nul(path.as_os_str()));
 
     // 8. Build STARTUPINFOEXW with the attribute list + stdio handles.
     //    The base StartupInfo is the inner field; the EX wrapper
@@ -1799,6 +1806,47 @@ fn build_environment_block(envs: &[OsString], env_clear: bool) -> Vec<u16> {
 
 // ── Wide-string helpers ──────────────────────────────────────────────
 
+fn process_working_directory(path: &Path, program: &OsStr) -> Result<PathBuf, AppContainerError> {
+    use std::os::windows::ffi::OsStringExt as _;
+    use std::path::{Component, Prefix};
+
+    let is_cmd = Path::new(program)
+        .file_name()
+        .and_then(OsStr::to_str)
+        .is_some_and(|name| {
+            name.eq_ignore_ascii_case("cmd.exe") || name.eq_ignore_ascii_case("cmd")
+        });
+    if !is_cmd {
+        return Ok(path.to_path_buf());
+    }
+    let Some(Component::Prefix(prefix)) = path.components().next() else {
+        return Ok(path.to_path_buf());
+    };
+    let failure = |source| AppContainerError::WorkingDirectory {
+        path: path.to_path_buf(),
+        source,
+    };
+    match prefix.kind() {
+        Prefix::Disk(_) => Ok(path.to_path_buf()),
+        Prefix::VerbatimDisk(_) => {
+            // CMD mistakes the extended drive prefix for UNC and changes to C:\Windows.
+            // Verify equivalence so stripping it cannot redirect trailing-dot or reserved paths.
+            let wide = path.as_os_str().encode_wide().collect::<Vec<_>>();
+            let ordinary = PathBuf::from(OsString::from_wide(&wide[4..]));
+            if ordinary.canonicalize().map_err(failure)? != path.canonicalize().map_err(failure)? {
+                return Err(failure(std::io::Error::other(
+                    "CMD cannot represent this directory without changing its meaning",
+                )));
+            }
+            Ok(ordinary)
+        }
+        _ => Err(failure(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "CMD requires a local drive working directory; use a local project directory",
+        ))),
+    }
+}
+
 fn str_to_wide_with_nul(s: &str) -> Vec<u16> {
     let mut v: Vec<u16> = s.encode_utf16().collect();
     v.push(0);
@@ -1817,6 +1865,25 @@ fn to_wide_with_nul(s: &OsStr) -> Vec<u16> {
 mod tests {
     use super::*;
     use windows_sys::Win32::Security::GetLengthSid;
+
+    #[test]
+    fn cmd_working_directory_rejects_paths_that_change_when_the_prefix_is_removed() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().canonicalize().unwrap();
+        let ordinary = root.join("project");
+        let extended_only = root.join("project.");
+        std::fs::create_dir(&ordinary).unwrap();
+        std::fs::create_dir(&extended_only).unwrap();
+        assert!(process_working_directory(&extended_only, OsStr::new("cmd.exe")).is_err());
+        assert_eq!(
+            process_working_directory(&extended_only, OsStr::new("node.exe")).unwrap(),
+            extended_only
+        );
+        assert!(
+            process_working_directory(Path::new(r"\\server\share\project"), OsStr::new("CMD.EXE"))
+                .is_err()
+        );
+    }
 
     #[test]
     fn quote_arg_for_cmdline_passes_simple_args_unmodified() {
@@ -2180,8 +2247,56 @@ mod tests {
 
     #[test]
     fn grant_dacl_ace_to_tree_distinguishes_strict_from_best_effort_on_root_failure() {
+        use windows_sys::Win32::Security::{
+            AdjustTokenPrivileges, ImpersonateSelf, RevertToSelf, SecurityImpersonation,
+            TOKEN_ADJUST_PRIVILEGES, TOKEN_QUERY,
+        };
+        use windows_sys::Win32::System::Threading::{GetCurrentThread, OpenThreadToken};
+
+        struct RevertImpersonation;
+        impl Drop for RevertImpersonation {
+            fn drop(&mut self) {
+                // SAFETY: this test established impersonation only on the current thread.
+                unsafe { RevertToSelf() };
+            }
+        }
         let tmp = tempfile::tempdir().unwrap();
-        set_test_dacl(tmp.path(), "D:P(D;;RCWD;;;OW)(A;OICI;FA;;;OW)");
+        set_test_dacl(tmp.path(), "D:P(D;;RCWD;;;WD)(A;OICI;FA;;;OW)");
+        // Hosted administrators can bypass DACLs through backup/restore privileges.
+        // Disable privileges on a private thread token without changing parallel tests.
+        unsafe {
+            // SAFETY: all handles and output pointers are valid for the synchronous calls.
+            assert_ne!(ImpersonateSelf(SecurityImpersonation), 0);
+        }
+        let _revert = RevertImpersonation;
+        let mut token = ptr::null_mut();
+        unsafe {
+            // SAFETY: this thread is impersonating; token is an initialized output slot.
+            assert_ne!(
+                OpenThreadToken(
+                    GetCurrentThread(),
+                    TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY,
+                    1,
+                    &mut token
+                ),
+                0
+            );
+        }
+        let token = HandleGuard(token);
+        unsafe {
+            // SAFETY: disable-all ignores new-state and output buffers, which are null.
+            assert_ne!(
+                AdjustTokenPrivileges(
+                    token.as_raw(),
+                    1,
+                    ptr::null(),
+                    0,
+                    ptr::null_mut(),
+                    ptr::null_mut()
+                ),
+                0
+            );
+        }
         let sid = create_or_reuse_appcontainer_sid("LpmDeniedDaclTest").unwrap();
         let strict = grant_dacl_ace_to_tree(tmp.path(), sid.0, FILE_GENERIC_READ, true);
         assert!(
@@ -2256,12 +2371,5 @@ mod tests {
             best_effort_result.is_ok(),
             "strict_root=false must downgrade reparse-point refusal to WARN+continue; got {best_effort_result:?}",
         );
-    }
-}
-
-fn qa_trace(message: std::fmt::Arguments<'_>) {
-    use std::io::Write;
-    if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(r"C:\lpm-sandbox-qa.log") {
-        let _ = writeln!(file, "{message}");
     }
 }

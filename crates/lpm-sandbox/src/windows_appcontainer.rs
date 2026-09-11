@@ -270,7 +270,13 @@ impl Sandbox for AppContainerSandbox {
             .iter()
             .map(|(k, _)| k.to_string_lossy().to_ascii_lowercase())
             .collect();
-        qa_trace(format_args!("QA msvc capture start"));
+        if cmd.env_clear && !caller_keys_lower.contains("localappdata") {
+            // CreateProcessW requires LOCALAPPDATA for AppContainer startup. Use
+            // the writable runtime directory without inheriting the user's profile.
+            let mut value = OsString::from("LOCALAPPDATA=");
+            value.push(&self.spec.tmpdir);
+            helper_cmd.arg("--env").arg(value);
+        }
         match capture_msvc_env() {
             Ok(msvc_env) => {
                 for (k, v) in msvc_env {
@@ -293,7 +299,6 @@ impl Sandbox for AppContainerSandbox {
                 );
             }
         }
-        qa_trace(format_args!("QA msvc capture done"));
         for (k, v) in &cmd.envs {
             let mut kv = OsString::from(k);
             kv.push("=");
@@ -840,12 +845,5 @@ mod tests {
             matches!(arch, "arm64" | "x64" | "x86"),
             "unexpected host arch token: {arch}",
         );
-    }
-}
-
-fn qa_trace(message: std::fmt::Arguments<'_>) {
-    use std::io::Write;
-    if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(r"C:\lpm-sandbox-qa.log") {
-        let _ = writeln!(file, "{message}");
     }
 }

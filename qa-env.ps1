@@ -1,38 +1,57 @@
-$ErrorActionPreference = 'Continue'
-$root = Join-Path $env:TEMP ('lpm-env-qa-' + $PID)
-New-Item -ItemType Directory -Force $root | Out-Null
-$base = @('SystemRoot','WINDIR','COMSPEC','PATH','TEMP','TMP')
-$cases = @(
-  ($base + @('USERPROFILE')),
-  ($base + @('LOCALAPPDATA')),
-  ($base + @('APPDATA')),
-  ($base + @('USERPROFILE','LOCALAPPDATA')),
-  ($base + @('USERPROFILE','APPDATA')),
-  ($base + @('LOCALAPPDATA','APPDATA')),
-  ($base + @('USERPROFILE','LOCALAPPDATA','APPDATA'))
-)
-$i = 0
-foreach ($keys in $cases) {
-  $arguments = @('--protocol-version','2','--appcontainer-name',('LpmEnvQA' + $PID + '-' + $i),'--delete-appcontainer-profile','--env-clear','--stdio-stdin','null','--stdio-stdout','inherit','--stdio-stderr','inherit','--working-dir',$root,'--writable-dir',$root)
-  foreach ($key in $keys) {
-    $value = [Environment]::GetEnvironmentVariable($key)
-    if ($null -ne $value) {$arguments += @('--env', ($key + '=' + $value))}
-  }
-  $arguments += @('--', (Join-Path $env:SystemRoot 'System32/cmd.exe'), '/d','/c','exit 0')
-  Write-Output ('CASE ' + $i + ' KEYS ' + ($keys -join ','))
-  & target/debug/lpm-sandbox-helper.exe @arguments
-  Write-Output ('EXIT ' + $LASTEXITCODE)
-  $i++
+$ErrorActionPreference = 'Stop'
+Add-Type @'
+using System;
+using System.Runtime.InteropServices;
+public class ContainerSid {
+ [DllImport("userenv.dll", CharSet=CharSet.Unicode)] public static extern int DeriveAppContainerSidFromAppContainerName(string name, out IntPtr sid);
+ [DllImport("kernel32.dll")] public static extern IntPtr LocalFree(IntPtr value);
 }
-foreach ($key in @('USERPROFILE','LOCALAPPDATA','APPDATA')) {
-  $arguments = @('--protocol-version','2','--appcontainer-name',('LpmMappedEnvQA' + $PID + '-' + $key),'--delete-appcontainer-profile','--env-clear','--stdio-stdin','null','--stdio-stdout','inherit','--stdio-stderr','inherit','--working-dir',$root,'--writable-dir',$root)
-  foreach ($system in $base) {
-    $arguments += @('--env',($system + '=' + [Environment]::GetEnvironmentVariable($system)))
-  }
-  $arguments += @('--env',($key + '=' + $root),'--',(Join-Path $env:SystemRoot 'System32/cmd.exe'),'/d','/c','exit 0')
-  Write-Output ('MAPPED ' + $key)
-  & target/debug/lpm-sandbox-helper.exe @arguments
-  Write-Output ('EXIT ' + $LASTEXITCODE)
+'@
+$root = Join-Path $env:TEMP ('lpm-ancestor-qa-' + $PID)
+$project = Join-Path $root 'project'
+New-Item -ItemType Directory -Force $project | Out-Null
+Set-Content (Join-Path $root 'unrelated.txt') 'outside-content'
+$node = (Get-Command node).Source
+@'
+const fs = require('fs');
+console.log('REALPATH', fs.realpathSync(__filename));
+const parent = require('path').dirname(__dirname);
+for (const [name, operation] of [['LIST', () => fs.readdirSync(parent)], ['READ', () => fs.readFileSync(require('path').join(parent, 'unrelated.txt'))]]) {
+ try { operation(); throw new Error(name + ' unexpectedly allowed'); }
+ catch (error) { if (!['EPERM','EACCES'].includes(error.code)) throw error; console.log(name, 'DENIED'); }
 }
-Remove-Item -Recurse -Force $root
+'@ | Set-Content (Join-Path $project 'hook.cjs')
+$name = 'LpmAncestorQA' + $PID
+$base = @('--protocol-version','2','--appcontainer-name',$name,'--env-clear','--stdio-stdin','null','--stdio-stdout','inherit','--stdio-stderr','inherit','--working-dir',$project,'--writable-dir',$project,'--readable-dir',(Split-Path $node))
+foreach ($key in @('SystemRoot','WINDIR','COMSPEC','PATH','TEMP','TMP')) { $base += @('--env',($key + '=' + [Environment]::GetEnvironmentVariable($key))) }
+$base += @('--env',('LOCALAPPDATA=' + $project))
+& target/debug/lpm-sandbox-helper.exe @base -- $node hook.cjs
+Write-Output ('BEFORE ' + $LASTEXITCODE)
+$pointer = [IntPtr]::Zero
+if ([ContainerSid]::DeriveAppContainerSidFromAppContainerName($name, [ref]$pointer) -ne 0) { throw 'SID failure' }
+$sid = [System.Security.Principal.SecurityIdentifier]::new($pointer)
+[ContainerSid]::LocalFree($pointer) | Out-Null
+$ancestors = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+foreach ($entry in @($project, (Split-Path $node))) {
+ $parent = [System.IO.Directory]::GetParent($entry)
+ while ($parent) { [void]$ancestors.Add($parent.FullName); $parent = $parent.Parent }
+}
+$rule = [System.Security.AccessControl.FileSystemAccessRule]::new($sid, [System.Security.AccessControl.FileSystemRights]160, 'None', 'None', 'Allow')
+try {
+ foreach ($path in $ancestors) {
+  $acl = Get-Acl $path
+  Write-Output ('ANCESTOR ' + $path + ' PROTECTED ' + $acl.AreAccessRulesProtected)
+  $acl.AddAccessRule($rule)
+  Set-Acl -LiteralPath $path -AclObject $acl
+ }
+ & target/debug/lpm-sandbox-helper.exe @base -- $node hook.cjs
+ Write-Output ('AFTER ' + $LASTEXITCODE)
+ if ($LASTEXITCODE -ne 0) { throw 'minimal metadata rights failed' }
+} finally {
+ foreach ($path in $ancestors) {
+  $acl = Get-Acl $path
+  $acl.RemoveAccessRuleSpecific($rule)
+  Set-Acl -LiteralPath $path -AclObject $acl
+ }
+}
 exit 0
