@@ -1,0 +1,43 @@
+---
+source: tests/workflows/tests/audit.rs
+expression: json
+---
+{
+  "success": false,
+  "behavioral_coverage": {
+    "complete": false,
+    "scanned_packages": 0,
+    "partial_packages": 0,
+    "unavailable_packages": 1,
+    "packages": [
+      {
+        "name": "missing",
+        "version": "1.0.0",
+        "instance_id": null,
+        "path": "node_modules/missing",
+        "reason": "source_missing_or_unreadable",
+        "files_scanned": 0,
+        "bytes_scanned": 0,
+        "oversized_source_files": []
+      }
+    ]
+  },
+  "manager": "npm",
+  "degraded": false,
+  "osv_degraded": false,
+  "osv_degraded_reason": null,
+  "scanned": 1,
+  "checked_lpm": 0,
+  "packages_with_issues": 0,
+  "total_issues": 0,
+  "osv_vulnerabilities": 0,
+  "counts": {
+    "critical": 0,
+    "high": 0,
+    "moderate": 0,
+    "low": 0,
+    "info": 0
+  },
+  "packages": [],
+  "vulnerabilities": []
+}

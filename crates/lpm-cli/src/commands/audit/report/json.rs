@@ -9,11 +9,13 @@ pub(in crate::commands::audit) fn print_json_report(
     osv_degraded_reason: Option<&str>,
     discovery: &DiscoveryResult,
     checked_lpm: usize,
+    behavioral: &super::super::behavior::BehavioralSummary,
 ) {
     let (counts, _) = summarize_findings(results, osv_vulns);
 
     let json = serde_json::json!({
-        "success": osv_degraded_reason.is_none(),
+        "success": osv_degraded_reason.is_none() && behavioral.coverage.complete,
+        "behavioral_coverage": behavioral.coverage,
         "manager": discovery.manager.to_string(),
         "degraded": discovery.is_degraded,
         // `osv_degraded` is true when the OSV advisory database was

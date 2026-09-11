@@ -283,7 +283,7 @@ pub(in crate::commands::audit) fn print_summary(
         .filter(|issue| issue.severity == "info")
         .count();
 
-    if osv_degraded {
+    if osv_degraded || !behavioral.coverage.complete {
         install_ui::warn_untrusted(&format!(
             "Audit incomplete · {total_scanned} {} scanned",
             install_ui::packages_word(total_scanned)

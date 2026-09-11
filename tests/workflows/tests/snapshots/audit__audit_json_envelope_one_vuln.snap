@@ -1,10 +1,16 @@
 ---
 source: tests/workflows/tests/audit.rs
-assertion_line: 2194
 expression: envelope
 ---
 {
   "success": true,
+  "behavioral_coverage": {
+    "complete": true,
+    "scanned_packages": 1,
+    "partial_packages": 0,
+    "unavailable_packages": 0,
+    "packages": []
+  },
   "manager": "lpm",
   "degraded": false,
   "osv_degraded": false,

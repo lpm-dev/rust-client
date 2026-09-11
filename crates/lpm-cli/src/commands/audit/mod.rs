@@ -200,7 +200,7 @@ pub async fn run(
 
     if discovery.packages.is_empty() {
         if json_output {
-            print_json_report(&[], &[], None, &discovery, 0);
+            print_json_report(&[], &[], None, &discovery, 0, &behavioral_results);
         } else {
             install_ui::warn("No packages found to audit");
         }
@@ -215,11 +215,13 @@ pub async fn run(
             osv_degraded_reason.as_deref(),
             &discovery,
             checked_lpm,
+            &behavioral_results,
         );
     } else {
         // Human-readable output — three-tier separation
         print_discovery_summary(&discovery);
         print_osv_status(osv_degraded_reason.as_deref());
+        behavioral_results.coverage.print_gaps();
 
         // Section 1: LPM quality scores
         print_lpm_results(&results, &lpm_packages);
@@ -258,7 +260,7 @@ pub async fn run(
         );
     }
 
-    if osv_degraded_reason.is_some() {
+    if osv_degraded_reason.is_some() || !behavioral_results.coverage.complete {
         return Err(LpmError::ExitCode(1));
     }
 
