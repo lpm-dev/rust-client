@@ -83,7 +83,7 @@ where
     let parent = destination_parent(path).map_err(E::from)?;
     let exact_mode = destination_mode(path, options).map_err(E::from)?;
     let mut temporary =
-        create_temporary(parent, exact_mode, || random_temp_path(parent)).map_err(E::from)?;
+        create_temporary(parent, exact_mode, || random_temp_path(parent)).map_err(|e| { eprintln!("QA temporary creation failed at {}: {e}", parent.display()); E::from(e) })?;
 
     let output = write(temporary.file_mut().map_err(E::from)?)?;
     if let Some(mode) = exact_mode {
@@ -589,6 +589,7 @@ fn replace_file(from: &Path, to: &Path) -> io::Result<()> {
             return Ok(());
         }
         let error = io::Error::last_os_error();
+        eprintln!("QA MoveFileEx error: {:?} -> {:?}: {error}", String::from_utf16_lossy(&from), String::from_utf16_lossy(&to));
         let raw = error.raw_os_error().map(|code| code as u32);
         if !matches!(
             raw,

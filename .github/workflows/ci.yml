@@ -36,6 +36,10 @@ jobs:
         run: |
           python -c 'import shutil; assert shutil.disk_usage(".").free >= 10*1024**3'
           cargo build --locked -p lpm-cli -p lpm-sandbox
+      - name: Long workspace diagnostic
+        continue-on-error: true
+        shell: bash
+        run: python qa-workspace.py --binary target/debug/lpm-rs.exe --output qa-results/followup/workspace-0
       - name: Long atomic-write baseline
         continue-on-error: true
         shell: bash

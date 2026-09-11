@@ -1072,7 +1072,7 @@ pub(crate) fn write_object_integrity_content(dir: &Path, content: &str) -> Resul
     let path = dir.join(OBJECT_INTEGRITY_FILENAME);
     write_file_atomic(&path, format!("{content}\n")).map_err(|e| {
         LpmError::Store(format!(
-            "failed to write virtual-store object integrity sidecar: {e}"
+            "failed to write virtual-store object integrity sidecar {} (parent exists {}): {e}", path.display(), dir.exists()
         ))
     })
 }
