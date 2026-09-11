@@ -410,6 +410,35 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_global_shims_forward_arguments_and_exit_code_to_project_shims() {
+        let dir = TempDir::new().unwrap();
+        let project_bin = dir.path().join("project with spaces/node_modules/.bin");
+        std::fs::create_dir_all(&project_bin).unwrap();
+        std::fs::write(project_bin.join("tool.cmd"), "@echo %~1\r\n@exit /b 7\r\n").unwrap();
+        let global_bin = dir.path().join("global bin");
+        emit_shim(&global_bin, &Shim {
+            command_name: "tool".into(), target: project_bin.join("tool"),
+        }).unwrap();
+        let output = std::process::Command::new("cmd.exe")
+            .args(["/d", "/c"]).arg(global_bin.join("tool.cmd"))
+            .arg("hello space").output().unwrap();
+        assert_eq!(output.status.code(), Some(7), "{}", String::from_utf8_lossy(&output.stderr));
+        assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "hello space");
+        let output = std::process::Command::new("powershell.exe")
+            .args(["-NoLogo", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File"])
+            .arg(global_bin.join("tool.ps1")).arg("hello space").output().unwrap();
+        assert_eq!(output.status.code(), Some(7), "{}", String::from_utf8_lossy(&output.stderr));
+        assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "hello space");
+        let output = std::process::Command::new("bash")
+            .arg(global_bin.join("tool").to_string_lossy().replace('\\', "/"))
+            .arg("hello space").output().unwrap();
+        assert_eq!(output.status.code(), Some(7), "{}", String::from_utf8_lossy(&output.stderr));
+        assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "hello space");
+    }
+
     fn shim(name: &str, target: &str) -> Shim {
         Shim {
             command_name: name.to_string(),
