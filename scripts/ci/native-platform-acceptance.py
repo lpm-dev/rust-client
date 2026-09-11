@@ -8,6 +8,7 @@ import json
 import os
 from pathlib import Path
 import platform
+import signal
 import shutil
 import socket
 import subprocess
@@ -71,14 +72,23 @@ def environment(home):
 def run(label, cwd, argv, expect=0, env=None, timeout=180):
     command = [str(x) for x in argv]
     start = time.monotonic()
-    try:
-        output = subprocess.run(command, cwd=cwd, env=env or ENV, capture_output=True, timeout=timeout)
-        code, stdout, stderr = output.returncode, output.stdout, output.stderr
-    except subprocess.TimeoutExpired as error:
-        code, stdout, stderr = 124, error.stdout or b'', error.stderr or b''
     prefix = f'{len(commands):03d}-{label}'
-    (ROOT / (prefix + '.stdout.log')).write_bytes(stdout)
-    (ROOT / (prefix + '.stderr.log')).write_bytes(stderr)
+    stdout_path = ROOT / (prefix + '.stdout.log')
+    stderr_path = ROOT / (prefix + '.stderr.log')
+    with stdout_path.open('wb') as out, stderr_path.open('wb') as err:
+        child = subprocess.Popen(command, cwd=cwd, env=env or ENV, stdout=out, stderr=err,
+                                 start_new_session=os.name != 'nt',
+                                 creationflags=0x200 if os.name == 'nt' else 0)
+        try:
+            code = child.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            if os.name == 'nt':
+                subprocess.run(['taskkill', '/PID', str(child.pid), '/T', '/F'], capture_output=True, timeout=15)
+            else:
+                os.killpg(child.pid, signal.SIGKILL)
+            child.wait(timeout=15)
+            code = 124
+    stdout, stderr = stdout_path.read_bytes(), stderr_path.read_bytes()
     entry = {'label': label, 'cwd': str(cwd), 'argv': command, 'exit': code,
              'seconds': round(time.monotonic() - start, 3), 'log': prefix}
     commands.append(entry)
@@ -274,18 +284,28 @@ try:
         write_json(source / 'lpm.json', {'publish': {'npm': {'registry': URL}}})
         run('publish-source', source, [BINARY, 'publish', '--npm', '--yes', '--ignore-scripts'])
         p = project('source-consumer')
-        run('source-add', p, [BINARY, 'add', '@qa/source', '--yes'])
+        before = (p / 'package.json').read_bytes()
+        first = run('source-add', p, [BINARY, 'add', '@qa/source', '--yes'], expect=None)
+        if first[0] != 0:
+            repeat = run('source-add-repeat', p, [BINARY, 'add', '@qa/source', '--yes'], expect=None)
+            check((p / 'package.json').read_bytes() == before, 'failed source add changed manifest')
+            check(repeat[0] == 0, 'source add rejected an in-project destination twice; see source-add logs')
         check((p / 'components/hello.txt').read_text() == 'hello source', 'source add missing file')
         run('source-remove', p, [BINARY, 'remove', '@qa/source'])
         check(not (p / 'components/hello.txt').exists(), 'source removal retained unchanged file')
     scenario('source-publish-add-remove', source_copy)
 
     def long_path():
-        p = project('long-path/' + '/'.join(['segment with spaces-' + str(i) + 'x' * 22 for i in range(7)]))
+        if os.name == 'nt':
+            p = project('long-path/' + 'x' * max(1, 220 - len(str(ROOT / 'long-path'))))
+        else:
+            p = project('long-path/' + '/'.join(['segment with spaces-' + str(i) + 'x' * 22 for i in range(7)]))
         run('long-path-install', p, [BINARY, 'install', '@qa/native-probe@1.0.0', *FLAGS])
         node('long-path-runtime', p, "require('node:assert/strict').equal(require('@qa/native-probe').answer,42)")
-        return {'path_length': len(str(p))}
-    scenario('project-path-over-260-characters', long_path)
+        asset = p / 'node_modules/@qa/native-probe/assets/日本語 file.bin'
+        check(len(str(asset)) > 260 and asset.read_bytes() == bytes(range(256)), 'long package asset not readable')
+        return {'project_path_length': len(str(p)), 'asset_path_length': len(str(asset))}
+    scenario('package-file-path-over-260-characters', long_path)
 
     def locked_file():
         p = project('open-file-lock')
@@ -356,11 +376,37 @@ static napi_value init(napi_env env, napi_value exports) {
 NAPI_MODULE(NODE_GYP_MODULE_NAME, init)
 ''')
         (p / 'probe.cjs').write_text("require('node:assert/strict').equal(require('./build/Release/qa_native.node').answer(),42); console.log('compiled-addon-ok')")
-        run('node-gyp-install', p, [BINARY, 'install', 'node-gyp@11.4.2', *FLAGS], timeout=300)
+        run('node-gyp-install', p, [BINARY, 'install', 'node-gyp@13.0.2', *FLAGS], timeout=300)
         run('native-source-build', p, [BINARY, 'run', 'build'], timeout=300)
         output = run('native-source-runtime', p, [BINARY, 'run', 'test'])
         check(b'compiled-addon-ok' in output[1], 'compiled N-API addon not usable')
     scenario('compile-and-load-real-native-addon', native_compile)
+
+    def global_install():
+        p = project('global-consumer', registry=False)
+        first = run('global-install', p, [BINARY, 'install', '-g', 'cowsay@1.6.0', *FLAGS], expect=None)
+        second = run('global-install-repeat', p, [BINARY, 'install', '-g', 'cowsay@1.6.0', *FLAGS], expect=None)
+        bins = list((ROOT / 'home/.lpm/global/installs').glob('**/.bin/cowsay*'))
+        write_json(ROOT / 'global-materialized-bins.json', [str(x) for x in bins])
+        check(first[0] == second[0] == 0, f'global install failed twice despite materialized bins: {bins}')
+        run('global-list', p, [BINARY, 'global', 'list'])
+        run('global-uninstall', p, [BINARY, 'uninstall', '-g', 'cowsay'])
+    scenario('real-global-bin-install-and-repeat', global_install)
+
+    def publish_hook():
+        p = project('publish-hook', {'name': '@qa/hook', 'version': '1.0.0', 'description': 'Publish hook fixture',
+            'license': 'MIT', 'main': 'index.cjs', 'files': ['index.cjs'], 'scripts': {'prepack': 'node hook.cjs'}})
+        (p / 'index.cjs').write_text('module.exports = 42')
+        (p / 'hook.cjs').write_text("require('node:fs').writeFileSync('hook-ran.txt','ok')")
+        write_json(p / 'lpm.json', {'publish': {'npm': {'registry': URL}}})
+        run('hook-node-control', p, [NODE, 'hook.cjs'])
+        (p / 'hook-ran.txt').unlink()
+        first = run('publish-hook', p, [BINARY, 'publish', '--npm', '--dry-run', '--yes'], expect=None, timeout=25)
+        second = run('publish-hook-repeat', p, [BINARY, 'publish', '--npm', '--dry-run', '--yes'], expect=None, timeout=25)
+        run('publish-hook-disabled-control', p, [BINARY, 'publish', '--npm', '--dry-run', '--yes', '--ignore-scripts'])
+        check(first[0] == second[0] == 0, f'publish hook failed/timed out twice: {first[0]}, {second[0]}; direct Node and --ignore-scripts controls pass')
+        check((p / 'hook-ran.txt').read_text() == 'ok', 'prepack hook did not run')
+    scenario('publish-lifecycle-hook-and-controls', publish_hook)
 
 finally:
     registry.terminate()
