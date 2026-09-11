@@ -875,12 +875,16 @@ mod tests {
     #[test]
     fn write_file_atomic_creates_and_replaces_beyond_max_path() {
         let root = tempfile::tempdir().unwrap();
-        let mut parent = root.path().to_path_buf();
+        let root_text = root.path().to_str().unwrap();
+        let ordinary_root = root_text.strip_prefix(r"\\?\").unwrap_or(root_text);
+        let mut parent = std::path::PathBuf::from(ordinary_root);
         while parent.as_os_str().len() < 300 {
             parent.push("nested-directory-with-spaces ü");
         }
         fs::create_dir_all(&parent).unwrap();
         let path = parent.join(".lpm-object-integrity");
+        assert!(!path.to_str().unwrap().starts_with(r"\\?\"));
+        eprintln!("ordinary long path: {}", path.display());
 
         write_file_atomic(&path, b"first").unwrap();
         write_file_atomic(&path, b"replacement").unwrap();
