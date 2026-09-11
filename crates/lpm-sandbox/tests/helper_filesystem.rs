@@ -24,7 +24,63 @@
 use assert_cmd::Command;
 use std::fs;
 
-const TEST_APPCONTAINER_NAME: &str = "LpmSandboxHelperIntegrationTest";
+static NEXT_PROFILE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+#[test]
+fn node_can_resolve_project_paths_without_listing_or_reading_ancestors() {
+    let temporary = tempfile::tempdir().unwrap();
+    let project = temporary.path().join("project");
+    fs::create_dir(&project).unwrap();
+    fs::write(temporary.path().join("unrelated.txt"), "outside content").unwrap();
+    fs::write(
+        project.join("hook.cjs"),
+        r#"
+const fs = require('node:fs');
+const path = require('node:path');
+const assert = require('node:assert/strict');
+assert.equal(fs.realpathSync(__filename), __filename);
+const parent = path.dirname(__dirname);
+for (const operation of [
+    () => fs.readdirSync(parent),
+    () => fs.readFileSync(path.join(parent, 'unrelated.txt')),
+]) {
+    assert.throws(operation, error => ['EACCES', 'EPERM'].includes(error.code));
+}
+console.log('ancestor boundaries verified');
+"#,
+    )
+    .unwrap();
+    let node = std::process::Command::new("node")
+        .args(["-p", "process.execPath"])
+        .output()
+        .expect("Node must be installed for the native filesystem gate");
+    assert!(node.status.success(), "{node:?}");
+    let node = std::path::PathBuf::from(String::from_utf8(node.stdout).unwrap().trim());
+    let mut argv = helper_argv_base();
+    argv.extend([
+        "--env-clear".into(),
+        "--env".into(),
+        format!("SystemRoot={}", std::env::var("SystemRoot").unwrap()),
+        "--env".into(),
+        format!("LOCALAPPDATA={}", project.display()),
+        "--working-dir".into(),
+        project.display().to_string(),
+        "--writable-dir".into(),
+        project.display().to_string(),
+        "--readable-dir".into(),
+        node.parent().unwrap().display().to_string(),
+        "--".into(),
+        node.display().to_string(),
+        "hook.cjs".into(),
+    ]);
+    let output = Command::cargo_bin("lpm-sandbox-helper")
+        .unwrap()
+        .args(argv)
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    assert!(String::from_utf8_lossy(&output.stdout).contains("ancestor boundaries verified"));
+}
 
 #[test]
 fn helper_preserves_an_extended_drive_working_directory() {
@@ -67,7 +123,11 @@ fn helper_argv_base() -> Vec<String> {
         "--protocol-version".into(),
         "2".into(),
         "--appcontainer-name".into(),
-        TEST_APPCONTAINER_NAME.into(),
+        format!(
+            "LpmFilesystemTest-{}-{}",
+            std::process::id(),
+            NEXT_PROFILE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ),
         "--stdio-stdin".into(),
         "null".into(),
         "--stdio-stdout".into(),

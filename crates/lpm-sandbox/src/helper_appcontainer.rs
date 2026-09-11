@@ -92,6 +92,9 @@ use windows_sys::Win32::System::Threading::{
 
 use crate::helper_protocol::{HelperArgs, StdioMode, split_env_entry};
 
+/// Explicit setup for Windows sandbox filesystem permissions.
+pub mod setup;
+
 /// `SE_GROUP_ENABLED` from winnt.h. The Attributes field of every
 /// `SID_AND_ATTRIBUTES` inside a `SECURITY_CAPABILITIES.Capabilities`
 /// array must carry this bit — otherwise the capability SID is
@@ -115,6 +118,20 @@ const PROFILE_CREATION_MUTEX_NAME: &str = r"Local\LpmSandboxAppContainerProfileC
 /// debugger.
 #[derive(Debug, thiserror::Error)]
 pub enum AppContainerError {
+    /// A required filesystem permission needs explicit administrator setup.
+    #[error(
+        "Windows sandbox permissions are missing for {path}. Preview them with `lpm doctor sandbox-setup`. Apply the preview from an administrator terminal for your normal Windows user, then retry publishing without elevation."
+    )]
+    SetupRequired {
+        /// Directory whose metadata is inaccessible to the sandbox.
+        path: PathBuf,
+    },
+    /// Explicit sandbox setup could not complete.
+    #[error("Windows sandbox setup failed: {reason}")]
+    Setup {
+        /// The failed setup operation and recovery information.
+        reason: String,
+    },
     /// `CreateMutexW` failed opening the cross-process profile creation lock.
     #[error("CreateMutexW(AppContainer profile creation) failed with Win32 error {last_error}")]
     CreateProfileMutex {
@@ -622,6 +639,8 @@ pub fn run_appcontainer_spawn(args: HelperArgs) -> Result<i32, AppContainerError
         }
     }
 
+    let prepared_access = setup::prepare(&args, &sid)?;
+
     // 2. Snapshot secret DACLs, then apply this invocation's allow-set.
     //    Secret policy lands last and the snapshots are restored after exit.
     //
@@ -643,6 +662,12 @@ pub fn run_appcontainer_spawn(args: HelperArgs) -> Result<i32, AppContainerError
     // downstream with a clearer "tool not found" error than a hard
     // sandbox-setup failure would give.
     for dir in &args.best_effort_readable_dirs {
+        if dir
+            .canonicalize()
+            .is_ok_and(|path| prepared_access.configured_tools.contains(&path))
+        {
+            continue;
+        }
         grant_dacl_ace_to_tree(
             dir,
             sid.0,
@@ -687,11 +712,20 @@ pub fn run_appcontainer_spawn(args: HelperArgs) -> Result<i32, AppContainerError
         CapabilityCount: 0,
         Reserved: 0,
     };
-    let mut caps_storage: [SID_AND_ATTRIBUTES; 1];
-    if let Some(attr) = internet_attrs {
-        caps_storage = [attr];
+    let mut caps_storage = Vec::with_capacity(prepared_access.capabilities.len() + 1);
+    caps_storage.extend(
+        prepared_access
+            .capabilities
+            .iter()
+            .map(|sid| SID_AND_ATTRIBUTES {
+                Sid: sid.raw(),
+                Attributes: SE_GROUP_ENABLED,
+            }),
+    );
+    caps_storage.extend(internet_attrs);
+    if !caps_storage.is_empty() {
         sec_caps.Capabilities = caps_storage.as_mut_ptr();
-        sec_caps.CapabilityCount = 1;
+        sec_caps.CapabilityCount = caps_storage.len() as u32;
     }
 
     // 4. Allocate the attribute list and attach SECURITY_CAPABILITIES.
@@ -820,6 +854,8 @@ pub fn run_appcontainer_spawn(args: HelperArgs) -> Result<i32, AppContainerError
         let last = unsafe { GetLastError() };
         return Err(AppContainerError::ExitCode { last_error: last });
     }
+    // Descendants must stop before secret permissions are restored.
+    drop(job);
     for restore in secret_dacl_restores.iter_mut().rev() {
         restore.restore()?;
     }
@@ -1261,6 +1297,38 @@ fn protect_secret_path_from_appcontainer(path: &Path, sid: PSID) -> Result<(), A
 
     let mut filtered_dacl = dacl_without_allowed_aces_for_sid(path, old_dacl, sid)?;
 
+    let entry = EXPLICIT_ACCESS_W {
+        grfAccessPermissions: FILE_GENERIC_READ | FILE_GENERIC_EXECUTE,
+        grfAccessMode: windows_sys::Win32::Security::Authorization::DENY_ACCESS,
+        grfInheritance: 0,
+        Trustee: TRUSTEE_W {
+            pMultipleTrustee: ptr::null_mut(),
+            MultipleTrusteeOperation: NO_MULTIPLE_TRUSTEE,
+            TrusteeForm: TRUSTEE_IS_SID,
+            TrusteeType: TRUSTEE_IS_GROUP,
+            ptstrName: sid.cast(),
+        },
+    };
+    let mut denied_dacl = ptr::null_mut();
+    // A tool capability can also grant reads. Deny the invocation SID so
+    // approved tool access cannot bypass the current project's secret policy.
+    // SAFETY: the filtered ACL and SID remain valid through the merge.
+    let merged = unsafe {
+        SetEntriesInAclW(
+            1,
+            &entry,
+            filtered_dacl.as_mut_ptr().cast(),
+            &mut denied_dacl,
+        )
+    };
+    if merged != ERROR_SUCCESS {
+        return Err(AppContainerError::MergeDacl {
+            path: path.to_path_buf(),
+            win32_error: merged,
+        });
+    }
+    let _denied_dacl = LocalAllocGuard(denied_dacl.cast());
+
     // SAFETY: the filtered ACL is initialized, valid, and lives through the call.
     let err = unsafe {
         SetNamedSecurityInfoW(
@@ -1269,7 +1337,7 @@ fn protect_secret_path_from_appcontainer(path: &Path, sid: PSID) -> Result<(), A
             DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
             ptr::null_mut(),
             ptr::null_mut(),
-            filtered_dacl.as_mut_ptr() as *mut ACL,
+            denied_dacl,
             ptr::null(),
         )
     };
@@ -1360,120 +1428,7 @@ fn set_dacl_ace_on(
     access_mask: u32,
     inheritance: u32,
 ) -> Result<(), AppContainerError> {
-    let wide_path = to_wide_with_nul(path.as_os_str());
-
-    // SAFETY: the terminated path lives through the call; no handle is inherited.
-    let handle = unsafe {
-        CreateFileW(
-            wide_path.as_ptr(),
-            windows_sys::Win32::Storage::FileSystem::READ_CONTROL
-                | windows_sys::Win32::Storage::FileSystem::WRITE_DAC,
-            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-            ptr::null(),
-            OPEN_EXISTING,
-            FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
-            ptr::null_mut(),
-        )
-    };
-    if handle == INVALID_HANDLE_VALUE {
-        return Err(AppContainerError::ReadDacl {
-            path: path.to_path_buf(),
-            // SAFETY: read immediately after the failed call.
-            win32_error: unsafe { GetLastError() },
-        });
-    }
-    let handle = HandleGuard(handle);
-
-    // Build the EXPLICIT_ACCESS_W carrying the new ACE.
-    let mut trustee = TRUSTEE_W {
-        pMultipleTrustee: ptr::null_mut(),
-        MultipleTrusteeOperation: NO_MULTIPLE_TRUSTEE,
-        TrusteeForm: TRUSTEE_IS_SID,
-        TrusteeType: TRUSTEE_IS_GROUP,
-        // When TrusteeForm == TRUSTEE_IS_SID, the SDK contract is
-        // that `ptstrName` holds the SID pointer (cast). Documented
-        // pattern.
-        ptstrName: sid as *mut u16,
-    };
-    let ea = EXPLICIT_ACCESS_W {
-        grfAccessPermissions: access_mask,
-        grfAccessMode: SET_ACCESS,
-        grfInheritance: inheritance,
-        Trustee: trustee,
-    };
-    // Silence the unused-write lint — Trustee is read by the
-    // closure via `ea.Trustee` reference.
-    let _ = &mut trustee;
-
-    // Read the current DACL so we can merge instead of replace.
-    let mut old_dacl: *mut ACL = ptr::null_mut();
-    let mut sd: PSECURITY_DESCRIPTOR = ptr::null_mut();
-    // SAFETY: wide_path Vec<u16> outlives the call; out params are
-    // freshly initialized.
-    let err = unsafe {
-        GetSecurityInfo(
-            handle.as_raw(),
-            SE_FILE_OBJECT,
-            DACL_SECURITY_INFORMATION,
-            ptr::null_mut(),
-            ptr::null_mut(),
-            &mut old_dacl,
-            ptr::null_mut(),
-            &mut sd,
-        )
-    };
-    if err != ERROR_SUCCESS {
-        return Err(AppContainerError::ReadDacl {
-            path: path.to_path_buf(),
-            win32_error: err,
-        });
-    }
-    let _sd_guard = LocalAllocGuard(sd as *mut _);
-
-    // Merge into a new DACL.
-    let mut new_dacl: *mut ACL = ptr::null_mut();
-    // SAFETY: `ea` is a valid EXPLICIT_ACCESS_W on this stack
-    // frame; `old_dacl` is owned by `_sd_guard`; `new_dacl` out
-    // param is freshly null.
-    let err = unsafe { SetEntriesInAclW(1, &ea, old_dacl, &mut new_dacl) };
-    if err != ERROR_SUCCESS {
-        return Err(AppContainerError::MergeDacl {
-            path: path.to_path_buf(),
-            win32_error: err,
-        });
-    }
-    let _new_dacl_guard = LocalAllocGuard(new_dacl as *mut _);
-
-    let mut descriptor = windows_sys::Win32::Security::SECURITY_DESCRIPTOR::default();
-    // SetKernelObjectSecurity changes only this entry. SetSecurityInfo propagates
-    // to descendants, duplicating the explicit walker and following linked trees.
-    // SAFETY: the initialized descriptor borrows the valid merged ACL until the call returns.
-    let ok = unsafe {
-        let descriptor_ptr = ptr::addr_of_mut!(descriptor).cast();
-        if windows_sys::Win32::Security::InitializeSecurityDescriptor(descriptor_ptr, 1) == 0
-            || windows_sys::Win32::Security::SetSecurityDescriptorDacl(
-                descriptor_ptr,
-                1,
-                new_dacl,
-                0,
-            ) == 0
-        {
-            0
-        } else {
-            windows_sys::Win32::Security::SetKernelObjectSecurity(
-                handle.as_raw(),
-                DACL_SECURITY_INFORMATION | UNPROTECTED_DACL_SECURITY_INFORMATION,
-                descriptor_ptr,
-            )
-        }
-    };
-    if ok == 0 {
-        return Err(AppContainerError::WriteDacl {
-            path: path.to_path_buf(),
-            win32_error: unsafe { GetLastError() },
-        });
-    }
-    Ok(())
+    setup::update_ace(path, sid, Some((access_mask, inheritance)))
 }
 
 fn is_reparse_point(metadata: &std::fs::Metadata) -> bool {

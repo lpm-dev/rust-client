@@ -49,14 +49,60 @@ jobs:
         run: |
           python -c 'import shutil; assert shutil.disk_usage(".").free >= 10*1024**3'
           cargo build --locked -p lpm-cli -p lpm-sandbox
+      - name: Standard-user setup and full publish
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force qa-results | Out-Null
+          ./scripts/ci/test-windows-sandbox-setup.ps1 2>&1 | Tee-Object -FilePath qa-results/standard-user-setup.log
+      - name: Windows setup JSON contracts
+        if: ${{ !cancelled() }}
+        shell: bash
+        run: |
+          python -c 'import shutil; assert shutil.disk_usage(".").free >= 10*1024**3'
+          cargo nextest run --locked -p lpm-workflows --test doctor_sandbox_setup --no-fail-fast
+      - name: Configure the runner Node installation explicitly
+        if: ${{ !cancelled() }}
+        shell: pwsh
+        run: target/debug/lpm-rs.exe doctor sandbox-setup --project . --tool-dir (Split-Path (Get-Command node).Source) --apply --yes --json
       - name: Windows process directory and source handle checks
         shell: bash
         run: |
           python -c 'import shutil; assert shutil.disk_usage(".").free >= 10*1024**3'
           cargo test --locked -p lpm-sandbox --test helper_filesystem
           python -c 'import shutil; assert shutil.disk_usage(".").free >= 10*1024**3'
+          cargo test --locked -p lpm-cli --bin lpm-rs directory_transaction
+      - name: Install disposable registry
+        if: ${{ !cancelled() }}
+        shell: bash
+        run: npm install --prefix qa-tools --no-audit --no-fund verdaccio@6.5.2
+      - name: Native consumer retest
+        if: ${{ !cancelled() }}
+        shell: bash
+        run: |
+          binary=target/debug/lpm-rs
+          if [ -f "$binary.exe" ]; then binary="$binary.exe"; fi
+          python qa-native.py --binary "$binary" --output qa-results/consumer --verdaccio qa-tools/node_modules/verdaccio/bin/verdaccio
+      - name: Long workspace retest
+        if: ${{ !cancelled() }}
+        shell: bash
+        run: |
+          binary=target/debug/lpm-rs
+          if [ -f "$binary.exe" ]; then binary="$binary.exe"; fi
+          python qa-workspace.py --binary "$binary" --output qa-results/long-workspace
+      - name: Native common, global, and sandbox regressions
+        if: ${{ !cancelled() }}
+        shell: bash
+        run: |
           mkdir -p qa-results
-          cargo test --locked -p lpm-cli --bin lpm-rs directory_transaction 2>&1 | tee qa-results/directory-transaction.log
+          python -c 'import shutil; assert shutil.disk_usage(".").free >= 10*1024**3'
+          cargo nextest run --locked -P native-retest -p lpm-common -p lpm-global -p lpm-sandbox --no-fail-fast --status-level slow --final-status-level fail 2>&1 | tee qa-results/crates.log
+          exit "${PIPESTATUS[0]}"
+      - name: Source, metadata, concurrency and publish regressions
+        if: ${{ !cancelled() }}
+        shell: bash
+        run: |
+          python -c 'import shutil; assert shutil.disk_usage(".").free >= 10*1024**3'
+          cargo nextest run --locked -P native-retest -p lpm-workflows --test install --test add --test install_concurrency --test publish -E 'test(source_add_and_remove_use_in_project_paths_on_native_platforms) | test(install_refreshes_custom_metadata_when_requested_version_was_published_after_cache) | test(install_refreshes_a_newly_published_version) | test(missing_version_refresh_is_bounded_and_preserves_the_installed_project) | test(metadata_refresh_does_not_bypass_revoked_custom_registry_access) | test(failed_metadata_refresh_keeps_optional_dependencies_optional) | test(global_alias_without_a_collision_runs_and_is_removed_with_its_package) | test(publish_lifecycle_does_not_receive_ambient_secrets) | test(two_concurrent_global_installs_serialize_via_global_tx_lock) | test(publish_dry_run_executes_publish_lifecycle_scripts_in_npm_order)' --no-fail-fast --status-level all --final-status-level all 2>&1 | tee qa-results/workflows.log
           exit "${PIPESTATUS[0]}"
       - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f
         if: always()

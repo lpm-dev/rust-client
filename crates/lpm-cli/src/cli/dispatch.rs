@@ -1987,6 +1987,9 @@ async fn async_main() -> Result<()> {
             .await
         }
         Commands::Doctor(args) => match args.action {
+            Some(DoctorAction::SandboxSetup { project, metadata_dirs, tool_dirs, user_sid, apply, remove }) => {
+                commands::doctor::sandbox_setup(project.as_deref(), &metadata_dirs, &tool_dirs, user_sid.as_deref(), apply, remove, args.yes, cli.json)
+            }
             Some(DoctorAction::List { code, category }) => {
                 commands::doctor::list(cli.json, code.as_deref(), category.as_deref())
             }

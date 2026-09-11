@@ -46,6 +46,13 @@ jobs:
       - name: Build Windows CLI
         run: cargo build --locked -p lpm-cli -p lpm-sandbox
 
+      - name: Windows standard-user sandbox setup and publish
+        shell: pwsh
+        run: ./scripts/ci/test-windows-sandbox-setup.ps1
+
+      - name: Windows sandbox setup CLI contracts
+        run: cargo nextest run --locked -p lpm-workflows --test doctor_sandbox_setup --no-fail-fast
+
       - name: Windows filesystem crate tests
         run: >-
           cargo nextest run --locked
