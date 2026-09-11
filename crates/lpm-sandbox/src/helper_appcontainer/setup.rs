@@ -973,6 +973,61 @@ mod tests {
     }
 
     #[test]
+    fn preview_refuses_a_tool_beneath_a_junction_ancestor() {
+        let temporary = tempfile::tempdir().unwrap();
+        let outside = temporary.path().join("outside");
+        std::fs::create_dir_all(outside.join("tool")).unwrap();
+        let link = temporary.path().join("redirect");
+        let output = std::process::Command::new("cmd.exe")
+            .args(["/d", "/c", "mklink", "/J"])
+            .arg(&link).arg(&outside).output().unwrap();
+        assert!(output.status.success(), "{output:?}");
+        assert!(grant_for(&link.join("tool"), Permission::ToolReadExecute, &current_user_sid().unwrap()).is_err(),
+            "preview must not turn a junction path into approval of its target");
+    }
+
+    #[test]
+    fn tool_permission_walk_covers_multiple_directory_batches_and_restarts_on_removal() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().join("tool");
+        let nested = root.join("bin").join("Unicode tools λ");
+        std::fs::create_dir_all(&nested).unwrap();
+        let paths: Vec<_> = (0..700)
+            .map(|index| root.join(format!("tool-{index:04}-with-a-long-name.exe")))
+            .chain([nested.join("工具.exe")])
+            .collect();
+        for path in &paths {
+            std::fs::write(path, "tool").unwrap();
+        }
+        let entry = grant_for(
+            &root,
+            Permission::ToolReadExecute,
+            &current_user_sid().unwrap(),
+        )
+        .unwrap();
+        let sid = capability_sid(&entry.capability_name).unwrap();
+        let (_parents, target) = pin_grant(&entry).unwrap();
+        for configured in [true, false] {
+            walk::children(
+                &target,
+                &entry.path,
+                sid.raw(),
+                configured.then_some((TOOL_ACCESS, 0)),
+            )
+            .unwrap();
+            for path in &paths {
+                let (file, _) = open_permissions(path, false).unwrap();
+                assert_eq!(
+                    has_grant(&file, path, sid.raw(), TOOL_ACCESS, 0).unwrap(),
+                    configured,
+                    "{}",
+                    path.display()
+                );
+            }
+        }
+    }
+
+    #[test]
     fn setup_does_not_grant_outside_files_after_in_place_junction_conversion() {
         let temporary = tempfile::tempdir().unwrap();
         let root = temporary.path().join("tool");
