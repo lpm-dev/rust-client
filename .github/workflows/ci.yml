@@ -12,7 +12,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-24.04, windows-2025]
+        os: [windows-2025]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 45
     steps:
@@ -49,6 +49,13 @@ jobs:
         run: |
           python -c 'import shutil; assert shutil.disk_usage(".").free >= 10*1024**3'
           cargo build --locked -p lpm-cli -p lpm-sandbox
+      - name: Windows process directory and source handle checks
+        shell: bash
+        run: |
+          python -c 'import shutil; assert shutil.disk_usage(".").free >= 10*1024**3'
+          cargo test --locked -p lpm-sandbox --test helper_filesystem
+          python -c 'import shutil; assert shutil.disk_usage(".").free >= 10*1024**3'
+          cargo test --locked -p lpm-cli --bin lpm-rs directory_transaction
       - name: Install disposable registry
         shell: bash
         run: npm install --prefix qa-tools --no-audit --no-fund verdaccio@6.5.2

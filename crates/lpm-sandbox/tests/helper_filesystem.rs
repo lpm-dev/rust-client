@@ -26,6 +26,42 @@ use std::fs;
 
 const TEST_APPCONTAINER_NAME: &str = "LpmSandboxHelperIntegrationTest";
 
+#[test]
+fn helper_preserves_an_extended_drive_working_directory() {
+    let temporary = tempfile::tempdir().unwrap();
+    let directory = temporary.path().canonicalize().unwrap();
+    let system = std::env::var("SystemRoot").unwrap();
+    let mut argv = helper_argv_base();
+    argv.extend([
+        "--env-clear".into(),
+        "--env".into(),
+        format!("SystemRoot={system}"),
+        "--env".into(),
+        format!("LOCALAPPDATA={}", directory.display()),
+        "--working-dir".into(),
+        directory.display().to_string(),
+        "--writable-dir".into(),
+        directory.display().to_string(),
+        "--".into(),
+        format!(r"{system}\System32\cmd.exe"),
+        "/d".into(),
+        "/c".into(),
+        "echo working-directory>created.txt".into(),
+    ]);
+    let output = Command::cargo_bin("lpm-sandbox-helper")
+        .unwrap()
+        .args(argv)
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(
+        fs::read_to_string(directory.join("created.txt"))
+            .unwrap()
+            .trim(),
+        "working-directory"
+    );
+}
+
 fn helper_argv_base() -> Vec<String> {
     vec![
         "--protocol-version".into(),

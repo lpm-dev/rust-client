@@ -237,6 +237,11 @@ pub enum AppContainerError {
         /// `GetLastError` reading.
         last_error: u32,
     },
+    #[error("cannot use working directory {path:?}: {source}")]
+    WorkingDirectory {
+        path: PathBuf,
+        source: std::io::Error,
+    },
     /// `AssignProcessToJobObject` failed (the lifecycle child is
     /// still suspended at this point, so we'll terminate it via the
     /// process-info handle in the error path).
@@ -715,7 +720,9 @@ pub fn run_appcontainer_spawn(args: HelperArgs) -> Result<i32, AppContainerError
     let working_dir_wide = args
         .working_dir
         .as_ref()
-        .map(|p| to_wide_with_nul(p.as_os_str()));
+        .map(|path| process_working_directory(path, &args.program))
+        .transpose()?
+        .map(|path| to_wide_with_nul(path.as_os_str()));
 
     // 8. Build STARTUPINFOEXW with the attribute list + stdio handles.
     //    The base StartupInfo is the inner field; the EX wrapper
@@ -1796,6 +1803,47 @@ fn build_environment_block(envs: &[OsString], env_clear: bool) -> Vec<u16> {
 
 // ── Wide-string helpers ──────────────────────────────────────────────
 
+fn process_working_directory(path: &Path, program: &OsStr) -> Result<PathBuf, AppContainerError> {
+    use std::os::windows::ffi::OsStringExt as _;
+    use std::path::{Component, Prefix};
+
+    let is_cmd = Path::new(program)
+        .file_name()
+        .and_then(OsStr::to_str)
+        .is_some_and(|name| {
+            name.eq_ignore_ascii_case("cmd.exe") || name.eq_ignore_ascii_case("cmd")
+        });
+    if !is_cmd {
+        return Ok(path.to_path_buf());
+    }
+    let Some(Component::Prefix(prefix)) = path.components().next() else {
+        return Ok(path.to_path_buf());
+    };
+    let failure = |source| AppContainerError::WorkingDirectory {
+        path: path.to_path_buf(),
+        source,
+    };
+    match prefix.kind() {
+        Prefix::Disk(_) => Ok(path.to_path_buf()),
+        Prefix::VerbatimDisk(_) => {
+            // CMD mistakes the extended drive prefix for UNC and changes to C:\Windows.
+            // Verify equivalence so stripping it cannot redirect trailing-dot or reserved paths.
+            let wide = path.as_os_str().encode_wide().collect::<Vec<_>>();
+            let ordinary = PathBuf::from(OsString::from_wide(&wide[4..]));
+            if ordinary.canonicalize().map_err(failure)? != path.canonicalize().map_err(failure)? {
+                return Err(failure(std::io::Error::other(
+                    "CMD cannot represent this directory without changing its meaning",
+                )));
+            }
+            Ok(ordinary)
+        }
+        _ => Err(failure(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "CMD requires a local drive working directory; use a local project directory",
+        ))),
+    }
+}
+
 fn str_to_wide_with_nul(s: &str) -> Vec<u16> {
     let mut v: Vec<u16> = s.encode_utf16().collect();
     v.push(0);
@@ -1814,6 +1862,25 @@ fn to_wide_with_nul(s: &OsStr) -> Vec<u16> {
 mod tests {
     use super::*;
     use windows_sys::Win32::Security::GetLengthSid;
+
+    #[test]
+    fn cmd_working_directory_rejects_paths_that_change_when_the_prefix_is_removed() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().canonicalize().unwrap();
+        let ordinary = root.join("project");
+        let extended_only = root.join("project.");
+        std::fs::create_dir(&ordinary).unwrap();
+        std::fs::create_dir(&extended_only).unwrap();
+        assert!(process_working_directory(&extended_only, OsStr::new("cmd.exe")).is_err());
+        assert_eq!(
+            process_working_directory(&extended_only, OsStr::new("node.exe")).unwrap(),
+            extended_only
+        );
+        assert!(
+            process_working_directory(Path::new(r"\\server\share\project"), OsStr::new("CMD.EXE"))
+                .is_err()
+        );
+    }
 
     #[test]
     fn quote_arg_for_cmdline_passes_simple_args_unmodified() {
