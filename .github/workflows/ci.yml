@@ -37,7 +37,7 @@ jobs:
           python -c 'import shutil; assert shutil.disk_usage(".").free >= 10*1024**3'
           cargo build --locked -p lpm-sandbox --bins --example qa_setup
           cargo test --locked -p lpm-sandbox --lib helper_appcontainer::setup -- --nocapture
-          cargo test --locked -p lpm-sandbox --test helper_filesystem -- --nocapture --bins --example qa_setup
+          cargo test --locked -p lpm-sandbox --test helper_filesystem -- --nocapture
           cargo test --locked -p lpm-sandbox --test helper_filesystem -- --nocapture
       - name: Cleared environment controls
         shell: pwsh

@@ -367,12 +367,21 @@ pub fn preview(
     tools: &[PathBuf],
     user_sid: Option<&str>,
 ) -> Result<Plan, AppContainerError> {
+    preview_paths(&[project.to_path_buf()], tools, user_sid)
+}
+
+/// Preview metadata ancestors for multiple roots, plus explicit readable tool trees.
+pub fn preview_paths(
+    metadata_roots: &[PathBuf],
+    tools: &[PathBuf],
+    user_sid: Option<&str>,
+) -> Result<Plan, AppContainerError> {
     let user_sid = match user_sid {
         Some(value) => normalize_user_sid(value)?,
         None => current_user_sid()?,
     };
     let mut paths = BTreeMap::new();
-    let roots = std::iter::once(project.to_path_buf()).chain(tools.iter().cloned());
+    let roots = metadata_roots.iter().chain(tools).cloned();
     for root in roots {
         let root = grant_for(&root, Permission::Metadata, &user_sid)?.path;
         for parent in root.ancestors().skip(1) {
