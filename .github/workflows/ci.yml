@@ -55,4 +55,6 @@ jobs:
         if: always()
         with:
           name: native-regression-baseline
-          path: qa-results
+          path: |
+            qa-results
+            C:\lpm-sandbox-qa.log

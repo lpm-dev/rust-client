@@ -601,7 +601,7 @@ impl Drop for AttrListGuard {
 pub fn run_appcontainer_spawn(args: HelperArgs) -> Result<i32, AppContainerError> {
     // 1. Derive (or create) the AppContainer SID. Production supplies
     //    a per-invocation name; integration tests can reuse a named profile.
-    eprintln!("QA sandbox: start");
+    qa_trace(format_args!("QA sandbox: start"));
     let sid = create_or_reuse_appcontainer_sid(&args.appcontainer_name)?;
     let mut profile_cleanup =
         AppContainerProfileCleanup::new(&args.appcontainer_name, args.delete_appcontainer_profile);
@@ -633,7 +633,7 @@ pub fn run_appcontainer_spawn(args: HelperArgs) -> Result<i32, AppContainerError
     // downstream with a clearer "tool not found" error than a hard
     // sandbox-setup failure would give.
     for dir in &args.best_effort_readable_dirs {
-        eprintln!("QA tool grant start: {}", dir.display());
+        qa_trace(format_args!("QA tool grant start: {}", dir.display()));
         let qa_started = std::time::Instant::now();
         grant_dacl_ace_to_tree(
             dir,
@@ -641,11 +641,11 @@ pub fn run_appcontainer_spawn(args: HelperArgs) -> Result<i32, AppContainerError
             FILE_GENERIC_READ | FILE_GENERIC_EXECUTE,
             /* strict_root */ false,
         )?;
-        eprintln!("QA tool grant done: {:?}", qa_started.elapsed());
+        qa_trace(format_args!("QA tool grant done: {:?}", qa_started.elapsed()));
     }
-    eprintln!("QA tools complete");
+    qa_trace(format_args!("QA tools complete"));
     for dir in &args.readable_dirs {
-        eprintln!("QA readable grant start: {}", dir.display());
+        qa_trace(format_args!("QA readable grant start: {}", dir.display()));
         grant_dacl_ace_to_tree(
             dir,
             sid.0,
@@ -653,9 +653,9 @@ pub fn run_appcontainer_spawn(args: HelperArgs) -> Result<i32, AppContainerError
             /* strict_root */ true,
         )?;
     }
-    eprintln!("QA reads complete");
+    qa_trace(format_args!("QA reads complete"));
     for dir in &args.writable_dirs {
-        eprintln!("QA writable grant start: {}", dir.display());
+        qa_trace(format_args!("QA writable grant start: {}", dir.display()));
         grant_dacl_ace_to_tree(
             dir,
             sid.0,
@@ -663,7 +663,7 @@ pub fn run_appcontainer_spawn(args: HelperArgs) -> Result<i32, AppContainerError
             /* strict_root */ true,
         )?;
     }
-    eprintln!("QA writes complete");
+    qa_trace(format_args!("QA writes complete"));
     for path in &args.secret_read_denied_paths {
         protect_secret_path_from_appcontainer(path, sid.0)?;
     }
@@ -745,7 +745,7 @@ pub fn run_appcontainer_spawn(args: HelperArgs) -> Result<i32, AppContainerError
     // `Vec<u16>` in this stack frame; startup is a stack local
     // with a valid attribute list; pi is a freshly-zeroed out
     // param.
-    eprintln!("QA creating child");
+    qa_trace(format_args!("QA creating child"));
     let ok = unsafe {
         CreateProcessW(
             // lpApplicationName = NULL — see comment at
@@ -2029,5 +2029,12 @@ mod tests {
             best_effort_result.is_ok(),
             "strict_root=false must downgrade reparse-point refusal to WARN+continue; got {best_effort_result:?}",
         );
+    }
+}
+
+fn qa_trace(message: std::fmt::Arguments<'_>) {
+    use std::io::Write;
+    if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(r"C:\lpm-sandbox-qa.log") {
+        let _ = writeln!(file, "{message}");
     }
 }
