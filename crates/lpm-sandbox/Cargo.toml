@@ -90,6 +90,8 @@ libc = "0.2"
 # so it can use the documented `ResumeThread` API.
 [target.'cfg(target_os = "windows")'.dependencies]
 rayon = { workspace = true }
+serde = { workspace = true }
+sha2 = { workspace = true }
 windows-sys = { version = "0.60", features = [
     "Win32_Foundation",
     "Win32_Security",

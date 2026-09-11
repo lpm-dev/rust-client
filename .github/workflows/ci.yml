@@ -27,6 +27,7 @@ jobs:
             ~/.cargo/git
             target
           key: Windows-sandbox-only-1940-${{ hashFiles('Cargo.lock') }}
+          restore-keys: Windows-sandbox-only-1940-
       - uses: taiki-e/install-action@9c6953334daacc48e55a35db9a19c771f79ffa9d
         with:
           tool: nextest
@@ -34,7 +35,9 @@ jobs:
         shell: bash
         run: |
           python -c 'import shutil; assert shutil.disk_usage(".").free >= 10*1024**3'
-          cargo build --locked -p lpm-sandbox
+          cargo build --locked -p lpm-sandbox --bins --example qa_setup
+          cargo test --locked -p lpm-sandbox --lib helper_appcontainer::setup -- --nocapture
+          cargo test --locked -p lpm-sandbox --test helper_filesystem -- --nocapture
       - name: Cleared environment controls
         shell: pwsh
         run: ./qa-env.ps1 2>&1 | Tee-Object -FilePath qa-environment.log

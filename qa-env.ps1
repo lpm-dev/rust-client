@@ -1,88 +1,91 @@
 $ErrorActionPreference = 'Stop'
-Add-Type @'
-using System;
-using System.Runtime.InteropServices;
-public class ContainerSid {
- [DllImport("userenv.dll", CharSet=CharSet.Unicode)] public static extern int DeriveAppContainerSidFromAppContainerName(string name, out IntPtr sid);
- [DllImport("kernel32.dll")] public static extern IntPtr LocalFree(IntPtr value);
- [DllImport("kernel32.dll", CharSet=CharSet.Unicode, SetLastError=true)] static extern IntPtr CreateFile(string path, uint access, uint share, IntPtr attributes, uint disposition, uint flags, IntPtr template);
- [DllImport("kernel32.dll")] static extern bool CloseHandle(IntPtr handle);
- [DllImport("advapi32.dll", SetLastError=true)] static extern bool SetKernelObjectSecurity(IntPtr handle, uint flags, byte[] descriptor);
- [DllImport("advapi32.dll", CharSet=CharSet.Unicode, SetLastError=true)] static extern bool LogonUser(string user, string domain, string password, uint type, uint provider, out IntPtr token);
- [DllImport("advapi32.dll", SetLastError=true)] static extern bool ImpersonateLoggedOnUser(IntPtr token);
- [DllImport("advapi32.dll")] static extern bool RevertToSelf();
- public static void SetAcl(string path, byte[] descriptor) {
-  IntPtr handle = CreateFile(path, 0x60000, 7, IntPtr.Zero, 3, 0x02200000, IntPtr.Zero);
-  if (handle == new IntPtr(-1)) throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error());
-  try { if (!SetKernelObjectSecurity(handle, 4, descriptor)) throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error()); }
-  finally { CloseHandle(handle); }
- }
- public static int StandardUserWriteDac(string user, string password, string path) {
-  IntPtr token;
-  if (!LogonUser(user, ".", password, 2, 0, out token)) throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error());
-  try {
-   if (!ImpersonateLoggedOnUser(token)) throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error());
-   try {
-    IntPtr handle = CreateFile(path, 0x60000, 7, IntPtr.Zero, 3, 0x02200000, IntPtr.Zero);
-    if (handle == new IntPtr(-1)) return Marshal.GetLastWin32Error();
-    CloseHandle(handle); return 0;
-   } finally { RevertToSelf(); }
-  } finally { CloseHandle(token); }
- }
-}
-'@
-$root = Join-Path $env:TEMP ('lpm-ancestor-qa-' + $PID)
-$project = Join-Path $root 'project'
-New-Item -ItemType Directory -Force $project | Out-Null
-Set-Content (Join-Path $root 'unrelated.txt') 'outside-content'
-$node = (Get-Command node).Source
-@'
-const fs = require('fs');
-console.log('REALPATH', fs.realpathSync(__filename));
-const parent = require('path').dirname(__dirname);
-for (const [name, operation] of [['LIST', () => fs.readdirSync(parent)], ['READ', () => fs.readFileSync(require('path').join(parent, 'unrelated.txt'))]]) {
- try { operation(); throw new Error(name + ' unexpectedly allowed'); }
- catch (error) { if (!['EPERM','EACCES'].includes(error.code)) throw error; console.log(name, 'DENIED'); }
-}
-'@ | Set-Content (Join-Path $project 'hook.cjs')
-$name = 'LpmAncestorQA' + $PID
-$base = @('--protocol-version','2','--appcontainer-name',$name,'--env-clear','--stdio-stdin','null','--stdio-stdout','inherit','--stdio-stderr','inherit','--working-dir',$project,'--writable-dir',$project,'--readable-dir',(Split-Path $node))
-foreach ($key in @('SystemRoot','WINDIR','COMSPEC','PATH','TEMP','TMP')) { $base += @('--env',($key + '=' + [Environment]::GetEnvironmentVariable($key))) }
-$base += @('--env',('LOCALAPPDATA=' + $project))
-& target/debug/lpm-sandbox-helper.exe @base -- $node hook.cjs
-Write-Output ('BEFORE ' + $LASTEXITCODE)
-$pointer = [IntPtr]::Zero
-if ([ContainerSid]::DeriveAppContainerSidFromAppContainerName($name, [ref]$pointer) -ne 0) { throw 'SID failure' }
-$sid = [System.Security.Principal.SecurityIdentifier]::new($pointer)
-[ContainerSid]::LocalFree($pointer) | Out-Null
-$ancestors = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
-foreach ($entry in @($project, (Split-Path $node))) {
- $parent = [System.IO.Directory]::GetParent($entry)
- while ($parent) { [void]$ancestors.Add($parent.FullName); $parent = $parent.Parent }
-}
-$rule = [System.Security.AccessControl.FileSystemAccessRule]::new($sid, [System.Security.AccessControl.FileSystemRights]160, 'None', 'None', 'Allow')
-try {
- foreach ($path in $ancestors) {
-  $acl = Get-Acl $path
-  Write-Output ('ANCESTOR ' + $path + ' PROTECTED ' + $acl.AreAccessRulesProtected)
-  $acl.AddAccessRule($rule)
-  [ContainerSid]::SetAcl($path, $acl.GetSecurityDescriptorBinaryForm())
- }
- & target/debug/lpm-sandbox-helper.exe @base -- $node hook.cjs
- Write-Output ('AFTER ' + $LASTEXITCODE)
- if ($LASTEXITCODE -ne 0) { throw 'minimal metadata rights failed' }
-} finally {
- foreach ($path in $ancestors) {
-  $acl = Get-Acl $path
-  $acl.RemoveAccessRuleSpecific($rule)
-  [ContainerSid]::SetAcl($path, $acl.GetSecurityDescriptorBinaryForm())
- }
-}
-$user = 'LpmQA' + $PID
+$root = 'C:\LpmSetupQA-' + $PID
+$user = 'LpmSetup' + $PID
 $password = 'Lpm-QA!' + [Guid]::NewGuid().ToString('N')
+$credential = [PSCredential]::new("$env:COMPUTERNAME\$user", (ConvertTo-SecureString $password -AsPlainText -Force))
+$project = Join-Path $root 'project'
+$tool = Join-Path $root 'node-tool'
+$otherTool = Join-Path $root 'other-tool'
+$setup = Join-Path $root 'qa_setup.exe'
+$helper = Join-Path $root 'lpm-sandbox-helper.exe'
+$counter = 0
+function AsUser([string]$exe, [string[]]$arguments) {
+ $script:counter++
+ $stdout = Join-Path $root "stdout-$counter.txt"
+ $stderr = Join-Path $root "stderr-$counter.txt"
+ $quoted = ($arguments | ForEach-Object { '"' + $_.Replace('"','\"') + '"' }) -join ' '
+ $process = Start-Process -FilePath $exe -ArgumentList $quoted -Credential $credential -LoadUserProfile -WorkingDirectory $project -RedirectStandardOutput $stdout -RedirectStandardError $stderr -PassThru -Wait
+ $out = Get-Content -Raw $stdout -ErrorAction SilentlyContinue
+ $err = Get-Content -Raw $stderr -ErrorAction SilentlyContinue
+ Write-Output "USER EXIT $($process.ExitCode) $out $err" | Out-Host
+ return @{Code=$process.ExitCode; Out=$out; Err=$err}
+}
 try {
- New-LocalUser -Name $user -Password (ConvertTo-SecureString $password -AsPlainText -Force) | Out-Null
+ New-LocalUser -Name $user -Password $credential.Password | Out-Null
  Add-LocalGroupMember -Group Users -Member $user
- Write-Output ('STANDARD_USER_ROOT_WRITE_DAC ' + [ContainerSid]::StandardUserWriteDac($user, $password, 'C:\'))
-} finally { Remove-LocalUser -Name $user }
-exit 0
+ $sid = (Get-LocalUser $user).SID.Value
+ New-Item -ItemType Directory -Force $project,$tool,$otherTool | Out-Null
+ Copy-Item target/debug/examples/qa_setup.exe $setup
+ Copy-Item target/debug/lpm-sandbox-helper.exe $helper
+ Copy-Item (Get-Command node).Source (Join-Path $tool 'node.exe')
+ Set-Content (Join-Path $root 'unrelated.txt') 'outside-content'
+ Set-Content (Join-Path $otherTool 'private.txt') 'other-tool-content'
+ Set-Content (Join-Path $project '.env') 'FAKE_TEST_SECRET=blocked'
+ # The normal Windows account can read all fixture inputs; the AppContainer must not.
+ & icacls $root /grant ('*' + $sid + ':(OI)(CI)(RX)') | Out-Host
+ & icacls $project /grant ('*' + $sid + ':(OI)(CI)(F)') | Out-Host
+ @'
+const fs = require('node:fs');
+const path = require('node:path');
+const assert = require('node:assert/strict');
+assert.equal(fs.realpathSync(__filename), __filename);
+const parent = path.dirname(__dirname);
+for (const [name, operation] of [
+ ['LIST', () => fs.readdirSync(parent)],
+ ['OUTSIDE_READ', () => fs.readFileSync(path.join(parent, 'unrelated.txt'))],
+ ['OTHER_TOOL_READ', () => fs.readFileSync(path.join(parent, 'other-tool', 'private.txt'))],
+ ['SECRET', () => fs.readFileSync(path.join(__dirname, '.env'))],
+ ['WRITE_OUTSIDE', () => fs.writeFileSync(path.join(parent, 'outside-write.txt'), 'bad')],
+]) {
+ assert.throws(operation, error => ['EACCES','EPERM'].includes(error.code), name);
+ console.log(name, 'DENIED');
+}
+fs.writeFileSync('hook-complete.txt','success');
+console.log('HOOK_OK');
+'@ | Set-Content (Join-Path $project 'hook.cjs')
+ $preview = AsUser $setup @('preview',$project,'current',$tool)
+ if ($preview.Code -ne 0) { throw 'standard preview failed' }
+ $json = $preview.Out | ConvertFrom-Json
+ if ($json.elevated -or $json.plan.user_sid -ne $sid) { throw 'not running as the expected standard user' }
+ $refused = AsUser $setup @('apply',$project,'current',$tool)
+ if ($refused.Code -eq 0 -or $refused.Err -notmatch 'administrator terminal') { throw 'standard setup must be refused' }
+ $base = @('--protocol-version','2','--env-clear','--stdio-stdin','null','--stdio-stdout','inherit','--stdio-stderr','inherit','--working-dir',$project,'--writable-dir',$project,'--best-effort-readable-dir',$tool,'--secret-read-denied-path',(Join-Path $project '.env'),'--env',('SystemRoot=' + $env:SystemRoot),'--env',('LOCALAPPDATA=' + $project))
+ $before = AsUser $helper ($base + @('--appcontainer-name',('LpmBefore' + $PID),'--',(Join-Path $tool 'node.exe'),'hook.cjs'))
+ if ($before.Code -eq 0 -or $before.Err -notmatch 'sandbox-setup') { throw 'missing setup should be actionable' }
+ for ($iteration=0; $iteration -lt 2; $iteration++) {
+  $watch = [Diagnostics.Stopwatch]::StartNew()
+  & $setup apply $project $sid $tool
+  if ($LASTEXITCODE -ne 0) { throw 'administrator apply failed' }
+  Write-Output "SETUP_MS $($watch.ElapsedMilliseconds)"
+ }
+ # Another configured tool must not be included in this invocation's capabilities.
+ & $setup apply $project $sid $otherTool
+ if ($LASTEXITCODE -ne 0) { throw 'other tool setup failed' }
+ for ($iteration=0; $iteration -lt 3; $iteration++) {
+  $watch = [Diagnostics.Stopwatch]::StartNew()
+  $after = AsUser $helper ($base + @('--appcontainer-name',('LpmAfter' + $PID + $iteration),'--',(Join-Path $tool 'node.exe'),'hook.cjs'))
+  Write-Output "HOOK_MS $($watch.ElapsedMilliseconds)"
+  if ($after.Code -ne 0 -or $after.Out -notmatch 'HOOK_OK') { throw 'standard Node hook failed' }
+ }
+ if ((Get-Content (Join-Path $project '.env')) -ne 'FAKE_TEST_SECRET=blocked') { throw 'secret restoration failed' }
+ & $setup remove $project $sid $tool
+ if ($LASTEXITCODE -ne 0) { throw 'administrator remove failed' }
+ $removed = AsUser $helper ($base + @('--appcontainer-name',('LpmRemoved' + $PID),'--',(Join-Path $tool 'node.exe'),'hook.cjs'))
+ if ($removed.Code -eq 0 -or $removed.Err -notmatch 'sandbox-setup') { throw 'removed setup should be required again' }
+ Write-Output 'STANDARD_USER_SETUP_ALL_PASS'
+} finally {
+ if (Test-Path $setup) {
+  & $setup remove $project $sid $tool $otherTool
+ }
+ Remove-LocalUser -Name $user -ErrorAction SilentlyContinue
+}
