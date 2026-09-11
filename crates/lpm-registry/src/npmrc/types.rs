@@ -30,12 +30,20 @@ impl RegistryTarget {
     /// Build a target from a raw `.npmrc` URL value. Strips one trailing
     /// slash if present so downstream `format!("{base}/{name}")` produces
     /// `https://npm.example.com/react`, not `…//react`.
-    pub(super) fn from_npmrc_url(raw: &str) -> Self {
+    pub(super) fn from_npmrc_url(raw: &str) -> Result<Self, &'static str> {
+        let url = reqwest::Url::parse(raw)
+            .map_err(|_| "invalid registry URL: expected an HTTP(S) URL with a host")?;
+        if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none() {
+            return Err("invalid registry URL: expected an HTTP(S) URL with a host");
+        }
+        if !url.username().is_empty() || url.password().is_some() {
+            return Err(lpm_http::URL_CREDENTIALS_REFUSAL);
+        }
         let trimmed = raw.trim_end_matches('/');
-        Self {
+        Ok(Self {
             base_url: Arc::from(trimmed),
             kind: RegistryKind::NpmCompatible,
-        }
+        })
     }
 }
 

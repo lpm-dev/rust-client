@@ -3412,7 +3412,7 @@ impl RegistryClient {
             }};
         }
 
-        tracing::debug!("fetching {name} from custom registry {base_url}");
+        tracing::debug!(registry = %lpm_common::safe_url_origin(base_url), "fetching {name} from custom registry");
         let req = self
             .http
             .for_destination(&destination)

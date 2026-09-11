@@ -22,6 +22,9 @@ pub const DEFAULT_REDIRECT_LIMIT: usize = 10;
 /// Stable user-facing error for a redirect that would weaken transport security.
 pub const HTTPS_DOWNGRADE_REFUSAL: &str = "refused HTTPS-to-HTTP redirect";
 
+/// URL userinfo must not bypass explicitly scoped registry authentication.
+pub const URL_CREDENTIALS_REFUSAL: &str = "credentials in registry URLs are not supported; remove the username and password from the URL and use registry-scoped .npmrc authentication";
+
 /// A streaming HTTP request body that can be reconstructed for retries.
 #[derive(Debug)]
 pub struct ReplayableRequestBody {
@@ -303,6 +306,8 @@ pub enum ReplayableRequestError<E> {
     CleartextNonLoopback,
     UnsupportedRedirectScheme,
     CrossOriginBodyReplay,
+    OutOfScopeBodyReplay,
+    UrlCredentials,
 }
 
 impl<E> ReplayableRequestError<E> {
@@ -329,6 +334,10 @@ impl<E: fmt::Display> fmt::Display for ReplayableRequestError<E> {
             }
             Self::CrossOriginBodyReplay => formatter
                 .write_str("refused cross-origin redirect that would replay a request body"),
+            Self::OutOfScopeBodyReplay => formatter.write_str(
+                "refused redirect outside the registry path that would replay a request body",
+            ),
+            Self::UrlCredentials => formatter.write_str(URL_CREDENTIALS_REFUSAL),
         }
     }
 }
@@ -347,7 +356,9 @@ where
             | Self::HttpsDowngrade
             | Self::CleartextNonLoopback
             | Self::UnsupportedRedirectScheme
-            | Self::CrossOriginBodyReplay => None,
+            | Self::CrossOriginBodyReplay
+            | Self::OutOfScopeBodyReplay
+            | Self::UrlCredentials => None,
         }
     }
 }
@@ -365,7 +376,7 @@ where
         .await
 }
 
-/// Execute a replay-safe request and re-check Authorization scope at every redirect hop.
+/// Re-check credential and request-body scope at every redirect hop.
 pub async fn send_with_replayable_redirects_and_authorization_scope<P>(
     provider: &P,
     request: reqwest::Request,
@@ -469,14 +480,18 @@ where
                 RedirectTargetError::UnsupportedScheme => {
                     ReplayableRequestError::UnsupportedRedirectScheme
                 }
+                RedirectTargetError::UrlCredentials => ReplayableRequestError::UrlCredentials,
             });
         }
         let next_is_same_origin = same_origin(&url, &next_url);
         if next_has_body && !next_is_same_origin {
             return Err(ReplayableRequestError::CrossOriginBodyReplay);
         }
-        if !next_is_same_origin || authorization_allowed.is_some_and(|allowed| !allowed(&next_url))
-        {
+        let outside_scope = authorization_allowed.is_some_and(|allowed| !allowed(&next_url));
+        if next_has_body && outside_scope {
+            return Err(ReplayableRequestError::OutOfScopeBodyReplay);
+        }
+        if !next_is_same_origin || outside_scope {
             remove_cross_origin_credentials(&mut headers);
         }
         if !next_has_body {
@@ -497,6 +512,7 @@ enum RedirectTargetError {
     HttpsDowngrade,
     CleartextNonLoopback,
     UnsupportedScheme,
+    UrlCredentials,
 }
 
 fn validate_redirect_target(
@@ -508,6 +524,9 @@ fn validate_redirect_target(
     }
     if chain_used_https && next_url.scheme() == "http" {
         return Err(RedirectTargetError::HttpsDowngrade);
+    }
+    if !next_url.username().is_empty() || next_url.password().is_some() {
+        return Err(RedirectTargetError::UrlCredentials);
     }
     if next_url.scheme() == "http" && !url_host_is_loopback(next_url) {
         return Err(RedirectTargetError::CleartextNonLoopback);
@@ -1411,6 +1430,18 @@ mod tests {
             validate_redirect_target(false, &target),
             Err(RedirectTargetError::UnsupportedScheme)
         );
+    }
+
+    #[test]
+    fn redirect_target_validation_refuses_all_nonempty_userinfo() {
+        for userinfo in ["user", "user:password", ":password", "user:p%40ssword"] {
+            let target =
+                reqwest::Url::parse(&format!("https://{userinfo}@example.test/a")).unwrap();
+            assert_eq!(
+                validate_redirect_target(true, &target),
+                Err(RedirectTargetError::UrlCredentials)
+            );
+        }
     }
 
     #[test]

@@ -352,7 +352,7 @@ async fn empty_bearer_never_appears_on_the_wire() {
 }
 
 #[tokio::test]
-async fn anonymous_health_probe_does_not_forward_url_userinfo_as_basic_auth() {
+async fn anonymous_health_probe_refuses_url_userinfo_before_network_access() {
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -367,12 +367,10 @@ async fn anonymous_health_probe_does_not_forward_url_userinfo_as_basic_auth() {
         .replacen("://", "://doctor-user:doctor-secret@", 1);
     let client = RegistryClient::new().with_base_url(credentialed);
 
-    assert!(client.diagnostic_health_check_once().await.unwrap());
+    let error = client.diagnostic_health_check_once().await.unwrap_err();
+    assert!(error.to_string().contains("registry-scoped"));
+    assert!(!error.to_string().contains("doctor-secret"));
 
     let requests = server.received_requests().await.unwrap();
-    assert_eq!(requests.len(), 1);
-    assert!(
-        requests[0].headers.get("authorization").is_none(),
-        "an anonymous health probe must not synthesize Basic auth from URL userinfo"
-    );
+    assert!(requests.is_empty());
 }

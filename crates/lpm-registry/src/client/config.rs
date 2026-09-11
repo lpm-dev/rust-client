@@ -780,6 +780,9 @@ impl RegistryClient {
                 safe_url_for_diagnostic(&self.base_url)
             )));
         }
+        if url.contains('@') {
+            super::auth::RequestDestination::parse(url)?;
+        }
         // When `--insecure` is the path that admitted an HTTP
         // non-loopback URL, surface the DNS-rebinding window
         // explicitly. The string-based scheme check happens here; the
@@ -802,6 +805,9 @@ impl RegistryClient {
     }
 
     pub(super) fn validate_request_url(&self, url: &reqwest::Url) -> Result<(), LpmError> {
+        if !url.username().is_empty() || url.password().is_some() {
+            return Err(LpmError::Registry(lpm_http::URL_CREDENTIALS_REFUSAL.into()));
+        }
         let allowed = url.scheme() == "https"
             || super::url_gate::is_loopback_http_url(url)
             || (self.allow_insecure && url.scheme() == "http");

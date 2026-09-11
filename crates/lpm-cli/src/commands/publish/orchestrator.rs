@@ -2425,7 +2425,7 @@ async fn resolve_npm_target_credential(
             auth_source: None,
         }),
         PublishTarget::Custom(url) => Ok(ResolvedNpmTargetCredential {
-            token: auth::get_custom_registry_token(url).ok_or_else(|| {
+            token: npm_auth::custom_registry_token(url).ok_or_else(|| {
                 let safe_origin = crate::install_ui::safe_url_origin(url);
                 LpmError::Registry(format!(
                     "no token found for {safe_origin}. Run `lpm login --login-registry <configured-registry-url> --token <token>`."
