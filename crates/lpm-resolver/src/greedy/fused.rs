@@ -1938,7 +1938,7 @@ pub async fn resolve_greedy_fused_with_cache_options_policy_and_selected_events_
                         policy_hydration_ns.saturating_add(duration_ns(started.elapsed()));
                 }
                 let info_arc = info_result?;
-                let info_arc = super::manifest::refresh_missing_range(
+                let info_arc = match super::manifest::refresh_missing_range(
                     &edge,
                     info_arc,
                     &client,
@@ -1947,7 +1947,15 @@ pub async fn resolve_greedy_fused_with_cache_options_policy_and_selected_events_
                     &policy,
                     &mut refreshed_metadata,
                 )
-                .await?;
+                .await
+                {
+                    Ok(info) => info,
+                    Err(error) => {
+                        super::manifest::propagate_fetch_error(&edge, &error, &mut state)?;
+                        pending_root_constraints.complete_root_edge(&edge, &mut state.task_queue);
+                        continue;
+                    }
+                };
                 let tree_policy_started = trace_metadata_fetches.then(Instant::now);
                 let preferred = preferred_tree_compatible_version(
                     &edge,

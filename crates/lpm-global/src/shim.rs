@@ -464,6 +464,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn windows_global_shims_forward_arguments_and_exit_code_to_project_shims() {
+        use std::os::windows::process::CommandExt;
         let dir = TempDir::new().unwrap();
         let root_text = dir.path().to_str().unwrap();
         let root = Path::new(root_text.strip_prefix(r"\\?\").unwrap_or(root_text));
@@ -480,9 +481,11 @@ mod tests {
         )
         .unwrap();
         let output = std::process::Command::new("cmd.exe")
-            .args(["/d", "/c"])
-            .arg(global_bin.join("tool.cmd"))
-            .arg("hello space")
+            .args(["/d", "/s", "/c"])
+            .raw_arg(format!(
+                "\"\"{}\" \"hello space\"\"",
+                global_bin.join("tool.cmd").display()
+            ))
             .output()
             .unwrap();
         assert_eq!(

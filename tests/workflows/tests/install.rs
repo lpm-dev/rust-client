@@ -180,6 +180,47 @@ async fn metadata_refresh_does_not_bypass_revoked_custom_registry_access() {
     );
 }
 
+#[tokio::test]
+async fn failed_metadata_refresh_keeps_optional_dependencies_optional() {
+    for mode in [
+        None,
+        Some(("LPM_GREEDY_FUSION", "0")),
+        Some(("LPM_RESOLVER", "pubgrub")),
+    ] {
+        let mock = MockRegistry::start().await;
+        let name = "optional-refresh";
+        mock.with_package(name, "1.0.0", &make_tarball(name, "1.0.0"))
+            .await;
+        let project = TempProject::empty(r#"{"name":"consumer","version":"1.0.0"}"#);
+        project.write_file(".npmrc", &format!("registry={}/\n", mock.url()));
+        lpm_with_registry(&project, &mock.url())
+            .args([
+                "install",
+                "optional-refresh@1.0.0",
+                "--no-skills",
+                "--no-editor-setup",
+            ])
+            .assert()
+            .success();
+        project.write_file("package.json", r#"{"name":"consumer","version":"1.0.0","optionalDependencies":{"optional-refresh":"1.1.0"}}"#);
+        mock.server().reset().await;
+        let mut command = lpm_with_registry(&project, &mock.url());
+        if let Some((key, value)) = mode {
+            command.env(key, value);
+        }
+        command
+            .args(["install", "--no-skills", "--no-editor-setup"])
+            .assert()
+            .success();
+        assert!(
+            !project
+                .path()
+                .join("node_modules/optional-refresh")
+                .exists()
+        );
+    }
+}
+
 async fn assert_unavailable_publication_message(status: Option<&str>, json: bool, expected: &str) {
     let mock = MockRegistry::start().await;
     let name = "@lpm.dev/example.pending";

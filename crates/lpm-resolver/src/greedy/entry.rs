@@ -240,7 +240,7 @@ pub async fn resolve_greedy_with_root_dependencies_options_and_policy(
                     continue;
                 }
             };
-            let info = super::manifest::refresh_missing_range(
+            let info = match super::manifest::refresh_missing_range(
                 &edge,
                 info,
                 &client,
@@ -249,7 +249,14 @@ pub async fn resolve_greedy_with_root_dependencies_options_and_policy(
                 &policy,
                 &mut refreshed_metadata,
             )
-            .await?;
+            .await
+            {
+                Ok(info) => info,
+                Err(error) => {
+                    super::manifest::propagate_fetch_error(&edge, &error, &mut state)?;
+                    continue;
+                }
+            };
             let preferred = preferred_tree_compatible_version(
                 &edge,
                 &info,

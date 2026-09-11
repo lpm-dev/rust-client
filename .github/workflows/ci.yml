@@ -49,7 +49,7 @@ jobs:
         shell: bash
         run: |
           python -c 'import shutil; assert shutil.disk_usage(".").free >= 10*1024**3'
-          cargo test --locked -p lpm-sandbox per_entry_dacl_grant -- --nocapture 2>&1 | tee qa-results/sandbox-unit.log
+          cargo test --locked -p lpm-sandbox dacl_ -- --nocapture 2>&1 | tee qa-results/sandbox-unit.log
           exit "${PIPESTATUS[0]}"
       - name: Long workspace diagnostic
         continue-on-error: true
