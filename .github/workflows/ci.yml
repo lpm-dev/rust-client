@@ -26,10 +26,7 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: Windows-native-acceptance-1940-${{ hashFiles('Cargo.lock') }}
-          restore-keys: |
-            Windows-native-acceptance-1940-
-            Windows-cargo-filesystem-1.94.0-
+          key: Windows-sandbox-only-1940-${{ hashFiles('Cargo.lock') }}
       - uses: taiki-e/install-action@9c6953334daacc48e55a35db9a19c771f79ffa9d
         with:
           tool: nextest
