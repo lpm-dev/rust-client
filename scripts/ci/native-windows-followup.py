@@ -5,6 +5,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 import urllib.request
@@ -69,3 +70,15 @@ workspace_script = str(Path('scripts/ci/test-complex-workspace-consumer.py').res
 for n in range(5):
     run(f'workspace-{n}', Path.cwd(), [sys.executable, workspace_script, '--binary', binary,
                                      '--output', str(root / f'workspace-{n}')], timeout=180)
+
+for n in range(2):
+    short = Path(root.anchor) / f'lpm-native-{os.environ.get("GITHUB_RUN_ID", os.getpid())}-{n}'
+    run(f'short-workspace-{n}', Path.cwd(), [sys.executable, workspace_script, '--binary', binary,
+                                           '--output', str(short)], timeout=180)
+    evidence = root / f'short-workspace-{n}'
+    evidence.mkdir()
+    for path in short.iterdir():
+        if path.is_file() and path.suffix in {'.json', '.log'}:
+            shutil.copy2(path, evidence / path.name)
+    if (short / 'project/lpm.lock').exists():
+        shutil.copy2(short / 'project/lpm.lock', evidence / 'lpm.lock')
