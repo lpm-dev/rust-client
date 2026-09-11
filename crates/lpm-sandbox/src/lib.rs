@@ -161,6 +161,7 @@ mod posture_decision;
 // (macOS) deny renderer, Linux bind-mount overlay enumerator, and
 // Windows AppContainer DACL-deny enumerator. Single source of truth
 // makes drift a type-system error.
+mod project_reads;
 #[cfg(any(
     target_os = "macos",
     target_os = "linux",
@@ -234,6 +235,8 @@ pub struct SandboxSpec {
     /// (`..`) and absolute paths outside the project are rejected by
     /// the loader.
     pub secret_read_allow: Vec<PathBuf>,
+    /// Allow all project files, including secrets, after explicit capability approval.
+    pub read_project_full: bool,
 }
 
 /// Caller-tunable knobs the sandbox factory consumes alongside
@@ -820,6 +823,7 @@ fn platform_backend(
 /// reason so the caller can distinguish "sandbox couldn't prep the
 /// filesystem" from "the sandbox itself failed."
 pub fn prepare_writable_dirs(spec: &SandboxSpec) -> Result<(), SandboxError> {
+    config::validate_builtin_write_dirs(spec)?;
     // Built-in writable subpaths first. These mirror the
     // standard-allow-set entries every backend renders into its
     // profile / ruleset / IL label.
@@ -834,6 +838,7 @@ pub fn prepare_writable_dirs(spec: &SandboxSpec) -> Result<(), SandboxError> {
     for p in &builtin {
         ensure_writable_dir_exists(p)?;
     }
+    config::validate_builtin_write_dirs(spec)?;
 
     // Then user-declared `sandboxWriteDirs`. These are the effective
     // paths returned by `load_sandbox_write_dirs`. Revalidation before
@@ -1002,6 +1007,10 @@ fn validate_spec(spec: &SandboxSpec) -> Result<(), SandboxError> {
             return Err(SandboxError::InvalidSpec { reason });
         }
     }
+    config::validate_builtin_write_dirs(spec)?;
+    for path in &spec.secret_read_allow {
+        config::validate_read_file(&spec.project_dir, path)?;
+    }
     for (i, p) in spec.extra_write_dirs.iter().enumerate() {
         if !p.is_absolute() {
             return Err(SandboxError::InvalidSpec {
@@ -1111,6 +1120,7 @@ mod tests {
             store_root: PathBuf::from(STORE_ROOT),
             home_dir: PathBuf::from(HOME_DIR),
             tmpdir: PathBuf::from(TMPDIR),
+            read_project_full: false,
             secret_read_allow: Vec::new(),
             extra_write_dirs: Vec::new(),
         }
@@ -1255,6 +1265,46 @@ mod tests {
     /// paths, the script then tries `mkdir build-output` against a
     /// Medium-IL `project_dir`, and fails with ERROR_ACCESS_DENIED).
     #[test]
+    fn prepare_writable_dirs_rejects_regular_file_builtin_root() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join(".husky"), "private input").unwrap();
+        let spec = SandboxSpec {
+            project_dir: root.path().to_path_buf(),
+            package_dir: root.path().join("package"),
+            package_name: "probe".into(),
+            package_version: "1.0.0".into(),
+            store_root: root.path().join("store"),
+            home_dir: root.path().join("home"),
+            tmpdir: root.path().join("scratch"),
+            read_project_full: false,
+            secret_read_allow: vec![],
+            extra_write_dirs: vec![],
+        };
+        assert!(prepare_writable_dirs(&spec).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn prepare_writable_dirs_rejects_symlinked_builtin_root() {
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(outside.path(), root.path().join(".husky")).unwrap();
+        let spec = SandboxSpec {
+            project_dir: root.path().to_path_buf(),
+            package_dir: root.path().join("package"),
+            package_name: "probe".into(),
+            package_version: "1.0.0".into(),
+            store_root: root.path().join("store"),
+            home_dir: root.path().join("home"),
+            tmpdir: root.path().join("scratch"),
+            read_project_full: false,
+            secret_read_allow: vec![],
+            extra_write_dirs: vec![],
+        };
+        assert!(prepare_writable_dirs(&spec).is_err());
+    }
+
+    #[test]
     fn prepare_writable_dirs_creates_extra_write_dirs() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let root = std::fs::canonicalize(tmp.path()).expect("canonical tempdir");
@@ -1273,6 +1323,7 @@ mod tests {
             store_root: root.join("store"),
             home_dir: home.clone(),
             tmpdir: root.join("tmpdir"),
+            read_project_full: false,
             secret_read_allow: Vec::new(),
             extra_write_dirs: vec![extra_a.clone(), extra_b.clone()],
         };

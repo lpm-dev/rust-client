@@ -306,13 +306,32 @@ impl SecretOverlaySpec {
     ///
     /// Returns `Ok(None)` when no protected file needs masking. Any
     /// preparation uncertainty is returned as an error before spawn.
+    #[cfg(test)]
     pub(crate) fn build(
         project_dir: &Path,
         allow_list: &[PathBuf],
     ) -> Result<Option<Self>, SecretOverlayBuildError> {
-        use std::os::unix::ffi::OsStrExt;
+        Self::from_paths(enumerate_project_secrets(project_dir, allow_list)?)
+    }
 
-        let paths_pb = enumerate_project_secrets(project_dir, allow_list)?;
+    pub(crate) fn build_for_spec(
+        spec: &crate::SandboxSpec,
+        build_cache_isolation: bool,
+    ) -> Result<Option<Self>, SecretOverlayBuildError> {
+        if spec.read_project_full {
+            return Ok(None);
+        }
+        let mut paths = enumerate_project_secrets(&spec.project_dir, &spec.secret_read_allow)?;
+        let readable =
+            crate::landlock_rules::describe_rules_with_isolation(spec, build_cache_isolation);
+        // Files outside every Landlock read grant are already denied. They do
+        // not need a mount namespace, which can be unavailable in containers.
+        paths.retain(|path| readable.iter().any(|(root, _)| path.starts_with(root)));
+        Self::from_paths(paths)
+    }
+
+    fn from_paths(paths_pb: Vec<PathBuf>) -> Result<Option<Self>, SecretOverlayBuildError> {
+        use std::os::unix::ffi::OsStrExt;
         if paths_pb.is_empty() {
             return Ok(None);
         }

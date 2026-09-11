@@ -34,6 +34,7 @@ pub(super) fn probe_sandbox_backend_with_global(
         store_root: home.join(".lpm").join("store"),
         home_dir: home.clone(),
         tmpdir: tmpdir.clone(),
+        read_project_full: false,
         secret_read_allow: Vec::new(),
         extra_write_dirs: Vec::new(),
     };
@@ -136,6 +137,11 @@ pub(super) fn probe_sandbox_backend_with_global(
                      strict mode is available.",
                 );
             }
+            let lifetime_note = if os == "macos" {
+                " Detached descendants can survive completion, timeout, or cancellation on macOS."
+            } else {
+                ""
+            };
             match sb.posture() {
                 SandboxPosture::Default => Check::pass(
                     &doctor_catalog::SANDBOX_AVAILABLE,
@@ -144,7 +150,7 @@ pub(super) fn probe_sandbox_backend_with_global(
                          containment + env scrubbing, outbound network ALLOWED. Enable \
                          strict mode (also denies outbound network) via \
                          `lpm config sandbox --set strict`, `--strict-sandbox` per-command, \
-                         or `LPM_STRICT_SANDBOX=1` in env."
+                         or `LPM_STRICT_SANDBOX=1` in env.{lifetime_note}"
                     ),
                 ),
                 SandboxPosture::Strict => {
@@ -176,7 +182,7 @@ pub(super) fn probe_sandbox_backend_with_global(
                         &doctor_catalog::SANDBOX_AVAILABLE,
                         &format!(
                             "{backend} available on {os} — strict mode: enforces \
-                             filesystem-write containment + {net_coverage}"
+                             filesystem-write containment + {net_coverage}.{lifetime_note}"
                         ),
                     )
                 }

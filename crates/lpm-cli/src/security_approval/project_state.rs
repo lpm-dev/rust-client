@@ -46,7 +46,7 @@ pub fn authorized_capability_user_bound() -> crate::capability::UserBound {
 fn current_capability_request_hash(project_dir: &Path) -> Result<Option<String>, LpmError> {
     let user_bound = authorized_capability_user_bound();
     let capability_set =
-        crate::capability::CapabilitySet::from_package_json(&project_dir.join("package.json"))
+        crate::capability::CapabilitySet::from_project(&project_dir.join("package.json"))
             .map_err(|e| LpmError::Registry(format!("{e}")))?;
     Ok(if capability_set.loosens_beyond(&user_bound) {
         Some(capability_set.canonical_hash())

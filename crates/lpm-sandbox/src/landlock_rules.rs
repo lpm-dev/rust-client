@@ -6,18 +6,15 @@
 //! install, `restrict_self` — live in [`crate::linux`].
 //!
 //! Rule layout:
-//! - Reads broad (project + toolchain + system).
+//! - Project reads follow approved capabilities; toolchain and system reads stay available.
 //! - Writes narrow (package store dir + `node_modules` + `.husky` +
 //!   `.lpm` + known caches + temp + extras from `sandboxWriteDirs`).
 //! - No blanket home-dir read — `~/.ssh`, `~/.aws`, `~/.config/**`
 //!   outside `~/.cache`/`~/.node-gyp`/`~/.npm` stay denied by default.
 //!
 //! Landlock semantics: rules are **additive** (union of access bits).
-//! A path that falls under both a Read rule and a ReadWrite rule ends
-//! up ReadWrite. That's why `project_dir` gets a Read rule and
-//! `project_dir/node_modules` gets a ReadWrite rule — the write rule
-//! wins where they overlap, and the read rule still grants read
-//! access to the rest of `project_dir`.
+//! A read/write rule also grants reads, so writable roots require the same
+//! capability authorization as explicit project reads.
 
 use crate::SandboxSpec;
 use std::path::PathBuf;
@@ -58,23 +55,8 @@ pub(crate) const SYSTEM_READ_PATHS: &[&str] = &[
     // network containment + project-output containment must remain
     // the primary defence against exfiltration of these reads.
     "/etc",
-    // `/proc/self/*`, `/proc/cpuinfo`, `/proc/sys/kernel/*`: needed
-    // by node's process module, by `uname -r`, and by tools that
-    // probe their own PID. Landlock does NOT restrict procfs
-    // beyond pathname enforcement, which is what we want.
-    //
-    // Accepted-posture (M54): the `/proc` grant exposes same-uid
-    // process introspection — a lifecycle script can read
-    // `/proc/<pid>/cmdline` and `/proc/<pid>/environ` for any peer
-    // process owned by the install operator. That includes a
-    // sibling `lpm-rs` invocation that holds vault unlock state /
-    // session bearer in memory at the read time. Narrowing to
-    // `/proc/self/*` would break legitimate tools (node's
-    // `process.platform`, `os-release` probes, `uname` shims) that
-    // pull from `/proc/cpuinfo`, `/proc/version`, and per-pid
-    // entries during install. Future mitigation handle: a `hidepid=2`
-    // mount or a per-task pid namespace that hides peer processes,
-    // tracked outside this audit batch's scope.
+    // Runtime probes need procfs. Landlock additionally restricts ptrace-style
+    // reads of processes outside the sandbox's domain, including peer environ.
     "/proc",
     // `/dev/null`, `/dev/urandom`, `/dev/tty`, `/dev/fd/*`,
     // `/dev/std{in,out,err}`. Narrower than the Seatbelt profile
@@ -120,7 +102,11 @@ pub(crate) fn describe_rules_with_isolation(
         // The normal sandbox may read the project tree. The live package
         // directory receives its own rule below because virtual-store
         // package bytes can resolve outside the project through symlinks.
-        rules.push((spec.project_dir.clone(), RuleAccess::Read));
+        rules.extend(
+            crate::project_reads::allowed_project_reads(spec)
+                .into_iter()
+                .map(|path| (path, RuleAccess::Read)),
+        );
     }
     // NVM-installed toolchain. Only added if the host has a matching
     // dir — [`crate::linux::spawn`] filters missing paths at FD-open
@@ -158,7 +144,6 @@ pub(crate) fn describe_rules_with_isolation(
         rules.push((spec.home_dir.join(".cache"), RuleAccess::ReadWrite));
         rules.push((spec.home_dir.join(".node-gyp"), RuleAccess::ReadWrite));
         rules.push((spec.home_dir.join(".npm"), RuleAccess::ReadWrite));
-        rules.push((PathBuf::from("/tmp"), RuleAccess::ReadWrite));
     }
     rules.push((spec.tmpdir.clone(), RuleAccess::ReadWrite));
     // `/dev/null` and `/dev/tty` as writable — shells redirect to
@@ -204,7 +189,8 @@ mod tests {
             package_version: "5.22.0".into(),
             store_root: PathBuf::from("/lpm-store"),
             home_dir: PathBuf::from("/home/u"),
-            tmpdir: PathBuf::from("/tmp"),
+            tmpdir: PathBuf::from("/tmp/lpm-scratch"),
+            read_project_full: false,
             secret_read_allow: Vec::new(),
             extra_write_dirs: Vec::new(),
         }
@@ -226,9 +212,9 @@ mod tests {
     }
 
     #[test]
-    fn project_dir_has_read_and_subpaths_have_write() {
+    fn narrow_project_reads_preserve_writable_dependency_subpaths() {
         let rules = describe_rules(&spec());
-        assert!(contains_rule(&rules, "/home/u/proj", RuleAccess::Read));
+        assert!(!contains_rule(&rules, "/home/u/proj", RuleAccess::Read));
         assert!(contains_rule(
             &rules,
             "/home/u/proj/node_modules",
@@ -281,14 +267,12 @@ mod tests {
     #[test]
     fn temp_paths_are_writable() {
         let rules = describe_rules(&spec());
-        // `/tmp` is broadly writable by design — real-world
-        // postinstalls shell out to `mktemp` and write intermediate
-        // artifacts to `/tmp/...` paths (see compat_greens
-        // `tmp_scratch_write_shape_succeeds`). `spec.tmpdir` on top
-        // resolves to the same path on the default unit-test spec
-        // (harmless union) but lets callers request a second narrow
-        // scratch dir when they set TMPDIR elsewhere.
-        assert!(contains_rule(&rules, "/tmp", RuleAccess::ReadWrite));
+        assert!(contains_rule(
+            &rules,
+            "/tmp/lpm-scratch",
+            RuleAccess::ReadWrite
+        ));
+        assert!(!contains_rule(&rules, "/tmp", RuleAccess::ReadWrite));
     }
 
     #[test]
@@ -380,7 +364,7 @@ mod tests {
             "/lpm-store/prisma@5.22.0",
             RuleAccess::ReadWrite
         ));
-        assert!(contains_rule(&rules, "/tmp", RuleAccess::ReadWrite));
+        assert!(!contains_rule(&rules, "/tmp", RuleAccess::ReadWrite));
         assert!(!contains_rule(
             &rules,
             "/home/u/proj/node_modules",
@@ -394,7 +378,7 @@ mod tests {
     }
 
     #[test]
-    fn tmpdir_distinct_from_slash_tmp_gets_its_own_rule() {
+    fn private_temporary_directory_does_not_grant_all_system_temp() {
         let mut s = spec();
         s.tmpdir = PathBuf::from("/var/tmp/user-xyz");
         let rules = describe_rules(&s);
@@ -403,6 +387,6 @@ mod tests {
             "/var/tmp/user-xyz",
             RuleAccess::ReadWrite
         ));
-        assert!(contains_rule(&rules, "/tmp", RuleAccess::ReadWrite));
+        assert!(!contains_rule(&rules, "/tmp", RuleAccess::ReadWrite));
     }
 }

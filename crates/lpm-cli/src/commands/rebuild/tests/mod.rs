@@ -1332,6 +1332,7 @@ fn install_hint_flips_to_untrusted_when_capability_gate_would_block() {
         pass_env: ["SSH_AUTH_SOCK".into()].into_iter().collect(),
         read_project: ReadProjectMode::Narrow,
         sandbox_limits: Default::default(),
+        ..Default::default()
     };
     let rows_widening = scriptable_package_rows(
         &lpm_root,

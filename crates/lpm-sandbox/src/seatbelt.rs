@@ -1,6 +1,6 @@
 //! Seatbelt profile synthesis for the macOS `sandbox-exec` backend.
 //!
-//! Reads broad (project + toolchain), writes narrow (package store
+//! Project reads follow approved capabilities; writes stay narrow (package store
 //! dir + `node_modules` + `.husky` + `.lpm` + known caches + temp),
 //! network allowed by default, process-fork + exec allowed so
 //! `node-gyp` children work.
@@ -80,7 +80,7 @@ pub(crate) fn render_profile_with_toolchain(
     let canon_tmpdir = canonicalize_or_passthrough(&spec.tmpdir, "tmpdir")?;
 
     let package_dir = quoted_path(&canon_package_dir, "package_dir")?;
-    let project_dir = quoted_path(&canon_project_dir, "project_dir")?;
+
     let home_cache = quoted_path(&canon_home_dir.join(".cache"), "home_dir/.cache")?;
     let home_node_gyp = quoted_path(&canon_home_dir.join(".node-gyp"), "home_dir/.node-gyp")?;
     let home_npm = quoted_path(&canon_home_dir.join(".npm"), "home_dir/.npm")?;
@@ -136,13 +136,6 @@ pub(crate) fn render_profile_with_toolchain(
     out.push_str("(allow file-read-metadata)\n");
     out.push('\n');
 
-    // file-read*: broad, because scripts legitimately read project +
-    // toolchain paths. The project + system baseline is extended with
-    // the paths every real macOS binary needs to load (dyld shared
-    // cache at /System/Volumes + /private/var/db/dyld, /bin + /sbin
-    // for shells and coreutils, /private/etc for locale + resolv.conf,
-    // /dev tty/random/zero for common libc initialization). Writes
-    // stay narrow.
     out.push_str("(allow file-read*\n");
     // Stat-the-root is required by the dyld loader on macOS; without
     // this entry even `/usr/bin/true` fails to launch under a
@@ -157,8 +150,24 @@ pub(crate) fn render_profile_with_toolchain(
         out.push_str(&format!("  (subpath {dependency_root})\n"));
         out.push_str(&format!("  (subpath {home_node_gyp})\n"));
     } else {
-        out.push_str(&format!("  (subpath {project_dir})\n"));
+        let read_files: std::collections::BTreeSet<_> = spec.secret_read_allow.iter().collect();
+        for path in crate::project_reads::allowed_project_reads(spec) {
+            let quoted = quoted_path(&path, "project read path")?;
+            let filter = if read_files.contains(&path) || path.is_file() {
+                "literal"
+            } else {
+                "subpath"
+            };
+            out.push_str(&format!("  ({filter} {quoted})\n"));
+        }
+        for path in extras
+            .iter()
+            .chain([&home_cache, &home_node_gyp, &home_npm])
+        {
+            out.push_str(&format!("  (subpath {path})\n"));
+        }
     }
+    out.push_str(&format!("  (subpath {tmpdir})\n"));
     out.push_str("  (subpath \"/usr\")\n");
     out.push_str("  (subpath \"/bin\")\n");
     out.push_str("  (subpath \"/sbin\")\n");
@@ -206,15 +215,11 @@ pub(crate) fn render_profile_with_toolchain(
     out.push_str(")\n");
     out.push('\n');
 
-    // Secret-file deny block — overrides the broad project_dir
-    // file-read* allow above for well-known secret conventions
-    // (`.env`, `.npmrc`, `.aws/`, `*.pem`, etc.). SBPL last-match-
-    // wins: a path covered by both the earlier allow and this deny
-    // ends up denied. The per-project / per-user
-    // `sandboxReadAllow` opt-in emits a follow-up
-    // (allow file-read*) block AFTER this deny so specific files
-    // can be exempted without disabling the whole list.
-    render_secret_denies(&mut out, &canon_project_dir)?;
+    // Protected files can also occur below writable dependency and tool-cache roots.
+    // Specific approved files override these denials; full reads authorize the project.
+    if !spec.read_project_full {
+        render_secret_denies(&mut out, &canon_project_dir)?;
+    }
     render_secret_read_allow_overrides(&mut out, &spec.secret_read_allow)?;
     out.push('\n');
 
@@ -223,9 +228,7 @@ pub(crate) fn render_profile_with_toolchain(
     // here), project `node_modules` (prisma generate),
     // `.husky` (husky install), `.lpm` (LPM's own state),
     // `~/.cache` + `~/.node-gyp` + `~/.npm` (tooling caches), and
-    // `/tmp` + `$TMPDIR` — plus `/private/var/folders` since macOS's
-    // `$TMPDIR` resolves to there and some tools pass the unresolved
-    // form. `/dev/null` is writable so `>/dev/null` redirects work.
+    // per-script scratch directory. `/dev/null` permits shell redirection.
     out.push_str("(allow file-write*\n");
     out.push_str(&format!("  (subpath {package_dir})\n"));
     if !build_cache_isolation {
@@ -235,7 +238,6 @@ pub(crate) fn render_profile_with_toolchain(
         out.push_str(&format!("  (subpath {home_cache})\n"));
         out.push_str(&format!("  (subpath {home_node_gyp})\n"));
         out.push_str(&format!("  (subpath {home_npm})\n"));
-        out.push_str("  (subpath \"/tmp\")\n");
     }
     out.push_str(&format!("  (subpath {tmpdir})\n"));
     out.push_str("  (literal \"/dev/null\")\n");
@@ -639,6 +641,7 @@ mod tests {
             store_root: PathBuf::from("/lpm-store"),
             home_dir: PathBuf::from("/home/u"),
             tmpdir: PathBuf::from("/var/folders/xx/T"),
+            read_project_full: false,
             secret_read_allow: Vec::new(),
             extra_write_dirs: Vec::new(),
         }
@@ -699,9 +702,9 @@ mod tests {
     }
 
     #[test]
-    fn profile_contains_temp_paths() {
+    fn profile_grants_only_the_supplied_temporary_directory() {
         let p = render_profile(&spec(), false).unwrap();
-        assert!(p.contains("/tmp"));
+        assert!(!p.contains("(subpath \"/tmp\")"));
         assert!(p.contains("/var/folders/xx/T"));
     }
 
@@ -1339,7 +1342,7 @@ mod tests {
     /// conventions only. A `src/index.ts` or `lib/foo.js` stays
     /// readable.
     #[test]
-    fn profile_does_not_deny_source_files() {
+    fn secret_patterns_do_not_match_source_filenames() {
         let p = render_profile(&spec(), false).unwrap();
         assert!(
             !p.contains(r#"(literal "/home/u/proj/src/index.ts")"#),

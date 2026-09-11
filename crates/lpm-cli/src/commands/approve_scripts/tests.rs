@@ -2898,6 +2898,7 @@ fn capability_widening_row_stays_in_effective_blocked_set() {
         pass_env: ["SSH_AUTH_SOCK".into()].into_iter().collect(),
         read_project: ReadProjectMode::Narrow,
         sandbox_limits: Default::default(),
+        ..Default::default()
     };
 
     let effective =

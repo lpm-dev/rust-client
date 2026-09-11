@@ -320,7 +320,7 @@ pub(super) async fn run_online_lifecycle_prepare_phase(
     };
 
     let requested_capabilities =
-        crate::capability::CapabilitySet::from_package_json(&project_dir.join("package.json"))
+        crate::capability::CapabilitySet::from_project(&project_dir.join("package.json"))
             .map_err(|e| LpmError::Registry(format!("{e}")))?;
     let user_bound = crate::security_approval::authorized_capability_user_bound();
 

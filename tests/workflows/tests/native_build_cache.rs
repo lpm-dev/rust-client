@@ -173,17 +173,18 @@ async fn native_lifecycle_output_is_restored_after_pristine_rematerialization() 
         serde_json::from_slice(&invalidated_rebuild.stdout)
             .expect("invalidated rebuild stdout must be JSON");
     assert_eq!(invalidated_envelope["build_cache"]["hits"], 0);
-    assert_eq!(invalidated_envelope["build_cache"]["misses"], 1);
-    assert_ne!(
+    assert_eq!(invalidated_envelope["build_cache"]["misses"], 0);
+    assert_eq!(invalidated_envelope["build_cache"]["local_state_hits"], 1);
+    assert_eq!(
         std::fs::read_to_string(installed_package_dir(&project).join("native-output.txt"))
             .expect("invalidated rebuild must produce native-output.txt"),
         first_output,
-        "a changed build-environment key must invalidate keyed local build state and rerun the lifecycle command"
+        "an undeclared environment value must not change the script environment or cache key"
     );
 }
 
 #[tokio::test]
-async fn custom_lifecycle_environment_change_invalidates_cached_output() {
+async fn approved_lifecycle_environment_bypasses_shared_build_cache() {
     if !node_available() {
         eprintln!("skipping: node is required for the native build-cache workflow");
         return;
@@ -207,6 +208,11 @@ fs.writeFileSync('native-output.txt', process.env.LPM_NATIVE_TEST_INPUT);
         )
         .await;
     let project = TempProject::empty(&project_manifest());
+    let mut manifest: serde_json::Value = serde_json::from_str(&project_manifest()).unwrap();
+    manifest["lpm"] = serde_json::json!({"scripts":{"passEnv":["LPM_NATIVE_TEST_INPUT"]}});
+    project.write_file("package.json", &manifest.to_string());
+    support::write_signed_unlock(&project, &["capability-widen", "trust-bulk-approve"]);
+
     let install = lpm_with_registry(&project, &registry.url())
         .arg("install")
         .env("LPM_STORE_VERSION", "v2")
@@ -216,7 +222,7 @@ fs.writeFileSync('native-output.txt', process.env.LPM_NATIVE_TEST_INPUT);
 
     for value in ["first", "second"] {
         let rebuild = lpm_with_registry(&project, &registry.url())
-            .args(["--json", "rebuild", "--all", "--strict-sandbox"])
+            .args(["--json", "rebuild", "--all", "--force", "--strict-sandbox"])
             .env("LPM_STORE_VERSION", "v2")
             .env("LPM_NATIVE_TEST_INPUT", value)
             .output()
@@ -229,9 +235,9 @@ fs.writeFileSync('native-output.txt', process.env.LPM_NATIVE_TEST_INPUT);
         let envelope: serde_json::Value =
             serde_json::from_slice(&rebuild.stdout).expect("native rebuild stdout must be JSON");
         assert_eq!(
-            envelope["build_cache"]["misses"],
+            envelope["build_cache"]["bypassed"],
             1,
-            "{value} must execute under its own cache key; envelope: {envelope}; stderr: {}",
+            "{value} must bypass shared cache with widened capabilities; envelope: {envelope}; stderr: {}",
             String::from_utf8_lossy(&rebuild.stderr)
         );
     }
@@ -241,13 +247,7 @@ fs.writeFileSync('native-output.txt', process.env.LPM_NATIVE_TEST_INPUT);
             .expect("second build output"),
         "second"
     );
-    assert_eq!(
-        std::fs::read_dir(project.store_dir().join("v2/builds"))
-            .expect("build artifacts")
-            .count(),
-        2,
-        "each visible custom environment must have a distinct cache key"
-    );
+    assert!(!project.store_dir().join("v2/builds").exists());
 }
 
 #[tokio::test]
@@ -428,7 +428,7 @@ async fn concurrent_native_rebuilds_with_different_keys_serialize_shared_package
     let registry = MockRegistry::start().await;
     let script = br#"
 const fs = require('fs');
-const label = process.env.CFLAGS;
+const label = process.env.LANG;
 fs.writeFileSync('active-build.txt', label);
 Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 6000);
 const active = fs.existsSync('active-build.txt')
@@ -464,7 +464,7 @@ fs.writeFileSync('native-output.txt', label);
     first_command
         .args(["--json", "rebuild", "--all", "--strict-sandbox"])
         .env("LPM_STORE_VERSION", "v2")
-        .env("CFLAGS", "build-a");
+        .env("LANG", "C");
     let first = first_command.spawn().expect("spawn first rebuild");
     let active_path = installed_package_dir(&project).join("active-build.txt");
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
@@ -479,7 +479,7 @@ fs.writeFileSync('native-output.txt', label);
     second_command
         .args(["--json", "rebuild", "--all", "--strict-sandbox"])
         .env("LPM_STORE_VERSION", "v2")
-        .env("CFLAGS", "build-b");
+        .env("LANG", "POSIX");
     let second = second_command.spawn().expect("spawn second rebuild");
     let first_output = first.wait_with_output().expect("wait for first rebuild");
     let second_output = second.wait_with_output().expect("wait for second rebuild");
@@ -503,5 +503,5 @@ fs.writeFileSync('native-output.txt', label);
         })
         .collect::<Vec<_>>();
     artifact_outputs.sort_unstable();
-    assert_eq!(artifact_outputs, ["build-a", "build-b"]);
+    assert_eq!(artifact_outputs, ["C", "POSIX"]);
 }

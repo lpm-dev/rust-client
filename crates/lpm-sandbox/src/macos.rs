@@ -190,6 +190,7 @@ mod tests {
             store_root: tmp.path().join("store"),
             home_dir: home,
             tmpdir,
+            read_project_full: false,
             secret_read_allow: Vec::new(),
             extra_write_dirs: Vec::new(),
         };
@@ -295,6 +296,7 @@ mod tests {
             store_root: home.join(".lpm/store"),
             home_dir: home.clone(),
             tmpdir: PathBuf::from("/tmp"),
+            read_project_full: false,
             secret_read_allow: Vec::new(),
             extra_write_dirs: Vec::new(),
         };
@@ -330,6 +332,7 @@ mod tests {
             store_root: td.path().join("store"),
             home_dir: home,
             tmpdir: PathBuf::from("/tmp"),
+            read_project_full: false,
             secret_read_allow: Vec::new(),
             extra_write_dirs: Vec::new(),
         };
@@ -374,6 +377,7 @@ mod tests {
             store_root: td.path().join("store"),
             home_dir: home,
             tmpdir: PathBuf::from("/tmp"),
+            read_project_full: false,
             secret_read_allow: Vec::new(),
             extra_write_dirs: Vec::new(),
         };
@@ -425,6 +429,7 @@ mod tests {
             store_root: td.path().join("store"),
             home_dir: home,
             tmpdir: PathBuf::from("/tmp"),
+            read_project_full: false,
             secret_read_allow: Vec::new(),
             extra_write_dirs: Vec::new(),
         };
@@ -476,6 +481,7 @@ mod tests {
             store_root: td.path().join("store"),
             home_dir: home,
             tmpdir: PathBuf::from("/tmp"),
+            read_project_full: false,
             secret_read_allow: Vec::new(),
             extra_write_dirs: Vec::new(),
         };

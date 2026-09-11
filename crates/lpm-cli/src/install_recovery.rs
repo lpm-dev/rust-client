@@ -11,7 +11,9 @@ use lpm_common::LpmError;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+mod cancellation;
 mod source;
+pub(crate) use cancellation::cancellation_flag;
 
 const DIRECTORY: &str = "install-recovery";
 const COMMITTED: &str = "committed";
@@ -517,11 +519,12 @@ where
         sources: None,
     };
     recovery.recover()?;
+    let cancellation = cancellation::SignalCancellation::new()?;
     #[cfg(unix)]
     let mut interrupt = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
     #[cfg(unix)]
     let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
-    ACTIVE.scope(RefCell::new(recovery), async {
+    cancellation.scope(ACTIVE.scope(RefCell::new(recovery), async {
         let result = {
             tokio::pin!(future);
             #[cfg(unix)]
@@ -536,5 +539,5 @@ where
         };
         ACTIVE.with(|recovery| recovery.borrow_mut().finish(result.is_ok()))?;
         result
-    }).await
+    })).await
 }

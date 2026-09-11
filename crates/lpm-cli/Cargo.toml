@@ -151,6 +151,7 @@ roxmltree = "=0.21.1"
 
 # Unix process group management (build.rs timeout kill)
 [target.'cfg(unix)'.dependencies]
+signal-hook = "0.3.18"
 libc = "0.2"
 mimalloc = "0.1"
 rustix = { version = "1.1", features = ["fs"] }

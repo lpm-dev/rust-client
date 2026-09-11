@@ -616,7 +616,7 @@ pub(super) async fn run_link_and_finish(
     // silently omit capability-widened packages from build-state.json
     // and leave approve-scripts with nothing actionable.
     let offline_requested_capabilities =
-        crate::capability::CapabilitySet::from_package_json(&project_dir.join("package.json"))
+        crate::capability::CapabilitySet::from_project(&project_dir.join("package.json"))
             .map_err(|e| LpmError::Registry(format!("{e}")))?;
     let offline_user_bound = crate::security_approval::authorized_capability_user_bound();
     let all_trusted_for_auto_build = crate::commands::rebuild::all_scripted_packages_trusted(

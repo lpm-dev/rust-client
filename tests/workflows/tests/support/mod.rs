@@ -215,6 +215,17 @@ impl TempProject {
         TempProject { dir, home }
     }
 
+    /// Keep filesystem-denial fixtures outside the system temporary directory.
+    pub fn empty_in(parent: &Path, package_json: &str) -> Self {
+        let dir = tempfile::Builder::new()
+            .prefix("lpm-workflow-")
+            .tempdir_in(parent)
+            .expect("create project outside system temp");
+        let home = TempDir::new().expect("create isolated home");
+        std::fs::write(dir.path().join("package.json"), package_json).unwrap();
+        TempProject { dir, home }
+    }
+
     /// Path to the project directory.
     pub fn path(&self) -> &Path {
         self.dir.path()

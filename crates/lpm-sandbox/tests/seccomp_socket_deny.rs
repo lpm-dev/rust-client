@@ -93,6 +93,7 @@ fn realistic_spec() -> SandboxSpec {
         store_root: home.join(".lpm/store"),
         home_dir: home,
         tmpdir: tmp,
+        read_project_full: false,
         secret_read_allow: Vec::new(),
         extra_write_dirs: Vec::new(),
     }
