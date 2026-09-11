@@ -1057,65 +1057,8 @@ fn grant_dacl_ace_to_tree(
         return Ok(());
     }
 
-    // Walk pre-existing descendants. OICI inheritance on the root
-    // covers FUTURE files created inside, but already-extracted
-    // package files (extractor wrote them with the parent's DACL)
-    // need explicit grants. Per-entry failures are logged and
-    // swallowed so a single stuck file doesn't fail the install.
-    if meta.is_dir() {
-        let mut stack: Vec<PathBuf> = vec![root.to_path_buf()];
-        while let Some(dir) = stack.pop() {
-            let entries = match std::fs::read_dir(&dir) {
-                Ok(it) => it,
-                Err(e) => {
-                    tracing::debug!(
-                        target: "lpm_sandbox::helper_appcontainer",
-                        "skip DACL walk of {}: read_dir failed: {e}",
-                        dir.display(),
-                    );
-                    continue;
-                }
-            };
-            for entry in entries.flatten() {
-                let path = entry.path();
-                let m = match entry.metadata() {
-                    Ok(m) => m,
-                    Err(e) => {
-                        tracing::debug!(
-                            target: "lpm_sandbox::helper_appcontainer",
-                            "skip DACL grant on {}: metadata failed: {e}",
-                            path.display(),
-                        );
-                        continue;
-                    }
-                };
-                if is_reparse_point(&m) {
-                    tracing::debug!(
-                        target: "lpm_sandbox::helper_appcontainer",
-                        "skip reparse point {} during DACL walk \
-                         (target not granted to prevent escape outside allow-set)",
-                        path.display(),
-                    );
-                    continue;
-                }
-                if let Err(e) = set_dacl_ace_on(
-                    &path,
-                    sid,
-                    access_mask,
-                    OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE,
-                ) {
-                    tracing::debug!(
-                        target: "lpm_sandbox::helper_appcontainer",
-                        "skip DACL grant on {}: {e}",
-                        path.display(),
-                    );
-                }
-                if m.is_dir() {
-                    stack.push(path);
-                }
-            }
-        }
-    }
+    // SetNamedSecurityInfoW propagates inheritable ACEs to existing descendants.
+    // Repeating that operation at each directory rescans the same subtrees.
 
     Ok(())
 }
