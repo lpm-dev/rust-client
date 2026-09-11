@@ -265,7 +265,9 @@ fn open_permissions_with_sharing(
     let raw = unsafe {
         CreateFileW(
             path_wide.as_ptr(),
-            READ_CONTROL | FILE_READ_ATTRIBUTES | if write { WRITE_DAC } else { 0 },
+            READ_CONTROL | FILE_READ_ATTRIBUTES | if write { WRITE_DAC } else { 0 }
+                // Metadata-only handles do not enforce Windows share restrictions.
+                | if allow_delete { 0 } else { windows_sys::Win32::Storage::FileSystem::FILE_READ_DATA },
             FILE_SHARE_READ | FILE_SHARE_WRITE | if allow_delete { FILE_SHARE_DELETE } else { 0 },
             ptr::null(),
             OPEN_EXISTING,
@@ -393,6 +395,33 @@ pub fn preview(
         .map(|(path, permission)| grant_for(&path, permission, &user_sid))
         .collect::<Result<_, _>>()?;
     Ok(Plan { user_sid, grants })
+}
+
+/// Find protected ancestors that need setup, without changing permissions or walking trees.
+pub fn required_metadata_setup(roots: &[PathBuf]) -> Result<Vec<PathBuf>, AppContainerError> {
+    let user = current_user_sid()?;
+    let mut ancestors = std::collections::BTreeSet::new();
+    for root in roots {
+        let root = root
+            .canonicalize()
+            .map_err(|error| failure(error.to_string()))?;
+        ancestors.extend(root.ancestors().skip(1).map(Path::to_path_buf));
+    }
+    let mut buffer = vec![0; 64];
+    let packages = build_capability_attr(WinBuiltinAnyPackageSid, &mut buffer)?;
+    let mut missing = Vec::new();
+    for path in ancestors {
+        if grant_for(&path, Permission::Metadata, &user)?.configured {
+            continue;
+        }
+        let (handle, _) = open_permissions(&path, false)?;
+        if !has_grant(&handle, &path, packages.Sid, METADATA_ACCESS, 0)?
+            && open_permissions(&path, true).is_err()
+        {
+            missing.push(path);
+        }
+    }
+    Ok(missing)
 }
 
 fn read_dacl(
