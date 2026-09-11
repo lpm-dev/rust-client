@@ -105,6 +105,9 @@ pub fn run(
             setup::apply(&plan, remove).map_err(|error| LpmError::Script(error.to_string()))?;
             plan = setup::preview_paths(&roots, tools, Some(&plan.user_sid))
                 .map_err(|error| LpmError::Script(error.to_string()))?;
+            if apply && plan.grants.iter().any(|grant| !grant.configured) {
+                return Err(LpmError::Script("The selected grants are not all usable after setup. Existing deny rules or directory changes may prevent access. Preview again and review the affected paths; existing restrictions were preserved.".into()));
+            }
         }
         let mut apply_args = vec![
             "doctor".to_owned(),

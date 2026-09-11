@@ -3,11 +3,14 @@ $ErrorActionPreference = 'Stop'
 if ($env:GITHUB_ACTIONS -ne 'true') { throw 'This test creates disposable Windows accounts and runs only on an isolated GitHub runner.' }
 $Binary = (Resolve-Path $Binary).Path
 $helperSource = Join-Path (Split-Path $Binary) 'lpm-sandbox-helper.exe'
-$originalPath = $env:PATH
+$originalEnvironment = @{}
+foreach ($key in @('PATH','TEMP','TMP','USERPROFILE','LOCALAPPDATA','APPDATA','LPM_NO_UPDATE_CHECK','LPM_FORCE_FILE_AUTH','LPM_FORCE_FILE_VAULT','LPM_DISABLE_HOST_CLI_AUTH')) {
+ $originalEnvironment[$key] = [Environment]::GetEnvironmentVariable($key)
+}
 $env:LPM_NO_UPDATE_CHECK = '1'
 $env:LPM_FORCE_FILE_AUTH = '1'
 $env:LPM_FORCE_FILE_VAULT = '1'
-$env:LPM_DISABLE_HOST_CLI_AUTH = '1' 
+$env:LPM_DISABLE_HOST_CLI_AUTH = '1'
 $root = 'C:\LpmSetupQA-' + $PID
 $user = 'LpmSetup' + $PID
 $password = 'Lpm-QA!' + [Guid]::NewGuid().ToString('N')
@@ -23,7 +26,8 @@ function AsUser([string]$exe, [string[]]$arguments) {
  $stdout = Join-Path $root "stdout-$counter.txt"
  $stderr = Join-Path $root "stderr-$counter.txt"
  $quoted = ($arguments | ForEach-Object { '"' + $_.Replace('"','\"') + '"' }) -join ' '
- $process = Start-Process -FilePath $exe -ArgumentList $quoted -Credential $credential -LoadUserProfile -WorkingDirectory $project -RedirectStandardOutput $stdout -RedirectStandardError $stderr -PassThru -Wait
+ $process = Start-Process -FilePath $exe -ArgumentList $quoted -Credential $credential -LoadUserProfile -WorkingDirectory $project -RedirectStandardOutput $stdout -RedirectStandardError $stderr -PassThru
+ if (!$process.WaitForExit(180000)) { $process.Kill($true); throw "standard-user command timed out: $exe" }
  $out = Get-Content -Raw $stdout -ErrorAction SilentlyContinue
  $err = Get-Content -Raw $stderr -ErrorAction SilentlyContinue
  Write-Host "USER EXIT $($process.ExitCode) $out $err"
@@ -62,6 +66,16 @@ for (const [name, operation] of [
 fs.writeFileSync('hook-complete.txt','success');
 console.log('HOOK_OK');
 '@ | Set-Content (Join-Path $project 'hook.cjs')
+ $bootstrap = AsUser "$env:SystemRoot\System32\whoami.exe" @('/user')
+ if ($bootstrap.Code -ne 0) { throw 'standard-user logon failed' }
+ $profile = Get-CimInstance Win32_UserProfile -Filter "SID='$sid'"
+ if (!$profile.LocalPath) { throw 'standard-user profile was not loaded' }
+ $env:USERPROFILE = $profile.LocalPath
+ $env:LOCALAPPDATA = Join-Path $profile.LocalPath 'AppData\Local'
+ $env:APPDATA = Join-Path $profile.LocalPath 'AppData\Roaming'
+ $env:TEMP = Join-Path $env:LOCALAPPDATA 'Temp'
+ $env:TMP = $env:TEMP
+ New-Item -ItemType Directory -Force $env:TEMP,$env:APPDATA | Out-Null
  $env:PATH = "$tool;$env:SystemRoot\System32;$env:SystemRoot\System32\WindowsPowerShell\v1.0"
  $preview = AsUser $setup @('doctor','sandbox-setup','--project',$project,'--tool-dir',$tool,'--json')
  if ($preview.Code -ne 0) { throw 'standard preview failed' }
@@ -116,7 +130,7 @@ fs.appendFileSync('publish-phases.txt', process.argv[2] + '\n');
  if ($removed.Code -eq 0 -or $removed.Err -notmatch 'sandbox-setup') { throw 'removed setup should be required again' }
  Write-Output 'STANDARD_USER_SETUP_ALL_PASS'
 } finally {
- $env:PATH = $originalPath
+ foreach ($key in $originalEnvironment.Keys) { [Environment]::SetEnvironmentVariable($key, $originalEnvironment[$key]) }
  if (Test-Path $setup) {
   if ($json) { & $setup @($json.apply_args | ForEach-Object { if ($_ -eq '--apply') { '--remove' } else { $_ } }) --yes --json }
   & $setup doctor sandbox-setup --project $project --user-sid $sid --tool-dir $tool --tool-dir $otherTool --tool-dir $project --remove --yes --json

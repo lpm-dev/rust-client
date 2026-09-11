@@ -65,6 +65,7 @@ jobs:
         shell: pwsh
         run: target/debug/lpm-rs.exe doctor sandbox-setup --project . --tool-dir (Split-Path (Get-Command node).Source) --apply --yes --json
       - name: Windows process directory and source handle checks
+        if: ${{ !cancelled() }}
         shell: bash
         run: |
           python -c 'import shutil; assert shutil.disk_usage(".").free >= 10*1024**3'
