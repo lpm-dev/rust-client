@@ -54,8 +54,8 @@ use windows_sys::Win32::Foundation::{
 };
 use windows_sys::Win32::Security::Authorization::{
     EXPLICIT_ACCESS_W, GetNamedSecurityInfoW, GetSecurityInfo, NO_MULTIPLE_TRUSTEE, SE_FILE_OBJECT,
-    SET_ACCESS, SetEntriesInAclW, SetNamedSecurityInfoW, SetSecurityInfo, TRUSTEE_IS_GROUP,
-    TRUSTEE_IS_SID, TRUSTEE_W,
+    SET_ACCESS, SetEntriesInAclW, SetNamedSecurityInfoW, TRUSTEE_IS_GROUP, TRUSTEE_IS_SID,
+    TRUSTEE_W,
 };
 use windows_sys::Win32::Security::Isolation::{
     CreateAppContainerProfile, DeleteAppContainerProfile, DeriveAppContainerSidFromAppContainerName,
@@ -102,8 +102,6 @@ use crate::helper_protocol::{HelperArgs, StdioMode, split_env_entry};
 /// which we don't otherwise need; inlining the literal mirrors the
 /// `SE_GROUP_INTEGRITY` pattern in [`crate::windows`].
 const SE_GROUP_ENABLED: u32 = 0x0000_0004;
-// WinNT access-mask flag; avoids enabling SystemServices for one constant.
-const MAXIMUM_ALLOWED: u32 = 0x0200_0000;
 // WinNT's ACCESS_ALLOWED_ACE_TYPE. windows-sys exposes it through
 // SystemServices, which would otherwise add an unused feature namespace.
 const ACCESS_ALLOWED_ACE_TYPE: u8 = 0;
@@ -161,7 +159,7 @@ pub enum AppContainerError {
         last_error: u32,
     },
     /// Reading the existing DACL via `GetNamedSecurityInfoW` failed.
-    #[error("GetNamedSecurityInfoW({path}) failed with Win32 error {win32_error}")]
+    #[error("cannot read permissions for {path}: Win32 error {win32_error}")]
     ReadDacl {
         /// Path whose DACL we tried to read.
         path: PathBuf,
@@ -178,7 +176,7 @@ pub enum AppContainerError {
         win32_error: u32,
     },
     /// `SetNamedSecurityInfoW` failed writing the merged DACL back.
-    #[error("SetNamedSecurityInfoW({path}) failed with Win32 error {win32_error}")]
+    #[error("cannot update permissions for {path}: Win32 error {win32_error}")]
     WriteDacl {
         /// Path we tried to update.
         path: PathBuf,
@@ -1336,13 +1334,12 @@ fn set_dacl_ace_on(
 ) -> Result<(), AppContainerError> {
     let wide_path = to_wide_with_nul(path.as_os_str());
 
-    // MAXIMUM_ALLOWED prevents SetSecurityInfo from propagating changes to
-    // descendants. The explicit walker updates each entry once and skips links.
     // SAFETY: the terminated path lives through the call; no handle is inherited.
     let handle = unsafe {
         CreateFileW(
             wide_path.as_ptr(),
-            MAXIMUM_ALLOWED,
+            windows_sys::Win32::Storage::FileSystem::READ_CONTROL
+                | windows_sys::Win32::Storage::FileSystem::WRITE_DAC,
             FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
             ptr::null(),
             OPEN_EXISTING,
@@ -1419,24 +1416,33 @@ fn set_dacl_ace_on(
     }
     let _new_dacl_guard = LocalAllocGuard(new_dacl as *mut _);
 
-    // Grants re-enable inheritance so current and future descendants receive
-    // the invocation-scoped AppContainer SID policy.
-    // SAFETY: wide_path lives; new_dacl is non-null + valid.
-    let err = unsafe {
-        SetSecurityInfo(
-            handle.as_raw(),
-            SE_FILE_OBJECT,
-            DACL_SECURITY_INFORMATION | UNPROTECTED_DACL_SECURITY_INFORMATION,
-            ptr::null_mut(),
-            ptr::null_mut(),
-            new_dacl,
-            ptr::null(),
-        )
+    let mut descriptor = windows_sys::Win32::Security::SECURITY_DESCRIPTOR::default();
+    // SetKernelObjectSecurity changes only this entry. SetSecurityInfo propagates
+    // to descendants, duplicating the explicit walker and following linked trees.
+    // SAFETY: the initialized descriptor borrows the valid merged ACL until the call returns.
+    let ok = unsafe {
+        let descriptor_ptr = ptr::addr_of_mut!(descriptor).cast();
+        if windows_sys::Win32::Security::InitializeSecurityDescriptor(descriptor_ptr, 1) == 0
+            || windows_sys::Win32::Security::SetSecurityDescriptorDacl(
+                descriptor_ptr,
+                1,
+                new_dacl,
+                0,
+            ) == 0
+        {
+            0
+        } else {
+            windows_sys::Win32::Security::SetKernelObjectSecurity(
+                handle.as_raw(),
+                DACL_SECURITY_INFORMATION | UNPROTECTED_DACL_SECURITY_INFORMATION,
+                descriptor_ptr,
+            )
+        }
     };
-    if err != ERROR_SUCCESS {
+    if ok == 0 {
         return Err(AppContainerError::WriteDacl {
             path: path.to_path_buf(),
-            win32_error: err,
+            win32_error: unsafe { GetLastError() },
         });
     }
     Ok(())
@@ -2091,6 +2097,20 @@ mod tests {
                 "{sddl}"
             );
         }
+    }
+
+    #[test]
+    fn dacl_grant_succeeds_while_a_directory_handle_denies_delete_sharing() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let _reader = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+            .open(tmp.path())
+            .unwrap();
+        let sid = create_or_reuse_appcontainer_sid("LpmHeldDirectoryGrantTest").unwrap();
+        grant_dacl_ace_to_tree(tmp.path(), sid.0, FILE_GENERIC_READ, true).unwrap();
     }
 
     #[test]

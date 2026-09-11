@@ -36,7 +36,12 @@ jobs:
           tool: nextest
       - name: Linux build dependencies
         if: runner.os == 'Linux'
-        run: bash scripts/ci/install-apt-packages.sh pkg-config libdbus-1-dev bubblewrap
+        run: |
+          bash scripts/ci/install-apt-packages.sh pkg-config libdbus-1-dev bubblewrap
+          if sysctl kernel.apparmor_restrict_unprivileged_userns >/dev/null 2>&1; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
+          unshare -Ur true
       - name: Build native CLI and sandbox helper
         shell: bash
         run: |

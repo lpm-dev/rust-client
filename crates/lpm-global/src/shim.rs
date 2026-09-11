@@ -373,9 +373,8 @@ fn ps1_template(target: &str) -> String {
 }
 
 fn bash_template(target: &str) -> String {
-    if let Some(command) = project_command_shim(target) {
-        let quoted = command.replace('\'', "'\\''");
-        return format!("#!/bin/sh\nexec '{quoted}' \"$@\"\n");
+    if project_command_shim(target).is_some() {
+        return "#!/bin/sh\nexec powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File \"$0.ps1\" \"$@\"\n".into();
     }
     // Mirrors npm's no-extension bash shim. Path-fallback model matches
     // the .cmd/.ps1 templates so all three artifacts behave the same.
@@ -445,7 +444,25 @@ mod tests {
             bash_template(&project_bin.join("tool").to_string_lossy()),
         )
         .unwrap();
+        let powershell = dir.path().join("powershell.exe");
+        std::fs::write(
+            &powershell,
+            "#!/bin/sh\nwhile [ \"$1\" != -File ]; do shift; done\nshift\nexec sh \"$@\"\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&powershell, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::write(
+            dir.path().join("global-tool.ps1"),
+            format!("#!/bin/sh\nexec '{}' \"$@\"\n", target.display()),
+        )
+        .unwrap();
+        let test_path = std::env::join_paths(
+            std::iter::once(dir.path().to_path_buf())
+                .chain(std::env::split_paths(&std::env::var_os("PATH").unwrap())),
+        )
+        .unwrap();
         let output = std::process::Command::new("sh")
+            .env("PATH", test_path)
             .arg(wrapper)
             .arg("hello space")
             .output()

@@ -1365,26 +1365,9 @@ fn open_owned_directory_component(parent: &Dir, name: &std::ffi::OsStr) -> std::
 
 #[cfg(windows)]
 fn open_owned_directory_component(parent: &Dir, name: &std::ffi::OsStr) -> std::io::Result<Dir> {
-    use cap_fs_ext::{FollowSymlinks, OpenOptionsFollowExt as _, OpenOptionsMaybeDirExt as _};
-    use cap_std::fs::{OpenOptions, OpenOptionsExt as _};
-    use windows_sys::Win32::Foundation::GENERIC_READ;
-    use windows_sys::Win32::Storage::FileSystem::{
-        FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_DELETE,
-        FILE_SHARE_READ, FILE_SHARE_WRITE,
-    };
-
     #[cfg(test)]
     OWNED_DIRECTORY_COMPONENT_OPENS.with(|opens| opens.set(opens.get() + 1));
-    let mut options = OpenOptions::new();
-    options
-        .access_mode(GENERIC_READ)
-        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
-        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
-        .follow(FollowSymlinks::No)
-        .maybe_dir(true);
-    parent
-        .open_with(name, &options)
-        .map(|file| Dir::from_std_file(file.into_std()))
+    crate::directory_transaction::open_directory_for_publication(parent, name)
 }
 
 #[cfg(test)]
