@@ -215,11 +215,24 @@ fn private_parent_has_extended_acl(_parent: &Dir) -> std::io::Result<bool> {
 
 #[cfg(windows)]
 fn create_and_open_private_directory(parent: &Dir, name: &OsStr) -> std::io::Result<Dir> {
-    open_windows_directory(parent, name, true)
+    open_windows_directory(parent, name, WindowsDirectoryIntent::Create)
 }
 
 #[cfg(windows)]
-fn open_windows_directory(parent: &Dir, name: &OsStr, create: bool) -> std::io::Result<Dir> {
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum WindowsDirectoryIntent {
+    Create,
+    Open,
+    Parent,
+}
+
+#[cfg(windows)]
+fn open_windows_directory(
+    parent: &Dir,
+    name: &OsStr,
+    intent: WindowsDirectoryIntent,
+) -> std::io::Result<Dir> {
+    let create = intent == WindowsDirectoryIntent::Create;
     use std::mem::size_of;
     use std::os::windows::ffi::OsStrExt as _;
     use std::os::windows::io::{AsRawHandle as _, FromRawHandle as _};
@@ -255,6 +268,7 @@ fn open_windows_directory(parent: &Dir, name: &OsStr, create: bool) -> std::io::
 
     let mut components = std::path::Path::new(name).components();
     if !matches!(components.next(), Some(std::path::Component::Normal(_)))
+        && !(intent == WindowsDirectoryIntent::Parent && name == OsStr::new(".."))
         || components.next().is_some()
     {
         return Err(std::io::Error::new(
@@ -372,7 +386,17 @@ pub(crate) fn open_directory_for_publication(parent: &Dir, name: &OsStr) -> std:
 pub(crate) fn open_directory_for_publication(parent: &Dir, name: &OsStr) -> std::io::Result<Dir> {
     // cap-std removes FILE_SHARE_DELETE when it opens directories, which
     // conflicts with the DELETE access needed by the retained rename handle.
-    open_windows_directory(parent, name, false)
+    open_windows_directory(parent, name, WindowsDirectoryIntent::Open)
+}
+
+#[cfg(windows)]
+pub(crate) fn open_directory_parent(directory: &Dir) -> std::io::Result<Dir> {
+    open_windows_directory(directory, OsStr::new(".."), WindowsDirectoryIntent::Parent)
+}
+
+#[cfg(not(windows))]
+pub(crate) fn open_directory_parent(directory: &Dir) -> std::io::Result<Dir> {
+    directory.open_parent_dir(cap_std::ambient_authority())
 }
 
 #[cfg(not(windows))]

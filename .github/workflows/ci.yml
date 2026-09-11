@@ -27,7 +27,9 @@ jobs:
             ~/.cargo/git
             target
           key: Windows-native-acceptance-1940-${{ hashFiles('Cargo.lock') }}
-          restore-keys: Windows-cargo-filesystem-1.94.0-
+          restore-keys: |
+            Windows-native-acceptance-1940-
+            Windows-cargo-filesystem-1.94.0-
       - uses: taiki-e/install-action@9c6953334daacc48e55a35db9a19c771f79ffa9d
         with:
           tool: nextest
@@ -36,6 +38,9 @@ jobs:
         run: |
           python -c 'import shutil; assert shutil.disk_usage(".").free >= 10*1024**3'
           cargo build --locked -p lpm-cli -p lpm-sandbox
+      - name: Cleared environment controls
+        shell: pwsh
+        run: ./qa-env.ps1 2>&1 | Tee-Object -FilePath qa-environment.log
       - name: Inspect existing tool access
         shell: pwsh
         run: |
@@ -101,4 +106,6 @@ jobs:
         if: always()
         with:
           name: native-regression-baseline
-          path: qa-results
+          path: |
+            qa-results
+            qa-environment.log
