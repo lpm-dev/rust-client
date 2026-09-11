@@ -673,7 +673,8 @@ mod tests {
             directory_identity(&reopened).unwrap()
         );
         drop(child);
-        publish_entry_noreplace(&root, &parent_name, &root, OsStr::new("renamed")).unwrap();
+        publish_directory_noreplace(&root, &parent, &parent_name, &root, OsStr::new("renamed"))
+            .unwrap();
         assert!(temporary.path().join("renamed").is_dir());
     }
 
