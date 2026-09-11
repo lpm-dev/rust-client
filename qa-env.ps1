@@ -5,6 +5,30 @@ using System.Runtime.InteropServices;
 public class ContainerSid {
  [DllImport("userenv.dll", CharSet=CharSet.Unicode)] public static extern int DeriveAppContainerSidFromAppContainerName(string name, out IntPtr sid);
  [DllImport("kernel32.dll")] public static extern IntPtr LocalFree(IntPtr value);
+ [DllImport("kernel32.dll", CharSet=CharSet.Unicode, SetLastError=true)] static extern IntPtr CreateFile(string path, uint access, uint share, IntPtr attributes, uint disposition, uint flags, IntPtr template);
+ [DllImport("kernel32.dll")] static extern bool CloseHandle(IntPtr handle);
+ [DllImport("advapi32.dll", SetLastError=true)] static extern bool SetKernelObjectSecurity(IntPtr handle, uint flags, byte[] descriptor);
+ [DllImport("advapi32.dll", CharSet=CharSet.Unicode, SetLastError=true)] static extern bool LogonUser(string user, string domain, string password, uint type, uint provider, out IntPtr token);
+ [DllImport("advapi32.dll", SetLastError=true)] static extern bool ImpersonateLoggedOnUser(IntPtr token);
+ [DllImport("advapi32.dll")] static extern bool RevertToSelf();
+ public static void SetAcl(string path, byte[] descriptor) {
+  IntPtr handle = CreateFile(path, 0x60000, 7, IntPtr.Zero, 3, 0x02200000, IntPtr.Zero);
+  if (handle == new IntPtr(-1)) throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error());
+  try { if (!SetKernelObjectSecurity(handle, 4, descriptor)) throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error()); }
+  finally { CloseHandle(handle); }
+ }
+ public static int StandardUserWriteDac(string user, string password, string path) {
+  IntPtr token;
+  if (!LogonUser(user, ".", password, 2, 0, out token)) throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error());
+  try {
+   if (!ImpersonateLoggedOnUser(token)) throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error());
+   try {
+    IntPtr handle = CreateFile(path, 0x60000, 7, IntPtr.Zero, 3, 0x02200000, IntPtr.Zero);
+    if (handle == new IntPtr(-1)) return Marshal.GetLastWin32Error();
+    CloseHandle(handle); return 0;
+   } finally { RevertToSelf(); }
+  } finally { CloseHandle(token); }
+ }
 }
 '@
 $root = Join-Path $env:TEMP ('lpm-ancestor-qa-' + $PID)
@@ -42,7 +66,7 @@ try {
   $acl = Get-Acl $path
   Write-Output ('ANCESTOR ' + $path + ' PROTECTED ' + $acl.AreAccessRulesProtected)
   $acl.AddAccessRule($rule)
-  Set-Acl -LiteralPath $path -AclObject $acl
+  [ContainerSid]::SetAcl($path, $acl.GetSecurityDescriptorBinaryForm())
  }
  & target/debug/lpm-sandbox-helper.exe @base -- $node hook.cjs
  Write-Output ('AFTER ' + $LASTEXITCODE)
@@ -51,7 +75,14 @@ try {
  foreach ($path in $ancestors) {
   $acl = Get-Acl $path
   $acl.RemoveAccessRuleSpecific($rule)
-  Set-Acl -LiteralPath $path -AclObject $acl
+  [ContainerSid]::SetAcl($path, $acl.GetSecurityDescriptorBinaryForm())
  }
 }
+$user = 'LpmQA' + $PID
+$password = 'Lpm-QA!' + [Guid]::NewGuid().ToString('N')
+try {
+ New-LocalUser -Name $user -Password (ConvertTo-SecureString $password -AsPlainText -Force) | Out-Null
+ Add-LocalGroupMember -Group Users -Member $user
+ Write-Output ('STANDARD_USER_ROOT_WRITE_DAC ' + [ContainerSid]::StandardUserWriteDac($user, $password, 'C:\'))
+} finally { Remove-LocalUser -Name $user }
 exit 0
