@@ -58,7 +58,7 @@ async fn health_human_output_renders_registry_status_table() {
 }
 
 #[tokio::test]
-async fn health_human_output_redacts_registry_credentials() {
+async fn health_human_refuses_registry_credentials_before_network_access() {
     let project = TempProject::empty(r#"{"name":"health","version":"1.0.0"}"#);
     let mock = MockRegistry::start().await;
     mock.with_health().await;
@@ -70,16 +70,18 @@ async fn health_human_output_redacts_registry_credentials() {
         .expect("failed to run lpm health");
     let stderr = String::from_utf8_lossy(&output.stderr);
 
-    assert!(output.status.success(), "{stderr}");
+    assert!(!output.status.success(), "{stderr}");
     assert!(
         !stderr.contains("audit-user") && !stderr.contains("audit-secret"),
         "health must not expose registry URL credentials: {stderr}"
     );
     assert!(stderr.contains(&mock.url()), "{stderr}");
+    assert!(stderr.contains("registry-scoped"), "{stderr}");
+    assert!(mock.server().received_requests().await.unwrap().is_empty());
 }
 
 #[tokio::test]
-async fn health_json_output_redacts_registry_credentials() {
+async fn health_json_refuses_registry_credentials_before_network_access() {
     let project = TempProject::empty(r#"{"name":"health","version":"1.0.0"}"#);
     let mock = MockRegistry::start().await;
     mock.with_health().await;
@@ -91,15 +93,31 @@ async fn health_json_output_redacts_registry_credentials() {
         .expect("failed to run lpm health --json");
     let stdout = String::from_utf8_lossy(&output.stdout);
 
-    assert!(output.status.success(), "{stdout}");
+    assert!(!output.status.success(), "{stdout}");
     assert!(
         !stdout.contains("audit-user") && !stdout.contains("audit-secret"),
         "health JSON must not expose registry URL credentials: {stdout}"
     );
-    assert_eq!(
-        parse_json_output(&output.stdout)["registry_url"],
-        mock.url()
-    );
+    let json = parse_json_output(&output.stdout);
+    assert_eq!(json["error_code"], "registry");
+    assert!(json["error"].as_str().unwrap().contains("registry-scoped"));
+    assert!(mock.server().received_requests().await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn health_json_reports_a_healthy_registry_without_url_credentials() {
+    let project = TempProject::empty(r#"{"name":"health","version":"1.0.0"}"#);
+    let mock = MockRegistry::start().await;
+    mock.with_health().await;
+    let output = lpm_with_registry(&project, &mock.url())
+        .args(["health", "--json"])
+        .output()
+        .expect("failed to run lpm health --json");
+    let json = parse_json_output(&output.stdout);
+    assert!(output.status.success(), "{json}");
+    assert_eq!(json["success"], true);
+    assert_eq!(json["healthy"], true);
+    assert_eq!(json["registry_url"], mock.url());
 }
 
 #[tokio::test]
@@ -155,8 +173,7 @@ async fn health_json_exits_nonzero_when_registry_returns_unhealthy_status() {
     let mock = MockRegistry::start().await;
     mock.with_health_status(304).await;
 
-    let registry_url = registry_url_with_credentials(&mock.url());
-    let output = lpm_with_registry(&project, &registry_url)
+    let output = lpm_with_registry(&project, &mock.url())
         .args(["health", "--json"])
         .output()
         .expect("failed to run unhealthy lpm health --json");
@@ -176,12 +193,6 @@ async fn health_json_exits_nonzero_when_registry_returns_unhealthy_status() {
             .as_str()
             .is_some_and(|error| error.contains("is unreachable")),
         "the JSON error must explain the failed health status: {json:#}"
-    );
-    assert!(
-        !json["error"]
-            .as_str()
-            .is_some_and(|error| error.contains("audit-secret")),
-        "the JSON error must redact registry credentials: {json:#}"
     );
     insta::with_settings!({
         filters => vec![(r"http://127\.0\.0\.1:\d+", "[registry-url]")],
