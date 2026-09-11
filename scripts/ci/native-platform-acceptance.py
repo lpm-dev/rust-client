@@ -321,6 +321,47 @@ try:
         node('native-runtime', p, "const a=require('node:assert/strict'); a.ok(require('esbuild').transformSync('let a: number=42',{loader:'ts'}).code.includes('42')); a.ok(require('bcrypt').compareSync('qa',require('bcrypt').hashSync('qa',4))); require('sharp')({create:{width:2,height:3,channels:4,background:'red'}}).png().toBuffer().then(x=>{a.ok(x.length>0);console.log('three-native-runtime-probes-ok')}).catch(e=>{console.error(e);process.exit(1)})")
     scenario('real-native-optional-dependencies-runtime', native_dependencies)
 
+    def shell_path():
+        p = project('shell path ! & (parentheses) ü')
+        run('shell-path-install', p, [BINARY, 'install', '@qa/native-probe@1.0.0', *FLAGS])
+        manifest = json.loads((p / 'package.json').read_text())
+        manifest['scripts'] = {'probe': 'qa-native'}
+        write_json(p / 'package.json', manifest)
+        output = run('shell-path-run', p, [BINARY, 'run', 'probe'])
+        check(b'native-bin-ok' in output[1], 'bin command failed in shell-sensitive path')
+    scenario('bin-execution-in-shell-sensitive-path', shell_path)
+
+    def linked_project():
+        p = project('linked-project-target')
+        link = ROOT / 'linked-project-alias'
+        link.symlink_to(p, target_is_directory=True)
+        run('linked-path-install', link, [BINARY, 'install', '@qa/native-probe@1.0.0', *FLAGS])
+        node('linked-path-runtime', link, "require('node:assert/strict').equal(require('@qa/native-probe').answer,42)")
+        run('linked-path-uninstall', link, [BINARY, 'uninstall', '@qa/native-probe'])
+        check(p.exists() and link.is_symlink(), 'uninstall damaged project alias')
+    scenario('install-and-remove-through-directory-symlink', linked_project)
+
+    def native_compile():
+        p = project('native compile ü space', {'name': 'qa-native-compile', 'version': '1.0.0', 'private': True,
+             'scripts': {'build': 'node-gyp rebuild', 'test': 'node probe.cjs'}}, registry=False)
+        write_json(p / 'binding.gyp', {'targets': [{'target_name': 'qa_native', 'sources': ['addon.c']}]})
+        (p / 'addon.c').write_text('''#include <node_api.h>
+static napi_value answer(napi_env env, napi_callback_info info) {
+  napi_value value; napi_create_int32(env, 42, &value); return value;
+}
+static napi_value init(napi_env env, napi_value exports) {
+  napi_value fn; napi_create_function(env, "answer", NAPI_AUTO_LENGTH, answer, 0, &fn);
+  napi_set_named_property(env, exports, "answer", fn); return exports;
+}
+NAPI_MODULE(NODE_GYP_MODULE_NAME, init)
+''')
+        (p / 'probe.cjs').write_text("require('node:assert/strict').equal(require('./build/Release/qa_native.node').answer(),42); console.log('compiled-addon-ok')")
+        run('node-gyp-install', p, [BINARY, 'install', 'node-gyp@11.4.2', *FLAGS], timeout=300)
+        run('native-source-build', p, [BINARY, 'run', 'build'], timeout=300)
+        output = run('native-source-runtime', p, [BINARY, 'run', 'test'])
+        check(b'compiled-addon-ok' in output[1], 'compiled N-API addon not usable')
+    scenario('compile-and-load-real-native-addon', native_compile)
+
 finally:
     registry.terminate()
     try:
