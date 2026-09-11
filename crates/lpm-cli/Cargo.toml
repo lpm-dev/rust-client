@@ -83,7 +83,7 @@ crossterm = "0.29"
 # `console::Style` from its color hooks, so the no-color theme override
 # needs a direct dep to construct an unstyled `Style::new()`. Pinned to the
 # same 0.15.x line cliclack 0.3.x uses so the two `Style` types unify.
-console = "0.15"
+console = "0.16"
 gag = "1"
 
 # Browser open
