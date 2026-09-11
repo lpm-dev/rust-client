@@ -1,12 +1,15 @@
 $ErrorActionPreference = 'Continue'
 $root = Join-Path $env:TEMP ('lpm-env-qa-' + $PID)
 New-Item -ItemType Directory -Force $root | Out-Null
+$base = @('SystemRoot','WINDIR','COMSPEC','PATH','TEMP','TMP')
 $cases = @(
-  @(),
-  @('SystemRoot'),
-  @('SystemRoot','WINDIR','COMSPEC','PATH','TEMP','TMP'),
-  @('SystemRoot','WINDIR','COMSPEC','PATH','TEMP','TMP','USERPROFILE','LOCALAPPDATA','APPDATA'),
-  @('SystemRoot','WINDIR','COMSPEC','PATH','TEMP','TMP','USERPROFILE','LOCALAPPDATA','APPDATA','ProgramData','ProgramFiles','ProgramFiles(x86)','SystemDrive')
+  ($base + @('USERPROFILE')),
+  ($base + @('LOCALAPPDATA')),
+  ($base + @('APPDATA')),
+  ($base + @('USERPROFILE','LOCALAPPDATA')),
+  ($base + @('USERPROFILE','APPDATA')),
+  ($base + @('LOCALAPPDATA','APPDATA')),
+  ($base + @('USERPROFILE','LOCALAPPDATA','APPDATA'))
 )
 $i = 0
 foreach ($keys in $cases) {
@@ -20,6 +23,16 @@ foreach ($keys in $cases) {
   & target/debug/lpm-sandbox-helper.exe @arguments
   Write-Output ('EXIT ' + $LASTEXITCODE)
   $i++
+}
+foreach ($key in @('USERPROFILE','LOCALAPPDATA','APPDATA')) {
+  $arguments = @('--protocol-version','2','--appcontainer-name',('LpmMappedEnvQA' + $PID + '-' + $key),'--delete-appcontainer-profile','--env-clear','--stdio-stdin','null','--stdio-stdout','inherit','--stdio-stderr','inherit','--working-dir',$root,'--writable-dir',$root)
+  foreach ($system in $base) {
+    $arguments += @('--env',($system + '=' + [Environment]::GetEnvironmentVariable($system)))
+  }
+  $arguments += @('--env',($key + '=' + $root),'--',(Join-Path $env:SystemRoot 'System32/cmd.exe'),'/d','/c','exit 0')
+  Write-Output ('MAPPED ' + $key)
+  & target/debug/lpm-sandbox-helper.exe @arguments
+  Write-Output ('EXIT ' + $LASTEXITCODE)
 }
 Remove-Item -Recurse -Force $root
 exit 0
