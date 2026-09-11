@@ -1,6 +1,11 @@
 name: Native platform acceptance
 on:
   workflow_dispatch:
+    inputs:
+      mode:
+        type: choice
+        options: [full, workflows]
+        default: full
 permissions:
   contents: read
 env:
@@ -47,6 +52,7 @@ jobs:
           python -c 'import shutil; from pathlib import Path; p=Path("target"); p.mkdir(exist_ok=True); assert shutil.disk_usage(p).free >= 10*1024**3, "disk floor"'
           cargo build --locked -p lpm-cli -p lpm-sandbox
       - name: New native consumer scenarios
+        if: inputs.mode != 'workflows'
         continue-on-error: true
         shell: bash
         run: python scripts/ci/native-platform-acceptance.py --binary target/debug/lpm-rs${{ runner.os == 'Windows' && '.exe' || '' }} --output qa-results/consumer --verdaccio qa-tools/node_modules/verdaccio/bin/verdaccio
@@ -56,9 +62,10 @@ jobs:
         run: |
           mkdir -p qa-results
           python -c 'import shutil; assert shutil.disk_usage("target").free >= 10*1024**3, "disk floor"'
-          cargo nextest run --locked -p lpm-workflows --test publish --test upgrade --test uninstall --test install_concurrency --test install_local_tarball --no-fail-fast --status-level all --final-status-level all 2>&1 | tee qa-results/workflows.log
+          scripts/ci/with-hermetic-workflow-cli.sh cargo nextest run --locked -p lpm-workflows --test publish --test upgrade --test uninstall --test install_concurrency --test install_local_tarball --no-fail-fast --status-level all --final-status-level all 2>&1 | tee qa-results/workflows.log
           exit "${PIPESTATUS[0]}"
       - name: Public native workspace consumers
+        if: inputs.mode != 'workflows'
         continue-on-error: true
         shell: bash
         run: python scripts/ci/test-complex-workspace-consumer.py --binary target/debug/lpm-rs${{ runner.os == 'Windows' && '.exe' || '' }} --output qa-results/complex-workspace
