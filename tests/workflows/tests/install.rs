@@ -20,6 +20,20 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 
 #[tokio::test]
 async fn install_refreshes_custom_metadata_when_requested_version_was_published_after_cache() {
+    assert_refreshes_published_version(None).await;
+}
+
+#[tokio::test]
+async fn walker_install_refreshes_a_newly_published_version() {
+    assert_refreshes_published_version(Some(("LPM_GREEDY_FUSION", "0"))).await;
+}
+
+#[tokio::test]
+async fn pubgrub_install_refreshes_a_newly_published_version() {
+    assert_refreshes_published_version(Some(("LPM_RESOLVER", "pubgrub"))).await;
+}
+
+async fn assert_refreshes_published_version(mode: Option<(&str, &str)>) {
     let mock = MockRegistry::start().await;
     let name = "freshly-published";
     let first = make_tarball(name, "1.0.0");
@@ -27,7 +41,12 @@ async fn install_refreshes_custom_metadata_when_requested_version_was_published_
     let project = TempProject::empty(r#"{"name":"consumer","version":"1.0.0"}"#);
     project.write_file(".npmrc", &format!("registry={}/\n", mock.url()));
     lpm_with_registry(&project, &mock.url())
-        .args(["install", "freshly-published@1.0.0", "--no-skills", "--no-editor-setup"])
+        .args([
+            "install",
+            "freshly-published@1.0.0",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
         .assert()
         .success();
 
@@ -37,19 +56,128 @@ async fn install_refreshes_custom_metadata_when_requested_version_was_published_
         "1.1.0",
         &[
             ("1.0.0", serde_json::json!({}), Some(first)),
-            ("1.1.0", serde_json::json!({}), Some(make_tarball(name, "1.1.0"))),
+            (
+                "1.1.0",
+                serde_json::json!({}),
+                Some(make_tarball(name, "1.1.0")),
+            ),
         ],
     )
     .await;
-    lpm_with_registry(&project, &mock.url())
-        .args(["install", "freshly-published@1.1.0", "--no-skills", "--no-editor-setup"])
+    let mut command = lpm_with_registry(&project, &mock.url());
+    if let Some((key, value)) = mode {
+        command.env(key, value);
+    }
+    command
+        .args([
+            "install",
+            "freshly-published@1.1.0",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
         .assert()
         .success();
-    let installed: serde_json::Value = serde_json::from_str(
-        &project.read_file("node_modules/freshly-published/package.json"),
-    )
-    .unwrap();
+    let installed: serde_json::Value =
+        serde_json::from_str(&project.read_file("node_modules/freshly-published/package.json"))
+            .unwrap();
     assert_eq!(installed["version"], "1.1.0");
+}
+
+#[tokio::test]
+async fn missing_version_refresh_is_bounded_and_preserves_the_installed_project() {
+    let mock = MockRegistry::start().await;
+    let package = "missing-new-version";
+    let tarball = make_tarball(package, "1.0.0");
+    mock.with_package(package, "1.0.0", &tarball).await;
+    let project = TempProject::empty(r#"{"name":"consumer","version":"1.0.0"}"#);
+    project.write_file(".npmrc", &format!("registry={}/\n", mock.url()));
+    lpm_with_registry(&project, &mock.url())
+        .args([
+            "install",
+            "missing-new-version@1.0.0",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .assert()
+        .success();
+    let manifest = project.read_file("package.json");
+    let lock = project.read_file("lpm.lock");
+    mock.server().reset().await;
+    mock.with_package(package, "1.0.0", &tarball).await;
+
+    lpm_with_registry(&project, &mock.url())
+        .args([
+            "install",
+            "missing-new-version@1.1.0",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .assert()
+        .failure();
+
+    let requests = mock.server().received_requests().await.unwrap();
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|request| request.url.path() == "/missing-new-version")
+            .count(),
+        1
+    );
+    assert_eq!(project.read_file("package.json"), manifest);
+    assert_eq!(project.read_file("lpm.lock"), lock);
+    assert!(
+        project
+            .read_file("node_modules/missing-new-version/package.json")
+            .contains("1.0.0")
+    );
+}
+
+#[tokio::test]
+async fn metadata_refresh_does_not_bypass_revoked_custom_registry_access() {
+    let mock = MockRegistry::start().await;
+    let package = "access-revoked";
+    mock.with_package(package, "1.0.0", &make_tarball(package, "1.0.0"))
+        .await;
+    let project = TempProject::empty(r#"{"name":"consumer","version":"1.0.0"}"#);
+    project.write_file(".npmrc", &format!("registry={}/\n", mock.url()));
+    lpm_with_registry(&project, &mock.url())
+        .args([
+            "install",
+            "access-revoked@1.0.0",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .assert()
+        .success();
+    let manifest = project.read_file("package.json");
+    let lock = project.read_file("lpm.lock");
+    mock.server().reset().await;
+    Mock::given(method("GET"))
+        .and(path("/access-revoked"))
+        .respond_with(
+            ResponseTemplate::new(403).set_body_json(serde_json::json!({"error":"access revoked"})),
+        )
+        .expect(1)
+        .mount(mock.server())
+        .await;
+
+    lpm_with_registry(&project, &mock.url())
+        .args([
+            "install",
+            "access-revoked@1.1.0",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .assert()
+        .failure();
+
+    assert_eq!(project.read_file("package.json"), manifest);
+    assert_eq!(project.read_file("lpm.lock"), lock);
+    assert!(
+        project
+            .read_file("node_modules/access-revoked/package.json")
+            .contains("1.0.0")
+    );
 }
 
 async fn assert_unavailable_publication_message(status: Option<&str>, json: bool, expected: &str) {

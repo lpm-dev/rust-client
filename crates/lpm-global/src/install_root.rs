@@ -162,6 +162,15 @@ pub enum InstallRootStatus {
     RootMissing,
 }
 
+/// Path of a materialized command inside a project's bin directory.
+pub fn project_command_path(bin_dir: &Path, command: &str) -> std::path::PathBuf {
+    #[cfg(windows)]
+    let name = format!("{command}.cmd");
+    #[cfg(not(windows))]
+    let name = command;
+    bin_dir.join(name)
+}
+
 /// Recovery / commit-time validation that an install root is bootable.
 ///
 /// `expected_commands` is the *anticipated* command list from the WAL
@@ -215,7 +224,7 @@ pub fn validate_install_root(
 
     let bin_dir = install_root.join("node_modules").join(".bin");
     for cmd in &marker.commands {
-        let bin_path = as_extended_path(&bin_dir.join(cmd));
+        let bin_path = as_extended_path(&project_command_path(&bin_dir, cmd));
         // symlink_metadata so a broken symlink reports MissingBinTarget
         // rather than misleadingly "Ready".
         let meta = match std::fs::symlink_metadata(&bin_path) {
@@ -294,7 +303,7 @@ mod tests {
         let bin = tmp.path().join("node_modules").join(".bin");
         std::fs::create_dir_all(&bin).unwrap();
         for cmd in commands {
-            let target = bin.join(cmd);
+            let target = project_command_path(&bin, cmd);
             std::fs::write(&target, b"#!/bin/sh\necho ok\n").unwrap();
             #[cfg(unix)]
             {
@@ -478,7 +487,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let bin = tmp.path().join("node_modules").join(".bin");
         std::fs::create_dir_all(&bin).unwrap();
-        let target = bin.join("eslint");
+        let target = project_command_path(&bin, "eslint");
         std::fs::write(&target, b"#!/bin/sh\necho ok\n").unwrap();
         #[cfg(unix)]
         {
@@ -496,7 +505,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let bin = tmp.path().join("node_modules").join(".bin");
         std::fs::create_dir_all(&bin).unwrap();
-        let target = bin.join("eslint");
+        let target = project_command_path(&bin, "eslint");
         std::fs::write(&target, b"#!/bin/sh\necho ok\n").unwrap();
         #[cfg(unix)]
         {
@@ -515,7 +524,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let bin = tmp.path().join("node_modules").join(".bin");
         std::fs::create_dir_all(&bin).unwrap();
-        let target = bin.join("eslint");
+        let target = project_command_path(&bin, "eslint");
         std::fs::write(&target, b"// not executable").unwrap();
         // Mode 0o644 — readable but not executable.
         use std::os::unix::fs::PermissionsExt;
@@ -559,7 +568,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let bin = tmp.path().join("node_modules").join(".bin");
         std::fs::create_dir_all(&bin).unwrap();
-        let target = bin.join("eslint");
+        let target = project_command_path(&bin, "eslint");
         std::fs::write(&target, b"#!/bin/sh\necho ok\n").unwrap();
         #[cfg(unix)]
         {
@@ -581,7 +590,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let bin = tmp.path().join("node_modules").join(".bin");
         std::fs::create_dir_all(&bin).unwrap();
-        let target = bin.join("eslint");
+        let target = project_command_path(&bin, "eslint");
         std::fs::write(&target, b"#!/bin/sh\necho ok\n").unwrap();
         #[cfg(unix)]
         {
@@ -607,7 +616,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let bin = tmp.path().join("node_modules").join(".bin");
         std::fs::create_dir_all(&bin).unwrap();
-        let target = bin.join("eslint");
+        let target = project_command_path(&bin, "eslint");
         std::fs::write(&target, b"#!/bin/sh\necho ok\n").unwrap();
         #[cfg(unix)]
         {
@@ -632,7 +641,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let bin = tmp.path().join("node_modules").join(".bin");
         std::fs::create_dir_all(&bin).unwrap();
-        let target = bin.join("eslint");
+        let target = project_command_path(&bin, "eslint");
         std::fs::write(&target, b"#!/bin/sh\necho ok\n").unwrap();
         #[cfg(unix)]
         {

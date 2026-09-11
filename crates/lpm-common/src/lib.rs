@@ -61,6 +61,8 @@ pub use npmrc::{
 };
 pub use package_instance::{PackageInstanceId, ResolutionNodeId, artifact_binding_id};
 pub use package_name::PackageName;
+#[cfg(windows)]
+pub use paths::absolute_extended_path;
 pub use paths::{
     ExclusiveLockHandle, FsKind, GLOBAL_INSTALL_PATH_BUDGET, INSTALL_READY_MARKER, LpmRoot,
     ProjectLockDirectory, ProjectLockKind, SharedLockHandle, SingleFileExclusiveLockHandle,

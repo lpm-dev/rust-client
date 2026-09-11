@@ -20,7 +20,7 @@ fn make_complete_install_root(install_root: &Path, commands: &[&str]) {
     let bin = install_root.join("node_modules").join(".bin");
     std::fs::create_dir_all(&bin).unwrap();
     for cmd in commands {
-        let target = bin.join(cmd);
+        let target = crate::project_command_path(&bin, cmd);
         std::fs::write(&target, b"#!/bin/sh\necho ok\n").unwrap();
         #[cfg(unix)]
         {

@@ -939,6 +939,7 @@ impl DescendantProcessSnapshot {
     }
 }
 
+#[cfg(not(windows))]
 pub(crate) fn descendant_process_snapshot(root_pid: u32) -> DescendantProcessSnapshot {
     #[cfg(unix)]
     {
@@ -1442,6 +1443,7 @@ fn process_tree_snapshot_batch(
     }
 }
 
+#[cfg(unix)]
 fn failed_process_tree_snapshot(root_pid: u32) -> DescendantProcessSnapshot {
     DescendantProcessSnapshot {
         identities: HashMap::from([(root_pid, None)]),
@@ -1801,7 +1803,7 @@ fn windows_process_snapshot_entries() -> Option<Vec<WindowsSnapshotEntry>> {
     )
 }
 
-#[cfg(any(windows, test))]
+#[cfg(test)]
 fn windows_descendant_snapshot_from_entries(
     root_pid: u32,
     trusted: &HashMap<u32, ProcessIdentity>,
@@ -2088,7 +2090,7 @@ fn windows_process_identity_ticks(identity: &ProcessIdentity) -> Option<u64> {
     identity.as_str().strip_prefix("windows:")?.parse().ok()
 }
 
-#[cfg(any(windows, test))]
+#[cfg(test)]
 pub(crate) fn descendant_process_ids_from_pairs(
     root_pid: u32,
     pairs: impl IntoIterator<Item = (u32, u32)>,

@@ -623,7 +623,7 @@ fn uninstall_json_envelope_with_one_removal_matches_snapshot() {
     insta::with_settings!({
         filters => vec![
             // Redact the temp-dir manifest path inside target_set.
-            (r#""/[^"]+/package\.json""#, r#""[MANIFEST]""#),
+            (r#""[^"]*[\\/]package\.json""#, r#""[MANIFEST]""#),
         ],
     }, {
         insta::assert_json_snapshot!("uninstall_json_envelope_one_removal", envelope);

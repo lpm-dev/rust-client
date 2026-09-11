@@ -1,5 +1,39 @@
 use super::prelude::*;
 
+pub(crate) async fn revalidate_metadata(
+    client: &RegistryClient,
+    route_table: &RouteTable,
+    canonical: &CanonicalKey,
+) -> Result<lpm_registry::PackageMetadata, lpm_common::LpmError> {
+    match canonical {
+        CanonicalKey::Root => Err(lpm_common::LpmError::Registry(
+            "cannot refresh project-root metadata".into(),
+        )),
+        CanonicalKey::Lpm { owner, name } => {
+            let name = lpm_common::PackageName::parse(&format!("@lpm.dev/{owner}.{name}"))?;
+            client
+                .revalidate_package_metadata_with_timings(&name)
+                .await
+                .map(|result| result.metadata)
+        }
+        CanonicalKey::Npm { name } => match route_table.route_for_package(name) {
+            UpstreamRoute::NpmDirect => client
+                .revalidate_npm_metadata_direct_with_timings(name)
+                .await
+                .map(|result| result.metadata),
+            UpstreamRoute::LpmWorker => {
+                client
+                    .revalidate_npm_package_metadata_proxy_only(name)
+                    .await
+            }
+            UpstreamRoute::Custom { target, auth } => client
+                .revalidate_npm_metadata_from_with_timings(&target.base_url, name, auth.as_deref())
+                .await
+                .map(|result| result.metadata),
+        },
+    }
+}
+
 pub(super) struct ReleaseTimePolicyFetchDetail {
     pub(super) total_ms: u128,
     pub(super) timings: lpm_registry::PackageMetadataFetchTimings,

@@ -1392,6 +1392,10 @@ fn get_dependencies_skips_optional_with_no_versions() {
         ],
     );
 
+    provider
+        .refreshed_metadata
+        .lock()
+        .insert(CanonicalKey::from_dep_name("fsevents"));
     let deps = provider
         .get_dependencies(&pkg, &NpmVersion::parse("1.0.0").unwrap())
         .unwrap();

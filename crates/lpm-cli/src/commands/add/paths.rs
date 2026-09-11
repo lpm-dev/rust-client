@@ -11,6 +11,11 @@ pub(super) fn validate_source_delivery_namespace(
     project_root_canonical: &Path,
     destination: &Path,
 ) -> Result<(), LpmError> {
+    #[cfg(windows)]
+    let normalized_destination =
+        lpm_common::absolute_extended_path(destination).map_err(LpmError::Io)?;
+    #[cfg(windows)]
+    let destination = normalized_destination.as_path();
     let relative = destination
         .strip_prefix(project_root_canonical)
         .map_err(|_| {

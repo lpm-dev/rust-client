@@ -9,6 +9,7 @@ mod config;
 mod error;
 mod fetch;
 mod manifest_core;
+pub(crate) use fetch::revalidate_metadata;
 mod parse;
 mod platform;
 mod policy;

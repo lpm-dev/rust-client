@@ -1047,7 +1047,7 @@ mod tests {
         let bin = install_root.join("node_modules").join(".bin");
         std::fs::create_dir_all(&bin).unwrap();
         for cmd in bins {
-            let target = bin.join(cmd);
+            let target = lpm_global::project_command_path(&bin, cmd);
             std::fs::write(&target, b"#!/bin/sh\necho ok\n").unwrap();
             #[cfg(unix)]
             {

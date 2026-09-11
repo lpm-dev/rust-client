@@ -83,7 +83,7 @@ where
     let parent = destination_parent(path).map_err(E::from)?;
     let exact_mode = destination_mode(path, options).map_err(E::from)?;
     let mut temporary =
-        create_temporary(parent, exact_mode, || random_temp_path(parent)).map_err(|e| { eprintln!("QA temporary creation failed at {}: {e}", parent.display()); E::from(e) })?;
+        create_temporary(parent, exact_mode, || random_temp_path(parent)).map_err(E::from)?;
 
     let output = write(temporary.file_mut().map_err(E::from)?)?;
     if let Some(mode) = exact_mode {
@@ -571,12 +571,13 @@ fn replace_file(from: &Path, to: &Path) -> io::Result<()> {
         MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,
     };
 
-    fn wide(path: &Path) -> Vec<u16> {
-        path.as_os_str().encode_wide().chain(Some(0)).collect()
+    fn wide(path: &Path) -> io::Result<Vec<u16>> {
+        let path = crate::absolute_extended_path(path)?;
+        Ok(path.as_os_str().encode_wide().chain(Some(0)).collect())
     }
 
-    let from = wide(from);
-    let to = wide(to);
+    let from = wide(from)?;
+    let to = wide(to)?;
     let flags = MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH;
     for delay_ms in [0, 50, 150, 450, 1_350, 4_050] {
         if delay_ms != 0 {
@@ -589,7 +590,6 @@ fn replace_file(from: &Path, to: &Path) -> io::Result<()> {
             return Ok(());
         }
         let error = io::Error::last_os_error();
-        eprintln!("QA MoveFileEx error: {:?} -> {:?}: {error}", String::from_utf16_lossy(&from), String::from_utf16_lossy(&to));
         let raw = error.raw_os_error().map(|code| code as u32);
         if !matches!(
             raw,
@@ -885,7 +885,6 @@ mod tests {
         fs::create_dir_all(&parent).unwrap();
         let path = parent.join(".lpm-object-integrity");
         assert!(!path.to_str().unwrap().starts_with(r"\\?\"));
-        eprintln!("ordinary long path: {}", path.display());
 
         write_file_atomic(&path, b"first").unwrap();
         write_file_atomic(&path, b"replacement").unwrap();

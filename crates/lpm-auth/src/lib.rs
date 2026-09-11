@@ -1878,6 +1878,7 @@ fn read_npmrc_file_layer(
     }
 }
 
+#[cfg_attr(not(unix), allow(unused_variables))]
 fn parse_npmrc_opened_assignment(
     path: &std::path::Path,
     bytes: &[u8],

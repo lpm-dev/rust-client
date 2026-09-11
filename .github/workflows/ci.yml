@@ -44,6 +44,13 @@ jobs:
           python -c 'import shutil; assert shutil.disk_usage(".").free >= 10*1024**3'
           cargo test --locked -p lpm-global windows_global_shims_forward_arguments_and_exit_code_to_project_shims -- --nocapture 2>&1 | tee qa-results/global-forwarding.log
           exit "${PIPESTATUS[0]}"
+      - name: Sandbox single-entry regression
+        continue-on-error: true
+        shell: bash
+        run: |
+          python -c 'import shutil; assert shutil.disk_usage(".").free >= 10*1024**3'
+          cargo test --locked -p lpm-sandbox per_entry_dacl_grant -- --nocapture 2>&1 | tee qa-results/sandbox-unit.log
+          exit "${PIPESTATUS[0]}"
       - name: Long workspace diagnostic
         continue-on-error: true
         shell: bash
@@ -61,7 +68,7 @@ jobs:
         shell: bash
         run: |
           python -c 'import shutil; assert shutil.disk_usage(".").free >= 10*1024**3'
-          cargo nextest run --locked -P native-baseline -p lpm-workflows --test add --test publish --test install_concurrency -E 'test(publish_dry_run_executes_publish_lifecycle_scripts_in_npm_order)' --no-fail-fast --status-level all --final-status-level all 2>&1 | tee qa-results/workflows.log
+          cargo nextest run --locked -P native-baseline -p lpm-workflows --test add --test publish --test install_concurrency -E 'test(publish_dry_run_executes_publish_lifecycle_scripts_in_npm_order) | test(source_add_and_remove_use_in_project_paths_on_native_platforms) | test(two_concurrent_global_installs_serialize_via_global_tx_lock)'  --no-fail-fast --status-level all --final-status-level all 2>&1 | tee qa-results/workflows.log
           exit "${PIPESTATUS[0]}"
       - name: Collect diagnostic output
         if: always()

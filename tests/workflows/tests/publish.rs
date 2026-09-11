@@ -143,17 +143,19 @@ fn snapshot_project_files(root: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
                     .strip_prefix(root)
                     .expect("project entry must remain below root")
                     .to_path_buf();
-                if matches!(
-                    relative.to_str(),
-                    Some(
-                        ".lpm/.install.lock"
-                            | ".lpm/.install.lock.writer-intent"
-                            | ".lpm/.install.lock.writer-queue"
-                            | ".lpm/.publish.lock"
-                            | ".lpm/.publish.lock.writer-intent"
-                            | ".lpm/.publish.lock.writer-queue"
+                if relative.parent() == Some(Path::new(".lpm"))
+                    && matches!(
+                        relative.file_name().and_then(|name| name.to_str()),
+                        Some(
+                            ".install.lock"
+                                | ".install.lock.writer-intent"
+                                | ".install.lock.writer-queue"
+                                | ".publish.lock"
+                                | ".publish.lock.writer-intent"
+                                | ".publish.lock.writer-queue"
+                        )
                     )
-                ) {
+                {
                     continue;
                 }
                 snapshot.insert(relative, std::fs::read(path).expect("read project file"));
@@ -4410,6 +4412,7 @@ fn uploaded_file_paths(tarball_data: &[u8]) -> Vec<String> {
         .collect()
 }
 
+#[cfg(unix)]
 fn extract_uploaded_file_mode(tarball_data: &[u8], expected_path: &str) -> u32 {
     let decoder = flate2::read::GzDecoder::new(tarball_data);
     let mut archive = tar::Archive::new(decoder);

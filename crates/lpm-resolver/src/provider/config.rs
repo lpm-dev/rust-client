@@ -35,6 +35,7 @@ impl LpmDependencyProvider {
             root_aliases: Mutex::new(HashMap::new()),
             skipped_dependencies: Mutex::new(HashMap::new()),
             range_cache: Mutex::new(HashMap::new()),
+            refreshed_metadata: Mutex::new(HashSet::new()),
             available_versions_cache: Mutex::new(HashMap::new()),
             include_optional_dependencies: true,
         }
@@ -82,6 +83,7 @@ impl LpmDependencyProvider {
             root_aliases: Mutex::new(HashMap::new()),
             skipped_dependencies: Mutex::new(HashMap::new()),
             range_cache: Mutex::new(HashMap::new()),
+            refreshed_metadata: Mutex::new(HashSet::new()),
             available_versions_cache: Mutex::new(HashMap::new()),
             include_optional_dependencies: true,
         }

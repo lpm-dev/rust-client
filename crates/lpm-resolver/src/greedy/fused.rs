@@ -1574,6 +1574,7 @@ pub async fn resolve_greedy_fused_with_cache_options_policy_and_selected_events_
         trace_metadata_fetches,
     };
     let mut tree_status_cache = super::tree_policy::TreeStatusCache::default();
+    let mut refreshed_metadata = AHashSet::new();
 
     // Loop-local state, owned by this single task. No Arcs needed
     // around `inflight` / `parked` because they never cross task
@@ -1937,6 +1938,16 @@ pub async fn resolve_greedy_fused_with_cache_options_policy_and_selected_events_
                         policy_hydration_ns.saturating_add(duration_ns(started.elapsed()));
                 }
                 let info_arc = info_result?;
+                let info_arc = super::manifest::refresh_missing_range(
+                    &edge,
+                    info_arc,
+                    &client,
+                    &route_table,
+                    &shared_cache,
+                    &policy,
+                    &mut refreshed_metadata,
+                )
+                .await?;
                 let tree_policy_started = trace_metadata_fetches.then(Instant::now);
                 let preferred = preferred_tree_compatible_version(
                     &edge,

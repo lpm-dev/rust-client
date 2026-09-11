@@ -334,6 +334,7 @@ pub(crate) fn load_identity_with_material(
     .map(|(identity, ())| identity)
 }
 
+#[cfg_attr(not(unix), allow(unused_variables))]
 pub(crate) fn load_identity_with_material_and_reservation<R>(
     cert: &TaggedPath,
     cert_bytes: Arc<Vec<u8>>,
