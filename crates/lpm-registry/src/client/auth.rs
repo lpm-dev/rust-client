@@ -13,6 +13,9 @@ impl RequestDestination {
                 lpm_common::safe_url_origin(url)
             ))
         })?;
+        if !parsed.username().is_empty() || parsed.password().is_some() {
+            return Err(LpmError::Registry(lpm_http::URL_CREDENTIALS_REFUSAL.into()));
+        }
         let origin = crate::npmrc::OriginKey::from_parsed_url(&parsed).ok_or_else(|| {
             LpmError::Registry(format!(
                 "invalid URL '{}' — must be http(s) with a host",

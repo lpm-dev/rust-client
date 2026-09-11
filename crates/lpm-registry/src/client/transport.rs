@@ -1,5 +1,8 @@
 use super::*;
 
+mod error_redaction;
+use error_redaction::read_request_error_text;
+
 pub(super) enum PublishSafeResponse {
     Response(reqwest::Response),
     Recovered(serde_json::Value),
@@ -689,11 +692,11 @@ impl RegistryClient {
                         // Non-retryable errors — fail immediately
                         401 => return Err(LpmError::AuthRequired),
                         403 => {
-                            let body = read_capped_error_text(response).await;
+                            let body = read_request_error_text(response, &request).await;
                             return Err(forbidden_error_from_body(body));
                         }
                         404 => {
-                            let body = read_capped_error_text(response).await;
+                            let body = read_request_error_text(response, &request).await;
                             return Err(LpmError::NotFound(body));
                         }
 
@@ -715,7 +718,7 @@ impl RegistryClient {
 
                         // Retryable: server errors and timeouts
                         408 | 500 | 502 | 503 | 504 => {
-                            let body = read_capped_error_text(response).await;
+                            let body = read_request_error_text(response, &request).await;
                             last_error = Some(LpmError::Http {
                                 status,
                                 message: body,
@@ -729,7 +732,7 @@ impl RegistryClient {
 
                         // Other errors — fail immediately
                         _ => {
-                            let body = read_capped_error_text(response).await;
+                            let body = read_request_error_text(response, &request).await;
                             return Err(LpmError::Http {
                                 status,
                                 message: body,

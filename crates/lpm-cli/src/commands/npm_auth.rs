@@ -170,7 +170,7 @@ fn missing_custom_registry_token_error(registry_url: &str) -> LpmError {
     ))
 }
 
-fn custom_registry_token(registry_url: &str) -> Option<String> {
+pub(crate) fn custom_registry_token(registry_url: &str) -> Option<String> {
     let normalized = normalized_registry_url(registry_url);
     auth::get_custom_registry_token(&normalized)
         .or_else(|| auth::get_custom_registry_token(&format!("{normalized}/")))

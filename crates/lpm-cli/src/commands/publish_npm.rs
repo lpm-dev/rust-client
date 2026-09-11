@@ -1008,7 +1008,25 @@ async fn execute_npm_publish_request(
     let request = request
         .build()
         .map_err(lpm_http::ReplayableRequestError::request)?;
-    lpm_http::send_with_replayable_redirects(client, request, Some(payload.replayable())).await
+    let original = request.url().clone();
+    let registry_path = original
+        .path()
+        .rsplit_once('/')
+        .map_or("", |(parent, _)| parent);
+    let authorization_allowed = |url: &reqwest::Url| {
+        url.origin() == original.origin()
+            && url
+                .path()
+                .strip_prefix(registry_path)
+                .is_some_and(|suffix| suffix.is_empty() || suffix.starts_with('/'))
+    };
+    lpm_http::send_with_replayable_redirects_and_authorization_scope(
+        client,
+        request,
+        Some(payload.replayable()),
+        Some(&authorization_allowed),
+    )
+    .await
 }
 
 /// Handle npm publish response, mapping HTTP status codes to clear errors.

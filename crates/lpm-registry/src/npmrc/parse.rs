@@ -522,10 +522,15 @@ fn classify_and_apply(key: &str, value: &str, context: ApplyContext<'_>, cfg: &m
             });
             return;
         }
-        cfg.scope_registries.insert(
-            scope.to_ascii_lowercase(),
-            RegistryTarget::from_npmrc_url(value),
-        );
+        match RegistryTarget::from_npmrc_url(value) {
+            Ok(target) => {
+                cfg.scope_registries
+                    .insert(scope.to_ascii_lowercase(), target);
+            }
+            Err(error) => {
+                cfg.push_error(source_label, || format!("{source_label}:{lineno}: {error}"))
+            }
+        }
         return;
     }
 
@@ -537,7 +542,12 @@ fn classify_and_apply(key: &str, value: &str, context: ApplyContext<'_>, cfg: &m
             });
             return;
         }
-        cfg.default_registry = Some(RegistryTarget::from_npmrc_url(value));
+        match RegistryTarget::from_npmrc_url(value) {
+            Ok(target) => cfg.default_registry = Some(target),
+            Err(error) => {
+                cfg.push_error(source_label, || format!("{source_label}:{lineno}: {error}"))
+            }
+        }
         return;
     }
 
