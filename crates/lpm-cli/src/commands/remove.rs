@@ -2307,15 +2307,14 @@ mod windows_directory_security {
 
     use cap_fs_ext::{FollowSymlinks, OpenOptionsFollowExt as _, OsMetadataExt as _};
     use cap_std::fs::{Dir, OpenOptions, OpenOptionsExt as _};
-    use windows_sys::Wdk::Storage::FileSystem::NtSetSecurityObject;
-    use windows_sys::Win32::Foundation::{ERROR_SUCCESS, HANDLE, LocalFree, RtlNtStatusToDosError};
+    use windows_sys::Win32::Foundation::{ERROR_SUCCESS, HANDLE, LocalFree};
     use windows_sys::Win32::Security::Authorization::{
         ConvertSecurityDescriptorToStringSecurityDescriptorW,
         ConvertStringSecurityDescriptorToSecurityDescriptorW, GetSecurityInfo, SDDL_REVISION_1,
-        SE_FILE_OBJECT,
+        SE_FILE_OBJECT, SetSecurityInfo,
     };
     use windows_sys::Win32::Security::{
-        DACL_SECURITY_INFORMATION, GetSecurityDescriptorControl,
+        DACL_SECURITY_INFORMATION, GetSecurityDescriptorControl, GetSecurityDescriptorDacl,
         PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, SE_DACL_PROTECTED,
         UNPROTECTED_DACL_SECURITY_INFORMATION,
     };
@@ -2385,7 +2384,9 @@ mod windows_directory_security {
         // SAFETY: successful conversion returned `text_len` initialized UTF-16 code units.
         let sddl = String::from_utf16_lossy(unsafe {
             std::slice::from_raw_parts(text, text_len as usize)
-        });
+        })
+        .trim_end_matches('\0')
+        .to_owned();
         // SAFETY: the conversion API allocated `text`; it is released exactly once here.
         unsafe {
             let _ = LocalFree(text.cast());
@@ -2446,14 +2447,38 @@ mod windows_directory_security {
             } else {
                 UNPROTECTED_DACL_SECURITY_INFORMATION
             };
-        // SAFETY: the handle has WRITE_DAC and the converted descriptor remains valid.
-        let status = unsafe { NtSetSecurityObject(handle, security_information, descriptor.0) };
-        if status == 0 {
+        let mut present = 0;
+        let mut defaulted = 0;
+        let mut acl = null_mut();
+        // SAFETY: the descriptor is valid and owns the DACL for the complete operation.
+        if unsafe {
+            GetSecurityDescriptorDacl(descriptor.0, &mut present, &mut acl, &mut defaulted)
+        } == 0
+        {
+            return Err(std::io::Error::last_os_error());
+        }
+        if present == 0 {
+            return Err(std::io::Error::other("the saved directory DACL is absent"));
+        }
+        // SetSecurityInfo applies the inheritance/protection flags that the
+        // native setter does not. Production calls this on an empty, private
+        // rollback directory before publication, so no existing tree is walked.
+        // SAFETY: the handle has WRITE_DAC and the borrowed DACL remains valid.
+        let status = unsafe {
+            SetSecurityInfo(
+                handle,
+                SE_FILE_OBJECT,
+                security_information,
+                null_mut(),
+                null_mut(),
+                acl,
+                null_mut(),
+            )
+        };
+        if status == ERROR_SUCCESS {
             Ok(())
         } else {
-            // SAFETY: `status` is the NTSTATUS produced by `NtSetSecurityObject`.
-            let error = unsafe { RtlNtStatusToDosError(status) };
-            Err(std::io::Error::from_raw_os_error(error as i32))
+            Err(std::io::Error::from_raw_os_error(status as i32))
         }
     }
 
@@ -2470,6 +2495,42 @@ mod windows_directory_security {
     #[cfg(test)]
     pub(super) fn test_sddl(directory: &Dir) -> std::io::Result<String> {
         snapshot(directory).map(|snapshot| snapshot.sddl)
+    }
+
+    #[test]
+    fn directory_rollback_preserves_protected_and_unprotected_dacls() {
+        for protected in [false, true] {
+            let temporary = tempfile::tempdir().unwrap();
+            let parent =
+                Dir::open_ambient_dir(temporary.path(), cap_std::ambient_authority()).unwrap();
+            parent.create_dir("original").unwrap();
+            let original = parent.open_dir("original").unwrap();
+            let handle = open_security_handle(&original, READ_CONTROL | WRITE_DAC).unwrap();
+            apply_sddl(
+                handle.as_raw_handle(),
+                "D:(A;OICI;GR;;;WD)(A;OICI;FA;;;OW)(A;OICI;FA;;;SY)",
+                protected,
+            )
+            .unwrap();
+            let expected = snapshot(&original).unwrap();
+            assert_eq!(expected.protected, protected);
+            assert!(!expected.sddl.contains('\0'));
+            let (private_name, restored) =
+                crate::directory_transaction::create_private_directory(&parent, "restore-test")
+                    .unwrap();
+            restore(&restored, &expected).unwrap();
+            crate::directory_transaction::publish_directory_noreplace(
+                &parent,
+                &restored,
+                &private_name,
+                &parent,
+                std::ffi::OsStr::new("restored"),
+            )
+            .unwrap();
+            let actual = snapshot(&restored).unwrap();
+            assert_eq!(actual.protected, protected);
+            assert_eq!(actual.sddl, expected.sddl);
+        }
     }
 }
 

@@ -75,11 +75,12 @@ jobs:
           --no-fail-fast --status-level slow --final-status-level fail
 
       - name: Windows CLI filesystem unit tests
+        shell: bash
         run: |
           cargo test --locked -p lpm-cli --bin lpm-rs remove_owned_cmd_shim
           cargo test --locked -p lpm-cli --bin lpm-rs directory_transaction
           cargo test --locked -p lpm-cli --bin lpm-rs commands::add::paths::tests
-          cargo test --locked -p lpm-cli --bin lpm-rs commands::remove::tests
+          cargo test --locked -p lpm-cli --bin lpm-rs commands::remove::
 
       - name: Windows install interruption recovery
         run: cargo nextest run --locked -p lpm-workflows --test install_concurrency -E 'test(interrupted_install)' --no-fail-fast --status-level slow --final-status-level fail

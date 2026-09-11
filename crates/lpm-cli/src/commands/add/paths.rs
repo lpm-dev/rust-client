@@ -1295,8 +1295,7 @@ mod tests {
             &mut rollback,
             |directory| recorded.push(directory.to_path_buf()),
             |current, name, directory| {
-                current.create_dir(name)?;
-                let created = current.open_dir_nofollow(name)?;
+                let created = create_owned_directory_noreplace(current, name)?;
                 std::fs::rename(directory, &displaced)?;
                 std::fs::create_dir(directory)?;
                 Ok(created)

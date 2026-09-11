@@ -603,7 +603,9 @@ fn publish_windows_handle_noreplace(
         .ok_or_else(|| std::io::Error::other("transaction directory name is too long"))?;
     let info_bytes = offset_of!(FILE_RENAME_INFORMATION, FileName)
         .checked_add(file_name_bytes)
-        .ok_or_else(|| std::io::Error::other("transaction rename data is too large"))?;
+        .ok_or_else(|| std::io::Error::other("transaction rename data is too large"))?
+        // NT requires the complete fixed-size record even for a one-unit filename.
+        .max(size_of::<FILE_RENAME_INFORMATION>());
     let mut storage = vec![0usize; info_bytes.div_ceil(size_of::<usize>())];
     let info = storage.as_mut_ptr().cast::<FILE_RENAME_INFORMATION>();
     let info_bytes = u32::try_from(info_bytes)
@@ -681,23 +683,27 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn private_directory_can_be_reopened_and_published_with_a_retained_handle() {
-        let temp = tempfile::tempdir().unwrap();
-        let parent =
-            cap_std::fs::Dir::open_ambient_dir(temp.path(), cap_std::ambient_authority()).unwrap();
-        let (name, directory) = super::create_private_directory(&parent, "test-publish").unwrap();
-        let expected = super::directory_identity(&directory).unwrap();
-        super::publish_directory_noreplace(
-            &parent,
-            &directory,
-            &name,
-            &parent,
-            std::ffi::OsStr::new("published"),
-        )
-        .unwrap();
-        let visible =
-            super::open_directory_for_publication(&parent, std::ffi::OsStr::new("published"))
-                .unwrap();
-        assert_eq!(super::directory_identity(&visible).unwrap(), expected);
+        for final_name in ["a", "ab", "λ", "工具", "🦀", "published"] {
+            let temp = tempfile::tempdir().unwrap();
+            let parent =
+                cap_std::fs::Dir::open_ambient_dir(temp.path(), cap_std::ambient_authority())
+                    .unwrap();
+            let (name, directory) =
+                super::create_private_directory(&parent, "test-publish").unwrap();
+            let expected = super::directory_identity(&directory).unwrap();
+            super::publish_directory_noreplace(
+                &parent,
+                &directory,
+                &name,
+                &parent,
+                std::ffi::OsStr::new(final_name),
+            )
+            .unwrap();
+            let visible =
+                super::open_directory_for_publication(&parent, std::ffi::OsStr::new(final_name))
+                    .unwrap();
+            assert_eq!(super::directory_identity(&visible).unwrap(), expected);
+        }
     }
 
     use super::*;
