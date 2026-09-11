@@ -1446,7 +1446,7 @@ fn git_source_expansion_respects_auto_install_peers_false() {
     let mut resolver_dependencies = HashMap::new();
     let mut source_dependencies = HashMap::new();
 
-    collect_git_source_dependencies(
+    collect_archive_source_dependencies(
         package.path(),
         "git+https://github.com/example/package.git#0123456789abcdef0123456789abcdef01234567",
         &mut resolver_dependencies,
@@ -2849,6 +2849,7 @@ fn apply_post_resolve_fixup_populates_directory_dependencies() {
                 optional: false,
                 auto_install: true,
                 target_source: None,
+                registry_root: None,
             },
             SourceDep {
                 local_name: "b".to_string(),
@@ -2858,6 +2859,7 @@ fn apply_post_resolve_fixup_populates_directory_dependencies() {
                 optional: false,
                 auto_install: true,
                 target_source: Some("directory+./packages/b".to_string()),
+                registry_root: None,
             },
         ],
     );
@@ -2959,6 +2961,7 @@ fn apply_post_resolve_fixup_preserves_registry_alias_edges_from_source_deps() {
             optional: false,
             auto_install: true,
             target_source: None,
+            registry_root: None,
         }],
     );
 
@@ -3068,6 +3071,7 @@ fn apply_post_resolve_fixup_uses_declared_source_when_name_version_collides() {
             optional: false,
             auto_install: true,
             target_source: Some(fork_source),
+            registry_root: None,
         }],
     );
 
@@ -3148,6 +3152,7 @@ fn apply_post_resolve_fixup_preserves_source_backed_peer_role() {
             optional: false,
             auto_install: true,
             target_source: Some(peer_source),
+            registry_root: None,
         }],
     );
 
@@ -3235,6 +3240,7 @@ fn local_source_fixup_rebuilds_exact_dependency_and_peer_targets() {
                 optional: false,
                 auto_install: true,
                 target_source: None,
+                registry_root: None,
             },
             SourceDep {
                 local_name: "runtime-peer".to_string(),
@@ -3244,6 +3250,7 @@ fn local_source_fixup_rebuilds_exact_dependency_and_peer_targets() {
                 optional: false,
                 auto_install: true,
                 target_source: None,
+                registry_root: None,
             },
         ],
     )]);
@@ -3282,6 +3289,7 @@ fn local_source_required_peer_rejects_incompatible_registry_provider() {
             optional: false,
             auto_install: true,
             target_source: None,
+            registry_root: None,
         }],
     )]);
 
@@ -3309,6 +3317,7 @@ fn local_source_npm_alias_peer_rejects_incompatible_provider() {
             optional: false,
             auto_install: true,
             target_source: None,
+            registry_root: None,
         }],
     )]);
 
@@ -3336,6 +3345,7 @@ fn local_source_required_peer_rejects_malformed_range() {
             optional: false,
             auto_install: true,
             target_source: None,
+            registry_root: None,
         }],
     )]);
 
@@ -3362,6 +3372,7 @@ fn local_source_optional_peer_skips_incompatible_provider() {
             optional: true,
             auto_install: false,
             target_source: None,
+            registry_root: None,
         }],
     )]);
 
@@ -3387,6 +3398,7 @@ fn local_source_workspace_peer_rejects_incompatible_member() {
             optional: false,
             auto_install: true,
             target_source: Some(provider_source.to_string()),
+            registry_root: None,
         }],
     )]);
 
@@ -3414,6 +3426,7 @@ fn local_source_peer_links_existing_provider_when_auto_install_is_disabled() {
             optional: false,
             auto_install: false,
             target_source: None,
+            registry_root: None,
         }],
     )]);
 
@@ -3470,6 +3483,7 @@ fn apply_post_resolve_fixup_skips_missing_registry_deps() {
             optional: false,
             auto_install: true,
             target_source: None,
+            registry_root: None,
         }],
     );
 
