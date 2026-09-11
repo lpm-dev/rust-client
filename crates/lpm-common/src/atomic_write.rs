@@ -873,6 +873,24 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
+    fn write_file_atomic_creates_and_replaces_beyond_max_path() {
+        let root = tempfile::tempdir().unwrap();
+        let mut parent = root.path().to_path_buf();
+        while parent.as_os_str().len() < 300 {
+            parent.push("nested-directory-with-spaces ü");
+        }
+        fs::create_dir_all(&parent).unwrap();
+        let path = parent.join(".lpm-object-integrity");
+
+        write_file_atomic(&path, b"first").unwrap();
+        write_file_atomic(&path, b"replacement").unwrap();
+
+        assert_eq!(fs::read(&path).unwrap(), b"replacement");
+        assert_eq!(fs::read_dir(&parent).unwrap().count(), 1);
+    }
+
+    #[cfg(windows)]
+    #[test]
     fn write_file_atomic_supports_near_max_path_destination() {
         use std::os::windows::ffi::OsStrExt;
 

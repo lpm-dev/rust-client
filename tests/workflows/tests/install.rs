@@ -18,6 +18,40 @@ use support::{
 use wiremock::matchers::{header, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
+#[tokio::test]
+async fn install_refreshes_custom_metadata_when_requested_version_was_published_after_cache() {
+    let mock = MockRegistry::start().await;
+    let name = "freshly-published";
+    let first = make_tarball(name, "1.0.0");
+    mock.with_package(name, "1.0.0", &first).await;
+    let project = TempProject::empty(r#"{"name":"consumer","version":"1.0.0"}"#);
+    project.write_file(".npmrc", &format!("registry={}/\n", mock.url()));
+    lpm_with_registry(&project, &mock.url())
+        .args(["install", "freshly-published@1.0.0", "--no-skills", "--no-editor-setup"])
+        .assert()
+        .success();
+
+    mock.server().reset().await;
+    mock.mount_full_package_metadata_routes(
+        name,
+        "1.1.0",
+        &[
+            ("1.0.0", serde_json::json!({}), Some(first)),
+            ("1.1.0", serde_json::json!({}), Some(make_tarball(name, "1.1.0"))),
+        ],
+    )
+    .await;
+    lpm_with_registry(&project, &mock.url())
+        .args(["install", "freshly-published@1.1.0", "--no-skills", "--no-editor-setup"])
+        .assert()
+        .success();
+    let installed: serde_json::Value = serde_json::from_str(
+        &project.read_file("node_modules/freshly-published/package.json"),
+    )
+    .unwrap();
+    assert_eq!(installed["version"], "1.1.0");
+}
+
 async fn assert_unavailable_publication_message(status: Option<&str>, json: bool, expected: &str) {
     let mock = MockRegistry::start().await;
     let name = "@lpm.dev/example.pending";

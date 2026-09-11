@@ -34,6 +34,29 @@ use support::{
 };
 
 #[tokio::test]
+async fn source_add_and_remove_use_in_project_paths_on_native_platforms() {
+    let mock = MockRegistry::start().await;
+    let package = "native-source-path";
+    let tarball = make_source_pkg_tarball(
+        package,
+        "1.0.0",
+        json!({"files": [{"src": "hello.txt", "dest": "nested/hello.txt"}]}),
+        &[("hello.txt", b"managed source")],
+    );
+    mock.with_package(package, "1.0.0", &tarball).await;
+    let project = TempProject::empty(r#"{"name":"host","version":"1.0.0"}"#);
+    project.write_file("keep.txt", "unrelated work");
+    lpm_with_registry(&project, &mock.url())
+        .args(["add", package, "--path", "source ü space", "--yes", "--no-skills"])
+        .assert()
+        .success();
+    assert_eq!(project.read_file("source ü space/nested/hello.txt"), "managed source");
+    lpm(&project).args(["remove", package]).assert().success();
+    assert!(!project.file_exists("source ü space/nested/hello.txt"));
+    assert_eq!(project.read_file("keep.txt"), "unrelated work");
+}
+
+#[tokio::test]
 async fn kill_during_source_copy_is_recovered_before_remove() {
     let mock = MockRegistry::start().await;
     let package = "partial-source-copy";
