@@ -21,13 +21,13 @@ $otherTool = Join-Path $root 'other-tool'
 $setup = Join-Path $root 'lpm.exe'
 $helper = Join-Path $root 'lpm-sandbox-helper.exe'
 $counter = 0
+$registryProcess = $null
 function AsUser([string]$exe, [string[]]$arguments) {
  $script:counter++
  $stdout = Join-Path $root "stdout-$counter.txt"
  $stderr = Join-Path $root "stderr-$counter.txt"
  $quoted = ($arguments | ForEach-Object { '"' + $_.Replace('"','\"') + '"' }) -join ' '
- $process = Start-Process -FilePath $exe -ArgumentList $quoted -Credential $credential -LoadUserProfile -WorkingDirectory $project -RedirectStandardOutput $stdout -RedirectStandardError $stderr -PassThru
- if (!$process.WaitForExit(180000)) { $process.Kill($true); throw "standard-user command timed out: $exe" }
+ $process = Start-Process -FilePath $exe -ArgumentList $quoted -Credential $credential -LoadUserProfile -WorkingDirectory $project -RedirectStandardOutput $stdout -RedirectStandardError $stderr -PassThru -Wait
  $out = Get-Content -Raw $stdout -ErrorAction SilentlyContinue
  $err = Get-Content -Raw $stderr -ErrorAction SilentlyContinue
  Write-Host "USER EXIT $($process.ExitCode) $out $err"
@@ -68,11 +68,11 @@ console.log('HOOK_OK');
 '@ | Set-Content (Join-Path $project 'hook.cjs')
  $bootstrap = AsUser "$env:SystemRoot\System32\whoami.exe" @('/user')
  if ($bootstrap.Code -ne 0) { throw 'standard-user logon failed' }
- $profile = Get-CimInstance Win32_UserProfile -Filter "SID='$sid'"
- if (!$profile.LocalPath) { throw 'standard-user profile was not loaded' }
- $env:USERPROFILE = $profile.LocalPath
- $env:LOCALAPPDATA = Join-Path $profile.LocalPath 'AppData\Local'
- $env:APPDATA = Join-Path $profile.LocalPath 'AppData\Roaming'
+ $standardProfile = Get-CimInstance Win32_UserProfile -Filter "SID='$sid'"
+ if (!$standardProfile.LocalPath) { throw 'standard-user profile was not loaded' }
+ $env:USERPROFILE = $standardProfile.LocalPath
+ $env:LOCALAPPDATA = Join-Path $standardProfile.LocalPath 'AppData\Local'
+ $env:APPDATA = Join-Path $standardProfile.LocalPath 'AppData\Roaming'
  $env:TEMP = Join-Path $env:LOCALAPPDATA 'Temp'
  $env:TMP = $env:TEMP
  New-Item -ItemType Directory -Force $env:TEMP,$env:APPDATA | Out-Null
@@ -106,6 +106,31 @@ console.log('HOOK_OK');
  if ($LASTEXITCODE -ne 0) { throw 'overlapping tool setup failed' }
  $overlap = AsUser $helper ($base + @('--readable-dir-best-effort',$project,'--appcontainer-name',('LpmOverlap' + $PID),'--',(Join-Path $tool 'node.exe'),'hook.cjs'))
  if ($overlap.Code -ne 0 -or $overlap.Out -notmatch 'HOOK_OK') { throw 'tool capability bypassed project-secret denial' }
+ & $setup doctor sandbox-setup --project $project --user-sid $sid --tool-dir $project --remove --yes --json
+ if ($LASTEXITCODE -ne 0) { throw 'overlapping tool removal failed' }
+ & $setup @($json.apply_args) --yes --json
+ if ($LASTEXITCODE -ne 0) { throw 'base setup restoration failed' }
+ $registryScript = Join-Path $root 'registry.cjs'
+ $registryPort = Join-Path $root 'registry-port.txt'
+ @'
+const fs = require('node:fs');
+const http = require('node:http');
+const server = http.createServer((req, res) => {
+  const expected = req.method === 'GET' && req.url === '/lpm-sandbox-setup-fixture'
+    && req.headers.authorization === 'Bearer publish-custom-registry-token';
+  res.writeHead(expected ? 404 : 400, {'Content-Type': 'application/json'});
+  res.end(JSON.stringify({error: expected ? 'not found' : 'unexpected request'}));
+});
+server.listen(0, '127.0.0.1', () => fs.writeFileSync(process.argv[2], String(server.address().port)));
+'@ | Set-Content $registryScript
+ $registryProcess = Start-Process -FilePath (Join-Path $tool 'node.exe') -ArgumentList @($registryScript,$registryPort) -PassThru
+ $deadline = [DateTime]::UtcNow.AddSeconds(15)
+ while (!(Test-Path $registryPort) -and [DateTime]::UtcNow -lt $deadline) { Start-Sleep -Milliseconds 100 }
+ if (!(Test-Path $registryPort)) { throw 'disposable registry did not start' }
+ $registryUrl = 'http://127.0.0.1:' + (Get-Content -Raw $registryPort)
+ @{publish=@{npm=@{registry=$registryUrl}}} | ConvertTo-Json -Depth 4 | Set-Content (Join-Path $project 'lpm.json')
+ $login = AsUser $setup @('login','--login-registry',$registryUrl,'--token','publish-custom-registry-token')
+ if ($login.Code -ne 0) { throw 'disposable registry login failed' }
  $phases = @('prepublishOnly','prepack','prepare','postpack','publish','postpublish')
  $scripts = [ordered]@{}
  foreach ($phase in $phases) { $scripts[$phase] = "node publish-hook.cjs $phase" }
@@ -118,7 +143,7 @@ assert.throws(() => fs.readFileSync('.env'), error => ['EACCES','EPERM'].include
 fs.appendFileSync('publish-phases.txt', process.argv[2] + '\n');
 '@ | Set-Content (Join-Path $project 'publish-hook.cjs')
  $watch = [Diagnostics.Stopwatch]::StartNew()
- $publish = AsUser $setup @('publish','--npm','--dry-run','--yes','--token','fixture-token')
+ $publish = AsUser $setup @('publish','--npm','--dry-run','--yes')
  Write-Output "PUBLISH_SIX_HOOKS_MS $($watch.ElapsedMilliseconds)"
  if ($publish.Code -ne 0) { throw 'standard-user publish failed' }
  $actualPhases = @(Get-Content (Join-Path $project 'publish-phases.txt'))
@@ -130,10 +155,11 @@ fs.appendFileSync('publish-phases.txt', process.argv[2] + '\n');
  if ($removed.Code -eq 0 -or $removed.Err -notmatch 'sandbox-setup') { throw 'removed setup should be required again' }
  Write-Output 'STANDARD_USER_SETUP_ALL_PASS'
 } finally {
+ if ($registryProcess -and !$registryProcess.HasExited) { Stop-Process -Id $registryProcess.Id -Force }
  foreach ($key in $originalEnvironment.Keys) { [Environment]::SetEnvironmentVariable($key, $originalEnvironment[$key]) }
  if (Test-Path $setup) {
   if ($json) { & $setup @($json.apply_args | ForEach-Object { if ($_ -eq '--apply') { '--remove' } else { $_ } }) --yes --json }
-  & $setup doctor sandbox-setup --project $project --user-sid $sid --tool-dir $tool --tool-dir $otherTool --tool-dir $project --remove --yes --json
+  & $setup doctor sandbox-setup --project $project --user-sid $sid --tool-dir $tool --tool-dir $otherTool --remove --yes --json
  }
  Remove-LocalUser -Name $user -ErrorAction SilentlyContinue
 }

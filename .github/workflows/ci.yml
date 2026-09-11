@@ -49,11 +49,24 @@ jobs:
         run: |
           python -c 'import shutil; assert shutil.disk_usage(".").free >= 10*1024**3'
           cargo build --locked -p lpm-cli -p lpm-sandbox
+      - name: Preserve native executables for isolated script retests
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f
+        with:
+          name: native-cli-executables
+          path: |
+            target/debug/lpm-rs.exe
+            target/debug/lpm-sandbox-helper.exe
       - name: Standard-user setup and full publish
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force qa-results | Out-Null
-          ./scripts/ci/test-windows-sandbox-setup.ps1 2>&1 | Tee-Object -FilePath qa-results/standard-user-setup.log
+          ./scripts/ci/test-windows-sandbox-setup.ps1 *>&1 | Tee-Object -FilePath qa-results/standard-user-setup.log
+      - name: Preserve standard-user logs
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f
+        with:
+          name: standard-user-setup-log
+          path: qa-results/standard-user-setup.log
       - name: Windows setup JSON contracts
         if: ${{ !cancelled() }}
         shell: bash
