@@ -270,6 +270,7 @@ impl Sandbox for AppContainerSandbox {
             .iter()
             .map(|(k, _)| k.to_string_lossy().to_ascii_lowercase())
             .collect();
+        eprintln!("QA msvc capture start");
         match capture_msvc_env() {
             Ok(msvc_env) => {
                 for (k, v) in msvc_env {
@@ -292,6 +293,7 @@ impl Sandbox for AppContainerSandbox {
                 );
             }
         }
+        eprintln!("QA msvc capture done");
         for (k, v) in &cmd.envs {
             let mut kv = OsString::from(k);
             kv.push("=");
