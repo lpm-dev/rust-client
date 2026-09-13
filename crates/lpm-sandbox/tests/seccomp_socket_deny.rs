@@ -127,6 +127,7 @@ fn denies_udp_socket_under_strict() {
         deny_outbound_network: true,
         allow_degraded: false,
         build_cache_isolation: false,
+        virtualize_self_process_group: false,
     };
     let project = tempfile::tempdir().expect("project tempdir");
     let mut spec = realistic_spec();

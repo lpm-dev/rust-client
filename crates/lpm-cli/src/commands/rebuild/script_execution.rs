@@ -278,6 +278,8 @@ pub(in crate::commands) fn execute_publish_lifecycle_script(
         allow_degraded: false,
         deny_outbound_network: true,
         build_cache_isolation: true,
+        #[cfg(target_os = "linux")]
+        virtualize_self_process_group: false,
         #[cfg(target_os = "macos")]
         apple_developer_dir: None,
     };

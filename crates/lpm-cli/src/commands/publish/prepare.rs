@@ -918,6 +918,8 @@ fn dump_swift_manifest_from_publish_artifact_with_command(
     let options = lpm_sandbox::SandboxOptions {
         deny_outbound_network: true,
         build_cache_isolation: true,
+        #[cfg(target_os = "linux")]
+        virtualize_self_process_group: true,
         #[cfg(target_os = "macos")]
         apple_developer_dir: apple_developer_dir.clone(),
         ..lpm_sandbox::SandboxOptions::default()
@@ -1856,6 +1858,49 @@ mod tests {
 
         assert!(manifest.is_err());
         assert!(started.elapsed() < std::time::Duration::from_secs(1));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn swift_manifest_inspection_reaps_compiler_groups_after_success() {
+        let fixture = swift_fixture_tarball();
+        let directory = tempfile::tempdir().unwrap();
+        let executable = directory.path().join("swift-child-group");
+        write_executable(
+            &executable,
+            "#!/usr/bin/python3\nimport json, os, subprocess\nchild = subprocess.Popen(['/bin/sleep', '30'], process_group=0)\nprint(json.dumps({'parent': os.getpid(), 'child': child.pid, 'group': os.getpgid(child.pid)}), flush=True)\n",
+        );
+        let manifest = dump_swift_manifest_from_publish_artifact_with_command(
+            &fixture,
+            executable.as_os_str(),
+            std::time::Duration::from_secs(2),
+            256,
+        )
+        .unwrap();
+        let pid = i32::try_from(manifest["child"].as_u64().unwrap()).unwrap();
+        let stopped = || match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+            Ok(stat) => stat
+                .rsplit_once(") ")
+                .is_some_and(|(_, fields)| fields.starts_with('Z') || fields.starts_with('X')),
+            Err(error) => error.kind() == std::io::ErrorKind::NotFound,
+        };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        while !stopped() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let child_stopped = stopped();
+        if !child_stopped {
+            // SAFETY: this PID was created by our isolated inspector and is
+            // still running. Clean it up even when the regression fails.
+            unsafe {
+                libc::kill(pid, libc::SIGKILL);
+            }
+        }
+        assert_eq!(manifest["group"], manifest["parent"]);
+        assert!(
+            child_stopped,
+            "compiler child outlived successful inspection"
+        );
     }
 
     #[cfg(unix)]

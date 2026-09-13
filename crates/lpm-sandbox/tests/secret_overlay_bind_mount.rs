@@ -197,6 +197,7 @@ fn default_mode_bind_mounts_dotenv_to_empty() {
         allow_degraded: false,
         deny_outbound_network: false,
         build_cache_isolation: false,
+        virtualize_self_process_group: false,
     };
     let sandbox = new_for_platform_with_options(spec, SandboxMode::Enforce, options)
         .expect("sandbox construction");
@@ -235,6 +236,7 @@ fn default_mode_does_not_overlay_source_files() {
         allow_degraded: false,
         deny_outbound_network: false,
         build_cache_isolation: false,
+        virtualize_self_process_group: false,
     };
     let sandbox = new_for_platform_with_options(spec, SandboxMode::Enforce, options)
         .expect("sandbox construction");
@@ -270,6 +272,7 @@ fn allowlisted_secret_remains_readable_without_overlay_setup() {
         allow_degraded: false,
         deny_outbound_network: false,
         build_cache_isolation: false,
+        virtualize_self_process_group: false,
     };
     let sandbox = new_for_platform_with_options(spec, SandboxMode::Enforce, options)
         .expect("sandbox construction");
@@ -309,6 +312,7 @@ fn unavailable_secret_overlay_setup_prevents_command_execution() {
         allow_degraded: false,
         deny_outbound_network: false,
         build_cache_isolation: false,
+        virtualize_self_process_group: false,
     };
     let sandbox = new_for_platform_with_options(spec, SandboxMode::Enforce, options)
         .expect("sandbox construction");
