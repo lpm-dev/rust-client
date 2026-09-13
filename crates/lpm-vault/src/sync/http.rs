@@ -153,7 +153,7 @@ pub(super) async fn read_verified_response(
     } else {
         MAX_VAULT_ERROR_RESPONSE_BYTES
     };
-    #[cfg(all(debug_assertions, not(test)))]
+    #[cfg(all(not(test), any(debug_assertions, feature = "acceptance-test-hooks")))]
     let local_development =
         signature::is_local_development_key(response.url(), key_id_header.as_deref());
     let mut body = read_capped_body_with_limit(response, max_bytes).await?;
@@ -162,7 +162,7 @@ pub(super) async fn read_verified_response(
     if status != reqwest::StatusCode::UNAUTHORIZED || has_signature_headers {
         #[cfg(not(test))]
         let verification = {
-            #[cfg(debug_assertions)]
+            #[cfg(any(debug_assertions, feature = "acceptance-test-hooks"))]
             if local_development {
                 signature::verify_response_with_test_key(
                     status.as_u16(),
@@ -178,7 +178,7 @@ pub(super) async fn read_verified_response(
                     signature_header.as_deref(),
                 )
             }
-            #[cfg(not(debug_assertions))]
+            #[cfg(not(any(debug_assertions, feature = "acceptance-test-hooks")))]
             signature::verify_response(
                 status.as_u16(),
                 &body,
