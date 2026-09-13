@@ -238,6 +238,7 @@ pub(crate) struct LandlockSandbox {
     mode: SandboxMode,
     posture: BackendPosture,
     build_cache_isolation: bool,
+    virtualize_self_process_group: bool,
 }
 
 impl LandlockSandbox {
@@ -318,6 +319,7 @@ impl LandlockSandbox {
                     mode,
                     posture,
                     build_cache_isolation,
+                    virtualize_self_process_group: options.virtualize_self_process_group,
                 })
             }
             // Landlock has no native observe-only primitive
@@ -487,11 +489,10 @@ impl Sandbox for LandlockSandbox {
         // path below catches the hypothetical double-invocation.
         let mut ruleset_opt = Some(ruleset);
         let process_group_filter =
-            crate::seccomp::build_process_group_filter().map_err(|error| {
-                SandboxError::ProfileRenderFailed {
+            crate::seccomp::build_process_group_filters(self.virtualize_self_process_group)
+                .map_err(|error| SandboxError::ProfileRenderFailed {
                     reason: format!("process containment filter failed: {error}"),
-                }
-            })?;
+                })?;
         let mut process_filters = Some(process_group_filter);
         let mut seccomp_opt = seccomp_program;
         let mut overlay_opt = overlay_spec;
@@ -647,8 +648,10 @@ impl Sandbox for LandlockSandbox {
                 // exit would otherwise have run `program.drop()`.
                 if let Some(group) = process_filters.take() {
                     let group = std::mem::ManuallyDrop::new(group);
-                    if seccompiler::apply_filter(&group).is_err() {
-                        return Err(std::io::Error::from_raw_os_error(libc::EPERM));
+                    for program in group.iter() {
+                        if seccompiler::apply_filter(program).is_err() {
+                            return Err(std::io::Error::from_raw_os_error(libc::EPERM));
+                        }
                     }
                 }
                 if let Some(program) = seccomp_opt.take() {
@@ -1042,6 +1045,7 @@ mod tests {
             deny_outbound_network: true,
             allow_degraded: true,
             build_cache_isolation: false,
+            virtualize_self_process_group: false,
         };
         match LandlockSandbox::new(realistic_spec(), SandboxMode::Enforce, options) {
             Ok(sb) => {

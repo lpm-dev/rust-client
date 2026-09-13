@@ -381,20 +381,147 @@ pub(crate) fn build_process_group_filter() -> Result<BpfProgram, seccompiler::Er
     Ok(filter.try_into()?)
 }
 
+pub(crate) fn build_process_group_filters(
+    virtualize_self_process_group: bool,
+) -> Result<Vec<BpfProgram>, seccompiler::Error> {
+    if !virtualize_self_process_group {
+        return Ok(vec![build_process_group_filter()?]);
+    }
+
+    let mut denied = BTreeMap::new();
+    denied.insert(libc::SYS_setsid, Vec::new());
+    denied.insert(
+        libc::SYS_setpgid,
+        (0..2)
+            .map(|index| {
+                SeccompRule::new(vec![SeccompCondition::new(
+                    index,
+                    SeccompCmpArgLen::Qword,
+                    SeccompCmpOp::Ne,
+                    0,
+                )?])
+            })
+            .collect::<Result<Vec<_>, _>>()?,
+    );
+    #[cfg(target_arch = "x86_64")]
+    for syscall in [libc::SYS_setsid, libc::SYS_setpgid] {
+        denied.insert(X32_SYSCALL_BIT | syscall, Vec::new());
+    }
+    let deny = SeccompFilter::new(
+        denied,
+        SeccompAction::Allow,
+        SeccompAction::Errno(libc::EPERM as u32),
+        TARGET_ARCH,
+    )?;
+
+    // SwiftPM's posix_spawn requests a new child group. A successful no-op
+    // keeps compiler descendants in our kill group; allowing the syscall
+    // would let a manifest leave that group and outlive the deadline.
+    let noop = SeccompFilter::new(
+        BTreeMap::from([(
+            libc::SYS_setpgid,
+            vec![SeccompRule::new(
+                (0..2)
+                    .map(|index| {
+                        SeccompCondition::new(index, SeccompCmpArgLen::Qword, SeccompCmpOp::Eq, 0)
+                    })
+                    .collect::<Result<Vec<_>, _>>()?,
+            )?],
+        )]),
+        SeccompAction::Allow,
+        SeccompAction::Errno(0),
+        TARGET_ARCH,
+    )?;
+    Ok(vec![deny.try_into()?, noop.try_into()?])
+}
+
 #[cfg(test)]
 mod process_group_tests {
     use super::*;
 
-    fn probe_group_change(syscall: i64, filtered: bool) {
-        let program = build_process_group_filter().unwrap();
+    #[test]
+    fn swift_child_group_request_succeeds_without_changing_the_supervised_group() {
+        let programs = build_process_group_filters(true).unwrap();
+        // SAFETY: the fork child performs only syscalls and exits without
+        // destructors. The parent waits for exactly its own child.
+        unsafe {
+            let pid = libc::fork();
+            assert!(pid >= 0);
+            if pid == 0 {
+                let group = libc::getpgrp();
+                for program in &programs {
+                    if seccompiler::apply_filter(program).is_err() {
+                        libc::_exit(20);
+                    }
+                }
+                if libc::setpgid(0, 0) != 0 {
+                    libc::_exit(21);
+                }
+                libc::_exit(if libc::getpgrp() == group { 0 } else { 22 });
+            }
+            let mut status = 0;
+            assert_eq!(libc::waitpid(pid, &mut status, 0), pid);
+            assert!(
+                libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0,
+                "Swift child group request failed or escaped: status={status}"
+            );
+        }
+    }
+
+    #[test]
+    fn swift_group_emulation_denies_explicit_group_and_session_changes() {
+        let programs = build_process_group_filters(true).unwrap();
+        // SAFETY: each child uses only syscalls and exits without destructors.
+        // The parent waits for exactly the child it just created.
+        unsafe {
+            for explicit_pid in [false, true] {
+                let pid = libc::fork();
+                assert!(pid >= 0);
+                if pid == 0 {
+                    for program in &programs {
+                        if seccompiler::apply_filter(program).is_err() {
+                            libc::_exit(20);
+                        }
+                    }
+                    let (target, group) = if explicit_pid {
+                        (libc::getpid(), 0)
+                    } else {
+                        (0, libc::getpgrp())
+                    };
+                    if libc::setpgid(target, group) != -1
+                        || *libc::__errno_location() != libc::EPERM
+                    {
+                        libc::_exit(21);
+                    }
+                    if libc::setsid() != -1 || *libc::__errno_location() != libc::EPERM {
+                        libc::_exit(22);
+                    }
+                    libc::_exit(0);
+                }
+                let mut status = 0;
+                assert_eq!(libc::waitpid(pid, &mut status, 0), pid);
+                assert!(
+                    libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0,
+                    "explicit_pid={explicit_pid}, status={status}"
+                );
+            }
+        }
+    }
+
+    fn probe_group_change(syscall: i64, filtered: bool, virtualize: bool) {
+        let programs = build_process_group_filters(virtualize).unwrap();
         // SAFETY: the fork child uses only direct syscalls and exits without
         // running destructors. The parent waits for exactly its own child.
         unsafe {
             let pid = libc::fork();
             assert!(pid >= 0);
             if pid == 0 {
-                if filtered && seccompiler::apply_filter(&program).is_err() {
-                    libc::_exit(20);
+                if filtered {
+                    for program in &programs {
+                        if seccompiler::apply_filter(program).is_err() {
+                            libc::_exit(20);
+                        }
+                    }
                 }
                 let result = libc::syscall(syscall, 0, 0);
                 let error = *libc::__errno_location();
@@ -417,8 +544,8 @@ mod process_group_tests {
     #[test]
     fn group_changes_succeed_without_filter_and_are_denied_with_filter() {
         for syscall in [libc::SYS_setsid, libc::SYS_setpgid] {
-            probe_group_change(syscall, false);
-            probe_group_change(syscall, true);
+            probe_group_change(syscall, false, false);
+            probe_group_change(syscall, true, false);
         }
     }
 
@@ -426,7 +553,9 @@ mod process_group_tests {
     #[cfg(target_arch = "x86_64")]
     fn x32_group_syscalls_cannot_bypass_the_filter() {
         for syscall in [libc::SYS_setsid, libc::SYS_setpgid] {
-            probe_group_change(X32_SYSCALL_BIT | syscall, true);
+            for virtualize in [false, true] {
+                probe_group_change(X32_SYSCALL_BIT | syscall, true, virtualize);
+            }
         }
     }
 }

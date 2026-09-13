@@ -296,6 +296,13 @@ pub struct SandboxOptions {
     /// compatibility write set.
     pub build_cache_isolation: bool,
 
+    /// Acknowledge `setpgid(0, 0)` without moving a Linux compiler child out of
+    /// the supervised process group. SwiftPM requires this call to succeed;
+    /// its entire process tree must remain reachable by the inspection deadline.
+    /// Other process-group and session changes remain denied.
+    #[cfg(target_os = "linux")]
+    pub virtualize_self_process_group: bool,
+
     /// The selected Apple developer directory for isolated compiler execution.
     /// Callers must discover this through the system toolchain, not package data.
     #[cfg(target_os = "macos")]
