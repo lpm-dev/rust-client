@@ -92,3 +92,49 @@ async fn install_access_does_not_treat_an_unavailable_endpoint_as_permission() {
             .is_err()
     );
 }
+
+#[tokio::test]
+async fn anonymous_install_probe_never_sends_credentials_and_checks_every_identity() {
+    let root = ManagedInstallRoot::new("@lpm.dev/author.free", "1.0.0");
+    for (status, body, expected) in [
+        (
+            200,
+            json!({"packages":[{"name":root.name,"version":root.version,"allowed":true}]}),
+            Some(true),
+        ),
+        (
+            200,
+            json!({"packages":[{"name":root.name,"version":root.version,"allowed":false}]}),
+            Some(false),
+        ),
+        (401, json!({}), Some(false)),
+        (200, json!({"packages":[]}), None),
+        (
+            200,
+            json!({"packages":[{"name":root.name,"version":"2.0.0","allowed":true}]}),
+            None,
+        ),
+        (503, json!({}), None),
+    ] {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/registry/install-check"))
+            .respond_with(move |request: &wiremock::Request| {
+                assert!(!request.headers.contains_key("authorization"));
+                ResponseTemplate::new(status).set_body_json(&body)
+            })
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client = RegistryClient::new()
+            .with_base_url(server.uri())
+            .with_token("irrelevant-token");
+        let result = client
+            .can_install_anonymously(std::slice::from_ref(&root))
+            .await;
+        match expected {
+            Some(expected) => assert_eq!(result.unwrap(), expected),
+            None => assert!(result.is_err()),
+        }
+    }
+}

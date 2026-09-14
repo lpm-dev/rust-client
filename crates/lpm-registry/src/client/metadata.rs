@@ -766,7 +766,7 @@ impl RegistryClient {
         name: &str,
         use_validator: bool,
     ) -> Result<(reqwest::Response, String, Option<CacheValidator>), LpmError> {
-        self.execute_with_recovery(AuthPosture::AuthRequired, || async {
+        self.execute_with_recovery(AuthPosture::PackageRead, || async {
             let bearer = self.current_bearer(AuthPosture::AuthRequired)?;
             let cache_key = self.metadata_cache_key_for_origin(
                 namespace,
@@ -1188,7 +1188,7 @@ impl RegistryClient {
         body: &serde_json::Value,
     ) -> Result<(reqwest::Response, String), LpmError> {
         let url = format!("{}/api/registry/batch-metadata", self.base_url);
-        self.execute_with_recovery(AuthPosture::AuthRequired, || async {
+        self.execute_with_recovery(AuthPosture::PackageRead, || async {
             let bearer = self.current_bearer(AuthPosture::AuthRequired)?;
             let cache_principal = bearer_principal_fingerprint(
                 bearer.as_deref(),
@@ -1377,7 +1377,7 @@ impl RegistryClient {
         let scoped_ref = scoped.as_str();
         let initial_timings = timings;
         let result = self
-            .execute_with_recovery(AuthPosture::AuthRequired, || {
+            .execute_with_recovery(AuthPosture::PackageRead, || {
                 let mut timings = initial_timings;
                 async move {
                     let bearer = self.current_bearer(AuthPosture::AuthRequired)?;

@@ -79,7 +79,7 @@ impl RegistryClient {
         url: &str,
         accounting: Option<ManagedInstallAccounting>,
     ) -> Result<reqwest::Response, LpmError> {
-        self.execute_with_recovery(AuthPosture::AuthRequired, || async {
+        self.execute_with_recovery(AuthPosture::PackageRead, || async {
             let mut request = self.build_get(url).await?;
             if accounting.is_some() {
                 request = request.header(

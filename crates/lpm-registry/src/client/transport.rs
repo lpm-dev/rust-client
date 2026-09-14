@@ -295,7 +295,8 @@ impl RegistryClient {
         Fut: std::future::Future<Output = Result<T, LpmError>>,
     {
         // Proactive pass.
-        if posture.allows_recovery()
+        if posture != AuthPosture::PackageRead
+            && posture.allows_recovery()
             && let Some(session) = &self.session
             && let Some(source) = session.current_source()?
             && source.refresh_policy() == RefreshPolicy::IfRefreshable

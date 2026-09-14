@@ -424,6 +424,16 @@ pub async fn ensure_configured(
     package_dir: &std::path::Path,
     json_output: bool,
 ) -> Result<SwiftRegistrySetupOutcome, LpmError> {
+    ensure_configured_for_install(session, registry_url, package_dir, json_output, false).await
+}
+
+pub(crate) async fn ensure_configured_for_install(
+    session: Option<&lpm_auth::SessionManager>,
+    registry_url: &str,
+    package_dir: &std::path::Path,
+    json_output: bool,
+    anonymous: bool,
+) -> Result<SwiftRegistrySetupOutcome, LpmError> {
     if !lpm_common::lpm_registry_url_is_accepted(registry_url) {
         return Err(LpmError::Registry(format!(
             "automatic Swift registry setup refuses {registry_url}: only https:// URLs or http:// loopback URLs are accepted"
@@ -486,7 +496,7 @@ pub async fn ensure_configured(
         }
     }
 
-    if is_https {
+    if is_https && !anonymous {
         let discovered_session;
         let session = match session {
             Some(session) => session,
@@ -1229,6 +1239,30 @@ exit 64
             fs::read_to_string(output_modes).expect("read Swift login output modes"),
             "null/null\nlive/live\n"
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn anonymous_https_setup_skips_rejected_credentials_but_requires_certificate_verification()
+     {
+        let _lock = home_env_lock().lock().await;
+        let home = TempDir::new().unwrap();
+        let package = TempDir::new().unwrap();
+        let path = fake_swift_path(home.path());
+        let _environment = crate::test_env::ScopedEnv::update([
+            ("HOME", Some(home.path().as_os_str().to_owned())),
+            ("PATH", Some(path)),
+            ("LPM_TOKEN", None),
+        ]);
+        let registry_url = "https://127.0.0.1:1";
+        write_matching_package_scope(package.path(), registry_url);
+        let session = lpm_auth::SessionManager::new(registry_url, Some("rejected-access".into()));
+        let error =
+            ensure_configured_for_install(Some(&session), registry_url, package.path(), true, true)
+                .await
+                .expect_err("unreachable certificate endpoint must prevent setup");
+        assert!(!home.path().join("swift-login-tokens").exists());
+        assert!(error.to_string().contains("certificate"), "{error}");
     }
 
     #[cfg(unix)]
