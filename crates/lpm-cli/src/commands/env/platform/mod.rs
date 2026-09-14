@@ -1218,37 +1218,18 @@ async fn read_signed_lpm_response(
         .get(lpm_vault::signature::SIGNATURE_HEADER)
         .and_then(|value| value.to_str().ok())
         .map(str::to_owned);
-    #[cfg(all(debug_assertions, not(test)))]
-    let local_development =
-        lpm_vault::signature::is_local_development_key(response.url(), key_id.as_deref());
+    #[cfg(not(test))]
+    let origin = response.url().clone();
     let body = super::response::read_capped_platform_body(response).await?;
     if status.is_success() {
         #[cfg(not(test))]
-        let verification = {
-            #[cfg(debug_assertions)]
-            if local_development {
-                lpm_vault::signature::verify_response_with_test_key(
-                    status.as_u16(),
-                    &body,
-                    key_id.as_deref(),
-                    signature.as_deref(),
-                )
-            } else {
-                lpm_vault::signature::verify_response(
-                    status.as_u16(),
-                    &body,
-                    key_id.as_deref(),
-                    signature.as_deref(),
-                )
-            }
-            #[cfg(not(debug_assertions))]
-            lpm_vault::signature::verify_response(
-                status.as_u16(),
-                &body,
-                key_id.as_deref(),
-                signature.as_deref(),
-            )
-        };
+        let verification = lpm_vault::signature::verify_response_for_origin(
+            &origin,
+            status.as_u16(),
+            &body,
+            key_id.as_deref(),
+            signature.as_deref(),
+        );
         #[cfg(test)]
         let verification = lpm_vault::signature::verify_response_with_test_key(
             status.as_u16(),

@@ -110,11 +110,29 @@ pub fn verify_response(
     })
 }
 
-/// Whether a debug response can use the built-in localhost signing key.
-#[cfg(debug_assertions)]
+/// Verify a response with the keys allowed for its origin and build configuration.
+pub fn verify_response_for_origin(
+    origin: &reqwest::Url,
+    status: u16,
+    body: &[u8],
+    key_id_header: Option<&str>,
+    signature_header: Option<&str>,
+) -> Result<(), SignatureError> {
+    #[cfg(any(debug_assertions, feature = "acceptance-test-hooks"))]
+    if is_local_development_key(origin, key_id_header) {
+        return verify_response_with_test_key(status, body, key_id_header, signature_header);
+    }
+    #[cfg(not(any(debug_assertions, feature = "acceptance-test-hooks")))]
+    let _ = origin;
+    verify_response(status, body, key_id_header, signature_header)
+}
+
+/// Whether a debug or isolated acceptance response can use the localhost signing key.
+#[cfg(any(debug_assertions, feature = "acceptance-test-hooks"))]
 #[inline]
 pub fn is_local_development_key(url: &reqwest::Url, key_id: Option<&str>) -> bool {
-    key_id == Some(TEST_KEY_ID)
+    (cfg!(debug_assertions) || crate::acceptance_file_storage_enabled())
+        && key_id == Some(TEST_KEY_ID)
         && url.scheme() == "http"
         && matches!(url.host_str(), Some("localhost" | "127.0.0.1" | "[::1]"))
 }

@@ -153,39 +153,20 @@ pub(super) async fn read_verified_response(
     } else {
         MAX_VAULT_ERROR_RESPONSE_BYTES
     };
-    #[cfg(all(debug_assertions, not(test)))]
-    let local_development =
-        signature::is_local_development_key(response.url(), key_id_header.as_deref());
+    #[cfg(not(test))]
+    let origin = response.url().clone();
     let mut body = read_capped_body_with_limit(response, max_bytes).await?;
     let has_signature_headers = key_id_header.is_some() || signature_header.is_some();
 
     if status != reqwest::StatusCode::UNAUTHORIZED || has_signature_headers {
         #[cfg(not(test))]
-        let verification = {
-            #[cfg(debug_assertions)]
-            if local_development {
-                signature::verify_response_with_test_key(
-                    status.as_u16(),
-                    &body,
-                    key_id_header.as_deref(),
-                    signature_header.as_deref(),
-                )
-            } else {
-                signature::verify_response(
-                    status.as_u16(),
-                    &body,
-                    key_id_header.as_deref(),
-                    signature_header.as_deref(),
-                )
-            }
-            #[cfg(not(debug_assertions))]
-            signature::verify_response(
-                status.as_u16(),
-                &body,
-                key_id_header.as_deref(),
-                signature_header.as_deref(),
-            )
-        };
+        let verification = signature::verify_response_for_origin(
+            &origin,
+            status.as_u16(),
+            &body,
+            key_id_header.as_deref(),
+            signature_header.as_deref(),
+        );
         #[cfg(test)]
         let verification = signature::verify_response_with_test_key(
             status.as_u16(),
