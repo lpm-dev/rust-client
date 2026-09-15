@@ -291,6 +291,23 @@ mod tests {
     }
 
     #[test]
+    fn constant_string_module_specifiers_are_static() {
+        for code in [
+            "const url = require('u' + 'rl');",
+            "const load = () => import('./' + 'plugin.js');",
+        ] {
+            assert!(!analyze(code).dynamic_require, "{code}");
+        }
+    }
+
+    #[test]
+    fn constant_string_process_imports_retain_capabilities() {
+        let tags = analyze("const cp = require('child_' + 'process'); cp.exec(command);");
+        assert!(tags.child_process);
+        assert!(tags.shell);
+    }
+
+    #[test]
     fn process_library_helpers_do_not_imply_process_or_shell_execution() {
         for code in [
             "import {parseCommand} from 'execa'; parseCommand(command);",

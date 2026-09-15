@@ -1,6 +1,7 @@
 use oxc_ast::{AstKind, ast::*};
 use oxc_ast_visit::{Visit, walk};
 use oxc_semantic::{Semantic, SemanticBuilder, SymbolId};
+use std::borrow::Cow;
 use std::collections::HashMap;
 
 #[derive(Default)]
@@ -111,6 +112,55 @@ fn method(name: &str) -> Method {
     }
 }
 
+fn static_string<'s>(expression: &'s Expression<'_>, depth: usize) -> Option<Cow<'s, str>> {
+    if depth >= 8 {
+        return None;
+    }
+    match expression.get_inner_expression() {
+        Expression::StringLiteral(value) => Some(Cow::Borrowed(value.value.as_str())),
+        Expression::TemplateLiteral(value) if value.expressions.is_empty() => Some(Cow::Borrowed(
+            value.quasis.first()?.value.cooked.as_ref()?.as_str(),
+        )),
+        Expression::BinaryExpression(binary) if binary.operator.as_str() == "+" => {
+            let left = static_string(&binary.left, depth + 1)?;
+            let right = static_string(&binary.right, depth + 1)?;
+            // Only short built-in module names need reconstruction for binding lookup.
+            if left.len() + right.len() > 32 {
+                return None;
+            }
+            let mut name = String::with_capacity(left.len() + right.len());
+            name.push_str(&left);
+            name.push_str(&right);
+            Some(Cow::Owned(name))
+        }
+        _ => None,
+    }
+}
+
+fn is_static_string(expression: &Expression<'_>, depth: usize) -> bool {
+    if depth >= 8 {
+        return false;
+    }
+    match expression.get_inner_expression() {
+        Expression::StringLiteral(_) => true,
+        Expression::TemplateLiteral(template) => template.expressions.is_empty(),
+        Expression::BinaryExpression(binary) if binary.operator.as_str() == "+" => {
+            is_static_string(&binary.left, depth + 1) && is_static_string(&binary.right, depth + 1)
+        }
+        _ => false,
+    }
+}
+
+fn required_module(call: &CallExpression<'_>, semantic: &Semantic<'_>) -> Option<Module> {
+    let Expression::Identifier(identifier) = call.callee.get_inner_expression() else {
+        return None;
+    };
+    if identifier.name != "require" || !semantic.is_reference_to_global_variable(identifier) {
+        return None;
+    }
+    module(static_string(call.arguments.first()?.as_expression()?, 0)?.as_ref())
+}
+
 fn origin(
     expression: &Expression<'_>,
     semantic: &Semantic<'_>,
@@ -192,12 +242,8 @@ fn origin(
             )
         }
         Expression::CallExpression(call) => {
-            if let Expression::Identifier(identifier) = call.callee.get_inner_expression()
-                && identifier.name == "require"
-                && semantic.is_reference_to_global_variable(identifier)
-                && let Some(Argument::StringLiteral(name)) = call.arguments.first()
-            {
-                return Some(Origin::new(module(name.value.as_str())?, Method::Namespace));
+            if let Some(module) = required_module(call, semantic) {
+                return Some(Origin::new(module, Method::Namespace));
             }
             let callee = origin(&call.callee, semantic, assignments, depth + 1)?;
             if callee.contains(Module::Loader, Method::CreateRequire) {
@@ -293,8 +339,7 @@ fn has_shell_option(call: &CallExpression<'_>, semantic: &Semantic<'_>) -> bool 
 fn dynamic_argument(argument: Option<&Expression<'_>>) -> bool {
     argument.is_some_and(|argument| {
         let argument = argument.get_inner_expression();
-        !argument.is_literal()
-            && !matches!(argument, Expression::TemplateLiteral(template) if template.expressions.is_empty())
+        !argument.is_literal() && !is_static_string(argument, 0)
     })
 }
 
@@ -324,10 +369,14 @@ impl<'a> Visit<'a> for CallCandidates {
 
     fn visit_call_expression(&mut self, call: &CallExpression<'a>) {
         if call.callee.get_inner_expression().is_specific_id("require")
-            && let Some(Argument::StringLiteral(name)) = call.arguments.first()
             && call.arguments.len() == 1
+            && let Some(name) = call
+                .arguments
+                .first()
+                .and_then(Argument::as_expression)
+                .and_then(|argument| static_string(argument, 0))
         {
-            self.0 |= module(name.value.as_str()).is_some();
+            self.0 |= module(name.as_ref()).is_some();
             return;
         }
         walk::walk_call_expression(self, call);
@@ -412,29 +461,31 @@ pub(super) fn analyze(program: &Program<'_>) -> CallFacts {
                     .filter(|identifier| semantic.is_reference_to_global_variable(identifier))
                     .map(|identifier| identifier.name.as_str());
                 let method = global_name.map_or(Method::Other, method);
-                let process = value.is_some_and(|value| {
-                    value.includes_module(Module::Process)
-                        || [
-                            Method::Namespace,
-                            Method::Spawn,
-                            Method::SpawnSync,
-                            Method::Fork,
-                        ]
-                        .iter()
-                        .any(|method| value.contains(Module::Execa, *method))
-                        || value.contains(Module::Shell, Method::Exec)
-                }) || matches!(
-                    global_name,
-                    Some(
-                        "exec"
-                            | "execSync"
-                            | "execFile"
-                            | "execFileSync"
-                            | "spawn"
-                            | "spawnSync"
-                            | "fork"
-                    )
-                );
+                let process = required_module(call, semantic) == Some(Module::Process)
+                    || value.is_some_and(|value| {
+                        value.includes_module(Module::Process)
+                            || [
+                                Method::Namespace,
+                                Method::Spawn,
+                                Method::SpawnSync,
+                                Method::Fork,
+                            ]
+                            .iter()
+                            .any(|method| value.contains(Module::Execa, *method))
+                            || value.contains(Module::Shell, Method::Exec)
+                    })
+                    || matches!(
+                        global_name,
+                        Some(
+                            "exec"
+                                | "execSync"
+                                | "execFile"
+                                | "execFileSync"
+                                | "spawn"
+                                | "spawnSync"
+                                | "fork"
+                        )
+                    );
                 if process {
                     facts.process.get_or_insert(call.span.start as usize);
                     let shell = matches!(method, Method::Exec | Method::ExecSync)
