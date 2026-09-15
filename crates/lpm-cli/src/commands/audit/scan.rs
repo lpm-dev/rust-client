@@ -172,16 +172,7 @@ fn merge_behavioral_results(results: &mut Vec<AuditResult>, behavioral: Vec<Audi
         if local_result.path.is_some() {
             result.path = local_result.path.take();
         }
-        let existing_messages: std::collections::HashSet<&str> = result
-            .issues
-            .iter()
-            .map(|issue| issue.message.as_str())
-            .collect();
-        local_result
-            .issues
-            .retain(|issue| !existing_messages.contains(issue.message.as_str()));
-        drop(existing_messages);
-        result.issues.extend(local_result.issues);
+        super::types::merge_issues(&mut result.issues, local_result.issues);
     }
 }
 
@@ -203,6 +194,7 @@ mod tests {
                 message: issue.to_string(),
                 category: "behavior".to_string(),
                 source: "test".to_string(),
+                ..AuditIssue::default()
             }],
         }
     }
@@ -216,6 +208,7 @@ mod tests {
             message: "local-only".to_string(),
             category: "behavior".to_string(),
             source: "local".to_string(),
+            ..AuditIssue::default()
         });
 
         merge_behavioral_results(&mut results, vec![local]);
@@ -224,5 +217,20 @@ mod tests {
         assert_eq!(results[0].quality_score, Some(90));
         assert_eq!(results[0].path.as_deref(), Some("local"));
         assert_eq!(results[0].issues.len(), 2);
+    }
+
+    #[test]
+    fn registry_behavior_duplicates_retain_local_source_evidence() {
+        let mut results = vec![result("same", "registry", Some(90), "eval()")];
+        let mut local = result("same", "local", None, "eval()");
+        results[0].issues[0].source = "registry".to_string();
+        local.issues[0].source = "local".to_string();
+        let analysis = lpm_security::behavioral::analyze_bytes("lib/index.js", b"eval(input)");
+        local.issues[0].evidence = analysis.evidence;
+        assert!(!local.issues[0].evidence.is_empty());
+        merge_behavioral_results(&mut results, vec![local]);
+        assert_eq!(results[0].issues.len(), 1);
+        assert_eq!(results[0].issues[0].evidence[0].path, "lib/index.js");
+        assert_eq!(results[0].issues[0].source, "combined");
     }
 }

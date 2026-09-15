@@ -250,6 +250,7 @@ fn fail_on_behavior_catches_high_severity() {
             message: "uses eval()".into(),
             category: "behavior".into(),
             source: "local".into(),
+            ..AuditIssue::default()
         }],
     }];
 
@@ -341,7 +342,8 @@ fn registry_behavioral_fields_use_the_shared_tag_policy() {
         let policy = tag.behavioral_policy().expect("behavioral tag policy");
         let expected_category = match policy.group {
             TagGroup::SupplyChain => "supply-chain",
-            TagGroup::Source | TagGroup::Manifest => "behavior",
+            TagGroup::Source => "capability",
+            TagGroup::Manifest => "behavior",
         };
 
         assert_eq!(

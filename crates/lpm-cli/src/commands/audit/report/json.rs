@@ -28,8 +28,9 @@ pub(in crate::commands::audit) fn print_json_report(
         "osv_degraded_reason": osv_degraded_reason,
         "scanned": discovery.packages.len(),
         "checked_lpm": checked_lpm,
-        "packages_with_issues": results.iter().filter(|r| !r.issues.is_empty()).count(),
-        "total_issues": results.iter().map(|r| r.issues.len()).sum::<usize>(),
+        "packages_with_issues": results.iter().filter(|r| r.issues.iter().any(|i| !i.is_capability())).count(),
+        "total_issues": results.iter().flat_map(|r| &r.issues).filter(|i| !i.is_capability()).count(),
+        "total_capabilities": results.iter().flat_map(|r| &r.issues).filter(|i| i.is_capability()).count(),
         "osv_vulnerabilities": osv_vulns.len(),
         "counts": {
             "critical": counts.critical,
@@ -45,13 +46,27 @@ pub(in crate::commands::audit) fn print_json_report(
                 "instance_id": r.instance_id.map(|instance_id| instance_id.to_string()),
                 "path": r.path,
                 "quality_score": r.quality_score,
-                "issues": r.issues.iter().map(|i| {
+                "capabilities": r.issues.iter().filter(|i| i.is_capability()).map(|i| {
                     serde_json::json!({
+                        "rule_id": i.rule_id,
+                        "name": i.message,
+                        "policy_severity": i.severity,
+                        "source": i.source,
+                        "evidence": i.evidence,
+                    })
+                }).collect::<Vec<_>>(),
+                "issues": r.issues.iter().filter(|i| !i.is_capability()).map(|i| {
+                    let mut issue = serde_json::json!({
                         "severity": i.severity,
                         "category": i.category,
                         "message": i.message,
                         "source": i.source,
-                    })
+                    });
+                    if let Some(rule_id) = i.rule_id {
+                        issue["rule_id"] = serde_json::json!(rule_id);
+                        issue["evidence"] = serde_json::json!(i.evidence);
+                    }
+                    issue
                 }).collect::<Vec<_>>(),
             })
         }).collect::<Vec<_>>(),

@@ -5,31 +5,22 @@
 //! - **Supply chain tags** (8): Obfuscation confidence, entropy, minified, telemetry, etc.
 //! - **Manifest tags** (5): License + dependency configuration issues
 //!
-//! Runs on every extracted package in the store. Results are cached in
-//! `.lpm-security.json` alongside the package — computed once per version, forever.
+//! Explicit audits and opted-in installs scan source without executing package code.
+//! Cached results are invalidated when the schema or package fingerprint changes.
 //!
-//! ## Security
-//!
-//! All regex patterns use the `regex` crate which guarantees linear-time matching
-//! (Thompson NFA). NEVER use `fancy-regex` here — we scan untrusted input from
-//! arbitrary npm packages.
-//!
-//! ## Performance
-//!
-//! - `RegexSet` + `OnceLock` for compile-once, single-pass matching
-//! - File extension filtering before I/O (skip non-source files)
-//! - Per-file size limit: 2MB (skip bundled/generated files)
-//! - Per-package total limit: 50MB scanned
-//! - Shannon entropy pre-filter: 95% of files skip the expensive extraction
-//! - Comment stripping: streaming state machine, preserves newlines
-//!
-//! Target: < 100ms per typical 100-file package on M1.
+//! Regex matching has linear time bounds. Syntax analysis distinguishes bindings
+//! from unrelated names. Oversized files receive bounded head and tail samples.
+//! Package byte and file limits produce explicit partial-coverage metadata.
 
+mod bindings;
+mod evidence;
 pub mod manifest;
 pub mod secrets;
 pub mod source;
 pub mod supply_chain;
 mod syntax;
+
+pub use evidence::SourceEvidence;
 
 use manifest::ManifestTags;
 use serde::{Deserialize, Serialize};
@@ -43,7 +34,7 @@ use supply_chain::SupplyChainTags;
 /// Current schema version for `.lpm-security.json`.
 /// Bump this when adding new tags or changing tag semantics — cached
 /// files with older versions will be automatically re-analyzed.
-pub const SCHEMA_VERSION: u32 = 6;
+pub const SCHEMA_VERSION: u32 = 7;
 
 /// Maximum file size for a full scan. Larger source files receive bounded samples.
 const MAX_FILE_SIZE: u64 = 2 * 1024 * 1024;
@@ -86,6 +77,9 @@ pub struct PackageAnalysis {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AnalysisMeta {
+    /// Up to three deterministic examples per behavioral rule; not an exhaustive match list.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub evidence: Vec<SourceEvidence>,
     /// Number of source files scanned.
     #[serde(default)]
     pub files_scanned: usize,
@@ -539,7 +533,7 @@ fn analyze_open_cap_source_file(
         .path
         .file_name()
         .and_then(|name| name.to_str())
-        .map(|filename| {
+        .map(|_filename| {
             if source_file.size > MAX_FILE_SIZE {
                 analyze_oversized_source_sample(
                     &source_file.path,
@@ -548,7 +542,7 @@ fn analyze_open_cap_source_file(
                     comment_buf,
                 )
             } else {
-                analyze_bytes_with_scratch(filename, &bytes, comment_buf)
+                analyze_bytes_with_scratch(&path_to_slash(&source_file.path), &bytes, comment_buf)
             }
         });
     Ok(ScannedCapSourceFile {
@@ -763,6 +757,7 @@ fn read_package_manifest_from_open_dir(
 /// [`analyze_bytes`] and merge results without reopening [`PackageAnalyzer`].
 #[derive(Debug, Default)]
 pub struct FileAnalysisResult {
+    pub evidence: Vec<SourceEvidence>,
     pub source: SourceTags,
     pub supply_chain: SupplyChainTags,
     pub url_domains: Vec<String>,
@@ -791,7 +786,6 @@ fn analyze_single_file(
     comment_buf: &mut Vec<u8>,
 ) -> Option<FileAnalysisResult> {
     let file_size = std::fs::metadata(file_path).ok()?.len();
-    let filename = file_path.file_name()?.to_str()?.to_string();
     let relative_path = file_path
         .strip_prefix(package_dir)
         .unwrap_or(file_path.as_path());
@@ -807,7 +801,7 @@ fn analyze_single_file(
 
     let raw_content = std::fs::read(file_path).ok()?;
     Some(analyze_bytes_with_scratch(
-        &filename,
+        &path_to_slash(relative_path),
         &raw_content,
         comment_buf,
     ))
@@ -842,14 +836,17 @@ fn analyze_bytes_with_scratch(
     let context = syntax::SourceContext::new(&raw_text, filename, comment_buf);
     let stripped = context.stripped.as_ref();
 
-    let file_source_tags = source::analyze_source_context(&context);
+    let (file_source_tags, mut evidence) =
+        source::analyze_source_context_with_evidence(&context, Some(filename));
     let domains = supply_chain::extract_url_domains(stripped);
     let mut file_supply_tags =
         supply_chain::analyze_supply_chain_context(&context, raw_content, !domains.is_empty());
     file_supply_tags.minified |= supply_chain::is_minified_filename(filename);
+    supply_chain::append_evidence(&context, filename, &file_supply_tags, &mut evidence);
     let trivial = supply_chain::analyze_trivial(stripped);
 
     FileAnalysisResult {
+        evidence,
         source: file_source_tags,
         supply_chain: file_supply_tags,
         url_domains: domains,
@@ -887,11 +884,16 @@ fn analyze_oversized_source_sample(
     let mut result = if sample.is_empty() {
         FileAnalysisResult::default()
     } else {
-        analyze_bytes_with_scratch(filename, sample, comment_buf)
+        analyze_bytes_with_scratch(&path_to_slash(relative_path), sample, comment_buf)
     };
 
     result.files_scanned = 0;
     result.bytes_scanned = sample.len() as u64;
+    for entry in &mut result.evidence {
+        entry.sampled = true;
+        entry.line = None;
+        entry.column = None;
+    }
     result.supply_chain.minified |= supply_chain::is_minified_filename(filename);
 
     let evidence = OversizedSourceFileEvidence {
@@ -1037,6 +1039,7 @@ fn accumulate_result(
     meta.files_scanned += result.files_scanned;
     meta.unparsed_files += result.unparsed_files;
     meta.bytes_scanned += result.bytes_scanned;
+    evidence::merge_evidence(&mut meta.evidence, result.evidence);
     extend_oversized_source_files(
         &mut meta.oversized_source_files,
         result.oversized_source_files,
@@ -1300,6 +1303,7 @@ fn parse_deps_map(value: Option<&serde_json::Value>) -> Option<HashMap<String, S
 /// the just-written directory a second time.
 #[derive(Debug, Default)]
 pub struct PackageAnalyzer {
+    evidence: Vec<SourceEvidence>,
     source: SourceTags,
     supply_chain: SupplyChainTags,
     url_domains: Vec<String>,
@@ -1394,11 +1398,6 @@ impl PackageAnalyzer {
             self.limit_reached = true;
             return;
         }
-        let filename = relative_path
-            .file_name()
-            .map(|s| s.to_string_lossy().into_owned())
-            .unwrap_or_default();
-
         if bytes.len() as u64 > MAX_FILE_SIZE {
             let scan_start = std::time::Instant::now();
             let sample = oversized_source_sample_from_bytes(bytes);
@@ -1422,7 +1421,7 @@ impl PackageAnalyzer {
         }
 
         let scan_start = std::time::Instant::now();
-        let result = analyze_bytes(&filename, bytes);
+        let result = analyze_bytes(&path_to_slash(relative_path), bytes);
         self.merge(result);
         self.source_scan_ns = self
             .source_scan_ns
@@ -1475,6 +1474,7 @@ impl PackageAnalyzer {
     }
 
     fn merge(&mut self, result: FileAnalysisResult) {
+        evidence::merge_evidence(&mut self.evidence, result.evidence);
         let oversized = !result.oversized_source_files.is_empty();
         self.source = source::merge_source_tags(&self.source, &result.source);
         self.supply_chain =
@@ -1508,6 +1508,7 @@ impl PackageAnalyzer {
         self.url_domains.dedup();
 
         let meta = AnalysisMeta {
+            evidence: self.evidence,
             files_scanned: self.files_scanned,
             unparsed_files: self.unparsed_files,
             input_incomplete: false,
@@ -1761,6 +1762,71 @@ mod tests {
         capability_json["analyzedAt"] = serde_json::Value::Null;
 
         assert_eq!(capability_json, path_json);
+    }
+
+    #[test]
+    fn reviewed_source_controls_preserve_capabilities_and_critical_patterns() {
+        let controls: serde_json::Value = serde_json::from_str(include_str!(
+            "../../tests/fixtures/source-capabilities.json"
+        ))
+        .unwrap();
+        for control in controls.as_array().unwrap() {
+            let result = analyze_bytes("index.js", control["source"].as_str().unwrap().as_bytes());
+            let actual =
+                serde_json::json!({"source": result.source, "supplyChain": result.supply_chain});
+            for (group, fields) in control["expected"].as_object().unwrap() {
+                for (field, expected) in fields.as_object().unwrap() {
+                    assert_eq!(
+                        &actual[group][field], expected,
+                        "{}: {group}.{field}",
+                        control["name"]
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn streaming_scans_and_serialized_cache_retain_relative_evidence() {
+        let package = tempfile::tempdir().unwrap();
+        let files = [
+            (
+                "package.json",
+                r#"{"name":"evidence","version":"1.0.0","license":"MIT"}"#,
+            ),
+            (
+                "lib/compile.js",
+                "export const compile = input => eval(input);",
+            ),
+            ("examples/network.js", "fetch(endpoint);"),
+        ];
+        create_test_package(package.path(), &files);
+        let direct = analyze_package(package.path());
+        let mut streaming = PackageAnalyzer::new();
+        for (path, source) in files.iter().rev() {
+            if PackageAnalyzer::should_scan(Path::new(path), source.len() as u64) {
+                streaming.feed(Path::new(path), source.as_bytes());
+            }
+        }
+        let streamed = streaming.finalize(package.path());
+        let cached: PackageAnalysis =
+            serde_json::from_slice(&serde_json::to_vec(&streamed).unwrap()).unwrap();
+        assert_eq!(direct.meta.evidence, cached.meta.evidence);
+        let eval = cached
+            .meta
+            .evidence
+            .iter()
+            .find(|e| e.rule_id == "eval")
+            .unwrap();
+        assert_eq!(eval.path, "lib/compile.js");
+        assert_eq!(eval.line, Some(1));
+        let network = cached
+            .meta
+            .evidence
+            .iter()
+            .find(|e| e.rule_id == "network")
+            .unwrap();
+        assert_eq!(network.file_context, "test-or-example");
     }
 
     #[test]
@@ -2073,6 +2139,14 @@ mod tests {
                 .contains(&"oversized.example".to_string())
         );
         assert!(oversized.sample_bytes_scanned < oversized.size_bytes);
+        assert!(!analysis.meta.evidence.is_empty());
+        assert!(
+            analysis
+                .meta
+                .evidence
+                .iter()
+                .all(|entry| entry.sampled && entry.line.is_none() && entry.column.is_none())
+        );
     }
 
     #[test]
