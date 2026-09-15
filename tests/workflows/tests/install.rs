@@ -6094,24 +6094,28 @@ async fn install_source_analysis_defaults_off_and_opt_in_backfills_cache_without
 async fn install_disabled_lpm_insights_skips_enrichment_request_but_keeps_local_findings() {
     let mock = MockRegistry::start().await;
     let tarball = make_tarball_with_files(
-        "@lpm.dev/local-findings",
+        "@lpm.dev/test.local-findings",
         "1.0.0",
         &[("behavior.js", b"eval('local-finding')")],
     );
-    mock.with_package("@lpm.dev/local-findings", "1.0.0", &tarball)
+    mock.with_package("@lpm.dev/test.local-findings", "1.0.0", &tarball)
         .await;
     let project = TempProject::empty(
         r#"{
         "name": "disabled-lpm-insights-project",
         "version": "1.0.0",
         "dependencies": {
-            "@lpm.dev/local-findings": "1.0.0"
+            "@lpm.dev/test.local-findings": "1.0.0"
         }
     }"#,
     );
     let config_path = project.home().join(".lpm/config.toml");
     std::fs::create_dir_all(config_path.parent().unwrap()).unwrap();
-    std::fs::write(&config_path, "fetch-lpm-security-insights = false\n").unwrap();
+    std::fs::write(
+        &config_path,
+        "fetch-lpm-security-insights = false\ninstall-time-source-analysis = true\n",
+    )
+    .unwrap();
 
     let output = lpm_with_registry(&project, &mock.url())
         .env("LPM_STORE_VERSION", "v2")
@@ -6854,6 +6858,11 @@ async fn npm_only_install_compacts_noncritical_security_findings_by_default() {
 }"#,
     );
 
+    lpm(&project)
+        .args(["config", "source-analysis", "--set", "true"])
+        .assert()
+        .success();
+
     let output = lpm_with_registry(&project, &mock.url())
         .args(["install", "--no-skills", "--no-editor-setup"])
         .output()
@@ -6875,7 +6884,7 @@ async fn npm_only_install_compacts_noncritical_security_findings_by_default() {
             && combined.contains("1 High")
             && combined.contains("1 Medium")
             && combined.contains("Run lpm audit for full details."),
-        "local cached analysis must use a severity roll-up without an @lpm.dev dependency:\n{combined}",
+        "local source analysis must use a severity roll-up without an @lpm.dev dependency:\n{combined}",
     );
     assert!(
         !combined.contains("eval()")
@@ -6907,6 +6916,11 @@ async fn verbose_npm_only_install_reports_noncritical_finding_details() {
   }
 }"#,
     );
+
+    lpm(&project)
+        .args(["config", "source-analysis", "--set", "true"])
+        .assert()
+        .success();
 
     let output = lpm_with_registry(&project, &mock.url())
         .args(["--verbose", "install", "--no-skills", "--no-editor-setup"])
@@ -7033,6 +7047,11 @@ async fn install_hides_info_only_behavioral_metadata_by_default() {
         r#"{"name":"info-only-default-app","version":"1.0.0","dependencies":{"info-only-default":"1.0.0"}}"#,
     );
 
+    lpm(&project)
+        .args(["config", "source-analysis", "--set", "true"])
+        .assert()
+        .success();
+
     let output = lpm_with_registry_and_npm(&project, &mock.url())
         .args(["install", "--no-skills", "--no-editor-setup"])
         .output()
@@ -7055,6 +7074,11 @@ async fn verbose_install_shows_info_metadata_with_matching_query_hint() {
     let project = TempProject::empty(
         r#"{"name":"info-only-verbose-app","version":"1.0.0","dependencies":{"info-only-verbose":"1.0.0"}}"#,
     );
+
+    lpm(&project)
+        .args(["config", "source-analysis", "--set", "true"])
+        .assert()
+        .success();
 
     let output = lpm_with_registry_and_npm(&project, &mock.url())
         .args(["--verbose", "install", "--no-skills", "--no-editor-setup"])
