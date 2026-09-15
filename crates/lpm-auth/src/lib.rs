@@ -38,18 +38,13 @@ use std::path::{Path, PathBuf};
 use credential_authority::{CredentialAuthority, CredentialBackend, CredentialKind};
 
 #[cfg(target_os = "macos")]
-use security_framework::passwords::{
-    delete_generic_password as macos_delete_generic_password,
-    get_generic_password as macos_get_generic_password,
-    set_generic_password as macos_set_generic_password,
-};
+use security_framework::base::Error as MacosSecurityError;
 #[cfg(target_os = "macos")]
-use security_framework::{
-    base::Error as MacosSecurityError,
-    item::{ItemClass, ItemSearchOptions, SearchResult},
-};
+mod macos_keychain;
 
 mod credential_authority;
+#[cfg(any(target_os = "macos", test))]
+mod keychain_migration;
 mod legacy_key;
 mod session;
 pub use session::{
@@ -64,9 +59,6 @@ const KEYCHAIN_SERVICE: &str = "lpm-cli";
 const KEYCHAIN_ACCOUNT_PREFIX: &str = "auth-token";
 
 const DISABLE_HOST_CLI_AUTH_ENV: &str = "LPM_DISABLE_HOST_CLI_AUTH";
-
-#[cfg(target_os = "macos")]
-const ERR_SEC_ITEM_NOT_FOUND: i32 = -25300;
 
 #[cfg(target_os = "macos")]
 const ERR_SEC_INTERACTION_NOT_ALLOWED: i32 = -25308;
@@ -416,7 +408,7 @@ fn set_credential_with_keychain_writer_unlocked(
             credential_authority::set(
                 registry,
                 kind,
-                CredentialAuthority::active(CredentialBackend::Keychain, token),
+                CredentialAuthority::committed_keychain(token),
             )
             .map_err(|error| {
                 format!(
@@ -934,6 +926,22 @@ fn get_stored_credential_with_backend_unlocked(
         CredentialKind::Refresh => scoped_refresh_account(registry),
     };
 
+    let mut notice = Some(notice);
+    #[cfg(target_os = "macos")]
+    let authority = {
+        let mut authority = authority;
+        if !force_file_auth()
+            && let Some(record) = &mut authority
+        {
+            keychain_migration::prepare(registry, kind, &account, record, || {
+                if let Some(notice) = notice.take() {
+                    notice();
+                }
+            })?;
+        }
+        authority
+    };
+
     let resolved = resolve_stored_credential_from_backends(
         authority.as_ref(),
         || {
@@ -948,7 +956,11 @@ fn get_stored_credential_with_backend_unlocked(
                 KeychainCredentialProbe::Failed
             })
         },
-        notice,
+        || {
+            if let Some(notice) = notice.take() {
+                notice();
+            }
+        },
         || get_password_from_keychain_account(&account),
         || probe_token_from_file(&file_key),
     )?;
@@ -988,7 +1000,7 @@ fn complete_pending_keychain_cleanup_with(
     credential_authority::set(
         registry,
         kind,
-        CredentialAuthority::active(CredentialBackend::Keychain, &credential.token),
+        CredentialAuthority::active(CredentialBackend::current_keychain(), &credential.token),
     )?;
     Ok(())
 }
@@ -2111,17 +2123,25 @@ fn set_password_in_keychain_account(account: &str, token: &str) -> Result<(), St
 }
 
 #[cfg(target_os = "macos")]
-fn get_password_from_macos_keychain_native(service: &str, account: &str) -> MacosKeychainLookup {
-    let _lock = lpm_common::platform::macos_keychain_operation_lock();
-    match macos_get_generic_password(service, account) {
-        Ok(password) => token_from_keychain_password(password)
-            .map_or(MacosKeychainLookup::NotFound, MacosKeychainLookup::Found),
-        Err(error) if error.code() == ERR_SEC_ITEM_NOT_FOUND => MacosKeychainLookup::NotFound,
+fn macos_lookup(
+    service: &str,
+    account: &str,
+    scope: macos_keychain::Scope,
+    interactive: bool,
+) -> MacosKeychainLookup {
+    match macos_keychain::read(service, account, scope, interactive) {
+        Ok(Some(token)) => MacosKeychainLookup::Found(token),
+        Ok(None) => MacosKeychainLookup::NotFound,
         Err(error) if error.code() == ERR_SEC_INTERACTION_NOT_ALLOWED => {
             MacosKeychainLookup::InteractionRequired
         }
         Err(error) => MacosKeychainLookup::Failed(error),
     }
+}
+
+#[cfg(target_os = "macos")]
+fn get_password_from_macos_keychain_native(service: &str, account: &str) -> MacosKeychainLookup {
+    macos_lookup(service, account, macos_keychain::Scope::Shared, true)
 }
 
 #[cfg(target_os = "macos")]
@@ -2129,47 +2149,10 @@ fn get_password_from_macos_keychain_noninteractive(
     service: &str,
     account: &str,
 ) -> MacosKeychainLookup {
-    use core_foundation::base::{CFType, TCFType};
-    use objc2_local_authentication::LAContext;
-
-    // SAFETY: `new` returns a retained `LAContext`, and the setter only changes
-    // whether Security.framework may present authentication UI for this query.
-    let context = unsafe { LAContext::new() };
-    unsafe {
-        context.setInteractionNotAllowed(true);
-    }
-    // SAFETY: `kSecUseAuthenticationContext` explicitly accepts an LAContext
-    // object. The retained Objective-C object stays alive through `search`,
-    // and `wrap_under_get_rule` adds the ownership needed by the CFType wrapper.
-    let context_ptr = std::ptr::from_ref(&*context).cast::<std::ffi::c_void>();
-    let context_value = unsafe { CFType::wrap_under_get_rule(context_ptr) };
-
-    let _lock = lpm_common::platform::macos_keychain_operation_lock();
-    let result = ItemSearchOptions::new()
-        .class(ItemClass::generic_password())
-        .service(service)
-        .account(account)
-        .load_data(true)
-        .local_authentication_context(Some(context_value))
-        .search();
-
-    match result {
-        Ok(results) => results
-            .into_iter()
-            .find_map(|result| match result {
-                SearchResult::Data(password) => token_from_keychain_password(password),
-                _ => None,
-            })
-            .map_or(MacosKeychainLookup::NotFound, MacosKeychainLookup::Found),
-        Err(error) if error.code() == ERR_SEC_ITEM_NOT_FOUND => MacosKeychainLookup::NotFound,
-        Err(error) if error.code() == ERR_SEC_INTERACTION_NOT_ALLOWED => {
-            MacosKeychainLookup::InteractionRequired
-        }
-        Err(error) => MacosKeychainLookup::Failed(error),
-    }
+    macos_lookup(service, account, macos_keychain::Scope::Shared, false)
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(all(target_os = "macos", test))]
 fn token_from_keychain_password(password: Vec<u8>) -> Option<String> {
     String::from_utf8(password)
         .ok()
@@ -2179,19 +2162,17 @@ fn token_from_keychain_password(password: Vec<u8>) -> Option<String> {
 
 #[cfg(target_os = "macos")]
 fn set_password_in_macos_keychain(service: &str, account: &str, token: &str) -> Result<(), String> {
-    let _lock = lpm_common::platform::macos_keychain_operation_lock();
-    macos_set_generic_password(service, account, token.as_bytes())
-        .map_err(|error| format!("keychain write error: {error}"))
+    macos_keychain::write(service, account, token)
+        .map_err(|error| format!("shared Keychain write failed: {error}"))
 }
 
 #[cfg(target_os = "macos")]
 fn clear_password_from_macos_keychain(service: &str, account: &str) -> Result<(), String> {
-    let _lock = lpm_common::platform::macos_keychain_operation_lock();
-    match macos_delete_generic_password(service, account) {
-        Ok(()) => Ok(()),
-        Err(error) if error.code() == ERR_SEC_ITEM_NOT_FOUND => Ok(()),
-        Err(error) => Err(format!("keychain delete error: {error}")),
-    }
+    let shared = macos_keychain::delete(service, account, macos_keychain::Scope::Shared);
+    let legacy = macos_keychain::delete(service, account, macos_keychain::Scope::Legacy);
+    shared
+        .and(legacy)
+        .map_err(|error| format!("Keychain delete failed: {error}"))
 }
 
 fn clear_password_from_keychain_account(account: &str) -> Result<(), String> {
@@ -2981,8 +2962,7 @@ mod tests {
             assert_eq!(get_token_from_file(registry), None);
             assert_eq!(
                 credential_authority::read(registry, CredentialKind::Access).unwrap(),
-                Some(CredentialAuthority::active(
-                    CredentialBackend::Keychain,
+                Some(CredentialAuthority::committed_keychain(
                     "new-keychain-token"
                 ))
             );
@@ -3061,7 +3041,7 @@ mod tests {
             assert_eq!(
                 credential_authority::read(registry, CredentialKind::Access).unwrap(),
                 Some(CredentialAuthority::active(
-                    CredentialBackend::Keychain,
+                    CredentialBackend::current_keychain(),
                     "matching-token"
                 ))
             );
@@ -3694,7 +3674,7 @@ mod tests {
         if std::env::var("LPM_RUN_KEYCHAIN_TESTS").is_err() {
             panic!(
                 "keychain integration test requires `LPM_RUN_KEYCHAIN_TESTS=1`. \
-                 Run via: `LPM_RUN_KEYCHAIN_TESTS=1 cargo test -p lpm-auth --lib tests::macos_auth_h4_write_round_trip -- --ignored --exact --test-threads=1`"
+                 Run via: `LPM_RUN_KEYCHAIN_TESTS=1 cargo test -p lpm-auth --lib tests::macos_shared_auth_write_round_trip -- --ignored --exact --test-threads=1`"
             );
         }
     }
@@ -3717,11 +3697,9 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     fn cleanup_keychain_item(service: &str, account: &str) {
-        let _ = std::process::Command::new("security")
-            .args(["delete-generic-password", "-s", service, "-a", account])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status();
+        for scope in [macos_keychain::Scope::Shared, macos_keychain::Scope::Legacy] {
+            macos_keychain::delete(service, account, scope).expect("test Keychain cleanup failed");
+        }
     }
 
     // `should_revalidate_when_marker_missing` and
@@ -3808,7 +3786,7 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     #[ignore = "macOS keychain integration; opt-in only and serial execution required"]
-    fn macos_auth_h4_write_round_trip() {
+    fn macos_shared_auth_write_round_trip() {
         require_keychain_opt_in();
 
         with_test_keychain_service(|service| {
@@ -3830,6 +3808,21 @@ mod tests {
                 get_password_from_macos_keychain_native(service, &refresh_account),
                 MacosKeychainLookup::Found(token) if token == "lpm_refresh_token"
             ));
+
+            if let Some(helper) = std::env::var_os("LPM_KEYCHAIN_INTEROP_HELPER") {
+                let status = std::process::Command::new(helper)
+                    .args([service, &access_account])
+                    .status()
+                    .expect("Swift Keychain helper failed to start");
+                assert!(
+                    status.success(),
+                    "Swift must read the Rust credential and replace it"
+                );
+                assert!(matches!(
+                    get_password_from_macos_keychain_native(service, &access_account),
+                    MacosKeychainLookup::Found(token) if token == "swift_interop_token"
+                ));
+            }
 
             cleanup_keychain_item(service, &access_account);
             cleanup_keychain_item(service, &refresh_account);
@@ -5738,7 +5731,9 @@ mod tests {
     /// surface a confusing message to the user).
     #[cfg(target_os = "macos")]
     #[test]
+    #[ignore = "requires a Developer ID signed test bundle with the CLI provisioning profile"]
     fn clear_password_from_keychain_account_treats_absent_as_ok() {
+        require_keychain_opt_in();
         let account = format!(
             "lpm-test-absent-{}-{}",
             std::process::id(),
@@ -5747,7 +5742,6 @@ mod tests {
                 .unwrap()
                 .as_nanos(),
         );
-        // No prior write — the account is guaranteed absent.
         let result = clear_password_from_keychain_account(&account);
         assert!(
             result.is_ok(),
