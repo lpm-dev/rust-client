@@ -128,13 +128,14 @@ mod tty {
     use std::process::{ExitStatus, Stdio};
     use std::time::{Duration, Instant};
 
-    fn grouped_release_age_input() -> Vec<u8> {
+    fn grouped_release_age_input(editor_input: &[u8]) -> Vec<u8> {
         let mut input = Vec::with_capacity(96);
         for _ in 0..9 {
             input.extend_from_slice(b"\x1b[B");
         }
         input.push(b'\r');
-        input.extend_from_slice(b"\x1b[C\x1b[B\x1b[C\r");
+        input.extend_from_slice(editor_input);
+        input.push(b'\r');
         for _ in 0..12 {
             input.extend_from_slice(b"\x1b[B");
         }
@@ -255,9 +256,35 @@ mod tty {
     }
 
     #[test]
+    fn guided_config_focuses_minimum_age_first_and_saves_one_day_cautious_preset() {
+        let (project, lpm_home) = isolated_project();
+        let input = grouped_release_age_input(b"\x1b[C");
+
+        let (status, transcript) = run_guided_config_in_pty(&project, &lpm_home, &input);
+
+        assert!(status.success(), "guided config failed:\n{transcript}");
+        let age_position = transcript.find("› Minimum release age").expect(&transcript);
+        let scope_position = transcript.find("Release-age scope").expect(&transcript);
+        assert!(
+            age_position < scope_position,
+            "minimum age must appear first and have initial focus:\n{transcript}"
+        );
+        assert!(
+            transcript.contains("● Cautious (1 day)"),
+            "right arrow on the initial row must select the one-day preset:\n{transcript}"
+        );
+        let cfg = read_lpm_config(&lpm_home);
+        assert!(
+            cfg.contains("minimum-release-age-secs = \"86400\"")
+                && cfg.contains("release-age-policy = \"direct\""),
+            "changing the first row must persist one day and retain direct scope:\n{cfg}"
+        );
+    }
+
+    #[test]
     fn guided_config_edits_release_age_scope_and_minimum_age_on_one_screen() {
         let (project, lpm_home) = isolated_project();
-        let input = grouped_release_age_input();
+        let input = grouped_release_age_input(b"\x1b[C\x1b[B\x1b[C");
 
         let (status, transcript) = run_guided_config_in_pty(&project, &lpm_home, &input);
 
@@ -271,14 +298,35 @@ mod tty {
             "both release-age controls must appear in the grouped editor:\n{transcript}"
         );
         assert!(
-            transcript.contains("Saved release age configuration: scope = strict, minimum = 3d"),
+            transcript.contains("Saved release age configuration: scope = strict, minimum = 1d"),
             "grouped save summary is missing:\n{transcript}"
         );
         let cfg = read_lpm_config(&lpm_home);
         assert!(
-            cfg.contains("minimum-release-age-secs = \"259200\"")
+            cfg.contains("minimum-release-age-secs = \"86400\"")
                 && cfg.contains("release-age-policy = \"strict\""),
             "grouped editor must persist both release-age settings:\n{cfg}"
+        );
+    }
+
+    #[test]
+    fn guided_config_left_arrow_changes_age_then_scope_after_moving_down() {
+        let (project, lpm_home) = isolated_project();
+        std::fs::write(
+            lpm_config_path(&lpm_home),
+            "minimum-release-age-secs = \"0\"\n",
+        )
+        .expect("seed disabled cooldown");
+        let input = grouped_release_age_input(b"\x1b[D\x1b[B\x1b[D");
+
+        let (status, transcript) = run_guided_config_in_pty(&project, &lpm_home, &input);
+
+        assert!(status.success(), "guided config failed:\n{transcript}");
+        let cfg = read_lpm_config(&lpm_home);
+        assert!(
+            cfg.contains("minimum-release-age-secs = \"86400\"")
+                && cfg.contains("release-age-policy = \"strict\""),
+            "left arrow must change the focused age or scope setting:\n{cfg}"
         );
     }
 }

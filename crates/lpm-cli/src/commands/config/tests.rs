@@ -852,7 +852,7 @@ async fn grouped_release_age_save_persists_scope_and_minimum_age_together() {
         ReleaseAgeSelection::Seconds(CAUTIOUS_RELEASE_AGE_SECS),
         Some(crate::release_age_config::ReleaseAgePolicy::Strict),
         false,
-        "lpm config release-age --set 3d",
+        "lpm config release-age --set 1d",
     )
     .await
     .unwrap();
@@ -867,7 +867,7 @@ async fn grouped_release_age_save_persists_scope_and_minimum_age_together() {
                 .and_then(toml::Value::as_str),
             table.get("registry").and_then(toml::Value::as_str),
         ),
-        (Some("259200"), Some("strict"), Some("https://example.test"),)
+        (Some("86400"), Some("strict"), Some("https://example.test"),)
     );
 }
 
@@ -919,18 +919,15 @@ async fn release_age_policy_wizard_rejects_lower_value_when_force_floor_enabled(
 }
 
 #[test]
-fn release_age_wizard_initial_choice_treats_explicit_one_day_as_custom() {
+fn release_age_wizard_initial_choice_matches_one_day_and_preserves_three_days_as_custom() {
     assert_eq!(release_age_initial_choice(None), "default");
     assert_eq!(release_age_initial_choice(Some(0)), "off");
     assert_eq!(
         release_age_initial_choice(Some(CAUTIOUS_RELEASE_AGE_SECS)),
         "cautious"
     );
-    assert_eq!(
-        release_age_initial_choice(Some(86_400)),
-        "custom",
-        "explicit 1d override must stay distinguishable from true default",
-    );
+    assert_eq!(release_age_initial_choice(Some(86_400)), "cautious");
+    assert_eq!(release_age_initial_choice(Some(259_200)), "custom");
 }
 
 // ── sandbox wizard (rework) ─────────────────────────
