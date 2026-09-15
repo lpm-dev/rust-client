@@ -8,7 +8,7 @@ pub(in crate::commands::config) const RELEASE_AGE_POLICY_KEY: &str =
 pub(in crate::commands::config) const RELEASE_AGE_GUIDED_MENU_LABEL: &str =
     "Release age configuration";
 const DEFAULT_RELEASE_AGE_SECS: u64 = crate::release_age_config::DEFAULT_MIN_RELEASE_AGE_SECS;
-pub(in crate::commands::config) const CAUTIOUS_RELEASE_AGE_SECS: u64 = 3 * 24 * 60 * 60;
+pub(in crate::commands::config) const CAUTIOUS_RELEASE_AGE_SECS: u64 = 24 * 60 * 60;
 const RELEASE_AGE_EDITOR_HELP: &str =
     "Use ↑/↓ to move, ←/→ to change, Enter to save, Esc to cancel.";
 
@@ -136,7 +136,7 @@ pub(in crate::commands::config) async fn run_release_age_wizard(
         let preset: &str =
             cliclack::select("How long should LPM wait before allowing newly published packages?")
                 .item("default", "Default (off)", "no cooldown")
-                .item("cautious", "Cautious (3 days)", "stricter")
+                .item("cautious", "Cautious (1 day)", "stricter")
                 .item("off", "Off", "always disable the cooldown")
                 .item("custom", "Custom", "enter 12h / 7d / 0")
                 .initial_value(release_age_initial_choice(current))
@@ -236,16 +236,16 @@ fn interact_release_age_editor(
             Key::ArrowUp | Key::ArrowDown | Key::Char('j') | Key::Char('k') => cursor ^= 1,
             Key::ArrowLeft | Key::Char('h') => {
                 if cursor == 0 {
-                    settings.step_scope();
-                } else {
                     settings.step_age(SelectionStep::Previous);
+                } else {
+                    settings.step_scope();
                 }
             }
             Key::ArrowRight | Key::Char('l') | Key::Char(' ') => {
                 if cursor == 0 {
-                    settings.step_scope();
-                } else {
                     settings.step_age(SelectionStep::Next);
+                } else {
+                    settings.step_scope();
                 }
             }
             Key::Enter => return Ok(settings),
@@ -266,17 +266,17 @@ fn format_release_age_editor_frame(settings: ReleaseAgeEditorSettings, cursor: u
     push_release_age_editor_row(
         &mut frame,
         cursor == 0,
-        "Release-age scope",
-        "Apply the release-age cooldown to which dependencies?",
-        &format_release_age_policy_options(settings.policy),
+        "Minimum release age",
+        "How long should LPM wait before allowing newly published packages?",
+        &format_release_age_options(settings.age_choice),
     );
     frame.push_str("│\n");
     push_release_age_editor_row(
         &mut frame,
         cursor == 1,
-        "Minimum release age",
-        "How long should LPM wait before allowing newly published packages?",
-        &format_release_age_options(settings.age_choice),
+        "Release-age scope",
+        "Apply the release-age cooldown to which dependencies?",
+        &format_release_age_policy_options(settings.policy),
     );
     frame.push_str("└\n");
     frame
@@ -325,7 +325,7 @@ fn format_release_age_options(choice: ReleaseAgeChoice) -> String {
     let mut rendered = String::with_capacity(130);
     for (candidate, label) in [
         (ReleaseAgeChoice::Default, "Default (off)"),
-        (ReleaseAgeChoice::Cautious, "Cautious (3 days)"),
+        (ReleaseAgeChoice::Cautious, "Cautious (1 day)"),
         (ReleaseAgeChoice::Off, "Off"),
         (ReleaseAgeChoice::Custom, "Custom"),
     ] {
@@ -622,7 +622,7 @@ mod tests {
         assert!(plain.contains("direct and transitive dependencies"));
         assert!(plain.contains("Minimum release age"));
         assert!(plain.contains("● Default (off)"));
-        assert!(plain.contains("○ Cautious (3 days)"));
+        assert!(plain.contains("○ Cautious (1 day)"));
         assert!(plain.contains("○ Off"));
         assert!(plain.contains("○ Custom"));
     }
@@ -641,6 +641,18 @@ mod tests {
                 age_choice: ReleaseAgeChoice::Custom,
                 custom_secs: 12 * 60 * 60,
             }
+        );
+    }
+
+    #[test]
+    fn grouped_editor_preserves_three_day_override_as_custom() {
+        let settings = ReleaseAgeEditorSettings::from_overrides(Some(259_200), None);
+
+        assert_eq!(settings.age_choice, ReleaseAgeChoice::Custom);
+        assert_eq!(settings.custom_secs, 259_200);
+        assert_eq!(
+            settings.age_choice.selection(settings.custom_secs),
+            ReleaseAgeSelection::Seconds(259_200)
         );
     }
 
