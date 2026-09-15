@@ -650,7 +650,11 @@ async fn run_locked(
         && metadata.resolve_version_spec(requested).is_err()
     {
         metadata = match &target {
-            AddTarget::Lpm(package) => client.refetch_package_metadata(package).await?,
+            AddTarget::Lpm(package) => {
+                client
+                    .refetch_package_metadata_after_missing_version(package)
+                    .await?
+            }
             AddTarget::Npm { spec } => {
                 let route = route_table.route_for_package(spec);
                 match &route {

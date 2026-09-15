@@ -70,7 +70,8 @@ impl RequestDestination {
 ///   Used for endpoints that *may* accept auth but the fast path is
 ///   anonymous (search, public info reads). Avoids needless refresh
 ///   storms when an old token sits on disk.
-/// - **PackageRead**: attach cached credentials and recover only after a 401.
+/// - **PackageRead**: attach cached credentials; refresh after an auth challenge.
+///   Required package lookups also recover missing versions and denied reads.
 ///   Public releases must not depend on a working refresh session.
 /// - **AuthRequired**: attach the bearer if present; on 401, perform
 ///   a single silent refresh + retry for refresh-backed sessions.

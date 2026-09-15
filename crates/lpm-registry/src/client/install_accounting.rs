@@ -222,57 +222,68 @@ impl RegistryClient {
         let mut warnings = Vec::new();
         for chunk in packages.chunks(200) {
             let body = serde_json::json!({ "packages": chunk });
-            let response: InstallAccessResponse = self
-                .execute_with_recovery(AuthPosture::PackageRead, || async {
+            let chunk_warnings = self
+                .execute_with_package_access_recovery(|| async {
                     let response = self.post_json_raw(&url, &body).await?;
-                    parse_capped_api_json(response, "registry install access check").await
+                    let response: InstallAccessResponse =
+                        parse_capped_api_json(response, "registry install access check").await?;
+                    validate_install_access(chunk, response)
                 })
                 .await?;
-            let mut decisions = std::collections::BTreeMap::new();
-            for decision in response.packages {
-                if decisions
-                    .insert((decision.name.clone(), decision.version.clone()), decision)
-                    .is_some()
-                {
-                    return Err(LpmError::Registry(
-                        "Duplicate registry install access decision".into(),
-                    ));
-                }
-            }
-            if decisions.len() != chunk.len() {
-                return Err(LpmError::Registry(
-                    "Incomplete registry install access response".into(),
-                ));
-            }
-            for package in chunk {
-                let decision = decisions
-                    .remove(&(package.name.clone(), package.version.clone()))
-                    .ok_or_else(|| {
-                        LpmError::Registry(format!(
-                            "Registry did not verify {}@{}",
-                            package.name, package.version
-                        ))
-                    })?;
-                if !decision.allowed {
-                    return Err(LpmError::PackageInstallDenied {
-                        package: package.name.clone(),
-                        version: package.version.clone(),
-                        reason: decision.reason.unwrap_or_else(|| {
-                            "Package access denied or version unavailable".into()
-                        }),
-                    });
-                }
-                if let Some(message) = decision
-                    .deprecated
-                    .filter(|message| !message.trim().is_empty())
-                {
-                    warnings.push(format!(
-                        "{}@{} is deprecated: {}",
-                        package.name, package.version, message
-                    ));
-                }
-            }
+            warnings.extend(chunk_warnings);
         }
         Ok(warnings)
     }
+}
+
+fn validate_install_access(
+    chunk: &[ManagedInstallRoot],
+    response: InstallAccessResponse,
+) -> Result<Vec<String>, LpmError> {
+    let mut warnings = Vec::new();
+    let mut decisions = std::collections::BTreeMap::new();
+    for decision in response.packages {
+        if decisions
+            .insert((decision.name.clone(), decision.version.clone()), decision)
+            .is_some()
+        {
+            return Err(LpmError::Registry(
+                "Duplicate registry install access decision".into(),
+            ));
+        }
+    }
+    if decisions.len() != chunk.len() {
+        return Err(LpmError::Registry(
+            "Incomplete registry install access response".into(),
+        ));
+    }
+    for package in chunk {
+        let decision = decisions
+            .remove(&(package.name.clone(), package.version.clone()))
+            .ok_or_else(|| {
+                LpmError::Registry(format!(
+                    "Registry did not verify {}@{}",
+                    package.name, package.version
+                ))
+            })?;
+        if !decision.allowed {
+            return Err(LpmError::PackageInstallDenied {
+                package: package.name.clone(),
+                version: package.version.clone(),
+                reason: decision
+                    .reason
+                    .unwrap_or_else(|| "Package access denied or version unavailable".into()),
+            });
+        }
+        if let Some(message) = decision
+            .deprecated
+            .filter(|message| !message.trim().is_empty())
+        {
+            warnings.push(format!(
+                "{}@{} is deprecated: {}",
+                package.name, package.version, message
+            ));
+        }
+    }
+    Ok(warnings)
 }

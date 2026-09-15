@@ -1307,6 +1307,17 @@ impl RegistryClient {
             .map(|result| result.metadata)
     }
 
+    /// Recover a stored publisher session after a required version was absent,
+    /// then reload metadata under the current bearer cache partition.
+    pub async fn refetch_package_metadata_after_missing_version(
+        &self,
+        name: &PackageName,
+    ) -> Result<PackageMetadata, LpmError> {
+        let bearer = self.current_bearer(AuthPosture::PackageRead)?;
+        self.recover_package_read_session(bearer.as_deref()).await?;
+        self.refetch_package_metadata(name).await
+    }
+
     /// Revalidate LPM package metadata even when the cached packument is
     /// within its normal install TTL. Reuses the cached body on HTTP 304.
     pub async fn revalidate_package_metadata_with_timings(
@@ -1377,7 +1388,7 @@ impl RegistryClient {
         let scoped_ref = scoped.as_str();
         let initial_timings = timings;
         let result = self
-            .execute_with_recovery(AuthPosture::PackageRead, || {
+            .execute_with_package_access_recovery(|| {
                 let mut timings = initial_timings;
                 async move {
                     let bearer = self.current_bearer(AuthPosture::AuthRequired)?;

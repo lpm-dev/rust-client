@@ -1008,7 +1008,9 @@ pub(super) async fn resolve_lpm_install_preflight(
             | LpmError::InvalidVersionRange(_)
             | LpmError::PublicationUnavailable(_),
         ) => {
-            let metadata = client.refetch_package_metadata(package_name).await?;
+            let metadata = client
+                .refetch_package_metadata_after_missing_version(package_name)
+                .await?;
             let version = resolve_lpm_install_metadata_version(&metadata, package_name, range)?;
             Ok((metadata, version))
         }
