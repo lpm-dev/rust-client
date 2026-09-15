@@ -31,7 +31,18 @@ impl CredentialKind {
 #[serde(rename_all = "snake_case")]
 pub(super) enum CredentialBackend {
     Keychain,
+    SharedKeychain,
     EncryptedFileFallback,
+}
+
+impl CredentialBackend {
+    pub(super) const fn current_keychain() -> Self {
+        if cfg!(target_os = "macos") {
+            Self::SharedKeychain
+        } else {
+            Self::Keychain
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -41,6 +52,8 @@ pub(super) enum CredentialAuthority {
         backend: CredentialBackend,
         credential_digest: String,
         stale_file_cleanup_pending: bool,
+        #[serde(default)]
+        legacy_keychain_cleanup_pending: bool,
     },
     Revoked,
 }
@@ -51,15 +64,56 @@ impl CredentialAuthority {
             backend,
             credential_digest: token_digest(token),
             stale_file_cleanup_pending: false,
+            legacy_keychain_cleanup_pending: false,
         }
     }
 
     pub(super) fn keychain_cleanup_pending(token: &str) -> Self {
         Self::Active {
-            backend: CredentialBackend::Keychain,
+            backend: CredentialBackend::current_keychain(),
             credential_digest: token_digest(token),
             stale_file_cleanup_pending: true,
+            legacy_keychain_cleanup_pending: cfg!(target_os = "macos"),
         }
+    }
+
+    pub(super) fn committed_keychain(token: &str) -> Self {
+        let mut value = Self::active(CredentialBackend::current_keychain(), token);
+        if let Self::Active {
+            legacy_keychain_cleanup_pending,
+            ..
+        } = &mut value
+        {
+            *legacy_keychain_cleanup_pending = cfg!(target_os = "macos");
+        }
+        value
+    }
+
+    #[cfg(any(target_os = "macos", test))]
+    pub(super) fn with_shared_keychain_cleanup(&self, pending: bool) -> Self {
+        let mut next = self.clone();
+        if let Self::Active {
+            backend,
+            legacy_keychain_cleanup_pending,
+            ..
+        } = &mut next
+        {
+            *backend = CredentialBackend::SharedKeychain;
+            *legacy_keychain_cleanup_pending = pending;
+        }
+        next
+    }
+
+    #[cfg(any(target_os = "macos", test))]
+    pub(super) fn has_pending_legacy_keychain_cleanup(&self) -> bool {
+        matches!(
+            self,
+            Self::Active {
+                backend: CredentialBackend::SharedKeychain,
+                legacy_keychain_cleanup_pending: true,
+                ..
+            }
+        )
     }
 
     pub(super) fn backend(&self) -> Option<CredentialBackend> {
@@ -82,7 +136,7 @@ impl CredentialAuthority {
         matches!(
             self,
             Self::Active {
-                backend: CredentialBackend::Keychain,
+                backend: CredentialBackend::Keychain | CredentialBackend::SharedKeychain,
                 stale_file_cleanup_pending: true,
                 ..
             }
