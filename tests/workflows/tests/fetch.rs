@@ -670,7 +670,7 @@ async fn fetch_firewall_enforce_blocks_public_npm_lockfile_package_before_tarbal
         "firewall-active fetch must show the badge; got:\n{combined}"
     );
     assert!(
-        combined.contains("blocked by LPM npm firewall"),
+        combined.contains("blocked by LPM Firewall"),
         "error must name the firewall block; got:\n{combined}"
     );
     assert_eq!(
@@ -711,7 +711,7 @@ async fn fetch_firewall_enforce_blocks_legacy_public_npm_tarball_before_download
         String::from_utf8_lossy(&output.stderr)
     );
     assert!(
-        combined.contains("blocked by LPM npm firewall"),
+        combined.contains("blocked by LPM Firewall"),
         "error must name the firewall block; got:\n{combined}"
     );
     assert!(
@@ -747,7 +747,7 @@ async fn fetch_firewall_enforce_blocks_canonical_public_npm_tarball_before_downl
         String::from_utf8_lossy(&output.stderr)
     );
     assert!(
-        combined.contains("blocked by LPM npm firewall"),
+        combined.contains("blocked by LPM Firewall"),
         "error must name the firewall block; got:\n{combined}"
     );
     assert!(

@@ -928,7 +928,7 @@ pub(super) fn finish_npm_firewall_preflight(
     if matches!(stats.mode, NpmFirewallMode::Monitor) {
         if !json_output && (blocked_count > 0 || warned_count > 0) {
             output::warn(&format!(
-                "npm firewall monitor found {} would-block and {} warned package(s); command continues because monitor mode is active.",
+                "LPM Firewall monitor: {} would-block, {} warned; command continues because monitor mode is active.",
                 blocked_count, warned_count
             ));
             print_firewall_decisions(&blocked);
@@ -939,8 +939,9 @@ pub(super) fn finish_npm_firewall_preflight(
 
     if warned_count > 0 && !json_output {
         output::warn(&format!(
-            "npm firewall warned for {} package(s):",
-            warned_count
+            "LPM Firewall warned for {} {}:",
+            warned_count,
+            install_ui::packages_word(warned_count),
         ));
         print_firewall_decisions(&warned);
     }
@@ -951,14 +952,16 @@ pub(super) fn finish_npm_firewall_preflight(
 
     if !json_output {
         output::warn(&format!(
-            "npm firewall blocked {} package(s):",
-            blocked_count
+            "LPM Firewall blocked {} {}:",
+            blocked_count,
+            install_ui::packages_word(blocked_count),
         ));
         print_firewall_decisions(&blocked);
     }
     Err(LpmError::Registry(format!(
-        "{} package(s) blocked by LPM npm firewall",
-        blocked_count
+        "{} {} blocked by LPM Firewall",
+        blocked_count,
+        install_ui::packages_word(blocked_count),
     )))
 }
 
@@ -1226,42 +1229,60 @@ fn npm_firewall_decision_json(decision: &NpmFirewallDecision) -> serde_json::Val
 fn print_firewall_decisions(decisions: &[&NpmFirewallDecision]) {
     for decision in decisions {
         for line in firewall_decision_lines(decision) {
-            eprintln!("{line}");
+            install_ui::detail_line(line);
         }
     }
 }
 
-fn firewall_decision_lines(decision: &NpmFirewallDecision) -> Vec<String> {
-    let name = lpm_common::sanitize_for_terminal(&decision.name);
-    let version = lpm_common::sanitize_for_terminal(&decision.version);
-    if let Some(display) = &decision.display
-        && let Some(summary) = non_empty_display_text(display.summary.as_deref())
-    {
-        let action = decision.action.as_str();
-        let summary = lpm_common::sanitize_for_terminal(summary);
-        let mut lines = vec![format!("    {name}@{version} - {action}: {summary}")];
-        if let Some(report_url) = non_empty_display_text(display.report_url.as_deref()) {
-            let report_url = lpm_common::sanitize_for_terminal(report_url);
-            lines.push(format!("    report: {report_url}"));
-        }
-        return lines;
-    }
-
-    let verdict = lpm_common::sanitize_for_terminal(&decision.verdict);
-    let reason = lpm_common::sanitize_for_terminal(&decision.reason);
-    let context = firewall_decision_context(decision);
-    let mut lines = vec![format!(
-        "    {name}@{version} - {verdict}: {reason}{context}"
-    )];
+fn firewall_decision_lines(decision: &NpmFirewallDecision) -> Vec<install_ui::TerminalLine> {
+    let package = format!("{}@{}", decision.name, decision.version);
+    let row = install_ui::terminal_line!(
+        "  {} {} - ",
+        firewall_action_field(decision.action, "›"),
+        firewall_action_field(decision.action, &package),
+    );
+    let summary = decision
+        .display
+        .as_ref()
+        .and_then(|display| non_empty_display_text(display.summary.as_deref()));
+    let row = if let Some(summary) = summary {
+        install_ui::terminal_line!(
+            "{}{}: {}",
+            row,
+            firewall_action_field(decision.action, decision.action.as_str()),
+            summary,
+        )
+    } else {
+        install_ui::terminal_line!(
+            "{}{}: {}{}",
+            row,
+            firewall_action_field(decision.action, &decision.verdict),
+            decision.reason,
+            firewall_decision_context(decision),
+        )
+    };
+    let mut lines = Vec::with_capacity(2);
+    lines.push(row);
     if let Some(report_url) = decision
         .display
         .as_ref()
         .and_then(|display| non_empty_display_text(display.report_url.as_deref()))
     {
-        let report_url = lpm_common::sanitize_for_terminal(report_url);
-        lines.push(format!("    report: {report_url}"));
+        lines.push(install_ui::terminal_line!(
+            "    {} {}",
+            install_ui::dim("report:"),
+            install_ui::hyperlink(report_url),
+        ));
     }
     lines
+}
+
+fn firewall_action_field(action: NpmFirewallAction, text: &str) -> install_ui::TerminalFragment {
+    match action {
+        NpmFirewallAction::Block => install_ui::red(text),
+        NpmFirewallAction::Warn => install_ui::yellow(text),
+        NpmFirewallAction::Allow => install_ui::green(text),
+    }
 }
 
 fn non_empty_display_text(value: Option<&str>) -> Option<&str> {
@@ -1373,6 +1394,13 @@ mod tests {
         );
     }
 
+    fn plain_firewall_decision_lines(decision: &NpmFirewallDecision) -> Vec<String> {
+        firewall_decision_lines(decision)
+            .iter()
+            .map(|line| console::strip_ansi_codes(line.as_ref()).into_owned())
+            .collect()
+    }
+
     #[test]
     fn firewall_decision_lines_prefer_display_summary_and_report_url() {
         let decision = firewall_decision_with_display(
@@ -1381,9 +1409,9 @@ mod tests {
         );
 
         assert_eq!(
-            firewall_decision_lines(&decision),
+            plain_firewall_decision_lines(&decision),
             vec![
-                "    moi-computer@0.1.0 - warn: May alter local Git configuration and add or overwrite package-owned agent skills in selected workspaces.".to_string(),
+                "  › moi-computer@0.1.0 - warn: May alter local Git configuration and add or overwrite package-owned agent skills in selected workspaces.".to_string(),
                 "    report: https://firewall.lpm.dev/npm/moi-computer/v/0.1.0".to_string(),
             ]
         );
@@ -1397,11 +1425,54 @@ mod tests {
         );
 
         assert_eq!(
-            firewall_decision_lines(&decision),
+            plain_firewall_decision_lines(&decision),
             vec![
-                "    moi-computer@0.1.0 - warn: summarybell?line?return?back?end".to_string(),
+                "  › moi-computer@0.1.0 - warn: summarybell?line?return?back?end".to_string(),
                 "    report: https://firewall.lpm.dev/bell?line?return?back?end".to_string(),
             ]
+        );
+    }
+
+    #[test]
+    fn firewall_decision_lines_retain_fallback_verdict_reason_and_context() {
+        let mut decision = firewall_decision_with_display(
+            "  ",
+            "https://firewall.lpm.dev/npm/moi-computer/v/0.1.0",
+        );
+        decision.policy = Some(NpmFirewallDecisionPolicy {
+            group: "lpm_ai_suspicious".to_string(),
+            key: None,
+            intent: None,
+            default_action: None,
+        });
+        decision.authority = Some(NpmFirewallDecisionAuthority {
+            source: "lpm_ai".to_string(),
+            source_type: None,
+            external_intel: None,
+        });
+
+        assert_eq!(
+            plain_firewall_decision_lines(&decision),
+            vec![
+                "  › moi-computer@0.1.0 - suspicious: client policy maps lpm_ai_suspicious to warn (policy lpm_ai_suspicious, source lpm_ai)",
+                "    report: https://firewall.lpm.dev/npm/moi-computer/v/0.1.0",
+            ]
+        );
+    }
+
+    #[test]
+    fn firewall_decision_lines_sanitize_fallback_package_and_verdict_fields() {
+        let mut decision = firewall_decision_with_display("", "");
+        decision.name = "package\nforged".to_string();
+        decision.version = "1.0.0\x1b[2J".to_string();
+        decision.verdict = "malicious\x1b]52;c;AAAA\x07".to_string();
+        decision.reason = "reason\rforged".to_string();
+        decision.policy = None;
+        decision.authority = None;
+
+        assert_eq!(
+            plain_firewall_decision_lines(&decision),
+            vec!["  › package?forged@1.0.0 - malicious: reason?forged"],
         );
     }
 
