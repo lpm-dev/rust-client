@@ -817,6 +817,42 @@ pub fn url(text: &str) -> TerminalFragment {
     TerminalFragment(lpm_common::sanitize_terminal_inline(text).blue())
 }
 
+/// Renders a visible HTTP(S) URL with a hyperlink in interactive color output.
+/// Redirected output and invalid targets retain only the sanitized URL text.
+pub fn hyperlink(text: &str) -> TerminalFragment {
+    format_hyperlink(
+        text,
+        lpm_common::color::enabled() && std::io::stderr().is_terminal(),
+    )
+}
+
+fn format_hyperlink(text: &str, enabled: bool) -> TerminalFragment {
+    let safe = lpm_common::sanitize_terminal_inline(text);
+    let fallback = || TerminalFragment(safe.blue());
+    if !enabled || safe != text {
+        return fallback();
+    }
+    let Ok(target) = reqwest::Url::parse(text) else {
+        return fallback();
+    };
+    if !matches!(target.scheme(), "http" | "https")
+        || target.host_str().is_none()
+        || !target.username().is_empty()
+        || target.password().is_some()
+    {
+        return fallback();
+    }
+
+    let visible = target.as_str().blue();
+    let mut rendered = String::with_capacity(target.as_str().len() + visible.len() + 14);
+    rendered.push_str("\x1b]8;;");
+    rendered.push_str(target.as_str());
+    rendered.push_str("\x1b\\");
+    rendered.push_str(&visible);
+    rendered.push_str("\x1b]8;;\x1b\\");
+    TerminalFragment(rendered)
+}
+
 /// Green helper for success/status-value roles.
 pub fn green(text: &str) -> TerminalFragment {
     TerminalFragment(lpm_common::sanitize_terminal_inline(text).green())
@@ -1041,6 +1077,74 @@ mod tests {
     fn terminal_line_format_rejects_implicit_named_capture() {
         let result = std::panic::catch_unwind(|| assert_positional_terminal_format("{field}"));
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn hyperlink_wraps_the_visible_url_and_survives_line_composition() {
+        let url = "https://firewall.lpm.dev/npm/example/v/1.0.0";
+        let link = super::format_hyperlink(url, true);
+        let row = terminal_line!("    report: {}", link);
+        assert_eq!(
+            row.to_string(),
+            format!(
+                "    report: \x1b]8;;{url}\x1b\\{}\x1b]8;;\x1b\\",
+                super::url(url)
+            )
+        );
+    }
+
+    #[test]
+    fn hyperlink_without_terminal_support_keeps_only_the_visible_url() {
+        let url = "https://firewall.lpm.dev/npm/example/v/1.0.0";
+        assert_eq!(super::format_hyperlink(url, false), super::url(url));
+    }
+
+    #[test]
+    fn hyperlink_uses_the_encoded_url_as_its_target() {
+        for (input, target) in [
+            ("https://example.test/a b", "https://example.test/a%20b"),
+            (
+                "https://example.test/\u{202e}forged",
+                "https://example.test/%E2%80%AEforged",
+            ),
+        ] {
+            let link = super::format_hyperlink(input, true);
+            assert_eq!(
+                link.to_string(),
+                format!("\x1b]8;;{target}\x1b\\{}\x1b]8;;\x1b\\", super::url(target)),
+            );
+        }
+    }
+
+    #[test]
+    fn hyperlink_rejects_non_web_targets_and_embedded_credentials() {
+        for target in [
+            "javascript:alert(1)",
+            "file:///tmp/report",
+            "mailto:user@example.test",
+            "not a URL",
+            "https://",
+            "https://user:secret@example.test/report",
+            "https://user@example.test/report",
+        ] {
+            assert_eq!(super::format_hyperlink(target, true), super::url(target));
+        }
+    }
+
+    #[test]
+    fn hyperlink_never_embeds_terminal_controls_from_the_target() {
+        for target in [
+            "https://example.test/\x1b]52;c;AAAA\x07",
+            "https://example.test/\x1b\\\x1b[2J",
+            "https://example.test/\x07",
+            "https://example.test/\nforged",
+            "https://example.test/\rforged",
+            "https://example.test/\u{009c}",
+        ] {
+            let rendered = super::format_hyperlink(target, true);
+            assert_eq!(rendered, super::url(target));
+            assert!(!rendered.contains("\x1b]"));
+        }
     }
 
     #[test]

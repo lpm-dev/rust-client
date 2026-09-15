@@ -2595,7 +2595,7 @@ async fn recursive_install_commits_no_importer_when_root_firewall_blocks() {
         String::from_utf8_lossy(&output.stderr)
     );
     assert!(
-        combined.contains("blocked by LPM npm firewall"),
+        combined.contains("blocked by LPM Firewall"),
         "recursive root error must retain firewall guidance: {combined}",
     );
     assert_target_not_installed(&project, "packages/member");

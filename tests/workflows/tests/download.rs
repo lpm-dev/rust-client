@@ -410,7 +410,7 @@ async fn download_firewall_enforce_blocks_public_npm_package_before_tarball_fetc
         "firewall-active download must show the badge; got:\n{combined}"
     );
     assert!(
-        combined.contains("blocked by LPM npm firewall"),
+        combined.contains("blocked by LPM Firewall"),
         "error must name the firewall block; got:\n{combined}"
     );
     assert_eq!(

@@ -2,9 +2,9 @@
 //!
 //! Two layers of security checking:
 //!
-//! 1. **Client-side analysis** (all packages): Scans each installed package's
-//!    live materialization (npm + @lpm.dev). Produces a severity-tiered summary
-//!    of behavioral tags.
+//! 1. **Client-side analysis** (all packages, when source analysis is enabled):
+//!    Scans each installed package's live materialization (npm + @lpm.dev).
+//!    Produces a severity-tiered summary of behavioral tags.
 //!
 //! 2. **Registry-side analysis** (@lpm.dev only): Fetches behavioral tags and
 //!    lifecycle scripts from registry metadata, then merges behavioral tags
@@ -17,6 +17,7 @@ use lpm_linker::MaterializedPackage;
 use lpm_registry::RegistryClient;
 use lpm_security::behavioral::{self, PackageAnalysis};
 use lpm_security::query::{InstallVisibility, PseudoClass, Severity, behavioral_tag_policies};
+use lpm_store::SecurityAnalysisPolicy;
 use rayon::prelude::*;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
@@ -88,14 +89,16 @@ enum SecuritySummaryLine {
 
 /// Run the full post-install security summary.
 ///
-/// Scans every live package materialization, then fetches registry metadata for
-/// @lpm.dev packages to merge behavioral tags and lifecycle scripts.
+/// Scans live package materializations only when source analysis is enabled.
+/// Independently fetches registry metadata for @lpm.dev packages when enrichment
+/// is enabled, merging behavioral tags and lifecycle scripts.
 /// Vulnerabilities and registry security findings are available only through
 /// `lpm audit` or audit-after-install.
 pub(crate) async fn post_install_security_summary(
     client: &RegistryClient,
     packages: &[SecuritySummaryPackage],
     materialized: &[MaterializedPackage],
+    security_analysis_policy: SecurityAnalysisPolicy,
     json_output: bool,
     verbose: bool,
     fetch_lpm_security_insights: bool,
@@ -104,33 +107,33 @@ pub(crate) async fn post_install_security_summary(
         return;
     }
 
-    // ── Client-side analysis (all packages) ──────────
-
-    let show_progress = !json_output && packages.len() > 50;
-    if show_progress {
-        install_ui::phase_untrusted(&format!(
-            "Scanning security behavior for {} installed packages",
-            packages.len()
-        ));
-    }
-
-    let analyses: Vec<_> = packages
-        .par_iter()
-        .filter_map(|package| {
-            analyze_live_package(package, materialized).map(|analysis| (package, analysis))
-        })
-        .collect();
     let mut tag_counts = SummaryCounts::default();
-    for (package, analysis) in analyses {
-        let pkg_id = package.finding_key();
-        collect_tags_from_analysis(&analysis, &pkg_id, &mut tag_counts);
-    }
+    if security_analysis_policy.is_enabled() {
+        let show_progress = !json_output && packages.len() > 50;
+        if show_progress {
+            install_ui::phase_untrusted(&format!(
+                "Scanning security behavior for {} installed packages",
+                packages.len()
+            ));
+        }
 
-    if show_progress {
-        install_ui::done_untrusted(&format!(
-            "Scanned security behavior for {} installed packages",
-            packages.len()
-        ));
+        let analyses: Vec<_> = packages
+            .par_iter()
+            .filter_map(|package| {
+                analyze_live_package(package, materialized).map(|analysis| (package, analysis))
+            })
+            .collect();
+        for (package, analysis) in analyses {
+            let pkg_id = package.finding_key();
+            collect_tags_from_analysis(&analysis, &pkg_id, &mut tag_counts);
+        }
+
+        if show_progress {
+            install_ui::done_untrusted(&format!(
+                "Scanned security behavior for {} installed packages",
+                packages.len()
+            ));
+        }
     }
 
     // ── Registry-side enrichment (@lpm.dev only) ─────
@@ -191,6 +194,11 @@ fn analyze_live_package(
     package: &SecuritySummaryPackage,
     materialized: &[MaterializedPackage],
 ) -> Option<PackageAnalysis> {
+    tracing::trace!(
+        package = %package.name,
+        version = %package.version,
+        "Scanning live package source for install security summary"
+    );
     let exact = package.instance_id.and_then(|instance_id| {
         materialized
             .iter()

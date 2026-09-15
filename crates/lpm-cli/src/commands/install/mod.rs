@@ -1717,6 +1717,7 @@ async fn run_with_options_under_store_lock(
             client,
             &all_packages,
             &link_result.materialized,
+            security_analysis_policy,
             false,
             verbose,
             fetch_lpm_security_insights,
