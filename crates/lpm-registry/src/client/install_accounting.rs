@@ -85,9 +85,7 @@ impl RegistryClient {
         let url = format!("{}/api/registry/pool/install-report", self.base_url);
         let body = serde_json::json!({ "graph": graph });
         let result = self
-            .execute_with_recovery(AuthPosture::AuthRequired, || {
-                self.post_json_raw(&url, &body)
-            })
+            .execute_with_recovery(AuthPosture::PackageRead, || self.post_json_raw(&url, &body))
             .await;
         match result {
             Ok(_) => return Ok(()),
@@ -103,7 +101,7 @@ impl RegistryClient {
         let roots = legacy_pool_roots(graph)?;
         for chunk in roots.chunks(200) {
             let body = serde_json::json!({ "roots": chunk });
-            self.execute_with_recovery(AuthPosture::AuthRequired, || {
+            self.execute_with_recovery(AuthPosture::PackageRead, || {
                 self.post_json_raw(&url, &body)
             })
             .await?;
@@ -150,6 +148,64 @@ struct InstallAccessDecision {
 }
 
 impl RegistryClient {
+    /// Check whether exact releases can be installed without a credential.
+    /// A protected or older registry response keeps authenticated Swift setup enabled.
+    pub async fn can_install_anonymously(
+        &self,
+        packages: &[ManagedInstallRoot],
+    ) -> Result<bool, LpmError> {
+        if packages.is_empty() {
+            return Ok(true);
+        }
+        let mut packages = packages.to_vec();
+        packages.sort_unstable();
+        packages.dedup();
+        let url = format!("{}/api/registry/install-check", self.base_url);
+        for chunk in packages.chunks(200) {
+            let request = self
+                .http
+                .for_url(&url)
+                .await?
+                .post(&url)
+                .json(&serde_json::json!({ "packages": chunk }));
+            let response = self.send_once_preserving_status(request).await?;
+            if matches!(response.status().as_u16(), 401 | 403 | 404) {
+                return Ok(false);
+            }
+            if !response.status().is_success() {
+                return Err(LpmError::Registry(
+                    "Anonymous install access could not be verified".into(),
+                ));
+            }
+            let response: InstallAccessResponse =
+                parse_capped_api_json(response, "anonymous install access check").await?;
+            let expected: std::collections::BTreeSet<_> = chunk
+                .iter()
+                .map(|package| (&package.name, &package.version))
+                .collect();
+            let mut received = std::collections::BTreeSet::new();
+            let mut allowed = true;
+            for decision in &response.packages {
+                let identity = (&decision.name, &decision.version);
+                if !expected.contains(&identity) || !received.insert(identity) {
+                    return Err(LpmError::Registry(
+                        "Invalid anonymous install access decision".into(),
+                    ));
+                }
+                allowed &= decision.allowed;
+            }
+            if received.len() != expected.len() {
+                return Err(LpmError::Registry(
+                    "Incomplete anonymous install access response".into(),
+                ));
+            }
+            if !allowed {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
     /// Check current installation rights for every exact registry dependency.
     /// Local artifacts and metadata never stand in for this online check.
     pub async fn check_install_access(
@@ -166,57 +222,68 @@ impl RegistryClient {
         let mut warnings = Vec::new();
         for chunk in packages.chunks(200) {
             let body = serde_json::json!({ "packages": chunk });
-            let response: InstallAccessResponse = self
-                .execute_with_recovery(AuthPosture::AuthRequired, || async {
+            let chunk_warnings = self
+                .execute_with_package_access_recovery(|| async {
                     let response = self.post_json_raw(&url, &body).await?;
-                    parse_capped_api_json(response, "registry install access check").await
+                    let response: InstallAccessResponse =
+                        parse_capped_api_json(response, "registry install access check").await?;
+                    validate_install_access(chunk, response)
                 })
                 .await?;
-            let mut decisions = std::collections::BTreeMap::new();
-            for decision in response.packages {
-                if decisions
-                    .insert((decision.name.clone(), decision.version.clone()), decision)
-                    .is_some()
-                {
-                    return Err(LpmError::Registry(
-                        "Duplicate registry install access decision".into(),
-                    ));
-                }
-            }
-            if decisions.len() != chunk.len() {
-                return Err(LpmError::Registry(
-                    "Incomplete registry install access response".into(),
-                ));
-            }
-            for package in chunk {
-                let decision = decisions
-                    .remove(&(package.name.clone(), package.version.clone()))
-                    .ok_or_else(|| {
-                        LpmError::Registry(format!(
-                            "Registry did not verify {}@{}",
-                            package.name, package.version
-                        ))
-                    })?;
-                if !decision.allowed {
-                    return Err(LpmError::PackageInstallDenied {
-                        package: package.name.clone(),
-                        version: package.version.clone(),
-                        reason: decision.reason.unwrap_or_else(|| {
-                            "Package access denied or version unavailable".into()
-                        }),
-                    });
-                }
-                if let Some(message) = decision
-                    .deprecated
-                    .filter(|message| !message.trim().is_empty())
-                {
-                    warnings.push(format!(
-                        "{}@{} is deprecated: {}",
-                        package.name, package.version, message
-                    ));
-                }
-            }
+            warnings.extend(chunk_warnings);
         }
         Ok(warnings)
     }
+}
+
+fn validate_install_access(
+    chunk: &[ManagedInstallRoot],
+    response: InstallAccessResponse,
+) -> Result<Vec<String>, LpmError> {
+    let mut warnings = Vec::new();
+    let mut decisions = std::collections::BTreeMap::new();
+    for decision in response.packages {
+        if decisions
+            .insert((decision.name.clone(), decision.version.clone()), decision)
+            .is_some()
+        {
+            return Err(LpmError::Registry(
+                "Duplicate registry install access decision".into(),
+            ));
+        }
+    }
+    if decisions.len() != chunk.len() {
+        return Err(LpmError::Registry(
+            "Incomplete registry install access response".into(),
+        ));
+    }
+    for package in chunk {
+        let decision = decisions
+            .remove(&(package.name.clone(), package.version.clone()))
+            .ok_or_else(|| {
+                LpmError::Registry(format!(
+                    "Registry did not verify {}@{}",
+                    package.name, package.version
+                ))
+            })?;
+        if !decision.allowed {
+            return Err(LpmError::PackageInstallDenied {
+                package: package.name.clone(),
+                version: package.version.clone(),
+                reason: decision
+                    .reason
+                    .unwrap_or_else(|| "Package access denied or version unavailable".into()),
+            });
+        }
+        if let Some(message) = decision
+            .deprecated
+            .filter(|message| !message.trim().is_empty())
+        {
+            warnings.push(format!(
+                "{}@{} is deprecated: {}",
+                package.name, package.version, message
+            ));
+        }
+    }
+    Ok(warnings)
 }

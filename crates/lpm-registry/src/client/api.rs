@@ -447,7 +447,7 @@ impl RegistryClient {
         if let Some(v) = version {
             url.push_str(&format!("&version={}", urlencoding::encode(v)));
         }
-        self.execute_with_recovery(AuthPosture::AuthRequired, || self.get_json(&url))
+        self.execute_with_recovery(AuthPosture::PackageRead, || self.get_json(&url))
             .await
     }
 

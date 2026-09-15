@@ -252,6 +252,72 @@ impl RegistryClient {
             .filter(|s| !s.is_empty()))
     }
 
+    pub(super) async fn recover_package_read_session(
+        &self,
+        rejected_bearer: Option<&str>,
+    ) -> Result<bool, LpmError> {
+        let Some(session) = &self.session else {
+            return Ok(false);
+        };
+        let mut attempted = self.package_read_recovery.lock().await;
+        if self.current_bearer(AuthPosture::PackageRead)?.as_deref() != rejected_bearer {
+            return Ok(true);
+        }
+        if *attempted {
+            return Ok(false);
+        }
+        if !session
+            .current_source()?
+            .is_some_and(|source| source.refresh_policy() == RefreshPolicy::IfRefreshable)
+        {
+            return Ok(false);
+        }
+        *attempted = true;
+        match session.refresh_now().await {
+            Ok(_) => Ok(true),
+            Err(error @ LpmError::CredentialStorage(_)) => Err(error),
+            Err(_) => Ok(false),
+        }
+    }
+
+    pub(super) async fn execute_with_package_access_recovery<F, T, Fut>(
+        &self,
+        op: F,
+    ) -> Result<T, LpmError>
+    where
+        F: Fn() -> Fut,
+        Fut: std::future::Future<Output = Result<T, LpmError>>,
+    {
+        let rejected_bearer = self.current_bearer(AuthPosture::PackageRead)?;
+        let attempts = std::sync::atomic::AtomicUsize::new(0);
+        match self
+            .execute_with_recovery(AuthPosture::PackageRead, || {
+                attempts.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                op()
+            })
+            .await
+        {
+            Err(
+                error @ (LpmError::NotFound(_)
+                | LpmError::PackageInstallDenied { .. }
+                | LpmError::Http {
+                    status: 403 | 404, ..
+                }),
+            ) => {
+                if attempts.load(std::sync::atomic::Ordering::Relaxed) == 1
+                    && self
+                        .recover_package_read_session(rejected_bearer.as_deref())
+                        .await?
+                {
+                    op().await
+                } else {
+                    Err(error)
+                }
+            }
+            result => result,
+        }
+    }
+
     /// Execute an HTTP-bearing operation, handling lazy refresh on 401
     /// for refresh-backed sessions.
     ///
@@ -295,7 +361,8 @@ impl RegistryClient {
         Fut: std::future::Future<Output = Result<T, LpmError>>,
     {
         // Proactive pass.
-        if posture.allows_recovery()
+        if posture != AuthPosture::PackageRead
+            && posture.allows_recovery()
             && let Some(session) = &self.session
             && let Some(source) = session.current_source()?
             && source.refresh_policy() == RefreshPolicy::IfRefreshable

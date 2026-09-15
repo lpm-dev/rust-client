@@ -3343,3 +3343,34 @@ fn validate_pem_root_accepts_valid_multi_cert_bundle() {
         "two valid concatenated cert blocks must pass"
     );
 }
+
+#[tokio::test]
+async fn forced_metadata_refetch_preserves_a_healthy_session() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+    let _lock = auth_env_lock().await;
+    let home = tempfile::tempdir().unwrap();
+    let _env = ScopedAuthEnv::file_backed(home.path());
+    let worker = MockServer::start().await;
+    let npm = MockServer::start().await;
+    let client = refreshable_metadata_client(&worker, &npm, home.path()).await;
+    Mock::given(method("POST"))
+        .and(path("/api/cli/refresh"))
+        .respond_with(ResponseTemplate::new(503))
+        .expect(0)
+        .mount(&worker)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/registry/@lpm.dev/alice.kit"))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(
+            test_metadata_json_version("@lpm.dev/alice.kit", "1.0.0"),
+            "application/json",
+        ))
+        .mount(&worker)
+        .await;
+    let metadata = client
+        .refetch_package_metadata(&PackageName::parse("@lpm.dev/alice.kit").unwrap())
+        .await
+        .unwrap();
+    assert!(metadata.version("1.0.0").is_some());
+}

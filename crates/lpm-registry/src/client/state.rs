@@ -408,6 +408,7 @@ pub struct RegistryClient {
     /// the current token / trigger silent refresh without the caller
     /// threading a session in.
     pub(super) session: Option<Arc<SessionManager>>,
+    pub(super) package_read_recovery: Arc<tokio::sync::Mutex<bool>>,
     /// Process-local cache for registry package-signing keys, keyed by
     /// registry URL plus auth/mTLS principal.
     pub(super) registry_signing_keys_cache:

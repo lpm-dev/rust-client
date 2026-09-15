@@ -946,35 +946,38 @@ fn insert_into_dependencies_array(
     let (package_open, package_close) = find_package_call(content)
         .ok_or_else(|| LpmError::Registry("Could not find Package(...) in Package.swift".into()))?;
 
-    let (bracket_start, close_pos) =
-        match find_direct_argument_array(content, package_open, package_close, "dependencies") {
-            Some(array) => (array.open, array.close),
-            None => {
-                if let Some(kw_pos) =
-                    find_direct_argument_label(content, package_open, package_close, "targets")
-                {
-                    let kw_indent = get_line_indent(content, kw_pos);
-                    let entry_indent = indent_one_level(&kw_indent);
-                    let new_deps = format!(
-                        "{}dependencies: [\n{}{},\n{}],\n",
-                        kw_indent, entry_indent, entry, kw_indent
-                    );
-                    // Insert the new dependencies array on a new line before the keyword line.
-                    // content[line_start..] already includes the keyword's own indentation,
-                    // so we don't append kw_indent again.
-                    let line_start = content[..kw_pos].rfind('\n').map_or(kw_pos, |i| i + 1);
-                    let mut new_content =
-                        String::with_capacity(content.len() + new_deps.len() + 10);
-                    new_content.push_str(&content[..line_start]);
-                    new_content.push_str(&new_deps);
-                    new_content.push_str(&content[line_start..]);
-                    return Ok(new_content);
-                }
-                return Err(LpmError::Registry(
-                    "Could not find 'dependencies:' in Package.swift".into(),
-                ));
+    let (bracket_start, close_pos) = match find_direct_argument_array(
+        content,
+        package_open,
+        package_close,
+        "dependencies",
+    ) {
+        Some(array) => (array.open, array.close),
+        None => {
+            if let Some(kw_pos) =
+                find_direct_argument_label(content, package_open, package_close, "targets")
+            {
+                let kw_indent = get_line_indent(content, kw_pos);
+                let entry_indent = indent_one_level(&kw_indent);
+                let line_start = content[..kw_pos].rfind('\n').map_or(0, |i| i + 1);
+                let on_own_line = content[line_start..kw_pos].trim().is_empty();
+                let insertion = if on_own_line { line_start } else { kw_pos };
+                let leading_indent = if on_own_line { kw_indent.as_str() } else { "" };
+                let trailing_indent = if on_own_line { "" } else { kw_indent.as_str() };
+                let new_deps = format!(
+                    "{leading_indent}dependencies: [\n{entry_indent}{entry},\n{kw_indent}],\n{trailing_indent}"
+                );
+                let mut new_content = String::with_capacity(content.len() + new_deps.len());
+                new_content.push_str(&content[..insertion]);
+                new_content.push_str(&new_deps);
+                new_content.push_str(&content[insertion..]);
+                return Ok(new_content);
             }
-        };
+            return Err(LpmError::Registry(
+                "Could not find 'dependencies:' in Package.swift".into(),
+            ));
+        }
+    };
 
     // Detect indentation from existing entries or derive from context
     let indent = detect_indent(content, bracket_start, close_pos);
@@ -1002,9 +1005,13 @@ fn insert_into_dependencies_array(
     let needs_comma = !before_close.ends_with(',');
 
     // Find the start of the line containing `]` — we'll insert before it
-    let close_line_start = content[..close_pos]
-        .rfind('\n')
-        .map_or(close_pos, |i| i + 1);
+    let close_line_start = content[..close_pos].rfind('\n').map_or(0, |i| i + 1);
+    let close_on_own_line = content[close_line_start..close_pos].trim().is_empty();
+    let close_line_start = if close_on_own_line {
+        close_line_start
+    } else {
+        close_pos
+    };
 
     let mut new_content = String::with_capacity(content.len() + entry.len() + 20);
 
@@ -1019,6 +1026,9 @@ fn insert_into_dependencies_array(
     } else {
         // Content up to the close line (everything before the `]` line)
         new_content.push_str(&content[..close_line_start]);
+        if !close_on_own_line {
+            new_content.push('\n');
+        }
     }
 
     new_content.push_str(&indent);
@@ -1094,9 +1104,13 @@ fn insert_into_target_deps(
     let before_close = content[bracket_start + 1..close_pos].trim_end();
     let needs_comma = !before_close.ends_with(',');
 
-    let close_line_start = content[..close_pos]
-        .rfind('\n')
-        .map_or(close_pos, |i| i + 1);
+    let close_line_start = content[..close_pos].rfind('\n').map_or(0, |i| i + 1);
+    let close_on_own_line = content[close_line_start..close_pos].trim().is_empty();
+    let close_line_start = if close_on_own_line {
+        close_line_start
+    } else {
+        close_pos
+    };
 
     let mut new_content = String::with_capacity(content.len() + entry.len() + 20);
 
@@ -1109,6 +1123,9 @@ fn insert_into_target_deps(
         new_content.push('\n');
     } else {
         new_content.push_str(&content[..close_line_start]);
+        if !close_on_own_line {
+            new_content.push('\n');
+        }
     }
 
     new_content.push_str(&indent);
@@ -2209,6 +2226,42 @@ let package = Package(
     }
 
     // === verify insert creates deps array in target ===
+    #[test]
+    fn registry_dependencies_preserve_inline_package_arguments() {
+        let entry = ".package(id: \"lpmdev.acme_logger\", from: \"1.0.0\")";
+        for dependencies in [
+            "",
+            "dependencies: [.package(url: \"https://example.com/a\", from: \"1.0.0\")], ",
+            "dependencies: [.package(url: \"https://example.com/a\", from: \"1.0.0\"),], ",
+        ] {
+            let input = format!(
+                "import PackageDescription\nlet package = Package(name: \"App\", {dependencies}targets: [.target(name: \"App\")])\n"
+            );
+            let output = insert_into_dependencies_array(&input, entry, Some("targets:")).unwrap();
+            assert_eq!(
+                output.matches("let package = Package(").count(),
+                1,
+                "{output}"
+            );
+            let array = find_package_argument_array(&output, "dependencies")
+                .unwrap_or_else(|| panic!("Package dependencies are missing: {output}"));
+            let calls = direct_calls_in_array(&output, array);
+            assert_eq!(
+                calls.len(),
+                if dependencies.is_empty() { 1 } else { 2 },
+                "{output}"
+            );
+            assert!(
+                output[..array.open].contains("let package = Package(name: \"App\","),
+                "{output}"
+            );
+            assert!(
+                output.contains("targets: [.target(name: \"App\")]"),
+                "{output}"
+            );
+        }
+    }
+
     #[test]
     fn insert_into_target_deps_creates_dependencies_array_when_target_lacks_one() {
         let input = r#"// swift-tools-version: 5.9

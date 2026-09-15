@@ -12,9 +12,8 @@ pub(crate) async fn revalidate_metadata(
         CanonicalKey::Lpm { owner, name } => {
             let name = lpm_common::PackageName::parse(&format!("@lpm.dev/{owner}.{name}"))?;
             client
-                .revalidate_package_metadata_with_timings(&name)
+                .refetch_package_metadata_after_missing_version(&name)
                 .await
-                .map(|result| result.metadata)
         }
         CanonicalKey::Npm { name } => match route_table.route_for_package(name) {
             UpstreamRoute::NpmDirect => client

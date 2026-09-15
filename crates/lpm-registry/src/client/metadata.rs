@@ -766,7 +766,7 @@ impl RegistryClient {
         name: &str,
         use_validator: bool,
     ) -> Result<(reqwest::Response, String, Option<CacheValidator>), LpmError> {
-        self.execute_with_recovery(AuthPosture::AuthRequired, || async {
+        self.execute_with_recovery(AuthPosture::PackageRead, || async {
             let bearer = self.current_bearer(AuthPosture::AuthRequired)?;
             let cache_key = self.metadata_cache_key_for_origin(
                 namespace,
@@ -1188,7 +1188,7 @@ impl RegistryClient {
         body: &serde_json::Value,
     ) -> Result<(reqwest::Response, String), LpmError> {
         let url = format!("{}/api/registry/batch-metadata", self.base_url);
-        self.execute_with_recovery(AuthPosture::AuthRequired, || async {
+        self.execute_with_recovery(AuthPosture::PackageRead, || async {
             let bearer = self.current_bearer(AuthPosture::AuthRequired)?;
             let cache_principal = bearer_principal_fingerprint(
                 bearer.as_deref(),
@@ -1307,6 +1307,17 @@ impl RegistryClient {
             .map(|result| result.metadata)
     }
 
+    /// Recover a stored publisher session after a required version was absent,
+    /// then reload metadata under the current bearer cache partition.
+    pub async fn refetch_package_metadata_after_missing_version(
+        &self,
+        name: &PackageName,
+    ) -> Result<PackageMetadata, LpmError> {
+        let bearer = self.current_bearer(AuthPosture::PackageRead)?;
+        self.recover_package_read_session(bearer.as_deref()).await?;
+        self.refetch_package_metadata(name).await
+    }
+
     /// Revalidate LPM package metadata even when the cached packument is
     /// within its normal install TTL. Reuses the cached body on HTTP 304.
     pub async fn revalidate_package_metadata_with_timings(
@@ -1377,7 +1388,7 @@ impl RegistryClient {
         let scoped_ref = scoped.as_str();
         let initial_timings = timings;
         let result = self
-            .execute_with_recovery(AuthPosture::AuthRequired, || {
+            .execute_with_package_access_recovery(|| {
                 let mut timings = initial_timings;
                 async move {
                     let bearer = self.current_bearer(AuthPosture::AuthRequired)?;

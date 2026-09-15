@@ -1629,3 +1629,94 @@ async fn download_tarball_with_auth_origin_mismatch_returns_error() {
         other => panic!("expected origin-mismatch Registry error, got {other:?}"),
     }
 }
+
+#[tokio::test]
+async fn denied_tarball_after_auth_recovery_does_not_refresh_twice() {
+    use wiremock::matchers::{header, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+    let _lock = auth_env_lock().await;
+    let home = tempfile::tempdir().unwrap();
+    let _env = ScopedAuthEnv::file_backed(home.path());
+    let server = MockServer::start().await;
+    lpm_auth::store_refresh_backed_session(
+        &server.uri(),
+        "stale-access",
+        "valid-refresh",
+        "2099-01-01T00:00:00Z",
+    )
+    .await
+    .unwrap();
+    let client = RegistryClient::new()
+        .with_base_url(server.uri())
+        .with_session(std::sync::Arc::new(lpm_auth::SessionManager::new(
+            server.uri(),
+            None,
+        )));
+    Mock::given(method("GET"))
+        .and(path("/private.tgz"))
+        .and(header("authorization", "Bearer stale-access"))
+        .respond_with(ResponseTemplate::new(401))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST")).and(path("/api/cli/refresh"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"token":"rotated-access","refreshToken":"rotated-refresh","expiresAt":"2099-01-01T00:00:00Z"}))).expect(1).mount(&server).await;
+    Mock::given(method("GET"))
+        .and(path("/private.tgz"))
+        .and(header("authorization", "Bearer rotated-access"))
+        .respond_with(ResponseTemplate::new(404))
+        .expect(1)
+        .mount(&server)
+        .await;
+    assert!(
+        client
+            .download_tarball(&format!("{}/private.tgz", server.uri()))
+            .await
+            .is_err()
+    );
+}
+
+#[tokio::test]
+async fn third_party_tarball_not_found_does_not_refresh_lpm_session() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+    let _lock = auth_env_lock().await;
+    let home = tempfile::tempdir().unwrap();
+    let _env = ScopedAuthEnv::file_backed(home.path());
+    let registry = MockServer::start().await;
+    let third_party = MockServer::start().await;
+    lpm_auth::store_refresh_backed_session(
+        &registry.uri(),
+        "stored-lpm-access",
+        "stored-lpm-refresh",
+        "2099-01-01T00:00:00Z",
+    )
+    .await
+    .unwrap();
+    Mock::given(method("POST"))
+        .and(path("/api/cli/refresh"))
+        .respond_with(ResponseTemplate::new(500))
+        .expect(0)
+        .mount(&registry)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/package.tgz"))
+        .respond_with(ResponseTemplate::new(404))
+        .expect(1)
+        .mount(&third_party)
+        .await;
+    let client = RegistryClient::new()
+        .with_base_url(registry.uri())
+        .with_session(std::sync::Arc::new(lpm_auth::SessionManager::new(
+            registry.uri(),
+            None,
+        )));
+    assert!(matches!(
+        client
+            .download_tarball(&format!("{}/package.tgz", third_party.uri()))
+            .await,
+        Err(LpmError::NotFound(_))
+    ));
+    let requests = third_party.received_requests().await.unwrap();
+    assert!(!requests[0].headers.contains_key("authorization"));
+}

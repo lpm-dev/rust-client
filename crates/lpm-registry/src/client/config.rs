@@ -418,6 +418,7 @@ impl RegistryClient {
             synchronous_cache_writes: false,
             allow_insecure: false,
             session: None,
+            package_read_recovery: Arc::new(tokio::sync::Mutex::new(false)),
             registry_signing_keys_cache: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             base_url_origin: Self::url_origin(DEFAULT_REGISTRY_URL),
             npm_registry_url_origin: Self::url_origin(NPM_REGISTRY_URL),
@@ -867,6 +868,7 @@ impl RegistryClient {
     /// calls replace the prior session reference.
     pub fn with_session(mut self, session: Arc<SessionManager>) -> Self {
         self.session = Some(session);
+        self.package_read_recovery = Arc::new(tokio::sync::Mutex::new(false));
         self
     }
 
@@ -902,6 +904,7 @@ impl RegistryClient {
             synchronous_cache_writes: self.synchronous_cache_writes,
             allow_insecure: self.allow_insecure,
             session: self.session.clone(),
+            package_read_recovery: Arc::clone(&self.package_read_recovery),
             registry_signing_keys_cache: Arc::clone(&self.registry_signing_keys_cache),
             base_url_origin: self.base_url_origin.clone(),
             npm_registry_url_origin: self.npm_registry_url_origin.clone(),
@@ -969,6 +972,7 @@ impl RegistryClient {
     pub fn clone_with_session_only(&self, session: Arc<SessionManager>) -> Self {
         let mut client = self.clone_with_config();
         client.session = Some(session);
+        client.package_read_recovery = Arc::new(tokio::sync::Mutex::new(false));
         client.token = None;
         client
     }

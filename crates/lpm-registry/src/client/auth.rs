@@ -70,10 +70,12 @@ impl RequestDestination {
 ///   Used for endpoints that *may* accept auth but the fast path is
 ///   anonymous (search, public info reads). Avoids needless refresh
 ///   storms when an old token sits on disk.
+/// - **PackageRead**: attach cached credentials; refresh after an auth challenge.
+///   Required package lookups also recover missing versions and denied reads.
+///   Public releases must not depend on a working refresh session.
 /// - **AuthRequired**: attach the bearer if present; on 401, perform
 ///   a single silent refresh + retry for refresh-backed sessions.
-///   Used for install / download / metadata for `@lpm.dev` packages,
-///   publish, token management, account-scoped reads.
+///   Used for publish, token management, and account-scoped reads.
 /// - **SessionRequired**: same as `AuthRequired` for transport, but
 ///   the **calling command** must additionally check that the
 ///   `SessionManager` source is `StoredSession`. Used for tunnel,
@@ -83,6 +85,7 @@ impl RequestDestination {
 pub enum AuthPosture {
     AnonymousOnly,
     AnonymousPreferred,
+    PackageRead,
     AuthRequired,
     SessionRequired,
 }
@@ -92,7 +95,7 @@ impl AuthPosture {
     pub fn attaches_bearer(self) -> bool {
         matches!(
             self,
-            AuthPosture::AuthRequired | AuthPosture::SessionRequired
+            AuthPosture::PackageRead | AuthPosture::AuthRequired | AuthPosture::SessionRequired
         )
     }
 
@@ -100,7 +103,7 @@ impl AuthPosture {
     pub fn allows_recovery(self) -> bool {
         matches!(
             self,
-            AuthPosture::AuthRequired | AuthPosture::SessionRequired
+            AuthPosture::PackageRead | AuthPosture::AuthRequired | AuthPosture::SessionRequired
         )
     }
 }

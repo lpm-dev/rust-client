@@ -144,11 +144,19 @@ pub(super) async fn run_swift_install_xcode_batch(
     let project_root = xcodeproj_path.parent().unwrap_or(project_dir);
     let wrapper = crate::swift_manifest::ensure_wrapper_package(project_root)?;
     let wrapper_dir = wrapper.manifest_path.parent().unwrap_or(project_root);
-    let mut setup = crate::commands::swift_registry::ensure_configured(
+    let coordinates = requests
+        .iter()
+        .map(|request| {
+            lpm_registry::ManagedInstallRoot::new(request.name.scoped(), request.version)
+        })
+        .collect::<Vec<_>>();
+    let anonymous = options.client.can_install_anonymously(&coordinates).await?;
+    let mut setup = crate::commands::swift_registry::ensure_configured_for_install(
         options.client.session().map(|session| session.as_ref()),
         options.client.base_url(),
         wrapper_dir,
         options.json_output,
+        anonymous,
     )
     .await?;
     setup.include_scope_repair(
@@ -241,6 +249,7 @@ async fn finish_swift_batch(
             )
         })
         .collect::<Vec<_>>();
+    let anonymous = options.client.can_install_anonymously(&coordinates).await?;
     let warnings = options.client.check_install_access(&coordinates).await?;
     if !options.json_output {
         for warning in warnings {
@@ -252,11 +261,12 @@ async fn finish_swift_batch(
         None => (
             None,
             &[][..],
-            crate::commands::swift_registry::ensure_configured(
+            crate::commands::swift_registry::ensure_configured_for_install(
                 options.client.session().map(|session| session.as_ref()),
                 options.client.base_url(),
                 resolve_dir,
                 options.json_output,
+                anonymous,
             )
             .await?,
         ),
@@ -264,7 +274,28 @@ async fn finish_swift_batch(
     if !options.json_output {
         output::info("Resolving Swift packages...");
     }
-    crate::swift_manifest::run_swift_resolve_with_force(resolve_dir, options.force)?;
+    if let Err(error) =
+        crate::swift_manifest::run_swift_resolve_with_force(resolve_dir, options.force)
+    {
+        let has_credential = options
+            .client
+            .session()
+            .map(|session| session.current_source())
+            .transpose()?
+            .flatten()
+            .is_some();
+        if !anonymous || !has_credential {
+            return Err(error);
+        }
+        crate::commands::swift_registry::ensure_configured(
+            options.client.session().map(|session| session.as_ref()),
+            options.client.base_url(),
+            resolve_dir,
+            options.json_output,
+        )
+        .await?;
+        crate::swift_manifest::run_swift_resolve_with_force(resolve_dir, options.force)?;
+    }
     crate::xcode_project::native::resolve(containers)?;
     let resolved = crate::swift_manifest::validate_swift_dependency_graph(resolve_dir)?;
     let coordinates = resolved
