@@ -1,0 +1,3592 @@
+{
+  "review_scope": "All baseline high source package/rule pairs and every added high pair. Evidence establishes a capability or a matcher error, not a package safety verdict.",
+  "counts": {
+    "unsupported-match": 10,
+    "capability-evidence": 126,
+    "unproven-shell": 12
+  },
+  "findings": [
+    {
+      "name": "@adobe/css-tools",
+      "version": "4.5.0",
+      "split": "tuning",
+      "rule_id": "dynamic-require",
+      "baseline": true,
+      "candidate": false,
+      "review": "unsupported-match",
+      "reason": "this.import compiles a CSS import node.",
+      "baseline_evidence": [
+        {
+          "path": "dist/cjs/adobe-css-tools.cjs",
+          "line": 1,
+          "column": 3172,
+          "excerpt": "eturn this.host(t);case exports.CssTypes.import:return this.import(t);case exports.CssTypes.keyframes:return this.keyframes(t);case exports.CssTypes.keyframe:return this.keyframe(t);case exports.CssTypes.layer:return this.layer(t);case expo"
+        }
+      ],
+      "candidate_evidence": []
+    },
+    {
+      "name": "@aws-sdk/credential-provider-process",
+      "version": "3.972.71",
+      "split": "tuning",
+      "rule_id": "child-process",
+      "baseline": true,
+      "candidate": true,
+      "review": "capability-evidence",
+      "reason": "A process API import or call supports a capability tag.",
+      "baseline_evidence": [
+        {
+          "path": "dist-cjs/index.js",
+          "line": 2,
+          "column": 18,
+          "excerpt": "const { exec } = require(\"node:child_process\");\nconst { promisify } = require(\"node:util\");\nconst { setCredentialFeature } = require(\"@aws-sdk/core/client\");\n\nconst getValidatedProcessCredentials = (profileName, data, profiles) => {\n    if "
+        }
+      ],
+      "candidate_evidence": [
+        {
+          "path": "dist-cjs/index.js",
+          "line": 2,
+          "column": 18,
+          "excerpt": "const { exec } = require(\"node:child_process\");\nconst { promisify } = require(\"node:util\");\nconst { setCredentialFeature } = require(\"@aws-sdk/core/client\");\n\nconst getValidatedProcessCredentials = (profileName, data, profiles) => {\n    if "
+        }
+      ]
+    },
+    {
+      "name": "@aws-sdk/credential-provider-process",
+      "version": "3.972.71",
+      "split": "tuning",
+      "rule_id": "shell",
+      "baseline": true,
+      "candidate": true,
+      "review": "capability-evidence",
+      "reason": "A shell API call or shell option supports a capability tag.",
+      "baseline_evidence": [
+        {
+          "path": "dist-es/resolveProcessCredentials.js",
+          "line": 2,
+          "column": 17,
+          "excerpt": "import { exec } from \"node:child_process\";\nimport { promisify } from \"node:util\";\nimport { getValidatedProcessCredentials } from \"./getValidatedProcessCredentials\";\nexport const resolveProcessCredentials = async (profileName, profiles, logg"
+        }
+      ],
+      "candidate_evidence": [
+        {
+          "path": "dist-cjs/index.js",
+          "line": 41,
+          "column": 33,
+          "excerpt": "            const execPromise = promisify(externalDataInterceptor?.getTokenRecord?.().exec ?? exec);\n            try {\n                const { stdout } = await execPromise(credentialProcess);\n                let data;\n                try {\n"
+        }
+      ]
+    },
+    {
+      "name": "@babel/core",
+      "version": "8.0.5",
+      "split": "tuning",
+      "rule_id": "dynamic-require",
+      "baseline": true,
+      "candidate": true,
+      "review": "capability-evidence",
+      "reason": "A computed module request or loader fallback supports a capability tag.",
+      "baseline_evidence": [
+        {
+          "path": "lib/config/files/index.js",
+          "line": 96,
+          "column": 16,
+          "excerpt": "  return await import(url);\n});\nconst tsNotSupportedError = ext => `\\\nYou are using a ${ext} config file, but Babel only supports transpiling .cts configs. Either:\n- Use a .cts config file\n- Update to Node.js 23.6.0, which has native TypeSc"
+        }
+      ],
+      "candidate_evidence": [
+        {
+          "path": "lib/config/files/index.js",
+          "line": 96,
+          "column": 16,
+          "excerpt": "  return await import(url);\n});\nconst tsNotSupportedError = ext => `\\\nYou are using a ${ext} config file, but Babel only supports transpiling .cts configs. Either:\n- Use a .cts config file\n- Update to Node.js 23.6.0, which has native TypeSc"
+        }
+      ]
+    },
+    {
+      "name": "@colors/colors",
+      "version": "1.6.1",
+      "split": "validation",
+      "rule_id": "dynamic-require",
+      "baseline": true,
+      "candidate": true,
+      "review": "capability-evidence",
+      "reason": "A computed module request or loader fallback supports a capability tag.",
+      "baseline_evidence": [
+        {
+          "path": "examples/normal-usage.js",
+          "line": 68,
+          "column": 19,
+          "excerpt": "  colors.setTheme(require(__dirname + '/../themes/generic-logging.js'));\n} catch (err) {\n  console.log(err);\n}\n\n                   \nconsole.log('this is an error'.error);\n\n                      \nconsole.log('this is a warning'.warn);\n\n     "
+        }
+      ],
+      "candidate_evidence": [
+        {
+          "path": "examples/normal-usage.js",
+          "line": 68,
+          "column": 19,
+          "excerpt": "  colors.setTheme(require(__dirname + '/../themes/generic-logging.js'));\n} catch (err) {\n  console.log(err);\n}\n\n                   \nconsole.log('this is an error'.error);\n\n                      \nconsole.log('this is a warning'.warn);\n\n     "
+        }
+      ]
+    },
+    {
+      "name": "@emnapi/core",
+      "version": "1.11.3",
+      "split": "tuning",
+      "rule_id": "eval",
+      "baseline": true,
+      "candidate": true,
+      "review": "capability-evidence",
+      "reason": "Runtime code generation or evaluation supports a capability tag.",
+      "baseline_evidence": [
+        {
+          "path": "dist/emnapi-core.cjs.js",
+          "line": 6979,
+          "column": 29,
+          "excerpt": "                var ret = g.eval(v8Script.value);\n                result >>>= 0;\n                value = envObject.ensureHandleId(ret);\n                var HEAP_DATA_VIEW = new DataView(wasmMemory.buffer), GET_HEAP_DATA_VIEW = function () {"
+        }
+      ],
+      "candidate_evidence": [
+        {
+          "path": "dist/emnapi-core.cjs.js",
+          "line": 6979,
+          "column": 29,
+          "excerpt": "                var ret = g.eval(v8Script.value);\n                result >>>= 0;\n                value = envObject.ensureHandleId(ret);\n                var HEAP_DATA_VIEW = new DataView(wasmMemory.buffer), GET_HEAP_DATA_VIEW = function () {"
+        }
+      ]
+    },
+    {
+      "name": "@emnapi/runtime",
+      "version": "1.11.3",
+      "split": "tuning",
+      "rule_id": "eval",
+      "baseline": true,
+      "candidate": true,
+      "review": "capability-evidence",
+      "reason": "Runtime code generation or evaluation supports a capability tag.",
+      "baseline_evidence": [
+        {
+          "path": "dist/emnapi.cjs.js",
+          "line": 23,
+          "column": 13,
+          "excerpt": "        f = new Function();\n    }\n    catch (_) {\n        return false;\n    }\n    return typeof f === 'function';\n})();\nconst _global = (function () {\n    if (typeof globalThis !== 'undefined')\n        return globalThis;\n    let g = (functi"
+        }
+      ],
+      "candidate_evidence": [
+        {
+          "path": "dist/emnapi.cjs.js",
+          "line": 23,
+          "column": 13,
+          "excerpt": "        f = new Function();\n    }\n    catch (_) {\n        return false;\n    }\n    return typeof f === 'function';\n})();\nconst _global = (function () {\n    if (typeof globalThis !== 'undefined')\n        return globalThis;\n    let g = (functi"
+        }
+      ]
+    },
+    {
+      "name": "@eslint/eslintrc",
+      "version": "3.3.7",
+      "split": "validation",
+      "rule_id": "dynamic-require",
+      "baseline": true,
+      "candidate": true,
+      "review": "capability-evidence",
+      "reason": "A computed module request or loader fallback supports a capability tag.",
+      "baseline_evidence": [
+        {
+          "path": "lib/config-array-factory.js",
+          "line": 356,
+          "column": 45,
+          "excerpt": "            const { version = \"unknown\" } = require(packageJsonPath);\n\n            nameAndVersion = `${request}@${version}`;\n        } catch (error) {\n            debug(\"package.json was not found:\", error.message);\n            nameAndVersi"
+        }
+      ],
+      "candidate_evidence": [
+        {
+          "path": "dist/eslintrc.cjs",
+          "line": 2803,
+          "column": 45,
+          "excerpt": "            const { version = \"unknown\" } = require$1(packageJsonPath);\n\n            nameAndVersion = `${request}@${version}`;\n        } catch (error) {\n            debug$2(\"package.json was not found:\", error.message);\n            nameAndV"
+        }
+      ]
+    },
+    {
+      "name": "@isaacs/cliui",
+      "version": "9.0.0",
+      "split": "validation",
+      "rule_id": "child-process",
+      "baseline": true,
+      "candidate": false,
+      "review": "unsupported-match",
+      "reason": "A bundled terminal-text wrapper is named exec.",
+      "baseline_evidence": [
+        {
+          "path": "dist/commonjs/wrap-ansi/index.js",
+          "line": 173,
+          "column": 20,
+          "excerpt": "    .map((line) => exec(line, columns, options))\n    .join(\"\\n\");\nexports.wrap = wrap;\n                                 "
+        }
+      ],
+      "candidate_evidence": []
+    },
+    {
+      "name": "@napi-rs/wasm-runtime",
+      "version": "1.2.4",
+      "split": "tuning",
+      "rule_id": "eval",
+      "baseline": true,
+      "candidate": true,
+      "review": "capability-evidence",
+      "reason": "Runtime code generation or evaluation supports a capability tag.",
+      "baseline_evidence": [
+        {
+          "path": "dist/fs.js",
+          "line": 3124,
+          "column": 27,
+          "excerpt": "\t\treturn regexes.length ? new Function(\"p\", \"return \" + regexes.map((r) => r + \".test(p)\").join(\"||\")) : () => false;\n\t};\n\texports.toMatcher = toMatcher;\n}));\n            \n                                                                    "
+        }
+      ],
+      "candidate_evidence": [
+        {
+          "path": "dist/fs.js",
+          "line": 3124,
+          "column": 27,
+          "excerpt": "\t\treturn regexes.length ? new Function(\"p\", \"return \" + regexes.map((r) => r + \".test(p)\").join(\"||\")) : () => false;\n\t};\n\texports.toMatcher = toMatcher;\n}));\n            \n                                                                    "
+        }
+      ]
+    },
+    {
+      "name": "@openai/codex",
+      "version": "0.154.0",
+      "split": "tuning",
+      "rule_id": "child-process",
+      "baseline": true,
+      "candidate": true,
+      "review": "capability-evidence",
+      "reason": "A process API import or call supports a capability tag.",
+      "baseline_evidence": [
+        {
+          "path": "bin/codex.js",
+          "line": 4,
+          "column": 18,
+          "excerpt": "import { spawn } from \"node:child_process\";\nimport { existsSync, readFileSync, realpathSync } from \"fs\";\nimport { createRequire } from \"node:module\";\nimport path from \"path\";\nimport { fileURLToPath } from \"url\";\n\n                           "
+        }
+      ],
+      "candidate_evidence": [
+        {
+          "path": "bin/codex.js",
+          "line": 4,
+          "column": 18,
+          "excerpt": "import { spawn } from \"node:child_process\";\nimport { existsSync, readFileSync, realpathSync } from \"fs\";\nimport { createRequire } from \"node:module\";\nimport path from \"path\";\nimport { fileURLToPath } from \"url\";\n\n                           "
+        }
+      ]
+    },
+    {
+      "name": "@openai/codex",
+      "version": "0.154.0",
+      "split": "tuning",
+      "rule_id": "shell",
+      "baseline": true,
+      "candidate": false,
+      "review": "unproven-shell",
+      "reason": "The baseline inferred shell use from an import or an exec-named alias. Process capability remains detected. No supported shell invocation was established in the scanned code.",
+      "baseline_evidence": [
+        {
+          "path": "bin/codex.js",
+          "line": 4,
+          "column": 18,
+          "excerpt": "import { spawn } from \"node:child_process\";\nimport { existsSync, readFileSync, realpathSync } from \"fs\";\nimport { createRequire } from \"node:module\";\nimport path from \"path\";\nimport { fileURLToPath } from \"url\";\n\n                           "
+        }
+      ],
+      "candidate_evidence": []
+    },
+    {
+      "name": "@opentelemetry/resources",
+      "version": "2.11.0",
+      "split": "tuning",
+      "rule_id": "child-process",
+      "baseline": true,
+      "candidate": true,
+      "review": "capability-evidence",
+      "reason": "A process API import or call supports a capability tag.",
+      "baseline_evidence": [
+        {
+          "path": "build/esm/detectors/platform/node/machine-id/execAsync.js",
+          "line": 5,
+          "column": 27,
+          "excerpt": "import * as child_process from 'child_process';\nimport * as util from 'util';\nexport const execAsync = util.promisify(child_process.exec);\n                                     "
+        }
+      ],
+      "candidate_evidence": [
+        {
+          "path": "build/esm/detectors/platform/node/machine-id/execAsync.js",
+          "line": 5,
+          "column": 27,
+          "excerpt": "import * as child_process from 'child_process';\nimport * as util from 'util';\nexport const execAsync = util.promisify(child_process.exec);\n                                     "
+        }
+      ]
+    },
+    {
+      "name": "@opentelemetry/resources",
+      "version": "2.11.0",
+      "split": "tuning",
+      "rule_id": "shell",
+      "baseline": true,
+      "candidate": true,
+      "review": "capability-evidence",
+      "reason": "A shell API call or shell option supports a capability tag.",
+      "baseline_evidence": [
+        {
+          "path": "build/esm/detectors/platform/node/machine-id/execAsync.js",
+          "line": 5,
+          "column": 27,
+          "excerpt": "import * as child_process from 'child_process';\nimport * as util from 'util';\nexport const execAsync = util.promisify(child_process.exec);\n                                     "
+        }
+      ],
+      "candidate_evidence": [
+        {
+          "path": "build/esm/detectors/platform/node/machine-id/execAsync.js",
+          "line": 7,
+          "column": 26,
+          "excerpt": "export const execAsync = util.promisify(child_process.exec);\n                                     "
+        }
+      ]
+    },
+    {
+      "name": "@protobufjs/inquire",
+      "version": "1.1.2",
+      "split": "validation",
+      "rule_id": "dynamic-require",
+      "baseline": true,
+      "candidate": true,
+      "review": "capability-evidence",
+      "reason": "A computed module request or loader fallback supports a capability tag.",
+      "baseline_evidence": [
+        {
+          "path": "index.js",
+          "line": 16,
+          "column": 15,
+          "excerpt": "    var mod = require(moduleName);\r\n    if (mod && (mod.length || Object.keys(mod).length)) return mod;\r\n    return null;\r\n  } catch (err) {\r\n             \r\n    return null;\r\n  }\r\n}\r\n\r\n  \r\n                                                 \r\n"
+        }
+      ],
+      "candidate_evidence": [
+        {
+          "path": "index.js",
+          "line": 16,
+          "column": 15,
+          "excerpt": "    var mod = require(moduleName);\r\n    if (mod && (mod.length || Object.keys(mod).length)) return mod;\r\n    return null;\r\n  } catch (err) {\r\n             \r\n    return null;\r\n  }\r\n}\r\n\r\n  \r\n                                                 \r\n"
+        }
+      ]
+    },
+    {
+      "name": "@sinonjs/commons",
+      "version": "4.0.0-alpha.0",
+      "split": "tuning",
+      "rule_id": "eval",
+      "baseline": true,
+      "candidate": true,
+      "review": "capability-evidence",
+      "reason": "Runtime code generation or evaluation supports a capability tag.",
+      "baseline_evidence": [
+        {
+          "path": "lib/function-name.test.mjs",
+          "line": 66,
+          "column": 22,
+          "excerpt": "                fn = eval(\"(function*() {})\")().constructor;\n            } catch (e) {\n                                                 \n                return;\n            }\n\n            functionName(fn);\n        });\n    });\n});\n"
+        }
+      ],
+      "candidate_evidence": [
+        {
+          "path": "lib/function-name.test.mjs",
+          "line": 66,
+          "column": 22,
+          "excerpt": "                fn = eval(\"(function*() {})\")().constructor;\n            } catch (e) {\n                                                 \n                return;\n            }\n\n            functionName(fn);\n        });\n    });\n});\n"
+        }
+      ]
+    },
+    {
+      "name": "@tailwindcss/node",
+      "version": "4.3.3",
+      "split": "tuning",
+      "rule_id": "dynamic-require",
+      "baseline": true,
+      "candidate": true,
+      "review": "capability-evidence",
+      "reason": "A computed module request or loader fallback supports a capability tag.",
+      "baseline_evidence": [
+        {
+          "path": "dist/index.js",
+          "line": 10,
+          "column": 4560,
+          "excerpt": "wait globalThis.__tw_load(e);if(r)return r}try{return await import(e)}catch{return Nt??=(0,Pt.createJiti)(mn.url,{moduleCache:!1,fsCache:!1}),await Nt.import(e)}}var Me=[\"node_modules\",...process.env.NODE_PATH?[...process.env.NODE_PATH.spli"
+        }
+      ],
+      "candidate_evidence": [
+        {
+          "path": "dist/index.js",
+          "line": 10,
+          "column": 4560,
+          "excerpt": "wait globalThis.__tw_load(e);if(r)return r}try{return await import(e)}catch{return Nt??=(0,Pt.createJiti)(mn.url,{moduleCache:!1,fsCache:!1}),await Nt.import(e)}}var Me=[\"node_modules\",...process.env.NODE_PATH?[...process.env.NODE_PATH.spli"
+        }
+      ]
+    },
+    {
+      "name": "@tailwindcss/oxide",
+      "version": "4.3.3",
+      "split": "tuning",
+      "rule_id": "child-process",
+      "baseline": true,
+      "candidate": true,
+      "review": "capability-evidence",
+      "reason": "A process API import or call supports a capability tag.",
+      "baseline_evidence": [
+        {
+          "path": "index.js",
+          "line": 56,
+          "column": 12,
+          "excerpt": "    return require('child_process').execSync('ldd --version', { encoding: 'utf8' }).includes('musl')\n  } catch (e) {\n                                                                                                                \n    return"
+        }
+      ],
+      "candidate_evidence": [
+        {
+          "path": "index.js",
+          "line": 56,
+          "column": 12,
+          "excerpt": "    return require('child_process').execSync('ldd --version', { encoding: 'utf8' }).includes('musl')\n  } catch (e) {\n                                                                                                                \n    return"
+        }
+      ]
+    },
+    {
+      "name": "@tailwindcss/oxide",
+      "version": "4.3.3",
+      "split": "tuning",
+      "rule_id": "shell",
+      "baseline": false,
+      "candidate": true,
+      "review": "capability-evidence",
+      "reason": "A shell API call or shell option supports a capability tag.",
+      "baseline_evidence": [],
+      "candidate_evidence": [
+        {
+          "path": "index.js",
+          "line": 56,
+          "column": 12,
+          "excerpt": "    return require('child_process').execSync('ldd --version', { encoding: 'utf8' }).includes('musl')\n  } catch (e) {\n                                                                                                                \n    return"
+        }
+      ]
+    },
+    {
+      "name": "@tailwindcss/oxide",
+      "version": "4.3.3",
+      "split": "tuning",
+      "rule_id": "dynamic-require",
+      "baseline": true,
+      "candidate": true,
+      "review": "capability-evidence",
+      "reason": "A computed module request or loader fallback supports a capability tag.",
+      "baseline_evidence": [
+        {
+          "path": "index.js",
+          "line": 66,
+          "column": 14,
+          "excerpt": "      return require(process.env.NAPI_RS_NATIVE_LIBRARY_PATH);\n    } catch (err) {\n      loadErrors.push(err)\n    }\n  } else if (process.platform === 'android') {\n    if (process.arch === 'arm64') {\n      try {\n        return require('./tai"
+        }
+      ],
+      "candidate_evidence": [
+        {
+          "path": "index.js",
+          "line": 66,
+          "column": 14,
+          "excerpt": "      return require(process.env.NAPI_RS_NATIVE_LIBRARY_PATH);\n    } catch (err) {\n      loadErrors.push(err)\n    }\n  } else if (process.platform === 'android') {\n    if (process.arch === 'arm64') {\n      try {\n        return require('./tai"
+        }
+      ]
+    },
+    {
+      "name": "@vitest/mocker",
+      "version": "5.0.1",
+      "split": "tuning",
+      "rule_id": "dynamic-require",
+      "baseline": true,
+      "candidate": true,
+      "review": "capability-evidence",
+      "reason": "A computed module request or loader fallback supports a capability tag.",
+      "baseline_evidence": [
+        {
+          "path": "dist/chunk-mocker.js",
+          "line": 383,
+          "column": 39,
+          "excerpt": "\t\treturn this.wrapDynamicImport(() => import(\n\t\t\t                  \n\t\t\tactualUrl\n)).then((mod) => {\n\t\t\tif (!resolved.optimized || typeof mod.default === \"undefined\") {\n\t\t\t\treturn mod;\n\t\t\t}\n\t\t\t                                                "
+        }
+      ],
+      "candidate_evidence": [
+        {
+          "path": "dist/chunk-automock.js",
+          "line": 373,
+          "column": 9,
+          "excerpt": "\treturn __globalRequire(moduleId);\n}\nconst ESM_RE = /(?:[\\s;]|^)(?:import[\\s\\w*,{}]*from|import\\s*[\"'*{]|export\\b\\s*(?:[*{]|default|class|type|function|const|var|let|async function)|import\\.meta\\b)/m;\nfunction hasESM(code) {\n\treturn ESM_RE."
+        }
+      ]
+    },
+    {
+      "name": "@vitest/snapshot",
+      "version": "5.0.1",
+      "split": "tuning",
+      "rule_id": "eval",
+      "baseline": true,
+      "candidate": true,
+      "review": "capability-evidence",
+      "reason": "Runtime code generation or evaluation supports a capability tag.",
+      "baseline_evidence": [
+        {
+          "path": "dist/chunk-utils.js",
+          "line": 124,
+          "column": 20,
+          "excerpt": "\t\tconst populate = new Function(\"exports\", content);\n\t\tpopulate(data);\n\t} catch (cause) {\n\t\tthrow new Error(`Invalid snapshot file, please manually fix or delete it: ${filepath}`, { cause });\n\t}\n\treturn data;\n}\n                             "
+        }
+      ],
+      "candidate_evidence": [
+        {
+          "path": "dist/chunk-utils.js",
+          "line": 124,
+          "column": 20,
+          "excerpt": "\t\tconst populate = new Function(\"exports\", content);\n\t\tpopulate(data);\n\t} catch (cause) {\n\t\tthrow new Error(`Invalid snapshot file, please manually fix or delete it: ${filepath}`, { cause });\n\t}\n\treturn data;\n}\n                             "
+        }
+      ]
+    },
+    {
+      "name": "ajv",
+      "version": "8.20.0",
+      "split": "tuning",
+      "rule_id": "eval",
+      "baseline": true,
+      "candidate": true,
+      "review": "capability-evidence",
+      "reason": "Runtime code generation or evaluation supports a capability tag.",
+      "baseline_evidence": [
+        {
+          "path": "dist/compile/index.js",
+          "line": 89,
+          "column": 30,
+          "excerpt": "        const makeValidate = new Function(`${names_1.default.self}`, `${names_1.default.scope}`, sourceCode);\n        const validate = makeValidate(this, this.scope.get());\n        this.scope.value(validateName, { ref: validate });\n        "
+        }
+      ],
+      "candidate_evidence": [
+        {
+          "path": "dist/compile/index.js",
+          "line": 89,
+          "column": 30,
+          "excerpt": "        const makeValidate = new Function(`${names_1.default.self}`, `${names_1.default.scope}`, sourceCode);\n        const validate = makeValidate(this, this.scope.get());\n        this.scope.value(validateName, { ref: validate });\n        "
+        }
+      ]
+    },
+    {
+      "name": "any-promise",
+      "version": "1.3.0",
+      "split": "tuning",
+      "rule_id": "dynamic-require",
+      "baseline": true,
+      "candidate": true,
+      "review": "capability-evidence",
+      "reason": "A computed module request or loader fallback supports a capability tag.",
+      "baseline_evidence": [
+        {
+          "path": "register.js",
+          "line": 24,
+          "column": 15,
+          "excerpt": "    var lib = require(implementation)\n    impl = {\n      Promise: lib.Promise || lib,\n      implementation: implementation\n    }\n  } else {\n                                                                   \n                                "
+        }
+      ],
+      "candidate_evidence": [
+        {
+          "path": "register.js",
+          "line": 24,
+          "column": 15,
+          "excerpt": "    var lib = require(implementation)\n    impl = {\n      Promise: lib.Promise || lib,\n      implementation: implementation\n    }\n  } else {\n                                                                   \n                                "
+        }
+      ]
+    },
+    {
+      "name": "babel-plugin-istanbul",
+      "version": "8.0.0",
+      "split": "tuning",
+      "rule_id": "child-process",
+      "baseline": true,
+      "candidate": true,
+      "review": "capability-evidence",
+      "reason": "A process API import or call supports a capability tag.",
+      "baseline_evidence": [
+        {
+          "path": "lib/index.js",
+          "line": 9,
+          "column": 22,
+          "excerpt": "var _child_process = require(\"child_process\");\nvar _helperPluginUtils = require(\"@babel/helper-plugin-utils\");\nvar _istanbulLibInstrument = require(\"istanbul-lib-instrument\");\nvar _testExclude = _interopRequireDefault(require(\"test-exclude\""
+        }
+      ],
+      "candidate_evidence": [
+        {
+          "path": "lib/index.js",
+          "line": 9,
+          "column": 22,
+          "excerpt": "var _child_process = require(\"child_process\");\nvar _helperPluginUtils = require(\"@babel/helper-plugin-utils\");\nvar _istanbulLibInstrument = require(\"istanbul-lib-instrument\");\nvar _testExclude = _interopRequireDefault(require(\"test-exclude\""
+        }
+      ]
+    },
+    {
+      "name": "base64-js",
+      "version": "1.5.1",
+      "split": "tuning",
+      "rule_id": "dynamic-require",
+      "baseline": false,
+      "candidate": true,
+      "review": "capability-evidence",
+      "reason": "A computed module request or loader fallback supports a capability tag.",
+      "baseline_evidence": [],
+      "candidate_evidence": [
+        {
+          "path": "base64js.min.js",
+          "line": 1,
+          "column": 423,
+          "excerpt": "){var f=\"function\"==typeof require&&require;if(!i&&f)return f(j,!0);if(h)return h(j,!0);var c=new Error(\"Cannot find module '\"+j+\"'\");throw c.code=\"MODULE_NOT_FOUND\",c}var k=e[j]={exports:{}};d[j][0].call(k.exports,function(b){var c=d[j][1]"
+        }
+      ]
+    },
+    {
+      "name": "bluebird",
+      "version": "3.7.2",
+      "split": "tuning",
+      "rule_id": "eval",
+      "baseline": true,
+      "candidate": true,
+      "review": "capability-evidence",
+      "reason": "Runtime code generation or evaluation supports a capability tag.",
+      "baseline_evidence": [
+        {
+          "path": "js/browser/bluebird.core.js",
+          "line": 3695,
+          "column": 5,
+          "excerpt": "    eval(obj);\n}\n\nvar rident = /^[a-z$_][a-z$_0-9]*$/i;\nfunction isIdentifier(str) {\n    return rident.test(str);\n}\n\nfunction filledRange(count, prefix, suffix) {\n    var ret = new Array(count);\n    for(var i = 0; i < count; ++i) {\n        "
+        }
+      ],
+      "candidate_evidence": [
+        {
+          "path": "js/browser/bluebird.core.js",
+          "line": 3695,
+          "column": 5,
+          "excerpt": "    eval(obj);\n}\n\nvar rident = /^[a-z$_][a-z$_0-9]*$/i;\nfunction isIdentifier(str) {\n    return rident.test(str);\n}\n\nfunction filledRange(count, prefix, suffix) {\n    var ret = new Array(count);\n    for(var i = 0; i < count; ++i) {\n        "
+        }
+      ]
+    },
+    {
+      "name": "browserslist",
+      "version": "4.29.0",
+      "split": "tuning",
+      "rule_id": "dynamic-require",
+      "baseline": true,
+      "candidate": true,
+      "review": "capability-evidence",
+      "reason": "A computed module request or loader fallback supports a capability tag.",
+      "baseline_evidence": [
+        {
+          "path": "node.js",
+          "line": 259,
+          "column": 19,
+          "excerpt": "    var queries = require(require.resolve(name, { paths: ['.', ctx.path] }))\n    if (typeof queries === 'object' && queries !== null && queries.__esModule) {\n      queries = queries.default\n    }\n    if (queries) {\n      if (Array.isArray(q"
+        }
+      ],
+      "candidate_evidence": [
+        {
+          "path": "node.js",
+          "line": 259,
+          "column": 19,
+          "excerpt": "    var queries = require(require.resolve(name, { paths: ['.', ctx.path] }))\n    if (typeof queries === 'object' && queries !== null && queries.__esModule) {\n      queries = queries.default\n    }\n    if (queries) {\n      if (Array.isArray(q"
+        }
+      ]
+    },
+    {
+      "name": "commander",
+      "version": "15.0.0",
+      "split": "tuning",
+      "rule_id": "child-process",
+      "baseline": true,
+      "candidate": true,
+      "review": "capability-evidence",
+      "reason": "A process API import or call supports a capability tag.",
+      "baseline_evidence": [
+        {
+          "path": "lib/command.js",
+          "line": 2,
+          "column": 21,
+          "excerpt": "import childProcess from 'node:child_process';\nimport path from 'node:path';\nimport fs from 'node:fs';\nimport process from 'node:process';\nimport { stripVTControlCharacters } from 'node:util';\n\nimport { Argument, humanReadableArgName } from"
+        }
+      ],
+      "candidate_evidence": [
+        {
+          "path": "lib/command.js",
+          "line": 2,
+          "column": 21,
+          "excerpt": "import childProcess from 'node:child_process';\nimport path from 'node:path';\nimport fs from 'node:fs';\nimport process from 'node:process';\nimport { stripVTControlCharacters } from 'node:util';\n\nimport { Argument, humanReadableArgName } from"
+        }
+      ]
+    },
+    {
+      "name": "commander",
+      "version": "15.0.0",
+      "split": "tuning",
+      "rule_id": "shell",
+      "baseline": true,
+      "candidate": false,
+      "review": "unproven-shell",
+      "reason": "The baseline inferred shell use from an import or an exec-named alias. Process capability remains detected. No supported shell invocation was established in the scanned code.",
+      "baseline_evidence": [
+        {
+          "path": "lib/command.js",
+          "line": 2,
+          "column": 21,
+          "excerpt": "import childProcess from 'node:child_process';\nimport path from 'node:path';\nimport fs from 'node:fs';\nimport process from 'node:process';\nimport { stripVTControlCharacters } from 'node:util';\n\nimport { Argument, humanReadableArgName } from"
+        }
+      ],
+      "candidate_evidence": []
+    },
+    {
+      "name": "core-js",
+      "version": "3.50.0",
+      "split": "tuning",
+      "rule_id": "child-process",
+      "baseline": true,
+      "candidate": false,
+      "review": "unsupported-match",
+      "reason": "exec is a local callback parameter.",
+      "baseline_evidence": [
+        {
+          "path": "internals/check-correctness-of-iteration.js",
+          "line": 40,
+          "column": 5,
+          "excerpt": "    exec(object);\n  } catch (error) {             }\n  return ITERATION_SUPPORT;\n};\n"
+        }
+      ],
+      "candidate_evidence": []
+    },
+    {
+      "name": "cosmiconfig",
+      "version": "10.0.1",
+      "split": "tuning",
+      "rule_id": "eval",
+      "baseline": true,
+      "candidate": true,
+      "review": "capability-evidence",
+      "reason": "Runtime code generation or evaluation supports a capability tag.",
+      "baseline_evidence": [
+        {
+          "path": "dist/canUseDynamicImport.js",
+          "line": 14,
+          "column": 7,
+          "excerpt": "      new Function('id', 'return import(id);');\n      result = true;\n    } catch (e) {\n      result = false;\n    }\n  }\n\n  return result;\n}\n                                               "
+        }
+      ],
+      "candidate_evidence": [
+        {
+          "path": "dist/canUseDynamicImport.js",
+          "line": 14,
+          "column": 7,
+          "excerpt": "      new Function('id', 'return import(id);');\n      result = true;\n    } catch (e) {\n      result = false;\n    }\n  }\n\n  return result;\n}\n                                               "
+        }
+      ]
+    },
+    {
+      "name": "cosmiconfig",
+      "version": "10.0.1",
+      "split": "tuning",
+      "rule_id": "dynamic-require",
+      "baseline": true,
+      "candidate": true,
+      "review": "capability-evidence",
+      "reason": "A computed module request or loader fallback supports a capability tag.",
+      "baseline_evidence": [
+        {
+          "path": "dist/loaders.js",
+          "line": 9,
+          "column": 12,
+          "excerpt": "    return require(filepath);\n};\nexports.loadJsSync = loadJsSync;\nconst loadJs = async function loadJs(filepath) {\n    try {\n        const { href } = (0, url_1.pathToFileURL)(await (0, promises_1.realpath)(filepath));\n        return (await "
+        }
+      ],
+      "candidate_evidence": [
+        {
+          "path": "dist/loaders.js",
+          "line": 9,
+          "column": 12,
+          "excerpt": "    return require(filepath);\n};\nexports.loadJsSync = loadJsSync;\nconst loadJs = async function loadJs(filepath) {\n    try {\n        const { href } = (0, url_1.pathToFileURL)(await (0, promises_1.realpath)(filepath));\n        return (await "
+        }
+      ]
+    },
+    {
+      "name": "cross-spawn",
+      "version": "7.0.6",
+      "split": "tuning",
+      "rule_id": "child-process",
+      "baseline": true,
+      "candidate": true,
+      "review": "capability-evidence",
+      "reason": "A process API import or call supports a capability tag.",
+      "baseline_evidence": [
+        {
+          "path": "index.js",
+          "line": 3,
+          "column": 12,
+          "excerpt": "const cp = require('child_process');\nconst parse = require('./lib/parse');\nconst enoent = require('./lib/enoent');\n\nfunction spawn(command, args, options) {\n                          \n    const parsed = parse(command, args, options);\n\n     "
+        }
+      ],
+      "candidate_evidence": [
+        {
+          "path": "index.js",
+          "line": 3,
+          "column": 12,
+          "excerpt": "const cp = require('child_process');\nconst parse = require('./lib/parse');\nconst enoent = require('./lib/enoent');\n\nfunction spawn(command, args, options) {\n                          \n    const parsed = parse(command, args, options);\n\n     "
+        }
+      ]
+    },
+    {
+      "name": "css-tree",
+      "version": "3.2.1",
+      "split": "validation",
+      "rule_id": "child-process",
+      "baseline": true,
+      "candidate": false,
+      "review": "unsupported-match",
+      "reason": "fork creates an extended syntax configuration.",
+      "baseline_evidence": [
+        {
+          "path": "cjs/syntax/create.cjs",
+          "line": 33,
+          "column": 9,
+          "excerpt": "        fork(extension) {\n            const base = mix({}, config);                  \n\n            return createSyntax(\n                typeof extension === 'function'\n                    ? extension(base)                                   "
+        }
+      ],
+      "candidate_evidence": []
+    },
+    {
+      "name": "depd",
+      "version": "2.0.0",
+      "split": "validation",
+      "rule_id": "eval",
+      "baseline": true,
+      "candidate": true,
+      "review": "capability-evidence",
+      "reason": "Runtime code generation or evaluation supports a capability tag.",
+      "baseline_evidence": [
+        {
+          "path": "index.js",
+          "line": 425,
+          "column": 22,
+          "excerpt": "  var deprecatedfn = new Function('fn', 'log', 'deprecate', 'message', 'site',\n    '\"use strict\"\\n' +\n    'return function (' + args + ') {' +\n    'log.call(deprecate, message, site)\\n' +\n    'return fn.apply(this, arguments)\\n' +\n    '}')("
+        }
+      ],
+      "candidate_evidence": [
+        {
+          "path": "index.js",
+          "line": 425,
+          "column": 22,
+          "excerpt": "  var deprecatedfn = new Function('fn', 'log', 'deprecate', 'message', 'site',\n    '\"use strict\"\\n' +\n    'return function (' + args + ') {' +\n    'log.call(deprecate, message, site)\\n' +\n    'return fn.apply(this, arguments)\\n' +\n    '}')("
+        }
+      ]
+    },
+    {
+      "name": "detect-libc",
+      "version": "2.1.2",
+      "split": "validation",
+      "rule_id": "child-process",
+      "baseline": true,
+      "candidate": true,
+      "review": "capability-evidence",
+      "reason": "A process API import or call supports a capability tag.",
+      "baseline_evidence": [
+        {
+          "path": "lib/detect-libc.js",
+          "line": 6,
+          "column": 22,
+          "excerpt": "const childProcess = require('child_process');\nconst { isLinux, getReport } = require('./process');\nconst { LDD_PATH, SELF_PATH, readFile, readFileSync } = require('./filesystem');\nconst { interpreterPath } = require('./elf');\n\nlet cachedFa"
+        }
+      ],
+      "candidate_evidence": [
+        {
+          "path": "lib/detect-libc.js",
+          "line": 6,
+          "column": 22,
+          "excerpt": "const childProcess = require('child_process');\nconst { isLinux, getReport } = require('./process');\nconst { LDD_PATH, SELF_PATH, readFile, readFileSync } = require('./filesystem');\nconst { interpreterPath } = require('./elf');\n\nlet cachedFa"
+        }
+      ]
+    },
+    {
+      "name": "detect-libc",
+      "version": "2.1.2",
+      "split": "validation",
+      "rule_id": "shell",
+      "baseline": false,
+      "candidate": true,
+      "review": "capability-evidence",
+      "reason": "A shell API call or shell option supports a capability tag.",
+      "baseline_evidence": [],
+      "candidate_evidence": [
+        {
+          "path": "lib/detect-libc.js",
+          "line": 21,
+          "column": 7,
+          "excerpt": "      childProcess.exec(command, (err, out) => {\n        commandOut = err ? ' ' : out;\n        resolve(commandOut);\n      });\n    });\n  }\n  return commandOut;\n};\n\nconst safeCommandSync = () => {\n  if (!commandOut) {\n    try {\n      commandO"
+        }
+      ]
+    },
+    {
+      "name": "diff",
+      "version": "9.0.0",
+      "split": "tuning",
+      "rule_id": "child-process",
+      "baseline": true,
+      "candidate": false,
+      "review": "unsupported-match",
+      "reason": "exec advances an asynchronous diff search.",
+      "baseline_evidence": [
+        {
+          "path": "dist/diff.js",
+          "line": 125,
+          "column": 27,
+          "excerpt": "                (function exec() {\n                    setTimeout(function () {\n                        if (editLength > maxEditLength || Date.now() > abortAfterTimestamp) {\n                            return callback(undefined);\n          "
+        }
+      ],
+      "candidate_evidence": []
+    },
+    {
+      "name": "esbuild",
+      "version": "0.28.2",
+      "split": "tuning",
+      "rule_id": "child-process",
+      "baseline": true,
+      "candidate": true,
+      "review": "capability-evidence",
+      "reason": "A process API import or call supports a capability tag.",
+      "baseline_evidence": [
+        {
+          "path": "install.js",
+          "line": 95,
+          "column": 21,
+          "excerpt": "var child_process = require(\"child_process\");\nvar packageJSON = require(path2.join(__dirname, \"package.json\"));\nvar toPath = path2.join(__dirname, \"bin\", \"esbuild\");\nvar isToPathJS = true;\nfunction validateBinaryVersion(...command) {\n  comm"
+        }
+      ],
+      "candidate_evidence": [
+        {
+          "path": "install.js",
+          "line": 95,
+          "column": 21,
+          "excerpt": "var child_process = require(\"child_process\");\nvar packageJSON = require(path2.join(__dirname, \"package.json\"));\nvar toPath = path2.join(__dirname, \"bin\", \"esbuild\");\nvar isToPathJS = true;\nfunction validateBinaryVersion(...command) {\n  comm"
+        }
+      ]
+    },
+    {
+      "name": "esbuild",
+      "version": "0.28.2",
+      "split": "tuning",
+      "rule_id": "shell",
+      "baseline": false,
+      "candidate": true,
+      "review": "capability-evidence",
+      "reason": "A shell API call or shell option supports a capability tag.",
+      "baseline_evidence": [],
+      "candidate_evidence": [
+        {
+          "path": "install.js",
+          "line": 187,
+          "column": 5,
+          "excerpt": "    child_process.execSync(\n      `npm install --loglevel=error --prefer-offline --no-audit --progress=false ${pkg}@${packageJSON.version}`,\n      { cwd: installDir, stdio: \"pipe\", env }\n    );\n    const installedBinPath = path2.join(instal"
+        }
+      ]
+    },
+    {
+      "name": "esbuild",
+      "version": "0.28.2",
+      "split": "tuning",
+      "rule_id": "dynamic-require",
+      "baseline": true,
+      "candidate": true,
+      "review": "capability-evidence",
+      "reason": "A computed module request or loader fallback supports a capability tag.",
+      "baseline_evidence": [
+        {
+          "path": "install.js",
+          "line": 96,
+          "column": 19,
+          "excerpt": "var packageJSON = require(path2.join(__dirname, \"package.json\"));\nvar toPath = path2.join(__dirname, \"bin\", \"esbuild\");\nvar isToPathJS = true;\nfunction validateBinaryVersion(...command) {\n  command.push(\"--version\");\n  let stdout;\n  try {\n "
+        }
+      ],
+      "candidate_evidence": [
+        {
+          "path": "install.js",
+          "line": 96,
+          "column": 19,
+          "excerpt": "var packageJSON = require(path2.join(__dirname, \"package.json\"));\nvar toPath = path2.join(__dirname, \"bin\", \"esbuild\");\nvar isToPathJS = true;\nfunction validateBinaryVersion(...command) {\n  command.push(\"--version\");\n  let stdout;\n  try {\n "
+        }
+      ]
+    },
+    {
+      "name": "escodegen",
+      "version": "2.1.0",
+      "split": "tuning",
+      "rule_id": "dynamic-require",
+      "baseline": true,
+      "candidate": true,
+      "review": "capability-evidence",
+      "reason": "A computed module request or loader fallback supports a capability tag.",
+      "baseline_evidence": [
+        {
+          "path": "bin/escodegen.js",
+          "line": 32,
+          "column": 17,
+          "excerpt": "    escodegen = require(root),\n    optionator = require('optionator')({\n        prepend: 'Usage: escodegen [options] file...',\n        options: [\n            {\n                option: 'config',\n                alias: 'c',\n                ty"
+        }
+      ],
+      "candidate_evidence": [
+        {
+          "path": "bin/escodegen.js",
+          "line": 32,
+          "column": 17,
+          "excerpt": "    escodegen = require(root),\n    optionator = require('optionator')({\n        prepend: 'Usage: escodegen [options] file...',\n        options: [\n            {\n                option: 'config',\n                alias: 'c',\n                ty"
+        }
+      ]
+    },
+    {
+      "name": "eslint",
+      "version": "10.10.0",
+      "split": "validation",
+      "rule_id": "dynamic-require",
+      "baseline": true,
+      "candidate": true,
+      "review": "capability-evidence",
+      "reason": "A computed module request or loader fallback supports a capability tag.",
+      "baseline_evidence": [
+        {
+          "path": "lib/config/config-loader.js",
+          "line": 169,
+          "column": 28,
+          "excerpt": "\tconst config = await jiti.import(fileURL.href);\n\n\timportedConfigFileModificationTime.set(filePath, mtime);\n\n\treturn config?.default ?? config;\n}\n\n   \n                                                         \n                               "
+        }
+      ],
+      "candidate_evidence": [
+        {
+          "path": "bin/eslint.js",
+          "line": 107,
+          "column": 21,
+          "excerpt": "\t\t\tconst template = require(`../messages/${error.messageTemplate}.js`);\n\n\t\t\treturn template(error.messageData || {});\n\t\t} catch {\n\t\t\t                                                            \n\t\t}\n\t}\n\n\t                                     "
+        }
+      ]
+    },
+    {
+      "name": "eslint-config-prettier",
+      "version": "10.1.8",
+      "split": "validation",
+      "rule_id": "dynamic-require",
+      "baseline": true,
+      "candidate": true,
+      "review": "capability-evidence",
+      "reason": "A computed module request or loader fallback supports a capability tag.",
+      "baseline_evidence": [
+        {
+          "path": "bin/cli.js",
+          "line": 12,
+          "column": 3,
+          "excerpt": "  require(\n    require.resolve(request, {\n      paths: [process.cwd(), ...require.resolve.paths(\"eslint\")],\n    })\n  );\n\nlet experimentalApi = {};\ntry {\n  experimentalApi = localRequire(\"eslint/use-at-your-own-risk\");\n} catch (_error) {}\n\nc"
+        }
+      ],
+      "candidate_evidence": [
+        {
+          "path": "bin/cli.js",
+          "line": 12,
+          "column": 3,
+          "excerpt": "  require(\n    require.resolve(request, {\n      paths: [process.cwd(), ...require.resolve.paths(\"eslint\")],\n    })\n  );\n\nlet experimentalApi = {};\ntry {\n  experimentalApi = localRequire(\"eslint/use-at-your-own-risk\");\n} catch (_error) {}\n\nc"
+        }
+      ]
+    },
+    {
+      "name": "eslint-module-utils",
+      "version": "2.14.0",
+      "split": "validation",
+      "rule_id": "dynamic-require",
+      "baseline": true,
+      "candidate": true,
+      "review": "capability-evidence",
+      "reason": "A computed module request or loader fallback supports a capability tag.",
+      "baseline_evidence": [
+        {
+          "path": "module-require.js",
+          "line": 25,
+          "column": 12,
+          "excerpt": "    return require(Module._resolveFilename(p, eslintModule));\n  } catch (err) {              }\n\n  try {\n                                  \n                                                     \n    return require.main.require(p);\n  } catch ("
+        }
+      ],
+      "candidate_evidence": [
+        {
+          "path": "module-require.js",
+          "line": 25,
+          "column": 12,
+          "excerpt": "    return require(Module._resolveFilename(p, eslintModule));\n  } catch (err) {              }\n\n  try {\n                                  \n                                                     \n    return require.main.require(p);\n  } catch ("
+        }
+      ]
+    },
+    {
+      "name": "eslint-plugin-react",
+      "version": "7.37.5",
+      "split": "validation",
+      "rule_id": "dynamic-require",
+      "baseline": true,
+      "candidate": true,
+      "review": "capability-evidence",
+      "reason": "A computed module request or loader fallback supports a capability tag.",
+      "baseline_evidence": [
+        {
+          "path": "lib/util/version.js",
+          "line": 89,
+          "column": 19,
+          "excerpt": "    const react = require(reactPath);                                                                 \n    cachedDetectedReactVersion = react.version;\n    return cachedDetectedReactVersion;\n  } catch (e) {\n    if (e.code === 'MODULE_NOT_FOU"
+        }
+      ],
+      "candidate_evidence": [
+        {
+          "path": "lib/util/version.js",
+          "line": 89,
+          "column": 19,
+          "excerpt": "    const react = require(reactPath);                                                                 \n    cachedDetectedReactVersion = react.version;\n    return cachedDetectedReactVersion;\n  } catch (e) {\n    if (e.code === 'MODULE_NOT_FOU"
+        }
+      ]
+    },
+    {
+      "name": "execa",
+      "version": "10.0.1",
+      "split": "tuning",
+      "rule_id": "child-process",
+      "baseline": true,
+      "candidate": true,
+      "review": "capability-evidence",
+      "reason": "A process API import or call supports a capability tag.",
+      "baseline_evidence": [
+        {
+          "path": "lib/methods/main-async.js",
+          "line": 2,
+          "column": 16,
+          "excerpt": "import {spawn} from 'node:child_process';\nimport {MaxBufferError} from 'get-stream';\nimport {handleCommand} from '../arguments/command.js';\nimport {normalizeOptions} from '../arguments/options.js';\nimport {SUBPROCESS_OPTIONS} from '../argum"
+        }
+      ],
+      "candidate_evidence": [
+        {
+          "path": "lib/methods/main-async.js",
+          "line": 2,
+          "column": 16,
+          "excerpt": "import {spawn} from 'node:child_process';\nimport {MaxBufferError} from 'get-stream';\nimport {handleCommand} from '../arguments/command.js';\nimport {normalizeOptions} from '../arguments/options.js';\nimport {SUBPROCESS_OPTIONS} from '../argum"
+        }
+      ]
+    },
+    {
+      "name": "execa",
+      "version": "10.0.1",
+      "split": "tuning",
+      "rule_id": "shell",
+      "baseline": true,
+      "candidate": false,
+      "review": "unproven-shell",
+      "reason": "The baseline inferred shell use from an import or an exec-named alias. Process capability remains detected. No supported shell invocation was established in the scanned code. Runtime options or downstream helpers can still select a shell. This removal is not evidence that the package cannot run a shell.",
+      "baseline_evidence": [
+        {
+          "path": "lib/methods/main-async.js",
+          "line": 2,
+          "column": 16,
+          "excerpt": "import {spawn} from 'node:child_process';\nimport {MaxBufferError} from 'get-stream';\nimport {handleCommand} from '../arguments/command.js';\nimport {normalizeOptions} from '../arguments/options.js';\nimport {SUBPROCESS_OPTIONS} from '../argum"
+        }
+      ],
+      "candidate_evidence": []
+    },
+    {
+      "name": "express",
+      "version": "5.2.1",
+      "split": "tuning",
+      "rule_id": "dynamic-require",
+      "baseline": true,
+      "candidate": true,
+      "review": "capability-evidence",
+      "reason": "A computed module request or loader fallback supports a capability tag.",
+      "baseline_evidence": [
+        {
+          "path": "lib/view.js",
+          "line": 81,
+          "column": 14,
+          "excerpt": "    var fn = require(mod).__express\n\n    if (typeof fn !== 'function') {\n      throw new Error('Module \"' + mod + '\" does not provide a view engine.')\n    }\n\n    opts.engines[this.ext] = fn\n  }\n\n                        \n  this.engine = opts"
+        }
+      ],
+      "candidate_evidence": [
+        {
+          "path": "lib/view.js",
+          "line": 81,
+          "column": 14,
+          "excerpt": "    var fn = require(mod).__express\n\n    if (typeof fn !== 'function') {\n      throw new Error('Module \"' + mod + '\" does not provide a view engine.')\n    }\n\n    opts.engines[this.ext] = fn\n  }\n\n                        \n  this.engine = opts"
+        }
+      ]
+    },
+    {
+      "name": "fast-json-stable-stringify",
+      "version": "2.1.0",
+      "split": "tuning",
+      "rule_id": "dynamic-require",
+      "baseline": true,
+      "candidate": true,
+      "review": "capability-evidence",
+      "reason": "A computed module request or loader fallback supports a capability tag.",
+      "baseline_evidence": [
+        {
+          "path": "benchmark/index.js",
+          "line": 19,
+          "column": 29,
+          "excerpt": "  if (func === true) func = require(name);\n\n  suite.add(name, function() {\n    func(testData);\n  });\n}\n\nsuite\n  .on('cycle', (event) => console.log(String(event.target)))\n  .on('complete', function () {\n    console.log('The fastest is ' + t"
+        }
+      ],
+      "candidate_evidence": [
+        {
+          "path": "benchmark/index.js",
+          "line": 19,
+          "column": 29,
+          "excerpt": "  if (func === true) func = require(name);\n\n  suite.add(name, function() {\n    func(testData);\n  });\n}\n\nsuite\n  .on('cycle', (event) => console.log(String(event.target)))\n  .on('complete', function () {\n    console.log('The fastest is ' + t"
+        }
+      ]
+    },
+    {
+      "name": "fb-watchman",
+      "version": "2.0.2",
+      "split": "tuning",
+      "rule_id": "child-process",
+      "baseline": true,
+      "candidate": true,
+      "review": "capability-evidence",
+      "reason": "A process API import or call supports a capability tag.",
+      "baseline_evidence": [
+        {
+          "path": "index.js",
+          "line": 13,
+          "column": 20,
+          "excerpt": "var childProcess = require('child_process');\nvar bser = require('bser');\n\n                                                                  \nvar unilateralTags = ['subscription', 'log'];\n\n   \n                                                "
+        }
+      ],
+      "candidate_evidence": [
+        {
+          "path": "index.js",
+          "line": 13,
+          "column": 20,
+          "excerpt": "var childProcess = require('child_process');\nvar bser = require('bser');\n\n                                                                  \nvar unilateralTags = ['subscription', 'log'];\n\n   \n                                                "
+        }
+      ]
+    },
+    {
+      "name": "file-type",
+      "version": "22.1.0",
+      "split": "tuning",
+      "rule_id": "dynamic-require",
+      "baseline": true,
+      "candidate": true,
+      "review": "capability-evidence",
+      "reason": "A computed module request or loader fallback supports a capability tag.",
+      "baseline_evidence": [
+        {
+          "path": "source/index.js",
+          "line": 67,
+          "column": 9,
+          "excerpt": "\treturn import(                                             specifier);\n}\n\n                                                                    \n                                                                            \n                   "
+        }
+      ],
+      "candidate_evidence": [
+        {
+          "path": "source/index.js",
+          "line": 67,
+          "column": 9,
+          "excerpt": "\treturn import(                                             specifier);\n}\n\n                                                                    \n                                                                            \n                   "
+        }
+      ]
+    },
+    {
+      "name": "foreground-child",
+      "version": "4.0.3",
+      "split": "validation",
+      "rule_id": "child-process",
+      "baseline": true,
+      "candidate": true,
+      "review": "capability-evidence",
+      "reason": "A process API import or call supports a capability tag.",
+      "baseline_evidence": [
+        {
+          "path": "dist/commonjs/index.js",
+          "line": 5,
+          "column": 30,
+          "excerpt": "const node_child_process_1 = require(\"node:child_process\");\nconst signal_exit_1 = require(\"signal-exit\");\nconst proxy_signals_js_1 = require(\"./proxy-signals.js\");\nconst watchdog_js_1 = require(\"./watchdog.js\");\n   \n                        "
+        }
+      ],
+      "candidate_evidence": [
+        {
+          "path": "dist/commonjs/index.js",
+          "line": 5,
+          "column": 30,
+          "excerpt": "const node_child_process_1 = require(\"node:child_process\");\nconst signal_exit_1 = require(\"signal-exit\");\nconst proxy_signals_js_1 = require(\"./proxy-signals.js\");\nconst watchdog_js_1 = require(\"./watchdog.js\");\n   \n                        "
+        }
+      ]
+    },
+    {
+      "name": "foreground-child",
+      "version": "4.0.3",
+      "split": "validation",
+      "rule_id": "shell",
+      "baseline": true,
+      "candidate": false,
+      "review": "unproven-shell",
+      "reason": "The baseline inferred shell use from an import or an exec-named alias. Process capability remains detected. No supported shell invocation was established in the scanned code. Runtime options or downstream helpers can still select a shell. This removal is not evidence that the package cannot run a shell.",
+      "baseline_evidence": [
+        {
+          "path": "dist/esm/index.js",
+          "line": 1,
+          "column": 19,
+          "excerpt": "import { spawn, } from 'node:child_process';\nimport { onExit } from 'signal-exit';\nimport { proxySignals } from './proxy-signals.js';\nimport { watchdog } from './watchdog.js';\n   \n                                                        \n  \n"
+        }
+      ],
+      "candidate_evidence": []
+    },
+    {
+      "name": "gaxios",
+      "version": "8.0.0",
+      "split": "tuning",
+      "rule_id": "child-process",
+      "baseline": true,
+      "candidate": true,
+      "review": "capability-evidence",
+      "reason": "A process API import or call supports a capability tag.",
+      "baseline_evidence": [
+        {
+          "path": "build/cjs/browser-test/browser-test-runner.js",
+          "line": 52,
+          "column": 25,
+          "excerpt": "const child_process_1 = require(\"child_process\");\nconst multiparty = __importStar(require(\"multiparty\"));\nconst cors_1 = __importDefault(require(\"cors\"));\nconst util_1 = require(\"util\");\nconst port = 7172;\nconst exec = (0, util_1.promisify)"
+        }
+      ],
+      "candidate_evidence": [
+        {
+          "path": "build/cjs/browser-test/browser-test-runner.js",
+          "line": 52,
+          "column": 25,
+          "excerpt": "const child_process_1 = require(\"child_process\");\nconst multiparty = __importStar(require(\"multiparty\"));\nconst cors_1 = __importDefault(require(\"cors\"));\nconst util_1 = require(\"util\");\nconst port = 7172;\nconst exec = (0, util_1.promisify)"
+        }
+      ]
+    },
+    {
+      "name": "gaxios",
+      "version": "8.0.0",
+      "split": "tuning",
+      "rule_id": "shell",
+      "baseline": true,
+      "candidate": false,
+      "review": "unproven-shell",
+      "reason": "The baseline inferred shell use from an import or an exec-named alias. Process capability remains detected. No supported shell invocation was established in the scanned code.",
+      "baseline_evidence": [
+        {
+          "path": "build/cjs/browser-test/browser-test-runner.js",
+          "line": 102,
+          "column": 11,
+          "excerpt": "    await exec('karma', ['start']);\n    server.close();\n    console.log(`[http server] Karma has finished! I'm no longer listening on port ${port}!`);\n}\nmain().catch(err => {\n    console.log('Error:', err);\n});\n                             "
+        }
+      ],
+      "candidate_evidence": []
+    },
+    {
+      "name": "google-auth-library",
+      "version": "11.0.2",
+      "split": "tuning",
+      "rule_id": "child-process",
+      "baseline": true,
+      "candidate": true,
+      "review": "capability-evidence",
+      "reason": "A process API import or call supports a capability tag.",
+      "baseline_evidence": [
+        {
+          "path": "build/src/auth/googleauth.js",
+          "line": 17,
+          "column": 25,
+          "excerpt": "const child_process_1 = require(\"child_process\");\nconst fs = require(\"fs\");\nconst gaxios_1 = require(\"gaxios\");\nconst gcpMetadata = require(\"gcp-metadata\");\nconst os = require(\"os\");\nconst path = require(\"path\");\nconst crypto_1 = require(\"."
+        }
+      ],
+      "candidate_evidence": [
+        {
+          "path": "build/src/auth/googleauth.js",
+          "line": 17,
+          "column": 25,
+          "excerpt": "const child_process_1 = require(\"child_process\");\nconst fs = require(\"fs\");\nconst gaxios_1 = require(\"gaxios\");\nconst gcpMetadata = require(\"gcp-metadata\");\nconst os = require(\"os\");\nconst path = require(\"path\");\nconst crypto_1 = require(\"."
+        }
+      ]
+    },
+    {
+      "name": "google-auth-library",
+      "version": "11.0.2",
+      "split": "tuning",
+      "rule_id": "shell",
+      "baseline": false,
+      "candidate": true,
+      "review": "capability-evidence",
+      "reason": "A shell API call or shell option supports a capability tag.",
+      "baseline_evidence": [],
+      "candidate_evidence": [
+        {
+          "path": "build/src/auth/googleauth.js",
+          "line": 616,
+          "column": 13,
+          "excerpt": "            (0, child_process_1.exec)('gcloud config config-helper --format json', (err, stdout) => {\n                if (!err && stdout) {\n                    try {\n                        const projectId = JSON.parse(stdout).configuration"
+        }
+      ]
+    },
+    {
+      "name": "immediate",
+      "version": "3.3.0",
+      "split": "validation",
+      "rule_id": "dynamic-require",
+      "baseline": false,
+      "candidate": true,
+      "review": "capability-evidence",
+      "reason": "A computed module request or loader fallback supports a capability tag.",
+      "baseline_evidence": [],
+      "candidate_evidence": [
+        {
+          "path": "dist/immediate.js",
+          "line": 1,
+          "column": 494,
+          "excerpt": "){var c=\"function\"==typeof require&&require;if(!f&&c)return c(i,!0);if(u)return u(i,!0);var a=new Error(\"Cannot find module '\"+i+\"'\");throw a.code=\"MODULE_NOT_FOUND\",a}var p=n[i]={exports:{}};e[i][0].call(p.exports,function(r){var n=e[i][1]"
+        }
+      ]
+    },
+    {
+      "name": "import-fresh",
+      "version": "4.0.0",
+      "split": "tuning",
+      "rule_id": "dynamic-require",
+      "baseline": true,
+      "candidate": true,
+      "review": "capability-evidence",
+      "reason": "A computed module request or loader fallback supports a capability tag.",
+      "baseline_evidence": [
+        {
+          "path": "index.js",
+          "line": 939,
+          "column": 48,
+          "excerpt": "\t\t\t\tconst loadedModule = importOptions ? await import(freshSpecifier, importOptions) : await import(freshSpecifier);\n\t\t\t\tawait waitForNextEventLoopTurn();\n\t\t\t\treturn loadedModule;\n\t\t\t});\n\t\t\treturn moduleNamespace;\n\t\t} finally {\n\t\t\tif (hasAc"
+        }
+      ],
+      "candidate_evidence": [
+        {
+          "path": "index.js",
+          "line": 939,
+          "column": 48,
+          "excerpt": "\t\t\t\tconst loadedModule = importOptions ? await import(freshSpecifier, importOptions) : await import(freshSpecifier);\n\t\t\t\tawait waitForNextEventLoopTurn();\n\t\t\t\treturn loadedModule;\n\t\t\t});\n\t\t\treturn moduleNamespace;\n\t\t} finally {\n\t\t\tif (hasAc"
+        }
+      ]
+    },
+    {
+      "name": "import-in-the-middle",
+      "version": "3.5.1",
+      "split": "validation",
+      "rule_id": "dynamic-require",
+      "baseline": true,
+      "candidate": true,
+      "review": "capability-evidence",
+      "reason": "The initial validation candidate missed a createRequire assignment after declaration. A regression test and bounded assignment propagation restored this tag.",
+      "baseline_evidence": [
+        {
+          "path": "lib/get-exports.mjs",
+          "line": 57,
+          "column": 10,
+          "excerpt": "  return require(name)\n}\n\nfunction getExportsForNodeBuiltIn (name) {\n  let exports = BUILT_INS.get(name)\n\n  if (!exports) {\n                                                            \n    exports = addDefault(Object.getOwnPropertyNames(loa"
+        }
+      ],
+      "candidate_evidence": [
+        {
+          "path": "lib/get-exports.mjs",
+          "line": 57,
+          "column": 10,
+          "excerpt": "  return require(name)\n}\n\nfunction getExportsForNodeBuiltIn (name) {\n  let exports = BUILT_INS.get(name)\n\n  if (!exports) {\n                                                            \n    exports = addDefault(Object.getOwnPropertyNames(loa"
+        }
+      ]
+    },
+    {
+      "name": "import-local",
+      "version": "3.2.0",
+      "split": "tuning",
+      "rule_id": "dynamic-require",
+      "baseline": true,
+      "candidate": true,
+      "review": "capability-evidence",
+      "reason": "A computed module request or loader fallback supports a capability tag.",
+      "baseline_evidence": [
+        {
+          "path": "index.js",
+          "line": 11,
+          "column": 14,
+          "excerpt": "\tconst pkg = require(path.join(globalDir, 'package.json'));\n\tconst localFile = resolveCwd.silent(path.join(pkg.name, relativePath));\n\tconst localNodeModules = path.join(process.cwd(), 'node_modules');\n\n\tconst filenameInLocalNodeModules = !p"
+        }
+      ],
+      "candidate_evidence": [
+        {
+          "path": "index.js",
+          "line": 11,
+          "column": 14,
+          "excerpt": "\tconst pkg = require(path.join(globalDir, 'package.json'));\n\tconst localFile = resolveCwd.silent(path.join(pkg.name, relativePath));\n\tconst localNodeModules = path.join(process.cwd(), 'node_modules');\n\n\tconst filenameInLocalNodeModules = !p"
+        }
+      ]
+    },
+    {
+      "name": "istanbul-reports",
+      "version": "3.2.0",
+      "split": "tuning",
+      "rule_id": "dynamic-require",
+      "baseline": true,
+      "candidate": true,
+      "review": "capability-evidence",
+      "reason": "A computed module request or loader fallback supports a capability tag.",
+      "baseline_evidence": [
+        {
+          "path": "index.js",
+          "line": 13,
+          "column": 20,
+          "excerpt": "            Cons = require(path.join(__dirname, 'lib', name));\n        } catch (e) {\n            if (e.code !== 'MODULE_NOT_FOUND') {\n                throw e;\n            }\n\n            Cons = require(name);\n        }\n\n        return new Co"
+        }
+      ],
+      "candidate_evidence": [
+        {
+          "path": "index.js",
+          "line": 13,
+          "column": 20,
+          "excerpt": "            Cons = require(path.join(__dirname, 'lib', name));\n        } catch (e) {\n            if (e.code !== 'MODULE_NOT_FOUND') {\n                throw e;\n            }\n\n            Cons = require(name);\n        }\n\n        return new Co"
+        }
+      ]
+    },
+    {
+      "name": "jest-changed-files",
+      "version": "30.5.1",
+      "split": "tuning",
+      "rule_id": "shell",
+      "baseline": true,
+      "candidate": false,
+      "review": "unproven-shell",
+      "reason": "The baseline inferred shell use from an import or an exec-named alias. Process capability remains detected. No supported shell invocation was established in the scanned code.",
+      "baseline_evidence": [
+        {
+          "path": "build/index.js",
+          "line": 30,
+          "column": 39,
+          "excerpt": "  const data = _interopRequireDefault(require(\"execa\"));\n  _execa = function () {\n    return data;\n  };\n  return data;\n}\nfunction _interopRequireDefault(e) { return e && e.__esModule ? e : { default: e }; }\nfunction _interopRequireWildcard("
+        }
+      ],
+      "candidate_evidence": []
+    },
+    {
+      "name": "jest-haste-map",
+      "version": "30.5.1",
+      "split": "tuning",
+      "rule_id": "child-process",
+      "baseline": true,
+      "candidate": true,
+      "review": "capability-evidence",
+      "reason": "A process API import or call supports a capability tag.",
+      "baseline_evidence": [
+        {
+          "path": "build/index.js",
+          "line": 429,
+          "column": 16,
+          "excerpt": "  const data = require(\"node:child_process\");\n  _nodeChild_process = function () {\n    return data;\n  };\n  return data;\n}\nfunction path() {\n  const data = _interopRequireWildcard(require(\"node:path\"));\n  path = function () {\n    return data"
+        }
+      ],
+      "candidate_evidence": [
+        {
+          "path": "build/index.js",
+          "line": 429,
+          "column": 16,
+          "excerpt": "  const data = require(\"node:child_process\");\n  _nodeChild_process = function () {\n    return data;\n  };\n  return data;\n}\nfunction path() {\n  const data = _interopRequireWildcard(require(\"node:path\"));\n  path = function () {\n    return data"
+        }
+      ]
+    },
+    {
+      "name": "jest-haste-map",
+      "version": "30.5.1",
+      "split": "tuning",
+      "rule_id": "dynamic-require",
+      "baseline": true,
+      "candidate": true,
+      "review": "capability-evidence",
+      "reason": "A computed module request or loader fallback supports a capability tag.",
+      "baseline_evidence": [
+        {
+          "path": "build/index.js",
+          "line": 2624,
+          "column": 48,
+          "excerpt": "  const hasteImpl = data.hasteImplModulePath ? require(data.hasteImplModulePath) : null;\n  let content;\n  let dependencies;\n  let id;\n  let module;\n  let sha1;\n  const {\n    computeDependencies,\n    computeSha1,\n    rootDir,\n    filePath\n  "
+        }
+      ],
+      "candidate_evidence": [
+        {
+          "path": "build/index.js",
+          "line": 2624,
+          "column": 48,
+          "excerpt": "  const hasteImpl = data.hasteImplModulePath ? require(data.hasteImplModulePath) : null;\n  let content;\n  let dependencies;\n  let id;\n  let module;\n  let sha1;\n  const {\n    computeDependencies,\n    computeSha1,\n    rootDir,\n    filePath\n  "
+        }
+      ]
+    },
+    {
+      "name": "jest-resolve",
+      "version": "30.5.1",
+      "split": "tuning",
+      "rule_id": "dynamic-require",
+      "baseline": true,
+      "candidate": true,
+      "review": "capability-evidence",
+      "reason": "A computed module request or loader fallback supports a capability tag.",
+      "baseline_evidence": [
+        {
+          "path": "build/index.js",
+          "line": 1400,
+          "column": 33,
+          "excerpt": "    return toResolver(resolver, require(resolver));\n  } catch (error) {\n    if (error.code === 'ERR_REQUIRE_ESM' || error.code === 'ERR_REQUIRE_ASYNC_MODULE') {\n      throw new Error(`Jest: resolver located at ${resolver} could not be loade"
+        }
+      ],
+      "candidate_evidence": [
+        {
+          "path": "build/index.js",
+          "line": 1400,
+          "column": 33,
+          "excerpt": "    return toResolver(resolver, require(resolver));\n  } catch (error) {\n    if (error.code === 'ERR_REQUIRE_ESM' || error.code === 'ERR_REQUIRE_ASYNC_MODULE') {\n      throw new Error(`Jest: resolver located at ${resolver} could not be loade"
+        }
+      ]
+    },
+    {
+      "name": "jest-runner",
+      "version": "30.5.1",
+      "split": "tuning",
+      "rule_id": "dynamic-require",
+      "baseline": true,
+      "candidate": true,
+      "review": "capability-evidence",
+      "reason": "A computed module request or loader fallback supports a capability tag.",
+      "baseline_evidence": [
+        {
+          "path": "build/index.js",
+          "line": 149,
+          "column": 82,
+          "excerpt": " _jestUtil().interopRequireDefault)(projectConfig.runtime ? require(projectConfig.runtime) : require('jest-runtime')).default;\n  const consoleOut = globalConfig.useStderr ? process.stderr : process.stdout;\n  const consoleFormatter = (type, "
+        }
+      ],
+      "candidate_evidence": [
+        {
+          "path": "build/index.js",
+          "line": 149,
+          "column": 82,
+          "excerpt": " _jestUtil().interopRequireDefault)(projectConfig.runtime ? require(projectConfig.runtime) : require('jest-runtime')).default;\n  const consoleOut = globalConfig.useStderr ? process.stderr : process.stdout;\n  const consoleFormatter = (type, "
+        }
+      ]
+    },
+    {
+      "name": "jest-runtime",
+      "version": "30.5.1",
+      "split": "tuning",
+      "rule_id": "child-process",
+      "baseline": true,
+      "candidate": true,
+      "review": "capability-evidence",
+      "reason": "A process API import or call supports a capability tag.",
+      "baseline_evidence": [
+        {
+          "path": "__benchmarks__/test.js",
+          "line": 47,
+          "column": 21,
+          "excerpt": "const {spawnSync} = require('node:child_process');\nconst os = require('node:os');\nconst path = require('node:path');\nconst fs = require('graceful-fs');\n\nconst NODE_COUNT = 2047;                                   \nconst RUNS = 5;\n\nconst JEST"
+        }
+      ],
+      "candidate_evidence": [
+        {
+          "path": "__benchmarks__/test.js",
+          "line": 47,
+          "column": 21,
+          "excerpt": "const {spawnSync} = require('node:child_process');\nconst os = require('node:os');\nconst path = require('node:path');\nconst fs = require('graceful-fs');\n\nconst NODE_COUNT = 2047;                                   \nconst RUNS = 5;\n\nconst JEST"
+        }
+      ]
+    },
+    {
+      "name": "jest-runtime",
+      "version": "30.5.1",
+      "split": "tuning",
+      "rule_id": "dynamic-require",
+      "baseline": true,
+      "candidate": true,
+      "review": "capability-evidence",
+      "reason": "A computed module request or loader fallback supports a capability tag.",
+      "baseline_evidence": [
+        {
+          "path": "build/index.js",
+          "line": 291,
+          "column": 30,
+          "excerpt": "      return this.coreModule.require(moduleName);\n    }\n    const isInternal = options?.isInternalModule ?? false;\n    let modulePath;\n\n                                                                              \n                         "
+        }
+      ],
+      "candidate_evidence": [
+        {
+          "path": "build/index.js",
+          "line": 291,
+          "column": 14,
+          "excerpt": "      return this.coreModule.require(moduleName);\n    }\n    const isInternal = options?.isInternalModule ?? false;\n    let modulePath;\n\n                                                                              \n                         "
+        }
+      ]
+    },
+    {
+      "name": "jest-snapshot",
+      "version": "30.5.1",
+      "split": "tuning",
+      "rule_id": "dynamic-require",
+      "baseline": true,
+      "candidate": true,
+      "review": "capability-evidence",
+      "reason": "A computed module request or loader fallback supports a capability tag.",
+      "baseline_evidence": [
+        {
+          "path": "build/index.js",
+          "line": 43,
+          "column": 18,
+          "excerpt": "  const semver = require(require.resolve('semver', {\n    [Symbol.for('jest-resolve-outside-vm-option')]: true\n  }));\n  return semver.gte(version, other);\n}\nfunction saveInlineSnapshots(snapshots, rootDir, prettierPath) {\n  let prettier = pr"
+        }
+      ],
+      "candidate_evidence": [
+        {
+          "path": "build/index.js",
+          "line": 43,
+          "column": 18,
+          "excerpt": "  const semver = require(require.resolve('semver', {\n    [Symbol.for('jest-resolve-outside-vm-option')]: true\n  }));\n  return semver.gte(version, other);\n}\nfunction saveInlineSnapshots(snapshots, rootDir, prettierPath) {\n  let prettier = pr"
+        }
+      ]
+    },
+    {
+      "name": "jest-util",
+      "version": "30.5.1",
+      "split": "tuning",
+      "rule_id": "dynamic-require",
+      "baseline": true,
+      "candidate": true,
+      "review": "capability-evidence",
+      "reason": "A computed module request or loader fallback supports a capability tag.",
+      "baseline_evidence": [
+        {
+          "path": "build/index.js",
+          "line": 1077,
+          "column": 28,
+          "excerpt": "    const requiredModule = require(filePath);\n    if (!applyInteropRequireDefault) {\n      return requiredModule;\n    }\n    return (0, _interopRequireDefault.default)(requiredModule).default;\n  } catch (error) {\n    if (error.code === 'ERR_"
+        }
+      ],
+      "candidate_evidence": [
+        {
+          "path": "build/index.js",
+          "line": 1052,
+          "column": 34,
+          "excerpt": "    const importedModule = await import(                         moduleUrl.href);\n    if (!applyInteropRequireDefault) {\n      return importedModule;\n    }\n    if (!importedModule.default) {\n      throw new Error(`Jest: Failed to load ESM a"
+        }
+      ]
+    },
+    {
+      "name": "jest-worker",
+      "version": "30.5.1",
+      "split": "tuning",
+      "rule_id": "child-process",
+      "baseline": true,
+      "candidate": true,
+      "review": "capability-evidence",
+      "reason": "A process API import or call supports a capability tag.",
+      "baseline_evidence": [
+        {
+          "path": "build/index.js",
+          "line": 646,
+          "column": 16,
+          "excerpt": "  const data = require(\"node:child_process\");\n  _nodeChild_process = function () {\n    return data;\n  };\n  return data;\n}\nfunction _nodeOs() {\n  const data = require(\"node:os\");\n  _nodeOs = function () {\n    return data;\n  };\n  return data;"
+        }
+      ],
+      "candidate_evidence": [
+        {
+          "path": "build/index.js",
+          "line": 646,
+          "column": 16,
+          "excerpt": "  const data = require(\"node:child_process\");\n  _nodeChild_process = function () {\n    return data;\n  };\n  return data;\n}\nfunction _nodeOs() {\n  const data = require(\"node:os\");\n  _nodeOs = function () {\n    return data;\n  };\n  return data;"
+        }
+      ]
+    },
+    {
+      "name": "jest-worker",
+      "version": "30.5.1",
+      "split": "tuning",
+      "rule_id": "dynamic-require",
+      "baseline": true,
+      "candidate": true,
+      "review": "capability-evidence",
+      "reason": "A computed module request or loader fallback supports a capability tag.",
+      "baseline_evidence": [
+        {
+          "path": "build/index.js",
+          "line": 1790,
+          "column": 20,
+          "excerpt": "    const module = require(workerPath);\n    exposedMethods = Object.keys(module).filter(name => typeof module[name] === 'function');\n    if (typeof module === 'function') {\n      exposedMethods = [...exposedMethods, 'default'];\n    }\n  }\n  "
+        }
+      ],
+      "candidate_evidence": [
+        {
+          "path": "build/index.js",
+          "line": 1790,
+          "column": 20,
+          "excerpt": "    const module = require(workerPath);\n    exposedMethods = Object.keys(module).filter(name => typeof module[name] === 'function');\n    if (typeof module === 'function') {\n      exposedMethods = [...exposedMethods, 'default'];\n    }\n  }\n  "
+        }
+      ]
+    },
+    {
+      "name": "jiti",
+      "version": "2.7.0",
+      "split": "tuning",
+      "rule_id": "dynamic-require",
+      "baseline": true,
+      "candidate": true,
+      "review": "capability-evidence",
+      "reason": "A computed module request or loader fallback supports a capability tag.",
+      "baseline_evidence": [
+        {
+          "path": "dist/jiti.cjs",
+          "line": 1,
+          "column": 189763,
+          "excerpt": "ansform(O,e),evalModule:(e,t)=>eval_evalModule(O,e,t),async import(e,t){const i=await jitiRequire(O,e,{...t,async:!0});return t?.default?i?.default??i:i},esmResolve(e,t){\"string\"==typeof t&&(t={parentURL:t});const i=jitiResolve(O,e,{parentU"
+        }
+      ],
+      "candidate_evidence": [
+        {
+          "path": "lib/jiti-native.mjs",
+          "line": 58,
+          "column": 24,
+          "excerpt": "          return await import(resolved, importAttrs);\n        } catch (error) {\n          if (error.code === 'ERR_MODULE_NOT_FOUND' || error.code === 'ERR_UNSUPPORTED_DIR_IMPORT') {\n            continue\n          }\n          if (opts?.try) "
+        }
+      ]
+    },
+    {
+      "name": "jsdom",
+      "version": "30.0.1",
+      "split": "tuning",
+      "rule_id": "eval",
+      "baseline": true,
+      "candidate": true,
+      "review": "capability-evidence",
+      "reason": "Runtime code generation or evaluation supports a capability tag.",
+      "baseline_evidence": [
+        {
+          "path": "lib/generated/idl/utils.js",
+          "line": 54,
+          "column": 22,
+          "excerpt": "        globalObject.eval(\"(async function* () {})\").prototype\n      )\n    );\n  } catch {\n    ctorRegistry[\"%AsyncIteratorPrototype%\"] = AsyncIteratorPrototype;\n  }\n\n  globalObject[ctorRegistrySymbol] = ctorRegistry;\n  return ctorRegistry;\n"
+        }
+      ],
+      "candidate_evidence": [
+        {
+          "path": "lib/generated/idl/utils.js",
+          "line": 54,
+          "column": 22,
+          "excerpt": "        globalObject.eval(\"(async function* () {})\").prototype\n      )\n    );\n  } catch {\n    ctorRegistry[\"%AsyncIteratorPrototype%\"] = AsyncIteratorPrototype;\n  }\n\n  globalObject[ctorRegistrySymbol] = ctorRegistry;\n  return ctorRegistry;\n"
+        }
+      ]
+    },
+    {
+      "name": "json5",
+      "version": "2.2.3",
+      "split": "validation",
+      "rule_id": "child-process",
+      "baseline": true,
+      "candidate": false,
+      "review": "unsupported-match",
+      "reason": "A bundled feature probe invokes its exec callback.",
+      "baseline_evidence": [
+        {
+          "path": "dist/index.js",
+          "line": 37,
+          "column": 15,
+          "excerpt": "\t    return !!exec();\n\t  } catch (e) {\n\t    return true;\n\t  }\n\t};\n\n\t                                           \n\tvar _descriptors = !_fails(function () {\n\t  return Object.defineProperty({}, 'a', { get: function () { return 7; } }).a != 7;\n\t"
+        }
+      ],
+      "candidate_evidence": []
+    },
+    {
+      "name": "lie",
+      "version": "3.3.0",
+      "split": "tuning",
+      "rule_id": "dynamic-require",
+      "baseline": false,
+      "candidate": true,
+      "review": "capability-evidence",
+      "reason": "A computed module request or loader fallback supports a capability tag.",
+      "baseline_evidence": [],
+      "candidate_evidence": [
+        {
+          "path": "dist/lie.js",
+          "line": 1,
+          "column": 481,
+          "excerpt": "){var a=typeof require==\"function\"&&require;if(!u&&a)return a(o,!0);if(i)return i(o,!0);var f=new Error(\"Cannot find module '\"+o+\"'\");throw f.code=\"MODULE_NOT_FOUND\",f}var l=n[o]={exports:{}};t[o][0].call(l.exports,function(e){var n=t[o][1]"
+        }
+      ]
+    },
+    {
+      "name": "lightningcss",
+      "version": "1.33.0",
+      "split": "validation",
+      "rule_id": "dynamic-require",
+      "baseline": false,
+      "candidate": true,
+      "review": "capability-evidence",
+      "reason": "A computed module request or loader fallback supports a capability tag.",
+      "baseline_evidence": [],
+      "candidate_evidence": [
+        {
+          "path": "node/index.js",
+          "line": 18,
+          "column": 12,
+          "excerpt": "  native = require(`lightningcss-${parts.join('-')}`);\n} catch (err) {\n  native = require(`../lightningcss.${parts.join('-')}.node`);\n}\n\nmodule.exports.transform = wrap(native.transform);\nmodule.exports.transformStyleAttribute = wrap(native"
+        }
+      ]
+    },
+    {
+      "name": "lilconfig",
+      "version": "3.1.3",
+      "split": "validation",
+      "rule_id": "dynamic-require",
+      "baseline": true,
+      "candidate": true,
+      "review": "capability-evidence",
+      "reason": "A computed module request or loader fallback supports a capability tag.",
+      "baseline_evidence": [
+        {
+          "path": "src/index.js",
+          "line": 59,
+          "column": 21,
+          "excerpt": "\t\tconst mod = await import(                          fileUrl);\n\n\t\treturn mod.default;\n\t} catch (e) {\n\t\ttry {\n\t\t\treturn requireFunc(id);\n\t\t} catch (                   requireE) {\n\t\t\tif (\n\t\t\t\trequireE.code === 'ERR_REQUIRE_ESM' ||\n\t\t\t\t(requir"
+        }
+      ],
+      "candidate_evidence": [
+        {
+          "path": "src/index.js",
+          "line": 59,
+          "column": 21,
+          "excerpt": "\t\tconst mod = await import(                          fileUrl);\n\n\t\treturn mod.default;\n\t} catch (e) {\n\t\ttry {\n\t\t\treturn requireFunc(id);\n\t\t} catch (                   requireE) {\n\t\t\tif (\n\t\t\t\trequireE.code === 'ERR_REQUIRE_ESM' ||\n\t\t\t\t(requir"
+        }
+      ]
+    },
+    {
+      "name": "make-error",
+      "version": "1.3.6",
+      "split": "tuning",
+      "rule_id": "dynamic-require",
+      "baseline": false,
+      "candidate": true,
+      "review": "capability-evidence",
+      "reason": "A computed module request or loader fallback supports a capability tag.",
+      "baseline_evidence": [],
+      "candidate_evidence": [
+        {
+          "path": "dist/make-error.js",
+          "line": 1,
+          "column": 404,
+          "excerpt": "){var c=\"function\"==typeof require&&require;if(!f&&c)return c(i,!0);if(u)return u(i,!0);var a=new Error(\"Cannot find module '\"+i+\"'\");throw a.code=\"MODULE_NOT_FOUND\",a}var p=n[i]={exports:{}};e[i][0].call(p.exports,function(r){return o(e[i]"
+        }
+      ]
+    },
+    {
+      "name": "mz",
+      "version": "2.7.0",
+      "split": "tuning",
+      "rule_id": "child-process",
+      "baseline": true,
+      "candidate": true,
+      "review": "capability-evidence",
+      "reason": "A process API import or call supports a capability tag.",
+      "baseline_evidence": [
+        {
+          "path": "child_process.js",
+          "line": 3,
+          "column": 3,
+          "excerpt": "  require('child_process'),\n  exports, [\n    'exec',\n    'execFile',\n  ]\n)\n"
+        }
+      ],
+      "candidate_evidence": [
+        {
+          "path": "child_process.js",
+          "line": 3,
+          "column": 3,
+          "excerpt": "  require('child_process'),\n  exports, [\n    'exec',\n    'execFile',\n  ]\n)\n"
+        }
+      ]
+    },
+    {
+      "name": "node-addon-api",
+      "version": "8.9.2",
+      "split": "tuning",
+      "rule_id": "child-process",
+      "baseline": true,
+      "candidate": true,
+      "review": "capability-evidence",
+      "reason": "A process API import or call supports a capability tag.",
+      "baseline_evidence": [
+        {
+          "path": "tools/check-napi.js",
+          "line": 11,
+          "column": 17,
+          "excerpt": "  const child = require('child_process').spawn(command, argv, {\n    stdio: ['inherit', 'pipe', 'inherit']\n  });\n  let leftover = '';\n  let isNapi;\n  child.stdout.on('data', (chunk) => {\n    if (isNapi === undefined) {\n      chunk = (leftove"
+        }
+      ],
+      "candidate_evidence": [
+        {
+          "path": "tools/check-napi.js",
+          "line": 11,
+          "column": 17,
+          "excerpt": "  const child = require('child_process').spawn(command, argv, {\n    stdio: ['inherit', 'pipe', 'inherit']\n  });\n  let leftover = '';\n  let isNapi;\n  child.stdout.on('data', (chunk) => {\n    if (isNapi === undefined) {\n      chunk = (leftove"
+        }
+      ]
+    },
+    {
+      "name": "node-gyp",
+      "version": "13.0.2",
+      "split": "validation",
+      "rule_id": "child-process",
+      "baseline": true,
+      "candidate": true,
+      "review": "capability-evidence",
+      "reason": "A process API import or call supports a capability tag.",
+      "baseline_evidence": [
+        {
+          "path": "lib/find-visualstudio.js",
+          "line": 601,
+          "column": 9,
+          "excerpt": "  async execFile (exec, args) {\n    return await execFile(exec, args, { encoding: 'utf8' })\n  }\n}\n\nmodule.exports = VisualStudioFinder\n"
+        }
+      ],
+      "candidate_evidence": [
+        {
+          "path": "lib/node-gyp.js",
+          "line": 6,
+          "column": 22,
+          "excerpt": "const childProcess = require('child_process')\nconst { EventEmitter } = require('events')\n\nconst commands = [\n                          \n  'build',\n  'clean',\n  'configure',\n  'rebuild',\n                                                \n  'in"
+        }
+      ]
+    },
+    {
+      "name": "node-gyp",
+      "version": "13.0.2",
+      "split": "validation",
+      "rule_id": "dynamic-require",
+      "baseline": false,
+      "candidate": true,
+      "review": "capability-evidence",
+      "reason": "A computed module request or loader fallback supports a capability tag.",
+      "baseline_evidence": [],
+      "candidate_evidence": [
+        {
+          "path": "lib/node-gyp.js",
+          "line": 80,
+          "column": 32,
+          "excerpt": "      acc[command] = (argv) => require('./' + command)(this, argv)\n      return acc\n    }, {})\n\n    Object.defineProperty(this, 'version', {\n      enumerable: true,\n      get: function () { return this.package.version }\n    })\n  }\n\n     \n  "
+        }
+      ]
+    },
+    {
+      "name": "object-hash",
+      "version": "3.0.0",
+      "split": "tuning",
+      "rule_id": "dynamic-require",
+      "baseline": false,
+      "candidate": true,
+      "review": "capability-evidence",
+      "reason": "A computed module request or loader fallback supports a capability tag.",
+      "baseline_evidence": [],
+      "candidate_evidence": [
+        {
+          "path": "dist/object_hash.js",
+          "line": 1,
+          "column": 369,
+          "excerpt": "){var t=\"function\"==typeof require&&require;if(!e&&t)return t(n,!0);if(a)return a(n,!0);throw new Error(\"Cannot find module '\"+n+\"'\")}e=i[n]={exports:{}};o[n][0].call(e.exports,function(e){var t=o[n][1][e];return s(t||e)},e,e.exports,r,o,i,"
+        }
+      ]
+    },
+    {
+      "name": "object.assign",
+      "version": "4.1.7",
+      "split": "tuning",
+      "rule_id": "dynamic-require",
+      "baseline": false,
+      "candidate": true,
+      "review": "capability-evidence",
+      "reason": "A computed module request or loader fallback supports a capability tag.",
+      "baseline_evidence": [],
+      "candidate_evidence": [
+        {
+          "path": "dist/browser.js",
+          "line": 1,
+          "column": 125,
+          "excerpt": "){var c=\"function\"==typeof require&&require;if(!f&&c)return c(i,!0);if(u)return u(i,!0);var a=new Error(\"Cannot find module '\"+i+\"'\");throw a.code=\"MODULE_NOT_FOUND\",a}var p=n[i]={exports:{}};e[i][0].call(p.exports,function(r){var n=e[i][1]"
+        }
+      ]
+    },
+    {
+      "name": "open",
+      "version": "11.0.4",
+      "split": "tuning",
+      "rule_id": "child-process",
+      "baseline": true,
+      "candidate": true,
+      "review": "capability-evidence",
+      "reason": "A process API import or call supports a capability tag.",
+      "baseline_evidence": [
+        {
+          "path": "index.js",
+          "line": 4,
+          "column": 21,
+          "excerpt": "import childProcess from 'node:child_process';\nimport fs, {constants as fsConstants} from 'node:fs/promises';\nimport {\n\tisWsl,\n\tpowerShellPath,\n\tconvertWslPathToWindows,\n\tcanAccessPowerShell,\n\twslDefaultBrowser,\n} from 'wsl-utils';\nimport {"
+        }
+      ],
+      "candidate_evidence": [
+        {
+          "path": "index.js",
+          "line": 4,
+          "column": 21,
+          "excerpt": "import childProcess from 'node:child_process';\nimport fs, {constants as fsConstants} from 'node:fs/promises';\nimport {\n\tisWsl,\n\tpowerShellPath,\n\tconvertWslPathToWindows,\n\tcanAccessPowerShell,\n\twslDefaultBrowser,\n} from 'wsl-utils';\nimport {"
+        }
+      ]
+    },
+    {
+      "name": "open",
+      "version": "11.0.4",
+      "split": "tuning",
+      "rule_id": "shell",
+      "baseline": true,
+      "candidate": false,
+      "review": "unproven-shell",
+      "reason": "The baseline inferred shell use from an import or an exec-named alias. Process capability remains detected. No supported shell invocation was established in the scanned code. Runtime options or downstream helpers can still select a shell. This removal is not evidence that the package cannot run a shell.",
+      "baseline_evidence": [
+        {
+          "path": "index.js",
+          "line": 4,
+          "column": 21,
+          "excerpt": "import childProcess from 'node:child_process';\nimport fs, {constants as fsConstants} from 'node:fs/promises';\nimport {\n\tisWsl,\n\tpowerShellPath,\n\tconvertWslPathToWindows,\n\tcanAccessPowerShell,\n\twslDefaultBrowser,\n} from 'wsl-utils';\nimport {"
+        }
+      ],
+      "candidate_evidence": []
+    },
+    {
+      "name": "pnpm",
+      "version": "12.4.2",
+      "split": "validation",
+      "rule_id": "child-process",
+      "baseline": true,
+      "candidate": true,
+      "review": "capability-evidence",
+      "reason": "A process API import or call supports a capability tag.",
+      "baseline_evidence": [
+        {
+          "path": "bin/pnpm.mjs",
+          "line": 23,
+          "column": 22,
+          "excerpt": "import { spawnSync } from 'node:child_process'\nimport console from 'node:console'\nimport fs from 'node:fs'\nimport os from 'node:os'\nimport path from 'node:path'\nimport process from 'node:process'\nimport { URL } from 'node:url'\nimport { read"
+        }
+      ],
+      "candidate_evidence": [
+        {
+          "path": "bin/pnpm.mjs",
+          "line": 23,
+          "column": 22,
+          "excerpt": "import { spawnSync } from 'node:child_process'\nimport console from 'node:console'\nimport fs from 'node:fs'\nimport os from 'node:os'\nimport path from 'node:path'\nimport process from 'node:process'\nimport { URL } from 'node:url'\nimport { read"
+        }
+      ]
+    },
+    {
+      "name": "pnpm",
+      "version": "12.4.2",
+      "split": "validation",
+      "rule_id": "shell",
+      "baseline": true,
+      "candidate": false,
+      "review": "unproven-shell",
+      "reason": "The baseline inferred shell use from an import or an exec-named alias. Process capability remains detected. No supported shell invocation was established in the scanned code.",
+      "baseline_evidence": [
+        {
+          "path": "bin/pnpm.mjs",
+          "line": 23,
+          "column": 22,
+          "excerpt": "import { spawnSync } from 'node:child_process'\nimport console from 'node:console'\nimport fs from 'node:fs'\nimport os from 'node:os'\nimport path from 'node:path'\nimport process from 'node:process'\nimport { URL } from 'node:url'\nimport { read"
+        }
+      ],
+      "candidate_evidence": []
+    },
+    {
+      "name": "pnpm",
+      "version": "12.4.2",
+      "split": "validation",
+      "rule_id": "dynamic-require",
+      "baseline": true,
+      "candidate": true,
+      "review": "capability-evidence",
+      "reason": "A computed module request or loader fallback supports a capability tag.",
+      "baseline_evidence": [
+        {
+          "path": "bin/pnpm.mjs",
+          "line": 75,
+          "column": 44,
+          "excerpt": "  const { downloadPnpmExecutable } = await import(GET_PNPM).catch((err) => {\n    fail(`This copy of the pnpm package is missing the downloader it needs: ${err.message}`)\n  })\n  try {\n    await downloadPnpmExecutable({\n      version,\n      r"
+        }
+      ],
+      "candidate_evidence": [
+        {
+          "path": "bin/pnpm.mjs",
+          "line": 75,
+          "column": 44,
+          "excerpt": "  const { downloadPnpmExecutable } = await import(GET_PNPM).catch((err) => {\n    fail(`This copy of the pnpm package is missing the downloader it needs: ${err.message}`)\n  })\n  try {\n    await downloadPnpmExecutable({\n      version,\n      r"
+        }
+      ]
+    },
+    {
+      "name": "postcss-load-config",
+      "version": "6.0.1",
+      "split": "validation",
+      "rule_id": "dynamic-require",
+      "baseline": true,
+      "candidate": true,
+      "review": "capability-evidence",
+      "reason": "A computed module request or loader fallback supports a capability tag.",
+      "baseline_evidence": [
+        {
+          "path": "src/req.js",
+          "line": 39,
+          "column": 22,
+          "excerpt": "    let loaded = tsx.require(name, rootFile)\n    return loaded && '__esModule' in loaded ? loaded.default : loaded\n  }\n\n  if (jiti === undefined) {\n    try {\n      jiti = (await import('jiti')).default\n    } catch (error) {\n      importErro"
+        }
+      ],
+      "candidate_evidence": [
+        {
+          "path": "src/req.js",
+          "line": 22,
+          "column": 19,
+          "excerpt": "    return (await import(`${pathToFileURL(url)}?t=${Date.now()}`)).default\n  } catch (err) {\n    if (!TS_EXT_RE.test(url)) {\n                           \n      throw err\n    }\n  }\n\n  if (tsx === undefined) {\n    try {\n      tsx = await impor"
+        }
+      ]
+    },
+    {
+      "name": "prettier",
+      "version": "3.9.6",
+      "split": "tuning",
+      "rule_id": "child-process",
+      "baseline": true,
+      "candidate": false,
+      "review": "unsupported-match",
+      "reason": "A bundled diff helper is named exec.",
+      "baseline_evidence": [
+        {
+          "path": "index.mjs",
+          "line": 7634,
+          "column": 17,
+          "excerpt": "      (function exec() {\n        setTimeout(function() {\n          if (editLength > maxEditLength || Date.now() > abortAfterTimestamp) {\n            return callback(void 0);\n          }\n          if (!execEditLength()) {\n            exec();"
+        }
+      ],
+      "candidate_evidence": []
+    },
+    {
+      "name": "prettier",
+      "version": "3.9.6",
+      "split": "tuning",
+      "rule_id": "eval",
+      "baseline": true,
+      "candidate": true,
+      "review": "capability-evidence",
+      "reason": "Runtime code generation or evaluation supports a capability tag.",
+      "baseline_evidence": [
+        {
+          "path": "bin/prettier.cjs",
+          "line": 67,
+          "column": 21,
+          "excerpt": "var dynamicImport = new Function(\"module\", \"return import(module)\");\nvar promise;\nvar index = process.argv.indexOf(\"--experimental-cli\");\nif (process.env.PRETTIER_EXPERIMENTAL_CLI || index !== -1) {\n  if (index !== -1) {\n    process.argv.sp"
+        }
+      ],
+      "candidate_evidence": [
+        {
+          "path": "bin/prettier.cjs",
+          "line": 67,
+          "column": 21,
+          "excerpt": "var dynamicImport = new Function(\"module\", \"return import(module)\");\nvar promise;\nvar index = process.argv.indexOf(\"--experimental-cli\");\nif (process.env.PRETTIER_EXPERIMENTAL_CLI || index !== -1) {\n  if (index !== -1) {\n    process.argv.sp"
+        }
+      ]
+    },
+    {
+      "name": "prettier",
+      "version": "3.9.6",
+      "split": "tuning",
+      "rule_id": "dynamic-require",
+      "baseline": true,
+      "candidate": true,
+      "review": "capability-evidence",
+      "reason": "A computed module request or loader fallback supports a capability tag.",
+      "baseline_evidence": [
+        {
+          "path": "index.mjs",
+          "line": 13672,
+          "column": 24,
+          "excerpt": "  const module = await import(pathToFileURL2(file).href);\n  return module.default;\n}\nasync function readBunPackageJson(file) {\n  try {\n    return await readJson(file);\n  } catch (error) {\n    try {\n      return await importModuleDefault(fil"
+        }
+      ],
+      "candidate_evidence": [
+        {
+          "path": "index.mjs",
+          "line": 13672,
+          "column": 24,
+          "excerpt": "  const module = await import(pathToFileURL2(file).href);\n  return module.default;\n}\nasync function readBunPackageJson(file) {\n  try {\n    return await readJson(file);\n  } catch (error) {\n    try {\n      return await importModuleDefault(fil"
+        }
+      ]
+    },
+    {
+      "name": "prop-types",
+      "version": "15.8.1",
+      "split": "tuning",
+      "rule_id": "dynamic-require",
+      "baseline": true,
+      "candidate": true,
+      "review": "capability-evidence",
+      "reason": "The baseline example is a static bundled numeric ID. The candidate retains the tag for a separate aliased global-require fallback.",
+      "baseline_evidence": [
+        {
+          "path": "prop-types.min.js",
+          "line": 1,
+          "column": 769,
+          "excerpt": "quire,module,exports){\"use strict\";var ReactPropTypesSecret=require(3);function emptyFunction(){}function emptyFunctionWithReset(){}emptyFunctionWithReset.resetWarningCache=emptyFunction,module.exports=function(){function e(e,t,n,r,o,c){if("
+        }
+      ],
+      "candidate_evidence": [
+        {
+          "path": "prop-types.js",
+          "line": 1,
+          "column": 494,
+          "excerpt": "){var c=\"function\"==typeof require&&require;if(!f&&c)return c(i,!0);if(u)return u(i,!0);var a=new Error(\"Cannot find module '\"+i+\"'\");throw a.code=\"MODULE_NOT_FOUND\",a}var p=n[i]={exports:{}};e[i][0].call(p.exports,function(r){var n=e[i][1]"
+        }
+      ]
+    },
+    {
+      "name": "protobufjs",
+      "version": "8.8.0",
+      "split": "validation",
+      "rule_id": "child-process",
+      "baseline": true,
+      "candidate": false,
+      "review": "unsupported-match",
+      "reason": "Writer.fork saves a serialization state.",
+      "baseline_evidence": [
+        {
+          "path": "dist/light/protobuf.js",
+          "line": 9212,
+          "column": 34,
+          "excerpt": "Writer.prototype.fork = function fork() {\n    this._reserve(1);\n    (this.states || (this.states = [])).push(this.pos);\n    this.pos += 1;\n    return this;\n};\n\n   \n                                          \n                           \n   \nW"
+        }
+      ],
+      "candidate_evidence": []
+    },
+    {
+      "name": "protobufjs",
+      "version": "8.8.0",
+      "split": "validation",
+      "rule_id": "dynamic-require",
+      "baseline": true,
+      "candidate": false,
+      "review": "unsupported-match",
+      "reason": "The match is the declaration of a closed bundled module loader named $require.",
+      "baseline_evidence": [
+        {
+          "path": "dist/light/protobuf.js",
+          "line": 14,
+          "column": 15,
+          "excerpt": "    function $require(name) {\n        var $module = cache[name];\n        if (!$module)\n            modules[name][0].call($module = cache[name] = { exports: {} }, $require, $module, $module.exports);\n        return $module.exports;\n    }\n\n  "
+        }
+      ],
+      "candidate_evidence": []
+    },
+    {
+      "name": "qs",
+      "version": "6.16.0",
+      "split": "validation",
+      "rule_id": "dynamic-require",
+      "baseline": true,
+      "candidate": true,
+      "review": "capability-evidence",
+      "reason": "The baseline example is a static bundled numeric ID. The candidate retains the tag for a separate aliased global-require fallback.",
+      "baseline_evidence": [
+        {
+          "path": "dist/qs.js",
+          "line": 5,
+          "column": 28,
+          "excerpt": "\"use strict\";var stringify=require(4),parse=require(3),formats=require(1);module.exports={formats:formats,parse:parse,stringify:stringify};\n\n},{\"1\":1,\"3\":3,\"4\":4}],3:[function(require,module,exports){\n\"use strict\";var utils=require(5),has=O"
+        }
+      ],
+      "candidate_evidence": [
+        {
+          "path": "dist/qs.js",
+          "line": 1,
+          "column": 487,
+          "excerpt": "){var c=\"function\"==typeof require&&require;if(!f&&c)return c(i,!0);if(u)return u(i,!0);var a=new Error(\"Cannot find module '\"+i+\"'\");throw a.code=\"MODULE_NOT_FOUND\",a}var p=n[i]={exports:{}};e[i][0].call(p.exports,function(r){var n=e[i][1]"
+        }
+      ]
+    },
+    {
+      "name": "recharts",
+      "version": "3.10.1",
+      "split": "tuning",
+      "rule_id": "eval",
+      "baseline": true,
+      "candidate": true,
+      "review": "capability-evidence",
+      "reason": "Runtime code generation or evaluation supports a capability tag.",
+      "baseline_evidence": [
+        {
+          "path": "umd/Recharts.js",
+          "line": 2,
+          "column": 19190,
+          "excerpt": "ject\"==typeof globalThis)return globalThis;try{return this||new Function(\"return this\")()}catch(e){if(\"object\"==typeof window)return window}}(),a.o=(e,t)=>Object.prototype.hasOwnProperty.call(e,t),a.r=e=>{Symbol.toStringTag&&Object.definePr"
+        }
+      ],
+      "candidate_evidence": [
+        {
+          "path": "umd/Recharts.js",
+          "line": 2,
+          "column": 19190,
+          "excerpt": "ject\"==typeof globalThis)return globalThis;try{return this||new Function(\"return this\")()}catch(e){if(\"object\"==typeof window)return window}}(),a.o=(e,t)=>Object.prototype.hasOwnProperty.call(e,t),a.r=e=>{Symbol.toStringTag&&Object.definePr"
+        }
+      ]
+    },
+    {
+      "name": "regexpu-core",
+      "version": "6.4.0",
+      "split": "tuning",
+      "rule_id": "dynamic-require",
+      "baseline": false,
+      "candidate": true,
+      "review": "capability-evidence",
+      "reason": "A computed module request or loader fallback supports a capability tag.",
+      "baseline_evidence": [],
+      "candidate_evidence": [
+        {
+          "path": "rewrite-pattern.js",
+          "line": 74,
+          "column": 10,
+          "excerpt": "\t\treturn require(`regenerate-unicode-properties/${ path }.js`);\n\t} catch (exception) {\n\t\tthrow new Error(\n\t\t\t`Failed to recognize value \\`${ value }\\` for property ` +\n\t\t\t`\\`${ property }\\`.`\n\t\t);\n\t}\n};\n\nconst handleLoneUnicodePropertyNameO"
+        }
+      ]
+    },
+    {
+      "name": "require-directory",
+      "version": "2.1.1",
+      "split": "validation",
+      "rule_id": "dynamic-require",
+      "baseline": true,
+      "candidate": true,
+      "review": "capability-evidence",
+      "reason": "A computed module request or loader fallback supports a capability tag.",
+      "baseline_evidence": [
+        {
+          "path": "index.js",
+          "line": 76,
+          "column": 17,
+          "excerpt": "        obj = m.require(joined);\n        retval[options.rename(key, joined, filename)] = options.visit(obj, joined, filename) || obj;\n      }\n    }\n  });\n\n  return retval;\n}\n\nmodule.exports = requireDirectory;\nmodule.exports.defaults = defa"
+        }
+      ],
+      "candidate_evidence": [
+        {
+          "path": "index.js",
+          "line": 76,
+          "column": 15,
+          "excerpt": "        obj = m.require(joined);\n        retval[options.rename(key, joined, filename)] = options.visit(obj, joined, filename) || obj;\n      }\n    }\n  });\n\n  return retval;\n}\n\nmodule.exports = requireDirectory;\nmodule.exports.defaults = defa"
+        }
+      ]
+    },
+    {
+      "name": "rollup",
+      "version": "4.63.3",
+      "split": "tuning",
+      "rule_id": "child-process",
+      "baseline": true,
+      "candidate": true,
+      "review": "capability-evidence",
+      "reason": "A process API import or call supports a capability tag.",
+      "baseline_evidence": [
+        {
+          "path": "dist/native.js",
+          "line": 4,
+          "column": 23,
+          "excerpt": "const { spawnSync } = require('node:child_process');\n\nconst getReportHeader = () => {\n\ttry {\n\t\tif (platform !== 'win32') {\n\t\t\t                                                                       \n\t\t\t                                       "
+        }
+      ],
+      "candidate_evidence": [
+        {
+          "path": "dist/native.js",
+          "line": 4,
+          "column": 23,
+          "excerpt": "const { spawnSync } = require('node:child_process');\n\nconst getReportHeader = () => {\n\ttry {\n\t\tif (platform !== 'win32') {\n\t\t\t                                                                       \n\t\t\t                                       "
+        }
+      ]
+    },
+    {
+      "name": "rollup",
+      "version": "4.63.3",
+      "split": "tuning",
+      "rule_id": "shell",
+      "baseline": false,
+      "candidate": true,
+      "review": "capability-evidence",
+      "reason": "A shell API call or shell option supports a capability tag.",
+      "baseline_evidence": [],
+      "candidate_evidence": [
+        {
+          "path": "dist/shared/watch-cli.js",
+          "line": 408,
+          "column": 17,
+          "excerpt": "                node_child_process.execSync(cmd, { stdio: command.silent ? 'ignore' : stdio });\n            }\n            catch (error) {\n                rollup.stderr(error.message);\n            }\n        }\n    };\n}\n\nasync function watch(c"
+        }
+      ]
+    },
+    {
+      "name": "rollup",
+      "version": "4.63.3",
+      "split": "tuning",
+      "rule_id": "eval",
+      "baseline": true,
+      "candidate": true,
+      "review": "capability-evidence",
+      "reason": "Runtime code generation or evaluation supports a capability tag.",
+      "baseline_evidence": [
+        {
+          "path": "dist/shared/loadConfigFile.js",
+          "line": 358,
+          "column": 18,
+          "excerpt": "        plugin = new Function('return ' + pluginText);\n    }\n    else {\n        const match = pluginText.match(/^([\\w./:@\\\\^{|}-]+)(=(.*))?$/);\n        if (match) {\n                        \n                            \n            pluginTex"
+        }
+      ],
+      "candidate_evidence": [
+        {
+          "path": "dist/shared/loadConfigFile.js",
+          "line": 358,
+          "column": 18,
+          "excerpt": "        plugin = new Function('return ' + pluginText);\n    }\n    else {\n        const match = pluginText.match(/^([\\w./:@\\\\^{|}-]+)(=(.*))?$/);\n        if (match) {\n                        \n                            \n            pluginTex"
+        }
+      ]
+    },
+    {
+      "name": "rollup",
+      "version": "4.63.3",
+      "split": "tuning",
+      "rule_id": "dynamic-require",
+      "baseline": true,
+      "candidate": true,
+      "review": "capability-evidence",
+      "reason": "A computed module request or loader fallback supports a capability tag.",
+      "baseline_evidence": [
+        {
+          "path": "dist/native.js",
+          "line": 103,
+          "column": 10,
+          "excerpt": "\t\treturn require(id);\n\t} catch (error) {\n\t\tif (\n\t\t\tplatform === 'win32' &&\n\t\t\terror instanceof Error &&\n\t\t\terror.code === 'ERR_DLOPEN_FAILED' &&\n\t\t\terror.message.includes('The specified module could not be found')\n\t\t) {\n\t\t\tconst msvcDownloa"
+        }
+      ],
+      "candidate_evidence": [
+        {
+          "path": "dist/native.js",
+          "line": 103,
+          "column": 10,
+          "excerpt": "\t\treturn require(id);\n\t} catch (error) {\n\t\tif (\n\t\t\tplatform === 'win32' &&\n\t\t\terror instanceof Error &&\n\t\t\terror.code === 'ERR_DLOPEN_FAILED' &&\n\t\t\terror.message.includes('The specified module could not be found')\n\t\t) {\n\t\t\tconst msvcDownloa"
+        }
+      ]
+    },
+    {
+      "name": "setimmediate",
+      "version": "1.0.5",
+      "split": "tuning",
+      "rule_id": "eval",
+      "baseline": true,
+      "candidate": true,
+      "review": "capability-evidence",
+      "reason": "Runtime code generation or evaluation supports a capability tag.",
+      "baseline_evidence": [
+        {
+          "path": "setImmediate.js",
+          "line": 17,
+          "column": 20,
+          "excerpt": "        callback = new Function(\"\" + callback);\n      }\n                                \n      var args = new Array(arguments.length - 1);\n      for (var i = 0; i < args.length; i++) {\n          args[i] = arguments[i + 1];\n      }\n         "
+        }
+      ],
+      "candidate_evidence": [
+        {
+          "path": "setImmediate.js",
+          "line": 17,
+          "column": 20,
+          "excerpt": "        callback = new Function(\"\" + callback);\n      }\n                                \n      var args = new Array(arguments.length - 1);\n      for (var i = 0; i < args.length; i++) {\n          args[i] = arguments[i + 1];\n      }\n         "
+        }
+      ]
+    },
+    {
+      "name": "sharp",
+      "version": "0.35.4",
+      "split": "tuning",
+      "rule_id": "child-process",
+      "baseline": true,
+      "candidate": true,
+      "review": "capability-evidence",
+      "reason": "A process API import or call supports a capability tag.",
+      "baseline_evidence": [
+        {
+          "path": "dist/libvips.cjs",
+          "line": 6,
+          "column": 23,
+          "excerpt": "const { spawnSync } = require('node:child_process');\nconst { createHash } = require('node:crypto');\nconst semver = require('semver');\nconst detectLibc = require('detect-libc');\nconst pkg = require('../package.json');\n\n                      "
+        }
+      ],
+      "candidate_evidence": [
+        {
+          "path": "dist/libvips.cjs",
+          "line": 6,
+          "column": 23,
+          "excerpt": "const { spawnSync } = require('node:child_process');\nconst { createHash } = require('node:crypto');\nconst semver = require('semver');\nconst detectLibc = require('detect-libc');\nconst pkg = require('../package.json');\n\n                      "
+        }
+      ]
+    },
+    {
+      "name": "sharp",
+      "version": "0.35.4",
+      "split": "tuning",
+      "rule_id": "shell",
+      "baseline": true,
+      "candidate": true,
+      "review": "capability-evidence",
+      "reason": "A shell API call or shell option supports a capability tag.",
+      "baseline_evidence": [
+        {
+          "path": "dist/libvips.mjs",
+          "line": 6,
+          "column": 22,
+          "excerpt": "import { spawnSync } from 'node:child_process';\nimport { createHash } from 'node:crypto';\nimport semver from 'semver';\nimport detectLibc from 'detect-libc';\nimport pkg from '../package.json' with { type: 'json' };\n\n                         "
+        }
+      ],
+      "candidate_evidence": [
+        {
+          "path": "dist/libvips.cjs",
+          "line": 96,
+          "column": 24,
+          "excerpt": "    const translated = spawnSync('sysctl sysctl.proc_translated', spawnSyncOptions).stdout;\n    return (translated || '').trim() === 'sysctl.proc_translated: 1';\n  }\n  return false;\n};\n\n                          \n\nconst sha512 = (s) => crea"
+        }
+      ]
+    },
+    {
+      "name": "sharp",
+      "version": "0.35.4",
+      "split": "tuning",
+      "rule_id": "dynamic-require",
+      "baseline": false,
+      "candidate": true,
+      "review": "capability-evidence",
+      "reason": "A computed module request or loader fallback supports a capability tag.",
+      "baseline_evidence": [],
+      "candidate_evidence": [
+        {
+          "path": "dist/libvips.cjs",
+          "line": 54,
+          "column": 12,
+          "excerpt": "    return require(`@img/sharp-libvips-dev-${buildPlatformArch()}/include`);\n  } catch {\n    try {\n      return require('@img/sharp-libvips-dev/include');\n    } catch {}\n  }\n  return '';\n};\n\nconst buildSharpLibvipsCPlusPlusDir = () => {\n  t"
+        }
+      ]
+    },
+    {
+      "name": "source-map-js",
+      "version": "1.2.1",
+      "split": "validation",
+      "rule_id": "eval",
+      "baseline": true,
+      "candidate": true,
+      "review": "capability-evidence",
+      "reason": "Runtime code generation or evaluation supports a capability tag.",
+      "baseline_evidence": [
+        {
+          "path": "lib/quick-sort.js",
+          "line": 111,
+          "column": 20,
+          "excerpt": "  let templateFn = new Function(`return ${template}`)();\n  return templateFn(comparator);\n}\n\n   \n                                                                    \n  \n                     \n                           \n                     "
+        }
+      ],
+      "candidate_evidence": [
+        {
+          "path": "lib/quick-sort.js",
+          "line": 111,
+          "column": 20,
+          "excerpt": "  let templateFn = new Function(`return ${template}`)();\n  return templateFn(comparator);\n}\n\n   \n                                                                    \n  \n                     \n                           \n                     "
+        }
+      ]
+    },
+    {
+      "name": "source-map-support",
+      "version": "0.5.21",
+      "split": "tuning",
+      "rule_id": "dynamic-require",
+      "baseline": true,
+      "candidate": true,
+      "review": "capability-evidence",
+      "reason": "A computed module request or loader fallback supports a capability tag.",
+      "baseline_evidence": [
+        {
+          "path": "source-map-support.js",
+          "line": 24,
+          "column": 14,
+          "excerpt": "  return mod.require(request);\n}\n\n                                             \nvar errorFormatterInstalled = false;\nvar uncaughtShimInstalled = false;\n\n                                                                          \nvar emptyCac"
+        }
+      ],
+      "candidate_evidence": [
+        {
+          "path": "browser-source-map-support.js",
+          "line": 11,
+          "column": 211,
+          "excerpt": "){var l=\"function\"==typeof require&&require;if(!c&&l)return l(f,!0);if(t)return t(f,!0);throw Error(\"Cannot find module '\"+f+\"'\");}l=J[f]={exports:{}};C[f][0].call(l.exports,function(q){var r=C[f][1][q];return p(r?r:q)},l,l.exports,e,C,J,A)"
+        }
+      ]
+    },
+    {
+      "name": "tapable",
+      "version": "2.3.3",
+      "split": "tuning",
+      "rule_id": "eval",
+      "baseline": true,
+      "candidate": true,
+      "review": "capability-evidence",
+      "reason": "Runtime code generation or evaluation supports a capability tag.",
+      "baseline_evidence": [
+        {
+          "path": "lib/HookCodeFactory.js",
+          "line": 19,
+          "column": 10,
+          "excerpt": "\t\t\t\tfn = new Function(\n\t\t\t\t\tthis.args(),\n\t\t\t\t\t`\"use strict\";\\n${this.header()}${this.contentWithInterceptors({\n\t\t\t\t\t\tonError: (err) => `throw ${err};\\n`,\n\t\t\t\t\t\tonResult: (result) => `return ${result};\\n`,\n\t\t\t\t\t\tresultReturns: true,\n\t\t\t\t\t\ton"
+        }
+      ],
+      "candidate_evidence": [
+        {
+          "path": "lib/HookCodeFactory.js",
+          "line": 19,
+          "column": 10,
+          "excerpt": "\t\t\t\tfn = new Function(\n\t\t\t\t\tthis.args(),\n\t\t\t\t\t`\"use strict\";\\n${this.header()}${this.contentWithInterceptors({\n\t\t\t\t\t\tonError: (err) => `throw ${err};\\n`,\n\t\t\t\t\t\tonResult: (result) => `return ${result};\\n`,\n\t\t\t\t\t\tresultReturns: true,\n\t\t\t\t\t\ton"
+        }
+      ]
+    },
+    {
+      "name": "terser-webpack-plugin",
+      "version": "5.6.1",
+      "split": "tuning",
+      "rule_id": "eval",
+      "baseline": true,
+      "candidate": true,
+      "review": "capability-evidence",
+      "reason": "Runtime code generation or evaluation supports a capability tag.",
+      "baseline_evidence": [
+        {
+          "path": "dist/minify.js",
+          "line": 328,
+          "column": 3,
+          "excerpt": "  new Function(\"exports\", \"require\", \"module\", \"__filename\", \"__dirname\", `'use strict'\\nreturn ${options}`)                                            \n  (exports, require, module, __filename, __dirname);\n  return minify(evaluatedOptions);"
+        }
+      ],
+      "candidate_evidence": [
+        {
+          "path": "dist/minify.js",
+          "line": 328,
+          "column": 3,
+          "excerpt": "  new Function(\"exports\", \"require\", \"module\", \"__filename\", \"__dirname\", `'use strict'\\nreturn ${options}`)                                            \n  (exports, require, module, __filename, __dirname);\n  return minify(evaluatedOptions);"
+        }
+      ]
+    },
+    {
+      "name": "terser-webpack-plugin",
+      "version": "5.6.1",
+      "split": "tuning",
+      "rule_id": "dynamic-require",
+      "baseline": true,
+      "candidate": true,
+      "review": "capability-evidence",
+      "reason": "A computed module request or loader fallback supports a capability tag.",
+      "baseline_evidence": [
+        {
+          "path": "dist/utils.js",
+          "line": 1091,
+          "column": 17,
+          "excerpt": "      exports = require(mod);\n      return exports;\n    } catch (err) {\n      let importESM;\n      try {\n                                               \n        importESM = new Function(\"id\", \"return import(id);\");\n      } catch (_err) {\n  "
+        }
+      ],
+      "candidate_evidence": [
+        {
+          "path": "dist/utils.js",
+          "line": 1091,
+          "column": 17,
+          "excerpt": "      exports = require(mod);\n      return exports;\n    } catch (err) {\n      let importESM;\n      try {\n                                               \n        importESM = new Function(\"id\", \"return import(id);\");\n      } catch (_err) {\n  "
+        }
+      ]
+    },
+    {
+      "name": "tinyexec",
+      "version": "1.3.1",
+      "split": "tuning",
+      "rule_id": "child-process",
+      "baseline": true,
+      "candidate": true,
+      "review": "capability-evidence",
+      "reason": "A process API import or call supports a capability tag.",
+      "baseline_evidence": [
+        {
+          "path": "dist/main.mjs",
+          "line": 1,
+          "column": 29,
+          "excerpt": "import { spawn, spawnSync } from \"node:child_process\";\nimport { cwd } from \"node:process\";\nimport { basename, delimiter, dirname, normalize, resolve } from \"node:path\";\nimport { fileURLToPath } from \"node:url\";\nimport { pipeline } from \"nod"
+        }
+      ],
+      "candidate_evidence": [
+        {
+          "path": "dist/main.mjs",
+          "line": 1,
+          "column": 29,
+          "excerpt": "import { spawn, spawnSync } from \"node:child_process\";\nimport { cwd } from \"node:process\";\nimport { basename, delimiter, dirname, normalize, resolve } from \"node:path\";\nimport { fileURLToPath } from \"node:url\";\nimport { pipeline } from \"nod"
+        }
+      ]
+    },
+    {
+      "name": "tinyexec",
+      "version": "1.3.1",
+      "split": "tuning",
+      "rule_id": "shell",
+      "baseline": true,
+      "candidate": false,
+      "review": "unproven-shell",
+      "reason": "The baseline inferred shell use from an import or an exec-named alias. Process capability remains detected. No supported shell invocation was established in the scanned code. Runtime options or downstream helpers can still select a shell. This removal is not evidence that the package cannot run a shell.",
+      "baseline_evidence": [
+        {
+          "path": "dist/main.mjs",
+          "line": 1,
+          "column": 29,
+          "excerpt": "import { spawn, spawnSync } from \"node:child_process\";\nimport { cwd } from \"node:process\";\nimport { basename, delimiter, dirname, normalize, resolve } from \"node:path\";\nimport { fileURLToPath } from \"node:url\";\nimport { pipeline } from \"nod"
+        }
+      ],
+      "candidate_evidence": []
+    },
+    {
+      "name": "ts-node",
+      "version": "10.9.2",
+      "split": "tuning",
+      "rule_id": "child-process",
+      "baseline": true,
+      "candidate": true,
+      "review": "capability-evidence",
+      "reason": "A process API import or call supports a capability tag.",
+      "baseline_evidence": [
+        {
+          "path": "dist/child/spawn-child.js",
+          "line": 4,
+          "column": 25,
+          "excerpt": "const child_process_1 = require(\"child_process\");\nconst url_1 = require(\"url\");\nconst util_1 = require(\"../util\");\nconst argv_payload_1 = require(\"./argv-payload\");\n   \n            \n                                                          "
+        }
+      ],
+      "candidate_evidence": [
+        {
+          "path": "dist/child/spawn-child.js",
+          "line": 4,
+          "column": 25,
+          "excerpt": "const child_process_1 = require(\"child_process\");\nconst url_1 = require(\"url\");\nconst util_1 = require(\"../util\");\nconst argv_payload_1 = require(\"./argv-payload\");\n   \n            \n                                                          "
+        }
+      ]
+    },
+    {
+      "name": "ts-node",
+      "version": "10.9.2",
+      "split": "tuning",
+      "rule_id": "dynamic-require",
+      "baseline": true,
+      "candidate": true,
+      "review": "capability-evidence",
+      "reason": "A computed module request or loader fallback supports a capability tag.",
+      "baseline_evidence": [
+        {
+          "path": "dist-raw/runmain-hack.js",
+          "line": 8,
+          "column": 3,
+          "excerpt": "  import(pathToFileURL(entryPointPath));\n}\n"
+        }
+      ],
+      "candidate_evidence": [
+        {
+          "path": "dist-raw/node-internal-modules-cjs-helpers.js",
+          "line": 67,
+          "column": 21,
+          "excerpt": "        const lib = (dummyModule.require || require)(name);\n\n                                                             \n                                   \n        delete object[name];\n        ObjectDefineProperty(object, name, {\n       "
+        }
+      ]
+    },
+    {
+      "name": "tsconfig-paths",
+      "version": "4.2.0",
+      "split": "tuning",
+      "rule_id": "dynamic-require",
+      "baseline": true,
+      "candidate": true,
+      "review": "capability-evidence",
+      "reason": "A computed module request or loader fallback supports a capability tag.",
+      "baseline_evidence": [
+        {
+          "path": "lib/filesystem.js",
+          "line": 31,
+          "column": 12,
+          "excerpt": "    return require(packageJsonPath);\n}\nexports.readJsonFromDiskSync = readJsonFromDiskSync;\nfunction readJsonFromDiskAsync(path, \n                                                              \ncallback) {\n    fs.readFile(path, \"utf8\", funct"
+        }
+      ],
+      "candidate_evidence": [
+        {
+          "path": "lib/filesystem.js",
+          "line": 31,
+          "column": 12,
+          "excerpt": "    return require(packageJsonPath);\n}\nexports.readJsonFromDiskSync = readJsonFromDiskSync;\nfunction readJsonFromDiskAsync(path, \n                                                              \ncallback) {\n    fs.readFile(path, \"utf8\", funct"
+        }
+      ]
+    },
+    {
+      "name": "tsx",
+      "version": "4.23.13",
+      "split": "validation",
+      "rule_id": "child-process",
+      "baseline": true,
+      "candidate": true,
+      "review": "capability-evidence",
+      "reason": "A process API import or call supports a capability tag.",
+      "baseline_evidence": [
+        {
+          "path": "dist/cli.cjs",
+          "line": 1,
+          "column": 691,
+          "excerpt": "e(\"./get-pipe-path-D4YM6rQt.cjs\"),Ru=require(\"node:url\"),Mn=require(\"child_process\"),q=require(\"path\"),De=require(\"fs\"),ke=require(\"./node-features-CEjg7cMX.cjs\"),Me=require(\"node:path\"),We=require(\"node:fs\"),Wn=require(\"events\"),_e=require"
+        }
+      ],
+      "candidate_evidence": [
+        {
+          "path": "dist/cli.cjs",
+          "line": 1,
+          "column": 691,
+          "excerpt": "e(\"./get-pipe-path-D4YM6rQt.cjs\"),Ru=require(\"node:url\"),Mn=require(\"child_process\"),q=require(\"path\"),De=require(\"fs\"),ke=require(\"./node-features-CEjg7cMX.cjs\"),Me=require(\"node:path\"),We=require(\"node:fs\"),Wn=require(\"events\"),_e=require"
+        }
+      ]
+    },
+    {
+      "name": "tsx",
+      "version": "4.23.13",
+      "split": "validation",
+      "rule_id": "dynamic-require",
+      "baseline": true,
+      "candidate": true,
+      "review": "capability-evidence",
+      "reason": "A computed module request or loader fallback supports a capability tag.",
+      "baseline_evidence": [
+        {
+          "path": "dist/esm/api/index.cjs",
+          "line": 1,
+          "column": 1176,
+          "excerpt": "rn.test(r)&&t.cjsExtensionPattern.test(r)?Promise.resolve(o.require(r,u)):s.register({namespace:a,...i?{}:e}).import(r,u)},\"tsImport\");exports.register=s.register,exports.tsImport=g;\n"
+        }
+      ],
+      "candidate_evidence": [
+        {
+          "path": "dist/esm/api/index.cjs",
+          "line": 1,
+          "column": 1174,
+          "excerpt": "tern.test(r)&&t.cjsExtensionPattern.test(r)?Promise.resolve(o.require(r,u)):s.register({namespace:a,...i?{}:e}).import(r,u)},\"tsImport\");exports.register=s.register,exports.tsImport=g;\n"
+        }
+      ]
+    },
+    {
+      "name": "typescript",
+      "version": "7.0.2",
+      "split": "tuning",
+      "rule_id": "child-process",
+      "baseline": true,
+      "candidate": true,
+      "review": "capability-evidence",
+      "reason": "A process API import or call supports a capability tag.",
+      "baseline_evidence": [
+        {
+          "path": "dist/api/async/client.js",
+          "line": 56,
+          "column": 28,
+          "excerpt": "            this.process = spawn(resolveExePath(options), args, {\n                stdio: [\"pipe\", \"pipe\", \"inherit\"],\n            });\n            this.process.once(\"error\", error => {\n                reject(new Error(`Failed to start tsgo p"
+        }
+      ],
+      "candidate_evidence": [
+        {
+          "path": "dist/api/syncChannel.js",
+          "line": 12,
+          "column": 19,
+          "excerpt": "import { spawn, } from \"node:child_process\";\nimport { closeSync, openSync, readSync, writeSync, } from \"node:fs\";\nimport { binHeaderSize, MSGPACK_BIN16, MSGPACK_BIN32, MSGPACK_BIN8, MSGPACK_FIXARRAY3, MSGPACK_UINT8, writeBinHeader, } from \""
+        }
+      ]
+    },
+    {
+      "name": "typescript",
+      "version": "7.0.2",
+      "split": "tuning",
+      "rule_id": "shell",
+      "baseline": true,
+      "candidate": false,
+      "review": "unproven-shell",
+      "reason": "The baseline inferred shell use from an import or an exec-named alias. Process capability remains detected. No supported shell invocation was established in the scanned code.",
+      "baseline_evidence": [
+        {
+          "path": "dist/api/syncChannel.js",
+          "line": 12,
+          "column": 19,
+          "excerpt": "import { spawn, } from \"node:child_process\";\nimport { closeSync, openSync, readSync, writeSync, } from \"node:fs\";\nimport { binHeaderSize, MSGPACK_BIN16, MSGPACK_BIN32, MSGPACK_BIN8, MSGPACK_FIXARRAY3, MSGPACK_UINT8, writeBinHeader, } from \""
+        }
+      ],
+      "candidate_evidence": []
+    },
+    {
+      "name": "uglify-js",
+      "version": "3.19.3",
+      "split": "validation",
+      "rule_id": "eval",
+      "baseline": true,
+      "candidate": true,
+      "review": "capability-evidence",
+      "reason": "Runtime code generation or evaluation supports a capability tag.",
+      "baseline_evidence": [
+        {
+          "path": "lib/ast.js",
+          "line": 64,
+          "column": 16,
+          "excerpt": "    var ctor = new Function(code.join(\"\"))();\n    ctor.prototype = proto;\n    ctor.prototype.CTOR = ctor;\n    ctor.prototype.TYPE = ctor.TYPE = type;\n    if (base) {\n        ctor.BASE = base;\n        base.SUBCLASSES.push(ctor);\n    }\n    ct"
+        }
+      ],
+      "candidate_evidence": [
+        {
+          "path": "lib/ast.js",
+          "line": 64,
+          "column": 16,
+          "excerpt": "    var ctor = new Function(code.join(\"\"))();\n    ctor.prototype = proto;\n    ctor.prototype.CTOR = ctor;\n    ctor.prototype.TYPE = ctor.TYPE = type;\n    if (base) {\n        ctor.BASE = base;\n        base.SUBCLASSES.push(ctor);\n    }\n    ct"
+        }
+      ]
+    },
+    {
+      "name": "update-browserslist-db",
+      "version": "1.3.3",
+      "split": "tuning",
+      "rule_id": "child-process",
+      "baseline": true,
+      "candidate": true,
+      "review": "capability-evidence",
+      "reason": "A process API import or call supports a capability tag.",
+      "baseline_evidence": [
+        {
+          "path": "check-npm-version.js",
+          "line": 1,
+          "column": 20,
+          "excerpt": "let { execSync } = require('child_process')\nlet { existsSync } = require('fs')\nlet pico = require('picocolors')\n\nif (!existsSync('deno.lock')) {\n  try {\n    let output = execSync('npm -v').toString().trim()\n    let version = parseInt(output"
+        }
+      ],
+      "candidate_evidence": [
+        {
+          "path": "check-npm-version.js",
+          "line": 1,
+          "column": 20,
+          "excerpt": "let { execSync } = require('child_process')\nlet { existsSync } = require('fs')\nlet pico = require('picocolors')\n\nif (!existsSync('deno.lock')) {\n  try {\n    let output = execSync('npm -v').toString().trim()\n    let version = parseInt(output"
+        }
+      ]
+    },
+    {
+      "name": "update-browserslist-db",
+      "version": "1.3.3",
+      "split": "tuning",
+      "rule_id": "shell",
+      "baseline": true,
+      "candidate": true,
+      "review": "capability-evidence",
+      "reason": "A shell API call or shell option supports a capability tag.",
+      "baseline_evidence": [
+        {
+          "path": "check-npm-version.js",
+          "line": 7,
+          "column": 18,
+          "excerpt": "    let output = execSync('npm -v').toString().trim()\n    let version = parseInt(output.replace(/^[^\\d]*/, ''))\n    if (version <= 6) {\n      process.stderr.write(\n        pico.red(\n          'Update npm or call ' +\n            pico.yellow("
+        }
+      ],
+      "candidate_evidence": [
+        {
+          "path": "check-npm-version.js",
+          "line": 7,
+          "column": 18,
+          "excerpt": "    let output = execSync('npm -v').toString().trim()\n    let version = parseInt(output.replace(/^[^\\d]*/, ''))\n    if (version <= 6) {\n      process.stderr.write(\n        pico.red(\n          'Update npm or call ' +\n            pico.yellow("
+        }
+      ]
+    },
+    {
+      "name": "vite",
+      "version": "8.3.0",
+      "split": "validation",
+      "rule_id": "child-process",
+      "baseline": true,
+      "candidate": true,
+      "review": "capability-evidence",
+      "reason": "A process API import or call supports a capability tag.",
+      "baseline_evidence": [
+        {
+          "path": "dist/node/chunks/node.js",
+          "line": 18,
+          "column": 51,
+          "excerpt": "import childProcess, { exec, execFile, execSync } from \"node:child_process\";\nimport { promises } from \"node:dns\";\nimport net from \"node:net\";\nimport os from \"node:os\";\nimport { isatty } from \"node:tty\";\nimport path$1, { isAbsolute as isAbso"
+        }
+      ],
+      "candidate_evidence": [
+        {
+          "path": "dist/node/chunks/node.js",
+          "line": 18,
+          "column": 51,
+          "excerpt": "import childProcess, { exec, execFile, execSync } from \"node:child_process\";\nimport { promises } from \"node:dns\";\nimport net from \"node:net\";\nimport os from \"node:os\";\nimport { isatty } from \"node:tty\";\nimport path$1, { isAbsolute as isAbso"
+        }
+      ]
+    },
+    {
+      "name": "vite",
+      "version": "8.3.0",
+      "split": "validation",
+      "rule_id": "shell",
+      "baseline": true,
+      "candidate": true,
+      "review": "capability-evidence",
+      "reason": "A shell API call or shell option supports a capability tag.",
+      "baseline_evidence": [
+        {
+          "path": "dist/node/chunks/node.js",
+          "line": 18,
+          "column": 51,
+          "excerpt": "import childProcess, { exec, execFile, execSync } from \"node:child_process\";\nimport { promises } from \"node:dns\";\nimport net from \"node:net\";\nimport os from \"node:os\";\nimport { isatty } from \"node:tty\";\nimport path$1, { isAbsolute as isAbso"
+        }
+      ],
+      "candidate_evidence": [
+        {
+          "path": "dist/node/chunks/node.js",
+          "line": 2438,
+          "column": 2,
+          "excerpt": "\texec(\"net use\", { windowsHide: true }, (error, stdout) => {\n\t\tif (error) return;\n\t\tconst lines = stdout.split(\"\\n\");\n\t\tfor (const line of lines) {\n\t\t\tconst m = parseNetUseRE.exec(line);\n\t\t\tif (m) windowsNetworkMap.set(m[2], m[1]);\n\t\t}\n\t\tif"
+        }
+      ]
+    },
+    {
+      "name": "vite",
+      "version": "8.3.0",
+      "split": "validation",
+      "rule_id": "eval",
+      "baseline": true,
+      "candidate": true,
+      "review": "capability-evidence",
+      "reason": "Runtime code generation or evaluation supports a capability tag.",
+      "baseline_evidence": [
+        {
+          "path": "dist/node/chunks/node.js",
+          "line": 2972,
+          "column": 9,
+          "excerpt": "\treturn new Function(`\n    var console, exports, global, module, process, require\n    return (\\n${rawValue}\\n)\n  `)();\n}\nfunction getNpmPackageName(importPath) {\n\tconst parts = importPath.split(\"/\");\n\tif (parts[0][0] === \"@\") {\n\t\tif (!parts"
+        }
+      ],
+      "candidate_evidence": [
+        {
+          "path": "dist/node/chunks/node.js",
+          "line": 2972,
+          "column": 9,
+          "excerpt": "\treturn new Function(`\n    var console, exports, global, module, process, require\n    return (\\n${rawValue}\\n)\n  `)();\n}\nfunction getNpmPackageName(importPath) {\n\tconst parts = importPath.split(\"/\");\n\tif (parts[0][0] === \"@\") {\n\t\tif (!parts"
+        }
+      ]
+    },
+    {
+      "name": "vite",
+      "version": "8.3.0",
+      "split": "validation",
+      "rule_id": "dynamic-require",
+      "baseline": true,
+      "candidate": true,
+      "review": "capability-evidence",
+      "reason": "A computed module request or loader fallback supports a capability tag.",
+      "baseline_evidence": [
+        {
+          "path": "dist/client/bundledDevClient.mjs",
+          "line": 680,
+          "column": 10,
+          "excerpt": "\t\t\tawait import(\n\t\t\t\t                  \n\t\t\t\tthis.options.base + url\n);\n\t\t} catch {\n\t\t\tthis.requestFullReload(`failed to import hmr patch ${url}`);\n\t\t\treturn;\n\t\t}\n\t\tawait this.applyUpdate(update);\n\t\tawait this.notifyListeners(\"vite:afterUpda"
+        }
+      ],
+      "candidate_evidence": [
+        {
+          "path": "dist/client/bundledDevClient.mjs",
+          "line": 680,
+          "column": 10,
+          "excerpt": "\t\t\tawait import(\n\t\t\t\t                  \n\t\t\t\tthis.options.base + url\n);\n\t\t} catch {\n\t\t\tthis.requestFullReload(`failed to import hmr patch ${url}`);\n\t\t\treturn;\n\t\t}\n\t\tawait this.applyUpdate(update);\n\t\tawait this.notifyListeners(\"vite:afterUpda"
+        }
+      ]
+    },
+    {
+      "name": "vitest",
+      "version": "5.0.1",
+      "split": "validation",
+      "rule_id": "child-process",
+      "baseline": true,
+      "candidate": true,
+      "review": "capability-evidence",
+      "reason": "A process API import or call supports a capability tag.",
+      "baseline_evidence": [
+        {
+          "path": "dist/chunks/doctor.DR3u0Z_G.js",
+          "line": 1,
+          "column": 18,
+          "excerpt": "import { spawn } from 'node:child_process';\nimport { mkdtempSync, writeFileSync, rmSync } from 'node:fs';\nimport { availableParallelism, tmpdir } from 'node:os';\nimport { join } from 'node:path';\nimport { performance } from 'node:perf_hooks"
+        }
+      ],
+      "candidate_evidence": [
+        {
+          "path": "dist/chunks/doctor.DR3u0Z_G.js",
+          "line": 1,
+          "column": 18,
+          "excerpt": "import { spawn } from 'node:child_process';\nimport { mkdtempSync, writeFileSync, rmSync } from 'node:fs';\nimport { availableParallelism, tmpdir } from 'node:os';\nimport { join } from 'node:path';\nimport { performance } from 'node:perf_hooks"
+        }
+      ]
+    },
+    {
+      "name": "vitest",
+      "version": "5.0.1",
+      "split": "validation",
+      "rule_id": "shell",
+      "baseline": true,
+      "candidate": false,
+      "review": "unproven-shell",
+      "reason": "The baseline inferred shell use from an import or an exec-named alias. Process capability remains detected. No supported shell invocation was established in the scanned code.",
+      "baseline_evidence": [
+        {
+          "path": "dist/chunks/doctor.DR3u0Z_G.js",
+          "line": 1,
+          "column": 18,
+          "excerpt": "import { spawn } from 'node:child_process';\nimport { mkdtempSync, writeFileSync, rmSync } from 'node:fs';\nimport { availableParallelism, tmpdir } from 'node:os';\nimport { join } from 'node:path';\nimport { performance } from 'node:perf_hooks"
+        }
+      ],
+      "candidate_evidence": []
+    },
+    {
+      "name": "vitest",
+      "version": "5.0.1",
+      "split": "validation",
+      "rule_id": "eval",
+      "baseline": true,
+      "candidate": true,
+      "review": "capability-evidence",
+      "reason": "Runtime code generation or evaluation supports a capability tag.",
+      "baseline_evidence": [
+        {
+          "path": "dist/chunks/index.m3L2HgmY.js",
+          "line": 97,
+          "column": 3,
+          "excerpt": "\t\tnew Function(\"exports\", content)(data);\n\t} catch (cause) {\n\t\tthrow new Error(`Invalid snapshot file, please manually fix or delete it: ${filepath}`, { cause });\n\t}\n\treturn data;\n}\n                                                          "
+        }
+      ],
+      "candidate_evidence": [
+        {
+          "path": "dist/chunks/index.m3L2HgmY.js",
+          "line": 97,
+          "column": 3,
+          "excerpt": "\t\tnew Function(\"exports\", content)(data);\n\t} catch (cause) {\n\t\tthrow new Error(`Invalid snapshot file, please manually fix or delete it: ${filepath}`, { cause });\n\t}\n\treturn data;\n}\n                                                          "
+        }
+      ]
+    },
+    {
+      "name": "vitest",
+      "version": "5.0.1",
+      "split": "validation",
+      "rule_id": "dynamic-require",
+      "baseline": true,
+      "candidate": true,
+      "review": "capability-evidence",
+      "reason": "A computed module request or loader fallback supports a capability tag.",
+      "baseline_evidence": [
+        {
+          "path": "dist/chunks/coverage.CX7NN5s7.js",
+          "line": 16,
+          "column": 71,
+          "excerpt": "default: coverageModule } = loader.isBrowser ? await loader.import(builtInModule) : await import(\n\t\t\t                  \n\t\t\tbuiltInModule\n);\n\t\tif (!coverageModule) throw new Error(`Failed to load ${CoverageProviderMap[provider]}. Default exp"
+        }
+      ],
+      "candidate_evidence": [
+        {
+          "path": "dist/chunks/coverage.CX7NN5s7.js",
+          "line": 16,
+          "column": 101,
+          "excerpt": "ader.isBrowser ? await loader.import(builtInModule) : await import(\n\t\t\t                  \n\t\t\tbuiltInModule\n);\n\t\tif (!coverageModule) throw new Error(`Failed to load ${CoverageProviderMap[provider]}. Default export is missing.`);\n\t\treturn co"
+        }
+      ]
+    },
+    {
+      "name": "webpack",
+      "version": "5.111.0",
+      "split": "validation",
+      "rule_id": "child-process",
+      "baseline": true,
+      "candidate": true,
+      "review": "capability-evidence",
+      "reason": "A process API import or call supports a capability tag.",
+      "baseline_evidence": [
+        {
+          "path": "bin/webpack.js",
+          "line": 23,
+          "column": 13,
+          "excerpt": "\tconst cp = require(\"child_process\");\n\n\treturn new Promise((resolve, reject) => {\n\t\tconst executedCommand = cp.spawn(command, args, {\n\t\t\tstdio: \"inherit\",\n\t\t\tshell: true\n\t\t});\n\n\t\texecutedCommand.on(\"error\", (error) => {\n\t\t\treject(error);\n\t\t"
+        }
+      ],
+      "candidate_evidence": [
+        {
+          "path": "bin/webpack.js",
+          "line": 23,
+          "column": 13,
+          "excerpt": "\tconst cp = require(\"child_process\");\n\n\treturn new Promise((resolve, reject) => {\n\t\tconst executedCommand = cp.spawn(command, args, {\n\t\t\tstdio: \"inherit\",\n\t\t\tshell: true\n\t\t});\n\n\t\texecutedCommand.on(\"error\", (error) => {\n\t\t\treject(error);\n\t\t"
+        }
+      ]
+    },
+    {
+      "name": "webpack",
+      "version": "5.111.0",
+      "split": "validation",
+      "rule_id": "shell",
+      "baseline": false,
+      "candidate": true,
+      "review": "capability-evidence",
+      "reason": "A shell API call or shell option supports a capability tag.",
+      "baseline_evidence": [],
+      "candidate_evidence": [
+        {
+          "path": "bin/webpack.js",
+          "line": 26,
+          "column": 27,
+          "excerpt": "\t\tconst executedCommand = cp.spawn(command, args, {\n\t\t\tstdio: \"inherit\",\n\t\t\tshell: true\n\t\t});\n\n\t\texecutedCommand.on(\"error\", (error) => {\n\t\t\treject(error);\n\t\t});\n\n\t\texecutedCommand.on(\"exit\", (code) => {\n\t\t\tif (code === 0) {\n\t\t\t\tresolve();\n"
+        }
+      ]
+    },
+    {
+      "name": "webpack",
+      "version": "5.111.0",
+      "split": "validation",
+      "rule_id": "eval",
+      "baseline": true,
+      "candidate": true,
+      "review": "capability-evidence",
+      "reason": "Runtime code generation or evaluation supports a capability tag.",
+      "baseline_evidence": [
+        {
+          "path": "lib/loaders/loadLoader.js",
+          "line": 68,
+          "column": 27,
+          "excerpt": "\t\t\t\tconst dynamicImport = eval(\"(url) => import(url)\");\n\t\t\t\timportModule =                                                    (\n\t\t\t\t\tdynamicImport\n\t\t\t\t);\n\t\t\t}\n\n\t\t\timportModule(pathToFileURL(loader.path)).then(\n\t\t\t\t(                         "
+        }
+      ],
+      "candidate_evidence": [
+        {
+          "path": "lib/loaders/loadLoader.js",
+          "line": 68,
+          "column": 27,
+          "excerpt": "\t\t\t\tconst dynamicImport = eval(\"(url) => import(url)\");\n\t\t\t\timportModule =                                                    (\n\t\t\t\t\tdynamicImport\n\t\t\t\t);\n\t\t\t}\n\n\t\t\timportModule(pathToFileURL(loader.path)).then(\n\t\t\t\t(                         "
+        }
+      ]
+    },
+    {
+      "name": "webpack",
+      "version": "5.111.0",
+      "split": "validation",
+      "rule_id": "dynamic-require",
+      "baseline": true,
+      "candidate": true,
+      "review": "capability-evidence",
+      "reason": "A computed module request or loader fallback supports a capability tag.",
+      "baseline_evidence": [
+        {
+          "path": "bin/webpack.js",
+          "line": 99,
+          "column": 14,
+          "excerpt": "\tconst pkg = require(pkgPath);\n\n\tif (pkg.type === \"module\" || /\\.mjs/i.test(pkg.bin[cli.binName])) {\n\t\timport(path.resolve(path.dirname(pkgPath), pkg.bin[cli.binName])).catch(\n\t\t\t(err) => {\n\t\t\t\tconsole.error(err);\n\t\t\t\tprocess.exitCode = 1;\n"
+        }
+      ],
+      "candidate_evidence": [
+        {
+          "path": "bin/webpack.js",
+          "line": 99,
+          "column": 14,
+          "excerpt": "\tconst pkg = require(pkgPath);\n\n\tif (pkg.type === \"module\" || /\\.mjs/i.test(pkg.bin[cli.binName])) {\n\t\timport(path.resolve(path.dirname(pkgPath), pkg.bin[cli.binName])).catch(\n\t\t\t(err) => {\n\t\t\t\tconsole.error(err);\n\t\t\t\tprocess.exitCode = 1;\n"
+        }
+      ]
+    },
+    {
+      "name": "whatwg-url",
+      "version": "17.1.1",
+      "split": "validation",
+      "rule_id": "eval",
+      "baseline": true,
+      "candidate": true,
+      "review": "capability-evidence",
+      "reason": "Runtime code generation or evaluation supports a capability tag.",
+      "baseline_evidence": [
+        {
+          "path": "lib/utils.js",
+          "line": 53,
+          "column": 22,
+          "excerpt": "        globalObject.eval(\"(async function* () {})\").prototype\n      )\n    );\n  } catch {\n    ctorRegistry[\"%AsyncIteratorPrototype%\"] = AsyncIteratorPrototype;\n  }\n\n  globalObject[ctorRegistrySymbol] = ctorRegistry;\n  return ctorRegistry;\n"
+        }
+      ],
+      "candidate_evidence": [
+        {
+          "path": "lib/utils.js",
+          "line": 53,
+          "column": 22,
+          "excerpt": "        globalObject.eval(\"(async function* () {})\").prototype\n      )\n    );\n  } catch {\n    ctorRegistry[\"%AsyncIteratorPrototype%\"] = AsyncIteratorPrototype;\n  }\n\n  globalObject[ctorRegistrySymbol] = ctorRegistry;\n  return ctorRegistry;\n"
+        }
+      ]
+    },
+    {
+      "name": "why-is-node-running",
+      "version": "3.2.2",
+      "split": "tuning",
+      "rule_id": "child-process",
+      "baseline": true,
+      "candidate": true,
+      "review": "capability-evidence",
+      "reason": "A process API import or call supports a capability tag.",
+      "baseline_evidence": [
+        {
+          "path": "cli.js",
+          "line": 2,
+          "column": 18,
+          "excerpt": "import { spawn } from 'node:child_process'\nimport path from 'node:path'\n\nconst [prog, ...progArgs] = process.argv.slice(2)\n\nconsole.info('probing program', prog)\n\nconst args = [\n  '--import',\n  path.join(import.meta.dirname, 'include.js'),\n"
+        }
+      ],
+      "candidate_evidence": [
+        {
+          "path": "cli.js",
+          "line": 2,
+          "column": 18,
+          "excerpt": "import { spawn } from 'node:child_process'\nimport path from 'node:path'\n\nconst [prog, ...progArgs] = process.argv.slice(2)\n\nconsole.info('probing program', prog)\n\nconst args = [\n  '--import',\n  path.join(import.meta.dirname, 'include.js'),\n"
+        }
+      ]
+    },
+    {
+      "name": "why-is-node-running",
+      "version": "3.2.2",
+      "split": "tuning",
+      "rule_id": "shell",
+      "baseline": true,
+      "candidate": false,
+      "review": "unproven-shell",
+      "reason": "The baseline inferred shell use from an import or an exec-named alias. Process capability remains detected. No supported shell invocation was established in the scanned code.",
+      "baseline_evidence": [
+        {
+          "path": "cli.js",
+          "line": 2,
+          "column": 18,
+          "excerpt": "import { spawn } from 'node:child_process'\nimport path from 'node:path'\n\nconst [prog, ...progArgs] = process.argv.slice(2)\n\nconsole.info('probing program', prog)\n\nconst args = [\n  '--import',\n  path.join(import.meta.dirname, 'include.js'),\n"
+        }
+      ],
+      "candidate_evidence": []
+    },
+    {
+      "name": "wrap-ansi",
+      "version": "10.0.1",
+      "split": "tuning",
+      "rule_id": "child-process",
+      "baseline": true,
+      "candidate": false,
+      "review": "unsupported-match",
+      "reason": "exec wraps terminal text.",
+      "baseline_evidence": [
+        {
+          "path": "index.js",
+          "line": 648,
+          "column": 16,
+          "excerpt": "\t\t.map(line => exec(expandTabs(line), columns, options))\n\t\t.join('\\n');\n}\n"
+        }
+      ],
+      "candidate_evidence": []
+    },
+    {
+      "name": "yaml",
+      "version": "2.9.1",
+      "split": "tuning",
+      "rule_id": "dynamic-require",
+      "baseline": true,
+      "candidate": true,
+      "review": "capability-evidence",
+      "reason": "A computed module request or loader fallback supports a capability tag.",
+      "baseline_evidence": [
+        {
+          "path": "dist/cli.mjs",
+          "line": 124,
+          "column": 26,
+          "excerpt": "                ? (await import(resolve(opt.visit))).default\n                : null;\n            let source = '';\n            let hasDoc = false;\n            let reqDocEnd = false;\n            const data = [];\n            const add = (doc) "
+        }
+      ],
+      "candidate_evidence": [
+        {
+          "path": "dist/cli.mjs",
+          "line": 124,
+          "column": 26,
+          "excerpt": "                ? (await import(resolve(opt.visit))).default\n                : null;\n            let source = '';\n            let hasDoc = false;\n            let reqDocEnd = false;\n            const data = [];\n            const add = (doc) "
+        }
+      ]
+    },
+    {
+      "name": "yargs",
+      "version": "18.1.0",
+      "split": "tuning",
+      "rule_id": "dynamic-require",
+      "baseline": true,
+      "candidate": true,
+      "review": "capability-evidence",
+      "reason": "A computed module request or loader fallback supports a capability tag.",
+      "baseline_evidence": [
+        {
+          "path": "build/lib/utils/apply-extends.js",
+          "line": 27,
+          "column": 21,
+          "excerpt": "            : _shim.require(config.extends);\n        delete config.extends;\n        defaultConfig = applyExtends(defaultConfig, shim.path.dirname(pathToDefault), mergeExtends, shim);\n    }\n    previouslyVisitedConfigs = [];\n    return merge"
+        }
+      ],
+      "candidate_evidence": [
+        {
+          "path": "build/lib/utils/apply-extends.js",
+          "line": 27,
+          "column": 15,
+          "excerpt": "            : _shim.require(config.extends);\n        delete config.extends;\n        defaultConfig = applyExtends(defaultConfig, shim.path.dirname(pathToDefault), mergeExtends, shim);\n    }\n    previouslyVisitedConfigs = [];\n    return merge"
+        }
+      ]
+    },
+    {
+      "name": "yargs-parser",
+      "version": "22.0.0",
+      "split": "tuning",
+      "rule_id": "dynamic-require",
+      "baseline": true,
+      "candidate": true,
+      "review": "capability-evidence",
+      "reason": "A computed module request or loader fallback supports a capability tag.",
+      "baseline_evidence": [
+        {
+          "path": "build/lib/index.js",
+          "line": 41,
+          "column": 20,
+          "excerpt": "            return require(path);\n        }\n        else if (path.match(/\\.json$/)) {\n                                                                    \n            return JSON.parse(readFileSync(path, 'utf8'));\n        }\n        else {\n "
+        }
+      ],
+      "candidate_evidence": [
+        {
+          "path": "build/lib/index.js",
+          "line": 41,
+          "column": 20,
+          "excerpt": "            return require(path);\n        }\n        else if (path.match(/\\.json$/)) {\n                                                                    \n            return JSON.parse(readFileSync(path, 'utf8'));\n        }\n        else {\n "
+        }
+      ]
+    }
+  ]
+}

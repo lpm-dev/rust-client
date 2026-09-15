@@ -1,5 +1,6 @@
 ---
 source: tests/workflows/tests/audit.rs
+assertion_line: 3460
 expression: envelope
 ---
 {
@@ -19,6 +20,7 @@ expression: envelope
   "checked_lpm": 0,
   "packages_with_issues": 1,
   "total_issues": 1,
+  "total_capabilities": 0,
   "osv_vulnerabilities": 1,
   "counts": {
     "critical": 0,
@@ -34,12 +36,15 @@ expression: envelope
       "instance_id": "[INSTANCE_ID]",
       "path": "[PACKAGE_PATH]",
       "quality_score": null,
+      "capabilities": [],
       "issues": [
         {
           "severity": "info",
           "category": "supply-chain",
           "message": "trivial package",
-          "source": "local"
+          "source": "local",
+          "rule_id": "trivial",
+          "evidence": []
         }
       ]
     }

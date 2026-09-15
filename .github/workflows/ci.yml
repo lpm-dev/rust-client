@@ -109,6 +109,9 @@ jobs:
       - name: Audit harness helper tests
         run: bash bench/test-audit-install-args.sh
 
+      - name: Source corpus helper tests
+        run: python3 bench/source-analysis/test_corpus.py
+
       - name: Audit install deadline tests
         run: |
           python3 bench/test_audit_install_timeout.py

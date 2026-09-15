@@ -176,7 +176,10 @@ pub(super) fn run_behavioral_analysis(
                 continue;
             }
         }
-        if issues.iter().any(|issue| issue.severity != "info") {
+        if issues
+            .iter()
+            .any(|issue| !issue.is_capability() && issue.severity != "info")
+        {
             with_actionable_findings += 1;
         }
 
@@ -186,17 +189,7 @@ pub(super) fn run_behavioral_analysis(
 
         // Merge into an exact registry result or create a local result.
         if let Some(idx) = existing_result {
-            // Dedup: don't add issues with the same message already present from registry
-            let existing_messages: HashSet<String> = results[idx]
-                .issues
-                .iter()
-                .map(|i| i.message.clone())
-                .collect();
-            for issue in issues {
-                if !existing_messages.contains(&issue.message) {
-                    results[idx].issues.push(issue);
-                }
-            }
+            super::types::merge_issues(&mut results[idx].issues, issues);
         } else {
             let idx = results.len();
             results.push(AuditResult {
@@ -252,7 +245,17 @@ pub(super) fn analysis_to_issues(
     behavioral_tag_policies()
         .iter()
         .filter(|policy| policy.tag.matches_analysis(analysis))
-        .filter_map(|policy| behavioral_issue(policy.tag, source))
+        .filter_map(|policy| {
+            let mut issue = behavioral_issue(policy.tag, source)?;
+            issue.evidence = analysis
+                .meta
+                .evidence
+                .iter()
+                .filter(|entry| Some(entry.rule_id.as_str()) == issue.rule_id)
+                .cloned()
+                .collect();
+            Some(issue)
+        })
         .collect()
 }
 
@@ -260,7 +263,8 @@ pub(super) fn behavioral_issue(tag: PseudoClass, source: &str) -> Option<AuditIs
     let policy = tag.behavioral_policy()?;
     let category = match policy.group {
         TagGroup::SupplyChain => "supply-chain",
-        TagGroup::Source | TagGroup::Manifest => "behavior",
+        TagGroup::Source => "capability",
+        TagGroup::Manifest => "behavior",
     };
     let severity = match policy.severity {
         Severity::Critical => "critical",
@@ -273,6 +277,8 @@ pub(super) fn behavioral_issue(tag: PseudoClass, source: &str) -> Option<AuditIs
         message: policy.label.to_string(),
         category: category.to_string(),
         source: source.to_string(),
+        rule_id: Some(policy.token.trim_start_matches(':')),
+        evidence: Vec::new(),
     })
 }
 

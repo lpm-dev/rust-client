@@ -7,8 +7,7 @@ pub struct AuditCounts {
     pub packages_audited: usize,
     /// OSV and LPM registry vulnerabilities across the discovered tree.
     pub vulnerabilities: usize,
-    /// Packages flagged by client-side behavioral analysis
-    /// (eval / child_process / dynamic require / etc.).
+    /// Packages with actionable behavioral findings, excluding source capabilities.
     pub suspicious: usize,
     /// Finding counts by normalized audit severity.
     pub severity_counts: AuditSeverityCounts,
@@ -45,6 +44,9 @@ pub(super) fn summarize_findings(
 
     for result in results {
         for issue in &result.issues {
+            if issue.is_capability() {
+                continue;
+            }
             let _ = increment_severity(&mut counts, &issue.severity);
             if issue.severity.eq_ignore_ascii_case("critical") {
                 critical_findings.push(AuditCriticalFinding {
@@ -109,13 +111,45 @@ pub(super) struct AuditResult {
     pub(super) issues: Vec<AuditIssue>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub(super) struct AuditIssue {
     pub(super) severity: String,
     pub(super) message: String,
     pub(super) category: String,
     /// Where the issue was detected: "registry", "local", or "combined".
     pub(super) source: String,
+    pub(super) rule_id: Option<&'static str>,
+    pub(super) evidence: Vec<lpm_security::behavioral::SourceEvidence>,
+}
+
+impl AuditIssue {
+    pub(super) fn is_capability(&self) -> bool {
+        self.category == "capability"
+    }
+}
+
+pub(super) fn merge_issues(target: &mut Vec<AuditIssue>, incoming: Vec<AuditIssue>) {
+    let mut indexes: std::collections::HashMap<_, _> = target
+        .iter()
+        .enumerate()
+        .map(|(index, issue)| ((issue.category.clone(), issue.message.clone()), index))
+        .collect();
+    for issue in incoming {
+        let key = (issue.category.clone(), issue.message.clone());
+        if let Some(index) = indexes.get(&key).copied() {
+            let existing = &mut target[index];
+            if !issue.evidence.is_empty() {
+                existing.evidence = issue.evidence;
+                existing.rule_id = issue.rule_id.or(existing.rule_id);
+                if existing.source != issue.source {
+                    existing.source = "combined".to_string();
+                }
+            }
+        } else {
+            indexes.insert(key, target.len());
+            target.push(issue);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -137,18 +171,21 @@ mod tests {
                     message: "LPM-ADV-A".to_string(),
                     category: "vulnerability".to_string(),
                     source: "registry".to_string(),
+                    ..AuditIssue::default()
                 },
                 AuditIssue {
                     severity: "critical".to_string(),
                     message: "LPM-ADV-B".to_string(),
                     category: "vulnerability".to_string(),
                     source: "registry".to_string(),
+                    ..AuditIssue::default()
                 },
                 AuditIssue {
                     severity: "critical".to_string(),
                     message: "registry analysis finding".to_string(),
                     category: "security".to_string(),
                     source: "registry".to_string(),
+                    ..AuditIssue::default()
                 },
             ],
         }];
