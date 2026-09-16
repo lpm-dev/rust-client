@@ -552,7 +552,7 @@ impl PseudoClass {
             .find(|policy| policy.tag == self)
     }
 
-    /// Tag group — `Source`, `SupplyChain`, or `Manifest` for the behavioral
+    /// Tag group — `Source`, `SupplyChain`, or `Manifest` for the
     /// behavioral tags; `None` for state / severity / special selectors
     /// that aren't part of the behavioral analysis catalog.
     pub fn group(self) -> Option<TagGroup> {

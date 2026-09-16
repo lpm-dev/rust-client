@@ -125,7 +125,7 @@ pub struct OversizedSourceFileEvidence {
 /// strips comments, and runs all tag detectors. Returns a complete
 /// `PackageAnalysis` that can be serialized to `.lpm-security.json`.
 ///
-/// Respects per-file (2MB) and per-package (50MB) size limits.
+/// Respects per-file (4 MiB) and per-package (50 MiB) size limits.
 /// Skips `.min.js` files for source tag analysis (but flags `minified: true`).
 pub fn analyze_package(package_dir: &Path) -> PackageAnalysis {
     analyze_package_with_timings(package_dir).0
@@ -1469,7 +1469,7 @@ impl PackageAnalyzer {
 
     /// Record an "oversized minified" file without reading its bytes.
     /// Used by the fused path for files that pass the
-    /// `should_scan` extension test but exceed 2 MB and match a minified
+    /// `should_scan` extension test but exceed 4 MiB and match a minified
     /// filename pattern — we still want the `minified: true` tag without
     /// pulling megabytes into RAM.
     pub fn feed_oversized_minified(&mut self, relative_path: &Path, size: u64) {
