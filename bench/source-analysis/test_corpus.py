@@ -6,12 +6,19 @@ import json
 from pathlib import Path
 import tarfile
 import tempfile
+import subprocess
+import shutil
+import os
 import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 import urllib.error
 import warnings
 import zipfile
+
+import archive_inventory
+import archive_pilot
+import archive_report
 
 spec = importlib.util.spec_from_file_location("corpus", Path(__file__).with_name("corpus.py"))
 corpus = importlib.util.module_from_spec(spec)
@@ -34,6 +41,193 @@ spec = importlib.util.spec_from_file_location(
 )
 attack_families = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(attack_families)
+
+
+class ArchivePilotTests(unittest.TestCase):
+    def record(self, number, name, evidence=(), advisory=None):
+        return {"sha256": f"{number:064x}", "name": name, "version": "1.0.0", "size_bytes": 10,
+                "locations": ["local"], "focus_hints": [], "evidence_hashes": list(evidence),
+                "provenance": [{"source": "test", "advisory_id": advisory}]}
+
+    def test_duplicate_archives_keep_all_provenance_and_review_links(self):
+        a, b = self.record(1, "one"), self.record(1, "one")
+        b.update(review_path="private-review", review_sha256="digest")
+        records = archive_inventory.consolidate([a, b])
+        self.assertEqual(len(records), 1)
+        self.assertEqual(len(records[0]["provenance"]), 2)
+        self.assertEqual(records[0]["review_path"], "private-review")
+
+    def test_same_package_with_different_archive_bytes_keeps_both_variants(self):
+        records = archive_inventory.consolidate([self.record(1, "one"), self.record(2, "one")])
+        self.assertEqual(len(records), 2)
+        archive_inventory.assign_splits(records, set())
+        self.assertEqual(records[0]["group"], records[1]["group"])
+
+    def test_conflicting_identity_for_identical_bytes_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, "conflicting"):
+            archive_inventory.consolidate([self.record(1, "one"), self.record(1, "two")])
+
+    def test_transitive_advisory_and_source_links_preserve_prior_exclusion(self):
+        records = [self.record(1, "prior", advisory="A"), self.record(2, "two", ["code"], "A"),
+                   self.record(3, "three", ["code"])]
+        archive_inventory.assign_splits(records, {"prior"})
+        self.assertEqual({r["split"] for r in records}, {"prior"})
+        self.assertEqual(len({r["group"] for r in records}), 1)
+
+    def test_split_membership_is_independent_of_record_order(self):
+        records = [self.record(i, f"package-{i}") for i in range(1, 100)]
+        archive_inventory.assign_splits(records, set())
+        expected = {r["sha256"]: r["split"] for r in records}
+        archive_inventory.assign_splits(records[::-1], set())
+        self.assertEqual(expected, {r["sha256"]: r["split"] for r in records})
+        self.assertIn("reserved", expected.values())
+
+    def test_public_inventory_omits_private_locations_and_review_paths(self):
+        record = self.record(1, "one")
+        record["review_path"] = "secret"
+        public = archive_inventory.public_record(record)
+        self.assertNotIn("locations", public)
+        self.assertNotIn("review_path", public)
+
+    def test_zip_root_is_selected_by_package_identity_without_execution(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            archive = root / "sample.zip"
+            with zipfile.ZipFile(archive, "w") as source:
+                source.writestr("wrapper/pkg/package.json", json.dumps({"name": "sample", "version": "1"}))
+                source.writestr("wrapper/pkg/index.js", "throw new Error('must never execute')")
+                source.writestr("metadata.json", "{}")
+            target = root / "output"
+            target.mkdir()
+            stats = archive_pilot.extract_zip(archive, target, {"name": "sample", "version": "1"})
+            self.assertEqual(stats["files"], 2)
+            self.assertTrue((target / "index.js").is_file())
+            self.assertFalse((target / "metadata.json").exists())
+
+    def test_zip_rejects_traversal_even_outside_selected_root(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            archive = root / "sample.zip"
+            with zipfile.ZipFile(archive, "w") as source:
+                source.writestr("../outside", "data")
+            with self.assertRaisesRegex(ValueError, "unsafe"):
+                archive_pilot.extract_zip(archive, root / "output", {"name": "sample", "version": "1"})
+
+    def test_zip_rejects_ambiguous_matching_package_roots(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            archive = Path(temporary) / "sample.zip"
+            identity = {"name": "sample", "version": "1"}
+            with zipfile.ZipFile(archive, "w") as source:
+                for prefix in ("one", "two"):
+                    source.writestr(prefix + "/package.json", json.dumps(identity))
+            with self.assertRaisesRegex(ValueError, "ambiguous"):
+                archive_pilot.extract_zip(archive, Path(temporary) / "output", identity)
+
+    def test_zip_bounds_all_members_before_reading_manifest_candidates(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            archive = Path(temporary) / "sample.zip"
+            identity = {"name": "sample", "version": "1"}
+            with zipfile.ZipFile(archive, "w") as source:
+                source.writestr("package/package.json", json.dumps(identity))
+                source.writestr("outside/data", b"x" * 100)
+            with patch.object(archive_pilot.corpus, "MAX_EXPANDED", 80), self.assertRaisesRegex(ValueError, "expanded"):
+                archive_pilot.extract_zip(archive, Path(temporary) / "output", identity)
+
+    def test_local_archives_obey_the_compressed_byte_limit(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            package = {"sha256": "a" * 64, "size_bytes": corpus.MAX_DOWNLOAD + 1, "locations": []}
+            with self.assertRaisesRegex(ValueError, "compressed"):
+                archive_pilot.prepare(package, root, root / "output")
+
+    def test_archive_hash_cannot_escape_the_result_directory(self):
+        with self.assertRaisesRegex(ValueError, "hash"):
+            archive_pilot.validate_package({"sha256": "../../outside", "size_bytes": 10})
+
+    def test_normalized_fingerprints_ignore_literal_and_comment_variants(self):
+        self.assertEqual(archive_pilot.normalized_hash("const x = 'one'; // comment\nf(12)"),
+                         archive_pilot.normalized_hash('const x="two"; f(42)'))
+        self.assertNotEqual(archive_pilot.normalized_hash("f(12)"), archive_pilot.normalized_hash("g(12)"))
+
+    def test_coverage_distinguishes_source_selection_from_unsupported_stages(self):
+        for name, expected in [("index.js", "selected_source"), ("install.sh", "unsupported_extension"),
+                               (".hidden/a.js", "hidden"), ("node_modules/a.js", "excluded_directory"),
+                               ("types.d.ts", "declaration_or_map")]:
+            self.assertEqual(archive_pilot.source_reason(Path(name)), expected)
+
+    def test_public_results_remove_payload_excerpts_and_domains(self):
+        row = {"analysis": {"meta": {"evidence": [{"ruleId": "fs", "excerpt": "private"}],
+                                     "urlDomains": ["private.invalid"]}}}
+        archive_pilot.sanitize(row)
+        self.assertEqual(row["analysis"]["meta"], {"evidence": [{"ruleId": "fs"}]})
+
+    def test_public_results_remove_domains_inside_oversized_source_metadata(self):
+        row = {"analysis": {"meta": {"oversizedSourceFiles": [
+            {"path": "large.js", "urlDomains": ["private.invalid"]}]}}}
+        archive_pilot.sanitize(row)
+        self.assertEqual(row["analysis"]["meta"]["oversizedSourceFiles"], [{"path": "large.js"}])
+
+    def test_code_linked_groups_join_literal_variants_but_ignore_package_json(self):
+        a, b, c = [self.record(i, str(i)) for i in range(1, 4)]
+        for row in (a, b, c):
+            row["group"] = row["sha256"]
+        inspections = {
+            a["sha256"]: {"coverage": {"files": [{"path": "payload.js", "normalized_sha256": "shared"}]}},
+            b["sha256"]: {"coverage": {"files": [{"path": "loader.js", "normalized_sha256": "shared"}]}},
+            c["sha256"]: {"coverage": {"files": [{"path": "package.json", "normalized_sha256": "shared"}]}},
+        }
+        groups = archive_report.code_groups([a, b, c], inspections)
+        self.assertEqual(groups[a["sha256"]], groups[b["sha256"]])
+        self.assertNotEqual(groups[a["sha256"]], groups[c["sha256"]])
+
+    def test_capability_and_information_flags_do_not_count_as_critical(self):
+        self.assertEqual(archive_report.critical({"supplyChain": {"possibleObfuscation": True,
+                                                                "highEntropyStrings": True}}), [])
+        self.assertEqual(archive_report.critical({"supplyChain": {"credentialExfiltration": True}}),
+                         ["credentialExfiltration"])
+
+    @unittest.skipUnless(shutil.which("node"), "Node required for read-only retrieval contract")
+    def test_r2_retrieval_uses_get_and_checks_hash_without_exposing_credentials(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            sdk = root / "sdk/node_modules/@aws-sdk/client-s3"
+            sdk.mkdir(parents=True)
+            (sdk / "index.js").write_text('''
+const { Readable } = require('node:stream');
+class GetObjectCommand { constructor(args) { this.args = args; } }
+class S3Client {
+  async send(command) {
+    if (!(command instanceof GetObjectCommand)) throw Error('read-only contract');
+    if (command.args.Bucket !== 'test' || command.args.Key !== 'archive') throw Error('location');
+    return { Body: Readable.from([Buffer.from('archive data')]) };
+  }
+  destroy() {}
+}
+module.exports = { S3Client, GetObjectCommand };
+''')
+            env = root / "env"
+            env.write_text("LPM_R2_ENDPOINT=https://abc.r2.cloudflarestorage.com\n"
+                           "LPM_R2_BUCKET=test\nLPM_R2_ACCESS_KEY_ID=private-test-id\n"
+                           "LPM_R2_SECRET_ACCESS_KEY=private-test-secret\n")
+            data = b"archive data"
+            digest = hashlib.sha256(data).hexdigest()
+            selection = root / "selection.json"
+            record = {"sha256": digest, "size_bytes": len(data), "locations": ["r2://test/archive"]}
+            selection.write_text(json.dumps({"packages": [record]}))
+            script = Path(__file__).with_name("archive_fetch.mjs")
+            command = [shutil.which("node"), str(script), str(selection), str(root / "out"),
+                       str(env), str(root / "sdk")]
+            environment = {k: v for k, v in os.environ.items() if not k.startswith("LPM_R2_")}
+            result = subprocess.run(command, capture_output=True, text=True, env=environment, check=False)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual((root / "out" / digest).read_bytes(), data)
+            self.assertNotIn("private-test", result.stdout + result.stderr)
+            record["sha256"] = "a" * 64
+            selection.write_text(json.dumps({"packages": [record]}))
+            result = subprocess.run(command, capture_output=True, text=True, env=environment, check=False)
+            self.assertEqual(result.returncode, 1)
+            self.assertFalse((root / "out" / record["sha256"]).exists())
+            self.assertNotIn("private-test", result.stdout + result.stderr)
 
 
 class IncidentReconstructionTests(unittest.TestCase):

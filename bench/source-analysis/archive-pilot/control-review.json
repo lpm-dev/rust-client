@@ -1,0 +1,387 @@
+[
+  {
+    "name": "eslint-scope",
+    "version": "3.7.1",
+    "role": "clean-before",
+    "review": "Incident-specific neighboring release from npm. This label does not establish absence of unrelated vulnerabilities.",
+    "locations": [],
+    "critical_source_findings": 0
+  },
+  {
+    "name": "eslint-scope",
+    "version": "3.7.3",
+    "role": "clean-after",
+    "review": "Incident-specific neighboring release from npm. This label does not establish absence of unrelated vulnerabilities.",
+    "locations": [],
+    "critical_source_findings": 0
+  },
+  {
+    "name": "ua-parser-js",
+    "version": "0.7.28",
+    "role": "clean-before",
+    "review": "Incident-specific neighboring release from npm. This label does not establish absence of unrelated vulnerabilities.",
+    "locations": [],
+    "critical_source_findings": 0
+  },
+  {
+    "name": "ua-parser-js",
+    "version": "0.7.30",
+    "role": "clean-after",
+    "review": "Incident-specific neighboring release from npm. This label does not establish absence of unrelated vulnerabilities.",
+    "locations": [],
+    "critical_source_findings": 0
+  },
+  {
+    "name": "npm",
+    "version": "6.14.18",
+    "role": "credential-control",
+    "review": "Loads project and user registry configuration for package-manager operations. Bundled node_modules are excluded by the scanner.",
+    "locations": [
+      {
+        "path": "lib/config/core.js",
+        "line": 128,
+        "sha256": "6fbe0493addceb3e2fb5723451c1914b5154bde863cb76b7aa230e3015091286"
+      }
+    ],
+    "critical_source_findings": 0
+  },
+  {
+    "name": "@npmcli/config",
+    "version": "9.0.0",
+    "role": "credential-control",
+    "review": "Reads and parses a selected npm configuration file. This package supplies configuration rather than an upload implementation.",
+    "locations": [
+      {
+        "path": "lib/index.js",
+        "line": 586,
+        "sha256": "aa283456b6e3c72396b0bc8230d31072665f753d5b80e04efa556713339adbad"
+      }
+    ],
+    "critical_source_findings": 0
+  },
+  {
+    "name": "npm-registry-fetch",
+    "version": "18.0.2",
+    "role": "credential-control",
+    "review": "Selects registry credentials for the request URI and builds authentication headers. Credential transmission can be a required function.",
+    "locations": [
+      {
+        "path": "lib/auth.js",
+        "line": 8,
+        "sha256": "fc50e1fa09f89b75eebfb632d7c4063a26881ec10791246ae4b30cfc47a8bd84"
+      },
+      {
+        "path": "lib/index.js",
+        "line": 236,
+        "sha256": "70be42b89bf61f0fa8e69c7d671bf4baac5e8cda650ef3fddd693b0f285746d1"
+      }
+    ],
+    "critical_source_findings": 0
+  },
+  {
+    "name": "registry-auth-token",
+    "version": "5.1.0",
+    "role": "credential-control",
+    "review": "Selects authentication information for the configured registry. Configuration-file loading is delegated to @pnpm/npm-conf, outside this package scan.",
+    "locations": [
+      {
+        "path": "index.js",
+        "line": 21,
+        "sha256": "fc2e205f0ec18ac0805f8c10f290eb1f8371ff1600ca14fe80f227112e9155f2"
+      }
+    ],
+    "critical_source_findings": 0
+  },
+  {
+    "name": "esbuild",
+    "version": "0.25.0",
+    "role": "downloader-control",
+    "review": "Downloads the platform binary from npm and writes it locally during installation. Network, filesystem, and child-process use are expected.",
+    "locations": [
+      {
+        "path": "install.js",
+        "line": 145,
+        "sha256": "417cbbaf3ea9cb878011832b70eeaa00ce49419a0589cbbf4b65d258c4d7c1dd"
+      },
+      {
+        "path": "install.js",
+        "line": 234,
+        "sha256": "417cbbaf3ea9cb878011832b70eeaa00ce49419a0589cbbf4b65d258c4d7c1dd"
+      }
+    ],
+    "critical_source_findings": 0
+  },
+  {
+    "name": "playwright",
+    "version": "1.51.1",
+    "role": "downloader-entry-control",
+    "review": "Requests browser installation through the registry helper. This is a tooling entry point, not proof of an automatic npm lifecycle download.",
+    "locations": [
+      {
+        "path": "lib/runner/testServer.js",
+        "line": 555,
+        "sha256": "7300efee179dd8eba00671df6e05b113f6dd8f8f966163e37c34b62c580c6f70"
+      }
+    ],
+    "critical_source_findings": 0
+  },
+  {
+    "name": "playwright-core",
+    "version": "1.51.1",
+    "role": "downloader-implementation-control",
+    "review": "Uses a child process to download a selected browser with progress and error handling.",
+    "locations": [
+      {
+        "path": "lib/server/registry/browserFetcher.js",
+        "line": 82,
+        "sha256": "0cb302be588c6830e3825f347e20544de438c75044ebf9e790c8b4ec600689c7"
+      }
+    ],
+    "critical_source_findings": 0
+  },
+  {
+    "name": "puppeteer",
+    "version": "24.4.0",
+    "role": "downloader-entry-control",
+    "review": "The installation entry point requests configured browser downloads and supports skipping them. Downloads are delegated to a helper package.",
+    "locations": [
+      {
+        "path": "install.mjs",
+        "line": 38,
+        "sha256": "ee0c7e52700bf3d90e041b01e04093552344ca9e1f4833f11577bb08946da224"
+      },
+      {
+        "path": "lib/cjs/puppeteer/node/install.js",
+        "line": 37,
+        "sha256": "7d6adbaa54da6feaecddde1721eed9163bd0cb5d979580aa48523f32bbea102b"
+      }
+    ],
+    "critical_source_findings": 0
+  },
+  {
+    "name": "@puppeteer/browsers",
+    "version": "2.9.0",
+    "role": "downloader-implementation-control",
+    "review": "Implements browser download and installation. Its source also contains optional system-dependency installation commands.",
+    "locations": [
+      {
+        "path": "lib/cjs/install.js",
+        "line": 130,
+        "sha256": "f68a2aa391da08aab933265af16c79e2dc24d963f5cc55b2b8260f33b7fa23ba"
+      },
+      {
+        "path": "lib/cjs/httpUtil.js",
+        "line": 97,
+        "sha256": "83bf3c8c38e4e8b126dba77271e59d8c7a6ef693adcda031f56fc13aaec3acd3"
+      }
+    ],
+    "critical_source_findings": 0
+  },
+  {
+    "name": "electron",
+    "version": "35.0.0",
+    "role": "downloader-entry-control",
+    "review": "Downloads and extracts the selected Electron artifact with platform, version, and checksum configuration.",
+    "locations": [
+      {
+        "path": "install.js",
+        "line": 42,
+        "sha256": "3fa1166ed4db6831ed0d1aeec05295e460127d92b1216c794719e817eaefe0fb"
+      }
+    ],
+    "critical_source_findings": 0
+  },
+  {
+    "name": "@electron/get",
+    "version": "2.0.3",
+    "role": "downloader-implementation-control",
+    "review": "Implements artifact downloads, caching, and checksum checks. Options can change checksum behavior; the control is not an unconditional trust exemption.",
+    "locations": [
+      {
+        "path": "dist/cjs/index.js",
+        "line": 21,
+        "sha256": "981d748427c0d783ddc67662eae7f684950417aada04459d237f2cd04348b642"
+      },
+      {
+        "path": "dist/cjs/index.js",
+        "line": 95,
+        "sha256": "981d748427c0d783ddc67662eae7f684950417aada04459d237f2cd04348b642"
+      }
+    ],
+    "critical_source_findings": 0
+  },
+  {
+    "name": "prebuild-install",
+    "version": "7.1.3",
+    "role": "downloader-control",
+    "review": "Downloads a configured native prebuild and can attach caller-supplied authentication. The HTTP helper itself is in a dependency outside this scan.",
+    "locations": [
+      {
+        "path": "download.js",
+        "line": 42,
+        "sha256": "91663d22ce22740be17b6f22868e3d2687ea5a759c50b75322f597f0f6ccfb15"
+      }
+    ],
+    "critical_source_findings": 0
+  },
+  {
+    "name": "crypto-js",
+    "version": "4.2.0",
+    "role": "encrypted-data",
+    "review": "AES transforms caller-supplied data and keys; decrypted data is returned to the caller.",
+    "locations": [
+      {
+        "path": "aes.js",
+        "sha256": "d6bb48feacbd63fd455becce7a5528877242f70e73ba1f7838c186ed8f35fd3c"
+      }
+    ],
+    "critical_source_findings": 0
+  },
+  {
+    "name": "sjcl",
+    "version": "1.0.8",
+    "role": "encrypted-data",
+    "review": "AES encrypt/decrypt methods transform caller-supplied blocks; encryption alone is not code execution.",
+    "locations": [
+      {
+        "path": "core/aes.js",
+        "sha256": "cb06b0e0f5405a08b19a22728bda36b182a6f7513bf5e4a36819f9ed0f3e5c33"
+      }
+    ],
+    "critical_source_findings": 0
+  },
+  {
+    "name": "tweetnacl",
+    "version": "1.0.3",
+    "role": "encrypted-data",
+    "review": "The secretbox/open APIs operate on caller-supplied message bytes, nonce and key.",
+    "locations": [
+      {
+        "path": "nacl-fast.js",
+        "sha256": "6bcd37a3b20dce913f82d4b23e4e2b661058b4b953df8a3f8c45d56ac4f72447"
+      }
+    ],
+    "critical_source_findings": 0
+  },
+  {
+    "name": "libsodium-wrappers",
+    "version": "0.7.15",
+    "role": "encrypted-data",
+    "review": "Exports cryptographic wrappers that transform caller-supplied byte arrays; cryptographic implementation is delegated to libsodium.",
+    "locations": [
+      {
+        "path": "dist/modules/libsodium-wrappers.js",
+        "sha256": "828884732c06fa4443688b33ceb4ab42e6e1b99200e4749be375faa289e94158"
+      }
+    ],
+    "critical_source_findings": 0
+  },
+  {
+    "name": "dotenv-vault",
+    "version": "1.27.0",
+    "role": "conditional-config-decryption",
+    "review": "The decrypt command selects an environment and decrypts user configuration for output, rather than treating plaintext as executable source.",
+    "locations": [
+      {
+        "path": "dist/services/decrypt-service.js",
+        "sha256": "c7d4b616b8e87df563635d4f6b3b3d8b29ae220756b46b25dda1bf1aa2d000c5"
+      }
+    ],
+    "critical_source_findings": 0
+  },
+  {
+    "name": "@dotenvx/dotenvx",
+    "version": "1.31.0",
+    "role": "conditional-config-decryption",
+    "review": "Explicit decryption reads chosen env files and keys, replaces encrypted values, and writes configuration data.",
+    "locations": [
+      {
+        "path": "src/lib/helpers/decrypt.js",
+        "sha256": "01145c1b8af716c1cdd7a256df7721bbc0a52b6ea4d57b994adbf3c0f7ac061e"
+      },
+      {
+        "path": "src/lib/services/decrypt.js",
+        "sha256": "043ca96648b2a66fddcac3941c09a5a287897ea8f7f9752a68afec32c3515ca8"
+      }
+    ],
+    "critical_source_findings": 0
+  },
+  {
+    "name": "rimraf",
+    "version": "6.0.1",
+    "role": "explicit-filesystem-deletion",
+    "review": "Deletion APIs accept caller-selected paths and options. They do not establish arbitrary background destruction.",
+    "locations": [
+      {
+        "path": "dist/esm/index.js",
+        "sha256": "5884154182fc3e57c3bbd70fa49620b7c9527d587c5a80d8c510be9cd5c72128"
+      }
+    ],
+    "critical_source_findings": 0
+  },
+  {
+    "name": "del",
+    "version": "8.0.0",
+    "role": "explicit-filesystem-deletion",
+    "review": "Deletion takes explicit patterns and guards the cwd and paths outside it unless force is selected.",
+    "locations": [
+      {
+        "path": "index.js",
+        "sha256": "24f24d12dc314678cf8570a34582142a45e211e22c3134e0dc4b13d19f99cdbd"
+      }
+    ],
+    "critical_source_findings": 0
+  },
+  {
+    "name": "fs-extra",
+    "version": "11.3.0",
+    "role": "explicit-filesystem-mutation",
+    "review": "remove/removeSync delete the path supplied by the caller.",
+    "locations": [
+      {
+        "path": "lib/remove/index.js",
+        "sha256": "0ac7807ffba679e0d8fee03d3879da7f3d99bc16e8db6c6494c8eaf9ec5608b6"
+      }
+    ],
+    "critical_source_findings": 0
+  },
+  {
+    "name": "trash",
+    "version": "9.0.0",
+    "role": "explicit-filesystem-deletion",
+    "review": "Explicitly supplied paths are resolved and passed to platform trash implementations.",
+    "locations": [
+      {
+        "path": "index.js",
+        "sha256": "eb080bca3e04ca0a831272a8c7080d061ea2c383beaf3936e6c53c0011afd241"
+      }
+    ],
+    "critical_source_findings": 0
+  },
+  {
+    "name": "clean-webpack-plugin",
+    "version": "4.0.0",
+    "role": "build-output-cleanup",
+    "review": "Build cleanup uses the configured webpack output directory and protects generated assets by default.",
+    "locations": [
+      {
+        "path": "dist/clean-webpack-plugin.js",
+        "sha256": "32b907781a6736073d979e4441a3b62b14b92efa58d4bd9e492b4f69b033bc71"
+      }
+    ],
+    "critical_source_findings": 0
+  },
+  {
+    "name": "shx",
+    "version": "0.3.4",
+    "role": "explicit-shell-tools",
+    "review": "The CLI dispatches an explicitly selected shell command; command support alone is a capability.",
+    "locations": [
+      {
+        "path": "lib/shx.js",
+        "sha256": "979f1757bd6a26175fbef4f66a02e8520bdfb3a842c45eb633446169738ce358"
+      }
+    ],
+    "critical_source_findings": 0
+  }
+]

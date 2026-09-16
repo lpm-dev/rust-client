@@ -1,0 +1,41 @@
+{
+  "version": 1,
+  "scope": "Evaluate and report only; detector, policy, severity and scan limits remain frozen.",
+  "families": {
+    "credential_files": "Credential-file contents reach an unrelated external recipient; environment-only telemetry does not satisfy this category.",
+    "install_download": "A lifecycle entry point retrieves and runs an untrusted remote stage; an ordinary vendor installer alone does not establish malware.",
+    "encrypted_activation": "An encoded or encrypted executable payload has a selective trigger. Encryption of user data alone does not establish a payload.",
+    "destructive_files": "Code deletes or overwrites consumer data outside its stated cleanup scope. File removal capability alone does not establish malicious intent."
+  },
+  "selection": "400 fixed candidate archives, one per metadata group. Four review-text hint strata of 60, 60 additional OpenSSF candidates, 100 Datadog candidates. Hints can overlap and are not confirmed labels.",
+  "holdout": "Reserve whole name/scope, advisory and cited-source-hash components by SHA-256 seed modulo five. Prior popular/historical families are excluded. Reserved archives are not opened or scanned in this pilot. Code-similarity closure and campaign review must precede any independent validation claim. Related reserved components discovered later must be quarantined, not relabeled independent.",
+  "label_tiers": [
+    "external_archive_label_unreviewed",
+    "model_label_unconfirmed",
+    "source_reviewed_attack",
+    "legitimate_control",
+    "ambiguous_or_out_of_scope"
+  ],
+  "reporting": [
+    "behavior-specific findings",
+    "other Critical source warnings",
+    "capabilities and informational signals",
+    "source-review-confirmed missed behavior",
+    "unsupported or absent stages",
+    "extraction, integrity, parser and budget failures"
+  ],
+  "no_substitution": "Acquisition and scan failures stay in the selected denominator and are reported separately.",
+  "control_selection": "16 previously reviewed credential/downloader controls and 12 additional pinned crypto, conditional-config and deletion controls. These are functional controls, not clean-package certifications.",
+  "execution": "Read-only source analysis. No package installation, lifecycle execution, sample execution, payload-destination requests or production enforcement writes.",
+  "bounds": {
+    "archive_bytes": 157286400,
+    "expanded_bytes": 536870912,
+    "archive_entries": 100000,
+    "per_case_scanner_seconds": 120,
+    "temporary_disk_headroom_bytes": 2147483648,
+    "scanner_threads": 4
+  },
+  "source_coverage": "Frozen JS/TS selection: 4 MiB/file, 50 MiB/package, 5000 files. Non-JS stages and dependencies are tracked separately.",
+  "metrics": "Archive-level counts and conservative code-linked-group counts. No population recall or false-positive estimate without reviewed ground truth and representative independent sampling.",
+  "operational_cost": "Per-package scan time, separate acquisition/inspection time, per-process peak RSS, parser and selection gaps. No before/after speed claim."
+}

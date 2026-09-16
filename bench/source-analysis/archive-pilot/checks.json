@@ -1,0 +1,42 @@
+{
+  "harness_tests": {
+    "command": "python3 bench/source-analysis/test_corpus.py",
+    "passed": 43,
+    "failed": 0
+  },
+  "detector_changes": 0,
+  "source_freeze": "All 11 frozen source hashes and preserved scanner hash match.",
+  "selection_freeze": "All four pre-scan protocol/selection/control/inventory commitments match.",
+  "reviewed_case_repeat": {
+    "cases": 13,
+    "analysis_matches": 13,
+    "comparison": "Compare full analyses after removing analyzedAt and applying identical publication redaction."
+  },
+  "acquisition_bounds": "All 400 selected records satisfy compressed-byte/hash rules; all 100 retrieved ZIP central directories satisfy the added expanded-byte bound.",
+  "controls": "All 28 acquired archive hashes and package identities match.",
+  "redaction": "All JSON and JSONL artifacts checked for excerpts, nested domain fields, private paths, storage URIs and raw snippets.",
+  "harness_corrections": "Three regressions reproduced before fixes: ZIP pre-inspection byte bounds, local compressed-byte bounds, nested domain redaction. No detector change.",
+  "final_harness_sha256": {
+    "archive_inventory.py": "3b88958ff1d57850e445d1d3b5c4ca18f46cad9a77dd6a2544eab99260cac0ab",
+    "archive_pilot.py": "9127cea5df6037c0b9693d687dfd8231b085f0a35212395f182ee28b6c727060",
+    "archive_fetch.mjs": "f29c089af01dcbe126d51c68750c84c70bdff4ffe1031b964e023417a1aac0df",
+    "archive_report.py": "51d25f0ceb37fe137d0a19d380ba381a42ee474db2f1daa487e9f9e499b97c20",
+    "test_corpus.py": "dc123d2bb18a80e954cbb70e0221571e2c9f170c694270ac325d65e766a686a0"
+  },
+  "rust_validation": "No Rust source, manifests, policies or dependencies changed. Used the preserved scanner; Rust workspace builds not repeated for this evaluation-only harness.",
+  "publication_files_sha256": {
+    "control-acquisition.json": "0dc7f311cec9083379b562fe5e33ec71554c8db968a37f9c1587668929be5b3c",
+    "control-results.jsonl": "fdfd2c712266e4d21ca641425e0f1a04630edc52d48d1af27481b9c333a4988d",
+    "control-review.json": "839603688675870cad014a3fbb723d5cfd16727250b660780d2f5044effddd46",
+    "controls.json": "1c68fc0a3626dca3eb1037c720e64faafd8eddd18719f00eb496a35a3a1a4011",
+    "coverage.json": "d9f7bde8ea67ea733812dcc31fc0893f2cd652287411957fc1794f75108dc7e5",
+    "freeze.json": "15f907be8ade8cd808888566bbfcb80c0f69da61760312bd0a7002322d07e487",
+    "inventory-summary.json": "5a92dc1544bda6aaf59dc503485ed697e711f4ebb669f1a783544a9b3e423c32",
+    "label-audit.json": "994e2313df54717770ac1b40f23f221c7a1cdb2b4dcf1999feedf6b996a0e586",
+    "protocol.json": "545b2cbcfa895c0639b95f7cd7a2c45b0ab549ba746377db36100cd3b5f57c30",
+    "results.jsonl": "167bc24c8ec3177bbba4fdf66307474989aa93dea4310c4e9594aaa6e7627fb9",
+    "selection.json": "d2cd5906e988d8457a3df4d797aa6e18097310a1a9213ac303da4cf707a388b1",
+    "source-reviews.json": "258e0ebd6b784889d1ed29002c0a8e03b533f0a86b661596d751bf78142e383d",
+    "summary.json": "3081d33efa7e6385f99aa36bdfa2c5dd476d005210dccf194764cf2c012503d9"
+  }
+}

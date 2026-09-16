@@ -9,6 +9,8 @@ The original 1,000-package report and artifacts remain unchanged.
 The [credential-exfiltration follow-up](threat-detection/report.md) records detection changes and their measured costs.
 That follow-up reuses the former validation set as regression evidence.
 The [attack-family evaluation](attack-families/report.md) measures credential-file theft and installation downloaders with the detector frozen.
+The [archive pilot](archive-pilot/report.md) screens 400 archived candidates across four focus areas with 28 legitimate controls.
+It reports source-reviewed gaps, uncertain labels, and coverage limits without changing the detector.
 
 ## Audit output
 
@@ -38,7 +40,7 @@ Registry-only evidence can be empty. Local evidence survives a matching registry
 
 ## Reproduce a scan
 
-Use Python 3.10 or newer and the repository's pinned Rust toolchain.
+Use Python 3.11 or newer and the repository's pinned Rust toolchain.
 The archive harness needs no third-party Python packages.
 
 1. Run the harness tests.

@@ -1,0 +1,30 @@
+{
+  "frozen_at": "2026-09-16T18:37:30.973855+00:00",
+  "detector_commit": "12d0ba41331e6e29367ac49ac258626a85762cbd",
+  "scanner_sha256": "c993cc8e9d02c2a8c5dc5e737545f36e80d38724fd80d53fe902092452190728",
+  "source_sha256": {
+    "crates/lpm-security/src/behavioral/supply_chain.rs": "158861829a5dabb4297cf1ea4955fc63554d9a813670fcc03d4ed87928a9e9f6",
+    "crates/lpm-security/src/behavioral/manifest.rs": "d43ebd89a04499348437e4904a9c3615328cce9ad0f1e2cca3adfec2db8ca570",
+    "crates/lpm-security/src/behavioral/source.rs": "218995a8a0545f92ef19c900de661290d9643d7c7ca7f51d915cc9852f4af4e7",
+    "crates/lpm-security/src/behavioral/evidence.rs": "31c9fa7f5421d0b7abd395f27a9e223f23a9d13fad0b9ac0ad3d4454de14ba15",
+    "crates/lpm-security/src/behavioral/mod.rs": "2bc56bd23def80edceda1d7faf374f4c823ad327854282e8c6cb390b40f13685",
+    "crates/lpm-security/src/behavioral/threats.rs": "3b85b930f75012ad911928576df1603cb944c2aa53b19ea614b9481289cd0740",
+    "crates/lpm-security/src/behavioral/syntax.rs": "26226e170f09b64af6726edaa8fa06cf430ed91741f3b3bfe4dd2587ce84bb78",
+    "crates/lpm-security/src/behavioral/bindings.rs": "8b9b845f8397d2266e52cb19bfc187e0bf6a299623fdcedc649b77516fb3f671",
+    "crates/lpm-security/src/behavioral/secrets.rs": "49f33159be794891389255cdcdf1eea2da1ec8e4ca5a9d9112b1c97a0e3bdc44",
+    "crates/lpm-security/src/behavioral/threats/bundles.rs": "8cc67b440bb47a364d362205febdb68203d30f0cbbed2d8516a534bb93bd006c",
+    "crates/lpm-security/src/query.rs": "978194df7c293d12d9e8e889444b971813e4013d6b9f95cbbd003e14cd1a2633"
+  },
+  "inputs_sha256": {
+    "selection.json": "d2cd5906e988d8457a3df4d797aa6e18097310a1a9213ac303da4cf707a388b1",
+    "inventory-summary.json": "5a92dc1544bda6aaf59dc503485ed697e711f4ebb669f1a783544a9b3e423c32",
+    "controls.json": "1c68fc0a3626dca3eb1037c720e64faafd8eddd18719f00eb496a35a3a1a4011",
+    "protocol.json": "545b2cbcfa895c0639b95f7cd7a2c45b0ab549ba746377db36100cd3b5f57c30"
+  },
+  "note": "Selection and protocol recorded before viewing frozen-detector pilot output. Later harness repairs must be documented with affected reruns.",
+  "harness_sha256": {
+    "archive_inventory.py": "3b88958ff1d57850e445d1d3b5c4ca18f46cad9a77dd6a2544eab99260cac0ab",
+    "archive_pilot.py": "744b1bedf1cbf1c5d5867dd11d61b5303a7e8ec1a266eed26780fd5775d3976b",
+    "archive_fetch.mjs": "f29c089af01dcbe126d51c68750c84c70bdff4ffe1031b964e023417a1aac0df"
+  }
+}
