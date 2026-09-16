@@ -281,3 +281,76 @@ async fn audit_separates_capabilities_and_preserves_explicit_policy_failures() {
         assert_eq!(explicit.status.code(), Some(1), "{policy}");
     }
 }
+
+#[tokio::test]
+async fn install_cache_and_audit_agree_on_scoped_runtime_evaluation() {
+    for (source, expected) in [
+        (
+            "class Function {} new Function(); const parser = {eval: value => value}; parser.eval(input);",
+            false,
+        ),
+        (
+            "const Compile = Function; module.exports = source => new Compile(source);",
+            true,
+        ),
+        (
+            "const vm = require('node:vm'); module.exports = source => vm.runInNewContext(source);",
+            true,
+        ),
+    ] {
+        let mock = MockRegistry::start().await;
+        let name = "evaluation-control";
+        let tarball = make_tarball_from_pkg_json(
+            serde_json::json!({"name": name, "version": "1.0.0", "license": "MIT"}),
+            &[("index.js", source.as_bytes())],
+        );
+        mock.with_package(name, "1.0.0", &tarball).await;
+        mock.with_osv_querybatch(vec![vec![]]).await;
+        let project = TempProject::empty(
+            r#"{"name":"consumer","version":"1.0.0","dependencies":{"evaluation-control":"1.0.0"}}"#,
+        );
+        write_config(&project, "install-time-source-analysis = true\n");
+        let installed = lpm_with_registry_and_npm(&project, &mock.url())
+            .env("LPM_STORE_VERSION", "v2")
+            .args(["install", "--no-skills", "--no-editor-setup"])
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&installed.stderr);
+        assert!(installed.status.success(), "{source}: {stderr}");
+        assert_eq!(stderr.contains("eval()"), expected, "{source}: {stderr}");
+        let store = lpm_store::v2::Store::at(project.home().join(".lpm/store/v2"));
+        let object = store
+            .paths()
+            .object_dir(&compute_integrity(&tarball))
+            .unwrap();
+        let cached: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(object.join(".lpm-security.json")).unwrap())
+                .unwrap();
+        assert_eq!(cached["source"]["eval"], expected, "{source}");
+        assert_eq!(cached["version"], lpm_security::behavioral::SCHEMA_VERSION);
+        let audit = lpm_with_registry_and_npm(&project, &mock.url())
+            .env("LPM_OSV_URL", format!("{}/v1/querybatch", mock.url()))
+            .args(["--json", "audit", "--fail-on=behavior"])
+            .output()
+            .unwrap();
+        assert_eq!(
+            audit.status.code(),
+            Some(i32::from(expected)),
+            "{source}: {}",
+            String::from_utf8_lossy(&audit.stderr)
+        );
+        let envelope: serde_json::Value = serde_json::from_slice(&audit.stdout).unwrap();
+        let found = envelope["packages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|package| {
+                package["capabilities"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|capability| capability["rule_id"] == "eval")
+            });
+        assert_eq!(found, expected, "{source}");
+    }
+}
