@@ -1,11 +1,11 @@
 # Source analysis finding ledger
 
-Nine findings were verified and fixed. None were rejected, externally blocked, or left pending.
+Ten findings were verified and fixed. None were rejected, externally blocked, or left pending.
 All changes belong to one source-analysis concept branch. The branch is not merged.
 No subagents participated in this review.
 
 Each regression failed before its corresponding production correction.
-The resolution commits are `d87e9982` and `6569ea1c`.
+The resolution commits are `d87e9982`, `6569ea1c`, and `89a2901d`.
 
 | ID | Source | Category | Location | Claim and evidence | Disposition | Regression coverage | Commit | PR status |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- |
@@ -18,6 +18,7 @@ The resolution commits are `d87e9982` and `6569ea1c`.
 | SRC-007 | Primary validation review | Correctness | `behavioral/bindings.rs` | The first validation candidate missed a deferred `createRequire` assignment in `import-in-the-middle`. | Verified | `loaders_and_process_aliases_assigned_after_declaration_remain_detectable` | `d87e9982` | Unmerged concept branch |
 | SRC-008 | Primary final code review | Correctness | `behavioral/bindings.rs` | Library helper calls such as Execa `parseCommand` and ShellJS `which` incorrectly implied process execution. | Verified | `process_library_helpers_do_not_imply_process_or_shell_execution`, `execa_entry_points_and_shelljs_exec_retain_process_capabilities` | `d87e9982` | Unmerged concept branch |
 | SRC-009 | Primary differential review | Correctness | `behavioral/bindings.rs` | The candidate classified `require('u' + 'rl')` in `@pkgr/core` as dynamic. Fixed string expressions now remain static, with process-module recognition preserved. | Verified | `constant_string_module_specifiers_are_static`, `constant_string_process_imports_retain_capabilities` | `6569ea1c` | Unmerged concept branch |
+| SRC-010 | Primary merge validation | Test reliability | `tests/workflows/tests/install.rs` | Four successful-audit tests contacted live OSV. All four failed with an unavailable endpoint. Mock responses now isolate these tests. | Verified | All 11 audit-after-install tests pass with an unavailable inherited OSV endpoint. | `89a2901d` | Unmerged concept branch |
 
 Source-only API findings now appear as capabilities. Explicit policies still use the shared severity definitions.
 Evidence retention, serialization, directory/streaming parity, and sampled-file positions also have regression coverage.

@@ -135,6 +135,10 @@ The tests cover source evidence, cache and scanner parity, human and JSON output
 Every verified detector correction started with a failing regression test.
 Earlier runs exposed unrelated timing failures under build load. The final complete workspace run passed those tests without source changes.
 
+Merge validation found that four successful-audit workflow tests contacted the live OSV service.
+All four failed with a deliberately unavailable endpoint. They now use the existing OSV mock.
+All 11 audit-after-install tests pass with that same unavailable inherited endpoint. This correction changes test setup only.
+
 ## Recommendation
 
 Keep capabilities separate from security warnings, with explicit policies for teams that restrict APIs.
