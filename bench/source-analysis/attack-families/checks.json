@@ -1,0 +1,17 @@
+{
+  "scope": "Evaluation harness and report only. Rust detector, CLI, dependencies, and policies are unchanged.",
+  "harness_tests": {
+    "command": "python3 bench/source-analysis/test_corpus.py",
+    "passed": 24,
+    "failed": 0,
+    "incident_reconstruction_tests": 6
+  },
+  "reconstruction_repeat": "All historical input paths, sizes, and SHA-256 hashes matched the frozen manifest on a second preparation.",
+  "frozen_inputs_and_source": "Every hash in freeze.json matches.",
+  "scan_output": "All 19 input identities matched; both scanner processes exited 0.",
+  "control_archives": "All 16 package identities and acquisition archive hashes matched.",
+  "public_evidence": "Valid JSON; evidence excerpts omitted from all published result rows.",
+  "detector_changes": 0,
+  "rust_builds": "Not repeated for unchanged detector code; this pass ran only source-corpus harness tests and the preserved scanner.",
+  "original_malicious_archives": "Unavailable from npm. Pinned contemporary source and an archived diff provide explicitly labeled reconstruction evidence."
+}

@@ -1,0 +1,26 @@
+[
+  {
+    "file": "ua-parser-diff.html",
+    "url": "https://raw.githubusercontent.com/tstromberg/supplychain-attack-data/a87dcc3559ca89f289ce22542805b7badea68cc2/oss/attacks/uaparser-js/refs/04-my-diffend-io.html",
+    "sha256": "3200d8eda2fd36b66d568b5bbc48dfe6fbee8f8580e5e6cf3c1f413aaeeea253",
+    "bytes": 50256
+  },
+  {
+    "file": "eslint-build.js",
+    "url": "https://gist.githubusercontent.com/hzoo/51cb84afdc50b14bffa6c6dc49826b3e/raw/8e4e7bcc93e644ff1b885c9fab32c31979c2c859/build.js",
+    "sha256": "16553c64b012b6197f717dfd92a91fb115516d70eb9cb5663f77b2524f62eef5",
+    "bytes": 560
+  },
+  {
+    "file": "eslint-pastebin.js",
+    "url": "https://gist.githubusercontent.com/hzoo/51cb84afdc50b14bffa6c6dc49826b3e/raw/8e4e7bcc93e644ff1b885c9fab32c31979c2c859/pastebin.js",
+    "sha256": "6e18314cee6610864225eb6bf83de25b8a5367de8f9eda6bb09c631da74a8fa9",
+    "bytes": 918
+  },
+  {
+    "file": "eslint-readme.md",
+    "url": "https://gist.githubusercontent.com/hzoo/51cb84afdc50b14bffa6c6dc49826b3e/raw/8e4e7bcc93e644ff1b885c9fab32c31979c2c859/readme.md",
+    "sha256": "41186a85f002912b5f8d7d97751363ffd367e840957c85ac71de84c691230093",
+    "bytes": 803
+  }
+]

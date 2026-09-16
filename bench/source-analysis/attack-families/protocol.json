@@ -1,0 +1,68 @@
+{
+  "schema_version": 1,
+  "scope": "Evaluate the frozen detector on credential-file theft and install-time downloaders. Report gaps without changing detection rules.",
+  "detector_commit": "12d0ba41331e6e29367ac49ac258626a85762cbd",
+  "scanner_sha256": "c993cc8e9d02c2a8c5dc5e737545f36e80d38724fd80d53fe902092452190728",
+  "selection_basis": "Two documented incidents selected for their attack mechanisms before this evaluation. Clean neighboring releases and legitimate API users provide contrast. This is a purposive study, not independent population validation.",
+  "historical_cases": [
+    {
+      "id": "eslint-downloader",
+      "incident": "eslint-scope@3.7.2",
+      "input_kind": "recovered first-stage source",
+      "expected_behavior": "Network response passed to eval from an install script",
+      "reference": "https://github.com/advisories/GHSA-hxxf-q3w9-4xgw"
+    },
+    {
+      "id": "eslint-credential-payload",
+      "incident": "eslint-scope@3.7.2",
+      "input_kind": "recovered runtime second stage, absent from the published package",
+      "expected_behavior": "Read the home .npmrc file and send its token in Referer headers to unrelated hosts",
+      "reference": "https://gist.github.com/hzoo/51cb84afdc50b14bffa6c6dc49826b3e/8e4e7bcc93e644ff1b885c9fab32c31979c2c859"
+    },
+    {
+      "id": "ua-parser-installer",
+      "incident": "ua-parser-js@0.7.29",
+      "input_kind": "published source changes reconstructed from an archived version diff and the clean 0.7.28 package",
+      "expected_behavior": "Install hook launches platform scripts that download and run native payloads",
+      "reference": "https://github.com/advisories/GHSA-pjwm-rvh2-c87w"
+    }
+  ],
+  "controls": [
+    {"name": "eslint-scope", "version": "3.7.1", "role": "clean-before"},
+    {"name": "eslint-scope", "version": "3.7.3", "role": "clean-after"},
+    {"name": "ua-parser-js", "version": "0.7.28", "role": "clean-before"},
+    {"name": "ua-parser-js", "version": "0.7.30", "role": "clean-after"},
+    {"name": "npm", "version": "6.14.18", "role": "credential-control"},
+    {"name": "@npmcli/config", "version": "9.0.0", "role": "credential-control"},
+    {"name": "npm-registry-fetch", "version": "18.0.2", "role": "credential-control"},
+    {"name": "registry-auth-token", "version": "5.1.0", "role": "credential-control"},
+    {"name": "esbuild", "version": "0.25.0", "role": "downloader-control"},
+    {"name": "playwright", "version": "1.51.1", "role": "downloader-entry-control"},
+    {"name": "playwright-core", "version": "1.51.1", "role": "downloader-implementation-control"},
+    {"name": "puppeteer", "version": "24.4.0", "role": "downloader-entry-control"},
+    {"name": "@puppeteer/browsers", "version": "2.9.0", "role": "downloader-implementation-control"},
+    {"name": "electron", "version": "35.0.0", "role": "downloader-entry-control"},
+    {"name": "@electron/get", "version": "2.0.3", "role": "downloader-implementation-control"},
+    {"name": "prebuild-install", "version": "7.1.3", "role": "downloader-control"}
+  ],
+  "outcomes": [
+    "Critical source warnings",
+    "Behavior-specific credential or downloader findings, separate from generic obfuscation",
+    "Capabilities retained for legitimate and malicious API use",
+    "Relevant attack-stage files selected, parsed, sampled, skipped, or absent",
+    "Package input completeness, distinct from source-language scan completeness",
+    "Wall time and peak resident memory as operational observations, not a performance comparison"
+  ],
+  "constraints": [
+    "Never execute package scripts, source, or binaries.",
+    "Never contact payload destinations found inside samples.",
+    "Keep payload bytes and raw evidence excerpts outside tracked files.",
+    "Pin source references, archive hashes, reconstructed inputs, and the scanner before scanning.",
+    "Count two incidents, not three independent attacks or every poisoned version as a separate family.",
+    "Do not count the recovered ESLint second stage as an install-time package detection.",
+    "Document missing original malicious archives and reconstruction limits.",
+    "Keep every selected control in the results. Record acquisition failures instead of silent replacement.",
+    "Do not claim that benign controls are free of unrelated vulnerabilities.",
+    "Do not tune the detector or select more examples after seeing outcomes."
+  ]
+}

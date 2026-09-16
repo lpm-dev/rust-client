@@ -6,6 +6,10 @@ It uses the same directory scanner as `lpm audit` and opted-in install analysis.
 The [expanded study](expanded/report.md) adds 9,000 packages and a fresh 2,000-package independent validation set.
 The original 1,000-package report and artifacts remain unchanged.
 
+The [credential-exfiltration follow-up](threat-detection/report.md) records detection changes and their measured costs.
+That follow-up reuses the former validation set as regression evidence.
+The [attack-family evaluation](attack-families/report.md) measures credential-file theft and installation downloaders with the detector frozen.
+
 ## Audit output
 
 Source capabilities describe API use. They do not establish execution or malicious intent.

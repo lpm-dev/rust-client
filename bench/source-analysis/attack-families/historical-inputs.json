@@ -1,0 +1,219 @@
+[
+  {
+    "rank": 1,
+    "case_id": "eslint-downloader",
+    "name": "eslint-scope",
+    "version": "3.7.2",
+    "split": "validation",
+    "files": [
+      {
+        "path": "CHANGELOG.md",
+        "bytes": 1468,
+        "sha256": "55346efd861505cdb6c3905e35025f658b9539bc47485d72245325f0d7455a7a"
+      },
+      {
+        "path": "LICENSE",
+        "bytes": 1403,
+        "sha256": "8be44da6cc59e890c406d6d05c3ce1850f29bb2e0da2a2d686d593e5ad3ecf59"
+      },
+      {
+        "path": "README.md",
+        "bytes": 1504,
+        "sha256": "85cb0606704bc29940ec3133e1b58739299e0db3c89f9c4eb3d8eb7b5bc847a4"
+      },
+      {
+        "path": "lib/build.js",
+        "bytes": 560,
+        "sha256": "16553c64b012b6197f717dfd92a91fb115516d70eb9cb5663f77b2524f62eef5"
+      },
+      {
+        "path": "lib/definition.js",
+        "bytes": 2866,
+        "sha256": "394ca9f0d46b63dda433faa63ae0dce2ef4eb35ae0846ab18f796c9e78eb0a99"
+      },
+      {
+        "path": "lib/index.js",
+        "bytes": 6345,
+        "sha256": "01f0cd3ed5512eb27b80e9498ae305e3afdd35aed586c1b288927286d42ed876"
+      },
+      {
+        "path": "lib/pattern-visitor.js",
+        "bytes": 4924,
+        "sha256": "c7e31aadbb9b7c26b7649593fa57be3b7d07eddaf00fee20dfef851ebab3900b"
+      },
+      {
+        "path": "lib/reference.js",
+        "bytes": 4771,
+        "sha256": "24d31ff2d639970ee8e920db53716495f05d1fdc13f5a4ddac75b4e66bad75ee"
+      },
+      {
+        "path": "lib/referencer.js",
+        "bytes": 19995,
+        "sha256": "89f6c642e34de8583aff78b2a48a43fc1b01d6e036db9a38ca98fd58795cab6c"
+      },
+      {
+        "path": "lib/scope-manager.js",
+        "bytes": 7694,
+        "sha256": "8629713e6bd9f6cf90300f24df8efc5fe79f6e9d69b2afe35917a122847ef853"
+      },
+      {
+        "path": "lib/scope.js",
+        "bytes": 20781,
+        "sha256": "f5f0c85c41dd8893a20d26010dc9726218795d54dadcac5509a093c27ecaa665"
+      },
+      {
+        "path": "lib/variable.js",
+        "bytes": 3163,
+        "sha256": "1e3849d6de279a5ca34e2d7510948bedc4d3b4be0b6db2e7de6e470ba12515d4"
+      },
+      {
+        "path": "package.json",
+        "bytes": 1195,
+        "sha256": "fc0ef468823ca140ee177c332abac764cfd69c7b66c964c433385f76336621ca"
+      }
+    ]
+  },
+  {
+    "rank": 2,
+    "case_id": "eslint-credential-payload",
+    "name": "evaluation-eslint-credential-payload",
+    "version": "0.0.0",
+    "split": "validation",
+    "files": [
+      {
+        "path": "package.json",
+        "bytes": 94,
+        "sha256": "2390f351fdc7ac9b985ce6767e7874e5a14c1260af0d8519335bc3a8fc0736f2"
+      },
+      {
+        "path": "pastebin.js",
+        "bytes": 918,
+        "sha256": "6e18314cee6610864225eb6bf83de25b8a5367de8f9eda6bb09c631da74a8fa9"
+      }
+    ]
+  },
+  {
+    "rank": 3,
+    "case_id": "ua-parser-installer",
+    "name": "ua-parser-js",
+    "version": "0.7.29",
+    "split": "validation",
+    "files": [
+      {
+        "path": ".github/FUNDING.yml",
+        "bytes": 640,
+        "sha256": "9499679b1abdde611e24b2ec225b3262d9e2157f55c5fc1e76e0dff2852f24f1"
+      },
+      {
+        "path": ".github/workflows/run-test.yml",
+        "bytes": 330,
+        "sha256": "0953685c3cc9fbfd6e11c12ab07e33a3b588bfc0bfe636b48695c80dd6b21972"
+      },
+      {
+        "path": ".travis.yml",
+        "bytes": 194,
+        "sha256": "96276e437080c80dc56fa7d255fa657c177d59a4c3c55c99442164848ae47d14"
+      },
+      {
+        "path": "bower.json",
+        "bytes": 282,
+        "sha256": "50261abd98b8d42a85a62eefe447f7c3ae3d4cc616cfa29b30cf66414dd42d4a"
+      },
+      {
+        "path": "changelog.md",
+        "bytes": 41,
+        "sha256": "c9772a0d6190f08a50a9d2377b1a9da22ab2bc2cfc181ba7d4630e3b57c4864f"
+      },
+      {
+        "path": "dist/ua-parser.html",
+        "bytes": 43,
+        "sha256": "f89caf9dfb42d9e102bfaaf9c03332dccddee3f06b8b1d308cc35e40faa95e90"
+      },
+      {
+        "path": "dist/ua-parser.min.js",
+        "bytes": 20032,
+        "sha256": "2c6d30046daef775ef149a76b9faf5a48f741e9d13575fe69955fd5caa061864"
+      },
+      {
+        "path": "dist/ua-parser.pack.js",
+        "bytes": 16487,
+        "sha256": "c6a7518bcf08fc939f9c3c45f8c61efd045a4613743689abb501dac0d3218cd4"
+      },
+      {
+        "path": "license.md",
+        "bytes": 1095,
+        "sha256": "fb9548e36708f09ae0cc1047ebd8153928bfe5bed67e4051f0ace552bdcbf0b3"
+      },
+      {
+        "path": "package.js",
+        "bytes": 329,
+        "sha256": "83a47c463ff35b4bb51273af75f4f86eb271d96bf0b5ed6fce28c3ce56f276b0"
+      },
+      {
+        "path": "package.json",
+        "bytes": 7418,
+        "sha256": "82bd9d21a895327a17a7fd55d8c1270402bd0e5cf0443936be90d3738ce24560"
+      },
+      {
+        "path": "preinstall.bat",
+        "bytes": 1020,
+        "sha256": "0a265ae6fc828cdbd917facf2383792190ff45c3cd63108edc510d4d54d53930"
+      },
+      {
+        "path": "preinstall.js",
+        "bytes": 669,
+        "sha256": "62e08e4967da57e037255d2e533b7c5d7d1f1773af2a06113470c29058b5fcd0"
+      },
+      {
+        "path": "preinstall.sh",
+        "bytes": 575,
+        "sha256": "21e68b048024ba0cc5a2a94ecbc3a78c626ec7d5d705829a82ea4715131d0509"
+      },
+      {
+        "path": "readme.md",
+        "bytes": 11796,
+        "sha256": "bb27eb2d49de6890b8738fb6c73cf8fb3def8042ea5534405a1f8bf6faad2b9c"
+      },
+      {
+        "path": "src/ua-parser.js",
+        "bytes": 44444,
+        "sha256": "d76e5ced3c7ad99574bdc7abac838e5111577172af775a978ee6a571c8218b0b"
+      },
+      {
+        "path": "test/browser-test.json",
+        "bytes": 45861,
+        "sha256": "c2d768d42ff4097809531a363633f5d71b0fff2e4c2f481c25dfdabec23d966e"
+      },
+      {
+        "path": "test/cpu-test.json",
+        "bytes": 5123,
+        "sha256": "72f071147b9e23e1da90042f789249790c46a82efcfcb2840db432f22d529c5b"
+      },
+      {
+        "path": "test/device-test.json",
+        "bytes": 87735,
+        "sha256": "e7f0fe7e37e328bba24572923cc92a86c78d4df1df4d579310f9b3b72ec33d9c"
+      },
+      {
+        "path": "test/engine-test.json",
+        "bytes": 4769,
+        "sha256": "2344a4847565a309dcbb50c3f27458ff9e0a13a3817544d49db0cbd221508053"
+      },
+      {
+        "path": "test/mediaplayer-test.json",
+        "bytes": 14318,
+        "sha256": "71a140d4a7f59cd7dc921308e0312f6c795699417d988c4655f402a15d9b5218"
+      },
+      {
+        "path": "test/os-test.json",
+        "bytes": 25905,
+        "sha256": "d339ea7b25b6655d9c53aa08a7661f83356d1432bb332077a60d46002495aa9f"
+      },
+      {
+        "path": "test/test.js",
+        "bytes": 13747,
+        "sha256": "9319b105edd95bc69ac9ebd1e111741bc0165880ca1b0685e3e434d1b206b977"
+      }
+    ]
+  }
+]
