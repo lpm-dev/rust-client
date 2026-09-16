@@ -12,6 +12,8 @@
   <a href="https://lpm.dev"><img src="assets/lpm-registry-icon.svg" alt="" height="18"> LPM.dev Registry</a>
   <span>&nbsp;&nbsp;•&nbsp;&nbsp;</span>
   <a href="https://firewall.lpm.dev"><img src="assets/lpm-firewall-icon.svg" alt="" height="18"> LPM Firewall</a>
+  <span>&nbsp;&nbsp;•&nbsp;&nbsp;</span>
+  <a href="https://vault.lpm.dev"><img src="assets/lpm-vault.svg" alt="" height="18"> LPM Vault</a>
 </div>
 
 ## What is LPM?
@@ -24,11 +26,12 @@ lpm add lpm-source-package
 lpm run dev
 ```
 
-LPM has three connected parts:
+LPM has four connected parts:
 
 - **LPM CLI** - an npm-compatible package manager and dev toolkit written in Rust. It installs from npm, lpm.dev, JSR, and private registries; blocks dependency lifecycle scripts by default; and includes a task runner, dev server, test/bench runner, linter, formatter, Node version pinning, local HTTPS, tunnels, secrets, and project health checks.
 - **LPM.dev Registry** - the hosted registry and platform behind the `@lpm.dev/*` scope. Use it for private packages, Pool distribution, Marketplace sales, Swift packages, package quality analysis, generated metadata, access control, and Pro/team platform features.
 - **LPM Firewall** - a hosted verdict service for public npm package versions. It can run in monitor mode or enforcement mode before LPM materializes package bytes, helping teams catch malicious packages, critical vulnerabilities, suspicious lifecycle behavior, and policy violations during install.
+- **LPM Vault** - a native macOS app for project environment variables and secrets. It stores secrets in the macOS Keychain, supports multiple environments, and syncs encrypted data through LPM.dev. The app shares local env data with the LPM CLI, so edits are available to `lpm env` and `lpm run`.
 
 ## Install
 
@@ -49,10 +52,6 @@ Run the installer and all LPM CLI user commands without `sudo`. LPM CLI elevates
 
 The npm package installs the matching platform package through `optionalDependencies`. The approved `postinstall` script verifies the native program and connects the global commands to it.
 
-On macOS, each install method stores a signed `LPM CLI.app` in its private support directory. The `lpm` and `lpx` commands are direct links to its Rust executable. Normal commands do not start Node or a shell. LPM CLI does not require LPM Vault to run.
-
-If install scripts are disabled, the npm package keeps its small Node launcher as a fallback. Reinstall with scripts enabled to restore direct native commands.
-
 If your npm version or policy does not require explicit script approval, this also works:
 
 ```bash
@@ -67,20 +66,12 @@ lpm self-update --channel nightly  # switch to nightly
 lpm self-update --channel stable   # switch back to stable
 ```
 
-Pre-bundle macOS standalone installs have one extra step. Run `lpm self-update` twice when the first run replaces version 0.75 or older. The second run migrates into `~/.lpm/libexec/LPM CLI.app` and creates direct `lpm` and `lpx` links. Releases retain the signed raw compatibility artifact until this updater baseline is retired.
-
 Nightly snapshots are available through npm and the standalone installer:
 
 ```bash
 npm install -g @lpm-registry/cli@nightly
 curl -fsSL https://cli.lpm.dev/install | LPM_INSTALL_CHANNEL=nightly sh
 ```
-
-## Authentication recovery
-
-`LPM_TOKEN` overrides a saved login. If the registry rejects this token, replace it or unset `LPM_TOKEN` to use your saved login. The CLI preserves saved credentials. JSON output reports `env_token_rejected` with recovery guidance.
-
-See [`lpm login`](https://cli.lpm.dev/docs/infra/login) for authentication and token storage.
 
 ## Quick Links
 
@@ -157,22 +148,22 @@ See [`lpm login`](https://cli.lpm.dev/docs/infra/login) for authentication and t
 
 Install benchmarks use the tracked VitePress docs fixture, a real-world workspace graph with 535 packages.
 
-| Benchmark                       |       npm |    pnpm |     bun |  **lpm** | **lpm + Firewall monitor** |
-| ------------------------------- | --------: | ------: | ------: | -------: | -------------------------: |
-| Cold install, equal footing ¹   | 17,354ms | 6,125ms | 2,455ms | 2,945ms |                    3,043ms |
-| Warm install ¹                  |  3,819ms | 3,301ms |   451ms | **387ms** |                   **324ms** |
-| Up-to-date install ¹            |    282ms |   522ms |    77ms |  **14ms** |                    **14ms** |
+| Benchmark                     |      npm |    pnpm |     bun |   **lpm** | **lpm + Firewall monitor** |
+| ----------------------------- | -------: | ------: | ------: | --------: | -------------------------: |
+| Cold install, equal footing ¹ | 17,354ms | 6,125ms | 2,455ms |   2,945ms |                    3,043ms |
+| Warm install ¹                |  3,819ms | 3,301ms |   451ms | **387ms** |                  **324ms** |
+| Up-to-date install ¹          |    282ms |   522ms |    77ms |  **14ms** |                   **14ms** |
 
 Dev command benchmarks measure already-installed local scripts, local bins, and built-in tools.
 
-| Benchmark                         | npm / npx / tsx |    pnpm | bun / bunx |  **lpm** |
-| --------------------------------- | --------------: | ------: | ---------: | -------: |
-| Package script: no-op ²           |            74ms |   161ms |       15ms | **10ms** |
-| Package script: empty Node ²      |           101ms |   185ms |       33ms | **27ms** |
-| Local bin: `esbuild --version` ²  |           144ms |   174ms |       27ms | **21ms** |
-| Run TSX app, warm cache ³         |           112ms |       — |       19ms | **41ms** |
-| `lpm lint` vs `npx oxlint` ⁴      |           273ms |       — |          — |  **3ms** |
-| `lpm fmt` vs `npx biome` ⁴        |           340ms |       — |          — |  **3ms** |
+| Benchmark                        | npm / npx / tsx |  pnpm | bun / bunx |  **lpm** |
+| -------------------------------- | --------------: | ----: | ---------: | -------: |
+| Package script: no-op ²          |            74ms | 161ms |       15ms | **10ms** |
+| Package script: empty Node ²     |           101ms | 185ms |       33ms | **27ms** |
+| Local bin: `esbuild --version` ² |           144ms | 174ms |       27ms | **21ms** |
+| Run TSX app, warm cache ³        |           112ms |     — |       19ms | **41ms** |
+| `lpm lint` vs `npx oxlint` ⁴     |           273ms |     — |          — |  **3ms** |
+| `lpm fmt` vs `npx biome` ⁴       |           340ms |     — |          — |  **3ms** |
 
 <details>
 <summary>Benchmark methodology</summary>
@@ -186,6 +177,7 @@ Dev command benchmarks measure already-installed local scripts, local bins, and 
 > **³ TSX benchmark** — Generated by [`exec-runtime-benchmark.mjs`](bench/scripts/exec-runtime-benchmark.mjs) against a generated 10-module TSX ESM app with 10 measured iterations after 2 warmups. The `npm / npx / tsx` column is `tsx`; the `bun / bunx` column is `bun`. Raw artifact: [`readme-exec-runtime-20260710T141510.md`](bench/perf-results/readme-exec-runtime-20260710T141510.md).
 >
 > **⁴ Built-in tool benchmarks** — Generated with `RUNS=10 LPM_BIN=target/release/lpm-rs BENCH_WORK_DIR=/tmp/lpm-readme-builtin-tools-work-20260711T205110Z ./bench/run.sh builtin-tools` on `bench/project`. The `npm / npx / tsx` column is `npx oxlint` or `npx @biomejs/biome`. Raw artifact: [`readme-builtin-tools-20260711T205110Z.md`](bench/perf-results/readme-builtin-tools-20260711T205110Z.md).
+
 </details>
 
 ## Contributing and security
