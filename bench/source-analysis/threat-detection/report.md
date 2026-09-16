@@ -175,7 +175,7 @@ The Rust 1.94.0 workspace build, all-target Clippy, formatting, and dependency p
 Build and Clippy produce zero warnings. Dependency checks retain existing duplicate-version warnings.
 
 The fast gates pass 6,347 non-CLI tests, 5,132 CLI unit tests, and 99 binary tests.
-All 11 source-analysis workflows and catalog checks pass. The dedicated security suite passes 567 unit tests and one corpus integration test.
+All 11 source-analysis workflows and catalog checks pass. All 70 audit workflows pass, including the oversized-file coverage boundary. The dedicated security suite passes 567 unit tests and one corpus integration test.
 Shell, Python, Node, npm wrapper, and release-helper checks also pass.
 Configured skips and process-leak notices remain visible in the [check records](checks.json).
 

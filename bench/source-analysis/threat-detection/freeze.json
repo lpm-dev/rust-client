@@ -23,7 +23,7 @@
     "historical": "b0be69f50a9b2e7cca8330f723532292454b963f6556b1fe375911e0428e2f98"
   },
   "candidate_code_commit": "f44b769b",
-  "post_freeze_changes": "Rust API documentation comments only; executable source is unchanged.",
+  "post_freeze_changes": "Rust API documentation comments and an oversized-file audit test fixture only; executable detector source is unchanged.",
   "documented_source_sha256": {
     "crates/lpm-security/src/behavioral/supply_chain.rs": "158861829a5dabb4297cf1ea4955fc63554d9a813670fcc03d4ed87928a9e9f6",
     "crates/lpm-security/src/behavioral/manifest.rs": "d43ebd89a04499348437e4904a9c3615328cce9ad0f1e2cca3adfec2db8ca570",
