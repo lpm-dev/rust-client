@@ -2528,8 +2528,8 @@ async fn audit_sampled_source_reports_incomplete_coverage_even_without_findings(
     let project = TempProject::empty(r#"{"name":"coverage-host","version":"1.0.0"}"#);
     let source = format!(
         "/*{}*/\neval(input);\n/*{}*/",
-        "x".repeat(1_100_000),
-        "x".repeat(1_100_000)
+        "x".repeat(2_200_000),
+        "x".repeat(2_200_000)
     );
     seed_node_modules_package(&project, "oversized", &[("index.js", &source)]);
     let mock = MockRegistry::start().await;
@@ -2549,7 +2549,7 @@ async fn audit_sampled_source_reports_incomplete_coverage_even_without_findings(
             json["behavioral_coverage"]["packages"][0]["oversized_source_files"][0]["size_bytes"]
                 .as_u64()
                 .unwrap()
-                > 2 * 1024 * 1024
+                > 4 * 1024 * 1024
         );
     }
 }
