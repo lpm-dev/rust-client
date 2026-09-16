@@ -1,0 +1,68 @@
+{
+  "schema_version": 1,
+  "dataset": "DataDog/malicious-software-packages-dataset",
+  "dataset_commit": "d77c1d650035e90a779bfe30e8368ad8f41b3b3c",
+  "selection": "Five archived compromised npm packages from distinct documented incidents; purposive controls, not a prevalence or recall estimate.",
+  "packages": [
+    {
+      "rank": 1,
+      "name": "@solana/web3.js",
+      "version": "1.95.7",
+      "split": "tuning",
+      "archive_url": "https://raw.githubusercontent.com/DataDog/malicious-software-packages-dataset/d77c1d650035e90a779bfe30e8368ad8f41b3b3c/samples/npm/compromised_lib/%40solana%40web3.js/1.95.7/2024-12-03-%40solana_web3.js-v1.95.7.zip",
+      "archive_sha256": "9059d6e4265a83aa89f47b6254947ae147889c2bada930f67c9cc7c0521a46bb",
+      "archive_bytes": 3305138,
+      "package_root": "tmp/tmp50t85f1e/@solana-web3.js/package/",
+      "label": "historical-compromise",
+      "label_source": "https://github.com/DataDog/malicious-software-packages-dataset/tree/d77c1d650035e90a779bfe30e8368ad8f41b3b3c/samples/npm/compromised_lib/%40solana%40web3.js/1.95.7"
+    },
+    {
+      "rank": 2,
+      "name": "@ctrl/tinycolor",
+      "version": "4.1.1",
+      "split": "tuning",
+      "archive_url": "https://raw.githubusercontent.com/DataDog/malicious-software-packages-dataset/d77c1d650035e90a779bfe30e8368ad8f41b3b3c/samples/npm/compromised_lib/%40ctrl%40tinycolor/4.1.1/2025-09-15-%40ctrl_tinycolor-v4.1.1.zip",
+      "archive_sha256": "71a3fd4f9a5f3269652757ae20530ca34fd1ca75a97c2f8d1c0374bfe57a1144",
+      "archive_bytes": 948823,
+      "package_root": "tmp/tmptq1724t2/@ctrl-tinycolor/package/",
+      "label": "historical-compromise",
+      "label_source": "https://github.com/DataDog/malicious-software-packages-dataset/tree/d77c1d650035e90a779bfe30e8368ad8f41b3b3c/samples/npm/compromised_lib/%40ctrl%40tinycolor/4.1.1"
+    },
+    {
+      "rank": 3,
+      "name": "xrpl",
+      "version": "4.2.1",
+      "split": "tuning",
+      "archive_url": "https://raw.githubusercontent.com/DataDog/malicious-software-packages-dataset/d77c1d650035e90a779bfe30e8368ad8f41b3b3c/samples/npm/compromised_lib/xrpl/4.2.1/2025-04-21-xrpl-v4.2.1.zip",
+      "archive_sha256": "42770982668a889f95b51cbafc8f3034147008f98fd1231f35874e9d171c2650",
+      "archive_bytes": 3064951,
+      "package_root": "tmp/tmpmkn5bwcj/xrpl/package/",
+      "label": "historical-compromise",
+      "label_source": "https://github.com/DataDog/malicious-software-packages-dataset/tree/d77c1d650035e90a779bfe30e8368ad8f41b3b3c/samples/npm/compromised_lib/xrpl/4.2.1"
+    },
+    {
+      "rank": 4,
+      "name": "debug",
+      "version": "4.4.2",
+      "split": "tuning",
+      "archive_url": "https://raw.githubusercontent.com/DataDog/malicious-software-packages-dataset/d77c1d650035e90a779bfe30e8368ad8f41b3b3c/samples/npm/compromised_lib/debug/4.4.2/2025-09-08-debug-v4.4.2.zip",
+      "archive_sha256": "33d397a255c25dc8df1233ddc2531889c203835c35a287deed4511404b79a768",
+      "archive_bytes": 88910,
+      "package_root": "tmp/tmpf56bzshu/debug/package/",
+      "label": "historical-compromise",
+      "label_source": "https://github.com/DataDog/malicious-software-packages-dataset/tree/d77c1d650035e90a779bfe30e8368ad8f41b3b3c/samples/npm/compromised_lib/debug/4.4.2"
+    },
+    {
+      "rank": 5,
+      "name": "node-ipc",
+      "version": "12.0.1",
+      "split": "tuning",
+      "archive_url": "https://raw.githubusercontent.com/DataDog/malicious-software-packages-dataset/d77c1d650035e90a779bfe30e8368ad8f41b3b3c/samples/npm/compromised_lib/node-ipc/12.0.1/2026-05-14-node-ipc-v12.0.1.zip",
+      "archive_sha256": "49dae8e1c1a92816bbf262b4dca15339402bed8e67b6cbb13c89e2c58e294c5e",
+      "archive_bytes": 98633,
+      "package_root": "tmp/tmp_gn0lq5d/node-ipc/package/",
+      "label": "historical-compromise",
+      "label_source": "https://github.com/DataDog/malicious-software-packages-dataset/tree/d77c1d650035e90a779bfe30e8368ad8f41b3b3c/samples/npm/compromised_lib/node-ipc/12.0.1"
+    }
+  ]
+}

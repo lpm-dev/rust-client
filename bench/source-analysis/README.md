@@ -1,7 +1,10 @@
 # Source analysis corpus
 
-This harness scans 1,000 frozen npm package versions without executing package code.
+This harness scans frozen npm package versions without executing package code.
 It uses the same directory scanner as `lpm audit` and opted-in install analysis.
+
+The [expanded study](expanded/report.md) adds 9,000 packages and a fresh 2,000-package independent validation set.
+The original 1,000-package report and artifacts remain unchanged.
 
 ## Audit output
 
@@ -115,3 +118,35 @@ The normal security tests run these controls, including obfuscation and locale-d
 These controls test specific patterns. They do not measure detection of arbitrary malicious packages.
 
 See [the results report](report.md) for the baseline comparison, review limits, and measurements.
+
+## Expanded and historical controls
+
+Use the same build, run, and compare commands with the expanded manifests:
+
+```sh
+python3 bench/source-analysis/corpus.py download \
+  --manifest bench/source-analysis/expanded-9000.json \
+  --cache /tmp/lpm-expanded-corpus
+
+python3 bench/source-analysis/corpus.py download \
+  --manifest bench/source-analysis/fresh-validation-2000.json \
+  --cache /path/to/case-sensitive-corpus
+
+python3 bench/source-analysis/historical.py \
+  --manifest bench/source-analysis/historical-controls.json \
+  --cache /tmp/lpm-historical-controls
+```
+
+The fresh validation manifest requires a case-sensitive filesystem for `locutus`.
+On a case-insensitive volume, acquisition rejects the filename collision instead of replacing a file.
+Keep historical samples outside the repository's tracked files. Run only the scanner against their extracted source.
+
+The expanded manifest contains 7,000 tuning packages and the initial 2,000 validation packages.
+The initial validation exposed a detector defect, so those results now belong to tuning evidence.
+The fresh manifest contains only validation packages and excludes every family from the preceding 10,000 packages.
+The final detector was frozen before its first fresh validation scan. No subsequent detector changes used those results.
+
+For a new expansion, `freeze --exclude-manifest PATH --validation-count N` excludes old package names and reserves whole families.
+Add `--exclude-prior-families` to exclude every family named in the prior manifest from selection.
+Use `--replace-unavailable` only to record and replace metadata 404/410 responses; other failures abort the freeze.
+Always use a new manifest path and preserve the previous hashes.

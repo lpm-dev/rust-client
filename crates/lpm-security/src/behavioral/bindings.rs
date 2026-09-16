@@ -2,13 +2,15 @@ use oxc_ast::{AstKind, ast::*};
 use oxc_ast_visit::{Visit, walk};
 use oxc_semantic::{Semantic, SemanticBuilder, SymbolId};
 use std::borrow::Cow;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 #[derive(Default)]
 pub(super) struct CallFacts {
     pub process: Option<usize>,
     pub shell: Option<usize>,
     pub dynamic_load: Option<usize>,
+    pub evaluation: Option<usize>,
+    pub unresolved_evaluation: Option<usize>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -36,12 +38,18 @@ enum Method {
     Other,
 }
 
-const _: () = assert!((Module::Util as u32 + 1) * (Method::Other as u32 + 1) <= u64::BITS);
+const MODULE_BITS: u32 = (Module::Util as u32 + 1) * (Method::Other as u32 + 1);
+const _: () = assert!(MODULE_BITS + 4 <= u64::BITS);
 
 #[derive(Clone, Copy)]
 struct Origin(u64);
 
 impl Origin {
+    const EVAL: Self = Self(1 << MODULE_BITS);
+    const FUNCTION: Self = Self(1 << (MODULE_BITS + 1));
+    const GLOBAL: Self = Self(1 << (MODULE_BITS + 2));
+    const VM: Self = Self(1 << (MODULE_BITS + 3));
+
     fn new(module: Module, method: Method) -> Self {
         Self(1 << (module as u32 * (Method::Other as u32 + 1) + method as u32))
     }
@@ -57,11 +65,32 @@ impl Origin {
             != 0
     }
 
-    fn member(self, method: Method) -> Self {
+    fn evaluates(self) -> bool {
+        self.0 & (Self::EVAL.0 | Self::FUNCTION.0) != 0
+    }
+
+    fn member(self, name: &str) -> Self {
+        let method = method(name);
         if method == Method::Namespace {
-            return self;
+            return Self(self.0 & (((1 << MODULE_BITS) - 1) | Self::VM.0));
         }
         let mut result = Self(0);
+        if self.0 & Self::GLOBAL.0 != 0 {
+            result.0 |= match name {
+                "eval" => Self::EVAL.0,
+                "Function" => Self::FUNCTION.0,
+                _ => 0,
+            };
+        }
+        if self.0 & Self::VM.0 != 0 {
+            result.0 |= match name {
+                "runInContext" | "runInNewContext" | "runInThisContext" | "compileFunction" => {
+                    Self::EVAL.0
+                }
+                "Script" | "SourceTextModule" => Self::FUNCTION.0,
+                _ => 0,
+            };
+        }
         for module in [
             Module::Process,
             Module::Execa,
@@ -84,15 +113,17 @@ fn union(a: Option<Origin>, b: Option<Origin>) -> Option<Origin> {
     }
 }
 
-fn module(name: &str) -> Option<Module> {
-    match name.strip_prefix("node:").unwrap_or(name) {
-        "child_process" => Some(Module::Process),
-        "execa" => Some(Module::Execa),
-        "shelljs" => Some(Module::Shell),
-        "module" => Some(Module::Loader),
-        "util" => Some(Module::Util),
-        _ => None,
-    }
+fn module(name: &str) -> Option<Origin> {
+    let module = match name.strip_prefix("node:").unwrap_or(name) {
+        "child_process" => Module::Process,
+        "execa" => Module::Execa,
+        "shelljs" => Module::Shell,
+        "module" => Module::Loader,
+        "util" => Module::Util,
+        "vm" => return Some(Origin::VM),
+        _ => return None,
+    };
+    Some(Origin::new(module, Method::Namespace))
 }
 
 fn method(name: &str) -> Method {
@@ -151,7 +182,7 @@ fn is_static_string(expression: &Expression<'_>, depth: usize) -> bool {
     }
 }
 
-fn required_module(call: &CallExpression<'_>, semantic: &Semantic<'_>) -> Option<Module> {
+fn required_module(call: &CallExpression<'_>, semantic: &Semantic<'_>) -> Option<Origin> {
     let Expression::Identifier(identifier) = call.callee.get_inner_expression() else {
         return None;
     };
@@ -179,6 +210,9 @@ fn origin(
                 return match identifier.name.as_str() {
                     "module" => Some(Origin::new(Module::Loader, Method::Namespace)),
                     "require" => Some(Origin::new(Module::Loader, Method::Require)),
+                    "eval" => Some(Origin::EVAL),
+                    "Function" => Some(Origin::FUNCTION),
+                    "globalThis" | "global" | "window" | "self" => Some(Origin::GLOBAL),
                     _ => None,
                 };
             };
@@ -199,12 +233,12 @@ fn origin(
                                     None
                                 }
                             })?;
-                    let method = if let AstKind::ImportSpecifier(specifier) = kind {
-                        method(specifier.imported.name().as_str())
+                    let imported_origin = module(imported.source.value.as_str())?;
+                    if let AstKind::ImportSpecifier(specifier) = kind {
+                        Some(imported_origin.member(specifier.imported.name().as_str()))
                     } else {
-                        Method::Namespace
-                    };
-                    Some(Origin::new(module(imported.source.value.as_str())?, method))
+                        Some(imported_origin)
+                    }
                 }
                 AstKind::VariableDeclarator(variable) => {
                     let initial = variable
@@ -214,7 +248,7 @@ fn origin(
                     let initial = if let BindingPattern::ObjectPattern(pattern) = &variable.id {
                         pattern.properties.iter().find_map(|property| {
                             if matches!(&property.value, BindingPattern::BindingIdentifier(binding) if binding.symbol_id.get() == Some(symbol)) {
-                                Some(initial?.member(method(property.key.static_name()?.as_ref())))
+                                Some(initial?.member(property.key.static_name()?.as_ref()))
                             } else {
                                 None
                             }
@@ -229,21 +263,17 @@ fn origin(
         }
         Expression::StaticMemberExpression(member) => Some(
             origin(&member.object, semantic, assignments, depth + 1)?
-                .member(method(member.property.name.as_str())),
+                .member(member.property.name.as_str()),
         ),
         Expression::ComputedMemberExpression(member) => {
-            let Expression::StringLiteral(property) = member.expression.get_inner_expression()
-            else {
-                return None;
-            };
+            let property = static_string(&member.expression, 0)?;
             Some(
-                origin(&member.object, semantic, assignments, depth + 1)?
-                    .member(method(property.value.as_str())),
+                origin(&member.object, semantic, assignments, depth + 1)?.member(property.as_ref()),
             )
         }
         Expression::CallExpression(call) => {
             if let Some(module) = required_module(call, semantic) {
-                return Some(Origin::new(module, Method::Namespace));
+                return Some(module);
             }
             let callee = origin(&call.callee, semantic, assignments, depth + 1)?;
             if callee.contains(Module::Loader, Method::CreateRequire) {
@@ -275,6 +305,81 @@ fn origin(
         ),
         _ => None,
     }
+}
+
+fn invocation_receiver<'s, 'a>(expression: &'s Expression<'a>) -> Option<&'s Expression<'a>> {
+    match expression.get_inner_expression() {
+        Expression::StaticMemberExpression(member)
+            if matches!(member.property.name.as_str(), "call" | "apply") =>
+        {
+            Some(&member.object)
+        }
+        Expression::ComputedMemberExpression(member)
+            if matches!(
+                static_string(&member.expression, 0).as_deref(),
+                Some("call" | "apply")
+            ) =>
+        {
+            Some(&member.object)
+        }
+        _ => None,
+    }
+}
+
+fn is_invocation_helper(
+    expression: &Expression<'_>,
+    semantic: &Semantic<'_>,
+    assignments: &HashMap<SymbolId, Origin>,
+    depth: usize,
+) -> bool {
+    if depth >= 8 {
+        return false;
+    }
+    if let Some(receiver) = invocation_receiver(expression) {
+        return origin(receiver, semantic, assignments, 0).is_some_and(Origin::evaluates)
+            || is_invocation_helper(receiver, semantic, assignments, depth + 1);
+    }
+    let Expression::Identifier(identifier) = expression.get_inner_expression() else {
+        return false;
+    };
+    let Some(symbol) = identifier
+        .reference_id
+        .get()
+        .and_then(|id| semantic.scoping().get_reference(id).symbol_id())
+    else {
+        return false;
+    };
+    let AstKind::VariableDeclarator(variable) = semantic
+        .nodes()
+        .kind(semantic.scoping().symbol_declaration(symbol))
+    else {
+        return false;
+    };
+    matches!(&variable.id, BindingPattern::BindingIdentifier(_))
+        && variable
+            .init
+            .as_ref()
+            .is_some_and(|initial| is_invocation_helper(initial, semantic, assignments, depth + 1))
+}
+
+fn indirect_evaluation(
+    call: &CallExpression<'_>,
+    semantic: &Semantic<'_>,
+    assignments: &HashMap<SymbolId, Origin>,
+) -> bool {
+    let Some(receiver) = invocation_receiver(&call.callee) else {
+        return false;
+    };
+    if origin(receiver, semantic, assignments, 0).is_some_and(Origin::evaluates) {
+        return true;
+    }
+    // Borrowed call/apply helpers invoke their supplied receiver, not their original owner.
+    call.arguments
+        .first()
+        .and_then(Argument::as_expression)
+        .and_then(|argument| origin(argument, semantic, assignments, 0))
+        .is_some_and(Origin::evaluates)
+        && is_invocation_helper(receiver, semantic, assignments, 0)
 }
 
 fn shell_option(
@@ -343,6 +448,148 @@ fn dynamic_argument(argument: Option<&Expression<'_>>) -> bool {
     })
 }
 
+fn has_local_eval_method(
+    object: &Expression<'_>,
+    semantic: &Semantic<'_>,
+    mutated: &HashSet<SymbolId>,
+    depth: usize,
+) -> bool {
+    if depth >= 8 {
+        return false;
+    }
+    match object.get_inner_expression() {
+        Expression::ObjectExpression(object) => object
+            .properties
+            .iter()
+            .rev()
+            .find_map(|property| match property {
+                ObjectPropertyKind::SpreadProperty(_) => Some(false),
+                ObjectPropertyKind::ObjectProperty(property)
+                    if property.key.static_name().as_deref() == Some("eval") =>
+                {
+                    Some(
+                        property.kind == PropertyKind::Init
+                            && matches!(
+                                property.value.get_inner_expression(),
+                                Expression::FunctionExpression(_)
+                                    | Expression::ArrowFunctionExpression(_)
+                            ),
+                    )
+                }
+                _ => None,
+            })
+            .unwrap_or(false),
+        Expression::Identifier(identifier) => {
+            let Some(symbol) = identifier
+                .reference_id
+                .get()
+                .and_then(|id| semantic.scoping().get_reference(id).symbol_id())
+            else {
+                return false;
+            };
+            if mutated.contains(&symbol) {
+                return false;
+            }
+            let declaration = semantic.scoping().symbol_declaration(symbol);
+            let AstKind::VariableDeclarator(variable) = semantic.nodes().kind(declaration) else {
+                return false;
+            };
+            variable
+                .init
+                .as_ref()
+                .is_some_and(|value| has_local_eval_method(value, semantic, mutated, depth + 1))
+        }
+        Expression::NewExpression(instance) => {
+            let Some(identifier) = instance
+                .callee
+                .get_inner_expression()
+                .get_identifier_reference()
+            else {
+                return false;
+            };
+            let Some(symbol) = identifier
+                .reference_id
+                .get()
+                .and_then(|id| semantic.scoping().get_reference(id).symbol_id())
+            else {
+                return false;
+            };
+            let declaration = semantic.scoping().symbol_declaration(symbol);
+            if mutated.contains(&symbol) {
+                return false;
+            }
+            let AstKind::Class(class) = semantic.nodes().kind(declaration) else {
+                return false;
+            };
+            class.body.body.iter().any(|element| {
+                matches!(element,
+                ClassElement::MethodDefinition(method)
+                    if !method.r#static && method.kind == MethodDefinitionKind::Method
+                        && method.decorators.is_empty()
+                        && method.key.static_name().as_deref() == Some("eval"))
+            })
+        }
+        _ => false,
+    }
+}
+
+fn unresolved_eval_call(
+    callee: &Expression<'_>,
+    semantic: &Semantic<'_>,
+    mutated: &HashSet<SymbolId>,
+) -> bool {
+    let object = match callee.get_inner_expression() {
+        Expression::StaticMemberExpression(member) if member.property.name == "eval" => {
+            &member.object
+        }
+        Expression::ComputedMemberExpression(member)
+            if static_string(&member.expression, 0).as_deref() == Some("eval") =>
+        {
+            &member.object
+        }
+        _ => return false,
+    };
+    !has_local_eval_method(object, semantic, mutated, 0)
+}
+
+fn mark_mutated_receiver(
+    object: &Expression<'_>,
+    semantic: &Semantic<'_>,
+    mutated: &mut HashSet<SymbolId>,
+    depth: usize,
+) {
+    if depth >= 8 {
+        return;
+    }
+    match object.get_inner_expression() {
+        Expression::Identifier(identifier) => {
+            let Some(symbol) = identifier
+                .reference_id
+                .get()
+                .and_then(|id| semantic.scoping().get_reference(id).symbol_id())
+            else {
+                return;
+            };
+            if !mutated.insert(symbol) {
+                return;
+            }
+            let declaration = semantic.scoping().symbol_declaration(symbol);
+            if let AstKind::VariableDeclarator(variable) = semantic.nodes().kind(declaration)
+                && let Some(initial) = &variable.init
+            {
+                mark_mutated_receiver(initial, semantic, mutated, depth + 1);
+            }
+        }
+        Expression::StaticMemberExpression(member) => {
+            mark_mutated_receiver(&member.object, semantic, mutated, depth + 1)
+        }
+        Expression::ComputedMemberExpression(member) => {
+            mark_mutated_receiver(&member.object, semantic, mutated, depth + 1)
+        }
+        _ => {}
+    }
+}
+
 #[derive(Default)]
 struct CallCandidates(bool);
 
@@ -364,6 +611,12 @@ impl<'a> Visit<'a> for CallCandidates {
                 | "spawn"
                 | "spawnSync"
                 | "fork"
+                | "eval"
+                | "Function"
+                | "globalThis"
+                | "global"
+                | "window"
+                | "self"
         );
     }
 
@@ -383,12 +636,15 @@ impl<'a> Visit<'a> for CallCandidates {
     }
 
     fn visit_static_member_expression(&mut self, member: &StaticMemberExpression<'a>) {
-        self.0 |= member.property.name == "require";
+        self.0 |= matches!(member.property.name.as_str(), "require" | "eval");
         walk::walk_static_member_expression(self, member);
     }
 
     fn visit_computed_member_expression(&mut self, member: &ComputedMemberExpression<'a>) {
-        self.0 |= matches!(member.expression.get_inner_expression(), Expression::StringLiteral(name) if name.value == "require");
+        self.0 |= matches!(
+            static_string(&member.expression, 0).as_deref(),
+            Some("require" | "eval")
+        );
         walk::walk_computed_member_expression(self, member);
     }
 
@@ -411,14 +667,39 @@ pub(super) fn analyze(program: &Program<'_>) -> CallFacts {
     let built = SemanticBuilder::new().build(program);
     let semantic = &built.semantic;
     let mut assignments = HashMap::new();
+    let mut mutated_receivers = HashSet::new();
     // Union possible assignments without assuming execution order or following control flow.
-    for _ in 0..8 {
+    for round in 0..8 {
         let mut changed = false;
         for node in semantic.nodes().iter() {
             let AstKind::AssignmentExpression(assignment) = node.kind() else {
                 continue;
             };
             let AssignmentTarget::AssignmentTargetIdentifier(identifier) = &assignment.left else {
+                if round == 0 {
+                    match &assignment.left {
+                        AssignmentTarget::StaticMemberExpression(member)
+                            if matches!(member.property.name.as_str(), "eval" | "prototype") =>
+                        {
+                            mark_mutated_receiver(
+                                &member.object,
+                                semantic,
+                                &mut mutated_receivers,
+                                0,
+                            );
+                        }
+                        AssignmentTarget::ComputedMemberExpression(member) if !matches!(static_string(&member.expression, 0).as_deref(), Some(name) if name != "eval" && name != "prototype") =>
+                        {
+                            mark_mutated_receiver(
+                                &member.object,
+                                semantic,
+                                &mut mutated_receivers,
+                                0,
+                            );
+                        }
+                        _ => {}
+                    }
+                }
                 continue;
             };
             let Some(symbol) = identifier
@@ -428,6 +709,9 @@ pub(super) fn analyze(program: &Program<'_>) -> CallFacts {
             else {
                 continue;
             };
+            if round == 0 {
+                mutated_receivers.insert(symbol);
+            }
             if let Some(value) = origin(&assignment.right, semantic, &assignments, 0) {
                 let previous = assignments.entry(symbol).or_insert(Origin(0));
                 let combined = previous.0 | value.0;
@@ -445,8 +729,26 @@ pub(super) fn analyze(program: &Program<'_>) -> CallFacts {
             AstKind::ImportExpression(import) if dynamic_argument(Some(&import.source)) => {
                 facts.dynamic_load.get_or_insert(import.span.start as usize);
             }
+            AstKind::NewExpression(expression) => {
+                if origin(&expression.callee, semantic, &assignments, 0)
+                    .is_some_and(|value| value.0 & Origin::FUNCTION.0 != 0)
+                {
+                    facts
+                        .evaluation
+                        .get_or_insert(expression.span.start as usize);
+                }
+            }
             AstKind::CallExpression(call) => {
                 let mut value = origin(&call.callee, semantic, &assignments, 0);
+                if value.is_some_and(Origin::evaluates)
+                    || indirect_evaluation(call, semantic, &assignments)
+                {
+                    facts.evaluation.get_or_insert(call.span.start as usize);
+                } else if unresolved_eval_call(&call.callee, semantic, &mutated_receivers) {
+                    facts
+                        .unresolved_evaluation
+                        .get_or_insert(call.span.start as usize);
+                }
                 if value.is_some_and(|value| value.contains(Module::Util, Method::Promisify)) {
                     value = call
                         .arguments
@@ -461,7 +763,8 @@ pub(super) fn analyze(program: &Program<'_>) -> CallFacts {
                     .filter(|identifier| semantic.is_reference_to_global_variable(identifier))
                     .map(|identifier| identifier.name.as_str());
                 let method = global_name.map_or(Method::Other, method);
-                let process = required_module(call, semantic) == Some(Module::Process)
+                let process = required_module(call, semantic)
+                    .is_some_and(|value| value.includes_module(Module::Process))
                     || value.is_some_and(|value| {
                         value.includes_module(Module::Process)
                             || [

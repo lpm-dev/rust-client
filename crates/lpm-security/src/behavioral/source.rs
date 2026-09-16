@@ -184,7 +184,8 @@ pub(super) fn analyze_source_context_with_evidence(
                 if context.calls.is_some()
                     && (tag.name == "dynamicRequire"
                         || (tag.name == "childProcess" && index == 2)
-                        || tag.name == "shell")
+                        || tag.name == "shell"
+                        || tag.name == "eval")
                 {
                     return None;
                 }
@@ -196,6 +197,7 @@ pub(super) fn analyze_source_context_with_evidence(
                     "childProcess" => calls.process,
                     "shell" => calls.shell,
                     "dynamicRequire" => calls.dynamic_load,
+                    "eval" => calls.evaluation.or(calls.unresolved_evaluation),
                     _ => None,
                 }
             });
@@ -214,7 +216,13 @@ pub(super) fn analyze_source_context_with_evidence(
                 super::evidence::SourceEvidence::new(
                     rule,
                     filename,
-                    "Source pattern indicates a capability; execution is not established.",
+                    if tag.name == "eval" && context.calls.as_ref().is_some_and(|calls| {
+                        calls.evaluation.is_none() && calls.unresolved_evaluation.is_some()
+                    }) {
+                        "Call named eval on an unresolved receiver; built-in evaluation is not established."
+                    } else {
+                        "Source pattern indicates a capability; execution is not established."
+                    },
                 )
                 .at(&context.stripped, offset),
             );
@@ -256,6 +264,112 @@ pub fn merge_source_tags(a: &SourceTags, b: &SourceTags) -> SourceTags {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn local_eval_methods_and_shadowed_function_constructors_are_not_runtime_evaluation() {
+        for code in [
+            "class Parser { eval(node) { return node.value; } }",
+            "const parser = {eval(node) { return node.value; }}; parser.eval(node);",
+            "function create(Function) { return new Function(value); }",
+            "class Function {} const object = new Function();",
+            "const globalThis = {eval: text => text}; globalThis.eval(text);",
+        ] {
+            assert!(!analyze(code).eval, "{code}");
+        }
+    }
+
+    #[test]
+    fn runtime_evaluation_survives_aliases_indirection_and_global_member_access() {
+        for code in [
+            "const execute = eval; execute(source);",
+            "let execute; execute = eval; execute(source);",
+            "(0, eval)(source);",
+            "eval?.(source);",
+            "Function(source);",
+            "const Compile = Function; new Compile(source);",
+            "new globalThis.Function(source);",
+            "globalThis['ev' + 'al'](source);",
+            "const {eval: execute} = globalThis; execute(source);",
+            "eval.call(null, source);",
+            "eval.apply(null, [source]);",
+            r"\u0065val(source);",
+        ] {
+            assert!(analyze(code).eval, "{code}");
+        }
+    }
+
+    #[test]
+    fn eval_on_an_unresolved_global_object_retains_conservative_capability_evidence() {
+        assert!(
+            analyze("function install(globalObject) { return globalObject.eval(source); }").eval
+        );
+    }
+
+    #[test]
+    fn borrowed_invocation_helpers_do_not_imply_runtime_evaluation() {
+        for code in [
+            "const apply = Function.apply; apply.call(target, receiver, args);",
+            "const call = Function.call; call.call(target, receiver, value);",
+            "Function.apply.call(target, receiver, args);",
+            "const apply = eval.apply; apply.call(target, receiver, args);",
+            "const apply = Function.apply; apply(receiver, args);",
+        ] {
+            assert!(!analyze(code).eval, "{code}");
+        }
+        for code in [
+            "Function.apply(null, [source]);",
+            "const Compile = Function; Compile.call(null, source);",
+            "const apply = Function.apply; apply.call(Function, null, [source]);",
+            "const apply = eval.apply; apply.call(eval, null, [source]);",
+        ] {
+            assert!(analyze(code).eval, "{code}");
+        }
+    }
+
+    #[test]
+    fn runtime_evaluation_evidence_skips_borrowed_invocation_helpers() {
+        let code =
+            "const apply = Function.apply; apply.call(target, receiver, args);\nFunction(source);";
+        let mut buffer = Vec::new();
+        let context = super::super::syntax::SourceContext::new(code, "source.js", &mut buffer);
+        let (_, evidence) = analyze_source_context_with_evidence(&context, Some("source.js"));
+        let evaluation = evidence.iter().find(|item| item.rule_id == "eval").unwrap();
+        assert_eq!(evaluation.line, Some(2));
+    }
+
+    #[test]
+    fn node_vm_source_evaluation_and_compilation_retain_runtime_capabilities() {
+        for code in [
+            "import vm from 'node:vm'; vm.runInContext(source, context);",
+            "const {runInNewContext: execute} = require('vm'); execute(source);",
+            "import {compileFunction} from 'node:vm'; compileFunction(source);",
+            "const vm = require('vm'); new vm.Script(source);",
+            "import {SourceTextModule as Module} from 'node:vm'; new Module(source);",
+        ] {
+            assert!(analyze(code).eval, "{code}");
+        }
+        for code in [
+            "import vm from 'node:vm'; vm.createContext(object); vm.isContext(object);",
+            "const vm = {runInContext: x => x}; vm.runInContext(source);",
+            "import vm from 'node:vm'; new vm.SyntheticModule(['value'], callback);",
+        ] {
+            assert!(!analyze(code).eval, "{code}");
+        }
+    }
+
+    #[test]
+    fn eval_getters_and_mutated_receivers_retain_conservative_capabilities() {
+        for code in [
+            "const receiver = {get eval() {return eval}}; receiver.eval(source);",
+            "class Receiver {get eval() {return eval}}; new Receiver().eval(source);",
+            "const receiver = {eval: value => value}; receiver.eval = eval; receiver.eval(source);",
+            "const receiver = {eval: value => value}; const alias = receiver; alias.eval = eval; receiver.eval(source);",
+            "let receiver = {eval: value => value}; receiver = supplied; receiver.eval(source);",
+            "class Receiver {eval(value) {return value}}; Receiver.prototype.eval = eval; new Receiver().eval(source);",
+        ] {
+            assert!(analyze(code).eval, "{code}");
+        }
+    }
 
     #[test]
     fn local_exec_helpers_and_callbacks_are_not_child_processes() {

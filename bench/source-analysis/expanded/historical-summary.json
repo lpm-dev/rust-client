@@ -1,0 +1,34 @@
+{
+  "packages": 5,
+  "complete": {
+    "baseline": 4,
+    "candidate": 4
+  },
+  "tag_counts": {
+    "baseline": {
+      "source.crypto": 2,
+      "source.environmentVars": 3,
+      "source.filesystem": 2,
+      "source.network": 3,
+      "source.webSocket": 1,
+      "supplyChain.highEntropyStrings": 4,
+      "supplyChain.minified": 3,
+      "supplyChain.obfuscated": 2,
+      "supplyChain.possibleObfuscation": 2,
+      "supplyChain.urlStrings": 3
+    },
+    "candidate": {
+      "source.crypto": 2,
+      "source.environmentVars": 3,
+      "source.filesystem": 2,
+      "source.network": 3,
+      "source.webSocket": 1,
+      "supplyChain.highEntropyStrings": 4,
+      "supplyChain.minified": 3,
+      "supplyChain.obfuscated": 2,
+      "supplyChain.possibleObfuscation": 2,
+      "supplyChain.urlStrings": 3
+    }
+  },
+  "changed_packages": 0
+}
