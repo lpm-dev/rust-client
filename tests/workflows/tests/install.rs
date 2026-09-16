@@ -1813,11 +1813,13 @@ async fn install_with_audit_after_install_flag_appends_summary_line() {
     let tarball = make_tarball("ms", "2.1.3");
     mock.with_package("ms", "2.1.3", &tarball).await;
     mount_ms_2_1_3(&mock).await;
+    mock.with_osv_querybatch(vec![vec![]]).await;
 
     let project = TempProject::empty(
         r#"{"name":"audit-on","version":"1.0.0","dependencies":{"ms":"^2.1.3"}}"#,
     );
     let output = lpm_with_registry(&project, &mock.url())
+        .env("LPM_OSV_URL", format!("{}/v1/querybatch", mock.url()))
         .args([
             "install",
             "--audit-after-install",
@@ -2142,11 +2144,13 @@ async fn install_env_audit_after_install_appends_summary_line() {
     let tarball = make_tarball("ms", "2.1.3");
     mock.with_package("ms", "2.1.3", &tarball).await;
     mount_ms_2_1_3(&mock).await;
+    mock.with_osv_querybatch(vec![vec![]]).await;
 
     let project = TempProject::empty(
         r#"{"name":"audit-env-on","version":"1.0.0","dependencies":{"ms":"^2.1.3"}}"#,
     );
     let output = lpm_with_registry(&project, &mock.url())
+        .env("LPM_OSV_URL", format!("{}/v1/querybatch", mock.url()))
         .env("LPM_AUDIT_AFTER_INSTALL", "1")
         .args([
             "install",
@@ -2171,11 +2175,13 @@ async fn install_audit_after_install_attaches_summary_to_json_envelope() {
     let tarball = make_tarball("ms", "2.1.3");
     mock.with_package("ms", "2.1.3", &tarball).await;
     mount_ms_2_1_3(&mock).await;
+    mock.with_osv_querybatch(vec![vec![]]).await;
 
     let project = TempProject::empty(
         r#"{"name":"audit-json","version":"1.0.0","dependencies":{"ms":"^2.1.3"}}"#,
     );
     let output = lpm_with_registry(&project, &mock.url())
+        .env("LPM_OSV_URL", format!("{}/v1/querybatch", mock.url()))
         .args([
             "--json",
             "install",
@@ -2245,6 +2251,7 @@ async fn install_audit_after_install_enabled_via_config_file() {
     let tarball = make_tarball("ms", "2.1.3");
     mock.with_package("ms", "2.1.3", &tarball).await;
     mount_ms_2_1_3(&mock).await;
+    mock.with_osv_querybatch(vec![vec![]]).await;
 
     let project = TempProject::empty(
         r#"{"name":"audit-cfg-on","version":"1.0.0","dependencies":{"ms":"^2.1.3"}}"#,
@@ -2258,6 +2265,7 @@ async fn install_audit_after_install_enabled_via_config_file() {
     std::fs::write(cfg_dir.join("config.toml"), "audit-after-install = true\n").unwrap();
 
     let output = lpm_with_registry(&project, &mock.url())
+        .env("LPM_OSV_URL", format!("{}/v1/querybatch", mock.url()))
         .args([
             "install",
             "--no-security-summary",
