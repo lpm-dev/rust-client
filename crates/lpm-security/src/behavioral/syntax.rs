@@ -10,6 +10,7 @@ pub(super) struct SourceContext<'s> {
     pub stripped: Cow<'s, str>,
     pub executable: Vec<u8>,
     pub complete: bool,
+    pub calls: Option<super::bindings::CallFacts>,
 }
 
 struct LiteralSpans<'s> {
@@ -64,24 +65,30 @@ impl<'s> SourceContext<'s> {
             executable: &mut executable,
         }
         .visit_program(&parsed.program);
+        let complete = !parsed.panicked && parsed.errors.is_empty();
+        let calls = complete.then(|| super::bindings::analyze(&parsed.program));
         Self {
             stripped: String::from_utf8_lossy(stripped),
             executable,
-            complete: !parsed.panicked && parsed.errors.is_empty(),
+            complete,
+            calls,
         }
     }
 
-    pub fn matches_with_context(&self, regex: &Regex, bare: bool) -> bool {
-        regex.find_iter(&self.stripped).any(|matched| {
-            self.executable
-                .get(matched.start())
-                .is_some_and(|byte| !byte.is_ascii_whitespace())
-                && (!bare
-                    || !self.stripped.as_bytes()[..matched.start()]
-                        .iter()
-                        .rev()
-                        .find(|byte| !byte.is_ascii_whitespace())
-                        .is_some_and(|byte| matches!(byte, b'.' | b'$')))
-        })
+    pub fn find_with_context(&self, regex: &Regex, bare: bool) -> Option<usize> {
+        regex
+            .find_iter(&self.stripped)
+            .find(|matched| {
+                self.executable
+                    .get(matched.start())
+                    .is_some_and(|byte| !byte.is_ascii_whitespace())
+                    && (!bare
+                        || !self.stripped.as_bytes()[..matched.start()]
+                            .iter()
+                            .rev()
+                            .find(|byte| !byte.is_ascii_whitespace())
+                            .is_some_and(|byte| matches!(byte, b'.' | b'$')))
+            })
+            .map(|matched| matched.start())
     }
 }

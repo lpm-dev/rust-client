@@ -1,0 +1,116 @@
+[
+  {
+    "name": "local-exec-helper",
+    "source": "const exec = text => text.trim(); export const wrap = text => exec(text);",
+    "expected": {
+      "source": {
+        "childProcess": false,
+        "shell": false
+      }
+    }
+  },
+  {
+    "name": "css-import-method",
+    "source": "class Css { import(node) { return node.text; } compile(node) { return this.import(node); } }",
+    "expected": {
+      "source": {
+        "dynamicRequire": false
+      }
+    }
+  },
+  {
+    "name": "static-bundle-id",
+    "source": "(function(require) { return require(3); })(loader);",
+    "expected": {
+      "source": {
+        "dynamicRequire": false
+      }
+    }
+  },
+  {
+    "name": "shell-disabled",
+    "source": "import {spawn} from 'node:child_process'; spawn(command, [], {shell:false});",
+    "expected": {
+      "source": {
+        "childProcess": true,
+        "shell": false
+      }
+    }
+  },
+  {
+    "name": "shell-options",
+    "source": "const {spawnSync} = require('child_process'); const options = {shell:true}; spawnSync(command, {...options});",
+    "expected": {
+      "source": {
+        "childProcess": true,
+        "shell": true
+      }
+    }
+  },
+  {
+    "name": "aliased-shell",
+    "source": "import {exec as execute} from 'node:child_process'; execute(command);",
+    "expected": {
+      "source": {
+        "childProcess": true,
+        "shell": true
+      }
+    }
+  },
+  {
+    "name": "promisified-shell",
+    "source": "import {exec} from 'node:child_process'; import {promisify} from 'node:util'; export const execute = promisify(exec);",
+    "expected": {
+      "source": {
+        "childProcess": true,
+        "shell": true
+      }
+    }
+  },
+  {
+    "name": "computed-import",
+    "source": "export const load = name => import(`./plugins/${name}.js`);",
+    "expected": {
+      "source": {
+        "dynamicRequire": true
+      }
+    }
+  },
+  {
+    "name": "runtime-compiler",
+    "source": "export const compile = source => new Function(source);",
+    "expected": {
+      "source": {
+        "eval": true
+      }
+    }
+  },
+  {
+    "name": "locale-exit",
+    "source": "if (Intl.DateTimeFormat().resolvedOptions().timeZone === 'Europe/Moscow') { process.exit(1); }",
+    "expected": {
+      "supplyChain": {
+        "protestware": true
+      }
+    }
+  },
+  {
+    "name": "ordinary-locale",
+    "source": "const locale = Intl.DateTimeFormat().resolvedOptions().timeZone; export const label = locale;",
+    "expected": {
+      "supplyChain": {
+        "protestware": false,
+        "obfuscated": false
+      }
+    }
+  },
+  {
+    "name": "obfuscation-signals",
+    "source": "var _0x1234 = \"\\x48\\x65\\x6c\\x6c\\x6f\\x20\\x57\\x6f\\x72\\x6c\\x64\"; var _0xabcd = _0x1234; String.fromCharCode(72,101,108); String.fromCharCode(108,111,32); String.fromCharCode(87,111,114);",
+    "expected": {
+      "supplyChain": {
+        "obfuscated": true
+      }
+    }
+  }
+]

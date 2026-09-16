@@ -2810,22 +2810,24 @@ async fn audit_json_keeps_same_coordinate_instances_and_source_paths_separate() 
             "{package}",
         );
     }
-    let issue_sets = packages
+    assert!(
+        packages
+            .iter()
+            .all(|package| package["issues"].to_string().contains("low quality score")),
+        "{report}",
+    );
+    let capability_sets = packages
         .iter()
-        .map(|package| package["issues"].to_string())
+        .map(|package| package["capabilities"].to_string())
         .collect::<Vec<_>>();
     assert!(
-        issue_sets
+        capability_sets
             .iter()
-            .all(|issues| issues.contains("low quality score")),
+            .any(|capabilities| capabilities.contains("eval()")),
         "{report}",
     );
     assert!(
-        issue_sets.iter().any(|issues| issues.contains("eval()")),
-        "{report}",
-    );
-    assert!(
-        issue_sets
+        capability_sets
             .iter()
             .any(|issues| issues.contains("child processes")),
         "{report}",
@@ -2932,16 +2934,18 @@ async fn audit_json_merges_registry_and_local_findings_for_each_foreign_instance
             "{package}"
         );
     }
-    let issue_sets = packages
+    let capability_sets = packages
         .iter()
-        .map(|package| package["issues"].to_string())
+        .map(|package| package["capabilities"].to_string())
         .collect::<Vec<_>>();
     assert!(
-        issue_sets.iter().any(|issues| issues.contains("eval()")),
+        capability_sets
+            .iter()
+            .any(|issues| issues.contains("eval()")),
         "{report}"
     );
     assert!(
-        issue_sets
+        capability_sets
             .iter()
             .any(|issues| issues.contains("child processes")),
         "{report}"
@@ -3034,9 +3038,13 @@ async fn audit_rejects_project_links_wired_to_the_wrong_locked_integrity() {
         package_b_report["path"],
         package_b.to_string_lossy().as_ref()
     );
-    assert!(package_a_report["issues"].to_string().contains("eval()"));
     assert!(
-        package_b_report["issues"]
+        package_a_report["capabilities"]
+            .to_string()
+            .contains("eval()")
+    );
+    assert!(
+        package_b_report["capabilities"]
             .to_string()
             .contains("child processes")
     );

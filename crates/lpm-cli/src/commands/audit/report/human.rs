@@ -80,7 +80,7 @@ pub(in crate::commands::audit) fn print_lpm_results(
             .map(|s| format!(" quality: {s}/100"))
             .unwrap_or_default();
 
-        if result.issues.is_empty() {
+        if result.issues.iter().all(|issue| issue.is_capability()) {
             let name = lpm_common::sanitize_terminal_inline(&result.name);
             let version = lpm_common::sanitize_terminal_inline(&result.version);
             eprintln!(
@@ -101,6 +101,9 @@ pub(in crate::commands::audit) fn print_lpm_results(
         );
 
         for issue in &result.issues {
+            if issue.is_capability() {
+                continue;
+            }
             let severity = issue.severity.to_ascii_lowercase();
             let icon = match severity.as_str() {
                 "high" | "critical" => "✗".red().to_string(),
@@ -155,14 +158,24 @@ pub(in crate::commands::audit) fn print_behavioral_results(
     let mut critical_tags: HashMap<String, Vec<String>> = HashMap::new();
     let mut moderate_tags: HashMap<String, Vec<String>> = HashMap::new();
     let mut info_tags: HashMap<String, Vec<String>> = HashMap::new();
+    let mut capabilities: HashMap<String, Vec<String>> = HashMap::new();
 
     for result in results {
+        for issue in result.issues.iter().filter(|issue| issue.is_capability()) {
+            capabilities
+                .entry(issue.message.clone())
+                .or_default()
+                .push(format!("{}@{}", result.name, result.version));
+        }
         if lpm_names.contains(result.name.as_str()) {
             continue;
         }
         let pkg_id = format!("{}@{}", result.name, result.version);
 
         for issue in &result.issues {
+            if issue.is_capability() {
+                continue;
+            }
             let sev = issue.severity.to_lowercase();
             let tags = match sev.as_str() {
                 "critical" => &mut critical_tags,
@@ -180,7 +193,7 @@ pub(in crate::commands::audit) fn print_behavioral_results(
     let has_moderate = !moderate_tags.is_empty();
     let has_info = !info_tags.is_empty();
 
-    if !has_critical && !has_moderate && !has_info {
+    if !has_critical && !has_moderate && !has_info && capabilities.is_empty() {
         return;
     }
 
@@ -216,6 +229,28 @@ pub(in crate::commands::audit) fn print_behavioral_results(
                 "!".yellow(),
                 format_behavior_message(message),
                 preview_package_names(packages, 2),
+            );
+        }
+        eprintln!();
+    }
+
+    if !capabilities.is_empty() {
+        eprintln!("  {}", install_ui::section("Capabilities"));
+        eprintln!(
+            "  {}",
+            install_ui::dim(
+                "API use detected in source; execution and malicious intent are not established."
+            )
+        );
+        let mut sorted: Vec<_> = capabilities.iter().collect();
+        sorted.sort_by(|a, b| b.1.len().cmp(&a.1.len()).then_with(|| a.0.cmp(b.0)));
+        for (name, packages) in sorted {
+            eprintln!(
+                "  {} {:<3} {}  {}",
+                "ℹ".blue(),
+                packages.len(),
+                lpm_common::sanitize_terminal_inline(name),
+                preview_package_names(packages, 2)
             );
         }
         eprintln!();
@@ -275,12 +310,17 @@ pub(in crate::commands::audit) fn print_summary(
         .iter()
         .filter(|r| r.name.starts_with("@lpm.dev/"))
         .flat_map(|result| &result.issues)
-        .filter(|issue| issue.severity != "info")
+        .filter(|issue| !issue.is_capability() && issue.severity != "info")
         .count();
     let metadata_signals = results
         .iter()
         .flat_map(|result| &result.issues)
-        .filter(|issue| issue.severity == "info")
+        .filter(|issue| !issue.is_capability() && issue.severity == "info")
+        .count();
+    let capability_signals = results
+        .iter()
+        .flat_map(|result| &result.issues)
+        .filter(|issue| issue.is_capability())
         .count();
 
     if osv_degraded || !behavioral.coverage.complete {
@@ -303,6 +343,13 @@ pub(in crate::commands::audit) fn print_summary(
             parts.push(format!(
                 "{metadata_signals} metadata signal{}",
                 if metadata_signals == 1 { "" } else { "s" }
+            ));
+        }
+        if capability_signals > 0 {
+            parts.push(count_phrase(
+                capability_signals,
+                "capability",
+                "capabilities",
             ));
         }
         install_ui::done_untrusted(&format!("No security issues found · {}", parts.join(" · ")));

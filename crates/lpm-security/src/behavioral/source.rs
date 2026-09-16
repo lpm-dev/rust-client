@@ -11,7 +11,7 @@ use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::sync::OnceLock;
 
-/// Source code behavioral tags — parity with server `lib/security/behavioral-tags.js`.
+/// Source capability fields shared with registry behavioral tags.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct SourceTags {
@@ -34,7 +34,7 @@ struct CompiledSourceTagPatterns {
 
 /// All source tag patterns, grouped by tag.
 ///
-/// These patterns are exact ports from the server's `behavioral-tags.js`.
+/// Binding analysis refines process, shell, and module-loading matches on parsed source.
 const SOURCE_PATTERNS: &[(&str, &[&str])] = &[
     // 0: filesystem
     (
@@ -164,13 +164,61 @@ pub fn analyze_source(stripped: &str) -> SourceTags {
 }
 
 pub(super) fn analyze_source_context(context: &super::syntax::SourceContext<'_>) -> SourceTags {
+    analyze_source_context_with_evidence(context, None).0
+}
+
+pub(super) fn analyze_source_context_with_evidence(
+    context: &super::syntax::SourceContext<'_>,
+    filename: Option<&str>,
+) -> (SourceTags, Vec<super::evidence::SourceEvidence>) {
     let compiled = compiled_patterns();
     let mut tags = SourceTags::default();
+    let mut evidence = Vec::new();
 
     for tag in &compiled.tags {
-        let matched = tag.regexes.iter().any(|regex| {
-            context.matches_with_context(regex, matches!(tag.name, "childProcess" | "shell"))
-        });
+        let offset = tag
+            .regexes
+            .iter()
+            .enumerate()
+            .find_map(|(index, regex)| {
+                if context.calls.is_some()
+                    && (tag.name == "dynamicRequire"
+                        || (tag.name == "childProcess" && index == 2)
+                        || tag.name == "shell")
+                {
+                    return None;
+                }
+                context.find_with_context(regex, matches!(tag.name, "childProcess" | "shell"))
+            })
+            .or_else(|| {
+                let calls = context.calls.as_ref()?;
+                match tag.name {
+                    "childProcess" => calls.process,
+                    "shell" => calls.shell,
+                    "dynamicRequire" => calls.dynamic_load,
+                    _ => None,
+                }
+            });
+        let matched = offset.is_some();
+        if let (Some(offset), Some(filename)) = (offset, filename) {
+            let rule = match tag.name {
+                "filesystem" => "fs",
+                "childProcess" => "child-process",
+                "environmentVars" => "env",
+                "nativeBindings" => "native",
+                "webSocket" => "ws",
+                "dynamicRequire" => "dynamic-require",
+                other => other,
+            };
+            evidence.push(
+                super::evidence::SourceEvidence::new(
+                    rule,
+                    filename,
+                    "Source pattern indicates a capability; execution is not established.",
+                )
+                .at(&context.stripped, offset),
+            );
+        }
         match tag.name {
             "filesystem" => tags.filesystem = matched,
             "network" => tags.network = matched,
@@ -186,7 +234,7 @@ pub(super) fn analyze_source_context(context: &super::syntax::SourceContext<'_>)
         }
     }
 
-    tags
+    (tags, evidence)
 }
 
 /// Merge two SourceTags with OR logic (if either is true, result is true).
@@ -208,6 +256,111 @@ pub fn merge_source_tags(a: &SourceTags, b: &SourceTags) -> SourceTags {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn local_exec_helpers_and_callbacks_are_not_child_processes() {
+        for code in [
+            "const exec = (text) => text.trim(); export const wrap = text => exec(text);",
+            "module.exports = function (exec) { try { return !!exec(); } catch (_) { return true; } };",
+            "(function exec() { setTimeout(() => exec(), 1); })();",
+        ] {
+            assert!(!analyze(code).child_process, "{code}");
+        }
+    }
+
+    #[test]
+    fn methods_and_declarations_named_import_or_require_are_not_dynamic_loads() {
+        for code in [
+            "class Css { import(node) { return node.text; } compile(node) { return this.import(node); } }",
+            "class Args { require(keys) { return this.demand(keys); } }",
+        ] {
+            assert!(!analyze(code).dynamic_require, "{code}");
+        }
+    }
+
+    #[test]
+    fn spawning_a_process_without_a_shell_does_not_imply_shell_execution() {
+        for code in [
+            "import cp from 'node:child_process'; cp.spawn('node', args, {stdio: 'inherit'});",
+            "import { execFileSync } from 'node:child_process'; execFileSync('node', args);",
+        ] {
+            let tags = analyze(code);
+            assert!(tags.child_process, "{code}");
+            assert!(!tags.shell, "{code}");
+        }
+    }
+
+    #[test]
+    fn constant_string_module_specifiers_are_static() {
+        for code in [
+            "const url = require('u' + 'rl');",
+            "const load = () => import('./' + 'plugin.js');",
+        ] {
+            assert!(!analyze(code).dynamic_require, "{code}");
+        }
+    }
+
+    #[test]
+    fn constant_string_process_imports_retain_capabilities() {
+        let tags = analyze("const cp = require('child_' + 'process'); cp.exec(command);");
+        assert!(tags.child_process);
+        assert!(tags.shell);
+    }
+
+    #[test]
+    fn process_library_helpers_do_not_imply_process_or_shell_execution() {
+        for code in [
+            "import {parseCommand} from 'execa'; parseCommand(command);",
+            "const shell = require('shelljs'); shell.which('node'); shell.cat('package.json');",
+        ] {
+            let tags = analyze(code);
+            assert!(!tags.child_process, "{code}");
+            assert!(!tags.shell, "{code}");
+        }
+    }
+
+    #[test]
+    fn execa_entry_points_and_shelljs_exec_retain_process_capabilities() {
+        for code in [
+            "import {execa} from 'execa'; execa(command, args);",
+            "const run = require('execa'); run(command, args);",
+            "const shell = require('shelljs'); shell.exec(command);",
+        ] {
+            assert!(analyze(code).child_process, "{code}");
+        }
+        assert!(analyze("const shell = require('shelljs'); shell.exec(command);").shell);
+    }
+
+    #[test]
+    fn loaders_and_process_aliases_assigned_after_declaration_remain_detectable() {
+        let loader = "import {createRequire} from 'node:module'; let require; function load(name) { if (!require) require = createRequire(import.meta.url); return require(name); }";
+        assert!(analyze(loader).dynamic_require);
+        let process = "import cp from 'node:child_process'; let run; if (condition) run = cp.exec; run(command);";
+        assert!(analyze(process).shell);
+    }
+
+    #[test]
+    fn shell_options_follow_constants_spreads_and_conditional_values() {
+        for code in [
+            "const {spawnSync} = require('child_process'); const options = {shell: true}; spawnSync(command, options);",
+            "import {spawn} from 'node:child_process'; const options = {shell: '/bin/sh'}; spawn(command, [], {...options, stdio: 'pipe'});",
+            "import {spawn} from 'node:child_process'; const options = flag ? {shell: true} : {shell: false}; spawn(command, [], options);",
+        ] {
+            assert!(analyze(code).shell, "{code}");
+        }
+    }
+
+    #[test]
+    fn explicit_false_shell_option_overrides_a_spread() {
+        let code = "import {spawn} from 'node:child_process'; const options = {shell: true}; spawn(command, [], {...options, shell: false});";
+        assert!(!analyze(code).shell);
+    }
+
+    #[test]
+    fn literal_module_ids_in_bundled_loaders_are_static() {
+        let code = "(function(require) { return require(3); })(loadModule);";
+        assert!(!analyze(code).dynamic_require);
+    }
 
     #[test]
     fn literal_examples_are_not_executable_capabilities() {
@@ -508,15 +661,65 @@ mod tests {
     // ── Shell ─────────────────────────────────────────────────
 
     #[test]
-    fn detect_shelljs_import() {
-        let tags = analyze(r#"import shell from "shelljs""#);
+    fn shelljs_exec_is_shell_execution() {
+        let tags = analyze(r#"import shell from "shelljs"; shell.exec(command);"#);
         assert!(tags.shell);
     }
 
     #[test]
-    fn detect_execa_require() {
-        let tags = analyze(r#"const execa = require("execa")"#);
-        assert!(tags.shell);
+    fn execa_without_shell_option_only_reports_child_processes() {
+        let tags = analyze(r#"const execa = require("execa"); execa('node', args);"#);
+        assert!(tags.child_process);
+        assert!(!tags.shell);
+    }
+
+    #[test]
+    fn process_aliases_and_explicit_shell_options_retain_detection() {
+        for code in [
+            "import {exec as run} from 'node:child_process'; run(command);",
+            "const {exec: run} = require('child_process'); run(command);",
+            "const cp = require('node:child_process'); cp.exec(command);",
+            "const cp = require('node:child_process'); cp['exec'](command);",
+            "const {spawn: run} = require('child_process'); run('node', args, {shell: true});",
+            "const {promisify} = require('util'); const cp = require('child_process'); const run = promisify(cp.exec); run(command);",
+        ] {
+            let tags = analyze(code);
+            assert!(tags.child_process && tags.shell, "{code}: {tags:?}");
+        }
+    }
+
+    #[test]
+    fn promisified_execfile_and_shadowed_exec_are_not_shell_execution() {
+        for code in [
+            "const {promisify} = require('util'); const cp = require('child_process'); const exec = promisify(cp.execFile); exec('node', args);",
+            "import {exec} from 'child_process'; function invoke(exec) { exec(); }",
+        ] {
+            assert!(!analyze(code).shell, "{code}");
+        }
+    }
+
+    #[test]
+    fn dynamic_imports_and_created_require_aliases_retain_detection() {
+        for code in [
+            "import(`./plugins/${name}.js`);",
+            "const {createRequire} = require('module'); const load = createRequire(__filename); load(name);",
+            "import {createRequire} from 'node:module'; const load = createRequire(import.meta.url); load(name);",
+            "module.require(name);",
+            "import {createRequire} from 'node:module'; const require = createRequire ? createRequire(import.meta.url) : undefined; require(path);",
+            "function dynamicRequire(mod, request) { return mod.require(request); } dynamicRequire(module, path);",
+        ] {
+            assert!(analyze(code).dynamic_require, "{code}");
+        }
+    }
+
+    #[test]
+    fn exported_and_conditional_promisified_exec_retain_shell_capability() {
+        for code in [
+            "import * as cp from 'child_process'; import * as util from 'util'; export const execAsync = util.promisify(cp.exec);",
+            "import {exec} from 'child_process'; import {promisify} from 'util'; const run = promisify(custom?.exec ?? exec); run(command);",
+        ] {
+            assert!(analyze(code).shell, "{code}");
+        }
     }
 
     #[test]

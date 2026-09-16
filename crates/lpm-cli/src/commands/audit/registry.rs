@@ -20,6 +20,7 @@ pub(super) fn registry_audit_result(
             message: format!("low quality score: {score}/100"),
             category: "quality".to_string(),
             source: "registry".to_string(),
+            ..AuditIssue::default()
         });
     }
 
@@ -56,6 +57,7 @@ pub(super) fn collect_registry_issues(
                 message: desc.to_string(),
                 category: "security".to_string(),
                 source: "registry".to_string(),
+                ..AuditIssue::default()
             });
         }
     }
@@ -101,6 +103,7 @@ pub(super) fn collect_registry_issues(
             message: format!("lifecycle scripts: {}", names.join(", ")),
             category: "scripts".to_string(),
             source: "registry".to_string(),
+            ..AuditIssue::default()
         });
     }
 
@@ -122,6 +125,7 @@ pub(super) fn collect_registry_issues(
                 ),
                 category: "vulnerability".to_string(),
                 source: "registry".to_string(),
+                ..AuditIssue::default()
             });
         }
     }

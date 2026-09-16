@@ -593,6 +593,85 @@ pub fn merge_supply_chain_tags(a: &SupplyChainTags, b: &SupplyChainTags) -> Supp
     }
 }
 
+pub(super) fn append_evidence(
+    context: &super::syntax::SourceContext<'_>,
+    filename: &str,
+    tags: &SupplyChainTags,
+    evidence: &mut Vec<super::SourceEvidence>,
+) {
+    let rules = [
+        (
+            tags.obfuscated,
+            "obfuscated",
+            "Multiple obfuscation heuristics exceeded the high-confidence threshold.",
+        ),
+        (
+            tags.possible_obfuscation,
+            "possible-obfuscation",
+            "Multiple obfuscation heuristics exceeded the informational threshold.",
+        ),
+        (
+            tags.high_entropy_strings,
+            "high-entropy",
+            "A long string exceeded the entropy threshold after known data exclusions.",
+        ),
+        (
+            tags.minified,
+            "minified",
+            "Filename or source layout indicates minified code.",
+        ),
+        (
+            tags.telemetry,
+            "telemetry",
+            "Source contains a telemetry SDK or tracking API pattern.",
+        ),
+        (
+            tags.url_strings,
+            "url-strings",
+            "Source contains a URL literal.",
+        ),
+        (
+            tags.protestware,
+            "protestware",
+            "Locale or network information occurs near a comparison and exit or unbounded loop.",
+        ),
+    ];
+    for (matched, rule, reason) in rules {
+        if !matched {
+            continue;
+        }
+        let mut entry = super::SourceEvidence::new(rule, filename, reason);
+        match rule {
+            "obfuscated" | "possible-obfuscation" => {
+                entry.heuristic_score = Some(tags.obfuscation_confidence);
+            }
+            "telemetry" => {
+                if let Some(offset) = supply_patterns()[TELEMETRY_START..TELEMETRY_END]
+                    .iter()
+                    .find_map(|pattern| {
+                        pattern
+                            .find(&context.stripped)
+                            .map(|matched| matched.start())
+                    })
+                {
+                    entry = entry.at(&context.stripped, offset);
+                }
+            }
+            "protestware" => {
+                let executable = String::from_utf8_lossy(&context.executable);
+                if let Some(offset) = supply_patterns()[PROTESTWARE_START..PROTESTWARE_END]
+                    .iter()
+                    .find_map(|pattern| pattern.find(&executable).map(|matched| matched.start()))
+                {
+                    entry = entry.at(&context.stripped, offset);
+                }
+            }
+            _ => {}
+        }
+        evidence.push(entry);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

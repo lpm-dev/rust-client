@@ -1,0 +1,61 @@
+---
+source: tests/workflows/tests/install_source_analysis.rs
+expression: envelope
+---
+{
+  "success": true,
+  "behavioral_coverage": {
+    "complete": true,
+    "scanned_packages": 1,
+    "partial_packages": 0,
+    "unavailable_packages": 0,
+    "packages": []
+  },
+  "manager": "lpm",
+  "degraded": false,
+  "osv_degraded": false,
+  "osv_degraded_reason": null,
+  "scanned": 1,
+  "checked_lpm": 0,
+  "packages_with_issues": 0,
+  "total_issues": 0,
+  "total_capabilities": 1,
+  "osv_vulnerabilities": 0,
+  "counts": {
+    "critical": 0,
+    "high": 0,
+    "moderate": 0,
+    "low": 0,
+    "info": 0
+  },
+  "packages": [
+    {
+      "name": "capability-evidence",
+      "version": "1.0.0",
+      "instance_id": "[INSTANCE_ID]",
+      "path": "[PACKAGE_PATH]",
+      "quality_score": null,
+      "capabilities": [
+        {
+          "rule_id": "eval",
+          "name": "eval()",
+          "policy_severity": "high",
+          "source": "local",
+          "evidence": [
+            {
+              "ruleId": "eval",
+              "path": "lib/compile.js",
+              "line": 1,
+              "column": 27,
+              "excerpt": "module.exports = input => eval(input);\nconst values = [\n1,\n2,\n3,\n4,\n5,\n6,\n7,\n8,\n9,\n10\n];\nmodule.exports.values = values;\n",
+              "reason": "Source pattern indicates a capability; execution is not established.",
+              "fileContext": "source"
+            }
+          ]
+        }
+      ],
+      "issues": []
+    }
+  ],
+  "vulnerabilities": []
+}

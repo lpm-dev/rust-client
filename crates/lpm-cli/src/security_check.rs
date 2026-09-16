@@ -31,6 +31,15 @@ struct TagIssue {
     packages: Vec<String>, // "name@version"
 }
 
+impl TagIssue {
+    fn is_capability(&self) -> bool {
+        behavioral_tag_policies().iter().any(|policy| {
+            policy.group == lpm_security::query::TagGroup::Source
+                && self.selector == Some(policy.token)
+        })
+    }
+}
+
 #[derive(Default)]
 struct SummaryCounts {
     behavioral: HashMap<PseudoClass, HashSet<String>>,
@@ -273,13 +282,17 @@ fn format_human_security_summary(
     let actionable: Vec<&TagIssue> = issues
         .iter()
         .filter(|issue| {
-            issue.severity != Severity::Info && issue.install_visibility.is_visible(verbose)
+            !issue.is_capability()
+                && issue.severity != Severity::Info
+                && issue.install_visibility.is_visible(verbose)
         })
         .collect();
     let metadata: Vec<&TagIssue> = issues
         .iter()
         .filter(|issue| {
-            issue.severity == Severity::Info && issue.install_visibility.is_visible(verbose)
+            !issue.is_capability()
+                && issue.severity == Severity::Info
+                && issue.install_visibility.is_visible(verbose)
         })
         .collect();
 
@@ -308,6 +321,44 @@ fn format_human_security_summary(
         )));
         if verbose {
             append_query_hint(&mut lines, &actionable, "findings");
+        }
+    }
+
+    let capabilities: Vec<_> = issues
+        .iter()
+        .filter(|issue| issue.is_capability() && issue.install_visibility.is_visible(verbose))
+        .collect();
+    if !capabilities.is_empty() {
+        lines.push(SecuritySummaryLine::Detail(summary_heading(
+            "Capabilities",
+            package_count,
+            issue_count(&capabilities),
+            "signal",
+        )));
+        lines.push(SecuritySummaryLine::Detail(install_ui::terminal_line!(
+            "  {}",
+            install_ui::dim(
+                "API use detected in source; execution and malicious intent are not established."
+            ),
+        )));
+        for issue in &capabilities {
+            lines.push(SecuritySummaryLine::Detail(install_ui::terminal_line!(
+                "  {} {}  {}",
+                install_ui::cyan("ℹ"),
+                lpm_common::sanitize_terminal_inline(issue.tag_label),
+                install_ui::dim(&format!(
+                    "{} {}",
+                    issue.packages.len(),
+                    if issue.packages.len() == 1 {
+                        "package"
+                    } else {
+                        "packages"
+                    }
+                )),
+            )));
+        }
+        if verbose {
+            append_query_hint(&mut lines, &capabilities, "capabilities");
         }
     }
 
@@ -1011,13 +1062,13 @@ mod tests {
             "security summary headline should render through install_ui::warn"
         );
         assert!(
-            joined.contains("Security summary · 9 packages · 9 findings"),
+            joined.contains("Security summary · 9 packages · 1 finding"),
             "summary headline missing: {joined}"
         );
         assert!(
             joined.contains("1 Critical")
-                && joined.contains("3 High")
-                && joined.contains("5 Medium"),
+                && joined.contains("0 High")
+                && joined.contains("0 Medium"),
             "severity roll-up missing: {joined}"
         );
         assert!(
@@ -1025,8 +1076,10 @@ mod tests {
             "critical issue detail missing: {joined}"
         );
         assert!(
-            !joined.contains("shell execution") && !joined.contains("network access"),
-            "normal output must hide High and Medium details: {joined}"
+            joined.contains("Capabilities · 9 packages · 8 signals")
+                && joined.contains("shell execution")
+                && joined.contains("network access"),
+            "normal output must separate capabilities from warnings: {joined}"
         );
         assert!(
             joined.contains("Run lpm audit for full details."),
@@ -1078,7 +1131,7 @@ mod tests {
             "medium-severity issue should stay visible: {joined}"
         );
         assert!(
-            joined.contains("lpm query \":network,:scripts\""),
+            joined.contains("lpm query \":network\"") && joined.contains("lpm query \":scripts\""),
             "verbose output should include exact selectors: {joined}"
         );
     }
@@ -1136,8 +1189,13 @@ mod tests {
             .join("\n");
         let joined = console::strip_ansi_codes(&joined).into_owned();
 
-        assert!(joined.contains("Behavioral metadata · 1 package · 2 signals"));
-        assert!(joined.contains("lpm query \":env,:url-strings\""));
+        assert!(
+            joined.contains("Behavioral metadata · 1 package · 1 signal")
+                && joined.contains("Capabilities · 1 package · 1 signal")
+        );
+        assert!(
+            joined.contains("lpm query \":env\"") && joined.contains("lpm query \":url-strings\"")
+        );
         assert!(!joined.contains(":critical"));
         assert!(!joined.contains("Security summary"));
     }

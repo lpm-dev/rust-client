@@ -1,5 +1,6 @@
 ---
 source: tests/workflows/tests/audit.rs
+assertion_line: 2519
 expression: json
 ---
 {
@@ -30,6 +31,7 @@ expression: json
   "checked_lpm": 0,
   "packages_with_issues": 0,
   "total_issues": 0,
+  "total_capabilities": 0,
   "osv_vulnerabilities": 0,
   "counts": {
     "critical": 0,

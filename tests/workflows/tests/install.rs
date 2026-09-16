@@ -1813,11 +1813,13 @@ async fn install_with_audit_after_install_flag_appends_summary_line() {
     let tarball = make_tarball("ms", "2.1.3");
     mock.with_package("ms", "2.1.3", &tarball).await;
     mount_ms_2_1_3(&mock).await;
+    mock.with_osv_querybatch(vec![vec![]]).await;
 
     let project = TempProject::empty(
         r#"{"name":"audit-on","version":"1.0.0","dependencies":{"ms":"^2.1.3"}}"#,
     );
     let output = lpm_with_registry(&project, &mock.url())
+        .env("LPM_OSV_URL", format!("{}/v1/querybatch", mock.url()))
         .args([
             "install",
             "--audit-after-install",
@@ -2142,11 +2144,13 @@ async fn install_env_audit_after_install_appends_summary_line() {
     let tarball = make_tarball("ms", "2.1.3");
     mock.with_package("ms", "2.1.3", &tarball).await;
     mount_ms_2_1_3(&mock).await;
+    mock.with_osv_querybatch(vec![vec![]]).await;
 
     let project = TempProject::empty(
         r#"{"name":"audit-env-on","version":"1.0.0","dependencies":{"ms":"^2.1.3"}}"#,
     );
     let output = lpm_with_registry(&project, &mock.url())
+        .env("LPM_OSV_URL", format!("{}/v1/querybatch", mock.url()))
         .env("LPM_AUDIT_AFTER_INSTALL", "1")
         .args([
             "install",
@@ -2171,11 +2175,13 @@ async fn install_audit_after_install_attaches_summary_to_json_envelope() {
     let tarball = make_tarball("ms", "2.1.3");
     mock.with_package("ms", "2.1.3", &tarball).await;
     mount_ms_2_1_3(&mock).await;
+    mock.with_osv_querybatch(vec![vec![]]).await;
 
     let project = TempProject::empty(
         r#"{"name":"audit-json","version":"1.0.0","dependencies":{"ms":"^2.1.3"}}"#,
     );
     let output = lpm_with_registry(&project, &mock.url())
+        .env("LPM_OSV_URL", format!("{}/v1/querybatch", mock.url()))
         .args([
             "--json",
             "install",
@@ -2245,6 +2251,7 @@ async fn install_audit_after_install_enabled_via_config_file() {
     let tarball = make_tarball("ms", "2.1.3");
     mock.with_package("ms", "2.1.3", &tarball).await;
     mount_ms_2_1_3(&mock).await;
+    mock.with_osv_querybatch(vec![vec![]]).await;
 
     let project = TempProject::empty(
         r#"{"name":"audit-cfg-on","version":"1.0.0","dependencies":{"ms":"^2.1.3"}}"#,
@@ -2258,6 +2265,7 @@ async fn install_audit_after_install_enabled_via_config_file() {
     std::fs::write(cfg_dir.join("config.toml"), "audit-after-install = true\n").unwrap();
 
     let output = lpm_with_registry(&project, &mock.url())
+        .env("LPM_OSV_URL", format!("{}/v1/querybatch", mock.url()))
         .args([
             "install",
             "--no-security-summary",
@@ -6130,12 +6138,12 @@ async fn install_disabled_lpm_insights_skips_enrichment_request_but_keeps_local_
     );
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("Security summary") && stderr.contains("1 High"),
-        "local behavioral findings must remain in the compact install summary; stderr:\n{stderr}"
+        stderr.contains("Capabilities") && stderr.contains("eval()") && stderr.contains("0 High"),
+        "local capabilities must remain separate from security findings; stderr:\n{stderr}"
     );
     assert!(
-        !stderr.contains("eval()"),
-        "normal install must hide High finding details; stderr:\n{stderr}"
+        !stderr.contains("lpm query"),
+        "normal install must keep capability query hints compact; stderr:\n{stderr}"
     );
 
     let batch_requests = mock
@@ -6833,7 +6841,7 @@ async fn bare_add_persists_finalized_manifest_in_lockfile_and_stays_up_to_date()
 }
 
 #[tokio::test]
-async fn npm_only_install_compacts_noncritical_security_findings_by_default() {
+async fn npm_only_install_separates_capabilities_from_noncritical_security_findings() {
     let mock = MockRegistry::start().await;
     let tarball = make_tarball_with_files(
         "local-security-finding",
@@ -6881,13 +6889,14 @@ async fn npm_only_install_compacts_noncritical_security_findings_by_default() {
     assert!(
         combined.contains("Security summary")
             && combined.contains("0 Critical")
-            && combined.contains("1 High")
+            && combined.contains("0 High")
             && combined.contains("1 Medium")
             && combined.contains("Run lpm audit for full details."),
         "local source analysis must use a severity roll-up without an @lpm.dev dependency:\n{combined}",
     );
     assert!(
-        !combined.contains("eval()")
+        combined.contains("Capabilities")
+            && combined.contains("eval()")
             && !combined.contains("no license")
             && !combined.contains("lpm query"),
         "normal install must hide noncritical finding details:\n{combined}",
@@ -6940,7 +6949,8 @@ async fn verbose_npm_only_install_reports_noncritical_finding_details() {
     assert!(
         combined.contains("eval()")
             && combined.contains("no license")
-            && combined.contains("lpm query \":eval,:no-license\""),
+            && combined.contains("lpm query \":no-license\"")
+            && combined.contains("lpm query \":eval,:env\""),
         "verbose install must show noncritical finding details and selectors:\n{combined}",
     );
 }
@@ -7092,13 +7102,14 @@ async fn verbose_install_shows_info_metadata_with_matching_query_hint() {
         String::from_utf8_lossy(&output.stderr)
     );
     assert!(
-        combined.contains("Behavioral metadata · 1 package · 3 signals"),
+        combined.contains("Behavioral metadata · 1 package · 2 signals"),
         "verbose install omitted Info behavioral metadata:\n{combined}",
     );
     assert!(combined.contains("environment-variable access"));
     assert!(combined.contains("URL literals"));
     assert!(combined.contains("trivial package"));
-    assert!(combined.contains("lpm query \":env,:url-strings,:trivial\""));
+    assert!(combined.contains("lpm query \":env\""));
+    assert!(combined.contains("lpm query \":url-strings,:trivial\""));
     assert!(!combined.contains("lpm query \":critical\""));
     assert!(!combined.contains("Security summary"));
 }

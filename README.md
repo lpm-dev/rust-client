@@ -97,7 +97,7 @@ See [`lpm login`](https://cli.lpm.dev/docs/infra/login) for authentication and t
   - [`lpm install`](https://cli.lpm.dev/docs/packages/install)
   - [`lpm add`](https://cli.lpm.dev/docs/packages/add)
   - [`lpm publish`](https://cli.lpm.dev/docs/packages/publish)
-  - [`lpm audit`](https://cli.lpm.dev/docs/packages/audit)
+  - [`lpm audit`](https://cli.lpm.dev/docs/packages/audit) — [source capabilities and JSON output](bench/source-analysis/README.md#audit-output)
   - [`lpm trust`](https://cli.lpm.dev/docs/packages/trust)
   - [`lpm approve-scripts`](https://cli.lpm.dev/docs/packages/approve-scripts)
   - [Workspaces](https://cli.lpm.dev/docs/packages/workspaces)

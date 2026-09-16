@@ -209,6 +209,75 @@ async fn disabled_source_analysis_preserves_independent_registry_insights() {
         assert!(!stderr.contains(SCAN_TRACE), "{stderr}");
         assert!(!stderr.contains("eval()"), "{stderr}");
         assert_eq!(stderr.contains("network access"), insights, "{stderr}");
-        assert_eq!(stderr.contains("Security summary"), insights, "{stderr}");
+        assert_eq!(stderr.contains("Capabilities"), insights, "{stderr}");
+        assert!(!stderr.contains("Security summary"), "{stderr}");
+    }
+}
+
+#[tokio::test]
+async fn audit_separates_capabilities_and_preserves_explicit_policy_failures() {
+    let mock = MockRegistry::start().await;
+    let name = "capability-evidence";
+    let tarball = make_tarball_from_pkg_json(
+        serde_json::json!({"name": name, "version": "1.0.0", "license": "MIT"}),
+        &[("lib/compile.js", b"module.exports = input => eval(input);\nconst values = [\n1,\n2,\n3,\n4,\n5,\n6,\n7,\n8,\n9,\n10\n];\nmodule.exports.values = values;\n")],
+    );
+    mock.with_package(name, "1.0.0", &tarball).await;
+    mock.with_osv_querybatch(vec![vec![]]).await;
+    let project = TempProject::empty(
+        r#"{"name":"consumer","version":"1.0.0","dependencies":{"capability-evidence":"1.0.0"}}"#,
+    );
+    write_config(&project, "install-time-source-analysis = true\n");
+    let installed = lpm_with_registry_and_npm(&project, &mock.url())
+        .args(["install", "--no-skills", "--no-editor-setup"])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&installed.stderr);
+    assert!(installed.status.success(), "{stderr}");
+    assert!(stderr.contains("Capabilities"), "{stderr}");
+    assert!(!stderr.contains("Security summary"), "{stderr}");
+
+    let audit = lpm_with_registry_and_npm(&project, &mock.url())
+        .env("LPM_OSV_URL", format!("{}/v1/querybatch", mock.url()))
+        .args(["--json", "audit"])
+        .output()
+        .unwrap();
+    assert!(
+        audit.status.success(),
+        "{}",
+        String::from_utf8_lossy(&audit.stderr)
+    );
+    let envelope: serde_json::Value = serde_json::from_slice(&audit.stdout).unwrap();
+    assert_eq!(envelope["total_issues"], 0);
+    assert_eq!(envelope["total_capabilities"], 1);
+    assert_eq!(envelope["counts"]["high"], 0);
+    let capability = &envelope["packages"][0]["capabilities"][0];
+    assert_eq!(capability["rule_id"], "eval");
+    assert_eq!(capability["policy_severity"], "high");
+    assert_eq!(capability["evidence"][0]["path"], "lib/compile.js");
+    assert_eq!(capability["evidence"][0]["line"], 1);
+    insta::assert_json_snapshot!("audit_capability_evidence", envelope, {
+        ".packages[].path" => "[PACKAGE_PATH]",
+        ".packages[].instance_id" => "[INSTANCE_ID]",
+    });
+
+    let human = lpm_with_registry_and_npm(&project, &mock.url())
+        .env("LPM_OSV_URL", format!("{}/v1/querybatch", mock.url()))
+        .args(["audit"])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&human.stderr);
+    assert!(human.status.success(), "{stderr}");
+    assert!(stderr.contains("Capabilities"), "{stderr}");
+    assert!(stderr.contains("No security issues found"), "{stderr}");
+    assert!(!stderr.contains("Behavioral flags"), "{stderr}");
+
+    for policy in ["--fail-on=behavior", "--fail-on=all"] {
+        let explicit = lpm_with_registry_and_npm(&project, &mock.url())
+            .env("LPM_OSV_URL", format!("{}/v1/querybatch", mock.url()))
+            .args(["--json", "audit", policy])
+            .output()
+            .unwrap();
+        assert_eq!(explicit.status.code(), Some(1), "{policy}");
     }
 }
