@@ -1,5 +1,7 @@
 # Expanded source-analysis validation
 
+This report records the frozen expansion study. The [credential-exfiltration follow-up](../threat-detection/report.md) covers the three historical misses and the next detector version.
+
 ## Result
 
 This study scanned 12,000 distinct npm package names and five historical compromised versions without executing package code.

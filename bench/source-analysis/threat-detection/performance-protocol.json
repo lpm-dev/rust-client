@@ -1,0 +1,32 @@
+{
+  "candidate_code_commit": "f44b769b",
+  "source": {
+    "manifest": "../expanded-9000.json",
+    "split": "tuning",
+    "packages": 7000,
+    "threads": 4,
+    "warmup_pairs": 2,
+    "measured_pairs": 5,
+    "order": "Alternate baseline/candidate order for each pair.",
+    "exclusion": "Reject both sides of a pair that overlaps Cargo build/test activity, sampled every 500 ms. Wait for a five-second quiet window before each pair."
+  },
+  "install": {
+    "runner": "bench/scripts/run-install-readiness.mjs",
+    "warmup_pairs_per_cell": 2,
+    "measured_pairs_per_cell": 20,
+    "modes": [
+      "cold",
+      "warm",
+      "up-to-date"
+    ],
+    "source_analysis": [
+      true,
+      false
+    ],
+    "order": "Use the runner paired, alternating binary order.",
+    "exclusion": "Reject the entire run if it overlaps detected Cargo activity. Preserve rejected attempts.",
+    "extension_policy": "No result-dependent sample extension."
+  },
+  "scheduling": "Finish build/test gates before timing. Run source and install measurements sequentially.",
+  "prior_warmup_attempts": "Preserved locally, but superseded by the computed-property correction before final measurements."
+}

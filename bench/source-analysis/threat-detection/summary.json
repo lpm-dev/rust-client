@@ -1,0 +1,254 @@
+{
+  "original": {
+    "packages": 1000,
+    "complete": {
+      "baseline": 997,
+      "candidate": 998
+    },
+    "tag_counts": {
+      "baseline": {
+        "manifest.copyleftLicense": 4,
+        "manifest.gitDependency": 7,
+        "manifest.wildcardDependency": 55,
+        "source.childProcess": 33,
+        "source.crypto": 47,
+        "source.dynamicRequire": 60,
+        "source.environmentVars": 128,
+        "source.eval": 46,
+        "source.filesystem": 167,
+        "source.nativeBindings": 8,
+        "source.network": 31,
+        "source.shell": 11,
+        "source.webSocket": 2,
+        "supplyChain.highEntropyStrings": 142,
+        "supplyChain.minified": 93,
+        "supplyChain.possibleObfuscation": 26,
+        "supplyChain.telemetry": 4,
+        "supplyChain.trivial": 46,
+        "supplyChain.urlStrings": 112
+      },
+      "candidate": {
+        "manifest.copyleftLicense": 4,
+        "manifest.gitDependency": 7,
+        "manifest.wildcardDependency": 55,
+        "source.childProcess": 33,
+        "source.crypto": 47,
+        "source.dynamicRequire": 60,
+        "source.environmentVars": 128,
+        "source.eval": 46,
+        "source.filesystem": 167,
+        "source.nativeBindings": 8,
+        "source.network": 31,
+        "source.shell": 11,
+        "source.webSocket": 2,
+        "supplyChain.highEntropyStrings": 142,
+        "supplyChain.minified": 93,
+        "supplyChain.possibleObfuscation": 26,
+        "supplyChain.telemetry": 4,
+        "supplyChain.trivial": 46,
+        "supplyChain.urlStrings": 112
+      }
+    },
+    "changed_packages": 0,
+    "critical_packages": {
+      "baseline": 0,
+      "candidate": 0
+    },
+    "credential_exfiltration_packages": 0,
+    "run": {
+      "binary_sha256": "c993cc8e9d02c2a8c5dc5e737545f36e80d38724fd80d53fe902092452190728",
+      "manifest_sha256": "2d0bb511bd6c5c90f2d65e6bfb3ef280b1bb7712afcec4c2746f503bd8043ed6",
+      "split": "all",
+      "count": 1000,
+      "threads": 4,
+      "wall_seconds": 4.651777749997564,
+      "exit_code": 0
+    }
+  },
+  "expanded": {
+    "packages": 9000,
+    "complete": {
+      "baseline": 8812,
+      "candidate": 8860
+    },
+    "tag_counts": {
+      "baseline": {
+        "manifest.copyleftLicense": 76,
+        "manifest.gitDependency": 68,
+        "manifest.noLicense": 204,
+        "manifest.wildcardDependency": 552,
+        "source.childProcess": 503,
+        "source.crypto": 630,
+        "source.dynamicRequire": 708,
+        "source.environmentVars": 1486,
+        "source.eval": 583,
+        "source.filesystem": 1761,
+        "source.nativeBindings": 87,
+        "source.network": 872,
+        "source.shell": 214,
+        "source.webSocket": 112,
+        "supplyChain.highEntropyStrings": 1960,
+        "supplyChain.minified": 1217,
+        "supplyChain.possibleObfuscation": 217,
+        "supplyChain.telemetry": 94,
+        "supplyChain.trivial": 502,
+        "supplyChain.urlStrings": 1635
+      },
+      "candidate": {
+        "manifest.copyleftLicense": 76,
+        "manifest.gitDependency": 68,
+        "manifest.noLicense": 204,
+        "manifest.wildcardDependency": 552,
+        "source.childProcess": 502,
+        "source.crypto": 635,
+        "source.dynamicRequire": 717,
+        "source.environmentVars": 1489,
+        "source.eval": 590,
+        "source.filesystem": 1762,
+        "source.nativeBindings": 88,
+        "source.network": 880,
+        "source.shell": 222,
+        "source.webSocket": 111,
+        "supplyChain.highEntropyStrings": 1960,
+        "supplyChain.minified": 1219,
+        "supplyChain.possibleObfuscation": 220,
+        "supplyChain.telemetry": 96,
+        "supplyChain.trivial": 502,
+        "supplyChain.urlStrings": 1638
+      }
+    },
+    "changed_packages": 28,
+    "critical_packages": {
+      "baseline": 0,
+      "candidate": 0
+    },
+    "credential_exfiltration_packages": 0,
+    "run": {
+      "binary_sha256": "c993cc8e9d02c2a8c5dc5e737545f36e80d38724fd80d53fe902092452190728",
+      "manifest_sha256": "ee7e74569582709c825c4ab6c3861bdf0ce4dfda474b81a6d36d461c9e2c80be",
+      "split": "all",
+      "count": 9000,
+      "threads": 4,
+      "wall_seconds": 64.4584549999563,
+      "exit_code": 0
+    }
+  },
+  "former-validation": {
+    "packages": 2000,
+    "complete": {
+      "baseline": 1937,
+      "candidate": 1953
+    },
+    "tag_counts": {
+      "baseline": {
+        "manifest.copyleftLicense": 46,
+        "manifest.gitDependency": 14,
+        "manifest.noLicense": 64,
+        "manifest.wildcardDependency": 97,
+        "source.childProcess": 131,
+        "source.crypto": 142,
+        "source.dynamicRequire": 161,
+        "source.environmentVars": 333,
+        "source.eval": 167,
+        "source.filesystem": 460,
+        "source.nativeBindings": 16,
+        "source.network": 255,
+        "source.shell": 61,
+        "source.webSocket": 32,
+        "supplyChain.highEntropyStrings": 528,
+        "supplyChain.minified": 425,
+        "supplyChain.possibleObfuscation": 59,
+        "supplyChain.telemetry": 28,
+        "supplyChain.trivial": 74,
+        "supplyChain.urlStrings": 494
+      },
+      "candidate": {
+        "manifest.copyleftLicense": 46,
+        "manifest.gitDependency": 14,
+        "manifest.noLicense": 64,
+        "manifest.wildcardDependency": 97,
+        "source.childProcess": 130,
+        "source.crypto": 142,
+        "source.dynamicRequire": 162,
+        "source.environmentVars": 333,
+        "source.eval": 167,
+        "source.filesystem": 460,
+        "source.nativeBindings": 16,
+        "source.network": 256,
+        "source.shell": 61,
+        "source.webSocket": 33,
+        "supplyChain.highEntropyStrings": 526,
+        "supplyChain.minified": 424,
+        "supplyChain.possibleObfuscation": 59,
+        "supplyChain.telemetry": 29,
+        "supplyChain.trivial": 74,
+        "supplyChain.urlStrings": 494
+      }
+    },
+    "changed_packages": 6,
+    "critical_packages": {
+      "baseline": 0,
+      "candidate": 0
+    },
+    "credential_exfiltration_packages": 0,
+    "run": {
+      "binary_sha256": "c993cc8e9d02c2a8c5dc5e737545f36e80d38724fd80d53fe902092452190728",
+      "manifest_sha256": "5a6b9f13ed3739ce6bced56a813339af0238e2e2e2e83019805f3d422ab36765",
+      "split": "all",
+      "count": 2000,
+      "threads": 4,
+      "wall_seconds": 26.859570417029317,
+      "exit_code": 0
+    }
+  },
+  "historical": {
+    "packages": 5,
+    "complete": {
+      "baseline": 4,
+      "candidate": 5
+    },
+    "tag_counts": {
+      "baseline": {
+        "source.crypto": 2,
+        "source.environmentVars": 3,
+        "source.filesystem": 2,
+        "source.network": 3,
+        "source.webSocket": 1,
+        "supplyChain.highEntropyStrings": 4,
+        "supplyChain.minified": 3,
+        "supplyChain.obfuscated": 2,
+        "supplyChain.possibleObfuscation": 2,
+        "supplyChain.urlStrings": 3
+      },
+      "candidate": {
+        "source.crypto": 3,
+        "source.environmentVars": 3,
+        "source.eval": 1,
+        "source.filesystem": 2,
+        "source.network": 3,
+        "source.webSocket": 1,
+        "supplyChain.credentialExfiltration": 3,
+        "supplyChain.highEntropyStrings": 4,
+        "supplyChain.minified": 3,
+        "supplyChain.obfuscated": 2,
+        "supplyChain.possibleObfuscation": 2,
+        "supplyChain.urlStrings": 3
+      }
+    },
+    "changed_packages": 3,
+    "critical_packages": {
+      "baseline": 2,
+      "candidate": 5
+    },
+    "credential_exfiltration_packages": 3,
+    "run": {
+      "binary_sha256": "c993cc8e9d02c2a8c5dc5e737545f36e80d38724fd80d53fe902092452190728",
+      "manifest_sha256": "b0be69f50a9b2e7cca8330f723532292454b963f6556b1fe375911e0428e2f98",
+      "split": "all",
+      "count": 5,
+      "threads": 4,
+      "wall_seconds": 0.34000145801110193,
+      "exit_code": 0
+    }
+  }
+}

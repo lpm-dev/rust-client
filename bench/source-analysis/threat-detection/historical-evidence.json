@@ -1,0 +1,260 @@
+[
+  {
+    "name": "@ctrl/tinycolor",
+    "version": "4.1.1",
+    "baseline": {
+      "tags": [
+        "source.environmentVars",
+        "source.filesystem",
+        "source.network",
+        "supplyChain.highEntropyStrings",
+        "supplyChain.minified",
+        "supplyChain.possibleObfuscation",
+        "supplyChain.urlStrings"
+      ],
+      "coverage": {
+        "complete": false,
+        "reasons": [
+          "limitReached",
+          "unparsedFiles"
+        ],
+        "files_scanned": 25,
+        "bytes_scanned": 385089
+      }
+    },
+    "candidate": {
+      "tags": [
+        "source.crypto",
+        "source.environmentVars",
+        "source.eval",
+        "source.filesystem",
+        "source.network",
+        "supplyChain.credentialExfiltration",
+        "supplyChain.highEntropyStrings",
+        "supplyChain.minified",
+        "supplyChain.possibleObfuscation",
+        "supplyChain.urlStrings"
+      ],
+      "coverage": {
+        "complete": true,
+        "reasons": [],
+        "files_scanned": 26,
+        "bytes_scanned": 3857619
+      }
+    },
+    "removed": [],
+    "added": [
+      "source.crypto",
+      "source.eval",
+      "supplyChain.credentialExfiltration"
+    ],
+    "evidence": [
+      {
+        "ruleId": "credential-exfiltration",
+        "path": "bundle.js",
+        "line": 2,
+        "column": 3336425,
+        "reason": "The complete process environment flows into a network payload through supported assignments or helper calls."
+      }
+    ]
+  },
+  {
+    "name": "@solana/web3.js",
+    "version": "1.95.7",
+    "baseline": {
+      "tags": [
+        "source.crypto",
+        "source.environmentVars",
+        "source.network",
+        "supplyChain.highEntropyStrings",
+        "supplyChain.minified",
+        "supplyChain.possibleObfuscation",
+        "supplyChain.urlStrings"
+      ],
+      "coverage": {
+        "complete": true,
+        "reasons": [],
+        "files_scanned": 67,
+        "bytes_scanned": 3462034
+      }
+    },
+    "candidate": {
+      "tags": [
+        "source.crypto",
+        "source.environmentVars",
+        "source.network",
+        "supplyChain.credentialExfiltration",
+        "supplyChain.highEntropyStrings",
+        "supplyChain.minified",
+        "supplyChain.possibleObfuscation",
+        "supplyChain.urlStrings"
+      ],
+      "coverage": {
+        "complete": true,
+        "reasons": [],
+        "files_scanned": 67,
+        "bytes_scanned": 3462034
+      }
+    },
+    "removed": [],
+    "added": [
+      "supplyChain.credentialExfiltration"
+    ],
+    "evidence": [
+      {
+        "ruleId": "credential-exfiltration",
+        "path": "lib/index.browser.cjs.js",
+        "line": 3157,
+        "column": 5,
+        "reason": "Private-key or wallet-seed material flows into a network payload through supported assignments or helper calls."
+      },
+      {
+        "ruleId": "credential-exfiltration",
+        "path": "lib/index.browser.esm.js",
+        "line": 3131,
+        "column": 5,
+        "reason": "Private-key or wallet-seed material flows into a network payload through supported assignments or helper calls."
+      },
+      {
+        "ruleId": "credential-exfiltration",
+        "path": "lib/index.cjs.js",
+        "line": 3165,
+        "column": 5,
+        "reason": "Private-key or wallet-seed material flows into a network payload through supported assignments or helper calls."
+      }
+    ]
+  },
+  {
+    "name": "debug",
+    "version": "4.4.2",
+    "baseline": {
+      "tags": [
+        "source.environmentVars",
+        "supplyChain.minified",
+        "supplyChain.obfuscated"
+      ],
+      "coverage": {
+        "complete": true,
+        "reasons": [],
+        "files_scanned": 4,
+        "bytes_scanned": 94500
+      }
+    },
+    "candidate": {
+      "tags": [
+        "source.environmentVars",
+        "supplyChain.minified",
+        "supplyChain.obfuscated"
+      ],
+      "coverage": {
+        "complete": true,
+        "reasons": [],
+        "files_scanned": 4,
+        "bytes_scanned": 94500
+      }
+    },
+    "removed": [],
+    "added": [],
+    "evidence": [
+      {
+        "ruleId": "obfuscated",
+        "path": "src/index.js",
+        "reason": "Multiple obfuscation heuristics exceeded the high-confidence threshold."
+      }
+    ]
+  },
+  {
+    "name": "node-ipc",
+    "version": "12.0.1",
+    "baseline": {
+      "tags": [
+        "source.filesystem",
+        "supplyChain.highEntropyStrings",
+        "supplyChain.obfuscated"
+      ],
+      "coverage": {
+        "complete": true,
+        "reasons": [],
+        "files_scanned": 9,
+        "bytes_scanned": 143414
+      }
+    },
+    "candidate": {
+      "tags": [
+        "source.filesystem",
+        "supplyChain.highEntropyStrings",
+        "supplyChain.obfuscated"
+      ],
+      "coverage": {
+        "complete": true,
+        "reasons": [],
+        "files_scanned": 9,
+        "bytes_scanned": 143414
+      }
+    },
+    "removed": [],
+    "added": [],
+    "evidence": [
+      {
+        "ruleId": "obfuscated",
+        "path": "node-ipc.cjs",
+        "reason": "Multiple obfuscation heuristics exceeded the high-confidence threshold."
+      }
+    ]
+  },
+  {
+    "name": "xrpl",
+    "version": "4.2.1",
+    "baseline": {
+      "tags": [
+        "source.crypto",
+        "source.network",
+        "source.webSocket",
+        "supplyChain.highEntropyStrings",
+        "supplyChain.urlStrings"
+      ],
+      "coverage": {
+        "complete": true,
+        "reasons": [],
+        "files_scanned": 562,
+        "bytes_scanned": 3119680
+      }
+    },
+    "candidate": {
+      "tags": [
+        "source.crypto",
+        "source.network",
+        "source.webSocket",
+        "supplyChain.credentialExfiltration",
+        "supplyChain.highEntropyStrings",
+        "supplyChain.urlStrings"
+      ],
+      "coverage": {
+        "complete": true,
+        "reasons": [],
+        "files_scanned": 562,
+        "bytes_scanned": 3119680
+      }
+    },
+    "removed": [],
+    "added": [
+      "supplyChain.credentialExfiltration"
+    ],
+    "evidence": [
+      {
+        "ruleId": "credential-exfiltration",
+        "path": "build/xrpl-latest-min.js",
+        "line": 17953,
+        "column": 3,
+        "reason": "Private-key or wallet-seed material flows into a network payload through supported assignments or helper calls."
+      },
+      {
+        "ruleId": "credential-exfiltration",
+        "path": "build/xrpl-latest.js",
+        "line": 17953,
+        "column": 3,
+        "reason": "Private-key or wallet-seed material flows into a network payload through supported assignments or helper calls."
+      }
+    ]
+  }
+]
