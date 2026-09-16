@@ -1,0 +1,105 @@
+---
+source: tests/workflows/tests/install_source_analysis.rs
+expression: envelope
+---
+{
+  "success": true,
+  "behavioral_coverage": {
+    "complete": true,
+    "scanned_packages": 1,
+    "partial_packages": 0,
+    "unavailable_packages": 0,
+    "packages": []
+  },
+  "manager": "lpm",
+  "degraded": false,
+  "osv_degraded": false,
+  "osv_degraded_reason": null,
+  "scanned": 1,
+  "checked_lpm": 0,
+  "packages_with_issues": 1,
+  "total_issues": 2,
+  "total_capabilities": 2,
+  "osv_vulnerabilities": 0,
+  "counts": {
+    "critical": 0,
+    "high": 1,
+    "moderate": 0,
+    "low": 0,
+    "info": 1
+  },
+  "packages": [
+    {
+      "name": "targeted-source-control",
+      "version": "1.0.0",
+      "instance_id": "[INSTANCE_ID]",
+      "path": "[PACKAGE_PATH]",
+      "quality_score": null,
+      "capabilities": [
+        {
+          "rule_id": "eval",
+          "name": "eval()",
+          "policy_severity": "high",
+          "source": "local",
+          "evidence": [
+            {
+              "ruleId": "eval",
+              "path": "index.js",
+              "line": 1,
+              "column": 95,
+              "excerpt": "nst decipher=crypto.createDecipheriv('aes-256-gcm',key,iv); eval(decipher.update(payload).toString());",
+              "reason": "Source pattern indicates a capability; execution is not established.",
+              "fileContext": "source"
+            }
+          ]
+        },
+        {
+          "rule_id": "crypto",
+          "name": "cryptography",
+          "policy_severity": "info",
+          "source": "local",
+          "evidence": [
+            {
+              "ruleId": "crypto",
+              "path": "index.js",
+              "line": 1,
+              "column": 14,
+              "excerpt": "const crypto=require('crypto'); const decipher=crypto.createDecipheriv('aes-256-gcm',key,iv); eval(decipher.update(payload).toString());",
+              "reason": "Source pattern indicates a capability; execution is not established.",
+              "fileContext": "source"
+            }
+          ]
+        }
+      ],
+      "issues": [
+        {
+          "severity": "info",
+          "category": "supply-chain",
+          "message": "trivial package",
+          "source": "local",
+          "rule_id": "trivial",
+          "evidence": []
+        },
+        {
+          "severity": "high",
+          "category": "supply-chain",
+          "message": "encrypted code execution",
+          "source": "local",
+          "rule_id": "encrypted-execution",
+          "evidence": [
+            {
+              "ruleId": "encrypted-execution",
+              "path": "index.js",
+              "line": 1,
+              "column": 95,
+              "excerpt": "nst decipher=crypto.createDecipheriv('aes-256-gcm',key,iv); eval(decipher.update(payload).toString());",
+              "reason": "Decrypted bytes reach code evaluation or a file passed to a process launcher.",
+              "fileContext": "source"
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "vulnerabilities": []
+}

@@ -129,7 +129,7 @@ impl InstallVisibility {
     }
 }
 
-const BEHAVIORAL_TAG_POLICIES: [BehavioralTagInfo; 24] = [
+const BEHAVIORAL_TAG_POLICIES: [BehavioralTagInfo; 27] = [
     BehavioralTagInfo {
         tag: PseudoClass::Eval,
         token: ":eval",
@@ -299,7 +299,34 @@ const BEHAVIORAL_TAG_POLICIES: [BehavioralTagInfo; 24] = [
         group: TagGroup::SupplyChain,
         severity: Severity::Critical,
         install_visibility: InstallVisibility::Default,
-        description: "Send private-key material or the complete process environment in a network payload",
+        description: "Send credential-file contents, private-key material, or the complete process environment in a network payload",
+    },
+    BehavioralTagInfo {
+        tag: PseudoClass::EncryptedExecution,
+        token: ":encrypted-execution",
+        label: "encrypted code execution",
+        group: TagGroup::SupplyChain,
+        severity: Severity::High,
+        install_visibility: InstallVisibility::Default,
+        description: "Decrypted bytes reach code evaluation or a file passed to a process launcher",
+    },
+    BehavioralTagInfo {
+        tag: PseudoClass::DownloadedExecution,
+        token: ":downloaded-execution",
+        label: "downloaded code execution",
+        group: TagGroup::SupplyChain,
+        severity: Severity::High,
+        install_visibility: InstallVisibility::Default,
+        description: "A downloaded response reaches code evaluation or a file passed to a process launcher",
+    },
+    BehavioralTagInfo {
+        tag: PseudoClass::DestructiveFilesystem,
+        token: ":destructive-filesystem",
+        label: "broad filesystem deletion",
+        group: TagGroup::SupplyChain,
+        severity: Severity::Critical,
+        install_visibility: InstallVisibility::Default,
+        description: "Recursively remove the home directory, a filesystem root, or current project contents",
     },
     BehavioralTagInfo {
         tag: PseudoClass::GitDep,
@@ -384,6 +411,9 @@ pub enum PseudoClass {
     Trivial,
     Protestware,
     CredentialExfiltration,
+    DestructiveFilesystem,
+    DownloadedExecution,
+    EncryptedExecution,
 
     // Manifest selectors (5)
     GitDep,
@@ -441,6 +471,9 @@ impl PseudoClass {
             "trivial" => Some(Self::Trivial),
             "protestware" => Some(Self::Protestware),
             "credential-exfiltration" => Some(Self::CredentialExfiltration),
+            "destructive-filesystem" => Some(Self::DestructiveFilesystem),
+            "downloaded-execution" => Some(Self::DownloadedExecution),
+            "encrypted-execution" => Some(Self::EncryptedExecution),
 
             // Manifest tags
             "git-dep" => Some(Self::GitDep),
@@ -493,6 +526,9 @@ impl PseudoClass {
             Self::Trivial => ":trivial",
             Self::Protestware => ":protestware",
             Self::CredentialExfiltration => ":credential-exfiltration",
+            Self::DestructiveFilesystem => ":destructive-filesystem",
+            Self::DownloadedExecution => ":downloaded-execution",
+            Self::EncryptedExecution => ":encrypted-execution",
             Self::GitDep => ":git-dep",
             Self::HttpDep => ":http-dep",
             Self::WildcardDep => ":wildcard-dep",
@@ -538,6 +574,9 @@ impl PseudoClass {
             Self::Trivial,
             Self::Protestware,
             Self::CredentialExfiltration,
+            Self::DestructiveFilesystem,
+            Self::DownloadedExecution,
+            Self::EncryptedExecution,
             Self::GitDep,
             Self::HttpDep,
             Self::WildcardDep,
@@ -611,6 +650,9 @@ impl PseudoClass {
             Self::Trivial => analysis.supply_chain.trivial,
             Self::Protestware => analysis.supply_chain.protestware,
             Self::CredentialExfiltration => analysis.supply_chain.credential_exfiltration,
+            Self::DestructiveFilesystem => analysis.supply_chain.destructive_filesystem,
+            Self::DownloadedExecution => analysis.supply_chain.downloaded_execution,
+            Self::EncryptedExecution => analysis.supply_chain.encrypted_execution,
             Self::GitDep => analysis.manifest.git_dependency,
             Self::HttpDep => analysis.manifest.http_dependency,
             Self::WildcardDep => analysis.manifest.wildcard_dependency,

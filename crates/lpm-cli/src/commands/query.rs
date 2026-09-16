@@ -729,6 +729,15 @@ fn collect_active_tags(analysis: &PackageAnalysis) -> Vec<String> {
     if analysis.supply_chain.credential_exfiltration {
         tags.push("credential-exfiltration".into());
     }
+    if analysis.supply_chain.encrypted_execution {
+        tags.push("encrypted-execution".into());
+    }
+    if analysis.supply_chain.downloaded_execution {
+        tags.push("downloaded-execution".into());
+    }
+    if analysis.supply_chain.destructive_filesystem {
+        tags.push("destructive-filesystem".into());
+    }
     if analysis.supply_chain.protestware {
         tags.push("protestware".into());
     }

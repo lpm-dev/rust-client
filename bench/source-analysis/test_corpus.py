@@ -19,6 +19,7 @@ import zipfile
 import archive_inventory
 import archive_pilot
 import archive_report
+import archive_labels
 
 spec = importlib.util.spec_from_file_location("corpus", Path(__file__).with_name("corpus.py"))
 corpus = importlib.util.module_from_spec(spec)
@@ -44,6 +45,29 @@ spec.loader.exec_module(attack_families)
 
 
 class ArchivePilotTests(unittest.TestCase):
+    def test_scan_requires_matching_explicit_candidate_pin_and_records_it(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            binary = root / "scanner"
+            binary.write_bytes(b"candidate identity fixture")
+            digest = hashlib.sha256(binary.read_bytes()).hexdigest()
+            selection = root / "selection.json"
+            selection.write_text('{"packages": []}')
+            output = root / "output"
+            command = ["scan", "--selection", str(selection), "--downloads", str(root),
+                       "--output", str(output), "--binary", str(binary)]
+            for pin in [[], ["--expected-binary-sha256", "f" * 64],
+                        ["--expected-binary-sha256", "invalid"]]:
+                with patch("sys.argv", ["archive_pilot.py", *command, *pin]):
+                    with self.assertRaises(SystemExit) as raised:
+                        archive_pilot.main()
+                    self.assertEqual(raised.exception.code, 2)
+                self.assertFalse(output.exists())
+            with patch("sys.argv", ["archive_pilot.py", *command,
+                                   "--expected-binary-sha256", digest]):
+                archive_pilot.main()
+            self.assertEqual(json.loads((output / "run.json").read_text())["scanner_sha256"], digest)
+
     def record(self, number, name, evidence=(), advisory=None):
         return {"sha256": f"{number:064x}", "name": name, "version": "1.0.0", "size_bytes": 10,
                 "locations": ["local"], "focus_hints": [], "evidence_hashes": list(evidence),
@@ -492,6 +516,58 @@ class CorpusTests(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     historical.extract_archive(archive, destination, {
                         "name": "sample", "version": "1", "package_root": "sample/package/"})
+
+
+class ReviewedArchiveLabels(unittest.TestCase):
+    def test_reserved_source_neighbors_are_quarantined_without_inheriting_labels(self):
+        records = [dict(sha256='a', name='one', version='1', group='a', split='pilot_pool', evidence_hashes=[]),
+                   dict(sha256='b', name='two', version='1', group='b', split='reserved', evidence_hashes=['payload'])]
+        reviews = [dict(archive_sha256='a', label_status='source_reviewed_attack', family='credential_files',
+                        source_files=[dict(path='index.js', sha256='payload')])]
+        rows, links = archive_labels.regroup(records, {}, reviews)
+        self.assertEqual(rows[1]['split'], 'quarantined_related')
+        self.assertEqual(rows[1]['label_status'], 'unreviewed')
+        self.assertEqual(rows[0]['leakage_group'], rows[1]['leakage_group'])
+        self.assertEqual(links[0]['basis'], 'reviewed-source')
+
+    def test_shared_unreviewed_libraries_do_not_establish_payload_groups(self):
+        records = [dict(sha256=k, name=k, version='1', group=k, split='pilot_pool', evidence_hashes=[]) for k in ['a', 'b']]
+        inspections = {k: {'coverage': {'files': [dict(path='vendor.js', sha256='common', normalized_sha256='common-normal')]}} for k in ['a', 'b']}
+        rows, links = archive_labels.regroup(records, inspections, [])
+        self.assertNotEqual(rows[0]['leakage_group'], rows[1]['leakage_group'])
+        self.assertEqual(links, [])
+
+    def test_normalized_reviewed_payloads_link_versions_without_changing_the_label(self):
+        records = [dict(sha256=k, name=k, version='1', group=k, split='pilot_pool', evidence_hashes=[]) for k in ['a', 'b']]
+        inspections = {k: {'coverage': {'files': [dict(path='index.js', sha256=k, normalized_sha256='same-shape')]}} for k in ['a', 'b']}
+        reviews = [dict(archive_sha256='a', label_status='source_reviewed_attack', family='credential_files', source_files=[dict(path='index.js', sha256='a')])]
+        rows, links = archive_labels.regroup(records, inspections, reviews)
+        self.assertEqual(rows[0]['leakage_group'], rows[1]['leakage_group'])
+        self.assertEqual(rows[1]['label_status'], 'unreviewed')
+        self.assertEqual(links[0]['basis'], 'reviewed-normalized-source')
+
+    def test_review_requires_exact_source_hash_and_unique_archive(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / 'archive').mkdir()
+            (root / 'archive/index.js').write_text('public')
+            review = dict(archive_sha256='archive', source_files=[dict(path='index.js', sha256=hashlib.sha256(b'public').hexdigest())])
+            archive_labels.validate_reviews([review], [root])
+            with self.assertRaisesRegex(ValueError, 'duplicate'):
+                archive_labels.validate_reviews([review, review], [root])
+            (root / 'archive/index.js').write_text('changed')
+            with self.assertRaisesRegex(ValueError, 'hash mismatch'):
+                archive_labels.validate_reviews([review], [root])
+
+    def test_review_rejects_traversal_and_symlinks(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / 'archive').mkdir()
+            (root / 'outside.js').write_text('public')
+            (root / 'archive/link.js').symlink_to(root / 'outside.js')
+            for path in ['../outside.js', '/outside.js', 'link.js']:
+                with self.assertRaises(ValueError):
+                    archive_labels.validate_reviews([dict(archive_sha256='archive', source_files=[dict(path=path, sha256='irrelevant')])], [root])
 
 
 if __name__ == "__main__":

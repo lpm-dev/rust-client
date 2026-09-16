@@ -202,12 +202,16 @@ def main():
     parser.add_argument("--downloads", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--binary", type=Path)
+    parser.add_argument("--expected-binary-sha256", default=SCANNER_SHA256,
+                        help="Explicit candidate pin; defaults to the frozen scanner")
     parser.add_argument("--temporary-root", type=Path)
     args = parser.parse_args()
     if args.output.exists():
         parser.error("output exists; preserve prior runs")
-    if args.action == "scan" and (not args.binary or sha_file(args.binary) != SCANNER_SHA256):
-        parser.error("frozen scanner hash mismatch")
+    if not re.fullmatch(r"[a-f0-9]{64}", args.expected_binary_sha256):
+        parser.error("invalid scanner hash")
+    if args.action == "scan" and (not args.binary or sha_file(args.binary) != args.expected_binary_sha256):
+        parser.error("scanner hash mismatch")
     packages = json.loads(args.selection.read_text())["packages"]
     if len({p["sha256"] for p in packages}) != len(packages):
         parser.error("duplicate archive identities")
@@ -250,7 +254,7 @@ def main():
         if index % 20 == 0 or index == len(packages):
             print(json.dumps({"processed": index, "total": len(packages),
                               "failed": sum(r["status"] == "failed" for r in records)}), flush=True)
-    corpus.write_json(args.output / "run.json", {"action": args.action, "scanner_sha256": SCANNER_SHA256,
+    corpus.write_json(args.output / "run.json", {"action": args.action, "scanner_sha256": args.expected_binary_sha256,
                       "selection_sha256": sha_file(args.selection), "records": records})
 
 

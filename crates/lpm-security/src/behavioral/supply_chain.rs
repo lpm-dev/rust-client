@@ -1,4 +1,4 @@
-//! Supply chain & code quality tag detection (8 tags).
+//! Supply chain and code quality detection.
 //!
 //! Detects patterns beyond API usage: obfuscation, high-entropy strings,
 //! minified code, telemetry SDKs, URL literals, trivial packages, and
@@ -25,6 +25,12 @@ pub struct SupplyChainTags {
     pub protestware: bool,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub credential_exfiltration: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub encrypted_execution: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub downloaded_execution: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub destructive_filesystem: bool,
     /// Obfuscation confidence score (0.0–1.0).
     /// - ≤ 0.3: not obfuscated
     /// - > 0.3 and ≤ 0.7: possible obfuscation (likely compiled/minified output)
@@ -589,6 +595,18 @@ pub(super) fn analyze_supply_chain_context(
             .calls
             .as_ref()
             .is_some_and(|calls| calls.credential_exfiltration.is_some()),
+        encrypted_execution: context
+            .calls
+            .as_ref()
+            .is_some_and(|calls| calls.encrypted_execution.is_some()),
+        downloaded_execution: context
+            .calls
+            .as_ref()
+            .is_some_and(|calls| calls.downloaded_execution.is_some()),
+        destructive_filesystem: context
+            .calls
+            .as_ref()
+            .is_some_and(|calls| calls.destructive_filesystem.is_some()),
         obfuscation_confidence: confidence,
     }
 }
@@ -610,6 +628,9 @@ pub fn merge_supply_chain_tags(a: &SupplyChainTags, b: &SupplyChainTags) -> Supp
         trivial: a.trivial || b.trivial,
         protestware: a.protestware || b.protestware,
         credential_exfiltration: a.credential_exfiltration || b.credential_exfiltration,
+        encrypted_execution: a.encrypted_execution || b.encrypted_execution,
+        downloaded_execution: a.downloaded_execution || b.downloaded_execution,
+        destructive_filesystem: a.destructive_filesystem || b.destructive_filesystem,
         obfuscation_confidence: confidence,
     }
 }
@@ -625,7 +646,9 @@ pub(super) fn append_evidence(
         .as_ref()
         .and_then(|calls| calls.credential_exfiltration)
     {
-        let reason = if leak.environment {
+        let reason = if leak.credential_file {
+            "Credential-file contents flow into a network payload through supported reads and transformations."
+        } else if leak.environment {
             "The complete process environment flows into a network payload through supported assignments or helper calls."
         } else {
             "Private-key or wallet-seed material flows into a network payload through supported assignments or helper calls."
@@ -634,6 +657,32 @@ pub(super) fn append_evidence(
             super::SourceEvidence::new("credential-exfiltration", filename, reason)
                 .at(&context.stripped, leak.offset),
         );
+    }
+    if let Some(calls) = &context.calls {
+        for (offset, rule, reason) in [
+            (
+                calls.encrypted_execution,
+                "encrypted-execution",
+                "Decrypted bytes reach code evaluation or a file passed to a process launcher.",
+            ),
+            (
+                calls.downloaded_execution,
+                "downloaded-execution",
+                "A downloaded response reaches code evaluation or a file passed to a process launcher.",
+            ),
+            (
+                calls.destructive_filesystem,
+                "destructive-filesystem",
+                "A recursive filesystem removal targets the home directory, a filesystem root, or current project contents.",
+            ),
+        ] {
+            if let Some(offset) = offset {
+                evidence.push(
+                    super::SourceEvidence::new(rule, filename, reason)
+                        .at(&context.stripped, offset),
+                );
+            }
+        }
     }
     let rules = [
         (
