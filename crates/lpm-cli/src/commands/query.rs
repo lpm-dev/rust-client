@@ -726,6 +726,9 @@ fn collect_active_tags(analysis: &PackageAnalysis) -> Vec<String> {
     if analysis.supply_chain.trivial {
         tags.push("trivial".into());
     }
+    if analysis.supply_chain.credential_exfiltration {
+        tags.push("credential-exfiltration".into());
+    }
     if analysis.supply_chain.protestware {
         tags.push("protestware".into());
     }

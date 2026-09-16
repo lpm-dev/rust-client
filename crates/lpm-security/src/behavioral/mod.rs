@@ -19,6 +19,7 @@ pub mod secrets;
 pub mod source;
 pub mod supply_chain;
 mod syntax;
+mod threats;
 
 pub use evidence::SourceEvidence;
 
@@ -34,10 +35,10 @@ use supply_chain::SupplyChainTags;
 /// Current schema version for `.lpm-security.json`.
 /// Bump this when adding new tags or changing tag semantics — cached
 /// files with older versions will be automatically re-analyzed.
-pub const SCHEMA_VERSION: u32 = 8;
+pub const SCHEMA_VERSION: u32 = 9;
 
 /// Maximum file size for a full scan. Larger source files receive bounded samples.
-const MAX_FILE_SIZE: u64 = 2 * 1024 * 1024;
+const MAX_FILE_SIZE: u64 = 4 * 1024 * 1024;
 
 /// Maximum total bytes to scan per package (50MB). Analysis aborts (with warning)
 /// if cumulative reads exceed this, returning partial results.
@@ -542,7 +543,12 @@ fn analyze_open_cap_source_file(
                     comment_buf,
                 )
             } else {
-                analyze_bytes_with_scratch(&path_to_slash(&source_file.path), &bytes, comment_buf)
+                analyze_bytes_with_scratch(
+                    &path_to_slash(&source_file.path),
+                    &bytes,
+                    comment_buf,
+                    true,
+                )
             }
         });
     Ok(ScannedCapSourceFile {
@@ -804,6 +810,7 @@ fn analyze_single_file(
         &path_to_slash(relative_path),
         &raw_content,
         comment_buf,
+        true,
     ))
 }
 
@@ -817,23 +824,29 @@ fn analyze_single_file(
 /// - filtering by extension (`SOURCE_EXTENSIONS`), `.d.ts`/`.map`
 ///   exclusion, and directory filtering (`node_modules` / `__tests__` /
 ///   `test`). [`PackageAnalyzer::should_scan`] encodes the current policy.
-/// - routing files over the 2 MB full-scan limit to
+/// - routing files over the 4 MiB full-scan limit to
 ///   [`PackageAnalyzer::feed_oversized_source_file`] or another bounded
 ///   sampling path instead of passing the entire file here.
 ///
 /// Pure function: no I/O; parses bounded source and reuses the comment buffer. Safe to call from any thread, no runtime needed.
 pub fn analyze_bytes(filename: &str, raw_content: &[u8]) -> FileAnalysisResult {
     let mut comment_buf = Vec::new();
-    analyze_bytes_with_scratch(filename, raw_content, &mut comment_buf)
+    analyze_bytes_with_scratch(filename, raw_content, &mut comment_buf, true)
 }
 
 fn analyze_bytes_with_scratch(
     filename: &str,
     raw_content: &[u8],
     comment_buf: &mut Vec<u8>,
+    complete_input: bool,
 ) -> FileAnalysisResult {
     let raw_text = String::from_utf8_lossy(raw_content);
-    let context = syntax::SourceContext::new(&raw_text, filename, comment_buf);
+    let context = syntax::SourceContext::with_complete_input(
+        &raw_text,
+        filename,
+        comment_buf,
+        complete_input,
+    );
     let stripped = context.stripped.as_ref();
 
     let (file_source_tags, mut evidence) =
@@ -884,7 +897,8 @@ fn analyze_oversized_source_sample(
     let mut result = if sample.is_empty() {
         FileAnalysisResult::default()
     } else {
-        analyze_bytes_with_scratch(&path_to_slash(relative_path), sample, comment_buf)
+        // Disjoint samples cannot establish a data flow between their source ranges.
+        analyze_bytes_with_scratch(&path_to_slash(relative_path), sample, comment_buf, false)
     };
 
     result.files_scanned = 0;
@@ -999,6 +1013,11 @@ fn oversized_source_signals(source: &SourceTags, supply_chain: &SupplyChainTags)
     push_signal(&mut signals, supply_chain.telemetry, "telemetry");
     push_signal(&mut signals, supply_chain.url_strings, "urlStrings");
     push_signal(&mut signals, supply_chain.protestware, "protestware");
+    push_signal(
+        &mut signals,
+        supply_chain.credential_exfiltration,
+        "credentialExfiltration",
+    );
     signals
 }
 
@@ -1621,6 +1640,7 @@ pub fn has_dangerous_tags(analysis: &PackageAnalysis) -> bool {
     // Critical
     analysis.supply_chain.obfuscated
 		|| analysis.supply_chain.protestware
+		|| analysis.supply_chain.credential_exfiltration
 		|| analysis.supply_chain.high_entropy_strings
 	// High
 		|| analysis.source.eval
@@ -1892,9 +1912,9 @@ mod tests {
         let (selected, limit_reached) = cap_scan_prefix(&files);
 
         assert!(limit_reached);
-        assert_eq!(selected.len(), 25);
+        assert_eq!(selected.len(), 12);
         assert_eq!(selected[0].path, Path::new("source-00.js"));
-        assert_eq!(selected[24].path, Path::new("source-24.js"));
+        assert_eq!(selected[11].path, Path::new("source-11.js"));
     }
 
     #[test]

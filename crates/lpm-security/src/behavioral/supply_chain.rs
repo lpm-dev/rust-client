@@ -23,6 +23,8 @@ pub struct SupplyChainTags {
     pub url_strings: bool,
     pub trivial: bool,
     pub protestware: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub credential_exfiltration: bool,
     /// Obfuscation confidence score (0.0–1.0).
     /// - ≤ 0.3: not obfuscated
     /// - > 0.3 and ≤ 0.7: possible obfuscation (likely compiled/minified output)
@@ -583,6 +585,10 @@ pub(super) fn analyze_supply_chain_context(
         url_strings: has_url_strings,
         trivial: false, // Set at package level, not file level
         protestware: patterns.protestware,
+        credential_exfiltration: context
+            .calls
+            .as_ref()
+            .is_some_and(|calls| calls.credential_exfiltration.is_some()),
         obfuscation_confidence: confidence,
     }
 }
@@ -603,6 +609,7 @@ pub fn merge_supply_chain_tags(a: &SupplyChainTags, b: &SupplyChainTags) -> Supp
         url_strings: a.url_strings || b.url_strings,
         trivial: a.trivial || b.trivial,
         protestware: a.protestware || b.protestware,
+        credential_exfiltration: a.credential_exfiltration || b.credential_exfiltration,
         obfuscation_confidence: confidence,
     }
 }
@@ -613,6 +620,21 @@ pub(super) fn append_evidence(
     tags: &SupplyChainTags,
     evidence: &mut Vec<super::SourceEvidence>,
 ) {
+    if let Some(leak) = context
+        .calls
+        .as_ref()
+        .and_then(|calls| calls.credential_exfiltration)
+    {
+        let reason = if leak.environment {
+            "The complete process environment flows into a network payload through supported assignments or helper calls."
+        } else {
+            "Private-key or wallet-seed material flows into a network payload through supported assignments or helper calls."
+        };
+        evidence.push(
+            super::SourceEvidence::new("credential-exfiltration", filename, reason)
+                .at(&context.stripped, leak.offset),
+        );
+    }
     let rules = [
         (
             tags.obfuscated,
