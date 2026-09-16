@@ -13,6 +13,9 @@ import urllib.error
 import warnings
 import zipfile
 
+import archive_inventory
+import archive_pilot
+
 spec = importlib.util.spec_from_file_location("corpus", Path(__file__).with_name("corpus.py"))
 corpus = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(corpus)
@@ -34,6 +37,104 @@ spec = importlib.util.spec_from_file_location(
 )
 attack_families = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(attack_families)
+
+
+class ArchivePilotTests(unittest.TestCase):
+    def record(self, number, name, evidence=(), advisory=None):
+        return {"sha256": f"{number:064x}", "name": name, "version": "1.0.0", "size_bytes": 10,
+                "locations": ["local"], "focus_hints": [], "evidence_hashes": list(evidence),
+                "provenance": [{"source": "test", "advisory_id": advisory}]}
+
+    def test_duplicate_archives_keep_all_provenance_and_review_links(self):
+        a, b = self.record(1, "one"), self.record(1, "one")
+        b.update(review_path="private-review", review_sha256="digest")
+        records = archive_inventory.consolidate([a, b])
+        self.assertEqual(len(records), 1)
+        self.assertEqual(len(records[0]["provenance"]), 2)
+        self.assertEqual(records[0]["review_path"], "private-review")
+
+    def test_same_package_with_different_archive_bytes_keeps_both_variants(self):
+        records = archive_inventory.consolidate([self.record(1, "one"), self.record(2, "one")])
+        self.assertEqual(len(records), 2)
+        archive_inventory.assign_splits(records, set())
+        self.assertEqual(records[0]["group"], records[1]["group"])
+
+    def test_conflicting_identity_for_identical_bytes_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, "conflicting"):
+            archive_inventory.consolidate([self.record(1, "one"), self.record(1, "two")])
+
+    def test_transitive_advisory_and_source_links_preserve_prior_exclusion(self):
+        records = [self.record(1, "prior", advisory="A"), self.record(2, "two", ["code"], "A"),
+                   self.record(3, "three", ["code"])]
+        archive_inventory.assign_splits(records, {"prior"})
+        self.assertEqual({r["split"] for r in records}, {"prior"})
+        self.assertEqual(len({r["group"] for r in records}), 1)
+
+    def test_split_membership_is_independent_of_record_order(self):
+        records = [self.record(i, f"package-{i}") for i in range(1, 100)]
+        archive_inventory.assign_splits(records, set())
+        expected = {r["sha256"]: r["split"] for r in records}
+        archive_inventory.assign_splits(records[::-1], set())
+        self.assertEqual(expected, {r["sha256"]: r["split"] for r in records})
+        self.assertIn("reserved", expected.values())
+
+    def test_public_inventory_omits_private_locations_and_review_paths(self):
+        record = self.record(1, "one")
+        record["review_path"] = "secret"
+        public = archive_inventory.public_record(record)
+        self.assertNotIn("locations", public)
+        self.assertNotIn("review_path", public)
+
+    def test_zip_root_is_selected_by_package_identity_without_execution(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            archive = root / "sample.zip"
+            with zipfile.ZipFile(archive, "w") as source:
+                source.writestr("wrapper/pkg/package.json", json.dumps({"name": "sample", "version": "1"}))
+                source.writestr("wrapper/pkg/index.js", "throw new Error('must never execute')")
+                source.writestr("metadata.json", "{}")
+            target = root / "output"
+            target.mkdir()
+            stats = archive_pilot.extract_zip(archive, target, {"name": "sample", "version": "1"})
+            self.assertEqual(stats["files"], 2)
+            self.assertTrue((target / "index.js").is_file())
+            self.assertFalse((target / "metadata.json").exists())
+
+    def test_zip_rejects_traversal_even_outside_selected_root(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            archive = root / "sample.zip"
+            with zipfile.ZipFile(archive, "w") as source:
+                source.writestr("../outside", "data")
+            with self.assertRaisesRegex(ValueError, "unsafe"):
+                archive_pilot.extract_zip(archive, root / "output", {"name": "sample", "version": "1"})
+
+    def test_zip_rejects_ambiguous_matching_package_roots(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            archive = Path(temporary) / "sample.zip"
+            identity = {"name": "sample", "version": "1"}
+            with zipfile.ZipFile(archive, "w") as source:
+                for prefix in ("one", "two"):
+                    source.writestr(prefix + "/package.json", json.dumps(identity))
+            with self.assertRaisesRegex(ValueError, "ambiguous"):
+                archive_pilot.extract_zip(archive, Path(temporary) / "output", identity)
+
+    def test_normalized_fingerprints_ignore_literal_and_comment_variants(self):
+        self.assertEqual(archive_pilot.normalized_hash("const x = 'one'; // comment\nf(12)"),
+                         archive_pilot.normalized_hash('const x="two"; f(42)'))
+        self.assertNotEqual(archive_pilot.normalized_hash("f(12)"), archive_pilot.normalized_hash("g(12)"))
+
+    def test_coverage_distinguishes_source_selection_from_unsupported_stages(self):
+        for name, expected in [("index.js", "selected_source"), ("install.sh", "unsupported_extension"),
+                               (".hidden/a.js", "hidden"), ("node_modules/a.js", "excluded_directory"),
+                               ("types.d.ts", "declaration_or_map")]:
+            self.assertEqual(archive_pilot.source_reason(Path(name)), expected)
+
+    def test_public_results_remove_payload_excerpts_and_domains(self):
+        row = {"analysis": {"meta": {"evidence": [{"ruleId": "fs", "excerpt": "private"}],
+                                     "urlDomains": ["private.invalid"]}}}
+        archive_pilot.sanitize(row)
+        self.assertEqual(row["analysis"]["meta"], {"evidence": [{"ruleId": "fs"}]})
 
 
 class IncidentReconstructionTests(unittest.TestCase):

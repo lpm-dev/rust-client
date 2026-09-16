@@ -1,0 +1,42 @@
+{
+  "sources": [
+    {
+      "source": "datadog",
+      "sha256": "63ef1bf84fb1b95bd4e9da2f92a5a978cd2350a8f6e32c98e17d4f313b05bd89",
+      "bytes": 22056930,
+      "updated_at": "2026-07-02T21:40:29.023Z",
+      "records": 25766
+    },
+    {
+      "source": "openssf",
+      "sha256": "33434725cd71de26809300ea919f1ac3b1a9a2a3b5726084f6b14d4f6812ba00",
+      "bytes": 2764317,
+      "updated_at": "2026-09-16T16:01:25.095Z",
+      "records": 2027
+    },
+    {
+      "source": "lpm",
+      "records": 5994,
+      "metadata_index_sha256": "98cd91c020a9538f333f98c57433d857ab4d45782765934c5c6d4a92e150282a"
+    }
+  ],
+  "unique_archives": 33252,
+  "unique_versions": 33247,
+  "metadata_groups": 15269,
+  "split_archives": {
+    "reserved": 6906,
+    "pilot_pool": 25602,
+    "prior": 744
+  },
+  "selection_strata": {
+    "encrypted_activation": 60,
+    "destructive_files": 60,
+    "credential_files": 60,
+    "install_download": 60,
+    "openssf": 60,
+    "datadog": 100
+  },
+  "inventory_sha256": "5a3f7444906f69940d638e257c3831873e1e644649e9a9a0694a3aa6ad06ddb3",
+  "reserved_index_sha256": "2966705a8044f92816aa421b83370f1974aeda9596c17f9e23cb4ebc8bdedf0f",
+  "grouping_limits": "Names/scopes, advisories and cited source hashes are provisional groups. Code-similarity closure is required before reserved cases can become independent validation."
+}
