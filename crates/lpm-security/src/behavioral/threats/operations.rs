@@ -234,7 +234,7 @@ impl<'s, 'a> Flow<'s, 'a> {
         }
     }
 
-    fn artifact(&mut self, expression: &Expression<'a>, depth: usize) -> u8 {
+    fn artifact(&mut self, expression: &Expression<'a>, depth: usize, text_only: bool) -> u8 {
         if depth >= MAX_DEPTH || self.steps == 0 {
             return 0;
         }
@@ -243,19 +243,20 @@ impl<'s, 'a> Flow<'s, 'a> {
         match expression.get_inner_expression() {
             Expression::Identifier(identifier) => self
                 .initial(identifier)
-                .map_or(0, |initial| self.artifact(initial, next)),
-            Expression::AwaitExpression(value) => self.artifact(&value.argument, next),
+                .map_or(0, |initial| self.artifact(initial, next, text_only)),
+            Expression::AwaitExpression(value) => self.artifact(&value.argument, next, text_only),
             Expression::BinaryExpression(binary) if binary.operator.as_str() == "+" => {
-                self.artifact(&binary.left, next) | self.artifact(&binary.right, next)
+                self.artifact(&binary.left, next, text_only)
+                    | self.artifact(&binary.right, next, text_only)
             }
-            Expression::ArrayExpression(array) => {
+            Expression::ArrayExpression(array) if !text_only => {
                 let mut value = 0;
                 for expression in array
                     .elements
                     .iter()
                     .filter_map(ArrayExpressionElement::as_expression)
                 {
-                    value |= self.artifact(expression, next);
+                    value |= self.artifact(expression, next, text_only);
                     if self.steps == 0 {
                         break;
                     }
@@ -268,7 +269,7 @@ impl<'s, 'a> Flow<'s, 'a> {
                     let mut value = 0;
                     for index in 0..count {
                         let expression = self.returns[&target][index];
-                        value |= self.artifact(expression, next);
+                        value |= self.artifact(expression, next, text_only);
                         if self.steps == 0 {
                             break;
                         }
@@ -277,21 +278,39 @@ impl<'s, 'a> Flow<'s, 'a> {
                 }
                 if let Some((object, method)) = member(&call.callee) {
                     if matches!(method, "update" | "final") && self.decipher(object, 0) {
-                        return DECRYPTED;
+                        let encoding = call
+                            .arguments
+                            .get(if method == "update" { 2 } else { 0 })
+                            .and_then(Argument::as_expression);
+                        let returns_text = matches!(encoding.map(Expression::get_inner_expression),
+                            Some(Expression::StringLiteral(value)) if matches!(value.value.as_str(),
+                                "utf8" | "utf-8" | "hex" | "base64" | "base64url" | "latin1" | "binary" | "ascii" | "ucs2" | "ucs-2" | "utf16le" | "utf-16le"));
+                        return if !text_only || returns_text {
+                            DECRYPTED
+                        } else {
+                            0
+                        };
                     }
                     if matches!(method, "text" | "json" | "arrayBuffer") && self.response(object, 0)
                     {
-                        return DOWNLOADED;
+                        return if !text_only || method == "text" {
+                            DOWNLOADED
+                        } else {
+                            0
+                        };
                     }
                     if method == "toString" {
-                        return self.artifact(object, next);
+                        return self.artifact(object, next, false);
                     }
-                    if matches!(method, "concat" | "from") && self.global(object, "Buffer") {
+                    if !text_only
+                        && matches!(method, "concat" | "from")
+                        && self.global(object, "Buffer")
+                    {
                         return call
                             .arguments
                             .first()
                             .and_then(Argument::as_expression)
-                            .map_or(0, |argument| self.artifact(argument, next));
+                            .map_or(0, |argument| self.artifact(argument, next, false));
                     }
                 }
                 0
@@ -519,7 +538,7 @@ pub(super) fn analyze(flow: &mut Flow<'_, '_>, facts: &mut crate::behavioral::bi
                 writes
                     .entry((block, key))
                     .or_default()
-                    .push((call.span.start, flow.artifact(value, 0)));
+                    .push((call.span.start, flow.artifact(value, 0, false)));
             }
         }
     }
@@ -556,7 +575,7 @@ pub(super) fn analyze(flow: &mut Flow<'_, '_>, facts: &mut crate::behavioral::bi
             arguments.last()
         };
         if evaluation && let Some(value) = code.and_then(Argument::as_expression) {
-            let value = flow.artifact(value, 0);
+            let value = flow.artifact(value, 0, flow.global(function, "eval"));
             if value & DECRYPTED != 0 {
                 facts.encrypted_execution.get_or_insert(start as usize);
             }

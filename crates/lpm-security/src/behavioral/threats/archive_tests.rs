@@ -172,3 +172,30 @@ fn dead_uploads_and_unused_eval_arguments_do_not_report_execution_or_theft() {
         }
     }
 }
+
+#[test]
+fn eval_requires_text_while_function_constructor_converts_bytes() {
+    let setup =
+        "const crypto=require('crypto'); const d=crypto.createDecipheriv('aes-256-gcm',key,iv); ";
+    for expression in [
+        "eval(d.update(data));",
+        "eval(Buffer.concat([d.update(data),d.final()]));",
+    ] {
+        assert!(!detected(
+            &format!("{setup}{expression}"),
+            "encryptedExecution"
+        ));
+    }
+    assert!(detected(
+        &format!("{setup}eval(d.update(data,'hex','utf8'));"),
+        "encryptedExecution"
+    ));
+    assert!(detected(
+        &format!("{setup}new Function(d.update(data));"),
+        "encryptedExecution"
+    ));
+    assert!(!detected(
+        "async function run(){const response=await fetch('https://api.example');eval(await response.arrayBuffer());}",
+        "downloadedExecution"
+    ));
+}
