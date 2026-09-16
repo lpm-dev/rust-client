@@ -6,6 +6,9 @@ import json
 from pathlib import Path
 import tarfile
 import tempfile
+import subprocess
+import shutil
+import os
 import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -15,6 +18,7 @@ import zipfile
 
 import archive_inventory
 import archive_pilot
+import archive_report
 
 spec = importlib.util.spec_from_file_location("corpus", Path(__file__).with_name("corpus.py"))
 corpus = importlib.util.module_from_spec(spec)
@@ -119,6 +123,27 @@ class ArchivePilotTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "ambiguous"):
                 archive_pilot.extract_zip(archive, Path(temporary) / "output", identity)
 
+    def test_zip_bounds_all_members_before_reading_manifest_candidates(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            archive = Path(temporary) / "sample.zip"
+            identity = {"name": "sample", "version": "1"}
+            with zipfile.ZipFile(archive, "w") as source:
+                source.writestr("package/package.json", json.dumps(identity))
+                source.writestr("outside/data", b"x" * 100)
+            with patch.object(archive_pilot.corpus, "MAX_EXPANDED", 80), self.assertRaisesRegex(ValueError, "expanded"):
+                archive_pilot.extract_zip(archive, Path(temporary) / "output", identity)
+
+    def test_local_archives_obey_the_compressed_byte_limit(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            package = {"sha256": "a" * 64, "size_bytes": corpus.MAX_DOWNLOAD + 1, "locations": []}
+            with self.assertRaisesRegex(ValueError, "compressed"):
+                archive_pilot.prepare(package, root, root / "output")
+
+    def test_archive_hash_cannot_escape_the_result_directory(self):
+        with self.assertRaisesRegex(ValueError, "hash"):
+            archive_pilot.validate_package({"sha256": "../../outside", "size_bytes": 10})
+
     def test_normalized_fingerprints_ignore_literal_and_comment_variants(self):
         self.assertEqual(archive_pilot.normalized_hash("const x = 'one'; // comment\nf(12)"),
                          archive_pilot.normalized_hash('const x="two"; f(42)'))
@@ -135,6 +160,74 @@ class ArchivePilotTests(unittest.TestCase):
                                      "urlDomains": ["private.invalid"]}}}
         archive_pilot.sanitize(row)
         self.assertEqual(row["analysis"]["meta"], {"evidence": [{"ruleId": "fs"}]})
+
+    def test_public_results_remove_domains_inside_oversized_source_metadata(self):
+        row = {"analysis": {"meta": {"oversizedSourceFiles": [
+            {"path": "large.js", "urlDomains": ["private.invalid"]}]}}}
+        archive_pilot.sanitize(row)
+        self.assertEqual(row["analysis"]["meta"]["oversizedSourceFiles"], [{"path": "large.js"}])
+
+    def test_code_linked_groups_join_literal_variants_but_ignore_package_json(self):
+        a, b, c = [self.record(i, str(i)) for i in range(1, 4)]
+        for row in (a, b, c):
+            row["group"] = row["sha256"]
+        inspections = {
+            a["sha256"]: {"coverage": {"files": [{"path": "payload.js", "normalized_sha256": "shared"}]}},
+            b["sha256"]: {"coverage": {"files": [{"path": "loader.js", "normalized_sha256": "shared"}]}},
+            c["sha256"]: {"coverage": {"files": [{"path": "package.json", "normalized_sha256": "shared"}]}},
+        }
+        groups = archive_report.code_groups([a, b, c], inspections)
+        self.assertEqual(groups[a["sha256"]], groups[b["sha256"]])
+        self.assertNotEqual(groups[a["sha256"]], groups[c["sha256"]])
+
+    def test_capability_and_information_flags_do_not_count_as_critical(self):
+        self.assertEqual(archive_report.critical({"supplyChain": {"possibleObfuscation": True,
+                                                                "highEntropyStrings": True}}), [])
+        self.assertEqual(archive_report.critical({"supplyChain": {"credentialExfiltration": True}}),
+                         ["credentialExfiltration"])
+
+    @unittest.skipUnless(shutil.which("node"), "Node required for read-only retrieval contract")
+    def test_r2_retrieval_uses_get_and_checks_hash_without_exposing_credentials(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            sdk = root / "sdk/node_modules/@aws-sdk/client-s3"
+            sdk.mkdir(parents=True)
+            (sdk / "index.js").write_text('''
+const { Readable } = require('node:stream');
+class GetObjectCommand { constructor(args) { this.args = args; } }
+class S3Client {
+  async send(command) {
+    if (!(command instanceof GetObjectCommand)) throw Error('read-only contract');
+    if (command.args.Bucket !== 'test' || command.args.Key !== 'archive') throw Error('location');
+    return { Body: Readable.from([Buffer.from('archive data')]) };
+  }
+  destroy() {}
+}
+module.exports = { S3Client, GetObjectCommand };
+''')
+            env = root / "env"
+            env.write_text("LPM_R2_ENDPOINT=https://abc.r2.cloudflarestorage.com\n"
+                           "LPM_R2_BUCKET=test\nLPM_R2_ACCESS_KEY_ID=private-test-id\n"
+                           "LPM_R2_SECRET_ACCESS_KEY=private-test-secret\n")
+            data = b"archive data"
+            digest = hashlib.sha256(data).hexdigest()
+            selection = root / "selection.json"
+            record = {"sha256": digest, "size_bytes": len(data), "locations": ["r2://test/archive"]}
+            selection.write_text(json.dumps({"packages": [record]}))
+            script = Path(__file__).with_name("archive_fetch.mjs")
+            command = [shutil.which("node"), str(script), str(selection), str(root / "out"),
+                       str(env), str(root / "sdk")]
+            environment = {k: v for k, v in os.environ.items() if not k.startswith("LPM_R2_")}
+            result = subprocess.run(command, capture_output=True, text=True, env=environment, check=False)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual((root / "out" / digest).read_bytes(), data)
+            self.assertNotIn("private-test", result.stdout + result.stderr)
+            record["sha256"] = "a" * 64
+            selection.write_text(json.dumps({"packages": [record]}))
+            result = subprocess.run(command, capture_output=True, text=True, env=environment, check=False)
+            self.assertEqual(result.returncode, 1)
+            self.assertFalse((root / "out" / record["sha256"]).exists())
+            self.assertNotIn("private-test", result.stdout + result.stderr)
 
 
 class IncidentReconstructionTests(unittest.TestCase):

@@ -71,6 +71,8 @@ def extract_zip(archive, destination, package):
         members = source.infolist()
         if len(members) > corpus.MAX_ENTRIES:
             raise ValueError("archive entry limit exceeded")
+        if sum(member.file_size for member in members) > corpus.MAX_EXPANDED:
+            raise ValueError("archive expanded byte limit exceeded")
         roots = []
         for member in members:
             path = PurePosixPath(member.filename)
@@ -109,7 +111,15 @@ def extract_zip(archive, destination, package):
         return {"files": files, "expanded_bytes": total}
 
 
+def validate_package(package):
+    if not re.fullmatch(r"[a-f0-9]{64}", package["sha256"]):
+        raise ValueError("invalid archive hash")
+    if not isinstance(package["size_bytes"], int) or not 0 < package["size_bytes"] <= corpus.MAX_DOWNLOAD:
+        raise ValueError("archive compressed byte limit exceeded")
+
+
 def prepare(package, downloads, destination):
+    validate_package(package)
     candidates = [downloads / package["sha256"]]
     candidates += [Path(p) for p in package.get("locations", []) if not p.startswith("r2://")]
     archive = next((p for p in candidates if p.is_file()), None)
@@ -159,10 +169,16 @@ def inspect_tree(root, manifest):
 
 
 def sanitize(row):
-    metadata = row["analysis"].get("meta", {})
-    for evidence in metadata.get("evidence", []):
-        evidence.pop("excerpt", None)
-    metadata.pop("urlDomains", None)
+    def scrub(value):
+        if isinstance(value, dict):
+            value.pop("excerpt", None)
+            value.pop("urlDomains", None)
+            for item in value.values():
+                scrub(item)
+        elif isinstance(value, list):
+            for item in value:
+                scrub(item)
+    scrub(row)
     return row
 
 
@@ -192,8 +208,12 @@ def main():
         parser.error("output exists; preserve prior runs")
     if args.action == "scan" and (not args.binary or sha_file(args.binary) != SCANNER_SHA256):
         parser.error("frozen scanner hash mismatch")
-    args.output.mkdir(parents=True)
     packages = json.loads(args.selection.read_text())["packages"]
+    if len({p["sha256"] for p in packages}) != len(packages):
+        parser.error("duplicate archive identities")
+    for package in packages:
+        validate_package(package)
+    args.output.mkdir(parents=True)
     records = []
     for index, package in enumerate(packages, 1):
         record = {k: package[k] for k in ("sha256", "name", "version")}
