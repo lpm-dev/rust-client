@@ -267,7 +267,7 @@
     "name": "libsodium-wrappers",
     "version": "0.7.15",
     "role": "encrypted-data",
-    "review": "Exports cryptographic wrappers that transform caller-supplied byte arrays; native implementation is delegated to libsodium.",
+    "review": "Exports cryptographic wrappers that transform caller-supplied byte arrays; cryptographic implementation is delegated to libsodium.",
     "locations": [
       {
         "path": "dist/modules/libsodium-wrappers.js",
