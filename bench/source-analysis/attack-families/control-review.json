@@ -1,0 +1,227 @@
+[
+  {
+    "name": "eslint-scope",
+    "version": "3.7.1",
+    "role": "clean-before",
+    "review": "Incident-specific neighboring release from npm. This label does not establish absence of unrelated vulnerabilities.",
+    "locations": [],
+    "critical_source_findings": 0
+  },
+  {
+    "name": "eslint-scope",
+    "version": "3.7.3",
+    "role": "clean-after",
+    "review": "Incident-specific neighboring release from npm. This label does not establish absence of unrelated vulnerabilities.",
+    "locations": [],
+    "critical_source_findings": 0
+  },
+  {
+    "name": "ua-parser-js",
+    "version": "0.7.28",
+    "role": "clean-before",
+    "review": "Incident-specific neighboring release from npm. This label does not establish absence of unrelated vulnerabilities.",
+    "locations": [],
+    "critical_source_findings": 0
+  },
+  {
+    "name": "ua-parser-js",
+    "version": "0.7.30",
+    "role": "clean-after",
+    "review": "Incident-specific neighboring release from npm. This label does not establish absence of unrelated vulnerabilities.",
+    "locations": [],
+    "critical_source_findings": 0
+  },
+  {
+    "name": "npm",
+    "version": "6.14.18",
+    "role": "credential-control",
+    "review": "Loads project and user registry configuration for package-manager operations. Bundled node_modules are excluded by the scanner.",
+    "locations": [
+      {
+        "path": "lib/config/core.js",
+        "line": 128,
+        "sha256": "6fbe0493addceb3e2fb5723451c1914b5154bde863cb76b7aa230e3015091286"
+      }
+    ],
+    "critical_source_findings": 0
+  },
+  {
+    "name": "@npmcli/config",
+    "version": "9.0.0",
+    "role": "credential-control",
+    "review": "Reads and parses a selected npm configuration file. This package supplies configuration rather than an upload implementation.",
+    "locations": [
+      {
+        "path": "lib/index.js",
+        "line": 586,
+        "sha256": "aa283456b6e3c72396b0bc8230d31072665f753d5b80e04efa556713339adbad"
+      }
+    ],
+    "critical_source_findings": 0
+  },
+  {
+    "name": "npm-registry-fetch",
+    "version": "18.0.2",
+    "role": "credential-control",
+    "review": "Selects registry credentials for the request URI and builds authentication headers. Credential transmission can be a required function.",
+    "locations": [
+      {
+        "path": "lib/auth.js",
+        "line": 8,
+        "sha256": "fc50e1fa09f89b75eebfb632d7c4063a26881ec10791246ae4b30cfc47a8bd84"
+      },
+      {
+        "path": "lib/index.js",
+        "line": 236,
+        "sha256": "70be42b89bf61f0fa8e69c7d671bf4baac5e8cda650ef3fddd693b0f285746d1"
+      }
+    ],
+    "critical_source_findings": 0
+  },
+  {
+    "name": "registry-auth-token",
+    "version": "5.1.0",
+    "role": "credential-control",
+    "review": "Selects authentication information for the configured registry. Configuration-file loading is delegated to @pnpm/npm-conf, outside this package scan.",
+    "locations": [
+      {
+        "path": "index.js",
+        "line": 21,
+        "sha256": "fc2e205f0ec18ac0805f8c10f290eb1f8371ff1600ca14fe80f227112e9155f2"
+      }
+    ],
+    "critical_source_findings": 0
+  },
+  {
+    "name": "esbuild",
+    "version": "0.25.0",
+    "role": "downloader-control",
+    "review": "Downloads the platform binary from npm and writes it locally during installation. Network, filesystem, and child-process use are expected.",
+    "locations": [
+      {
+        "path": "install.js",
+        "line": 145,
+        "sha256": "417cbbaf3ea9cb878011832b70eeaa00ce49419a0589cbbf4b65d258c4d7c1dd"
+      },
+      {
+        "path": "install.js",
+        "line": 234,
+        "sha256": "417cbbaf3ea9cb878011832b70eeaa00ce49419a0589cbbf4b65d258c4d7c1dd"
+      }
+    ],
+    "critical_source_findings": 0
+  },
+  {
+    "name": "playwright",
+    "version": "1.51.1",
+    "role": "downloader-entry-control",
+    "review": "Requests browser installation through the registry helper. This is a tooling entry point, not proof of an automatic npm lifecycle download.",
+    "locations": [
+      {
+        "path": "lib/runner/testServer.js",
+        "line": 555,
+        "sha256": "7300efee179dd8eba00671df6e05b113f6dd8f8f966163e37c34b62c580c6f70"
+      }
+    ],
+    "critical_source_findings": 0
+  },
+  {
+    "name": "playwright-core",
+    "version": "1.51.1",
+    "role": "downloader-implementation-control",
+    "review": "Uses a child process to download a selected browser with progress and error handling.",
+    "locations": [
+      {
+        "path": "lib/server/registry/browserFetcher.js",
+        "line": 82,
+        "sha256": "0cb302be588c6830e3825f347e20544de438c75044ebf9e790c8b4ec600689c7"
+      }
+    ],
+    "critical_source_findings": 0
+  },
+  {
+    "name": "puppeteer",
+    "version": "24.4.0",
+    "role": "downloader-entry-control",
+    "review": "The installation entry point requests configured browser downloads and supports skipping them. Downloads are delegated to a helper package.",
+    "locations": [
+      {
+        "path": "install.mjs",
+        "line": 38,
+        "sha256": "ee0c7e52700bf3d90e041b01e04093552344ca9e1f4833f11577bb08946da224"
+      },
+      {
+        "path": "lib/cjs/puppeteer/node/install.js",
+        "line": 37,
+        "sha256": "7d6adbaa54da6feaecddde1721eed9163bd0cb5d979580aa48523f32bbea102b"
+      }
+    ],
+    "critical_source_findings": 0
+  },
+  {
+    "name": "@puppeteer/browsers",
+    "version": "2.9.0",
+    "role": "downloader-implementation-control",
+    "review": "Implements browser download and installation. Its source also contains optional system-dependency installation commands.",
+    "locations": [
+      {
+        "path": "lib/cjs/install.js",
+        "line": 130,
+        "sha256": "f68a2aa391da08aab933265af16c79e2dc24d963f5cc55b2b8260f33b7fa23ba"
+      },
+      {
+        "path": "lib/cjs/httpUtil.js",
+        "line": 97,
+        "sha256": "83bf3c8c38e4e8b126dba77271e59d8c7a6ef693adcda031f56fc13aaec3acd3"
+      }
+    ],
+    "critical_source_findings": 0
+  },
+  {
+    "name": "electron",
+    "version": "35.0.0",
+    "role": "downloader-entry-control",
+    "review": "Downloads and extracts the selected Electron artifact with platform, version, and checksum configuration.",
+    "locations": [
+      {
+        "path": "install.js",
+        "line": 42,
+        "sha256": "3fa1166ed4db6831ed0d1aeec05295e460127d92b1216c794719e817eaefe0fb"
+      }
+    ],
+    "critical_source_findings": 0
+  },
+  {
+    "name": "@electron/get",
+    "version": "2.0.3",
+    "role": "downloader-implementation-control",
+    "review": "Implements artifact downloads, caching, and checksum checks. Options can change checksum behavior; the control is not an unconditional trust exemption.",
+    "locations": [
+      {
+        "path": "dist/cjs/index.js",
+        "line": 21,
+        "sha256": "981d748427c0d783ddc67662eae7f684950417aada04459d237f2cd04348b642"
+      },
+      {
+        "path": "dist/cjs/index.js",
+        "line": 95,
+        "sha256": "981d748427c0d783ddc67662eae7f684950417aada04459d237f2cd04348b642"
+      }
+    ],
+    "critical_source_findings": 0
+  },
+  {
+    "name": "prebuild-install",
+    "version": "7.1.3",
+    "role": "downloader-control",
+    "review": "Downloads a configured native prebuild and can attach caller-supplied authentication. The HTTP helper itself is in a dependency outside this scan.",
+    "locations": [
+      {
+        "path": "download.js",
+        "line": 42,
+        "sha256": "91663d22ce22740be17b6f22868e3d2687ea5a759c50b75322f597f0f6ccfb15"
+      }
+    ],
+    "critical_source_findings": 0
+  }
+]

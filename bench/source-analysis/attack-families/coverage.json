@@ -1,0 +1,674 @@
+[
+  {
+    "group": "historical",
+    "case_id": "eslint-downloader",
+    "name": "eslint-scope",
+    "version": "3.7.2",
+    "file_counts": {
+      "unsupported_extension": 4,
+      "selected_source": 9
+    },
+    "byte_counts": {
+      "unsupported_extension": 5570,
+      "selected_source": 71099
+    },
+    "unparsed_files": 0,
+    "input_incomplete": false,
+    "scan_limit_reached": false,
+    "excluded_script_files": [],
+    "present_in_prior_corpus": {
+      "name": true,
+      "exact_version": false,
+      "family": true
+    }
+  },
+  {
+    "group": "historical",
+    "case_id": "eslint-credential-payload",
+    "name": "evaluation-eslint-credential-payload",
+    "version": "0.0.0",
+    "file_counts": {
+      "unsupported_extension": 1,
+      "selected_source": 1
+    },
+    "byte_counts": {
+      "unsupported_extension": 94,
+      "selected_source": 918
+    },
+    "unparsed_files": 0,
+    "input_incomplete": false,
+    "scan_limit_reached": false,
+    "excluded_script_files": [],
+    "present_in_prior_corpus": {
+      "name": false,
+      "exact_version": false,
+      "family": false
+    }
+  },
+  {
+    "group": "historical",
+    "case_id": "ua-parser-installer",
+    "name": "ua-parser-js",
+    "version": "0.7.29",
+    "file_counts": {
+      "hidden": 3,
+      "unsupported_extension": 8,
+      "selected_source": 5,
+      "excluded_directory": 7
+    },
+    "byte_counts": {
+      "hidden": 1164,
+      "unsupported_extension": 22270,
+      "selected_source": 81961,
+      "excluded_directory": 197458
+    },
+    "unparsed_files": 0,
+    "input_incomplete": false,
+    "scan_limit_reached": false,
+    "excluded_script_files": [
+      {
+        "path": "preinstall.bat",
+        "bytes": 1020,
+        "reason": "unsupported_extension",
+        "sha256": "0a265ae6fc828cdbd917facf2383792190ff45c3cd63108edc510d4d54d53930"
+      },
+      {
+        "path": "preinstall.sh",
+        "bytes": 575,
+        "reason": "unsupported_extension",
+        "sha256": "21e68b048024ba0cc5a2a94ecbc3a78c626ec7d5d705829a82ea4715131d0509"
+      }
+    ],
+    "present_in_prior_corpus": {
+      "name": true,
+      "exact_version": false,
+      "family": true
+    }
+  },
+  {
+    "group": "control",
+    "case_id": null,
+    "name": "eslint-scope",
+    "version": "3.7.1",
+    "file_counts": {
+      "unsupported_extension": 4,
+      "selected_source": 8
+    },
+    "byte_counts": {
+      "unsupported_extension": 5528,
+      "selected_source": 70539
+    },
+    "unparsed_files": 0,
+    "input_incomplete": false,
+    "scan_limit_reached": false,
+    "excluded_script_files": [],
+    "present_in_prior_corpus": {
+      "name": true,
+      "exact_version": false,
+      "family": true
+    }
+  },
+  {
+    "group": "control",
+    "case_id": null,
+    "name": "eslint-scope",
+    "version": "3.7.3",
+    "file_counts": {
+      "unsupported_extension": 4,
+      "selected_source": 8
+    },
+    "byte_counts": {
+      "unsupported_extension": 5528,
+      "selected_source": 70539
+    },
+    "unparsed_files": 0,
+    "input_incomplete": false,
+    "scan_limit_reached": false,
+    "excluded_script_files": [],
+    "present_in_prior_corpus": {
+      "name": true,
+      "exact_version": false,
+      "family": true
+    }
+  },
+  {
+    "group": "control",
+    "case_id": null,
+    "name": "ua-parser-js",
+    "version": "0.7.28",
+    "file_counts": {
+      "hidden": 3,
+      "unsupported_extension": 6,
+      "selected_source": 4,
+      "excluded_directory": 7
+    },
+    "byte_counts": {
+      "hidden": 1164,
+      "unsupported_extension": 20605,
+      "selected_source": 81292,
+      "excluded_directory": 197458
+    },
+    "unparsed_files": 0,
+    "input_incomplete": false,
+    "scan_limit_reached": false,
+    "excluded_script_files": [],
+    "present_in_prior_corpus": {
+      "name": true,
+      "exact_version": false,
+      "family": true
+    }
+  },
+  {
+    "group": "control",
+    "case_id": null,
+    "name": "ua-parser-js",
+    "version": "0.7.30",
+    "file_counts": {
+      "hidden": 4,
+      "unsupported_extension": 7,
+      "selected_source": 4,
+      "excluded_directory": 7
+    },
+    "byte_counts": {
+      "hidden": 1186,
+      "unsupported_extension": 20901,
+      "selected_source": 79069,
+      "excluded_directory": 225988
+    },
+    "unparsed_files": 0,
+    "input_incomplete": false,
+    "scan_limit_reached": false,
+    "excluded_script_files": [],
+    "present_in_prior_corpus": {
+      "name": true,
+      "exact_version": false,
+      "family": true
+    }
+  },
+  {
+    "group": "control",
+    "case_id": null,
+    "name": "npm",
+    "version": "6.14.18",
+    "file_counts": {
+      "hidden": 207,
+      "unsupported_extension": 259,
+      "selected_source": 202,
+      "excluded_directory": 3547
+    },
+    "byte_counts": {
+      "hidden": 176248,
+      "unsupported_extension": 2221481,
+      "selected_source": 584251,
+      "excluded_directory": 16057396
+    },
+    "unparsed_files": 0,
+    "input_incomplete": false,
+    "scan_limit_reached": false,
+    "excluded_script_files": [
+      {
+        "path": "bin/node-gyp-bin/node-gyp.cmd",
+        "bytes": 148,
+        "reason": "unsupported_extension",
+        "sha256": "dfbc9e7834d3d01e8a87015fffcb78dcb3399f90cafe1b5f15bc554c393c2d26"
+      },
+      {
+        "path": "bin/npm.cmd",
+        "bytes": 483,
+        "reason": "unsupported_extension",
+        "sha256": "afa68b96334ea8493bcb908743af3dbd619cf26be7b44460179abd4d75d849d2"
+      },
+      {
+        "path": "bin/npx.cmd",
+        "bytes": 539,
+        "reason": "unsupported_extension",
+        "sha256": "b6004636a98cbb9814fdfc98bb7365e78ab48b3208f60ac5b2f17794c5285f26"
+      },
+      {
+        "path": "lib/utils/completion.sh",
+        "bytes": 1781,
+        "reason": "unsupported_extension",
+        "sha256": "3842dc49fee02980daa1e13d1f64d2b004869a396a5140caa539e22e75c5c13b"
+      },
+      {
+        "path": "make.bat",
+        "bytes": 156,
+        "reason": "unsupported_extension",
+        "sha256": "4df0656aa9df91dbdd375edfc37e0851c9a838ca8cabba1f9282d842e354f38e"
+      },
+      {
+        "path": "node_modules/lockfile/gen-changelog.sh",
+        "bytes": 238,
+        "reason": "excluded_directory",
+        "sha256": "4129184658f8178c18e7a3628e06ca1a9c10ee0d6fdc095e3c6999677cc26e0f"
+      },
+      {
+        "path": "node_modules/node-gyp/gyp/gyp.bat",
+        "bytes": 201,
+        "reason": "excluded_directory",
+        "sha256": "77bf45e8c077df03d65e6c076920f24bee04752e29bcb21b63d3622fffe84f10"
+      },
+      {
+        "path": "node_modules/node-gyp/gyp/samples/samples.bat",
+        "bytes": 196,
+        "reason": "excluded_directory",
+        "sha256": "bc8b6a646e3c13f38a1577d8a8241dcdf9008273edf7de07e3afc0e98e864205"
+      },
+      {
+        "path": "node_modules/node-gyp/gyp/tools/emacs/run-unit-tests.sh",
+        "bytes": 306,
+        "reason": "excluded_directory",
+        "sha256": "ecb8d03579a0a68704fcd398545f27b5db5c7548c9fbe1aace49bfa3044273fa"
+      },
+      {
+        "path": "node_modules/npm-lifecycle/node-gyp-bin/node-gyp.cmd",
+        "bytes": 148,
+        "reason": "excluded_directory",
+        "sha256": "dfbc9e7834d3d01e8a87015fffcb78dcb3399f90cafe1b5f15bc554c393c2d26"
+      },
+      {
+        "path": "scripts/clean-old.sh",
+        "bytes": 4266,
+        "reason": "unsupported_extension",
+        "sha256": "1fb8e9b01acf56b2b4607d3ae012db9c9b6db21f8b3ed0f93738c6dfb4617606"
+      },
+      {
+        "path": "scripts/install.sh",
+        "bytes": 5597,
+        "reason": "unsupported_extension",
+        "sha256": "c00516fcfc833724e1b49aa1111ff5dcc5d8d6fc6eb328e2d36ce7adfa7253a1"
+      },
+      {
+        "path": "scripts/release.sh",
+        "bytes": 889,
+        "reason": "unsupported_extension",
+        "sha256": "9b5fd598b01c850a70b6ab0f13ed08f947abd3b7a144be4b948697193aaaa9ba"
+      },
+      {
+        "path": "scripts/relocate.sh",
+        "bytes": 673,
+        "reason": "unsupported_extension",
+        "sha256": "075d0dc21563dab11e7ccaac7622faa865f46645086ed2998b14ed21cbf5d773"
+      },
+      {
+        "path": "scripts/update-authors.sh",
+        "bytes": 197,
+        "reason": "unsupported_extension",
+        "sha256": "540e82377a6d8803c0a5ad94e88dd22ac30185b29829e864e5af33557612e70f"
+      }
+    ],
+    "present_in_prior_corpus": {
+      "name": true,
+      "exact_version": false,
+      "family": true
+    }
+  },
+  {
+    "group": "control",
+    "case_id": null,
+    "name": "@npmcli/config",
+    "version": "9.0.0",
+    "file_counts": {
+      "unsupported_extension": 3,
+      "selected_source": 12
+    },
+    "byte_counts": {
+      "unsupported_extension": 11961,
+      "selected_source": 121589
+    },
+    "unparsed_files": 0,
+    "input_incomplete": false,
+    "scan_limit_reached": false,
+    "excluded_script_files": [],
+    "present_in_prior_corpus": {
+      "name": true,
+      "exact_version": false,
+      "family": true
+    }
+  },
+  {
+    "group": "control",
+    "case_id": null,
+    "name": "npm-registry-fetch",
+    "version": "18.0.2",
+    "file_counts": {
+      "unsupported_extension": 3,
+      "selected_source": 6
+    },
+    "byte_counts": {
+      "unsupported_extension": 21200,
+      "selected_source": 23117
+    },
+    "unparsed_files": 0,
+    "input_incomplete": false,
+    "scan_limit_reached": false,
+    "excluded_script_files": [],
+    "present_in_prior_corpus": {
+      "name": true,
+      "exact_version": false,
+      "family": true
+    }
+  },
+  {
+    "group": "control",
+    "case_id": null,
+    "name": "registry-auth-token",
+    "version": "5.1.0",
+    "file_counts": {
+      "unsupported_extension": 4,
+      "declaration_or_source_map": 2,
+      "selected_source": 2
+    },
+    "byte_counts": {
+      "unsupported_extension": 8514,
+      "declaration_or_source_map": 2513,
+      "selected_source": 4750
+    },
+    "unparsed_files": 0,
+    "input_incomplete": false,
+    "scan_limit_reached": false,
+    "excluded_script_files": [],
+    "present_in_prior_corpus": {
+      "name": true,
+      "exact_version": false,
+      "family": true
+    }
+  },
+  {
+    "group": "control",
+    "case_id": null,
+    "name": "esbuild",
+    "version": "0.25.0",
+    "file_counts": {
+      "unsupported_extension": 4,
+      "selected_source": 2,
+      "declaration_or_source_map": 1
+    },
+    "byte_counts": {
+      "unsupported_extension": 11957,
+      "selected_source": 99008,
+      "declaration_or_source_map": 23005
+    },
+    "unparsed_files": 0,
+    "input_incomplete": false,
+    "scan_limit_reached": false,
+    "excluded_script_files": [],
+    "present_in_prior_corpus": {
+      "name": true,
+      "exact_version": false,
+      "family": true
+    }
+  },
+  {
+    "group": "control",
+    "case_id": null,
+    "name": "playwright",
+    "version": "1.51.1",
+    "file_counts": {
+      "unsupported_extension": 5,
+      "selected_source": 102,
+      "declaration_or_source_map": 4
+    },
+    "byte_counts": {
+      "unsupported_extension": 257122,
+      "selected_source": 2571562,
+      "declaration_or_source_map": 377015
+    },
+    "unparsed_files": 0,
+    "input_incomplete": false,
+    "scan_limit_reached": false,
+    "excluded_script_files": [],
+    "present_in_prior_corpus": {
+      "name": true,
+      "exact_version": false,
+      "family": true
+    }
+  },
+  {
+    "group": "control",
+    "case_id": null,
+    "name": "playwright-core",
+    "version": "1.51.1",
+    "file_counts": {
+      "unsupported_extension": 41,
+      "selected_source": 288,
+      "declaration_or_source_map": 4,
+      "excluded_directory": 1
+    },
+    "byte_counts": {
+      "unsupported_extension": 1105272,
+      "selected_source": 5178996,
+      "declaration_or_source_map": 1645686,
+      "excluded_directory": 3125
+    },
+    "unparsed_files": 0,
+    "input_incomplete": false,
+    "scan_limit_reached": false,
+    "excluded_script_files": [
+      {
+        "path": "bin/install_media_pack.ps1",
+        "bytes": 174,
+        "reason": "unsupported_extension",
+        "sha256": "bc20f049badf021e3a53bdb4156603caa5ef482c9a9a251f927605e676a44171"
+      },
+      {
+        "path": "bin/reinstall_chrome_beta_linux.sh",
+        "bytes": 1214,
+        "reason": "unsupported_extension",
+        "sha256": "1516fd36def44bfcf87855850322a54e3b26e863a82fbdf2a44a5f5134f7eedf"
+      },
+      {
+        "path": "bin/reinstall_chrome_beta_mac.sh",
+        "bytes": 553,
+        "reason": "unsupported_extension",
+        "sha256": "a3f90ce121969762bc56b554574c0e903c381c9509f1b28d5c6d15fe34bdf3e5"
+      },
+      {
+        "path": "bin/reinstall_chrome_beta_win.ps1",
+        "bytes": 957,
+        "reason": "unsupported_extension",
+        "sha256": "b6d9e44742feafb98d5edc56fa20042949973cf30d141a1c5b4fb384096967c5"
+      },
+      {
+        "path": "bin/reinstall_chrome_stable_linux.sh",
+        "bytes": 1209,
+        "reason": "unsupported_extension",
+        "sha256": "8b578baa16f286f17d6a29cc8998a7a16f2635b7fb018f9473d5c498e0be450f"
+      },
+      {
+        "path": "bin/reinstall_chrome_stable_mac.sh",
+        "bytes": 509,
+        "reason": "unsupported_extension",
+        "sha256": "d4392f2d30407a39231b7e78af0cdb4af217b69b5273a48b893181649fe6f9e2"
+      },
+      {
+        "path": "bin/reinstall_chrome_stable_win.ps1",
+        "bytes": 923,
+        "reason": "unsupported_extension",
+        "sha256": "3d96c4e2f4ebbb3fad44cf3ba58d9cf90af1c9fb3073e3b27d45a74cf005515b"
+      },
+      {
+        "path": "bin/reinstall_msedge_beta_linux.sh",
+        "bytes": 1491,
+        "reason": "unsupported_extension",
+        "sha256": "50a5fb48211ce0dc524e17e18547f40e863c1732555ca288cbc69cd6cb55ae2a"
+      },
+      {
+        "path": "bin/reinstall_msedge_beta_mac.sh",
+        "bytes": 367,
+        "reason": "unsupported_extension",
+        "sha256": "73277b38cc6a768644fa33fa24ee121867e116c5d5cf02a2d41a14381217cc09"
+      },
+      {
+        "path": "bin/reinstall_msedge_beta_win.ps1",
+        "bytes": 874,
+        "reason": "unsupported_extension",
+        "sha256": "b173c378a59f0cc38033cee702de1f44f09276c9b2270d1a650ebe66ee312433"
+      },
+      {
+        "path": "bin/reinstall_msedge_dev_linux.sh",
+        "bytes": 1486,
+        "reason": "unsupported_extension",
+        "sha256": "38e74c2ac8a403c512590d11d20742773d338d8b68b02022b209a9d8a6e03d7c"
+      },
+      {
+        "path": "bin/reinstall_msedge_dev_mac.sh",
+        "bytes": 362,
+        "reason": "unsupported_extension",
+        "sha256": "d011981b2a6901c017bb74bf8003274cb0907e8e290a9a5ac2d81866ad01b782"
+      },
+      {
+        "path": "bin/reinstall_msedge_dev_win.ps1",
+        "bytes": 869,
+        "reason": "unsupported_extension",
+        "sha256": "46f7f98c81cb0abe687d7f4a5afea9b897a38d2a6dd6f6662fbd847f7a22bd51"
+      },
+      {
+        "path": "bin/reinstall_msedge_stable_linux.sh",
+        "bytes": 1504,
+        "reason": "unsupported_extension",
+        "sha256": "db2fb3492a689ee5472ec159fef6a5efb7a62f1f513339350813c9d1334ba8d2"
+      },
+      {
+        "path": "bin/reinstall_msedge_stable_mac.sh",
+        "bytes": 361,
+        "reason": "unsupported_extension",
+        "sha256": "ea14756557893d000af667a5db943933eccab051c7b02373d1e7427d9dfea740"
+      },
+      {
+        "path": "bin/reinstall_msedge_stable_win.ps1",
+        "bytes": 856,
+        "reason": "unsupported_extension",
+        "sha256": "40bb5fcbfcebbbe2ce43c6e736e7c5deefc5be03b6e9c6914423c06ec1f591be"
+      }
+    ],
+    "present_in_prior_corpus": {
+      "name": true,
+      "exact_version": false,
+      "family": true
+    }
+  },
+  {
+    "group": "control",
+    "case_id": null,
+    "name": "puppeteer",
+    "version": "24.4.0",
+    "file_counts": {
+      "unsupported_extension": 5,
+      "selected_source": 13,
+      "declaration_or_source_map": 25
+    },
+    "byte_counts": {
+      "unsupported_extension": 5836,
+      "selected_source": 34651,
+      "declaration_or_source_map": 318527
+    },
+    "unparsed_files": 0,
+    "input_incomplete": false,
+    "scan_limit_reached": false,
+    "excluded_script_files": [],
+    "present_in_prior_corpus": {
+      "name": true,
+      "exact_version": false,
+      "family": true
+    }
+  },
+  {
+    "group": "control",
+    "case_id": null,
+    "name": "@puppeteer/browsers",
+    "version": "2.9.0",
+    "file_counts": {
+      "unsupported_extension": 5,
+      "declaration_or_source_map": 102,
+      "selected_source": 51
+    },
+    "byte_counts": {
+      "unsupported_extension": 5871,
+      "declaration_or_source_map": 216088,
+      "selected_source": 309316
+    },
+    "unparsed_files": 0,
+    "input_incomplete": false,
+    "scan_limit_reached": false,
+    "excluded_script_files": [],
+    "present_in_prior_corpus": {
+      "name": true,
+      "exact_version": false,
+      "family": true
+    }
+  },
+  {
+    "group": "control",
+    "case_id": null,
+    "name": "electron",
+    "version": "35.0.0",
+    "file_counts": {
+      "unsupported_extension": 4,
+      "selected_source": 3,
+      "declaration_or_source_map": 1
+    },
+    "byte_counts": {
+      "unsupported_extension": 15170,
+      "selected_source": 4441,
+      "declaration_or_source_map": 1033810
+    },
+    "unparsed_files": 0,
+    "input_incomplete": false,
+    "scan_limit_reached": false,
+    "excluded_script_files": [],
+    "present_in_prior_corpus": {
+      "name": true,
+      "exact_version": false,
+      "family": true
+    }
+  },
+  {
+    "group": "control",
+    "case_id": null,
+    "name": "@electron/get",
+    "version": "2.0.3",
+    "file_counts": {
+      "unsupported_extension": 3,
+      "declaration_or_source_map": 36,
+      "selected_source": 18
+    },
+    "byte_counts": {
+      "unsupported_extension": 9132,
+      "declaration_or_source_map": 45200,
+      "selected_source": 39304
+    },
+    "unparsed_files": 0,
+    "input_incomplete": false,
+    "scan_limit_reached": false,
+    "excluded_script_files": [],
+    "present_in_prior_corpus": {
+      "name": true,
+      "exact_version": false,
+      "family": true
+    }
+  },
+  {
+    "group": "control",
+    "case_id": null,
+    "name": "prebuild-install",
+    "version": "7.1.3",
+    "file_counts": {
+      "unsupported_extension": 6,
+      "selected_source": 9
+    },
+    "byte_counts": {
+      "unsupported_extension": 18067,
+      "selected_source": 16113
+    },
+    "unparsed_files": 0,
+    "input_incomplete": false,
+    "scan_limit_reached": false,
+    "excluded_script_files": [],
+    "present_in_prior_corpus": {
+      "name": true,
+      "exact_version": true,
+      "family": true
+    }
+  }
+]

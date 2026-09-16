@@ -1,0 +1,19 @@
+{
+  "detector_unchanged": true,
+  "incidents": 2,
+  "historical_inputs": 3,
+  "legitimate_controls": 16,
+  "historical_inputs_with_critical_source_findings": 0,
+  "controls_with_critical_source_findings": 0,
+  "credential_exfiltration_findings": 0,
+  "total_source_files": 747,
+  "total_source_bytes": 9442515,
+  "unparsed_files": 0,
+  "selected_source_complete": true,
+  "control_overlap": {
+    "name": 16,
+    "exact_version": 1,
+    "family": 16
+  },
+  "interpretation": "Purposive mechanism evaluation. Original malicious archives are unavailable; reconstructed stages are not authentic full-package recall measurements. No independent validation or population false-positive rate is claimed."
+}
