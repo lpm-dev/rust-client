@@ -1,0 +1,13 @@
+{
+  "initial_freeze": "initial-freeze.json",
+  "initial_validation_packages": 2000,
+  "initial_validation_used_for_tuning": true,
+  "finding": "Quoted obfuscator examples in js-beautify caused a critical false positive.",
+  "final_freeze": "final-freeze.json",
+  "fresh_validation_packages": 2000,
+  "fresh_validation_families_disjoint_from_all_prior_packages": true,
+  "detector_changed_after_fresh_validation": false,
+  "case_sensitive_extraction_required_for": [
+    "locutus@3.0.36"
+  ]
+}

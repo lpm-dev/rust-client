@@ -1,0 +1,26 @@
+{
+  "corpus": {
+    "totals": {
+      "archive_regular_files": 799852,
+      "other_extension": 102096,
+      "eligible_source": 326675,
+      "source_map": 132910,
+      "declaration": 217013,
+      "hidden": 4080,
+      "excluded_directory": 17078
+    },
+    "package_count": 9000
+  },
+  "fresh-validation": {
+    "totals": {
+      "archive_regular_files": 308099,
+      "other_extension": 40848,
+      "declaration": 85599,
+      "eligible_source": 121626,
+      "source_map": 49627,
+      "hidden": 1524,
+      "excluded_directory": 8875
+    },
+    "package_count": 2000
+  }
+}

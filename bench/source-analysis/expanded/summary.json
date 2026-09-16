@@ -1,0 +1,307 @@
+{
+  "tuning": {
+    "packages": 7000,
+    "complete": {
+      "baseline": 6850,
+      "candidate": 6850
+    },
+    "tag_counts": {
+      "baseline": {
+        "manifest.copyleftLicense": 60,
+        "manifest.gitDependency": 56,
+        "manifest.noLicense": 162,
+        "manifest.wildcardDependency": 469,
+        "source.childProcess": 373,
+        "source.crypto": 470,
+        "source.dynamicRequire": 527,
+        "source.environmentVars": 1096,
+        "source.eval": 233,
+        "source.filesystem": 1320,
+        "source.nativeBindings": 73,
+        "source.network": 641,
+        "source.shell": 151,
+        "source.webSocket": 84,
+        "supplyChain.highEntropyStrings": 1450,
+        "supplyChain.minified": 912,
+        "supplyChain.possibleObfuscation": 165,
+        "supplyChain.telemetry": 68,
+        "supplyChain.trivial": 414,
+        "supplyChain.urlStrings": 1231
+      },
+      "candidate": {
+        "manifest.copyleftLicense": 60,
+        "manifest.gitDependency": 56,
+        "manifest.noLicense": 162,
+        "manifest.wildcardDependency": 469,
+        "source.childProcess": 373,
+        "source.crypto": 470,
+        "source.dynamicRequire": 527,
+        "source.environmentVars": 1096,
+        "source.eval": 429,
+        "source.filesystem": 1320,
+        "source.nativeBindings": 73,
+        "source.network": 641,
+        "source.shell": 151,
+        "source.webSocket": 84,
+        "supplyChain.highEntropyStrings": 1450,
+        "supplyChain.minified": 912,
+        "supplyChain.possibleObfuscation": 164,
+        "supplyChain.telemetry": 68,
+        "supplyChain.trivial": 414,
+        "supplyChain.urlStrings": 1231
+      }
+    },
+    "changed_packages": 209
+  },
+  "initial-validation": {
+    "packages": 2000,
+    "complete": {
+      "baseline": 1962,
+      "candidate": 1962
+    },
+    "tag_counts": {
+      "baseline": {
+        "manifest.copyleftLicense": 16,
+        "manifest.gitDependency": 12,
+        "manifest.noLicense": 42,
+        "manifest.wildcardDependency": 83,
+        "source.childProcess": 130,
+        "source.crypto": 160,
+        "source.dynamicRequire": 181,
+        "source.environmentVars": 390,
+        "source.eval": 104,
+        "source.filesystem": 441,
+        "source.nativeBindings": 14,
+        "source.network": 231,
+        "source.shell": 63,
+        "source.webSocket": 28,
+        "supplyChain.highEntropyStrings": 510,
+        "supplyChain.minified": 305,
+        "supplyChain.obfuscated": 1,
+        "supplyChain.possibleObfuscation": 53,
+        "supplyChain.telemetry": 26,
+        "supplyChain.trivial": 88,
+        "supplyChain.urlStrings": 404
+      },
+      "candidate": {
+        "manifest.copyleftLicense": 16,
+        "manifest.gitDependency": 12,
+        "manifest.noLicense": 42,
+        "manifest.wildcardDependency": 83,
+        "source.childProcess": 130,
+        "source.crypto": 160,
+        "source.dynamicRequire": 181,
+        "source.environmentVars": 390,
+        "source.eval": 154,
+        "source.filesystem": 441,
+        "source.nativeBindings": 14,
+        "source.network": 231,
+        "source.shell": 63,
+        "source.webSocket": 28,
+        "supplyChain.highEntropyStrings": 510,
+        "supplyChain.minified": 305,
+        "supplyChain.obfuscated": 1,
+        "supplyChain.possibleObfuscation": 53,
+        "supplyChain.telemetry": 26,
+        "supplyChain.trivial": 88,
+        "supplyChain.urlStrings": 404
+      }
+    },
+    "changed_packages": 54
+  },
+  "expanded": {
+    "packages": 9000,
+    "complete": {
+      "baseline": 8812,
+      "candidate": 8812
+    },
+    "tag_counts": {
+      "baseline": {
+        "manifest.copyleftLicense": 76,
+        "manifest.gitDependency": 68,
+        "manifest.noLicense": 204,
+        "manifest.wildcardDependency": 552,
+        "source.childProcess": 503,
+        "source.crypto": 630,
+        "source.dynamicRequire": 708,
+        "source.environmentVars": 1486,
+        "source.eval": 337,
+        "source.filesystem": 1761,
+        "source.nativeBindings": 87,
+        "source.network": 872,
+        "source.shell": 214,
+        "source.webSocket": 112,
+        "supplyChain.highEntropyStrings": 1960,
+        "supplyChain.minified": 1217,
+        "supplyChain.obfuscated": 1,
+        "supplyChain.possibleObfuscation": 218,
+        "supplyChain.telemetry": 94,
+        "supplyChain.trivial": 502,
+        "supplyChain.urlStrings": 1635
+      },
+      "candidate": {
+        "manifest.copyleftLicense": 76,
+        "manifest.gitDependency": 68,
+        "manifest.noLicense": 204,
+        "manifest.wildcardDependency": 552,
+        "source.childProcess": 503,
+        "source.crypto": 630,
+        "source.dynamicRequire": 708,
+        "source.environmentVars": 1486,
+        "source.eval": 583,
+        "source.filesystem": 1761,
+        "source.nativeBindings": 87,
+        "source.network": 872,
+        "source.shell": 214,
+        "source.webSocket": 112,
+        "supplyChain.highEntropyStrings": 1960,
+        "supplyChain.minified": 1217,
+        "supplyChain.possibleObfuscation": 217,
+        "supplyChain.telemetry": 94,
+        "supplyChain.trivial": 502,
+        "supplyChain.urlStrings": 1635
+      }
+    },
+    "changed_packages": 263
+  },
+  "original": {
+    "packages": 1000,
+    "complete": {
+      "baseline": 997,
+      "candidate": 997
+    },
+    "tag_counts": {
+      "baseline": {
+        "manifest.copyleftLicense": 4,
+        "manifest.gitDependency": 7,
+        "manifest.wildcardDependency": 55,
+        "source.childProcess": 33,
+        "source.crypto": 47,
+        "source.dynamicRequire": 60,
+        "source.environmentVars": 128,
+        "source.eval": 22,
+        "source.filesystem": 167,
+        "source.nativeBindings": 8,
+        "source.network": 31,
+        "source.shell": 11,
+        "source.webSocket": 2,
+        "supplyChain.highEntropyStrings": 142,
+        "supplyChain.minified": 93,
+        "supplyChain.possibleObfuscation": 26,
+        "supplyChain.telemetry": 4,
+        "supplyChain.trivial": 46,
+        "supplyChain.urlStrings": 112
+      },
+      "candidate": {
+        "manifest.copyleftLicense": 4,
+        "manifest.gitDependency": 7,
+        "manifest.wildcardDependency": 55,
+        "source.childProcess": 33,
+        "source.crypto": 47,
+        "source.dynamicRequire": 60,
+        "source.environmentVars": 128,
+        "source.eval": 46,
+        "source.filesystem": 167,
+        "source.nativeBindings": 8,
+        "source.network": 31,
+        "source.shell": 11,
+        "source.webSocket": 2,
+        "supplyChain.highEntropyStrings": 142,
+        "supplyChain.minified": 93,
+        "supplyChain.possibleObfuscation": 26,
+        "supplyChain.telemetry": 4,
+        "supplyChain.trivial": 46,
+        "supplyChain.urlStrings": 112
+      }
+    },
+    "changed_packages": 24
+  },
+  "historical": {
+    "packages": 5,
+    "complete": {
+      "baseline": 4,
+      "candidate": 4
+    },
+    "tag_counts": {
+      "baseline": {
+        "source.crypto": 2,
+        "source.environmentVars": 3,
+        "source.filesystem": 2,
+        "source.network": 3,
+        "source.webSocket": 1,
+        "supplyChain.highEntropyStrings": 4,
+        "supplyChain.minified": 3,
+        "supplyChain.obfuscated": 2,
+        "supplyChain.possibleObfuscation": 2,
+        "supplyChain.urlStrings": 3
+      },
+      "candidate": {
+        "source.crypto": 2,
+        "source.environmentVars": 3,
+        "source.filesystem": 2,
+        "source.network": 3,
+        "source.webSocket": 1,
+        "supplyChain.highEntropyStrings": 4,
+        "supplyChain.minified": 3,
+        "supplyChain.obfuscated": 2,
+        "supplyChain.possibleObfuscation": 2,
+        "supplyChain.urlStrings": 3
+      }
+    },
+    "changed_packages": 0
+  },
+  "validation": {
+    "packages": 2000,
+    "complete": {
+      "baseline": 1937,
+      "candidate": 1937
+    },
+    "tag_counts": {
+      "baseline": {
+        "manifest.copyleftLicense": 46,
+        "manifest.gitDependency": 14,
+        "manifest.noLicense": 64,
+        "manifest.wildcardDependency": 97,
+        "source.childProcess": 131,
+        "source.crypto": 142,
+        "source.dynamicRequire": 161,
+        "source.environmentVars": 333,
+        "source.eval": 124,
+        "source.filesystem": 460,
+        "source.nativeBindings": 16,
+        "source.network": 255,
+        "source.shell": 61,
+        "source.webSocket": 32,
+        "supplyChain.highEntropyStrings": 528,
+        "supplyChain.minified": 425,
+        "supplyChain.possibleObfuscation": 61,
+        "supplyChain.telemetry": 28,
+        "supplyChain.trivial": 74,
+        "supplyChain.urlStrings": 494
+      },
+      "candidate": {
+        "manifest.copyleftLicense": 46,
+        "manifest.gitDependency": 14,
+        "manifest.noLicense": 64,
+        "manifest.wildcardDependency": 97,
+        "source.childProcess": 131,
+        "source.crypto": 142,
+        "source.dynamicRequire": 161,
+        "source.environmentVars": 333,
+        "source.eval": 167,
+        "source.filesystem": 460,
+        "source.nativeBindings": 16,
+        "source.network": 255,
+        "source.shell": 61,
+        "source.webSocket": 32,
+        "supplyChain.highEntropyStrings": 528,
+        "supplyChain.minified": 425,
+        "supplyChain.possibleObfuscation": 59,
+        "supplyChain.telemetry": 28,
+        "supplyChain.trivial": 74,
+        "supplyChain.urlStrings": 494
+      }
+    },
+    "changed_packages": 45
+  }
+}
