@@ -1,0 +1,328 @@
+{
+  "toolchain": "1.94.0",
+  "candidate_code_commit": "0f918d2c",
+  "workspace_build_warnings": 0,
+  "new_targeted_unit_tests": 17,
+  "source_corpus_helper_tests": 49,
+  "gate_results": [
+    {
+      "command": [
+        "cargo",
+        "+1.94.0",
+        "build",
+        "--workspace",
+        "--locked"
+      ],
+      "exit_code": 0,
+      "seconds": 31.645922042000166
+    },
+    {
+      "command": [
+        "cargo",
+        "+1.94.0",
+        "clippy",
+        "--workspace",
+        "--all-targets",
+        "--locked",
+        "--",
+        "-D",
+        "warnings"
+      ],
+      "exit_code": 0,
+      "seconds": 37.995926042000065
+    },
+    {
+      "command": [
+        "cargo",
+        "+1.94.0",
+        "fmt",
+        "--check"
+      ],
+      "exit_code": 0,
+      "seconds": 6.070267082999635
+    },
+    {
+      "command": [
+        "cargo",
+        "+1.94.0",
+        "nextest",
+        "run",
+        "--locked",
+        "--workspace",
+        "--exclude",
+        "lpm-workflows",
+        "--exclude",
+        "lpm-cli",
+        "--no-fail-fast",
+        "--status-level",
+        "slow",
+        "--final-status-level",
+        "fail"
+      ],
+      "exit_code": 0,
+      "seconds": 57.54484020900054
+    },
+    {
+      "command": [
+        "cargo",
+        "+1.94.0",
+        "test",
+        "--locked",
+        "-p",
+        "lpm-cli",
+        "--bin",
+        "lpm-rs",
+        "--",
+        "--test-threads=1"
+      ],
+      "exit_code": 0,
+      "seconds": 91.32826187499995
+    },
+    {
+      "command": [
+        "cargo",
+        "+1.94.0",
+        "nextest",
+        "run",
+        "--locked",
+        "-p",
+        "lpm-cli",
+        "-E",
+        "not binary_id(/bin\\/lpm-rs/)",
+        "--no-fail-fast",
+        "--status-level",
+        "slow",
+        "--final-status-level",
+        "fail"
+      ],
+      "exit_code": 0,
+      "seconds": 33.91055362499901
+    },
+    {
+      "command": [
+        "scripts/ci/with-hermetic-workflow-cli.sh",
+        "cargo",
+        "+1.94.0",
+        "nextest",
+        "run",
+        "--locked",
+        "-p",
+        "lpm-workflows",
+        "--test",
+        "install_source_analysis",
+        "--test",
+        "behavioral_tag_catalog_drift",
+        "--no-fail-fast",
+        "--status-level",
+        "slow",
+        "--final-status-level",
+        "fail"
+      ],
+      "exit_code": 0,
+      "seconds": 35.58159508300014
+    },
+    {
+      "command": [
+        "cargo",
+        "check",
+        "--locked",
+        "-p",
+        "lpm-auth"
+      ],
+      "exit_code": 0,
+      "seconds": 4.525201917000231
+    },
+    {
+      "command": [
+        "cargo",
+        "check",
+        "--locked",
+        "-p",
+        "lpm-vault"
+      ],
+      "exit_code": 0,
+      "seconds": 2.791836125001282
+    },
+    {
+      "command": [
+        "bash",
+        "scripts/ci/test-install-apt-packages.sh"
+      ],
+      "exit_code": 0,
+      "seconds": 1.1516587910009548
+    },
+    {
+      "command": [
+        "bash",
+        "scripts/ci/test-macos-keychain-search-list.sh"
+      ],
+      "exit_code": 0,
+      "seconds": 0.23668637499940814
+    },
+    {
+      "command": [
+        "sh",
+        "tests/install-sh/run.sh"
+      ],
+      "exit_code": 0,
+      "seconds": 16.98632062499928
+    },
+    {
+      "command": [
+        "bash",
+        "bench/test-audit-install-args.sh"
+      ],
+      "exit_code": 0,
+      "seconds": 1.6912440409996634
+    },
+    {
+      "command": [
+        "python3",
+        "bench/source-analysis/test_corpus.py"
+      ],
+      "exit_code": 0,
+      "seconds": 0.24987104200044996
+    },
+    {
+      "command": [
+        "python3",
+        "bench/test_audit_install_timeout.py"
+      ],
+      "exit_code": 0,
+      "seconds": 12.675718167000014
+    },
+    {
+      "command": [
+        "python3",
+        "bench/audit-fixtures/test_classify_result.py"
+      ],
+      "exit_code": 0,
+      "seconds": 0.28792716700081655
+    },
+    {
+      "command": [
+        "bash",
+        "bench/test-local-install.sh"
+      ],
+      "exit_code": 0,
+      "seconds": 5.212090625000201
+    },
+    {
+      "command": [
+        "bash",
+        "bench/test-live-metadata-route.sh"
+      ],
+      "exit_code": 0,
+      "seconds": 0.5038907079997443
+    },
+    {
+      "command": [
+        "bash",
+        "bench/test-run-readme.sh"
+      ],
+      "exit_code": 0,
+      "seconds": 1.0088921249989653
+    },
+    {
+      "command": [
+        "bash",
+        "scripts/ci/test-with-hermetic-workflow-cli.sh"
+      ],
+      "exit_code": 0,
+      "seconds": 0.46052829200016276
+    },
+    {
+      "command": [
+        "node",
+        "bench/scripts/run-install-readiness.mjs",
+        "--self-test"
+      ],
+      "exit_code": 0,
+      "seconds": 0.04088374999992084
+    },
+    {
+      "command": [
+        "node",
+        "bench/scripts/run-t3-install-six-states.mjs",
+        "--self-test"
+      ],
+      "exit_code": 0,
+      "seconds": 0.031945999999152264
+    },
+    {
+      "command": [
+        "node",
+        "bench/scripts/run-runtime-readiness.mjs",
+        "--self-test"
+      ],
+      "exit_code": 0,
+      "seconds": 0.13864645800094877
+    },
+    {
+      "command": [
+        "npm",
+        "--prefix",
+        "npm/cli",
+        "test"
+      ],
+      "exit_code": 0,
+      "seconds": 0.5784428749993822
+    },
+    {
+      "command": [
+        "npm",
+        "--prefix",
+        "npm/cli",
+        "run",
+        "pack:check"
+      ],
+      "exit_code": 0,
+      "seconds": 0.3663384159990528
+    },
+    {
+      "command": [
+        "cargo",
+        "deny",
+        "--all-features",
+        "check",
+        "--hide-inclusion-graph",
+        "advisories",
+        "bans",
+        "licenses"
+      ],
+      "exit_code": 0,
+      "seconds": 0.9204225840003346
+    },
+    {
+      "command": [
+        "node",
+        "--test",
+        "npm/release/tests/acceptance-artifact-policy.test.mjs",
+        "npm/release/tests/ci-policy.test.mjs",
+        "npm/release/tests/linux-glibc-compatibility.test.mjs",
+        "npm/release/tests/nightly-release-state.test.mjs",
+        "npm/release/tests/nightly-version.test.mjs",
+        "npm/release/tests/release-api-contract.test.mjs",
+        "npm/release/tests/release-artifacts.test.mjs",
+        "npm/release/tests/release-candidate.test.mjs",
+        "npm/release/tests/release-hardening-policy.test.mjs",
+        "npm/release/tests/release-policy.test.mjs",
+        "npm/release/tests/rust-toolchain-policy.test.mjs",
+        "npm/release/tests/stable-release-policy.test.mjs",
+        "npm/release/tests/validate-recovery-source.test.mjs",
+        "npm/release/tests/validate-release-candidate-source.test.mjs",
+        "npm/release/tests/verify-packages.test.mjs",
+        "npm/release/tests/verify-published-package.test.mjs"
+      ],
+      "exit_code": 0,
+      "seconds": 5.603171249998923
+    }
+  ],
+  "docs": {
+    "pull_request": "https://github.com/lpm-dev/rust-client-docs/pull/233",
+    "local_check": "npm run check",
+    "status": "passed",
+    "content_dates_check": "passed",
+    "github_checks": "No GitHub checks reported"
+  }
+}

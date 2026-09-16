@@ -1,0 +1,324 @@
+{
+  "baseline_scanner_sha256": "c993cc8e9d02c2a8c5dc5e737545f36e80d38724fd80d53fe902092452190728",
+  "candidate_scanner_sha256": "055c236f067212181d77cf0b139fa2fe8afe91798989a6c9219ecef492096104",
+  "cohorts": {
+    "pilot": {
+      "selected": 400,
+      "new_findings": [
+        {
+          "name": "core-js-buffer",
+          "version": "1.0.0",
+          "sha256": "7223c92e3d4419afe42c20a736479afd4a7d31ab90889028126efba711c17bf8",
+          "tags": [
+            "encryptedExecution"
+          ]
+        },
+        {
+          "name": "autbank-core",
+          "version": "99.0.2",
+          "sha256": "d09a73d60dec21676b6cf3745dc5cd5b501576d53a1640820f0b90aac7f330c0",
+          "tags": [
+            "credentialExfiltration"
+          ]
+        },
+        {
+          "name": "coin-fees",
+          "version": "20.1.1",
+          "sha256": "89961912410c1a33132d04e24ce39593c722f968d187ae6cbfcfbe4b3058f529",
+          "tags": [
+            "credentialExfiltration"
+          ]
+        },
+        {
+          "name": "es6-codify",
+          "version": "2.2.0",
+          "sha256": "a6f11f8da9e706f8713e9fdfd7440453497f38d1d9fa5cebf78b655951c9493d",
+          "tags": [
+            "credentialExfiltration"
+          ]
+        },
+        {
+          "name": "fin-logger",
+          "version": "33.12.13",
+          "sha256": "18dcdde869c481ef31ea45ebb721f745acc49e4cdf64ecdae48b9d47bec4fea1",
+          "tags": [
+            "credentialExfiltration"
+          ]
+        }
+      ],
+      "removed_findings": [],
+      "baseline": {
+        "scanned": 399,
+        "failed": 1,
+        "with_critical": 17,
+        "with_targeted_warning": 3,
+        "critical_rules": {
+          "obfuscated": 14,
+          "credentialExfiltration": 3
+        },
+        "targeted_rules": {
+          "credentialExfiltration": 3
+        },
+        "coverage": {
+          "files_scanned": 16275,
+          "bytes_scanned": 367083728,
+          "unparsed_files": 27,
+          "packages_with_limits": 6,
+          "packages_with_input_incomplete": 0,
+          "packages_without_selected_source": 37
+        }
+      },
+      "candidate": {
+        "scanned": 399,
+        "failed": 1,
+        "with_critical": 21,
+        "with_targeted_warning": 8,
+        "critical_rules": {
+          "obfuscated": 14,
+          "credentialExfiltration": 7
+        },
+        "targeted_rules": {
+          "encryptedExecution": 1,
+          "credentialExfiltration": 7
+        },
+        "coverage": {
+          "files_scanned": 16275,
+          "bytes_scanned": 367083728,
+          "unparsed_files": 27,
+          "packages_with_limits": 6,
+          "packages_with_input_incomplete": 0,
+          "packages_without_selected_source": 37
+        }
+      }
+    },
+    "added_wipers": {
+      "selected": 2,
+      "new_findings": [
+        {
+          "name": "cache-cleanup-module",
+          "version": "2.5.0",
+          "sha256": "174726731b3fb60ea78de07c1b747cd40942d9f30fe7e20851b6b7b70754dfa1",
+          "tags": [
+            "destructiveFilesystem"
+          ]
+        },
+        {
+          "name": "cache-cleanup-module",
+          "version": "2.6.0",
+          "sha256": "f18a6a4f793fe2df523619ac64f6f495d8471827578c852d422b6ab203bd27bc",
+          "tags": [
+            "destructiveFilesystem"
+          ]
+        }
+      ],
+      "removed_findings": [],
+      "baseline": {
+        "scanned": 2,
+        "failed": 0,
+        "with_critical": 0,
+        "with_targeted_warning": 0,
+        "critical_rules": {},
+        "targeted_rules": {},
+        "coverage": {
+          "files_scanned": 2,
+          "bytes_scanned": 6590,
+          "unparsed_files": 0,
+          "packages_with_limits": 0,
+          "packages_with_input_incomplete": 0,
+          "packages_without_selected_source": 0
+        }
+      },
+      "candidate": {
+        "scanned": 2,
+        "failed": 0,
+        "with_critical": 2,
+        "with_targeted_warning": 2,
+        "critical_rules": {
+          "destructiveFilesystem": 2
+        },
+        "targeted_rules": {
+          "destructiveFilesystem": 2
+        },
+        "coverage": {
+          "files_scanned": 2,
+          "bytes_scanned": 6590,
+          "unparsed_files": 0,
+          "packages_with_limits": 0,
+          "packages_with_input_incomplete": 0,
+          "packages_without_selected_source": 0
+        }
+      }
+    }
+  },
+  "regression_corpora": {
+    "controls": {
+      "binary_sha256": "055c236f067212181d77cf0b139fa2fe8afe91798989a6c9219ecef492096104",
+      "manifest_sha256": "1c68fc0a3626dca3eb1037c720e64faafd8eddd18719f00eb496a35a3a1a4011",
+      "split": "all",
+      "count": 28,
+      "threads": 4,
+      "wall_seconds": 0.44208208300005936,
+      "exit_code": 0,
+      "targeted_warning_packages": 0,
+      "new_tag_packages": 0,
+      "targeted_rules": {}
+    },
+    "top1000": {
+      "binary_sha256": "055c236f067212181d77cf0b139fa2fe8afe91798989a6c9219ecef492096104",
+      "manifest_sha256": "2d0bb511bd6c5c90f2d65e6bfb3ef280b1bb7712afcec4c2746f503bd8043ed6",
+      "split": "all",
+      "count": 1000,
+      "threads": 4,
+      "wall_seconds": 5.2256703750008455,
+      "exit_code": 0,
+      "targeted_warning_packages": 0,
+      "new_tag_packages": 0,
+      "targeted_rules": {}
+    },
+    "expanded": {
+      "binary_sha256": "055c236f067212181d77cf0b139fa2fe8afe91798989a6c9219ecef492096104",
+      "manifest_sha256": "ee7e74569582709c825c4ab6c3861bdf0ce4dfda474b81a6d36d461c9e2c80be",
+      "split": "all",
+      "count": 9000,
+      "threads": 4,
+      "wall_seconds": 73.19359941699986,
+      "exit_code": 0,
+      "targeted_warning_packages": 0,
+      "new_tag_packages": 0,
+      "targeted_rules": {}
+    },
+    "fresh": {
+      "binary_sha256": "055c236f067212181d77cf0b139fa2fe8afe91798989a6c9219ecef492096104",
+      "manifest_sha256": "5a6b9f13ed3739ce6bced56a813339af0238e2e2e2e83019805f3d422ab36765",
+      "split": "all",
+      "count": 2000,
+      "threads": 4,
+      "wall_seconds": 23.391613167001196,
+      "exit_code": 0,
+      "targeted_warning_packages": 0,
+      "new_tag_packages": 0,
+      "targeted_rules": {}
+    }
+  },
+  "historical_regressions": {
+    "historical": [
+      {
+        "name": "@solana/web3.js",
+        "version": "1.95.7",
+        "baseline_tags": [
+          "credentialExfiltration",
+          "highEntropyStrings",
+          "minified",
+          "possibleObfuscation",
+          "urlStrings"
+        ],
+        "candidate_tags": [
+          "credentialExfiltration",
+          "highEntropyStrings",
+          "minified",
+          "possibleObfuscation",
+          "urlStrings"
+        ],
+        "removed_tags": []
+      },
+      {
+        "name": "@ctrl/tinycolor",
+        "version": "4.1.1",
+        "baseline_tags": [
+          "credentialExfiltration",
+          "highEntropyStrings",
+          "minified",
+          "possibleObfuscation",
+          "urlStrings"
+        ],
+        "candidate_tags": [
+          "credentialExfiltration",
+          "highEntropyStrings",
+          "minified",
+          "possibleObfuscation",
+          "urlStrings"
+        ],
+        "removed_tags": []
+      },
+      {
+        "name": "xrpl",
+        "version": "4.2.1",
+        "baseline_tags": [
+          "credentialExfiltration",
+          "highEntropyStrings",
+          "urlStrings"
+        ],
+        "candidate_tags": [
+          "credentialExfiltration",
+          "highEntropyStrings",
+          "urlStrings"
+        ],
+        "removed_tags": []
+      },
+      {
+        "name": "debug",
+        "version": "4.4.2",
+        "baseline_tags": [
+          "minified",
+          "obfuscated"
+        ],
+        "candidate_tags": [
+          "minified",
+          "obfuscated"
+        ],
+        "removed_tags": []
+      },
+      {
+        "name": "node-ipc",
+        "version": "12.0.1",
+        "baseline_tags": [
+          "highEntropyStrings",
+          "obfuscated"
+        ],
+        "candidate_tags": [
+          "highEntropyStrings",
+          "obfuscated"
+        ],
+        "removed_tags": []
+      }
+    ],
+    "attack-families": [
+      {
+        "name": "eslint-scope",
+        "version": "3.7.2",
+        "baseline_tags": [
+          "highEntropyStrings"
+        ],
+        "candidate_tags": [
+          "highEntropyStrings"
+        ],
+        "removed_tags": []
+      },
+      {
+        "name": "evaluation-eslint-credential-payload",
+        "version": "0.0.0",
+        "baseline_tags": [
+          "urlStrings"
+        ],
+        "candidate_tags": [
+          "urlStrings"
+        ],
+        "removed_tags": []
+      },
+      {
+        "name": "ua-parser-js",
+        "version": "0.7.29",
+        "baseline_tags": [
+          "minified",
+          "urlStrings"
+        ],
+        "candidate_tags": [
+          "minified",
+          "urlStrings"
+        ],
+        "removed_tags": []
+      }
+    ]
+  },
+  "interpretation": "Development and regression evidence. Most archive labels remain unreviewed. Selected families, related versions, missing stages and prior tuning prevent a malware-recall estimate."
+}
