@@ -135,15 +135,22 @@ impl<'s, 'a> Flow<'s, 'a> {
         match expression.get_inner_expression() {
             Expression::StringLiteral(value) => {
                 let path = value.value.as_str();
-                path == ".env"
-                    || path.ends_with("/.env")
-                    || path == ".npmrc"
-                    || path.ends_with("/.npmrc")
-                    || path.ends_with(".aws/credentials")
-                    || path.ends_with(".ssh/id_rsa")
-                    || path.ends_with(".ssh/id_ed25519")
-                    || path.ends_with(".kube/config")
-                    || path.ends_with(".git-credentials")
+                [
+                    ".env",
+                    ".npmrc",
+                    ".aws/credentials",
+                    ".ssh/id_rsa",
+                    ".ssh/id_ed25519",
+                    ".kube/config",
+                    ".git-credentials",
+                ]
+                .iter()
+                .any(|credential| {
+                    path == *credential
+                        || path
+                            .strip_suffix(credential)
+                            .is_some_and(|prefix| prefix.ends_with('/'))
+                })
             }
             Expression::Identifier(identifier) => self
                 .initial(identifier)

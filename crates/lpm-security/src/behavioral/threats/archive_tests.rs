@@ -199,3 +199,19 @@ fn eval_requires_text_while_function_constructor_converts_bytes() {
         "downloadedExecution"
     ));
 }
+
+#[test]
+fn similar_public_path_suffixes_do_not_count_as_credential_files() {
+    for path in [
+        "public.aws/credentials",
+        "public.ssh/id_rsa",
+        "public.ssh/id_ed25519",
+        "public.kube/config",
+        "public.git-credentials",
+    ] {
+        let source = format!(
+            "const fs=require('fs'); fetch('https://api.example',{{body:fs.readFileSync('{path}')}});"
+        );
+        assert!(!detected(&source, "credentialExfiltration"), "{path}");
+    }
+}
