@@ -1,0 +1,260 @@
+{
+  "scope": "13 purposive source reviews from the frozen screening set, not a random adjudication sample or family-recall denominator. All remaining labels retain their unreviewed status.",
+  "cases": [
+    {
+      "name": "price-scripping-js",
+      "version": "1.1.2",
+      "archive_sha256": "23c8d92062fa7ab93ffc60c1432103bd44bffcf0759930d633fae585acbb11d1",
+      "family": "credential_files",
+      "label_status": "source_reviewed_attack",
+      "observed_chain": "The postinstall entry calls prices(), reads the consumer .env through INIT_CWD, and POSTs parsed contents to its concealed default endpoint.",
+      "detector_assessment": "No credential-file-to-fetch-body warning.",
+      "limits": "Destination can be overridden; the default path runs automatically.",
+      "source_files": [
+        {
+          "path": "dist/postinstall.js",
+          "sha256": "b07cd2ec46198306e722224682b33ad62aff4033a37adca46db168f7f29da93e"
+        },
+        {
+          "path": "dist/index.js",
+          "sha256": "b8ab49918d9b5cc2f48e1e4f56a9323b34a69d8354e279863f61ea303d2b3bb3"
+        }
+      ],
+      "critical_source_findings": []
+    },
+    {
+      "name": "wallet-watcher",
+      "version": "1.0.2",
+      "archive_sha256": "bd6a550c82156f117c4caec77f5747d9968ab2445d3ee030b59ab06eb8ddc3e4",
+      "family": "credential_files",
+      "label_status": "source_reviewed_attack",
+      "observed_chain": "Postinstall scans the consumer project for secrets and wallet keys, encrypts the findings, and uploads them to package-selected endpoints.",
+      "detector_assessment": "No credential-file collection-to-encrypted-upload warning.",
+      "limits": "Encryption is applied to stolen data; this is not an encrypted executable-payload example.",
+      "source_files": [
+        {
+          "path": "src/postinstall.cjs",
+          "sha256": "8457c61ec199e2765d0cd3ca53348a77df1e459adb7d39234873554960449233"
+        },
+        {
+          "path": "src/scan.cjs",
+          "sha256": "6182efa6dc6149deb6598128becdfac81c57b212ae989fec51e3cd4e45361f7d"
+        }
+      ],
+      "critical_source_findings": []
+    },
+    {
+      "name": "debugcli",
+      "version": "4.3.8",
+      "archive_sha256": "026dc39872c8928afffd2ee436632a57a27a2f78f3e9662cd36d75d61efddd1c",
+      "family": "credential_files",
+      "label_status": "source_reviewed_attack",
+      "observed_chain": "Postinstall reads home credential files and browser wallet stores, then uploads compressed file contents through Telegram.",
+      "detector_assessment": "No credential-file-to-multipart-upload warning.",
+      "limits": "Sandbox checks and a daily lock gate activation. Only static source was inspected.",
+      "source_files": [
+        {
+          "path": "install.js",
+          "sha256": "62c57137e671c270c1d86fcd4916418facf3ac52764cd64fe0c028f483b24a48"
+        }
+      ],
+      "critical_source_findings": []
+    },
+    {
+      "name": "test__123q1",
+      "version": "2.1.3",
+      "archive_sha256": "133ef9e351193413acac008f27ba93c89f5f6765a0098d9981bf8a383005cce0",
+      "family": "credential_files",
+      "label_status": "source_reviewed_attack",
+      "observed_chain": "Postinstall collects home credential files, writes a report archive, and sends it to a hard-coded Telegram recipient.",
+      "detector_assessment": "No credential-file-to-archive-to-upload warning.",
+      "limits": "The archive also contains token-use and package-propagation code, outside this focused result.",
+      "source_files": [
+        {
+          "path": "dist/script.js",
+          "sha256": "97a40a73ca2529ced783b7ddb6d5d63818a203c0bd627ea0bebfb2d6a9d7685a"
+        }
+      ],
+      "critical_source_findings": []
+    },
+    {
+      "name": "autbank-core",
+      "version": "99.0.2",
+      "archive_sha256": "d09a73d60dec21676b6cf3745dc5cd5b501576d53a1640820f0b90aac7f330c0",
+      "family": "credential_files",
+      "label_status": "source_reviewed_attack",
+      "observed_chain": "Preinstall collects selected environment secrets and any .env file in the lifecycle working directory, then sends the object with https.request.",
+      "detector_assessment": "No credential-file or filtered-environment exfiltration warning.",
+      "limits": "Its relative .env path points at the package working directory during standard npm lifecycle execution, not automatically the consumer root.",
+      "source_files": [
+        {
+          "path": "preinstall.js",
+          "sha256": "b37811416b19900b9649acb6db9faab5122fa4aa8c78d9a54387f16904a3e451"
+        },
+        {
+          "path": "postinstall.js",
+          "sha256": "8478f17823de8f0fb7d8c44291c652f521cb0a57375f8c36f5e9c7671c2240a5"
+        }
+      ],
+      "critical_source_findings": []
+    },
+    {
+      "name": "core-js-buffer",
+      "version": "1.0.0",
+      "archive_sha256": "7223c92e3d4419afe42c20a736479afd4a7d31ab90889028126efba711c17bf8",
+      "family": "install_download",
+      "label_status": "source_reviewed_attack",
+      "observed_chain": "Postinstall checks for developer-directory names, retrieves encrypted bytes, decrypts them into Python source, and launches the written script.",
+      "detector_assessment": "No download-decrypt-write-spawn warning.",
+      "limits": "The external Python payload is absent. This confirms the packaged launcher, not the eventual payload effects.",
+      "source_files": [
+        {
+          "path": "init.js",
+          "sha256": "d2151c94c8fadefee3ffca12886a08e04e24a3f0cffae2dee54b36e1dbd6274c"
+        }
+      ],
+      "critical_source_findings": []
+    },
+    {
+      "name": "mutex-core",
+      "version": "2.1.2",
+      "archive_sha256": "8ad9f53fc580bd941bd8fc8c13df6c9ba4da6d0f1b550f276731a0ab99e6969c",
+      "family": "encrypted_activation",
+      "label_status": "source_reviewed_attack",
+      "observed_chain": "A normal mutex API hashes callback metadata. A matching hash gates decryption of a bundled file and detached Node execution.",
+      "detector_assessment": "No conditional decrypt-to-spawn warning.",
+      "limits": "The activation key and decrypted payload are unknown. Two other selected files fail parsing; the readable launcher is available.",
+      "source_files": [
+        {
+          "path": "lib/Mutex.js",
+          "sha256": "ad626b78f2f5ca13ad8b255a13b912bb1db69bfd564a91c99f7e39c97e4d0e13"
+        },
+        {
+          "path": "lib/common.js",
+          "sha256": "22c0e6da62021cce16f293679c859c2b6ab7920309f7a4109d03ea7b59d219d1"
+        }
+      ],
+      "critical_source_findings": []
+    },
+    {
+      "name": "matrixflow-js",
+      "version": "3.2.1",
+      "archive_sha256": "7ed05a12c0bee752b999f6695bde62a78a5c5f8013a57f40cc9b16c4062f8d79",
+      "family": "encrypted_activation",
+      "label_status": "source_reviewed_attack",
+      "observed_chain": "Matrix solve passes serialized input to a concealed hash-gated helper that decrypts a bundled file and spawns Node.",
+      "detector_assessment": "No conditional decrypt-to-spawn warning.",
+      "limits": "The activation input and decrypted effects are unknown. Shared code links this case to other payload-carrier archives.",
+      "source_files": [
+        {
+          "path": "matrix.js",
+          "sha256": "de82608912a8491cc85dc7a407f9e503311725f6f1e674d078d2dcc0c71bbe0c"
+        },
+        {
+          "path": "src/common.js",
+          "sha256": "6356f2672bfdf085091bbc8a98bc41923481f3a2467124371a80f3f89c19559f"
+        }
+      ],
+      "critical_source_findings": []
+    },
+    {
+      "name": "helmet-pro",
+      "version": "10.0.4",
+      "archive_sha256": "2b11764217fd912c22b2a329a8a49d800e68fc0e5e3aa7b9f5c293da22683a82",
+      "family": "install_download",
+      "label_status": "source_reviewed_attack",
+      "observed_chain": "Postinstall starts a detached helper that fetches a JSON record and passes its contents to a Function constructor.",
+      "detector_assessment": "A Critical obfuscation warning fires. It does not specifically identify downloaded-response execution.",
+      "limits": "External response bytes were not fetched.",
+      "source_files": [
+        {
+          "path": "lib/utils/index.js",
+          "sha256": "9fb27c30f484650bb4a39f65a03fbccdc0b9b5f1cb84700ca73ee8893c66e06e"
+        },
+        {
+          "path": "lib/utils/smtp-connection/index.js",
+          "sha256": "082583b62d90da834dc8e262f6999bcd2a1194e3ef3fefca8d70f6c1ebc4fa79"
+        }
+      ],
+      "critical_source_findings": [
+        "obfuscated"
+      ]
+    },
+    {
+      "name": "greensaver",
+      "version": "1.2.2",
+      "archive_sha256": "d58d3e1612aa88385b9fd044d3d20aec5eabed3f5fc832aca8e9d50fe37fa9a6",
+      "family": "install_download",
+      "label_status": "source_reviewed_conditional_chain",
+      "observed_chain": "Lifecycle code decodes packaged .map data into JavaScript. That decoded loader fetches, decrypts, and evaluates a remote response.",
+      "detector_assessment": "No Critical warning. The encoded .map stage is excluded from JS source selection.",
+      "limits": "The loader assumes ./node_modules/greensaver paths. Standard lifecycle cwd can prevent this path from activating. Static base64 decoding was used only for review.",
+      "source_files": [
+        {
+          "path": "lib/greensaver.js",
+          "sha256": "e91c3c294e1c1ef2496e27e6076e621597e9750636bd7890223d34eae8053012"
+        },
+        {
+          "path": "lib/parse.ts.map",
+          "sha256": "603684b9c77e304c3cf77f6f061b751bbf92264b4a27ed61a3783e02539e5938"
+        },
+        {
+          "path": "lib/init.ts.map",
+          "sha256": "266d3860b0caa206ed878e1139335dbbed119a095e23fb23003ab21f59b8186b"
+        }
+      ],
+      "critical_source_findings": []
+    },
+    {
+      "name": "kelly-sizing",
+      "version": "0.1.1",
+      "archive_sha256": "57de2fba614800744c53dd8b7b067983116d6b496fd5c699a8467954745b5c9a",
+      "family": "install_download",
+      "label_status": "source_reviewed_remote_loader",
+      "observed_chain": "Postinstall downloads a configured tarball, installs its dependencies, and requires its peer module.",
+      "detector_assessment": "No Critical warning. The external stage is absent.",
+      "limits": "The source confirms remote execution, but the absent stage prevents an independent malware verdict from this chain alone.",
+      "source_files": [
+        {
+          "path": "scripts/install-check.cjs",
+          "sha256": "3e15f1692c4075cf29cefa94c84d564a95086ab7a6838a97ea25cd02475a282d"
+        }
+      ],
+      "critical_source_findings": []
+    },
+    {
+      "name": "@1interface/shared-core",
+      "version": "0.7.0",
+      "archive_sha256": "b2bc964ecf9317b82815e2ffd61f38dd1e8dbbabf8605a0ae2091ac386f3d737",
+      "family": "destructive_files",
+      "label_status": "ambiguous_or_out_of_scope",
+      "observed_chain": "Postinstall removes relative node_modules/react and node_modules/react-dom directories.",
+      "detector_assessment": "No Critical warning; this is not counted as a missed filesystem attack.",
+      "limits": "Standard lifecycle cwd is the installed package directory. The archived review incorrectly assumes these relative paths always target consumer-root dependencies. This does not certify the package as safe.",
+      "source_files": [
+        {
+          "path": "package.json",
+          "sha256": "b848a7b921ad89cc047b502e2ecb52d7222db61e9083996be5710cfbf16b6e88"
+        }
+      ],
+      "critical_source_findings": []
+    },
+    {
+      "name": "@vpxa/aikit",
+      "version": "0.1.469",
+      "archive_sha256": "33681360f2ce5a8198360a491f15cb4a9740d44129fa5881cea0506e380ecdc6",
+      "family": "destructive_files",
+      "label_status": "ambiguous_or_out_of_scope",
+      "observed_chain": "Startup removes the whole ~/.claude/mcp.json file if its parsed mcpServers contains an AI Kit entry.",
+      "detector_assessment": "No Critical warning; deletion scope can lose unrelated configuration.",
+      "limits": "This is a guarded cleanup path with possible data loss. Source alone does not establish a malicious destructive campaign; the archived description of unconditional deletion is inaccurate.",
+      "source_files": [
+        {
+          "path": "packages/server/dist/version-check-WY-1_gsR.js",
+          "sha256": "34d9269e20fa3a09c3b3d03f1638012f42b240c86112698c3de385c942ed532d"
+        }
+      ],
+      "critical_source_findings": []
+    }
+  ]
+}

@@ -1,0 +1,94 @@
+{
+  "selected": 400,
+  "scanned": 399,
+  "failed": 1,
+  "with_critical_source_warning": 17,
+  "critical_rules": {
+    "obfuscated": 14,
+    "credentialExfiltration": 3
+  },
+  "code_linked_components": 363,
+  "components_with_critical_warning": 11,
+  "components_with_credential_exfiltration": 1,
+  "strata": {
+    "encrypted_activation": {
+      "selected": 60,
+      "scanned": 60,
+      "with_critical": 3,
+      "with_credential_exfiltration": 0,
+      "with_obfuscated": 3,
+      "zero_selected_source": 13
+    },
+    "destructive_files": {
+      "selected": 60,
+      "scanned": 60,
+      "with_critical": 3,
+      "with_credential_exfiltration": 0,
+      "with_obfuscated": 3,
+      "zero_selected_source": 1
+    },
+    "credential_files": {
+      "selected": 60,
+      "scanned": 60,
+      "with_critical": 0,
+      "with_credential_exfiltration": 0,
+      "with_obfuscated": 0,
+      "zero_selected_source": 1
+    },
+    "install_download": {
+      "selected": 60,
+      "scanned": 60,
+      "with_critical": 5,
+      "with_credential_exfiltration": 0,
+      "with_obfuscated": 5,
+      "zero_selected_source": 2
+    },
+    "openssf": {
+      "selected": 60,
+      "scanned": 60,
+      "with_critical": 0,
+      "with_credential_exfiltration": 0,
+      "with_obfuscated": 0,
+      "zero_selected_source": 3
+    },
+    "datadog": {
+      "selected": 100,
+      "scanned": 99,
+      "with_critical": 6,
+      "with_credential_exfiltration": 3,
+      "with_obfuscated": 3,
+      "zero_selected_source": 17,
+      "acquisition_or_scan_failures": 1
+    }
+  },
+  "coverage": {
+    "files_scanned": 16275,
+    "bytes_scanned": 367083728,
+    "unparsed_files": 27,
+    "packages_with_unparsed_files": 14,
+    "packages_with_limits": 6,
+    "packages_with_input_incomplete": 0,
+    "packages_without_selected_source": 37
+  },
+  "performance": {
+    "scan_sum_seconds": 5.575924544,
+    "scan_median_ms": 4.505958,
+    "scan_p95_ms": 62.036708,
+    "scan_max_ms": 349.221583,
+    "max_process_rss_bytes": 323747840,
+    "acquire_and_scan_seconds": 70.5501527581946,
+    "inspect_seconds": 110.07211017300142
+  },
+  "interpretation": "Archive screening counts only. Unreviewed labels, code overlap, missing stages and selection bias prevent a malware-recall estimate.",
+  "grouping": "Conservative connected components of metadata groups and matching normalized source files. Normalization ignores comments and literal values; common libraries can overmerge groups. These are not independently attributed campaigns. Reserved archive code was not inspected.",
+  "source_reviews": {
+    "source_reviewed_attack": 9,
+    "source_reviewed_conditional_chain": 1,
+    "source_reviewed_remote_loader": 1,
+    "ambiguous_or_out_of_scope": 2
+  },
+  "controls": {
+    "scanned": 28,
+    "with_critical": 0
+  }
+}

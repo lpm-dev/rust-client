@@ -1,0 +1,17 @@
+{
+  "counts": {
+    "reviews_available": 246,
+    "reviews_with_citations": 109,
+    "citations": 438,
+    "matching_citation_hashes": 438
+  },
+  "destruction_stratum_source_labels": {
+    "destructive_action": 3,
+    "ai_agent_control_hijack": 50,
+    "data_exfiltration": 2,
+    "install_hook_abuse": 2,
+    "malware": 1,
+    "credential_exfiltration": 2
+  },
+  "interpretation": "Source hash correspondence does not validate a malware verdict. Only the 13 listed source reviews were independently adjudicated in this pass."
+}
