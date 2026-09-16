@@ -1,0 +1,2506 @@
+[
+  {
+    "dataset": "expanded",
+    "name": "@babel/standalone",
+    "version": "8.0.5",
+    "baseline": {
+      "tags": [
+        "source.network",
+        "supplyChain.highEntropyStrings",
+        "supplyChain.minified",
+        "supplyChain.possibleObfuscation",
+        "supplyChain.urlStrings"
+      ],
+      "coverage": {
+        "complete": false,
+        "reasons": [
+          "limitReached",
+          "unparsedFiles"
+        ],
+        "files_scanned": 0,
+        "bytes_scanned": 524290
+      }
+    },
+    "candidate": {
+      "tags": [
+        "source.filesystem",
+        "source.network",
+        "supplyChain.highEntropyStrings",
+        "supplyChain.minified",
+        "supplyChain.possibleObfuscation",
+        "supplyChain.urlStrings"
+      ],
+      "coverage": {
+        "complete": false,
+        "reasons": [
+          "limitReached",
+          "unparsedFiles"
+        ],
+        "files_scanned": 1,
+        "bytes_scanned": 2621602
+      }
+    },
+    "removed": [],
+    "added": [
+      "source.filesystem"
+    ],
+    "review": "Full bundle coverage adds a filesystem pattern. This remains a capability heuristic, not proof of host filesystem access.",
+    "evidence": {
+      "added": [
+        {
+          "ruleId": "fs",
+          "path": "babel.min.js",
+          "line": 3,
+          "column": 618631,
+          "excerpt": "n&&(a||(a=this.generateUidIdentifier(e).name),new dE(n,e,a).rename())},a.dump=function(){var e=\"-\".repeat(60);console.log(e);var a=this;do{console.log(\"#\",a.block.type);for(var n=0,t=Object.keys(a.bindings);n<t.length;n++){var r=t[n],i=a.bi",
+          "reason": "Source pattern indicates a capability; execution is not established."
+        }
+      ],
+      "removed": []
+    }
+  },
+  {
+    "dataset": "expanded",
+    "name": "@cloudflare/vite-plugin",
+    "version": "1.54.10",
+    "baseline": {
+      "tags": [
+        "source.childProcess",
+        "source.crypto",
+        "source.dynamicRequire",
+        "source.environmentVars",
+        "source.eval",
+        "source.filesystem",
+        "source.network",
+        "source.shell",
+        "source.webSocket",
+        "supplyChain.highEntropyStrings",
+        "supplyChain.urlStrings"
+      ],
+      "coverage": {
+        "complete": false,
+        "reasons": [
+          "limitReached",
+          "unparsedFiles"
+        ],
+        "files_scanned": 11,
+        "bytes_scanned": 843647
+      }
+    },
+    "candidate": {
+      "tags": [
+        "source.childProcess",
+        "source.crypto",
+        "source.dynamicRequire",
+        "source.environmentVars",
+        "source.eval",
+        "source.filesystem",
+        "source.network",
+        "source.shell",
+        "source.webSocket",
+        "supplyChain.highEntropyStrings",
+        "supplyChain.possibleObfuscation",
+        "supplyChain.urlStrings"
+      ],
+      "coverage": {
+        "complete": true,
+        "reasons": [],
+        "files_scanned": 12,
+        "bytes_scanned": 4058977
+      }
+    },
+    "removed": [],
+    "added": [
+      "supplyChain.possibleObfuscation"
+    ],
+    "review": "Whole-file heuristics add informational possible obfuscation in bundled tooling. No Critical warning.",
+    "evidence": {
+      "added": [
+        {
+          "ruleId": "possible-obfuscation",
+          "path": "dist/index.mjs",
+          "reason": "Multiple obfuscation heuristics exceeded the informational threshold."
+        }
+      ],
+      "removed": []
+    }
+  },
+  {
+    "dataset": "expanded",
+    "name": "@cloudflare/vitest-pool-workers",
+    "version": "0.22.0",
+    "baseline": {
+      "tags": [
+        "source.childProcess",
+        "source.crypto",
+        "source.environmentVars",
+        "source.eval",
+        "source.filesystem",
+        "source.network",
+        "source.shell",
+        "source.webSocket",
+        "supplyChain.highEntropyStrings",
+        "supplyChain.possibleObfuscation",
+        "supplyChain.urlStrings"
+      ],
+      "coverage": {
+        "complete": false,
+        "reasons": [
+          "limitReached",
+          "unparsedFiles"
+        ],
+        "files_scanned": 9,
+        "bytes_scanned": 365898
+      }
+    },
+    "candidate": {
+      "tags": [
+        "source.childProcess",
+        "source.crypto",
+        "source.dynamicRequire",
+        "source.environmentVars",
+        "source.eval",
+        "source.filesystem",
+        "source.network",
+        "source.shell",
+        "supplyChain.highEntropyStrings",
+        "supplyChain.possibleObfuscation",
+        "supplyChain.urlStrings"
+      ],
+      "coverage": {
+        "complete": true,
+        "reasons": [],
+        "files_scanned": 10,
+        "bytes_scanned": 2672295
+      }
+    },
+    "removed": [
+      "source.webSocket"
+    ],
+    "added": [
+      "source.dynamicRequire"
+    ],
+    "review": "The added dynamic load uses createRequire(bindingPath). Removed WebSocket evidence was quoted escaped source in the old sample.",
+    "evidence": {
+      "added": [
+        {
+          "ruleId": "dynamic-require",
+          "path": "dist/pool/index.mjs",
+          "line": 52817,
+          "column": 14,
+          "excerpt": "\tconst mod = createRequire(bindingPath)(bindingPath);\n\treturn (service, account) => new mod.Entry(service, account);\n}\n__name$1(resolveKeyringEntryFactory, \"resolveKeyringEntryFactory\");\nfunction getKeyringAccountName(profile) {\n\treturn res",
+          "reason": "Source pattern indicates a capability; execution is not established."
+        }
+      ],
+      "removed": [
+        {
+          "ruleId": "ws",
+          "path": "dist/pool/index.mjs",
+          "excerpt": "\\n  if (typeof webSocket === \\\"string\\\") {\\n    webSocket = new WebSocket(webSocket);\\n  }\\n  let transport = new WebSocketTransport(webSocket);\\n  let rpc = new RpcSession(transport, localMain, options);\\n  return rpc.getRemoteMain();\\n}\\n",
+          "reason": "Source pattern indicates a capability; execution is not established."
+        }
+      ]
+    }
+  },
+  {
+    "dataset": "expanded",
+    "name": "@codesandbox/sandpack-client",
+    "version": "2.19.8",
+    "baseline": {
+      "tags": [
+        "source.childProcess",
+        "source.crypto",
+        "source.dynamicRequire",
+        "source.environmentVars",
+        "source.eval",
+        "source.filesystem",
+        "source.network",
+        "supplyChain.highEntropyStrings",
+        "supplyChain.minified",
+        "supplyChain.possibleObfuscation",
+        "supplyChain.telemetry",
+        "supplyChain.urlStrings"
+      ],
+      "coverage": {
+        "complete": false,
+        "reasons": [
+          "limitReached",
+          "unparsedFiles"
+        ],
+        "files_scanned": 213,
+        "bytes_scanned": 30094047
+      }
+    },
+    "candidate": {
+      "tags": [
+        "source.crypto",
+        "source.dynamicRequire",
+        "source.environmentVars",
+        "source.eval",
+        "source.filesystem",
+        "source.network",
+        "supplyChain.highEntropyStrings",
+        "supplyChain.minified",
+        "supplyChain.possibleObfuscation",
+        "supplyChain.telemetry",
+        "supplyChain.urlStrings"
+      ],
+      "coverage": {
+        "complete": false,
+        "reasons": [
+          "limitReached",
+          "unparsedFiles"
+        ],
+        "files_scanned": 218,
+        "bytes_scanned": 41169920
+      }
+    },
+    "removed": [
+      "source.childProcess"
+    ],
+    "added": [],
+    "review": "Removed child-process evidence calls a local parameter named exec in an exception probe.",
+    "evidence": {
+      "added": [],
+      "removed": [
+        {
+          "ruleId": "child-process",
+          "path": "sandpack/static/js/eslint.4.1.0.min.js",
+          "excerpt": "_,module,exports){module.exports=function(exec){try{return!!exec()}catch(e){return true}}},{}],35:[function(_dereq_,module,exports){\"use strict\";var hide=_dereq_(40),redefine=_dereq_(87),fails=_dereq_(34),defined=_dereq_(27),wks=_dereq_(117",
+          "reason": "Source pattern indicates a capability; execution is not established."
+        }
+      ]
+    }
+  },
+  {
+    "dataset": "expanded",
+    "name": "@datadog/datadog-ci-plugin-deployment",
+    "version": "5.24.1",
+    "baseline": {
+      "tags": [
+        "source.childProcess",
+        "source.environmentVars",
+        "source.filesystem",
+        "supplyChain.highEntropyStrings"
+      ],
+      "coverage": {
+        "complete": false,
+        "reasons": [
+          "limitReached",
+          "unparsedFiles"
+        ],
+        "files_scanned": 4,
+        "bytes_scanned": 262445
+      }
+    },
+    "candidate": {
+      "tags": [
+        "source.childProcess",
+        "source.crypto",
+        "source.dynamicRequire",
+        "source.environmentVars",
+        "source.filesystem",
+        "source.network",
+        "source.shell",
+        "supplyChain.highEntropyStrings",
+        "supplyChain.urlStrings"
+      ],
+      "coverage": {
+        "complete": true,
+        "reasons": [],
+        "files_scanned": 5,
+        "bytes_scanned": 3398391
+      }
+    },
+    "removed": [],
+    "added": [
+      "source.crypto",
+      "source.dynamicRequire",
+      "source.network",
+      "source.shell",
+      "supplyChain.urlStrings"
+    ],
+    "review": "Full bundle analysis exposes plugin imports, shell helpers, and other listed capability patterns. Some network evidence names a cache fetch method; capabilities do not establish malicious traffic.",
+    "evidence": {
+      "added": [
+        {
+          "ruleId": "crypto",
+          "path": "dist/bundle.js",
+          "line": 21413,
+          "column": 21,
+          "excerpt": "\tconst crypto_1$1 = require(\"crypto\");\n\tconst data_uri_to_buffer_1 = require_node();\n\tconst notmodified_1 = __importDefault(require_notmodified());\n\tconst debug = (0, debug_1.default)(\"get-uri:data\");\n\tvar DataReadable = class extends strea",
+          "reason": "Source pattern indicates a capability; execution is not established."
+        },
+        {
+          "ruleId": "dynamic-require",
+          "path": "dist/bundle.js",
+          "line": 7347,
+          "column": 55,
+          "excerpt": "\t\t\treturn (0, exports.normalizePluginSubmodule)(yield import(submodulePath));\n\t\t}\n\t\tconst pluginPackage = `@datadog/datadog-ci-plugin-${scope}`;\n\t\ttry {\n\t\t\tconst submodule = (_b = require(pluginPackage).commands) === null || _b === void 0 ?",
+          "reason": "Source pattern indicates a capability; execution is not established."
+        },
+        {
+          "ruleId": "network",
+          "path": "dist/bundle.js",
+          "line": 9179,
+          "column": 10,
+          "excerpt": "\t\t\tasync fetch(t, e = {}) {\n\t\t\t\tlet { allowStale: s = this.allowStale, updateAgeOnGet: i = this.updateAgeOnGet, noDeleteOnStaleGet: r = this.noDeleteOnStaleGet, ttl: h = this.ttl, noDisposeOnSet: o = this.noDisposeOnSet, size: a = 0, sizeCa",
+          "reason": "Source pattern indicates a capability; execution is not established."
+        },
+        {
+          "ruleId": "shell",
+          "path": "dist/bundle.js",
+          "line": 7270,
+          "column": 4,
+          "excerpt": "\t\t\t(0, node_child_process_1.exec)(cmd, (error, stdout) => {\n\t\t\t\tif (error) reject(error);\n\t\t\t\telse resolve(stdout);\n\t\t\t});\n\t\t});\n\t\tdebug(\"Output:\", output);\n\t\tconst tempPath = (0, exports.getTempPath)(output, isWindows);\n\t\tconst nodeModules",
+          "reason": "Source pattern indicates a capability; execution is not established."
+        },
+        {
+          "ruleId": "url-strings",
+          "path": "dist/bundle.js",
+          "reason": "Source contains a URL literal."
+        }
+      ],
+      "removed": []
+    }
+  },
+  {
+    "dataset": "expanded",
+    "name": "@datadog/datadog-ci-plugin-dora",
+    "version": "5.24.1",
+    "baseline": {
+      "tags": [
+        "source.childProcess",
+        "source.crypto",
+        "source.environmentVars",
+        "source.filesystem",
+        "source.network",
+        "supplyChain.highEntropyStrings",
+        "supplyChain.urlStrings"
+      ],
+      "coverage": {
+        "complete": false,
+        "reasons": [
+          "limitReached",
+          "unparsedFiles"
+        ],
+        "files_scanned": 1,
+        "bytes_scanned": 262222
+      }
+    },
+    "candidate": {
+      "tags": [
+        "source.childProcess",
+        "source.crypto",
+        "source.dynamicRequire",
+        "source.environmentVars",
+        "source.filesystem",
+        "source.network",
+        "source.shell",
+        "supplyChain.highEntropyStrings",
+        "supplyChain.urlStrings"
+      ],
+      "coverage": {
+        "complete": true,
+        "reasons": [],
+        "files_scanned": 2,
+        "bytes_scanned": 3031956
+      }
+    },
+    "removed": [],
+    "added": [
+      "source.dynamicRequire",
+      "source.shell"
+    ],
+    "review": "Full bundle analysis exposes plugin imports, shell helpers, and other listed capability patterns. Some network evidence names a cache fetch method; capabilities do not establish malicious traffic.",
+    "evidence": {
+      "added": [
+        {
+          "ruleId": "dynamic-require",
+          "path": "dist/bundle.js",
+          "line": 7345,
+          "column": 55,
+          "excerpt": "\t\t\treturn (0, exports.normalizePluginSubmodule)(yield import(submodulePath));\n\t\t}\n\t\tconst pluginPackage = `@datadog/datadog-ci-plugin-${scope}`;\n\t\ttry {\n\t\t\tconst submodule = (_b = require(pluginPackage).commands) === null || _b === void 0 ?",
+          "reason": "Source pattern indicates a capability; execution is not established."
+        },
+        {
+          "ruleId": "shell",
+          "path": "dist/bundle.js",
+          "line": 7268,
+          "column": 4,
+          "excerpt": "\t\t\t(0, node_child_process_1.exec)(cmd, (error, stdout) => {\n\t\t\t\tif (error) reject(error);\n\t\t\t\telse resolve(stdout);\n\t\t\t});\n\t\t});\n\t\tdebug(\"Output:\", output);\n\t\tconst tempPath = (0, exports.getTempPath)(output, isWindows);\n\t\tconst nodeModules",
+          "reason": "Source pattern indicates a capability; execution is not established."
+        }
+      ],
+      "removed": []
+    }
+  },
+  {
+    "dataset": "expanded",
+    "name": "@datadog/datadog-ci-plugin-gate",
+    "version": "5.24.1",
+    "baseline": {
+      "tags": [
+        "source.childProcess",
+        "source.crypto",
+        "source.environmentVars",
+        "source.filesystem",
+        "supplyChain.highEntropyStrings",
+        "supplyChain.urlStrings"
+      ],
+      "coverage": {
+        "complete": false,
+        "reasons": [
+          "limitReached",
+          "unparsedFiles"
+        ],
+        "files_scanned": 1,
+        "bytes_scanned": 262220
+      }
+    },
+    "candidate": {
+      "tags": [
+        "source.childProcess",
+        "source.crypto",
+        "source.dynamicRequire",
+        "source.environmentVars",
+        "source.filesystem",
+        "source.network",
+        "source.shell",
+        "supplyChain.highEntropyStrings",
+        "supplyChain.urlStrings"
+      ],
+      "coverage": {
+        "complete": true,
+        "reasons": [],
+        "files_scanned": 2,
+        "bytes_scanned": 3265368
+      }
+    },
+    "removed": [],
+    "added": [
+      "source.dynamicRequire",
+      "source.network",
+      "source.shell"
+    ],
+    "review": "Full bundle analysis exposes plugin imports, shell helpers, and other listed capability patterns. Some network evidence names a cache fetch method; capabilities do not establish malicious traffic.",
+    "evidence": {
+      "added": [
+        {
+          "ruleId": "dynamic-require",
+          "path": "dist/bundle.js",
+          "line": 7344,
+          "column": 55,
+          "excerpt": "\t\t\treturn (0, exports.normalizePluginSubmodule)(yield import(submodulePath));\n\t\t}\n\t\tconst pluginPackage = `@datadog/datadog-ci-plugin-${scope}`;\n\t\ttry {\n\t\t\tconst submodule = (_b = require(pluginPackage).commands) === null || _b === void 0 ?",
+          "reason": "Source pattern indicates a capability; execution is not established."
+        },
+        {
+          "ruleId": "network",
+          "path": "dist/bundle.js",
+          "line": 9266,
+          "column": 10,
+          "excerpt": "\t\t\tasync fetch(t, e = {}) {\n\t\t\t\tlet { allowStale: s = this.allowStale, updateAgeOnGet: i = this.updateAgeOnGet, noDeleteOnStaleGet: r = this.noDeleteOnStaleGet, ttl: h = this.ttl, noDisposeOnSet: o = this.noDisposeOnSet, size: a = 0, sizeCa",
+          "reason": "Source pattern indicates a capability; execution is not established."
+        },
+        {
+          "ruleId": "shell",
+          "path": "dist/bundle.js",
+          "line": 7267,
+          "column": 4,
+          "excerpt": "\t\t\t(0, node_child_process_1.exec)(cmd, (error, stdout) => {\n\t\t\t\tif (error) reject(error);\n\t\t\t\telse resolve(stdout);\n\t\t\t});\n\t\t});\n\t\tdebug(\"Output:\", output);\n\t\tconst tempPath = (0, exports.getTempPath)(output, isWindows);\n\t\tconst nodeModules",
+          "reason": "Source pattern indicates a capability; execution is not established."
+        }
+      ],
+      "removed": []
+    }
+  },
+  {
+    "dataset": "expanded",
+    "name": "@datadog/datadog-ci-plugin-junit",
+    "version": "5.24.1",
+    "baseline": {
+      "tags": [
+        "source.childProcess",
+        "source.crypto",
+        "source.environmentVars",
+        "source.filesystem",
+        "supplyChain.highEntropyStrings"
+      ],
+      "coverage": {
+        "complete": false,
+        "reasons": [
+          "limitReached",
+          "unparsedFiles"
+        ],
+        "files_scanned": 1,
+        "bytes_scanned": 262218
+      }
+    },
+    "candidate": {
+      "tags": [
+        "source.childProcess",
+        "source.crypto",
+        "source.dynamicRequire",
+        "source.environmentVars",
+        "source.eval",
+        "source.filesystem",
+        "source.network",
+        "source.shell",
+        "supplyChain.highEntropyStrings",
+        "supplyChain.urlStrings"
+      ],
+      "coverage": {
+        "complete": true,
+        "reasons": [],
+        "files_scanned": 2,
+        "bytes_scanned": 3711379
+      }
+    },
+    "removed": [],
+    "added": [
+      "source.dynamicRequire",
+      "source.eval",
+      "source.network",
+      "source.shell",
+      "supplyChain.urlStrings"
+    ],
+    "review": "Full bundle analysis exposes plugin imports, shell helpers, and other listed capability patterns. Some network evidence names a cache fetch method; capabilities do not establish malicious traffic.",
+    "evidence": {
+      "added": [
+        {
+          "ruleId": "dynamic-require",
+          "path": "dist/bundle.js",
+          "line": 77707,
+          "column": 55,
+          "excerpt": "\t\t\treturn (0, exports.normalizePluginSubmodule)(yield import(submodulePath));\n\t\t}\n\t\tconst pluginPackage = `@datadog/datadog-ci-plugin-${scope}`;\n\t\ttry {\n\t\t\tconst submodule = (_b = require(pluginPackage).commands) === null || _b === void 0 ?",
+          "reason": "Source pattern indicates a capability; execution is not established."
+        },
+        {
+          "ruleId": "eval",
+          "path": "dist/bundle.js",
+          "line": 73352,
+          "column": 11,
+          "excerpt": "\t\tbound = Function(\"binder\", \"return function (\" + joiny(boundArgs, \",\") + \"){ return binder.apply(this,arguments); }\")(binder);\n\t\tif (target.prototype) {\n\t\t\tvar Empty = function Empty() {};\n\t\t\tEmpty.prototype = target.prototype;\n\t\t\tbound.p",
+          "reason": "Source pattern indicates a capability; execution is not established."
+        },
+        {
+          "ruleId": "network",
+          "path": "dist/bundle.js",
+          "line": 8821,
+          "column": 10,
+          "excerpt": "\t\t\tasync fetch(t, e = {}) {\n\t\t\t\tlet { allowStale: s = this.allowStale, updateAgeOnGet: i = this.updateAgeOnGet, noDeleteOnStaleGet: r = this.noDeleteOnStaleGet, ttl: h = this.ttl, noDisposeOnSet: o = this.noDisposeOnSet, size: a = 0, sizeCa",
+          "reason": "Source pattern indicates a capability; execution is not established."
+        },
+        {
+          "ruleId": "shell",
+          "path": "dist/bundle.js",
+          "line": 63648,
+          "column": 19,
+          "excerpt": "\tconst execProc = (0, util_1.promisify)(child_process_1$1.exec);\n\tconst execute = (cmd, cwd) => execProc(cmd, {\n\t\tcwd,\n\t\tmaxBuffer: 5 * 1024 * 5e3\n\t});\n\texports.execute = execute;\n\tconst getGitHubEventPayload = () => {\n\t\tif (!process.env.GI",
+          "reason": "Source pattern indicates a capability; execution is not established."
+        },
+        {
+          "ruleId": "url-strings",
+          "path": "dist/bundle.js",
+          "reason": "Source contains a URL literal."
+        }
+      ],
+      "removed": []
+    }
+  },
+  {
+    "dataset": "expanded",
+    "name": "@datadog/datadog-ci-plugin-sarif",
+    "version": "5.24.1",
+    "baseline": {
+      "tags": [
+        "source.childProcess",
+        "source.crypto",
+        "source.environmentVars",
+        "source.filesystem",
+        "supplyChain.highEntropyStrings",
+        "supplyChain.telemetry",
+        "supplyChain.urlStrings"
+      ],
+      "coverage": {
+        "complete": false,
+        "reasons": [
+          "limitReached",
+          "unparsedFiles"
+        ],
+        "files_scanned": 1,
+        "bytes_scanned": 262218
+      }
+    },
+    "candidate": {
+      "tags": [
+        "source.childProcess",
+        "source.crypto",
+        "source.dynamicRequire",
+        "source.environmentVars",
+        "source.eval",
+        "source.filesystem",
+        "source.network",
+        "source.shell",
+        "supplyChain.highEntropyStrings",
+        "supplyChain.telemetry",
+        "supplyChain.urlStrings"
+      ],
+      "coverage": {
+        "complete": true,
+        "reasons": [],
+        "files_scanned": 2,
+        "bytes_scanned": 3848537
+      }
+    },
+    "removed": [],
+    "added": [
+      "source.dynamicRequire",
+      "source.eval",
+      "source.network",
+      "source.shell"
+    ],
+    "review": "Full bundle analysis exposes plugin imports, shell helpers, and other listed capability patterns. Some network evidence names a cache fetch method; capabilities do not establish malicious traffic.",
+    "evidence": {
+      "added": [
+        {
+          "ruleId": "dynamic-require",
+          "path": "dist/bundle.js",
+          "line": 7348,
+          "column": 55,
+          "excerpt": "\t\t\treturn (0, exports.normalizePluginSubmodule)(yield import(submodulePath));\n\t\t}\n\t\tconst pluginPackage = `@datadog/datadog-ci-plugin-${scope}`;\n\t\ttry {\n\t\t\tconst submodule = (_b = require(pluginPackage).commands) === null || _b === void 0 ?",
+          "reason": "Source pattern indicates a capability; execution is not established."
+        },
+        {
+          "ruleId": "eval",
+          "path": "dist/bundle.js",
+          "line": 75099,
+          "column": 11,
+          "excerpt": "\t\tbound = Function(\"binder\", \"return function (\" + joiny(boundArgs, \",\") + \"){ return binder.apply(this,arguments); }\")(binder);\n\t\tif (target.prototype) {\n\t\t\tvar Empty = function Empty() {};\n\t\t\tEmpty.prototype = target.prototype;\n\t\t\tbound.p",
+          "reason": "Source pattern indicates a capability; execution is not established."
+        },
+        {
+          "ruleId": "network",
+          "path": "dist/bundle.js",
+          "line": 9234,
+          "column": 10,
+          "excerpt": "\t\t\tasync fetch(t, e = {}) {\n\t\t\t\tlet { allowStale: s = this.allowStale, updateAgeOnGet: i = this.updateAgeOnGet, noDeleteOnStaleGet: r = this.noDeleteOnStaleGet, ttl: h = this.ttl, noDisposeOnSet: o = this.noDisposeOnSet, size: a = 0, sizeCa",
+          "reason": "Source pattern indicates a capability; execution is not established."
+        },
+        {
+          "ruleId": "shell",
+          "path": "dist/bundle.js",
+          "line": 7271,
+          "column": 4,
+          "excerpt": "\t\t\t(0, node_child_process_1.exec)(cmd, (error, stdout) => {\n\t\t\t\tif (error) reject(error);\n\t\t\t\telse resolve(stdout);\n\t\t\t});\n\t\t});\n\t\tdebug(\"Output:\", output);\n\t\tconst tempPath = (0, exports.getTempPath)(output, isWindows);\n\t\tconst nodeModules",
+          "reason": "Source pattern indicates a capability; execution is not established."
+        }
+      ],
+      "removed": []
+    }
+  },
+  {
+    "dataset": "expanded",
+    "name": "@datadog/datadog-ci-plugin-sbom",
+    "version": "5.24.1",
+    "baseline": {
+      "tags": [
+        "source.childProcess",
+        "source.crypto",
+        "source.environmentVars",
+        "source.filesystem",
+        "supplyChain.highEntropyStrings",
+        "supplyChain.urlStrings"
+      ],
+      "coverage": {
+        "complete": false,
+        "reasons": [
+          "limitReached",
+          "unparsedFiles"
+        ],
+        "files_scanned": 1,
+        "bytes_scanned": 262218
+      }
+    },
+    "candidate": {
+      "tags": [
+        "source.childProcess",
+        "source.crypto",
+        "source.dynamicRequire",
+        "source.environmentVars",
+        "source.eval",
+        "source.filesystem",
+        "source.network",
+        "source.shell",
+        "supplyChain.highEntropyStrings",
+        "supplyChain.urlStrings"
+      ],
+      "coverage": {
+        "complete": true,
+        "reasons": [],
+        "files_scanned": 2,
+        "bytes_scanned": 3978363
+      }
+    },
+    "removed": [],
+    "added": [
+      "source.dynamicRequire",
+      "source.eval",
+      "source.network",
+      "source.shell"
+    ],
+    "review": "Full bundle analysis exposes plugin imports, shell helpers, and other listed capability patterns. Some network evidence names a cache fetch method; capabilities do not establish malicious traffic.",
+    "evidence": {
+      "added": [
+        {
+          "ruleId": "dynamic-require",
+          "path": "dist/bundle.js",
+          "line": 7351,
+          "column": 55,
+          "excerpt": "\t\t\treturn (0, exports.normalizePluginSubmodule)(yield import(submodulePath));\n\t\t}\n\t\tconst pluginPackage = `@datadog/datadog-ci-plugin-${scope}`;\n\t\ttry {\n\t\t\tconst submodule = (_b = require(pluginPackage).commands) === null || _b === void 0 ?",
+          "reason": "Source pattern indicates a capability; execution is not established."
+        },
+        {
+          "ruleId": "eval",
+          "path": "dist/bundle.js",
+          "line": 69689,
+          "column": 21,
+          "excerpt": "\t\t\tconst validate = new Function(`${names_1.default.self}`, `${names_1.default.scope}`, sourceCode)(this, this.scope.get());\n\t\t\tthis.scope.value(validateName, { ref: validate });\n\t\t\tvalidate.errors = null;\n\t\t\tvalidate.schema = sch.schema;\n\t",
+          "reason": "Source pattern indicates a capability; execution is not established."
+        },
+        {
+          "ruleId": "network",
+          "path": "dist/bundle.js",
+          "line": 25304,
+          "column": 11,
+          "excerpt": "\tfunction fetch(input, init = void 0) {\n\t\twebidl.argumentLengthCheck(arguments, 1, \"globalThis.fetch\");\n\t\tlet p = createDeferredPromise();\n\t\tlet requestObject;\n\t\ttry {\n\t\t\trequestObject = new Request(input, init);\n\t\t} catch (e) {\n\t\t\tp.reject",
+          "reason": "Source pattern indicates a capability; execution is not established."
+        },
+        {
+          "ruleId": "shell",
+          "path": "dist/bundle.js",
+          "line": 7274,
+          "column": 4,
+          "excerpt": "\t\t\t(0, node_child_process_1.exec)(cmd, (error, stdout) => {\n\t\t\t\tif (error) reject(error);\n\t\t\t\telse resolve(stdout);\n\t\t\t});\n\t\t});\n\t\tdebug(\"Output:\", output);\n\t\tconst tempPath = (0, exports.getTempPath)(output, isWindows);\n\t\tconst nodeModules",
+          "reason": "Source pattern indicates a capability; execution is not established."
+        }
+      ],
+      "removed": []
+    }
+  },
+  {
+    "dataset": "expanded",
+    "name": "@linear/sdk",
+    "version": "95.0.0",
+    "baseline": {
+      "tags": [
+        "source.crypto",
+        "source.environmentVars",
+        "source.network",
+        "supplyChain.highEntropyStrings",
+        "supplyChain.urlStrings"
+      ],
+      "coverage": {
+        "complete": false,
+        "reasons": [
+          "limitReached",
+          "unparsedFiles"
+        ],
+        "files_scanned": 5,
+        "bytes_scanned": 544561
+      }
+    },
+    "candidate": {
+      "tags": [
+        "source.crypto",
+        "source.environmentVars",
+        "source.network",
+        "supplyChain.urlStrings"
+      ],
+      "coverage": {
+        "complete": true,
+        "reasons": [],
+        "files_scanned": 7,
+        "bytes_scanned": 6406429
+      }
+    },
+    "removed": [
+      "supplyChain.highEntropyStrings"
+    ],
+    "added": [],
+    "review": "Whole-file parsing and string statistics remove the high-entropy trait from generated SDK source. This does not prove the absence of encoded data.",
+    "evidence": {
+      "added": [],
+      "removed": [
+        {
+          "ruleId": "high-entropy",
+          "path": "dist/index.cjs",
+          "reason": "A long string exceeded the entropy threshold after known data exclusions."
+        },
+        {
+          "ruleId": "high-entropy",
+          "path": "dist/index.mjs",
+          "reason": "A long string exceeded the entropy threshold after known data exclusions."
+        }
+      ]
+    }
+  },
+  {
+    "dataset": "expanded",
+    "name": "@storybook/mdx2-csf",
+    "version": "1.1.0",
+    "baseline": {
+      "tags": [
+        "supplyChain.highEntropyStrings",
+        "supplyChain.urlStrings"
+      ],
+      "coverage": {
+        "complete": false,
+        "reasons": [
+          "limitReached",
+          "unparsedFiles"
+        ],
+        "files_scanned": 2,
+        "bytes_scanned": 525498
+      }
+    },
+    "candidate": {
+      "tags": [
+        "source.dynamicRequire",
+        "source.environmentVars",
+        "source.eval",
+        "source.filesystem",
+        "supplyChain.highEntropyStrings",
+        "supplyChain.urlStrings"
+      ],
+      "coverage": {
+        "complete": true,
+        "reasons": [],
+        "files_scanned": 4,
+        "bytes_scanned": 7222238
+      }
+    },
+    "removed": [],
+    "added": [
+      "source.dynamicRequire",
+      "source.environmentVars",
+      "source.eval",
+      "source.filesystem"
+    ],
+    "review": "Added capabilities cover bundled Babel configuration loading, process.env checks, filesystem imports, and Function-based global discovery.",
+    "evidence": {
+      "added": [
+        {
+          "ruleId": "dynamic-require",
+          "path": "dist/index.js",
+          "line": 63987,
+          "column": 23,
+          "excerpt": "        var queries = require(require.resolve(name2, { paths: [\".\", ctx.path] }));\n        if (queries) {\n          if (Array.isArray(queries)) {\n            return queries;\n          } else if (typeof queries === \"object\") {\n            if",
+          "reason": "Source pattern indicates a capability; execution is not established."
+        },
+        {
+          "ruleId": "dynamic-require",
+          "path": "dist/index.mjs",
+          "line": 71947,
+          "column": 14,
+          "excerpt": "      return import(filepath);\n    };\n  }\n});\n\n                                                     \nvar require_package2 = __commonJS({\n  \"node_modules/@babel/preset-typescript/package.json\"(exports, module) {\n    module.exports = {\n      ",
+          "reason": "Source pattern indicates a capability; execution is not established."
+        },
+        {
+          "ruleId": "env",
+          "path": "dist/index.js",
+          "line": 12508,
+          "column": 15,
+          "excerpt": "          if (process.env.BABEL_TYPES_8_BREAKING)\n            (0, _validate.validateChild)(node2, subkey, v);\n        }\n      }\n      validator.each = callback;\n      return validator;\n    }\n    function assertOneOf(...values) {\n      funct",
+          "reason": "Source pattern indicates a capability; execution is not established."
+        },
+        {
+          "ruleId": "env",
+          "path": "dist/index.mjs",
+          "line": 12517,
+          "column": 15,
+          "excerpt": "          if (process.env.BABEL_TYPES_8_BREAKING)\n            (0, _validate.validateChild)(node2, subkey, v);\n        }\n      }\n      validator.each = callback;\n      return validator;\n    }\n    function assertOneOf(...values) {\n      funct",
+          "reason": "Source pattern indicates a capability; execution is not established."
+        },
+        {
+          "ruleId": "eval",
+          "path": "dist/index.js",
+          "line": 28039,
+          "column": 43,
+          "excerpt": "    var root4 = freeGlobal || freeSelf || Function(\"return this\")();\n    module2.exports = root4;\n  }\n});\n\n                                 \nvar require_Symbol = __commonJS({\n  \"node_modules/lodash/_Symbol.js\"(exports, module2) {\n    var ro",
+          "reason": "Source pattern indicates a capability; execution is not established."
+        },
+        {
+          "ruleId": "eval",
+          "path": "dist/index.mjs",
+          "line": 28048,
+          "column": 43,
+          "excerpt": "    var root4 = freeGlobal || freeSelf || Function(\"return this\")();\n    module.exports = root4;\n  }\n});\n\n                                 \nvar require_Symbol = __commonJS({\n  \"node_modules/lodash/_Symbol.js\"(exports, module) {\n    var root",
+          "reason": "Source pattern indicates a capability; execution is not established."
+        },
+        {
+          "ruleId": "fs",
+          "path": "dist/index.js",
+          "line": 61882,
+          "column": 21,
+          "excerpt": "      const data3 = require(\"fs\");\n      _fs = function() {\n        return data3;\n      };\n      return data3;\n    }\n    function _gensync() {\n      const data3 = require_gensync();\n      _gensync = function() {\n        return data3;\n      ",
+          "reason": "Source pattern indicates a capability; execution is not established."
+        },
+        {
+          "ruleId": "fs",
+          "path": "dist/index.mjs",
+          "line": 30884,
+          "column": 7,
+          "excerpt": "      rename() {\n        const {\n          binding,\n          oldName,\n          newName\n        } = this;\n        const {\n          scope,\n          path\n        } = binding;\n        const parentDeclar = path.find((path2) => path2.isDeclar",
+          "reason": "Source pattern indicates a capability; execution is not established."
+        }
+      ],
+      "removed": []
+    }
+  },
+  {
+    "dataset": "expanded",
+    "name": "@ts-morph/common",
+    "version": "0.29.0",
+    "baseline": {
+      "tags": [
+        "source.filesystem",
+        "supplyChain.highEntropyStrings",
+        "supplyChain.urlStrings"
+      ],
+      "coverage": {
+        "complete": false,
+        "reasons": [
+          "limitReached",
+          "unparsedFiles"
+        ],
+        "files_scanned": 0,
+        "bytes_scanned": 524290
+      }
+    },
+    "candidate": {
+      "tags": [
+        "source.filesystem",
+        "supplyChain.highEntropyStrings",
+        "supplyChain.minified",
+        "supplyChain.telemetry",
+        "supplyChain.urlStrings"
+      ],
+      "coverage": {
+        "complete": false,
+        "reasons": [
+          "limitReached",
+          "unparsedFiles"
+        ],
+        "files_scanned": 1,
+        "bytes_scanned": 3278648
+      }
+    },
+    "removed": [],
+    "added": [
+      "supplyChain.minified",
+      "supplyChain.telemetry"
+    ],
+    "review": "Whole-file layout and embedded DOM documentation add informational minification and telemetry patterns. The quoted sendBeacon text does not prove telemetry execution.",
+    "evidence": {
+      "added": [
+        {
+          "ruleId": "minified",
+          "path": "dist/ts-morph-common.js",
+          "reason": "Filename or source layout indicates minified code."
+        },
+        {
+          "ruleId": "telemetry",
+          "path": "dist/ts-morph-common.js",
+          "line": 863,
+          "column": 332914,
+          "excerpt": "ich can be sent using the fetch(), XMLHttpRequest.send() or navigator.sendBeacon() methods. It uses the same format a form would use if the encoding type were set to \\\"multipart/form-data\\\".\\n *\\n * [MDN Reference](https://developer.mozilla",
+          "reason": "Source contains a telemetry SDK or tracking API pattern."
+        }
+      ],
+      "removed": []
+    }
+  },
+  {
+    "dataset": "expanded",
+    "name": "@turbo/gen",
+    "version": "2.10.13",
+    "baseline": {
+      "tags": [
+        "source.crypto",
+        "source.dynamicRequire",
+        "source.environmentVars",
+        "source.filesystem",
+        "supplyChain.highEntropyStrings",
+        "supplyChain.minified",
+        "supplyChain.possibleObfuscation",
+        "supplyChain.urlStrings"
+      ],
+      "coverage": {
+        "complete": false,
+        "reasons": [
+          "limitReached",
+          "unparsedFiles"
+        ],
+        "files_scanned": 7,
+        "bytes_scanned": 755694
+      }
+    },
+    "candidate": {
+      "tags": [
+        "source.childProcess",
+        "source.crypto",
+        "source.dynamicRequire",
+        "source.environmentVars",
+        "source.eval",
+        "source.filesystem",
+        "source.network",
+        "supplyChain.highEntropyStrings",
+        "supplyChain.minified",
+        "supplyChain.possibleObfuscation",
+        "supplyChain.urlStrings"
+      ],
+      "coverage": {
+        "complete": true,
+        "reasons": [],
+        "files_scanned": 8,
+        "bytes_scanned": 2933885
+      }
+    },
+    "removed": [],
+    "added": [
+      "source.childProcess",
+      "source.eval",
+      "source.network"
+    ],
+    "review": "Added evidence includes a child_process import, a regenerator runtime Function call, and a fetch wrapper.",
+    "evidence": {
+      "added": [
+        {
+          "ruleId": "child-process",
+          "path": "dist/cli.js",
+          "line": 2,
+          "column": 188,
+          "excerpt": "e(`node:https`)),i=e.__toESM(require(`events`)),a=e.__toESM(require(`child_process`)),o=e.__toESM(require(`path`)),s=e.__toESM(require(`fs`)),c=e.__toESM(require(`node:fs`)),l=e.__toESM(require(`node:path`)),u=e.__toESM(require(`assert`)),d",
+          "reason": "Source pattern indicates a capability; execution is not established."
+        },
+        {
+          "ruleId": "eval",
+          "path": "dist/cli.js",
+          "line": 17,
+          "column": 5389,
+          "excerpt": "typeof globalThis==`object`?globalThis.regeneratorRuntime=n:Function(`r`,`regeneratorRuntime = r`)(n)}}),ue=e.__commonJSMin((exports,t)=>{function n(e,t,n,r,i,a,o){try{var s=e[a](o),c=s.value}catch(e){return void n(e)}s.done?t(c):Promise.re",
+          "reason": "Source pattern indicates a capability; execution is not established."
+        },
+        {
+          "ruleId": "network",
+          "path": "dist/cli.js",
+          "line": 116,
+          "column": 114258,
+          "excerpt": "Controller,i=setTimeout(()=>{r.abort()},n);try{return await fetch(e,{...Nh(e,t),signal:r.signal})}finally{clearTimeout(i)}}async function Fh(e){try{let t=await Ph(e,{method:`HEAD`});return!t.ok&&Dh()&&(t.status===401||t.status===403)&&Ia(`G",
+          "reason": "Source pattern indicates a capability; execution is not established."
+        }
+      ],
+      "removed": []
+    }
+  },
+  {
+    "dataset": "expanded",
+    "name": "ag-charts-community",
+    "version": "14.2.0",
+    "baseline": {
+      "tags": [
+        "source.dynamicRequire",
+        "source.filesystem",
+        "source.network",
+        "supplyChain.highEntropyStrings",
+        "supplyChain.minified",
+        "supplyChain.urlStrings"
+      ],
+      "coverage": {
+        "complete": false,
+        "reasons": [
+          "limitReached",
+          "unparsedFiles"
+        ],
+        "files_scanned": 7,
+        "bytes_scanned": 5812021
+      }
+    },
+    "candidate": {
+      "tags": [
+        "source.network",
+        "supplyChain.highEntropyStrings",
+        "supplyChain.minified",
+        "supplyChain.urlStrings"
+      ],
+      "coverage": {
+        "complete": true,
+        "reasons": [],
+        "files_scanned": 10,
+        "bytes_scanned": 13254568
+      }
+    },
+    "removed": [
+      "source.dynamicRequire",
+      "source.filesystem"
+    ],
+    "added": [],
+    "review": "Removed dynamic require evidence is a local function that throws. The filesystem sample matched documentation/property access without filesystem evidence.",
+    "evidence": {
+      "added": [],
+      "removed": [
+        {
+          "ruleId": "dynamic-require",
+          "path": "dist/umd/ag-charts-community.js",
+          "excerpt": "    function require(name) {\n        \n        throw new Error('Unknown module: ' + name);\n    }\n}\n        \n\"use strict\";\nvar __defProp = Object.defineProperty;\nvar __getOwnPropDesc = Object.getOwnPropertyDescriptor;\nvar __getOwnPropNames = ",
+          "reason": "Source pattern indicates a capability; execution is not established."
+        },
+        {
+          "ruleId": "fs",
+          "path": "dist/umd/ag-charts-community.js",
+          "excerpt": "   * All property access (domain, range, etc.) will be delegated to the source.\n   */\n  setSourceScale(scale2) {\n    this._sourceScale = scale2;\n    const delegateProperty = (prop) => {\n      Object.defineProperty(this, prop, {\n        get:",
+          "reason": "Source pattern indicates a capability; execution is not established."
+        }
+      ]
+    }
+  },
+  {
+    "dataset": "expanded",
+    "name": "ag-grid-community",
+    "version": "36.2.0",
+    "baseline": {
+      "tags": [
+        "source.dynamicRequire",
+        "source.eval",
+        "supplyChain.highEntropyStrings",
+        "supplyChain.minified",
+        "supplyChain.urlStrings"
+      ],
+      "coverage": {
+        "complete": false,
+        "reasons": [
+          "limitReached",
+          "unparsedFiles"
+        ],
+        "files_scanned": 4,
+        "bytes_scanned": 7275605
+      }
+    },
+    "candidate": {
+      "tags": [
+        "source.eval",
+        "supplyChain.highEntropyStrings",
+        "supplyChain.minified",
+        "supplyChain.urlStrings"
+      ],
+      "coverage": {
+        "complete": true,
+        "reasons": [],
+        "files_scanned": 8,
+        "bytes_scanned": 17033562
+      }
+    },
+    "removed": [
+      "source.dynamicRequire"
+    ],
+    "added": [],
+    "review": "Removed dynamic require evidence is a local function that throws Unknown module.",
+    "evidence": {
+      "added": [],
+      "removed": [
+        {
+          "ruleId": "dynamic-require",
+          "path": "dist/ag-grid-community.js",
+          "excerpt": "    function require(name) {\n        \n        throw new Error('Unknown module: ' + name);\n    }\n}\n        \nvar __defProp = Object.defineProperty;\nvar __getOwnPropDesc = Object.getOwnPropertyDescriptor;\nvar __getOwnPropNames = Object.getOwnP",
+          "reason": "Source pattern indicates a capability; execution is not established."
+        },
+        {
+          "ruleId": "dynamic-require",
+          "path": "dist/ag-grid-community.noStyle.js",
+          "excerpt": "    function require(name) {\n        \n        throw new Error('Unknown module: ' + name);\n    }\n}\n        \nvar __defProp = Object.defineProperty;\nvar __getOwnPropDesc = Object.getOwnPropertyDescriptor;\nvar __getOwnPropNames = Object.getOwnP",
+          "reason": "Source pattern indicates a capability; execution is not established."
+        }
+      ]
+    }
+  },
+  {
+    "dataset": "expanded",
+    "name": "ag-grid-enterprise",
+    "version": "36.2.0",
+    "baseline": {
+      "tags": [
+        "source.dynamicRequire",
+        "supplyChain.highEntropyStrings",
+        "supplyChain.minified",
+        "supplyChain.possibleObfuscation",
+        "supplyChain.urlStrings"
+      ],
+      "coverage": {
+        "complete": false,
+        "reasons": [
+          "limitReached",
+          "unparsedFiles"
+        ],
+        "files_scanned": 2,
+        "bytes_scanned": 4748818
+      }
+    },
+    "candidate": {
+      "tags": [
+        "source.dynamicRequire",
+        "source.eval",
+        "supplyChain.highEntropyStrings",
+        "supplyChain.minified",
+        "supplyChain.possibleObfuscation",
+        "supplyChain.urlStrings"
+      ],
+      "coverage": {
+        "complete": false,
+        "reasons": [
+          "limitReached",
+          "unparsedFiles"
+        ],
+        "files_scanned": 6,
+        "bytes_scanned": 16085265
+      }
+    },
+    "removed": [],
+    "added": [
+      "source.eval"
+    ],
+    "review": "The added evaluator constructs a function for grid expressions. It remains a capability.",
+    "evidence": {
+      "added": [
+        {
+          "ruleId": "eval",
+          "path": "dist/ag-grid-enterprise.min.js",
+          "line": 14861,
+          "column": 148746,
+          "excerpt": "he;if(t[e])return t[e];const r=this.createFunctionBody(e),a=new Function(\"x, ctx, oldValue, newValue, value, node, data, colDef, rowIndex, api, getValue, column, columnGroup\",r);return t[e]=a,a}createFunctionBody(e){return e.includes(\"retur",
+          "reason": "Source pattern indicates a capability; execution is not established."
+        },
+        {
+          "ruleId": "eval",
+          "path": "dist/ag-grid-enterprise.min.noStyle.js",
+          "line": 22,
+          "column": 148746,
+          "excerpt": "he;if(t[e])return t[e];const s=this.createFunctionBody(e),i=new Function(\"x, ctx, oldValue, newValue, value, node, data, colDef, rowIndex, api, getValue, column, columnGroup\",s);return t[e]=i,i}createFunctionBody(e){return e.includes(\"retur",
+          "reason": "Source pattern indicates a capability; execution is not established."
+        }
+      ],
+      "removed": []
+    }
+  },
+  {
+    "dataset": "expanded",
+    "name": "aws-sdk",
+    "version": "2.1693.0",
+    "baseline": {
+      "tags": [
+        "manifest.wildcardDependency",
+        "source.childProcess",
+        "source.crypto",
+        "source.environmentVars",
+        "source.eval",
+        "source.filesystem",
+        "source.network",
+        "source.shell",
+        "supplyChain.highEntropyStrings",
+        "supplyChain.minified",
+        "supplyChain.possibleObfuscation",
+        "supplyChain.urlStrings"
+      ],
+      "coverage": {
+        "complete": false,
+        "reasons": [
+          "limitReached",
+          "unparsedFiles"
+        ],
+        "files_scanned": 560,
+        "bytes_scanned": 2740602
+      }
+    },
+    "candidate": {
+      "tags": [
+        "manifest.wildcardDependency",
+        "source.childProcess",
+        "source.crypto",
+        "source.dynamicRequire",
+        "source.environmentVars",
+        "source.eval",
+        "source.filesystem",
+        "source.network",
+        "source.shell",
+        "supplyChain.highEntropyStrings",
+        "supplyChain.minified",
+        "supplyChain.possibleObfuscation",
+        "supplyChain.urlStrings"
+      ],
+      "coverage": {
+        "complete": false,
+        "reasons": [
+          "limitReached",
+          "unparsedFiles"
+        ],
+        "files_scanned": 561,
+        "bytes_scanned": 5878947
+      }
+    },
+    "removed": [],
+    "added": [
+      "source.dynamicRequire"
+    ],
+    "review": "The added dynamic load is in the bundled module loader fallback.",
+    "evidence": {
+      "added": [
+        {
+          "ruleId": "dynamic-require",
+          "path": "dist/aws-sdk.min.js",
+          "line": 4,
+          "column": 125,
+          "excerpt": "){var u=\"function\"==typeof require&&require;if(!n&&u)return u(o,!0);if(s)return s(o,!0);var p=new Error(\"Cannot find module '\"+o+\"'\");throw p.code=\"MODULE_NOT_FOUND\",p}var m=r[o]={exports:{}};t[o][0].call(m.exports,function(e){return i(t[o]",
+          "reason": "Source pattern indicates a capability; execution is not established."
+        }
+      ],
+      "removed": []
+    }
+  },
+  {
+    "dataset": "expanded",
+    "name": "babel-plugin-react-compiler",
+    "version": "1.0.0",
+    "baseline": {
+      "tags": [
+        "source.environmentVars",
+        "source.filesystem",
+        "supplyChain.highEntropyStrings",
+        "supplyChain.urlStrings"
+      ],
+      "coverage": {
+        "complete": false,
+        "reasons": [
+          "limitReached",
+          "unparsedFiles"
+        ],
+        "files_scanned": 0,
+        "bytes_scanned": 262145
+      }
+    },
+    "candidate": {
+      "tags": [
+        "source.crypto",
+        "source.dynamicRequire",
+        "source.environmentVars",
+        "source.eval",
+        "source.filesystem",
+        "supplyChain.highEntropyStrings",
+        "supplyChain.possibleObfuscation",
+        "supplyChain.urlStrings"
+      ],
+      "coverage": {
+        "complete": true,
+        "reasons": [],
+        "files_scanned": 1,
+        "bytes_scanned": 3826059
+      }
+    },
+    "removed": [],
+    "added": [
+      "source.crypto",
+      "source.dynamicRequire",
+      "source.eval",
+      "supplyChain.possibleObfuscation"
+    ],
+    "review": "Added capabilities cover a crypto import, configuration loading, and a Function-based binding helper. Whole-file heuristics also add informational possible obfuscation.",
+    "evidence": {
+      "added": [
+        {
+          "ruleId": "crypto",
+          "path": "dist/index.js",
+          "line": 90114,
+          "column": 21,
+          "excerpt": "var import_crypto = require(\"crypto\");\n\n                                                              \nfunction memoizeFbtAndMacroOperandsInSameScope(fn) {\n  var _a;\n  const fbtMacroTags =                 new Set([\n    ...Array.from(FBT_TAG",
+          "reason": "Source pattern indicates a capability; execution is not established."
+        },
+        {
+          "ruleId": "dynamic-require",
+          "path": "dist/index.js",
+          "line": 48358,
+          "column": 30,
+          "excerpt": "        const configModule = require(filepath);\n        options = configModule && configModule.__esModule ? configModule.default || void 0 : configModule;\n      } catch (err) {\n        err.message = `${filepath}: Error while loading config ",
+          "reason": "Source pattern indicates a capability; execution is not established."
+        },
+        {
+          "ruleId": "eval",
+          "path": "dist/index.js",
+          "line": 46897,
+          "column": 15,
+          "excerpt": "      bound = Function(\"binder\", \"return function (\" + boundArgs.join(\",\") + \"){ return binder.apply(this,arguments); }\")(binder);\n      if (target.prototype) {\n        var Empty2 = function Empty3() {\n        };\n        Empty2.prototype = ",
+          "reason": "Source pattern indicates a capability; execution is not established."
+        },
+        {
+          "ruleId": "possible-obfuscation",
+          "path": "dist/index.js",
+          "reason": "Multiple obfuscation heuristics exceeded the informational threshold."
+        }
+      ],
+      "removed": []
+    }
+  },
+  {
+    "dataset": "expanded",
+    "name": "cdk-assets",
+    "version": "4.7.3",
+    "baseline": {
+      "tags": [
+        "source.childProcess",
+        "source.dynamicRequire",
+        "source.environmentVars",
+        "source.filesystem",
+        "supplyChain.highEntropyStrings",
+        "supplyChain.urlStrings"
+      ],
+      "coverage": {
+        "complete": false,
+        "reasons": [
+          "limitReached",
+          "unparsedFiles"
+        ],
+        "files_scanned": 3,
+        "bytes_scanned": 537096
+      }
+    },
+    "candidate": {
+      "tags": [
+        "source.childProcess",
+        "source.crypto",
+        "source.dynamicRequire",
+        "source.environmentVars",
+        "source.filesystem",
+        "source.network",
+        "source.shell",
+        "supplyChain.highEntropyStrings",
+        "supplyChain.urlStrings"
+      ],
+      "coverage": {
+        "complete": true,
+        "reasons": [],
+        "files_scanned": 5,
+        "bytes_scanned": 5396821
+      }
+    },
+    "removed": [],
+    "added": [
+      "source.crypto",
+      "source.network",
+      "source.shell"
+    ],
+    "review": "Added evidence includes crypto and HTTP imports plus execution of credentialProcess commands.",
+    "evidence": {
+      "added": [
+        {
+          "ruleId": "crypto",
+          "path": "bin/cdk-assets.js",
+          "line": 21846,
+          "column": 26,
+          "excerpt": "    import_node_crypto = require(\"node:crypto\");\n    import_node_path2 = require(\"node:path\");\n    init_getHomeDir();\n    getSSOTokenFilepath =                 __name((id) => {\n      const hasher = (0, import_node_crypto.createHash)(\"sha1\")",
+          "reason": "Source pattern indicates a capability; execution is not established."
+        },
+        {
+          "ruleId": "crypto",
+          "path": "bin/docker-credential-cdk-assets.js",
+          "line": 21893,
+          "column": 26,
+          "excerpt": "    import_node_crypto = require(\"node:crypto\");\n    import_node_path2 = require(\"node:path\");\n    init_getHomeDir();\n    getSSOTokenFilepath =                 __name((id) => {\n      const hasher = (0, import_node_crypto.createHash)(\"sha1\")",
+          "reason": "Source pattern indicates a capability; execution is not established."
+        },
+        {
+          "ruleId": "network",
+          "path": "bin/cdk-assets.js",
+          "line": 32850,
+          "column": 21,
+          "excerpt": "    var node_http = require(\"node:http\");\n    var { parseUrl: parseUrl2 } = (init_protocols(), __toCommonJS(protocols_exports));\n    var isImdsCredentials =                 __name((arg) => Boolean(arg) && typeof arg === \"object\" && typeof a",
+          "reason": "Source pattern indicates a capability; execution is not established."
+        },
+        {
+          "ruleId": "network",
+          "path": "bin/docker-credential-cdk-assets.js",
+          "line": 32897,
+          "column": 21,
+          "excerpt": "    var node_http = require(\"node:http\");\n    var { parseUrl: parseUrl2 } = (init_protocols(), __toCommonJS(protocols_exports));\n    var isImdsCredentials =                 __name((arg) => Boolean(arg) && typeof arg === \"object\" && typeof a",
+          "reason": "Source pattern indicates a capability; execution is not established."
+        },
+        {
+          "ruleId": "shell",
+          "path": "bin/cdk-assets.js",
+          "line": 44101,
+          "column": 31,
+          "excerpt": "          const execPromise = promisify(externalDataInterceptor2?.getTokenRecord?.().exec ?? exec);\n          try {\n            const { stdout } = await execPromise(credentialProcess);\n            let data;\n            try {\n              d",
+          "reason": "Source pattern indicates a capability; execution is not established."
+        },
+        {
+          "ruleId": "shell",
+          "path": "bin/docker-credential-cdk-assets.js",
+          "line": 44148,
+          "column": 31,
+          "excerpt": "          const execPromise = promisify(externalDataInterceptor2?.getTokenRecord?.().exec ?? exec);\n          try {\n            const { stdout } = await execPromise(credentialProcess);\n            let data;\n            try {\n              d",
+          "reason": "Source pattern indicates a capability; execution is not established."
+        }
+      ],
+      "removed": []
+    }
+  },
+  {
+    "dataset": "expanded",
+    "name": "drizzle-kit",
+    "version": "0.31.10",
+    "baseline": {
+      "tags": [
+        "source.childProcess",
+        "source.crypto",
+        "source.environmentVars",
+        "source.eval",
+        "source.filesystem",
+        "source.network",
+        "source.shell",
+        "supplyChain.highEntropyStrings",
+        "supplyChain.urlStrings"
+      ],
+      "coverage": {
+        "complete": false,
+        "reasons": [
+          "limitReached",
+          "unparsedFiles"
+        ],
+        "files_scanned": 4,
+        "bytes_scanned": 1184962
+      }
+    },
+    "candidate": {
+      "tags": [
+        "source.childProcess",
+        "source.crypto",
+        "source.dynamicRequire",
+        "source.environmentVars",
+        "source.eval",
+        "source.filesystem",
+        "source.nativeBindings",
+        "source.network",
+        "source.shell",
+        "supplyChain.highEntropyStrings",
+        "supplyChain.urlStrings"
+      ],
+      "coverage": {
+        "complete": true,
+        "reasons": [],
+        "files_scanned": 7,
+        "bytes_scanned": 9994410
+      }
+    },
+    "removed": [],
+    "added": [
+      "source.dynamicRequire",
+      "source.nativeBindings"
+    ],
+    "review": "Added patterns cover runtime loading and native binding selection in bundled loader code.",
+    "evidence": {
+      "added": [
+        {
+          "ruleId": "dynamic-require",
+          "path": "api.js",
+          "line": 35302,
+          "column": 14,
+          "excerpt": "      return runtimeRequire(load.resolve(dir));\n    }\n    load.resolve = load.path = function(dir) {\n      dir = path3.resolve(dir || \".\");\n      try {\n        var name = runtimeRequire(path3.join(dir, \"package.json\")).name.toUpperCase().re",
+          "reason": "Source pattern indicates a capability; execution is not established."
+        },
+        {
+          "ruleId": "dynamic-require",
+          "path": "api.mjs",
+          "line": 41103,
+          "column": 15,
+          "excerpt": "        await import(it);\n        return true;\n      } catch (e6) {\n        return false;\n      }\n    };\n    assertPackages = async (...pkgs) => {\n      try {\n        for (let i6 = 0; i6 < pkgs.length; i6++) {\n          const it = pkgs[i6];",
+          "reason": "Source pattern indicates a capability; execution is not established."
+        },
+        {
+          "ruleId": "dynamic-require",
+          "path": "bin.cjs",
+          "line": 15148,
+          "column": 96,
+          "excerpt": "3.startsWith(\"node:\") && E2.set(\"namespace\", s4.namespace), Y.require(d3 + T(E2));\n        }, \"scopedRequire\");\n        i4.require = c3;\n        const f5 = o3((l3, p3, P) => {\n          const d3 = H2(l3, p3), [h4, E2] = d3.split(\"?\"), U = n",
+          "reason": "Source pattern indicates a capability; execution is not established."
+        },
+        {
+          "ruleId": "native",
+          "path": "api.js",
+          "line": 35390,
+          "column": 16,
+          "excerpt": "          tags.napi = true;\n        } else if (tag.slice(0, 3) === \"abi\") {\n          tags.abi = tag.slice(3);\n        } else if (tag.slice(0, 2) === \"uv\") {\n          tags.uv = tag.slice(2);\n        } else if (tag.slice(0, 4) === \"armv\") {",
+          "reason": "Source pattern indicates a capability; execution is not established."
+        },
+        {
+          "ruleId": "native",
+          "path": "api.mjs",
+          "line": 35432,
+          "column": 16,
+          "excerpt": "          tags.napi = true;\n        } else if (tag.slice(0, 3) === \"abi\") {\n          tags.abi = tag.slice(3);\n        } else if (tag.slice(0, 2) === \"uv\") {\n          tags.uv = tag.slice(2);\n        } else if (tag.slice(0, 4) === \"armv\") {",
+          "reason": "Source pattern indicates a capability; execution is not established."
+        },
+        {
+          "ruleId": "native",
+          "path": "bin.cjs",
+          "line": 41529,
+          "column": 16,
+          "excerpt": "          tags.napi = true;\n        } else if (tag.slice(0, 3) === \"abi\") {\n          tags.abi = tag.slice(3);\n        } else if (tag.slice(0, 2) === \"uv\") {\n          tags.uv = tag.slice(2);\n        } else if (tag.slice(0, 4) === \"armv\") {",
+          "reason": "Source pattern indicates a capability; execution is not established."
+        }
+      ],
+      "removed": []
+    }
+  },
+  {
+    "dataset": "expanded",
+    "name": "json-refs",
+    "version": "3.0.15",
+    "baseline": {
+      "tags": [
+        "source.eval",
+        "supplyChain.highEntropyStrings",
+        "supplyChain.minified",
+        "supplyChain.possibleObfuscation",
+        "supplyChain.urlStrings"
+      ],
+      "coverage": {
+        "complete": false,
+        "reasons": [
+          "limitReached",
+          "unparsedFiles"
+        ],
+        "files_scanned": 2,
+        "bytes_scanned": 489804
+      }
+    },
+    "candidate": {
+      "tags": [
+        "source.environmentVars",
+        "source.eval",
+        "source.network",
+        "supplyChain.highEntropyStrings",
+        "supplyChain.minified",
+        "supplyChain.possibleObfuscation",
+        "supplyChain.urlStrings"
+      ],
+      "coverage": {
+        "complete": true,
+        "reasons": [],
+        "files_scanned": 3,
+        "bytes_scanned": 3195136
+      }
+    },
+    "removed": [],
+    "added": [
+      "source.environmentVars",
+      "source.network"
+    ],
+    "review": "Added evidence covers a browser process shim and an XMLHttpRequest implementation. The env tag does not prove access to host credentials.",
+    "evidence": {
+      "added": [
+        {
+          "ruleId": "env",
+          "path": "dist/json-refs.js",
+          "line": 20851,
+          "column": 1,
+          "excerpt": "process.env = {};\nprocess.argv = [];\nprocess.version = '';                                       \n\nprocess.versions = {};\n\nfunction noop() {}\n\nprocess.on = noop;\nprocess.addListener = noop;\nprocess.once = noop;\nprocess.off = noop;\nprocess.r",
+          "reason": "Source pattern indicates a capability; execution is not established."
+        },
+        {
+          "ruleId": "network",
+          "path": "dist/json-refs.js",
+          "line": 21441,
+          "column": 12,
+          "excerpt": "    return new XMLHttpRequest();\n  } else {\n    try {\n      return new ActiveXObject('Microsoft.XMLHTTP');\n    } catch (e) {}\n\n    try {\n      return new ActiveXObject('Msxml2.XMLHTTP.6.0');\n    } catch (e) {}\n\n    try {\n      return new Ac",
+          "reason": "Source pattern indicates a capability; execution is not established."
+        }
+      ],
+      "removed": []
+    }
+  },
+  {
+    "dataset": "expanded",
+    "name": "nx",
+    "version": "23.2.1",
+    "baseline": {
+      "tags": [
+        "source.childProcess",
+        "source.crypto",
+        "source.dynamicRequire",
+        "source.environmentVars",
+        "source.eval",
+        "source.filesystem",
+        "source.nativeBindings",
+        "source.network",
+        "source.shell",
+        "supplyChain.highEntropyStrings",
+        "supplyChain.minified",
+        "supplyChain.urlStrings"
+      ],
+      "coverage": {
+        "complete": false,
+        "reasons": [
+          "limitReached",
+          "unparsedFiles"
+        ],
+        "files_scanned": 660,
+        "bytes_scanned": 4773825
+      }
+    },
+    "candidate": {
+      "tags": [
+        "source.childProcess",
+        "source.crypto",
+        "source.dynamicRequire",
+        "source.environmentVars",
+        "source.eval",
+        "source.filesystem",
+        "source.nativeBindings",
+        "source.network",
+        "source.shell",
+        "supplyChain.highEntropyStrings",
+        "supplyChain.minified",
+        "supplyChain.possibleObfuscation",
+        "supplyChain.telemetry",
+        "supplyChain.urlStrings"
+      ],
+      "coverage": {
+        "complete": true,
+        "reasons": [],
+        "files_scanned": 661,
+        "bytes_scanned": 7447535
+      }
+    },
+    "removed": [],
+    "added": [
+      "supplyChain.possibleObfuscation",
+      "supplyChain.telemetry"
+    ],
+    "review": "Whole-file analysis adds informational obfuscation and telemetry patterns in the graph bundle. Keyword lists do not establish telemetry execution.",
+    "evidence": {
+      "added": [
+        {
+          "ruleId": "possible-obfuscation",
+          "path": "dist/src/core/graph/main.js",
+          "reason": "Multiple obfuscation heuristics exceeded the informational threshold."
+        },
+        {
+          "ruleId": "telemetry",
+          "path": "dist/src/core/graph/main.js",
+          "line": 1,
+          "column": 2714205,
+          "excerpt": "caled_inv_chi_square_lpdf\",\"scaled_inv_chi_square_rng\",\"sd\",\"segment\",\"sin\",\"singular_values\",\"sinh\",\"size\",\"skew_normal_cdf\",\"skew_normal_lccdf\",\"skew_normal_lcdf\",\"skew_normal_lpdf\",\"skew_normal_rng\",\"softmax\",\"sort_asc\",\"sort_desc\",\"sort",
+          "reason": "Source contains a telemetry SDK or tracking API pattern."
+        }
+      ],
+      "removed": []
+    }
+  },
+  {
+    "dataset": "expanded",
+    "name": "pdfjs-dist",
+    "version": "6.3.289",
+    "baseline": {
+      "tags": [
+        "source.childProcess",
+        "source.dynamicRequire",
+        "source.eval",
+        "source.filesystem",
+        "source.network",
+        "supplyChain.highEntropyStrings",
+        "supplyChain.minified",
+        "supplyChain.possibleObfuscation",
+        "supplyChain.urlStrings"
+      ],
+      "coverage": {
+        "complete": false,
+        "reasons": [
+          "limitReached",
+          "unparsedFiles"
+        ],
+        "files_scanned": 21,
+        "bytes_scanned": 8632494
+      }
+    },
+    "candidate": {
+      "tags": [
+        "source.dynamicRequire",
+        "source.eval",
+        "source.filesystem",
+        "source.network",
+        "supplyChain.highEntropyStrings",
+        "supplyChain.minified",
+        "supplyChain.possibleObfuscation",
+        "supplyChain.urlStrings"
+      ],
+      "coverage": {
+        "complete": true,
+        "reasons": [],
+        "files_scanned": 23,
+        "bytes_scanned": 12732231
+      }
+    },
+    "removed": [
+      "source.childProcess"
+    ],
+    "added": [],
+    "review": "Removed child-process evidence invokes a local exec callback inside a bundled helper.",
+    "evidence": {
+      "added": [],
+      "removed": [
+        {
+          "ruleId": "child-process",
+          "path": "legacy/build/pdf.worker.mjs",
+          "excerpt": "    return !!exec();\n  } catch (error) {\n    return true;\n  }\n};\n\n\n      },\n\n      8745\n(module, __unused_webpack_exports, __webpack_require__) {\n\n\nvar NATIVE_BIND = __webpack_require__(616);\n\nvar FunctionPrototype = Function.prototype;\nvar",
+          "reason": "Source pattern indicates a capability; execution is not established."
+        }
+      ]
+    }
+  },
+  {
+    "dataset": "expanded",
+    "name": "pdfmake",
+    "version": "0.3.11",
+    "baseline": {
+      "tags": [
+        "manifest.gitDependency",
+        "source.crypto",
+        "source.eval",
+        "source.filesystem",
+        "source.network",
+        "supplyChain.highEntropyStrings",
+        "supplyChain.minified",
+        "supplyChain.possibleObfuscation",
+        "supplyChain.urlStrings"
+      ],
+      "coverage": {
+        "complete": false,
+        "reasons": [
+          "limitReached",
+          "unparsedFiles"
+        ],
+        "files_scanned": 99,
+        "bytes_scanned": 4457827
+      }
+    },
+    "candidate": {
+      "tags": [
+        "manifest.gitDependency",
+        "source.crypto",
+        "source.environmentVars",
+        "source.eval",
+        "source.filesystem",
+        "source.network",
+        "supplyChain.highEntropyStrings",
+        "supplyChain.minified",
+        "supplyChain.possibleObfuscation",
+        "supplyChain.urlStrings"
+      ],
+      "coverage": {
+        "complete": true,
+        "reasons": [],
+        "files_scanned": 100,
+        "bytes_scanned": 6644302
+      }
+    },
+    "removed": [],
+    "added": [
+      "source.environmentVars"
+    ],
+    "review": "The added env pattern is a browser process shim, not evidence of reading host credentials.",
+    "evidence": {
+      "added": [
+        {
+          "ruleId": "env",
+          "path": "build/pdfmake.js",
+          "line": 39335,
+          "column": 1,
+          "excerpt": "process.env = {};\nprocess.argv = [];\nprocess.version = '';                                       \nprocess.versions = {};\n\nfunction noop() {}\n\nprocess.on = noop;\nprocess.addListener = noop;\nprocess.once = noop;\nprocess.off = noop;\nprocess.re",
+          "reason": "Source pattern indicates a capability; execution is not established."
+        }
+      ],
+      "removed": []
+    }
+  },
+  {
+    "dataset": "expanded",
+    "name": "react-devtools-inline",
+    "version": "8.0.0",
+    "baseline": {
+      "tags": [
+        "source.environmentVars",
+        "source.eval",
+        "source.filesystem",
+        "source.network",
+        "supplyChain.highEntropyStrings",
+        "supplyChain.possibleObfuscation",
+        "supplyChain.urlStrings"
+      ],
+      "coverage": {
+        "complete": false,
+        "reasons": [
+          "limitReached",
+          "unparsedFiles"
+        ],
+        "files_scanned": 6,
+        "bytes_scanned": 3393349
+      }
+    },
+    "candidate": {
+      "tags": [
+        "source.environmentVars",
+        "source.eval",
+        "source.filesystem",
+        "source.network",
+        "supplyChain.highEntropyStrings",
+        "supplyChain.minified",
+        "supplyChain.urlStrings"
+      ],
+      "coverage": {
+        "complete": true,
+        "reasons": [],
+        "files_scanned": 7,
+        "bytes_scanned": 6102196
+      }
+    },
+    "removed": [
+      "supplyChain.possibleObfuscation"
+    ],
+    "added": [
+      "supplyChain.minified"
+    ],
+    "review": "Whole-file heuristics replace informational possible obfuscation with a minified-layout trait. This is a statistical change, not proof of safety.",
+    "evidence": {
+      "added": [
+        {
+          "ruleId": "minified",
+          "path": "dist/hookNames.js",
+          "reason": "Filename or source layout indicates minified code."
+        }
+      ],
+      "removed": [
+        {
+          "ruleId": "possible-obfuscation",
+          "path": "dist/hookNames.js",
+          "reason": "Multiple obfuscation heuristics exceeded the informational threshold."
+        }
+      ]
+    }
+  },
+  {
+    "dataset": "expanded",
+    "name": "vite-plugin-vue-devtools",
+    "version": "8.2.1",
+    "baseline": {
+      "tags": [
+        "source.dynamicRequire",
+        "source.environmentVars",
+        "source.eval",
+        "source.filesystem",
+        "source.network",
+        "supplyChain.highEntropyStrings",
+        "supplyChain.minified",
+        "supplyChain.urlStrings"
+      ],
+      "coverage": {
+        "complete": false,
+        "reasons": [
+          "limitReached",
+          "unparsedFiles"
+        ],
+        "files_scanned": 31,
+        "bytes_scanned": 2768800
+      }
+    },
+    "candidate": {
+      "tags": [
+        "source.crypto",
+        "source.dynamicRequire",
+        "source.environmentVars",
+        "source.eval",
+        "source.filesystem",
+        "source.network",
+        "supplyChain.highEntropyStrings",
+        "supplyChain.minified",
+        "supplyChain.possibleObfuscation",
+        "supplyChain.urlStrings"
+      ],
+      "coverage": {
+        "complete": true,
+        "reasons": [],
+        "files_scanned": 32,
+        "bytes_scanned": 5679722
+      }
+    },
+    "removed": [],
+    "added": [
+      "source.crypto",
+      "supplyChain.possibleObfuscation"
+    ],
+    "review": "Added evidence includes createHash calls plus an informational whole-bundle obfuscation trait.",
+    "evidence": {
+      "added": [
+        {
+          "ruleId": "crypto",
+          "path": "client/assets/index-FgjDDWNS.js",
+          "line": 449,
+          "column": 9052,
+          "excerpt": "void 0&&(oc=n(343),lc===void 0&&(lc=X4())),j=new lc((()=>oc.createHash(\"md4\")),\"md4\")):(oc===void 0&&(oc=n(343),lc===void 0&&(lc=X4())),j=new lc((()=>oc.createHash(E)),E)),j.update(_),P===\"base26\"||P===\"base32\"||P===\"base36\"||P===\"base49\"||",
+          "reason": "Source pattern indicates a capability; execution is not established."
+        },
+        {
+          "ruleId": "possible-obfuscation",
+          "path": "client/assets/index-FgjDDWNS.js",
+          "reason": "Multiple obfuscation heuristics exceeded the informational threshold."
+        }
+      ],
+      "removed": []
+    }
+  },
+  {
+    "dataset": "expanded",
+    "name": "xml2js",
+    "version": "0.6.2",
+    "baseline": {
+      "tags": [
+        "source.childProcess",
+        "source.environmentVars",
+        "source.eval",
+        "source.filesystem"
+      ],
+      "coverage": {
+        "complete": false,
+        "reasons": [
+          "limitReached",
+          "unparsedFiles"
+        ],
+        "files_scanned": 6,
+        "bytes_scanned": 283635
+      }
+    },
+    "candidate": {
+      "tags": [
+        "source.childProcess",
+        "source.crypto",
+        "source.environmentVars",
+        "source.eval",
+        "source.filesystem",
+        "source.shell",
+        "supplyChain.highEntropyStrings",
+        "supplyChain.urlStrings"
+      ],
+      "coverage": {
+        "complete": true,
+        "reasons": [],
+        "files_scanned": 7,
+        "bytes_scanned": 3412980
+      }
+    },
+    "removed": [],
+    "added": [
+      "source.crypto",
+      "source.shell",
+      "supplyChain.highEntropyStrings",
+      "supplyChain.urlStrings"
+    ],
+    "review": "Added bundle evidence includes crypto random bytes and child_process.execSync. Whole-file analysis also adds entropy and URL traits.",
+    "evidence": {
+      "added": [
+        {
+          "ruleId": "crypto",
+          "path": "lib/xml2js.bc.js",
+          "line": 6063,
+          "column": 36,
+          "excerpt": "      var buff = globalThis.crypto.randomBytes(4), a = new Uint32Array(buff);\n      return [0, a[0]];\n     }\n    var now = new Date().getTime(), x = now ^ 0xffffffff * Math.random();\n    return [0, x];\n   }\n   var all_finalizers = new globa",
+          "reason": "Source pattern indicates a capability; execution is not established."
+        },
+        {
+          "ruleId": "high-entropy",
+          "path": "lib/xml2js.bc.js",
+          "reason": "A long string exceeded the entropy threshold after known data exclusions."
+        },
+        {
+          "ruleId": "shell",
+          "path": "lib/xml2js.bc.js",
+          "line": 3986,
+          "column": 11,
+          "excerpt": "      try{child_process.execSync(cmd, {stdio: \"inherit\"}); return 0;}\n      catch(e){return 1;}\n    }\n    else\n     return 127;\n   }\n   function caml_js_error_of_exception(exn){\n    if(exn.js_error) return exn.js_error;\n    return null;\n   ",
+          "reason": "Source pattern indicates a capability; execution is not established."
+        },
+        {
+          "ruleId": "url-strings",
+          "path": "lib/xml2js.bc.js",
+          "reason": "Source contains a URL literal."
+        }
+      ],
+      "removed": []
+    }
+  },
+  {
+    "dataset": "former-validation",
+    "name": "@mdi/js",
+    "version": "7.4.47",
+    "baseline": {
+      "tags": [
+        "supplyChain.highEntropyStrings",
+        "supplyChain.minified"
+      ],
+      "coverage": {
+        "complete": false,
+        "reasons": [
+          "limitReached",
+          "unparsedFiles"
+        ],
+        "files_scanned": 1,
+        "bytes_scanned": 524792
+      }
+    },
+    "candidate": {
+      "tags": [],
+      "coverage": {
+        "complete": true,
+        "reasons": [],
+        "files_scanned": 3,
+        "bytes_scanned": 5847052
+      }
+    },
+    "removed": [
+      "supplyChain.highEntropyStrings",
+      "supplyChain.minified"
+    ],
+    "added": [],
+    "review": "Whole-file parsing and layout statistics remove entropy and minification traits from generated SVG path data.",
+    "evidence": {
+      "added": [],
+      "removed": [
+        {
+          "ruleId": "high-entropy",
+          "path": "commonjs/mdi.js",
+          "reason": "A long string exceeded the entropy threshold after known data exclusions."
+        },
+        {
+          "ruleId": "minified",
+          "path": "commonjs/mdi.js",
+          "reason": "Filename or source layout indicates minified code."
+        }
+      ]
+    }
+  },
+  {
+    "dataset": "former-validation",
+    "name": "ag-charts-enterprise",
+    "version": "14.2.0",
+    "baseline": {
+      "tags": [
+        "source.dynamicRequire",
+        "supplyChain.highEntropyStrings",
+        "supplyChain.minified",
+        "supplyChain.urlStrings"
+      ],
+      "coverage": {
+        "complete": false,
+        "reasons": [
+          "limitReached",
+          "unparsedFiles"
+        ],
+        "files_scanned": 2,
+        "bytes_scanned": 3498583
+      }
+    },
+    "candidate": {
+      "tags": [
+        "source.dynamicRequire",
+        "source.network",
+        "supplyChain.highEntropyStrings",
+        "supplyChain.minified",
+        "supplyChain.urlStrings"
+      ],
+      "coverage": {
+        "complete": false,
+        "reasons": [
+          "limitReached",
+          "unparsedFiles"
+        ],
+        "files_scanned": 5,
+        "bytes_scanned": 9545073
+      }
+    },
+    "removed": [],
+    "added": [
+      "source.network"
+    ],
+    "review": "The added fetch call retrieves image data in the chart bundle.",
+    "evidence": {
+      "added": [
+        {
+          "ruleId": "network",
+          "path": "dist/umd/ag-charts-enterprise.min.js",
+          "line": 22,
+          "column": 55946,
+          "excerpt": "\"data:image/svg\");if(!i&&!n)return{src:e};try{const s=await fetch(e,{mode:\"cors\"}),o=s.headers.get(\"content-type\")??\"\",a=o.startsWith(\"image/\")||o.startsWith(\"application/\"),r=o.includes(\"svg\");if(a&&!r)return{src:e};const l=await s.text();",
+          "reason": "Source pattern indicates a capability; execution is not established."
+        }
+      ],
+      "removed": []
+    }
+  },
+  {
+    "dataset": "former-validation",
+    "name": "chrome-devtools-mcp",
+    "version": "1.9.0",
+    "baseline": {
+      "tags": [
+        "source.childProcess",
+        "source.crypto",
+        "source.environmentVars",
+        "source.eval",
+        "source.filesystem",
+        "source.network",
+        "source.shell",
+        "supplyChain.highEntropyStrings",
+        "supplyChain.urlStrings"
+      ],
+      "coverage": {
+        "complete": false,
+        "reasons": [
+          "limitReached",
+          "unparsedFiles"
+        ],
+        "files_scanned": 76,
+        "bytes_scanned": 2086574
+      }
+    },
+    "candidate": {
+      "tags": [
+        "source.childProcess",
+        "source.crypto",
+        "source.dynamicRequire",
+        "source.environmentVars",
+        "source.eval",
+        "source.filesystem",
+        "source.network",
+        "source.shell",
+        "supplyChain.highEntropyStrings",
+        "supplyChain.urlStrings"
+      ],
+      "coverage": {
+        "complete": false,
+        "reasons": [
+          "limitReached",
+          "unparsedFiles"
+        ],
+        "files_scanned": 77,
+        "bytes_scanned": 5717303
+      }
+    },
+    "removed": [],
+    "added": [
+      "source.dynamicRequire"
+    ],
+    "review": "The added dynamic import loads a computed requirePath in the Lighthouse bundle.",
+    "evidence": {
+      "added": [
+        {
+          "ruleId": "dynamic-require",
+          "path": "build/src/third_party/lighthouse-devtools-mcp-bundle.js",
+          "line": 54281,
+          "column": 25,
+          "excerpt": "        module2 = await import(requirePath);\n    }\n    else {\n        requirePath += \".js\";\n        module2 = await import(requirePath);\n    }\n    if (module2.default)\n        return module2.default;\n    const methods =                 new ",
+          "reason": "Source pattern indicates a capability; execution is not established."
+        }
+      ],
+      "removed": []
+    }
+  },
+  {
+    "dataset": "former-validation",
+    "name": "expo-sqlite",
+    "version": "57.0.3",
+    "baseline": {
+      "tags": [
+        "source.childProcess",
+        "source.dynamicRequire",
+        "source.environmentVars",
+        "source.eval",
+        "source.filesystem",
+        "source.nativeBindings",
+        "source.network",
+        "supplyChain.highEntropyStrings",
+        "supplyChain.minified",
+        "supplyChain.urlStrings"
+      ],
+      "coverage": {
+        "complete": false,
+        "reasons": [
+          "limitReached",
+          "unparsedFiles"
+        ],
+        "files_scanned": 60,
+        "bytes_scanned": 866819
+      }
+    },
+    "candidate": {
+      "tags": [
+        "source.dynamicRequire",
+        "source.environmentVars",
+        "source.eval",
+        "source.filesystem",
+        "source.nativeBindings",
+        "source.network",
+        "source.webSocket",
+        "supplyChain.highEntropyStrings",
+        "supplyChain.minified",
+        "supplyChain.urlStrings"
+      ],
+      "coverage": {
+        "complete": true,
+        "reasons": [],
+        "files_scanned": 61,
+        "bytes_scanned": 3982907
+      }
+    },
+    "removed": [
+      "source.childProcess"
+    ],
+    "added": [
+      "source.webSocket"
+    ],
+    "review": "The added WebSocket constructs a connection. Removed child-process evidence was a database execSync method delegating to a worker.",
+    "evidence": {
+      "added": [
+        {
+          "ruleId": "ws",
+          "path": "dev-plugin-dist/_expo/static/js/web/entry-6b462075328bf796a095088ecb34b129.js",
+          "line": 784,
+          "column": 1190,
+          "excerpt": "eout(this.handleConnectTimeout,this.connectTimeout),this.ws=new WebSocket(this.url.toString()),null!=this.wsBinaryType&&(this.ws.binaryType=this.wsBinaryType),this.ws.addEventListener('message',this.handleMessage),this.ws.addEventListener('",
+          "reason": "Source pattern indicates a capability; execution is not established."
+        }
+      ],
+      "removed": [
+        {
+          "ruleId": "child-process",
+          "path": "dev-plugin-dist/_expo/static/js/web/entry-6b462075328bf796a095088ecb34b129.js",
+          "excerpt": "orkerAsync)(y(),'exec',{nativeDatabaseId:this.id,source:t})}execSync(t){(0,n.invokeWorkerSync)(y(),'exec',{nativeDatabaseId:this.id,source:t})}async serializeAsync(t){return await(0,n.invokeWorkerAsync)(y(),'serialize',{nativeDatabaseId:thi",
+          "reason": "Source pattern indicates a capability; execution is not established."
+        }
+      ]
+    }
+  },
+  {
+    "dataset": "former-validation",
+    "name": "plotly.js",
+    "version": "4.1.1",
+    "baseline": {
+      "tags": [
+        "source.environmentVars",
+        "source.eval",
+        "source.network",
+        "supplyChain.highEntropyStrings",
+        "supplyChain.minified",
+        "supplyChain.possibleObfuscation",
+        "supplyChain.urlStrings"
+      ],
+      "coverage": {
+        "complete": false,
+        "reasons": [
+          "limitReached",
+          "unparsedFiles"
+        ],
+        "files_scanned": 1034,
+        "bytes_scanned": 18908617
+      }
+    },
+    "candidate": {
+      "tags": [
+        "source.environmentVars",
+        "source.eval",
+        "source.network",
+        "supplyChain.highEntropyStrings",
+        "supplyChain.minified",
+        "supplyChain.possibleObfuscation",
+        "supplyChain.telemetry",
+        "supplyChain.urlStrings"
+      ],
+      "coverage": {
+        "complete": false,
+        "reasons": [
+          "limitReached",
+          "unparsedFiles"
+        ],
+        "files_scanned": 1040,
+        "bytes_scanned": 37215331
+      }
+    },
+    "removed": [],
+    "added": [
+      "supplyChain.telemetry"
+    ],
+    "review": "Whole-file analysis adds a telemetry pattern in the map bundle. This informational match does not establish a data upload.",
+    "evidence": {
+      "added": [
+        {
+          "ruleId": "telemetry",
+          "path": "dist/plotly-map.min.js",
+          "line": 38,
+          "column": 356600,
+          "excerpt": "dex\"},{type:\"Uint32\",name:\"lineLength\"},{type:\"Uint16\",name:\"segment\"},{type:\"Uint16\",name:\"lowerSize\"},{type:\"Uint16\",name:\"upperSize\"},{type:\"Float32\",name:\"lineOffsetX\"},{type:\"Float32\",name:\"lineOffsetY\"},{type:\"Uint8\",name:\"writingMode",
+          "reason": "Source contains a telemetry SDK or tracking API pattern."
+        }
+      ],
+      "removed": []
+    }
+  },
+  {
+    "dataset": "former-validation",
+    "name": "quickjs-emscripten",
+    "version": "0.32.0",
+    "baseline": {
+      "tags": [
+        "supplyChain.highEntropyStrings",
+        "supplyChain.minified"
+      ],
+      "coverage": {
+        "complete": false,
+        "reasons": [
+          "limitReached"
+        ],
+        "files_scanned": 5,
+        "bytes_scanned": 269769
+      }
+    },
+    "candidate": {
+      "tags": [
+        "supplyChain.minified"
+      ],
+      "coverage": {
+        "complete": true,
+        "reasons": [],
+        "files_scanned": 6,
+        "bytes_scanned": 2381504
+      }
+    },
+    "removed": [
+      "supplyChain.highEntropyStrings"
+    ],
+    "added": [],
+    "review": "Whole-file string analysis removes the high-entropy trait in the global bundle. This does not prove the absence of encoded data.",
+    "evidence": {
+      "added": [],
+      "removed": [
+        {
+          "ruleId": "high-entropy",
+          "path": "dist/index.global.js",
+          "reason": "A long string exceeded the entropy threshold after known data exclusions."
+        }
+      ]
+    }
+  }
+]

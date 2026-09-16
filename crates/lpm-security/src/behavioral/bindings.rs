@@ -7,6 +7,7 @@ use std::collections::{HashMap, HashSet};
 #[derive(Default)]
 pub(super) struct CallFacts {
     pub process: Option<usize>,
+    pub credential_exfiltration: Option<super::threats::Leak>,
     pub shell: Option<usize>,
     pub dynamic_load: Option<usize>,
     pub evaluation: Option<usize>,
@@ -552,7 +553,7 @@ fn unresolved_eval_call(
     !has_local_eval_method(object, semantic, mutated, 0)
 }
 
-fn mark_mutated_receiver(
+pub(super) fn mark_mutated_receiver(
     object: &Expression<'_>,
     semantic: &Semantic<'_>,
     mutated: &mut HashSet<SymbolId>,
@@ -590,18 +591,20 @@ fn mark_mutated_receiver(
     }
 }
 
-#[derive(Default)]
-struct CallCandidates(bool);
+struct CallCandidates {
+    found: bool,
+    include_threats: bool,
+}
 
 impl<'a> Visit<'a> for CallCandidates {
     fn visit_expression(&mut self, expression: &Expression<'a>) {
-        if !self.0 {
+        if !self.found {
             walk::walk_expression(self, expression);
         }
     }
 
     fn visit_identifier_reference(&mut self, identifier: &IdentifierReference<'a>) {
-        self.0 |= matches!(
+        self.found |= matches!(
             identifier.name.as_str(),
             "require"
                 | "exec"
@@ -621,6 +624,7 @@ impl<'a> Visit<'a> for CallCandidates {
     }
 
     fn visit_call_expression(&mut self, call: &CallExpression<'a>) {
+        self.found |= self.include_threats && super::threats::is_candidate(call);
         if call.callee.get_inner_expression().is_specific_id("require")
             && call.arguments.len() == 1
             && let Some(name) = call
@@ -629,19 +633,19 @@ impl<'a> Visit<'a> for CallCandidates {
                 .and_then(Argument::as_expression)
                 .and_then(|argument| static_string(argument, 0))
         {
-            self.0 |= module(name.as_ref()).is_some();
+            self.found |= module(name.as_ref()).is_some();
             return;
         }
         walk::walk_call_expression(self, call);
     }
 
     fn visit_static_member_expression(&mut self, member: &StaticMemberExpression<'a>) {
-        self.0 |= matches!(member.property.name.as_str(), "require" | "eval");
+        self.found |= matches!(member.property.name.as_str(), "require" | "eval");
         walk::walk_static_member_expression(self, member);
     }
 
     fn visit_computed_member_expression(&mut self, member: &ComputedMemberExpression<'a>) {
-        self.0 |= matches!(
+        self.found |= matches!(
             static_string(&member.expression, 0).as_deref(),
             Some("require" | "eval")
         );
@@ -649,19 +653,22 @@ impl<'a> Visit<'a> for CallCandidates {
     }
 
     fn visit_import_expression(&mut self, import: &ImportExpression<'a>) {
-        self.0 |= dynamic_argument(Some(&import.source));
+        self.found |= dynamic_argument(Some(&import.source));
         walk::walk_import_expression(self, import);
     }
 
     fn visit_import_declaration(&mut self, import: &ImportDeclaration<'a>) {
-        self.0 |= module(import.source.value.as_str()).is_some();
+        self.found |= module(import.source.value.as_str()).is_some();
     }
 }
 
-pub(super) fn analyze(program: &Program<'_>) -> CallFacts {
-    let mut candidates = CallCandidates::default();
+pub(super) fn analyze(program: &Program<'_>, complete_input: bool) -> CallFacts {
+    let mut candidates = CallCandidates {
+        found: false,
+        include_threats: complete_input,
+    };
     candidates.visit_program(program);
-    if !candidates.0 {
+    if !candidates.found {
         return CallFacts::default();
     }
     let built = SemanticBuilder::new().build(program);
@@ -813,6 +820,9 @@ pub(super) fn analyze(program: &Program<'_>) -> CallFacts {
             }
             _ => {}
         }
+    }
+    if complete_input {
+        facts.credential_exfiltration = super::threats::analyze(semantic);
     }
     facts
 }

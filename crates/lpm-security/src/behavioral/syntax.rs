@@ -47,6 +47,15 @@ impl<'a> Visit<'a> for LiteralSpans<'_> {
 
 impl<'s> SourceContext<'s> {
     pub fn new(source: &str, filename: &str, stripped: &'s mut Vec<u8>) -> Self {
+        Self::with_complete_input(source, filename, stripped, true)
+    }
+
+    pub fn with_complete_input(
+        source: &str,
+        filename: &str,
+        stripped: &'s mut Vec<u8>,
+        complete_input: bool,
+    ) -> Self {
         let allocator = Allocator::default();
         let source_type = SourceType::from_path(filename).unwrap_or_else(|_| SourceType::tsx());
         let parsed = Parser::new(&allocator, source, source_type)
@@ -66,7 +75,7 @@ impl<'s> SourceContext<'s> {
         }
         .visit_program(&parsed.program);
         let complete = !parsed.panicked && parsed.errors.is_empty();
-        let calls = complete.then(|| super::bindings::analyze(&parsed.program));
+        let calls = complete.then(|| super::bindings::analyze(&parsed.program, complete_input));
         Self {
             stripped: String::from_utf8_lossy(stripped),
             executable,

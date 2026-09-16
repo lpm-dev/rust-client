@@ -15,7 +15,7 @@
 //!
 //! ## Severity aliases
 //!
-//! - `:critical` = `:obfuscated` OR `:protestware`
+//! - `:critical` includes obfuscation, protestware, and credential exfiltration
 //! - `:high` = `:eval` OR `:child-process` OR `:shell` OR `:dynamic-require` OR `:scripts` OR `:vulnerable`
 //! - `:medium` = `:network` OR `:git-dep` OR `:http-dep` OR `:wildcard-dep` OR `:no-license` OR `:native`
 //! - `:info` = `:fs` OR `:crypto` OR `:env` OR `:ws` OR `:possible-obfuscation` OR `:high-entropy` OR `:telemetry` OR `:trivial` OR `:copyleft` OR `:minified` OR `:url-strings`
@@ -69,7 +69,7 @@ impl Selector {
     }
 }
 
-/// Group a behavioral tag belongs to. The 23 tags split across three
+/// Group a behavioral tag belongs to. The behavioral tags split across three
 /// groups: source-behavior tags (what the code does), supply-chain
 /// tags (what the artifact looks like), and manifest tags (what
 /// `package.json` declares).
@@ -94,7 +94,7 @@ impl fmt::Display for TagGroup {
 }
 
 /// One row of the behavioral-tag catalog — single source of truth for
-/// the 23 tags emitted by `lpm audit` / `lpm query`. Includes the CLI
+/// the behavioral tags emitted by `lpm audit` / `lpm query`. Includes the CLI
 /// token (e.g., `:eval`), the group it belongs to, the severity tier,
 /// and a short user-facing description. The drift test in
 /// `lpm-workflows` asserts the doc tables in `security-audit.mdx` and
@@ -129,7 +129,7 @@ impl InstallVisibility {
     }
 }
 
-const BEHAVIORAL_TAG_POLICIES: [BehavioralTagInfo; 23] = [
+const BEHAVIORAL_TAG_POLICIES: [BehavioralTagInfo; 24] = [
     BehavioralTagInfo {
         tag: PseudoClass::Eval,
         token: ":eval",
@@ -293,6 +293,15 @@ const BEHAVIORAL_TAG_POLICIES: [BehavioralTagInfo; 23] = [
         description: "Match a curated list of known protest-license / sabotage packages",
     },
     BehavioralTagInfo {
+        tag: PseudoClass::CredentialExfiltration,
+        token: ":credential-exfiltration",
+        label: "credential exfiltration",
+        group: TagGroup::SupplyChain,
+        severity: Severity::Critical,
+        install_visibility: InstallVisibility::Default,
+        description: "Send private-key material or the complete process environment in a network payload",
+    },
+    BehavioralTagInfo {
         tag: PseudoClass::GitDep,
         token: ":git-dep",
         label: "git dependency",
@@ -365,7 +374,7 @@ pub enum PseudoClass {
     Env,
     Ws,
 
-    // Supply chain selectors (8)
+    // Supply chain selectors
     Obfuscated,
     PossibleObfuscation,
     HighEntropy,
@@ -374,6 +383,7 @@ pub enum PseudoClass {
     UrlStrings,
     Trivial,
     Protestware,
+    CredentialExfiltration,
 
     // Manifest selectors (5)
     GitDep,
@@ -430,6 +440,7 @@ impl PseudoClass {
             "url-strings" => Some(Self::UrlStrings),
             "trivial" => Some(Self::Trivial),
             "protestware" => Some(Self::Protestware),
+            "credential-exfiltration" => Some(Self::CredentialExfiltration),
 
             // Manifest tags
             "git-dep" => Some(Self::GitDep),
@@ -481,6 +492,7 @@ impl PseudoClass {
             Self::UrlStrings => ":url-strings",
             Self::Trivial => ":trivial",
             Self::Protestware => ":protestware",
+            Self::CredentialExfiltration => ":credential-exfiltration",
             Self::GitDep => ":git-dep",
             Self::HttpDep => ":http-dep",
             Self::WildcardDep => ":wildcard-dep",
@@ -525,6 +537,7 @@ impl PseudoClass {
             Self::UrlStrings,
             Self::Trivial,
             Self::Protestware,
+            Self::CredentialExfiltration,
             Self::GitDep,
             Self::HttpDep,
             Self::WildcardDep,
@@ -539,7 +552,7 @@ impl PseudoClass {
             .find(|policy| policy.tag == self)
     }
 
-    /// Tag group — `Source`, `SupplyChain`, or `Manifest` for the 23
+    /// Tag group — `Source`, `SupplyChain`, or `Manifest` for the
     /// behavioral tags; `None` for state / severity / special selectors
     /// that aren't part of the behavioral analysis catalog.
     pub fn group(self) -> Option<TagGroup> {
@@ -597,6 +610,7 @@ impl PseudoClass {
             Self::UrlStrings => analysis.supply_chain.url_strings,
             Self::Trivial => analysis.supply_chain.trivial,
             Self::Protestware => analysis.supply_chain.protestware,
+            Self::CredentialExfiltration => analysis.supply_chain.credential_exfiltration,
             Self::GitDep => analysis.manifest.git_dependency,
             Self::HttpDep => analysis.manifest.http_dependency,
             Self::WildcardDep => analysis.manifest.wildcard_dependency,

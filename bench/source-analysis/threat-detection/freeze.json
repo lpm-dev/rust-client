@@ -1,0 +1,40 @@
+{
+  "baseline_commit": "840d6ac5a397f9958e038d86493a94256678c262",
+  "baseline_scanner_sha256": "c0b489e36a26b19a8cc8c4590fa8da49390de787977ce5a5f4e284ee7a52ed8a",
+  "candidate_scanner_sha256": "c993cc8e9d02c2a8c5dc5e737545f36e80d38724fd80d53fe902092452190728",
+  "source_sha256": {
+    "crates/lpm-security/src/behavioral/supply_chain.rs": "158861829a5dabb4297cf1ea4955fc63554d9a813670fcc03d4ed87928a9e9f6",
+    "crates/lpm-security/src/behavioral/manifest.rs": "d43ebd89a04499348437e4904a9c3615328cce9ad0f1e2cca3adfec2db8ca570",
+    "crates/lpm-security/src/behavioral/source.rs": "218995a8a0545f92ef19c900de661290d9643d7c7ca7f51d915cc9852f4af4e7",
+    "crates/lpm-security/src/behavioral/evidence.rs": "31c9fa7f5421d0b7abd395f27a9e223f23a9d13fad0b9ac0ad3d4454de14ba15",
+    "crates/lpm-security/src/behavioral/mod.rs": "6544a912786074b0483019565523766533054fa0fb0356ec0db994195c25e8c3",
+    "crates/lpm-security/src/behavioral/threats.rs": "3b85b930f75012ad911928576df1603cb944c2aa53b19ea614b9481289cd0740",
+    "crates/lpm-security/src/behavioral/syntax.rs": "26226e170f09b64af6726edaa8fa06cf430ed91741f3b3bfe4dd2587ce84bb78",
+    "crates/lpm-security/src/behavioral/bindings.rs": "8b9b845f8397d2266e52cb19bfc187e0bf6a299623fdcedc649b77516fb3f671",
+    "crates/lpm-security/src/behavioral/secrets.rs": "49f33159be794891389255cdcdf1eea2da1ec8e4ca5a9d9112b1c97a0e3bdc44",
+    "crates/lpm-security/src/behavioral/threats/bundles.rs": "8cc67b440bb47a364d362205febdb68203d30f0cbbed2d8516a534bb93bd006c",
+    "crates/lpm-security/src/query.rs": "475a6734b552cbdc4d85be2195391896c9ae71d1e5c142e16f0f5ceecbd3c948"
+  },
+  "dataset_role": "All popular packages are regression/tuning evidence. No independent validation is claimed in this study.",
+  "manifests": {
+    "original": "2d0bb511bd6c5c90f2d65e6bfb3ef280b1bb7712afcec4c2746f503bd8043ed6",
+    "expanded": "ee7e74569582709c825c4ab6c3861bdf0ce4dfda474b81a6d36d461c9e2c80be",
+    "former-validation": "5a6b9f13ed3739ce6bced56a813339af0238e2e2e2e83019805f3d422ab36765",
+    "historical": "b0be69f50a9b2e7cca8330f723532292454b963f6556b1fe375911e0428e2f98"
+  },
+  "candidate_code_commit": "f44b769b",
+  "post_freeze_changes": "Rust API documentation comments and an oversized-file audit test fixture only; executable detector source is unchanged.",
+  "documented_source_sha256": {
+    "crates/lpm-security/src/behavioral/supply_chain.rs": "158861829a5dabb4297cf1ea4955fc63554d9a813670fcc03d4ed87928a9e9f6",
+    "crates/lpm-security/src/behavioral/manifest.rs": "d43ebd89a04499348437e4904a9c3615328cce9ad0f1e2cca3adfec2db8ca570",
+    "crates/lpm-security/src/behavioral/source.rs": "218995a8a0545f92ef19c900de661290d9643d7c7ca7f51d915cc9852f4af4e7",
+    "crates/lpm-security/src/behavioral/evidence.rs": "31c9fa7f5421d0b7abd395f27a9e223f23a9d13fad0b9ac0ad3d4454de14ba15",
+    "crates/lpm-security/src/behavioral/mod.rs": "2bc56bd23def80edceda1d7faf374f4c823ad327854282e8c6cb390b40f13685",
+    "crates/lpm-security/src/behavioral/threats.rs": "3b85b930f75012ad911928576df1603cb944c2aa53b19ea614b9481289cd0740",
+    "crates/lpm-security/src/behavioral/syntax.rs": "26226e170f09b64af6726edaa8fa06cf430ed91741f3b3bfe4dd2587ce84bb78",
+    "crates/lpm-security/src/behavioral/bindings.rs": "8b9b845f8397d2266e52cb19bfc187e0bf6a299623fdcedc649b77516fb3f671",
+    "crates/lpm-security/src/behavioral/secrets.rs": "49f33159be794891389255cdcdf1eea2da1ec8e4ca5a9d9112b1c97a0e3bdc44",
+    "crates/lpm-security/src/behavioral/threats/bundles.rs": "8cc67b440bb47a364d362205febdb68203d30f0cbbed2d8516a534bb93bd006c",
+    "crates/lpm-security/src/query.rs": "978194df7c293d12d9e8e889444b971813e4013d6b9f95cbbd003e14cd1a2633"
+  }
+}
