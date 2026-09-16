@@ -68,8 +68,9 @@ def family(name):
     return name
 
 
-def select_ranked_packages(names, count, excluded):
-    selected = [(rank, name) for rank, name in enumerate(names, 1) if name not in excluded][:count]
+def select_ranked_packages(names, count, excluded, excluded_families=frozenset()):
+    selected = [(rank, name) for rank, name in enumerate(names, 1)
+                if name not in excluded and family(name) not in excluded_families][:count]
     if count < 1 or len(selected) != count:
         raise ValueError("count exceeds available ranking after exclusions")
     return selected
@@ -108,7 +109,10 @@ def freeze(args):
     if len(set(names)) != len(names) or any(not PACKAGE_NAME.fullmatch(n) for n in names):
         raise ValueError("ranking contains invalid or duplicate package names")
     prior = json.loads(args.exclude_manifest.read_text())["packages"] if args.exclude_manifest else []
-    selected = select_ranked_packages(names, args.count, {package["name"] for package in prior})
+    excluded_families = ({family(p["name"]) for p in prior}
+                         if getattr(args, "exclude_prior_families", False) else set())
+    selected = select_ranked_packages(names, args.count, {package["name"] for package in prior},
+                                      excluded_families)
     metadata_dir = args.cache / "metadata"
     metadata_dir.mkdir(parents=True, exist_ok=True)
 
@@ -156,7 +160,8 @@ def freeze(args):
             if len(packages) == args.count:
                 break
             excluded = {p["name"] for p in prior + packages + unavailable}
-            selected = select_ranked_packages(names, args.count - len(packages), excluded)
+            selected = select_ranked_packages(names, args.count - len(packages), excluded,
+                                              excluded_families)
     packages.sort(key=lambda package: package["rank"])
     reserved = (validation_families([p["name"] for p in packages], args.validation_count,
                                    {family(p["name"]) for p in prior})
@@ -176,6 +181,7 @@ def freeze(args):
             "excluded_manifest_sha256": (hashlib.sha256(args.exclude_manifest.read_bytes()).hexdigest()
                                          if args.exclude_manifest else None),
             "validation_count": args.validation_count,
+            "exclude_prior_families": bool(excluded_families),
             "unavailable": sorted(unavailable, key=lambda entry: entry["rank"]),
             "split_method": ("whole-family exact subset, SHA-256 lpm-source-validation-v2 order; "
                              "prior families restricted to tuning" if reserved is not None
@@ -302,6 +308,7 @@ def main():
     parser.add_argument("--cache", type=Path, required=True)
     parser.add_argument("--count", type=int, default=1000)
     parser.add_argument("--exclude-manifest", type=Path)
+    parser.add_argument("--exclude-prior-families", action="store_true")
     parser.add_argument("--validation-count", type=int)
     parser.add_argument("--replace-unavailable", action="store_true")
     parser.add_argument("--workers", type=int, default=8)

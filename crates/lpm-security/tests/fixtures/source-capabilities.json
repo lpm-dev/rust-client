@@ -456,5 +456,24 @@
         "eval": true
       }
     }
+  },
+  {
+    "name": "quoted-obfuscator-example",
+    "source": "const example = \"var _0x1234=['a','b']; _0x5678(0x0); String.fromCharCode(42)\";",
+    "expected": {
+      "supplyChain": {
+        "obfuscated": false,
+        "possibleObfuscation": false
+      }
+    }
+  },
+  {
+    "name": "decoder-example-identifiers",
+    "source": "function decode(x) { return String.fromCharCode(x); } expect('\\\\x40', '@'); expect('var _0xaaaa=[\"a\",\"b\"]', true);",
+    "expected": {
+      "supplyChain": {
+        "obfuscated": false
+      }
+    }
   }
 ]

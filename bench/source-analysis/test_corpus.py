@@ -64,6 +64,11 @@ class CorpusTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "positive"):
             corpus.validation_families(names, 0, set())
 
+    def test_fresh_validation_selection_excludes_every_previously_seen_family(self):
+        names = ["@old/new", "lodash.more", "fresh", "@new/a", "@new/b"]
+        self.assertEqual(corpus.select_ranked_packages(names, 3, set(), {"@old", "lodash"}),
+                         [(3, "fresh"), (4, "@new/a"), (5, "@new/b")])
+
     def test_freeze_records_unavailable_names_and_only_replaces_missing_metadata(self):
         def fetch(url, limit):
             if url == corpus.RANKING_URL:
