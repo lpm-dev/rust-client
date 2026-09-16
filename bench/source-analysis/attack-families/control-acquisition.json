@@ -1,0 +1,162 @@
+[
+  {
+    "name": "eslint-scope",
+    "version": "3.7.1",
+    "role": "clean-before",
+    "tarball_sha256": "28d8af412475cdc7d88b58b7e71d6c55fab0b560535a6dce56b275474f27f2ef",
+    "compressed_bytes": 15576,
+    "expanded_bytes": 76067,
+    "files": 12,
+    "identical_duplicates": 0
+  },
+  {
+    "name": "eslint-scope",
+    "version": "3.7.3",
+    "role": "clean-after",
+    "tarball_sha256": "98745fcf1f63ffd967a2854c37d86ba55f96958b9baf70a101e3e5e89a2f7d48",
+    "compressed_bytes": 15613,
+    "expanded_bytes": 76067,
+    "files": 12,
+    "identical_duplicates": 0
+  },
+  {
+    "name": "ua-parser-js",
+    "version": "0.7.28",
+    "role": "clean-before",
+    "tarball_sha256": "416a7af001e40ea2430136873c638c8afe655a1485b62b3b9e0d7ed49535e46b",
+    "compressed_bytes": 55433,
+    "expanded_bytes": 300519,
+    "files": 20,
+    "identical_duplicates": 0
+  },
+  {
+    "name": "ua-parser-js",
+    "version": "0.7.30",
+    "role": "clean-after",
+    "tarball_sha256": "4d433579092044b1e3c17e01d94dc02f29cd133ab83cc3d5f70f35b4c3359056",
+    "compressed_bytes": 58999,
+    "expanded_bytes": 327144,
+    "files": 22,
+    "identical_duplicates": 0
+  },
+  {
+    "name": "npm",
+    "version": "6.14.18",
+    "role": "credential-control",
+    "tarball_sha256": "c9b15f277e2a0b1b57e05bad04504296a27024555d56c2aa967f862e957ad2ed",
+    "compressed_bytes": 4849875,
+    "expanded_bytes": 19039376,
+    "files": 4215,
+    "identical_duplicates": 0
+  },
+  {
+    "name": "@npmcli/config",
+    "version": "9.0.0",
+    "role": "credential-control",
+    "tarball_sha256": "644084ea14f8adbb3120dc4460d69f4c1322925c313646d27670eeb8c93df79b",
+    "compressed_bytes": 37770,
+    "expanded_bytes": 133550,
+    "files": 15,
+    "identical_duplicates": 0
+  },
+  {
+    "name": "npm-registry-fetch",
+    "version": "18.0.2",
+    "role": "credential-control",
+    "tarball_sha256": "d0242f5eac518e4d9dffb5b4d3caf75f5f0eb14b67722a2f6d4542115f952332",
+    "compressed_bytes": 14264,
+    "expanded_bytes": 44317,
+    "files": 9,
+    "identical_duplicates": 0
+  },
+  {
+    "name": "registry-auth-token",
+    "version": "5.1.0",
+    "role": "credential-control",
+    "tarball_sha256": "e6e073c5a00bfa2c47eee02ee72887caeb74d1220f7e83f8d485a0fd259879d2",
+    "compressed_bytes": 5772,
+    "expanded_bytes": 15777,
+    "files": 8,
+    "identical_duplicates": 0
+  },
+  {
+    "name": "esbuild",
+    "version": "0.25.0",
+    "role": "downloader-control",
+    "tarball_sha256": "b8f1eda6f66657b929c96660340bd4307b3d1718a8505d5e8e12ad8ea9ae8a10",
+    "compressed_bytes": 30616,
+    "expanded_bytes": 133970,
+    "files": 7,
+    "identical_duplicates": 0
+  },
+  {
+    "name": "playwright",
+    "version": "1.51.1",
+    "role": "downloader-entry-control",
+    "tarball_sha256": "3a6c0086adaa6db58f5d2d2e8c6e6feb6971084385efb9ff0efa4cac181334d0",
+    "compressed_bytes": 746672,
+    "expanded_bytes": 3205699,
+    "files": 111,
+    "identical_duplicates": 0
+  },
+  {
+    "name": "playwright-core",
+    "version": "1.51.1",
+    "role": "downloader-implementation-control",
+    "tarball_sha256": "780064c4e3d98a0f80d66afe8befb576a7a3471766ef3dfe6d46c9836fce5e6b",
+    "compressed_bytes": 1939928,
+    "expanded_bytes": 7933079,
+    "files": 334,
+    "identical_duplicates": 0
+  },
+  {
+    "name": "puppeteer",
+    "version": "24.4.0",
+    "role": "downloader-entry-control",
+    "tarball_sha256": "a441c875741c1706654cf5e9d7e2fb4958ff29c989957685969b06f3036e6232",
+    "compressed_bytes": 73536,
+    "expanded_bytes": 359014,
+    "files": 43,
+    "identical_duplicates": 0
+  },
+  {
+    "name": "@puppeteer/browsers",
+    "version": "2.9.0",
+    "role": "downloader-implementation-control",
+    "tarball_sha256": "a127ddd01597e1b353d15eb59995380921aafbd321b73ec1351e7a2264c23c8f",
+    "compressed_bytes": 78486,
+    "expanded_bytes": 531275,
+    "files": 158,
+    "identical_duplicates": 0
+  },
+  {
+    "name": "electron",
+    "version": "35.0.0",
+    "role": "downloader-entry-control",
+    "tarball_sha256": "6712e702bd8563d0ec75bf81e462ab3055d26792baefd22ffc9d5b3786c0b083",
+    "compressed_bytes": 174951,
+    "expanded_bytes": 1053421,
+    "files": 8,
+    "identical_duplicates": 0
+  },
+  {
+    "name": "@electron/get",
+    "version": "2.0.3",
+    "role": "downloader-implementation-control",
+    "tarball_sha256": "a53704cc26048fc06390114df0709c549fc47eaf63fe2c04684d37273548b9d3",
+    "compressed_bytes": 17544,
+    "expanded_bytes": 93636,
+    "files": 57,
+    "identical_duplicates": 0
+  },
+  {
+    "name": "prebuild-install",
+    "version": "7.1.3",
+    "role": "downloader-control",
+    "tarball_sha256": "6741b8ecf3c24c0a652748ca362560405b38797c760ccff531ab61f14930f9ab",
+    "compressed_bytes": 11276,
+    "expanded_bytes": 34180,
+    "files": 15,
+    "identical_duplicates": 0
+  }
+]

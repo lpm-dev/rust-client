@@ -1,0 +1,27 @@
+{
+  "frozen_at": "2026-09-16T17:15:20.350410+00:00",
+  "detector_commit": "12d0ba41331e6e29367ac49ac258626a85762cbd",
+  "scanner_sha256": "c993cc8e9d02c2a8c5dc5e737545f36e80d38724fd80d53fe902092452190728",
+  "source_sha256": {
+    "crates/lpm-security/src/behavioral/supply_chain.rs": "158861829a5dabb4297cf1ea4955fc63554d9a813670fcc03d4ed87928a9e9f6",
+    "crates/lpm-security/src/behavioral/manifest.rs": "d43ebd89a04499348437e4904a9c3615328cce9ad0f1e2cca3adfec2db8ca570",
+    "crates/lpm-security/src/behavioral/source.rs": "218995a8a0545f92ef19c900de661290d9643d7c7ca7f51d915cc9852f4af4e7",
+    "crates/lpm-security/src/behavioral/evidence.rs": "31c9fa7f5421d0b7abd395f27a9e223f23a9d13fad0b9ac0ad3d4454de14ba15",
+    "crates/lpm-security/src/behavioral/mod.rs": "2bc56bd23def80edceda1d7faf374f4c823ad327854282e8c6cb390b40f13685",
+    "crates/lpm-security/src/behavioral/threats.rs": "3b85b930f75012ad911928576df1603cb944c2aa53b19ea614b9481289cd0740",
+    "crates/lpm-security/src/behavioral/syntax.rs": "26226e170f09b64af6726edaa8fa06cf430ed91741f3b3bfe4dd2587ce84bb78",
+    "crates/lpm-security/src/behavioral/bindings.rs": "8b9b845f8397d2266e52cb19bfc187e0bf6a299623fdcedc649b77516fb3f671",
+    "crates/lpm-security/src/behavioral/secrets.rs": "49f33159be794891389255cdcdf1eea2da1ec8e4ca5a9d9112b1c97a0e3bdc44",
+    "crates/lpm-security/src/behavioral/threats/bundles.rs": "8cc67b440bb47a364d362205febdb68203d30f0cbbed2d8516a534bb93bd006c",
+    "crates/lpm-security/src/query.rs": "978194df7c293d12d9e8e889444b971813e4013d6b9f95cbbd003e14cd1a2633"
+  },
+  "inputs_sha256": {
+    "protocol.json": "a28008db216e7896a806e5381c6703859f4ed3954dd8f99680011480ea4e94a4",
+    "controls.json": "eb89e5572fb44588e52713363cda02b719d862109a23a3787447718a6652571b",
+    "control-acquisition.json": "1c639140f7cd0bf19bc24b7fea6b73c29b6cab0fbda4ed15730cb298c18ede27",
+    "references.json": "9ee8cecaab8f189557c257a6e4691703031ed2372aed316697d3c26bd4996ea9",
+    "historical-inputs.json": "c4191d41174c770e940c09f261d1288e8497553ca2199f1e95e015a1c405f882",
+    "prepare.py": "f9f0dd872231aaeb42f47f3b5e9544f525df9f0004f5c03dda109f4b041c605d"
+  },
+  "note": "Recorded before scanning these cases. No detector modifications are authorized in this pass."
+}

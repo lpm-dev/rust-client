@@ -29,6 +29,63 @@ spec = importlib.util.spec_from_file_location("historical", Path(__file__).with_
 historical = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(historical)
 
+spec = importlib.util.spec_from_file_location(
+    "attack_families", Path(__file__).parent / "attack-families" / "prepare.py"
+)
+attack_families = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(attack_families)
+
+
+class IncidentReconstructionTests(unittest.TestCase):
+    def test_reference_download_rejects_payload_hosts_and_redirects(self):
+        for url in ("http://raw.githubusercontent.com/example", "https://payload.invalid/code",
+                    "https://user@raw.githubusercontent.com/example",
+                    "https://raw.githubusercontent.com:8443/example"):
+            with self.subTest(url=url), self.assertRaisesRegex(ValueError, "origin"):
+                attack_families.fetch_reference(url)
+        self.assertIsNone(attack_families.NoRedirect().redirect_request(
+            None, None, 302, "", {}, "https://payload.invalid/code"))
+
+    def test_html_diff_preserves_entities_inline_changes_and_empty_lines(self):
+        parser = attack_families.DiffHTML()
+        parser.feed('''<div class="d2h-file-wrapper">
+          <span class="d2h-file-name"><a>package/entry.js</a></span>
+          <td class="d2h-info"><div class="d2h-code-line">@@ -0,0 +1,2 @@</div></td>
+          <td class="d2h-ins"><span class="d2h-code-line-ctn">const s = &quot;<ins>a&amp;b</ins>&quot;;</span></td>
+          <td class="d2h-ins"><span class="d2h-code-line-ctn"><br></span></td></div>''')
+        self.assertEqual(attack_families.apply_hunks("", parser.files["entry.js"]),
+                         'const s = "a&b";\n\n')
+
+    def test_html_diff_rejects_parent_paths_and_duplicate_files(self):
+        for path in ("package/../outside.js", "package/a\\b.js", "/outside.js"):
+            with self.subTest(path=path), self.assertRaisesRegex(ValueError, "unsafe"):
+                attack_families.DiffHTML().feed(f'<span class="d2h-file-name">{path}</span>')
+        with self.assertRaisesRegex(ValueError, "duplicate"):
+            attack_families.DiffHTML().feed(
+                '<span class="d2h-file-name">package/a.js</span>' * 2)
+
+    def test_reconstruction_keeps_unchanged_lines_between_hunks(self):
+        rows = [("@", "@@ -1,1 +1,1 @@"), ("-", "a"), ("+", "A"),
+                ("@", "@@ -3,1 +3,2 @@"), (" ", "c"), ("+", "new")]
+        self.assertEqual(attack_families.apply_hunks("a\nb\nc\nd\n", rows), "A\nb\nc\nnew\nd\n")
+
+    def test_reconstruction_rejects_wrong_base_truncated_hunks_and_offsets(self):
+        cases = [
+            ([("@", "@@ -1,1 +1,1 @@"), (" ", "wrong")], "context"),
+            ([("@", "@@ -1,1 +1,2 @@"), (" ", "a")], "line-count"),
+            ([("@", "@@ -1,1 +2,1 @@"), (" ", "a")], "offset"),
+            ([("@", "@@ -5,1 +5,1 @@"), (" ", "a")], "out-of-range"),
+            ([], "missing"),
+            ([("@", "unrecognized diff")], "header"),
+        ]
+        for rows, reason in cases:
+            with self.subTest(reason=reason), self.assertRaisesRegex(ValueError, reason):
+                attack_families.apply_hunks("a\n", rows)
+
+    def test_unchanged_diff_preserves_original_line_endings(self):
+        self.assertEqual(attack_families.apply_hunks("a\r\nb", [("@", "File without changes")]),
+                         "a\r\nb")
+
 
 class CorpusTests(unittest.TestCase):
     def test_ranking_accepts_legacy_uppercase_package_names(self):
