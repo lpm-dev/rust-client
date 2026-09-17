@@ -920,6 +920,8 @@ async fn outdated_does_not_report_an_installed_version_above_the_registry_latest
     let envelope: serde_json::Value =
         serde_json::from_slice(&out.stdout).expect("valid outdated envelope");
     assert_eq!(envelope["outdated_count"], serde_json::json!(0));
+    assert_eq!(envelope["packages"][0]["wanted"], "2.0.0");
+    assert!(envelope.get("unresolved").is_none());
     assert_eq!(
         envelope["packages"][0]["current"],
         serde_json::json!("2.0.0")
@@ -1675,3 +1677,6 @@ async fn outdated_json_envelope_with_one_outdated_pkg_matches_snapshot() {
         serde_json::from_slice(&out.stdout).expect("valid JSON envelope");
     insta::assert_json_snapshot!("outdated_json_envelope_one_outdated", envelope);
 }
+
+#[path = "outdated_contract/mod.rs"]
+mod outdated_contract;

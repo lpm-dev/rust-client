@@ -1,3 +1,5 @@
+mod json;
+
 use crate::install_ui;
 use crate::npm_public_source::{
     LockfileRootIndex, NpmMetadataSource, lockfile_npm_metadata_source,
@@ -48,7 +50,7 @@ struct MetadataJob {
 struct OutdatedResult {
     name: String,
     current: String,
-    wanted: Option<String>,
+    wanted: String,
     wanted_range: String,
     latest: String,
     section: &'static str,
@@ -132,7 +134,14 @@ pub async fn run(
             ))
         })?;
         let (lookup_name, version_range) = match parsed_specifier {
-            Specifier::SemverRange(range) => (dependency.name.clone(), range),
+            Specifier::SemverRange(range) => (
+                dependency.name.clone(),
+                if resolved_range.trim() == "latest" {
+                    "latest".to_string()
+                } else {
+                    range
+                },
+            ),
             Specifier::NpmAlias { target, range } => (target, range),
             Specifier::Workspace(_)
             | Specifier::Tarball { .. }
@@ -286,91 +295,18 @@ pub async fn run(
     drop(release_age_policy);
 
     if json_output {
-        let outdated_count = results.iter().filter(|result| result.outdated).count();
-        let result_count = results.len();
-        let package_json: Vec<_> = results
-            .into_iter()
-            .map(|result| {
-                serde_json::json!({
-                    "name": result.name,
-                    "current": result.current,
-                    "wanted": result.wanted,
-                    "wanted_range": result.wanted_range,
-                    "latest": result.latest,
-                    "section": result.section,
-                    "outdated": result.outdated,
-                })
-            })
-            .collect();
-        let mut json = serde_json::json!({
-            "schema_version": OUTDATED_JSON_SCHEMA_VERSION,
-            "success": lookup_failures.is_empty(),
-            "packages": package_json,
-            "count": result_count,
-            "outdated_count": outdated_count,
-        });
-        let lookup_failure_count = lookup_failures.len();
-        let lookup_failed = lookup_failure_count != 0;
-        let object = json.as_object_mut().ok_or_else(|| {
-            LpmError::Json(serde_json::Error::io(std::io::Error::other(
-                "outdated JSON envelope is not an object",
-            )))
-        })?;
-        if lookup_failed {
-            let unresolved_json: Vec<_> = lookup_failures
-                .into_iter()
-                .map(|failure| {
-                    serde_json::json!({
-                        "name": failure.name,
-                        "section": failure.section,
-                        "reason": failure.reason.as_ref(),
-                    })
-                })
-                .collect();
-            object.insert("unresolved".into(), serde_json::json!(unresolved_json));
-            object.insert(
-                "unresolved_count".into(),
-                serde_json::json!(lookup_failure_count),
-            );
-            object.insert(
-                "error".into(),
-                serde_json::json!(format!(
-                    "could not check {lookup_failure_count} package(s) due to registry lookup failures"
-                )),
-            );
-            object.insert("error_code".into(), serde_json::json!("registry"));
-        }
-        if !skipped_private.is_empty() {
-            object.insert(
-                "skipped_private_count".into(),
-                serde_json::json!(skipped_private.len()),
-            );
-            object.insert("skipped_private".into(), serde_json::json!(skipped_private));
-            object.insert(
-                "skipped_private_reason".into(),
-                serde_json::json!(
-                    "Packages without a recorded public npm or LPM-registry source were skipped to avoid leaking private names to registry.npmjs.org. Run `lpm install` to resolve sources, then re-run."
-                ),
-            );
-        }
-        if !skipped_non_registry.is_empty() {
-            object.insert(
-                "skipped_non_registry_count".into(),
-                serde_json::json!(skipped_non_registry.len()),
-            );
-            object.insert(
-                "skipped_non_registry".into(),
-                serde_json::json!(skipped_non_registry),
-            );
-            object.insert(
-                "skipped_non_registry_reason".into(),
-                serde_json::json!(
-                    "Local, workspace, Git, tarball, and JSR dependencies do not use registry version metadata and were skipped."
-                ),
-            );
-        }
-        println!("{}", serde_json::to_string_pretty(&json)?);
-        if lookup_failed {
+        use std::io::Write;
+        let mut writer = std::io::BufWriter::new(std::io::stdout().lock());
+        json::write(
+            &mut writer,
+            &results,
+            &lookup_failures,
+            &skipped_private,
+            &skipped_non_registry,
+        )?;
+        writer.write_all(b"\n")?;
+        writer.flush()?;
+        if !lookup_failures.is_empty() {
             return Err(LpmError::ExitCode(1));
         }
     } else {
@@ -386,7 +322,7 @@ pub async fn run(
             let rendered = outdated
                 .iter()
                 .map(|result| {
-                    let wanted = result.wanted.as_deref().unwrap_or("?");
+                    let wanted = result.wanted.as_str();
                     (
                         *result,
                         lpm_common::sanitize_terminal_inline(&result.name),
@@ -587,10 +523,20 @@ async fn fetch_metadata(
             let package = PackageName::parse(name).map_err(|error| {
                 LpmError::Script(format!("invalid LPM dependency name `{name}`: {error}"))
             })?;
-            client.get_package_metadata(&package).await
+            client
+                .revalidate_package_metadata_with_timings(&package)
+                .await
+                .map(|result| result.metadata)
         }
-        MetadataRoute::PublicNpm => client.get_npm_metadata_direct(name).await,
-        MetadataRoute::ConfiguredRegistry => client.get_npm_package_metadata_proxy_only(name).await,
+        MetadataRoute::PublicNpm => client
+            .revalidate_npm_metadata_direct_with_timings(name)
+            .await
+            .map(|result| result.metadata),
+        MetadataRoute::ConfiguredRegistry => {
+            client
+                .revalidate_npm_package_metadata_proxy_only(name)
+                .await
+        }
     }
 }
 
@@ -627,18 +573,24 @@ fn plan_outdated_result(
         &dependency.version_range,
         release_age_policy,
     ) {
-        Ok(wanted) => Some(wanted),
+        Ok(wanted) => wanted,
         Err(_)
             if Version::parse(&dependency.version_range).is_err()
                 && latest_version < current
                 && lpm_semver::VersionReq::parse(&dependency.version_range)
                     .is_ok_and(|requirement| requirement.matches(&current)) =>
         {
-            Some(installed.version.clone())
+            installed.version.clone()
         }
         Err(error) => return Err(error),
     };
-    let outdated = latest_version > current;
+    let wanted_version = Version::parse(&wanted).map_err(|error| {
+        LpmError::Registry(format!(
+            "registry selected invalid wanted version '{}@{wanted}': {error}",
+            metadata.name
+        ))
+    })?;
+    let outdated = latest_version > current || wanted_version > current;
 
     Ok(OutdatedResult {
         name: dependency.name.clone(),
