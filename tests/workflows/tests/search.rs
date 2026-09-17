@@ -87,7 +87,10 @@ async fn search_without_matches_warns_and_exits_zero() {
         "expected empty-result warning, got:\n{combined}"
     );
     assert!(
-        combined.contains("› Searching lpm.dev for \"@lpm.dev/nothing-here\""),
+        combined.contains(&format!(
+            "› Searching {} for \"@lpm.dev/nothing-here\"",
+            mock.url().trim_start_matches("http://")
+        )),
         "search must use a slim phase line, got:\n{combined}"
     );
     assert!(
@@ -189,4 +192,333 @@ async fn search_json_envelope_one_result_matches_snapshot() {
     );
 
     insta::assert_json_snapshot!("search_json_envelope_one_result", envelope);
+}
+
+#[tokio::test]
+async fn search_rejects_out_of_range_limits_before_network() {
+    for limit in ["0", "21", "4294967295"] {
+        let project = TempProject::empty(r#"{"name":"search-limits","version":"1.0.0"}"#);
+        let mock = MockRegistry::start().await;
+        mock.with_search_results(
+            "@lpm.dev/query",
+            limit.parse::<u32>().unwrap().min(20),
+            vec![],
+        )
+        .await;
+        let output = lpm_with_registry(&project, &mock.url())
+            .args(["search", "@lpm.dev/query", "--limit", limit])
+            .output()
+            .unwrap();
+        assert!(
+            !output.status.success(),
+            "limit {limit} must fail before the request"
+        );
+        assert!(mock.server().received_requests().await.unwrap().is_empty());
+    }
+}
+
+#[tokio::test]
+async fn search_accepts_both_limit_boundaries() {
+    for limit in ["1", "20"] {
+        let project = TempProject::empty(r#"{"name":"search-limits","version":"1.0.0"}"#);
+        let mock = MockRegistry::start().await;
+        mock.with_search_results("@lpm.dev/query", limit.parse().unwrap(), vec![])
+            .await;
+        let output = lpm_with_registry(&project, &mock.url())
+            .args(["search", "@lpm.dev/query", "--limit", limit, "--json"])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(json["count"], 0);
+    }
+}
+
+#[tokio::test]
+async fn search_rejects_malformed_npm_success_envelopes() {
+    use wiremock::{
+        Mock, ResponseTemplate,
+        matchers::{method, path},
+    };
+    for body in [
+        serde_json::json!({}),
+        serde_json::json!({"error":"access denied"}),
+        serde_json::json!({"objects":{}}),
+    ] {
+        let project = TempProject::empty(r#"{"name":"search-envelope","version":"1.0.0"}"#);
+        let mock = MockRegistry::start().await;
+        project.write_file(".npmrc", &format!("registry={}\n", mock.url()));
+        Mock::given(method("GET"))
+            .and(path("/-/v1/search"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&body))
+            .mount(mock.server())
+            .await;
+        let output = lpm_with_registry(&project, &mock.url())
+            .args(["search", "react", "--json"])
+            .output()
+            .unwrap();
+        assert!(
+            !output.status.success(),
+            "invalid response must fail: {body}; stdout={}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+    }
+}
+
+#[tokio::test]
+async fn search_accepts_valid_empty_and_populated_npm_envelopes() {
+    use wiremock::{
+        Mock, ResponseTemplate,
+        matchers::{method, path},
+    };
+    for objects in [
+        serde_json::json!([]),
+        serde_json::json!([{"package":{"name":"react","version":"1.2.3"}}]),
+    ] {
+        let project = TempProject::empty(r#"{"name":"search-envelope","version":"1.0.0"}"#);
+        let mock = MockRegistry::start().await;
+        project.write_file(".npmrc", &format!("registry={}\n", mock.url()));
+        Mock::given(method("GET"))
+            .and(path("/-/v1/search"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({"objects":objects})),
+            )
+            .mount(mock.server())
+            .await;
+        let output = lpm_with_registry(&project, &mock.url())
+            .args(["search", "react", "--json"])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(json["count"], objects.as_array().unwrap().len());
+    }
+}
+
+#[tokio::test]
+async fn search_npm_authentication_errors_explain_npmrc_credentials() {
+    use wiremock::{
+        Mock, ResponseTemplate,
+        matchers::{method, path},
+    };
+    for json in [false, true] {
+        let project = TempProject::empty(r#"{"name":"search-auth","version":"1.0.0"}"#);
+        let mock = MockRegistry::start().await;
+        project.write_file(".npmrc", &format!("registry={}\n", mock.url()));
+        Mock::given(method("GET"))
+            .and(path("/-/v1/search"))
+            .respond_with(ResponseTemplate::new(401))
+            .mount(mock.server())
+            .await;
+        let mut command = lpm_with_registry(&project, &mock.url());
+        command.args(["search", "react"]);
+        if json {
+            command.arg("--json");
+        }
+        let output = command.output().unwrap();
+        assert!(!output.status.success());
+        let combined = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            combined.contains(".npmrc"),
+            "wrong authentication advice: {combined}"
+        );
+        assert!(!combined.contains("lpm login") && !combined.contains("LPM_TOKEN"));
+    }
+}
+
+#[tokio::test]
+async fn search_rejects_registry_query_and_fragment_before_network() {
+    use wiremock::{Mock, ResponseTemplate, matchers::method};
+    for suffix in ["/base?mirror=1", "/base#fragment"] {
+        let project = TempProject::empty(r#"{"name":"search-url","version":"1.0.0"}"#);
+        let mock = MockRegistry::start().await;
+        project.write_file(".npmrc", &format!("registry=\"{}{suffix}\"\n", mock.url()));
+        Mock::given(method("GET"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({"objects":[]})),
+            )
+            .mount(mock.server())
+            .await;
+        let output = lpm_with_registry(&project, &mock.url())
+            .args(["search", "react", "--json"])
+            .output()
+            .unwrap();
+        assert!(
+            !output.status.success(),
+            "ambiguous registry URL must fail: {suffix}"
+        );
+        assert!(mock.server().received_requests().await.unwrap().is_empty());
+    }
+}
+
+#[tokio::test]
+async fn search_ignores_unrelated_lpm_tls_identity_in_proxy_mode() {
+    use wiremock::{
+        Mock, ResponseTemplate,
+        matchers::{method, path},
+    };
+    let project = TempProject::empty(r#"{"name":"search-tls","version":"1.0.0"}"#);
+    let lpm_mock = MockRegistry::start().await;
+    let npm_mock = MockRegistry::start().await;
+    let origin = "lpm-search.example.invalid";
+    project.write_file(
+        ".npmrc",
+        &format!("//{origin}/:certfile=missing-cert.pem\n//{origin}/:keyfile=missing-key.pem\n"),
+    );
+    Mock::given(method("GET"))
+        .and(path("/-/v1/search"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"objects":[]})))
+        .mount(npm_mock.server())
+        .await;
+    let output = lpm_with_registry(&project, "https://lpm-search.example.invalid")
+        .env("NPM_CONFIG_USERCONFIG", project.path().join(".npmrc"))
+        .env("LPM_INTERNAL_TEST_NPM_REGISTRY_URL", npm_mock.url())
+        .env("LPM_NPM_ROUTE", "proxy")
+        .args(["search", "react", "--json"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "unrelated LPM identity blocked npm search: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    assert!(
+        lpm_mock
+            .server()
+            .received_requests()
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        npm_mock.server().received_requests().await.unwrap().len(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn search_preserves_registry_path_prefix_and_scoped_credentials() {
+    use wiremock::{
+        Mock, ResponseTemplate,
+        matchers::{header, method, path, query_param},
+    };
+    let project = TempProject::empty(r#"{"name":"search-path","version":"1.0.0"}"#);
+    let mock = MockRegistry::start().await;
+    project.write_private_file(
+        ".npmrc",
+        &format!(
+            "@company:registry={}/npm/\n//{}/npm/:_authToken=search-secret\n",
+            mock.url(),
+            mock.url().trim_start_matches("http://")
+        ),
+    );
+    Mock::given(method("GET"))
+        .and(path("/npm/-/v1/search"))
+        .and(query_param("text", "@company/tool"))
+        .and(header("authorization", "Bearer search-secret"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"objects":[]})))
+        .expect(1)
+        .mount(mock.server())
+        .await;
+    let output = lpm_with_registry(&project, &mock.url())
+        .args(["search", "@company/tool", "--json"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+}
+
+#[tokio::test]
+async fn search_lpm_catalogue_remains_anonymous_with_available_credentials() {
+    let project = TempProject::empty(r#"{"name":"search-anonymous","version":"1.0.0"}"#);
+    let mock = MockRegistry::start().await;
+    let unused = MockRegistry::start().await;
+    project.write_private_file(
+        ".npmrc",
+        &format!(
+            "@lpm.dev:registry={}\n//{}/:_authToken=npm-secret\n",
+            unused.url(),
+            mock.url().trim_start_matches("http://")
+        ),
+    );
+    mock.with_search_results("@lpm.dev/alice", 20, vec![]).await;
+    let output = lpm_with_registry(&project, &mock.url())
+        .env("LPM_TOKEN", "ambient-secret")
+        .args([
+            "--token",
+            "explicit-secret",
+            "search",
+            "@lpm.dev/alice",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let requests = mock.server().received_requests().await.unwrap();
+    assert_eq!(requests.len(), 1);
+    assert!(requests[0].headers.get("authorization").is_none());
+    assert!(
+        unused
+            .server()
+            .received_requests()
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn search_enforces_limit_when_registry_returns_extra_results() {
+    use wiremock::{
+        Mock, ResponseTemplate,
+        matchers::{method, path},
+    };
+    for lpm_route in [true, false] {
+        let project = TempProject::empty(r#"{"name":"search-cap","version":"1.0.0"}"#);
+        let mock = MockRegistry::start().await;
+        let query = if lpm_route { "@lpm.dev/alice" } else { "react" };
+        if lpm_route {
+            mock.with_search_results(
+                query,
+                1,
+                vec![
+                    sample_search_package("first", 0),
+                    sample_search_package("second", 0),
+                ],
+            )
+            .await;
+        } else {
+            project.write_file(".npmrc", &format!("registry={}\n", mock.url()));
+            Mock::given(method("GET")).and(path("/-/v1/search"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"objects":[{"package":{"name":"first","version":"1.0.0"}},{"package":{"name":"second","version":"1.0.0"}}]})))
+                .mount(mock.server()).await;
+        }
+        let output = lpm_with_registry(&project, &mock.url())
+            .args(["search", query, "--limit", "1", "--json"])
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(json["count"], 1, "search must enforce its requested limit");
+        assert_eq!(json["packages"].as_array().unwrap().len(), 1);
+    }
 }

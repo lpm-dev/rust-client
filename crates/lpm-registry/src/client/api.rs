@@ -14,14 +14,18 @@ impl RegistryClient {
         query: &str,
         limit: u32,
     ) -> Result<SearchResponse, LpmError> {
+        validate_search_registry_base(&self.base_url)?;
         let url = format!(
             "{}/api/search/packages?q={}&limit={}&mode=semantic",
             self.base_url,
             urlencoding::encode(query),
             limit.min(20)
         );
-        self.get_json_anon(&url, AuthPosture::AnonymousPreferred)
-            .await
+        let mut results: SearchResponse = self
+            .get_json_anon(&url, AuthPosture::AnonymousPreferred)
+            .await?;
+        results.packages.truncate(limit.min(20) as usize);
+        Ok(results)
     }
 
     pub async fn search_npm_packages_routed(
@@ -58,7 +62,6 @@ impl RegistryClient {
     ) -> Result<SearchResponse, LpmError> {
         #[derive(serde::Deserialize)]
         struct NpmSearchEnvelope {
-            #[serde(default)]
             objects: Vec<NpmSearchObject>,
         }
 
@@ -75,6 +78,7 @@ impl RegistryClient {
             version: String,
         }
 
+        validate_search_registry_base(base_url)?;
         let destination = RequestDestination::parse(&format!(
             "{base_url}/-/v1/search?text={}&size={}",
             urlencoding::encode(query),
@@ -87,7 +91,14 @@ impl RegistryClient {
             .get(destination.as_url().clone())
             .header("Accept", "application/json");
         let req = apply_npmrc_auth_to_destination(req, &destination, auth)?;
-        let response = self.send_with_retry_with_npmrc_auth(req, auth).await?;
+        let response = self.send_with_retry_with_npmrc_auth(req, auth).await.map_err(|error| {
+            match error {
+                LpmError::AuthRequired => LpmError::Registry(
+                    "search authentication failed. Configure credentials in .npmrc for the selected npm-compatible registry.".into(),
+                ),
+                error => error,
+            }
+        })?;
         let envelope: NpmSearchEnvelope =
             parse_capped_api_json(response, &format!("response from {}", destination.as_str()))
                 .await?;
@@ -96,6 +107,7 @@ impl RegistryClient {
             packages: envelope
                 .objects
                 .into_iter()
+                .take(limit.min(20) as usize)
                 .map(|object| SearchPackage {
                     id: None,
                     name: object.package.name,
@@ -694,4 +706,14 @@ impl RegistryClient {
         }
         parse_capped_api_json(response, "tunnel diagnostic lookup response").await
     }
+}
+
+fn validate_search_registry_base(base_url: &str) -> Result<(), LpmError> {
+    let base = RequestDestination::parse(base_url)?;
+    if base.as_url().query().is_some() || base.as_url().fragment().is_some() {
+        return Err(LpmError::Registry(
+            "search registry URL must not contain a query or fragment".into(),
+        ));
+    }
+    Ok(())
 }

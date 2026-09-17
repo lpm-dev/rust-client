@@ -1,4 +1,4 @@
-use crate::commands::registry_reads::{prepare_routed_read_context, search_route_for_query};
+use crate::commands::registry_reads::prepare_search_read_context;
 use crate::install_ui;
 use lpm_common::{LpmError, sanitize_for_terminal};
 use lpm_registry::RegistryClient;
@@ -11,9 +11,8 @@ pub async fn run(
     limit: u32,
     json_output: bool,
 ) -> Result<(), LpmError> {
-    let context =
-        prepare_routed_read_context(client, project_dir, &[query.to_string()], json_output)?;
-    let route = search_route_for_query(&context.route_table, query);
+    let context = prepare_search_read_context(client, project_dir, query, json_output)?;
+    let route = context.route_table.route_for_package(query);
     if !json_output {
         let registry_label = search_registry_label(&context.client, &route);
         let query_safe = sanitize_for_terminal(query);
@@ -84,14 +83,18 @@ pub async fn run(
 }
 
 fn search_registry_label(client: &RegistryClient, route: &lpm_registry::UpstreamRoute) -> String {
-    match route {
-        lpm_registry::UpstreamRoute::LpmWorker => "lpm.dev".to_string(),
-        lpm_registry::UpstreamRoute::NpmDirect => {
-            install_ui::short_registry_host(client.npm_registry_url())
-        }
-        lpm_registry::UpstreamRoute::Custom { target, .. } => {
-            install_ui::short_registry_host(target.base_url.as_ref())
-        }
+    let base_url = match route {
+        lpm_registry::UpstreamRoute::LpmWorker => client.base_url(),
+        lpm_registry::UpstreamRoute::NpmDirect => client.npm_registry_url(),
+        lpm_registry::UpstreamRoute::Custom { target, .. } => target.base_url.as_ref(),
+    };
+    let host = install_ui::short_registry_host(base_url);
+    match reqwest::Url::parse(base_url)
+        .ok()
+        .and_then(|url| url.port())
+    {
+        Some(port) => format!("{host}:{port}"),
+        None => host,
     }
 }
 
