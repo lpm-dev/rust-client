@@ -9,6 +9,7 @@ use std::path::Path;
 pub(super) struct SwiftTraversal {
     resolved: HashMap<String, String>,
     warnings: Vec<String>,
+    pub(super) preview: super::preview::PreviewState,
 }
 
 impl SwiftTraversal {

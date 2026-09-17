@@ -1,0 +1,31 @@
+---
+source: tests/workflows/tests/add.rs
+expression: body
+---
+{
+  "success": true,
+  "dry_run": true,
+  "package": "restoration-preview",
+  "version": "2.0.0",
+  "target": "components",
+  "files": [
+    {
+      "path": "Keep.ts",
+      "action": "skip"
+    }
+  ],
+  "dependencies_count": 0,
+  "stale_files": [
+    {
+      "path": "components/Restore.ts",
+      "action": "restore"
+    }
+  ],
+  "dependencies_removed": [
+    {
+      "name": "preview-leaf",
+      "section": "dependencies",
+      "spec": "1.0.0"
+    }
+  ]
+}

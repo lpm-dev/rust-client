@@ -601,7 +601,7 @@ pub(crate) struct AddArgs {
     #[arg(long)]
     pub(crate) dry_run: bool,
 
-    /// Skip dependency installation after adding.
+    /// Skip consumer dependency changes. Still copy Swift source dependencies.
     #[arg(long)]
     pub(crate) no_install_deps: bool,
 
@@ -618,7 +618,7 @@ pub(crate) struct AddArgs {
     pub(crate) no_editor_setup: bool,
 
     /// Package manager for dependency installation (lpm, npm, pnpm, yarn, bun, auto).
-    #[arg(long, default_value = "lpm")]
+    #[arg(long, default_value = "lpm", value_parser = ["lpm", "npm", "pnpm", "yarn", "bun", "auto"])]
     pub(crate) pm: String,
 
     /// Import alias prefix (e.g., @/components). Overrides auto-detection.

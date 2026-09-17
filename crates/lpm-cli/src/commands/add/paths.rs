@@ -144,6 +144,15 @@ pub(super) fn resolve_safe_dest_validate(
     target_dir: &Path,
     dest_rel: &str,
 ) -> Result<PathBuf, LpmError> {
+    resolve_safe_dest_validate_planned(target_root_canonical, target_dir, dest_rel, false)
+}
+
+pub(super) fn resolve_safe_dest_validate_planned(
+    target_root_canonical: &Path,
+    target_dir: &Path,
+    dest_rel: &str,
+    removed_by_preview: bool,
+) -> Result<PathBuf, LpmError> {
     let rel_path = Path::new(dest_rel);
 
     // Reject absolute `dest_rel`. `Path::join(absolute)` would
@@ -181,7 +190,7 @@ pub(super) fn resolve_safe_dest_validate(
 
     // Refuse to overwrite/follow an existing symlink at the
     // destination itself. `symlink_metadata` does NOT follow links.
-    if let Ok(metadata) = std::fs::symlink_metadata(&dest) {
+    if !removed_by_preview && let Ok(metadata) = std::fs::symlink_metadata(&dest) {
         if lpm_common::is_symlink_or_junction(&metadata) {
             return Err(LpmError::Registry(format!(
                 "destination '{}' is a symlink; refusing to write through it",

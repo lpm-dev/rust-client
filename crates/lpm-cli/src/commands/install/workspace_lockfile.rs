@@ -511,6 +511,27 @@ pub(crate) async fn scope_member_install<F, T>(project_dir: &Path, future: F) ->
 where
     F: Future<Output = Result<T, LpmError>>,
 {
+    scope_member_install_with_projection_requirement(project_dir, future, true).await
+}
+
+pub(crate) async fn scope_member_source_delivery<F, T>(
+    project_dir: &Path,
+    future: F,
+) -> Result<T, LpmError>
+where
+    F: Future<Output = Result<T, LpmError>>,
+{
+    scope_member_install_with_projection_requirement(project_dir, future, false).await
+}
+
+async fn scope_member_install_with_projection_requirement<F, T>(
+    project_dir: &Path,
+    future: F,
+    require_projection: bool,
+) -> Result<T, LpmError>
+where
+    F: Future<Output = Result<T, LpmError>>,
+{
     let future = Box::pin(future);
     if active() {
         return future.await;
@@ -576,8 +597,16 @@ where
                         future,
                     )
                     .await?;
-                    let remove_legacy_importers =
-                        coordinator.commit(std::slice::from_ref(&importer))?;
+                    let has_staged_projection = !coordinator
+                        .staged
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .is_empty();
+                    let remove_legacy_importers = if require_projection || has_staged_projection {
+                        coordinator.commit(std::slice::from_ref(&importer))?
+                    } else {
+                        false
+                    };
                     commit_pending_manifest_transactions()?;
                     Ok::<_, LpmError>((result, remove_legacy_importers))
                 },
