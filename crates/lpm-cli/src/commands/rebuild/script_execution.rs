@@ -81,6 +81,7 @@ pub(super) fn execute_script(
         home_dir,
         tmpdir,
         lpm_sandbox::SandboxStdio::Inherit,
+        None,
     )?;
     let output_readers = spawn_sanitized_output_readers(&mut child, false);
 
@@ -177,8 +178,13 @@ pub(super) fn spawn_lifecycle_child(
     home_dir: &Path,
     tmpdir: &Path,
     stdin: lpm_sandbox::SandboxStdio,
+    retained_directory: Option<&cap_std::fs::Dir>,
 ) -> Result<std::process::Child, String> {
     use lpm_sandbox::{SandboxSpec, SandboxStdio, SandboxedCommand, new_for_platform_with_options};
+
+    if let Some(directory) = retained_directory {
+        validate_retained_lifecycle_directory(package_dir, directory)?;
+    }
 
     let spec = SandboxSpec {
         package_dir: package_dir.to_path_buf(),
@@ -202,6 +208,10 @@ pub(super) fn spawn_lifecycle_child(
     let sandbox = new_for_platform_with_options(spec, sandbox_mode, sandbox_options.clone())
         .map_err(|e| format!("sandbox init failed: {e}"))?;
 
+    if let Some(directory) = retained_directory {
+        validate_retained_lifecycle_directory(package_dir, directory)?;
+    }
+
     let (shell_program, shell_args) = platform_shell_invocation(cmd)?;
     let mut sbcmd = SandboxedCommand::new(shell_program);
     for arg in shell_args {
@@ -210,6 +220,17 @@ pub(super) fn spawn_lifecycle_child(
     sbcmd = sbcmd
         .current_dir(package_dir)
         .envs_cleared(envs.iter().map(|(k, v)| (k.clone(), v.clone())));
+    #[cfg(unix)]
+    if let Some(directory) = retained_directory {
+        sbcmd = sbcmd.current_dir_from_file(
+            directory
+                .try_clone()
+                .map_err(|error| error.to_string())?
+                .into_std_file(),
+        );
+    }
+    #[cfg(not(unix))]
+    let _ = retained_directory;
     sbcmd.stdout = SandboxStdio::Piped;
     sbcmd.stderr = SandboxStdio::Piped;
     sbcmd.stdin = stdin;
@@ -217,6 +238,23 @@ pub(super) fn spawn_lifecycle_child(
     sandbox
         .spawn(sbcmd)
         .map_err(|e| format!("failed to spawn: {e}"))
+}
+
+fn validate_retained_lifecycle_directory(
+    package_dir: &Path,
+    retained_directory: &cap_std::fs::Dir,
+) -> Result<(), String> {
+    use crate::commands::publish_common::{DirectoryIdentity, open_tarball_source_root};
+
+    let current = open_tarball_source_root(package_dir).map_err(|error| error.to_string())?;
+    let retained_identity =
+        DirectoryIdentity::from_directory(retained_directory).map_err(|error| error.to_string())?;
+    let current_identity =
+        DirectoryIdentity::from_directory(&current).map_err(|error| error.to_string())?;
+    if current_identity != retained_identity {
+        return Err("publish lifecycle directory changed; retry the command".into());
+    }
+    Ok(())
 }
 
 struct OutputReaders {
@@ -268,6 +306,7 @@ pub(in crate::commands) fn execute_publish_lifecycle_script(
     package_name: &str,
     package_version: &str,
     project_dir: &Path,
+    retained_directory: &cap_std::fs::Dir,
     envs: &[(String, String)],
     store_root: &Path,
     home_dir: &Path,
@@ -299,6 +338,7 @@ pub(in crate::commands) fn execute_publish_lifecycle_script(
         home_dir,
         tmpdir,
         lpm_sandbox::SandboxStdio::Null,
+        Some(retained_directory),
     )?;
     let output_readers = spawn_sanitized_output_readers(&mut child, true);
     let output = wait_with_timeout(child, &timeout);

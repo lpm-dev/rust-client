@@ -154,7 +154,6 @@ impl std::io::Write for CappedManifestWriter {
 #[derive(Debug, Clone)]
 struct WorkspaceManifest {
     name: String,
-    version: Version,
     path: PathBuf,
     manifest_path: PathBuf,
     original_bytes: Arc<[u8]>,
@@ -568,6 +567,16 @@ struct ResolvedPlannedManifest<'a> {
 }
 
 impl ReleasePlan {
+    pub(crate) fn validate_transaction(
+        &self,
+        root: &Path,
+        directory: &cap_std::fs::Dir,
+    ) -> Result<(), LpmError> {
+        let planned = self.planned_manifests()?;
+        resolve_planned_manifests_from_open_root(root, directory, &planned)?;
+        Ok(())
+    }
+
     pub(crate) fn to_json(&self, dry_run: bool) -> serde_json::Value {
         serde_json::json!({
             "success": true,
@@ -704,13 +713,12 @@ use transaction::*;
 use version_git::*;
 
 pub(crate) use planning::{
-    ensure_unique_selection, load_change_bumps, plan_workspace, sorted_selected_indices,
-    validate_workspace_internal_ranges,
+    ensure_unique_selection, load_change_bumps, plan_workspace_from_open_root,
+    sorted_selected_indices, validate_workspace_internal_ranges,
 };
 pub(crate) use transaction::{
     ensure_no_pending_release_transaction, ensure_no_pending_release_transaction_from_open_root,
-    has_release_transaction_from_open_root, recover_pending_operation_transaction,
-    recover_pending_release_transaction_from_open_root, write_planned_manifests,
+    has_release_transaction_from_open_root, recover_pending_release_transaction_from_open_root,
 };
 pub(crate) use version_git::create_version_commit_and_tag;
 
@@ -735,7 +743,8 @@ mod tests {
 
     fn workspace_with_app_dep(app_dep: &str) -> (TempDir, Workspace) {
         let tmp = TempDir::new().unwrap();
-        let root = tmp.path().to_path_buf();
+        let root = tmp.path().canonicalize().unwrap();
+        write_manifest(&root, r#"{"private":true,"workspaces":["packages/*"]}"#);
         let core = root.join("packages/core");
         let app = root.join("packages/app");
         write_manifest(&core, r#"{"name":"core","version":"1.2.3"}"#);
@@ -833,6 +842,38 @@ mod tests {
         let output = run_git(directory, &["rev-parse", "HEAD"]);
         assert!(output.status.success());
         String::from_utf8(output.stdout).unwrap().trim().to_string()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn live_release_rollback_refuses_a_replaced_member_with_identical_updated_bytes() {
+        let (_tmp, workspace) = workspace_with_app_dep("^1.2.3");
+        let manifests = major_release_manifests(&workspace);
+        let mut replacement = None;
+        let result = write_planned_manifests_with(&workspace.root, &manifests, |target, bytes| {
+            write_manifest_target_durable(target, bytes)?;
+            let directory = target.display.parent().unwrap();
+            std::fs::rename(directory, workspace.root.join("displaced-member"))?;
+            std::fs::create_dir(directory)?;
+            std::fs::write(&target.display, bytes)?;
+            replacement = Some((target.display.clone(), bytes.to_vec()));
+            Err(std::io::Error::other(
+                "injected failure after directory replacement",
+            ))
+        });
+        assert!(result.is_err());
+        let (path, bytes) = replacement.unwrap();
+        assert_eq!(
+            std::fs::read(path).unwrap(),
+            bytes,
+            "rollback rewrote the replacement member"
+        );
+        assert!(
+            workspace
+                .root
+                .join(".lpm/release-apply/journal.json")
+                .exists()
+        );
     }
 
     #[test]
@@ -1494,9 +1535,10 @@ mod tests {
         });
 
         assert!(
-            result.is_ok(),
-            "descriptor-relative apply failed: {result:?}"
+            result.is_err(),
+            "directory replacement was accepted: {result:?}"
         );
+        assert!(tmp.path().join(".lpm/release-apply/journal.json").exists());
         assert_eq!(std::fs::read(outside_manifest).unwrap(), original.as_ref());
         assert_eq!(
             std::fs::read(moved_dir.join("package.json")).unwrap(),

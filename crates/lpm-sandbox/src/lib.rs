@@ -501,6 +501,9 @@ pub struct SandboxedCommand {
     pub env_clear: bool,
     /// Working directory for the child. [`None`] inherits the parent's.
     pub current_dir: Option<PathBuf>,
+    /// Retained working directory for Unix children, selected before spawn.
+    #[cfg(unix)]
+    pub current_dir_file: Option<std::sync::Arc<std::fs::File>>,
     /// Wiring for the child's stdout.
     pub stdout: SandboxStdio,
     /// Wiring for the child's stderr.
@@ -520,6 +523,8 @@ impl SandboxedCommand {
             envs: Vec::new(),
             env_clear: false,
             current_dir: None,
+            #[cfg(unix)]
+            current_dir_file: None,
             stdout: SandboxStdio::Inherit,
             stderr: SandboxStdio::Inherit,
             stdin: SandboxStdio::Inherit,
@@ -552,6 +557,35 @@ impl SandboxedCommand {
     pub fn current_dir(mut self, dir: impl Into<PathBuf>) -> Self {
         self.current_dir = Some(dir.into());
         self
+    }
+    /// Bind a Unix child's working directory to an already-open directory.
+    #[cfg(unix)]
+    pub fn current_dir_from_file(mut self, directory: std::fs::File) -> Self {
+        self.current_dir_file = Some(std::sync::Arc::new(directory));
+        self
+    }
+
+    fn configure_current_dir(&self, command: &mut std::process::Command) {
+        #[cfg(unix)]
+        if let Some(directory) = &self.current_dir_file {
+            use std::os::fd::AsRawFd as _;
+            use std::os::unix::process::CommandExt as _;
+            let directory = std::sync::Arc::clone(directory);
+            // SAFETY: the closure owns the live descriptor; fchdir is async-signal-safe.
+            unsafe {
+                command.pre_exec(move || {
+                    if libc::fchdir(directory.as_raw_fd()) == 0 {
+                        Ok(())
+                    } else {
+                        Err(std::io::Error::last_os_error())
+                    }
+                });
+            }
+            return;
+        }
+        if let Some(path) = &self.current_dir {
+            command.current_dir(path);
+        }
     }
 }
 
@@ -1051,9 +1085,7 @@ impl Sandbox for NoopSandbox {
         for (k, v) in &cmd.envs {
             command.env(k, v);
         }
-        if let Some(dir) = &cmd.current_dir {
-            command.current_dir(dir);
-        }
+        cmd.configure_current_dir(&mut command);
         command.stdout(std::process::Stdio::from(cmd.stdout));
         command.stderr(std::process::Stdio::from(cmd.stderr));
         command.stdin(std::process::Stdio::from(cmd.stdin));

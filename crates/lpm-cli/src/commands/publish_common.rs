@@ -133,7 +133,7 @@ impl TarballSourceCursor {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum DirectoryIdentity {
+pub(crate) enum DirectoryIdentity {
     #[cfg(unix)]
     Unix { device: u64, inode: u64 },
     #[cfg(windows)]
@@ -1126,7 +1126,7 @@ impl TarballSourceRoot {
 
 impl DirectoryIdentity {
     #[cfg(unix)]
-    fn from_directory(directory: &Dir) -> std::io::Result<Self> {
+    pub(crate) fn from_directory(directory: &Dir) -> std::io::Result<Self> {
         use std::os::unix::fs::MetadataExt as _;
 
         let metadata = directory.try_clone()?.into_std_file().metadata()?;
@@ -1137,7 +1137,7 @@ impl DirectoryIdentity {
     }
 
     #[cfg(windows)]
-    fn from_directory(directory: &Dir) -> std::io::Result<Self> {
+    pub(crate) fn from_directory(directory: &Dir) -> std::io::Result<Self> {
         use std::os::windows::io::AsRawHandle as _;
         use windows_sys::Win32::Storage::FileSystem::{
             BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle,

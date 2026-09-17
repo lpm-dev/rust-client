@@ -415,9 +415,7 @@ impl Sandbox for LandlockSandbox {
         for (k, v) in &cmd.envs {
             command.env(k, v);
         }
-        if let Some(dir) = &cmd.current_dir {
-            command.current_dir(dir);
-        }
+        cmd.configure_current_dir(&mut command);
         command.stdout(Stdio::from(cmd.stdout));
         command.stderr(Stdio::from(cmd.stderr));
         command.stdin(Stdio::from(cmd.stdin));

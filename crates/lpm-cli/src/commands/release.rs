@@ -48,6 +48,7 @@ pub(crate) struct ReleasePublishOptions {
 
 struct ReleasePublishMember {
     path: PathBuf,
+    source_identity: publish_common::DirectoryIdentity,
     intent: publish::PublishIntent,
     publish_lifecycle: Option<Arc<publish::PublishLifecycle>>,
 }
@@ -147,6 +148,19 @@ impl SelectedReleaseWorkspaceRoot {
         Ok(())
     }
 
+    fn open_member(&self, path: &Path) -> Result<cap_std::fs::Dir, LpmError> {
+        self.validate_named_path()?;
+        let relative = path
+            .strip_prefix(&self.path)
+            .map_err(|_| LpmError::Registry("release member is outside the workspace".into()))?;
+        publish_common::open_cap_directory_path(&self.directory, relative)?.ok_or_else(|| {
+            LpmError::Registry(format!(
+                "release member directory changed: {}",
+                path.display()
+            ))
+        })
+    }
+
     fn discover(&self, start_dir: &Path) -> Result<lpm_workspace::Workspace, LpmError> {
         #[cfg(any(debug_assertions, feature = "acceptance-test-hooks"))]
         if let Some(marker_path) = std::env::var_os(RELEASE_WORKSPACE_DISCOVERY_MARKER_ENV) {
@@ -159,11 +173,15 @@ impl SelectedReleaseWorkspaceRoot {
                 .map_err(LpmError::Io)?;
             marker.write_all(b"discover\n").map_err(LpmError::Io)?;
         }
-        lpm_workspace::discover_workspace_from_open_root(&self.path, &self.directory, start_dir)
-            .map_err(|error| LpmError::Workspace(error.to_string()))?
-            .ok_or_else(|| {
-                LpmError::Script("no workspace found. `lpm release` requires a monorepo.".into())
-            })
+        lpm_workspace::discover_release_workspace_from_open_root(
+            &self.path,
+            &self.directory,
+            start_dir,
+        )
+        .map_err(|error| LpmError::Workspace(error.to_string()))?
+        .ok_or_else(|| {
+            LpmError::Script("no workspace found. `lpm release` requires a monorepo.".into())
+        })
     }
 }
 
@@ -192,32 +210,33 @@ pub(crate) fn apply(
         );
     }
 
-    let initial_workspace = discover_release_workspace(project_dir)?;
-    let initial_root = initial_workspace
-        .root
-        .canonicalize()
-        .map_err(LpmError::Io)?;
-    let allowed_manifests = release_workspace_manifest_paths(&initial_workspace, true);
+    let (initial_root, lock_directory, scope) = open_release_transaction(project_dir)?;
     let transaction_operation = release_apply_transaction_operation(selection, bump)?;
-    let lock_path = lpm_common::project_install_lock(&initial_root);
-    let plan = lpm_common::with_exclusive_lock(lock_path, || {
-        if matches!(
-            release_plan::recover_pending_operation_transaction(
-                &initial_root,
-                &allowed_manifests,
-                &transaction_operation,
-            )?,
-            release_plan::ReleaseOperationRecoveryOutcome::Completed { .. }
-        ) {
-            return Ok(None);
-        }
-        let workspace = discover_release_workspace(project_dir)?;
-        ensure_workspace_root_unchanged(&initial_root, &workspace.root)?;
-        let plan = build_plan_for_workspace(&workspace, selection, bump)?;
-        let planned = plan.planned_manifests()?;
-        release_plan::write_planned_manifests(&workspace.root, &planned, transaction_operation)?;
-        Ok(Some(plan))
-    })?;
+    let plan = lpm_common::with_project_exclusive_lock(
+        lock_directory,
+        lpm_common::ProjectLockKind::Install,
+        || {
+            scope.validate()?;
+            let allowed_manifests = lpm_workspace::workspace_manifest_paths_from_open_root(
+                &initial_root.path,
+                &initial_root.directory,
+            )
+            .map_err(|error| LpmError::Workspace(error.to_string()))?;
+            if matches!(
+                scope.recover(&allowed_manifests, &transaction_operation)?,
+                release_plan::ReleaseOperationRecoveryOutcome::Completed { .. }
+            ) {
+                return Ok(None);
+            }
+            let workspace = initial_root.discover(project_dir)?;
+            let plan =
+                build_plan_for_workspace(&workspace, &initial_root.directory, selection, bump)?;
+            scope.validate()?;
+            let planned = plan.planned_manifests()?;
+            scope.write_workspace(&planned, transaction_operation)?;
+            Ok(Some(plan))
+        },
+    )?;
     match plan {
         Some(plan) => emit_plan(&plan, false, json_output),
         None if json_output => {
@@ -344,12 +363,33 @@ async fn plan_release_publish_under_workspace_lock(
         .iter()
         .map(|index| workspace.members[*index].path.clone())
         .collect();
+    let mut source_identities = HashMap::with_capacity(publish_order.len());
+    for index in &publish_order {
+        let path = &workspace.members[*index].path;
+        let directory = initial_root.open_member(path)?;
+        source_identities.insert(
+            path.clone(),
+            publish_common::DirectoryIdentity::from_directory(&directory).map_err(LpmError::Io)?,
+        );
+    }
     let mut lifecycles = HashMap::with_capacity(publish_order.len());
     let mut has_lifecycle = false;
     for index in &publish_order {
         let member_path = &workspace.members[*index].path;
-        let lifecycle = publish::PublishLifecycle::load_for_publish(
+        let directory = initial_root.open_member(member_path)?;
+        if source_identities.get(member_path)
+            != Some(
+                &publish_common::DirectoryIdentity::from_directory(&directory)
+                    .map_err(LpmError::Io)?,
+            )
+        {
+            return Err(LpmError::Registry(
+                "release member directory changed before lifecycle execution".into(),
+            ));
+        }
+        let lifecycle = publish::PublishLifecycle::load_for_release(
             member_path,
+            &directory,
             options.yes,
             options.ignore_scripts,
             json_output,
@@ -395,6 +435,13 @@ async fn plan_release_publish_under_workspace_lock(
                     member.path.display()
                 ))
             })?;
+        let source_identity =
+            publish_common::DirectoryIdentity::from_directory(&directory).map_err(LpmError::Io)?;
+        if source_identities.get(&member.path) != Some(&source_identity) {
+            return Err(LpmError::Registry(
+                "release member directory changed after lifecycle execution".into(),
+            ));
+        }
         let source = publish::PublishSource::from_open_directory(member.path.clone(), directory)?;
         let intent = publish::plan_publish_intent_from_source(
             source,
@@ -407,6 +454,7 @@ async fn plan_release_publish_under_workspace_lock(
         )?;
         members.push(ReleasePublishMember {
             path: member.path.clone(),
+            source_identity,
             intent,
             publish_lifecycle: lifecycles.remove(&member.path).unwrap_or(None),
         });
@@ -435,14 +483,14 @@ async fn publish_intent_members(
         !options.dry_run,
     )?;
     let already_published = preflight_publish_members(client, &members, &publish_clients).await?;
-    let workspace = refresh_release_publish_workspace(&initial_root, &members)?;
+    let mut workspace = refresh_release_publish_workspace(&initial_root, &members)?;
 
     for (index, (member, is_published)) in members.iter().zip(&already_published).enumerate() {
         let name = member.intent.package_name().to_string();
         let version = member.intent.package_version().to_string();
         if *is_published {
             if let Err(error) =
-                validate_release_publish_member(&initial_root, &workspace, member, options)
+                validate_release_publish_member(&initial_root, &mut workspace, member, options)
             {
                 let error_summary = release_publish_error_summary(&error);
                 append_failed_and_unattempted_results(
@@ -470,7 +518,7 @@ async fn publish_intent_members(
 
         let prepared = match prepare_release_publish_member(
             &initial_root,
-            &workspace,
+            &mut workspace,
             member,
             options,
             json_output,
@@ -677,7 +725,7 @@ fn refresh_release_publish_workspace(
 
 fn current_release_publish_projection(
     initial_root: &SelectedReleaseWorkspaceRoot,
-    workspace: &ReleasePublishWorkspace,
+    workspace: &mut ReleasePublishWorkspace,
     member: &ReleasePublishMember,
     validate_workspace_generation: bool,
 ) -> Result<(lpm_workspace::Workspace, publish::PublishManifest), LpmError> {
@@ -695,14 +743,32 @@ fn current_release_publish_projection(
                 member.path.display()
             ))
         })?;
+    if publish_common::DirectoryIdentity::from_directory(&directory).map_err(LpmError::Io)?
+        != member.source_identity
+    {
+        return Err(LpmError::Registry(
+            "release member directory changed after preflight".into(),
+        ));
+    }
     let source = publish::PublishSource::from_open_directory(member.path.clone(), directory)?;
     let publish_manifest =
         publish::select_publish_projection(publish::read_publish_manifest_from_source(source)?)?;
+    if validate_workspace_generation {
+        workspace
+            .generation
+            .refresh_if_changed_from_open_root(
+                &initial_root.path,
+                &initial_root.directory,
+                &workspace.member_paths_by_name,
+                &workspace.member_paths,
+            )
+            .map_err(|error| LpmError::Workspace(error.to_string()))?;
+    }
     let projection_context = lpm_workspace::PublishProjectionContext::new(
         &workspace.member_paths_by_name,
         &workspace.member_paths,
         &workspace.generation,
-        validate_workspace_generation,
+        false,
     );
     let projection = lpm_workspace::read_publish_projection_from_open_root(
         &initial_root.path,
@@ -718,7 +784,7 @@ fn current_release_publish_projection(
 
 fn validate_release_publish_member(
     initial_root: &SelectedReleaseWorkspaceRoot,
-    workspace: &ReleasePublishWorkspace,
+    workspace: &mut ReleasePublishWorkspace,
     member: &ReleasePublishMember,
     options: &ReleasePublishOptions,
 ) -> Result<(), LpmError> {
@@ -739,7 +805,7 @@ fn validate_release_publish_member(
 
 async fn prepare_release_publish_member(
     initial_root: &SelectedReleaseWorkspaceRoot,
-    workspace: &ReleasePublishWorkspace,
+    workspace: &mut ReleasePublishWorkspace,
     member: &ReleasePublishMember,
     options: &ReleasePublishOptions,
     json_output: bool,
@@ -986,18 +1052,48 @@ fn build_plan_read_only(
     selection: &ReleaseSelection,
     bump: Option<&VersionBump>,
 ) -> Result<ReleasePlan, LpmError> {
-    let initial_workspace = discover_release_workspace(project_dir)?;
-    let initial_root = initial_workspace
-        .root
-        .canonicalize()
-        .map_err(LpmError::Io)?;
-    let lock_path = lpm_common::project_install_lock(&initial_root);
-    lpm_common::with_shared_lock(lock_path, || {
-        release_plan::ensure_no_pending_release_transaction(&initial_root)?;
-        let workspace = discover_release_workspace(project_dir)?;
-        ensure_workspace_root_unchanged(&initial_root, &workspace.root)?;
-        build_plan_for_workspace(&workspace, selection, bump)
-    })
+    let (initial_root, lock_directory, scope) = open_release_transaction(project_dir)?;
+    lpm_common::with_project_shared_lock(
+        lock_directory,
+        lpm_common::ProjectLockKind::Install,
+        || {
+            scope.ensure_no_pending()?;
+            let workspace = initial_root.discover(project_dir)?;
+            let plan =
+                build_plan_for_workspace(&workspace, &initial_root.directory, selection, bump)?;
+            scope.validate()?;
+            Ok(plan)
+        },
+    )
+}
+
+fn open_release_transaction(
+    project_dir: &Path,
+) -> Result<
+    (
+        SelectedReleaseWorkspaceRoot,
+        lpm_common::ProjectLockDirectory,
+        release_plan::VersionTransactionScope,
+    ),
+    LpmError,
+> {
+    let source = publish::PublishSource::open(project_dir)?;
+    let initial_root = SelectedReleaseWorkspaceRoot::from_open_project(
+        source.project_dir(),
+        &source.try_clone_directory()?,
+    )?;
+    let lock_directory = lpm_common::ProjectLockDirectory::open_or_create(
+        &initial_root.directory,
+        &initial_root.path,
+    )?;
+    let scope = release_plan::VersionTransactionScope::new(
+        &initial_root.path,
+        initial_root.directory.try_clone().map_err(LpmError::Io)?,
+        &lock_directory,
+        source.project_dir(),
+        source.try_clone_directory()?,
+    )?;
+    Ok((initial_root, lock_directory, scope))
 }
 
 pub(crate) fn release_workspace_manifest_paths(
@@ -1017,38 +1113,21 @@ pub(crate) fn release_workspace_manifest_paths(
     manifests
 }
 
-fn ensure_workspace_root_unchanged(expected: &Path, actual: &Path) -> Result<(), LpmError> {
-    let actual = actual.canonicalize().map_err(LpmError::Io)?;
-    if actual != expected {
-        return Err(LpmError::Script(format!(
-            "release workspace root changed while waiting for the transaction lock ({} -> {}); retry the command",
-            expected.display(),
-            actual.display()
-        )));
-    }
-    Ok(())
-}
-
 fn build_plan_for_workspace(
     workspace: &lpm_workspace::Workspace,
+    root: &cap_std::fs::Dir,
     selection: &ReleaseSelection,
     bump: Option<&VersionBump>,
 ) -> Result<ReleasePlan, LpmError> {
     let (graph, selected) = resolve_workspace_selection_for(workspace, selection)?;
     let selected = release_plan::ensure_unique_selection(&selected);
-    let change_bumps = release_plan::load_change_bumps(&workspace.root)?;
+    let change_bumps = release_plan::load_change_bumps(&workspace.root, root)?;
     let selected_set: HashSet<usize> = selected.iter().copied().collect();
     let sorted = release_plan::sorted_selected_indices(&graph, &selected_set)?;
-    release_plan::plan_workspace(workspace, &sorted, &change_bumps, bump)
-}
-
-fn discover_release_workspace(project_dir: &Path) -> Result<lpm_workspace::Workspace, LpmError> {
-    let workspace = lpm_workspace::discover_workspace(project_dir)
-        .map_err(|error| LpmError::Workspace(error.to_string()))?
-        .ok_or_else(|| {
-            LpmError::Script("no workspace found. `lpm release` requires a monorepo.".into())
-        })?;
-    Ok(workspace)
+    let plan =
+        release_plan::plan_workspace_from_open_root(workspace, root, &sorted, &change_bumps, bump)?;
+    plan.validate_transaction(&workspace.root, root)?;
+    Ok(plan)
 }
 
 fn resolve_workspace_selection_for(

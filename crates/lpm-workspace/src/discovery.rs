@@ -169,12 +169,40 @@ pub fn discover_workspace_from_open_root(
     root_dir: &cap_std::fs::Dir,
     start_dir: &Path,
 ) -> Result<Option<Workspace>, WorkspaceError> {
+    discover_workspace_with_member_reader(
+        root_path,
+        root_dir,
+        start_dir,
+        read_package_json_from_open_dir,
+    )
+}
+
+/// Discover release names, versions, dependency edges and publication configuration without retaining unrelated member fields.
+pub fn discover_release_workspace_from_open_root(
+    root_path: &Path,
+    root_dir: &cap_std::fs::Dir,
+    start_dir: &Path,
+) -> Result<Option<Workspace>, WorkspaceError> {
+    discover_workspace_with_member_reader(
+        root_path,
+        root_dir,
+        start_dir,
+        read_release_member_from_open_dir,
+    )
+}
+
+fn discover_workspace_with_member_reader(
+    root_path: &Path,
+    root_dir: &cap_std::fs::Dir,
+    start_dir: &Path,
+    read_member: fn(&cap_std::fs::Dir, &Path, &Path) -> Result<PackageJson, WorkspaceError>,
+) -> Result<Option<Workspace>, WorkspaceError> {
     let (root_package, pnpm_workspace) = read_workspace_root_from_open_dir(root_path, root_dir)?;
     let globs = workspace_member_globs(&root_package, pnpm_workspace.as_ref());
     if globs.is_empty() {
         return Ok(None);
     }
-    let members = discover_members_from_open_root(root_path, root_dir, &globs)?;
+    let members = discover_members_from_open_root(root_path, root_dir, &globs, read_member)?;
     validate_unique_package_names(root_path, &root_package, &members)?;
     warn_on_member_catalogs(&members);
     let workspace = Workspace {
@@ -413,6 +441,25 @@ pub fn capture_publish_workspace_generation_from_open_root(
 }
 
 impl PublishWorkspaceGeneration {
+    /// Refresh after a manifest edit only after checking the complete member set and names.
+    pub fn refresh_if_changed_from_open_root(
+        &mut self,
+        root_path: &Path,
+        root_dir: &cap_std::fs::Dir,
+        expected_paths_by_name: &HashMap<String, PathBuf>,
+        expected_member_paths: &[PathBuf],
+    ) -> Result<(), WorkspaceError> {
+        if !self.is_current(root_dir)? {
+            *self = capture_publish_workspace_generation_from_open_root(
+                root_path,
+                root_dir,
+                expected_paths_by_name,
+                expected_member_paths,
+            )?;
+        }
+        Ok(())
+    }
+
     fn is_current(&self, root_dir: &cap_std::fs::Dir) -> Result<bool, WorkspaceError> {
         for expected in &self.entries {
             let Some(metadata) = workspace_generation_metadata(root_dir, &expected.relative_path)?
@@ -624,6 +671,11 @@ fn compile_workspace_globs(
     root: &Path,
     globs: &[String],
 ) -> Result<(Vec<WorkspaceGlob>, Vec<WorkspaceGlob>), WorkspaceError> {
+    if globs.len() > 10_000 {
+        return Err(WorkspaceError::Parse(
+            "workspace scan exceeds the pattern limit of 10000".into(),
+        ));
+    }
     let mut inclusions = Vec::with_capacity(globs.len());
     let mut exclusions = Vec::new();
     for raw in globs {
@@ -741,6 +793,7 @@ fn validate_publish_workspace_names_from_open_root(
     expected_paths_by_name: &HashMap<String, PathBuf>,
     expected_member_paths: &[PathBuf],
 ) -> Result<(), WorkspaceError> {
+    tracing::trace!(target: "lpm_workspace::publish_name_scan", member_count = current_member_paths.len(), "publish workspace name scan");
     let expected_relative_paths = expected_member_paths
         .iter()
         .map(|path| {
@@ -933,6 +986,65 @@ fn read_package_json_from_open_dir(
             display_path.display()
         ))
     })
+}
+
+fn read_release_member_from_open_dir(
+    directory: &cap_std::fs::Dir,
+    relative: &Path,
+    display_path: &Path,
+) -> Result<PackageJson, WorkspaceError> {
+    struct ReleaseMemberVisitor;
+    impl<'de> serde::de::Visitor<'de> for ReleaseMemberVisitor {
+        type Value = serde_json::Value;
+        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("a package manifest object")
+        }
+        fn visit_map<A: serde::de::MapAccess<'de>>(
+            self,
+            mut map: A,
+        ) -> Result<Self::Value, A::Error> {
+            let mut fields = serde_json::Map::new();
+            while let Some(key) = map.next_key::<String>()? {
+                match key.as_str() {
+                    "name"
+                    | "version"
+                    | "dependencies"
+                    | "devDependencies"
+                    | "peerDependencies"
+                    | "optionalDependencies"
+                    | "catalogs"
+                    | "publishConfig" => {
+                        fields.insert(key, map.next_value()?);
+                    }
+                    _ => {
+                        map.next_value::<serde::de::IgnoredAny>()?;
+                    }
+                }
+            }
+            Ok(serde_json::Value::Object(fields))
+        }
+    }
+    let content = read_text_from_open_dir(
+        directory,
+        relative,
+        display_path,
+        lpm_common::CONFIG_FILE_SIZE_CAP_BYTES,
+        false,
+    )?
+    .ok_or_else(|| WorkspaceError::NotFound(display_path.display().to_string()))?;
+    let mut deserializer =
+        serde_json::Deserializer::from_str(lpm_common::strip_utf8_bom_str(&content));
+    let value = serde::Deserializer::deserialize_map(&mut deserializer, ReleaseMemberVisitor)
+        .map_err(|error| {
+            WorkspaceError::Parse(format!(
+                "failed to parse {}: {error}",
+                display_path.display()
+            ))
+        })?;
+    deserializer
+        .end()
+        .map_err(|error| WorkspaceError::Parse(error.to_string()))?;
+    crate::package_json::package_json_from_value(&value).map_err(WorkspaceError::Parse)
 }
 
 fn read_pnpm_workspace_from_open_dir(
@@ -1277,6 +1389,7 @@ fn discover_members_from_open_root(
     root_path: &Path,
     root_dir: &cap_std::fs::Dir,
     globs: &[String],
+    read_member: fn(&cap_std::fs::Dir, &Path, &Path) -> Result<PackageJson, WorkspaceError>,
 ) -> Result<Vec<WorkspaceMember>, WorkspaceError> {
     let (inclusions, exclusions) = compile_workspace_globs(root_path, globs)?;
     let member_scan =
@@ -1287,8 +1400,7 @@ fn discover_members_from_open_root(
             WorkspaceError::NotFound(root_path.join(&relative).display().to_string())
         })?;
         let display_path = root_path.join(&relative).join("package.json");
-        let package =
-            read_package_json_from_open_dir(&directory, Path::new("package.json"), &display_path)?;
+        let package = read_member(&directory, Path::new("package.json"), &display_path)?;
         members.push(WorkspaceMember {
             path: root_path.join(relative),
             package,
@@ -1297,12 +1409,24 @@ fn discover_members_from_open_root(
     Ok(members)
 }
 
+fn retain_workspace_scan_path(path: &Path, bytes: &mut usize) -> Result<(), WorkspaceError> {
+    *bytes = bytes.saturating_add(path.as_os_str().as_encoded_bytes().len());
+    if *bytes > lpm_common::CONFIG_FILE_SIZE_CAP_BYTES as usize {
+        return Err(WorkspaceError::Parse(
+            "workspace scan exceeds the 16 MiB path budget".into(),
+        ));
+    }
+    Ok(())
+}
+
 fn discover_member_paths_from_open_root(
     root_path: &Path,
     root_dir: &cap_std::fs::Dir,
     inclusions: &[WorkspaceGlob],
     exclusions: &[WorkspaceGlob],
 ) -> Result<WorkspaceMemberScan, WorkspaceError> {
+    let mut inspected_entries = 0usize;
+    let mut retained_path_bytes = 0usize;
     let mut members = std::collections::BTreeSet::new();
     let mut directories = std::collections::BTreeSet::new();
     let match_options = glob::MatchOptions {
@@ -1330,6 +1454,7 @@ fn discover_member_paths_from_open_root(
             let Some(directory) = open_relative_directory(root_dir, &relative)? else {
                 continue;
             };
+            retain_workspace_scan_path(&relative, &mut retained_path_bytes)?;
             directories.insert(relative.clone());
             if inclusion.matches_directory(&relative, match_options)
                 && !exclusions
@@ -1341,6 +1466,7 @@ fn discover_member_paths_from_open_root(
                     Ok(metadata)
                         if metadata.is_file() && !metadata_is_link_or_reparse(&metadata) =>
                     {
+                        retain_workspace_scan_path(&relative, &mut retained_path_bytes)?;
                         members.insert(relative.clone());
                     }
                     Ok(_) => {
@@ -1371,6 +1497,12 @@ fn discover_member_paths_from_open_root(
                 ))
             })?;
             for entry in entries {
+                inspected_entries += 1;
+                if inspected_entries > 100_000 {
+                    return Err(WorkspaceError::Parse(
+                        "workspace scan exceeds the directory entry limit of 100000".into(),
+                    ));
+                }
                 let entry = entry.map_err(|error| {
                     WorkspaceError::Io(format!(
                         "failed to read {}: {error}",
@@ -1392,7 +1524,9 @@ fn discover_member_paths_from_open_root(
                 if metadata_is_link_or_reparse(&metadata) || !metadata.is_dir() {
                     continue;
                 }
-                pending.push((relative.join(name), depth + 1));
+                let child = relative.join(name);
+                retain_workspace_scan_path(&child, &mut retained_path_bytes)?;
+                pending.push((child, depth + 1));
             }
         }
     }

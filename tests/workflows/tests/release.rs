@@ -1,3 +1,4 @@
+mod release_contract;
 mod support;
 
 use base64::Engine as _;
