@@ -53,9 +53,7 @@ async fn publish_current_project_locked(
         .publish_config
         .as_ref()
         .and_then(|config| config.npm.as_ref());
-    let npm_name = npm_config
-        .and_then(|config| config.name.clone())
-        .map_or_else(|| publish_npm::resolve_npm_name(&prepared.name, None), Ok)?;
+    let npm_name = publish_npm::resolve_npm_name(&prepared.name, npm_config)?;
     let rewritten_tarball = publish_common::rewrite_tarball_name_for_publish(
         &prepared.tarball_data,
         &prepared.name,
@@ -71,7 +69,7 @@ async fn publish_current_project_locked(
     let registry =
         npm_stage::resolve_npm_stage_registry_with_source(npm_config, options.npm_registry)?;
     let access = resolve_stage_access(options.access, &npm_name, npm_config)?;
-    let (tag, tag_explicit) = resolve_stage_tag(options.tag, npm_config);
+    let (tag, tag_explicit) = resolve_stage_tag(options.tag, npm_config)?;
     let (provenance_source, provenance_pkg_json) = prepared
         .publish_control
         .as_ref()
@@ -157,7 +155,7 @@ async fn publish_current_project_locked(
             "tag": tag,
             "access": access,
             "files": prepared.tarball_files.len(),
-            "tarball_size": prepared.tarball_size,
+            "tarball_size": rewritten_tarball.as_ref().map_or(prepared.tarball_size, |tarball| tarball.len()),
             "quality": quality,
         });
         if options.json_output {
@@ -280,7 +278,7 @@ pub(crate) async fn list(
     npm_registry: Option<&str>,
     json_output: bool,
 ) -> Result<(), LpmError> {
-    let npm_config = read_npm_config(cwd);
+    let npm_config = read_npm_config(cwd)?;
     let registry =
         npm_stage::resolve_npm_stage_registry_with_source(npm_config.as_ref(), npm_registry)?;
     let package_filter = npm_stage::parse_stage_list_filter(package)?;
@@ -313,7 +311,7 @@ pub(crate) async fn view(
     npm_registry: Option<&str>,
     json_output: bool,
 ) -> Result<(), LpmError> {
-    let npm_config = read_npm_config(cwd);
+    let npm_config = read_npm_config(cwd)?;
     let registry =
         npm_stage::resolve_npm_stage_registry_with_source(npm_config.as_ref(), npm_registry)?;
     let token = npm_token(&registry)?;
@@ -362,7 +360,7 @@ pub(crate) async fn download(
     npm_registry: Option<&str>,
     json_output: bool,
 ) -> Result<(), LpmError> {
-    let npm_config = read_npm_config(cwd);
+    let npm_config = read_npm_config(cwd)?;
     let registry =
         npm_stage::resolve_npm_stage_registry_with_source(npm_config.as_ref(), npm_registry)?;
     let token = npm_token(&registry)?;
@@ -397,7 +395,7 @@ async fn mutate_stage(
     yes: bool,
     approve: bool,
 ) -> Result<(), LpmError> {
-    let npm_config = read_npm_config(cwd);
+    let npm_config = read_npm_config(cwd)?;
     let registry =
         npm_stage::resolve_npm_stage_registry_with_source(npm_config.as_ref(), npm_registry)?;
     let token = npm_token(&registry)?;
@@ -445,12 +443,11 @@ fn auth_policy(registry: &npm_stage::NpmStageRegistry) -> npm_auth::NpmRegistryA
     }
 }
 
-fn read_npm_config(cwd: &Path) -> Option<NpmPublishConfig> {
-    lpm_json::read_lpm_json(cwd)
-        .ok()
-        .flatten()
+fn read_npm_config(cwd: &Path) -> Result<Option<NpmPublishConfig>, LpmError> {
+    Ok(lpm_json::read_lpm_json(cwd)
+        .map_err(|error| LpmError::Registry(format!("invalid lpm.json: {error}")))?
         .and_then(|config| config.publish)
-        .and_then(|publish| publish.npm)
+        .and_then(|publish| publish.npm))
 }
 
 fn resolve_stage_access(
@@ -462,6 +459,11 @@ fn resolve_stage_access(
         || publish_npm::resolve_npm_access(npm_name, npm_config),
         str::to_string,
     );
+    if access == "restricted" && !npm_name.starts_with('@') {
+        return Err(LpmError::Registry(
+            "npm cannot restrict access to an unscoped package".into(),
+        ));
+    }
     match access.as_str() {
         "public" | "restricted" => Ok(access),
         other => Err(LpmError::Registry(format!(
@@ -473,14 +475,11 @@ fn resolve_stage_access(
 fn resolve_stage_tag(
     cli_tag: Option<&str>,
     npm_config: Option<&NpmPublishConfig>,
-) -> (String, bool) {
-    if let Some(tag) = cli_tag {
-        return (tag.to_string(), true);
-    }
-    if let Some(tag) = npm_config.and_then(|config| config.tag.as_deref()) {
-        return (tag.to_string(), true);
-    }
-    ("latest".to_string(), false)
+) -> Result<(String, bool), LpmError> {
+    let explicit_tag = cli_tag.or_else(|| npm_config.and_then(|config| config.tag.as_deref()));
+    let tag = explicit_tag.unwrap_or("latest");
+    publish_npm::validate_npm_tag(tag)?;
+    Ok((tag.to_string(), explicit_tag.is_some()))
 }
 
 fn print_stage_item(item: &serde_json::Value) {
@@ -530,7 +529,7 @@ mod tests {
             ..NpmPublishConfig::default()
         };
         assert_eq!(
-            resolve_stage_tag(None, Some(&config)),
+            resolve_stage_tag(None, Some(&config)).unwrap(),
             ("next".to_string(), true)
         );
     }
