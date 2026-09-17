@@ -25,11 +25,11 @@ pub(super) const MAX_PENDING_METADATA_CACHE_BYTES: usize = 128 * 1024 * 1024;
 /// On format change, bump the trailing version number — old cache
 /// entries fail the magic match and are silently treated as misses.
 ///
-/// V4 invalidates typed payloads written before the current persisted
+/// V5 invalidates typed payloads written before the current persisted
 /// metadata schema and stores each response's bounded local freshness.
 /// The magic also salts cache filenames, so schema-old entries cannot make
 /// the resolver's stat-only batch probe disagree with the typed reader.
-pub(super) const METADATA_CACHE_MAGIC: &[u8] = b"LPM-MD-V4\n";
+pub(super) const METADATA_CACHE_MAGIC: &[u8] = b"LPM-MD-V5\n";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum MetadataCacheDirective {
@@ -620,7 +620,7 @@ impl RegistryClient {
     /// Returns `(PackageMetadata, Option<etag>)`. The ETag (if present) can be
     /// sent as `If-None-Match` on the next request to enable 304 responses.
     ///
-    /// Cache format (v4): `LPM-MD-V4\n{freshness_seconds}\n{ETag}\n{binary_data}`
+    /// Cache format (v5): `LPM-MD-V5\n{freshness_seconds}\n{ETag}\n{binary_data}`
     /// - Bytes 0..MAGIC.len(): magic header (ends in `\n`)
     /// - After magic, up to next `\n`: local freshness in seconds
     /// - Next line: ETag string (empty if absent)
@@ -1246,7 +1246,7 @@ mod cache_control_tests {
 mod metadata_cache_schema_tests {
     use super::*;
 
-    fn package_metadata_v4_fields(metadata: PackageMetadata) {
+    fn package_metadata_v5_fields(metadata: PackageMetadata) {
         let PackageMetadata {
             name: _,
             description: _,
@@ -1262,7 +1262,7 @@ mod metadata_cache_schema_tests {
         } = metadata;
     }
 
-    fn version_metadata_v4_fields(metadata: VersionMetadata) {
+    fn version_metadata_v5_fields(metadata: VersionMetadata) {
         let VersionMetadata {
             name: _,
             version: _,
@@ -1286,6 +1286,8 @@ mod metadata_cache_schema_tests {
             npm_user: _,
             behavioral_tags: _,
             lifecycle_scripts: _,
+            scripts: _,
+            has_install_script: _,
             security_findings: _,
             quality_score: _,
             vulnerabilities: _,
@@ -1293,11 +1295,11 @@ mod metadata_cache_schema_tests {
         } = metadata;
     }
 
-    fn peer_dependency_meta_v4_fields(metadata: PeerDependencyMeta) {
+    fn peer_dependency_meta_v5_fields(metadata: PeerDependencyMeta) {
         let PeerDependencyMeta { optional: _ } = metadata;
     }
 
-    fn vulnerability_v4_fields(vulnerability: Vulnerability) {
+    fn vulnerability_v5_fields(vulnerability: Vulnerability) {
         let Vulnerability {
             id: _,
             summary: _,
@@ -1306,7 +1308,7 @@ mod metadata_cache_schema_tests {
         } = vulnerability;
     }
 
-    fn behavioral_tags_v4_fields(tags: BehavioralTags) {
+    fn behavioral_tags_v5_fields(tags: BehavioralTags) {
         let BehavioralTags {
             eval: _,
             child_process: _,
@@ -1333,7 +1335,7 @@ mod metadata_cache_schema_tests {
         } = tags;
     }
 
-    fn security_finding_v4_fields(finding: SecurityFinding) {
+    fn security_finding_v5_fields(finding: SecurityFinding) {
         let SecurityFinding {
             severity: _,
             description: _,
@@ -1341,14 +1343,14 @@ mod metadata_cache_schema_tests {
         } = finding;
     }
 
-    fn swift_meta_v4_fields(metadata: SwiftMeta) {
+    fn swift_meta_v5_fields(metadata: SwiftMeta) {
         let SwiftMeta {
             products: _,
             platforms: _,
         } = metadata;
     }
 
-    fn swift_product_v4_fields(product: SwiftProduct) {
+    fn swift_product_v5_fields(product: SwiftProduct) {
         let SwiftProduct {
             name: _,
             product_type: _,
@@ -1356,14 +1358,14 @@ mod metadata_cache_schema_tests {
         } = product;
     }
 
-    fn swift_platform_v4_fields(platform: SwiftPlatform) {
+    fn swift_platform_v5_fields(platform: SwiftPlatform) {
         let SwiftPlatform {
             platform_name: _,
             version: _,
         } = platform;
     }
 
-    fn dist_info_v4_fields(dist: DistInfo) {
+    fn dist_info_v5_fields(dist: DistInfo) {
         let DistInfo {
             tarball: _,
             integrity: _,
@@ -1374,25 +1376,25 @@ mod metadata_cache_schema_tests {
         } = dist;
     }
 
-    fn npm_user_metadata_v4_fields(metadata: NpmUserMetadata) {
+    fn npm_user_metadata_v5_fields(metadata: NpmUserMetadata) {
         let NpmUserMetadata {
             trusted_publisher: _,
             approver: _,
         } = metadata;
     }
 
-    fn registry_signature_v4_fields(signature: RegistrySignature) {
+    fn registry_signature_v5_fields(signature: RegistrySignature) {
         let RegistrySignature { keyid: _, sig: _ } = signature;
     }
 
-    fn attestation_ref_v4_fields(attestation: AttestationRef) {
+    fn attestation_ref_v5_fields(attestation: AttestationRef) {
         let AttestationRef {
             url: _,
             provenance: _,
         } = attestation;
     }
 
-    fn release_time_metadata_v4_fields(metadata: ReleaseTimeMetadata) {
+    fn release_time_metadata_v5_fields(metadata: ReleaseTimeMetadata) {
         let ReleaseTimeMetadata {
             name: _,
             time: _,
@@ -1400,7 +1402,7 @@ mod metadata_cache_schema_tests {
         } = metadata;
     }
 
-    fn release_time_version_metadata_v4_fields(metadata: ReleaseTimeVersionMetadata) {
+    fn release_time_version_metadata_v5_fields(metadata: ReleaseTimeVersionMetadata) {
         let ReleaseTimeVersionMetadata {
             os: _,
             cpu: _,
@@ -1409,23 +1411,23 @@ mod metadata_cache_schema_tests {
     }
 
     #[test]
-    fn persisted_metadata_schema_v4_fields_are_exhaustive() {
-        assert_eq!(METADATA_CACHE_MAGIC, b"LPM-MD-V4\n");
-        let _: fn(PackageMetadata) = package_metadata_v4_fields;
-        let _: fn(VersionMetadata) = version_metadata_v4_fields;
-        let _: fn(PeerDependencyMeta) = peer_dependency_meta_v4_fields;
-        let _: fn(Vulnerability) = vulnerability_v4_fields;
-        let _: fn(BehavioralTags) = behavioral_tags_v4_fields;
-        let _: fn(SecurityFinding) = security_finding_v4_fields;
-        let _: fn(SwiftMeta) = swift_meta_v4_fields;
-        let _: fn(SwiftProduct) = swift_product_v4_fields;
-        let _: fn(SwiftPlatform) = swift_platform_v4_fields;
-        let _: fn(DistInfo) = dist_info_v4_fields;
-        let _: fn(NpmUserMetadata) = npm_user_metadata_v4_fields;
-        let _: fn(RegistrySignature) = registry_signature_v4_fields;
-        let _: fn(AttestationRef) = attestation_ref_v4_fields;
-        let _: fn(ReleaseTimeMetadata) = release_time_metadata_v4_fields;
-        let _: fn(ReleaseTimeVersionMetadata) = release_time_version_metadata_v4_fields;
+    fn persisted_metadata_schema_v5_fields_are_exhaustive() {
+        assert_eq!(METADATA_CACHE_MAGIC, b"LPM-MD-V5\n");
+        let _: fn(PackageMetadata) = package_metadata_v5_fields;
+        let _: fn(VersionMetadata) = version_metadata_v5_fields;
+        let _: fn(PeerDependencyMeta) = peer_dependency_meta_v5_fields;
+        let _: fn(Vulnerability) = vulnerability_v5_fields;
+        let _: fn(BehavioralTags) = behavioral_tags_v5_fields;
+        let _: fn(SecurityFinding) = security_finding_v5_fields;
+        let _: fn(SwiftMeta) = swift_meta_v5_fields;
+        let _: fn(SwiftProduct) = swift_product_v5_fields;
+        let _: fn(SwiftPlatform) = swift_platform_v5_fields;
+        let _: fn(DistInfo) = dist_info_v5_fields;
+        let _: fn(NpmUserMetadata) = npm_user_metadata_v5_fields;
+        let _: fn(RegistrySignature) = registry_signature_v5_fields;
+        let _: fn(AttestationRef) = attestation_ref_v5_fields;
+        let _: fn(ReleaseTimeMetadata) = release_time_metadata_v5_fields;
+        let _: fn(ReleaseTimeVersionMetadata) = release_time_version_metadata_v5_fields;
     }
 }
 

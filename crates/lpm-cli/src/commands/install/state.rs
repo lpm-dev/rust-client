@@ -249,6 +249,7 @@ pub(super) async fn run_install_freshness_phase(
         );
     let cleanup_catalogs_in_pipeline = input.requested_add_count.is_none();
     let fast_path_base_eligible = !input.force
+        && !root_versions::active(input.project_dir)
         && !input.offline
         && (input.no_skills
             || crate::commands::skills::package::materialization_complete(

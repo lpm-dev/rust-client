@@ -147,6 +147,8 @@ fn make_metadata(versions: &[&str], latest: &str) -> lpm_registry::PackageMetada
                 npm_user: None,
                 behavioral_tags: None,
                 lifecycle_scripts: None,
+                scripts: None,
+                has_install_script: None,
                 security_findings: None,
                 quality_score: None,
                 vulnerabilities: None,

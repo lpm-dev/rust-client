@@ -45,6 +45,7 @@ mod recursive;
 mod report_capture;
 mod reporting;
 mod resolve;
+pub(crate) mod root_versions;
 mod setup;
 mod skills;
 mod source_resolution;
@@ -970,7 +971,7 @@ async fn run_with_options_under_store_lock(
         client,
         gate_stats: &gate_stats,
         frozen_lockfile_active,
-        force,
+        force: force || root_versions::active(project_dir),
         overrides_changed,
         patches_changed,
         workspace_root_provider_state_changed,
@@ -1064,6 +1065,7 @@ async fn run_with_options_under_store_lock(
     };
 
     if !workspace_resolution::active()
+        && !root_versions::active(project_dir)
         && experimental_resolver::should_run(
             experimental_resolver::ExperimentalResolverAdmission {
                 json_output,

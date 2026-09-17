@@ -965,7 +965,7 @@ async fn resolve_with_prefetch_handles_root_npm_alias() {
     let resolved_names: HashSet<String> = result
         .packages
         .iter()
-        .map(|p| p.package.to_string())
+        .map(|p| p.package.canonical_name())
         .collect();
     assert!(
         resolved_names.contains("strip-ansi"),

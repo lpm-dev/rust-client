@@ -11,7 +11,7 @@ pub(super) fn root_resolutions_from_solution(
         let target = root_aliases
             .get(local_name)
             .map_or(local_name.as_str(), String::as_str);
-        let root_package = ResolverPackage::from_dep_name(target);
+        let root_package = ResolverPackage::from_root_dependency(local_name, target);
         let Some((package, version)) = solution
             .iter()
             .find(|(package, _)| package == &&root_package)
@@ -288,9 +288,11 @@ fn root_resolutions_from_solution_for_ids(
         let target = root_aliases
             .get(local)
             .map_or(local.as_str(), String::as_str);
-        if let Some(package) = packages.iter().find(|package| {
-            package.package.canonical_name() == target && package.package.context().is_none()
-        }) {
+        let root_package = ResolverPackage::from_root_dependency(local, target);
+        if let Some(package) = packages
+            .iter()
+            .find(|package| package.package == root_package)
+        {
             roots.insert(
                 local.clone(),
                 RootResolution {
