@@ -592,6 +592,25 @@ fn resolve_publish_targets(
         )));
     }
     let target_names = resolve_target_names(manifest, &targets)?;
+    let mut destinations = HashMap::with_capacity(targets.len());
+    for target in &targets {
+        let Some(endpoint) =
+            resolve_npm_compatible_publish_endpoint(target, manifest.publish_config.as_ref())?
+        else {
+            continue;
+        };
+        let endpoint = super::target::normalized_custom_publish_endpoint(&endpoint.registry_url)
+            .ok_or_else(|| LpmError::Registry("invalid publish registry endpoint".into()))?;
+        let name = target_names.get(&target.key()).ok_or_else(|| {
+            LpmError::Registry("publish target has no resolved package name".into())
+        })?;
+        if let Some(previous) = destinations.insert((endpoint, name), target.display_name()) {
+            return Err(LpmError::Registry(format!(
+                "{previous} and {} resolve to the same publication destination for {name}; select only one target",
+                target.display_name()
+            )));
+        }
+    }
     Ok((targets, target_names))
 }
 
@@ -1921,10 +1940,9 @@ async fn execute_prepared_inner(
                         if !json_output {
                             let package_url = match target {
                                 PublishTarget::Npm => {
-                                    Some(format!(
-                                        "https://www.npmjs.com/package/{}",
-                                        npm_name_str
-                                    ))
+                                    npm_auth::registry_is_default_npm(&registry_url).then(|| {
+                                        format!("https://www.npmjs.com/package/{npm_name_str}")
+                                    })
                                 }
                                 PublishTarget::GitHub => npm_name_str
                                     .strip_prefix('@')
@@ -2421,10 +2439,10 @@ async fn resolve_npm_target_credential(
         }),
         PublishTarget::GitLab => Ok(ResolvedNpmTargetCredential {
             token: auth::get_gitlab_token_for_host(registry_url).ok_or_else(|| {
-                LpmError::Registry(format!(
-                    "no GitLab Packages token found. For gitlab.com, run `glab auth login`; otherwise run `lpm login --login-registry {} --token <token>`.",
-                    crate::install_ui::safe_url_origin(registry_url)
-                ))
+                LpmError::Registry(
+                    "no GitLab Packages token found. For gitlab.com, run `glab auth login`; otherwise run `lpm login --login-registry <gitlab-package-registry-url> --token <token>`. Use the full project endpoint ending in `/api/v4/projects/<project-id>/packages/npm`, not only the instance origin."
+                        .into(),
+                )
             })?,
             auth_source: None,
         }),

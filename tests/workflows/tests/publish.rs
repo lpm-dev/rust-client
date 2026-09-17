@@ -2,6 +2,7 @@
 //!
 //! Tests dry-run, quality check, error cases, and mock registry publish.
 
+mod publish_contract;
 mod support;
 
 use base64::Engine as _;

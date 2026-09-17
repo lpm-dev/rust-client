@@ -2848,7 +2848,7 @@ pub(crate) fn rewrite_tarball_name_for_publish(
 
                     if path == "package/package.json" {
                         let mut pkg =
-                    serde_json::from_slice::<serde_json::Value>(&content).map_err(|error| {
+                    serde_json::from_slice::<serde_json::Value>(lpm_common::strip_utf8_bom_bytes(&content)).map_err(|error| {
                         LpmError::Registry(format!(
                             "failed to parse package.json while preparing target tarball: {error}"
                         ))
