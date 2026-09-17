@@ -406,6 +406,7 @@ async fn async_main() -> Result<()> {
         // not nagged on every invocation.
         maybe_emit_network_fs_warning(root);
 
+        commands::global::recover_local_links(root)?;
         match lpm_global::recover(root) {
             Ok(report) => {
                 if !report.skipped_due_to_lock {

@@ -95,9 +95,17 @@ pub async fn run(
     json_output: bool,
 ) -> Result<(), LpmError> {
     let root = LpmRoot::from_env()?;
+    if dry_run {
+        lpm_global::recover::require_settled(&root)?;
+        if super::global::local_link_pending(&root)? {
+            return Err(LpmError::Script("local global links need recovery before a preview; run `lpm global list`, then retry".into()));
+        }
+    }
     let planning_registry = client.clone_with_config().without_metadata_memory_cache();
     let install_registry = client.clone_with_metadata_memory_cache();
     let manifest = read_for(&root)?;
+    let routes = lpm_registry::RouteTable::from_env_and_filesystem(&root.global_root())
+        .map_err(|error| LpmError::Registry(format!("npmrc: {error}")))?;
 
     let targets = match package {
         Some(spec) => vec![parse_target(spec)?],
@@ -133,6 +141,7 @@ pub async fn run(
     let planning_registry_ref = &planning_registry;
     let release_age_policy_ref = &release_age_policy;
     let aliases_by_package_ref = &aliases_by_package;
+    let routes = &routes;
     let planning = futures::stream::iter(targets.into_iter().enumerate().map(
         move |(target_index, target)| async move {
             let result = plan_upgrade(
@@ -141,6 +150,7 @@ pub async fn run(
                 &target,
                 release_age_policy_ref,
                 aliases_by_package_ref,
+                routes,
             )
             .await;
             (target_index, target, result)
@@ -202,11 +212,7 @@ pub async fn run(
                 metadata,
                 route,
             } => {
-                if !install_registry.seed_metadata_for_command(
-                    &prep.name,
-                    &route.upstream_route(),
-                    metadata,
-                ) {
+                if !install_registry.seed_metadata_for_command(&prep.name, &route, metadata) {
                     ordered_results[index] = Some(UpgradeResult::Failed {
                         package: prep.name.clone(),
                         reason: "failed to retain validated global-update metadata".to_string(),
@@ -382,7 +388,7 @@ enum UpgradePlan {
     Upgrade {
         prep: Box<UpgradePrep>,
         metadata: Arc<PackageMetadata>,
-        route: MetadataRoute,
+        route: UpstreamRoute,
     },
     /// Resolved version is unchanged but the user typed a `<pkg>@<spec>`
     /// that produces a different `saved_spec` — manifest-only mutation
@@ -414,34 +420,13 @@ enum UpgradePlan {
     },
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum MetadataRoute {
-    Lpm,
-    PublicNpm,
-}
-
-impl MetadataRoute {
-    fn upstream_route(self) -> UpstreamRoute {
-        match self {
-            Self::Lpm => UpstreamRoute::LpmWorker,
-            Self::PublicNpm => UpstreamRoute::NpmDirect,
-        }
-    }
-
-    fn release_time_source(self) -> crate::release_age_selection::ReleaseTimeMetadataSource {
-        match self {
-            Self::Lpm => crate::release_age_selection::ReleaseTimeMetadataSource::WorkerOnly,
-            Self::PublicNpm => crate::release_age_selection::ReleaseTimeMetadataSource::NpmDirect,
-        }
-    }
-}
-
 async fn plan_upgrade(
     manifest: &GlobalManifest,
     registry: &RegistryClient,
     target: &Target,
     release_age_policy: &lpm_resolver::ResolverPolicy,
     aliases_by_package: &HashMap<String, serde_json::Value>,
+    routes: &lpm_registry::RouteTable,
 ) -> Result<UpgradePlan, LpmError> {
     let active = manifest.packages.get(&target.name).ok_or_else(|| {
         LpmError::Script(format!(
@@ -467,14 +452,9 @@ async fn plan_upgrade(
         None => infer_intent_from_saved_spec(&active.saved_spec),
     };
 
-    // Dispatch by name shape — same as install_global.
-    let route = match active.source {
-        PackageSource::LpmDev => MetadataRoute::Lpm,
-        PackageSource::UpstreamNpm => MetadataRoute::PublicNpm,
-        PackageSource::LocalLink => unreachable!("local links returned above"),
-    };
-    let mut metadata = match route {
-        MetadataRoute::Lpm => {
+    let route = super::global_util::metadata_route(routes, &target.name);
+    let mut metadata = match &route {
+        UpstreamRoute::LpmWorker => {
             let package = lpm_common::PackageName::parse(&target.name).map_err(|error| {
                 LpmError::Script(format!(
                     "invalid LPM package name '{}': {error}",
@@ -486,18 +466,36 @@ async fn plan_upgrade(
                 .await?
                 .metadata
         }
-        MetadataRoute::PublicNpm => {
+        UpstreamRoute::NpmDirect => {
             registry
                 .revalidate_npm_metadata_direct_with_timings(&target.name)
                 .await?
                 .metadata
         }
+        UpstreamRoute::Custom {
+            target: registry_target,
+            auth,
+        } => {
+            registry
+                .revalidate_npm_metadata_from_with_timings(
+                    &registry_target.base_url,
+                    &target.name,
+                    auth.as_deref(),
+                )
+                .await?
+                .metadata
+        }
+    };
+    let release_time_source = if matches!(route, UpstreamRoute::LpmWorker) {
+        crate::release_age_selection::ReleaseTimeMetadataSource::WorkerOnly
+    } else {
+        crate::release_age_selection::ReleaseTimeMetadataSource::Routed(&route)
     };
     crate::release_age_selection::hydrate_release_times_if_needed(
         registry,
         &mut metadata,
         release_age_policy,
-        route.release_time_source(),
+        release_time_source,
     )
     .await?;
     let new_version_str =

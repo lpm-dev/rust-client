@@ -976,7 +976,7 @@ fn global_link_creates_manifest_entry_and_global_shim_for_local_package() {
         entry.saved_spec,
         format!("link:{}", canonical_package_dir.display())
     );
-    assert_eq!(entry.root, "links/linked-tool");
+    assert!(entry.root.starts_with("links/.lpm-link-"));
 
     let install_bin = root
         .global_root()
@@ -1864,4 +1864,741 @@ fn install_g_without_package_args_fails_or_no_ops() {
             "install -g without args error must mention packages/spec, got:\n{combined}",
         );
     }
+}
+
+#[test]
+fn global_update_preview_leaves_an_unused_global_root_absent() {
+    let project = TempProject::empty(r#"{"name":"global-preview","version":"1.0.0"}"#);
+    let root = isolated_lpm_root(&project);
+    lpm(&project)
+        .args(["global", "update", "--dry-run", "--json"])
+        .assert()
+        .success();
+    assert!(!root.global_root().exists(), "preview created global state");
+    assert!(
+        !root.bin_dir().exists(),
+        "preview created the global bin directory"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn global_link_rejects_nonexecutable_targets_without_changing_the_checkout() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let project = TempProject::empty(r#"{"name":"global-link","version":"1.0.0"}"#);
+    let package = write_local_cli_package(&project);
+    let target = package.join("bin/linked-tool");
+    std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o644)).unwrap();
+    lpm(&project)
+        .args(["global", "link"])
+        .arg(&package)
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("executable"));
+    assert_eq!(
+        std::fs::metadata(&target).unwrap().permissions().mode() & 0o777,
+        0o644
+    );
+    assert!(!isolated_lpm_root(&project).global_manifest().exists());
+}
+
+#[test]
+fn global_link_preserves_unmanaged_command_artifacts() {
+    let project = TempProject::empty(r#"{"name":"global-link","version":"1.0.0"}"#);
+    let package = write_local_cli_package(&project);
+    let root = isolated_lpm_root(&project);
+    std::fs::create_dir_all(root.bin_dir()).unwrap();
+    let artifact = lpm_global::expected_artifacts(&root.bin_dir(), "linked-tool").remove(0);
+    std::fs::write(&artifact, b"user-owned command\n").unwrap();
+    lpm(&project)
+        .args(["global", "link"])
+        .arg(&package)
+        .assert()
+        .failure();
+    assert_eq!(std::fs::read(&artifact).unwrap(), b"user-owned command\n");
+    assert!(!root.global_manifest().exists());
+}
+
+#[cfg(any(target_os = "macos", windows))]
+#[test]
+fn global_link_rejects_case_colliding_command_names_before_publication() {
+    let project = TempProject::empty(r#"{"name":"global-link","version":"1.0.0"}"#);
+    let package = write_local_cli_package(&project);
+    std::fs::write(package.join("package.json"), r#"{"name":"linked-tool","version":"1.0.0","bin":{"linked-tool":"bin/linked-tool","Linked-Tool":"bin/linked-tool"}}"#).unwrap();
+    lpm(&project)
+        .args(["global", "link"])
+        .arg(&package)
+        .assert()
+        .failure();
+    assert!(!isolated_lpm_root(&project).global_manifest().exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn global_unlink_keeps_the_command_when_manifest_persistence_fails() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let project = TempProject::empty(r#"{"name":"global-link","version":"1.0.0"}"#);
+    let package = write_local_cli_package(&project);
+    let root = isolated_lpm_root(&project);
+    lpm(&project)
+        .args(["global", "link"])
+        .arg(&package)
+        .assert()
+        .success();
+    let manifest_before = std::fs::read(root.global_manifest()).unwrap();
+    let permissions = std::fs::metadata(root.global_root()).unwrap().permissions();
+    std::fs::set_permissions(root.global_root(), std::fs::Permissions::from_mode(0o555)).unwrap();
+    let result = lpm(&project)
+        .args(["global", "unlink", "linked-tool"])
+        .output()
+        .unwrap();
+    std::fs::set_permissions(root.global_root(), permissions).unwrap();
+    assert!(!result.status.success());
+    assert_eq!(
+        std::fs::read(root.global_manifest()).unwrap(),
+        manifest_before
+    );
+    assert!(
+        root.bin_dir().join("linked-tool").exists(),
+        "failed unlink removed the active command"
+    );
+}
+
+#[tokio::test]
+async fn global_outdated_reports_new_major_versions_outside_the_saved_range() {
+    let project = TempProject::empty(r#"{"name":"global-outdated","version":"1.0.0"}"#);
+    seed_global_package(&project, "major-tool", vec!["major-tool".into()]);
+    let mock = MockRegistry::start().await;
+    mock.with_package_metadata_and_tarballs("major-tool", serde_json::json!({
+        "name":"major-tool", "dist-tags":{"latest":"2.0.0"},
+        "versions":{"1.0.0":{"name":"major-tool","version":"1.0.0"},"2.0.0":{"name":"major-tool","version":"2.0.0"}}
+    }), &[]).await;
+    let result = lpm_with_registry_and_npm(&project, &mock.url())
+        .args(["global", "list", "--outdated", "--json"])
+        .output()
+        .unwrap();
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let body: serde_json::Value = serde_json::from_slice(&result.stdout).unwrap();
+    assert_eq!(body["outdated"][0]["wanted"], "1.0.0");
+    assert_eq!(body["outdated"][0]["latest"], "2.0.0");
+}
+
+#[tokio::test]
+async fn global_comparison_and_update_use_the_configured_private_registry() {
+    let project = TempProject::empty(r#"{"name":"global-private","version":"1.0.0"}"#);
+    seed_global_package(&project, "private-tool", vec!["private-tool".into()]);
+    let public = MockRegistry::start().await;
+    let private = MockRegistry::start().await;
+    let tarball = support::mock_registry::make_tarball_from_pkg_json(
+        serde_json::json!({"name":"private-tool","version":"1.1.0","bin":{"private-tool":"cli.js"}}),
+        &[("cli.js", b"#!/usr/bin/env node\n")],
+    );
+    private.with_package_metadata_and_tarballs("private-tool", serde_json::json!({
+        "name":"private-tool", "dist-tags":{"latest":"1.1.0"},
+        "versions":{"1.0.0":{"name":"private-tool","version":"1.0.0"},"1.1.0":{
+            "name":"private-tool","version":"1.1.0", "bin":{"private-tool":"cli.js"}, "dist":{
+                "tarball":private.tarball_url("private-tool", "1.1.0"),"integrity":compute_integrity(&tarball)
+            }
+        }}
+    }), &[("1.1.0", tarball)]).await;
+    support::write_private_file(
+        &project.home().join(".npmrc"),
+        format!(
+            "registry={}\n//{}/:_authToken=global-private-test\n",
+            private.url(),
+            private.url().trim_start_matches("http://")
+        ),
+    );
+    for args in [
+        vec!["global", "list", "--outdated", "--json"],
+        vec!["global", "update", "--dry-run", "--json"],
+        vec!["global", "update", "--json"],
+    ] {
+        let result = lpm_with_registry_and_npm(&project, &public.url())
+            .env("NPM_CONFIG_USERCONFIG", project.home().join(".npmrc"))
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            result.status.success(),
+            "private registry operation failed: {} {}",
+            String::from_utf8_lossy(&result.stdout),
+            String::from_utf8_lossy(&result.stderr)
+        );
+    }
+    assert_eq!(
+        lpm_global::read_for(&isolated_lpm_root(&project))
+            .unwrap()
+            .packages["private-tool"]
+            .resolved,
+        "1.1.0"
+    );
+    for request in private.server().received_requests().await.unwrap() {
+        if request.url.path() == "/private-tool" {
+            assert_eq!(
+                request
+                    .headers
+                    .get("authorization")
+                    .and_then(|v| v.to_str().ok()),
+                Some("Bearer global-private-test"),
+                "unauthenticated private metadata request: {:?}",
+                request.headers
+            );
+        }
+    }
+    assert!(
+        public
+            .server()
+            .received_requests()
+            .await
+            .unwrap()
+            .is_empty(),
+        "private package name leaked to the public route"
+    );
+}
+
+#[tokio::test]
+async fn global_outdated_distinguishes_cooldown_from_a_missing_exact_version() {
+    let project = TempProject::empty(r#"{"name":"global-outdated","version":"1.0.0"}"#);
+    let root = isolated_lpm_root(&project);
+    seed_global_package(&project, "pinned-tool", vec!["pinned-tool".into()]);
+    let mut manifest = lpm_global::read_for(&root).unwrap();
+    manifest.packages.get_mut("pinned-tool").unwrap().saved_spec = "1.0.0".into();
+    lpm_global::write_for(&root, &manifest).unwrap();
+    lpm(&project)
+        .args(["config", "release-age", "--set", "1d"])
+        .assert()
+        .success();
+    let mock = MockRegistry::start().await;
+    mock.with_package_metadata_and_tarballs("pinned-tool", serde_json::json!({
+        "name":"pinned-tool", "dist-tags":{"latest":"2.0.0"},
+        "versions":{"1.0.0":{"name":"pinned-tool","version":"1.0.0"},"2.0.0":{"name":"pinned-tool","version":"2.0.0"}},
+        "time":{"1.0.0":iso8601_n_secs_ago(60),"2.0.0":iso8601_n_secs_ago(3*86400)}
+    }), &[]).await;
+    let result = lpm_with_registry_and_npm(&project, &mock.url())
+        .args(["global", "list", "--outdated", "--json"])
+        .output()
+        .unwrap();
+    assert!(!result.status.success());
+    let body: serde_json::Value = serde_json::from_slice(&result.stdout).unwrap();
+    let reason = body["unresolved"][0]["reason"].as_str().unwrap();
+    assert!(reason.contains("minimumReleaseAge"), "{reason}");
+    assert!(!reason.contains("no longer serves"), "{reason}");
+}
+
+#[test]
+fn global_update_preview_refuses_recovery_without_truncating_a_torn_log() {
+    let project = TempProject::empty(r#"{"name":"global-preview","version":"1.0.0"}"#);
+    let root = isolated_lpm_root(&project);
+    std::fs::create_dir_all(root.global_root()).unwrap();
+    std::fs::write(root.global_wal(), [0, 0, 0]).unwrap();
+    lpm(&project)
+        .args(["global", "update", "--dry-run", "--json"])
+        .assert()
+        .failure();
+    assert_eq!(std::fs::read(root.global_wal()).unwrap(), [0, 0, 0]);
+}
+
+#[test]
+fn interrupted_global_link_recovers_uncommitted_command_files() {
+    let project = TempProject::empty(r#"{"name":"global-link","version":"1.0.0"}"#);
+    let package = write_local_cli_package(&project);
+    let root = isolated_lpm_root(&project);
+    let mut command = support::lpm_spawnable(&project);
+    command.args(["global", "link"]).arg(&package);
+    support::source_recovery::interrupt(
+        command,
+        &project.home().join("link-interrupted"),
+        "after-global-link-shims",
+        None,
+    );
+    lpm(&project)
+        .args(["global", "list", "--json"])
+        .assert()
+        .success();
+    assert!(
+        !lpm_global::read_for(&root)
+            .unwrap()
+            .packages
+            .contains_key("linked-tool")
+    );
+    for artifact in lpm_global::expected_artifacts(&root.bin_dir(), "linked-tool") {
+        assert!(std::fs::symlink_metadata(artifact).is_err());
+    }
+    assert!(package.join("bin/linked-tool").is_file());
+}
+
+#[test]
+fn interrupted_global_unlink_finishes_committed_cleanup() {
+    let project = TempProject::empty(r#"{"name":"global-link","version":"1.0.0"}"#);
+    let package = write_local_cli_package(&project);
+    let root = isolated_lpm_root(&project);
+    lpm(&project)
+        .args(["global", "link"])
+        .arg(&package)
+        .assert()
+        .success();
+    let mut command = support::lpm_spawnable(&project);
+    command.args(["global", "unlink", "linked-tool"]);
+    support::source_recovery::interrupt(
+        command,
+        &project.home().join("unlink-interrupted"),
+        "after-global-unlink-manifest",
+        None,
+    );
+    lpm(&project)
+        .args(["global", "list", "--json"])
+        .assert()
+        .success();
+    assert!(
+        !lpm_global::read_for(&root)
+            .unwrap()
+            .packages
+            .contains_key("linked-tool")
+    );
+    for artifact in lpm_global::expected_artifacts(&root.bin_dir(), "linked-tool") {
+        assert!(std::fs::symlink_metadata(artifact).is_err());
+    }
+    assert!(package.join("bin/linked-tool").is_file());
+}
+
+#[test]
+fn local_link_recovery_rejects_a_forged_unmanaged_command_record() {
+    let project = TempProject::empty(r#"{"name":"global-link","version":"1.0.0"}"#);
+    let package = write_local_cli_package(&project);
+    let root = isolated_lpm_root(&project);
+    let mut command = support::lpm_spawnable(&project);
+    command.args(["global", "link"]).arg(&package);
+    support::source_recovery::interrupt(
+        command,
+        &project.home().join("link-forged"),
+        "after-global-link-shims",
+        None,
+    );
+    let unmanaged = root.bin_dir().join("user-tool");
+    std::fs::write(&unmanaged, "user-owned\n").unwrap();
+    let journal_path = root.global_root().join("local-link-transaction.json");
+    let mut journal: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&journal_path).unwrap()).unwrap();
+    journal["global"][0] =
+        serde_json::json!({"name":"user-tool","value":{"type":"file","value":"user-owned\n"}});
+    std::fs::write(&journal_path, serde_json::to_vec(&journal).unwrap()).unwrap();
+    lpm(&project)
+        .args(["global", "list", "--json"])
+        .assert()
+        .failure();
+    assert_eq!(std::fs::read(&unmanaged).unwrap(), b"user-owned\n");
+}
+
+#[test]
+fn global_unlink_preserves_a_replaced_wrapper_command() {
+    let project = TempProject::empty(r#"{"name":"global-link","version":"1.0.0"}"#);
+    let package = write_local_cli_package(&project);
+    let root = isolated_lpm_root(&project);
+    lpm(&project)
+        .args(["global", "link"])
+        .arg(&package)
+        .assert()
+        .success();
+    let manifest = lpm_global::read_for(&root).unwrap();
+    let bin = root
+        .global_root()
+        .join(&manifest.packages["linked-tool"].root)
+        .join("node_modules/.bin");
+    let artifact = lpm_global::expected_artifacts(&bin, "linked-tool").remove(0);
+    std::fs::remove_file(&artifact).unwrap();
+    std::fs::write(&artifact, "user replacement\n").unwrap();
+    lpm(&project)
+        .args(["global", "unlink", "linked-tool"])
+        .assert()
+        .failure();
+    assert_eq!(std::fs::read(&artifact).unwrap(), b"user replacement\n");
+    assert!(
+        lpm_global::read_for(&root)
+            .unwrap()
+            .packages
+            .contains_key("linked-tool")
+    );
+}
+
+#[test]
+fn global_link_refuses_a_package_with_a_pending_registry_install() {
+    let project = TempProject::empty(r#"{"name":"global-link","version":"1.0.0"}"#);
+    let package = write_local_cli_package(&project);
+    let root = isolated_lpm_root(&project);
+    let mut manifest = GlobalManifest::default();
+    manifest.pending.insert(
+        "linked-tool".into(),
+        lpm_global::PendingEntry {
+            saved_spec: "^1.0.0".into(),
+            resolved: "1.0.0".into(),
+            integrity: "sha512-test".into(),
+            source: PackageSource::UpstreamNpm,
+            started_at: Utc::now(),
+            root: "installs/linked-tool@1.0.0".into(),
+            commands: vec![],
+            replaces_version: None,
+        },
+    );
+    lpm_global::write_for(&root, &manifest).unwrap();
+    lpm(&project)
+        .args(["global", "link"])
+        .arg(&package)
+        .assert()
+        .failure();
+    assert_eq!(lpm_global::read_for(&root).unwrap(), manifest);
+}
+
+#[test]
+fn global_unlink_preserves_legacy_wrapper_contents_and_retires_the_link() {
+    let project = TempProject::empty(r#"{"name":"global-link","version":"1.0.0"}"#);
+    let package = write_local_cli_package(&project);
+    let root = isolated_lpm_root(&project);
+    lpm(&project)
+        .args(["global", "link"])
+        .arg(&package)
+        .assert()
+        .success();
+    let mut manifest = lpm_global::read_for(&root).unwrap();
+    let entry = manifest.packages.get_mut("linked-tool").unwrap();
+    entry.integrity = "local-link".into();
+    let bin = root
+        .global_root()
+        .join(&entry.root)
+        .join("node_modules/.bin");
+    lpm_global::write_for(&root, &manifest).unwrap();
+    let artifact = lpm_global::expected_artifacts(&bin, "linked-tool").remove(0);
+    std::fs::remove_file(&artifact).unwrap();
+    std::fs::write(&artifact, "legacy replacement\n").unwrap();
+    lpm(&project)
+        .args(["global", "unlink", "linked-tool"])
+        .assert()
+        .success();
+    assert_eq!(std::fs::read(&artifact).unwrap(), b"legacy replacement\n");
+    assert!(
+        !root
+            .global_root()
+            .join("local-link-transaction.json")
+            .exists()
+    );
+    assert!(
+        !lpm_global::read_for(&root)
+            .unwrap()
+            .packages
+            .contains_key("linked-tool")
+    );
+}
+
+#[test]
+fn global_unlink_succeeds_when_the_checkout_and_wrapper_are_missing() {
+    let project = TempProject::empty(r#"{"name":"global-link","version":"1.0.0"}"#);
+    let package = write_local_cli_package(&project);
+    let root = isolated_lpm_root(&project);
+    lpm(&project)
+        .args(["global", "link"])
+        .arg(&package)
+        .assert()
+        .success();
+    let manifest = lpm_global::read_for(&root).unwrap();
+    std::fs::remove_dir_all(
+        root.global_root()
+            .join(&manifest.packages["linked-tool"].root),
+    )
+    .unwrap();
+    std::fs::remove_dir_all(package).unwrap();
+    lpm(&project)
+        .args(["global", "unlink", "linked-tool"])
+        .assert()
+        .success();
+    assert!(
+        !lpm_global::read_for(&root)
+            .unwrap()
+            .packages
+            .contains_key("linked-tool")
+    );
+}
+
+#[test]
+fn local_link_cleanup_preserves_unrecorded_staging_files() {
+    let project = TempProject::empty(r#"{"name":"global-link","version":"1.0.0"}"#);
+    let package = write_local_cli_package(&project);
+    let root = isolated_lpm_root(&project);
+    let mut command = support::lpm_spawnable(&project);
+    command.args(["global", "link"]).arg(&package);
+    support::source_recovery::interrupt(
+        command,
+        &project.home().join("link-cleanup"),
+        "after-global-link-cleanup",
+        None,
+    );
+    let journal: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(root.global_root().join("local-link-transaction.json")).unwrap(),
+    )
+    .unwrap();
+    let unexpected = root
+        .global_root()
+        .join(journal["archive"].as_str().unwrap())
+        .join("publish-user");
+    std::fs::write(&unexpected, "user data\n").unwrap();
+    lpm(&project)
+        .args(["global", "list", "--json"])
+        .assert()
+        .failure();
+    assert_eq!(std::fs::read(&unexpected).unwrap(), b"user data\n");
+}
+
+#[cfg(unix)]
+#[test]
+fn global_recovery_rejects_a_fifo_journal_without_waiting_for_a_writer() {
+    let project = TempProject::empty(r#"{"name":"global-link","version":"1.0.0"}"#);
+    let root = isolated_lpm_root(&project);
+    std::fs::create_dir_all(root.global_root()).unwrap();
+    assert!(
+        std::process::Command::new("mkfifo")
+            .arg(root.global_root().join("local-link-transaction.json"))
+            .status()
+            .unwrap()
+            .success()
+    );
+    lpm(&project)
+        .args(["global", "list", "--json"])
+        .timeout(std::time::Duration::from_secs(3))
+        .assert()
+        .failure()
+        .code(1);
+}
+
+#[cfg(windows)]
+#[test]
+fn global_link_rejects_overlapping_windows_command_artifacts() {
+    let project = TempProject::empty(r#"{"name":"global-link","version":"1.0.0"}"#);
+    let package = write_local_cli_package(&project);
+    std::fs::write(package.join("package.json"), r#"{"name":"linked-tool","version":"1.0.0","bin":{"tool":"bin/linked-tool","tool.cmd":"bin/linked-tool"}}"#).unwrap();
+    let root = isolated_lpm_root(&project);
+    lpm(&project)
+        .args(["global", "link"])
+        .arg(&package)
+        .assert()
+        .failure();
+    assert!(
+        !root
+            .global_root()
+            .join("local-link-transaction.json")
+            .exists()
+    );
+    assert!(!root.global_manifest().exists());
+}
+
+#[test]
+fn global_unlink_retains_extra_wrapper_files_without_blocking_recovery() {
+    let project = TempProject::empty(r#"{"name":"global-link","version":"1.0.0"}"#);
+    let package = write_local_cli_package(&project);
+    let root = isolated_lpm_root(&project);
+    lpm(&project)
+        .args(["global", "link"])
+        .arg(&package)
+        .assert()
+        .success();
+    let manifest = lpm_global::read_for(&root).unwrap();
+    let wrapper = root
+        .global_root()
+        .join(&manifest.packages["linked-tool"].root);
+    let extra = wrapper.join("node_modules/.bin/user-file");
+    std::fs::write(&extra, "user data\n").unwrap();
+    lpm(&project)
+        .args(["global", "unlink", "linked-tool", "--json"])
+        .assert()
+        .success();
+    assert_eq!(std::fs::read(extra).unwrap(), b"user data\n");
+    lpm(&project)
+        .args(["global", "list", "--json"])
+        .assert()
+        .success();
+    assert!(
+        !root
+            .global_root()
+            .join("local-link-transaction.json")
+            .exists()
+    );
+}
+
+#[test]
+fn local_link_recovery_cannot_remove_another_manifest_owners_commands() {
+    let project = TempProject::empty(r#"{"name":"global-link","version":"1.0.0"}"#);
+    let package = write_local_cli_package(&project);
+    let root = isolated_lpm_root(&project);
+    lpm(&project)
+        .args(["global", "link"])
+        .arg(&package)
+        .assert()
+        .success();
+    let entry = lpm_global::read_for(&root).unwrap().packages["linked-tool"].clone();
+    std::fs::write(
+        package.join("package.json"),
+        r#"{"name":"other-tool","version":"1.0.0","bin":{"other-tool":"bin/linked-tool"}}"#,
+    )
+    .unwrap();
+    let mut command = support::lpm_spawnable(&project);
+    command.args(["global", "link"]).arg(&package);
+    support::source_recovery::interrupt(
+        command,
+        &project.home().join("link-owner"),
+        "after-global-link-shims",
+        None,
+    );
+    let path = root.global_root().join("local-link-transaction.json");
+    let mut journal: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    journal["entry"] = serde_json::to_value(&entry).unwrap();
+    let wrapper = root.global_root().join(&entry.root);
+    journal["wrapper"] =
+        serde_json::from_slice(&std::fs::read(wrapper.join(".lpm-link-provenance.json")).unwrap())
+            .unwrap();
+    let mut globals = Vec::new();
+    for artifact in lpm_global::expected_artifacts(&root.bin_dir(), "linked-tool") {
+        #[cfg(unix)]
+        let value =
+            serde_json::json!({"type":"symlink", "value": std::fs::read_link(&artifact).unwrap()});
+        #[cfg(windows)]
+        let value = serde_json::json!({"type":"file", "value": std::fs::read_to_string(&artifact).unwrap()});
+        globals.push(serde_json::json!({"name":artifact.file_name().unwrap().to_str().unwrap(), "value":value}));
+    }
+    journal["global"] = serde_json::json!(globals);
+    // Retain the victim's actual wrapper identity from a stopped unlink.
+    std::fs::remove_file(&path).unwrap();
+    let mut command = support::lpm_spawnable(&project);
+    command.args(["global", "unlink", "linked-tool"]);
+    support::source_recovery::interrupt(
+        command,
+        &project.home().join("victim-identity"),
+        "after-global-unlink-manifest",
+        None,
+    );
+    let victim: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    journal["wrapper_identity"] = victim["wrapper_identity"].clone();
+    let mut manifest = lpm_global::read_for(&root).unwrap();
+    manifest.packages.insert("linked-tool".into(), entry);
+    lpm_global::write_for(&root, &manifest).unwrap();
+    std::fs::write(&path, serde_json::to_vec(&journal).unwrap()).unwrap();
+    lpm(&project)
+        .args(["global", "list", "--json"])
+        .assert()
+        .failure();
+    assert!(wrapper.exists());
+    for artifact in lpm_global::expected_artifacts(&root.bin_dir(), "linked-tool") {
+        assert!(artifact.exists());
+    }
+}
+
+#[cfg(windows)]
+#[test]
+fn interrupted_global_link_recovers_an_empty_windows_staging_file() {
+    let project = TempProject::empty(r#"{"name":"global-link","version":"1.0.0"}"#);
+    let package = write_local_cli_package(&project);
+    let root = isolated_lpm_root(&project);
+    let mut command = support::lpm_spawnable(&project);
+    command.args(["global", "link"]).arg(&package);
+    support::source_recovery::interrupt(
+        command,
+        &project.home().join("link-staged"),
+        "after-global-link-stage-created",
+        None,
+    );
+    lpm(&project)
+        .args(["global", "list", "--json"])
+        .assert()
+        .success();
+    assert!(
+        !root
+            .global_root()
+            .join("local-link-transaction.json")
+            .exists()
+    );
+    assert!(lpm_global::read_for(&root).unwrap().packages.is_empty());
+}
+
+#[cfg(unix)]
+#[test]
+fn failed_global_link_cleans_an_unjournaled_empty_wrapper() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let project = TempProject::empty(r#"{"name":"global-link","version":"1.0.0"}"#);
+    let package = write_local_cli_package(&project);
+    let root = isolated_lpm_root(&project);
+    lpm(&project)
+        .args(["global", "list", "--json"])
+        .assert()
+        .success();
+    let permissions = std::fs::metadata(root.global_root()).unwrap().permissions();
+    std::fs::set_permissions(root.global_root(), std::fs::Permissions::from_mode(0o555)).unwrap();
+    let result = lpm(&project)
+        .args(["global", "link"])
+        .arg(&package)
+        .output()
+        .unwrap();
+    std::fs::set_permissions(root.global_root(), permissions).unwrap();
+    assert!(!result.status.success());
+    assert_eq!(
+        std::fs::read_dir(root.global_root().join("links"))
+            .unwrap()
+            .count(),
+        0
+    );
+}
+
+#[test]
+fn interrupted_global_link_recovers_before_provenance_publication() {
+    let project = TempProject::empty(r#"{"name":"global-link","version":"1.0.0"}"#);
+    let package = write_local_cli_package(&project);
+    let root = isolated_lpm_root(&project);
+    let mut command = support::lpm_spawnable(&project);
+    command.args(["global", "link"]).arg(&package);
+    support::source_recovery::interrupt(
+        command,
+        &project.home().join("link-recorded"),
+        "after-global-link-journal",
+        None,
+    );
+    lpm(&project)
+        .args(["global", "list", "--json"])
+        .assert()
+        .success();
+    assert!(
+        !root
+            .global_root()
+            .join("local-link-transaction.json")
+            .exists()
+    );
+    assert!(lpm_global::read_for(&root).unwrap().packages.is_empty());
+}
+
+#[cfg(windows)]
+#[test]
+fn invalid_windows_global_launcher_target_leaves_no_unjournaled_wrapper() {
+    let project = TempProject::empty(r#"{"name":"global-link","version":"1.0.0"}"#);
+    let package = write_local_cli_package(&project);
+    let home = project.home().join("lpm&home");
+    let root = lpm_common::LpmRoot::from_dir(home.clone());
+    lpm(&project)
+        .env("LPM_HOME", &home)
+        .args(["global", "link"])
+        .arg(&package)
+        .assert()
+        .failure();
+    assert!(!root.global_manifest().exists());
+    assert!(
+        !root
+            .global_root()
+            .join("local-link-transaction.json")
+            .exists()
+    );
+    assert_eq!(
+        std::fs::read_dir(root.global_root().join("links"))
+            .unwrap()
+            .count(),
+        0
+    );
 }

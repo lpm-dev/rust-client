@@ -180,7 +180,17 @@ pub fn read_manifest(path: &Path) -> Result<GlobalManifest, LpmError> {
             Ok(None) => return Ok(GlobalManifest::default()),
             Err(e) => return Err(LpmError::Io(e)),
         };
-    let text = std::str::from_utf8(&bytes)
+    parse_manifest(&bytes)
+}
+
+/// Decode a bounded manifest snapshot retained by the caller.
+pub fn parse_manifest(bytes: &[u8]) -> Result<GlobalManifest, LpmError> {
+    if bytes.len() as u64 > lpm_common::STATE_FILE_SIZE_CAP_BYTES {
+        return Err(manifest_parse_error(
+            "manifest exceeds the size limit".into(),
+        ));
+    }
+    let text = std::str::from_utf8(bytes)
         .map_err(|e| manifest_parse_error(format!("manifest is not valid UTF-8: {e}")))?;
     let manifest: GlobalManifest = toml::from_str(text)
         .map_err(|e| manifest_parse_error(format!("manifest TOML parse error: {e}")))?;
