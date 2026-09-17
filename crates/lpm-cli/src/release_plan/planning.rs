@@ -1,11 +1,19 @@
 use super::*;
 
-pub(crate) fn plan_single_package(
+#[cfg(test)]
+pub(super) fn plan_single_package(
     project_dir: &Path,
     bump: &VersionBump,
 ) -> Result<ReleasePlan, LpmError> {
     let manifest_path = project_dir.join("package.json");
     let manifest = read_workspace_manifest(project_dir, manifest_path)?;
+    plan_manifest(manifest, bump)
+}
+
+pub(super) fn plan_manifest(
+    manifest: WorkspaceManifest,
+    bump: &VersionBump,
+) -> Result<ReleasePlan, LpmError> {
     let package = bumped_package(&manifest, bump)?;
     let source_manifests = BTreeMap::from([(
         manifest.manifest_path.clone(),
@@ -160,11 +168,22 @@ pub(super) fn read_workspace_manifest(
     path: &Path,
     manifest_path: PathBuf,
 ) -> Result<WorkspaceManifest, LpmError> {
-    let original_bytes: Arc<[u8]> =
-        lpm_common::read_file_capped(&manifest_path, lpm_common::CONFIG_FILE_SIZE_CAP_BYTES)?
-            .into();
+    let (original_bytes, _) = lpm_common::read_regular_file_capped_with_metadata(
+        &manifest_path,
+        lpm_common::CONFIG_FILE_SIZE_CAP_BYTES,
+    )?;
+    parse_workspace_manifest(path, manifest_path, original_bytes)
+}
+
+pub(super) fn parse_workspace_manifest(
+    path: &Path,
+    manifest_path: PathBuf,
+    original_bytes: Vec<u8>,
+) -> Result<WorkspaceManifest, LpmError> {
+    let original_bytes: Arc<[u8]> = original_bytes.into();
     let json: serde_json::Value =
-        serde_json::from_slice(&original_bytes).map_err(LpmError::Json)?;
+        serde_json::from_slice(lpm_common::strip_utf8_bom_bytes(&original_bytes))
+            .map_err(LpmError::Json)?;
     let obj = json.as_object().ok_or_else(|| {
         LpmError::Script(format!(
             "{} must contain a JSON object",
@@ -213,12 +232,25 @@ pub(super) fn bumped_package(
             manifest.name, manifest.version, new_version
         )));
     }
+    let old_version = manifest
+        .json
+        .get("version")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| LpmError::Script("package.json is missing a string version".into()))?;
+    let mut new_version = new_version.to_string();
+    if let VersionBump::Exact(exact) = bump
+        && let Some((_, build)) = exact.split_once('+')
+    {
+        new_version.truncate(new_version.find('+').unwrap_or(new_version.len()));
+        new_version.push('+');
+        new_version.push_str(build);
+    }
     Ok(PackageRelease {
         name: manifest.name.clone(),
         path: manifest.path.clone(),
         manifest_path: manifest.manifest_path.clone(),
-        old_version: manifest.version.to_string(),
-        new_version: new_version.to_string(),
+        old_version: old_version.to_string(),
+        new_version,
         bump: bump.as_str().to_string(),
     })
 }
@@ -300,12 +332,17 @@ pub(super) fn updated_dependency_spec(
         return None;
     }
 
-    let replacement = if inner == old_version {
+    let same_version =
+        |candidate: &str| match (Version::parse(candidate), Version::parse(old_version)) {
+            (Ok(candidate), Ok(old)) => candidate == old,
+            _ => false,
+        };
+    let replacement = if same_version(inner) {
         Some(new_version.to_string())
     } else if let Some(rest) = inner.strip_prefix('^') {
-        (rest == old_version).then(|| format!("^{new_version}"))
+        same_version(rest).then(|| format!("^{new_version}"))
     } else if let Some(rest) = inner.strip_prefix('~') {
-        (rest == old_version).then(|| format!("~{new_version}"))
+        same_version(rest).then(|| format!("~{new_version}"))
     } else {
         None
     };

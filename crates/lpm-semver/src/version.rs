@@ -159,7 +159,7 @@ impl Version {
             VersionBump::PreMajor => Version::parse(&format!("{}.0.0-0", self.major() + 1)),
             VersionBump::Prerelease => {
                 if self.is_prerelease() {
-                    let pre = increment_prerelease(self.pre_release());
+                    let pre = increment_prerelease(self.pre_release())?;
                     Version::parse(&format!(
                         "{}.{}.{}-{}",
                         self.major(),
@@ -181,15 +181,20 @@ impl Version {
     }
 }
 
-fn increment_prerelease(mut identifiers: Vec<String>) -> Vec<String> {
-    if let Some(last) = identifiers.last_mut()
-        && let Ok(number) = last.parse::<u64>()
-    {
-        *last = (number + 1).to_string();
-        return identifiers;
+fn increment_prerelease(mut identifiers: Vec<String>) -> Result<Vec<String>, LpmError> {
+    for identifier in identifiers.iter_mut().rev() {
+        if let Ok(number) = identifier.parse::<u64>() {
+            let next = number.checked_add(1).ok_or_else(|| {
+                LpmError::InvalidVersion(
+                    "prerelease numeric identifier is too large to increment".into(),
+                )
+            })?;
+            *identifier = next.to_string();
+            return Ok(identifiers);
+        }
     }
     identifiers.push("0".to_string());
-    identifiers
+    Ok(identifiers)
 }
 
 impl fmt::Display for Version {

@@ -1,4 +1,4 @@
-use crate::commands::release::release_workspace_manifest_paths;
+use crate::commands::publish::PublishSource;
 use crate::install_ui;
 use crate::output;
 use crate::release_plan;
@@ -29,33 +29,39 @@ pub(crate) fn run(
     tag_prefix: &str,
     message: &str,
 ) -> Result<(), LpmError> {
-    let project_dir = project_dir.canonicalize().map_err(LpmError::Io)?;
-    let (transaction_root, allowed_manifests) = version_transaction_scope(&project_dir)?;
+    let project = PublishSource::open(project_dir)?;
+    let project_dir = project.project_dir();
+    let (root, allowed_manifests) = version_transaction_scope(&project)?;
+    let transaction_root = root.project_dir();
     let transaction_operation =
-        version_transaction_operation(&project_dir, bump, git_tag_version, tag_prefix, message)?;
+        version_transaction_operation(project_dir, bump, git_tag_version, tag_prefix, message)?;
+    let lock_directory = lpm_common::ProjectLockDirectory::open_or_create(
+        &root.try_clone_directory()?,
+        transaction_root,
+    )?;
+    let scope = release_plan::VersionTransactionScope::new(
+        transaction_root,
+        root.try_clone_directory()?,
+        &lock_directory,
+        project_dir,
+        project.try_clone_directory()?,
+    )?;
     let operation = || {
-        ensure_version_transaction_scope_unchanged(
-            &project_dir,
-            &transaction_root,
-            &allowed_manifests,
-        )?;
+        scope.validate()?;
+        ensure_version_transaction_scope_unchanged(&project, transaction_root, &allowed_manifests)?;
         if dry_run {
-            release_plan::ensure_no_pending_release_transaction(&transaction_root)?;
+            scope.ensure_no_pending()?;
         } else {
-            let recovery = release_plan::recover_pending_operation_transaction(
-                &transaction_root,
-                &allowed_manifests,
-                &transaction_operation,
-            )?;
+            let recovery = scope.recover(&allowed_manifests, &transaction_operation)?;
             if let release_plan::ReleaseOperationRecoveryOutcome::Completed { tag } = recovery {
                 return Ok(VersionOperation::Recovered { tag });
             }
         }
         if git_tag_version && !dry_run {
-            ensure_clean_git(&project_dir)?;
+            ensure_clean_git(project_dir)?;
         }
 
-        let plan = release_plan::plan_single_package(&project_dir, bump)?;
+        let plan = scope.plan(bump)?;
         let planned = plan.planned_manifests()?;
         let package = plan
             .packages
@@ -65,27 +71,26 @@ pub(crate) fn run(
         let mut commit_message = format_message(message, &package.new_version);
 
         if git_tag_version && !dry_run {
-            ensure_tag_available(&project_dir, &tag)?;
+            ensure_tag_available(project_dir, &tag)?;
         }
 
         if !dry_run {
             if git_tag_version {
-                let old_head =
-                    git_stdout(&project_dir, ["rev-parse", "--verify", "HEAD^{commit}"])?;
+                let old_head = git_stdout(project_dir, ["rev-parse", "--verify", "HEAD^{commit}"])?;
                 let manifest = planned.first().ok_or_else(|| {
                     LpmError::Script("version transaction contained no package manifest".into())
                 })?;
-                commit_message = release_plan::write_planned_manifests_then_git(
-                    &transaction_root,
+                commit_message = scope.write(
                     &planned,
                     transaction_operation.clone(),
-                    release_plan::VersionGitTransaction {
+                    Some(release_plan::VersionGitTransaction {
                         old_head: old_head.clone(),
                         tag: tag.clone(),
-                    },
+                    }),
                     || {
                         release_plan::create_version_commit_and_tag(
-                            &project_dir,
+                            project_dir,
+                            &project.try_clone_directory()?,
                             manifest,
                             &old_head,
                             &tag,
@@ -94,11 +99,7 @@ pub(crate) fn run(
                     },
                 )?;
             } else {
-                release_plan::write_planned_manifests(
-                    &transaction_root,
-                    &planned,
-                    transaction_operation.clone(),
-                )?;
+                scope.write(&planned, transaction_operation.clone(), None, || Ok(()))?;
             }
         }
 
@@ -108,11 +109,18 @@ pub(crate) fn run(
             commit_message,
         })
     };
-    let lock_path = lpm_common::project_install_lock(&transaction_root);
     let outcome = if dry_run {
-        lpm_common::with_shared_lock(lock_path, operation)?
+        lpm_common::with_project_shared_lock(
+            lock_directory,
+            lpm_common::ProjectLockKind::Install,
+            operation,
+        )?
     } else {
-        lpm_common::with_exclusive_lock(lock_path, operation)?
+        lpm_common::with_project_exclusive_lock(
+            lock_directory,
+            lpm_common::ProjectLockKind::Install,
+            operation,
+        )?
     };
     let (plan, tag, commit_message) = match outcome {
         VersionOperation::Applied {
@@ -228,26 +236,38 @@ fn append_version_path_identity(identity: &mut Vec<u8>, path: &Path) -> Result<(
     Ok(())
 }
 
-fn version_transaction_scope(project_dir: &Path) -> Result<(PathBuf, Vec<PathBuf>), LpmError> {
-    let workspace = lpm_workspace::discover_workspace(project_dir)
+fn version_transaction_scope(
+    project: &PublishSource,
+) -> Result<(PublishSource, Vec<PathBuf>), LpmError> {
+    let project_dir = project.project_dir();
+    let directory = project.try_clone_directory()?;
+    let workspace = lpm_workspace::find_workspace_root_from_open_project(project_dir, &directory)
         .map_err(|error| LpmError::Workspace(error.to_string()))?;
     if let Some(workspace) = workspace {
-        let root = workspace.root.canonicalize().map_err(LpmError::Io)?;
-        return Ok((root, release_workspace_manifest_paths(&workspace, true)));
+        let manifests = lpm_workspace::workspace_manifest_paths_from_open_root(
+            workspace.path(),
+            workspace.directory(),
+        )
+        .map_err(|error| LpmError::Workspace(error.to_string()))?;
+        let (path, directory) = workspace.into_parts();
+        return Ok((
+            PublishSource::from_open_directory(path, directory)?,
+            manifests,
+        ));
     }
     Ok((
-        project_dir.to_path_buf(),
+        PublishSource::from_open_directory(project_dir.to_path_buf(), directory)?,
         vec![project_dir.join("package.json")],
     ))
 }
 
 fn ensure_version_transaction_scope_unchanged(
-    project_dir: &Path,
+    project: &PublishSource,
     expected_root: &Path,
     expected_manifests: &[PathBuf],
 ) -> Result<(), LpmError> {
-    let (current_root, current_manifests) = version_transaction_scope(project_dir)?;
-    if current_root != expected_root || current_manifests != expected_manifests {
+    let (current_root, current_manifests) = version_transaction_scope(project)?;
+    if current_root.project_dir() != expected_root || current_manifests != expected_manifests {
         return Err(LpmError::Script(format!(
             "version project scope changed while waiting for the transaction lock at {}; retry the command",
             expected_root.display()

@@ -21,34 +21,6 @@ pub(crate) fn write_planned_manifests(
     transaction.commit()
 }
 
-pub(crate) fn write_planned_manifests_then_git<T>(
-    workspace_root: &Path,
-    manifests: &[PlannedManifest],
-    transaction_operation: ReleaseTransactionOperation,
-    git: VersionGitTransaction,
-    operation: impl FnOnce() -> Result<T, LpmError>,
-) -> Result<T, LpmError> {
-    if manifests.is_empty() {
-        return Err(LpmError::Script(
-            "version transaction contained no manifest changes".into(),
-        ));
-    }
-    let transaction = apply_planned_manifests_with(
-        workspace_root,
-        manifests,
-        transaction_operation,
-        Some(git),
-        write_manifest_target_durable,
-    )?;
-    match operation() {
-        Ok(value) => {
-            transaction.commit()?;
-            Ok(value)
-        }
-        Err(error) => transaction.rollback(error),
-    }
-}
-
 pub(super) struct AppliedReleaseTransaction {
     canonical_root: PathBuf,
     root: cap_std::fs::Dir,
@@ -56,6 +28,7 @@ pub(super) struct AppliedReleaseTransaction {
     allowed_manifests: Vec<PathBuf>,
     journal_bytes: Vec<u8>,
     commit: ReleaseApplyCommit,
+    expected_version_parent: Option<cap_std::fs::Dir>,
 }
 
 impl AppliedReleaseTransaction {
@@ -78,13 +51,14 @@ impl AppliedReleaseTransaction {
         Ok(())
     }
 
-    fn rollback<T>(self, primary: LpmError) -> Result<T, LpmError> {
+    pub(super) fn rollback<T>(self, primary: LpmError) -> Result<T, LpmError> {
         rollback_after_apply_error(
             &self.canonical_root,
             &self.root,
             &self.state,
             &self.allowed_manifests,
             &self.journal_bytes,
+            self.expected_version_parent.as_ref(),
             primary,
         )
     }
@@ -95,7 +69,7 @@ pub(super) fn apply_planned_manifests_with(
     manifests: &[PlannedManifest],
     operation: ReleaseTransactionOperation,
     version_git: Option<VersionGitTransaction>,
-    mut write_manifest: impl FnMut(&ManifestTarget, &[u8]) -> std::io::Result<()>,
+    write_manifest: impl FnMut(&ManifestTarget, &[u8]) -> std::io::Result<()>,
 ) -> Result<AppliedReleaseTransaction, LpmError> {
     let canonical_root = canonical_workspace_root(workspace_root)?;
     let root = open_root_directory_nofollow(&canonical_root)?;
@@ -105,6 +79,40 @@ pub(super) fn apply_planned_manifests_with(
         })?;
     ensure_no_pending_release_transaction_in(&state)?;
     let resolved = resolve_planned_manifests_from_open_root(&canonical_root, &root, manifests)?;
+    apply_resolved_manifests_with(
+        ReleaseWriteContext {
+            canonical_root,
+            root,
+            state,
+            expected_version_parent: None,
+        },
+        resolved,
+        operation,
+        version_git,
+        write_manifest,
+    )
+}
+
+pub(super) struct ReleaseWriteContext {
+    pub(super) canonical_root: PathBuf,
+    pub(super) root: cap_std::fs::Dir,
+    pub(super) state: ReleaseStateDirectory,
+    pub(super) expected_version_parent: Option<cap_std::fs::Dir>,
+}
+
+pub(super) fn apply_resolved_manifests_with(
+    context: ReleaseWriteContext,
+    resolved: Vec<ResolvedPlannedManifest<'_>>,
+    operation: ReleaseTransactionOperation,
+    version_git: Option<VersionGitTransaction>,
+    mut write_manifest: impl FnMut(&ManifestTarget, &[u8]) -> std::io::Result<()>,
+) -> Result<AppliedReleaseTransaction, LpmError> {
+    let ReleaseWriteContext {
+        canonical_root,
+        root,
+        state,
+        expected_version_parent,
+    } = context;
     let (journal_bytes, commit) =
         serialize_planned_release_journal(&resolved, operation, version_git)?;
     persist_release_journal_in(&state, &journal_bytes)?;
@@ -124,6 +132,7 @@ pub(super) fn apply_planned_manifests_with(
                     &state,
                     &allowed_manifests,
                     &journal_bytes,
+                    expected_version_parent.as_ref(),
                     error,
                 );
             }
@@ -135,6 +144,7 @@ pub(super) fn apply_planned_manifests_with(
                 &state,
                 &allowed_manifests,
                 &journal_bytes,
+                expected_version_parent.as_ref(),
                 LpmError::Script(format!(
                     "{} changed after the release journal was created",
                     resolved_manifest.target.display.display()
@@ -148,6 +158,7 @@ pub(super) fn apply_planned_manifests_with(
                 &state,
                 &allowed_manifests,
                 &journal_bytes,
+                expected_version_parent.as_ref(),
                 LpmError::Io(error),
             );
         }
@@ -161,6 +172,7 @@ pub(super) fn apply_planned_manifests_with(
         allowed_manifests,
         journal_bytes,
         commit,
+        expected_version_parent,
     })
 }
 
@@ -324,6 +336,22 @@ fn recover_pending_release_transaction_in_open_root(
     state: &ReleaseStateDirectory,
     allowed_manifests: &[PathBuf],
 ) -> Result<RecoveryOutcome, LpmError> {
+    recover_pending_release_transaction_with_parent(
+        canonical_root,
+        root,
+        state,
+        allowed_manifests,
+        None,
+    )
+}
+
+fn recover_pending_release_transaction_with_parent(
+    canonical_root: &Path,
+    root: &cap_std::fs::Dir,
+    state: &ReleaseStateDirectory,
+    allowed_manifests: &[PathBuf],
+    expected_version_parent: Option<&cap_std::fs::Dir>,
+) -> Result<RecoveryOutcome, LpmError> {
     let Some(journal_bytes) = read_existing_release_journal_bytes_in(state)? else {
         return recover_commit_marker_without_journal_in(state);
     };
@@ -351,6 +379,7 @@ fn recover_pending_release_transaction_in_open_root(
         root,
         journal.entries,
         allowed_manifests,
+        expected_version_parent,
     )?;
 
     if let Some(git) = version_git
@@ -412,9 +441,16 @@ pub(super) fn rollback_after_apply_error<T>(
     state: &ReleaseStateDirectory,
     allowed_manifests: &[PathBuf],
     trusted_journal_bytes: &[u8],
+    expected_version_parent: Option<&cap_std::fs::Dir>,
     primary: LpmError,
 ) -> Result<T, LpmError> {
-    match recover_pending_release_transaction_in(canonical_root, root, state, allowed_manifests) {
+    match recover_pending_release_transaction_with_parent(
+        canonical_root,
+        root,
+        state,
+        allowed_manifests,
+        expected_version_parent,
+    ) {
         Ok(RecoveryOutcome::RolledBack | RecoveryOutcome::Completed { .. }) => Err(primary),
         Ok(RecoveryOutcome::None) | Err(_) => {
             if let Err(error) = persist_release_journal_in(state, trusted_journal_bytes) {
@@ -422,11 +458,12 @@ pub(super) fn rollback_after_apply_error<T>(
                     "{primary}; rollback journal could not be restored: {error}"
                 )));
             }
-            match recover_pending_release_transaction_in(
+            match recover_pending_release_transaction_with_parent(
                 canonical_root,
                 root,
                 state,
                 allowed_manifests,
+                expected_version_parent,
             ) {
                 Ok(RecoveryOutcome::RolledBack | RecoveryOutcome::Completed { .. }) => Err(primary),
                 Ok(RecoveryOutcome::None) => Err(LpmError::Script(format!(
@@ -1047,6 +1084,7 @@ fn validate_recovery_entries_from_open_root(
     root_dir: &cap_std::fs::Dir,
     journal_entries: Vec<RecoveryApplyJournalEntry<'_>>,
     allowed_manifests: &[PathBuf],
+    expected_version_parent: Option<&cap_std::fs::Dir>,
 ) -> Result<Vec<RecoveryEntry>, LpmError> {
     if journal_entries.is_empty() || journal_entries.len() > MAX_RELEASE_JOURNAL_ENTRIES {
         return Err(LpmError::Script(format!(
@@ -1111,6 +1149,9 @@ fn validate_recovery_entries_from_open_root(
         }
         previous_path = Some(relative.clone());
         let target = recovery_manifest_target(root_dir, canonical_root, &relative)?;
+        if let Some(expected) = expected_version_parent {
+            version_scope::same_directory(&target.parent, expected, &target.display)?;
+        }
         let current = read_manifest_target(&target)?;
         let restore = if current == original {
             false

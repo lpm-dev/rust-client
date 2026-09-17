@@ -1,4 +1,5 @@
 mod support;
+mod version_contract;
 
 use support::assertions::parse_json_output;
 use support::{
@@ -518,13 +519,13 @@ fn version_rejects_files_staged_by_pre_commit_hook_without_losing_them() {
         !output.status.success(),
         "hook-expanded commit must be rejected"
     );
-    assert_eq!(run_git(&project, &["log", "-1", "--pretty=%s"]), "initial");
+    assert_eq!(run_git(&project, &["log", "-1", "--pretty=%s"]), "v1.2.4");
     assert_eq!(
         read_package_json(&project, "package.json")["version"],
-        "1.2.3"
+        "1.2.4"
     );
-    assert!(run_git(&project, &["diff", "--cached", "--name-only"]).is_empty());
-    assert_eq!(run_git(&project, &["diff", "--name-only"]), "notes.txt");
+    assert_eq!(run_git(&project, &["show", "HEAD:notes.txt"]), "from hook");
+    assert!(project.file_exists(".lpm/release-apply/journal.json"));
     assert_eq!(project.read_file("notes.txt"), "from hook\n");
     assert!(run_git(&project, &["tag", "--list", "v1.2.4"]).is_empty());
 }

@@ -1,63 +1,56 @@
 use super::*;
 
 pub(crate) fn create_version_commit_and_tag(
-    project_dir: &Path,
+    _project_dir: &Path,
+    project_directory: &cap_std::fs::Dir,
     manifest: &PlannedManifest,
     old_head: &str,
     tag: &str,
     requested_message: &str,
 ) -> Result<String, LpmError> {
-    let repository_root = version_git_repository_root(project_dir)?;
-    let repository_manifest = manifest.path.strip_prefix(&repository_root).map_err(|_| {
-        LpmError::Script(format!(
-            "version manifest is outside its Git worktree: {}",
-            manifest.path.display()
-        ))
-    })?;
-    require_version_git_success(
-        &repository_root,
+    let runner = RecoveryVersionGitCommandRunner {
+        working_directory: project_directory,
+        #[cfg(not(unix))]
+        display: _project_dir,
+    };
+    let prefix = require_version_git_success_with(&runner, ["rev-parse", "--show-prefix"])?;
+    let mut repository_manifest = path_from_git_output(prefix.stdout)?;
+    repository_manifest.push("package.json");
+    validate_version_git_relative_path(&repository_manifest)?;
+    let mut manifest_pathspec = OsString::from(":(top,literal)");
+    manifest_pathspec.push(&repository_manifest);
+    require_version_git_success_with(
+        &runner,
         [
             OsStr::new("add"),
             OsStr::new("--"),
-            repository_manifest.as_os_str(),
+            manifest_pathspec.as_os_str(),
         ],
     )?;
     abort_version_git_stage_for_test("add");
-    require_version_git_success(
-        &repository_root,
+    require_version_git_success_with(
+        &runner,
         [
             OsStr::new("commit"),
             OsStr::new("--only"),
             OsStr::new("-m"),
             OsStr::new(requested_message),
             OsStr::new("--"),
-            repository_manifest.as_os_str(),
+            manifest_pathspec.as_os_str(),
         ],
     )?;
-    let created_head = resolve_version_git_commit(&repository_root, "HEAD^{commit}")?;
-    if let Err(primary) = verify_version_git_commit(
-        &repository_root,
-        repository_manifest,
+    let created_head = resolve_version_git_commit_with(&runner, "HEAD^{commit}")?;
+    verify_version_git_commit_with(
+        &runner,
+        &repository_manifest,
         old_head,
         &created_head,
         &sha256_hex(&manifest.updated_bytes),
-    ) {
-        return match rollback_created_version_commit(
-            &repository_root,
-            repository_manifest,
-            old_head,
-            &created_head,
-        ) {
-            Ok(()) => Err(primary),
-            Err(rollback) => Err(LpmError::Script(format!(
-                "{primary}; Git rollback was not safe: {rollback}"
-            ))),
-        };
-    }
+    )?;
     abort_version_git_stage_for_test("commit");
 
-    let actual_message = version_git_commit_message(&repository_root, &created_head)?;
-    let tag_args = if version_git_config_bool(&repository_root, "tag.gpgSign")? {
+    let actual_message = version_git_commit_message(&runner, &created_head)?;
+    let tag_args = if version_git_config_bool(&runner, "tag.gpgSign")? {
         vec![
             OsString::from("tag"),
             OsString::from("-s"),
@@ -75,7 +68,7 @@ pub(crate) fn create_version_commit_and_tag(
             OsString::from(&created_head),
         ]
     };
-    let tag_output = version_git_output(&repository_root, &tag_args)?;
+    let tag_output = version_git_output_with(&runner, &tag_args)?;
     let tag_error = (!tag_output.status.success()).then(|| {
         let command = tag_args
             .iter()
@@ -87,7 +80,7 @@ pub(crate) fn create_version_commit_and_tag(
     let mut peeled_tag = OsString::from("refs/tags/");
     peeled_tag.push(tag);
     peeled_tag.push("^{commit}");
-    let tag_commit = resolve_optional_version_git_commit(&repository_root, &peeled_tag)?;
+    let tag_commit = resolve_optional_version_git_commit_with(&runner, &peeled_tag)?;
     if let Some(error) = tag_error
         && tag_commit.as_deref() != Some(created_head.as_str())
     {
@@ -107,51 +100,15 @@ pub(crate) fn create_version_commit_and_tag(
     Ok(actual_message)
 }
 
-pub(super) fn rollback_created_version_commit(
-    repository_root: &Path,
-    manifest: &Path,
-    old_head: &str,
-    created_head: &str,
-) -> Result<(), LpmError> {
-    let current_head = resolve_version_git_commit(repository_root, "HEAD^{commit}")?;
-    if current_head == created_head && current_head != old_head {
-        require_version_git_success(
-            repository_root,
-            [
-                OsStr::new("update-ref"),
-                OsStr::new("-m"),
-                OsStr::new("lpm version rejected commit rollback"),
-                OsStr::new("HEAD"),
-                OsStr::new(old_head),
-                OsStr::new(created_head),
-            ],
-        )?;
-    } else if current_head != old_head {
-        return Err(LpmError::Script(format!(
-            "Git HEAD moved from the rejected version commit {created_head} to {current_head}; no ref was changed"
-        )));
-    }
-    require_version_git_success(
-        repository_root,
-        [
-            OsStr::new("reset"),
-            OsStr::new("--quiet"),
-            OsStr::new(old_head),
-            OsStr::new("--"),
-            manifest.as_os_str(),
-        ],
-    )?;
-    Ok(())
-}
-
-pub(super) fn version_git_commit_message(
-    repository_root: &Path,
+fn version_git_commit_message(
+    runner: &impl VersionGitCommandRunner,
     commit: &str,
 ) -> Result<String, LpmError> {
-    let output = require_version_git_success(
-        repository_root,
+    let output = require_version_git_success_with(
+        runner,
         [
             OsStr::new("log"),
+            OsStr::new("--no-show-signature"),
             OsStr::new("-1"),
             OsStr::new("--format=%B"),
             OsStr::new(commit),
@@ -162,9 +119,12 @@ pub(super) fn version_git_commit_message(
     Ok(message.trim_end().to_string())
 }
 
-pub(super) fn version_git_config_bool(repository_root: &Path, key: &str) -> Result<bool, LpmError> {
-    let output = version_git_output(
-        repository_root,
+fn version_git_config_bool(
+    runner: &impl VersionGitCommandRunner,
+    key: &str,
+) -> Result<bool, LpmError> {
+    let output = version_git_output_with(
+        runner,
         [
             OsStr::new("config"),
             OsStr::new("--type=bool"),
@@ -205,20 +165,6 @@ pub(super) enum VersionGitRecoveryState {
 
 trait VersionGitCommandRunner {
     fn output(&self, args: &[OsString]) -> Result<Output, LpmError>;
-}
-
-struct PathVersionGitCommandRunner<'a> {
-    working_directory: &'a Path,
-}
-
-impl VersionGitCommandRunner for PathVersionGitCommandRunner<'_> {
-    fn output(&self, args: &[OsString]) -> Result<Output, LpmError> {
-        Command::new("git")
-            .args(args)
-            .current_dir(self.working_directory)
-            .output()
-            .map_err(LpmError::Io)
-    }
 }
 
 struct RecoveryVersionGitCommandRunner<'a> {
@@ -394,6 +340,8 @@ pub(super) fn recover_version_git_transaction(
             ],
         )?;
     }
+    let mut manifest_pathspec = OsString::from(":(top,literal)");
+    manifest_pathspec.push(repository_manifest.as_os_str());
     require_version_git_success_with(
         &runner,
         [
@@ -401,28 +349,10 @@ pub(super) fn recover_version_git_transaction(
             OsStr::new("--quiet"),
             OsStr::new(&git.old_head),
             OsStr::new("--"),
-            repository_manifest.as_os_str(),
+            &manifest_pathspec,
         ],
     )?;
     Ok(VersionGitRecoveryState::RolledBack)
-}
-
-pub(super) fn verify_version_git_commit(
-    repository_root: &Path,
-    manifest: &Path,
-    old_head: &str,
-    candidate: &str,
-    updated_sha256: &str,
-) -> Result<(), LpmError> {
-    verify_version_git_commit_with(
-        &PathVersionGitCommandRunner {
-            working_directory: repository_root,
-        },
-        manifest,
-        old_head,
-        candidate,
-        updated_sha256,
-    )
 }
 
 fn verify_version_git_commit_with(
@@ -432,10 +362,19 @@ fn verify_version_git_commit_with(
     candidate: &str,
     updated_sha256: &str,
 ) -> Result<(), LpmError> {
-    let parent = resolve_version_git_commit_with(runner, &format!("{candidate}^{{commit}}^"))?;
-    if parent != old_head {
+    let parents = require_version_git_success_with(
+        runner,
+        [
+            OsStr::new("show"),
+            OsStr::new("--no-show-signature"),
+            OsStr::new("-s"),
+            OsStr::new("--format=%P"),
+            OsStr::new(candidate),
+        ],
+    )?;
+    if String::from_utf8_lossy(&parents.stdout).trim() != old_head {
         return Err(LpmError::Script(format!(
-            "Git HEAD moved outside the version transaction; expected parent {old_head}, found {parent}. The release journal was preserved."
+            "Git HEAD moved outside the version transaction; expected exactly one parent {old_head}. The release journal was preserved."
         )));
     }
 
@@ -498,27 +437,6 @@ fn verify_version_git_commit_with(
     Ok(())
 }
 
-pub(super) fn version_git_repository_root(working_dir: &Path) -> Result<PathBuf, LpmError> {
-    let output = require_version_git_success(
-        working_dir,
-        [OsStr::new("rev-parse"), OsStr::new("--show-toplevel")],
-    )?;
-    let path = path_from_git_output(output.stdout)?;
-    path.canonicalize().map_err(LpmError::Io)
-}
-
-pub(super) fn resolve_version_git_commit(
-    repository_root: &Path,
-    object: &str,
-) -> Result<String, LpmError> {
-    resolve_version_git_commit_with(
-        &PathVersionGitCommandRunner {
-            working_directory: repository_root,
-        },
-        object,
-    )
-}
-
 fn resolve_version_git_commit_with(
     runner: &impl VersionGitCommandRunner,
     object: &str,
@@ -532,18 +450,6 @@ fn resolve_version_git_commit_with(
         ],
     )?;
     version_git_stdout_text("rev-parse --verify", output.stdout)
-}
-
-pub(super) fn resolve_optional_version_git_commit(
-    repository_root: &Path,
-    object: &OsStr,
-) -> Result<Option<String>, LpmError> {
-    resolve_optional_version_git_commit_with(
-        &PathVersionGitCommandRunner {
-            working_directory: repository_root,
-        },
-        object,
-    )
 }
 
 fn resolve_optional_version_git_commit_with(
@@ -589,19 +495,6 @@ fn version_git_ref_exists_with(
     }
 }
 
-pub(super) fn require_version_git_success<I, S>(cwd: &Path, args: I) -> Result<Output, LpmError>
-where
-    I: IntoIterator<Item = S>,
-    S: AsRef<OsStr>,
-{
-    require_version_git_success_with(
-        &PathVersionGitCommandRunner {
-            working_directory: cwd,
-        },
-        args,
-    )
-}
-
 fn require_version_git_success_with<I, S>(
     runner: &impl VersionGitCommandRunner,
     args: I,
@@ -625,19 +518,6 @@ where
     } else {
         Err(version_git_error(&command, output))
     }
-}
-
-pub(super) fn version_git_output<I, S>(cwd: &Path, args: I) -> Result<Output, LpmError>
-where
-    I: IntoIterator<Item = S>,
-    S: AsRef<OsStr>,
-{
-    version_git_output_with(
-        &PathVersionGitCommandRunner {
-            working_directory: cwd,
-        },
-        args,
-    )
 }
 
 fn version_git_output_with<I, S>(
