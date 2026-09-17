@@ -745,7 +745,12 @@ pub(super) fn platform_shell_invocation(cmd: &str) -> Result<(PathBuf, Vec<Strin
     {
         Ok((
             windows_system_directory()?.join("cmd.exe"),
-            vec!["/D".to_string(), "/C".to_string(), cmd.to_string()],
+            vec![
+                "/D".to_string(),
+                "/S".to_string(),
+                "/C".to_string(),
+                cmd.to_string(),
+            ],
         ))
     }
     #[cfg(not(any(unix, windows)))]

@@ -3547,7 +3547,7 @@ fn capability_not_approved_reports_not_trusted() {
 /// `UnsupportedPlatform` on Windows so this code path never
 /// fired there; with the real backend landed, `sh -c` would
 /// fail at spawn because `sh.exe` isn't on the standard Windows
-/// PATH. The helper picks `cmd.exe /D /C` instead so end-to-end
+/// PATH. The helper picks `cmd.exe /D /S /C` instead so end-to-end
 /// Windows installs actually work.
 #[cfg(windows)]
 #[test]
@@ -3562,6 +3562,7 @@ fn platform_shell_invocation_uses_cmd_exe_on_windows() {
         args,
         vec![
             "/D".to_string(),
+            "/S".to_string(),
             "/C".to_string(),
             "node install.js".to_string()
         ],

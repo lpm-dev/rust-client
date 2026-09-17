@@ -180,6 +180,9 @@ mod secret_paths;
 ))]
 mod linux_secret_overlay;
 
+#[cfg(any(windows, test))]
+mod windows_command_line;
+
 pub mod config;
 pub use config::{load_sandbox_read_allow, load_sandbox_write_dirs, resolve_sandbox_read_allow};
 
@@ -1078,6 +1081,9 @@ pub struct NoopSandbox {
 impl Sandbox for NoopSandbox {
     fn spawn(&self, cmd: SandboxedCommand) -> Result<std::process::Child, SandboxError> {
         let mut command = std::process::Command::new(&cmd.program);
+        #[cfg(windows)]
+        crate::windows_command_line::apply_arguments(&mut command, &cmd.program, &cmd.args);
+        #[cfg(not(windows))]
         command.args(&cmd.args);
         if cmd.env_clear {
             command.env_clear();

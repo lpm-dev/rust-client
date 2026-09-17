@@ -309,9 +309,7 @@ impl Sandbox for WindowsSandbox {
         // other backends), then a post-spawn integrity-drop +
         // job-object-assign + resume sequence.
         let mut command = Command::new(&cmd.program);
-        for a in &cmd.args {
-            command.arg(a);
-        }
+        crate::windows_command_line::apply_arguments(&mut command, &cmd.program, &cmd.args);
         if cmd.env_clear {
             command.env_clear();
         }
