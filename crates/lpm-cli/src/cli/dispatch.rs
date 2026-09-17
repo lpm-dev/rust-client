@@ -18,11 +18,11 @@ use super::format::{
 };
 use super::helpers::{
     argv_requests_top_level_version, build_install_global_overrides_with_excludes,
-    command_needs_global_state, install_omit_policy_from_cli, maybe_emit_network_fs_warning,
-    print_version_with_notice, resolve_install_project_dir, resolve_tunnel_bearer,
-    should_suppress_update_banner, spawn_background_update_check, tunnel_action_requires_session,
-    validate_global_install_project_scoped_flags, validate_global_install_unsupported_flags,
-    validate_global_uninstall_project_scoped_flags,
+    command_allows_background_update, command_needs_global_state, install_omit_policy_from_cli,
+    maybe_emit_network_fs_warning, print_version_with_notice, resolve_install_project_dir,
+    resolve_tunnel_bearer, should_suppress_update_banner, spawn_background_update_check,
+    tunnel_action_requires_session, validate_global_install_project_scoped_flags,
+    validate_global_install_unsupported_flags, validate_global_uninstall_project_scoped_flags,
 };
 
 pub(crate) fn run() -> Result<()> {
@@ -502,6 +502,7 @@ async fn async_main() -> Result<()> {
     // suppression scoped to this invocation only; the next command still
     // sees the banner.
     let is_self_update_command = matches!(command, Commands::SelfUpdate(_));
+    let allow_background_update = command_allows_background_update(&command);
 
     // Wrap the entire dispatch in an async block so every
     // `?` inside a match arm body propagates to THIS block's
@@ -775,6 +776,14 @@ async fn async_main() -> Result<()> {
                 ));
             }
 
+            if offline && !packages.is_empty() {
+                return Err(lpm_common::LpmError::Script(
+                    "offline installs do not accept package specs. Run `lpm install --offline` \
+                     to replay the existing lockfile, or remove --offline to add packages."
+                        .into(),
+                ));
+            }
+
             // Token expiry warnings.
             if !cli.json {
                 for warning in auth::check_token_expiry_warnings() {
@@ -986,6 +995,15 @@ async fn async_main() -> Result<()> {
                 ));
             }
 
+            let add_options = commands::install::AddInstallOptions {
+                strict_integrity,
+                linker_override: linker.map(LinkerCli::into_linker_mode),
+                no_editor_setup: no_editor_setup || cfg.get_bool("noEditorSetup").unwrap_or(false),
+                no_security_summary: no_security_summary
+                    || cfg.get_bool("noSecuritySummary").unwrap_or(false),
+                auto_build: auto_build || cfg.get_bool("autoBuild").unwrap_or(false),
+            };
+
             if packages.is_empty() {
                 let workspace_root_default = lpm_workspace::read_package_json(
                     &cwd.join("package.json"),
@@ -1156,6 +1174,7 @@ async fn async_main() -> Result<()> {
                     eff_audit_after_install,
                     timing,
                     lpm_skills_preference,
+                    add_options,
                 )
                 .await
             } else {
@@ -1200,6 +1219,7 @@ async fn async_main() -> Result<()> {
                         eff_audit_after_install,
                         timing,
                         lpm_skills_preference,
+                        add_options,
                     )
                     .await
                 } else {
@@ -1229,6 +1249,7 @@ async fn async_main() -> Result<()> {
                         eff_audit_after_install,
                         timing,
                         lpm_skills_preference,
+                        add_options,
                     )
                     .await
                 }
@@ -3197,7 +3218,7 @@ async fn async_main() -> Result<()> {
     // spawn a detached child process to refresh the update cache
     // if stale. The parent never waits for it — command exit is immediate.
     // The staleness check is sync (file stat + timestamp comparison).
-    if update_check.should_spawn_background_check() {
+    if allow_background_update && update_check.should_spawn_background_check() {
         spawn_background_update_check();
     }
 

@@ -91,9 +91,9 @@ pub(crate) use lockfile::{
 #[cfg(test)]
 pub(crate) use manifest::finalize_packages_in_manifest;
 use manifest::*;
+pub(crate) use manifest::{AddInstallOptions, run_add_packages, run_install_filtered_add};
 #[cfg(test)]
 pub(crate) use manifest::{StagedKind, stage_packages_to_manifest};
-pub use manifest::{run_add_packages, run_install_filtered_add};
 use package::*;
 use patches::*;
 use peer::*;
