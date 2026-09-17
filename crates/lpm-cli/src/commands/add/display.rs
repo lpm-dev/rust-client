@@ -1,167 +1,60 @@
-use super::target::AddTarget;
 use crate::install_ui;
 use lpm_common::LpmError;
-use lpm_common::color::Painted;
-use serde::Serialize;
-use std::collections::HashMap;
 use std::io::Write;
 use std::path::Path;
 
-#[derive(Serialize)]
-struct DryRunFile<'a> {
-    path: &'a str,
-    action: &'static str,
-}
-
-#[derive(Serialize)]
-struct DryRunOutput<'a> {
-    success: bool,
-    dry_run: bool,
-    package: String,
-    version: &'a str,
-    target: String,
-    files: Vec<DryRunFile<'a>>,
-    dependencies_count: usize,
-}
-
-// ---------------------------------------------------------------------------
-// Dry-run mode
-// ---------------------------------------------------------------------------
-
-/// Show what would happen without writing any files.
-#[allow(clippy::too_many_arguments)]
-pub(super) fn handle_dry_run(
-    project_dir: &Path,
-    target_dir: &Path,
-    files: &[(String, String)],
-    force: bool,
-    add_target: &AddTarget,
-    version: &str,
-    lpm_config: &Option<serde_json::Value>,
-    inline_config: &HashMap<String, String>,
-    _ecosystem: &str,
+pub(super) fn print_dry_run(
+    packages: &mut Vec<super::preview::PackagePreview>,
     json_output: bool,
-    no_install_deps: bool,
-    planned_dependency_count: usize,
 ) -> Result<(), LpmError> {
-    let mut file_actions = Vec::with_capacity(files.len());
-    let state = crate::added_sources_state::load_state_with_snapshot(project_dir)?.0;
-    let package_name = add_target.json_name();
-    let previous = state.package(&package_name);
-
-    for (_src_rel, dest_rel) in files {
-        let dest_target = target_dir.join(dest_rel);
-        let exists = dest_target.exists();
-        let manifest_path =
-            crate::added_sources_state::manifest_path_for_file(project_dir, &dest_target);
-        let managed = if exists {
-            previous
-                .and_then(|record| record.files.get(&manifest_path))
-                .filter(|file| file.action.is_some())
-                .is_some_and(|file| {
-                    file.installed_digest.as_deref()
-                        == crate::added_sources_state::digest_file(&dest_target)
-                            .ok()
-                            .as_deref()
-                })
-        } else {
-            false
-        };
-        let action = if exists {
-            if managed || force {
-                "overwrite"
-            } else {
-                "skip"
-            }
-        } else {
-            "create"
-        };
-        file_actions.push((dest_rel.as_str(), action));
-    }
-
-    // Count dependencies that would be installed
-    let dep_count = if no_install_deps || lpm_config.is_none() {
-        0
-    } else {
-        planned_dependency_count
+    let mut previews = std::mem::take(packages).into_iter();
+    let Some(mut root) = previews.next() else {
+        return Ok(());
     };
-
+    root.source_dependencies.extend(previews);
     if json_output {
-        let files = file_actions
-            .iter()
-            .map(|(path, action)| DryRunFile { path, action })
-            .collect();
-        let output = DryRunOutput {
-            success: true,
-            dry_run: true,
-            package: add_target.json_name(),
-            version,
-            target: target_dir
-                .strip_prefix(project_dir)
-                .unwrap_or(target_dir)
-                .display()
-                .to_string(),
-            files,
-            dependencies_count: dep_count,
-        };
         let stdout = std::io::stdout();
         let mut stdout = stdout.lock();
-        serde_json::to_writer_pretty(&mut stdout, &output).map_err(|error| {
+        serde_json::to_writer_pretty(&mut stdout, &root).map_err(|error| {
             LpmError::Registry(format!("failed to serialize add dry-run output: {error}"))
         })?;
-        stdout.write_all(b"\n").map_err(LpmError::Io)?;
+        stdout.write_all(b"\n")?;
     } else {
-        eprintln!("\n  Dry run -- no files will be modified.\n");
-        let target = target_dir
-            .strip_prefix(project_dir)
-            .unwrap_or(target_dir)
-            .display()
-            .to_string();
-        eprintln!(
-            "  Would install to: {}",
-            lpm_common::sanitize_terminal_inline(&target)
-        );
-        eprintln!("  Files:");
-        for (path, action) in &file_actions {
-            let icon = if *action == "create" {
-                "+".green().to_string()
-            } else if *action == "overwrite" {
-                "~".yellow().to_string()
-            } else {
-                "-".dimmed().to_string()
-            };
+        eprintln!("\n  Dry run -- no project files will be modified.\n");
+        for package in std::iter::once(&root).chain(root.source_dependencies.iter()) {
             eprintln!(
-                "    {} {} ({})",
-                icon,
-                lpm_common::sanitize_terminal_inline(path),
-                action
+                "  {}@{} -> {}",
+                lpm_common::sanitize_terminal_inline(&package.package),
+                lpm_common::sanitize_terminal_inline(&package.version),
+                lpm_common::sanitize_terminal_inline(&package.target)
             );
-        }
-        if dep_count > 0 {
-            eprintln!("\n  Dependencies to install: {dep_count}");
-
-            // Show individual dep names if available
-            if let Some(config) = lpm_config
-                && let Some(dep_config) = config.get("dependencies").and_then(|d| d.as_object())
-            {
-                for (config_key, dep_map) in dep_config {
-                    let config_value = inline_config.get(config_key).map_or("", |s| s.as_str());
-                    if config_value.is_empty() {
-                        continue;
-                    }
-                    if let Some(deps) = dep_map.get(config_value).and_then(|d| d.as_array()) {
-                        for dep in deps {
-                            if let Some(dep_name) = dep.as_str() {
-                                eprintln!("    {}", lpm_common::sanitize_terminal_inline(dep_name));
-                            }
-                        }
-                    }
-                }
+            for file in &package.files {
+                eprintln!(
+                    "    {} ({})",
+                    lpm_common::sanitize_terminal_inline(&file.path),
+                    file.action
+                );
+            }
+            for file in &package.stale_files {
+                eprintln!(
+                    "    {} ({}, project-relative)",
+                    lpm_common::sanitize_terminal_inline(&file.path),
+                    file.action
+                );
+            }
+            for dependency in &package.dependencies_removed {
+                eprintln!(
+                    "    Remove dependency {} from {}",
+                    lpm_common::sanitize_terminal_inline(&dependency.name),
+                    lpm_common::sanitize_terminal_inline(&dependency.section)
+                );
+            }
+            if package.dependencies_count > 0 {
+                eprintln!("  Dependencies to install: {}", package.dependencies_count);
             }
         }
         eprintln!();
     }
-
     Ok(())
 }
 

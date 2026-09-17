@@ -2,6 +2,8 @@ mod conflict;
 mod dependencies;
 mod display;
 mod paths;
+mod plan;
+mod preview;
 mod project;
 mod security;
 mod source;
@@ -22,14 +24,12 @@ use dependencies::{
     DependencyOutcome, collect_source_pkg_deps, handle_dependencies, pm_lockfile_paths,
     preflight_no_manifest_with_deps, refresh_dependency_install,
 };
-use display::{
-    dependencies_word, files_word, handle_dry_run, print_add_file, print_add_project_structure,
-};
+use display::{dependencies_word, files_word, print_add_file, print_add_project_structure};
 use lpm_common::LpmError;
 use lpm_registry::{RegistryClient, RouteTable};
 use paths::{
     CreatedDirectoryRollback, portable_destination_identity, prepare_safe_dest_parent_tracked,
-    resolve_safe_dest_validate, validate_extracted_paths, validate_source_delivery_namespace,
+    validate_extracted_paths, validate_source_delivery_namespace,
 };
 use project::{
     detect_buyer_alias, detect_default_install_dir, detect_framework, detect_package_manager,
@@ -39,8 +39,7 @@ use serde::ser::SerializeSeq;
 use serde::{Serialize, Serializer};
 use source::{
     collect_source_with_fallback, filter_config_files, json_value_to_config_string,
-    read_lpm_config, read_runtime_source_text, resolve_noninteractive_required_config,
-    validate_declared_config_values,
+    read_lpm_config, resolve_noninteractive_required_config, validate_declared_config_values,
 };
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -111,11 +110,23 @@ fn validate_destination_plan(
     target_root_canonical: &Path,
     target_dir: &Path,
     files: &[(String, String)],
+    preview: Option<&preview::PreviewState>,
 ) -> Result<Vec<PathBuf>, LpmError> {
     let mut identities = HashSet::with_capacity(files.len());
     let mut destinations = Vec::with_capacity(files.len());
     for (_, destination) in files {
-        let resolved = resolve_safe_dest_validate(target_root_canonical, target_dir, destination)?;
+        let removed = preview.is_some_and(|preview| preview.removed(&target_dir.join(destination)));
+        let resolved = if removed {
+            paths::resolve_safe_dest_validate_planned(
+                target_root_canonical,
+                target_dir,
+                destination,
+                true,
+            )
+        } else {
+            paths::resolve_safe_dest_validate(target_root_canonical, target_dir, destination)
+        }?;
+        let resolved = planned_target_root(&resolved)?;
         validate_source_delivery_namespace(project_root_canonical, &resolved)?;
         let identity = portable_destination_identity(&resolved);
         if !identities.insert(identity) {
@@ -125,6 +136,17 @@ fn validate_destination_plan(
             )));
         }
         destinations.push(resolved);
+    }
+    for destination in &destinations {
+        for parent in destination.ancestors().skip(1) {
+            if identities.contains(&portable_destination_identity(parent)) {
+                return Err(LpmError::Registry(format!(
+                    "source destination '{}' conflicts with file destination '{}'",
+                    destination.display(),
+                    parent.display()
+                )));
+            }
+        }
     }
     Ok(destinations)
 }
@@ -234,25 +256,17 @@ fn reconcile_stale_source_files(
 
         let destination =
             crate::added_sources_state::resolve_tracked_manifest_path(project_dir, manifest_path)?;
-        let Some(expected_digest) = file.installed_digest.as_deref() else {
+        if file.installed_digest.is_none() {
             tracked_files.push((manifest_path.clone(), file.clone()));
             continue;
-        };
+        }
         let current_digest = match std::fs::symlink_metadata(&destination) {
             Ok(_) => Some(crate::added_sources_state::digest_file(&destination)?),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
             Err(error) => return Err(LpmError::Io(error)),
         };
-        if current_digest
-            .as_deref()
-            .is_some_and(|digest| digest != expected_digest)
-        {
-            tracked_files.push((manifest_path.clone(), file.clone()));
-            continue;
-        }
-
-        match (file.action, current_digest.is_some()) {
-            (Some(crate::added_sources_state::AddedSourceFileAction::Create), true) => {
+        match plan::stale_file_action(false, file, current_digest.as_deref()) {
+            plan::StaleFileAction::Remove => {
                 transaction
                     .snapshot_optional_path(&destination)
                     .map_err(LpmError::Io)?;
@@ -262,10 +276,10 @@ fn reconcile_stale_source_files(
                     .map_err(LpmError::Io)?;
                 reconciled.push(manifest_path.clone());
             }
-            (Some(crate::added_sources_state::AddedSourceFileAction::Create), false) => {
+            plan::StaleFileAction::Forget => {
                 reconciled.push(manifest_path.clone());
             }
-            (Some(crate::added_sources_state::AddedSourceFileAction::Overwrite), true) => {
+            plan::StaleFileAction::Restore => {
                 let recorded_backup = file.backup_path.as_deref().ok_or_else(|| {
                     LpmError::Registry(format!(
                         "source state for '{}' is missing its overwrite backup",
@@ -302,44 +316,9 @@ fn reconcile_stale_source_files(
                     .map_err(LpmError::Io)?;
                 reconciled.push(manifest_path.clone());
             }
-            (Some(crate::added_sources_state::AddedSourceFileAction::Overwrite), false) => {
-                let recorded_backup = file.backup_path.as_deref().ok_or_else(|| {
-                    LpmError::Registry(format!(
-                        "source state for '{}' is missing its overwrite backup",
-                        manifest_path.display()
-                    ))
-                })?;
-                let relative_backup = crate::added_sources_state::validate_recorded_backup_path(
-                    package,
-                    manifest_path,
-                    recorded_backup,
-                )?;
-                let backup = crate::added_sources_state::validate_existing_backup(
-                    project_dir,
-                    &relative_backup,
-                    file.backup_digest.as_deref(),
-                )?;
-                transaction
-                    .snapshot_optional_path(&destination)
-                    .map_err(LpmError::Io)?;
-                transaction
-                    .snapshot_optional_path(&backup)
-                    .map_err(LpmError::Io)?;
-                crate::added_sources_state::copy_file_atomic_with_mode(
-                    &backup,
-                    &destination,
-                    file.backup_mode,
-                )?;
-                transaction
-                    .restore_only_if_current(&destination)
-                    .map_err(LpmError::Io)?;
-                crate::install_recovery::remove_source(&backup).map_err(LpmError::Io)?;
-                transaction
-                    .restore_only_if_current(&backup)
-                    .map_err(LpmError::Io)?;
-                reconciled.push(manifest_path.clone());
+            plan::StaleFileAction::Preserve => {
+                tracked_files.push((manifest_path.clone(), file.clone()))
             }
-            (None, _) => tracked_files.push((manifest_path.clone(), file.clone())),
         }
     }
     Ok(reconciled)
@@ -352,59 +331,7 @@ fn reconcile_stale_dependencies(
     desired: &HashSet<&str>,
     transaction: &mut crate::manifest_tx::ManifestTransaction,
 ) -> Result<bool, LpmError> {
-    let Some(previous) = previous else {
-        return Ok(false);
-    };
-    let stale_names = previous
-        .dependencies
-        .iter()
-        .filter(|(name, dependency)| dependency.inserted && !desired.contains(name.as_str()))
-        .map(|(name, _)| name.as_str())
-        .collect::<HashSet<_>>();
-    let mut replacement_owners = HashMap::<String, String>::with_capacity(stale_names.len());
-    let mut inserted_elsewhere = HashSet::<String>::with_capacity(stale_names.len());
-    for (other_package, record) in &state.packages {
-        for (name, candidate) in &record.dependencies {
-            if !stale_names.contains(name.as_str()) {
-                continue;
-            }
-            if candidate.inserted {
-                inserted_elsewhere.insert(name.clone());
-            }
-            let previous_dependency = &previous.dependencies[name];
-            if candidate.spec == previous_dependency.spec
-                && candidate.section == previous_dependency.section
-            {
-                replacement_owners
-                    .entry(name.clone())
-                    .or_insert_with(|| other_package.clone());
-            }
-        }
-    }
-    for (name, _) in previous
-        .dependencies
-        .iter()
-        .filter(|(name, dependency)| dependency.inserted && !desired.contains(name.as_str()))
-    {
-        if let Some(replacement_owner) = replacement_owners.get(name)
-            && let Some(replacement) = state
-                .packages
-                .get_mut(replacement_owner)
-                .and_then(|record| record.dependencies.get_mut(name))
-        {
-            replacement.inserted = true;
-            inserted_elsewhere.insert(name.clone());
-        }
-    }
-    let stale = previous
-        .dependencies
-        .iter()
-        .filter(|(name, dependency)| {
-            dependency.inserted
-                && !desired.contains(name.as_str())
-                && !inserted_elsewhere.contains(name.as_str())
-        })
-        .collect::<Vec<_>>();
+    let stale = plan::stale_dependency_candidates(state, previous, desired);
     if stale.is_empty() {
         return Ok(false);
     }
@@ -415,22 +342,7 @@ fn reconcile_stale_dependencies(
             .map_err(|error| LpmError::Registry(format!("failed to read package.json: {error}")))?;
     let mut manifest: serde_json::Value = serde_json::from_str(&content)
         .map_err(|error| LpmError::Registry(format!("failed to parse package.json: {error}")))?;
-    let object = manifest
-        .as_object_mut()
-        .ok_or_else(|| LpmError::Registry("package.json root must be a JSON object".to_string()))?;
-    let mut changed = false;
-    for (name, dependency) in stale {
-        let Some(section) = object
-            .get_mut(&dependency.section)
-            .and_then(serde_json::Value::as_object_mut)
-        else {
-            continue;
-        };
-        if section.get(name).and_then(serde_json::Value::as_str) == Some(dependency.spec.as_str()) {
-            section.remove(name);
-            changed = true;
-        }
-    }
+    let changed = !plan::remove_unchanged_dependencies(&mut manifest, &stale)?.is_empty();
     if changed {
         let mut body = serde_json::to_vec_pretty(&manifest).map_err(|error| {
             LpmError::Registry(format!("failed to serialize package.json: {error}"))
@@ -523,7 +435,24 @@ pub async fn run(
         )
         .await
     };
-    crate::commands::install::workspace_lockfile::scope_member_install(project_dir, operation).await
+    if dry_run {
+        let workspace = lpm_workspace::discover_workspace(project_dir)
+            .map_err(|error| LpmError::Registry(format!("workspace discovery failed: {error}")))?;
+        let root = workspace
+            .as_ref()
+            .map_or(project_dir, |workspace| workspace.root.as_path());
+        if crate::install_recovery::pending(root) || crate::install_recovery::pending(project_dir) {
+            return Err(LpmError::Registry("source preview requires completed recovery; run lpm add without --dry-run or lpm remove to recover first".into()));
+        }
+        crate::release_plan::ensure_no_pending_release_transaction(root)?;
+        operation.await
+    } else {
+        crate::commands::install::workspace_lockfile::scope_member_source_delivery(
+            project_dir,
+            operation,
+        )
+        .await
+    }
 }
 
 #[expect(
@@ -555,7 +484,7 @@ async fn run_locked(
         project_dir,
         &[package_spec.to_string()],
         &[project_dir.to_path_buf()],
-        yes,
+        yes || dry_run,
         json_output,
     )?;
     let package_spec =
@@ -1009,11 +938,12 @@ async fn run_locked(
     }
     ensure_unique_destinations(&files)?;
     let project_root_canonical = project_dir.canonicalize().map_err(LpmError::Io)?;
-    validate_destination_plan(
+    let planned_destinations = validate_destination_plan(
         &project_root_canonical,
         &target_root_planned,
         &target_dir,
         &files,
+        dry_run.then_some(&swift_traversal.preview),
     )?;
     let planned_dependency_entries = if lpm_config.is_some() {
         collect_source_pkg_deps(&lpm_config, &inline_config, temp_dir.path())?
@@ -1026,24 +956,6 @@ async fn run_locked(
         no_install_deps,
         planned_dependency_entries.len(),
     )?;
-
-    // Dry-run mode: show what would happen and exit.
-    if dry_run {
-        return handle_dry_run(
-            project_dir,
-            &target_dir,
-            &files,
-            force,
-            &target,
-            &version,
-            &lpm_config,
-            &inline_config,
-            ecosystem,
-            json_output,
-            no_install_deps,
-            planned_dependency_entries.len(),
-        );
-    }
 
     // Prepare import rewriting.
     let author_alias = lpm_config
@@ -1119,6 +1031,53 @@ async fn run_locked(
         .iter()
         .map(|(_, destination)| destination.as_str())
         .collect();
+
+    let source_content = plan::SourceContent {
+        configured: lpm_config.is_some(),
+        author_alias: author_alias.as_deref(),
+        buyer_alias: buyer_alias.as_deref(),
+        src_to_dest: &src_to_dest,
+        dest_files: &dest_files,
+    };
+    if dry_run {
+        preview::plan_package(
+            project_dir,
+            temp_dir.path(),
+            &target_dir,
+            &files,
+            &planned_destinations,
+            &source_content,
+            force,
+            &target,
+            &version,
+            no_install_deps,
+            &planned_dependency_entries,
+            &mut swift_traversal.preview,
+        )?;
+        if ecosystem == "swift" {
+            handle_swift_lpm_deps(
+                client,
+                project_dir,
+                &ver_meta,
+                yes,
+                json_output,
+                force,
+                true,
+                no_install_deps,
+                no_skills,
+                no_editor_setup,
+                no_engine_strict,
+                pm,
+                swift_traversal,
+            )
+            .await?;
+        }
+        if emit_output {
+            swift_traversal.preview.ensure_unchanged()?;
+            display::print_dry_run(&mut swift_traversal.preview.packages, json_output)?;
+        }
+        return Ok(());
+    }
 
     // Destination validation first runs without filesystem mutations.
     // The transaction then owns every directory creation, file write, and
@@ -1201,6 +1160,7 @@ async fn run_locked(
             &target_root_canonical,
             &target_dir,
             &files,
+            None,
         )?
         .into_iter()
         .map(|validated| {
@@ -1272,33 +1232,13 @@ async fn run_locked(
     for ((src_rel, dest_rel), dest_path) in files.iter().zip(final_dest_paths.iter()) {
         let src_path = temp_dir.path().join(src_rel);
 
-        let content = read_runtime_source_text(&src_path)?;
-        let rewritten = content.as_deref().and_then(|text| {
-            if lpm_config.is_none() {
-                crate::import_rewriter::rewrite_imports_indexed_collecting_bare(
-                    text,
-                    src_rel,
-                    dest_rel,
-                    author_alias.as_deref(),
-                    buyer_alias.as_deref(),
-                    &src_to_dest,
-                    &dest_files,
-                    &mut collected_external_imports,
-                )
-            } else {
-                crate::import_rewriter::rewrite_imports_indexed(
-                    text,
-                    src_rel,
-                    dest_rel,
-                    author_alias.as_deref(),
-                    buyer_alias.as_deref(),
-                    &src_to_dest,
-                    &dest_files,
-                )
-            }
-        });
-
-        let final_content = rewritten.as_deref().or(content.as_deref());
+        let content = source_content.prepare(
+            &src_path,
+            src_rel,
+            dest_rel,
+            &mut collected_external_imports,
+        )?;
+        let final_content = content.as_deref();
 
         let dest_existed = dest_path.exists();
         let manifest_path =
@@ -1310,10 +1250,8 @@ async fn run_locked(
         let current_digest = (dest_existed && previous_file.is_some())
             .then(|| crate::added_sources_state::digest_file(dest_path))
             .transpose()?;
-        let previous_is_current = previous_file.as_ref().is_some_and(|previous| {
-            previous.installed_digest.as_ref() == current_digest.as_ref()
-                && previous.action.is_some()
-        });
+        let previous_is_current =
+            plan::managed_file_matches(previous_file.as_ref(), current_digest.as_deref());
 
         if previous_is_current {
             let incoming_digest = if let Some(text) = final_content {
@@ -1613,22 +1551,37 @@ async fn run_locked(
     let tracked_skill_short = previous_package_record
         .as_ref()
         .and_then(|record| record.skill_package_short.as_deref());
-    let tracked_dependencies = (!no_install_deps && lpm_config.is_some()).then(|| {
-        dependency_outcome
-            .requirements
-            .into_iter()
-            .map(|requirement| {
-                (
-                    requirement.name,
-                    crate::added_sources_state::AddedSourceDependency {
-                        spec: requirement.spec,
-                        section: requirement.section,
-                        inserted: requirement.inserted,
-                    },
-                )
+    let tracked_dependencies = (!no_install_deps && lpm_config.is_some())
+        .then(|| {
+            dependency_outcome
+                .requirements
+                .into_iter()
+                .map(|requirement| {
+                    (
+                        requirement.name,
+                        crate::added_sources_state::AddedSourceDependency {
+                            spec: requirement.spec,
+                            section: requirement.section,
+                            inserted: requirement.inserted,
+                        },
+                    )
+                })
+                .collect()
+        })
+        .or_else(|| {
+            no_install_deps.then(|| {
+                previous_package_record
+                    .as_ref()
+                    .map(|record| {
+                        record
+                            .dependencies
+                            .iter()
+                            .map(|(name, dependency)| (name.clone(), dependency.clone()))
+                            .collect()
+                    })
+                    .unwrap_or_default()
             })
-            .collect()
-    });
+        });
     let tracked_ancestors = crate::added_sources_state::tracked_file_ancestor_directories(
         tracked_files.iter().map(|(path, _)| path.as_path()),
     );

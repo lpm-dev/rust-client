@@ -1,0 +1,34 @@
+---
+source: tests/workflows/tests/add.rs
+expression: body
+---
+{
+  "success": true,
+  "dry_run": true,
+  "package": "@lpm.dev/swift.preview-root",
+  "version": "1.0.0",
+  "target": "Sources",
+  "files": [
+    {
+      "path": "swift.preview-root-1.0.0.swift",
+      "action": "create"
+    }
+  ],
+  "dependencies_count": 0,
+  "source_dependencies": [
+    {
+      "success": true,
+      "dry_run": true,
+      "package": "@lpm.dev/swift.preview-child",
+      "version": "1.0.0",
+      "target": "Sources",
+      "files": [
+        {
+          "path": "swift.preview-child-1.0.0.swift",
+          "action": "create"
+        }
+      ],
+      "dependencies_count": 0
+    }
+  ]
+}
