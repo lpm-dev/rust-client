@@ -11,7 +11,9 @@ use serde_json::{Map, Value};
 
 use crate::commands::install::{FrozenLockfileMode, InstallOmitPolicy};
 use crate::install_ui;
-use crate::intelligence::{SourceImport, node_builtin_package_names, scan_source_imports_checked};
+use crate::intelligence::{
+    SourceImport, node_builtin_package_names, scan_dependency_imports_checked,
+};
 
 const DEPENDENCY_SECTIONS: [DependencySection; 4] = [
     DependencySection {
@@ -137,11 +139,11 @@ pub async fn run(
     let start = Instant::now();
     let project_dir = cwd;
     let manifest_path = project_dir.join("package.json");
-    let manifest_bytes = match lpm_common::read_file_capped(
+    let manifest_bytes = match lpm_common::read_regular_file_capped_with_metadata(
         &manifest_path,
         lpm_common::CONFIG_FILE_SIZE_CAP_BYTES,
     ) {
-        Ok(content) => content,
+        Ok((content, _)) => content,
         Err(lpm_common::BoundedReadError::NotFound { .. }) => {
             return Err(LpmError::NotFound(format!(
                 "no package.json found at {}",
@@ -156,12 +158,13 @@ pub async fn run(
             manifest_path.display()
         ))
     })?;
-    let mut manifest: Value = serde_json::from_str(&manifest_text).map_err(|error| {
-        LpmError::Registry(format!(
-            "failed to parse package.json at {}: {error}",
-            manifest_path.display()
-        ))
-    })?;
+    let mut manifest: Value = serde_json::from_str(lpm_common::strip_utf8_bom_str(&manifest_text))
+        .map_err(|error| {
+            LpmError::Registry(format!(
+                "failed to parse package.json at {}: {error}",
+                manifest_path.display()
+            ))
+        })?;
     let config = TidyConfig::load(project_dir)?;
 
     let mut analysis = analyze_project(project_dir, &manifest, &config)?;
@@ -175,6 +178,7 @@ pub async fn run(
             &manifest_bytes,
             &mut manifest,
             &analysis,
+            json_output,
         )
         .await?;
         if !removed.is_empty() {
@@ -249,9 +253,28 @@ fn analyze_project(
 ) -> Result<Analysis, LpmError> {
     let declared = collect_declared_dependencies(manifest);
     let workspace_names = collect_workspace_member_names(project_dir, manifest)?;
-    let imports = filtered_imports(project_dir, config)?;
-    let import_usage = ImportUsage::from_imports(imports);
-    let script_tokens = collect_script_tokens(manifest);
+    let imports = filtered_imports(project_dir, manifest, config)?;
+    let import_usage = ImportUsage::from_imports(imports, &declared);
+    let mut script_tokens = collect_script_tokens(manifest);
+    if let Some(config) = read_tidy_lpm_json(project_dir)? {
+        let commands = config
+            .services
+            .values()
+            .map(|service| service.command.as_str())
+            .chain(
+                config
+                    .tasks
+                    .values()
+                    .filter_map(|task| task.command.as_deref()),
+            );
+        for command in commands {
+            script_tokens.extend(
+                tokenize_script(command)
+                    .into_iter()
+                    .filter(|token| !token_is_assignment(token)),
+            );
+        }
+    }
     let script_bins =
         collect_installed_bin_names(project_dir, declared.iter().map(|entry| &entry.name))?;
     let config_text = read_known_config_text(project_dir)?;
@@ -387,7 +410,9 @@ struct ImportUsage {
 }
 
 impl ImportUsage {
-    fn from_imports(imports: Vec<SourceImport>) -> Self {
+    fn from_imports(imports: Vec<SourceImport>, declared: &[DeclaredDependency]) -> Self {
+        let declared_names: HashSet<&str> =
+            declared.iter().map(|entry| entry.name.as_str()).collect();
         let node_builtins = node_builtin_package_names();
         let mut used_packages = BTreeSet::new();
         let mut imports_by_package: BTreeMap<String, Vec<SourceImport>> = BTreeMap::new();
@@ -395,9 +420,16 @@ impl ImportUsage {
         let mut uses_node_builtin = false;
 
         for import in imports {
-            let Some(package_name) = import.package_name.clone() else {
+            if import.specifier.starts_with("node:") {
+                uses_node_builtin = true;
+                continue;
+            }
+            let Some(mut package_name) = import.package_name.clone() else {
                 continue;
             };
+            if import.type_reference && !declared_names.contains(package_name.as_str()) {
+                package_name = runtime_to_types_package(&package_name).unwrap_or(package_name);
+            }
             if !seen.insert((package_name.clone(), import.file.clone(), import.line)) {
                 continue;
             }
@@ -423,16 +455,42 @@ impl ImportUsage {
 
 fn filtered_imports(
     project_dir: &Path,
+    manifest: &Value,
     config: &TidyConfig,
 ) -> Result<Vec<SourceImport>, LpmError> {
-    Ok(scan_source_imports_checked(project_dir)
-        .map_err(LpmError::Io)?
-        .into_iter()
-        .filter(|import| {
-            let rel = relative_display(project_dir, &import.file);
-            config.match_path(&rel).is_none()
-        })
-        .collect())
+    let mut entrypoints = Vec::new();
+    for field in ["main", "module", "types", "typings", "exports", "bin"] {
+        if let Some(value) = manifest.get(field) {
+            collect_entrypoints(value, &mut entrypoints);
+        }
+    }
+    scan_dependency_imports_checked(
+        project_dir,
+        &|path, is_directory| {
+            let rel = path.to_string_lossy().replace('\\', "/");
+            config.match_path(&rel).is_some()
+                || (is_directory && config.match_path(&format!("{rel}/")).is_some())
+        },
+        &entrypoints,
+    )
+    .map_err(LpmError::Io)
+}
+
+fn collect_entrypoints(value: &Value, paths: &mut Vec<String>) {
+    match value {
+        Value::String(path) => paths.push(path.strip_prefix("./").unwrap_or(path).to_owned()),
+        Value::Object(entries) => {
+            for entry in entries.values() {
+                collect_entrypoints(entry, paths);
+            }
+        }
+        Value::Array(entries) => {
+            for entry in entries {
+                collect_entrypoints(entry, paths);
+            }
+        }
+        _ => {}
+    }
 }
 
 fn absorb_type_package_usage(used: &mut BTreeSet<String>, import_usage: &ImportUsage) {
@@ -660,6 +718,34 @@ fn tokenize_script(script: &str) -> Vec<String> {
         }
     }
     push_script_token(&mut tokens, &mut current);
+    let mut loaders = Vec::new();
+    let mut expects_loader = false;
+    for token in &tokens {
+        let loader = if expects_loader {
+            expects_loader = false;
+            Some(token.as_str())
+        } else if matches!(
+            token.as_str(),
+            "--import" | "--loader" | "--experimental-loader" | "--require" | "-r"
+        ) {
+            expects_loader = true;
+            None
+        } else {
+            token.split_once('=').and_then(|(option, value)| {
+                matches!(
+                    option,
+                    "--import" | "--loader" | "--experimental-loader" | "--require"
+                )
+                .then_some(value)
+            })
+        };
+        if let Some(loader) = loader
+            && let Some(package) = crate::intelligence::extract_package_name(loader)
+        {
+            loaders.push(package);
+        }
+    }
+    tokens.extend(loaders);
     tokens
 }
 
@@ -694,15 +780,15 @@ fn collect_installed_bin_names<'a>(
             .join("node_modules")
             .join(name)
             .join("package.json");
-        let content = match lpm_common::read_text_file_capped(
+        let content = match lpm_common::read_text_regular_file_capped_with_metadata(
             &manifest,
             lpm_common::CONFIG_FILE_SIZE_CAP_BYTES,
         ) {
-            Ok(content) => content,
+            Ok((content, _)) => content,
             Err(lpm_common::BoundedReadError::NotFound { .. }) => continue,
             Err(error) => return Err(error.into()),
         };
-        let value = serde_json::from_str::<Value>(&content).map_err(|error| {
+        let value = serde_json::from_str::<Value>(lpm_common::strip_utf8_bom_str(&content)).map_err(|error| {
             LpmError::Registry(format!(
                 "failed to parse installed package manifest {} while analyzing scripts: {error}",
                 manifest.display()
@@ -766,10 +852,7 @@ fn read_known_config_text(project_dir: &Path) -> Result<String, LpmError> {
     let mut text = String::with_capacity(8192);
     for file in CONFIG_FILES {
         let path = project_dir.join(file);
-        let content = match lpm_common::read_text_file_capped(
-            &path,
-            lpm_common::CONFIG_FILE_SIZE_CAP_BYTES,
-        ) {
+        let content = match read_tidy_text(&path, lpm_common::CONFIG_FILE_SIZE_CAP_BYTES) {
             Ok(content) => content,
             Err(lpm_common::BoundedReadError::NotFound { .. }) => continue,
             Err(error) => return Err(error.into()),
@@ -892,9 +975,8 @@ fn collect_workspace_member_names(
             if path == project_dir.join("package.json") {
                 continue;
             }
-            let content =
-                lpm_common::read_text_file_capped(&path, lpm_common::CONFIG_FILE_SIZE_CAP_BYTES)?;
-            let value = serde_json::from_str::<Value>(&content).map_err(|error| {
+            let content = read_tidy_text(&path, lpm_common::CONFIG_FILE_SIZE_CAP_BYTES)?;
+            let value = serde_json::from_str::<Value>(lpm_common::strip_utf8_bom_str(&content)).map_err(|error| {
                 LpmError::Registry(format!(
                     "failed to parse workspace package manifest {} during tidy analysis: {error}",
                     path.display()
@@ -907,6 +989,26 @@ fn collect_workspace_member_names(
     }
 
     Ok(names)
+}
+
+fn read_tidy_text(path: &Path, limit: u64) -> Result<String, lpm_common::BoundedReadError> {
+    lpm_common::read_text_regular_file_capped_with_metadata(path, limit).map(|(content, _)| content)
+}
+
+fn read_tidy_lpm_json(
+    project_dir: &Path,
+) -> Result<Option<lpm_runner::lpm_json::LpmJsonConfig>, LpmError> {
+    let content = match read_tidy_text(
+        &project_dir.join("lpm.json"),
+        lpm_common::CONFIG_FILE_SIZE_CAP_BYTES,
+    ) {
+        Ok(content) => content,
+        Err(lpm_common::BoundedReadError::NotFound { .. }) => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    lpm_runner::lpm_json::parse_lpm_json(lpm_common::strip_utf8_bom_str(&content))
+        .map(Some)
+        .map_err(LpmError::Script)
 }
 
 fn tidy_io_error(action: &str, path: &Path, source: std::io::Error) -> std::io::Error {
@@ -923,6 +1025,7 @@ async fn apply_fix(
     original_manifest: &[u8],
     manifest: &mut Value,
     analysis: &Analysis,
+    json_output: bool,
 ) -> Result<Vec<RemovedDependency>, LpmError> {
     let fixable: Vec<&UnusedDependency> = analysis
         .unused
@@ -959,7 +1062,7 @@ async fn apply_fix(
                 .map_err(|error| LpmError::Registry(error.to_string()))?;
             write_file_atomic(manifest_path, format!("{updated}\n")).map_err(LpmError::Io)?;
 
-            reconcile_install(client, project_dir).await?;
+            reconcile_install(client, project_dir, json_output).await?;
             let removed_names = removed
                 .iter()
                 .map(|entry| entry.name.clone())
@@ -1034,11 +1137,15 @@ fn remove_empty_dependency_sections(manifest: &mut Value) {
     }
 }
 
-async fn reconcile_install(client: &RegistryClient, project_dir: &Path) -> Result<(), LpmError> {
-    crate::commands::install::run_with_options(
+async fn reconcile_install(
+    client: &RegistryClient,
+    project_dir: &Path,
+    json_output: bool,
+) -> Result<(), LpmError> {
+    crate::commands::install::run_with_options_with_lpm_root(
         client,
         project_dir,
-        false,
+        json_output,
         false,
         FrozenLockfileMode::Never,
         false,
@@ -1067,6 +1174,10 @@ async fn reconcile_install(client: &RegistryClient, project_dir: &Path) -> Resul
         false,
         false,
         &[],
+        !json_output,
+        false,
+        None,
+        lpm_common::LpmRoot::from_env()?,
     )
     .await
 }
@@ -1074,10 +1185,7 @@ async fn reconcile_install(client: &RegistryClient, project_dir: &Path) -> Resul
 impl TidyConfig {
     fn load(project_dir: &Path) -> Result<Self, LpmError> {
         let path = project_dir.join("lpm.toml");
-        let content = match lpm_common::read_text_file_capped(
-            &path,
-            lpm_common::CONFIG_FILE_SIZE_CAP_BYTES,
-        ) {
+        let content = match read_tidy_text(&path, lpm_common::CONFIG_FILE_SIZE_CAP_BYTES) {
             Ok(content) => content,
             Err(lpm_common::BoundedReadError::NotFound { .. }) => return Ok(Self::default()),
             Err(error) => return Err(error.into()),
@@ -1085,9 +1193,15 @@ impl TidyConfig {
         let value: toml::Value = toml::from_str(&content).map_err(|error| {
             LpmError::Registry(format!("failed to parse {}: {error}", path.display()))
         })?;
-        let Some(table) = value.get("tidy").and_then(toml::Value::as_table) else {
+        let Some(tidy) = value.get("tidy") else {
             return Ok(Self::default());
         };
+        let table = tidy.as_table().ok_or_else(|| {
+            LpmError::Registry(format!(
+                "invalid [tidy] configuration in {}: expected a table",
+                path.display()
+            ))
+        })?;
 
         Ok(Self {
             ignore_unused: read_pattern_list(table, "ignore-unused", &path)?,
