@@ -2783,6 +2783,10 @@ impl LockedRemoveResult {
 }
 
 pub async fn run(project_dir: &Path, package: &str, json_output: bool) -> Result<(), LpmError> {
+    #[cfg(windows)]
+    let canonical_project = project_dir.canonicalize().map_err(LpmError::Io)?;
+    #[cfg(windows)]
+    let project_dir = canonical_project.as_path();
     let start = Instant::now();
     if !json_output {
         install_ui::phase_line(crate::install_ui::terminal_line!(

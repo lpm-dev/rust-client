@@ -34,6 +34,16 @@ fn write_source_state_v3(project: &TempProject, packages: serde_json::Value) {
     );
 }
 
+fn source_file_key(files: &serde_json::Value, path: &str) -> String {
+    files
+        .as_object()
+        .expect("tracked files object")
+        .keys()
+        .find(|key| std::path::Path::new(key) == std::path::Path::new(path))
+        .unwrap_or_else(|| panic!("missing tracked source file {path}: {files}"))
+        .clone()
+}
+
 fn created_file(content: &[u8]) -> serde_json::Value {
     json!({
         "installed_digest": digest(content),
@@ -753,9 +763,11 @@ async fn remove_preserves_a_tracked_overwrite_that_the_user_modified() {
     let state_after: serde_json::Value =
         serde_json::from_str(&project.read_file(".lpm/added-sources.json")).unwrap();
     let state_before: serde_json::Value = serde_json::from_str(&state_before).unwrap();
+    let files_before = &state_before["packages"]["source-pkg"]["files"];
+    let key = source_file_key(files_before, "custom/Source.ts");
     assert_eq!(
-        state_after["packages"]["source-pkg"]["files"]["custom/Source.ts"],
-        state_before["packages"]["source-pkg"]["files"]["custom/Source.ts"]
+        state_after["packages"]["source-pkg"]["files"][&key],
+        files_before[&key]
     );
 }
 
@@ -786,9 +798,9 @@ async fn remove_rejects_a_tampered_overwrite_backup_before_mutating_the_destinat
         .success();
     let state: serde_json::Value =
         serde_json::from_str(&project.read_file(".lpm/added-sources.json")).unwrap();
-    let backup = state["packages"]["source-pkg"]["files"]["custom/Source.ts"]["backup_path"]
-        .as_str()
-        .unwrap();
+    let files = &state["packages"]["source-pkg"]["files"];
+    let key = source_file_key(files, "custom/Source.ts");
+    let backup = files[&key]["backup_path"].as_str().unwrap();
     project.write_file(backup, "tampered\n");
 
     let output = lpm(&project)
@@ -866,8 +878,9 @@ async fn remove_rejects_a_forged_overwrite_backup_path_before_mutating_files() {
     std::fs::write(&outside_backup, b"outside\n").unwrap();
     let mut state: serde_json::Value =
         serde_json::from_str(&project.read_file(".lpm/added-sources.json")).unwrap();
-    state["packages"]["source-pkg"]["files"]["custom/Source.ts"]["backup_path"] =
-        json!(outside_backup);
+    let files = &mut state["packages"]["source-pkg"]["files"];
+    let key = source_file_key(files, "custom/Source.ts");
+    files[&key]["backup_path"] = json!(outside_backup);
     project.write_file(
         ".lpm/added-sources.json",
         &serde_json::to_string_pretty(&state).unwrap(),
@@ -1793,9 +1806,9 @@ async fn interrupted_original_restoration_restores_backup_content_and_modes() {
         .success();
     let state: serde_json::Value =
         serde_json::from_str(&project.read_file(".lpm/added-sources.json")).unwrap();
-    let backup = state["packages"]["source-pkg"]["files"]["custom/Source.ts"]["backup_path"]
-        .as_str()
-        .unwrap();
+    let files = &state["packages"]["source-pkg"]["files"];
+    let key = source_file_key(files, "custom/Source.ts");
+    let backup = files[&key]["backup_path"].as_str().unwrap();
     let state_before = project.read_file(".lpm/added-sources.json");
     let mut command = lpm_spawnable(&project);
     command.args(["remove", "source-pkg"]);
