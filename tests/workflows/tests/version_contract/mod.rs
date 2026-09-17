@@ -1,7 +1,7 @@
 use super::{read_package_json, run_git};
-use crate::support::{
-    LOCK_CONTENTION_MARKER_ENV, TempProject, lpm, lpm_spawnable, wait_for_lock_contention,
-};
+#[cfg(unix)]
+use crate::support::{LOCK_CONTENTION_MARKER_ENV, lpm_spawnable, wait_for_lock_contention};
+use crate::support::{TempProject, lpm};
 
 #[cfg(unix)]
 #[test]
