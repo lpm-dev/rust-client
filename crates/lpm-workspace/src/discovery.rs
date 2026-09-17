@@ -194,6 +194,28 @@ pub fn discover_workspace_from_open_root(
     }
 }
 
+/// List workspace manifests without reading or retaining member package contents.
+/// Includes the root manifest for transaction recovery.
+pub fn workspace_manifest_paths_from_open_root(
+    root_path: &Path,
+    root_dir: &cap_std::fs::Dir,
+) -> Result<Vec<PathBuf>, WorkspaceError> {
+    let (root_package, pnpm_workspace) = read_workspace_root_from_open_dir(root_path, root_dir)?;
+    let globs = workspace_member_globs(&root_package, pnpm_workspace.as_ref());
+    let (inclusions, exclusions) = compile_workspace_globs(root_path, &globs)?;
+    let scan = discover_member_paths_from_open_root(root_path, root_dir, &inclusions, &exclusions)?;
+    let mut manifests = Vec::with_capacity(scan.member_paths.len() + 1);
+    manifests.push(root_path.join("package.json"));
+    for relative in scan.member_paths {
+        let mut manifest = root_path.join(relative);
+        manifest.push("package.json");
+        manifests.push(manifest);
+    }
+    manifests.sort();
+    manifests.dedup();
+    Ok(manifests)
+}
+
 pub fn read_publish_projection_from_open_root(
     root_path: &Path,
     root_dir: &cap_std::fs::Dir,

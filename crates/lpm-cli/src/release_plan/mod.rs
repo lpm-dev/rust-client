@@ -696,20 +696,21 @@ fn manifest_size_error(path: &Path, description: &str) -> LpmError {
 mod planning;
 mod transaction;
 mod version_git;
+mod version_scope;
+pub(crate) use version_scope::VersionTransactionScope;
 
 use planning::*;
 use transaction::*;
 use version_git::*;
 
 pub(crate) use planning::{
-    ensure_unique_selection, load_change_bumps, plan_single_package, plan_workspace,
-    sorted_selected_indices, validate_workspace_internal_ranges,
+    ensure_unique_selection, load_change_bumps, plan_workspace, sorted_selected_indices,
+    validate_workspace_internal_ranges,
 };
 pub(crate) use transaction::{
     ensure_no_pending_release_transaction, ensure_no_pending_release_transaction_from_open_root,
     has_release_transaction_from_open_root, recover_pending_operation_transaction,
     recover_pending_release_transaction_from_open_root, write_planned_manifests,
-    write_planned_manifests_then_git,
 };
 pub(crate) use version_git::create_version_commit_and_tag;
 

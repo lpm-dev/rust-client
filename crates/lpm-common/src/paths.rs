@@ -436,6 +436,11 @@ pub struct ProjectLockDirectory {
 }
 
 impl ProjectLockDirectory {
+    /// The retained directory containing this project's lock files.
+    pub fn directory(&self) -> &cap_std::fs::Dir {
+        &self.directory
+    }
+
     /// Open or create `.lpm` relative to an already-open project or workspace root.
     pub fn open_or_create(
         project_root: &cap_std::fs::Dir,
@@ -1006,6 +1011,28 @@ where
     F: FnOnce() -> Result<R, LpmError>,
 {
     let _h = acquire_shared_with_hint(lock_path.as_ref(), default_wait_hint)?;
+    body()
+}
+
+/// Run a synchronous body under a shared lock in a retained project directory.
+pub fn with_project_shared_lock<R>(
+    lock_directory: ProjectLockDirectory,
+    kind: ProjectLockKind,
+    body: impl FnOnce() -> Result<R, LpmError>,
+) -> Result<R, LpmError> {
+    let source = CapabilityLockFileSource::new(lock_directory, kind);
+    let _handle = acquire_shared_from_source(&source, default_wait_hint)?;
+    body()
+}
+
+/// Run a synchronous body under an exclusive lock in a retained project directory.
+pub fn with_project_exclusive_lock<R>(
+    lock_directory: ProjectLockDirectory,
+    kind: ProjectLockKind,
+    body: impl FnOnce() -> Result<R, LpmError>,
+) -> Result<R, LpmError> {
+    let source = CapabilityLockFileSource::new(lock_directory, kind);
+    let _handle = acquire_exclusive_from_source(&source, default_wait_hint)?;
     body()
 }
 

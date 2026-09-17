@@ -65,13 +65,23 @@ pub(in crate::release_plan) fn open_release_state_directory_from_open_root(
     };
     validate_lpm_state_parent(&lpm_dir, &lpm_display)?;
 
+    open_release_state_directory_from_lpm(&lpm_display, &lpm_dir, create)
+}
+
+pub(in crate::release_plan) fn open_release_state_directory_from_lpm(
+    lpm_display: &Path,
+    lpm_dir: &cap_std::fs::Dir,
+    create: bool,
+) -> Result<Option<ReleaseStateDirectory>, LpmError> {
+    use cap_fs_ext::DirExt as _;
+    validate_lpm_state_parent(lpm_dir, lpm_display)?;
     let state_display = lpm_display.join(RELEASE_STATE_DIRECTORY);
     let state_dir = match lpm_dir.open_dir_nofollow(RELEASE_STATE_DIRECTORY) {
         Ok(dir) => dir,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound && !create => return Ok(None),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            match create_private_cap_directory(&lpm_dir, RELEASE_STATE_DIRECTORY) {
-                Ok(()) => sync_cap_directory(&lpm_dir).map_err(LpmError::Io)?,
+            match create_private_cap_directory(lpm_dir, RELEASE_STATE_DIRECTORY) {
+                Ok(()) => sync_cap_directory(lpm_dir).map_err(LpmError::Io)?,
                 Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
                 Err(error) => return Err(LpmError::Io(error)),
             }
