@@ -191,6 +191,10 @@ const REVIEWED_RAW_ATOMIC_WRITERS: &[(&str, &str)] = &[
         "publishes an exclusively created same-directory NamedTempFile with persist_noclobber so a concurrent .env creator always wins",
     ),
     (
+        "crates/lpm-cli/src/commands/init.rs::create_manifest",
+        "syncs an exclusively created sibling NamedTempFile, publishes with persist_noclobber, and guards rollback so existing or concurrent manifests are preserved",
+    ),
+    (
         "crates/lpm-cli/src/commands/rebuild/build_cache/toolchain_snapshot.rs::write_snapshot",
         "NamedTempFile exclusively creates a randomized sibling before persist",
     ),

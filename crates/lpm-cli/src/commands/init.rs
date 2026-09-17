@@ -1,8 +1,9 @@
 use crate::cli::InitPackageTargetCli;
 use crate::install_ui;
+use crate::manifest_tx::ManifestTransaction;
 use lpm_common::{LpmError, PackageName};
 use lpm_registry::RegistryClient;
-use std::io::IsTerminal;
+use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -91,8 +92,11 @@ pub(crate) async fn run(
     options: InitOptions<'_>,
 ) -> Result<(), LpmError> {
     let pkg_json_path = project_dir.join("package.json");
-    if pkg_json_path.exists() {
-        return Err(LpmError::Registry("package.json already exists".into()));
+    require_missing_manifest(&pkg_json_path)?;
+    if !options.yes && (options.json_output || !std::io::stdin().is_terminal()) {
+        return Err(LpmError::Registry(
+            "lpm init requires --yes when prompts are unavailable or --json is used".into(),
+        ));
     }
 
     let target = resolve_init_target(&options)?;
@@ -123,19 +127,22 @@ pub(crate) async fn run(
     let content =
         serde_json::to_string_pretty(&pkg).map_err(|e| LpmError::Registry(e.to_string()))?;
 
+    let (agents_status, agents_update) = if options.write_agents {
+        prepare_agents_snippet(project_dir)?
+    } else {
+        (FileWriteStatus::Skipped, None)
+    };
+    let mut transaction = ManifestTransaction::snapshot_install_state(&[], &[], &[])?;
+    create_manifest(&pkg_json_path, &format!("{content}\n"), &mut transaction)?;
+    if let Some(update) = agents_update {
+        apply_agents_update(project_dir, update, &mut transaction)?;
+    }
     let lpm_json_status = if answers.target == InitPackageTarget::Npm {
-        ensure_npm_publish_config(project_dir)?
+        ensure_npm_publish_config(project_dir, Some(&mut transaction))?
     } else {
         FileWriteStatus::Skipped
     };
-
-    std::fs::write(&pkg_json_path, format!("{content}\n"))?;
-
-    let agents_status = if options.write_agents {
-        ensure_agents_snippet(project_dir)?
-    } else {
-        FileWriteStatus::Skipped
-    };
+    transaction.commit();
 
     let gitattributes_ready = match lpm_lockfile::ensure_gitattributes(project_dir) {
         Ok(()) => true,
@@ -190,7 +197,7 @@ fn collect_init_answers(
     target: InitPackageTarget,
     resolved_owner: Option<&str>,
 ) -> Result<InitAnswers, LpmError> {
-    if matches!(options.target, Some(InitPackageTargetCli::Npm)) && options.owner.is_some() {
+    if target == InitPackageTarget::Npm && options.owner.is_some() {
         return Err(LpmError::Registry(
             "`--owner` only applies to lpm.dev packages; remove it or use `--lpm`".into(),
         ));
@@ -220,6 +227,10 @@ fn collect_init_answers(
             true,
         )?
     };
+
+    super::publish::validate_publish_version(&version).map_err(|error| {
+        LpmError::Registry(format!("invalid package version '{version}': {error}"))
+    })?;
 
     let description = if options.yes {
         String::new()
@@ -254,12 +265,6 @@ fn resolve_init_target(options: &InitOptions<'_>) -> Result<InitPackageTarget, L
     if options.yes {
         return Ok(InitPackageTarget::Lpm);
     }
-    if !std::io::stdin().is_terminal() || options.json_output {
-        return Err(LpmError::Registry(
-            "lpm init needs --lpm, --npm, or -y when prompts are unavailable".into(),
-        ));
-    }
-
     let choice: &str = cliclack::select("Package target?")
         .item("lpm", "lpm.dev package", "@lpm.dev/<owner>.<name>")
         .item("npm", "npm-compatible package", "publish target: npm")
@@ -279,7 +284,13 @@ fn resolve_lpm_name_inputs(
     resolved_owner: &str,
 ) -> Result<(String, String), LpmError> {
     if let Some(name) = options.name.map(str::trim) {
-        if name.starts_with("@lpm.dev/") {
+        let unscoped = name.strip_prefix("@lpm.dev/").unwrap_or(name);
+        if unscoped.contains(['@', '?']) {
+            return Err(LpmError::InvalidPackageName(
+                "init requires a package name without a version or query suffix".into(),
+            ));
+        }
+        if name.starts_with('@') || name.contains('.') {
             let parsed = PackageName::parse(name)?;
             if let Some(owner) = options.owner.map(str::trim)
                 && owner != parsed.owner
@@ -288,12 +299,6 @@ fn resolve_lpm_name_inputs(
                     "`--owner {owner}` does not match package name `{name}`"
                 )));
             }
-            validate_lpm_owner(&parsed.owner)?;
-            return Ok((parsed.owner, parsed.name));
-        }
-
-        if options.owner.is_none() && name.contains('.') {
-            let parsed = PackageName::parse(name)?;
             validate_lpm_owner(&parsed.owner)?;
             return Ok((parsed.owner, parsed.name));
         }
@@ -321,6 +326,11 @@ fn resolve_lpm_name_inputs(
             true,
         )?,
     };
+    if package_name.contains(['@', '?']) {
+        return Err(LpmError::InvalidPackageName(
+            "init requires a package name without a version or query suffix".into(),
+        ));
+    }
 
     Ok((owner, package_name))
 }
@@ -389,75 +399,13 @@ fn validate_lpm_owner(owner: &str) -> Result<(), LpmError> {
 }
 
 fn validate_npm_init_name(name: &str) -> Result<(), LpmError> {
-    if name.is_empty() {
-        return Err(LpmError::InvalidPackageName(
-            "npm package name cannot be empty".into(),
-        ));
-    }
-    if name.len() > 214 {
-        return Err(LpmError::InvalidPackageName(format!(
-            "npm package name too long ({} chars, max 214)",
-            name.len()
-        )));
-    }
-    if name.starts_with("@lpm.dev/") {
-        return Err(LpmError::InvalidPackageName(
-            "npm package names cannot use the reserved @lpm.dev/ scope".into(),
-        ));
-    }
-    if name == "node_modules" || name == "favicon.ico" {
-        return Err(LpmError::InvalidPackageName(format!(
-            "npm package name '{name}' is reserved"
-        )));
-    }
-
-    if let Some(rest) = name.strip_prefix('@') {
-        let Some((scope, package)) = rest.split_once('/') else {
-            return Err(LpmError::InvalidPackageName(format!(
-                "scoped npm package '{name}' must be in @scope/name format"
-            )));
-        };
-        validate_npm_name_part(scope, "scope", name)?;
-        validate_npm_name_part(package, "package", name)?;
-        return Ok(());
-    }
-
-    if name.contains('/') {
-        return Err(LpmError::InvalidPackageName(format!(
-            "unscoped npm package name cannot contain '/': {name}"
-        )));
-    }
-    validate_npm_name_part(name, "package", name)
+    super::publish_npm::validate_npm_name(name)
 }
 
-fn validate_npm_name_part(part: &str, label: &str, full_name: &str) -> Result<(), LpmError> {
-    if part.is_empty() {
-        return Err(LpmError::InvalidPackageName(format!(
-            "npm {label} cannot be empty in '{full_name}'"
-        )));
-    }
-    if part.starts_with('.') || part.starts_with('_') {
-        return Err(LpmError::InvalidPackageName(format!(
-            "npm {label} cannot start with '.' or '_' in '{full_name}'"
-        )));
-    }
-    if part != part.to_ascii_lowercase() {
-        return Err(LpmError::InvalidPackageName(format!(
-            "npm package name must be lowercase: '{full_name}'"
-        )));
-    }
-    if !part
-        .chars()
-        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '-' | '.' | '_' | '~'))
-    {
-        return Err(LpmError::InvalidPackageName(format!(
-            "npm {label} contains invalid characters in '{full_name}'"
-        )));
-    }
-    Ok(())
-}
-
-fn ensure_npm_publish_config(project_dir: &Path) -> Result<FileWriteStatus, LpmError> {
+fn ensure_npm_publish_config(
+    project_dir: &Path,
+    mut transaction: Option<&mut ManifestTransaction>,
+) -> Result<FileWriteStatus, LpmError> {
     lpm_common::update_lpm_json(project_dir, |obj, file_state| {
         let publish = obj
             .entry("publish".to_string())
@@ -490,6 +438,31 @@ fn ensure_npm_publish_config(project_dir: &Path) -> Result<FileWriteStatus, LpmE
             lpm_common::LpmJsonFileState::Existing if changed => FileWriteStatus::Updated,
             lpm_common::LpmJsonFileState::Existing => FileWriteStatus::Unchanged,
         };
+        if changed && let Some(transaction) = transaction.as_mut() {
+            let path = project_dir.join("lpm.json");
+            let original = match file_state {
+                lpm_common::LpmJsonFileState::Missing => None,
+                lpm_common::LpmJsonFileState::Existing => Some(
+                    lpm_common::read_text_file_capped_nofollow(
+                        &path,
+                        lpm_common::CONFIG_FILE_SIZE_CAP_BYTES,
+                    )
+                    .map_err(|error| error.to_string())?
+                    .into_bytes(),
+                ),
+            };
+            let expected = format!(
+                "{}\n",
+                serde_json::to_string_pretty(obj).map_err(|error| error.to_string())?
+            );
+            transaction
+                .snapshot_optional_path_with_bytes(&path, original)
+                .map_err(|error| error.to_string())?;
+            // The config writer can fail its directory sync after the replacement succeeds.
+            transaction
+                .restore_only_if_unchanged(&path, expected.as_bytes())
+                .map_err(|error| error.to_string())?;
+        }
         Ok(
             if changed || matches!(file_state, lpm_common::LpmJsonFileState::Missing) {
                 lpm_common::LpmJsonMutation::Changed(status)
@@ -515,7 +488,7 @@ mod lpm_json_mutation_tests {
         std::fs::write(outside.path(), "{}\n").unwrap();
         symlink(outside.path(), dir.path().join("lpm.json")).unwrap();
 
-        let error = ensure_npm_publish_config(dir.path())
+        let error = ensure_npm_publish_config(dir.path(), None)
             .expect_err("mutating a symlinked lpm.json must be rejected");
 
         assert!(error.to_string().contains("symbolic link"));
@@ -528,9 +501,9 @@ mod lpm_json_mutation_tests {
         let path = dir.path().join("lpm.json");
         std::fs::write(&path, "{\"publish\":{\"registries\":[\"npm\"]}}\n").unwrap();
 
-        let first = ensure_npm_publish_config(dir.path()).unwrap();
+        let first = ensure_npm_publish_config(dir.path(), None).unwrap();
         let after_first = std::fs::read_to_string(&path).unwrap();
-        let second = ensure_npm_publish_config(dir.path()).unwrap();
+        let second = ensure_npm_publish_config(dir.path(), None).unwrap();
 
         assert_eq!(first, FileWriteStatus::Unchanged);
         assert_eq!(second, FileWriteStatus::Unchanged);
@@ -538,23 +511,106 @@ mod lpm_json_mutation_tests {
     }
 }
 
-fn ensure_agents_snippet(project_dir: &Path) -> Result<FileWriteStatus, LpmError> {
-    let path = project_dir.join("AGENTS.md");
-    if !path.exists() {
-        std::fs::write(path, AGENTS_SNIPPET)?;
-        return Ok(FileWriteStatus::Created);
+fn require_missing_manifest(path: &Path) -> Result<(), LpmError> {
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => Err(LpmError::Registry("package.json already exists".into())),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.into()),
     }
+}
 
-    let current = std::fs::read_to_string(&path)?;
+fn create_manifest(
+    path: &Path,
+    content: &str,
+    transaction: &mut ManifestTransaction,
+) -> Result<(), LpmError> {
+    let mut builder = tempfile::Builder::new();
+    builder.prefix(".lpm-init-");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        builder.permissions(std::fs::Permissions::from_mode(0o666));
+    }
+    let mut temporary = builder.tempfile_in(path.parent().unwrap_or_else(|| Path::new(".")))?;
+    temporary.write_all(content.as_bytes())?;
+    temporary.as_file().sync_all()?;
+    // Commit without replacement: another process can create a manifest while we prompt.
+    temporary
+        .persist_noclobber(path)
+        .map_err(|error| LpmError::Io(error.error))?;
+    transaction.snapshot_optional_path_with_bytes(path, None)?;
+    transaction.restore_only_if_unchanged(path, content.as_bytes())?;
+    Ok(())
+}
+
+struct AgentsUpdate {
+    original: Option<String>,
+    updated: String,
+}
+
+fn read_agents(path: &Path) -> Result<Option<String>, LpmError> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if lpm_common::is_symlink_or_junction(&metadata) || !metadata.is_file() => {
+            return Err(LpmError::Registry(
+                "AGENTS.md must be a regular file, not a link or special file".into(),
+            ));
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    }
+    lpm_common::read_text_file_capped_nofollow(path, lpm_common::CONFIG_FILE_SIZE_CAP_BYTES)
+        .map(Some)
+        .map_err(|error| LpmError::Registry(error.to_string()))
+}
+
+fn prepare_agents_snippet(
+    project_dir: &Path,
+) -> Result<(FileWriteStatus, Option<AgentsUpdate>), LpmError> {
+    let original = read_agents(&project_dir.join("AGENTS.md"))?;
+    let Some(current) = original.as_deref() else {
+        return Ok((
+            FileWriteStatus::Created,
+            Some(AgentsUpdate {
+                original: None,
+                updated: AGENTS_SNIPPET.to_string(),
+            }),
+        ));
+    };
     if current.contains(AGENTS_SNIPPET.trim_end()) {
-        return Ok(FileWriteStatus::Unchanged);
+        return Ok((FileWriteStatus::Unchanged, None));
     }
-    let updated = replace_or_append_agents_snippet(&current)?;
+    let updated = replace_or_append_agents_snippet(current)?;
     if updated == current {
-        return Ok(FileWriteStatus::Unchanged);
+        return Ok((FileWriteStatus::Unchanged, None));
     }
-    std::fs::write(path, updated)?;
-    Ok(FileWriteStatus::Updated)
+    if updated.len() as u64 > lpm_common::CONFIG_FILE_SIZE_CAP_BYTES {
+        return Err(LpmError::Registry(
+            "updated AGENTS.md exceeds the configuration file size limit".into(),
+        ));
+    }
+    Ok((
+        FileWriteStatus::Updated,
+        Some(AgentsUpdate { original, updated }),
+    ))
+}
+
+fn apply_agents_update(
+    project_dir: &Path,
+    update: AgentsUpdate,
+    transaction: &mut ManifestTransaction,
+) -> Result<(), LpmError> {
+    let path = project_dir.join("AGENTS.md");
+    if read_agents(&path)? != update.original {
+        return Err(LpmError::Registry(
+            "AGENTS.md changed during initialization; retry the command".into(),
+        ));
+    }
+    transaction
+        .snapshot_optional_path_with_bytes(&path, update.original.map(String::into_bytes))?;
+    transaction.restore_only_if_unchanged(&path, update.updated.as_bytes())?;
+    lpm_common::write_file_atomic(&path, update.updated)?;
+    Ok(())
 }
 
 fn replace_or_append_agents_snippet(current: &str) -> Result<String, LpmError> {
@@ -581,17 +637,9 @@ fn replace_or_append_agents_snippet(current: &str) -> Result<String, LpmError> {
         })?;
 
     let mut updated = String::with_capacity(current.len() + AGENTS_SNIPPET.len());
-    updated.push_str(current[..start].trim_end());
-    if !updated.is_empty() {
-        updated.push_str("\n\n");
-    }
+    updated.push_str(&current[..start]);
     updated.push_str(AGENTS_SNIPPET.trim_end());
-    updated.push('\n');
-    let tail = current[end..].trim_start();
-    if !tail.is_empty() {
-        updated.push('\n');
-        updated.push_str(tail);
-    }
+    updated.push_str(&current[end..]);
     Ok(updated)
 }
 
@@ -645,7 +693,7 @@ mod tests {
     fn validate_npm_init_name_rejects_malformed_scoped_name() {
         let err = validate_npm_init_name("@scope").unwrap_err();
         assert!(
-            err.to_string().contains("@scope/name"),
+            err.to_string().contains("one slash"),
             "error should explain scoped npm syntax: {err}"
         );
     }

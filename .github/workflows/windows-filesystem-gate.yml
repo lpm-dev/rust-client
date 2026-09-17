@@ -86,6 +86,9 @@ jobs:
       - name: Windows uninstall cleanup contracts
         run: cargo nextest run --locked -p lpm-workflows --test uninstall_contract --no-fail-fast --status-level slow --final-status-level fail
 
+      - name: Windows package initialization contracts
+        run: cargo nextest run --locked -p lpm-workflows --test init --no-fail-fast --status-level slow --final-status-level fail
+
       - name: Windows cache pruning and registry retention
         run: cargo nextest run --locked -p lpm-workflows --test cache_prune --no-fail-fast --status-level slow --final-status-level fail
 
