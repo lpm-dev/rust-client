@@ -7,7 +7,7 @@ pub(crate) struct InfoArgs {
     /// Bare and other scoped names use npm or .npmrc routing, for example react.
     pub(crate) package: String,
 
-    /// Show a specific version instead of latest.
+    /// Select an exact version, dist-tag, or semantic-version range instead of the default.
     #[arg(long = "version")]
     pub(crate) package_version: Option<String>,
 }

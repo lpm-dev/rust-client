@@ -1,4 +1,4 @@
-use crate::commands::registry_reads::prepare_search_read_context;
+use crate::commands::registry_reads::prepare_direct_read_context;
 use crate::install_ui;
 use lpm_common::{LpmError, sanitize_for_terminal};
 use lpm_registry::RegistryClient;
@@ -11,7 +11,7 @@ pub async fn run(
     limit: u32,
     json_output: bool,
 ) -> Result<(), LpmError> {
-    let context = prepare_search_read_context(client, project_dir, query, json_output)?;
+    let context = prepare_direct_read_context(client, project_dir, query, json_output)?;
     let route = context.route_table.route_for_package(query);
     if !json_output {
         let registry_label = search_registry_label(&context.client, &route);
