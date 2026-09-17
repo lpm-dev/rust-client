@@ -1,0 +1,22 @@
+{
+  "inventory_sha256": "5a3f7444906f69940d638e257c3831873e1e644649e9a9a0694a3aa6ad06ddb3",
+  "reviews_sha256": "352cf9e129f8a9d7677cc3e3ffb7bee48e5fff36d2965b276804d5bd483e312c",
+  "records": 33252,
+  "reviewed": 18,
+  "label_statuses": {
+    "unreviewed": 33234,
+    "source_reviewed_attack": 12,
+    "source_reviewed_destructive_behavior": 2,
+    "ambiguous_or_out_of_scope": 2,
+    "source_reviewed_remote_loader": 1,
+    "source_reviewed_conditional_chain": 1
+  },
+  "splits": {
+    "reserved": 6906,
+    "pilot_pool": 25602,
+    "prior": 744
+  },
+  "leakage_groups": 15265,
+  "code_links": 9,
+  "interpretation": "Groups prevent validation leakage. They do not establish common malicious intent or campaign attribution. Unopened reserved code can retain unknown overlap."
+}

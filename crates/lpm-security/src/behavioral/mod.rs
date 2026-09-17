@@ -35,7 +35,7 @@ use supply_chain::SupplyChainTags;
 /// Current schema version for `.lpm-security.json`.
 /// Bump this when adding new tags or changing tag semantics — cached
 /// files with older versions will be automatically re-analyzed.
-pub const SCHEMA_VERSION: u32 = 9;
+pub const SCHEMA_VERSION: u32 = 10;
 
 /// Maximum file size for a full scan. Larger source files receive bounded samples.
 const MAX_FILE_SIZE: u64 = 4 * 1024 * 1024;
@@ -1018,6 +1018,21 @@ fn oversized_source_signals(source: &SourceTags, supply_chain: &SupplyChainTags)
         supply_chain.credential_exfiltration,
         "credentialExfiltration",
     );
+    push_signal(
+        &mut signals,
+        supply_chain.encrypted_execution,
+        "encryptedExecution",
+    );
+    push_signal(
+        &mut signals,
+        supply_chain.downloaded_execution,
+        "downloadedExecution",
+    );
+    push_signal(
+        &mut signals,
+        supply_chain.destructive_filesystem,
+        "destructiveFilesystem",
+    );
     signals
 }
 
@@ -1641,6 +1656,9 @@ pub fn has_dangerous_tags(analysis: &PackageAnalysis) -> bool {
     analysis.supply_chain.obfuscated
 		|| analysis.supply_chain.protestware
 		|| analysis.supply_chain.credential_exfiltration
+        || analysis.supply_chain.encrypted_execution
+        || analysis.supply_chain.downloaded_execution
+        || analysis.supply_chain.destructive_filesystem
 		|| analysis.supply_chain.high_entropy_strings
 	// High
 		|| analysis.source.eval

@@ -1,0 +1,13 @@
+{
+  "concept": "Reviewed archive labels, leakage grouping, and targeted source detection",
+  "base_commit": "0d1b9ddfefc30acf556a0b20f55f1af7924ce12c",
+  "baseline": "../archive-pilot/freeze.json",
+  "baseline_artifacts": "Immutable. Candidate results use a separate directory and an explicit binary hash.",
+  "scope": ["Credential-file uploads", "Downloaded code execution", "Decrypted code execution", "Broad filesystem deletion"],
+  "labels": "Verify reviewed source hashes. Distinguish behavior, activation, missing stages, and intent. Keep all other records unreviewed.",
+  "grouping": "Use reviewed source anchors and metadata for leakage groups. Do not infer a campaign or propagate labels from group membership.",
+  "validation": "The 400-case pilot and two added wiper versions are development evidence. The reserved set remains unopened. Its independence is provisional.",
+  "controls": "Use the 28 pinned legitimate controls and paired synthetic controls. Review every newly triggered rule in the existing popular-package corpus.",
+  "safety": "Read archived source as data. Never install or execute archived code, invoke lifecycle scripts, or contact embedded destinations.",
+  "measurements": "Preserve baseline and candidate binaries. Alternate runs on identical fixtures. Report source timing and peak RSS, coverage, and operational install cost."
+}

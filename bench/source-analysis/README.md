@@ -11,6 +11,7 @@ That follow-up reuses the former validation set as regression evidence.
 The [attack-family evaluation](attack-families/report.md) measures credential-file theft and installation downloaders with the detector frozen.
 The [archive pilot](archive-pilot/report.md) screens 400 archived candidates across four focus areas with 28 legitimate controls.
 It reports source-reviewed gaps, uncertain labels, and coverage limits without changing the detector.
+The [targeted archive follow-up](archive-targeted/report.md) improves labels and grouping, adds narrow source-flow checks, and retains the remaining detection gaps.
 
 ## Audit output
 

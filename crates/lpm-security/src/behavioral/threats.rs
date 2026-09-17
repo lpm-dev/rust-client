@@ -1,4 +1,9 @@
+#[cfg(test)]
+mod archive_tests;
 mod bundles;
+mod destruction;
+mod operations;
+mod reports;
 
 use oxc_ast::{AstKind, ast::*};
 use oxc_semantic::{Semantic, SymbolId};
@@ -6,6 +11,7 @@ use std::collections::{HashMap, HashSet};
 
 const SECRET: u8 = 1;
 const ENVIRONMENT: u8 = 2;
+const CREDENTIAL_FILE: u8 = 4;
 const MAX_DEPTH: usize = 32;
 const MAX_STEPS: usize = 4096;
 
@@ -13,6 +19,7 @@ const MAX_STEPS: usize = 4096;
 pub(super) struct Leak {
     pub offset: usize,
     pub environment: bool,
+    pub credential_file: bool,
 }
 
 fn member<'s, 'a>(expression: &'s Expression<'a>) -> Option<(&'s Expression<'a>, &'s str)> {
@@ -65,7 +72,21 @@ fn secret_name(name: &str) -> bool {
 pub(super) fn is_candidate(call: &CallExpression<'_>) -> bool {
     matches!(
         name(&call.callee),
-        Some("fetch" | "createOrUpdateFileContents")
+        Some(
+            "fetch"
+                | "createOrUpdateFileContents"
+                | "write"
+                | "end"
+                | "rmSync"
+                | "rm"
+                | "spawn"
+                | "spawnSync"
+                | "execFile"
+                | "execFileSync"
+                | "fork"
+                | "eval"
+                | "Function"
+        )
     )
 }
 
@@ -74,6 +95,11 @@ struct Flow<'s, 'a> {
     parameters: HashMap<SymbolId, (u32, usize)>,
     callers: HashMap<u32, Vec<&'a CallExpression<'a>>>,
     methods: HashMap<(u32, bool), HashMap<String, Option<u32>>>,
+    terminators: HashMap<u32, u32>,
+    defaults: HashMap<SymbolId, &'a Expression<'a>>,
+    iterations: HashMap<SymbolId, &'a Expression<'a>>,
+    report_writes: HashMap<SymbolId, Vec<reports::Write<'a>>>,
+    returns: HashMap<u32, Vec<&'a Expression<'a>>>,
     steps: usize,
     written: HashSet<SymbolId>,
     bundles: bundles::Bundles,
@@ -187,7 +213,7 @@ impl<'s, 'a> Flow<'s, 'a> {
         }
     }
 
-    fn value(&mut self, expression: &Expression<'_>, depth: usize) -> u8 {
+    fn value(&mut self, expression: &Expression<'a>, depth: usize) -> u8 {
         if depth >= MAX_DEPTH || self.steps == 0 {
             return 0;
         }
@@ -202,7 +228,7 @@ impl<'s, 'a> Flow<'s, 'a> {
                     return 0;
                 };
                 if self.written.contains(&symbol) {
-                    return 0;
+                    return self.report_value(identifier, next);
                 }
                 let Some(&(owner, index)) = self.parameters.get(&symbol) else {
                     return 0;
@@ -251,7 +277,7 @@ impl<'s, 'a> Flow<'s, 'a> {
             Expression::ObjectExpression(object) => {
                 let mut seen = HashSet::new();
                 let mut result = 0;
-                for property in object.properties.iter().rev() {
+                for property in object.properties.iter().rev().take(MAX_STEPS) {
                     if self.steps == 0 {
                         break;
                     }
@@ -318,6 +344,9 @@ impl<'s, 'a> Flow<'s, 'a> {
                 {
                     return 0;
                 }
+                if self.credential_read(call, next) {
+                    return CREDENTIAL_FILE;
+                }
                 if matches!(
                     function_name,
                     "generateSeed"
@@ -333,6 +362,18 @@ impl<'s, 'a> Flow<'s, 'a> {
                     "slice" | "substring" | "substr" | "split" | "reverse" | "join" | "toString"
                 ) {
                     return member(function).map_or(0, |(object, _)| self.value(object, next));
+                }
+                if self.api(function, 0).is_some_and(|api| {
+                    matches!(
+                        (api.module, api.method),
+                        ("dotenv", Some("parse")) | ("zlib", Some("gzipSync" | "deflateSync"))
+                    )
+                }) {
+                    return call
+                        .arguments
+                        .first()
+                        .and_then(Argument::as_expression)
+                        .map_or(0, |value| self.value(value, next));
                 }
                 let encoding = matches!(
                     function_name,
@@ -370,8 +411,15 @@ impl<'s, 'a> Flow<'s, 'a> {
             Expression::Identifier(identifier) => {
                 self.field(self.initial(identifier)?, field, depth + 1)
             }
+            Expression::CallExpression(call)
+                if member(&call.callee).is_some_and(|(object, method)| {
+                    method == "freeze" && self.global(object, "Object")
+                }) =>
+            {
+                self.field(call.arguments.first()?.as_expression()?, field, depth + 1)
+            }
             Expression::ObjectExpression(object) => {
-                for property in object.properties.iter().rev() {
+                for property in object.properties.iter().rev().take(MAX_STEPS) {
                     match property {
                         ObjectPropertyKind::ObjectProperty(property) => {
                             let key = property.key.static_name()?;
@@ -404,6 +452,11 @@ impl<'s, 'a> Flow<'s, 'a> {
                 return None;
             }
             return call.arguments.get(1)?.as_expression();
+        }
+        if let Some((request, "write" | "end")) = member(function)
+            && self.http_request(request, 0)
+        {
+            return call.arguments.first()?.as_expression();
         }
         let (repos, "createOrUpdateFileContents") = member(function)? else {
             return None;
@@ -443,28 +496,17 @@ fn is_source_candidate(kind: AstKind<'_>) -> bool {
     }
 }
 
-pub(super) fn analyze(semantic: &Semantic<'_>) -> Option<Leak> {
-    let candidates: Vec<_> = semantic
-        .nodes()
-        .iter()
-        .filter_map(|node| match node.kind() {
-            AstKind::CallExpression(call) if is_candidate(call) => Some(call),
-            _ => None,
-        })
-        .collect();
-    if candidates.is_empty()
-        || !semantic
-            .nodes()
-            .iter()
-            .any(|node| is_source_candidate(node.kind()))
-    {
-        return None;
-    }
+fn build_flow<'s, 'a>(semantic: &'s Semantic<'a>) -> Flow<'s, 'a> {
     let mut flow = Flow {
         semantic,
         parameters: HashMap::new(),
         callers: HashMap::new(),
         methods: HashMap::new(),
+        returns: HashMap::new(),
+        report_writes: HashMap::new(),
+        terminators: operations::terminators(semantic),
+        defaults: HashMap::new(),
+        iterations: HashMap::new(),
         steps: MAX_STEPS,
         written: semantic
             .scoping()
@@ -524,7 +566,18 @@ pub(super) fn analyze(semantic: &Semantic<'_>) -> Option<Leak> {
             _ => continue,
         };
         for (index, parameter) in parameters.items.iter().enumerate() {
-            if let BindingPattern::BindingIdentifier(identifier) = &parameter.pattern
+            let pattern = if let BindingPattern::AssignmentPattern(assignment) = &parameter.pattern
+            {
+                if let BindingPattern::BindingIdentifier(identifier) = &assignment.left
+                    && let Some(symbol) = identifier.symbol_id.get()
+                {
+                    flow.defaults.insert(symbol, &assignment.right);
+                }
+                &assignment.left
+            } else {
+                &parameter.pattern
+            };
+            if let BindingPattern::BindingIdentifier(identifier) = pattern
                 && let Some(symbol) = identifier.symbol_id.get()
             {
                 flow.parameters.insert(symbol, (owner, index));
@@ -538,7 +591,86 @@ pub(super) fn analyze(semantic: &Semantic<'_>) -> Option<Leak> {
             flow.callers.entry(target).or_default().push(call);
         }
     }
-    for call in candidates {
+    for node in semantic.nodes().iter() {
+        if let AstKind::CallExpression(call) = node.kind()
+            && let Some((object, "filter")) = member(&call.callee)
+            && let Some(predicate) = call.arguments.first().and_then(Argument::as_expression)
+        {
+            let parameters = match predicate.get_inner_expression() {
+                Expression::ArrowFunctionExpression(function) => Some(&function.params),
+                Expression::FunctionExpression(function) => Some(&function.params),
+                _ => None,
+            };
+            if let Some(parameters) = parameters
+                && let Some(parameter) = parameters.items.first()
+                && let BindingPattern::BindingIdentifier(identifier) = &parameter.pattern
+                && let Some(symbol) = identifier.symbol_id.get()
+            {
+                flow.iterations.insert(symbol, object);
+            }
+        }
+        if let AstKind::ArrowFunctionExpression(function) = node.kind()
+            && function.expression
+            && let Some(Statement::ExpressionStatement(statement)) =
+                function.body.statements.first()
+        {
+            flow.returns
+                .entry(function.span.start)
+                .or_default()
+                .push(&statement.expression);
+        }
+    }
+    for node in semantic.nodes().iter() {
+        if let AstKind::ReturnStatement(statement) = node.kind()
+            && operations::reachable(semantic, &flow.terminators, node.id())
+            && let Some(value) = &statement.argument
+            && let Some(owner) =
+                semantic
+                    .nodes()
+                    .ancestor_kinds(node.id())
+                    .find_map(|kind| match kind {
+                        AstKind::Function(function) => Some(function.span.start),
+                        AstKind::ArrowFunctionExpression(function) => Some(function.span.start),
+                        _ => None,
+                    })
+        {
+            flow.returns.entry(owner).or_default().push(value);
+        }
+    }
+    flow.report_writes = reports::collect(&flow);
+    flow
+}
+
+pub(super) fn analyze(semantic: &Semantic<'_>, facts: &mut super::bindings::CallFacts) {
+    let has_sources = semantic.nodes().iter().any(|node| is_source_candidate(node.kind())
+        || matches!(node.kind(), AstKind::StringLiteral(value) if matches!(value.value.as_str(), "fs" | "node:fs" | "fs/promises" | "node:fs/promises")));
+    let has_operations = operations::has_candidates(semantic);
+    let has_sink = semantic.nodes().iter().any(|node| match node.kind() {
+        AstKind::CallExpression(call) => is_candidate(call),
+        AstKind::NewExpression(call) => name(&call.callee) == Some("Function"),
+        _ => false,
+    });
+    if !(has_operations || has_sources && has_sink) {
+        return;
+    }
+    let mut flow = build_flow(semantic);
+    if has_operations {
+        operations::analyze(&mut flow, facts);
+    }
+    if !has_sources {
+        return;
+    }
+    let candidates = semantic
+        .nodes()
+        .iter()
+        .filter_map(|node| match node.kind() {
+            AstKind::CallExpression(call) if is_candidate(call) => Some((node.id(), call)),
+            _ => None,
+        });
+    for (id, call) in candidates {
+        if !operations::reachable(semantic, &flow.terminators, id) {
+            continue;
+        }
         let Some(payload) = flow.sink(call) else {
             continue;
         };
@@ -552,13 +684,14 @@ pub(super) fn analyze(semantic: &Semantic<'_>) -> Option<Leak> {
             flow.value(payload, 0)
         };
         if value != 0 {
-            return Some(Leak {
+            facts.credential_exfiltration = Some(Leak {
                 offset: call.span.start as usize,
                 environment: value & ENVIRONMENT != 0,
+                credential_file: value & CREDENTIAL_FILE != 0,
             });
+            return;
         }
     }
-    None
 }
 
 #[cfg(test)]

@@ -8,6 +8,9 @@ use std::collections::{HashMap, HashSet};
 pub(super) struct CallFacts {
     pub process: Option<usize>,
     pub credential_exfiltration: Option<super::threats::Leak>,
+    pub encrypted_execution: Option<usize>,
+    pub downloaded_execution: Option<usize>,
+    pub destructive_filesystem: Option<usize>,
     pub shell: Option<usize>,
     pub dynamic_load: Option<usize>,
     pub evaluation: Option<usize>,
@@ -633,7 +636,12 @@ impl<'a> Visit<'a> for CallCandidates {
                 .and_then(Argument::as_expression)
                 .and_then(|argument| static_string(argument, 0))
         {
-            self.found |= module(name.as_ref()).is_some();
+            self.found |= module(name.as_ref()).is_some()
+                || (self.include_threats
+                    && matches!(
+                        name.strip_prefix("node:").unwrap_or(&name),
+                        "fs" | "fs/promises" | "crypto" | "http" | "https"
+                    ));
             return;
         }
         walk::walk_call_expression(self, call);
@@ -658,7 +666,17 @@ impl<'a> Visit<'a> for CallCandidates {
     }
 
     fn visit_import_declaration(&mut self, import: &ImportDeclaration<'a>) {
-        self.found |= module(import.source.value.as_str()).is_some();
+        self.found |= module(import.source.value.as_str()).is_some()
+            || (self.include_threats
+                && matches!(
+                    import
+                        .source
+                        .value
+                        .as_str()
+                        .strip_prefix("node:")
+                        .unwrap_or(import.source.value.as_str()),
+                    "fs" | "fs/promises" | "crypto" | "http" | "https"
+                ));
     }
 }
 
@@ -822,7 +840,7 @@ pub(super) fn analyze(program: &Program<'_>, complete_input: bool) -> CallFacts 
         }
     }
     if complete_input {
-        facts.credential_exfiltration = super::threats::analyze(semantic);
+        super::threats::analyze(semantic, &mut facts);
     }
     facts
 }

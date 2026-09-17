@@ -1,0 +1,56 @@
+[
+  {
+    "left": "02b45570f3990bb6a331c62f91040f8ab4b01a1ac29a996a06e09688b0a25d81",
+    "right": "55d76bc2d5c78e9f5ba3cf0b49a17d8308184cc80d3c22ece3ed5a4102950bfc",
+    "basis": "reviewed-source",
+    "source_hash": "e91c3c294e1c1ef2496e27e6076e621597e9750636bd7890223d34eae8053012"
+  },
+  {
+    "left": "02b45570f3990bb6a331c62f91040f8ab4b01a1ac29a996a06e09688b0a25d81",
+    "right": "d58d3e1612aa88385b9fd044d3d20aec5eabed3f5fc832aca8e9d50fe37fa9a6",
+    "basis": "reviewed-source",
+    "source_hash": "e91c3c294e1c1ef2496e27e6076e621597e9750636bd7890223d34eae8053012"
+  },
+  {
+    "left": "0a5ad09e1510f85fb40c0dcf4bfe7cafe492a4384cc169d323a77565573a0b03",
+    "right": "250c6947cec62062d5338d99453c140f4b059cd5a25d5ec29b33e407a5c342c4",
+    "basis": "reviewed-normalized-source",
+    "source_hash": "f4d18ec90d36f97d3579209ca87bbe1fd9943821dc1d3dcad2f633c97b5a4dd6"
+  },
+  {
+    "left": "0a5ad09e1510f85fb40c0dcf4bfe7cafe492a4384cc169d323a77565573a0b03",
+    "right": "2b11764217fd912c22b2a329a8a49d800e68fc0e5e3aa7b9f5c293da22683a82",
+    "basis": "reviewed-normalized-source",
+    "source_hash": "f4d18ec90d36f97d3579209ca87bbe1fd9943821dc1d3dcad2f633c97b5a4dd6"
+  },
+  {
+    "left": "0a5ad09e1510f85fb40c0dcf4bfe7cafe492a4384cc169d323a77565573a0b03",
+    "right": "2b11764217fd912c22b2a329a8a49d800e68fc0e5e3aa7b9f5c293da22683a82",
+    "basis": "reviewed-source",
+    "source_hash": "9fb27c30f484650bb4a39f65a03fbccdc0b9b5f1cb84700ca73ee8893c66e06e"
+  },
+  {
+    "left": "0a5ad09e1510f85fb40c0dcf4bfe7cafe492a4384cc169d323a77565573a0b03",
+    "right": "38e49016f2f4ee73adcb5b4600f674c629c223231c5ec733f1aa6f8cee9710c0",
+    "basis": "reviewed-source",
+    "source_hash": "9fb27c30f484650bb4a39f65a03fbccdc0b9b5f1cb84700ca73ee8893c66e06e"
+  },
+  {
+    "left": "23c8d92062fa7ab93ffc60c1432103bd44bffcf0759930d633fae585acbb11d1",
+    "right": "4708363b8e90a9657612c49867e7b8a263d5ff0ca11f9ddffbeb86c9a6fff78c",
+    "basis": "reviewed-source",
+    "source_hash": "b07cd2ec46198306e722224682b33ad62aff4033a37adca46db168f7f29da93e"
+  },
+  {
+    "left": "57de2fba614800744c53dd8b7b067983116d6b496fd5c699a8467954745b5c9a",
+    "right": "6b8fc525da8ea36c4544aca5093835bb99177507e6c332dfb9b00fd4394f8b52",
+    "basis": "reviewed-normalized-source",
+    "source_hash": "a1c24062045848b33531b9287d9b65c4f13827ac2324e8a01eb216c1b0874c88"
+  },
+  {
+    "left": "57de2fba614800744c53dd8b7b067983116d6b496fd5c699a8467954745b5c9a",
+    "right": "6b8fc525da8ea36c4544aca5093835bb99177507e6c332dfb9b00fd4394f8b52",
+    "basis": "reviewed-source",
+    "source_hash": "3e15f1692c4075cf29cefa94c84d564a95086ab7a6838a97ea25cd02475a282d"
+  }
+]
