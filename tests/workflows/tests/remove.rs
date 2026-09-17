@@ -149,11 +149,17 @@ fn remove_json_cleans_source_package_paths_and_editor_links() {
     );
 
     let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
-    let envelope: serde_json::Value = serde_json::from_str(&stdout)
+    let mut envelope: serde_json::Value = serde_json::from_str(&stdout)
         .unwrap_or_else(|e| panic!("remove --json must be valid JSON: {e}\n---\n{stdout}"));
 
     assert_eq!(envelope["success"], serde_json::json!(true));
     assert_eq!(envelope["package"], serde_json::json!("owner.widget"));
+    let editor_path = ".cursor/rules/owner.widget--build.md";
+    assert_eq!(
+        std::path::Path::new(envelope["removed"][2].as_str().unwrap()),
+        std::path::Path::new(editor_path),
+    );
+    envelope["removed"][2] = json!(editor_path);
     assert_eq!(
         envelope["removed"],
         serde_json::json!([
@@ -226,7 +232,13 @@ fn remove_human_output_uses_slim_done_line_and_stderr_only_paths() {
     assert!(
         stderr.contains("- .lpm/skills/owner.widget/")
             && stderr.contains("- components/widget/index.ts")
-            && stderr.contains("- .cursor/rules/owner.widget--build.md")
+            && stderr.contains(&format!(
+                "- {}",
+                std::path::Path::new(".cursor")
+                    .join("rules")
+                    .join("owner.widget--build.md")
+                    .display()
+            ))
             && stderr.contains("✓ Removed package skill directory"),
         "remove should report every removed path on stderr, got:\n{stderr}"
     );
@@ -337,9 +349,12 @@ async fn remove_reverses_manifest_tracked_custom_path_add_for_bare_package() {
     assert_eq!(envelope["success"], serde_json::json!(true));
     assert_eq!(envelope["package"], serde_json::json!("source-pkg"));
     assert!(
-        envelope["removed"].as_array().is_some_and(|removed| removed
-            .iter()
-            .any(|value| value == "custom/widgets/Foo.tsx")),
+        envelope["removed"]
+            .as_array()
+            .is_some_and(|removed| removed.iter().any(|value| value
+                .as_str()
+                .is_some_and(|path| std::path::Path::new(path)
+                    == std::path::Path::new("custom/widgets/Foo.tsx")))),
         "remove must report the manifest-tracked custom file path, got: {envelope}"
     );
     assert!(
