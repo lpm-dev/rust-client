@@ -38,8 +38,7 @@ pub const LINK_META_MAX_BYTES: u64 = 256 * 1024;
 
 /// Schema version of the sidecar payload. Bump in lock-step with any
 /// breaking field change. Readers MUST reject unknown versions and
-/// treat the link entry as malformed (i.e., re-materialize on next
-/// install, prune-eligible in the meantime).
+/// treat the link entry as malformed. Prune must refuse an incomplete graph.
 pub const LINK_META_SCHEMA_VERSION: u32 = 1;
 
 /// One sibling-symlink target recorded in [`LinkMeta::deps`].
@@ -220,27 +219,21 @@ impl LinkMeta {
     /// walk to allocate megabytes before bailing.
     pub fn read_from(link_dir: &Path) -> Result<Self, LpmError> {
         let path = link_dir.join(LINK_META_FILENAME);
-        let metadata = std::fs::metadata(&path).map_err(|e| {
-            LpmError::Store(format!(
-                "failed to read virtual-store link sidecar at {}: {e}",
-                path.display()
-            ))
-        })?;
-        if metadata.len() > LINK_META_MAX_BYTES {
-            return Err(LpmError::Store(format!(
-                "virtual-store link sidecar at {} is {} bytes; refusing to read above the {} byte cap",
-                path.display(),
-                metadata.len(),
-                LINK_META_MAX_BYTES
-            )));
-        }
-        let bytes = std::fs::read(&path).map_err(|e| {
-            LpmError::Store(format!(
-                "failed to read virtual-store link sidecar at {}: {e}",
-                path.display()
-            ))
-        })?;
-        let parsed: LinkMeta = serde_json::from_slice(&bytes).map_err(|e| {
+        let bytes = lpm_common::read_text_file_capped_nofollow(&path, LINK_META_MAX_BYTES)
+            .map_err(|error| {
+                LpmError::Store(match error {
+                    lpm_common::BoundedReadError::TooLarge { .. } => format!(
+                        "virtual-store link sidecar at {}: refusing to read above the {} byte cap",
+                        path.display(),
+                        LINK_META_MAX_BYTES
+                    ),
+                    _ => format!(
+                        "failed to read virtual-store link sidecar at {}: {error}",
+                        path.display()
+                    ),
+                })
+            })?;
+        let parsed: LinkMeta = serde_json::from_str(&bytes).map_err(|e| {
             LpmError::Store(format!(
                 "malformed virtual-store link sidecar at {}: {e}",
                 path.display()

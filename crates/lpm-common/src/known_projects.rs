@@ -29,21 +29,18 @@
 //! ## Atomic rewrite contract
 //!
 //! All writes go through an exclusively created, random same-directory
-//! staging file and atomic replacement. Concurrent writers serialize
-//! naturally — a second writer overwrites the first's atomic-final
-//! result; no partial-write corruption is observable. Readers see
-//! either the old file or the new file.
+//! staging file and atomic replacement. Registration holds a separate lock
+//! across read, modification, and write so concurrent installs keep every root.
+//! Readers see either the old file or the new file.
 //!
 //! ## Missing / unreadable registry policy
 //!
 //! Two helpers, two postures:
 //!
 //! - [`load`] is **lossy** — collapses missing-file, malformed-JSON,
-//!   and schema-mismatch all to an empty [`Registry`]. Used by the
-//!   install pipeline's `register()` path: the registry is a
-//!   performance + UX cache there, not load-bearing, and a degraded
-//!   file must never block a successful install. The next install
-//!   rebuilds the file from scratch.
+//!   and schema-mismatch all to an empty [`Registry`]. Diagnostic callers can
+//!   use it when missing information is acceptable. Registration uses the
+//!   strict reader so a damaged registry cannot lose its degraded status.
 //!
 //! - [`try_load`] surfaces specific failure modes via [`LoadError`].
 //!   Used by `lpm cache prune` so a corrupt registry can be detected
@@ -158,9 +155,8 @@ impl std::fmt::Display for LoadError {
 ///
 /// The "best-effort" posture is intentional — the registry is a
 /// performance + UX cache, not a load-bearing data structure for the
-/// install pipeline. Real errors here would block every install on
-/// every machine that ever shipped a buggy registry write; instead we
-/// degrade silently and rebuild on the next successful install.
+/// install pipeline. Registration uses the strict reader and preserves
+/// unusable registries so pruning cannot mistake a partial list for complete roots.
 pub fn load(path: &Path) -> Registry {
     try_load(path).unwrap_or_else(|_| Registry::new())
 }
@@ -172,12 +168,12 @@ pub fn load(path: &Path) -> Registry {
 /// registered projects" — the latter would mark every link entry as
 /// orphaned and wipe the live store under `--apply`.
 pub fn try_load(path: &Path) -> Result<Registry, LoadError> {
-    let bytes = match crate::read_capped_state_file(path, crate::STATE_FILE_SIZE_CAP_BYTES) {
-        Ok(Some(b)) => b,
-        Ok(None) => return Err(LoadError::NotFound),
-        Err(e) => return Err(LoadError::Io(e)),
+    let text = match crate::read_text_file_capped_nofollow(path, crate::STATE_FILE_SIZE_CAP_BYTES) {
+        Ok(text) => text,
+        Err(crate::BoundedReadError::NotFound { .. }) => return Err(LoadError::NotFound),
+        Err(error) => return Err(LoadError::Io(std::io::Error::other(error))),
     };
-    match serde_json::from_slice::<Registry>(&bytes) {
+    match serde_json::from_str::<Registry>(&text) {
         Ok(r) if r.version == REGISTRY_VERSION => Ok(r),
         Ok(_) => Err(LoadError::SchemaMismatch),
         Err(_) => Err(LoadError::MalformedJson),
@@ -239,21 +235,32 @@ pub fn register(path: &Path, project_dir: &Path) -> Result<Entry, LpmError> {
             ),
         ))
     })?;
-    let mut registry = load(path);
-    let now = Utc::now();
-    if let Some(existing) = registry.projects.iter_mut().find(|e| e.path == canonical) {
-        existing.last_seen = now;
-        let entry = existing.clone();
+    // Installs share the store lock, so registry updates need their own serialization.
+    crate::with_exclusive_lock(path.with_extension("lock"), || {
+        let mut registry = match try_load(path) {
+            Ok(registry) => registry,
+            Err(LoadError::NotFound) => Registry::new(),
+            Err(error) => {
+                return Err(LpmError::Store(format!(
+                    "known-projects: cannot update incomplete registry: {error}"
+                )));
+            }
+        };
+        let now = Utc::now();
+        if let Some(existing) = registry.projects.iter_mut().find(|e| e.path == canonical) {
+            existing.last_seen = now;
+            let entry = existing.clone();
+            write(path, &registry)?;
+            return Ok(entry);
+        }
+        let entry = Entry {
+            path: canonical,
+            last_seen: now,
+        };
+        registry.projects.push(entry.clone());
         write(path, &registry)?;
-        return Ok(entry);
-    }
-    let entry = Entry {
-        path: canonical,
-        last_seen: now,
-    };
-    registry.projects.push(entry.clone());
-    write(path, &registry)?;
-    Ok(entry)
+        Ok(entry)
+    })
 }
 
 /// Drop entries whose `path` no longer exists on disk. Returns the
