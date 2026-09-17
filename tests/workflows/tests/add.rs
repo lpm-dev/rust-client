@@ -2515,7 +2515,10 @@ async fn add_records_installed_digest_and_original_backup_for_forced_overwrite()
 
     let state: serde_json::Value =
         serde_json::from_str(&project.read_file(".lpm/added-sources.json")).unwrap();
-    let file = &state["packages"][package]["files"]["components/Source.ts"];
+    let file = &state["packages"][package]["files"][std::path::Path::new("components")
+        .join("Source.ts")
+        .to_str()
+        .unwrap()];
     assert_eq!(state["schema_version"], 3);
     assert_eq!(file["action"], "overwrite");
     assert_eq!(
@@ -2566,7 +2569,10 @@ async fn add_repeat_after_installed_file_deletion_preserves_original_backup() {
 
     let state: serde_json::Value =
         serde_json::from_str(&project.read_file(".lpm/added-sources.json")).unwrap();
-    let file = &state["packages"][package]["files"]["components/Source.ts"];
+    let file = &state["packages"][package]["files"][std::path::Path::new("components")
+        .join("Source.ts")
+        .to_str()
+        .unwrap()];
     assert_eq!(file["action"], "overwrite");
     let backup_path = file["backup_path"].as_str().expect("overwrite backup path");
     assert_eq!(project.read_file(backup_path), "original project bytes\n");
@@ -2652,7 +2658,11 @@ async fn add_new_version_replaces_unchanged_created_and_overwritten_outputs() {
 
     let overwritten_state: serde_json::Value =
         serde_json::from_str(&overwritten_project.read_file(".lpm/added-sources.json")).unwrap();
-    let overwritten_file = &overwritten_state["packages"][package]["files"]["components/Source.ts"];
+    let overwritten_file =
+        &overwritten_state["packages"][package]["files"][std::path::Path::new("components")
+            .join("Source.ts")
+            .to_str()
+            .unwrap()];
     assert_eq!(overwritten_file["action"], "overwrite");
     #[cfg(unix)]
     assert_eq!(overwritten_file["backup_mode"], 0o751);
@@ -2706,7 +2716,10 @@ async fn add_new_version_restores_original_when_a_dropped_overwrite_is_missing()
         .success();
     let first_state: serde_json::Value =
         serde_json::from_str(&project.read_file(".lpm/added-sources.json")).unwrap();
-    let backup_path = first_state["packages"][package]["files"]["components/Old.ts"]["backup_path"]
+    let backup_path = first_state["packages"][package]["files"][std::path::Path::new("components")
+        .join("Old.ts")
+        .to_str()
+        .unwrap()]["backup_path"]
         .as_str()
         .unwrap()
         .to_string();
@@ -2732,7 +2745,12 @@ async fn add_new_version_restores_original_when_a_dropped_overwrite_is_missing()
         serde_json::from_str(&project.read_file(".lpm/added-sources.json")).unwrap();
     assert!(
         final_state["packages"][package]["files"]
-            .get("components/Old.ts")
+            .get(
+                std::path::Path::new("components")
+                    .join("Old.ts")
+                    .to_str()
+                    .unwrap()
+            )
             .is_none()
     );
 }
@@ -2778,7 +2796,10 @@ async fn add_rejects_a_tampered_backup_before_restoring_a_dropped_overwrite() {
         .success();
     let state: serde_json::Value =
         serde_json::from_str(&project.read_file(".lpm/added-sources.json")).unwrap();
-    let backup_path = state["packages"][package]["files"]["components/Old.ts"]["backup_path"]
+    let backup_path = state["packages"][package]["files"][std::path::Path::new("components")
+        .join("Old.ts")
+        .to_str()
+        .unwrap()]["backup_path"]
         .as_str()
         .unwrap()
         .to_string();
