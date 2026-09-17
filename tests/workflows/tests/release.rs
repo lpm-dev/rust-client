@@ -2,6 +2,7 @@ mod support;
 
 use base64::Engine as _;
 use support::assertions::parse_json_output;
+use support::mock_registry::{MockRegistry, make_tarball};
 use support::{
     LOCK_CONTENTION_MARKER_ENV, TempProject, lpm, lpm_spawnable, lpm_with_registry,
     wait_for_lock_contention,
@@ -728,9 +729,14 @@ fn release_apply_runs_after_recovering_a_different_completed_operation() {
     );
 }
 
-#[test]
-fn install_package_from_a_workspace_member_uses_the_workspace_transaction_lock() {
+#[tokio::test]
+async fn install_package_from_a_workspace_member_uses_the_workspace_transaction_lock() {
+    let registry = MockRegistry::start().await;
+    registry
+        .with_package("left-pad", "1.3.0", &make_tarball("left-pad", "1.3.0"))
+        .await;
     let project = workspace_project();
+    project.write_file(".npmrc", &format!("registry={}/\n", registry.url()));
     let root_lock_path = lpm_common::project_install_lock(project.path());
     let root_lock = lpm_common::acquire_exclusive_lock(&root_lock_path)
         .expect("hold the workspace transaction lock");
@@ -739,14 +745,25 @@ fn install_package_from_a_workspace_member_uses_the_workspace_transaction_lock()
     command
         .current_dir(project.path().join("packages/core"))
         .env(LOCK_CONTENTION_MARKER_ENV, &marker_path)
-        .args(["install", "left-pad", "--offline", "--json"]);
+        .args(["--registry", &registry.url(), "--insecure"])
+        .args(["install", "left-pad@1.3.0", "--json", "--no-skills"]);
     let mut child = command.spawn().expect("spawn member package install");
 
     wait_for_lock_contention(&mut child, &marker_path, &root_lock_path);
     drop(root_lock);
-    let _ = child
+    let output = child
         .wait_with_output()
         .expect("finish member package install");
+    assert!(
+        output.status.success(),
+        "install failed after the workspace lock was released\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        read_package_json(&project, "packages/core/package.json")["dependencies"]["left-pad"],
+        "1.3.0"
+    );
 }
 
 #[test]
