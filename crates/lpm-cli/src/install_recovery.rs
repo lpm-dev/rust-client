@@ -1,5 +1,5 @@
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::ffi::OsStr;
 use std::future::Future;
 use std::io::{self, Read, Write};
@@ -12,6 +12,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 mod cancellation;
+mod moves;
 mod source;
 pub(crate) use cancellation::cancellation_flag;
 
@@ -48,6 +49,7 @@ struct Recovery {
     records: HashMap<PathBuf, Record>,
     total_bytes: usize,
     sources: Option<source::Sources>,
+    moves: Option<moves::Moves>,
 }
 
 tokio::task_local! {
@@ -174,17 +176,23 @@ impl Recovery {
             Err(error) if error.kind() == io::ErrorKind::NotFound => None,
             Err(error) => return Err(error),
         };
-        let sources = source_directory
+        let mut checkpoints = BTreeSet::new();
+        let move_directory = match state.open_dir_nofollow(moves::DIRECTORY) {
+            Ok(directory) => Some(directory),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+            Err(error) => return Err(error),
+        };
+        let mut move_journal = move_directory
             .as_ref()
-            .map(source::Sources::load)
+            .map(moves::Moves::load)
             .transpose()?;
-        if !committed && let (Some(sources), Some(directory)) = (&sources, &source_directory) {
-            sources.validate(&self.directory, directory)?;
-        }
         for entry in state.entries()? {
             let entry = entry?;
             let name = entry.file_name();
-            if name == OsStr::new(COMMITTED) || name == OsStr::new(source::DIRECTORY) {
+            if name == OsStr::new(COMMITTED)
+                || name == OsStr::new(source::DIRECTORY)
+                || name == OsStr::new(moves::DIRECTORY)
+            {
                 continue;
             }
             if name
@@ -192,6 +200,22 @@ impl Recovery {
                 .is_some_and(lpm_common::atomic_write::is_atomic_temp_name)
             {
                 state.remove_file(&name)?;
+                continue;
+            }
+            if let Some(value) = name
+                .to_str()
+                .and_then(|name| name.strip_prefix(source::CHECKPOINT_PREFIX))
+            {
+                let sequence: u64 = value
+                    .parse()
+                    .map_err(|_| invalid("invalid source checkpoint sequence"))?;
+                if name != OsStr::new(&source::checkpoint_name(sequence))
+                    || checkpoints.len() >= 10_000
+                {
+                    return Err(invalid("invalid source checkpoint"));
+                }
+                state.open_dir_nofollow(&name)?;
+                checkpoints.insert(sequence);
                 continue;
             }
             let bytes = read_regular(&state, &name, RECORD_LIMIT)?;
@@ -223,8 +247,35 @@ impl Recovery {
             records.push((record, parent));
         }
         if !committed {
-            if let (Some(sources), Some(directory)) = (&sources, &source_directory) {
-                sources.restore(&self.directory, directory)?;
+            if let Some(directory) = &source_directory {
+                source::recover(
+                    &self.directory,
+                    directory,
+                    &self
+                        .root
+                        .join(".lpm")
+                        .join(DIRECTORY)
+                        .join(source::DIRECTORY),
+                )?;
+            }
+            // Each checkpoint precedes its move. Replay their shared order in reverse.
+            for &sequence in checkpoints.iter().rev() {
+                if let (Some(journal), Some(directory)) = (&mut move_journal, &move_directory) {
+                    journal.undo_from(&self.directory, directory, sequence)?;
+                }
+                let directory = state.open_dir_nofollow(source::checkpoint_name(sequence))?;
+                source::recover(
+                    &self.directory,
+                    &directory,
+                    &self
+                        .root
+                        .join(".lpm")
+                        .join(DIRECTORY)
+                        .join(source::checkpoint_name(sequence)),
+                )?;
+            }
+            if let (Some(journal), Some(directory)) = (&mut move_journal, &move_directory) {
+                journal.undo(&self.directory, directory)?;
             }
             for (record, parent) in &records {
                 let current = read_regular(
@@ -251,12 +302,22 @@ impl Recovery {
             invalidate_hash(&self.directory)?;
             write_record(&state, OsStr::new(COMMITTED), b"1\n")?;
         }
+        if let (Some(journal), Some(directory)) = (move_journal, move_directory) {
+            journal.cleanup(&self.directory, &directory)?;
+            directory.remove_open_dir()?;
+            sync_directory(&state)?;
+        }
         if let Some(directory) = source_directory {
             source::cleanup(directory)?;
+        }
+        for sequence in checkpoints {
+            source::cleanup(state.open_dir_nofollow(source::checkpoint_name(sequence))?)?;
         }
         for name in names {
             state.remove_file(name)?;
         }
+        // Persist cleanup before retiring its commit marker, including after power loss.
+        sync_directory(&state)?;
         state.remove_file(COMMITTED)?;
         sync_directory(&state)?;
         let lpm = self.directory.open_dir_nofollow(".lpm")?;
@@ -332,11 +393,12 @@ impl Recovery {
     }
 
     fn finish(&mut self, success: bool) -> io::Result<()> {
-        if self.records.is_empty() && self.sources.is_none() {
+        if self.records.is_empty() && self.sources.is_none() && self.moves.is_none() {
             return Ok(());
         }
         if success && let Some(state) = self.state_directory(false)? {
             write_record(&state, OsStr::new(COMMITTED), b"1\n")?;
+            test_pause("after-source-commit");
         }
         self.recover()
     }
@@ -407,6 +469,168 @@ pub(crate) fn may_restore(path: &Path) -> bool {
                 .is_ok_and(|current| record.accepts(&current))
         })
         .unwrap_or(true)
+}
+
+pub(crate) fn source_moves_active() -> bool {
+    ACTIVE.try_with(|_| ()).is_ok()
+}
+
+pub(crate) fn register_source_archive(path: &Path) -> io::Result<()> {
+    ACTIVE
+        .try_with(|active| {
+            let mut recovery = active.borrow_mut();
+            let relative = path
+                .strip_prefix(&recovery.root)
+                .map_err(|_| invalid("source archive is outside the locked project"))?
+                .to_path_buf();
+            let state = recovery
+                .state_directory(true)?
+                .ok_or_else(|| invalid("missing source recovery directory"))?;
+            let state = moves::directory(&state)?;
+            let root = recovery.directory.try_clone()?;
+            recovery
+                .moves
+                .get_or_insert_with(Default::default)
+                .register_archive(&root, &state, &relative)
+        })
+        .unwrap_or(Ok(()))
+}
+
+pub(crate) fn move_source(source: &Path, destination: &Path, mode: Option<u32>) -> io::Result<()> {
+    ACTIVE
+        .try_with(|active| {
+            let mut recovery = active.borrow_mut();
+            let source = source
+                .strip_prefix(&recovery.root)
+                .map_err(|_| invalid("source move is outside the locked project"))?
+                .to_path_buf();
+            let destination = destination
+                .strip_prefix(&recovery.root)
+                .map_err(|_| invalid("source move is outside the locked project"))?
+                .to_path_buf();
+            let state = recovery
+                .state_directory(true)?
+                .ok_or_else(|| invalid("missing source recovery directory"))?;
+            let sequence = recovery
+                .moves
+                .get_or_insert_with(Default::default)
+                .reserve_sequence()?;
+            if source::checkpoint(&state, sequence)?
+                && let Some(sources) = recovery.sources.take()
+            {
+                recovery.sources = Some(sources.next_epoch());
+            }
+            let state = moves::directory(&state)?;
+            let root = recovery.directory.try_clone()?;
+            recovery.moves.get_or_insert_with(Default::default).execute(
+                &root,
+                &state,
+                &source,
+                &destination,
+                mode,
+                sequence,
+            )
+        })
+        .map_err(|_| invalid("source move requires active recovery"))?
+}
+
+pub(crate) fn prune_source_directory(
+    project: &Path,
+    relative: &Path,
+    expected: &Dir,
+) -> io::Result<bool> {
+    if expected.entries()?.next().transpose()?.is_some() {
+        return Ok(false);
+    }
+    let archive = ACTIVE.with(|active| {
+        let recovery = active.borrow();
+        let project_relative = project
+            .strip_prefix(&recovery.root)
+            .map_err(|_| invalid("source cleanup is outside the locked project"))?;
+        Ok::<_, io::Error>(
+            recovery
+                .moves
+                .as_ref()
+                .and_then(|journal| journal.archive_for_project(project_relative))
+                .map(|path| recovery.root.join(path)),
+        )
+    })?;
+    let archive = match archive {
+        Some(path) => path,
+        None => {
+            let archive = tempfile::Builder::new()
+                .prefix(".source-remove-")
+                .tempdir_in(project.join(".lpm"))?;
+            register_source_archive(archive.path())?;
+            archive.keep()
+        }
+    };
+    let entry_name = ACTIVE
+        .with(|active| {
+            active
+                .borrow()
+                .moves
+                .as_ref()
+                .map(moves::Moves::next_directory_name)
+        })
+        .ok_or_else(|| invalid("missing source move journal"))?;
+    let destination = archive.join(entry_name);
+    let source = project.join(relative);
+    let expected_identity = crate::directory_transaction::directory_identity(expected)?;
+    move_source(&source, &destination, None)?;
+    let archive_directory = Dir::open_ambient_dir(&archive, cap_std::ambient_authority())?;
+    let staged = crate::directory_transaction::open_directory_for_publication(
+        &archive_directory,
+        destination
+            .file_name()
+            .ok_or_else(|| invalid("source archive entry has no name"))?,
+    )?;
+    let still_empty = staged.entries()?.next().transpose()?.is_none();
+    let same_identity =
+        crate::directory_transaction::directory_identity(&staged)? == expected_identity;
+    drop(staged);
+    if !still_empty || !same_identity {
+        ACTIVE.with(|active| {
+            let mut recovery = active.borrow_mut();
+            let state = recovery
+                .state_directory(false)?
+                .ok_or_else(|| invalid("missing source recovery directory"))?;
+            let state = moves::directory(&state)?;
+            let root = recovery.directory.try_clone()?;
+            recovery
+                .moves
+                .as_mut()
+                .ok_or_else(|| invalid("missing source move journal"))?
+                .undo_last(&root, &state)
+        })?;
+        return Ok(false);
+    }
+    test_pause("after-source-directory");
+    Ok(true)
+}
+
+pub(crate) fn test_pause(stage: &str) {
+    if !cfg!(debug_assertions)
+        || std::env::var("LPM_TEST_SOURCE_RECOVERY_STAGE").as_deref() != Ok(stage)
+    {
+        return;
+    }
+    let Ok(marker) = std::env::var("LPM_TEST_SOURCE_RECOVERY_MARKER") else {
+        return;
+    };
+    let marker = PathBuf::from(marker);
+    std::fs::write(&marker, b"ready").expect("write source recovery test marker");
+    let resume = marker.with_extension("resume");
+    for _ in 0..1_000 {
+        if resume.exists() {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    panic!(
+        "timed out waiting for source recovery test marker {}",
+        resume.display()
+    );
 }
 
 pub(crate) fn enable_source_recovery() {
@@ -517,6 +741,7 @@ where
         records: HashMap::new(),
         total_bytes: 0,
         sources: None,
+        moves: None,
     };
     recovery.recover()?;
     let cancellation = cancellation::SignalCancellation::new()?;

@@ -43,6 +43,7 @@ pub mod auth_state;
 pub mod build_state;
 pub mod fault_registry;
 pub mod mock_registry;
+pub mod source_recovery;
 pub mod verdaccio;
 pub mod verdaccio_proxy;
 
@@ -766,6 +767,9 @@ fn apply_lpm_env<S: LpmEnvSink>(cmd: &mut S, project: &TempProject) {
     cmd.remove_env("LPM_OIDC_POLICY_ID");
     cmd.remove_env("LPM_TEST_ASSUME_EUID_ROOT");
     cmd.remove_env(LOCK_CONTENTION_MARKER_ENV);
+    cmd.remove_env("LPM_TEST_SOURCE_RECOVERY_STAGE");
+    cmd.remove_env("LPM_TEST_SOURCE_RECOVERY_MARKER");
+    cmd.remove_env("LPM_TEST_SOURCE_RECOVERY_PATH");
     cmd.remove_env("SUDO_USER");
 
     // Clear CI-environment vars that GitHub Actions / GitLab inject into

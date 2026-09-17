@@ -34,6 +34,16 @@ fn write_source_state_v3(project: &TempProject, packages: serde_json::Value) {
     );
 }
 
+fn source_file_key(files: &serde_json::Value, path: &str) -> String {
+    files
+        .as_object()
+        .expect("tracked files object")
+        .keys()
+        .find(|key| std::path::Path::new(key) == std::path::Path::new(path))
+        .unwrap_or_else(|| panic!("missing tracked source file {path}: {files}"))
+        .clone()
+}
+
 fn created_file(content: &[u8]) -> serde_json::Value {
     json!({
         "installed_digest": digest(content),
@@ -61,6 +71,22 @@ fn write_materialized_package_skill(
         }))
         .unwrap(),
     );
+}
+
+fn write_owned_cursor_link(project: &TempProject, package: &str, skill: &str) {
+    let rules = project.path().join(".cursor/rules");
+    std::fs::create_dir_all(&rules).unwrap();
+    let link = rules.join(format!("{package}--{skill}.md"));
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(format!("../../.lpm/skills/{package}/{skill}.md"), link).unwrap();
+    #[cfg(windows)]
+    std::os::windows::fs::symlink_file(
+        project
+            .path()
+            .join(format!(".lpm/skills/{package}/{skill}.md")),
+        link,
+    )
+    .unwrap();
 }
 
 fn make_source_pkg_tarball(
@@ -97,7 +123,7 @@ fn remove_json_cleans_source_package_paths_and_editor_links() {
         "components/widget/index.ts",
         "export const widget = true;\n",
     );
-    project.write_file(".cursor/rules/owner.widget--build.md", "linked skill\n");
+    write_owned_cursor_link(&project, "owner.widget", "build");
     write_source_state(
         &project,
         json!({
@@ -123,11 +149,17 @@ fn remove_json_cleans_source_package_paths_and_editor_links() {
     );
 
     let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
-    let envelope: serde_json::Value = serde_json::from_str(&stdout)
+    let mut envelope: serde_json::Value = serde_json::from_str(&stdout)
         .unwrap_or_else(|e| panic!("remove --json must be valid JSON: {e}\n---\n{stdout}"));
 
     assert_eq!(envelope["success"], serde_json::json!(true));
     assert_eq!(envelope["package"], serde_json::json!("owner.widget"));
+    let editor_path = ".cursor/rules/owner.widget--build.md";
+    assert_eq!(
+        std::path::Path::new(envelope["removed"][2].as_str().unwrap()),
+        std::path::Path::new(editor_path),
+    );
+    envelope["removed"][2] = json!(editor_path);
     assert_eq!(
         envelope["removed"],
         serde_json::json!([
@@ -161,7 +193,7 @@ fn remove_human_output_uses_slim_done_line_and_stderr_only_paths() {
         "components/widget/index.ts",
         "export const widget = true;\n",
     );
-    project.write_file(".cursor/rules/owner.widget--build.md", "linked skill\n");
+    write_owned_cursor_link(&project, "owner.widget", "build");
     write_source_state(
         &project,
         json!({
@@ -200,7 +232,13 @@ fn remove_human_output_uses_slim_done_line_and_stderr_only_paths() {
     assert!(
         stderr.contains("- .lpm/skills/owner.widget/")
             && stderr.contains("- components/widget/index.ts")
-            && stderr.contains("- .cursor/rules/owner.widget--build.md")
+            && stderr.contains(&format!(
+                "- {}",
+                std::path::Path::new(".cursor")
+                    .join("rules")
+                    .join("owner.widget--build.md")
+                    .display()
+            ))
             && stderr.contains("✓ Removed package skill directory"),
         "remove should report every removed path on stderr, got:\n{stderr}"
     );
@@ -311,9 +349,12 @@ async fn remove_reverses_manifest_tracked_custom_path_add_for_bare_package() {
     assert_eq!(envelope["success"], serde_json::json!(true));
     assert_eq!(envelope["package"], serde_json::json!("source-pkg"));
     assert!(
-        envelope["removed"].as_array().is_some_and(|removed| removed
-            .iter()
-            .any(|value| value == "custom/widgets/Foo.tsx")),
+        envelope["removed"]
+            .as_array()
+            .is_some_and(|removed| removed.iter().any(|value| value
+                .as_str()
+                .is_some_and(|path| std::path::Path::new(path)
+                    == std::path::Path::new("custom/widgets/Foo.tsx")))),
         "remove must report the manifest-tracked custom file path, got: {envelope}"
     );
     assert!(
@@ -737,9 +778,11 @@ async fn remove_preserves_a_tracked_overwrite_that_the_user_modified() {
     let state_after: serde_json::Value =
         serde_json::from_str(&project.read_file(".lpm/added-sources.json")).unwrap();
     let state_before: serde_json::Value = serde_json::from_str(&state_before).unwrap();
+    let files_before = &state_before["packages"]["source-pkg"]["files"];
+    let key = source_file_key(files_before, "custom/Source.ts");
     assert_eq!(
-        state_after["packages"]["source-pkg"]["files"]["custom/Source.ts"],
-        state_before["packages"]["source-pkg"]["files"]["custom/Source.ts"]
+        state_after["packages"]["source-pkg"]["files"][&key],
+        files_before[&key]
     );
 }
 
@@ -770,9 +813,9 @@ async fn remove_rejects_a_tampered_overwrite_backup_before_mutating_the_destinat
         .success();
     let state: serde_json::Value =
         serde_json::from_str(&project.read_file(".lpm/added-sources.json")).unwrap();
-    let backup = state["packages"]["source-pkg"]["files"]["custom/Source.ts"]["backup_path"]
-        .as_str()
-        .unwrap();
+    let files = &state["packages"]["source-pkg"]["files"];
+    let key = source_file_key(files, "custom/Source.ts");
+    let backup = files[&key]["backup_path"].as_str().unwrap();
     project.write_file(backup, "tampered\n");
 
     let output = lpm(&project)
@@ -850,8 +893,9 @@ async fn remove_rejects_a_forged_overwrite_backup_path_before_mutating_files() {
     std::fs::write(&outside_backup, b"outside\n").unwrap();
     let mut state: serde_json::Value =
         serde_json::from_str(&project.read_file(".lpm/added-sources.json")).unwrap();
-    state["packages"]["source-pkg"]["files"]["custom/Source.ts"]["backup_path"] =
-        json!(outside_backup);
+    let files = &mut state["packages"]["source-pkg"]["files"];
+    let key = source_file_key(files, "custom/Source.ts");
+    files[&key]["backup_path"] = json!(outside_backup);
     project.write_file(
         ".lpm/added-sources.json",
         &serde_json::to_string_pretty(&state).unwrap(),
@@ -1317,7 +1361,7 @@ fn remove_rejects_a_package_skill_directory_with_untracked_content() {
 fn remove_deletes_only_editor_links_declared_by_the_package_skill_manifest() {
     let project = TempProject::empty(r#"{"name":"host","version":"1.0.0"}"#);
     write_materialized_package_skill(&project, "owner.widget", "guide", "managed\n");
-    project.write_file(".cursor/rules/owner.widget--guide.md", "managed link\n");
+    write_owned_cursor_link(&project, "owner.widget", "guide");
     project.write_file(
         ".cursor/rules/owner.widget--user-notes.md",
         "untracked user link\n",
@@ -1361,4 +1405,511 @@ fn remove_preserves_a_preexisting_directory_after_its_last_managed_file_is_delet
         .success();
 
     assert!(project.path().join("custom/preexisting").is_dir());
+}
+
+#[test]
+fn remove_preserves_user_cursor_rules_with_tracked_skill_names() {
+    let project = TempProject::empty(r#"{"name":"consumer","version":"1.0.0"}"#);
+    write_materialized_package_skill(&project, "owner.widget", "build", "skill\n");
+    project.write_file(".cursor/rules/owner.widget--build.md", "my own rule\n");
+    write_source_state(
+        &project,
+        json!({"@lpm.dev/owner.widget":{"files":{},"skillPackageShort":"owner.widget"}}),
+    );
+    lpm(&project)
+        .args(["remove", "owner.widget"])
+        .assert()
+        .success();
+    assert_eq!(
+        project.read_file(".cursor/rules/owner.widget--build.md"),
+        "my own rule\n"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn remove_preserves_foreign_cursor_links_with_tracked_skill_names() {
+    let project = TempProject::empty(r#"{"name":"consumer","version":"1.0.0"}"#);
+    write_materialized_package_skill(&project, "owner.widget", "build", "skill\n");
+    project.write_file(".cursor/rules/other.md", "other rule\n");
+    std::os::unix::fs::symlink(
+        "other.md",
+        project.path().join(".cursor/rules/owner.widget--build.md"),
+    )
+    .unwrap();
+    write_source_state(
+        &project,
+        json!({"@lpm.dev/owner.widget":{"files":{},"skillPackageShort":"owner.widget"}}),
+    );
+    lpm(&project)
+        .args(["remove", "owner.widget"])
+        .assert()
+        .success();
+    assert_eq!(
+        std::fs::read_link(project.path().join(".cursor/rules/owner.widget--build.md")).unwrap(),
+        std::path::Path::new("other.md")
+    );
+}
+
+fn interrupted_removal_fixture() -> TempProject {
+    let project = TempProject::empty(
+        r#"{"name":"consumer","version":"1.0.0","dependencies":{"owned-dep":"^1.0.0"}}"#,
+    );
+    project.write_file("vendor/nested/source.ts", "managed source\n");
+    project.write_file(".lpm/install-hash", "stale hash");
+    write_source_state_v3(
+        &project,
+        json!({"source-pkg":{
+            "files":{"vendor/nested/source.ts":created_file(b"managed source\n")},
+            "createdDirectories":["vendor", "vendor/nested"],
+            "dependencies":{"owned-dep":{"spec":"^1.0.0","section":"dependencies","inserted":true}}
+        }}),
+    );
+    project
+}
+
+fn interrupt_removal(project: &TempProject, stage: &str) {
+    let mut command = lpm_spawnable(project);
+    command.args(["remove", "source-pkg", "--json"]);
+    support::source_recovery::interrupt(
+        command,
+        &project.home().join("source-interrupted"),
+        stage,
+        None,
+    );
+}
+
+#[test]
+fn interrupted_source_removal_recovers_quarantined_files_before_the_next_command() {
+    for stage in [
+        "after-source-move",
+        "after-source-state",
+        "after-source-directory",
+    ] {
+        let project = interrupted_removal_fixture();
+        let state = project.read_file(".lpm/added-sources.json");
+        let manifest = project.read_file("package.json");
+        #[cfg(unix)]
+        let directory_inode = {
+            use std::os::unix::fs::MetadataExt as _;
+            std::fs::metadata(project.path().join("vendor/nested"))
+                .unwrap()
+                .ino()
+        };
+        interrupt_removal(&project, stage);
+        lpm(&project)
+            .args(["remove", "unknown-source"])
+            .assert()
+            .success();
+        assert_eq!(
+            project.read_file("vendor/nested/source.ts"),
+            "managed source\n",
+            "{stage}"
+        );
+        assert_eq!(
+            project.read_file(".lpm/added-sources.json"),
+            state,
+            "{stage}"
+        );
+        assert_eq!(project.read_file("package.json"), manifest, "{stage}");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt as _;
+            assert_eq!(
+                std::fs::metadata(project.path().join("vendor/nested"))
+                    .unwrap()
+                    .ino(),
+                directory_inode,
+                "{stage}"
+            );
+        }
+        assert!(!project.path().join(".lpm/install-recovery").exists());
+    }
+}
+
+#[test]
+fn remove_preserves_user_cursor_directories_with_tracked_skill_names() {
+    let project = TempProject::empty(r#"{"name":"consumer","version":"1.0.0"}"#);
+    write_materialized_package_skill(&project, "owner.widget", "build", "skill\n");
+    project.write_file(
+        ".cursor/rules/owner.widget--build.md/user.md",
+        "my own rule\n",
+    );
+    write_source_state(
+        &project,
+        json!({"@lpm.dev/owner.widget":{"files":{},"skillPackageShort":"owner.widget"}}),
+    );
+    lpm(&project)
+        .args(["remove", "owner.widget"])
+        .assert()
+        .success();
+    assert_eq!(
+        project.read_file(".cursor/rules/owner.widget--build.md/user.md"),
+        "my own rule\n"
+    );
+}
+
+#[test]
+fn committed_source_removal_survives_interruption_before_archive_cleanup() {
+    let project = interrupted_removal_fixture();
+    interrupt_removal(&project, "after-source-commit");
+    assert!(!project.file_exists("vendor/nested/source.ts"));
+    lpm(&project)
+        .args(["remove", "unknown-source"])
+        .assert()
+        .success();
+    assert!(!project.path().join("vendor").exists());
+    assert!(!project.path().join(".lpm/added-sources.json").exists());
+    assert!(!project.path().join(".lpm/install-recovery").exists());
+    let manifest: serde_json::Value =
+        serde_json::from_str(&project.read_file("package.json")).unwrap();
+    assert!(manifest["dependencies"]["owned-dep"].is_null());
+}
+
+#[test]
+fn source_recovery_resumes_after_a_second_interruption() {
+    for stage in [
+        "after-source-undo",
+        "after-source-epoch-restore",
+        "after-source-epoch",
+    ] {
+        let project = interrupted_removal_fixture();
+        let state = project.read_file(".lpm/added-sources.json");
+        interrupt_removal(&project, "after-source-directory");
+        let mut command = lpm_spawnable(&project);
+        command.args(["remove", "unknown-source"]);
+        support::source_recovery::interrupt(
+            command,
+            &project.home().join("recovery-interrupted"),
+            stage,
+            None,
+        );
+        lpm(&project)
+            .args(["remove", "unknown-source"])
+            .assert()
+            .success();
+        assert_eq!(
+            project.read_file("vendor/nested/source.ts"),
+            "managed source\n",
+            "{stage}"
+        );
+        assert_eq!(
+            project.read_file(".lpm/added-sources.json"),
+            state,
+            "{stage}"
+        );
+        assert!(!project.path().join(".lpm/install-recovery").exists());
+    }
+}
+
+#[test]
+fn interrupted_removal_preserves_later_user_edits_until_reconciled() {
+    let project = interrupted_removal_fixture();
+    interrupt_removal(&project, "after-source-move");
+    project.write_file("vendor/nested/source.ts", "later user edit\n");
+    lpm(&project)
+        .args(["remove", "unknown-source"])
+        .assert()
+        .failure();
+    assert_eq!(
+        project.read_file("vendor/nested/source.ts"),
+        "later user edit\n"
+    );
+    assert!(project.path().join(".lpm/install-recovery").is_dir());
+    std::fs::rename(
+        project.path().join("vendor/nested/source.ts"),
+        project.path().join("saved-user-edit.ts"),
+    )
+    .unwrap();
+    lpm(&project)
+        .args(["remove", "unknown-source"])
+        .assert()
+        .success();
+    assert_eq!(
+        project.read_file("vendor/nested/source.ts"),
+        "managed source\n"
+    );
+    assert_eq!(project.read_file("saved-user-edit.ts"), "later user edit\n");
+}
+
+#[test]
+fn interrupted_removal_rejects_journal_paths_outside_the_project() {
+    let project = interrupted_removal_fixture();
+    interrupt_removal(&project, "after-source-move");
+    let journal = project
+        .path()
+        .join(".lpm/install-recovery/moves/move-00000000000000000000.json");
+    let original = std::fs::read(&journal).unwrap();
+    let mut record: serde_json::Value = serde_json::from_slice(&original).unwrap();
+    record["source"] = json!("../outside.ts");
+    std::fs::write(&journal, serde_json::to_vec(&record).unwrap()).unwrap();
+    lpm(&project)
+        .args(["remove", "unknown-source"])
+        .assert()
+        .failure();
+    assert!(!project.file_exists("vendor/nested/source.ts"));
+    std::fs::write(&journal, original).unwrap();
+    lpm(&project)
+        .args(["remove", "unknown-source"])
+        .assert()
+        .success();
+    assert_eq!(
+        project.read_file("vendor/nested/source.ts"),
+        "managed source\n"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn interrupted_removal_does_not_follow_a_replaced_source_parent() {
+    let project = interrupted_removal_fixture();
+    let outside = tempfile::tempdir().unwrap();
+    std::fs::write(outside.path().join("source.ts"), "outside\n").unwrap();
+    interrupt_removal(&project, "after-source-move");
+    std::fs::rename(
+        project.path().join("vendor/nested"),
+        project.path().join("vendor/saved"),
+    )
+    .unwrap();
+    std::os::unix::fs::symlink(outside.path(), project.path().join("vendor/nested")).unwrap();
+    lpm(&project)
+        .args(["remove", "unknown-source"])
+        .assert()
+        .failure();
+    assert_eq!(
+        std::fs::read_to_string(outside.path().join("source.ts")).unwrap(),
+        "outside\n"
+    );
+    std::fs::remove_file(project.path().join("vendor/nested")).unwrap();
+    std::fs::rename(
+        project.path().join("vendor/saved"),
+        project.path().join("vendor/nested"),
+    )
+    .unwrap();
+    lpm(&project)
+        .args(["remove", "unknown-source"])
+        .assert()
+        .success();
+    assert_eq!(
+        project.read_file("vendor/nested/source.ts"),
+        "managed source\n"
+    );
+}
+
+#[test]
+fn interrupted_workspace_member_removal_recovers_under_the_root_lock() {
+    let project =
+        TempProject::empty(r#"{"name":"root","private":true,"workspaces":["packages/*"]}"#);
+    project.write_file(
+        "packages/app/package.json",
+        r#"{"name":"app","version":"1.0.0","dependencies":{"owned-dep":"^1.0.0"}}"#,
+    );
+    project.write_file("packages/app/source.ts", "managed\n");
+    project.write_file("packages/app/.lpm/added-sources.json", &serde_json::to_string(&json!({"schema_version":3,"packages":{"source-pkg":{"files":{"source.ts":created_file(b"managed\n")},"dependencies":{"owned-dep":{"spec":"^1.0.0","section":"dependencies","inserted":true}}}}})).unwrap());
+    let mut command = lpm_spawnable(&project);
+    command
+        .current_dir(project.path().join("packages/app"))
+        .args(["remove", "source-pkg"]);
+    support::source_recovery::interrupt(
+        command,
+        &project.home().join("member-interrupted"),
+        "after-source-state",
+        None,
+    );
+    lpm(&project)
+        .args(["remove", "unknown-source"])
+        .assert()
+        .success();
+    assert_eq!(project.read_file("packages/app/source.ts"), "managed\n");
+    assert!(!project.path().join(".lpm/install-recovery").exists());
+    let manifest: serde_json::Value =
+        serde_json::from_str(&project.read_file("packages/app/package.json")).unwrap();
+    assert_eq!(manifest["dependencies"]["owned-dep"], "^1.0.0");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn interrupted_backup_promotion_restores_shared_ownership_before_retry() {
+    let mock = MockRegistry::start().await;
+    for (package, content) in [("source-a", b"lower\n"), ("source-b", b"upper\n")] {
+        let tarball = make_source_pkg_tarball(
+            package,
+            "1.0.0",
+            json!({"ecosystem": "js", "files": [{"src": "Source.ts"}]}),
+            &[("Source.ts", content)],
+        );
+        mock.with_package(package, "1.0.0", &tarball).await;
+    }
+    let project = TempProject::empty(r#"{"name":"host","version":"1.0.0"}"#);
+    project.write_file("custom/Source.ts", "original\n");
+    for package in ["source-a", "source-b"] {
+        lpm_with_registry(&project, &mock.url())
+            .args([
+                "add",
+                package,
+                "--yes",
+                "--force",
+                "--path",
+                "custom",
+                "--no-install-deps",
+                "--no-skills",
+            ])
+            .assert()
+            .success();
+    }
+
+    let state = project.read_file(".lpm/added-sources.json");
+    let mut command = lpm_spawnable(&project);
+    command.args(["remove", "source-a"]);
+    support::source_recovery::interrupt(
+        command,
+        &project.home().join("promotion-interrupted"),
+        "after-source-state",
+        None,
+    );
+    lpm(&project)
+        .args(["remove", "unknown-source"])
+        .assert()
+        .success();
+    assert_eq!(project.read_file(".lpm/added-sources.json"), state);
+    assert_eq!(project.read_file("custom/Source.ts"), "upper\n");
+    lpm(&project)
+        .args(["remove", "source-a"])
+        .assert()
+        .success();
+    lpm(&project)
+        .args(["remove", "source-b"])
+        .assert()
+        .success();
+
+    assert_eq!(project.read_file("custom/Source.ts"), "original\n");
+    assert!(!project.file_exists(".lpm/added-sources.json"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn interrupted_original_restoration_restores_backup_content_and_modes() {
+    let mock = MockRegistry::start().await;
+    let tarball = make_source_pkg_tarball(
+        "source-pkg",
+        "1.0.0",
+        json!({"ecosystem": "js", "files": [{"src": "Source.ts"}]}),
+        &[("Source.ts", b"installed\n")],
+    );
+    mock.with_package("source-pkg", "1.0.0", &tarball).await;
+    let project = TempProject::empty(r#"{"name":"host","version":"1.0.0"}"#);
+    project.write_file("custom/Source.ts", "original\n");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(
+            project.path().join("custom/Source.ts"),
+            std::fs::Permissions::from_mode(0o751),
+        )
+        .unwrap();
+    }
+    lpm_with_registry(&project, &mock.url())
+        .args([
+            "add",
+            "source-pkg",
+            "--yes",
+            "--force",
+            "--path",
+            "custom",
+            "--no-skills",
+            "--no-install-deps",
+        ])
+        .assert()
+        .success();
+    let state: serde_json::Value =
+        serde_json::from_str(&project.read_file(".lpm/added-sources.json")).unwrap();
+    let files = &state["packages"]["source-pkg"]["files"];
+    let key = source_file_key(files, "custom/Source.ts");
+    let backup = files[&key]["backup_path"].as_str().unwrap();
+    let state_before = project.read_file(".lpm/added-sources.json");
+    let mut command = lpm_spawnable(&project);
+    command.args(["remove", "source-pkg"]);
+    support::source_recovery::interrupt(
+        command,
+        &project.home().join("restore-interrupted"),
+        if cfg!(unix) {
+            "after-source-restore"
+        } else {
+            "after-source-state"
+        },
+        None,
+    );
+    assert_eq!(project.read_file("custom/Source.ts"), "original\n");
+    lpm(&project)
+        .args(["remove", "unknown-source"])
+        .assert()
+        .success();
+    assert_eq!(project.read_file("custom/Source.ts"), "installed\n");
+    assert_eq!(project.read_file(backup), "original\n");
+    assert_eq!(project.read_file(".lpm/added-sources.json"), state_before);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        assert_eq!(
+            std::fs::metadata(project.path().join(backup))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+    }
+    lpm(&project)
+        .args(["remove", "source-pkg"])
+        .assert()
+        .success();
+    assert_eq!(project.read_file("custom/Source.ts"), "original\n");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        assert_eq!(
+            std::fs::metadata(project.path().join("custom/Source.ts"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o751
+        );
+    }
+}
+
+#[test]
+fn committed_archive_cleanup_preserves_later_user_additions() {
+    let project = interrupted_removal_fixture();
+    interrupt_removal(&project, "after-source-commit");
+    let archive = std::fs::read_dir(project.path().join(".lpm"))
+        .unwrap()
+        .map(Result::unwrap)
+        .find(|entry| {
+            entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".source-remove-")
+        })
+        .unwrap()
+        .path();
+    std::fs::write(archive.join("user.txt"), "later addition\n").unwrap();
+    lpm(&project)
+        .args(["remove", "unknown-source"])
+        .assert()
+        .failure();
+    assert_eq!(
+        std::fs::read_to_string(archive.join("user.txt")).unwrap(),
+        "later addition\n"
+    );
+    assert!(!project.file_exists("vendor/nested/source.ts"));
+    std::fs::rename(
+        archive.join("user.txt"),
+        project.path().join("saved-user.txt"),
+    )
+    .unwrap();
+    lpm(&project)
+        .args(["remove", "unknown-source"])
+        .assert()
+        .success();
+    assert_eq!(project.read_file("saved-user.txt"), "later addition\n");
+    assert!(!project.path().join(".lpm/install-recovery").exists());
 }

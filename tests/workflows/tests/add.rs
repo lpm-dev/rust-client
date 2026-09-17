@@ -5009,3 +5009,163 @@ async fn swift_source_preview_preserves_untracked_links_to_stale_files() {
         std::path::Path::new("Old.swift")
     );
 }
+
+async fn directory_reuse_fixture(destination: &str) -> (TempProject, MockRegistry) {
+    let mock = MockRegistry::start().await;
+    let root = "@lpm.dev/swift.directory-parent";
+    let child = "@lpm.dev/swift.directory-child";
+    let first = make_source_pkg_tarball(
+        root,
+        "1.0.0",
+        json!({"ecosystem":"swift","dependencies":{},"files":[{"src":"Root.swift"},{"src":"Old.swift","dest":"Legacy/Old.swift"}]}),
+        &[("Root.swift", b"root\n"), ("Old.swift", b"old\n")],
+    );
+    let second = make_source_pkg_tarball(
+        root,
+        "2.0.0",
+        json!({"ecosystem":"swift","dependencies":{},"files":[{"src":"Root.swift"}]}),
+        &[("Root.swift", b"root\n")],
+    );
+    mock.mount_full_package_metadata_routes(
+        root,
+        "2.0.0",
+        &[
+            ("1.0.0", json!({}), Some(first)),
+            ("2.0.0", json!({child:"1.0.0"}), Some(second)),
+        ],
+    )
+    .await;
+    let child_tarball = make_source_pkg_tarball(
+        child,
+        "1.0.0",
+        json!({"ecosystem":"swift","dependencies":{},"files":[{"src":"Child.swift","dest":destination}]}),
+        &[("Child.swift", b"child\n")],
+    );
+    mock.mount_full_package_metadata_routes(
+        child,
+        "1.0.0",
+        &[(
+            "1.0.0",
+            json!({"@lpm.dev/swift.missing-grandchild":"1.0.0"}),
+            Some(child_tarball),
+        )],
+    )
+    .await;
+    let project = TempProject::empty(r#"{"name":"host","version":"1.0.0"}"#);
+    lpm_with_registry(&project, &mock.url())
+        .args([
+            "add",
+            &format!("{root}@1.0.0"),
+            "--yes",
+            "--no-skills",
+            "--no-install-deps",
+        ])
+        .assert()
+        .success();
+    (project, mock)
+}
+
+#[tokio::test]
+async fn failed_recursive_add_restores_a_directory_replaced_by_a_child_file() {
+    assert_failed_directory_reuse_restores("Legacy").await;
+}
+
+#[tokio::test]
+async fn failed_recursive_add_restores_a_directory_recreated_by_a_child() {
+    assert_failed_directory_reuse_restores("Legacy/Child.swift").await;
+}
+
+async fn assert_failed_directory_reuse_restores(destination: &str) {
+    let (project, mock) = directory_reuse_fixture(destination).await;
+    let state = project.read_file(".lpm/added-sources.json");
+    lpm_with_registry(&project, &mock.url())
+        .args([
+            "add",
+            "@lpm.dev/swift.directory-parent@2.0.0",
+            "--yes",
+            "--no-skills",
+            "--no-install-deps",
+        ])
+        .assert()
+        .failure();
+    assert_eq!(project.read_file("Sources/Legacy/Old.swift"), "old\n");
+    assert_eq!(project.read_file(".lpm/added-sources.json"), state);
+    assert!(!project.path().join(".lpm/install-recovery").exists());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn interrupted_recursive_add_recovers_reused_directories_and_resumes_rollback() {
+    for destination in ["Legacy", "Legacy/Child.swift"] {
+        for recovery_stage in [
+            None,
+            Some("after-source-epoch-restore"),
+            Some("after-source-epoch"),
+            Some("after-source-undo"),
+        ] {
+            let (project, mock) = directory_reuse_fixture(destination).await;
+            let state = project.read_file(".lpm/added-sources.json");
+            let mut command = lpm_spawnable_with_registry(&project, &mock.url());
+            command.args([
+                "add",
+                "@lpm.dev/swift.directory-parent@2.0.0",
+                "--yes",
+                "--no-skills",
+                "--no-install-deps",
+            ]);
+            support::source_recovery::interrupt(
+                command,
+                &project.home().join("add-interrupted"),
+                "after-source-write",
+                Some(&format!("Sources/{destination}")),
+            );
+            assert_eq!(
+                project.read_file(&format!("Sources/{destination}")),
+                "child\n"
+            );
+            if let Some(stage) = recovery_stage {
+                let mut command = support::lpm_spawnable(&project);
+                command.args(["remove", "unknown-source"]);
+                support::source_recovery::interrupt(
+                    command,
+                    &project.home().join("rollback-interrupted"),
+                    stage,
+                    None,
+                );
+            }
+            lpm(&project)
+                .args(["remove", "unknown-source"])
+                .assert()
+                .success();
+            assert_eq!(project.read_file("Sources/Legacy/Old.swift"), "old\n");
+            assert_eq!(project.read_file(".lpm/added-sources.json"), state);
+            assert!(!project.path().join(".lpm/install-recovery").exists());
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn source_checkpoint_without_its_move_recovers_before_the_next_command() {
+    let (project, mock) = directory_reuse_fixture("Legacy").await;
+    let state = project.read_file(".lpm/added-sources.json");
+    let mut command = lpm_spawnable_with_registry(&project, &mock.url());
+    command.args([
+        "add",
+        "@lpm.dev/swift.directory-parent@2.0.0",
+        "--yes",
+        "--no-skills",
+        "--no-install-deps",
+    ]);
+    support::source_recovery::interrupt(
+        command,
+        &project.home().join("checkpoint-interrupted"),
+        "after-source-checkpoint",
+        None,
+    );
+    lpm(&project)
+        .args(["remove", "unknown-source"])
+        .assert()
+        .success();
+    assert_eq!(project.read_file("Sources/Legacy/Old.swift"), "old\n");
+    assert_eq!(project.read_file(".lpm/added-sources.json"), state);
+    assert!(!project.path().join(".lpm/install-recovery").exists());
+}

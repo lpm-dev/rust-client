@@ -81,9 +81,16 @@ jobs:
           cargo test --locked -p lpm-cli --bin lpm-rs directory_transaction
           cargo test --locked -p lpm-cli --bin lpm-rs commands::add::paths::tests
           cargo test --locked -p lpm-cli --bin lpm-rs commands::remove::
+          cargo test --locked -p lpm-cli --bin lpm-rs install_recovery::
 
       - name: Windows uninstall cleanup contracts
         run: cargo nextest run --locked -p lpm-workflows --test uninstall_contract --no-fail-fast --status-level slow --final-status-level fail
+
+      - name: Windows source removal and recursive-add recovery
+        shell: bash
+        run: |
+          cargo nextest run --locked -p lpm-workflows --test remove --no-fail-fast --status-level slow --final-status-level fail
+          cargo nextest run --locked -p lpm-workflows --test add -E 'test(failed_recursive_add_restores_a_directory) | test(interrupted_recursive_add_recovers_reused_directories_and_resumes_rollback) | test(source_checkpoint_without_its_move)' --no-fail-fast --status-level slow --final-status-level fail
 
       - name: Windows install interruption recovery
         run: cargo nextest run --locked -p lpm-workflows --test install_concurrency -E 'test(interrupted_install)' --no-fail-fast --status-level slow --final-status-level fail

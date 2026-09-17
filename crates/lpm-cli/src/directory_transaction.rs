@@ -4,21 +4,21 @@ use cap_std::fs::Dir;
 use std::ffi::{OsStr, OsString};
 
 #[cfg(unix)]
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct DirectoryIdentity {
     device: u64,
     inode: u64,
 }
 
 #[cfg(windows)]
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct DirectoryIdentity {
     volume: u32,
     file_index: u64,
 }
 
 #[cfg(not(any(unix, windows)))]
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct DirectoryIdentity;
 
 #[cfg(unix)]
@@ -215,11 +215,16 @@ fn private_parent_has_extended_acl(_parent: &Dir) -> std::io::Result<bool> {
 
 #[cfg(windows)]
 fn create_and_open_private_directory(parent: &Dir, name: &OsStr) -> std::io::Result<Dir> {
-    open_windows_directory(parent, name, true)
+    open_windows_directory(parent, name, true, true)
 }
 
 #[cfg(windows)]
-fn open_windows_directory(parent: &Dir, name: &OsStr, create: bool) -> std::io::Result<Dir> {
+fn open_windows_directory(
+    parent: &Dir,
+    name: &OsStr,
+    create: bool,
+    publication: bool,
+) -> std::io::Result<Dir> {
     use std::mem::size_of;
     use std::os::windows::ffi::OsStrExt as _;
     use std::os::windows::io::{AsRawHandle as _, FromRawHandle as _};
@@ -318,7 +323,13 @@ fn open_windows_directory(parent: &Dir, name: &OsStr, create: bool) -> std::io::
         // the parent handle is valid and the output handle is initialized by NtCreateFile.
         NtCreateFile(
             &mut handle,
-            GENERIC_READ | GENERIC_WRITE | DELETE | SYNCHRONIZE,
+            GENERIC_READ
+                | SYNCHRONIZE
+                | if publication {
+                    GENERIC_WRITE | DELETE
+                } else {
+                    0
+                },
             &attributes,
             &mut io_status,
             std::ptr::null(),
@@ -372,7 +383,17 @@ pub(crate) fn open_directory_for_publication(parent: &Dir, name: &OsStr) -> std:
 pub(crate) fn open_directory_for_publication(parent: &Dir, name: &OsStr) -> std::io::Result<Dir> {
     // cap-std removes FILE_SHARE_DELETE when it opens directories, which
     // conflicts with the DELETE access needed by the retained rename handle.
-    open_windows_directory(parent, name, false)
+    open_windows_directory(parent, name, false, true)
+}
+
+#[cfg(windows)]
+pub(crate) fn open_directory_shared(parent: &Dir, name: &OsStr) -> std::io::Result<Dir> {
+    open_windows_directory(parent, name, false, false)
+}
+
+#[cfg(not(windows))]
+pub(crate) fn open_directory_shared(parent: &Dir, name: &OsStr) -> std::io::Result<Dir> {
+    parent.open_dir_nofollow(name)
 }
 
 #[cfg(windows)]

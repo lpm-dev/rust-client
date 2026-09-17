@@ -3,12 +3,14 @@ use cap_fs_ext::{DirExt as _, FollowSymlinks, OpenOptionsFollowExt as _, OpenOpt
 use cap_std::fs::Dir;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
-use std::collections::{BTreeMap, BTreeSet};
-use std::ffi::OsStr;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::ffi::{OsStr, OsString};
 use std::io::{self, Read, Seek, SeekFrom};
 use std::path::{Component, Path, PathBuf};
 
 pub(super) const DIRECTORY: &str = "sources";
+const RESTORED: &str = "restored";
+pub(super) const CHECKPOINT_PREFIX: &str = "sources-before-";
 const FILE_LIMIT: u64 = 1024 * 1024 * 1024;
 const ENTRY_LIMIT: usize = 20_000;
 
@@ -40,6 +42,15 @@ impl Record {
 pub(super) struct Sources {
     records: BTreeMap<PathBuf, Record>,
     directories: BTreeSet<PathBuf>,
+    limits: Limits,
+    record_sizes: HashMap<OsString, usize>,
+}
+
+#[derive(Default)]
+struct Limits {
+    files: BTreeSet<PathBuf>,
+    directories: BTreeSet<PathBuf>,
+    metadata_bytes: usize,
 }
 
 fn validate_path(path: &Path) -> io::Result<()> {
@@ -164,18 +175,42 @@ pub(super) fn directory(state: &Dir) -> io::Result<Dir> {
 }
 
 impl Sources {
+    pub(super) fn next_epoch(self) -> Self {
+        Self {
+            limits: self.limits,
+            ..Self::default()
+        }
+    }
+
     pub(super) fn contains(&self, path: &Path) -> bool {
-        self.records.contains_key(path)
+        self.limits.files.contains(path)
+    }
+
+    fn write_metadata(&mut self, state: &Dir, name: &OsStr, bytes: &[u8]) -> io::Result<()> {
+        let previous = self.record_sizes.get(name).copied().unwrap_or(0);
+        let total = self
+            .limits
+            .metadata_bytes
+            .saturating_sub(previous)
+            .saturating_add(bytes.len());
+        if bytes.len() as u64 > super::RECORD_LIMIT || total > super::TOTAL_LIMIT {
+            return Err(invalid("source recovery metadata exceeds its size limit"));
+        }
+        write_record(state, name, bytes)?;
+        self.record_sizes.insert(name.to_os_string(), bytes.len());
+        self.limits.metadata_bytes = total;
+        Ok(())
     }
     pub(super) fn record_directories(&mut self, state: &Dir, paths: &[PathBuf]) -> io::Result<()> {
         for path in paths {
             validate_path(path)?;
         }
-        self.directories.extend(paths.iter().cloned());
-        if self.directories.len() > ENTRY_LIMIT {
+        self.limits.directories.extend(paths.iter().cloned());
+        if self.limits.directories.len() > ENTRY_LIMIT {
             return Err(invalid("too many source recovery directories"));
         }
-        write_record(
+        self.directories.extend(paths.iter().cloned());
+        self.write_metadata(
             state,
             OsStr::new("directories.json"),
             &serde_json::to_vec(&self.directories)?,
@@ -220,11 +255,8 @@ impl Sources {
         if record.written.len() > 128 {
             return Err(invalid("too many source writes in one transaction"));
         }
-        write_record(
-            state,
-            OsStr::new(&format!("{key}.json")),
-            &serde_json::to_vec(record)?,
-        )?;
+        let bytes = serde_json::to_vec(record)?;
+        self.write_metadata(state, OsStr::new(&format!("{key}.json")), &bytes)?;
         if current(&parent, name)? != expected {
             return Err(invalid(
                 "source destination changed during delivery; retry after reconciling your edits",
@@ -232,6 +264,12 @@ impl Sources {
         }
         state.rename(&stage, &parent, name)?;
         sync_directory(&parent)?;
+        if cfg!(debug_assertions)
+            && std::env::var_os("LPM_TEST_SOURCE_RECOVERY_PATH")
+                .is_some_and(|value| Path::new(&value) == path)
+        {
+            super::test_pause("after-source-write");
+        }
         Ok(result)
     }
 
@@ -249,11 +287,9 @@ impl Sources {
         if !record.written.contains(&None) {
             record.written.push(None);
         }
-        write_record(
-            state,
-            OsStr::new(&format!("{}.json", record.key())),
-            &serde_json::to_vec(record)?,
-        )?;
+        let record_name = format!("{}.json", record.key());
+        let bytes = serde_json::to_vec(record)?;
+        self.write_metadata(state, OsStr::new(&record_name), &bytes)?;
         if current(&parent, name)? != expected {
             return Err(invalid("source destination changed during removal"));
         }
@@ -271,9 +307,10 @@ impl Sources {
         if self.records.contains_key(path) {
             return Ok(());
         }
-        if self.records.len() >= ENTRY_LIMIT {
+        if !self.limits.files.contains(path) && self.limits.files.len() >= ENTRY_LIMIT {
             return Err(invalid("too many source recovery files"));
         }
+        self.limits.files.insert(path.to_path_buf());
         let record = Record {
             path: path.to_path_buf(),
             original,
@@ -293,7 +330,7 @@ impl Sources {
                 return Err(invalid("source changed while saving its recovery backup"));
             }
         }
-        write_record(
+        self.write_metadata(
             state,
             OsStr::new(&format!("{key}.json")),
             &serde_json::to_vec(&record)?,
@@ -304,12 +341,13 @@ impl Sources {
 
     pub(super) fn load(state: &Dir) -> io::Result<Self> {
         let mut result = Self::default();
+        let mut total_bytes = 0usize;
         for entry in state.entries()? {
             let entry = entry?;
             let name = entry.file_name();
             if name == "directories.json" {
                 result.directories =
-                    serde_json::from_slice(&read_regular(state, &name, super::RECORD_LIMIT)?)?;
+                    serde_json::from_slice(&read_metadata(state, &name, &mut total_bytes)?)?;
                 if result.directories.len() > ENTRY_LIMIT {
                     return Err(invalid("too many source recovery directories"));
                 }
@@ -318,7 +356,7 @@ impl Sources {
                 }
             } else if name.to_str().is_some_and(|name| name.ends_with(".json")) {
                 let record: Record =
-                    serde_json::from_slice(&read_regular(state, &name, super::RECORD_LIMIT)?)?;
+                    serde_json::from_slice(&read_metadata(state, &name, &mut total_bytes)?)?;
                 validate_path(&record.path)?;
                 if name != format!("{}.json", record.key()).as_str()
                     || record.written.len() > 128
@@ -357,7 +395,7 @@ impl Sources {
                     .ok_or_else(|| invalid("missing source name"))?,
             )?) {
                 return Err(invalid(format!(
-                    "Interrupted source delivery found later edits in {}. Your edits were preserved. Original files remain in .lpm/install-recovery/sources. Reconcile this file with its backup, then retry.",
+                    "Interrupted source delivery found later edits in {}. Your edits were preserved. Original files remain in the source recovery journal. Reconcile this file with its backup, then retry.",
                     record.path.display()
                 )));
             }
@@ -417,9 +455,10 @@ impl Sources {
         let mut directories: Vec<_> = self.directories.iter().collect();
         directories.sort_unstable_by_key(|path| std::cmp::Reverse(path.components().count()));
         for path in directories {
-            match parent(root, path)
-                .and_then(|parent| parent.remove_dir(path.file_name().unwrap_or_default()))
-            {
+            match parent(root, path).and_then(|parent| {
+                parent.remove_dir(path.file_name().unwrap_or_default())?;
+                sync_directory(&parent)
+            }) {
                 Ok(()) => {}
                 Err(error)
                     if matches!(
@@ -431,6 +470,60 @@ impl Sources {
         }
         Ok(())
     }
+}
+
+fn read_metadata(state: &Dir, name: &OsStr, total: &mut usize) -> io::Result<Vec<u8>> {
+    let bytes = read_regular(state, name, super::RECORD_LIMIT)?;
+    *total = total.saturating_add(bytes.len());
+    if *total > super::TOTAL_LIMIT {
+        return Err(invalid("source recovery metadata exceeds its size limit"));
+    }
+    Ok(bytes)
+}
+
+pub(super) fn checkpoint_name(sequence: u64) -> String {
+    format!("{CHECKPOINT_PREFIX}{sequence:020}")
+}
+
+pub(super) fn checkpoint(state: &Dir, sequence: u64) -> io::Result<bool> {
+    match state.open_dir_nofollow(DIRECTORY) {
+        Ok(_) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error),
+    }
+    crate::directory_transaction::publish_entry_noreplace(
+        state,
+        OsStr::new(DIRECTORY),
+        state,
+        OsStr::new(&checkpoint_name(sequence)),
+    )?;
+    sync_directory(state)?;
+    super::test_pause("after-source-checkpoint");
+    Ok(true)
+}
+
+pub(super) fn recover(root: &Dir, state: &Dir, location: &Path) -> io::Result<()> {
+    match read_regular(state, OsStr::new(RESTORED), 16) {
+        Ok(bytes) if bytes == b"1\n" => return Ok(()),
+        Ok(_) => return Err(invalid("invalid source recovery restoration marker")),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+    let sources = Sources::load(state)?;
+    sources
+        .validate(root, state)
+        .and_then(|()| sources.restore(root, state))
+        .map_err(|error| {
+            io::Error::new(
+                error.kind(),
+                format!("{error}. Recovery files: {}", location.display()),
+            )
+        })?;
+    super::test_pause("after-source-epoch-restore");
+    // An older move can reuse these paths, so this epoch must never replay twice.
+    write_record(state, OsStr::new(RESTORED), b"1\n")?;
+    super::test_pause("after-source-epoch");
+    Ok(())
 }
 
 pub(super) fn cleanup(state: Dir) -> io::Result<()> {
@@ -550,5 +643,47 @@ mod tests {
         );
         assert_eq!(root.read("saved-vendor/new.js").unwrap(), b"new");
         assert!(!outside.path().join("new.js").exists());
+    }
+    #[test]
+    fn oversized_directory_metadata_is_rejected_before_publication() {
+        let (_temp, _root, state) = fixture();
+        let mut sources = Sources::default();
+        let padding = "a".repeat(1700);
+        let directories: Vec<_> = (0..20_000)
+            .map(|index| PathBuf::from(format!("{padding}/{index}")))
+            .collect();
+        assert!(sources.record_directories(&state, &directories).is_err());
+        assert!(!state.try_exists("directories.json").unwrap());
+    }
+
+    #[test]
+    fn source_file_limits_survive_epoch_checkpoints() {
+        let (_temp, root, state) = fixture();
+        let mut sources = Sources::default();
+        sources
+            .limits
+            .files
+            .extend((0..ENTRY_LIMIT).map(|i| PathBuf::from(format!("old-{i}"))));
+        let mut next = sources.next_epoch();
+        assert!(
+            next.write(&root, &state, PathBuf::from("new.js"), None, |file| file
+                .write_all(b"new"))
+                .is_err()
+        );
+        assert!(!root.try_exists("new.js").unwrap());
+    }
+
+    #[test]
+    fn source_metadata_limits_survive_epoch_checkpoints() {
+        let (_temp, root, state) = fixture();
+        let mut sources = Sources::default();
+        sources.limits.metadata_bytes = super::super::TOTAL_LIMIT - 1;
+        let mut next = sources.next_epoch();
+        assert!(
+            next.write(&root, &state, PathBuf::from("new.js"), None, |file| file
+                .write_all(b"new"))
+                .is_err()
+        );
+        assert!(!root.try_exists("new.js").unwrap());
     }
 }
