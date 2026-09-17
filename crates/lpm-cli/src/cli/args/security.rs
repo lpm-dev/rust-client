@@ -68,11 +68,11 @@ pub(crate) struct AuditArgs {
     #[command(subcommand)]
     pub(crate) action: Option<commands::audit::AuditCmd>,
 
-    /// Minimum severity level to report (info/low, moderate/medium, high, critical).
+    /// Minimum severity for the report and failure policy (info/low, moderate/medium, high, critical).
     #[arg(long, value_enum, conflicts_with_all = ["secrets", "fix"])]
     pub(crate) level: Option<commands::audit::AuditLevel>,
 
-    /// CI exit code policy (`vuln`, `behavior`, or `all`).
+    /// CI exit code policy (`vuln`, `behavior`, `secrets`, or `all`).
     #[arg(
         long,
         value_name = "POLICY",
@@ -81,7 +81,9 @@ pub(crate) struct AuditArgs {
   vuln     — only confirmed vulnerabilities (OSV/registry)\n\
   behavior — only critical/high behavioral flags\n\
   secrets  — only hardcoded secret findings from --secrets mode\n\
-  all      — vulnerabilities, behavioral flags, or secrets (default)"
+  all      — vulnerabilities and high/critical findings in regular mode, or secrets in --secrets mode\n\n\
+Without --fail-on, regular audits fail on vulnerabilities and critical findings.\n\
+Secret scans fail on any secret finding. Incomplete scans always fail."
     )]
     pub(crate) fail_on: Option<String>,
 

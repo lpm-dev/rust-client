@@ -263,7 +263,7 @@ fn discover_packages_with_options(
     // No lockfile found — try node_modules/ fallback from start_dir
     let nm_dir = start_dir.join("node_modules");
     if nm_dir.is_dir() {
-        return Ok(discover_from_node_modules(start_dir));
+        return discover_from_node_modules(start_dir);
     }
 
     Err(LpmError::NotFound(
@@ -644,12 +644,12 @@ fn discover_from_bun_lockfile(
 
 // ─── node_modules fallback (degraded mode) ──────────────────────────────────
 
-fn discover_from_node_modules(project_root: &Path) -> DiscoveryResult {
+fn discover_from_node_modules(project_root: &Path) -> Result<DiscoveryResult, LpmError> {
     let nm_dir = project_root.join("node_modules");
 
     let mut entries: Vec<(DiscoveredPackage, Vec<String>, std::path::PathBuf, String)> = Vec::new();
     let mut visited = std::collections::HashSet::new();
-    collect_node_modules_entries(project_root, &nm_dir, &mut entries, &mut visited);
+    collect_node_modules_entries(project_root, &nm_dir, &mut entries, &mut visited)?;
 
     let scope_index = NodeModulesScopeIndex::new(project_root, &entries);
     let mut resolved_dependencies = Vec::with_capacity(entries.len());
@@ -675,7 +675,7 @@ fn discover_from_node_modules(project_root: &Path) -> DiscoveryResult {
         })
         .collect();
 
-    DiscoveryResult {
+    Ok(DiscoveryResult {
         manager: ManagerKind::FallbackNodeModules,
         lockfile_path: None,
         project_root: project_root.to_path_buf(),
@@ -685,7 +685,29 @@ fn discover_from_node_modules(project_root: &Path) -> DiscoveryResult {
         lpm_lockfile: None,
         lpm_lockfile_content: None,
         workspace_root: None,
+    })
+}
+
+fn inspect_fallback_directory(path: &Path) -> Result<bool, LpmError> {
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(fallback_inventory_error(path, error)),
+    };
+    if lpm_common::is_symlink_or_junction(&metadata) {
+        return Err(fallback_inventory_error(
+            path,
+            "package links require a supported lockfile",
+        ));
     }
+    Ok(metadata.is_dir())
+}
+
+fn fallback_inventory_error(path: &Path, error: impl std::fmt::Display) -> LpmError {
+    LpmError::Script(format!(
+        "incomplete node_modules inventory at {}: {error}",
+        path.display()
+    ))
 }
 
 fn collect_node_modules_entries(
@@ -693,45 +715,34 @@ fn collect_node_modules_entries(
     node_modules: &Path,
     entries: &mut Vec<(DiscoveredPackage, Vec<String>, std::path::PathBuf, String)>,
     visited: &mut std::collections::HashSet<std::path::PathBuf>,
-) {
-    let Ok(metadata) = std::fs::symlink_metadata(node_modules) else {
-        return;
-    };
-    if !metadata.is_dir() || lpm_common::is_symlink_or_junction(&metadata) {
-        return;
+) -> Result<(), LpmError> {
+    if !inspect_fallback_directory(node_modules)? {
+        return Ok(());
     }
-    let Ok(identity) = node_modules.canonicalize() else {
-        return;
-    };
+    let identity = node_modules
+        .canonicalize()
+        .map_err(|error| fallback_inventory_error(node_modules, error))?;
     if !visited.insert(identity) {
-        return;
+        return Ok(());
     }
-    let Ok(dir_entries) = std::fs::read_dir(node_modules) else {
-        return;
-    };
-
-    for entry in dir_entries.flatten() {
+    let dir_entries = std::fs::read_dir(node_modules)
+        .map_err(|error| fallback_inventory_error(node_modules, error))?;
+    for entry in dir_entries {
+        let entry = entry.map_err(|error| fallback_inventory_error(node_modules, error))?;
         let name = entry.file_name().to_string_lossy().to_string();
         if name.starts_with('.') {
             continue;
         }
-        let Ok(metadata) = std::fs::symlink_metadata(entry.path()) else {
-            continue;
-        };
-        if !metadata.is_dir() || lpm_common::is_symlink_or_junction(&metadata) {
+        if !inspect_fallback_directory(&entry.path())? {
             continue;
         }
-
         if name.starts_with('@') {
-            let Ok(scoped_entries) = std::fs::read_dir(entry.path()) else {
-                continue;
-            };
-            for scoped_entry in scoped_entries.flatten() {
-                let Ok(scoped_metadata) = std::fs::symlink_metadata(scoped_entry.path()) else {
-                    continue;
-                };
-                if !scoped_metadata.is_dir() || lpm_common::is_symlink_or_junction(&scoped_metadata)
-                {
+            let scoped_entries = std::fs::read_dir(entry.path())
+                .map_err(|error| fallback_inventory_error(&entry.path(), error))?;
+            for scoped_entry in scoped_entries {
+                let scoped_entry =
+                    scoped_entry.map_err(|error| fallback_inventory_error(&entry.path(), error))?;
+                if !inspect_fallback_directory(&scoped_entry.path())? {
                     continue;
                 }
                 let scoped_name = scoped_entry.file_name().to_string_lossy().to_string();
@@ -742,12 +753,13 @@ fn collect_node_modules_entries(
                     &full_name,
                     entries,
                     visited,
-                );
+                )?;
             }
         } else {
-            collect_node_modules_package(project_root, &entry.path(), &name, entries, visited);
+            collect_node_modules_package(project_root, &entry.path(), &name, entries, visited)?;
         }
     }
+    Ok(())
 }
 
 fn collect_node_modules_package(
@@ -756,23 +768,20 @@ fn collect_node_modules_package(
     name: &str,
     entries: &mut Vec<(DiscoveredPackage, Vec<String>, std::path::PathBuf, String)>,
     visited: &mut std::collections::HashSet<std::path::PathBuf>,
-) {
-    if let Some((package, dependencies)) =
-        read_package_from_node_modules(project_root, package_dir, name)
-    {
-        entries.push((
-            package,
-            dependencies,
-            package_dir.to_path_buf(),
-            name.to_string(),
-        ));
-    }
+) -> Result<(), LpmError> {
+    let (package, dependencies) = read_package_from_node_modules(project_root, package_dir, name)?;
+    entries.push((
+        package,
+        dependencies,
+        package_dir.to_path_buf(),
+        name.to_string(),
+    ));
     collect_node_modules_entries(
         project_root,
         &package_dir.join("node_modules"),
         entries,
         visited,
-    );
+    )
 }
 
 struct NodeModulesScopeIndex<'a> {
@@ -871,20 +880,30 @@ fn read_package_from_node_modules(
     project_root: &Path,
     pkg_dir: &Path,
     name: &str,
-) -> Option<(DiscoveredPackage, Vec<String>)> {
+) -> Result<(DiscoveredPackage, Vec<String>), LpmError> {
     let pkg_json_path = pkg_dir.join("package.json");
-    let content =
-        lpm_common::read_text_file_capped(&pkg_json_path, lpm_common::CONFIG_FILE_SIZE_CAP_BYTES)
-            .ok()?;
-    let json: serde_json::Value = serde_json::from_str(&content).ok()?;
-    let version = json.get("version")?.as_str()?.to_string();
+    let content = lpm_common::read_text_file_capped_nofollow(
+        &pkg_json_path,
+        lpm_common::CONFIG_FILE_SIZE_CAP_BYTES,
+    )
+    .map_err(|error| fallback_inventory_error(&pkg_json_path, error))?;
+    let json: serde_json::Value = serde_json::from_str(lpm_common::strip_utf8_bom_str(&content))
+        .map_err(|error| fallback_inventory_error(&pkg_json_path, error))?;
+    let version = json
+        .get("version")
+        .and_then(serde_json::Value::as_str)
+        .filter(|version| !version.is_empty())
+        .ok_or_else(|| fallback_inventory_error(&pkg_json_path, "missing string package version"))?
+        .to_string();
     let canonical_name = json
         .get("name")
         .and_then(|value| value.as_str())
         .unwrap_or(name)
         .to_string();
 
-    let rel_path = pkg_dir.strip_prefix(project_root).ok()?;
+    let rel_path = pkg_dir
+        .strip_prefix(project_root)
+        .map_err(|error| fallback_inventory_error(pkg_dir, error))?;
     let path = rel_path.to_string_lossy().to_string();
 
     let mut dep_names = Vec::new();
@@ -901,7 +920,7 @@ fn read_package_from_node_modules(
     dep_names.sort_unstable();
     dep_names.dedup();
 
-    Some((
+    Ok((
         DiscoveredPackage {
             name: canonical_name,
             version,
@@ -1428,7 +1447,7 @@ mod tests {
         )
         .unwrap();
 
-        let result = discover_from_node_modules(dir.path());
+        let result = discover_from_node_modules(dir.path()).unwrap();
         let package = result
             .packages
             .iter()
@@ -1462,7 +1481,7 @@ mod tests {
         )
         .unwrap();
 
-        let result = discover_from_node_modules(dir.path());
+        let result = discover_from_node_modules(dir.path()).unwrap();
 
         assert_eq!(result.packages.len(), 2);
         assert!(result.packages.iter().any(|package| {
@@ -1489,7 +1508,7 @@ mod tests {
         )
         .unwrap();
 
-        let result = discover_from_node_modules(dir.path());
+        let result = discover_from_node_modules(dir.path()).unwrap();
 
         assert_eq!(result.packages.len(), 1);
         assert_eq!(result.packages[0].name, "canonical-package");
@@ -1516,7 +1535,7 @@ mod tests {
         )
         .unwrap();
 
-        let result = discover_from_node_modules(dir.path());
+        let result = discover_from_node_modules(dir.path()).unwrap();
         let consumer = result
             .packages
             .iter()
@@ -2221,7 +2240,7 @@ packages:
 
     #[cfg(windows)]
     #[test]
-    fn node_modules_fallback_does_not_follow_package_junctions() {
+    fn node_modules_fallback_rejects_package_junctions() {
         let project = tempfile::tempdir().unwrap();
         let outside = tempfile::tempdir().unwrap();
         fs::create_dir_all(project.path().join("node_modules")).unwrap();
@@ -2236,9 +2255,15 @@ packages:
         )
         .unwrap();
 
-        let discovery = discover_from_node_modules(project.path());
+        let error = discover_from_node_modules(project.path())
+            .err()
+            .expect("junction must fail");
 
-        assert!(discovery.packages.is_empty());
+        assert!(
+            error
+                .to_string()
+                .contains("package links require a supported lockfile")
+        );
     }
 
     #[test]

@@ -7,6 +7,8 @@
 
 mod support;
 
+mod audit_contract;
+
 use support::mock_registry::{
     MockRegistry, RegistrySigningFixture, compute_integrity, make_tarball,
     make_tarball_from_pkg_json, make_tarball_with_files,
@@ -73,7 +75,7 @@ fn audit_help_lists_fail_on_policies_on_separate_lines() {
         "expected secrets policy on its own help line; got:\n{combined}"
     );
     assert!(
-        combined.contains("all      — vulnerabilities, behavioral flags, or secrets (default)"),
+        combined.contains("all      — vulnerabilities and high/critical findings in regular mode, or secrets in --secrets mode"),
         "expected all policy on its own help line; got:\n{combined}"
     );
     assert!(

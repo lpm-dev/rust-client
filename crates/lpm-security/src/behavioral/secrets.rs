@@ -37,6 +37,9 @@ pub struct SecretScanResult {
     /// Resource limit that stopped the scan before completion.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub limit_exceeded: Option<SecretScanLimit>,
+    /// Input failure that prevented a complete directory scan.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub incomplete_reason: Option<String>,
 }
 
 impl SecretScanResult {
@@ -60,6 +63,9 @@ impl SecretScanResult {
         self.files_scanned += other.files_scanned;
         if self.limit_exceeded.is_none() {
             self.limit_exceeded = other.limit_exceeded;
+        }
+        if self.incomplete_reason.is_none() {
+            self.incomplete_reason = other.incomplete_reason.clone();
         }
     }
 }
@@ -506,7 +512,15 @@ pub fn scan_directory_with_budget(
         })
         .build();
 
-    for entry in walker.flatten() {
+    for entry in walker {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) => {
+                result.incomplete_reason =
+                    Some(format!("cannot enumerate package sources: {error}"));
+                return result;
+            }
+        };
         if !entry.file_type().is_some_and(|t| t.is_file()) {
             continue;
         }
@@ -524,11 +538,13 @@ pub fn scan_directory_with_budget(
         let content = if is_blocked_file(&rel_path) || !is_scannable_file(&rel_path) {
             Vec::new()
         } else {
-            let Ok(content) = lpm_common::read_file_capped(path, MAX_SCANNABLE_FILE_BYTES as u64)
-            else {
-                continue;
-            };
-            content
+            match lpm_common::read_file_capped(path, MAX_SCANNABLE_FILE_BYTES as u64) {
+                Ok(content) => content,
+                Err(error) => {
+                    result.incomplete_reason = Some(format!("cannot scan {rel_path}: {error}"));
+                    return result;
+                }
+            }
         };
         let mut file_scan = scan_file_content_after_file_charge(&content, &rel_path, budget);
         result.matches.append(&mut file_scan.matches);
@@ -825,6 +841,13 @@ mod tests {
 
         assert!(!result.has_secrets());
         assert_eq!(result.files_scanned, 0);
+        assert!(
+            result
+                .incomplete_reason
+                .as_deref()
+                .unwrap()
+                .contains("bundle.js")
+        );
     }
 
     #[test]
@@ -955,6 +978,7 @@ mod tests {
             }],
             files_scanned: 1,
             limit_exceeded: None,
+            incomplete_reason: None,
         };
         let b = SecretScanResult {
             matches: vec![SecretMatch {
@@ -965,6 +989,7 @@ mod tests {
             }],
             files_scanned: 2,
             limit_exceeded: None,
+            incomplete_reason: None,
         };
         a.merge(&b);
         assert_eq!(a.matches.len(), 2);
