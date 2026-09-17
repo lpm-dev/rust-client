@@ -604,6 +604,31 @@ pub fn link_v2_finalize(
     link_v2_finalize_inner(project_dir, plan, store, self_package_name, false)
 }
 
+/// Refresh project copies and executables after patches mutate existing link entries.
+/// The original plan preserves the resolved dependency and peer context.
+pub fn refresh_links_after_package_mutation(
+    project_dir: &Path,
+    plan: &LinkPlanV2,
+    store: &Store,
+) -> Result<usize, LpmError> {
+    create_root_symlinks(project_dir, &plan.augmented_targets, store, &plan.key_map)?;
+    let compatibility_links = create_project_compatibility_links(
+        project_dir,
+        &plan.augmented_targets,
+        store,
+        &plan.key_map,
+        &plan.compatibility_bin_names,
+        true,
+    )?;
+    create_bin_links_v2(
+        project_dir,
+        &plan.augmented_targets,
+        store,
+        &plan.key_map,
+        &compatibility_links,
+    )
+}
+
 fn link_v2_finalize_inner(
     project_dir: &Path,
     plan: &LinkPlanV2,

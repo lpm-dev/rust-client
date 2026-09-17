@@ -20,8 +20,8 @@
 
 use crate::install_ui;
 use crate::patch_engine::{
-    GeneratedPatch, PatchSelector, STAGING_BREADCRUMB_FILE, copy_store_to_staging, generate_patch,
-    parse_patch_selector, resolve_patch_selector,
+    self, GeneratedPatch, PatchSelector, STAGING_BREADCRUMB_FILE, copy_store_to_staging,
+    generate_patch, parse_patch_selector, resolve_patch_selector,
 };
 use lpm_common::LpmError;
 use lpm_lockfile::{Lockfile, LockfilePatch};
@@ -444,6 +444,13 @@ async fn run_patch_commit_inner(
     let patches_dir_existed = std::fs::symlink_metadata(&patches_dir)
         .is_ok_and(|metadata| metadata.is_dir() && !metadata.file_type().is_symlink());
     let patch_file_abs = project_dir.join(&patch_file_rel);
+    patch_engine::validate_authored_patch(
+        &store_path,
+        &patch_file_abs,
+        generated.diff.as_bytes(),
+        name,
+        version,
+    )?;
     let patch_sha256 = crate::patch_fs::sha256_bytes(generated.diff.as_bytes());
     let project_dirs = [project_dir.to_path_buf()];
     let mutation =
@@ -722,6 +729,16 @@ fn remove_package_json_patches(
     }
 }
 
+fn same_patch_path(project_dir: &Path, left: &Path, right: &Path) -> bool {
+    left == right
+        || project_dir
+            .join(left)
+            .canonicalize()
+            .ok()
+            .zip(project_dir.join(right).canonicalize().ok())
+            .is_some_and(|(left, right)| left == right)
+}
+
 fn plan_package_json_patch_removal(
     project_dir: &Path,
     selectors: &[String],
@@ -818,11 +835,12 @@ fn plan_package_json_patch_removal(
             .to_string();
         let normalized_path = &normalized_paths[key];
 
-        let (deleted_patch_file, retained_reason) = if dry_run {
-            (false, Some("dry-run".to_string()))
-        } else if keep_file {
+        let (deleted_patch_file, retained_reason) = if keep_file {
             (false, Some("keep-file".to_string()))
-        } else if remaining_file_refs.contains(normalized_path) {
+        } else if remaining_file_refs
+            .iter()
+            .any(|other| same_patch_path(project_dir, other, normalized_path))
+        {
             (false, Some("still referenced by another patch".to_string()))
         } else {
             if !is_patch_artifact_path(normalized_path) {
@@ -840,6 +858,11 @@ fn plan_package_json_patch_removal(
             }
         };
 
+        let (deleted_patch_file, retained_reason) = if dry_run {
+            (false, Some("dry-run".to_string()))
+        } else {
+            (deleted_patch_file, retained_reason)
+        };
         removals.push(PatchRemoval {
             key: key.clone(),
             patch_file,
@@ -1010,6 +1033,22 @@ fn plan_package_json_patch_update(
         LpmError::Script("package.json `lpm.patchedDependencies` is not an object".into())
     })?;
 
+    for (other_key, entry) in patches_obj
+        .iter()
+        .filter(|(other_key, _)| *other_key != key)
+    {
+        if entry
+            .get("path")
+            .and_then(serde_json::Value::as_str)
+            .and_then(|raw| crate::patch_fs::validate_manifest_patch_path(raw).ok())
+            .is_some_and(|path| same_patch_path(project_dir, &path, &new_path))
+        {
+            return Err(LpmError::Script(format!(
+                "patch destination {patch_file_rel:?} is still referenced by another patch ({other_key}); move that artifact and update its registration before committing"
+            )));
+        }
+    }
+
     let prior_path = patches_obj
         .get(key)
         .and_then(|entry| entry.get("path"))
@@ -1023,12 +1062,12 @@ fn plan_package_json_patch_update(
                     .get("path")
                     .and_then(serde_json::Value::as_str)
                     .and_then(|raw| crate::patch_fs::validate_manifest_patch_path(raw).ok())
-                    .is_some_and(|other| other == *prior)
+                    .is_some_and(|other| same_patch_path(project_dir, &other, prior))
         })
     });
     let obsolete_patch = match prior_path {
         Some(prior)
-            if prior != new_path
+            if !same_patch_path(project_dir, &prior, &new_path)
                 && !prior_path_is_shared
                 && is_patch_artifact_path(&prior)
                 && project_root.regular_file_exists(&prior)? =>

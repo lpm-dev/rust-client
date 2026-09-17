@@ -550,6 +550,8 @@ pub(in crate::commands::install) async fn run(
             ));
         }
     };
+    let mut omitted_patch_targets =
+        registered_patch_targets(current_patches, install_packages.iter())?;
     filter_dependency_engine_packages(&mut install_packages, dependency_engine_policy)?;
     let mut platform_skipped = filter_platform_packages(&mut install_packages)?;
     if graph_source == ExperimentalResolverGraphSource::Lockfile {
@@ -713,7 +715,7 @@ pub(in crate::commands::install) async fn run(
     };
     stage_timings.link_task_await_ms = link_outcome.task_await_ms;
     stage_timings.link_finalize_ms = link_outcome.finalize_ms;
-    let link_result = link_outcome.result;
+    let mut link_result = link_outcome.result;
     let workspace_links_created = link_workspace_members(project_dir, workspace_member_deps)?;
     if workspace_links_created > 0 && !json_output {
         output::info_line(crate::install_ui::terminal_line!(
@@ -721,14 +723,32 @@ pub(in crate::commands::install) async fn run(
             install_ui::bold(&workspace_links_created.to_string())
         ));
     }
+    retain_omitted_patch_targets(&mut omitted_patch_targets, install_packages.iter());
+    let baseline_index = store_v2_handle
+        .is_some()
+        .then(|| lpm_store::V2BaselineIndex::for_project(project_dir, lpm_root));
     let applied_patches = apply_patches_for_install(
         current_patches,
         current_lockfile_patches,
         &link_result,
         &store,
         project_dir,
-        json_output,
+        &omitted_patch_targets,
+        baseline_index.as_ref(),
     )?;
+    if !applied_patches.is_empty()
+        && let Some(store_v2) = store_v2_handle.as_deref()
+    {
+        link_result.bin_linked = refresh_links_after_patches(
+            project_dir,
+            &install_packages,
+            &link_targets,
+            store_v2,
+            linker_mode,
+            compatibility_bin_names,
+            v2_event_plan.as_ref().map(|(plan, _)| plan.as_ref()),
+        )?;
+    }
     persist_patch_state(
         project_dir,
         current_patches,

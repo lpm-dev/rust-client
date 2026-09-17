@@ -1114,6 +1114,12 @@ pub(super) async fn run_offline_install_phase(
 
     let ambient_peer_installs = fast.lockfile.ambient_peer_installs.clone();
     let mut locked = fast.packages;
+    let mut omitted_patch_targets = registered_patch_targets(
+        current_patches,
+        locked
+            .iter()
+            .chain(v2_workspace_root_pre_resolve.install_pkgs.iter()),
+    )?;
     if omit_policy.dev {
         filter_dev_packages(&mut locked, production_dependency_names);
     }
@@ -1206,6 +1212,10 @@ pub(super) async fn run_offline_install_phase(
         filter_optional_packages(&mut ephemeral_packages, root_optional_dependency_names);
     }
 
+    retain_omitted_patch_targets(
+        &mut omitted_patch_targets,
+        locked.iter().chain(ephemeral_packages.iter()),
+    );
     run_link_and_finish(
         client,
         project_dir,
@@ -1225,6 +1235,7 @@ pub(super) async fn run_offline_install_phase(
         force,
         workspace_member_deps,
         current_lockfile_patches,
+        &omitted_patch_targets,
         script_policy_override,
         lpm_root,
         global_config,

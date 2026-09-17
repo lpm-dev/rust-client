@@ -85,7 +85,7 @@ pub struct V2BaselineIndex {
     ambiguous_integrities: HashSet<String>,
     by_graph_digest: HashMap<String, Arc<InstalledPackageBaseline>>,
     graph_dependencies: HashMap<String, Vec<crate::v2::link_meta::LinkMetaDep>>,
-    graph_digest_by_package_dir: HashMap<PathBuf, String>,
+    graph_digest_by_package_dir: HashMap<PathBuf, (String, Arc<InstalledPackageBaseline>)>,
 }
 
 impl V2BaselineIndex {
@@ -289,7 +289,7 @@ impl V2BaselineIndex {
                     .package_dir
                     .canonicalize()
                     .unwrap_or_else(|_| baseline.package_dir.clone()),
-                graph_digest.clone(),
+                (graph_digest.clone(), Arc::clone(&baseline)),
             );
             by_graph_digest
                 .entry(graph_digest.clone())
@@ -393,7 +393,7 @@ impl V2BaselineIndex {
                         .package_dir
                         .canonicalize()
                         .unwrap_or_else(|_| baseline.package_dir.clone()),
-                    meta.graph_key_digest_hex.clone(),
+                    (meta.graph_key_digest_hex.clone(), Arc::clone(&baseline)),
                 );
                 by_graph_digest
                     .entry(meta.graph_key_digest_hex.clone())
@@ -468,7 +468,15 @@ impl V2BaselineIndex {
         let canonical = package_dir.canonicalize().ok()?;
         self.graph_digest_by_package_dir
             .get(&canonical)
-            .map(String::as_str)
+            .map(|(digest, _)| digest.as_str())
+    }
+
+    /// Resolve a materialized directory without conflating graph digests across store versions.
+    pub fn lookup_by_package_dir(&self, package_dir: &Path) -> Option<&InstalledPackageBaseline> {
+        let canonical = package_dir.canonicalize().ok()?;
+        self.graph_digest_by_package_dir
+            .get(&canonical)
+            .map(|(_, baseline)| baseline.as_ref())
     }
 }
 
