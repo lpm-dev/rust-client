@@ -49,16 +49,13 @@ pub fn remove_editor_skills(project_dir: &Path, package_short_name: &str) {
         let Ok(target) = directory.read_link_contents(&filename) else {
             continue;
         };
-        let target = cursor_rules.join(target);
-        let expected = project_dir
-            .join(".lpm/skills")
-            .join(package_short_name)
-            .join(skill_file);
-        let Some(actual) = crate::project_fs::canonicalize_with_missing_tail(&target) else {
-            continue;
-        };
-        if crate::project_fs::canonicalize_with_missing_tail(&expected).as_ref() == Some(&actual)
-            && let Err(error) = directory.remove_file_or_symlink(&filename)
+        if is_package_skill_target(
+            project_dir,
+            package_short_name,
+            skill_file,
+            &cursor_rules,
+            &target,
+        ) && let Err(error) = directory.remove_file_or_symlink(&filename)
             && error.kind() != std::io::ErrorKind::NotFound
         {
             tracing::debug!(
@@ -67,6 +64,21 @@ pub fn remove_editor_skills(project_dir: &Path, package_short_name: &str) {
             );
         }
     }
+}
+
+pub(crate) fn is_package_skill_target(
+    project: &Path,
+    package: &str,
+    skill_file: &str,
+    link_parent: &Path,
+    target: &Path,
+) -> bool {
+    let expected = project.join(".lpm/skills").join(package).join(skill_file);
+    let Some(actual) = crate::project_fs::canonicalize_with_missing_tail(&link_parent.join(target))
+    else {
+        return false;
+    };
+    crate::project_fs::canonicalize_with_missing_tail(&expected).as_ref() == Some(&actual)
 }
 
 #[cfg(test)]

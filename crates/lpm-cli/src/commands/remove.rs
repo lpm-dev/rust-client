@@ -302,19 +302,26 @@ struct RemovalTransaction {
     quarantine: tempfile::TempDir,
     moves: Vec<MoveEntry>,
     committed: bool,
+    durable: bool,
 }
 
 impl RemovalTransaction {
     fn new(project_dir: &Path) -> Result<Self, LpmError> {
         let canonical_project = project_dir.canonicalize().map_err(LpmError::Io)?;
-        let quarantine = tempfile::Builder::new()
+        let mut quarantine = tempfile::Builder::new()
             .prefix(".source-remove-")
             .tempdir_in(canonical_project.join(".lpm"))
             .map_err(LpmError::Io)?;
+        let durable = crate::install_recovery::source_moves_active();
+        if durable {
+            crate::install_recovery::register_source_archive(quarantine.path())?;
+            quarantine.disable_cleanup(true);
+        }
         Ok(Self {
             project_dir: project_dir.to_path_buf(),
             canonical_project,
             quarantine,
+            durable,
             moves: Vec::new(),
             committed: false,
         })
@@ -382,7 +389,11 @@ impl RemovalTransaction {
         let destination = self.resolve_path(destination)?;
         self.validate_parent(&source)?;
         self.validate_parent(&destination)?;
-        std::fs::rename(&source, &destination).map_err(LpmError::Io)?;
+        if self.durable {
+            crate::install_recovery::move_source(&source, &destination, None)?;
+        } else {
+            std::fs::rename(&source, &destination).map_err(LpmError::Io)?;
+        }
         self.moves.push(MoveEntry {
             source,
             destination,
@@ -403,10 +414,21 @@ impl RemovalTransaction {
         let destination = self.resolve_path(destination)?;
         self.validate_parent(&source)?;
         self.validate_parent(&destination)?;
+        if self.durable {
+            crate::install_recovery::move_source(&source, &destination, destination_mode)?;
+            self.moves.push(MoveEntry {
+                source,
+                destination,
+                destination_guard: None,
+                #[cfg(unix)]
+                source_permissions: None,
+            });
+            return Ok(());
+        }
         #[cfg(unix)]
         let source_permissions = regular_file_permissions(&source)?;
+        let destination_guard = Some(RemovalDestinationGuard::from_path(&source)?);
         std::fs::rename(&source, &destination).map_err(LpmError::Io)?;
-        let destination_guard = Some(RemovalDestinationGuard::from_path(&destination)?);
         self.moves.push(MoveEntry {
             source,
             destination,
@@ -459,7 +481,7 @@ impl RemovalTransaction {
 
 impl Drop for RemovalTransaction {
     fn drop(&mut self) {
-        if self.committed {
+        if self.durable || self.committed {
             return;
         }
         let mut rollback_incomplete = false;
@@ -738,8 +760,25 @@ fn plan_skill_removal(
             editor_links.reserve(skill_names.len());
             for skill_name in &skill_names {
                 let path = rules.join(format!("{recorded_short}--{skill_name}.md"));
-                if let Some(fingerprint) = fingerprint_editor_link(&path)? {
-                    editor_links.push(PlannedEditorLink { path, fingerprint });
+                match std::fs::symlink_metadata(&path) {
+                    Ok(metadata) if lpm_common::is_symlink_or_junction(&metadata) => {}
+                    Ok(_) => continue,
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                    Err(error) => return Err(LpmError::Io(error)),
+                }
+                if let Some(EditorLinkFingerprint::Link(target)) = fingerprint_editor_link(&path)?
+                    && crate::editor_skills::is_package_skill_target(
+                        project_dir,
+                        recorded_short,
+                        &format!("{skill_name}.md"),
+                        &rules,
+                        &target,
+                    )
+                {
+                    editor_links.push(PlannedEditorLink {
+                        path,
+                        fingerprint: EditorLinkFingerprint::Link(target),
+                    });
                 }
             }
         }
@@ -1197,11 +1236,9 @@ impl OwnedDirectoryCleanup {
     }
 
     pub(crate) fn stage_in(mut self, transaction: &mut crate::manifest_tx::ManifestTransaction) {
-        let rollback = self
-            .rollback
-            .take()
-            .expect("active directory cleanup owns rollback state");
-        transaction.on_rollback(move || rollback.restore_best_effort());
+        if let Some(rollback) = self.rollback.take() {
+            transaction.on_rollback(move || rollback.restore_best_effort());
+        }
     }
 
     pub(crate) fn commit(mut self) {
@@ -1456,14 +1493,22 @@ fn prune_owned_empty_directories_with_operations(
     let mut tree = owned_directory_tree(&directories)?;
     let root = open_removal_root_directory(canonical_project)?;
     validate_owned_directory_children(&root, &tree)?;
-    match prune_owned_directory_children(&root, &mut tree, &mut on_prune_operation) {
+    match prune_owned_directory_children(
+        canonical_project,
+        &root,
+        &mut tree,
+        &mut on_prune_operation,
+    ) {
         Ok(removed) => Ok(OwnedDirectoryCleanup {
             removed,
-            rollback: Some(OwnedDirectoryRollback {
-                canonical_project: canonical_project.to_path_buf(),
-                tree,
+            rollback: (!crate::install_recovery::source_moves_active()).then(|| {
+                OwnedDirectoryRollback {
+                    canonical_project: canonical_project.to_path_buf(),
+                    tree,
+                }
             }),
         }),
+        Err(error) if crate::install_recovery::source_moves_active() => Err(error),
         Err(error) => {
             restore_pruned_directories_with(&root, &tree, &mut on_restore_operation).map_err(
                 |rollback_error| {
@@ -1480,6 +1525,7 @@ fn prune_owned_empty_directories_with_operations(
 }
 
 fn prune_owned_directory_children(
+    canonical_project: &Path,
     root: &Dir,
     tree: &mut OwnedDirectoryTree,
     on_operation: &mut impl FnMut(
@@ -1527,6 +1573,7 @@ fn prune_owned_directory_children(
                         )));
                     }
                     if quarantine_and_prune_owned_directory(
+                        canonical_project,
                         &parent,
                         current,
                         &mut tree.nodes[child],
@@ -1539,6 +1586,7 @@ fn prune_owned_directory_children(
             }
         }
         if quarantine_and_prune_owned_directory(
+            canonical_project,
             root,
             current,
             &mut tree.nodes[root_index],
@@ -1551,6 +1599,7 @@ fn prune_owned_directory_children(
 }
 
 fn quarantine_and_prune_owned_directory(
+    canonical_project: &Path,
     parent: &Dir,
     opened: Dir,
     node: &mut OwnedDirectoryNode,
@@ -1563,6 +1612,14 @@ fn quarantine_and_prune_owned_directory(
 ) -> Result<bool, LpmError> {
     if !node.owned {
         return Ok(false);
+    }
+    if crate::install_recovery::source_moves_active() {
+        return crate::install_recovery::prune_source_directory(
+            canonical_project,
+            &node.relative,
+            &opened,
+        )
+        .map_err(LpmError::Io);
     }
     let expected_identity = directory_identity(&opened).map_err(LpmError::Io)?;
     let (private_name, private_directory) = crate::directory_transaction::create_private_directory(
@@ -2742,6 +2799,7 @@ pub async fn run(project_dir: &Path, package: &str, json_output: bool) -> Result
 }
 
 async fn run_locked(project_dir: &Path, package: &str) -> Result<LockedRemoveResult, LpmError> {
+    crate::install_recovery::enable_source_recovery();
     let (mut state, state_snapshot) =
         crate::added_sources_state::load_state_with_snapshot(project_dir)?;
     let package_key = manifest_lookup_keys(package)
@@ -2916,7 +2974,11 @@ async fn run_locked(project_dir: &Path, package: &str) -> Result<LockedRemoveRes
                     manifest_path.display()
                 ))
             })?;
-        lpm_common::write_file_atomic(&manifest_path, &manifest_body).map_err(LpmError::Io)?;
+        let expected = lpm_common::read_text_file_capped(
+            &manifest_path,
+            lpm_common::CONFIG_FILE_SIZE_CAP_BYTES,
+        )?;
+        crate::install_recovery::write_manifest(&manifest_path, &expected, &manifest_body)?;
         match std::fs::remove_file(&install_hash) {
             Ok(()) => {}
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -2929,6 +2991,7 @@ async fn run_locked(project_dir: &Path, package: &str) -> Result<LockedRemoveRes
         ));
     }
     crate::added_sources_state::write_state(project_dir, &state)?;
+    crate::install_recovery::test_pause("after-source-state");
     manifest_transaction
         .restore_only_if_current(&state_path)
         .map_err(|error| {
