@@ -1,5 +1,8 @@
 mod support;
 
+#[path = "init_contract/mod.rs"]
+mod init_contract;
+
 use support::mock_registry::MockRegistry;
 use support::{TempProject, lpm_with_registry};
 
@@ -109,14 +112,10 @@ async fn init_yes_json_uses_profile_username_and_creates_gitattributes() {
     assert_eq!(envelope["lpm_json_status"], serde_json::json!("skipped"));
     assert_eq!(envelope["gitattributes_ready"], serde_json::json!(true));
 
-    insta::with_settings!({
-        filters => vec![
-            (r#""/[^"]+/package\.json""#, r#""[PACKAGE_JSON]""#),
-            (r#""/[^"]+/AGENTS\.md""#, r#""[AGENTS_MD]""#),
-            (r#""lpm@[0-9]+\.[0-9]+\.[0-9]+""#, r#""lpm@[VERSION]""#),
-        ],
-    }, {
-        insta::assert_json_snapshot!("init_json_envelope_default_owner", envelope);
+    insta::assert_json_snapshot!("init_json_envelope_default_owner", envelope, {
+        ".path" => "[PACKAGE_JSON]",
+        ".agents_path" => "[AGENTS_MD]",
+        ".package_manager" => "lpm@[VERSION]",
     });
 
     let package_json: serde_json::Value = serde_json::from_str(&project.read_file("package.json"))
