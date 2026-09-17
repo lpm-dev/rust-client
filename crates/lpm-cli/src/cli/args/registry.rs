@@ -18,7 +18,7 @@ pub(crate) struct SearchArgs {
     pub(crate) query: String,
 
     /// Maximum results (1-20).
-    #[arg(long, default_value = "20")]
+    #[arg(long, default_value = "20", value_parser = clap::value_parser!(u32).range(1..=20))]
     pub(crate) limit: u32,
 }
 

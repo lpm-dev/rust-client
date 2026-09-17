@@ -75,6 +75,29 @@ pub fn prepare_routed_read_context(
     let route_table = RouteTable::from_env_and_filesystem(project_dir)
         .map_err(|error| LpmError::Registry(format!("npmrc: {error}")))?;
 
+    configure_read_context(client, route_table, top_level_specs, json_output)
+}
+
+pub fn prepare_search_read_context(
+    client: &RegistryClient,
+    project_dir: &Path,
+    query: &str,
+    json_output: bool,
+) -> Result<RoutedReadContext, LpmError> {
+    let route_table = RouteTable::new(
+        lpm_registry::RouteMode::Direct,
+        lpm_registry::NpmrcConfig::load_from_filesystem(project_dir),
+    )
+    .map_err(|error| LpmError::Registry(format!("npmrc: {error}")))?;
+    configure_read_context(client, route_table, &[query.to_string()], json_output)
+}
+
+fn configure_read_context(
+    client: &RegistryClient,
+    route_table: RouteTable,
+    top_level_specs: &[String],
+    json_output: bool,
+) -> Result<RoutedReadContext, LpmError> {
     if !json_output {
         for warning in route_table.npmrc_warnings() {
             install_ui::warn_untrusted(&lpm_common::sanitize_terminal_inline(warning));
@@ -174,17 +197,6 @@ pub async fn revalidate_routed_package_metadata(
     };
     let metadata = result?;
     Ok((RoutedPackageRef::Registry(package.to_string()), metadata))
-}
-
-pub fn search_route_for_query(route_table: &RouteTable, query: &str) -> UpstreamRoute {
-    if query.starts_with("@lpm.dev/") {
-        return UpstreamRoute::LpmWorker;
-    }
-
-    match route_table.route_for_package(query) {
-        UpstreamRoute::Custom { target, auth } => UpstreamRoute::Custom { target, auth },
-        _ => UpstreamRoute::NpmDirect,
-    }
 }
 
 #[cfg(test)]

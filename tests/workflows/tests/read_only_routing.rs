@@ -380,7 +380,10 @@ async fn search_human_banner_names_project_npmrc_registry() {
         String::from_utf8_lossy(&output.stderr)
     );
     assert!(
-        combined.contains("› Searching 127.0.0.1 for \"lodash.merge\""),
+        combined.contains(&format!(
+            "› Searching {} for \"lodash.merge\"",
+            mock.url().trim_start_matches("http://")
+        )),
         "search banner must name the routed custom registry, got:\n{combined}"
     );
     assert!(
