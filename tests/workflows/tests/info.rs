@@ -1,3 +1,4 @@
+mod info_contract;
 mod support;
 
 use support::mock_registry::{MockRegistry, make_tarball};
@@ -69,7 +70,6 @@ async fn info_human_output_sanitizes_registry_control_sequences() {
     let tarball = make_tarball("ansi-info-pkg", "1.0.0");
     let mut metadata = mock.package_metadata("ansi-info-pkg", "1.0.0", &tarball);
     metadata["description"] = serde_json::json!("safe description\u{1b}]52;c;AAAA\u{7}");
-    metadata["versions"]["1.0.0"]["version"] = serde_json::json!("1.0.0\u{1b}[31m");
     metadata["versions"]["1.0.0"]["dependencies"] = serde_json::json!({
         "dep\u{1b}[2J": "^1.0.0\u{7}"
     });

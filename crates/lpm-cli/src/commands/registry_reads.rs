@@ -78,7 +78,7 @@ pub fn prepare_routed_read_context(
     configure_read_context(client, route_table, top_level_specs, json_output)
 }
 
-pub fn prepare_search_read_context(
+pub fn prepare_direct_read_context(
     client: &RegistryClient,
     project_dir: &Path,
     query: &str,
@@ -163,6 +163,7 @@ pub async fn revalidate_routed_package_metadata(
 ) -> Result<(RoutedPackageRef, TimedPackageMetadata), LpmError> {
     if package.starts_with("@lpm.dev/") {
         let lpm_package = PackageName::parse(package)?;
+        validate_metadata_registry_base(context.client.base_url())?;
         let metadata = context
             .client
             .revalidate_package_metadata_with_timings(&lpm_package)
@@ -172,13 +173,15 @@ pub async fn revalidate_routed_package_metadata(
 
     let route = context.route_table.route_for_package(package);
     let result = match route {
-        UpstreamRoute::NpmDirect => {
+        UpstreamRoute::NpmDirect | UpstreamRoute::LpmWorker => {
+            validate_metadata_registry_base(context.client.npm_registry_url())?;
             context
                 .client
                 .revalidate_npm_metadata_direct_with_timings(package)
                 .await
         }
         UpstreamRoute::Custom { target, auth } => {
+            validate_metadata_registry_base(&target.base_url)?;
             context
                 .client
                 .revalidate_npm_metadata_from_with_timings(
@@ -188,15 +191,25 @@ pub async fn revalidate_routed_package_metadata(
                 )
                 .await
         }
-        UpstreamRoute::LpmWorker => {
-            context
-                .client
-                .revalidate_npm_metadata_direct_with_timings(package)
-                .await
-        }
     };
-    let metadata = result?;
+    let metadata = result.map_err(|error| match error {
+        LpmError::AuthRequired => LpmError::Registry(
+            "info authentication failed. Configure credentials in .npmrc for the selected npm-compatible registry.".into(),
+        ),
+        error => error,
+    })?;
     Ok((RoutedPackageRef::Registry(package.to_string()), metadata))
+}
+
+fn validate_metadata_registry_base(base_url: &str) -> Result<(), LpmError> {
+    let parsed = reqwest::Url::parse(base_url)
+        .map_err(|_| LpmError::Registry("invalid metadata registry URL".into()))?;
+    if parsed.query().is_some() || parsed.fragment().is_some() {
+        return Err(LpmError::Registry(
+            "metadata registry URL must not contain a query or fragment".into(),
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(test)]

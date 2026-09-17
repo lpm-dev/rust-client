@@ -1,0 +1,115 @@
+---
+source: tests/workflows/tests/info_contract/mod.rs
+expression: envelope
+---
+{
+  "_cache": {
+    "age_seconds": null,
+    "network_request": true,
+    "not_modified": false,
+    "status": "fetched"
+  },
+  "description": "Package description",
+  "dist-tags": {
+    "broken": "9.0.0",
+    "latest": "1.10.0",
+    "next": "1.2.0"
+  },
+  "distributionMode": null,
+  "downloads": null,
+  "ecosystem": null,
+  "latestVersion": null,
+  "modified": null,
+  "name": "info-fixture",
+  "packageType": null,
+  "selected_version": "1.0.0",
+  "success": true,
+  "time": {
+    "1.0.0": "2025-01-01T00:00:00Z",
+    "1.10.0": "2026-01-01T00:00:00Z"
+  },
+  "versions": {
+    "1.0.0": {
+      "_behavioralTags": null,
+      "_ecosystem": null,
+      "_lifecycleScripts": null,
+      "_npmUser": null,
+      "_qualityScore": null,
+      "_securityFindings": null,
+      "_swiftMeta": null,
+      "_vulnerabilities": null,
+      "bundleDependencies": [],
+      "cpu": [],
+      "dependencies": {
+        "runtime-dep": "^1"
+      },
+      "description": null,
+      "devDependencies": {},
+      "dist": null,
+      "engines": {},
+      "libc": [],
+      "lpmConfig": null,
+      "name": "info-fixture",
+      "optionalDependencies": {},
+      "os": [],
+      "peerDependencies": {
+        "peer-dep": "^1"
+      },
+      "peerDependenciesMeta": {},
+      "readme": null,
+      "version": "1.0.0"
+    },
+    "1.10.0": {
+      "_behavioralTags": null,
+      "_ecosystem": null,
+      "_lifecycleScripts": null,
+      "_npmUser": null,
+      "_qualityScore": null,
+      "_securityFindings": null,
+      "_swiftMeta": null,
+      "_vulnerabilities": null,
+      "bundleDependencies": [],
+      "cpu": [],
+      "dependencies": {},
+      "description": null,
+      "devDependencies": {},
+      "dist": null,
+      "engines": {},
+      "libc": [],
+      "lpmConfig": null,
+      "name": "info-fixture",
+      "optionalDependencies": {},
+      "os": [],
+      "peerDependencies": {},
+      "peerDependenciesMeta": {},
+      "readme": null,
+      "version": "1.10.0"
+    },
+    "1.2.0": {
+      "_behavioralTags": null,
+      "_ecosystem": null,
+      "_lifecycleScripts": null,
+      "_npmUser": null,
+      "_qualityScore": null,
+      "_securityFindings": null,
+      "_swiftMeta": null,
+      "_vulnerabilities": null,
+      "bundleDependencies": [],
+      "cpu": [],
+      "dependencies": {},
+      "description": null,
+      "devDependencies": {},
+      "dist": null,
+      "engines": {},
+      "libc": [],
+      "lpmConfig": null,
+      "name": "info-fixture",
+      "optionalDependencies": {},
+      "os": [],
+      "peerDependencies": {},
+      "peerDependenciesMeta": {},
+      "readme": null,
+      "version": "1.2.0"
+    }
+  }
+}

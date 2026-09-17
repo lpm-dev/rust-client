@@ -1,5 +1,5 @@
 use crate::commands::registry_reads::{
-    normalize_package_version_input, prepare_routed_read_context,
+    normalize_package_version_input, prepare_direct_read_context,
     revalidate_routed_package_metadata,
 };
 use crate::install_ui;
@@ -16,16 +16,38 @@ pub async fn run(
     verbose: bool,
 ) -> Result<(), LpmError> {
     let (package, version) = normalize_package_version_input("info", package, version)?;
-    let context =
-        prepare_routed_read_context(client, project_dir, &[package.to_string()], json_output)?;
+    let context = prepare_direct_read_context(client, project_dir, package, json_output)?;
     let (_package_ref, result) = revalidate_routed_package_metadata(&context, package).await?;
     let metadata = result.metadata;
     let cache = result.timings;
+    let version_key = match version {
+        Some(spec) => Some(metadata.resolve_version_spec(spec)?),
+        None => metadata.latest_version_tag().map(str::to_string),
+    };
+    let selected_version = match version_key.as_deref() {
+        Some(key) => {
+            let selected = metadata.version(key).ok_or_else(|| {
+                LpmError::NotFound(format!("version {key} not found for {package}"))
+            })?;
+            if selected.version != key {
+                return Err(LpmError::Registry(format!(
+                    "inconsistent version metadata for {package}@{key}: entry declares {}",
+                    selected.version
+                )));
+            }
+            Some(selected)
+        }
+        None => None,
+    };
 
     if json_output {
         let mut json = serde_json::to_value(&metadata)?;
         if let Some(obj) = json.as_object_mut() {
             obj.insert("success".to_string(), serde_json::Value::Bool(true));
+            obj.insert(
+                "selected_version".to_string(),
+                serde_json::json!(version_key),
+            );
             obj.insert("_cache".to_string(), cache_diagnostics_json(cache));
         }
         println!("{}", serde_json::to_string_pretty(&json)?);
@@ -41,14 +63,13 @@ pub async fn run(
         print_field("metadata", &cache_diagnostics_text(cache));
     }
 
-    // Determine which version to show
-    let version_key = version
-        .map(|v| v.to_string())
-        .or_else(|| metadata.latest_version_tag().map(|s| s.to_string()));
-
-    if let Some(ref vk) = version_key
-        && let Some(ver) = metadata.version(vk)
+    if let Some(desc) = &metadata.description
+        && !desc.is_empty()
     {
+        print_field("description", desc);
+    }
+
+    if let Some(ver) = selected_version {
         print_field("version", &ver.version);
 
         if let Some(eco) = &ver.ecosystem {
@@ -57,12 +78,6 @@ pub async fn run(
 
         if let Some(integrity) = ver.integrity_or_shasum() {
             print_field("integrity", &short_integrity(integrity.as_ref()));
-        }
-
-        if let Some(desc) = &metadata.description
-            && !desc.is_empty()
-        {
-            print_field("description", desc);
         }
 
         if !ver.dependencies.is_empty() {
@@ -76,6 +91,11 @@ pub async fn run(
             println!("{}", install_ui::section("peer dependencies"));
             print_name_value_rows(&ver.peer_dependencies);
         }
+    } else {
+        print_field(
+            "version",
+            "No default version. Use --version to select a version.",
+        );
     }
 
     if let Some(mode) = &metadata.distribution_mode {
@@ -115,8 +135,8 @@ pub async fn run(
         }
     }
 
-    if let Some(tag) = metadata.dist_tags.get("latest")
-        && let Some(time) = metadata.time.get(tag.as_str())
+    if let Some(key) = version_key.as_deref()
+        && let Some(time) = metadata.time.get(key)
     {
         println!();
         print_field("published", time);
