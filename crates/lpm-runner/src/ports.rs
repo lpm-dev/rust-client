@@ -2294,18 +2294,33 @@ fn list_listening_ports_lsof() -> Vec<ListeningPort> {
 
 #[cfg(target_os = "macos")]
 fn list_listening_ports_macos_until(deadline: std::time::Instant) -> Vec<ListeningPort> {
+    list_listening_ports_macos_with(
+        deadline,
+        |deadline| {
+            let mut command = Command::new("/usr/sbin/netstat");
+            command.args(["-anv", "-p", "tcp"]);
+            command_stdout_capped_until(&mut command, deadline)
+        },
+        |deadline| list_listening_ports_lsof_until_inner(deadline, false),
+    )
+}
+
+#[cfg(target_os = "macos")]
+fn list_listening_ports_macos_with(
+    deadline: std::time::Instant,
+    netstat: impl FnOnce(std::time::Instant) -> Option<Vec<u8>>,
+    lsof: impl FnOnce(std::time::Instant) -> Vec<ListeningPort>,
+) -> Vec<ListeningPort> {
     if std::time::Instant::now() >= deadline {
         return Vec::new();
     }
-    let mut command = Command::new("/usr/sbin/netstat");
-    command.args(["-anv", "-p", "tcp"]);
-    let Some(output) = command_stdout_capped_until(&mut command, deadline) else {
-        return list_listening_ports_lsof_until_inner(deadline, false);
+    let Some(output) = netstat(deadline) else {
+        return lsof(deadline);
     };
     let stdout = String::from_utf8_lossy(&output);
     let mut rows = parse_macos_netstat_listen_output(&stdout);
-    if rows.is_empty() && !output.is_empty() {
-        return list_listening_ports_lsof_until_inner(deadline, false);
+    if rows.is_empty() {
+        return lsof(deadline);
     }
 
     enrich_non_linux_listener_processes(&mut rows, deadline, false);
@@ -5175,6 +5190,84 @@ tcp4 0 0 127.0.0.1.60000 127.0.0.1.443 ESTABLISHED 1 2 3 4 node:99 00100\n",
         assert_eq!(rows[1].port, 5173);
         assert_eq!(rows[1].pid, Some(1191));
         assert_eq!(rows[1].process.as_deref(), Some("Codex (Service)"));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_listener_query_falls_back_when_netstat_succeeds_without_output() {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let rows = list_listening_ports_macos_with(
+            deadline,
+            |query_deadline| {
+                assert_eq!(query_deadline, deadline);
+                Some(Vec::new())
+            },
+            |fallback_deadline| {
+                assert_eq!(fallback_deadline, deadline);
+                parse_lsof_listen_output("p42\ncnode\nf1\ntIPv4\nPTCP\nn127.0.0.1:5173\n")
+            },
+        );
+
+        assert_eq!(
+            rows.len(),
+            1,
+            "empty netstat output must use lsof listeners"
+        );
+        assert_eq!(rows[0].port, 5173);
+        assert_eq!(rows[0].pid, Some(42));
+        assert_eq!(rows[0].address.as_deref(), Some("127.0.0.1"));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_listener_query_falls_back_when_netstat_fails_or_has_no_listeners() {
+        for output in [
+            None,
+            Some(b"Active Internet connections (including servers)\n".to_vec()),
+            Some(b" \n\t".to_vec()),
+            Some(b"tcp4 0 0 127.0.0.1.60000 127.0.0.1.443 ESTABLISHED\n".to_vec()),
+        ] {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+            let mut fallback_called = false;
+            let rows = list_listening_ports_macos_with(
+                deadline,
+                |_| output,
+                |fallback_deadline| {
+                    assert_eq!(fallback_deadline, deadline);
+                    fallback_called = true;
+                    Vec::new()
+                },
+            );
+
+            assert!(fallback_called);
+            assert!(rows.is_empty());
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_listener_query_keeps_netstat_listeners_without_calling_lsof() {
+        let rows = list_listening_ports_macos_with(
+            std::time::Instant::now() + std::time::Duration::from_secs(2),
+            |_| Some(b"tcp4 0 0 127.0.0.1.5173 *.* LISTEN\n".to_vec()),
+            |_| panic!("parsed netstat listeners must not trigger lsof"),
+        );
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].port, 5173);
+        assert_eq!(rows[0].address.as_deref(), Some("127.0.0.1"));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_listener_query_does_not_start_either_backend_after_its_deadline() {
+        let rows = list_listening_ports_macos_with(
+            std::time::Instant::now() - std::time::Duration::from_millis(1),
+            |_| panic!("netstat must not start after the deadline"),
+            |_| panic!("lsof must not start after the deadline"),
+        );
+
+        assert!(rows.is_empty());
     }
 
     #[cfg(target_os = "macos")]
