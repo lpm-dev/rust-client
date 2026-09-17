@@ -28,6 +28,10 @@ impl VersionTransactionScope {
         })
     }
 
+    pub(crate) fn project_path(&self) -> &Path {
+        &self.project_path
+    }
+
     pub(crate) fn validate(&self) -> Result<(), LpmError> {
         use cap_fs_ext::DirExt as _;
         let root = open_root_directory_nofollow(&self.root_path)?;

@@ -228,7 +228,7 @@ pub(crate) fn apply(
             ) {
                 return Ok(None);
             }
-            let workspace = initial_root.discover(project_dir)?;
+            let workspace = initial_root.discover(scope.project_path())?;
             let plan =
                 build_plan_for_workspace(&workspace, &initial_root.directory, selection, bump)?;
             scope.validate()?;
@@ -1058,7 +1058,7 @@ fn build_plan_read_only(
         lpm_common::ProjectLockKind::Install,
         || {
             scope.ensure_no_pending()?;
-            let workspace = initial_root.discover(project_dir)?;
+            let workspace = initial_root.discover(scope.project_path())?;
             let plan =
                 build_plan_for_workspace(&workspace, &initial_root.directory, selection, bump)?;
             scope.validate()?;
@@ -1264,5 +1264,49 @@ mod tests {
             .to_string();
 
         assert!(error.contains("changed"), "{error}");
+    }
+}
+
+#[cfg(all(test, unix))]
+mod selected_path_tests {
+    use super::*;
+
+    #[test]
+    fn release_plan_and_apply_use_the_selected_canonical_project_path() {
+        let fixture = tempfile::tempdir().unwrap();
+        let root = fixture.path().join("workspace");
+        std::fs::create_dir_all(root.join("packages/core")).unwrap();
+        std::fs::write(
+            root.join("package.json"),
+            r#"{"private":true,"workspaces":["packages/*"]}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("packages/core/package.json"),
+            r#"{"name":"core","version":"1.0.0"}"#,
+        )
+        .unwrap();
+        let alias = fixture.path().join("alias");
+        std::os::unix::fs::symlink(&root, &alias).unwrap();
+        let selection = ReleaseSelection {
+            all: true,
+            affected: false,
+            base: "main".into(),
+            filter: Vec::new(),
+            filter_prod: Vec::new(),
+            changed_files_ignore_pattern: Vec::new(),
+            test_pattern: Vec::new(),
+            fail_if_no_match: false,
+        };
+        for start in [&alias, &alias.join("packages/core")] {
+            build_plan_read_only(start, &selection, Some(&VersionBump::Patch))
+                .unwrap_or_else(|error| panic!("canonical project selection was lost: {error}"));
+        }
+        apply(&alias, &selection, Some(&VersionBump::Patch), false, true).unwrap();
+        let package: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(root.join("packages/core/package.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(package["version"], "1.0.1");
     }
 }
