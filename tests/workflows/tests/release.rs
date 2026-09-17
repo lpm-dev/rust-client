@@ -1,3 +1,4 @@
+mod release_contract;
 mod support;
 
 use base64::Engine as _;
@@ -320,7 +321,7 @@ fn redact_release_paths(json: &mut serde_json::Value) {
     }
     if let Some(files) = json["files"].as_array_mut() {
         for file in files {
-            let path = file["path"].as_str().unwrap_or_default();
+            let path = file["path"].as_str().unwrap_or_default().replace('\\', "/");
             let placeholder = if path.contains("/packages/core/") {
                 "[core/package.json]"
             } else if path.contains("/packages/app/") {
@@ -3705,7 +3706,7 @@ async fn release_publish_preserves_successful_upload_when_postpublish_fails() {
 
     assert!(
         !output.status.success(),
-        "postpublish failure must fail the command"
+        "postpublish failure must fail the command: {output:?}"
     );
     let json = parse_json_output(&output.stdout);
     assert_eq!(json["results"][0]["status"], "failed");

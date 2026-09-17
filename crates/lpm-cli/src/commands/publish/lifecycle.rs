@@ -1,3 +1,4 @@
+use crate::commands::publish_common::{self, DirectoryIdentity};
 use crate::install_ui;
 use lpm_common::LpmError;
 use std::io::IsTerminal as _;
@@ -11,6 +12,7 @@ const PUBLISH_LIFECYCLE_TIMEOUT: Duration = Duration::from_secs(300);
 
 #[derive(Debug)]
 pub(crate) struct PublishLifecycle {
+    directory_identity: DirectoryIdentity,
     package_name: String,
     package_version: String,
     before_pack: Vec<PublishLifecycleScript>,
@@ -68,13 +70,51 @@ impl PublishLifecycle {
         if ignore_scripts {
             return Ok(None);
         }
-        let package = lpm_workspace::read_package_json(&project_dir.join("package.json")).map_err(
-            |error| {
-                LpmError::Script(format!(
-                    "failed to read package.json lifecycle scripts: {error}"
-                ))
-            },
+        let directory = publish_common::open_tarball_source_root(project_dir)?;
+        Self::load_from_directory(
+            project_dir,
+            &directory,
+            yes,
+            json_output,
+            include_publish_phases,
+            operation,
+        )
+    }
+
+    pub(crate) fn load_for_release(
+        project_dir: &Path,
+        directory: &cap_std::fs::Dir,
+        yes: bool,
+        ignore_scripts: bool,
+        json_output: bool,
+    ) -> Result<Option<Self>, LpmError> {
+        if ignore_scripts {
+            return Ok(None);
+        }
+        Self::load_from_directory(project_dir, directory, yes, json_output, true, "publish")
+    }
+
+    fn load_from_directory(
+        project_dir: &Path,
+        directory: &cap_std::fs::Dir,
+        yes: bool,
+        json_output: bool,
+        include_publish_phases: bool,
+        operation: &str,
+    ) -> Result<Option<Self>, LpmError> {
+        let (file, size) = publish_common::open_tarball_source_file(
+            directory,
+            Path::new("package.json"),
+            "package.json",
         )?;
+        let content = lpm_common::read_text_file_capped_from_open_file_with_known_size(
+            file,
+            &project_dir.join("package.json"),
+            lpm_common::CONFIG_FILE_SIZE_CAP_BYTES,
+            size,
+        )?;
+        let package: lpm_workspace::PackageJson =
+            serde_json::from_str(lpm_common::strip_utf8_bom_str(&content))?;
         let before_pack = scripts_for_phases(&package.scripts, BEFORE_PACK_PHASES);
         let after_pack = scripts_for_phases(&package.scripts, AFTER_PACK_PHASES);
         let after_publish = if include_publish_phases {
@@ -88,6 +128,8 @@ impl PublishLifecycle {
         }
         require_consent(yes, json_output, operation, script_count)?;
         Ok(Some(Self {
+            directory_identity: DirectoryIdentity::from_directory(directory)
+                .map_err(LpmError::Io)?,
             package_name: package.name.unwrap_or_else(|| "<anonymous>".into()),
             package_version: package.version.unwrap_or_else(|| "0.0.0".into()),
             before_pack,
@@ -138,6 +180,16 @@ impl PublishLifecycle {
         script: &PublishLifecycleScript,
         json_output: bool,
     ) -> Result<(), LpmError> {
+        let directory = publish_common::open_tarball_source_root(project_dir)?;
+        if DirectoryIdentity::from_directory(&directory).map_err(LpmError::Io)?
+            != self.directory_identity
+        {
+            return Err(LpmError::Script(
+                "publish lifecycle directory changed; retry the command".into(),
+            ));
+        }
+        #[cfg(windows)]
+        let _guards = pin_windows_lifecycle_directory(project_dir, &directory)?;
         if !json_output {
             install_ui::phase_line(crate::install_ui::terminal_line!(
                 "Running publish lifecycle {}",
@@ -156,6 +208,7 @@ impl PublishLifecycle {
             &self.package_name,
             &self.package_version,
             project_dir,
+            &directory,
             &envs,
             &store_root,
             runtime.path(),
@@ -167,7 +220,16 @@ impl PublishLifecycle {
                 "publish lifecycle script `{}` failed: {error}",
                 script.phase
             ))
-        })
+        })?;
+        let current = publish_common::open_tarball_source_root(project_dir)?;
+        if DirectoryIdentity::from_directory(&current).map_err(LpmError::Io)?
+            != self.directory_identity
+        {
+            return Err(LpmError::Script(
+                "publish lifecycle directory changed; retry the command".into(),
+            ));
+        }
+        Ok(())
     }
 
     fn envs_for(
@@ -251,4 +313,51 @@ fn scripts_for_phases(
                 })
         })
         .collect()
+}
+
+#[cfg(windows)]
+fn pin_windows_lifecycle_directory(
+    path: &Path,
+    retained: &cap_std::fs::Dir,
+) -> Result<Vec<std::fs::File>, LpmError> {
+    use std::os::windows::fs::{MetadataExt as _, OpenOptionsExt as _};
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
+        FILE_SHARE_READ, FILE_SHARE_WRITE,
+    };
+    let mut paths: Vec<_> = path.ancestors().collect();
+    paths.reverse();
+    let mut guards = Vec::with_capacity(paths.len());
+    for parent in paths {
+        let guard = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(parent)
+            .map_err(LpmError::Io)?;
+        let metadata = guard.metadata().map_err(LpmError::Io)?;
+        if !metadata.is_dir() || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return Err(LpmError::Script(
+                "publish lifecycle directory changed; retry the command".into(),
+            ));
+        }
+        guards.push(guard);
+    }
+    let actual = same_file::Handle::from_file(
+        guards
+            .last()
+            .ok_or_else(|| LpmError::Script("missing lifecycle directory".into()))?
+            .try_clone()
+            .map_err(LpmError::Io)?,
+    )
+    .map_err(LpmError::Io)?;
+    let expected =
+        same_file::Handle::from_file(retained.try_clone().map_err(LpmError::Io)?.into_std_file())
+            .map_err(LpmError::Io)?;
+    if actual != expected {
+        return Err(LpmError::Script(
+            "publish lifecycle directory changed; retry the command".into(),
+        ));
+    }
+    Ok(guards)
 }

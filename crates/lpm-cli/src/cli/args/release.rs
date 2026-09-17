@@ -48,7 +48,7 @@ pub(crate) struct ReleaseSelectionArgs {
 
 #[derive(Subcommand)]
 pub(crate) enum ReleaseCommands {
-    /// Print the workspace release plan without mutating files.
+    /// Print the workspace release plan without changing manifests.
     Plan {
         #[command(flatten)]
         selection: ReleaseSelectionArgs,
@@ -89,7 +89,7 @@ pub(crate) enum ReleaseCommands {
         #[arg(long = "ignore-scripts")]
         ignore_scripts: bool,
 
-        /// Six-digit authenticator code for MFA-protected LPM publishes.
+        /// Six-digit authenticator code for MFA-protected LPM.dev Registry uploads.
         #[arg(long, value_name = "CODE")]
         otp: Option<String>,
 
@@ -105,7 +105,7 @@ pub(crate) enum ReleaseCommands {
         #[arg(long)]
         npm: bool,
 
-        /// Publish to LPM registry (default if no other registry specified).
+        /// Publish to LPM.dev Registry.
         #[arg(long)]
         lpm: bool,
 

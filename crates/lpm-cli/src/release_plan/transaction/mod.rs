@@ -1,8 +1,11 @@
 mod fs;
 
 use super::*;
+type ManifestDirectoryIdentities =
+    BTreeMap<PathBuf, crate::commands::publish_common::DirectoryIdentity>;
 pub(super) use fs::*;
 
+#[cfg(test)]
 pub(crate) fn write_planned_manifests(
     workspace_root: &Path,
     manifests: &[PlannedManifest],
@@ -29,6 +32,7 @@ pub(super) struct AppliedReleaseTransaction {
     journal_bytes: Vec<u8>,
     commit: ReleaseApplyCommit,
     expected_version_parent: Option<cap_std::fs::Dir>,
+    expected_member_parents: ManifestDirectoryIdentities,
 }
 
 impl AppliedReleaseTransaction {
@@ -59,11 +63,13 @@ impl AppliedReleaseTransaction {
             &self.allowed_manifests,
             &self.journal_bytes,
             self.expected_version_parent.as_ref(),
+            &self.expected_member_parents,
             primary,
         )
     }
 }
 
+#[cfg(test)]
 pub(super) fn apply_planned_manifests_with(
     workspace_root: &Path,
     manifests: &[PlannedManifest],
@@ -113,6 +119,16 @@ pub(super) fn apply_resolved_manifests_with(
         state,
         expected_version_parent,
     } = context;
+    let expected_member_parents = resolved
+        .iter()
+        .map(|manifest| {
+            crate::commands::publish_common::DirectoryIdentity::from_directory(
+                &manifest.target.parent,
+            )
+            .map(|identity| (manifest.relative.clone(), identity))
+            .map_err(LpmError::Io)
+        })
+        .collect::<Result<ManifestDirectoryIdentities, LpmError>>()?;
     let (journal_bytes, commit) =
         serialize_planned_release_journal(&resolved, operation, version_git)?;
     persist_release_journal_in(&state, &journal_bytes)?;
@@ -121,37 +137,28 @@ pub(super) fn apply_resolved_manifests_with(
         .map(|manifest| manifest.target.display.clone())
         .collect::<Vec<_>>();
 
-    for (index, resolved_manifest) in resolved.into_iter().enumerate() {
+    let mut pending = resolved.into_iter().enumerate();
+    while let Some((index, resolved_manifest)) = pending.next() {
         let manifest = resolved_manifest.manifest;
-        let current = match read_manifest_target(&resolved_manifest.target) {
-            Ok(current) => current,
-            Err(error) => {
-                return rollback_after_apply_error(
-                    &canonical_root,
-                    &root,
-                    &state,
-                    &allowed_manifests,
-                    &journal_bytes,
-                    expected_version_parent.as_ref(),
-                    error,
-                );
-            }
-        };
-        if current.as_slice() != manifest.original_bytes.as_ref() {
-            return rollback_after_apply_error(
-                &canonical_root,
-                &root,
-                &state,
-                &allowed_manifests,
-                &journal_bytes,
-                expected_version_parent.as_ref(),
-                LpmError::Script(format!(
+        let result = (|| {
+            let named = open_manifest_target(&root, &canonical_root, &resolved_manifest.relative)?;
+            validate_member_parent(
+                &named,
+                &resolved_manifest.relative,
+                Some(&expected_member_parents),
+            )?;
+            let current = read_manifest_target(&resolved_manifest.target)?;
+            if current.as_slice() != manifest.original_bytes.as_ref() {
+                return Err(LpmError::Script(format!(
                     "{} changed after the release journal was created",
                     resolved_manifest.target.display.display()
-                )),
-            );
-        }
-        if let Err(error) = write_manifest(&resolved_manifest.target, &manifest.updated_bytes) {
+                )));
+            }
+            write_manifest(&resolved_manifest.target, &manifest.updated_bytes).map_err(LpmError::Io)
+        })();
+        if let Err(error) = result {
+            drop(resolved_manifest);
+            drop(pending);
             return rollback_after_apply_error(
                 &canonical_root,
                 &root,
@@ -159,10 +166,28 @@ pub(super) fn apply_resolved_manifests_with(
                 &allowed_manifests,
                 &journal_bytes,
                 expected_version_parent.as_ref(),
-                LpmError::Io(error),
+                &expected_member_parents,
+                error,
             );
         }
         abort_after_manifest_write_for_test(index + 1);
+    }
+    for relative in expected_member_parents.keys() {
+        let result = open_manifest_target(&root, &canonical_root, relative).and_then(|target| {
+            validate_member_parent(&target, relative, Some(&expected_member_parents))
+        });
+        if let Err(error) = result {
+            return rollback_after_apply_error(
+                &canonical_root,
+                &root,
+                &state,
+                &allowed_manifests,
+                &journal_bytes,
+                expected_version_parent.as_ref(),
+                &expected_member_parents,
+                error,
+            );
+        }
     }
 
     Ok(AppliedReleaseTransaction {
@@ -173,6 +198,7 @@ pub(super) fn apply_resolved_manifests_with(
         journal_bytes,
         commit,
         expected_version_parent,
+        expected_member_parents,
     })
 }
 
@@ -275,6 +301,7 @@ pub(crate) fn recover_pending_release_transaction_from_open_root(
     ))
 }
 
+#[cfg(test)]
 pub(crate) fn recover_pending_operation_transaction(
     workspace_root: &Path,
     allowed_manifests: &[PathBuf],
@@ -299,6 +326,7 @@ pub(super) enum RecoveryOutcome {
     },
 }
 
+#[cfg(test)]
 pub(super) fn recover_pending_release_transaction_inner(
     workspace_root: &Path,
     allowed_manifests: &[PathBuf],
@@ -306,6 +334,7 @@ pub(super) fn recover_pending_release_transaction_inner(
     recover_pending_release_transaction_inner_with_hook(workspace_root, allowed_manifests, || {})
 }
 
+#[cfg(test)]
 pub(super) fn recover_pending_release_transaction_inner_with_hook(
     workspace_root: &Path,
     allowed_manifests: &[PathBuf],
@@ -342,6 +371,7 @@ fn recover_pending_release_transaction_in_open_root(
         state,
         allowed_manifests,
         None,
+        None,
     )
 }
 
@@ -351,6 +381,7 @@ fn recover_pending_release_transaction_with_parent(
     state: &ReleaseStateDirectory,
     allowed_manifests: &[PathBuf],
     expected_version_parent: Option<&cap_std::fs::Dir>,
+    expected_member_parents: Option<&ManifestDirectoryIdentities>,
 ) -> Result<RecoveryOutcome, LpmError> {
     let Some(journal_bytes) = read_existing_release_journal_bytes_in(state)? else {
         return recover_commit_marker_without_journal_in(state);
@@ -380,6 +411,7 @@ fn recover_pending_release_transaction_with_parent(
         journal.entries,
         allowed_manifests,
         expected_version_parent,
+        expected_member_parents,
     )?;
 
     if let Some(git) = version_git
@@ -435,6 +467,10 @@ pub(super) fn recover_commit_marker_without_journal_in(
     })
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "rollback retains the same transaction and directory identity context as apply"
+)]
 pub(super) fn rollback_after_apply_error<T>(
     canonical_root: &Path,
     root: &cap_std::fs::Dir,
@@ -442,6 +478,7 @@ pub(super) fn rollback_after_apply_error<T>(
     allowed_manifests: &[PathBuf],
     trusted_journal_bytes: &[u8],
     expected_version_parent: Option<&cap_std::fs::Dir>,
+    expected_member_parents: &ManifestDirectoryIdentities,
     primary: LpmError,
 ) -> Result<T, LpmError> {
     match recover_pending_release_transaction_with_parent(
@@ -450,6 +487,7 @@ pub(super) fn rollback_after_apply_error<T>(
         state,
         allowed_manifests,
         expected_version_parent,
+        Some(expected_member_parents),
     ) {
         Ok(RecoveryOutcome::RolledBack | RecoveryOutcome::Completed { .. }) => Err(primary),
         Ok(RecoveryOutcome::None) | Err(_) => {
@@ -464,6 +502,7 @@ pub(super) fn rollback_after_apply_error<T>(
                 state,
                 allowed_manifests,
                 expected_version_parent,
+                Some(expected_member_parents),
             ) {
                 Ok(RecoveryOutcome::RolledBack | RecoveryOutcome::Completed { .. }) => Err(primary),
                 Ok(RecoveryOutcome::None) => Err(LpmError::Script(format!(
@@ -1085,6 +1124,7 @@ fn validate_recovery_entries_from_open_root(
     journal_entries: Vec<RecoveryApplyJournalEntry<'_>>,
     allowed_manifests: &[PathBuf],
     expected_version_parent: Option<&cap_std::fs::Dir>,
+    expected_member_parents: Option<&ManifestDirectoryIdentities>,
 ) -> Result<Vec<RecoveryEntry>, LpmError> {
     if journal_entries.is_empty() || journal_entries.len() > MAX_RELEASE_JOURNAL_ENTRIES {
         return Err(LpmError::Script(format!(
@@ -1149,6 +1189,7 @@ fn validate_recovery_entries_from_open_root(
         }
         previous_path = Some(relative.clone());
         let target = recovery_manifest_target(root_dir, canonical_root, &relative)?;
+        validate_member_parent(&target, &relative, expected_member_parents)?;
         if let Some(expected) = expected_version_parent {
             version_scope::same_directory(&target.parent, expected, &target.display)?;
         }
@@ -1188,4 +1229,24 @@ pub(super) fn allowed_release_manifest_paths(
         allowed.insert(planned_manifest_relative_path(canonical_root, manifest)?);
     }
     Ok(allowed)
+}
+
+fn validate_member_parent(
+    target: &ManifestTarget,
+    relative: &Path,
+    expected: Option<&ManifestDirectoryIdentities>,
+) -> Result<(), LpmError> {
+    let Some(expected) = expected else {
+        return Ok(());
+    };
+    let identity =
+        crate::commands::publish_common::DirectoryIdentity::from_directory(&target.parent)
+            .map_err(LpmError::Io)?;
+    if expected.get(relative) != Some(&identity) {
+        return Err(LpmError::Script(format!(
+            "release member directory changed: {}; the transaction journal was preserved",
+            target.display.display()
+        )));
+    }
+    Ok(())
 }

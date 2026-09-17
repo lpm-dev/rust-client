@@ -28,6 +28,10 @@ impl VersionTransactionScope {
         })
     }
 
+    pub(crate) fn project_path(&self) -> &Path {
+        &self.project_path
+    }
+
     pub(crate) fn validate(&self) -> Result<(), LpmError> {
         use cap_fs_ext::DirExt as _;
         let root = open_root_directory_nofollow(&self.root_path)?;
@@ -84,6 +88,40 @@ impl VersionTransactionScope {
         let bytes = read_manifest_target(&target)?;
         let manifest = parse_workspace_manifest(&self.project_path, target.display, bytes)?;
         plan_manifest(manifest, bump)
+    }
+
+    pub(crate) fn write_workspace(
+        &self,
+        manifests: &[PlannedManifest],
+        operation: ReleaseTransactionOperation,
+    ) -> Result<(), LpmError> {
+        self.validate()?;
+        if manifests.is_empty() {
+            return Ok(());
+        }
+        let state = self.state(true)?.ok_or_else(|| {
+            LpmError::Script("could not create the release transaction directory".into())
+        })?;
+        ensure_no_pending_release_transaction_in(&state)?;
+        let resolved =
+            resolve_planned_manifests_from_open_root(&self.root_path, &self.root, manifests)?;
+        self.validate()?;
+        let transaction = apply_resolved_manifests_with(
+            ReleaseWriteContext {
+                canonical_root: self.root_path.clone(),
+                root: self.root.try_clone().map_err(LpmError::Io)?,
+                state,
+                expected_version_parent: None,
+            },
+            resolved,
+            operation,
+            None,
+            write_manifest_target_durable,
+        )?;
+        self.validate().map_err(|error| {
+            LpmError::Script(format!("{error}; the release journal was preserved"))
+        })?;
+        transaction.commit()
     }
 
     pub(crate) fn write<T>(

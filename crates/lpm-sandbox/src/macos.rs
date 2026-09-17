@@ -102,9 +102,7 @@ impl Sandbox for SeatbeltSandbox {
         for (k, v) in &cmd.envs {
             command.env(k, v);
         }
-        if let Some(dir) = &cmd.current_dir {
-            command.current_dir(dir);
-        }
+        cmd.configure_current_dir(&mut command);
         command.stdout(std::process::Stdio::from(cmd.stdout));
         command.stderr(std::process::Stdio::from(cmd.stderr));
         command.stdin(std::process::Stdio::from(cmd.stdin));

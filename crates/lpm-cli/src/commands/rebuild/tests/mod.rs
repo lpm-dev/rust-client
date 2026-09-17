@@ -3547,7 +3547,7 @@ fn capability_not_approved_reports_not_trusted() {
 /// `UnsupportedPlatform` on Windows so this code path never
 /// fired there; with the real backend landed, `sh -c` would
 /// fail at spawn because `sh.exe` isn't on the standard Windows
-/// PATH. The helper picks `cmd.exe /D /C` instead so end-to-end
+/// PATH. The helper picks `cmd.exe /D /S /C` instead so end-to-end
 /// Windows installs actually work.
 #[cfg(windows)]
 #[test]
@@ -3562,6 +3562,7 @@ fn platform_shell_invocation_uses_cmd_exe_on_windows() {
         args,
         vec![
             "/D".to_string(),
+            "/S".to_string(),
             "/C".to_string(),
             "node install.js".to_string()
         ],
@@ -3670,4 +3671,38 @@ fn trusted_scope_exact_pattern_still_matches() {
     assert!(name_matches_trusted_scope("exact-pkg", &scopes));
     assert!(!name_matches_trusted_scope("exact-pkg-evil", &scopes));
     assert!(!name_matches_trusted_scope("other-pkg", &scopes));
+}
+
+#[cfg(unix)]
+#[test]
+fn publish_lifecycle_rejects_replaced_directory_before_sandbox_configuration() {
+    let fixture = tempfile::tempdir().unwrap();
+    let root = fixture.path().canonicalize().unwrap();
+    let member = root.join("member");
+    let outside = root.join("outside");
+    let runtime = root.join("runtime");
+    for path in [&member, &outside, &runtime] {
+        std::fs::create_dir(path).unwrap();
+    }
+    let retained =
+        cap_std::fs::Dir::open_ambient_dir(&member, cap_std::ambient_authority()).unwrap();
+    std::fs::rename(&member, root.join("original-member")).unwrap();
+    std::os::unix::fs::symlink(&outside, &member).unwrap();
+    let result = super::script_execution::execute_publish_lifecycle_script(
+        "printf marker > \"$INIT_CWD/outside-ran\"",
+        "fixture",
+        "1.0.0",
+        &member,
+        &retained,
+        &[("INIT_CWD".into(), member.display().to_string())],
+        &runtime,
+        &runtime,
+        &runtime,
+        std::time::Duration::from_secs(5),
+    );
+    assert!(
+        !outside.join("outside-ran").exists(),
+        "sandbox granted the replacement directory write access: {result:?}"
+    );
+    assert!(result.is_err(), "replaced source directory was accepted");
 }

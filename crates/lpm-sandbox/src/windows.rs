@@ -309,18 +309,14 @@ impl Sandbox for WindowsSandbox {
         // other backends), then a post-spawn integrity-drop +
         // job-object-assign + resume sequence.
         let mut command = Command::new(&cmd.program);
-        for a in &cmd.args {
-            command.arg(a);
-        }
+        crate::windows_command_line::apply_arguments(&mut command, &cmd.program, &cmd.args);
         if cmd.env_clear {
             command.env_clear();
         }
         for (k, v) in &cmd.envs {
             command.env(k, v);
         }
-        if let Some(dir) = &cmd.current_dir {
-            command.current_dir(dir);
-        }
+        cmd.configure_current_dir(&mut command);
         command.stdout(Stdio::from(cmd.stdout));
         command.stderr(Stdio::from(cmd.stderr));
         command.stdin(Stdio::from(cmd.stdin));

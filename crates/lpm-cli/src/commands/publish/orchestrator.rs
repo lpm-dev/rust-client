@@ -243,7 +243,7 @@ pub(crate) struct PublishTargetPreflight {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct PublishIntent {
-    project_directory_identity: std::sync::Arc<same_file::Handle>,
+    project_directory_identity: crate::commands::publish_common::DirectoryIdentity,
     package_name: String,
     package_version: String,
     package_manifest_fingerprint: [u8; 32],
@@ -497,7 +497,11 @@ fn publish_intent_from_manifest(
     })?;
     let projected_manifest_fingerprint = projected_manifest_fingerprint(manifest, workspace)?;
     Ok(PublishIntent {
-        project_directory_identity: std::sync::Arc::clone(&manifest.package_json_parent_identity),
+        project_directory_identity:
+            crate::commands::publish_common::DirectoryIdentity::from_directory(
+                &manifest.package_json_parent,
+            )
+            .map_err(LpmError::Io)?,
         package_name: manifest.name.clone(),
         package_version: manifest.version.clone(),
         package_manifest_fingerprint: Sha256::digest(manifest.package_json_content.as_bytes())

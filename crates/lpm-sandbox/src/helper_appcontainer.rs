@@ -42,6 +42,7 @@
 
 #![cfg(target_os = "windows")]
 
+use crate::windows_command_line::build_command_line_wide;
 use std::ffi::{OsStr, OsString};
 use std::os::windows::ffi::OsStrExt;
 use std::os::windows::fs::MetadataExt;
@@ -749,7 +750,7 @@ pub fn run_appcontainer_spawn(args: HelperArgs) -> Result<i32, AppContainerError
     //    via System32 / nvm dirs / etc. With
     //    `lpApplicationName` set, `CreateProcessW` treats it as a
     //    literal path and a bare name fails with ERROR_FILE_NOT_FOUND.
-    //    Quoting in `quote_arg_for_cmdline` ensures the first token
+    //    Quoting the executable ensures the first token
     //    is unambiguously the program path even when it contains
     //    spaces.
     let cmdline_wide = build_command_line_wide(&args.program, &args.program_args);
@@ -1637,73 +1638,6 @@ fn stdio_handle(
     }
 }
 
-// ── Command line + environment block builders ─────────────────────
-
-/// Build a `LPWSTR` command line from program + args following the
-/// `CommandLineToArgvW` quoting rules. Result is a null-terminated
-/// UTF-16 buffer suitable for `CreateProcessW`'s `lpCommandLine`.
-///
-/// `program` is also embedded as argv[0] so the lifecycle child
-/// sees a sensible `_argv[0]`. We keep `lpApplicationName` set
-/// separately to the program path so Windows uses the explicit
-/// path rather than re-parsing argv[0].
-fn build_command_line_wide(program: &OsStr, args: &[OsString]) -> Vec<u16> {
-    let mut s = String::new();
-    s.push_str(&quote_arg_for_cmdline(&program.to_string_lossy()));
-    for a in args {
-        s.push(' ');
-        s.push_str(&quote_arg_for_cmdline(&a.to_string_lossy()));
-    }
-    let mut wide: Vec<u16> = s.encode_utf16().collect();
-    wide.push(0);
-    wide
-}
-
-/// Quote a single argv element per `CommandLineToArgvW`'s parsing
-/// rules. Reference: Microsoft documentation for argv parsing in
-/// commercial CRTs.
-fn quote_arg_for_cmdline(arg: &str) -> String {
-    if !arg.is_empty()
-        && !arg
-            .chars()
-            .any(|c| c == ' ' || c == '\t' || c == '"' || c == '\n' || c == '\u{0B}')
-    {
-        return arg.to_string();
-    }
-    let mut out = String::with_capacity(arg.len() + 2);
-    out.push('"');
-    let mut backslashes = 0;
-    for c in arg.chars() {
-        match c {
-            '\\' => {
-                backslashes += 1;
-                out.push('\\');
-            }
-            '"' => {
-                // Double every preceding backslash + escape the
-                // quote itself.
-                for _ in 0..backslashes {
-                    out.push('\\');
-                }
-                out.push('\\');
-                out.push('"');
-                backslashes = 0;
-            }
-            other => {
-                backslashes = 0;
-                out.push(other);
-            }
-        }
-    }
-    // Double trailing backslashes so they don't escape the closing
-    // quote.
-    for _ in 0..backslashes {
-        out.push('\\');
-    }
-    out.push('"');
-    out
-}
-
 /// Build the Unicode environment block: `KEY=VALUE\0KEY=VALUE\0...\0\0`.
 ///
 /// When `env_clear` is false the helper's own env is the base layer
@@ -1838,59 +1772,6 @@ mod tests {
             process_working_directory(Path::new(r"\\server\share\project"), OsStr::new("CMD.EXE"))
                 .is_err()
         );
-    }
-
-    #[test]
-    fn quote_arg_for_cmdline_passes_simple_args_unmodified() {
-        assert_eq!(quote_arg_for_cmdline("simple"), "simple");
-        assert_eq!(
-            quote_arg_for_cmdline("C:/Windows/System32/cmd.exe"),
-            "C:/Windows/System32/cmd.exe",
-        );
-    }
-
-    #[test]
-    fn quote_arg_for_cmdline_quotes_args_with_spaces() {
-        assert_eq!(quote_arg_for_cmdline("hello world"), "\"hello world\"");
-        assert_eq!(
-            quote_arg_for_cmdline("C:\\Program Files\\node.exe"),
-            "\"C:\\Program Files\\node.exe\"",
-        );
-    }
-
-    #[test]
-    fn quote_arg_for_cmdline_escapes_embedded_quotes() {
-        assert_eq!(quote_arg_for_cmdline(r#"a"b"#), r#""a\"b""#);
-    }
-
-    #[test]
-    fn quote_arg_for_cmdline_doubles_trailing_backslashes_to_avoid_escaping_close_quote() {
-        // `C:\foo\` inside an arg containing a space must become
-        // `"C:\foo\\"` so the closing quote isn't escaped.
-        assert_eq!(
-            quote_arg_for_cmdline("C:\\foo with space\\"),
-            "\"C:\\foo with space\\\\\"",
-        );
-    }
-
-    #[test]
-    fn quote_arg_for_cmdline_doubles_backslashes_before_internal_quote() {
-        // `a\"b` must become `"a\\\"b"` — the single backslash
-        // before the quote needs doubling + the quote needs
-        // escaping.
-        assert_eq!(quote_arg_for_cmdline(r#"a\"b"#), r#""a\\\"b""#);
-    }
-
-    #[test]
-    fn build_command_line_wide_emits_null_terminated_utf16() {
-        let cmdline = build_command_line_wide(
-            OsStr::new("C:/Windows/System32/cmd.exe"),
-            &[OsString::from("/c"), OsString::from("exit 0")],
-        );
-        assert_eq!(*cmdline.last().expect("must have terminator"), 0);
-        let decoded = String::from_utf16_lossy(&cmdline[..cmdline.len() - 1]);
-        // /c is bare; "exit 0" contains a space → quoted.
-        assert_eq!(decoded, "C:/Windows/System32/cmd.exe /c \"exit 0\"");
     }
 
     #[test]
