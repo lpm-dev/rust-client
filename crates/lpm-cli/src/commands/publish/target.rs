@@ -152,7 +152,7 @@ fn publish_target_identity(target: &PublishTarget) -> String {
     normalized_custom_publish_endpoint(registry_url).unwrap_or_else(|| registry_url.clone())
 }
 
-fn normalized_custom_publish_endpoint(registry_url: &str) -> Option<String> {
+pub(super) fn normalized_custom_publish_endpoint(registry_url: &str) -> Option<String> {
     let mut parsed = reqwest::Url::parse(registry_url).ok()?;
     let path = canonicalize_publish_endpoint_path(parsed.path());
     let path = path.trim_end_matches('/');

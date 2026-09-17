@@ -214,7 +214,8 @@ pub(crate) fn read_publish_manifest_from_source(
         package_json_metadata.len(),
     )?;
     let pkg_json: serde_json::Value =
-        serde_json::from_str(&content).map_err(|e| LpmError::Registry(e.to_string()))?;
+        serde_json::from_str(lpm_common::strip_utf8_bom_str(&content))
+            .map_err(|e| LpmError::Registry(e.to_string()))?;
     validate_publish_dependency_fields(&pkg_json)?;
 
     let name = pkg_json
