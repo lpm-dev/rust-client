@@ -641,6 +641,14 @@ pub(super) fn should_suppress_update_banner(is_self_update_command: bool) -> boo
     is_self_update_command
 }
 
+pub(super) fn command_allows_background_update(command: &Commands) -> bool {
+    match command {
+        Commands::Install(args) => !args.offline,
+        Commands::Ci(args) => !args.offline,
+        _ => true,
+    }
+}
+
 /// spawn a detached child process to refresh the update cache.
 ///
 /// The child re-execs the current binary with `internal-update-check`.
@@ -759,6 +767,34 @@ mod tests {
             !should_suppress_update_banner(false),
             "any other command → show banner"
         );
+    }
+
+    #[test]
+    fn offline_commands_never_allow_background_update_requests() {
+        for args in [
+            vec!["lpm", "install", "--offline"],
+            vec!["lpm", "i", "--offline"],
+            vec!["lpm", "install", "--offline", "package-name"],
+            vec!["lpm", "install", "--offline", "--json"],
+            vec!["lpm", "ci", "--offline"],
+        ] {
+            let cli = Cli::try_parse_from(&args).unwrap();
+            assert!(
+                !command_allows_background_update(cli.command.as_ref().unwrap()),
+                "{args:?}"
+            );
+        }
+        for args in [
+            vec!["lpm", "install"],
+            vec!["lpm", "ci"],
+            vec!["lpm", "store", "path"],
+        ] {
+            let cli = Cli::try_parse_from(&args).unwrap();
+            assert!(
+                command_allows_background_update(cli.command.as_ref().unwrap()),
+                "{args:?}"
+            );
+        }
     }
 
     #[test]

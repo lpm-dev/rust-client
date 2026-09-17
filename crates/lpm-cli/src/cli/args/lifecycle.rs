@@ -41,8 +41,8 @@ pub(crate) struct InstallArgs {
     pub(crate) no_recursive: bool,
 
     /// Maximum number of workspace packages a recursive install runs
-    /// concurrently. Defaults to 1; the `LPM_WORKSPACE_CONCURRENCY`
-    /// environment variable overrides the default when this flag is absent.
+    /// concurrently. Overrides `LPM_WORKSPACE_CONCURRENCY` and automatic
+    /// scheduling. Use 1 to install workspace packages sequentially.
     #[arg(long, value_name = "N", conflicts_with = "no_recursive")]
     pub(crate) workspace_concurrency: Option<std::num::NonZeroUsize>,
 
@@ -59,6 +59,7 @@ pub(crate) struct InstallArgs {
     pub(crate) prod: bool,
 
     /// Install without network (use lockfile + global store only).
+    /// Cannot be combined with package specs.
     #[arg(long)]
     pub(crate) offline: bool,
 
@@ -114,7 +115,7 @@ pub(crate) struct InstallArgs {
     pub(crate) no_strict_peer_dependencies: bool,
 
     /// Override the minimumReleaseAge cooldown for this install only.
-    /// Accepts `<N>h` (hours), `<N>d` (days), or plain `<N>` seconds.
+    /// Accepts `<N>m` (minutes), `<N>h` (hours), `<N>d` (days), or plain `<N>` seconds.
     /// Use `0` to disable the cooldown for this invocation; any other
     /// value tightens or loosens the window vs. the disabled default /
     /// `package.json > lpm > minimumReleaseAge` /
@@ -122,7 +123,7 @@ pub(crate) struct InstallArgs {
     ///
     /// The full precedence chain is `--min-release-age` (this flag,
     /// highest) → package.json →
-    /// `~/.lpm/config.toml` → 24h default. `--allow-new` and this
+    /// `~/.lpm/config.toml` → disabled default. `--allow-new` and this
     /// flag are independent escape hatches: `--allow-new` bypasses
     /// the check entirely; `--min-release-age=<dur>` adjusts the
     /// window that the check enforces.

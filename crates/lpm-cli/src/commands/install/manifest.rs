@@ -1109,6 +1109,15 @@ async fn route_explicit_packages(
     Ok((javascript, swift))
 }
 
+#[derive(Clone, Copy, Default)]
+pub(crate) struct AddInstallOptions {
+    pub(crate) strict_integrity: bool,
+    pub(crate) linker_override: Option<lpm_linker::LinkerMode>,
+    pub(crate) no_editor_setup: bool,
+    pub(crate) no_security_summary: bool,
+    pub(crate) auto_build: bool,
+}
+
 /// Install specific packages: add them to package.json then run full install.
 /// For Swift packages (ecosystem=swift), uses SE-0292 registry mode instead.
 ///
@@ -1166,6 +1175,7 @@ pub async fn run_add_packages(
     audit_after_install: bool,
     timing: bool,
     lpm_skills_preference: crate::lpm_skills_config::LpmSkillsPreference,
+    install_options: AddInstallOptions,
 ) -> Result<(), LpmError> {
     let reviewed = crate::typosquat_guard::guard_explicit_package_specs(
         project_dir,
@@ -1351,15 +1361,15 @@ pub async fn run_add_packages(
                 FrozenLockfileMode::Never,
                 force,
                 allow_new,
-                false, // strict_integrity — internal call, no flag
+                install_options.strict_integrity,
                 no_engine_strict,
                 strict_peer_dependencies_override,
-                None, // linker_override
+                install_options.linker_override,
                 lpm_skills_preference,
-                false, // no_editor_setup
-                false, // no_security_summary
-                false, // auto_build
-                None,  // target_set: legacy single-project path
+                install_options.no_editor_setup,
+                install_options.no_security_summary,
+                install_options.auto_build,
+                None, // target_set: legacy single-project path
                 Some(&mut direct_versions),
                 Some(js_packages.len()),
                 script_policy_override,
@@ -1493,6 +1503,7 @@ pub async fn run_install_filtered_add(
     audit_after_install: bool,
     timing: bool,
     lpm_skills_preference: crate::lpm_skills_config::LpmSkillsPreference,
+    install_options: AddInstallOptions,
 ) -> Result<(), LpmError> {
     // 1. Resolve CLI flags into a concrete target list.
     let targets = crate::commands::install_targets::resolve_install_targets(
@@ -1881,14 +1892,14 @@ pub async fn run_install_filtered_add(
                     FrozenLockfileMode::Never,
                     force,
                     allow_new,
-                    false, // strict_integrity — workspace-add path, no flag
+                    install_options.strict_integrity,
                     no_engine_strict,
                     strict_peer_dependencies_override,
-                    None, // linker_override
+                    install_options.linker_override,
                     lpm_skills_preference,
-                    false, // no_editor_setup
-                    false, // no_security_summary
-                    false, // auto_build
+                    install_options.no_editor_setup,
+                    install_options.no_security_summary,
+                    install_options.auto_build,
                     Some(&target_paths),
                     Some(&mut direct_versions),
                     Some(packages.len()),
