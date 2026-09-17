@@ -143,18 +143,19 @@ pub(crate) fn resolve_token_auth_for_registry(
     registry_url: &str,
     policy: NpmRegistryAuthPolicy,
 ) -> Result<NpmAuth, LpmError> {
-    if registry_is_default_npm(registry_url)
-        || policy == NpmRegistryAuthPolicy::AllowAmbientNpmToken
-    {
+    if registry_is_default_npm(registry_url) {
         return resolve_token_auth();
     }
-
-    custom_registry_token(registry_url)
-        .map(|token| NpmAuth {
+    if let Some(token) = custom_registry_token(registry_url) {
+        return Ok(NpmAuth {
             token,
             source: NpmAuthSource::Token,
-        })
-        .ok_or_else(|| missing_custom_registry_token_error(registry_url))
+        });
+    }
+    if policy == NpmRegistryAuthPolicy::AllowAmbientNpmToken {
+        return resolve_token_auth();
+    }
+    Err(missing_custom_registry_token_error(registry_url))
 }
 
 pub(crate) fn missing_npm_token_error() -> LpmError {

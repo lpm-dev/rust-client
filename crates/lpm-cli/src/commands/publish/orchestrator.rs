@@ -768,6 +768,10 @@ pub(crate) async fn with_publish_install_lock_for_project<R>(
     let lock_directory = open_publish_lock_directory(&transaction_root)?;
     with_publish_install_lock(lock_directory, shared, async {
         ensure_publish_transaction_root_unchanged(project_dir, &publish_source, &transaction_root)?;
+        crate::release_plan::ensure_no_pending_release_transaction_from_open_root(
+            transaction_root.path(),
+            &transaction_root.directory,
+        )?;
         body.await
     })
     .await

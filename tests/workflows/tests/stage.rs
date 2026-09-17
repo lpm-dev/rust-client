@@ -1,3 +1,4 @@
+mod stage_contract;
 mod support;
 
 use base64::{Engine, engine::general_purpose::STANDARD as BASE64};

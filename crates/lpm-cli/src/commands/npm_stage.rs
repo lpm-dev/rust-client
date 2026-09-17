@@ -607,7 +607,10 @@ pub(crate) async fn download_staged_package(
             "downloaded staged tarball has an invalid package version {version:?}: {error}"
         ))
     })?;
-    let filename = format!("{}-{version}-{stage_id}.tgz", safe_tarball_name(name));
+    let suffix = format!("-{stage_id}.tgz");
+    let mut filename = format!("{}-{version}", safe_tarball_name(name));
+    filename.truncate(filename.floor_char_boundary(255 - suffix.len()));
+    filename.push_str(&suffix);
     let path = output_dir.join(filename);
     if path.parent() != Some(output_dir) {
         return Err(LpmError::Registry(
@@ -890,7 +893,7 @@ fn stage_error_message(
     let error = lpm_common::redact_exact_secret(error, token);
     match status.as_u16() {
         401 => format!(
-            "{action} failed: authentication failed. Run `lpm login --npm` or set NPM_TOKEN."
+            "{action} failed: authentication failed. For public npm, run `lpm login --npm` or set NPM_TOKEN. For a custom registry, run `lpm login --login-registry <configured-registry-url> --token <token>`."
         ),
         403 => format!(
             "{action} forbidden — token may lack npm staged-publish permission. npm says: {error}"
@@ -940,7 +943,7 @@ fn read_manifest_from_tarball_reader(
                     lpm_common::CONFIG_FILE_SIZE_CAP_BYTES
                 )));
             }
-            let manifest = serde_json::from_slice(&content)
+            let manifest = serde_json::from_slice(lpm_common::strip_utf8_bom_bytes(&content))
                 .map_err(|e| LpmError::Registry(format!("staged manifest is invalid JSON: {e}")))?;
             return Ok(std::ops::ControlFlow::Break(manifest));
         }
