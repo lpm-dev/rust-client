@@ -42,6 +42,7 @@ pub mod patch_state;
 pub mod path_onboarding;
 pub mod precedence;
 mod privilege;
+mod project_fs;
 mod prompt;
 mod provenance;
 mod provenance_bundle;

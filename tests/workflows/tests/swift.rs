@@ -1808,6 +1808,21 @@ let package = Package(
 async fn failed_swift_uninstall_restores_manifest_and_lockfile() {
     let mock = MockRegistry::start().await;
     let project = swift_project();
+    mock.with_package("remove-me", "1.0.0", &make_tarball("remove-me", "1.0.0"))
+        .await;
+    project.write_file(".npmrc", &format!("registry={}/\n", mock.url()));
+    lpm_with_registry(&project, &mock.url())
+        .args([
+            "install",
+            "remove-me@1.0.0",
+            "--no-skills",
+            "--no-security-summary",
+        ])
+        .assert()
+        .success();
+    let original_package_json = project.read_file("package.json");
+    let original_lpm_lock = project.read_file("lpm.lock");
+    let original_lpm_lockb = std::fs::read(project.path().join("lpm.lockb")).ok();
     project.write_file(
         "Package.swift",
         r#"// swift-tools-version: 5.9
@@ -1830,13 +1845,19 @@ let package = Package(
         r#"{"version":2,"pins":[{"identity":"rewritten"}]}"#,
     );
     let output = command
-        .args(["uninstall", SWIFT_PACKAGE])
+        .args(["uninstall", SWIFT_PACKAGE, "remove-me"])
         .output()
         .expect("run failing Swift uninstall");
 
     assert!(!output.status.success());
     assert_eq!(project.read_file("Package.swift"), original_manifest);
     assert_eq!(project.read_file("Package.resolved"), original_lockfile);
+    assert_eq!(project.read_file("package.json"), original_package_json);
+    assert_eq!(project.read_file("lpm.lock"), original_lpm_lock);
+    assert_eq!(
+        std::fs::read(project.path().join("lpm.lockb")).ok(),
+        original_lpm_lockb
+    );
 }
 
 #[tokio::test]

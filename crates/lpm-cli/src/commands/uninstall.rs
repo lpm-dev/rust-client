@@ -1,6 +1,7 @@
 use super::uninstall_ui;
 use crate::commands::install::workspace_lockfile;
 use crate::install_ui;
+use cap_fs_ext::DirExt as _;
 use lpm_common::LpmError;
 use lpm_registry::RegistryClient;
 use serde_json::Value;
@@ -67,6 +68,7 @@ pub(crate) fn cleanup_removed_packages(
     removed: &[String],
     direct_versions: &HashMap<String, String>,
 ) -> Result<CleanupReport, LpmError> {
+    validate_cleanup_paths(project_dir, removed)?;
     let pruned = prune_lockfile_to_current_manifest(project_dir)?;
     let orphaned: Vec<PackageVersion> = pruned
         .removed_packages
@@ -83,6 +85,9 @@ pub(crate) fn cleanup_removed_packages(
     let node_modules = project_dir.join("node_modules");
     let mut freed_bytes = 0u64;
     for name in removed {
+        if pruned.retained_roots.contains(name) {
+            continue;
+        }
         if name.starts_with("@lpm.dev/") {
             freed_bytes = freed_bytes
                 .saturating_add(crate::commands::skills::package::remove(project_dir, name)?);
@@ -95,6 +100,12 @@ pub(crate) fn cleanup_removed_packages(
         freed_bytes = freed_bytes.saturating_add(remove_node_modules_entry(&node_modules, name)?);
     }
     for package in &orphaned {
+        if pruned.retained_roots.contains(&package.name)
+            || node_modules_package_version(project_dir, &package.name)
+                .is_some_and(|version| version != package.version)
+        {
+            continue;
+        }
         freed_bytes = freed_bytes
             .saturating_add(cleanup_bin_shims_for_package(&node_modules, &package.name)?);
         freed_bytes =
@@ -111,27 +122,36 @@ pub(crate) fn cleanup_removed_packages(
 }
 
 fn invalidate_install_hash_marker(project_dir: &Path) -> Result<(), LpmError> {
-    let path = project_dir.join(".lpm").join("install-hash");
-    let metadata = match path.symlink_metadata() {
-        Ok(metadata) => metadata,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(err) => return Err(err.into()),
-    };
-
-    if metadata.is_dir() && !metadata.file_type().is_symlink() {
-        std::fs::remove_dir_all(&path)?;
-        return Ok(());
+    if let Some(directory) = crate::project_fs::open_directory(project_dir, Path::new(".lpm"))? {
+        crate::project_fs::remove_entry(&directory, Path::new("install-hash"))?;
     }
-
-    #[cfg(unix)]
-    std::fs::remove_file(&path).or_else(|_| std::fs::remove_dir(&path))?;
-    #[cfg(windows)]
-    std::fs::remove_dir(&path).or_else(|_| std::fs::remove_file(&path))?;
-
     Ok(())
 }
 
+fn validate_cleanup_paths(project_dir: &Path, names: &[String]) -> Result<(), LpmError> {
+    crate::project_fs::open_directory(project_dir, Path::new("node_modules/.bin"))?;
+    for name in names {
+        validate_uninstall_name(name)?;
+        if let Some(scope) = npm_scope_name(name) {
+            crate::project_fs::open_directory(project_dir, &Path::new("node_modules").join(scope))?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_uninstall_name(name: &str) -> Result<(), LpmError> {
+    lpm_lockfile::Lockfile::validate_package_name_and_version(name, "0.0.0")
+        .map_err(|error| LpmError::InvalidPackageName(error.to_string()))
+}
+
 fn cleanup_bin_shims_for_package(node_modules: &Path, name: &str) -> Result<u64, LpmError> {
+    let Some(bin_directory) = crate::project_fs::open_directory(
+        node_modules.parent().unwrap_or(node_modules),
+        Path::new("node_modules/.bin"),
+    )?
+    else {
+        return Ok(0);
+    };
     let package_dir = node_modules.join(name);
     let manifest_path = package_dir.join("package.json");
     let Ok(pkg_json) = lpm_workspace::read_package_json(&manifest_path) else {
@@ -149,14 +169,20 @@ fn cleanup_bin_shims_for_package(node_modules: &Path, name: &str) -> Result<u64,
             continue;
         };
         let expected_target = package_dir.join(script_path);
-        freed_bytes =
-            freed_bytes.saturating_add(remove_owned_bin_shim(&shim_path, &expected_target)?);
+        freed_bytes = freed_bytes.saturating_add(remove_owned_bin_shim(
+            &bin_directory,
+            &shim_path,
+            &expected_target,
+        )?);
 
         #[cfg(windows)]
         {
             let cmd_path = shim_path.with_extension("cmd");
-            freed_bytes =
-                freed_bytes.saturating_add(remove_owned_cmd_shim(&cmd_path, &expected_target)?);
+            freed_bytes = freed_bytes.saturating_add(remove_owned_cmd_shim(
+                &bin_directory,
+                &cmd_path,
+                &expected_target,
+            )?);
         }
     }
 
@@ -175,7 +201,11 @@ fn safe_bin_shim_path(bin_dir: &Path, cmd_name: &str) -> Option<PathBuf> {
     Some(bin_dir.join(cmd_name))
 }
 
-fn remove_owned_bin_shim(shim_path: &Path, expected_target: &Path) -> Result<u64, LpmError> {
+fn remove_owned_bin_shim(
+    directory: &cap_std::fs::Dir,
+    shim_path: &Path,
+    expected_target: &Path,
+) -> Result<u64, LpmError> {
     let Ok(metadata) = shim_path.symlink_metadata() else {
         return Ok(0);
     };
@@ -194,10 +224,13 @@ fn remove_owned_bin_shim(shim_path: &Path, expected_target: &Path) -> Result<u64
             .unwrap_or_else(|| Path::new(""))
             .join(actual_target)
     };
-    let Ok(actual_canonical) = actual_abs.canonicalize() else {
+    let Some(actual_canonical) = crate::project_fs::canonicalize_with_missing_tail(&actual_abs)
+    else {
         return Ok(0);
     };
-    let Ok(expected_canonical) = expected_target.canonicalize() else {
+    let Some(expected_canonical) =
+        crate::project_fs::canonicalize_with_missing_tail(expected_target)
+    else {
         return Ok(0);
     };
     if actual_canonical != expected_canonical {
@@ -205,19 +238,25 @@ fn remove_owned_bin_shim(shim_path: &Path, expected_target: &Path) -> Result<u64
     }
 
     let freed_bytes = removable_path_size(shim_path, &metadata);
-    std::fs::remove_file(shim_path)?;
+    directory.remove_file_or_symlink(shim_path.file_name().unwrap_or_default())?;
     Ok(freed_bytes)
 }
 
 #[cfg(windows)]
-fn remove_owned_cmd_shim(shim_path: &Path, expected_target: &Path) -> Result<u64, LpmError> {
+fn remove_owned_cmd_shim(
+    directory: &cap_std::fs::Dir,
+    shim_path: &Path,
+    expected_target: &Path,
+) -> Result<u64, LpmError> {
     let Ok(metadata) = shim_path.symlink_metadata() else {
         return Ok(0);
     };
     if !metadata.is_file() {
         return Ok(0);
     }
-    let Ok(expected_canonical) = expected_target.canonicalize() else {
+    let Some(expected_canonical) =
+        crate::project_fs::canonicalize_with_missing_tail(expected_target)
+    else {
         return Ok(0);
     };
     let Ok(content) =
@@ -228,14 +267,16 @@ fn remove_owned_cmd_shim(shim_path: &Path, expected_target: &Path) -> Result<u64
     let Some(actual_target) = generated_cmd_shim_target(&content) else {
         return Ok(0);
     };
-    let Ok(actual_canonical) = Path::new(actual_target).canonicalize() else {
+    let Some(actual_canonical) =
+        crate::project_fs::canonicalize_with_missing_tail(Path::new(actual_target))
+    else {
         return Ok(0);
     };
     if actual_canonical != expected_canonical {
         return Ok(0);
     }
     let freed_bytes = removable_path_size(shim_path, &metadata);
-    std::fs::remove_file(shim_path)?;
+    directory.remove_file(shim_path.file_name().unwrap_or_default())?;
     Ok(freed_bytes)
 }
 
@@ -274,29 +315,26 @@ fn generated_cmd_shim_target(content: &str) -> Option<&str> {
 }
 
 fn remove_node_modules_entry(node_modules: &Path, name: &str) -> Result<u64, LpmError> {
+    validate_uninstall_name(name)?;
+    let relative_parent =
+        Path::new("node_modules").join(Path::new(name).parent().unwrap_or(Path::new("")));
+    let Some(directory) = crate::project_fs::open_directory(
+        node_modules.parent().unwrap_or(node_modules),
+        &relative_parent,
+    )?
+    else {
+        return Ok(0);
+    };
     let link = node_modules.join(name);
     let Ok(metadata) = link.symlink_metadata() else {
         return Ok(0);
     };
     let freed_bytes = removable_path_size(&link, &metadata);
 
-    if metadata.file_type().is_symlink() {
-        #[cfg(unix)]
-        std::fs::remove_file(&link).or_else(|_| std::fs::remove_dir(&link))?;
-        #[cfg(windows)]
-        std::fs::remove_dir(&link).or_else(|_| std::fs::remove_file(&link))?;
-        return Ok(freed_bytes);
-    }
-
-    if metadata.is_dir() {
-        std::fs::remove_dir_all(&link)?;
-        return Ok(freed_bytes);
-    }
-
-    if metadata.is_file() {
-        std::fs::remove_file(&link)?;
-    }
-
+    crate::project_fs::remove_entry(
+        &directory,
+        Path::new(name).file_name().map_or(Path::new(""), Path::new),
+    )?;
     Ok(freed_bytes)
 }
 
@@ -329,12 +367,18 @@ fn cleanup_empty_scope_dirs(
 
     let mut cleaned = 0usize;
     for scope in scopes {
-        let scope_dir = node_modules.join(scope);
-        let Ok(mut entries) = std::fs::read_dir(&scope_dir) else {
+        let relative = Path::new("node_modules").join(scope);
+        let Some(directory) = crate::project_fs::open_directory(
+            node_modules.parent().unwrap_or(node_modules),
+            &relative,
+        )?
+        else {
             continue;
         };
+        let mut entries = directory.entries()?;
         if entries.next().is_none() {
-            std::fs::remove_dir(&scope_dir)?;
+            drop(entries);
+            directory.remove_open_dir()?;
             cleaned += 1;
         }
     }
@@ -445,10 +489,24 @@ fn split_locked_dependency(entry: &str) -> Option<(&str, &str)> {
 fn locked_package_versions(project_dir: &Path, packages: &[String]) -> HashMap<String, String> {
     let mut versions = HashMap::with_capacity(packages.len());
     if let Ok(lockfile) = workspace_lockfile::read_project(project_dir) {
-        let package_names: HashSet<&str> = packages.iter().map(String::as_str).collect();
-        for pkg in &lockfile.packages {
-            if package_names.contains(pkg.name.as_str()) {
-                versions.insert(pkg.name.clone(), pkg.version.clone());
+        for name in packages {
+            if let Some(root) = lockfile.root_resolutions.get(name) {
+                versions.insert(name.clone(), root.version.clone());
+                continue;
+            }
+            if let Some(version) = node_modules_package_version(project_dir, name) {
+                versions.insert(name.clone(), version);
+                continue;
+            }
+            let canonical = lockfile.root_aliases.get(name).unwrap_or(name);
+            let mut candidates = lockfile
+                .packages
+                .iter()
+                .filter(|package| package.name == *canonical);
+            if let Some(package) = candidates.next()
+                && candidates.all(|candidate| candidate.version == package.version)
+            {
+                versions.insert(name.clone(), package.version.clone());
             }
         }
     }
@@ -483,6 +541,7 @@ fn node_modules_package_version(project_dir: &Path, package: &str) -> Option<Str
 #[derive(Debug, Default)]
 struct LockfilePruneReport {
     removed_packages: Vec<PackageVersion>,
+    retained_roots: HashSet<String>,
 }
 
 fn prune_lockfile_to_current_manifest(project_dir: &Path) -> Result<LockfilePruneReport, LpmError> {
@@ -492,9 +551,13 @@ fn prune_lockfile_to_current_manifest(project_dir: &Path) -> Result<LockfilePrun
     let manifest: Value =
         serde_json::from_str(&manifest_content).map_err(|e| LpmError::Registry(e.to_string()))?;
     let direct_specs = collect_manifest_dependency_specs(&manifest);
+    let mut retained_roots = direct_specs.keys().cloned().collect::<HashSet<_>>();
 
     let Ok(mut lockfile) = workspace_lockfile::read_project(project_dir) else {
-        return Ok(LockfilePruneReport::default());
+        return Ok(LockfilePruneReport {
+            retained_roots,
+            ..LockfilePruneReport::default()
+        });
     };
     reconcile_importer_dependencies(&mut lockfile, &manifest);
 
@@ -513,14 +576,22 @@ fn prune_lockfile_to_current_manifest(project_dir: &Path) -> Result<LockfilePrun
         lockfile.ambient_peer_installs.clear();
         workspace_lockfile::write(project_dir, lockfile)
             .map_err(|e| LpmError::Registry(e.to_string()))?;
-        return Ok(LockfilePruneReport { removed_packages });
+        return Ok(LockfilePruneReport {
+            removed_packages,
+            retained_roots,
+        });
     }
 
     let exact_schema =
         lockfile.metadata.lockfile_version >= lpm_lockfile::LOCKFILE_VERSION_WITH_PACKAGE_INSTANCES;
     let reachable_instances = if exact_schema {
         Some(
-            exact_reachable_instances(&lockfile, &direct_specs).ok_or_else(|| {
+            exact_reachable_instances(
+                &lockfile,
+                &direct_specs,
+                &collect_manifest_section(&manifest, "optionalDependencies"),
+            )
+            .ok_or_else(|| {
                 LpmError::Registry(
                     "current lockfile is missing an exact dependency target; run lpm install"
                         .to_string(),
@@ -570,8 +641,24 @@ fn prune_lockfile_to_current_manifest(project_dir: &Path) -> Result<LockfilePrun
     lockfile
         .root_aliases
         .retain(|local, _| direct_specs.contains_key(local));
+    let kept_names = lockfile
+        .packages
+        .iter()
+        .map(|package| package.name.as_str())
+        .collect::<HashSet<_>>();
+    lockfile.ambient_peer_installs.retain(|name| {
+        kept_names.contains(name.as_str())
+            && lockfile.root_resolutions.get(name).is_none_or(|root| {
+                root.instance_id.is_none_or(|id| {
+                    reachable_instances
+                        .as_ref()
+                        .is_none_or(|reachable| reachable.contains(&id))
+                })
+            })
+    });
+    retained_roots.extend(lockfile.ambient_peer_installs.iter().cloned());
     lockfile.root_resolutions.retain(|local, root| {
-        direct_specs.contains_key(local)
+        retained_roots.contains(local)
             && root.instance_id.is_none_or(|instance_id| {
                 reachable_instances
                     .as_ref()
@@ -579,24 +666,19 @@ fn prune_lockfile_to_current_manifest(project_dir: &Path) -> Result<LockfilePrun
             })
     });
 
-    let kept_names: std::collections::HashSet<&str> = lockfile
-        .packages
-        .iter()
-        .map(|pkg| pkg.name.as_str())
-        .collect();
-    lockfile
-        .ambient_peer_installs
-        .retain(|name| kept_names.contains(name.as_str()));
-
     workspace_lockfile::write(project_dir, lockfile)
         .map_err(|e| LpmError::Registry(e.to_string()))?;
 
-    Ok(LockfilePruneReport { removed_packages })
+    Ok(LockfilePruneReport {
+        removed_packages,
+        retained_roots,
+    })
 }
 
 fn exact_reachable_instances(
     lockfile: &lpm_lockfile::Lockfile,
     direct_specs: &HashMap<String, String>,
+    optional_specs: &BTreeMap<String, String>,
 ) -> Option<HashSet<lpm_common::PackageInstanceId>> {
     let package_index = lockfile
         .packages
@@ -605,7 +687,11 @@ fn exact_reachable_instances(
         .collect::<HashMap<_, _>>();
     let mut queue = std::collections::VecDeque::with_capacity(lockfile.packages.len());
     for local in direct_specs.keys() {
-        queue.push_back(lockfile.root_resolutions.get(local)?.instance_id?);
+        match lockfile.root_resolutions.get(local) {
+            Some(root) => queue.push_back(root.instance_id?),
+            None if optional_specs.contains_key(local) => {}
+            None => return None,
+        }
     }
 
     let mut reachable = HashSet::with_capacity(lockfile.packages.len());
@@ -884,6 +970,9 @@ pub async fn run(
             "specify at least one package to uninstall".to_string(),
         ));
     }
+    for package in packages {
+        validate_uninstall_name(package)?;
+    }
 
     // route through the shared target resolver, which
     // handles all 8 cells of the install/uninstall decision matrix
@@ -914,7 +1003,9 @@ pub async fn run(
                 None => base.to_string(),
             }));
         }
-        if !json_output {
+        if json_output {
+            print_uninstall_json(&[], &[], &[])?;
+        } else {
             uninstall_ui::warn_no_filter_match();
             if let Some(h) = hint {
                 eprintln!();
@@ -983,13 +1074,20 @@ pub async fn run(
         .iter()
         .map(PathBuf::as_path)
         .collect::<Vec<_>>();
-    let optional_refs = optional_paths
-        .iter()
-        .map(PathBuf::as_path)
-        .collect::<Vec<_>>();
-
     let result =
         workspace_lockfile::scope_workspace_mutation_if_present(cwd, &member_roots, async {
+            for root in &member_roots {
+                validate_cleanup_paths(root, packages)?;
+                let lockfile = workspace_lockfile::active_lockfile_path(root);
+                optional_paths.push(lockfile.with_extension("lockb"));
+                optional_paths.push(lockfile);
+            }
+            optional_paths.sort();
+            optional_paths.dedup();
+            let optional_refs = optional_paths
+                .iter()
+                .map(PathBuf::as_path)
+                .collect::<Vec<_>>();
             let transaction = crate::manifest_tx::ManifestTransaction::snapshot_install_state(
                 &required_refs,
                 &optional_refs,
@@ -1023,26 +1121,13 @@ pub async fn run(
         freed_bytes,
     } = result;
 
-    if all_removed.is_empty() {
-        if !json_output {
-            uninstall_ui::warn_no_packages_removed();
-        }
+    if all_removed.is_empty() && !json_output {
+        uninstall_ui::warn_no_packages_removed();
         return Ok(());
     }
 
     if json_output {
-        let target_set: Vec<String> = targets
-            .member_manifests
-            .iter()
-            .map(|p| p.display().to_string())
-            .collect();
-        let json = serde_json::json!({
-            "success": true,
-            "removed": all_removed,
-            "not_found": all_not_found,
-            "target_set": target_set,
-        });
-        println!("{}", serde_json::to_string_pretty(&json).unwrap());
+        print_uninstall_json(&all_removed, &all_not_found, &targets.member_manifests)?;
     } else {
         eprintln!();
         for name in &all_removed {
@@ -1064,6 +1149,24 @@ pub async fn run(
         uninstall_ui::done_removed(all_removed.len(), uninstall_start.elapsed());
     }
 
+    Ok(())
+}
+
+fn print_uninstall_json(
+    removed: &[String],
+    not_found: &[String],
+    manifests: &[PathBuf],
+) -> Result<(), LpmError> {
+    let target_set = manifests
+        .iter()
+        .map(|path| path.display().to_string())
+        .collect::<Vec<_>>();
+    let json = serde_json::json!({"success": true, "removed": removed, "not_found": not_found, "target_set": target_set});
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&json)
+            .map_err(|error| LpmError::Registry(error.to_string()))?
+    );
     Ok(())
 }
 
@@ -1125,7 +1228,9 @@ mod tests {
         )
         .unwrap();
 
-        remove_owned_cmd_shim(&shim, &target).unwrap();
+        let directory =
+            cap_std::fs::Dir::open_ambient_dir(dir.path(), cap_std::ambient_authority()).unwrap();
+        remove_owned_cmd_shim(&directory, &shim, &target).unwrap();
 
         assert!(
             shim.symlink_metadata().is_err(),
@@ -1153,7 +1258,9 @@ mod tests {
         )
         .unwrap();
 
-        remove_owned_cmd_shim(&shim, &expected_target).unwrap();
+        let directory =
+            cap_std::fs::Dir::open_ambient_dir(dir.path(), cap_std::ambient_authority()).unwrap();
+        remove_owned_cmd_shim(&directory, &shim, &expected_target).unwrap();
 
         assert!(
             shim.is_file(),
