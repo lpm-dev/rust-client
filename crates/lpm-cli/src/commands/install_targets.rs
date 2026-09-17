@@ -130,6 +130,7 @@ pub fn resolve_install_targets(
         if !filters.is_empty()
             || !filter_prod.is_empty()
             || !changed_files_ignore_pattern.is_empty()
+            || !test_pattern.is_empty()
         {
             return Err(LpmError::Script(
                 "`--filter` requires a workspace. This also applies to `--filter-prod`, \

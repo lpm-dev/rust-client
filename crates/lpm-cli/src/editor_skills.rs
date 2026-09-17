@@ -3,12 +3,22 @@
 //! Current package-skill installs only materialize `.lpm/skills/<package>/`
 //! and never create editor links or modify editor configuration.
 
+use cap_fs_ext::DirExt as _;
 use std::path::Path;
 
 /// Remove editor links associated with one package's skills.
 pub fn remove_editor_skills(project_dir: &Path, package_short_name: &str) {
     let cursor_rules = project_dir.join(".cursor").join("rules");
-    let entries = match std::fs::read_dir(&cursor_rules) {
+    let directory = match crate::project_fs::open_directory(project_dir, Path::new(".cursor/rules"))
+    {
+        Ok(Some(directory)) => directory,
+        Ok(None) => return,
+        Err(error) => {
+            tracing::debug!("could not safely open package-skill editor links: {error}");
+            return;
+        }
+    };
+    let entries = match directory.entries() {
         Ok(entries) => entries,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return,
         Err(error) => {
@@ -31,13 +41,29 @@ pub fn remove_editor_skills(project_dir: &Path, package_short_name: &str) {
                 continue;
             }
         };
-        if entry.file_name().to_string_lossy().starts_with(&prefix)
-            && let Err(error) = std::fs::remove_file(entry.path())
+        let filename = entry.file_name();
+        let filename_text = filename.to_string_lossy();
+        let Some(skill_file) = filename_text.strip_prefix(&prefix) else {
+            continue;
+        };
+        let Ok(target) = directory.read_link_contents(&filename) else {
+            continue;
+        };
+        let target = cursor_rules.join(target);
+        let expected = project_dir
+            .join(".lpm/skills")
+            .join(package_short_name)
+            .join(skill_file);
+        let Some(actual) = crate::project_fs::canonicalize_with_missing_tail(&target) else {
+            continue;
+        };
+        if crate::project_fs::canonicalize_with_missing_tail(&expected).as_ref() == Some(&actual)
+            && let Err(error) = directory.remove_file_or_symlink(&filename)
             && error.kind() != std::io::ErrorKind::NotFound
         {
             tracing::debug!(
                 "could not remove package-skill editor link {}: {error}",
-                entry.path().display()
+                cursor_rules.join(filename).display()
             );
         }
     }
@@ -47,19 +73,42 @@ pub fn remove_editor_skills(project_dir: &Path, package_short_name: &str) {
 mod tests {
     use super::*;
 
+    #[cfg(any(unix, windows))]
     #[test]
     fn remove_editor_skills_only_cleans_matching_package_links() {
         let directory = tempfile::tempdir().unwrap();
         let cursor_rules = directory.path().join(".cursor/rules");
         std::fs::create_dir_all(&cursor_rules).unwrap();
-        std::fs::write(cursor_rules.join("owner.pkg--guide.md"), "skill content").unwrap();
-        std::fs::write(cursor_rules.join("owner.pkg--api.md"), "skill content").unwrap();
+        let skills = directory.path().join(".lpm/skills/owner.pkg");
+        std::fs::create_dir_all(&skills).unwrap();
+        std::fs::write(skills.join("guide.md"), "skill content").unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(
+            "../../.lpm/skills/owner.pkg/guide.md",
+            cursor_rules.join("owner.pkg--guide.md"),
+        )
+        .unwrap();
+        #[cfg(windows)]
+        std::os::windows::fs::symlink_file(
+            skills.join("guide.md"),
+            cursor_rules.join("owner.pkg--guide.md"),
+        )
+        .unwrap();
+        std::fs::write(cursor_rules.join("owner.pkg--api.md"), "user content").unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(
+            "other.pkg--guide.md",
+            cursor_rules.join("owner.pkg--foreign.md"),
+        )
+        .unwrap();
         std::fs::write(cursor_rules.join("other.pkg--guide.md"), "other content").unwrap();
 
         remove_editor_skills(directory.path(), "owner.pkg");
 
         assert!(!cursor_rules.join("owner.pkg--guide.md").exists());
-        assert!(!cursor_rules.join("owner.pkg--api.md").exists());
+        assert!(cursor_rules.join("owner.pkg--api.md").exists());
+        #[cfg(unix)]
+        assert!(cursor_rules.join("owner.pkg--foreign.md").is_symlink());
         assert!(cursor_rules.join("other.pkg--guide.md").exists());
     }
 }
