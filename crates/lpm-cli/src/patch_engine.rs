@@ -656,7 +656,11 @@ pub fn generate_patch(original_dir: &Path, edited_dir: &Path) -> Result<Generate
         // prefixes. For added files, original is `/dev/null`; for
         // deleted, modified is `/dev/null`.
         let mut opts = diffy::DiffOptions::default();
-        let rel_str = rel.to_string_lossy().to_string();
+        let rel_str = rel
+            .to_str()
+            .ok_or_else(|| LpmError::Script(format!("patch filename {rel:?} is not valid UTF-8")))?
+            .replace(std::path::MAIN_SEPARATOR, "/");
+        validate_apply_path(&rel_str, Path::new("generated patch"))?;
         if in_orig {
             opts.set_original_filename(format!("a/{rel_str}"));
         } else {
@@ -1350,20 +1354,6 @@ pub fn apply_patch_bytes(
     name: &str,
     version: &str,
 ) -> Result<AppliedPatch, LpmError> {
-    let patch_text = std::str::from_utf8(patch_bytes)
-        .map_err(|_| LpmError::Script(format!("patch file {patch_file:?} is not valid UTF-8")))?;
-    let chunks = split_multi_file_patch_with_limit(patch_text, Some(PATCH_MAX_OPERATIONS))
-        .map_err(|()| {
-            LpmError::Script(format!(
-                "patch file {patch_file:?} exceeds the {PATCH_MAX_OPERATIONS}-operation limit"
-            ))
-        })?;
-    if chunks.is_empty() {
-        return Err(LpmError::Script(format!(
-            "patch file {patch_file:?} contains no file diffs"
-        )));
-    }
-
     if locations.is_empty() {
         return Err(LpmError::Script(format!(
             "{name}@{version} declared in lpm.patchedDependencies but \
@@ -1386,25 +1376,29 @@ pub fn apply_patch_bytes(
         ))
     })?;
 
-    let mut validated = Vec::with_capacity(chunks.len());
-    for chunk in chunks {
-        validate_chunk_header_paths(chunk, patch_file)?;
-        let op = classify_patch_op(chunk).map_err(|error| {
-            LpmError::Script(format!(
-                "patch file {patch_file:?} parse error in chunk: {error}"
-            ))
-        })?;
-        validated.push(validate_patch_op(op, patch_file)?);
-    }
-    validate_nonoverlapping_operations(&validated, patch_file)?;
+    apply_patch_bytes_from_baseline(locations, patch_file, patch_bytes, &baseline, name, version)
+}
 
-    let baseline_root =
-        crate::patch_fs::SafeRoot::open(&baseline.pristine_dir).map_err(|error| {
-            LpmError::Script(format!(
-                "patch baseline for {name}@{version} is unavailable or unsafe: {error}"
-            ))
-        })?;
-    let prepared = prepare_patch_ops(validated, &baseline_root, patch_file, name, version)?;
+pub(crate) fn apply_patch_bytes_from_baseline(
+    locations: &[&MaterializedPackage],
+    patch_file: &Path,
+    patch_bytes: &[u8],
+    baseline: &lpm_store::InstalledPackageBaseline,
+    name: &str,
+    version: &str,
+) -> Result<AppliedPatch, LpmError> {
+    if locations.is_empty() {
+        return Err(LpmError::Script(format!(
+            "{name}@{version} has no patch destinations"
+        )));
+    }
+    let prepared = prepare_patch_bytes(
+        &baseline.pristine_dir,
+        patch_file,
+        patch_bytes,
+        name,
+        version,
+    )?;
 
     let mut destination_roots = Vec::with_capacity(locations.len());
     for location in locations {
@@ -1461,12 +1455,66 @@ pub fn apply_patch_bytes(
         name: name.to_string(),
         version: version.to_string(),
         patch_path: patch_file.to_path_buf(),
-        original_integrity: expected_integrity.to_string(),
+        original_integrity: baseline.integrity.clone(),
         locations_patched: locations.iter().map(|m| m.destination.clone()).collect(),
         files_modified,
         files_added,
         files_deleted,
     })
+}
+
+/// Check that an authored artifact satisfies the same contract as installation.
+pub(crate) fn validate_authored_patch(
+    baseline_dir: &Path,
+    patch_file: &Path,
+    patch_bytes: &[u8],
+    name: &str,
+    version: &str,
+) -> Result<(), LpmError> {
+    prepare_patch_bytes(baseline_dir, patch_file, patch_bytes, name, version).map(|_| ())
+}
+
+fn prepare_patch_bytes(
+    baseline_dir: &Path,
+    patch_file: &Path,
+    patch_bytes: &[u8],
+    name: &str,
+    version: &str,
+) -> Result<Vec<PreparedPatchOp>, LpmError> {
+    let patch_text = std::str::from_utf8(patch_bytes)
+        .map_err(|_| LpmError::Script(format!("patch file {patch_file:?} is not valid UTF-8")))?;
+    let chunks = split_multi_file_patch_with_limit(patch_text, Some(PATCH_MAX_OPERATIONS))
+        .map_err(|()| {
+            LpmError::Script(format!(
+                "patch file {patch_file:?} exceeds the {PATCH_MAX_OPERATIONS}-operation limit"
+            ))
+        })?;
+    if chunks.is_empty() {
+        return Err(LpmError::Script(format!(
+            "patch file {patch_file:?} contains no file diffs"
+        )));
+    }
+
+    let mut validated = Vec::with_capacity(chunks.len());
+    for chunk in chunks {
+        validate_chunk_header_paths(chunk, patch_file)?;
+        let op = classify_patch_op(chunk).map_err(|error| {
+            LpmError::Script(format!(
+                "patch file {patch_file:?} parse error in chunk: {error}"
+            ))
+        })?;
+        validated.push(validate_patch_op(op, patch_file)?);
+    }
+    validate_nonoverlapping_operations(&validated, patch_file)?;
+
+    let baseline_root = crate::patch_fs::SafeRoot::open(baseline_dir).map_err(|error| {
+        LpmError::Script(format!(
+            "patch baseline for {name}@{version} is unavailable or unsafe: {error}"
+        ))
+    })?;
+    let prepared = prepare_patch_ops(validated, &baseline_root, patch_file, name, version)?;
+
+    Ok(prepared)
 }
 
 fn prepare_patch_ops(

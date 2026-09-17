@@ -792,7 +792,20 @@ async fn run_with_options_under_store_lock(
         force,
     })?;
 
+    if !omit_policy.is_default() {
+        match std::fs::remove_file(project_dir.join(".lpm/install-hash")) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(LpmError::Io(error)),
+        }
+    }
+
     if deps.is_empty() && workspace_member_deps.is_empty() {
+        if let Some(key) = current_patches.keys().min() {
+            return Err(LpmError::Script(format!(
+                "{key} declared in lpm.patchedDependencies but this project has no dependencies — remove the stale registration with `lpm patch-remove {key}`"
+            )));
+        }
         workspace_resolution::publish_root_peer_providers_for_empty_install(
             project_dir,
             omit_policy,
@@ -1529,14 +1542,35 @@ async fn run_with_options_under_store_lock(
     //
     // Apply is unconditional even on the lockfile fast path: see the
     // module-level comment in `patch_engine.rs` for why.
+    let baseline_index = store_version
+        .uses_virtual_store()
+        .then(|| lpm_store::V2BaselineIndex::for_project(project_dir, lpm_root));
+    let mut omitted_patch_targets =
+        registered_patch_targets(&current_patches, packages_for_lockfile.iter())?;
+    retain_omitted_patch_targets(&mut omitted_patch_targets, packages.iter());
     let applied_patches = apply_patches_for_install(
         &current_patches,
         &current_lockfile_patches,
         &link_result,
         &store,
         project_dir,
-        json_output,
+        &omitted_patch_targets,
+        baseline_index.as_ref(),
     )?;
+
+    if !applied_patches.is_empty()
+        && let Some(store_v2) = store_v2_handle.as_deref()
+    {
+        link_result.bin_linked = refresh_links_after_patches(
+            project_dir,
+            &packages,
+            &link_targets,
+            store_v2,
+            linker_mode,
+            compatibility_bin_names,
+            v2_plan.as_deref(),
+        )?;
+    }
 
     let OnlineLifecyclePrepareResult {
         policy,
@@ -1558,7 +1592,7 @@ async fn run_with_options_under_store_lock(
         packages: &packages,
         package: &pkg,
         store: &store,
-        store_version,
+        baseline_index,
         used_lockfile,
         script_policy_override,
         advisor_override: advisor_override.as_deref(),
@@ -1984,13 +2018,15 @@ async fn run_with_options_under_store_lock(
     // delegated to `write_install_hash`, which also captures
     // manifest mtimes into the v2 file format so the next up-to-date
     // check can take the mtime fast path.
-    write_post_install_hash(
-        project_dir,
-        linker_mode,
-        object_integrity_policy,
-        security_analysis_policy,
-        dependency_engine_policy.as_ref(),
-    );
+    if omit_policy.is_default() {
+        write_post_install_hash(
+            project_dir,
+            linker_mode,
+            object_integrity_policy,
+            security_analysis_policy,
+            dependency_engine_policy.as_ref(),
+        );
+    }
 
     // Register the project in the machine-global known-projects registry.
     // `lpm cache prune` walks this set to

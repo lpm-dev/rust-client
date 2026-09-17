@@ -180,6 +180,31 @@ pub(super) fn validate_store_graph_compatibility(
     Ok(())
 }
 
+pub(super) fn refresh_links_after_patches(
+    project_dir: &Path,
+    packages: &[InstallPackage],
+    targets: &[LinkTarget],
+    store: &lpm_store::v2::Store,
+    linker_mode: lpm_linker::LinkerMode,
+    compatibility_bin_names: &[String],
+    plan: Option<&lpm_linker::v2::LinkPlanV2>,
+) -> Result<usize, LpmError> {
+    let prepared;
+    let plan = if let Some(plan) = plan {
+        plan
+    } else {
+        prepared = lpm_linker::v2::link_v2_prepare_with_compatibility_bin_names(
+            project_dir,
+            build_v2_targets(packages, targets)?,
+            store,
+            linker_mode,
+            compatibility_bin_names,
+        )?;
+        &prepared
+    };
+    lpm_linker::v2::refresh_links_after_package_mutation(project_dir, plan, store)
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(super) fn relink_bins_after_lifecycle_build(
     project_dir: &Path,
@@ -455,6 +480,7 @@ pub(super) async fn run_link_and_finish(
     force: bool,
     workspace_member_deps: &[WorkspaceMemberLink],
     current_lockfile_patches: &lpm_lockfile::LockfilePatches,
+    omitted_patch_targets: &HashSet<(String, String)>,
     // same CLI-side policy override as
     // [`run_with_options`]. Reached via the lockfile fast path when
     // `run_with_options` short-circuits resolution; both paths must
@@ -583,14 +609,40 @@ pub(super) async fn run_link_and_finish(
     // path; the underlying clone is one HashMap and patches are rare,
     // so the cost is negligible.
     let current_patches = current_patches_for_link;
+    let baseline_index = if store_version.uses_virtual_store() {
+        Some(lpm_store::V2BaselineIndex::for_project(
+            project_dir,
+            lpm_root,
+        ))
+    } else {
+        None
+    };
     let applied_patches = apply_patches_for_install(
         &current_patches,
         current_lockfile_patches,
         &link_result,
         &store,
         project_dir,
-        json_output,
+        omitted_patch_targets,
+        baseline_index.as_ref(),
     )?;
+
+    if !applied_patches.is_empty() && store_version.uses_virtual_store() {
+        let store_v2 = lpm_store::v2::Store::from_lpm_root_for_version_with_object_integrity_policy(
+            lpm_root,
+            store_version,
+            object_integrity_policy,
+        );
+        link_result.bin_linked = refresh_links_after_patches(
+            project_dir,
+            &packages,
+            &link_targets,
+            &store_v2,
+            linker_mode,
+            compatibility_bin_names,
+            None,
+        )?;
+    }
 
     let policy = lpm_security::SecurityPolicy::from_package_json(&project_dir.join("package.json"));
     let script_policy_cfg =
@@ -636,14 +688,6 @@ pub(super) async fn run_link_and_finish(
         all_trusted_for_auto_build,
         effective_policy,
     );
-    let baseline_index = if store_version.uses_virtual_store() {
-        Some(lpm_store::V2BaselineIndex::for_project(
-            project_dir,
-            lpm_root,
-        ))
-    } else {
-        None
-    };
 
     let mut blocked_capture = crate::build_state::capture_blocked_set_after_install_with_options(
         project_dir,

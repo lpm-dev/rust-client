@@ -1936,3 +1936,6 @@ fn patch_bare_name_errors_with_list_on_multiple_versions() {
         "got:\n{combined}"
     );
 }
+
+#[path = "patch_contract/mod.rs"]
+mod patch_contract;

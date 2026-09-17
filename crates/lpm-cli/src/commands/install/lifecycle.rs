@@ -224,7 +224,7 @@ pub(super) struct OnlineLifecyclePrepareInput<'a> {
     pub(super) packages: &'a [InstallPackage],
     pub(super) package: &'a lpm_workspace::PackageJson,
     pub(super) store: &'a lpm_store::PackageStore,
-    pub(super) store_version: lpm_store::StoreVersion,
+    pub(super) baseline_index: Option<lpm_store::V2BaselineIndex>,
     pub(super) used_lockfile: bool,
     pub(super) script_policy_override: Option<crate::script_policy_config::ScriptPolicy>,
     pub(super) advisor_override: Option<&'a str>,
@@ -261,7 +261,7 @@ pub(super) async fn run_online_lifecycle_prepare_phase(
         packages,
         package,
         store,
-        store_version,
+        baseline_index,
         used_lockfile,
         script_policy_override,
         advisor_override,
@@ -278,14 +278,6 @@ pub(super) async fn run_online_lifecycle_prepare_phase(
         .iter()
         .map(|p| (p.name.clone(), p.version.clone(), p.integrity.clone()))
         .collect();
-    let baseline_index = if store_version.uses_virtual_store() {
-        Some(lpm_store::V2BaselineIndex::for_project(
-            project_dir,
-            lpm_root,
-        ))
-    } else {
-        None
-    };
 
     let blocked_metadata_start = std::time::Instant::now();
     let mut blocked_metadata_ms = 0u128;

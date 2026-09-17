@@ -2,6 +2,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::Mutex;
 
+use sha2::{Digest, Sha256};
+
 use lpm_common::{LpmError, PackageInstanceId};
 use lpm_store::v2::{GraphKey, LinkerModeTag, PlatformTuple};
 
@@ -261,6 +263,94 @@ impl KeyMap {
     }
 }
 
+fn targets_with_patch_context(targets: &[Arc<V2Target>]) -> Option<Vec<Arc<V2Target>>> {
+    let mut patched: Vec<_> = targets
+        .iter()
+        .enumerate()
+        .filter(|(_, target)| target.target.patch_fingerprint.is_some())
+        .collect();
+    if patched.is_empty() {
+        return None;
+    }
+    patched.sort_by(|(_, left), (_, right)| {
+        (
+            &left.target.name,
+            &left.target.version,
+            &left.target.patch_fingerprint,
+        )
+            .cmp(&(
+                &right.target.name,
+                &right.target.version,
+                &right.target.patch_fingerprint,
+            ))
+    });
+    let by_instance: HashMap<_, _> = targets
+        .iter()
+        .enumerate()
+        .map(|(index, target)| (target.instance_id, index))
+        .collect();
+    let mut parents = vec![Vec::new(); targets.len()];
+    for (index, target) in targets.iter().enumerate() {
+        for child in target
+            .dependency_targets
+            .values()
+            .chain(target.peer_targets.values())
+        {
+            if let Some(&child_index) = by_instance.get(child) {
+                parents[child_index].push(index);
+            }
+        }
+    }
+    let mut contexts: Vec<Option<Sha256>> = vec![None; targets.len()];
+    let mut patch_counts = vec![0usize; targets.len()];
+    let mut visited = vec![0usize; targets.len()];
+    let mut pending = Vec::new();
+    for (patch_index, (target_index, patch)) in patched.iter().enumerate() {
+        let patch = &patch.target;
+        let mut descriptor = Sha256::new();
+        for value in [
+            patch.name.as_str(),
+            patch.version.as_str(),
+            patch.patch_fingerprint.as_deref().unwrap_or_default(),
+        ] {
+            descriptor.update((value.len() as u64).to_le_bytes());
+            descriptor.update(value.as_bytes());
+        }
+        let descriptor = descriptor.finalize();
+        pending.push(*target_index);
+        while let Some(index) = pending.pop() {
+            if visited[index] == patch_index + 1 {
+                continue;
+            }
+            visited[index] = patch_index + 1;
+            contexts[index]
+                .get_or_insert_with(Sha256::new)
+                .update(descriptor);
+            patch_counts[index] += 1;
+            pending.extend(parents[index].iter().copied());
+        }
+    }
+    Some(
+        targets
+            .iter()
+            .enumerate()
+            .zip(contexts)
+            .map(|((index, target), context)| {
+                let Some(context) = context else {
+                    return Arc::clone(target);
+                };
+                if patch_counts[index] == 1 && target.target.patch_fingerprint.is_some() {
+                    return Arc::clone(target);
+                }
+                let fingerprint = format!("patch-dependencies-v1:{:x}", context.finalize());
+                let mut contextual = target.as_ref().clone();
+                Arc::make_mut(&mut contextual.target).patch_fingerprint = Some(fingerprint);
+                Arc::new(contextual)
+            })
+            .collect(),
+    )
+}
+
 pub(super) fn derive_graph_keys(
     targets: &[Arc<V2Target>],
     platform: &PlatformTuple,
@@ -270,14 +360,17 @@ pub(super) fn derive_graph_keys(
     let mut by_instance: HashMap<PackageInstanceId, Arc<GraphKey>> =
         HashMap::with_capacity(targets.len());
 
+    // A parent's links must remain private to its reachable patch set, including cycles and peers.
+    let contextual_targets = targets_with_patch_context(targets);
+    let key_targets = contextual_targets.as_deref().unwrap_or(targets);
     let graph_keys = cache.map_or_else(
         || {
-            targets
+            key_targets
                 .iter()
                 .map(|target| derive_graph_key(target, platform, linker_tag))
                 .collect()
         },
-        |cache| cache.derive_many(targets, platform, linker_tag),
+        |cache| cache.derive_many(key_targets, platform, linker_tag),
     );
 
     for (v2t, key) in targets.iter().zip(graph_keys) {
@@ -423,5 +516,60 @@ mod tests {
             .expect("distinct row IDs with identical context must remain addressable");
 
         assert_eq!(key_map.get_for(&targets[0]), key_map.get_for(&targets[1]));
+    }
+    fn graph_node(name: &str) -> V2Target {
+        let mut node = target();
+        node.instance_id = PackageInstanceId::derive(name, "1.0.0", "registry+npm", name);
+        node.dependency_targets.clear();
+        node.peer_targets.clear();
+        let link = Arc::make_mut(&mut node.target);
+        link.name = name.to_owned();
+        link.dependencies.clear();
+        link.peers.clear();
+        node
+    }
+
+    #[test]
+    fn descendant_patch_keys_propagate_through_cycles_and_peers_and_restore_on_removal() {
+        let mut parent = graph_node("parent");
+        let mut middle = graph_node("middle");
+        let mut leaf = graph_node("leaf");
+        let unrelated = graph_node("unrelated");
+        parent
+            .dependency_targets
+            .insert("middle".to_owned(), middle.instance_id);
+        middle
+            .peer_targets
+            .insert("leaf".to_owned(), leaf.instance_id);
+        leaf.dependency_targets
+            .insert("parent".to_owned(), parent.instance_id);
+        let platform = PlatformTuple::new("linux", "x64", None);
+        let cache = GraphKeyCache::default();
+        let original: Vec<_> = [parent, middle, leaf, unrelated]
+            .into_iter()
+            .map(Arc::new)
+            .collect();
+        let before =
+            derive_graph_keys(&original, &platform, LinkerModeTag::Isolated, Some(&cache)).unwrap();
+        let mut patched = original.clone();
+        Arc::make_mut(&mut Arc::make_mut(&mut patched[2]).target).patch_fingerprint =
+            Some("p-first".to_owned());
+        let after =
+            derive_graph_keys(&patched, &platform, LinkerModeTag::Isolated, Some(&cache)).unwrap();
+        for node in &original[..3] {
+            assert_ne!(before.get_for(node), after.get_for(node));
+        }
+        assert_eq!(before.get_for(&original[3]), after.get_for(&original[3]));
+        patched.reverse();
+        let reordered =
+            derive_graph_keys(&patched, &platform, LinkerModeTag::Isolated, Some(&cache)).unwrap();
+        for node in &original {
+            assert_eq!(after.get_for(node), reordered.get_for(node));
+        }
+        let restored =
+            derive_graph_keys(&original, &platform, LinkerModeTag::Isolated, Some(&cache)).unwrap();
+        for node in &original {
+            assert_eq!(before.get_for(node), restored.get_for(node));
+        }
     }
 }

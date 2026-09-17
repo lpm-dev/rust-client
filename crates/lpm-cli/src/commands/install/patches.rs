@@ -204,6 +204,40 @@ pub(super) fn compute_patch_fingerprints(
     Ok(out)
 }
 
+pub(super) fn registered_patch_targets<'a>(
+    patches: &HashMap<String, PatchedDependencyEntry>,
+    packages: impl Iterator<Item = &'a InstallPackage>,
+) -> Result<HashSet<(String, String)>, LpmError> {
+    if patches.is_empty() {
+        return Ok(HashSet::new());
+    }
+    let present: HashSet<(&str, &str)> = packages
+        .map(|package| (package.name.as_str(), package.version.as_str()))
+        .collect();
+    patches
+        .keys()
+        .try_fold(HashSet::with_capacity(patches.len()), |mut targets, key| {
+            let target = patch_engine::parse_patch_key(key)?;
+            if present.contains(&(target.0.as_str(), target.1.as_str())) {
+                targets.insert(target);
+            }
+            Ok(targets)
+        })
+}
+
+pub(super) fn retain_omitted_patch_targets<'a>(
+    targets: &mut HashSet<(String, String)>,
+    selected: impl Iterator<Item = &'a InstallPackage>,
+) {
+    if targets.is_empty() {
+        return;
+    }
+    let selected: HashSet<(&str, &str)> = selected
+        .map(|package| (package.name.as_str(), package.version.as_str()))
+        .collect();
+    targets.retain(|(name, version)| !selected.contains(&(name.as_str(), version.as_str())));
+}
+
 /// Both online (`run_with_options`) and offline (`run_link_and_finish`)
 /// install paths call this exact function — there is no parallel apply
 /// logic to keep in sync.
@@ -217,23 +251,27 @@ pub(super) fn apply_patches_for_install(
     link_result: &LinkResult,
     store: &PackageStore,
     project_dir: &Path,
-    json_output: bool,
+    omitted_targets: &HashSet<(String, String)>,
+    baseline_index: Option<&lpm_store::V2BaselineIndex>,
 ) -> Result<Vec<patch_engine::AppliedPatch>, LpmError> {
     if patches.is_empty() {
         return Ok(Vec::new());
     }
-
-    let mut results: Vec<patch_engine::AppliedPatch> = Vec::with_capacity(patches.len());
-
-    // Iterate in a deterministic order so error messages and the
-    // applied list are stable across runs (HashMap iteration is
-    // randomized).
+    let mut by_target: HashMap<(&str, &str), Vec<&MaterializedPackage>> =
+        HashMap::with_capacity(link_result.materialized.len());
+    for location in &link_result.materialized {
+        by_target
+            .entry((&location.name, &location.version))
+            .or_default()
+            .push(location);
+    }
+    let mut results = Vec::with_capacity(patches.len());
     let mut sorted_keys: Vec<&String> = patches.keys().collect();
     sorted_keys.sort();
 
     for key in sorted_keys {
         let entry = &patches[key];
-        let (name, version) = patch_engine::parse_patch_key(key)?;
+        let target = patch_engine::parse_patch_key(key)?;
         let record = patch_records.get(key).ok_or_else(|| {
             LpmError::Script(format!(
                 "patch {key} has no checksum record; re-run `lpm install` to refresh lpm.lock"
@@ -241,41 +279,70 @@ pub(super) fn apply_patches_for_install(
         })?;
         let artifact = crate::patch_fs::load_patch_artifact(project_dir, &entry.path)?;
         validate_apply_artifact_checksum(key, entry, &artifact, record)?;
+        if omitted_targets.contains(&target) {
+            continue;
+        }
+        let (name, version) = target;
+        let locations = by_target.get(&(name.as_str(), version.as_str())).ok_or_else(|| {
+            LpmError::Script(format!(
+                "{key} declared in lpm.patchedDependencies but not present in node_modules — remove the stale registration with `lpm patch-remove {key}`"
+            ))
+        })?;
+        let drift = || {
+            LpmError::Script(format!(
+                "patch baseline drift for {key}: installed source integrity does not match {} — regenerate with `lpm patch {key}`",
+                entry.original_integrity
+            ))
+        };
+        let v1_baseline;
+        let baseline = if let Some(index) = baseline_index {
+            let mut baseline = None;
+            for location in locations {
+                let candidate = index
+                    .lookup_by_package_dir(&location.destination)
+                    .ok_or_else(drift)?;
+                if candidate.integrity != entry.original_integrity {
+                    return Err(drift());
+                }
+                baseline = Some(candidate);
+            }
+            baseline.ok_or_else(drift)?
+        } else {
+            let package_dir = store.package_dir(&name, &version);
+            let integrity = lpm_store::read_stored_integrity(&package_dir).ok_or_else(drift)?;
+            if integrity != entry.original_integrity {
+                return Err(drift());
+            }
+            for location in locations {
+                if lpm_store::read_stored_integrity(&location.destination).as_deref()
+                    != Some(entry.original_integrity.as_str())
+                {
+                    return Err(drift());
+                }
+            }
+            v1_baseline = lpm_store::InstalledPackageBaseline {
+                pristine_dir: package_dir.clone(),
+                package_dir,
+                integrity,
+                layout: lpm_store::PackageBaselineLayout::V1,
+            };
+            &v1_baseline
+        };
         let patch_file = project_dir.join(&artifact.relative_path);
-
-        // Filter the linker's materialized list to physical copies of
-        // this package. The linker reports every shape (isolated,
-        // hoisted root, nested under hoisted parent, hoisted-nested
-        // fallback at `<project>/.lpm/hoisted/nested/`) so we never
-        // have to reverse-engineer the layout.
-        let locations: Vec<&MaterializedPackage> = link_result
-            .materialized
-            .iter()
-            .filter(|m| m.name == name && m.version == version)
-            .collect();
-
-        let applied = patch_engine::apply_patch_bytes(
-            &locations,
+        let applied = patch_engine::apply_patch_bytes_from_baseline(
+            locations,
             &patch_file,
             &artifact.bytes,
-            &entry.original_integrity,
-            store,
+            baseline,
             &name,
             &version,
         )?;
-
-        // Surface a per-package debug breadcrumb so users running with
-        // `RUST_LOG=debug` can see the patch pass without parsing JSON.
-        // Production output stays on the post-install summary block.
-        let total_files = applied.files_modified + applied.files_added + applied.files_deleted;
         tracing::debug!(
-            "patch applied: {name}@{version} → {} location(s), {total_files} file(s)",
+            "patch applied: {key} to {} locations",
             applied.locations_patched.len()
         );
-        let _ = json_output; // suppress unused — we read it for symmetry only
         results.push(applied);
     }
-
     Ok(results)
 }
 
