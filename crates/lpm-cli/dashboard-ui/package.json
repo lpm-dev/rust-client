@@ -21,7 +21,7 @@
     "@types/react-dom": "^19.1.0",
     "@vitejs/plugin-react": "^5.0.0",
     "happy-dom": "^18.0.1",
-    "typescript": "^5.9.0",
+    "typescript": "^7.0.2",
     "vite": "^7.0.0",
     "vitest": "^3.2.4"
   }
