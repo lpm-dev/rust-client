@@ -8,7 +8,8 @@ use std::{io::Write, path::PathBuf};
 
 #[cfg(unix)]
 use lpm_store::v2::{
-    GraphKey, GraphKeyInputs, LinkMeta, LinkMetaPlatform, LinkerModeTag, PlatformTuple, Store,
+    GraphKey, GraphKeyInputs, LinkEntryRequest, LinkMetaPlatform, LinkerModeTag, PlatformTuple,
+    Store,
 };
 use sha2::{Digest, Sha256};
 use support::{TempProject, lpm};
@@ -162,21 +163,24 @@ fn seed_orphaned_store_link(project: &TempProject) -> std::path::PathBuf {
         LinkerModeTag::Isolated,
     ));
     let link_dir = store.paths().link_dir(&graph_key);
-    std::fs::create_dir_all(link_dir.join("node_modules/doctor-orphan"))
-        .expect("failed to create orphaned link entry");
-    LinkMeta::new(
-        &graph_key,
-        "sha512-doctor-orphan",
-        "objects/doctor-orphan",
-        Vec::new(),
-        Arc::new(LinkMetaPlatform {
-            os: std::env::consts::OS.into(),
-            cpu: std::env::consts::ARCH.into(),
-            libc: None,
-        }),
-    )
-    .write_to(&link_dir)
-    .expect("failed to write orphaned link metadata");
+    let tarball = support::mock_registry::make_tarball("doctor-orphan", "1.0.0");
+    let source_sri = lpm_store::compute_sri_hash(&tarball);
+    store
+        .extract_object(&source_sri, &tarball)
+        .expect("create doctor fixture object");
+    store
+        .populate_link_entry(LinkEntryRequest {
+            graph_key: Arc::new(graph_key),
+            object_dir: store.paths().object_dir(&source_sri).unwrap(),
+            source_sri,
+            deps: Vec::new(),
+            platform: Arc::new(LinkMetaPlatform {
+                os: std::env::consts::OS.into(),
+                cpu: std::env::consts::ARCH.into(),
+                libc: None,
+            }),
+        })
+        .expect("create doctor fixture link");
     link_dir
 }
 

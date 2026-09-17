@@ -528,3 +528,503 @@ fn prune_back_to_back_apply_invocations_release_the_store_lock() {
         );
     }
 }
+
+fn prune_root(project: &TempProject) -> lpm_common::LpmRoot {
+    lpm_common::LpmRoot::from_dir(project.home().join(".lpm"))
+}
+
+fn seed_prune_package(
+    store: &lpm_store::v2::Store,
+    name: &str,
+    deps: Vec<lpm_store::v2::DepLink>,
+) -> std::sync::Arc<lpm_store::v2::GraphKey> {
+    use lpm_store::v2::{
+        GraphKey, GraphKeyInputs, LinkEntryRequest, LinkMetaPlatform, LinkerModeTag, PlatformTuple,
+    };
+    use std::io::Write;
+    use std::sync::Arc;
+
+    let key = Arc::new(GraphKey::derive(&GraphKeyInputs::new(
+        name,
+        "1.0.0",
+        PlatformTuple::current(),
+        LinkerModeTag::Isolated,
+    )));
+    let mut builder = tar::Builder::new(Vec::new());
+    let content = serde_json::to_vec(&serde_json::json!({"name":name,"version":"1.0.0"})).unwrap();
+    let mut header = tar::Header::new_gnu();
+    header.set_size(content.len() as u64);
+    header.set_mode(0o644);
+    header.set_cksum();
+    builder
+        .append_data(&mut header, "package/package.json", content.as_slice())
+        .unwrap();
+    let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+    encoder.write_all(&builder.into_inner().unwrap()).unwrap();
+    let tarball = encoder.finish().unwrap();
+    let sri = lpm_store::compute_sri_hash(&tarball);
+    store.extract_object(&sri, &tarball).unwrap();
+    store
+        .populate_link_entry(LinkEntryRequest {
+            graph_key: Arc::clone(&key),
+            source_sri: sri.clone(),
+            object_dir: store.paths().object_dir(&sri).unwrap(),
+            deps,
+            platform: Arc::new(LinkMetaPlatform {
+                os: std::env::consts::OS.into(),
+                cpu: std::env::consts::ARCH.into(),
+                libc: None,
+            }),
+        })
+        .unwrap();
+    key
+}
+
+fn age_prune_package(store: &lpm_store::v2::Store, key: &lpm_store::v2::GraphKey) {
+    let dir = store.paths().link_dir(key);
+    let mut meta = lpm_store::v2::LinkMeta::read_from(&dir).unwrap();
+    meta.last_referenced_at = chrono::Utc::now() - chrono::Duration::days(30);
+    let path = meta.write_to(&dir).unwrap();
+    std::fs::File::options()
+        .write(true)
+        .open(path)
+        .unwrap()
+        .set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(30 * 86400))
+        .unwrap();
+}
+
+#[test]
+fn prune_preview_preserves_unsettled_global_recovery_state() {
+    let project = TempProject::empty(r#"{"name":"prune-preview","version":"1.0.0"}"#);
+    let root = prune_root(&project);
+    std::fs::create_dir_all(root.global_root()).unwrap();
+    std::fs::write(root.global_wal(), [0, 0, 0]).unwrap();
+    let output = lpm(&project)
+        .args(["cache", "prune", "--json"])
+        .output()
+        .unwrap();
+    assert_eq!(
+        std::fs::read(root.global_wal()).unwrap(),
+        [0, 0, 0],
+        "preview must not replay or truncate recovery state"
+    );
+    assert!(
+        !output.status.success(),
+        "preview must report unsettled global state"
+    );
+}
+
+#[test]
+fn prune_rejects_a_regular_file_as_explicit_project() {
+    let project = TempProject::empty(r#"{"name":"prune-file","version":"1.0.0"}"#);
+    lpm(&project)
+        .args(["cache", "prune", "--apply", "--json", "--project"])
+        .arg(project.path().join("package.json"))
+        .assert()
+        .failure();
+}
+
+#[test]
+fn prune_keeps_dependencies_of_age_retained_packages() {
+    let project = TempProject::empty(r#"{"name":"prune-age","version":"1.0.0"}"#);
+    let root = prune_root(&project);
+    let store = lpm_store::v2::Store::from_lpm_root(&root);
+    let dependency = seed_prune_package(&store, "old-dependency", Vec::new());
+    age_prune_package(&store, &dependency);
+    let parent = seed_prune_package(
+        &store,
+        "young-parent",
+        vec![lpm_store::v2::DepLink {
+            local: "old-dependency".into(),
+            target: dependency.clone(),
+        }],
+    );
+    lpm(&project)
+        .args(["cache", "prune", "--apply", "--max-age", "7d", "--project"])
+        .arg(project.path())
+        .assert()
+        .success();
+    assert!(store.paths().link_package_dir(&parent).is_dir());
+    assert!(
+        store.paths().link_package_dir(&dependency).is_dir(),
+        "age-retained parent must keep its dependency closure"
+    );
+}
+
+#[test]
+fn prune_rejects_corrupt_link_metadata_before_deleting_objects() {
+    let project = TempProject::empty(r#"{"name":"prune-corrupt-link","version":"1.0.0"}"#);
+    let root = prune_root(&project);
+    let store = lpm_store::v2::Store::from_lpm_root(&root);
+    let key = seed_prune_package(&store, "retained-package", Vec::new());
+    let dir = store.paths().link_dir(&key);
+    let meta = lpm_store::v2::LinkMeta::read_from(&dir).unwrap();
+    let object = store.paths().object_dir(&meta.source_sri).unwrap();
+    std::fs::write(dir.join(lpm_store::v2::LINK_META_FILENAME), b"{broken").unwrap();
+    let output = lpm(&project)
+        .args(["cache", "prune", "--apply", "--json", "--project"])
+        .arg(project.path())
+        .output()
+        .unwrap();
+    assert!(
+        object.is_dir(),
+        "unknown link metadata must not discard its object"
+    );
+    assert!(!output.status.success());
+}
+
+#[test]
+fn prune_reports_retained_tombstones_as_incomplete_cleanup() {
+    let project = TempProject::empty(r#"{"name":"prune-tombstone","version":"1.0.0"}"#);
+    let root = prune_root(&project);
+    let mut manifest = lpm_global::read_for(&root).unwrap();
+    manifest.tombstones.push(".".into());
+    lpm_global::write_for(&root, &manifest).unwrap();
+    let output = lpm(&project)
+        .args(["cache", "prune", "--apply", "--json"])
+        .output()
+        .unwrap();
+    let json = parse_json(&output.stdout);
+    assert_eq!(json["tombstones_retained"].as_array().unwrap().len(), 1);
+    assert_eq!(json["success"], false);
+    assert!(!output.status.success());
+}
+
+#[cfg(unix)]
+#[test]
+fn prune_preserves_store_when_project_dependencies_are_unreadable() {
+    use std::os::unix::fs::PermissionsExt;
+    let project = TempProject::empty(r#"{"name":"prune-unreadable","version":"1.0.0"}"#);
+    let root = prune_root(&project);
+    let store = lpm_store::v2::Store::from_lpm_root(&root);
+    let key = seed_prune_package(&store, "used-package", Vec::new());
+    let modules = project.path().join("node_modules");
+    std::fs::create_dir_all(&modules).unwrap();
+    std::os::unix::fs::symlink(
+        store.paths().link_package_dir(&key),
+        modules.join("used-package"),
+    )
+    .unwrap();
+    std::fs::set_permissions(&modules, std::fs::Permissions::from_mode(0o000)).unwrap();
+    let output = lpm(&project)
+        .args(["cache", "prune", "--apply", "--json", "--project"])
+        .arg(project.path())
+        .output()
+        .unwrap();
+    std::fs::set_permissions(&modules, std::fs::Permissions::from_mode(0o755)).unwrap();
+    assert!(
+        store.paths().link_dir(&key).is_dir(),
+        "unreadable roots must not become empty roots"
+    );
+    assert!(!output.status.success());
+}
+
+#[cfg(unix)]
+#[test]
+fn prune_preserves_artifacts_when_completion_state_is_unreadable() {
+    use std::os::unix::fs::PermissionsExt;
+    let project = TempProject::empty(r#"{"name":"prune-artifact","version":"1.0.0"}"#);
+    let root = prune_root(&project);
+    let store = lpm_store::v2::Store::from_lpm_root(&root);
+    let artifact = store.paths().builds_root().join("opaque-artifact");
+    std::fs::create_dir_all(&artifact).unwrap();
+    std::fs::write(
+        artifact.join(lpm_store::v2::BUILD_ARTIFACT_COMPLETE_FILENAME),
+        b"complete",
+    )
+    .unwrap();
+    std::fs::set_permissions(&artifact, std::fs::Permissions::from_mode(0o000)).unwrap();
+    let output = lpm(&project)
+        .args(["cache", "prune", "--json"])
+        .output()
+        .unwrap();
+    std::fs::set_permissions(&artifact, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let json = parse_json(&output.stdout);
+    assert!(
+        !output.status.success(),
+        "unreadable completion state must fail inspection: {json}"
+    );
+}
+
+#[test]
+fn prune_validates_both_stores_before_deleting_any_entries() {
+    let project = TempProject::empty(r#"{"name":"prune-two-stores","version":"1.0.0"}"#);
+    let root = prune_root(&project);
+    let store = lpm_store::v2::Store::from_lpm_root(&root);
+    let key = seed_prune_package(&store, "orphan-package", Vec::new());
+    let v3 = lpm_store::v2::Store::from_lpm_root_for_version(&root, lpm_store::StoreVersion::V3);
+    std::fs::create_dir_all(v3.paths().root()).unwrap();
+    std::fs::write(v3.paths().links_root(), b"not a directory").unwrap();
+    lpm(&project)
+        .args(["cache", "prune", "--apply", "--json", "--project"])
+        .arg(project.path())
+        .assert()
+        .failure();
+    assert!(
+        store.paths().link_dir(&key).is_dir(),
+        "a v3 planning failure must precede v2 deletion"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn prune_does_not_follow_store_category_symlinks_outside_the_store() {
+    let project = TempProject::empty(r#"{"name":"prune-category","version":"1.0.0"}"#);
+    let root = prune_root(&project);
+    let store = lpm_store::v2::Store::from_lpm_root(&root);
+    let outside = project.path().join("outside");
+    let protected = outside.join("important");
+    std::fs::create_dir_all(&protected).unwrap();
+    std::fs::write(protected.join("data"), b"retain me").unwrap();
+    std::fs::create_dir_all(store.paths().root()).unwrap();
+    std::os::unix::fs::symlink(&outside, store.paths().builds_root()).unwrap();
+    let output = lpm(&project)
+        .args(["cache", "prune", "--apply", "--json"])
+        .output()
+        .unwrap();
+    assert!(
+        protected.join("data").is_file(),
+        "prune must not delete through a redirected category"
+    );
+    assert!(!output.status.success());
+}
+
+#[test]
+fn concurrent_project_registrations_preserve_all_prune_roots() {
+    use std::sync::{Arc, Barrier};
+    let project = TempProject::empty(r#"{"name":"prune-registry","version":"1.0.0"}"#);
+    let root = prune_root(&project);
+    let barrier = Arc::new(Barrier::new(16));
+    let threads = (0..16)
+        .map(|index| {
+            let directory = project.path().join(format!("project-{index}"));
+            std::fs::create_dir_all(&directory).unwrap();
+            let registry = root.known_projects();
+            let barrier = Arc::clone(&barrier);
+            std::thread::spawn(move || {
+                barrier.wait();
+                lpm_common::known_projects::register(&registry, &directory).unwrap();
+            })
+        })
+        .collect::<Vec<_>>();
+    for thread in threads {
+        thread.join().unwrap();
+    }
+    assert_eq!(
+        lpm_common::known_projects::try_load(&root.known_projects())
+            .unwrap()
+            .projects
+            .len(),
+        16
+    );
+}
+
+#[test]
+fn prune_rejects_inconsistent_link_identity_and_object_references() {
+    for field in ["graph_key_digest_hex", "object_path"] {
+        let project = TempProject::empty(r#"{"name":"prune-identity","version":"1.0.0"}"#);
+        let root = prune_root(&project);
+        let store = lpm_store::v2::Store::from_lpm_root(&root);
+        let key = seed_prune_package(&store, "identity-package", Vec::new());
+        let path = store
+            .paths()
+            .link_dir(&key)
+            .join(lpm_store::v2::LINK_META_FILENAME);
+        let mut meta: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        meta[field] = if field == "graph_key_digest_hex" {
+            "0".repeat(64).into()
+        } else {
+            "objects/foreign-object".into()
+        };
+        std::fs::write(&path, serde_json::to_vec(&meta).unwrap()).unwrap();
+        let output = lpm(&project)
+            .args(["cache", "prune", "--apply", "--json", "--project"])
+            .arg(project.path())
+            .output()
+            .unwrap();
+        assert!(
+            store.paths().link_dir(&key).is_dir(),
+            "invalid {field} must stop deletion"
+        );
+        assert!(!output.status.success());
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn prune_rejects_symlinked_link_sidecars() {
+    let project = TempProject::empty(r#"{"name":"prune-sidecar","version":"1.0.0"}"#);
+    let root = prune_root(&project);
+    let store = lpm_store::v2::Store::from_lpm_root(&root);
+    let key = seed_prune_package(&store, "sidecar-package", Vec::new());
+    let path = store
+        .paths()
+        .link_dir(&key)
+        .join(lpm_store::v2::LINK_META_FILENAME);
+    let outside = project.path().join("outside-sidecar.json");
+    std::fs::rename(&path, &outside).unwrap();
+    std::os::unix::fs::symlink(&outside, path).unwrap();
+    lpm(&project)
+        .args(["cache", "prune", "--json", "--project"])
+        .arg(project.path())
+        .assert()
+        .failure();
+}
+
+#[test]
+fn project_registration_preserves_an_unusable_registry() {
+    let project = TempProject::empty(r#"{"name":"prune-registry","version":"1.0.0"}"#);
+    let root = prune_root(&project);
+    std::fs::create_dir_all(root.root()).unwrap();
+    std::fs::write(root.known_projects(), b"{corrupt").unwrap();
+    let result = lpm_common::known_projects::register(&root.known_projects(), project.path());
+    assert_eq!(std::fs::read(root.known_projects()).unwrap(), b"{corrupt");
+    assert!(result.is_err());
+}
+
+#[test]
+fn project_registration_preserves_an_oversized_registry() {
+    let project = TempProject::empty(r#"{"name":"prune-registry","version":"1.0.0"}"#);
+    let root = prune_root(&project);
+    std::fs::create_dir_all(root.root()).unwrap();
+    let file = std::fs::File::create(root.known_projects()).unwrap();
+    let size = lpm_common::STATE_FILE_SIZE_CAP_BYTES + 1;
+    file.set_len(size).unwrap();
+    let result = lpm_common::known_projects::register(&root.known_projects(), project.path());
+    assert_eq!(
+        std::fs::metadata(root.known_projects()).unwrap().len(),
+        size
+    );
+    assert!(result.is_err());
+}
+
+#[cfg(unix)]
+#[test]
+fn prune_rejects_fifo_link_sidecars_without_waiting_for_a_writer() {
+    use std::os::unix::ffi::OsStrExt;
+    let project = TempProject::empty(r#"{"name":"prune-fifo","version":"1.0.0"}"#);
+    let root = prune_root(&project);
+    let store = lpm_store::v2::Store::from_lpm_root(&root);
+    let key = seed_prune_package(&store, "fifo-package", Vec::new());
+    let path = store
+        .paths()
+        .link_dir(&key)
+        .join(lpm_store::v2::LINK_META_FILENAME);
+    std::fs::remove_file(&path).unwrap();
+    let fifo = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+    // SAFETY: the path is NUL-terminated and belongs to this isolated fixture.
+    assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+    let mut command = support::lpm_spawnable(&project);
+    command
+        .args(["cache", "prune", "--json", "--project"])
+        .arg(project.path());
+    let mut child = command.spawn().unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            assert!(!status.success());
+            break;
+        }
+        if std::time::Instant::now() >= deadline {
+            child.kill().unwrap();
+            child.wait().unwrap();
+            panic!("prune waited for a FIFO writer while holding the store lock");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
+#[test]
+fn prune_rejects_dependency_metadata_that_disagrees_with_installed_links() {
+    let project = TempProject::empty(r#"{"name":"prune-edges","version":"1.0.0"}"#);
+    let root = prune_root(&project);
+    let store = lpm_store::v2::Store::from_lpm_root(&root);
+    let dependency = seed_prune_package(&store, "required-package", Vec::new());
+    let unrelated = seed_prune_package(&store, "unrelated-package", Vec::new());
+    let parent = seed_prune_package(
+        &store,
+        "parent-package",
+        vec![lpm_store::v2::DepLink {
+            local: "required-package".into(),
+            target: dependency.clone(),
+        }],
+    );
+    let dir = store.paths().link_dir(&parent);
+    let mut meta = lpm_store::v2::LinkMeta::read_from(&dir).unwrap();
+    meta.deps[0].target_graph_key = unrelated.digest_hex();
+    meta.write_to(&dir).unwrap();
+    std::fs::create_dir_all(project.path().join("node_modules")).unwrap();
+    lpm_common::create_dir_symlink_or_junction(
+        &store.paths().link_package_dir(&parent),
+        &project.path().join("node_modules/parent-package"),
+    )
+    .unwrap();
+    let output = lpm(&project)
+        .args(["cache", "prune", "--apply", "--json", "--project"])
+        .arg(project.path())
+        .output()
+        .unwrap();
+    assert!(
+        store.paths().link_dir(&dependency).is_dir(),
+        "installed dependency link must remain valid"
+    );
+    assert!(!output.status.success());
+}
+
+#[cfg(unix)]
+#[test]
+fn prune_rejects_nested_cas_redirection_before_mutating_other_stores() {
+    let project = TempProject::empty(r#"{"name":"prune-cas","version":"1.0.0"}"#);
+    let root = prune_root(&project);
+    let store = lpm_store::v2::Store::from_lpm_root(&root);
+    let key = seed_prune_package(&store, "v2-orphan", Vec::new());
+    let v3 = lpm_store::v2::Store::from_lpm_root_for_version(&root, lpm_store::StoreVersion::V3);
+    let outside = project.path().join("outside");
+    let shard = outside.join("blake3/ab");
+    std::fs::create_dir_all(&shard).unwrap();
+    let blob = shard.join(format!("ab{}", "0".repeat(62)));
+    std::fs::write(&blob, b"retain").unwrap();
+    std::fs::create_dir_all(v3.paths().root()).unwrap();
+    std::os::unix::fs::symlink(&outside, v3.paths().root().join("blobs")).unwrap();
+    let output = lpm(&project)
+        .args(["cache", "prune", "--apply", "--json", "--project"])
+        .arg(project.path())
+        .output()
+        .unwrap();
+    assert!(
+        store.paths().link_dir(&key).is_dir(),
+        "v3 redirection must fail before v2 deletion"
+    );
+    assert!(blob.is_file());
+    assert!(!output.status.success());
+}
+
+#[cfg(unix)]
+#[test]
+fn prune_preserves_cas_sources_when_object_inventory_is_unreadable() {
+    use std::os::unix::fs::PermissionsExt;
+    let project = TempProject::empty(r#"{"name":"prune-objects","version":"1.0.0"}"#);
+    let root = prune_root(&project);
+    let store = lpm_store::v2::Store::from_lpm_root_for_version(&root, lpm_store::StoreVersion::V3);
+    let key = seed_prune_package(&store, "retained-source", Vec::new());
+    let meta = lpm_store::v2::LinkMeta::read_from(&store.paths().link_dir(&key)).unwrap();
+    let object = store.paths().object_dir(&meta.source_sri).unwrap();
+    std::fs::create_dir_all(project.path().join("node_modules")).unwrap();
+    lpm_common::create_dir_symlink_or_junction(
+        &store.paths().link_package_dir(&key),
+        &project.path().join("node_modules/retained-source"),
+    )
+    .unwrap();
+    std::fs::set_permissions(&object, std::fs::Permissions::from_mode(0o000)).unwrap();
+    let output = lpm(&project)
+        .args(["cache", "prune", "--json", "--project"])
+        .arg(project.path())
+        .output()
+        .unwrap();
+    std::fs::set_permissions(&object, std::fs::Permissions::from_mode(0o755)).unwrap();
+    assert!(
+        !output.status.success(),
+        "unreadable source inventory must stop CAS planning: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+}

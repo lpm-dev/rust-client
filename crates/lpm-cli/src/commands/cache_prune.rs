@@ -63,6 +63,8 @@ use std::time::{Duration, Instant};
 
 use super::cache::PruneFlags;
 
+mod inventory;
+
 /// Outcome of a prune walk. Used by the human + JSON emitters; tests
 /// also assert against this shape directly so the algorithm can be
 /// unit-tested without spawning the CLI.
@@ -224,6 +226,19 @@ struct StoreDiscovery {
 /// [`lpm store` — Locking model](https://cli.lpm.dev/docs/infra/store#locking-model).
 pub async fn run(root: &LpmRoot, json_output: bool, flags: PruneFlags<'_>) -> Result<(), LpmError> {
     let start = Instant::now();
+    if !flags.apply {
+        lpm_global::recover::require_settled(root)?;
+        if root
+            .global_root()
+            .join("local-link-transaction.json")
+            .try_exists()?
+        {
+            return Err(LpmError::Store(
+                "global state needs recovery before a preview; run `lpm global list`, then retry"
+                    .into(),
+            ));
+        }
+    }
     let summary = execute_prune(root, &flags)?;
 
     if json_output {
@@ -291,6 +306,15 @@ fn run_all_virtual_stores_locked(
         .then(|| filesystem_available_bytes(v3_store.paths().root()))
         .flatten();
     let stores = [v2_store, v3_store];
+    let directories = [
+        inventory::open_store(root, v2_store, flags.apply)?,
+        inventory::open_store(root, v3_store, flags.apply)?,
+    ];
+    for (store, directory) in stores.into_iter().zip(&directories) {
+        if let Some(directory) = directory {
+            inventory::validate_layout(store, directory)?;
+        }
+    }
     let discovery = discover_prune_inputs(root, &stores, flags, true)?;
     let mut roots = discovery.root_link_dirs.into_iter();
     let v2_roots = roots.next().expect("v2 store must have a root set");
@@ -304,15 +328,29 @@ fn run_all_virtual_stores_locked(
         tombstones_pending: discovery.tombstones_pending,
         tombstone_count_error: discovery.tombstone_count_error.clone(),
     };
-    let v2 = run_locked(
-        root,
-        v2_store,
-        flags,
-        max_age,
-        false,
-        Some(common(v2_roots)),
-    )?;
-    let v3 = run_locked(root, v3_store, flags, max_age, true, Some(common(v3_roots)))?;
+    let mut v2 = plan_locked(root, v2_store, flags, max_age, Some(common(v2_roots)))?;
+    let mut v3 = plan_locked(root, v3_store, flags, max_age, Some(common(v3_roots)))?;
+    for ((store, directory), plan) in stores.into_iter().zip(&directories).zip([&v2, &v3]) {
+        if let Some(directory) = directory {
+            inventory::validate_deletion_parents(directory, store, plan)?;
+        }
+    }
+    if flags.apply {
+        apply_plan(
+            root,
+            v2_store,
+            &mut v2,
+            false,
+            directories[0].as_ref().expect("apply opens v2 store"),
+        )?;
+        apply_plan(
+            root,
+            v3_store,
+            &mut v3,
+            true,
+            directories[1].as_ref().expect("apply opens v3 store"),
+        )?;
+    }
     let mut summary = merge_prune_summaries(v2, v3);
     summary.observed_physical_bytes_freed = free_before.and_then(|before| {
         filesystem_available_bytes(v3_store.paths().root())?.checked_sub(before)
@@ -393,17 +431,35 @@ fn merge_prune_summaries(mut left: PruneSummary, right: PruneSummary) -> PruneSu
 }
 
 fn prune_had_errors(summary: &PruneSummary) -> bool {
-    summary.tombstone_count_error.is_some() || summary.tombstone_sweep_error.is_some()
+    summary.tombstone_count_error.is_some()
+        || summary.tombstone_sweep_error.is_some()
+        || !summary.tombstones_retained.is_empty()
 }
 
 /// Inner body executed under the store lock. Pulled out so the lock
 /// closure has a single sync entry point.
+#[cfg(test)]
 fn run_locked(
     root: &LpmRoot,
     v2_store: &V2Store,
     flags: &PruneFlags<'_>,
     max_age: Option<ChronoDuration>,
     handle_tombstones: bool,
+    discovery: Option<StoreDiscovery>,
+) -> Result<PruneSummary, LpmError> {
+    let mut summary = plan_locked(root, v2_store, flags, max_age, discovery)?;
+    if flags.apply {
+        let directory = inventory::open_store(root, v2_store, true)?.expect("apply opens store");
+        apply_plan(root, v2_store, &mut summary, handle_tombstones, &directory)?;
+    }
+    Ok(summary)
+}
+
+fn plan_locked(
+    root: &LpmRoot,
+    v2_store: &V2Store,
+    flags: &PruneFlags<'_>,
+    max_age: Option<ChronoDuration>,
     discovery: Option<StoreDiscovery>,
 ) -> Result<PruneSummary, LpmError> {
     let mut summary = compute_prune(root, v2_store, flags, max_age, true, discovery)
@@ -441,11 +497,22 @@ fn run_locked(
         }
     }
 
-    if flags.apply {
+    Ok(summary)
+}
+
+fn apply_plan(
+    root: &LpmRoot,
+    v2_store: &V2Store,
+    summary: &mut PruneSummary,
+    handle_tombstones: bool,
+    directory: &cap_std::fs::Dir,
+) -> Result<(), LpmError> {
+    {
         summary.bytes_freed_or_eligible = 0;
         let prune_tombstone_path = v2_store.paths().root().join(".prune-tombstones");
-        let prune_tombstones = PruneTombstones::open(&prune_tombstone_path, true)?
-            .expect("creating the prune tombstone root must return an open directory");
+        let prune_tombstones =
+            PruneTombstones::open_in(directory.try_clone()?, &prune_tombstone_path, true)?
+                .expect("creating the prune tombstone root must return an open directory");
         prune_tombstones.sweep()?;
         // When the registry is missing OR corrupt AND no explicit
         // `--project` was given, `compute_prune_plan` skipped the
@@ -515,8 +582,8 @@ fn run_locked(
                 prune_tombstones.remove(artifact)?,
             );
         }
-        remove_orphaned_build_locks(v2_store)?;
-        remove_orphaned_build_entry_locks(v2_store, &summary.live_graph_keys)?;
+        remove_orphaned_build_locks_in(v2_store, directory)?;
+        remove_orphaned_build_entry_locks_in(v2_store, directory, &summary.live_graph_keys)?;
 
         // Sweep deferred global-uninstall tombstones. Errors are
         // surfaced via `summary.tombstone_sweep_error` (and a
@@ -546,7 +613,7 @@ fn run_locked(
         summary.applied = true;
     }
 
-    Ok(summary)
+    Ok(())
 }
 
 fn add_removed_bytes(total: &mut u64, removed: u64) {
@@ -562,11 +629,13 @@ fn sweep_prune_tombstones(tombstone_root: &Path) -> Result<(), LpmError> {
 }
 
 struct PruneTombstones {
+    store_directory: cap_std::fs::Dir,
     directory: cap_std::fs::Dir,
     path: PathBuf,
 }
 
 impl PruneTombstones {
+    #[cfg(test)]
     fn open(path: &Path, create: bool) -> Result<Option<Self>, LpmError> {
         let parent_path = path.parent().ok_or_else(|| {
             LpmError::Store(format!(
@@ -585,6 +654,14 @@ impl PruneTombstones {
                 }
                 Err(error) => return Err(error.into()),
             };
+        Self::open_in(parent, path, create)
+    }
+
+    fn open_in(
+        parent: cap_std::fs::Dir,
+        path: &Path,
+        create: bool,
+    ) -> Result<Option<Self>, LpmError> {
         let name = path.file_name().ok_or_else(|| {
             LpmError::Store(format!(
                 "cache prune tombstone root has no name: {}",
@@ -614,6 +691,7 @@ impl PruneTombstones {
         };
         restrict_prune_tombstone_directory(&directory)?;
         Ok(Some(Self {
+            store_directory: parent,
             directory,
             path: path.to_path_buf(),
         }))
@@ -642,8 +720,17 @@ impl PruneTombstones {
                 path.display()
             ))
         })?;
-        let source_parent =
-            cap_std::fs::Dir::open_ambient_dir(parent_path, cap_std::ambient_authority())?;
+        let store_path = self
+            .path
+            .parent()
+            .ok_or_else(|| LpmError::Store("cache prune: invalid store boundary".into()))?;
+        let relative = parent_path
+            .strip_prefix(store_path)
+            .map_err(|_| LpmError::Store("cache prune: deletion target escapes store".into()))?;
+        let Some(source_parent) = inventory::open_directory(&self.store_directory, relative)?
+        else {
+            return Ok(0);
+        };
         let suffix = rand::thread_rng().next_u64();
         let label = source_name.to_string_lossy();
         let tombstone_name = format!("{label}.{suffix:016x}");
@@ -676,48 +763,81 @@ fn restrict_prune_tombstone_directory(_directory: &cap_std::fs::Dir) -> Result<(
     Ok(())
 }
 
-fn remove_orphaned_build_locks(store: &V2Store) -> Result<(), LpmError> {
-    let entries = match std::fs::read_dir(store.paths().build_locks_root()) {
-        Ok(entries) => entries,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(error) => return Err(error.into()),
+#[cfg(test)]
+fn remove_orphaned_build_entry_locks(
+    store: &V2Store,
+    live_graph_keys: &HashSet<String>,
+) -> Result<(), LpmError> {
+    let directory =
+        cap_std::fs::Dir::open_ambient_dir(store.paths().root(), cap_std::ambient_authority())?;
+    remove_orphaned_build_entry_locks_in(store, &directory, live_graph_keys)
+}
+
+fn remove_orphaned_build_locks_in(
+    store: &V2Store,
+    directory: &cap_std::fs::Dir,
+) -> Result<(), LpmError> {
+    let path = store.paths().build_locks_root();
+    let relative = path
+        .strip_prefix(store.paths().root())
+        .map_err(|_| LpmError::Store("cache prune: invalid lock path".into()))?;
+    let Some(locks) = inventory::open_directory(directory, relative)? else {
+        return Ok(());
     };
-    for entry in entries {
+    let builds_relative = store
+        .paths()
+        .builds_root()
+        .strip_prefix(store.paths().root())
+        .map_err(|_| LpmError::Store("cache prune: invalid build path".into()))?;
+    let builds = inventory::open_directory(directory, builds_relative)?;
+    for entry in locks.entries()? {
         let entry = entry?;
         if !entry.file_type()?.is_file() {
             continue;
         }
-        let path = entry.path();
-        let Some(key) = advisory_lock_key(&path) else {
+        let name = entry.file_name();
+        let Some(key) = advisory_lock_key(Path::new(&name)) else {
             continue;
         };
-        if !store.paths().builds_root().join(key).is_dir() {
-            std::fs::remove_file(path)?;
+        let exists = if let Some(builds) = &builds {
+            match builds.symlink_metadata(key) {
+                Ok(_) => true,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+                Err(error) => return Err(error.into()),
+            }
+        } else {
+            false
+        };
+        if !exists {
+            locks.remove_file(name)?;
         }
     }
     Ok(())
 }
 
-fn remove_orphaned_build_entry_locks(
+fn remove_orphaned_build_entry_locks_in(
     store: &V2Store,
+    directory: &cap_std::fs::Dir,
     live_graph_keys: &HashSet<String>,
 ) -> Result<(), LpmError> {
-    let entries = match std::fs::read_dir(store.paths().build_entry_locks_root()) {
-        Ok(entries) => entries,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(error) => return Err(error.into()),
+    let path = store.paths().build_entry_locks_root();
+    let relative = path
+        .strip_prefix(store.paths().root())
+        .map_err(|_| LpmError::Store("cache prune: invalid lock path".into()))?;
+    let Some(locks) = inventory::open_directory(directory, relative)? else {
+        return Ok(());
     };
-    for entry in entries {
+    for entry in locks.entries()? {
         let entry = entry?;
         if !entry.file_type()?.is_file() {
             continue;
         }
-        let path = entry.path();
-        let Some(key) = advisory_lock_key(&path) else {
+        let name = entry.file_name();
+        let Some(key) = advisory_lock_key(Path::new(&name)) else {
             continue;
         };
         if !live_graph_keys.contains(key) {
-            std::fs::remove_file(path)?;
+            locks.remove_file(name)?;
         }
     }
     Ok(())
@@ -807,12 +927,31 @@ fn discover_prune_inputs(
                 format!("cache prune: --project {explicit} unreadable: {error}"),
             ))
         })?;
+        if !std::fs::metadata(&project)?.is_dir() {
+            return Err(LpmError::Store(format!(
+                "cache prune: --project {explicit} must be a directory"
+            )));
+        }
         projects.push(project);
     } else {
         match known_projects::try_load(&registry_path) {
             Ok(mut registry) => {
                 let before = registry.projects.len();
-                registry.projects.retain(|entry| entry.path.exists());
+                let mut surviving = Vec::with_capacity(registry.projects.len());
+                for entry in registry.projects {
+                    match std::fs::metadata(&entry.path) {
+                        Ok(meta) if meta.is_dir() => surviving.push(entry),
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                        Ok(_) => {
+                            return Err(LpmError::Store(format!(
+                                "cache prune: registered project is not a directory: {}",
+                                entry.path.display()
+                            )));
+                        }
+                        Err(error) => return Err(prune_inspection_error(&entry.path, error)),
+                    }
+                }
+                registry.projects = surviving;
                 registry_entries_dropped = before.saturating_sub(registry.projects.len());
                 projects.reserve(registry.projects.len());
                 projects.extend(registry.projects.iter().map(|entry| entry.path.clone()));
@@ -841,7 +980,7 @@ fn discover_prune_inputs(
     let mut project_scans = 0usize;
     if analysis == PruneAnalysis::Available {
         for project in &projects {
-            collect_project_link_roots_for_stores(project, &links_roots, &mut root_link_dirs);
+            collect_project_link_roots_for_stores(project, &links_roots, &mut root_link_dirs)?;
             #[cfg(test)]
             {
                 project_scans = project_scans.saturating_add(1);
@@ -912,12 +1051,12 @@ fn compute_prune(
         // tombstone count is populated so dry-run still surfaces
         // the work `--apply` will do.
         let (compat_islands_total, compat_islands_orphaned) = if build_full_plan {
-            compute_compat_island_orphans(v2_store.paths().compat_root(), max_age)
+            compute_compat_island_orphans(v2_store.paths().compat_root(), max_age)?
         } else {
             (0, Vec::new())
         };
         let (build_artifacts_total, build_artifacts_orphaned) = if build_full_plan {
-            compute_build_artifact_orphans(v2_store.paths().builds_root(), max_age)
+            compute_build_artifact_orphans(v2_store.paths().builds_root(), max_age)?
         } else {
             (0, Vec::new())
         };
@@ -986,26 +1125,17 @@ fn compute_prune(
     // comparison against `add_if_link_descendant`'s canonical frontier).
     // macOS's `/private/var/folders/...` canonical form vs.
     // `/var/folders/...` symlink-shape requires the canonical compare;
-    // keeping the raw path for deletion ensures `remove_dir_all`
-    // operates on the actual store child even when canonicalize would
-    // resolve elsewhere. The store-side `iter_link_entries` refuses
-    // symlinks at `links/<entry>` (see store.rs), so the raw path is
-    // always a direct store child; the `starts_with` defence below is
-    // belt-and-suspenders for any future regression.
-    let mut raw_entries = v2_store.iter_link_entries()?;
-    let (entry_capacity, _) = raw_entries.size_hint();
-    let mut all_link_entries = Vec::with_capacity(entry_capacity);
+    // The strict inventory rejects redirected entries. Deletion uses the
+    // raw child path relative to the retained store directory.
+    let mut all_link_entries = Vec::new();
     let mut root_link_indices = Vec::with_capacity(root_link_dirs.len());
-    for (raw_dir, meta) in &mut raw_entries {
-        let canonical_dir = std::fs::canonicalize(&raw_dir).unwrap_or_else(|_| raw_dir.clone());
+    inventory::walk_link_entries(v2_store, |raw_dir, meta| {
+        let canonical_dir = std::fs::canonicalize(&raw_dir)
+            .map_err(|error| prune_inspection_error(&raw_dir, error))?;
         if !canonical_dir.starts_with(&links_root_canonical) {
-            tracing::warn!(
-                "cache prune: skipping link entry at {} — canonical path {} escapes the canonical links root {} (corrupted store?)",
-                raw_dir.display(),
-                canonical_dir.display(),
-                links_root_canonical.display(),
-            );
-            continue;
+            return Err(LpmError::Store(
+                "cache prune: link entry escapes its store".into(),
+            ));
         }
         let index = all_link_entries.len();
         if root_link_dirs.contains(&canonical_dir) {
@@ -1030,12 +1160,20 @@ fn compute_prune(
             object_segment,
             last_referenced_at,
         });
-    }
+        Ok(())
+    })?;
 
     let mut by_digest: std::collections::HashMap<&str, usize> =
         std::collections::HashMap::with_capacity(all_link_entries.len());
     for (index, entry) in all_link_entries.iter().enumerate() {
-        by_digest.insert(&entry.graph_key_digest_hex, index);
+        if by_digest
+            .insert(&entry.graph_key_digest_hex, index)
+            .is_some()
+        {
+            return Err(LpmError::Store(
+                "cache prune: duplicate link graph identity".into(),
+            ));
+        }
     }
 
     let link_entries_total = all_link_entries.len();
@@ -1043,6 +1181,20 @@ fn compute_prune(
     let mut reachable = vec![false; all_link_entries.len()];
     let mut reachable_count = 0usize;
     let mut frontier = root_link_indices;
+    if let Some(max_age) = max_age {
+        let now = Utc::now();
+        frontier.extend(
+            all_link_entries
+                .iter()
+                .enumerate()
+                .filter_map(|(index, entry)| {
+                    entry
+                        .last_referenced_at
+                        .filter(|last_seen| now - *last_seen < max_age)
+                        .map(|_| index)
+                }),
+        );
+    }
     while let Some(index) = frontier.pop() {
         if reachable[index] {
             continue;
@@ -1050,33 +1202,17 @@ fn compute_prune(
         reachable[index] = true;
         reachable_count += 1;
         for dependency in &all_link_entries[index].dependency_graph_keys {
-            if let Some(target_index) = by_digest.get(dependency.as_str()) {
-                frontier.push(*target_index);
-            }
+            let target_index = by_digest.get(dependency.as_str()).ok_or_else(||
+                LpmError::Store(format!("cache prune: retained package has a missing dependency {dependency}; repair the installation before pruning")))?;
+            frontier.push(*target_index);
         }
     }
 
-    // ── Step 4: Apply --max-age filter to mark "young" orphans as live.
-    //
-    // Orphan list stores the RAW store-child path — the deletion path
-    // in `run_locked` calls `remove_dir_all` on it directly, so the
-    // canonical-form is intentionally not used for that purpose.
-    let now = Utc::now();
-    let mut orphan_link_indices = Vec::new();
-    for (index, entry) in all_link_entries.iter().enumerate() {
-        if reachable[index] {
-            continue;
-        }
-        if let Some(max_age) = max_age {
-            let last_seen = entry
-                .last_referenced_at
-                .expect("max-age planning stores each effective reference time");
-            if (now - last_seen) < max_age {
-                continue;
-            }
-        }
-        orphan_link_indices.push(index);
-    }
+    let orphan_link_indices = reachable
+        .iter()
+        .enumerate()
+        .filter_map(|(index, reachable)| (!reachable).then_some(index))
+        .collect::<Vec<_>>();
 
     let link_entries_orphaned = if build_full_plan {
         orphan_link_indices
@@ -1123,7 +1259,18 @@ fn compute_prune(
     let mut object_entries_total = 0usize;
     let mut object_entries_orphaned_count = 0usize;
     let mut object_entries_orphaned = Vec::new();
-    for (object_dir, segment) in v2_store.iter_object_dirs()? {
+    let objects = v2_store.object_dirs_for_prune()?;
+    let complete_objects = objects
+        .iter()
+        .map(|(_, segment)| segment.as_str())
+        .collect::<HashSet<_>>();
+    if object_referenced_segments
+        .iter()
+        .any(|segment| !complete_objects.contains(segment))
+    {
+        return Err(LpmError::Store("cache prune: a retained package references a missing or incomplete source object; repair the store before pruning".into()));
+    }
+    for (object_dir, segment) in objects {
         object_entries_total += 1;
         if !object_referenced_segments.contains(segment.as_str()) {
             object_entries_orphaned_count += 1;
@@ -1140,12 +1287,12 @@ fn compute_prune(
     //         their last-used sentinel stale. Absent on non-macOS (islands
     //         are a macOS clonefile feature) → the dir is missing → no-op.
     let (compat_islands_total, compat_islands_orphaned) = if build_full_plan {
-        compute_compat_island_orphans(v2_store.paths().compat_root(), max_age)
+        compute_compat_island_orphans(v2_store.paths().compat_root(), max_age)?
     } else {
         (0, Vec::new())
     };
     let (build_artifacts_total, build_artifacts_orphaned) = if build_full_plan {
-        compute_build_artifact_orphans(v2_store.paths().builds_root(), max_age)
+        compute_build_artifact_orphans(v2_store.paths().builds_root(), max_age)?
     } else {
         (0, Vec::new())
     };
@@ -1234,45 +1381,57 @@ fn count_tombstones_with_error_capture(root: &LpmRoot) -> (usize, Option<String>
     }
 }
 
+fn prune_inspection_error(path: &Path, error: std::io::Error) -> LpmError {
+    LpmError::Store(format!(
+        "cache prune: cannot inspect {}: {error}; no pruning plan is safe with unreadable state",
+        path.display()
+    ))
+}
+
 fn collect_project_link_roots_for_stores(
     project: &Path,
     links_roots_canonical: &[PathBuf],
     outputs: &mut [HashSet<PathBuf>],
-) {
+) -> Result<(), LpmError> {
     let node_modules = project.join("node_modules");
-    let Ok(entries) = std::fs::read_dir(node_modules) else {
-        return;
+    let entries = match std::fs::read_dir(&node_modules) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(prune_inspection_error(&node_modules, error)),
     };
-    for entry in entries.flatten() {
+    for entry in entries {
+        let entry = entry.map_err(|error| prune_inspection_error(&node_modules, error))?;
         let name = entry.file_name();
         let name = name.to_string_lossy();
         if name.starts_with('.') {
             continue;
         }
         let path = entry.path();
-        if name.starts_with('@') && path.is_dir() {
-            if let Ok(scoped) = std::fs::read_dir(path) {
-                for package in scoped.flatten() {
-                    add_canonical_link_to_store(&package.path(), links_roots_canonical, outputs);
-                }
+        if name.starts_with('@') {
+            for package in
+                std::fs::read_dir(&path).map_err(|error| prune_inspection_error(&path, error))?
+            {
+                let package = package.map_err(|error| prune_inspection_error(&path, error))?;
+                add_canonical_link_to_store(&package.path(), links_roots_canonical, outputs)?;
             }
         } else {
-            add_canonical_link_to_store(&path, links_roots_canonical, outputs);
+            add_canonical_link_to_store(&path, links_roots_canonical, outputs)?;
         }
     }
+    Ok(())
 }
 
 fn add_canonical_link_to_store(
     candidate: &Path,
     links_roots_canonical: &[PathBuf],
     outputs: &mut [HashSet<PathBuf>],
-) {
-    let Ok(canonical) = std::fs::canonicalize(candidate) else {
-        return;
-    };
+) -> Result<(), LpmError> {
+    let canonical = std::fs::canonicalize(candidate)
+        .map_err(|error| prune_inspection_error(candidate, error))?;
     for (links_root, output) in links_roots_canonical.iter().zip(outputs) {
         add_canonical_if_link_descendant(&canonical, links_root, output);
     }
+    Ok(())
 }
 
 fn add_canonical_if_link_descendant(
@@ -1382,7 +1541,7 @@ fn filesystem_available_bytes(_path: &Path) -> Option<u64> {
 fn compute_compat_island_orphans(
     compat_root: &Path,
     max_age: Option<ChronoDuration>,
-) -> (usize, Vec<PathBuf>) {
+) -> Result<(usize, Vec<PathBuf>), LpmError> {
     compute_lru_artifact_orphans(
         compat_root,
         lpm_store::v2::COMPAT_ISLAND_COMPLETE_FILENAME,
@@ -1393,7 +1552,7 @@ fn compute_compat_island_orphans(
 fn compute_build_artifact_orphans(
     builds_root: &Path,
     max_age: Option<ChronoDuration>,
-) -> (usize, Vec<PathBuf>) {
+) -> Result<(usize, Vec<PathBuf>), LpmError> {
     compute_lru_artifact_orphans(
         builds_root,
         lpm_store::v2::BUILD_ARTIFACT_COMPLETE_FILENAME,
@@ -1405,24 +1564,40 @@ fn compute_lru_artifact_orphans(
     root: &Path,
     completion_sentinel: &str,
     max_age: Option<ChronoDuration>,
-) -> (usize, Vec<PathBuf>) {
+) -> Result<(usize, Vec<PathBuf>), LpmError> {
     let read = match std::fs::read_dir(root) {
         Ok(read) => read,
-        Err(_) => return (0, Vec::new()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok((0, Vec::new())),
+        Err(error) => return Err(prune_inspection_error(root, error)),
     };
     let max_age_std = max_age.and_then(|d| d.to_std().ok());
     let mut total = 0usize;
     let mut orphaned = Vec::new();
-    for entry in read.flatten() {
-        if !entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+    for entry in read {
+        let entry = entry.map_err(|error| prune_inspection_error(root, error))?;
+        if !entry
+            .file_type()
+            .map_err(|error| prune_inspection_error(&entry.path(), error))?
+            .is_dir()
+        {
             continue;
         }
         let island = entry.path();
         total += 1;
         let sentinel = island.join(completion_sentinel);
-        let Ok(meta) = std::fs::metadata(&sentinel) else {
-            orphaned.push(island);
-            continue;
+        let meta = match std::fs::symlink_metadata(&sentinel) {
+            Ok(meta) if meta.is_file() && !lpm_common::is_symlink_or_junction(&meta) => meta,
+            Ok(_) => {
+                return Err(LpmError::Store(format!(
+                    "cache prune: invalid completion marker at {}",
+                    sentinel.display()
+                )));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                orphaned.push(island);
+                continue;
+            }
+            Err(error) => return Err(prune_inspection_error(&sentinel, error)),
         };
         if let Some(max_age_std) = max_age_std
             && meta
@@ -1434,7 +1609,7 @@ fn compute_lru_artifact_orphans(
             orphaned.push(island);
         }
     }
-    (total, orphaned)
+    Ok((total, orphaned))
 }
 
 fn emit_human(summary: &PruneSummary, applied: bool, elapsed: Duration) -> Result<(), LpmError> {
@@ -2088,13 +2263,13 @@ mod tests {
             .unwrap();
 
         // No --max-age: only the incomplete (crash-recovery) island is pruned.
-        let (total, orphans) = compute_compat_island_orphans(&compat_root, None);
+        let (total, orphans) = compute_compat_island_orphans(&compat_root, None).unwrap();
         assert_eq!(total, 3);
         assert_eq!(orphans, vec![incomplete.clone()]);
 
         // --max-age 7d: incomplete + stale pruned; the fresh island is kept.
         let (total, mut orphans) =
-            compute_compat_island_orphans(&compat_root, Some(ChronoDuration::days(7)));
+            compute_compat_island_orphans(&compat_root, Some(ChronoDuration::days(7))).unwrap();
         assert_eq!(total, 3);
         orphans.sort();
         let mut expected = vec![incomplete, stale];
@@ -2103,7 +2278,7 @@ mod tests {
 
         // Missing compat dir → no-op, never errors.
         assert_eq!(
-            compute_compat_island_orphans(&tmp.path().join("nope"), None),
+            compute_compat_island_orphans(&tmp.path().join("nope"), None).unwrap(),
             (0, Vec::new())
         );
     }
@@ -2135,12 +2310,12 @@ mod tests {
             .set_modified(ten_days_ago)
             .unwrap();
 
-        let (total, orphans) = compute_build_artifact_orphans(&builds_root, None);
+        let (total, orphans) = compute_build_artifact_orphans(&builds_root, None).unwrap();
         assert_eq!(total, 3);
         assert_eq!(orphans, vec![incomplete.clone()]);
 
         let (total, mut orphans) =
-            compute_build_artifact_orphans(&builds_root, Some(ChronoDuration::days(7)));
+            compute_build_artifact_orphans(&builds_root, Some(ChronoDuration::days(7))).unwrap();
         assert_eq!(total, 3);
         orphans.sort();
         let mut expected = vec![incomplete, stale];
@@ -2193,7 +2368,10 @@ mod tests {
         std::fs::write(format!("{}.writer-intent", live_lock.display()), b"").unwrap();
         std::fs::write(format!("{}.writer-queue", live_lock.display()), b"").unwrap();
 
-        remove_orphaned_build_locks(&store).unwrap();
+        let directory =
+            cap_std::fs::Dir::open_ambient_dir(store.paths().root(), cap_std::ambient_authority())
+                .unwrap();
+        remove_orphaned_build_locks_in(&store, &directory).unwrap();
 
         assert!(!orphan_lock.exists());
         assert!(!std::fs::exists(format!("{}.writer-intent", orphan_lock.display())).unwrap());
@@ -2431,12 +2609,10 @@ mod tests {
     /// A poisoned link entry shaped as a symlink resolving outside the
     /// store must not appear in the orphan list — otherwise `--apply`
     /// would call `remove_dir_all` on the symlink target outside the
-    /// store. The store-side filter rejects symlinks at `links/<entry>`
-    /// before the prune plan ever sees them; this regression pins that
-    /// contract from the cache-prune caller's point of view.
+    /// store. The prune inventory rejects a redirected entry before deletion.
     #[test]
     #[cfg(unix)]
-    fn compute_prune_plan_drops_symlinked_link_entry_resolving_outside_store() {
+    fn compute_prune_plan_rejects_symlinked_link_entry_resolving_outside_store() {
         let dir = tempfile::tempdir().unwrap();
         let lpm_home = dir.path().join("lpm-home");
         std::fs::create_dir_all(&lpm_home).unwrap();
@@ -2470,23 +2646,8 @@ mod tests {
         synthesize_project(&project, &store, &[("used-pkg", used_key)]);
         known_projects::register(&root.known_projects(), &project).unwrap();
 
-        let summary = compute_prune_plan(&root, &store, &PruneFlags::default(), None).unwrap();
-
-        assert_eq!(
-            summary.link_entries_total, 1,
-            "symlinked entry must not be counted as a valid link entry"
-        );
-        for orphan in &summary.link_entries_orphaned {
-            assert!(
-                !orphan.starts_with(&outside),
-                "orphan list must not contain a path resolving outside the store: {}",
-                orphan.display()
-            );
-            assert!(
-                orphan.file_name().is_none_or(|n| n != "poisoned-entry"),
-                "orphan list must not contain the symlinked entry name"
-            );
-        }
+        let error = compute_prune_plan(&root, &store, &PruneFlags::default(), None).unwrap_err();
+        assert!(error.to_string().contains("redirected link entry"));
 
         assert!(
             outside.exists(),

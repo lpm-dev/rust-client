@@ -297,11 +297,12 @@ pub(super) fn command_needs_global_state(cmd: &Commands) -> bool {
         {
             true
         }
-        // `cache prune --apply` walks every globally-installed package's
-        // lockfile + sweeps deferred tombstones — the manifest must be
-        // settled before either step runs.
+        // Applying prune retries global-install cleanup, so recovery must finish first.
         Commands::Cache(args)
-            if matches!(&args.action, commands::cache::CacheCmd::Prune { .. }) =>
+            if matches!(
+                &args.action,
+                commands::cache::CacheCmd::Prune { apply: true, .. }
+            ) =>
         {
             true
         }
@@ -999,13 +1000,12 @@ mod tests {
     #[test]
     fn predicate_true_for_store_verify_and_cache_prune() {
         // `store verify` reads per-package state from the manifest;
-        // `cache prune --apply` walks every globally-installed package's
-        // lockfile + sweeps deferred tombstones. Both need the manifest
-        // settled before they run.
+        // Applying prune retries deferred global-install cleanup.
+        // Both commands need the manifest settled before they run.
         assert!(command_needs_global_state(&parse(&[
             "lpm", "store", "verify"
         ])));
-        assert!(command_needs_global_state(&parse(&[
+        assert!(!command_needs_global_state(&parse(&[
             "lpm", "cache", "prune"
         ])));
         assert!(command_needs_global_state(&parse(&[

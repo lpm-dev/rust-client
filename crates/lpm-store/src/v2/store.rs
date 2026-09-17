@@ -2752,6 +2752,65 @@ impl Store {
         Ok(Box::new(iter) as Box<dyn Iterator<Item = (PathBuf, String)>>)
     }
 
+    /// Enumerate complete objects without hiding inspection failures from garbage collection.
+    pub fn object_dirs_for_prune(&self) -> Result<Vec<(PathBuf, String)>, LpmError> {
+        let root = self.paths.objects_root();
+        let entries = match std::fs::read_dir(&root) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) => return Err(error.into()),
+        };
+        let mut output = Vec::new();
+        for entry in entries {
+            let entry = entry?;
+            let path = entry.path();
+            let metadata = std::fs::symlink_metadata(&path)?;
+            if lpm_common::is_symlink_or_junction(&metadata) {
+                return Err(LpmError::Store(format!(
+                    "refusing redirected object at {}",
+                    path.display()
+                )));
+            }
+            if !metadata.is_dir() {
+                continue;
+            }
+            let mut complete = true;
+            for marker in [
+                "package.json",
+                ".integrity",
+                super::integrity::OBJECT_INTEGRITY_FILENAME,
+            ] {
+                let marker = path.join(marker);
+                match std::fs::symlink_metadata(&marker) {
+                    Ok(metadata)
+                        if metadata.is_file() && !lpm_common::is_symlink_or_junction(&metadata) => {
+                    }
+                    Ok(_) => {
+                        return Err(LpmError::Store(format!(
+                            "invalid object marker at {}",
+                            marker.display()
+                        )));
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => complete = false,
+                    Err(error) => {
+                        return Err(LpmError::Store(format!(
+                            "cannot inspect object marker at {}: {error}",
+                            marker.display()
+                        )));
+                    }
+                }
+            }
+            if complete {
+                let segment = entry
+                    .file_name()
+                    .into_string()
+                    .map_err(|_| LpmError::Store("invalid object directory name".into()))?;
+                output.push((path, segment));
+            }
+        }
+        Ok(output)
+    }
+
     pub fn verify_file_cas(
         &self,
         deep: bool,
@@ -2952,17 +3011,20 @@ impl Store {
         let mut reachable_trees = std::collections::HashMap::new();
         let mut reachable_blobs = std::collections::HashSet::new();
         let mut live_source_digests = std::collections::HashSet::new();
-        for (object_dir, _) in self.iter_object_dirs()? {
+        for (object_dir, _) in self.object_dirs_for_prune()? {
             if objects_to_remove.contains(object_dir.as_path()) {
                 continue;
             }
-            let source_sri =
-                std::fs::read_to_string(object_dir.join(".integrity")).map_err(|error| {
-                    LpmError::Store(format!(
-                        "failed to read v3 source integrity at {}: {error}",
-                        object_dir.display()
-                    ))
-                })?;
+            let source_sri = lpm_common::read_text_file_capped_nofollow(
+                &object_dir.join(".integrity"),
+                INTEGRITY_MARKER_SIZE_CAP_BYTES,
+            )
+            .map_err(|error| {
+                LpmError::Store(format!(
+                    "failed to read v3 source integrity at {}: {error}",
+                    object_dir.display()
+                ))
+            })?;
             let source_sri = source_sri.trim();
             let record = cas.source_record_for_prune(&object_dir, source_sri)?;
             live_source_digests.insert(blake3::hash(source_sri.as_bytes()).to_hex().to_string());
