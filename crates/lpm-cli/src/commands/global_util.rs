@@ -2,8 +2,19 @@ use crate::provenance_fetch::{DriftIgnorePolicy, VerifyPolicy};
 use crate::save_spec::UserSaveIntent;
 use crate::script_policy_config::ScriptPolicy;
 use lpm_common::{LpmError, LpmRoot};
-use lpm_registry::RegistryClient;
+use lpm_registry::{RegistryClient, RouteTable, UpstreamRoute};
 use std::path::Path;
+
+pub(super) fn metadata_route(routes: &RouteTable, name: &str) -> UpstreamRoute {
+    if lpm_common::package_name::is_lpm_package(name) {
+        UpstreamRoute::LpmWorker
+    } else {
+        match routes.route_for_package(name) {
+            route @ UpstreamRoute::Custom { .. } => route,
+            _ => UpstreamRoute::NpmDirect,
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy)]
 pub(super) enum SyntheticProjectJsonFormat {

@@ -6,16 +6,15 @@
 //! Read-only commands (`list`, `bin`, `path`) do not acquire a lock.
 
 use crate::install_ui;
-use chrono::Utc;
 use futures::StreamExt;
 use lpm_common::color::Painted;
 use lpm_common::{LpmError, LpmRoot, format_bytes, sanitize_for_terminal, with_exclusive_lock};
-use lpm_global::{
-    GlobalManifest, PackageEntry, PackageSource, Shim, artifacts_complete, emit_shim,
-    find_command_collisions, remove_shim,
-};
+use lpm_global::{GlobalManifest, PackageEntry, PackageSource, find_command_collisions};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+
+mod local_transaction;
+pub(crate) use local_transaction::{pending as local_link_pending, recover as recover_local_links};
 
 const LOCAL_LINK_SPEC_PREFIX: &str = "link:";
 const GLOBAL_OUTDATED_METADATA_CONCURRENCY: usize = 4;
@@ -29,8 +28,7 @@ pub enum GlobalCmd {
     /// List globally-installed packages with their active versions and exposed commands.
     List {
         /// Compare each install's resolved version against the registry
-        /// and flag packages with newer versions available under the
-        /// persisted `saved_spec`.
+        /// and flag packages with a newer matching or latest release.
         #[arg(long)]
         outdated: bool,
 
@@ -84,8 +82,7 @@ pub enum GlobalCmd {
     /// using the `decide_saved_dependency_spec`, then upgrade.
     /// Same precedence as `lpm install <pkg>@<spec>` in a project.
     ///
-    /// Use `--dry-run` to print the upgrade plan without making any
-    /// state changes.
+    /// Use `--dry-run` to print the upgrade plan without changing installations.
     Update {
         /// Optional package spec. Bare invocation iterates every
         /// globally-installed package. `<pkg>` re-resolves one;
@@ -172,7 +169,7 @@ fn run_list(
 /// outdated row.
 async fn run_list_outdated(
     client: &lpm_registry::RegistryClient,
-    _root: &LpmRoot,
+    root: &LpmRoot,
     manifest: &GlobalManifest,
     verbose: bool,
     json_output: bool,
@@ -244,7 +241,7 @@ async fn run_list_outdated(
     let mut unresolved: Vec<UnresolvedRow> = Vec::new();
     let alias_commands = index_alias_commands(manifest);
     let release_age_policy = crate::release_age_selection::resolver_policy_for_project(
-        &_root.global_root(),
+        &root.global_root(),
         None,
         false,
         json_output,
@@ -318,15 +315,19 @@ async fn run_list_outdated(
         }));
     }
 
+    let routes = lpm_registry::RouteTable::from_env_and_filesystem(&root.global_root())
+        .map_err(|error| LpmError::Registry(format!("npmrc: {error}")))?;
+    let routes = &routes;
     let release_age_policy_ref = &release_age_policy;
     let npm_fetches = futures::stream::iter(npm_names.into_iter().map(|name| async move {
         let result = async {
-            let mut metadata = client.get_npm_metadata_direct(&name).await?;
+            let route = super::global_util::metadata_route(routes, &name);
+            let mut metadata = client.get_npm_metadata_routed(&name, route.clone()).await?;
             crate::release_age_selection::hydrate_release_times_if_needed(
                 client,
                 &mut metadata,
                 release_age_policy_ref,
-                crate::release_age_selection::ReleaseTimeMetadataSource::NpmDirect,
+                crate::release_age_selection::ReleaseTimeMetadataSource::Routed(&route),
             )
             .await?;
             Ok::<_, LpmError>(metadata)
@@ -437,11 +438,12 @@ fn classify_global_outdated_entry(
             return;
         }
     };
-    if candidate <= current {
+    let latest = allowed_versions.latest;
+    let newer_latest = lpm_semver::Version::parse(&latest).is_ok_and(|version| version > current);
+    if candidate <= current && !newer_latest {
         up_to_date.push(name.to_string());
         return;
     }
-    let latest = allowed_versions.latest;
     outdated.push(OutdatedRow {
         package: name.to_string(),
         current: entry.resolved.clone(),
@@ -492,12 +494,10 @@ fn pick_latest_matching_from_index(
     // Exact pins that disappeared upstream should surface as unresolved,
     // not silently report up-to-date.
     if lpm_semver::Version::parse(saved_spec).is_ok() {
-        if meta.versions.contains_key(saved_spec)
-            && allowed_versions
+        if meta.versions.contains_key(saved_spec) {
+            return allowed_versions
                 .resolve_spec(meta, saved_spec, policy)
-                .is_ok()
-        {
-            return Ok(saved_spec.to_string());
+                .map_err(|error| error.to_string());
         }
         return Err(format!(
             "registry no longer serves the exact-pinned version '{saved_spec}' for '{}' — \
@@ -967,7 +967,7 @@ struct LocalLinkPackage {
 }
 
 fn run_link(root: &LpmRoot, path: Option<&Path>, json_output: bool) -> Result<(), LpmError> {
-    let link = load_local_link_package(path)?;
+    let mut link = load_local_link_package(path)?;
     let command_names: Vec<String> = link
         .bins
         .iter()
@@ -975,7 +975,11 @@ fn run_link(root: &LpmRoot, path: Option<&Path>, json_output: bool) -> Result<()
         .collect();
 
     with_exclusive_lock(root.global_tx_lock(), || {
+        local_transaction::recover_locked(root)?;
         let mut manifest = lpm_global::read_for(root)?;
+        if manifest.pending.contains_key(&link.name) {
+            return Err(LpmError::Script("a registry install for this package is still pending; finish or recover it before linking".into()));
+        }
         if let Some(existing) = manifest.packages.get(&link.name) {
             let name_safe = sanitize_for_terminal(&link.name);
             return match existing.source {
@@ -1006,25 +1010,7 @@ fn run_link(root: &LpmRoot, path: Option<&Path>, json_output: bool) -> Result<()
             return Err(local_link_collision_error(&link.name, &collisions));
         }
 
-        let result = materialize_local_link(root, &link).and_then(|()| {
-            let entry = PackageEntry {
-                saved_spec: format!("{LOCAL_LINK_SPEC_PREFIX}{}", link.source_dir.display()),
-                resolved: link.version.clone(),
-                integrity: "local-link".into(),
-                source: PackageSource::LocalLink,
-                installed_at: Utc::now(),
-                root: link.root_relative.clone(),
-                commands: command_names.clone(),
-            };
-            manifest.packages.insert(link.name.clone(), entry);
-            lpm_global::write_for(root, &manifest)
-        });
-
-        if let Err(err) = result {
-            cleanup_local_link_outputs(root, &link);
-            return Err(err);
-        }
-        Ok(())
+        local_transaction::link(root, &mut link, &mut manifest)
     })?;
 
     emit_link_success(&link, json_output);
@@ -1033,6 +1019,7 @@ fn run_link(root: &LpmRoot, path: Option<&Path>, json_output: bool) -> Result<()
 
 fn run_unlink(root: &LpmRoot, package: &str, json_output: bool) -> Result<(), LpmError> {
     let summary = with_exclusive_lock(root.global_tx_lock(), || {
+        local_transaction::recover_locked(root)?;
         let mut manifest = lpm_global::read_for(root)?;
         let entry = manifest.packages.get(package).cloned().ok_or_else(|| {
             LpmError::Script(format!(
@@ -1047,80 +1034,11 @@ fn run_unlink(root: &LpmRoot, package: &str, json_output: bool) -> Result<(), Lp
                 sanitize_for_terminal(package),
             )));
         }
-        let _validated_root = validated_local_link_root(root, &entry.root)?;
-
-        let aliases: Vec<(String, String)> = manifest
-            .aliases
-            .iter()
-            .filter_map(|(alias, owner)| {
-                (owner.package == package).then_some((alias.clone(), owner.bin.clone()))
-            })
-            .collect();
-        for command in &entry.commands {
-            if let Err(err) = remove_shim(&root.bin_dir(), command) {
-                return Err(restore_after_unlink_shim_failure(
-                    root, package, &entry, &aliases, err,
-                ));
-            }
-        }
-        for (alias, _) in &aliases {
-            if let Err(err) = remove_shim(&root.bin_dir(), alias) {
-                return Err(restore_after_unlink_shim_failure(
-                    root, package, &entry, &aliases, err,
-                ));
-            }
-        }
-        if let Err(err) = remove_local_link_root(root, &entry.root) {
-            if let Err(restore_failures) = restore_local_link_global_shims(root, &entry, &aliases) {
-                return Err(LpmError::Script(format!(
-                    "failed to remove local-link root for '{}': {err}. Additionally, failed to \
-                     restore {} shim(s): {}",
-                    sanitize_for_terminal(package),
-                    restore_failures.len(),
-                    restore_failures.join("; "),
-                )));
-            }
-            return Err(err);
-        }
-
-        manifest.packages.remove(package);
-        for (alias, _) in aliases {
-            manifest.aliases.remove(&alias);
-        }
-        lpm_global::write_for(root, &manifest)?;
-
-        let linked_path = linked_source_path(&entry).map(str::to_string);
-        Ok(UnlinkSummary {
-            package: package.to_string(),
-            version: entry.resolved,
-            linked_path,
-            commands: entry.commands,
-        })
+        local_transaction::unlink(root, package, &mut manifest, entry)
     })?;
 
     emit_unlink_success(&summary, json_output);
     Ok(())
-}
-
-fn restore_after_unlink_shim_failure(
-    root: &LpmRoot,
-    package: &str,
-    entry: &PackageEntry,
-    aliases: &[(String, String)],
-    remove_error: impl std::fmt::Display,
-) -> LpmError {
-    match restore_local_link_global_shims(root, entry, aliases) {
-        Ok(()) => LpmError::Script(format!(
-            "failed to remove a shim for '{}': {remove_error}; restored the package's shims",
-            sanitize_for_terminal(package),
-        )),
-        Err(restore_failures) => LpmError::Script(format!(
-            "failed to remove a shim for '{}': {remove_error}. Additionally, failed to restore {} shim(s): {}",
-            sanitize_for_terminal(package),
-            restore_failures.len(),
-            restore_failures.join("; "),
-        )),
-    }
 }
 
 #[derive(Debug, Clone)]
@@ -1129,6 +1047,7 @@ struct UnlinkSummary {
     version: String,
     linked_path: Option<String>,
     commands: Vec<String>,
+    retained_wrapper: Option<PathBuf>,
 }
 
 fn load_local_link_package(path: Option<&Path>) -> Result<LocalLinkPackage, LpmError> {
@@ -1188,6 +1107,18 @@ fn load_local_link_package(path: Option<&Path>) -> Result<LocalLinkPackage, LpmE
         )));
     }
 
+    #[cfg(any(target_os = "macos", windows))]
+    {
+        let mut seen = HashSet::with_capacity(entries.len());
+        for (command, _) in &entries {
+            if !seen.insert(command.to_ascii_lowercase()) {
+                return Err(LpmError::Script(format!(
+                    "local package declares colliding bin command '{}'",
+                    sanitize_for_terminal(command),
+                )));
+            }
+        }
+    }
     let mut bins = Vec::with_capacity(entries.len());
     for (command_name, script_path) in entries {
         if let Err(err) = lpm_global::shim::validate_command_name(&command_name) {
@@ -1203,6 +1134,8 @@ fn load_local_link_package(path: Option<&Path>) -> Result<LocalLinkPackage, LpmE
             target,
         });
     }
+
+    local_transaction::validate_bins(&bins)?;
 
     Ok(LocalLinkPackage {
         root_relative: local_link_root_relative(&name),
@@ -1227,6 +1160,16 @@ fn resolve_local_bin_target(package_dir: &Path, script_path: &str) -> Result<Pat
             "bin target '{}' is not a file",
             sanitize_for_terminal(&candidate.display().to_string()),
         )));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        if metadata.permissions().mode() & 0o111 == 0 {
+            return Err(LpmError::Script(format!(
+                "bin target '{}' is not executable; make the target executable before linking",
+                sanitize_for_terminal(&candidate.display().to_string()),
+            )));
+        }
     }
     let canonical = candidate.canonicalize().map_err(LpmError::Io)?;
     if !canonical.starts_with(package_dir) {
@@ -1291,129 +1234,6 @@ fn local_link_root_relative(package_name: &str) -> String {
         safe.push_str("package");
     }
     format!("links/{safe}")
-}
-
-fn materialize_local_link(root: &LpmRoot, link: &LocalLinkPackage) -> Result<(), LpmError> {
-    let link_root = validated_local_link_root(root, &link.root_relative)?;
-    if std::fs::symlink_metadata(&link_root).is_ok() {
-        remove_local_link_root(root, &link.root_relative)?;
-    }
-    let install_bin = link_root.join("node_modules").join(".bin");
-    for bin in &link.bins {
-        emit_shim(
-            &install_bin,
-            &Shim {
-                command_name: bin.command_name.clone(),
-                target: bin.target.clone(),
-            },
-        )?;
-        if !artifacts_complete(&install_bin, &bin.command_name) {
-            return Err(LpmError::Script(format!(
-                "failed to create complete local-link shim for '{}'",
-                sanitize_for_terminal(&bin.command_name),
-            )));
-        }
-    }
-
-    let global_bin = root.bin_dir();
-    for bin in &link.bins {
-        emit_shim(
-            &global_bin,
-            &Shim {
-                command_name: bin.command_name.clone(),
-                target: install_bin.join(&bin.command_name),
-            },
-        )?;
-        if !artifacts_complete(&global_bin, &bin.command_name) {
-            return Err(LpmError::Script(format!(
-                "failed to create complete global shim for '{}'",
-                sanitize_for_terminal(&bin.command_name),
-            )));
-        }
-    }
-    Ok(())
-}
-
-fn cleanup_local_link_outputs(root: &LpmRoot, link: &LocalLinkPackage) {
-    for bin in &link.bins {
-        let _ = remove_shim(&root.bin_dir(), &bin.command_name);
-    }
-    let _ = remove_local_link_root(root, &link.root_relative);
-}
-
-fn restore_local_link_global_shims(
-    root: &LpmRoot,
-    entry: &PackageEntry,
-    aliases: &[(String, String)],
-) -> Result<(), Vec<String>> {
-    let install_bin = root
-        .global_root()
-        .join(&entry.root)
-        .join("node_modules")
-        .join(".bin");
-    let mut failures = Vec::new();
-
-    for command in &entry.commands {
-        match emit_shim(
-            &root.bin_dir(),
-            &Shim {
-                command_name: command.clone(),
-                target: install_bin.join(command),
-            },
-        ) {
-            Ok(_) if artifacts_complete(&root.bin_dir(), command) => {}
-            Ok(_) => failures.push(format!(
-                "{}: restored shim artifact is incomplete",
-                sanitize_for_terminal(command)
-            )),
-            Err(err) => failures.push(format!("{}: {err}", sanitize_for_terminal(command))),
-        }
-    }
-
-    for (alias, bin) in aliases {
-        match emit_shim(
-            &root.bin_dir(),
-            &Shim {
-                command_name: alias.clone(),
-                target: install_bin.join(bin),
-            },
-        ) {
-            Ok(_) if artifacts_complete(&root.bin_dir(), alias) => {}
-            Ok(_) => failures.push(format!(
-                "{}: restored alias shim artifact is incomplete",
-                sanitize_for_terminal(alias)
-            )),
-            Err(err) => failures.push(format!("{}: {err}", sanitize_for_terminal(alias))),
-        }
-    }
-
-    if failures.is_empty() {
-        Ok(())
-    } else {
-        Err(failures)
-    }
-}
-
-fn remove_local_link_root(root: &LpmRoot, relative: &str) -> Result<(), LpmError> {
-    let path = validated_local_link_root(root, relative)?;
-    match std::fs::symlink_metadata(&path) {
-        Ok(meta) if meta.file_type().is_dir() => std::fs::remove_dir_all(&path)?,
-        Ok(_) => std::fs::remove_file(&path)?,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => return Err(LpmError::Io(e)),
-    }
-    Ok(())
-}
-
-fn validated_local_link_root(root: &LpmRoot, relative: &str) -> Result<PathBuf, LpmError> {
-    lpm_global::validated_local_link_root_relative(&root.global_root(), relative).map_err(
-        |reason| {
-            LpmError::Script(format!(
-                "invalid local-link root '{}': {reason}",
-                sanitize_for_terminal(relative),
-            ))
-        },
-    )
 }
 
 fn local_link_collision_error(
@@ -1490,10 +1310,17 @@ fn emit_unlink_success(summary: &UnlinkSummary, json_output: bool) {
                 "version": summary.version,
                 "path": summary.linked_path,
                 "commands": summary.commands,
+                "retained_wrapper": summary.retained_wrapper,
             }))
             .unwrap()
         );
         return;
+    }
+    if let Some(path) = &summary.retained_wrapper {
+        install_ui::warn_untrusted(&format!(
+            "Preserved wrapper at {} because it contains files without verified ownership",
+            path.display()
+        ));
     }
     install_ui::done_untrusted(&format!(
         "Unlinked {}@{}",

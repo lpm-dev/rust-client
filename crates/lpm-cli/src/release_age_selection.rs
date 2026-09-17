@@ -5,9 +5,10 @@ use lpm_semver::{Version, VersionReq};
 use std::path::Path;
 
 #[derive(Debug, Clone, Copy)]
-pub(crate) enum ReleaseTimeMetadataSource {
+pub(crate) enum ReleaseTimeMetadataSource<'a> {
     NpmDirect,
     WorkerOnly,
+    Routed(&'a lpm_registry::UpstreamRoute),
 }
 
 pub(crate) fn resolver_policy_for_project(
@@ -237,7 +238,7 @@ pub(crate) async fn hydrate_release_times_if_needed(
     client: &lpm_registry::RegistryClient,
     metadata: &mut PackageMetadata,
     policy: &ResolverPolicy,
-    source: ReleaseTimeMetadataSource,
+    source: ReleaseTimeMetadataSource<'_>,
 ) -> Result<(), LpmError> {
     let canonical = CanonicalKey::from_dep_name(&metadata.name);
     let missing_release_times = metadata
@@ -257,6 +258,11 @@ pub(crate) async fn hydrate_release_times_if_needed(
                     &metadata.name,
                     lpm_registry::UpstreamRoute::NpmDirect,
                 )
+                .await?
+        }
+        ReleaseTimeMetadataSource::Routed(route) => {
+            client
+                .get_npm_release_times_routed_full(&metadata.name, route.clone())
                 .await?
         }
         ReleaseTimeMetadataSource::WorkerOnly => {

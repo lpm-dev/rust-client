@@ -285,8 +285,10 @@ pub(super) fn command_needs_global_state(cmd: &Commands) -> bool {
         // a crashed install gets cleaned up before uninstall sees it
         // and bails with the in-flight-install error message.
         Commands::Uninstall(args) if args.global => true,
-        // Every `lpm global *` subcommand can observe or mutate global state.
-        Commands::Global(_) => true,
+        Commands::Global(args) => !matches!(
+            args.action,
+            commands::global::GlobalCmd::Update { dry_run: true, .. }
+        ),
         // `store verify` needs the manifest settled so the walker sees
         // the right per-package state. `cache prune` covers the
         // reachability-aware union (which is itself listed below).

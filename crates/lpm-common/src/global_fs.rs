@@ -13,6 +13,16 @@ pub struct GlobalStateDirectories {
 }
 
 impl GlobalStateDirectories {
+    pub fn global(&self) -> &cap_std::fs::Dir {
+        &self._global
+    }
+    pub fn links(&self) -> &cap_std::fs::Dir {
+        &self._links
+    }
+    pub fn bin(&self) -> &cap_std::fs::Dir {
+        &self._bin
+    }
+
     pub fn open_or_create(root: &LpmRoot) -> Result<Self, LpmError> {
         ensure_real_lpm_home(root)?;
         let home = cap_std::fs::Dir::open_ambient_dir(root.root(), cap_std::ambient_authority())

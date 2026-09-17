@@ -150,6 +150,32 @@ impl From<UnknownOpError> for LpmError {
     }
 }
 
+/// Refuse previews over incomplete global state without replaying or changing it.
+pub fn require_settled(root: &LpmRoot) -> Result<(), LpmError> {
+    let scan = WalReader::at(root.global_wal()).scan()?;
+    let resolved = scan
+        .records
+        .iter()
+        .filter_map(|record| match record {
+            WalRecord::Commit { tx_id, .. } | WalRecord::Abort { tx_id, .. } => {
+                Some(tx_id.as_str())
+            }
+            WalRecord::Intent(_) => None,
+        })
+        .collect::<BTreeSet<_>>();
+    let pending = scan.records.iter().any(|record| match record {
+        WalRecord::Intent(payload) => !resolved.contains(payload.tx_id.as_str()),
+        _ => false,
+    });
+    if !scan.is_clean() || pending || !read_for(root)?.pending.is_empty() {
+        return Err(LpmError::Script(
+            "global state needs recovery before a preview; run `lpm global list`, then retry"
+                .into(),
+        ));
+    }
+    Ok(())
+}
+
 pub fn recover(root: &LpmRoot) -> Result<RecoveryReport, LpmError> {
     let lock_path = root.global_tx_lock();
     let outcome = try_with_exclusive_lock(&lock_path, || run_recovery_locked(root))?;

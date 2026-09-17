@@ -326,6 +326,20 @@ pub fn verify_windows_shim_triple(
     Ok(())
 }
 
+/// Expected Windows command files, including their shell-specific suffixes.
+pub fn windows_shim_contents(shim: &Shim) -> Result<[(String, String); 3], ShimError> {
+    validate_command_name(&shim.command_name)?;
+    validate_command_name(&format!("{}.cmd", shim.command_name))?;
+    validate_command_name(&format!("{}.ps1", shim.command_name))?;
+    let target = shim.target.to_string_lossy();
+    validate_windows_target_path(&target)?;
+    Ok([
+        (format!("{}.cmd", shim.command_name), cmd_template(&target)),
+        (format!("{}.ps1", shim.command_name), ps1_template(&target)),
+        (shim.command_name.clone(), bash_template(&target)),
+    ])
+}
+
 // ─── Unix internals ───────────────────────────────────────────────────
 
 #[cfg(unix)]
@@ -360,6 +374,11 @@ fn ps1_template(target: &str) -> String {
         let quoted = command.replace('\'', "''");
         return format!("#!/usr/bin/env pwsh\n& '{quoted}' @args\nexit $LASTEXITCODE\n");
     }
+    let literal_target = if target.contains(['$', '`']) {
+        format!("'{}'", target.replace('\'', "''"))
+    } else {
+        format!("\"{target}\"")
+    };
     // PowerShell mirror of the .cmd template. `$env:PATH` covers the
     // PATH-fallback branch since PowerShell's `&` operator resolves
     // through PATH the same way cmd.exe does.
@@ -367,8 +386,8 @@ fn ps1_template(target: &str) -> String {
         "#!/usr/bin/env pwsh\n\
          $basedir = Split-Path $MyInvocation.MyCommand.Definition -Parent\n\
          $exe = Join-Path $basedir 'node.exe'\n\
-         if (Test-Path $exe) {{ & $exe \"{target}\" $args }}\n\
-         else {{ & node \"{target}\" $args }}\n"
+         if (Test-Path $exe) {{ & $exe {literal_target} $args }}\n\
+         else {{ & node {literal_target} $args }}\n"
     )
 }
 
@@ -376,6 +395,11 @@ fn bash_template(target: &str) -> String {
     if project_command_shim(target).is_some() {
         return "#!/bin/sh\nexec powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File \"$0.ps1\" \"$@\"\n".into();
     }
+    let literal_target = if target.contains(['$', '`']) {
+        format!("'{}'", target.replace('\'', "'\"'\"'"))
+    } else {
+        format!("\"{target}\"")
+    };
     // Mirrors npm's no-extension bash shim. Path-fallback model matches
     // the .cmd/.ps1 templates so all three artifacts behave the same.
     format!(
@@ -385,9 +409,9 @@ fn bash_template(target: &str) -> String {
              *CYGWIN*|*MINGW*|*MSYS*) basedir=`cygpath -w \"$basedir\"` ;;\n\
          esac\n\
          if [ -x \"$basedir/node\" ]; then\n\
-             exec \"$basedir/node\"  \"{target}\" \"$@\"\n\
+             exec \"$basedir/node\"  {literal_target} \"$@\"\n\
          else\n\
-             exec node  \"{target}\" \"$@\"\n\
+             exec node  {literal_target} \"$@\"\n\
          fi\n"
     )
 }
@@ -427,6 +451,49 @@ fn atomic_replace_file_windows(path: &Path, contents: &[u8]) -> Result<(), ShimE
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    #[cfg(unix)]
+    #[test]
+    fn windows_bash_shim_passes_shell_syntax_as_a_literal_path() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = TempDir::new().unwrap();
+        let target = dir
+            .path()
+            .join("$(touch injected)-`touch injected2`-'tool.js");
+        let shim = dir.path().join("tool");
+        std::fs::write(&shim, bash_template(&target.to_string_lossy())).unwrap();
+        let node = dir.path().join("node");
+        std::fs::write(&node, "#!/bin/sh\nprintf '%s\\n' \"$1\"\n").unwrap();
+        std::fs::set_permissions(&node, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let result = std::process::Command::new("sh")
+            .arg(&shim)
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        assert!(result.status.success());
+        assert_eq!(
+            String::from_utf8(result.stdout).unwrap().trim_end(),
+            target.to_string_lossy()
+        );
+        assert!(!dir.path().join("injected").exists());
+        assert!(!dir.path().join("injected2").exists());
+    }
+
+    #[test]
+    fn windows_powershell_shim_quotes_expansion_characters_literally() {
+        let target = "C:/$(Start-Process calc)/`variable/'tool.js";
+        let text = ps1_template(target);
+        assert!(text.contains("& node 'C:/$(Start-Process calc)/`variable/''tool.js' $args"));
+    }
+
+    #[test]
+    fn windows_shim_rejects_a_command_whose_suffix_exceeds_the_filename_limit() {
+        let shim = Shim {
+            command_name: "x".repeat(253),
+            target: PathBuf::from("C:/tool.js"),
+        };
+        assert!(windows_shim_contents(&shim).is_err());
+    }
 
     #[cfg(unix)]
     #[test]
