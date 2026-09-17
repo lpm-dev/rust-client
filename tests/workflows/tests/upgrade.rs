@@ -2862,3 +2862,6 @@ async fn upgrade_yes_dry_run_json_envelope_with_full_enrichment_smoke() {
         serde_json::json!(format!("{UP7_PKG}@{UP7_CURRENT}"))
     );
 }
+
+#[path = "upgrade_contract/mod.rs"]
+mod upgrade_contract;

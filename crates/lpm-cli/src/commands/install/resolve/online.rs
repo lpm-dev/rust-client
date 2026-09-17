@@ -236,7 +236,7 @@ pub(in crate::commands::install) async fn run_online_resolution_phase(
                 );
                 let resolver_root_dependencies =
                     lpm_resolver::RootDependencies::with_optional_names(
-                        deps.clone(),
+                        root_versions::constrain(project_dir, deps)?,
                         optional_registry_roots,
                     );
                 let resolve_start = Instant::now();
@@ -471,7 +471,15 @@ pub(in crate::commands::install) async fn run_online_resolution_phase(
                     });
                     (res, 0u128)
                 } else {
-                    let dep_names: Vec<String> = deps.keys().cloned().collect();
+                    let dep_names: Vec<String> = deps
+                        .iter()
+                        .map(|(name, range)| {
+                            lpm_resolver::ranges::parse_npm_alias(range)
+                                .map_or_else(|| name.clone(), |alias| alias.target)
+                        })
+                        .collect::<BTreeSet<_>>()
+                        .into_iter()
+                        .collect();
                     use lpm_resolver::{BfsWalker, NotifyMap, SharedCache, WalkerDone};
                     let shared_cache: SharedCache = Arc::new(dashmap::DashMap::new());
                     seed_workspace_resolver_cache(&shared_cache, all_workspace_members)?;

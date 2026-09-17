@@ -165,7 +165,13 @@ impl DependencyProvider for LpmDependencyProvider {
         // newest-in-range pass below for whatever the resolver wants to
         // do (usually return None and surface a NoSolution).
         if let Some(natural_ver) = natural.as_ref() {
-            let parent_ctx = package.context();
+            // Split identities include ancestor contexts; path selectors name only the parent.
+            let parent_ctx = package.context().and_then(|context| {
+                let parent = context
+                    .split_once('[')
+                    .map_or(context, |(parent, _)| parent);
+                (!parent.starts_with("<root>")).then_some(parent)
+            });
             if let Some(entry) = self
                 .overrides
                 .find_match(&canonical, natural_ver, parent_ctx)
@@ -337,7 +343,7 @@ impl DependencyProvider for LpmDependencyProvider {
 
                 let npm_range = NpmRange::parse_registry_spec(&range_str)
                     .map_err(ProviderError::InvalidRange)?;
-                let pkg = ResolverPackage::from_dep_name(&target_name);
+                let pkg = ResolverPackage::from_root_dependency(dep_name, &target_name);
                 if let Err(error) = self.ensure_cached_for_range(&pkg, &npm_range) {
                     if edge_is_optional {
                         tracing::debug!(

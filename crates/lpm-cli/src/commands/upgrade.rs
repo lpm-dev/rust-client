@@ -245,7 +245,8 @@ pub async fn run(
                 "dependency `{name}` uses invalid package specifier `{manifest_value}`: {error}"
             ))
         })?;
-        if manifest_value.trim_start().starts_with("jsr:")
+        if manifest_value.trim_start().starts_with("catalog:")
+            || manifest_value.trim_start().starts_with("jsr:")
             || matches!(
                 parsed_specifier,
                 Specifier::Workspace(_)
@@ -307,7 +308,7 @@ pub async fn run(
 
     if !requested_packages.is_empty() && !skipped_non_registry.is_empty() {
         return Err(LpmError::Script(format!(
-            "cannot upgrade requested non-registry package(s): {}. Update the local, git, tarball, workspace, or JSR spec directly in package.json.",
+            "cannot upgrade requested non-registry package(s): {}. Update the local, git, tarball, workspace, or JSR spec directly in package.json. For a catalog reference, update the owning catalog.",
             skipped_non_registry.join(", ")
         )));
     }
@@ -365,7 +366,7 @@ pub async fn run(
                 &metadata,
                 release_age_policy_ref,
             )?;
-            Ok::<_, LpmError>((metadata, allowed_versions))
+            Ok::<_, LpmError>((Arc::new(metadata), allowed_versions))
         }
         .await;
         (job, result)
@@ -550,6 +551,68 @@ pub async fn run(
     }
 
     seed_selected_metadata_for_install(&install_client, &deduped)?;
+    let mut root_versions = HashMap::new();
+    for (name, value, kind) in extract_deps_from_value(&doc) {
+        let (spec, range) = ManifestDependencySpec::from_manifest_value(&name, &value)?;
+        if !value.starts_with("catalog:")
+            && VersionReq::parse(&range).is_err()
+            && let Some(snapshot) = lockfile.as_ref().and_then(|lock| lock.importers.get("."))
+        {
+            let declared = match kind {
+                DependencyKind::Runtime => snapshot.dependencies.get(&name),
+                DependencyKind::Development => snapshot.dev_dependencies.get(&name),
+                DependencyKind::Optional => snapshot.optional_dependencies.get(&name),
+            };
+            if declared != Some(&value) {
+                continue;
+            }
+        }
+        let canonical = match &spec {
+            ManifestDependencySpec::Plain if value.starts_with("catalog:") => lockfile
+                .as_ref()
+                .and_then(|lock| lock.root_resolutions.get(&name))
+                .map_or(name.as_str(), |root| root.package.as_str()),
+            ManifestDependencySpec::Plain => &name,
+            ManifestDependencySpec::NpmAlias { target } => target,
+        };
+        if let Some(locked) = roots.root_package(&name, canonical)
+            && matches!(
+                locked.source_kind(),
+                Some(Ok(lpm_lockfile::Source::Registry { .. })) | None
+            )
+        {
+            let catalog_specifier = value.strip_prefix("catalog:").map(|catalog| {
+                let catalog = if catalog.is_empty() {
+                    "default"
+                } else {
+                    catalog
+                };
+                lockfile
+                    .as_ref()
+                    .and_then(|lock| lock.catalogs.get(catalog))
+                    .and_then(|entries| entries.get(&name))
+                    .map_or_else(|| value.clone(), |entry| entry.specifier.clone())
+            });
+            root_versions.insert(
+                name,
+                crate::commands::install::root_versions::RootVersionPin {
+                    canonical_name: locked.name.clone(),
+                    version: locked.version.clone(),
+                    catalog_specifier,
+                },
+            );
+        }
+    }
+    for candidate in &deduped {
+        root_versions.insert(
+            candidate.name.clone(),
+            crate::commands::install::root_versions::RootVersionPin {
+                canonical_name: candidate.lookup_name.clone(),
+                version: candidate.to.clone(),
+                catalog_specifier: None,
+            },
+        );
+    }
 
     // ── Mutate package.json ─────────────────────────────────────────
 
@@ -611,13 +674,8 @@ pub async fn run(
                     install_ui::phase("Installing upgraded dependencies");
                 }
 
-                if !crate::commands::install::workspace_lockfile::mutation_active() {
-                    remove_optional_file(&lockfile_path)?;
-                    remove_optional_file(&lockfile_binary_path)?;
-                }
-
                 let lpm_root = lpm_common::LpmRoot::from_env()?;
-                let install_result = crate::commands::install::run_with_options_with_lpm_root(
+                let install = crate::commands::install::run_with_options_with_lpm_root(
                     &install_client,
                     project_dir,
                     json_output,
@@ -653,8 +711,10 @@ pub async fn run(
                     false,
                     None,
                     lpm_root,
-                )
-                .await;
+                );
+                let install_result = crate::commands::install::root_versions::scope(
+                    project_dir, root_versions, install,
+                ).await;
                 if let Err(error) = install_result {
                     if !json_output {
                         install_ui::warn("install failed — restored original package.json");
@@ -702,61 +762,22 @@ fn seed_selected_metadata_for_install(
     client: &RegistryClient,
     candidates: &[EnrichedCandidate],
 ) -> Result<(), LpmError> {
-    let mut metadata_by_route: HashMap<(MetadataRoute, String), Arc<PackageMetadata>> =
-        HashMap::with_capacity(candidates.len());
+    let mut seeded = std::collections::HashSet::with_capacity(candidates.len());
     for candidate in candidates {
-        let key = (candidate.route, candidate.lookup_name.clone());
-        match metadata_by_route.entry(key) {
-            std::collections::hash_map::Entry::Vacant(entry) => {
-                entry.insert(Arc::clone(&candidate.selected_metadata));
-            }
-            std::collections::hash_map::Entry::Occupied(mut entry) => {
-                if !Arc::ptr_eq(entry.get(), &candidate.selected_metadata) {
-                    merge_selected_metadata(
-                        Arc::make_mut(entry.get_mut()),
-                        &candidate.selected_metadata,
-                    );
-                }
-            }
-        }
-    }
-
-    for ((route, name), metadata) in metadata_by_route {
-        if !client.seed_metadata_for_command(&name, &route.upstream_route(), metadata) {
+        if seeded.insert((candidate.route, candidate.lookup_name.as_str()))
+            && !client.seed_metadata_for_command(
+                &candidate.lookup_name,
+                &candidate.route.upstream_route(),
+                Arc::clone(&candidate.selected_metadata),
+            )
+        {
             return Err(LpmError::Registry(format!(
-                "failed to retain validated upgrade metadata for '{name}'"
+                "failed to retain validated upgrade metadata for '{}'",
+                candidate.lookup_name
             )));
         }
     }
     Ok(())
-}
-
-fn merge_selected_metadata(existing: &mut PackageMetadata, incoming: &PackageMetadata) {
-    existing.versions.extend(incoming.versions.clone());
-    existing.time.extend(incoming.time.clone());
-    for (tag, version) in &incoming.dist_tags {
-        let replace = existing.dist_tags.get(tag).is_none_or(|current| {
-            match (Version::parse(version), Version::parse(current)) {
-                (Ok(candidate), Ok(current)) => candidate > current,
-                _ => version > current,
-            }
-        });
-        if replace {
-            existing.dist_tags.insert(tag.clone(), version.clone());
-        }
-    }
-    existing.latest_version = existing.dist_tags.get("latest").cloned();
-}
-
-fn remove_optional_file(path: &Path) -> Result<(), LpmError> {
-    match std::fs::remove_file(path) {
-        Ok(()) => Ok(()),
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(err) => Err(LpmError::Script(format!(
-            "failed to remove {}: {err}",
-            path.display()
-        ))),
-    }
 }
 
 async fn fetch_metadata(
@@ -844,7 +865,7 @@ fn join_bounded_metadata_failures(failures: &[(usize, usize, String)]) -> String
 #[allow(clippy::too_many_arguments)]
 fn plan_upgrade_dependency(
     dependency: &UpgradeDependency,
-    metadata: &PackageMetadata,
+    metadata: &Arc<PackageMetadata>,
     allowed_versions: &crate::release_age_selection::AllowedVersionIndex,
     mode: ResolvedMode,
     major: bool,
@@ -906,11 +927,7 @@ fn plan_upgrade_dependency(
             installed_version.unwrap_or("0.0.0"),
             &target_version,
         );
-        let selected_metadata = Arc::new(compact_metadata_for_version(
-            metadata,
-            &target_version,
-            required_dist_tag,
-        )?);
+        let selected_metadata = Arc::clone(metadata);
         Ok(Some(EnrichedCandidate {
             name: dependency.name.clone(),
             from: from.clone(),
@@ -938,17 +955,22 @@ fn plan_upgrade_dependency(
     } else {
         1
     });
-    if metadata.dist_tags.contains_key(&dependency.range) {
+    if metadata.dist_tags.contains_key(&dependency.range)
+        || VersionReq::parse(&dependency.range).is_err()
+    {
         let target =
             allowed_versions.resolve_spec(metadata, &dependency.range, release_age_policy)?;
-        if installed_version.is_none_or(|installed| installed != target)
-            && let Some(candidate) = build_candidate(
-                target,
-                dependency.range.clone(),
-                TargetKind::WithinMajor,
-                Some(&dependency.range),
-            )?
-        {
+        if installed_version.is_none_or(|installed| {
+            Version::parse(installed)
+                .ok()
+                .zip(Version::parse(&target).ok())
+                .is_some_and(|(installed, target)| target > installed)
+        }) && let Some(candidate) = build_candidate(
+            target,
+            dependency.range.clone(),
+            TargetKind::WithinMajor,
+            Some(&dependency.range),
+        )? {
             planned.push(candidate);
         }
         return Ok(planned);
@@ -1014,43 +1036,6 @@ fn plan_upgrade_dependency(
         }
     }
     Ok(planned)
-}
-
-fn compact_metadata_for_version(
-    metadata: &PackageMetadata,
-    version: &str,
-    required_dist_tag: Option<&str>,
-) -> Result<PackageMetadata, LpmError> {
-    let selected = metadata.version(version).cloned().ok_or_else(|| {
-        LpmError::Registry(format!(
-            "registry selected missing version '{}@{version}'",
-            metadata.name
-        ))
-    })?;
-    let mut dist_tags = HashMap::with_capacity(1 + usize::from(required_dist_tag.is_some()));
-    dist_tags.insert("latest".to_string(), version.to_string());
-    if let Some(tag) = required_dist_tag {
-        dist_tags.insert(tag.to_string(), version.to_string());
-    }
-    let mut versions = HashMap::with_capacity(1);
-    versions.insert(version.to_string(), selected);
-    let mut time = HashMap::with_capacity(1);
-    if let Some(published_at) = metadata.time.get(version) {
-        time.insert(version.to_string(), published_at.clone());
-    }
-    Ok(PackageMetadata {
-        name: metadata.name.clone(),
-        description: None,
-        modified: metadata.modified.clone(),
-        dist_tags,
-        versions,
-        time,
-        downloads: None,
-        distribution_mode: metadata.distribution_mode.clone(),
-        package_type: metadata.package_type.clone(),
-        latest_version: Some(version.to_string()),
-        ecosystem: metadata.ecosystem.clone(),
-    })
 }
 
 fn emit_upgrade_json(
@@ -1385,6 +1370,14 @@ fn extract_deps_from_value(doc: &serde_json::Value) -> Vec<(String, String, Depe
     }
     if let Some(obj) = doc.get("devDependencies").and_then(|d| d.as_object()) {
         for (k, v) in obj {
+            if optional.is_some_and(|optional| optional.contains_key(k))
+                || doc
+                    .get("dependencies")
+                    .and_then(|deps| deps.get(k))
+                    .is_some_and(|runtime| runtime != v)
+            {
+                continue;
+            }
             if let Some(range) = v.as_str() {
                 deps.push((k.clone(), range.to_string(), DependencyKind::Development));
             }
@@ -1494,8 +1487,12 @@ fn compute_upgrade(
         }
     };
 
+    let latest_version = Version::parse(latest).ok();
     let Some(best) = available_versions.iter().rev().find(|version| {
-        version.major() == current_major
+        latest_version
+            .as_ref()
+            .is_none_or(|latest| *version <= latest)
+            && version.major() == current_major
             && prerelease_allowed(version)
             && (simple_range.is_some()
                 || requirement

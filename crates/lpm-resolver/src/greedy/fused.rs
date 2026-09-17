@@ -1690,9 +1690,13 @@ pub async fn resolve_greedy_fused_with_cache_options_policy_and_selected_events_
     let worker_root_names: Vec<String> = if range_aware_worker_batch {
         worker_package_names_from_specs(&worker_root_package_specs)
     } else {
-        state
+        let mut names: Vec<_> = state
             .root_deps
-            .keys()
+            .iter()
+            .map(|(name, range)| {
+                crate::ranges::parse_npm_alias(range)
+                    .map_or_else(|| name.clone(), |alias| alias.target)
+            })
             .filter(|name| {
                 !shared_cache.contains_key(&CanonicalKey::from_dep_name(name))
                     && matches!(
@@ -1700,8 +1704,10 @@ pub async fn resolve_greedy_fused_with_cache_options_policy_and_selected_events_
                         UpstreamRoute::LpmWorker
                     )
             })
-            .cloned()
-            .collect()
+            .collect();
+        names.sort();
+        names.dedup();
+        names
     };
     let streaming_worker_batch = range_aware_worker_batch
         && worker_streaming_batch_enabled()

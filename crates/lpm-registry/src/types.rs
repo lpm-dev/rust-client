@@ -168,6 +168,16 @@ pub struct VersionMetadata {
     #[serde(default, rename = "_lifecycleScripts")]
     pub lifecycle_scripts: Option<HashMap<String, String>>,
 
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scripts: Option<HashMap<String, String>>,
+
+    #[serde(
+        default,
+        rename = "hasInstallScript",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub has_install_script: Option<bool>,
+
     #[serde(default, rename = "_securityFindings")]
     pub security_findings: Option<Vec<SecurityFinding>>,
 

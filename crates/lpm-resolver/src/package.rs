@@ -82,6 +82,16 @@ impl ResolverPackage {
         }
     }
 
+    /// Keep independently named root aliases distinct in the PubGrub constraint map.
+    pub(crate) fn from_root_dependency(local_name: &str, target: &str) -> Self {
+        let package = Self::from_dep_name(target);
+        if local_name == target {
+            package
+        } else {
+            package.with_context(&format!("<root>:{local_name}"))
+        }
+    }
+
     /// Create a context-scoped copy of this package for multi-version splitting.
     /// `ms` with context `"debug"` becomes a separate package from `ms` with context `"send"`.
     pub fn with_context(&self, ctx: &str) -> Self {

@@ -61,19 +61,19 @@ pub fn classify_semver_change(from: &str, to: &str) -> SemverClass {
     }
 }
 
-/// True iff the upgrade target's published manifest declares any
-/// non-empty `EXECUTED_INSTALL_PHASES` lifecycle script.
-///
-/// Reads from `VersionMetadata::lifecycle_scripts` (the LPM-extended
-/// `_lifecycleScripts` field). the `[!]` marker is gated on this
-/// predicate — see design doc F-V8 for the rationale.
+/// Whether registry metadata reports install lifecycle scripts for this version.
 pub fn target_has_install_scripts(meta: &VersionMetadata) -> bool {
-    let Some(scripts) = meta.lifecycle_scripts.as_ref() else {
-        return false;
-    };
-    lpm_security::EXECUTED_INSTALL_PHASES
-        .iter()
-        .any(|phase| scripts.get(*phase).is_some_and(|body| !body.is_empty()))
+    meta.has_install_script == Some(true)
+        || [meta.lifecycle_scripts.as_ref(), meta.scripts.as_ref()]
+            .into_iter()
+            .flatten()
+            .any(|scripts| {
+                lpm_security::EXECUTED_INSTALL_PHASES.iter().any(|phase| {
+                    scripts
+                        .get(*phase)
+                        .is_some_and(|body| !body.trim().is_empty())
+                })
+            })
 }
 
 /// Peer-dep satisfaction analysis for an upgrade candidate.

@@ -277,6 +277,11 @@ impl NdjsonBatchEntryStream {
             self.cache_write_ns += write_start.elapsed().as_nanos();
         }
         self.received += 1;
+        // A deep batch can include a package already selected by this command.
+        // Keep that selection's metadata even if the registry changed meanwhile.
+        let meta = client
+            .npm_metadata_memory_cache(&name, &crate::UpstreamRoute::LpmWorker)
+            .map_or(meta, |snapshot| snapshot.as_ref().clone());
         Ok(Some((name, meta)))
     }
 
@@ -1265,6 +1270,9 @@ impl RegistryClient {
                 let cache_key = self.batch_metadata_cache_key_for_principal(&name, cache_principal);
                 self.write_metadata_cache_with_directive(&cache_key, &meta, None, cache_directive);
             }
+            let meta = self
+                .npm_metadata_memory_cache(&name, &crate::UpstreamRoute::LpmWorker)
+                .map_or(meta, |snapshot| snapshot.as_ref().clone());
             map.insert(name, meta);
         }
 
