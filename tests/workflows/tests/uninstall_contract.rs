@@ -31,7 +31,12 @@ async fn assert_optional_install_retained(workspace: bool) {
         .assert()
         .success();
     let installed = format!("{target}/node_modules/retained-tool/package.json");
-    let shim = format!("{target}/node_modules/.bin/retained-tool");
+    let command_name = if cfg!(windows) {
+        "retained-tool.cmd"
+    } else {
+        "retained-tool"
+    };
+    let shim = format!("{target}/node_modules/.bin/{command_name}");
     assert!(project.file_exists(&installed));
     assert!(project.file_exists(&shim));
 
