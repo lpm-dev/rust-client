@@ -1055,7 +1055,7 @@ pub(crate) struct MigrateArgs {
     #[arg(long)]
     pub(crate) ci: bool,
 
-    /// Don't run `lpm install` after conversion (lockfile-only migration).
+    /// Skip dependency installation. Verification and configuration remain enabled.
     #[arg(long)]
     pub(crate) no_install: bool,
 
@@ -1068,7 +1068,7 @@ pub(crate) struct MigrateArgs {
     pub(crate) force: bool,
 
     /// Restore files from .backup copies created by a previous migration.
-    #[arg(long)]
+    #[arg(long, conflicts_with = "dry_run")]
     pub(crate) rollback: bool,
 
     /// Reserved. The migrate flow is non-interactive today, so this

@@ -98,6 +98,19 @@ fn detect_version(path: &Path, kind: SourceKind) -> Result<u32, LpmError> {
     }
 }
 
+pub(crate) fn snapshot_version(
+    content: &str,
+    path: &Path,
+    kind: SourceKind,
+) -> Result<u32, LpmError> {
+    match kind {
+        SourceKind::Npm => crate::npm::lockfile_version_from_value(&serde_json::from_str(content)?),
+        SourceKind::Yarn => Ok(yarn_version_from_snapshot(content)),
+        SourceKind::Pnpm => Ok(pnpm_version_from_snapshot(content)),
+        SourceKind::Bun => Ok(detect_bun_version(path)),
+    }
+}
+
 /// npm: parse `lockfileVersion` from JSON.
 fn detect_npm_version(path: &Path) -> Result<u32, LpmError> {
     let content = crate::read_lockfile_snapshot(path)?;
@@ -109,7 +122,10 @@ fn detect_npm_version(path: &Path) -> Result<u32, LpmError> {
 /// Yarn v1 uses a custom format; Yarn Berry (v2+) uses YAML.
 fn detect_yarn_version(path: &Path) -> Result<u32, LpmError> {
     let content = crate::read_lockfile_snapshot(path)?;
+    Ok(yarn_version_from_snapshot(&content))
+}
 
+fn yarn_version_from_snapshot(content: &str) -> u32 {
     // Yarn Berry (v2+) lockfiles start with __metadata and contain a "cacheKey"
     if content.contains("__metadata:") {
         // Try to extract the version from __metadata
@@ -118,26 +134,29 @@ fn detect_yarn_version(path: &Path) -> Result<u32, LpmError> {
             if let Some(rest) = trimmed.strip_prefix("version:") {
                 let ver_str = rest.trim().trim_matches('"');
                 if let Ok(v) = ver_str.parse::<u32>() {
-                    return Ok(v);
+                    return v;
                 }
             }
         }
-        return Ok(2);
+        return 2;
     }
 
     // Classic yarn v1: look for the header comment
     if content.contains("# yarn lockfile v1") {
-        return Ok(1);
+        return 1;
     }
 
     // Default to v1 if we can't determine
-    Ok(1)
+    1
 }
 
 /// pnpm: parse `lockfileVersion` from the first few lines of YAML.
 fn detect_pnpm_version(path: &Path) -> Result<u32, LpmError> {
     let content = crate::read_lockfile_snapshot(path)?;
+    Ok(pnpm_version_from_snapshot(&content))
+}
 
+fn pnpm_version_from_snapshot(content: &str) -> u32 {
     for line in content.lines().take(5) {
         let trimmed = line.trim();
         if let Some(rest) = trimmed.strip_prefix("lockfileVersion:") {
@@ -146,20 +165,20 @@ fn detect_pnpm_version(path: &Path) -> Result<u32, LpmError> {
             if let Some(dot_pos) = ver_str.find('.')
                 && let Ok(major) = ver_str[..dot_pos].parse::<u32>()
             {
-                return Ok(major);
+                return major;
             }
             // Try parsing as plain integer
             if let Ok(v) = ver_str.parse::<u32>() {
-                return Ok(v);
+                return v;
             }
             // Try parsing as float and take the integer part
             if let Ok(v) = ver_str.parse::<f64>() {
-                return Ok(v as u32);
+                return v as u32;
             }
         }
     }
 
-    Ok(5) // Default to v5 if unparseable
+    5 // Default to v5 if unparseable
 }
 
 /// bun: version is determined by the extension.

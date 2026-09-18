@@ -3,6 +3,7 @@
 //! Tests the full migration path from npm/yarn/pnpm/bun lockfiles to LPM,
 //! including backup creation, rollback, and dry-run.
 
+mod migrate_contract;
 mod support;
 
 use support::assertions;

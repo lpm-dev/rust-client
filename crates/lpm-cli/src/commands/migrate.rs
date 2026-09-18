@@ -197,51 +197,26 @@ pub async fn run(
         return Ok(());
     }
 
-    let mut migration_backup = MigrationBackup::new();
+    let mut migration_backup = MigrationBackup::for_project(cwd)?;
 
-    // Back up the source lockfile (package-lock.json, yarn.lock, etc.)
-    migration_backup.backup_file(&result.source.path)?;
-
-    // Back up existing lpm.lock if overwriting
-    migration_backup.backup_file(&lockfile_path)?;
-
-    // Back up lpm.lockb too — `Lockfile::write_all` writes both files
-    // atomically (the binary file is derived from the TOML content), so
-    // both need to round-trip through the backup chain. Without this
-    // line, a fresh migration's freshly-created lpm.lockb would survive
-    // `lpm migrate --rollback` even after lpm.lock was removed from the
-    // `created` list, leaving the project with a stale binary lockfile.
     let lockb_path = cwd.join("lpm.lockb");
-    migration_backup.backup_file(&lockb_path)?;
-
-    // Back up .gitattributes unconditionally — `ensure_gitattributes`
-    // creates the file when missing AND modifies it when present, so
-    // the backup chain needs to track it on both paths. With the
-    // existence guard the v2 manifest's `created` array would miss the
-    // newly-created file, leaving a stray `.gitattributes` on disk
-    // after `lpm migrate --rollback`.
     let gitattributes_path = cwd.join(".gitattributes");
-    migration_backup.backup_file(&gitattributes_path)?;
-
-    // Back up package.json iff either plan is about to write to it.
-    // Skipping when there's nothing to apply keeps the backup surface
-    // narrow and avoids littering the project with stray `.backup` files
-    // for migrations that didn't touch the manifest.
-    if overrides_plan.has_entries() || patches_plan.has_entries() {
-        migration_backup.backup_file(&pkg_json_path)?;
+    let mut backup_paths = Vec::with_capacity(5 + patches_plan.to_apply.len());
+    backup_paths.extend([
+        result.source.path.as_path(),
+        lockfile_path.as_path(),
+        lockb_path.as_path(),
+        gitattributes_path.as_path(),
+    ]);
+    if overrides_plan.has_entries() || patches_plan.has_entries() || peer_rules_plan.has_entries() {
+        backup_paths.push(&pkg_json_path);
     }
-
-    // For each non-self-copy patch entry whose destination already exists
-    // pre-migration (rare: user mid-manual-port), back up the destination
-    // so a rollback restores its prior content. Self-copy entries don't
-    // write to the destination, so they don't widen the backup surface.
     for translation in &patches_plan.to_apply {
-        if !translation.is_self_copy && translation.dest_pre_exists {
-            migration_backup.backup_file(&translation.dest_absolute)?;
+        if !translation.is_self_copy {
+            backup_paths.push(&translation.dest_absolute);
         }
     }
-
-    migration_backup.write_manifest(cwd)?;
+    migration_backup.backup_files(cwd, &backup_paths)?;
 
     if let Err(e) = result.lockfile.write_all(&lockfile_path) {
         render_migration_failure_with_rollback(&e, &migration_backup);
@@ -291,11 +266,7 @@ pub async fn run(
     // via the v2 manifest's `created` list), and brings the
     // pre-existing destination paths back from their backups.
     if patches_plan.has_entries() {
-        if let Err(e) = apply_patches(
-            &pkg_json_path,
-            &patches_plan.to_apply,
-            &mut migration_backup,
-        ) {
+        if let Err(e) = apply_patches(&pkg_json_path, &patches_plan.to_apply) {
             render_migration_failure_with_rollback(&e, &migration_backup);
             return Err(e);
         }
@@ -360,7 +331,9 @@ pub async fn run(
             ));
         }
 
-        match super::install::run_with_options(
+        super::root_lifecycle::RootProjectLifecycle::load(cwd)?.run_dev_preinstall(cwd, json)?;
+
+        match super::install::run_with_options_with_lpm_root(
             client,
             cwd,
             json,
@@ -395,11 +368,16 @@ pub async fn run(
             false, // audit_after_install: internal pipeline never runs audit
             false, // timing: migrate does not expose install's --timing flag
             &[],
+            !json,
+            json,
+            None,
+            lpm_common::LpmRoot::from_env()?,
         )
         .await
         {
             Ok(()) => {
-                // install prints its own output
+                super::root_lifecycle::RootProjectLifecycle::load(cwd)?
+                    .run_after_successful_install(cwd, json)?;
             }
             Err(e) => {
                 if !json {
@@ -411,6 +389,7 @@ pub async fn run(
                         install_ui::yellow("lpm install")
                     ));
                 }
+                return Err(e);
             }
         }
     }
@@ -685,22 +664,11 @@ async fn run_verification(
         install_ui::phase("Verifying migration");
     }
 
-    // Read package.json to find available scripts
-    let pkg_json_path = cwd.join("package.json");
-    let content =
-        lpm_common::read_text_file_capped(&pkg_json_path, lpm_common::CONFIG_FILE_SIZE_CAP_BYTES)?;
-    let scripts =
-        match Some(content).and_then(|c| serde_json::from_str::<serde_json::Value>(&c).ok()) {
-            Some(json_val) => json_val
-                .get("scripts")
-                .and_then(|s| s.as_object())
-                .map(|s| s.keys().cloned().collect::<Vec<_>>())
-                .unwrap_or_default(),
-            None => Vec::new(),
-        };
-
-    let has_build = scripts.iter().any(|s| s == "build");
-    let has_test = scripts.iter().any(|s| s == "test");
+    let pkg = lpm_workspace::read_package_json(&cwd.join("package.json")).map_err(|error| {
+        LpmError::Script(format!("failed to read verification manifest: {error}"))
+    })?;
+    let has_build = pkg.scripts.contains_key("build");
+    let has_test = pkg.scripts.contains_key("test");
 
     if !has_build && !has_test {
         if !json {
@@ -717,7 +685,18 @@ async fn run_verification(
 
     // Run build if it exists
     if has_build {
-        match super::run::run(cwd, "build", &[], None, false, &bin_hint, session.clone()).await {
+        match super::run::run_with_reserved_stdout(
+            cwd,
+            "build",
+            &[],
+            None,
+            false,
+            &bin_hint,
+            session.clone(),
+            json,
+        )
+        .await
+        {
             Ok(()) => {
                 if !json {
                     install_ui::done("build script passed");
@@ -734,7 +713,18 @@ async fn run_verification(
 
     // Run test if it exists
     if has_test {
-        match super::run::run(cwd, "test", &[], None, false, &bin_hint, session).await {
+        match super::run::run_with_reserved_stdout(
+            cwd,
+            "test",
+            &[],
+            None,
+            false,
+            &bin_hint,
+            session,
+            json,
+        )
+        .await
+        {
             Ok(()) => {
                 if !json {
                     install_ui::done("test script passed");
@@ -810,12 +800,10 @@ fn generate_ci_template(
     let template = lpm_migrate::ci::generate_template(platform);
     let output_path = lpm_migrate::ci::template_output_path(cwd, platform);
 
-    // Back up existing file if present
-    if output_path.exists() {
-        backup.backup_file(&output_path)?;
-    }
+    backup.backup_file(&output_path)?;
+    backup.write_manifest(cwd)?;
 
-    std::fs::write(&output_path, &template).map_err(|e| {
+    backup::write_output(cwd, &output_path, template.as_bytes()).map_err(|e| {
         LpmError::Script(format!(
             "failed to write CI template {}: {e}",
             output_path.display()
@@ -976,8 +964,9 @@ fn apply_overrides_to_package_json(
         .map_err(|e| {
         LpmError::Script(format!("package.json at {pkg_path:?} unreadable: {e}"))
     })?;
-    let mut value: serde_json::Value = serde_json::from_str(&raw)
-        .map_err(|e| LpmError::Script(format!("package.json malformed: {e}")))?;
+    let mut value: serde_json::Value =
+        serde_json::from_str(raw.strip_prefix('\u{feff}').unwrap_or(&raw))
+            .map_err(|e| LpmError::Script(format!("package.json malformed: {e}")))?;
 
     let lpm_section = value
         .as_object_mut()
@@ -1271,8 +1260,9 @@ fn apply_peer_rules_to_package_json(
         .map_err(|e| {
         LpmError::Script(format!("package.json at {pkg_path:?} unreadable: {e}"))
     })?;
-    let mut value: serde_json::Value = serde_json::from_str(&raw)
-        .map_err(|e| LpmError::Script(format!("package.json malformed: {e}")))?;
+    let mut value: serde_json::Value =
+        serde_json::from_str(raw.strip_prefix('\u{feff}').unwrap_or(&raw))
+            .map_err(|e| LpmError::Script(format!("package.json malformed: {e}")))?;
 
     let lpm_section = value
         .as_object_mut()
@@ -1355,7 +1345,6 @@ fn apply_peer_rules_to_package_json(
 fn apply_patches(
     pkg_path: &Path,
     to_apply: &[super::migrate_patches::PatchTranslation],
-    migration_backup: &mut MigrationBackup,
 ) -> Result<(), LpmError> {
     use std::collections::HashMap;
 
@@ -1366,29 +1355,18 @@ fn apply_patches(
             continue;
         }
 
-        if let Some(parent) = t.dest_absolute.parent()
-            && !parent.exists()
-        {
-            std::fs::create_dir_all(parent).map_err(LpmError::Io)?;
-        }
-
-        // Record BEFORE write: backup_file's "did the file exist?"
-        // probe must happen first so rollback's "newly created"
-        // tracking is correct. backup_file copies pre-existing
-        // content to .backup if present (that's already handled in
-        // the caller's pre-write loop above), or just records the
-        // path as newly-created.
-        if !t.dest_pre_exists {
-            migration_backup.backup_file(&t.dest_absolute)?;
-        }
-
-        std::fs::copy(&t.src_absolute, &t.dest_absolute).map_err(|e| {
-            LpmError::Script(format!(
-                "failed to copy {} → {}: {e}",
-                t.src_absolute.display(),
-                t.dest_absolute.display(),
-            ))
-        })?;
+        let content = lpm_common::read_text_regular_file_capped_with_metadata(
+            &t.src_absolute,
+            lpm_common::CONFIG_FILE_SIZE_CAP_BYTES,
+        )?
+        .0;
+        backup::write_output(
+            pkg_path
+                .parent()
+                .ok_or_else(|| LpmError::Script("missing project directory".into()))?,
+            &t.dest_absolute,
+            content.as_bytes(),
+        )?;
     }
 
     // 2. Merge the manifest entries into `lpm.patchedDependencies`.
@@ -1406,8 +1384,9 @@ fn apply_patches(
         .map_err(|e| {
         LpmError::Script(format!("package.json at {pkg_path:?} unreadable: {e}"))
     })?;
-    let mut value: serde_json::Value = serde_json::from_str(&raw)
-        .map_err(|e| LpmError::Script(format!("package.json malformed: {e}")))?;
+    let mut value: serde_json::Value =
+        serde_json::from_str(raw.strip_prefix('\u{feff}').unwrap_or(&raw))
+            .map_err(|e| LpmError::Script(format!("package.json malformed: {e}")))?;
 
     {
         let lpm_section = value

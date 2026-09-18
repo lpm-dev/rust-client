@@ -103,11 +103,6 @@ pub struct PatchTranslation {
     /// destination is NOT added to the backup chain — there's no write
     /// to undo).
     pub is_self_copy: bool,
-    /// True iff the destination patch file already exists pre-migration.
-    /// The migrate handler adds this path to the backup chain so a
-    /// rollback restores its original content. Always false when
-    /// `is_self_copy` is true.
-    pub dest_pre_exists: bool,
 }
 
 /// `pnpm.patchedDependencies[key] = pnpm_dest_path` collides with
@@ -358,9 +353,9 @@ pub fn build_plan(
         let safe_key = cleaned_key.replace('/', "__");
         let dest_relative = format!("patches/{safe_key}.patch");
         let dest_absolute = project_dir.join(&dest_relative);
+        lpm_migrate::backup::validate_output_path(project_dir, &dest_absolute)?;
 
         let is_self_copy = same_canonical_path(&src_absolute, &dest_absolute);
-        let dest_pre_exists = !is_self_copy && dest_absolute.exists();
 
         // ── Conflict with existing lpm.patchedDependencies ──────
         if let Some(existing) = lpm_patches.get(&cleaned_key) {
@@ -386,7 +381,6 @@ pub fn build_plan(
             dest_absolute,
             integrity,
             is_self_copy,
-            dest_pre_exists,
         });
     }
 
@@ -564,10 +558,7 @@ mod tests {
         assert_eq!(t.dest_relative, "patches/react@18.0.0.patch");
         assert_eq!(t.integrity, "sha512-abc");
         assert!(t.is_self_copy, "src already at canonical dest is self-copy");
-        assert!(
-            !t.dest_pre_exists,
-            "self-copy must not flag dest_pre_exists"
-        );
+
         assert!(!plan.has_blocking_errors());
     }
 
@@ -913,60 +904,6 @@ mod tests {
         let plan = build_plan(&pkg, dir.path(), &lf).unwrap();
         assert_eq!(plan.parse_errors.len(), 1);
         assert_eq!(plan.parse_errors[0].key, "no-at-sign-key");
-    }
-
-    #[test]
-    fn build_plan_marks_dest_pre_exists_for_non_self_copy() {
-        // Source is in vendor/, dest path patches/react@18.0.0.patch
-        // already exists from a previous manual port. Plan must mark
-        // this so the migrate handler adds the dest to the backup chain.
-        let (dir, _) = with_patch_file("source diff", "vendor/react.patch");
-        std::fs::create_dir_all(dir.path().join("patches")).unwrap();
-        std::fs::write(
-            dir.path().join("patches/react@18.0.0.patch"),
-            "pre-existing content",
-        )
-        .unwrap();
-
-        let pkg_json = r#"{
-            "name": "x",
-            "pnpm": {
-                "patchedDependencies": { "react@18.0.0": "vendor/react.patch" }
-            }
-        }"#;
-        let pkg: PackageJson = serde_json::from_str(pkg_json).unwrap();
-        let lf = lockfile_with(&[("react", "18.0.0", Some("sha512-x"))]);
-
-        let plan = build_plan(&pkg, dir.path(), &lf).unwrap();
-        assert_eq!(plan.to_apply.len(), 1);
-        let t = &plan.to_apply[0];
-        assert!(!t.is_self_copy);
-        assert!(
-            t.dest_pre_exists,
-            "dest_pre_exists must be true so migrate adds the path to backup chain"
-        );
-    }
-
-    #[test]
-    fn build_plan_self_copy_does_not_mark_dest_pre_exists() {
-        // Source path === canonical dest path, AND it exists. The
-        // is_self_copy flag wins; dest_pre_exists must be false because
-        // the migrate handler won't write there (no backup needed).
-        let (dir, _) = with_patch_file("diff", "patches/react@18.0.0.patch");
-
-        let pkg_json = r#"{
-            "name": "x",
-            "pnpm": {
-                "patchedDependencies": { "react@18.0.0": "patches/react@18.0.0.patch" }
-            }
-        }"#;
-        let pkg: PackageJson = serde_json::from_str(pkg_json).unwrap();
-        let lf = lockfile_with(&[("react", "18.0.0", Some("sha512-x"))]);
-
-        let plan = build_plan(&pkg, dir.path(), &lf).unwrap();
-        assert_eq!(plan.to_apply.len(), 1);
-        assert!(plan.to_apply[0].is_self_copy);
-        assert!(!plan.to_apply[0].dest_pre_exists);
     }
 
     #[test]

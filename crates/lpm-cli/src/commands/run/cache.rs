@@ -87,6 +87,7 @@ pub(super) struct CacheContext {
     workspace_validation: Option<lpm_task::hasher::FilesystemValidation>,
     input_validation: lpm_task::hasher::FilesystemValidation,
     dependencies: Vec<TaskDependencyIdentity>,
+    command_preference: CommandPreference,
 }
 
 pub(super) struct CacheStoreRequest<'a> {
@@ -99,6 +100,12 @@ pub(super) struct CacheStoreRequest<'a> {
     pub(super) duration_ms: u64,
     pub(super) stdout: &'a str,
     pub(super) stderr: &'a str,
+}
+
+#[derive(Clone, Copy)]
+enum CommandPreference {
+    Task,
+    PackageScript,
 }
 
 enum RemoteCacheResolution {
@@ -190,6 +197,7 @@ pub(super) fn build_cache_context(
         bin_hint,
         lpm_config,
         RemoteCacheResolution::Resolve(None),
+        CommandPreference::Task,
     )
 }
 
@@ -207,6 +215,7 @@ fn build_task_context(
     bin_hint: &lpm_runner::bin_path::ManagedRuntimeHint,
     lpm_config: Option<&lpm_runner::lpm_json::LpmJsonConfig>,
     remote_cache: RemoteCacheResolution,
+    command_preference: CommandPreference,
 ) -> Result<Option<CacheContext>, LpmError> {
     if let Some(provided_config) = lpm_config {
         let current_config =
@@ -289,15 +298,15 @@ fn build_task_context(
         (None, "{}".into())
     };
 
-    let command = if let Some(cmd) = &task_config.command {
-        cmd.clone()
-    } else {
-        package
-            .as_ref()
-            .and_then(|pkg| pkg.scripts.get(script_name))
-            .cloned()
-            .unwrap_or_default()
-    };
+    let package_command = package
+        .as_ref()
+        .and_then(|pkg| pkg.scripts.get(script_name));
+    let command = match command_preference {
+        CommandPreference::Task => task_config.command.as_ref().or(package_command),
+        CommandPreference::PackageScript => package_command.or(task_config.command.as_ref()),
+    }
+    .cloned()
+    .unwrap_or_default();
 
     let cache_inputs = effective_cache_inputs(&task_config, config_ref);
     let dependency_pairs = dependency_identity_pairs(dependency_identities);
@@ -314,6 +323,7 @@ fn build_task_context(
     )?;
 
     Ok(Some(CacheContext {
+        command_preference,
         task_config,
         cache_key: cache_snapshot.key,
         command,
@@ -356,6 +366,30 @@ pub(super) fn prepare_cache_context_with_config(
         bin_hint,
         lpm_config,
         RemoteCacheResolution::Resolve(session),
+        CommandPreference::Task,
+    )
+}
+
+pub(super) fn prepare_package_script_cache_context(
+    project_dir: &Path,
+    script_name: &str,
+    env_mode: Option<&str>,
+    extra_args: &[String],
+    bin_hint: &lpm_runner::bin_path::ManagedRuntimeHint,
+    lpm_config: Option<&lpm_runner::lpm_json::LpmJsonConfig>,
+    session: Option<Arc<lpm_auth::SessionManager>>,
+) -> Result<Option<CacheContext>, LpmError> {
+    build_task_context(
+        project_dir,
+        None,
+        &[],
+        script_name,
+        env_mode,
+        extra_args,
+        bin_hint,
+        lpm_config,
+        RemoteCacheResolution::Resolve(session),
+        CommandPreference::PackageScript,
     )
 }
 
@@ -508,6 +542,7 @@ fn store_cache_with_context(
         request.bin_hint,
         None,
         RemoteCacheResolution::Omit,
+        expected.command_preference,
     )? {
         Some(current) => current,
         None => return Ok(false),
