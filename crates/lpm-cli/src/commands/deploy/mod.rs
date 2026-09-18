@@ -92,11 +92,7 @@ impl ManifestSelectionStats {
 /// All four steps are wired — target resolution, source file
 /// copy, manifest rewrite, and install pipeline at the deploy output dir.
 ///
-/// In `--json` mode the deploy command produces a deploy-specific summary
-/// JSON object on stdout AFTER the install pipeline's own JSON output.
-/// Together they form a JSON-Lines stream (two objects, one per line).
-/// This is the same multi-object pattern uses for multi-target
-/// installs and is documented as the deploy JSON contract.
+/// JSON output is one deploy summary after the installation succeeds.
 #[allow(clippy::too_many_arguments)] // matches the install/uninstall surface for consistency
 pub async fn run(
     client: &RegistryClient,
@@ -272,8 +268,8 @@ pub async fn run(
         false, // audit_after_install: internal pipeline never runs audit
         false, // timing: deploy does not expose install's --timing flag
         &[],
-        true,  // emit the install report before the deploy-specific summary
-        false, // reserve_stdout: deploy owns no stdio protocol channel
+        !json_output, // JSON belongs to the single deploy summary
+        false,        // reserve_stdout: deploy owns no stdio protocol channel
         None,
         lpm_common::LpmRoot::from_dir(plan.output_dir.join(".lpm")),
     )
@@ -284,9 +280,7 @@ pub async fn run(
 
     let elapsed = start.elapsed();
 
-    // Emit the deploy-specific summary AFTER the install pipeline's output.
-    // In JSON mode this produces a JSON-Lines stream (install JSON, then
-    // deploy JSON). In human mode it's a final success line.
+    // The install pipeline reserves JSON stdout for this final result.
     if json_output {
         let payload = serde_json::json!({
             "success": true,

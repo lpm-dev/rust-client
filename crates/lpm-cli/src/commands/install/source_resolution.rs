@@ -1836,7 +1836,11 @@ fn project_relative_source_path(project_dir: &Path, source_realpath: &Path) -> S
         .unwrap_or_else(|_| project_dir.to_path_buf());
     let path = pathdiff::diff_paths(source_realpath, project_realpath)
         .unwrap_or_else(|| source_realpath.to_path_buf());
-    path.to_string_lossy().replace('\\', "/")
+    if path.as_os_str().is_empty() {
+        ".".to_string()
+    } else {
+        path.to_string_lossy().replace('\\', "/")
+    }
 }
 
 /// read a local source's

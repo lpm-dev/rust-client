@@ -29,8 +29,9 @@ impl PackageFileSelector {
                 "deploy: failed to read package manifest {manifest_path:?}: {e}"
             ))
         })?;
-        let doc: serde_json::Value = serde_json::from_str(&manifest)
-            .map_err(|e| LpmError::Script(format!("deploy: invalid package.json: {e}")))?;
+        let doc: serde_json::Value =
+            serde_json::from_str(lpm_common::strip_utf8_bom_str(&manifest))
+                .map_err(|e| LpmError::Script(format!("deploy: invalid package.json: {e}")))?;
         let files = doc
             .get("files")
             .and_then(|value| value.as_array())

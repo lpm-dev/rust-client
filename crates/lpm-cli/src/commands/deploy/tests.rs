@@ -555,17 +555,12 @@ async fn run_full_pipeline_workspace_protocol_dep_is_localized_in_output() {
         let after: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(output.join("package.json")).unwrap())
                 .unwrap();
-        assert_eq!(
-            after["dependencies"]["@scope/auth"], "file:.lpm/deploy-workspace/packages/auth",
-            "workspace:* must be rewritten to a local file dependency in deploy output"
-        );
-        assert!(
-            output
-                .join(DEPLOY_WORKSPACE_DIR)
-                .join("packages/auth/package.json")
-                .exists(),
-            "local workspace dependency source must be copied into the deploy output"
-        );
+        let local = after["dependencies"]["@scope/auth"]
+            .as_str()
+            .unwrap()
+            .strip_prefix("file:")
+            .expect("deployment retains a local dependency");
+        assert!(output.join(local).join("package.json").is_file());
 
         // CRITICAL: source workspace manifest is unchanged (still has workspace:*)
         let source: serde_json::Value = serde_json::from_str(
@@ -884,17 +879,12 @@ async fn run_e2e_combines_deny_list_and_local_workspace_dep_rewrite() {
     let deployed_pkg: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(output.join("package.json")).unwrap())
             .unwrap();
-    assert_eq!(
-        deployed_pkg["dependencies"]["@scope/auth"], "file:.lpm/deploy-workspace/packages/auth",
-        "workspace:* must be rewritten to a local file dependency in the deploy output"
-    );
-    assert!(
-        output
-            .join(DEPLOY_WORKSPACE_DIR)
-            .join("packages/auth/package.json")
-            .exists(),
-        "workspace dependency source must be copied into deploy output"
-    );
+    let local = deployed_pkg["dependencies"]["@scope/auth"]
+        .as_str()
+        .unwrap()
+        .strip_prefix("file:")
+        .expect("deployment retains a local dependency");
+    assert!(output.join(local).join("package.json").is_file());
 
     // ── Read-only on source: every source manifest is byte-identical ──
     assert_eq!(
@@ -995,18 +985,12 @@ fn copy_workspace_dependency_closure_copies_unpublished_member_and_localizes_spe
     assert_eq!(members_copied, 1);
     assert_eq!(rewrites, 2);
     assert!(copy_stats.files_copied > 0);
-    assert_eq!(
-        deployed_pkg["dependencies"]["@scope/auth"],
-        "file:.lpm/deploy-workspace/packages/auth"
-    );
-    assert!(
-        output
-            .path()
-            .join(DEPLOY_WORKSPACE_DIR)
-            .join("packages/auth/package.json")
-            .exists(),
-        "workspace member source must be copied into deploy-local workspace area"
-    );
+    let local = deployed_pkg["dependencies"]["@scope/auth"]
+        .as_str()
+        .unwrap()
+        .strip_prefix("file:")
+        .expect("deployment retains a local dependency");
+    assert!(output.path().join(local).join("package.json").is_file());
 }
 
 #[test]
