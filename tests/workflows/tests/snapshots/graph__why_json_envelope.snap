@@ -1,6 +1,6 @@
 ---
 source: tests/workflows/tests/graph.rs
-assertion_line: 704
+assertion_line: 808
 expression: graph_json
 ---
 {
@@ -9,6 +9,12 @@ expression: graph_json
   "found": true,
   "path_count": 1,
   "paths": [
+    [
+      "why-top-level@0.0.0",
+      "lodash@4.17.20"
+    ]
+  ],
+  "path_keys": [
     [
       "why-top-level@0.0.0",
       "lodash@4.17.20"

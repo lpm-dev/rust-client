@@ -97,6 +97,7 @@ pub struct DepGraph {
 // ── Graph Construction ─────────────────────────────────────────────
 
 impl DepGraph {
+    #[cfg(test)]
     pub fn from_lockfile_with_root_resolutions(
         packages: &[lpm_lockfile::LockedPackage],
         direct_dep_names: &HashSet<String>,
@@ -113,6 +114,7 @@ impl DepGraph {
 
     /// Build a dependency graph from lockfile packages and direct dependency names.
     /// `root_name` is the project name from package.json (e.g., "my-app@1.0.0").
+    #[cfg(test)]
     pub fn from_lockfile(
         packages: &[lpm_lockfile::LockedPackage],
         direct_dep_names: &HashSet<String>,
@@ -121,29 +123,49 @@ impl DepGraph {
         Self::from_lockfile_inner(packages, direct_dep_names, None, root_name)
     }
 
+    #[cfg(test)]
     fn from_lockfile_inner(
         packages: &[lpm_lockfile::LockedPackage],
         direct_dep_names: &HashSet<String>,
         root_resolutions: Option<&lpm_lockfile::RootResolutions>,
         root_name: &str,
     ) -> Self {
-        let mut nodes = HashMap::new();
+        let direct_indices = packages
+            .iter()
+            .enumerate()
+            .filter_map(|(index, package)| {
+                let direct = root_resolutions.map_or_else(
+                    || direct_dep_names.contains(&package.name),
+                    |resolutions| {
+                        resolutions.iter().any(|(local, root)| {
+                            direct_dep_names.contains(local)
+                                && root.instance_id.is_some()
+                                && root.instance_id == package.instance_id
+                        })
+                    },
+                );
+                direct.then_some(index)
+            })
+            .collect();
+        let indexes = crate::commands::manifest_metadata::graph::PackageIndexes::new(packages);
+        let adjacency =
+            crate::commands::manifest_metadata::graph::package_adjacency(packages, &indexes);
+        Self::from_indexed_packages(packages, &direct_indices, &adjacency, root_name)
+    }
 
-        let exact_root_ids = root_resolutions.map(|resolutions| {
-            resolutions
-                .iter()
-                .filter(|(local_name, _)| direct_dep_names.contains(*local_name))
-                .filter_map(|(_, resolution)| resolution.instance_id)
-                .collect::<HashSet<_>>()
-        });
-
+    pub(crate) fn from_indexed_packages(
+        packages: &[lpm_lockfile::LockedPackage],
+        direct_indices: &HashSet<usize>,
+        adjacency: &[Vec<usize>],
+        root_name: &str,
+    ) -> Self {
+        let mut nodes = HashMap::with_capacity(packages.len() + 1);
         let mut coordinate_counts = HashMap::with_capacity(packages.len());
         for package in packages {
             *coordinate_counts
                 .entry((package.name.as_str(), package.version.as_str()))
                 .or_insert(0_usize) += 1;
         }
-        let mut instance_indices = HashMap::with_capacity(packages.len());
         let mut package_keys = Vec::with_capacity(packages.len());
         for (index, package) in packages.iter().enumerate() {
             let base = format!("{}@{}", package.name, package.version);
@@ -155,9 +177,6 @@ impl DepGraph {
             } else {
                 base
             };
-            if let Some(instance_id) = package.instance_id {
-                instance_indices.insert(instance_id, index);
-            }
             package_keys.push(key);
         }
 
@@ -177,19 +196,10 @@ impl DepGraph {
                     }
                 });
 
-            let mut dependencies = if pkg.instance_id.is_some() {
-                pkg.dependency_targets
-                    .values()
-                    .chain(pkg.peer_targets.values())
-                    .filter_map(|instance_id| {
-                        instance_indices
-                            .get(instance_id)
-                            .map(|target_index| package_keys[*target_index].clone())
-                    })
-                    .collect()
-            } else {
-                pkg.dependencies.clone()
-            };
+            let mut dependencies: Vec<_> = adjacency[index]
+                .iter()
+                .map(|&target| package_keys[target].clone())
+                .collect();
             dependencies.sort_unstable();
             dependencies.dedup();
 
@@ -200,13 +210,7 @@ impl DepGraph {
                     version: pkg.version.clone(),
                     registry,
                     depth: 0,
-                    is_direct: exact_root_ids.as_ref().map_or_else(
-                        || direct_dep_names.contains(&pkg.name),
-                        |instance_ids| {
-                            pkg.instance_id
-                                .is_some_and(|instance_id| instance_ids.contains(&instance_id))
-                        },
-                    ),
+                    is_direct: direct_indices.contains(&index),
                     is_duplicate: false,
                     is_root: false,
                     is_project_root: false,
@@ -256,31 +260,7 @@ impl DepGraph {
 
         let roots = vec![root_key];
 
-        // BFS to compute depths
-        let mut queue: VecDeque<(String, usize)> = VecDeque::new();
-        let mut visited: HashSet<String> = HashSet::new();
-
-        for root in &roots {
-            queue.push_back((root.clone(), 0));
-        }
-
-        while let Some((key, depth)) = queue.pop_front() {
-            if visited.contains(&key) {
-                continue;
-            }
-            visited.insert(key.clone());
-
-            if let Some(node) = nodes.get_mut(&key) {
-                node.depth = depth;
-            }
-            if let Some(node) = nodes.get(&key) {
-                for dep_key in &node.dependencies {
-                    if !visited.contains(dep_key) {
-                        queue.push_back((dep_key.clone(), depth + 1));
-                    }
-                }
-            }
-        }
+        recompute_depths(&mut nodes, &roots);
 
         let duplicates = recompute_duplicate_state(&mut nodes);
 
@@ -757,10 +737,37 @@ pub fn prune_to_depth(graph: &mut DepGraph, max_depth: usize) {
     }
 }
 
+fn recompute_depths(nodes: &mut HashMap<String, DepNode>, roots: &[String]) {
+    for node in nodes.values_mut() {
+        node.depth = usize::MAX;
+    }
+    let mut queue = VecDeque::from_iter(roots.iter().map(|key| (key.clone(), 0)));
+    while let Some((key, depth)) = queue.pop_front() {
+        let Some(node) = nodes.get_mut(&key) else {
+            continue;
+        };
+        if node.depth != usize::MAX {
+            continue;
+        }
+        node.depth = depth;
+        queue.extend(
+            node.dependencies
+                .iter()
+                .map(|target| (target.clone(), depth + 1)),
+        );
+    }
+    for node in nodes.values_mut() {
+        if node.depth == usize::MAX {
+            node.depth = 0;
+        }
+    }
+}
+
 /// Recompute graph stats after a mutation (filter, depth-prune,
 /// subtree restriction, unreachable prune). Counts exclude synthetic
 /// root nodes so `total_packages` is the user-meaningful count.
 pub fn recompute_stats(graph: &mut DepGraph) {
+    recompute_depths(&mut graph.nodes, &graph.roots);
     let lpm_count = graph
         .nodes
         .values()
@@ -1295,7 +1302,7 @@ impl Serialize for WhyJson<'_, '_> {
     where
         S: serde::Serializer,
     {
-        let mut output = serializer.serialize_struct("WhyJson", 7)?;
+        let mut output = serializer.serialize_struct("WhyJson", 8)?;
         output.serialize_field("success", &true)?;
         output.serialize_field("target", self.target_name)?;
         output.serialize_field("found", &(self.summary.path_count > 0))?;
@@ -1306,6 +1313,16 @@ impl Serialize for WhyJson<'_, '_> {
                 graph: self.graph,
                 target_name: self.target_name,
                 path_count: self.summary.path_count,
+                exact_keys: false,
+            },
+        )?;
+        output.serialize_field(
+            "path_keys",
+            &WhyJsonPaths {
+                graph: self.graph,
+                target_name: self.target_name,
+                path_count: self.summary.path_count,
+                exact_keys: true,
             },
         )?;
         output.serialize_field(
@@ -1392,6 +1409,7 @@ struct WhyJsonPaths<'graph, 'value> {
     graph: &'graph DepGraph,
     target_name: &'value str,
     path_count: usize,
+    exact_keys: bool,
 }
 
 impl Serialize for WhyJsonPaths<'_, '_> {
@@ -1402,10 +1420,15 @@ impl Serialize for WhyJsonPaths<'_, '_> {
         let mut paths = serializer.serialize_seq(Some(self.path_count))?;
         let mut serialization_error = None;
         let serialized_path_count = self.graph.visit_paths(self.target_name, |path| {
-            match paths.serialize_element(&WhyJsonPath {
-                graph: self.graph,
-                path,
-            }) {
+            let result = if self.exact_keys {
+                paths.serialize_element(path)
+            } else {
+                paths.serialize_element(&WhyJsonPath {
+                    graph: self.graph,
+                    path,
+                })
+            };
+            match result {
                 Ok(()) => true,
                 Err(error) => {
                     serialization_error = Some(error);
@@ -2750,6 +2773,10 @@ mod tests {
         let path_count = graph.visit_paths("target", |_| true);
 
         assert_eq!(path_count, 2);
+        let json = render_why_json(&graph, "target", None, None).unwrap();
+        let report: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(report["path_count"], 2);
+        assert_eq!(report["path_keys"], report["paths"]);
     }
 
     #[test]

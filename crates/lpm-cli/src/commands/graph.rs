@@ -1,7 +1,7 @@
 use crate::graph_render::{self, DepGraph};
 use crate::install_ui;
 use crate::overrides_state;
-use lpm_common::LpmError;
+use lpm_common::{LpmError, sanitize_terminal_inline};
 use std::collections::{HashSet, VecDeque};
 use std::ffi::OsStr;
 use std::io::{BufWriter, Write};
@@ -103,7 +103,7 @@ pub async fn run(
         "project@0.0.0".to_string()
     };
 
-    let mut graph = build_graph(&lockfile, &direct_deps, &root_name, pkg_json.is_some());
+    let mut graph = build_graph(&lockfile, &direct_deps, &root_name, pkg_json.is_some())?;
 
     // When filtering by --prod or --dev, prune transitive deps that are no longer reachable
     if prod_only || dev_only {
@@ -363,20 +363,79 @@ fn build_graph(
     direct_deps: &HashSet<String>,
     root_name: &str,
     has_package_manifest: bool,
-) -> DepGraph {
-    if has_package_manifest
-        && lockfile.metadata.lockfile_version
-            >= lpm_lockfile::LOCKFILE_VERSION_WITH_PACKAGE_INSTANCES
-    {
-        DepGraph::from_lockfile_with_root_resolutions(
-            &lockfile.packages,
-            direct_deps,
-            &lockfile.root_resolutions,
-            root_name,
-        )
+) -> Result<DepGraph, LpmError> {
+    use super::manifest_metadata::graph::{
+        PackageIndexes, package_adjacency, unique_package_targets_for_kind,
+    };
+    let packages = &lockfile.packages;
+    let indexes = PackageIndexes::new(packages);
+    let exact =
+        lockfile.metadata.lockfile_version >= lpm_lockfile::LOCKFILE_VERSION_WITH_PACKAGE_INSTANCES;
+    let adjacency = if exact {
+        package_adjacency(packages, &indexes)
     } else {
-        DepGraph::from_lockfile(&lockfile.packages, direct_deps, root_name)
-    }
+        let mut adjacency = Vec::with_capacity(packages.len());
+        for package in packages {
+            let mut children = Vec::new();
+            for peers in [false, true] {
+                let targets = unique_package_targets_for_kind(package, &indexes, peers).map_err(|local| {
+                    LpmError::Script(format!(
+                        "legacy lockfile has an ambiguous target for {}@{} dependency {}. Run `lpm install` online to record exact package instances",
+                        sanitize_terminal_inline(&package.name), sanitize_terminal_inline(&package.version), sanitize_terminal_inline(local)
+                    ))
+                })?;
+                children.extend(targets);
+            }
+            children.sort_unstable();
+            children.dedup();
+            adjacency.push(children);
+        }
+        adjacency
+    };
+    let direct_indices = if !has_package_manifest {
+        (0..packages.len()).collect()
+    } else {
+        let roots = crate::npm_public_source::LockfileRootIndex::new(Some(lockfile));
+        let mut selected_instances = HashSet::new();
+        let mut selected_packages = HashSet::new();
+        let mut legacy_names = HashSet::new();
+        for local in direct_deps {
+            if let Some(resolution) = lockfile.root_resolutions.get(local) {
+                let package = roots.root_package(local, &resolution.package).ok_or_else(|| LpmError::Script(format!(
+                    "lockfile root {} does not identify one package. Run `lpm install` online to record exact package instances",
+                    sanitize_terminal_inline(local)
+                )))?;
+                if let Some(id) = package.instance_id {
+                    selected_instances.insert(id);
+                } else {
+                    selected_packages.insert(package.package_key());
+                }
+            } else if lockfile.metadata.lockfile_version
+                < lpm_lockfile::LOCKFILE_VERSION_WITH_ROOT_RESOLUTIONS
+            {
+                legacy_names.insert(lockfile.root_aliases.get(local).unwrap_or(local).as_str());
+            }
+        }
+        packages
+            .iter()
+            .enumerate()
+            .filter_map(|(index, package)| {
+                (package
+                    .instance_id
+                    .is_some_and(|id| selected_instances.contains(&id))
+                    || (!exact
+                        && (selected_packages.contains(&package.package_key())
+                            || legacy_names.contains(package.name.as_str()))))
+                .then_some(index)
+            })
+            .collect()
+    };
+    Ok(DepGraph::from_indexed_packages(
+        packages,
+        &direct_indices,
+        &adjacency,
+        root_name,
+    ))
 }
 
 /// Find a package key in the graph by name (with or without version).
@@ -438,27 +497,6 @@ fn restrict_to_subtree(graph: &mut DepGraph, subtree_root: &str) {
         node.depth = 0;
     }
     graph.roots = vec![subtree_root.to_string()];
-
-    // Recompute depths via BFS from new root
-    let mut visited = HashSet::new();
-    let mut bfs_queue = VecDeque::new();
-    bfs_queue.push_back((subtree_root.to_string(), 0_usize));
-
-    while let Some((key, depth)) = bfs_queue.pop_front() {
-        if !visited.insert(key.clone()) {
-            continue;
-        }
-        if let Some(node) = graph.nodes.get_mut(&key) {
-            node.depth = depth;
-        }
-        if let Some(node) = graph.nodes.get(&key) {
-            for dep_key in &node.dependencies {
-                if !visited.contains(dep_key) {
-                    bfs_queue.push_back((dep_key.clone(), depth + 1));
-                }
-            }
-        }
-    }
 
     // Recompute stats
     graph_render::recompute_stats(graph);
@@ -784,7 +822,7 @@ mod tests {
         );
         let all_package_names = HashSet::from(["leaf".to_string(), "parent".to_string()]);
 
-        let graph = build_graph(&lockfile, &all_package_names, "project@0.0.0", false);
+        let graph = build_graph(&lockfile, &all_package_names, "project@0.0.0", false).unwrap();
 
         assert_eq!(
             graph.nodes["project@0.0.0"].dependencies,

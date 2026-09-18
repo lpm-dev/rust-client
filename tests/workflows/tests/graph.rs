@@ -871,6 +871,7 @@ fn why_commands_return_every_dense_graph_path_in_json_output() {
     let why_json: serde_json::Value =
         serde_json::from_slice(&why_output.stdout).expect("why stdout must be JSON");
     assert_eq!(graph_json, why_json);
+    assert_eq!(graph_json["path_keys"], graph_json["paths"]);
     assert_eq!(
         (
             graph_json["path_count"].as_u64(),

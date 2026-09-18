@@ -1,6 +1,8 @@
 use super::*;
 use serde_json::Value;
 
+mod feature_graph;
+
 fn json_output(project: &TempProject, args: &[&str], directory: Option<&std::path::Path>) -> Value {
     let mut command = lpm(project);
     if let Some(directory) = directory {
