@@ -18,6 +18,7 @@
 
 use crate::commands::audit::inventory::PackageInventory;
 use crate::install_ui;
+use futures::{StreamExt, TryStreamExt};
 use lpm_common::LpmError;
 use lpm_common::color::Painted;
 use lpm_registry::RegistryClient;
@@ -54,6 +55,7 @@ impl fmt::Display for QueryFormat {
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 struct QueryDataRequirements {
+    analysis: bool,
     scripts: bool,
     built: bool,
     vulnerabilities: bool,
@@ -71,6 +73,21 @@ impl QueryDataRequirements {
         let human_list = !count_mode && !json_output && format == QueryFormat::List;
         let verbose_json = !count_mode && json_output && verbose && format == QueryFormat::List;
         Self {
+            analysis: count_mode
+                || human_list
+                || verbose_json
+                || selector.is_some_and(|selector| {
+                    selector_uses_pseudo_class(selector, |class| {
+                        class.behavioral_policy().is_some()
+                            || matches!(
+                                class,
+                                PseudoClass::Critical
+                                    | PseudoClass::High
+                                    | PseudoClass::Medium
+                                    | PseudoClass::Info
+                            )
+                    })
+                }),
             scripts: count_mode
                 || human_list
                 || verbose_json
@@ -171,6 +188,12 @@ pub async fn run(
     let is_lpm_project =
         pre_discovery.manager == crate::commands::audit::discovery::ManagerKind::Lpm;
 
+    if format == QueryFormat::Mermaid && !is_lpm_project {
+        return Err(LpmError::Registry(
+            "Mermaid output is only supported for LPM-managed projects.".into(),
+        ));
+    }
+
     // ── Load inventory + lifecycle/build-state under the right lock ───
     //
     // For LPM projects, inventory and disk-state loading read package bytes
@@ -204,7 +227,7 @@ pub async fn run(
                     requirements.built,
                     &mut has_scripts,
                     &mut is_built,
-                );
+                )?;
             }
             Ok(inv)
         })?
@@ -220,24 +243,42 @@ pub async fn run(
                 requirements.built,
                 &mut has_scripts,
                 &mut is_built,
-            );
+            )?;
         }
         inv
     };
 
     if inv.discovery.packages.is_empty() {
-        if json_output {
+        if count_mode {
+            run_count_mode(&[], json_output);
+        } else if json_output {
             println!("[]");
+        } else if format == QueryFormat::Mermaid {
+            output_mermaid(&[], &[], selector_str.unwrap_or_default());
         } else {
             install_ui::warn("No packages found");
         }
         return Ok(());
     }
 
-    // Read root package.json for direct dependencies
-    let root_dep_names = read_root_dependencies(project_dir);
-
+    if requirements.analysis {
+        require_complete_analysis(&inv)?;
+    }
     let project_root = &inv.discovery.project_root;
+    let needs_dependency_graph = selector
+        .as_ref()
+        .is_some_and(Selector::needs_dependency_graph)
+        || format == QueryFormat::Mermaid;
+    let uses_root_anchor = selector.as_ref().is_some_and(|selector| {
+        selector_uses_pseudo_class(selector, |class| {
+            matches!(class, PseudoClass::Root | PseudoClass::WorkspaceRoot)
+        })
+    });
+    let root_dep_names = if needs_dependency_graph && uses_root_anchor && !is_lpm_project {
+        read_root_dependencies(project_root)?
+    } else {
+        HashSet::new()
+    };
 
     let external_state = if requirements.vulnerabilities || requirements.deprecations {
         let package_pairs = inv
@@ -246,28 +287,24 @@ pub async fn run(
             .iter()
             .map(|package| (package.name.clone(), package.version.clone()))
             .collect::<Vec<_>>();
-        load_external_package_state(client, &package_pairs, requirements).await?
+        load_external_package_state(client, project_root, &package_pairs, requirements).await?
     } else {
         ExternalPackageState::default()
     };
     let vulnerable_versions = external_state.vulnerable_versions;
     let deprecated_versions = external_state.deprecated_versions;
 
-    // ── Workspace detection ───────────────────────────────────────────
-    //
-    // If the lockfile root (project_root) differs from the invocation dir
-    // (project_dir), we're in a monorepo sub-workspace. In that case:
-    // - :root deps = invocation dir's package.json dependencies
-    // - :workspace-root deps = lockfile root's package.json dependencies
     let workspace_project_root = inv
         .discovery
         .workspace_root
         .as_ref()
-        .map(|workspace| workspace.project_root.as_path())
-        .or_else(|| (project_root != project_dir).then_some(project_root.as_path()));
+        .map(|workspace| workspace.project_root.as_path());
     let is_workspace = workspace_project_root.is_some();
-    let workspace_root_dep_names = if let Some(workspace_root) = workspace_project_root {
-        read_root_dependencies(workspace_root)
+    let workspace_root_dep_names = if needs_dependency_graph
+        && selector.as_ref().is_some_and(Selector::uses_workspace_root)
+        && let Some(workspace_root) = workspace_project_root
+    {
+        read_root_dependencies(workspace_root)?
     } else {
         HashSet::new()
     };
@@ -311,8 +348,6 @@ pub async fn run(
     let selector = selector
         .as_ref()
         .expect("selector mode parses the selector before discovery");
-    let needs_dependency_graph =
-        selector.needs_dependency_graph() || format == QueryFormat::Mermaid;
 
     // ── Build PackageContexts ───────────────────────────────────────────
 
@@ -365,10 +400,7 @@ pub async fn run(
                 .get(&pkg.name)
                 .is_some_and(|versions| versions.contains(&pkg.version)),
             is_root: false,
-            is_workspace_root_dep: pkg.instance_id.map_or_else(
-                || is_workspace && workspace_root_dep_names.contains(&pkg.name),
-                |instance_id| workspace_root_instances.contains(&instance_id),
-            ),
+            is_workspace_root_dep: false,
         })
         .collect();
 
@@ -442,6 +474,10 @@ pub async fn run(
         dep_graph.set_workspace_root_deps(ws_deps);
     }
 
+    if needs_dependency_graph && !is_workspace {
+        dep_graph.set_workspace_root_deps(dep_graph.root_deps.clone());
+    }
+
     // Build all_packages map for combinator matching
     let all_packages: HashMap<&str, PackageContext<'_>> = if needs_dependency_graph {
         graph_keys
@@ -486,7 +522,7 @@ pub async fn run(
         if let Some(lf) = lockfile {
             let matched_indices = matched.iter().map(|(index, _)| *index).collect::<Vec<_>>();
             output_mermaid(&matched_indices, &lf.packages, selector_str);
-            return Ok(());
+            return query_assertion_result(assert_none, matched.len(), selector_str, false);
         }
         // For npm projects, Mermaid output is not yet supported
         // (would need to build edges from DiscoveredPackage deps)
@@ -584,15 +620,47 @@ pub async fn run(
         ));
     }
 
-    // --assert-none: exit 1 if ANY packages matched (CI gate)
-    if assert_none && !matched.is_empty() {
-        return Err(LpmError::Registry(format!(
-            "assertion failed: {} package{} matched selector '{selector_str}'",
-            matched.len(),
-            if matched.len() == 1 { "" } else { "s" }
-        )));
-    }
+    query_assertion_result(assert_none, matched.len(), selector_str, json_output)
+}
 
+fn query_assertion_result(
+    assert_none: bool,
+    count: usize,
+    selector: &str,
+    json_output: bool,
+) -> Result<(), LpmError> {
+    if !assert_none || count == 0 {
+        return Ok(());
+    }
+    if json_output {
+        return Err(LpmError::ExitCode(1));
+    }
+    Err(LpmError::Registry(format!(
+        "assertion failed: {count} package{} matched selector '{selector}'",
+        if count == 1 { "" } else { "s" }
+    )))
+}
+
+fn require_complete_analysis(inventory: &PackageInventory) -> Result<(), LpmError> {
+    for (package, analysis) in inventory.discovery.packages.iter().zip(&inventory.analyses) {
+        let reason = match analysis {
+            None => Some("package source is missing or unreadable"),
+            Some(analysis) if analysis.meta.limit_reached => Some("source scan limit was reached"),
+            Some(analysis) if analysis.meta.input_incomplete => {
+                Some("source input could not be read")
+            }
+            Some(analysis) if analysis.meta.unparsed_files > 0 => {
+                Some("source syntax could not be analyzed")
+            }
+            Some(_) => None,
+        };
+        if let Some(reason) = reason {
+            return Err(LpmError::Script(format!(
+                "query analysis is incomplete for {}@{}: {reason}. Restore package sources or review unsupported inputs before rerunning the query.",
+                package.name, package.version
+            )));
+        }
+    }
     Ok(())
 }
 
@@ -770,6 +838,7 @@ struct ExternalPackageState {
 
 async fn load_external_package_state(
     client: &RegistryClient,
+    project_dir: &Path,
     packages: &[(String, String)],
     requirements: QueryDataRequirements,
 ) -> Result<ExternalPackageState, LpmError> {
@@ -796,7 +865,8 @@ async fn load_external_package_state(
         }
     }
 
-    let registry_future = load_registry_package_state(client, &registry_pairs, requirements);
+    let registry_future =
+        load_registry_package_state(client, project_dir, &registry_pairs, requirements);
     let osv_future = async {
         if osv_pairs.is_empty() {
             Ok(HashMap::new())
@@ -817,6 +887,7 @@ async fn load_external_package_state(
 
 async fn load_registry_package_state(
     client: &RegistryClient,
+    project_dir: &Path,
     packages: &[(String, String)],
     requirements: QueryDataRequirements,
 ) -> Result<ExternalPackageState, LpmError> {
@@ -831,20 +902,59 @@ async fn load_registry_package_state(
             names.push(name.clone());
         }
     }
-    let metadata = client
-        .batch_metadata_deep_with_release_age_packages_and_package_specs(
-            &names,
-            &[],
-            false,
-            packages,
-            None,
-        )
-        .await
-        .map_err(|error| {
-            LpmError::Network(format!(
-                "registry metadata required by query could not be loaded: {error}"
-            ))
-        })?;
+    let lpm_names = names
+        .iter()
+        .filter(|name| name.starts_with("@lpm.dev/"))
+        .cloned()
+        .collect::<Vec<_>>();
+    let lpm_pairs = packages
+        .iter()
+        .filter(|(name, _)| name.starts_with("@lpm.dev/"))
+        .cloned()
+        .collect::<Vec<_>>();
+    let mut metadata = if lpm_names.is_empty() {
+        HashMap::new()
+    } else {
+        client
+            .batch_metadata_deep_with_release_age_packages_and_package_specs(
+                &lpm_names,
+                &[],
+                false,
+                &lpm_pairs,
+                None,
+            )
+            .await
+            .map_err(|error| {
+                LpmError::Network(format!(
+                    "registry metadata required by query could not be loaded: {error}"
+                ))
+            })?
+    };
+    let npm_names = names
+        .into_iter()
+        .filter(|name| !name.starts_with("@lpm.dev/"))
+        .collect::<Vec<_>>();
+    if !npm_names.is_empty() {
+        let context = crate::commands::registry_reads::prepare_routed_read_context(
+            client,
+            project_dir,
+            &npm_names,
+            true,
+        )?;
+        let routed = futures::stream::iter(npm_names.iter().map(|name| {
+            let context = &context;
+            async move {
+                let (_, metadata) =
+                    crate::commands::registry_reads::fetch_routed_package_metadata(context, name)
+                        .await?;
+                Ok::<_, LpmError>((name.clone(), metadata))
+            }
+        }))
+        .buffer_unordered(16)
+        .try_collect::<HashMap<_, _>>()
+        .await?;
+        metadata.extend(routed);
+    }
 
     let mut state = ExternalPackageState::default();
     for (name, version) in packages {
@@ -893,34 +1003,26 @@ fn registry_deprecation_is_active(value: Option<&serde_json::Value>) -> bool {
 }
 
 /// Read direct dependencies from the root package.json.
-fn read_root_dependencies(project_dir: &Path) -> HashSet<String> {
-    let pkg_json_path = project_dir.join("package.json");
-    let content = match lpm_common::read_text_file_capped(
-        &pkg_json_path,
+fn read_root_dependencies(project_dir: &Path) -> Result<HashSet<String>, LpmError> {
+    let path = project_dir.join("package.json");
+    let (content, _) = lpm_common::read_text_regular_file_capped_with_metadata(
+        &path,
         lpm_common::CONFIG_FILE_SIZE_CAP_BYTES,
-    ) {
-        Ok(c) => c,
-        Err(_) => return HashSet::new(),
-    };
-    let parsed: serde_json::Value = match serde_json::from_str(&content) {
-        Ok(v) => v,
-        Err(_) => return HashSet::new(),
-    };
-
-    let mut deps = HashSet::new();
-
-    if let Some(d) = parsed.get("dependencies").and_then(|d| d.as_object()) {
-        for key in d.keys() {
-            deps.insert(key.clone());
+    )?;
+    let parsed: serde_json::Map<String, serde_json::Value> =
+        serde_json::from_str(lpm_common::strip_utf8_bom_str(&content)).map_err(|error| {
+            LpmError::Script(format!(
+                "cannot read query root dependencies from {}: {error}",
+                path.display()
+            ))
+        })?;
+    let mut dependencies = HashSet::new();
+    for section in ["dependencies", "devDependencies", "optionalDependencies"] {
+        if let Some(entries) = parsed.get(section).and_then(serde_json::Value::as_object) {
+            dependencies.extend(entries.keys().cloned());
         }
     }
-    if let Some(d) = parsed.get("devDependencies").and_then(|d| d.as_object()) {
-        for key in d.keys() {
-            deps.insert(key.clone());
-        }
-    }
-
-    deps
+    Ok(dependencies)
 }
 
 fn populate_package_disk_state(
@@ -931,7 +1033,7 @@ fn populate_package_disk_state(
     load_built: bool,
     has_scripts: &mut Vec<bool>,
     is_built: &mut Vec<bool>,
-) {
+) -> Result<(), LpmError> {
     has_scripts.clear();
     is_built.clear();
     if load_scripts {
@@ -944,64 +1046,69 @@ fn populate_package_disk_state(
         crate::commands::audit::inventory::open_project_root(&inventory.discovery.project_root)
             .ok();
     for (index, package) in inventory.discovery.packages.iter().enumerate() {
-        let Ok(directory) = crate::commands::audit::inventory::open_package_source_directory(
+        let directory = crate::commands::audit::inventory::open_package_source_directory(
             project_root.as_ref(),
             package,
             lpm_root,
             baseline_index,
-        ) else {
-            continue;
-        };
+        )
+        .map_err(|error| {
+            LpmError::Script(format!(
+                "query disk state is incomplete for {}@{}: {error}",
+                package.name, package.version
+            ))
+        })?;
         if load_scripts {
-            has_scripts[index] = check_has_lifecycle_scripts(&directory);
+            has_scripts[index] = check_has_lifecycle_scripts(&directory).map_err(|error| {
+                LpmError::Script(format!(
+                    "cannot read scripts for {}@{}: {error}",
+                    package.name, package.version
+                ))
+            })?;
         }
         if load_built {
-            is_built[index] = has_regular_build_marker(&directory);
+            is_built[index] = has_regular_build_marker(&directory)?;
         }
     }
+    Ok(())
 }
 
-fn check_has_lifecycle_scripts(package_dir: &cap_std::fs::Dir) -> bool {
+fn check_has_lifecycle_scripts(package_dir: &cap_std::fs::Dir) -> Result<bool, LpmError> {
     use cap_fs_ext::{FollowSymlinks, OpenOptionsFollowExt as _, OpenOptionsSyncExt as _};
-
     let mut options = cap_std::fs::OpenOptions::new();
     options.read(true).follow(FollowSymlinks::No).nonblock(true);
-    let file = match package_dir.open_with("package.json", &options) {
-        Ok(file) => file,
-        Err(_) => return false,
-    };
-    let metadata = match file.metadata() {
-        Ok(metadata) if metadata.is_file() && !metadata.is_symlink() => metadata,
-        _ => return false,
-    };
-    let content = match lpm_common::read_text_file_capped_from_open_file_with_known_size(
+    let file = package_dir.open_with("package.json", &options)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
+        return Err(LpmError::Script(
+            "package.json is not a regular file".into(),
+        ));
+    }
+    let content = lpm_common::read_text_file_capped_from_open_file_with_known_size(
         file.into_std(),
         Path::new("package.json"),
         lpm_common::CONFIG_FILE_SIZE_CAP_BYTES,
         metadata.len(),
-    ) {
-        Ok(content) => content,
-        Err(_) => return false,
-    };
-    let parsed: serde_json::Value = match serde_json::from_str(&content) {
-        Ok(v) => v,
-        Err(_) => return false,
-    };
-
-    let scripts = match parsed.get("scripts").and_then(|s| s.as_object()) {
-        Some(s) => s,
-        None => return false,
-    };
-
-    LIFECYCLE_SCRIPTS
-        .iter()
-        .any(|phase| scripts.contains_key(*phase))
+    )?;
+    let parsed: serde_json::Map<String, serde_json::Value> =
+        serde_json::from_str(lpm_common::strip_utf8_bom_str(&content))
+            .map_err(|error| LpmError::Script(format!("invalid package.json: {error}")))?;
+    Ok(parsed
+        .get("scripts")
+        .and_then(serde_json::Value::as_object)
+        .is_some_and(|scripts| {
+            LIFECYCLE_SCRIPTS
+                .iter()
+                .any(|phase| scripts.contains_key(*phase))
+        }))
 }
 
-fn has_regular_build_marker(package_dir: &cap_std::fs::Dir) -> bool {
-    package_dir
-        .symlink_metadata(BUILD_MARKER)
-        .is_ok_and(|metadata| metadata.is_file() && !metadata.is_symlink())
+fn has_regular_build_marker(package_dir: &cap_std::fs::Dir) -> Result<bool, LpmError> {
+    match package_dir.symlink_metadata(BUILD_MARKER) {
+        Ok(metadata) => Ok(metadata.is_file() && !metadata.is_symlink()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error.into()),
+    }
 }
 
 /// Output matching packages as a Mermaid dependency subgraph.
@@ -1212,7 +1319,7 @@ mod tests {
         )
         .unwrap();
 
-        let deps = read_root_dependencies(dir.path());
+        let deps = read_root_dependencies(dir.path()).unwrap();
         assert!(deps.contains("react"));
         assert!(deps.contains("lodash"));
         assert!(deps.contains("jest"));
@@ -1220,10 +1327,9 @@ mod tests {
     }
 
     #[test]
-    fn read_root_deps_missing_package_json() {
+    fn read_root_deps_rejects_missing_package_json() {
         let dir = tempfile::tempdir().unwrap();
-        let deps = read_root_dependencies(dir.path());
-        assert!(deps.is_empty());
+        assert!(read_root_dependencies(dir.path()).is_err());
     }
 
     #[test]
@@ -1237,7 +1343,7 @@ mod tests {
 
         let package_dir =
             cap_std::fs::Dir::open_ambient_dir(dir.path(), cap_std::ambient_authority()).unwrap();
-        assert!(check_has_lifecycle_scripts(&package_dir));
+        assert!(check_has_lifecycle_scripts(&package_dir).unwrap());
     }
 
     #[test]
@@ -1251,14 +1357,14 @@ mod tests {
 
         let package_dir =
             cap_std::fs::Dir::open_ambient_dir(dir.path(), cap_std::ambient_authority()).unwrap();
-        assert!(!check_has_lifecycle_scripts(&package_dir));
+        assert!(!check_has_lifecycle_scripts(&package_dir).unwrap());
     }
 
     #[test]
-    fn check_lifecycle_scripts_missing_file() {
+    fn check_lifecycle_scripts_rejects_missing_file() {
         let dir = tempfile::tempdir().unwrap();
         let package_dir =
             cap_std::fs::Dir::open_ambient_dir(dir.path(), cap_std::ambient_authority()).unwrap();
-        assert!(!check_has_lifecycle_scripts(&package_dir));
+        assert!(check_has_lifecycle_scripts(&package_dir).is_err());
     }
 }

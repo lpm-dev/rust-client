@@ -11,6 +11,7 @@
 //! `analyze_package` (the *uncached* entry point) directly, so a
 //! sidecar file is never consulted in this code path.
 
+mod query_contract;
 mod support;
 
 use support::mock_registry::MockRegistry;
@@ -1281,18 +1282,22 @@ async fn query_deprecated_matches_the_installed_deprecated_version() {
     );
     seed_pkg_with_source(&project, "legacy-pkg", "1.0.0", SRC_CLEAN);
     let mock = MockRegistry::start().await;
-    mock.with_batch_metadata(vec![serde_json::json!({
-        "name": "legacy-pkg",
-        "dist-tags": {"latest": "1.0.0"},
-        "versions": {
-            "1.0.0": {
-                "name": "legacy-pkg",
-                "version": "1.0.0",
-                "deprecated": "use replacement-pkg"
+    project.write_file(".npmrc", &format!("registry={}\n", mock.url()));
+    Mock::given(method("GET"))
+        .and(path("/legacy-pkg"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "name": "legacy-pkg",
+            "dist-tags": {"latest": "1.0.0"},
+            "versions": {
+                "1.0.0": {
+                    "name": "legacy-pkg",
+                    "version": "1.0.0",
+                    "deprecated": "use replacement-pkg"
+                }
             }
-        }
-    })])
-    .await;
+        })))
+        .mount(mock.server())
+        .await;
     mock.with_osv_querybatch(vec![vec![]]).await;
 
     let output = lpm(&project)
@@ -1309,6 +1314,11 @@ async fn query_deprecated_matches_the_installed_deprecated_version() {
         .expect("failed to run deprecated-package query");
 
     assert!(
+        String::from_utf8_lossy(&output.stderr).contains("1 package matched"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
         !output.status.success(),
         "the installed deprecated version must match :deprecated"
     );
@@ -1321,18 +1331,22 @@ async fn query_deprecated_ignores_an_empty_registry_deprecation_message() {
     );
     seed_pkg_with_source(&project, "current-pkg", "1.0.0", SRC_CLEAN);
     let mock = MockRegistry::start().await;
-    mock.with_batch_metadata(vec![serde_json::json!({
-        "name": "current-pkg",
-        "dist-tags": {"latest": "1.0.0"},
-        "versions": {
-            "1.0.0": {
-                "name": "current-pkg",
-                "version": "1.0.0",
-                "deprecated": ""
+    project.write_file(".npmrc", &format!("registry={}\n", mock.url()));
+    Mock::given(method("GET"))
+        .and(path("/current-pkg"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "name": "current-pkg",
+            "dist-tags": {"latest": "1.0.0"},
+            "versions": {
+                "1.0.0": {
+                    "name": "current-pkg",
+                    "version": "1.0.0",
+                    "deprecated": ""
+                }
             }
-        }
-    })])
-    .await;
+        })))
+        .mount(mock.server())
+        .await;
 
     let output = lpm(&project)
         .args([
