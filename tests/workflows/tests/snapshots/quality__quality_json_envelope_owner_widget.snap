@@ -1,14 +1,18 @@
 ---
 source: tests/workflows/tests/quality.rs
-assertion_line: 111
 expression: envelope
 ---
 {
+  "success": true,
   "name": "owner.widget",
+  "available": true,
+  "message": null,
   "score": 73,
   "maxScore": 100,
   "tier": "silver",
   "ecosystem": "node",
+  "categories": null,
+  "published_at": null,
   "checks": [
     {
       "id": "readme",
@@ -29,5 +33,5 @@ expression: envelope
       "detail": "missing provenance attestations"
     }
   ],
-  "success": true
+  "count": 2
 }

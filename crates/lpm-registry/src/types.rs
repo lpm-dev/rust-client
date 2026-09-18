@@ -1075,6 +1075,18 @@ pub struct QualityResponse {
     pub name: String,
 
     #[serde(default)]
+    pub available: Option<bool>,
+
+    #[serde(default)]
+    pub message: Option<String>,
+
+    #[serde(default)]
+    pub categories: Option<serde_json::Value>,
+
+    #[serde(default, alias = "publishedAt")]
+    pub published_at: Option<String>,
+
+    #[serde(default)]
     pub score: Option<u32>,
 
     #[serde(default, rename = "maxScore")]
@@ -1106,7 +1118,7 @@ pub struct QualityCheck {
     #[serde(default)]
     pub points: Option<u32>,
 
-    #[serde(default, rename = "maxPoints")]
+    #[serde(default, rename = "maxPoints", alias = "max_points")]
     pub max_points: Option<u32>,
 
     #[serde(default)]

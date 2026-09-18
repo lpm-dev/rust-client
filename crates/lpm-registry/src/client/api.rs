@@ -426,7 +426,7 @@ impl RegistryClient {
 
     /// Get quality report for a package.
     ///
-    /// Posture: `AnonymousPreferred` — public read; bearer not attached.
+    /// Public reports allow anonymous reads; private reports require publisher access.
     ///
     /// Calls: GET /api/registry/quality?name=owner.package-name
     pub async fn get_quality(&self, name: &str) -> Result<QualityResponse, LpmError> {
@@ -435,7 +435,7 @@ impl RegistryClient {
             self.base_url,
             urlencoding::encode(name)
         );
-        self.get_json_anon(&url, AuthPosture::AnonymousPreferred)
+        self.execute_with_package_access_recovery(|| self.get_json(&url))
             .await
     }
 

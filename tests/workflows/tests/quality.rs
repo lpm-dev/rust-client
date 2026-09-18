@@ -115,3 +115,6 @@ async fn quality_json_envelope_matches_snapshot() {
 
     insta::assert_json_snapshot!("quality_json_envelope_owner_widget", envelope);
 }
+
+#[path = "quality_contract/mod.rs"]
+mod contract;

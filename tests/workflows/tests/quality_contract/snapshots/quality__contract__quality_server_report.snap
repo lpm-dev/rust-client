@@ -1,0 +1,33 @@
+---
+source: tests/workflows/tests/quality_contract/mod.rs
+expression: json
+---
+{
+  "success": true,
+  "name": "@lpm.dev/owner.widget",
+  "available": true,
+  "message": null,
+  "score": 0,
+  "maxScore": 100,
+  "tier": "needs-work",
+  "ecosystem": "js",
+  "categories": {
+    "documentation": {
+      "score": 0,
+      "max": 30
+    }
+  },
+  "published_at": "2026-09-18T00:00:00Z",
+  "checks": [
+    {
+      "id": "readme",
+      "category": null,
+      "label": "README",
+      "passed": false,
+      "points": 0,
+      "maxPoints": 10,
+      "detail": "Add a README."
+    }
+  ],
+  "count": 1
+}
