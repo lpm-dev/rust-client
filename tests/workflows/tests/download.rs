@@ -1,3 +1,4 @@
+mod download_contract;
 mod support;
 
 use support::assertions::{JsonType, assert_json_field, parse_json_output};

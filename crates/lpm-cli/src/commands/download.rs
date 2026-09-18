@@ -1,3 +1,5 @@
+mod publication;
+
 use crate::commands::install::{
     NpmFirewallMaterializationPackage, prepare_npm_firewall_materialization_preflight,
     registry_materialization_route_is_public_npm,
@@ -54,6 +56,13 @@ pub async fn run(
     })?;
 
     let integrity_str = ver.integrity_or_shasum();
+    if let Some(sri) = integrity_str.as_ref() {
+        lpm_common::integrity::Integrity::parse(sri.as_ref())?;
+    } else if !allow_unverified {
+        return Err(LpmError::Registry(format!(
+            "{package_name}@{version_key}: registry returned no integrity hash; refusing to download an unverified tarball. Use --allow-unverified to extract without verification"
+        )));
+    }
 
     let firewall_packages = match &package_ref {
         RoutedPackageRef::Registry(route_name)
@@ -96,31 +105,32 @@ pub async fn run(
     )
     .await?;
 
-    let downloaded = context
-        .client
-        .download_tarball_routed(&context.route_table, &package_ref.route_name(), tarball_url)
-        .await?;
-    let tarball_data = std::fs::read(downloaded.file.path()).map_err(LpmError::Io)?;
-    let size = tarball_data.len();
+    let downloaded = match integrity_str.as_ref() {
+        Some(sri) => {
+            context
+                .client
+                .download_tarball_routed_with_integrity(
+                    &context.route_table,
+                    &package_ref.route_name(),
+                    tarball_url,
+                    sri.as_ref(),
+                )
+                .await?
+        }
+        None => {
+            context
+                .client
+                .download_tarball_routed(
+                    &context.route_table,
+                    &package_ref.route_name(),
+                    tarball_url,
+                )
+                .await?
+        }
+    };
+    let size = downloaded.compressed_size as usize;
 
-    // Step 3: Verify integrity. Refuse-by-default for the audit-use
-    // posture: `lpm download` is documented as the tool for
-    // inspecting a package's contents, and silently accepting bytes
-    // for which the registry shipped no SRI defeats that purpose.
-    // `--allow-unverified` explicitly waives the gate for legacy
-    // sources (mirrors, GitHub release assets) that genuinely lack
-    // integrity.
-    if integrity_str.is_none() && !allow_unverified {
-        return Err(LpmError::Registry(format!(
-            "{package_name}@{version_key}: registry returned no integrity hash; \
-             refusing to extract an unverified tarball. Re-run with \
-             --allow-unverified if you accept the risk (audit use \
-             should not normally take that path).",
-        )));
-    }
     let integrity_verified = if let Some(sri) = integrity_str.as_ref() {
-        lpm_extractor::verify_integrity(&tarball_data, sri.as_ref())?;
-
         if !json_output {
             install_ui::done_line(
                 install_ui::TerminalLine::new("Verified integrity ").field(&short_integrity(sri)),
@@ -134,10 +144,15 @@ pub async fn run(
         false
     };
 
-    // Step 4: Extract
     let target_dir = output_dir.map_or_else(|| PathBuf::from("."), PathBuf::from);
-
-    let files = lpm_extractor::extract_tarball(&tarball_data, &target_dir)?;
+    let (target_dir, files) = tokio::task::spawn_blocking(move || {
+        let result = publication::extract_and_publish(downloaded.file.path(), &target_dir);
+        // Keep the spool reservation until extraction and publication finish.
+        drop(downloaded);
+        result.map(|files| (target_dir, files))
+    })
+    .await
+    .map_err(|error| LpmError::Registry(format!("download extraction worker failed: {error}")))??;
 
     let elapsed = start.elapsed();
 
