@@ -74,16 +74,17 @@ pub fn run(
     deny: &[String],
     json_output: bool,
 ) -> Result<(), LpmError> {
-    let package_json_path = project_dir.join("package.json");
-    let root_json = read_json_file(&package_json_path)?;
-    let lockfile = Lockfile::read_for_project(project_dir)
-        .map_err(|e| {
-            LpmError::NotFound(format!(
-                "no usable lpm.lock found. Run `lpm install` before listing licenses: {e}"
-            ))
-        })?
-        .lockfile;
-    let inventory = build_inventory(project_dir, root_json, &lockfile, fail_on, deny)?;
+    let selected = Lockfile::read_for_project(project_dir).map_err(|e| {
+        LpmError::NotFound(format!(
+            "no usable lpm.lock found. Run `lpm install` before listing licenses: {e}"
+        ))
+    })?;
+    let mut selected_dir = selected.path.parent().unwrap_or(project_dir).to_path_buf();
+    if selected.importer != "." {
+        selected_dir.push(&selected.importer);
+    }
+    let root_json = read_json_file(&selected_dir.join("package.json"))?;
+    let inventory = build_inventory(&selected_dir, root_json, &selected.lockfile, fail_on, deny)?;
     let summary = policy_summary(&inventory);
 
     if json_output {
