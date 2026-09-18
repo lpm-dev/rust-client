@@ -2196,3 +2196,6 @@ async fn forced_swift_install_resets_generated_state_before_reacquiring_download
         .expect("force must reset generated Swift state");
     assert!(reset < commands.find("package resolve").unwrap());
 }
+
+#[path = "swift/registry_contract.rs"]
+mod registry_contract;

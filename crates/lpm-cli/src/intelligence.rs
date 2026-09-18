@@ -1293,8 +1293,13 @@ pub async fn check_install_quality(
         }
 
         let short = name.trim_start_matches("@lpm.dev/");
-        if let Ok(quality) = client.get_quality(short).await {
-            let score = quality.score.unwrap_or(0);
+        if let Ok(quality) = client.get_quality_for_install(short).await {
+            if quality.available == Some(false) {
+                continue;
+            }
+            let Some(score) = quality.score else {
+                continue;
+            };
             if score < quality_threshold {
                 let severity = if score < 25 {
                     WarningSeverity::Critical

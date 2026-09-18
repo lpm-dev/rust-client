@@ -1075,6 +1075,18 @@ pub struct QualityResponse {
     pub name: String,
 
     #[serde(default)]
+    pub available: Option<bool>,
+
+    #[serde(default)]
+    pub message: Option<String>,
+
+    #[serde(default)]
+    pub categories: Option<serde_json::Value>,
+
+    #[serde(default, alias = "publishedAt")]
+    pub published_at: Option<String>,
+
+    #[serde(default)]
     pub score: Option<u32>,
 
     #[serde(default, rename = "maxScore")]
@@ -1106,7 +1118,7 @@ pub struct QualityCheck {
     #[serde(default)]
     pub points: Option<u32>,
 
-    #[serde(default, rename = "maxPoints")]
+    #[serde(default, rename = "maxPoints", alias = "max_points")]
     pub max_points: Option<u32>,
 
     #[serde(default)]
@@ -1201,8 +1213,12 @@ pub struct PoolStatsResponse {
     #[serde(default, rename = "billingPeriod")]
     pub billing_period: Option<String>,
 
-    #[serde(default, rename = "totalWeightedDownloads")]
-    pub total_weighted_downloads: Option<u64>,
+    #[serde(
+        default,
+        rename = "totalWeightedDownloads",
+        deserialize_with = "deserialize_pool_weight"
+    )]
+    pub total_weighted_downloads: Option<serde_json::Number>,
 
     #[serde(default, rename = "estimatedEarningsCents")]
     pub estimated_earnings_cents: Option<u64>,
@@ -1224,14 +1240,33 @@ pub struct PoolPackageStat {
     #[serde(default, rename = "installCount")]
     pub install_count: Option<u64>,
 
-    #[serde(default, rename = "weightedDownloads")]
-    pub weighted_downloads: Option<u64>,
+    #[serde(
+        default,
+        rename = "weightedDownloads",
+        deserialize_with = "deserialize_pool_weight"
+    )]
+    pub weighted_downloads: Option<serde_json::Number>,
 
     #[serde(default, rename = "sharePercentage")]
     pub share_percentage: Option<f64>,
 
     #[serde(default, rename = "estimatedEarningsCents")]
     pub estimated_earnings_cents: Option<u64>,
+}
+
+fn deserialize_pool_weight<'de, D>(deserializer: D) -> Result<Option<serde_json::Number>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Option::<serde_json::Number>::deserialize(deserializer)?;
+    if value
+        .as_ref()
+        .and_then(serde_json::Number::as_f64)
+        .is_some_and(|value| value < 0.0)
+    {
+        return Err(serde::de::Error::custom("Pool weight must be non-negative"));
+    }
+    Ok(value)
 }
 
 /// GET /api/registry/marketplace/earnings

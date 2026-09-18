@@ -426,7 +426,7 @@ impl RegistryClient {
 
     /// Get quality report for a package.
     ///
-    /// Posture: `AnonymousPreferred` — public read; bearer not attached.
+    /// Public reports allow anonymous reads; private reports require publisher access.
     ///
     /// Calls: GET /api/registry/quality?name=owner.package-name
     pub async fn get_quality(&self, name: &str) -> Result<QualityResponse, LpmError> {
@@ -435,13 +435,23 @@ impl RegistryClient {
             self.base_url,
             urlencoding::encode(name)
         );
-        self.get_json_anon(&url, AuthPosture::AnonymousPreferred)
+        self.execute_with_package_access_recovery(|| self.get_json(&url))
             .await
+    }
+
+    /// Read an optional install report using available credentials without refreshing a session.
+    pub async fn get_quality_for_install(&self, name: &str) -> Result<QualityResponse, LpmError> {
+        let url = format!(
+            "{}/api/registry/quality?name={}",
+            self.base_url,
+            urlencoding::encode(name)
+        );
+        self.get_json(&url).await
     }
 
     /// Get Agent Skills for a package.
     ///
-    /// Posture: `AuthRequired` — private package skills and publisher-only
+    /// Private package skills and publisher-only
     /// pending versions must follow the same principal as package metadata
     /// and tarball access.
     ///
@@ -459,7 +469,7 @@ impl RegistryClient {
         if let Some(v) = version {
             url.push_str(&format!("&version={}", urlencoding::encode(v)));
         }
-        self.execute_with_recovery(AuthPosture::PackageRead, || self.get_json(&url))
+        self.execute_with_package_access_recovery(|| self.get_json(&url))
             .await
     }
 

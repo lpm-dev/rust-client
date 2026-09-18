@@ -1,0 +1,18 @@
+---
+source: tests/workflows/tests/quality_contract/mod.rs
+expression: json
+---
+{
+  "success": true,
+  "name": "owner.widget",
+  "available": false,
+  "message": "No quality data available.",
+  "score": null,
+  "maxScore": null,
+  "tier": null,
+  "ecosystem": null,
+  "categories": null,
+  "published_at": null,
+  "checks": [],
+  "count": 0
+}

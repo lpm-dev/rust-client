@@ -119,6 +119,12 @@ fn main() {
             std::process::exit(exit_code);
         }
         (Some("package-registry"), Some("set")) => {
+            if std::env::var_os("LPM_TEST_SWIFT_SET_STDERR").is_some() {
+                use std::io::Write as _;
+                std::io::stderr()
+                    .write_all(b"SwiftPM setup diagnostic\n")
+                    .expect("write SwiftPM diagnostic");
+            }
             let remaining: Vec<_> = args.collect();
             let scope = remaining
                 .windows(2)

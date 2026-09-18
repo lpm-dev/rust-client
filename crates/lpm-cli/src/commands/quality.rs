@@ -8,17 +8,41 @@ pub async fn run(
     json_output: bool,
 ) -> Result<(), LpmError> {
     let report = client.get_quality(package).await?;
+    let available = report.available.unwrap_or(report.score.is_some());
 
     if json_output {
-        let mut json = serde_json::to_value(&report)?;
-        if let Some(obj) = json.as_object_mut() {
-            obj.insert("success".to_string(), serde_json::Value::Bool(true));
-        }
+        let json = serde_json::json!({
+            "success": true,
+            "name": report.name,
+            "available": available,
+            "message": report.message,
+            "score": report.score,
+            "maxScore": report.max_score,
+            "tier": report.tier,
+            "ecosystem": report.ecosystem,
+            "categories": report.categories,
+            "published_at": report.published_at,
+            "checks": report.checks,
+            "count": report.checks.len(),
+        });
         println!("{}", serde_json::to_string_pretty(&json)?);
         return Ok(());
     }
 
     println!("{}", install_ui::cyan(&report.name));
+
+    if !available {
+        println!(
+            "{}",
+            install_ui::field(
+                report
+                    .message
+                    .as_deref()
+                    .unwrap_or("No quality data available.")
+            )
+        );
+        return Ok(());
+    }
 
     if let Some(score) = report.score {
         let max = report.max_score.unwrap_or(100);

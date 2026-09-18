@@ -17,12 +17,31 @@ const MAX_FILE_BYTES: usize = 1024 * 1024;
 const MAX_FILE_COUNT: usize = 500;
 const MAX_ARCHIVE_ENTRIES: usize = 500;
 const MAX_DIRECTORY_DEPTH: usize = 12;
+const MAX_MATERIALIZED_ENTRIES: usize = MAX_FILE_COUNT * (MAX_DIRECTORY_DEPTH + 1);
 
 #[derive(Clone, Copy)]
 struct LocalTraversal {
     label: &'static str,
     skip_git: bool,
     max_entries: Option<usize>,
+    max_total_bytes: usize,
+}
+
+#[derive(Default)]
+struct LocalReadProgress {
+    entries: usize,
+    files: usize,
+    bytes: usize,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq, Ord, PartialOrd)]
+pub(super) enum UpdateSource {
+    Local(String),
+    Github {
+        repository: String,
+        reference: String,
+        subpath: String,
+    },
 }
 
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
@@ -41,6 +60,22 @@ pub enum SourceDescriptor {
 }
 
 impl SourceDescriptor {
+    pub(super) fn update_source(&self) -> UpdateSource {
+        match self {
+            Self::Local { path, .. } => UpdateSource::Local(path.clone()),
+            Self::Github {
+                repository,
+                reference,
+                subpath,
+                ..
+            } => UpdateSource::Github {
+                repository: repository.clone(),
+                reference: reference.clone(),
+                subpath: subpath.clone(),
+            },
+        }
+    }
+
     pub fn display(&self) -> String {
         match self {
             Self::Github {
@@ -140,6 +175,27 @@ pub async fn load(input: &str, project_dir: &Path) -> Result<SourceTree, LpmErro
     }
     let github = GithubLocation::parse(input)?;
     load_github(github).await
+}
+
+pub(super) async fn load_update(
+    source: UpdateSource,
+    project_dir: &Path,
+) -> Result<SourceTree, LpmError> {
+    match source {
+        UpdateSource::Local(path) => load(&path, project_dir).await,
+        UpdateSource::Github {
+            repository,
+            reference,
+            subpath,
+        } => {
+            let mut location = GithubLocation::parse(&repository)?;
+            location.path = GithubPath::Exact {
+                reference,
+                subpath: PathBuf::from(subpath),
+            };
+            load_github(location).await
+        }
+    }
 }
 
 pub fn discover(tree: &SourceTree, full_depth: bool) -> Result<Vec<DiscoveredSkill>, LpmError> {
@@ -250,7 +306,7 @@ fn load_local(input: &str, project_dir: &Path) -> Result<SourceTree, LpmError> {
     };
     let root = root.canonicalize()?;
     let mut files = BTreeMap::new();
-    let mut entry_count = 0;
+    let mut progress = LocalReadProgress::default();
     collect_local_files(
         &root,
         &root,
@@ -260,8 +316,9 @@ fn load_local(input: &str, project_dir: &Path) -> Result<SourceTree, LpmError> {
             label: "standalone source",
             skip_git: true,
             max_entries: None,
+            max_total_bytes: MAX_EXPANDED_BYTES,
         },
-        &mut entry_count,
+        &mut progress,
     )?;
     let digest = tree_digest(&files);
     Ok(SourceTree {
@@ -277,6 +334,18 @@ fn load_local(input: &str, project_dir: &Path) -> Result<SourceTree, LpmError> {
 pub(super) fn read_bounded_skill_directory(
     root: &Path,
 ) -> Result<BTreeMap<PathBuf, Vec<u8>>, LpmError> {
+    let mut files = BTreeMap::new();
+    visit_bounded_skill_directory(root, |path, content| {
+        files.insert(path, content);
+        Ok(())
+    })?;
+    Ok(files)
+}
+
+pub(super) fn visit_bounded_skill_directory(
+    root: &Path,
+    mut visit: impl FnMut(PathBuf, Vec<u8>) -> Result<(), LpmError>,
+) -> Result<(), LpmError> {
     let metadata = std::fs::symlink_metadata(root)?;
     if metadata.file_type().is_symlink() || !metadata.is_dir() {
         return Err(LpmError::Registry(format!(
@@ -285,21 +354,31 @@ pub(super) fn read_bounded_skill_directory(
         )));
     }
     let root = root.canonicalize()?;
-    let mut files = BTreeMap::new();
-    let mut entry_count = 0;
-    collect_local_files(
+    visit_local_files(
         &root,
         &root,
-        &mut files,
+        &mut visit,
         0,
         LocalTraversal {
             label: "skill directory",
             skip_git: false,
-            max_entries: Some(MAX_ARCHIVE_ENTRIES),
+            max_entries: Some(MAX_MATERIALIZED_ENTRIES),
+            max_total_bytes: MAX_EXPANDED_BYTES,
         },
-        &mut entry_count,
-    )?;
-    Ok(files)
+        &mut LocalReadProgress::default(),
+    )
+}
+
+pub(super) fn read_canonical_skill(
+    directory: &Path,
+    descriptor: &SourceDescriptor,
+) -> Result<DiscoveredSkill, LpmError> {
+    let tree = SourceTree {
+        descriptor: descriptor.clone(),
+        files: read_bounded_skill_directory(directory)?,
+        unsafe_entries: BTreeMap::new(),
+    };
+    discover_skill(&tree, Path::new(""))
 }
 
 fn collect_local_files(
@@ -308,7 +387,28 @@ fn collect_local_files(
     files: &mut BTreeMap<PathBuf, Vec<u8>>,
     depth: usize,
     traversal: LocalTraversal,
-    entry_count: &mut usize,
+    progress: &mut LocalReadProgress,
+) -> Result<(), LpmError> {
+    visit_local_files(
+        root,
+        directory,
+        &mut |path, content| {
+            files.insert(path, content);
+            Ok(())
+        },
+        depth,
+        traversal,
+        progress,
+    )
+}
+
+fn visit_local_files(
+    root: &Path,
+    directory: &Path,
+    visit: &mut impl FnMut(PathBuf, Vec<u8>) -> Result<(), LpmError>,
+    depth: usize,
+    traversal: LocalTraversal,
+    progress: &mut LocalReadProgress,
 ) -> Result<(), LpmError> {
     if depth > MAX_DIRECTORY_DEPTH {
         return Err(LpmError::Registry(format!(
@@ -321,9 +421,9 @@ fn collect_local_files(
         if traversal.skip_git && entry.file_name() == ".git" {
             continue;
         }
-        *entry_count = (*entry_count).saturating_add(1);
+        progress.entries = progress.entries.saturating_add(1);
         if let Some(limit) = traversal.max_entries
-            && *entry_count > limit
+            && progress.entries > limit
         {
             return Err(LpmError::Registry(format!(
                 "{} exceeds the {limit}-entry limit",
@@ -340,7 +440,7 @@ fn collect_local_files(
             )));
         }
         if metadata.is_dir() {
-            collect_local_files(root, &path, files, depth + 1, traversal, entry_count)?;
+            visit_local_files(root, &path, visit, depth + 1, traversal, progress)?;
             continue;
         }
         if !metadata.is_file() {
@@ -350,7 +450,7 @@ fn collect_local_files(
                 path.display(),
             )));
         }
-        if files.len() >= MAX_FILE_COUNT {
+        if progress.files >= MAX_FILE_COUNT {
             return Err(LpmError::Registry(format!(
                 "{} exceeds the {MAX_FILE_COUNT}-file limit",
                 traversal.label
@@ -369,10 +469,23 @@ fn collect_local_files(
                 path.display()
             ))
         })?;
+        let remaining = traversal.max_total_bytes.saturating_sub(progress.bytes);
+        if metadata.len() > remaining as u64 {
+            return Err(LpmError::Registry(format!(
+                "{} exceeds the {}-byte content limit",
+                traversal.label, traversal.max_total_bytes
+            )));
+        }
         let mut content = Vec::with_capacity(metadata.len() as usize);
         std::fs::File::open(&path)?
-            .take((MAX_FILE_BYTES + 1) as u64)
+            .take((MAX_FILE_BYTES.min(remaining) + 1) as u64)
             .read_to_end(&mut content)?;
+        if content.len() > remaining {
+            return Err(LpmError::Registry(format!(
+                "{} exceeds the {}-byte content limit",
+                traversal.label, traversal.max_total_bytes
+            )));
+        }
         if content.len() > MAX_FILE_BYTES {
             return Err(LpmError::Registry(format!(
                 "{} file exceeds the {MAX_FILE_BYTES}-byte limit: {}",
@@ -380,14 +493,9 @@ fn collect_local_files(
                 path.display(),
             )));
         }
-        files.insert(relative.to_path_buf(), content);
-    }
-    let expanded_bytes = files.values().map(Vec::len).sum::<usize>();
-    if expanded_bytes > MAX_EXPANDED_BYTES {
-        return Err(LpmError::Registry(format!(
-            "{} exceeds the {MAX_EXPANDED_BYTES}-byte content limit",
-            traversal.label
-        )));
+        progress.bytes += content.len();
+        progress.files += 1;
+        visit(relative.to_path_buf(), content)?;
     }
     Ok(())
 }
@@ -404,6 +512,7 @@ enum GithubPath {
     Repository,
     Tree(Vec<String>),
     Blob(Vec<String>),
+    Exact { reference: String, subpath: PathBuf },
 }
 
 impl GithubLocation {
@@ -466,7 +575,7 @@ impl GithubLocation {
 impl GithubPath {
     fn parts(&self) -> &[String] {
         match self {
-            Self::Repository => &[],
+            Self::Repository | Self::Exact { .. } => &[],
             Self::Tree(parts) | Self::Blob(parts) => parts,
         }
     }
@@ -582,14 +691,12 @@ fn github_api_get(
     }
 }
 
-async fn resolve_github_location(
-    client: &reqwest::Client,
-    authentication: Option<&reqwest::header::HeaderValue>,
-    repository: &str,
-    path: &GithubPath,
-) -> Result<(String, PathBuf, String), LpmError> {
+fn github_reference_candidates(path: &GithubPath) -> Vec<(String, PathBuf)> {
+    if let GithubPath::Exact { reference, subpath } = path {
+        return vec![(reference.clone(), subpath.clone())];
+    }
     let parts = path.parts();
-    let candidates: Vec<(String, PathBuf)> = if parts.is_empty() {
+    if parts.is_empty() {
         vec![("HEAD".to_string(), PathBuf::new())]
     } else {
         (1..=parts.len())
@@ -601,7 +708,16 @@ async fn resolve_github_location(
                 )
             })
             .collect()
-    };
+    }
+}
+
+async fn resolve_github_location(
+    client: &reqwest::Client,
+    authentication: Option<&reqwest::header::HeaderValue>,
+    repository: &str,
+    path: &GithubPath,
+) -> Result<(String, PathBuf, String), LpmError> {
+    let candidates = github_reference_candidates(path);
     let mut last_status = None;
     for (reference, mut subpath) in candidates {
         let resolve_url = format!(
@@ -968,6 +1084,45 @@ fn agent_slug(agent: AgentTarget) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bounded_directory_stops_before_reading_beyond_total_budget() {
+        let root = tempfile::tempdir().unwrap();
+        for name in ["a", "b", "c"] {
+            std::fs::write(root.path().join(name), b"data").unwrap();
+        }
+        let mut files = BTreeMap::new();
+        let error = collect_local_files(
+            root.path(),
+            root.path(),
+            &mut files,
+            0,
+            LocalTraversal {
+                label: "fixture",
+                skip_git: false,
+                max_entries: Some(10),
+                max_total_bytes: 8,
+            },
+            &mut LocalReadProgress::default(),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("content limit"));
+        assert_eq!(files.len(), 2, "reader retained content beyond its budget");
+    }
+
+    #[test]
+    fn recorded_github_reference_preserves_the_known_subpath_boundary() {
+        for (reference, subpath) in [("main", "guides"), ("main/guides", "")] {
+            let path = GithubPath::Exact {
+                reference: reference.into(),
+                subpath: subpath.into(),
+            };
+            assert_eq!(
+                github_reference_candidates(&path),
+                vec![(reference.into(), PathBuf::from(subpath))]
+            );
+        }
+    }
 
     #[test]
     fn github_shorthand_defaults_to_head() {
