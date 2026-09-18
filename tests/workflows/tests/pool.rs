@@ -252,3 +252,93 @@ async fn pool_json_envelope_matches_snapshot() {
 
     insta::assert_json_snapshot!("pool_json_envelope_two_packages", envelope);
 }
+
+#[tokio::test]
+async fn pool_preserves_fractional_weights_in_json() {
+    let project = TempProject::empty(r#"{"name":"pool-test","version":"1.0.0"}"#);
+    let mock = MockRegistry::start().await;
+    mock.with_pool_stats(
+        "pool-session-token",
+        serde_json::json!({
+            "billingPeriod": "2026-09",
+            "totalWeightedDownloads": 1234.847,
+            "estimatedEarningsCents": 123,
+            "packages": [{"name": "@lpm.dev/owner.package", "weightedDownloads": 0.147}]
+        }),
+    )
+    .await;
+    let output = lpm_with_registry(&project, &mock.url())
+        .env("LPM_TOKEN", "pool-session-token")
+        .args(["pool", "--json"])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(json["totalWeightedDownloads"], 1234.847);
+    assert_eq!(json["packages"][0]["weightedDownloads"], 0.147);
+}
+
+#[tokio::test]
+async fn pool_human_output_preserves_fractional_weights() {
+    let project = TempProject::empty(r#"{"name":"pool-test","version":"1.0.0"}"#);
+    let mock = MockRegistry::start().await;
+    mock.with_pool_stats(
+        "pool-session-token",
+        serde_json::json!({
+            "totalWeightedDownloads": 1234.847,
+            "packages": [{"name": "@lpm.dev/owner.package", "weightedDownloads": 0.147}]
+        }),
+    )
+    .await;
+    let output = lpm_with_registry(&project, &mock.url())
+        .env("LPM_TOKEN", "pool-session-token")
+        .args(["pool"])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    let text = String::from_utf8_lossy(&output.stdout);
+    assert!(text.contains("1,234.847"), "{text}");
+    assert!(text.contains("0.147 downloads"), "{text}");
+}
+
+#[tokio::test]
+async fn pool_formats_large_integer_cents_without_float_rounding() {
+    let project = TempProject::empty(r#"{"name":"pool-test","version":"1.0.0"}"#);
+    let mock = MockRegistry::start().await;
+    mock.with_pool_stats(
+        "pool-session-token",
+        serde_json::json!({
+            "estimatedEarningsCents": 9_007_199_254_740_901_u64
+        }),
+    )
+    .await;
+    let output = lpm_with_registry(&project, &mock.url())
+        .env("LPM_TOKEN", "pool-session-token")
+        .arg("pool")
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    let text = String::from_utf8_lossy(&output.stdout);
+    assert!(text.contains("$90071992547409.01"), "{text}");
+}
+
+#[tokio::test]
+async fn pool_rejects_negative_weights() {
+    let project = TempProject::empty(r#"{"name":"pool-test","version":"1.0.0"}"#);
+    let mock = MockRegistry::start().await;
+    mock.with_pool_stats(
+        "pool-session-token",
+        serde_json::json!({
+            "totalWeightedDownloads": -0.7
+        }),
+    )
+    .await;
+    let output = lpm_with_registry(&project, &mock.url())
+        .env("LPM_TOKEN", "pool-session-token")
+        .args(["pool", "--json"])
+        .output()
+        .unwrap();
+    assert!(!output.status.success(), "{output:?}");
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(json["error_code"], "registry");
+}

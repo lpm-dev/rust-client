@@ -24,7 +24,7 @@ pub async fn run(client: &RegistryClient, json_output: bool) -> Result<(), LpmEr
         if let Some(period) = &stats.billing_period {
             print_field("billing period", install_ui::field(&period.to_string()));
         }
-        if let Some(downloads) = stats.total_weighted_downloads {
+        if let Some(downloads) = &stats.total_weighted_downloads {
             print_field(
                 "weighted downloads",
                 install_ui::field(&format_count(downloads)),
@@ -33,7 +33,7 @@ pub async fn run(client: &RegistryClient, json_output: bool) -> Result<(), LpmEr
         if let Some(earnings) = stats.estimated_earnings_cents {
             print_field(
                 "estimated earnings",
-                install_ui::green(&format!("${:.2}", earnings as f64 / 100.0)),
+                install_ui::green(&format!("${}.{:02}", earnings / 100, earnings % 100)),
             );
         }
 
@@ -50,13 +50,16 @@ pub async fn run(client: &RegistryClient, json_output: bool) -> Result<(), LpmEr
                 .max()
                 .unwrap_or(0);
             for pkg in &stats.packages {
-                let downloads = pkg.weighted_downloads.unwrap_or(0);
+                let downloads = pkg
+                    .weighted_downloads
+                    .as_ref()
+                    .map_or_else(|| "0".into(), format_count);
                 println!(
                     "{}",
                     install_ui::terminal_line!(
                         "    {:<width$}   {}",
                         install_ui::cyan(&pkg.name),
-                        install_ui::dim(&format!("({} downloads)", format_count(downloads))),
+                        install_ui::dim(&format!("({downloads} downloads)")),
                     )
                 );
             }
@@ -75,8 +78,12 @@ fn print_field(label: &'static str, value: install_ui::TerminalFragment) {
     );
 }
 
-fn format_count(value: u64) -> String {
-    let digits = value.to_string();
+fn format_count(value: &serde_json::Number) -> String {
+    let number = value.to_string();
+    if number.contains(['e', 'E']) {
+        return number;
+    }
+    let (digits, fraction) = number.split_once('.').unwrap_or((&number, ""));
     let mut formatted = String::with_capacity(digits.len() + digits.len() / 3);
     let leading = digits.len() % 3;
     if leading != 0 {
@@ -87,6 +94,10 @@ fn format_count(value: u64) -> String {
             formatted.push(',');
         }
         formatted.push_str(&digits[chunk_start..chunk_start + 3]);
+    }
+    if !fraction.is_empty() && fraction != "0" {
+        formatted.push('.');
+        formatted.push_str(fraction);
     }
     formatted
 }
