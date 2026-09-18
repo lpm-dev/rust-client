@@ -150,6 +150,22 @@ impl SkippedDependency {
     }
 }
 
+pub(super) struct CachedAvailableVersions {
+    pub metadata: Arc<CachedPackageInfo>,
+    pub versions: Arc<[NpmVersion]>,
+}
+
+pub(super) struct CachedRange {
+    pub available: Arc<[NpmVersion]>,
+    pub tagged_version: Option<NpmVersion>,
+    pub range: Ranges<NpmVersion>,
+}
+
+pub(super) struct PendingOverride {
+    pub child: ResolverPackage,
+    pub hit: OverrideHit,
+}
+
 /// The DependencyProvider that bridges PubGrub with LPM's registry.
 pub struct LpmDependencyProvider {
     pub(super) client: Arc<RegistryClient>,
@@ -191,6 +207,8 @@ pub struct LpmDependencyProvider {
     /// can drain the trace after `pubgrub::resolve` returns. Always present
     /// (defaults to `OverrideSet::empty()` when no overrides are declared).
     pub(super) overrides: OverrideSet,
+    pub(super) override_edges:
+        Mutex<HashMap<(ResolverPackage, NpmVersion, String), PendingOverride>>,
     /// Set after the first batch_metadata call fails (e.g., 401).
     /// Prevents repeated guaranteed-failing batch requests during resolution.
     /// Individual ensure_cached calls still work as fallback.
@@ -205,31 +223,9 @@ pub struct LpmDependencyProvider {
     /// Their effective optionality is decided from the final selected graph.
     pub(super) skipped_dependencies:
         Mutex<HashMap<(ResolverPackage, String, ResolverPackage, String), SkippedDependency>>,
-    /// Memoize `(ResolverPackage, raw_range) → Ranges<NpmVersion>` so
-    /// repeated PubGrub `get_dependencies` queries for the same edge skip
-    /// the O(N-versions) conversion inside `NpmRange::to_pubgrub_ranges`.
-    /// The uncached conversion measured at ~962 ms of `pubgrub_core_ms`
-    /// when the metadata cache grew by 9 packages; the uncached O(queries
-    /// × N) cost is what made the resolver look "sensitive to metadata bloat."
-    ///
-    /// Correctness. Safe to memoize for the lifetime of a single
-    /// provider instance because `available_versions(pkg)` is fixed
-    /// once `ensure_cached(pkg)` runs: the metadata cache is append-
-    /// only during a resolve pass and platform filtering is a pure
-    /// function of the cached platform map, which is also fixed.
-    /// Keyed on `ResolverPackage` (not bare canonical name) so split
-    /// contexts stay in distinct cells — cheaper than teaching the
-    /// cache to reason about split equivalence, and safe by
-    /// construction.
-    ///
-    /// NOT transferred across provider instances. The `SharedCache`
-    /// Arc carries metadata across split-retry passes;
-    /// this range cache is re-built per pass. Keeps the invariant
-    /// local: anything that changes how `available_versions` resolves
-    /// (e.g. a future per-split platform override) can't accidentally
-    /// read stale memoized Ranges from a prior pass.
-    pub(super) range_cache: Mutex<HashMap<(ResolverPackage, String), Ranges<NpmVersion>>>,
+    /// Cache conversions against the exact available-version snapshot and tag.
+    pub(super) range_cache: Mutex<HashMap<(ResolverPackage, String), CachedRange>>,
     pub(super) refreshed_metadata: Mutex<HashSet<CanonicalKey>>,
-    pub(super) available_versions_cache: Mutex<HashMap<ResolverPackage, Arc<[NpmVersion]>>>,
+    pub(super) available_versions_cache: Mutex<HashMap<ResolverPackage, CachedAvailableVersions>>,
     pub(super) include_optional_dependencies: bool,
 }

@@ -1,4 +1,5 @@
 use super::prelude::*;
+use super::types::{CachedAvailableVersions, CachedRange};
 
 pub(crate) fn insert_or_merge_cached_package_info(
     shared_cache: &SharedCache,
@@ -472,14 +473,17 @@ impl LpmDependencyProvider {
     pub(super) fn available_versions(&self, package: &ResolverPackage) -> Arc<[NpmVersion]> {
         let _span = tracing::debug_span!("available_versions", pkg = %package).entered();
         let _prof = crate::profile::available_versions::start();
-        if let Some(cached) = self.available_versions_cache.lock().get(package) {
-            return Arc::clone(cached);
-        }
         let key = CanonicalKey::from(package);
         let Some(info) = self.cache.get(&key) else {
             return Arc::from([]);
         };
         let info = info.value();
+        if let Some(cached) = self.available_versions_cache.lock().get(package)
+            && Arc::ptr_eq(&cached.metadata, info)
+        {
+            return Arc::clone(&cached.versions);
+        }
+
         let versions = if !self.policy.release_age_active()
             && !self.policy.trust_policy().is_no_downgrade()
         {
@@ -493,46 +497,46 @@ impl LpmDependencyProvider {
                     .collect::<Vec<_>>(),
             )
         };
-        self.available_versions_cache
-            .lock()
-            .insert(package.clone(), Arc::clone(&versions));
+        self.available_versions_cache.lock().insert(
+            package.clone(),
+            CachedAvailableVersions {
+                metadata: Arc::clone(info),
+                versions: Arc::clone(&versions),
+            },
+        );
         versions
     }
 
-    /// Memoized wrapper around [`NpmRange::to_pubgrub_ranges`]. First call
-    /// for a given
-    /// `(package, raw_range)` pair computes the O(N-versions)
-    /// conversion and caches the result; subsequent calls return a
-    /// clone of the cached `Ranges`. See the doc on
-    /// [`Self::range_cache`] for the correctness argument.
-    ///
-    /// Callers MUST pass the same `available` slice they'd have passed
-    /// to the uncached call (i.e. the output of
-    /// `available_versions(pkg)` at the moment of the call). The cache
-    /// doesn't re-derive `available` on hits — it just returns what it
-    /// recorded. Because `available_versions(pkg)` is fixed for the
-    /// lifetime of one provider (metadata cache is append-only per
-    /// pass), this is safe; calling with a stale `available` is a
-    /// caller bug that would be wrong uncached too.
+    /// Reuse a conversion only while its available versions and tag are unchanged.
     pub(super) fn to_pubgrub_ranges_cached(
         &self,
         pkg: &ResolverPackage,
         npm_range: &NpmRange,
-        available: &[NpmVersion],
+        available: &Arc<[NpmVersion]>,
     ) -> Ranges<NpmVersion> {
         let key = (pkg.clone(), npm_range.raw().to_string());
-        if let Some(cached) = self.range_cache.lock().get(&key) {
-            return cached.clone();
-        }
         let tagged_version = npm_range.dist_tag().and_then(|tag| {
             let canonical = CanonicalKey::from(pkg);
             self.cache
                 .get(&canonical)
                 .and_then(|info| info.dist_tag_version(tag).cloned())
         });
+        if let Some(cached) = self.range_cache.lock().get(&key)
+            && Arc::ptr_eq(&cached.available, available)
+            && cached.tagged_version == tagged_version
+        {
+            return cached.range.clone();
+        }
         let computed =
             npm_range.to_pubgrub_ranges_with_dist_tag(available, tagged_version.as_ref());
-        self.range_cache.lock().insert(key, computed.clone());
+        self.range_cache.lock().insert(
+            key,
+            CachedRange {
+                available: Arc::clone(available),
+                tagged_version,
+                range: computed.clone(),
+            },
+        );
         computed
     }
 
@@ -547,6 +551,7 @@ impl LpmDependencyProvider {
     #[allow(clippy::type_complexity)]
     pub fn into_parts(
         self,
+        solution: &pubgrub::SelectedDependencies<Self>,
     ) -> (
         HashMap<CanonicalKey, Arc<CachedPackageInfo>>,
         Vec<OverrideHit>,
@@ -554,7 +559,7 @@ impl LpmDependencyProvider {
         HashMap<String, String>,
         RootDependencies,
     ) {
-        let hits = self.overrides.take_hits();
+        let hits = self.selected_override_hits(solution);
         let mut skipped_dependencies: Vec<_> = self
             .skipped_dependencies
             .into_inner()

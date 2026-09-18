@@ -1057,8 +1057,21 @@ fn override_set_with(key: &str, target: &str) -> OverrideSet {
     OverrideSet::parse(&lpm, &HashMap::new(), &HashMap::new()).unwrap()
 }
 
+fn selected_hits(
+    provider: &LpmDependencyProvider,
+    package: &ResolverPackage,
+    version: Option<&NpmVersion>,
+) -> Vec<OverrideHit> {
+    let mut solution = pubgrub::Map::default();
+    solution.insert(ResolverPackage::Root, NpmVersion::new(0, 0, 0));
+    if let Some(version) = version {
+        solution.insert(package.clone(), version.clone());
+    }
+    provider.selected_override_hits(&solution)
+}
+
 #[test]
-fn choose_version_override_in_range_applies() {
+fn edge_override_in_range_applies() {
     let pkg = ResolverPackage::npm("lodash");
     let info = make_info(&["4.17.21", "4.17.20", "4.17.19"], vec![], vec![], vec![]);
 
@@ -1074,24 +1087,31 @@ fn choose_version_override_in_range_applies() {
     let range = NpmRange::parse("^4.17.0")
         .unwrap()
         .to_pubgrub_ranges(&provider.available_versions(&pkg));
+    let range = provider.effective_dependency_range(
+        &ResolverPackage::Root,
+        &NpmVersion::new(0, 0, 0),
+        &pkg.canonical_name(),
+        &pkg,
+        range,
+    );
     let chosen = provider.choose_version(&pkg, &range).unwrap();
     assert_eq!(
-        chosen.map(|v| v.to_string()),
+        chosen.as_ref().map(|v| v.to_string()),
         Some("4.17.20".to_string()),
         "override 4.17.20 should be selected over newest 4.17.21"
     );
 
     // Verify the apply trace was recorded.
-    let hits = provider.overrides.take_hits();
+    let hits = selected_hits(&provider, &pkg, chosen.as_ref());
     assert_eq!(hits.len(), 1, "exactly one override hit should be recorded");
     assert_eq!(hits[0].package, "lodash");
-    assert_eq!(hits[0].from_version, "4.17.21");
+    assert_eq!(hits[0].from_version.as_deref(), Some("4.17.21"));
     assert_eq!(hits[0].to_version, "4.17.20");
     assert_eq!(hits[0].via_parent, None);
 }
 
 #[test]
-fn choose_version_pinned_override_replaces_consumer_range() {
+fn edge_override_pinned_override_replaces_consumer_range() {
     let pkg = ResolverPackage::npm("lodash");
     let info = make_info(&["4.17.21", "4.17.20", "3.0.0"], vec![], vec![], vec![]);
 
@@ -1106,21 +1126,28 @@ fn choose_version_pinned_override_replaces_consumer_range() {
     let range = NpmRange::parse("^4.17.0")
         .unwrap()
         .to_pubgrub_ranges(&provider.available_versions(&pkg));
+    let range = provider.effective_dependency_range(
+        &ResolverPackage::Root,
+        &NpmVersion::new(0, 0, 0),
+        &pkg.canonical_name(),
+        &pkg,
+        range,
+    );
     let chosen = provider.choose_version(&pkg, &range).unwrap();
     assert_eq!(
-        chosen.map(|v| v.to_string()),
+        chosen.as_ref().map(|v| v.to_string()),
         Some("3.0.0".to_string()),
         "the pinned override replaces the consumer's declared range"
     );
 
-    let hits = provider.overrides.take_hits();
+    let hits = selected_hits(&provider, &pkg, chosen.as_ref());
     assert_eq!(hits.len(), 1);
-    assert_eq!(hits[0].from_version, "4.17.21");
+    assert_eq!(hits[0].from_version.as_deref(), Some("4.17.21"));
     assert_eq!(hits[0].to_version, "3.0.0");
 }
 
 #[test]
-fn choose_version_override_range_target_picks_newest_target_match() {
+fn edge_override_range_target_picks_newest_target_match() {
     // `^2.0.0` selects the newest 2.x target rather than one fixed version.
     let pkg = ResolverPackage::npm("foo");
     let info = make_info(
@@ -1143,10 +1170,20 @@ fn choose_version_override_range_target_picks_newest_target_match() {
     let range = NpmRange::parse("*")
         .unwrap()
         .to_pubgrub_ranges(&provider.available_versions(&pkg));
+    let range = provider.effective_dependency_range(
+        &ResolverPackage::Root,
+        &NpmVersion::new(0, 0, 0),
+        &pkg.canonical_name(),
+        &pkg,
+        range,
+    );
     let chosen = provider.choose_version(&pkg, &range).unwrap();
-    assert_eq!(chosen.map(|v| v.to_string()), Some("2.5.0".to_string()));
+    assert_eq!(
+        chosen.as_ref().map(|v| v.to_string()),
+        Some("2.5.0".to_string())
+    );
 
-    let hits = provider.overrides.take_hits();
+    let hits = selected_hits(&provider, &pkg, chosen.as_ref());
     assert!(
         hits.is_empty(),
         "an override that does not change the selected version is not applied work"
@@ -1154,7 +1191,7 @@ fn choose_version_override_range_target_picks_newest_target_match() {
 }
 
 #[test]
-fn choose_version_override_range_target_replaces_consumer_range() {
+fn edge_override_range_target_replaces_consumer_range() {
     let pkg = ResolverPackage::npm("foo");
     let info = make_info(&["3.0.0", "2.5.0", "2.0.0"], vec![], vec![], vec![]);
 
@@ -1169,17 +1206,27 @@ fn choose_version_override_range_target_replaces_consumer_range() {
     let range = NpmRange::parse("^3.0.0")
         .unwrap()
         .to_pubgrub_ranges(&provider.available_versions(&pkg));
+    let range = provider.effective_dependency_range(
+        &ResolverPackage::Root,
+        &NpmVersion::new(0, 0, 0),
+        &pkg.canonical_name(),
+        &pkg,
+        range,
+    );
     let chosen = provider.choose_version(&pkg, &range).unwrap();
-    assert_eq!(chosen.map(|v| v.to_string()), Some("2.5.0".to_string()));
+    assert_eq!(
+        chosen.as_ref().map(|v| v.to_string()),
+        Some("2.5.0".to_string())
+    );
 
-    let hits = provider.overrides.take_hits();
+    let hits = selected_hits(&provider, &pkg, chosen.as_ref());
     assert_eq!(hits.len(), 1);
-    assert_eq!(hits[0].from_version, "3.0.0");
+    assert_eq!(hits[0].from_version.as_deref(), Some("3.0.0"));
     assert_eq!(hits[0].to_version, "2.5.0");
 }
 
 #[test]
-fn choose_version_unpublished_override_target_falls_back_to_natural_version() {
+fn edge_override_unpublished_override_target_falls_back_to_natural_version() {
     let pkg = ResolverPackage::npm("foo");
     let info = make_info(&["2.0.0"], vec![], vec![], vec![]);
 
@@ -1194,17 +1241,24 @@ fn choose_version_unpublished_override_target_falls_back_to_natural_version() {
     let range = NpmRange::parse("^2.0.0")
         .unwrap()
         .to_pubgrub_ranges(&provider.available_versions(&pkg));
+    let range = provider.effective_dependency_range(
+        &ResolverPackage::Root,
+        &NpmVersion::new(0, 0, 0),
+        &pkg.canonical_name(),
+        &pkg,
+        range,
+    );
     let chosen = provider.choose_version(&pkg, &range).unwrap();
 
     assert_eq!(
-        chosen.map(|version| version.to_string()),
+        chosen.as_ref().map(|version| version.to_string()),
         Some("2.0.0".to_string())
     );
-    assert!(provider.overrides.take_hits().is_empty());
+    assert!(selected_hits(&provider, &pkg, chosen.as_ref()).is_empty());
 }
 
 #[test]
-fn choose_version_path_selector_only_applies_to_matching_parent() {
+fn edge_override_path_selector_only_applies_to_matching_parent() {
     // Path selector `baz>qar@1` should ONLY apply when `qar` is
     // reached through `baz` AND the natural version satisfies `^1.0.0`.
     // The split mechanism gives us per-parent identities (`qar[baz]` vs
@@ -1241,9 +1295,18 @@ fn choose_version_path_selector_only_applies_to_matching_parent() {
 
     // Through `baz`: natural is 1.5.0; selector range filter `1`
     // (= ^1.0.0) matches 1.5.0 → override forces 1.1.0.
-    let chosen_baz = provider.choose_version(&qar_baz, &consumer_range).unwrap();
+    let baz = ResolverPackage::npm("baz");
+    let baz_version = NpmVersion::new(1, 0, 0);
+    let effective = provider.effective_dependency_range(
+        &baz,
+        &baz_version,
+        "qar",
+        &qar_baz,
+        consumer_range.clone(),
+    );
+    let chosen_baz = provider.choose_version(&qar_baz, &effective).unwrap();
     assert_eq!(
-        chosen_baz.map(|v| v.to_string()),
+        chosen_baz.as_ref().map(|v| v.to_string()),
         Some("1.1.0".to_string()),
         "qar via baz should be forced to the override target 1.1.0"
     );
@@ -1260,11 +1323,14 @@ fn choose_version_path_selector_only_applies_to_matching_parent() {
     );
 
     // Drain the apply trace — only the baz hit should be recorded.
-    let hits = provider.overrides.take_hits();
+    let mut solution = pubgrub::Map::default();
+    solution.insert(baz, baz_version);
+    solution.insert(qar_baz, chosen_baz.unwrap());
+    let hits = provider.selected_override_hits(&solution);
     assert_eq!(hits.len(), 1, "only the baz path should record a hit");
     assert_eq!(hits[0].package, "qar");
     assert_eq!(hits[0].via_parent, Some("baz".to_string()));
-    assert_eq!(hits[0].from_version, "1.5.0");
+    assert_eq!(hits[0].from_version.as_deref(), Some("1.5.0"));
     assert_eq!(hits[0].to_version, "1.1.0");
 }
 
@@ -2309,4 +2375,67 @@ fn blocking_pool_saturation_smoke_max_2_threads() {
             .await
             .expect("blocking-pool must not deadlock on cache-hit fast-path");
     });
+}
+
+#[path = "tests/override_constraints.rs"]
+mod override_constraints;
+
+#[test]
+fn cache_refresh_recomputes_ranges_and_tags_in_all_contexts() {
+    let pkg = ResolverPackage::npm("refreshed");
+    let split = pkg.with_context("parent");
+    let old = parse_metadata_to_cache_info(
+        &serde_json::from_value(serde_json::json!({
+            "name": "refreshed", "dist-tags": {"beta":"1.0.0"},
+            "versions": {"1.0.0": {"name":"refreshed", "version":"1.0.0"}}
+        }))
+        .unwrap(),
+    );
+    let provider = make_provider_with_cache(HashMap::new(), vec![(pkg.clone(), old)]);
+    let range = NpmRange::parse("^1").unwrap();
+    let tag = NpmRange::parse_registry_spec("beta").unwrap();
+    for package in [&pkg, &split] {
+        let available = provider.available_versions(package);
+        provider.to_pubgrub_ranges_cached(package, &range, &available);
+        provider.to_pubgrub_ranges_cached(package, &tag, &available);
+    }
+    let fresh = parse_metadata_to_cache_info(
+        &serde_json::from_value(serde_json::json!({
+            "name": "refreshed", "dist-tags": {"beta":"2.0.0"},
+            "versions": {
+                "1.0.0": {"name":"refreshed", "version":"1.0.0"},
+                "1.5.0": {"name":"refreshed", "version":"1.5.0"},
+                "2.0.0": {"name":"refreshed", "version":"2.0.0"}
+            }
+        }))
+        .unwrap(),
+    );
+    provider.insert_and_notify(CanonicalKey::from(&pkg), fresh);
+    for package in [&pkg, &split] {
+        let available = provider.available_versions(package);
+        assert!(
+            provider
+                .to_pubgrub_ranges_cached(package, &range, &available)
+                .contains(&NpmVersion::new(1, 5, 0))
+        );
+        assert_eq!(
+            provider.to_pubgrub_ranges_cached(package, &tag, &available),
+            Ranges::singleton(NpmVersion::new(2, 0, 0))
+        );
+    }
+}
+
+#[test]
+fn cache_refresh_from_shared_walker_recomputes_available_versions() {
+    let pkg = ResolverPackage::npm("refreshed");
+    let provider = make_provider_with_cache(
+        HashMap::new(),
+        vec![(pkg.clone(), make_info(&["1.0.0"], vec![], vec![], vec![]))],
+    );
+    assert_eq!(provider.available_versions(&pkg).len(), 1);
+    provider.cache.insert(
+        CanonicalKey::from(&pkg),
+        Arc::new(make_info(&["2.0.0", "1.0.0"], vec![], vec![], vec![])),
+    );
+    assert_eq!(provider.available_versions(&pkg).len(), 2);
 }

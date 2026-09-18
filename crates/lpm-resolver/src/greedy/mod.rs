@@ -212,22 +212,14 @@ pub fn experimental_select_version_with_policy_and_overrides_outcome(
     }
 
     let natural = match &natural_pick {
-        version::VersionPick::Picked(version) => version.clone(),
-        version::VersionPick::NoSatisfying
-        | version::VersionPick::BlockedByReleaseAge { .. }
-        | version::VersionPick::BlockedByTrustPolicy { .. } => {
-            return ExperimentalVersionSelectionOutcome {
-                selection: natural_pick.into(),
-                override_hit: None,
-                override_selected: false,
-            };
-        }
+        version::VersionPick::Picked(version) => Some(version),
+        _ => None,
     };
-
     let canonical_name = canonical.to_string();
-    let Some(entry) = overrides.find_match(&canonical_name, &natural, parent_canonical) else {
+    let Some(entry) = overrides.find_match_optional(&canonical_name, natural, parent_canonical)
+    else {
         return ExperimentalVersionSelectionOutcome {
-            selection: ExperimentalVersionSelection::Picked(natural),
+            selection: natural_pick.into(),
             override_hit: None,
             override_selected: false,
         };
@@ -235,19 +227,13 @@ pub fn experimental_select_version_with_policy_and_overrides_outcome(
     let Some(forced) = policy::apply_override_target_greedy(canonical, info, &entry.target, policy)
     else {
         return ExperimentalVersionSelectionOutcome {
-            selection: ExperimentalVersionSelection::Picked(natural),
+            selection: natural_pick.into(),
             override_hit: None,
             override_selected: false,
         };
     };
-    let hit = (forced != natural).then(|| OverrideHit {
-        raw_key: entry.raw_key.clone(),
-        source: entry.source,
-        package: canonical_name,
-        from_version: natural.to_string(),
-        to_version: forced.to_string(),
-        via_parent: parent_canonical.map(str::to_string),
-    });
+    let hit =
+        OverrideHit::changed_selection(entry, canonical_name, natural, &forced, parent_canonical);
     ExperimentalVersionSelectionOutcome {
         selection: ExperimentalVersionSelection::Picked(forced),
         override_hit: hit,

@@ -687,7 +687,7 @@ pub(super) fn emit_online_install_report(input: OnlineInstallReportInput<'_>) {
                     Some(parent) => crate::install_ui::terminal_line!(
                         "   {} {} → {} (via {}, reached through {})",
                         install_ui::bold(&hit.package),
-                        install_ui::dim(&hit.from_version),
+                        install_ui::dim(hit.from_version.as_deref().unwrap_or("unresolved")),
                         install_ui::bold(&hit.to_version),
                         &source_ref,
                         install_ui::bold(parent),
@@ -695,7 +695,7 @@ pub(super) fn emit_online_install_report(input: OnlineInstallReportInput<'_>) {
                     None => crate::install_ui::terminal_line!(
                         "   {} {} → {} (via {})",
                         install_ui::bold(&hit.package),
-                        install_ui::dim(&hit.from_version),
+                        install_ui::dim(hit.from_version.as_deref().unwrap_or("unresolved")),
                         install_ui::bold(&hit.to_version),
                         &source_ref,
                     ),

@@ -28,6 +28,9 @@
 
 mod support;
 
+#[path = "install_overrides/rescue.rs"]
+mod rescue;
+
 use support::mock_registry::{MockRegistry, compute_integrity, make_tarball};
 use support::{TempProject, lpm, lpm_with_registry};
 
