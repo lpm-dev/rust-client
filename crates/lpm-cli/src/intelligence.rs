@@ -15,9 +15,15 @@ use cap_fs_ext::OpenOptionsExt as _;
 use cap_fs_ext::{DirExt as _, FollowSymlinks, OpenOptionsFollowExt as _};
 use cap_std::fs::{Dir, OpenOptions};
 use oxc_allocator::Allocator;
-use oxc_ast::ast::{CallExpression, Expression, ImportExpression};
+use oxc_ast::ast::{
+    CallExpression, Expression, ImportExpression, TSImportEqualsDeclaration, TSImportType,
+    TSModuleReference,
+};
 use oxc_ast_visit::Visit;
-use oxc_ast_visit::walk::{walk_call_expression, walk_import_expression};
+use oxc_ast_visit::walk::{
+    walk_call_expression, walk_import_expression, walk_ts_import_equals_declaration,
+    walk_ts_import_type,
+};
 use oxc_parser::Parser;
 use oxc_span::SourceType;
 
@@ -34,6 +40,8 @@ pub struct SourceImport {
     pub line: usize,
     /// The package name extracted from the specifier (bare specifier only)
     pub package_name: Option<String>,
+    /// Whether this is a TypeScript reference to a type provider.
+    pub type_reference: bool,
 }
 
 /// Scan all source files in a project for import/require statements.
@@ -93,13 +101,53 @@ pub fn scan_source_imports_checked(project_dir: &Path) -> io::Result<Vec<SourceI
     scan_source_imports_with_limits(project_dir, SourceScanLimits::default())
 }
 
+/// Scan dependency usage throughout one package, including type declarations.
+pub(crate) fn scan_dependency_imports_checked(
+    project_dir: &Path,
+    skip_path: &dyn Fn(&Path, bool) -> bool,
+    entrypoints: &[String],
+) -> io::Result<Vec<SourceImport>> {
+    scan_source_imports_with_options(
+        project_dir,
+        SourceScanLimits::default(),
+        SourceScanOptions {
+            all_sources: true,
+            include_declarations: true,
+            skip_path: Some(skip_path),
+            entrypoints,
+        },
+    )
+}
+
+type SourcePathFilter<'a> = &'a dyn Fn(&Path, bool) -> bool;
+
+#[derive(Default)]
+struct SourceScanOptions<'a> {
+    all_sources: bool,
+    include_declarations: bool,
+    skip_path: Option<SourcePathFilter<'a>>,
+    entrypoints: &'a [String],
+}
+
 fn scan_source_imports_with_limits(
     project_dir: &Path,
     limits: SourceScanLimits,
 ) -> io::Result<Vec<SourceImport>> {
+    scan_source_imports_with_options(project_dir, limits, SourceScanOptions::default())
+}
+
+fn scan_source_imports_with_options(
+    project_dir: &Path,
+    limits: SourceScanLimits,
+    options: SourceScanOptions<'_>,
+) -> io::Result<Vec<SourceImport>> {
     let project = Dir::open_ambient_dir(project_dir, cap_std::ambient_authority())
         .map_err(|source| scan_io_error("open project directory", project_dir, source))?;
-    let aliases = ProjectAliases::load(project_dir);
+    let aliases = if options.include_declarations {
+        ProjectAliases::load_checked(project_dir)?
+    } else {
+        ProjectAliases::load(project_dir)
+    };
     let mut state = SourceScanState {
         project_dir,
         aliases: &aliases,
@@ -109,7 +157,12 @@ fn scan_source_imports_with_limits(
         entries: 0,
         imports: Vec::with_capacity(128),
         parser_allocator: Allocator::default(),
+        options,
     };
+    if state.options.all_sources {
+        scan_dir(&project, Path::new(""), true, 0, &mut state)?;
+        return Ok(state.imports);
+    }
     let mut found_source_root = false;
 
     for candidate in ["src", "app", "pages", "components", "lib"] {
@@ -154,12 +207,14 @@ struct SourceScanState<'a> {
     entries: usize,
     imports: Vec<SourceImport>,
     parser_allocator: Allocator,
+    options: SourceScanOptions<'a>,
 }
 
 /// Recursively scan a directory for source files.
 ///
 /// At the project root, its own `package.json` is the manifest being checked,
-/// not a boundary. Every nested directory containing `package.json` is opaque.
+/// not a boundary. Nested packages are opaque unless a published entrypoint
+/// explicitly points into them during dependency analysis.
 fn scan_dir(
     directory: &Dir,
     relative_dir: &Path,
@@ -182,7 +237,12 @@ fn scan_dir(
     ];
 
     let display_dir = state.project_dir.join(relative_dir);
-    if !is_project_root {
+    let contains_entrypoint = state
+        .options
+        .entrypoints
+        .iter()
+        .any(|entry| Path::new(entry).starts_with(relative_dir));
+    if !is_project_root && !contains_entrypoint {
         match directory.symlink_metadata("package.json") {
             Ok(_) => return Ok(()),
             Err(source) if source.kind() == io::ErrorKind::NotFound => {}
@@ -232,11 +292,26 @@ fn scan_dir(
             .symlink_metadata(&name)
             .map_err(|source| scan_io_error("inspect source entry", &display_path, source))?;
 
+        if state
+            .options
+            .skip_path
+            .is_some_and(|skip| skip(&path, metadata.is_dir()))
+        {
+            continue;
+        }
         if metadata.is_symlink() {
             continue;
         }
         if metadata.is_dir() {
-            if SKIP_DIRS.contains(&name_str.as_ref()) || name_str.starts_with('.') {
+            let published_output = matches!(name_str.as_ref(), "dist" | "build")
+                && state
+                    .options
+                    .entrypoints
+                    .iter()
+                    .any(|entry| Path::new(entry).starts_with(&path));
+            if (SKIP_DIRS.contains(&name_str.as_ref()) && !published_output)
+                || name_str.starts_with('.')
+            {
                 continue;
             }
             let child = directory.open_dir_nofollow(&name).map_err(|source| {
@@ -247,7 +322,7 @@ fn scan_dir(
                 )
             })?;
             scan_dir(&child, &path, false, depth + 1, state)?;
-        } else if metadata.is_file() && is_runtime_source_file(&path) {
+        } else if metadata.is_file() && is_source_file(&path, state.options.include_declarations) {
             scan_file(directory, &name, &path, metadata.len(), state)?;
         }
     }
@@ -255,13 +330,14 @@ fn scan_dir(
     Ok(())
 }
 
-fn is_runtime_source_file(path: &Path) -> bool {
+fn is_source_file(path: &Path, include_declarations: bool) -> bool {
     let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
         return false;
     };
-    if file_name.ends_with(".d.ts")
-        || file_name.ends_with(".d.cts")
-        || file_name.ends_with(".d.mts")
+    if !include_declarations
+        && (file_name.ends_with(".d.ts")
+            || file_name.ends_with(".d.cts")
+            || file_name.ends_with(".d.mts"))
     {
         return false;
     }
@@ -399,22 +475,40 @@ fn scan_file(
     );
     for (specifier, occurrences) in &parsed.module_record.requested_modules {
         for occurrence in occurrences {
-            found.push((occurrence.statement_span.start, specifier.to_string()));
+            found.push((
+                occurrence.statement_span.start,
+                specifier.to_string(),
+                false,
+            ));
         }
     }
     let mut runtime_imports = RuntimeImportCollector {
         imports: Vec::with_capacity(parsed.module_record.dynamic_imports.len()),
+        include_types: state.options.include_declarations,
     };
     runtime_imports.visit_program(&parsed.program);
     found.extend(runtime_imports.imports);
-    found.sort_unstable_by_key(|(offset, _)| *offset);
+    if state.options.include_declarations {
+        for comment in &parsed.program.comments {
+            if comment.is_line() {
+                let span = comment.content_span();
+                if let Some(specifier) =
+                    type_reference_directive(&content[span.start as usize..span.end as usize])
+                {
+                    found.push((span.start, specifier.to_owned(), true));
+                }
+            }
+        }
+    }
+    found.sort_unstable_by_key(|(offset, _, _)| *offset);
     drop(parsed);
     state.parser_allocator.reset();
 
     let line_index = LineIndex::new(&content);
-    for (offset, specifier) in found {
+    for (offset, specifier, type_reference) in found {
         record_source_import(
             specifier,
+            type_reference,
             &display_path,
             line_index.line_number(offset),
             state,
@@ -425,14 +519,36 @@ fn scan_file(
 }
 
 struct RuntimeImportCollector {
-    imports: Vec<(u32, String)>,
+    imports: Vec<(u32, String, bool)>,
+    include_types: bool,
 }
 
 impl<'a> Visit<'a> for RuntimeImportCollector {
+    fn visit_ts_import_type(&mut self, import: &TSImportType<'a>) {
+        if self.include_types {
+            self.imports
+                .push((import.span.start, import.source.value.to_string(), false));
+        }
+        walk_ts_import_type(self, import);
+    }
+
+    fn visit_ts_import_equals_declaration(&mut self, import: &TSImportEqualsDeclaration<'a>) {
+        if self.include_types
+            && let TSModuleReference::ExternalModuleReference(reference) = &import.module_reference
+        {
+            self.imports.push((
+                import.span.start,
+                reference.expression.value.to_string(),
+                false,
+            ));
+        }
+        walk_ts_import_equals_declaration(self, import);
+    }
+
     fn visit_call_expression(&mut self, expression: &CallExpression<'a>) {
         if let Some(specifier) = expression.common_js_require() {
             self.imports
-                .push((expression.span.start, specifier.value.to_string()));
+                .push((expression.span.start, specifier.value.to_string(), false));
         }
         walk_call_expression(self, expression);
     }
@@ -440,10 +556,41 @@ impl<'a> Visit<'a> for RuntimeImportCollector {
     fn visit_import_expression(&mut self, expression: &ImportExpression<'a>) {
         if let Expression::StringLiteral(specifier) = &expression.source {
             self.imports
-                .push((expression.span.start, specifier.value.to_string()));
+                .push((expression.span.start, specifier.value.to_string(), false));
         }
         walk_import_expression(self, expression);
     }
+}
+
+fn type_reference_directive(comment: &str) -> Option<&str> {
+    let mut attributes = comment
+        .strip_prefix('/')?
+        .trim_start()
+        .strip_prefix("<reference")?;
+    if !attributes.starts_with(char::is_whitespace) {
+        return None;
+    }
+    while !attributes.trim_start().starts_with(['/', '>']) {
+        attributes = attributes.trim_start();
+        let name_end = attributes.find(|ch: char| ch == '=' || ch.is_whitespace())?;
+        let name = &attributes[..name_end];
+        attributes = attributes[name_end..]
+            .trim_start()
+            .strip_prefix('=')?
+            .trim_start();
+        let quote = attributes.chars().next()?;
+        if !matches!(quote, '\'' | '"') {
+            return None;
+        }
+        attributes = &attributes[1..];
+        let value_end = attributes.find(quote)?;
+        let value = &attributes[..value_end];
+        if name == "types" {
+            return Some(value);
+        }
+        attributes = &attributes[value_end + 1..];
+    }
+    None
 }
 
 struct LineIndex {
@@ -468,6 +615,7 @@ impl LineIndex {
 
 fn record_source_import(
     specifier: String,
+    type_reference: bool,
     path: &Path,
     line: usize,
     state: &mut SourceScanState<'_>,
@@ -476,9 +624,12 @@ fn record_source_import(
     {
         return Ok(());
     }
-    let Some(package_name) = extract_package_name(&specifier) else {
+    let package_name = extract_package_name(&specifier);
+    if package_name.is_none()
+        && !(state.options.include_declarations && specifier.starts_with("node:"))
+    {
         return Ok(());
-    };
+    }
     if state.imports.len() >= state.limits.max_imports {
         return Err(scan_limit_error(
             "import finding",
@@ -490,7 +641,8 @@ fn record_source_import(
         specifier,
         file: path.to_path_buf(),
         line,
-        package_name: Some(package_name),
+        package_name,
+        type_reference,
     });
     Ok(())
 }
@@ -527,7 +679,7 @@ fn scan_limit_error(kind: &str, limit: impl std::fmt::Display, path: &Path) -> i
 /// - `react/jsx-runtime` → `react`
 /// - `@types/node` → `@types/node`
 /// - `@scope/pkg/sub/path` → `@scope/pkg`
-fn extract_package_name(specifier: &str) -> Option<String> {
+pub(crate) fn extract_package_name(specifier: &str) -> Option<String> {
     // Reject protocol schemes — `bun:test`, `node:fs`, `npm:lodash`,
     // `data:...`, etc. Detected as a `:` before any `/`.
     if let Some(colon) = specifier.find(':') {
@@ -631,6 +783,39 @@ impl ProjectAliases {
 
         aliases.prefixes.sort_by_key(|p| std::cmp::Reverse(p.len()));
         aliases
+    }
+
+    fn load_checked(project_dir: &Path) -> io::Result<Self> {
+        let mut aliases = Self::default();
+        let read = |name: &str| {
+            let path = project_dir.join(name);
+            match lpm_common::read_text_regular_file_capped_with_metadata(
+                &path,
+                lpm_common::CONFIG_FILE_SIZE_CAP_BYTES,
+            ) {
+                Ok((content, _)) => Ok(Some(content)),
+                Err(lpm_common::BoundedReadError::NotFound { .. }) => Ok(None),
+                Err(error) => Err(io::Error::new(io::ErrorKind::InvalidData, error)),
+            }
+        };
+        for name in ["tsconfig.json", "jsconfig.json"] {
+            if let Some(content) = read(name)?
+                && absorb_ts_config(
+                    lpm_common::strip_utf8_bom_str(&content),
+                    project_dir,
+                    &mut aliases,
+                )
+            {
+                break;
+            }
+        }
+        if let Some(content) = read("lpm.config.json")? {
+            absorb_lpm_import_alias(lpm_common::strip_utf8_bom_str(&content), &mut aliases);
+        }
+        aliases
+            .prefixes
+            .sort_by_key(|prefix| std::cmp::Reverse(prefix.len()));
+        Ok(aliases)
     }
 
     /// Does this specifier match a user-declared alias?

@@ -1,6 +1,7 @@
 //! Workflow tests for `lpm tidy`.
 
 mod support;
+mod tidy_contract;
 
 use support::mock_registry::{MockRegistry, make_tarball};
 use support::{TempProject, lpm, lpm_with_registry};
