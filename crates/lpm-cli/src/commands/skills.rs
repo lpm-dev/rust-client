@@ -29,7 +29,7 @@ pub enum SkillsCmd {
     /// List package-published, LPM-managed, and externally discovered skills.
     #[command(visible_alias = "ls")]
     List(ListArgs),
-    /// Show source, security, context, and agent-target details for a skill.
+    /// Show details for a package skill set, managed skill, or external skill.
     View(ViewArgs),
     /// Open a local browser dashboard for inspecting and managing skills.
     #[command(visible_alias = "ui")]
@@ -135,7 +135,7 @@ pub struct DoctorArgs {
 
 #[derive(Debug, Args, Default)]
 pub struct ManageArgs {
-    /// Managed skill names. Omit only with `--all` in a TTY.
+    /// Managed skill names. Omit only with `--all`.
     #[arg(value_name = "SKILL")]
     pub selectors: Vec<String>,
     /// Restrict the operation to these agent targets.
@@ -1109,7 +1109,11 @@ struct PackageCleanPlan {
 }
 
 fn clean_skills(project_dir: &Path, args: CleanArgs, json_output: bool) -> Result<(), LpmError> {
-    let _lock = package::acquire_mutation_lock(project_dir)?;
+    let _lock = if args.dry_run {
+        None
+    } else {
+        Some(package::acquire_mutation_lock(project_dir)?)
+    };
     let skills_dir = project_dir.join(".lpm").join("skills");
     let plan = plan_package_clean(&skills_dir)?;
     if !json_output {

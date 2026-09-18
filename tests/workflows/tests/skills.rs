@@ -3001,3 +3001,6 @@ fn uninstall_preserves_locally_edited_package_skills() {
         "user changes\n"
     );
 }
+
+#[path = "skills/command_contract.rs"]
+mod command_contract;

@@ -1,3 +1,5 @@
+mod diff;
+
 use super::inventory::{
     DashboardAction, DirectoryAssessment, InventoryBatch, InventoryWarning, SecurityAssessment,
     SkillInventoryItem, SkillInventoryKind, SkillTarget, read_and_scan_directory, stable_id,
@@ -5,12 +7,14 @@ use super::inventory::{
 };
 use super::source::{self, DiscoveredSkill, SourceDescriptor, SourceTree};
 use super::{AgentTarget, ManageArgs, PruneArgs};
+use diff::bounded_diff;
 use lpm_common::{LpmError, LpmRoot};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
-use std::io::{IsTerminal, Read, Write};
+use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 #[cfg(test)]
 use std::cell::Cell;
@@ -368,6 +372,12 @@ fn plan_install_for_targets(
                 },
             );
         }
+
+        let enabled_agents: Vec<_> = target_records
+            .iter()
+            .filter_map(|(agent, target)| target.enabled.then_some(*agent))
+            .collect();
+        source::ensure_agents_are_compatible(&[skill], &enabled_agents)?;
 
         let mut targets = Vec::with_capacity(target_records.len());
         for (agent, target_record) in &target_records {
@@ -2014,9 +2024,11 @@ pub fn mutate(
 
 fn plan_mutation(
     project_dir: &Path,
-    args: ManageArgs,
+    mut args: ManageArgs,
     mutation: Mutation,
 ) -> Result<ManagedMutationPlan, LpmError> {
+    args.agent.sort_unstable();
+    args.agent.dedup();
     let store = Store::for_scope(
         if args.global {
             Scope::Global
@@ -2490,6 +2502,21 @@ pub(super) async fn plan_dashboard_update(
 }
 
 async fn plan_update(project_dir: &Path, args: ManageArgs) -> Result<ManagedUpdatePlan, LpmError> {
+    plan_update_with_loader(project_dir, args, |input| async move {
+        source::load_update(input, project_dir).await
+    })
+    .await
+}
+
+async fn plan_update_with_loader<F, Fut>(
+    project_dir: &Path,
+    args: ManageArgs,
+    mut load: F,
+) -> Result<ManagedUpdatePlan, LpmError>
+where
+    F: FnMut(source::UpdateSource) -> Fut,
+    Fut: std::future::Future<Output = Result<SourceTree, LpmError>>,
+{
     if !args.agent.is_empty() {
         return Err(LpmError::Registry(
             "`lpm skills update` refreshes shared managed content and all recorded targets; `--agent` cannot safely narrow an update"
@@ -2506,23 +2533,33 @@ async fn plan_update(project_dir: &Path, args: ManageArgs) -> Result<ManagedUpda
     )?;
     let state = load_state(&store)?;
     let names = select_record_names(&state, &args)?;
-    let mut updates = Vec::new();
+    let mut updates = Vec::with_capacity(names.len());
+    let mut sources: BTreeMap<
+        source::UpdateSource,
+        (Arc<SourceTree>, BTreeMap<String, DiscoveredSkill>),
+    > = BTreeMap::new();
     for name in names {
         let record = state.skills.get(&name).ok_or_else(|| {
             LpmError::Registry(format!("managed skill `{name}` is no longer present"))
         })?;
-        let input = update_input(&record.source);
-        let tree = source::load(&input, project_dir).await?;
-        let discovered = source::discover(&tree, true)?;
-        let skill = discovered
-            .into_iter()
-            .find(|skill| skill.name == record.name)
-            .ok_or_else(|| {
-                LpmError::Registry(format!(
-                    "updated source no longer contains managed skill `{}`",
-                    record.name
-                ))
-            })?;
+        let input = record.source.update_source();
+        if !sources.contains_key(&input) {
+            let tree = load(input.clone()).await?;
+            let discovered = source::discover(&tree, true)?
+                .into_iter()
+                .map(|skill| (skill.name.clone(), skill))
+                .collect();
+            sources.insert(input.clone(), (Arc::new(tree), discovered));
+        }
+        let (tree, discovered) = sources
+            .get(&input)
+            .ok_or_else(|| LpmError::Registry("managed source snapshot was not retained".into()))?;
+        let skill = discovered.get(&record.name).cloned().ok_or_else(|| {
+            LpmError::Registry(format!(
+                "updated source no longer contains managed skill `{}`",
+                record.name
+            ))
+        })?;
         let target_methods: BTreeMap<_, _> = record
             .targets
             .iter()
@@ -2530,11 +2567,9 @@ async fn plan_update(project_dir: &Path, args: ManageArgs) -> Result<ManagedUpda
                 target.enabled.then_some((*agent, target.materialization))
             })
             .collect();
-        let agents: Vec<_> = target_methods.keys().copied().collect();
-        source::ensure_agents_are_compatible(&[&skill], &agents)?;
-        let plan = plan_install_for_targets(&store, &tree, &[&skill], &target_methods)?;
+        let plan = plan_install_for_targets(&store, tree, &[&skill], &target_methods)?;
         let current = canonical_skill_text(&store.root.join(&record.canonical_dir))?;
-        let candidate = source_skill_text(&tree, &skill)?;
+        let candidate = source_skill_text(tree, &skill)?;
         let previous_findings = scan_canonical_findings(&store.root.join(&record.canonical_dir))?;
         let candidate_findings = discovered_finding_identities(&skill)?;
         let new_findings = candidate_findings
@@ -2542,7 +2577,7 @@ async fn plan_update(project_dir: &Path, args: ManageArgs) -> Result<ManagedUpda
             .cloned()
             .collect();
         updates.push(PendingUpdate {
-            tree,
+            tree: Arc::clone(tree),
             skill,
             plan,
             diff: bounded_diff(&current, &candidate),
@@ -2588,7 +2623,7 @@ pub(super) fn apply_update_plan(plan: ManagedUpdatePlan) -> Result<Vec<PlannedCh
 }
 
 struct PendingUpdate {
-    tree: SourceTree,
+    tree: Arc<SourceTree>,
     skill: DiscoveredSkill,
     plan: InstallPlan,
     diff: String,
@@ -2670,23 +2705,6 @@ fn print_update_preview(updates: &[PendingUpdate], changes: &[PlannedChange], js
     print_changes(changes, false);
 }
 
-const MAX_UPDATE_DIFF_CHARS: usize = 16 * 1024;
-
-fn bounded_diff(current: &str, candidate: &str) -> String {
-    let patch = diffy::create_patch(current, candidate).to_string();
-    if patch.len() <= MAX_UPDATE_DIFF_CHARS {
-        return patch;
-    }
-    let mut end = MAX_UPDATE_DIFF_CHARS;
-    while !patch.is_char_boundary(end) {
-        end -= 1;
-    }
-    format!(
-        "{}\n… diff truncated after {MAX_UPDATE_DIFF_CHARS} bytes",
-        &patch[..end]
-    )
-}
-
 fn source_skill_text(tree: &SourceTree, skill: &DiscoveredSkill) -> Result<String, LpmError> {
     let mut text = String::new();
     for (path, content) in tree.files.range(skill.directory.clone()..) {
@@ -2706,8 +2724,7 @@ fn canonical_skill_text(directory: &Path) -> Result<String, LpmError> {
     if !validate_canonical_directory(directory)? {
         return Ok(String::new());
     }
-    let mut files = BTreeMap::new();
-    collect_skill_text_files(directory, directory, &mut files)?;
+    let files = canonical_skill_files(directory)?;
     let mut text = String::new();
     for (relative, content) in files {
         append_skill_text(&mut text, &relative, &content);
@@ -2715,32 +2732,11 @@ fn canonical_skill_text(directory: &Path) -> Result<String, LpmError> {
     Ok(text)
 }
 
-fn collect_skill_text_files(
-    root: &Path,
-    directory: &Path,
-    files: &mut BTreeMap<PathBuf, String>,
-) -> Result<(), LpmError> {
-    for entry in std::fs::read_dir(directory)? {
-        let entry = entry?;
-        let path = entry.path();
-        let metadata = std::fs::symlink_metadata(&path)?;
-        if metadata.file_type().is_symlink() || !(metadata.is_file() || metadata.is_dir()) {
-            return Err(LpmError::Registry(format!(
-                "managed canonical content is not a regular directory tree: {}",
-                path.display()
-            )));
-        }
-        if metadata.is_dir() {
-            collect_skill_text_files(root, &path, files)?;
-            continue;
-        }
-        let relative = path
-            .strip_prefix(root)
-            .map_err(|_| LpmError::Registry("managed canonical content escaped its root".into()))?;
-        let content = display_skill_file_content(&std::fs::read(&path)?);
-        files.insert(relative.to_path_buf(), content);
-    }
-    Ok(())
+fn canonical_skill_files(directory: &Path) -> Result<BTreeMap<PathBuf, String>, LpmError> {
+    Ok(source::read_bounded_skill_directory(directory)?
+        .into_iter()
+        .map(|(path, content)| (path, display_skill_file_content(&content)))
+        .collect())
 }
 
 fn append_skill_text(destination: &mut String, relative: &Path, content: &str) {
@@ -2790,8 +2786,7 @@ fn scan_canonical_findings(directory: &Path) -> Result<BTreeSet<FindingIdentity>
     if !is_regular_directory(directory) {
         return Ok(BTreeSet::new());
     }
-    let mut files = BTreeMap::new();
-    collect_skill_text_files(directory, directory, &mut files)?;
+    let files = canonical_skill_files(directory)?;
     let mut findings = BTreeSet::new();
     for (path, content) in files {
         findings.extend(
@@ -2809,24 +2804,6 @@ fn scan_canonical_findings(directory: &Path) -> Result<BTreeSet<FindingIdentity>
     Ok(findings)
 }
 
-fn update_input(source: &SourceDescriptor) -> String {
-    match source {
-        SourceDescriptor::Github {
-            repository,
-            reference,
-            subpath,
-            ..
-        } if subpath.is_empty() => format!("https://github.com/{repository}/tree/{reference}"),
-        SourceDescriptor::Github {
-            repository,
-            reference,
-            subpath,
-            ..
-        } => format!("https://github.com/{repository}/tree/{reference}/{subpath}"),
-        SourceDescriptor::Local { path, .. } => path.clone(),
-    }
-}
-
 fn mutation_changes(
     store: &Store,
     state: &ManagedState,
@@ -2839,10 +2816,10 @@ fn mutation_changes(
         let record = state.skills.get(name).ok_or_else(|| {
             LpmError::Registry(format!("managed skill `{name}` is no longer present"))
         })?;
-        let selected_agents: Vec<_> = if agents.is_empty() {
+        let selected_agents: BTreeSet<_> = if agents.is_empty() {
             record.targets.keys().copied().collect()
         } else {
-            agents.to_vec()
+            agents.iter().copied().collect()
         };
         for agent in &selected_agents {
             if let Some(target) = record.targets.get(agent) {
@@ -2895,6 +2872,15 @@ fn preflight_mutation(
         } else {
             agents.to_vec()
         };
+        if matches!(mutation, Mutation::Enable) {
+            let skill = source::read_canonical_skill(&canonical, &record.source)?;
+            let recorded_agents: Vec<_> = selected_agents
+                .iter()
+                .copied()
+                .filter(|agent| record.targets.contains_key(agent))
+                .collect();
+            source::ensure_agents_are_compatible(&[&skill], &recorded_agents)?;
+        }
         for agent in selected_agents {
             let Some(target) = record.targets.get(&agent) else {
                 continue;
@@ -3228,49 +3214,11 @@ fn canonical_matches_skill(
         expected.insert(relative.to_path_buf(), Sha256::digest(content).to_vec());
     }
     let mut actual = BTreeMap::new();
-    collect_canonical_digests(directory, directory, &mut actual)?;
+    source::visit_bounded_skill_directory(directory, |path, content| {
+        actual.insert(path, Sha256::digest(&content).to_vec());
+        Ok(())
+    })?;
     Ok(actual == expected)
-}
-
-fn collect_canonical_digests(
-    root: &Path,
-    directory: &Path,
-    files: &mut BTreeMap<PathBuf, Vec<u8>>,
-) -> Result<(), LpmError> {
-    for entry in std::fs::read_dir(directory)? {
-        let entry = entry?;
-        let path = entry.path();
-        let metadata = std::fs::symlink_metadata(&path)?;
-        if metadata.file_type().is_symlink() || !(metadata.is_file() || metadata.is_dir()) {
-            return Err(LpmError::Registry(format!(
-                "managed canonical content is not a regular directory tree: {}",
-                path.display()
-            )));
-        }
-        if metadata.is_dir() {
-            collect_canonical_digests(root, &path, files)?;
-            continue;
-        }
-        let relative = path
-            .strip_prefix(root)
-            .map_err(|_| LpmError::Registry("managed canonical content escaped its root".into()))?;
-        files.insert(relative.to_path_buf(), digest_file(&path)?);
-    }
-    Ok(())
-}
-
-fn digest_file(path: &Path) -> Result<Vec<u8>, LpmError> {
-    let mut file = std::fs::File::open(path)?;
-    let mut digest = Sha256::new();
-    let mut buffer = [0_u8; 16 * 1024];
-    loop {
-        let read = file.read(&mut buffer)?;
-        if read == 0 {
-            break;
-        }
-        digest.update(&buffer[..read]);
-    }
-    Ok(digest.finalize().to_vec())
 }
 
 fn is_regular_directory(path: &Path) -> bool {
@@ -3403,6 +3351,125 @@ mod tests {
     fn write_state_unchecked(store: &Store, state: &ManagedState) {
         std::fs::create_dir_all(&store.root).unwrap();
         std::fs::write(store.state_path(), serde_json::to_vec(state).unwrap()).unwrap();
+    }
+
+    #[tokio::test]
+    async fn update_loads_and_discovers_each_source_snapshot_once() {
+        let project = tempfile::tempdir().unwrap();
+        let store = Store::for_scope(Scope::Project, project.path()).unwrap();
+        let mut tree = source_tree();
+        tree.files
+            .extend(source_tree_with("review", &"a".repeat(64), "Review the release notes.").files);
+        let skills = source::discover(&tree, false).unwrap();
+        for skill in &skills {
+            install_skill(&store, &tree, skill, &[AgentTarget::Codex], false).unwrap();
+        }
+        let calls = Cell::new(0);
+        let plan = plan_update_with_loader(
+            project.path(),
+            ManageArgs {
+                all: true,
+                ..Default::default()
+            },
+            |_| {
+                calls.set(calls.get() + 1);
+                let mut candidate = tree.clone();
+                candidate.descriptor = SourceDescriptor::Local {
+                    path: "/tmp/skills".into(),
+                    digest: format!("{:064x}", calls.get()),
+                };
+                std::future::ready(Ok(candidate))
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(calls.get(), 1);
+        assert_eq!(plan.updates.len(), 2);
+        assert!(Arc::ptr_eq(&plan.updates[0].tree, &plan.updates[1].tree));
+        assert_eq!(
+            plan.updates[0].tree.descriptor.revision(),
+            plan.updates[1].tree.descriptor.revision()
+        );
+        apply_update_plan(plan).unwrap();
+        assert_eq!(load_state(&store).unwrap().skills.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn update_keeps_different_references_and_subpaths_in_separate_snapshots() {
+        let project = tempfile::tempdir().unwrap();
+        let store = Store::for_scope(Scope::Project, project.path()).unwrap();
+        let mut candidates = BTreeMap::new();
+        for (name, reference, subpath) in [
+            ("main-guide", "main", ""),
+            ("dev-guide", "dev", ""),
+            ("nested-guide", "main", "nested"),
+            ("branch-guide", "main/nested", ""),
+        ] {
+            let mut tree = source_tree_with(name, "initial", "Use the guide.");
+            tree.descriptor = SourceDescriptor::Github {
+                repository: "owner/repo".into(),
+                reference: reference.into(),
+                commit: "a".repeat(40),
+                subpath: subpath.into(),
+            };
+            let skill = source::discover(&tree, true).unwrap().remove(0);
+            install_skill(&store, &tree, &skill, &[AgentTarget::Codex], false).unwrap();
+            let input = tree.descriptor.update_source();
+            if let SourceDescriptor::Github { commit, .. } = &mut tree.descriptor {
+                *commit = format!("{:040x}", candidates.len() + 1);
+            }
+            candidates.insert(input, tree);
+        }
+        let mut calls = BTreeSet::new();
+        let plan = plan_update_with_loader(
+            project.path(),
+            ManageArgs {
+                all: true,
+                ..Default::default()
+            },
+            |input| {
+                assert!(calls.insert(input.clone()), "loaded a source twice");
+                std::future::ready(Ok(candidates.get(&input).unwrap().clone()))
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(calls.len(), 4);
+        for update in plan.updates {
+            assert_eq!(
+                update.tree.descriptor.revision(),
+                candidates[&update.tree.descriptor.update_source()]
+                    .descriptor
+                    .revision()
+            );
+        }
+    }
+
+    #[test]
+    fn canonical_matching_rejects_oversized_files_before_hashing() {
+        let project = tempfile::tempdir().unwrap();
+        let tree = source_tree();
+        let skill = discovered_skill();
+        std::fs::write(
+            project.path().join("oversized.txt"),
+            vec![b'x'; 2 * 1024 * 1024],
+        )
+        .unwrap();
+        let error = canonical_matches_skill(&tree, &skill, project.path()).unwrap_err();
+        assert!(error.to_string().contains("byte limit"));
+    }
+
+    #[test]
+    fn canonical_matching_rejects_excessive_directory_depth() {
+        let project = tempfile::tempdir().unwrap();
+        let mut path = project.path().to_path_buf();
+        for _ in 0..14 {
+            path.push("nested");
+        }
+        std::fs::create_dir_all(path).unwrap();
+        let error = canonical_matches_skill(&source_tree(), &discovered_skill(), project.path())
+            .unwrap_err();
+        assert!(error.to_string().contains("nesting limit"));
     }
 
     #[test]

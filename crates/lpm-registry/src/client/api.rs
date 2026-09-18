@@ -451,7 +451,7 @@ impl RegistryClient {
 
     /// Get Agent Skills for a package.
     ///
-    /// Posture: `AuthRequired` — private package skills and publisher-only
+    /// Private package skills and publisher-only
     /// pending versions must follow the same principal as package metadata
     /// and tarball access.
     ///
@@ -469,7 +469,7 @@ impl RegistryClient {
         if let Some(v) = version {
             url.push_str(&format!("&version={}", urlencoding::encode(v)));
         }
-        self.execute_with_recovery(AuthPosture::PackageRead, || self.get_json(&url))
+        self.execute_with_package_access_recovery(|| self.get_json(&url))
             .await
     }
 
