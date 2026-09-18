@@ -127,7 +127,7 @@ pub(super) fn peer_conflict_json_value(report: &PeerConflictReport) -> serde_jso
     })
 }
 
-pub(super) fn peer_issues_json_value(
+pub(crate) fn peer_issues_json_value(
     peer_warnings: &[PeerWarning],
     peer_conflicts: &[PeerConflictReport],
 ) -> serde_json::Value {
