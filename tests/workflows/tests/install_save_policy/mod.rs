@@ -658,10 +658,7 @@ async fn mixed_local_and_swift_targets_fail_before_manifest_changes() {
     let other = r#"{"name":"other","version":"1.0.0"}"#;
     project.write_file("packages/app/package.json", &member);
     project.write_file("packages/other/package.json", other);
-    project.write_file(
-        "packages/shared/package.json",
-        &serde_json::json!({"name":name,"version":"1.0.0"}).to_string(),
-    );
+
     let output = lpm_with_registry_and_npm(&project, &registry.url())
         .env("LPM_TYPOSQUAT_GUARD", "0")
         .args([

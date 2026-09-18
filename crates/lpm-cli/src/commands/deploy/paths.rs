@@ -119,6 +119,12 @@ fn validate_output_dir(cwd: &Path, output_dir: &Path, force: bool) -> Result<Pat
                  Choose an output directory outside the workspace to prevent self-deploy loops."
             )));
         }
+        if workspace_canonical.starts_with(&output_canonical) {
+            return Err(LpmError::Script(format!(
+                "lpm deploy: output directory {output_dir:?} overlaps the workspace at {workspace_canonical:?}. \
+                 Choose a directory that does not contain the workspace."
+            )));
+        }
     }
 
     // Empty / force check. Non-existent paths are fine — the copy step
@@ -220,7 +226,9 @@ pub(in crate::commands::deploy) fn read_member_name(manifest_path: &Path) -> Str
     else {
         return fallback();
     };
-    let Ok(doc) = serde_json::from_str::<serde_json::Value>(&content) else {
+    let Ok(doc) =
+        serde_json::from_str::<serde_json::Value>(lpm_common::strip_utf8_bom_str(&content))
+    else {
         return fallback();
     };
     doc.get("name")

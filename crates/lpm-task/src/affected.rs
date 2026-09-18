@@ -6,7 +6,7 @@
 use crate::graph::WorkspaceGraph;
 use globset::{Glob, GlobSet, GlobSetBuilder};
 use std::collections::HashSet;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 /// Options for git-based workspace change detection.
@@ -100,16 +100,10 @@ pub fn find_affected_direct_sets_with_options(
     let test_matcher = compile_changed_files_test_patterns(options.test_patterns)?;
 
     // Collect all member relative paths for root-level detection
-    let member_paths: Vec<String> = graph
+    let member_paths: Vec<&Path> = graph
         .members
         .iter()
-        .map(|m| {
-            m.path
-                .strip_prefix(workspace_root)
-                .unwrap_or(&m.path)
-                .to_string_lossy()
-                .to_string()
-        })
+        .map(|m| m.path.strip_prefix(workspace_root).unwrap_or(&m.path))
         .collect();
 
     // Map changed files to workspace members
@@ -121,14 +115,11 @@ pub fn find_affected_direct_sets_with_options(
         let mut matched_any = false;
 
         for (idx, member_rel) in member_paths.iter().enumerate() {
-            if member_rel.is_empty() {
+            if member_rel.as_os_str().is_empty() {
                 continue;
             }
 
-            // Use directory boundary check: file must start with "member_path/"
-            // This prevents "packages/api-client/x.ts" matching "packages/api"
-            let member_with_sep = format!("{member_rel}/");
-            if file.starts_with(&member_with_sep) || file == member_rel.as_str() {
+            if file.starts_with(member_rel) {
                 record_change(&mut directly_changed, idx, change_type);
                 matched_any = true;
             }
@@ -213,9 +204,9 @@ pub fn find_affected_with_options(
 }
 
 fn filter_ignored_changed_files(
-    changed_files: Vec<String>,
+    changed_files: Vec<PathBuf>,
     ignore_patterns: &[String],
-) -> Result<Vec<String>, String> {
+) -> Result<Vec<PathBuf>, String> {
     if changed_files.is_empty() || ignore_patterns.is_empty() {
         return Ok(changed_files);
     }
@@ -267,7 +258,7 @@ fn compile_changed_files_test_patterns(patterns: &[String]) -> Result<Option<Glo
         .map_err(|e| format!("invalid test patterns: {e}"))
 }
 
-fn classify_changed_file(file: &str, test_matcher: Option<&GlobSet>) -> ChangeType {
+fn classify_changed_file(file: &Path, test_matcher: Option<&GlobSet>) -> ChangeType {
     match test_matcher {
         Some(matcher) if matcher.is_match(file) => ChangeType::Test,
         _ => ChangeType::Source,
@@ -295,7 +286,7 @@ fn record_root_change(root_change_type: &mut Option<ChangeType>, change_type: Ch
 }
 
 /// Get changed files from git diff relative to a base ref.
-fn git_diff_files(repo_dir: &Path, base_ref: &str) -> Result<Vec<String>, String> {
+fn git_diff_files(repo_dir: &Path, base_ref: &str) -> Result<Vec<PathBuf>, String> {
     if base_ref.is_empty() {
         return Err("base ref must not be empty".into());
     }
@@ -310,31 +301,48 @@ fn git_diff_files(repo_dir: &Path, base_ref: &str) -> Result<Vec<String>, String
     let output = Command::new("git")
         // base_ref in revision position (before `--`), `--` separates from pathspecs.
         // Flag injection prevented by the starts_with('-') check above.
-        .args(["diff", "--name-only", base_ref, "--"])
+        .args([
+            "diff",
+            "--name-only",
+            "--no-renames",
+            "-z",
+            "--relative",
+            base_ref,
+            "--",
+            ".",
+        ])
         .current_dir(repo_dir)
         .output()
         .map_err(|e| format!("failed to run git diff: {e}"))?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        // If the base ref doesn't exist, return empty (no changes detected)
-        if stderr.contains("unknown revision") || stderr.contains("bad revision") {
-            tracing::warn!(
-                "git base ref '{base_ref}' not found — treating as no changes. Check your --base flag."
-            );
-            return Ok(vec![]);
-        }
         return Err(format!("git diff failed: {stderr}"));
     }
 
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let files: Vec<String> = stdout
-        .lines()
-        .filter(|l| !l.is_empty())
-        .map(|l| l.to_string())
-        .collect();
+    output
+        .stdout
+        .split(|byte| *byte == 0)
+        .filter(|path| !path.is_empty())
+        .map(git_path)
+        .collect()
+}
 
-    Ok(files)
+#[cfg(unix)]
+#[expect(
+    clippy::unnecessary_wraps,
+    reason = "shares the fallible non-Unix decoding contract"
+)]
+fn git_path(bytes: &[u8]) -> Result<PathBuf, String> {
+    use std::os::unix::ffi::OsStrExt as _;
+    Ok(Path::new(std::ffi::OsStr::from_bytes(bytes)).to_path_buf())
+}
+
+#[cfg(not(unix))]
+fn git_path(bytes: &[u8]) -> Result<PathBuf, String> {
+    std::str::from_utf8(bytes)
+        .map(PathBuf::from)
+        .map_err(|_| "Git worktree path is not valid UTF-8".to_string())
 }
 
 #[cfg(test)]
@@ -476,14 +484,9 @@ mod tests {
     }
 
     #[test]
-    fn git_diff_with_bad_ref_returns_empty() {
+    fn git_diff_outside_repository_returns_error() {
         let dir = tempfile::tempdir().unwrap();
-        // Not a git repo, so this should handle gracefully
-        let result = git_diff_files(dir.path(), "nonexistent-branch");
-        // Either returns empty or an error — both are acceptable
-        if let Ok(files) = result {
-            assert!(files.is_empty())
-        }
+        assert!(git_diff_files(dir.path(), "nonexistent-branch").is_err());
     }
 
     // -- git flag injection --
@@ -565,7 +568,7 @@ mod tests {
             "git_diff_files should detect changes between feature and main"
         );
         assert!(
-            files.contains(&"packages/utils/src/index.js".to_string()),
+            files.contains(&PathBuf::from("packages/utils/src/index.js")),
             "should contain the changed file, got: {files:?}"
         );
     }

@@ -58,7 +58,7 @@ pub(in crate::commands::deploy) fn rewrite_workspace_protocol_in_deploy_manifest
             ))
         })?;
 
-    let mut doc: serde_json::Value = serde_json::from_str(&content)
+    let mut doc: serde_json::Value = serde_json::from_str(lpm_common::strip_utf8_bom_str(&content))
         .map_err(|e| LpmError::Script(format!("invalid package.json in deploy output: {e}")))?;
 
     let mut total_rewritten = 0;
@@ -149,7 +149,7 @@ pub(in crate::commands::deploy) fn strip_dev_dependencies_from_deploy_manifest(
             ))
         })?;
 
-    let mut doc: serde_json::Value = serde_json::from_str(&content)
+    let mut doc: serde_json::Value = serde_json::from_str(lpm_common::strip_utf8_bom_str(&content))
         .map_err(|e| LpmError::Script(format!("invalid package.json in deploy output: {e}")))?;
 
     let stripped_count = doc
@@ -190,7 +190,7 @@ pub(in crate::commands::deploy) fn read_manifest_value(
                     "deploy: failed to read manifest at {manifest_path:?}: {e}"
                 ))
             })?;
-    serde_json::from_str(&content)
+    serde_json::from_str(lpm_common::strip_utf8_bom_str(&content))
         .map_err(|e| LpmError::Script(format!("deploy: invalid package.json: {e}")))
 }
 
@@ -226,12 +226,28 @@ pub(in crate::commands::deploy) fn apply_dependency_selection_to_manifest_path(
     let mut doc = read_manifest_value(manifest_path)?;
     let mut stats = ManifestSelectionStats::default();
 
+    let optional_names: Vec<String> = doc
+        .get("optionalDependencies")
+        .and_then(|value| value.as_object())
+        .map(|deps| deps.keys().cloned().collect())
+        .unwrap_or_default();
+    for (section, count) in [
+        ("dependencies", &mut stats.production_dependencies_stripped),
+        ("devDependencies", &mut stats.dev_dependencies_stripped),
+    ] {
+        if let Some(deps) = doc.get_mut(section).and_then(|value| value.as_object_mut()) {
+            for name in &optional_names {
+                *count += usize::from(deps.remove(name).is_some());
+            }
+        }
+    }
+
     match mode {
         DependencyMode::Production => {
-            stats.dev_dependencies_stripped = remove_manifest_section(&mut doc, "devDependencies");
+            stats.dev_dependencies_stripped += remove_manifest_section(&mut doc, "devDependencies");
         }
         DependencyMode::Development => {
-            stats.production_dependencies_stripped =
+            stats.production_dependencies_stripped +=
                 remove_manifest_section(&mut doc, "dependencies");
             stats.optional_dependencies_stripped =
                 remove_manifest_section(&mut doc, "optionalDependencies");
@@ -241,6 +257,36 @@ pub(in crate::commands::deploy) fn apply_dependency_selection_to_manifest_path(
     if no_optional && matches!(mode, DependencyMode::Production) {
         stats.optional_dependencies_stripped =
             remove_manifest_section(&mut doc, "optionalDependencies");
+    }
+
+    if let Some(name) = doc
+        .get("name")
+        .and_then(|value| value.as_str())
+        .map(str::to_owned)
+    {
+        for section in ["dependencies", "optionalDependencies", "peerDependencies"] {
+            if let Some(spec) = doc
+                .get(section)
+                .and_then(|deps| deps.get(&name))
+                .and_then(|value| value.as_str())
+                && spec.starts_with("workspace:")
+            {
+                return Err(LpmError::Workspace(format!(
+                    "workspace member `{name}` depends on itself via {section}.{name} = `{spec}`"
+                )));
+            }
+        }
+        if let Some(deps) = doc
+            .get_mut("devDependencies")
+            .and_then(|value| value.as_object_mut())
+            && deps
+                .get(&name)
+                .and_then(|value| value.as_str())
+                .is_some_and(|spec| spec.starts_with("workspace:"))
+        {
+            deps.remove(&name);
+            stats.dev_dependencies_stripped += 1;
+        }
     }
 
     if stats.dev_dependencies_stripped > 0
@@ -261,36 +307,41 @@ pub(in crate::commands::deploy) fn apply_dependency_selection_to_deploy_manifest
     apply_dependency_selection_to_manifest_path(&output_dir.join("package.json"), mode, no_optional)
 }
 
-fn workspace_dep_names_for_package(
+fn workspace_dependencies_for_package(
     pkg: &lpm_workspace::PackageJson,
     mode: DependencyMode,
     no_optional: bool,
-) -> Vec<String> {
-    let mut names = Vec::with_capacity(
-        pkg.dependencies.len() + pkg.dev_dependencies.len() + pkg.optional_dependencies.len(),
-    );
-    match mode {
-        DependencyMode::Production => {
-            collect_workspace_dep_names(&pkg.dependencies, &mut names);
-            if !no_optional {
-                collect_workspace_dep_names(&pkg.optional_dependencies, &mut names);
-            }
-        }
-        DependencyMode::Development => {
-            collect_workspace_dep_names(&pkg.dev_dependencies, &mut names);
-        }
-    }
-    names.sort();
-    names.dedup();
-    names
-}
-
-fn collect_workspace_dep_names(deps: &HashMap<String, String>, names: &mut Vec<String>) {
-    for (name, spec) in deps {
-        if spec.starts_with("workspace:") {
-            names.push(name.clone());
+    catalogs: &HashMap<String, HashMap<String, String>>,
+) -> Result<Vec<(String, String)>, LpmError> {
+    let mut dependencies = match mode {
+        DependencyMode::Production => pkg.dependencies.clone(),
+        DependencyMode::Development => pkg
+            .dev_dependencies
+            .iter()
+            .filter(|(name, _)| Some(name.as_str()) != pkg.name.as_deref())
+            .map(|(name, spec)| (name.clone(), spec.clone()))
+            .collect(),
+    };
+    for (name, spec) in &pkg.optional_dependencies {
+        if !no_optional && matches!(mode, DependencyMode::Production) {
+            dependencies.insert(name.clone(), spec.clone());
+        } else {
+            dependencies.remove(name);
         }
     }
+    // Peers can require sources outside the selected installation roots.
+    // Resolve each section separately so an ordinary dependency does not hide
+    // a workspace peer declaration under the same name.
+    lpm_workspace::resolve_catalog_protocol(&mut dependencies, catalogs)
+        .map_err(|error| LpmError::Workspace(error.to_string()))?;
+    let mut peers = pkg.peer_dependencies.clone();
+    lpm_workspace::resolve_catalog_protocol(&mut peers, catalogs)
+        .map_err(|error| LpmError::Workspace(error.to_string()))?;
+    Ok(dependencies
+        .into_iter()
+        .chain(peers)
+        .filter(|(_, spec)| spec.starts_with("workspace:"))
+        .collect())
 }
 
 pub(in crate::commands::deploy) fn copy_workspace_dependency_closure(
@@ -308,62 +359,68 @@ pub(in crate::commands::deploy) fn copy_workspace_dependency_closure(
             )
         })?;
 
-    let members_by_name: HashMap<String, lpm_workspace::WorkspaceMember> = workspace
+    let mut members_by_name: HashMap<&str, (&lpm_workspace::PackageJson, &Path)> = workspace
         .members
         .iter()
-        .filter_map(|member| Some((member.package.name.as_deref()?.to_string(), member.clone())))
+        .filter_map(|member| {
+            Some((
+                member.package.name.as_deref()?,
+                (&member.package, member.path.as_path()),
+            ))
+        })
         .collect();
-    let root_member = members_by_name.get(root_member_name).ok_or_else(|| {
-        LpmError::Script(format!(
-            "deploy: selected member {root_member_name:?} was not found in the source workspace"
-        ))
-    })?;
+    if let Some(name) = workspace.root_package.name.as_deref() {
+        members_by_name.insert(name, (&workspace.root_package, workspace.root.as_path()));
+    }
 
-    let mut queue: VecDeque<String> =
-        workspace_dep_names_for_package(&root_member.package, mode, no_optional).into();
-    let mut selected = HashSet::new();
-    while let Some(name) = queue.pop_front() {
-        if name == root_member_name || !selected.insert(name.clone()) {
+    let mut queue = VecDeque::from([(root_member_name, mode)]);
+    let mut visited = HashSet::new();
+    while let Some((name, selection)) = queue.pop_front() {
+        if !visited.insert(name) {
             continue;
         }
-        let Some(member) = members_by_name.get(&name) else {
-            continue;
-        };
-        for child in workspace_dep_names_for_package(
-            &member.package,
-            DependencyMode::Production,
+        let (package, _) = members_by_name.get(name).ok_or_else(|| {
+            LpmError::Script(format!("deploy: workspace provider {name:?} was not found"))
+        })?;
+        for (dependency, spec) in workspace_dependencies_for_package(
+            package,
+            selection,
             no_optional,
-        ) {
-            if child != root_member_name && !selected.contains(&child) {
-                queue.push_back(child);
+            &workspace.root_package.catalogs,
+        )? {
+            let (provider, _) = members_by_name.get(dependency.as_str()).ok_or_else(|| {
+                LpmError::Script(format!(
+                    "deploy: {name:?} requires missing workspace provider {dependency:?}"
+                ))
+            })?;
+            lpm_workspace::validate_workspace_protocol_version(
+                &dependency,
+                &spec,
+                provider.version.as_deref().unwrap_or("0.0.0"),
+            )
+            .map_err(|error| LpmError::Script(format!("deploy: {error}")))?;
+            if !visited.contains(dependency.as_str()) {
+                let provider_name = provider
+                    .name
+                    .as_deref()
+                    .ok_or_else(|| LpmError::Workspace("workspace provider has no name".into()))?;
+                queue.push_back((provider_name, DependencyMode::Production));
             }
         }
     }
-
-    if selected.is_empty() {
-        return Ok((
-            0,
-            0,
-            CopyStats::default(),
-            ManifestSelectionStats::default(),
-        ));
-    }
-
-    let mut selected_names: Vec<String> = selected.into_iter().collect();
-    selected_names.sort();
-    let mut destination_by_name = HashMap::with_capacity(selected_names.len());
-    for name in &selected_names {
-        let member = members_by_name.get(name).ok_or_else(|| {
-            LpmError::Script(format!("deploy: workspace member {name:?} disappeared"))
-        })?;
-        let relative = pathdiff::diff_paths(&member.path, &workspace.root).ok_or_else(|| {
-            LpmError::Script(format!(
-                "deploy: failed to compute relative path for workspace member {name}"
-            ))
-        })?;
+    visited.remove(root_member_name);
+    let mut selected_names: Vec<&str> = visited.into_iter().collect();
+    selected_names.sort_unstable();
+    let mut destination_by_name = HashMap::with_capacity(selected_names.len() + 1);
+    destination_by_name.insert(root_member_name.to_string(), output_dir.to_path_buf());
+    // Sibling destinations prevent a nested provider copy from overwriting an
+    // earlier hardlink to the source workspace.
+    for (index, name) in selected_names.iter().enumerate() {
         destination_by_name.insert(
-            name.clone(),
-            output_dir.join(DEPLOY_WORKSPACE_DIR).join(relative),
+            (*name).to_string(),
+            output_dir
+                .join(DEPLOY_WORKSPACE_DIR)
+                .join(format!("provider-{index:06}")),
         );
     }
 
@@ -371,13 +428,13 @@ pub(in crate::commands::deploy) fn copy_workspace_dependency_closure(
     let mut selection_stats = ManifestSelectionStats::default();
     let mut workspace_spec_rewrites = 0;
     for name in &selected_names {
-        let member = members_by_name.get(name).ok_or_else(|| {
-            LpmError::Script(format!("deploy: workspace member {name:?} disappeared"))
+        let (_, source_dir) = members_by_name.get(name).ok_or_else(|| {
+            LpmError::Script(format!("deploy: workspace provider {name:?} disappeared"))
         })?;
         let destination = destination_by_name
-            .get(name)
-            .expect("destination map is complete");
-        let stats = copy_member_source(&member.path, destination)?;
+            .get(*name)
+            .ok_or_else(|| LpmError::Script(format!("deploy: missing destination for {name:?}")))?;
+        let stats = copy_member_source(source_dir, destination)?;
         copy_stats.files_copied += stats.files_copied;
         copy_stats.files_skipped += stats.files_skipped;
         copy_stats.bytes_copied += stats.bytes_copied;
@@ -389,13 +446,17 @@ pub(in crate::commands::deploy) fn copy_workspace_dependency_closure(
             no_optional,
         )?;
         selection_stats.add(&member_selection);
-        workspace_spec_rewrites +=
-            rewrite_workspace_specs_to_file_paths(&manifest_path, &destination_by_name)?;
+        workspace_spec_rewrites += rewrite_workspace_specs_to_file_paths(
+            &manifest_path,
+            &destination_by_name,
+            &workspace.root_package.catalogs,
+        )?;
     }
 
     workspace_spec_rewrites += rewrite_workspace_specs_to_file_paths(
         &output_dir.join("package.json"),
         &destination_by_name,
+        &workspace.root_package.catalogs,
     )?;
 
     Ok((
@@ -409,6 +470,7 @@ pub(in crate::commands::deploy) fn copy_workspace_dependency_closure(
 fn rewrite_workspace_specs_to_file_paths(
     manifest_path: &Path,
     destination_by_name: &HashMap<String, PathBuf>,
+    catalogs: &HashMap<String, HashMap<String, String>>,
 ) -> Result<usize, LpmError> {
     let mut doc = read_manifest_value(manifest_path)?;
     let manifest_dir = manifest_path.parent().ok_or_else(|| {
@@ -417,6 +479,7 @@ fn rewrite_workspace_specs_to_file_paths(
         ))
     })?;
     let mut rewritten = 0;
+    let mut catalogs_resolved = false;
 
     for section in REWRITE_DEP_SECTIONS {
         let Some(section_obj) = doc
@@ -425,6 +488,21 @@ fn rewrite_workspace_specs_to_file_paths(
         else {
             continue;
         };
+        let mut catalog_deps: HashMap<String, String> = section_obj
+            .iter()
+            .filter_map(|(name, value)| {
+                value
+                    .as_str()
+                    .filter(|spec| spec.starts_with("catalog:"))
+                    .map(|spec| (name.clone(), spec.to_string()))
+            })
+            .collect();
+        lpm_workspace::resolve_catalog_protocol(&mut catalog_deps, catalogs)
+            .map_err(|error| LpmError::Workspace(error.to_string()))?;
+        catalogs_resolved |= !catalog_deps.is_empty();
+        for (name, spec) in catalog_deps {
+            section_obj.insert(name, serde_json::Value::String(spec));
+        }
         let keys: Vec<String> = section_obj.keys().cloned().collect();
         for name in keys {
             let Some(raw_spec) = section_obj.get(&name).and_then(|value| value.as_str()) else {
@@ -442,12 +520,13 @@ fn rewrite_workspace_specs_to_file_paths(
                 ))
             })?;
             let relative = normalize_relative_path(&relative);
+            let relative = if relative.is_empty() { "." } else { &relative };
             section_obj.insert(name, serde_json::Value::String(format!("file:{relative}")));
             rewritten += 1;
         }
     }
 
-    if rewritten > 0 {
+    if rewritten > 0 || catalogs_resolved {
         write_manifest_value(manifest_path, &doc)?;
     }
 

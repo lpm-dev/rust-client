@@ -188,7 +188,7 @@ fn collect_registry_specs_from_deploy_manifests(
     let mut manifests = vec![output_dir.join("package.json")];
     let deploy_workspace = output_dir.join(DEPLOY_WORKSPACE_DIR);
     if deploy_workspace.exists() {
-        collect_package_manifests_recursive(&deploy_workspace, &mut manifests)?;
+        collect_provider_manifests(&deploy_workspace, &mut manifests)?;
     }
 
     for manifest in manifests {
@@ -221,10 +221,7 @@ fn collect_registry_specs_from_deploy_manifests(
     Ok(Some(specs))
 }
 
-fn collect_package_manifests_recursive(
-    dir: &Path,
-    manifests: &mut Vec<PathBuf>,
-) -> Result<(), LpmError> {
+fn collect_provider_manifests(dir: &Path, manifests: &mut Vec<PathBuf>) -> Result<(), LpmError> {
     for entry in std::fs::read_dir(dir)
         .map_err(|e| LpmError::Script(format!("deploy: failed to read {dir:?}: {e}")))?
     {
@@ -239,7 +236,8 @@ fn collect_package_manifests_recursive(
             if manifest.exists() {
                 manifests.push(manifest);
             }
-            collect_package_manifests_recursive(&path, manifests)?;
+            // Provider directories are disjoint direct children. Nested fixture
+            // manifests are package contents, not additional deploy providers.
         }
     }
     Ok(())

@@ -7,9 +7,7 @@ use super::paths::canonicalize_or_partial;
 
 /// Files and directories that are NEVER copied to the deploy output.
 ///
-/// Match by EXACT basename. The list is intentionally small and conservative
-/// —a future release may add a user-configurable extension via `package.json` or
-/// a `--exclude <glob>` flag.
+/// Exact basename exclusions supplement the `.env` prefix check in the walker.
 ///
 /// Categories:
 /// - **LPM internal state**: `node_modules`, `.lpm`, `lpm.lock`, `lpm.lockb`
@@ -27,15 +25,6 @@ const DEPLOY_DENY_BASENAMES: &[&str] = &[
     ".lpm",
     "lpm.lock",
     "lpm.lockb",
-    // Secrets — critical security boundary
-    ".env",
-    ".env.local",
-    ".env.development",
-    ".env.development.local",
-    ".env.production",
-    ".env.production.local",
-    ".env.test",
-    ".env.test.local",
     // Version control
     ".git",
     ".gitignore",
@@ -112,9 +101,10 @@ fn copy_member_source_recursive(
 
         // Apply the deny list at every level (not just root) so a nested
         // .env or node_modules anywhere under the source is excluded.
-        if DEPLOY_DENY_BASENAMES
-            .iter()
-            .any(|denied| *denied == basename_str.as_ref())
+        if basename.as_encoded_bytes().starts_with(b".env")
+            || DEPLOY_DENY_BASENAMES
+                .iter()
+                .any(|denied| *denied == basename_str.as_ref())
         {
             stats.files_skipped += 1;
             continue;

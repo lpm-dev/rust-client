@@ -834,9 +834,13 @@ fn catalog_save_targets_registry(
 pub(super) async fn resolve_catalog_policy_candidate_version(
     client: &RegistryClient,
     route_table: &RouteTable,
+    workspace: Option<&lpm_workspace::Workspace>,
     package: &str,
     requested_spec: &str,
 ) -> Result<lpm_semver::Version, LpmError> {
+    if let Some(version) = matching_workspace_version(workspace, package, requested_spec) {
+        return Ok(version);
+    }
     let resolved = if lpm_common::package_name::is_lpm_package(package) {
         let pkg_name = lpm_common::PackageName::parse(package)
             .map_err(|e| LpmError::Registry(e.to_string()))?;
@@ -874,6 +878,9 @@ pub(super) async fn preflight_catalog_policy_rejection(
     } else {
         "dependencies"
     };
+    let workspace =
+        lpm_workspace::discover_workspace(staged.pkg_json_path.parent().unwrap_or(Path::new(".")))
+            .map_err(|error| LpmError::Workspace(error.to_string()))?;
     for entry in &staged.entries {
         let manifest_spec = doc
             .get(dep_key)
@@ -897,6 +904,7 @@ pub(super) async fn preflight_catalog_policy_rejection(
             let resolved = resolve_catalog_policy_candidate_version(
                 client,
                 route_table,
+                workspace.as_ref(),
                 &entry.name,
                 &effective_spec,
             )
@@ -924,6 +932,7 @@ pub(super) async fn preflight_catalog_policy_rejection(
         let resolved = resolve_catalog_policy_candidate_version(
             client,
             route_table,
+            workspace.as_ref(),
             &entry.name,
             &effective_spec,
         )
@@ -1125,26 +1134,56 @@ fn selected_swift_install_locations(
     Ok(locations.into_iter().flatten().collect())
 }
 
+fn matching_workspace_version(
+    workspace: Option<&lpm_workspace::Workspace>,
+    name: &str,
+    spec: &str,
+) -> Option<lpm_semver::Version> {
+    let workspace = workspace?;
+    let package = workspace
+        .members
+        .iter()
+        .find(|member| member.package.name.as_deref() == Some(name))
+        .map(|member| &member.package)
+        .or_else(|| {
+            (workspace.root_package.name.as_deref() == Some(name))
+                .then_some(&workspace.root_package)
+        })?;
+    let lpm_resolver::Specifier::SemverRange(range) = lpm_resolver::Specifier::parse(spec).ok()?
+    else {
+        return None;
+    };
+    let version = package.version.as_deref().unwrap_or("0.0.0");
+    if lpm_resolver::NpmRange::parse(&range)
+        .ok()?
+        .satisfies(&lpm_resolver::NpmVersion::parse(version).ok()?)
+    {
+        lpm_semver::Version::parse(version).ok()
+    } else {
+        None
+    }
+}
+
 fn preserved_source_targets(
     packages: &[String],
     manifests: &[PathBuf],
     save_dev: bool,
+    save_flags: crate::save_spec::SaveFlags,
 ) -> Result<Vec<std::collections::HashSet<String>>, LpmError> {
-    let bare_scoped = packages
+    use crate::save_spec::UserSaveIntent;
+    let scoped_requests = packages
         .iter()
         .map(|spec| crate::save_spec::parse_user_save_intent(spec))
         .collect::<Result<Vec<_>, _>>()?
         .into_iter()
         .filter(|(name, intent)| {
-            name.starts_with("@lpm.dev/")
-                && matches!(intent, crate::save_spec::UserSaveIntent::Bare)
+            name.starts_with("@lpm.dev/") && !matches!(intent, UserSaveIntent::DistTag(_))
         })
-        .map(|(name, _)| name)
         .collect::<Vec<_>>();
     let mut sources = Vec::with_capacity(manifests.len());
     for path in manifests {
         let mut names = std::collections::HashSet::new();
-        if !bare_scoped.is_empty() {
+        if !scoped_requests.is_empty() {
             // Swift-only projects do not require a JavaScript manifest.
             let text = match read_manifest_text(path) {
                 Ok(text) => Some(text),
@@ -1152,21 +1191,37 @@ fn preserved_source_targets(
                 Err(error) => return Err(error),
             };
             if let Some(text) = text {
-                let doc: serde_json::Value = serde_json::from_str(&text)
-                    .map_err(|error| LpmError::Registry(error.to_string()))?;
-                let key = if save_dev {
-                    "devDependencies"
+                let package: lpm_workspace::PackageJson =
+                    serde_json::from_str(lpm_common::strip_utf8_bom_str(&text))
+                        .map_err(|error| LpmError::Registry(error.to_string()))?;
+                let workspace =
+                    lpm_workspace::discover_workspace(path.parent().unwrap_or(Path::new(".")))
+                        .map_err(|error| LpmError::Workspace(error.to_string()))?;
+                let policy = CatalogSavePolicy::from_package(
+                    workspace.as_ref().map_or(&package, |ws| &ws.root_package),
+                    None,
+                );
+                let dependencies = if save_dev {
+                    &package.dev_dependencies
                 } else {
-                    "dependencies"
+                    &package.dependencies
                 };
-                let policy =
-                    catalog_save_policy_for_project(path.parent().unwrap_or(Path::new(".")), None)?;
-                for name in &bare_scoped {
-                    if let Some(spec) = doc[key][name].as_str() {
-                        let effective = resolve_catalog_policy_manifest_spec(name, spec, &policy)?;
+                for (name, intent) in &scoped_requests {
+                    let mut effective = intent_to_range_string(intent);
+                    if matches!(intent, UserSaveIntent::Bare)
+                        && let Some(spec) = dependencies.get(name)
+                    {
+                        effective = resolve_catalog_policy_manifest_spec(name, spec, &policy)?;
                         if manifest_spec_has_source(name, &effective)? {
                             names.insert(name.clone());
+                            continue;
                         }
+                        if save_flags.forces_rewrite() {
+                            effective = STAGE_PLACEHOLDER.to_string();
+                        }
+                    }
+                    if matching_workspace_version(workspace.as_ref(), name, &effective).is_some() {
+                        names.insert(name.clone());
                     }
                 }
             }
@@ -1180,9 +1235,10 @@ fn validate_source_targets(
     packages: &[String],
     manifests: &[PathBuf],
     save_dev: bool,
+    save_flags: crate::save_spec::SaveFlags,
     expected: &[std::collections::HashSet<String>],
 ) -> Result<(), LpmError> {
-    if preserved_source_targets(packages, manifests, save_dev)? != expected {
+    if preserved_source_targets(packages, manifests, save_dev, save_flags)? != expected {
         return Err(LpmError::Registry(
             "dependency sources changed while preparing the install; retry the command".into(),
         ));
@@ -1337,12 +1393,12 @@ pub async fn run_add_packages(
     // First pass: check if any LPM packages are Swift ecosystem
     // Route Swift packages to SE-0292 registry mode
     let manifests = [project_dir.join("package.json")];
-    let source_targets = preserved_source_targets(&packages, &manifests, save_dev)?;
+    let source_targets = preserved_source_targets(&packages, &manifests, save_dev, save_flags)?;
     let (js_packages, swift_packages) =
         route_explicit_packages(client, &packages, save_flags, &source_targets).await?;
 
     let mutation = async {
-        validate_source_targets(&packages, &manifests, save_dev, &source_targets)?;
+        validate_source_targets(&packages, &manifests, save_dev, save_flags, &source_targets)?;
         let mut swift_transaction = None;
         let swift_report = if swift_packages.is_empty() {
             None
@@ -1719,8 +1775,12 @@ pub async fn run_install_filtered_add(
         json_output,
     )?;
     let requested_packages = reviewed.specs;
-    let source_targets =
-        preserved_source_targets(&requested_packages, &targets.member_manifests, save_dev)?;
+    let source_targets = preserved_source_targets(
+        &requested_packages,
+        &targets.member_manifests,
+        save_dev,
+        save_flags,
+    )?;
     let (js_packages, swift_packages) =
         route_explicit_packages(client, &requested_packages, save_flags, &source_targets).await?;
 
@@ -1757,6 +1817,7 @@ pub async fn run_install_filtered_add(
             &requested_packages,
             &targets.member_manifests,
             save_dev,
+            save_flags,
             &source_targets,
         )?;
         let swift_locations = selected_swift_install_locations(&targets.member_manifests)?;

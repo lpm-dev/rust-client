@@ -1,0 +1,36 @@
+---
+source: tests/workflows/tests/workspace_contract.rs
+assertion_line: 242
+expression: envelope
+---
+{
+  "success": true,
+  "dry_run": false,
+  "deployed": {
+    "member": "app",
+    "member_dir": "[MEMBER]",
+    "output_dir": "[OUTPUT]"
+  },
+  "copy_stats": {
+    "files_copied": 1,
+    "files_skipped": 0,
+    "bytes_copied": "[BYTES]"
+  },
+  "workspace_copy_stats": {
+    "members_copied": 0,
+    "files_copied": 0,
+    "files_skipped": 0,
+    "bytes_copied": 0
+  },
+  "workspace_protocol_rewrites": 0,
+  "dependency_mode": "production",
+  "optional_dependencies": true,
+  "dependencies_stripped": {
+    "dev": 0,
+    "production": 0,
+    "optional": 0
+  },
+  "pruned_lockfile_packages": 0,
+  "internal_symlinks_retargeted": 0,
+  "duration_ms": "[DURATION]"
+}
