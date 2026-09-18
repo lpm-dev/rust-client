@@ -92,6 +92,11 @@ pub async fn run_install_summary(
             "audit-after-install OSV scan did not complete: {reason}"
         )));
     }
+    if !scan.behavioral.coverage.complete {
+        return Err(LpmError::Script(
+            "audit-after-install source scan did not complete; run `lpm audit` to inspect coverage gaps".into(),
+        ));
+    }
 
     let registry_vulnerabilities = scan
         .results

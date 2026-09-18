@@ -161,6 +161,12 @@ fn scan_installed_packages(
         if let Some(limit) = result.limit_exceeded.or_else(|| budget.exceeded()) {
             return Err(secret_scan_limit_error(limit));
         }
+        if let Some(reason) = &result.incomplete_reason {
+            return Err(LpmError::Script(format!(
+                "secret scan incomplete for {}: {reason}; no clean result was reported",
+                package.name
+            )));
+        }
         if result.has_secrets() {
             packages_with_secrets.push((package.name, result));
         }
@@ -356,7 +362,17 @@ fn canonicalize_scannable_directory(
 ) -> Result<Option<PathBuf>, LpmError> {
     let canonical = match directory.canonicalize() {
         Ok(canonical) => canonical,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            match std::fs::symlink_metadata(directory) {
+                Err(missing) if missing.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+                _ => {
+                    return Err(LpmError::Script(format!(
+                        "failed to resolve installed package path {}: {error}",
+                        lpm_common::sanitize_terminal_inline(&directory.display().to_string())
+                    )));
+                }
+            }
+        }
         Err(error) => {
             return Err(LpmError::Script(format!(
                 "failed to resolve installed package path {}: {error}",

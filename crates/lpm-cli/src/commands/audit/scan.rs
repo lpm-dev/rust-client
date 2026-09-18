@@ -7,7 +7,7 @@ use super::behavior::{BehavioralSummary, package_result_key, run_behavioral_anal
 use super::discovery::{self, DiscoveryResult, ScanMode};
 use super::osv::{OsvVulnerability, collect_osv_queries, run_osv_queries};
 use super::policy::{AuditLevel, min_severity_level, severity_level};
-use super::registry::registry_audit_result;
+use super::registry::{registry_audit_result, validate_registry_version};
 use super::types::AuditResult;
 
 pub(super) struct AuditScan {
@@ -125,6 +125,7 @@ pub(super) async fn run_scan(
                     package.name, package.version,
                 ))
             })?;
+            validate_registry_version(&package.name, &package.version, version_metadata)?;
             checked_lpm += 1;
 
             let mut result =

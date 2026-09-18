@@ -6,7 +6,9 @@ use lpm_registry::{PackageMetadata, RegistryClient};
 use lpm_semver::Version;
 
 use crate::install_ui;
-use crate::npm_public_source::{NpmMetadataSource, locked_package_npm_metadata_source};
+use crate::npm_public_source::{
+    LockfileRootIndex, NpmMetadataSource, locked_package_npm_metadata_source,
+};
 
 use super::discovery::{self, ManagerKind};
 use super::osv::{OsvVulnerability, run_osv_scan};
@@ -73,8 +75,9 @@ async fn run_fix_inner(
             )));
         }
     };
-    let mut doc: serde_json::Value = serde_json::from_slice(&original_content)
-        .map_err(|e| LpmError::Script(format!("failed to parse package.json: {e}")))?;
+    let mut doc: serde_json::Value =
+        serde_json::from_slice(lpm_common::strip_utf8_bom_bytes(&original_content))
+            .map_err(|e| LpmError::Script(format!("failed to parse package.json: {e}")))?;
 
     let discovery = discovery::discover_packages_retaining_lpm_lockfile(project_dir)?;
     if discovery.manager != ManagerKind::Lpm {
@@ -116,11 +119,13 @@ async fn run_fix_inner(
 
     let mut planned = Vec::new();
     let mut skipped = Vec::new();
+    let root_index = LockfileRootIndex::new(Some(lockfile));
     for dep in audit_fix_direct_deps_from_value(&doc) {
         let target_name = dep.target_name.as_str();
         let locked_package = match select_installed_direct_locked_package(
             project_dir,
             lockfile,
+            &root_index,
             &dep.local_name,
             target_name,
         ) {
@@ -171,6 +176,19 @@ async fn run_fix_inner(
                 continue;
             }
         };
+        if let Some(installed) = metadata.version(installed_version)
+            && let Err(error) = super::registry::validate_registry_version(
+                target_name,
+                installed_version,
+                installed,
+            )
+        {
+            skipped.push(AuditFixSkipped {
+                name: dep.local_name,
+                reason: error.to_string(),
+            });
+            continue;
+        }
 
         let (target, vulnerability_ids) = if is_lpm_package {
             let Some(version_metadata) = metadata.version(installed_version) else {
@@ -373,24 +391,28 @@ fn audit_fix_completion(skipped: &[AuditFixSkipped]) -> Result<(), LpmError> {
 fn select_installed_direct_locked_package<'a>(
     project_dir: &Path,
     lockfile: &'a lpm_lockfile::Lockfile,
+    root_index: &LockfileRootIndex<'a>,
     local_name: &str,
     target_name: &str,
 ) -> Result<&'a lpm_lockfile::LockedPackage, String> {
     let manifest_path = installed_direct_manifest_path(project_dir, local_name)?;
-    let content =
-        lpm_common::read_file_capped(&manifest_path, lpm_common::CONFIG_FILE_SIZE_CAP_BYTES)
-            .map_err(|error| {
-                format!(
-                    "cannot read installed direct dependency {}: {error}",
-                    manifest_path.display()
-                )
-            })?;
-    let manifest: serde_json::Value = serde_json::from_slice(&content).map_err(|error| {
+    let content = lpm_common::read_text_file_capped_nofollow(
+        &manifest_path,
+        lpm_common::CONFIG_FILE_SIZE_CAP_BYTES,
+    )
+    .map_err(|error| {
         format!(
-            "installed direct dependency {} has invalid package.json: {error}",
+            "cannot read installed direct dependency {}: {error}",
             manifest_path.display()
         )
     })?;
+    let manifest: serde_json::Value =
+        serde_json::from_str(lpm_common::strip_utf8_bom_str(&content)).map_err(|error| {
+            format!(
+                "installed direct dependency {} has invalid package.json: {error}",
+                manifest_path.display()
+            )
+        })?;
     let installed_name = manifest
         .get("name")
         .and_then(serde_json::Value::as_str)
@@ -414,6 +436,22 @@ fn select_installed_direct_locked_package<'a>(
                 manifest_path.display()
             )
         })?;
+
+    if lockfile
+        .root_resolutions
+        .get(local_name)
+        .is_some_and(|root| root.instance_id.is_some())
+    {
+        let selected = root_index.root_package(local_name, target_name).ok_or_else(|| {
+            format!("installed direct dependency '{local_name}' has no matching exact root in lpm.lock")
+        })?;
+        if selected.version != installed_version || selected.name != installed_name {
+            return Err(format!(
+                "installed direct dependency {target_name}@{installed_version} does not match its exact lpm.lock root"
+            ));
+        }
+        return Ok(selected);
+    }
 
     let start = lockfile
         .packages
@@ -558,6 +596,11 @@ fn choose_audit_fix_target(
     candidates.sort();
     for candidate in candidates {
         let candidate_text = candidate.to_string();
+        let version = metadata.version(&candidate_text).ok_or_else(|| {
+            format!("registry metadata omitted canonical candidate {package}@{candidate_text}")
+        })?;
+        super::registry::validate_registry_version(package, &candidate_text, version)
+            .map_err(|error| error.to_string())?;
         let mut safe = true;
         for vulnerability in vulns {
             match vulnerability.affects_version(&candidate_text) {
@@ -592,19 +635,20 @@ fn choose_lpm_audit_fix_target(
         .filter(|version| !version.is_prerelease() && version > &installed)
         .collect();
     candidates.sort();
-    candidates
-        .into_iter()
-        .find(|candidate| {
-            metadata
-                .version(&candidate.to_string())
-                .is_some_and(|version| lpm_vulnerability_ids(version).is_empty())
-        })
-        .map(|version| version.to_string())
-        .ok_or_else(|| {
-            format!(
-                "registry has no verified non-vulnerable version of '{package}' newer than {installed_version}"
-            )
-        })
+    for candidate in candidates {
+        let candidate = candidate.to_string();
+        let Some(version) = metadata.version(&candidate) else {
+            continue;
+        };
+        super::registry::validate_registry_version(package, &candidate, version)
+            .map_err(|error| error.to_string())?;
+        if lpm_vulnerability_ids(version).is_empty() {
+            return Ok(candidate);
+        }
+    }
+    Err(format!(
+        "registry has no verified non-vulnerable version of '{package}' newer than {installed_version}"
+    ))
 }
 
 fn lpm_vulnerability_ids(metadata: &lpm_registry::VersionMetadata) -> Vec<String> {
@@ -702,11 +746,13 @@ async fn verify_audit_fixes(
 ) -> Result<(), LpmError> {
     let lockfile = crate::commands::install::workspace_lockfile::read_project(project_dir)
         .map_err(|error| LpmError::Script(format!("failed to verify updated lpm.lock: {error}")))?;
+    let root_index = LockfileRootIndex::new(Some(&lockfile));
 
     for fix in fixes.iter() {
         let installed = select_installed_direct_locked_package(
             project_dir,
             &lockfile,
+            &root_index,
             &fix.name,
             &fix.target_name,
         )
@@ -744,13 +790,15 @@ async fn verify_audit_fixes(
 
     for fix in fixes {
         if fix.target_name.starts_with("@lpm.dev/") {
-            let metadata = fetch_audit_fix_metadata(client, &fix.target_name, None).await?;
+            let name = PackageName::parse(&fix.target_name)?;
+            let metadata = client.refetch_package_metadata(&name).await?;
             let version = metadata.version(&fix.to).ok_or_else(|| {
                 LpmError::Script(format!(
                     "audit fix verification metadata omitted {}@{}",
                     fix.target_name, fix.to
                 ))
             })?;
+            super::registry::validate_registry_version(&fix.target_name, &fix.to, version)?;
             let remaining = lpm_vulnerability_ids(version);
             if !remaining.is_empty() {
                 return Err(LpmError::Script(format!(

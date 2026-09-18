@@ -34,6 +34,7 @@ fn secret_scan_human_renderer_uses_slim_lines_with_expected_content() {
         }],
         files_scanned: 1,
         limit_exceeded: None,
+        incomplete_reason: None,
     };
 
     let lines = format_secret_scan_human(&scan);
@@ -76,6 +77,7 @@ fn secret_scan_json_envelope_preserves_machine_fields() {
         }],
         files_scanned: 1,
         limit_exceeded: None,
+        incomplete_reason: None,
     };
 
     let json = secret_scan_json(&scan);

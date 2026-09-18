@@ -3,6 +3,39 @@ use lpm_security::query::PseudoClass;
 use super::behavior::behavioral_issue;
 use super::types::{AuditIssue, AuditResult};
 
+pub(super) fn validate_registry_version(
+    name: &str,
+    version: &str,
+    metadata: &lpm_registry::VersionMetadata,
+) -> Result<(), lpm_common::LpmError> {
+    if metadata.version != version {
+        return Err(lpm_common::LpmError::Registry(format!(
+            "inconsistent version metadata for {name}@{version}: entry declares {}",
+            metadata.version
+        )));
+    }
+    let severities = metadata
+        .security_findings
+        .iter()
+        .flatten()
+        .filter_map(|finding| finding.severity.as_deref())
+        .chain(
+            metadata
+                .vulnerabilities
+                .iter()
+                .flatten()
+                .filter_map(|vulnerability| vulnerability.severity.as_deref()),
+        );
+    for severity in severities {
+        if super::policy::severity_level(severity.trim()) == 0 {
+            return Err(lpm_common::LpmError::Registry(format!(
+                "unsupported audit severity {severity:?} for {name}@{version}"
+            )));
+        }
+    }
+    Ok(())
+}
+
 pub(super) fn registry_audit_result(
     name: &str,
     version: &str,
@@ -114,7 +147,7 @@ pub(super) fn collect_registry_issues(
             let summary = vuln.summary.as_deref().unwrap_or("");
             let severity = vuln.severity.as_deref().unwrap_or("moderate");
             issues.push(AuditIssue {
-                severity: severity.to_lowercase(),
+                severity: severity.trim().to_ascii_lowercase(),
                 message: format!(
                     "{id}{}",
                     if summary.is_empty() {

@@ -351,7 +351,7 @@ impl ManifestTransaction {
                     ),
                 ));
             }
-            let bytes = lpm_common::read_file_capped(path, lpm_common::CONFIG_FILE_SIZE_CAP_BYTES)
+            let bytes = lpm_common::read_file_capped(path, expected.len() as u64)
                 .map_err(std::io::Error::other)?;
             if bytes != *expected {
                 return Err(std::io::Error::new(
