@@ -785,6 +785,10 @@ pub fn check_unmet_peers(
             acc
         });
 
+    let resolved_by_id: HashMap<_, _> = resolved
+        .iter()
+        .map(|package| (package.resolution_id, package))
+        .collect();
     let mut warnings = Vec::new();
 
     for resolved_pkg in resolved {
@@ -811,18 +815,33 @@ pub fn check_unmet_peers(
             let tagged_version = parsed_range.as_ref().and_then(|range| {
                 target_info.and_then(|info| info.tagged_version_for_range(range))
             });
-            let resolved_peer_ver = resolve_peer_binding_version(
-                &resolved_pkg.package,
-                target_name,
-                parsed_range.as_ref(),
-                &resolved_versions,
-                tagged_version,
-            );
+            let resolved_peer_ver = if let Some(target) = resolved_pkg.peer_targets.get(peer_name) {
+                resolved_by_id
+                    .get(target)
+                    .filter(|provider| provider.package.canonical_name() == target_name)
+                    .map(|provider| {
+                        let version = provider.version.to_string();
+                        let satisfies =
+                            peer_version_satisfies(&version, parsed_range.as_ref(), tagged_version);
+                        (std::borrow::Cow::Owned(version), satisfies)
+                    })
+            } else {
+                resolve_peer_binding_version(
+                    &resolved_pkg.package,
+                    target_name,
+                    parsed_range.as_ref(),
+                    &resolved_versions,
+                    tagged_version,
+                )
+                .map(|(_, version, satisfies)| {
+                    (std::borrow::Cow::Borrowed(version.as_str()), satisfies)
+                })
+            };
 
             match resolved_peer_ver {
-                Some((_, resolved_ver, satisfies)) => {
+                Some((resolved_ver, satisfies)) => {
                     // Peer is in the tree — check if the resolved version satisfies the range
-                    let parsed_resolved = NpmVersion::parse(resolved_ver).ok();
+                    let parsed_resolved = NpmVersion::parse(&resolved_ver).ok();
 
                     if !satisfies {
                         // peerDependencyRules filter: allow_any
@@ -851,7 +870,7 @@ pub fn check_unmet_peers(
                             peer: peer_name.to_owned(),
                             target: target_name.to_owned(),
                             required_range: peer_range_str.to_owned(),
-                            resolved_version: Some(resolved_ver.clone()),
+                            resolved_version: Some(resolved_ver.into_owned()),
                         });
                     }
                 }

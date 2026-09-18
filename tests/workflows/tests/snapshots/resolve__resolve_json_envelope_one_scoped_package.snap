@@ -1,16 +1,38 @@
 ---
 source: tests/workflows/tests/resolve.rs
-assertion_line: 135
+assertion_line: 240
 expression: envelope
 ---
 {
   "success": true,
   "packages": [
     {
+      "id": 1,
       "package": "@lpm.dev/owner.react",
-      "version": "1.0.0"
+      "version": "1.0.0",
+      "context": null,
+      "dependencies": {},
+      "peers": {}
     }
   ],
+  "roots": [
+    {
+      "name": "@lpm.dev/owner.react",
+      "target": 1
+    }
+  ],
+  "ambient_peer_installs": [],
+  "peer_issues": {
+    "missing": [],
+    "bad": [],
+    "conflicts": [],
+    "intersections": [],
+    "missing_count": 0,
+    "bad_count": 0,
+    "conflicts_count": 0,
+    "intersections_count": 0,
+    "total_count": 0
+  },
   "count": 1,
   "elapsed_secs": "[elapsed]"
 }

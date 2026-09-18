@@ -3297,3 +3297,34 @@ fn validate_allowed_versions_range_uses_npm_range_grammar() {
         );
     }
 }
+
+#[test]
+fn peer_check_reports_the_exact_bound_provider_even_when_another_version_satisfies() {
+    let mut consumer =
+        resolved_pkg_with_graph("plugin", "1.0.0", None, &[], &[("react", "17.0.2")]);
+    let bound = resolved_pkg_with_graph("react", "17.0.2", None, &[], &[]);
+    let unrelated = resolved_pkg_with_graph("react", "18.2.0", None, &[], &[]);
+    consumer
+        .peer_targets
+        .insert("react".into(), bound.resolution_id);
+    let mut cache = HashMap::new();
+    cache.insert(
+        CanonicalKey::npm("plugin"),
+        make_cached_info(&["1.0.0"], vec![], vec![("1.0.0", vec![("react", "^18")])]),
+    );
+    cache.insert(
+        CanonicalKey::npm("react"),
+        make_cached_info(&["17.0.2", "18.2.0"], vec![], vec![]),
+    );
+    let warnings = check_unmet_peers(
+        &[consumer, bound, unrelated],
+        &cache,
+        &CompiledPeerRules::default(),
+    );
+    assert_eq!(
+        warnings.len(),
+        1,
+        "exact incompatible binding must not be hidden: {warnings:?}"
+    );
+    assert_eq!(warnings[0].resolved_version.as_deref(), Some("17.0.2"));
+}

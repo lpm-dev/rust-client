@@ -1,3 +1,4 @@
+mod resolve_contract;
 mod support;
 
 use support::mock_registry::{MockRegistry, compute_integrity, make_tarball};

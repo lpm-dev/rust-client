@@ -97,6 +97,7 @@ pub(crate) use manifest::{AddInstallOptions, run_add_packages, run_install_filte
 pub(crate) use manifest::{StagedKind, stage_packages_to_manifest};
 use package::*;
 use patches::*;
+pub(crate) use peer::peer_issues_json_value;
 use peer::*;
 use policy_extensions::{
     PolicyExtensionStats, load_policy_extension_configs,
