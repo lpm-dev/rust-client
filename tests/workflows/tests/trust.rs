@@ -6,6 +6,7 @@
 //! the human + JSON outputs and the mutated manifest state.
 
 mod support;
+mod trust_contract;
 
 use serde_json::json;
 use support::{
@@ -296,8 +297,9 @@ fn trust_diff_human_output_uses_slim_sections() {
     assert!(combined.contains("scriptHash"));
     assert!(combined.contains("sha256-old → sha256-new"));
     assert!(
-        combined
-            .contains("! 2 trust entries differ from the last install snapshot — lpm trust review"),
+        combined.contains(
+            "! 2 trust entries differ from the last install snapshot — review package.json"
+        ),
         "must show slim warning summary; got:\n{combined}"
     );
     assert!(

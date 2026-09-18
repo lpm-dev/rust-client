@@ -328,7 +328,8 @@ async fn run_diff(project_dir: &Path, json: bool, assert_none: bool) -> Result<(
             "lpm trust diff requires a package.json in the current directory.".into(),
         ));
     }
-    let pkg = lpm_workspace::read_package_json(&pkg_json_path)
+    let value = crate::commands::manifest_metadata::read_json_file(&pkg_json_path)?;
+    let pkg: lpm_workspace::PackageJson = serde_json::from_value(value)
         .map_err(|e| LpmError::Registry(format!("failed to read package.json: {e}")))?;
 
     let snapshot = trust_snapshot::read_snapshot(project_dir);
@@ -420,7 +421,7 @@ fn print_diff_human(entries: &[DiffEntry], snapshot: Option<&TrustSnapshot>) {
                 lpm_common::sanitize_terminal_inline(&s.captured_at),
             )),
             None => install_ui::warn(
-                "no prior snapshot found; this project has not been installed with LPM before",
+                "no prior snapshot found; this project has not been installed with LPM CLI before",
             ),
         }
         return;
@@ -435,13 +436,14 @@ fn print_diff_human(entries: &[DiffEntry], snapshot: Option<&TrustSnapshot>) {
     } else {
         "entries"
     };
-    let suffix = if snapshot.is_some() {
-        "differ from the last install snapshot"
-    } else {
-        "need review before the next install"
+    let suffix = match (snapshot.is_some(), entries.len() == 1) {
+        (true, true) => "differs from the last install snapshot",
+        (true, false) => "differ from the last install snapshot",
+        (false, true) => "needs review before the next install",
+        (false, false) => "need review before the next install",
     };
     install_ui::warn_untrusted(&format!(
-        "{} trust {entry_word} {suffix} — lpm trust review",
+        "{} trust {entry_word} {suffix} — review package.json",
         entries.len()
     ));
 }
@@ -571,6 +573,8 @@ async fn run_prune(
         ));
     }
 
+    let (_, stale) = load_prune_state(project_dir)?;
+
     if yes && !dry_run {
         let initial_workspace_root = discover_workspace_root(project_dir)?;
         return scope_project_policy_mutation_from(project_dir, initial_workspace_root, async {
@@ -579,7 +583,6 @@ async fn run_prune(
         .await;
     }
 
-    let (_, stale) = load_prune_state(project_dir)?;
     if stale.is_empty() {
         if json {
             print_prune_json(&stale, dry_run, false);
@@ -632,12 +635,9 @@ async fn run_prune(
 }
 
 fn load_prune_state(project_dir: &Path) -> Result<(serde_json::Value, Vec<String>), LpmError> {
+    let manifest =
+        crate::commands::manifest_metadata::read_json_file(&project_dir.join("package.json"))?;
     let installed_names = installed_names_from_lockfile(project_dir)?;
-    let pkg_json_path = project_dir.join("package.json");
-    let manifest_text =
-        lpm_common::read_text_file_capped(&pkg_json_path, lpm_common::CONFIG_FILE_SIZE_CAP_BYTES)?;
-    let manifest: serde_json::Value = serde_json::from_str(&manifest_text)
-        .map_err(|e| LpmError::Registry(format!("failed to parse package.json: {e}")))?;
     let trusted = extract_trusted_dependencies(&manifest)?;
     let stale = compute_stale_keys(&trusted, &installed_names);
     Ok((manifest, stale))

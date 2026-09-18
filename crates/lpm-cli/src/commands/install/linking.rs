@@ -790,7 +790,7 @@ pub(super) async fn run_link_and_finish(
             &lpm_workspace::TrustedDependencies::Legacy(Vec::new()),
             |l| &l.trusted_dependencies,
         ));
-        if let Err(e) = crate::trust_snapshot::write_snapshot(project_dir, &snap) {
+        if let Err(e) = crate::trust_snapshot::stage_install_snapshot(project_dir, snap) {
             tracing::warn!("failed to write trust-snapshot.json: {e}");
         }
         tracing::debug!(
