@@ -96,6 +96,20 @@ pub(super) fn post_parse_error(cli: &Cli) -> Option<clap::Error> {
         ));
     }
 
+    if let Some(Commands::Graph(args)) = &cli.command
+        && !matches!(args.format.as_str(), "tree" | "json")
+        && (cli.json || args.why.is_some())
+    {
+        let mut command = Cli::command();
+        let graph = command
+            .find_subcommand_mut("graph")
+            .expect("graph command must exist");
+        return Some(graph.error(
+            clap::error::ErrorKind::ArgumentConflict,
+            "--json and --why support only --format tree or --format json",
+        ));
+    }
+
     None
 }
 

@@ -162,11 +162,20 @@ impl DepGraph {
         }
 
         for (index, pkg) in packages.iter().enumerate() {
-            let registry = match pkg.source.as_deref() {
-                Some(s) if s.contains("lpm.dev") => Registry::Lpm,
-                Some(s) if s.contains("npmjs.org") => Registry::Npm,
-                _ => Registry::Unknown,
-            };
+            let registry = pkg
+                .source
+                .as_deref()
+                .and_then(|source| source.strip_prefix("registry+"))
+                .and_then(|source| reqwest::Url::parse(source).ok())
+                .map_or(Registry::Unknown, |url| {
+                    match (url.scheme(), url.host_str()) {
+                        ("http" | "https", Some("lpm.dev")) => Registry::Lpm,
+                        ("http" | "https", Some("npmjs.org" | "registry.npmjs.org")) => {
+                            Registry::Npm
+                        }
+                        _ => Registry::Unknown,
+                    }
+                });
 
             let mut dependencies = if pkg.instance_id.is_some() {
                 pkg.dependency_targets
@@ -185,7 +194,7 @@ impl DepGraph {
             dependencies.dedup();
 
             nodes.insert(
-                std::mem::take(&mut package_keys[index]),
+                package_keys[index].clone(),
                 DepNode {
                     name: pkg.name.clone(),
                     version: pkg.version.clone(),
@@ -306,7 +315,7 @@ impl DepGraph {
             let mut versions = HashSet::new();
             let mut path_count = 0usize;
             for (key, node) in &self.nodes {
-                if node.name != target_name {
+                if node.is_project_root || node.name != target_name {
                     continue;
                 }
                 let reachable_paths = path_counts.get(key.as_str()).copied().unwrap_or(0);
@@ -406,7 +415,7 @@ impl DepGraph {
         let mut target_keys: Vec<&str> = self
             .nodes
             .iter()
-            .filter(|(_, node)| node.name == target_name)
+            .filter(|(_, node)| !node.is_project_root && node.name == target_name)
             .map(|(key, _)| key.as_str())
             .collect();
         target_keys.sort_unstable();
@@ -643,86 +652,62 @@ fn color_tree_version(text: &str, use_color: bool) -> String {
 // ── Graph-level filter ────────────────────────────────────────────
 
 /// Remove nodes that are not on any path from a root to a node whose name
-/// contains `filter`. Keeps the root and all ancestors/descendants of
-/// matching nodes. Recomputes edges (removes dangling deps) and stats.
+/// contains `filter`. Keeps the synthetic project root and all ancestors
+/// and descendants of matching dependency nodes. Removes dangling edges.
 pub fn filter_graph(graph: &mut DepGraph, filter: &str) {
-    // Collect the set of nodes to keep: root nodes + nodes that are ancestors of
-    // a match (i.e., their subtree contains a match).
-    let mut keep = HashSet::new();
-
-    let mut memo = HashMap::with_capacity(graph.nodes.len());
-    let mut visiting = HashSet::new();
-    for root_key in &graph.roots {
-        // Root always stays
-        keep.insert(root_key.clone());
-        mark_matching_subtrees(graph, root_key, filter, &mut keep, &mut memo, &mut visiting);
-    }
-
-    // Remove non-kept nodes
-    graph.nodes.retain(|key, _| keep.contains(key));
-
-    // Remove dangling edges from remaining nodes
-    for node in graph.nodes.values_mut() {
-        node.dependencies.retain(|dep_key| keep.contains(dep_key));
-    }
-}
-
-/// DFS walk: if this node or any descendant contains `filter`, add this node
-/// (and the chain leading to it) to `keep`. Returns true when the subtree
-/// contains a match.
-fn mark_matching_subtrees<'graph>(
-    graph: &'graph DepGraph,
-    key: &str,
-    filter: &str,
-    keep: &mut HashSet<String>,
-    memo: &mut HashMap<&'graph str, bool>,
-    visiting: &mut HashSet<&'graph str>,
-) -> bool {
-    let Some((graph_key, node)) = graph.nodes.get_key_value(key) else {
-        return false;
-    };
-    let graph_key = graph_key.as_str();
-    if let Some(matches) = memo.get(graph_key) {
-        return *matches;
-    }
-    if !visiting.insert(graph_key) {
-        return false;
-    }
-
-    let self_matches = node.name.contains(filter);
-
-    let mut child_matches = false;
-    for dep_key in &node.dependencies {
-        if mark_matching_subtrees(graph, dep_key, filter, keep, memo, visiting) {
-            child_matches = true;
-        }
-    }
-
-    visiting.remove(graph_key);
-
-    if self_matches || child_matches {
-        keep.insert(graph_key.to_string());
-        // Also ensure the matched node's full subtree is kept (so the user
-        // can see the dependencies of the matched package)
-        if self_matches {
-            keep_subtree(graph, graph_key, keep);
-        }
-        memo.insert(graph_key, true);
-        true
-    } else {
-        memo.insert(graph_key, false);
-        false
-    }
-}
-
-/// Recursively add all descendants of `key` to `keep`.
-fn keep_subtree<'graph>(graph: &'graph DepGraph, key: &'graph str, keep: &mut HashSet<String>) {
-    if let Some(node) = graph.nodes.get(key) {
-        for dep_key in &node.dependencies {
-            if keep.insert(dep_key.clone()) {
-                keep_subtree(graph, dep_key, keep);
+    let keep: HashSet<String> = {
+        let mut reachable = HashSet::with_capacity(graph.nodes.len());
+        let mut parents: HashMap<&str, Vec<&str>> = HashMap::with_capacity(graph.nodes.len());
+        let mut pending: Vec<&str> = graph.roots.iter().map(String::as_str).collect();
+        let mut matches = Vec::new();
+        while let Some(key) = pending.pop() {
+            let Some(node) = graph.nodes.get(key) else {
+                continue;
+            };
+            if !reachable.insert(key) {
+                continue;
+            }
+            if !node.is_project_root && node.name.contains(filter) {
+                matches.push(key);
+            }
+            for dep in &node.dependencies {
+                parents.entry(dep.as_str()).or_default().push(key);
+                pending.push(dep);
             }
         }
+
+        let mut keep = HashSet::with_capacity(reachable.len());
+        pending.extend(matches.iter().copied());
+        while let Some(key) = pending.pop() {
+            if keep.insert(key)
+                && let Some(ancestors) = parents.get(key)
+            {
+                pending.extend(ancestors.iter().copied());
+            }
+        }
+
+        // Ancestors are already retained, but matching nodes still need expansion.
+        let mut descendants = HashSet::with_capacity(reachable.len());
+        pending.extend(matches);
+        while let Some(key) = pending.pop() {
+            if descendants.insert(key)
+                && let Some(node) = graph.nodes.get(key)
+            {
+                keep.insert(key);
+                pending.extend(node.dependencies.iter().map(String::as_str));
+            }
+        }
+        keep.extend(graph.roots.iter().filter_map(|key| {
+            graph.nodes.get(key).filter(|node| node.is_project_root)?;
+            Some(key.as_str())
+        }));
+        keep.into_iter().map(str::to_owned).collect()
+    };
+
+    graph.nodes.retain(|key, _| keep.contains(key));
+    graph.roots.retain(|key| keep.contains(key));
+    for node in graph.nodes.values_mut() {
+        node.dependencies.retain(|dep_key| keep.contains(dep_key));
     }
 }
 
@@ -883,58 +868,36 @@ pub fn render_dot(graph: &DepGraph) -> String {
 
 pub fn render_mermaid(graph: &DepGraph) -> String {
     let mut output = String::from("graph LR\n");
-
-    // Sanitize node IDs for Mermaid — only allow alphanumeric + underscore.
-    // Everything else is replaced with underscore to prevent Mermaid parse errors.
-    let sanitize = |s: &str| -> String {
-        s.chars()
-            .map(|c| {
-                if c.is_ascii_alphanumeric() || c == '_' {
-                    c
-                } else {
-                    '_'
-                }
-            })
-            .collect()
-    };
-
-    // Sort keys for deterministic output
     let mut sorted_keys: Vec<&String> = graph.nodes.keys().collect();
-    sorted_keys.sort();
+    sorted_keys.sort_unstable();
+    let node_ids: HashMap<&str, usize> = sorted_keys
+        .iter()
+        .enumerate()
+        .map(|(index, key)| (key.as_str(), index))
+        .collect();
 
-    // Define nodes once (avoids verbose redefinition on every edge)
-    for key in &sorted_keys {
-        let id = sanitize(key);
-        output.push_str(&format!("  {id}[\"{}\"]\n", mermaid_escape(key)));
+    for (index, key) in sorted_keys.iter().enumerate() {
+        output.push_str(&format!("  n{index}[\"{}\"]\n", mermaid_escape(key)));
     }
     output.push('\n');
 
-    // Edges (reference by ID only)
-    for key in &sorted_keys {
+    for (index, key) in sorted_keys.iter().enumerate() {
         let node = &graph.nodes[*key];
-        let from_id = sanitize(key);
         for dep_key in &node.dependencies {
-            let to_id = sanitize(dep_key);
-            output.push_str(&format!("  {from_id} --> {to_id}\n"));
+            if let Some(target) = node_ids.get(dep_key.as_str()) {
+                output.push_str(&format!("  n{index} --> n{target}\n"));
+            }
         }
     }
 
-    // Style LPM packages and duplicates
-    for key in &sorted_keys {
+    for (index, key) in sorted_keys.iter().enumerate() {
         let node = &graph.nodes[*key];
         if node.registry == Registry::Lpm {
-            output.push_str(&format!(
-                "  style {} fill:#10b981,color:#fff\n",
-                sanitize(key)
-            ));
+            output.push_str(&format!("  style n{index} fill:#10b981,color:#fff\n"));
         } else if node.is_duplicate {
-            output.push_str(&format!(
-                "  style {} fill:#f59e0b,color:#fff\n",
-                sanitize(key)
-            ));
+            output.push_str(&format!("  style n{index} fill:#f59e0b,color:#fff\n"));
         }
     }
-
     output
 }
 

@@ -1,0 +1,64 @@
+---
+source: tests/workflows/tests/graph_contract/mod.rs
+expression: report
+---
+{
+  "success": true,
+  "root": "host@1.0.0",
+  "packages": 2,
+  "lpm_packages": 0,
+  "npm_packages": 0,
+  "max_depth": 2,
+  "duplicates": [],
+  "nodes": [
+    {
+      "key": "host@1.0.0",
+      "name": "host",
+      "version": "1.0.0",
+      "registry": "unknown",
+      "depth": 0,
+      "is_direct": false,
+      "is_duplicate": false,
+      "is_root": true,
+      "dependency_count": 2,
+      "deps": [
+        "react@1.0.0",
+        "unrelated@1.0.0"
+      ]
+    },
+    {
+      "key": "react@1.0.0",
+      "name": "react",
+      "version": "1.0.0",
+      "registry": "unknown",
+      "depth": 1,
+      "is_direct": true,
+      "is_duplicate": false,
+      "is_root": false,
+      "dependency_count": 0,
+      "deps": []
+    },
+    {
+      "key": "unrelated@1.0.0",
+      "name": "unrelated",
+      "version": "1.0.0",
+      "registry": "unknown",
+      "depth": 1,
+      "is_direct": true,
+      "is_duplicate": false,
+      "is_root": false,
+      "dependency_count": 0,
+      "deps": []
+    }
+  ],
+  "edges": [
+    {
+      "from": "host@1.0.0",
+      "to": "react@1.0.0"
+    },
+    {
+      "from": "host@1.0.0",
+      "to": "unrelated@1.0.0"
+    }
+  ]
+}

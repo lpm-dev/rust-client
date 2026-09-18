@@ -33,32 +33,37 @@ pub async fn run(
         );
     }
 
-    // Load lockfile
-    let lockfile = lpm_lockfile::Lockfile::read_for_project(project_dir)
-        .map_err(|e| {
-            LpmError::Script(format!(
-                "no usable lpm.lock found. Run `lpm install` first: {e}"
-            ))
-        })?
-        .lockfile;
+    let format = if json_output { "json" } else { format };
+    let selected = lpm_lockfile::Lockfile::read_for_project(project_dir).map_err(|e| {
+        LpmError::Script(format!(
+            "no usable lpm.lock found. Run `lpm install` first: {e}"
+        ))
+    })?;
+    let mut selected_project_dir = selected.path.parent().unwrap_or(project_dir).to_path_buf();
+    if selected.importer != "." {
+        selected_project_dir.push(&selected.importer);
+    }
+    let project_dir = selected_project_dir.as_path();
+    let lockfile = selected.lockfile;
 
     // Read package.json once, reuse for both direct deps and root name
     let pkg_json_path = project_dir.join("package.json");
-    let pkg_json: Option<serde_json::Value> = match lpm_common::read_text_file_capped(
-        &pkg_json_path,
-        lpm_common::CONFIG_FILE_SIZE_CAP_BYTES,
-    ) {
-        Ok(content) => Some(
-            serde_json::from_str(&content)
-                .map_err(|e| LpmError::Script(format!("failed to parse package.json: {e}")))?,
-        ),
-        Err(lpm_common::BoundedReadError::NotFound { .. }) => None,
-        Err(error) => {
-            return Err(LpmError::Script(format!(
-                "failed to read package.json: {error}"
-            )));
-        }
-    };
+    let pkg_json: Option<serde_json::Map<String, serde_json::Value>> =
+        match lpm_common::read_text_regular_file_capped_with_metadata(
+            &pkg_json_path,
+            lpm_common::CONFIG_FILE_SIZE_CAP_BYTES,
+        ) {
+            Ok((content, _)) => Some(
+                serde_json::from_str(lpm_common::strip_utf8_bom_str(&content))
+                    .map_err(|e| LpmError::Script(format!("failed to parse package.json: {e}")))?,
+            ),
+            Err(lpm_common::BoundedReadError::NotFound { .. }) => None,
+            Err(error) => {
+                return Err(LpmError::Script(format!(
+                    "failed to read package.json: {error}"
+                )));
+            }
+        };
 
     let direct_deps = if let Some(ref pkg) = pkg_json {
         let mut deps = HashSet::new();
@@ -108,7 +113,6 @@ pub async fn run(
         if graph.stats.total_packages == 0 {
             let dep_type = if prod_only { "production" } else { "dev" };
             install_ui::warn_untrusted(&format!("No {dep_type} dependencies found"));
-            return Ok(());
         }
     }
 
@@ -134,14 +138,6 @@ pub async fn run(
 
     // Apply --filter at the graph level so ALL renderers see the filtered graph
     if let Some(f) = filter {
-        let has_match = graph
-            .nodes
-            .values()
-            .any(|n| !n.is_root && n.name.contains(f));
-        if !has_match {
-            install_ui::warn_untrusted(&format!("No packages matching '{f}' in dependency tree"));
-            return Ok(());
-        }
         graph_render::filter_graph(&mut graph, f);
         graph_render::recompute_stats(&mut graph);
     }
@@ -171,7 +167,7 @@ pub async fn run(
     if let Some(target) = why {
         let stdout = std::io::stdout();
         let mut output = BufWriter::new(stdout.lock());
-        if json_output {
+        if format == "json" {
             graph_render::write_why_json(
                 &mut output,
                 &graph,
