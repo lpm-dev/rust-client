@@ -82,6 +82,20 @@ pub(super) fn post_parse_error(cli: &Cli) -> Option<clap::Error> {
         ));
     }
 
+    if let Some(Commands::Query(args)) = &cli.command
+        && cli.json
+        && args.format == crate::commands::query::QueryFormat::Mermaid
+    {
+        let mut command = Cli::command();
+        let query = command
+            .find_subcommand_mut("query")
+            .expect("query command must exist");
+        return Some(query.error(
+            clap::error::ErrorKind::ArgumentConflict,
+            "--json cannot be combined with --format mermaid",
+        ));
+    }
+
     None
 }
 

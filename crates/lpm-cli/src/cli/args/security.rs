@@ -106,7 +106,7 @@ pub(crate) struct QueryArgs {
     pub(crate) selector: Option<String>,
 
     /// Show tag counts across all packages, grouped by severity.
-    #[arg(long)]
+    #[arg(long, conflicts_with_all = ["selector", "assert_none", "query_verbose", "format"])]
     pub(crate) count: bool,
 
     /// Show tag details for each match. Long form only — `-V`

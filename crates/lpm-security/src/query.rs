@@ -155,7 +155,7 @@ const BEHAVIORAL_TAG_POLICIES: [BehavioralTagInfo; 27] = [
         group: TagGroup::Source,
         severity: Severity::Info,
         install_visibility: InstallVisibility::VerboseOnly,
-        description: "Touch the filesystem outside their own directory",
+        description: "Use filesystem APIs",
     },
     BehavioralTagInfo {
         tag: PseudoClass::Shell,
@@ -335,7 +335,7 @@ const BEHAVIORAL_TAG_POLICIES: [BehavioralTagInfo; 27] = [
         group: TagGroup::Manifest,
         severity: Severity::Medium,
         install_visibility: InstallVisibility::Default,
-        description: "Installed from a git URL",
+        description: "Declare a dependency with a git URL",
     },
     BehavioralTagInfo {
         tag: PseudoClass::HttpDep,
@@ -344,7 +344,7 @@ const BEHAVIORAL_TAG_POLICIES: [BehavioralTagInfo; 27] = [
         group: TagGroup::Manifest,
         severity: Severity::Medium,
         install_visibility: InstallVisibility::Default,
-        description: "Installed from an HTTP tarball URL",
+        description: "Declare a dependency with an insecure HTTP URL",
     },
     BehavioralTagInfo {
         tag: PseudoClass::WildcardDep,
@@ -353,7 +353,7 @@ const BEHAVIORAL_TAG_POLICIES: [BehavioralTagInfo; 27] = [
         group: TagGroup::Manifest,
         severity: Severity::Medium,
         install_visibility: InstallVisibility::Default,
-        description: "Declared with `*` or `latest`",
+        description: "Declare a dependency with `*`, `latest`, or an empty version",
     },
     BehavioralTagInfo {
         tag: PseudoClass::Copyleft,
@@ -362,7 +362,7 @@ const BEHAVIORAL_TAG_POLICIES: [BehavioralTagInfo; 27] = [
         group: TagGroup::Manifest,
         severity: Severity::Info,
         install_visibility: InstallVisibility::VerboseOnly,
-        description: "Copyleft license (GPL family)",
+        description: "Declare a license expression with a recognized copyleft license",
     },
     BehavioralTagInfo {
         tag: PseudoClass::NoLicense,
@@ -371,7 +371,7 @@ const BEHAVIORAL_TAG_POLICIES: [BehavioralTagInfo; 27] = [
         group: TagGroup::Manifest,
         severity: Severity::Medium,
         install_visibility: InstallVisibility::Default,
-        description: "No `license` field",
+        description: "Have no usable license declaration, except private packages",
     },
 ];
 
@@ -763,7 +763,8 @@ fn tokenize(input: &str) -> Result<Vec<(Token, usize)>, ParseError> {
                         || chars[i] == '_'
                         || chars[i] == '.'
                         || chars[i] == '/'
-                        || chars[i] == '@')
+                        || chars[i] == '@'
+                        || chars[i] == '+')
                 {
                     i += 1;
                 }
@@ -1146,7 +1147,7 @@ impl<'a> DepGraph<'a> {
         let mut children = HashMap::with_capacity(packages.len());
         let mut parents: HashMap<&str, Vec<&str>> = HashMap::new();
         for (package, key) in packages.iter().zip(package_keys.iter().copied()) {
-            let dependencies = if package.dependency_targets.is_empty() {
+            let mut dependencies = if package.dependency_targets.is_empty() {
                 package
                     .dependencies
                     .iter()
@@ -1164,6 +1165,14 @@ impl<'a> DepGraph<'a> {
                     .filter_map(|instance_id| key_by_instance.get(instance_id).copied())
                     .collect::<Vec<_>>()
             };
+            dependencies.extend(
+                package
+                    .peer_targets
+                    .values()
+                    .filter_map(|id| key_by_instance.get(id).copied()),
+            );
+            dependencies.sort_unstable();
+            dependencies.dedup();
             for dependency in &dependencies {
                 parents.entry(dependency).or_default().push(key);
             }
@@ -1236,7 +1245,10 @@ impl<'a> DepGraph<'a> {
         // if "qs" is in root_dep_names — only node_modules/qs is.
         let root_deps: HashSet<&str> = entries
             .iter()
-            .filter(|e| root_dep_names.contains(e.name) && is_top_level_node_modules_path(e.path))
+            .filter(|entry| {
+                top_level_node_modules_name(entry.path)
+                    .is_some_and(|name| root_dep_names.contains(name))
+            })
             .map(|e| e.path)
             .collect();
 
@@ -1311,17 +1323,9 @@ fn resolve_closest_path<'a>(parent_path: &str, dep_name: &str, candidates: &[&'a
     candidates[0]
 }
 
-/// Check if a path is a top-level node_modules entry (not nested).
-///
-/// `"node_modules/qs"` → true
-/// `"node_modules/@scope/pkg"` → true
-/// `"node_modules/a/node_modules/qs"` → false
-fn is_top_level_node_modules_path(path: &str) -> bool {
-    let Some(rest) = path.strip_prefix("node_modules/") else {
-        return false;
-    };
-    // For scoped packages, rest is "@scope/name" — no further "node_modules/"
-    !rest.contains("node_modules/")
+fn top_level_node_modules_name(path: &str) -> Option<&str> {
+    let name = path.strip_prefix("node_modules/")?;
+    (!name.contains("node_modules/")).then_some(name)
 }
 
 /// Evaluate a selector against a package, considering the dependency graph
