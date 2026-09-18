@@ -59,6 +59,7 @@ async fn native_lifecycle_output_is_restored_after_pristine_rematerialization() 
         )
         .await;
     let project = TempProject::empty(&project_manifest());
+    support::write_signed_unlock(&project, &["scripts-allow"]);
 
     let install = lpm_with_registry(&project, &registry.url())
         .arg("install")
@@ -208,10 +209,14 @@ fs.writeFileSync('native-output.txt', process.env.LPM_NATIVE_TEST_INPUT);
         )
         .await;
     let project = TempProject::empty(&project_manifest());
+    support::write_signed_unlock(&project, &["scripts-allow"]);
     let mut manifest: serde_json::Value = serde_json::from_str(&project_manifest()).unwrap();
     manifest["lpm"] = serde_json::json!({"scripts":{"passEnv":["LPM_NATIVE_TEST_INPUT"]}});
     project.write_file("package.json", &manifest.to_string());
-    support::write_signed_unlock(&project, &["capability-widen", "trust-bulk-approve"]);
+    support::write_signed_unlock(
+        &project,
+        &["capability-widen", "trust-bulk-approve", "scripts-allow"],
+    );
 
     let install = lpm_with_registry(&project, &registry.url())
         .arg("install")
@@ -282,6 +287,7 @@ async fn native_toolchain_snapshot_persists_across_rebuild_processes() {
   }}
 }}"#
     ));
+    support::write_signed_unlock(&project, &["scripts-allow"]);
     let install = lpm_with_registry(&project, &registry.url())
         .arg("install")
         .env("LPM_STORE_VERSION", "v2")
@@ -366,6 +372,7 @@ Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 500);
         )
         .await;
     let project = TempProject::empty(&project_manifest());
+    support::write_signed_unlock(&project, &["scripts-allow"]);
     let install = lpm_with_registry(&project, &registry.url())
         .arg("install")
         .env("LPM_STORE_VERSION", "v2")
@@ -453,6 +460,7 @@ fs.writeFileSync('native-output.txt', label);
         )
         .await;
     let project = TempProject::empty(&project_manifest());
+    support::write_signed_unlock(&project, &["scripts-allow"]);
     let install = lpm_with_registry(&project, &registry.url())
         .arg("install")
         .env("LPM_STORE_VERSION", "v2")
@@ -504,4 +512,50 @@ fs.writeFileSync('native-output.txt', label);
         .collect::<Vec<_>>();
     artifact_outputs.sort_unstable();
     assert_eq!(artifact_outputs, ["C", "POSIX"]);
+}
+
+#[tokio::test]
+async fn native_cache_scratch_failure_records_a_lifecycle_fingerprint() {
+    use std::os::unix::fs::PermissionsExt;
+    let registry = MockRegistry::start().await;
+    registry.with_manifest_package(
+        serde_json::json!({"name":PACKAGE_NAME,"version":PACKAGE_VERSION,"scripts":{"postinstall":"node install.js"}}),
+        &[("install.js",BUILD_SCRIPT.as_bytes())],
+    ).await;
+    let project = TempProject::empty(&project_manifest());
+    support::write_signed_unlock(&project, &["scripts-allow"]);
+    let install = lpm_with_registry(&project, &registry.url())
+        .arg("install")
+        .env("LPM_STORE_VERSION", "v2")
+        .output()
+        .unwrap();
+    assert!(install.status.success());
+    let package = installed_package_dir(&project);
+    let scratch = package
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .join(".lpm-build-tmp");
+    std::fs::create_dir(&scratch).unwrap();
+    std::fs::write(scratch.join("keep"), "occupied").unwrap();
+    std::fs::set_permissions(&scratch, std::fs::Permissions::from_mode(0o000)).unwrap();
+    let output = lpm_with_registry(&project, &registry.url())
+        .args(["rebuild", "--all", "--strict-sandbox", "--json"])
+        .env("LPM_STORE_VERSION", "v2")
+        .output()
+        .unwrap();
+    std::fs::set_permissions(&scratch, std::fs::Permissions::from_mode(0o700)).unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["built"], 1);
+    let marker = std::fs::read_to_string(package.join(".lpm-built")).unwrap();
+    assert!(
+        marker.starts_with("sha256-"),
+        "fallback marker must bind script input: {marker:?}"
+    );
 }

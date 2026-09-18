@@ -121,10 +121,13 @@ pub fn compute_script_hash_with_phase_bodies(
     store_pkg_dir: &Path,
 ) -> Option<ScriptHashWithPhaseBodies> {
     let pkg_json_path = store_pkg_dir.join("package.json");
-    let content =
-        lpm_common::read_text_file_capped(&pkg_json_path, lpm_common::CONFIG_FILE_SIZE_CAP_BYTES)
-            .ok()?;
-    let parsed: serde_json::Value = serde_json::from_str(&content).ok()?;
+    let (content, _) = lpm_common::read_text_regular_file_capped_with_metadata(
+        &pkg_json_path,
+        lpm_common::CONFIG_FILE_SIZE_CAP_BYTES,
+    )
+    .ok()?;
+    let parsed: serde_json::Value =
+        serde_json::from_str(content.trim_start_matches('\u{feff}')).ok()?;
     let scripts = parsed.get("scripts")?.as_object()?;
 
     let mut hasher = Sha256::new();
@@ -374,6 +377,23 @@ mod tests {
             serde_json::to_string_pretty(&pkg).unwrap(),
         )
         .unwrap();
+    }
+
+    #[test]
+    fn script_hash_accepts_bom_without_changing_the_binding() {
+        let dir = tempdir().unwrap();
+        write_pkg_json(
+            dir.path(),
+            &serde_json::json!({"postinstall": "echo ready"}),
+        );
+        let expected = compute_script_hash(dir.path()).unwrap();
+        let path = dir.path().join("package.json");
+        let content = std::fs::read_to_string(&path).unwrap();
+        std::fs::write(path, format!("\u{feff}{content}")).unwrap();
+        assert_eq!(
+            compute_script_hash(dir.path()).as_deref(),
+            Some(expected.as_str())
+        );
     }
 
     #[test]

@@ -350,6 +350,22 @@ pub fn resolve_script_policy_with_security(
     project_config: &ScriptPolicyConfig,
     json_output: bool,
 ) -> Result<ScriptPolicy, lpm_common::LpmError> {
+    resolve_script_policy_with_security_for_packages(
+        project_dir,
+        cli_override,
+        project_config,
+        json_output,
+        &[],
+    )
+}
+
+pub(crate) fn resolve_script_policy_with_security_for_packages(
+    project_dir: &Path,
+    cli_override: Option<ScriptPolicy>,
+    project_config: &ScriptPolicyConfig,
+    json_output: bool,
+    packages: &[String],
+) -> Result<ScriptPolicy, lpm_common::LpmError> {
     let global = GlobalConfig::load();
     let user = global
         .get_str("script-policy")
@@ -370,7 +386,7 @@ pub fn resolve_script_policy_with_security(
                 requested.as_str()
             ),
             None,
-            &[],
+            packages,
         )?;
     } else if cli_override.is_none()
         && let Some(requested) = project_config.policy

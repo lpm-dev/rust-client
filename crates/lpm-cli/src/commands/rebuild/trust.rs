@@ -1,4 +1,5 @@
 use crate::script_policy_config::ScriptPolicy;
+#[cfg(test)]
 use lpm_security::script_hash::compute_script_hash;
 use lpm_security::triage::StaticTier;
 use lpm_security::{SecurityPolicy, TrustMatch};
@@ -203,6 +204,7 @@ impl TrustReason {
 /// needs to re-review the delta via `lpm approve-scripts`. This keeps
 /// the security floor at "no execution without current user approval
 /// intent".
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn evaluate_trust(
     package_dir: &Path,
@@ -245,6 +247,39 @@ pub(crate) fn evaluate_trust(
     >,
 ) -> TrustReason {
     let script_hash = compute_script_hash(package_dir);
+    evaluate_trust_with_hash(
+        script_hash.as_deref(),
+        name,
+        version,
+        integrity,
+        scripts,
+        policy,
+        project_dir,
+        effective_policy,
+        force_security_floor,
+        requested_capabilities,
+        user_bound,
+        advisor_approvals,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn evaluate_trust_with_hash(
+    script_hash: Option<&str>,
+    name: &str,
+    version: &str,
+    integrity: Option<&str>,
+    scripts: &HashMap<String, String>,
+    policy: &SecurityPolicy,
+    project_dir: &Path,
+    effective_policy: ScriptPolicy,
+    force_security_floor: bool,
+    requested_capabilities: &crate::capability::CapabilitySet,
+    user_bound: &crate::capability::UserBound,
+    advisor_approvals: Option<
+        &std::collections::HashSet<crate::triage_advisor_session::AdvisorApprovalKey>,
+    >,
+) -> TrustReason {
     let candidate = evaluate_trust_unsuspended(
         name,
         version,
@@ -254,7 +289,7 @@ pub(crate) fn evaluate_trust(
         project_dir,
         effective_policy,
         advisor_approvals,
-        script_hash.as_deref(),
+        script_hash,
     );
     let after_force = if force_security_floor && candidate.is_trusted() {
         TrustReason::SuspendedByForceFloor
@@ -286,7 +321,7 @@ pub(crate) fn evaluate_trust(
     // None) and missing bindings both fail this check, collapsing
     // into CapabilityNotApproved — which 6d's UX surfaces as a
     // distinct reason from Untrusted.
-    match policy.get_binding_for_artifact(name, version, integrity, script_hash.as_deref()) {
+    match policy.get_binding_for_artifact(name, version, integrity, script_hash) {
         Some(binding) if requested_capabilities.is_approved_by(binding) => after_force,
         _ => TrustReason::CapabilityNotApproved,
     }
