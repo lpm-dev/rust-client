@@ -1,5 +1,33 @@
 use super::prelude::*;
 
+fn bound_script_bodies(
+    baseline_index: Option<&crate::commands::audit::inventory::ProjectV2BaselineIndex>,
+    lpm_root: &lpm_common::LpmRoot,
+    name: &str,
+    version: &str,
+    integrity: Option<&str>,
+    script_hash: Option<&str>,
+) -> Option<Vec<(String, String)>> {
+    let expected_hash = script_hash?;
+    let index = baseline_index?;
+    let matching_bodies = |directory: std::path::PathBuf| {
+        let data = lpm_security::script_hash::compute_script_hash_with_phase_bodies(&directory)?;
+        (data.hash == expected_hash).then_some(data.phase_bodies)
+    };
+    crate::commands::audit::inventory::find_project_artifact_directories(
+        index, lpm_root, name, version, integrity,
+    )
+    .into_iter()
+    .find_map(matching_bodies)
+    .or_else(|| {
+        crate::commands::audit::inventory::find_cached_artifact_directories(
+            index, lpm_root, name, version, integrity,
+        )
+        .into_iter()
+        .find_map(matching_bodies)
+    })
+}
+
 /// Print the version-diff card for a
 /// blocked entry — the fuller "changes since v<prior>" view that
 /// renders alongside the package's existing card during the
@@ -36,35 +64,24 @@ pub(super) fn print_version_diff_card_for_blocked(
     if !diff.is_drift() {
         return;
     }
-    let store_dir_for = |version: &str| -> Option<std::path::PathBuf> {
-        crate::commands::audit::inventory::find_project_baseline(
-            baseline_index,
-            lpm_root,
-            &blocked.name,
-            version,
-        )
-        .map(|b| b.package_dir)
-    };
-    let prior_pairs = match store_dir_for(prior_version) {
-        Some(dir) => crate::build_state::read_install_phase_bodies(&dir),
-        None => Vec::new(),
-    };
-    let candidate_pairs = match store_dir_for(&blocked.version) {
-        Some(dir) => crate::build_state::read_install_phase_bodies(&dir),
-        None => Vec::new(),
-    };
-    let prior_bodies = if prior_pairs.is_empty() {
-        None
-    } else {
-        Some(crate::version_diff::phase_bodies_from_pairs(prior_pairs))
-    };
-    let candidate_bodies = if candidate_pairs.is_empty() {
-        None
-    } else {
-        Some(crate::version_diff::phase_bodies_from_pairs(
-            candidate_pairs,
-        ))
-    };
+    let prior_bodies = bound_script_bodies(
+        baseline_index,
+        lpm_root,
+        &blocked.name,
+        prior_version,
+        binding.integrity.as_deref(),
+        binding.script_hash.as_deref(),
+    )
+    .map(crate::version_diff::phase_bodies_from_pairs);
+    let candidate_bodies = bound_script_bodies(
+        baseline_index,
+        lpm_root,
+        &blocked.name,
+        &blocked.version,
+        blocked.integrity.as_deref(),
+        blocked.script_hash.as_deref(),
+    )
+    .map(crate::version_diff::phase_bodies_from_pairs);
     if let Some(card) = crate::version_diff::render_preflight_card(
         &diff,
         &blocked.name,
@@ -190,51 +207,27 @@ pub(super) fn print_full_script(
     baseline_index: Option<&crate::commands::audit::inventory::ProjectV2BaselineIndex>,
     lpm_root: &lpm_common::LpmRoot,
 ) {
-    let pkg_dir = match crate::commands::audit::inventory::find_project_baseline(
+    let Some(scripts) = bound_script_bodies(
         baseline_index,
         lpm_root,
         &blocked.name,
         &blocked.version,
-    ) {
-        Some(b) => b.package_dir,
-        None => {
-            output::warn(&format!(
-                "{}@{}: not found in store (workspace/file/link source, or corrupt install)",
-                blocked.name, blocked.version
-            ));
-            return;
-        }
+        blocked.integrity.as_deref(),
+        blocked.script_hash.as_deref(),
+    ) else {
+        output::warn(
+            "scripts matching the captured artifact are unavailable; run `lpm install` to refresh the review queue",
+        );
+        return;
     };
-    let pkg_json_path = pkg_dir.join("package.json");
-    let content = match lpm_common::read_text_file_capped(
-        &pkg_json_path,
-        lpm_common::CONFIG_FILE_SIZE_CAP_BYTES,
-    ) {
-        Ok(c) => c,
-        Err(e) => {
-            output::warn(&format!(
-                "could not read package.json from store at {}: {e}",
-                pkg_json_path.display()
-            ));
-            return;
-        }
-    };
-    let parsed: serde_json::Value = match serde_json::from_str(&content) {
-        Ok(v) => v,
-        Err(e) => {
-            output::warn(&format!("could not parse package.json: {e}"));
-            return;
-        }
-    };
-    let scripts = parsed.get("scripts").and_then(|v| v.as_object());
 
     println!();
     println!("  ── Full install scripts ──");
     for phase in lpm_security::EXECUTED_INSTALL_PHASES {
         let body = scripts
-            .and_then(|s| s.get(*phase))
-            .and_then(|v| v.as_str())
-            .filter(|s| !s.is_empty());
+            .iter()
+            .find(|(name, _)| name == phase)
+            .map(|(_, body)| body.as_str());
         match body {
             Some(b) => {
                 println!(

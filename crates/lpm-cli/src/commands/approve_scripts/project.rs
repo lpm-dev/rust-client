@@ -195,7 +195,7 @@ async fn run_under_store_lock(context: RunContext<'_>) -> Result<(), LpmError> {
         ));
     }
 
-    let state = match build_state::read_build_state_for_approval(project_dir)? {
+    let mut state = match build_state::read_build_state_for_approval(project_dir)? {
         Some(s) => s,
         None => {
             return Err(LpmError::NotFound(
@@ -205,6 +205,8 @@ async fn run_under_store_lock(context: RunContext<'_>) -> Result<(), LpmError> {
         }
     };
 
+    build_state::normalize_blocked_packages(&mut state.blocked_packages);
+
     // ── Load current trustedDependencies () ─────────
     //
     // Loading the manifest BEFORE the early-return on empty state lets
@@ -212,11 +214,19 @@ async fn run_under_store_lock(context: RunContext<'_>) -> Result<(), LpmError> {
     // compute the *effective* blocked set, so an already-approved package
     // doesn't appear in --list / --yes output.
 
-    let manifest_text =
-        lpm_common::read_text_file_capped(&pkg_json_path, lpm_common::CONFIG_FILE_SIZE_CAP_BYTES)?;
-    let mut manifest: serde_json::Value = serde_json::from_str(&manifest_text)
-        .map_err(|e| LpmError::Registry(format!("failed to parse package.json: {e}")))?;
+    let (manifest_text, _) = lpm_common::read_text_regular_file_capped_with_metadata(
+        &pkg_json_path,
+        lpm_common::CONFIG_FILE_SIZE_CAP_BYTES,
+    )?;
+    let mut manifest: serde_json::Value =
+        serde_json::from_str(lpm_common::strip_utf8_bom_str(&manifest_text))
+            .map_err(|e| LpmError::Registry(format!("failed to parse package.json: {e}")))?;
 
+    if !manifest.is_object() {
+        return Err(LpmError::Registry(
+            "package.json must contain a JSON object".into(),
+        ));
+    }
     let mut trusted = extract_trusted_dependencies(&manifest)?;
 
     // ── capability request + hash ────────
@@ -302,12 +312,13 @@ async fn run_under_store_lock(context: RunContext<'_>) -> Result<(), LpmError> {
         baseline_index.get_or_init(|| {
             #[cfg(test)]
             BASELINE_INDEX_BUILD_COUNT.with(|count| count.set(count.get() + 1));
-            crate::commands::audit::inventory::build_project_v2_baseline_index(
+            crate::commands::audit::inventory::build_project_script_review_index(
                 project_dir,
                 &lpm_root,
                 store_version,
-                None,
-                None,
+                crate::commands::install::workspace_lockfile::read_project(project_dir)
+                    .ok()
+                    .as_ref(),
             )
         })
     };

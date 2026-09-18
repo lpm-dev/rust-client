@@ -1578,7 +1578,7 @@ async fn run_with_options_under_store_lock(
 
     let OnlineLifecyclePrepareResult {
         policy,
-        installed_with_integrity,
+        capture_packages,
         blocked_set_metadata,
         requested_capabilities: install_requested_capabilities,
         user_bound: install_user_bound,
@@ -1586,7 +1586,6 @@ async fn run_with_options_under_store_lock(
         advisor_session,
         auto_build_attempted,
         blocked_capture,
-        baseline_index,
         blocked_metadata_ms: wf_tail_blocked_metadata_ms,
         trust_snapshot_ms: wf_tail_trust_snapshot_ms,
     } = run_online_lifecycle_prepare_phase(OnlineLifecyclePrepareInput {
@@ -1594,6 +1593,7 @@ async fn run_with_options_under_store_lock(
         route_table: &route_table,
         project_dir,
         packages: &packages,
+        materialized: &link_result.materialized,
         package: &pkg,
         store: &store,
         baseline_index,
@@ -1825,12 +1825,11 @@ async fn run_with_options_under_store_lock(
         effective_policy: lifecycle_effective_policy,
         advisor_session: advisor_session.as_ref(),
         blocked_capture,
-        installed_with_integrity: &installed_with_integrity,
+        capture_packages: &capture_packages,
         policy: &policy,
         blocked_set_metadata: &blocked_set_metadata,
         requested_capabilities: &install_requested_capabilities,
         user_bound: &install_user_bound,
-        baseline_index: baseline_index.as_ref(),
     })
     .await?;
     if let Some(bin_linked) = bin_linked {

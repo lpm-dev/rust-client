@@ -217,11 +217,58 @@ pub(super) fn maybe_emit_post_install_lifecycle_hint(
     Ok(())
 }
 
+pub(super) fn resolve_blocked_capture_packages(
+    project_dir: &Path,
+    store: &lpm_store::PackageStore,
+    packages: &[InstallPackage],
+    materialized: &[lpm_linker::MaterializedPackage],
+    uses_virtual_store: bool,
+) -> Result<Vec<crate::build_state::BlockedCapturePackage>, LpmError> {
+    let mut by_instance = HashMap::with_capacity(materialized.len());
+    if uses_virtual_store {
+        for location in materialized {
+            let id = location.instance_id.ok_or_else(|| {
+                LpmError::Store(
+                    "cannot capture script approvals: installed package has no instance identity"
+                        .into(),
+                )
+            })?;
+            if let Some(previous) = by_instance.insert(id, location)
+                && (previous.destination != location.destination
+                    || previous.name != location.name
+                    || previous.version != location.version)
+            {
+                return Err(LpmError::Store(
+                    "cannot capture script approvals: conflicting instance locations".into(),
+                ));
+            }
+        }
+    }
+    packages.iter().map(|package| {
+        let package_dir = if uses_virtual_store {
+            let location = package.instance_id.and_then(|id| by_instance.get(&id))
+                .ok_or_else(|| LpmError::Store(format!(
+                    "cannot capture script approvals for {}@{}: exact installed location is missing", package.name, package.version)))?;
+            if location.name != package.name || location.version != package.version {
+                return Err(LpmError::Store("cannot capture script approvals: installed coordinates do not match the instance".into()));
+            }
+            location.destination.clone()
+        } else {
+            package.store_path_or_err(store, project_dir, None)?
+        };
+        Ok(crate::build_state::BlockedCapturePackage {
+            instance_id: package.instance_id,
+            name: package.name.clone(), version: package.version.clone(), integrity: package.integrity.clone(), package_dir,
+        })
+    }).collect()
+}
+
 pub(super) struct OnlineLifecyclePrepareInput<'a> {
     pub(super) client: &'a lpm_registry::RegistryClient,
     pub(super) route_table: &'a RouteTable,
     pub(super) project_dir: &'a Path,
     pub(super) packages: &'a [InstallPackage],
+    pub(super) materialized: &'a [lpm_linker::MaterializedPackage],
     pub(super) package: &'a lpm_workspace::PackageJson,
     pub(super) store: &'a lpm_store::PackageStore,
     pub(super) baseline_index: Option<lpm_store::V2BaselineIndex>,
@@ -238,7 +285,7 @@ pub(super) struct OnlineLifecyclePrepareInput<'a> {
 
 pub(super) struct OnlineLifecyclePrepareResult {
     pub(super) policy: lpm_security::SecurityPolicy,
-    pub(super) installed_with_integrity: Vec<(String, String, Option<String>)>,
+    pub(super) capture_packages: Vec<crate::build_state::BlockedCapturePackage>,
     pub(super) blocked_set_metadata: crate::build_state::BlockedSetMetadata,
     pub(super) requested_capabilities: crate::capability::CapabilitySet,
     pub(super) user_bound: crate::capability::UserBound,
@@ -246,7 +293,6 @@ pub(super) struct OnlineLifecyclePrepareResult {
     pub(super) advisor_session: Option<crate::triage_advisor_session::AdvisorSession>,
     pub(super) auto_build_attempted: bool,
     pub(super) blocked_capture: crate::build_state::BlockedSetCapture,
-    pub(super) baseline_index: Option<lpm_store::V2BaselineIndex>,
     pub(super) blocked_metadata_ms: u128,
     pub(super) trust_snapshot_ms: u128,
 }
@@ -259,6 +305,7 @@ pub(super) async fn run_online_lifecycle_prepare_phase(
         route_table,
         project_dir,
         packages,
+        materialized,
         package,
         store,
         baseline_index,
@@ -279,6 +326,13 @@ pub(super) async fn run_online_lifecycle_prepare_phase(
         .map(|p| (p.name.clone(), p.version.clone(), p.integrity.clone()))
         .collect();
 
+    let capture_packages = resolve_blocked_capture_packages(
+        project_dir,
+        store,
+        packages,
+        materialized,
+        baseline_index.is_some(),
+    )?;
     let blocked_metadata_start = std::time::Instant::now();
     let mut blocked_metadata_ms = 0u128;
     let blocked_set_metadata = if used_lockfile {
@@ -293,13 +347,7 @@ pub(super) async fn run_online_lifecycle_prepare_phase(
     } else {
         let metadata = lpm_registry::timing::with_metadata_purpose(
             lpm_registry::timing::MetadataPurpose::BlockedSet,
-            build_blocked_set_metadata(
-                client,
-                route_table,
-                store,
-                baseline_index.as_ref(),
-                packages,
-            ),
+            build_blocked_set_metadata(client, route_table, packages, &capture_packages),
         )
         .await;
         blocked_metadata_ms = blocked_metadata_start.elapsed().as_millis();
@@ -337,14 +385,11 @@ pub(super) async fn run_online_lifecycle_prepare_phase(
         )
         .await;
         if session.is_active() {
-            let amber_requests = collect_amber_classification_requests(
-                store,
-                lpm_root,
-                baseline_index.as_ref(),
-                &installed_with_integrity,
+            let amber_requests = collect_amber_requests_from_materializations(
+                &capture_packages,
                 publish_ages,
                 min_release_age_secs,
-            );
+            )?;
             session.classify_amber(&amber_requests).await;
         }
         Some(session)
@@ -377,8 +422,7 @@ pub(super) async fn run_online_lifecycle_prepare_phase(
     let capture_start = std::time::Instant::now();
     let blocked_capture = crate::build_state::capture_blocked_set_after_install_with_options(
         project_dir,
-        store,
-        &installed_with_integrity,
+        &capture_packages,
         &policy,
         &blocked_set_metadata,
         &requested_capabilities,
@@ -389,7 +433,6 @@ pub(super) async fn run_online_lifecycle_prepare_phase(
                 advisor_session.as_ref().map(|s| s.approvals()),
             ),
             execution_exclusions: None,
-            baseline_index: baseline_index.as_ref(),
         },
     )?;
     tracing::debug!(
@@ -411,7 +454,7 @@ pub(super) async fn run_online_lifecycle_prepare_phase(
 
     Ok(OnlineLifecyclePrepareResult {
         policy,
-        installed_with_integrity,
+        capture_packages,
         blocked_set_metadata,
         requested_capabilities,
         user_bound,
@@ -419,7 +462,6 @@ pub(super) async fn run_online_lifecycle_prepare_phase(
         advisor_session,
         auto_build_attempted,
         blocked_capture,
-        baseline_index,
         blocked_metadata_ms,
         trust_snapshot_ms,
     })
@@ -443,12 +485,11 @@ pub(super) struct OnlineAutoBuildPhaseInput<'a> {
     pub(super) effective_policy: crate::script_policy_config::ScriptPolicy,
     pub(super) advisor_session: Option<&'a crate::triage_advisor_session::AdvisorSession>,
     pub(super) blocked_capture: crate::build_state::BlockedSetCapture,
-    pub(super) installed_with_integrity: &'a [(String, String, Option<String>)],
+    pub(super) capture_packages: &'a [crate::build_state::BlockedCapturePackage],
     pub(super) policy: &'a lpm_security::SecurityPolicy,
     pub(super) blocked_set_metadata: &'a crate::build_state::BlockedSetMetadata,
     pub(super) requested_capabilities: &'a crate::capability::CapabilitySet,
     pub(super) user_bound: &'a crate::capability::UserBound,
-    pub(super) baseline_index: Option<&'a lpm_store::V2BaselineIndex>,
 }
 
 pub(super) struct OnlineAutoBuildPhaseResult {
@@ -477,12 +518,11 @@ pub(super) async fn run_online_auto_build_phase(
         effective_policy,
         advisor_session,
         mut blocked_capture,
-        installed_with_integrity,
+        capture_packages,
         policy,
         blocked_set_metadata,
         requested_capabilities,
         user_bound,
-        baseline_index,
     } = input;
 
     if auto_build_attempted {
@@ -539,8 +579,7 @@ pub(super) async fn run_online_auto_build_phase(
             .collect::<HashSet<_>>();
         blocked_capture = crate::build_state::capture_blocked_set_after_install_with_options(
             project_dir,
-            store,
-            installed_with_integrity,
+            capture_packages,
             policy,
             blocked_set_metadata,
             requested_capabilities,
@@ -551,7 +590,6 @@ pub(super) async fn run_online_auto_build_phase(
                     advisor_session.map(|s| s.approvals()),
                 ),
                 execution_exclusions: Some(&execution_exclusions),
-                baseline_index,
             },
         )?;
     }
@@ -839,37 +877,66 @@ pub(super) fn read_trusted_deps_from_manifest(
 /// [`crate::build_state::compute_blocked_packages_with_metadata`]
 /// and the rebuild trust evaluator so the advisor pass agrees with
 /// both downstream consumers on which packages are amber-eligible.
+#[cfg(test)]
 pub(super) fn collect_amber_classification_requests(
     store: &lpm_store::PackageStore,
     lpm_root: &lpm_common::LpmRoot,
     baseline_index: Option<&lpm_store::V2BaselineIndex>,
     packages: &[(String, String, Option<String>)],
-    publish_ages: &std::collections::HashMap<(String, String), u64>,
+    publish_ages: &HashMap<(String, String), u64>,
     min_release_age_secs: u64,
 ) -> Vec<crate::triage_advisor_session::AmberPackageRequest> {
+    let resolved: Vec<_> = packages
+        .iter()
+        .filter_map(|(name, version, integrity)| {
+            let package_dir = match baseline_index {
+                Some(index) => {
+                    lpm_store::find_installed_package_baseline_by_identity_indexed(
+                        index,
+                        lpm_root,
+                        name,
+                        version,
+                        integrity.as_deref(),
+                    )?
+                    .package_dir
+                }
+                None => store.package_dir(name, version),
+            };
+            Some(crate::build_state::BlockedCapturePackage {
+                instance_id: None,
+                name: name.clone(),
+                version: version.clone(),
+                integrity: integrity.clone(),
+                package_dir,
+            })
+        })
+        .collect();
+    collect_amber_requests_from_materializations(&resolved, publish_ages, min_release_age_secs)
+        .unwrap()
+}
+
+pub(super) fn collect_amber_requests_from_materializations(
+    packages: &[crate::build_state::BlockedCapturePackage],
+    publish_ages: &HashMap<(String, String), u64>,
+    min_release_age_secs: u64,
+) -> Result<Vec<crate::triage_advisor_session::AmberPackageRequest>, LpmError> {
     use lpm_security::static_gate::ManifestContext;
     use lpm_security::triage::StaticTier;
-    let mut out = Vec::new();
-    for (name, version, integrity) in packages {
-        let pkg_dir = match baseline_index {
-            Some(index) => {
-                let Some(baseline) = lpm_store::find_installed_package_baseline_by_identity_indexed(
-                    index,
-                    lpm_root,
-                    name,
-                    version,
-                    integrity.as_deref(),
-                ) else {
-                    continue;
-                };
-                baseline.package_dir
-            }
-            None => store.package_dir(name, version),
-        };
-        let bodies = crate::build_state::read_install_phase_bodies(&pkg_dir);
-        if bodies.is_empty() {
+    let mut out = Vec::with_capacity(packages.len());
+    for package in packages {
+        let crate::build_state::BlockedCapturePackage {
+            name,
+            version,
+            integrity,
+            package_dir: pkg_dir,
+            ..
+        } = package;
+        let Some(data) =
+            lpm_security::script_hash::try_compute_script_hash_with_phase_bodies(pkg_dir)?
+        else {
             continue;
-        }
+        };
+        let bodies = data.phase_bodies;
         // Read the package's `repository` URL from the same store package.json.
         // It feeds both the advisor prompt and the classifier widening that
         // converts delegate-to-local-file + matching identity into Green.
@@ -880,7 +947,7 @@ pub(super) fn collect_amber_classification_requests(
         // the cooldown defense-in-depth (refuses to widen recent
         // publishes even when `--allow-new` bypassed the
         // install-level halt).
-        let repository = crate::build_state::read_manifest_repository(&pkg_dir);
+        let repository = crate::build_state::read_manifest_repository(pkg_dir);
         let publish_age = publish_ages.get(&(name.clone(), version.clone())).copied();
         let ctx = ManifestContext {
             package_name: name.as_str(),
@@ -921,8 +988,7 @@ pub(super) fn collect_amber_classification_requests(
         let mut seen = std::collections::BTreeSet::new();
         let mut referenced_scripts: Vec<(String, String)> = Vec::new();
         for (_phase, body) in &amber_phases {
-            for (filename, content) in
-                crate::build_state::collect_referenced_scripts(&pkg_dir, body)
+            for (filename, content) in crate::build_state::collect_referenced_scripts(pkg_dir, body)
             {
                 if seen.insert(filename.clone()) {
                     referenced_scripts.push((filename, content));
@@ -933,25 +999,31 @@ pub(super) fn collect_amber_classification_requests(
             name: name.clone(),
             version: version.clone(),
             integrity: integrity.clone(),
+            script_hash: data.hash,
             repository,
             amber_phases,
             referenced_scripts,
         });
     }
-    out
+    Ok(out)
 }
 
 pub(super) fn blocked_set_metadata_from_previous_state(
     project_dir: &Path,
 ) -> crate::build_state::BlockedSetMetadata {
-    let Some(previous) = crate::build_state::read_build_state(project_dir) else {
+    let Ok(Some(mut previous)) = crate::build_state::read_build_state_for_approval(project_dir)
+    else {
         return crate::build_state::BlockedSetMetadata::default();
     };
 
+    crate::build_state::normalize_blocked_packages(&mut previous.blocked_packages);
     let mut metadata = crate::build_state::BlockedSetMetadata {
         by_pkg: std::collections::HashMap::with_capacity(previous.blocked_packages.len()),
     };
     for package in previous.blocked_packages {
+        if package.integrity.is_none() {
+            continue;
+        }
         if package.published_at.is_none()
             && package.behavioral_tags_hash.is_none()
             && package.behavioral_tags.is_none()
@@ -962,6 +1034,7 @@ pub(super) fn blocked_set_metadata_from_previous_state(
         metadata.insert(
             package.name,
             package.version,
+            package.integrity,
             crate::build_state::BlockedSetMetadataEntry {
                 published_at: package.published_at,
                 behavioral_tags_hash: package.behavioral_tags_hash,
@@ -980,9 +1053,8 @@ pub(super) fn blocked_set_metadata_from_previous_state(
 pub(super) async fn build_blocked_set_metadata(
     client: &lpm_registry::RegistryClient,
     route_table: &RouteTable,
-    store: &lpm_store::PackageStore,
-    baseline_index: Option<&lpm_store::V2BaselineIndex>,
     packages: &[InstallPackage],
+    capture_packages: &[crate::build_state::BlockedCapturePackage],
 ) -> crate::build_state::BlockedSetMetadata {
     let mut out = crate::build_state::BlockedSetMetadata::default();
 
@@ -1018,8 +1090,8 @@ pub(super) async fn build_blocked_set_metadata(
     // Only packages with lifecycle scripts can enter the blocked set and
     // consume this enrichment. Fetch those candidates concurrently.
     let mut metadata_packages = Vec::with_capacity(packages.len());
-    for package in packages {
-        if package_requires_blocked_set_metadata(store, baseline_index, package) {
+    for (package, capture) in packages.iter().zip(capture_packages) {
+        if package_requires_blocked_set_metadata(package, &capture.package_dir) {
             metadata_packages.push(package);
         }
     }
@@ -1050,6 +1122,7 @@ pub(super) async fn build_blocked_set_metadata(
                                     k,
                                     lpm_registry::types::BlockedSetVersionMeta {
                                         behavioral_tags: v.behavioral_tags,
+                                        dist: v.dist.map(Into::into),
                                     },
                                 )
                             })
@@ -1070,6 +1143,12 @@ pub(super) async fn build_blocked_set_metadata(
         );
 
         let meta = meta?;
+        let version_meta = meta.versions.get(&p.version)?;
+        let expected_integrity = p.integrity.as_deref()?;
+        let dist = version_meta.dist.as_ref()?;
+        if dist.integrity_or_shasum().as_deref() != Some(expected_integrity) {
+            return None;
+        }
 
         let published_at = meta.time.get(&p.version).cloned();
 
@@ -1101,6 +1180,7 @@ pub(super) async fn build_blocked_set_metadata(
             Some((
                 p.name.clone(),
                 p.version.clone(),
+                p.integrity.clone(),
                 crate::build_state::BlockedSetMetadataEntry {
                     published_at,
                     behavioral_tags_hash,
@@ -1120,12 +1200,12 @@ pub(super) async fn build_blocked_set_metadata(
     // Order is deterministic because `join_all` preserves the input order
     // and the downstream `BlockedSetMetadata` is keyed by (name, version)
     // — identical output to the serial loop.
-    for (name, version, e) in futures::future::join_all(entry_futures)
+    for (name, version, integrity, e) in futures::future::join_all(entry_futures)
         .await
         .into_iter()
         .flatten()
     {
-        out.insert(name, version, e);
+        out.insert(name, version, integrity, e);
     }
 
     // Permanent perf diagnostic. dropped the `prov_sum_ms`
@@ -1142,20 +1222,11 @@ pub(super) async fn build_blocked_set_metadata(
 }
 
 pub(super) fn package_requires_blocked_set_metadata(
-    store: &lpm_store::PackageStore,
-    baseline_index: Option<&lpm_store::V2BaselineIndex>,
     package: &InstallPackage,
+    package_dir: &Path,
 ) -> bool {
-    if install_package_is_local_source(package) {
-        return false;
-    }
-    let package_dir = crate::build_state::resolve_blocked_package_dir(
-        store,
-        &package.name,
-        &package.version,
-        baseline_index,
-    );
-    !crate::build_state::read_install_phase_bodies(&package_dir).is_empty()
+    install_package_is_registry_source(package)
+        && !crate::build_state::read_install_phase_bodies(package_dir).is_empty()
 }
 
 // is_install_up_to_date() moved to crate::install_state::check_install_state()

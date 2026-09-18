@@ -372,22 +372,15 @@ pub(super) fn evaluate_trust_unsuspended(
         // install.
         if matches!(tier, Some(StaticTier::Amber) | Some(StaticTier::AmberLlm))
             && let Some(set) = advisor_approvals
+            && let Some(script_hash) = script_hash
+            && set.contains(&(
+                name.to_string(),
+                version.to_string(),
+                integrity.map(str::to_string),
+                script_hash.to_string(),
+            ))
         {
-            // M29: the approval key includes a script_bundle_hash that
-            // isn't available here without threading the bodies in.
-            // Today script classification is whole-package, so an
-            // approval for `(name, version, integrity)` is unique on
-            // that triple — match on the first three fields and
-            // ignore the bundle hash slot. A future per-phase refactor
-            // would tighten this to the full 4-tuple by threading the
-            // body hash through to this site.
-            let integrity_owned: Option<String> = integrity.map(str::to_string);
-            if set
-                .iter()
-                .any(|(n, v, i, _)| n == name && v == version && *i == integrity_owned)
-            {
-                return TrustReason::AdvisorApprovedThisRun;
-            }
+            return TrustReason::AdvisorApprovedThisRun;
         }
     }
 
@@ -413,4 +406,78 @@ pub(super) fn green_tier_can_auto_trust(scripts: &HashMap<String, String>) -> bo
     scripts
         .values()
         .all(|body| lpm_security::static_gate::extract_delegate_path(body).is_none())
+}
+
+#[cfg(test)]
+mod approval_identity_tests {
+    use super::*;
+
+    #[test]
+    fn advisor_approval_does_not_cover_a_different_script_bundle() {
+        let project = tempfile::tempdir().unwrap();
+        let approvals = std::collections::HashSet::from([(
+            "addon".into(),
+            "1.0.0".into(),
+            None,
+            "sha256-approved-script-content".into(),
+        )]);
+        let scripts = HashMap::from([("postinstall".into(), "node install.js --different".into())]);
+        let reason = evaluate_trust_unsuspended(
+            "addon",
+            "1.0.0",
+            None,
+            &scripts,
+            &SecurityPolicy::default_policy(),
+            project.path(),
+            ScriptPolicy::Triage,
+            Some(&approvals),
+            Some("sha256-different-script-content"),
+        );
+        assert!(
+            !reason.is_trusted(),
+            "advisor approval for different script bytes was reused: {reason:?}"
+        );
+    }
+    #[test]
+    fn advisor_approval_cannot_cover_changed_delegated_files() {
+        let project = tempfile::tempdir().unwrap();
+        let mut hashes = Vec::new();
+        for value in ["approved", "changed"] {
+            let directory = project.path().join(value);
+            std::fs::create_dir_all(&directory).unwrap();
+            std::fs::write(
+                directory.join("package.json"),
+                r#"{"scripts":{"postinstall":"node install.js"}}"#,
+            )
+            .unwrap();
+            std::fs::write(
+                directory.join("install.js"),
+                format!("console.log('{value}');"),
+            )
+            .unwrap();
+            hashes.push(lpm_security::script_hash::compute_script_hash(&directory).unwrap());
+        }
+        let scripts = HashMap::from([("postinstall".into(), "node install.js".into())]);
+        let approvals = std::collections::HashSet::from([(
+            "addon".into(),
+            "1.0.0".into(),
+            None,
+            hashes[0].clone(),
+        )]);
+        let reason = |hash: &str| {
+            evaluate_trust_unsuspended(
+                "addon",
+                "1.0.0",
+                None,
+                &scripts,
+                &SecurityPolicy::default_policy(),
+                project.path(),
+                ScriptPolicy::Triage,
+                Some(&approvals),
+                Some(hash),
+            )
+        };
+        assert_eq!(reason(&hashes[0]), TrustReason::AdvisorApprovedThisRun);
+        assert!(!reason(&hashes[1]).is_trusted());
+    }
 }

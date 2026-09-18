@@ -689,10 +689,16 @@ pub(super) async fn run_link_and_finish(
         effective_policy,
     );
 
-    let mut blocked_capture = crate::build_state::capture_blocked_set_after_install_with_options(
+    let capture_packages = resolve_blocked_capture_packages(
         project_dir,
         &store,
-        &installed_with_integrity,
+        &packages,
+        &link_result.materialized,
+        store_version.uses_virtual_store(),
+    )?;
+    let mut blocked_capture = crate::build_state::capture_blocked_set_after_install_with_options(
+        project_dir,
+        &capture_packages,
         &policy,
         &crate::build_state::BlockedSetMetadata::default(),
         &offline_requested_capabilities,
@@ -700,7 +706,6 @@ pub(super) async fn run_link_and_finish(
         crate::build_state::BlockedSetCaptureOptions {
             advisor_approvals: None,
             execution_exclusions: None,
-            baseline_index: baseline_index.as_ref(),
         },
     )?;
 
@@ -747,8 +752,7 @@ pub(super) async fn run_link_and_finish(
             .collect::<HashSet<_>>();
         blocked_capture = crate::build_state::capture_blocked_set_after_install_with_options(
             project_dir,
-            &store,
-            &installed_with_integrity,
+            &capture_packages,
             &policy,
             &crate::build_state::BlockedSetMetadata::default(),
             &offline_requested_capabilities,
@@ -756,7 +760,6 @@ pub(super) async fn run_link_and_finish(
             crate::build_state::BlockedSetCaptureOptions {
                 advisor_approvals: None,
                 execution_exclusions: Some(&execution_exclusions),
-                baseline_index: baseline_index.as_ref(),
             },
         )?;
 

@@ -3223,6 +3223,7 @@ impl RegistryClient {
                         k,
                         crate::types::BlockedSetVersionMeta {
                             behavioral_tags: v.behavioral_tags,
+                            dist: v.dist.map(Into::into),
                         },
                     )
                 })

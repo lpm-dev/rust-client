@@ -17,6 +17,7 @@
 //! survivors in `approve_scripts_audit_regression.rs` (kept post-6.5
 //! for the TTY subset only).
 
+mod approve_scripts_contract;
 mod support;
 
 use std::path::PathBuf;
@@ -828,8 +829,8 @@ fn write_project_with_prior_binding(
 #[test]
 fn approve_scripts_list_surfaces_exact_added_line_on_script_hash_drift() {
     let project = TempProject::empty("");
-    seed_store_pkg_with_postinstall(&project, "shapeshift", "1.0.0", "echo hi");
-    seed_store_pkg_with_postinstall(
+    let prior = seed_store_pkg_with_postinstall(&project, "shapeshift", "1.0.0", "echo hi");
+    let candidate = seed_store_pkg_with_postinstall(
         &project,
         "shapeshift",
         "2.0.0",
@@ -839,7 +840,7 @@ fn approve_scripts_list_surfaces_exact_added_line_on_script_hash_drift() {
         &project,
         "shapeshift",
         "1.0.0",
-        "sha256-shapeshift-v1-fixture",
+        &lpm_security::script_hash::compute_script_hash(&prior).unwrap(),
         None,
         None,
     );
@@ -847,7 +848,7 @@ fn approve_scripts_list_surfaces_exact_added_line_on_script_hash_drift() {
         &project,
         "shapeshift",
         "2.0.0",
-        "sha256-shapeshift-v2-fixture",
+        &lpm_security::script_hash::compute_script_hash(&candidate).unwrap(),
         None,
         None,
     );

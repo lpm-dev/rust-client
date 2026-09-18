@@ -563,7 +563,14 @@ async fn run_under_store_lock(
     }
     let covered_packages = selected_for_policy
         .iter()
-        .map(|pkg| (pkg.name.clone(), pkg.version.clone(), pkg.integrity.clone()))
+        .map(|pkg| {
+            (
+                pkg.name.clone(),
+                pkg.version.clone(),
+                pkg.integrity.clone(),
+                pkg.instance_id,
+            )
+        })
         .collect::<Vec<_>>();
 
     // Filter out already-built (unless --force)
@@ -1378,6 +1385,7 @@ async fn run_under_store_lock(
                                 pkg.name.clone(),
                                 pkg.version.clone(),
                                 pkg.integrity.clone(),
+                                pkg.instance_id,
                             ));
                             return result;
                         }
@@ -1592,6 +1600,7 @@ async fn run_under_store_lock(
                 pkg.name.clone(),
                 pkg.version.clone(),
                 pkg.integrity.clone(),
+                pkg.instance_id,
             ));
         } else {
             result.failures += 1;

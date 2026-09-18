@@ -414,6 +414,11 @@ impl V2BaselineIndex {
         })
     }
 
+    /// Enumerate indexed virtual-store materializations, including shared integrities.
+    pub fn materializations(&self) -> impl Iterator<Item = &InstalledPackageBaseline> {
+        self.by_graph_digest.values().map(Arc::as_ref)
+    }
+
     /// O(1) lookup. `None` means no v2 link entry covers the
     /// `(name, version)` pair — caller should fall back to v1.
     pub fn lookup(&self, name: &str, version: &str) -> Option<&InstalledPackageBaseline> {

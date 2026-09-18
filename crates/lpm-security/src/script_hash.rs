@@ -57,13 +57,8 @@
 //! the shared parser in the same change — the contract note on
 //! `extract_delegate_path` itself spells this out.
 //!
-//! ## Source of truth
-//!
-//! The package.json read is from `<store>/<safe_name>@<version>/package.json`
-//! (the GLOBAL STORE), NOT from a project-local `node_modules/` symlink.
-//! This matches what the build pipeline actually executes, and forecloses
-//! an attack where a project-local symlink edit (e.g., to a workspace
-//! member's manifest) drifts the observed hash from the executed bytes.
+//! The caller selects the exact installed artifact directory. The same directory
+//! supplies both the manifest and delegated files.
 
 use sha2::{Digest, Sha256};
 use std::collections::{HashSet, VecDeque};
@@ -112,7 +107,7 @@ pub struct ScriptHashWithPhaseBodies {
 ///   absence as "this package has nothing to approve")
 ///
 /// The function is pure: it reads disk but writes nothing. It does not
-/// touch any state outside `store_pkg_dir/package.json`.
+/// mutate the package directory.
 pub fn compute_script_hash(store_pkg_dir: &Path) -> Option<String> {
     Some(compute_script_hash_with_phase_bodies(store_pkg_dir)?.hash)
 }
@@ -120,15 +115,37 @@ pub fn compute_script_hash(store_pkg_dir: &Path) -> Option<String> {
 pub fn compute_script_hash_with_phase_bodies(
     store_pkg_dir: &Path,
 ) -> Option<ScriptHashWithPhaseBodies> {
+    try_compute_script_hash_with_phase_bodies(store_pkg_dir)
+        .ok()
+        .flatten()
+}
+
+/// Read and hash lifecycle scripts, distinguishing invalid bytes from absent scripts.
+pub fn try_compute_script_hash_with_phase_bodies(
+    store_pkg_dir: &Path,
+) -> Result<Option<ScriptHashWithPhaseBodies>, lpm_common::LpmError> {
     let pkg_json_path = store_pkg_dir.join("package.json");
     let (content, _) = lpm_common::read_text_regular_file_capped_with_metadata(
         &pkg_json_path,
         lpm_common::CONFIG_FILE_SIZE_CAP_BYTES,
-    )
-    .ok()?;
-    let parsed: serde_json::Value =
-        serde_json::from_str(content.trim_start_matches('\u{feff}')).ok()?;
-    let scripts = parsed.get("scripts")?.as_object()?;
+    )?;
+    let invalid = |detail: &str| {
+        lpm_common::LpmError::Store(format!(
+            "installed manifest {} {detail}",
+            pkg_json_path.display()
+        ))
+    };
+    let parsed: serde_json::Value = serde_json::from_str(lpm_common::strip_utf8_bom_str(&content))
+        .map_err(|error| invalid(&format!("is malformed: {error}")))?;
+    let object = parsed
+        .as_object()
+        .ok_or_else(|| invalid("must contain a JSON object"))?;
+    let Some(scripts) = object.get("scripts") else {
+        return Ok(None);
+    };
+    let scripts = scripts
+        .as_object()
+        .ok_or_else(|| invalid("has a non-object scripts field"))?;
 
     let mut hasher = Sha256::new();
     let mut phase_bodies = Vec::with_capacity(EXECUTED_INSTALL_PHASES.len());
@@ -143,7 +160,12 @@ pub fn compute_script_hash_with_phase_bodies(
         // `(empty preinstall, "x" install)` and `("x" preinstall, empty install)`
         // produce different hashes even though the concatenated bodies are
         // identical.
-        let body = scripts.get(*phase).and_then(|v| v.as_str()).unwrap_or("");
+        let body = match scripts.get(*phase) {
+            Some(value) => value
+                .as_str()
+                .ok_or_else(|| invalid(&format!("has a non-string {phase} script")))?,
+            None => "",
+        };
         if !body.is_empty() {
             phase_bodies.push(((*phase).to_string(), body.to_string()));
         }
@@ -171,13 +193,13 @@ pub fn compute_script_hash_with_phase_bodies(
     }
 
     if phase_bodies.is_empty() {
-        return None;
+        return Ok(None);
     }
 
-    Some(ScriptHashWithPhaseBodies {
+    Ok(Some(ScriptHashWithPhaseBodies {
         hash: format!("sha256-{}", hex_lower(&hasher.finalize())),
         phase_bodies,
-    })
+    }))
 }
 
 fn hash_delegate_graph(hasher: &mut Sha256, store_pkg_dir: &Path, rel_path: &str) {
