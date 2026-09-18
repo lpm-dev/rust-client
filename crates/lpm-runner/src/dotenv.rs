@@ -15,6 +15,9 @@ use lpm_common::{BoundedReadError, CONFIG_FILE_SIZE_CAP_BYTES, LpmError, read_te
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
+mod names;
+use names::EnvName;
+
 const DENIED_ENV_VARS: &[&str] = &[
     "LD_PRELOAD",
     "LD_LIBRARY_PATH",
@@ -102,22 +105,7 @@ pub(crate) struct LoadedProjectEnv {
     pub(crate) vault_count: usize,
 }
 
-pub(crate) fn load_project_env_details_with_config(
-    project_dir: &Path,
-    env_name: Option<&str>,
-    configured_file_path: Option<&str>,
-    lpm_config: Option<&lpm_json::LpmJsonConfig>,
-) -> Result<LoadedProjectEnv, LpmError> {
-    load_project_env_details_with_config_and_schema_validation(
-        project_dir,
-        env_name,
-        configured_file_path,
-        lpm_config,
-        !crate::script::should_skip_env_validation(),
-    )
-}
-
-fn load_project_env_details_with_config_and_schema_validation(
+pub(crate) fn load_project_env_details_with_config_and_schema_validation(
     project_dir: &Path,
     env_name: Option<&str>,
     configured_file_path: Option<&str>,
@@ -152,14 +140,14 @@ fn load_project_env_details_with_config_and_schema_validation(
                 load_env_from_chain(project_dir, &chain)?
             }
             Err(e) if e.contains("not found") => {
-                // Env not declared in `environments` config — fall back to standard
-                // .env file loading. This allows custom envs (e.g., .env.preview) to
-                // work in projects with `environments` config without requiring every
-                // env to be declared.
+                // An undeclared environment must preserve an explicit file mapping.
                 tracing::debug!(
-                    "env '{env_name}' not in environments config, falling back to standard loading"
+                    "env '{env_name}' not in environments config, using file mapping or standard loading"
                 );
-                load_env_files(project_dir, Some(env_name))?
+                match configured_file_path {
+                    Some(path) => load_env_from_configured_path(project_dir, path)?,
+                    None => load_env_files(project_dir, Some(env_name))?,
+                }
             }
             Err(e) => {
                 // Cycle or other structural error — hard fail
@@ -192,31 +180,140 @@ fn load_project_env_details_with_config_and_schema_validation(
     let vault_count = vault_vars.len();
     if vault_count > 0 {
         tracing::debug!("loaded {vault_count} env var(s) from vault");
-        loaded.extend(vault_vars);
+        merge_project_env(&mut loaded, &vault_vars)?;
     }
 
     remove_dangerous_env_vars(&mut loaded, "project env");
 
-    // Validate against env schema (if defined in lpm.json)
-    if validate_schema
-        && let Some(config) = lpm_config
-        && let Some(schema) = &config.env_schema
-        && !schema.is_empty()
-    {
-        let errors = lpm_env::validate(schema, &mut loaded);
-        if !errors.is_empty() {
-            let lines: Vec<String> = errors.iter().map(|e| format!("  {e}")).collect();
-            return Err(LpmError::EnvValidation(lines.join("\n")));
-        }
-        tracing::debug!("env schema validation passed ({} vars)", schema.len());
+    if validate_schema {
+        validate_project_env(&mut loaded, lpm_config)?;
     }
-
-    remove_dangerous_env_vars(&mut loaded, "project env");
 
     Ok(LoadedProjectEnv {
         vars: loaded,
         vault_count,
     })
+}
+
+pub(crate) fn validate_project_env(
+    vars: &mut HashMap<String, String>,
+    config: Option<&lpm_json::LpmJsonConfig>,
+) -> Result<(), LpmError> {
+    validate_project_env_with_case_policy(vars, config, cfg!(windows))
+}
+
+fn validate_project_env_with_case_policy(
+    vars: &mut HashMap<String, String>,
+    config: Option<&lpm_json::LpmJsonConfig>,
+    case_insensitive: bool,
+) -> Result<(), LpmError> {
+    if let Some(schema) = config.and_then(|config| config.env_schema.as_ref()) {
+        if case_insensitive {
+            let mut schema_names = std::collections::BTreeSet::new();
+            for key in schema.vars.keys() {
+                if !schema_names.insert(EnvName::new(key)) {
+                    return Err(LpmError::EnvValidation(format!(
+                        "ambiguous environment schema variable casing for '{key}'"
+                    )));
+                }
+            }
+            let mut existing_names = std::collections::BTreeMap::new();
+            for key in vars.keys() {
+                if existing_names
+                    .insert(EnvName::new(key), key.clone())
+                    .is_some()
+                {
+                    return Err(LpmError::EnvValidation(format!(
+                        "ambiguous environment variable casing for '{key}'"
+                    )));
+                }
+            }
+            for key in schema.vars.keys() {
+                if let Some(existing) = existing_names.get(&EnvName::new(key))
+                    && existing != key
+                    && let Some(value) = vars.remove(existing)
+                {
+                    vars.insert(key.clone(), value);
+                }
+            }
+        }
+        let mut inherited_values = Vec::with_capacity(schema.vars.len());
+        for key in schema.vars.keys() {
+            if !vars.contains_key(key)
+                && !crate::shell::inherited_env_is_stripped(key)
+                && let Ok(value) = std::env::var(key)
+            {
+                inherited_values.push((key.clone(), value.clone()));
+                vars.insert(key.clone(), value);
+            }
+        }
+        let errors = lpm_env::validate(schema, vars);
+        if !errors.is_empty() {
+            let lines: Vec<String> = errors.iter().map(|error| format!("  {error}")).collect();
+            return Err(LpmError::EnvValidation(lines.join("\n")));
+        }
+        // Validation must not turn inherited values into explicit project
+        // overrides: task cacheEnv selection depends on that distinction.
+        for (key, value) in inherited_values {
+            if vars.get(&key) == Some(&value) {
+                vars.remove(&key);
+            }
+        }
+    }
+    remove_dangerous_env_vars(vars, "project env");
+    Ok(())
+}
+
+pub(crate) fn merge_project_env(
+    target: &mut HashMap<String, String>,
+    values: &HashMap<String, String>,
+) -> Result<(), LpmError> {
+    merge_env_with_case_policy(target, values, cfg!(windows))
+}
+
+fn merge_env_with_case_policy(
+    target: &mut HashMap<String, String>,
+    values: &HashMap<String, String>,
+    case_insensitive: bool,
+) -> Result<(), LpmError> {
+    if case_insensitive {
+        let mut names = std::collections::BTreeSet::new();
+        for key in values.keys() {
+            if !names.insert(EnvName::new(key)) {
+                return Err(LpmError::EnvValidation(format!(
+                    "ambiguous environment variable casing for '{key}'"
+                )));
+            }
+        }
+        target.retain(|existing, _| !names.contains(&EnvName::new(existing)));
+    }
+    target.extend(
+        values
+            .iter()
+            .map(|(key, value)| (key.clone(), value.clone())),
+    );
+    Ok(())
+}
+
+pub(crate) fn insert_project_env(target: &mut HashMap<String, String>, key: String, value: String) {
+    insert_env_with_case_policy(target, key, value, cfg!(windows));
+}
+
+fn insert_env_with_case_policy(
+    target: &mut HashMap<String, String>,
+    key: String,
+    value: String,
+    case_insensitive: bool,
+) {
+    if case_insensitive {
+        let name = EnvName::new(&key);
+        target.retain(|existing, _| EnvName::new(existing) != name);
+    }
+    target.insert(key, value);
+}
+
+fn retain_project_env_value(key: &str) -> bool {
+    crate::shell::inherited_env_is_stripped(key) || std::env::var_os(key).is_none()
 }
 
 /// Parse a `.env` file into a key-value map.
@@ -240,10 +337,18 @@ pub fn parse_env_file(path: &Path) -> Result<HashMap<String, String>, BoundedRea
 /// -----END CERTIFICATE-----"
 /// ```
 pub fn parse_env_str(content: &str) -> HashMap<String, String> {
+    parse_env_str_with_case_policy(content, cfg!(windows))
+}
+
+fn parse_env_str_with_case_policy(
+    content: &str,
+    case_insensitive: bool,
+) -> HashMap<String, String> {
     // Strip UTF-8 BOM if present — editors like Notepad prepend it, corrupting the first key
     let content = content.strip_prefix('\u{feff}').unwrap_or(content);
 
     let mut vars = HashMap::new();
+    let mut names = std::collections::BTreeMap::new();
     let mut lines = content.lines();
 
     while let Some(line) = lines.next() {
@@ -266,6 +371,9 @@ pub fn parse_env_str(content: &str) -> HashMap<String, String> {
         let key = trimmed[..eq_pos].trim().to_string();
         if key.is_empty() {
             continue;
+        }
+        if case_insensitive && let Some(previous) = names.insert(EnvName::new(&key), key.clone()) {
+            vars.remove(&previous);
         }
 
         let raw_value = trimmed[eq_pos + 1..].trim();
@@ -365,9 +473,8 @@ pub fn load_env_files(
         )?;
     }
 
-    // Filter out vars that already exist in process environment
-    // (process env takes precedence)
-    merged.retain(|key, _| std::env::var(key).is_err());
+    // Only inherited values retained by the child take precedence.
+    merged.retain(|key, _| retain_project_env_value(key));
 
     remove_dangerous_env_vars(&mut merged, ".env file");
 
@@ -398,8 +505,8 @@ pub fn load_env_from_chain(
         merge_env_file(&mut merged, &local_path)?;
     }
 
-    // Filter out vars that already exist in process environment
-    merged.retain(|key, _| std::env::var(key).is_err());
+    // Only inherited values retained by the child take precedence.
+    merged.retain(|key, _| retain_project_env_value(key));
 
     remove_dangerous_env_vars(&mut merged, ".env file");
 
@@ -419,7 +526,7 @@ fn load_env_from_configured_path(
     ] {
         merge_env_file(&mut merged, &contained_env_file_path(project_dir, &path)?)?;
     }
-    merged.retain(|key, _| std::env::var(key).is_err());
+    merged.retain(|key, _| retain_project_env_value(key));
     remove_dangerous_env_vars(&mut merged, ".env file");
     Ok(merged)
 }
@@ -450,7 +557,7 @@ fn contained_env_file_path(project_dir: &Path, file_path: &str) -> Result<PathBu
     Ok(canonical_path)
 }
 
-fn remove_dangerous_env_vars(vars: &mut HashMap<String, String>, source: &str) {
+pub(crate) fn remove_dangerous_env_vars(vars: &mut HashMap<String, String>, source: &str) {
     let denied_keys: Vec<String> = vars
         .keys()
         .filter(|key| is_denied_env_var(key))
@@ -475,16 +582,106 @@ fn is_denied_env_var(key: &str) -> bool {
 /// Merge a single `.env` file into an existing map (overwriting existing keys).
 fn merge_env_file(target: &mut HashMap<String, String>, path: &Path) -> Result<(), LpmError> {
     let vars = parse_env_file(path).map_err(|error| LpmError::EnvValidation(error.to_string()))?;
-    for (k, v) in vars {
-        target.insert(k, v);
-    }
-    Ok(())
+    merge_project_env(target, &vars)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::fs;
+
+    #[test]
+    fn case_insensitive_env_merge_applies_the_last_layer_once() {
+        let mut vars = HashMap::from([("port".to_string(), "invalid".to_string())]);
+        let managed = HashMap::from([("PORT".to_string(), "4000".to_string())]);
+        merge_env_with_case_policy(&mut vars, &managed, true).unwrap();
+        assert_eq!(vars, managed);
+    }
+
+    #[test]
+    fn case_insensitive_schema_checks_the_explicit_mixed_case_value() {
+        let config = lpm_json::parse_lpm_json(
+            r#"{"envSchema":{"vars":{"LPM_SCHEMA_CASE_PORT":{"format":"port"}}}}"#,
+        )
+        .unwrap();
+        let mut vars = HashMap::from([("lpm_schema_case_port".to_string(), "invalid".to_string())]);
+        assert!(validate_project_env_with_case_policy(&mut vars, Some(&config), true).is_err());
+    }
+
+    #[test]
+    fn case_sensitive_env_merge_preserves_distinct_names() {
+        let mut vars = HashMap::from([("port".to_string(), "invalid".to_string())]);
+        let managed = HashMap::from([("PORT".to_string(), "4000".to_string())]);
+        merge_env_with_case_policy(&mut vars, &managed, false).unwrap();
+        assert_eq!(vars.get("port").unwrap(), "invalid");
+        assert_eq!(vars.get("PORT").unwrap(), "4000");
+    }
+
+    #[test]
+    fn case_insensitive_schema_rejects_conflicting_names_before_defaults() {
+        for rule in [r#"{"default":"3000"}"#, r#"{"required":true}"#] {
+            let config = lpm_json::parse_lpm_json(&format!(
+                r#"{{"envSchema":{{"vars":{{"APPLICATION_PORT":{rule},"application_port":{{"default":"4000"}}}}}}}}"#
+            )).unwrap();
+            let mut vars = HashMap::new();
+            let error = validate_project_env_with_case_policy(&mut vars, Some(&config), true)
+                .expect_err("case-insensitive schema names must be unique");
+            assert!(error.to_string().contains("ambiguous"), "{error}");
+            assert!(vars.is_empty(), "invalid schema applied defaults");
+        }
+    }
+
+    #[test]
+    fn case_insensitive_merge_applies_unicode_name_precedence() {
+        let mut vars = HashMap::from([("É_VAR".to_string(), "old".to_string())]);
+        let overrides = HashMap::from([("é_var".to_string(), "new".to_string())]);
+        merge_env_with_case_policy(&mut vars, &overrides, true).unwrap();
+        assert_eq!(vars, overrides);
+    }
+
+    #[test]
+    fn insensitive_parser_preserves_the_last_spelling_and_multiline_value() {
+        let source = "É_VAR=old\né_var=\"first\nsecond\"\n";
+        assert_eq!(
+            parse_env_str_with_case_policy(source, true),
+            HashMap::from([("é_var".to_string(), "first\nsecond".to_string())])
+        );
+        assert_eq!(parse_env_str_with_case_policy(source, false).len(), 2);
+    }
+
+    #[test]
+    fn case_sensitive_schema_keeps_distinct_defaults() {
+        let config = lpm_json::parse_lpm_json(
+            r#"{"envSchema":{"vars":{"APPLICATION_PORT":{"default":"3000"},"application_port":{"default":"4000"}}}}"#,
+        ).unwrap();
+        let mut vars = HashMap::new();
+        validate_project_env_with_case_policy(&mut vars, Some(&config), false).unwrap();
+        assert_eq!(vars.get("APPLICATION_PORT").unwrap(), "3000");
+        assert_eq!(vars.get("application_port").unwrap(), "4000");
+    }
+
+    #[test]
+    fn case_insensitive_env_merge_rejects_ambiguous_names_before_mutation() {
+        let mut vars = HashMap::from([("PORT".to_string(), "3000".to_string())]);
+        let original = vars.clone();
+        let overrides = HashMap::from([
+            ("PORT".to_string(), "4000".to_string()),
+            ("port".to_string(), "5000".to_string()),
+        ]);
+        assert!(merge_env_with_case_policy(&mut vars, &overrides, true).is_err());
+        assert_eq!(vars, original);
+    }
+
+    #[test]
+    fn env_file_layers_follow_platform_name_matching() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(".env.local");
+        fs::write(&path, "port=4000\n").unwrap();
+        let mut vars = HashMap::from([("PORT".to_string(), "3000".to_string())]);
+        merge_env_file(&mut vars, &path).unwrap();
+        assert_eq!(vars.get("port").unwrap(), "4000");
+        assert_eq!(vars.contains_key("PORT"), !cfg!(windows));
+    }
 
     #[test]
     fn parse_basic_env() {

@@ -1314,12 +1314,33 @@ pub fn run_services_with_config(
     let cross_env = ports::build_cross_service_env(&port_map, options.https);
 
     // Load .env files + vault + validate schema (unified loader)
-    let dotenv = crate::script::load_script_env_with_config(
+    let dotenv = crate::script::load_script_env_without_schema(
         project_dir,
         "dev",
         options.env_mode.as_deref(),
         config,
     )?;
+
+    let mut service_envs = HashMap::with_capacity(active_services.len());
+    for (name, service) in active_services.iter() {
+        let mut env = dotenv.clone();
+        crate::dotenv::merge_project_env(&mut env, &service.env)?;
+        crate::dotenv::remove_dangerous_env_vars(&mut env, "service env");
+        if let Some(peer_env) = cross_env.get(name) {
+            crate::dotenv::merge_project_env(&mut env, peer_env)?;
+        }
+        if let Some(port) = port_map.get(name) {
+            crate::dotenv::insert_project_env(&mut env, "PORT".to_string(), port.to_string());
+        }
+        for (key, value) in &options.extra_envs {
+            crate::dotenv::insert_project_env(&mut env, key.clone(), value.clone());
+        }
+        if !crate::script::should_skip_env_validation() {
+            crate::dotenv::validate_project_env(&mut env, config)
+                .map_err(|error| LpmError::EnvValidation(format!("service '{name}': {error}")))?;
+        }
+        service_envs.insert(name.clone(), env);
+    }
 
     // Assign colors
     let service_names: Vec<String> = groups.iter().flatten().cloned().collect();
@@ -1426,16 +1447,7 @@ pub fn run_services_with_config(
                     ServiceStatus::Starting,
                 );
 
-                // Build env for this service
-                let mut env = dotenv.clone();
-                env.extend(config.env.clone());
-                if let Some(svc_cross_env) = cross_env.get(name) {
-                    env.extend(svc_cross_env.clone());
-                }
-                // Override PORT if we reassigned it
-                if let Some(&port) = port_map.get(name) {
-                    env.insert("PORT".to_string(), port.to_string());
-                }
+                let env = &service_envs[name];
 
                 // Resolve working directory with path traversal protection
                 let cwd = service_cwds[name].clone();
@@ -1456,12 +1468,7 @@ pub fn run_services_with_config(
                 cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
                 isolate_service_process_tree(&mut cmd);
                 crate::shell::strip_inherited_env_hooks(&mut cmd);
-                cmd.envs(&env);
-
-                // Inject extra envs from HTTPS/tunnel/network setup (safe, no global mutation)
-                for (key, value) in &options.extra_envs {
-                    cmd.env(key, value);
-                }
+                cmd.envs(env);
 
                 let mut child =
                     spawn_service_command_with(&mut cmd, project_dir, &cwd, &service_path, || {
@@ -1696,8 +1703,7 @@ pub fn run_services_with_config(
             service_cwds: &service_cwds,
             groups: &groups,
             service_runtime_hints: &options.service_runtime_hints,
-            dotenv: &dotenv,
-            cross_env: &cross_env,
+            service_envs: &service_envs,
             port_map: &port_map,
             color_map: &color_map,
             service_names: &service_names,
@@ -1710,7 +1716,6 @@ pub fn run_services_with_config(
             initial_endpoints: service_endpoints,
             on_all_ready: options.on_all_ready.take(),
             on_endpoint_changed: options.on_endpoint_changed.as_ref(),
-            extra_envs: &options.extra_envs,
         })?;
 
         Ok(())

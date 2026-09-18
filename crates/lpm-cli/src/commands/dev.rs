@@ -1345,17 +1345,8 @@ pub async fn run(
         proxy_lines: startup_proxy_lines,
     };
 
-    // ── Run independent detection steps in parallel ──────────────────
-    // Steps that can run concurrently:
-    //   - auto_install_if_stale (async, potentially slow — runs `lpm install`)
-    //   - auto_copy_env_example (sync file I/O — wrap in spawn_blocking)
-    //   - HTTPS cert setup (sync, may generate certs — wrap in spawn_blocking)
-    //   - ensure_detected_runtimes (async, may download node — potentially slow)
-    //
-    // Network display and tunnel setup depend on HTTPS result (cert env vars),
-    // so they run after the parallel batch.
-
-    let install_dir = project_dir.to_path_buf();
+    // Certificate consent uses process stdio; it must finish before the
+    // nested install suppresses output. Installation also needs the runtime.
     let env_dir = project_dir.to_path_buf();
     let https_dir = project_dir.to_path_buf();
     let host_owned = host.map(|h| h.to_string());
@@ -1379,15 +1370,7 @@ pub async fn run(
         .map(lpm_runtime::detect::DetectedRuntimeVersion::source_label);
     let dev_entrypoint_compatibility_bins = dev_entrypoint_compatibility_bins(project_dir);
 
-    let (install_result, env_result, https_result, runtime_hint) = tokio::join!(
-        async {
-            if !no_install {
-                auto_install_if_stale(client, &install_dir, &dev_entrypoint_compatibility_bins)
-                    .await
-            } else {
-                Ok("skipped (--no-install)".to_string())
-            }
-        },
+    let (env_result, https_result, runtime_hint) = tokio::join!(
         async {
             let dir = env_dir.clone();
             tokio::task::spawn_blocking(move || auto_copy_env_example(&dir))
@@ -1435,9 +1418,8 @@ pub async fn run(
         async { super::run::ensure_detected_runtimes(detected_runtimes).await },
     );
 
-    // Process parallel results
-    startup.deps_status = install_result?;
     startup.env_status = env_result?;
+    let https_setup: Option<DevCertSetup> = https_result?;
     let script_path =
         lpm_runner::bin_path::build_path_with_bins_pre_resolved(project_dir, &runtime_hint)?;
     let effective_node = lpm_runtime::effective::resolve_node_on_path_with_fingerprint(
@@ -1463,7 +1445,11 @@ pub async fn run(
         ));
     }
 
-    let https_setup: Option<DevCertSetup> = https_result?;
+    startup.deps_status = if no_install {
+        "skipped (--no-install)".to_string()
+    } else {
+        auto_install_if_stale(client, project_dir, &dev_entrypoint_compatibility_bins).await?
+    };
     let tls_material = if let Some(cert_setup) = https_setup {
         let setup = cert_setup.setup;
         if setup.ca_freshly_installed {
@@ -2271,7 +2257,6 @@ pub async fn run(
     })?;
     let hosts_file_lease = prepare_local_hosts_file(project_dir, &local_domain_hostnames, yes)?;
     let mut script_env = extra_env.clone();
-    let child_requested_port = requested_port.filter(|_| !https);
     let explicit_inspector_port = if tunnel && !no_inspect {
         inspect_port
     } else {
@@ -2281,6 +2266,11 @@ pub async fn run(
         find_internal_dev_port_excluding(port, explicit_inspector_port)?
     } else {
         port
+    };
+    let child_requested_port = if https {
+        Some(child_port_hint)
+    } else {
+        requested_port
     };
     upsert_extra_env(&mut script_env, "PORT", child_port_hint.to_string());
     let mut script_args = extra_args.to_vec();
@@ -3754,18 +3744,18 @@ fn normalize_script_binary_name(word: &str) -> Option<String> {
     Some(word.to_string())
 }
 
-/// Auto-copy .env.example → .env if .env doesn't exist.
-///
-/// Uses `create_new(true)` for atomic file creation to avoid TOCTOU races
-/// where a concurrent process could create .env between the exists() check
-/// and the copy, potentially clobbering the other process's file.
-///
-/// Returns a status string for the startup banner, or None if no .env.example.
+/// Copy a regular example only when the destination is absent.
+/// Atomic publication preserves a destination created concurrently.
 fn auto_copy_env_example(project_dir: &std::path::Path) -> Result<Option<String>, LpmError> {
     use std::io::{ErrorKind, Write};
 
     let env_file = project_dir.join(".env");
     let example_file = project_dir.join(".env.example");
+    match std::fs::symlink_metadata(&env_file) {
+        Ok(_) => return Ok(Some(".env loaded".to_string())),
+        Err(error) if error.kind() == ErrorKind::NotFound => {}
+        Err(error) => return Err(LpmError::Io(error)),
+    }
 
     let source_metadata = match std::fs::symlink_metadata(&example_file) {
         Ok(metadata) => metadata,
@@ -3818,7 +3808,7 @@ fn auto_copy_env_example(project_dir: &std::path::Path) -> Result<Option<String>
             dev_ui::warn("No .env file found. Created from .env.example");
             dev_ui::hint_line("Review .env and fill in missing values");
             dev_ui::trusted_hint_line(install_ui::terminal_line!(
-                "Or use {} to store secrets in the vault",
+                "Or use {} to store project secrets",
                 install_ui::yellow("lpm env vars set"),
             ));
             Ok(Some("created from .env.example".to_string()))

@@ -78,7 +78,7 @@ const STRIPPED_INHERITED_ENV_SUFFIXES: &[&str] = &[
     "_TOKEN",
 ];
 
-fn inherited_env_is_stripped(name: &str) -> bool {
+pub(crate) fn inherited_env_is_stripped(name: &str) -> bool {
     let upper = name.to_ascii_uppercase();
     STRIPPED_INHERITED_ENV_PATTERNS.contains(&upper.as_str())
         || STRIPPED_INHERITED_ENV_SUFFIXES
@@ -258,7 +258,7 @@ pub type EndpointResultCallback =
     Box<dyn FnOnce(Result<Option<DevEndpoint>, String>) + Send + 'static>;
 
 #[cfg(unix)]
-struct StopSignalRegistrations(Vec<signal_hook::SigId>);
+pub(crate) struct StopSignalRegistrations(Vec<signal_hook::SigId>);
 
 #[cfg(unix)]
 impl Drop for StopSignalRegistrations {
@@ -270,7 +270,7 @@ impl Drop for StopSignalRegistrations {
 }
 
 #[cfg(unix)]
-fn register_stop_signals(
+pub(crate) fn register_stop_signals(
     stop_requested: &std::sync::Arc<std::sync::atomic::AtomicBool>,
 ) -> Result<StopSignalRegistrations, LpmError> {
     use signal_hook::consts::{SIGINT, SIGTERM};
@@ -313,6 +313,34 @@ pub fn spawn_shell(cmd: &ShellCommand) -> Result<ExitStatus, LpmError> {
     command
         .status()
         .map_err(|e| LpmError::Script(format!("failed to execute '{}': {e}", cmd.command)))
+}
+
+pub(crate) fn spawn_shell_cancellable(
+    cmd: &ShellCommand,
+    stop_requested: &std::sync::atomic::AtomicBool,
+) -> Result<ExitStatus, LpmError> {
+    let mut command = shell_process(cmd.command)?;
+    command
+        .current_dir(cmd.cwd)
+        .stdin(Stdio::inherit())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit());
+    strip_inherited_env_hooks(&mut command);
+    command.envs(cmd.envs).env("PATH", cmd.path);
+    let mut child = command.spawn().map_err(|error| {
+        LpmError::Script(format!("failed to execute '{}': {error}", cmd.command))
+    })?;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break Ok(status),
+            Ok(None) => {}
+            Err(error) => break Err(LpmError::Io(error)),
+        }
+        if stop_requested.load(std::sync::atomic::Ordering::Acquire) {
+            break crate::ports::terminate_child_process_tree(&mut child).map_err(LpmError::Io);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
 }
 
 pub fn spawn_shell_with_endpoint(
