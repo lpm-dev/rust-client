@@ -1828,6 +1828,24 @@ pub async fn run_install_filtered_add(
         ));
         }
 
+        if !swift_packages.is_empty() {
+            for location in &swift_locations {
+                let package_dir = match location {
+                    SwiftInstallLocation::Spm { manifest_path } => {
+                        manifest_path.parent().unwrap_or(cwd).to_path_buf()
+                    }
+                    SwiftInstallLocation::Xcode { xcodeproj_path } => xcodeproj_path
+                        .parent()
+                        .unwrap_or(cwd)
+                        .join(crate::swift_manifest::LPM_DEPS_REL_PATH),
+                };
+                crate::commands::swift_registry::preflight_configuration(
+                    client.base_url(),
+                    &package_dir,
+                )?;
+            }
+        }
+
         let mut swift_transaction = if swift_packages.is_empty() {
             None
         } else {

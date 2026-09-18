@@ -7,7 +7,10 @@ fn main() {
         return;
     }
     let mut args = std::env::args();
-    let _program = args.next();
+    let via_xcrun = args.next().is_some_and(|name| name.contains("xcrun"));
+    if via_xcrun {
+        assert_eq!(args.next().as_deref(), Some("swift"));
+    }
     let command = args.next();
     let action = args.next();
     let command_name = match (command.as_deref(), action.as_deref()) {
@@ -51,6 +54,16 @@ fn main() {
     }
 
     match (command.as_deref(), action.as_deref()) {
+        (Some("package"), Some("--version")) => println!(
+            "{}Swift Package Manager - Swift {}",
+            std::env::var("LPM_TEST_SWIFT_VENDOR").unwrap_or_default(),
+            std::env::var(if via_xcrun {
+                "LPM_TEST_XCODE_SWIFT_TOOLS_VERSION"
+            } else {
+                "LPM_TEST_SWIFT_TOOLS_VERSION"
+            })
+            .unwrap_or_else(|_| "6.4.0".into())
+        ),
         (Some("package"), Some("reset")) => {}
         (Some("package"), Some("show-dependencies")) => {
             let exit_code = std::env::var("LPM_TEST_SWIFT_GRAPH_EXIT_CODE")
@@ -195,8 +208,22 @@ fn main() {
                 .ok()
                 .and_then(|value| value.parse::<i32>().ok())
                 .unwrap_or(0);
+            if exit_code == 0
+                && let Some(config_path) = remaining
+                    .windows(2)
+                    .find(|pair| pair[0] == "--config-path")
+                    .map(|pair| std::path::Path::new(&pair[1]))
+            {
+                let address = remaining[0].split_once("://").unwrap().1;
+                let (authority, path) = address.split_once('/').unwrap_or((address, ""));
+                let login_path = format!("/{path}");
+                std::fs::write(config_path.join("registries.json"), serde_json::to_vec(&serde_json::json!({
+                        "version":1,"registries":{},"authentication":{authority:{"type":"token","loginAPIPath":login_path}}
+                    })).unwrap()).unwrap();
+            }
             std::process::exit(exit_code);
         }
+        (Some("--version"), None) => println!("Swift version 6.4.0"),
         _ => std::process::exit(64),
     }
 }

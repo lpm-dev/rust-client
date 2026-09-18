@@ -11,6 +11,9 @@ use std::ffi::OsStr;
 use std::io::Read as _;
 use std::path::{Path, PathBuf};
 
+pub(crate) mod paths;
+mod requirement_edit;
+
 const SWIFT_PROCESS_OUTPUT_LIMIT: usize = lpm_common::CONFIG_FILE_SIZE_CAP_BYTES as usize;
 
 /// Convert an LPM package name to an SE-0292 registry identifier.
@@ -47,6 +50,7 @@ pub fn get_spm_targets(project_dir: &Path) -> Result<Vec<String>, LpmError> {
     command
         .args(["package", "dump-package"])
         .current_dir(project_dir);
+    paths::append_to(&mut command)?;
     let output = run_bounded_swift_output(command, "swift package dump-package")?;
 
     if !output.status.success() {
@@ -794,6 +798,9 @@ pub fn reconcile_registry_dependencies(
     for dependency in dependencies {
         validate_registry_identity(dependency.se0292_id)?;
         validate_manifest_value(dependency.requirement.version(), "version")?;
+        if let SwiftRequirement::UpToNextMinor { upper, .. } = &dependency.requirement {
+            validate_manifest_value(upper, "version")?;
+        }
         validate_manifest_value(dependency.product_name, "product_name")?;
     }
     let mut content = read_managed_text(manifest_path, "Package.swift")?;
@@ -814,9 +821,8 @@ pub fn reconcile_registry_dependencies(
                     })
             });
         if let Some(call) = existing_dependency {
-            if content[call.start..=call.close].trim() != desired_dependency {
-                content = replacement(&content, call.start, call.close + 1, &desired_dependency);
-            }
+            content =
+                requirement_edit::update_requirement(&content, call, &dependency.requirement)?;
         } else {
             content =
                 insert_into_dependencies_array(&content, &desired_dependency, Some("targets:"))?;
@@ -840,13 +846,14 @@ pub fn reconcile_registry_dependencies(
                             find_direct_string_argument(&content, call.open, call.close, "package")
                                 .as_deref()
                                 == Some(dependency.se0292_id)
+                                && find_direct_string_argument(
+                                    &content, call.open, call.close, "name",
+                                )
+                                .as_deref()
+                                    == Some(dependency.product_name)
                         })
                 });
-        if let Some(call) = existing_product {
-            if content[call.start..=call.close].trim() != desired_product {
-                content = replacement(&content, call.start, call.close + 1, &desired_product);
-            }
-        } else {
+        if existing_product.is_none() {
             content = insert_into_target_deps(&content, target_name, &desired_product)?;
         }
         edits.push(ManifestEdit {
@@ -1331,13 +1338,12 @@ pub(crate) fn run_swift_resolve_with_force(
     force: bool,
 ) -> Result<(), LpmError> {
     if force {
-        let status = swift_command()
-            .args(["package", "reset"])
-            .current_dir(project_dir)
-            .status()
-            .map_err(|error| {
-                LpmError::Registry(format!("Failed to reset generated Swift state: {error}"))
-            })?;
+        let mut command = swift_command();
+        command.args(["package", "reset"]);
+        paths::append_to(&mut command)?;
+        let status = command.current_dir(project_dir).status().map_err(|error| {
+            LpmError::Registry(format!("Failed to reset generated Swift state: {error}"))
+        })?;
         if !status.success() {
             return Err(LpmError::Registry(
                 "Swift package reset failed before the forced install".into(),
@@ -1346,6 +1352,7 @@ pub(crate) fn run_swift_resolve_with_force(
     }
     let mut command = swift_command();
     command.args(["package", "resolve"]);
+    paths::append_to(&mut command)?;
     if force {
         command.arg("--disable-dependency-cache");
     }
@@ -1384,6 +1391,7 @@ pub fn validate_swift_dependency_graph(
     command
         .args(["package", "show-dependencies", "--format", "json"])
         .current_dir(project_dir);
+    paths::append_to(&mut command)?;
     let output = run_bounded_swift_output(command, "swift package show-dependencies")?;
     if !output.status.success() {
         let diagnostic = String::from_utf8_lossy(&output.stderr);
@@ -2624,6 +2632,78 @@ let package = Package(
         let updated = std::fs::read_to_string(manifest_path).unwrap();
         assert!(updated.contains("from: \"2.0.0\""));
         assert!(!updated.contains("from: \"1.0.0\""));
+    }
+
+    #[test]
+    fn registry_reinstall_preserves_products_conditions_aliases_and_comments() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("Package.swift");
+        let original = r#"import PackageDescription
+let package = Package(
+    name: "App",
+    dependencies: [.package(id: "lpmdev.acme_kit", /* policy */ from: "1.0.0")],
+    targets: [.target(name: "App", dependencies: [
+        .product(name: "Core", package: "lpmdev.acme_kit"),
+        .product(name: "UI", package: "lpmdev.acme_kit", moduleAliases: ["UI": "KitUI"], condition: .when(platforms: [.iOS])),
+        .product(name: "UI", package: "lpmdev.acme_kit", condition: .when(platforms: [.macOS]))
+    ])]
+)
+"#;
+        std::fs::write(&path, original).unwrap();
+        for _ in 0..2 {
+            let edit =
+                add_registry_dependency(&path, "lpmdev.acme_kit", "1.0.0", "UI", "App").unwrap();
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+            assert!(edit.already_exists);
+        }
+        add_registry_dependency(&path, "lpmdev.acme_kit", "2.0.0", "UI", "App").unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            original.replace("1.0.0", "2.0.0")
+        );
+    }
+
+    #[test]
+    fn registry_product_addition_keeps_other_products_from_the_same_package() {
+        let directory = tempfile::tempdir().unwrap();
+        let wrapper = ensure_wrapper_package(directory.path()).unwrap();
+        add_wrapper_dependency(&wrapper.manifest_path, "lpmdev.acme_kit", "1.0.0", "Core").unwrap();
+        add_wrapper_dependency(&wrapper.manifest_path, "lpmdev.acme_kit", "1.0.0", "UI").unwrap();
+        let manifest = std::fs::read_to_string(&wrapper.manifest_path).unwrap();
+        assert!(manifest.contains(".product(name: \"Core\", package: \"lpmdev.acme_kit\")"));
+        assert!(manifest.contains(".product(name: \"UI\", package: \"lpmdev.acme_kit\")"));
+        let exports = std::fs::read_to_string(
+            wrapper
+                .manifest_path
+                .parent()
+                .unwrap()
+                .join("Sources/LPMDependencies/Exports.swift"),
+        )
+        .unwrap();
+        assert!(exports.contains("@_exported import Core"));
+        assert!(exports.contains("@_exported import UI"));
+    }
+
+    #[test]
+    fn registry_requirement_update_rejects_expressions_without_changing_the_manifest() {
+        for requirement in [
+            "from: minimumVersion",
+            "exact: version(1)",
+            "\"1.0.0\"...\"2.0.0\"",
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("Package.swift");
+            let original = format!(
+                r#"let package = Package(name: "App", dependencies: [.package(id: "lpmdev.acme_kit", {requirement})], targets: [.target(name: "App", dependencies: [])])"#
+            );
+            std::fs::write(&path, &original).unwrap();
+            let result = add_registry_dependency(&path, "lpmdev.acme_kit", "2.0.0", "UI", "App");
+            assert!(
+                result.is_err(),
+                "must preserve unsupported requirement: {requirement}"
+            );
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+        }
     }
 
     #[test]

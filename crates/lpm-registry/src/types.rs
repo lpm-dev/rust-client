@@ -366,35 +366,8 @@ pub struct SecurityFinding {
     pub file: Option<String>,
 }
 
-/// Swift package metadata (products, platforms) from SE-0292 manifest.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SwiftMeta {
-    #[serde(default)]
-    pub products: Vec<SwiftProduct>,
-
-    #[serde(default)]
-    pub platforms: Vec<SwiftPlatform>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SwiftProduct {
-    pub name: String,
-
-    #[serde(default, rename = "type")]
-    pub product_type: Option<serde_json::Value>,
-
-    #[serde(default)]
-    pub targets: Vec<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SwiftPlatform {
-    #[serde(default, rename = "platformName", alias = "name")]
-    pub platform_name: Option<String>,
-
-    #[serde(default)]
-    pub version: Option<String>,
-}
+mod swift;
+pub use swift::*;
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct DistInfo {
