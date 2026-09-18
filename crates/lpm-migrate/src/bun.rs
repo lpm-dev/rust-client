@@ -1,4 +1,4 @@
-//! Parser for Bun lockfiles (`bun.lock` JSON and `bun.lockb` binary).
+//! Parser for Bun lockfiles (`bun.lock` JSONC and `bun.lockb` binary).
 
 use crate::{
     BoundedMap, MAX_PACKAGES, MigratedPackage, enforce_package_limit, ensure_lockfile_size,
@@ -18,7 +18,7 @@ const BUN_CONVERSION_TIMEOUT: Duration = Duration::from_secs(30);
 // Public API
 // ---------------------------------------------------------------------------
 
-/// Parse a bun lockfile (either `bun.lock` JSON or `bun.lockb` binary).
+/// Parse a bun lockfile (either `bun.lock` JSONC or `bun.lockb` binary).
 pub fn parse(path: &Path) -> Result<Vec<MigratedPackage>, LpmError> {
     parse_with_options(path, true)
 }
@@ -44,38 +44,64 @@ fn parse_with_options(
     }
 }
 
-/// Parse a `bun.lock` (JSON format, Bun v1.2+).
+/// Parse a `bun.lock` (JSONC format, Bun v1.2+).
 fn parse_json_lockfile(path: &Path) -> Result<Vec<MigratedPackage>, LpmError> {
     let content = read_lockfile_snapshot(path)?;
     parse_json_str(&content)
 }
 
-/// Parse bun lockfile JSON from a string (for testing).
+/// Parse a Bun text lockfile with comments and trailing commas.
 pub fn parse_json_str(content: &str) -> Result<Vec<MigratedPackage>, LpmError> {
-    #[derive(serde::Deserialize)]
-    struct BunLockfile {
-        packages: Option<BoundedMap<serde_json::Map<String, serde_json::Value>, MAX_PACKAGES>>,
+    type Packages = BoundedMap<serde_json::Map<String, serde_json::Value>, MAX_PACKAGES>;
+    struct LockfileVisitor;
+    impl<'de> serde::de::Visitor<'de> for LockfileVisitor {
+        type Value = Option<Packages>;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("a Bun lockfile object")
+        }
+
+        fn visit_map<A: serde::de::MapAccess<'de>>(
+            self,
+            mut map: A,
+        ) -> Result<Self::Value, A::Error> {
+            let mut packages = None;
+            while let Some(key) = map.next_key::<String>()? {
+                if key == "packages" {
+                    if packages.is_some() {
+                        return Err(serde::de::Error::duplicate_field("packages"));
+                    }
+                    packages = Some(map.next_value()?);
+                } else {
+                    // IgnoredAny in the JSONC parser rejects trailing commas in objects.
+                    // Decode and discard each metadata field without retaining the root.
+                    map.next_value::<serde_json::Value>()?;
+                }
+            }
+            Ok(packages)
+        }
     }
 
-    let lockfile: BunLockfile = serde_json::from_str(content)
+    let mut deserializer = serde_json_lenient::Deserializer::from_str(content);
+    let lockfile = serde::Deserializer::deserialize_map(&mut deserializer, LockfileVisitor)
+        .and_then(|packages| deserializer.end().map(|()| packages))
         .map_err(|e| LpmError::Script(format!("failed to parse bun.lock: {e}")))?;
 
     let packages = lockfile
-        .packages
         .as_ref()
         .ok_or_else(|| LpmError::Script("bun.lock has no 'packages' block".to_string()))?;
     enforce_package_limit(packages.len())?;
 
-    // Build name → resolved_version lookup from all packages.
+    // Preserve package locations so nested dependencies resolve to their nearest version.
     // Each package entry's arr[0] is "name@version" with the exact resolved version.
     let mut version_lookup: HashMap<String, String> = HashMap::with_capacity(packages.len());
-    for (_key, value) in packages.iter() {
+    for (key, value) in packages.iter() {
         if let Some(arr) = value.as_array()
             && let Some(nv) = arr.first().and_then(|v| v.as_str())
         {
             let (n, v) = split_name_version(nv);
             if !n.is_empty() && !v.is_empty() {
-                version_lookup.insert(n, v);
+                version_lookup.insert(key.clone(), v);
             }
         }
     }
@@ -86,45 +112,103 @@ pub fn parse_json_str(content: &str) -> Result<Vec<MigratedPackage>, LpmError> {
         let arr = match value.as_array() {
             Some(a) => a,
             None => {
-                tracing::debug!("skipping non-array package entry: {key}");
-                continue;
+                return Err(LpmError::Script(format!(
+                    "bun.lock: package entry must be an array: {key}"
+                )));
             }
         };
 
         if arr.is_empty() {
-            continue;
+            return Err(LpmError::Script(format!(
+                "bun.lock: empty package entry: {key}"
+            )));
         }
 
-        // arr[0] = "name@version"
-        // arr[1] = tarball URL (or empty string)
-        // arr[2] = integrity hash (or empty string)
-        // arr[3] = metadata object (dependencies, optionalDependencies, etc.)
-        let name_version = arr[0].as_str().unwrap_or("");
+        let name_version = arr[0].as_str().ok_or_else(|| {
+            LpmError::Script(format!("bun.lock: package resolution must be text: {key}"))
+        })?;
         let (name, version) = split_name_version(name_version);
-        if name.is_empty() {
-            tracing::debug!("skipping unparseable bun package key: {key}");
-            continue;
+        if name.is_empty() || version.is_empty() {
+            return Err(LpmError::Script(format!(
+                "bun.lock: invalid package resolution: {key}"
+            )));
         }
-
-        let resolved = arr
-            .get(1)
-            .and_then(|v| v.as_str())
-            .filter(|s| !s.is_empty())
-            .map(|s| s.to_string());
-
-        let integrity = arr
-            .get(2)
-            .and_then(|v| v.as_str())
-            .filter(|s| !s.is_empty())
-            .map(|s| s.to_string());
-
-        let metadata = arr.get(3);
+        let (resolved, integrity, metadata) = if lpm_semver::Version::parse(&version).is_ok() {
+            let source = arr.get(1).and_then(|value| value.as_str()).ok_or_else(|| {
+                LpmError::Script(format!("bun.lock: missing package source: {key}"))
+            })?;
+            let (metadata, integrity) = match (arr.get(2), arr.get(3)) {
+                (Some(metadata), Some(integrity))
+                    if metadata.is_object() && integrity.is_string() =>
+                {
+                    (metadata, integrity)
+                }
+                // Retain compatibility with files accepted by older CLI releases.
+                (Some(integrity), Some(metadata))
+                    if metadata.is_object() && integrity.is_string() =>
+                {
+                    (metadata, integrity)
+                }
+                _ => {
+                    return Err(LpmError::Script(format!(
+                        "bun.lock: invalid package metadata or integrity: {key}"
+                    )));
+                }
+            };
+            (
+                if source.is_empty() {
+                    None
+                } else {
+                    Some(source.to_owned())
+                },
+                integrity
+                    .as_str()
+                    .filter(|value| !value.is_empty())
+                    .map(str::to_owned),
+                Some(metadata),
+            )
+        } else {
+            let supported_reference = [
+                "workspace:",
+                "root:",
+                "file:",
+                "link:",
+                "git:",
+                "git+",
+                "github:",
+                "http://",
+                "https://",
+                "./",
+                "../",
+                "/",
+                "~/",
+            ]
+            .iter()
+            .any(|prefix| version.starts_with(prefix))
+                || version.ends_with(".tgz");
+            if !supported_reference || arr.get(1).is_some_and(|metadata| !metadata.is_object()) {
+                return Err(LpmError::Script(format!(
+                    "bun.lock: invalid non-registry package entry: {key}"
+                )));
+            }
+            let source = if version.starts_with("root:") {
+                "workspace:root".to_owned()
+            } else if ["workspace:", "file:", "link:", "git:", "git+", "github:"]
+                .iter()
+                .any(|prefix| version.starts_with(prefix))
+            {
+                version.clone()
+            } else {
+                format!("file:{version}")
+            };
+            (Some(source), None, arr.get(1))
+        };
 
         // Parse dependencies from metadata, resolving ranges to exact versions
         let mut dependencies =
-            extract_deps_from_metadata(metadata, "dependencies", &version_lookup);
+            extract_deps_from_metadata(metadata, "dependencies", key, &version_lookup);
         let optional_deps =
-            extract_deps_from_metadata(metadata, "optionalDependencies", &version_lookup);
+            extract_deps_from_metadata(metadata, "optionalDependencies", key, &version_lookup);
 
         let is_optional = metadata
             .and_then(|m| m.get("optional"))
@@ -195,7 +279,11 @@ fn parse_binary_lockfile(
     drop(input);
 
     let output = run_bun_converter(snapshot.path(), BUN_CONVERSION_TIMEOUT)?;
-    parse_json_str(&output)
+    if output.trim_start().starts_with('{') {
+        parse_json_str(&output)
+    } else {
+        crate::yarn::parse_str(&output)
+    }
 }
 
 fn run_bun_converter(path: &Path, timeout: Duration) -> Result<String, LpmError> {
@@ -395,11 +483,8 @@ fn terminate_bun_converter_with(
 /// Handles scoped packages: `"@scope/name@1.0.0"` -> `("@scope/name", "1.0.0")`.
 /// Finds the last `@` that is not at position 0.
 fn split_name_version(s: &str) -> (String, String) {
-    let at_pos = s
-        .char_indices()
-        .rev()
-        .find(|&(i, c)| c == '@' && i > 0)
-        .map(|(i, _)| i);
+    let start = usize::from(s.starts_with('@'));
+    let at_pos = s[start..].find('@').map(|position| position + start);
 
     match at_pos {
         Some(pos) => (s[..pos].to_string(), s[pos + 1..].to_string()),
@@ -414,6 +499,7 @@ fn split_name_version(s: &str) -> (String, String) {
 fn extract_deps_from_metadata(
     metadata: Option<&serde_json::Value>,
     field: &str,
+    package_key: &str,
     version_lookup: &HashMap<String, String>,
 ) -> Vec<(String, String)> {
     let deps = metadata
@@ -425,9 +511,8 @@ fn extract_deps_from_metadata(
             let mut out: Vec<(String, String)> = obj
                 .keys()
                 .filter_map(|dep_name| {
-                    version_lookup
-                        .get(dep_name.as_str())
-                        .map(|exact_ver| (dep_name.clone(), exact_ver.clone()))
+                    resolve_bun_dependency(package_key, dep_name, version_lookup)
+                        .map(|exact_ver| (dep_name.clone(), exact_ver.to_owned()))
                 })
                 .collect();
             out.sort_by(|a, b| a.0.cmp(&b.0));
@@ -435,6 +520,37 @@ fn extract_deps_from_metadata(
         }
         None => Vec::new(),
     }
+}
+
+fn resolve_bun_dependency<'a>(
+    package_key: &str,
+    dependency: &str,
+    versions: &'a HashMap<String, String>,
+) -> Option<&'a str> {
+    let mut current = Some(package_key);
+    let mut candidate = String::with_capacity(package_key.len() + dependency.len() + 1);
+    while let Some(location) = current {
+        candidate.clear();
+        candidate.push_str(location);
+        candidate.push('/');
+        candidate.push_str(dependency);
+        if let Some(version) = versions.get(&candidate) {
+            return Some(version);
+        }
+        current = location.rfind('/').and_then(|end| {
+            let parent = &location[..end];
+            if parent
+                .rsplit('/')
+                .next()
+                .is_some_and(|part| part.starts_with('@'))
+            {
+                parent.rfind('/').map(|end| &parent[..end])
+            } else {
+                Some(parent)
+            }
+        });
+    }
+    versions.get(dependency).map(String::as_str)
 }
 
 // ---------------------------------------------------------------------------

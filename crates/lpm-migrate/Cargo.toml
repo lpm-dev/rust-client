@@ -9,12 +9,16 @@ license.workspace = true
 [dependencies]
 lpm-lockfile.workspace = true
 lpm-common.workspace = true
+lpm-semver.workspace = true
 serde = { workspace = true }
 serde_json = { workspace = true }
+serde_json_lenient = "0.2.4"
 serde_yaml = "0.9"
 glob = { workspace = true }
 tracing = { workspace = true }
 tempfile = "3"
+cap-std = "4.0.2"
+cap-fs-ext.workspace = true
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

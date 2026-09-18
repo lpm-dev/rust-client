@@ -117,8 +117,24 @@ pub fn write_file_atomic_in_dir_with<T, E>(
 where
     E: From<io::Error>,
 {
+    write_file_atomic_in_dir_with_options(directory, destination, AtomicWriteOptions::new(), write)
+}
+
+/// Replace a file through a retained directory with explicit permissions and durability.
+pub fn write_file_atomic_in_dir_with_options<T, E>(
+    directory: &cap_std::fs::Dir,
+    destination: &OsStr,
+    options: AtomicWriteOptions,
+    write: impl FnOnce(&mut cap_std::fs::File) -> Result<T, E>,
+) -> Result<T, E>
+where
+    E: From<io::Error>,
+{
     validate_relative_file_name(destination).map_err(E::from)?;
-    let exact_mode = capability_destination_mode(directory, destination).map_err(E::from)?;
+    let exact_mode = match options.unix_mode {
+        Some(mode) => Some(mode),
+        None => capability_destination_mode(directory, destination).map_err(E::from)?,
+    };
     let (temporary_name, mut temporary) =
         create_capability_temporary(directory, exact_mode).map_err(E::from)?;
 
@@ -127,8 +143,20 @@ where
         if let Some(mode) = exact_mode {
             set_capability_file_mode(&temporary, mode).map_err(E::from)?;
         }
+        if options.sync_file {
+            temporary.sync_all().map_err(E::from)?;
+        }
         replace_capability_file(directory, &temporary_name, destination, temporary)
             .map_err(E::from)?;
+        #[cfg(unix)]
+        if options.sync_parent {
+            directory
+                .try_clone()
+                .map_err(E::from)?
+                .into_std_file()
+                .sync_all()
+                .map_err(E::from)?;
+        }
         Ok(output)
     })();
     if result.is_err() {

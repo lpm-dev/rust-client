@@ -275,15 +275,36 @@ pub struct SkippedPackage {
 ///
 /// Does NOT write files — caller decides what to do with the result.
 pub fn migrate(project_dir: &Path) -> Result<MigrateResult, LpmError> {
-    // Detect source
-    let source = detect::detect_source(project_dir)?;
-
-    // Parse foreign lockfile into common intermediate
-    let mut packages = match source.kind {
-        SourceKind::Npm => npm::parse(&source.path, source.version)?,
-        SourceKind::Yarn => yarn::parse(&source.path, project_dir)?,
-        SourceKind::Pnpm => pnpm::parse(&source.path, source.version)?,
-        SourceKind::Bun => bun::parse(&source.path)?,
+    let selected = detect::detect_lockfile(project_dir)?.ok_or_else(|| LpmError::Script(
+        "no lockfile found. Expected package-lock.json, yarn.lock, pnpm-lock.yaml, bun.lockb, or bun.lock".into(),
+    ))?;
+    let (version, mut packages) = if selected.kind == SourceKind::Bun
+        && selected
+            .path
+            .extension()
+            .is_some_and(|extension| extension == "lockb")
+    {
+        (0, bun::parse_selected(&selected.path)?)
+    } else {
+        let snapshot = read_lockfile_snapshot(&selected.path)?;
+        if selected.kind == SourceKind::Npm {
+            let parsed = npm::parse_snapshot(&snapshot)?;
+            (parsed.version, parsed.packages)
+        } else {
+            let version = detect::snapshot_version(&snapshot, &selected.path, selected.kind)?;
+            let packages = match selected.kind {
+                SourceKind::Yarn => yarn::parse_str(&snapshot)?,
+                SourceKind::Pnpm => pnpm::parse_str(&snapshot)?,
+                SourceKind::Bun => bun::parse_json_str(&snapshot)?,
+                SourceKind::Npm => unreachable!("npm snapshot was parsed above"),
+            };
+            (version, packages)
+        }
+    };
+    let source = DetectedSource {
+        kind: selected.kind,
+        path: selected.path,
+        version,
     };
 
     // Guard against corrupt/malicious lockfiles with excessive entries

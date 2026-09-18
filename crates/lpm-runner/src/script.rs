@@ -461,6 +461,25 @@ pub fn run_script_captured(
     env_mode: Option<&str>,
     bin_hint: &ManagedRuntimeHint,
 ) -> Result<ScriptOutput, LpmError> {
+    run_script_captured_with_reserved_stdout(
+        project_dir,
+        script_name,
+        extra_args,
+        env_mode,
+        bin_hint,
+        false,
+    )
+}
+
+/// Run package scripts and their hooks with live output on stderr when stdout is reserved.
+pub fn run_script_captured_with_reserved_stdout(
+    project_dir: &Path,
+    script_name: &str,
+    extra_args: &[String],
+    env_mode: Option<&str>,
+    bin_hint: &ManagedRuntimeHint,
+    reserve_stdout: bool,
+) -> Result<ScriptOutput, LpmError> {
     let (script_cmd, scripts) = resolve_script_command(project_dir, script_name)?;
 
     let path = bin_path::build_path_with_bins_pre_resolved(project_dir, bin_hint)?;
@@ -474,12 +493,17 @@ pub fn run_script_captured(
         let pre_name = hooks::pre_hook_name(script_name);
         tracing::debug!("running pre-hook: {pre_name}");
 
-        let status = shell::spawn_shell(&ShellCommand {
+        let hook = ShellCommand {
             command: pre_cmd,
             cwd: project_dir,
             path: &path,
             envs: &env_vars,
-        })?;
+        };
+        let status = if reserve_stdout {
+            shell::spawn_shell_tee_with_reserved_stdout(&hook, true)?.status
+        } else {
+            shell::spawn_shell(&hook)?
+        };
 
         if !status.success() {
             let code = status.code().unwrap_or(1);
@@ -492,12 +516,15 @@ pub fn run_script_captured(
     let full_cmd = assemble_shell_command(&script_cmd, extra_args, project_dir, &path)?;
 
     // Run the main script with tee capture
-    let captured = shell::spawn_shell_tee(&ShellCommand {
-        command: &full_cmd,
-        cwd: project_dir,
-        path: &path,
-        envs: &env_vars,
-    })?;
+    let captured = shell::spawn_shell_tee_with_reserved_stdout(
+        &ShellCommand {
+            command: &full_cmd,
+            cwd: project_dir,
+            path: &path,
+            envs: &env_vars,
+        },
+        reserve_stdout,
+    )?;
 
     if !captured.status.success() {
         return Err(LpmError::ExitCode(shell::exit_code(&captured.status)));
@@ -508,12 +535,17 @@ pub fn run_script_captured(
         let post_name = hooks::post_hook_name(script_name);
         tracing::debug!("running post-hook: {post_name}");
 
-        let status = shell::spawn_shell(&ShellCommand {
+        let hook = ShellCommand {
             command: post_cmd,
             cwd: project_dir,
             path: &path,
             envs: &env_vars,
-        })?;
+        };
+        let status = if reserve_stdout {
+            shell::spawn_shell_tee_with_reserved_stdout(&hook, true)?.status
+        } else {
+            shell::spawn_shell(&hook)?
+        };
 
         if !status.success() {
             let code = status.code().unwrap_or(1);

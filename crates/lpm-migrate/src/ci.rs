@@ -112,35 +112,24 @@ fn generate_gitlab_ci() -> String {
 #   Settings → CI/CD → Variables → Add variable (masked, protected)
 image: node:22
 
-stages:
-  - install
-  - build
-  - test
-
-install:
-  stage: install
-  script:
+default:
+  before_script:
     - npm install -g @lpm-registry/cli
     - lpm install
-  variables:
-    LPM_TOKEN: $LPM_TOKEN
-  artifacts:
-    paths:
-      - node_modules/
+
+stages:
+  - build
+  - test
 
 build:
   stage: build
   script:
     - lpm run build
-  dependencies:
-    - install
 
 test:
   stage: test
   script:
     - lpm run test
-  dependencies:
-    - install
 "#
     .to_string()
 }

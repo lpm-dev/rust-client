@@ -1,460 +1,317 @@
-//! Backup and rollback for migration files.
-//!
-//! Before overwriting any files (lpm.lock, .npmrc, etc.), we create `.backup`
-//! copies. On failure, the caller can roll back to the original state.
-//!
-//! ## Manifest format
-//!
-//! After a successful migration, [`MigrationBackup::write_manifest`] persists
-//! the backup state to `.lpm-migrate-manifest.json` in the project root so
-//! `lpm migrate --rollback` can restore the pre-migration state later.
-//!
-//! The current format (`"version": 2`) records **project-relative POSIX
-//! paths** for both backed-up and newly-created files, so files in nested
-//! directories (e.g. `patches/react@18.0.0.patch`) round-trip correctly.
-//!
-//! Backwards compatibility:
-//!
-//! - **No-manifest fallback.** If no manifest is present at all, rollback
-//!   falls back to scanning the project root for `.backup` files. This
-//!   path is preserved so users with in-flight migrations from older LPM
-//!   versions can still roll back after upgrading.
-//! - **v1 manifests (basenames, no version field).** Read by the same
-//!   scan-and-filter path used for the no-manifest fallback. v1 only ever
-//!   stored basenames in the project root, so the scan path is sufficient.
-//!
-//! Only the v2 path is exercised by new migrations; v1 reads are best-effort.
-//!
-//! ## Path containment
-//!
-//! Manifest paths are validated before any filesystem operation:
-//!
-//! - rejected: absolute paths
-//! - rejected: any path containing a `..` component
-//! - rejected: paths that, after `canonicalize`, escape the project root
-//!
-//! The manifest is written by LPM itself, but defense-in-depth costs nothing
-//! and protects against a malformed manifest from a third-party tool, a
-//! corrupted on-disk write, or a partial manual edit.
+//! Persistent migration snapshots and rollback within a project boundary.
+
+mod files;
 
 use lpm_common::LpmError;
+use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::path::{Component, Path, PathBuf};
 
-/// Name of the manifest file written alongside backups.
 const MANIFEST_FILENAME: &str = ".lpm-migrate-manifest.json";
-
-/// Current manifest schema version.
 const MANIFEST_VERSION: u32 = 2;
 
-/// Tracks files that have been backed up during a migration.
-#[derive(Debug)]
+#[derive(Debug, Deserialize, Serialize)]
+struct BackupEntry {
+    original: String,
+    backup: String,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct Manifest {
+    #[serde(default = "legacy_version")]
+    version: u32,
+    #[serde(default)]
+    backups: Vec<BackupEntry>,
+    #[serde(default)]
+    created: Vec<String>,
+}
+
+fn legacy_version() -> u32 {
+    1
+}
+
+/// Tracks original files across migration retries until rollback or cleanup.
+#[derive(Debug, Default)]
 pub struct MigrationBackup {
-    /// (original_path, backup_path, existed_before) tuples.
     backups: Vec<(PathBuf, PathBuf, bool)>,
+    project_dir: Option<PathBuf>,
+    tracked: HashSet<PathBuf>,
 }
 
 impl MigrationBackup {
-    /// Create a new empty backup tracker.
+    /// Create an empty tracker. Use `for_project` to resume persistent snapshots.
     pub fn new() -> Self {
-        Self {
+        Self::default()
+    }
+
+    /// Load and validate the original snapshots from an earlier migration.
+    pub fn for_project(project_dir: &Path) -> Result<Self, LpmError> {
+        let mut tracker = Self {
             backups: Vec::new(),
-        }
-    }
-
-    /// Back up a file before modifying it.
-    ///
-    /// - If the file exists, copies it to `<path>.backup`.
-    /// - If it doesn't exist, records that it was newly created (for removal on rollback).
-    pub fn backup_file(&mut self, path: &Path) -> Result<(), LpmError> {
-        let backup_path = {
-            let mut name = path.as_os_str().to_os_string();
-            name.push(".backup");
-            PathBuf::from(name)
+            project_dir: Some(project_dir.to_path_buf()),
+            tracked: HashSet::new(),
         };
-
-        let existed = path.exists();
-
-        if existed {
-            std::fs::copy(path, &backup_path).map_err(|e| {
-                LpmError::Script(format!("failed to backup {}: {e}", path.display()))
-            })?;
-
-            // Restrict backup permissions — backups may contain auth tokens
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                let _ =
-                    std::fs::set_permissions(&backup_path, std::fs::Permissions::from_mode(0o600));
-            }
+        if let Some(manifest) = read_manifest(project_dir)? {
+            let entries = manifest_entries(project_dir, manifest)?;
+            validate_entries(project_dir, &entries)?;
+            tracker.tracked = entries.iter().map(|(path, _, _)| path.clone()).collect();
+            tracker.backups = entries;
         }
-
-        self.backups
-            .push((path.to_path_buf(), backup_path, existed));
-        Ok(())
+        Ok(tracker)
     }
 
-    /// Roll back all backed-up files to their original state.
-    ///
-    /// - If the file existed before, restores from the `.backup` copy.
-    /// - If the file was newly created, removes it.
-    ///
-    /// This path does **not** clean up empty parent directories — that
-    /// happens only in [`rollback_from_backups`] where we have an
-    /// explicit project root to bound the walk. The immediate-failure
-    /// path is rare (mid-migrate error), and a leftover empty `patches/`
-    /// from a failed migration is harmless: the user's retry with
-    /// `lpm migrate --force` will reuse the directory cleanly.
-    pub fn rollback(&self) -> Result<(), LpmError> {
-        for (original, backup, existed) in &self.backups {
-            if *existed {
-                // Restore from backup
-                if backup.exists() {
-                    std::fs::copy(backup, original).map_err(|e| {
-                        LpmError::Script(format!(
-                            "failed to restore {} from backup: {e}",
-                            original.display()
-                        ))
-                    })?;
-                }
-            } else {
-                // File was newly created — remove it
-                if original.exists() {
-                    std::fs::remove_file(original).map_err(|e| {
-                        LpmError::Script(format!(
-                            "failed to remove newly created {}: {e}",
-                            original.display()
-                        ))
-                    })?;
-                }
-            }
-        }
-
-        Ok(())
-    }
-
-    /// Write a manifest file listing all backed-up and newly created files.
-    ///
-    /// Used by `rollback_from_backups` to:
-    /// - restore files that existed before from their `.backup` copies
-    /// - remove files that were newly created by the migration
-    ///
-    /// Paths are written project-relative using POSIX separators so the
-    /// manifest is portable across platforms.
-    pub fn write_manifest(&self, project_dir: &Path) -> Result<(), LpmError> {
-        let backup_entries: Vec<serde_json::Value> = self
-            .backups
-            .iter()
-            .filter(|(_, _, existed)| *existed)
-            .map(|(original, backup, _)| {
-                let original_rel = relativize_to_posix(original, project_dir);
-                let backup_rel = relativize_to_posix(backup, project_dir);
-                serde_json::json!({
-                    "original": original_rel,
-                    "backup": backup_rel,
-                })
-            })
-            .collect();
-
-        let created_entries: Vec<serde_json::Value> = self
-            .backups
-            .iter()
-            .filter(|(_, _, existed)| !*existed)
-            .map(|(original, _, _)| serde_json::json!(relativize_to_posix(original, project_dir)))
-            .collect();
-
-        let manifest = serde_json::json!({
-            "version": MANIFEST_VERSION,
-            "backups": backup_entries,
-            "created": created_entries,
+    /// Preserve a file once, or record its absence before the first write.
+    pub fn backup_file(&mut self, path: &Path) -> Result<(), LpmError> {
+        let root = self.project_dir.as_deref().unwrap_or_else(|| {
+            path.ancestors()
+                .skip(1)
+                .find(|ancestor| ancestor.is_dir())
+                .unwrap_or(Path::new("."))
         });
-        let manifest_path = project_dir.join(MANIFEST_FILENAME);
-        let contents = serde_json::to_string_pretty(&manifest)?;
-        lpm_common::write_file_atomic_with_options(
-            &manifest_path,
-            contents,
-            lpm_common::AtomicWriteOptions::new()
-                .sync_file()
-                .sync_parent(),
-        )
-        .map_err(|e| LpmError::Script(format!("failed to write backup manifest: {e}")))?;
-        Ok(())
-    }
-
-    /// Clean up backup files and manifest after a successful migration.
-    pub fn cleanup_backups(&self) -> Result<(), LpmError> {
-        for (_, backup, _) in &self.backups {
-            if backup.exists() {
-                std::fs::remove_file(backup).map_err(|e| {
-                    LpmError::Script(format!(
-                        "failed to clean up backup {}: {e}",
-                        backup.display()
-                    ))
-                })?;
-            }
+        files::validate(root, path)?;
+        if self.tracked.contains(path) {
+            return Ok(());
         }
-        // Also remove manifest if any backup existed in a known directory
-        if let Some((original, _, _)) = self.backups.first()
-            && let Some(dir) = original.parent()
-        {
-            let manifest_path = dir.join(MANIFEST_FILENAME);
-            if manifest_path.exists() {
-                let _ = std::fs::remove_file(&manifest_path);
-            }
-        }
-        Ok(())
-    }
-}
-
-impl Default for MigrationBackup {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-/// Rollback from `.backup` files found in the project directory.
-///
-/// Reads `.lpm-migrate-manifest.json` if present and dispatches to the
-/// matching format handler:
-///
-/// - **v2 manifest** (`"version": 2`): iterates manifest entries directly
-///   to support nested paths like `patches/react@18.0.0.patch`. Validates
-///   each path for containment before any filesystem operation. Removes
-///   newly-created empty directories (e.g. `patches/`) on the way out.
-/// - **v1 manifest or no `version` field**: legacy compatibility path —
-///   scans the project root for `.backup` files and filters by the
-///   manifest's `backups` array. Used for migrations created by older
-///   LPM versions that only ever wrote basenames.
-/// - **no manifest at all**: same scan-only behavior as the v1 path. Lets
-///   anyone with stray `.backup` files on disk still roll back.
-///
-/// Returns the list of restored / removed paths (project-relative for
-/// v2, basenames for v1) for the human summary.
-pub fn rollback_from_backups(project_dir: &Path) -> Result<Vec<String>, LpmError> {
-    let manifest_path = project_dir.join(MANIFEST_FILENAME);
-
-    match lpm_common::read_text_file_capped(&manifest_path, lpm_common::STATE_FILE_SIZE_CAP_BYTES) {
-        Ok(content) => {
-            let manifest: serde_json::Value = serde_json::from_str(&content)
-                .map_err(|e| LpmError::Script(format!("failed to parse backup manifest: {e}")))?;
-
-            let version = manifest
-                .get("version")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(1);
-
-            if version == MANIFEST_VERSION as u64 {
-                return rollback_v2(project_dir, &manifest, &manifest_path);
-            }
-            // Fall through to the legacy scan path for v1 (and any other
-            // unknown version — best-effort recovery is preferable to
-            // erroring out and stranding the user).
-            return rollback_legacy_scan(project_dir, Some(&manifest), &manifest_path);
-        }
-        Err(lpm_common::BoundedReadError::NotFound { .. }) => {}
-        Err(error) => {
+        let backup = backup_path(path);
+        files::validate(root, &backup)?;
+        if files::exists(root, &backup)? {
             return Err(LpmError::Script(format!(
-                "failed to read backup manifest: {error}"
+                "refusing to replace an untracked backup {}; restore or move it before migration",
+                backup.display()
             )));
         }
-    }
-
-    rollback_legacy_scan(project_dir, None, &manifest_path)
-}
-
-/// v2 rollback: enumerate manifest entries, restore nested paths, clean
-/// up empty created directories.
-fn rollback_v2(
-    project_dir: &Path,
-    manifest: &serde_json::Value,
-    manifest_path: &Path,
-) -> Result<Vec<String>, LpmError> {
-    let mut restored: Vec<String> = Vec::new();
-    let mut removed_files: Vec<PathBuf> = Vec::new();
-
-    // Restore from backup entries.
-    if let Some(backups) = manifest.get("backups").and_then(|b| b.as_array()) {
-        for entry in backups {
-            let original = entry
-                .get("original")
-                .and_then(|v| v.as_str())
-                .ok_or_else(|| {
-                    LpmError::Script("backup manifest entry missing `original` field".into())
-                })?;
-            let backup = entry
-                .get("backup")
-                .and_then(|v| v.as_str())
-                .ok_or_else(|| {
-                    LpmError::Script("backup manifest entry missing `backup` field".into())
-                })?;
-
-            let original_path = resolve_manifest_path(project_dir, original)?;
-            let backup_path = resolve_manifest_path(project_dir, backup)?;
-
-            if !backup_path.exists() {
-                // Skip silently — the backup file was already removed (e.g.,
-                // user deleted .backup files manually after success). The
-                // user might have intentionally accepted the new state.
-                continue;
-            }
-
-            if let Some(parent) = original_path.parent()
-                && !parent.exists()
-            {
-                std::fs::create_dir_all(parent).map_err(|e| {
-                    LpmError::Script(format!(
-                        "failed to create parent directory for {}: {e}",
-                        original_path.display()
-                    ))
-                })?;
-            }
-
-            std::fs::copy(&backup_path, &original_path).map_err(|e| {
-                LpmError::Script(format!(
-                    "failed to restore {} from backup: {e}",
-                    original_path.display()
-                ))
-            })?;
-
-            std::fs::remove_file(&backup_path).map_err(|e| {
-                LpmError::Script(format!(
-                    "failed to remove backup {}: {e}",
-                    backup_path.display()
-                ))
-            })?;
-
-            restored.push(original.to_string());
+        let existed = files::exists(root, path)?;
+        if existed {
+            files::create_backup(root, path, &backup)?;
         }
+        self.tracked.insert(path.to_path_buf());
+        self.backups.push((path.to_path_buf(), backup, existed));
+        Ok(())
     }
 
-    // Remove files that were newly created by the migration.
-    if let Some(created) = manifest.get("created").and_then(|c| c.as_array()) {
-        for entry in created {
-            let Some(rel) = entry.as_str() else {
-                continue;
-            };
-            let path = resolve_manifest_path(project_dir, rel)?;
-            if path.exists() {
-                if let Err(e) = std::fs::remove_file(&path) {
-                    tracing::warn!("failed to remove created file {}: {e}", path.display());
-                } else {
-                    restored.push(format!("{rel} (removed)"));
-                    removed_files.push(path);
+    /// Validate a batch before taking snapshots and persist its inventory before writes.
+    pub fn backup_files(&mut self, project_dir: &Path, paths: &[&Path]) -> Result<(), LpmError> {
+        for path in paths {
+            files::validate(project_dir, path)?;
+            if !self.tracked.contains(*path) {
+                let backup = backup_path(path);
+                if files::exists(project_dir, &backup)? {
+                    return Err(LpmError::Script(format!(
+                        "refusing to replace an untracked backup {}; restore or move it before migration",
+                        backup.display()
+                    )));
                 }
             }
         }
+        for path in paths {
+            if let Err(error) = self.backup_file(path) {
+                self.write_manifest(project_dir)?;
+                return Err(error);
+            }
+        }
+        self.write_manifest(project_dir)
     }
 
-    // Clean up empty parent directories that were created by
-    // the migration. Walks up each removed file's parent chain stopping
-    // at the project root. A non-empty directory is left alone so we
-    // never delete user content.
-    for path in &removed_files {
-        cleanup_empty_ancestors(path, Some(project_dir));
-    }
-
-    if manifest_path.exists() {
-        let _ = std::fs::remove_file(manifest_path);
-    }
-
-    Ok(restored)
-}
-
-/// Legacy rollback path: scans the project root for `.backup` files and
-/// filters by the manifest if one exists. Preserved for v1 manifests and
-/// for users without any manifest at all.
-fn rollback_legacy_scan(
-    project_dir: &Path,
-    manifest: Option<&serde_json::Value>,
-    manifest_path: &Path,
-) -> Result<Vec<String>, LpmError> {
-    let mut allowed_backups: Option<std::collections::HashSet<String>> = None;
-    let mut created_files: Vec<String> = Vec::new();
-
-    if let Some(m) = manifest {
-        let set = m["backups"]
-            .as_array()
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|entry| entry["backup"].as_str().map(String::from))
-                    .collect()
+    /// Restore snapshots without deleting recovery state, so a failed rollback can be retried.
+    pub fn rollback(&self) -> Result<(), LpmError> {
+        let plans = self
+            .backups
+            .iter()
+            .map(|(original, backup, existed)| {
+                let root = self
+                    .project_dir
+                    .as_deref()
+                    .unwrap_or_else(|| original.parent().unwrap_or(Path::new(".")));
+                files::Restore::prepare(root, original, backup, *existed)
             })
-            .unwrap_or_default();
-        allowed_backups = Some(set);
+            .collect::<Result<Vec<_>, _>>()?;
+        for mut plan in plans {
+            plan.apply()?;
+        }
+        Ok(())
+    }
 
-        if let Some(arr) = m["created"].as_array() {
-            for entry in arr {
-                if let Some(name) = entry.as_str() {
-                    created_files.push(name.to_string());
+    /// Persist the original snapshot inventory before a managed file changes.
+    pub fn write_manifest(&self, project_dir: &Path) -> Result<(), LpmError> {
+        let mut manifest = Manifest {
+            version: MANIFEST_VERSION,
+            backups: Vec::new(),
+            created: Vec::new(),
+        };
+        for (original, backup, existed) in &self.backups {
+            let original = files::relative(project_dir, original)?
+                .to_string_lossy()
+                .replace('\\', "/");
+            if *existed {
+                manifest.backups.push(BackupEntry {
+                    original,
+                    backup: files::relative(project_dir, backup)?
+                        .to_string_lossy()
+                        .replace('\\', "/"),
+                });
+            } else {
+                manifest.created.push(original);
+            }
+        }
+        files::write(
+            project_dir,
+            &project_dir.join(MANIFEST_FILENAME),
+            &serde_json::to_vec_pretty(&manifest)?,
+        )
+    }
+
+    /// Remove snapshots after the caller accepts the migration.
+    pub fn cleanup_backups(&self) -> Result<(), LpmError> {
+        for (original, backup, existed) in &self.backups {
+            if *existed {
+                let root = self
+                    .project_dir
+                    .as_deref()
+                    .unwrap_or_else(|| original.parent().unwrap_or(Path::new(".")));
+                files::remove(root, backup)?;
+            }
+        }
+        let root = self
+            .project_dir
+            .as_deref()
+            .or_else(|| self.backups.first().and_then(|(path, _, _)| path.parent()));
+        if let Some(root) = root {
+            files::remove(root, &root.join(MANIFEST_FILENAME))?;
+        }
+        Ok(())
+    }
+}
+
+fn backup_path(path: &Path) -> PathBuf {
+    let mut name = path.as_os_str().to_os_string();
+    name.push(".backup");
+    PathBuf::from(name)
+}
+
+fn read_manifest(project_dir: &Path) -> Result<Option<Manifest>, LpmError> {
+    let path = project_dir.join(MANIFEST_FILENAME);
+    let Some(contents) = files::read(project_dir, &path, lpm_common::STATE_FILE_SIZE_CAP_BYTES)?
+    else {
+        return Ok(None);
+    };
+    let manifest: Manifest = serde_json::from_slice(&contents)
+        .map_err(|error| LpmError::Script(format!("failed to parse backup manifest: {error}")))?;
+    if !matches!(manifest.version, 1 | MANIFEST_VERSION) {
+        return Err(LpmError::Script(format!(
+            "unsupported backup manifest version {}",
+            manifest.version
+        )));
+    }
+    Ok(Some(manifest))
+}
+
+fn manifest_entries(
+    project_dir: &Path,
+    manifest: Manifest,
+) -> Result<Vec<(PathBuf, PathBuf, bool)>, LpmError> {
+    let mut entries = Vec::with_capacity(manifest.backups.len() + manifest.created.len());
+    let mut paths = HashSet::with_capacity(entries.capacity() * 2);
+    for entry in manifest.backups {
+        let original = resolve_manifest_path(project_dir, &entry.original)?;
+        let backup = resolve_manifest_path(project_dir, &entry.backup)?;
+        if !entry.backup.ends_with(".backup")
+            || !paths.insert(original.clone())
+            || !paths.insert(backup.clone())
+        {
+            return Err(LpmError::Script(
+                "conflicting or invalid backup manifest paths".into(),
+            ));
+        }
+        entries.push((original, backup, true));
+    }
+    for entry in manifest.created {
+        let path = resolve_manifest_path(project_dir, &entry)?;
+        if !paths.insert(path.clone()) {
+            return Err(LpmError::Script("duplicate backup manifest path".into()));
+        }
+        entries.push((path.clone(), backup_path(&path), false));
+    }
+    for path in paths {
+        let rel = files::relative(project_dir, &path)?;
+        if rel == Path::new(MANIFEST_FILENAME) || rel.starts_with(".git") {
+            return Err(LpmError::Script(
+                "backup manifest targets reserved project state".into(),
+            ));
+        }
+    }
+    Ok(entries)
+}
+
+fn validate_entries(
+    project_dir: &Path,
+    entries: &[(PathBuf, PathBuf, bool)],
+) -> Result<(), LpmError> {
+    for (original, backup, existed) in entries {
+        files::Restore::prepare(project_dir, original, backup, *existed)?;
+    }
+    Ok(())
+}
+
+/// Restore every validated snapshot, then remove backups and recovery state.
+/// Legacy manifests and root-level backup files use the same containment checks.
+pub fn rollback_from_backups(project_dir: &Path) -> Result<Vec<String>, LpmError> {
+    let manifest = match read_manifest(project_dir)? {
+        Some(manifest) => manifest,
+        None => {
+            let mut manifest = Manifest {
+                version: MANIFEST_VERSION,
+                backups: Vec::new(),
+                created: Vec::new(),
+            };
+            for entry in std::fs::read_dir(project_dir)? {
+                let name = entry?.file_name().to_string_lossy().into_owned();
+                if let Some(original) = name.strip_suffix(".backup") {
+                    manifest.backups.push(BackupEntry {
+                        original: original.to_owned(),
+                        backup: name,
+                    });
                 }
             }
+            manifest
         }
-    }
-
-    let mut restored = Vec::new();
-
-    // Restore from .backup files in the project root.
-    let entries = std::fs::read_dir(project_dir).map_err(|e| {
-        LpmError::Script(format!(
-            "failed to read directory {}: {e}",
-            project_dir.display()
-        ))
-    })?;
-
-    for entry in entries {
-        let entry =
-            entry.map_err(|e| LpmError::Script(format!("failed to read directory entry: {e}")))?;
-
-        let path = entry.path();
-        let file_name = match path.file_name().and_then(|n| n.to_str()) {
-            Some(n) => n.to_string(),
-            None => continue,
-        };
-
-        if !file_name.ends_with(".backup") {
-            continue;
-        }
-
-        // If manifest exists, only restore files listed in it.
-        if let Some(ref allowed) = allowed_backups
-            && !allowed.contains(&file_name)
-        {
-            continue;
-        }
-
-        let original_name = &file_name[..file_name.len() - ".backup".len()];
-        let original_path = project_dir.join(original_name);
-
-        std::fs::copy(&path, &original_path).map_err(|e| {
-            LpmError::Script(format!(
-                "failed to restore {} from backup: {e}",
-                original_path.display()
-            ))
-        })?;
-
-        std::fs::remove_file(&path).map_err(|e| {
-            LpmError::Script(format!("failed to remove backup {}: {e}", path.display()))
-        })?;
-
-        restored.push(original_name.to_string());
-    }
-
-    // Remove files that were newly created by migration.
-    for name in &created_files {
-        let path = project_dir.join(name);
-        if path.exists() {
-            if let Err(e) = std::fs::remove_file(&path) {
-                tracing::warn!("failed to remove created file {}: {e}", path.display());
+    };
+    let entries = manifest_entries(project_dir, manifest)?;
+    let mut plans = entries
+        .iter()
+        .map(|(original, backup, existed)| {
+            files::Restore::prepare(project_dir, original, backup, *existed)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut restored = Vec::with_capacity(plans.len());
+    for ((original, _, existed), plan) in entries.iter().zip(&mut plans) {
+        if plan.apply()? {
+            let name = relativize_to_posix(original, project_dir);
+            restored.push(if *existed {
+                name
             } else {
-                restored.push(format!("{name} (removed)"));
-            }
+                format!("{name} (removed)")
+            });
         }
     }
-
-    if manifest_path.exists() {
-        let _ = std::fs::remove_file(manifest_path);
+    for (original, backup, existed) in &entries {
+        if *existed {
+            files::remove(project_dir, backup)?;
+        } else {
+            files::cleanup_empty_parents(project_dir, original)?;
+        }
     }
-
+    files::remove(project_dir, &project_dir.join(MANIFEST_FILENAME))?;
     Ok(restored)
+}
+
+/// Reject linked ancestors and non-regular destinations before migration writes.
+pub fn validate_output_path(project_dir: &Path, path: &Path) -> Result<(), LpmError> {
+    files::validate(project_dir, path)
+}
+
+/// Write a managed migration file without following project links.
+pub fn write_output(project_dir: &Path, path: &Path, contents: &[u8]) -> Result<(), LpmError> {
+    files::write(project_dir, path, contents)
 }
 
 /// Resolve a project-relative path to an absolute path, rejecting
@@ -570,25 +427,6 @@ fn relativize_to_posix(path: &Path, project_dir: &Path) -> String {
         })
         .collect::<Vec<_>>()
         .join("/")
-}
-
-/// Walk up the parent chain of `path` and remove empty directories until
-/// hitting `boundary` (exclusive) or a non-empty directory. Best-effort —
-/// silently skips directories that fail to remove (typically because
-/// they're not empty, which is the expected case for shared dirs).
-fn cleanup_empty_ancestors(path: &Path, boundary: Option<&Path>) {
-    let mut current = path.parent();
-    while let Some(dir) = current {
-        if let Some(b) = boundary
-            && dir == b
-        {
-            break;
-        }
-        match std::fs::remove_dir(dir) {
-            Ok(_) => current = dir.parent(),
-            Err(_) => break, // not empty, or permission denied — stop walking
-        }
-    }
 }
 
 #[cfg(test)]

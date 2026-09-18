@@ -591,6 +591,14 @@ pub struct CapturedOutput {
 /// into strings so stored data keeps its original semantics. Cache replay must
 /// sanitize the captured strings again at its terminal boundary.
 pub fn spawn_shell_tee(cmd: &ShellCommand) -> Result<CapturedOutput, LpmError> {
+    spawn_shell_tee_with_reserved_stdout(cmd, false)
+}
+
+/// Capture both streams, with optional live stdout routing to stderr.
+pub fn spawn_shell_tee_with_reserved_stdout(
+    cmd: &ShellCommand,
+    reserve_stdout: bool,
+) -> Result<CapturedOutput, LpmError> {
     let mut command = shell_process(cmd.command)?;
     command
         .current_dir(cmd.cwd)
@@ -621,7 +629,11 @@ pub fn spawn_shell_tee(cmd: &ShellCommand) -> Result<CapturedOutput, LpmError> {
     let stdout_handle = std::thread::spawn(move || -> String {
         child_stdout.map_or_else(String::new, |stdout| {
             drain_captured_stream(stdout, |line| {
-                println!("{}", sanitize_terminal_inline(line));
+                if reserve_stdout {
+                    eprintln!("{}", sanitize_terminal_inline(line));
+                } else {
+                    println!("{}", sanitize_terminal_inline(line));
+                }
             })
         })
     });

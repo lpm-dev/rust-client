@@ -1,5 +1,5 @@
 use super::cache::{
-    CacheStoreRequest, prepare_cache_context_with_config, try_cache_hit_with_context,
+    CacheStoreRequest, prepare_package_script_cache_context, try_cache_hit_with_context,
     try_cache_store_with_context,
 };
 use super::format::{print_captured_stderr, print_captured_stdout};
@@ -68,16 +68,38 @@ pub async fn run(
     bin_hint: &ManagedRuntimeHint,
     session: Option<Arc<lpm_auth::SessionManager>>,
 ) -> Result<(), LpmError> {
+    run_with_reserved_stdout(
+        project_dir,
+        script_name,
+        extra_args,
+        env_mode,
+        no_cache,
+        bin_hint,
+        session,
+        false,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn run_with_reserved_stdout(
+    project_dir: &Path,
+    script_name: &str,
+    extra_args: &[String],
+    env_mode: Option<&str>,
+    no_cache: bool,
+    bin_hint: &ManagedRuntimeHint,
+    session: Option<Arc<lpm_auth::SessionManager>>,
+    reserve_stdout: bool,
+) -> Result<(), LpmError> {
     // Read lpm.json once so the cache lookup and task predicate share the same config.
     let lpm_config = lpm_runner::lpm_json::read_lpm_json(project_dir).map_err(LpmError::Script)?;
     let command = script_command_for_display(project_dir, script_name, lpm_config.as_ref())?;
     let cache_context = if no_cache {
         None
     } else {
-        prepare_cache_context_with_config(
+        prepare_package_script_cache_context(
             project_dir,
-            None,
-            &[],
             script_name,
             env_mode,
             extra_args,
@@ -96,7 +118,11 @@ pub async fn run(
     {
         // Cache hit — replay output
         if !hit.stdout.is_empty() {
-            print_captured_stdout(&hit.stdout);
+            if reserve_stdout {
+                print_captured_stderr(&hit.stdout);
+            } else {
+                print_captured_stdout(&hit.stdout);
+            }
         }
         if !hit.stderr.is_empty() {
             print_captured_stderr(&hit.stderr);
@@ -127,33 +153,33 @@ pub async fn run(
 
     let start = std::time::Instant::now();
 
-    if caching_enabled {
+    if caching_enabled || reserve_stdout {
         // Run with tee capture (output streams to terminal + captured for cache)
-        let output = lpm_runner::script::run_script_captured(
+        let output = lpm_runner::script::run_script_captured_with_reserved_stdout(
             project_dir,
             script_name,
             extra_args,
             env_mode,
             bin_hint,
+            reserve_stdout,
         )?;
         let duration_ms = start.elapsed().as_millis() as u64;
-        let context = cache_context.as_ref().ok_or_else(|| {
-            LpmError::Task(format!("cache context missing for task '{script_name}'"))
-        })?;
-        let _ = try_cache_store_with_context(
-            CacheStoreRequest {
-                project_dir,
-                workspace_contract: None,
-                script_name,
-                env_mode,
-                extra_args,
-                bin_hint,
-                duration_ms,
-                stdout: &output.stdout,
-                stderr: &output.stderr,
-            },
-            context,
-        );
+        if let Some(context) = cache_context.as_ref() {
+            let _ = try_cache_store_with_context(
+                CacheStoreRequest {
+                    project_dir,
+                    workspace_contract: None,
+                    script_name,
+                    env_mode,
+                    extra_args,
+                    bin_hint,
+                    duration_ms,
+                    stdout: &output.stdout,
+                    stderr: &output.stderr,
+                },
+                context,
+            );
+        }
     } else {
         // Run normally (inherited stdio, no capture)
         lpm_runner::script::run_script(project_dir, script_name, extra_args, env_mode, bin_hint)?;

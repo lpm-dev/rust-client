@@ -46,35 +46,29 @@ fn parse_berry_str(content: &str) -> Result<Vec<MigratedPackage>, LpmError> {
     let mut entries = Vec::with_capacity(package_count);
 
     for (key, value) in root.iter() {
-        let Some(descriptor_key) = key.as_str() else {
-            continue;
-        };
+        let descriptor_key = key
+            .as_str()
+            .ok_or_else(|| LpmError::Script("yarn.lock: package descriptor must be text".into()))?;
         if descriptor_key == "__metadata" {
             continue;
         }
-
-        let Some(entry) = value.as_mapping() else {
-            tracing::debug!(
-                descriptor = descriptor_key,
-                "skipping non-mapping Yarn entry"
-            );
-            continue;
-        };
-
-        let Some(version) = mapping_string(entry, "version") else {
-            tracing::debug!(
-                descriptor = descriptor_key,
-                "skipping Yarn entry without version"
-            );
-            continue;
-        };
-        let Some(name) = yarn_descriptor_name(descriptor_key).map(str::to_owned) else {
-            tracing::debug!(
-                descriptor = descriptor_key,
-                "skipping Yarn entry with unparseable descriptor"
-            );
-            continue;
-        };
+        let entry = value.as_mapping().ok_or_else(|| {
+            LpmError::Script(format!(
+                "yarn.lock: package entry must be a mapping: {descriptor_key}"
+            ))
+        })?;
+        let version = mapping_string(entry, "version")
+            .filter(|version| !version.is_empty())
+            .ok_or_else(|| {
+                LpmError::Script(format!("yarn.lock: missing version for {descriptor_key}"))
+            })?;
+        let name = yarn_descriptor_name(descriptor_key)
+            .map(str::to_owned)
+            .ok_or_else(|| {
+                LpmError::Script(format!(
+                    "yarn.lock: invalid package descriptor: {descriptor_key}"
+                ))
+            })?;
 
         let resolution = mapping_string(entry, "resolution");
         let mut deps_with_ranges = extract_berry_deps(entry, "dependencies");
@@ -373,7 +367,9 @@ fn flush_and_start_new(
         });
         Ok(Some(State::InEntry))
     } else {
-        Ok(Some(State::TopLevel))
+        Err(LpmError::Script(format!(
+            "yarn.lock: invalid top-level line: {line}"
+        )))
     }
 }
 
@@ -432,6 +428,10 @@ fn parse_entries(content: &str) -> Result<Vec<YarnEntry>, LpmError> {
                         deps_with_ranges: Vec::new(),
                     });
                     state = State::InEntry;
+                } else {
+                    return Err(LpmError::Script(format!(
+                        "yarn.lock: invalid top-level line: {line}"
+                    )));
                 }
             }
             State::InEntry => {
@@ -507,6 +507,12 @@ fn parse_entries(content: &str) -> Result<Vec<YarnEntry>, LpmError> {
 }
 
 fn push_entry(entries: &mut Vec<YarnEntry>, entry: YarnEntry) -> Result<(), LpmError> {
+    if entry.version.is_empty() {
+        return Err(LpmError::Script(format!(
+            "yarn.lock: missing version for {}",
+            entry.name
+        )));
+    }
     enforce_package_limit(entries.len().saturating_add(1))?;
     entries.push(entry);
     Ok(())

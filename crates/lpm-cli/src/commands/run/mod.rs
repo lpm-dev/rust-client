@@ -4,6 +4,7 @@ mod parallel;
 mod runtime;
 mod sequential;
 mod single;
+pub(crate) use single::run_with_reserved_stdout;
 mod task;
 mod workspace;
 
