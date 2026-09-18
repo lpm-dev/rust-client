@@ -7,6 +7,10 @@
 //! Feature-gated tests require a real Swift toolchain.
 //! Run with: `cargo nextest run -p lpm-workflows --features swift-tests`
 
+#[path = "swift/configuration.rs"]
+mod configuration;
+#[path = "swift/manifest_variants.rs"]
+mod manifest_variants;
 mod support;
 #[path = "swift/xcode.rs"]
 mod xcode;
@@ -35,12 +39,7 @@ async fn swift_registry_fresh_configuration_contains_required_registries_object(
         .success();
 
     let config: serde_json::Value = serde_json::from_slice(
-        &std::fs::read(
-            project
-                .home()
-                .join(".swiftpm/configuration/registries.json"),
-        )
-        .unwrap(),
+        &std::fs::read(swiftpm_home(&project).join("configuration/registries.json")).unwrap(),
     )
     .unwrap();
     assert!(
@@ -55,9 +54,7 @@ async fn swift_registry_migrates_signing_action_to_current_registry_without_chan
     let cert = mount_swift_package(&mock).await;
     let project = swift_project();
     configure_existing_registry(&project, &mock.url(), &cert);
-    let config_path = project
-        .home()
-        .join(".swiftpm/configuration/registries.json");
+    let config_path = swiftpm_home(&project).join("configuration/registries.json");
     let mut config: serde_json::Value =
         serde_json::from_slice(&std::fs::read(&config_path).unwrap()).unwrap();
     config["security"]["scopeOverrides"] =
@@ -265,6 +262,14 @@ async fn mount_swift_package_with_security_metadata(
     cert
 }
 
+fn swiftpm_home(project: &TempProject) -> std::path::PathBuf {
+    if cfg!(target_os = "macos") {
+        project.home().join("Library/org.swift.swiftpm")
+    } else {
+        project.home().join(".config/swiftpm")
+    }
+}
+
 fn configure_existing_registry(project: &TempProject, registry_url: &str, cert: &[u8]) {
     project.write_file(
         ".swiftpm/configuration/registries.json",
@@ -277,9 +282,7 @@ fn configure_existing_registry(project: &TempProject, registry_url: &str, cert: 
         })
         .to_string(),
     );
-    let global_config = project
-        .home()
-        .join(".swiftpm/configuration/registries.json");
+    let global_config = swiftpm_home(project).join("configuration/registries.json");
     std::fs::create_dir_all(global_config.parent().unwrap()).unwrap();
     std::fs::write(
         global_config,
@@ -305,9 +308,7 @@ fn configure_existing_registry(project: &TempProject, registry_url: &str, cert: 
         .unwrap(),
     )
     .unwrap();
-    let cert_path = project
-        .home()
-        .join(".swiftpm/security/trusted-root-certs/lpm.der");
+    let cert_path = swiftpm_home(project).join("security/trusted-root-certs/lpm.der");
     std::fs::create_dir_all(cert_path.parent().unwrap()).unwrap();
     std::fs::write(cert_path, cert).unwrap();
 }
@@ -367,6 +368,9 @@ fn fake_swift_configuration(
     std::fs::copy(&swift_path, &xcode_path).unwrap();
     set_executable(&xcode_path);
 
+    let xcrun_path = bin_dir.join(if cfg!(windows) { "xcrun.exe" } else { "xcrun" });
+    std::fs::copy(&swift_path, &xcrun_path).unwrap();
+    set_executable(&xcrun_path);
     let existing_path = std::env::var_os("PATH").unwrap_or_default();
     let paths = std::iter::once(bin_dir).chain(std::env::split_paths(&existing_path));
     let path = std::env::join_paths(paths).expect("construct PATH with fake Swift");
@@ -2159,12 +2163,7 @@ async fn xcode_install_configures_workspace_scope_and_uses_app_deployment_target
         .assert()
         .success();
     let global: serde_json::Value = serde_json::from_slice(
-        &std::fs::read(
-            project
-                .home()
-                .join(".swiftpm/configuration/registries.json"),
-        )
-        .unwrap(),
+        &std::fs::read(swiftpm_home(&project).join("configuration/registries.json")).unwrap(),
     )
     .unwrap();
     assert_eq!(

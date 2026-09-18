@@ -26,21 +26,48 @@ struct PreparedSwiftInstall<'a> {
     request: &'a SwiftInstallRequest<'a>,
     se0292_id: String,
     product: &'a lpm_registry::SwiftProduct,
+    platforms: &'a [lpm_registry::SwiftPlatform],
 }
 
 fn prepare_swift_installs<'a>(
     requests: &'a [SwiftInstallRequest<'a>],
+    xcode: bool,
 ) -> Result<Vec<PreparedSwiftInstall<'a>>, LpmError> {
+    let needs_tools = requests.iter().any(|request| {
+        request
+            .ver_meta
+            .swift_meta
+            .as_ref()
+            .is_some_and(|meta| meta.manifest_set.is_some())
+    });
+    let current = if needs_tools {
+        let tools = swift_tools_version(false)?;
+        if xcode && tools != swift_tools_version(true)? {
+            return Err(LpmError::Registry("SwiftPM and Xcode use different tools versions. Select the same Swift toolchain before installing this package.".into()));
+        }
+        Some(tools)
+    } else {
+        None
+    };
     requests
         .iter()
         .map(|request| {
-            let product = request.ver_meta.swift_library_product().ok_or_else(|| {
-                LpmError::Registry(format!(
-                    "{}@{} does not publish a Swift library product",
-                    request.name.scoped(),
-                    request.version
-                ))
-            })?;
+            let selected = request
+                .ver_meta
+                .swift_meta
+                .as_ref()
+                .map(|meta| meta.select_manifest(current))
+                .transpose()?;
+            let product = selected
+                .as_ref()
+                .and_then(|manifest| manifest.library_product())
+                .ok_or_else(|| {
+                    LpmError::Registry(format!(
+                        "{}@{} does not publish a Swift library product",
+                        request.name.scoped(),
+                        request.version
+                    ))
+                })?;
             if product.targets.is_empty() {
                 return Err(LpmError::Registry(format!(
                     "Swift library product '{}' for {}@{} does not declare an importable module",
@@ -53,9 +80,42 @@ fn prepare_swift_installs<'a>(
                 request,
                 se0292_id: crate::swift_manifest::lpm_to_se0292_id(request.name),
                 product,
+                platforms: selected.map_or(&[], |manifest| manifest.platforms),
             })
         })
         .collect()
+}
+
+fn swift_tools_version(xcode: bool) -> Result<lpm_registry::SwiftToolsVersion, LpmError> {
+    let mut command = if xcode {
+        let mut command = std::process::Command::new("xcrun");
+        crate::swift_manifest::sanitize_swift_environment(&mut command);
+        command.arg("swift");
+        command
+    } else {
+        crate::swift_manifest::swift_command()
+    };
+    command.args(["package", "--version"]);
+    let output = crate::swift_manifest::run_bounded_swift_output(command, "SwiftPM tools version")?;
+    let text = String::from_utf8_lossy(&output.stdout);
+    if output.status.success()
+        && let Some(version) = text
+            .trim()
+            .split_once("Swift Package Manager - Swift ")
+            .filter(|(vendor, _)| {
+                vendor.len() <= 64
+                    && vendor
+                        .chars()
+                        .all(|c| c.is_ascii_alphanumeric() || matches!(c, ' ' | '-' | '.'))
+            })
+            .map(|(_, version)| version)
+            .and_then(|value| value.split_whitespace().next())
+            .and_then(|value| value.split('-').next())
+            .and_then(lpm_registry::SwiftToolsVersion::parse)
+    {
+        return Ok(version);
+    }
+    Err(LpmError::Registry("Cannot determine the SwiftPM tools version. Check that the selected Swift toolchain is installed.".into()))
 }
 
 pub(super) async fn run_swift_install_batch(
@@ -87,8 +147,12 @@ pub(super) async fn run_swift_install_spm_batch(
     requests: &[SwiftInstallRequest<'_>],
     options: SwiftInstallOptions<'_>,
 ) -> Result<serde_json::Value, LpmError> {
-    let prepared = prepare_swift_installs(requests)?;
     let manifest_dir = manifest_path.parent().unwrap_or(project_dir);
+    crate::commands::swift_registry::preflight_configuration(
+        options.client.base_url(),
+        manifest_dir,
+    )?;
+    let prepared = prepare_swift_installs(requests, false)?;
     let targets = crate::swift_manifest::get_spm_targets(manifest_dir)?;
     let target_name = select_spm_target(&targets, options.yes)?;
     let dependencies = prepared
@@ -140,8 +204,12 @@ pub(super) async fn run_swift_install_xcode_batch(
     requests: &[SwiftInstallRequest<'_>],
     options: SwiftInstallOptions<'_>,
 ) -> Result<serde_json::Value, LpmError> {
-    let prepared = prepare_swift_installs(requests)?;
     let project_root = xcodeproj_path.parent().unwrap_or(project_dir);
+    crate::commands::swift_registry::preflight_configuration(
+        options.client.base_url(),
+        &project_root.join(crate::swift_manifest::LPM_DEPS_REL_PATH),
+    )?;
+    let prepared = prepare_swift_installs(requests, true)?;
     let wrapper = crate::swift_manifest::ensure_wrapper_package(project_root)?;
     let wrapper_dir = wrapper.manifest_path.parent().unwrap_or(project_root);
     let coordinates = requests
@@ -164,32 +232,30 @@ pub(super) async fn run_swift_install_xcode_batch(
     );
     let containers = crate::xcode_project::native::containers(project_dir, xcodeproj_path)?;
     let mut platforms = crate::xcode_project::deployment_targets(xcodeproj_path)?;
-    for request in requests {
-        if let Some(metadata) = &request.ver_meta.swift_meta {
-            for platform in &metadata.platforms {
-                let name = match platform.platform_name.as_deref() {
-                    Some("macos") => "macOS",
-                    Some("ios") => "iOS",
-                    Some("tvos") => "tvOS",
-                    Some("watchos") => "watchOS",
-                    Some("visionos") => "visionOS",
-                    _ => continue,
-                };
-                let Some(version) = platform
-                    .version
-                    .as_ref()
-                    .filter(|value| crate::xcode_project::deployment_version(value).is_some())
-                else {
-                    continue;
-                };
-                let existing = platforms
-                    .entry(name.to_owned())
-                    .or_insert_with(|| version.clone());
-                if crate::xcode_project::deployment_version(version)
-                    > crate::xcode_project::deployment_version(existing)
-                {
-                    *existing = version.clone();
-                }
+    for package in &prepared {
+        for platform in package.platforms {
+            let name = match platform.platform_name.as_deref() {
+                Some("macos") => "macOS",
+                Some("ios") => "iOS",
+                Some("tvos") => "tvOS",
+                Some("watchos") => "watchOS",
+                Some("visionos") => "visionOS",
+                _ => continue,
+            };
+            let Some(version) = platform
+                .version
+                .as_ref()
+                .filter(|value| crate::xcode_project::deployment_version(value).is_some())
+            else {
+                continue;
+            };
+            let existing = platforms
+                .entry(name.to_owned())
+                .or_insert_with(|| version.clone());
+            if crate::xcode_project::deployment_version(version)
+                > crate::xcode_project::deployment_version(existing)
+            {
+                *existing = version.clone();
             }
         }
     }

@@ -1,3 +1,5 @@
+mod configuration;
+
 use crate::{auth_storage_notice, install_ui};
 use futures::StreamExt;
 use lpm_common::LpmError;
@@ -118,20 +120,84 @@ async fn run_swift_login(
                 .stderr(std::process::Stdio::null());
         }
     }
-    let status = command.status().await;
-    let cleanup = token_file.close();
-    match (status, cleanup) {
-        (Ok(status), Ok(())) => Ok(status),
-        (Err(command_error), Ok(())) => Err(LpmError::Registry(format!(
-            "swift login failed: {command_error}"
-        ))),
-        (Ok(_), Err(cleanup_error)) => Err(LpmError::CredentialStorage(format!(
-            "failed to remove the temporary SwiftPM token file: {cleanup_error}"
-        ))),
-        (Err(command_error), Err(cleanup_error)) => Err(LpmError::CredentialStorage(format!(
-            "swift login failed: {command_error}; the temporary token file also could not be removed: {cleanup_error}"
-        ))),
-    }
+    command
+        .arg("--security-path")
+        .arg(crate::swift_manifest::paths::security_dir()?);
+    let endpoint = reqwest::Url::parse(swift_registry_url)
+        .map_err(|error| LpmError::Registry(error.to_string()))?;
+    tokio::task::spawn_blocking(move || {
+        let mut command = command.into_std();
+        let mut status = None;
+        let host = swiftpm_registry_host(&endpoint);
+        let authority = match endpoint.port() {
+            Some(port) => format!("{host}:{port}"),
+            None => host.to_owned(),
+        };
+        let result = configuration::update(&configuration::global_path()?, host, |config| {
+            let staged = tempfile::tempdir()?;
+            let mut native_config = config.clone();
+            let root = ensure_json_object(&mut native_config)?;
+            root.entry("version")
+                .or_insert_with(|| serde_json::json!(1));
+            root.entry("registries")
+                .or_insert_with(|| serde_json::json!({}));
+            std::fs::write(
+                staged.path().join("registries.json"),
+                serde_json::to_vec(&native_config)?,
+            )?;
+            let login_status = command
+                .arg("--config-path")
+                .arg(staged.path())
+                .status()
+                .map_err(|error| LpmError::Registry(format!("swift login failed: {error}")))?;
+            status = Some(login_status);
+            if login_status.success() {
+                let native_config =
+                    configuration::load(&staged.path().join("registries.json"), host)?;
+                let entry = native_config
+                    .get("authentication")
+                    .and_then(|value| value.get(&authority))
+                    .and_then(serde_json::Value::as_object)
+                    .ok_or_else(|| {
+                        LpmError::Registry(
+                            "Swift login did not write its authentication configuration".into(),
+                        )
+                    })?;
+                let root = ensure_json_object(config)?;
+                root.entry("version")
+                    .or_insert_with(|| serde_json::json!(1));
+                root.entry("registries")
+                    .or_insert_with(|| serde_json::json!({}));
+                let authentication = root
+                    .entry("authentication")
+                    .or_insert_with(|| serde_json::json!({}));
+                let target = ensure_json_object(authentication)?
+                    .entry(&authority)
+                    .or_insert_with(|| serde_json::json!({}));
+                let target = ensure_json_object(target)?;
+                for key in ["type", "loginAPIPath"] {
+                    if let Some(value) = entry.get(key) {
+                        target.insert(key.into(), value.clone());
+                    } else {
+                        target.remove(key);
+                    }
+                }
+            }
+            Ok(())
+        });
+        let cleanup = token_file.close();
+        match (result, cleanup) {
+            (Err(error), _) => Err(error),
+            (Ok(_), Err(error)) => Err(LpmError::CredentialStorage(format!(
+                "failed to remove the temporary SwiftPM token file: {error}"
+            ))),
+            (Ok(_), Ok(())) => {
+                status.ok_or_else(|| LpmError::Registry("Swift login did not run".into()))
+            }
+        }
+    })
+    .await
+    .map_err(|error| LpmError::Registry(format!("Swift login task failed: {error}")))?
 }
 
 async fn configure_swift_authentication(
@@ -241,59 +307,35 @@ pub async fn run(
     json_output: bool,
     force: bool,
 ) -> Result<(), LpmError> {
+    run_in_directory(
+        session,
+        registry_url,
+        json_output,
+        force,
+        &std::env::current_dir()?,
+    )
+    .await
+}
+
+async fn run_in_directory(
+    session: &lpm_auth::SessionManager,
+    registry_url: &str,
+    json_output: bool,
+    force: bool,
+    cwd: &Path,
+) -> Result<(), LpmError> {
     let endpoint = swift_registry_endpoint(registry_url)?;
     let is_https = endpoint.scheme() == "https";
     let swift_registry_url = endpoint.to_string();
+    let manifest = crate::swift_manifest::find_package_swift(cwd);
+    let package_dir = manifest.as_deref().and_then(Path::parent).unwrap_or(cwd);
+    preflight_configuration(registry_url, package_dir)?;
 
     if !json_output {
         install_ui::phase_line(swift_package_manager_phase());
     }
 
-    // Step 1: Set the registry for the lpmdev scope
-    let mut args = vec![
-        "package-registry".to_string(),
-        "set".to_string(),
-        "--scope".to_string(),
-        "lpmdev".to_string(),
-    ];
-
-    if !is_https {
-        args.push("--allow-insecure-http".to_string());
-    }
-
-    args.push(swift_registry_url.clone());
-
-    // Use tokio::process::Command instead of std::process::Command
-    // to avoid blocking the async runtime thread.
-    // When json_output is true, suppress subprocess stdout/stderr
-    // to avoid interleaving with our JSON output.
-    let step1_result = if json_output {
-        swift_command()
-            .args(&args)
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .await
-    } else {
-        swift_command()
-            .args(&args)
-            .stdout(std::process::Stdio::inherit())
-            .stderr(std::process::Stdio::inherit())
-            .status()
-            .await
-    };
-
-    let status = step1_result.map_err(|e| {
-        LpmError::Registry(format!(
-            "failed to run swift command: {e}. Is Swift installed?"
-        ))
-    })?;
-
-    if !status.success() {
-        return Err(LpmError::Registry(
-            "swift package-registry set failed".into(),
-        ));
-    }
+    configure_project_scope(package_dir, &endpoint).await?;
     if !json_output {
         install_ui::done_line(scope_set_message(&swift_registry_url));
     }
@@ -398,27 +440,21 @@ enum ExistingScope {
     Absent,
 }
 
-/// Inspect `registries.json` and classify the state of the `lpmdev`
-/// scope. Pure, no IO failure leaks: any read/parse error is treated
-/// as `Absent` (the caller does a fresh setup, which produces a
-/// correct registry config).
+// SwiftPM uses Foundation URL.host, which omits IPv6 brackets.
+fn swiftpm_registry_host(endpoint: &reqwest::Url) -> &str {
+    let host = endpoint.host_str().unwrap_or_default();
+    host.strip_prefix('[')
+        .and_then(|value| value.strip_suffix(']'))
+        .unwrap_or(host)
+}
+
 fn evaluate_existing_lpmdev_scope(
     config_path: &std::path::Path,
     expected_url: &str,
 ) -> Result<ExistingScope, LpmError> {
-    let content = match lpm_common::read_text_file_capped(
-        config_path,
-        lpm_common::CONFIG_FILE_SIZE_CAP_BYTES,
-    ) {
-        Ok(content) => content,
-        Err(lpm_common::BoundedReadError::NotFound { .. }) => {
-            return Ok(ExistingScope::Absent);
-        }
-        Err(error) => return Err(LpmError::Registry(error.to_string())),
-    };
-    let Ok(json) = serde_json::from_str::<serde_json::Value>(&content) else {
-        return Ok(ExistingScope::Absent);
-    };
+    let endpoint =
+        reqwest::Url::parse(expected_url).map_err(|error| LpmError::Registry(error.to_string()))?;
+    let json = configuration::load(config_path, swiftpm_registry_host(&endpoint))?;
     let Some(scope) = json.get("registries").and_then(|r| r.get("lpmdev")) else {
         return Ok(ExistingScope::Absent);
     };
@@ -454,6 +490,7 @@ pub(crate) async fn ensure_configured_for_install(
     let is_https = endpoint.scheme() == "https";
     let swift_registry_url = endpoint.to_string();
 
+    preflight_configuration(registry_url, package_dir)?;
     let config_path = package_dir.join(".swiftpm/configuration/registries.json");
     let scope_matches = match evaluate_existing_lpmdev_scope(&config_path, &swift_registry_url)? {
         ExistingScope::Matches => true,
@@ -478,31 +515,7 @@ pub(crate) async fn ensure_configured_for_install(
     }
 
     if !scope_matches {
-        let mut args = vec![
-            "package-registry".to_string(),
-            "set".to_string(),
-            "--scope".to_string(),
-            "lpmdev".to_string(),
-        ];
-        if !is_https {
-            args.push("--allow-insecure-http".to_string());
-        }
-        args.push(swift_registry_url.clone());
-
-        let status = swift_command()
-            .args(&args)
-            .current_dir(package_dir)
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .await
-            .map_err(|e| LpmError::Registry(format!("failed to run swift: {e}")))?;
-
-        if !status.success() {
-            return Err(LpmError::Registry(
-                "Failed to configure SPM registry scope. Run `lpm swift-registry` manually.".into(),
-            ));
-        }
+        configure_project_scope(package_dir, &endpoint).await?;
         if !json_output {
             install_ui::done_line(scope_set_message(&swift_registry_url));
         }
@@ -540,32 +553,74 @@ pub(crate) async fn ensure_configured_for_install(
     })
 }
 
-pub(crate) fn ensure_xcode_registry_scope(registry_url: &str) -> Result<bool, LpmError> {
-    let expected = swift_registry_endpoint(registry_url)?.to_string();
-    let home = dirs::home_dir().ok_or_else(|| {
-        LpmError::Registry("Could not determine the SwiftPM configuration directory".into())
-    })?;
-    let path = home.join(".swiftpm/configuration/registries.json");
-    let text = lpm_common::read_text_file_capped(&path, lpm_common::CONFIG_FILE_SIZE_CAP_BYTES)
-        .map_err(|error| LpmError::Registry(error.to_string()))?;
-    let mut config: serde_json::Value = serde_json::from_str(&text)
-        .map_err(|error| LpmError::Registry(format!("Invalid SwiftPM configuration: {error}")))?;
-    if config["registries"]["lpmdev"]["url"] == expected {
-        return Ok(false);
+async fn configure_project_scope(
+    package_dir: &Path,
+    endpoint: &reqwest::Url,
+) -> Result<(), LpmError> {
+    let status = swift_command()
+        .arg("--version")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .await
+        .map_err(|error| {
+            LpmError::Registry(format!("failed to run swift: {error}. Is Swift installed?"))
+        })?;
+    if !status.success() {
+        return Err(LpmError::Registry("Swift toolchain check failed".into()));
     }
-    let registries = ensure_json_object(&mut config)?
+    let path = package_dir.join(".swiftpm/configuration/registries.json");
+    configuration::update(&path, swiftpm_registry_host(endpoint), |config| {
+        apply_registry_scope(config, endpoint)
+    })?;
+    Ok(())
+}
+
+fn apply_registry_scope(
+    config: &mut serde_json::Value,
+    endpoint: &reqwest::Url,
+) -> Result<(), LpmError> {
+    let root = ensure_json_object(config)?;
+    root.entry("version")
+        .or_insert_with(|| serde_json::json!(1));
+    let registries = root
         .entry("registries")
         .or_insert_with(|| serde_json::json!({}));
     let entry = ensure_json_object(registries)?
         .entry("lpmdev")
         .or_insert_with(|| serde_json::json!({}));
-    ensure_json_object(entry)?.insert("url".into(), serde_json::Value::String(expected));
-    let bytes = serde_json::to_vec_pretty(&config)
-        .map_err(|error| LpmError::Registry(error.to_string()))?;
-    lpm_common::write_file_atomic(&path, bytes).map_err(|error| {
-        LpmError::Registry(format!("Failed to configure Xcode registry scope: {error}"))
-    })?;
-    Ok(true)
+    let entry = ensure_json_object(entry)?;
+    entry.insert(
+        "url".into(),
+        serde_json::Value::String(endpoint.to_string()),
+    );
+    entry.insert(
+        "supportsAvailability".into(),
+        serde_json::Value::Bool(false),
+    );
+    Ok(())
+}
+
+pub(crate) fn ensure_xcode_registry_scope(registry_url: &str) -> Result<bool, LpmError> {
+    let endpoint = swift_registry_endpoint(registry_url)?;
+    let host = swiftpm_registry_host(&endpoint);
+    configuration::update(&configuration::global_path()?, host, |config| {
+        apply_registry_scope(config, &endpoint)
+    })
+}
+
+pub(crate) fn preflight_configuration(
+    registry_url: &str,
+    package_dir: &Path,
+) -> Result<(), LpmError> {
+    let endpoint = swift_registry_endpoint(registry_url)?;
+    let host = swiftpm_registry_host(&endpoint);
+    configuration::load(&configuration::global_path()?, host)?;
+    configuration::load(
+        &package_dir.join(".swiftpm/configuration/registries.json"),
+        host,
+    )?;
+    Ok(())
 }
 
 /// Check whether a certificate file exists and is valid (non-empty, non-corrupted).
@@ -688,13 +743,7 @@ async fn install_signing_certificate(
     force: bool,
 ) -> Result<CertOutcome, LpmError> {
     let cert_url = format!("{swift_registry_url}/certificate");
-    let trust_dir = dirs::home_dir()
-        .map(|h| h.join(".swiftpm/security/trusted-root-certs"))
-        .ok_or_else(|| {
-            LpmError::Registry(
-                "Could not determine home directory for certificate installation".into(),
-            )
-        })?;
+    let trust_dir = crate::swift_manifest::paths::security_dir()?.join("trusted-root-certs");
 
     let cert_path = trust_dir.join("lpm.der");
 
@@ -744,45 +793,35 @@ fn configure_signing_trust(
     registry_url: &str,
     json_output: bool,
 ) -> Result<TrustOutcome, LpmError> {
-    let home = dirs::home_dir().ok_or_else(|| {
-        LpmError::Registry(
-            "could not determine home directory for SPM signing trust configuration".into(),
-        )
+    let endpoint = swift_registry_endpoint(registry_url)?;
+    let host = swiftpm_registry_host(&endpoint);
+    let config_path = configuration::global_path()?;
+    let changed = configuration::update(&config_path, host, |config| {
+        if signing_trust_is_valid(config, host) {
+            return Ok(());
+        }
+        apply_signing_trust(config, host)
     })?;
-
-    let registry = reqwest::Url::parse(registry_url)
-        .map_err(|error| LpmError::Registry(format!("invalid Swift registry URL: {error}")))?;
-    let registry_host = registry
-        .host_str()
-        .ok_or_else(|| LpmError::Registry("Swift registry URL must contain a host".into()))?;
-    let config_path = home.join(".swiftpm/configuration/registries.json");
-
-    // Read existing config or start fresh
-    let mut config: serde_json::Value = match lpm_common::read_text_file_capped(
-        &config_path,
-        lpm_common::CONFIG_FILE_SIZE_CAP_BYTES,
-    ) {
-        Ok(content) => {
-            serde_json::from_str(&content).unwrap_or_else(|_| serde_json::json!({ "version": 1 }))
-        }
-        Err(lpm_common::BoundedReadError::NotFound { .. }) => serde_json::json!({ "version": 1 }),
-        Err(error) => return Err(LpmError::Registry(error.to_string())),
-    };
-
-    let already_configured = signing_trust_is_valid(&config, registry_host);
-
-    if already_configured {
-        if !json_output {
-            install_ui::done_line(signing_trust_already_configured_message(&config_path));
-        }
-        return Ok(TrustOutcome::AlreadyConfigured);
+    if !json_output {
+        let message = if changed {
+            signing_trust_updated_message(&config_path)
+        } else {
+            signing_trust_already_configured_message(&config_path)
+        };
+        install_ui::done_line(message);
     }
+    Ok(if changed {
+        TrustOutcome::Configured
+    } else {
+        TrustOutcome::AlreadyConfigured
+    })
+}
 
-    if !config.is_object() {
-        config = serde_json::json!({ "version": 1 });
-    }
-
-    let root = ensure_json_object(&mut config)?;
+fn apply_signing_trust(
+    config: &mut serde_json::Value,
+    registry_host: &str,
+) -> Result<(), LpmError> {
+    let root = ensure_json_object(config)?;
     root.insert("version".to_string(), serde_json::json!(1));
     ensure_json_object(
         root.entry("registries")
@@ -790,7 +829,7 @@ fn configure_signing_trust(
     )?;
 
     // Merge security config — preserve any existing keys
-    let security = ensure_json_object(&mut config)?
+    let security = ensure_json_object(config)?
         .entry("security")
         .or_insert_with(|| serde_json::json!({}));
 
@@ -827,42 +866,14 @@ fn configure_signing_trust(
         serde_json::Value::String("silentAllow".to_string()),
     );
 
-    // Ensure the parent dir exists — first install on a fresh machine
-    // typically has no `~/.swiftpm/configuration/`.
-    if let Some(parent) = config_path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| {
-            LpmError::Registry(format!(
-                "failed to create SPM configuration directory {}: {e}",
-                parent.display()
-            ))
-        })?;
-    }
-
-    let json_str = serde_json::to_string_pretty(&config).map_err(|e| {
-        LpmError::Registry(format!("failed to serialize signing trust config: {e}"))
-    })?;
-    lpm_common::write_file_atomic(&config_path, json_str).map_err(|e| {
-        LpmError::Registry(format!(
-            "failed to write signing trust config to {}: {e}",
-            config_path.display()
-        ))
-    })?;
-
-    if !json_output {
-        install_ui::done_line(signing_trust_updated_message(&config_path));
-    }
-
-    Ok(TrustOutcome::Configured)
+    Ok(())
 }
 
 fn ensure_json_object(
     value: &mut serde_json::Value,
 ) -> Result<&mut serde_json::Map<String, serde_json::Value>, LpmError> {
-    if !value.is_object() {
-        *value = serde_json::Value::Object(serde_json::Map::new());
-    }
     value.as_object_mut().ok_or_else(|| {
-        LpmError::Registry("failed to normalize Swift signing trust configuration".into())
+        LpmError::Registry("Swift signing trust configuration must contain objects".into())
     })
 }
 
@@ -1057,15 +1068,212 @@ mod tests {
         })
     }
 
+    fn test_swiftpm_root(home: &Path) -> PathBuf {
+        if cfg!(target_os = "macos") {
+            home.join("Library/org.swift.swiftpm")
+        } else if cfg!(windows) {
+            home.join("swiftpm-test-config/swiftpm")
+        } else {
+            home.join(".swiftpm")
+        }
+    }
+
     fn write_global_signing_trust(home: &Path, config: &serde_json::Value) -> PathBuf {
-        let config_path = home.join(".swiftpm/configuration/registries.json");
+        let config_path = test_swiftpm_root(home).join("configuration/registries.json");
         fs::create_dir_all(config_path.parent().unwrap()).unwrap();
         fs::write(&config_path, serde_json::to_vec(config).unwrap()).unwrap();
         config_path
     }
 
+    #[tokio::test]
+    async fn native_platform_configuration_is_validated_instead_of_an_unused_legacy_file() {
+        let _guard = home_env_lock().lock().await;
+        let home = TempDir::new().unwrap();
+        let xdg = home.path().join("xdg");
+        let _environment = crate::test_env::ScopedEnv::update([
+            ("HOME", Some(home.path().as_os_str().to_owned())),
+            ("XDG_CONFIG_HOME", Some(xdg.as_os_str().to_owned())),
+        ]);
+        let native = if cfg!(target_os = "macos") {
+            home.path().join("Library/org.swift.swiftpm")
+        } else {
+            xdg.join("swiftpm")
+        };
+        let config = native.join("configuration/registries.json");
+        fs::create_dir_all(config.parent().unwrap()).unwrap();
+        fs::write(&config, "invalid native configuration").unwrap();
+        assert!(configure_signing_trust("https://lpm.dev", true).is_err());
+        assert_eq!(
+            fs::read_to_string(config).unwrap(),
+            "invalid native configuration"
+        );
+        assert!(!home.path().join(".swiftpm").exists());
+    }
+
+    #[tokio::test]
+    async fn signing_configuration_rejects_invalid_shapes_without_replacing_bytes() {
+        let _guard = home_env_lock().lock().await;
+        let home = TempDir::new().unwrap();
+        let _home = HomeOverride::new(home.path());
+        let path = write_global_signing_trust(home.path(), &serde_json::json!({}));
+        let cases = [
+            "broken json",
+            "null",
+            "[]",
+            "42",
+            r#"{"version":2}"#,
+            r#"{"version":"1"}"#,
+            r#"{"registries":[]}"#,
+            r#"{"registries":{"lpmdev":{"url":42}}}"#,
+            r#"{"registries":{"lpmdev":{"url":"https://lpm.dev/api/swift-registry","supportsAvailability":"bad"}}}"#,
+            r#"{"security":null}"#,
+            r#"{"security":{"default":[]}}"#,
+            r#"{"security":{"default":{"signing":false}}}"#,
+            r#"{"security":{"default":{"signing":{"onUnsigned":42}}}}"#,
+            r#"{"security":{"scopeOverrides":[]}}"#,
+            r#"{"security":{"scopeOverrides":{"lpmdev":{"signing":[]}}}}"#,
+            r#"{"security":{"registryOverrides":{"lpm.dev":null}}}"#,
+            r#"{"security":{"registryOverrides":{"lpm.dev":{"signing":{"onUntrustedCertificate":false}}}}}"#,
+        ];
+        let mut accepted = Vec::new();
+        for original in cases {
+            fs::write(&path, original).unwrap();
+            let result = configure_signing_trust("https://lpm.dev", true);
+            if result.is_ok() || fs::read_to_string(&path).unwrap() != original {
+                accepted.push(original);
+            } else {
+                assert!(
+                    result
+                        .err()
+                        .unwrap()
+                        .to_string()
+                        .contains(path.to_str().unwrap())
+                );
+            }
+        }
+        assert!(
+            accepted.is_empty(),
+            "invalid configurations accepted or replaced: {accepted:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn signing_configuration_preserves_swiftpm_global_directory_alias() {
+        let _guard = home_env_lock().lock().await;
+        let home = TempDir::new().unwrap();
+        let _home = HomeOverride::new(home.path());
+        let native = home.path().join("Library/org.swift.swiftpm/configuration");
+        fs::create_dir_all(&native).unwrap();
+        fs::write(
+            native.join("registries.json"),
+            r#"{"version":1,"registries":{"other":{"url":"https://other.example"}}}"#,
+        )
+        .unwrap();
+        let swiftpm = home.path().join(".swiftpm");
+        fs::create_dir(&swiftpm).unwrap();
+        let alias = swiftpm.join("configuration");
+        std::os::unix::fs::symlink(&native, &alias).unwrap();
+        configure_signing_trust("https://lpm.dev", true).unwrap();
+        assert!(
+            fs::symlink_metadata(alias)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        let config: serde_json::Value =
+            serde_json::from_slice(&fs::read(native.join("registries.json")).unwrap()).unwrap();
+        assert_eq!(
+            config["registries"]["other"]["url"],
+            "https://other.example"
+        );
+        assert_eq!(
+            config["security"]["registryOverrides"]["lpm.dev"]["signing"]["onUntrustedCertificate"],
+            "silentAllow"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn signing_configuration_rejects_symlinks_without_replacing_them() {
+        let _guard = home_env_lock().lock().await;
+        let home = TempDir::new().unwrap();
+        let _home = HomeOverride::new(home.path());
+        let path = write_global_signing_trust(home.path(), &serde_json::json!({}));
+        let target = home.path().join("shared.json");
+        fs::rename(&path, &target).unwrap();
+        std::os::unix::fs::symlink(&target, &path).unwrap();
+        assert!(configure_signing_trust("https://lpm.dev", true).is_err());
+        assert!(
+            fs::symlink_metadata(&path)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(fs::read_to_string(&target).unwrap(), "{}");
+    }
+
+    #[tokio::test]
+    async fn signing_configuration_concurrent_hosts_keep_each_override() {
+        let _guard = home_env_lock().lock().await;
+        let home = TempDir::new().unwrap();
+        let _home = HomeOverride::new(home.path());
+        let path = write_global_signing_trust(
+            home.path(),
+            &serde_json::json!({"unrelated": "x".repeat(500_000)}),
+        );
+        let barrier = std::sync::Barrier::new(8);
+        std::thread::scope(|scope| {
+            for index in 0..8 {
+                let barrier = &barrier;
+                scope.spawn(move || {
+                    barrier.wait();
+                    configure_signing_trust(&format!("https://registry{index}.example"), true)
+                        .unwrap();
+                });
+            }
+        });
+        let config: serde_json::Value = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
+        for index in 0..8 {
+            assert_eq!(
+                config["security"]["registryOverrides"][format!("registry{index}.example")]["signing"]
+                    ["onUntrustedCertificate"],
+                "silentAllow"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn automatic_setup_rejects_invalid_configuration_before_certificate_changes() {
+        let _guard = home_env_lock().lock().await;
+        let home = TempDir::new().unwrap();
+        let package = TempDir::new().unwrap();
+        let _home = HomeOverride::new(home.path());
+        let server = MockServer::start().await;
+        write_matching_package_scope(package.path(), &server.uri());
+        let path = write_global_signing_trust(home.path(), &serde_json::json!({}));
+        fs::write(&path, "broken json").unwrap();
+        let certificate = signing_certificate_path(home.path());
+        fs::create_dir_all(certificate.parent().unwrap()).unwrap();
+        fs::write(&certificate, "existing certificate").unwrap();
+        Mock::given(method("GET"))
+            .and(wiremock::matchers::path("/api/swift-registry/certificate"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(valid_der_certificate()))
+            .mount(&server)
+            .await;
+        let result =
+            ensure_configured_for_install(None, &server.uri(), package.path(), true, true).await;
+        assert!(result.is_err(), "invalid configuration must stop setup");
+        assert_eq!(fs::read_to_string(path).unwrap(), "broken json");
+        assert_eq!(
+            fs::read_to_string(certificate).unwrap(),
+            "existing certificate"
+        );
+        assert!(server.received_requests().await.unwrap().is_empty());
+    }
+
     fn signing_certificate_path(home: &Path) -> PathBuf {
-        home.join(".swiftpm/security/trusted-root-certs/lpm.der")
+        test_swiftpm_root(home).join("security/trusted-root-certs/lpm.der")
     }
 
     async fn mount_signing_certificate(server: &MockServer, certificate: Vec<u8>) {
@@ -1087,11 +1295,17 @@ mod tests {
         fs::write(
             &swift_path,
             r#"#!/bin/sh
+if [ "$1" = "--version" ]; then exit 0; fi
 if [ "$1" = "package-registry" ] && [ "$2" = "set" ]; then
   exit 0
 fi
 if [ "$1" = "package-registry" ] && [ "$2" = "login" ]; then
+  registry_url="$3"
+  authority="${registry_url#*://}"
+  authority="${authority%%/*}"
+  login_path="${registry_url#*://$authority}"
   shift 2
+  config_path=""
   if [ -e "$HOME/swift-login-output-modes" ]; then
     if [ /dev/fd/1 -ef /dev/null ]; then stdout_mode="null"; else stdout_mode="live"; fi
     if [ /dev/fd/2 -ef /dev/null ]; then stderr_mode="null"; else stderr_mode="live"; fi
@@ -1102,18 +1316,20 @@ if [ "$1" = "package-registry" ] && [ "$2" = "login" ]; then
     if [ "$1" = "--token" ]; then
       shift
       token="$1"
-      break
     fi
     if [ "$1" = "--token-file" ]; then
       shift
       token="$(cat "$1")"
-      break
     fi
+    if [ "$1" = "--config-path" ]; then shift; config_path="$1"; fi
     shift
   done
   printf '%s\n' "$token" >> "$HOME/swift-login-tokens"
   if [ "$token" = "rejected-access" ]; then
     exit 1
+  fi
+  if [ -n "$config_path" ]; then
+    printf '{"version":1,"registries":{},"authentication":{"%s":{"type":"token","loginAPIPath":"%s"}}}' "$authority" "$login_path" > "$config_path/registries.json"
   fi
   exit 0
 fi
@@ -1130,6 +1346,145 @@ exit 64
         let existing_path = std::env::var_os("PATH").unwrap_or_default();
         std::env::join_paths(std::iter::once(bin_dir).chain(std::env::split_paths(&existing_path)))
             .expect("construct PATH with fake Swift")
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn staged_login_and_signing_trust_use_native_ipv6_host_keys() {
+        let _guard = home_env_lock().lock().await;
+        let home = TempDir::new().unwrap();
+        let path = fake_swift_path(home.path());
+        fs::write(home.path().join("fake-swift-bin/swift"), r#"#!/bin/sh
+while [ "$#" -gt 0 ]; do
+  if [ "$1" = "--config-path" ]; then shift; config="$1"; fi
+  shift
+done
+printf '%s' '{"version":1,"registries":{},"authentication":{"::1:8443":{"type":"token","loginAPIPath":"/api/swift-registry"}}}' > "$config/registries.json"
+"#).unwrap();
+        let _environment = crate::test_env::ScopedEnv::update([
+            ("HOME", Some(home.path().as_os_str().to_owned())),
+            ("PATH", Some(path)),
+            ("XDG_CONFIG_HOME", None),
+        ]);
+        assert!(
+            run_swift_login(
+                "https://[::1]:8443/api/swift-registry",
+                "fixture-token",
+                None,
+                SwiftLoginOutput::Suppress
+            )
+            .await
+            .unwrap()
+            .success()
+        );
+        configure_signing_trust("https://[::1]:8443", true).unwrap();
+        let config = configuration::load(&configuration::global_path().unwrap(), "::1").unwrap();
+        assert_eq!(config["authentication"]["::1:8443"]["type"], "token");
+        assert_eq!(
+            config["security"]["registryOverrides"]["::1"]["signing"]["onUntrustedCertificate"],
+            "silentAllow"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn rejected_fresh_login_leaves_the_global_configuration_absent() {
+        let _guard = home_env_lock().lock().await;
+        let home = TempDir::new().unwrap();
+        let path = fake_swift_path(home.path());
+        let _environment = crate::test_env::ScopedEnv::update([
+            ("HOME", Some(home.path().as_os_str().to_owned())),
+            ("PATH", Some(path)),
+            ("XDG_CONFIG_HOME", None),
+        ]);
+        assert!(
+            !run_swift_login(
+                "https://lpm.dev/api/swift-registry",
+                "rejected-access",
+                None,
+                SwiftLoginOutput::Suppress
+            )
+            .await
+            .unwrap()
+            .success()
+        );
+        assert!(!configuration::global_path().unwrap().exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn successful_fresh_login_writes_required_native_fields_before_later_setup_steps() {
+        let _guard = home_env_lock().lock().await;
+        let home = TempDir::new().unwrap();
+        let path = fake_swift_path(home.path());
+        let _environment = crate::test_env::ScopedEnv::update([
+            ("HOME", Some(home.path().as_os_str().to_owned())),
+            ("PATH", Some(path)),
+            ("XDG_CONFIG_HOME", None),
+        ]);
+        assert!(
+            run_swift_login(
+                "https://lpm.dev/api/swift-registry",
+                "fixture-token",
+                None,
+                SwiftLoginOutput::Suppress
+            )
+            .await
+            .unwrap()
+            .success()
+        );
+        let config =
+            configuration::load(&configuration::global_path().unwrap(), "lpm.dev").unwrap();
+        assert!(config["registries"].is_object());
+        assert_eq!(config["version"], 1);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn native_login_preserves_existing_global_configuration_extensions() {
+        let _guard = home_env_lock().lock().await;
+        let home = TempDir::new().unwrap();
+        let path = fake_swift_path(home.path());
+        fs::write(home.path().join("fake-swift-bin/swift"), r#"#!/bin/sh
+if [ "$(uname)" = "Darwin" ]; then config="$HOME/Library/org.swift.swiftpm/configuration"; else config="$HOME/.swiftpm/configuration"; fi
+while [ "$#" -gt 0 ]; do
+  if [ "$1" = "--config-path" ]; then shift; config="$1"; fi
+  shift
+done
+mkdir -p "$config"
+printf '%s' '{"version":1,"registries":{},"authentication":{"lpm.dev":{"type":"token","loginAPIPath":"/api/swift-registry"}}}' > "$config/registries.json"
+"#).unwrap();
+        let _environment = crate::test_env::ScopedEnv::update([
+            ("HOME", Some(home.path().as_os_str().to_owned())),
+            ("PATH", Some(path)),
+            ("XDG_CONFIG_HOME", None),
+        ]);
+        let config_path = write_global_signing_trust(
+            home.path(),
+            &serde_json::json!({
+                "version":1,"registries":{},"unrelated":{"keep":true},
+                "authentication":{"lpm.dev":{"type":"token","extension":"preserve"}}
+            }),
+        );
+        assert!(
+            run_swift_login(
+                "https://lpm.dev/api/swift-registry",
+                "fixture-token",
+                None,
+                SwiftLoginOutput::Suppress
+            )
+            .await
+            .unwrap()
+            .success()
+        );
+        let config: serde_json::Value =
+            serde_json::from_slice(&fs::read(config_path).unwrap()).unwrap();
+        assert_eq!(config["unrelated"]["keep"], true);
+        assert_eq!(config["authentication"]["lpm.dev"]["extension"], "preserve");
+        assert_eq!(
+            config["authentication"]["lpm.dev"]["loginAPIPath"],
+            "/api/swift-registry"
+        );
     }
 
     #[cfg(unix)]
@@ -1154,6 +1509,7 @@ exit 64
         let _environment = crate::test_env::ScopedEnv::update([
             ("HOME", Some(home.path().as_os_str().to_owned())),
             ("PATH", Some(path)),
+            ("XDG_CONFIG_HOME", None),
             ("LPM_FORCE_FILE_AUTH", Some("1".into())),
             ("LPM_TEST_FAST_SCRYPT", Some("1".into())),
             (
@@ -1177,7 +1533,15 @@ exit 64
         let session = lpm_auth::SessionManager::new(server.uri(), None);
         let swift_registry_origin = server.uri().replacen("http://", "https://", 1);
 
-        let _ = run(&session, &swift_registry_origin, true, false).await;
+        let package = TempDir::new().unwrap();
+        let _ = run_in_directory(
+            &session,
+            &swift_registry_origin,
+            true,
+            false,
+            package.path(),
+        )
+        .await;
 
         let attempted_tokens = fs::read_to_string(login_tokens).expect("read Swift login attempts");
         assert_eq!(attempted_tokens, "rejected-access\nrotated-access\n");
@@ -1207,6 +1571,7 @@ exit 64
         let _environment = crate::test_env::ScopedEnv::update([
             ("HOME", Some(home.path().as_os_str().to_owned())),
             ("PATH", Some(path)),
+            ("XDG_CONFIG_HOME", None),
             ("LPM_FORCE_FILE_AUTH", Some("1".into())),
             ("LPM_TEST_FAST_SCRYPT", Some("1".into())),
             (
@@ -1261,6 +1626,7 @@ exit 64
         let _environment = crate::test_env::ScopedEnv::update([
             ("HOME", Some(home.path().as_os_str().to_owned())),
             ("PATH", Some(path)),
+            ("XDG_CONFIG_HOME", None),
             ("LPM_TOKEN", None),
         ]);
         let registry_url = "https://127.0.0.1:1";
@@ -1286,6 +1652,7 @@ exit 64
         let _environment = crate::test_env::ScopedEnv::update([
             ("HOME", Some(home.path().as_os_str().to_owned())),
             ("PATH", Some(path)),
+            ("XDG_CONFIG_HOME", None),
             (
                 "LPM_TEST_SWIFT_LOGIN_TOKENS",
                 Some(login_tokens.as_os_str().to_owned()),
@@ -1326,6 +1693,7 @@ exit 64
         let _environment = crate::test_env::ScopedEnv::update([
             ("HOME", Some(home.path().as_os_str().to_owned())),
             ("PATH", Some(path)),
+            ("XDG_CONFIG_HOME", None),
             (
                 "LPM_TEST_SWIFT_LOGIN_TOKENS",
                 Some(login_tokens.as_os_str().to_owned()),
@@ -1411,15 +1779,24 @@ exit 64
     /// the var if there was none). Must be held alongside `home_env_lock()`.
     struct HomeOverride {
         prior: Option<std::ffi::OsString>,
+        prior_xdg: Option<std::ffi::OsString>,
     }
 
     impl HomeOverride {
         fn new(home: &std::path::Path) -> Self {
             let prior = std::env::var_os("HOME");
+            let prior_xdg = std::env::var_os("XDG_CONFIG_HOME");
             // SAFETY: caller holds home_env_lock(), serializing env mutation
             // across the test module.
-            unsafe { std::env::set_var("HOME", home) };
-            HomeOverride { prior }
+            unsafe {
+                std::env::set_var("HOME", home);
+                if cfg!(windows) {
+                    std::env::set_var("XDG_CONFIG_HOME", home.join("swiftpm-test-config"));
+                } else {
+                    std::env::remove_var("XDG_CONFIG_HOME");
+                }
+            };
+            HomeOverride { prior, prior_xdg }
         }
     }
 
@@ -1427,6 +1804,10 @@ exit 64
         fn drop(&mut self) {
             // SAFETY: still inside the home_env_lock()-protected section.
             unsafe {
+                match &self.prior_xdg {
+                    Some(v) => std::env::set_var("XDG_CONFIG_HOME", v),
+                    None => std::env::remove_var("XDG_CONFIG_HOME"),
+                }
                 match &self.prior {
                     Some(v) => std::env::set_var("HOME", v),
                     None => std::env::remove_var("HOME"),
@@ -1647,9 +2028,8 @@ exit 64
         .expect("first install should succeed against a healthy origin");
 
         assert_eq!(outcome, CertOutcome::Installed);
-        let cert_path = temp_home
-            .path()
-            .join(".swiftpm/security/trusted-root-certs/lpm.der");
+        let cert_path =
+            test_swiftpm_root(temp_home.path()).join("security/trusted-root-certs/lpm.der");
         let written = fs::read(&cert_path).expect("cert should land at the SPM trust path");
         assert_eq!(written, cert_bytes);
     }
@@ -1662,9 +2042,8 @@ exit 64
         let temp_home = TempDir::new().unwrap();
         let _home = HomeOverride::new(temp_home.path());
 
-        let cert_path = temp_home
-            .path()
-            .join(".swiftpm/security/trusted-root-certs/lpm.der");
+        let cert_path =
+            test_swiftpm_root(temp_home.path()).join("security/trusted-root-certs/lpm.der");
         fs::create_dir_all(cert_path.parent().unwrap()).unwrap();
         let cert_bytes = valid_der_certificate();
         fs::write(&cert_path, &cert_bytes).unwrap();
@@ -1700,9 +2079,8 @@ exit 64
         let _home = HomeOverride::new(temp_home.path());
 
         // Seed a valid cert on disk that --force should override.
-        let cert_path = temp_home
-            .path()
-            .join(".swiftpm/security/trusted-root-certs/lpm.der");
+        let cert_path =
+            test_swiftpm_root(temp_home.path()).join("security/trusted-root-certs/lpm.der");
         fs::create_dir_all(cert_path.parent().unwrap()).unwrap();
         fs::write(&cert_path, valid_der_certificate()).unwrap();
 
@@ -1741,9 +2119,7 @@ exit 64
             configure_signing_trust("https://lpm.dev", true).expect("trust config should succeed");
         assert_eq!(outcome, TrustOutcome::Configured);
 
-        let config_path = temp_home
-            .path()
-            .join(".swiftpm/configuration/registries.json");
+        let config_path = test_swiftpm_root(temp_home.path()).join("configuration/registries.json");
         let content = fs::read_to_string(&config_path).expect("registries.json should be written");
         let json: serde_json::Value = serde_json::from_str(&content).unwrap();
         assert_eq!(
@@ -1824,19 +2200,13 @@ exit 64
         );
     }
 
-    /// Malformed JSON / missing `url` field — fall through to fresh
-    /// setup. Treating a corrupted file as "matching" would honour
-    /// whatever happened to be on disk; treating it as Absent forces
-    /// the setup to write the correct URL.
     #[test]
-    fn scope_eval_handles_malformed_or_partial_entries() {
+    fn scope_eval_rejects_malformed_json_and_repairs_missing_url() {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("registries.json");
-
         std::fs::write(&path, "not json").unwrap();
-        assert_eq!(
-            evaluate_existing_lpmdev_scope(&path, "https://lpm.dev/api/swift-registry").unwrap(),
-            ExistingScope::Absent
+        assert!(
+            evaluate_existing_lpmdev_scope(&path, "https://lpm.dev/api/swift-registry").is_err()
         );
 
         std::fs::write(&path, r#"{"registries": {"lpmdev": {}}}"#).unwrap();
@@ -2024,7 +2394,7 @@ exit 64
         mount_signing_certificate(&server, valid_der_certificate()).await;
         write_matching_package_scope(package.path(), &server.uri());
         write_global_signing_trust(home.path(), &complete_signing_trust());
-        let blocked_directory = home.path().join(".swiftpm/security/trusted-root-certs");
+        let blocked_directory = test_swiftpm_root(home.path()).join("security/trusted-root-certs");
         fs::create_dir_all(blocked_directory.parent().unwrap()).unwrap();
         fs::write(&blocked_directory, "not a directory").unwrap();
 

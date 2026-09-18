@@ -117,9 +117,7 @@ async fn swift_registry_stalled_certificate_headers_fail_within_the_deadline() {
         .await;
     let project = swift_project();
     configure_existing_registry(&project, &mock.url(), &cert);
-    let cert_path = project
-        .home()
-        .join(".swiftpm/security/trusted-root-certs/lpm.der");
+    let cert_path = swiftpm_home(&project).join("security/trusted-root-certs/lpm.der");
     let mut command = lpm_with_registry(&project, &mock.url());
     configure_fake_swift(&mut command, &project, &[], 0);
     let start = Instant::now();
@@ -167,9 +165,7 @@ async fn swift_registry_stalled_certificate_body_fails_within_the_deadline() {
         .der()
         .to_vec();
     configure_existing_registry(&project, &base_url, &cert);
-    let cert_path = project
-        .home()
-        .join(".swiftpm/security/trusted-root-certs/lpm.der");
+    let cert_path = swiftpm_home(&project).join("security/trusted-root-certs/lpm.der");
     let mut command = lpm_with_registry(&project, &base_url);
     configure_fake_swift(&mut command, &project, &[], 0);
     let start = Instant::now();
@@ -212,12 +208,7 @@ async fn xcode_registry_scopes_use_the_same_normalized_url() {
         .assert()
         .success();
     let global: serde_json::Value = serde_json::from_slice(
-        &std::fs::read(
-            project
-                .home()
-                .join(".swiftpm/configuration/registries.json"),
-        )
-        .unwrap(),
+        &std::fs::read(swiftpm_home(&project).join("configuration/registries.json")).unwrap(),
     )
     .unwrap();
     let local: serde_json::Value = serde_json::from_str(
