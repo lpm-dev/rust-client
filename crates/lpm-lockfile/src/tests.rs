@@ -5341,3 +5341,30 @@ fn write_for_project_replaces_only_the_member_projection_and_prunes_old_rows() {
             .all(|package| package.name != "old")
     );
 }
+
+#[test]
+fn ambient_peer_can_share_a_skipped_optional_name_without_becoming_a_reachability_root() {
+    let mut valid = exact_lockfile_with_ambient_peer(true);
+    valid
+        .importers
+        .get_mut(".")
+        .unwrap()
+        .optional_dependencies
+        .insert("peer-host".into(), "^99".into());
+    let encoded = valid
+        .to_toml()
+        .expect("a reachable peer can coexist with an unresolved optional declaration");
+    assert_eq!(Lockfile::from_toml(&encoded).unwrap(), valid);
+
+    let mut invalid = exact_lockfile_with_ambient_peer(false);
+    invalid
+        .importers
+        .get_mut(".")
+        .unwrap()
+        .optional_dependencies
+        .insert("peer-host".into(), "^99".into());
+    assert!(
+        invalid.to_toml().is_err(),
+        "optional declaration cannot make an otherwise unreachable peer valid"
+    );
+}

@@ -482,6 +482,7 @@ fn project_importer(
     let mut required = HashSet::with_capacity(union.packages.len());
     let mut root_aliases = HashMap::with_capacity(slots.len());
     let mut root_resolutions = HashMap::with_capacity(slots.len());
+    let mut skipped_optional_roots = HashSet::new();
     let mut seeds = Vec::with_capacity(slots.len());
 
     for slot in slots {
@@ -490,6 +491,7 @@ fn project_importer(
         }
         let Some(resolution) = union.root_resolutions.get(&slot.synthetic) else {
             if slot.optional {
+                skipped_optional_roots.insert(slot.local.as_str());
                 continue;
             }
             tracing::debug!(
@@ -535,7 +537,11 @@ fn project_importer(
     };
     let mut ambient_peer_installs = ambient_root_resolutions.keys().cloned().collect::<Vec<_>>();
     ambient_peer_installs.sort_unstable();
-    root_resolutions.extend(ambient_root_resolutions);
+    root_resolutions.extend(
+        ambient_root_resolutions
+            .into_iter()
+            .filter(|(name, _)| !skipped_optional_roots.contains(name.as_str())),
+    );
 
     let mut packages = included
         .iter()

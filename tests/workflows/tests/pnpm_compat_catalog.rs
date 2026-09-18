@@ -1,5 +1,6 @@
 //! Workflow tests for pnpm-sourced catalog compatibility scenarios.
 
+mod catalog_contract;
 mod support;
 
 use std::process::Output;
@@ -1056,6 +1057,10 @@ async fn frozen_catalog_replay_allows_unused_catalog_backed_resolution() {
         frozen.status.success(),
         "frozen replay must accept a configured catalog-backed resolution that was not applied\n{frozen_text}"
     );
+    lpm(&project)
+        .args(["catalog", "show", "--resolved"])
+        .assert()
+        .success();
 }
 
 #[tokio::test]

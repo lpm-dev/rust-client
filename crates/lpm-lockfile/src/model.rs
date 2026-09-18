@@ -2051,6 +2051,10 @@ impl Lockfile {
             )));
         }
 
+        let ambient_roots = ambient_peer_installs
+            .iter()
+            .map(String::as_str)
+            .collect::<HashSet<_>>();
         let mut pending = Vec::with_capacity(root_resolutions.len());
         for (local_name, root) in root_resolutions {
             let target_id = root.instance_id.ok_or_else(|| {
@@ -2074,6 +2078,7 @@ impl Lockfile {
             if declared_roots
                 .as_ref()
                 .is_none_or(|declared| declared.contains(local_name.as_str()))
+                && !ambient_roots.contains(local_name.as_str())
             {
                 pending.push(target_id);
             }
@@ -2097,6 +2102,8 @@ impl Lockfile {
             if declared_roots
                 .as_ref()
                 .is_some_and(|declared| declared.contains(local_name.as_str()))
+                && !importer_snapshot
+                    .is_some_and(|snapshot| snapshot.optional_dependencies.contains_key(local_name))
             {
                 return Err(LockfileError::Deserialize(format!(
                     "ambient peer root {local_name:?}{importer_context} is already manifest-declared"

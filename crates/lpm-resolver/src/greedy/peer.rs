@@ -648,6 +648,16 @@ fn synthesize_ambient_edge(
         ))
     })?;
     let canonical_name = canonical.to_string();
+    // Peer synthesis follows the declared-edge drain. An absent declaration must
+    // not acquire the peer's selection, even when the names are equal.
+    if state.root_deps.contains_key(&canonical_name)
+        && !state.nodes[0]
+            .children
+            .iter()
+            .any(|(local, _)| local == &canonical_name)
+    {
+        state.ambient_only_root_names.insert(canonical_name.clone());
+    }
     out.push(Edge {
         parent: 0,
         local_name: canonical_name.clone(),

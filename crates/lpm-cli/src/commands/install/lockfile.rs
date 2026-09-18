@@ -272,8 +272,25 @@ fn fresh_resolved_lockfile(
     lockfile.root_aliases = root_aliases_for_lockfile(persisted_packages, input.deps);
     lockfile.root_resolutions = root_resolutions_for_lockfile(persisted_packages);
     lockfile.ambient_peer_installs = input.ambient_peer_installs_for_lockfile.to_vec();
+    let dependency_catalog_resolutions: Vec<_> = input.catalog_resolutions
+        [..input.dependency_catalog_resolution_count]
+        .iter()
+        .filter(|resolution| {
+            !input
+                .current_importer_snapshot
+                .optional_dependencies
+                .contains_key(&resolution.package_name)
+                || (lockfile
+                    .root_resolutions
+                    .contains_key(&resolution.package_name)
+                    && !lockfile
+                        .ambient_peer_installs
+                        .contains(&resolution.package_name))
+        })
+        .cloned()
+        .collect();
     let lockfile_catalog_resolutions = catalog_resolutions_for_lockfile(
-        &input.catalog_resolutions[..input.dependency_catalog_resolution_count],
+        &dependency_catalog_resolutions,
         input.override_catalog_resolutions,
         input.applied_overrides,
     );
@@ -1585,6 +1602,7 @@ pub(super) fn lockfile_catalog_snapshots_match_current(
         &packages,
         deps,
         catalog_resolutions,
+        &HashSet::new(),
     )
 }
 
@@ -1593,6 +1611,7 @@ fn lockfile_catalog_snapshots_match_current_with_packages(
     packages: &[&lpm_lockfile::LockedPackage],
     deps: &HashMap<String, String>,
     catalog_resolutions: &[lpm_workspace::CatalogProtocolResolution],
+    optional_root_names: &HashSet<String>,
 ) -> bool {
     let mut current_resolutions = HashMap::with_capacity(catalog_resolutions.len());
     for resolution in catalog_resolutions {
@@ -1640,7 +1659,14 @@ fn lockfile_catalog_snapshots_match_current_with_packages(
     }
 
     for resolution in catalog_resolutions {
+        let selected_optional = lockfile
+            .root_resolutions
+            .contains_key(&resolution.package_name)
+            && !lockfile
+                .ambient_peer_installs
+                .contains(&resolution.package_name);
         if deps.contains_key(&resolution.package_name)
+            && (!optional_root_names.contains(&resolution.package_name) || selected_optional)
             && !lockfile
                 .catalogs
                 .get(&resolution.catalog_name)
@@ -1930,73 +1956,6 @@ fn locked_version_satisfies_requested_range(version: &str, requested_spec: &str)
     };
     lpm_resolver::NpmVersion::parse(version)
         .is_ok_and(|version| requested_range.satisfies(&version))
-}
-
-fn select_resolved_package_for_requested_spec<'a>(
-    resolved: &'a [ResolvedPackage],
-    target: &str,
-    requested_spec: &str,
-) -> Option<&'a ResolvedPackage> {
-    let requested_range = requested_range_for_locked_lookup(requested_spec)
-        .and_then(|range| lpm_resolver::NpmRange::parse(&range).ok());
-    let mut first_match: Option<&ResolvedPackage> = None;
-    let mut first_unscoped: Option<&ResolvedPackage> = None;
-    let mut best_satisfying_unscoped: Option<(lpm_resolver::NpmVersion, &ResolvedPackage)> = None;
-    let mut best_satisfying: Option<(lpm_resolver::NpmVersion, &ResolvedPackage)> = None;
-    let mut best_any_unscoped: Option<(lpm_resolver::NpmVersion, &ResolvedPackage)> = None;
-    let mut best_any: Option<(lpm_resolver::NpmVersion, &ResolvedPackage)> = None;
-
-    for candidate in resolved {
-        if candidate.package.canonical_name() != target {
-            continue;
-        }
-        if first_match.is_none() {
-            first_match = Some(candidate);
-        }
-        let is_unscoped = candidate.package.context().is_none();
-        if is_unscoped && first_unscoped.is_none() {
-            first_unscoped = Some(candidate);
-        }
-
-        let version = candidate.version.clone();
-        let better_any = best_any.as_ref().is_none_or(|(best, _)| version > *best);
-        if better_any {
-            best_any = Some((version.clone(), candidate));
-        }
-        if is_unscoped
-            && best_any_unscoped
-                .as_ref()
-                .is_none_or(|(best, _)| version > *best)
-        {
-            best_any_unscoped = Some((version.clone(), candidate));
-        }
-
-        if let Some(range) = requested_range.as_ref()
-            && range.satisfies(&version)
-        {
-            let better_satisfying = best_satisfying
-                .as_ref()
-                .is_none_or(|(best, _)| version > *best);
-            if better_satisfying {
-                best_satisfying = Some((version.clone(), candidate));
-            }
-            if is_unscoped
-                && best_satisfying_unscoped
-                    .as_ref()
-                    .is_none_or(|(best, _)| version > *best)
-            {
-                best_satisfying_unscoped = Some((version, candidate));
-            }
-        }
-    }
-
-    best_satisfying_unscoped
-        .map(|(_, candidate)| candidate)
-        .or_else(|| best_satisfying.map(|(_, candidate)| candidate))
-        .or_else(|| best_any_unscoped.map(|(_, candidate)| candidate))
-        .or(first_unscoped)
-        .or_else(|| best_any.map(|(_, candidate)| candidate))
-        .or(first_match)
 }
 
 fn collect_locked_direct_versions_from_rows(
@@ -2592,6 +2551,7 @@ pub(super) fn lockfile_satisfies_fast_path_with_packages_and_optional_roots(
         packages,
         deps,
         catalog_resolutions,
+        optional_root_names,
     ) {
         if policy.emit_warnings {
             tracing::debug!("catalog snapshot drift detected — invalidating lockfile fast path");
@@ -2973,9 +2933,6 @@ fn try_lockfile_fast_path_from_rows(
     // `dependencies`, we don't want a double-link entry.
     let ambient_peer_installs = lockfile.ambient_peer_installs.clone();
     for ambient in &ambient_peer_installs {
-        if input.deps.contains_key(ambient) {
-            continue;
-        }
         let lp = select_locked_ambient_root_package_from_rows(lockfile, package_rows, ambient)?;
         let selected = lpm_lockfile::LockedRootResolution {
             instance_id: lp.instance_id,
@@ -3064,7 +3021,11 @@ fn try_lockfile_fast_path_from_rows(
             let root_link_names = lp
                 .instance_id
                 .and_then(|instance_id| root_link_map.get(&instance_id).cloned());
-            let is_direct = install_package_is_direct(root_link_names.as_deref(), input.deps);
+            let is_direct = root_link_names.as_deref().is_some_and(|names| {
+                names.iter().any(|name| {
+                    input.deps.contains_key(name) && !ambient_peer_installs.contains(name)
+                })
+            });
 
             InstallPackage {
                 instance_id: lp.instance_id,
@@ -3321,7 +3282,7 @@ pub(super) fn resolved_to_install_packages(
 fn resolved_to_unfinalized_install_packages(
     resolved: &[ResolvedPackage],
     deps: &HashMap<String, String>,
-    root_aliases: &HashMap<String, String>,
+    _root_aliases: &HashMap<String, String>,
     root_resolutions: &HashMap<String, lpm_resolver::RootResolution>,
     ambient_peer_installs: &[String],
     resolver_cache: &HashMap<CanonicalKey, Arc<CachedPackageInfo>>,
@@ -3331,38 +3292,16 @@ fn resolved_to_unfinalized_install_packages(
         route_table,
         registry_client,
     } = registry_source;
-    // Targets the root either declares directly OR reaches via an
-    // npm-alias: each such target's (any version's) resolved package
-    // is considered a direct dep for scripts/display.
-    //
-    // **Note:** ambient_peer_installs are intentionally NOT folded
-    // into `direct_target_names` — they aren't user-declared, so
-    // they don't get `is_direct = true` (which gates script
-    // execution + display). They DO get root_link entries below.
-    // For each resolved direct package, capture its resolved
-    // version. Keyed by canonical_name. Used below to compute the
-    // `(name, version, source_id)` triple under which the package
-    // will be filed in the lockfile.
-    // "name\x00version" compound key — avoids allocating a PackageKey
-    // (SHA-256 source_id + 2 String clones) per entry and per lookup.
-    // Safe because same-name-same-version cross-source packages collapse
-    // to one row via the dedup filter below.
     let resolved_by_id = resolved
         .iter()
         .map(|package| (package.resolution_id, package))
         .collect::<HashMap<_, _>>();
     let mut root_link_map: HashMap<lpm_common::ResolutionNodeId, Vec<String>> = HashMap::new();
-    for (local, requested_spec) in deps {
-        let target = root_aliases
+    for local in deps.keys() {
+        if let Some(package) = root_resolutions
             .get(local)
-            .cloned()
-            .unwrap_or_else(|| local.clone());
-        let exact = root_resolutions
-            .get(local)
-            .and_then(|selection| resolved_by_id.get(&selection.target).copied());
-        if let Some(package) = exact.or_else(|| {
-            select_resolved_package_for_requested_spec(resolved, &target, requested_spec)
-        }) {
+            .and_then(|selection| resolved_by_id.get(&selection.target).copied())
+        {
             root_link_map
                 .entry(package.resolution_id)
                 .or_default()
