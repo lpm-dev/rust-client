@@ -785,6 +785,8 @@ async fn async_main() -> Result<()> {
                 ));
             }
 
+            let packages = save_spec::normalize_explicit_package_specs(&packages)?;
+
             // Token expiry warnings.
             if !cli.json {
                 for warning in auth::check_token_expiry_warnings() {

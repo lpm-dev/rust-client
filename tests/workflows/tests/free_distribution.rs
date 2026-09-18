@@ -319,6 +319,14 @@ async fn missing_versions_share_one_failed_session_refresh() {
     registry
         .with_package(PACKAGE, "2.0.0", &make_tarball(PACKAGE, "2.0.0"))
         .await;
+    let other_package = "@lpm.dev/author.other-free-package";
+    registry
+        .with_package(
+            other_package,
+            "2.0.0",
+            &make_tarball(other_package, "2.0.0"),
+        )
+        .await;
     Mock::given(method("POST"))
         .and(path("/api/cli/refresh"))
         .respond_with(ResponseTemplate::new(503).set_delay(std::time::Duration::from_millis(50)))
@@ -338,7 +346,7 @@ async fn missing_versions_share_one_failed_session_refresh() {
         .args([
             "install",
             &format!("{PACKAGE}@1.0.0"),
-            &format!("{PACKAGE}@0.9.0"),
+            &format!("{other_package}@0.9.0"),
             "--no-editor-setup",
         ])
         .assert()
