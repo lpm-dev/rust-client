@@ -13,6 +13,8 @@ use std::time::Duration;
 #[allow(clippy::too_many_arguments)]
 pub(super) fn execute_script(
     cmd: &str,
+    phase: &str,
+    tools: &super::lifecycle_tools::LifecycleTools,
     pkg_name: &str,
     pkg_version: &str,
     package_dir: &Path,
@@ -33,33 +35,18 @@ pub(super) fn execute_script(
     if cancelled.load(Ordering::Acquire) {
         return Err("Lifecycle script interrupted".to_string());
     }
-    // Build the environment the same way the legacy path did: start
-    // from the sanitized set, strip INIT_CWD + PATH if the caller
-    // pre-set them, then append our own INIT_CWD and PATH-with-
-    // node_modules/.bin-prepended.
-    //
-    // : the path string is platform-aware
-    // now. Pre-46.2 the helper hardcoded the POSIX `:` separator and
-    // the POSIX `/usr/bin:/bin` fallback, which produced a malformed
-    // PATH on Windows: the local `node_modules\.bin` shim got fused
-    // into the same entry as the inherited system PATH and neither
-    // resolved, so commands like `tsc`, `webpack`, or any sibling-
-    // package binary were invisible to lifecycle scripts even though
-    // the sandbox itself succeeded.
-    //
-    // round-5 : PATH lookup + filter are now
-    // case-insensitive. Windows env vars are case-insensitive at the
-    // OS level — `std::env::vars()` yields the key with its original
-    // case (typically `"Path"` on Windows, `"PATH"` on POSIX). A
-    // case-sensitive `env.get("PATH")` returned `None` on Windows
-    // even when PATH was populated, so the child got the System32-
-    // only fallback and lifecycle scripts couldn't find `node`,
-    // `npm`, or any sibling-package binary on the inherited PATH.
-    // Same hazard for the filter — letting "Path" through unfiltered
-    // worked accidentally because `std::process::Command::env` on
-    // Windows does case-insensitive deduplication and our explicit
-    // `"PATH"` overrides won, but the LOOKUP path was still broken.
-    let envs = build_lifecycle_environment(env, project_dir, tmpdir);
+    let mut envs: HashMap<_, _> =
+        build_lifecycle_environment(env, project_dir, tmpdir, Some(&tools.bin_dir))
+            .into_iter()
+            .collect();
+    lpm_runner::npm_context::NpmScriptContext::new(
+        Some(pkg_name),
+        Some(pkg_version),
+        package_dir,
+        &std::env::current_dir().map_err(|e| e.to_string())?,
+    )
+    .apply(&mut envs, phase, cmd);
+    let envs = envs.into_iter().collect::<Vec<_>>();
 
     let start = std::time::Instant::now();
 
@@ -78,6 +65,7 @@ pub(super) fn execute_script(
         sandbox_options,
         extra_write_dirs,
         extra_secret_read_allow,
+        &tools.read_dirs,
         store_root,
         home_dir,
         tmpdir,
@@ -111,9 +99,14 @@ pub(super) fn build_lifecycle_environment(
     env: &HashMap<String, String>,
     project_dir: &Path,
     tmpdir: &Path,
+    bin_dir: Option<&Path>,
 ) -> Vec<(String, String)> {
     let parent_path = find_env_case_insensitive(env, "PATH");
-    let path_value = build_lifecycle_path(project_dir, parent_path);
+    let mut path_value = build_lifecycle_path(project_dir, parent_path);
+    if let Some(bin_dir) = bin_dir {
+        let separator = if cfg!(windows) { ";" } else { ":" };
+        path_value = format!("{}{separator}{path_value}", bin_dir.display());
+    }
     let mut envs: Vec<(String, String)> = env
         .iter()
         .filter(|(k, _)| {
@@ -175,6 +168,7 @@ pub(super) fn spawn_lifecycle_child(
     sandbox_options: &lpm_sandbox::SandboxOptions,
     extra_write_dirs: &[PathBuf],
     extra_secret_read_allow: &[PathBuf],
+    dependency_read_dirs: &[PathBuf],
     store_root: &Path,
     home_dir: &Path,
     tmpdir: &Path,
@@ -197,6 +191,7 @@ pub(super) fn spawn_lifecycle_child(
         tmpdir: tmpdir.to_path_buf(),
         read_project_full,
         secret_read_allow: extra_secret_read_allow.to_vec(),
+        dependency_read_dirs: dependency_read_dirs.to_vec(),
         extra_write_dirs: extra_write_dirs.to_vec(),
     };
     // thread the resolved `[sandbox] allow-degraded`
@@ -333,6 +328,7 @@ pub(in crate::commands) fn execute_publish_lifecycle_script(
         SandboxMode::Enforce,
         false,
         &sandbox_options,
+        &[],
         &[],
         &[],
         store_root,
@@ -800,6 +796,14 @@ mod cancellation_tests {
         let root = tempfile::tempdir().unwrap();
         let result = execute_script(
             "printf started > started.txt",
+            "postinstall",
+            &super::super::lifecycle_tools::LifecycleTools::prepare(
+                root.path(),
+                None,
+                root.path(),
+                root.path(),
+            )
+            .unwrap(),
             "cancel-probe",
             "1.0.0",
             root.path(),

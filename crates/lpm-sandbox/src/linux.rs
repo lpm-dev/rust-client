@@ -895,6 +895,7 @@ mod tests {
             tmpdir: tmp,
             read_project_full: false,
             secret_read_allow: Vec::new(),
+            dependency_read_dirs: Vec::new(),
             extra_write_dirs: Vec::new(),
         }
     }
@@ -1232,6 +1233,7 @@ mod tests {
             tmpdir: PathBuf::from("/tmp"),
             read_project_full: false,
             secret_read_allow: Vec::new(),
+            dependency_read_dirs: Vec::new(),
             extra_write_dirs: Vec::new(),
         };
         let sb = match new_for_platform(spec, SandboxMode::Enforce) {
@@ -1286,6 +1288,7 @@ mod tests {
             tmpdir: PathBuf::from("/tmp"),
             read_project_full: false,
             secret_read_allow: Vec::new(),
+            dependency_read_dirs: Vec::new(),
             extra_write_dirs: Vec::new(),
         };
         let sb = match new_for_platform(spec, SandboxMode::Enforce) {

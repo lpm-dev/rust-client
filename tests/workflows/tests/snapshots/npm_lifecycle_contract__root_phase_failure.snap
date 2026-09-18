@@ -1,0 +1,13 @@
+---
+source: tests/workflows/tests/npm_lifecycle_contract.rs
+assertion_line: 484
+expression: envelope
+---
+{
+  "schema_version": 1,
+  "success": false,
+  "error": "script phase `preinstall` exited with code 42",
+  "error_code": "script",
+  "phase": "preinstall",
+  "exit_code": 42
+}

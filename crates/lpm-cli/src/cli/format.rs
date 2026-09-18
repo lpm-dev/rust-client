@@ -144,7 +144,9 @@ pub(super) fn exit_with_lpm_error(error: &lpm_common::LpmError, json_output: boo
     }
 
     match error {
-        lpm_common::LpmError::ExitCode(code) => std::process::exit(*code),
+        lpm_common::LpmError::ExitCode(code)
+        | lpm_common::LpmError::ScriptPhase { code, .. }
+        | lpm_common::LpmError::ScriptWithOutput { code, .. } => std::process::exit(*code),
         _ => std::process::exit(1),
     }
 }
@@ -204,6 +206,14 @@ fn print_json_error(error: &lpm_common::LpmError) {
 
 fn json_error_value(error: &lpm_common::LpmError) -> serde_json::Value {
     let mut json = match error {
+        lpm_common::LpmError::ScriptPhase { phase, code, .. } => serde_json::json!({
+            "schema_version": crate::json_contract::ERROR_ENVELOPE_SCHEMA_VERSION,
+            "success": false,
+            "error": error.to_string(),
+            "error_code": error.error_code(),
+            "phase": phase,
+            "exit_code": code,
+        }),
         lpm_common::LpmError::Resolution(context) => {
             let mut detail = serde_json::Map::with_capacity(12);
             detail.insert("code".to_owned(), serde_json::json!("RESOLUTION_FAILED"));
@@ -811,6 +821,21 @@ fn slim_error_lines(error: &lpm_common::LpmError) -> Vec<SlimErrorLine> {
         lpm_common::LpmError::Store(reason) => diagnostic_lines("Store error", Some(reason), error),
         lpm_common::LpmError::ProjectLayout(reason) => {
             diagnostic_lines("Project layout error", Some(reason), error)
+        }
+        lpm_common::LpmError::ScriptPhase {
+            phase,
+            code,
+            stdout,
+            stderr,
+        } => {
+            let mut lines = vec![SlimErrorLine::Failed(install_ui::terminal_line!(
+                "Script phase {} exited with code {}",
+                install_ui::yellow(phase),
+                install_ui::red(&code.to_string()),
+            ))];
+            push_captured_output(&mut lines, "stdout", stdout);
+            push_captured_output(&mut lines, "stderr", stderr);
+            lines
         }
         lpm_common::LpmError::ScriptWithOutput {
             code,

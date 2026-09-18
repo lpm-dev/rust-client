@@ -4,10 +4,10 @@ use super::cache::{
     resolve_task_dependency_identities, try_cache_hit_with_context, try_cache_store_with_context,
 };
 use super::format::{
-    TaskResult, TaskRunReport, format_run_failure_detail, print_captured_stderr,
-    print_captured_stdout, print_json_summary, print_results_summary, print_task_result,
+    TaskOutputPolicy, TaskResult, TaskRunReport, format_run_failure_detail, print_captured_stderr,
+    print_json_summary, print_results_summary, print_task_result, print_task_stdout, task_failure,
 };
-use super::task::{is_meta_task, run_task, run_task_captured};
+use super::task::{is_meta_task, run_task, run_task_captured_with_reserved_stdout};
 use crate::install_ui;
 use lpm_common::LpmError;
 use lpm_runner::bin_path::ManagedRuntimeHint;
@@ -27,12 +27,13 @@ pub(super) fn run_tasks_sequential(
     no_cache: bool,
     tasks: &HashMap<String, lpm_runner::lpm_json::TaskConfig>,
     lpm_config: Option<&lpm_runner::lpm_json::LpmJsonConfig>,
-    json_output: bool,
+    output_policy: TaskOutputPolicy,
     bin_hint: &ManagedRuntimeHint,
     pkg_scripts: Option<&HashMap<String, String>>,
     initially_failed_tasks: &HashSet<String>,
     session: Option<Arc<lpm_auth::SessionManager>>,
 ) -> Result<TaskRunReport, LpmError> {
+    let json_output = output_policy.reserve_stdout;
     let mut results: Vec<TaskResult> = Vec::with_capacity(scripts.len());
     let total_start = std::time::Instant::now();
     let mut failed_tasks = initially_failed_tasks.clone();
@@ -53,6 +54,8 @@ pub(super) fn run_tasks_sequential(
             results.push(TaskResult {
                 name: script.clone(),
                 success: false,
+                exit_code: None,
+                phase: None,
                 duration: std::time::Duration::ZERO,
                 cached: false,
                 skipped: true,
@@ -85,6 +88,8 @@ pub(super) fn run_tasks_sequential(
             results.push(TaskResult {
                 name: script.clone(),
                 success: true,
+                exit_code: None,
+                phase: None,
                 duration: start.elapsed(),
                 cached: false,
                 skipped: false,
@@ -114,7 +119,7 @@ pub(super) fn run_tasks_sequential(
             .flatten();
         if let Some(hit) = cache_hit {
             if !hit.stdout.is_empty() {
-                print_captured_stdout(&hit.stdout);
+                print_task_stdout(&hit.stdout, json_output);
             }
             if !hit.stderr.is_empty() {
                 print_captured_stderr(&hit.stderr);
@@ -122,6 +127,8 @@ pub(super) fn run_tasks_sequential(
             results.push(TaskResult {
                 name: script.clone(),
                 success: true,
+                exit_code: None,
+                phase: None,
                 duration: start.elapsed(),
                 cached: true,
                 skipped: false,
@@ -145,28 +152,35 @@ pub(super) fn run_tasks_sequential(
         let task_start = std::time::Instant::now();
 
         // Resolve command: lpm.json task command > package.json script
-        let run_result = if caching_enabled {
-            match run_task_captured(project_dir, script, extra_args, env_mode, tasks, bin_hint) {
+        let run_result = if caching_enabled || json_output {
+            match run_task_captured_with_reserved_stdout(
+                project_dir,
+                script,
+                extra_args,
+                env_mode,
+                tasks,
+                bin_hint,
+                json_output,
+            ) {
                 Ok(captured) => {
                     let duration_ms = task_start.elapsed().as_millis() as u64;
-                    let context = cache_context.as_ref().ok_or_else(|| {
-                        LpmError::Task(format!("cache context missing for task '{script}'"))
-                    })?;
-                    if try_cache_store_with_context(
-                        CacheStoreRequest {
-                            project_dir,
-                            workspace_contract,
-                            script_name: script,
-                            env_mode,
-                            extra_args,
-                            bin_hint,
-                            duration_ms,
-                            stdout: &captured.stdout,
-                            stderr: &captured.stderr,
-                        },
-                        context,
-                    ) && let Some(identity) =
-                        complete_task_cache_identity(project_dir, script, context)
+                    if let Some(context) = &cache_context
+                        && try_cache_store_with_context(
+                            CacheStoreRequest {
+                                project_dir,
+                                workspace_contract,
+                                script_name: script,
+                                env_mode,
+                                extra_args,
+                                bin_hint,
+                                duration_ms,
+                                stdout: &captured.stdout,
+                                stderr: &captured.stderr,
+                            },
+                            context,
+                        )
+                        && let Some(identity) =
+                            complete_task_cache_identity(project_dir, script, context)
                     {
                         cache_identities.insert(script.clone(), identity);
                     }
@@ -183,6 +197,8 @@ pub(super) fn run_tasks_sequential(
                 results.push(TaskResult {
                     name: script.clone(),
                     success: true,
+                    exit_code: None,
+                    phase: None,
                     duration: start.elapsed(),
                     cached: false,
                     skipped: false,
@@ -190,10 +206,13 @@ pub(super) fn run_tasks_sequential(
                 print_task_result(results.last().unwrap());
             }
             Err(error) => {
+                let (exit_code, phase) = task_failure(&error);
                 install_ui::detail_line(format_run_failure_detail(script, &error));
                 results.push(TaskResult {
                     name: script.clone(),
                     success: false,
+                    exit_code,
+                    phase,
                     duration: start.elapsed(),
                     cached: false,
                     skipped: false,
@@ -207,6 +226,8 @@ pub(super) fn run_tasks_sequential(
                         results.push(TaskResult {
                             name: remaining.clone(),
                             success: false,
+                            exit_code: None,
+                            phase: None,
                             duration: std::time::Duration::ZERO,
                             cached: false,
                             skipped: true,
@@ -224,7 +245,7 @@ pub(super) fn run_tasks_sequential(
 
     print_results_summary(&results, total_start.elapsed());
 
-    if json_output {
+    if output_policy.report_json {
         print_json_summary(&results, total_start.elapsed());
     }
     Ok(TaskRunReport::with_cache_identities(

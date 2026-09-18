@@ -133,7 +133,7 @@ pub async fn run_multi(
             no_cache,
             &tasks,
             lpm_config.as_ref(),
-            json_output,
+            format::TaskOutputPolicy::standalone(json_output),
             &bin_hint,
             pkg_scripts.as_ref(),
             &initially_failed_tasks,
@@ -153,14 +153,18 @@ pub async fn run_multi(
             no_cache,
             &tasks,
             lpm_config.as_ref(),
-            json_output,
+            format::TaskOutputPolicy::standalone(json_output),
             &bin_hint,
             pkg_scripts.as_ref(),
             &initially_failed_tasks,
             session,
         )
     }?;
-    report.into_result()
+    if total_tasks == 1 && scripts.len() == 1 {
+        report.into_single_result()
+    } else {
+        report.into_result()
+    }
 }
 
 /// Run an unknown top-level command as a script/task shortcut, then as a

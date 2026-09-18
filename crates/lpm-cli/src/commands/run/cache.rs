@@ -308,6 +308,14 @@ fn build_task_context(
     .cloned()
     .unwrap_or_default();
 
+    lpm_runner::npm_context::NpmScriptContext::new(
+        package.as_ref().and_then(|pkg| pkg.name.as_deref()),
+        package.as_ref().and_then(|pkg| pkg.version.as_deref()),
+        project_dir,
+        &std::env::current_dir()?,
+    )
+    .apply(&mut child_env, script_name, &command);
+
     let cache_inputs = effective_cache_inputs(&task_config, config_ref);
     let dependency_pairs = dependency_identity_pairs(dependency_identities);
     let cache_snapshot = lpm_task::hasher::compute_cache_key_snapshot_with_workspace_contract(

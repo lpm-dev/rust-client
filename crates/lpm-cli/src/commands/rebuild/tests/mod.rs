@@ -3714,3 +3714,48 @@ fn publish_lifecycle_rejects_replaced_directory_before_sandbox_configuration() {
     );
     assert!(result.is_err(), "replaced source directory was accepted");
 }
+
+#[test]
+fn legacy_build_order_traverses_unscripted_alias_and_peer_dependencies() {
+    let packages = ["a-consumer", "z-helper"].map(|name| ScriptablePackage {
+        instance_id: None,
+        name: name.into(),
+        version: "1.0.0".into(),
+        integrity: None,
+        wrapper_id: None,
+        store_path: name.into(),
+        pristine_path: "pristine".into(),
+        source_integrity: "sha512-unused".into(),
+        graph_key_digest: None,
+        scripts: HashMap::new(),
+        is_built: false,
+        build_marker_key: None,
+        is_trusted: true,
+        trust_reason: TrustReason::StrictBinding,
+    });
+    let mut lockfile = lpm_lockfile::Lockfile::new();
+    lockfile.packages = vec![
+        lpm_lockfile::LockedPackage {
+            name: "a-consumer".into(),
+            version: "1.0.0".into(),
+            dependencies: vec!["bridge@1.0.0".into()],
+            alias_dependencies: vec![["bridge".into(), "b-middle".into()]],
+            ..Default::default()
+        },
+        lpm_lockfile::LockedPackage {
+            name: "b-middle".into(),
+            version: "1.0.0".into(),
+            peers: vec!["z-helper@1.0.0".into()],
+            ..Default::default()
+        },
+        lpm_lockfile::LockedPackage {
+            name: "z-helper".into(),
+            version: "1.0.0".into(),
+            ..Default::default()
+        },
+    ];
+    let layers = package_build_layers(packages.iter().collect(), &lockfile);
+    assert_eq!(layers.len(), 2);
+    assert_eq!(layers[0][0].name, "z-helper");
+    assert_eq!(layers[1][0].name, "a-consumer");
+}

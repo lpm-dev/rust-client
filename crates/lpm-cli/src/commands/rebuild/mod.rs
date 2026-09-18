@@ -31,6 +31,7 @@
 
 mod build_cache;
 mod hints;
+mod lifecycle_tools;
 mod package_dir;
 pub(super) mod process_tree;
 pub(in crate::commands) mod sandbox_env;
@@ -961,6 +962,7 @@ async fn run_under_store_lock(
             tmpdir: tmpdir.clone(),
             read_project_full: false,
             secret_read_allow: Vec::new(),
+            dependency_read_dirs: Vec::new(),
             extra_write_dirs: extra_write_dirs.clone(),
         };
         lpm_sandbox::prepare_writable_dirs(&prepare_spec)
@@ -1001,6 +1003,7 @@ async fn run_under_store_lock(
             tmpdir: tmpdir.clone(),
             read_project_full: false,
             secret_read_allow: Vec::new(),
+            dependency_read_dirs: Vec::new(),
             extra_write_dirs: Vec::new(),
         };
         let probe_sandbox = lpm_sandbox::new_for_platform_with_options(
@@ -1129,6 +1132,13 @@ async fn run_under_store_lock(
         .map_err(|error| LpmError::Registry(format!("failed to start rebuild workers: {error}")))?;
 
     for layer in &to_build_layers {
+        if let Some(invocation) = &build_cache_invocation {
+            invocation.begin_layer();
+        }
+        let active_layer_directories = layer
+            .iter()
+            .filter_map(|package| package.store_path.canonicalize().ok())
+            .collect::<std::collections::HashSet<_>>();
         let execute_layer = || {
             lifecycle_pool.install(|| {
             layer
@@ -1142,16 +1152,6 @@ async fn run_under_store_lock(
                     }
         let mut pkg_success = true;
 
-        let key_start = std::time::Instant::now();
-        let mut build_key = build_cache_invocation
-            .as_ref()
-            .and_then(|invocation| build_key_for_package(invocation, pkg, project_dir));
-        result.build_cache.key_ms += elapsed_millis(key_start.elapsed());
-        if build_key.is_some() {
-            result.build_cache.eligible += 1;
-        } else if is_cacheable_native_build(pkg) {
-            result.build_cache.bypassed += 1;
-        }
         let package_store_version = match rebuild_store_version(
             &pkg.store_path,
             &v3_store_root,
@@ -1203,23 +1203,6 @@ async fn run_under_store_lock(
         } else {
             None
         };
-        let _build_key_lock = if let Some(key) = build_key.as_ref() {
-            match lpm_common::acquire_exclusive_lock(virtual_store.paths().build_lock_path(key)) {
-                Ok(lock) => Some(lock),
-                Err(error) => {
-                    tracing::warn!(
-                        "build cache bypassed for {}@{} because the per-key lock failed: {error}",
-                        pkg.name,
-                        pkg.version
-                    );
-                    result.build_cache.bypassed += 1;
-                    build_key = None;
-                    None
-                }
-            }
-        } else {
-            None
-        };
 
         // fix: lifecycle scripts must run from the LIVE
         // per-package directory (where the symlinked sibling
@@ -1262,8 +1245,61 @@ async fn run_under_store_lock(
             }
         };
 
+        let build_cache_scratch = pkg.graph_key_digest.as_deref()
+            .and_then(|digest| match BuildCacheScratch::create(&live_pkg_dir, digest) {
+                Ok(scratch) => Some(scratch),
+                Err(error) => { tracing::debug!("stable lifecycle scratch unavailable: {error}"); None }
+            });
+        let package_tmpdir = if build_cache_scratch.is_none() {
+            match tempfile::Builder::new().prefix("lpm-rebuild-").tempdir_in(&tmpdir) {
+                Ok(directory) => Some(directory),
+                Err(error) => { install_ui::failed_untrusted(&rebuild_package_failure_message(pkg, &error)); result.failures += 1; return result; }
+            }
+        } else { None };
+        let scratch_path = match (build_cache_scratch.as_ref(), package_tmpdir.as_ref()) {
+            (Some(scratch), _) => scratch.path(),
+            (_, Some(scratch)) => scratch.path(),
+            _ => { result.failures += 1; return result; }
+        };
+        let script_tmpdir = scratch_path.join("tmp");
+        let tools = match std::fs::create_dir(&script_tmpdir).map_err(|e| e.to_string()).and_then(|()| {
+            lifecycle_tools::LifecycleTools::prepare(&live_pkg_dir, pkg.graph_key_digest.as_deref(), &virtual_store.paths().links_root(), scratch_path)
+        }) {
+            Ok(tools) => tools,
+            Err(error) => { install_ui::failed_untrusted(&rebuild_package_failure_message(pkg, &error)); result.failures += 1; return result; }
+        };
+        let key_start = std::time::Instant::now();
+        let mut build_key = build_cache_invocation
+            .as_ref()
+            .filter(|_| build_cache_scratch.is_some())
+            .filter(|_| !tools.read_dirs.iter().any(|directory| active_layer_directories.contains(directory)))
+            .and_then(|invocation| build_key_for_package(invocation, pkg, project_dir, &tools, &script_tmpdir));
+        result.build_cache.key_ms += elapsed_millis(key_start.elapsed());
+        if build_key.is_some() {
+            result.build_cache.eligible += 1;
+        } else if is_cacheable_native_build(pkg) {
+            result.build_cache.bypassed += 1;
+        }
+        let _build_key_lock = if let Some(key) = build_key.as_ref() {
+            match lpm_common::acquire_exclusive_lock(virtual_store.paths().build_lock_path(key)) {
+                Ok(lock) => Some(lock),
+                Err(error) => {
+                    tracing::warn!(
+                        "build cache bypassed for {}@{} because the per-key lock failed: {error}",
+                        pkg.name,
+                        pkg.version
+                    );
+                    result.build_cache.bypassed += 1;
+                    build_key = None;
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
         // Capture the input before scripts can change their own files.
-        let mut lifecycle_hash = if build_key.is_none() {
+        let lifecycle_hash = if build_key.is_none() {
             match lpm_security::script_hash::compute_script_hash(&pkg.store_path) {
                 Some(hash) => Some(hash),
                 None => {
@@ -1441,68 +1477,6 @@ async fn run_under_store_lock(
                 elapsed_millis(rematerialize_start.elapsed());
         }
 
-        let build_cache_scratch = if build_key.is_some() {
-            let scratch = pkg
-                .graph_key_digest
-                .as_deref()
-                .ok_or_else(|| std::io::Error::other("package has no v2 graph identity"))
-                .and_then(|digest| BuildCacheScratch::create(&pkg.store_path, digest));
-            match scratch {
-                Ok(scratch) => Some(scratch),
-                Err(error) => {
-                    tracing::warn!(
-                        "build cache bypassed for {}@{} because isolated scratch setup failed: {error}",
-                        pkg.name,
-                        pkg.version
-                    );
-                    build_key = None;
-                    None
-                }
-            }
-        } else {
-            None
-        };
-        if build_key.is_none() && lifecycle_hash.is_none() {
-            lifecycle_hash = lpm_security::script_hash::compute_script_hash(&pkg.store_path);
-            if lifecycle_hash.is_none() {
-                install_ui::failed_untrusted(&rebuild_package_failure_message(
-                    pkg, &"cannot fingerprint installed lifecycle scripts",
-                ));
-                result.failures += 1;
-                return result;
-            }
-        }
-        let package_tmpdir = if build_cache_scratch.is_none() {
-            match tempfile::Builder::new()
-                .prefix("lpm-rebuild-")
-                .tempdir_in(&tmpdir)
-            {
-                Ok(package_tmpdir) => Some(package_tmpdir),
-                Err(error) => {
-                    if !json_output {
-                        let label = format!("{:<package_label_width$}", rebuild_package_label(pkg));
-                        install_ui::detail_line(crate::install_ui::terminal_line!(
-                            "  {} {}  failed to create package temporary directory: {}",
-                            install_ui::red("✗"),
-                            label,
-                            lpm_common::sanitize_terminal_inline(&error.to_string()),
-                        ));
-                    }
-                    result.failures += 1;
-                    return result;
-                }
-            }
-        } else {
-            None
-        };
-        let script_tmpdir = if let Some(scratch) = build_cache_scratch.as_ref() {
-            scratch.path()
-        } else if let Some(package_tmpdir) = package_tmpdir.as_ref() {
-            package_tmpdir.path()
-        } else {
-            result.failures += 1;
-            return result;
-        };
         let mut package_sandbox_options = sandbox_options.clone();
         package_sandbox_options.build_cache_isolation = build_key.is_some();
 
@@ -1515,6 +1489,8 @@ async fn run_under_store_lock(
 
             match execute_script(
                 cmd,
+                phase,
+                &tools,
                 &pkg.name,
                 &pkg.version,
                 &live_pkg_dir,
@@ -1529,7 +1505,7 @@ async fn run_under_store_lock(
                 &extra_secret_read_allow,
                 &store_root,
                 &home_dir,
-                script_tmpdir,
+                &script_tmpdir,
                 json_output,
             ) {
                 Ok(()) => {

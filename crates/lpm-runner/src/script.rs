@@ -13,6 +13,7 @@ use crate::bin_path::ManagedRuntimeHint;
 use crate::dotenv;
 use crate::hooks;
 use crate::lpm_json;
+use crate::npm_context::NpmScriptContext;
 use crate::shell::{self, ShellCommand};
 use lpm_common::color::Painted;
 use lpm_common::{LpmError, sanitize_terminal_inline};
@@ -270,7 +271,11 @@ pub fn run_script_with_envs(
     extra_envs: &[(String, String)],
     bin_hint: &ManagedRuntimeHint,
 ) -> Result<(), LpmError> {
-    let (script_cmd, scripts) = resolve_script_command(project_dir, script_name)?;
+    let ResolvedScript {
+        command: script_cmd,
+        scripts,
+        context,
+    } = resolve_script_command(project_dir, script_name)?;
 
     // Build PATH with .bin dirs prepended
     let path = bin_path::build_path_with_bins_pre_resolved(project_dir, bin_hint)?;
@@ -280,6 +285,9 @@ pub fn run_script_with_envs(
     print_env_context(&loaded);
     let mut env_vars = loaded.vars;
     for (key, value) in extra_envs {
+        if cfg!(windows) {
+            env_vars.retain(|existing, _| !existing.eq_ignore_ascii_case(key));
+        }
         env_vars.insert(key.clone(), value.clone());
     }
     mark_script_child_env(&mut env_vars);
@@ -287,6 +295,7 @@ pub fn run_script_with_envs(
     // Run pre-hook if it exists
     if let Some(pre_cmd) = hooks::find_pre_hook(&scripts, script_name) {
         let pre_name = hooks::pre_hook_name(script_name);
+        context.apply(&mut env_vars, &pre_name, pre_cmd);
         tracing::debug!("running pre-hook: {pre_name}");
 
         let status = shell::spawn_shell(&ShellCommand {
@@ -297,13 +306,16 @@ pub fn run_script_with_envs(
         })?;
 
         if !status.success() {
-            let code = status.code().unwrap_or(1);
-            return Err(LpmError::Script(format!(
-                "pre-hook '{pre_name}' exited with code {code}"
-            )));
+            return Err(script_phase_error(
+                &pre_name,
+                &status,
+                String::new(),
+                String::new(),
+            ));
         }
     }
 
+    context.apply(&mut env_vars, script_name, &script_cmd);
     let full_cmd = assemble_shell_command(&script_cmd, extra_args, project_dir, &path)?;
 
     // Run the main script
@@ -321,6 +333,7 @@ pub fn run_script_with_envs(
     // Run post-hook if it exists
     if let Some(post_cmd) = hooks::find_post_hook(&scripts, script_name) {
         let post_name = hooks::post_hook_name(script_name);
+        context.apply(&mut env_vars, &post_name, post_cmd);
         tracing::debug!("running post-hook: {post_name}");
 
         let status = shell::spawn_shell(&ShellCommand {
@@ -331,10 +344,12 @@ pub fn run_script_with_envs(
         })?;
 
         if !status.success() {
-            let code = status.code().unwrap_or(1);
-            return Err(LpmError::Script(format!(
-                "post-hook '{post_name}' exited with code {code}"
-            )));
+            return Err(script_phase_error(
+                &post_name,
+                &status,
+                String::new(),
+                String::new(),
+            ));
         }
     }
 
@@ -377,17 +392,25 @@ pub fn run_dev_script_with_envs_and_config(
     config: Option<&lpm_json::LpmJsonConfig>,
     endpoint_options: DevScriptEndpointOptions,
 ) -> Result<(), LpmError> {
-    let (script_cmd, scripts) = resolve_script_command_with_config(project_dir, "dev", config)?;
+    let ResolvedScript {
+        command: script_cmd,
+        scripts,
+        context,
+    } = resolve_script_command_with_config(project_dir, "dev", config)?;
     let path = bin_path::build_path_with_bins_pre_resolved(project_dir, bin_hint)?;
     let loaded = resolve_and_load_env_with_config(project_dir, "dev", env_mode, config)?;
     print_env_context(&loaded);
     let mut env_vars = loaded.vars;
     for (key, value) in extra_envs {
+        if cfg!(windows) {
+            env_vars.retain(|existing, _| !existing.eq_ignore_ascii_case(key));
+        }
         env_vars.insert(key.clone(), value.clone());
     }
     mark_script_child_env(&mut env_vars);
 
     if let Some(pre_cmd) = hooks::find_pre_hook(&scripts, "dev") {
+        context.apply(&mut env_vars, "predev", pre_cmd);
         let status = shell::spawn_shell(&ShellCommand {
             command: pre_cmd,
             cwd: project_dir,
@@ -395,13 +418,16 @@ pub fn run_dev_script_with_envs_and_config(
             envs: &env_vars,
         })?;
         if !status.success() {
-            let code = status.code().unwrap_or(1);
-            return Err(LpmError::Script(format!(
-                "pre-hook 'predev' exited with code {code}"
-            )));
+            return Err(script_phase_error(
+                "predev",
+                &status,
+                String::new(),
+                String::new(),
+            ));
         }
     }
 
+    context.apply(&mut env_vars, "dev", &script_cmd);
     let full_cmd = assemble_shell_command(&script_cmd, extra_args, project_dir, &path)?;
     let status = shell::spawn_shell_with_endpoint(
         &ShellCommand {
@@ -426,6 +452,7 @@ pub fn run_dev_script_with_envs_and_config(
     }
 
     if let Some(post_cmd) = hooks::find_post_hook(&scripts, "dev") {
+        context.apply(&mut env_vars, "postdev", post_cmd);
         let status = shell::spawn_shell(&ShellCommand {
             command: post_cmd,
             cwd: project_dir,
@@ -433,13 +460,29 @@ pub fn run_dev_script_with_envs_and_config(
             envs: &env_vars,
         })?;
         if !status.success() {
-            let code = status.code().unwrap_or(1);
-            return Err(LpmError::Script(format!(
-                "post-hook 'postdev' exited with code {code}"
-            )));
+            return Err(script_phase_error(
+                "postdev",
+                &status,
+                String::new(),
+                String::new(),
+            ));
         }
     }
     Ok(())
+}
+
+fn script_phase_error(
+    phase: &str,
+    status: &std::process::ExitStatus,
+    stdout: String,
+    stderr: String,
+) -> LpmError {
+    LpmError::ScriptPhase {
+        phase: phase.to_string(),
+        code: shell::exit_code(status),
+        stdout,
+        stderr,
+    }
 }
 
 /// Result of a captured script execution.
@@ -453,7 +496,7 @@ pub struct ScriptOutput {
 /// Run a script with tee-captured stdout/stderr.
 ///
 /// Like `run_script`, but captures output for caching while still streaming
-/// to the terminal. Pre/post hooks run normally (not captured).
+/// to the terminal. The capture includes pre/post hooks.
 pub fn run_script_captured(
     project_dir: &Path,
     script_name: &str,
@@ -480,85 +523,28 @@ pub fn run_script_captured_with_reserved_stdout(
     bin_hint: &ManagedRuntimeHint,
     reserve_stdout: bool,
 ) -> Result<ScriptOutput, LpmError> {
-    let (script_cmd, scripts) = resolve_script_command(project_dir, script_name)?;
+    run_script_with_output(
+        project_dir,
+        script_name,
+        extra_args,
+        env_mode,
+        bin_hint,
+        |command| shell::spawn_shell_tee_with_reserved_stdout(command, reserve_stdout),
+    )
+    .map_err(without_echoed_output)
+}
 
-    let path = bin_path::build_path_with_bins_pre_resolved(project_dir, bin_hint)?;
-    let loaded = resolve_and_load_env(project_dir, script_name, env_mode)?;
-    print_env_context(&loaded);
-    let mut env_vars = loaded.vars;
-    mark_script_child_env(&mut env_vars);
-
-    // Run pre-hook (not captured — hooks output goes to terminal only)
-    if let Some(pre_cmd) = hooks::find_pre_hook(&scripts, script_name) {
-        let pre_name = hooks::pre_hook_name(script_name);
-        tracing::debug!("running pre-hook: {pre_name}");
-
-        let hook = ShellCommand {
-            command: pre_cmd,
-            cwd: project_dir,
-            path: &path,
-            envs: &env_vars,
-        };
-        let status = if reserve_stdout {
-            shell::spawn_shell_tee_with_reserved_stdout(&hook, true)?.status
-        } else {
-            shell::spawn_shell(&hook)?
-        };
-
-        if !status.success() {
-            let code = status.code().unwrap_or(1);
-            return Err(LpmError::Script(format!(
-                "pre-hook '{pre_name}' exited with code {code}"
-            )));
-        }
-    }
-
-    let full_cmd = assemble_shell_command(&script_cmd, extra_args, project_dir, &path)?;
-
-    // Run the main script with tee capture
-    let captured = shell::spawn_shell_tee_with_reserved_stdout(
-        &ShellCommand {
-            command: &full_cmd,
-            cwd: project_dir,
-            path: &path,
-            envs: &env_vars,
+fn without_echoed_output(error: LpmError) -> LpmError {
+    match error {
+        LpmError::ScriptPhase { phase, code, .. } => LpmError::ScriptPhase {
+            phase,
+            code,
+            stdout: String::new(),
+            stderr: String::new(),
         },
-        reserve_stdout,
-    )?;
-
-    if !captured.status.success() {
-        return Err(LpmError::ExitCode(shell::exit_code(&captured.status)));
+        LpmError::ScriptWithOutput { code, .. } => LpmError::ExitCode(code),
+        error => error,
     }
-
-    // Run post-hook (not captured)
-    if let Some(post_cmd) = hooks::find_post_hook(&scripts, script_name) {
-        let post_name = hooks::post_hook_name(script_name);
-        tracing::debug!("running post-hook: {post_name}");
-
-        let hook = ShellCommand {
-            command: post_cmd,
-            cwd: project_dir,
-            path: &path,
-            envs: &env_vars,
-        };
-        let status = if reserve_stdout {
-            shell::spawn_shell_tee_with_reserved_stdout(&hook, true)?.status
-        } else {
-            shell::spawn_shell(&hook)?
-        };
-
-        if !status.success() {
-            let code = status.code().unwrap_or(1);
-            return Err(LpmError::Script(format!(
-                "post-hook '{post_name}' exited with code {code}"
-            )));
-        }
-    }
-
-    Ok(ScriptOutput {
-        stdout: captured.stdout,
-        stderr: captured.stderr,
-    })
 }
 
 /// Run a script with fully captured output (no terminal echo).
@@ -572,68 +558,80 @@ pub fn run_script_buffered(
     env_mode: Option<&str>,
     bin_hint: &ManagedRuntimeHint,
 ) -> Result<ScriptOutput, LpmError> {
-    let (script_cmd, scripts) = resolve_script_command(project_dir, script_name)?;
+    run_script_with_output(
+        project_dir,
+        script_name,
+        extra_args,
+        env_mode,
+        bin_hint,
+        shell::spawn_shell_capture,
+    )
+}
 
+fn run_script_with_output(
+    project_dir: &Path,
+    script_name: &str,
+    extra_args: &[String],
+    env_mode: Option<&str>,
+    bin_hint: &ManagedRuntimeHint,
+    mut spawn: impl FnMut(&ShellCommand<'_>) -> Result<shell::CapturedOutput, LpmError>,
+) -> Result<ScriptOutput, LpmError> {
+    let ResolvedScript {
+        command,
+        scripts,
+        context,
+    } = resolve_script_command(project_dir, script_name)?;
     let path = bin_path::build_path_with_bins_pre_resolved(project_dir, bin_hint)?;
-    let mut env_vars = resolve_and_load_env(project_dir, script_name, env_mode)?.vars;
-    mark_script_child_env(&mut env_vars);
-
-    // Pre-hook (not captured)
-    if let Some(pre_cmd) = hooks::find_pre_hook(&scripts, script_name) {
-        let pre_name = hooks::pre_hook_name(script_name);
-        let status = shell::spawn_shell(&ShellCommand {
-            command: pre_cmd,
+    let mut environment = resolve_and_load_env(project_dir, script_name, env_mode)?.vars;
+    mark_script_child_env(&mut environment);
+    let pre_name = hooks::pre_hook_name(script_name);
+    let post_name = hooks::post_hook_name(script_name);
+    let phases = [
+        (
+            pre_name.as_str(),
+            hooks::find_pre_hook(&scripts, script_name),
+        ),
+        (script_name, Some(command.as_str())),
+        (
+            post_name.as_str(),
+            hooks::find_post_hook(&scripts, script_name),
+        ),
+    ];
+    let mut output = ScriptOutput {
+        stdout: String::new(),
+        stderr: String::new(),
+    };
+    for (phase, declared_command) in phases {
+        let Some(declared_command) = declared_command else {
+            continue;
+        };
+        context.apply(&mut environment, phase, declared_command);
+        let full_command;
+        let command = if phase == script_name {
+            full_command =
+                assemble_shell_command(declared_command, extra_args, project_dir, &path)?;
+            full_command.as_str()
+        } else {
+            declared_command
+        };
+        let captured = spawn(&ShellCommand {
+            command,
             cwd: project_dir,
             path: &path,
-            envs: &env_vars,
+            envs: &environment,
         })?;
-        if !status.success() {
-            let code = status.code().unwrap_or(1);
-            return Err(LpmError::Script(format!(
-                "pre-hook '{pre_name}' exited with code {code}"
-            )));
+        shell::append_capped_output(&mut output.stdout, &captured.stdout);
+        shell::append_capped_output(&mut output.stderr, &captured.stderr);
+        if !captured.status.success() {
+            return Err(script_phase_error(
+                phase,
+                &captured.status,
+                output.stdout,
+                output.stderr,
+            ));
         }
     }
-
-    let full_cmd = assemble_shell_command(&script_cmd, extra_args, project_dir, &path)?;
-
-    // Capture without terminal echo
-    let captured = shell::spawn_shell_capture(&ShellCommand {
-        command: &full_cmd,
-        cwd: project_dir,
-        path: &path,
-        envs: &env_vars,
-    })?;
-
-    if !captured.status.success() {
-        return Err(LpmError::ScriptWithOutput {
-            code: shell::exit_code(&captured.status),
-            stdout: captured.stdout,
-            stderr: captured.stderr,
-        });
-    }
-
-    // Post-hook (not captured)
-    if let Some(post_cmd) = hooks::find_post_hook(&scripts, script_name) {
-        let post_name = hooks::post_hook_name(script_name);
-        let status = shell::spawn_shell(&ShellCommand {
-            command: post_cmd,
-            cwd: project_dir,
-            path: &path,
-            envs: &env_vars,
-        })?;
-        if !status.success() {
-            let code = status.code().unwrap_or(1);
-            return Err(LpmError::Script(format!(
-                "post-hook '{post_name}' exited with code {code}"
-            )));
-        }
-    }
-
-    Ok(ScriptOutput {
-        stdout: captured.stdout,
-        stderr: captured.stderr,
-    })
+    Ok(output)
 }
 
 /// Run an explicit command with fully captured output (no terminal echo).
@@ -706,7 +704,17 @@ fn run_command_buffered_named(
     let path = bin_path::build_path_with_bins_pre_resolved(project_dir, bin_hint)?;
     let mut env_vars = resolve_and_load_env(project_dir, task_name, env_mode)?.vars;
     for (key, value) in extra_envs {
+        if cfg!(windows) {
+            env_vars.retain(|existing, _| !existing.eq_ignore_ascii_case(key));
+        }
         env_vars.insert(key.clone(), value.clone());
+    }
+    if !task_name.is_empty() {
+        NpmScriptContext::load(project_dir, &std::env::current_dir()?)?.apply(
+            &mut env_vars,
+            task_name,
+            command,
+        );
     }
     mark_script_child_env(&mut env_vars);
 
@@ -743,37 +751,14 @@ pub fn run_script_prefixed(
     color: &str,
     bin_hint: &ManagedRuntimeHint,
 ) -> Result<ScriptOutput, LpmError> {
-    let (script_cmd, _scripts) = resolve_script_command(project_dir, script_name)?;
-
-    let path = bin_path::build_path_with_bins_pre_resolved(project_dir, bin_hint)?;
-    let mut env_vars = resolve_and_load_env(project_dir, script_name, env_mode)?.vars;
-    mark_script_child_env(&mut env_vars);
-
-    let full_cmd = assemble_shell_command(&script_cmd, extra_args, project_dir, &path)?;
-
-    let captured = shell::spawn_shell_prefixed(
-        &ShellCommand {
-            command: &full_cmd,
-            cwd: project_dir,
-            path: &path,
-            envs: &env_vars,
-        },
-        prefix,
-        color,
-    )?;
-
-    if !captured.status.success() {
-        return Err(LpmError::ScriptWithOutput {
-            code: shell::exit_code(&captured.status),
-            stdout: captured.stdout,
-            stderr: captured.stderr,
-        });
-    }
-
-    Ok(ScriptOutput {
-        stdout: captured.stdout,
-        stderr: captured.stderr,
-    })
+    run_script_with_output(
+        project_dir,
+        script_name,
+        extra_args,
+        env_mode,
+        bin_hint,
+        |command| shell::spawn_shell_prefixed(command, prefix, color),
+    )
 }
 
 /// Run an explicit command with prefixed live output.
@@ -840,6 +825,13 @@ fn run_command_prefixed_named(
 ) -> Result<ScriptOutput, LpmError> {
     let path = bin_path::build_path_with_bins_pre_resolved(project_dir, bin_hint)?;
     let mut env_vars = resolve_and_load_env(project_dir, task_name, env_mode)?.vars;
+    if !task_name.is_empty() {
+        NpmScriptContext::load(project_dir, &std::env::current_dir()?)?.apply(
+            &mut env_vars,
+            task_name,
+            command,
+        );
+    }
     mark_script_child_env(&mut env_vars);
 
     let full_cmd = assemble_shell_command(command, extra_args, project_dir, &path)?;
@@ -944,7 +936,17 @@ fn run_command_named_with_envs(
     let path = bin_path::build_path_with_bins_pre_resolved(project_dir, bin_hint)?;
     let mut env_vars = resolve_and_load_env(project_dir, task_name, env_mode)?.vars;
     for (key, value) in extra_envs {
+        if cfg!(windows) {
+            env_vars.retain(|existing, _| !existing.eq_ignore_ascii_case(key));
+        }
         env_vars.insert(key.clone(), value.clone());
+    }
+    if !task_name.is_empty() {
+        NpmScriptContext::load(project_dir, &std::env::current_dir()?)?.apply(
+            &mut env_vars,
+            task_name,
+            command,
+        );
     }
     mark_script_child_env(&mut env_vars);
 
@@ -1187,7 +1189,15 @@ pub fn run_command_captured(
     env_mode: Option<&str>,
     bin_hint: &ManagedRuntimeHint,
 ) -> Result<ScriptOutput, LpmError> {
-    run_command_captured_named(project_dir, "", command, extra_args, env_mode, bin_hint)
+    run_command_captured_named(
+        project_dir,
+        "",
+        command,
+        extra_args,
+        env_mode,
+        bin_hint,
+        false,
+    )
 }
 
 pub fn run_task_command_captured(
@@ -1205,6 +1215,27 @@ pub fn run_task_command_captured(
         extra_args,
         env_mode,
         bin_hint,
+        false,
+    )
+}
+
+pub fn run_task_command_captured_with_reserved_stdout(
+    project_dir: &Path,
+    task_name: &str,
+    command: &str,
+    extra_args: &[String],
+    env_mode: Option<&str>,
+    bin_hint: &ManagedRuntimeHint,
+    reserve_stdout: bool,
+) -> Result<ScriptOutput, LpmError> {
+    run_command_captured_named(
+        project_dir,
+        task_name,
+        command,
+        extra_args,
+        env_mode,
+        bin_hint,
+        reserve_stdout,
     )
 }
 
@@ -1215,19 +1246,30 @@ fn run_command_captured_named(
     extra_args: &[String],
     env_mode: Option<&str>,
     bin_hint: &ManagedRuntimeHint,
+    reserve_stdout: bool,
 ) -> Result<ScriptOutput, LpmError> {
     let path = bin_path::build_path_with_bins_pre_resolved(project_dir, bin_hint)?;
     let mut env_vars = resolve_and_load_env(project_dir, task_name, env_mode)?.vars;
+    if !task_name.is_empty() {
+        NpmScriptContext::load(project_dir, &std::env::current_dir()?)?.apply(
+            &mut env_vars,
+            task_name,
+            command,
+        );
+    }
     mark_script_child_env(&mut env_vars);
 
     let full_cmd = assemble_shell_command(command, extra_args, project_dir, &path)?;
 
-    let captured = shell::spawn_shell_tee(&ShellCommand {
-        command: &full_cmd,
-        cwd: project_dir,
-        path: &path,
-        envs: &env_vars,
-    })?;
+    let captured = shell::spawn_shell_tee_with_reserved_stdout(
+        &ShellCommand {
+            command: &full_cmd,
+            cwd: project_dir,
+            path: &path,
+            envs: &env_vars,
+        },
+        reserve_stdout,
+    )?;
 
     if !captured.status.success() {
         return Err(LpmError::ExitCode(shell::exit_code(&captured.status)));
@@ -1392,7 +1434,7 @@ pub fn load_script_env_with_config(
 
 /// Resolve only a script command from package.json or lpm.json tasks.
 pub fn script_command(project_dir: &Path, script_name: &str) -> Result<String, LpmError> {
-    resolve_script_command(project_dir, script_name).map(|(command, _)| command)
+    resolve_script_command(project_dir, script_name).map(|resolved| resolved.command)
 }
 
 pub fn script_command_with_config(
@@ -1400,7 +1442,8 @@ pub fn script_command_with_config(
     script_name: &str,
     config: Option<&lpm_json::LpmJsonConfig>,
 ) -> Result<String, LpmError> {
-    resolve_script_command_with_config(project_dir, script_name, config).map(|(command, _)| command)
+    resolve_script_command_with_config(project_dir, script_name, config)
+        .map(|resolved| resolved.command)
 }
 
 /// Resolve a script command from package.json or lpm.json tasks.
@@ -1410,10 +1453,16 @@ pub fn script_command_with_config(
 /// 2. `lpm.json` tasks with a `command` field (pure lpm.json projects)
 ///
 /// Returns `(script_command, all_scripts_map)` for hook resolution.
+struct ResolvedScript {
+    command: String,
+    scripts: HashMap<String, String>,
+    context: NpmScriptContext,
+}
+
 fn resolve_script_command(
     project_dir: &Path,
     script_name: &str,
-) -> Result<(String, HashMap<String, String>), LpmError> {
+) -> Result<ResolvedScript, LpmError> {
     let config = lpm_json::read_lpm_json(project_dir).map_err(LpmError::Script)?;
     resolve_script_command_with_config(project_dir, script_name, config.as_ref())
 }
@@ -1422,7 +1471,7 @@ fn resolve_script_command_with_config(
     project_dir: &Path,
     script_name: &str,
     lpm_config: Option<&lpm_json::LpmJsonConfig>,
-) -> Result<(String, HashMap<String, String>), LpmError> {
+) -> Result<ResolvedScript, LpmError> {
     let pkg_json_path = project_dir.join("package.json");
 
     let package = match read_package_json(&pkg_json_path) {
@@ -1435,10 +1484,21 @@ fn resolve_script_command_with_config(
         }
     };
 
+    let context = NpmScriptContext::new(
+        package.as_ref().and_then(|pkg| pkg.name.as_deref()),
+        package.as_ref().and_then(|pkg| pkg.version.as_deref()),
+        project_dir,
+        &std::env::current_dir()?,
+    );
+
     if let Some(pkg) = &package
         && let Some(cmd) = pkg.scripts.get(script_name)
     {
-        return Ok((cmd.clone(), pkg.scripts.clone()));
+        return Ok(ResolvedScript {
+            command: cmd.clone(),
+            scripts: pkg.scripts.clone(),
+            context,
+        });
     }
 
     if let Some(config) = lpm_config {
@@ -1452,7 +1512,11 @@ fn resolve_script_command_with_config(
                     .iter()
                     .filter_map(|(k, v)| v.command.as_ref().map(|c| (k.clone(), c.clone())))
                     .collect();
-                return Ok((cmd.clone(), scripts));
+                return Ok(ResolvedScript {
+                    command: cmd.clone(),
+                    scripts,
+                    context,
+                });
             }
         }
     }
@@ -2086,6 +2150,28 @@ mod tests {
     }
 
     #[test]
+    fn run_script_buffered_caps_combined_hook_output() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("package.json"),
+            r#"{"scripts":{"preprobe":"node output.cjs","probe":"node output.cjs"}}"#,
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("output.cjs"),
+            "process.stdout.write('x'.repeat(6*1024*1024)+'\\n');",
+        )
+        .unwrap();
+        let output = run_script_buffered(dir.path(), "probe", &[], None, &Unknown).unwrap();
+        assert!(
+            output.stdout.len() <= lpm_common::TASK_OUTPUT_CAPTURE_BYTES + 64,
+            "{}",
+            output.stdout.len()
+        );
+        assert!(output.stdout.contains("output truncated"));
+    }
+
+    #[test]
     fn run_script_buffered_failure_preserves_output() {
         let dir = tempfile::tempdir().unwrap();
         fs::write(
@@ -2096,11 +2182,18 @@ mod tests {
 
         let result = run_script_buffered(dir.path(), "fail", &[], None, &Unknown);
         assert!(result.is_err());
-        if let Err(LpmError::ScriptWithOutput { code, stderr, .. }) = result {
+        if let Err(LpmError::ScriptPhase {
+            phase,
+            code,
+            stderr,
+            ..
+        }) = result
+        {
+            assert_eq!(phase, "fail");
             assert_eq!(code, 1);
             assert!(stderr.contains("fail-output"));
         } else {
-            panic!("expected ScriptWithOutput error");
+            panic!("expected ScriptPhase error");
         }
     }
 

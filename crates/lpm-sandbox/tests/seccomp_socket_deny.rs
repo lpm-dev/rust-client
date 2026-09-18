@@ -95,6 +95,7 @@ fn realistic_spec() -> SandboxSpec {
         tmpdir: tmp,
         read_project_full: false,
         secret_read_allow: Vec::new(),
+        dependency_read_dirs: Vec::new(),
         extra_write_dirs: Vec::new(),
     }
 }

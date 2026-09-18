@@ -389,6 +389,7 @@ fn stdio_for_argv(s: SandboxStdio) -> StdioMode {
 pub(crate) fn readable_allow_set(spec: &SandboxSpec) -> Vec<PathBuf> {
     let mut out = Vec::with_capacity(2);
     out.extend(crate::project_reads::allowed_project_reads(spec));
+    out.extend(spec.dependency_read_dirs.iter().cloned());
     let nvm = spec.home_dir.join(".nvm").join("versions");
     out.push(nvm);
     out
@@ -741,6 +742,7 @@ mod tests {
             tmpdir: PathBuf::from("C:/Users/u/AppData/Local/Temp"),
             read_project_full: false,
             secret_read_allow: Vec::new(),
+            dependency_read_dirs: Vec::new(),
             extra_write_dirs: Vec::new(),
         }
     }

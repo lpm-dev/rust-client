@@ -142,6 +142,11 @@ pub(crate) fn render_profile_with_toolchain(
     // deny-default profile.
     out.push_str("  (literal \"/\")\n");
     out.push_str(&format!("  (subpath {package_dir})\n"));
+    for path in &spec.dependency_read_dirs {
+        let canonical = canonicalize_or_passthrough(path, "dependency read directory")?;
+        let quoted = quoted_path(&canonical, "dependency read directory")?;
+        out.push_str(&format!("  (subpath {quoted})\n"));
+    }
     if build_cache_isolation {
         let dependency_root = quoted_path(
             &package_dependency_root(spec, &canon_package_dir),
@@ -643,6 +648,7 @@ mod tests {
             tmpdir: PathBuf::from("/var/folders/xx/T"),
             read_project_full: false,
             secret_read_allow: Vec::new(),
+            dependency_read_dirs: Vec::new(),
             extra_write_dirs: Vec::new(),
         }
     }

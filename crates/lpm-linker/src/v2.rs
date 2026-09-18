@@ -71,6 +71,7 @@ use crate::validation::is_safe_node_modules_entry_name as is_safe_root_link_name
 use crate::{LinkDependency, LinkResult, LinkTarget, LinkerMode, MaterializedPackage};
 
 mod bin_shims;
+pub use bin_shims::{LifecycleBin, LifecycleBinProvider, create_lifecycle_bin_links};
 mod compat_island;
 mod keymap;
 mod reconcile;

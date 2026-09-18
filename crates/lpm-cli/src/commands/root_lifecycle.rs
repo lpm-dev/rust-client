@@ -96,7 +96,7 @@ impl RootProjectLifecycle {
             ));
         }
 
-        let envs = self.envs_for(script);
+        let envs = self.envs_for(project_dir, script)?;
         let result = if json_output {
             let output = lpm_runner::script::run_command_buffered_with_envs(
                 project_dir,
@@ -119,10 +119,7 @@ impl RootProjectLifecycle {
                 }) => {
                     forward_script_output_to_stderr(&stdout)?;
                     forward_script_output_to_stderr(&stderr)?;
-                    Err(LpmError::Script(format!(
-                        "root lifecycle script `{}` failed with exit code {code}",
-                        script.phase
-                    )))
+                    Err(LpmError::ExitCode(code))
                 }
                 Err(err) => Err(err),
             }
@@ -139,25 +136,28 @@ impl RootProjectLifecycle {
 
         match result {
             Ok(()) => Ok(()),
-            Err(LpmError::ExitCode(code)) => Err(LpmError::Script(format!(
-                "root lifecycle script `{}` failed with exit code {code}",
-                script.phase
-            ))),
+            Err(LpmError::ExitCode(code)) => Err(LpmError::ScriptPhase {
+                phase: script.phase.to_string(),
+                code,
+                stdout: String::new(),
+                stderr: String::new(),
+            }),
             Err(err) => Err(err),
         }
     }
 
-    fn envs_for(&self, script: &RootLifecycleScript) -> Vec<(String, String)> {
-        let mut envs = Vec::with_capacity(4);
-        envs.push(("npm_lifecycle_event".to_string(), script.phase.to_string()));
-        envs.push(("npm_lifecycle_script".to_string(), script.command.clone()));
-        if let Some(name) = &self.package_name {
-            envs.push(("npm_package_name".to_string(), name.clone()));
-        }
-        if let Some(version) = &self.package_version {
-            envs.push(("npm_package_version".to_string(), version.clone()));
-        }
-        envs
+    fn envs_for(
+        &self,
+        project_dir: &Path,
+        script: &RootLifecycleScript,
+    ) -> Result<[(String, String); 6], LpmError> {
+        let context = lpm_runner::npm_context::NpmScriptContext::new(
+            self.package_name.as_deref(),
+            self.package_version.as_deref(),
+            project_dir,
+            &std::env::current_dir()?,
+        );
+        Ok(context.envs(script.phase, &script.command))
     }
 }
 

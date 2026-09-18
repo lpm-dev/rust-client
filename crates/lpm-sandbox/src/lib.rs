@@ -238,6 +238,9 @@ pub struct SandboxSpec {
     /// (`..`) and absolute paths outside the project are rejected by
     /// the loader.
     pub secret_read_allow: Vec<PathBuf>,
+    /// Validated installed dependency directories and lifecycle tool shims.
+    /// Internal callers supply these read-only roots after resolving the package graph.
+    pub dependency_read_dirs: Vec<PathBuf>,
     /// Allow all project files, including secrets, after explicit capability approval.
     pub read_project_full: bool,
 }
@@ -1051,6 +1054,18 @@ fn validate_spec(spec: &SandboxSpec) -> Result<(), SandboxError> {
             return Err(SandboxError::InvalidSpec { reason });
         }
     }
+    for path in &spec.dependency_read_dirs {
+        if !path.is_absolute()
+            || path
+                .components()
+                .any(|component| matches!(component, std::path::Component::ParentDir))
+        {
+            return Err(SandboxError::InvalidSpec {
+                reason: "dependency read directories must be absolute without parent traversal"
+                    .into(),
+            });
+        }
+    }
     config::validate_builtin_write_dirs(spec)?;
     for path in &spec.secret_read_allow {
         config::validate_read_file(&spec.project_dir, path)?;
@@ -1167,6 +1182,7 @@ mod tests {
             tmpdir: PathBuf::from(TMPDIR),
             read_project_full: false,
             secret_read_allow: Vec::new(),
+            dependency_read_dirs: Vec::new(),
             extra_write_dirs: Vec::new(),
         }
     }
@@ -1323,6 +1339,7 @@ mod tests {
             tmpdir: root.path().join("scratch"),
             read_project_full: false,
             secret_read_allow: vec![],
+            dependency_read_dirs: Vec::new(),
             extra_write_dirs: vec![],
         };
         assert!(prepare_writable_dirs(&spec).is_err());
@@ -1344,6 +1361,7 @@ mod tests {
             tmpdir: root.path().join("scratch"),
             read_project_full: false,
             secret_read_allow: vec![],
+            dependency_read_dirs: Vec::new(),
             extra_write_dirs: vec![],
         };
         assert!(prepare_writable_dirs(&spec).is_err());
@@ -1370,6 +1388,7 @@ mod tests {
             tmpdir: root.join("tmpdir"),
             read_project_full: false,
             secret_read_allow: Vec::new(),
+            dependency_read_dirs: Vec::new(),
             extra_write_dirs: vec![extra_a.clone(), extra_b.clone()],
         };
         std::fs::create_dir_all(&spec.package_dir).unwrap();

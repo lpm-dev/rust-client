@@ -540,6 +540,15 @@ pub enum LpmError {
         stderr: String,
     },
 
+    #[error("script phase `{phase}` exited with code {code}")]
+    #[diagnostic(code(lpm::script))]
+    ScriptPhase {
+        phase: String,
+        code: i32,
+        stdout: String,
+        stderr: String,
+    },
+
     #[error("process exited with code {0}")]
     #[diagnostic(code(lpm::exit_code))]
     ExitCode(i32),
@@ -767,6 +776,7 @@ impl LpmError {
             LpmError::RateLimited { .. } => "rate_limited",
             LpmError::Script(_) => "script",
             LpmError::ScriptWithOutput { .. } => "script",
+            LpmError::ScriptPhase { .. } => "script",
             LpmError::Cert(_) => "cert",
             LpmError::Tunnel(_) => "tunnel",
             LpmError::Store(_) => "store",
@@ -980,6 +990,12 @@ mod tests {
             LpmError::Script("x".into()),
             LpmError::ScriptWithOutput {
                 code: 1,
+                stdout: String::new(),
+                stderr: String::new(),
+            },
+            LpmError::ScriptPhase {
+                phase: "pretest".into(),
+                code: 42,
                 stdout: String::new(),
                 stderr: String::new(),
             },
