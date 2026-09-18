@@ -717,3 +717,5 @@ fn store_help_scopes_verify_flags_to_verify_subcommand() {
         "verify help must advertise both verification flags:\n{verify_stdout}"
     );
 }
+
+mod store_contract;

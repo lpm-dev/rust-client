@@ -279,14 +279,14 @@ pub(crate) fn unique_package_targets_for_kind<'a>(
     package: &'a LockedPackage,
     indexes: &PackageIndexes<'_>,
     peers: bool,
-) -> Result<Vec<usize>, &'a str> {
+) -> Result<Vec<(&'a str, usize)>, &'a str> {
     let mut selected = HashMap::new();
     let mut targets = Vec::new();
     let result = visit_package_targets(package, indexes, peers, |local, index| {
         match selected.insert(local, index) {
             Some(prior) if prior != index => return std::ops::ControlFlow::Break(local),
             Some(_) => {}
-            None => targets.push(index),
+            None => targets.push((local, index)),
         }
         std::ops::ControlFlow::Continue(())
     });

@@ -1,10 +1,12 @@
+mod lockfile_verification;
+
 use crate::install_ui;
 use lpm_common::color::Painted;
 use lpm_common::{
     LpmError, LpmRoot, format_bytes, sanitize_for_terminal, with_exclusive_lock, with_shared_lock,
 };
 use lpm_store::PackageStore;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 
 #[derive(Debug, clap::Subcommand)]
 pub(crate) enum StoreCmd {
@@ -284,20 +286,17 @@ fn run_verify(
         print_verify_counts(verify_counts);
     }
 
-    let (lockfile_integrity, lockfile_issue) = load_lockfile_integrity_for_verify(deep);
-    let mut corrupted: Vec<String> =
-        Vec::with_capacity(sidecar_issues.len() + usize::from(lockfile_issue.is_some()));
-    if let Some(issue) = lockfile_issue {
-        corrupted.push(issue);
-    }
+    let mut lockfile_verification = lockfile_verification::load(deep, &packages);
+    let mut corrupted = std::mem::take(&mut lockfile_verification.issues);
     corrupted.append(&mut sidecar_issues);
-
     if packages.is_empty() && corrupted.is_empty() && verify_counts.is_empty() {
         if json_output {
             let mut result = build_verify_envelope(true, deep, 0, 0, 0, &[], 0, 0);
             attach_cas_verification(&mut result, &cas_verification, deep);
+            lockfile_verification.attach(&mut result, deep);
             println!("{}", serde_json::to_string_pretty(&result).unwrap());
         } else {
+            lockfile_verification.print_scope();
             install_ui::done("Store is empty — nothing to verify");
         }
         return Ok(());
@@ -310,7 +309,7 @@ fn run_verify(
     let mut referenced_objects_ok = true;
     let v2_paths = lpm_store::v2::StoreV2Paths::from_lpm_root(lpm_root);
 
-    for entry in &packages {
+    for (entry_index, entry) in packages.iter().enumerate() {
         let StoreVerifyEntry {
             name,
             version,
@@ -474,34 +473,48 @@ fn run_verify(
                 }
             }
 
-            // Verify integrity hash: compare stored integrity with lockfile.
-            // V2 entries carry `inline_integrity` (the link sidecar's
-            // `source_sri`); V1 entries fall back to
-            // `read_stored_integrity` (`.integrity` sentinel file).
-            let key = format!("{name}@{version}");
-            if let Some(expected_integrity) = lockfile_integrity.get(&key) {
-                let stored = inline_integrity
-                    .clone()
-                    .or_else(|| lpm_store::read_stored_integrity(dir));
+            // Compare only after project links independently bind this entry to
+            // a locked artifact. Global name/version coordinates are not provenance.
+            if let Some(expected_integrity) = lockfile_verification.expected.get(&entry_index) {
+                let stored = match inline_integrity.as_deref() {
+                    Some(integrity) => Ok(Some(std::borrow::Cow::Borrowed(integrity))),
+                    None => match lpm_common::read_text_file_capped_nofollow(
+                        &dir.join(".integrity"),
+                        lpm_common::CONFIG_FILE_SIZE_CAP_BYTES,
+                    ) {
+                        Ok(integrity) => {
+                            Ok(Some(std::borrow::Cow::Owned(integrity.trim().to_owned())))
+                        }
+                        Err(lpm_common::BoundedReadError::NotFound { .. }) => Ok(None),
+                        Err(error) => Err(error),
+                    },
+                };
                 match stored {
-                    Some(stored) => {
-                        if stored != *expected_integrity {
+                    Ok(Some(stored)) => {
+                        let matches = stored == *expected_integrity;
+                        if !matches {
                             corrupted.push(format!(
                                 "{safe_name}@{safe_version} — integrity mismatch: stored '{}...' != lockfile '{}...'",
                                 truncate_chars_safe(&sanitize_for_terminal(&stored), 20),
                                 truncate_chars_safe(&sanitize_for_terminal(expected_integrity), 20),
                             ));
+                        }
+                        lockfile_verification.record_comparison(entry_index);
+                        if !matches {
                             continue;
                         }
                     }
-                    None => {
-                        // No `.integrity` file AND no v2 sidecar
-                        // integrity — package was stored before
-                        // integrity tracking. Not an error, but noted
-                        // at debug level.
+                    Ok(None) => {
                         tracing::debug!(
                             "{name}@{version}: no integrity record (pre-integrity store)"
                         );
+                    }
+                    Err(error) => {
+                        corrupted.push(format!(
+                            "{safe_name}@{safe_version} — unreadable integrity marker: {}",
+                            sanitize_for_terminal(&error.to_string()),
+                        ));
+                        continue;
                     }
                 }
             }
@@ -584,6 +597,10 @@ fn run_verify(
         verified += 1;
     }
 
+    if !json_output {
+        lockfile_verification.print_scope();
+    }
+
     // Distinguish
     // "store entries" (one per v1 dir + one per v2 link entry) from
     // "unique packages" (deduped on `(name, version)`). During v1↔v2
@@ -626,6 +643,7 @@ fn run_verify(
             security_reanalyzed,
         );
         attach_cas_verification(&mut result, &cas_verification, deep);
+        lockfile_verification.attach(&mut result, deep);
         println!("{}", serde_json::to_string_pretty(&result).unwrap());
     } else if corrupted.is_empty() {
         if referenced_objects_ok {
@@ -779,51 +797,6 @@ fn compute_verify_dedup_counts(entries: &[StoreVerifyEntry]) -> (usize, usize) {
     let unique = seen.len();
     let duplicated = entries.len().saturating_sub(unique);
     (unique, duplicated)
-}
-
-fn load_lockfile_integrity_for_verify(deep: bool) -> (HashMap<String, String>, Option<String>) {
-    if !deep {
-        return (HashMap::new(), None);
-    }
-
-    let cwd = match std::env::current_dir() {
-        Ok(cwd) => cwd,
-        Err(e) => {
-            return (
-                HashMap::new(),
-                Some(format!(
-                    "lpm.lock — unreadable: {}",
-                    sanitize_for_terminal(&e.to_string())
-                )),
-            );
-        }
-    };
-    match lpm_lockfile::Lockfile::read_for_project(&cwd) {
-        Ok(project) => {
-            let integrity = project
-                .lockfile
-                .packages
-                .iter()
-                .filter_map(|package| {
-                    package.integrity.as_ref().map(|integrity| {
-                        (
-                            format!("{}@{}", package.name, package.version),
-                            integrity.clone(),
-                        )
-                    })
-                })
-                .collect();
-            (integrity, None)
-        }
-        Err(lpm_lockfile::LockfileError::NotFound(_)) => (HashMap::new(), None),
-        Err(e) => (
-            HashMap::new(),
-            Some(format!(
-                "lpm.lock — unreadable: {}",
-                sanitize_for_terminal(&e.to_string())
-            )),
-        ),
-    }
 }
 
 /// Build the JSON envelope `lpm store verify --json` emits to stdout.
