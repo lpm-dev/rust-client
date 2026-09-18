@@ -122,28 +122,24 @@ function init() {
 }
 
 function updateVisibleLinks() {
-  // Build set of visible node keys (not hidden by collapsed parents)
-  var hidden = {};
-  function hideDescendants(key) {
-    var n = nodeMap[key];
-    if (!n) return;
-    (n.deps || []).forEach(function(depKey) {
-      if (!hidden[depKey]) {
-        hidden[depKey] = true;
-        hideDescendants(depKey);
-      }
+  var visible = new Set();
+  var pending = nodes.filter(function(n) { return n.is_root; });
+  while (pending.length) {
+    var node = pending.pop();
+    if (visible.has(node.key)) continue;
+    visible.add(node.key);
+    if (collapsed[node.key]) continue;
+    (node.deps || []).forEach(function(key) {
+      if (nodeMap[key]) pending.push(nodeMap[key]);
     });
-  }
-  for (var key in collapsed) {
-    if (collapsed[key]) hideDescendants(key);
   }
 
   links = allLinks.filter(function(l) {
-    return !hidden[l.source.key] && !hidden[l.target.key];
+    return visible.has(l.source.key) && visible.has(l.target.key) && !collapsed[l.source.key];
   });
 
   nodes.forEach(function(n) {
-    n._visible = !hidden[n.key];
+    n._visible = visible.has(n.key);
   });
 }
 

@@ -9,6 +9,7 @@
 //! actually see — unit tests at the renderer layer can't pin the
 //! file-write side effect or the `output::warn` stderr surface.
 
+mod graph_contract;
 mod support;
 
 use support::TempProject;
@@ -131,12 +132,6 @@ fn graph_includes_optional_root_by_default_and_in_prod_but_not_dev() {
 
 // ─── bare `lpm graph` (tree default): --json error envelope ──────────
 
-/// `lpm --json graph` on a project without `lpm.lock` must surface the
-/// missing-lockfile error as a JSON envelope on stdout (not a free-form
-/// stderr message). The default `tree` format renderer doesn't emit a
-/// success envelope — that's `--format json` (a separate surface). The
-/// load-bearing claim on the bare-tree surface is the error path's
-/// envelope shape.
 #[test]
 fn graph_bare_under_json_without_lockfile_emits_error_envelope_on_stdout() {
     let project = TempProject::empty(r#"{"name":"graph-bare","version":"1.0.0"}"#);
@@ -158,14 +153,8 @@ fn graph_bare_under_json_without_lockfile_emits_error_envelope_on_stdout() {
     );
 }
 
-/// `lpm --json graph --format html --no-open` on a project without
-/// `lpm.lock` surfaces the missing-lockfile error as a JSON envelope.
-/// Pins the contract that `--format html`'s failure mode is
-/// machine-readable; the happy path (file emission) is covered by
-/// `graph_html_writes_*` below and is intentionally non-JSON (it
-/// writes an HTML file, not an envelope).
 #[test]
-fn graph_format_html_under_json_without_lockfile_emits_error_envelope_on_stdout() {
+fn graph_html_conflicts_with_json_before_lockfile_discovery() {
     let project = TempProject::empty(r#"{"name":"graph-html","version":"1.0.0"}"#);
 
     let output = lpm(&project)
@@ -181,20 +170,13 @@ fn graph_format_html_under_json_without_lockfile_emits_error_envelope_on_stdout(
     assert!(
         envelope["error"]
             .as_str()
-            .is_some_and(|s| s.contains("lpm.lock") || s.contains("lockfile")),
-        "error must reference the missing lockfile, got: {envelope}",
+            .is_some_and(|s| s.contains("--format")),
+        "error must explain the format conflict, got: {envelope}",
     );
 }
 
-/// `--format dot`, `--format mermaid`, and `--format stats` share the
-/// same lockfile-read prelude as the rest of `lpm graph`. On a
-/// missing-lockfile project, all three surface the same error envelope
-/// on stdout under `--json`. One test covers the contract for the
-/// whole group — the per-format text rendering on the happy path is
-/// covered by the existing `graph_format_dot_emits_valid_dot_syntax_to_stdout`
-/// and friends below.
 #[test]
-fn graph_format_dot_mermaid_stats_under_json_without_lockfile_emit_error_envelope_on_stdout() {
+fn graph_non_json_formats_conflict_with_json_before_lockfile_discovery() {
     let project = TempProject::empty(r#"{"name":"graph-fmt","version":"1.0.0"}"#);
 
     for format in ["dot", "mermaid", "stats"] {
@@ -215,8 +197,8 @@ fn graph_format_dot_mermaid_stats_under_json_without_lockfile_emit_error_envelop
         assert!(
             envelope["error"]
                 .as_str()
-                .is_some_and(|s| s.contains("lpm.lock") || s.contains("lockfile")),
-            "graph --format {format} error must reference the missing lockfile, got: {envelope}",
+                .is_some_and(|s| s.contains("--format")),
+            "graph --format {format} error must explain the format conflict, got: {envelope}",
         );
     }
 }
