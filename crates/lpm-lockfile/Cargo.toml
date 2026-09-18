@@ -9,6 +9,7 @@ description = "TOML lockfile read/write for LPM"
 
 [dependencies]
 lpm-common = { workspace = true }
+lpm-workspace = { workspace = true }
 serde = { workspace = true }
 toml = { workspace = true }
 thiserror = { workspace = true }
