@@ -179,12 +179,12 @@ fn resolved_to_install_packages(
     resolved: &[ResolvedPackage],
     deps: &HashMap<String, String>,
     root_aliases: &HashMap<String, String>,
-    _root_resolutions: &HashMap<String, lpm_resolver::RootResolution>,
+    root_resolutions: &HashMap<String, lpm_resolver::RootResolution>,
     ambient_peer_installs: &[String],
     resolver_cache: &HashMap<CanonicalKey, Arc<CachedPackageInfo>>,
     registry_source: RegistrySourceContext<'_>,
 ) -> Vec<InstallPackage> {
-    let roots = resolved
+    let mut roots: HashMap<_, _> = resolved
         .iter()
         .enumerate()
         .map(|(index, package)| {
@@ -198,6 +198,40 @@ fn resolved_to_install_packages(
             )
         })
         .collect();
+    for (local, specifier) in deps {
+        let target = root_aliases.get(local).unwrap_or(local);
+        if let Some(package) =
+            select_resolved_package_for_requested_spec(resolved, target, specifier)
+        {
+            roots.insert(
+                local.clone(),
+                lpm_resolver::RootResolution {
+                    target: package.resolution_id,
+                    package: package.package.canonical_name(),
+                    version: package.version.to_string(),
+                },
+            );
+        }
+    }
+    roots.extend(root_resolutions.clone());
+    for ambient in ambient_peer_installs {
+        if roots.contains_key(ambient) {
+            continue;
+        }
+        if let Some(package) = resolved
+            .iter()
+            .find(|package| package.package.canonical_name() == *ambient)
+        {
+            roots.insert(
+                ambient.clone(),
+                lpm_resolver::RootResolution {
+                    target: package.resolution_id,
+                    package: package.package.canonical_name(),
+                    version: package.version.to_string(),
+                },
+            );
+        }
+    }
     super::resolved_to_install_packages(
         resolved,
         deps,
@@ -2379,4 +2413,129 @@ fn lockfile_package_without_stored_tarball_has_no_install_url() {
     assert_eq!(gate_stats.origin_mismatch.load(Ordering::Relaxed), 0);
     assert_eq!(gate_stats.shape_mismatch.load(Ordering::Relaxed), 0);
     assert_eq!(gate_stats.scheme_mismatch.load(Ordering::Relaxed), 0);
+}
+
+fn select_resolved_package_for_requested_spec<'a>(
+    resolved: &'a [ResolvedPackage],
+    target: &str,
+    requested_spec: &str,
+) -> Option<&'a ResolvedPackage> {
+    let requested_range = requested_range_for_locked_lookup(requested_spec)
+        .and_then(|range| lpm_resolver::NpmRange::parse(&range).ok());
+    let mut first_match: Option<&ResolvedPackage> = None;
+    let mut first_unscoped: Option<&ResolvedPackage> = None;
+    let mut best_satisfying_unscoped: Option<(lpm_resolver::NpmVersion, &ResolvedPackage)> = None;
+    let mut best_satisfying: Option<(lpm_resolver::NpmVersion, &ResolvedPackage)> = None;
+    let mut best_any_unscoped: Option<(lpm_resolver::NpmVersion, &ResolvedPackage)> = None;
+    let mut best_any: Option<(lpm_resolver::NpmVersion, &ResolvedPackage)> = None;
+
+    for candidate in resolved {
+        if candidate.package.canonical_name() != target {
+            continue;
+        }
+        if first_match.is_none() {
+            first_match = Some(candidate);
+        }
+        let is_unscoped = candidate.package.context().is_none();
+        if is_unscoped && first_unscoped.is_none() {
+            first_unscoped = Some(candidate);
+        }
+
+        let version = candidate.version.clone();
+        let better_any = best_any.as_ref().is_none_or(|(best, _)| version > *best);
+        if better_any {
+            best_any = Some((version.clone(), candidate));
+        }
+        if is_unscoped
+            && best_any_unscoped
+                .as_ref()
+                .is_none_or(|(best, _)| version > *best)
+        {
+            best_any_unscoped = Some((version.clone(), candidate));
+        }
+
+        if let Some(range) = requested_range.as_ref()
+            && range.satisfies(&version)
+        {
+            let better_satisfying = best_satisfying
+                .as_ref()
+                .is_none_or(|(best, _)| version > *best);
+            if better_satisfying {
+                best_satisfying = Some((version.clone(), candidate));
+            }
+            if is_unscoped
+                && best_satisfying_unscoped
+                    .as_ref()
+                    .is_none_or(|(best, _)| version > *best)
+            {
+                best_satisfying_unscoped = Some((version, candidate));
+            }
+        }
+    }
+
+    best_satisfying_unscoped
+        .map(|(_, candidate)| candidate)
+        .or_else(|| best_satisfying.map(|(_, candidate)| candidate))
+        .or_else(|| best_any_unscoped.map(|(_, candidate)| candidate))
+        .or(first_unscoped)
+        .or_else(|| best_any.map(|(_, candidate)| candidate))
+        .or(first_match)
+}
+
+#[test]
+fn replay_keeps_ambient_peer_non_direct_when_optional_declaration_is_unresolved() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("lpm.lock");
+    let mut lockfile = current_leaf_lockfile("runtime", "1.0.0", TEST_REGISTRY_SOURCE);
+    lockfile.packages[0].integrity = Some(VALID_SHA512_SRI.into());
+    lockfile.ambient_peer_installs.push("runtime".into());
+    let mut host = current_leaf_lockfile("host", "1.0.0", TEST_REGISTRY_SOURCE);
+    host.packages[0].integrity = Some(VALID_SHA512_SRI.into());
+    host.packages[0]
+        .peer_edges
+        .push(lpm_common::PeerEdge::registry(
+            "runtime", "runtime", "1.0.0",
+        ));
+    host.packages[0]
+        .peer_targets
+        .insert("runtime".into(), lockfile.packages[0].instance_id.unwrap());
+    lockfile.root_resolutions.extend(host.root_resolutions);
+    lockfile.add_package(host.packages.remove(0));
+    lockfile.importers.insert(
+        ".".into(),
+        lpm_lockfile::ImporterSnapshot {
+            dependencies: std::collections::BTreeMap::from([("host".into(), "1.0.0".into())]),
+            ..Default::default()
+        },
+    );
+    lockfile.write_all(&path).unwrap();
+    let deps = HashMap::from([
+        ("host".into(), "1.0.0".into()),
+        ("runtime".into(), "^99".into()),
+    ]);
+    let optional = HashSet::from(["runtime".into()]);
+    let client = RegistryClient::new();
+    let routes = RouteTable::from_mode_only(lpm_registry::RouteMode::Direct);
+    let result = try_lockfile_fast_path_with_optional_roots(TryLockfileFastPathInput {
+        lockfile_path: &path,
+        deps: &deps,
+        optional_root_names: &optional,
+        catalog_resolutions: &[],
+        workspace: None,
+        route_table: &routes,
+        client: &client,
+        gate_stats: &GateStats::default(),
+        accept_unsafe_sources: false,
+    })
+    .expect("ambient peer graph remains replayable");
+    let runtime = result
+        .packages
+        .iter()
+        .find(|package| package.name == "runtime")
+        .unwrap();
+    assert_eq!(
+        runtime.root_link_names.as_deref(),
+        Some(&["runtime".to_string()][..])
+    );
+    assert!(!runtime.is_direct);
 }

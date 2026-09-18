@@ -430,6 +430,7 @@ pub(super) struct ResolveState {
     ///
     /// Sorted alphabetically before drain for deterministic output.
     pub(super) ambient_peer_installs: Vec<String>,
+    pub(super) ambient_only_root_names: HashSet<String>,
     /// Peer-group conflicts the drain resolved best-effort. Each entry
     /// corresponds to one canonical whose required consumer ranges were
     /// pairwise-incompatible: lpm picked the version satisfying the most
@@ -526,6 +527,7 @@ impl ResolveState {
             // Typically 0 (most installs don't need ambient peer
             // synthesis). Allocated lazily on first push.
             ambient_peer_installs: Vec::new(),
+            ambient_only_root_names: HashSet::new(),
             // Typically 0 (most installs have a clean peer graph).
             // Allocated lazily on first conflict.
             peer_conflicts: Vec::new(),
@@ -721,7 +723,10 @@ impl ResolveState {
                 .ambient_peer_installs
                 .iter()
                 .any(|peer| peer == local_name);
-            if (!is_manifest_root && !is_ambient_peer) || resolutions.contains_key(local_name) {
+            if (!is_manifest_root && !is_ambient_peer)
+                || resolutions.contains_key(local_name)
+                || self.ambient_only_root_names.contains(local_name)
+            {
                 continue;
             }
             let Some(selected) = self.nodes.get(*node_id as usize) else {
