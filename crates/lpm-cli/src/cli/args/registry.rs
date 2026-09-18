@@ -244,7 +244,7 @@ pub(crate) struct SetupArgs {
 
 #[derive(Args)]
 pub(crate) struct SwiftRegistryArgs {
-    /// Force re-download the signing certificate (useful for cert rotation).
+    /// Replace the local signing certificate even when its bytes already match.
     #[arg(long)]
     pub(crate) force: bool,
 }

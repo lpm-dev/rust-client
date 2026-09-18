@@ -4,6 +4,24 @@ use lpm_common::LpmError;
 use std::path::Path;
 use x509_parser::prelude::{FromDer, X509Certificate};
 
+fn swift_registry_endpoint(registry_url: &str) -> Result<reqwest::Url, LpmError> {
+    if !lpm_common::lpm_registry_url_is_accepted(registry_url) {
+        return Err(LpmError::Registry(
+            "Swift registry setup requires an HTTPS base URL or an HTTP loopback base URL without embedded credentials".into(),
+        ));
+    }
+    let mut base = reqwest::Url::parse(registry_url)
+        .map_err(|error| LpmError::Registry(format!("invalid Swift registry base URL: {error}")))?;
+    if base.query().is_some() || base.fragment().is_some() {
+        return Err(LpmError::Registry(
+            "Swift registry base URL must not contain a query or fragment".into(),
+        ));
+    }
+    let endpoint_path = format!("{}/api/swift-registry", base.path().trim_end_matches('/'));
+    base.set_path(&endpoint_path);
+    Ok(base)
+}
+
 fn swift_command() -> tokio::process::Command {
     let mut command = tokio::process::Command::new("swift");
     crate::swift_manifest::sanitize_swift_environment(command.as_std_mut());
@@ -223,25 +241,9 @@ pub async fn run(
     json_output: bool,
     force: bool,
 ) -> Result<(), LpmError> {
-    // H20: refuse to globally install SwiftPM signing trust for a
-    // registry URL that fails the same gating contract used for
-    // LPM_REGISTRY_URL itself (H16). HTTPS is accepted for any host
-    // (legitimate private mirror / on-prem appliance); HTTP only for
-    // loopback (workflow tests against wiremock). Plain HTTP non-
-    // loopback was previously passed straight to SwiftPM with
-    // `--allow-insecure-http`, which then installed `lpm.der` into
-    // `~/.swiftpm/security/trusted-root-certs/` and silently allowed
-    // every `lpmdev` Swift package to be signed against whatever
-    // cert that registry served. That's a persistent SwiftPM trust
-    // downgrade that survives across LPM sessions. Refuse upfront.
-    if !lpm_common::lpm_registry_url_is_accepted(registry_url) {
-        return Err(LpmError::Registry(format!(
-            "swift-registry setup refuses to install global SwiftPM signing trust against {registry_url}: only https:// (any host) or http:// loopback URLs are accepted (H20). Pass an https:// registry URL or unset LPM_REGISTRY_URL."
-        )));
-    }
-
-    let swift_registry_url = format!("{registry_url}/api/swift-registry");
-    let is_https = registry_url.starts_with("https://");
+    let endpoint = swift_registry_endpoint(registry_url)?;
+    let is_https = endpoint.scheme() == "https";
+    let swift_registry_url = endpoint.to_string();
 
     if !json_output {
         install_ui::phase_line(swift_package_manager_phase());
@@ -269,7 +271,7 @@ pub async fn run(
         swift_command()
             .args(&args)
             .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
             .status()
             .await
     } else {
@@ -296,29 +298,42 @@ pub async fn run(
         install_ui::done_line(scope_set_message(&swift_registry_url));
     }
 
-    // Step 2: Login with LPM token (HTTPS only — SPM refuses auth over HTTP)
-    if is_https {
+    let authentication_outcome = if is_https {
         let output = if json_output {
             SwiftLoginOutput::Suppress
         } else {
             SwiftLoginOutput::Inherit
         };
-        if configure_swift_authentication(session, &swift_registry_url, None, output, !json_output)
-            .await?
-            == SwiftAuthenticationOutcome::Configured
+        match configure_swift_authentication(
+            session,
+            &swift_registry_url,
+            None,
+            output,
+            !json_output,
+        )
+        .await?
         {
-            if !json_output {
-                install_ui::done("Authentication configured");
+            SwiftAuthenticationOutcome::Configured => {
+                if !json_output {
+                    install_ui::done("Authentication configured");
+                }
+                "configured"
             }
-        } else if !json_output {
-            // User-facing binary name is `lpm`, not `lpm-rs`
-            install_ui::warn(
-                "No LPM.dev Registry token found — run `lpm login` first for authenticated access",
-            );
+            SwiftAuthenticationOutcome::NoCredential => {
+                if !json_output {
+                    install_ui::warn(
+                        "No LPM.dev Registry token found — run `lpm login`, then rerun `lpm swift-registry` for authenticated access",
+                    );
+                }
+                "skipped_no_credential"
+            }
         }
-    } else if !json_output {
-        install_ui::warn("HTTP registry — SPM won't send auth. Use HTTPS in production.");
-    }
+    } else {
+        if !json_output {
+            install_ui::warn("HTTP registry — SPM won't send auth. Use HTTPS in production.");
+        }
+        "skipped_http"
+    };
 
     // Step 3: Install signing certificate to SPM trust store. Fatal on
     // failure — proceeding without a cert leaves SPM without the bytes
@@ -346,7 +361,8 @@ pub async fn run(
             "signing_trust_configured": true,
             "signing_certificate_outcome": cert_outcome_label,
             "signing_trust_outcome": trust_outcome_label,
-            "trust_anchor": "https",
+            "trust_anchor": if is_https { "https" } else { "insecure_http" },
+            "authentication_outcome": authentication_outcome,
             "signer_trust_policy": "silentAllow",
         });
         println!("{}", serde_json::to_string_pretty(&json).unwrap());
@@ -434,13 +450,9 @@ pub(crate) async fn ensure_configured_for_install(
     json_output: bool,
     anonymous: bool,
 ) -> Result<SwiftRegistrySetupOutcome, LpmError> {
-    if !lpm_common::lpm_registry_url_is_accepted(registry_url) {
-        return Err(LpmError::Registry(format!(
-            "automatic Swift registry setup refuses {registry_url}: only https:// URLs or http:// loopback URLs are accepted"
-        )));
-    }
-    let swift_registry_url = format!("{registry_url}/api/swift-registry");
-    let is_https = registry_url.starts_with("https://");
+    let endpoint = swift_registry_endpoint(registry_url)?;
+    let is_https = endpoint.scheme() == "https";
+    let swift_registry_url = endpoint.to_string();
 
     let config_path = package_dir.join(".swiftpm/configuration/registries.json");
     let scope_matches = match evaluate_existing_lpmdev_scope(&config_path, &swift_registry_url)? {
@@ -481,7 +493,7 @@ pub(crate) async fn ensure_configured_for_install(
             .args(&args)
             .current_dir(package_dir)
             .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
             .status()
             .await
             .map_err(|e| LpmError::Registry(format!("failed to run swift: {e}")))?;
@@ -529,16 +541,11 @@ pub(crate) async fn ensure_configured_for_install(
 }
 
 pub(crate) fn ensure_xcode_registry_scope(registry_url: &str) -> Result<bool, LpmError> {
-    if !lpm_common::lpm_registry_url_is_accepted(registry_url) {
-        return Err(LpmError::Registry(
-            "Xcode registry setup requires HTTPS or a loopback URL".into(),
-        ));
-    }
+    let expected = swift_registry_endpoint(registry_url)?.to_string();
     let home = dirs::home_dir().ok_or_else(|| {
         LpmError::Registry("Could not determine the SwiftPM configuration directory".into())
     })?;
     let path = home.join(".swiftpm/configuration/registries.json");
-    let expected = format!("{registry_url}/api/swift-registry");
     let text = lpm_common::read_text_file_capped(&path, lpm_common::CONFIG_FILE_SIZE_CAP_BYTES)
         .map_err(|error| LpmError::Registry(error.to_string()))?;
     let mut config: serde_json::Value = serde_json::from_str(&text)
@@ -605,12 +612,21 @@ fn validate_der_certificate(bytes: &[u8]) -> Result<(), LpmError> {
 }
 
 async fn fetch_signing_certificate(cert_url: &str) -> Result<Vec<u8>, LpmError> {
-    let client = lpm_http::client_builder().build().map_err(|error| {
-        LpmError::Registry(format!(
-            "could not build signing certificate client: {error}"
-        ))
-    })?;
+    let client = lpm_http::client_builder()
+        .connect_timeout(std::time::Duration::from_secs(10))
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .map_err(|error| {
+            LpmError::Registry(format!(
+                "could not build signing certificate client: {error}"
+            ))
+        })?;
     let response = client.get(cert_url).send().await.map_err(|error| {
+        if error.is_timeout() {
+            return LpmError::Registry(
+                "signing certificate request timed out (10-second connection limit; 30-second overall limit)".into(),
+            );
+        }
         LpmError::Registry(format!(
             "could not download signing certificate: {}",
             lpm_http::display_error(&error)
@@ -639,6 +655,11 @@ async fn fetch_signing_certificate(cert_url: &str) -> Result<Vec<u8>, LpmError> 
     let mut stream = response.bytes_stream();
     while let Some(chunk) = stream.next().await {
         let chunk = chunk.map_err(|error| {
+            if error.is_timeout() {
+                return LpmError::Registry(
+                    "signing certificate request timed out (10-second connection limit; 30-second overall limit)".into(),
+                );
+            }
             LpmError::Registry(format!(
                 "failed to read signing certificate from {cert_url}: {error}"
             ))
@@ -658,21 +679,9 @@ async fn fetch_signing_certificate(cert_url: &str) -> Result<Vec<u8>, LpmError> 
     Ok(bytes)
 }
 
-/// Download the LPM signing certificate and install to SPM's trust store.
-///
-/// Idempotent: a valid cert already on disk short-circuits with
-/// `CertOutcome::AlreadyInstalled`. Failures (network, HTTP, mkdir,
-/// disk write, or a downloaded cert that fails the minimum-size guard)
-/// surface as `Err(LpmError::Registry(...))` so the caller — `run` for
-/// the user-facing setup, `ensure_configured` for the auto-setup path
-/// from `lpm install` — can fail-closed instead of completing with
-/// silently-broken signing.
-///
-/// `--force` bypasses idempotency: even with a valid cert on disk,
-/// the cert is re-downloaded so a server-side rotation can be picked
-/// up. A failed re-download with `--force` is fatal even if the old
-/// cert is still on disk — staying on the stale cert without telling
-/// the user would defeat the purpose of `--force`.
+/// Fetch and validate the current certificate before comparing local bytes.
+/// Matching bytes avoid a rewrite unless `force` is set. Download or validation
+/// failures preserve the existing certificate and stop setup.
 async fn install_signing_certificate(
     swift_registry_url: &str,
     json_output: bool,
