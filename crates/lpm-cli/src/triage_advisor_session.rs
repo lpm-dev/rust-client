@@ -72,122 +72,9 @@ use lpm_triage_advisor::{
 
 use crate::output;
 
-/// Type alias for the ephemeral advisor approval key.
-///
-/// M29: keyed on `(name, version, integrity, script_bundle_hash)`.
-/// The script-bundle hash folds every `(phase, body)` pair the
-/// advisor evaluated into a SHA-256 digest. Today the same digest
-/// applies to every script of the package (whole-package
-/// classification); if a future refactor moves to per-phase
-/// classification, the key automatically distinguishes them. The
-/// integrity slot keeps source-aware identity (so a workspace
-/// `pkg@1` is distinct from a registry `pkg@1`); the bundle-hash
-/// slot keeps script-aware identity (so an approval can't leak to
-/// a sibling phase or to a different script body that happens to
-/// share the same package coordinate).
+/// Ephemeral approval for an artifact and its complete lifecycle script hash.
+/// The hash includes recognized delegated files, including their local imports.
 pub type AdvisorApprovalKey = (String, String, Option<String>, String);
-
-/// Hash an ordered `(phase, body)` slice into a hex SHA-256 digest.
-/// Used to fold script bodies into [`AdvisorApprovalKey`].
-///
-/// Order is preserved (the caller passes phases in
-/// `EXECUTED_INSTALL_PHASES` order, matching `compute_script_hash`'s
-/// phase ordering). Distinct field separators (`0x1e` records,
-/// `0x00` fields) prevent the `phase="ab" body="cd"` /
-/// `phase="abc" body="d"` ambiguity that naive concatenation would
-/// have.
-pub fn compute_script_bundle_hash(amber_phases: &[(String, String)]) -> String {
-    use sha2::{Digest, Sha256};
-    let mut hasher = Sha256::new();
-    for (phase, body) in amber_phases {
-        hasher.update(phase.as_bytes());
-        hasher.update([0x00]);
-        hasher.update(body.as_bytes());
-        hasher.update([0x1e]);
-    }
-    hex::encode(hasher.finalize())
-}
-
-#[cfg(test)]
-mod bundle_hash_tests {
-    use super::compute_script_bundle_hash;
-
-    /// M29: identical phase lists hash identically.
-    #[test]
-    fn bundle_hash_is_deterministic_for_same_input() {
-        let a = vec![("preinstall".into(), "echo a".into())];
-        assert_eq!(
-            compute_script_bundle_hash(&a),
-            compute_script_bundle_hash(&a)
-        );
-    }
-
-    /// M29: different script body → different bundle hash. Pins the
-    /// per-script identity property the approval key is supposed to
-    /// guarantee against a future per-phase refactor.
-    #[test]
-    fn bundle_hash_changes_when_body_changes() {
-        let a = vec![("preinstall".into(), "echo a".into())];
-        let b = vec![("preinstall".into(), "echo b".into())];
-        assert_ne!(
-            compute_script_bundle_hash(&a),
-            compute_script_bundle_hash(&b)
-        );
-    }
-
-    /// Different phase → different hash, even with identical body.
-    #[test]
-    fn bundle_hash_changes_when_phase_changes() {
-        let a = vec![("preinstall".into(), "echo a".into())];
-        let b = vec![("postinstall".into(), "echo a".into())];
-        assert_ne!(
-            compute_script_bundle_hash(&a),
-            compute_script_bundle_hash(&b)
-        );
-    }
-
-    /// Order matters — `[a, b]` and `[b, a]` hash differently.
-    #[test]
-    fn bundle_hash_changes_with_phase_order() {
-        let a = vec![
-            ("preinstall".into(), "echo one".into()),
-            ("postinstall".into(), "echo two".into()),
-        ];
-        let b = vec![
-            ("postinstall".into(), "echo two".into()),
-            ("preinstall".into(), "echo one".into()),
-        ];
-        assert_ne!(
-            compute_script_bundle_hash(&a),
-            compute_script_bundle_hash(&b)
-        );
-    }
-
-    /// Distinct field separators close the
-    /// `phase="ab" body="cd"` vs `phase="abc" body="d"`
-    /// concatenation-ambiguity gap.
-    #[test]
-    fn bundle_hash_disambiguates_field_boundaries() {
-        let a = vec![("ab".into(), "cd".into())];
-        let b = vec![("abc".into(), "d".into())];
-        assert_ne!(
-            compute_script_bundle_hash(&a),
-            compute_script_bundle_hash(&b)
-        );
-    }
-
-    /// Empty bundle still produces a stable hash (used as the
-    /// "no amber phases" sentinel — `has_phases` filters them out at
-    /// the call site, but the helper must still be total).
-    #[test]
-    fn bundle_hash_empty_input_is_stable() {
-        let empty: Vec<(String, String)> = Vec::new();
-        let h1 = compute_script_bundle_hash(&empty);
-        let h2 = compute_script_bundle_hash(&empty);
-        assert_eq!(h1, h2);
-        assert_eq!(h1.len(), 64, "32-byte SHA-256 encoded as 64 hex chars");
-    }
-}
 
 /// Max in-flight advisor classifications inside
 /// [`AdvisorSession::classify_amber`]. parallelization
@@ -472,7 +359,7 @@ impl AdvisorSession {
                         c.name.clone(),
                         c.version.clone(),
                         c.integrity.clone(),
-                        compute_script_bundle_hash(&c.amber_phases),
+                        c.script_hash.clone(),
                         outcome,
                         !c.amber_phases.is_empty(),
                     );
@@ -522,7 +409,7 @@ impl AdvisorSession {
                                 c.name.clone(),
                                 c.version.clone(),
                                 c.integrity.clone(),
-                                compute_script_bundle_hash(&c.amber_phases),
+                                c.script_hash.clone(),
                                 package_verdict,
                                 !c.amber_phases.is_empty(),
                             );
@@ -553,7 +440,7 @@ impl AdvisorSession {
                     c.name.clone(),
                     c.version.clone(),
                     c.integrity.clone(),
-                    compute_script_bundle_hash(&c.amber_phases),
+                    c.script_hash.clone(),
                     package_verdict,
                     !c.amber_phases.is_empty(),
                 )
@@ -566,11 +453,11 @@ impl AdvisorSession {
         // Serial application of approvals — single-thread mutation,
         // no locks. Order doesn't matter because the approval set is
         // a `HashSet` keyed by
-        // `(name, version, integrity, script_bundle_hash)`.
-        for (name, version, integrity, script_bundle_hash, outcome, has_phases) in results {
+        // `(name, version, integrity, script_hash)`.
+        for (name, version, integrity, script_hash, outcome, has_phases) in results {
             if outcome == PackageAdvisorOutcome::Approve && has_phases {
                 self.approvals
-                    .insert((name, version, integrity, script_bundle_hash));
+                    .insert((name, version, integrity, script_hash));
             }
         }
 
@@ -618,6 +505,8 @@ pub struct AmberPackageRequest {
     /// the request must carry the same identity the downstream
     /// trust-evaluation path will use.
     pub integrity: Option<String>,
+    /// Hash of all executed lifecycle scripts and recognized delegated files.
+    pub script_hash: String,
     /// `repository` URL from the package manifest (typically
     /// `package.json > repository.url` or the
     /// legacy shorthand string). Forwarded to the advisor prompt as
@@ -734,7 +623,7 @@ fn build_package_cache_key(
         .iter()
         .map(|(filename, content)| (filename.as_str(), content.as_str()))
         .collect();
-    build_cache_key(&CacheKeyInputs {
+    let prompt_key = build_cache_key(&CacheKeyInputs {
         package_name: &c.name,
         package_version: &c.version,
         amber_phases: &phases,
@@ -743,7 +632,13 @@ fn build_package_cache_key(
         prompt_template_hash,
         provider_slug,
         model_version,
-    })
+    });
+    use sha2::Digest;
+    let mut hasher = sha2::Sha256::new();
+    hasher.update(prompt_key.as_bytes());
+    hasher.update([0]);
+    hasher.update(c.script_hash.as_bytes());
+    format!("sha256-{}", hex::encode(hasher.finalize()))
 }
 
 #[cfg(test)]
@@ -931,6 +826,7 @@ mod tests {
     async fn classify_no_op_when_inactive() {
         let mut s = AdvisorSession::preflight(None, None, None, false).await;
         let req = AmberPackageRequest {
+            script_hash: "sha256-captured-scripts".into(),
             name: "p".into(),
             version: "1.0.0".into(),
             integrity: None,
@@ -965,6 +861,7 @@ mod tests {
         let one_phase = || vec![("postinstall".to_string(), "tsc".to_string())];
         let reqs = [
             AmberPackageRequest {
+                script_hash: "sha256-captured-scripts".into(),
                 name: "approve-me".into(),
                 version: "1.0.0".into(),
                 integrity: None,
@@ -973,6 +870,7 @@ mod tests {
                 amber_phases: one_phase(),
             },
             AmberPackageRequest {
+                script_hash: "sha256-captured-scripts".into(),
                 name: "manual".into(),
                 version: "1.0.0".into(),
                 integrity: None,
@@ -981,6 +879,7 @@ mod tests {
                 amber_phases: one_phase(),
             },
             AmberPackageRequest {
+                script_hash: "sha256-captured-scripts".into(),
                 name: "abstain".into(),
                 version: "1.0.0".into(),
                 integrity: None,
@@ -989,6 +888,7 @@ mod tests {
                 amber_phases: one_phase(),
             },
             AmberPackageRequest {
+                script_hash: "sha256-captured-scripts".into(),
                 name: "env-fail".into(),
                 version: "1.0.0".into(),
                 integrity: None,
@@ -997,6 +897,7 @@ mod tests {
                 amber_phases: one_phase(),
             },
             AmberPackageRequest {
+                script_hash: "sha256-captured-scripts".into(),
                 name: "int-fail".into(),
                 version: "1.0.0".into(),
                 integrity: None,
@@ -1045,6 +946,7 @@ mod tests {
         };
         let mut s = session_with_fake(fake);
         let req = AmberPackageRequest {
+            script_hash: "sha256-captured-scripts".into(),
             name: "two-phase-trap".into(),
             version: "1.0.0".into(),
             integrity: None,
@@ -1079,6 +981,7 @@ mod tests {
         };
         let mut s = session_with_fake(fake);
         let req = AmberPackageRequest {
+            script_hash: "sha256-captured-scripts".into(),
             name: "edge".into(),
             version: "1.0.0".into(),
             integrity: None,
@@ -1195,6 +1098,7 @@ mod tests {
         };
         let reqs: Vec<AmberPackageRequest> = (0..6)
             .map(|i| AmberPackageRequest {
+                script_hash: "sha256-captured-scripts".into(),
                 name: format!("pkg-{i}"),
                 version: "1.0.0".into(),
                 integrity: None,
@@ -1263,6 +1167,7 @@ mod tests {
         };
         let reqs: Vec<AmberPackageRequest> = (0..n)
             .map(|i| AmberPackageRequest {
+                script_hash: "sha256-captured-scripts".into(),
                 name: format!("pkg-{i}"),
                 version: "1.0.0".into(),
                 integrity: None,
@@ -1354,6 +1259,7 @@ mod tests {
         };
         let mut s = session_with_cache(fake_cold, Arc::clone(&cache));
         let req = AmberPackageRequest {
+            script_hash: "sha256-captured-scripts".into(),
             name: "sharp".into(),
             version: "0.34.4".into(),
             integrity: Some("sha512-abc".into()),
@@ -1388,6 +1294,7 @@ mod tests {
         };
         let mut s = session_with_cache(fake_warm, cache);
         let req = AmberPackageRequest {
+            script_hash: "sha256-captured-scripts".into(),
             name: "sharp".into(),
             version: "0.34.4".into(),
             integrity: Some("sha512-abc".into()),
@@ -1414,4 +1321,22 @@ mod tests {
     /// self-contained even if the upstream default changes.
     const DEFAULT_TTL_FOR_TEST: std::time::Duration =
         std::time::Duration::from_secs(30 * 24 * 60 * 60);
+    #[test]
+    fn advisor_cache_key_changes_with_the_complete_script_hash() {
+        let mut request = AmberPackageRequest {
+            name: "addon".into(),
+            version: "1.0.0".into(),
+            integrity: None,
+            script_hash: "sha256-a".into(),
+            repository: None,
+            amber_phases: vec![("postinstall".into(), "node install.js".into())],
+            referenced_scripts: vec![],
+        };
+        let before = build_package_cache_key(&request, "template", "provider", "model");
+        request.script_hash = "sha256-b".into();
+        assert_ne!(
+            before,
+            build_package_cache_key(&request, "template", "provider", "model")
+        );
+    }
 }

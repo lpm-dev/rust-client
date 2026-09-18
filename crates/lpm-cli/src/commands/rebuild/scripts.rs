@@ -162,7 +162,12 @@ impl BuildCacheMetrics {
     }
 }
 
-pub(crate) type RebuildPackageIdentity = (String, String, Option<String>);
+pub(crate) type RebuildPackageIdentity = (
+    String,
+    String,
+    Option<String>,
+    Option<lpm_common::PackageInstanceId>,
+);
 
 #[derive(Debug, Clone, Default)]
 pub(crate) struct RebuildRunReport {

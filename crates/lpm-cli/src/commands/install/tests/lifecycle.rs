@@ -153,60 +153,66 @@ fn blocked_set_metadata_candidates_include_only_registry_packages_with_scripts()
     }
 
     assert!(package_requires_blocked_set_metadata(
-        &store, None, &scripted
+        &scripted,
+        &store.package_dir(&scripted.name, &scripted.version)
     ));
-    assert!(!package_requires_blocked_set_metadata(&store, None, &plain));
-    assert!(!package_requires_blocked_set_metadata(&store, None, &local));
+    assert!(!package_requires_blocked_set_metadata(
+        &plain,
+        &store.package_dir(&plain.name, &plain.version)
+    ));
+    assert!(!package_requires_blocked_set_metadata(
+        &local,
+        &store.package_dir(&local.name, &local.version)
+    ));
 }
 
 #[test]
 fn blocked_set_metadata_replay_preserves_previous_enrichment_only() {
     let dir = tempfile::tempdir().unwrap();
-    crate::build_state::write_build_state(
-        dir.path(),
-        &crate::build_state::BuildState {
-            state_version: crate::build_state::BUILD_STATE_VERSION,
-            blocked_set_fingerprint: "sha256-fixture".into(),
-            captured_at: "2026-06-09T00:00:00Z".into(),
-            blocked_packages: vec![
-                crate::build_state::BlockedPackage {
-                    name: "scripted-meta".into(),
-                    version: "1.0.0".into(),
-                    integrity: Some("sha512-meta".into()),
-                    script_hash: Some("sha256-script".into()),
-                    phases_present: vec!["postinstall".into()],
-                    binding_drift: false,
-                    static_tier: None,
-                    provenance_at_capture: None,
-                    published_at: Some("2026-04-22T00:00:00Z".into()),
-                    behavioral_tags_hash: Some("sha256-tags".into()),
-                    behavioral_tags: Some(vec!["network".into(), "eval".into()]),
-                },
-                crate::build_state::BlockedPackage {
-                    name: "scripted-empty".into(),
-                    version: "1.0.0".into(),
-                    integrity: Some("sha512-empty".into()),
-                    script_hash: Some("sha256-empty".into()),
-                    phases_present: vec!["postinstall".into()],
-                    binding_drift: false,
-                    static_tier: None,
-                    provenance_at_capture: None,
-                    published_at: None,
-                    behavioral_tags_hash: None,
-                    behavioral_tags: None,
-                },
-            ],
-            authentication_tag: None,
-            drift_ignore_override: None,
-        },
-    )
-    .unwrap();
+    let mut state = crate::build_state::BuildState {
+        state_version: crate::build_state::BUILD_STATE_VERSION,
+        blocked_set_fingerprint: "sha256-fixture".into(),
+        captured_at: "2026-06-09T00:00:00Z".into(),
+        blocked_packages: vec![
+            crate::build_state::BlockedPackage {
+                name: "scripted-meta".into(),
+                version: "1.0.0".into(),
+                integrity: Some("sha512-meta".into()),
+                script_hash: Some("sha256-script".into()),
+                phases_present: vec!["postinstall".into()],
+                binding_drift: false,
+                static_tier: None,
+                provenance_at_capture: None,
+                published_at: Some("2026-04-22T00:00:00Z".into()),
+                behavioral_tags_hash: Some("sha256-tags".into()),
+                behavioral_tags: Some(vec!["network".into(), "eval".into()]),
+            },
+            crate::build_state::BlockedPackage {
+                name: "scripted-empty".into(),
+                version: "1.0.0".into(),
+                integrity: Some("sha512-empty".into()),
+                script_hash: Some("sha256-empty".into()),
+                phases_present: vec!["postinstall".into()],
+                binding_drift: false,
+                static_tier: None,
+                provenance_at_capture: None,
+                published_at: None,
+                behavioral_tags_hash: None,
+                behavioral_tags: None,
+            },
+        ],
+        authentication_tag: None,
+        drift_ignore_override: None,
+    };
+    state.blocked_set_fingerprint =
+        crate::build_state::compute_blocked_set_fingerprint(&state.blocked_packages);
+    crate::build_state::write_build_state(dir.path(), &state).unwrap();
 
     let metadata = blocked_set_metadata_from_previous_state(dir.path());
 
     assert_eq!(metadata.by_pkg.len(), 1);
     let entry = metadata
-        .get("scripted-meta", "1.0.0")
+        .get("scripted-meta", "1.0.0", Some("sha512-meta"))
         .expect("metadata replay should include enriched prior rows");
     assert_eq!(entry.published_at.as_deref(), Some("2026-04-22T00:00:00Z"));
     assert_eq!(entry.behavioral_tags_hash.as_deref(), Some("sha256-tags"));
@@ -215,7 +221,11 @@ fn blocked_set_metadata_replay_preserves_previous_enrichment_only() {
         .as_deref()
         .expect("metadata replay should preserve behavioral tag names");
     assert_eq!(tags, ["network", "eval"]);
-    assert!(metadata.get("scripted-empty", "1.0.0").is_none());
+    assert!(
+        metadata
+            .get("scripted-empty", "1.0.0", Some("sha512-empty"))
+            .is_none()
+    );
 }
 
 /// The drift gate must appear before the install pipeline hands off to
@@ -785,5 +795,85 @@ fn post_install_version_diff_hints_surface_behavioral_tag_delta() {
     assert!(
         line.contains("+eval") && line.contains("+network"),
         "gained tags must surface in terse hint — got {line}"
+    );
+}
+
+#[test]
+fn blocked_metadata_replay_keeps_distinct_artifacts_separate_and_rejects_unsigned_state() {
+    let project = tempfile::tempdir().unwrap();
+    let rows = ["a", "b"]
+        .into_iter()
+        .map(|id| crate::build_state::BlockedPackage {
+            name: "shared".into(),
+            version: "1.0.0".into(),
+            integrity: Some(format!("sha512-{id}")),
+            script_hash: Some(format!("sha256-{id}")),
+            phases_present: vec!["postinstall".into()],
+            binding_drift: false,
+            static_tier: None,
+            published_at: Some(id.into()),
+            behavioral_tags_hash: None,
+            behavioral_tags: None,
+            provenance_at_capture: None,
+        })
+        .collect::<Vec<_>>();
+    let state = crate::build_state::BuildState {
+        state_version: crate::build_state::BUILD_STATE_VERSION,
+        blocked_set_fingerprint: crate::build_state::compute_blocked_set_fingerprint(&rows),
+        captured_at: "2026-01-01T00:00:00Z".into(),
+        blocked_packages: rows,
+        authentication_tag: None,
+        drift_ignore_override: None,
+    };
+    crate::build_state::write_build_state(project.path(), &state).unwrap();
+    let replay = blocked_set_metadata_from_previous_state(project.path());
+    assert_eq!(
+        replay.by_pkg.len(),
+        2,
+        "distinct metadata artifacts collapsed"
+    );
+}
+
+#[test]
+fn blocked_metadata_replay_does_not_authenticate_unsigned_enrichment() {
+    let project = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(project.path().join(".lpm")).unwrap();
+    std::fs::write(project.path().join(".lpm/build-state.json"), r#"{"state_version":1,"captured_at":"2026-01-01T00:00:00Z","blocked_set_fingerprint":"fake","blocked_packages":[{"name":"shared","version":"1.0.0","phases_present":[],"binding_drift":false,"published_at":"untrusted-date"}]}"#).unwrap();
+    assert!(
+        blocked_set_metadata_from_previous_state(project.path())
+            .by_pkg
+            .is_empty()
+    );
+}
+
+#[test]
+fn blocked_metadata_replay_omits_artifacts_without_integrity() {
+    let project = tempfile::tempdir().unwrap();
+    let rows = vec![crate::build_state::BlockedPackage {
+        name: "shared".into(),
+        version: "1.0.0".into(),
+        integrity: None,
+        script_hash: Some("sha256-a".into()),
+        phases_present: vec!["postinstall".into()],
+        binding_drift: false,
+        static_tier: None,
+        published_at: Some("2020-01-01T00:00:00Z".into()),
+        behavioral_tags_hash: None,
+        behavioral_tags: None,
+        provenance_at_capture: None,
+    }];
+    let state = crate::build_state::BuildState {
+        state_version: crate::build_state::BUILD_STATE_VERSION,
+        blocked_set_fingerprint: crate::build_state::compute_blocked_set_fingerprint(&rows),
+        captured_at: "2026-01-01T00:00:00Z".into(),
+        blocked_packages: rows,
+        authentication_tag: None,
+        drift_ignore_override: None,
+    };
+    crate::build_state::write_build_state(project.path(), &state).unwrap();
+    assert!(
+        blocked_set_metadata_from_previous_state(project.path())
+            .by_pkg
+            .is_empty()
     );
 }

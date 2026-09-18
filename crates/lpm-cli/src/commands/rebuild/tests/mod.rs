@@ -2299,7 +2299,7 @@ fn advisor_approval_promotes_amber_under_triage() {
         "amber-pkg".to_string(),
         "1.0.0".to_string(),
         None,
-        String::new(),
+        compute_script_hash(&pkg_dir).unwrap(),
     ));
 
     let reason = evaluate_trust(
@@ -2402,13 +2402,13 @@ fn advisor_approval_for_other_package_does_not_promote_this_one() {
         "OTHER-pkg".to_string(),
         "1.0.0".to_string(),
         None,
-        String::new(),
+        compute_script_hash(&pkg_dir).unwrap(),
     ));
     approvals.insert((
         "amber-pkg".to_string(),
         "2.0.0".to_string(),
         None,
-        String::new(),
+        compute_script_hash(&pkg_dir).unwrap(),
     )); // wrong version
     let reason = evaluate_trust(
         &pkg_dir,
@@ -2447,7 +2447,7 @@ fn advisor_approval_does_not_apply_under_deny() {
         "amber-pkg".to_string(),
         "1.0.0".to_string(),
         None,
-        String::new(),
+        compute_script_hash(&pkg_dir).unwrap(),
     ));
     let reason = evaluate_trust(
         &pkg_dir,
@@ -2487,7 +2487,7 @@ fn advisor_approval_does_not_apply_under_allow() {
         "amber-pkg".to_string(),
         "1.0.0".to_string(),
         None,
-        String::new(),
+        compute_script_hash(&pkg_dir).unwrap(),
     ));
     let reason = evaluate_trust(
         &pkg_dir,
@@ -2534,7 +2534,7 @@ fn advisor_approval_does_not_leak_across_sources_with_same_coord() {
         "amber-pkg".to_string(),
         "1.0.0".to_string(),
         Some("sha512-registry-integrity".to_string()),
-        String::new(),
+        compute_script_hash(&pkg_dir).unwrap(),
     ));
 
     // Querying for the SAME coord but a DIFFERENT integrity must
@@ -2612,7 +2612,7 @@ fn green_under_triage_still_wins_over_advisor() {
         "green-pkg".to_string(),
         "1.0.0".to_string(),
         None,
-        String::new(),
+        compute_script_hash(&pkg_dir).unwrap(),
     ));
     let reason = evaluate_trust(
         &pkg_dir,

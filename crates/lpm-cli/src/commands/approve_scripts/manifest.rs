@@ -152,8 +152,10 @@ pub(super) fn ensure_manifest_unchanged(
     pkg_json_path: &Path,
     reviewed_manifest_text: &str,
 ) -> Result<(), LpmError> {
-    let current_text =
-        lpm_common::read_text_file_capped(pkg_json_path, lpm_common::CONFIG_FILE_SIZE_CAP_BYTES)?;
+    let (current_text, _) = lpm_common::read_text_regular_file_capped_with_metadata(
+        pkg_json_path,
+        lpm_common::CONFIG_FILE_SIZE_CAP_BYTES,
+    )?;
     if current_text != reviewed_manifest_text {
         return Err(LpmError::Script(
             "package.json changed while approve-scripts was reviewing it; no approvals were written. Review the current manifest and retry."

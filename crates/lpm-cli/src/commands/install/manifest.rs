@@ -502,13 +502,6 @@ pub(super) fn install_package_is_registry_source(package: &InstallPackage) -> bo
     )
 }
 
-pub(super) fn install_package_is_local_source(package: &InstallPackage) -> bool {
-    matches!(
-        package.source_kind(),
-        Ok(lpm_lockfile::Source::Directory { .. }) | Ok(lpm_lockfile::Source::Link { .. })
-    )
-}
-
 /// Replay the stage decisions against the
 /// current manifest using the resolver's output, replacing any
 /// deferred entries with the final save spec computed by

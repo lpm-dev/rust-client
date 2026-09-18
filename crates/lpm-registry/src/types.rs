@@ -1623,17 +1623,82 @@ pub struct BlockedSetPackageMeta {
     pub versions: HashMap<String, BlockedSetVersionMeta>,
 }
 
-/// Per-version slice of [`BlockedSetPackageMeta`] — only the behavioral-tags
-/// field. All other `VersionMetadata` fields are skipped during deserialization.
+/// Per-version artifact identity and behavioral tags for blocked-set review.
+/// Other version metadata is skipped during deserialization.
 #[derive(serde::Deserialize, Default)]
 pub struct BlockedSetVersionMeta {
+    #[serde(default)]
+    pub dist: Option<BlockedSetDist>,
     #[serde(default, rename = "_behavioralTags")]
     pub behavioral_tags: Option<BehavioralTags>,
+}
+
+/// Distribution identity retained by the lightweight blocked-set metadata reader.
+#[derive(serde::Deserialize, Default)]
+pub struct BlockedSetDist {
+    #[serde(default)]
+    pub integrity: Option<String>,
+    #[serde(default)]
+    pub shasum: Option<String>,
+}
+
+impl BlockedSetDist {
+    pub fn integrity_or_shasum(&self) -> Option<std::borrow::Cow<'_, str>> {
+        self.integrity
+            .as_deref()
+            .map(std::borrow::Cow::Borrowed)
+            .or_else(|| {
+                self.shasum
+                    .as_deref()
+                    .and_then(shasum_to_sha1_sri)
+                    .map(std::borrow::Cow::Owned)
+            })
+    }
+}
+
+impl From<DistInfo> for BlockedSetDist {
+    fn from(dist: DistInfo) -> Self {
+        Self {
+            integrity: dist.integrity,
+            shasum: dist.shasum,
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn blocked_set_projection_preserves_distribution_identity_in_json_and_cache() {
+        for dist in [
+            serde_json::json!({"integrity":"sha512-artifact"}),
+            serde_json::json!({"shasum":"0123456789abcdef0123456789abcdef01234567"}),
+        ] {
+            let source = serde_json::json!({"name":"addon","time":{"1.0.0":"2020-01-01T00:00:00Z"},"versions":{"1.0.0":{"name":"addon","version":"1.0.0","dist":dist}}});
+            let full: PackageMetadata = serde_json::from_value(source.clone()).unwrap();
+            let cached = rmp_serde::to_vec_named(&full).unwrap();
+            let json: BlockedSetPackageMeta = serde_json::from_value(source).unwrap();
+            let cache: BlockedSetPackageMeta = rmp_serde::from_slice(&cached).unwrap();
+            let expected = full.versions["1.0.0"]
+                .dist
+                .clone()
+                .unwrap()
+                .take_integrity_or_shasum()
+                .unwrap();
+            for projected in [json, cache] {
+                assert_eq!(
+                    projected.versions["1.0.0"]
+                        .dist
+                        .as_ref()
+                        .unwrap()
+                        .integrity_or_shasum()
+                        .as_deref(),
+                    Some(expected.as_str())
+                );
+            }
+        }
+    }
 
     #[test]
     fn version_metadata_reads_deprecation_without_adding_absent_null_fields() {

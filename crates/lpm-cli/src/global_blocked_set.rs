@@ -85,23 +85,12 @@ pub struct AggregateBlockedRow {
 /// when the same `(name, version, integrity, script_hash)` is reported
 /// by more than one origin and the two origins disagree on tier.
 ///
-/// Precedence (most-strict first): `Red > AmberLlm > Amber > Green > None`.
-/// The gate that consumes the aggregate refuses non-green tiers, so a
-/// "promote to strictest" merge keeps the policy boundary at the most
-/// conservative reading — a Red contribution from any origin keeps the
-/// row blocked from bulk approval even if another origin labelled the
-/// same binding Green.
+/// An unclassified contribution cannot become eligible for bulk approval.
 fn merge_static_tier(a: Option<StaticTier>, b: Option<StaticTier>) -> Option<StaticTier> {
-    fn rank(t: Option<StaticTier>) -> u8 {
-        match t {
-            None => 0,
-            Some(StaticTier::Green) => 1,
-            Some(StaticTier::Amber) => 2,
-            Some(StaticTier::AmberLlm) => 3,
-            Some(StaticTier::Red) => 4,
-        }
+    match (a, b) {
+        (Some(a), Some(b)) => Some(a.worse_of(b)),
+        _ => None,
     }
-    if rank(a) >= rank(b) { a } else { b }
 }
 
 /// Output of [`aggregate_blocked_across_globals`].
@@ -667,19 +656,30 @@ mod tests {
     /// than silently weaken the gate. Six representative pairings cover
     /// every adjacency in the strictness ladder.
     #[test]
-    fn merge_static_tier_precedence_red_over_amber_llm_over_amber_over_green_over_none() {
+    fn merge_static_tier_preserves_the_worst_known_tier_and_unknown_annotations() {
         let none = None::<StaticTier>;
         let g = Some(StaticTier::Green);
         let a = Some(StaticTier::Amber);
         let al = Some(StaticTier::AmberLlm);
         let r = Some(StaticTier::Red);
 
-        assert_eq!(merge_static_tier(none, g), g);
+        assert_eq!(merge_static_tier(none, g), none);
         assert_eq!(merge_static_tier(g, a), a);
         assert_eq!(merge_static_tier(a, al), al);
         assert_eq!(merge_static_tier(al, r), r);
         // Commutative + idempotent for the equal-tier case.
         assert_eq!(merge_static_tier(r, r), r);
         assert_eq!(merge_static_tier(r, g), r);
+    }
+    #[test]
+    fn merging_an_unclassified_global_row_does_not_enable_bulk_approval() {
+        assert_ne!(
+            merge_static_tier(None, Some(StaticTier::Green)),
+            Some(StaticTier::Green)
+        );
+        assert_ne!(
+            merge_static_tier(Some(StaticTier::Green), None),
+            Some(StaticTier::Green)
+        );
     }
 }

@@ -18,7 +18,9 @@ pub(crate) struct ProjectV2BaselineIndex {
     uses_virtual_store: bool,
     scoped: lpm_store::V2BaselineIndex,
     by_instance: HashMap<lpm_common::PackageInstanceId, Arc<lpm_store::InstalledPackageBaseline>>,
+    by_coordinates: HashMap<(String, String), Vec<Arc<lpm_store::InstalledPackageBaseline>>>,
     global: std::sync::OnceLock<lpm_store::V2BaselineIndex>,
+    global_artifact_directories: std::sync::OnceLock<HashMap<String, Vec<PathBuf>>>,
 }
 
 pub(crate) fn build_project_v2_baseline_index(
@@ -33,7 +35,9 @@ pub(crate) fn build_project_v2_baseline_index(
             uses_virtual_store: false,
             scoped: lpm_store::V2BaselineIndex::default(),
             by_instance: HashMap::new(),
+            by_coordinates: HashMap::new(),
             global: std::sync::OnceLock::new(),
+            global_artifact_directories: std::sync::OnceLock::new(),
         };
     }
     let scoped = lpm_store::V2BaselineIndex::for_project(project_dir, lpm_root);
@@ -53,8 +57,80 @@ pub(crate) fn build_project_v2_baseline_index(
         uses_virtual_store: true,
         scoped,
         by_instance,
+        by_coordinates: HashMap::new(),
         global: std::sync::OnceLock::new(),
+        global_artifact_directories: std::sync::OnceLock::new(),
     }
+}
+
+pub(crate) fn build_project_script_review_index(
+    project_dir: &Path,
+    lpm_root: &lpm_common::LpmRoot,
+    store_version: lpm_store::StoreVersion,
+    lockfile: Option<&lpm_lockfile::Lockfile>,
+) -> ProjectV2BaselineIndex {
+    let mut index =
+        build_project_v2_baseline_index(project_dir, lpm_root, store_version, lockfile, None);
+    if !store_version.uses_virtual_store() {
+        index.by_coordinates = v1_artifact_baselines(project_dir, lpm_root, lockfile);
+    } else {
+        for package in lockfile.into_iter().flat_map(|lockfile| &lockfile.packages) {
+            if let Some(baseline) = package
+                .instance_id
+                .and_then(|id| index.by_instance.get(&id))
+            {
+                index
+                    .by_coordinates
+                    .entry((package.name.clone(), package.version.clone()))
+                    .or_default()
+                    .push(Arc::clone(baseline));
+            }
+        }
+    }
+    index
+}
+
+fn v1_artifact_baselines(
+    project_dir: &Path,
+    lpm_root: &lpm_common::LpmRoot,
+    lockfile: Option<&lpm_lockfile::Lockfile>,
+) -> HashMap<(String, String), Vec<Arc<lpm_store::InstalledPackageBaseline>>> {
+    use lpm_lockfile::Source;
+    let store = lpm_store::PackageStore::from_root(lpm_root);
+    let mut candidates: HashMap<_, Vec<_>> = HashMap::new();
+    for package in lockfile.into_iter().flat_map(|lockfile| &lockfile.packages) {
+        let path = match package.source_kind() {
+            Some(Ok(Source::Directory { path } | Source::Link { path })) => {
+                project_dir.join(path).canonicalize().ok()
+            }
+            Some(Ok(Source::Tarball { url })) if url.starts_with("file:") => package
+                .integrity
+                .as_deref()
+                .and_then(|sri| lpm_common::integrity::Integrity::parse(sri).ok())
+                .filter(|sri| sri.algorithm == lpm_common::integrity::HashAlgorithm::Sha256)
+                .and_then(|sri| store.tarball_local_store_path(&hex::encode(sri.hash)).ok()),
+            Some(Ok(Source::Tarball { .. } | Source::Git { .. })) => package
+                .integrity
+                .as_deref()
+                .and_then(|sri| store.tarball_store_path(sri).ok()),
+            Some(Ok(Source::Registry { .. })) | None => {
+                Some(store.package_dir(&package.name, &package.version))
+            }
+            Some(Err(_)) => None,
+        };
+        if let Some(package_dir) = path {
+            candidates
+                .entry((package.name.clone(), package.version.clone()))
+                .or_default()
+                .push(Arc::new(lpm_store::InstalledPackageBaseline {
+                    pristine_dir: package_dir.clone(),
+                    package_dir,
+                    integrity: package.integrity.clone().unwrap_or_default(),
+                    layout: lpm_store::PackageBaselineLayout::V1,
+                }));
+        }
+    }
+    candidates
 }
 
 pub(crate) fn build_instance_baselines(
@@ -170,23 +246,70 @@ pub(crate) fn find_project_baseline_by_identity(
     .map(Arc::new)
 }
 
-pub(crate) fn find_project_baseline(
-    index: Option<&ProjectV2BaselineIndex>,
+pub(crate) fn find_project_artifact_directories(
+    index: &ProjectV2BaselineIndex,
     lpm_root: &lpm_common::LpmRoot,
     name: &str,
     version: &str,
-) -> Option<lpm_store::InstalledPackageBaseline> {
-    if let Some(index) = index {
-        return lpm_store::find_installed_package_baseline_indexed(
-            &index.scoped,
-            lpm_root,
-            name,
-            version,
-        );
+    integrity: Option<&str>,
+) -> Vec<PathBuf> {
+    let mut directories = Vec::new();
+    if let Some(candidates) = index
+        .by_coordinates
+        .get(&(name.to_string(), version.to_string()))
+    {
+        for candidate in candidates {
+            if integrity.is_none_or(|value| value == candidate.integrity) {
+                directories.push(candidate.package_dir.clone());
+            }
+        }
     }
-    lpm_store::find_installed_package_baseline(lpm_root, name, version)
-        .ok()
-        .flatten()
+    if let Some(candidate) = lpm_store::find_installed_package_baseline_by_identity_indexed(
+        &index.scoped,
+        lpm_root,
+        name,
+        version,
+        integrity,
+    ) {
+        directories.push(candidate.package_dir);
+    }
+    directories.sort_unstable();
+    directories.dedup();
+    directories
+}
+
+pub(crate) fn find_cached_artifact_directories(
+    index: &ProjectV2BaselineIndex,
+    lpm_root: &lpm_common::LpmRoot,
+    name: &str,
+    version: &str,
+    integrity: Option<&str>,
+) -> Vec<PathBuf> {
+    let global = index
+        .global
+        .get_or_init(|| lpm_store::V2BaselineIndex::build(lpm_root).unwrap_or_default());
+    let by_integrity = index.global_artifact_directories.get_or_init(|| {
+        let mut directories: HashMap<String, Vec<PathBuf>> = HashMap::new();
+        for baseline in global.materializations() {
+            directories
+                .entry(baseline.integrity.clone())
+                .or_default()
+                .push(baseline.package_dir.clone());
+        }
+        for paths in directories.values_mut() {
+            paths.sort_unstable();
+            paths.dedup();
+        }
+        directories
+    });
+    if let Some(paths) = integrity.and_then(|value| by_integrity.get(value)) {
+        return paths.clone();
+    }
+    lpm_store::find_installed_package_baseline_by_identity_indexed(
+        global, lpm_root, name, version, integrity,
+    )
+    .map(|baseline| vec![baseline.package_dir])
+    .unwrap_or_default()
 }
 
 /// A fully loaded package inventory ready for audit or query consumption.
