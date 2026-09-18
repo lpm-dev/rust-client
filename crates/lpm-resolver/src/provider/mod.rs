@@ -35,7 +35,7 @@ pub(crate) use parse::{
 };
 #[cfg(test)]
 pub(crate) use platform::Platform;
-pub use platform::is_platform_compatible;
+pub use platform::{is_platform_compatible, is_platform_compatible_with_target};
 pub(crate) use policy::{
     release_age_status_for_version, release_age_status_for_version_unprofiled,
     select_override_target, trust_downgrade_violation, trust_downgrade_violation_unprofiled,

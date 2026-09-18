@@ -1,8 +1,8 @@
 use std::path::{Path, PathBuf};
 
 use crate::{
-    LOCKFILE_VERSION, Lockfile, LockfileError, TOML_LOCKFILE_SIZE_CAP_BYTES, ValidatedLockfile,
-    binary,
+    LOCKFILE_NAME, LOCKFILE_VERSION, Lockfile, LockfileError, TOML_LOCKFILE_SIZE_CAP_BYTES,
+    ValidatedLockfile, binary,
 };
 
 fn read_authoritative_toml(path: &Path) -> Result<String, LockfileError> {
@@ -31,59 +31,40 @@ impl Lockfile {
             .ancestors()
             .find(|ancestor| ancestor.join("package.json").is_file())
             .unwrap_or(project_dir);
-        let mut local = None;
-        for root in project_root.ancestors() {
-            let path = root.join(crate::LOCKFILE_NAME);
-            if !path.exists() {
-                continue;
-            }
-            if root == project_root {
-                local = Some(read_authoritative_toml(&path).and_then(|content| {
-                    let lockfile = ValidatedLockfile::from_toml(&content)?;
-                    Ok(ProjectLockfile {
-                        path,
-                        importer: ".".to_string(),
-                        lockfile: lockfile.as_lockfile().project_root_importer()?,
-                        workspace_root: None,
-                        content,
-                    })
-                }));
-                continue;
-            }
-            let content = read_authoritative_toml(&path)?;
-            let lockfile = ValidatedLockfile::from_toml(&content)?;
-            let relative = project_root.strip_prefix(root).map_err(|error| {
-                LockfileError::Io(format!(
-                    "failed to derive importer path below {}: {error}",
-                    root.display()
-                ))
-            })?;
-            let Some(importer) = importer_path(relative) else {
-                continue;
-            };
-            if !lockfile.as_lockfile().importers.contains_key(&importer) {
-                continue;
-            }
-            let workspace_root = WorkspaceRootLockfile {
-                root: root.to_path_buf(),
-                lockfile: lockfile.as_lockfile().project_root_importer()?,
-            };
-            return Ok(ProjectLockfile {
-                path,
-                lockfile: lockfile.project_importer(&importer)?,
-                importer,
-                workspace_root: Some(workspace_root),
-                content,
-            });
-        }
-        if let Some(local) = local {
-            return local;
-        }
-        Err(LockfileError::NotFound(format!(
-            "no {} found for {}",
-            crate::LOCKFILE_NAME,
-            project_dir.display()
-        )))
+        let selected = read_project_document(project_root)?;
+        let workspace_root = (selected.importer != ".")
+            .then(|| {
+                Ok(WorkspaceRootLockfile {
+                    root: selected.path.parent().unwrap_or(project_root).to_path_buf(),
+                    lockfile: selected.lockfile.as_lockfile().project_root_importer()?,
+                })
+            })
+            .transpose()?;
+        let lockfile = if selected.importer == "." {
+            selected.lockfile.as_lockfile().project_root_importer()?
+        } else {
+            selected.lockfile.project_importer(&selected.importer)?
+        };
+        Ok(ProjectLockfile {
+            path: selected.path,
+            importer: selected.importer,
+            lockfile,
+            workspace_root,
+            content: selected.content,
+        })
+    }
+
+    /// Read the complete owning lockfile, including all workspace importers.
+    /// A lockfile-only directory takes precedence over an unrelated ancestor
+    /// manifest; an ancestor union that records this project remains authoritative.
+    pub fn read_full_for_project(project_dir: &Path) -> Result<Self, LockfileError> {
+        let project_root = project_dir
+            .ancestors()
+            .find(|ancestor| {
+                ancestor.join("package.json").is_file() || ancestor.join(LOCKFILE_NAME).exists()
+            })
+            .unwrap_or(project_dir);
+        read_project_document(project_root).map(|selected| selected.lockfile.0)
     }
 
     /// Atomically write a standalone project view back to its owning
@@ -344,6 +325,61 @@ impl Lockfile {
     pub fn exists(path: &Path) -> bool {
         path.exists()
     }
+}
+
+struct ProjectDocument {
+    path: PathBuf,
+    importer: String,
+    lockfile: ValidatedLockfile,
+    content: String,
+}
+
+fn read_project_document(project_root: &Path) -> Result<ProjectDocument, LockfileError> {
+    let mut local = None;
+    for root in project_root.ancestors() {
+        let path = root.join(LOCKFILE_NAME);
+        if !path.exists() {
+            continue;
+        }
+        let read = || {
+            let content = read_authoritative_toml(&path)?;
+            let lockfile = ValidatedLockfile::from_toml(&content)?;
+            Ok::<_, LockfileError>((content, lockfile))
+        };
+        if root == project_root {
+            local = Some(read().map(|(content, lockfile)| ProjectDocument {
+                path,
+                importer: ".".into(),
+                lockfile,
+                content,
+            }));
+            continue;
+        }
+        let (content, lockfile) = read()?;
+        let relative = project_root.strip_prefix(root).map_err(|error| {
+            LockfileError::Io(format!(
+                "failed to derive importer path below {}: {error}",
+                root.display()
+            ))
+        })?;
+        let Some(importer) = importer_path(relative) else {
+            continue;
+        };
+        if lockfile.as_lockfile().importers.contains_key(&importer) {
+            return Ok(ProjectDocument {
+                path,
+                importer,
+                lockfile,
+                content,
+            });
+        }
+    }
+    local.unwrap_or_else(|| {
+        Err(LockfileError::NotFound(format!(
+            "no {LOCKFILE_NAME} found for {}",
+            project_root.display()
+        )))
+    })
 }
 
 /// A project-local view and the physical lockfile that owns it.

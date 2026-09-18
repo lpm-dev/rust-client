@@ -131,13 +131,26 @@ fn is_platform_compatible_values_for<'a>(
     libc: impl IntoIterator<Item = &'a str>,
     platform: &Platform,
 ) -> bool {
-    let os_ok = check_platform_filter_values(os, platform.os, "os");
-    let cpu_ok = check_platform_filter_values(cpu, platform.cpu, "cpu");
+    is_platform_compatible_with_target(os, cpu, libc, platform.os, platform.cpu, platform.libc)
+}
+
+/// Match npm OS, CPU and libc restrictions against an explicit target.
+/// Nonempty libc restrictions require a known target libc.
+pub fn is_platform_compatible_with_target<'a>(
+    os: impl IntoIterator<Item = &'a str>,
+    cpu: impl IntoIterator<Item = &'a str>,
+    libc: impl IntoIterator<Item = &'a str>,
+    target_os: &str,
+    target_cpu: &str,
+    target_libc: Option<&str>,
+) -> bool {
+    let os_ok = check_platform_filter_values(os, target_os, "os");
+    let cpu_ok = check_platform_filter_values(cpu, target_cpu, "cpu");
     let mut libc = libc.into_iter().peekable();
     let libc_ok = if libc.peek().is_none() {
         true
     } else {
-        match platform.libc {
+        match target_libc {
             Some(host_libc) => check_platform_filter_values(libc, host_libc, "libc"),
             None => false,
         }

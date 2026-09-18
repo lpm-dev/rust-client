@@ -1,5 +1,6 @@
 //! Workflow tests for lockfile-only `lpm fetch`.
 
+mod fetch_contract;
 mod support;
 
 use support::mock_registry::{
@@ -994,5 +995,21 @@ async fn fetch_downloads_shared_contextual_artifact_once_and_reports_each_instan
         envelope["packages"].as_array().map(Vec::len),
         Some(2),
         "reporting remains per lockfile instance"
+    );
+    let warm = lpm_with_registry(&project, &mock.url())
+        .args(["fetch", "--json"])
+        .output()
+        .unwrap();
+    assert!(
+        warm.status.success(),
+        "{}",
+        String::from_utf8_lossy(&warm.stderr)
+    );
+    let envelope: serde_json::Value = serde_json::from_slice(&warm.stdout).unwrap();
+    assert_eq!(envelope["counts"]["cached"], 2);
+    assert_eq!(envelope["counts"]["fetched"], 0);
+    assert_eq!(
+        mock.tarball_request_count("shared-artifact", "1.0.0").await,
+        1
     );
 }
