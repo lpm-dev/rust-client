@@ -736,7 +736,7 @@ pub(crate) struct RebuildArgs {
     /// Specific packages to rebuild. If omitted, rebuilds all trusted packages.
     pub(crate) packages: Vec<String>,
 
-    /// Rebuild ALL packages with scripts (dangerous — bypasses trust policy).
+    /// Rebuild all scripted packages. Untrusted execution requires signed authorization.
     #[arg(long)]
     pub(crate) all: bool,
 

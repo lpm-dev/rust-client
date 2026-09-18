@@ -28,6 +28,7 @@ pub(super) fn execute_script(
     store_root: &Path,
     home_dir: &Path,
     tmpdir: &Path,
+    json_output: bool,
 ) -> Result<(), String> {
     if cancelled.load(Ordering::Acquire) {
         return Err("Lifecycle script interrupted".to_string());
@@ -83,7 +84,7 @@ pub(super) fn execute_script(
         lpm_sandbox::SandboxStdio::Inherit,
         None,
     )?;
-    let output_readers = spawn_sanitized_output_readers(&mut child, false);
+    let output_readers = spawn_sanitized_output_readers(&mut child, json_output);
 
     let output =
         wait_with_timeout_or_cancel(child, timeout, cancelled, "Lifecycle script interrupted");
@@ -814,6 +815,7 @@ mod cancellation_tests {
             root.path(),
             root.path(),
             root.path(),
+            false,
         );
         assert_eq!(result.unwrap_err(), "Lifecycle script interrupted");
         assert!(!root.path().join("started.txt").exists());

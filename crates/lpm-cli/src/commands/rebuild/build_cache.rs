@@ -217,7 +217,7 @@ fn debug_bypass(reason: &str) {
 }
 
 pub(super) fn is_cacheable_native_build(package: &ScriptablePackage) -> bool {
-    native_build_kind(package).is_some()
+    native_build_kind(&package.name, &package.scripts).is_some()
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -226,14 +226,14 @@ enum NativeBuildKind {
     NativeToolchain,
 }
 
-fn native_build_kind(package: &ScriptablePackage) -> Option<NativeBuildKind> {
+fn native_build_kind(name: &str, scripts: &HashMap<String, String>) -> Option<NativeBuildKind> {
     if !cfg!(any(target_os = "macos", target_os = "linux")) {
         return None;
     }
     let mut kind = None;
-    for command in package.scripts.values() {
+    for command in scripts.values() {
         for segment in shell_command_segments(command)? {
-            let Some(segment_kind) = native_segment_kind(&package.name, &segment) else {
+            let Some(segment_kind) = native_segment_kind(name, &segment) else {
                 continue;
             };
             if segment_kind == NativeBuildKind::NativeToolchain {
@@ -368,6 +368,19 @@ fn normalize_shell_structure(command: &str) -> String {
     normalized
 }
 
+pub(super) fn marker_matches_scripts(
+    key: Option<&str>,
+    name: &str,
+    scripts: &HashMap<String, String>,
+    script_hash: Option<&str>,
+) -> bool {
+    match key {
+        Some(key) if key.starts_with("sha256-") => Some(key) == script_hash,
+        Some(key) if key.len() == 64 => native_build_kind(name, scripts).is_some(),
+        _ => false,
+    }
+}
+
 pub(super) fn marker_requires_key_validation(package: &ScriptablePackage) -> bool {
     package.build_marker_key.is_some() && is_cacheable_native_build(package)
 }
@@ -381,7 +394,7 @@ pub(super) enum BuildMarkerState {
 pub(super) fn read_build_marker(
     marker_path: &Path,
 ) -> Result<BuildMarkerState, lpm_common::LpmError> {
-    let content = match lpm_common::read_text_file_capped_nofollow(marker_path, 64) {
+    let content = match lpm_common::read_text_file_capped_nofollow(marker_path, 71) {
         Ok(content) => content,
         Err(lpm_common::BoundedReadError::NotFound { .. }) => return Ok(BuildMarkerState::Absent),
         Err(error) => {
@@ -394,15 +407,16 @@ pub(super) fn read_build_marker(
     if content.is_empty() {
         return Ok(BuildMarkerState::Present { key: None });
     }
-    if content.len() == 64
-        && content
+    let digest = content.strip_prefix("sha256-").unwrap_or(&content);
+    if digest.len() == 64
+        && digest
             .bytes()
             .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
     {
         return Ok(BuildMarkerState::Present { key: Some(content) });
     }
     Err(lpm_common::LpmError::Store(format!(
-        "invalid build marker {}: expected an empty marker or a lowercase SHA-256 key",
+        "invalid build marker {}: expected an empty marker, a lowercase SHA-256 key, or a sha256- script hash",
         marker_path.display()
     )))
 }
@@ -465,7 +479,7 @@ pub(super) fn build_key_for_package(
         debug_bypass(&format!("{} has no v2 graph identity", package.name));
         return None;
     };
-    let Some(native_kind) = native_build_kind(package) else {
+    let Some(native_kind) = native_build_kind(&package.name, &package.scripts) else {
         debug_bypass(&format!(
             "{} lifecycle command is not a recognized native build",
             package.name

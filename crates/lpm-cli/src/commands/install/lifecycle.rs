@@ -512,6 +512,7 @@ pub(super) async fn run_online_auto_build_phase(
             false,
             effective_policy,
             advisor_session.map(|s| s.approvals()),
+            false,
         )
         .await
         {

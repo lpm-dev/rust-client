@@ -720,6 +720,7 @@ pub(super) async fn run_link_and_finish(
             false,
             effective_policy,
             None,
+            false,
         )
         .await
         {

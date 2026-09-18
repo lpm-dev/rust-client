@@ -21,37 +21,30 @@ pub(super) fn package_baseline_dir_indexed(
 pub(super) fn read_lifecycle_scripts(
     pkg_json_path: &Path,
 ) -> Result<Option<HashMap<String, String>>, lpm_common::LpmError> {
-    let content =
-        lpm_common::read_file_capped(pkg_json_path, lpm_common::CONFIG_FILE_SIZE_CAP_BYTES)?;
-
-    // Fast byte pre-scan: if "scripts" never appears as a JSON key, the
-    // result is always None — skip the full parse.
-    const SCRIPTS_KEY: &[u8] = b"\"scripts\"";
-    if !content.windows(SCRIPTS_KEY.len()).any(|w| w == SCRIPTS_KEY) {
-        serde_json::from_slice::<serde::de::IgnoredAny>(&content).map_err(|error| {
-            lpm_common::LpmError::Store(format!(
-                "installed manifest {} is malformed: {error}",
-                pkg_json_path.display()
-            ))
-        })?;
-        return Ok(None);
+    #[derive(serde::Deserialize)]
+    struct LifecycleManifest {
+        #[serde(default)]
+        scripts: HashMap<String, serde_json::Value>,
     }
 
-    let parsed: serde_json::Value = serde_json::from_slice(&content).map_err(|error| {
+    let (content, _) = lpm_common::read_regular_file_capped_with_metadata(
+        pkg_json_path,
+        lpm_common::CONFIG_FILE_SIZE_CAP_BYTES,
+    )?;
+    let content = content.strip_prefix(b"\xef\xbb\xbf").unwrap_or(&content);
+    if content.iter().find(|byte| !byte.is_ascii_whitespace()) != Some(&b'{') {
+        return Err(lpm_common::LpmError::Store(format!(
+            "installed manifest {} must contain a JSON object",
+            pkg_json_path.display(),
+        )));
+    }
+    let manifest: LifecycleManifest = serde_json::from_slice(content).map_err(|error| {
         lpm_common::LpmError::Store(format!(
             "installed manifest {} is malformed: {error}",
             pkg_json_path.display()
         ))
     })?;
-    let Some(scripts_value) = parsed.get("scripts") else {
-        return Ok(None);
-    };
-    let scripts = scripts_value.as_object().ok_or_else(|| {
-        lpm_common::LpmError::Store(format!(
-            "installed manifest {} has a non-object scripts field",
-            pkg_json_path.display()
-        ))
-    })?;
+    let scripts = manifest.scripts;
 
     let mut lifecycle = HashMap::new();
     for phase in EXECUTED_INSTALL_PHASES {
@@ -187,12 +180,72 @@ impl RebuildRunReport {
     }
 }
 
+pub(super) fn select_named_packages<'a>(
+    packages: &'a [ScriptablePackage],
+    requests: &[String],
+) -> Result<Vec<&'a ScriptablePackage>, lpm_common::LpmError> {
+    let mut names: HashMap<&str, Vec<usize>> = HashMap::with_capacity(packages.len());
+    let mut suffixes: HashMap<&str, HashSet<&str>> = HashMap::new();
+    for (index, package) in packages.iter().enumerate() {
+        names.entry(&package.name).or_default().push(index);
+        for (offset, _) in package.name.match_indices('.') {
+            suffixes
+                .entry(&package.name[offset + 1..])
+                .or_default()
+                .insert(&package.name);
+        }
+    }
+    let mut selected = vec![false; packages.len()];
+    let mut missing = Vec::new();
+    let mut seen = HashSet::with_capacity(requests.len());
+    for request in requests {
+        if !seen.insert(request.as_str()) {
+            continue;
+        }
+        let canonical = if names.contains_key(request.as_str()) {
+            request.as_str()
+        } else if let Some(matches) = suffixes.get(request.as_str()) {
+            if matches.len() != 1 {
+                let mut alternatives = matches.iter().copied().collect::<Vec<_>>();
+                alternatives.sort_unstable();
+                return Err(lpm_common::LpmError::Registry(format!(
+                    "ambiguous package {}; use an exact name: {}",
+                    lpm_common::sanitize_for_terminal(request),
+                    lpm_common::sanitize_for_terminal(&alternatives.join(", ")),
+                )));
+            }
+            matches.iter().next().copied().unwrap_or_default()
+        } else {
+            missing.push(lpm_common::sanitize_for_terminal(request));
+            continue;
+        };
+        if let Some(indices) = names.get(canonical) {
+            for &index in indices {
+                selected[index] = true;
+            }
+        }
+    }
+    if !missing.is_empty() {
+        return Err(lpm_common::LpmError::Registry(format!(
+            "requested packages {} have no lifecycle scripts or are not installed",
+            missing.join(", ")
+        )));
+    }
+    Ok(packages
+        .iter()
+        .zip(selected)
+        .filter_map(|(package, selected)| selected.then_some(package))
+        .collect())
+}
+
 pub(super) fn rebuild_dry_run_envelope(
     packages: &[&ScriptablePackage],
     force_security_floor: bool,
 ) -> serde_json::Value {
     let mut json = serde_json::json!({
+        "success": true,
         "dry_run": true,
+        "count": packages.len(),
         "packages": packages.iter().map(|p| {
             serde_json::json!({
                 "name": p.name,

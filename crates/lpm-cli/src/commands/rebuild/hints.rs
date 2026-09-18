@@ -1,5 +1,6 @@
+use super::build_cache::{BuildMarkerState, marker_matches_scripts, read_build_marker};
 use super::scripts::{BUILD_MARKER, package_baseline_dir_indexed, read_lifecycle_scripts};
-use super::trust::{evaluate_trust, name_matches_trusted_scope, parse_trusted_scopes};
+use super::trust::{evaluate_trust_with_hash, name_matches_trusted_scope, parse_trusted_scopes};
 use crate::install_ui;
 use crate::script_policy_config::ScriptPolicy;
 use lpm_common::color::Painted;
@@ -108,7 +109,12 @@ pub(crate) fn scriptable_package_rows(
             }
         };
 
-        let is_built = pkg_dir.join(BUILD_MARKER).exists();
+        let script_hash = compute_script_hash(&pkg_dir);
+        let is_built = matches!(
+            read_build_marker(&pkg_dir.join(BUILD_MARKER)),
+            Ok(BuildMarkerState::Present { key })
+                if marker_matches_scripts(key.as_deref(), name, &scripts, script_hash.as_deref())
+        );
 
         // Strict/tiered gate — same four-way match as `rebuild::run` at
         // the main rebuild loop. `Strict` + `LegacyNameOnly` are trusted;
@@ -117,7 +123,6 @@ pub(crate) fn scriptable_package_rows(
         // still run the script (with a deprecation warning), so the
         // hint must not mislead the user about what the subsequent
         // `lpm rebuild` will do.
-        let script_hash = compute_script_hash(&pkg_dir);
         let trust = policy.can_run_scripts_strict(
             name,
             version,
@@ -346,16 +351,20 @@ pub fn all_scripted_packages_trusted(
             }
         };
 
-        // Has scripts — check if built already
-        if pkg_dir.join(BUILD_MARKER).exists() {
-            continue; // already built, skip
+        let script_hash = compute_script_hash(&pkg_dir);
+        if matches!(
+            read_build_marker(&pkg_dir.join(BUILD_MARKER)),
+            Ok(BuildMarkerState::Present { key })
+                if marker_matches_scripts(key.as_deref(), name, &scripts, script_hash.as_deref())
+        ) {
+            continue;
         }
 
         // Unbuilt with scripts — first fresh trust-check.
         has_any_unbuilt = true;
 
-        let reason = evaluate_trust(
-            &pkg_dir,
+        let reason = evaluate_trust_with_hash(
+            script_hash.as_deref(),
             name,
             version,
             integrity.as_deref(),

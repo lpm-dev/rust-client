@@ -26,7 +26,11 @@ fn write_store_package(
     )
     .unwrap();
     if built {
-        std::fs::write(pkg_dir.join(BUILD_MARKER), "").unwrap();
+        std::fs::write(
+            pkg_dir.join(BUILD_MARKER),
+            compute_script_hash(&pkg_dir).unwrap(),
+        )
+        .unwrap();
     }
     // `find_installed_package_baseline`'s
     // v1 fallback requires `.integrity` to be Some (sentinel for
@@ -2831,7 +2835,11 @@ fn all_scripted_packages_trusted_ignores_already_built_amber_under_triage() {
     write_scripted_pkg(&store, "green-pkg", "1.0.0", "node-gyp rebuild");
     // Mark as already-built so the predicate ignores it.
     let amber_dir = write_scripted_pkg(&store, "amber-built", "1.0.0", "playwright install");
-    std::fs::write(amber_dir.join(BUILD_MARKER), "").unwrap();
+    std::fs::write(
+        amber_dir.join(BUILD_MARKER),
+        compute_script_hash(&amber_dir).unwrap(),
+    )
+    .unwrap();
 
     let policy = SecurityPolicy::from_package_json(&dir.path().join("package.json"));
     let trusted = all_scripted_packages_trusted(

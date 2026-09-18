@@ -18,6 +18,7 @@
 //! that's out of scope for the policy gate. Dry-run exercises the same
 //! selection step in `build::run` without firing scripts.
 
+mod rebuild_contract;
 mod support;
 
 use support::assertions;
@@ -145,7 +146,7 @@ fn rebuild_executes_independent_packages_concurrently() {
     }
 
     let project = TempProject::empty("");
-    write_signed_unlock_for(&project, project.path(), &["sandbox-none"]);
+    write_signed_unlock_for(&project, project.path(), &["sandbox-none", "scripts-allow"]);
     write_policy_manifest(&project, "rebuild-independent-concurrency", None, &[]);
     let package_names = ["parallel-a", "parallel-b", "parallel-c", "parallel-d"];
     for name in package_names {
@@ -584,6 +585,7 @@ fn rebuild_deny_skips_all_packages_and_keeps_legacy_pointer() {
 #[test]
 fn rebuild_human_output_collapses_lifecycle_scripts_to_slim_rows() {
     let project = TempProject::empty("");
+    write_signed_unlock_for(&project, project.path(), &["scripts-allow"]);
     write_policy_manifest(&project, "rebuild-slim-output", None, &[]);
     let store_pkg = seed_scripted_package(&project, "green-native", "1.0.0", "echo lifecycle-ok");
     seed_wrapper(&project, &store_pkg, "green-native", "1.0.0");
@@ -624,6 +626,7 @@ fn rebuild_human_output_collapses_lifecycle_scripts_to_slim_rows() {
 #[test]
 fn rebuild_lifecycle_output_sanitizes_terminal_controls() {
     let project = TempProject::empty("");
+    write_signed_unlock_for(&project, project.path(), &["scripts-allow"]);
     write_policy_manifest(&project, "rebuild-controls", None, &[]);
     let name = "control-script-pkg";
     let version = "1.0.0";
@@ -741,7 +744,7 @@ fn rebuild_fails_when_an_installed_manifest_is_missing() {
 #[test]
 fn rebuild_rejects_a_directory_in_place_of_the_build_marker() {
     let project = TempProject::empty("");
-    write_signed_unlock_for(&project, project.path(), &["sandbox-none"]);
+    write_signed_unlock_for(&project, project.path(), &["sandbox-none", "scripts-allow"]);
     write_policy_manifest(&project, "rebuild-directory-marker", None, &[]);
     let store_pkg = seed_scripted_package(
         &project,
@@ -801,7 +804,7 @@ fn rebuild_fails_when_the_success_marker_cannot_be_written() {
     use std::os::unix::fs::PermissionsExt;
 
     let project = TempProject::empty("");
-    write_signed_unlock_for(&project, project.path(), &["sandbox-none"]);
+    write_signed_unlock_for(&project, project.path(), &["sandbox-none", "scripts-allow"]);
     write_policy_manifest(&project, "rebuild-unwritable-marker", None, &[]);
     let store_pkg = seed_scripted_package(&project, "unwritable-marker-pkg", "1.0.0", "true");
     seed_wrapper(&project, &store_pkg, "unwritable-marker-pkg", "1.0.0");
@@ -822,6 +825,7 @@ fn rebuild_fails_when_the_success_marker_cannot_be_written() {
 #[test]
 fn standalone_rebuild_waits_for_the_project_install_lock() {
     let project = TempProject::empty("");
+    write_signed_unlock_for(&project, project.path(), &["scripts-allow"]);
     write_policy_manifest(&project, "rebuild-project-lock", None, &[]);
     seed_scripted_package(&project, "locked-pkg", "1.0.0", "true");
     write_lockfile_for_packages(&project, &[("locked-pkg", "1.0.0")]);

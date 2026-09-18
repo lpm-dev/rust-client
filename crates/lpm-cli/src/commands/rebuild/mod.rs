@@ -43,8 +43,8 @@ mod tests;
 
 use self::build_cache::{
     BuildCacheInvocation, BuildCacheScratch, BuildMarkerState, build_key_for_package,
-    is_cacheable_native_build, marker_requires_key_validation, read_build_marker,
-    read_v2_graph_key_digest, remove_build_marker_durably, write_build_marker,
+    is_cacheable_native_build, marker_matches_scripts, marker_requires_key_validation,
+    read_build_marker, read_v2_graph_key_digest, remove_build_marker_durably, write_build_marker,
 };
 #[cfg(test)]
 pub(crate) use self::hints::scriptable_package_rows;
@@ -62,10 +62,13 @@ use self::scripts::{
     BUILD_MARKER, BuildCacheMetrics, ScriptablePackage, count_untrusted_unbuilt,
     package_build_layers, read_lifecycle_scripts, rebuild_dry_run_envelope,
     rebuild_package_failure_message, rebuild_package_label, rebuild_summary_envelope, scripts_word,
-    warn_stale_trusted_deps, widen_to_build_by_policy,
+    select_named_packages, warn_stale_trusted_deps, widen_to_build_by_policy,
 };
 pub(crate) use self::scripts::{RebuildPackageIdentity, RebuildRunReport};
-pub(crate) use self::trust::{TrustReason, evaluate_trust};
+pub(crate) use self::trust::TrustReason;
+#[cfg(test)]
+use self::trust::evaluate_trust;
+use self::trust::evaluate_trust_with_hash;
 
 use crate::install_ui;
 use crate::script_policy_config::ScriptPolicy;
@@ -174,6 +177,7 @@ pub async fn run(
             sandbox_log,
             effective_policy,
             advisor_approvals,
+            true,
         ),
     )
     .await
@@ -197,6 +201,7 @@ pub(crate) async fn run_with_report(
     advisor_approvals: Option<
         &std::collections::HashSet<crate::triage_advisor_session::AdvisorApprovalKey>,
     >,
+    emit_summary: bool,
 ) -> Result<RebuildRunReport, LpmError> {
     // hold the shared store lock across rebuild —
     // it traverses store package dirs to read package.json, compute
@@ -220,6 +225,7 @@ pub(crate) async fn run_with_report(
             sandbox_log,
             effective_policy,
             advisor_approvals,
+            emit_summary,
         ),
     )
     .await
@@ -243,6 +249,7 @@ async fn run_under_store_lock(
     advisor_approvals: Option<
         &std::collections::HashSet<crate::triage_advisor_session::AdvisorApprovalKey>,
     >,
+    emit_summary: bool,
 ) -> Result<RebuildRunReport, LpmError> {
     let cancelled = crate::install_recovery::cancellation_flag();
     crate::security_floor::clear_recorded_suppressions();
@@ -262,11 +269,23 @@ async fn run_under_store_lock(
     //: consolidated into the ScriptPolicyConfig loader so
     // the package.json read is a single pass across all four keys
     // (scriptPolicy, autoBuild, denyAll, trustedScopes).
-    let config_deny_all =
-        crate::script_policy_config::ScriptPolicyConfig::try_from_package_json(project_dir)?
-            .deny_all;
-    if deny_all || config_deny_all {
-        if !json_output {
+    let project_config =
+        crate::script_policy_config::ScriptPolicyConfig::try_from_package_json(project_dir)?;
+    if deny_all || project_config.deny_all {
+        if json_output {
+            let force_floor = crate::commands::config::GlobalConfig::load()
+                .get_bool("force-security-floor")
+                .unwrap_or(false);
+            let mut report = if dry_run {
+                rebuild_dry_run_envelope(&[], force_floor)
+            } else {
+                rebuild_summary_envelope(0, 0, force_floor, &BuildCacheMetrics::default())
+            };
+            report["denied_all"] = serde_json::json!(true);
+            if emit_summary {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            }
+        } else {
             install_ui::warn(
                 "Script execution denied. All scripts are blocked by --deny-all or lpm.scripts.denyAll config.",
             );
@@ -370,10 +389,19 @@ async fn run_under_store_lock(
             _ => continue,
         };
 
+        let script_hash = lpm_security::script_hash::compute_script_hash(&pkg_dir);
         let marker_path = pkg_dir.join(BUILD_MARKER);
         let (is_built, build_marker_key) = match read_build_marker(&marker_path)? {
             BuildMarkerState::Absent => (false, None),
-            BuildMarkerState::Present { key } => (true, key),
+            BuildMarkerState::Present { key } => {
+                let current = marker_matches_scripts(
+                    key.as_deref(),
+                    &lp.name,
+                    &scripts,
+                    script_hash.as_deref(),
+                );
+                (current, key)
+            }
         };
 
         // trust decision
@@ -384,8 +412,8 @@ async fn run_under_store_lock(
         // `is_scope_trusted` scope glob AND the green-tier auto-
         // trust path (*active only under
         // [`ScriptPolicy::Triage`]).
-        let trust_reason = evaluate_trust(
-            &pkg_dir,
+        let trust_reason = evaluate_trust_with_hash(
+            script_hash.as_deref(),
             &lp.name,
             &lp.version,
             lp.integrity.as_deref(),
@@ -478,14 +506,16 @@ async fn run_under_store_lock(
         }
     }
 
-    if scriptable_packages.is_empty() {
+    if scriptable_packages.is_empty() && specific_packages.is_empty() {
         if json_output {
             let result = if dry_run {
                 rebuild_dry_run_envelope(&[], force_security_floor)
             } else {
                 rebuild_summary_envelope(0, 0, force_security_floor, &BuildCacheMetrics::default())
             };
-            println!("{}", serde_json::to_string_pretty(&result).unwrap());
+            if emit_summary {
+                println!("{}", serde_json::to_string_pretty(&result).unwrap());
+            }
         } else {
             install_ui::done("No packages have lifecycle scripts · nothing to build");
             warn_stale_trusted_deps(&policy, &scriptable_packages);
@@ -500,46 +530,37 @@ async fn run_under_store_lock(
 
     // Determine which packages to build
     let selected_for_policy: Vec<&ScriptablePackage> = if !specific_packages.is_empty() {
-        // Build specific packages by name
-        let mut selected = Vec::new();
-        let mut missing = Vec::new();
-        let mut seen_requests = std::collections::HashSet::new();
-        for name in specific_packages {
-            if !seen_requests.insert(name.as_str()) {
-                continue;
-            }
-            let suffix = format!(".{name}");
-            let before = selected.len();
-            selected.extend(
-                scriptable_packages
-                    .iter()
-                    .filter(|package| package.name == *name || package.name.ends_with(&suffix)),
-            );
-            if selected.len() == before {
-                let safe_name = lpm_common::sanitize_for_terminal(name);
-                if !json_output {
-                    install_ui::warn_untrusted(&format!(
-                        "{safe_name} has no lifecycle scripts or is not installed"
-                    ));
-                }
-                missing.push(safe_name);
-            }
-        }
-        if !missing.is_empty() {
-            let package_word = if missing.len() == 1 {
-                "package"
-            } else {
-                "packages"
-            };
-            return Err(LpmError::Registry(format!(
-                "requested {package_word} {} have no lifecycle scripts or are not installed",
-                missing.join(", ")
-            )));
-        }
-        selected
+        select_named_packages(&scriptable_packages, specific_packages)?
     } else {
         widen_to_build_by_policy(&scriptable_packages, all, effective_policy)
     };
+    if (all || !specific_packages.is_empty())
+        && effective_policy != ScriptPolicy::Allow
+        && selected_for_policy
+            .iter()
+            .any(|package| !package.is_trusted)
+    {
+        let mut requested_packages = selected_for_policy
+            .iter()
+            .filter(|package| !package.is_trusted)
+            .map(|package| package.name.clone())
+            .collect::<Vec<_>>();
+        requested_packages.sort_unstable();
+        requested_packages.dedup();
+        let authorized_policy =
+            crate::script_policy_config::resolve_script_policy_with_security_for_packages(
+                project_dir,
+                Some(ScriptPolicy::Allow),
+                &project_config,
+                json_output,
+                &requested_packages,
+            )?;
+        if authorized_policy != ScriptPolicy::Allow {
+            return Err(LpmError::Registry(
+                "the security floor blocks explicit execution of untrusted scripts".to_string(),
+            ));
+        }
+    }
     let covered_packages = selected_for_policy
         .iter()
         .map(|pkg| (pkg.name.clone(), pkg.version.clone(), pkg.integrity.clone()))
@@ -569,7 +590,9 @@ async fn run_under_store_lock(
             } else {
                 rebuild_summary_envelope(0, 0, force_security_floor, &BuildCacheMetrics::default())
             };
-            println!("{}", serde_json::to_string_pretty(&result).unwrap());
+            if emit_summary {
+                println!("{}", serde_json::to_string_pretty(&result).unwrap());
+            }
         } else {
             let total = scriptable_packages.len();
             let built = scriptable_packages.iter().filter(|p| p.is_built).count();
@@ -644,7 +667,9 @@ async fn run_under_store_lock(
     if dry_run {
         if json_output {
             let json = rebuild_dry_run_envelope(&to_build, force_security_floor);
-            println!("{}", serde_json::to_string_pretty(&json).unwrap());
+            if emit_summary {
+                println!("{}", serde_json::to_string_pretty(&json).unwrap());
+            }
         } else {
             install_ui::phase_untrusted(&format!(
                 "Dry run: {} package(s) would be built:",
@@ -1230,6 +1255,21 @@ async fn run_under_store_lock(
             }
         };
 
+        // Capture the input before scripts can change their own files.
+        let mut lifecycle_hash = if build_key.is_none() {
+            match lpm_security::script_hash::compute_script_hash(&pkg.store_path) {
+                Some(hash) => Some(hash),
+                None => {
+                    install_ui::failed_untrusted(&rebuild_package_failure_message(
+                        pkg, &"cannot fingerprint installed lifecycle scripts",
+                    ));
+                    result.failures += 1;
+                    return result;
+                }
+            }
+        } else {
+            None
+        };
         let marker_path = pkg.store_path.join(BUILD_MARKER);
         let current_marker = match read_build_marker(&marker_path) {
             Ok(marker) => marker,
@@ -1272,7 +1312,7 @@ async fn run_under_store_lock(
                     result.build_cache.local_state_hits += 1;
                     return result;
                 }
-                (_, None) => return result,
+                (Some(marker_key), None) if Some(marker_key) == lifecycle_hash.as_deref() => return result,
                 _ => {
                     if let Err(error) = remove_build_marker_durably(&marker_path) {
                         if !json_output {
@@ -1414,6 +1454,16 @@ async fn run_under_store_lock(
         } else {
             None
         };
+        if build_key.is_none() && lifecycle_hash.is_none() {
+            lifecycle_hash = lpm_security::script_hash::compute_script_hash(&pkg.store_path);
+            if lifecycle_hash.is_none() {
+                install_ui::failed_untrusted(&rebuild_package_failure_message(
+                    pkg, &"cannot fingerprint installed lifecycle scripts",
+                ));
+                result.failures += 1;
+                return result;
+            }
+        }
         let package_tmpdir = if build_cache_scratch.is_none() {
             match tempfile::Builder::new()
                 .prefix("lpm-rebuild-")
@@ -1472,6 +1522,7 @@ async fn run_under_store_lock(
                 &store_root,
                 &home_dir,
                 script_tmpdir,
+                json_output,
             ) {
                 Ok(()) => {
                     if !json_output {
@@ -1522,7 +1573,7 @@ async fn run_under_store_lock(
                 result.build_cache.publish_ms += elapsed_millis(publish_start.elapsed());
             }
             if let Err(error) =
-                write_build_marker(&marker_path, build_key.as_ref().map(|key| key.as_str()))
+                write_build_marker(&marker_path, build_key.as_ref().map(|key| key.as_str()).or(lifecycle_hash.as_deref()))
             {
                 if !json_output {
                     let label = format!("{:<package_label_width$}", rebuild_package_label(pkg));
@@ -1581,7 +1632,9 @@ async fn run_under_store_lock(
             force_security_floor,
             &build_cache_metrics,
         );
-        println!("{}", serde_json::to_string_pretty(&json).unwrap());
+        if emit_summary {
+            println!("{}", serde_json::to_string_pretty(&json).unwrap());
+        }
     } else if failures == 0 {
         eprintln!();
         install_ui::done_untrusted(&format!(
@@ -1621,7 +1674,9 @@ async fn run_under_store_lock(
         install_ui::warn_untrusted(&format!("{successes} succeeded, {failures} failed"));
     }
 
-    if failures > 0 {
+    if failures > 0 && json_output && emit_summary {
+        Err(LpmError::ExitCode(1))
+    } else if failures > 0 {
         Err(LpmError::Registry(format!(
             "{failures} package(s) failed to build"
         )))
