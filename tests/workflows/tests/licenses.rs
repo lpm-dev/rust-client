@@ -1,5 +1,6 @@
 //! Workflow tests for `lpm licenses`.
 
+mod licenses_contract;
 mod support;
 
 use support::{
