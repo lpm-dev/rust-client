@@ -1,5 +1,6 @@
 //! Workflow tests for `lpm sbom`.
 
+mod sbom_contract;
 mod support;
 
 use support::{

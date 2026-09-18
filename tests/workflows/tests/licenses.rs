@@ -416,7 +416,7 @@ fn licenses_scope_marks_dev_only_alias_transitives_as_excluded() {
         .write_to_file(&project.path().join(lpm_lockfile::LOCKFILE_NAME))
         .expect("failed to write aliased dev-only lockfile");
     project.write_file(
-        "node_modules/ansi-regex/package.json",
+        "node_modules/ansi-regex-dev/package.json",
         r#"{
             "name": "ansi-regex",
             "version": "5.0.1",
