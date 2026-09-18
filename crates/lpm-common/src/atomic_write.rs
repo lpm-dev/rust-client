@@ -150,10 +150,10 @@ where
             .map_err(E::from)?;
         #[cfg(unix)]
         if options.sync_parent {
+            // Linux directory capabilities can use O_PATH, which cannot be synced.
             directory
-                .try_clone()
+                .open(".")
                 .map_err(E::from)?
-                .into_std_file()
                 .sync_all()
                 .map_err(E::from)?;
         }
@@ -651,6 +651,24 @@ mod tests {
         .unwrap();
 
         assert_eq!(fs::read(dir.path().join("graph.html")).unwrap(), b"after");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn capability_relative_atomic_write_syncs_a_nested_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir(dir.path().join("nested")).unwrap();
+        let root =
+            cap_std::fs::Dir::open_ambient_dir(dir.path(), cap_std::ambient_authority()).unwrap();
+        let directory = root.open_dir("nested").unwrap();
+        super::write_file_atomic_in_dir_with_options(
+            &directory,
+            "state.json".as_ref(),
+            AtomicWriteOptions::new().sync_file().sync_parent(),
+            |file| file.write_all(b"state"),
+        )
+        .unwrap();
+        assert_eq!(directory.read("state.json").unwrap(), b"state");
     }
 
     #[test]

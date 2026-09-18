@@ -159,7 +159,8 @@ pub(super) fn create_backup(root: &Path, source: &Path, backup: &Path) -> Result
 
 fn sync_directory(directory: &Dir) -> Result<(), LpmError> {
     #[cfg(unix)]
-    directory.try_clone()?.into_std_file().sync_all()?;
+    // Reopen through the capability: Linux O_PATH descriptors cannot be synced.
+    directory.open(".")?.sync_all()?;
     #[cfg(not(unix))]
     let _ = directory;
     Ok(())
