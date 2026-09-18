@@ -466,8 +466,6 @@ pub(super) struct OnlineFetchPhaseResult {
     pub(super) fetch_breakdown: FetchBreakdown,
     pub(super) walker_summary_final: Option<lpm_resolver::WalkerSummary>,
     pub(super) spec_stats: SpeculativeStats,
-    pub(super) publish_ages: HashMap<(String, String), u64>,
-    pub(super) min_release_age_secs: u64,
     pub(super) install_provenance_status_map:
         HashMap<(String, String), lpm_common::ProvenanceStatus>,
     pub(super) verified_provenance_for_lockfile:
@@ -2505,8 +2503,6 @@ pub(super) async fn run_online_fetch_phase(
         fetch_breakdown,
         walker_summary_final,
         spec_stats,
-        publish_ages,
-        min_release_age_secs: cooldown_policy.minimum_release_age_secs,
         install_provenance_status_map,
         verified_provenance_for_lockfile,
         fresh_urls,

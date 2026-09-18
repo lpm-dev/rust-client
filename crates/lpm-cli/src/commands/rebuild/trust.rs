@@ -360,7 +360,7 @@ pub(super) fn evaluate_trust_unsuspended(
 
     if effective_policy == ScriptPolicy::Triage {
         let tier = classify_package_worst_tier(scripts);
-        if tier == Some(StaticTier::Green) && green_tier_can_auto_trust(scripts) {
+        if tier == Some(StaticTier::Green) {
             return TrustReason::GreenTierUnderTriage;
         }
         // Amber + advisor said Approve →
@@ -387,25 +387,12 @@ pub(super) fn evaluate_trust_unsuspended(
     TrustReason::Untrusted
 }
 
-/// Worst-wins classification across the lifecycle phases present in
-/// `scripts`. Returns `None` when `scripts` is empty (caller has
-/// already early-returned in practice, since the trust-decision call
-/// sites only run after at least one lifecycle script was found).
-///
-/// Mirrors the reduction at `build_state.rs:418-421` exactly so the
-/// install-time annotation and the `lpm rebuild` gate agree on tier
-/// per-package without sharing cached state.
+/// Worst execution tier across the active lifecycle phases.
 pub(super) fn classify_package_worst_tier(scripts: &HashMap<String, String>) -> Option<StaticTier> {
     scripts
         .values()
-        .map(|body| lpm_security::static_gate::classify(body))
+        .map(|body| lpm_security::static_gate::classify_for_execution(body))
         .reduce(StaticTier::worse_of)
-}
-
-pub(super) fn green_tier_can_auto_trust(scripts: &HashMap<String, String>) -> bool {
-    scripts
-        .values()
-        .all(|body| lpm_security::static_gate::extract_delegate_path(body).is_none())
 }
 
 #[cfg(test)]

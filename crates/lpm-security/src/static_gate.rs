@@ -138,6 +138,15 @@ pub fn classify(script: &str) -> StaticTier {
     classify_with_context(script, None)
 }
 
+/// Classification for automatic execution. Recognized local delegates need
+/// review even when the command spelling or manifest identity looks safe.
+pub fn classify_for_execution(script: &str) -> StaticTier {
+    match classify(script) {
+        StaticTier::Green if extract_delegate_path(script).is_some() => StaticTier::Amber,
+        tier => tier,
+    }
+}
+
 /// Context-aware classification.
 ///
 /// When `ctx` is `Some`, an additional green arm fires for

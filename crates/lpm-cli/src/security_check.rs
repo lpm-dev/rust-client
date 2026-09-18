@@ -161,7 +161,7 @@ pub(crate) async fn post_install_security_summary(
                 if let Some(metadata) = metadata_map.get(&package.name) {
                     let ver_meta = metadata
                         .version(&package.version)
-                        .or_else(|| metadata.latest());
+                        .filter(|version| version.version == package.version);
                     if let Some(vm) = ver_meta {
                         let pkg_id = package.finding_key();
                         collect_registry_warnings(vm, &pkg_id, &mut tag_counts);

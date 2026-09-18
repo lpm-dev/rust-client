@@ -817,29 +817,8 @@ fn compute_blocked_packages_with_metadata_and_baseline(
         }
         let phases_present: Vec<String> = phase_bodies.iter().map(|(n, _)| n.clone()).collect();
 
-        // Classify each present phase and aggregate
-        // worst-wins. Populated unconditionally (not gated on
-        // `script-policy`) — the annotation is
-        // user-visible UX in all three modes.
-        //
-        // Pass identity context so a delegate-to-local-file +
-        // matching identity body surfaces as Green in the UI's
-        // blocked-set annotation, consistent with what the install
-        // pipeline's amber filter at
-        // `collect_amber_classification_requests` sees.
-        //
-        // Option B: `publish_age_secs = None` +
-        // `min_release_age_secs = 0` means the L1 widening fires
-        // independently of cooldown. This is correct here because
-        // `compute_blocked_packages_with_metadata` produces a
-        // UI-annotation tier on the BLOCKED set. Auto-run
-        // packages widened by the install pipeline are already
-        // excluded from the blocked set upstream — so the cooldown
-        // defense was already applied
-        // there. The annotation here only fires for packages
-        // already in the blocked set; widening them to Green at
-        // annotation time has no security impact (they'll still
-        // require `lpm approve-scripts` to run).
+        // Identity context affects the displayed tier only. Execution and advisor
+        // collection still require review of recognized delegated files.
         let repository = read_manifest_repository(pkg_dir);
         let ctx = lpm_security::static_gate::ManifestContext {
             package_name: name.as_str(),

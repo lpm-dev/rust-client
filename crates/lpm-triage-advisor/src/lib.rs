@@ -218,6 +218,12 @@ pub trait Advisor: Send + Sync {
     /// Which provider this adapter speaks to.
     fn provider(&self) -> Provider;
 
+    /// Adapter configuration that changes the meaning of a cached verdict.
+    /// This supplements the provider binary version; it is not a model digest.
+    fn cache_identity(&self) -> String {
+        self.provider().slug().to_string()
+    }
+
     /// Quick probe: is this provider available right now? Strict for
     /// Ollama (binary on PATH + HTTP probe to confirm the daemon
     /// answers); `which`-style for the CLI providers.

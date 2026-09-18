@@ -324,7 +324,12 @@ impl AdvisorSession {
         // `self.approvals` mutation single-threaded without locks.
         let provider_slug = self.configured_slug.clone().unwrap_or_default();
         let template_hash = self.prompt_template_hash.clone();
-        let model_version = self.model_version.clone();
+        let model_version = format!(
+            "{}:{}{}",
+            self.model_version.len(),
+            self.model_version,
+            adapter.cache_identity()
+        );
         let cache = self.cache.clone();
 
         let results: Vec<(
@@ -1338,5 +1343,74 @@ mod tests {
             before,
             build_package_cache_key(&request, "template", "provider", "model")
         );
+    }
+    #[tokio::test]
+    async fn changing_ollama_model_or_endpoint_does_not_reuse_another_approval() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/generate"))
+            .respond_with(|request: &wiremock::Request| {
+                let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+                let verdict = if body["model"] == "first-model" {
+                    "APPROVE"
+                } else {
+                    "MANUAL"
+                };
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({"response": verdict}))
+            })
+            .mount(&server)
+            .await;
+        let other_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/generate"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({"response":"MANUAL"})),
+            )
+            .expect(1)
+            .mount(&other_server)
+            .await;
+        let directory = tempfile::tempdir().unwrap();
+        let cache = Arc::new(
+            L4Cache::open_at(directory.path().join("verdicts.json"), DEFAULT_TTL_FOR_TEST).unwrap(),
+        );
+        for (model, endpoint, expected_approval) in [
+            ("first-model", server.uri(), true),
+            ("first-model", server.uri(), true),
+            ("second-model", server.uri(), false),
+            ("first-model", other_server.uri(), false),
+        ] {
+            let mut session = AdvisorSession {
+                adapter: Some(Box::new(OllamaAdapter {
+                    model: model.into(),
+                    url: format!("{endpoint}/api/generate"),
+                    timeout: std::time::Duration::from_secs(5),
+                })),
+                configured_slug: Some("ollama".into()),
+                approvals: HashSet::new(),
+                warned_about_unavailable: false,
+                cache: Some(Arc::clone(&cache)),
+                prompt_template_hash: "stable-template".into(),
+                model_version: "ollama binary 1.0".into(),
+            };
+            session
+                .classify_amber(&[AmberPackageRequest {
+                    name: "addon".into(),
+                    version: "1.0.0".into(),
+                    integrity: None,
+                    script_hash: "sha256-same-content".into(),
+                    repository: None,
+                    amber_phases: vec![("postinstall".into(), "node install.js".into())],
+                    referenced_scripts: vec![],
+                }])
+                .await;
+            assert_eq!(
+                !session.approvals().is_empty(),
+                expected_approval,
+                "model: {model}"
+            );
+        }
+        assert_eq!(server.received_requests().await.unwrap().len(), 2);
     }
 }

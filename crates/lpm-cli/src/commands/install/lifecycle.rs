@@ -276,8 +276,6 @@ pub(super) struct OnlineLifecyclePrepareInput<'a> {
     pub(super) script_policy_override: Option<crate::script_policy_config::ScriptPolicy>,
     pub(super) advisor_override: Option<&'a str>,
     pub(super) global_config: &'a crate::commands::config::GlobalConfig,
-    pub(super) publish_ages: &'a HashMap<(String, String), u64>,
-    pub(super) min_release_age_secs: u64,
     pub(super) auto_build: bool,
     pub(super) json_output: bool,
     pub(super) lpm_root: &'a lpm_common::LpmRoot,
@@ -313,8 +311,6 @@ pub(super) async fn run_online_lifecycle_prepare_phase(
         script_policy_override,
         advisor_override,
         global_config,
-        publish_ages,
-        min_release_age_secs,
         auto_build,
         json_output,
         lpm_root,
@@ -385,11 +381,7 @@ pub(super) async fn run_online_lifecycle_prepare_phase(
         )
         .await;
         if session.is_active() {
-            let amber_requests = collect_amber_requests_from_materializations(
-                &capture_packages,
-                publish_ages,
-                min_release_age_secs,
-            )?;
+            let amber_requests = collect_amber_requests_from_materializations(&capture_packages)?;
             session.classify_amber(&amber_requests).await;
         }
         Some(session)
@@ -851,40 +843,13 @@ pub(super) fn read_trusted_deps_from_manifest(
     serde_json::from_value::<lpm_workspace::TrustedDependencies>(raw.clone()).ok()
 }
 
-/// build the metadata map that
-/// enriches [`crate::build_state::BlockedPackage`] entries with
-/// `published_at` (RFC 3339) and `behavioral_tags_hash` (SHA-256 over
-/// the sorted set of active behavioral tags).
-///
-/// Fetches registry metadata via the existing client API which is
-/// backed by a 5-min TTL cache. On fresh resolutions the resolver
-/// already populated that cache, so this is a memory-local lookup.
-/// On offline installs or registry-unreachable installs, fetches
-/// return `Err`; we silently drop those packages from the map and
-/// the captured fields stay `None` — documented graceful
-/// degradation (see [`crate::build_state::BlockedSetMetadata`]).
-///
-/// Walk the install set, classify every
-/// lifecycle script through Layer 1, and emit one
-/// [`crate::triage_advisor_session::AmberPackageRequest`] per
-/// package that has at least one amber phase. Green-only packages
-/// auto-run via the existing GreenTierUnderTriage path and don't
-/// need an advisor call; red-only packages are hard-blocked
-/// regardless of the advisor; packages with no scripts have nothing
-/// to advise on.
-///
-/// Mirrors the worst-of reduction in
-/// [`crate::build_state::compute_blocked_packages_with_metadata`]
-/// and the rebuild trust evaluator so the advisor pass agrees with
-/// both downstream consumers on which packages are amber-eligible.
+/// Resolve installed source identities for advisor request tests.
 #[cfg(test)]
 pub(super) fn collect_amber_classification_requests(
     store: &lpm_store::PackageStore,
     lpm_root: &lpm_common::LpmRoot,
     baseline_index: Option<&lpm_store::V2BaselineIndex>,
     packages: &[(String, String, Option<String>)],
-    publish_ages: &HashMap<(String, String), u64>,
-    min_release_age_secs: u64,
 ) -> Vec<crate::triage_advisor_session::AmberPackageRequest> {
     let resolved: Vec<_> = packages
         .iter()
@@ -911,16 +876,13 @@ pub(super) fn collect_amber_classification_requests(
             })
         })
         .collect();
-    collect_amber_requests_from_materializations(&resolved, publish_ages, min_release_age_secs)
-        .unwrap()
+    collect_amber_requests_from_materializations(&resolved).unwrap()
 }
 
 pub(super) fn collect_amber_requests_from_materializations(
     packages: &[crate::build_state::BlockedCapturePackage],
-    publish_ages: &HashMap<(String, String), u64>,
-    min_release_age_secs: u64,
 ) -> Result<Vec<crate::triage_advisor_session::AmberPackageRequest>, LpmError> {
-    use lpm_security::static_gate::ManifestContext;
+    use lpm_security::static_gate::classify_for_execution;
     use lpm_security::triage::StaticTier;
     let mut out = Vec::with_capacity(packages.len());
     for package in packages {
@@ -937,34 +899,18 @@ pub(super) fn collect_amber_requests_from_materializations(
             continue;
         };
         let bodies = data.phase_bodies;
-        // Read the package's `repository` URL from the same store package.json.
-        // It feeds both the advisor prompt and the classifier widening that
-        // converts delegate-to-local-file + matching identity into Green.
-        //
-        // Feed the package's publish age + the configured
-        // `minimum_release_age_secs` into the classifier context so
-        // identity-match widening can apply
-        // the cooldown defense-in-depth (refuses to widen recent
-        // publishes even when `--allow-new` bypassed the
-        // install-level halt).
         let repository = crate::build_state::read_manifest_repository(pkg_dir);
-        let publish_age = publish_ages.get(&(name.clone(), version.clone())).copied();
-        let ctx = ManifestContext {
-            package_name: name.as_str(),
-            repository: repository.as_deref(),
-            bin_names: &[],
-            publish_age_secs: publish_age,
-            min_release_age_secs,
-        };
-        // Classify each phase independently; collect those that
-        // resolve to Amber/AmberLlm. The advisor needs the per-phase
-        // body to make a per-phase judgement; the session then
-        // worst-ofs across phases for the package-level outcome.
+        if bodies
+            .iter()
+            .any(|(_, body)| classify_for_execution(body) == StaticTier::Red)
+        {
+            continue;
+        }
         let amber_phases: Vec<(String, String)> = bodies
             .into_iter()
             .filter(|(_, body)| {
                 matches!(
-                    lpm_security::static_gate::classify_with_context(body, Some(&ctx)),
+                    classify_for_execution(body),
                     StaticTier::Amber | StaticTier::AmberLlm
                 )
             })
