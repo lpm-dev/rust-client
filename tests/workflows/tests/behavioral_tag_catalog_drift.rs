@@ -1,7 +1,6 @@
 //! Drift guard between the source-side `behavioral_tag_catalog()` in
-//! `lpm-security` and the two doc tables that publish those tags to
-//! end users (`security-audit.mdx` § "Layer 2" and `query.mdx` §
-//! "Behavioral tags" / "Dependency state").
+//! `lpm-security` and the query reference that publishes those tags.
+//! The security overview links readers to that complete reference.
 //!
 //! Source of truth: [`lpm_security::query::behavioral_tag_catalog`].
 //! Doc tables MUST mirror the catalog exactly — same tokens, same
@@ -207,12 +206,8 @@ fn assert_doc_covers_catalog(
     }
 }
 
-/// security-audit.mdx splits the catalog into three tables — Source
-/// (10), Supply chain (8), Manifest (5). Every catalog entry MUST
-/// appear in exactly one of those tables, and every row MUST be in
-/// the catalog.
 #[test]
-fn security_audit_mdx_mirrors_catalog() {
+fn security_audit_links_to_the_complete_tag_reference() {
     let dir = match locate_docs_dir() {
         Located::Found(d) => d,
         Located::Skipped(reason) => {
@@ -226,51 +221,20 @@ fn security_audit_mdx_mirrors_catalog() {
             path.display()
         ),
     };
-    let mdx_path = dir.join("packages").join("security-audit.mdx");
+    let overview_path = dir.join("packages").join("security-audit.mdx");
+    let overview = std::fs::read_to_string(&overview_path).unwrap();
+    assert!(
+        overview.contains("](/docs/packages/query)")
+            || overview.contains("](/docs/packages/query#behavioral-tags)"),
+        "security-audit.mdx must link readers to the complete query tag reference"
+    );
     let catalog = behavioral_tag_catalog();
     let all_tokens: HashSet<&str> = catalog.iter().map(|t| t.token).collect();
-    assert_doc_covers_catalog("security-audit.mdx", &mdx_path, &catalog, &all_tokens);
-
-    // Reverse direction: every `:tag` row in the doc must map to a
-    // catalog entry. Catches the case where the doc adds a tag the
-    // catalog hasn't grown yet.
-    let mdx = std::fs::read_to_string(&mdx_path).unwrap();
-    let rows = parse_tag_rows(&mdx);
-    let catalog_tokens: HashSet<&str> = all_tokens.clone();
-    let mut stray = Vec::new();
-    for token in rows.keys() {
-        // Tolerate state/severity tokens that legitimately appear in
-        // adjacent non-behavioral tables (e.g., `:scripts`, `:built`,
-        // `:critical`, `:lpm`). Only flag tokens shaped like behavioral
-        // tags but absent from the catalog.
-        if catalog_tokens.contains(token.as_str()) {
-            continue;
-        }
-        // Skip clearly-non-behavioral tokens.
-        const NON_BEHAVIORAL: &[&str] = &[
-            ":scripts",
-            ":built",
-            ":vulnerable",
-            ":deprecated",
-            ":lpm",
-            ":npm",
-            ":critical",
-            ":high",
-            ":medium",
-            ":info",
-            ":root",
-            ":workspace-root",
-        ];
-        if NON_BEHAVIORAL.contains(&token.as_str()) {
-            continue;
-        }
-        stray.push(token.clone());
-    }
-    assert!(
-        stray.is_empty(),
-        "security-audit.mdx has tag rows that aren't in the catalog: {stray:?}\n\
-         Either add them to lpm_security::query::PseudoClass + behavioral_tag_catalog() \
-         or remove them from the doc."
+    assert_doc_covers_catalog(
+        "query.mdx",
+        &dir.join("packages").join("query.mdx"),
+        &catalog,
+        &all_tokens,
     );
 }
 
@@ -299,12 +263,9 @@ fn query_mdx_mirrors_catalog() {
     let all_tokens: HashSet<&str> = catalog.iter().map(|t| t.token).collect();
     assert_doc_covers_catalog("query.mdx", &mdx_path, &catalog, &all_tokens);
 
-    // Reverse-direction stray-tag check (mirrors security-audit's).
+    // Reverse-direction stray-tag check.
     // Without it, an extra `:bogus-tag` row added to query.mdx would
     // pass CI as long as none of the real catalog rows go missing.
-    // query.mdx documents the same non-behavioral tokens as
-    // security-audit (state, severity, special), so the tolerance list
-    // matches.
     let mdx = std::fs::read_to_string(&mdx_path).unwrap();
     let rows = parse_tag_rows(&mdx);
     let mut stray = Vec::new();

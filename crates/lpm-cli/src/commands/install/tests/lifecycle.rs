@@ -71,8 +71,6 @@ fn amber_advisor_requests_read_scripts_from_default_v2_store() {
         &lpm_root,
         Some(&baseline_index),
         &[("scripted".into(), "1.0.0".into(), Some(sri))],
-        &std::collections::HashMap::new(),
-        0,
     );
 
     assert_eq!(requests.len(), 1);
@@ -107,8 +105,6 @@ fn amber_advisor_requests_use_source_identity_when_v2_coordinates_collide() {
             "1.0.0".into(),
             Some(requested_sri.clone()),
         )],
-        &std::collections::HashMap::new(),
-        0,
     );
     let [request] = requests.as_slice() else {
         panic!("the exact V2 package identity should produce one advisor request");

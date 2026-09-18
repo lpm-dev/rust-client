@@ -162,6 +162,10 @@ impl Advisor for OllamaAdapter {
         Provider::Ollama
     }
 
+    fn cache_identity(&self) -> String {
+        format!("{}:{}{}", self.url.len(), self.url, self.model)
+    }
+
     async fn detect(&self) -> bool {
         detection::detect(Provider::Ollama).await.is_available()
     }

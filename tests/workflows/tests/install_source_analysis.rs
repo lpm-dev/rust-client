@@ -516,3 +516,80 @@ async fn audit_and_query_expose_targeted_execution_and_deletion_findings() {
         }
     }
 }
+
+#[tokio::test]
+async fn install_summary_does_not_substitute_latest_for_missing_installed_metadata() {
+    assert_summary_uses_exact_metadata("2.0.0", "2.0.0", false).await;
+}
+
+#[tokio::test]
+async fn install_summary_rejects_mismatched_version_identity() {
+    assert_summary_uses_exact_metadata("1.0.0", "2.0.0", false).await;
+}
+
+#[tokio::test]
+async fn install_summary_keeps_findings_from_the_exact_installed_version() {
+    assert_summary_uses_exact_metadata("1.0.0", "1.0.0", true).await;
+}
+
+async fn assert_summary_uses_exact_metadata(key: &str, version: &str, expected_network: bool) {
+    use wiremock::matchers::{body_partial_json, method, path};
+    use wiremock::{Mock, ResponseTemplate};
+    let mock = MockRegistry::start().await;
+    let name = "@lpm.dev/test.summary-version";
+    let tarball = source_tarball(name);
+    let metadata = mock
+        .mount_full_package_metadata_routes(
+            name,
+            "1.0.0",
+            &[("1.0.0", serde_json::json!({}), Some(tarball))],
+        )
+        .await;
+    mock.with_batch_metadata(Vec::new()).await;
+    Mock::given(method("GET"))
+        .and(path(format!("/api/registry/{name}")))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(&metadata)
+                .append_header("cache-control", "no-store"),
+        )
+        .with_priority(1)
+        .mount(mock.server())
+        .await;
+    let mut latest = metadata["versions"]["1.0.0"].clone();
+    latest["version"] = serde_json::json!(version);
+    latest["_behavioralTags"] = serde_json::json!({"network": true});
+    let summary =
+        serde_json::json!({"name":name,"dist-tags":{"latest":"2.0.0"},"versions":{key:latest}});
+    Mock::given(method("POST"))
+        .and(path("/api/registry/batch-metadata"))
+        .and(body_partial_json(serde_json::json!({"deep":false})))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(serde_json::json!({"packages":{name: summary}}))
+                .append_header("cache-control", "no-store"),
+        )
+        .with_priority(1)
+        .expect(1..)
+        .mount(mock.server())
+        .await;
+    let project = TempProject::empty(
+        &serde_json::json!({"name":"consumer","version":"1.0.0","dependencies":{name:"1.0.0"}})
+            .to_string(),
+    );
+    write_config(
+        &project,
+        "install-time-source-analysis = false\nfetch-lpm-security-insights = true\n",
+    );
+    let output = lpm_with_registry_and_npm(&project, &mock.url())
+        .args(["--verbose", "install", "--no-skills", "--no-editor-setup"])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stderr}");
+    assert_eq!(
+        stderr.contains("network access"),
+        expected_network,
+        "only exact installed metadata can supply findings: {stderr}"
+    );
+}
