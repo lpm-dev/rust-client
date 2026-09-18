@@ -439,6 +439,16 @@ impl RegistryClient {
             .await
     }
 
+    /// Read an optional install report using available credentials without refreshing a session.
+    pub async fn get_quality_for_install(&self, name: &str) -> Result<QualityResponse, LpmError> {
+        let url = format!(
+            "{}/api/registry/quality?name={}",
+            self.base_url,
+            urlencoding::encode(name)
+        );
+        self.get_json(&url).await
+    }
+
     /// Get Agent Skills for a package.
     ///
     /// Posture: `AuthRequired` — private package skills and publisher-only

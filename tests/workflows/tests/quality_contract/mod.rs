@@ -201,3 +201,93 @@ async fn quality_unavailable_human_report_does_not_claim_readiness() {
     assert!(text.contains("No quality data available."), "{text}");
     assert!(!text.contains("Quality report ready"), "{text}");
 }
+
+#[tokio::test]
+async fn install_quality_ignores_unavailable_scores_but_keeps_real_zero() {
+    use support::mock_registry::make_tarball;
+    const PACKAGE: &str = "@lpm.dev/owner.widget";
+    for (report, warning) in [
+        (
+            serde_json::json!({"name": PACKAGE, "available": false, "score": 0}),
+            false,
+        ),
+        (serde_json::json!({"name": PACKAGE, "score": null}), false),
+        (serde_json::json!({"name": PACKAGE}), false),
+        (
+            serde_json::json!({"name": PACKAGE, "available": true, "score": 0}),
+            true,
+        ),
+    ] {
+        let project = TempProject::empty(r#"{"name":"quality-test","version":"1.0.0"}"#);
+        let mock = MockRegistry::start().await;
+        mock.with_package(PACKAGE, "1.0.0", &make_tarball(PACKAGE, "1.0.0"))
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/registry/quality"))
+            .and(header("authorization", "Bearer owner-token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(report.clone()))
+            .expect(1)
+            .mount(mock.server())
+            .await;
+        let output = lpm_with_registry(&project, &mock.url())
+            .args([
+                "install",
+                PACKAGE,
+                "--token",
+                "owner-token",
+                "--no-editor-setup",
+            ])
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        let text = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            text.contains("Quality score: 0/100"),
+            warning,
+            "report={report}; output={text}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn optional_install_quality_denials_do_not_refresh_or_change_credentials() {
+    use support::mock_registry::make_tarball;
+    const PACKAGE: &str = "@lpm.dev/owner.widget";
+    for status in [401, 403, 404] {
+        let project = TempProject::empty(r#"{"name":"quality-test","version":"1.0.0"}"#);
+        let mock = MockRegistry::start().await;
+        mock.with_package(PACKAGE, "1.0.0", &make_tarball(PACKAGE, "1.0.0"))
+            .await;
+        seed_sessions(
+            project.home(),
+            &[SessionSeed {
+                registry_url: &mock.url(),
+                access_token: Some("expired-access"),
+                refresh_token: Some("expired-refresh"),
+                session_access_expires_at: Some("2020-01-01T00:00:00Z"),
+            }],
+        );
+        let before = read_credentials(project.home());
+        Mock::given(method("GET"))
+            .and(path("/api/registry/quality"))
+            .respond_with(ResponseTemplate::new(status))
+            .expect(1)
+            .mount(mock.server())
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/cli/refresh"))
+            .respond_with(ResponseTemplate::new(401))
+            .expect(0)
+            .mount(mock.server())
+            .await;
+        lpm_with_registry(&project, &mock.url())
+            .args(["install", PACKAGE, "--no-editor-setup"])
+            .assert()
+            .success();
+        assert_eq!(read_credentials(project.home()), before);
+    }
+}
