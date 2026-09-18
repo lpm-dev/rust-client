@@ -384,7 +384,7 @@ fn build_graph(
                         sanitize_terminal_inline(&package.name), sanitize_terminal_inline(&package.version), sanitize_terminal_inline(local)
                     ))
                 })?;
-                children.extend(targets);
+                children.extend(targets.into_iter().map(|(_, index)| index));
             }
             children.sort_unstable();
             children.dedup();

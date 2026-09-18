@@ -1,0 +1,38 @@
+---
+source: tests/workflows/tests/store_contract/mod.rs
+assertion_line: 185
+expression: report
+---
+{
+  "success": true,
+  "check_kind": "lockfile_marker_consistency",
+  "legacy_check_kind": "lockfile_marker_consistency",
+  "bytes_integrity_recomputed": false,
+  "entries_verified": 2,
+  "verified": 2,
+  "unique_coords": 1,
+  "duplicated_entries": 1,
+  "corrupted": 0,
+  "issues": [],
+  "securityMismatches": 2,
+  "securityReanalyzed": 0,
+  "cas": {
+    "check_kind": "content_hash",
+    "sources": 0,
+    "trees": 0,
+    "blobs": 0,
+    "blobs_rehashed": 0,
+    "materialized": 0,
+    "orphaned_sources": 0,
+    "orphaned_trees": 0,
+    "orphaned_blobs": 0,
+    "orphaned_materialized": 0,
+    "blob_integrity_recomputed": false
+  },
+  "lockfile_comparison": {
+    "status": "partial",
+    "packages": 1,
+    "compared_packages": 0,
+    "uncompared_packages": 1
+  }
+}

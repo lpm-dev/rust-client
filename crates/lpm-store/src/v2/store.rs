@@ -1913,6 +1913,7 @@ impl Store {
                 &graph_key,
                 &object_dir,
                 &source_sri,
+                &deps,
                 verified_object_digest,
                 cas_tree_digest.as_deref(),
                 policy,
@@ -1938,6 +1939,7 @@ impl Store {
                 &graph_key,
                 &object_dir,
                 &source_sri,
+                &deps,
                 verified_object_digest,
                 cas_tree_digest.as_deref(),
                 policy,
@@ -2043,6 +2045,7 @@ impl Store {
                     &graph_key,
                     &object_dir,
                     &source_sri,
+                    &deps,
                     verified_object_digest,
                     cas_tree_digest.as_deref(),
                     policy,
@@ -3217,6 +3220,30 @@ fn create_sibling_symlink(
     dep: &DepLink,
     self_key: &GraphKey,
 ) -> Result<(), LpmError> {
+    let (link_path, target) = sibling_link_paths(node_modules, dep, self_key)?;
+    if dep.local == self_key.name() {
+        let mut nested = node_modules.join(self_key.name());
+        nested.push(LINK_NODE_MODULES);
+        ensure_real_dir_or_create(&nested, "same-name dependency node_modules")?;
+        ensure_sibling_parent_dir(&nested, &link_path, "same-name sibling")?;
+    } else {
+        ensure_sibling_parent_dir(node_modules, &link_path, "sibling")?;
+    }
+    create_dir_symlink(&target, &link_path).map_err(|e| {
+        LpmError::Store(format!(
+            "failed to create virtual-store sibling symlink {} → {} (self={}): {e}",
+            link_path.display(),
+            target.display(),
+            self_key.dir_name()
+        ))
+    })
+}
+
+fn sibling_link_paths(
+    node_modules: &Path,
+    dep: &DepLink,
+    self_key: &GraphKey,
+) -> Result<(PathBuf, PathBuf), LpmError> {
     if let Err(why) = validate_name_for_path_join(&dep.local) {
         return Err(LpmError::Store(format!(
             "unsafe dependency local name {:?} in virtual-store link entry for {}: {why}",
@@ -3226,18 +3253,15 @@ fn create_sibling_symlink(
     }
 
     let (link_path, ascents) = if dep.local == self_key.name() {
-        let package_dir = node_modules.join(self_key.name());
-        let nested_node_modules = package_dir.join(LINK_NODE_MODULES);
-        ensure_real_dir_or_create(&nested_node_modules, "same-name dependency node_modules")?;
-        let link_path = nested_node_modules.join(&dep.local);
-        ensure_sibling_parent_dir(&nested_node_modules, &link_path, "same-name sibling")?;
+        let mut link_path = node_modules.join(self_key.name());
+        link_path.push(LINK_NODE_MODULES);
+        link_path.push(&dep.local);
         (
             link_path,
             depth_of_local(self_key.name()) + depth_of_local(&dep.local) + 4,
         )
     } else {
         let link_path = node_modules.join(&dep.local);
-        ensure_sibling_parent_dir(node_modules, &link_path, "sibling")?;
         (link_path, depth_of_local(&dep.local) + 2)
     };
 
@@ -3249,14 +3273,7 @@ fn create_sibling_symlink(
     target.push(LINK_NODE_MODULES);
     target.push(dep.target.name());
 
-    create_dir_symlink(&target, &link_path).map_err(|e| {
-        LpmError::Store(format!(
-            "failed to create virtual-store sibling symlink {} → {} (self={}): {e}",
-            link_path.display(),
-            target.display(),
-            self_key.dir_name()
-        ))
-    })
+    Ok((link_path, target))
 }
 
 fn ensure_sibling_parent_dir(base: &Path, link_path: &Path, label: &str) -> Result<(), LpmError> {
@@ -3358,11 +3375,13 @@ fn is_complete_link_entry(dir: &Path, key: &GraphKey) -> bool {
     path.is_file()
 }
 
+#[allow(clippy::too_many_arguments)]
 fn link_entry_is_reusable(
     dir: &Path,
     key: &GraphKey,
     object_dir: &Path,
     source_sri: &str,
+    deps: &[DepLink],
     verified_object_digest: Option<&VerifiedObjectIntegrity>,
     tree_digest: Option<&str>,
     policy: ObjectIntegrityPolicy,
@@ -3374,6 +3393,7 @@ fn link_entry_is_reusable(
     if sidecar.graph_key_digest_hex != key.digest_hex()
         || sidecar.source_sri != source_sri
         || sidecar.tree_digest.as_deref() != tree_digest
+        || !dependency_links_match(dir, key, deps, &sidecar.deps)?
     {
         return Ok(false);
     }
@@ -3418,6 +3438,181 @@ fn link_entry_is_reusable(
         return Ok(true);
     }
     Ok(false)
+}
+
+fn dependency_links_match(
+    dir: &Path,
+    key: &GraphKey,
+    deps: &[DepLink],
+    recorded: &[LinkMetaDep],
+) -> Result<bool, LpmError> {
+    if deps.len() != recorded.len() {
+        return Ok(false);
+    }
+    let by_local: std::collections::HashMap<_, _> = recorded
+        .iter()
+        .map(|dep| (dep.local.as_str(), dep))
+        .collect();
+    if by_local.len() != deps.len() {
+        return Ok(false);
+    }
+    let node_modules = dir.join(LINK_NODE_MODULES);
+    let mut expected_slots = std::collections::HashSet::with_capacity(deps.len() + 1);
+    expected_slots.insert(key.name());
+    expected_slots.extend(deps.iter().map(|dep| dep.local.as_str()));
+    if !is_real_link_directory(dir)?
+        || !wrapper_slots_match(&node_modules, key.name(), &expected_slots)?
+    {
+        return Ok(false);
+    }
+    for dep in deps {
+        let Some(recorded) = by_local.get(dep.local.as_str()) else {
+            return Ok(false);
+        };
+        if recorded.target_graph_key != dep.target.digest_hex()
+            || recorded.target_name != dep.target.name()
+            || recorded.target_version != dep.target.version()
+        {
+            return Ok(false);
+        }
+        let (link, expected) = sibling_link_paths(&node_modules, dep, key)?;
+        if dep.local == key.name() {
+            let mut nested = node_modules.join(key.name());
+            nested.push(LINK_NODE_MODULES);
+            if !is_real_link_directory(&nested)? {
+                return Ok(false);
+            }
+            if let Some((scope, _)) = dep.local.split_once('/') {
+                nested.push(scope);
+                if !is_real_link_directory(&nested)? {
+                    return Ok(false);
+                }
+            }
+        }
+        match std::fs::symlink_metadata(&link) {
+            Ok(meta) if lpm_common::is_symlink_or_junction(&meta) => {}
+            Ok(_) => return Ok(false),
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+                ) =>
+            {
+                return Ok(false);
+            }
+            Err(error) => {
+                return Err(LpmError::Store(format!(
+                    "failed to inspect dependency link {}: {error}",
+                    link.display()
+                )));
+            }
+        }
+        let actual = std::fs::read_link(&link).map_err(|error| {
+            LpmError::Store(format!(
+                "failed to read dependency link {}: {error}",
+                link.display()
+            ))
+        })?;
+        if actual != expected {
+            #[cfg(windows)]
+            if actual.is_absolute() {
+                let parent = link
+                    .parent()
+                    .ok_or_else(|| LpmError::Store("dependency link has no parent".into()))?;
+                if normalized_link_target(&actual)?
+                    == normalized_link_target(&parent.join(&expected))?
+                {
+                    continue;
+                }
+            }
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+fn is_real_link_directory(path: &Path) -> Result<bool, LpmError> {
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) => Ok(meta.is_dir() && !lpm_common::is_symlink_or_junction(&meta)),
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+            ) =>
+        {
+            Ok(false)
+        }
+        Err(error) => Err(LpmError::Store(format!(
+            "failed to inspect link directory {}: {error}",
+            path.display()
+        ))),
+    }
+}
+
+fn wrapper_slots_match(
+    node_modules: &Path,
+    own_name: &str,
+    expected: &std::collections::HashSet<&str>,
+) -> Result<bool, LpmError> {
+    if !is_real_link_directory(node_modules)? {
+        return Ok(false);
+    }
+    let mut found = 0;
+    for entry in std::fs::read_dir(node_modules)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            return Ok(false);
+        };
+        if name.starts_with('@') {
+            if !is_real_link_directory(&entry.path())? {
+                return Ok(false);
+            }
+            let mut scoped_count = 0;
+            for child in std::fs::read_dir(entry.path())? {
+                let child = child?;
+                let child_name = child.file_name();
+                let Some(child_name) = child_name.to_str() else {
+                    return Ok(false);
+                };
+                let local = format!("{name}/{child_name}");
+                if !expected.contains(local.as_str())
+                    || (local == own_name && !is_real_link_directory(&child.path())?)
+                {
+                    return Ok(false);
+                }
+                scoped_count += 1;
+            }
+            if scoped_count == 0 {
+                return Ok(false);
+            }
+            found += scoped_count;
+        } else {
+            if !expected.contains(name)
+                || (name == own_name && !is_real_link_directory(&entry.path())?)
+            {
+                return Ok(false);
+            }
+            found += 1;
+        }
+    }
+    Ok(found == expected.len())
+}
+
+#[cfg(windows)]
+fn normalized_link_target(path: &Path) -> Result<PathBuf, LpmError> {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                normalized.pop();
+            }
+            other => normalized.push(other.as_os_str()),
+        }
+    }
+    lpm_common::paths::absolute_extended_path(&normalized)
+        .map_err(|error| LpmError::Store(error.to_string()))
 }
 
 fn link_entry_package_dir(dir: &Path, key: &GraphKey) -> PathBuf {

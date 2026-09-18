@@ -5251,3 +5251,83 @@ fn tree_hash_ignores_in_flight_atomic_sidecar_rewrites() {
         "an in-flight atomic sidecar rewrite must not perturb the tree hash (baseline {baseline})",
     );
 }
+
+#[test]
+fn reuse_restores_removed_nested_dependency_directory() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::at(dir.path());
+    let request = same_name_dependency_request(&store, "removed-nested-dependency");
+    let first = populate_link_entry_source(&store, request.clone()).unwrap();
+    let nested = first
+        .link_dir
+        .join("node_modules/self-dependent/node_modules");
+    std::fs::remove_dir_all(&nested).unwrap();
+
+    let second = populate_link_entry_source(&store, request).unwrap();
+    assert!(second.freshly_populated);
+    assert!(nested.join("self-dependent/package.json").is_file());
+}
+
+#[test]
+fn reuse_repairs_retargeted_sibling_links_and_dependency_metadata() {
+    for damage in ["retarget", "metadata"] {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::at(dir.path());
+        let mut request = same_name_dependency_request(&store, damage);
+        request.deps[0].local = "@scope/alias".into();
+        let first = populate_link_entry_source(&store, request.clone()).unwrap();
+        let sibling = first.link_dir.join("node_modules/@scope/alias");
+        let expected = sibling.canonicalize().unwrap();
+        if damage == "retarget" {
+            lpm_common::symlink::remove_symlink_or_junction_entry(&sibling).unwrap();
+            let wrong = first.link_dir.join("node_modules/self-dependent");
+            create_dir_symlink(&wrong, &sibling).unwrap();
+        } else {
+            let mut sidecar = LinkMeta::read_from(&first.link_dir).unwrap();
+            sidecar.deps.clear();
+            sidecar.write_to(&first.link_dir).unwrap();
+        }
+
+        let second = populate_link_entry_source(&store, request).unwrap();
+        assert!(second.freshly_populated, "{damage}");
+        assert_eq!(sibling.canonicalize().unwrap(), expected);
+        assert_eq!(LinkMeta::read_from(&second.link_dir).unwrap().deps.len(), 1);
+    }
+}
+
+#[test]
+fn reuse_replaces_generated_dependency_parent_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::at(dir.path());
+    let mut request = same_name_dependency_request(&store, "dependency-parent-file");
+    request.graph_key = arc_key("@scope/self-dependent", "2.0.0");
+    request.deps[0].local = "@scope/self-dependent".into();
+    let first = populate_link_entry_source(&store, request.clone()).unwrap();
+    let nested = first
+        .link_dir
+        .join("node_modules/@scope/self-dependent/node_modules");
+    std::fs::remove_dir_all(&nested).unwrap();
+    std::fs::write(&nested, b"not a directory").unwrap();
+
+    let second = populate_link_entry_source(&store, request).unwrap();
+    assert!(second.freshly_populated);
+    assert!(nested.join("@scope/self-dependent/package.json").is_file());
+}
+
+#[test]
+fn reuse_removes_unrecorded_package_slots() {
+    for local in ["evil", "@extra/evil"] {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::at(dir.path());
+        let mut request = same_name_dependency_request(&store, "unrecorded-package-slot");
+        request.deps.clear();
+        let first = populate_link_entry_source(&store, request.clone()).unwrap();
+        let extra = first.link_dir.join("node_modules").join(local);
+        std::fs::create_dir_all(&extra).unwrap();
+        std::fs::write(extra.join("package.json"), b"{}").unwrap();
+
+        let second = populate_link_entry_source(&store, request).unwrap();
+        assert!(second.freshly_populated, "{local}");
+        assert!(!extra.exists());
+    }
+}

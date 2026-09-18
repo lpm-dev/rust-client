@@ -8,9 +8,7 @@ use lpm_common::{LpmError, PackageInstanceId};
 use lpm_store::v2::{GraphKey, LinkerModeTag, PlatformTuple};
 
 use super::V2Target;
-use crate::LinkDependency;
-#[cfg(test)]
-use crate::LinkTarget;
+use crate::{LinkDependency, LinkTarget};
 
 /// Per-install lookup table from exact package-instance identity to the
 /// derived `GraphKey`.
@@ -60,7 +58,7 @@ impl GraphKeyCacheInput {
             && cached_link_target.aliases == link_target.aliases
             && cached_link_target.peers == link_target.peers
             && cached_target.peer_targets == target.peer_targets
-            && cached_link_target.root_link_names == link_target.root_link_names
+            && root_link_identity(cached_link_target) == root_link_identity(link_target)
             && cached_link_target.wrapper_id == link_target.wrapper_id
             && cached_link_target.patch_fingerprint == link_target.patch_fingerprint
     }
@@ -138,6 +136,16 @@ fn fingerprint_optional(fingerprint: &mut u64, value: Option<&str>) {
     }
 }
 
+// Implicit transitive roots are absent in V2/V3. Cold source resolution can
+// explicitly suppress them, while lockfile replay leaves them implicit. Keep that legacy
+// linker distinction out of the virtual-store identity and its cache inputs.
+fn root_link_identity(target: &LinkTarget) -> Option<&[String]> {
+    match target.root_link_names.as_deref() {
+        Some([]) if !target.is_direct => None,
+        names => names,
+    }
+}
+
 fn graph_key_input_fingerprint(
     target: &V2Target,
     platform: &PlatformTuple,
@@ -191,7 +199,7 @@ fn graph_key_input_fingerprint(
             fingerprint_bytes(&mut fingerprint, instance_id.as_bytes());
         }
     }
-    match link_target.root_link_names.as_deref() {
+    match root_link_identity(link_target) {
         None => fingerprint_bytes(&mut fingerprint, b"none"),
         Some(names) => {
             fingerprint_bytes(&mut fingerprint, b"some");
@@ -229,7 +237,7 @@ fn derive_graph_key(
         &link_target.aliases,
         &link_target.peers,
         &target.peer_targets,
-        link_target.root_link_names.as_deref(),
+        root_link_identity(link_target),
         link_target.wrapper_id.as_deref(),
         link_target.patch_fingerprint.as_deref(),
     ))
@@ -415,6 +423,43 @@ mod tests {
             verified_object_integrity: None,
             fresh_object: None,
         }
+    }
+
+    #[test]
+    fn graph_key_cache_normalizes_empty_transitive_root_names() {
+        let cache = GraphKeyCache::default();
+        let platform = PlatformTuple::new("darwin", "arm64", None);
+        let explicit = target();
+        let mut implicit = explicit.clone();
+        Arc::make_mut(&mut implicit.target).root_link_names = None;
+        for mode in [LinkerModeTag::Isolated, LinkerModeTag::Hoisted] {
+            let keys = cache.derive_many(
+                &[Arc::new(explicit.clone()), Arc::new(implicit.clone())],
+                &platform,
+                mode,
+            );
+            assert!(Arc::ptr_eq(&keys[0], &keys[1]));
+        }
+        assert_eq!(cache.len(), 2);
+    }
+
+    #[test]
+    fn graph_key_cache_preserves_direct_empty_and_alias_root_names() {
+        let cache = GraphKeyCache::default();
+        let platform = PlatformTuple::new("darwin", "arm64", None);
+        let transitive = target();
+        let mut direct = transitive.clone();
+        Arc::make_mut(&mut direct.target).is_direct = true;
+        let mut alias = direct.clone();
+        Arc::make_mut(&mut alias.target).root_link_names = Some(vec!["alias".into()]);
+        let keys = cache.derive_many(
+            &[Arc::new(transitive), Arc::new(direct), Arc::new(alias)],
+            &platform,
+            LinkerModeTag::Isolated,
+        );
+        assert_eq!(cache.len(), 3);
+        assert_ne!(keys[0], keys[1]);
+        assert_ne!(keys[1], keys[2]);
     }
 
     #[test]
