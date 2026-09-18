@@ -609,3 +609,61 @@ async fn audit_fix_rolls_back_when_verification_metadata_changes_version_identit
     assert_eq!(project.read_file("package.json"), manifest);
     assert_eq!(project.read_file("lpm.lock"), lockfile);
 }
+
+#[tokio::test]
+async fn audit_rejects_missing_installed_manifests() {
+    assert_invalid_installed_manifest(None).await;
+}
+
+#[tokio::test]
+async fn audit_rejects_malformed_installed_manifests() {
+    assert_invalid_installed_manifest(Some("{")).await;
+}
+
+#[tokio::test]
+async fn audit_rejects_non_object_installed_manifests() {
+    for content in ["null", "[]"] {
+        assert_invalid_installed_manifest(Some(content)).await;
+    }
+}
+
+async fn assert_invalid_installed_manifest(manifest: Option<&str>) {
+    let project = TempProject::empty(
+        r#"{"name":"host","version":"1.0.0","dependencies":{"sample":"1.0.0"}}"#,
+    );
+    project.write_file("package-lock.json", r#"{"name":"host","lockfileVersion":3,"packages":{"":{"dependencies":{"sample":"1.0.0"}},"node_modules/sample":{"version":"1.0.0","resolved":"https://registry.npmjs.org/sample/-/sample-1.0.0.tgz"}}}"#);
+    project.write_file("node_modules/sample/index.js", "module.exports = 42;");
+    if let Some(content) = manifest {
+        project.write_file("node_modules/sample/package.json", content);
+    }
+    let mock = MockRegistry::start().await;
+    mock.with_osv_querybatch(vec![vec![]]).await;
+    let output = run_audit_json(&project, &mock, &["--fail-on=all"]);
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(output.status.code(), Some(1), "{manifest:?}: {report}");
+    assert_eq!(report["behavioral_coverage"]["complete"], false);
+    assert_eq!(report["behavioral_coverage"]["partial_packages"], 1);
+}
+
+#[test]
+fn query_manifest_tags_accept_installed_bom_manifests() {
+    let project = TempProject::empty(
+        r#"{"name":"host","version":"1.0.0","dependencies":{"sample":"1.0.0"}}"#,
+    );
+    project.write_file(
+        "node_modules/sample/package.json",
+        "\u{feff}{\"name\":\"sample\",\"version\":\"1.0.0\",\"license\":\"GPL-3.0-only\"}",
+    );
+    project.write_file("node_modules/sample/index.js", "module.exports = 42;");
+    let output = lpm(&project)
+        .args(["query", ":copyleft", "--json"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report.as_array().unwrap().len(), 1, "{report}");
+}

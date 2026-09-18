@@ -35,7 +35,7 @@ use supply_chain::SupplyChainTags;
 /// Current schema version for `.lpm-security.json`.
 /// Bump this when adding new tags or changing tag semantics — cached
 /// files with older versions will be automatically re-analyzed.
-pub const SCHEMA_VERSION: u32 = 10;
+pub const SCHEMA_VERSION: u32 = 11;
 
 /// Maximum file size for a full scan. Larger source files receive bounded samples.
 const MAX_FILE_SIZE: u64 = 4 * 1024 * 1024;
@@ -171,6 +171,8 @@ pub fn analyze_package_with_timings(
 
     // Manifest tags (5) — read package.json
     let manifest_tags = analyze_package_manifest(package_dir);
+    meta.input_incomplete |= manifest_tags.is_none();
+    let manifest_tags = manifest_tags.unwrap_or_default();
 
     // Build timestamp
     let analyzed_at = chrono::Utc::now().to_rfc3339();
@@ -244,17 +246,12 @@ pub fn analyze_package_from_open_dir_with_fingerprint(
             }
             analyze_package_manifest_bytes(&content)
         }
-        Ok(None) => {
-            if let Some(hasher) = fingerprint.as_mut() {
-                hasher.update(b"package.json\0missing\0");
-            }
-            ManifestTags::default()
-        }
-        Err(_) => {
-            fingerprint = None;
-            ManifestTags::default()
-        }
+        Ok(None) | Err(_) => None,
     };
+    if manifest_tags.is_none() {
+        fingerprint = None;
+    }
+    let manifest_tags = manifest_tags.unwrap_or_default();
     meta.input_incomplete = fingerprint.is_none();
     let analysis = PackageAnalysis {
         version: SCHEMA_VERSION,
@@ -1263,30 +1260,22 @@ fn collect_source_files_recursive(dir: &Path, files: &mut Vec<std::path::PathBuf
 }
 
 /// Analyze package.json for manifest tags.
-fn analyze_package_manifest(package_dir: &Path) -> ManifestTags {
+fn analyze_package_manifest(package_dir: &Path) -> Option<ManifestTags> {
     let pkg_json_path = package_dir.join("package.json");
-    let content = match lpm_common::read_text_file_capped(
-        &pkg_json_path,
-        lpm_common::CONFIG_FILE_SIZE_CAP_BYTES,
-    ) {
-        Ok(c) => c,
-        Err(_) => return ManifestTags::default(),
-    };
-
+    let content =
+        lpm_common::read_text_file_capped(&pkg_json_path, lpm_common::CONFIG_FILE_SIZE_CAP_BYTES)
+            .ok()?;
     analyze_package_manifest_content(&content)
 }
 
-fn analyze_package_manifest_bytes(content: &[u8]) -> ManifestTags {
-    std::str::from_utf8(content)
-        .map(analyze_package_manifest_content)
-        .unwrap_or_default()
+fn analyze_package_manifest_bytes(content: &[u8]) -> Option<ManifestTags> {
+    analyze_package_manifest_content(std::str::from_utf8(content).ok()?)
 }
 
-fn analyze_package_manifest_content(content: &str) -> ManifestTags {
-    let parsed: serde_json::Value = match serde_json::from_str(content) {
-        Ok(v) => v,
-        Err(_) => return ManifestTags::default(),
-    };
+fn analyze_package_manifest_content(content: &str) -> Option<ManifestTags> {
+    let parsed: serde_json::Value =
+        serde_json::from_str(content.trim_start_matches('\u{feff}')).ok()?;
+    parsed.as_object()?;
 
     let license = parsed.get("license").and_then(|v| v.as_str());
     let private_package = parsed
@@ -1301,13 +1290,13 @@ fn analyze_package_manifest_content(content: &str) -> ManifestTags {
     let dev_dependencies = parse_deps_map(parsed.get("devDependencies"));
     let optional_dependencies = parse_deps_map(parsed.get("optionalDependencies"));
 
-    manifest::analyze_manifest_with_privacy(
+    Some(manifest::analyze_manifest_with_privacy(
         license,
         private_package,
         dependencies.as_ref(),
         dev_dependencies.as_ref(),
         optional_dependencies.as_ref(),
-    )
+    ))
 }
 
 /// Parse a JSON value into a HashMap<String, String> for dependency maps.
@@ -1541,18 +1530,19 @@ impl PackageAnalyzer {
         self.url_domains.sort_unstable();
         self.url_domains.dedup();
 
+        let manifest_tags = analyze_package_manifest(package_dir);
         let meta = AnalysisMeta {
             evidence: self.evidence,
             files_scanned: self.files_scanned,
             unparsed_files: self.unparsed_files,
-            input_incomplete: false,
+            input_incomplete: manifest_tags.is_none(),
             bytes_scanned: self.bytes_scanned,
             limit_reached: self.limit_reached,
             url_domains: self.url_domains,
             oversized_source_files: self.oversized_source_files,
         };
 
-        let manifest_tags = analyze_package_manifest(package_dir);
+        let manifest_tags = manifest_tags.unwrap_or_default();
         let analyzed_at = chrono::Utc::now().to_rfc3339();
 
         PackageAnalysis {
