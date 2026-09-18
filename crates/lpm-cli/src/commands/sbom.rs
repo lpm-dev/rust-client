@@ -1,23 +1,25 @@
+use crate::commands::manifest_metadata::graph::{
+    PackageIndexes, PackageScope as ComponentScope, package_scopes_by_lockfile_index,
+    selected_roots,
+};
 use crate::commands::manifest_metadata::{
-    ManifestMetadata, extract_manifest_metadata, package_metadata_key,
-    read_installed_manifest_metadata, read_json_file,
+    ManifestMetadata, extract_manifest_metadata, license_expression_from_list,
+    package_artifact_key, read_installed_manifest_metadata, read_json_file,
 };
-use crate::commands::registry_reads::{
-    RoutedPackageRef, RoutedReadContext, fetch_routed_package_metadata, prepare_routed_read_context,
-};
+use crate::commands::registry_reads::prepare_locked_read_context;
 use crate::install_ui;
 use crate::provenance_fetch;
 use clap::ValueEnum;
 use futures::stream::{self, StreamExt as _};
 use lpm_common::provenance::{ProvenanceSnapshot, ProvenanceStatus};
-use lpm_common::{LpmError, LpmRoot, PackageInstanceId};
+use lpm_common::{LpmError, LpmRoot};
 use lpm_lockfile::{LockedPackage, Lockfile};
-use lpm_registry::{RegistryClient, UpstreamRoute};
+use lpm_registry::RegistryClient;
 use serde::ser::{SerializeMap as _, SerializeSeq as _};
 use serde::{Serialize, Serializer};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ffi::OsString;
 use std::io::BufWriter;
 use std::path::{Component, Path, PathBuf};
@@ -60,23 +62,6 @@ struct SbomComponent {
     provenance: Option<ProvenanceMetadata>,
 }
 
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
-enum ComponentScope {
-    Excluded,
-    Optional,
-    Required,
-}
-
-impl ComponentScope {
-    const fn as_str(self) -> &'static str {
-        match self {
-            Self::Excluded => "excluded",
-            Self::Optional => "optional",
-            Self::Required => "required",
-        }
-    }
-}
-
 #[derive(Debug)]
 struct SbomDocument {
     root_name: String,
@@ -101,16 +86,24 @@ pub async fn run(
         install_ui::yellow(sbom_format_title(format)),
     ));
 
-    let lockfile = Lockfile::read_for_project(project_dir)
-        .map_err(|e| {
-            LpmError::NotFound(format!(
-                "no usable lpm.lock found. Run `lpm install` before generating an SBOM: {e}"
-            ))
-        })?
-        .lockfile;
-    let package_json_path = project_dir.join("package.json");
-    let root_json = read_json_file(&package_json_path)?;
-    let document = build_document(client, project_dir, root_json, lockfile, registry).await?;
+    let selected = Lockfile::read_for_project(project_dir).map_err(|e| {
+        LpmError::NotFound(format!(
+            "no usable lpm.lock found. Run `lpm install` before generating an SBOM: {e}"
+        ))
+    })?;
+    let mut selected_dir = selected.path.parent().unwrap_or(project_dir).to_path_buf();
+    if selected.importer != "." {
+        selected_dir.push(&selected.importer);
+    }
+    let root_json = read_json_file(&selected_dir.join("package.json"))?;
+    let document = build_document(
+        client,
+        &selected_dir,
+        root_json,
+        selected.lockfile,
+        registry,
+    )
+    .await?;
     print_sbom_summary(project_dir, &document, format, output);
     emit_sbom(project_dir, &document, format, output)?;
 
@@ -216,7 +209,7 @@ async fn build_document(
     let patch_metadata = read_patch_metadata(&lockfile);
     let generated_at = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
 
-    let local_metadata = read_installed_manifest_metadata(project_dir, &lockfile.packages)?;
+    let local_metadata = read_installed_manifest_metadata(project_dir, &lockfile, &root_json)?;
     lockfile
         .packages
         .retain(|package| !local_metadata.is_platform_skipped(package));
@@ -232,35 +225,23 @@ async fn build_document(
         registry,
     )
     .await?;
-    let component_scopes = component_scopes(
+    let component_scopes = package_scopes_by_lockfile_index(&root_json, &lockfile);
+    let root_dependency_refs = selected_roots(
         &root_json,
-        &lockfile.packages,
-        &lockfile.root_resolutions,
-        &lockfile.root_aliases,
-    );
+        &lockfile,
+        &PackageIndexes::new(&lockfile.packages),
+    )
+    .into_iter()
+    .map(|(_, index, _)| bom_ref_for_package(&lockfile.packages[index]))
+    .collect::<BTreeSet<_>>()
+    .into_iter()
+    .collect();
 
-    let mut source_index: BTreeMap<(String, String), Vec<String>> = BTreeMap::new();
-    for package in &lockfile.packages {
-        let bom_ref = bom_ref_for_package(package);
-        source_index
-            .entry((package.name.clone(), package.version.clone()))
-            .or_default()
-            .push(bom_ref);
-    }
-    for refs in source_index.values_mut() {
-        refs.sort();
-    }
-
+    let dependencies = dependency_graph(&lockfile);
     let mut components = Vec::with_capacity(lockfile.packages.len());
-    let mut component_refs = BTreeSet::new();
-    let mut refs_by_instance = HashMap::with_capacity(lockfile.packages.len());
     for (index, package) in lockfile.packages.into_iter().enumerate() {
-        let key = package_metadata_key(&package);
+        let key = package_artifact_key(&package);
         let bom_ref = bom_ref_for_package(&package);
-        component_refs.insert(bom_ref.clone());
-        if let Some(instance_id) = package.instance_id {
-            refs_by_instance.insert(instance_id, bom_ref.clone());
-        }
         let mut metadata = ManifestMetadata::default();
         if let Some(local) = local_metadata.get(&package) {
             metadata.merge_missing(local.clone());
@@ -278,25 +259,12 @@ async fn build_document(
             provenance: provenance_metadata.get(&key).cloned(),
             package,
             bom_ref,
-            scope: component_scopes[index],
+            scope: component_scopes[index].unwrap_or(ComponentScope::Required),
             metadata,
             patch,
         });
     }
     components.sort_by(|left, right| left.bom_ref.cmp(&right.bom_ref));
-
-    let root_dependency_refs = root_dependency_refs(
-        &root_json,
-        &lockfile.root_resolutions,
-        &source_index,
-        &refs_by_instance,
-    );
-    let dependencies = dependency_graph(
-        &components,
-        &source_index,
-        &component_refs,
-        &refs_by_instance,
-    );
 
     Ok(SbomDocument {
         root_name,
@@ -314,24 +282,6 @@ struct RegistryComponentMetadata {
     manifest: ManifestMetadata,
     attestation_ref: Option<lpm_registry::AttestationRef>,
     registry_url: String,
-}
-
-fn attestation_registry_url(
-    context: &RoutedReadContext,
-    package_name: &str,
-    routed_package: &RoutedPackageRef,
-) -> String {
-    match routed_package {
-        RoutedPackageRef::Lpm(_) => context.client.base_url().to_string(),
-        RoutedPackageRef::Registry(_) => {
-            match context.route_table.route_for_package(package_name) {
-                UpstreamRoute::Custom { target, .. } => target.base_url.as_ref().to_string(),
-                UpstreamRoute::LpmWorker | UpstreamRoute::NpmDirect => {
-                    context.client.npm_registry_url().to_string()
-                }
-            }
-        }
-    }
 }
 
 fn locked_registry_source(package: &LockedPackage) -> Option<String> {
@@ -356,42 +306,89 @@ async fn fetch_registry_metadata(
         .iter()
         .filter(|package| locked_registry_source(package).is_some())
         .collect::<Vec<_>>();
-    let names = registry_packages
+    let destinations: BTreeSet<_> = registry_packages
         .iter()
-        .map(|package| package.name.clone())
-        .collect::<BTreeSet<_>>();
-    let route_names = names.iter().cloned().collect::<Vec<_>>();
-    let context = prepare_routed_read_context(client, project_dir, &route_names, true)?;
-    let mut by_key = BTreeMap::new();
-
-    let fetched_results = stream::iter(names.into_iter().map(|name| {
-        let context = &context;
+        .filter_map(|package| {
+            let url = if package.name.starts_with("@lpm.dev/") {
+                client.base_url().to_string()
+            } else {
+                locked_registry_source(package)?
+            };
+            Some((url, package.name.clone()))
+        })
+        .collect();
+    let origins: Vec<_> = destinations
+        .iter()
+        .filter_map(|(url, _)| lpm_registry::npmrc::OriginKey::from_request_url(url))
+        .collect();
+    let context = prepare_locked_read_context(client, project_dir, &origins)?;
+    let mut required_versions_by_name: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
+    for package in &registry_packages {
+        if package.name.starts_with("@lpm.dev/") {
+            required_versions_by_name
+                .entry(&package.name)
+                .or_default()
+                .push(&package.version);
+        }
+    }
+    let fetched_results = stream::iter(destinations.into_iter().map(|(url, name)| {
+        let client = &context.client;
+        let route_table = &context.route_table;
+        let required_versions = required_versions_by_name
+            .get(name.as_str())
+            .map(Vec::as_slice)
+            .unwrap_or_default();
         async move {
-            let result = fetch_routed_package_metadata(context, &name).await;
-            (name, result)
+            let result = if name.starts_with("@lpm.dev/") {
+                match lpm_common::PackageName::parse(&name) {
+                    Ok(package) => {
+                        client
+                            .get_package_manifest_metadata(&package, required_versions)
+                            .await
+                    }
+                    Err(error) => Err(error),
+                }
+            } else {
+                let destination = format!("{}/{name}", url.trim_end_matches('/'));
+                client
+                    .get_manifest_metadata_from(&url, &name, route_table.auth_for_url(&destination))
+                    .await
+            };
+            (url, name, result)
         }
     }))
     .buffer_unordered(REGISTRY_ENRICHMENT_CONCURRENCY)
     .collect::<Vec<_>>()
     .await;
     let mut fetched = BTreeMap::new();
-    for (name, result) in fetched_results {
+    for (url, name, result) in fetched_results {
         let metadata = result.map_err(|error| {
             LpmError::Registry(format!(
                 "failed to fetch registry metadata for {name}: {error}"
             ))
         })?;
-        fetched.insert(name, metadata);
+        fetched.insert((url, name), metadata);
     }
-
+    let mut by_key = BTreeMap::new();
     for package in registry_packages {
-        let (routed_package, metadata) = fetched.get(&package.name).ok_or_else(|| {
-            LpmError::Registry(format!(
-                "registry metadata was not fetched for {}",
-                package.name
-            ))
-        })?;
-        let version = metadata.versions.get(&package.version).ok_or_else(|| {
+        let key = package_artifact_key(package);
+        if by_key.contains_key(&key) {
+            continue;
+        }
+        let url = if package.name.starts_with("@lpm.dev/") {
+            client.base_url().to_string()
+        } else {
+            locked_registry_source(package).unwrap_or_default()
+        };
+        let versions = fetched
+            .get(&(url.clone(), package.name.clone()))
+            .ok_or_else(|| {
+                LpmError::Registry(format!(
+                    "registry metadata was not fetched for {}",
+                    package.name
+                ))
+            })?;
+        let version = versions.get(&package.version).ok_or_else(|| {
             LpmError::Registry(format!(
                 "registry metadata for {} does not include locked version {}",
                 package.name, package.version
@@ -400,14 +397,14 @@ async fn fetch_registry_metadata(
         let value = serde_json::to_value(version)
             .map_err(|e| LpmError::Registry(format!("failed to serialize metadata: {e}")))?;
         by_key.insert(
-            package_metadata_key(package),
+            key,
             RegistryComponentMetadata {
                 manifest: extract_manifest_metadata(&value),
                 attestation_ref: version
                     .dist
                     .as_ref()
                     .and_then(|dist| dist.attestations.clone()),
-                registry_url: attestation_registry_url(&context, &package.name, routed_package),
+                registry_url: url,
             },
         );
     }
@@ -436,7 +433,7 @@ async fn collect_provenance_metadata(
             if locked_registry_source(package).is_none() {
                 continue;
             }
-            let key = package_metadata_key(package);
+            let key = package_artifact_key(package);
             let Some(metadata) = registry_metadata.get(&key) else {
                 continue;
             };
@@ -476,7 +473,11 @@ async fn collect_provenance_metadata(
     }
 
     let mut cache_candidates = Vec::with_capacity(packages.len());
+    let mut seen = BTreeSet::new();
     for package in packages {
+        if !seen.insert(package_artifact_key(package)) {
+            continue;
+        }
         let Some(registry_source) = locked_registry_source(package) else {
             continue;
         };
@@ -488,7 +489,7 @@ async fn collect_provenance_metadata(
                 evidence,
             )?;
             out.insert(
-                package_metadata_key(package),
+                package_artifact_key(package),
                 ProvenanceMetadata {
                     status: "verified",
                     snapshot: Some(evidence.snapshot.clone()),
@@ -516,7 +517,7 @@ async fn collect_provenance_metadata(
             package.integrity.as_deref(),
         )? {
             out.insert(
-                package_metadata_key(package),
+                package_artifact_key(package),
                 ProvenanceMetadata {
                     status: "cached",
                     snapshot: Some(snapshot),
@@ -891,7 +892,7 @@ impl Serialize for SpdxRelationships<'_> {
 }
 
 fn spdx_root_package(document: &SbomDocument, spdx_id: &str) -> Value {
-    json!({
+    let mut package = json!({
         "name": document.root_name,
         "SPDXID": spdx_id,
         "versionInfo": document.root_version,
@@ -905,7 +906,9 @@ fn spdx_root_package(document: &SbomDocument, spdx_id: &str) -> Value {
             "referenceType": "purl",
             "referenceLocator": purl_for_package(&document.root_name, &document.root_version),
         }],
-    })
+    });
+    add_spdx_license_comments(&mut package, &document.root_metadata);
+    package
 }
 
 fn spdx_package(component: &SbomComponent) -> Value {
@@ -932,6 +935,7 @@ fn spdx_package(component: &SbomComponent) -> Value {
             Value::String(description.clone()),
         );
     }
+    add_spdx_license_comments(&mut package, &component.metadata);
     let attribution = spdx_attribution(component);
     if !attribution.is_empty()
         && let Some(object) = package.as_object_mut()
@@ -974,281 +978,24 @@ fn spdx_attribution(component: &SbomComponent) -> Vec<String> {
     out
 }
 
-fn dependency_graph(
-    components: &[SbomComponent],
-    source_index: &BTreeMap<(String, String), Vec<String>>,
-    component_refs: &BTreeSet<String>,
-    refs_by_instance: &HashMap<PackageInstanceId, String>,
-) -> BTreeMap<String, Vec<String>> {
-    let mut graph = BTreeMap::new();
-    for component in components {
-        let mut refs = BTreeSet::new();
-        let exact_targets = component
-            .package
-            .dependency_targets
-            .values()
-            .chain(component.package.peer_targets.values());
-        if !component.package.dependency_targets.is_empty()
-            || !component.package.peer_targets.is_empty()
-        {
-            for target in exact_targets {
-                if let Some(target_ref) = refs_by_instance.get(target) {
-                    refs.insert(target_ref.clone());
-                }
-            }
-            graph.insert(component.bom_ref.clone(), refs.into_iter().collect());
-            continue;
-        }
-
-        let alias_targets = component
-            .package
-            .alias_dependencies
-            .iter()
-            .map(|[local, target]| (local.as_str(), target.as_str()))
-            .collect::<BTreeMap<_, _>>();
-        for dep in component
-            .package
-            .dependencies
-            .iter()
-            .chain(component.package.peers.iter())
-        {
-            let Some((local_name, version)) = split_dependency_pin(dep) else {
-                continue;
-            };
-            let target_name = alias_targets
-                .get(local_name.as_str())
-                .copied()
-                .unwrap_or(local_name.as_str());
-            if let Some(target_refs) = source_index.get(&(target_name.to_string(), version))
-                && let Some(target_ref) = target_refs.first()
-                && component_refs.contains(target_ref)
-            {
-                refs.insert(target_ref.clone());
-            }
-        }
-        graph.insert(component.bom_ref.clone(), refs.into_iter().collect());
-    }
-    graph
-}
-
-fn root_dependency_refs(
-    root_json: &Value,
-    root_resolutions: &lpm_lockfile::RootResolutions,
-    source_index: &BTreeMap<(String, String), Vec<String>>,
-    refs_by_instance: &HashMap<PackageInstanceId, String>,
-) -> Vec<String> {
-    let mut out = BTreeSet::new();
-    for resolution in root_resolutions.values() {
-        if let Some(reference) = resolution
-            .instance_id
-            .and_then(|instance_id| refs_by_instance.get(&instance_id))
-        {
-            out.insert(reference.clone());
-            continue;
-        }
-        if let Some(reference) = source_index
-            .get(&(resolution.package.clone(), resolution.version.clone()))
-            .and_then(|refs| refs.first())
-        {
-            out.insert(reference.clone());
-        }
-    }
-    if root_resolutions.is_empty() {
-        for name in root_dependency_scopes(root_json).keys() {
-            for ((package_name, _version), refs) in source_index {
-                if package_name == name
-                    && let Some(reference) = refs.first()
-                {
-                    out.insert(reference.clone());
-                }
-            }
-        }
-    }
-    out.into_iter().collect()
-}
-
-fn component_scopes(
-    root_json: &Value,
-    packages: &[LockedPackage],
-    root_resolutions: &lpm_lockfile::RootResolutions,
-    root_aliases: &BTreeMap<String, String>,
-) -> Vec<ComponentScope> {
-    let root_scopes = root_dependency_scopes(root_json);
-    let mut by_instance = HashMap::with_capacity(packages.len());
-    let mut by_coordinates: BTreeMap<(&str, &str), Vec<usize>> = BTreeMap::new();
-    for (index, package) in packages.iter().enumerate() {
-        if let Some(instance_id) = package.instance_id {
-            by_instance.insert(instance_id, index);
-        }
-        by_coordinates
-            .entry((&package.name, &package.version))
-            .or_default()
-            .push(index);
-    }
-
-    let mut scopes = vec![None; packages.len()];
-    let mut pending = VecDeque::with_capacity(packages.len());
-    for (local_name, resolution) in root_resolutions {
-        let scope = root_scopes
-            .get(local_name)
-            .copied()
-            .unwrap_or(ComponentScope::Required);
-        let target_index = resolution
-            .instance_id
-            .and_then(|instance_id| by_instance.get(&instance_id).copied())
-            .or_else(|| {
-                by_coordinates
-                    .get(&(resolution.package.as_str(), resolution.version.as_str()))
-                    .and_then(|indices| indices.first().copied())
-            });
-        if let Some(target_index) = target_index {
-            promote_component_scope(&mut scopes, &mut pending, target_index, scope);
-        }
-    }
-    if root_resolutions.is_empty() {
-        for (local_name, scope) in &root_scopes {
-            let target_name = root_aliases.get(local_name).unwrap_or(local_name);
-            if let Some(target_index) = by_coordinates
-                .iter()
-                .find(|((name, _), _)| *name == target_name.as_str())
-                .and_then(|(_, indices)| indices.first().copied())
-            {
-                promote_component_scope(&mut scopes, &mut pending, target_index, *scope);
-            }
-        }
-    }
-
-    while let Some(package_index) = pending.pop_front() {
-        let package = &packages[package_index];
-        let scope = scopes[package_index].unwrap_or(ComponentScope::Required);
-        let exact_targets = package
-            .dependency_targets
-            .values()
-            .chain(package.peer_targets.values());
-        if !package.dependency_targets.is_empty() || !package.peer_targets.is_empty() {
-            for target_id in exact_targets {
-                let Some(target_index) = by_instance.get(target_id).copied() else {
-                    continue;
-                };
-                let inherited = inherited_component_scope(scope, &packages[target_index]);
-                promote_component_scope(&mut scopes, &mut pending, target_index, inherited);
-            }
-            continue;
-        }
-
-        let alias_targets = package
-            .alias_dependencies
-            .iter()
-            .map(|[local, target]| (local.as_str(), target.as_str()))
-            .collect::<BTreeMap<_, _>>();
-        for dependency in package.dependencies.iter().chain(&package.peers) {
-            let Some((local_name, version)) = split_dependency_pin(dependency) else {
-                continue;
-            };
-            let target_name = alias_targets
-                .get(local_name.as_str())
-                .copied()
-                .unwrap_or(local_name.as_str());
-            let Some(target_index) = by_coordinates
-                .get(&(target_name, version.as_str()))
-                .and_then(|indices| indices.first().copied())
-            else {
-                continue;
-            };
-            let inherited = inherited_component_scope(scope, &packages[target_index]);
-            promote_component_scope(&mut scopes, &mut pending, target_index, inherited);
-        }
-    }
-
-    scopes
-        .into_iter()
-        .map(|scope| scope.unwrap_or(ComponentScope::Required))
-        .collect()
-}
-
-fn inherited_component_scope(scope: ComponentScope, target: &LockedPackage) -> ComponentScope {
-    if scope == ComponentScope::Required && target.optional {
-        ComponentScope::Optional
-    } else {
-        scope
-    }
-}
-
-fn promote_component_scope(
-    scopes: &mut [Option<ComponentScope>],
-    pending: &mut VecDeque<usize>,
-    index: usize,
-    scope: ComponentScope,
-) {
-    if scopes[index].is_none_or(|existing| scope > existing) {
-        scopes[index] = Some(scope);
-        pending.push_back(index);
-    }
-}
-
-fn root_dependency_scopes(root_json: &Value) -> BTreeMap<String, ComponentScope> {
-    let mut scopes = BTreeMap::new();
-    collect_dependency_scope(
-        root_json,
-        "dependencies",
-        ComponentScope::Required,
-        &mut scopes,
-        false,
-    );
-    collect_dependency_scope(
-        root_json,
-        "peerDependencies",
-        ComponentScope::Required,
-        &mut scopes,
-        false,
-    );
-    collect_dependency_scope(
-        root_json,
-        "optionalDependencies",
-        ComponentScope::Optional,
-        &mut scopes,
-        true,
-    );
-    collect_dependency_scope(
-        root_json,
-        "devDependencies",
-        ComponentScope::Excluded,
-        &mut scopes,
-        true,
-    );
-    scopes
-}
-
-fn collect_dependency_scope(
-    root_json: &Value,
-    section: &str,
-    scope: ComponentScope,
-    scopes: &mut BTreeMap<String, ComponentScope>,
-    only_if_absent: bool,
-) {
-    let Some(deps) = root_json.get(section).and_then(Value::as_object) else {
-        return;
-    };
-    for name in deps.keys() {
-        if only_if_absent {
-            scopes.entry(name.clone()).or_insert(scope);
-        } else {
-            scopes.insert(name.clone(), scope);
-        }
-    }
-}
-
-fn split_dependency_pin(input: &str) -> Option<(String, String)> {
-    let split_at = input.rfind('@')?;
-    if split_at == 0 {
-        return None;
-    }
-    let name = &input[..split_at];
-    let version = &input[split_at + 1..];
-    if name.is_empty() || version.is_empty() {
-        return None;
-    }
-    Some((name.to_string(), version.to_string()))
+fn dependency_graph(lockfile: &Lockfile) -> BTreeMap<String, Vec<String>> {
+    let refs: Vec<_> = lockfile.packages.iter().map(bom_ref_for_package).collect();
+    crate::commands::manifest_metadata::graph::package_adjacency(
+        &lockfile.packages,
+        &PackageIndexes::new(&lockfile.packages),
+    )
+    .into_iter()
+    .enumerate()
+    .map(|(index, targets)| {
+        let edges = targets
+            .into_iter()
+            .map(|target| refs[target].clone())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        (refs[index].clone(), edges)
+    })
+    .collect()
 }
 
 fn purl_for_package(name: &str, version: &str) -> String {
@@ -1311,10 +1058,27 @@ fn sanitize_ref_fragment(input: &str) -> String {
 }
 
 fn license_declared(metadata: &ManifestMetadata) -> String {
-    if metadata.licenses.is_empty() {
-        "NOASSERTION".to_string()
+    let expression = license_expression_from_list(&metadata.licenses);
+    if expression == "NONE"
+        || expression == "NOASSERTION"
+        || spdx::Expression::parse(&expression).is_ok_and(|parsed| {
+            parsed
+                .requirements()
+                .all(|requirement| requirement.req.license.id().is_some())
+        })
+    {
+        expression
     } else {
-        metadata.licenses.join(" AND ")
+        "NOASSERTION".to_string()
+    }
+}
+
+fn add_spdx_license_comments(value: &mut Value, metadata: &ManifestMetadata) {
+    if !metadata.licenses.is_empty() && license_declared(metadata) == "NOASSERTION" {
+        value["licenseComments"] = Value::String(format!(
+            "Package manifest declarations: {}",
+            metadata.licenses.join("; ")
+        ));
     }
 }
 
@@ -1511,11 +1275,12 @@ fn open_output_file_nofollow(
     use cap_fs_ext::{FollowSymlinks, OpenOptionsFollowExt as _};
 
     let mut options = cap_std::fs::OpenOptions::new();
-    options
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .follow(FollowSymlinks::No);
+    options.write(true).create(true).follow(FollowSymlinks::No);
+    #[cfg(unix)]
+    {
+        use cap_std::fs::OpenOptionsExt as _;
+        options.custom_flags(libc::O_NONBLOCK);
+    }
     let file = directory
         .open_with(file_name, &options)
         .map_err(LpmError::Io)?;
@@ -1525,6 +1290,7 @@ fn open_output_file_nofollow(
             "refusing SBOM output that is not a regular file",
         )));
     }
+    file.set_len(0).map_err(LpmError::Io)?;
     Ok(file)
 }
 
@@ -1544,61 +1310,12 @@ fn capability_metadata_is_link_or_reparse(metadata: &cap_std::fs::Metadata) -> b
 #[cfg(test)]
 mod tests {
     use super::*;
-    use lpm_registry::{RouteMode, RouteTable};
-
-    #[test]
-    fn split_dependency_pin_handles_scoped_names() {
-        assert_eq!(
-            split_dependency_pin("@scope/pkg@1.2.3"),
-            Some(("@scope/pkg".to_string(), "1.2.3".to_string()))
-        );
-        assert_eq!(
-            split_dependency_pin("left-pad@1.3.0"),
-            Some(("left-pad".to_string(), "1.3.0".to_string()))
-        );
-        assert_eq!(split_dependency_pin("@1.0.0"), None);
-    }
 
     #[test]
     fn purl_encodes_scoped_npm_names() {
         assert_eq!(
             purl_for_package("@scope/pkg", "1.2.3"),
             "pkg:npm/%40scope/pkg@1.2.3"
-        );
-    }
-
-    #[test]
-    fn proxy_routed_npm_metadata_keeps_the_npm_attestation_origin() {
-        let context = RoutedReadContext {
-            client: RegistryClient::new()
-                .with_base_url("https://lpm.example.test")
-                .with_npm_registry_url("https://npm.example.test"),
-            route_table: RouteTable::from_mode_only(RouteMode::Proxy),
-        };
-        let routed = RoutedPackageRef::Registry("axios".to_string());
-
-        assert_eq!(
-            attestation_registry_url(&context, "axios", &routed),
-            "https://npm.example.test"
-        );
-    }
-
-    #[test]
-    fn lpm_metadata_uses_the_lpm_attestation_origin() {
-        let context = RoutedReadContext {
-            client: RegistryClient::new()
-                .with_base_url("https://lpm.example.test")
-                .with_npm_registry_url("https://npm.example.test"),
-            route_table: RouteTable::from_mode_only(RouteMode::Proxy),
-        };
-        let routed = RoutedPackageRef::Lpm(
-            lpm_common::PackageName::parse("@lpm.dev/acme.package")
-                .expect("valid LPM package name"),
-        );
-
-        assert_eq!(
-            attestation_registry_url(&context, "@lpm.dev/acme.package", &routed),
-            "https://lpm.example.test"
         );
     }
 

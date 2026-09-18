@@ -27,6 +27,7 @@ mod config;
 mod firewall;
 mod http;
 mod install_accounting;
+mod manifest;
 mod metadata;
 mod state;
 mod tarball;
@@ -50,6 +51,7 @@ pub use self::install_accounting::{
     MAX_MANAGED_POOL_INSTALL_NODES, ManagedInstallAccounting, ManagedInstallGraph,
     ManagedInstallNode, ManagedInstallRoot,
 };
+pub use self::manifest::ManifestVersionMetadata;
 pub use self::metadata::BatchMetadataEntryStream;
 pub use self::state::{
     CompressedTarballSpoolReservation, DownloadedTarball, FanOutStats, HttpClients,

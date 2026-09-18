@@ -1,8 +1,9 @@
+pub(crate) mod graph;
+
 use lpm_common::{BoundedReadError, LpmError, LpmRoot, with_shared_lock};
-use lpm_lockfile::LockedPackage;
+use lpm_lockfile::{LockedPackage, Lockfile};
 use serde_json::Value;
-use std::borrow::Cow;
-use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Default)]
@@ -28,10 +29,8 @@ impl ManifestMetadata {
         if self.author.is_none() {
             self.author = other.author;
         }
-        for license in other.licenses {
-            if !self.licenses.iter().any(|existing| existing == &license) {
-                self.licenses.push(license);
-            }
+        if self.licenses.is_empty() {
+            self.licenses = other.licenses;
         }
     }
 }
@@ -54,10 +53,15 @@ impl InstalledManifestInventory {
 }
 
 pub(crate) fn read_json_file(path: &Path) -> Result<Value, LpmError> {
-    let content = lpm_common::read_text_file_capped(path, lpm_common::CONFIG_FILE_SIZE_CAP_BYTES)?;
-    serde_json::from_str(&content).map_err(|e| {
-        LpmError::Registry(format!("failed to parse JSON from {}: {e}", path.display()))
-    })
+    let (content, _) = lpm_common::read_text_regular_file_capped_with_metadata(
+        path,
+        lpm_common::CONFIG_FILE_SIZE_CAP_BYTES,
+    )?;
+    let object: serde_json::Map<String, Value> =
+        serde_json::from_str(lpm_common::strip_utf8_bom_str(&content)).map_err(|e| {
+            LpmError::Registry(format!("failed to parse JSON from {}: {e}", path.display()))
+        })?;
+    Ok(Value::Object(object))
 }
 
 pub(crate) fn extract_manifest_metadata(value: &Value) -> ManifestMetadata {
@@ -93,7 +97,8 @@ pub(crate) fn extract_manifest_metadata(value: &Value) -> ManifestMetadata {
 
 pub(crate) fn read_installed_manifest_metadata(
     project_dir: &Path,
-    packages: &[LockedPackage],
+    lockfile: &Lockfile,
+    root_json: &Value,
 ) -> Result<InstalledManifestInventory, LpmError> {
     let root = LpmRoot::from_env()?;
     let lock_path = root.store_lock();
@@ -101,15 +106,57 @@ pub(crate) fn read_installed_manifest_metadata(
     with_shared_lock(lock_path, || {
         let baseline_index = lpm_store::V2BaselineIndex::for_project(project_dir, &root_for_lock);
         let store_version = lpm_store::StoreVersion::from_env();
-        let platform_skipped_candidates = platform_skipped_package_keys(packages);
+        let packages = &lockfile.packages;
+        let indexes = graph::PackageIndexes::new(packages);
+        let roots = graph::selected_roots(root_json, lockfile, &indexes);
+        let platform_skipped_candidates = platform_skipped_package_keys(lockfile, &indexes, &roots);
+        let instance_baselines = super::audit::inventory::build_instance_baselines(
+            project_dir,
+            &baseline_index,
+            lockfile,
+        );
+        let installed_paths = installed_package_paths(project_dir, lockfile, &indexes, &roots)?;
         let mut metadata_by_package = BTreeMap::new();
         let mut platform_skipped_packages = BTreeSet::new();
         for package in packages {
             let package_key = package_metadata_key(package);
-            let virtual_baseline = match package.integrity.as_deref() {
-                Some(integrity) => baseline_index.lookup_by_integrity(integrity),
-                None => baseline_index.lookup(&package.name, &package.version),
-            };
+            if let Some(path) = installed_paths.get(&package_key) {
+                if let Some(baseline) = baseline_index.lookup_by_package_dir(path)
+                    && package
+                        .integrity
+                        .as_deref()
+                        .is_some_and(|expected| expected != baseline.integrity)
+                {
+                    return Err(LpmError::Store(format!(
+                        "installed package {}@{} has a different integrity than lpm.lock. Run `lpm install` to repair this project's dependencies",
+                        package.name, package.version
+                    )));
+                }
+                let manifest = path.join("package.json");
+                match read_matching_manifest_metadata(&manifest, package)? {
+                    ManifestProbe::Match(metadata) => {
+                        metadata_by_package.insert(package_key, metadata);
+                        continue;
+                    }
+                    ManifestProbe::Missing | ManifestProbe::DifferentPackage { .. } => {
+                        if store_version.uses_virtual_store() {
+                            return Err(missing_installed_manifest(package, Some(&manifest)));
+                        }
+                    }
+                }
+            }
+            let virtual_baseline = package
+                .instance_id
+                .and_then(|id| instance_baselines.get(&id).map(std::sync::Arc::as_ref))
+                .or_else(|| {
+                    if package.instance_id.is_some() {
+                        return None;
+                    }
+                    match package.integrity.as_deref() {
+                        Some(integrity) => baseline_index.lookup_by_integrity(integrity),
+                        None => baseline_index.lookup(&package.name, &package.version),
+                    }
+                });
             if let Some(baseline) = virtual_baseline {
                 let manifest_path = baseline.package_dir.join("package.json");
                 let metadata = read_required_manifest_metadata(&manifest_path, package)?;
@@ -117,6 +164,13 @@ pub(crate) fn read_installed_manifest_metadata(
                 continue;
             }
 
+            if package.instance_id.is_some() && store_version.uses_virtual_store() {
+                if platform_skipped_candidates.contains(&package_key) {
+                    platform_skipped_packages.insert(package_key);
+                    continue;
+                }
+                return Err(missing_installed_manifest(package, None));
+            }
             let project_manifest = node_modules_package_json(project_dir, &package.name);
             match read_matching_manifest_metadata(&project_manifest, package)? {
                 ManifestProbe::Match(metadata) => {
@@ -185,22 +239,25 @@ fn read_matching_manifest_metadata(
     path: &Path,
     package: &LockedPackage,
 ) -> Result<ManifestProbe, LpmError> {
-    let content =
-        match lpm_common::read_text_file_capped(path, lpm_common::CONFIG_FILE_SIZE_CAP_BYTES) {
-            Ok(content) => content,
-            Err(BoundedReadError::NotFound { .. }) => return Ok(ManifestProbe::Missing),
-            Err(error) => {
-                return Err(LpmError::Store(format!(
-                    "failed to read installed package manifest: {error}"
-                )));
-            }
-        };
-    let value: Value = serde_json::from_str(&content).map_err(|error| {
-        LpmError::Store(format!(
-            "failed to parse installed package manifest {}: {error}",
-            path.display()
-        ))
-    })?;
+    let content = match lpm_common::read_text_regular_file_capped_with_metadata(
+        path,
+        lpm_common::CONFIG_FILE_SIZE_CAP_BYTES,
+    ) {
+        Ok((content, _)) => content,
+        Err(BoundedReadError::NotFound { .. }) => return Ok(ManifestProbe::Missing),
+        Err(error) => {
+            return Err(LpmError::Store(format!(
+                "failed to read installed package manifest: {error}"
+            )));
+        }
+    };
+    let value: Value =
+        serde_json::from_str(lpm_common::strip_utf8_bom_str(&content)).map_err(|error| {
+            LpmError::Store(format!(
+                "failed to parse installed package manifest {}: {error}",
+                path.display()
+            ))
+        })?;
     if manifest_matches_package(&value, package) {
         Ok(ManifestProbe::Match(extract_manifest_metadata(&value)))
     } else {
@@ -220,26 +277,38 @@ fn manifest_matches_package(value: &Value, package: &LockedPackage) -> bool {
 }
 
 pub(crate) fn package_metadata_key(package: &LockedPackage) -> String {
+    if let Some(instance_id) = package.instance_id {
+        return instance_id.to_string();
+    }
+    package_artifact_key(package)
+}
+
+pub(crate) fn package_artifact_key(package: &LockedPackage) -> String {
     let source = package.source.as_deref().unwrap_or("");
-    let mut key =
-        String::with_capacity(package.name.len() + package.version.len() + source.len() + 2);
+    let integrity = package.integrity.as_deref().unwrap_or("");
+    let mut key = String::with_capacity(
+        package.name.len() + package.version.len() + source.len() + integrity.len() + 3,
+    );
     key.push_str(&package.name);
     key.push('\0');
     key.push_str(&package.version);
     key.push('\0');
     key.push_str(source);
+    key.push('\0');
+    key.push_str(integrity);
     key
 }
 
 fn collect_licenses(value: &Value, out: &mut Vec<String>) {
     match value {
-        Value::String(s) if !s.is_empty() => out.push(s.clone()),
+        Value::String(s) if !s.trim().is_empty() => out.push(s.trim().to_string()),
         Value::Object(obj) => {
             if let Some(s) = obj
                 .get("type")
                 .or_else(|| obj.get("name"))
                 .or_else(|| obj.get("url"))
                 .and_then(Value::as_str)
+                .map(str::trim)
                 .filter(|s| !s.is_empty())
             {
                 out.push(s.to_string());
@@ -312,58 +381,113 @@ fn mismatched_installed_manifest(
     ))
 }
 
-fn platform_skipped_package_keys(packages: &[LockedPackage]) -> BTreeSet<String> {
-    let mut packages_by_pin: HashMap<String, Vec<usize>> = HashMap::with_capacity(packages.len());
-    for (index, package) in packages.iter().enumerate() {
-        packages_by_pin
-            .entry(package_pin(&package.name, &package.version))
-            .or_default()
-            .push(index);
+fn platform_skipped_package_keys(
+    lockfile: &Lockfile,
+    indexes: &graph::PackageIndexes<'_>,
+    roots: &[(String, usize, graph::PackageScope)],
+) -> BTreeSet<String> {
+    let packages = &lockfile.packages;
+    let adjacency = graph::package_adjacency(packages, indexes);
+    let blocked: Vec<_> = packages
+        .iter()
+        .map(|package| package.optional && !locked_package_matches_current_platform(package))
+        .collect();
+    let mut candidates = vec![false; packages.len()];
+    let mut queue: VecDeque<_> = blocked
+        .iter()
+        .enumerate()
+        .filter_map(|(index, blocked)| blocked.then_some(index))
+        .collect();
+    while let Some(index) = queue.pop_front() {
+        if candidates[index] {
+            continue;
+        }
+        candidates[index] = true;
+        queue.extend(
+            adjacency[index]
+                .iter()
+                .copied()
+                .filter(|&child| packages[child].optional),
+        );
     }
+    let mut reachable = vec![false; packages.len()];
+    queue.extend(roots.iter().map(|(_, index, _)| *index));
+    queue.extend(
+        packages
+            .iter()
+            .enumerate()
+            .filter_map(|(index, package)| (!package.optional).then_some(index)),
+    );
+    while let Some(index) = queue.pop_front() {
+        if blocked[index] || reachable[index] {
+            continue;
+        }
+        reachable[index] = true;
+        queue.extend(adjacency[index].iter().copied());
+    }
+    packages
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| candidates[*index] && !reachable[*index])
+        .map(|(_, package)| package_metadata_key(package))
+        .collect()
+}
 
-    let mut skipped = vec![false; packages.len()];
-    let mut queue = VecDeque::new();
-    for (index, package) in packages.iter().enumerate() {
-        if package.optional && !locked_package_matches_current_platform(package) {
-            skipped[index] = true;
-            queue.push_back(index);
+fn installed_package_paths(
+    project_dir: &Path,
+    lockfile: &Lockfile,
+    indexes: &graph::PackageIndexes<'_>,
+    roots: &[(String, usize, graph::PackageScope)],
+) -> Result<BTreeMap<String, PathBuf>, LpmError> {
+    let project_dir = project_dir.canonicalize()?;
+    let mut paths = BTreeMap::new();
+    let mut pending = VecDeque::new();
+    for (local, index, _) in roots {
+        if let Some(path) = installed_slot(&project_dir, local)? {
+            pending.push_back((*index, path));
         }
     }
-
-    while let Some(index) = queue.pop_front() {
-        let package = &packages[index];
-        for dependency in package.dependencies.iter().chain(&package.peers) {
-            let Some((local_name, version)) = split_dependency_pin(dependency) else {
+    while let Some((index, path)) = pending.pop_front() {
+        let package = &lockfile.packages[index];
+        let key = package_metadata_key(package);
+        if paths.contains_key(&key) {
+            continue;
+        }
+        paths.insert(key, path.clone());
+        for (local, target_index) in graph::package_targets(package, indexes) {
+            if paths.contains_key(&package_metadata_key(&lockfile.packages[target_index])) {
                 continue;
-            };
-            let target_name = package
-                .alias_dependencies
-                .iter()
-                .find(|[local, _target]| local == local_name)
-                .map_or(local_name, |[_local, target]| target.as_str());
-            let target_pin = if target_name == local_name {
-                Cow::Borrowed(dependency.as_str())
-            } else {
-                Cow::Owned(package_pin(target_name, version))
-            };
-            let Some(target_indices) = packages_by_pin.get(target_pin.as_ref()) else {
-                continue;
-            };
-            for &target_index in target_indices {
-                if packages[target_index].optional && !skipped[target_index] {
-                    skipped[target_index] = true;
-                    queue.push_back(target_index);
+            }
+            let mut resolved = None;
+            for directory in path.ancestors() {
+                if let Some(candidate) = installed_slot(directory, local)? {
+                    resolved = Some(candidate);
+                    break;
                 }
+                if directory == project_dir {
+                    break;
+                }
+            }
+            if resolved.is_none() && !path.starts_with(&project_dir) {
+                resolved = installed_slot(&project_dir, local)?;
+            }
+            if let Some(path) = resolved {
+                pending.push_back((target_index, path));
             }
         }
     }
+    Ok(paths)
+}
 
-    packages
-        .iter()
-        .zip(skipped)
-        .filter(|(_package, skipped)| *skipped)
-        .map(|(package, _skipped)| package_metadata_key(package))
-        .collect()
+fn installed_slot(directory: &Path, local: &str) -> Result<Option<PathBuf>, LpmError> {
+    Lockfile::validate_package_name_and_version(local, "0.0.0")
+        .map_err(|error| LpmError::Store(error.to_string()))?;
+    let path = directory.join("node_modules").join(local);
+    match std::fs::symlink_metadata(&path) {
+        Ok(_) => Ok(Some(path.canonicalize()?)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error.into()),
+    }
 }
 
 fn locked_package_matches_current_platform(package: &LockedPackage) -> bool {
@@ -377,25 +501,41 @@ fn locked_package_matches_current_platform(package: &LockedPackage) -> bool {
     })
 }
 
-fn package_pin(name: &str, version: &str) -> String {
-    let mut pin = String::with_capacity(name.len() + version.len() + 1);
-    pin.push_str(name);
-    pin.push('@');
-    pin.push_str(version);
-    pin
-}
-
-fn split_dependency_pin(input: &str) -> Option<(&str, &str)> {
-    let split_at = input.rfind('@')?;
-    if split_at == 0 || split_at + 1 == input.len() {
-        return None;
+pub(crate) fn license_expression_from_list(licenses: &[String]) -> String {
+    if licenses.is_empty() {
+        return "NOASSERTION".to_string();
     }
-    Some((&input[..split_at], &input[split_at + 1..]))
+    if licenses.len() == 1 {
+        return licenses[0].clone();
+    }
+    licenses
+        .iter()
+        .map(|license| {
+            if license.contains(char::is_whitespace) {
+                format!("({license})")
+            } else {
+                license.clone()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" AND ")
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn platform_skipped_test_keys(packages: Vec<LockedPackage>) -> BTreeSet<String> {
+        let lockfile = Lockfile {
+            packages,
+            ..Lockfile::new()
+        };
+        platform_skipped_package_keys(
+            &lockfile,
+            &graph::PackageIndexes::new(&lockfile.packages),
+            &[],
+        )
+    }
 
     fn locked_package(name: &str, optional: bool) -> LockedPackage {
         LockedPackage {
@@ -428,7 +568,7 @@ mod tests {
         platform_package.dependencies = vec!["optional-runtime@1.0.0".to_string()];
         let runtime = locked_package("optional-runtime", true);
 
-        let skipped = platform_skipped_package_keys(&[platform_package.clone(), runtime.clone()]);
+        let skipped = platform_skipped_test_keys(vec![platform_package.clone(), runtime.clone()]);
 
         assert_eq!(
             skipped,
@@ -446,7 +586,7 @@ mod tests {
         platform_package.dependencies = vec!["shared-runtime@1.0.0".to_string()];
         let runtime = locked_package("shared-runtime", false);
 
-        let skipped = platform_skipped_package_keys(&[platform_package.clone(), runtime]);
+        let skipped = platform_skipped_test_keys(vec![platform_package.clone(), runtime]);
 
         assert_eq!(
             skipped,

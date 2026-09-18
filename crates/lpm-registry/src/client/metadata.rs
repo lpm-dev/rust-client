@@ -637,7 +637,7 @@ impl RegistryClient {
             .await
     }
 
-    async fn build_worker_metadata_get_with_bearer(
+    pub(super) async fn build_worker_metadata_get_with_bearer(
         &self,
         url: &str,
         bearer: Option<&str>,
@@ -718,7 +718,7 @@ impl RegistryClient {
         (cached.value.matches_package(name) && !cached.value.time.is_empty()).then_some(cached)
     }
 
-    async fn send_package_metadata_request(
+    pub(super) async fn send_package_metadata_request(
         &self,
         request_builder: reqwest::RequestBuilder,
     ) -> Result<reqwest::Response, LpmError> {
@@ -726,7 +726,7 @@ impl RegistryClient {
             .await
     }
 
-    async fn send_package_metadata_request_with_npmrc_auth(
+    pub(super) async fn send_package_metadata_request_with_npmrc_auth(
         &self,
         request_builder: reqwest::RequestBuilder,
         auth: Option<&crate::npmrc::RegistryAuth>,

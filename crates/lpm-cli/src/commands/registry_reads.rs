@@ -98,6 +98,30 @@ fn configure_read_context(
     top_level_specs: &[String],
     json_output: bool,
 ) -> Result<RoutedReadContext, LpmError> {
+    let eager_origins = route_table.effective_registry_origins(
+        top_level_specs,
+        client.base_url(),
+        client.npm_registry_url(),
+    );
+    configure_read_context_for_origins(client, route_table, &eager_origins, json_output)
+}
+
+pub fn prepare_locked_read_context(
+    client: &RegistryClient,
+    project_dir: &Path,
+    origins: &[lpm_registry::npmrc::OriginKey],
+) -> Result<RoutedReadContext, LpmError> {
+    let route_table = RouteTable::from_env_and_filesystem(project_dir)
+        .map_err(|error| LpmError::Registry(format!("npmrc: {error}")))?;
+    configure_read_context_for_origins(client, route_table, origins, true)
+}
+
+fn configure_read_context_for_origins(
+    client: &RegistryClient,
+    route_table: RouteTable,
+    eager_origins: &[lpm_registry::npmrc::OriginKey],
+    json_output: bool,
+) -> Result<RoutedReadContext, LpmError> {
     if !json_output {
         for warning in route_table.npmrc_warnings() {
             install_ui::warn_untrusted(&lpm_common::sanitize_terminal_inline(warning));
@@ -120,14 +144,9 @@ fn configure_read_context(
         install_ui::warn_untrusted(&lpm_common::sanitize_terminal_inline(warning));
     }
 
-    let eager_origins = route_table.effective_registry_origins(
-        top_level_specs,
-        client.base_url(),
-        client.npm_registry_url(),
-    );
     let configured_client = client
         .clone_with_config()
-        .with_tls_overrides_for(route_table.tls_overrides(), &eager_origins)?;
+        .with_tls_overrides_for(route_table.tls_overrides(), eager_origins)?;
 
     if !json_output && let Some(summary) = configured_client.render_effective_tls_summary() {
         install_ui::phase_untrusted(&lpm_common::sanitize_terminal_inline(&summary));
