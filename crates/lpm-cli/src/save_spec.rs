@@ -32,7 +32,7 @@
 //! 5. **Default.** `^resolvedVersion`.
 
 use lpm_common::LpmError;
-use lpm_resolver::{Specifier, SpecifierParseError};
+use lpm_resolver::Specifier;
 use lpm_semver::{Version, VersionReq};
 
 // ─── Public API ─────────────────────────────────────────────────────
@@ -205,18 +205,10 @@ pub struct SaveSpecDecision {
 /// 2. `workspace:...` → [`UserSaveIntent::Workspace`]
 /// 3. Parses as [`Version`] → [`UserSaveIntent::Exact`]
 /// 4. Parses as [`lpm_semver::VersionReq`] → [`UserSaveIntent::Range`]
-/// 5. Otherwise → [`UserSaveIntent::DistTag`] (npm allows arbitrary tag names),
-///    UNLESS the token has a colon-shaped protocol prefix that
-///    [`Specifier::parse`] rejects as unknown — see
-///    [`classify_version_token`] for the contract.
+/// 5. Otherwise, accept a registry tag only after source-specifier validation.
 ///
-/// Returns an error when the explicit version token after `@` carries
-/// an unknown package-specifier protocol (e.g. `foo@magic:bar`,
-/// `foo@filee:./bar`) or a Windows drive-letter shape
-/// (`foo@C:\path`). Pre-fix these silently became
-/// [`UserSaveIntent::DistTag`], causing the resolver to fall back to
-/// `latest` and rewrite `package.json` with the wrong dependency —
-/// silent corruption worse than the original confusing failure.
+/// Reject unknown protocols and source specifications that this CLI argument
+/// path cannot preserve. Supported local workspace requests remain explicit.
 pub fn parse_user_save_intent(spec: &str) -> Result<(String, UserSaveIntent), LpmError> {
     let (name, version_token) = split_name_and_version_token(spec);
     crate::typosquat_guard::validate_package_name(&name)?;
@@ -225,6 +217,32 @@ pub fn parse_user_save_intent(spec: &str) -> Result<(String, UserSaveIntent), Lp
         Some(token) => classify_version_token(token)?,
     };
     Ok((name, intent))
+}
+
+/// Validate explicit package requests before mutation or registry access.
+/// Equivalent requests keep their first position; conflicting save intents for
+/// one local name cannot share a staged manifest entry.
+pub(crate) fn normalize_explicit_package_specs(specs: &[String]) -> Result<Vec<String>, LpmError> {
+    let mut seen: std::collections::HashMap<String, (UserSaveIntent, &str)> =
+        std::collections::HashMap::with_capacity(specs.len());
+    let mut normalized = Vec::with_capacity(specs.len());
+    for spec in specs {
+        let (name, intent) = parse_user_save_intent(spec)?;
+        if let Some((prior_intent, prior_spec)) = seen.get(&name) {
+            if prior_intent != &intent {
+                return Err(LpmError::Registry(format!(
+                    "conflicting package requests for '{}': '{}' and '{}'. Request each package with one specification.",
+                    lpm_common::sanitize_terminal_inline(&name),
+                    lpm_common::sanitize_terminal_inline(prior_spec),
+                    lpm_common::sanitize_terminal_inline(spec),
+                )));
+            }
+        } else {
+            seen.insert(name, (intent, spec.as_str()));
+            normalized.push(spec.clone());
+        }
+    }
+    Ok(normalized)
 }
 
 /// Split a CLI install argument into `(name, Some(version_token))` or
@@ -260,15 +278,8 @@ fn split_name_and_version_token(spec: &str) -> (String, Option<&str>) {
 /// doesn't parse as semver. This mirrors npm's CLI semantics — `latest`,
 /// `next`, `beta`, etc. are tags, never versions.
 ///
-/// Before the DistTag fallback fires, the token is validated against
-/// [`Specifier::parse`]. If the parser surfaces
-/// [`SpecifierParseError::UnknownProtocol`] or
-/// [`SpecifierParseError::WindowsDriveLetterPath`], propagate the error
-/// instead of silently falling through. Pre-fix the bug at the manifest
-/// layer only covered `package.json`-side specifiers;
-/// argv-side tokens (`lpm install foo@magic:bar`) silently became
-/// `DistTag("magic:bar")` and the resolver installed `latest` with a
-/// placeholder. The argv-side guard plugs that gap.
+/// Source-shaped tokens cannot be tags on this path: accepting one would fetch
+/// the local alias name and could silently replace the requested source.
 fn classify_version_token(token: &str) -> Result<UserSaveIntent, LpmError> {
     // Empty token after `@` (e.g. `zod@`) — treat as bare. This is a
     // degenerate user input but a valid one to recover from.
@@ -287,26 +298,27 @@ fn classify_version_token(token: &str) -> Result<UserSaveIntent, LpmError> {
     if VersionReq::parse(token).is_ok() {
         return Ok(UserSaveIntent::Range(token.to_string()));
     }
-    // Final check before DistTag: an unknown protocol (`magic:bar`) or a
-    // bare Windows drive letter (`C:\path`) would otherwise corrupt the
-    // install. Other Specifier shapes (NpmAlias, Git, Tarball, File,
-    // Link) are NOT promoted here — that's a wider CLI surface change
-    // (npm-CLI-parity aliases on the install line) and out of scope.
-    //
-    // The error message stays surface-neutral: `parse_user_save_intent`
-    // is shared by `lpm install`, `lpm add`, `lpm global install`, and
-    // `lpm global update`, and the offending token is already in the
-    // message — the user knows which command they ran. Hardcoding
-    // "on the install command line" here reads wrong under
-    // `lpm global update foo@magic:bar`.
-    if let Err(
-        err @ (SpecifierParseError::UnknownProtocol { .. }
-        | SpecifierParseError::WindowsDriveLetterPath(_)),
-    ) = Specifier::parse(token)
-    {
-        return Err(LpmError::Registry(format!(
-            "invalid version token '{token}': {err}"
-        )));
+    if token.trim().starts_with("catalog:") {
+        return Err(LpmError::Registry(
+            "catalog references are not accepted as package version tokens".into(),
+        ));
+    }
+    match Specifier::parse(token) {
+        Ok(Specifier::SemverRange(_))
+            if !token.contains([':', '/', '\\']) && !matches!(token, "." | "..") => {}
+        Ok(_) => {
+            return Err(LpmError::Registry(format!(
+                "unsupported package source in package version token '{}'",
+                lpm_common::sanitize_terminal_inline(token),
+            )));
+        }
+        Err(error) => {
+            return Err(LpmError::Registry(format!(
+                "invalid version token '{}': {}",
+                lpm_common::sanitize_terminal_inline(token),
+                lpm_common::sanitize_terminal_inline(&error.to_string()),
+            )));
+        }
     }
     Ok(UserSaveIntent::DistTag(token.to_string()))
 }
@@ -950,6 +962,64 @@ mod tests {
         );
         assert_eq!(decision.spec_to_write, "workspace:*");
         assert_eq!(decision.reason, SaveSpecReason::PreservedWorkspace);
+    }
+
+    #[test]
+    fn repeated_specs_keep_first_order_and_scoped_local_names() {
+        let specs = [
+            "@scope/first",
+            "second@1.0.0",
+            "@scope/first@",
+            "second@1.0.0",
+        ]
+        .map(str::to_owned);
+        assert_eq!(
+            normalize_explicit_package_specs(&specs).unwrap(),
+            ["@scope/first", "second@1.0.0"]
+        );
+        let conflict = ["@scope/first@1.0.0", "@scope/first@2.0.0"].map(str::to_owned);
+        assert!(normalize_explicit_package_specs(&conflict).is_err());
+    }
+
+    #[test]
+    fn source_tokens_are_not_interpreted_as_registry_tags() {
+        for token in [
+            "npm:real@1.0.0",
+            "npm:@scope/real@1.0.0",
+            "npm:",
+            "jsr:@scope/real",
+            "file:./local",
+            "file:",
+            "link:../local",
+            "git+https://example.com/repo.git",
+            "github:owner/repo",
+            "owner/repo",
+            "https://example.com/package.tgz",
+            "https:invalid",
+            "catalog:",
+            "catalog:ui",
+            "../local",
+            "./local",
+            "/tmp/local.tgz",
+            r"..\local",
+        ] {
+            assert!(
+                parse_user_save_intent(&format!("local@{token}")).is_err(),
+                "{token}"
+            );
+        }
+        for tag in ["latest", "next", "beta", "qa-2026", ".beta"] {
+            assert_eq!(
+                parse_user_save_intent(&format!("local@{tag}")).unwrap().1,
+                UserSaveIntent::DistTag(tag.into())
+            );
+        }
+        assert_eq!(
+            parse_user_save_intent("@scope/local@workspace:*")
+                .unwrap()
+                .1,
+            UserSaveIntent::Workspace("workspace:*".into())
+        );
     }
 
     // ─── SavePrefix::parse ──────────────────────────────────────

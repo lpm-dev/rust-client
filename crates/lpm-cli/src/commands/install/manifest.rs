@@ -116,7 +116,7 @@ pub(crate) enum StagedKind {
     Skipped,
 }
 
-/// Per-package record produced by [`stage_packages_to_manifest`].
+/// Per-package record produced by [`stage_packages_with_catalog_policy`].
 #[derive(Debug, Clone)]
 pub(crate) struct StagedEntry {
     pub name: String,
@@ -172,11 +172,28 @@ impl StagedManifest {
 ///
 /// Returns `Err(LpmError::NotFound)` if the manifest is missing,
 /// `Err(LpmError::Registry)` for parse/serialize failures.
+#[cfg(test)]
 pub(crate) fn stage_packages_to_manifest(
     pkg_json_path: &Path,
     package_specs: &[String],
     save_dev: bool,
     flags: crate::save_spec::SaveFlags,
+) -> Result<StagedManifest, LpmError> {
+    stage_packages_with_catalog_policy(
+        pkg_json_path,
+        package_specs,
+        save_dev,
+        flags,
+        &CatalogSavePolicy::manual(),
+    )
+}
+
+fn stage_packages_with_catalog_policy(
+    pkg_json_path: &Path,
+    package_specs: &[String],
+    save_dev: bool,
+    flags: crate::save_spec::SaveFlags,
+    catalog_policy: &CatalogSavePolicy,
 ) -> Result<StagedManifest, LpmError> {
     use crate::save_spec::{UserSaveIntent, parse_user_save_intent};
 
@@ -245,12 +262,23 @@ pub(crate) fn stage_packages_to_manifest(
         // flag → skip (no-churn rule).
         //
         let is_bare_reinstall = matches!(intent, UserSaveIntent::Bare);
-        let already_present = doc
+        let existing_spec = doc
             .get(dep_key)
             .and_then(|v| v.get(&name))
-            .and_then(|v| v.as_str())
-            .is_some();
-        if is_bare_reinstall && already_present && !force_rewrite {
+            .and_then(|v| v.as_str());
+        let preserve_source = if is_bare_reinstall && force_rewrite {
+            existing_spec
+                .map(|spec| {
+                    let effective =
+                        resolve_catalog_policy_manifest_spec(&name, spec, catalog_policy)?;
+                    manifest_spec_has_source(&name, &effective)
+                })
+                .transpose()?
+                .unwrap_or(false)
+        } else {
+            false
+        };
+        if is_bare_reinstall && existing_spec.is_some() && (!force_rewrite || preserve_source) {
             // Silent: no "Refreshing X in deps" line. The Done-block
             // `+` list only fires when something actually changed —
             // a bare reinstall that keeps the existing range produces
@@ -558,6 +586,19 @@ pub(super) fn finalize_packages_in_manifest_with_catalog_policy(
     let mut doc_mutated = false;
 
     for entry in &staged.entries {
+        if catalog_policy.can_rewrite_manifest() {
+            let manifest_spec = doc[dep_key][&entry.name].as_str().ok_or_else(|| {
+                LpmError::Registry(format!(
+                    "catalogMode: missing staged specification for `{}`",
+                    entry.name
+                ))
+            })?;
+            let effective_spec =
+                resolve_catalog_policy_manifest_spec(&entry.name, manifest_spec, catalog_policy)?;
+            if !catalog_save_targets_registry(&entry.name, &effective_spec, catalog_policy)? {
+                continue;
+            }
+        }
         let resolved = resolved_versions.get(&entry.name);
 
         if let Some(catalog_name) = catalog_policy.forced_catalog.as_deref() {
@@ -756,6 +797,40 @@ pub(super) fn resolve_catalog_policy_manifest_spec(
     })
 }
 
+fn parse_manifest_spec(package: &str, spec: &str) -> Result<lpm_resolver::Specifier, LpmError> {
+    let normalized = lpm_resolver::normalize_jsr_dependency(package, spec)
+        .map_err(|error| LpmError::Registry(error.to_string()))?;
+    lpm_resolver::Specifier::parse(normalized.as_deref().unwrap_or(spec))
+        .map_err(|error| LpmError::Registry(error.to_string()))
+}
+
+fn manifest_spec_has_source(package: &str, spec: &str) -> Result<bool, LpmError> {
+    Ok(!matches!(
+        parse_manifest_spec(package, spec)?,
+        lpm_resolver::Specifier::SemverRange(_)
+    ))
+}
+
+fn catalog_save_targets_registry(
+    package: &str,
+    spec: &str,
+    policy: &CatalogSavePolicy,
+) -> Result<bool, LpmError> {
+    if !manifest_spec_has_source(package, spec)? {
+        return Ok(true);
+    }
+    if let Some(catalog) = policy.forced_catalog.as_deref() {
+        return Err(LpmError::Registry(format!(
+            "{} cannot replace a source dependency: {}@{}",
+            forced_catalog_flag(catalog),
+            lpm_common::sanitize_terminal_inline(package),
+            lpm_common::sanitize_terminal_inline(spec),
+        )));
+    }
+    // A range policy cannot replace a local, aliased, or remote source identity.
+    Ok(false)
+}
+
 pub(super) async fn resolve_catalog_policy_candidate_version(
     client: &RegistryClient,
     route_table: &RouteTable,
@@ -813,6 +888,9 @@ pub(super) async fn preflight_catalog_policy_rejection(
 
         let effective_spec =
             resolve_catalog_policy_manifest_spec(&entry.name, manifest_spec, catalog_policy)?;
+        if !catalog_save_targets_registry(&entry.name, &effective_spec, catalog_policy)? {
+            continue;
+        }
 
         if let Some(catalog_name) = forced_catalog {
             let catalog_range = catalog_policy.catalog_entry(catalog_name, &entry.name)?;
@@ -1047,18 +1125,89 @@ fn selected_swift_install_locations(
     Ok(locations.into_iter().flatten().collect())
 }
 
+fn preserved_source_targets(
+    packages: &[String],
+    manifests: &[PathBuf],
+    save_dev: bool,
+) -> Result<Vec<std::collections::HashSet<String>>, LpmError> {
+    let bare_scoped = packages
+        .iter()
+        .map(|spec| crate::save_spec::parse_user_save_intent(spec))
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .filter(|(name, intent)| {
+            name.starts_with("@lpm.dev/")
+                && matches!(intent, crate::save_spec::UserSaveIntent::Bare)
+        })
+        .map(|(name, _)| name)
+        .collect::<Vec<_>>();
+    let mut sources = Vec::with_capacity(manifests.len());
+    for path in manifests {
+        let mut names = std::collections::HashSet::new();
+        if !bare_scoped.is_empty() {
+            // Swift-only projects do not require a JavaScript manifest.
+            let text = match read_manifest_text(path) {
+                Ok(text) => Some(text),
+                Err(LpmError::NotFound(_)) => None,
+                Err(error) => return Err(error),
+            };
+            if let Some(text) = text {
+                let doc: serde_json::Value = serde_json::from_str(&text)
+                    .map_err(|error| LpmError::Registry(error.to_string()))?;
+                let key = if save_dev {
+                    "devDependencies"
+                } else {
+                    "dependencies"
+                };
+                let policy =
+                    catalog_save_policy_for_project(path.parent().unwrap_or(Path::new(".")), None)?;
+                for name in &bare_scoped {
+                    if let Some(spec) = doc[key][name].as_str() {
+                        let effective = resolve_catalog_policy_manifest_spec(name, spec, &policy)?;
+                        if manifest_spec_has_source(name, &effective)? {
+                            names.insert(name.clone());
+                        }
+                    }
+                }
+            }
+        }
+        sources.push(names);
+    }
+    Ok(sources)
+}
+
+fn validate_source_targets(
+    packages: &[String],
+    manifests: &[PathBuf],
+    save_dev: bool,
+    expected: &[std::collections::HashSet<String>],
+) -> Result<(), LpmError> {
+    if preserved_source_targets(packages, manifests, save_dev)? != expected {
+        return Err(LpmError::Registry(
+            "dependency sources changed while preparing the install; retry the command".into(),
+        ));
+    }
+    Ok(())
+}
+
 async fn route_explicit_packages(
     client: &RegistryClient,
     packages: &[String],
     save_flags: crate::save_spec::SaveFlags,
+    source_targets: &[std::collections::HashSet<String>],
 ) -> Result<(Vec<String>, Vec<RoutedSwiftPackage>), LpmError> {
     use futures::{StreamExt as _, TryStreamExt as _};
 
+    let packages = crate::save_spec::normalize_explicit_package_specs(packages)?;
     let concurrency = packages.len().clamp(1, 8);
     let mut routed = futures::stream::iter(packages.iter().cloned().enumerate())
         .map(|(index, spec)| async move {
             let (name, intent) = crate::save_spec::parse_user_save_intent(&spec)?;
-            if !name.starts_with("@lpm.dev/") {
+            let source_count = source_targets.iter().filter(|names| names.contains(&name)).count();
+            if !name.starts_with("@lpm.dev/")
+                || matches!(intent, crate::save_spec::UserSaveIntent::Workspace(_))
+                || (source_count > 0 && source_count == source_targets.len())
+            {
                 return Ok::<_, LpmError>((index, RoutedExplicitPackage::JavaScript(spec)));
             }
             let package_name = lpm_common::PackageName::parse(&name)?;
@@ -1073,6 +1222,12 @@ async fn route_explicit_packages(
             })?;
             if version_metadata.effective_ecosystem() != "swift" {
                 return Ok((index, RoutedExplicitPackage::JavaScript(spec)));
+            }
+            if source_count > 0 {
+                return Err(LpmError::Registry(format!(
+                    "{} is a source dependency in some selected manifests and a Swift registry package in others; install those targets separately",
+                    lpm_common::sanitize_terminal_inline(&name),
+                )));
             }
             let requirement =
                 swift_requirement_from_intent(&intent, &resolved_version, save_flags)?;
@@ -1181,10 +1336,13 @@ pub async fn run_add_packages(
 
     // First pass: check if any LPM packages are Swift ecosystem
     // Route Swift packages to SE-0292 registry mode
+    let manifests = [project_dir.join("package.json")];
+    let source_targets = preserved_source_targets(&packages, &manifests, save_dev)?;
     let (js_packages, swift_packages) =
-        route_explicit_packages(client, &packages, save_flags).await?;
+        route_explicit_packages(client, &packages, save_flags, &source_targets).await?;
 
     let mutation = async {
+        validate_source_targets(&packages, &manifests, save_dev, &source_targets)?;
         let mut swift_transaction = None;
         let swift_report = if swift_packages.is_empty() {
             None
@@ -1328,8 +1486,13 @@ pub async fn run_add_packages(
             let save_config = crate::save_config::SaveConfigLoader::load_for_project(project_dir)?;
             let catalog_policy =
                 catalog_save_policy_for_project(project_dir, catalog_name_override)?;
-            let staged =
-                stage_packages_to_manifest(&pkg_json_path, &js_packages, save_dev, save_flags)?;
+            let staged = stage_packages_with_catalog_policy(
+                &pkg_json_path,
+                &js_packages,
+                save_dev,
+                save_flags,
+                &catalog_policy,
+            )?;
             let route_table = load_install_route_table(project_dir, client)?;
             pin_staged_dist_tags_for_resolution(client, &route_table, &staged).await?;
             preflight_catalog_policy_rejection(client, &route_table, &staged, &catalog_policy)
@@ -1556,8 +1719,10 @@ pub async fn run_install_filtered_add(
         json_output,
     )?;
     let requested_packages = reviewed.specs;
+    let source_targets =
+        preserved_source_targets(&requested_packages, &targets.member_manifests, save_dev)?;
     let (js_packages, swift_packages) =
-        route_explicit_packages(client, &requested_packages, save_flags).await?;
+        route_explicit_packages(client, &requested_packages, save_flags, &source_targets).await?;
 
     // 3. Multi-member confirmation prompt.
     //
@@ -1588,6 +1753,12 @@ pub async fn run_install_filtered_add(
 
     let requires_workspace_lockfile = !js_packages.is_empty();
     let mutation = async {
+        validate_source_targets(
+            &requested_packages,
+            &targets.member_manifests,
+            save_dev,
+            &source_targets,
+        )?;
         let swift_locations = selected_swift_install_locations(&targets.member_manifests)?;
         if !swift_packages.is_empty() && swift_locations.is_empty() {
             return Err(LpmError::Registry(
@@ -1827,11 +1998,12 @@ pub async fn run_install_filtered_add(
             for manifest_path in &targets.member_manifests {
                 // (a) Stage the target manifest. Explicit specs land verbatim;
                 // bare/dist-tag entries get a `*` placeholder.
-                let staged = match stage_packages_to_manifest(
+                let staged = match stage_packages_with_catalog_policy(
                     manifest_path,
                     &packages,
                     save_dev,
                     save_flags,
+                    &catalog_policy,
                 ) {
                     Ok(s) => s,
                     Err(e) => {
@@ -2088,11 +2260,18 @@ fn reconcile_finalized_dependency_catalog_snapshots(
                 root.version, resolution.package_name
             ))
         })?;
-        if !catalog_range_matches_resolved(
-            &resolution.package_name,
-            &resolution.specifier,
-            &resolved_version,
-        )? {
+        let version_range =
+            match parse_manifest_spec(&resolution.package_name, &resolution.specifier)? {
+                lpm_resolver::Specifier::SemverRange(range) => Some(range),
+                lpm_resolver::Specifier::NpmAlias { range, .. } => {
+                    // A tag was already resolved by the successful install.
+                    lpm_semver::VersionReq::parse(&range).ok().map(|_| range)
+                }
+                _ => None,
+            };
+        if let Some(range) = version_range
+            && !catalog_range_matches_resolved(&resolution.package_name, &range, &resolved_version)?
+        {
             return Err(LpmError::Registry(format!(
                 "catalog snapshot: resolved {}@{} does not satisfy finalized catalog range {}",
                 resolution.package_name, root.version, resolution.specifier

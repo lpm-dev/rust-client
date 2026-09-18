@@ -3,6 +3,7 @@
 //! Tests that exercise the full install pipeline through the real binary.
 //! Network-dependent tests use MockRegistry; local-only tests use fixtures.
 
+mod install_save_policy;
 mod support;
 
 use support::assertions;
