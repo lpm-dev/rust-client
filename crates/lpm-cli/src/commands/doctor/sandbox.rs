@@ -36,6 +36,7 @@ pub(super) fn probe_sandbox_backend_with_global(
         tmpdir: tmpdir.clone(),
         read_project_full: false,
         secret_read_allow: Vec::new(),
+        dependency_read_dirs: Vec::new(),
         extra_write_dirs: Vec::new(),
     };
 

@@ -597,6 +597,7 @@ pub async fn run_workspace(
                 parallel,
                 continue_on_error,
                 stream,
+                json_output,
                 member_runtime_hints[idx].as_ref(),
                 member_task_plan,
                 &workspace_dependency_identities,
@@ -659,6 +660,7 @@ pub async fn run_workspace(
                                 parallel,
                                 continue_on_error,
                                 stream,
+                                json_output,
                                 member_runtime_hint.as_ref(),
                                 member_task_plan.as_ref(),
                                 &workspace_dependency_identities,
@@ -747,6 +749,7 @@ fn run_workspace_package(
     parallel: bool,
     continue_on_error: bool,
     stream: bool,
+    json_output: bool,
     bin_hint: &ManagedRuntimeHint,
     member_task_plan: &WorkspaceMemberTaskPlan,
     workspace_dependency_identities: &WorkspaceDependencyIdentities,
@@ -764,7 +767,8 @@ fn run_workspace_package(
     let task_count: usize = member_task_plan.task_levels.iter().map(Vec::len).sum();
 
     // Single task, no deps → simple run
-    if task_count == 1
+    if !json_output
+        && task_count == 1
         && scripts.len() == 1
         && !initially_failed_tasks.contains(&scripts[0])
         && (no_cache || !is_task_cached_with_config(&scripts[0], lpm_config))
@@ -792,6 +796,8 @@ fn run_workspace_package(
         return Ok(TaskRunReport::new(vec![TaskResult {
             name: scripts[0].clone(),
             success,
+            exit_code: None,
+            phase: None,
             duration: start.elapsed(),
             cached: false,
             skipped: false,
@@ -811,7 +817,7 @@ fn run_workspace_package(
             no_cache,
             tasks,
             lpm_config,
-            false,
+            super::format::TaskOutputPolicy::nested(json_output),
             bin_hint,
             Some(&member_task_config.package_scripts),
             initially_failed_tasks,
@@ -835,7 +841,7 @@ fn run_workspace_package(
             no_cache,
             tasks,
             lpm_config,
-            false,
+            super::format::TaskOutputPolicy::nested(json_output),
             bin_hint,
             Some(&member_task_config.package_scripts),
             initially_failed_tasks,

@@ -181,6 +181,8 @@ fn sequential_excludes_skipped() {
         TaskResult {
             name: "build".into(),
             success: true,
+            exit_code: None,
+            phase: None,
             duration: std::time::Duration::from_secs(5),
             cached: false,
             skipped: false,
@@ -188,6 +190,8 @@ fn sequential_excludes_skipped() {
         TaskResult {
             name: "test".into(),
             success: true,
+            exit_code: None,
+            phase: None,
             duration: std::time::Duration::from_secs(3),
             cached: false,
             skipped: false,
@@ -195,6 +199,8 @@ fn sequential_excludes_skipped() {
         TaskResult {
             name: "deploy".into(),
             success: false,
+            exit_code: None,
+            phase: None,
             duration: std::time::Duration::ZERO,
             cached: false,
             skipped: true,
@@ -810,6 +816,8 @@ fn json_summary_format() {
         TaskResult {
             name: "lint".into(),
             success: true,
+            exit_code: None,
+            phase: None,
             duration: std::time::Duration::from_millis(100),
             cached: false,
             skipped: false,
@@ -817,6 +825,8 @@ fn json_summary_format() {
         TaskResult {
             name: "test".into(),
             success: false,
+            exit_code: None,
+            phase: None,
             duration: std::time::Duration::from_millis(200),
             cached: false,
             skipped: false,
@@ -824,6 +834,8 @@ fn json_summary_format() {
         TaskResult {
             name: "deploy".into(),
             success: false,
+            exit_code: None,
+            phase: None,
             duration: std::time::Duration::ZERO,
             cached: false,
             skipped: true,
@@ -940,6 +952,8 @@ fn sequential_failure_exit_code_is_failure_count() {
         TaskResult {
             name: "lint".into(),
             success: false,
+            exit_code: None,
+            phase: None,
             duration: std::time::Duration::from_millis(100),
             cached: false,
             skipped: false,
@@ -947,6 +961,8 @@ fn sequential_failure_exit_code_is_failure_count() {
         TaskResult {
             name: "test".into(),
             success: false,
+            exit_code: None,
+            phase: None,
             duration: std::time::Duration::ZERO,
             cached: false,
             skipped: true,
@@ -1001,4 +1017,13 @@ fn meta_task_in_expanded_graph_is_noop() {
     let levels = lpm_runner::task_graph::task_levels(&pkg.scripts, &tasks, &["ci".into()]).unwrap();
     assert_eq!(levels.len(), 2);
     assert_eq!(levels[1], vec!["ci"]);
+}
+
+#[test]
+fn truncate_output_preserves_unicode_at_the_byte_limit() {
+    let mut output = "a".repeat(MAX_CAPTURED_OUTPUT - 1);
+    output.push_str("élast");
+    let result = truncate_output(output);
+    assert!(result.starts_with(&"a".repeat(MAX_CAPTURED_OUTPUT - 1)));
+    assert!(result.contains("output truncated"));
 }

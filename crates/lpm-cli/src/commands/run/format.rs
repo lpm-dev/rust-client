@@ -16,6 +16,8 @@ pub(super) fn print_captured_stderr(output: &str) {
 pub(super) struct TaskResult {
     pub(super) name: String,
     pub(super) success: bool,
+    pub(super) exit_code: Option<i32>,
+    pub(super) phase: Option<String>,
     pub(super) duration: std::time::Duration,
     pub(super) cached: bool,
     pub(super) skipped: bool,
@@ -62,6 +64,14 @@ impl TaskRunReport {
         self.cache_identities.get(task_name)
     }
 
+    pub(super) fn into_single_result(self) -> Result<(), LpmError> {
+        if let Some(result) = self.results.iter().find(|r| !r.success && !r.skipped) {
+            Err(LpmError::ExitCode(result.exit_code.unwrap_or(1)))
+        } else {
+            Ok(())
+        }
+    }
+
     pub(super) fn into_result(self) -> Result<(), LpmError> {
         let failure_count = self
             .results
@@ -98,9 +108,15 @@ pub(super) fn print_task_result(result: &TaskResult) {
     } else {
         let timing = format_duration(result.duration);
         install_ui::detail_line(crate::install_ui::terminal_line!(
-            "  {} {}   failed (exit 1, {})",
+            "  {} {}   failed (exit {}, {}{})",
             install_ui::red("✗"),
             install_ui::yellow(&name),
+            result.exit_code.unwrap_or(1),
+            result
+                .phase
+                .as_ref()
+                .map(|phase| format!("{}, ", lpm_common::sanitize_terminal_inline(phase)))
+                .unwrap_or_default(),
             timing,
         ));
     }
@@ -230,13 +246,20 @@ pub(super) fn print_json_summary(results: &[TaskResult], elapsed: std::time::Dur
     let tasks: Vec<serde_json::Value> = results
         .iter()
         .map(|r| {
-            serde_json::json!({
+            let mut task = serde_json::json!({
                 "name": r.name,
                 "success": r.success,
                 "cached": r.cached,
                 "skipped": r.skipped,
                 "duration_ms": r.duration.as_millis() as u64,
-            })
+            });
+            if let Some(code) = r.exit_code {
+                task["exit_code"] = code.into();
+            }
+            if let Some(phase) = &r.phase {
+                task["phase"] = phase.clone().into();
+            }
+            task
         })
         .collect();
 
@@ -256,4 +279,41 @@ pub(super) fn print_json_summary(results: &[TaskResult], elapsed: std::time::Dur
         "duration_ms": elapsed.as_millis() as u64,
     });
     println!("{}", serde_json::to_string_pretty(&json).unwrap());
+}
+
+pub(super) fn task_failure(error: &LpmError) -> (Option<i32>, Option<String>) {
+    match error {
+        LpmError::ExitCode(code) | LpmError::ScriptWithOutput { code, .. } => (Some(*code), None),
+        LpmError::ScriptPhase { code, phase, .. } => (Some(*code), Some(phase.clone())),
+        _ => (Some(1), None),
+    }
+}
+
+pub(super) fn print_task_stdout(output: &str, json_output: bool) {
+    if json_output {
+        print_captured_stderr(output);
+    } else {
+        print_captured_stdout(output);
+    }
+}
+
+#[derive(Clone, Copy)]
+pub(super) struct TaskOutputPolicy {
+    pub(super) reserve_stdout: bool,
+    pub(super) report_json: bool,
+}
+
+impl TaskOutputPolicy {
+    pub(super) fn standalone(json: bool) -> Self {
+        Self {
+            reserve_stdout: json,
+            report_json: json,
+        }
+    }
+    pub(super) fn nested(json: bool) -> Self {
+        Self {
+            reserve_stdout: json,
+            report_json: false,
+        }
+    }
 }

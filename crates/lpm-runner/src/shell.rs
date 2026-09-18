@@ -165,6 +165,12 @@ fn push_capped_line(buf: &mut String, line: &str) {
     ));
 }
 
+pub(crate) fn append_capped_output(buffer: &mut String, captured: &str) {
+    for line in captured.split_terminator('\n') {
+        push_capped_line(buffer, line);
+    }
+}
+
 fn drain_captured_stream<R: std::io::Read>(mut reader: R, mut render: impl FnMut(&str)) -> String {
     let mut captured = String::with_capacity(OUTPUT_READ_CHUNK_BYTES);
     let mut pending = Vec::with_capacity(OUTPUT_READ_CHUNK_BYTES);

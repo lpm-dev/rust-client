@@ -235,7 +235,15 @@ pub(super) fn create_bin_links_v2(
         return Ok(0);
     }
 
-    ensure_bin_dir(&bin_dir)?;
+    emit_bin_specs(&bin_dir, &project_node_modules, specs)
+}
+
+fn emit_bin_specs(
+    bin_dir: &Path,
+    project_node_modules: &Path,
+    specs: Vec<BinLinkSpec>,
+) -> Result<usize, LpmError> {
+    ensure_bin_dir(bin_dir)?;
     let desired: HashSet<String> = specs
         .iter()
         .map(|spec| {
@@ -249,13 +257,13 @@ pub(super) fn create_bin_links_v2(
             }
         })
         .collect();
-    reconcile_bin_dir(&bin_dir, &desired)?;
+    reconcile_bin_dir(bin_dir, &desired)?;
 
     let mut link_path = PathBuf::with_capacity(bin_dir.as_os_str().len() + 64);
     let mut count = 0usize;
     for spec in specs {
         link_path.clear();
-        link_path.push(&bin_dir);
+        link_path.push(bin_dir);
         link_path.push(&spec.cmd_name);
 
         #[cfg(unix)]
@@ -263,9 +271,8 @@ pub(super) fn create_bin_links_v2(
             if spec.needs_project_node_path
                 || !matches!(spec.unix_invocation, UnixBinInvocation::Direct)
             {
-                let project_node_modules = spec
-                    .needs_project_node_path
-                    .then_some(project_node_modules.as_path());
+                let project_node_modules =
+                    spec.needs_project_node_path.then_some(project_node_modules);
                 write_unix_bin_wrapper(
                     &link_path,
                     &spec.target,
@@ -273,7 +280,7 @@ pub(super) fn create_bin_links_v2(
                     &spec.unix_invocation,
                 )?;
             } else {
-                let relative = pathdiff::diff_paths(&spec.target, &bin_dir)
+                let relative = pathdiff::diff_paths(&spec.target, bin_dir)
                     .unwrap_or_else(|| spec.target.clone());
                 if std::fs::read_link(&link_path).is_ok_and(|existing| existing == relative) {
                     count += 1;
@@ -344,6 +351,104 @@ pub(super) fn create_bin_links_v2(
         count += 1;
     }
     Ok(count)
+}
+
+/// An installed provider chosen by the caller from the consumer's dependency graph.
+pub struct LifecycleBinProvider<'a> {
+    pub name: &'a str,
+    pub directory: &'a Path,
+}
+
+/// A generated shim and the validated target used to fingerprint its executable inputs.
+pub struct LifecycleBin {
+    pub name: String,
+    pub shim: PathBuf,
+    pub target: PathBuf,
+}
+
+/// Emit dependency-local tools without changing installed package directories.
+/// Providers are ordered by precedence. The first provider for a command wins.
+pub fn create_lifecycle_bin_links(
+    bin_dir: &Path,
+    providers: &[LifecycleBinProvider<'_>],
+) -> Result<Vec<LifecycleBin>, LpmError> {
+    let mut specs = Vec::with_capacity(providers.len());
+    let mut bins = Vec::with_capacity(providers.len());
+    let mut names = HashSet::with_capacity(providers.len());
+    for provider in providers {
+        let content = lpm_common::read_file_capped(
+            &provider.directory.join("package.json"),
+            lpm_common::CONFIG_FILE_SIZE_CAP_BYTES,
+        )
+        .map_err(|error| {
+            LpmError::Store(format!(
+                "cannot read lifecycle tool provider {}: {error}",
+                provider.name
+            ))
+        })?;
+        if !content.windows(5).any(|window| window == b"\"bin\"") {
+            continue;
+        }
+        let Some(config) = lpm_workspace::parse_bin_field(&content).map_err(|error| {
+            LpmError::Store(format!(
+                "invalid lifecycle tools in {}: {error}",
+                provider.name
+            ))
+        })?
+        else {
+            continue;
+        };
+        let mut entries = config.entries(provider.name);
+        entries.sort_unstable();
+        for (name, relative) in entries {
+            if names.contains(&name) {
+                continue;
+            }
+            if let Err(error) = validate_bin_name(&name, provider.name) {
+                tracing::warn!("rejecting lifecycle bin {name}: {error}");
+                continue;
+            }
+            let target = match validate_bin_target(provider.directory, &relative) {
+                Ok(target) => target,
+                Err(error) => {
+                    tracing::warn!("rejecting lifecycle bin {name}: {error}");
+                    continue;
+                }
+            };
+            #[cfg(unix)]
+            let unix_invocation = match unix_bin_invocation(&target) {
+                Ok(invocation) => invocation,
+                Err(error) => {
+                    tracing::warn!("rejecting lifecycle bin {name}: {error}");
+                    continue;
+                }
+            };
+            #[cfg(windows)]
+            if let Err(error) = lpm_common::symlink::validate_cmd_path(&target.to_string_lossy()) {
+                tracing::warn!("rejecting lifecycle bin {name}: {error}");
+                continue;
+            }
+            names.insert(name.clone());
+            #[cfg(windows)]
+            let shim = bin_dir.join(format!("{name}.cmd"));
+            #[cfg(not(windows))]
+            let shim = bin_dir.join(&name);
+            bins.push(LifecycleBin {
+                name: name.clone(),
+                shim,
+                target: target.clone(),
+            });
+            specs.push(BinLinkSpec {
+                cmd_name: name,
+                target,
+                needs_project_node_path: false,
+                #[cfg(unix)]
+                unix_invocation,
+            });
+        }
+    }
+    emit_bin_specs(bin_dir, bin_dir, specs)?;
+    Ok(bins)
 }
 
 #[cfg(unix)]

@@ -108,6 +108,12 @@ pub(crate) fn describe_rules_with_isolation(
                 .map(|path| (path, RuleAccess::Read)),
         );
     }
+    rules.extend(
+        spec.dependency_read_dirs
+            .iter()
+            .cloned()
+            .map(|path| (path, RuleAccess::Read)),
+    );
     // NVM-installed toolchain. Only added if the host has a matching
     // dir — [`crate::linux::spawn`] filters missing paths at FD-open
     // time; the description layer stays complete.
@@ -192,6 +198,7 @@ mod tests {
             tmpdir: PathBuf::from("/tmp/lpm-scratch"),
             read_project_full: false,
             secret_read_allow: Vec::new(),
+            dependency_read_dirs: Vec::new(),
             extra_write_dirs: Vec::new(),
         }
     }

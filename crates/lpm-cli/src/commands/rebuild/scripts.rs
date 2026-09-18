@@ -385,6 +385,29 @@ pub(super) fn package_build_layers<'a>(
         .iter()
         .filter_map(|package| package.instance_id.map(|id| (id, package)))
         .collect::<HashMap<_, _>>();
+    let mut selected_legacy = HashMap::<_, Vec<usize>>::new();
+    for (index, package) in packages
+        .iter()
+        .enumerate()
+        .filter(|(_, p)| p.instance_id.is_none())
+    {
+        selected_legacy
+            .entry((package.name.as_str(), package.version.as_str()))
+            .or_default()
+            .push(index);
+    }
+    let mut locked_legacy = HashMap::<_, Vec<usize>>::new();
+    for (index, package) in lockfile
+        .packages
+        .iter()
+        .enumerate()
+        .filter(|(_, p)| p.instance_id.is_none())
+    {
+        locked_legacy
+            .entry((package.name.as_str(), package.version.as_str()))
+            .or_default()
+            .push(index);
+    }
     let mut in_degree = vec![0_usize; packages.len()];
     let mut dependents = vec![Vec::<usize>::new(); packages.len()];
     let mut edges = HashSet::new();
@@ -393,47 +416,70 @@ pub(super) fn package_build_layers<'a>(
         if let Some(instance_id) = package.instance_id
             && let Some(locked) = locked_by_instance.get(&instance_id)
         {
-            for target in locked
+            let mut pending = locked
                 .dependency_targets
                 .values()
                 .chain(locked.peer_targets.values())
-            {
-                if let Some(&dependency_index) = selected_by_instance.get(target)
-                    && dependency_index != consumer_index
-                    && edges.insert((dependency_index, consumer_index))
-                {
-                    in_degree[consumer_index] += 1;
-                    dependents[dependency_index].push(consumer_index);
+                .copied()
+                .collect::<Vec<_>>();
+            let mut visited = HashSet::new();
+            while let Some(target) = pending.pop() {
+                if !visited.insert(target) {
+                    continue;
+                }
+                if let Some(&dependency_index) = selected_by_instance.get(&target) {
+                    if dependency_index != consumer_index
+                        && edges.insert((dependency_index, consumer_index))
+                    {
+                        in_degree[consumer_index] += 1;
+                        dependents[dependency_index].push(consumer_index);
+                    }
+                } else if let Some(dependency) = locked_by_instance.get(&target) {
+                    pending.extend(
+                        dependency
+                            .dependency_targets
+                            .values()
+                            .chain(dependency.peer_targets.values())
+                            .copied(),
+                    );
                 }
             }
             continue;
         }
 
-        let Some(locked) = lockfile.packages.iter().find(|candidate| {
-            candidate.instance_id.is_none()
-                && candidate.name == package.name
-                && candidate.version == package.version
-                && candidate.integrity == package.integrity
-        }) else {
-            continue;
-        };
-        for dependency in locked.dependencies.iter().chain(&locked.peers) {
-            let Some((local_name, version)) = dependency.rsplit_once('@') else {
+        let mut pending = locked_legacy
+            .get(&(package.name.as_str(), package.version.as_str()))
+            .into_iter()
+            .flatten()
+            .copied()
+            .filter(|&index| lockfile.packages[index].integrity == package.integrity)
+            .collect::<Vec<_>>();
+        let mut visited = HashSet::new();
+        while let Some(index) = pending.pop() {
+            if !visited.insert(index) {
                 continue;
-            };
-            let target_name = locked
-                .alias_dependencies
-                .iter()
-                .find(|alias| alias[0] == local_name)
-                .map_or(local_name, |alias| alias[1].as_str());
-            for (dependency_index, candidate) in packages.iter().enumerate() {
-                if candidate.name == target_name
-                    && candidate.version == version
-                    && dependency_index != consumer_index
-                    && edges.insert((dependency_index, consumer_index))
-                {
-                    in_degree[consumer_index] += 1;
-                    dependents[dependency_index].push(consumer_index);
+            }
+            let locked = &lockfile.packages[index];
+            for dependency in locked.dependencies.iter().chain(&locked.peers) {
+                let Some((local_name, version)) = dependency.rsplit_once('@') else {
+                    continue;
+                };
+                let target_name = locked
+                    .alias_dependencies
+                    .iter()
+                    .find(|alias| alias[0] == local_name)
+                    .map_or(local_name, |alias| alias[1].as_str());
+                if let Some(selected) = selected_legacy.get(&(target_name, version)) {
+                    for &dependency_index in selected {
+                        if dependency_index != consumer_index
+                            && edges.insert((dependency_index, consumer_index))
+                        {
+                            in_degree[consumer_index] += 1;
+                            dependents[dependency_index].push(consumer_index);
+                        }
+                    }
+                } else if let Some(targets) = locked_legacy.get(&(target_name, version)) {
+                    pending.extend(targets);
                 }
             }
         }

@@ -2053,3 +2053,16 @@ async fn run_with_options_under_store_lock(
 
     Ok(())
 }
+
+/// Keep one install report across the install pipeline and its root lifecycle.
+pub(crate) async fn with_deferred_report<F>(future: F) -> Result<(), LpmError>
+where
+    F: std::future::Future<Output = Result<(), LpmError>>,
+{
+    let capture = report_capture::new_capture();
+    report_capture::scope(capture.clone(), future).await?;
+    if let Some(report) = report_capture::take(&capture) {
+        report_capture::emit_install_json(&report);
+    }
+    Ok(())
+}

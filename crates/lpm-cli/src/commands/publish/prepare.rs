@@ -914,6 +914,7 @@ fn dump_swift_manifest_from_publish_artifact_with_command(
         tmpdir: sandbox_cache.clone(),
         read_project_full: false,
         secret_read_allow: Vec::new(),
+        dependency_read_dirs: Vec::new(),
         extra_write_dirs: Vec::new(),
     };
     let options = lpm_sandbox::SandboxOptions {

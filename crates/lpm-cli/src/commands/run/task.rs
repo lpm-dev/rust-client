@@ -66,6 +66,7 @@ pub(super) fn run_task(
 }
 
 /// Resolve and run a task with tee-captured output (for caching).
+#[cfg(test)]
 pub(super) fn run_task_captured(
     project_dir: &Path,
     task_name: &str,
@@ -74,19 +75,47 @@ pub(super) fn run_task_captured(
     tasks: &HashMap<String, lpm_runner::lpm_json::TaskConfig>,
     bin_hint: &ManagedRuntimeHint,
 ) -> Result<lpm_runner::script::ScriptOutput, LpmError> {
+    run_task_captured_with_reserved_stdout(
+        project_dir,
+        task_name,
+        extra_args,
+        env_mode,
+        tasks,
+        bin_hint,
+        false,
+    )
+}
+
+pub(super) fn run_task_captured_with_reserved_stdout(
+    project_dir: &Path,
+    task_name: &str,
+    extra_args: &[String],
+    env_mode: Option<&str>,
+    tasks: &HashMap<String, lpm_runner::lpm_json::TaskConfig>,
+    bin_hint: &ManagedRuntimeHint,
+    reserve_stdout: bool,
+) -> Result<lpm_runner::script::ScriptOutput, LpmError> {
     // Check lpm.json for command override
     if let Some(command) = tasks.get(task_name).and_then(|tc| tc.command.as_ref()) {
-        return lpm_runner::script::run_task_command_captured(
+        return lpm_runner::script::run_task_command_captured_with_reserved_stdout(
             project_dir,
             task_name,
             command,
             extra_args,
             env_mode,
             bin_hint,
+            reserve_stdout,
         );
     }
     // Fall back to package.json script
-    lpm_runner::script::run_script_captured(project_dir, task_name, extra_args, env_mode, bin_hint)
+    lpm_runner::script::run_script_captured_with_reserved_stdout(
+        project_dir,
+        task_name,
+        extra_args,
+        env_mode,
+        bin_hint,
+        reserve_stdout,
+    )
 }
 
 pub(super) fn reject_direct_hidden_scripts(scripts: &[String]) -> Result<(), LpmError> {

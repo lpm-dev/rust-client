@@ -1104,6 +1104,7 @@ async fn async_main() -> Result<()> {
                             commands::root_lifecycle::RootProjectLifecycle::load(&cwd)?;
                         root_lifecycle.run_dev_preinstall(&cwd, cli.json)?;
 
+                        commands::install::with_deferred_report(async {
                         commands::install::run_with_options(
                             &client,
                             &cwd,
@@ -1141,6 +1142,7 @@ async fn async_main() -> Result<()> {
 
                         commands::root_lifecycle::RootProjectLifecycle::load(&cwd)?
                             .run_after_successful_install(&cwd, cli.json)
+                        }).await
                     }
                 }
             } else if !filter.is_empty() || !filter_prod.is_empty() || workspace_root {
@@ -2788,7 +2790,8 @@ async fn async_main() -> Result<()> {
             let root_lifecycle = commands::root_lifecycle::RootProjectLifecycle::load(&cwd)?;
             root_lifecycle.run_dev_preinstall(&cwd, cli.json)?;
 
-            commands::install::run_with_options(
+            commands::install::with_deferred_report(async {
+                        commands::install::run_with_options(
                 &client,
                 &cwd,
                 cli.json,
@@ -2825,6 +2828,7 @@ async fn async_main() -> Result<()> {
 
             commands::root_lifecycle::RootProjectLifecycle::load(&cwd)?
                 .run_after_successful_install(&cwd, cli.json)
+                        }).await
         }).await,
         Commands::Dev(args) => {
             let build_args::DevArgs {

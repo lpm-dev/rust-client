@@ -1,0 +1,25 @@
+---
+source: tests/workflows/tests/npm_lifecycle_contract.rs
+assertion_line: 450
+expression: envelope
+---
+{
+  "success": false,
+  "tasks": [
+    {
+      "name": "probe",
+      "success": false,
+      "cached": false,
+      "skipped": false,
+      "duration_ms": "<ms>",
+      "exit_code": 42,
+      "phase": "preprobe"
+    }
+  ],
+  "total": 1,
+  "passed": 0,
+  "failed": 1,
+  "skipped": 0,
+  "cached": 0,
+  "duration_ms": "<ms>"
+}

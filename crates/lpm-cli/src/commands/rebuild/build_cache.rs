@@ -1,7 +1,8 @@
 use self::toolchain_snapshot::{
     ComputedToolchainFingerprint, ToolchainFingerprintCache, cached_toolchain_fingerprint,
 };
-use super::script_execution::{build_lifecycle_environment, build_lifecycle_path};
+use super::lifecycle_tools::LifecycleTools;
+use super::script_execution::build_lifecycle_environment;
 use super::scripts::ScriptablePackage;
 use crate::capability::CapabilitySet;
 use lpm_sandbox::{SandboxMode, SandboxOptions, SandboxPosture};
@@ -98,7 +99,7 @@ impl BuildCacheScratch {
     pub(super) fn create(package_dir: &Path, graph_key_digest: &str) -> std::io::Result<Self> {
         let path = Self::path_for(package_dir, graph_key_digest)?;
         match std::fs::symlink_metadata(&path) {
-            Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {
+            Ok(metadata) if metadata.is_dir() && !lpm_common::is_symlink_or_junction(&metadata) => {
                 std::fs::remove_dir_all(&path)?;
             }
             Ok(_) => std::fs::remove_file(&path)?,
@@ -133,13 +134,20 @@ pub(super) struct BuildCacheInvocation {
     sandbox: BuildSandboxFingerprint,
     environment: HashMap<String, String>,
     trusted_toolchain_environment: HashMap<String, String>,
-    build_executable_environment: HashMap<String, String>,
     project_dir: PathBuf,
     toolchain_cache: Option<ToolchainFingerprintCache>,
     native_toolchain_hash: OnceLock<Option<String>>,
+    dependency_input_hashes: Mutex<HashMap<PathBuf, String>>,
 }
 
 impl BuildCacheInvocation {
+    pub(super) fn begin_layer(&self) {
+        self.dependency_input_hashes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(super) fn prepare(
         lockfile: &lpm_lockfile::Lockfile,
@@ -174,16 +182,6 @@ impl BuildCacheInvocation {
             return None;
         };
         let platform = PlatformTuple::current();
-        let mut build_executable_environment = environment.clone();
-        let parent_path = environment
-            .iter()
-            .find(|(key, _)| key.eq_ignore_ascii_case("PATH"))
-            .map(|(_, value)| value.as_str());
-        build_executable_environment.retain(|key, _| !key.eq_ignore_ascii_case("PATH"));
-        build_executable_environment.insert(
-            "PATH".into(),
-            build_lifecycle_path(project_dir, parent_path),
-        );
         Some(Self {
             dependency_closure_hash: hash_lockfile_graph(lockfile),
             platform: BuildPlatformFingerprint {
@@ -202,12 +200,12 @@ impl BuildCacheInvocation {
             },
             environment: environment.clone(),
             trusted_toolchain_environment,
-            build_executable_environment,
             project_dir: project_dir.to_path_buf(),
             toolchain_cache: lpm_common::LpmRoot::from_env()
                 .ok()
                 .map(ToolchainFingerprintCache::from_lpm_root),
             native_toolchain_hash: OnceLock::new(),
+            dependency_input_hashes: Mutex::new(HashMap::new()),
         })
     }
 }
@@ -474,7 +472,14 @@ pub(super) fn build_key_for_package(
     invocation: &BuildCacheInvocation,
     package: &ScriptablePackage,
     project_dir: &Path,
+    tools: &LifecycleTools,
+    scratch_path: &Path,
 ) -> Option<BuildCacheKey> {
+    // Build artifacts cannot represent linker-owned links that escape the package tree.
+    if tools.has_nested_dependency {
+        debug_bypass("package contains a nested same-name dependency link");
+        return None;
+    }
     let Some(graph_key_digest) = package.graph_key_digest.as_ref() else {
         debug_bypass(&format!("{} has no v2 graph identity", package.name));
         return None;
@@ -486,28 +491,36 @@ pub(super) fn build_key_for_package(
         ));
         return None;
     };
-    let scratch_path = match BuildCacheScratch::path_for(&package.store_path, graph_key_digest) {
-        Ok(path) => path,
-        Err(error) => {
-            debug_bypass(&format!(
-                "{} has invalid v2 build-cache context: {error}",
-                package.name
-            ));
-            return None;
-        }
-    };
-    let lifecycle_environment =
-        build_lifecycle_environment(&invocation.environment, project_dir, &scratch_path);
+    let lifecycle_environment = build_lifecycle_environment(
+        &invocation.environment,
+        project_dir,
+        scratch_path,
+        Some(&tools.bin_dir),
+    );
+    let mut build_environment: HashMap<_, _> = lifecycle_environment.iter().cloned().collect();
+    let context = lpm_runner::npm_context::NpmScriptContext::new(
+        Some(&package.name),
+        Some(&package.version),
+        &package.store_path,
+        &std::env::current_dir().ok()?,
+    );
+    let mut phase_environments = Vec::with_capacity(package.scripts.len());
     let mut scripts = Vec::with_capacity(EXECUTED_INSTALL_PHASES.len());
     for phase in EXECUTED_INSTALL_PHASES {
         if let Some(command) = package.scripts.get(*phase) {
+            context.apply(&mut build_environment, phase, command);
+            let pairs = build_environment
+                .iter()
+                .map(|(key, value)| (key.clone(), value.clone()))
+                .collect::<Vec<_>>();
+            phase_environments.push(hash_environment_pairs(&pairs));
             scripts.push(BuildScriptFingerprint {
                 phase: (*phase).to_string(),
                 command: command.clone(),
             });
         }
     }
-    if !build_visible_node_matches_trusted(invocation) {
+    if !build_visible_node_matches_trusted(invocation, &build_environment) {
         debug_bypass("build-visible Node does not match the trusted runtime");
         return None;
     }
@@ -515,9 +528,8 @@ pub(super) fn build_key_for_package(
         let Some(hash) = invocation
             .native_toolchain_hash
             .get_or_init(|| {
-                hash_toolchain_cached(
+                hash_host_toolchain_cached(
                     &invocation.trusted_toolchain_environment,
-                    &invocation.build_executable_environment,
                     &invocation.project_dir,
                     invocation.toolchain_cache.as_ref(),
                 )
@@ -529,12 +541,19 @@ pub(super) fn build_key_for_package(
             return None;
         };
         let invoked_executables =
-            hash_invoked_build_executables(package, &invocation.build_executable_environment);
-        hash_records([hash.as_bytes(), invoked_executables.as_bytes()])
+            hash_invoked_build_executables(package, &build_environment, Some(tools));
+        let visible = hash_build_visible_toolchain_executables(&build_environment, Some(tools));
+        hash_records([
+            hash.as_bytes(),
+            invoked_executables.as_bytes(),
+            visible.as_bytes(),
+        ])
     } else {
         RUNTIME_ONLY_TOOLCHAIN_FINGERPRINT.to_string()
     };
-    let environment_hash = hash_environment_pairs(&lifecycle_environment);
+    let tools_hash = lifecycle_tools_identity(tools, invocation).ok()?;
+    let toolchain_hash = hash_records([toolchain_hash.as_bytes(), tools_hash.as_bytes()]);
+    let environment_hash = hash_records(phase_environments.iter().map(String::as_bytes));
     let key = BuildCacheKey::derive(&BuildKeyInputs {
         source_integrity: package.source_integrity.clone(),
         graph_key_digest: graph_key_digest.clone(),
@@ -556,9 +575,12 @@ pub(super) fn build_key_for_package(
     Some(key)
 }
 
-fn build_visible_node_matches_trusted(invocation: &BuildCacheInvocation) -> bool {
+fn build_visible_node_matches_trusted(
+    invocation: &BuildCacheInvocation,
+    build_environment: &HashMap<String, String>,
+) -> bool {
     let trusted = resolve_executable("node", &invocation.trusted_toolchain_environment);
-    let build_visible = resolve_executable("node", &invocation.build_executable_environment);
+    let build_visible = resolve_executable("node", build_environment);
     trusted.is_some() && trusted == build_visible
 }
 
@@ -938,9 +960,24 @@ fn hash_toolchain(
     hash_toolchain_cached(trusted_environment, build_environment, project_dir, None)
 }
 
+#[cfg(test)]
 fn hash_toolchain_cached(
     trusted_environment: &HashMap<String, String>,
     build_environment: &HashMap<String, String>,
+    project_dir: &Path,
+    cache: Option<&ToolchainFingerprintCache>,
+) -> std::io::Result<String> {
+    let host_fingerprint = hash_host_toolchain_cached(trusted_environment, project_dir, cache)?;
+    let build_visible_fingerprint =
+        hash_build_visible_toolchain_executables(build_environment, None);
+    Ok(hash_records([
+        host_fingerprint.as_bytes(),
+        build_visible_fingerprint.as_bytes(),
+    ]))
+}
+
+fn hash_host_toolchain_cached(
+    trusted_environment: &HashMap<String, String>,
     project_dir: &Path,
     cache: Option<&ToolchainFingerprintCache>,
 ) -> std::io::Result<String> {
@@ -969,11 +1006,7 @@ fn hash_toolchain_cached(
         )?,
         None => compute()?.fingerprint,
     };
-    let build_visible_fingerprint = hash_build_visible_toolchain_executables(build_environment);
-    Ok(hash_records([
-        host_fingerprint.as_bytes(),
-        build_visible_fingerprint.as_bytes(),
-    ]))
+    Ok(host_fingerprint)
 }
 
 fn toolchain_snapshot_base_key(
@@ -1018,7 +1051,10 @@ fn toolchain_snapshot_base_key(
     format!("sha256-{}", hex::encode(hasher.finalize()))
 }
 
-fn hash_build_visible_toolchain_executables(build_environment: &HashMap<String, String>) -> String {
+fn hash_build_visible_toolchain_executables(
+    build_environment: &HashMap<String, String>,
+    tools: Option<&LifecycleTools>,
+) -> String {
     let mut hasher = Sha256::new();
     hasher.update(b"lpm-build-visible-toolchain-v1\0");
     let mut identities = HashMap::with_capacity(TOOLCHAIN_PROBES.len());
@@ -1032,7 +1068,7 @@ fn hash_build_visible_toolchain_executables(build_environment: &HashMap<String, 
             .entry(*program)
             .or_insert_with(|| {
                 let executable = resolve_executable(program, build_environment)?;
-                let identity = runtime_executable_identity(&executable).ok()?;
+                let identity = build_executable_identity(&executable, tools).ok()?;
                 Some((executable, identity))
             })
             .as_ref()
@@ -1330,6 +1366,7 @@ fn hash_optional_file(path: &Path, hasher: &mut Sha256) -> std::io::Result<()> {
 fn hash_invoked_build_executables(
     package: &ScriptablePackage,
     environment: &HashMap<String, String>,
+    tools: Option<&LifecycleTools>,
 ) -> String {
     let mut identities = Vec::new();
     for command in package.scripts.values() {
@@ -1347,13 +1384,80 @@ fn hash_invoked_build_executables(
             let Some(path) = resolve_executable(executable, environment) else {
                 continue;
             };
-            if let Ok(identity) = runtime_executable_identity(&path) {
+            if let Ok(identity) = build_executable_identity(&path, tools) {
                 identities.push(format!("{executable}\0{identity}"));
             }
         }
     }
     identities.sort_unstable();
     hash_records(identities.iter().map(String::as_bytes))
+}
+
+fn build_executable_identity(
+    path: &Path,
+    tools: Option<&LifecycleTools>,
+) -> std::io::Result<String> {
+    if let Some(bin) = tools.and_then(|tools| {
+        tools
+            .bins
+            .iter()
+            .find(|bin| bin.shim == path || bin.target == path)
+    }) {
+        let mut hasher = Sha256::new();
+        hasher.update(b"lifecycle-bin-v2\0");
+        hash_os_path(&mut hasher, &bin.target);
+        if std::fs::symlink_metadata(&bin.shim)?
+            .file_type()
+            .is_symlink()
+        {
+            hash_os_path(&mut hasher, &std::fs::read_link(&bin.shim)?);
+        } else {
+            let recipe =
+                lpm_common::read_file_capped(&bin.shim, lpm_common::CONFIG_FILE_SIZE_CAP_BYTES)
+                    .map_err(|e| std::io::Error::other(e.to_string()))?;
+            hasher.update(recipe);
+        }
+        return Ok(format!("sha256-{}", hex::encode(hasher.finalize())));
+    }
+    runtime_executable_identity(path)
+}
+
+fn lifecycle_tools_identity(
+    tools: &LifecycleTools,
+    invocation: &BuildCacheInvocation,
+) -> std::io::Result<String> {
+    let mut identities = tools.graph_identities.clone();
+    for bin in &tools.bins {
+        identities.push(format!(
+            "{}\0{}",
+            bin.name,
+            build_executable_identity(&bin.shim, Some(tools))?
+        ));
+    }
+    let mut input_hashes = invocation
+        .dependency_input_hashes
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    for directory in tools
+        .read_dirs
+        .iter()
+        .filter(|directory| **directory != tools.bin_dir)
+    {
+        let fingerprint = match input_hashes.get(directory) {
+            Some(fingerprint) => fingerprint.clone(),
+            None => {
+                let mut hasher = Sha256::new();
+                hash_os_path(&mut hasher, directory);
+                hash_directory_tree(directory, &mut hasher)?;
+                let fingerprint = format!("sha256-{}", hex::encode(hasher.finalize()));
+                input_hashes.insert(directory.clone(), fingerprint.clone());
+                fingerprint
+            }
+        };
+        identities.push(fingerprint);
+    }
+    identities.sort_unstable();
+    Ok(hash_records(identities.iter().map(String::as_bytes)))
 }
 
 fn resolve_executable(executable: &str, environment: &HashMap<String, String>) -> Option<PathBuf> {
@@ -1373,7 +1477,7 @@ fn resolve_executable(executable: &str, environment: &HashMap<String, String>) -
 }
 
 fn hash_directory_tree(root: &Path, hasher: &mut Sha256) -> std::io::Result<()> {
-    hasher.update(b"directory-tree-v1\0");
+    hasher.update(b"directory-tree-v2\0");
     if !root.exists() {
         hasher.update(b"absent");
         return Ok(());
@@ -1388,19 +1492,35 @@ fn hash_directory_tree(root: &Path, hasher: &mut Sha256) -> std::io::Result<()> 
             let relative = path.strip_prefix(root).unwrap_or(&path);
             hash_os_path(hasher, relative);
             let file_type = entry.file_type()?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                hasher.update(
+                    std::fs::symlink_metadata(&path)?
+                        .permissions()
+                        .mode()
+                        .to_le_bytes(),
+                );
+            }
+            #[cfg(not(unix))]
+            hasher.update([u8::from(
+                std::fs::symlink_metadata(&path)?.permissions().readonly(),
+            )]);
             if file_type.is_dir() {
                 hasher.update(b"d");
                 pending.push(path);
             } else if file_type.is_file() {
                 hasher.update(b"f");
                 let mut file = std::fs::File::open(path)?;
+                let mut content_hash = Sha256::new();
                 loop {
                     let read = file.read(&mut buffer)?;
                     if read == 0 {
                         break;
                     }
-                    hasher.update(&buffer[..read]);
+                    content_hash.update(&buffer[..read]);
                 }
+                hasher.update(content_hash.finalize());
             } else if file_type.is_symlink() {
                 hasher.update(b"l");
                 hash_os_path(hasher, &std::fs::read_link(path)?);
@@ -1938,11 +2058,7 @@ mod tests {
         let graph_key_digest = write_link_meta(&link_dir, "esbuild");
         let platform = PlatformTuple::current();
         let trusted_path = trusted_bin.display().to_string();
-        let trusted_environment = HashMap::from([("PATH".to_string(), trusted_path.clone())]);
-        let build_executable_environment = HashMap::from([(
-            "PATH".to_string(),
-            build_lifecycle_path(&project, Some(&trusted_path)),
-        )]);
+        let trusted_environment = HashMap::from([("PATH".to_string(), trusted_path)]);
         let invocation = BuildCacheInvocation {
             dependency_closure_hash: "graph".into(),
             platform: BuildPlatformFingerprint {
@@ -1968,16 +2084,25 @@ mod tests {
             },
             environment: trusted_environment.clone(),
             trusted_toolchain_environment: trusted_environment,
-            build_executable_environment,
             project_dir: project.clone(),
             toolchain_cache: None,
             native_toolchain_hash: OnceLock::new(),
+            dependency_input_hashes: Mutex::new(HashMap::new()),
         };
         let mut package = scriptable_package("esbuild", "node install.js");
         package.store_path = package_dir;
         package.graph_key_digest = Some(graph_key_digest);
 
-        assert!(build_key_for_package(&invocation, &package, &project).is_none());
+        assert!(
+            build_key_for_package(
+                &invocation,
+                &package,
+                &project,
+                &LifecycleTools::prepare(&project, None, &project, &project).unwrap(),
+                &project
+            )
+            .is_none()
+        );
     }
 
     #[test]
@@ -2043,10 +2168,10 @@ mod tests {
         std::fs::set_permissions(&cmake_js, std::fs::Permissions::from_mode(0o755)).unwrap();
         let environment = HashMap::from([("PATH".to_string(), bin.display().to_string())]);
         let package = scriptable_package("fixture", "cmake-js compile");
-        let first = hash_invoked_build_executables(&package, &environment);
+        let first = hash_invoked_build_executables(&package, &environment, None);
 
         std::fs::write(&cmake_js, "#!/bin/sh\necho cmake-js-two\n").unwrap();
-        let second = hash_invoked_build_executables(&package, &environment);
+        let second = hash_invoked_build_executables(&package, &environment, None);
 
         assert_ne!(first, second);
     }
@@ -2182,5 +2307,40 @@ mod tests {
         let package = scriptable_package("fixture", "prebuild-install || node-gyp rebuild");
 
         assert!(is_cacheable_native_build(&package));
+    }
+    #[test]
+    fn dependency_tree_hash_frames_files_unambiguously() {
+        let first = tempfile::tempdir().unwrap();
+        let second = tempfile::tempdir().unwrap();
+        std::fs::write(first.path().join("a"), b"X").unwrap();
+        std::fs::write(first.path().join("b"), b"Y").unwrap();
+        let mut merged = b"X\x1e".to_vec();
+        merged.extend_from_slice(&1_u64.to_le_bytes());
+        merged.extend_from_slice(b"bfY");
+        std::fs::write(second.path().join("a"), merged).unwrap();
+        let hash = |path: &Path| {
+            let mut hasher = Sha256::new();
+            hash_directory_tree(path, &mut hasher).unwrap();
+            hasher.finalize()
+        };
+        assert_ne!(hash(first.path()), hash(second.path()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dependency_tree_hash_tracks_executable_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        let helper = root.path().join("helper.sh");
+        std::fs::write(&helper, b"#!/bin/sh\nexit 0\n").unwrap();
+        let hash = || {
+            let mut hasher = Sha256::new();
+            hash_directory_tree(root.path(), &mut hasher).unwrap();
+            hasher.finalize()
+        };
+        std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let first = hash();
+        std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert_ne!(first, hash());
     }
 }

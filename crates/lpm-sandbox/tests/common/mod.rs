@@ -57,6 +57,7 @@ impl SandboxFixture {
             tmpdir: PathBuf::from("/tmp"),
             read_project_full: false,
             secret_read_allow: Vec::new(),
+            dependency_read_dirs: Vec::new(),
             extra_write_dirs: Vec::new(),
         };
         lpm_sandbox::prepare_writable_dirs(&spec).expect("prepare_writable_dirs");
@@ -135,6 +136,7 @@ pub fn sandbox_supported(mode: SandboxMode) -> bool {
             tmpdir: PathBuf::from("/tmp"),
             read_project_full: false,
             secret_read_allow: Vec::new(),
+            dependency_read_dirs: Vec::new(),
             extra_write_dirs: Vec::new(),
         };
         new_for_platform(probe, mode).is_ok()

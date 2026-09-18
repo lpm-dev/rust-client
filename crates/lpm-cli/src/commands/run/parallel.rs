@@ -4,11 +4,11 @@ use super::cache::{
     resolve_task_dependency_identities, try_cache_hit_with_context, try_cache_store_with_context,
 };
 use super::format::{
-    TaskResult, TaskRunReport, format_failed_task_output_footer, format_failed_task_output_header,
-    format_run_failure_detail, print_captured_stderr, print_captured_stdout, print_json_summary,
-    print_results_summary, print_task_result,
+    TaskOutputPolicy, TaskResult, TaskRunReport, format_failed_task_output_footer,
+    format_failed_task_output_header, format_run_failure_detail, print_captured_stderr,
+    print_json_summary, print_results_summary, print_task_result, print_task_stdout, task_failure,
 };
-use super::task::{is_meta_task, run_task, run_task_captured};
+use super::task::{is_meta_task, run_task, run_task_captured_with_reserved_stdout};
 use crate::install_ui;
 use lpm_common::LpmError;
 use lpm_runner::bin_path::ManagedRuntimeHint;
@@ -32,8 +32,9 @@ type TaskWorkerResult = Result<
 /// the last newline boundary to avoid splitting a line.
 pub(super) fn truncate_output(output: String) -> String {
     if output.len() > MAX_CAPTURED_OUTPUT {
-        let truncated = &output[..MAX_CAPTURED_OUTPUT];
-        let end = truncated.rfind('\n').unwrap_or(MAX_CAPTURED_OUTPUT);
+        let limit = output.floor_char_boundary(MAX_CAPTURED_OUTPUT);
+        let truncated = &output[..limit];
+        let end = truncated.rfind('\n').unwrap_or(limit);
         format!(
             "{}...\n\n[output truncated at {}MB]",
             &output[..end],
@@ -60,12 +61,13 @@ pub(super) fn run_tasks_parallel(
     no_cache: bool,
     tasks: &HashMap<String, lpm_runner::lpm_json::TaskConfig>,
     lpm_config: Option<&lpm_runner::lpm_json::LpmJsonConfig>,
-    json_output: bool,
+    output_policy: TaskOutputPolicy,
     bin_hint: &ManagedRuntimeHint,
     pkg_scripts: Option<&HashMap<String, String>>,
     initially_failed_tasks: &HashSet<String>,
     session: Option<Arc<lpm_auth::SessionManager>>,
 ) -> Result<TaskRunReport, LpmError> {
+    let json_output = output_policy.reserve_stdout;
     let total_start = std::time::Instant::now();
     let mut all_results: Vec<TaskResult> = Vec::new();
     let mut failed_tasks = initially_failed_tasks.clone();
@@ -118,6 +120,8 @@ pub(super) fn run_tasks_parallel(
                 all_results.push(TaskResult {
                     name: task.clone(),
                     success: false,
+                    exit_code: None,
+                    phase: None,
                     duration: std::time::Duration::ZERO,
                     cached: false,
                     skipped: true,
@@ -157,6 +161,8 @@ pub(super) fn run_tasks_parallel(
                 all_results.push(TaskResult {
                     name: task_name.clone(),
                     success: true,
+                    exit_code: None,
+                    phase: None,
                     duration: start.elapsed(),
                     cached: false,
                     skipped: false,
@@ -186,7 +192,7 @@ pub(super) fn run_tasks_parallel(
                 .flatten();
             if let Some(hit) = cache_hit {
                 if !hit.stdout.is_empty() {
-                    print_captured_stdout(&hit.stdout);
+                    print_task_stdout(&hit.stdout, json_output);
                 }
                 if !hit.stderr.is_empty() {
                     print_captured_stderr(&hit.stderr);
@@ -194,6 +200,8 @@ pub(super) fn run_tasks_parallel(
                 all_results.push(TaskResult {
                     name: task_name.clone(),
                     success: true,
+                    exit_code: None,
+                    phase: None,
                     duration: start.elapsed(),
                     cached: true,
                     skipped: false,
@@ -218,51 +226,57 @@ pub(super) fn run_tasks_parallel(
             // Use captured execution when caching is enabled.
             let caching_enabled = cache_context.is_some();
 
-            if caching_enabled {
-                match run_task_captured(
+            if caching_enabled || json_output {
+                match run_task_captured_with_reserved_stdout(
                     project_dir,
                     task_name,
                     extra_args,
                     env_mode,
                     tasks,
                     bin_hint,
+                    json_output,
                 ) {
                     Ok(output) => {
                         let duration_ms = start.elapsed().as_millis() as u64;
-                        let context = cache_context.as_ref().ok_or_else(|| {
-                            LpmError::Task(format!("cache context missing for task '{task_name}'"))
-                        })?;
-                        if try_cache_store_with_context(
-                            CacheStoreRequest {
-                                project_dir,
-                                workspace_contract: workspace_contract.as_ref(),
-                                script_name: task_name,
-                                env_mode,
-                                extra_args,
-                                bin_hint,
-                                duration_ms,
-                                stdout: &output.stdout,
-                                stderr: &output.stderr,
-                            },
-                            context,
-                        ) && let Some(identity) =
-                            complete_task_cache_identity(project_dir, task_name, context)
+                        if let Some(context) = &cache_context
+                            && try_cache_store_with_context(
+                                CacheStoreRequest {
+                                    project_dir,
+                                    workspace_contract: workspace_contract.as_ref(),
+                                    script_name: task_name,
+                                    env_mode,
+                                    extra_args,
+                                    bin_hint,
+                                    duration_ms,
+                                    stdout: &output.stdout,
+                                    stderr: &output.stderr,
+                                },
+                                context,
+                            )
+                            && let Some(identity) =
+                                complete_task_cache_identity(project_dir, task_name, context)
                         {
                             cache_identities.insert(task_name.clone(), identity);
                         }
                         all_results.push(TaskResult {
                             name: task_name.clone(),
                             success: true,
+                            exit_code: None,
+                            phase: None,
                             duration: start.elapsed(),
                             cached: false,
                             skipped: false,
                         });
                         print_task_result(all_results.last().unwrap());
                     }
-                    Err(_) => {
+                    Err(error) => {
+                        let (exit_code, phase) = task_failure(&error);
+                        install_ui::detail_line(format_run_failure_detail(task_name, &error));
                         all_results.push(TaskResult {
                             name: task_name.clone(),
                             success: false,
+                            exit_code,
+                            phase,
                             duration: start.elapsed(),
                             cached: false,
                             skipped: false,
@@ -284,16 +298,22 @@ pub(super) fn run_tasks_parallel(
                         all_results.push(TaskResult {
                             name: task_name.clone(),
                             success: true,
+                            exit_code: None,
+                            phase: None,
                             duration: start.elapsed(),
                             cached: false,
                             skipped: false,
                         });
                         print_task_result(all_results.last().unwrap());
                     }
-                    Err(_) => {
+                    Err(error) => {
+                        let (exit_code, phase) = task_failure(&error);
+                        install_ui::detail_line(format_run_failure_detail(task_name, &error));
                         all_results.push(TaskResult {
                             name: task_name.clone(),
                             success: false,
+                            exit_code,
+                            phase,
                             duration: start.elapsed(),
                             cached: false,
                             skipped: false,
@@ -334,7 +354,7 @@ pub(super) fn run_tasks_parallel(
                         let pkg_scripts_clone = pkg_scripts_arc.clone();
                         let workspace_contract = workspace_contract.clone();
                         let session = session.clone();
-                        let is_stream = stream;
+                        let is_stream = stream && !json_output;
                         let color = chunk_colors[ci].clone();
                         let dependency_identities = if no_cache {
                             None
@@ -359,6 +379,8 @@ pub(super) fn run_tasks_parallel(
                                     TaskResult {
                                         name,
                                         success: true,
+                                        exit_code: None,
+                                        phase: None,
                                         duration: start.elapsed(),
                                         cached: false,
                                         skipped: false,
@@ -400,6 +422,8 @@ pub(super) fn run_tasks_parallel(
                                     TaskResult {
                                         name,
                                         success: true,
+                                        exit_code: None,
+                                        phase: None,
                                         duration: start.elapsed(),
                                         cached: true,
                                         skipped: false,
@@ -489,6 +513,8 @@ pub(super) fn run_tasks_parallel(
                                         TaskResult {
                                             name,
                                             success: true,
+                                            exit_code: None,
+                                            phase: None,
                                             duration: start.elapsed(),
                                             cached: false,
                                             skipped: false,
@@ -498,30 +524,38 @@ pub(super) fn run_tasks_parallel(
                                         cache_identity,
                                     ))
                                 }
-                                Err(LpmError::ScriptWithOutput { stdout, stderr, .. }) => Ok((
-                                    TaskResult {
-                                        name,
-                                        success: false,
-                                        duration: start.elapsed(),
-                                        cached: false,
-                                        skipped: false,
-                                    },
-                                    truncate_output(stdout),
-                                    truncate_output(stderr),
-                                    None,
-                                )),
-                                Err(_) => Ok((
-                                    TaskResult {
-                                        name,
-                                        success: false,
-                                        duration: start.elapsed(),
-                                        cached: false,
-                                        skipped: false,
-                                    },
-                                    String::new(),
-                                    String::new(),
-                                    None,
-                                )),
+                                Err(error) => {
+                                    let (exit_code, phase) = task_failure(&error);
+                                    let (stdout, stderr) = match error {
+                                        LpmError::ScriptWithOutput { stdout, stderr, .. }
+                                        | LpmError::ScriptPhase { stdout, stderr, .. } => {
+                                            (stdout, stderr)
+                                        }
+                                        error => {
+                                            let diagnostic = error.to_string();
+                                            if is_stream {
+                                                print_captured_stderr(&diagnostic);
+                                                (String::new(), String::new())
+                                            } else {
+                                                (String::new(), diagnostic)
+                                            }
+                                        }
+                                    };
+                                    Ok((
+                                        TaskResult {
+                                            name,
+                                            success: false,
+                                            exit_code,
+                                            phase,
+                                            duration: start.elapsed(),
+                                            cached: false,
+                                            skipped: false,
+                                        },
+                                        truncate_output(stdout),
+                                        truncate_output(stderr),
+                                        None,
+                                    ))
+                                }
                             }
                         })
                     })
@@ -533,10 +567,10 @@ pub(super) fn run_tasks_parallel(
                 for (i, handle) in handles.into_iter().enumerate() {
                     match handle.join() {
                         Ok(Ok((result, stdout, stderr, cache_identity))) => {
-                            if !stream {
-                                // Buffered mode: print captured output now
+                            if !stream || json_output || result.cached {
+                                // Cached tasks have no live process to render their output.
                                 if !stdout.is_empty() {
-                                    print_captured_stdout(&stdout);
+                                    print_task_stdout(&stdout, json_output);
                                 }
                                 if !stderr.is_empty() && result.success {
                                     print_captured_stderr(&stderr);
@@ -545,7 +579,7 @@ pub(super) fn run_tasks_parallel(
                             // Streaming mode: output was already printed with prefixes
 
                             if !result.success {
-                                if !stderr.is_empty() {
+                                if !stderr.is_empty() && (!stream || json_output) {
                                     failed_outputs.push((result.name.clone(), stderr));
                                 }
                                 failed_tasks.insert(result.name.clone());
@@ -567,6 +601,8 @@ pub(super) fn run_tasks_parallel(
                             all_results.push(TaskResult {
                                 name,
                                 success: false,
+                                exit_code: None,
+                                phase: None,
                                 cached: false,
                                 duration: std::time::Duration::ZERO,
                                 skipped: false,
@@ -600,6 +636,8 @@ pub(super) fn run_tasks_parallel(
                     all_results.push(TaskResult {
                         name: task.clone(),
                         success: false,
+                        exit_code: None,
+                        phase: None,
                         duration: std::time::Duration::ZERO,
                         cached: false,
                         skipped: true,
@@ -612,7 +650,7 @@ pub(super) fn run_tasks_parallel(
 
     print_results_summary(&all_results, total_start.elapsed());
 
-    if json_output {
+    if output_policy.report_json {
         print_json_summary(&all_results, total_start.elapsed());
     }
 
