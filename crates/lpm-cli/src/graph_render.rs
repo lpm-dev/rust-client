@@ -1174,7 +1174,8 @@ pub fn write_why<W: Write>(
                     }
                     None => String::new(),
                 };
-                let from_version = sanitize_terminal_inline(&hit.from_version);
+                let from_version =
+                    sanitize_terminal_inline(hit.from_version.as_deref().unwrap_or("unresolved"));
                 let to_version = sanitize_terminal_inline(&hit.to_version);
                 let source_display = hit.source_display();
                 let source_display = sanitize_terminal_inline(&source_display);
@@ -3617,7 +3618,7 @@ mod tests {
                 raw_key: package.to_string(),
                 source: lpm_resolver::OverrideSource::LpmOverrides,
                 package: package.to_string(),
-                from_version: from.to_string(),
+                from_version: Some(from.to_string()),
                 to_version: to.to_string(),
                 via_parent: via_parent.map(str::to_string),
             }],

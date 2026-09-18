@@ -79,7 +79,6 @@ pub(super) fn format_solution(
         .filter(|(pkg, _)| !pkg.is_root())
         .map(|(package, version)| {
             let ver_str = version.to_string();
-            let parent_identity = package.to_string();
             // Cache is canonical-keyed. Split-retry identities of the
             // same canonical package share one entry, so every lookup
             // canonicalizes.
@@ -108,10 +107,20 @@ pub(super) fn format_solution(
                             let local_name = dependency.name;
                             let target_name = dependency.alias.unwrap_or(local_name);
                             let target = ResolverPackage::from_dep_name(target_name);
-                            let split_target = target.with_context(&parent_identity);
+                            let split_target = ResolverPackage::from_transitive_dependency(
+                                &package,
+                                &version,
+                                local_name,
+                                target_name,
+                                true,
+                            );
                             resolved_versions
                                 .get(&split_target)
-                                .or_else(|| resolved_versions.get(&target))
+                                .or_else(|| {
+                                    (local_name == target_name)
+                                        .then(|| resolved_versions.get(&target))
+                                        .flatten()
+                                })
                                 .map(|resolved_ver| {
                                     let exact_target =
                                         if resolved_versions.contains_key(&split_target) {

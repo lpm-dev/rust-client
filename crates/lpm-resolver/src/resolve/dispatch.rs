@@ -338,7 +338,7 @@ pub async fn resolve_with_shared_cache_options_and_policy_roots(
                     skipped_dependencies,
                     root_aliases,
                     root_dependencies,
-                ) = provider.into_parts();
+                ) = provider.into_parts(&solution);
                 let root_resolutions =
                     root_resolutions_from_solution(&solution, &root_dependencies, &root_aliases);
                 let (packages, platform_skipped) = match format_solution(

@@ -92,6 +92,27 @@ impl ResolverPackage {
         }
     }
 
+    /// Preserve alias slots within a parent, independently of conflict splitting.
+    pub(crate) fn from_transitive_dependency(
+        parent: &Self,
+        parent_version: &crate::npm_version::NpmVersion,
+        local_name: &str,
+        target: &str,
+        split: bool,
+    ) -> Self {
+        let package = Self::from_dep_name(target);
+        if local_name != target {
+            package.with_context(&format!(
+                "{}@{parent_version}:alias:{local_name}",
+                parent.canonical_name()
+            ))
+        } else if split {
+            package.with_context(&parent.to_string())
+        } else {
+            package
+        }
+    }
+
     /// Create a context-scoped copy of this package for multi-version splitting.
     /// `ms` with context `"debug"` becomes a separate package from `ms` with context `"send"`.
     pub fn with_context(&self, ctx: &str) -> Self {

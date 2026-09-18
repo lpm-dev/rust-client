@@ -1519,7 +1519,7 @@ fn process_edge_records_work_stats_for_allocation_and_reuse() {
 }
 
 #[test]
-fn process_edge_counts_override_path_no_version_attempt() {
+fn process_edge_counts_rescued_override_attempt() {
     let info = mk_info(&["4.17.21"], &[]);
     let mut deps = HashMap::new();
     deps.insert("lodash".to_string(), "^99.0.0".to_string());
@@ -1529,9 +1529,9 @@ fn process_edge_counts_override_path_no_version_attempt() {
     let root_edge = state.task_queue.pop_front().unwrap();
     let result = process_edge(&root_edge, &info, &mut state);
 
-    assert!(result.is_err());
+    assert!(result.is_ok());
     assert_eq!(state.work_stats.edge_process_count, 1);
-    assert_eq!(state.work_stats.node_allocated_count, 0);
+    assert_eq!(state.work_stats.node_allocated_count, 1);
     assert_eq!(state.work_stats.edge_reuse_count, 0);
 }
 
@@ -1782,7 +1782,7 @@ fn process_edge_applies_name_selector_override() {
     let hits = state.overrides.take_hits();
     assert_eq!(hits.len(), 1);
     assert_eq!(hits[0].package, "lodash");
-    assert_eq!(hits[0].from_version, "4.17.21");
+    assert_eq!(hits[0].from_version.as_deref(), Some("4.17.21"));
     assert_eq!(hits[0].to_version, "3.10.1");
     assert_eq!(hits[0].via_parent, None, "Name selector — no parent ctx");
 }
@@ -1829,7 +1829,7 @@ fn process_edge_pinned_override_replaces_consumer_range() {
     );
     let hits = state.overrides.take_hits();
     assert_eq!(hits.len(), 1);
-    assert_eq!(hits[0].from_version, "4.17.21");
+    assert_eq!(hits[0].from_version.as_deref(), Some("4.17.21"));
     assert_eq!(hits[0].to_version, "3.10.1");
 }
 

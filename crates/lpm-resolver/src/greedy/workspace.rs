@@ -843,14 +843,13 @@ fn apply_projected_peer_override(
         );
         return Ok(None);
     };
-    let VersionPick::Picked(natural) =
-        find_best_version_with_policy(&canonical, info, &range, policy)
-    else {
-        return Ok(Some(range));
+    let natural = match find_best_version_with_policy(&canonical, info, &range, policy) {
+        VersionPick::Picked(version) => Some(version),
+        _ => None,
     };
     let parent = consumer.package.canonical_name();
     let Some(entry) = overrides
-        .find_match(target, &natural, Some(&parent))
+        .find_match_optional(target, natural.as_ref(), Some(&parent))
         .cloned()
     else {
         return Ok(Some(range));
@@ -873,14 +872,15 @@ fn apply_projected_peer_override(
             "override produced invalid peer version range '{forced}' for {target}: {error}"
         ))
     })?;
-    overrides.record_hit(OverrideHit {
-        raw_key: entry.raw_key,
-        source: entry.source,
-        package: target.to_string(),
-        from_version: natural.to_string(),
-        to_version: forced.to_string(),
-        via_parent: Some(parent),
-    });
+    if let Some(hit) = OverrideHit::changed_selection(
+        &entry,
+        target.to_string(),
+        natural.as_ref(),
+        &forced,
+        Some(&parent),
+    ) {
+        overrides.record_hit(hit);
+    }
     Ok(Some(forced_range))
 }
 
@@ -1339,7 +1339,67 @@ mod tests {
                 )]
             );
             assert!(result.applied_overrides.iter().any(|hit| {
-                hit.package == "runtime" && hit.from_version == "2.0.0" && hit.to_version == "1.0.0"
+                hit.package == "runtime"
+                    && hit.from_version.as_deref() == Some("2.0.0")
+                    && hit.to_version == "1.0.0"
+            }));
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn union_resolution_rescues_missing_peer_ranges_inside_each_projection() {
+        let roots = vec![
+            RootDependencies::required(HashMap::from([
+                ("consumer".to_string(), "1.0.0".to_string()),
+                ("runtime".to_string(), "1.0.0".to_string()),
+            ])),
+            RootDependencies::required(HashMap::from([(
+                "consumer".to_string(),
+                "1.0.0".to_string(),
+            )])),
+        ];
+        let policies = vec![ResolverPolicy::default(); roots.len()];
+        let overrides = OverrideSet::parse(
+            &HashMap::new(),
+            &HashMap::from([("runtime".to_string(), "1.0.0".to_string())]),
+            &HashMap::new(),
+        )
+        .expect("peer override should parse");
+        let outcome = resolve_roots_with_policies_and_overrides(
+            roots,
+            vec![
+                (
+                    "consumer",
+                    cached_package(&[("1.0.0", &[], &[("runtime", "^99")])]),
+                ),
+                (
+                    "runtime",
+                    cached_package(&[("2.0.0", &[], &[]), ("1.0.0", &[], &[])]),
+                ),
+            ],
+            policies,
+            overrides,
+        )
+        .await;
+
+        let WorkspaceResolveOutcome::Projected { results, .. } = outcome else {
+            panic!("peer overrides should stay inside the union traversal")
+        };
+        for result in results {
+            let result = result.expect("peer override should preserve the projection");
+            let consumer = result
+                .packages
+                .iter()
+                .find(|package| package.package.canonical_name() == "consumer")
+                .expect("projection should contain consumer");
+            assert_eq!(
+                consumer.peers,
+                vec![lpm_common::PeerEdge::registry(
+                    "runtime", "runtime", "1.0.0"
+                )]
+            );
+            assert!(result.applied_overrides.iter().any(|hit| {
+                hit.package == "runtime" && hit.from_version.is_none() && hit.to_version == "1.0.0"
             }));
         }
     }

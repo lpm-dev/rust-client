@@ -1,4 +1,5 @@
 use super::prelude::*;
+use super::types::PendingOverride;
 
 impl LpmDependencyProvider {
     fn record_skipped_dependency(&self, skipped: SkippedDependency) {
@@ -13,12 +14,7 @@ impl LpmDependencyProvider {
         );
     }
 
-    /// Pick the version the resolver would choose without any override applied.
-    /// Returns the newest version in the consumer's declared range.
-    ///
-    /// Factored out of [`Self::choose_version`] so the override path can
-    /// compute `from_version` for the apply trace AND fall back to this same
-    /// value when no override matches.
+    /// Pick a policy-allowed version within the supplied constraint.
     pub(super) fn pick_natural_version(
         &self,
         package: &ResolverPackage,
@@ -67,6 +63,84 @@ impl LpmDependencyProvider {
         };
         let info = info.value();
         select_override_target(&key, info, target, &self.policy)
+    }
+
+    pub(super) fn effective_dependency_range(
+        &self,
+        parent: &ResolverPackage,
+        parent_version: &NpmVersion,
+        local_name: &str,
+        child: &ResolverPackage,
+        original: Ranges<NpmVersion>,
+    ) -> Ranges<NpmVersion> {
+        if self.overrides.is_empty() {
+            return original;
+        }
+        self.override_edges.lock().remove(&(
+            parent.clone(),
+            parent_version.clone(),
+            local_name.to_string(),
+        ));
+        let canonical = child.canonical_name();
+        let natural = self.pick_natural_version(child, &original);
+        let parent_name = (!parent.is_root()).then(|| parent.canonical_name());
+        let Some(entry) = self.overrides.find_match_optional(
+            &canonical,
+            natural.as_ref(),
+            parent_name.as_deref(),
+        ) else {
+            return original;
+        };
+        match self.apply_override_target(child, &entry.target) {
+            Ok(forced) => {
+                if let Some(hit) = OverrideHit::changed_selection(
+                    entry,
+                    canonical,
+                    natural.as_ref(),
+                    &forced,
+                    parent_name.as_deref(),
+                ) {
+                    self.override_edges.lock().insert(
+                        (
+                            parent.clone(),
+                            parent_version.clone(),
+                            local_name.to_string(),
+                        ),
+                        PendingOverride {
+                            child: child.clone(),
+                            hit,
+                        },
+                    );
+                }
+                Ranges::singleton(forced)
+            }
+            Err(rejection) => {
+                tracing::warn!(
+                    "override {} could not select target {} for {}: {}",
+                    entry.raw_key,
+                    entry.target.raw(),
+                    canonical,
+                    rejection,
+                );
+                original
+            }
+        }
+    }
+
+    pub(super) fn selected_override_hits(
+        &self,
+        solution: &pubgrub::SelectedDependencies<Self>,
+    ) -> Vec<OverrideHit> {
+        for ((parent, parent_version, _), pending) in self.override_edges.lock().iter() {
+            if solution.get(parent) == Some(parent_version)
+                && solution
+                    .get(&pending.child)
+                    .is_some_and(|version| version.to_string() == pending.hit.to_version)
+            {
+                self.overrides.record_hit(pending.hit.clone());
+            }
+        }
+        self.overrides.take_hits()
     }
 }
 
@@ -149,79 +223,9 @@ impl DependencyProvider for LpmDependencyProvider {
         let _prof = crate::profile::choose_version::start();
         self.ensure_cached(package)?;
 
-        let canonical = package.canonical_name();
-
-        // Step 1 — compute the *natural* version: the newest version
-        // satisfying the consumer's declared range, ignoring overrides.
-        // The natural version is what the resolver WOULD pick without
-        // any override; we capture it so the override summary can show
-        // `from → to` (e.g. `foo 1.5.3 → 2.1.0`).
-        let natural = self.pick_natural_version(package, range);
-
-        // Step 2 — override lookup. We need a natural version to evaluate
-        // the NameRange and Path range filters against. If there's no
-        // natural match (range satisfies nothing in the cache), the
-        // override can't apply — fall through to the unconstrained
-        // newest-in-range pass below for whatever the resolver wants to
-        // do (usually return None and surface a NoSolution).
-        if let Some(natural_ver) = natural.as_ref() {
-            // Split identities include ancestor contexts; path selectors name only the parent.
-            let parent_ctx = package.context().and_then(|context| {
-                let parent = context
-                    .split_once('[')
-                    .map_or(context, |(parent, _)| parent);
-                (!parent.starts_with("<root>")).then_some(parent)
-            });
-            if let Some(entry) = self
-                .overrides
-                .find_match(&canonical, natural_ver, parent_ctx)
-            {
-                // Apply the override target to produce the forced version.
-                match self.apply_override_target(package, &entry.target) {
-                    Ok(forced) => {
-                        if forced != *natural_ver {
-                            let hit = OverrideHit {
-                                raw_key: entry.raw_key.clone(),
-                                source: entry.source,
-                                package: canonical.clone(),
-                                from_version: natural_ver.to_string(),
-                                to_version: forced.to_string(),
-                                via_parent: parent_ctx.map(str::to_string),
-                            };
-                            tracing::debug!(
-                                "override applied: {} {} → {} (via {})",
-                                hit.package,
-                                hit.from_version,
-                                hit.to_version,
-                                hit.source_display()
-                            );
-                            self.overrides.record_hit(hit);
-                        } else {
-                            tracing::debug!(
-                                "override already satisfied: {} {} (via {})",
-                                canonical,
-                                forced,
-                                entry.source_display()
-                            );
-                        }
-                        return Ok(Some(forced));
-                    }
-                    Err(rejection) => {
-                        tracing::warn!(
-                            "override {} could not select target {} for {}: {}",
-                            entry.raw_key,
-                            entry.target.raw(),
-                            canonical,
-                            rejection,
-                        );
-                    }
-                }
-            }
-        }
-
-        // Step 3 — no override applied. Return the natural version
-        // (computed above so we don't re-traverse the cache).
-        Ok(natural)
+        // Overrides are applied to each original edge before PubGrub combines
+        // constraints. Reapplying them here would match selectors against targets.
+        Ok(self.pick_natural_version(package, range))
     }
 
     fn get_dependencies(
@@ -361,6 +365,8 @@ impl DependencyProvider for LpmDependencyProvider {
                     self.to_pubgrub_ranges_cached(&pkg, &npm_range, &available)
                 };
 
+                let range =
+                    self.effective_dependency_range(package, version, dep_name, &pkg, range);
                 if edge_is_optional && !available.iter().any(|version| range.contains(version)) {
                     tracing::debug!(
                         "optional root dep {dep_name}@{range_str} has no matching version; skipping"
@@ -426,7 +432,6 @@ impl DependencyProvider for LpmDependencyProvider {
         // parent's full Display form propagates the split downward:
         // grandchildren get `[ajv[<root>]]` vs `[ajv[eslint]]` and resolve
         // independently, preserving the nested node_modules shape.
-        let parent_name = package.to_string();
         let mut constraints = pubgrub::Map::default();
 
         // Batch-prefetch deps missing from BOTH in-memory and disk cache.
@@ -473,7 +478,7 @@ impl DependencyProvider for LpmDependencyProvider {
                 match self.rt.block_on(fetch) {
                     Ok(batch) => {
                         tracing::debug!(
-                            "dep batch prefetch for {parent_name} (deep={}): {} uncached → {} fetched",
+                            "dep batch prefetch for {package} (deep={}): {} uncached → {} fetched",
                             deep_followup,
                             uncached.len(),
                             batch.len()
@@ -527,18 +532,13 @@ impl DependencyProvider for LpmDependencyProvider {
             // `format_solution` it becomes the edge key on
             // `ResolvedPackage.dependencies`.
             let target_name = dependency.alias.as_deref().unwrap_or(dep_name);
-            let base_pkg = ResolverPackage::from_dep_name(target_name);
-
-            // If this dep is in the split set, create a scoped identity
-            // so PubGrub treats each consumer's version independently.
-            // Match against the TARGET name — split decisions are about
-            // the canonical registry identity, not the parent-specific
-            // alias label.
-            let pkg = if self.split_packages.contains(target_name) {
-                base_pkg.with_context(&parent_name)
-            } else {
-                base_pkg
-            };
+            let pkg = ResolverPackage::from_transitive_dependency(
+                package,
+                version,
+                dep_name,
+                target_name,
+                self.split_packages.contains(target_name),
+            );
 
             let edge_is_optional = dependency.optional;
 
@@ -603,6 +603,7 @@ impl DependencyProvider for LpmDependencyProvider {
                 self.to_pubgrub_ranges_cached(&pkg, &npm_range, &available)
             };
 
+            let range = self.effective_dependency_range(package, version, dep_name, &pkg, range);
             if !available.iter().any(|version| range.contains(version)) {
                 let host = Platform::current();
                 let detail = format!(
@@ -625,6 +626,12 @@ impl DependencyProvider for LpmDependencyProvider {
                 ));
                 continue;
             }
+            self.skipped_dependencies.lock().remove(&(
+                package.clone(),
+                version.to_string(),
+                pkg.clone(),
+                dep_name.clone(),
+            ));
             constraints.insert(pkg, range);
         }
 

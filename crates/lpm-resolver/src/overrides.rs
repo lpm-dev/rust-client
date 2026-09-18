@@ -20,8 +20,8 @@
 //!   resolve_dependencies_with_overrides(client, deps, overrides: OverrideSet)
 //!    ├─ split_targets() seeds the resolver's split set so path selectors
 //!    │  encode parent context into PubGrub identity
-//!    ├─ choose_version checks the override IR for each (pkg, version) and
-//!    │  forces the override target if it matches
+//!    ├─ Each dependency edge matches against its original natural candidate
+//!    │  and applies an allowed override target before version constraints combine
 //!    └─ Every applied override is recorded as an OverrideHit so callers
 //!       can render the install summary, persist `.lpm/overrides-state.json`,
 //!       and decorate `lpm graph --why`.
@@ -270,10 +270,8 @@ pub struct OverrideHit {
     pub source: OverrideSource,
     /// Canonical name of the overridden package.
     pub package: String,
-    /// What the resolver would have picked WITHOUT the override (the
-    /// newest version in the consumer's natural range, ignoring the
-    /// override). Captured for the `1.5.3 → 2.1.0` summary line.
-    pub from_version: String,
+    /// The natural selection, or `None` when the original range has no allowed version.
+    pub from_version: Option<String>,
     /// What the resolver picked AFTER applying the override.
     pub to_version: String,
     /// For path selectors, the immediate parent through which the
@@ -282,6 +280,23 @@ pub struct OverrideHit {
 }
 
 impl OverrideHit {
+    pub(crate) fn changed_selection(
+        entry: &OverrideEntry,
+        package: String,
+        natural: Option<&NpmVersion>,
+        forced: &NpmVersion,
+        parent: Option<&str>,
+    ) -> Option<Self> {
+        (natural != Some(forced)).then(|| Self {
+            raw_key: entry.raw_key.clone(),
+            source: entry.source,
+            package,
+            from_version: natural.map(ToString::to_string),
+            to_version: forced.to_string(),
+            via_parent: parent.map(str::to_string),
+        })
+    }
+
     /// Pretty source reference (matches `OverrideEntry::source_display`).
     pub fn source_display(&self) -> String {
         let source = self.source.display();
@@ -477,6 +492,17 @@ impl OverrideSet {
         natural_version: &NpmVersion,
         parent_canonical: Option<&str>,
     ) -> Option<&OverrideEntry> {
+        self.find_match_optional(canonical_name, Some(natural_version), parent_canonical)
+    }
+
+    /// Match an edge even when its original range has no allowed candidate.
+    /// Range-qualified selectors require a natural version.
+    pub fn find_match_optional(
+        &self,
+        canonical_name: &str,
+        natural_version: Option<&NpmVersion>,
+        parent_canonical: Option<&str>,
+    ) -> Option<&OverrideEntry> {
         // Tier 1 — Path selectors. Only consult if the resolver gave us a
         // parent context (i.e., this resolution edge is split).
         if let Some(parent) = parent_canonical {
@@ -488,7 +514,9 @@ impl OverrideSet {
                 } = &entry.selector
                     && p == parent
                     && name == canonical_name
-                    && range.as_ref().is_none_or(|r| r.satisfies(natural_version))
+                    && range
+                        .as_ref()
+                        .is_none_or(|r| natural_version.is_some_and(|v| r.satisfies(v)))
                 {
                     return Some(entry);
                 }
@@ -503,7 +531,8 @@ impl OverrideSet {
                     return Some(entry);
                 }
                 OverrideSelector::NameRange { name, range }
-                    if name == canonical_name && range.satisfies(natural_version) =>
+                    if name == canonical_name
+                        && natural_version.is_some_and(|v| range.satisfies(v)) =>
                 {
                     return Some(entry);
                 }
@@ -520,7 +549,7 @@ impl OverrideSet {
     /// Idempotent on (raw_key, source, package, from_version, to_version,
     /// via_parent).
     pub fn record_hit(&self, hit: OverrideHit) {
-        if hit.from_version == hit.to_version {
+        if hit.from_version.as_deref() == Some(hit.to_version.as_str()) {
             return;
         }
         let mut hits = self.hits.lock();
@@ -1223,7 +1252,7 @@ mod tests {
             raw_key: "foo".into(),
             source: OverrideSource::LpmOverrides,
             package: "foo".into(),
-            from_version: "1.5.3".into(),
+            from_version: Some("1.5.3".into()),
             to_version: "2.0.0".into(),
             via_parent: None,
         };
@@ -1240,7 +1269,7 @@ mod tests {
             raw_key: "foo".into(),
             source: OverrideSource::LpmOverrides,
             package: "foo".into(),
-            from_version: "2.0.0".into(),
+            from_version: Some("2.0.0".into()),
             to_version: "2.0.0".into(),
             via_parent: Some("consumer".into()),
         });
@@ -1260,7 +1289,7 @@ mod tests {
             raw_key: "foo".into(),
             source: OverrideSource::LpmOverrides,
             package: "foo".into(),
-            from_version: "1.0.0".into(),
+            from_version: Some("1.0.0".into()),
             to_version: "2.0.0".into(),
             via_parent: None,
         });
@@ -1268,7 +1297,7 @@ mod tests {
             raw_key: "bar".into(),
             source: OverrideSource::LpmOverrides,
             package: "bar".into(),
-            from_version: "1.0.0".into(),
+            from_version: Some("1.0.0".into()),
             to_version: "3.0.0".into(),
             via_parent: None,
         });

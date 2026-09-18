@@ -254,10 +254,14 @@ where
 
     let info = fetch_peer_manifest(state, canonical.clone(), fetch_manifest).await?;
     for requirement in requirements {
-        let VersionPick::Picked(natural) =
-            find_best_version_with_policy(canonical, &info, &requirement.range, &state.policy)
-        else {
-            continue;
+        let natural = match find_best_version_with_policy(
+            canonical,
+            &info,
+            &requirement.range,
+            &state.policy,
+        ) {
+            VersionPick::Picked(version) => Some(version),
+            _ => None,
         };
         let parent = state
             .nodes
@@ -265,7 +269,7 @@ where
             .map(|node| node.canonical.to_string());
         let Some(entry) = state
             .overrides
-            .find_match(&canonical_name, &natural, parent.as_deref())
+            .find_match_optional(&canonical_name, natural.as_ref(), parent.as_deref())
             .cloned()
         else {
             continue;
@@ -288,14 +292,15 @@ where
                 "override produced invalid peer version range '{forced}' for {canonical_name}: {error}"
             ))
         })?;
-        state.overrides.record_hit(OverrideHit {
-            raw_key: entry.raw_key,
-            source: entry.source,
-            package: canonical_name.clone(),
-            from_version: natural.to_string(),
-            to_version: forced.to_string(),
-            via_parent: parent,
-        });
+        if let Some(hit) = OverrideHit::changed_selection(
+            &entry,
+            canonical_name.clone(),
+            natural.as_ref(),
+            &forced,
+            parent.as_deref(),
+        ) {
+            state.overrides.record_hit(hit);
+        }
     }
     Ok(())
 }
