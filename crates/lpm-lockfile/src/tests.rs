@@ -5368,3 +5368,179 @@ fn ambient_peer_can_share_a_skipped_optional_name_without_becoming_a_reachabilit
         "optional declaration cannot make an otherwise unreachable peer valid"
     );
 }
+
+#[test]
+fn current_lockfile_write_reports_obstructed_binary_cleanup() {
+    let directory = tempfile::tempdir().unwrap();
+    let toml_path = directory.path().join(LOCKFILE_NAME);
+    let binary_path = toml_path.with_extension("lockb");
+    std::fs::create_dir(&binary_path).unwrap();
+    std::fs::write(binary_path.join("retain"), b"unrelated contents").unwrap();
+    let result = Lockfile::new().write_all(&toml_path);
+    assert!(
+        result.is_err(),
+        "failed binary cleanup must not report success"
+    );
+    assert_eq!(
+        std::fs::read(binary_path.join("retain")).unwrap(),
+        b"unrelated contents"
+    );
+}
+
+#[test]
+#[cfg(unix)]
+fn current_lockfile_write_removes_a_dangling_binary_symlink() {
+    let directory = tempfile::tempdir().unwrap();
+    let toml_path = directory.path().join(LOCKFILE_NAME);
+    let binary_path = toml_path.with_extension("lockb");
+    std::os::unix::fs::symlink("absent-target", &binary_path).unwrap();
+    Lockfile::new().write_all(&toml_path).unwrap();
+    assert!(std::fs::symlink_metadata(&binary_path).is_err());
+}
+
+#[test]
+fn project_discovery_prefers_a_local_lockfile_without_a_manifest() {
+    let directory = tempfile::tempdir().unwrap();
+    std::fs::write(
+        directory.path().join("package.json"),
+        r#"{"name":"parent","version":"1.0.0"}"#,
+    )
+    .unwrap();
+    importer_lockfile("parent-dep", "1.0.0")
+        .write_to_file(&directory.path().join(LOCKFILE_NAME))
+        .unwrap();
+    let export = directory.path().join("export");
+    std::fs::create_dir(&export).unwrap();
+    importer_lockfile("export-dep", "2.0.0")
+        .write_to_file(&export.join(LOCKFILE_NAME))
+        .unwrap();
+    let selected = Lockfile::read_for_project(&export).unwrap();
+    assert_eq!(selected.path, export.join(LOCKFILE_NAME));
+    assert_eq!(selected.lockfile.packages[0].name, "export-dep");
+}
+
+#[test]
+fn project_discovery_ignores_an_unrelated_malformed_ancestor_lockfile() {
+    let directory = tempfile::tempdir().unwrap();
+    std::fs::write(
+        directory.path().join("package.json"),
+        r#"{"name":"parent","version":"1.0.0"}"#,
+    )
+    .unwrap();
+    std::fs::write(directory.path().join(LOCKFILE_NAME), "invalid = [").unwrap();
+    let child = directory.path().join("standalone");
+    std::fs::create_dir(&child).unwrap();
+    std::fs::write(
+        child.join("package.json"),
+        r#"{"name":"child","version":"1.0.0"}"#,
+    )
+    .unwrap();
+    importer_lockfile("child-dep", "2.0.0")
+        .write_to_file(&child.join(LOCKFILE_NAME))
+        .unwrap();
+    assert_eq!(
+        Lockfile::read_for_project(&child)
+            .unwrap()
+            .lockfile
+            .packages[0]
+            .name,
+        "child-dep"
+    );
+    assert_eq!(
+        Lockfile::read_full_for_project(&child).unwrap().packages[0].name,
+        "child-dep"
+    );
+}
+
+#[test]
+fn project_discovery_rejects_a_malformed_owning_workspace_lockfile() {
+    let directory = tempfile::tempdir().unwrap();
+    std::fs::write(
+        directory.path().join("package.json"),
+        r#"{"name":"root","version":"1.0.0","workspaces":["packages/*"]}"#,
+    )
+    .unwrap();
+    std::fs::write(directory.path().join(LOCKFILE_NAME), "invalid = [").unwrap();
+    let child = directory.path().join("packages/app");
+    std::fs::create_dir_all(&child).unwrap();
+    std::fs::write(
+        child.join("package.json"),
+        r#"{"name":"app","version":"1.0.0"}"#,
+    )
+    .unwrap();
+    importer_lockfile("legacy-dep", "2.0.0")
+        .write_to_file(&child.join(LOCKFILE_NAME))
+        .unwrap();
+    assert!(Lockfile::read_for_project(&child).is_err());
+    assert!(Lockfile::read_full_for_project(&child).is_err());
+}
+
+#[test]
+fn nested_workspace_keeps_its_owning_outer_lockfile_authority() {
+    let directory = tempfile::tempdir().unwrap();
+    std::fs::write(
+        directory.path().join("package.json"),
+        r#"{"name":"root","workspaces":["packages/*"]}"#,
+    )
+    .unwrap();
+    let child = directory.path().join("packages/app");
+    std::fs::create_dir_all(&child).unwrap();
+    std::fs::write(
+        child.join("package.json"),
+        r#"{"name":"app","workspaces":["nested/*"]}"#,
+    )
+    .unwrap();
+    importer_lockfile("legacy-dep", "1.0.0")
+        .write_to_file(&child.join(LOCKFILE_NAME))
+        .unwrap();
+    let outer_path = directory.path().join(LOCKFILE_NAME);
+    let mut union = legacy_lockfile();
+    union
+        .absorb_importer("packages/app", importer_lockfile("outer-dep", "2.0.0"))
+        .unwrap();
+    union.write_to_file(&outer_path).unwrap();
+    assert_eq!(Lockfile::read_for_project(&child).unwrap().path, outer_path);
+
+    std::fs::write(&outer_path, "invalid = [").unwrap();
+    assert!(Lockfile::read_for_project(&child).is_err());
+    assert!(Lockfile::read_full_for_project(&child).is_err());
+}
+
+#[test]
+fn exported_lockfile_ignores_a_malformed_unrelated_workspace_lockfile() {
+    let directory = tempfile::tempdir().unwrap();
+    std::fs::write(
+        directory.path().join("package.json"),
+        r#"{"name":"root","workspaces":["packages/*"]}"#,
+    )
+    .unwrap();
+    std::fs::write(directory.path().join(LOCKFILE_NAME), "invalid = [").unwrap();
+    let export = directory.path().join("export");
+    std::fs::create_dir(&export).unwrap();
+    importer_lockfile("export-dep", "2.0.0")
+        .write_to_file(&export.join(LOCKFILE_NAME))
+        .unwrap();
+    let selected = Lockfile::read_for_project(&export).unwrap();
+    assert_eq!(selected.path, export.join(LOCKFILE_NAME));
+    assert_eq!(selected.lockfile.packages[0].name, "export-dep");
+}
+
+#[test]
+fn manifest_free_export_matching_workspace_globs_remains_standalone() {
+    let directory = tempfile::tempdir().unwrap();
+    std::fs::write(
+        directory.path().join("package.json"),
+        r#"{"name":"root","workspaces":["packages/*"]}"#,
+    )
+    .unwrap();
+    std::fs::write(directory.path().join(LOCKFILE_NAME), "invalid = [").unwrap();
+    let export = directory.path().join("packages/export");
+    std::fs::create_dir_all(&export).unwrap();
+    importer_lockfile("export-dep", "2.0.0")
+        .write_to_file(&export.join(LOCKFILE_NAME))
+        .unwrap();
+    assert_eq!(
+        Lockfile::read_for_project(&export).unwrap().path,
+        export.join(LOCKFILE_NAME)
+    );
+}

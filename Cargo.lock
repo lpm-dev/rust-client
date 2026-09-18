@@ -3668,6 +3668,7 @@ dependencies = [
  "criterion",
  "hex",
  "lpm-common",
+ "lpm-workspace",
  "memmap2",
  "node-semver",
  "serde",

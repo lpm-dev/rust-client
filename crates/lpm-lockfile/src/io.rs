@@ -27,10 +27,14 @@ impl Lockfile {
     /// Read the lockfile view for a project, resolving a workspace member to
     /// its importer projection in the nearest ancestor union lockfile.
     pub fn read_for_project(project_dir: &Path) -> Result<ProjectLockfile, LockfileError> {
-        let project_root = project_dir
-            .ancestors()
-            .find(|ancestor| ancestor.join("package.json").is_file())
-            .unwrap_or(project_dir);
+        let project_root = if project_dir.join(LOCKFILE_NAME).exists() {
+            project_dir
+        } else {
+            project_dir
+                .ancestors()
+                .find(|ancestor| ancestor.join("package.json").is_file())
+                .unwrap_or(project_dir)
+        };
         let selected = read_project_document(project_root)?;
         let workspace_root = (selected.importer != ".")
             .then(|| {
@@ -288,25 +292,28 @@ impl Lockfile {
         Self::from_toml(&content)
     }
 
-    /// Write both TOML and binary lockfiles atomically.
-    /// The binary file is written alongside the TOML file as `lpm.lockb`.
-    ///
-    /// The binary format has no section for some TOML metadata,
-    /// so we gate the binary write on [`binary::binary_format_supports`].
-    /// When the lockfile uses TOML-only fields, the binary file is skipped
-    /// and any stale binary file from a prior install is removed so
-    /// `read_fast` doesn't silently pick it over the authoritative TOML.
+    /// Write authoritative TOML and any supported binary companion.
+    /// Each file replacement is atomic. For TOML-only graphs, remove an obsolete
+    /// companion without following symlinks and report cleanup failures.
     pub fn write_all(&self, toml_path: &Path) -> Result<(), LockfileError> {
         self.write_to_file(toml_path)?;
         let binary_path = toml_path.with_extension("lockb");
         if binary::binary_format_supports(self) {
             binary::write_binary(self, &binary_path)?;
-        } else if binary_path.exists() {
-            let _ = std::fs::remove_file(&binary_path);
-            tracing::debug!(
-                "removed stale binary lockfile ({}): lockfile has TOML-only metadata not expressible in binary format",
-                binary_path.display()
-            );
+        } else {
+            match std::fs::remove_file(&binary_path) {
+                Ok(()) => tracing::debug!(
+                    path = %binary_path.display(),
+                    "removed obsolete binary lockfile for TOML-only graph"
+                ),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(LockfileError::Io(format!(
+                        "failed to remove obsolete binary lockfile {}: {error}",
+                        binary_path.display()
+                    )));
+                }
+            }
         }
         Ok(())
     }
@@ -355,7 +362,24 @@ fn read_project_document(project_root: &Path) -> Result<ProjectDocument, Lockfil
             }));
             continue;
         }
-        let (content, lockfile) = read()?;
+        let (content, lockfile) = match read() {
+            Ok(document) => document,
+            Err(error) => {
+                if local.is_some() {
+                    let is_member = lpm_workspace::workspace_declares_member(root, project_root)
+                        .map_err(|error| {
+                            LockfileError::Io(format!(
+                                "failed to determine workspace ownership for {}: {error}",
+                                project_root.display()
+                            ))
+                        })?;
+                    if !is_member {
+                        continue;
+                    }
+                }
+                return Err(error);
+            }
+        };
         let relative = project_root.strip_prefix(root).map_err(|error| {
             LockfileError::Io(format!(
                 "failed to derive importer path below {}: {error}",

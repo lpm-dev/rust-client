@@ -571,6 +571,32 @@ pub fn find_workspace_root(start_dir: &Path) -> Result<Option<PathBuf>, Workspac
     }
 }
 
+/// Check whether a root's workspace patterns include an exact member directory.
+/// A member must have a manifest, but its contents are not read.
+pub fn workspace_declares_member(root: &Path, project: &Path) -> Result<bool, WorkspaceError> {
+    if project == root || !project.starts_with(root) {
+        return Ok(false);
+    }
+    let (root_package, pnpm_workspace) = match read_workspace_root(root) {
+        Ok(declarations) => declarations,
+        Err(WorkspaceError::NotFound(_)) => return Ok(false),
+        Err(error) => return Err(error),
+    };
+    let globs = workspace_member_globs(&root_package, pnpm_workspace.as_ref());
+    if !workspace_globs_include_project(project, root, &globs)? {
+        return Ok(false);
+    }
+    let manifest = project.join("package.json");
+    match std::fs::metadata(&manifest) {
+        Ok(metadata) => Ok(metadata.is_file()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(WorkspaceError::Io(format!(
+            "failed to inspect {}: {error}",
+            manifest.display()
+        ))),
+    }
+}
+
 pub fn find_workspace_root_from_open_project(
     start_path: &Path,
     start_dir: &cap_std::fs::Dir,
@@ -1754,6 +1780,44 @@ mod tests {
 
     fn create_package_json(dir: &Path, content: &str) {
         fs::write(dir.join("package.json"), content).unwrap();
+    }
+
+    #[test]
+    fn declared_members_combine_manifest_and_pnpm_patterns_with_exclusions() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        create_package_json(root, r#"{"workspaces":["packages/*"]}"#);
+        fs::write(
+            root.join("pnpm-workspace.yaml"),
+            "packages:\n  - 'apps/*'\n  - '!packages/excluded'\n",
+        )
+        .unwrap();
+        for member in ["packages/lib", "apps/web"] {
+            fs::create_dir_all(root.join(member)).unwrap();
+            create_package_json(&root.join(member), "{}");
+            assert!(workspace_declares_member(root, &root.join(member)).unwrap());
+        }
+        fs::create_dir_all(root.join("packages/excluded")).unwrap();
+        create_package_json(&root.join("packages/excluded"), "{}");
+        for other in [
+            "packages/excluded",
+            "packages/export",
+            "export",
+            "apps/web/src",
+            "",
+        ] {
+            assert!(!workspace_declares_member(root, &root.join(other)).unwrap());
+        }
+        assert!(!workspace_declares_member(&root.join("absent"), root).unwrap());
+    }
+
+    #[test]
+    fn declared_members_report_invalid_root_configuration() {
+        let directory = tempfile::tempdir().unwrap();
+        create_package_json(directory.path(), "{");
+        assert!(
+            workspace_declares_member(directory.path(), &directory.path().join("app")).is_err()
+        );
     }
 
     #[test]

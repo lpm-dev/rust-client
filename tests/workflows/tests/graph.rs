@@ -1314,3 +1314,92 @@ fn graph_format_json_envelope_matches_snapshot() {
         insta::assert_json_snapshot!("graph_format_json_depth1_envelope", envelope);
     });
 }
+
+#[test]
+fn graph_uses_local_exported_lockfile_without_a_manifest() {
+    let project = graph_fixture();
+    let exported = project
+        .read_file("lpm.lock")
+        .replace("express", "export-only");
+    project.write_file("export/lpm.lock", &exported);
+    let output = lpm(&project)
+        .current_dir(project.path().join("export"))
+        .args(["graph", "--format", "json"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("export-only"), "{stdout}");
+    assert!(!stdout.contains("express"), "{stdout}");
+}
+
+#[test]
+fn graph_ignores_malformed_lockfile_above_a_standalone_project() {
+    let project = graph_fixture();
+    project.write_file("standalone/lpm.lock", &project.read_file("lpm.lock"));
+    project.write_file(
+        "standalone/package.json",
+        &project.read_file("package.json"),
+    );
+    project.write_file("lpm.lock", "invalid = [");
+    let output = lpm(&project)
+        .current_dir(project.path().join("standalone"))
+        .args(["graph", "--format", "json"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("express"));
+}
+
+#[test]
+fn graph_export_ignores_a_malformed_unrelated_workspace_lockfile() {
+    let project = graph_fixture();
+    project.write_file("packages/export/lpm.lock", &project.read_file("lpm.lock"));
+    project.write_file("package.json", r#"{"workspaces":["packages/*"]}"#);
+    project.write_file("lpm.lock", "invalid = [");
+    let output = lpm(&project)
+        .current_dir(project.path().join("packages/export"))
+        .args(["graph", "--format", "json"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("express"));
+}
+
+#[test]
+fn graph_nested_workspace_rejects_a_malformed_owning_outer_lockfile() {
+    let project = workspace_projection_project();
+    let root = lpm_lockfile::Lockfile::from_toml(&project.read_file("lpm.lock")).unwrap();
+    let local = root
+        .project_importer("packages/app")
+        .unwrap()
+        .to_toml()
+        .unwrap();
+    project.write_file("packages/app/lpm.lock", &local);
+    let mut manifest: serde_json::Value =
+        serde_json::from_str(&project.read_file("packages/app/package.json")).unwrap();
+    manifest["workspaces"] = serde_json::json!(["nested/*"]);
+    project.write_file("packages/app/package.json", &manifest.to_string());
+    project.write_file("lpm.lock", "invalid = [");
+
+    let output = lpm(&project)
+        .current_dir(project.path().join("packages/app"))
+        .args(["graph", "--format", "json"])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert_eq!(project.read_file("packages/app/lpm.lock"), local);
+    assert_eq!(project.read_file("lpm.lock"), "invalid = [");
+}
