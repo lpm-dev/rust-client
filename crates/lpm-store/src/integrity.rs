@@ -69,9 +69,75 @@ pub fn read_stored_integrity(store_dir: &Path) -> Option<String> {
     std::fs::read_to_string(integrity_path).ok()
 }
 
+fn integrity_alias_path(store_root: &Path, stored: &str, sri: &str) -> Option<std::path::PathBuf> {
+    use lpm_common::integrity::{HashAlgorithm, Integrity};
+    let suffix = match Integrity::parse(sri).ok()?.algorithm {
+        HashAlgorithm::Sha1 => "sha1",
+        HashAlgorithm::Sha256 => "sha256",
+        HashAlgorithm::Sha512 => "sha512",
+    };
+    let mut path = store_root.join("integrity-aliases-v1");
+    path.push(format!("{:x}.{suffix}", Sha512::digest(stored.as_bytes())));
+    Some(path)
+}
+
+pub(crate) fn stored_integrity_matches(store_root: &Path, store_dir: &Path, sri: &str) -> bool {
+    let Ok(stored) =
+        lpm_common::read_text_file_capped_nofollow(&store_dir.join(".integrity"), 4096)
+    else {
+        return false;
+    };
+    if stored == sri {
+        return true;
+    }
+    let Some(alias) = integrity_alias_path(store_root, &stored, sri) else {
+        return false;
+    };
+    lpm_common::read_text_file_capped_nofollow(&alias, 4096)
+        .is_ok_and(|receipt| receipt.split_once('\n') == Some((stored.as_str(), sri)))
+}
+
+pub(crate) fn record_verified_integrity_alias(
+    store_root: &Path,
+    stored: &str,
+    sri: &str,
+) -> Result<(), LpmError> {
+    let alias = integrity_alias_path(store_root, stored, sri).ok_or_else(|| {
+        LpmError::InvalidIntegrity("cannot record invalid integrity alias".into())
+    })?;
+    std::fs::create_dir_all(store_root.join("integrity-aliases-v1"))?;
+    // Bind the proof to the original marker so replacement invalidates it.
+    lpm_common::write_file_atomic(&alias, format!("{stored}\n{sri}"))?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn verified_alias_is_invalid_after_the_original_marker_changes() {
+        let directory = tempfile::tempdir().unwrap();
+        let original = compute_sri_hash(b"original");
+        let alternate = compute_sri_hash_sha256(b"original");
+        std::fs::write(directory.path().join(".integrity"), &original).unwrap();
+        record_verified_integrity_alias(directory.path(), &original, &alternate).unwrap();
+        assert!(stored_integrity_matches(
+            directory.path(),
+            directory.path(),
+            &alternate
+        ));
+        std::fs::write(
+            directory.path().join(".integrity"),
+            compute_sri_hash(b"replacement"),
+        )
+        .unwrap();
+        assert!(!stored_integrity_matches(
+            directory.path(),
+            directory.path(),
+            &alternate
+        ));
+    }
 
     #[test]
     fn read_stored_integrity_returns_none_when_missing() {

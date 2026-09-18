@@ -140,17 +140,20 @@ pub async fn run(
         Some(raw) => FetchPlatform::parse(raw)?,
         None => FetchPlatform::current(),
     };
-    let lockfile = lpm_lockfile::Lockfile::read_for_project(project_dir)
-        .map_err(|e| {
-            LpmError::NotFound(format!(
-                "no usable lpm.lock found. Run `lpm install` before `lpm fetch`: {e}"
-            ))
-        })?
-        .lockfile;
+    let lockfile = lpm_lockfile::Lockfile::read_full_for_project(project_dir).map_err(|e| {
+        LpmError::NotFound(format!(
+            "no usable lpm.lock found. Run `lpm install` before `lpm fetch`: {e}"
+        ))
+    })?;
 
-    let mut targets = Vec::with_capacity(lockfile.packages.len());
+    let mut targets =
+        Vec::with_capacity(lockfile.packages.len() + lockfile.workspace_packages.len());
     let mut results = Vec::new();
-    for package in &lockfile.packages {
+    for package in lockfile
+        .packages
+        .iter()
+        .chain(lockfile.workspace_packages.values())
+    {
         match classify_package(package, &target_platform)? {
             FetchPlan::Fetch(target) => targets.push(target),
             FetchPlan::Skip(reason) => results.push(FetchPackageResult {
@@ -336,10 +339,11 @@ async fn fetch_artifact(
         source,
         targets,
     } = work;
-    let cached: Vec<bool> = targets
-        .iter()
-        .map(|target| is_cached(target, &store, store_v2.as_deref()))
-        .collect();
+    let cached = cached_targets(
+        &targets,
+        store_v2.is_some() || !matches!(source, FetchSource::Registry { .. }),
+        |target| is_cached(target, &store, store_v2.as_deref()),
+    );
     if cached.iter().all(|cached| *cached) {
         return Ok(targets
             .iter()
@@ -378,8 +382,12 @@ async fn fetch_artifact(
         } else {
             match source {
                 FetchSource::Registry { .. } => {
+                    let mut stored = std::collections::HashSet::with_capacity(targets.len());
                     for target in &targets {
-                        store.store_package_from_file(
+                        if !stored.insert((&target.name, &target.version)) {
+                            continue;
+                        }
+                        store.store_package_from_file_matching_integrity(
                             &target.name,
                             &target.version,
                             downloaded.file.path(),
@@ -529,11 +537,33 @@ fn is_cached(
     }
 
     match &target.source {
-        FetchSource::Registry { .. } => store.has_package(&target.name, &target.version),
+        FetchSource::Registry { .. } => {
+            store.has_package_matching_integrity(&target.name, &target.version, &target.integrity)
+        }
         FetchSource::RemoteTarball { .. } | FetchSource::GitHub { .. } => {
             store.has_tarball(&target.integrity)
         }
     }
+}
+
+fn cached_targets(
+    targets: &[FetchTarget],
+    shared_artifact: bool,
+    mut check: impl FnMut(&FetchTarget) -> bool,
+) -> Vec<bool> {
+    if shared_artifact {
+        let cached = targets.first().is_some_and(&mut check);
+        return vec![cached; targets.len()];
+    }
+    let mut coordinates = HashMap::with_capacity(targets.len());
+    targets
+        .iter()
+        .map(|target| {
+            *coordinates
+                .entry((&target.name, &target.version))
+                .or_insert_with(|| check(target))
+        })
+        .collect()
 }
 
 fn npm_firewall_packages_for_fetch_targets(
@@ -689,32 +719,14 @@ fn max_concurrent_downloads() -> usize {
 }
 
 fn package_matches_platform(package: &LockedPackage, platform: &FetchPlatform) -> bool {
-    check_platform_filter(&package.os, &platform.os)
-        && check_platform_filter(&package.cpu, &platform.cpu)
-        && if package.libc.is_empty() {
-            true
-        } else {
-            platform
-                .libc
-                .as_deref()
-                .is_some_and(|libc| check_platform_filter(&package.libc, libc))
-        }
-}
-
-fn check_platform_filter(entries: &[String], current: &str) -> bool {
-    if entries.is_empty() {
-        return true;
-    }
-
-    if entries.iter().any(|entry| entry.starts_with('!')) {
-        entries.iter().all(|entry| {
-            entry
-                .strip_prefix('!')
-                .is_none_or(|excluded| excluded != current)
-        })
-    } else {
-        entries.iter().any(|entry| entry == current)
-    }
+    lpm_resolver::is_platform_compatible_with_target(
+        package.os.iter().map(String::as_str),
+        package.cpu.iter().map(String::as_str),
+        package.libc.iter().map(String::as_str),
+        &platform.os,
+        &platform.cpu,
+        platform.libc.as_deref(),
+    )
 }
 
 fn render_platform(platform: &FetchPlatform) -> String {
@@ -792,6 +804,44 @@ fn normalize_cpu(raw: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shared_artifact_cache_validation_runs_once_for_all_contexts() {
+        let FetchPlan::Fetch(target) =
+            classify_package(&locked_package(), &FetchPlatform::current()).unwrap()
+        else {
+            panic!("remote package");
+        };
+        let targets = vec![target; 100];
+        let mut calls = 0;
+        let cached = cached_targets(&targets, true, |_| {
+            calls += 1;
+            true
+        });
+        assert_eq!(calls, 1);
+        assert_eq!(cached, vec![true; 100]);
+    }
+
+    #[test]
+    fn v1_registry_cache_validation_runs_once_per_coordinate() {
+        let FetchPlan::Fetch(target) =
+            classify_package(&locked_package(), &FetchPlatform::current()).unwrap()
+        else {
+            panic!("remote package");
+        };
+        let mut targets = vec![target; 100];
+        for target in &mut targets[50..] {
+            target.version = "2.0.0".into();
+        }
+        let mut calls = 0;
+        let cached = cached_targets(&targets, false, |target| {
+            calls += 1;
+            target.version == "1.0.0"
+        });
+        assert_eq!(calls, 2);
+        assert!(cached[..50].iter().all(|cached| *cached));
+        assert!(cached[50..].iter().all(|cached| !*cached));
+    }
 
     fn locked_package() -> LockedPackage {
         LockedPackage {

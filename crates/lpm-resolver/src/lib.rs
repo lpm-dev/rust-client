@@ -55,6 +55,7 @@ pub use provider::{
     CachedDistInfo, CachedPackageInfo, ManifestDependency, ManifestDependencyIter,
     ManifestDependencyRef, ManifestPeerDependency, ManifestPeerDependencyIter,
     ManifestPeerDependencyRef, ManifestVersion, PlatformMeta, is_platform_compatible,
+    is_platform_compatible_with_target,
 };
 pub use provider::{NotifyMap, SharedCache, StreamingBfsMetrics, WalkerDone};
 pub use ranges::NpmRange;

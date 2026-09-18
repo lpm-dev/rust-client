@@ -157,7 +157,7 @@ impl PackageStore {
         tarball_path: &std::path::Path,
         sri: &str,
     ) -> Result<PathBuf, LpmError> {
-        self.store_from_file_at_timed(dir, label, tarball_path, sri)
+        self.store_from_file_at_timed(dir, label, tarball_path, sri, false)
             .map(|(path, _)| path)
     }
 
@@ -443,7 +443,26 @@ impl PackageStore {
     ) -> Result<(PathBuf, StageTimings), LpmError> {
         let dir = self.package_dir(name, version);
         let label = format!("{name}@{version}");
-        self.store_from_file_at_timed(dir, &label, tarball_path, sri)
+        self.store_from_file_at_timed(dir, &label, tarball_path, sri, false)
+    }
+
+    /// Store a verified archive, rejecting a complete existing coordinate whose
+    /// recorded integrity differs. Also validates a concurrent publication winner.
+    pub fn store_package_from_file_matching_integrity(
+        &self,
+        name: &str,
+        version: &str,
+        tarball_path: &std::path::Path,
+        sri: &str,
+    ) -> Result<PathBuf, LpmError> {
+        self.store_from_file_at_timed(
+            self.package_dir(name, version),
+            &format!("{name}@{version}"),
+            tarball_path,
+            sri,
+            true,
+        )
+        .map(|(path, _)| path)
     }
 
     fn store_from_file_at_timed(
@@ -452,6 +471,7 @@ impl PackageStore {
         label: &str,
         tarball_path: &std::path::Path,
         sri: &str,
+        require_matching_integrity: bool,
     ) -> Result<(PathBuf, StageTimings), LpmError> {
         let mut timings = StageTimings::default();
 
@@ -460,6 +480,9 @@ impl PackageStore {
         // general-purpose API contract.
         if dir.exists() {
             if is_complete_package_dir(&dir) {
+                if require_matching_integrity {
+                    ensure_matching_stored_integrity(self.root(), &dir, label, sri, tarball_path)?;
+                }
                 self.backfill_security_cache_if_enabled(&dir, label);
                 tracing::debug!("store hit: {label}");
                 return Ok((dir, timings));
@@ -538,6 +561,9 @@ impl PackageStore {
             Ok(()) => Ok((dir, timings)),
             Err(_) if dir.exists() => {
                 let _ = std::fs::remove_dir_all(&tmp_dir);
+                if require_matching_integrity {
+                    ensure_matching_stored_integrity(self.root(), &dir, label, sri, tarball_path)?;
+                }
                 Ok((dir, timings))
             }
             Err(e) => {
@@ -546,6 +572,32 @@ impl PackageStore {
             }
         }
     }
+}
+
+fn ensure_matching_stored_integrity(
+    store_root: &std::path::Path,
+    dir: &std::path::Path,
+    label: &str,
+    sri: &str,
+    tarball_path: &std::path::Path,
+) -> Result<(), LpmError> {
+    if is_complete_package_dir(dir)
+        && let Ok(stored) =
+            lpm_common::read_text_file_capped_nofollow(&dir.join(".integrity"), 4096)
+    {
+        if stored == sri {
+            return Ok(());
+        }
+        if Integrity::parse(&stored)
+            .is_ok_and(|integrity| integrity.verify_file(tarball_path).is_ok())
+        {
+            crate::integrity::record_verified_integrity_alias(store_root, &stored, sri)?;
+            return Ok(());
+        }
+    }
+    Err(LpmError::Store(format!(
+        "v1 store integrity conflict for {label}; use the default v2 store or a separate LPM_HOME"
+    )))
 }
 
 /// Transparent `Read` wrapper that computes the canonical SHA-512 tarball
@@ -1183,6 +1235,61 @@ mod tests {
     }
 
     #[test]
+    fn pinned_file_insertions_reject_a_different_concurrent_artifact() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = PackageStore::at(directory.path());
+        let barrier = std::sync::Barrier::new(2);
+        let results = std::thread::scope(|scope| {
+            let handles: Vec<_> = [b"first".as_slice(), b"second".as_slice()]
+                .into_iter()
+                .map(|marker| {
+                    let store = &store;
+                    let barrier = &barrier;
+                    scope.spawn(move || {
+                        let bytes = create_test_tarball(&[
+                            ("package.json", br#"{"name":"race","version":"1.0.0"}"#),
+                            ("marker.txt", marker),
+                        ]);
+                        let sri = compute_sri_hash(&bytes);
+                        let mut archive = tempfile::NamedTempFile::new().unwrap();
+                        std::io::Write::write_all(&mut archive, &bytes).unwrap();
+                        barrier.wait();
+                        store.store_package_from_file_matching_integrity(
+                            "race",
+                            "1.0.0",
+                            archive.path(),
+                            &sri,
+                        )
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|handle| handle.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+        assert_eq!(
+            results.iter().filter(|result| result.is_ok()).count(),
+            1,
+            "{results:?}"
+        );
+        let error = results
+            .iter()
+            .find_map(|result| result.as_ref().err())
+            .unwrap();
+        assert!(error.to_string().contains("integrity conflict"), "{error}");
+        let winner = results.iter().position(Result::is_ok).unwrap();
+        assert_eq!(
+            std::fs::read(store.package_dir("race", "1.0.0").join("marker.txt")).unwrap(),
+            if winner == 0 {
+                b"first".as_slice()
+            } else {
+                b"second".as_slice()
+            }
+        );
+    }
+
+    #[test]
     fn store_from_file_concurrent_same_package() {
         let dir = tempfile::tempdir().unwrap();
         let store = std::sync::Arc::new(PackageStore::at(dir.path()));
@@ -1199,6 +1306,47 @@ mod tests {
                     let mut temp = tempfile::NamedTempFile::new().unwrap();
                     std::io::Write::write_all(&mut temp, &data).unwrap();
                     s.store_package_from_file("race", "1.0.0", temp.path(), "sha512-race")
+                })
+            })
+            .collect();
+
+        for h in handles {
+            let result: Result<PathBuf, _> = h.join().unwrap();
+            assert!(result.is_ok(), "concurrent store_from_file should not fail");
+        }
+
+        assert!(store.has_package("race", "1.0.0"));
+        let store_v1 = store.root().join("v1");
+        if store_v1.exists() {
+            for entry in std::fs::read_dir(&store_v1).unwrap() {
+                let name = entry.unwrap().file_name().to_string_lossy().to_string();
+                assert!(!name.contains(".tmp."), "stale temp dir found: {name}");
+            }
+        }
+    }
+
+    #[test]
+    fn pinned_file_insertions_accept_the_same_concurrent_artifact() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = std::sync::Arc::new(PackageStore::at(dir.path()));
+        let tgz = create_test_tarball(&[
+            ("package.json", br#"{"name":"race","version":"1.0.0"}"#),
+            ("index.js", b"module.exports = 'race'"),
+        ]);
+
+        let handles: Vec<_> = (0..8)
+            .map(|_| {
+                let s = store.clone();
+                let data = tgz.clone();
+                std::thread::spawn(move || {
+                    let mut temp = tempfile::NamedTempFile::new().unwrap();
+                    std::io::Write::write_all(&mut temp, &data).unwrap();
+                    s.store_package_from_file_matching_integrity(
+                        "race",
+                        "1.0.0",
+                        temp.path(),
+                        &compute_sri_hash(&data),
+                    )
                 })
             })
             .collect();
