@@ -587,7 +587,7 @@ async fn async_main() -> Result<()> {
             let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
             commands::resolve::run(&client, &cwd, &packages, cli.json).await
         }
-        Commands::Install(args) => {
+        Commands::Install(args) => crate::trust_snapshot::scope_install(async {
             let lifecycle_args::InstallArgs {
                 packages,
                 recursive,
@@ -1255,7 +1255,7 @@ async fn async_main() -> Result<()> {
                     .await
                 }
             }
-        }
+        }).await,
         Commands::Uninstall(args) => {
             let lifecycle_args::UninstallArgs {
                 packages,
@@ -1728,7 +1728,7 @@ async fn async_main() -> Result<()> {
             )
             .await
         }
-        Commands::Upgrade(args) => {
+        Commands::Upgrade(args) => crate::trust_snapshot::scope_install(async {
             let lifecycle_args::UpgradeArgs {
                 packages,
                 major,
@@ -1748,7 +1748,7 @@ async fn async_main() -> Result<()> {
                 cli.json,
             )
             .await
-        }
+        }).await,
         Commands::Init(args) => {
             let lifecycle_args::InitArgs {
                 yes,
@@ -2635,7 +2635,7 @@ async fn async_main() -> Result<()> {
             )
             .await
         }
-        Commands::Ci(args) => {
+        Commands::Ci(args) => crate::trust_snapshot::scope_install(async {
             let build_args::CiArgs {
                 omit,
                 prod,
@@ -2823,7 +2823,7 @@ async fn async_main() -> Result<()> {
 
             commands::root_lifecycle::RootProjectLifecycle::load(&cwd)?
                 .run_after_successful_install(&cwd, cli.json)
-        }
+        }).await,
         Commands::Dev(args) => {
             let build_args::DevArgs {
                 https,

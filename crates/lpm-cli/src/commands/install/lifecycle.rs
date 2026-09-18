@@ -403,7 +403,7 @@ pub(super) async fn run_online_lifecycle_prepare_phase(
         &lpm_workspace::TrustedDependencies::Legacy(Vec::new()),
         |l| &l.trusted_dependencies,
     ));
-    if let Err(e) = crate::trust_snapshot::write_snapshot(project_dir, &snap) {
+    if let Err(e) = crate::trust_snapshot::stage_install_snapshot(project_dir, snap) {
         tracing::warn!("failed to write trust-snapshot.json: {e}");
     }
     let trust_snapshot_ms = trust_snap_start.elapsed().as_millis();

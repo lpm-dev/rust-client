@@ -99,11 +99,11 @@ fn prepare_project_edit(
     operation: LifecycleScopeOperation<'_>,
 ) -> Result<(std::path::PathBuf, serde_json::Value, EditResult), LpmError> {
     let manifest_path = project_dir.join("package.json");
-    let content = match lpm_common::read_text_file_capped(
+    let content = match lpm_common::read_text_regular_file_capped_with_metadata(
         &manifest_path,
         lpm_common::CONFIG_FILE_SIZE_CAP_BYTES,
     ) {
-        Ok(content) => content,
+        Ok((content, _)) => content,
         Err(lpm_common::BoundedReadError::NotFound { .. }) => {
             return Err(LpmError::NotFound(
                 "lpm trust lifecycle-scope requires a package.json in the current directory."
@@ -112,8 +112,10 @@ fn prepare_project_edit(
         }
         Err(error) => return Err(LpmError::Registry(error.to_string())),
     };
-    let manifest: serde_json::Value = serde_json::from_str(&content)
-        .map_err(|error| LpmError::Registry(format!("failed to parse package.json: {error}")))?;
+    let manifest: serde_json::Value =
+        serde_json::from_str(lpm_common::strip_utf8_bom_str(&content)).map_err(|error| {
+            LpmError::Registry(format!("failed to parse package.json: {error}"))
+        })?;
     if !manifest.is_object() {
         return Err(LpmError::Registry(
             "package.json must contain a JSON object at the top level".into(),

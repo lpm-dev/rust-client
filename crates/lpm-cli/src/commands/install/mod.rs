@@ -481,7 +481,11 @@ pub(crate) async fn run_with_options_with_lpm_root(
             &lpm_root,
         )),
     );
-    workspace_lockfile::scope_member_install(project_dir, install).await
+    crate::trust_snapshot::scope_install(workspace_lockfile::scope_member_install(
+        project_dir,
+        install,
+    ))
+    .await
 }
 
 fn assert_send_install_future<F>(future: F) -> F

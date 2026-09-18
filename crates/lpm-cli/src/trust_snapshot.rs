@@ -181,9 +181,11 @@ pub fn snapshot_path(project_dir: &Path) -> PathBuf {
 /// compatibility.
 pub fn read_snapshot(project_dir: &Path) -> Option<TrustSnapshot> {
     let path = snapshot_path(project_dir);
-    let bytes = lpm_common::read_capped_state_file(&path, lpm_common::STATE_FILE_SIZE_CAP_BYTES)
-        .ok()
-        .flatten()?;
+    let (bytes, _) = lpm_common::read_regular_file_capped_with_metadata(
+        &path,
+        lpm_common::STATE_FILE_SIZE_CAP_BYTES,
+    )
+    .ok()?;
     let snap: TrustSnapshot = serde_json::from_slice(&bytes).ok()?;
     if snap.schema_version > SCHEMA_VERSION {
         tracing::debug!(
@@ -195,6 +197,59 @@ pub fn read_snapshot(project_dir: &Path) -> Option<TrustSnapshot> {
         return None;
     }
     Some(snap)
+}
+
+tokio::task_local! {
+    static PENDING_INSTALL_SNAPSHOTS: std::sync::Arc<std::sync::Mutex<BTreeMap<PathBuf, TrustSnapshot>>>;
+}
+
+// The outer command includes root lifecycle scripts and manifest finalization.
+// Keep the pre-script capture, but publish it only if that whole command succeeds.
+pub(crate) fn scope_install<F, T>(
+    future: F,
+) -> impl std::future::Future<Output = Result<T, LpmError>>
+where
+    F: std::future::Future<Output = Result<T, LpmError>>,
+{
+    let future = Box::pin(future);
+    async move {
+        if PENDING_INSTALL_SNAPSHOTS.try_with(|_| ()).is_ok() {
+            return future.await;
+        }
+        let pending = std::sync::Arc::new(std::sync::Mutex::new(BTreeMap::new()));
+        let result = PENDING_INSTALL_SNAPSHOTS
+            .scope(std::sync::Arc::clone(&pending), future)
+            .await;
+        if result.is_ok() {
+            let snapshots = std::mem::take(
+                &mut *pending
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner),
+            );
+            for (project_dir, snapshot) in snapshots {
+                if let Err(error) = write_snapshot(&project_dir, &snapshot) {
+                    tracing::warn!("failed to write trust-snapshot.json: {error}");
+                }
+            }
+        }
+        result
+    }
+}
+
+pub(crate) fn stage_install_snapshot(
+    project_dir: &Path,
+    snapshot: TrustSnapshot,
+) -> Result<(), LpmError> {
+    match PENDING_INSTALL_SNAPSHOTS.try_with(std::sync::Arc::clone) {
+        Ok(pending) => {
+            pending
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert(project_dir.to_path_buf(), snapshot);
+            Ok(())
+        }
+        Err(_) => write_snapshot(project_dir, &snapshot),
+    }
 }
 
 /// Atomically write the snapshot to
