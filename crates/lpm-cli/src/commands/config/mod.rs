@@ -1,6 +1,7 @@
 mod effective;
 mod global_config;
 mod io;
+mod values;
 mod wizards;
 
 #[cfg(test)]
@@ -17,6 +18,7 @@ use lpm_common::{LpmError, LpmRoot};
 use std::io::IsTerminal;
 
 pub use global_config::GlobalConfig;
+pub(crate) use global_config::parse_env_bool;
 pub(crate) use wizards::{
     TRUST_POLICY_KEY, TYPOSQUAT_GUARD_KEY, TyposquatGuardSelection, resolve_object_integrity_policy,
 };
@@ -46,8 +48,6 @@ use wizards::{
     validate_trust_policy_value,
 };
 
-const NESTED_CONFIG_SECTIONS: [&str; 5] = ["sandbox", "sigstore", "firewall", "policy", "tunnel"];
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum GenericSetTarget {
     Scalar,
@@ -65,13 +65,7 @@ fn generic_set_target(key: &str) -> GenericSetTarget {
         "sigstore" => GenericSetTarget::Sigstore,
         "firewall" => GenericSetTarget::Firewall,
         "policy" | "tunnel" => GenericSetTarget::UnsupportedNested,
-        _ if NESTED_CONFIG_SECTIONS.iter().any(|section| {
-            key.strip_prefix(section)
-                .is_some_and(|suffix| suffix.starts_with('.'))
-        }) =>
-        {
-            GenericSetTarget::UnsupportedNested
-        }
+        _ if key.contains('.') => GenericSetTarget::UnsupportedNested,
         _ => GenericSetTarget::Scalar,
     }
 }
@@ -123,6 +117,32 @@ pub async fn run(
     json_output: bool,
 ) -> Result<(), LpmError> {
     validate_action_arguments(action, key, value, set)?;
+    if json_output
+        && set.is_none()
+        && matches!(
+            action,
+            Some(
+                "scripts"
+                    | "triage"
+                    | "sandbox"
+                    | "sigstore"
+                    | "signatures"
+                    | "trust-policy"
+                    | "typosquat"
+                    | "firewall"
+                    | "integrity"
+                    | "release-age"
+                    | "release-age-policy"
+                    | "source-analysis"
+                    | "lpm-skills"
+                    | "lpm-insights"
+            )
+        )
+    {
+        return Err(LpmError::Registry(
+            "focused config commands require --set <VALUE> with --json".into(),
+        ));
+    }
     let config_path = LpmRoot::from_env()?.root().join("config.toml");
 
     let Some(action) = action else {
@@ -282,6 +302,7 @@ pub async fn run(
                 }
                 GenericSetTarget::Scalar => {}
             }
+            values::validate_scalar(key, value)?;
             let json_value = update_config(&config_path, |config| {
                 guard_generic_set_against_force_floor(config, key, value)?;
                 match key {

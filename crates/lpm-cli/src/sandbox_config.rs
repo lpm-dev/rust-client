@@ -309,13 +309,11 @@ pub(crate) fn resolve_sandbox_mode_from_chain_with_global(
 /// kind of "what the user configured wins" violation the Q4
 /// redline rejected.
 fn env_strict_sandbox_set() -> bool {
-    match std::env::var("LPM_STRICT_SANDBOX") {
-        Ok(v) => matches!(
-            v.trim().to_ascii_lowercase().as_str(),
-            "1" | "true" | "yes" | "on"
-        ),
-        Err(_) => false,
-    }
+    std::env::var("LPM_STRICT_SANDBOX")
+        .ok()
+        .as_deref()
+        .and_then(crate::commands::config::parse_env_bool)
+        == Some(true)
 }
 
 /// Raw key snapshot from a single TOML file. `None` means the key is

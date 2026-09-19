@@ -333,7 +333,9 @@ pub fn resolve_script_policy_with_reporting(
     resolution.effective
 }
 
-fn approval_scope_for_policy(policy: ScriptPolicy) -> crate::security_approval::ApprovalScope {
+pub(crate) fn approval_scope_for_policy(
+    policy: ScriptPolicy,
+) -> crate::security_approval::ApprovalScope {
     match policy {
         ScriptPolicy::Deny => crate::security_approval::ApprovalScope::ScriptsTriage,
         ScriptPolicy::Triage => crate::security_approval::ApprovalScope::ScriptsTriage,

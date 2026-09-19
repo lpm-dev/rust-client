@@ -845,11 +845,8 @@ async fn async_main() -> Result<()> {
             } else if no_audit_after_install {
                 false
             } else if let Ok(env_val) = std::env::var("LPM_AUDIT_AFTER_INSTALL") {
-                match env_val.trim().to_lowercase().as_str() {
-                    "1" | "true" | "yes" | "on" => true,
-                    "0" | "false" | "no" | "off" => false,
-                    _ => cfg.get_bool("audit-after-install").unwrap_or(false),
-                }
+                crate::commands::config::parse_env_bool(&env_val)
+                    .unwrap_or_else(|| cfg.get_bool("audit-after-install").unwrap_or(false))
             } else {
                 cfg.get_bool("audit-after-install").unwrap_or(false)
             };

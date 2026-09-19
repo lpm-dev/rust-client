@@ -459,11 +459,7 @@ pub(super) fn positive_usize_env_or_default(name: &str, default: usize) -> usize
 }
 
 pub(super) fn parse_bool_env_value(value: &str, default: bool) -> bool {
-    match value.trim().to_ascii_lowercase().as_str() {
-        "1" | "true" | "yes" | "on" => true,
-        "0" | "false" | "no" | "off" => false,
-        _ => default,
-    }
+    crate::commands::config::parse_env_bool(value).unwrap_or(default)
 }
 
 pub(super) fn registry_signature_verification_enabled(

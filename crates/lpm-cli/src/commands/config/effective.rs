@@ -212,7 +212,7 @@ fn add_save_entries(
         .unwrap_or(crate::save_spec::SavePrefix::Caret)
         .as_str();
     let project_exact = read_optional_bool_from_table(project, "save-exact", project_path)?;
-    let global_exact = read_optional_bool(global, "save-exact", global_path)?;
+    let global_exact = read_optional_bool_from_table(global.table(), "save-exact", global_path)?;
     let save_exact = project_exact.or(global_exact).unwrap_or(false);
     entries.push(EffectiveConfigEntry::new(
         "save-prefix",
@@ -278,13 +278,26 @@ fn add_script_entries(
         global,
     );
     let candidate_source = policy_source(resolution.effective_source, user_source);
-    let (script_policy, script_source) = select_security_value(
+    let (mut script_policy, mut script_source) = select_security_value(
         resolution.effective,
         candidate_source,
         posture.posture.script_policy(),
         posture.sources.script_policy,
         |candidate, floor| candidate.loosens(floor),
     );
+    if let Some(requested) = script_config.policy
+        && requested.loosens(posture.posture.script_policy())
+        && posture.sources.script_policy != PostureSourceKind::ManagedPolicy
+        && crate::security_approval::has_active_project_unlock(
+            crate::script_policy_config::approval_scope_for_policy(requested),
+            project_dir,
+            None,
+            &[],
+        )?
+    {
+        script_policy = requested;
+        script_source = format!("{PACKAGE_JSON_SOURCE} (temporary project unlock)");
+    }
     entries.push(EffectiveConfigEntry::new(
         "script-policy",
         script_policy.as_str(),
@@ -608,7 +621,7 @@ fn add_security_entries(
     let configured_signatures = read_optional_bool(global, "signatures", global_path)?;
     let signatures = signatures_env.as_deref().map_or_else(
         || configured_signatures.unwrap_or(false),
-        |value| parse_bool_text(value).unwrap_or(false),
+        |value| super::parse_env_bool(value).unwrap_or(false),
     );
     let signatures_source = if signatures_env.is_some() {
         "LPM_VERIFY_REGISTRY_SIGNATURES"
@@ -656,7 +669,9 @@ fn add_security_entries(
         }
         None => None,
     };
-    let env_typosquat_off = env_bool("LPM_TYPOSQUAT_GUARD") == Some(false);
+    let env_typosquat_off = crate::typosquat_guard::typosquat_guard_disabled_from_env_value(
+        std::env::var("LPM_TYPOSQUAT_GUARD").ok().as_deref(),
+    );
     let (typosquat, typosquat_source) = if let Some(candidate) = config_typosquat {
         select_security_value(
             candidate,
@@ -921,7 +936,7 @@ fn add_install_entries(
     ));
 
     let audit_env = std::env::var("LPM_AUDIT_AFTER_INSTALL").ok();
-    let audit_env_value = audit_env.as_deref().and_then(parse_bool_text);
+    let audit_env_value = audit_env.as_deref().and_then(super::parse_env_bool);
     let configured_audit = read_optional_bool(global, "audit-after-install", global_path)?;
     let audit = audit_env_value.or(configured_audit).unwrap_or(false);
     entries.push(EffectiveConfigEntry::new(
@@ -1243,13 +1258,9 @@ fn read_optional_bool_from_table(
     let Some(value) = table.get(key) else {
         return Ok(None);
     };
-    match value {
-        toml::Value::Boolean(value) => Ok(Some(*value)),
-        toml::Value::String(value) => parse_bool_text(value)
-            .map(Some)
-            .ok_or_else(|| invalid_global_value(path, key, "true or false")),
-        _ => Err(invalid_global_value(path, key, "true or false")),
-    }
+    crate::save_config::coerce_bool(value)
+        .map(Some)
+        .ok_or_else(|| invalid_global_value(path, key, "true or false"))
 }
 
 fn read_save_prefix(
@@ -1511,15 +1522,7 @@ fn env_bool(name: &str) -> Option<bool> {
     std::env::var(name)
         .ok()
         .as_deref()
-        .and_then(parse_bool_text)
-}
-
-fn parse_bool_text(value: &str) -> Option<bool> {
-    match value.trim().to_ascii_lowercase().as_str() {
-        "1" | "true" | "yes" | "on" | "enabled" => Some(true),
-        "0" | "false" | "no" | "off" | "disabled" => Some(false),
-        _ => None,
-    }
+        .and_then(super::parse_env_bool)
 }
 
 fn display_json_value(value: &serde_json::Value) -> String {

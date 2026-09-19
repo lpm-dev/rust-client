@@ -2086,3 +2086,249 @@ fn config_mutation_creates_an_owner_only_config_file() {
         & 0o777;
     assert_eq!(mode, 0o600);
 }
+
+#[test]
+fn config_delete_sandbox_mode_preserves_the_forced_user_floor() {
+    for action in ["delete", "unset"] {
+        let project = TempProject::empty(r#"{"name":"config-floor","version":"1.0.0"}"#);
+        let before = "force-security-floor = true\n[sandbox]\nmode = \"strict\"\n";
+        seed_config(&project, before);
+        let output = lpm(&project)
+            .args(["config", action, "sandbox.mode", "--json"])
+            .output()
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert!(
+            !output.status.success(),
+            "{action} bypassed the floor: {json}"
+        );
+        assert_eq!(json["error_code"], "security_floor");
+        assert_eq!(
+            std::fs::read_to_string(config_path(&project)).unwrap(),
+            before
+        );
+    }
+}
+
+#[test]
+fn config_set_rejects_unaddressable_keys_without_mutation() {
+    for key in ["custom.value", ".custom", "custom.", "custom..value", ""] {
+        let project = TempProject::empty(r#"{"name":"config-key","version":"1.0.0"}"#);
+        let before = "custom = \"preserved\"\n";
+        seed_config(&project, before);
+        let output = lpm(&project)
+            .args(["config", "set", key, "value", "--json"])
+            .output()
+            .unwrap();
+        assert!(
+            !output.status.success(),
+            "saved unaddressable {key}: {}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        assert_eq!(
+            std::fs::read_to_string(config_path(&project)).unwrap(),
+            before
+        );
+    }
+}
+
+#[test]
+fn config_set_rejects_invalid_known_values_without_mutation() {
+    let cases = [
+        ("workspace-concurrency", "0"),
+        ("workspace-concurrency", "-2"),
+        ("workspace-concurrency", "+2"),
+        ("save-prefix", "*"),
+        ("save-exact", "on"),
+        ("engine-strict", "maybe"),
+        ("strict-peer-dependencies", "maybe"),
+        ("auto-install-peers", "maybe"),
+        ("audit-after-install", "maybe"),
+        ("force-security-floor", "maybe"),
+        ("triage-advisor", "unknown"),
+        ("linker", "flat"),
+        ("script-read-allow", "/tmp/read"),
+        ("max-sandbox-write-roots", "/tmp/bound"),
+    ];
+    for (key, value) in cases {
+        let project = TempProject::empty(r#"{"name":"config-values","version":"1.0.0"}"#);
+        let before = "max-sandbox-write-roots = [\"/approved\"]\n";
+        seed_config(&project, before);
+        let output = lpm(&project)
+            .args(["config", "set", key, value, "--json"])
+            .output()
+            .unwrap();
+        assert!(
+            !output.status.success(),
+            "saved invalid {key}={value}: {}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        assert_eq!(
+            std::fs::read_to_string(config_path(&project)).unwrap(),
+            before
+        );
+    }
+}
+
+#[test]
+fn config_list_environment_booleans_match_runtime_spellings() {
+    let cases = [
+        (
+            "LPM_STRICT_SANDBOX",
+            "enabled",
+            "sandbox.mode",
+            serde_json::json!("default"),
+            "built-in default",
+        ),
+        (
+            "LPM_VERIFY_REGISTRY_SIGNATURES",
+            "enabled",
+            "signatures",
+            serde_json::json!(false),
+            "LPM_VERIFY_REGISTRY_SIGNATURES",
+        ),
+        (
+            "LPM_AUDIT_AFTER_INSTALL",
+            "enabled",
+            "audit-after-install",
+            serde_json::json!(false),
+            "built-in default",
+        ),
+        (
+            "LPM_TYPOSQUAT_GUARD",
+            "no",
+            "typosquat-guard",
+            serde_json::json!("default"),
+            "built-in default",
+        ),
+        (
+            "LPM_STRICT_SANDBOX",
+            " ON ",
+            "sandbox.mode",
+            serde_json::json!("strict"),
+            "LPM_STRICT_SANDBOX",
+        ),
+        (
+            "LPM_AUDIT_AFTER_INSTALL",
+            " YES ",
+            "audit-after-install",
+            serde_json::json!(true),
+            "LPM_AUDIT_AFTER_INSTALL",
+        ),
+        (
+            "LPM_TYPOSQUAT_GUARD",
+            " DISABLED ",
+            "typosquat-guard",
+            serde_json::json!("off"),
+            "LPM_TYPOSQUAT_GUARD",
+        ),
+    ];
+    for (variable, raw, key, expected, source) in cases {
+        let project = TempProject::empty(r#"{"name":"config-bool","version":"1.0.0"}"#);
+        let output = lpm(&project)
+            .env(variable, raw)
+            .args(["config", "list", "--json"])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        let entry = json["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| entry["key"] == key)
+            .unwrap();
+        assert_eq!(entry["value"], expected, "{variable}={raw}");
+        assert_eq!(entry["source"], source, "{variable}={raw}");
+    }
+}
+
+#[test]
+fn config_list_rejects_save_exact_aliases_rejected_by_install() {
+    let project = TempProject::empty(r#"{"name":"config-save","version":"1.0.0"}"#);
+    project.write_file("lpm.toml", "save-exact = \"on\"\n");
+    let output = lpm(&project)
+        .args(["config", "list", "--json"])
+        .output()
+        .unwrap();
+    assert!(
+        !output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(json["error"].as_str().unwrap().contains("save-exact"));
+}
+
+#[test]
+fn config_list_honors_only_matching_project_script_unlocks() {
+    for scenario in ["absent", "valid", "wrong-project", "expired", "managed"] {
+        let project = TempProject::empty(
+            r#"{"name":"config-unlock","version":"1.0.0","lpm":{"scriptPolicy":"allow"}}"#,
+        );
+        if scenario != "absent" {
+            support::write_signed_unlock(&project, &["scripts-allow"]);
+        }
+        if scenario == "wrong-project" || scenario == "expired" {
+            use hmac::Mac;
+            let directory = project.home().join(".lpm/security/unlocks");
+            let path = std::fs::read_dir(directory)
+                .unwrap()
+                .next()
+                .unwrap()
+                .unwrap()
+                .path();
+            let mut envelope: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+            if scenario == "expired" {
+                envelope["payload"]["expires_at"] = serde_json::json!(
+                    (chrono::Utc::now() - chrono::Duration::minutes(1)).to_rfc3339()
+                );
+            } else {
+                envelope["payload"]["project_root"] =
+                    serde_json::json!(project.home().display().to_string());
+            }
+            let mut mac = hmac::Hmac::<sha2::Sha256>::new_from_slice(&[42u8; 32]).unwrap();
+            mac.update(&serde_json::to_vec(&envelope["payload"]).unwrap());
+            envelope["signature"] = serde_json::json!(hex::encode(mac.finalize().into_bytes()));
+            std::fs::write(path, serde_json::to_vec(&envelope).unwrap()).unwrap();
+        }
+        if scenario == "managed" {
+            std::fs::write(
+                project.home().join(".lpm/security-policy.toml"),
+                "script-policy = \"deny\"\n",
+            )
+            .unwrap();
+        }
+        let unlocked = scenario == "valid";
+        let output = lpm(&project)
+            .args(["config", "list", "--json"])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        let entry = json["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| entry["key"] == "script-policy")
+            .unwrap();
+        assert_eq!(entry["value"], if unlocked { "allow" } else { "deny" });
+        if unlocked {
+            assert!(
+                entry["source"]
+                    .as_str()
+                    .unwrap()
+                    .contains("temporary project unlock")
+            );
+        }
+    }
+}

@@ -595,7 +595,7 @@ pub(super) fn guard_generic_delete_against_force_floor(
             global,
             crate::release_age_config::ReleaseAgePolicy::Direct,
         )?,
-        "sandbox" => crate::security_floor::reject_looser_sandbox_mode_write(
+        "sandbox" | "sandbox.mode" => crate::security_floor::reject_looser_sandbox_mode_write(
             global,
             ResolvedSandboxMode::Default,
         )?,
