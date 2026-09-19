@@ -17,7 +17,9 @@ pub fn run_internal_hosts_file(
     action: &str,
     block_id: Option<&str>,
     hosts: &[String],
+    expected_blocks: Option<usize>,
 ) -> Result<(), LpmError> {
+    validate_clean_expectation(action, expected_blocks)?;
     crate::privilege::require_effective_root("hosts-file")?;
     let path = lpm_runner::local_domains::system_hosts_file_path();
     match action {
@@ -39,8 +41,13 @@ pub fn run_internal_hosts_file(
                 .map_err(LpmError::Script)?;
         }
         "clean" => {
-            lpm_runner::local_domains::clean_hosts_file_without_backup(&path)
-                .map_err(LpmError::Script)?;
+            lpm_runner::local_domains::clean_hosts_file_without_backup(
+                &path,
+                expected_blocks.ok_or_else(|| {
+                    LpmError::Script("internal hosts-file clean requires --expected-blocks".into())
+                })?,
+            )
+            .map_err(|error| LpmError::Script(error.to_string()))?;
         }
         _ => {
             return Err(LpmError::Script(format!(
@@ -58,7 +65,7 @@ pub fn apply_hosts_file_plan_with_permission(
         Ok(lease) => Ok(lease),
         Err(_) if should_try_privileged_hosts_helper(&plan.path) => {
             lpm_runner::local_domains::ensure_hosts_file_backup(&plan.path, &plan.backup_path)?;
-            run_privileged_hosts_helper("upsert", Some(&plan.block_id), &plan.hosts)?;
+            run_privileged_hosts_helper("upsert", Some(&plan.block_id), &plan.hosts, None)?;
             Ok(lpm_runner::local_domains::ManagedHostsFile::from_plan(
                 plan, true,
             ))
@@ -74,7 +81,7 @@ pub fn release_hosts_file_with_permission(
     match hosts_file.release() {
         Ok(_) => Ok(()),
         Err(_) if should_try_privileged_hosts_helper(elevated_release.path()) => {
-            run_privileged_hosts_helper("remove", Some(elevated_release.block_id()), &[])
+            run_privileged_hosts_helper("remove", Some(elevated_release.block_id()), &[], None)
         }
         Err(err) => Err(err),
     }
@@ -96,7 +103,7 @@ fn run_clean(json_output: bool, yes: bool) -> Result<(), LpmError> {
     confirm_hosts_file_clean(&plan, yes)?;
     let outcome = apply_hosts_file_clean_plan_with_permission(&plan).map_err(|err| {
         LpmError::Script(format!(
-            "local hosts file cleanup failed for {}: {err}. Run `lpm hosts clean` with permission to edit the hosts file (sudo on Unix, Administrator on Windows).",
+            "local hosts file cleanup failed for {}: {err}. Review the current block count and file access, then run `lpm hosts clean` again.",
             plan.path.display()
         ))
     })?;
@@ -127,11 +134,26 @@ fn run_clean(json_output: bool, yes: bool) -> Result<(), LpmError> {
 fn apply_hosts_file_clean_plan_with_permission(
     plan: &lpm_runner::local_domains::HostsFileCleanPlan,
 ) -> Result<lpm_runner::local_domains::HostsFileCleanOutcome, String> {
+    apply_hosts_file_clean_plan_with(
+        plan,
+        should_try_privileged_hosts_helper(&plan.path),
+        |count| run_privileged_hosts_helper("clean", None, &[], Some(count)),
+    )
+}
+
+fn apply_hosts_file_clean_plan_with(
+    plan: &lpm_runner::local_domains::HostsFileCleanPlan,
+    may_elevate: bool,
+    helper: impl FnOnce(usize) -> Result<(), String>,
+) -> Result<lpm_runner::local_domains::HostsFileCleanOutcome, String> {
     match lpm_runner::local_domains::apply_hosts_file_clean_plan(plan) {
         Ok(outcome) => Ok(outcome),
-        Err(_) if should_try_privileged_hosts_helper(&plan.path) => {
+        Err(error @ lpm_runner::local_domains::HostsFileCleanError::CountChanged { .. }) => {
+            Err(error.to_string())
+        }
+        Err(_) if may_elevate => {
             lpm_runner::local_domains::ensure_hosts_file_backup(&plan.path, &plan.backup_path)?;
-            run_privileged_hosts_helper("clean", None, &[])?;
+            helper(plan.block_count)?;
             Ok(lpm_runner::local_domains::HostsFileCleanOutcome {
                 path: plan.path.clone(),
                 backup_path: plan.backup_path.clone(),
@@ -139,7 +161,7 @@ fn apply_hosts_file_clean_plan_with_permission(
                 changed: plan.block_count > 0,
             })
         }
-        Err(err) => Err(err),
+        Err(err) => Err(err.to_string()),
     }
 }
 
@@ -167,8 +189,9 @@ fn run_privileged_hosts_helper(
     action: &str,
     block_id: Option<&str>,
     hosts: &[String],
+    expected_blocks: Option<usize>,
 ) -> Result<(), String> {
-    let args = internal_hosts_file_args(action, block_id, hosts);
+    let args = internal_hosts_file_args(action, block_id, hosts, expected_blocks);
     crate::elevation::run_current_exe_helper(
         &args,
         "Password for LPM hosts-file update: ",
@@ -177,10 +200,19 @@ fn run_privileged_hosts_helper(
     .map_err(|error| error.to_string())
 }
 
-fn internal_hosts_file_args(action: &str, block_id: Option<&str>, hosts: &[String]) -> Vec<String> {
+fn internal_hosts_file_args(
+    action: &str,
+    block_id: Option<&str>,
+    hosts: &[String],
+    expected_blocks: Option<usize>,
+) -> Vec<String> {
     let mut args = Vec::with_capacity(2 + usize::from(block_id.is_some()) * 2 + hosts.len() * 2);
     args.push("internal-hosts-file".to_string());
     args.push(action.to_string());
+    if let Some(count) = expected_blocks {
+        args.push("--expected-blocks".into());
+        args.push(count.to_string());
+    }
     if let Some(block_id) = block_id {
         args.push("--block-id".to_string());
         args.push(block_id.to_string());
@@ -190,6 +222,21 @@ fn internal_hosts_file_args(action: &str, block_id: Option<&str>, hosts: &[Strin
         args.push(host.clone());
     }
     args
+}
+
+fn validate_clean_expectation(
+    action: &str,
+    expected_blocks: Option<usize>,
+) -> Result<(), LpmError> {
+    match (action, expected_blocks) {
+        ("clean", None) => Err(LpmError::Script(
+            "internal hosts-file clean requires --expected-blocks".into(),
+        )),
+        ("clean", Some(_)) | (_, None) => Ok(()),
+        (_, Some(_)) => Err(LpmError::Script(
+            "--expected-blocks is only valid for internal hosts-file clean".into(),
+        )),
+    }
 }
 
 fn validated_block_id(block_id: Option<&str>) -> Result<&str, LpmError> {
@@ -343,6 +390,7 @@ mod tests {
             "upsert",
             Some("project.local"),
             &["app.localhost".to_string(), "api.localhost".to_string()],
+            None,
         );
 
         assert_eq!(
@@ -357,6 +405,35 @@ mod tests {
                 "--host",
                 "api.localhost",
             ]
+        );
+    }
+    #[test]
+    fn cleanup_count_changes_do_not_request_elevation_or_create_a_backup() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hosts");
+        std::fs::write(&path, "127.0.0.1 localhost\n").unwrap();
+        let plan = lpm_runner::local_domains::HostsFileCleanPlan {
+            path,
+            backup_path: dir.path().join("hosts.bak"),
+            block_count: 1,
+        };
+        let error = apply_hosts_file_clean_plan_with(&plan, true, |_| {
+            panic!("must not elevate a changed count")
+        })
+        .unwrap_err();
+        assert!(error.contains("count changed"), "{error}");
+        assert!(!plan.backup_path.exists());
+    }
+
+    #[test]
+    fn privileged_cleanup_requires_and_transports_the_approved_count() {
+        assert!(validate_clean_expectation("clean", None).is_err());
+        assert!(validate_clean_expectation("remove", Some(2)).is_err());
+        assert!(validate_clean_expectation("upsert", Some(2)).is_err());
+        validate_clean_expectation("clean", Some(2)).unwrap();
+        assert_eq!(
+            internal_hosts_file_args("clean", None, &[], Some(2)),
+            ["internal-hosts-file", "clean", "--expected-blocks", "2"]
         );
     }
 }
