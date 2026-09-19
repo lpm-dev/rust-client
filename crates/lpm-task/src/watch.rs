@@ -763,14 +763,14 @@ mod tests {
             ran_rx.recv_timeout(Duration::from_secs(3)).unwrap(),
             "initial"
         );
-        std::fs::write(&input, "changed").unwrap();
+        std::fs::write(&input, "changed input").unwrap();
         let changed = ran_rx.recv_timeout(Duration::from_secs(3));
         let _ = shutdown_tx.send(());
         watcher.join().unwrap().unwrap();
         drop(notifications);
         assert_eq!(
             changed.as_deref(),
-            Ok("changed"),
+            Ok("changed input"),
             "an edit with no native callback was lost"
         );
     }

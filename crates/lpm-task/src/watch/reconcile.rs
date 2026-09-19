@@ -284,16 +284,36 @@ mod tests {
     fn same_length_writes_and_atomic_replacements_are_detected() {
         let root = tempfile::tempdir().unwrap();
         let file = root.path().join("input.txt");
+        let first_time = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        let second_time = first_time + Duration::from_secs(2);
+        let set_time = |path: &Path, modified| {
+            fs::OpenOptions::new()
+                .write(true)
+                .open(path)
+                .unwrap()
+                .set_modified(modified)
+                .unwrap();
+        };
         fs::write(&file, "before").unwrap();
+        set_time(&file, first_time);
         let filter = filter(root.path(), &["input.txt"], &[]);
         let mut snapshot = Reconciler::default();
         snapshot.baseline(&filter, &|| false);
-        std::thread::sleep(Duration::from_millis(5));
         fs::write(&file, "after!").unwrap();
+        set_time(&file, second_time);
         assert!(scan(&mut snapshot, &filter));
         assert!(!scan(&mut snapshot, &filter));
         let replacement = root.path().join("replacement");
         fs::write(&replacement, "after!").unwrap();
+        // Unix also detects replacement when size and modification time stay identical.
+        set_time(
+            &replacement,
+            if cfg!(unix) {
+                second_time
+            } else {
+                second_time + Duration::from_secs(2)
+            },
+        );
         fs::rename(replacement, &file).unwrap();
         assert!(scan(&mut snapshot, &filter));
     }
