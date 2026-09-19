@@ -301,15 +301,15 @@ pub(super) fn check_typescript_setup(
     let root_declares_typescript = workspace.as_ref().is_some_and(|workspace| {
         crate::tsc_status::manifest_declares_typescript(&workspace.root_package)
     });
-    let system_tsc = crate::tsc_status::find_system_tsc();
-    let mut local_tsc = crate::tsc_status::LocalTscResolver::default();
+    let system_tsc = crate::tsc_status::SystemTscResolver::new();
+    let mut local_tsc = crate::tsc_status::LocalTscResolver::new(project_dir);
 
     for (dir, package) in candidates {
         let in_deps =
             root_declares_typescript || crate::tsc_status::manifest_declares_typescript(package);
         let status = crate::tsc_status::TscStatus::probe_with_local_snapshot(
             local_tsc.find(&dir),
-            system_tsc.as_deref(),
+            system_tsc.find(&dir).as_deref(),
             in_deps,
         );
         let label = label_for_tsconfig(project_dir, &dir);
