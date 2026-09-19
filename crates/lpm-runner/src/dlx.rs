@@ -3,26 +3,26 @@
 //! Cache management, package name parsing, and binary execution.
 //! The install step is handled in the CLI layer (self-hosted via LPM's resolver/store/linker).
 
+mod managed;
+
 use crate::bin_path;
 use lpm_common::{LpmError, LpmRoot, as_extended_path};
 use lpm_workspace::read_package_json;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::Once;
 
 /// Default cache TTL in seconds (24 hours).
 pub const CACHE_TTL_SECS: u64 = 24 * 60 * 60;
 
-static DLX_LEGACY_MIGRATION: Once = Once::new();
+const SWEEP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(3600);
 
 /// Get the dlx cache directory for a given package spec.
 ///
 /// Returns `~/.lpm/cache/dlx/{hash}/`. Legacy location was `~/.lpm/dlx-cache/`;
 /// migrated to keep all caches under `~/.lpm/cache/`.
 ///
-/// The first call after an upgrade silently migrates the legacy location by
-/// renaming `~/.lpm/dlx-cache/` to `~/.lpm/cache/dlx/` when only the legacy
+/// An idle cache migrates the legacy location by renaming `~/.lpm/dlx-cache/` to `~/.lpm/cache/dlx/` when only the legacy
 /// exists. The migration is idempotent: subsequent calls observe the
 /// modern location and do nothing. See [`migrate_legacy_dlx_cache`] for
 /// full semantics.
@@ -30,25 +30,30 @@ pub fn dlx_cache_dir(package_spec: &str) -> Result<PathBuf, LpmError> {
     let root = LpmRoot::from_env()
         .map_err(|e| LpmError::Script(format!("could not determine LPM home: {e}")))?;
 
-    // Run the one-shot migration exactly once per process. If the migration
-    // itself fails we log and continue — an inability to move the legacy
-    // directory should not block dlx from working against the modern one.
-    DLX_LEGACY_MIGRATION.call_once(|| {
-        if let Err(e) = migrate_legacy_dlx_cache(&root) {
-            tracing::warn!("dlx legacy cache migration failed (non-fatal): {e}");
+    let target = dlx_cache_dir_at(&root, package_spec);
+    if let Some(_lock) =
+        lpm_common::try_acquire_exclusive_lock(root.cache_root().join(".dlx.lock"))?
+    {
+        if let Err(error) = migrate_legacy_dlx_cache(&root) {
+            tracing::warn!("dlx legacy cache migration failed: {error}");
         }
-    });
-
-    // Proactive sweep: before resolving the requested spec, drop any dlx
-    // entries older than the TTL. Without this, a user who runs `lpm dlx
-    // cowsay` once and never again never triggers cleanup for that entry.
-    // The sweep is cheap: one `read_dir` + one `stat` per direct child, no
-    // registry traffic.
-    if let Err(e) = sweep_stale_dlx_entries(&root, CACHE_TTL_SECS) {
-        tracing::debug!("dlx proactive sweep failed (non-fatal): {e}");
+        let marker = root.cache_dlx().join(".sweep-at");
+        let recent = std::fs::metadata(&marker)
+            .and_then(|metadata| metadata.modified())
+            .ok()
+            .and_then(|mtime| mtime.elapsed().ok())
+            .is_some_and(|age| age < SWEEP_INTERVAL);
+        if !recent {
+            match sweep_stale_dlx_entries_unlocked(&root, CACHE_TTL_SECS, Some(&target)) {
+                Ok(_) => {
+                    create_cache_dir(&root.cache_dlx())?;
+                    std::fs::write(marker, [])?;
+                }
+                Err(error) => tracing::debug!("dlx cache sweep failed: {error}"),
+            }
+        }
     }
-
-    Ok(dlx_cache_dir_at(&root, package_spec))
+    Ok(target)
 }
 
 /// Remove every direct child of `~/.lpm/cache/dlx/` whose `package.json`
@@ -63,6 +68,18 @@ pub fn dlx_cache_dir(package_spec: &str) -> Result<PathBuf, LpmError> {
 /// Failures on individual entries are logged and swallowed; one stuck
 /// entry must not block cleanup of the others.
 pub fn sweep_stale_dlx_entries(root: &LpmRoot, ttl_secs: u64) -> Result<usize, LpmError> {
+    let Some(_lock) = lpm_common::try_acquire_exclusive_lock(root.cache_root().join(".dlx.lock"))?
+    else {
+        return Ok(0);
+    };
+    sweep_stale_dlx_entries_unlocked(root, ttl_secs, None)
+}
+
+fn sweep_stale_dlx_entries_unlocked(
+    root: &LpmRoot,
+    ttl_secs: u64,
+    preserve: Option<&Path>,
+) -> Result<usize, LpmError> {
     let dlx_root = root.cache_dlx();
     if !dlx_root.is_dir() {
         return Ok(0);
@@ -75,6 +92,9 @@ pub fn sweep_stale_dlx_entries(root: &LpmRoot, ttl_secs: u64) -> Result<usize, L
     for entry in std::fs::read_dir(&dlx_root)? {
         let Ok(entry) = entry else { continue };
         let path = entry.path();
+        if preserve == Some(path.as_path()) {
+            continue;
+        }
 
         // We only sweep cache dirs — skip files, symlinks, and anything
         // that isn't a regular directory at the top level.
@@ -389,6 +409,7 @@ fn resolve_dlx_bin_name(cache_dir: &Path, package_spec: &str) -> Result<String, 
         .entries(manifest_name)
         .into_iter()
         .map(|(name, _)| name)
+        .filter(|name| lpm_common::validate_portable_command_name(name).is_ok())
         .collect();
     bin_names.sort();
     bin_names.dedup();
@@ -437,6 +458,11 @@ pub fn build_dlx_command(
     let bin_dir = cache_dir.join("node_modules").join(".bin");
     let bin_name = resolve_dlx_bin_name(cache_dir, package_spec)?;
     let bin_path = dlx_program_path(&bin_dir, &bin_name, cfg!(windows));
+    if !bin_path.is_file() {
+        return Err(LpmError::Script(format!(
+            "package '{package_spec}' has no installed executable for '{bin_name}'"
+        )));
+    }
 
     // Build PATH with the dlx cache's .bin prepended
     let project_bin_dirs = bin_path::find_bin_dirs(project_dir);
@@ -497,6 +523,14 @@ pub fn exec_dlx_binary(
     exec_built_dlx_command(command, package_spec)
 }
 
+/// Validate the managed runtime's selected entrypoint before promoting an installation.
+pub fn validate_managed_runtime_entrypoint(
+    cache_dir: &Path,
+    package_spec: &str,
+) -> Result<(), LpmError> {
+    managed::entrypoint(cache_dir, package_spec).map(|_| ())
+}
+
 /// Execute a verified LPM-owned runtime while preserving the environment
 /// variables that runtime documents as part of its public contract.
 ///
@@ -508,7 +542,7 @@ pub fn exec_verified_lpm_runtime(
     package_spec: &str,
     extra_args: &[String],
 ) -> Result<(), LpmError> {
-    let mut command = build_dlx_command(project_dir, cache_dir, package_spec, extra_args)?;
+    let mut command = managed::build_command(project_dir, cache_dir, package_spec, extra_args)?;
     for variable in ["LPM_TOKEN", "LPM_REGISTRY_URL", "LPM_CLI_PATH"] {
         if let Some(value) = std::env::var_os(variable) {
             command.env(variable, value);
@@ -517,16 +551,19 @@ pub fn exec_verified_lpm_runtime(
     exec_built_dlx_command(command, package_spec)
 }
 
-fn exec_built_dlx_command(mut command: Command, package_spec: &str) -> Result<(), LpmError> {
+/// Execute a prepared dlx command after the caller completes its policy checks.
+pub fn exec_built_dlx_command(mut command: Command, package_spec: &str) -> Result<(), LpmError> {
     let bin_name = Path::new(command.get_program())
         .file_name()
         .and_then(|name| name.to_str())
         .unwrap_or_else(|| bin_name_from_spec(package_spec))
         .to_string();
 
-    let status = command
-        .status()
-        .map_err(|e| LpmError::Script(format!("failed to execute '{bin_name}': {e}")))?;
+    let signals = crate::execution::ExecutionSignals::new()?;
+    let status = signals.run(&mut command).map_err(|error| match error {
+        LpmError::Io(error) => LpmError::Script(format!("failed to execute '{bin_name}': {error}")),
+        error => error,
+    })?;
 
     if !status.success() {
         #[cfg(not(unix))]

@@ -341,6 +341,18 @@ impl RegistryClient {
         }
     }
 
+    /// Opaque identity of the registry and credential principal used for a package.
+    /// A missing identity prevents reuse across invocations.
+    pub fn routed_cache_identity(
+        &self,
+        name: &str,
+        route: &crate::UpstreamRoute,
+    ) -> Option<String> {
+        use sha2::{Digest, Sha256};
+        self.routed_metadata_storage_cache_key(name, route)
+            .map(|key| hex::encode(Sha256::digest(key.as_bytes())))
+    }
+
     fn routed_metadata_storage_cache_key(
         &self,
         name: &str,

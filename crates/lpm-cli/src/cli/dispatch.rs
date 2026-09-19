@@ -2223,7 +2223,7 @@ async fn async_main() -> Result<()> {
                     min_release_age_override,
                     min_release_age_exclude: &min_release_age_exclude,
                     inherit_caller_context: true,
-                    reserve_stdout: false,
+                    reserve_stdout: cli.json,
                 },
             )
             .await

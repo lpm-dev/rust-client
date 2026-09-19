@@ -8,6 +8,7 @@ repository.workspace = true
 description = "Script execution engine for LPM — PATH injection, pre/post hooks, exec, dlx"
 
 [dependencies]
+tempfile = "3"
 lpm-cert = { workspace = true }
 lpm-common = { workspace = true }
 lpm-env = { workspace = true }
@@ -50,9 +51,6 @@ windows-sys = { version = "0.60", features = [
     "Win32_System_SystemInformation",
     "Win32_System_Threading",
 ] }
-
-[dev-dependencies]
-tempfile = "3"
 
 [lints]
 workspace = true

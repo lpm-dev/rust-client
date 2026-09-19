@@ -31,6 +31,7 @@ pub(super) fn execute_script(
     home_dir: &Path,
     tmpdir: &Path,
     json_output: bool,
+    policy_project_dir: &Path,
 ) -> Result<(), String> {
     if cancelled.load(Ordering::Acquire) {
         return Err("Lifecycle script interrupted".to_string());
@@ -58,7 +59,7 @@ pub(super) fn execute_script(
         pkg_name,
         pkg_version,
         package_dir,
-        project_dir,
+        policy_project_dir,
         &envs,
         sandbox_mode,
         read_project_full,
@@ -820,6 +821,7 @@ mod cancellation_tests {
             root.path(),
             root.path(),
             false,
+            root.path(),
         );
         assert_eq!(result.unwrap_err(), "Lifecycle script interrupted");
         assert!(!root.path().join("started.txt").exists());

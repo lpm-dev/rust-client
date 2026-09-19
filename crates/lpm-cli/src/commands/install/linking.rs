@@ -726,6 +726,7 @@ pub(super) async fn run_link_and_finish(
             effective_policy,
             None,
             false,
+            None,
         )
         .await
         {

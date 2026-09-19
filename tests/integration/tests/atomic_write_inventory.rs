@@ -203,12 +203,12 @@ const REVIEWED_RAW_ATOMIC_WRITERS: &[(&str, &str)] = &[
         "publishes a randomized same-directory staging file installed by the shared secure writer and retains the prior record for rollback",
     ),
     (
-        "crates/lpm-cli/src/commands/run/single.rs::recover_managed_runtime",
+        "crates/lpm-cli/src/commands/run/dlx.rs::recover_managed_runtime",
         "restores a complete verified MCP runtime directory while holding the MCP cache lock",
     ),
     (
-        "crates/lpm-cli/src/commands/run/single.rs::replace_managed_runtime",
-        "swaps complete MCP runtime directories with rollback while holding the MCP cache lock",
+        "crates/lpm-cli/src/commands/run/dlx.rs::replace_runtime_entry",
+        "swaps complete staged runtime directories with rollback while holding the MCP cache lock or the dlx entry lock",
     ),
     (
         "crates/lpm-cli/src/commands/self_update.rs::install_staged_binary",
