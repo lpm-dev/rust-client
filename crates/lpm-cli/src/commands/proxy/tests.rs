@@ -44,6 +44,7 @@ fn resolve_start_options_uses_proxy_port_and_redirect_setting_from_config() {
     assert_eq!(
         options,
         lpm_proxy::ProxyDaemonOptions {
+            public_tls_port: None,
             http_port: None,
             http_redirect_port: None,
             tls_port: Some(9443),
@@ -65,6 +66,7 @@ fn resolve_start_options_defaults_proxy_listener_for_service_hosts() {
     assert_eq!(
         options,
         lpm_proxy::ProxyDaemonOptions {
+            public_tls_port: None,
             http_port: None,
             http_redirect_port: Some(80),
             tls_port: Some(443),
@@ -86,6 +88,7 @@ fn resolve_start_options_keeps_explicit_listener_flags_over_config() {
     assert_eq!(
         options,
         lpm_proxy::ProxyDaemonOptions {
+            public_tls_port: None,
             http_port: Some(8080),
             http_redirect_port: None,
             tls_port: None,
@@ -96,6 +99,7 @@ fn resolve_start_options_keeps_explicit_listener_flags_over_config() {
 #[test]
 fn proxy_service_start_args_use_resolved_listener_options() {
     let args = listener_args(lpm_proxy::ProxyDaemonOptions {
+        public_tls_port: None,
         http_port: None,
         http_redirect_port: Some(8080),
         tls_port: Some(9443),
@@ -111,6 +115,7 @@ fn proxy_service_start_args_use_resolved_listener_options() {
 #[test]
 fn proxy_service_install_rejects_privileged_user_service_ports() {
     let err = reject_privileged_user_service_ports(lpm_proxy::ProxyDaemonOptions {
+        public_tls_port: None,
         http_port: None,
         http_redirect_port: Some(80),
         tls_port: Some(443),
@@ -129,6 +134,7 @@ fn proxy_service_install_rejects_privileged_user_service_ports() {
 #[test]
 fn proxy_service_install_allows_high_and_ephemeral_ports() {
     reject_privileged_user_service_ports(lpm_proxy::ProxyDaemonOptions {
+        public_tls_port: None,
         http_port: Some(0),
         http_redirect_port: Some(8080),
         tls_port: Some(9443),
@@ -144,6 +150,7 @@ fn privileged_external_options_defaults_to_low_https_and_redirect_ports() {
     assert_eq!(
         options,
         lpm_proxy::ProxyDaemonOptions {
+            public_tls_port: None,
             http_port: None,
             http_redirect_port: Some(80),
             tls_port: Some(443),
@@ -155,6 +162,7 @@ fn privileged_external_options_defaults_to_low_https_and_redirect_ports() {
 fn privileged_external_options_maps_config_high_ports_to_low_external_ports() {
     let options = privileged_external_options(
         lpm_proxy::ProxyDaemonOptions {
+            public_tls_port: None,
             http_port: None,
             http_redirect_port: Some(9080),
             tls_port: Some(9443),
@@ -166,6 +174,7 @@ fn privileged_external_options_maps_config_high_ports_to_low_external_ports() {
     assert_eq!(
         options,
         lpm_proxy::ProxyDaemonOptions {
+            public_tls_port: None,
             http_port: None,
             http_redirect_port: Some(80),
             tls_port: Some(443),
@@ -177,6 +186,7 @@ fn privileged_external_options_maps_config_high_ports_to_low_external_ports() {
 fn privileged_external_options_preserves_config_redirect_disabled() {
     let options = privileged_external_options(
         lpm_proxy::ProxyDaemonOptions {
+            public_tls_port: None,
             http_port: None,
             http_redirect_port: None,
             tls_port: Some(9443),
@@ -188,6 +198,7 @@ fn privileged_external_options_preserves_config_redirect_disabled() {
     assert_eq!(
         options,
         lpm_proxy::ProxyDaemonOptions {
+            public_tls_port: None,
             http_port: None,
             http_redirect_port: None,
             tls_port: Some(443),
@@ -199,6 +210,7 @@ fn privileged_external_options_preserves_config_redirect_disabled() {
 fn privileged_external_options_rejects_plain_http_forwarding() {
     let err = privileged_external_options(
         lpm_proxy::ProxyDaemonOptions {
+            public_tls_port: None,
             http_port: Some(80),
             http_redirect_port: None,
             tls_port: None,
@@ -213,6 +225,7 @@ fn privileged_external_options_rejects_plain_http_forwarding() {
 #[test]
 fn privileged_external_options_rejects_high_external_tls_port() {
     let err = validate_privileged_external_options(lpm_proxy::ProxyDaemonOptions {
+        public_tls_port: None,
         http_port: None,
         http_redirect_port: None,
         tls_port: Some(9443),
@@ -229,11 +242,13 @@ fn privileged_forwarder_config_maps_low_listeners_to_backend_targets() {
         PathBuf::from("/tmp/lpm home/proxy.json"),
         PathBuf::from("/tmp/LPM Bin/lpm-rs"),
         lpm_proxy::ProxyDaemonOptions {
+            public_tls_port: None,
             http_port: None,
             http_redirect_port: Some(80),
             tls_port: Some(443),
         },
         lpm_proxy::ProxyDaemonOptions {
+            public_tls_port: None,
             http_port: None,
             http_redirect_port: Some(9080),
             tls_port: Some(9443),
@@ -432,6 +447,7 @@ fn sample_service_spec() -> ProxyServiceSpec {
 
 fn sample_forwarder_spec() -> PrivilegedForwarderSpec {
     let backend_options = lpm_proxy::ProxyDaemonOptions {
+        public_tls_port: None,
         http_port: None,
         http_redirect_port: Some(9080),
         tls_port: Some(9443),
@@ -441,6 +457,7 @@ fn sample_forwarder_spec() -> PrivilegedForwarderSpec {
         PathBuf::from("/tmp/lpm home/proxy.json"),
         PathBuf::from("/tmp/LPM Bin/lpm-rs"),
         lpm_proxy::ProxyDaemonOptions {
+            public_tls_port: None,
             http_port: None,
             http_redirect_port: Some(80),
             tls_port: Some(443),
@@ -473,11 +490,13 @@ fn write_forwarder_config(path: &Path, target_uid: u32) {
         PathBuf::from("/tmp/lpm home/proxy.json"),
         PathBuf::from("/tmp/LPM Bin/lpm-rs"),
         lpm_proxy::ProxyDaemonOptions {
+            public_tls_port: None,
             http_port: None,
             http_redirect_port: Some(80),
             tls_port: Some(443),
         },
         lpm_proxy::ProxyDaemonOptions {
+            public_tls_port: None,
             http_port: None,
             http_redirect_port: Some(9080),
             tls_port: Some(9443),

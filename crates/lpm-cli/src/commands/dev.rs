@@ -1320,15 +1320,22 @@ pub async fn run(
         .map_err(LpmError::Script)?
         .map(|entries| lpm_cert::name_constraints::dns_subtrees_from_entries(&entries))
         .unwrap_or_default();
-    let startup_proxy_lines = lpm_config
+    let mut startup_proxy_lines = lpm_config
         .as_ref()
         .map(|config| startup_proxy_lines_from_config(config))
         .unwrap_or_default();
-    if !local_domain_hostnames.is_empty() {
+    let proxy_port = if !local_domain_hostnames.is_empty() {
         let config = lpm_config.as_ref().ok_or_else(|| {
             LpmError::Script("local domains require an lpm.json configuration".to_string())
         })?;
-        ensure_local_proxy_running(project_dir, config).await?;
+        Some(ensure_local_proxy_running(project_dir, config).await?)
+    } else {
+        None
+    };
+    if let Some(port) = proxy_port {
+        for line in &mut startup_proxy_lines {
+            line.port = port;
+        }
     }
 
     // ── Collect startup info for banner ─────────────────────────────
@@ -1765,7 +1772,11 @@ pub async fn run(
             let service_runtime_hints =
                 prepare_service_runtime_hints(project_dir, &config.services, &runtime_hint).await?;
             let dashboard_services = if dashboard {
-                build_dashboard_services(config)?
+                let mut services = build_dashboard_services(config)?;
+                for service in &mut services {
+                    service.proxy_port = proxy_port;
+                }
+                services
             } else {
                 Vec::new()
             };
@@ -2614,6 +2625,13 @@ fn startup_proxy_lines_from_config(
         if let Some(host) = config.proxy.as_ref().and_then(|proxy| proxy.host.as_ref()) {
             push_startup_proxy_line(&mut lines, host, None);
         }
+        for line in &mut lines {
+            line.port = config
+                .proxy
+                .as_ref()
+                .and_then(|proxy| proxy.port)
+                .unwrap_or(443);
+        }
         return lines;
     }
 
@@ -2634,6 +2652,7 @@ fn startup_proxy_lines_from_config(
                 }
             }
             None => lines.push(StartupProxyLine {
+                port: 443,
                 host: host.clone(),
                 target: "primary service required".to_string(),
                 service: None,
@@ -2641,6 +2660,13 @@ fn startup_proxy_lines_from_config(
         }
     }
 
+    for line in &mut lines {
+        line.port = config
+            .proxy
+            .as_ref()
+            .and_then(|proxy| proxy.port)
+            .unwrap_or(443);
+    }
     lines
 }
 
@@ -2715,6 +2741,7 @@ fn build_dashboard_services(
             .map(|name| {
                 let service = &config.services[&name];
                 lpm_dashboard::ServiceState {
+                    proxy_port: None,
                     hosts: dashboard_service_hosts(config, &name),
                     name,
                     port: service.port,
@@ -2751,6 +2778,7 @@ fn push_startup_proxy_line(lines: &mut Vec<StartupProxyLine>, host: &str, servic
         return;
     }
     lines.push(StartupProxyLine {
+        port: 443,
         host: host.to_string(),
         target: "resolving endpoint".to_string(),
         service,
@@ -2760,7 +2788,7 @@ fn push_startup_proxy_line(lines: &mut Vec<StartupProxyLine>, host: &str, servic
 async fn ensure_local_proxy_running(
     project_dir: &Path,
     config: &lpm_runner::lpm_json::LpmJsonConfig,
-) -> Result<(), LpmError> {
+) -> Result<u16, LpmError> {
     let status = match lpm_proxy::status().await {
         Ok(status) if status.running => status,
         Ok(_) => {
@@ -2790,7 +2818,10 @@ async fn ensure_local_proxy_running(
             "local proxy listener contract does not match lpm.json: {error}. Restart it with `{}` before using `host` in lpm.json.",
             local_proxy_https_start_command()
         ))
-    })
+    })?;
+    status
+        .https_port()
+        .ok_or_else(|| LpmError::Script("local proxy did not report a valid HTTPS endpoint".into()))
 }
 
 fn validate_local_proxy_listener_contract(
@@ -2809,10 +2840,14 @@ fn validate_local_proxy_listener_contract(
         .parse::<std::net::SocketAddr>()
         .map_err(|_| format!("local proxy reported an invalid HTTPS listener `{tls_addr}`"))?
         .port();
+    if status.https_port().is_none_or(|port| port == 0) {
+        return Err("local proxy reported an invalid public HTTPS listener".into());
+    }
     let proxy = config.proxy.as_ref();
     if let Some(expected_tls_port) = proxy.and_then(|proxy| proxy.port)
         && expected_tls_port != 0
         && expected_tls_port != 443
+        && status.public_tls_addr.is_none()
         && actual_tls_port != expected_tls_port
     {
         return Err(format!(
@@ -3393,6 +3428,7 @@ struct StartupInfo {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct StartupProxyLine {
+    port: u16,
     host: String,
     target: String,
     service: Option<String>,
@@ -3493,7 +3529,16 @@ fn startup_banner_lines(info: &StartupInfo, _project_dir: &Path) -> Vec<StartupB
     for proxy in &info.proxy_lines {
         lines.push(StartupBannerLine {
             label: "Proxy",
-            value: format!("https://{} -> {}", proxy.host, proxy.target),
+            value: format!(
+                "https://{}{} -> {}",
+                proxy.host,
+                if proxy.port == 443 {
+                    String::new()
+                } else {
+                    format!(":{}", proxy.port)
+                },
+                proxy.target
+            ),
             hint: proxy.service.as_ref().map(|service| format!("({service})")),
         });
     }
@@ -4388,6 +4433,21 @@ mod tests {
     }
 
     #[test]
+    fn local_proxy_accepts_the_installed_public_endpoint_instead_of_its_backend_port() {
+        let config: lpm_runner::lpm_json::LpmJsonConfig = serde_json::from_str(
+            r#"{"proxy":{"host":"app.localhost","port":8443,"httpRedirect":false}}"#,
+        )
+        .unwrap();
+        let status: lpm_proxy::ProxyStatus = serde_json::from_value(serde_json::json!({
+            "running":true,"pid":42,"httpAddr":null,"httpRedirectAddr":null,
+            "tlsAddr":"https://127.0.0.1:9444", "public_tls_addr":"https://127.0.0.1:443",
+            "routes":[],"stale":false,"stateError":null
+        }))
+        .unwrap();
+        validate_local_proxy_listener_contract(&config, &status).unwrap();
+    }
+
+    #[test]
     fn local_proxy_rejects_a_high_tls_port_that_differs_from_lpm_json() {
         let config = lpm_runner::lpm_json::LpmJsonConfig {
             proxy: Some(lpm_runner::lpm_json::ProxyConfig {
@@ -4398,6 +4458,7 @@ mod tests {
             ..Default::default()
         };
         let status = lpm_proxy::ProxyStatus {
+            public_tls_addr: None,
             running: true,
             pid: Some(42),
             http_addr: None,
@@ -4425,6 +4486,7 @@ mod tests {
             ..Default::default()
         };
         let status = lpm_proxy::ProxyStatus {
+            public_tls_addr: None,
             running: true,
             pid: Some(42),
             http_addr: None,
@@ -4449,6 +4511,7 @@ mod tests {
             ..Default::default()
         };
         let status = lpm_proxy::ProxyStatus {
+            public_tls_addr: None,
             running: true,
             pid: Some(42),
             http_addr: None,
@@ -4473,6 +4536,7 @@ mod tests {
             ..Default::default()
         };
         let status = lpm_proxy::ProxyStatus {
+            public_tls_addr: None,
             running: true,
             pid: Some(42),
             http_addr: None,
@@ -4497,6 +4561,7 @@ mod tests {
             ..Default::default()
         };
         let status = lpm_proxy::ProxyStatus {
+            public_tls_addr: None,
             running: true,
             pid: Some(42),
             http_addr: None,
@@ -4524,6 +4589,7 @@ mod tests {
             ..Default::default()
         };
         let status = lpm_proxy::ProxyStatus {
+            public_tls_addr: None,
             running: true,
             pid: Some(42),
             http_addr: None,
@@ -4554,6 +4620,7 @@ mod tests {
             ..Default::default()
         };
         let status = lpm_proxy::ProxyStatus {
+            public_tls_addr: None,
             running: true,
             pid: Some(42),
             http_addr: None,
@@ -5876,6 +5943,32 @@ mod tests {
     }
 
     #[test]
+    fn startup_banner_includes_the_configured_https_proxy_port() {
+        let dir = TempDir::new().unwrap();
+        let config: lpm_runner::lpm_json::LpmJsonConfig = serde_json::from_str(
+            r#"{"proxy":{"host":"app.localhost","port":9443,"httpRedirect":false}}"#,
+        )
+        .unwrap();
+        let info = StartupInfo {
+            deps_status: String::new(),
+            env_status: None,
+            https_active: false,
+            tunnel_url: None,
+            tunnel_source: None,
+            network_addr: None,
+            node_version: None,
+            node_source: None,
+            inspector_url: None,
+            proxy_lines: startup_proxy_lines_from_config(&config),
+        };
+        let lines = startup_banner_lines(&info, dir.path());
+        assert!(
+            lines.iter().any(|line| line.label == "Proxy"
+                && line.value.starts_with("https://app.localhost:9443 ->"))
+        );
+    }
+
+    #[test]
     fn startup_banner_lines_use_slim_wording_for_created_env() {
         let dir = TempDir::new().unwrap();
         fs::write(dir.path().join(".nvmrc"), "22\n").unwrap();
@@ -5891,6 +5984,7 @@ mod tests {
             node_source: Some("from .nvmrc".to_string()),
             inspector_url: Some("http://127.0.0.1:53412".to_string()),
             proxy_lines: vec![StartupProxyLine {
+                port: 443,
                 host: "web.localhost".to_string(),
                 target: "localhost:3000".to_string(),
                 service: Some("web".to_string()),
@@ -6017,11 +6111,13 @@ mod tests {
             startup_proxy_lines_from_config(&config),
             vec![
                 StartupProxyLine {
+                    port: 443,
                     host: "api.localhost".to_string(),
                     target: "resolving endpoint".to_string(),
                     service: Some("api".to_string()),
                 },
                 StartupProxyLine {
+                    port: 443,
                     host: "web.localhost".to_string(),
                     target: "resolving endpoint".to_string(),
                     service: Some("web".to_string()),
@@ -6043,6 +6139,7 @@ mod tests {
         assert_eq!(
             startup_proxy_lines_from_config(&config),
             vec![StartupProxyLine {
+                port: 443,
                 host: "app.localhost".to_string(),
                 target: "resolving endpoint".to_string(),
                 service: None,

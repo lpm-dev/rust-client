@@ -51,9 +51,11 @@ pub fn read_status_from_path(path: &std::path::Path) -> Result<ProxyStatus, Prox
             state.http_addr,
             state.http_redirect_addr,
             state.tls_addr,
+            state.public_tls_addr,
             None,
         )),
         Err(err) => Ok(ProxyStatus::stale(
+            None,
             None,
             None,
             None,

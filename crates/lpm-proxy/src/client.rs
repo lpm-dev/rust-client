@@ -241,9 +241,14 @@ impl Drop for RouteLease {
 pub async fn status() -> Result<ProxyStatus, ProxyError> {
     match send_request(ProxyRequest::Status).await {
         Ok(ProxyResponse::Status { status }) => Ok(status),
-        Ok(ProxyResponse::Error { message }) => {
-            Ok(ProxyStatus::stale(None, None, None, None, Some(message)))
-        }
+        Ok(ProxyResponse::Error { message }) => Ok(ProxyStatus::stale(
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(message),
+        )),
         Ok(other) => Err(ProxyError::IpcProtocol(format!(
             "expected status response, got {other:?}"
         ))),
