@@ -9,19 +9,27 @@ const COMMAND: &str = "lpm token-rotate";
 #[serde(rename_all = "camelCase")]
 struct TokenRotationResponse {
     token: String,
-    expires_at: String,
+    expires_at: Option<String>,
 }
 
 impl TokenRotationResponse {
     fn parse(body: serde_json::Value) -> Result<Self, LpmError> {
+        if body.get("expiresAt").is_none() {
+            return Err(LpmError::Registry(
+                "invalid token rotation response: missing expiresAt".into(),
+            ));
+        }
         let response: Self = serde_json::from_value(body).map_err(|error| {
             LpmError::Registry(format!("invalid token rotation response: {error}"))
         })?;
         if response.token.trim().is_empty()
-            || chrono::DateTime::parse_from_rfc3339(&response.expires_at).is_err()
+            || response
+                .expires_at
+                .as_deref()
+                .is_some_and(|expiry| chrono::DateTime::parse_from_rfc3339(expiry).is_err())
         {
             return Err(LpmError::Registry(
-                "invalid token rotation response: expected a non-empty token and RFC 3339 expiry"
+                "invalid token rotation response: expected a non-empty token and an RFC 3339 or null expiry"
                     .to_string(),
             ));
         }
@@ -64,7 +72,7 @@ pub async fn run_rotate(
 
     let url = format!("{}/api/registry/-/token/rotate", registry_url);
 
-    let body = match rotate_once(client, &url, otp.as_ref()).await {
+    let (body, submitted_bearer) = match rotate_once(client, &url, otp.as_ref()).await {
         Err(LpmError::OtpRequired { .. })
             if otp.is_none()
                 && !json_output
@@ -90,16 +98,13 @@ pub async fn run_rotate(
     };
     let rotated = TokenRotationResponse::parse(body)?;
 
-    let storage_backend = crate::auth::set_token_with_backend(registry_url, &rotated.token)
-        .map_err(|e| LpmError::CredentialStorage(format!("failed to store new token: {e}")))?;
-    let storage_status = crate::auth::AuthStorageStatus::from_backend(storage_backend);
-
-    let date_part = rotated
-        .expires_at
-        .split('T')
-        .next()
-        .unwrap_or(&rotated.expires_at);
-    crate::auth::set_token_expiry(registry_url, date_part);
+    let storage_status = lpm_auth::store_rotated_access_token_if_current(
+        registry_url,
+        submitted_bearer.expose_secret(),
+        &rotated.token,
+        rotated.expires_at.as_deref(),
+    )
+    .await?;
 
     if json_output {
         let json = serde_json::json!({
@@ -118,14 +123,14 @@ pub async fn run_rotate(
         }
         if storage_status.degraded {
             install_ui::warn(
-                "Encrypted file fallback is active; unlock or repair the OS keychain and rotate again to use keychain storage.",
+                "Encrypted file fallback is active; unlock or repair the OS keychain, then run `lpm logout` and `lpm login` to store a new session in the keychain.",
             );
         }
         install_ui::done("Done · session token rotated successfully");
         install_ui::detail_line(crate::install_ui::terminal_line!(
             "  {} {}",
             install_ui::dim("Expires:"),
-            install_ui::dim(&rotated.expires_at)
+            install_ui::dim(rotated.expires_at.as_deref().unwrap_or("never"))
         ));
         eprintln!();
     }
@@ -160,9 +165,9 @@ async fn rotate_once(
     client: &RegistryClient,
     url: &str,
     otp: Option<&OtpCode>,
-) -> Result<serde_json::Value, LpmError> {
+) -> Result<(serde_json::Value, SecretString), LpmError> {
     client
-        .post_json_with_otp_recovery(
+        .post_json_with_otp_recovery_and_bearer(
             url,
             &serde_json::json!({}),
             otp.map(OtpCode::expose),

@@ -21,8 +21,7 @@ pub use lpm_auth::{
     resolve_github_environment_credential, resolve_gitlab_credential_for_host,
     resolve_gitlab_environment_credential, set_custom_registry_token_with_backend,
     set_github_token_with_backend, set_gitlab_token_with_backend, set_npm_token_with_backend,
-    set_otp_required, set_token_expiry, set_token_with_backend, store_refresh_backed_session,
-    try_get_npm_token,
+    set_otp_required, set_token_expiry, store_refresh_backed_session, try_get_npm_token,
 };
 
 #[cfg(test)]
