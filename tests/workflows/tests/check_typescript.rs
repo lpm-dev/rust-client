@@ -538,3 +538,542 @@ fn unsupported_tool_pin_silent_when_only_supported_keys() {
         "no warning expected when tools.* keys are all plugin-backed; got:\n{stderr}"
     );
 }
+
+#[cfg(unix)]
+fn seed_recording_tsc(project: &TempProject) {
+    make_local_tool(
+        project,
+        "",
+        "tsc",
+        "#!/bin/sh\nprintf '%s\\n' \"$@\" > .check-args.txt\nprintf 'compiler output\\n'\nexit 0\n",
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn check_preserves_build_as_the_first_compiler_argument() {
+    for engine in ["tsc", "tsgo"] {
+        let project = TempProject::empty(r#"{"name":"build-check"}"#);
+        project.write_file("tsconfig.json", "{}");
+        let script =
+            "#!/bin/sh\n[ \"$1\" = --build ] || exit 7\nprintf '%s\\n' \"$@\" > .check-args.txt\n";
+        make_local_tool(&project, "", "tsc", script);
+        seed_fake_tsgo_engine(&project, script);
+        let output = lpm(&project)
+            .args(["check", "--engine", engine, "--", "--build"])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{engine}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            project
+                .read_file(".check-args.txt")
+                .lines()
+                .any(|arg| arg == "--noEmit")
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn check_help_version_and_invalid_options_reach_the_compiler_without_a_config() {
+    let project = TempProject::empty(r#"{"name":"compiler-options"}"#);
+    seed_recording_tsc(&project);
+    for args in [
+        vec!["--help"],
+        vec!["--version"],
+        vec!["--all"],
+        vec!["-p"],
+        vec!["--pretty", "false"],
+    ] {
+        let output = lpm(&project)
+            .args(["check", "--"])
+            .args(&args)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(String::from_utf8_lossy(&output.stdout).contains("compiler output"));
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn check_bare_nested_invocation_finds_an_ancestor_project_config() {
+    let project = TempProject::empty(r#"{"name":"ancestor-config"}"#);
+    project.write_file("tsconfig.json", "{}");
+    project.write_file("src/nested/entry.ts", "export const x=1");
+    seed_recording_tsc(&project);
+    let output = lpm(&project)
+        .current_dir(project.path().join("src/nested"))
+        .arg("check")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn check_single_json_captures_diagnostics_and_preserves_compiler_exit_code() {
+    let project = TempProject::empty(r#"{"name":"failed-check"}"#);
+    project.write_file("tsconfig.json", "{}");
+    make_local_tool(
+        &project,
+        "",
+        "tsc",
+        "#!/bin/sh\nprintf 'type error\\n'\nprintf 'details\\n' >&2\nexit 7\n",
+    );
+    let output = lpm(&project).args(["check", "--json"]).output().unwrap();
+    assert_eq!(output.status.code(), Some(7));
+    let value: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("one JSON envelope");
+    assert_eq!(value["members"][0]["exit_code"], 7);
+    assert!(
+        value["members"][0]["stdout"]
+            .as_str()
+            .unwrap()
+            .contains("type error")
+    );
+    insta::assert_json_snapshot!("check_single_failure", value, {".duration_ms" => "[duration]", ".members[].duration_ms" => "[duration]"});
+}
+
+#[cfg(unix)]
+#[test]
+fn check_no_emit_wins_over_forwarded_flags_responses_and_dangling_values() {
+    let project = TempProject::empty(r#"{"name":"no-emit"}"#);
+    project.write_file("tsconfig.json", "{}");
+    project.write_file("inner.args", "--noEmit false\n");
+    project.write_file("outer.args", "@inner.args\n");
+    project.write_file("compiler.cjs", r#"
+const fs=require('fs');let noEmit=false;
+function parse(args){for(let i=0;i<args.length;i++){
+ const a=args[i]; if(a.startsWith('@')) {parse(fs.readFileSync(a.slice(1),'utf8').trim().split(/\s+/));continue;}
+ const key=a.replace(/^--?/,'').toLowerCase();
+ if(key==='outdir'){i++;continue;}
+ if(key==='noemit') {const v=args[i+1];noEmit=v!=='false'&&v!=='null';if(['true','false','null'].includes(v))i++;}
+}}
+parse(process.argv.slice(2)); if(!noEmit) fs.writeFileSync('unexpected.js','emitted');
+"#);
+    make_local_tool(
+        &project,
+        "",
+        "tsc",
+        "#!/bin/sh\nexec node compiler.cjs \"$@\"\n",
+    );
+    let cases: &[&[&str]] = &[
+        &["--noEmit", "false"],
+        &["--NoEmit", "null"],
+        &["-noemit", "false"],
+        &["@outer.args"],
+        &["--noEmit", "false", "--outDir"],
+    ];
+    for args in cases {
+        let output = lpm(&project)
+            .args(["check", "--"])
+            .args(*args)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            !project.file_exists("unexpected.js"),
+            "{args:?} enabled output"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn check_rejects_writing_and_server_modes_before_starting_a_compiler() {
+    let project = TempProject::empty(r#"{"name":"finite-check"}"#);
+    project.write_file("tsconfig.json", "{}");
+    seed_recording_tsc(&project);
+    for args in [
+        vec!["check", "--", "--init"],
+        vec!["check", "--", "--build", "--clean"],
+        vec!["check", "--engine", "tsgo", "--", "--api"],
+        vec!["check", "--engine", "tsgo", "--", "--lsp"],
+    ] {
+        let output = lpm(&project).args(&args).output().unwrap();
+        assert!(!output.status.success(), "{args:?} was allowed");
+        assert!(
+            !project.file_exists(".check-args.txt"),
+            "{args:?} started the compiler"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn check_json_watch_admission_respects_case_values_and_response_frames() {
+    let project = TempProject::empty(r#"{"name":"watch-check"}"#);
+    project.write_file("tsconfig.json", "{}");
+    project.write_file("watch.args", "--WaTcH true\n");
+    project.write_file("value.args", "--outDir\n");
+    seed_recording_tsc(&project);
+    let cases: &[(&[&str], bool)] = &[
+        (&["--watch"], false),
+        (&["-W"], false),
+        (&["@watch.args"], false),
+        (&["--watch", "false"], true),
+        (&["--watch", "true", "--watch", "null"], true),
+        (&["--outDir", "--watch"], true),
+        (&["@value.args", "--watch"], false),
+        (&["--watch", "--help"], true),
+        (&["--watch", "--version"], true),
+    ];
+    for (args, allowed) in cases {
+        let _ = std::fs::remove_file(project.path().join(".check-args.txt"));
+        let output = lpm(&project)
+            .args(["check", "--json", "--"])
+            .args(*args)
+            .output()
+            .unwrap();
+        assert_eq!(
+            output.status.success(),
+            *allowed,
+            "{args:?}: {}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        assert_eq!(project.file_exists(".check-args.txt"), *allowed, "{args:?}");
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn check_does_not_execute_a_compiler_from_an_unrelated_ancestor() {
+    let project = TempProject::empty(r#"{"name":"unrelated"}"#);
+    seed_recording_tsc(&project);
+    project.write_file("nested/package.json", r#"{"name":"actual-project"}"#);
+    project.write_file("nested/tsconfig.json", "{}");
+    let output = lpm(&project)
+        .current_dir(project.path().join("nested"))
+        .env("PATH", "")
+        .arg("check")
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(!project.file_exists("nested/.check-args.txt"));
+}
+
+#[cfg(unix)]
+#[test]
+fn check_response_snapshots_do_not_strip_a_second_content_bom() {
+    let project = TempProject::empty(r#"{"name":"response-bom"}"#);
+    project.write_file("args.txt", "\u{feff}\u{feff}--watch\n");
+    project.write_file("compiler.cjs", r#"
+const fs=require('fs');const arg=process.argv.find(a=>a.startsWith('@'));const text=fs.readFileSync(arg.slice(1),'utf8').replace(/^\uFEFF/,'');if(text.replace(/^[\x00-\x20]*/, '').startsWith('--watch'))process.exit(9);
+"#);
+    make_local_tool(
+        &project,
+        "",
+        "tsc",
+        "#!/bin/sh\nexec node compiler.cjs \"$@\"\n",
+    );
+    let text = "\u{feff}--watch\n";
+    let utf16_le = [
+        vec![0xff, 0xfe],
+        text.encode_utf16().flat_map(u16::to_le_bytes).collect(),
+    ]
+    .concat();
+    let utf16_be = [
+        vec![0xfe, 0xff],
+        text.encode_utf16().flat_map(u16::to_be_bytes).collect(),
+    ]
+    .concat();
+    for bytes in [
+        "\u{feff}\u{feff}--watch\n".as_bytes().to_vec(),
+        utf16_le,
+        utf16_be,
+    ] {
+        std::fs::write(project.path().join("args.txt"), bytes).unwrap();
+        let output = lpm(&project)
+            .args(["check", "--json", "--", "@args.txt"])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "a content BOM must not become a watch flag: {}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn check_snapshots_response_files_before_starting_the_compiler() {
+    let project = TempProject::empty(r#"{"name":"response-capture"}"#);
+    project.write_file("outer.args", "@nested.args");
+    project.write_file("nested.args", "--watch false");
+    project.write_file("compiler.cjs", r#"
+const fs=require('fs');fs.writeFileSync('outer.args','--watch true');const seen=[];
+function read(args) {for (const a of args) {if(!a.startsWith('@'))continue;const path=a.slice(1);const text=fs.readFileSync(path,'utf8');seen.push({path,text});read([...text.matchAll(/"([^"]*)"|([^\s]+)/g)].map(m=>m[1]??m[2]));}}
+read(process.argv.slice(2));fs.writeFileSync('.response-seen.json',JSON.stringify(seen));
+"#);
+    make_local_tool(
+        &project,
+        "",
+        "tsc",
+        "#!/bin/sh\nexec node compiler.cjs \"$@\"\n",
+    );
+    let output = lpm(&project)
+        .args(["check", "--json", "--", "@outer.args"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let seen: serde_json::Value =
+        serde_json::from_str(&project.read_file(".response-seen.json")).unwrap();
+    let seen = seen.as_array().unwrap();
+    assert_eq!(
+        seen.len(),
+        2,
+        "the compiler must read the captured nested frame"
+    );
+    assert_eq!(seen[1]["text"].as_str().unwrap().trim(), "--watch false");
+    for file in seen {
+        assert!(
+            !std::path::Path::new(file["path"].as_str().unwrap()).exists(),
+            "temporary responses must be cleaned after execution"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn check_rejects_recursive_and_oversized_responses_without_starting_the_compiler() {
+    let project = TempProject::empty(r#"{"name":"response-limits"}"#);
+    seed_recording_tsc(&project);
+    project.write_file("cycle.args", "@cycle.args\n");
+    project.write_file("large.args", &" ".repeat(4 * 1024 * 1024 + 1));
+    for name in ["cycle.args", "large.args"] {
+        let output = lpm(&project)
+            .args(["check", "--json", "--", &format!("@{name}")])
+            .output()
+            .unwrap();
+        assert!(!output.status.success(), "{name} was accepted");
+        assert!(!project.file_exists(".check-args.txt"));
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn doctor_does_not_mark_a_nonexecutable_local_compiler_healthy() {
+    use std::os::unix::fs::PermissionsExt;
+    let project = TempProject::empty(
+        r#"{"name":"nonexecutable-compiler","devDependencies":{"typescript":"6"}}"#,
+    );
+    project.write_file("tsconfig.json", "{}");
+    make_local_tsc(&project, "");
+    std::fs::set_permissions(
+        project.path().join("node_modules/.bin/tsc"),
+        std::fs::Permissions::from_mode(0o644),
+    )
+    .unwrap();
+    let output = lpm_with_registry(&project, "http://127.0.0.1:1")
+        .env("PATH", "")
+        .args(["doctor", "--all", "--json"])
+        .output()
+        .unwrap();
+    let value = parse_json_output(&output.stdout);
+    assert!(
+        find_check_by_code(&value, "typescript_unavailable").is_some(),
+        "{value}"
+    );
+    assert!(find_check_by_code(&value, "typescript_healthy").is_none());
+}
+
+#[cfg(unix)]
+#[test]
+fn check_rejects_unrepresentable_nested_response_snapshot_paths() {
+    #[cfg(target_os = "linux")]
+    use std::os::unix::ffi::OsStringExt;
+    let project = TempProject::empty(r#"{"name":"snapshot-paths"}"#);
+    seed_recording_tsc(&project);
+    project.write_file("outer.args", "@inner.args\n");
+    project.write_file("inner.args", "--help\n");
+    #[cfg(target_os = "linux")]
+    let names = [
+        std::ffi::OsString::from("quote\" and space"),
+        std::ffi::OsString::from_vec(b"invalid-\xff".to_vec()),
+    ];
+    #[cfg(not(target_os = "linux"))]
+    let names = [std::ffi::OsString::from("quote\" and space")];
+    for name in names {
+        let temp = project.path().join(name);
+        std::fs::create_dir(&temp).unwrap();
+        let _ = std::fs::remove_file(project.path().join(".check-args.txt"));
+        let output = lpm(&project)
+            .env("TMPDIR", &temp)
+            .args(["check", "--json", "--", "@outer.args"])
+            .output()
+            .unwrap();
+        assert!(
+            !output.status.success(),
+            "unrepresentable path was accepted: {}",
+            temp.display()
+        );
+        assert!(!project.file_exists(".check-args.txt"));
+    }
+}
+
+#[cfg(windows)]
+#[test]
+fn check_prefers_windows_cmd_shims_and_captures_their_exit_code() {
+    let project = TempProject::empty(r#"{"name":"windows-check"}"#);
+    project.write_file("tsconfig.json", "{}");
+    project.write_file("node_modules/.bin/tsc", "#!/bin/sh\nexit 9\n");
+    project.write_file(
+        "node_modules/.bin/tsc.cmd",
+        "@echo off\r\necho cmd-shim>cmd-shim.txt\r\nexit /b 7\r\n",
+    );
+    let output = lpm(&project).args(["check", "--json"]).output().unwrap();
+    assert_eq!(output.status.code(), Some(7));
+    let value = parse_json_output(&output.stdout);
+    assert_eq!(value["members"][0]["exit_code"], 7);
+    assert_eq!(project.read_file("cmd-shim.txt").trim(), "cmd-shim");
+}
+
+#[cfg(unix)]
+#[test]
+fn check_workspace_watch_requires_exactly_one_selected_member() {
+    let project = TempProject::empty(r#"{"name":"root","workspaces":["packages/*"]}"#);
+    project.write_file("packages/a/package.json", r#"{"name":"a"}"#);
+    project.write_file("packages/b/package.json", r#"{"name":"b"}"#);
+    seed_recording_tsc(&project);
+    let cases: &[(&[&str], bool)] = &[
+        (&["--all"], false),
+        (&["--filter", "a"], true),
+        (&["--filter", "missing"], false),
+    ];
+    for (selection, allowed) in cases {
+        let output = lpm(&project)
+            .arg("check")
+            .args(*selection)
+            .args(["--", "--watch"])
+            .output()
+            .unwrap();
+        assert_eq!(
+            output.status.success(),
+            *allowed,
+            "{selection:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    assert!(project.file_exists("packages/a/.check-args.txt"));
+    assert!(!project.file_exists("packages/b/.check-args.txt"));
+}
+
+#[cfg(unix)]
+#[test]
+fn check_and_doctor_resolve_relative_path_from_each_workspace_member() {
+    use std::os::unix::fs::PermissionsExt;
+    let project = TempProject::empty(r#"{"name":"root","workspaces":["packages/*"]}"#);
+    for name in ["a", "b"] {
+        project.write_file(
+            &format!("packages/{name}/package.json"),
+            &format!(r#"{{"name":"{name}"}}"#),
+        );
+        project.write_file(&format!("packages/{name}/tsconfig.json"), "{}");
+    }
+    {
+        let path = "packages/a/bin/tsc";
+        project.write_file(
+            path,
+            "#!/bin/sh\nprintf 'member compiler' > compiler-seen.txt\nexit 0\n",
+        );
+        std::fs::set_permissions(
+            project.path().join(path),
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+    }
+    let output = lpm(&project)
+        .env("PATH", "bin:/usr/bin:/bin")
+        .args(["check", "--all", "--json"])
+        .output()
+        .unwrap();
+    let value = parse_json_output(&output.stdout);
+    let members = value["members"].as_array().unwrap();
+    assert_eq!(
+        members.iter().find(|m| m["name"] == "a").unwrap()["exit_code"],
+        0,
+        "{value}"
+    );
+    assert!(
+        members.iter().find(|m| m["name"] == "b").unwrap()["exit_code"].is_null(),
+        "{value}"
+    );
+    assert!(project.file_exists("packages/a/compiler-seen.txt"));
+    assert!(!project.file_exists("packages/b/compiler-seen.txt"));
+    project.write_file("bin/tsc", "#!/bin/sh\nexit 0\n");
+    std::fs::set_permissions(
+        project.path().join("bin/tsc"),
+        std::fs::Permissions::from_mode(0o755),
+    )
+    .unwrap();
+    let output = lpm_with_registry(&project, "http://127.0.0.1:1")
+        .env("PATH", "bin:/usr/bin:/bin")
+        .args(["doctor", "--all", "--json"])
+        .output()
+        .unwrap();
+    let value = parse_json_output(&output.stdout);
+    assert!(
+        find_check_by_code(&value, "typescript_unavailable").is_some(),
+        "{value}"
+    );
+    assert!(
+        find_check_by_code(&value, "typescript_missing_for_tsconfig").is_some(),
+        "{value}"
+    );
+}
+
+#[test]
+fn check_does_not_prepare_tsgo_when_every_response_file_is_invalid() {
+    let project = TempProject::empty(r#"{"name":"root","workspaces":["packages/*"]}"#);
+    project.write_file("packages/a/package.json", r#"{"name":"a"}"#);
+    let output = lpm(&project)
+        .env("HTTPS_PROXY", "http://127.0.0.1:1")
+        .env("ALL_PROXY", "http://127.0.0.1:1")
+        .env("NO_PROXY", "")
+        .args([
+            "check",
+            "--all",
+            "--engine",
+            "tsgo",
+            "--json",
+            "--",
+            "@missing.args",
+        ])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let value = parse_json_output(&output.stdout);
+    assert!(
+        value["members"][0]["error"]
+            .as_str()
+            .unwrap()
+            .contains("missing.args"),
+        "{value}"
+    );
+    assert!(
+        !project.home().join(".lpm/engines/tsgo").exists(),
+        "invalid arguments must not prepare or download tsgo"
+    );
+}

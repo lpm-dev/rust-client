@@ -1,16 +1,4 @@
-//! Shared TypeScript reachability + dep-declaration predicate.
-//!
-//! `lpm check` (call-site preflight) and `lpm doctor` (workspace-aware
-//! reachability check) both need to answer the same questions about a
-//! tsconfig-owning directory:
-//!
-//! - Does `tsc` resolve through the local `node_modules/.bin` chain?
-//! - Is `typescript` declared in any reachable manifest?
-//! - Is `tsc` runnable at all (system PATH counted as a fallback)?
-//!
-//! Centralizing the predicate keeps the two surfaces honest — they
-//! cannot disagree about whether a project is set up correctly. Pure
-//! disk + env reads; never spawns `tsc`.
+//! Bounded compiler discovery shared by type checking and doctor.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -38,16 +26,20 @@ pub struct TscStatus {
 }
 
 impl TscStatus {
-    /// Probe TypeScript status for `dir`. Walks up to find ancestor
-    /// manifests for the dep declaration check.
+    #[cfg(test)]
     pub fn probe(dir: &Path) -> Self {
-        let local_bin = find_local_tsc(dir);
+        Self::probe_bounded(dir, &project_boundary(dir))
+    }
+
+    pub(crate) fn probe_bounded(dir: &Path, boundary: &Path) -> Self {
+        let local_bin =
+            lpm_runner::script::resolve_local_bin_path_bounded(dir, boundary, "tsc").ok();
         let system_bin = if local_bin.is_some() {
             None
         } else {
-            find_system_tsc()
+            SystemTscResolver::new().find(dir)
         };
-        let in_deps = typescript_declared_in_reachable_manifest(dir);
+        let in_deps = typescript_declared_in_reachable_manifest(dir, boundary);
         Self {
             local_bin,
             system_bin,
@@ -81,36 +73,38 @@ impl TscStatus {
     }
 
     /// Some `tsc` is reachable, even if only via system `PATH`.
+    #[cfg(test)]
     pub fn runnable(&self) -> bool {
         self.local_bin.is_some() || self.system_bin.is_some()
     }
 }
 
-/// Walk up from `dir` looking for `node_modules/.bin/tsc`. Mirrors
-/// `lpm_runner::bin_path::build_path_with_bins` precedence so the
-/// predicate matches actual runtime behavior.
-fn find_local_tsc(dir: &Path) -> Option<PathBuf> {
-    let mut current = dir.to_path_buf();
-    loop {
-        let candidate = current
-            .join("node_modules")
-            .join(".bin")
-            .join(tsc_filename());
-        if candidate.is_file() {
-            return Some(candidate);
-        }
-        if !current.pop() {
-            return None;
-        }
-    }
+fn project_boundary(dir: &Path) -> PathBuf {
+    lpm_workspace::find_workspace_root(dir)
+        .ok()
+        .flatten()
+        .or_else(|| lpm_workspace::find_project_root(dir))
+        .unwrap_or_else(|| dir.to_path_buf())
 }
 
-#[derive(Default)]
+#[cfg(test)]
+fn find_local_tsc(dir: &Path) -> Option<PathBuf> {
+    lpm_runner::script::resolve_local_bin_path_bounded(dir, &project_boundary(dir), "tsc").ok()
+}
+
 pub(crate) struct LocalTscResolver {
+    boundary: PathBuf,
     by_directory: HashMap<PathBuf, Option<PathBuf>>,
 }
 
 impl LocalTscResolver {
+    pub(crate) fn new(dir: &Path) -> Self {
+        Self {
+            boundary: project_boundary(dir),
+            by_directory: HashMap::new(),
+        }
+    }
+
     pub(crate) fn find(&mut self, dir: &Path) -> Option<PathBuf> {
         let mut visited = Vec::new();
         let mut current = Some(dir);
@@ -118,16 +112,20 @@ impl LocalTscResolver {
             let Some(directory) = current else {
                 break None;
             };
+            if !directory.starts_with(&self.boundary) {
+                break None;
+            }
             if let Some(cached) = self.by_directory.get(directory) {
                 break cached.clone();
             }
             visited.push(directory.to_path_buf());
-            let candidate = directory
-                .join("node_modules")
-                .join(".bin")
-                .join(tsc_filename());
-            if candidate.is_file() {
-                break Some(candidate);
+            if let Ok(path) =
+                lpm_runner::script::resolve_local_bin_path_bounded(directory, directory, "tsc")
+            {
+                break Some(path);
+            }
+            if directory == self.boundary {
+                break None;
             }
             current = directory.parent();
         };
@@ -138,34 +136,78 @@ impl LocalTscResolver {
     }
 }
 
-/// Scan the system `PATH` for a `tsc` binary. Used only when no local
-/// install exists, since local always wins at runtime via the
-/// PATH-injection layer.
-pub(crate) fn find_system_tsc() -> Option<PathBuf> {
-    let path = std::env::var_os("PATH")?;
-    for dir in std::env::split_paths(&path) {
-        let candidate = dir.join(tsc_filename());
-        if candidate.is_file() {
-            return Some(candidate);
+enum SystemPathEntry {
+    Absolute(PathBuf),
+    Relative(PathBuf),
+}
+
+pub(crate) struct SystemTscResolver {
+    entries: Vec<SystemPathEntry>,
+}
+
+impl SystemTscResolver {
+    pub(crate) fn new() -> Self {
+        let entries = std::env::var_os("PATH")
+            .map(|path| {
+                std::env::split_paths(&path)
+                    .filter_map(|dir| {
+                        if dir.is_absolute() {
+                            find_tsc_in_directory(&dir, cfg!(windows))
+                                .map(SystemPathEntry::Absolute)
+                        } else {
+                            Some(SystemPathEntry::Relative(dir))
+                        }
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        Self { entries }
+    }
+
+    pub(crate) fn find(&self, cwd: &Path) -> Option<PathBuf> {
+        let cwd = std::path::absolute(cwd).ok()?;
+        self.entries.iter().find_map(|entry| match entry {
+            SystemPathEntry::Absolute(path) => Some(path.clone()),
+            SystemPathEntry::Relative(dir) => find_tsc_in_directory(&cwd.join(dir), cfg!(windows)),
+        })
+    }
+}
+
+fn find_tsc_in_directory(dir: &Path, windows: bool) -> Option<PathBuf> {
+    let names: &[&str] = if windows {
+        &["tsc.cmd", "tsc.exe", "tsc.bat", "tsc"]
+    } else {
+        &["tsc"]
+    };
+    for name in names {
+        let candidate = dir.join(name);
+        let Ok(metadata) = candidate.metadata() else {
+            continue;
+        };
+        if !metadata.is_file() {
+            continue;
         }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if metadata.permissions().mode() & 0o111 == 0 {
+                continue;
+            }
+        }
+        return Some(candidate);
     }
     None
 }
 
-#[cfg(windows)]
+#[cfg(test)]
 fn tsc_filename() -> &'static str {
-    "tsc.cmd"
-}
-
-#[cfg(not(windows))]
-fn tsc_filename() -> &'static str {
-    "tsc"
+    if cfg!(windows) { "tsc.cmd" } else { "tsc" }
 }
 
 /// True when `typescript` appears in any dep map of `dir/package.json`
 /// or any ancestor's `package.json`. Captures the common monorepo
 /// shape where `typescript` is hoisted to the root manifest only.
-fn typescript_declared_in_reachable_manifest(dir: &Path) -> bool {
+fn typescript_declared_in_reachable_manifest(dir: &Path, boundary: &Path) -> bool {
     let mut current = dir.to_path_buf();
     loop {
         let pkg_json_path = current.join("package.json");
@@ -175,7 +217,7 @@ fn typescript_declared_in_reachable_manifest(dir: &Path) -> bool {
         {
             return true;
         }
-        if !current.pop() {
+        if current == boundary || !current.pop() {
             return false;
         }
     }
@@ -214,6 +256,19 @@ mod tests {
     }
 
     #[test]
+    fn system_compiler_lookup_accepts_a_windows_executable_without_a_cmd_sibling() {
+        let temp = TempDir::new().unwrap();
+        let executable = temp.path().join("tsc.exe");
+        fs::write(&executable, b"native compiler fixture").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&executable, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        assert_eq!(find_tsc_in_directory(temp.path(), true), Some(executable));
+    }
+
+    #[test]
     fn local_bin_at_project_root_is_picked_up() {
         let tmp = TempDir::new().unwrap();
         write_pkg(
@@ -233,7 +288,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         write_pkg(
             tmp.path(),
-            r#"{"name":"root","devDependencies":{"typescript":"^5"}}"#,
+            r#"{"name":"root","workspaces":["packages/*"],"devDependencies":{"typescript":"^5"}}"#,
         );
         make_local_tsc(tmp.path());
 

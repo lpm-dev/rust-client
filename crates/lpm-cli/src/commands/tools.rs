@@ -215,93 +215,7 @@ fn validate_fmt_args(args: &[String], check: bool, json_output: bool) -> Result<
     Ok(watch)
 }
 
-/// Run `lpm check` — delegates to the selected engine with `--noEmit`.
-///
-/// Argument-aware preflight: when the user passes an explicit project
-/// path (`-p` / `--project`) or a positional input file, we trust the
-/// user knows the layout and skip the missing-tsconfig hint. Without
-/// an explicit target, we surface "no tsconfig.json" first for every
-/// engine. The default `tsc` engine also keeps the existing
-/// "typescript not installed" preflight so users get the more
-/// actionable LPM hint before the compiler would fail.
-pub async fn check(
-    project_dir: &Path,
-    args: &[String],
-    engine: CheckEngine,
-    json_output: bool,
-) -> Result<(), LpmError> {
-    let start = std::time::Instant::now();
-    if !json_output {
-        tools_ui::using_check_engine(check_engine_binary(engine));
-    }
-
-    if !user_targeted_explicit_input(args) {
-        check_preflight(project_dir, engine)?;
-    }
-
-    let signals = Arc::new(lpm_runner::execution::ExecutionSignals::new()?);
-    let outcome = run_check_engine(project_dir, args, engine, StdioMode::Inherit, signals).await?;
-    if outcome.success() && !json_output {
-        tools_ui::done_typecheck(start.elapsed());
-    }
-    finish_tool_outcome("typecheck", outcome, json_output)
-}
-
-/// True when the user passed `-p` / `--project <path>` or any
-/// positional (non-flag) argument. In those cases the user has named
-/// the input target explicitly and a missing root `tsconfig.json` is
-/// not a problem — preflight should defer to tsc.
-fn user_targeted_explicit_input(args: &[String]) -> bool {
-    let mut iter = args.iter().peekable();
-    while let Some(arg) = iter.next() {
-        if arg == "-p" || arg == "--project" {
-            return iter.peek().is_some();
-        }
-        if arg.starts_with("-p=") || arg.starts_with("--project=") {
-            return true;
-        }
-        if !arg.starts_with('-') {
-            return true;
-        }
-    }
-    false
-}
-
-/// Surface the common setup gaps with LPM-formatted messages before
-/// spawning the selected engine:
-///
-/// - `tsconfig.json` missing → suggest `lpm init` or pass `-p`.
-/// - `tsc` selected but typescript not reachable at all → suggest
-///   `lpm install -D typescript` (or `lpm install` when the dep is
-///   declared but not installed).
-///
-/// The post-spawn fallback in `run_check_engine` still wraps any
-/// race-condition failure with the matching install hint.
-fn check_preflight(project_dir: &Path, engine: CheckEngine) -> Result<(), LpmError> {
-    if !project_dir.join("tsconfig.json").is_file() {
-        return Err(LpmError::Script(format!(
-            "no tsconfig.json found in {}. Add one (or pass `-p <path>` to use a different one)",
-            project_dir.display(),
-        )));
-    }
-
-    if matches!(engine, CheckEngine::Tsc) {
-        let status = crate::tsc_status::TscStatus::probe(project_dir);
-        if !status.runnable() {
-            if status.in_deps {
-                return Err(LpmError::Script(
-                    "typescript declared in package.json but not installed. Run: lpm install"
-                        .into(),
-                ));
-            }
-            return Err(LpmError::Script(
-                "typescript not installed. Run: lpm install -D typescript".into(),
-            ));
-        }
-    }
-
-    Ok(())
-}
+pub use super::check::check;
 
 /// Run `lpm test` — auto-detects test runner and delegates.
 pub async fn test(project_dir: &Path, args: &[String], json_output: bool) -> Result<(), LpmError> {
@@ -704,63 +618,6 @@ async fn run_tool_binary(
     Ok(process::run(command, stdio, signals).await)
 }
 
-fn check_engine_binary(engine: CheckEngine) -> &'static str {
-    match engine {
-        CheckEngine::Tsc => "tsc",
-        CheckEngine::Tsgo => "tsgo",
-    }
-}
-
-fn check_engine_spawn_hint(engine: CheckEngine) -> &'static str {
-    match engine {
-        CheckEngine::Tsc => "Is typescript installed? Run: lpm install -D typescript",
-        CheckEngine::Tsgo => "The managed tsgo engine failed to start after install",
-    }
-}
-
-/// Run the selected type-check engine with the configured stdio mode.
-/// Honors `node_modules/.bin` PATH injection so project-local tools win
-/// over a system install.
-async fn run_check_engine(
-    project_dir: &Path,
-    args: &[String],
-    engine: CheckEngine,
-    stdio: StdioMode,
-    signals: Arc<lpm_runner::execution::ExecutionSignals>,
-) -> Result<ToolOutcome, LpmError> {
-    if matches!(engine, CheckEngine::Tsgo) {
-        return run_tsgo(project_dir, args, stdio, signals).await;
-    }
-
-    let binary = check_engine_binary(engine);
-    let path = lpm_runner::bin_path::build_path_with_bins(project_dir)?;
-    let mut cmd_args = vec!["--noEmit".to_string()];
-    cmd_args.extend_from_slice(args);
-
-    let mut cmd = Command::new(binary);
-    cmd.args(&cmd_args)
-        .current_dir(project_dir)
-        .env("PATH", &path);
-
-    let mut outcome = process::run(cmd, stdio, signals).await;
-    if let Some(error) = &mut outcome.error {
-        error.push_str(&format!(". {}", check_engine_spawn_hint(engine)));
-    }
-    Ok(outcome)
-}
-
-async fn run_tsgo(
-    project_dir: &Path,
-    args: &[String],
-    stdio: StdioMode,
-    signals: Arc<lpm_runner::execution::ExecutionSignals>,
-) -> Result<ToolOutcome, LpmError> {
-    let bin = lpm_plugin::ensure_engine("tsgo", None, matches!(stdio, StdioMode::Capture)).await?;
-    let mut cmd_args = vec!["--noEmit".to_string()];
-    cmd_args.extend_from_slice(args);
-    run_tool_binary(&bin, &cmd_args, project_dir, stdio, signals).await
-}
-
 /// Returns `true` if the forwarded args contain a watch-mode opt-in.
 fn enabled_watch_option(args: &[String], flags: &[&str]) -> bool {
     args.iter().any(|arg| {
@@ -833,6 +690,21 @@ pub async fn tool_workspace(
     workspace_concurrency: WorkspaceConcurrency,
     json_output: bool,
 ) -> Result<(), LpmError> {
+    if tool == "check" {
+        return super::check::workspace(
+            project_dir,
+            args,
+            check_engine.unwrap_or(CheckEngine::Tsc),
+            filters,
+            filter_prod,
+            changed_files_ignore_pattern,
+            test_pattern,
+            affected_base,
+            fail_if_no_match,
+            json_output,
+        )
+        .await;
+    }
     let fmt_watch = tool == "fmt" && validate_fmt_args(args, check, json_output)?;
     let workspace = lpm_workspace::discover_workspace(project_dir)
         .map_err(|e| LpmError::Script(format!("workspace error: {e}")))?
@@ -1017,7 +889,6 @@ pub async fn tool_workspace(
         tool,
         shared_args,
         check,
-        check_engine,
         stdio,
         &prepared_plugins,
         runner_tasks.as_deref(),
@@ -1120,7 +991,6 @@ async fn run_selected_members(
     tool: &str,
     args: Arc<[String]>,
     check: bool,
-    check_engine: Option<CheckEngine>,
     stdio: StdioMode,
     prepared_plugins: &Option<Vec<Result<PathBuf, String>>>,
     runner_tasks: Option<&[RunnerTask]>,
@@ -1142,7 +1012,6 @@ async fn run_selected_members(
                 tool,
                 Arc::clone(&args),
                 check,
-                check_engine,
                 stdio,
                 prepared_plugins,
                 runner_tasks.and_then(|tasks| tasks.get(index)).cloned(),
@@ -1179,7 +1048,6 @@ async fn run_indexed_member(
     tool: &str,
     args: Arc<[String]>,
     check: bool,
-    check_engine: Option<CheckEngine>,
     stdio: StdioMode,
     prepared_plugins: &Option<Vec<Result<PathBuf, String>>>,
     runner_task: Option<RunnerTask>,
@@ -1192,7 +1060,6 @@ async fn run_indexed_member(
         tool,
         args,
         check,
-        check_engine,
         stdio,
         prepared_plugins
             .as_ref()
@@ -1213,7 +1080,6 @@ async fn run_one_member(
     tool: &str,
     args: Arc<[String]>,
     check: bool,
-    check_engine: Option<CheckEngine>,
     stdio: StdioMode,
     prepared_plugin: Option<Result<PathBuf, String>>,
     runner_task: Option<RunnerTask>,
@@ -1243,18 +1109,6 @@ async fn run_one_member(
                 Err(error) => Err(LpmError::Script(error)),
             }
         }
-        "check" => Ok(run_check_engine(
-            member_dir,
-            &args,
-            check_engine.unwrap_or(CheckEngine::Tsc),
-            stdio,
-            signals,
-        )
-        .await
-        .unwrap_or_else(|e| ToolOutcome {
-            error: Some(e.to_string()),
-            ..Default::default()
-        })),
         "test" | "bench" => Ok(run_runner_member(member_dir, args, stdio, runner_task).await),
         _ => Err(LpmError::Script(format!("unknown tool: {tool}"))),
     };
@@ -1536,56 +1390,6 @@ mod tests {
             console::strip_ansi_codes(&format_member_failure("web", "exit 1")).into_owned(),
             "  ✗ web: exit 1"
         );
-    }
-
-    // --- check preflight argument parsing ---
-
-    #[test]
-    fn user_targeted_explicit_input_detects_dash_p_with_value() {
-        assert!(user_targeted_explicit_input(&[
-            "-p".into(),
-            "tsconfig.test.json".into()
-        ]));
-    }
-
-    #[test]
-    fn user_targeted_explicit_input_detects_long_project_with_value() {
-        assert!(user_targeted_explicit_input(&[
-            "--project".into(),
-            "tsconfig.test.json".into()
-        ]));
-    }
-
-    #[test]
-    fn user_targeted_explicit_input_detects_eq_form() {
-        assert!(user_targeted_explicit_input(&[
-            "-p=tsconfig.test.json".into()
-        ]));
-        assert!(user_targeted_explicit_input(&[
-            "--project=tsconfig.test.json".into()
-        ]));
-    }
-
-    #[test]
-    fn user_targeted_explicit_input_detects_positional_file() {
-        assert!(user_targeted_explicit_input(&["src/foo.ts".into()]));
-    }
-
-    #[test]
-    fn user_targeted_explicit_input_no_target_for_only_flags() {
-        assert!(!user_targeted_explicit_input(&[]));
-        assert!(!user_targeted_explicit_input(&["--pretty".into()]));
-        assert!(!user_targeted_explicit_input(&[
-            "--noEmit".into(),
-            "--strict".into()
-        ]));
-    }
-
-    #[test]
-    fn user_targeted_explicit_input_dash_p_without_value_is_not_targeted() {
-        // A dangling `-p` with no following arg is malformed; we let
-        // tsc surface its own error rather than asserting our own.
-        assert!(!user_targeted_explicit_input(&["-p".into()]));
     }
 
     // --- watch detection ---

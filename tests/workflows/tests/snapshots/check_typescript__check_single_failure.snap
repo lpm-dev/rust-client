@@ -1,0 +1,22 @@
+---
+source: tests/workflows/tests/check_typescript.rs
+assertion_line: 647
+expression: value
+---
+{
+  "success": false,
+  "packages": 1,
+  "succeeded": 0,
+  "failed": 1,
+  "duration_ms": "[duration]",
+  "members": [
+    {
+      "name": "failed-check",
+      "success": false,
+      "exit_code": 7,
+      "duration_ms": "[duration]",
+      "stdout": "type error\n",
+      "stderr": "details\n"
+    }
+  ]
+}
