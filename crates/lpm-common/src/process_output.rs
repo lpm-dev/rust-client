@@ -105,6 +105,8 @@ impl CaptureSession {
         let mut exited = None;
         let mut cancelled_at = None;
         let mut buffer = [0_u8; 16384];
+        #[cfg(unix)]
+        let mut readable = Vec::with_capacity(2 * (self.processes.len() + 1));
         loop {
             if cancelled_at.is_none()
                 && let Some(signal) = cancellation_signal(process.child.id())
@@ -200,6 +202,44 @@ impl CaptureSession {
                 });
             }
             if !progressed {
+                #[cfg(unix)]
+                {
+                    use std::os::fd::AsRawFd;
+                    readable.clear();
+                    let mut observe = |fd| {
+                        readable.push(libc::pollfd {
+                            fd,
+                            events: libc::POLLIN,
+                            revents: 0,
+                        });
+                    };
+                    if !stdout_eof {
+                        observe(stdout_pipe.as_raw_fd());
+                    }
+                    if !stderr_eof {
+                        observe(stderr_pipe.as_raw_fd());
+                    }
+                    for previous in &self.processes {
+                        if let Some(pipe) = &previous.child.stdout {
+                            observe(pipe.as_raw_fd());
+                        }
+                        if let Some(pipe) = &previous.child.stderr {
+                            observe(pipe.as_raw_fd());
+                        }
+                    }
+                    // SAFETY: the owned pipes remain open, and poll only updates
+                    // initialized entries. The timeout also bounds signal checks.
+                    let result = unsafe {
+                        libc::poll(readable.as_mut_ptr(), readable.len() as libc::nfds_t, 2)
+                    };
+                    if result < 0 {
+                        let error = io::Error::last_os_error();
+                        if error.kind() != io::ErrorKind::Interrupted {
+                            return Err(error);
+                        }
+                    }
+                }
+                #[cfg(not(unix))]
                 std::thread::sleep(Duration::from_millis(2));
             }
         }
