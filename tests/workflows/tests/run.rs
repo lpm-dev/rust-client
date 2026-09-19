@@ -5048,14 +5048,27 @@ fn watch_ignores_declared_outputs_but_reacts_to_source_changes() {
     };
     let mut watcher = TaskWatcher::start(&project, "build", &[]);
     watcher.wait_until(|| cycles() >= 1);
+    // FSEvents can deliver queued fixture-creation events after registration.
+    let initial = std::cell::Cell::new(cycles());
+    let quiet_since = std::cell::Cell::new(std::time::Instant::now());
+    watcher.wait_until(|| {
+        let current = cycles();
+        if current != initial.get() {
+            initial.set(current);
+            quiet_since.set(std::time::Instant::now());
+        }
+        quiet_since.get().elapsed() >= std::time::Duration::from_millis(1200)
+    });
+    let initial = initial.get();
+    project.write_file("generated/result.txt", "external output edit");
     std::thread::sleep(std::time::Duration::from_millis(1200));
-    assert_eq!(cycles(), 1, "task outputs caused a watch loop");
+    assert_eq!(cycles(), initial, "declared output edit triggered a run");
     project.write_file("src/input.txt", "second");
-    watcher.wait_until(|| cycles() >= 2);
+    watcher.wait_until(|| cycles() > initial);
     std::thread::sleep(std::time::Duration::from_millis(1200));
     assert_eq!(
         cycles(),
-        2,
+        initial + 1,
         "source change did not cause exactly one new cycle"
     );
     assert_eq!(project.read_file("generated/result.txt"), "second");
