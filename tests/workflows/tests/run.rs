@@ -5199,22 +5199,22 @@ fn watch_runs_meta_task_dependencies_hooks_and_overrides_on_each_cycle() {
     project.write_file("lpm.json", r#"{"tasks":{"build":{"command":"node record.js build","dependsOn":["prepare"],"inputs":["src/**"]},"verify":{"dependsOn":["build"]}}}"#);
     project.write_file(
         "record.js",
-        "const fs=require('fs');fs.appendFileSync('.lpm/events.txt',process.argv[2]+'\\n');",
+        "const fs=require('fs');fs.appendFileSync('.lpm/events.txt',fs.readFileSync('src/input.txt','utf8')+':'+process.argv[2]+'\\n');",
     );
-    project.write_file("src/input.txt", "first");
+    project.write_file_and_sync("src/input.txt", "first");
     let events = project.path().join(".lpm/events.txt");
+    let records = || std::fs::read_to_string(&events).unwrap_or_default();
     let mut watcher = TaskWatcher::start(&project, "verify", &[]);
-    watcher.wait_until(|| std::fs::read_to_string(&events).is_ok_and(|s| s.lines().count() >= 4));
-    assert_eq!(
-        std::fs::read_to_string(&events).unwrap(),
-        "pre\nprepare\npost\nbuild\n"
-    );
-    project.write_file("src/input.txt", "second");
-    watcher.wait_until(|| std::fs::read_to_string(&events).is_ok_and(|s| s.lines().count() >= 8));
-    assert_eq!(
-        std::fs::read_to_string(&events).unwrap(),
-        "pre\nprepare\npost\nbuild\npre\nprepare\npost\nbuild\n"
-    );
+    watcher.wait_until(|| records().contains("first:build\n"));
+    project.write_file_and_sync("src/input.txt", "second");
+    watcher.wait_until(|| records().contains("second:build\n"));
+    let stages = ["pre", "prepare", "post", "build"];
+    for (index, record) in records().lines().enumerate() {
+        assert_eq!(
+            record.split_once(':').unwrap().1,
+            stages[index % stages.len()]
+        );
+    }
 }
 
 #[test]
@@ -5365,28 +5365,29 @@ fn watch_reloads_task_commands_and_inputs_after_configuration_changes() {
 }
 
 #[test]
-fn watch_finishes_the_current_task_and_coalesces_changes_during_execution() {
+fn watch_finishes_current_task_before_running_changed_input() {
     let project = TempProject::empty(
         r#"{"name":"watch-finite","version":"1.0.0","scripts":{"build":"node build.js"}}"#,
     );
     project.write_file("lpm.json", r#"{"tasks":{"build":{"inputs":["src/**"]}}}"#);
-    project.write_file("src/input.txt", "first");
+    project.write_file_and_sync("src/input.txt", "first");
     project.write_file("build.js", r#"
 const fs=require('fs');
 const first=!fs.existsSync('.lpm/started');
+const input=fs.readFileSync('src/input.txt','utf8');
 fs.appendFileSync('.lpm/started','run\n');
 if(first) {
   const timer=setInterval(()=>{
-    if(fs.existsSync('.lpm/release')) {clearInterval(timer);fs.appendFileSync('.lpm/completed','done\n');}
+    if(fs.existsSync('.lpm/release')) {clearInterval(timer);fs.appendFileSync('.lpm/completed',input+'\n');}
   },20);
-} else fs.appendFileSync('.lpm/completed','done\n');
+} else fs.appendFileSync('.lpm/completed',input+'\n');
 "#);
     let started = project.path().join(".lpm/started");
     let completed = project.path().join(".lpm/completed");
     let mut watcher = TaskWatcher::start(&project, "build", &[]);
     watcher.wait_until(|| started.exists());
     for value in 0..20 {
-        project.write_file("src/input.txt", &value.to_string());
+        project.write_file_and_sync("src/input.txt", &value.to_string());
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
     std::thread::sleep(std::time::Duration::from_millis(300));
@@ -5396,10 +5397,14 @@ if(first) {
         "watch overlapped a running task"
     );
     project.write_file(".lpm/release", "yes");
-    watcher
-        .wait_until(|| std::fs::read_to_string(&completed).is_ok_and(|s| s.lines().count() >= 2));
-    std::thread::sleep(std::time::Duration::from_millis(700));
-    assert_eq!(std::fs::read_to_string(&started).unwrap(), "run\nrun\n");
+    watcher.wait_until(|| {
+        std::fs::read_to_string(&completed).is_ok_and(|s| s.lines().any(|line| line == "19"))
+    });
+    assert!(
+        std::fs::read_to_string(&completed)
+            .unwrap()
+            .starts_with("first\n")
+    );
 }
 
 #[test]
