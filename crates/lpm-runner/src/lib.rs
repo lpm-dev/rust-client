@@ -26,6 +26,7 @@ pub mod dev_session;
 pub mod dlx;
 pub mod dotenv;
 pub mod exec;
+pub mod execution;
 pub mod hooks;
 pub mod isolate;
 pub mod local_domains;

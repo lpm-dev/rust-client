@@ -2,6 +2,7 @@
 
 use globset::{Glob, GlobBuilder, GlobSet, GlobSetBuilder};
 use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher};
+use std::collections::HashSet;
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock, mpsc};
 use std::time::{Duration, Instant};
@@ -16,6 +17,7 @@ pub struct WatchFilter {
     outputs: GlobSet,
     all_inputs: bool,
     config_files: bool,
+    literal_files: Vec<PathBuf>,
 }
 
 impl WatchFilter {
@@ -39,7 +41,42 @@ impl WatchFilter {
             outputs: output_builder.build().map_err(|error| error.to_string())?,
             all_inputs: inputs.is_empty(),
             config_files: false,
+            literal_files: Vec::new(),
         })
+    }
+
+    fn for_file(file: &Path) -> Result<Self, String> {
+        let file = normalize_file_path(file)?;
+        let root = file.parent().ok_or("watched file has no parent")?;
+        let mut filter = Self::new(root, &[], &[])?;
+        let mut current = file;
+        for _ in 0..40 {
+            if filter.literal_files.contains(&current) {
+                break;
+            }
+            filter.literal_files.push(current.clone());
+            let Ok(target) = std::fs::read_link(&current) else {
+                break;
+            };
+            let target = if target.is_absolute() {
+                target
+            } else {
+                current
+                    .parent()
+                    .ok_or("symlink has no parent")?
+                    .join(target)
+            };
+            let Ok(target) = normalize_file_path(&target) else {
+                break;
+            };
+            current = target;
+        }
+        if let Ok(target) = std::fs::canonicalize(&filter.literal_files[0])
+            && !filter.literal_files.contains(&target)
+        {
+            filter.literal_files.push(target);
+        }
+        Ok(filter)
     }
 
     /// Observe task configuration changes even outside the declared inputs.
@@ -55,6 +92,9 @@ impl WatchFilter {
     }
 
     fn matches_path(&self, path: &Path) -> bool {
+        if !self.literal_files.is_empty() {
+            return self.literal_files.iter().any(|file| file == path);
+        }
         let Ok(relative) = path.strip_prefix(&self.root) else {
             return false;
         };
@@ -76,6 +116,16 @@ impl WatchFilter {
         }
         !self.outputs.is_match(relative) && (self.all_inputs || self.inputs.is_match(relative))
     }
+}
+
+fn normalize_file_path(file: &Path) -> Result<PathBuf, String> {
+    let parent = file
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    let parent = std::fs::canonicalize(parent).map_err(|error| error.to_string())?;
+    let name = file.file_name().ok_or("watched file has no name")?;
+    Ok(parent.join(name))
 }
 
 fn normalize_watch_glob(pattern: &str) -> String {
@@ -263,6 +313,20 @@ pub fn watch_and_run_with_filter(
     filter: WatchFilterHandle,
     shutdown: Option<mpsc::Receiver<()>>,
 ) -> Result<(), String> {
+    watch_and_run_until(watch_dir, on_change, filter, move || {
+        shutdown
+            .as_ref()
+            .is_some_and(|receiver| receiver.try_recv().is_ok())
+    })
+}
+
+/// Keep observing changes until the caller requests a stop.
+pub fn watch_and_run_until(
+    watch_dir: &Path,
+    on_change: OnChange,
+    filter: WatchFilterHandle,
+    should_stop: impl Fn() -> bool,
+) -> Result<(), String> {
     let watch_dir = std::fs::canonicalize(watch_dir).map_err(|error| error.to_string())?;
     let (notifications, receiver) = WatchNotifications::new(filter);
     let state = notifications.state.clone();
@@ -272,22 +336,81 @@ pub fn watch_and_run_with_filter(
     watcher
         .watch(&watch_dir, RecursiveMode::Recursive)
         .map_err(|error| format!("failed to watch directory: {error}"))?;
-    run_watch_loop(receiver, on_change, state, shutdown)
+    run_watch_loop(receiver, on_change, state, should_stop)
+}
+
+/// Watch a literal entrypoint and refresh its symlink targets before each run.
+pub fn watch_file_and_run(
+    file: &Path,
+    mut on_change: OnChange,
+    should_stop: impl Fn() -> bool,
+) -> Result<(), String> {
+    let file = normalize_file_path(file)?;
+    let filter = WatchFilterHandle::new(WatchFilter::for_file(&file)?);
+    let (notifications, receiver) = WatchNotifications::new(filter.clone());
+    let state = notifications.state.clone();
+    let errors = state.clone();
+    let mut watcher: RecommendedWatcher =
+        notify::recommended_watcher(move |event| notifications.submit(event))
+            .map_err(|error| format!("failed to create file watcher: {error}"))?;
+    let mut roots = HashSet::new();
+    refresh_file_watch(&file, &mut watcher, &mut roots, &filter)?;
+    run_watch_loop(
+        receiver,
+        Box::new(move || {
+            if let Err(error) = refresh_file_watch(&file, &mut watcher, &mut roots, &filter) {
+                errors
+                    .0
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .error = Some(error);
+                return;
+            }
+            on_change();
+        }),
+        state,
+        should_stop,
+    )
+}
+
+fn refresh_file_watch(
+    file: &Path,
+    watcher: &mut RecommendedWatcher,
+    roots: &mut HashSet<PathBuf>,
+    filter: &WatchFilterHandle,
+) -> Result<(), String> {
+    let next_filter = WatchFilter::for_file(file)?;
+    let next_roots: HashSet<_> = next_filter
+        .literal_files
+        .iter()
+        .filter_map(|path| path.parent().map(Path::to_path_buf))
+        .collect();
+    for root in next_roots.difference(roots) {
+        watcher
+            .watch(root, RecursiveMode::NonRecursive)
+            .map_err(|error| error.to_string())?;
+    }
+    filter.replace(next_filter);
+    for root in roots.difference(&next_roots) {
+        watcher.unwatch(root).map_err(|error| error.to_string())?;
+    }
+    *roots = next_roots;
+    Ok(())
 }
 
 fn run_watch_loop(
     receiver: mpsc::Receiver<()>,
     mut on_change: OnChange,
     state: WatchState,
-    shutdown: Option<mpsc::Receiver<()>>,
+    should_stop: impl Fn() -> bool,
 ) -> Result<(), String> {
     state.start_initial_run()?;
+    if should_stop() {
+        return Ok(());
+    }
     on_change();
     loop {
-        if shutdown
-            .as_ref()
-            .is_some_and(|receiver| receiver.try_recv().is_ok())
-        {
+        if should_stop() {
             return Ok(());
         }
         // Clear only immediately before execution, preserving edits made while a task runs.
@@ -514,7 +637,7 @@ mod tests {
                     let _ = ran_tx.send(());
                 }),
                 notifications.state,
-                Some(shutdown_rx),
+                || shutdown_rx.try_recv().is_ok(),
             )
         });
         ran_rx.recv_timeout(Duration::from_secs(2)).unwrap();
@@ -561,7 +684,7 @@ mod tests {
                     let _ = ran_tx.send(());
                 }),
                 state,
-                Some(shutdown_rx),
+                || shutdown_rx.try_recv().is_ok(),
             )
         });
         ran_rx.recv_timeout(Duration::from_secs(2)).unwrap();

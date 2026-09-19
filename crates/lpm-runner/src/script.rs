@@ -1070,9 +1070,8 @@ pub fn run_local_bin(
         no_env_check,
         bin_hint,
     )?;
-    let status = command
-        .status()
-        .map_err(|e| LpmError::Script(format!("failed to execute '{command_name}': {e}")))?;
+    let signals = crate::execution::ExecutionSignals::new()?;
+    let status = signals.run(&mut command)?;
 
     if !status.success() {
         return Err(LpmError::ExitCode(shell::exit_code(&status)));
