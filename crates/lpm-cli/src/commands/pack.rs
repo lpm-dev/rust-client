@@ -1,10 +1,16 @@
+use super::tool_execution::{
+    StdioMode, ToolOutcome, emit_envelope, finish_single_tool, member_result,
+    selected_schedule_state,
+};
+use super::tool_runtime::InstalledRuntimes;
 use crate::{BundleFormat, BundlePlatform, install_ui};
+use futures::stream::{FuturesUnordered, StreamExt};
 use lpm_common::LpmError;
 use lpm_common::color::Painted;
+use lpm_runner::execution::ExecutionSignals;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
-
-const MAX_CAPTURED_OUTPUT: usize = 10 * 1024 * 1024;
+use std::process::Command;
+use std::sync::Arc;
 
 #[derive(Clone, Debug)]
 pub struct PackOptions {
@@ -22,27 +28,27 @@ pub struct PackOptions {
 }
 
 impl PackOptions {
-    fn tsdown_args(&self) -> Vec<String> {
+    fn tsdown_args(&self, force_finite: bool) -> Vec<String> {
         let mut args = Vec::new();
 
         if let Some(config) = &self.config {
-            args.push("--config".to_string());
-            args.push(config.clone());
+            push_option_value(&mut args, "--config", config);
         }
         if let Some(tsconfig) = &self.tsconfig {
-            args.push("--tsconfig".to_string());
-            args.push(tsconfig.clone());
+            push_option_value(&mut args, "--tsconfig", tsconfig);
         }
         if let Some(target) = &self.target {
-            args.push("--target".to_string());
-            args.push(target.clone());
+            push_option_value(&mut args, "--target", target);
         }
         if let Some(entry) = &self.entry {
-            args.push(entry.clone());
+            args.push(if entry.starts_with('-') {
+                format!("./{entry}")
+            } else {
+                entry.clone()
+            });
         }
         if let Some(out_dir) = &self.out_dir {
-            args.push("--out-dir".to_string());
-            args.push(out_dir.clone());
+            push_option_value(&mut args, "--out-dir", out_dir);
         }
         if let Some(format) = self.format {
             args.push("--format".to_string());
@@ -63,7 +69,23 @@ impl PackOptions {
         }
 
         args.extend(self.args.iter().cloned());
+        if force_finite {
+            let delimiter = args
+                .iter()
+                .position(|arg| arg == "--")
+                .unwrap_or(args.len());
+            args.insert(delimiter, "--no-watch".into());
+        }
         args
+    }
+}
+
+fn push_option_value(args: &mut Vec<String>, option: &str, value: &str) {
+    if value.starts_with('-') {
+        args.push(format!("{option}={value}"));
+    } else {
+        args.push(option.into());
+        args.push(value.into());
     }
 }
 
@@ -83,54 +105,6 @@ fn bundle_platform_cli_value(platform: BundlePlatform) -> &'static str {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum StdioMode {
-    Inherit,
-    Capture,
-}
-
-#[derive(Default)]
-struct Captured {
-    stdout: String,
-    stderr: String,
-}
-
-#[derive(Default)]
-struct ToolOutcome {
-    exit_code: Option<i32>,
-    captured: Captured,
-    error: Option<String>,
-}
-
-impl ToolOutcome {
-    fn success(&self) -> bool {
-        matches!(self.exit_code, Some(0)) && self.error.is_none()
-    }
-
-    fn into_result(self) -> Result<(), LpmError> {
-        if let Some(error) = self.error {
-            return Err(LpmError::Script(error));
-        }
-
-        match self.exit_code {
-            Some(0) => Ok(()),
-            Some(code) => Err(LpmError::ExitCode(code)),
-            None => Err(LpmError::Script(
-                "pack exited without an exit code".to_string(),
-            )),
-        }
-    }
-}
-
-struct MemberResult {
-    name: String,
-    success: bool,
-    exit_code: Option<i32>,
-    duration_ms: u64,
-    captured: Captured,
-    error: Option<String>,
-}
-
 #[allow(clippy::too_many_arguments)]
 pub async fn dispatch(
     project_dir: &Path,
@@ -145,51 +119,12 @@ pub async fn dispatch(
     fail_if_no_match: bool,
     json_output: bool,
 ) -> Result<(), LpmError> {
-    let workspace_mode = all || affected || !filters.is_empty() || !filter_prod.is_empty();
-
-    if workspace_mode && args_imply_watch(&options.args) {
-        let workspace = lpm_workspace::discover_workspace(project_dir)
-            .map_err(|e| LpmError::Script(format!("workspace error: {e}")))?
-            .ok_or_else(|| {
-                LpmError::Script(
-                    "no workspace found. --all/--filter/--affected require a monorepo".into(),
-                )
-            })?;
-        let ws_graph = lpm_task::graph::WorkspaceGraph::from_workspace(&workspace);
-        let target_set = crate::workspace_select::select_workspace_target_set(
-            &ws_graph,
-            &workspace.root,
-            filters,
-            filter_prod,
-            changed_files_ignore_pattern,
-            test_pattern,
-            affected,
-            base_ref,
-        )?;
-
-        match target_set.len() {
-            0 => {
-                return Err(LpmError::Script(
-                    "no workspace member matched the selection — nothing to watch with `lpm pack --watch`."
-                        .into(),
-                ));
-            }
-            1 => {
-                let idx = *target_set.iter().next().expect("len == 1");
-                return pack(&ws_graph.members[idx].path, options, json_output).await;
-            }
-            n => {
-                return Err(LpmError::Script(format!(
-                    "--watch is not supported when the selection resolves to {n} members for `lpm pack` \
-                     (would start one watcher per member). Narrow the selection so it resolves to exactly \
-                     one member, e.g. `lpm pack --filter <single-name> -- --watch`, or run from the member's \
-                     directory with `cd <member> && lpm pack -- --watch`."
-                )));
-            }
-        }
+    if args_imply_watch(&options.args) && json_output {
+        return Err(LpmError::Script(
+            "--watch cannot be combined with --json for lpm pack".into(),
+        ));
     }
-
-    if workspace_mode {
+    if all || affected || !filters.is_empty() || !filter_prod.is_empty() {
         pack_workspace(
             project_dir,
             options,
@@ -212,33 +147,41 @@ pub async fn pack(
     options: &PackOptions,
     json_output: bool,
 ) -> Result<(), LpmError> {
-    let start = std::time::Instant::now();
-    if json_output {
-        let outcome =
-            run_pack_process(project_dir, options, StdioMode::Capture).unwrap_or_else(|e| {
-                ToolOutcome {
-                    error: Some(e.to_string()),
-                    ..Default::default()
-                }
-            });
-        let result =
-            member_result_from_outcome(package_name_for_project(project_dir), outcome, start);
-        let succeeded = usize::from(result.success);
-        let failed = usize::from(!result.success);
-        let results = [result];
-        emit_envelope(&results, 1, succeeded, failed, start.elapsed());
-        if failed > 0 {
-            return Err(LpmError::ExitCode(1));
-        }
-        return Ok(());
+    if args_imply_watch(&options.args) && json_output {
+        return Err(LpmError::Script(
+            "--watch cannot be combined with --json for lpm pack".into(),
+        ));
     }
-
-    install_ui::phase_line(crate::install_ui::terminal_line!(
-        "Using local {}",
-        install_ui::yellow("tsdown")
-    ));
-
-    let outcome = run_pack_process(project_dir, options, StdioMode::Inherit)?;
+    let boundary = super::tool_runtime::boundary(project_dir)?;
+    let runtimes = InstalledRuntimes::new(&boundary)?;
+    let path = runtimes.path_for(project_dir)?;
+    let entry = resolve_local_pack_binary(project_dir, &boundary)?;
+    if !json_output {
+        install_ui::phase_line(crate::install_ui::terminal_line!(
+            "Using local {}",
+            install_ui::yellow("tsdown")
+        ));
+    }
+    let start = std::time::Instant::now();
+    let signals = Arc::new(ExecutionSignals::new()?);
+    let stdio = if json_output {
+        StdioMode::Capture
+    } else {
+        StdioMode::Inherit
+    };
+    let outcome = run_pack_process(
+        project_dir,
+        &entry,
+        &path,
+        options,
+        json_output,
+        stdio,
+        Arc::clone(&signals),
+    )
+    .await;
+    if json_output {
+        return finish_single_tool(project_dir, outcome, start.elapsed(), &signals);
+    }
     if outcome.success() {
         let duration = install_ui::format_duration(start.elapsed());
         install_ui::done_line(crate::install_ui::terminal_line!(
@@ -248,124 +191,115 @@ pub async fn pack(
     } else if let Some(code) = outcome.exit_code {
         install_ui::failed_untrusted(&format!("pack failed · exit code {code}"));
     }
+    signals.check()?;
     outcome.into_result()
 }
 
-fn run_pack_process(
+async fn run_pack_process(
     project_dir: &Path,
+    entry: &Path,
+    path: &str,
     options: &PackOptions,
+    force_finite: bool,
     stdio: StdioMode,
-) -> Result<ToolOutcome, LpmError> {
-    let pack_bin = resolve_local_pack_binary(project_dir).ok_or_else(|| {
-        LpmError::Script("tsdown not installed. Run: lpm install -D tsdown".to_string())
-    })?;
-    let path = lpm_runner::bin_path::build_path_with_bins(project_dir)?;
-    let mut cmd = Command::new(&pack_bin);
-    cmd.args(options.tsdown_args())
+    signals: Arc<ExecutionSignals>,
+) -> ToolOutcome {
+    let mut command = Command::new(entry);
+    command
+        .args(options.tsdown_args(force_finite && !args_imply_watch(&options.args)))
         .current_dir(project_dir)
-        .env("PATH", &path);
-
-    apply_stdio(&mut cmd, stdio);
-
-    let mut outcome = ToolOutcome::default();
-    let spawn_hint = "Install Node via `lpm use node@22` or ensure `node` is on PATH";
-
-    match stdio {
-        StdioMode::Inherit => {
-            let status = cmd.status().map_err(|e| {
-                LpmError::Script(format!(
-                    "failed to run {}: {e}. {spawn_hint}",
-                    pack_bin.display(),
-                ))
-            })?;
-            outcome.exit_code = Some(status.code().unwrap_or(1));
-        }
-        StdioMode::Capture => match cmd.output() {
-            Ok(output) => {
-                outcome.captured = Captured {
-                    stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
-                    stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
-                };
-                outcome.exit_code = Some(output.status.code().unwrap_or(1));
-            }
-            Err(e) => {
-                outcome.error = Some(format!(
-                    "failed to run {}: {e}. {spawn_hint}",
-                    pack_bin.display(),
-                ));
-            }
-        },
+        .env("PATH", path);
+    let mut outcome = super::tool_execution::run(command, stdio, signals).await;
+    if let Some(error) = &mut outcome.error {
+        error.push_str(". Install Node via `lpm use node@22` or ensure `node` is on PATH");
     }
-
-    Ok(outcome)
-}
-
-fn resolve_local_pack_binary(project_dir: &Path) -> Option<PathBuf> {
-    for bin_dir in lpm_runner::bin_path::find_bin_dirs(project_dir) {
-        for candidate_name in tool_candidates("tsdown") {
-            let candidate = bin_dir.join(candidate_name);
-            if is_executable_file(&candidate) {
-                return Some(candidate);
-            }
-        }
-    }
-
-    None
-}
-
-#[cfg(windows)]
-fn tool_candidates(name: &str) -> Vec<String> {
-    let raw = std::env::var("PATHEXT").unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".to_string());
-    let mut candidates = vec![name.to_string()];
-    candidates.extend(
-        raw.split(';')
-            .filter(|ext| !ext.is_empty())
-            .map(|ext| format!("{name}{ext}")),
-    );
-    candidates
-}
-
-#[cfg(not(windows))]
-fn tool_candidates(name: &str) -> Vec<String> {
-    vec![name.to_string()]
-}
-
-fn is_executable_file(path: &Path) -> bool {
-    let Ok(meta) = std::fs::metadata(path) else {
-        return false;
-    };
-    if !meta.is_file() {
-        return false;
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        meta.permissions().mode() & 0o111 != 0
-    }
-    #[cfg(not(unix))]
-    {
-        true
-    }
-}
-
-fn apply_stdio(cmd: &mut Command, stdio: StdioMode) {
-    match stdio {
-        StdioMode::Inherit => {
-            cmd.stdin(Stdio::inherit())
-                .stdout(Stdio::inherit())
-                .stderr(Stdio::inherit());
-        }
-        StdioMode::Capture => {
-            cmd.stdin(Stdio::null())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped());
-        }
-    }
+    outcome
 }
 
 fn args_imply_watch(args: &[String]) -> bool {
-    args.iter()
-        .any(|arg| arg == "--watch" || arg.starts_with("--watch=") || arg == "-w")
+    let mut args = args.iter().peekable();
+    let mut selected_alias = None;
+    let mut watching = false;
+    let mut had_value = false;
+    // CAC keeps aliases separately. Repeated watch paths form a truthy array;
+    // a negated option replaces that array with false.
+    let mut record = |alias: &'static str, value: bool, negated: bool| {
+        if *selected_alias.get_or_insert(alias) == alias {
+            watching = if had_value && !negated { true } else { value };
+            had_value = true;
+        }
+    };
+    while let Some(arg) = args.next() {
+        if arg == "--" {
+            break;
+        }
+        let name = arg.trim_start_matches('-');
+        let dashes = arg.len() - name.len();
+        if dashes == 0 {
+            continue;
+        }
+        if let Some(negated) = name.strip_prefix("no-") {
+            match negated {
+                "watch" => record("watch", false, true),
+                "w" => record("w", false, true),
+                _ => {}
+            }
+            continue;
+        }
+        let (name, assigned) = name.split_once('=').unwrap_or((name, ""));
+        let value = if !assigned.is_empty() {
+            assigned
+        } else if args.peek().is_some_and(|next| !next.starts_with('-')) {
+            args.next().map_or("true", String::as_str)
+        } else {
+            "true"
+        };
+        if dashes == 2 {
+            match name {
+                "watch" => record("watch", watch_path_is_truthy(value), false),
+                "w" => record("w", watch_path_is_truthy(value), false),
+                _ => {}
+            }
+        } else {
+            let mut chars = name.chars().peekable();
+            while let Some(short) = chars.next() {
+                if short == 'w' {
+                    record(
+                        "w",
+                        chars.peek().is_some() || watch_path_is_truthy(value),
+                        false,
+                    );
+                }
+            }
+        }
+    }
+    watching
+}
+
+fn watch_path_is_truthy(value: &str) -> bool {
+    let value = value.trim();
+    if value.is_empty() {
+        return false;
+    }
+    if let Ok(number) = value.parse::<f64>() {
+        return number != 0.0;
+    }
+    for prefix in ["0x", "0X", "0b", "0B", "0o", "0O"] {
+        if let Some(digits) = value.strip_prefix(prefix) {
+            return digits.is_empty() || digits.bytes().any(|byte| byte != b'0');
+        }
+    }
+    true
+}
+
+fn resolve_local_pack_binary(project_dir: &Path, boundary: &Path) -> Result<PathBuf, LpmError> {
+    lpm_runner::script::resolve_local_bin_path_bounded(project_dir, boundary, "tsdown").map_err(
+        |error| {
+            LpmError::Script(format!(
+                "{error}. Install tsdown with `lpm install -D tsdown`"
+            ))
+        },
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -381,19 +315,15 @@ async fn pack_workspace(
     json_output: bool,
 ) -> Result<(), LpmError> {
     let workspace = lpm_workspace::discover_workspace(project_dir)
-        .map_err(|e| LpmError::Script(format!("workspace error: {e}")))?
+        .map_err(|error| LpmError::Script(format!("workspace error: {error}")))?
         .ok_or_else(|| {
             LpmError::Script(
                 "no workspace found. --all/--filter/--affected require a monorepo".into(),
             )
         })?;
-
-    let ws_graph = lpm_task::graph::WorkspaceGraph::from_workspace(&workspace);
-    let levels = ws_graph
-        .topological_levels()
-        .map_err(|e| LpmError::Script(e.to_string()))?;
-    let target_set = crate::workspace_select::select_workspace_target_set(
-        &ws_graph,
+    let graph = lpm_task::graph::WorkspaceGraph::from_workspace(&workspace);
+    let targets = crate::workspace_select::select_workspace_target_set(
+        &graph,
         &workspace.root,
         filters,
         filter_prod,
@@ -402,302 +332,177 @@ async fn pack_workspace(
         affected_base.is_some(),
         affected_base.unwrap_or("main"),
     )?;
-
-    if target_set.is_empty() {
+    if args_imply_watch(&options.args) && targets.len() != 1 {
+        return Err(LpmError::Script(format!(
+            "pack watch mode requires exactly one selected workspace member (selected {})",
+            targets.len()
+        )));
+    }
+    if targets.is_empty() {
         let affected_only = filters.is_empty() && filter_prod.is_empty() && affected_base.is_some();
         if fail_if_no_match {
-            let msg = if affected_only {
+            let message = if affected_only {
                 format!(
                     "no workspace packages affected vs {} (--fail-if-no-match)",
-                    affected_base.unwrap_or("main"),
+                    affected_base.unwrap_or("main")
                 )
             } else {
-                let hint =
-                    crate::commands::filter::format_no_match_hint_for_sets(filters, filter_prod);
                 let base = "no workspace packages matched the filter (--fail-if-no-match)";
-                match hint {
-                    Some(h) => format!("{base}\n\n{h}"),
-                    None => base.to_string(),
-                }
+                crate::commands::filter::format_no_match_hint_for_sets(filters, filter_prod)
+                    .map_or_else(|| base.into(), |hint| format!("{base}\n\n{hint}"))
             };
-            return Err(LpmError::Script(msg));
+            return Err(LpmError::Script(message));
         }
-
         if json_output {
-            let envelope = serde_json::json!({
-                "success": true,
-                "packages": 0,
-                "succeeded": 0,
-                "failed": 0,
-                "duration_ms": 0,
-                "members": [],
-            });
-            println!("{}", serde_json::to_string_pretty(&envelope).unwrap());
+            emit_envelope(
+                &[],
+                0,
+                0,
+                0,
+                std::time::Duration::ZERO,
+                &ExecutionSignals::new()?,
+            )?;
         } else if affected_only {
             install_ui::done_untrusted(&format!(
                 "no packages affected vs {} — nothing to pack",
-                affected_base.unwrap_or("main"),
+                affected_base.unwrap_or("main")
             ));
         } else {
-            let hint = crate::commands::filter::format_no_match_hint_for_sets(filters, filter_prod);
             install_ui::warn("No packages matched");
-            if let Some(h) = hint {
-                eprintln!();
-                for line in h.lines() {
-                    install_ui::detail_line(crate::install_ui::terminal_line!(
-                        "  {}",
-                        install_ui::dim(line)
-                    ));
-                }
-                eprintln!();
+            if let Some(hint) =
+                crate::commands::filter::format_no_match_hint_for_sets(filters, filter_prod)
+            {
+                eprintln!("\n{hint}\n");
             }
         }
         return Ok(());
     }
-
+    let (mut unmet, mut ready) = selected_schedule_state(&graph, &targets)?;
+    let mut result_order = vec![0; graph.len()];
+    for (order, index) in graph
+        .topological_levels()
+        .map_err(|error| LpmError::Script(error.to_string()))?
+        .into_iter()
+        .flatten()
+        .enumerate()
+    {
+        result_order[index] = order;
+    }
+    let runtimes = InstalledRuntimes::new(&workspace.root)?;
+    let mut prepared = Vec::with_capacity(graph.len());
+    for (index, member) in graph.members.iter().enumerate() {
+        if !targets.contains(&index) {
+            prepared.push(Err("member not selected".into()));
+            continue;
+        }
+        let result = (|| {
+            let path = runtimes.path_for(&member.path)?;
+            let entry = resolve_local_pack_binary(&member.path, &workspace.root)?;
+            Ok::<_, LpmError>((entry, path))
+        })()
+        .map_err(|error| error.to_string());
+        prepared.push(result);
+    }
+    let start = std::time::Instant::now();
+    let signals = Arc::new(ExecutionSignals::new()?);
     let stdio = if json_output {
         StdioMode::Capture
     } else {
         StdioMode::Inherit
     };
-
-    let start = std::time::Instant::now();
-    let mut member_results = Vec::with_capacity(target_set.len());
-
-    for level in &levels {
-        let level_targets: Vec<usize> = level
-            .iter()
-            .filter(|idx| target_set.contains(idx))
-            .copied()
-            .collect();
-        if level_targets.is_empty() {
-            continue;
+    let limit = std::thread::available_parallelism().map_or(4, |count| count.get());
+    let mut running = FuturesUnordered::new();
+    let mut results = Vec::with_capacity(targets.len());
+    loop {
+        while running.len() < limit {
+            let Some(index) = ready.pop_front() else {
+                break;
+            };
+            let member = &graph.members[index];
+            let task = &prepared[index];
+            let task_signals = Arc::clone(&signals);
+            running.push(async move {
+                let started = std::time::Instant::now();
+                if !json_output {
+                    install_ui::detail_line(crate::install_ui::terminal_line!(
+                        "  {} pack",
+                        install_ui::bold(&format!("[{}]", member.name))
+                    ));
+                }
+                let outcome = match task {
+                    Ok((entry, path)) => {
+                        run_pack_process(
+                            &member.path,
+                            entry,
+                            path,
+                            options,
+                            true,
+                            stdio,
+                            task_signals,
+                        )
+                        .await
+                    }
+                    Err(error) => ToolOutcome {
+                        error: Some(error.clone()),
+                        ..Default::default()
+                    },
+                };
+                (
+                    index,
+                    member_result(member.name.clone(), outcome, started.elapsed()),
+                )
+            });
         }
-
-        member_results.extend(run_level(&ws_graph, &level_targets, options, stdio).await);
+        let Some((index, result)) = running.next().await else {
+            break;
+        };
+        results.push((index, result));
+        for &dependent in &graph.reverse_edges[index] {
+            if targets.contains(&dependent) {
+                unmet[dependent] -= 1;
+                if unmet[dependent] == 0 {
+                    ready.push_back(dependent);
+                }
+            }
+        }
     }
-
-    let elapsed = start.elapsed();
-    let succeeded = member_results
-        .iter()
-        .filter(|result| result.success)
-        .count();
-    let failed = member_results.len() - succeeded;
-
+    results.sort_unstable_by_key(|(index, _)| result_order[*index]);
+    let results = results
+        .into_iter()
+        .map(|(_, result)| result)
+        .collect::<Vec<_>>();
+    let succeeded = results.iter().filter(|result| result.success).count();
+    let failed = results.len() - succeeded;
     if json_output {
         emit_envelope(
-            &member_results,
-            member_results.len(),
+            &results,
+            results.len(),
             succeeded,
             failed,
-            elapsed,
-        );
+            start.elapsed(),
+            &signals,
+        )?;
     } else {
+        for result in &results {
+            if let Some(error) = &result.error {
+                install_ui::failed_untrusted(&format!("{}: {error}", result.name));
+            }
+        }
         emit_human_summary(
             "pack",
-            member_results.len(),
+            results.len(),
             succeeded,
             failed,
-            target_set.len(),
-            elapsed,
+            targets.len(),
+            start.elapsed(),
         );
     }
-
+    signals.check()?;
     if failed > 0 {
-        return Err(LpmError::ExitCode(1));
-    }
-
-    Ok(())
-}
-
-async fn run_level(
-    ws_graph: &lpm_task::graph::WorkspaceGraph,
-    level_targets: &[usize],
-    options: &PackOptions,
-    stdio: StdioMode,
-) -> Vec<MemberResult> {
-    if level_targets.len() == 1 {
-        let idx = level_targets[0];
-        return vec![
-            run_one_member(
-                &ws_graph.members[idx].path,
-                &ws_graph.members[idx].name,
-                options,
-                stdio,
-            )
-            .await,
-        ];
-    }
-
-    let max_threads = std::thread::available_parallelism().map_or(4, |n| n.get());
-    let mut all_results = Vec::with_capacity(level_targets.len());
-
-    for chunk in level_targets.chunks(max_threads) {
-        let mut chunk_futs = Vec::with_capacity(chunk.len());
-        for &idx in chunk {
-            let member_dir = ws_graph.members[idx].path.clone();
-            let member_name = ws_graph.members[idx].name.clone();
-            let pack_options = options.clone();
-
-            chunk_futs.push(tokio::spawn(async move {
-                run_one_member(&member_dir, &member_name, &pack_options, stdio).await
-            }));
-        }
-
-        for fut in chunk_futs {
-            match fut.await {
-                Ok(result) => all_results.push(result),
-                Err(join_err) => all_results.push(MemberResult {
-                    name: "<unknown>".into(),
-                    success: false,
-                    exit_code: None,
-                    duration_ms: 0,
-                    captured: Captured::default(),
-                    error: Some(format!("workspace task panicked: {join_err}")),
-                }),
-            }
-        }
-    }
-
-    all_results
-}
-
-async fn run_one_member(
-    member_dir: &Path,
-    member_name: &str,
-    options: &PackOptions,
-    stdio: StdioMode,
-) -> MemberResult {
-    let start = std::time::Instant::now();
-
-    if matches!(stdio, StdioMode::Inherit) {
-        install_ui::detail_line(crate::install_ui::terminal_line!(
-            "  {} pack",
-            install_ui::bold(&format!("[{member_name}]"))
-        ));
-    }
-
-    let outcome = run_pack_process(member_dir, options, stdio).unwrap_or_else(|e| ToolOutcome {
-        error: Some(e.to_string()),
-        ..Default::default()
-    });
-    let result = member_result_from_outcome(member_name.to_string(), outcome, start);
-
-    if matches!(stdio, StdioMode::Inherit) && !result.success {
-        if let Some(code) = result.exit_code {
-            install_ui::failed_untrusted(&format!("{member_name}: exit {code}"));
-        } else if let Some(ref msg) = result.error {
-            install_ui::failed_untrusted(&format!("{member_name}: {msg}"));
-        }
-    }
-
-    result
-}
-
-fn member_result_from_outcome(
-    name: String,
-    outcome: ToolOutcome,
-    started_at: std::time::Instant,
-) -> MemberResult {
-    MemberResult {
-        name,
-        success: outcome.success(),
-        exit_code: outcome.exit_code,
-        duration_ms: started_at.elapsed().as_millis() as u64,
-        captured: outcome.captured,
-        error: outcome.error,
-    }
-}
-
-fn package_name_for_project(project_dir: &Path) -> String {
-    let package_json_path = project_dir.join("package.json");
-    if let Ok(package) = lpm_workspace::read_package_json(&package_json_path)
-        && let Some(name) = package.name
-    {
-        return name;
-    }
-
-    project_dir
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or(".")
-        .to_string()
-}
-
-fn truncate_output(text: &str) -> String {
-    if text.len() > MAX_CAPTURED_OUTPUT {
-        let truncated = &text[..MAX_CAPTURED_OUTPUT];
-        let end = truncated.rfind('\n').unwrap_or(MAX_CAPTURED_OUTPUT);
-        format!(
-            "{}...\n\n[output truncated at {}MB]",
-            &text[..end],
-            MAX_CAPTURED_OUTPUT / (1024 * 1024),
-        )
+        Err(LpmError::ExitCode(1))
     } else {
-        text.to_string()
+        Ok(())
     }
-}
-
-fn emit_envelope(
-    results: &[MemberResult],
-    total: usize,
-    succeeded: usize,
-    failed: usize,
-    elapsed: std::time::Duration,
-) {
-    let members: Vec<serde_json::Value> = results
-        .iter()
-        .map(|result| {
-            let mut obj = serde_json::Map::new();
-            obj.insert(
-                "name".into(),
-                serde_json::Value::String(result.name.clone()),
-            );
-            obj.insert("success".into(), serde_json::Value::Bool(result.success));
-            obj.insert(
-                "exit_code".into(),
-                match result.exit_code {
-                    Some(code) => serde_json::Value::Number(code.into()),
-                    None => serde_json::Value::Null,
-                },
-            );
-            obj.insert(
-                "duration_ms".into(),
-                serde_json::Value::Number(result.duration_ms.into()),
-            );
-
-            if !result.success {
-                if let Some(ref error) = result.error {
-                    obj.insert("error".into(), serde_json::Value::String(error.clone()));
-                }
-                if !result.captured.stdout.is_empty() {
-                    obj.insert(
-                        "stdout".into(),
-                        serde_json::Value::String(truncate_output(&result.captured.stdout)),
-                    );
-                }
-                if !result.captured.stderr.is_empty() {
-                    obj.insert(
-                        "stderr".into(),
-                        serde_json::Value::String(truncate_output(&result.captured.stderr)),
-                    );
-                }
-            }
-
-            serde_json::Value::Object(obj)
-        })
-        .collect();
-
-    let envelope = serde_json::json!({
-        "success": failed == 0,
-        "packages": total,
-        "succeeded": succeeded,
-        "failed": failed,
-        "duration_ms": elapsed.as_millis() as u64,
-        "members": members,
-    });
-
-    println!("{}", serde_json::to_string_pretty(&envelope).unwrap());
 }
 
 fn emit_human_summary(
