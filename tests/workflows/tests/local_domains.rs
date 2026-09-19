@@ -52,6 +52,7 @@ server.listen(process.env.PORT, '127.0.0.1', () => {
         .spawn()
         .expect("spawn lpm proxy start");
     wait_for_proxy_running(&project, &mut proxy);
+    let tls_port = proxy_tls_port(&project);
 
     let mut dev_command = lpm_spawnable(&project);
     dev_command
@@ -80,8 +81,10 @@ server.listen(process.env.PORT, '127.0.0.1', () => {
     );
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("https://web.localhost -> resolving endpoint"),
-        "startup banner should show the configured host before port assignment, got:\n{stderr}"
+        stderr.contains(&format!(
+            "https://web.localhost:{tls_port} -> resolving endpoint"
+        )),
+        "startup banner should show the actual HTTPS listener port, got:\n{stderr}"
     );
     assert!(
         stderr.contains(&format!("web.localhost -> localhost:{upstream_port}")),
