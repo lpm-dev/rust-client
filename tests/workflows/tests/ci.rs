@@ -5,21 +5,6 @@ use support::{TempProject, lpm};
 const HOSTILE_ENV_NAME: &str =
     "safe\nFORGED\rrewritten\u{8}\u{1b}]52;c;AAAA\u{7}\u{0090}hidden\u{009c}end";
 
-fn assert_hostile_env_name_is_inline_safe(context: &str, rendered: &str) {
-    assert!(
-        rendered.matches("safe?FORGED?rewritten?end").count() >= 2,
-        "{context} must preserve the readable env name in both generated commands, got:\n{rendered}"
-    );
-    for attacker_fragment in [
-        "\nFORGED", "\u{1b}", "\u{7}", "\u{8}", "\r", "\u{007f}", "\u{0090}", "\u{009c}", "hidden",
-    ] {
-        assert!(
-            !rendered.contains(attacker_fragment),
-            "{context} retained attacker fragment {attacker_fragment:?}:\n{rendered}"
-        );
-    }
-}
-
 #[test]
 fn ci_env_github_actions_masks_secret_values_and_emits_github_env_commands() {
     let project = TempProject::empty(r#"{"name":"ci-test","version":"1.0.0"}"#);
@@ -170,7 +155,7 @@ fn ci_setup_github_actions_uses_project_vault_id_and_requested_env_name() {
         "setup output must thread the requested env name through the pull step, got:\n{stdout}"
     );
     assert!(
-        stdout.contains("LPM_VAULT_ID: vault-123"),
+        stdout.contains("LPM_VAULT_ID: \"vault-123\""),
         "setup output must use the project vault id when present, got:\n{stdout}"
     );
     assert!(
@@ -223,13 +208,11 @@ fn ci_setup_github_actions_env_name_cannot_inject_terminal_rows() {
         .output()
         .expect("failed to run GitHub Actions setup with terminal controls");
 
-    assert!(output.status.success(), "GitHub Actions setup must succeed");
-    let rendered = format!(
-        "{}{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
+    assert!(!output.status.success(), "invalid environment must fail");
+    assert!(
+        output.stdout.is_empty(),
+        "no unsafe workflow must be printed"
     );
-    assert_hostile_env_name_is_inline_safe("GitHub Actions setup output", &rendered);
 }
 
 // ─── setup ci gitlab ──────────────────────────────────────────────────
@@ -305,13 +288,11 @@ fn ci_setup_gitlab_env_name_cannot_inject_terminal_rows() {
         .output()
         .expect("failed to run GitLab setup with terminal controls");
 
-    assert!(output.status.success(), "GitLab setup must succeed");
-    let rendered = format!(
-        "{}{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
+    assert!(!output.status.success(), "invalid environment must fail");
+    assert!(
+        output.stdout.is_empty(),
+        "no unsafe workflow must be printed"
     );
-    assert_hostile_env_name_is_inline_safe("GitLab setup output", &rendered);
 }
 
 #[test]
@@ -335,12 +316,6 @@ fn ci_setup_unknown_platform_fails_with_helpful_message() {
     );
 }
 
-/// `lpm --json setup ci <unknown-platform>` surfaces the same
-/// validation error as a structured envelope. Pins the JSON contract
-/// shared by `setup ci github-actions` and `setup ci gitlab` (the
-/// happy paths emit shell-format on stdout, not envelopes — see the
-/// existing tests above — but the dispatcher's unknown-platform
-/// rejection is the cheapest envelope contract for both surfaces).
 #[test]
 fn ci_setup_unknown_platform_under_json_emits_error_envelope_on_stdout() {
     let project = TempProject::empty(r#"{"name":"ci","version":"1.0.0"}"#);
@@ -527,4 +502,107 @@ fn ci_without_lockfile_fails_as_frozen_install() {
         stderr.contains("Frozen lockfile") && stderr.contains("lpm.lock"),
         "stderr must explain that lpm ci is a frozen install requiring lpm.lock, got:\n{stderr}"
     );
+}
+
+#[test]
+fn ci_setup_workflows_emit_structured_json() {
+    let project = TempProject::empty(r#"{"name":"ci-json"}"#);
+    for target in ["github-actions", "gha", "gitlab", "gitlab-ci"] {
+        let output = lpm(&project)
+            .args(["setup", "ci", target, "--env=preview", "--json"])
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        let result: serde_json::Value =
+            serde_json::from_slice(&output.stdout).expect("workflow JSON");
+        assert_eq!(result["success"], true);
+        assert_eq!(result["environment"], "preview");
+        assert!(
+            result["workflow"]
+                .as_str()
+                .unwrap()
+                .contains("--env=preview")
+        );
+        assert!(
+            result["authorization_command"]
+                .as_str()
+                .unwrap()
+                .contains("--env=preview")
+        );
+        assert!(
+            result["policy_instruction"]
+                .as_str()
+                .unwrap()
+                .contains("LPM_OIDC_POLICY_ID")
+        );
+        assert!(!project.path().join(".github").exists());
+    }
+}
+
+#[test]
+fn ci_setup_rejects_shell_active_environment_names() {
+    let project = TempProject::empty(r#"{"name":"ci-input"}"#);
+    for target in ["github-actions", "gitlab"] {
+        for environment in [
+            "production;printf injected",
+            "$(id)",
+            "../prod",
+            "__index__",
+            "",
+        ] {
+            let output = lpm(&project)
+                .args(["setup", "ci", target, "--env", environment])
+                .output()
+                .unwrap();
+            assert!(
+                !output.status.success(),
+                "accepted {target} environment {environment:?}"
+            );
+            assert!(output.stdout.is_empty());
+        }
+    }
+}
+
+#[test]
+fn ci_setup_github_rejects_invalid_manifest_instead_of_printing_a_placeholder() {
+    let project = TempProject::empty(r#"{"name":"ci-manifest"}"#);
+    for manifest in ["{", r#"{"vault":42}"#, r#"{"vault":"../other"}"#] {
+        project.write_file("lpm.json", manifest);
+        let output = lpm(&project)
+            .args(["setup", "ci", "github-actions"])
+            .output()
+            .unwrap();
+        assert!(!output.status.success(), "accepted manifest {manifest}");
+        assert!(output.stdout.is_empty());
+    }
+}
+
+#[test]
+fn ci_setup_github_quotes_vault_values_and_rejects_expressions() {
+    let project = TempProject::empty(r#"{"name":"ci-yaml"}"#);
+    project.write_file("lpm.json", r##"{"vault":"#selected"}"##);
+    let output = lpm(&project)
+        .args(["setup", "ci", "github-actions"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    assert!(String::from_utf8_lossy(&output.stdout).contains("LPM_VAULT_ID: \"#selected\""));
+    project.write_file("lpm.json", r#"{"vault":"${{ secrets.UNRELATED }}"}"#);
+    let output = lpm(&project)
+        .args(["setup", "ci", "github-actions"])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty());
+}
+
+#[test]
+fn ci_setup_gitlab_prints_a_copyable_yaml_job() {
+    let project = TempProject::empty(r#"{"name":"ci-yaml"}"#);
+    let output = lpm(&project)
+        .args(["setup", "ci", "gitlab"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    assert!(String::from_utf8_lossy(&output.stdout).contains("\ndeploy:\n  id_tokens:"));
 }
