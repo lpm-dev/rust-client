@@ -151,14 +151,8 @@ impl ManagedRuntimeInventory {
                 continue;
             }
             let installed = self.installed(runtime.runtime)?;
-            let matched = match runtime.runtime {
-                lpm_runtime::detect::RuntimeKind::Node => {
-                    lpm_runtime::node::find_matching_installed(&runtime.spec, installed)
-                }
-                lpm_runtime::detect::RuntimeKind::Bun => {
-                    lpm_runtime::bun::find_matching_installed(&runtime.spec, installed)
-                }
-            };
+            let matched =
+                lpm_runtime::find_matching_installed(runtime.runtime, &runtime.spec, installed);
             let Some(version) = matched else {
                 continue;
             };
@@ -388,14 +382,9 @@ fn detect_one_managed_runtime_bin(
     }
     let (matched, bin_dir) = match detected.runtime {
         lpm_runtime::detect::RuntimeKind::Node => {
-            let spec = detected
-                .spec
-                .trim_start_matches(">=")
-                .trim_start_matches("^")
-                .trim_start_matches("~")
-                .trim_start_matches('>');
             let installed = lpm_runtime::node::list_installed().ok()?;
-            let matched = lpm_runtime::node::find_matching_installed(spec, &installed)?;
+            let matched =
+                lpm_runtime::find_matching_installed(detected.runtime, &detected.spec, &installed)?;
             let bin_dir = lpm_runtime::node::node_bin_dir(&matched).ok()?;
             (matched, bin_dir)
         }

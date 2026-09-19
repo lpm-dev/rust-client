@@ -361,7 +361,9 @@ fn list_installed(runtime: detect::RuntimeKind) -> Result<Vec<String>, lpm_commo
     }
 }
 
-fn find_matching_installed(
+/// Select an installed runtime without a network request.
+/// Node channel selectors can use cached release metadata, including stale metadata.
+pub fn find_matching_installed(
     runtime: detect::RuntimeKind,
     spec: &str,
     installed: &[String],

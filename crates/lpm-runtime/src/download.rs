@@ -896,18 +896,13 @@ async fn verify_checksum(
     };
     let expected_filename = format!("node-{}-{}.{ext}", release.version, platform.node_suffix());
 
-    let expected_hash = body
-        .lines()
-        .find(|line| line.contains(&expected_filename))
-        .and_then(|line| line.split_whitespace().next())
-        .ok_or_else(|| {
-            LpmError::Network(format!(
-                "checksum not found for {expected_filename} in SHASUMS256"
-            ))
-        })?;
+    let expected_hash = checksum_from_shasums(body, &expected_filename).ok_or_else(|| {
+        LpmError::Network(format!(
+            "missing or invalid checksum for {expected_filename} in SHASUMS256"
+        ))
+    })?;
 
-    compare_checksum(expected_hash, data)?;
-    let expected_hash = expected_hash.to_ascii_lowercase();
+    compare_checksum(&expected_hash, data)?;
 
     // SHASUMS256.txt is fetched over HTTPS from nodejs.org but the
     // detached `.sig` GPG signature is NOT verified, so a CA-trusted
@@ -1002,14 +997,25 @@ fn parse_github_sha256_digest(digest: &str) -> Result<String, LpmError> {
 }
 
 fn checksum_from_shasums(body: &str, filename: &str) -> Option<String> {
-    body.lines()
-        .filter_map(|line| {
-            let mut fields = line.split_whitespace();
-            let hash = fields.next()?;
-            let name = fields.next()?.trim_start_matches('*');
-            (name == filename).then(|| hash.to_ascii_lowercase())
-        })
-        .next()
+    let mut expected: Option<&str> = None;
+    for line in body.lines() {
+        let mut fields = line.split_whitespace();
+        let (Some(hash), Some(name)) = (fields.next(), fields.next()) else {
+            continue;
+        };
+        if name.strip_prefix('*').unwrap_or(name) != filename {
+            continue;
+        }
+        if fields.next().is_some()
+            || hash.len() != 64
+            || !hash.as_bytes().iter().all(u8::is_ascii_hexdigit)
+            || expected.is_some_and(|previous| !previous.eq_ignore_ascii_case(hash))
+        {
+            return None;
+        }
+        expected = Some(hash);
+    }
+    expected.map(str::to_ascii_lowercase)
 }
 
 #[cfg(test)]
@@ -1694,6 +1700,24 @@ mod tests {
         assert!(
             err.to_string().contains("unsupported GitHub asset digest"),
             "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn checksum_manifest_rejects_conflicting_or_malformed_asset_entries() {
+        let digest = "a".repeat(64);
+        let name = "bun-linux-x64.zip";
+        for manifest in [
+            format!("{digest}  {name}\n{}  {name}\n", "b".repeat(64)),
+            format!("{digest}  {name} trailing\n"),
+            format!("{digest}  **{name}\n"),
+            format!("short  {name}\n"),
+        ] {
+            assert_eq!(checksum_from_shasums(&manifest, name), None, "{manifest}");
+        }
+        assert_eq!(
+            checksum_from_shasums(&format!("{digest}  {name}\n{digest}  *{name}\n"), name),
+            Some(digest)
         );
     }
 
