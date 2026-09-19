@@ -395,7 +395,12 @@ pub fn run_dev_script_with_envs_and_config(
         command: script_cmd,
         scripts,
         context,
-    } = resolve_script_command_with_config(project_dir, "dev", config)?;
+    } = resolve_script_command_with_config(
+        project_dir,
+        "dev",
+        config,
+        ScriptPreference::TaskCommand,
+    )?;
     let path = bin_path::build_path_with_bins_pre_resolved(project_dir, bin_hint)?;
     let loaded =
         resolve_and_load_env_with_schema_validation(project_dir, "dev", env_mode, config, false)?;
@@ -1475,9 +1480,10 @@ pub(crate) fn load_script_env_without_schema(
     .vars)
 }
 
-/// Resolve only a script command from package.json or lpm.json tasks.
+/// Resolve a development command, preferring an explicit lpm.json task command.
 pub fn script_command(project_dir: &Path, script_name: &str) -> Result<String, LpmError> {
-    resolve_script_command(project_dir, script_name).map(|resolved| resolved.command)
+    let config = lpm_json::read_lpm_json(project_dir).map_err(LpmError::Script)?;
+    script_command_with_config(project_dir, script_name, config.as_ref())
 }
 
 pub fn script_command_with_config(
@@ -1485,8 +1491,13 @@ pub fn script_command_with_config(
     script_name: &str,
     config: Option<&lpm_json::LpmJsonConfig>,
 ) -> Result<String, LpmError> {
-    resolve_script_command_with_config(project_dir, script_name, config)
-        .map(|resolved| resolved.command)
+    resolve_script_command_with_config(
+        project_dir,
+        script_name,
+        config,
+        ScriptPreference::TaskCommand,
+    )
+    .map(|resolved| resolved.command)
 }
 
 /// Resolve a script command from package.json or lpm.json tasks.
@@ -1502,18 +1513,30 @@ struct ResolvedScript {
     context: NpmScriptContext,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ScriptPreference {
+    PackageScript,
+    TaskCommand,
+}
+
 fn resolve_script_command(
     project_dir: &Path,
     script_name: &str,
 ) -> Result<ResolvedScript, LpmError> {
     let config = lpm_json::read_lpm_json(project_dir).map_err(LpmError::Script)?;
-    resolve_script_command_with_config(project_dir, script_name, config.as_ref())
+    resolve_script_command_with_config(
+        project_dir,
+        script_name,
+        config.as_ref(),
+        ScriptPreference::PackageScript,
+    )
 }
 
 fn resolve_script_command_with_config(
     project_dir: &Path,
     script_name: &str,
     lpm_config: Option<&lpm_json::LpmJsonConfig>,
+    preference: ScriptPreference,
 ) -> Result<ResolvedScript, LpmError> {
     let pkg_json_path = project_dir.join("package.json");
 
@@ -1534,23 +1557,25 @@ fn resolve_script_command_with_config(
         &std::env::current_dir()?,
     );
 
-    if let Some(command) = lpm_config
+    let task_command = lpm_config
         .and_then(|config| config.tasks.get(script_name))
-        .and_then(|task| task.command.as_ref())
+        .and_then(|task| task.command.as_ref());
+
+    if (preference == ScriptPreference::PackageScript || task_command.is_none())
+        && let Some(pkg) = &package
+        && let Some(command) = pkg.scripts.get(script_name)
     {
         return Ok(ResolvedScript {
             command: command.clone(),
-            scripts: HashMap::new(),
+            scripts: pkg.scripts.clone(),
             context,
         });
     }
 
-    if let Some(pkg) = &package
-        && let Some(cmd) = pkg.scripts.get(script_name)
-    {
+    if let Some(command) = task_command {
         return Ok(ResolvedScript {
-            command: cmd.clone(),
-            scripts: pkg.scripts.clone(),
+            command: command.clone(),
+            scripts: HashMap::new(),
             context,
         });
     }

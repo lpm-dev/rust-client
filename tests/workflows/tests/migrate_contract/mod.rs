@@ -706,6 +706,42 @@ fn verification_cannot_reuse_an_explicit_tasks_cache_for_a_different_package_scr
 }
 
 #[test]
+fn verification_runs_package_scripts_and_hooks_despite_task_overrides() {
+    for json_output in [false, true] {
+        for cache in [false, true] {
+            let project = TempProject::from_fixture("migrate-npm");
+            project.write_file(
+                "package.json",
+                &json!({"name":"verification-hooks","scripts":{
+                    "pretest":"echo pre > pre.txt",
+                    "test":"echo package > result.txt",
+                    "posttest":"echo post > post.txt"
+                }})
+                .to_string(),
+            );
+            project.write_file(
+                "lpm.json",
+                &json!({"tasks":{"test":{
+                    "command":"exit 42","cache":cache,
+                    "outputs":["result.txt"],"inputs":["package.json","lpm.json"],"cacheEnv":[]
+                }}})
+                .to_string(),
+            );
+            let mut command = lpm(&project);
+            configure_fake_node(&mut command, &project, "22.0.0");
+            command.args(["migrate", "--no-install", "--no-npmrc", "--no-ci"]);
+            if json_output {
+                command.arg("--json");
+            }
+            command.assert().success();
+            assert_eq!(project.read_file("pre.txt").trim(), "pre");
+            assert_eq!(project.read_file("result.txt").trim(), "package");
+            assert_eq!(project.read_file("post.txt").trim(), "post");
+        }
+    }
+}
+
+#[test]
 fn migration_rejects_malformed_berry_and_bun_package_rows() {
     for (filename, content) in [
         (
