@@ -869,7 +869,7 @@ pub(crate) struct UseArgs {
     #[arg(long, conflicts_with_all = ["pin", "remove"])]
     pub(crate) list: bool,
 
-    /// Pin only (skip install if already installed).
+    /// Write the project pin without downloading a runtime.
     #[arg(long, conflicts_with_all = ["list", "remove"])]
     pub(crate) pin: bool,
 

@@ -52,10 +52,6 @@ impl NodeRelease {
         self.version.strip_prefix('v').unwrap_or(&self.version)
     }
 
-    fn has_valid_version(&self) -> bool {
-        validate_exact_version(self.version_bare()).is_ok()
-    }
-
     fn dist_base_url(&self) -> String {
         std::env::var("LPM_NODE_DIST_BASE_URL")
             .ok()
@@ -232,23 +228,8 @@ pub fn list_installed() -> Result<Vec<String>, LpmError> {
 pub async fn fetch_index(client: &reqwest::Client) -> Result<Vec<NodeRelease>, LpmError> {
     let cache_path = runtimes_dir()?.join("index-cache.json");
 
-    // Check cache freshness (1 hour TTL)
-    if let Ok(meta) = std::fs::metadata(&cache_path)
-        && let Ok(modified) = meta.modified()
-    {
-        let age = std::time::SystemTime::now()
-            .duration_since(modified)
-            .unwrap_or_default();
-        if age.as_secs() < 3600
-            && let Ok(Some(content)) = lpm_common::read_capped_state_file(
-                &cache_path,
-                lpm_common::STATE_FILE_SIZE_CAP_BYTES,
-            )
-            && let Ok(releases) = serde_json::from_slice::<Vec<NodeRelease>>(&content)
-        {
-            tracing::debug!("using cached node index ({} releases)", releases.len());
-            return Ok(releases);
-        }
+    if let Some(releases) = read_cached_index(false) {
+        return Ok(releases);
     }
 
     // Fetch fresh index
@@ -287,80 +268,97 @@ pub async fn fetch_index(client: &reqwest::Client) -> Result<Vec<NodeRelease>, L
     Ok(releases)
 }
 
-/// Validate a version spec string against injection attacks.
-///
-/// Allows alphanumeric characters plus semver operators and whitespace:
-/// digits, letters, `.`, `*`, `_`, `^`, `~`, `>`, `=`, `<`, `|`, `-`, ` `.
-/// Rejects empty specs, null bytes, shell metacharacters, and path traversal.
+fn read_cached_index(allow_stale: bool) -> Option<Vec<NodeRelease>> {
+    let cache_path = runtimes_dir().ok()?.join("index-cache.json");
+    let modified = std::fs::metadata(&cache_path).ok()?.modified().ok()?;
+    if !allow_stale
+        && std::time::SystemTime::now()
+            .duration_since(modified)
+            .unwrap_or_default()
+            .as_secs()
+            >= 3600
+    {
+        return None;
+    }
+    let bytes =
+        lpm_common::read_capped_state_file(&cache_path, lpm_common::STATE_FILE_SIZE_CAP_BYTES)
+            .ok()??;
+    serde_json::from_slice(&bytes).ok()
+}
+
+pub(crate) fn find_matching_cached_channel(spec: &str, installed: &[String]) -> Option<String> {
+    if spec.trim().eq_ignore_ascii_case("latest") {
+        return find_matching_installed("*", installed);
+    }
+    if !is_channel_spec(spec) {
+        return None;
+    }
+    let mut releases = read_cached_index(true)?;
+    let installed: std::collections::HashSet<_> = installed.iter().map(String::as_str).collect();
+    releases.retain(|release| installed.contains(release.version_bare()));
+    resolve_version(&releases, spec).map(|release| release.version_bare().to_owned())
+}
+
+/// Validate an explicit runtime selector before lookup or persistence.
 pub fn validate_version_spec(spec: &str) -> Result<(), LpmError> {
-    if spec.is_empty() {
-        return Err(LpmError::Script("version spec must not be empty".into()));
+    let valid = !spec.chars().any(char::is_control)
+        && (is_channel_spec(spec)
+            || lpm_semver::StrictVersionReq::parse(spec).is_ok_and(|range| !range.is_empty()));
+    if !valid {
+        return Err(LpmError::Script(format!(
+            "invalid runtime version selector '{spec}'"
+        )));
     }
-
-    for ch in spec.chars() {
-        if !matches!(ch,
-            'a'..='z' | 'A'..='Z' | '0'..='9'
-            | '.' | '*' | '_' | '^' | '~'
-            | '>' | '=' | '<' | '|' | '-' | ' '
-        ) {
-            return Err(LpmError::Script(format!(
-                "invalid character '{}' in version spec \"{}\". \
-				 Only alphanumeric characters and semver operators (. * _ ^ ~ > = < | -) are allowed.",
-                ch, spec
-            )));
-        }
-    }
-
     Ok(())
 }
 
-/// Resolve a version spec (e.g., "22", "22.5", "22.5.0", "lts") to an exact version.
-///
-/// Returns `None` if the spec doesn't match any release.
-/// The spec is validated before processing; invalid specs return `None` (with a warning logged).
+pub fn is_channel_spec(spec: &str) -> bool {
+    let spec = spec.trim();
+    spec.eq_ignore_ascii_case("latest")
+        || spec.eq_ignore_ascii_case("lts")
+        || lts_codename(spec).is_some()
+}
+
+fn lts_codename(spec: &str) -> Option<&str> {
+    let (channel, name) = spec.split_once('/')?;
+    (channel.eq_ignore_ascii_case("lts")
+        && (name == "*" || (!name.is_empty() && name.bytes().all(|b| b.is_ascii_alphabetic()))))
+    .then_some(name)
+}
+
+/// Resolve the highest release that satisfies a version selector or Node channel.
 pub fn resolve_version(releases: &[NodeRelease], spec: &str) -> Option<NodeRelease> {
-    if let Err(e) = validate_version_spec(spec) {
-        tracing::warn!("invalid version spec: {e}");
-        return None;
-    }
-
-    let spec = spec.strip_prefix('v').unwrap_or(spec);
-
-    // "lts" -> latest LTS
-    if spec.eq_ignore_ascii_case("lts") {
-        return releases
-            .iter()
-            .find(|release| release.lts.is_lts() && release.has_valid_version())
-            .cloned();
-    }
-
-    // "latest" -> latest release
-    if spec.eq_ignore_ascii_case("latest") {
-        return releases
-            .iter()
-            .find(|release| release.has_valid_version())
-            .cloned();
-    }
-
-    // Exact match: "22.5.0"
-    let exact_target = format!("v{spec}");
-
-    if let Some(r) = releases
-        .iter()
-        .find(|release| release.version == exact_target && release.has_valid_version())
-    {
-        return Some(r.clone());
-    }
-
-    // Partial match: "22" -> latest 22.x.x, "22.5" -> latest 22.5.x
-    let prefix = format!("v{spec}.");
+    validate_version_spec(spec).ok()?;
+    let spec = spec.trim();
+    let codename = lts_codename(spec);
+    let lts = spec.eq_ignore_ascii_case("lts") || codename.is_some();
+    let channel = is_channel_spec(spec);
+    let range = if channel {
+        None
+    } else {
+        Some(lpm_semver::StrictVersionReq::parse(spec).ok()?)
+    };
     releases
         .iter()
-        .find(|release| {
-            release.has_valid_version()
-                && (release.version.starts_with(&prefix) || release.version == exact_target)
+        .filter_map(|release| {
+            let version = lpm_semver::Version::parse(release.version_bare()).ok()?;
+            let matches = if channel {
+                version.pre_release().is_empty()
+                    && (!lts || release.lts.is_lts())
+                    && codename.is_none_or(|name| {
+                        name == "*"
+                            || release
+                                .lts
+                                .name()
+                                .is_some_and(|actual| actual.eq_ignore_ascii_case(name))
+                    })
+            } else {
+                range.as_ref().is_some_and(|range| range.matches(&version))
+            };
+            matches.then_some((release, version))
         })
-        .cloned()
+        .max_by(|(_, a), (_, b)| a.cmp(b))
+        .map(|(release, _)| release.clone())
 }
 
 /// Compare two version strings using `lpm_semver::Version` for correct semver ordering.
@@ -383,66 +381,22 @@ pub(crate) fn compare_versions(a: &str, b: &str) -> std::cmp::Ordering {
 ///
 /// Always returns the **highest** satisfying installed version, regardless of input order.
 pub fn find_matching_installed(spec: &str, installed: &[String]) -> Option<String> {
-    let spec = spec.strip_prefix('v').unwrap_or(spec);
-
-    if spec.eq_ignore_ascii_case("lts") || spec.eq_ignore_ascii_case("latest") {
-        return None;
-    }
-
-    // 1. Exact match -- only one version can match exactly.
-    if let Some(v) = installed.iter().find(|v| v.as_str() == spec) {
-        return Some(v.clone());
-    }
-
-    // 2. Range match for explicit semver requirements.
-    if is_range_spec(spec) {
-        let req = lpm_semver::VersionReq::parse(spec).ok()?;
-        return highest_matching_installed(installed, |_, version| req.matches(version));
-    }
-
-    // 3. Full semver specs are exact requirements. If the exact match wasn't found,
-    // do not silently downgrade to an older version in the same major.
-    if lpm_semver::Version::parse(spec).is_ok() {
-        return None;
-    }
-
-    // 4. Prefix match for partial versions (e.g., "22" or "22.5").
-    let prefix = format!("{spec}.");
-    highest_matching_installed(installed, |raw, _| raw.starts_with(&prefix))
-}
-
-fn highest_matching_installed<F>(installed: &[String], matches: F) -> Option<String>
-where
-    F: Fn(&str, &lpm_semver::Version) -> bool,
-{
+    let range = lpm_semver::StrictVersionReq::parse(spec).ok()?;
     installed
         .iter()
-        .filter_map(|version| {
-            lpm_semver::Version::parse(version)
-                .ok()
-                .map(|parsed| (version, parsed))
+        .filter_map(|raw| {
+            let version = lpm_semver::Version::parse(raw).ok()?;
+            range.matches(&version).then_some((raw, version))
         })
-        .filter(|(raw, parsed)| matches(raw, parsed))
         .max_by(|(_, a), (_, b)| a.cmp(b))
-        .map(|(version, _)| version.clone())
-}
-
-fn is_range_spec(spec: &str) -> bool {
-    spec.contains('>')
-        || spec.contains('<')
-        || spec.contains('^')
-        || spec.contains('~')
-        || spec.contains('|')
-        || spec.contains('*')
-        || spec.contains('=')
-        || spec.contains('x')
-        || spec.contains('X')
-        || spec.split_whitespace().count() > 1
+        .map(|(raw, _)| raw.clone())
 }
 
 /// Remove an installed Node.js version.
 pub fn uninstall(version: &str) -> Result<(), LpmError> {
     let dir = node_version_dir(version)?;
+    let _lock =
+        lpm_common::acquire_single_file_exclusive_lock(download::runtime_install_lock_path(&dir)?)?;
     if dir.exists() {
         std::fs::remove_dir_all(&dir)?;
     }
@@ -452,6 +406,35 @@ pub fn uninstall(version: &str) -> Result<(), LpmError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn managed_node_selectors_reject_garbage_and_contradictions() {
+        for spec in ["22 foo", ">=22 garbage", "22 || nonsense", ">=22 <20"] {
+            assert!(validate_version_spec(spec).is_err(), "{spec}");
+        }
+    }
+
+    #[test]
+    fn node_release_selection_supports_ranges_and_ignores_index_order() {
+        let mut releases = sample_releases();
+        releases.reverse();
+        for spec in ["22", "^22", ">=22 <23", "22.X", "latest"] {
+            assert_eq!(
+                resolve_version(&releases, spec).map(|r| r.version),
+                Some("v22.5.0".to_owned()),
+                "{spec}"
+            );
+        }
+    }
+
+    #[test]
+    fn node_lts_selection_preserves_the_requested_codename() {
+        let releases = sample_releases();
+        assert_eq!(
+            resolve_version(&releases, "lts/hydrogen").map(|r| r.version),
+            Some("v18.20.4".into())
+        );
+    }
 
     fn sample_releases() -> Vec<NodeRelease> {
         vec![
