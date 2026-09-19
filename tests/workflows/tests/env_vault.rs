@@ -22,6 +22,45 @@ use support::{TempProject, lpm, write_private_file};
 use wiremock::matchers::{header, method, path, query_param};
 use wiremock::{Mock, Request, Respond, ResponseTemplate};
 
+#[tokio::test]
+async fn env_remote_actions_reject_unintended_scope_before_network_access() {
+    let cases: &[&[&str]] = &[
+        &["unpair", "--org=acme"],
+        &["log", "--env=production"],
+        &["diff", "default", "staging", "production"],
+        &["diff", "--org", "acme"],
+    ];
+    let mut failures = Vec::new();
+    for args in cases {
+        let project = TempProject::empty(r#"{"name":"env-remote-arguments"}"#);
+        let mock = MockRegistry::start().await;
+        write_personal_bound_manifest(&project, &mock.url(), "env-argument-project");
+        seed_sessions(
+            project.home(),
+            &[SessionSeed {
+                registry_url: &mock.url(),
+                access_token: Some("session-access-token"),
+                refresh_token: Some("refresh-token"),
+                session_access_expires_at: Some("2030-01-01T00:00:00Z"),
+            }],
+        );
+        let output = lpm(&project)
+            .env("LPM_REGISTRY_URL", mock.url())
+            .args(["--json", "env"])
+            .args(*args)
+            .output()
+            .unwrap();
+        let requests = mock.server().received_requests().await.unwrap();
+        if output.status.success() || !requests.is_empty() {
+            failures.push((args.join(" "), output.status.code(), requests.len()));
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "invalid arguments reached an operation: {failures:?}"
+    );
+}
+
 const TEST_OIDC_POLICY_ID_2: &str = "22222222-2222-4222-8222-222222222222";
 
 fn write_personal_bound_manifest(project: &TempProject, registry_url: &str, vault_id: &str) {

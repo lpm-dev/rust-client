@@ -1,5 +1,6 @@
 //! `lpm env` command dispatcher and domain modules.
 
+mod arguments;
 pub(crate) mod auth;
 mod ci;
 mod github;
@@ -35,97 +36,127 @@ use lpm_registry::RegistryClient;
 /// (`push --to <platform>`, `pull --from <platform>`, `connect`,
 /// `status`), and OIDC policies (`oidc allow`, `oidc list`, `oidc pull`).
 ///
-/// The `Env` clap variant captures everything after `lpm env` as `extra`
-/// (trailing_var_arg), so this function re-parses raw argv to dispatch
-/// on the subcommand.
+/// Dispatch the arguments captured by the CLI parser.
 pub async fn run(
     client: &RegistryClient,
     project_dir: &std::path::Path,
+    extra: &[String],
     json_output: bool,
 ) -> Result<(), LpmError> {
-    let raw_args: Vec<String> = std::env::args().collect();
-    let cmd_pos = raw_args.iter().position(|a| a == "env");
-    let args: Vec<&str> = match cmd_pos {
-        Some(pos) => raw_args[pos + 1..].iter().map(|s| s.as_str()).collect(),
-        None => vec![],
-    };
-
+    let args: Vec<&str> = extra.iter().map(String::as_str).collect();
     if args.is_empty() {
-        local::vars_list(project_dir, None, false, json_output)?;
-        return Ok(());
+        return local::env_list(None, false, project_dir, json_output);
+    }
+    if let Some(action) = arguments::parse(&args)? {
+        use arguments::LocalAction;
+        return match action {
+            LocalAction::Set {
+                environment,
+                assignments,
+            } => local::env_set(
+                environment.env.as_deref(),
+                &assignments,
+                project_dir,
+                json_output,
+            ),
+            LocalAction::Get {
+                environment,
+                key,
+                reveal,
+            } => local::env_get(
+                environment.env.as_deref(),
+                &key,
+                reveal,
+                project_dir,
+                json_output,
+            ),
+            LocalAction::List {
+                environment,
+                reveal,
+            } => local::env_list(environment.env.as_deref(), reveal, project_dir, json_output),
+            LocalAction::Delete { environment, keys } => {
+                local::env_delete(environment.env.as_deref(), &keys, project_dir, json_output)
+            }
+            LocalAction::Import {
+                environment,
+                file,
+                overwrite,
+            } => local::env_import(
+                environment.env.as_deref(),
+                &file,
+                overwrite,
+                project_dir,
+                json_output,
+            ),
+            LocalAction::Export {
+                environment,
+                file,
+                ci,
+            } => local::env_export(
+                environment.env.as_deref(),
+                &file,
+                ci,
+                project_dir,
+                json_output,
+            ),
+            LocalAction::Print {
+                environment,
+                format,
+                schema_only,
+                ci,
+            } => schema::vars_print(
+                environment.env.as_deref(),
+                format,
+                schema_only,
+                ci,
+                project_dir,
+                json_output,
+            ),
+            LocalAction::Example { environment } => {
+                schema::vars_example(project_dir, environment.env.as_deref(), json_output)
+            }
+            LocalAction::Check => schema::vars_check(project_dir, json_output),
+            LocalAction::Validate { strict } => {
+                schema::vars_validate(project_dir, strict, json_output)
+            }
+            LocalAction::Init { force } => inventory::vars_init(project_dir, force, json_output),
+            LocalAction::Ls => inventory::vars_ls(project_dir, json_output),
+            LocalAction::Log => remote::env_log(client, project_dir, json_output).await,
+            LocalAction::Unpair => pairing::env_unpair(client, json_output).await,
+            LocalAction::Diff { environments } => {
+                let environments: Vec<&str> = environments.iter().map(String::as_str).collect();
+                remote::vars_diff(client, &environments, project_dir, json_output).await
+            }
+            LocalAction::Copy {
+                source,
+                target,
+                overwrite,
+            } => inventory::vars_copy(project_dir, &source, &target, overwrite, json_output),
+        };
     }
 
     match args[0] {
-        "set" => local::env_set(&args[1..], project_dir, json_output)?,
-        "get" => local::env_get(&args[1..], project_dir, json_output)?,
-        "list" => local::env_list(&args[1..], project_dir, json_output)?,
-        "delete" => local::env_delete(&args[1..], project_dir, json_output)?,
-        "import" => local::env_import(&args[1..], project_dir, json_output)?,
-        "export" => local::env_export(&args[1..], project_dir, json_output)?,
-        "push" => return push::vars_push(client, &args, project_dir, json_output).await,
-        "pull" => return pull::vars_pull(client, &args, project_dir, json_output).await,
-        "log" => return remote::env_log(client, project_dir, json_output).await,
-        "share" => return remote::env_share(client, &args, project_dir, json_output).await,
+        "push" => push::vars_push(client, &args, project_dir, json_output).await,
+        "pull" => pull::vars_pull(client, &args, project_dir, json_output).await,
+        "share" => remote::env_share(client, &args, project_dir, json_output).await,
         "rotate-key" => {
-            return rotation::env_rotate_key(client, &args[1..], project_dir, json_output).await;
+            rotation::env_rotate_key(client, &args[1..], project_dir, json_output).await
         }
-        "rotate-sharing-key" => {
-            return rotation::env_rotate_sharing_key(client, &args, json_output).await;
-        }
+        "rotate-sharing-key" => rotation::env_rotate_sharing_key(client, &args, json_output).await,
         "list-remote" | "ls-remote" => {
             let org_flag = remote::parse_list_remote_org_slug(&args)?;
-            return remote::vars_list_remote(client, org_flag, json_output).await;
+            remote::vars_list_remote(client, org_flag, json_output).await
         }
-        "diff" => return remote::vars_diff(client, &args[1..], project_dir, json_output).await,
-        "validate" => {
-            let strict = args.contains(&"--strict");
-            return schema::vars_validate(project_dir, strict, json_output);
-        }
-        "example" => {
-            let (env_input, _remaining) = local::parse_env_flag(&args[1..])?;
-            return schema::vars_example(project_dir, env_input, json_output);
-        }
-        "print" => return schema::vars_print(&args[1..], project_dir),
-        "check" => return schema::vars_check(project_dir, json_output),
-        "connect" => {
-            return platform::vars_connect(client, &args[1..], project_dir, json_output).await;
-        }
-        "oidc" => return oidc::vars_oidc(client, &args[1..], project_dir, json_output).await,
+        "connect" => platform::vars_connect(client, &args[1..], project_dir, json_output).await,
+        "oidc" => oidc::vars_oidc(client, &args[1..], project_dir, json_output).await,
         "status" => {
-            return platform::vars_platform_status(client, &args[1..], project_dir, json_output)
-                .await;
+            platform::vars_platform_status(client, &args[1..], project_dir, json_output).await
         }
-        "pair" => return pairing::env_pair(client, &args[1..], json_output).await,
-        "unpair" => return pairing::env_unpair(client, json_output).await,
-        "init" => {
-            let force = args.contains(&"--force");
-            return inventory::vars_init(project_dir, force, json_output);
-        }
-        "ls" => return inventory::vars_ls(project_dir, json_output),
-        "copy" | "cp" => {
-            let remaining = &args[1..];
-            if remaining.len() < 2 {
-                return Err(LpmError::Script(
-                    "usage: lpm env copy <source-env> <target-env> [--overwrite]".into(),
-                ));
-            }
-            let overwrite = remaining.contains(&"--overwrite");
-            let envs: Vec<&&str> = remaining.iter().filter(|a| **a != "--overwrite").collect();
-            if envs.len() < 2 {
-                return Err(LpmError::Script(
-                    "usage: lpm env copy <source-env> <target-env> [--overwrite]".into(),
-                ));
-            }
-            return inventory::vars_copy(project_dir, envs[0], envs[1], overwrite, json_output);
-        }
-        unknown => {
-            return Err(LpmError::Script(format!(
-                "unknown env action: '{unknown}'. Available: set, get, list, delete, import, export, push, pull, diff, validate, example, print, check, connect, status, log, share, rotate-key, rotate-sharing-key, pair, unpair, init, ls, copy"
-            )));
-        }
+        "pair" => pairing::env_pair(client, &args[1..], json_output).await,
+        unknown => Err(LpmError::Script(format!(
+            "unknown env action: '{unknown}'. Available: set, get, list, delete, import, export, push, pull, diff, validate, example, print, check, connect, status, log, share, rotate-key, rotate-sharing-key, pair, unpair, init, ls, copy"
+        ))),
     }
-
-    Ok(())
 }
 
 #[cfg(test)]

@@ -14,12 +14,14 @@ pub(super) fn emit_project_env_for_ci(
     project_dir: &Path,
     env_mode: Option<&str>,
     destination: CiEnvDestination<'_>,
+    json_output: bool,
 ) -> Result<(), LpmError> {
     let format = match destination {
         CiEnvDestination::Stdout => detect_ci_format(),
         CiEnvDestination::DotenvFile(_) => lpm_env::PrintFormat::Dotenv,
     };
-    let env_vars = lpm_runner::dotenv::load_project_env(project_dir, env_mode)?;
+    let (resolved_env, _) = super::local::resolve_env_from_flag(env_mode, project_dir)?;
+    let env_vars = lpm_runner::dotenv::load_project_env(project_dir, resolved_env.as_deref())?;
     let secret_keys = secret_keys(project_dir)?;
     let output = lpm_env::format_env(&env_vars, format, &secret_keys);
 
@@ -33,20 +35,20 @@ pub(super) fn emit_project_env_for_ci(
             ));
         }
         CiEnvDestination::DotenvFile(file) => {
-            std::fs::write(file, &output)
-                .map_err(|e| LpmError::Script(format!("failed to write {file}: {e}")))?;
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                if let Err(e) =
-                    std::fs::set_permissions(file, std::fs::Permissions::from_mode(0o600))
-                {
-                    tracing::warn!(
-                        path = %file,
-                        error = %e,
-                        "failed to set 0o600 on ci env output file; secrets may be readable by other local uids",
-                    );
-                }
+            lpm_common::write_file_atomic_with_options(
+                &project_dir.join(file),
+                output.as_bytes(),
+                lpm_common::AtomicWriteOptions::new()
+                    .unix_mode(0o600)
+                    .sync_file(),
+            )
+            .map_err(|e| LpmError::Script(format!("failed to write {file}: {e}")))?;
+            if json_output {
+                println!(
+                    "{}",
+                    serde_json::json!({"success":true, "exported":env_vars.len(), "to":file, "env":resolved_env.as_deref().unwrap_or("default")})
+                );
+                return Ok(());
             }
             install_ui::done_line(crate::install_ui::terminal_line!(
                 "Wrote {} vars to {}",

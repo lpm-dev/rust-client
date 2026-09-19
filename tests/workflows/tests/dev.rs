@@ -1667,7 +1667,8 @@ fn dev_sigterm_stops_predev_and_postdev_process_trees() {
         project.write_file("hook.js", r#"
 const fs=require('fs');
 const child=require('child_process').spawn(process.execPath,['-e','setInterval(()=>{},1000)'],{stdio:'inherit'});
-fs.writeFileSync('hook-pids.json',JSON.stringify([process.pid,child.pid]));
+fs.writeFileSync('hook-pids.tmp',JSON.stringify([process.pid,child.pid]));
+fs.renameSync('hook-pids.tmp','hook-pids.json');
 setInterval(()=>{},1000);
 "#);
         let mut command = lpm_spawnable(&project);

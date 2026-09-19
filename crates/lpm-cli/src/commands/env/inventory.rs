@@ -85,7 +85,7 @@ fn perform_init_actions(
     })
 }
 
-/// `lpm env init` — interactive environment setup.
+/// `lpm env init` imports configured environments without a prompt.
 ///
 /// Detects lpm.json config, scans for .env files, imports each into
 /// the correct vault environment, and creates empty envs for configured

@@ -378,18 +378,8 @@ fn parse_env_str_with_case_policy(
 
         let raw_value = trimmed[eq_pos + 1..].trim();
 
-        // Check for multiline double-quoted value: starts with `"` but doesn't end with `"`
-        if raw_value.starts_with('"') && !(raw_value.len() >= 2 && raw_value.ends_with('"')) {
-            let mut value = String::with_capacity(raw_value.len());
-            value.push_str(&raw_value[1..]);
-            for line in lines.by_ref() {
-                value.push('\n');
-                if let Some(stripped) = line.strip_suffix('"') {
-                    value.push_str(stripped);
-                    break;
-                }
-                value.push_str(line);
-            }
+        if let Some(rest) = raw_value.strip_prefix('"') {
+            let value = lpm_vault::parse_double_quoted_env_value(rest, &mut lines);
             vars.insert(key, value);
         } else {
             let value = unquote(raw_value);

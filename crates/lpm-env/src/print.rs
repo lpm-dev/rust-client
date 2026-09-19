@@ -37,7 +37,7 @@ pub enum PrintFormat {
     Json,
     /// `KEY=value` — Docker `--env-file` format (no quotes, no export)
     Docker,
-    /// `::add-mask::value\necho "KEY=value" >> $GITHUB_ENV` — GitHub Actions
+    /// Shell script that masks secrets and appends values to `$GITHUB_ENV`.
     GithubActions,
 }
 
@@ -115,7 +115,7 @@ fn format_shell(vars: &[(&str, &str)]) -> String {
     output
 }
 
-fn format_dotenv(vars: &[(&str, &str)]) -> String {
+pub(crate) fn format_dotenv(vars: &[(&str, &str)]) -> String {
     let mut output = String::with_capacity(output_capacity(vars, 4));
     for (key, value) in vars {
         start_line(&mut output);
@@ -198,24 +198,15 @@ fn format_github_actions(
 ) -> String {
     let mut output = String::with_capacity(output_capacity(vars, 48));
 
-    // M39: multiline values must use the GHA `<<EOF` env-file form,
-    // not `echo "KEY=value"` which would emit multiple physical lines
-    // and let an attacker who controls a value set additional env
-    // vars. `::add-mask::` similarly does NOT support newlines —
-    // refuse to mask multiline secrets (the unmasked value would leak
-    // in logs, which is worse than refusing the secret entirely).
     for (key, value) in vars {
         if secrets.contains(*key) {
             start_line(&mut output);
-            if value.contains('\n') || value.contains('\r') {
-                let _ = write!(
-                    output,
-                    "# {key}: multiline secret — refused (::add-mask:: does not support newlines)"
-                );
-            } else {
-                output.push_str("::add-mask::");
-                output.push_str(value);
-            }
+            output.push_str("printf '%s\\n' ");
+            let escaped = value
+                .replace('%', "%25")
+                .replace('\r', "%0D")
+                .replace('\n', "%0A");
+            push_shell_quoted(&mut output, &format!("::add-mask::{escaped}"));
         }
     }
 
@@ -236,18 +227,18 @@ fn format_github_actions(
                     "# {key}: value contains internal delimiter — refused (would close the heredoc early)"
                 );
             } else {
-                output.push_str("{ echo '");
+                output.push_str("{ printf '%s\\n' '");
                 output.push_str(key);
                 output.push_str("<<");
                 output.push_str(DELIM);
-                output.push_str("'; echo ");
+                output.push_str("'; printf '%s\\n' ");
                 push_shell_quoted(&mut output, value);
-                output.push_str("; echo '");
+                output.push_str("; printf '%s\\n' '");
                 output.push_str(DELIM);
                 output.push_str("'; } >> \"$GITHUB_ENV\"");
             }
         } else {
-            output.push_str("echo '");
+            output.push_str("printf '%s\\n' '");
             output.push_str(key);
             output.push('=');
             push_single_quoted_contents(&mut output, value);
@@ -460,8 +451,8 @@ mod tests {
         let secrets: HashSet<String> = ["SECRET_KEY".to_string()].into();
         let output = format_env(&vars, PrintFormat::GithubActions, &secrets);
         assert!(output.contains("::add-mask::sk_test_abc123"));
-        assert!(output.contains("echo 'SECRET_KEY=sk_test_abc123' >> \"$GITHUB_ENV\""));
-        assert!(output.contains("echo 'PUBLIC=hello' >> \"$GITHUB_ENV\""));
+        assert!(output.contains("printf '%s\\n' 'SECRET_KEY=sk_test_abc123' >> \"$GITHUB_ENV\""));
+        assert!(output.contains("printf '%s\\n' 'PUBLIC=hello' >> \"$GITHUB_ENV\""));
         // PUBLIC should NOT be masked
         assert!(!output.contains("::add-mask::hello"));
     }
@@ -472,7 +463,7 @@ mod tests {
         let output = format_env(&vars, PrintFormat::GithubActions, &HashSet::new());
 
         assert!(
-            output.contains("echo 'EVIL=$(whoami) > /tmp/pwned' >> \"$GITHUB_ENV\""),
+            output.contains("printf '%s\\n' 'EVIL=$(whoami) > /tmp/pwned' >> \"$GITHUB_ENV\""),
             "github-actions output must shell-quote env assignments: {output}"
         );
     }
@@ -527,11 +518,6 @@ mod tests {
         );
     }
 
-    /// GitHub Actions newline values use the heredoc `<<EOF`
-    /// envelope shape (not the unsafe `echo "KEY=value"` form),
-    /// and `::add-mask::` for multiline secrets is refused entirely
-    /// — masking newlines doesn't work and unmasked secrets would
-    /// leak in logs.
     #[test]
     fn github_actions_uses_heredoc_for_multiline_value() {
         let vars = make_vars(&[("KEY", "line1\nline2")]);
@@ -543,14 +529,14 @@ mod tests {
     }
 
     #[test]
-    fn github_actions_refuses_multiline_secret_mask() {
+    fn github_actions_escapes_multiline_secret_mask() {
         let vars = make_vars(&[("SECRET", "line1\nline2")]);
         let mut secrets = HashSet::new();
         secrets.insert("SECRET".to_string());
         let output = format_env(&vars, PrintFormat::GithubActions, &secrets);
         assert!(
-            output.contains("# SECRET: multiline secret — refused"),
-            "expected refusal comment for multiline secret, got: {output}",
+            output.contains("::add-mask::line1%0Aline2"),
+            "expected escaped mask for multiline secret, got: {output}",
         );
     }
 }

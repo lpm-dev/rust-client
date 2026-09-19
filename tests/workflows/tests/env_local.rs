@@ -13,6 +13,305 @@ mod support;
 use support::{TempProject, lpm};
 
 #[test]
+fn env_assignment_errors_do_not_print_secret_values() {
+    let project = TempProject::empty(r#"{"name":"env-private-errors"}"#);
+    for assignment in ["BAD-NAME=private-fixture-value", "private-fixture-value"] {
+        let output = lpm(&project)
+            .args(["env", "set", assignment, "--json"])
+            .output()
+            .unwrap();
+        assert!(!output.status.success());
+        for bytes in [&output.stdout, &output.stderr] {
+            assert!(
+                !String::from_utf8_lossy(bytes).contains("private-fixture-value"),
+                "assignment error exposed its value"
+            );
+        }
+        assert!(!project.path().join("lpm.json").exists());
+    }
+}
+
+#[test]
+fn env_set_rejects_partial_assignments_before_writing_the_vault() {
+    let project = TempProject::empty(r#"{"name":"env-assignment-validation"}"#);
+    let output = lpm(&project)
+        .args(["env", "set", "GOOD=fixture-only", "NOT_AN_ASSIGNMENT"])
+        .output()
+        .unwrap();
+    assert!(!output.status.success(), "malformed assignments must fail");
+    assert!(!project.path().join("lpm.json").exists());
+}
+
+#[test]
+fn env_local_arguments_reject_unknown_flags_and_extra_operands() {
+    let cases: &[&[&str]] = &[
+        &["list", "--unknown"],
+        &["get", "GOOD", "EXTRA", "--reveal"],
+        &["print", "--en=staging"],
+        &["print", "--env"],
+        &["print", "--format"],
+        &["print", "--env="],
+        &["list", "--env=staging", "--env=default"],
+        &["import", ".env", "extra.env"],
+        &["export", "out.env", "extra.env"],
+        &["init", "--unknown"],
+        &["ls", "--env=staging"],
+        &["check", "--env=staging"],
+        &["validate", "--unknown"],
+        &["example", "--unknown"],
+        &["copy", "default", "staging", "production"],
+    ];
+    let mut accepted = Vec::new();
+    for args in cases {
+        let project = TempProject::empty(r#"{"name":"env-argument-validation"}"#);
+        project.write_file(".env", "GOOD=fixture-only\n");
+        project.write_file(".env.example", "GOOD=\n");
+        project.write_file("lpm.json", r#"{"envSchema":{"vars":{"GOOD":{}}}}"#);
+        lpm(&project)
+            .args(["env", "set", "GOOD=fixture-only"])
+            .assert()
+            .success();
+        let output = lpm(&project).arg("env").args(*args).output().unwrap();
+        if output.status.success() {
+            accepted.push(args.join(" "));
+        }
+    }
+    assert!(
+        accepted.is_empty(),
+        "accepted invalid arguments: {accepted:?}"
+    );
+}
+
+#[test]
+fn env_trailing_json_applies_to_success_and_error_output() {
+    let project = TempProject::empty(r#"{"name":"env-trailing-json"}"#);
+    lpm(&project)
+        .args(["env", "set", "GOOD=fixture-only"])
+        .assert()
+        .success();
+    let output = lpm(&project)
+        .args(["env", "list", "--json"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let value = parse_json_stdout(&output, "env list --json");
+    insta::assert_json_snapshot!(value, @r###"
+    {
+      "GOOD": "••••••••"
+    }
+    "###);
+    let error = lpm(&project)
+        .args(["env", "get", "MISSING", "--json"])
+        .output()
+        .unwrap();
+    assert!(!error.status.success());
+    assert_eq!(
+        parse_json_stdout(&error, "env get --json")["success"],
+        false
+    );
+}
+
+#[test]
+fn env_json_print_and_ci_export_report_the_resolved_environment() {
+    let project = TempProject::empty(r#"{"name":"env-json-outputs"}"#);
+    project.write_file(".env", "VALUE=fixture-only\n");
+    let printed = lpm(&project)
+        .args(["env", "print", "--json"])
+        .output()
+        .unwrap();
+    assert!(printed.status.success());
+    insta::assert_json_snapshot!(parse_json_stdout(&printed, "env print --json"), @r###"
+    {
+      "VALUE": "fixture-only"
+    }
+    "###);
+    let exported = lpm(&project)
+        .args(["env", "export", "--ci", "ci.env", "--json"])
+        .output()
+        .unwrap();
+    assert!(exported.status.success());
+    insta::assert_json_snapshot!(parse_json_stdout(&exported, "env export --ci --json"), @r###"
+    {
+      "success": true,
+      "exported": 1,
+      "to": "ci.env",
+      "env": "default"
+    }
+    "###);
+    assert_eq!(project.read_file("ci.env"), "VALUE=fixture-only");
+}
+
+#[test]
+fn env_dispatch_does_not_treat_a_global_flag_value_as_the_command() {
+    let project = TempProject::empty(r#"{"name":"env-token-value"}"#);
+    let output = lpm(&project)
+        .args(["--token", "env", "--json", "env", "list"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    assert_eq!(
+        parse_json_stdout(&output, "env list"),
+        serde_json::json!({})
+    );
+}
+
+#[test]
+fn bare_env_validates_project_configuration_before_listing_secrets() {
+    let project = TempProject::empty(r#"{"name":"env-bare-config"}"#);
+    project.write_file("lpm.json", "{not json");
+    let output = lpm(&project).args(["--json", "env"]).output().unwrap();
+    assert!(!output.status.success());
+    assert_eq!(parse_json_stdout(&output, "bare env")["success"], false);
+}
+
+#[cfg(unix)]
+#[test]
+fn env_ci_export_never_changes_a_linked_destination() {
+    let project = TempProject::empty(r#"{"name":"env-ci-export-link"}"#);
+    project.write_file(".env", "VALUE=fixture-only\n");
+    project.write_file("sentinel.txt", "original");
+    std::os::unix::fs::symlink("sentinel.txt", project.path().join("ci.env")).unwrap();
+    let output = lpm(&project)
+        .args(["env", "export", "--ci", "ci.env"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "export must atomically replace the link"
+    );
+    assert_eq!(project.read_file("sentinel.txt"), "original");
+}
+
+#[cfg(unix)]
+#[test]
+fn env_example_never_changes_a_linked_destination() {
+    let project = TempProject::empty(r#"{"name":"env-example-link"}"#);
+    project.write_file(
+        "lpm.json",
+        r#"{"envSchema":{"vars":{"VALUE":{"default":"fixture-only"}}}}"#,
+    );
+    project.write_file("sentinel.txt", "original");
+    std::os::unix::fs::symlink("sentinel.txt", project.path().join(".env.example")).unwrap();
+    let output = lpm(&project).args(["env", "example"]).output().unwrap();
+    assert!(
+        output.status.success(),
+        "export must atomically replace the link"
+    );
+    assert_eq!(project.read_file("sentinel.txt"), "original");
+}
+
+#[test]
+fn env_export_round_trips_multiline_values_through_project_loading() {
+    let project = TempProject::empty(r#"{"name":"env-export-round-trip"}"#);
+    let consumer = TempProject::empty(r#"{"name":"env-export-consumer"}"#);
+    let value = "first \\\"quote\\\" \\path\nsecond $literal #hash\tend";
+    lpm(&project)
+        .args(["env", "set", &format!("VALUE={value}")])
+        .assert()
+        .success();
+    lpm(&project)
+        .args(["env", "export", "export.env"])
+        .assert()
+        .success();
+    consumer.write_file(".env", &project.read_file("export.env"));
+    let output = lpm(&consumer)
+        .args(["env", "print", "--format=json"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    assert_eq!(parse_json_stdout(&output, "round trip")["VALUE"], value);
+}
+
+#[test]
+fn env_example_keeps_multiline_metadata_and_defaults_in_one_variable() {
+    let project = TempProject::empty(r#"{"name":"env-example-escaping"}"#);
+    let consumer = TempProject::empty(r#"{"name":"env-example-consumer"}"#);
+    let value = "first\nINJECTED=from-default\nlast \\\"quote\\\"";
+    project.write_file(
+        "lpm.json",
+        &serde_json::json!({"envSchema":{"vars":{"VALUE":{
+            "description":"description\nINJECTED_COMMENT=from-comment", "default":value
+        }}}})
+        .to_string(),
+    );
+    lpm(&project).args(["env", "example"]).assert().success();
+    consumer.write_file(".env", &project.read_file(".env.example"));
+    let output = lpm(&consumer)
+        .args(["env", "print", "--format=json"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    assert_eq!(
+        parse_json_stdout(&output, "example round trip"),
+        serde_json::json!({"VALUE":value})
+    );
+}
+
+#[test]
+fn env_print_rejects_missing_schema_and_conflicting_formats() {
+    let project = TempProject::empty(r#"{"name":"env-print-controls"}"#);
+    project.write_file(".env", "UNDECLARED=fixture-only\n");
+    for args in [
+        vec!["--schema-only"],
+        vec!["--ci", "--format=json"],
+        vec!["--ci", "--schema-only"],
+    ] {
+        let output = lpm(&project)
+            .args(["env", "print"])
+            .args(&args)
+            .output()
+            .unwrap();
+        assert!(
+            !output.status.success(),
+            "accepted unsupported print controls: {args:?}"
+        );
+        assert!(!String::from_utf8_lossy(&output.stdout).contains("fixture-only"));
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn env_github_output_runs_as_shell_and_masks_multiline_secrets() {
+    let project = TempProject::empty(r#"{"name":"env-github-format"}"#);
+    let value = "first%0A;$(touch injected-marker)\nsecond'\\tail";
+    project.write_file(
+        "lpm.json",
+        &serde_json::json!({"envSchema":{"vars":{"VALUE":{
+            "secret":true,"default":value
+        }}}})
+        .to_string(),
+    );
+    let output = lpm(&project)
+        .args(["env", "print", "--format=github-actions"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    project.write_file("apply.sh", &String::from_utf8(output.stdout).unwrap());
+    let applied = std::process::Command::new("sh")
+        .args(["-eu", "apply.sh"])
+        .current_dir(project.path())
+        .env("GITHUB_ENV", project.path().join("github.env"))
+        .output()
+        .unwrap();
+    assert!(
+        applied.status.success(),
+        "{}",
+        String::from_utf8_lossy(&applied.stderr)
+    );
+    let log = String::from_utf8(applied.stdout).unwrap();
+    assert!(
+        log.contains("::add-mask::first%250A;$(touch injected-marker)%0Asecond'\\tail"),
+        "{log}"
+    );
+    assert!(project.read_file("github.env").contains(value));
+    assert!(!project.path().join("injected-marker").exists());
+}
+
+#[test]
 fn env_list_and_validate_fail_closed_on_malformed_lpm_json() {
     let project = TempProject::empty(r#"{"name":"env-config-matrix","version":"1.0.0"}"#);
     project.write_file("lpm.json", "{ not valid json");

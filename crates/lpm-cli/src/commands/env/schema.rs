@@ -62,8 +62,14 @@ pub(super) fn vars_example(
     }
 
     let example_path = project_dir.join(&example_filename);
-    std::fs::write(&example_path, &content)
-        .map_err(|e| LpmError::Script(format!("failed to write {example_filename}: {e}")))?;
+    lpm_common::write_file_atomic_with_options(
+        &example_path,
+        content.as_bytes(),
+        lpm_common::AtomicWriteOptions::new()
+            .unix_mode(0o600)
+            .sync_file(),
+    )
+    .map_err(|e| LpmError::Script(format!("failed to write {example_filename}: {e}")))?;
 
     output::success_line(install_ui::terminal_line!(
         "generated {} ({} variables)",
@@ -74,62 +80,43 @@ pub(super) fn vars_example(
     Ok(())
 }
 
-pub(super) fn vars_print(args: &[&str], project_dir: &std::path::Path) -> Result<(), LpmError> {
-    // Parse --format=<fmt> and --env=<mode> and --schema-only
-    let mut format_str = "dotenv";
-    let mut env_mode: Option<&str> = None;
-    let mut schema_only = false;
-    let mut ci = false;
-
-    let mut i = 0;
-    while i < args.len() {
-        if let Some(fmt) = args[i].strip_prefix("--format=") {
-            format_str = fmt;
-        } else if args[i] == "--format" {
-            if let Some(next) = args.get(i + 1) {
-                format_str = next;
-                i += 1;
-            }
-        } else if let Some(mode) = args[i].strip_prefix("--env=") {
-            env_mode = Some(mode);
-        } else if args[i] == "--env" {
-            if let Some(next) = args.get(i + 1) {
-                env_mode = Some(next);
-                i += 1;
-            }
-        } else if args[i] == "--schema-only" {
-            schema_only = true;
-        } else if args[i] == "--ci" {
-            ci = true;
-        }
-        i += 1;
+pub(super) fn vars_print(
+    env_mode: Option<&str>,
+    format: Option<lpm_env::PrintFormat>,
+    schema_only: bool,
+    ci: bool,
+    project_dir: &std::path::Path,
+    json_output: bool,
+) -> Result<(), LpmError> {
+    if json_output && (ci || format.is_some_and(|format| format != lpm_env::PrintFormat::Json)) {
+        return Err(LpmError::Script(
+            "--json conflicts with --ci or a non-JSON --format".into(),
+        ));
     }
-
     if ci {
         return super::ci::emit_project_env_for_ci(
             project_dir,
             env_mode,
             super::ci::CiEnvDestination::Stdout,
+            false,
         );
     }
-
-    let format = lpm_env::PrintFormat::parse(format_str).ok_or_else(|| {
-        LpmError::Script(format!(
-            "unknown format: '{format_str}'. Available: {}",
-            lpm_env::PrintFormat::all_names()
-        ))
-    })?;
-
-    // Read config first so we can resolve env aliases
-    let config = lpm_runner::lpm_json::read_lpm_json(project_dir).map_err(LpmError::Script)?;
-
-    // Resolve the env mode through the canonical resolver (e.g., "dev" → "development")
-    let empty_env_map = std::collections::HashMap::new();
-    let resolved_mode = env_mode.map(|m| {
-        let env_map = config.as_ref().map_or(&empty_env_map, |c| &c.env);
-        let environments = config.as_ref().and_then(|c| c.environments.as_ref());
-        lpm_env::resolver::resolve(m, env_map, environments).canonical
+    let format = format.unwrap_or(if json_output {
+        lpm_env::PrintFormat::Json
+    } else {
+        lpm_env::PrintFormat::Dotenv
     });
+    let (resolved_mode, config) = super::local::resolve_env_from_flag(env_mode, project_dir)?;
+    if schema_only
+        && config
+            .as_ref()
+            .and_then(|config| config.env_schema.as_ref())
+            .is_none_or(|schema| schema.is_empty())
+    {
+        return Err(LpmError::Script(
+            "--schema-only requires a non-empty envSchema in lpm.json".into(),
+        ));
+    }
 
     // Use the unified loader (handles inheritance, vault, schema validation + defaults)
     let mut env_vars = lpm_runner::dotenv::load_project_env(project_dir, resolved_mode.as_deref())?;
