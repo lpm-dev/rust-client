@@ -1,0 +1,21 @@
+---
+source: tests/workflows/tests/bundle.rs
+expression: value
+---
+{
+  "success": false,
+  "packages": 1,
+  "succeeded": 0,
+  "failed": 1,
+  "duration_ms": 0,
+  "members": [
+    {
+      "name": "bundle-json",
+      "success": false,
+      "exit_code": 7,
+      "duration_ms": 0,
+      "stdout": "bundle output\n",
+      "stderr": "bundle error\n"
+    }
+  ]
+}

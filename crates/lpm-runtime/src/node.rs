@@ -434,6 +434,9 @@ fn is_range_spec(spec: &str) -> bool {
         || spec.contains('~')
         || spec.contains('|')
         || spec.contains('*')
+        || spec.contains('=')
+        || spec.contains('x')
+        || spec.contains('X')
         || spec.split_whitespace().count() > 1
 }
 
