@@ -1298,3 +1298,158 @@ fn workspace_reuses_lpm_managed_node_version_across_member_cwds() {
         "LPM-managed Node was probed more than once:\n{combined}"
     );
 }
+
+#[cfg(unix)]
+#[test]
+fn pack_reuses_installed_node_channels_without_network_lookup() {
+    for selector in ["latest", "lts", "lts/iron"] {
+        let project = TempProject::empty(
+            r#"{"name":"installed-channel-tool","devDependencies":{"tsdown":"0.23.0"}}"#,
+        );
+        install_fake_managed_node(&project, "20.18.0");
+        project.write_file(
+            "lpm.json",
+            &serde_json::json!({"runtime":{"node":selector}}).to_string(),
+        );
+        std::fs::write(
+            project.home().join(".lpm/runtimes/index-cache.json"),
+            r#"[{"version":"v20.18.0","date":"2025-01-01","lts":"Iron"}]"#,
+        )
+        .unwrap();
+        let bin = project.path().join("node_modules/.bin/tsdown");
+        std::fs::create_dir_all(bin.parent().unwrap()).unwrap();
+        std::fs::write(&bin, "#!/bin/sh\nnode --version > selected-node\n").unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        lpm(&project).args(["pack"]).assert().success();
+        assert_eq!(
+            project.read_file("selected-node").trim(),
+            "v20.18.0",
+            "selector {selector}"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn install_lifecycle_preserves_node_range_operators() {
+    let mut mismatches = Vec::new();
+    for (selector, expected) in [
+        (">=20", "v24.11.0"),
+        ("^22.1.0", "v22.13.0"),
+        (">22.12.0", "v24.11.0"),
+    ] {
+        let project = TempProject::empty(
+            r#"{"name":"lifecycle-runtime-selector","scripts":{"install":"node --version > selected-node"}}"#,
+        );
+        for version in ["20.18.0", "22.12.0", "22.13.0", "24.11.0"] {
+            install_fake_managed_node(&project, version);
+        }
+        project.write_file(
+            "lpm.json",
+            &serde_json::json!({"runtime":{"node":selector}}).to_string(),
+        );
+        lpm(&project).args(["install"]).assert().success();
+        let actual = project.read_file("selected-node");
+        if actual.trim() != expected {
+            mismatches.push(format!(
+                "{selector}: expected {expected}, got {}",
+                actual.trim()
+            ));
+        }
+    }
+    assert!(mismatches.is_empty(), "{}", mismatches.join("; "));
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn node_install_requires_exact_unambiguous_checksum_entries() {
+    use sha2::{Digest, Sha256};
+    let platform = lpm_runtime::platform::Platform::current().unwrap();
+    let archive = fake_node_archive(&platform, "99.0.0");
+    let digest = format!("{:x}", Sha256::digest(&archive));
+    let filename = format!("node-v99.0.0-{}.tar.gz", platform.node_suffix());
+    let mut accepted = Vec::new();
+    for (label, manifest) in [
+        ("valid", format!("{digest}  *{filename}\n")),
+        ("suffix", format!("{digest}  {filename}.extra\n")),
+        ("comment", format!("{digest}  other-file # {filename}\n")),
+        (
+            "conflict",
+            format!("{digest}  {filename}\n{}  {filename}\n", "00".repeat(32)),
+        ),
+    ] {
+        let server = MockServer::start().await;
+        let project = TempProject::empty(r#"{"name":"node-checksum-identity"}"#);
+        let runtimes = project.home().join(".lpm/runtimes");
+        std::fs::create_dir_all(&runtimes).unwrap();
+        std::fs::write(
+            runtimes.join("index-cache.json"),
+            r#"[{"version":"v99.0.0","date":"2099-01-01","lts":false}]"#,
+        )
+        .unwrap();
+        Mock::given(method("GET"))
+            .and(path(format!("/v99.0.0/{filename}")))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(archive.clone()))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/v99.0.0/SHASUMS256.txt"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(manifest))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let output = lpm(&project)
+            .env("LPM_NODE_DIST_BASE_URL", server.uri())
+            .args(["use", "node@99.0.0"])
+            .output()
+            .unwrap();
+        server.verify().await;
+        if label == "valid" {
+            assert!(
+                output.status.success(),
+                "valid manifest failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(runtimes.join("node/99.0.0/bin/node").is_file());
+        } else if output.status.success() {
+            accepted.push(label);
+        } else {
+            assert!(
+                !runtimes.join("node/99.0.0").exists(),
+                "invalid manifest published runtime: {label}"
+            );
+        }
+    }
+    assert!(
+        accepted.is_empty(),
+        "invalid manifests accepted: {accepted:?}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn install_lifecycle_reuses_installed_node_channels() {
+    for selector in ["latest", "lts", "lts/iron"] {
+        let project = TempProject::empty(
+            r#"{"name":"installed-channel-lifecycle","scripts":{"install":"node --version > selected-node"}}"#,
+        );
+        install_fake_managed_node(&project, "20.18.0");
+        project.write_file(
+            "lpm.json",
+            &serde_json::json!({"runtime":{"node":selector}}).to_string(),
+        );
+        std::fs::write(
+            project.home().join(".lpm/runtimes/index-cache.json"),
+            r#"[{"version":"v20.18.0","date":"2025-01-01","lts":"Iron"}]"#,
+        )
+        .unwrap();
+        lpm(&project).args(["install"]).assert().success();
+        assert_eq!(
+            project.read_file("selected-node").trim(),
+            "v20.18.0",
+            "selector {selector}"
+        );
+    }
+}
