@@ -1003,7 +1003,11 @@ function resolveTsconfigPath(specifier) {
   const targetList = Array.isArray(selected.targets) ? selected.targets : [selected.targets];
   for (const target of targetList) {
     if (typeof target !== "string") continue;
-    const substituted = target.includes("*") ? target.replace("*", selected.match.star || "") : target;
+    const star = target.indexOf("*");
+    if (star !== -1 && target.indexOf("*", star + 1) !== -1) continue;
+    const substituted = star === -1
+      ? target
+      : target.slice(0, star) + (selected.match.star || "") + target.slice(star + 1);
     const resolved = resolveCandidate(path.resolve(baseDir, substituted));
     if (resolved) return resolved;
   }

@@ -2774,3 +2774,59 @@ fn source_watch_follows_repointed_symlinks_and_their_new_external_target() {
     std::thread::sleep(Duration::from_millis(500));
     assert_eq!(count(), 3);
 }
+
+#[test]
+fn typescript_alias_substitution_preserves_literal_dollar_sequences() {
+    for name in ["$&", "$$", "$`", "$'"] {
+        let project = TempProject::empty(r#"{"name":"literal-alias","version":"1.0.0"}"#);
+        project.write_file(
+            "tsconfig.json",
+            r#"{"compilerOptions":{"paths":{"@x/*":["right/*"]}}}"#,
+        );
+        project.write_file(
+            &format!("right/{name}.ts"),
+            "export const value = 'LITERAL_OK';",
+        );
+        project.write_file(
+            "entry.ts",
+            &format!(
+                "import {{value}} from {}; console.log(value);",
+                serde_json::to_string(&format!("@x/{name}")).unwrap()
+            ),
+        );
+        let output = lpm(&project).arg("entry.ts").output().unwrap();
+        assert!(
+            output.status.success(),
+            "{name}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(String::from_utf8_lossy(&output.stdout).contains("LITERAL_OK"));
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn typescript_alias_targets_ignore_multiple_wildcards() {
+    let project = TempProject::empty(r#"{"name":"invalid-alias-target","version":"1.0.0"}"#);
+    project.write_file(
+        "tsconfig.json",
+        r#"{"compilerOptions":{"paths":{"@x/*":["wrong/*-*.ts","right/*.ts"]}}}"#,
+    );
+    project.write_file("wrong/value-*.ts", "export const value = 'WRONG_TARGET';");
+    project.write_file("right/value.ts", "export const value = 'VALID_TARGET';");
+    project.write_file(
+        "entry.ts",
+        "import {value} from '@x/value'; console.log(value);",
+    );
+    let output = lpm(&project).arg("entry.ts").output().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("VALID_TARGET"),
+        "{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+}
