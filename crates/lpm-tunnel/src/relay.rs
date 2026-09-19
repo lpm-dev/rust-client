@@ -94,7 +94,6 @@ fn accept_relay_override(raw: &str, origin: &str) -> String {
     }
     tracing::warn!(
         origin = origin,
-        override_url = %raw,
         "rejecting tunnel relay override: only wss:// (any host) or ws:// (loopback host) accepted; \
          falling back to default to avoid leaking the LPM bearer to an unexpected endpoint",
     );
@@ -103,27 +102,38 @@ fn accept_relay_override(raw: &str, origin: &str) -> String {
 
 /// Accept `wss://` overrides (any host) or `ws://` overrides only
 /// when the host is a loopback address. Anything else is refused.
-fn relay_url_is_accepted(url: &str) -> bool {
-    let (scheme, rest) = match url.split_once("://") {
-        Some(pair) => pair,
-        None => return false,
+pub(crate) fn relay_url_is_accepted(url: &str) -> bool {
+    let Ok(uri) = url.parse::<tokio_tungstenite::tungstenite::http::Uri>() else {
+        return false;
     };
-    let host_port = rest.split('/').next().unwrap_or("");
-    let host = if host_port.starts_with('[') {
-        host_port
-            .split(']')
-            .next()
-            .unwrap_or("")
-            .trim_start_matches('[')
-    } else {
-        host_port.split(':').next().unwrap_or("")
+    let Some(authority) = uri.authority() else {
+        return false;
     };
+    if authority.as_str().contains('@') || url.contains('#') {
+        return false;
+    }
+    let host = authority.host();
+    let suffix = authority
+        .as_str()
+        .strip_prefix(host)
+        .unwrap_or(authority.as_str());
+    if !suffix.is_empty()
+        && suffix
+            .strip_prefix(':')
+            .is_none_or(|port| port.parse::<u16>().is_err())
+    {
+        return false;
+    }
+    let host = host
+        .strip_prefix('[')
+        .and_then(|host| host.strip_suffix(']'))
+        .unwrap_or(host);
     if host.is_empty() {
         return false;
     }
-    match scheme.to_ascii_lowercase().as_str() {
-        "wss" => true,
-        "ws" => is_loopback_host(host),
+    match uri.scheme_str() {
+        Some("wss") => true,
+        Some("ws") => is_loopback_host(host),
         _ => false,
     }
 }
@@ -460,6 +470,21 @@ mod tests {
         assert!(relay_url_is_accepted("ws://[::1]:8787/connect"));
         assert!(!relay_url_is_accepted("ws://attacker.example/connect"));
         assert!(!relay_url_is_accepted("ws://relay.lpm.fyi/connect"));
+    }
+
+    #[test]
+    fn relay_url_rejects_userinfo_and_malformed_authorities() {
+        for url in [
+            "ws://127.0.0.1:80@remote.example/connect",
+            "ws://localhost:80@remote.example/connect",
+            "ws://[::1]:80@remote.example/connect",
+            "wss://user:password@remote.example/connect",
+            "ws://[::1]remote.example/connect",
+            "wss://relay.example/connect#fragment",
+        ] {
+            assert!(!relay_url_is_accepted(url), "accepted {url}");
+            assert_eq!(accept_relay_override(url, "test"), crate::DEFAULT_RELAY_URL);
+        }
     }
 
     #[test]

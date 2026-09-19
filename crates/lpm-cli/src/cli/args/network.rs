@@ -300,6 +300,46 @@ pub(crate) struct TunnelArgs {
     pub(crate) args: Vec<String>,
 }
 
+impl TunnelArgs {
+    pub(crate) fn validate_mode(&self) -> Result<(), lpm_common::LpmError> {
+        let start = self.action == "start" || self.action.parse::<u16>().is_ok();
+        let claims = matches!(
+            self.action.as_str(),
+            "claim" | "unclaim" | "release" | "list" | "ls"
+        );
+        for (present, allowed, flag) in [
+            (self.org.is_some(), claims, "--org"),
+            (self.tunnel_auth, start, "--tunnel-auth"),
+            (self.auto_ack, start, "--auto-ack"),
+            (self.session.is_some(), start, "--session"),
+            (self.no_inspect, start, "--no-inspect"),
+            (
+                self.inspect_port.is_some(),
+                start || self.action == "inspect",
+                "--inspect-port",
+            ),
+        ] {
+            if present && !allowed {
+                return Err(lpm_common::LpmError::Tunnel(format!(
+                    "option `{flag}` is not valid with `lpm tunnel {}`",
+                    lpm_common::sanitize_terminal_inline(&self.action)
+                )));
+            }
+        }
+        if self.no_inspect && self.inspect_port.is_some() {
+            return Err(lpm_common::LpmError::Tunnel(
+                "cannot combine `--no-inspect` and `--inspect-port`".into(),
+            ));
+        }
+        if self.domain.is_some() && matches!(self.action.as_str(), "list" | "ls" | "domains") {
+            return Err(lpm_common::LpmError::Tunnel(
+                "a domain argument is not valid with domain listing actions".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
 #[derive(Args)]
 pub(crate) struct InternalHostsFileArgs {
     /// Action: upsert, remove, or clean.

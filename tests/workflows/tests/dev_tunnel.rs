@@ -1584,6 +1584,27 @@ async fn tunnel_replay_uses_persisted_headers_and_body_and_emits_one_json_docume
 
     let port = server.address().port().to_string();
     let output = tokio::task::spawn_blocking(move || {
+        for args in [
+            vec!["--last".to_string(), "--port".to_string(), port.clone()],
+            vec!["--".to_string(), "-n".to_string(), format!("-p={port}")],
+            vec![
+                "--".to_string(),
+                "--port".to_string(),
+                port.clone(),
+                "1".to_string(),
+            ],
+        ] {
+            let output = lpm(&project)
+                .args(["--json", "tunnel", "replay"])
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
         lpm(&project)
             .args(["--json", "tunnel", "replay", "--last", "--port", &port])
             .output()
@@ -1603,7 +1624,7 @@ async fn tunnel_replay_uses_persisted_headers_and_body_and_emits_one_json_docume
     assert_eq!(envelope["status"], 204);
 
     let requests = server.received_requests().await.unwrap();
-    assert_eq!(requests.len(), 1);
+    assert_eq!(requests.len(), 4);
     assert_eq!(requests[0].method.as_str(), "POST");
     assert_eq!(requests[0].url.path(), "/webhooks/replay");
     assert_eq!(requests[0].url.query(), Some("source=sqlite"));
@@ -1693,4 +1714,99 @@ fn internal_update_check_is_hidden_from_help() {
         !stdout.contains("internal-update-check"),
         "the hidden internal-update-check subcommand must not appear in user-facing help, got:\n{stdout}",
     );
+}
+
+#[test]
+fn tunnel_rejects_inapplicable_options_before_opening_capture_history() {
+    for args in [
+        vec!["inspect", "--auto-ack"],
+        vec!["inspect", "--tunnel-auth"],
+        vec!["inspect", "--session", "ignored"],
+        vec!["inspect", "--org", "ignored"],
+        vec!["inspect", "--no-inspect"],
+        vec!["inspect", "--inspect-port", "4500"],
+        vec!["inspect", "--ui", "--json"],
+        vec!["inspect", "--ui", "--filter", "stripe"],
+        vec!["log", "--clear", "--filter", "stripe"],
+        vec!["log", "--clear", "--last", "1"],
+        vec!["replay", "1", "--last", "--port", "3000"],
+        vec!["list", "unused.example"],
+        vec!["start", "--org", "ignored"],
+        vec!["start", "--no-inspect", "--inspect-port", "4500"],
+    ] {
+        let project = TempProject::empty(r#"{"name":"tunnel","version":"1.0.0"}"#);
+        let mut command = lpm_spawnable(&project);
+        command.arg("tunnel").args(&args);
+        let output = command_output_with_deadline(command, Duration::from_secs(5));
+        let rendered = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(!output.status.success(), "accepted {args:?}: {rendered}");
+        assert!(
+            rendered.contains("not valid") || rendered.contains("cannot combine"),
+            "wrong error for {args:?}: {rendered}"
+        );
+        assert!(
+            !project.path().join(".lpm/inspector.db").exists(),
+            "created history for {args:?}"
+        );
+    }
+}
+
+#[test]
+fn tunnel_replay_requires_a_selection_before_resolving_a_target() {
+    let project = TempProject::empty(r#"{"name":"tunnel","version":"1.0.0"}"#);
+    let output = lpm(&project)
+        .args(["--json", "tunnel", "replay", "--", "--port", "3000"])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let rendered = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        rendered.contains("specify a webhook number or use --last"),
+        "{rendered}"
+    );
+    assert!(!project.path().join(".lpm/inspector.db").exists());
+}
+
+#[test]
+fn tunnel_filtered_detail_and_short_equals_flags_select_the_requested_capture() {
+    let project = TempProject::empty(r#"{"name":"tunnel","version":"1.0.0"}"#);
+    tokio::runtime::Runtime::new().unwrap().block_on(async {
+        let state = lpm_inspect::state::InspectorState::with_db(
+            3000,
+            lpm_inspect::db::InspectorDb::open(project.path()).unwrap(),
+        );
+        state
+            .push(captured_webhook("stripe", "2026-05-22T10:05:00Z", 402))
+            .await;
+        let mut other = captured_webhook("github", "2026-05-22T10:05:01Z", 500);
+        other.provider = Some(lpm_tunnel::webhook::WebhookProvider::GitHub);
+        state.push(other).await;
+        state.flush().await.unwrap();
+    });
+    for args in [
+        vec!["inspect", "--filter", "stripe", "--detail", "1"],
+        vec!["inspect", "--", "--filter=stripe", "-d=1"],
+    ] {
+        let output = lpm(&project)
+            .arg("--json")
+            .arg("tunnel")
+            .args(&args)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let detail: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(detail["id"], "stripe", "{args:?}");
+    }
 }

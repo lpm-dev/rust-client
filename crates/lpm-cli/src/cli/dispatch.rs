@@ -3058,6 +3058,7 @@ async fn async_main() -> Result<()> {
             unreachable!("privileged helpers return before normal command startup")
         }
         Commands::Tunnel(args) => {
+            args.validate_mode()?;
             let network_args::TunnelArgs {
                 action,
                 domain,
