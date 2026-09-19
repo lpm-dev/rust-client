@@ -176,7 +176,7 @@ fn ports_list_human_renders_table_and_slim_completion() {
 
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("✓ 2 declared service ports"),
+        stderr.contains("✓ 2 service ports"),
         "ports list must report a slim service-port count, got:\n{stderr}"
     );
     assert!(
@@ -837,4 +837,146 @@ fn ports_reset_json_clears_only_current_project_overrides() {
         persisted.contains(other_key) && persisted.contains("api = 4100"),
         "ports reset must preserve unrelated project overrides, got:\n{persisted}"
     );
+}
+
+#[test]
+fn ports_list_prefers_saved_assignments_and_includes_primary_host_services() {
+    let project = TempProject::empty(r#"{"name":"ports-test","version":"1.0.0"}"#);
+    project.write_file(
+        "lpm.json",
+        r#"{
+        "proxy":{"host":"app.localhost","port":9443,"httpRedirect":false},
+        "services": {
+            "saved_declared":{"command":"node server.js","port":19001},
+            "web":{"command":"node server.js","primary":true},
+            "without_host":{"command":"node server.js"},
+            "declared":{"command":"node server.js","port":19004},
+            "absent":{"command":"node server.js","readyPort":19005}
+        }
+    }"#,
+    );
+    let project_dir = project.path().canonicalize().unwrap();
+    let key = project_key(&project_dir);
+    let state = project.home().join(".lpm/ports.toml");
+    std::fs::create_dir_all(state.parent().unwrap()).unwrap();
+    std::fs::write(
+        &state,
+        format!("[{key}]\nsaved_declared=19002\nweb=19003\nwithout_host=19006\n"),
+    )
+    .unwrap();
+    let output = lpm(&project)
+        .current_dir(&project_dir)
+        .args(["ports", "--json"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let rows = value["ports"].as_array().unwrap();
+    let selected = rows
+        .iter()
+        .find(|row| row["service"] == "saved_declared")
+        .unwrap();
+    assert_eq!(selected["port"], 19002);
+    let assignments: Vec<_> = rows
+        .iter()
+        .map(|row| {
+            (
+                row["service"].as_str().unwrap(),
+                row["port"].as_u64().unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        assignments,
+        [
+            ("declared", 19004),
+            ("saved_declared", 19002),
+            ("web", 19003),
+            ("without_host", 19006)
+        ]
+    );
+    let human = lpm(&project)
+        .current_dir(&project_dir)
+        .args(["ports"])
+        .output()
+        .unwrap();
+    assert!(human.status.success());
+    let human = String::from_utf8_lossy(&human.stdout);
+    let names: Vec<_> = human
+        .lines()
+        .filter_map(|line| line.split_whitespace().next())
+        .filter(|name| ["declared", "saved_declared", "web", "without_host"].contains(name))
+        .collect();
+    assert_eq!(names, ["declared", "saved_declared", "web", "without_host"]);
+}
+
+#[test]
+fn ports_reset_rejects_unreadable_or_invalid_saved_state() {
+    for directory in [false, true] {
+        let project = TempProject::empty(r#"{"name":"ports-test","version":"1.0.0"}"#);
+        let state = project.home().join(".lpm/ports.toml");
+        std::fs::create_dir_all(state.parent().unwrap()).unwrap();
+        if directory {
+            std::fs::create_dir(&state).unwrap();
+        } else {
+            std::fs::write(&state, "[broken state").unwrap();
+        }
+        let output = lpm(&project)
+            .args(["ports", "reset", "--json"])
+            .output()
+            .unwrap();
+        assert!(
+            !output.status.success(),
+            "reset must fail for invalid state"
+        );
+        let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(value["success"], false);
+        assert!(value["error"].as_str().unwrap().contains("ports.toml"));
+        if !directory {
+            assert_eq!(std::fs::read_to_string(&state).unwrap(), "[broken state");
+        }
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn ports_reset_reports_failed_state_replacement() {
+    use std::os::unix::fs::PermissionsExt;
+    let project = TempProject::empty(r#"{"name":"ports-test","version":"1.0.0"}"#);
+    let output = lpm(&project)
+        .args(["ports", "reset", "--json"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let root = project.home().join(".lpm");
+    let state = root.join("ports.toml");
+    let key = project_key(&project.path().canonicalize().unwrap());
+    let original = format!("[{key}]\nweb=19002\n");
+    std::fs::write(&state, &original).unwrap();
+    let permissions = std::fs::metadata(&root).unwrap().permissions();
+    std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o500)).unwrap();
+    let probe = root.join("write-probe");
+    if std::fs::write(&probe, "").is_ok() {
+        std::fs::remove_file(probe).unwrap();
+        std::fs::set_permissions(&root, permissions).unwrap();
+        return;
+    }
+    let output = lpm(&project).args(["ports", "reset", "--json"]).output();
+    std::fs::set_permissions(&root, permissions).unwrap();
+    let output = output.unwrap();
+    assert!(
+        !output.status.success(),
+        "reset must not report success after a failed write"
+    );
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(value["success"], false);
+    assert!(
+        value["error"].as_str().unwrap().contains("ports.toml"),
+        "{value}"
+    );
+    assert_eq!(std::fs::read_to_string(&state).unwrap(), original);
 }

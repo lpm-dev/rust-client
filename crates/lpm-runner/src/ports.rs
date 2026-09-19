@@ -68,8 +68,8 @@ impl PortAllocation {
         write_port_override_to(&self.root.ports_toml(), project_dir, service_name, port);
     }
 
-    fn clear_overrides(&mut self, project_dir: &std::path::Path) {
-        clear_port_overrides_from(&self.root.ports_toml(), project_dir);
+    fn clear_overrides(&mut self, project_dir: &std::path::Path) -> Result<(), LpmError> {
+        clear_port_overrides_from(&self.root.ports_toml(), project_dir)
     }
 
     pub(crate) fn try_acquire_lease(&self, port: u16) -> Result<Option<PortLease>, LpmError> {
@@ -4115,26 +4115,42 @@ fn write_port_override_to(
 /// project's concurrent override update.
 pub fn clear_port_overrides(project_dir: &std::path::Path) -> Result<(), LpmError> {
     let mut allocation = PortAllocation::acquire()?;
-    allocation.clear_overrides(project_dir);
-    Ok(())
+    allocation.clear_overrides(project_dir)
 }
 
-fn clear_port_overrides_from(path: &std::path::Path, project_dir: &std::path::Path) {
+fn clear_port_overrides_from(path: &Path, project_dir: &Path) -> Result<(), LpmError> {
     let content =
         match lpm_common::read_text_file_capped(path, lpm_common::CONFIG_FILE_SIZE_CAP_BYTES) {
-            Ok(c) => c,
-            Err(_) => return,
+            Ok(content) => content,
+            Err(lpm_common::BoundedReadError::NotFound { .. }) => return Ok(()),
+            Err(error) => {
+                return Err(LpmError::Script(format!(
+                    "read saved port state {}: {error}",
+                    path.display()
+                )));
+            }
         };
-
-    let mut doc: toml::value::Table = match content.parse::<toml::Value>() {
-        Ok(v) => v.try_into().unwrap_or_default(),
-        Err(_) => return,
-    };
-
-    let project_key = project_hash(project_dir);
-    doc.remove(&project_key);
-
-    atomic_write_toml(path, &doc);
+    let mut doc: toml::value::Table = toml::from_str(&content).map_err(|error| {
+        LpmError::Script(format!(
+            "parse saved port state {}: {error}",
+            path.display()
+        ))
+    })?;
+    if doc.remove(&project_hash(project_dir)).is_none() {
+        return Ok(());
+    }
+    let content = toml::to_string_pretty(&doc).map_err(|error| {
+        LpmError::Script(format!(
+            "serialize saved port state {}: {error}",
+            path.display()
+        ))
+    })?;
+    lpm_common::write_file_atomic(path, content).map_err(|error| {
+        LpmError::Script(format!(
+            "write saved port state {}: {error}",
+            path.display()
+        ))
+    })
 }
 
 /// Atomically write a TOML table to a file via tempfile + rename.
@@ -5716,7 +5732,7 @@ tcp4 0 0 127.0.0.1.60000 127.0.0.1.443 ESTABLISHED 1 2 3 4 node:99 00100\n",
         allocation.write_override(&project_dir, "web", 4001);
         allocation.write_override(&other_project_dir, "api", 5000);
 
-        allocation.clear_overrides(&project_dir);
+        allocation.clear_overrides(&project_dir).unwrap();
 
         assert!(allocation.read_overrides(&project_dir).is_empty());
         assert_eq!(allocation.read_overrides(&other_project_dir)["api"], 5000);
@@ -5731,7 +5747,7 @@ tcp4 0 0 127.0.0.1.60000 127.0.0.1.443 ESTABLISHED 1 2 3 4 node:99 00100\n",
             PortAllocation::acquire_for_root_and_lease_dir(root.clone(), tmp.path().join("leases"))
                 .unwrap();
 
-        allocation.clear_overrides(&project_dir);
+        allocation.clear_overrides(&project_dir).unwrap();
 
         assert!(!root.ports_toml().exists());
     }
