@@ -57,12 +57,17 @@ pub fn generate(schema: &EnvSchema) -> String {
         }
 
         if !parts.is_empty() {
-            output.push_str(&format!("# {}\n", parts.join(" · ")));
+            for line in parts.join(" · ").lines() {
+                output.push_str("# ");
+                output.push_str(line);
+                output.push('\n');
+            }
         }
 
         // Value line: KEY=default_or_empty
         let value = rule.default.as_deref().unwrap_or("");
-        output.push_str(&format!("{key}={value}\n"));
+        output.push_str(&crate::print::format_dotenv(&[(key.as_str(), value)]));
+        output.push('\n');
 
         // Blank line between entries (except after last)
         if i < keys.len() - 1 {

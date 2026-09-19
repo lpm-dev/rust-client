@@ -2066,11 +2066,10 @@ async fn async_main() -> Result<()> {
         },
         Commands::Env(args) => {
             let network_args::EnvArgs {
-                extra: _,
+                extra,
             } = args;
-            // Subcommand args are re-parsed from raw argv inside run().
             let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
-            commands::env::run(&client, &cwd, cli.json).await
+            commands::env::run(&client, &cwd, &extra, cli.json).await
         },
         Commands::Run(args) => {
             let network_args::RunArgs {

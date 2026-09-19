@@ -1,21 +1,25 @@
 use super::prelude::*;
 
 pub(super) fn env_set(
-    args: &[&str],
+    env_input: Option<&str>,
+    assignments: &[String],
     project_dir: &std::path::Path,
     json_output: bool,
 ) -> Result<(), LpmError> {
-    let (env_input, remaining) = parse_env_flag(args)?;
-    let pairs: Vec<(&str, &str)> = remaining
+    let pairs: Vec<(&str, &str)> = assignments
         .iter()
-        .filter_map(|arg| arg.split_once('='))
-        .collect();
-
-    if pairs.is_empty() {
-        return Err(LpmError::Script(
-            "usage: lpm env set [--env=<name>] KEY=VALUE [KEY2=VALUE2 ...]".into(),
-        ));
-    }
+        .map(|arg| {
+            let pair = arg
+                .split_once('=')
+                .ok_or_else(|| LpmError::Script("expected KEY=VALUE".into()))?;
+            if !lpm_env::is_valid_env_var_name(pair.0) {
+                return Err(LpmError::Script(
+                    "env keys must match [A-Za-z_][A-Za-z0-9_]*".into(),
+                ));
+            }
+            Ok(pair)
+        })
+        .collect::<Result<_, _>>()?;
 
     let (resolved_env, _config) = resolve_env_from_flag(env_input, project_dir)?;
     let env_label = resolved_env.as_deref().unwrap_or("default");
@@ -48,19 +52,12 @@ pub(super) fn env_set(
 }
 
 pub(super) fn env_get(
-    args: &[&str],
+    env_input: Option<&str>,
+    key: &str,
+    reveal: bool,
     project_dir: &std::path::Path,
     json_output: bool,
 ) -> Result<(), LpmError> {
-    let (env_input, remaining) = parse_env_flag(args)?;
-    let key = remaining
-        .iter()
-        .find(|a| **a != "--reveal")
-        .ok_or_else(|| {
-            LpmError::Script("usage: lpm env get [--env=<name>] KEY [--reveal]".into())
-        })?;
-    let reveal = remaining.contains(&"--reveal");
-
     let (resolved_env, _config) = resolve_env_from_flag(env_input, project_dir)?;
 
     let value = match &resolved_env {
@@ -73,9 +70,9 @@ pub(super) fn env_get(
         Some(value) => {
             if json_output {
                 if reveal {
-                    println!("{}", serde_json::json!({"success": true, *key: value}));
+                    println!("{}", serde_json::json!({"success": true, key: value}));
                 } else {
-                    println!("{}", serde_json::json!({"success": true, *key: "••••••••"}));
+                    println!("{}", serde_json::json!({"success": true, key: "••••••••"}));
                 }
             } else if reveal {
                 println!("{value}");
@@ -98,31 +95,23 @@ pub(super) fn env_get(
 }
 
 pub(super) fn env_list(
-    args: &[&str],
+    env_input: Option<&str>,
+    reveal: bool,
     project_dir: &std::path::Path,
     json_output: bool,
 ) -> Result<(), LpmError> {
-    let (env_input, remaining) = parse_env_flag(args)?;
-    let reveal = remaining.contains(&"--reveal");
     let (resolved_env, _config) = resolve_env_from_flag(env_input, project_dir)?;
     vars_list(project_dir, resolved_env.as_deref(), reveal, json_output)?;
     Ok(())
 }
 
 pub(super) fn env_delete(
-    args: &[&str],
+    env_input: Option<&str>,
+    keys: &[String],
     project_dir: &std::path::Path,
     json_output: bool,
 ) -> Result<(), LpmError> {
-    let (env_input, remaining) = parse_env_flag(args)?;
-    let keys: Vec<&str> = remaining.to_vec();
-
-    if keys.is_empty() {
-        return Err(LpmError::Script(
-            "usage: lpm env delete [--env=<name>] KEY [KEY2 ...]".into(),
-        ));
-    }
-
+    let keys: Vec<&str> = keys.iter().map(String::as_str).collect();
     let (resolved_env, _config) = resolve_env_from_flag(env_input, project_dir)?;
     let env_label = resolved_env.as_deref().unwrap_or("default");
 
@@ -153,18 +142,12 @@ pub(super) fn env_delete(
 }
 
 pub(super) fn env_import(
-    args: &[&str],
+    env_input: Option<&str>,
+    file: &str,
+    overwrite: bool,
     project_dir: &std::path::Path,
     json_output: bool,
 ) -> Result<(), LpmError> {
-    let (env_input, remaining) = parse_env_flag(args)?;
-    let file = remaining
-        .iter()
-        .find(|a| **a != "--overwrite")
-        .ok_or_else(|| {
-            LpmError::Script("usage: lpm env import [--env=<name>] <file> [--overwrite]".into())
-        })?;
-    let overwrite = remaining.contains(&"--overwrite");
     let path = project_dir.join(file);
 
     let (resolved_env, _config) = resolve_env_from_flag(env_input, project_dir)?;
@@ -181,7 +164,7 @@ pub(super) fn env_import(
     if json_output {
         println!(
             "{}",
-            serde_json::json!({"success": true, "imported": count, "from": *file, "env": env_label})
+            serde_json::json!({"success": true, "imported": count, "from": file, "env": env_label})
         );
     } else {
         output::success_line(install_ui::terminal_line!(
@@ -196,21 +179,18 @@ pub(super) fn env_import(
 }
 
 pub(super) fn env_export(
-    args: &[&str],
+    env_input: Option<&str>,
+    file: &str,
+    ci: bool,
     project_dir: &std::path::Path,
     json_output: bool,
 ) -> Result<(), LpmError> {
-    let ci = args.contains(&"--ci");
-    let filtered_args: Vec<&str> = args.iter().copied().filter(|arg| *arg != "--ci").collect();
-    let (env_input, remaining) = parse_env_flag(&filtered_args)?;
-    let file = remaining
-        .first()
-        .ok_or_else(|| LpmError::Script("usage: lpm env export [--env=<name>] <file>".into()))?;
     if ci {
         return super::ci::emit_project_env_for_ci(
             project_dir,
             env_input,
             super::ci::CiEnvDestination::DotenvFile(file),
+            json_output,
         );
     }
     let path = project_dir.join(file);
@@ -227,7 +207,7 @@ pub(super) fn env_export(
     if json_output {
         println!(
             "{}",
-            serde_json::json!({"success": true, "exported": count, "to": *file, "env": env_label})
+            serde_json::json!({"success": true, "exported": count, "to": file, "env": env_label})
         );
     } else {
         output::success_line(install_ui::terminal_line!(
@@ -239,40 +219,6 @@ pub(super) fn env_export(
         ));
     }
     Ok(())
-}
-
-/// Parse `--env=<name>` or `--env <name>` from args, returning the env value
-/// and the remaining args with the flag stripped.
-///
-/// Returns `Err` if `--env` is present but has no value (bare trailing `--env`).
-pub(super) fn parse_env_flag<'a>(
-    args: &'a [&'a str],
-) -> Result<(Option<&'a str>, Vec<&'a str>), LpmError> {
-    let mut env_mode = None;
-    let mut remaining = Vec::new();
-    let mut i = 0;
-    while i < args.len() {
-        if let Some(val) = args[i].strip_prefix("--env=") {
-            env_mode = Some(val);
-        } else if args[i] == "--env" {
-            match args.get(i + 1) {
-                Some(next) if !next.starts_with('-') => {
-                    env_mode = Some(*next);
-                    i += 1;
-                }
-                _ => {
-                    return Err(LpmError::Script(
-                        "--env requires a value (e.g., --env=production or --env production)"
-                            .into(),
-                    ));
-                }
-            }
-        } else {
-            remaining.push(args[i]);
-        }
-        i += 1;
-    }
-    Ok((env_mode, remaining))
 }
 
 /// Resolve an `--env` flag value to a canonical env name.

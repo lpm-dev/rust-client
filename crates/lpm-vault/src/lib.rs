@@ -1457,7 +1457,9 @@ fn merge_imported_secrets(
     imported
 }
 
-fn parse_double_quoted_env_value(value: &str, lines: &mut std::str::Lines<'_>) -> String {
+/// Decode a dotenv value after its opening double quote, consuming continuation lines.
+/// Escaped quotes and backslashes remain part of the value; the first unescaped quote closes it.
+pub fn parse_double_quoted_env_value(value: &str, lines: &mut std::str::Lines<'_>) -> String {
     let mut decoded = String::with_capacity(value.len());
     let mut fragment = value;
     let mut pending_escape = false;

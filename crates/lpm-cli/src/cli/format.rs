@@ -11,7 +11,21 @@ pub(super) fn parse_cli_or_exit() -> Cli {
     let json_output = argv_requests_json(&args);
     let help_hint = clap_help_hint_from_argv(&args);
     match Cli::try_parse_from(args) {
-        Ok(cli) => {
+        Ok(mut cli) => {
+            if let Some(Commands::Env(args)) = &mut cli.command {
+                let mut options = true;
+                args.extra.retain(|arg| {
+                    if arg == "--" {
+                        options = false;
+                    }
+                    if options && arg == "--json" {
+                        cli.json = true;
+                        false
+                    } else {
+                        true
+                    }
+                });
+            }
             if let Some(error) = post_parse_error(&cli) {
                 exit_with_clap_error(error, json_output, help_hint);
             }
