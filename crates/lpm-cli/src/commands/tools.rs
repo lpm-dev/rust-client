@@ -519,7 +519,7 @@ fn execute_local_runner(
 }
 
 fn local_runner_args(name: &str, base_args: &[String], forwarded_args: &[String]) -> Vec<String> {
-    let drop_vitest_run = name == "vitest" && args_imply_watch(forwarded_args);
+    let drop_vitest_run = name == "vitest" && vitest_implies_watch(forwarded_args);
     let mut args = Vec::with_capacity(base_args.len() + forwarded_args.len());
     args.extend(
         base_args
@@ -620,24 +620,41 @@ async fn run_tool_binary(
 
 /// Returns `true` if the forwarded args contain a watch-mode opt-in.
 fn enabled_watch_option(args: &[String], flags: &[&str]) -> bool {
-    args.iter().any(|arg| {
-        let (key, value) = arg.split_once('=').unwrap_or((arg.as_str(), "true"));
-        flags.contains(&key) && value != "false"
-    })
+    args.iter()
+        .take_while(|arg| arg.as_str() != "--")
+        .any(|arg| {
+            let (key, value) = arg.split_once('=').unwrap_or((arg.as_str(), "true"));
+            flags.contains(&key) && value != "false"
+        })
 }
 
 fn args_imply_watch(args: &[String]) -> bool {
     enabled_watch_option(args, &["--watch", "-w"])
 }
 
+fn vitest_implies_watch(args: &[String]) -> bool {
+    args_imply_watch(args)
+        || args
+            .iter()
+            .take_while(|arg| arg.as_str() != "--")
+            .any(|arg| {
+                let Some(short) = arg.strip_prefix('-').filter(|arg| !arg.starts_with('-')) else {
+                    return false;
+                };
+                let (flags, value) = short.split_once('=').unwrap_or((short, "true"));
+                flags.char_indices().any(|(index, flag)| {
+                    flag == 'w' && (index + 1 < flags.len() || value != "false")
+                })
+            })
+}
+
 fn runner_implies_watch(runner: &DetectedRunner, args: &[String]) -> bool {
-    if matches!(
-        &runner.invocation,
-        RunnerInvocation::LocalBin { name: "jest", .. }
-    ) {
-        enabled_watch_option(args, &["--watch", "--watchAll"])
-    } else {
-        args_imply_watch(args)
+    match &runner.invocation {
+        RunnerInvocation::LocalBin { name: "vitest", .. } => vitest_implies_watch(args),
+        RunnerInvocation::LocalBin { name: "jest", .. } => {
+            enabled_watch_option(args, &["--watch", "--watchAll"])
+        }
+        _ => args_imply_watch(args),
     }
 }
 
@@ -1209,7 +1226,10 @@ pub async fn dispatch_test_or_bench(
     // Resolve workspace target selection up-front when watch is requested,
     // so we can hand off to single-package mode for the one-member case
     // before paying the orchestrator setup cost.
-    if workspace_mode && enabled_watch_option(args, &["--watch", "-w", "--watchAll"]) {
+    if workspace_mode
+        && (enabled_watch_option(args, &["--watch", "-w", "--watchAll"])
+            || vitest_implies_watch(args))
+    {
         let workspace = lpm_workspace::discover_workspace(project_dir)
             .map_err(|e| LpmError::Script(format!("workspace error: {e}")))?
             .ok_or_else(|| {

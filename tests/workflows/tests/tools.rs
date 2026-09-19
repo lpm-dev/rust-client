@@ -9,6 +9,87 @@
 mod support;
 
 #[cfg(unix)]
+#[test]
+fn vitest_short_bundles_use_the_single_member_watch_gate() {
+    let project = TempProject::empty(r#"{"name":"watch-bundles","workspaces":["packages/*"]}"#);
+    for name in ["a", "b"] {
+        project.write_file(
+            &format!("packages/{name}/package.json"),
+            &serde_json::json!({"name":name,"devDependencies":{"vitest":"4.1.9"}}).to_string(),
+        );
+    }
+    write_unix_executable(
+        &project.path().join("node_modules/.bin/vitest"),
+        "#!/bin/sh\nprintf '%s\\n' \"$@\" > args\n",
+    );
+    for tool in ["test", "bench"] {
+        for flag in ["-uw", "-wu=false"] {
+            let output = lpm(&project)
+                .args([tool, "--all", "--", flag])
+                .output()
+                .unwrap();
+            assert!(
+                !output.status.success(),
+                "{tool} accepted {flag} for two members"
+            );
+            assert!(!project.file_exists("packages/a/args"));
+        }
+    }
+    lpm(&project)
+        .args(["test", "--all", "--", "-uw=false"])
+        .assert()
+        .success();
+    assert_eq!(project.read_file("packages/a/args"), "run\n-uw=false\n");
+}
+
+#[cfg(unix)]
+#[test]
+fn vitest_bundled_watch_removes_default_run_arguments() {
+    let project = TempProject::empty(
+        r#"{"name":"watch-bundle-single","devDependencies":{"vitest":"4.1.9"}}"#,
+    );
+    write_unix_executable(
+        &project.path().join("node_modules/.bin/vitest"),
+        "#!/bin/sh\nprintf '%s\\n' \"$@\" > args\n",
+    );
+    for (tool, expected) in [("test", "-uw\n"), ("bench", "bench\n-uw\n")] {
+        lpm(&project).args([tool, "--", "-uw"]).assert().success();
+        assert_eq!(project.read_file("args"), expected);
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn runner_separator_keeps_watch_named_operands_out_of_watch_admission() {
+    let project = TempProject::empty(r#"{"name":"watch-operands","workspaces":["packages/*"]}"#);
+    for name in ["a", "b"] {
+        project.write_file(
+            &format!("packages/{name}/package.json"),
+            &serde_json::json!({"name":name,"devDependencies":{"vitest":"4.1.9"}}).to_string(),
+        );
+    }
+    write_unix_executable(
+        &project.path().join("node_modules/.bin/vitest"),
+        "#!/bin/sh\nprintf '%s\\n' \"$@\" > args\n",
+    );
+    for (tool, expected) in [
+        ("test", "run\n--\n--watch\n"),
+        ("bench", "bench\n--run\n--\n--watch\n"),
+    ] {
+        lpm(&project)
+            .args([tool, "--all", "--", "--", "--watch"])
+            .assert()
+            .success();
+        for name in ["a", "b"] {
+            assert_eq!(
+                project.read_file(&format!("packages/{name}/args")),
+                expected
+            );
+        }
+    }
+}
+
+#[cfg(unix)]
 fn runner_lifetime_fixture(tool: &str, local: bool, workspace: bool, orphan: bool) -> TempProject {
     let project = TempProject::empty(
         r#"{"name":"runner-lifetime","private":true,"workspaces":["packages/*"]}"#,
