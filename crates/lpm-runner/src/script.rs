@@ -1165,6 +1165,16 @@ fn resolve_local_bin_path(project_dir: &Path, command_name: &str) -> Result<Path
     resolve_local_bin_path_from_dirs(command_name, &bin_dirs)
 }
 
+/// Resolve a project-local executable without searching above the project or workspace boundary.
+pub fn resolve_local_bin_path_bounded(
+    project_dir: &Path,
+    boundary: &Path,
+    command_name: &str,
+) -> Result<PathBuf, LpmError> {
+    let bin_dirs = bin_path::find_bin_dirs_bounded(project_dir, boundary)?;
+    resolve_local_bin_path_from_dirs(command_name, &bin_dirs)
+}
+
 fn resolve_local_bin_path_from_dirs(
     command_name: &str,
     bin_dirs: &[PathBuf],
@@ -1214,28 +1224,23 @@ fn is_path_like_command(command_name: &str) -> bool {
 }
 
 fn local_bin_candidate_names(command_name: &str) -> Vec<String> {
-    #[cfg(windows)]
-    {
-        let path = Path::new(command_name);
-        if path.extension().is_some() {
-            return vec![command_name.to_string()];
-        }
-        return ["cmd", "exe", "bat", ""]
-            .iter()
-            .map(|ext| {
-                if ext.is_empty() {
-                    command_name.to_string()
-                } else {
-                    format!("{command_name}.{ext}")
-                }
-            })
-            .collect();
-    }
+    local_bin_candidate_names_for_platform(command_name, cfg!(windows))
+}
 
-    #[cfg(not(windows))]
-    {
-        vec![command_name.to_string()]
+fn local_bin_candidate_names_for_platform(command_name: &str, windows: bool) -> Vec<String> {
+    if !windows || Path::new(command_name).extension().is_some() {
+        return vec![command_name.to_string()];
     }
+    ["cmd", "exe", "bat", ""]
+        .iter()
+        .map(|ext| {
+            if ext.is_empty() {
+                command_name.to_string()
+            } else {
+                format!("{command_name}.{ext}")
+            }
+        })
+        .collect()
 }
 
 #[cfg(unix)]
@@ -1751,6 +1756,14 @@ fn script_not_found_error(script_name: &str, scripts: &HashMap<String, String>) 
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn windows_local_bin_candidates_prefer_cmd_shims_over_posix_scripts() {
+        assert_eq!(
+            super::local_bin_candidate_names_for_platform("tsdown", true)[0],
+            "tsdown.cmd"
+        );
+    }
+
     use super::*;
     use crate::bin_path::ManagedRuntimeHint::Unknown;
     use std::fs;
