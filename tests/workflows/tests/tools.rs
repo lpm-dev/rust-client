@@ -26,6 +26,19 @@ fn runner_lifetime_fixture(tool: &str, local: bool, workspace: bool, orphan: boo
     } else {
         manifest["scripts"] = serde_json::json!({tool:"node runner.cjs"});
     }
+    if tool == "lint" {
+        project.write_file("lpm.json", r#"{"tools":{"oxlint":"1.0.0"}}"#);
+        project.write_file(
+            &format!("{directory}lpm.json"),
+            r#"{"tools":{"oxlint":"1.0.0"}}"#,
+        );
+        seed_fake_plugin_script(
+            &project,
+            "oxlint",
+            "1.0.0",
+            "#!/bin/sh\nexec node runner.cjs\n",
+        );
+    }
     project.write_file(&format!("{directory}package.json"), &manifest.to_string());
     project.write_file(&format!("{directory}runner.cjs"), &format!(
         "const fs=require('fs'); const child=require('child_process').spawn(process.execPath,['-e',\"setInterval(()=>require('fs').appendFileSync('heartbeat','x'),20)\"],{{stdio:'inherit'}}); fs.writeFileSync('ready',String(child.pid)); {}",
@@ -226,6 +239,16 @@ fn seed_workspace_tool_pin(project: &TempProject, tool: &str, version: &str) {
 
 #[cfg(unix)]
 fn seed_fake_plugin(project: &TempProject, plugin: &str, version: &str, marker_file: &str) {
+    seed_fake_plugin_script(
+        project,
+        plugin,
+        version,
+        &format!("#!/bin/sh\n: > {marker_file}\n"),
+    );
+}
+
+#[cfg(unix)]
+fn seed_fake_plugin_script(project: &TempProject, plugin: &str, version: &str, script: &str) {
     let platform = current_plugin_platform();
     let plugin_dir = project
         .home()
@@ -236,9 +259,7 @@ fn seed_fake_plugin(project: &TempProject, plugin: &str, version: &str, marker_f
         .join(platform);
     let bin_path = plugin_dir.join(plugin);
     let sidecar_path = plugin_dir.join(".lpm-plugin.json");
-    let script = format!("#!/bin/sh\n: > {marker_file}\n");
-
-    write_unix_executable(&bin_path, &script);
+    write_unix_executable(&bin_path, script);
 
     let hash = sha256_hex(&std::fs::read(&bin_path).expect("failed to read fake plugin binary"));
     let sidecar = serde_json::json!({
@@ -948,38 +969,18 @@ fn lint_single_package_reports_slim_completion_with_elapsed_time() {
 
 #[cfg(unix)]
 #[test]
-fn lint_malformed_lpm_json_tools_config_warns_with_slim_line() {
-    let project = TempProject::empty(r#"{"name":"slim-lint-config","version":"1.0.0"}"#);
+fn lint_malformed_lpm_json_stops_before_running_an_unpinned_tool() {
+    let project = TempProject::empty(r#"{"name":"invalid-lint-config","version":"1.0.0"}"#);
     project.write_file("lpm.json", "{");
     seed_fake_plugin(&project, "oxlint", "1.79.0", ".lint-ok");
-
-    let output = lpm(&project)
-        .args(["lint"])
-        .output()
-        .expect("failed to run lpm lint");
-
+    let output = lpm(&project).args(["--json", "lint"]).output().unwrap();
     assert!(
-        output.status.success(),
-        "lint stand-in must succeed despite malformed lpm.json\nstdout:\n{}\nstderr:\n{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr),
+        !output.status.success(),
+        "malformed tool pin must not fall back to another version"
     );
-    assert!(
-        project.file_exists(".lint-ok"),
-        "lint stand-in must execute inside the project"
-    );
-
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        stderr
-            .lines()
-            .any(|line| line.starts_with("! failed to read lpm.json tools config:")),
-        "malformed lpm.json warning must use a slim warning line, got:\n{stderr}"
-    );
-    assert!(
-        !stderr.contains("\u{1b}[33m!") && !stderr.contains("warning: failed to read lpm.json"),
-        "malformed lpm.json warning must not use the legacy raw warning label, got:\n{stderr:?}"
-    );
+    assert!(!project.file_exists(".lint-ok"));
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(value["success"], false);
 }
 
 #[cfg(unix)]
@@ -3001,5 +3002,389 @@ fn test_and_bench_keep_pre_hook_output_pipes_through_later_phases() {
                 .unwrap_or_default()
                 .contains("LATE_ERROR")
         );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn lint_workspace_inherits_root_pin_and_keeps_member_overrides_from_any_cwd() {
+    let project = TempProject::from_fixture("workspace-monorepo");
+    project.write_file("lpm.json", r#"{"tools":{"oxlint":"1.0.0"}}"#);
+    project.write_file("packages/utils/lpm.json", r#"{"tools":{"oxlint":"2.0.0"}}"#);
+    for version in ["1.0.0", "2.0.0", "1.79.0"] {
+        seed_fake_plugin_script(
+            &project,
+            "oxlint",
+            version,
+            &format!("#!/bin/sh\nprintf '{version}' > selected-version\n"),
+        );
+    }
+    for cwd in [
+        project.path().to_path_buf(),
+        project.path().join("packages/utils"),
+    ] {
+        let output = lpm(&project)
+            .current_dir(cwd)
+            .args(["--json", "lint", "--all"])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        for member in WORKSPACE_MEMBERS {
+            let expected = if member == "packages/utils" {
+                "2.0.0"
+            } else {
+                "1.0.0"
+            };
+            assert_eq!(
+                project.read_file(&format!("{member}/selected-version")),
+                expected,
+                "wrong pin for {member}"
+            );
+        }
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn lint_workspace_does_not_install_an_unused_root_version() {
+    let project = TempProject::from_fixture("workspace-monorepo");
+    seed_workspace_tool_pin(&project, "oxlint", "1.0.0");
+    project.write_file("lpm.json", r#"{"tools":{"oxlint":"not-a-valid-version"}}"#);
+    seed_fake_plugin(&project, "oxlint", "1.0.0", ".lint-ok");
+    let output = lpm(&project)
+        .args(["--json", "lint", "--all"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "unused root version blocked explicit member pins: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn lint_workspace_processes_can_reach_a_shared_barrier_concurrently() {
+    let project =
+        TempProject::empty(r#"{"name":"tool-barrier","private":true,"workspaces":["packages/*"]}"#);
+    project.write_file("lpm.json", r#"{"tools":{"oxlint":"1.0.0"}}"#);
+    let count = std::thread::available_parallelism()
+        .map_or(1, usize::from)
+        .min(4);
+    if count < 2 {
+        return;
+    }
+    for name in ["a", "b", "c", "d"].into_iter().take(count) {
+        project.write_file(
+            &format!("packages/{name}/package.json"),
+            &format!(r#"{{"name":"{name}","version":"1.0.0"}}"#),
+        );
+        project.write_file(
+            &format!("packages/{name}/lpm.json"),
+            r#"{"tools":{"oxlint":"1.0.0"}}"#,
+        );
+    }
+    seed_fake_plugin_script(
+        &project,
+        "oxlint",
+        "1.0.0",
+        &format!(
+            "#!/bin/sh\n: > ready\ni=0\nwhile [ $i -lt 100 ]; do\n  count=$(find .. -name ready | wc -l)\n  [ $count -eq {count} ] && exit 0\n  i=$((i+1))\n  sleep 0.02\ndone\nexit 8\n"
+        ),
+    );
+    let output = lpm(&project)
+        .env("TOKIO_WORKER_THREADS", "1")
+        .args(["--json", "lint", "--all"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "tool waits serialized: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn lint_json_captures_one_envelope_and_preserves_the_child_exit_code() {
+    let project = TempProject::empty(r#"{"name":"lint-json","version":"1.0.0"}"#);
+    project.write_file("lpm.json", r#"{"tools":{"oxlint":"1.0.0"}}"#);
+    seed_fake_plugin_script(
+        &project,
+        "oxlint",
+        "1.0.0",
+        "#!/bin/sh\necho lint-diagnostic\necho lint-error >&2\nexit 7\n",
+    );
+    let output = lpm(&project).args(["--json", "lint"]).output().unwrap();
+    assert_eq!(output.status.code(), Some(7));
+    let value: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("one JSON envelope");
+    assert_eq!(value["members"][0]["stdout"], "lint-diagnostic\n");
+    assert_eq!(value["members"][0]["stderr"], "lint-error\n");
+    insta::assert_json_snapshot!("lint_single_failure", value, {
+        ".duration_ms" => 0,
+        ".members[].duration_ms" => 0,
+    });
+}
+
+#[cfg(unix)]
+#[test]
+fn lint_workspace_json_bounds_multibyte_diagnostics_without_panicking() {
+    let project = TempProject::from_fixture("workspace-monorepo");
+    seed_workspace_tool_pin(&project, "oxlint", "1.0.0");
+    seed_fake_plugin_script(
+        &project,
+        "oxlint",
+        "1.0.0",
+        "#!/bin/sh\nnode -e \"process.stdout.write('a'.repeat(10*1024*1024-1)+'€'.repeat(1024));process.exitCode=7\"\n",
+    );
+    let output = lpm(&project)
+        .args(["--json", "lint", "--filter", "@test/utils"])
+        .output()
+        .unwrap();
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let value: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("UTF-8-safe bounded envelope");
+    let stdout = value["members"][0]["stdout"].as_str().unwrap();
+    assert!(stdout.len() <= 10 * 1024 * 1024 + 128);
+    assert!(stdout.contains("truncated"));
+}
+
+#[cfg(unix)]
+#[test]
+fn lint_stop_signals_stop_tool_descendants() {
+    for workspace in [false, true] {
+        for json in [false, true] {
+            run_lifetime_case("lint", false, workspace, json, false);
+        }
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn lint_json_finishes_when_descendants_inherit_output_pipes() {
+    for workspace in [false, true] {
+        run_lifetime_case("lint", false, workspace, true, true);
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn lint_json_marks_newline_terminated_output_only_when_truncated() {
+    for extra in [0, 2] {
+        let project = TempProject::empty(r#"{"name":"lint-cap","version":"1.0.0"}"#);
+        project.write_file("lpm.json", r#"{"tools":{"oxlint":"1.0.0"}}"#);
+        seed_fake_plugin_script(
+            &project,
+            "oxlint",
+            "1.0.0",
+            &format!(
+                "#!/bin/sh\nnode -e \"const s='a\\n'.repeat((10*1024*1024+{extra})/2);process.stdout.write(s);process.stderr.write(s);process.exitCode=7\"\n"
+            ),
+        );
+        let output = lpm(&project).args(["--json", "lint"]).output().unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        for key in ["stdout", "stderr"] {
+            let text = value["members"][0][key].as_str().unwrap();
+            assert_eq!(
+                text.contains("truncated"),
+                extra > 0,
+                "missing or false truncation marker for {key}"
+            );
+        }
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn lint_workspace_can_be_interrupted_during_plugin_preparation() {
+    use std::io::Read;
+    use std::net::TcpListener;
+    use std::sync::mpsc;
+    use std::time::{Duration, Instant};
+    let project = TempProject::from_fixture("workspace-monorepo");
+    seed_workspace_tool_pin(&project, "oxlint", "1.0.0");
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let proxy = format!("http://{}", listener.local_addr().unwrap());
+    let (ready_tx, ready_rx) = mpsc::channel();
+    let (done_tx, done_rx) = mpsc::channel();
+    let server = std::thread::spawn(move || {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline {
+            if let Ok((mut stream, _)) = listener.accept() {
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(2)))
+                    .unwrap();
+                let mut buffer = [0u8; 4096];
+                let size = stream.read(&mut buffer).unwrap();
+                ready_tx
+                    .send(String::from_utf8_lossy(&buffer[..size]).starts_with("CONNECT "))
+                    .unwrap();
+                let _ = done_rx.recv_timeout(Duration::from_secs(10));
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    });
+    let mut child = lpm_spawnable(&project)
+        .args(["--json", "lint", "--all"])
+        .env("HTTPS_PROXY", &proxy)
+        .env("https_proxy", &proxy)
+        .env("NO_PROXY", "")
+        .env("no_proxy", "")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    let ready = ready_rx
+        .recv_timeout(Duration::from_secs(10))
+        .unwrap_or(false);
+    // SAFETY: child is the fixture's owned CLI process.
+    unsafe {
+        libc::kill(child.id() as i32, libc::SIGTERM);
+    }
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break Some(status);
+        }
+        if Instant::now() > deadline {
+            break None;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    let _ = child.kill();
+    let _ = child.wait();
+    let _ = done_tx.send(());
+    server.join().unwrap();
+    assert!(ready, "plugin download did not reach the controlled proxy");
+    assert!(status.is_some(), "plugin preparation swallowed SIGTERM");
+}
+
+#[cfg(unix)]
+#[test]
+fn lint_json_reporting_stops_when_the_reader_blocks_and_the_cli_is_interrupted() {
+    use std::io::Read;
+    use std::time::{Duration, Instant};
+    for workspace in [false, true] {
+        let project = TempProject::from_fixture("workspace-monorepo");
+        seed_workspace_tool_pin(&project, "oxlint", "1.0.0");
+        seed_fake_plugin_script(
+            &project,
+            "oxlint",
+            "1.0.0",
+            "#!/bin/sh\nnode -e \"process.stdout.write('x'.repeat(1024*1024));process.exitCode=7\"\n",
+        );
+        let mut command = lpm_spawnable(&project);
+        command.args(["--json", "lint"]);
+        if workspace {
+            command.arg("--all");
+        }
+        let mut child = command
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let mut output = child.stdout.take().unwrap();
+        let mut byte = [0u8; 1];
+        output.read_exact(&mut byte).unwrap();
+        // SAFETY: the process identifier belongs to this fixture.
+        unsafe {
+            libc::kill(child.id() as i32, libc::SIGTERM);
+        }
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let status = loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                break Some(status);
+            }
+            if Instant::now() > deadline {
+                break None;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        let _ = child.kill();
+        let _ = child.wait();
+        assert!(
+            status.is_some(),
+            "JSON reporting ignored interruption with workspace={workspace}"
+        );
+        assert_eq!(status.unwrap().code(), Some(143));
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn lint_workspace_reports_bad_member_config_without_skipping_healthy_members() {
+    let project = TempProject::from_fixture("workspace-monorepo");
+    seed_workspace_tool_pin(&project, "oxlint", "1.0.0");
+    seed_fake_plugin(&project, "oxlint", "1.0.0", ".lint-ok");
+    project.write_file("packages/utils/lpm.json", "{");
+    let output = lpm(&project)
+        .args(["--json", "lint", "--all"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(value["failed"], 1);
+    assert_eq!(value["succeeded"], 2);
+    assert!(!project.file_exists("packages/utils/.lint-ok"));
+    assert!(project.file_exists("packages/core/.lint-ok"));
+}
+
+#[cfg(unix)]
+#[test]
+fn native_tools_keep_project_pins_when_run_from_nested_directories() {
+    for (command, plugin) in [("lint", "oxlint"), ("fmt", "biome")] {
+        for workspace in [false, true] {
+            let project = TempProject::empty(if workspace {
+                r#"{"name":"root","private":true,"workspaces":["packages/*"]}"#
+            } else {
+                r#"{"name":"single"}"#
+            });
+            let member = if workspace { "packages/member/" } else { "" };
+            project.write_file(
+                "lpm.json",
+                &serde_json::json!({"tools":{plugin:"1.0.0"}}).to_string(),
+            );
+            project.write_file(&format!("{member}package.json"), r#"{"name":"member"}"#);
+            project.write_file(
+                &format!("{member}lpm.json"),
+                &serde_json::json!({"tools":{plugin:"2.0.0"}}).to_string(),
+            );
+            for version in ["1.0.0", "2.0.0", "1.79.0", "2.5.9"] {
+                seed_fake_plugin_script(
+                    &project,
+                    plugin,
+                    version,
+                    &format!("#!/bin/sh\nprintf '{version}' > selected-version\n"),
+                );
+            }
+            project.write_file(&format!("{member}src/input.js"), "");
+            let output = lpm(&project)
+                .current_dir(project.path().join(format!("{member}src")))
+                .arg(command)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert_eq!(
+                project.read_file(&format!("{member}src/selected-version")),
+                "2.0.0",
+                "nested {command} lost its project pin"
+            );
+        }
     }
 }

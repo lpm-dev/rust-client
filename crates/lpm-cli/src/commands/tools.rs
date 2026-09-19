@@ -1,8 +1,10 @@
+mod process;
+
 use super::tools_ui;
 use crate::{CheckEngine, install_ui};
 use futures::stream::{FuturesUnordered, StreamExt};
 use lpm_common::LpmError;
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -17,8 +19,11 @@ const MAX_CAPTURED_OUTPUT: usize = 10 * 1024 * 1024; // 10 MB
 /// the last newline boundary to avoid splitting a line.
 fn truncate_output(text: &str) -> String {
     if text.len() > MAX_CAPTURED_OUTPUT {
-        let truncated = &text[..MAX_CAPTURED_OUTPUT];
-        let end = truncated.rfind('\n').unwrap_or(MAX_CAPTURED_OUTPUT);
+        let mut end = MAX_CAPTURED_OUTPUT;
+        while !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        let end = text[..end].rfind('\n').unwrap_or(end);
         format!(
             "{}...\n\n[output truncated at {}MB]",
             &text[..end],
@@ -115,15 +120,24 @@ struct DetectedRunner {
 /// Run `lpm lint` — delegates to oxlint via plugin system.
 pub async fn lint(project_dir: &Path, args: &[String], json_output: bool) -> Result<(), LpmError> {
     let start = std::time::Instant::now();
-    let version = read_tool_version(project_dir, "oxlint");
-    let bin = lpm_plugin::ensure_plugin("oxlint", version.as_deref(), false).await?;
+    let version = effective_tool_version(project_dir, "oxlint")?;
+    let bin = lpm_plugin::ensure_plugin("oxlint", version.as_deref(), json_output).await?;
 
     if !json_output {
         let version_label = tools_ui::plugin_version_label(&bin, version.as_deref());
         tools_ui::using_tool("Oxlint", &version_label);
     }
 
-    let outcome = run_tool_binary(&bin, args, project_dir, StdioMode::Inherit)?;
+    let signals = Arc::new(lpm_runner::execution::ExecutionSignals::new()?);
+    let stdio = if json_output {
+        StdioMode::Capture
+    } else {
+        StdioMode::Inherit
+    };
+    let outcome = run_tool_binary(&bin, args, project_dir, stdio, Arc::clone(&signals)).await?;
+    if json_output {
+        return finish_single_tool(project_dir, outcome, start.elapsed(), &signals);
+    }
     if outcome.success() && !json_output {
         tools_ui::done_lint(start.elapsed());
     }
@@ -142,7 +156,7 @@ pub async fn fmt(
     json_output: bool,
 ) -> Result<(), LpmError> {
     let start = std::time::Instant::now();
-    let version = read_tool_version(project_dir, "biome");
+    let version = effective_tool_version(project_dir, "biome")?;
     let bin = lpm_plugin::ensure_plugin("biome", version.as_deref(), false).await?;
 
     if !json_output {
@@ -151,7 +165,9 @@ pub async fn fmt(
     }
 
     let biome_args = build_biome_args(args, check);
-    let outcome = run_tool_binary(&bin, &biome_args, project_dir, StdioMode::Inherit)?;
+    let signals = Arc::new(lpm_runner::execution::ExecutionSignals::new()?);
+    let outcome =
+        run_tool_binary(&bin, &biome_args, project_dir, StdioMode::Inherit, signals).await?;
     if outcome.success() && !json_output {
         if check {
             tools_ui::done_fmt_check(start.elapsed());
@@ -165,7 +181,7 @@ pub async fn fmt(
 /// Apply project formatting for doctor without writing a nested command
 /// response or forwarding the formatter's stdout into doctor's JSON.
 pub(crate) async fn fmt_for_doctor(project_dir: &Path) -> Result<(), LpmError> {
-    let version = read_tool_version(project_dir, "biome");
+    let version = effective_tool_version(project_dir, "biome")?;
     let bin = lpm_plugin::ensure_plugin("biome", version.as_deref(), true).await?;
     let biome_args = build_biome_args(&[], false);
     let args: Vec<&str> = biome_args.iter().map(String::as_str).collect();
@@ -218,7 +234,8 @@ pub async fn check(
         check_preflight(project_dir, engine)?;
     }
 
-    let outcome = run_check_engine(project_dir, args, engine, StdioMode::Inherit).await?;
+    let signals = Arc::new(lpm_runner::execution::ExecutionSignals::new()?);
+    let outcome = run_check_engine(project_dir, args, engine, StdioMode::Inherit, signals).await?;
     if outcome.success() && !json_output {
         tools_ui::done_typecheck(start.elapsed());
     }
@@ -353,21 +370,24 @@ async fn run_single_runner(
     }
     .await;
     let outcome = match preparation {
-        Ok(runtime_hint) => tokio::task::spawn_blocking(move || {
-            execute_runner(
-                &project_dir,
-                &boundary,
-                &runner,
-                &args,
-                stdio,
-                &runtime_hint,
-                &signals,
-            )
-        })
-        .await
-        .map_err(|error| {
-            LpmError::Script(format!("{} runner task panicked: {error}", tool.label()))
-        })?,
+        Ok(runtime_hint) => {
+            let worker_signals = Arc::clone(&signals);
+            tokio::task::spawn_blocking(move || {
+                execute_runner(
+                    &project_dir,
+                    &boundary,
+                    &runner,
+                    &args,
+                    stdio,
+                    &runtime_hint,
+                    &worker_signals,
+                )
+            })
+            .await
+            .map_err(|error| {
+                LpmError::Script(format!("{} runner task panicked: {error}", tool.label()))
+            })?
+        }
         Err(error) => runner_error(error),
     };
     let elapsed = start.elapsed();
@@ -390,7 +410,8 @@ async fn run_single_runner(
             usize::from(success),
             usize::from(!success),
             elapsed,
-        );
+            &signals,
+        )?;
     } else if outcome.success() {
         match tool {
             RunnerTool::Test => tools_ui::done_test(elapsed),
@@ -648,18 +669,61 @@ fn execute_package_script(
 
 // --- Helpers ---
 
-/// Read a tool version from lpm.json tools section.
-///
-/// Warns on parse errors instead of silently falling back to latest version,
-/// so users know their pinned version was ignored.
-fn read_tool_version(project_dir: &Path, tool_name: &str) -> Option<String> {
-    match lpm_runner::lpm_json::read_lpm_json(project_dir) {
-        Ok(Some(config)) => config.tools.get(tool_name).cloned(),
-        Ok(None) => None,
-        Err(e) => {
-            install_ui::warn_untrusted(&format!("failed to read lpm.json tools config: {e}"));
-            None
+fn read_tool_version(project_dir: &Path, tool_name: &str) -> Result<Option<String>, LpmError> {
+    lpm_runner::lpm_json::read_lpm_json(project_dir)
+        .map(|config| config.and_then(|config| config.tools.get(tool_name).cloned()))
+        .map_err(|error| LpmError::Script(format!("failed to read lpm.json tools config: {error}")))
+}
+
+fn effective_tool_version(project_dir: &Path, tool_name: &str) -> Result<Option<String>, LpmError> {
+    let local = read_tool_version(project_dir, tool_name)?;
+    if local.is_some() {
+        return Ok(local);
+    }
+    let project_root = lpm_workspace::find_project_root(project_dir);
+    if let Some(root) = project_root.as_deref().filter(|root| *root != project_dir) {
+        let project = read_tool_version(root, tool_name)?;
+        if project.is_some() {
+            return Ok(project);
         }
+    }
+    let boundary = runner_boundary(project_dir)?;
+    if boundary != project_dir {
+        return read_tool_version(&boundary, tool_name);
+    }
+    Ok(None)
+}
+
+fn finish_single_tool(
+    project_dir: &Path,
+    outcome: ToolOutcome,
+    elapsed: std::time::Duration,
+    signals: &lpm_runner::execution::ExecutionSignals,
+) -> Result<(), LpmError> {
+    let code = outcome.exit_code.unwrap_or(1);
+    let success = outcome.success();
+    let name = lpm_workspace::read_package_json(&project_dir.join("package.json"))
+        .ok()
+        .and_then(|package| package.name)
+        .unwrap_or_else(|| {
+            project_dir.file_name().map_or_else(
+                || "<project>".into(),
+                |name| name.to_string_lossy().into_owned(),
+            )
+        });
+    let member = member_result(name, outcome, elapsed);
+    emit_envelope(
+        std::slice::from_ref(&member),
+        1,
+        usize::from(success),
+        usize::from(!success),
+        elapsed,
+        signals,
+    )?;
+    if success {
+        Ok(())
+    } else {
+        Err(LpmError::ExitCode(code))
     }
 }
 
@@ -713,46 +777,16 @@ fn finish_tool_outcome(
     outcome.into_result()
 }
 
-/// Run a plugin binary with args. Returns the outcome rather than panicking
-/// on non-zero so workspace mode can collect per-member results.
-fn run_tool_binary(
+async fn run_tool_binary(
     bin: &Path,
     args: &[String],
     cwd: &Path,
     stdio: StdioMode,
+    signals: Arc<lpm_runner::execution::ExecutionSignals>,
 ) -> Result<ToolOutcome, LpmError> {
-    let mut cmd = Command::new(bin);
-    cmd.args(args).current_dir(cwd);
-
-    apply_stdio(&mut cmd, stdio);
-
-    let mut outcome = ToolOutcome::default();
-
-    match stdio {
-        StdioMode::Inherit => {
-            let status = cmd
-                .status()
-                .map_err(|e| LpmError::Script(format!("failed to run {}: {e}", bin.display())))?;
-            outcome.exit_code = Some(status.code().unwrap_or(1));
-        }
-        StdioMode::Capture => {
-            let result = cmd.output();
-            match result {
-                Ok(output) => {
-                    outcome.captured = Captured {
-                        stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
-                        stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
-                    };
-                    outcome.exit_code = Some(output.status.code().unwrap_or(1));
-                }
-                Err(e) => {
-                    outcome.error = Some(format!("failed to run {}: {e}", bin.display()));
-                }
-            }
-        }
-    }
-
-    Ok(outcome)
+    let mut command = Command::new(bin);
+    command.args(args).current_dir(cwd);
+    Ok(process::run(command, stdio, signals).await)
 }
 
 fn check_engine_binary(engine: CheckEngine) -> &'static str {
@@ -777,9 +811,10 @@ async fn run_check_engine(
     args: &[String],
     engine: CheckEngine,
     stdio: StdioMode,
+    signals: Arc<lpm_runner::execution::ExecutionSignals>,
 ) -> Result<ToolOutcome, LpmError> {
     if matches!(engine, CheckEngine::Tsgo) {
-        return run_tsgo(project_dir, args, stdio).await;
+        return run_tsgo(project_dir, args, stdio, signals).await;
     }
 
     let binary = check_engine_binary(engine);
@@ -792,37 +827,10 @@ async fn run_check_engine(
         .current_dir(project_dir)
         .env("PATH", &path);
 
-    apply_stdio(&mut cmd, stdio);
-
-    let mut outcome = ToolOutcome::default();
-
-    match stdio {
-        StdioMode::Inherit => {
-            let status = cmd.status().map_err(|e| {
-                LpmError::Script(format!(
-                    "failed to run {binary}: {e}. {}",
-                    check_engine_spawn_hint(engine)
-                ))
-            })?;
-            outcome.exit_code = Some(status.code().unwrap_or(1));
-        }
-        StdioMode::Capture => match cmd.output() {
-            Ok(output) => {
-                outcome.captured = Captured {
-                    stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
-                    stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
-                };
-                outcome.exit_code = Some(output.status.code().unwrap_or(1));
-            }
-            Err(e) => {
-                outcome.error = Some(format!(
-                    "failed to run {binary}: {e}. {}",
-                    check_engine_spawn_hint(engine)
-                ));
-            }
-        },
+    let mut outcome = process::run(cmd, stdio, signals).await;
+    if let Some(error) = &mut outcome.error {
+        error.push_str(&format!(". {}", check_engine_spawn_hint(engine)));
     }
-
     Ok(outcome)
 }
 
@@ -830,11 +838,12 @@ async fn run_tsgo(
     project_dir: &Path,
     args: &[String],
     stdio: StdioMode,
+    signals: Arc<lpm_runner::execution::ExecutionSignals>,
 ) -> Result<ToolOutcome, LpmError> {
     let bin = lpm_plugin::ensure_engine("tsgo", None, matches!(stdio, StdioMode::Capture)).await?;
     let mut cmd_args = vec!["--noEmit".to_string()];
     cmd_args.extend_from_slice(args);
-    run_tool_binary(&bin, &cmd_args, project_dir, stdio)
+    run_tool_binary(&bin, &cmd_args, project_dir, stdio, signals).await
 }
 
 fn apply_stdio(cmd: &mut Command, stdio: StdioMode) {
@@ -1001,12 +1010,62 @@ pub async fn tool_workspace(
         return Ok(());
     }
 
-    let signals = if matches!(tool, "test" | "bench") {
-        Some(Arc::new(lpm_runner::execution::ExecutionSignals::new()?))
-    } else {
-        None
+    let prewarm = match tool {
+        "lint" => Some(
+            prepare_member_plugins(
+                &ws_graph,
+                &workspace.root,
+                &target_set,
+                "oxlint",
+                json_output,
+            )
+            .await,
+        ),
+        "fmt" => Some(
+            prepare_member_plugins(
+                &ws_graph,
+                &workspace.root,
+                &target_set,
+                "biome",
+                json_output,
+            )
+            .await,
+        ),
+        _ => None,
     };
-    let runner_tasks = if let Some(signals) = &signals {
+    let prepared_plugins = match prewarm {
+        None => None,
+        Some(Ok(plugins)) => Some(plugins),
+        Some(Err(prewarm_err)) => {
+            let elapsed = std::time::Duration::from_millis(0);
+            let failed_members = synthesize_prewarm_failure_members(
+                &ws_graph,
+                &target_set,
+                &prewarm_err.to_string(),
+            );
+            let total = failed_members.len();
+            let succeeded = 0;
+            let failed = total;
+
+            if json_output {
+                emit_envelope(
+                    &failed_members,
+                    total,
+                    succeeded,
+                    failed,
+                    elapsed,
+                    &lpm_runner::execution::ExecutionSignals::new()?,
+                )?;
+            } else {
+                emit_prewarm_failure(tool, &prewarm_err.to_string());
+                emit_human_summary(tool, total, succeeded, failed, target_set.len(), elapsed);
+            }
+            return Err(LpmError::ExitCode(1));
+        }
+    };
+
+    let signals = Arc::new(lpm_runner::execution::ExecutionSignals::new()?);
+    let runner_tasks = if matches!(tool, "test" | "bench") {
         let runner_tool = RunnerTool::from_label(tool)?;
         let boundary = Arc::new(workspace.root.clone());
         let root_hint = super::run::ensure_runtime(&workspace.root).await?;
@@ -1028,54 +1087,12 @@ pub async fn tool_workspace(
                 boundary: Arc::clone(&boundary),
                 runner,
                 runtime_hint,
-                signals: Arc::clone(signals),
+                signals: Arc::clone(&signals),
             });
         }
         Some(tasks)
     } else {
         None
-    };
-
-    // Pre-resolve plugin once at root for lint/fmt — covers the homogeneous
-    // cold-cache race where N parallel members would all call ensure_plugin
-    // for the same version. Per-member calls below reuse this binary if the
-    // member's version pin matches root, otherwise fall back to a per-member
-    // ensure_plugin (rare; mixed-version monorepos accept today's race).
-    //
-    // Prewarm failure is not an early-return: the workspace+`--json` contract
-    // promises a single envelope on stdout, with plugin / config / spawn
-    // failures represented as member entries with `exit_code: null`. We
-    // synthesize per-member failure entries (one per targeted member) carrying
-    // the prewarm error and skip orchestration. The plain-text path emits the
-    // human summary so the user sees the same N-of-N-failed shape.
-    let prewarm = match tool {
-        "lint" => Some(prewarm_root_plugin(project_dir, "oxlint").await),
-        "fmt" => Some(prewarm_root_plugin(project_dir, "biome").await),
-        _ => None,
-    };
-
-    let root_pin: Option<(String, Option<String>, PathBuf)> = match prewarm {
-        None => None,
-        Some(Ok(pin)) => Some(pin),
-        Some(Err(prewarm_err)) => {
-            let elapsed = std::time::Duration::from_millis(0);
-            let failed_members = synthesize_prewarm_failure_members(
-                &ws_graph,
-                &target_set,
-                &prewarm_err.to_string(),
-            );
-            let total = failed_members.len();
-            let succeeded = 0;
-            let failed = total;
-
-            if json_output {
-                emit_envelope(&failed_members, total, succeeded, failed, elapsed);
-            } else {
-                emit_prewarm_failure(tool, &prewarm_err.to_string());
-                emit_human_summary(tool, total, succeeded, failed, target_set.len(), elapsed);
-            }
-            return Err(LpmError::ExitCode(1));
-        }
     };
 
     let stdio = if json_output {
@@ -1094,9 +1111,10 @@ pub async fn tool_workspace(
         check,
         check_engine,
         stdio,
-        &root_pin,
+        &prepared_plugins,
         runner_tasks.as_deref(),
         workspace_concurrency,
+        Arc::clone(&signals),
     )
     .await?;
 
@@ -1106,14 +1124,12 @@ pub async fn tool_workspace(
     let total = member_results.len();
 
     if json_output {
-        emit_envelope(&member_results, total, succeeded, failed, elapsed);
+        emit_envelope(&member_results, total, succeeded, failed, elapsed, &signals)?;
     } else {
         emit_human_summary(tool, total, succeeded, failed, target_set.len(), elapsed);
     }
 
-    if let Some(signals) = &signals {
-        signals.check()?;
-    }
+    signals.check()?;
 
     if failed > 0 {
         return Err(LpmError::ExitCode(1));
@@ -1122,20 +1138,37 @@ pub async fn tool_workspace(
     Ok(())
 }
 
-/// Pre-resolve a plugin once at the workspace root. Reads the root's tool
-/// version pin and returns the resolved binary path along with the pin so
-/// per-member calls can short-circuit when their pin matches.
-///
-/// Extracted as a named helper so the prewarm-failure envelope path can call
-/// it via a single owned `Result` rather than the inline `?` form (which
-/// would short-circuit `tool_workspace` before the envelope is built).
-async fn prewarm_root_plugin(
-    project_dir: &Path,
-    plugin_name: &str,
-) -> Result<(String, Option<String>, PathBuf), LpmError> {
-    let v = read_tool_version(project_dir, plugin_name);
-    let bin = lpm_plugin::ensure_plugin(plugin_name, v.as_deref(), false).await?;
-    Ok((plugin_name.to_string(), v, bin))
+async fn prepare_member_plugins(
+    graph: &lpm_task::graph::WorkspaceGraph,
+    root: &Path,
+    targets: &HashSet<usize>,
+    plugin: &str,
+    quiet: bool,
+) -> Result<Vec<Result<PathBuf, String>>, LpmError> {
+    let root_version = read_tool_version(root, plugin)?;
+    let mut resolved = HashMap::new();
+    let mut members = Vec::with_capacity(graph.len());
+    for (index, member) in graph.members.iter().enumerate() {
+        if !targets.contains(&index) {
+            members.push(Err("member was not selected".into()));
+            continue;
+        }
+        let version = match read_tool_version(&member.path, plugin) {
+            Ok(version) => version.or_else(|| root_version.clone()),
+            Err(error) => {
+                members.push(Err(error.to_string()));
+                continue;
+            }
+        };
+        if !resolved.contains_key(&version) {
+            let result = lpm_plugin::ensure_plugin(plugin, version.as_deref(), quiet)
+                .await
+                .map_err(|error| error.to_string());
+            resolved.insert(version.clone(), result);
+        }
+        members.push(resolved[&version].clone());
+    }
+    Ok(members)
 }
 
 /// Build per-member failure entries for the case where the root plugin
@@ -1258,9 +1291,10 @@ async fn run_selected_members(
     check: bool,
     check_engine: Option<CheckEngine>,
     stdio: StdioMode,
-    root_pin: &Option<(String, Option<String>, PathBuf)>,
+    prepared_plugins: &Option<Vec<Result<PathBuf, String>>>,
     runner_tasks: Option<&[RunnerTask]>,
     workspace_concurrency: usize,
+    signals: Arc<lpm_runner::execution::ExecutionSignals>,
 ) -> Result<Vec<MemberResult>, LpmError> {
     let (mut unmet, mut ready) = selected_schedule_state(ws_graph, target_set)?;
     let mut in_flight = FuturesUnordered::new();
@@ -1279,8 +1313,9 @@ async fn run_selected_members(
                 check,
                 check_engine,
                 stdio,
-                root_pin,
+                prepared_plugins,
                 runner_tasks.and_then(|tasks| tasks.get(index)).cloned(),
+                Arc::clone(&signals),
             ));
         }
 
@@ -1315,8 +1350,9 @@ async fn run_indexed_member(
     check: bool,
     check_engine: Option<CheckEngine>,
     stdio: StdioMode,
-    root_pin: &Option<(String, Option<String>, PathBuf)>,
+    prepared_plugins: &Option<Vec<Result<PathBuf, String>>>,
     runner_task: Option<RunnerTask>,
+    signals: Arc<lpm_runner::execution::ExecutionSignals>,
 ) -> (usize, MemberResult) {
     let member = &ws_graph.members[index];
     let result = run_one_member(
@@ -1327,8 +1363,12 @@ async fn run_indexed_member(
         check,
         check_engine,
         stdio,
-        root_pin,
+        prepared_plugins
+            .as_ref()
+            .and_then(|members| members.get(index))
+            .cloned(),
         runner_task,
+        signals,
     )
     .await;
     (index, result)
@@ -1344,8 +1384,9 @@ async fn run_one_member(
     check: bool,
     check_engine: Option<CheckEngine>,
     stdio: StdioMode,
-    root_pin: &Option<(String, Option<String>, PathBuf)>,
+    prepared_plugin: Option<Result<PathBuf, String>>,
     runner_task: Option<RunnerTask>,
+    signals: Arc<lpm_runner::execution::ExecutionSignals>,
 ) -> MemberResult {
     let start = std::time::Instant::now();
 
@@ -1358,13 +1399,25 @@ async fn run_one_member(
     }
 
     let outcome_result = match tool {
-        "lint" => run_lint_member(member_dir, &args, stdio, root_pin).await,
-        "fmt" => run_fmt_member(member_dir, &args, check, stdio, root_pin).await,
+        "lint" | "fmt" => {
+            match prepared_plugin.unwrap_or_else(|| Err("tool was not prepared".into())) {
+                Ok(bin) => {
+                    let tool_args = if tool == "fmt" {
+                        build_biome_args(&args, check)
+                    } else {
+                        args.to_vec()
+                    };
+                    run_tool_binary(&bin, &tool_args, member_dir, stdio, signals).await
+                }
+                Err(error) => Err(LpmError::Script(error)),
+            }
+        }
         "check" => Ok(run_check_engine(
             member_dir,
             &args,
             check_engine.unwrap_or(CheckEngine::Tsc),
             stdio,
+            signals,
         )
         .await
         .unwrap_or_else(|e| ToolOutcome {
@@ -1430,28 +1483,6 @@ async fn run_runner_member(
         error: Some(format!("workspace runner task panicked: {error}")),
         ..Default::default()
     })
-}
-
-async fn run_lint_member(
-    member_dir: &Path,
-    args: &[String],
-    stdio: StdioMode,
-    root_pin: &Option<(String, Option<String>, PathBuf)>,
-) -> Result<ToolOutcome, LpmError> {
-    let bin = resolve_member_plugin(member_dir, "oxlint", root_pin).await?;
-    run_tool_binary(&bin, args, member_dir, stdio)
-}
-
-async fn run_fmt_member(
-    member_dir: &Path,
-    args: &[String],
-    check: bool,
-    stdio: StdioMode,
-    root_pin: &Option<(String, Option<String>, PathBuf)>,
-) -> Result<ToolOutcome, LpmError> {
-    let bin = resolve_member_plugin(member_dir, "biome", root_pin).await?;
-    let biome_args = build_biome_args(args, check);
-    run_tool_binary(&bin, &biome_args, member_dir, stdio)
 }
 
 /// Top-level dispatcher for `lpm test` and `lpm bench`. Owns the workspace-
@@ -1585,26 +1616,6 @@ pub async fn dispatch_test_or_bench(
     }
 }
 
-/// Reuse the root-prewarmed plugin binary when the member's version pin
-/// matches the root, otherwise re-resolve. Prewarm at root closes the
-/// homogeneous cold-cache race; mixed-version pins accept today's behavior.
-async fn resolve_member_plugin(
-    member_dir: &Path,
-    plugin_name: &str,
-    root_pin: &Option<(String, Option<String>, PathBuf)>,
-) -> Result<PathBuf, LpmError> {
-    let member_version = read_tool_version(member_dir, plugin_name);
-
-    if let Some((root_name, root_version, root_bin)) = root_pin
-        && root_name == plugin_name
-        && member_version == *root_version
-    {
-        return Ok(root_bin.clone());
-    }
-
-    lpm_plugin::ensure_plugin(plugin_name, member_version.as_deref(), false).await
-}
-
 /// Emit the workspace JSON envelope. Stdout/stderr surface ONLY for failed
 /// members and are truncated at the 10MB ceiling.
 fn emit_envelope(
@@ -1613,7 +1624,8 @@ fn emit_envelope(
     succeeded: usize,
     failed: usize,
     elapsed: std::time::Duration,
-) {
+    signals: &lpm_runner::execution::ExecutionSignals,
+) -> Result<(), LpmError> {
     let members: Vec<serde_json::Value> = results
         .iter()
         .map(|r| {
@@ -1663,7 +1675,7 @@ fn emit_envelope(
         "members": members,
     });
 
-    println!("{}", serde_json::to_string_pretty(&envelope).unwrap());
+    process::write_json(&envelope, signals)
 }
 
 fn emit_human_summary(
@@ -1886,28 +1898,32 @@ mod tests {
     // --- run_tool_binary outcome shape ---
 
     #[cfg(unix)]
-    #[test]
-    fn run_tool_binary_inherit_returns_exit_code() {
+    #[tokio::test]
+    async fn run_tool_binary_inherit_returns_exit_code() {
         let outcome = run_tool_binary(
             Path::new("/usr/bin/false"),
             &[],
             Path::new("/tmp"),
             StdioMode::Inherit,
+            Arc::new(lpm_runner::execution::ExecutionSignals::new().unwrap()),
         )
+        .await
         .expect("should not error launching /usr/bin/false");
         assert_eq!(outcome.exit_code, Some(1));
         assert!(!outcome.success());
     }
 
     #[cfg(unix)]
-    #[test]
-    fn run_tool_binary_capture_collects_stdout() {
+    #[tokio::test]
+    async fn run_tool_binary_capture_collects_stdout() {
         let outcome = run_tool_binary(
             Path::new("/bin/echo"),
             &["hello".to_string()],
             Path::new("/tmp"),
             StdioMode::Capture,
+            Arc::new(lpm_runner::execution::ExecutionSignals::new().unwrap()),
         )
+        .await
         .expect("should run echo");
         assert_eq!(outcome.exit_code, Some(0));
         assert!(outcome.success());
@@ -1987,10 +2003,13 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            read_tool_version(dir.path(), "oxlint"),
+            read_tool_version(dir.path(), "oxlint").unwrap(),
             Some("1.55.0".into())
         );
-        assert_eq!(read_tool_version(dir.path(), "biome"), Some("2.4.5".into()));
+        assert_eq!(
+            read_tool_version(dir.path(), "biome").unwrap(),
+            Some("2.4.5".into())
+        );
     }
 
     #[test]
@@ -2001,89 +2020,20 @@ mod tests {
             r#"{"tools":{"oxlint":"1.55.0"}}"#,
         )
         .unwrap();
-        assert_eq!(read_tool_version(dir.path(), "biome"), None);
+        assert_eq!(read_tool_version(dir.path(), "biome").unwrap(), None);
     }
 
     #[test]
     fn read_tool_version_no_lpm_json_returns_none() {
         let dir = tempfile::tempdir().unwrap();
-        assert_eq!(read_tool_version(dir.path(), "oxlint"), None);
+        assert_eq!(read_tool_version(dir.path(), "oxlint").unwrap(), None);
     }
 
     #[test]
-    fn read_tool_version_malformed_json_warns_returns_none() {
+    fn read_tool_version_malformed_json_returns_error() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("lpm.json"), "not valid json{{{").unwrap();
-        assert_eq!(read_tool_version(dir.path(), "oxlint"), None);
-    }
-
-    // --- Plugin prewarm reuse decision ---
-    //
-    // Proves the homogeneous-cold-cache contract: when every member's tool
-    // version matches the root pin, member-level resolution returns the
-    // root-prewarmed binary path WITHOUT spawning a fresh ensure_plugin call.
-    //
-    // We test the decision logic directly rather than mocking ensure_plugin,
-    // which makes the contract explicit at the call site.
-
-    #[test]
-    fn member_with_matching_version_reuses_root_binary() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(
-            dir.path().join("lpm.json"),
-            r#"{"tools":{"oxlint":"1.55.0"}}"#,
-        )
-        .unwrap();
-
-        let root_bin = PathBuf::from("/fake/root/oxlint");
-        let root_pin = Some((
-            "oxlint".to_string(),
-            Some("1.55.0".to_string()),
-            root_bin.clone(),
-        ));
-
-        // Synchronously inspect the decision: read the member version, compare
-        // to root pin. This mirrors the real `resolve_member_plugin` short-
-        // circuit at the top of the function.
-        let member_version = read_tool_version(dir.path(), "oxlint");
-        assert_eq!(member_version, Some("1.55.0".into()));
-
-        let (root_name, root_version, root_bin_ref) = root_pin.as_ref().unwrap();
-        assert_eq!(root_name, "oxlint");
-        assert_eq!(member_version, *root_version);
-        assert_eq!(*root_bin_ref, root_bin);
-    }
-
-    #[test]
-    fn member_with_unpinned_version_matches_root_unpinned() {
-        // Member has no lpm.json, root also has no pin → both `None` → reuse.
-        let dir = tempfile::tempdir().unwrap();
-        let root_bin = PathBuf::from("/fake/root/oxlint");
-        let root_pin = Some(("oxlint".to_string(), None, root_bin));
-
-        let member_version = read_tool_version(dir.path(), "oxlint");
-        let (_, root_version, _) = root_pin.as_ref().unwrap();
-        assert_eq!(member_version, *root_version);
-    }
-
-    #[test]
-    fn member_with_diverging_version_falls_back_to_resolution() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(
-            dir.path().join("lpm.json"),
-            r#"{"tools":{"oxlint":"1.99.0"}}"#,
-        )
-        .unwrap();
-
-        let root_bin = PathBuf::from("/fake/root/oxlint");
-        let root_pin = Some(("oxlint".to_string(), Some("1.55.0".to_string()), root_bin));
-
-        let member_version = read_tool_version(dir.path(), "oxlint");
-        let (_, root_version, _) = root_pin.as_ref().unwrap();
-        assert_ne!(
-            member_version, *root_version,
-            "diverging pin must NOT reuse root binary"
-        );
+        assert!(read_tool_version(dir.path(), "oxlint").is_err());
     }
 
     // --- detection ---
