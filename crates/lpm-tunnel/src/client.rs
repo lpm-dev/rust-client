@@ -239,7 +239,9 @@ fn relay_code_retry_class(code: &str) -> Option<RetryClass> {
         | "billing_inactive"
         | "session_expired"
         | "monthly_allowance_exhausted" => Some(RetryClass::Permanent),
-        "quota_unavailable"
+        "auth_unavailable"
+        | "domain_unavailable"
+        | "quota_unavailable"
         | "account_unavailable"
         | "usage_unavailable"
         | "usage_report_unavailable" => Some(RetryClass::Transient),
@@ -2542,9 +2544,14 @@ async fn try_connect_with_token(
                             }
                         }
                     }
-                    Some(Ok(Message::Close(_))) => {
+                    Some(Ok(Message::Close(frame))) => {
                         tracing::info!("relay closed connection");
-                        connection_result = Ok(());
+                        connection_result = match frame {
+                            Some(frame) if frame.code != tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode::Normal => {
+                                Err(TunnelConnectError::transient(format!("relay closed connection ({})", u16::from(frame.code))))
+                            }
+                            _ => Ok(()),
+                        };
                         break;
                     }
                     Some(Err(e)) => {
@@ -3026,6 +3033,39 @@ mod tests {
             value,
             serde_json::json!({"type":"credential_renew", "token":"renewed-token"})
         );
+    }
+
+    #[tokio::test]
+    async fn abnormal_relay_close_is_a_transient_failure() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let relay = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let mut websocket = tokio_tungstenite::accept_async(socket).await.unwrap();
+            websocket.send(Message::Text(serde_json::json!({
+                "type": "hello", "subdomain": "recovery.localhost", "tunnel_url": "http://recovery.localhost", "session_id": "recovery",
+            }).to_string())).await.unwrap();
+            websocket
+                .close(Some(tokio_tungstenite::tungstenite::protocol::CloseFrame {
+                    code:
+                        tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode::Restart,
+                    reason: "relay restarting".into(),
+                }))
+                .await
+                .unwrap();
+        });
+        let mut options = TunnelOptions::new("test-token".into(), 3000);
+        options.relay_url = format!("ws://{address}/connect");
+        options.no_pin = true;
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            try_connect(&options, &|_| Ok(()), &|_, _| {}),
+        )
+        .await
+        .unwrap();
+        relay.await.unwrap();
+        let error = result.expect_err("a relay restart must trigger reconnection");
+        assert_eq!(error.retry_class, RetryClass::Transient);
     }
 
     #[tokio::test]

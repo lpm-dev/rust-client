@@ -59,8 +59,19 @@ pub async fn run(
             run_domains(client, json_output).await
         }
         "inspect" => {
-            let local_args = local_action_args(domain, extra_args);
+            let local_args = normalized_local_action_args(domain, extra_args);
             validate_local_action_args(action, &local_args)?;
+            let ui = local_args.iter().any(|arg| arg == "--ui");
+            if inspect_port.is_some() && !ui {
+                return Err(LpmError::Tunnel(
+                    "`--inspect-port` is not valid without `inspect --ui`".into(),
+                ));
+            }
+            if ui && json_output {
+                return Err(LpmError::Tunnel(
+                    "`--json` is not valid with `inspect --ui`".into(),
+                ));
+            }
             // `lpm tunnel inspect --ui` opens the browser inspector on historical data
             if local_args.contains(&"--ui".to_string()) {
                 return run_inspect_ui(project_dir, inspect_port).await;
@@ -68,12 +79,12 @@ pub async fn run(
             run_inspect(project_dir, &local_args, json_output).await
         }
         "replay" => {
-            let local_args = local_action_args(domain, extra_args);
+            let local_args = normalized_local_action_args(domain, extra_args);
             validate_local_action_args(action, &local_args)?;
             run_replay(project_dir, &local_args, port, json_output).await
         }
         "log" | "logs" => {
-            let local_args = local_action_args(domain, extra_args);
+            let local_args = normalized_local_action_args(domain, extra_args);
             validate_local_action_args(action, &local_args)?;
             run_log(project_dir, &local_args, json_output).await
         }
@@ -182,6 +193,45 @@ fn local_action_args(second_positional: Option<&str>, extra_args: &[String]) -> 
     }
     normalized_args.extend(extra_args.iter().cloned());
     normalized_args
+}
+
+fn normalized_local_action_args(
+    second_positional: Option<&str>,
+    extra_args: &[String],
+) -> Vec<String> {
+    let args = local_action_args(second_positional, extra_args);
+    let mut normalized = Vec::with_capacity(args.len());
+    let mut index = 0;
+    while index < args.len() {
+        let raw = &args[index];
+        let (flag, inline) = raw
+            .split_once('=')
+            .map_or((raw.as_str(), None), |(flag, value)| (flag, Some(value)));
+        let flag = match flag {
+            "-n" => "--last",
+            "-d" => "--detail",
+            "-p" => "--port",
+            other => other,
+        };
+        if matches!(
+            flag,
+            "--last" | "--detail" | "--port" | "--filter" | "--status"
+        ) {
+            if let Some(value) = inline {
+                normalized.push(format!("{flag}={value}"));
+            } else if let Some(value) = args.get(index + 1).filter(|value| !value.starts_with('-'))
+            {
+                normalized.push(format!("{flag}={value}"));
+                index += 1;
+            } else {
+                normalized.push(flag.to_string());
+            }
+        } else {
+            normalized.push(raw.clone());
+        }
+        index += 1;
+    }
+    normalized
 }
 
 fn reject_local_options(action: &str, args: &[String]) -> Result<(), LpmError> {
@@ -308,6 +358,34 @@ fn validate_local_action_args(action: &str, args: &[String]) -> Result<(), LpmEr
         index += if inline_value.is_some() { 1 } else { 2 };
     }
 
+    let has = |flag: &str| args.iter().any(|arg| arg.split('=').next() == Some(flag));
+    if has("--ui") && args.len() != 1 {
+        return Err(LpmError::Tunnel(
+            "cannot combine `--ui` with capture selection options".into(),
+        ));
+    }
+    if has("--clear") && args.len() != 1 {
+        return Err(LpmError::Tunnel(
+            "cannot combine `--clear` with capture filters or limits".into(),
+        ));
+    }
+    if has("--detail") && has("--last") {
+        return Err(LpmError::Tunnel(
+            "cannot combine `--detail` and `--last`".into(),
+        ));
+    }
+    if action == "replay" {
+        if replay_index_seen && has("--last") {
+            return Err(LpmError::Tunnel(
+                "cannot combine a webhook number and `--last`".into(),
+            ));
+        }
+        if !replay_index_seen && !has("--last") {
+            return Err(LpmError::Tunnel(
+                "specify a webhook number or use --last".into(),
+            ));
+        }
+    }
     Ok(())
 }
 
@@ -931,6 +1009,7 @@ async fn run_inspect(
     let filter_provider = parse_flag_str(args, "--filter");
     let filter_status = parse_flag_str(args, "--status");
     let detail_index = parse_flag_usize(args, "--detail", "-d");
+    let filter = build_filter(filter_provider.as_deref(), filter_status.as_deref());
 
     if let Some(idx) = detail_index {
         if idx == 0 {
@@ -942,7 +1021,7 @@ async fn run_inspect(
             install_ui::warn("--detail uses 1-based indexing. Use --detail 1 for the first entry.");
             return Ok(());
         }
-        let entries = read_capture_entries(&db, idx, None).await?;
+        let entries = read_capture_entries(&db, idx, filter.as_ref()).await?;
         if let Some(entry) = entries.get(idx.saturating_sub(1)) {
             if let Some(full) = db
                 .get_webhook(&entry.id)
@@ -969,7 +1048,6 @@ async fn run_inspect(
         return Ok(());
     }
 
-    let filter = build_filter(filter_provider.as_deref(), filter_status.as_deref());
     let entries = read_capture_entries(&db, last, filter.as_ref()).await?;
 
     if json_output {
