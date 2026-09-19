@@ -36,6 +36,37 @@ fn build_task_graph_nodes(
             continue;
         }
 
+        let task = tasks.get(&task_name);
+        if !scripts.contains_key(&task_name)
+            && !task.is_some_and(|task| task.command.is_some() || !task.depends_on.is_empty())
+        {
+            let mut available: Vec<&str> = scripts
+                .keys()
+                .map(String::as_str)
+                .chain(tasks.iter().filter_map(|(name, task)| {
+                    (task.command.is_some() || !task.depends_on.is_empty()).then_some(name.as_str())
+                }))
+                .filter(|name| !name.starts_with('.'))
+                .collect();
+            available.sort_unstable();
+            available.dedup();
+            return Err(format!(
+                "task '{task_name}' is not a script in package.json, a task with a command, or a meta-task with dependsOn in lpm.json. Available: {}",
+                available.join(", ")
+            ));
+        }
+        if let Some(task) = task {
+            for dependency in &task.depends_on {
+                if let Some(upstream) = dependency.strip_prefix('^')
+                    && (upstream.is_empty() || upstream.starts_with('^'))
+                {
+                    return Err(format!(
+                        "task '{task_name}' has invalid upstream dependency '{dependency}'"
+                    ));
+                }
+            }
+        }
+
         // Get local dependencies from lpm.json task config (skip upstream `^` deps)
         let local_deps: Vec<String> = tasks
             .get(&task_name)

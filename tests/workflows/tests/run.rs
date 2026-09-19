@@ -13,6 +13,194 @@ use wiremock::matchers::{header, method, path_regex};
 use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
 
 #[test]
+fn run_validates_every_requested_task_before_starting_any_task() {
+    for flags in [&[][..], &["--parallel"][..], &["--stream"][..]] {
+        let project =
+            TempProject::empty(r#"{"name":"task-preflight","scripts":{"first":"node first.js"}}"#);
+        project.write_file("first.js", "require('fs').writeFileSync('ran','yes');");
+        let output = lpm(&project)
+            .args(["run", "first", "missing"])
+            .args(flags)
+            .output()
+            .unwrap();
+        assert!(!output.status.success());
+        assert!(
+            !project.file_exists("ran"),
+            "a task ran before all requested names were validated: {flags:?}"
+        );
+    }
+}
+
+#[test]
+fn run_rejects_upstream_dependencies_without_workspace_selection() {
+    for dependency in ["^", "^^build", "^build"] {
+        for flags in [
+            &[][..],
+            &["--parallel"][..],
+            &["--stream"][..],
+            &["--json"][..],
+        ] {
+            let project = TempProject::empty(r#"{"name":"task-upstream-context"}"#);
+            project.write_file("lpm.json", &serde_json::json!({"tasks":{"build":{"command":"node build.js","dependsOn":[dependency]}}}).to_string());
+            project.write_file("build.js", "require('fs').writeFileSync('ran','yes');");
+            let output = lpm(&project)
+                .args(["run", "build"])
+                .args(flags)
+                .output()
+                .unwrap();
+            assert!(
+                !output.status.success(),
+                "ignored upstream dependency {dependency} with {flags:?}"
+            );
+            assert!(!project.file_exists("ran"));
+        }
+    }
+}
+
+#[test]
+fn watch_rejects_upstream_dependencies_before_starting_tasks() {
+    let project = TempProject::empty(r#"{"name":"watch-upstream-context"}"#);
+    project.write_file(
+        "lpm.json",
+        r#"{"tasks":{"build":{"command":"node build.js","dependsOn":["^build"]}}}"#,
+    );
+    project.write_file("build.js", "require('fs').writeFileSync('ran','yes');");
+    let mut watcher = TaskWatcher::start(&project, "build", &[]);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    while watcher.child.try_wait().unwrap().is_none() && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert!(!project.file_exists("ran"));
+    assert!(
+        watcher
+            .child
+            .try_wait()
+            .unwrap()
+            .is_some_and(|status| !status.success())
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn parallel_preparation_errors_wait_for_started_tasks() {
+    if std::thread::available_parallelism().map_or(1, |n| n.get()) < 3 {
+        return;
+    }
+    let project = TempProject::empty(r#"{"name":"parallel-worker-cleanup"}"#);
+    project.write_file("lpm.json", r#"{"tasks":{
+      "gate":{"command":"node gate.js"},
+      "bad":{"command":"echo should-not-run","cache":true,"inputs":["src/**"],"outputs":["dist/**"]},
+      "slow":{"command":"node slow.js"}
+    }}"#);
+    write_preparation_barriers(&project, "", "");
+    let external = tempfile::tempdir().unwrap();
+    std::fs::write(external.path().join("input"), "outside").unwrap();
+    std::fs::create_dir(project.path().join("src")).unwrap();
+    std::os::unix::fs::symlink(
+        external.path().join("input"),
+        project.path().join("src/input"),
+    )
+    .unwrap();
+    assert_preparation_error_drains_tasks(
+        &project,
+        &["run", "gate", "bad", "slow", "--parallel"],
+        "",
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn workspace_preparation_errors_wait_for_started_members() {
+    let project =
+        TempProject::empty(r#"{"name":"workspace-worker-cleanup","workspaces":["packages/*"]}"#);
+    for name in ["a", "b"] {
+        project.write_file(
+            &format!("packages/{name}/package.json"),
+            &serde_json::json!({"name":name,"version":"1.0.0"}).to_string(),
+        );
+    }
+    project.write_file(
+        "packages/a/lpm.json",
+        r#"{"tasks":{
+      "gate":{"command":"node gate.js"},
+      "bad":{"command":"echo should-not-run","cache":true,"inputs":["src/**"],"outputs":["dist/**"]}
+    }}"#,
+    );
+    project.write_file(
+        "packages/b/lpm.json",
+        r#"{"tasks":{"gate":{"command":"node slow.js"},"bad":{"command":"echo done"}}}"#,
+    );
+    write_preparation_barriers(&project, "packages/a/", "packages/b/");
+    let external = tempfile::tempdir().unwrap();
+    std::fs::write(external.path().join("input"), "outside").unwrap();
+    std::fs::create_dir(project.path().join("packages/a/src")).unwrap();
+    std::os::unix::fs::symlink(
+        external.path().join("input"),
+        project.path().join("packages/a/src/input"),
+    )
+    .unwrap();
+    assert_preparation_error_drains_tasks(
+        &project,
+        &[
+            "run",
+            "gate",
+            "bad",
+            "--all",
+            "--workspace-concurrency",
+            "2",
+        ],
+        "packages/b/",
+    );
+}
+
+#[cfg(unix)]
+fn write_preparation_barriers(project: &TempProject, gate_dir: &str, slow_dir: &str) {
+    let ready = project.path().join(format!("{slow_dir}slow.ready"));
+    project.write_file(&format!("{gate_dir}gate.js"), &format!(
+        "const fs=require('fs'); const deadline=Date.now()+8000; const timer=setInterval(()=>{{if(fs.existsSync({})||Date.now()>deadline)clearInterval(timer);}},10);",
+        serde_json::to_string(&ready).unwrap()
+    ));
+    project.write_file(&format!("{slow_dir}slow.js"), "const fs=require('fs');fs.writeFileSync('slow.ready','yes');const deadline=Date.now()+8000;const timer=setInterval(()=>{if(fs.existsSync('slow.release')||Date.now()>deadline){clearInterval(timer);fs.writeFileSync('slow.done','yes');}},10);");
+}
+
+#[cfg(unix)]
+fn assert_preparation_error_drains_tasks(project: &TempProject, args: &[&str], slow_dir: &str) {
+    let diagnostics = project.path().join("worker-error.log");
+    let mut command = lpm_spawnable(project);
+    command
+        .args(args)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::fs::File::create(&diagnostics).unwrap());
+    let mut child = command.spawn().unwrap();
+    wait_for_task_marker(
+        &mut child,
+        &project.path().join(format!("{slow_dir}slow.ready")),
+        "slow task startup",
+    );
+    std::thread::sleep(std::time::Duration::from_millis(400));
+    let premature = child.try_wait().unwrap().is_some();
+    project.write_file(&format!("{slow_dir}slow.release"), "go");
+    let status = child.wait().unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    while !project.file_exists(&format!("{slow_dir}slow.done"))
+        && std::time::Instant::now() < deadline
+    {
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert!(!status.success());
+    assert!(
+        std::fs::read_to_string(diagnostics)
+            .unwrap()
+            .contains("outside project")
+    );
+    assert!(
+        !premature,
+        "CLI returned while a started task was still active"
+    );
+    assert!(project.file_exists(&format!("{slow_dir}slow.done")));
+}
+
+#[test]
 fn run_rejects_an_invalid_env_schema_regex_before_starting_the_script() {
     let project = TempProject::empty(
         r#"{

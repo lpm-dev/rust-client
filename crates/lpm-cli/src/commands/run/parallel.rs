@@ -566,6 +566,7 @@ pub(super) fn run_tasks_parallel(
 
                 // Collect results — failed tasks dump stderr after summary
                 let mut failed_outputs: Vec<(String, String)> = Vec::new();
+                let mut preparation_error = None;
 
                 for (i, handle) in handles.into_iter().enumerate() {
                     match handle.join() {
@@ -601,7 +602,9 @@ pub(super) fn run_tasks_parallel(
                             print_task_result(&result);
                             all_results.push(result);
                         }
-                        Ok(Err(error)) => return Err(error),
+                        Ok(Err(error)) => {
+                            preparation_error.get_or_insert(error);
+                        }
                         Err(_) => {
                             let name = chunk_names[i].clone();
                             install_ui::detail_line(format_run_failure_detail(
@@ -628,6 +631,9 @@ pub(super) fn run_tasks_parallel(
                     install_ui::detail_line(format_failed_task_output_header(name));
                     print_captured_stderr(stderr);
                     install_ui::detail_line(format_failed_task_output_footer());
+                }
+                if let Some(error) = preparation_error {
+                    return Err(error);
                 }
             }
         }

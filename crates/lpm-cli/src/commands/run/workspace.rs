@@ -619,7 +619,8 @@ pub async fn run_workspace(
         } else {
             // Multiple packages in this level — run in parallel
             for chunk in level_targets.chunks(workspace_concurrency) {
-                let handles: Vec<_> = chunk
+                std::thread::scope(|scope| -> Result<(), LpmError> {
+                    let handles: Vec<_> = chunk
                     .iter()
                     .map(|&idx| -> Result<_, LpmError> {
                         let member_dir = ws_graph.members[idx].path.clone();
@@ -649,7 +650,7 @@ pub async fn run_workspace(
                             &completed_task_states,
                         );
 
-                        Ok((idx, std::thread::spawn(move || -> Result<_, LpmError> {
+                        Ok((idx, scope.spawn(move || -> Result<_, LpmError> {
                             let report = run_workspace_package(
                                 &member_dir,
                                 workspace_contract.as_ref(),
@@ -680,26 +681,29 @@ pub async fn run_workspace(
                     })
                     .collect::<Result<_, _>>()?;
 
-                for (idx, handle) in handles {
-                    match handle.join() {
-                        Ok(Ok((report, identities))) => {
-                            completed_task_identities[idx] = identities;
-                            completed_task_states[idx] = Some(report.task_states());
-                            if report.is_successful() {
-                                succeeded.fetch_add(1, Ordering::Relaxed);
-                            } else {
-                                failed_flag.store(true, Ordering::Relaxed);
+                    for (idx, handle) in handles {
+                        match handle.join() {
+                            Ok(Ok((report, identities))) => {
+                                completed_task_identities[idx] = identities;
+                                completed_task_states[idx] = Some(report.task_states());
+                                if report.is_successful() {
+                                    succeeded.fetch_add(1, Ordering::Relaxed);
+                                } else {
+                                    failed_flag.store(true, Ordering::Relaxed);
+                                }
+                            }
+                            Ok(Err(error)) => return Err(error),
+                            Err(_) => {
+                                return Err(LpmError::Task(format!(
+                                    "workspace task thread panicked for '{}'",
+                                    ws_graph.members[idx].name
+                                )));
                             }
                         }
-                        Ok(Err(error)) => return Err(error),
-                        Err(_) => {
-                            return Err(LpmError::Task(format!(
-                                "workspace task thread panicked for '{}'",
-                                ws_graph.members[idx].name
-                            )));
-                        }
                     }
-                }
+
+                    Ok(())
+                })?;
 
                 if !continue_on_error && failed_flag.load(Ordering::Relaxed) {
                     break;
