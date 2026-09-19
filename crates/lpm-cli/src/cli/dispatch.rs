@@ -345,14 +345,7 @@ async fn async_main() -> Result<()> {
     // methods (Step 4). The eager `try_silent_refresh` + 24h `whoami`
     // block that lived here pre-existing is gone.
     //
-    // `cli.token` carries either an explicit `--token` value or the
-    // `LPM_TOKEN` env (clap merges them). When the value matches
-    // `LPM_TOKEN` exactly, treat it as env-sourced so SessionManager
-    // can classify it correctly; otherwise it's an explicit flag value.
-    let explicit_flag_token = cli
-        .token
-        .clone()
-        .filter(|t| std::env::var("LPM_TOKEN").ok().as_deref() != Some(t.as_str()));
+    let explicit_flag_token = cli.token.clone();
     let session_registry_url = match &command {
         Commands::Setup(args) => match &args.action {
             SetupAction::Ci {

@@ -92,7 +92,7 @@ pub async fn run(client: &RegistryClient, json_output: bool) -> Result<(), LpmEr
     }
     if storage_status.degraded {
         whoami_ui::warn(
-            "Encrypted file fallback is active; unlock or repair the OS keychain and run `lpm login` again to use keychain storage.",
+            "Encrypted file fallback is active; unlock or repair the OS keychain, run `lpm logout`, then run `lpm login` again to use keychain storage.",
         );
     }
 

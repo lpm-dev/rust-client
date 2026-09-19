@@ -76,6 +76,7 @@ pub async fn run(
     registry_url: &str,
     json_output: bool,
 ) -> Result<(), LpmError> {
+    client.validate_base_url()?;
     let existing_session_client = match client.session() {
         Some(session) => {
             let stored_session = Arc::new(session.stored_session_only());
@@ -98,7 +99,13 @@ pub async fn run(
                     .as_deref()
                     .or(info.username.as_deref())
                     .unwrap_or("unknown");
-                if !json_output {
+                if json_output {
+                    print_login_json(
+                        name,
+                        registry_url,
+                        lpm_auth::auth_storage_status(registry_url),
+                    );
+                } else {
                     install_ui::done_line(crate::install_ui::terminal_line!(
                         "Already logged in as {}. Use {} to log out first.",
                         install_ui::cyan(name),
@@ -181,9 +188,7 @@ pub async fn run(
         install_ui::phase("Exchanging authorization code");
     }
     let exchange_url = format!("{registry_url}/api/cli/exchange");
-    let http_client = lpm_http::client_builder()
-        .build()
-        .map_err(|error| LpmError::Registry(format!("exchange client build failed: {error}")))?;
+    let http_client = exchange_client(std::time::Duration::from_secs(30))?;
     let resp = http_client
         .post(&exchange_url)
         .json(&serde_json::json!({ "code": code, "code_verifier": code_verifier }))
@@ -218,9 +223,7 @@ pub async fn run(
     let refresh_token = session.refresh_token;
 
     // Verify the token via whoami
-    let client = RegistryClient::new()
-        .with_base_url(registry_url.to_string())
-        .with_token(&token);
+    let client = verification_client(client, registry_url, &token);
 
     let info = client
         .whoami()
@@ -239,20 +242,38 @@ pub async fn run(
             .await?;
 
     if json_output {
-        let json = serde_json::json!({
-            "success": true,
-            "username": username,
-            "registry": registry_url,
-            "storage_backend": storage_status.backend_json_value(),
-            "storage_degraded": storage_status.degraded,
-        });
-        println!("{}", serde_json::to_string_pretty(&json).unwrap());
+        print_login_json(&username, registry_url, storage_status);
     } else {
         let email_str = info.username.as_deref().unwrap_or("");
         emit_browser_login_success(&username, email_str, registry_url, storage_status);
     }
 
     Ok(())
+}
+
+fn exchange_client(timeout: std::time::Duration) -> Result<reqwest::Client, LpmError> {
+    lpm_http::client_builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(timeout)
+        .build()
+        .map_err(|error| LpmError::Registry(format!("exchange client build failed: {error}")))
+}
+
+fn verification_client(client: &RegistryClient, registry_url: &str, token: &str) -> RegistryClient {
+    client
+        .clone_with_static_token(token)
+        .with_base_url(registry_url.to_string())
+}
+
+fn print_login_json(username: &str, registry_url: &str, storage: auth::AuthStorageStatus) {
+    let json = serde_json::json!({
+        "success": true,
+        "username": username,
+        "registry": registry_url,
+        "storage_backend": storage.backend_json_value(),
+        "storage_degraded": storage.degraded,
+    });
+    println!("{}", serde_json::to_string_pretty(&json).unwrap());
 }
 
 fn emit_browser_login_success(
@@ -278,7 +299,7 @@ fn emit_browser_login_success(
     }
     if storage_status.degraded {
         install_ui::warn(
-            "Encrypted file fallback is active; unlock or repair the OS keychain and run `lpm login` again to use keychain storage.",
+            "Encrypted file fallback is active; unlock or repair the OS keychain, run `lpm logout`, then run `lpm login` again to use keychain storage.",
         );
     }
 }
@@ -351,49 +372,38 @@ async fn handle_callback(stream: tokio::net::TcpStream, expected_state: &str) ->
     let mut stream = stream;
     let mut buf = vec![0u8; 8192];
 
-    let mut total = match tokio::time::timeout(
-        std::time::Duration::from_secs(2),
-        stream.read(&mut buf),
-    )
-    .await
-    {
-        Ok(Ok(n)) if n > 0 => n,
-        _ => return None,
-    };
-
-    // For POST requests the body may arrive in a separate TCP segment.
-    // Check if we have the full body by parsing Content-Length from headers.
-    let request_so_far = String::from_utf8_lossy(&buf[..total]);
-    if let Some(header_end) = request_so_far.find("\r\n\r\n") {
-        let headers = &request_so_far[..header_end];
-        // Extract Content-Length (case-insensitive)
-        let content_length: usize = headers
-            .lines()
-            .find_map(|line| {
-                let lower = line.to_ascii_lowercase();
-                lower
-                    .strip_prefix("content-length:")
-                    .and_then(|v| v.trim().parse().ok())
-            })
-            .unwrap_or(0);
-
-        let body_start = header_end + 4; // skip \r\n\r\n
-
-        // Keep reading until we have the full body (with a short timeout)
-        while total.saturating_sub(body_start) < content_length && total < buf.len() {
-            match tokio::time::timeout(
-                std::time::Duration::from_secs(2),
-                stream.read(&mut buf[total..]),
-            )
-            .await
-            {
-                Ok(Ok(n)) if n > 0 => total += n,
-                _ => break,
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+    let mut total = 0;
+    let request_end = loop {
+        if let Some(header_end) = buf[..total].windows(4).position(|part| part == b"\r\n\r\n") {
+            let headers = String::from_utf8_lossy(&buf[..header_end]);
+            let content_length = headers
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse::<usize>())
+                })
+                .transpose()
+                .ok()?
+                .unwrap_or(0);
+            if content_length > buf.len().saturating_sub(header_end + 4) {
+                return None;
+            }
+            if total >= header_end + 4 + content_length {
+                break header_end + 4 + content_length;
             }
         }
-    }
+        if total == buf.len() {
+            return None;
+        }
+        match tokio::time::timeout_at(deadline, stream.read(&mut buf[total..])).await {
+            Ok(Ok(n)) if n > 0 => total += n,
+            _ => return None,
+        }
+    };
 
-    let request = String::from_utf8_lossy(&buf[..total]);
+    let request = String::from_utf8_lossy(&buf[..request_end]);
 
     // Parse request line
     let first_line = request.lines().next().unwrap_or("");
@@ -688,6 +698,122 @@ fn generate_pkce_pair() -> (String, String) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn exchange_client_refuses_redirects_that_replay_pkce_secrets() {
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let destination = MockServer::start().await;
+        let source = MockServer::start().await;
+        Mock::given(wiremock::matchers::any())
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&destination)
+            .await;
+        Mock::given(wiremock::matchers::any())
+            .respond_with(ResponseTemplate::new(307).insert_header("location", destination.uri()))
+            .mount(&source)
+            .await;
+        let response = exchange_client(std::time::Duration::from_secs(1))
+            .unwrap()
+            .post(source.uri())
+            .json(&serde_json::json!({"code":"secret-code", "code_verifier":"secret-verifier"}))
+            .send()
+            .await
+            .unwrap();
+        assert!(response.status().is_redirection());
+        assert!(destination.received_requests().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn exchange_client_bounds_stalled_headers_and_body() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        for headers in [false, true] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut request = [0u8; 4096];
+                assert!(stream.read(&mut request).await.unwrap() > 0);
+                if headers {
+                    stream
+                        .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\n{")
+                        .await
+                        .unwrap();
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+            });
+            let client = exchange_client(std::time::Duration::from_millis(50)).unwrap();
+            let result = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+                match client.post(format!("http://{address}")).send().await {
+                    Ok(response) => read_capped_exchange_body(response).await.map(|_| ()),
+                    Err(error) => Err(LpmError::Registry(error.to_string())),
+                }
+            })
+            .await;
+            server.abort();
+            assert!(
+                matches!(result, Ok(Err(_))),
+                "exchange must time out for headers={headers}"
+            );
+        }
+    }
+
+    #[test]
+    fn verification_preserves_explicit_insecure_transport_choice() {
+        let client = RegistryClient::new().with_insecure(true);
+        let verify = verification_client(&client, "http://registry.example.test", "new-token");
+        assert!(verify.allow_insecure());
+        assert!(verify.validate_base_url().is_ok());
+        assert!(
+            verification_client(
+                &RegistryClient::new(),
+                "http://registry.example.test",
+                "new-token"
+            )
+            .validate_base_url()
+            .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn callback_accepts_fragmented_headers() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            handle_callback(stream, "expected-state").await
+        });
+        let mut client = tokio::net::TcpStream::connect(address).await.unwrap();
+        let code = "a".repeat(64);
+        let body = format!("code={code}&state=expected-state");
+        client
+            .write_all(b"POST /callback HTTP/1.1\r\nHost: localhost\r\n")
+            .await
+            .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+        let _ = client
+            .write_all(format!("Content-Length: {}\r\n\r\n{body}", body.len()).as_bytes())
+            .await;
+        let mut response = String::new();
+        let _ = client.read_to_string(&mut response).await;
+        assert_eq!(
+            server.await.unwrap().as_deref(),
+            Some(code.as_str()),
+            "{response}"
+        );
+        assert!(response.starts_with("HTTP/1.1 200"));
+    }
+
+    #[tokio::test]
+    async fn callback_ignores_credentials_beyond_declared_body() {
+        let request = format!(
+            "POST /callback HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\n\r\ncode={}&state=expected-state",
+            "a".repeat(64)
+        );
+        let (response, code) = send_callback_request(&request).await;
+        assert!(code.is_none());
+        assert!(response.starts_with("HTTP/1.1 400"));
+    }
 
     fn valid_exchange_session() -> serde_json::Value {
         serde_json::json!({
