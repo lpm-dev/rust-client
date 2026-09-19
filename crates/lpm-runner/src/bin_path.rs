@@ -137,6 +137,14 @@ impl ManagedRuntimeInventory {
         project_dir: &Path,
     ) -> Result<ManagedRuntimeHint, lpm_common::LpmError> {
         let detected = lpm_runtime::detect::detect_runtime_versions(project_dir)?;
+        self.resolve_detected(&detected)
+    }
+
+    /// Resolve previously read selectors using the cached installed runtime inventories.
+    pub fn resolve_detected(
+        &self,
+        detected: &[lpm_runtime::detect::DetectedRuntimeVersion],
+    ) -> Result<ManagedRuntimeHint, lpm_common::LpmError> {
         let mut bins = Vec::with_capacity(detected.len());
         for runtime in detected {
             if !runtime.is_runtime_selector() {

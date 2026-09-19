@@ -4,7 +4,7 @@ use lpm_runner::execution::ExecutionSignals;
 use std::process::Command;
 use std::sync::Arc;
 
-pub(super) async fn run(
+pub(in crate::commands) async fn run(
     mut command: Command,
     stdio: StdioMode,
     signals: Arc<ExecutionSignals>,
@@ -31,7 +31,7 @@ pub(super) async fn run(
     .unwrap_or_else(|error| runner_error(LpmError::Script(format!("tool task failed: {error}"))))
 }
 
-pub(super) fn write_json(
+pub(in crate::commands) fn write_json(
     value: &serde_json::Value,
     signals: &ExecutionSignals,
 ) -> Result<(), LpmError> {

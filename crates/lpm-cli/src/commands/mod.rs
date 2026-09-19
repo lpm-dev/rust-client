@@ -74,6 +74,8 @@ pub mod swift_registry;
 pub mod third_party_login;
 pub mod tidy;
 pub mod token;
+mod tool_execution;
+mod tool_runtime;
 pub mod tools;
 pub mod tools_ui;
 pub mod trust;
