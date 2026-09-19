@@ -932,6 +932,17 @@ pub(crate) struct DescendantProcessSnapshot {
 }
 
 impl DescendantProcessSnapshot {
+    #[cfg(unix)]
+    pub(crate) fn signal_surviving_descendants(&self, root_pid: u32, signal: i32) {
+        for (&pid, expected) in &self.identities {
+            if pid != root_pid
+                && let Some(expected) = expected
+            {
+                let _ = signal_unix_pid_if_process_identity(pid, expected, signal);
+            }
+        }
+    }
+
     pub(crate) fn process_ids(&self) -> HashSet<u32> {
         self.identities.keys().copied().collect()
     }
