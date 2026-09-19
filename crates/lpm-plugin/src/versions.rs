@@ -27,6 +27,10 @@ const GITHUB_API_RESPONSE_CAP_BYTES: usize = 1024 * 1024;
 #[derive(Debug, serde::Deserialize)]
 struct GithubRelease {
     tag_name: String,
+    #[serde(default)]
+    draft: bool,
+    #[serde(default)]
+    prerelease: bool,
 }
 
 /// Cached install-selection state. Each entry is the highest version
@@ -83,6 +87,15 @@ pub fn is_newer_semver(a: &str, b: &str) -> bool {
     }
 }
 
+pub(crate) fn compare_versions(a: &str, b: &str) -> std::cmp::Ordering {
+    match (lpm_semver::Version::parse(a), lpm_semver::Version::parse(b)) {
+        (Ok(a), Ok(b)) => a.cmp(&b),
+        (Ok(_), Err(_)) => std::cmp::Ordering::Greater,
+        (Err(_), Ok(_)) => std::cmp::Ordering::Less,
+        (Err(_), Err(_)) => a.cmp(b),
+    }
+}
+
 /// Read a cached version for a plugin.
 fn read_cached_version(plugin_name: &str) -> Option<String> {
     let cache = read_cache().ok()?;
@@ -106,26 +119,34 @@ fn write_cached_version_at(
     plugin_name: &str,
     version: &str,
 ) -> Result<(), LpmError> {
-    let mut cache = read_cache_at(cache_path).unwrap_or_default();
-    cache
-        .versions
-        .insert(plugin_name.to_string(), version.to_string());
+    lpm_common::with_exclusive_lock(cache_path.with_extension("lock"), || {
+        let mut cache = read_cache_at(cache_path).unwrap_or_default();
+        if cache
+            .versions
+            .get(plugin_name)
+            .is_none_or(|current| is_newer_semver(version, current))
+        {
+            cache
+                .versions
+                .insert(plugin_name.to_string(), version.to_string());
+        }
 
-    if let Some(parent) = cache_path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
+        if let Some(parent) = cache_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
 
-    let json = serde_json::to_string(&cache)
-        .map_err(|e| LpmError::Plugin(format!("failed to serialize version cache: {e}")))?;
+        let json = serde_json::to_string(&cache)
+            .map_err(|e| LpmError::Plugin(format!("failed to serialize version cache: {e}")))?;
 
-    lpm_common::write_file_atomic_with_options(
-        cache_path,
-        json,
-        lpm_common::AtomicWriteOptions::new().unix_mode(0o600),
-    )
-    .map_err(|e| LpmError::Plugin(format!("failed to write version cache: {e}")))?;
+        lpm_common::write_file_atomic_with_options(
+            cache_path,
+            json,
+            lpm_common::AtomicWriteOptions::new().unix_mode(0o600),
+        )
+        .map_err(|e| LpmError::Plugin(format!("failed to write version cache: {e}")))?;
 
-    Ok(())
+        Ok(())
+    })
 }
 
 fn read_cache() -> Result<VersionCache, LpmError> {
@@ -260,63 +281,159 @@ pub async fn peek_latest_from_github_with_client(
     let (owner, repo) = parse_github_owner_repo(def)?;
     let tag_prefix = tag_prefix_for_plugin(def);
 
-    let tag = if let Some(prefix) = tag_prefix {
-        let api_url = format!(
-            "{}/repos/{owner}/{repo}/releases?per_page=20",
-            github_api_base()
-        );
-
-        let resp = build_github_request(client, &api_url)
+    let mut best: Option<lpm_semver::Version> = None;
+    for page in 1..=100 {
+        let url = if tag_prefix.is_some() {
+            let mut url = format!(
+                "{}/repos/{owner}/{repo}/releases?per_page=20",
+                github_api_base()
+            );
+            if page > 1 {
+                url.push_str(&format!("&page={page}"));
+            }
+            url
+        } else {
+            format!("{}/repos/{owner}/{repo}/releases/latest", github_api_base())
+        };
+        let response = build_github_request(client, &url)
             .send()
             .await
-            .map_err(|e| format!("github request failed: {}", lpm_http::display_error(&e)))?;
-
-        if let Some(rate_err) = check_rate_limit(&resp) {
-            return Err(rate_err);
+            .map_err(|error| {
+                format!("github request failed: {}", lpm_http::display_error(&error))
+            })?;
+        if let Some(error) = check_rate_limit(&response) {
+            return Err(error);
         }
-        if !resp.status().is_success() {
-            return Err(format!("github API returned {}", resp.status()));
+        if !response.status().is_success() {
+            return Err(format!("github API returned {}", response.status()));
         }
-
-        let releases: Vec<GithubRelease> = read_capped_github_json(resp).await?;
-
-        releases
-            .iter()
-            .map(|release| release.tag_name.as_str())
-            .find(|tag| tag.starts_with(prefix))
-            .ok_or_else(|| {
-                format!("no release found with tag prefix '{prefix}' in {owner}/{repo}")
-            })?
-            .to_string()
-    } else {
-        let api_url = format!("{}/repos/{owner}/{repo}/releases/latest", github_api_base());
-
-        let resp = build_github_request(client, &api_url)
-            .send()
-            .await
-            .map_err(|e| format!("github request failed: {}", lpm_http::display_error(&e)))?;
-
-        if let Some(rate_err) = check_rate_limit(&resp) {
-            return Err(rate_err);
+        let more = tag_prefix.is_some()
+            && response
+                .headers()
+                .get("link")
+                .and_then(|value| value.to_str().ok())
+                .is_some_and(|value| value.contains("rel=\"next\""));
+        let releases = if tag_prefix.is_some() {
+            read_capped_github_json::<Vec<GithubRelease>>(response).await?
+        } else {
+            vec![read_capped_github_json::<GithubRelease>(response).await?]
+        };
+        for release in releases {
+            if release.draft
+                || release.prerelease
+                || tag_prefix.is_some_and(|prefix| !release.tag_name.starts_with(prefix))
+            {
+                continue;
+            }
+            let value = extract_version_from_tag(&release.tag_name);
+            if !is_semver_like(&value) {
+                continue;
+            }
+            let Ok(version) = lpm_semver::Version::parse(&value) else {
+                continue;
+            };
+            if !version.is_prerelease() && best.as_ref().is_none_or(|current| version > *current) {
+                best = Some(version);
+            }
         }
-        if !resp.status().is_success() {
-            return Err(format!("github API returned {}", resp.status()));
+        if !more {
+            return best.map(|version| version.to_string()).ok_or_else(|| {
+                format!("no stable release found for {} in {owner}/{repo}", def.name)
+            });
         }
-
-        read_capped_github_json::<GithubRelease>(resp)
-            .await?
-            .tag_name
-    };
-
-    let version = extract_version_from_tag(&tag);
-
-    if !is_semver_like(&version) {
-        return Err(format!(
-            "extracted version '{version}' from tag '{tag}' doesn't look like semver"
-        ));
     }
+    Err(format!(
+        "release discovery for {} exceeded 100 pages; latest version is unknown",
+        def.name
+    ))
+}
 
-    Ok(version)
+#[derive(serde::Deserialize)]
+struct ReleaseWithAssets {
+    tag_name: String,
+    draft: bool,
+    assets: Vec<ReleaseAsset>,
+}
+
+#[derive(serde::Deserialize)]
+struct ReleaseAsset {
+    name: String,
+    browser_download_url: String,
+    digest: Option<String>,
+}
+
+pub(crate) async fn release_asset_checksum(
+    def: &PluginDef,
+    version: &str,
+    platform: &str,
+    asset_url: &str,
+    client: &reqwest::Client,
+) -> Result<String, String> {
+    release_asset_checksum_at(
+        def,
+        version,
+        platform,
+        asset_url,
+        client,
+        "https://api.github.com",
+    )
+    .await
+}
+
+async fn release_asset_checksum_at(
+    def: &PluginDef,
+    version: &str,
+    platform: &str,
+    asset_url: &str,
+    client: &reqwest::Client,
+    api_base: &str,
+) -> Result<String, String> {
+    let (owner, repo) = parse_github_owner_repo(def)?;
+    let name = crate::registry::resolve_platform_asset(def, platform)
+        .ok_or("unsupported plugin platform")?;
+    let expected_url = def
+        .url_template
+        .replace("{version}", version)
+        .replace("{platform}", name);
+    if asset_url != expected_url {
+        return Err("release asset download URL does not match the plugin definition".into());
+    }
+    let tag = format!("{}{version}", tag_prefix_for_plugin(def).unwrap_or("v"));
+    let mut url = reqwest::Url::parse(api_base).map_err(|error| error.to_string())?;
+    url.path_segments_mut()
+        .map_err(|()| "invalid GitHub API base")?
+        .pop_if_empty()
+        .extend(["repos", &owner, &repo, "releases", "tags", &tag]);
+    let response = build_github_request(client, url.as_str())
+        .timeout(std::time::Duration::from_secs(5))
+        .send()
+        .await
+        .map_err(|error| format!("github request failed: {}", lpm_http::display_error(&error)))?;
+    if let Some(error) = check_rate_limit(&response) {
+        return Err(error);
+    }
+    if !response.status().is_success() {
+        return Err(format!("github API returned {}", response.status()));
+    }
+    if response.url().origin() != url.origin() {
+        return Err("release digest response redirected outside the trusted API origin".into());
+    }
+    let release: ReleaseWithAssets = read_capped_github_json(response).await?;
+    if release.draft || release.tag_name != tag {
+        return Err("release metadata does not match the requested published tag".into());
+    }
+    let mut matching = release.assets.iter().filter(|asset| asset.name == name);
+    let asset = matching.next().ok_or("release asset is missing")?;
+    if matching.next().is_some() || asset.browser_download_url != asset_url {
+        return Err("release asset identity is ambiguous or mismatched".into());
+    }
+    let digest = asset
+        .digest
+        .as_deref()
+        .and_then(|value| value.strip_prefix("sha256:"))
+        .filter(|value| value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit()))
+        .ok_or("release asset has no valid SHA-256 digest")?;
+    Ok(digest.to_ascii_lowercase())
 }
 
 async fn read_capped_github_json<T: serde::de::DeserializeOwned>(
@@ -695,5 +812,166 @@ mod tests {
         let before = read_cache_at(&path).unwrap();
         let after = read_cache_at(&path).unwrap();
         assert_eq!(before.versions, after.versions);
+    }
+
+    #[test]
+    fn concurrent_approvals_preserve_every_plugin_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(".version-cache.json");
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(24));
+        std::thread::scope(|scope| {
+            for index in 0..24 {
+                let path = &path;
+                let barrier = std::sync::Arc::clone(&barrier);
+                scope.spawn(move || {
+                    barrier.wait();
+                    write_cached_version_at(path, &format!("tool{index}"), "1.0.0").unwrap();
+                });
+            }
+        });
+        assert_eq!(read_cache_at(&path).unwrap().versions.len(), 24);
+    }
+
+    #[test]
+    fn an_older_approval_does_not_downgrade_the_selected_version() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(".version-cache.json");
+        write_cached_version_at(&path, "oxlint", "2.10.0").unwrap();
+        write_cached_version_at(&path, "oxlint", "2.9.0").unwrap();
+        assert_eq!(read_cache_at(&path).unwrap().versions["oxlint"], "2.10.0");
+    }
+    #[tokio::test]
+    async fn release_digest_requires_exact_tag_asset_and_url() {
+        use wiremock::{
+            Mock, MockServer, ResponseTemplate,
+            matchers::{method, path},
+        };
+        for plugin in ["oxlint", "biome"] {
+            let def = crate::registry::get_plugin(plugin).unwrap();
+            let version = "1.0.0";
+            let platform = "darwin-arm64";
+            let name = crate::registry::resolve_platform_asset(def, platform).unwrap();
+            let asset_url = def
+                .url_template
+                .replace("{version}", version)
+                .replace("{platform}", name);
+            let tag = format!("{}{version}", tag_prefix_for_plugin(def).unwrap());
+            let (owner, repo) = parse_github_owner_repo(def).unwrap();
+            let mut endpoint = reqwest::Url::parse("http://localhost/").unwrap();
+            endpoint
+                .path_segments_mut()
+                .unwrap()
+                .extend(["repos", &owner, &repo, "releases", "tags", &tag]);
+            let valid = serde_json::json!({"tag_name":tag,"draft":false,"assets":[{
+                "name":name,"browser_download_url":asset_url,"digest":format!("sha256:{}", "A".repeat(64))
+            }]});
+            for case in [
+                "valid",
+                "tag",
+                "draft",
+                "name",
+                "url",
+                "algorithm",
+                "digest",
+                "duplicate",
+                "missing",
+            ] {
+                let mut body = valid.clone();
+                match case {
+                    "tag" => body["tag_name"] = "wrong-tag".into(),
+                    "draft" => body["draft"] = true.into(),
+                    "name" => body["assets"][0]["name"] = "other.bin".into(),
+                    "url" => {
+                        body["assets"][0]["browser_download_url"] =
+                            "https://example.test/other".into()
+                    }
+                    "algorithm" => {
+                        body["assets"][0]["digest"] = format!("sha512:{}", "a".repeat(64)).into()
+                    }
+                    "digest" => body["assets"][0]["digest"] = "sha256:bad".into(),
+                    "duplicate" => body["assets"]
+                        .as_array_mut()
+                        .unwrap()
+                        .push(valid["assets"][0].clone()),
+                    "missing" => body["assets"][0]
+                        .as_object_mut()
+                        .unwrap()
+                        .remove("digest")
+                        .map(|_| ())
+                        .unwrap(),
+                    _ => {}
+                }
+                let server = MockServer::start().await;
+                Mock::given(method("GET"))
+                    .and(path(endpoint.path()))
+                    .respond_with(ResponseTemplate::new(200).set_body_json(body))
+                    .expect(1)
+                    .mount(&server)
+                    .await;
+                let result = release_asset_checksum_at(
+                    def,
+                    version,
+                    platform,
+                    &asset_url,
+                    &github_client().unwrap(),
+                    &server.uri(),
+                )
+                .await;
+                if case == "valid" {
+                    assert_eq!(result.unwrap(), "a".repeat(64));
+                } else {
+                    assert!(result.is_err(), "{plugin}: {case}");
+                }
+            }
+        }
+    }
+    #[test]
+    fn mixed_version_ordering_is_transitive() {
+        for a in ["1.2.0", "1.10.0", "1.15x"] {
+            for b in ["1.2.0", "1.10.0", "1.15x"] {
+                for c in ["1.2.0", "1.10.0", "1.15x"] {
+                    if compare_versions(a, b).is_lt() && compare_versions(b, c).is_lt() {
+                        assert!(compare_versions(a, c).is_lt(), "{a} < {b} < {c}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn release_digest_rejects_a_redirect_to_another_origin() {
+        use wiremock::{Mock, MockServer, ResponseTemplate, matchers::method};
+        let initial = MockServer::start().await;
+        let destination = MockServer::start().await;
+        let def = crate::registry::get_plugin("oxlint").unwrap();
+        let name = crate::registry::resolve_platform_asset(def, "darwin-arm64").unwrap();
+        let asset_url = def
+            .url_template
+            .replace("{version}", "1.0.0")
+            .replace("{platform}", name);
+        Mock::given(method("GET"))
+            .respond_with(
+                ResponseTemplate::new(302)
+                    .insert_header("location", format!("{}/redirected", destination.uri())),
+            )
+            .mount(&initial)
+            .await;
+        Mock::given(method("GET")).respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "tag_name":"apps_v1.0.0","draft":false,"assets":[{
+                "name":name,"browser_download_url":asset_url,"digest":format!("sha256:{}", "a".repeat(64))
+            }]
+        }))).mount(&destination).await;
+        assert!(
+            release_asset_checksum_at(
+                def,
+                "1.0.0",
+                "darwin-arm64",
+                &asset_url,
+                &github_client().unwrap(),
+                &initial.uri()
+            )
+            .await
+            .is_err()
+        );
     }
 }

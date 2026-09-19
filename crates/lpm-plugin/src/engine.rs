@@ -413,8 +413,9 @@ pub async fn ensure_engine(
     let sidecar_path = engine_sidecar_path(def.name, &version, &platform_str)?;
     let platform_dir = engine_platform_dir(def.name, &version, &platform_str)?;
 
-    if matches!(
-        validate_for_reuse(
+    let lock_path = engine_install_lock_path(def.name, &version)?;
+    let decision = lpm_common::with_shared_lock_async(lock_path.clone(), async {
+        Ok(validate_for_reuse(
             &sidecar_path,
             &platform_dir,
             def.name,
@@ -422,13 +423,13 @@ pub async fn ensure_engine(
             &platform_str,
             &asset.entry_rel_path,
             &asset.packages,
-        ),
-        EngineReuseDecision::Hit,
-    ) {
+        ))
+    })
+    .await?;
+    if matches!(decision, EngineReuseDecision::Hit) {
         return Ok(entry_path);
     }
 
-    let lock_path = engine_install_lock_path(def.name, &version)?;
     let engine_name_owned = def.name.to_string();
     let version_owned = version.clone();
     let platform_owned = platform_str.clone();
@@ -473,16 +474,45 @@ pub fn get_latest_engine_version(engine_name: &str) -> Result<String, LpmError> 
 }
 
 pub fn list_installed_versions(engine_name: &str) -> Result<Vec<String>, LpmError> {
+    crate::storage::validate_name(engine_name)?;
     let dir = engines_dir()?.join(engine_name);
+    crate::storage::directory_if_present(&dir)?;
     if !dir.exists() {
         return Ok(Vec::new());
     }
-
     let mut versions = Vec::new();
     for entry in std::fs::read_dir(&dir)? {
         let entry = entry?;
-        if entry.path().is_dir() {
-            versions.push(entry.file_name().to_string_lossy().to_string());
+        let version = entry.file_name().to_string_lossy().into_owned();
+        if !entry.file_type()?.is_dir()
+            || validate_engine_version(&version).is_err()
+            || version.starts_with('.')
+        {
+            continue;
+        }
+        for platform in std::fs::read_dir(entry.path())? {
+            let platform = platform?;
+            if !platform.file_type()?.is_dir() {
+                continue;
+            }
+            let directory = platform.path();
+            let Ok(receipt) = read_sidecar(&directory.join(ENGINE_SIDECAR_FILE_NAME)) else {
+                continue;
+            };
+            let entry_path = Path::new(&receipt.entry_rel_path);
+            if receipt.schema_version == ENGINE_SCHEMA_VERSION
+                && receipt.engine_name == engine_name
+                && receipt.version == version
+                && receipt.platform == platform.file_name().to_string_lossy()
+                && !entry_path.as_os_str().is_empty()
+                && entry_path
+                    .components()
+                    .all(|part| matches!(part, std::path::Component::Normal(_)))
+                && directory.join(entry_path).is_file()
+            {
+                versions.push(version);
+                break;
+            }
         }
     }
     versions.sort_by(|a, b| compare_semver_like(a, b));
@@ -490,25 +520,28 @@ pub fn list_installed_versions(engine_name: &str) -> Result<Vec<String>, LpmErro
 }
 
 pub fn remove_version(engine_name: &str, version: &str) -> Result<bool, LpmError> {
-    let dir = engine_version_dir(engine_name, version)?;
-    if dir.exists() {
-        std::fs::remove_dir_all(&dir)?;
-        Ok(true)
-    } else {
-        Ok(false)
-    }
+    lpm_common::with_exclusive_lock(engine_install_lock_path(engine_name, version)?, || {
+        let dir = engine_version_dir(engine_name, version)?;
+        if dir.exists() {
+            std::fs::remove_dir_all(dir)?;
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    })
 }
 
 pub fn remove_all(engine_name: &str) -> Result<usize, LpmError> {
-    let dir = engines_dir()?.join(engine_name);
-    if !dir.exists() {
-        return Ok(0);
-    }
-
-    let versions = list_installed_versions(engine_name)?;
-    let count = versions.len();
-    std::fs::remove_dir_all(&dir)?;
-    Ok(count)
+    lpm_common::with_exclusive_lock(engine_update_lock_path(engine_name)?, || {
+        let dir = engines_dir()?.join(engine_name);
+        crate::storage::directory_if_present(&dir)?;
+        if !dir.exists() {
+            return Ok(0);
+        }
+        let count = list_installed_versions(engine_name)?.len();
+        std::fs::remove_dir_all(dir)?;
+        Ok(count)
+    })
 }
 
 fn resolve_engine_version(
@@ -569,10 +602,7 @@ fn resolve_engine_asset(
 }
 
 fn compare_semver_like(a: &str, b: &str) -> std::cmp::Ordering {
-    match (Version::parse(a), Version::parse(b)) {
-        (Ok(a), Ok(b)) => a.cmp(&b),
-        _ => a.cmp(b),
-    }
+    crate::versions::compare_versions(a, b)
 }
 
 fn get_latest_engine_version_for_platform(def: &EngineDef, platform: &str) -> String {
@@ -612,30 +642,54 @@ fn approve_engine_version(
     platform: &str,
     asset: &ResolvedEngineAsset,
 ) -> Result<(), LpmError> {
-    let cache_path = engine_version_cache_path()?;
-    let mut cache = read_engine_version_cache_at(&cache_path).unwrap_or_default();
-    let entry = cache.engines.entry(engine_name.to_string()).or_default();
-    entry
-        .selected
-        .insert(platform.to_string(), version.to_string());
-    entry
-        .assets
-        .entry(version.to_string())
-        .or_default()
-        .insert(platform.to_string(), asset.clone());
-
-    if let Some(parent) = cache_path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let json = serde_json::to_string_pretty(&cache)
-        .map_err(|e| LpmError::Engine(format!("failed to serialize engine version cache: {e}")))?;
-    lpm_common::write_file_atomic_with_options(
-        &cache_path,
-        json.as_bytes(),
-        lpm_common::AtomicWriteOptions::new().unix_mode(0o600),
+    approve_engine_version_at(
+        &engine_version_cache_path()?,
+        engine_name,
+        version,
+        platform,
+        asset,
     )
-    .map_err(|e| LpmError::Engine(format!("failed to write engine version cache: {e}")))?;
-    Ok(())
+}
+
+fn approve_engine_version_at(
+    cache_path: &Path,
+    engine_name: &str,
+    version: &str,
+    platform: &str,
+    asset: &ResolvedEngineAsset,
+) -> Result<(), LpmError> {
+    lpm_common::with_exclusive_lock(cache_path.with_extension("lock"), || {
+        let mut cache = read_engine_version_cache_at(cache_path).unwrap_or_default();
+        let entry = cache.engines.entry(engine_name.to_string()).or_default();
+        if entry
+            .selected
+            .get(platform)
+            .is_none_or(|current| crate::versions::is_newer_semver(version, current))
+        {
+            entry
+                .selected
+                .insert(platform.to_string(), version.to_string());
+        }
+        entry
+            .assets
+            .entry(version.to_string())
+            .or_default()
+            .insert(platform.to_string(), asset.clone());
+
+        if let Some(parent) = cache_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let json = serde_json::to_string_pretty(&cache).map_err(|e| {
+            LpmError::Engine(format!("failed to serialize engine version cache: {e}"))
+        })?;
+        lpm_common::write_file_atomic_with_options(
+            cache_path,
+            json.as_bytes(),
+            lpm_common::AtomicWriteOptions::new().unix_mode(0o600),
+        )
+        .map_err(|e| LpmError::Engine(format!("failed to write engine version cache: {e}")))?;
+        Ok(())
+    })
 }
 
 fn read_engine_version_cache() -> Result<EngineVersionCache, LpmError> {
@@ -643,8 +697,8 @@ fn read_engine_version_cache() -> Result<EngineVersionCache, LpmError> {
 }
 
 fn read_engine_version_cache_at(path: &Path) -> Result<EngineVersionCache, LpmError> {
-    let content = std::fs::read_to_string(path)?;
-    serde_json::from_str(&content)
+    let content = lpm_common::read_file_capped(path, lpm_common::STATE_FILE_SIZE_CAP_BYTES)?;
+    serde_json::from_slice(&content)
         .map_err(|e| LpmError::Engine(format!("failed to parse engine version cache: {e}")))
 }
 
@@ -706,19 +760,11 @@ async fn install_under_lock_at(
     let version_dir = engine_version_dir_at(engines_root, engine_name, version)?;
     std::fs::create_dir_all(&version_dir)?;
 
-    if platform_dir.exists() {
-        std::fs::remove_dir_all(&platform_dir).map_err(|e| {
-            LpmError::Engine(format!(
-                "failed to clear invalid cached engine '{}' at {}: {e}",
-                engine_name,
-                platform_dir.display(),
-            ))
-        })?;
-    }
-
-    let stage_dir = version_dir.join(format!(".{platform}.{}.stage", std::process::id()));
-    let _ = std::fs::remove_dir_all(&stage_dir);
-    std::fs::create_dir_all(&stage_dir)?;
+    let staging = tempfile::Builder::new()
+        .prefix(".lpm-engine-stage-")
+        .tempdir_in(&version_dir)?;
+    let stage_dir = staging.path().join("payload");
+    std::fs::create_dir(&stage_dir)?;
 
     let mut sidecar_packages = Vec::with_capacity(asset.packages.len());
 
@@ -758,14 +804,6 @@ async fn install_under_lock_at(
     }
 
     let layout_sha256 = hash_directory_tree(&stage_dir)?;
-    std::fs::rename(&stage_dir, &platform_dir).map_err(|e| {
-        let _ = std::fs::remove_dir_all(&stage_dir);
-        LpmError::Engine(format!(
-            "failed to finalize engine '{}' install: {e}",
-            engine_name,
-        ))
-    })?;
-
     let sidecar = EngineSidecar::new(
         engine_name,
         version,
@@ -774,10 +812,8 @@ async fn install_under_lock_at(
         sidecar_packages,
         layout_sha256,
     );
-    if let Err(error) = write_sidecar_atomic(&sidecar_path, &sidecar) {
-        let _ = std::fs::remove_dir_all(&platform_dir);
-        return Err(error);
-    }
+    write_sidecar_atomic(&stage_dir.join(ENGINE_SIDECAR_FILE_NAME), &sidecar)?;
+    crate::storage::publish(&stage_dir, &platform_dir)?;
 
     Ok(entry_path)
 }
@@ -818,20 +854,7 @@ async fn download_tarball(url: &str) -> Result<Vec<u8>, LpmError> {
         )));
     }
 
-    let bytes = resp
-        .bytes()
-        .await
-        .map_err(|e| LpmError::Network(format!("failed to read engine tarball: {e}")))?;
-
-    if bytes.len() > MAX_ENGINE_DOWNLOAD_SIZE {
-        return Err(LpmError::Engine(format!(
-            "engine download size ({} bytes) exceeds maximum allowed size ({} bytes)",
-            bytes.len(),
-            MAX_ENGINE_DOWNLOAD_SIZE,
-        )));
-    }
-
-    Ok(bytes.to_vec())
+    crate::io::read_response(resp, MAX_ENGINE_DOWNLOAD_SIZE, "engine download").await
 }
 
 pub async fn peek_latest_engine_version(engine_name: &str) -> Result<String, String> {
@@ -902,15 +925,15 @@ async fn run_engine_update_under_lock(
         }
     };
 
-    let (target_version, asset) =
-        if crate::versions::is_newer_semver(&latest_version, def.latest_version) {
-            (latest_version, fetched_asset)
-        } else {
-            (
-                def.latest_version.to_string(),
-                resolve_engine_asset(def, def.latest_version, &platform_str)?,
-            )
-        };
+    let selected = get_latest_engine_version_for_platform(def, &platform_str);
+    let (target_version, asset) = if crate::versions::is_newer_semver(&latest_version, &selected) {
+        (latest_version, fetched_asset)
+    } else {
+        (
+            selected.clone(),
+            resolve_engine_asset(def, &selected, &platform_str)?,
+        )
+    };
 
     emit_engine_install_event(
         &mut observer,
@@ -1125,9 +1148,14 @@ async fn fetch_json<T: serde::de::DeserializeOwned>(
             message: format!("failed to fetch {context} from {url}"),
         });
     }
-    resp.json()
-        .await
-        .map_err(|e| LpmError::Network(format!("failed to parse {context}: {e}")))
+    let bytes = crate::io::read_response(
+        resp,
+        lpm_common::STATE_FILE_SIZE_CAP_BYTES as usize,
+        context,
+    )
+    .await?;
+    serde_json::from_slice(&bytes)
+        .map_err(|error| LpmError::Network(format!("failed to parse {context}: {error}")))
 }
 
 fn encode_npm_package_path(name: &str) -> String {
@@ -1205,6 +1233,15 @@ fn validate_for_reuse(
     if !install_dir.join(expected_entry_rel_path).is_file() {
         return EngineReuseDecision::Miss(EngineMissReason::EntryMissing);
     }
+    #[cfg(unix)]
+    if requested_engine == "tsgo" {
+        use std::os::unix::fs::PermissionsExt;
+        if std::fs::metadata(install_dir.join(expected_entry_rel_path))
+            .map_or(true, |metadata| metadata.permissions().mode() & 0o111 == 0)
+        {
+            return EngineReuseDecision::Miss(EngineMissReason::EntryMissing);
+        }
+    }
     match hash_directory_tree(install_dir) {
         Ok(observed) if observed == sidecar.layout_sha256 => EngineReuseDecision::Hit,
         Ok(_) => EngineReuseDecision::Miss(EngineMissReason::LayoutHashMismatch),
@@ -1213,13 +1250,14 @@ fn validate_for_reuse(
 }
 
 fn read_sidecar(sidecar_path: &Path) -> Result<EngineSidecar, EngineMissReason> {
-    let bytes = match std::fs::read(sidecar_path) {
-        Ok(bytes) => bytes,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            return Err(EngineMissReason::SidecarMissing);
-        }
-        Err(_) => return Err(EngineMissReason::SidecarMalformed),
-    };
+    let bytes =
+        match lpm_common::read_file_capped(sidecar_path, lpm_common::STATE_FILE_SIZE_CAP_BYTES) {
+            Ok(bytes) => bytes,
+            Err(lpm_common::BoundedReadError::NotFound { .. }) => {
+                return Err(EngineMissReason::SidecarMissing);
+            }
+            Err(_) => return Err(EngineMissReason::SidecarMalformed),
+        };
     serde_json::from_slice(&bytes).map_err(|_| EngineMissReason::SidecarMalformed)
 }
 
@@ -1346,9 +1384,9 @@ fn validate_engine_version(version: &str) -> Result<(), LpmError> {
     if version.is_empty() {
         return Err(LpmError::Engine("engine version must not be empty".into()));
     }
-    if version.contains("..") {
+    if version == "." || version.contains("..") {
         return Err(LpmError::Engine(format!(
-            "engine version contains forbidden sequence '..': {version}"
+            "engine version contains a forbidden path component: {version}"
         )));
     }
     if !version
@@ -1391,7 +1429,12 @@ fn engine_version_dir_at(
     version: &str,
 ) -> Result<PathBuf, LpmError> {
     validate_engine_version(version)?;
-    Ok(engines_root.join(engine_name).join(version))
+    crate::storage::validate_name(engine_name)?;
+    let tool = engines_root.join(engine_name);
+    crate::storage::directory_if_present(&tool)?;
+    let directory = tool.join(version);
+    crate::storage::directory_if_present(&directory)?;
+    Ok(directory)
 }
 
 fn engine_version_dir(engine_name: &str, version: &str) -> Result<PathBuf, LpmError> {
@@ -1416,7 +1459,9 @@ fn engine_platform_dir_at(
 ) -> Result<PathBuf, LpmError> {
     validate_engine_version(version)?;
     validate_platform(platform)?;
-    Ok(engine_version_dir_at(engines_root, engine_name, version)?.join(platform))
+    let directory = engine_version_dir_at(engines_root, engine_name, version)?.join(platform);
+    crate::storage::directory_if_present(&directory)?;
+    Ok(directory)
 }
 
 fn engine_sidecar_path(
@@ -1467,12 +1512,12 @@ fn engine_entry_path_at(
 }
 
 fn engine_install_lock_path(engine_name: &str, version: &str) -> Result<PathBuf, LpmError> {
-    let engines_root = engines_dir()?;
-    Ok(engine_version_dir_at(&engines_root, engine_name, version)?.join(".install.lock"))
+    validate_engine_version(version)?;
+    crate::storage::operation_lock("engines", engine_name)
 }
 
 fn engine_update_lock_path(engine_name: &str) -> Result<PathBuf, LpmError> {
-    Ok(engines_dir()?.join(engine_name).join(".update.lock"))
+    crate::storage::operation_lock("engines", engine_name)
 }
 
 fn now_unix() -> u64 {
@@ -1518,6 +1563,11 @@ mod tests {
         let entry_path = install_dir.join(entry_rel_path);
         std::fs::create_dir_all(entry_path.parent().unwrap()).unwrap();
         std::fs::write(&entry_path, b"engine-bytes").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&entry_path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
         std::fs::write(
             install_dir.join("lib/lib.d.ts"),
             b"declare const x: string;",
@@ -1729,5 +1779,195 @@ mod tests {
             resolve_engine_version(get_engine("tsgo").unwrap(), Some("1.0.0"), "darwin-arm64")
                 .unwrap_err();
         assert!(error.to_string().contains("not approved"));
+    }
+
+    #[test]
+    fn oversized_engine_caches_and_receipts_are_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let entry = install_fake_engine(dir.path(), "lib/tsgo");
+        let receipt = entry
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .join(ENGINE_SIDECAR_FILE_NAME);
+        let mut bytes = std::fs::read(&receipt).unwrap();
+        bytes.resize(lpm_common::STATE_FILE_SIZE_CAP_BYTES as usize + 1, b' ');
+        std::fs::write(&receipt, bytes).unwrap();
+        assert!(read_sidecar(&receipt).is_err());
+        let cache = dir.path().join("cache.json");
+        let mut bytes = br#"{"engines":{}}"#.to_vec();
+        bytes.resize(lpm_common::STATE_FILE_SIZE_CAP_BYTES as usize + 1, b' ');
+        std::fs::write(&cache, bytes).unwrap();
+        assert!(read_engine_version_cache_at(&cache).is_err());
+    }
+
+    #[tokio::test]
+    async fn oversized_engine_metadata_is_rejected_before_deserialization() {
+        let server = MockServer::start().await;
+        let mut bytes = b"{}".to_vec();
+        bytes.resize(lpm_common::STATE_FILE_SIZE_CAP_BYTES as usize + 1, b' ');
+        Mock::given(method("GET"))
+            .and(path("/large"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(bytes))
+            .mount(&server)
+            .await;
+        let result = fetch_json::<serde_json::Value>(
+            &npm_client().unwrap(),
+            &format!("{}/large", server.uri()),
+            "engine metadata",
+        )
+        .await;
+        assert!(result.is_err(), "oversized metadata was accepted");
+    }
+
+    #[test]
+    fn dot_is_not_a_managed_version_directory() {
+        assert!(validate_engine_version(".").is_err());
+    }
+    #[cfg(unix)]
+    #[test]
+    fn engine_reuse_rejects_an_entry_without_execute_permission() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        let entry = install_fake_engine(root.path(), "lib/tsgo");
+        std::fs::set_permissions(&entry, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let dir = entry.parent().unwrap().parent().unwrap();
+        assert!(matches!(
+            validate_for_reuse(
+                &dir.join(ENGINE_SIDECAR_FILE_NAME),
+                dir,
+                "tsgo",
+                "1.0.0",
+                "darwin-arm64",
+                "lib/tsgo",
+                &[ResolvedEngineInstallAsset {
+                    install_subdir: "".into(),
+                    tarball_url: "https://example.test/native-preview.tgz".into(),
+                    tarball_integrity: "sha512-test".into()
+                }],
+            ),
+            EngineReuseDecision::Miss(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn interrupted_or_partial_engine_replacements_preserve_previous_files_and_remove_stages()
+    {
+        for interrupted in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let previous = install_fake_engine(root.path(), "lib/tsgo");
+            let before_receipt = std::fs::read(
+                previous
+                    .parent()
+                    .unwrap()
+                    .parent()
+                    .unwrap()
+                    .join(ENGINE_SIDECAR_FILE_NAME),
+            )
+            .unwrap();
+            let server = MockServer::start().await;
+            let tarball = create_test_tarball(&[("lib/tsgo", b"replacement")]);
+            let integrity = lpm_common::Integrity::from_bytes(
+                lpm_common::integrity::HashAlgorithm::Sha512,
+                &tarball,
+            )
+            .to_string();
+            Mock::given(method("GET"))
+                .and(path("/first.tgz"))
+                .respond_with(ResponseTemplate::new(200).set_body_bytes(tarball))
+                .expect(1)
+                .mount(&server)
+                .await;
+            Mock::given(method("GET"))
+                .and(path("/second.tgz"))
+                .respond_with(if interrupted {
+                    ResponseTemplate::new(200).set_delay(std::time::Duration::from_secs(5))
+                } else {
+                    ResponseTemplate::new(500)
+                })
+                .expect(1)
+                .mount(&server)
+                .await;
+            let install = install_under_lock_at(
+                root.path(),
+                "tsgo",
+                "1.0.0",
+                "darwin-arm64",
+                ResolvedEngineAsset {
+                    entry_rel_path: "lib/tsgo".into(),
+                    packages: vec![
+                        ResolvedEngineInstallAsset {
+                            install_subdir: "".into(),
+                            tarball_url: format!("{}/first.tgz", server.uri()),
+                            tarball_integrity: integrity.clone(),
+                        },
+                        ResolvedEngineInstallAsset {
+                            install_subdir: "dependency".into(),
+                            tarball_url: format!("{}/second.tgz", server.uri()),
+                            tarball_integrity: integrity,
+                        },
+                    ],
+                },
+                true,
+            );
+            if interrupted {
+                assert!(
+                    tokio::time::timeout(std::time::Duration::from_secs(1), install)
+                        .await
+                        .is_err()
+                );
+            } else {
+                assert!(install.await.is_err());
+            }
+            assert_eq!(std::fs::read(&previous).unwrap(), b"engine-bytes");
+            assert_eq!(
+                std::fs::read(
+                    previous
+                        .parent()
+                        .unwrap()
+                        .parent()
+                        .unwrap()
+                        .join(ENGINE_SIDECAR_FILE_NAME)
+                )
+                .unwrap(),
+                before_receipt
+            );
+            let version_dir = previous
+                .parent()
+                .unwrap()
+                .parent()
+                .unwrap()
+                .parent()
+                .unwrap();
+            assert_eq!(std::fs::read_dir(version_dir).unwrap().count(), 1);
+        }
+    }
+    #[test]
+    fn concurrent_engine_approvals_preserve_platforms_and_never_downgrade() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("cache.json");
+        let asset = ResolvedEngineAsset {
+            entry_rel_path: "bin/cli.mjs".into(),
+            packages: Vec::new(),
+        };
+        std::thread::scope(|scope| {
+            for platform in ["darwin-arm64", "linux-x64"] {
+                let path = &path;
+                let asset = &asset;
+                scope.spawn(move || {
+                    approve_engine_version_at(path, "rolldown", "2.0.0", platform, asset).unwrap();
+                    approve_engine_version_at(path, "rolldown", "1.0.0", platform, asset).unwrap();
+                });
+            }
+        });
+        let cache = read_engine_version_cache_at(&path).unwrap();
+        let entry = &cache.engines["rolldown"];
+        for platform in ["darwin-arm64", "linux-x64"] {
+            assert_eq!(entry.selected[platform], "2.0.0");
+            for version in ["1.0.0", "2.0.0"] {
+                assert!(entry.assets[version].contains_key(platform));
+            }
+        }
     }
 }

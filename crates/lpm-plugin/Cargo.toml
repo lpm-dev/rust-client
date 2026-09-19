@@ -21,13 +21,13 @@ flate2 = { workspace = true }
 tar = { workspace = true }
 zip = { workspace = true }
 sha2 = { workspace = true }
+tempfile = "3"
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.60", features = ["Win32_Foundation", "Win32_Storage_FileSystem"] }
 
 [dev-dependencies]
 filetime = { workspace = true }
-tempfile = "3"
 wiremock = "0.6"
 tokio = { workspace = true }
 

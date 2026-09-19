@@ -17,8 +17,7 @@ pub struct PluginDef {
     pub is_archive: bool,
     /// Expected SHA-256 checksums for the hardcoded `latest_version`, keyed by platform string.
     ///
-    /// For user-pinned custom versions, checksums are not available and verification is skipped
-    /// with a warning.
+    /// Other versions require upstream verification data or an explicit unverified override.
     pub checksums: &'static [(&'static str, &'static str)],
 }
 
