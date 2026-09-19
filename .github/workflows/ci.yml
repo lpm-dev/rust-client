@@ -536,7 +536,8 @@ jobs:
         run: cargo test --locked -p lpm-runner ports::tests
 
       - name: Windows environment name tests
-        run: cargo test --locked -p lpm-runner dotenv::
+        run: |
+          cargo test --locked -p lpm-runner dotenv::
 
       - name: Windows proxy named-pipe tests
         run: cargo test --locked -p lpm-proxy named_pipe
