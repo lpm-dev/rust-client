@@ -78,6 +78,19 @@ pub(super) fn post_parse_error(cli: &Cli) -> Option<clap::Error> {
         ));
     }
 
+    if let Some(Commands::Login(args)) = &cli.command
+        && args.token.is_some()
+        && !args.npm
+        && !args.github
+        && !args.gitlab
+        && args.login_registry.is_none()
+    {
+        return Some(Cli::command().error(
+            clap::error::ErrorKind::MissingRequiredArgument,
+            "--token requires --npm, --github, --gitlab, or --login-registry; use plain `lpm login` for browser authentication",
+        ));
+    }
+
     if let Some(Commands::Audit(args)) = &cli.command
         && args.action.is_some()
         && (args.level.is_some()

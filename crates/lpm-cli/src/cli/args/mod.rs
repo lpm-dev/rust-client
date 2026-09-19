@@ -50,7 +50,7 @@ pub(crate) struct Cli {
     pub(crate) self_update_probe_executable: Option<std::path::PathBuf>,
 
     /// Use a specific auth token instead of the stored one.
-    #[arg(long, global = true, env = "LPM_TOKEN")]
+    #[arg(long, global = true)]
     pub(crate) token: Option<String>,
 
     /// Override the registry URL.

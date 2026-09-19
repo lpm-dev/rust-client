@@ -363,6 +363,13 @@ async fn login_uses_refresh_session_before_starting_browser_flow() {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr),
     );
+    let json: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("reused login must emit a JSON object");
+    assert_eq!(json["success"], true);
+    assert_eq!(json["username"], "testuser");
+    assert_eq!(json["registry"], mock.url());
+    assert!(json["storage_backend"].is_string());
+    assert!(json["storage_degraded"].is_boolean());
 }
 
 #[tokio::test]
@@ -2369,4 +2376,102 @@ async fn assert_rejected_env_token_recovery(ci_oidc: bool) {
         parse_json_output(&recovered.stdout)["username"],
         "storeduser"
     );
+}
+
+#[test]
+fn login_provider_environment_is_not_shadowed_by_lpm_token() {
+    for (flag, variable) in [("--github", "GITHUB_TOKEN"), ("--gitlab", "GITLAB_TOKEN")] {
+        let project = TempProject::empty(r#"{"name":"login-token-isolation","version":"1.0.0"}"#);
+        let output = lpm(&project)
+            .env("LPM_TOKEN", "lpm-must-not-be-stored")
+            .env(variable, "provider-transient-token")
+            .args(["login", flag, "--json"])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(json["stored"], false, "{json}");
+        assert!(!credentials_path(project.home()).exists());
+    }
+}
+
+#[test]
+fn login_explicit_token_requires_a_third_party_target() {
+    let project = TempProject::empty(r#"{"name":"login-token-target","version":"1.0.0"}"#);
+    let mut command = lpm_spawnable(&project);
+    command
+        .args(["login", "--token", "unused-token", "--json"])
+        .env("BROWSER", "false");
+    let mut child = command.spawn().unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    loop {
+        if child.try_wait().unwrap().is_some() {
+            break;
+        }
+        if std::time::Instant::now() >= deadline {
+            child.kill().unwrap();
+            let _ = child.wait();
+            panic!("unsupported token login started browser flow");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    let output = child.wait_with_output().unwrap();
+    assert!(!output.status.success());
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(json["success"], false);
+    assert!(json["error"].as_str().unwrap().contains("--token"));
+}
+
+#[test]
+fn login_provider_import_ignores_unrelated_lpm_environment_token() {
+    for (flag, variable, registry) in [
+        ("--github", "GITHUB_TOKEN", GITHUB_REGISTRY_URL),
+        ("--gitlab", "GITLAB_TOKEN", GITLAB_REGISTRY_URL),
+        ("--npm", "NPM_TOKEN", NPM_REGISTRY_URL),
+    ] {
+        let project = TempProject::empty(r#"{"name":"login-import-isolation","version":"1.0.0"}"#);
+        write_credentials_store(project.home(), &serde_json::json!({}));
+        let mut command = lpm(&project);
+        command
+            .env("LPM_TOKEN", "lpm-must-not-be-stored")
+            .env(variable, "provider-saved-token")
+            .args(["login", flag, "--json"]);
+        if flag != "--npm" {
+            command.arg("--save-env-token");
+        }
+        let output = command.output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        let saved = read_credentials(project.home());
+        assert_eq!(saved[registry], "provider-saved-token");
+        assert!(
+            !serde_json::to_string(&saved)
+                .unwrap()
+                .contains("lpm-must-not-be-stored")
+        );
+    }
+}
+
+#[test]
+fn login_custom_registry_does_not_import_lpm_environment_token() {
+    let project = TempProject::empty(r#"{"name":"login-custom-isolation","version":"1.0.0"}"#);
+    let output = lpm(&project)
+        .env("LPM_TOKEN", "lpm-must-not-be-stored")
+        .args([
+            "login",
+            "--login-registry",
+            "https://registry.example.test/team",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(!credentials_path(project.home()).exists());
 }
