@@ -2519,16 +2519,27 @@ fn source_watch_matches_normalized_literal_entrypoint_paths() {
         };
         let mut process = ExecFixtureProcess::spawn(&project, &[entry, "--watch"]);
         process.wait_until(|| count() >= 1);
-        std::thread::sleep(Duration::from_millis(350));
+        // FSEvents can deliver queued fixture-creation events after registration.
+        let initial = std::cell::Cell::new(count());
+        let quiet_since = std::cell::Cell::new(Instant::now());
+        process.wait_until(|| {
+            let current = count();
+            if current != initial.get() {
+                initial.set(current);
+                quiet_since.set(Instant::now());
+            }
+            quiet_since.get().elapsed() >= Duration::from_millis(800)
+        });
+        let initial = initial.get();
         project.write_file("scripts/e.js", "console.log('still unrelated');");
         std::thread::sleep(Duration::from_millis(800));
-        assert_eq!(count(), 1, "{entry}: unrelated file triggered watch");
+        assert_eq!(count(), initial, "{entry}: unrelated file triggered watch");
         project.write_file(entry, &format!("{source}\n// changed\n"));
-        process.wait_until(|| count() >= 2);
+        process.wait_until(|| count() > initial);
         std::thread::sleep(Duration::from_millis(800));
         assert_eq!(
             count(),
-            2,
+            initial + 1,
             "{entry}: entrypoint change did not trigger once"
         );
     }
