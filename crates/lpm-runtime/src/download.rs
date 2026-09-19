@@ -56,7 +56,7 @@ fn remove_stale_runtime_staging_dirs(parent: &Path, version: &str) -> Result<(),
     Ok(())
 }
 
-fn runtime_install_lock_path(target_dir: &Path) -> Result<std::path::PathBuf, LpmError> {
+pub(crate) fn runtime_install_lock_path(target_dir: &Path) -> Result<std::path::PathBuf, LpmError> {
     let parent = target_dir
         .parent()
         .ok_or_else(|| LpmError::Script("invalid runtime path".into()))?;
@@ -69,7 +69,7 @@ fn runtime_install_lock_path(target_dir: &Path) -> Result<std::path::PathBuf, Lp
 }
 
 fn runtime_is_complete(target_dir: &Path, executable_relative_path: &Path) -> bool {
-    target_dir.join(executable_relative_path).is_file()
+    node::is_executable_file(&target_dir.join(executable_relative_path))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -193,6 +193,11 @@ pub async fn install_node_with_report(
     // The tarball contains a single top-level directory like "node-v22.5.0-darwin-arm64/"
     // We need to move its contents to the final location.
     let inner_dir = find_single_subdir(temp_dir)?;
+    if !runtime_is_complete(&inner_dir, executable_relative_path) {
+        return Err(LpmError::Script(
+            "Node archive does not contain a valid runtime executable".into(),
+        ));
+    }
 
     // Rename with TOCTOU race recovery
     rename_with_fallback(&inner_dir, &target_dir)?;
@@ -305,7 +310,7 @@ pub async fn install_bun_with_report(
     create_restricted_dir(&bin_dir)?;
 
     let source_binary = inner_dir.join(binary_name);
-    if !source_binary.exists() {
+    if !std::fs::symlink_metadata(&source_binary).is_ok_and(|metadata| metadata.is_file()) {
         return Err(LpmError::Script(format!(
             "Bun archive {} did not contain {binary_name}",
             asset.name
@@ -737,11 +742,11 @@ fn find_single_subdir(dir: &Path) -> Result<std::path::PathBuf, LpmError> {
         .ok_or_else(|| LpmError::Script("extracted tarball is empty".into()))?
         .map_err(|e| LpmError::Script(format!("failed to read extracted dir: {e}")))?;
 
-    if first.path().is_dir() {
+    if first.file_type()?.is_dir() && entries.next().transpose()?.is_none() {
         Ok(first.path())
     } else {
         Err(LpmError::Script(
-            "extracted tarball doesn't contain a directory".into(),
+            "runtime archive must contain exactly one real directory".into(),
         ))
     }
 }
@@ -1010,6 +1015,39 @@ fn checksum_from_shasums(body: &str, filename: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn runtime_completeness_rejects_nonexecutable_and_linked_entries() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+        let root = tempfile::tempdir().unwrap();
+        let binary = root.path().join("node");
+        std::fs::write(&binary, "node").unwrap();
+        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(!runtime_is_complete(root.path(), Path::new("node")));
+        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(runtime_is_complete(root.path(), Path::new("node")));
+        symlink(&binary, root.path().join("linked")).unwrap();
+        assert!(!runtime_is_complete(root.path(), Path::new("linked")));
+    }
+
+    #[test]
+    fn runtime_archive_root_must_be_a_single_real_directory() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join("first")).unwrap();
+        std::fs::create_dir(root.path().join("second")).unwrap();
+        assert!(find_single_subdir(root.path()).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn runtime_archive_root_rejects_directory_links() {
+        let root = tempfile::tempdir().unwrap();
+        let target = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(target.path(), root.path().join("linked")).unwrap();
+        assert!(find_single_subdir(root.path()).is_err());
+    }
+
     use std::io::Write;
     use tempfile::TempDir;
 

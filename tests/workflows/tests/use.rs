@@ -20,13 +20,12 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 use zip::write::SimpleFileOptions;
 
 fn seed_installed_node(project: &TempProject, version: &str) {
-    let bin_dir = project
-        .home()
-        .join(".lpm")
-        .join("runtimes")
-        .join("node")
-        .join(version)
-        .join("bin");
+    let version_dir = managed_node_dir(project, version);
+    let bin_dir = if cfg!(windows) {
+        version_dir
+    } else {
+        version_dir.join("bin")
+    };
     std::fs::create_dir_all(&bin_dir).expect("failed to create runtime bin dir");
     let binary = bin_dir.join(if cfg!(windows) { "node.exe" } else { "node" });
     std::fs::write(&binary, "").expect("failed to seed node binary");
@@ -1509,5 +1508,440 @@ fn use_list_with_unsupported_runtime_filter_fails_cleanly() {
     assert!(
         stderr.contains("deno") || stderr.contains("not yet supported"),
         "stderr must indicate the unsupported runtime, got:\n{stderr}"
+    );
+}
+
+#[test]
+fn use_pin_rejects_malformed_and_contradictory_selectors_without_writing_config() {
+    for spec in [
+        "node@22 foo",
+        "node@>=22 garbage",
+        "node@22 || nonsense",
+        "node@>=22 <20",
+        "bun@1 garbage",
+    ] {
+        let project = TempProject::empty(r#"{"name":"invalid-pin"}"#);
+        seed_installed_node(&project, "22.12.0");
+        seed_installed_bun(&project, "1.3.14");
+        let output = lpm(&project)
+            .args(["use", "pin", spec, "--json"])
+            .output()
+            .unwrap();
+        assert!(!output.status.success(), "accepted {spec}");
+        assert!(
+            !project.path().join("lpm.json").exists(),
+            "persisted {spec}"
+        );
+    }
+}
+
+#[test]
+fn use_pin_bun_resolves_equals_and_wildcard_selectors() {
+    for spec in ["=1.3.14", "1.x", "1.X"] {
+        let project = TempProject::empty(r#"{"name":"bun-selector"}"#);
+        seed_installed_bun(&project, "1.3.14");
+        let output = lpm(&project)
+            .args(["use", "pin", &format!("bun@{spec}")])
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        assert_eq!(lpm_json_runtime(&project, "bun"), "1.3.14", "{spec}");
+    }
+}
+
+#[test]
+fn use_remove_resolves_equals_and_wildcards_for_both_runtimes() {
+    for (runtime, version, wildcard) in [("node", "22.12.0", "22.X"), ("bun", "1.3.14", "1.x")] {
+        for selector in [format!("={version}"), wildcard.to_owned()] {
+            let project = TempProject::empty(r#"{"name":"remove-selector"}"#);
+            if runtime == "node" {
+                seed_installed_node(&project, version);
+            } else {
+                seed_installed_bun(&project, version);
+            }
+            let output = lpm(&project)
+                .args(["use", "remove", &format!("{runtime}@{selector}")])
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(
+                !project
+                    .home()
+                    .join(".lpm/runtimes")
+                    .join(runtime)
+                    .join(version)
+                    .exists(),
+                "{runtime}@{selector}"
+            );
+        }
+    }
+}
+
+fn removal_waits_for_installation(runtime: &str, version: &str) {
+    let project = TempProject::empty(r#"{"name":"locked-remove"}"#);
+    if runtime == "node" {
+        seed_installed_node(&project, version);
+    } else {
+        seed_installed_bun(&project, version);
+    }
+    let parent = project.home().join(".lpm/runtimes").join(runtime);
+    let lock = lpm_common::acquire_single_file_exclusive_lock(
+        parent
+            .join(".install-locks")
+            .join(format!("{version}.lock")),
+    )
+    .unwrap();
+    let mut child = support::lpm_spawnable(&project)
+        .args(["use", "remove", &format!("{runtime}@{version}")])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(350));
+    let early = child.try_wait().unwrap();
+    let exists = parent.join(version).exists();
+    drop(lock);
+    let status = child.wait().unwrap();
+    assert!(
+        early.is_none() && exists,
+        "removal ignored the active {runtime} install lock"
+    );
+    assert!(status.success());
+    assert!(!parent.join(version).exists());
+}
+
+#[test]
+fn use_remove_node_waits_for_installation() {
+    removal_waits_for_installation("node", "22.12.0");
+}
+
+#[test]
+fn use_remove_bun_waits_for_installation() {
+    removal_waits_for_installation("bun", "1.3.14");
+}
+
+#[test]
+fn use_install_selects_highest_matching_node_release_from_an_unordered_index() {
+    for spec in [">=22 <23", "^22", "22.x", "latest", "lts", "lts/jod"] {
+        let project = TempProject::empty(r#"{"name":"node-ranges"}"#);
+        seed_installed_node(&project, "22.12.0");
+        seed_installed_node(&project, "22.10.0");
+        write_node_index_cache(
+            &project,
+            r#"[{"version":"v22.10.0","date":"2025-01-01","lts":"Jod"},{"version":"v22.12.0","date":"2025-02-01","lts":"Jod"}]"#,
+        );
+        let output = lpm(&project)
+            .args(["use", &format!("node@{spec}")])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{spec}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(lpm_json_runtime(&project, "node"), "22.12.0", "{spec}");
+    }
+}
+
+#[test]
+fn use_bun_latest_selects_the_highest_cached_stable_release() {
+    let project = TempProject::empty(r#"{"name":"bun-latest"}"#);
+    seed_installed_bun(&project, "1.3.14");
+    seed_installed_bun(&project, "1.2.0");
+    write_bun_index_cache(
+        &project,
+        r#"[{"tag_name":"bun-v1.2.0"},{"tag_name":"bun-v1.3.14"}]"#,
+    );
+    let output = lpm(&project).args(["use", "bun@latest"]).output().unwrap();
+    assert!(output.status.success());
+    assert_eq!(lpm_json_runtime(&project, "bun"), "1.3.14");
+}
+
+#[tokio::test]
+async fn use_install_node_rejects_a_verified_archive_without_the_node_executable() {
+    let server = MockServer::start().await;
+    let version = "22.12.0";
+    let name = current_node_archive_name(version);
+    let bytes = if cfg!(windows) {
+        let mut writer = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        writer
+            .start_file("node-dist/README", SimpleFileOptions::default())
+            .unwrap();
+        writer.write_all(b"missing executable").unwrap();
+        writer.finish().unwrap().into_inner()
+    } else {
+        let mut archive = Builder::new(GzEncoder::new(Vec::new(), Compression::default()));
+        let mut header = tar::Header::new_gnu();
+        header.set_mode(0o644);
+        header.set_size(4);
+        header.set_cksum();
+        archive
+            .append_data(
+                &mut header,
+                "node-dist/README",
+                std::io::Cursor::new(b"text"),
+            )
+            .unwrap();
+        archive.into_inner().unwrap().finish().unwrap()
+    };
+    Mock::given(method("GET"))
+        .and(path(format!("/v{version}/{name}")))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(bytes.clone()))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(format!("/v{version}/SHASUMS256.txt")))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_string(format!("{}  {name}\n", sha256_hex(&bytes))),
+        )
+        .mount(&server)
+        .await;
+    let project = TempProject::empty(r#"{"name":"invalid-node-archive"}"#);
+    write_node_index_cache(
+        &project,
+        r#"[{"version":"v22.12.0","date":"2025-01-01","lts":false}]"#,
+    );
+    let output = lpm(&project)
+        .env("LPM_NODE_DIST_BASE_URL", server.uri())
+        .args(["use", "node@22.12.0", "--json"])
+        .output()
+        .unwrap();
+    assert!(
+        !output.status.success(),
+        "archive without node was accepted"
+    );
+    assert!(!managed_node_dir(&project, version).exists());
+    assert!(!project.path().join("lpm.json").exists());
+}
+
+#[tokio::test]
+async fn use_install_bun_rejects_a_directory_at_the_executable_path() {
+    let server = MockServer::start().await;
+    let version = "1.3.14";
+    let asset = current_bun_asset_name();
+    let binary = if cfg!(windows) { "bun.exe" } else { "bun" };
+    let mut writer = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+    writer
+        .add_directory(format!("bun-dist/{binary}/"), SimpleFileOptions::default())
+        .unwrap();
+    let bytes = writer.finish().unwrap().into_inner();
+    let digest = format!("sha256:{}", sha256_hex(&bytes));
+    Mock::given(method("GET"))
+        .and(path("/bun.zip"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(bytes))
+        .mount(&server)
+        .await;
+    let project = TempProject::empty(r#"{"name":"invalid-bun-archive"}"#);
+    write_bun_index_cache(&project,&serde_json::json!([{"tag_name":"bun-v1.3.14","assets":[{"name":asset,"browser_download_url":format!("{}/bun.zip",server.uri()),"digest":digest}]}]).to_string());
+    let output = lpm(&project)
+        .args(["use", "bun@1.3.14", "--json"])
+        .output()
+        .unwrap();
+    assert!(!output.status.success(), "directory was accepted as bun");
+    assert!(!managed_bun_dir(&project, version).exists());
+    assert!(!project.path().join("lpm.json").exists());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn run_auto_install_preserves_node_ranges_and_named_nvm_lts() {
+    let server = MockServer::start().await;
+    for version in ["20.18.0", "22.12.0"] {
+        let name = current_node_archive_name(version);
+        let bytes = make_node_runtime_archive(version);
+        let digest = sha256_hex(&bytes);
+        Mock::given(method("GET"))
+            .and(path(format!("/v{version}/{name}")))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(bytes))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(format!("/v{version}/SHASUMS256.txt")))
+            .respond_with(ResponseTemplate::new(200).set_body_string(format!("{digest}  {name}\n")))
+            .mount(&server)
+            .await;
+    }
+    for (selector, expected) in [
+        ("^20", "20.18.0"),
+        ("lts/iron", "20.18.0"),
+        (">20", "22.12.0"),
+    ] {
+        let project =
+            TempProject::empty(r#"{"name":"automatic-runtime","scripts":{"runtime":"node"}}"#);
+        project.write_file(".nvmrc", selector);
+        write_node_index_cache(
+            &project,
+            r#"[{"version":"v22.12.0","date":"2025-02-01","lts":"Jod"},{"version":"v20.18.0","date":"2025-01-01","lts":"Iron"}]"#,
+        );
+        let output = lpm(&project)
+            .env("LPM_NODE_DIST_BASE_URL", server.uri())
+            .env("LPM_NO_AUTO_INSTALL", "0")
+            .args(["run", "runtime"])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{selector}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            managed_node_dir(&project, expected)
+                .join("bin/node")
+                .is_file(),
+            "{selector} did not install {expected}"
+        );
+        let unexpected = if expected == "20.18.0" {
+            "22.12.0"
+        } else {
+            "20.18.0"
+        };
+        assert!(
+            !managed_node_dir(&project, unexpected).exists(),
+            "{selector} installed {unexpected}"
+        );
+    }
+}
+
+#[test]
+fn use_exact_installed_equality_selectors_work_without_release_metadata() {
+    for (runtime, version) in [("node", "22.12.0"), ("bun", "1.3.14")] {
+        for selector in [
+            format!("={version}"),
+            format!("= {version}"),
+            format!(" {version} "),
+        ] {
+            let project = TempProject::empty(r#"{"name":"offline-exact-runtime"}"#);
+            if runtime == "node" {
+                seed_installed_node(&project, version);
+            } else {
+                seed_installed_bun(&project, version);
+            }
+            let output = lpm(&project)
+                .env("HTTPS_PROXY", "http://127.0.0.1:9")
+                .env("HTTP_PROXY", "http://127.0.0.1:9")
+                .env("NO_PROXY", "")
+                .args(["use", &format!("{runtime}@{selector}"), "--json"])
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{runtime}@{selector}: {} {}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert_eq!(lpm_json_runtime(&project, runtime), version);
+        }
+    }
+}
+
+#[test]
+fn use_pin_rejects_empty_wildcard_ranges_without_writing_config() {
+    for spec in ["node@>*", "node@<*", "bun@<0.0.0-0"] {
+        let project = TempProject::empty(r#"{"name":"empty-runtime-selector"}"#);
+        let output = lpm(&project).args(["use", "pin", spec]).output().unwrap();
+        assert!(!output.status.success(), "accepted {spec}");
+        assert!(!project.path().join("lpm.json").exists());
+    }
+}
+
+#[test]
+fn use_remove_warns_when_a_node_channel_pin_remains() {
+    for selector in ["lts/iron", "lts", "latest"] {
+        let project = TempProject::empty(r#"{"name":"channel-removal"}"#);
+        seed_installed_node(&project, "20.18.0");
+        project.write_file(
+            "lpm.json",
+            &serde_json::json!({"runtime":{"node":selector}}).to_string(),
+        );
+        let output = lpm(&project)
+            .args(["use", "remove", "node@20", "--json"])
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert!(
+            json["warning"]
+                .as_str()
+                .is_some_and(|warning| warning.contains(selector)),
+            "{selector}: {json}"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn run_reuses_cached_node_channels_when_automatic_downloads_are_disabled() {
+    for selector in ["lts/iron", "lts", "latest"] {
+        let project = TempProject::empty(
+            r#"{"name":"offline-channel","scripts":{"runtime":"node --version"}}"#,
+        );
+        seed_installed_node(&project, "20.18.0");
+        std::fs::write(
+            managed_node_dir(&project, "20.18.0").join("bin/node"),
+            "#!/bin/sh\necho v20.18.0\n",
+        )
+        .unwrap();
+        project.write_file(
+            "lpm.json",
+            &serde_json::json!({"runtime":{"node":selector}}).to_string(),
+        );
+        write_node_index_cache(
+            &project,
+            r#"[{"version":"v20.18.0","date":"2025-01-01","lts":"Iron"}]"#,
+        );
+        let output = lpm(&project)
+            .env("LPM_NO_AUTO_INSTALL", "1")
+            .args(["run", "runtime"])
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains("v20.18.0"),
+            "{selector}: {}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn run_reuses_installed_named_lts_from_stale_metadata_without_downloads() {
+    let project =
+        TempProject::empty(r#"{"name":"stale-channel","scripts":{"runtime":"node --version"}}"#);
+    seed_installed_node(&project, "20.18.0");
+    std::fs::write(
+        managed_node_dir(&project, "20.18.0").join("bin/node"),
+        "#!/bin/sh\necho v20.18.0\n",
+    )
+    .unwrap();
+    project.write_file("lpm.json", r#"{"runtime":{"node":"lts/iron"}}"#);
+    write_node_index_cache(
+        &project,
+        r#"[{"version":"v20.18.0","date":"2025-01-01","lts":"Iron"}]"#,
+    );
+    let cache = std::fs::File::options()
+        .write(true)
+        .open(project.home().join(".lpm/runtimes/index-cache.json"))
+        .unwrap();
+    cache
+        .set_times(
+            std::fs::FileTimes::new()
+                .set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(7200)),
+        )
+        .unwrap();
+    let output = lpm(&project)
+        .env("LPM_NO_AUTO_INSTALL", "1")
+        .args(["run", "runtime"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("v20.18.0"),
+        "{}",
+        String::from_utf8_lossy(&output.stdout)
     );
 }

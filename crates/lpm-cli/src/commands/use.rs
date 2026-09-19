@@ -195,9 +195,9 @@ pub async fn run(
             let (runtime, version_spec) = parse_runtime_spec(spec)?;
 
             validate_runtime_spec(runtime, &version_spec)?;
-            if matches!(version_spec.to_ascii_lowercase().as_str(), "lts" | "latest") {
+            if lpm_runtime::node::is_channel_spec(&version_spec) {
                 return Err(LpmError::Script(
-                    "remove requires an explicit version, prefix, or semver range; `lts` and `latest` are not supported"
+                    "remove requires an explicit version, prefix, or semver range; `lts` and `latest` are not supported; named LTS channels are also excluded"
                         .into(),
                 ));
             }
@@ -214,7 +214,8 @@ pub async fn run(
             }
 
             let pin_warning = read_pinned_runtime_version(project_dir, runtime)?.filter(|pinned| {
-                find_matching_installed(runtime, pinned, &removed_versions).is_some()
+                (runtime == RuntimeKind::Node && lpm_runtime::node::is_channel_spec(pinned))
+                    || find_matching_installed(runtime, pinned, &removed_versions).is_some()
             });
 
             for version in &removed_versions {
@@ -639,15 +640,12 @@ fn pin_runtime(
 }
 
 fn exact_installed_version(runtime: RuntimeKind, version_spec: &str) -> Option<String> {
-    let parsed = match runtime {
-        RuntimeKind::Node => {
-            lpm_semver::Version::parse(version_spec.strip_prefix('v').unwrap_or(version_spec))
-        }
-        RuntimeKind::Bun => {
-            let normalized = lpm_runtime::bun::normalize_spec(version_spec);
-            lpm_semver::Version::parse(normalized)
-        }
+    let normalized = match runtime {
+        RuntimeKind::Node => version_spec.trim(),
+        RuntimeKind::Bun => lpm_runtime::bun::normalize_spec(version_spec),
     };
+    let exact = normalized.strip_prefix('=').unwrap_or(normalized).trim();
+    let parsed = lpm_semver::Version::parse(exact);
     let version = parsed.ok()?.to_string();
     is_installed(runtime, &version).then_some(version)
 }
@@ -674,57 +672,17 @@ fn matching_installed_versions(
     installed: &[String],
 ) -> Vec<String> {
     let spec = match runtime {
-        RuntimeKind::Node => version_spec
-            .strip_prefix('v')
-            .unwrap_or(version_spec)
-            .to_string(),
-        RuntimeKind::Bun => lpm_runtime::bun::normalize_spec(version_spec).to_string(),
+        RuntimeKind::Node => version_spec.trim(),
+        RuntimeKind::Bun => lpm_runtime::bun::normalize_spec(version_spec),
     };
-
-    if spec.eq_ignore_ascii_case("lts") || spec.eq_ignore_ascii_case("latest") {
+    let Ok(range) = lpm_semver::StrictVersionReq::parse(spec) else {
         return Vec::new();
-    }
-
-    if let Some(version) = installed.iter().find(|version| version.as_str() == spec) {
-        return vec![version.clone()];
-    }
-
-    if is_range_spec(&spec) {
-        let Ok(req) = lpm_semver::VersionReq::parse(&spec) else {
-            return Vec::new();
-        };
-        let matches: Vec<String> = installed
-            .iter()
-            .filter(|version| {
-                lpm_semver::Version::parse(version)
-                    .ok()
-                    .is_some_and(|parsed| req.matches(&parsed))
-            })
-            .cloned()
-            .collect();
-        return matches;
-    }
-
-    if lpm_semver::Version::parse(&spec).is_ok() {
-        return Vec::new();
-    }
-
-    let prefix = format!("{spec}.");
+    };
     installed
         .iter()
-        .filter(|version| version.starts_with(&prefix) || version.as_str() == spec)
+        .filter(|raw| lpm_semver::Version::parse(raw).is_ok_and(|version| range.matches(&version)))
         .cloned()
         .collect()
-}
-
-fn is_range_spec(spec: &str) -> bool {
-    spec.contains('>')
-        || spec.contains('<')
-        || spec.contains('^')
-        || spec.contains('~')
-        || spec.contains('|')
-        || spec.contains('*')
-        || spec.split_whitespace().count() > 1
 }
 
 fn find_matching_installed(
@@ -833,7 +791,7 @@ mod tests {
         assert!(is_valid_pin_version("lts"));
         assert!(is_valid_pin_version("latest"));
         assert!(is_valid_pin_version("22.0.0-rc.1"));
-        assert!(is_valid_pin_version("v20_lts"));
+        assert!(!is_valid_pin_version("v20_lts"));
         assert!(is_valid_pin_version("^20"));
         assert!(is_valid_pin_version(">=20.0.0 <22.0.0"));
     }

@@ -4,7 +4,7 @@ use crate::download;
 use crate::node;
 use crate::platform::Platform;
 use lpm_common::LpmError;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
 const BUN_RELEASES_URL: &str = "https://api.github.com/repos/oven-sh/bun/releases?per_page=100";
@@ -12,7 +12,7 @@ const GITHUB_API_VERSION: &str = "2022-11-28";
 const USER_AGENT: &str = "lpm-runtime";
 
 /// A single Bun release from GitHub.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct BunRelease {
     /// Release tag, usually `bun-v1.3.14`.
     pub tag_name: String,
@@ -27,7 +27,7 @@ pub struct BunRelease {
 }
 
 /// A downloadable asset on a Bun GitHub release.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct BunAsset {
     pub name: String,
     pub browser_download_url: String,
@@ -151,190 +151,167 @@ pub fn list_installed() -> Result<Vec<String>, LpmError> {
 /// Caches to `~/.lpm/runtimes/bun-index-cache.json` with a 1-hour TTL.
 pub async fn fetch_releases(client: &reqwest::Client) -> Result<Vec<BunRelease>, LpmError> {
     let cache_path = node::runtimes_dir()?.join("bun-index-cache.json");
-
-    if let Ok(meta) = std::fs::metadata(&cache_path)
-        && let Ok(modified) = meta.modified()
-    {
-        let age = std::time::SystemTime::now()
-            .duration_since(modified)
-            .unwrap_or_default();
-        if age.as_secs() < 3600
-            && let Ok(Some(content)) = lpm_common::read_capped_state_file(
-                &cache_path,
-                lpm_common::STATE_FILE_SIZE_CAP_BYTES,
-            )
-            && let Ok(releases) = serde_json::from_slice::<Vec<BunRelease>>(&content)
-        {
-            tracing::debug!(
-                "using cached bun release index ({} releases)",
-                releases.len()
-            );
-            return Ok(releases);
-        }
-    }
-
-    tracing::debug!("fetching bun release index");
-    let resp = client
-        .get(BUN_RELEASES_URL)
-        .header(reqwest::header::USER_AGENT, USER_AGENT)
-        .header(reqwest::header::ACCEPT, "application/vnd.github+json")
-        .header("X-GitHub-Api-Version", GITHUB_API_VERSION)
-        .send()
-        .await
-        .map_err(|e| {
-            LpmError::Network(format!(
-                "failed to fetch bun releases: {}",
-                lpm_http::display_error(&e)
-            ))
-        })?;
-
-    if !resp.status().is_success() {
-        return Err(LpmError::Http {
-            status: resp.status().as_u16(),
-            message: "failed to fetch Bun releases from GitHub".into(),
-        });
-    }
-
-    let body = lpm_http::read_body_capped(resp, lpm_common::STATE_FILE_SIZE_CAP_BYTES as usize)
-        .await
-        .map_err(|e| LpmError::Network(format!("failed to read bun releases body: {e}")))?;
-
-    let mut releases: Vec<BunRelease> = serde_json::from_slice(&body)
-        .map_err(|e| LpmError::Script(format!("failed to parse Bun releases: {e}")))?;
-    releases.sort_by(|a, b| node::compare_versions(b.version_bare(), a.version_bare()));
-
-    if let Some(parent) = cache_path.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    let _ = download::write_restricted_file(&cache_path, &body);
-
-    Ok(releases)
+    fetch_releases_at(client, &cache_path, BUN_RELEASES_URL).await
 }
 
-/// Validate a Bun version spec string against injection attacks.
+#[derive(Deserialize, Serialize)]
+struct ReleaseIndex {
+    schema_version: u32,
+    releases: Vec<BunRelease>,
+}
+
+fn cached_releases(bytes: &[u8]) -> Option<Vec<BunRelease>> {
+    if let Ok(index) = serde_json::from_slice::<ReleaseIndex>(bytes) {
+        return (index.schema_version == 1).then_some(index.releases);
+    }
+    // Older caches contain only page one. A short page proves completeness.
+    let releases = serde_json::from_slice::<Vec<BunRelease>>(bytes).ok()?;
+    (releases.len() < 100).then_some(releases)
+}
+
+async fn fetch_releases_at(
+    client: &reqwest::Client,
+    cache_path: &std::path::Path,
+    endpoint: &str,
+) -> Result<Vec<BunRelease>, LpmError> {
+    if let Ok(meta) = std::fs::metadata(cache_path)
+        && let Ok(modified) = meta.modified()
+        && std::time::SystemTime::now()
+            .duration_since(modified)
+            .unwrap_or_default()
+            .as_secs()
+            < 3600
+        && let Ok(Some(content)) =
+            lpm_common::read_capped_state_file(cache_path, lpm_common::STATE_FILE_SIZE_CAP_BYTES)
+        && let Some(releases) = cached_releases(&content)
+    {
+        return Ok(releases);
+    }
+
+    let mut releases = Vec::new();
+    let mut remaining_bytes = lpm_common::STATE_FILE_SIZE_CAP_BYTES as usize;
+    for page in 1..=100 {
+        let mut url = reqwest::Url::parse(endpoint)
+            .map_err(|e| LpmError::Network(format!("invalid Bun releases URL: {e}")))?;
+        url.set_query(None);
+        url.query_pairs_mut()
+            .append_pair("per_page", "100")
+            .append_pair("page", &page.to_string());
+        let resp = client
+            .get(url)
+            .header(reqwest::header::USER_AGENT, USER_AGENT)
+            .header(reqwest::header::ACCEPT, "application/vnd.github+json")
+            .header("X-GitHub-Api-Version", GITHUB_API_VERSION)
+            .send()
+            .await
+            .map_err(|e| {
+                LpmError::Network(format!(
+                    "failed to fetch Bun releases: {}",
+                    lpm_http::display_error(&e)
+                ))
+            })?;
+        if !resp.status().is_success() {
+            return Err(LpmError::Http {
+                status: resp.status().as_u16(),
+                message: "failed to fetch Bun releases from GitHub".into(),
+            });
+        }
+        let body = lpm_http::read_body_capped(resp, remaining_bytes)
+            .await
+            .map_err(|e| LpmError::Network(format!("failed to read Bun release index: {e}")))?;
+        remaining_bytes = remaining_bytes.saturating_sub(body.len());
+        let mut batch: Vec<BunRelease> = serde_json::from_slice(&body)
+            .map_err(|e| LpmError::Script(format!("failed to parse Bun releases: {e}")))?;
+        if batch.len() > 100 {
+            return Err(LpmError::Network(
+                "Bun release page exceeds 100 entries".into(),
+            ));
+        }
+        let complete = batch.len() < 100;
+        releases.append(&mut batch);
+        if complete {
+            let index = ReleaseIndex {
+                schema_version: 1,
+                releases,
+            };
+            let bytes = serde_json::to_vec(&index).map_err(|e| {
+                LpmError::Script(format!("failed to encode Bun release cache: {e}"))
+            })?;
+            if bytes.len() <= lpm_common::STATE_FILE_SIZE_CAP_BYTES as usize {
+                if let Some(parent) = cache_path.parent() {
+                    let _ = std::fs::create_dir_all(parent);
+                }
+                let _ = download::write_restricted_file(cache_path, &bytes);
+            }
+            return Ok(index.releases);
+        }
+    }
+    Err(LpmError::Network(
+        "Bun release index exceeds the 100-page coverage limit".into(),
+    ))
+}
+
+/// Validate an explicit Bun selector. Bun has no LTS channel.
 pub fn validate_version_spec(spec: &str) -> Result<(), LpmError> {
-    node::validate_version_spec(spec)?;
     let normalized = normalize_spec(spec);
-    if normalized.eq_ignore_ascii_case("lts") {
+    if node::is_channel_spec(normalized) && !normalized.eq_ignore_ascii_case("latest") {
         return Err(LpmError::Script(
             "Bun does not publish an LTS channel; use bun@latest or bun@<version>".into(),
         ));
     }
-    Ok(())
+    node::validate_version_spec(normalized)
 }
 
-/// Resolve a Bun version spec to an exact GitHub release.
+/// Resolve the highest stable Bun release that satisfies the selector.
 pub fn resolve_version(
     releases: &[BunRelease],
     spec: &str,
 ) -> Result<Option<BunRelease>, LpmError> {
     validate_version_spec(spec)?;
     let spec = normalize_spec(spec);
-    let candidates = || {
-        releases.iter().filter(|release| {
-            !release.draft
-                && !release.prerelease
-                && node::validate_exact_version(release.version_bare()).is_ok()
-        })
+    let range = if spec.eq_ignore_ascii_case("latest") {
+        None
+    } else {
+        Some(lpm_semver::StrictVersionReq::parse(spec)?)
     };
-
-    if spec.eq_ignore_ascii_case("latest") {
-        return Ok(candidates().next().cloned());
-    }
-
-    if let Some(release) = candidates().find(|release| release.version_bare() == spec) {
-        return Ok(Some(release.clone()));
-    }
-
-    if is_range_spec(spec) {
-        let req = lpm_semver::VersionReq::parse(spec)
-            .map_err(|e| LpmError::Script(format!("invalid Bun version range '{spec}': {e}")))?;
-        return Ok(best_release_match(candidates(), |release| {
-            lpm_semver::Version::parse(release.version_bare())
-                .ok()
-                .is_some_and(|version| req.matches(&version))
-        }));
-    }
-
-    if lpm_semver::Version::parse(spec).is_ok() {
-        return Ok(None);
-    }
-
-    let prefix = format!("{spec}.");
-    Ok(best_release_match(candidates(), |release| {
-        release.version_bare().starts_with(&prefix) || release.version_bare() == spec
-    }))
+    Ok(releases
+        .iter()
+        .filter_map(|release| {
+            if release.draft || release.prerelease {
+                return None;
+            }
+            let version = lpm_semver::Version::parse(release.version_bare()).ok()?;
+            if !version.pre_release().is_empty()
+                || range.as_ref().is_some_and(|range| !range.matches(&version))
+            {
+                return None;
+            }
+            Some((release, version))
+        })
+        .max_by(|(_, a), (_, b)| a.cmp(b))
+        .map(|(release, _)| release.clone()))
 }
 
-/// Find the best matching installed Bun version for a version spec.
+/// Find the highest matching installed Bun version.
 pub fn find_matching_installed(spec: &str, installed: &[String]) -> Option<String> {
     let normalized = normalize_spec(spec);
-
-    if normalized.eq_ignore_ascii_case("lts") {
-        return None;
-    }
-
-    if normalized.eq_ignore_ascii_case("latest") {
-        return highest_matching_installed(installed, |_, _| true);
-    }
-
-    if let Some(version) = installed
-        .iter()
-        .find(|version| version.as_str() == normalized)
-    {
-        return Some(version.clone());
-    }
-
-    if is_range_spec(normalized) {
-        let req = lpm_semver::VersionReq::parse(normalized).ok()?;
-        return highest_matching_installed(installed, |_, version| req.matches(version));
-    }
-
-    if lpm_semver::Version::parse(normalized).is_ok() {
-        return None;
-    }
-
-    let prefix = format!("{normalized}.");
-    highest_matching_installed(installed, |raw, _| raw.starts_with(&prefix))
+    let selector = if normalized.eq_ignore_ascii_case("latest") {
+        "*"
+    } else {
+        normalized
+    };
+    node::find_matching_installed(selector, installed)
 }
 
 /// Remove an installed Bun version.
 pub fn uninstall(version: &str) -> Result<(), LpmError> {
     let dir = bun_version_dir(version)?;
+    let _lock =
+        lpm_common::acquire_single_file_exclusive_lock(download::runtime_install_lock_path(&dir)?)?;
     if dir.exists() {
         std::fs::remove_dir_all(&dir)?;
     }
     Ok(())
-}
-
-fn best_release_match<'a, F>(
-    candidates: impl Iterator<Item = &'a BunRelease>,
-    matches: F,
-) -> Option<BunRelease>
-where
-    F: Fn(&BunRelease) -> bool,
-{
-    candidates
-        .into_iter()
-        .filter(|release| matches(release))
-        .max_by(|a, b| node::compare_versions(a.version_bare(), b.version_bare()))
-        .cloned()
-}
-
-fn highest_matching_installed<F>(installed: &[String], matches: F) -> Option<String>
-where
-    F: Fn(&str, &lpm_semver::Version) -> bool,
-{
-    installed
-        .iter()
-        .filter_map(|version| {
-            lpm_semver::Version::parse(version)
-                .ok()
-                .map(|parsed| (version, parsed))
-        })
-        .filter(|(raw, parsed)| matches(raw, parsed))
-        .max_by(|(_, a), (_, b)| a.cmp(b))
-        .map(|(version, _)| version.clone())
 }
 
 pub fn normalize_spec(spec: &str) -> &str {
@@ -348,19 +325,32 @@ fn normalize_bun_version_label(label: &str) -> &str {
         .unwrap_or(label)
 }
 
-fn is_range_spec(spec: &str) -> bool {
-    spec.contains('>')
-        || spec.contains('<')
-        || spec.contains('^')
-        || spec.contains('~')
-        || spec.contains('|')
-        || spec.contains('*')
-        || spec.split_whitespace().count() > 1
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bun_latest_is_the_semantic_maximum_of_an_unordered_index() {
+        let releases = vec![release("1.2.0"), release("1.3.14"), release("1.3.9")];
+        assert_eq!(
+            resolve_version(&releases, "latest")
+                .unwrap()
+                .unwrap()
+                .version_bare(),
+            "1.3.14"
+        );
+    }
+
+    #[test]
+    fn bun_installed_selectors_include_equals_and_wildcards() {
+        for spec in ["=1.3.14", "1.x", "1.X"] {
+            assert_eq!(
+                find_matching_installed(spec, &["1.2.0".into(), "1.3.14".into()]),
+                Some("1.3.14".into()),
+                "{spec}"
+            );
+        }
+    }
 
     fn asset(name: &str) -> BunAsset {
         BunAsset {
@@ -540,5 +530,68 @@ mod tests {
             "platform-specific host features choose one linux-x64 asset, got {}",
             asset.name
         );
+    }
+}
+
+#[cfg(test)]
+mod release_index_tests {
+    use super::*;
+    use wiremock::matchers::{method, query_param};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    #[tokio::test]
+    async fn bun_discovery_includes_versions_after_the_first_hundred_releases() {
+        let server = MockServer::start().await;
+        let first: Vec<_> = (0..100)
+            .map(|i| serde_json::json!({"tag_name":format!("bun-v2.0.{i}")}))
+            .collect();
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(first))
+            .with_priority(10)
+            .mount(&server)
+            .await;
+        Mock::given(query_param("page", "2"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!([{"tag_name":"bun-v1.3.14"}])),
+            )
+            .mount(&server)
+            .await;
+        let root = tempfile::tempdir().unwrap();
+        let cache = root.path().join("cache.json");
+        let releases = fetch_releases_at(&reqwest::Client::new(), &cache, &server.uri())
+            .await
+            .unwrap();
+        assert!(releases.iter().any(|r| r.version_bare() == "1.3.14"));
+        let cached = fetch_releases_at(&reqwest::Client::new(), &cache, &server.uri())
+            .await
+            .unwrap();
+        assert_eq!(cached.len(), 101);
+        assert_eq!(server.received_requests().await.unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn failed_later_bun_release_pages_do_not_publish_a_partial_cache() {
+        let server = MockServer::start().await;
+        let first: Vec<_> = (0..100)
+            .map(|i| serde_json::json!({"tag_name":format!("bun-v2.0.{i}")}))
+            .collect();
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(first))
+            .with_priority(10)
+            .mount(&server)
+            .await;
+        Mock::given(query_param("page", "2"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&server)
+            .await;
+        let root = tempfile::tempdir().unwrap();
+        let cache = root.path().join("cache.json");
+        assert!(
+            fetch_releases_at(&reqwest::Client::new(), &cache, &server.uri())
+                .await
+                .is_err()
+        );
+        assert!(!cache.exists());
     }
 }

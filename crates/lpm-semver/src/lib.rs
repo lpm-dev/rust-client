@@ -14,9 +14,11 @@
 //! assert!(range.matches(&version));
 //! ```
 
+mod strict_version_req;
 mod version;
 mod version_req;
 
+pub use strict_version_req::StrictVersionReq;
 pub use version::{Version, VersionBump};
 pub use version_req::{VersionReq, parse_node_semver_range};
 

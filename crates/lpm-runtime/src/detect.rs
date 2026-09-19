@@ -268,7 +268,7 @@ fn read_lpm_json_runtime_specs(
 /// - Comments (lines starting with `#`)
 /// - Empty lines
 /// - `v` prefix stripping
-/// - `lts/*` and `lts/codename` -> `"lts"`
+/// - `lts/*` -> `"lts"`; named LTS selectors retain their codename
 /// - Whitespace trimming
 ///
 /// Only the first non-empty, non-comment line is used.
@@ -279,7 +279,7 @@ fn parse_version_file(content: &str) -> Option<String> {
         .find(|l| !l.is_empty() && !l.starts_with('#'))
         .map(|l| l.strip_prefix('v').unwrap_or(l))
         .map(|l| {
-            if l.starts_with("lts/") || l == "lts/*" {
+            if l.eq_ignore_ascii_case("lts/*") {
                 "lts"
             } else {
                 l
@@ -582,7 +582,7 @@ mod tests {
 
     #[test]
     fn parse_version_file_lts_codename() {
-        assert_eq!(parse_version_file("lts/iron"), Some("lts".into()));
+        assert_eq!(parse_version_file("lts/iron"), Some("lts/iron".into()));
     }
 
     #[test]
@@ -624,7 +624,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         fs::write(dir.path().join(".nvmrc"), "lts/iron").unwrap();
         let v = detect_node_version(dir.path()).unwrap().unwrap();
-        assert_eq!(v.spec, "lts");
+        assert_eq!(v.spec, "lts/iron");
     }
 
     #[test]

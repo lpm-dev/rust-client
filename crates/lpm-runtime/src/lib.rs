@@ -367,7 +367,8 @@ fn find_matching_installed(
     installed: &[String],
 ) -> Option<String> {
     match runtime {
-        detect::RuntimeKind::Node => node::find_matching_installed(spec, installed),
+        detect::RuntimeKind::Node => node::find_matching_installed(spec, installed)
+            .or_else(|| node::find_matching_cached_channel(spec, installed)),
         detect::RuntimeKind::Bun => bun::find_matching_installed(spec, installed),
     }
 }
@@ -384,12 +385,7 @@ fn bin_dir(
 
 fn clean_lookup_spec(runtime: detect::RuntimeKind, spec: &str) -> String {
     match runtime {
-        detect::RuntimeKind::Node => spec
-            .trim_start_matches(">=")
-            .trim_start_matches("^")
-            .trim_start_matches("~")
-            .trim_start_matches('>')
-            .to_string(),
+        detect::RuntimeKind::Node => spec.trim().to_owned(),
         detect::RuntimeKind::Bun => bun::normalize_spec(spec).to_string(),
     }
 }
