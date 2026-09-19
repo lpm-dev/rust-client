@@ -218,6 +218,9 @@ fn build_task_context(
     command_preference: CommandPreference,
 ) -> Result<Option<CacheContext>, LpmError> {
     if let Some(provided_config) = lpm_config {
+        if !is_task_cached_with_config(script_name, Some(provided_config)) {
+            return Ok(None);
+        }
         let current_config =
             lpm_runner::lpm_json::read_lpm_json(project_dir).map_err(LpmError::Script)?;
         if current_config

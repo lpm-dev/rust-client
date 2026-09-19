@@ -4961,3 +4961,358 @@ fn inherited_schema_values_keep_their_cache_env_selection() {
         "excluded inherited schema value invalidated task cache"
     );
 }
+
+struct TaskWatcher {
+    child: std::process::Child,
+    diagnostics: std::path::PathBuf,
+}
+
+impl TaskWatcher {
+    fn start(project: &TempProject, task: &str, flags: &[&str]) -> Self {
+        project.write_file(".lpm/watch.log", "");
+        let diagnostics = project.path().join(".lpm/watch.log");
+        let mut command = lpm_spawnable(project);
+        command.args(["run", task, "--watch"]).args(flags);
+        command.stdout(std::process::Stdio::null());
+        command.stderr(std::fs::File::create(&diagnostics).unwrap());
+        Self {
+            child: command.spawn().unwrap(),
+            diagnostics,
+        }
+    }
+
+    fn wait_until(&mut self, ready: impl Fn() -> bool) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !ready() {
+            assert!(
+                self.child.try_wait().unwrap().is_none() && std::time::Instant::now() < deadline,
+                "watch did not complete the expected cycle: {}",
+                std::fs::read_to_string(&self.diagnostics).unwrap_or_default()
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
+}
+
+impl Drop for TaskWatcher {
+    fn drop(&mut self) {
+        if self.child.try_wait().ok().flatten().is_none() {
+            let _ = lpm_runner::ports::terminate_child_process_tree(&mut self.child);
+        }
+    }
+}
+
+#[test]
+fn watch_runs_meta_task_dependencies_hooks_and_overrides_on_each_cycle() {
+    let project = TempProject::empty(
+        r#"{"name":"watch-graph","version":"1.0.0","scripts":{"preprepare":"node record.js pre","prepare":"node record.js prepare","postprepare":"node record.js post","prebuild":"node record.js wrong-hook","build":"node record.js wrong-command"}}"#,
+    );
+    project.write_file("lpm.json", r#"{"tasks":{"build":{"command":"node record.js build","dependsOn":["prepare"],"inputs":["src/**"]},"verify":{"dependsOn":["build"]}}}"#);
+    project.write_file(
+        "record.js",
+        "const fs=require('fs');fs.appendFileSync('.lpm/events.txt',process.argv[2]+'\\n');",
+    );
+    project.write_file("src/input.txt", "first");
+    let events = project.path().join(".lpm/events.txt");
+    let mut watcher = TaskWatcher::start(&project, "verify", &[]);
+    watcher.wait_until(|| std::fs::read_to_string(&events).is_ok_and(|s| s.lines().count() >= 4));
+    assert_eq!(
+        std::fs::read_to_string(&events).unwrap(),
+        "pre\nprepare\npost\nbuild\n"
+    );
+    project.write_file("src/input.txt", "second");
+    watcher.wait_until(|| std::fs::read_to_string(&events).is_ok_and(|s| s.lines().count() >= 8));
+    assert_eq!(
+        std::fs::read_to_string(&events).unwrap(),
+        "pre\nprepare\npost\nbuild\npre\nprepare\npost\nbuild\n"
+    );
+}
+
+#[test]
+fn watch_ignores_declared_outputs_but_reacts_to_source_changes() {
+    let project = TempProject::empty(
+        r#"{"name":"watch-output","version":"1.0.0","scripts":{"build":"node build.js"}}"#,
+    );
+    project.write_file(
+        "lpm.json",
+        r#"{"tasks":{"build":{"inputs":["**/*.txt"],"outputs":["generated/**"]}}}"#,
+    );
+    project.write_file("src/input.txt", "first");
+    project.write_file("build.js", "const fs=require('fs');fs.mkdirSync('generated',{recursive:true});fs.writeFileSync('generated/result.txt',fs.readFileSync('src/input.txt'));fs.appendFileSync('.lpm/count.txt','run\\n');");
+    let count = project.path().join(".lpm/count.txt");
+    let cycles = || {
+        std::fs::read_to_string(&count)
+            .unwrap_or_default()
+            .lines()
+            .count()
+    };
+    let mut watcher = TaskWatcher::start(&project, "build", &[]);
+    watcher.wait_until(|| cycles() >= 1);
+    std::thread::sleep(std::time::Duration::from_millis(1200));
+    assert_eq!(cycles(), 1, "task outputs caused a watch loop");
+    project.write_file("src/input.txt", "second");
+    watcher.wait_until(|| cycles() >= 2);
+    std::thread::sleep(std::time::Duration::from_millis(1200));
+    assert_eq!(
+        cycles(),
+        2,
+        "source change did not cause exactly one new cycle"
+    );
+    assert_eq!(project.read_file("generated/result.txt"), "second");
+}
+
+#[test]
+fn watch_rejects_json_before_runtime_checks_or_child_execution() {
+    let project = TempProject::empty(
+        r#"{"name":"watch-json","version":"1.0.0","engines":{"node":">=999.0.0"},"scripts":{"build":"node build.js"}}"#,
+    );
+    project.write_file("build.js", "require('fs').writeFileSync('ran.txt','yes');");
+    let output = lpm(&project)
+        .args(["run", "build", "--watch", "--json"])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(!project.file_exists("ran.txt"));
+    let actual: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    insta::assert_json_snapshot!(actual, @r#"
+    {
+      "schema_version": 1,
+      "success": false,
+      "error": "script error: --watch cannot be combined with --json; run without --watch for one JSON result",
+      "error_code": "script"
+    }
+    "#);
+}
+
+#[test]
+fn stream_prefixes_single_tasks_sequential_tasks_and_single_task_levels() {
+    for flags in [vec![], vec!["--parallel"]] {
+        for graph in [false, true] {
+            let project = TempProject::empty(
+                r#"{"name":"stream-tasks","version":"1.0.0","scripts":{"first":"node first.js","second":"node second.js"}}"#,
+            );
+            project.write_file("first.js", "console.log('FIRST_MARKER');");
+            project.write_file("second.js", "console.log('SECOND_MARKER');");
+            if graph {
+                project.write_file(
+                    "lpm.json",
+                    r#"{"tasks":{"second":{"dependsOn":["first"]}}}"#,
+                );
+            }
+            let output = lpm(&project)
+                .args(["run", "second", "--stream", "--no-cache"])
+                .args(&flags)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let rendered = format!(
+                "{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(
+                rendered.contains("[second] SECOND_MARKER"),
+                "flags={flags:?}, graph={graph}: {rendered}"
+            );
+            if graph {
+                assert!(rendered.contains("[first] FIRST_MARKER"), "{rendered}");
+            }
+        }
+    }
+}
+
+#[test]
+fn parallel_bail_does_not_start_a_later_chunk_after_failure() {
+    let width = std::thread::available_parallelism().map_or(4, |n| n.get());
+    let scripts: serde_json::Map<String, serde_json::Value> = (0..=width)
+        .map(|index| {
+            let command = if index == 0 {
+                "exit 1".to_string()
+            } else {
+                format!("echo ran > task-{index}.txt")
+            };
+            (format!("task{index:05}"), command.into())
+        })
+        .collect();
+    let project = TempProject::empty(
+        &serde_json::json!({"name":"parallel-bail","version":"1.0.0","scripts":scripts})
+            .to_string(),
+    );
+    let names: Vec<String> = (0..=width).map(|i| format!("task{i:05}")).collect();
+    let output = lpm(&project)
+        .arg("run")
+        .args(&names)
+        .args(["--parallel", "--json", "--no-cache"])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(
+        !project.file_exists(&format!("task-{width}.txt")),
+        "later chunk ran after the first task failed"
+    );
+    let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(result["failed"], 1);
+    assert_eq!(result["skipped"], 1);
+}
+
+#[test]
+fn watch_reloads_task_commands_inputs_and_outputs_after_configuration_changes() {
+    let project = TempProject::empty(r#"{"name":"watch-reconfigure","version":"1.0.0"}"#);
+    project.write_file(
+        "lpm.json",
+        r#"{"tasks":{"build":{"command":"node record.js old","inputs":["old/**"]}}}"#,
+    );
+    project.write_file(
+        "record.js",
+        "const fs=require('fs');fs.appendFileSync('.lpm/events.txt',process.argv[2]+'\\n');",
+    );
+    project.write_file("old/input.txt", "first");
+    project.write_file("new/input.txt", "first");
+    let events = project.path().join(".lpm/events.txt");
+    let records = || std::fs::read_to_string(&events).unwrap_or_default();
+    let mut watcher = TaskWatcher::start(&project, "build", &[]);
+    watcher.wait_until(|| records().contains("old\n"));
+    project.write_file("lpm.json", r#"{"tasks":{"build":{"command":"node record.js new","inputs":["new/**"],"outputs":["new/generated/**"]}}}"#);
+    watcher.wait_until(|| records().contains("new\n"));
+    project.write_file("new/generated/output.txt", "ignored");
+    project.write_file("old/input.txt", "ignored");
+    std::thread::sleep(std::time::Duration::from_millis(1200));
+    assert_eq!(
+        records(),
+        "old\nnew\n",
+        "watch retained stale inputs or ignored new outputs"
+    );
+    project.write_file("new/input.txt", "changed");
+    watcher.wait_until(|| records().lines().count() >= 3);
+    assert_eq!(records(), "old\nnew\nnew\n");
+}
+
+#[test]
+fn watch_finishes_the_current_task_and_coalesces_changes_during_execution() {
+    let project = TempProject::empty(
+        r#"{"name":"watch-finite","version":"1.0.0","scripts":{"build":"node build.js"}}"#,
+    );
+    project.write_file("lpm.json", r#"{"tasks":{"build":{"inputs":["src/**"]}}}"#);
+    project.write_file("src/input.txt", "first");
+    project.write_file("build.js", r#"
+const fs=require('fs');
+const first=!fs.existsSync('.lpm/started');
+fs.appendFileSync('.lpm/started','run\n');
+if(first) {
+  const timer=setInterval(()=>{
+    if(fs.existsSync('.lpm/release')) {clearInterval(timer);fs.appendFileSync('.lpm/completed','done\n');}
+  },20);
+} else fs.appendFileSync('.lpm/completed','done\n');
+"#);
+    let started = project.path().join(".lpm/started");
+    let completed = project.path().join(".lpm/completed");
+    let mut watcher = TaskWatcher::start(&project, "build", &[]);
+    watcher.wait_until(|| started.exists());
+    for value in 0..20 {
+        project.write_file("src/input.txt", &value.to_string());
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    assert_eq!(
+        std::fs::read_to_string(&started).unwrap(),
+        "run\n",
+        "watch overlapped a running task"
+    );
+    project.write_file(".lpm/release", "yes");
+    watcher
+        .wait_until(|| std::fs::read_to_string(&completed).is_ok_and(|s| s.lines().count() >= 2));
+    std::thread::sleep(std::time::Duration::from_millis(700));
+    assert_eq!(std::fs::read_to_string(&started).unwrap(), "run\nrun\n");
+}
+
+#[test]
+fn watch_recovers_after_a_failed_prerequisite_without_running_its_dependent() {
+    let project = TempProject::empty(
+        r#"{"name":"watch-recovery","version":"1.0.0","scripts":{"check":"node check.js","build":"node build.js"}}"#,
+    );
+    project.write_file("lpm.json", r#"{"tasks":{"check":{"inputs":["src/**"]},"build":{"dependsOn":["check"],"inputs":["src/**"]}}}"#);
+    project.write_file("src/state.txt", "fail");
+    project.write_file("check.js", "const fs=require('fs');fs.appendFileSync('.lpm/checked','yes\\n');if(fs.readFileSync('src/state.txt','utf8')==='fail')process.exit(1);");
+    project.write_file(
+        "build.js",
+        "require('fs').writeFileSync('.lpm/built','yes');",
+    );
+    let mut watcher =
+        TaskWatcher::start(&project, "build", &["--parallel", "--no-bail", "--stream"]);
+    watcher.wait_until(|| project.file_exists(".lpm/checked"));
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    assert!(
+        !project.file_exists(".lpm/built"),
+        "dependent ran after its prerequisite failed"
+    );
+    project.write_file("src/state.txt", "pass");
+    watcher.wait_until(|| project.file_exists(".lpm/built"));
+}
+
+#[test]
+fn stream_prefixes_cached_output_and_respects_disabled_color() {
+    let project = TempProject::empty(
+        r#"{"name":"stream-cache","version":"1.0.0","scripts":{"build":"node build.js"}}"#,
+    );
+    project.write_file("lpm.json", r#"{"tasks":{"build":{"cache":true,"cacheEnv":[],"inputs":["build.js"],"outputs":["dist/**"]}}}"#);
+    project.write_file("build.js", "const fs=require('fs');fs.mkdirSync('dist',{recursive:true});fs.writeFileSync('dist/result.txt','ok');console.log('CACHE_STDOUT');console.error('CACHE_STDERR');");
+    for cached in [false, true] {
+        let output = lpm(&project)
+            .args(["run", "build", "--stream", "--color=never"])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let rendered = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(rendered.contains("cached"), cached, "{rendered}");
+        assert!(rendered.contains("[build] CACHE_STDOUT"), "{rendered:?}");
+        assert!(rendered.contains("[build] CACHE_STDERR"), "{rendered:?}");
+        assert!(
+            !rendered.contains('\x1b'),
+            "disabled color emitted escapes: {rendered:?}"
+        );
+    }
+}
+
+#[test]
+fn shared_upstream_tasks_keep_each_dependent_task_blocked_after_failure() {
+    let project = TempProject::from_fixture("workspace-monorepo");
+    for member in ["app", "core", "utils"] {
+        let path = format!("packages/{member}/package.json");
+        let mut package: serde_json::Value =
+            serde_json::from_str(&project.read_file(&path)).unwrap();
+        package["scripts"] =
+            serde_json::json!({"compile": if member == "utils" {"exit 1"} else {"exit 0"}});
+        project.write_file(&path, &serde_json::to_string(&package).unwrap());
+    }
+    project.write_file("packages/app/lpm.json", r#"{"tasks":{"build":{"command":"echo wrong > build.txt","dependsOn":["^compile"]},"deploy":{"command":"echo wrong > deploy.txt","dependsOn":["^compile"]}}}"#);
+    let output = lpm(&project)
+        .args([
+            "run",
+            "build",
+            "deploy",
+            "--filter",
+            "@test/app",
+            "--no-bail",
+        ])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    for name in ["build", "deploy"] {
+        assert!(
+            !project.file_exists(&format!("packages/app/{name}.txt")),
+            "{name} lost its shared failed prerequisite"
+        );
+    }
+}

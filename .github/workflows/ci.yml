@@ -543,6 +543,10 @@ jobs:
         run: |
           cargo test --locked -p lpm-runner dev_session::
 
+      - name: Windows task watcher tests
+        run: |
+          cargo test --locked -p lpm-task watch::
+
       - name: Windows proxy named-pipe tests
         run: cargo test --locked -p lpm-proxy named_pipe
 

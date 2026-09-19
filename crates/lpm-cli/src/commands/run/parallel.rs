@@ -135,7 +135,7 @@ pub(super) fn run_tasks_parallel(
             continue;
         }
 
-        if runnable.len() == 1 {
+        if runnable.len() == 1 && !stream {
             // Single task in this level — run directly (no thread overhead)
             let task_name = runnable[0];
             let start = std::time::Instant::now();
@@ -328,6 +328,9 @@ pub(super) fn run_tasks_parallel(
             let max_threads = std::thread::available_parallelism().map_or(4, |n| n.get());
 
             for chunk in runnable.chunks(max_threads) {
+                if !continue_on_error && !failed_tasks.is_empty() {
+                    break;
+                }
                 let chunk_names: Vec<String> = chunk.iter().map(|t| (*t).clone()).collect();
                 // Assign color per task for streaming mode
                 let chunk_colors: Vec<String> = chunk
@@ -567,7 +570,15 @@ pub(super) fn run_tasks_parallel(
                 for (i, handle) in handles.into_iter().enumerate() {
                     match handle.join() {
                         Ok(Ok((result, stdout, stderr, cache_identity))) => {
-                            if !stream || json_output || result.cached {
+                            if stream && !json_output && result.cached {
+                                for output in [&stdout, &stderr] {
+                                    lpm_runner::shell::print_prefixed_output(
+                                        output,
+                                        &result.name,
+                                        &chunk_colors[i],
+                                    );
+                                }
+                            } else if !stream || json_output {
                                 // Cached tasks have no live process to render their output.
                                 if !stdout.is_empty() {
                                     print_task_stdout(&stdout, json_output);

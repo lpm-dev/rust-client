@@ -2096,6 +2096,11 @@ async fn async_main() -> Result<()> {
                 ));
             }
             if watch {
+                if cli.json {
+                    return Err(lpm_common::LpmError::Script(
+                        "--watch cannot be combined with --json; run without --watch for one JSON result".into(),
+                    ));
+                }
                 if scripts.len() != 1 {
                     return Err(lpm_common::LpmError::Script(
                         "--watch supports exactly one script".into(),
@@ -2108,7 +2113,7 @@ async fn async_main() -> Result<()> {
                     ));
                 }
                 let bin_hint = commands::run::prepare_runtime(&cwd, cli.json).await?;
-                commands::run::run_watch(&cwd, &scripts[0], &args, env.as_deref(), bin_hint)
+                commands::run::run_watch(&cwd, &scripts[0], &args, env.as_deref(), bin_hint, parallel, continue_on_error, stream)
             } else if workspace_mode {
                 // Workspace mode: run scripts across packages with task graph
                 commands::run::run_workspace(
