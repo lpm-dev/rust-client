@@ -679,6 +679,118 @@ fn policy_test_rejects_dist_tag_before_starting_extension() {
 }
 
 #[test]
+fn policy_list_redacts_credentials_without_changing_saved_arguments() {
+    let project = TempProject::empty(r#"{"name":"policy-list-secrets","version":"1.0.0"}"#);
+    let command = policy_extension_command(&[
+        "--token",
+        "fixture-token",
+        "--api-key=fixture-api-key",
+        "--endpoint",
+        "https://fixture-user:fixture-password@example.com/feed?token=fixture-query-token",
+    ]);
+    write_policy_extension_config(&project, &command, "enforce", None);
+    let config_path = project.home().join(".lpm/config.toml");
+    let original = std::fs::read_to_string(&config_path).unwrap();
+    for json in [false, true] {
+        let mut cmd = lpm(&project);
+        cmd.args(["policy", "list"]);
+        if json {
+            cmd.arg("--json");
+        }
+        let output = cmd.output().unwrap();
+        assert!(output.status.success());
+        let rendered = String::from_utf8_lossy(&output.stdout);
+        for secret in [
+            "fixture-token",
+            "fixture-api-key",
+            "fixture-user",
+            "fixture-password",
+            "fixture-query-token",
+        ] {
+            assert!(!rendered.contains(secret), "policy list exposed {secret}");
+        }
+        assert!(rendered.contains("REDACTED"));
+        if json {
+            let result = assertions::parse_json_output(&output.stdout);
+            assert_eq!(result["extensions"][0]["command"][1], "--token");
+            assert_eq!(result["extensions"][0]["command"][2], "[REDACTED]");
+        }
+    }
+    assert_eq!(std::fs::read_to_string(config_path).unwrap(), original);
+}
+
+#[test]
+fn policy_list_redaction_does_not_change_executed_arguments() {
+    let project = TempProject::empty(r#"{"name":"policy-execution","version":"1.0.0"}"#);
+    let reason = "https://fixture-user:fixture-password@example.com/?token=fixture-token";
+    write_policy_extension_config(
+        &project,
+        &policy_extension_command(&["--name", "react", "--version", "19.0.0", "--reason", reason]),
+        "enforce",
+        None,
+    );
+    let listed = lpm(&project)
+        .args(["policy", "list", "--json"])
+        .output()
+        .unwrap();
+    assert!(listed.status.success());
+    assert!(!String::from_utf8_lossy(&listed.stdout).contains("fixture-password"));
+    let output = lpm(&project)
+        .args([
+            "policy",
+            "test",
+            "fixture",
+            "--package",
+            "react@19.0.0",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let result = assertions::parse_json_output(&output.stdout);
+    assert_eq!(result["decisions"][0]["reason"], reason);
+}
+
+#[test]
+fn policy_test_rejects_malformed_names_before_starting_extension() {
+    for name in [
+        "../react",
+        "@scope",
+        "@scope/../react",
+        "react\\child",
+        "react\nchild",
+        "CON",
+    ] {
+        let project = TempProject::empty(r#"{"name":"policy-invalid-name","version":"1.0.0"}"#);
+        let request_log = project.path().join("request.json");
+        write_policy_extension_config(
+            &project,
+            &policy_extension_command(&["--name", name, "--log", request_log.to_str().unwrap()]),
+            "enforce",
+            None,
+        );
+        let output = lpm(&project)
+            .args([
+                "policy",
+                "test",
+                "fixture",
+                "--package",
+                &format!("{name}@1.0.0"),
+                "--json",
+            ])
+            .output()
+            .unwrap();
+        assert!(!output.status.success(), "accepted malformed name {name:?}");
+        let result = assertions::parse_json_output(&output.stdout);
+        assert_eq!(result["error_code"], "invalid_package_name", "{result}");
+        assert!(
+            !request_log.exists(),
+            "extension ran for invalid name {name:?}"
+        );
+    }
+}
+
+#[test]
 fn policy_test_rejects_invalid_version_before_loading_configuration() {
     let project = TempProject::empty(r#"{"name":"policy-test-order","version":"1.0.0"}"#);
     let lpm_dir = project.home().join(".lpm");
