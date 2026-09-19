@@ -353,4 +353,7 @@ pub(crate) struct InternalHostsFileArgs {
     /// Hostname to place in the managed block. Repeat for multiple hosts.
     #[arg(long = "host")]
     pub(crate) hosts: Vec<String>,
+    /// Approved number of managed blocks for clean.
+    #[arg(long)]
+    pub(crate) expected_blocks: Option<usize>,
 }

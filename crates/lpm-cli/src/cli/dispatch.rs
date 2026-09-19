@@ -249,6 +249,7 @@ async fn async_main() -> Result<()> {
             &args.action,
             args.block_id.as_deref(),
             &args.hosts,
+            args.expected_blocks,
         )),
         Commands::InternalSecurityPolicy(args) => Some(
             crate::security_approval::run_internal_managed_protection(args.action),

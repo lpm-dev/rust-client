@@ -159,6 +159,10 @@ fn reviewed_raw_atomic_writer(key: &str) -> bool {
 
 const REVIEWED_RAW_ATOMIC_WRITERS: &[(&str, &str)] = &[
     (
+        "crates/lpm-runner/src/local_domains.rs::backup_hosts_file_once_with",
+        "streams and syncs an exclusive NamedTempFile, then publishes with persist_noclobber to preserve the first backup and avoid following destination links",
+    ),
+    (
         "crates/lpm-audit-corpus/src/layers/l4.rs::enrich_advisor_in_place",
         "the persist method belongs to L4Cache and delegates to the shared secure writer",
     ),

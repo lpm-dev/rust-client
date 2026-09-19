@@ -74,3 +74,49 @@ fn hosts_clean_aborts_non_interactive_without_yes_before_mutation() {
     );
     assert!(!project.home().join(".lpm").join("hosts.bak").exists());
 }
+
+#[test]
+fn hosts_clean_rejects_malformed_blocks_without_editing_the_file() {
+    for block in [
+        "# >>> lpm:owned >>>\n127.0.0.1 app.test\n10.0.0.1 router\n",
+        "# >>> lpm:owned >>>\n# >>> lpm:other >>>\n10.0.0.1 router\n# <<< lpm:owned <<<\n",
+    ] {
+        let project = TempProject::empty(r#"{"name":"hosts-test","version":"1.0.0"}"#);
+        let hosts_path = project.path().join("hosts");
+        std::fs::write(&hosts_path, block).unwrap();
+        let output = lpm(&project)
+            .args(["hosts", "clean", "--yes", "--json"])
+            .env("LPM_HOSTS_FILE", &hosts_path)
+            .output()
+            .unwrap();
+        assert!(!output.status.success());
+        let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(value["success"], false);
+        assert_eq!(std::fs::read_to_string(&hosts_path).unwrap(), block);
+        assert!(!project.home().join(".lpm/hosts.bak").exists());
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn hosts_clean_rejects_linked_backup_without_editing_either_target() {
+    let project = TempProject::empty(r#"{"name":"hosts-test","version":"1.0.0"}"#);
+    let hosts_path = project.path().join("hosts");
+    let block = "# >>> lpm:owned >>>\n127.0.0.1 app.test\n# <<< lpm:owned <<<\n";
+    std::fs::write(&hosts_path, block).unwrap();
+    let backup = project.home().join(".lpm/hosts.bak");
+    let target = project.path().join("unrelated");
+    std::fs::create_dir_all(backup.parent().unwrap()).unwrap();
+    std::os::unix::fs::symlink(&target, &backup).unwrap();
+    let output = lpm(&project)
+        .args(["hosts", "clean", "--yes", "--json"])
+        .env("LPM_HOSTS_FILE", &hosts_path)
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(value["success"], false);
+    assert!(value["error"].as_str().unwrap().contains("regular file"));
+    assert_eq!(std::fs::read_to_string(&hosts_path).unwrap(), block);
+    assert!(!target.exists());
+}

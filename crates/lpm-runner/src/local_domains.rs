@@ -47,6 +47,39 @@ pub struct HostsFileCleanOutcome {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HostsFileCleanError {
+    CountChanged { expected: usize, actual: usize },
+    Operation(String),
+}
+
+impl std::fmt::Display for HostsFileCleanError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::CountChanged { expected, actual } => write!(
+                f,
+                "hosts file block count changed from {expected} to {actual}; run `lpm hosts clean` again to review the new count"
+            ),
+            Self::Operation(message) => f.write_str(message),
+        }
+    }
+}
+
+impl std::error::Error for HostsFileCleanError {}
+
+impl From<String> for HostsFileCleanError {
+    fn from(message: String) -> Self {
+        Self::Operation(message)
+    }
+}
+
+fn check_hosts_clean_count(expected: usize, actual: usize) -> Result<(), HostsFileCleanError> {
+    if expected != actual {
+        return Err(HostsFileCleanError::CountChanged { expected, actual });
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ManagedHostsFile {
     path: PathBuf,
     backup_path: PathBuf,
@@ -155,10 +188,14 @@ pub fn remove_hosts_file_block_without_backup(path: &Path, block_id: &str) -> Re
     remove_managed_hosts_file_block_without_backup(path, block_id)
 }
 
-pub fn clean_hosts_file_without_backup(path: &Path) -> Result<HostsFileCleanOutcome, String> {
+pub fn clean_hosts_file_without_backup(
+    path: &Path,
+    expected_blocks: usize,
+) -> Result<HostsFileCleanOutcome, HostsFileCleanError> {
     with_hosts_file_lock(path, || {
         let current = read_hosts_file(path)?;
         let (next, removed_blocks) = remove_all_managed_hosts_blocks(&current)?;
+        check_hosts_clean_count(expected_blocks, removed_blocks)?;
         if current == next {
             return Ok(HostsFileCleanOutcome {
                 path: path.to_path_buf(),
@@ -192,10 +229,11 @@ pub fn plan_hosts_file_clean() -> Result<HostsFileCleanPlan, String> {
 
 pub fn apply_hosts_file_clean_plan(
     plan: &HostsFileCleanPlan,
-) -> Result<HostsFileCleanOutcome, String> {
+) -> Result<HostsFileCleanOutcome, HostsFileCleanError> {
     with_hosts_file_lock(&plan.path, || {
         let current = read_hosts_file(&plan.path)?;
         let (next, removed_blocks) = remove_all_managed_hosts_blocks(&current)?;
+        check_hosts_clean_count(plan.block_count, removed_blocks)?;
         if current == next {
             return Ok(HostsFileCleanOutcome {
                 path: plan.path.clone(),
@@ -304,7 +342,7 @@ fn upsert_managed_hosts_file_block(
     with_hosts_file_lock(path, || {
         let current = read_hosts_file(path)?;
         let reconciled = remove_stale_managed_hosts_blocks(&current)?;
-        let next = upsert_managed_hosts_block(&reconciled, block_id, hosts);
+        let next = upsert_managed_hosts_block(&reconciled, block_id, hosts)?;
         if current == next {
             return Ok(false);
         }
@@ -322,7 +360,7 @@ fn upsert_managed_hosts_file_block_without_backup(
     with_hosts_file_lock(path, || {
         let current = read_hosts_file(path)?;
         let reconciled = remove_stale_managed_hosts_blocks(&current)?;
-        let next = upsert_managed_hosts_block(&reconciled, block_id, hosts);
+        let next = upsert_managed_hosts_block(&reconciled, block_id, hosts)?;
         if current == next {
             return Ok(false);
         }
@@ -338,7 +376,7 @@ fn remove_managed_hosts_file_block(
 ) -> Result<bool, String> {
     with_hosts_file_lock(path, || {
         let current = read_hosts_file(path)?;
-        let next = remove_managed_hosts_block(&current, block_id);
+        let next = remove_managed_hosts_block(&current, block_id)?;
         if current == next {
             return Ok(false);
         }
@@ -354,7 +392,7 @@ fn remove_managed_hosts_file_block_without_backup(
 ) -> Result<bool, String> {
     with_hosts_file_lock(path, || {
         let current = read_hosts_file(path)?;
-        let next = remove_managed_hosts_block(&current, block_id);
+        let next = remove_managed_hosts_block(&current, block_id)?;
         if current == next {
             return Ok(false);
         }
@@ -363,10 +401,10 @@ fn remove_managed_hosts_file_block_without_backup(
     })
 }
 
-fn with_hosts_file_lock<T>(
+fn with_hosts_file_lock<T, E: From<String>>(
     path: &Path,
-    operation: impl FnOnce() -> Result<T, String>,
-) -> Result<T, String> {
+    operation: impl FnOnce() -> Result<T, E>,
+) -> Result<T, E> {
     let lock_path = hosts_file_lock_path(path)?;
     let _lock = lpm_common::acquire_single_file_exclusive_lock(&lock_path).map_err(|error| {
         format!(
@@ -420,24 +458,69 @@ fn read_hosts_file(path: &Path) -> Result<String, String> {
 }
 
 fn backup_hosts_file_once(path: &Path, backup_path: &Path) -> Result<(), String> {
-    if !path.exists() {
+    backup_hosts_file_once_with(path, backup_path, || {})
+}
+
+fn backup_hosts_file_once_with(
+    path: &Path,
+    backup_path: &Path,
+    before_publish: impl FnOnce(),
+) -> Result<(), String> {
+    if existing_hosts_backup(backup_path)? {
         return Ok(());
     }
-    if backup_path.exists() {
-        return Ok(());
-    }
-    if let Some(parent) = backup_path.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|err| format!("create {}: {err}", parent.display()))?;
-    }
-    std::fs::copy(path, backup_path).map_err(|err| {
-        format!(
-            "backup hosts file {} to {}: {err}",
-            path.display(),
+    let mut source = match std::fs::File::open(path) {
+        Ok(source) => source,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(format!(
+                "read hosts file {} for backup: {error}",
+                path.display()
+            ));
+        }
+    };
+    let parent = backup_path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    std::fs::create_dir_all(parent)
+        .map_err(|error| format!("create {}: {error}", parent.display()))?;
+    let mut staged = tempfile::NamedTempFile::new_in(parent)
+        .map_err(|error| format!("stage hosts backup in {}: {error}", parent.display()))?;
+    std::io::copy(&mut source, staged.as_file_mut())
+        .and_then(|_| staged.as_file().sync_all())
+        .map_err(|error| format!("write hosts backup {}: {error}", backup_path.display()))?;
+    before_publish();
+    // Publish only complete backups, without following or replacing a racing destination.
+    match staged.persist_noclobber(backup_path) {
+        Ok(_) => Ok(()),
+        Err(error) if error.error.kind() == std::io::ErrorKind::AlreadyExists => {
+            if existing_hosts_backup(backup_path)? {
+                Ok(())
+            } else {
+                Err(format!(
+                    "hosts backup {} changed during creation; retry",
+                    backup_path.display()
+                ))
+            }
+        }
+        Err(error) => Err(format!(
+            "publish hosts backup {}: {error}",
             backup_path.display()
-        )
-    })?;
-    Ok(())
+        )),
+    }
+}
+
+fn existing_hosts_backup(path: &Path) -> Result<bool, String> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_file() => Ok(true),
+        Ok(_) => Err(format!(
+            "hosts backup {} must be a regular file, not a symbolic link or directory",
+            path.display()
+        )),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(format!("inspect hosts backup {}: {error}", path.display())),
+    }
 }
 
 fn write_hosts_file_atomic(path: &Path, content: &str) -> Result<(), String> {
@@ -450,19 +533,23 @@ fn write_hosts_file_atomic(path: &Path, content: &str) -> Result<(), String> {
         .map_err(|err| format!("replace hosts file {}: {err}", path.display()))
 }
 
-fn upsert_managed_hosts_block(content: &str, block_id: &str, hosts: &[String]) -> String {
+fn upsert_managed_hosts_block(
+    content: &str,
+    block_id: &str,
+    hosts: &[String],
+) -> Result<String, String> {
     let newline = preferred_newline(content);
-    let without_existing = remove_managed_hosts_block_with_newline(content, block_id, newline);
+    let without_existing = remove_managed_hosts_block_with_newline(content, block_id, newline)?;
     let block = render_managed_hosts_block(block_id, hosts, newline);
     let trimmed = without_existing.trim_end_matches(['\r', '\n']);
-    if trimmed.is_empty() {
+    Ok(if trimmed.is_empty() {
         block
     } else {
         format!("{trimmed}{newline}{newline}{block}")
-    }
+    })
 }
 
-fn remove_managed_hosts_block(content: &str, block_id: &str) -> String {
+fn remove_managed_hosts_block(content: &str, block_id: &str) -> Result<String, String> {
     remove_managed_hosts_block_with_newline(content, block_id, preferred_newline(content))
 }
 
@@ -470,7 +557,12 @@ fn remove_all_managed_hosts_blocks(content: &str) -> Result<(String, usize), Str
     remove_all_managed_hosts_blocks_with_newline(content, preferred_newline(content))
 }
 
-fn remove_managed_hosts_block_with_newline(content: &str, block_id: &str, newline: &str) -> String {
+fn remove_managed_hosts_block_with_newline(
+    content: &str,
+    block_id: &str,
+    newline: &str,
+) -> Result<String, String> {
+    validate_managed_hosts_blocks(content)?;
     let begin = managed_hosts_begin(block_id);
     let end = managed_hosts_end(block_id);
     let mut out: Vec<&str> = Vec::new();
@@ -495,13 +587,14 @@ fn remove_managed_hosts_block_with_newline(content: &str, block_id: &str, newlin
     if !rendered.is_empty() {
         rendered.push_str(newline);
     }
-    rendered
+    Ok(rendered)
 }
 
 fn remove_all_managed_hosts_blocks_with_newline(
     content: &str,
     newline: &str,
 ) -> Result<(String, usize), String> {
+    validate_managed_hosts_blocks(content)?;
     let mut out: Vec<&str> = Vec::new();
     let mut in_block = None::<String>;
     let mut removed = 0usize;
@@ -547,6 +640,7 @@ fn remove_stale_managed_hosts_blocks_with(
     content: &str,
     mut process_identity: impl FnMut(u32) -> Option<crate::ports::ProcessIdentity>,
 ) -> Result<String, String> {
+    validate_managed_hosts_blocks(content)?;
     let newline = preferred_newline(content);
     let mut out = Vec::new();
     let mut managed_block = None::<(&str, bool)>;
@@ -630,6 +724,36 @@ fn managed_hosts_begin(block_id: &str) -> String {
 
 fn managed_hosts_end(block_id: &str) -> String {
     format!("# <<< lpm:{block_id} <<<")
+}
+
+fn validate_managed_hosts_blocks(content: &str) -> Result<(), String> {
+    let mut current = None;
+    for line in content.lines() {
+        if let Some(block) = parse_managed_hosts_begin(line) {
+            if current.is_some() {
+                return Err(format!(
+                    "hosts file contains nested LPM managed block `{block}`"
+                ));
+            }
+            current = Some(block);
+        } else if let Some(block) = line
+            .strip_prefix("# <<< lpm:")
+            .and_then(|line| line.strip_suffix(" <<<"))
+        {
+            if current != Some(block) {
+                return Err(format!(
+                    "hosts file contains unmatched LPM managed end marker `{block}`"
+                ));
+            }
+            current = None;
+        }
+    }
+    if let Some(block) = current {
+        return Err(format!(
+            "hosts file contains unterminated LPM managed block `{block}`"
+        ));
+    }
+    Ok(())
 }
 
 fn parse_managed_hosts_begin(line: &str) -> Option<&str> {
@@ -986,7 +1110,8 @@ mod tests {
             content,
             "project-abc",
             &["api.test".to_string(), "web.test".to_string()],
-        );
+        )
+        .unwrap();
 
         assert!(!next.contains("old.test"));
         assert!(next.contains("127.0.0.1 localhost"));
@@ -1001,7 +1126,7 @@ mod tests {
     fn remove_managed_hosts_block_preserves_unmanaged_lines() {
         let content = "127.0.0.1 localhost\n# >>> lpm:project-abc >>>\n127.0.0.1 api.test\n# <<< lpm:project-abc <<<\n10.0.0.1 router\n";
 
-        let next = remove_managed_hosts_block(content, "project-abc");
+        let next = remove_managed_hosts_block(content, "project-abc").unwrap();
 
         assert_eq!(next, "127.0.0.1 localhost\n10.0.0.1 router\n");
     }
@@ -1029,7 +1154,8 @@ mod tests {
     fn upsert_managed_hosts_block_preserves_crlf_hosts_file_style() {
         let content = "127.0.0.1 localhost\r\n";
 
-        let next = upsert_managed_hosts_block(content, "project-abc", &["api.test".to_string()]);
+        let next =
+            upsert_managed_hosts_block(content, "project-abc", &["api.test".to_string()]).unwrap();
 
         assert!(next.contains("127.0.0.1 localhost\r\n\r\n"));
         assert!(next.contains("# >>> lpm:project-abc >>>\r\n"));
@@ -1129,7 +1255,7 @@ mod tests {
             with_hosts_file_lock(&lock_path, || {
                 locked_tx.send(()).unwrap();
                 release_rx.recv().unwrap();
-                Ok(())
+                Ok::<(), String>(())
             })
             .unwrap();
         });
@@ -1231,7 +1357,7 @@ mod tests {
         let original = "127.0.0.1 localhost\n# >>> lpm:project-abc >>>\n127.0.0.1 api.test\n# <<< lpm:project-abc <<<\n";
         std::fs::write(&hosts_path, original).unwrap();
 
-        let outcome = clean_hosts_file_without_backup(&hosts_path).unwrap();
+        let outcome = clean_hosts_file_without_backup(&hosts_path, 1).unwrap();
 
         assert!(outcome.changed);
         assert_eq!(outcome.removed_blocks, 1);
@@ -1240,5 +1366,17 @@ mod tests {
             "127.0.0.1 localhost\n"
         );
         assert!(!backup_path.exists());
+    }
+    #[test]
+    fn hosts_backup_preserves_a_concurrently_created_backup() {
+        let dir = tempfile::tempdir().unwrap();
+        let hosts = dir.path().join("hosts");
+        let backup = dir.path().join("hosts.bak");
+        std::fs::write(&hosts, "current hosts").unwrap();
+        backup_hosts_file_once_with(&hosts, &backup, || {
+            std::fs::write(&backup, "first backup").unwrap();
+        })
+        .unwrap();
+        assert_eq!(std::fs::read_to_string(&backup).unwrap(), "first backup");
     }
 }
