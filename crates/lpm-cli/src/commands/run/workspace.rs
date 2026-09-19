@@ -153,6 +153,7 @@ fn build_workspace_task_schedule(
     }
 
     let mut expanded = HashSet::new();
+    let mut expanded_upstream = HashSet::new();
     while let Some((member_idx, task_name)) = pending.pop_front() {
         if !expanded.insert((member_idx, task_name.clone())) {
             continue;
@@ -194,13 +195,9 @@ fn build_workspace_task_schedule(
                     .iter()
                     .map(|&upstream_idx| (member_idx, task_name.clone(), upstream_idx))
                     .collect();
-                let mut expanded_edges = HashSet::new();
                 while let Some((dependent_idx, dependent_task, upstream_idx)) =
                     upstream_edges.pop_front()
                 {
-                    if !expanded_edges.insert((dependent_idx, upstream_idx)) {
-                        continue;
-                    }
                     direct_upstream_task_dependencies[dependent_idx]
                         .entry(dependent_task.clone())
                         .or_default()
@@ -208,6 +205,9 @@ fn build_workspace_task_schedule(
                             member_idx: upstream_idx,
                             task_name: upstream_task.to_string(),
                         });
+                    if !expanded_upstream.insert((upstream_idx, upstream_task.to_string())) {
+                        continue;
+                    }
                     ensure_workspace_member_task_config(
                         upstream_idx,
                         workspace_graph,
@@ -229,8 +229,8 @@ fn build_workspace_task_schedule(
                     }
                     if scheduled_names[upstream_idx].insert(upstream_task.to_string()) {
                         scheduled_tasks[upstream_idx].push(upstream_task.to_string());
+                        pending.push_back((upstream_idx, upstream_task.to_string()));
                     }
-                    pending.push_back((upstream_idx, upstream_task.to_string()));
                     upstream_edges.extend(workspace_graph.edges[upstream_idx].iter().map(
                         |&transitive_idx| (upstream_idx, upstream_task.to_string(), transitive_idx),
                     ));
@@ -768,6 +768,7 @@ fn run_workspace_package(
 
     // Single task, no deps → simple run
     if !json_output
+        && !stream
         && task_count == 1
         && scripts.len() == 1
         && !initially_failed_tasks.contains(&scripts[0])
@@ -804,12 +805,25 @@ fn run_workspace_package(
         }]));
     }
 
-    if parallel {
+    if parallel || stream {
+        let serial_levels;
+        let execution_levels = if parallel {
+            &member_task_plan.task_levels
+        } else {
+            serial_levels = member_task_plan
+                .task_levels
+                .iter()
+                .flatten()
+                .cloned()
+                .map(|task| vec![task])
+                .collect::<Vec<_>>();
+            &serial_levels
+        };
         run_tasks_parallel(
             member_dir,
             workspace_contract,
             workspace_dependency_identities,
-            &member_task_plan.task_levels,
+            execution_levels,
             extra_args,
             env_mode,
             continue_on_error,

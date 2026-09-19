@@ -4,7 +4,6 @@ use super::cache::{
 };
 use super::format::{print_captured_stderr, print_captured_stdout};
 use super::runtime::ensure_runtime;
-use super::task::reject_direct_hidden_scripts;
 use crate::install_ui;
 use lpm_common::{LpmError, LpmRoot, ResolutionFailureKind};
 use lpm_runner::bin_path::ManagedRuntimeHint;
@@ -194,54 +193,30 @@ pub(crate) async fn run_with_reserved_stdout(
     Ok(())
 }
 
-/// Run a script in watch mode — re-run on file changes.
-///
-/// Watch mode always runs fresh (no caching) — this is the correct behavior
-/// for a development workflow where you want immediate feedback on every save.
-/// The `--no-cache` flag has no effect in watch mode.
-///
-/// If the task has configured `inputs` globs in `lpm.json`, only file changes
-/// matching those globs trigger a rebuild. Otherwise, any relevant file change
-/// (excluding `.git/`, `node_modules/`, etc.) triggers a rebuild.
+/// Rerun a finite task graph after its inputs change, bypassing caches.
+#[allow(clippy::too_many_arguments)]
 pub fn run_watch(
     project_dir: &Path,
     script_name: &str,
     extra_args: &[String],
     env_mode: Option<&str>,
     bin_hint: ManagedRuntimeHint,
+    parallel: bool,
+    continue_on_error: bool,
+    stream: bool,
 ) -> Result<(), LpmError> {
-    reject_direct_hidden_scripts(&[script_name.to_string()])?;
-
-    // Read task config for input globs — only trigger on relevant file changes
-    let lpm_config = lpm_runner::lpm_json::read_lpm_json(project_dir).map_err(LpmError::Script)?;
-    let input_globs = lpm_config
-        .as_ref()
-        .and_then(|c| c.tasks.get(script_name))
-        .map(|tc| tc.effective_inputs())
-        .unwrap_or_default();
-
-    if input_globs.is_empty() {
-        install_ui::phase_untrusted(&format!(
-            "Watching {} (Ctrl+C to stop)",
-            lpm_common::sanitize_terminal_inline(script_name)
-        ));
-    } else {
-        install_ui::phase_line(crate::install_ui::terminal_line!(
-            "Watching {} [{}] (Ctrl+C to stop)",
-            lpm_common::sanitize_terminal_inline(script_name),
-            install_ui::dim(&input_globs.join(", ")),
-        ));
-    }
-
     let script = script_name.to_string();
-    let args: Vec<String> = extra_args.to_vec();
-    let mode = env_mode.map(|s| s.to_string());
+    let plan = super::prepare_single_package_task_plan(project_dir, std::slice::from_ref(&script))?;
+    let filter = lpm_task::watch::WatchFilterHandle::new(task_watch_filter(project_dir, &plan)?);
+    let cycle_filter = filter.clone();
+    install_ui::phase_untrusted(&format!(
+        "Watching {} (Ctrl+C to stop)",
+        lpm_common::sanitize_terminal_inline(&script)
+    ));
+    let args = extra_args.to_vec();
+    let mode = env_mode.map(str::to_string);
     let dir = project_dir.to_path_buf();
-    // Move the hint into the closure so each watch iteration reuses the
-    // initial-startup-resolved managed runtime bin.
-    let hint = bin_hint;
-
-    lpm_task::watch::watch_and_run(
+    lpm_task::watch::watch_and_run_with_filter(
         project_dir,
         Box::new(move || {
             let mut stderr = std::io::stderr();
@@ -249,37 +224,81 @@ pub fn run_watch(
                 let _ = write!(stderr, "\x1B[2J\x1B[1;1H");
                 let _ = stderr.flush();
             }
-            install_ui::phase_line(crate::install_ui::terminal_line!(
-                "watch running {}",
-                install_ui::yellow(&script)
-            ));
-
-            let result =
-                lpm_runner::script::run_script(&dir, &script, &args, mode.as_deref(), &hint);
-
+            let result = (|| {
+                let plan =
+                    super::prepare_single_package_task_plan(&dir, std::slice::from_ref(&script))?;
+                cycle_filter.replace(task_watch_filter(&dir, &plan)?);
+                super::execute_single_package_task_plan(
+                    &dir,
+                    &plan,
+                    &args,
+                    mode.as_deref(),
+                    super::TaskExecutionOptions {
+                        parallel,
+                        continue_on_error,
+                        stream,
+                        no_cache: true,
+                        json_output: false,
+                    },
+                    &bin_hint,
+                    None,
+                )?
+                .into_result()
+            })();
             match result {
-                Ok(()) => {
-                    install_ui::done_line(crate::install_ui::terminal_line!(
-                        "{} completed. Waiting for changes...",
-                        install_ui::yellow(&script)
-                    ));
-                }
-                Err(e) => {
+                Ok(()) => install_ui::done_line(crate::install_ui::terminal_line!(
+                    "{} completed. Waiting for changes...",
+                    install_ui::yellow(&script)
+                )),
+                Err(error) => {
                     install_ui::failed_line(crate::install_ui::terminal_line!(
                         "{}: {}",
                         install_ui::yellow(&script),
-                        lpm_common::sanitize_for_terminal(&e.to_string())
+                        lpm_common::sanitize_for_terminal(&error.to_string())
                     ));
                     install_ui::detail("  Waiting for changes...");
                 }
             }
         }),
-        &input_globs,
-        None, // No shutdown channel — runs until Ctrl+C
+        filter,
+        None,
     )
-    .map_err(|e| LpmError::Script(format!("watch error: {e}")))?;
+    .map_err(|error| LpmError::Script(format!("watch error: {error}")))
+}
 
-    Ok(())
+fn task_watch_filter(
+    project_dir: &Path,
+    plan: &super::SinglePackageTaskPlan,
+) -> Result<lpm_task::watch::WatchFilter, LpmError> {
+    let mut inputs = std::collections::BTreeSet::new();
+    let mut outputs = std::collections::BTreeSet::new();
+    let mut all_inputs = false;
+    for task_name in plan.levels.iter().flatten() {
+        let task = plan.tasks().get(task_name);
+        if let Some(task) = task {
+            outputs.extend(task.outputs.iter().cloned());
+        }
+        if super::task::is_meta_task(task_name, plan.tasks(), plan.package_scripts.as_ref()) {
+            continue;
+        }
+        if let Some(task) = task {
+            inputs.extend(task.effective_inputs());
+        } else {
+            all_inputs = true;
+        }
+    }
+    let inputs = if all_inputs {
+        Vec::new()
+    } else {
+        inputs.into_iter().collect::<Vec<_>>()
+    };
+    lpm_task::watch::WatchFilter::new(
+        project_dir,
+        &inputs,
+        &outputs.into_iter().collect::<Vec<_>>(),
+    )
+    .map(lpm_task::watch::WatchFilter::with_config_files)
+    .map_err(LpmError::Script)
 }
 
 /// Run a project-local binary from node_modules/.bin.

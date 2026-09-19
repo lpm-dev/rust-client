@@ -1,109 +1,302 @@
-//! File watching for `--watch` mode.
-//!
-//! Uses the `notify` crate for cross-platform file system events.
-//! Debounces events by 200ms — only fires after 200ms of quiet.
-//! Filters by input globs so only relevant file changes trigger rebuilds.
+//! Debounced file watching for finite task runs.
 
+use globset::{Glob, GlobBuilder, GlobSet, GlobSetBuilder};
 use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher};
-use std::path::Path;
-use std::sync::mpsc;
+use std::path::{Component, Path, PathBuf};
+use std::sync::{Arc, Mutex, RwLock, mpsc};
 use std::time::{Duration, Instant};
 
-/// Callback invoked when watched files change.
-pub type OnChange = Box<dyn Fn() + Send>;
+/// Callback invoked initially and after relevant file changes settle.
+pub type OnChange = Box<dyn FnMut() + Send>;
 
-/// Watch a directory for file changes and invoke a callback on change.
-///
-/// Blocks the current thread. The callback is called after debouncing
-/// (200ms of quiet after the last relevant event).
-///
-/// Only fires for modify/create/remove events on relevant paths — ignores
-/// access events, `.git` changes, `node_modules`, and build outputs.
-///
-/// If `input_globs` is non-empty, only file changes matching those globs trigger
-/// a rebuild (uses `matches_input_globs`).
-///
-/// If `shutdown` is `Some`, the loop will exit when a message is received on the
-/// channel. Pass `None` for infinite watch (original behavior).
+/// Compiled input and output rules for a watched directory.
+pub struct WatchFilter {
+    root: PathBuf,
+    inputs: GlobSet,
+    outputs: GlobSet,
+    all_inputs: bool,
+    config_files: bool,
+}
+
+impl WatchFilter {
+    /// Compile globs once, including output directory roots.
+    pub fn new(root: &Path, inputs: &[String], outputs: &[String]) -> Result<Self, String> {
+        let mut input_builder = GlobSetBuilder::new();
+        for pattern in inputs {
+            input_builder.add(compile_watch_glob(&normalize_watch_glob(pattern))?);
+        }
+        let mut output_builder = GlobSetBuilder::new();
+        for pattern in outputs {
+            let pattern = normalize_watch_glob(pattern);
+            output_builder.add(compile_watch_glob(&pattern)?);
+            if pattern.ends_with("/**") {
+                output_builder.add(compile_watch_glob(pattern.trim_end_matches("/**"))?);
+            }
+        }
+        Ok(Self {
+            root: std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf()),
+            inputs: input_builder.build().map_err(|error| error.to_string())?,
+            outputs: output_builder.build().map_err(|error| error.to_string())?,
+            all_inputs: inputs.is_empty(),
+            config_files: false,
+        })
+    }
+
+    /// Observe task configuration changes even outside the declared inputs.
+    pub fn with_config_files(mut self) -> Self {
+        self.config_files = true;
+        self
+    }
+
+    fn matches(&self, event: &notify::Event) -> bool {
+        event.need_rescan()
+            || (is_relevant_event(&event.kind)
+                && event.paths.iter().any(|path| self.matches_path(path)))
+    }
+
+    fn matches_path(&self, path: &Path) -> bool {
+        let Ok(relative) = path.strip_prefix(&self.root) else {
+            return false;
+        };
+        if relative.components().any(|part| match part {
+            Component::ParentDir => true,
+            Component::Normal(name) => name == ".git" || name == "node_modules" || name == ".lpm",
+            _ => false,
+        }) {
+            return false;
+        }
+        let name = relative.file_name().unwrap_or_default().to_string_lossy();
+        if name.ends_with(".swp") || name.ends_with('~') {
+            return false;
+        }
+        if self.config_files
+            && (relative == Path::new("package.json") || relative == Path::new("lpm.json"))
+        {
+            return true;
+        }
+        !self.outputs.is_match(relative) && (self.all_inputs || self.inputs.is_match(relative))
+    }
+}
+
+fn normalize_watch_glob(pattern: &str) -> String {
+    pattern
+        .split(std::path::is_separator)
+        .filter(|component| !component.is_empty() && *component != ".")
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+fn compile_watch_glob(pattern: &str) -> Result<Glob, String> {
+    glob::Pattern::new(pattern).map_err(|error| error.to_string())?;
+    // Task-cache globs treat braces and Unix backslashes as literal characters.
+    let mut compatible = String::with_capacity(pattern.len());
+    let mut characters = pattern.chars().peekable();
+    while let Some(character) = characters.next() {
+        match character {
+            '{' => compatible.push_str("[{]"),
+            '}' => compatible.push_str("[}]"),
+            '[' => {
+                let class_start = compatible.len();
+                compatible.push('[');
+                if characters.peek() == Some(&'!') {
+                    compatible.push(characters.next().unwrap_or('!'));
+                }
+                if characters.peek() == Some(&']') {
+                    compatible.push(characters.next().unwrap_or(']'));
+                }
+                for part in characters.by_ref() {
+                    compatible.push(part);
+                    if part == ']' {
+                        break;
+                    }
+                }
+                if compatible[class_start..].starts_with("[^") {
+                    let class = &compatible[class_start..];
+                    let body = &class[1..class.len() - 1];
+                    let candidate = body
+                        .chars()
+                        .find(|character| !matches!(character, '^' | '!' | '-'));
+                    let parsed = glob::Pattern::new(class).map_err(|error| error.to_string())?;
+                    if let Some(first) = candidate.or_else(|| parsed.matches("-").then_some('-')) {
+                        // Duplicate a literal member before '^', preserving all original ranges.
+                        compatible.insert(class_start + 1, first);
+                    } else {
+                        let replacement = match (parsed.matches("^"), parsed.matches("!")) {
+                            (true, true) => "{^,!}",
+                            (true, false) => "^",
+                            (false, true) => "!",
+                            (false, false) => "\0",
+                        };
+                        compatible.truncate(class_start);
+                        compatible.push_str(replacement);
+                    }
+                }
+            }
+            _ => compatible.push(character),
+        }
+    }
+    GlobBuilder::new(&compatible)
+        .literal_separator(true)
+        .backslash_escape(false)
+        .build()
+        .map_err(|error| error.to_string())
+}
+
+/// Replaceable rules shared by the task callback and notification thread.
+#[derive(Clone)]
+pub struct WatchFilterHandle(Arc<RwLock<WatchFilter>>);
+
+impl WatchFilterHandle {
+    /// Create a shared filter.
+    pub fn new(filter: WatchFilter) -> Self {
+        Self(Arc::new(RwLock::new(filter)))
+    }
+
+    /// Replace a complete, validated filter before executing the next task.
+    pub fn replace(&self, filter: WatchFilter) {
+        *self.0.write().unwrap_or_else(|error| error.into_inner()) = filter;
+    }
+
+    fn matches(&self, event: &notify::Event) -> bool {
+        self.0
+            .read()
+            .unwrap_or_else(|error| error.into_inner())
+            .matches(event)
+    }
+}
+
+#[derive(Default)]
+struct PendingChange {
+    last_relevant: Option<Instant>,
+    error: Option<String>,
+}
+
+#[derive(Clone, Default)]
+struct WatchState(Arc<Mutex<PendingChange>>);
+
+impl WatchState {
+    fn take_ready(&self, now: Instant) -> Result<bool, String> {
+        let mut pending = self.0.lock().unwrap_or_else(|error| error.into_inner());
+        if let Some(error) = pending.error.take() {
+            return Err(error);
+        }
+        if pending
+            .last_relevant
+            .is_some_and(|last| now.saturating_duration_since(last) >= Duration::from_millis(200))
+        {
+            pending.last_relevant = None;
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
+    fn start_initial_run(&self) -> Result<(), String> {
+        let mut pending = self.0.lock().unwrap_or_else(|error| error.into_inner());
+        if let Some(error) = pending.error.take() {
+            return Err(error);
+        }
+        Ok(())
+    }
+}
+
+struct WatchNotifications {
+    state: WatchState,
+    filter: WatchFilterHandle,
+    wake: mpsc::SyncSender<()>,
+}
+
+impl WatchNotifications {
+    fn new(filter: WatchFilterHandle) -> (Self, mpsc::Receiver<()>) {
+        let (wake, receiver) = mpsc::sync_channel(1);
+        (
+            Self {
+                state: WatchState::default(),
+                filter,
+                wake,
+            },
+            receiver,
+        )
+    }
+
+    fn submit(&self, event: notify::Result<notify::Event>) {
+        let error = match event {
+            Ok(event) if self.filter.matches(&event) => None,
+            Ok(_) => return,
+            Err(error) => {
+                let mut message = error.to_string();
+                message.truncate(message.floor_char_boundary(4096));
+                Some(message)
+            }
+        };
+        let mut pending = self
+            .state
+            .0
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if let Some(error) = error {
+            if pending.error.is_none() {
+                pending.error = Some(error);
+            }
+        } else {
+            pending.last_relevant = Some(Instant::now());
+        }
+        drop(pending);
+        let _ = self.wake.try_send(());
+    }
+}
+
+/// Watch inputs and rerun after 200 ms of quiet. Each callback runs to completion.
 pub fn watch_and_run(
     watch_dir: &Path,
     on_change: OnChange,
     input_globs: &[String],
-    shutdown: Option<std::sync::mpsc::Receiver<()>>,
+    shutdown: Option<mpsc::Receiver<()>>,
 ) -> Result<(), String> {
-    let (tx, rx) = mpsc::channel();
+    let filter = WatchFilterHandle::new(WatchFilter::new(watch_dir, input_globs, &[])?);
+    watch_and_run_with_filter(watch_dir, on_change, filter, shutdown)
+}
 
-    let mut watcher: RecommendedWatcher = notify::recommended_watcher(move |res| {
-        if let Ok(event) = res {
-            let _ = tx.send(event);
-        }
-    })
-    .map_err(|e| format!("failed to create file watcher: {e}"))?;
-
+/// Watch with rules that the callback can replace between runs.
+pub fn watch_and_run_with_filter(
+    watch_dir: &Path,
+    on_change: OnChange,
+    filter: WatchFilterHandle,
+    shutdown: Option<mpsc::Receiver<()>>,
+) -> Result<(), String> {
+    let watch_dir = std::fs::canonicalize(watch_dir).map_err(|error| error.to_string())?;
+    let (notifications, receiver) = WatchNotifications::new(filter);
+    let state = notifications.state.clone();
+    let mut watcher: RecommendedWatcher =
+        notify::recommended_watcher(move |event| notifications.submit(event))
+            .map_err(|error| format!("failed to create file watcher: {error}"))?;
     watcher
-        .watch(watch_dir, RecursiveMode::Recursive)
-        .map_err(|e| format!("failed to watch directory: {e}"))?;
+        .watch(&watch_dir, RecursiveMode::Recursive)
+        .map_err(|error| format!("failed to watch directory: {error}"))?;
+    run_watch_loop(receiver, on_change, state, shutdown)
+}
 
-    let debounce = Duration::from_millis(200);
-    let mut last_relevant_event: Option<Instant> = None;
-    let mut debounce_fired = true; // Start as fired so initial run doesn't re-trigger
-
-    // Run once initially
+fn run_watch_loop(
+    receiver: mpsc::Receiver<()>,
+    mut on_change: OnChange,
+    state: WatchState,
+    shutdown: Option<mpsc::Receiver<()>>,
+) -> Result<(), String> {
+    state.start_initial_run()?;
     on_change();
-
     loop {
-        // Check for shutdown signal
-        if let Some(ref shutdown_rx) = shutdown
-            && shutdown_rx.try_recv().is_ok()
+        if shutdown
+            .as_ref()
+            .is_some_and(|receiver| receiver.try_recv().is_ok())
         {
             return Ok(());
         }
-
-        match rx.recv_timeout(Duration::from_millis(50)) {
-            Ok(event) => {
-                // Filter: only care about modifications, creates, removes
-                if !is_relevant_event(&event.kind) {
-                    continue;
-                }
-
-                // Filter: ignore .git, node_modules, common build outputs
-                let dominated_by_ignored = event.paths.iter().all(|p| {
-                    let s = p.to_string_lossy();
-                    s.contains("/.git/")
-                        || s.contains("/node_modules/")
-                        || s.contains("/.lpm/")
-                        || s.ends_with(".swp")
-                        || s.ends_with("~")
-                });
-                if dominated_by_ignored {
-                    continue;
-                }
-
-                // Filter: if input globs are specified, only trigger on matching files
-                if !input_globs.is_empty() {
-                    let any_match = event
-                        .paths
-                        .iter()
-                        .any(|p| matches_input_globs(p, watch_dir, input_globs));
-                    if !any_match {
-                        continue;
-                    }
-                }
-
-                // Record this as a relevant event and reset debounce
-                last_relevant_event = Some(Instant::now());
-                debounce_fired = false;
-            }
-            Err(mpsc::RecvTimeoutError::Timeout) => {
-                // Check if debounce period has passed since last relevant event
-                if let Some(last) = last_relevant_event
-                    && !debounce_fired
-                    && last.elapsed() >= debounce
-                {
-                    on_change();
-                    debounce_fired = true;
-                }
-            }
+        // Clear only immediately before execution, preserving edits made while a task runs.
+        if state.take_ready(Instant::now())? {
+            on_change();
+            continue;
+        }
+        match receiver.recv_timeout(Duration::from_millis(50)) {
+            Ok(()) | Err(mpsc::RecvTimeoutError::Timeout) => {}
             Err(mpsc::RecvTimeoutError::Disconnected) => {
                 return Err("file watcher disconnected".into());
             }
@@ -111,7 +304,6 @@ pub fn watch_and_run(
     }
 }
 
-/// Check if a file event kind is relevant (not just access/metadata).
 fn is_relevant_event(kind: &EventKind) -> bool {
     matches!(
         kind,
@@ -119,30 +311,285 @@ fn is_relevant_event(kind: &EventKind) -> bool {
     )
 }
 
-/// Filter file paths against input glob patterns.
-/// Returns true if the path matches any of the patterns.
+/// Match a path against input globs, relative to the project directory.
 pub fn matches_input_globs(path: &Path, project_dir: &Path, globs: &[String]) -> bool {
-    let rel = path
-        .strip_prefix(project_dir)
-        .unwrap_or(path)
-        .to_string_lossy();
-
-    for pattern in globs {
-        if let Ok(glob) = globset::Glob::new(pattern) {
-            let matcher = glob.compile_matcher();
-            if matcher.is_match(rel.as_ref()) {
-                return true;
-            }
-        }
-    }
-
-    false
+    let relative = path.strip_prefix(project_dir).unwrap_or(path);
+    globs.iter().any(|pattern| {
+        Glob::new(pattern).is_ok_and(|glob| glob.compile_matcher().is_match(relative))
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::path::PathBuf;
+
+    fn matches_watch_event(event: &notify::Event, root: &Path, inputs: &[String]) -> bool {
+        WatchFilter::new(root, inputs, &[]).unwrap().matches(event)
+    }
+
+    #[test]
+    fn file_outputs_do_not_exclude_parent_directory_changes() {
+        let filter =
+            WatchFilter::new(Path::new("/project"), &[], &["**/generated.txt".into()]).unwrap();
+        let event = notify::Event::new(EventKind::Create(notify::event::CreateKind::Folder))
+            .add_path(Path::new("/project/src/new").to_path_buf());
+        assert!(filter.matches(&event));
+    }
+
+    #[test]
+    fn subtree_output_roots_are_excluded_for_untyped_and_rename_events() {
+        let filter =
+            WatchFilter::new(Path::new("/project"), &[], &["artifacts/*/**".into()]).unwrap();
+        for kind in [
+            EventKind::Create(notify::event::CreateKind::Any),
+            EventKind::Remove(notify::event::RemoveKind::Any),
+            EventKind::Modify(notify::event::ModifyKind::Name(
+                notify::event::RenameMode::Any,
+            )),
+        ] {
+            let event = notify::Event::new(kind)
+                .add_path(Path::new("/project/artifacts/job-1").to_path_buf());
+            assert!(!filter.matches(&event), "{kind:?}");
+        }
+        let parent = notify::Event::new(EventKind::Create(notify::event::CreateKind::Folder))
+            .add_path(Path::new("/project/artifacts").to_path_buf());
+        assert!(filter.matches(&parent));
+    }
+
+    #[test]
+    fn rescan_notifications_trigger_a_bounded_rebuild_without_paths() {
+        let filter = WatchFilterHandle::new(
+            WatchFilter::new(Path::new("/project"), &["src/**".into()], &[]).unwrap(),
+        );
+        let (notifications, receiver) = WatchNotifications::new(filter);
+        for _ in 0..10_000 {
+            notifications.submit(Ok(
+                notify::Event::new(EventKind::Other).set_flag(notify::event::Flag::Rescan)
+            ));
+        }
+        assert_eq!(receiver.try_iter().count(), 1);
+        assert!(
+            notifications
+                .state
+                .take_ready(Instant::now() + Duration::from_secs(1))
+                .unwrap()
+        );
+        assert!(
+            !notifications
+                .state
+                .take_ready(Instant::now() + Duration::from_secs(1))
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn single_star_inputs_do_not_match_nested_directories() {
+        let filter = WatchFilter::new(Path::new("/project"), &["src/*.ts".into()], &[]).unwrap();
+        for (path, expected) in [("src/main.ts", true), ("src/nested/main.ts", false)] {
+            let event = notify::Event::new(EventKind::Modify(notify::event::ModifyKind::Any))
+                .add_path(Path::new("/project").join(path));
+            assert_eq!(filter.matches(&event), expected, "{path}");
+        }
+    }
+
+    #[test]
+    fn watch_globs_match_task_cache_path_syntax() {
+        for (pattern, path, expected) in [
+            ("./src/*.ts", "src/main.ts", true),
+            ("generated/{a,b}/**", "generated/a/file.txt", false),
+            ("generated/{a,b}/**", "generated/{a,b}/file.txt", true),
+            ("src/[[]name].ts", "src/[name].ts", true),
+        ] {
+            let filter = WatchFilter::new(Path::new("/project"), &[pattern.into()], &[]).unwrap();
+            let event = notify::Event::new(EventKind::Modify(notify::event::ModifyKind::Any))
+                .add_path(Path::new("/project").join(path));
+            assert_eq!(filter.matches(&event), expected, "{pattern}: {path}");
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn native_windows_paths_preserve_inputs_and_exclude_output_roots() {
+        let root = Path::new(r"C:\project");
+        let filter = WatchFilter::new(root, &[r"src\*.ts".into()], &[r"dist\**".into()]).unwrap();
+        for (path, expected) in [
+            (r"C:\project\src\main.ts", true),
+            (r"C:\project\src\deep\main.ts", false),
+            (r"C:\project\dist", false),
+            (r"C:\project\node_modules", false),
+        ] {
+            let event = notify::Event::new(EventKind::Create(notify::event::CreateKind::Any))
+                .add_path(PathBuf::from(path));
+            assert_eq!(filter.matches(&event), expected, "{path}");
+        }
+    }
+
+    #[test]
+    fn notification_errors_are_bounded_and_preserve_valid_utf8() {
+        let filter =
+            WatchFilterHandle::new(WatchFilter::new(Path::new("/project"), &[], &[]).unwrap());
+        let (notifications, receiver) = WatchNotifications::new(filter);
+        for _ in 0..100 {
+            notifications.submit(Err(notify::Error::generic(&"é".repeat(10_000))));
+        }
+        assert_eq!(receiver.try_iter().count(), 1);
+        let error = notifications.state.take_ready(Instant::now()).unwrap_err();
+        assert!(error.len() <= 4096);
+        assert!(!error.is_empty());
+    }
+
+    #[test]
+    fn character_class_carets_remain_literal_like_task_cache_globs() {
+        for (pattern, path, expected) in [
+            ("src/[^a].ts", "src/a.ts", true),
+            ("src/[^a].ts", "src/b.ts", false),
+            ("src/[^].ts", "src/^.ts", true),
+            ("src/[!^].ts", "src/a.ts", true),
+        ] {
+            let filter = WatchFilter::new(Path::new("/project"), &[pattern.into()], &[]).unwrap();
+            let event = notify::Event::new(EventKind::Modify(notify::event::ModifyKind::Any))
+                .add_path(Path::new("/project").join(path));
+            assert_eq!(filter.matches(&event), expected, "{pattern}: {path}");
+        }
+    }
+
+    #[test]
+    fn repeated_recursive_output_globs_exclude_the_same_root() {
+        let filter = WatchFilter::new(Path::new("/project"), &[], &["dist/**/**".into()]).unwrap();
+        let event = notify::Event::new(EventKind::Remove(notify::event::RemoveKind::Any))
+            .add_path(Path::new("/project/dist").to_path_buf());
+        assert!(!filter.matches(&event));
+    }
+
+    #[test]
+    fn metadata_changes_still_trigger_tasks() {
+        let filter = WatchFilter::new(Path::new("/project"), &[], &[]).unwrap();
+        let event = notify::Event::new(EventKind::Modify(notify::event::ModifyKind::Metadata(
+            notify::event::MetadataKind::Permissions,
+        )))
+        .add_path(Path::new("/project/src/script.sh").to_path_buf());
+        assert!(filter.matches(&event));
+    }
+
+    #[test]
+    fn mixed_paths_must_have_one_nonignored_matching_path() {
+        let event = notify::Event::new(EventKind::Modify(notify::event::ModifyKind::Any))
+            .add_path(PathBuf::from("/project/node_modules/tool/index.ts"))
+            .add_path(PathBuf::from("/project/docs/readme.txt"));
+        assert!(!matches_watch_event(
+            &event,
+            Path::new("/project"),
+            &["**/*.ts".into()]
+        ));
+    }
+
+    #[test]
+    fn ignored_directory_roots_do_not_trigger_watch() {
+        for name in [".git", "node_modules", ".lpm"] {
+            let event = notify::Event::new(EventKind::Create(notify::event::CreateKind::Folder))
+                .add_path(Path::new("/project").join(name));
+            assert!(
+                !matches_watch_event(&event, Path::new("/project"), &[]),
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn startup_changes_are_retained_for_a_followup_cycle() {
+        let filter =
+            WatchFilterHandle::new(WatchFilter::new(Path::new("/project"), &[], &[]).unwrap());
+        let (notifications, receiver) = WatchNotifications::new(filter);
+        notifications.submit(Ok(notify::Event::new(EventKind::Modify(
+            notify::event::ModifyKind::Any,
+        ))
+        .add_path(Path::new("/project/lpm.json").to_path_buf())));
+        let (shutdown_tx, shutdown_rx) = mpsc::channel();
+        let (ran_tx, ran_rx) = mpsc::channel();
+        let watcher = std::thread::spawn(move || {
+            run_watch_loop(
+                receiver,
+                Box::new(move || {
+                    let _ = ran_tx.send(());
+                }),
+                notifications.state,
+                Some(shutdown_rx),
+            )
+        });
+        ran_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        let second = ran_rx.recv_timeout(Duration::from_millis(700));
+        let _ = shutdown_tx.send(());
+        watcher.join().unwrap().unwrap();
+        assert!(
+            second.is_ok(),
+            "startup change was lost before the initial callback"
+        );
+    }
+
+    #[test]
+    fn watcher_errors_reach_the_waiting_loop() {
+        let filter =
+            WatchFilterHandle::new(WatchFilter::new(Path::new("/project"), &[], &[]).unwrap());
+        let (notifications, _) = WatchNotifications::new(filter);
+        notifications.submit(Err(notify::Error::generic("fixture watcher failed")));
+        assert!(
+            notifications
+                .state
+                .take_ready(Instant::now())
+                .unwrap_err()
+                .contains("fixture watcher failed")
+        );
+    }
+
+    #[test]
+    fn ignored_event_traffic_cannot_starve_a_pending_rebuild() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        };
+        let filter =
+            WatchFilterHandle::new(WatchFilter::new(Path::new("/project"), &[], &[]).unwrap());
+        let (notifications, rx) = WatchNotifications::new(filter);
+        let state = notifications.state.clone();
+        let (shutdown_tx, shutdown_rx) = mpsc::channel();
+        let (ran_tx, ran_rx) = mpsc::channel();
+        let watcher = std::thread::spawn(move || {
+            run_watch_loop(
+                rx,
+                Box::new(move || {
+                    let _ = ran_tx.send(());
+                }),
+                state,
+                Some(shutdown_rx),
+            )
+        });
+        ran_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        notifications.submit(Ok(notify::Event::new(EventKind::Modify(
+            notify::event::ModifyKind::Any,
+        ))
+        .add_path(PathBuf::from("/project/src/file.ts"))));
+        let stop = Arc::new(AtomicBool::new(false));
+        let producer_stop = Arc::clone(&stop);
+        let producer = std::thread::spawn(move || {
+            while !producer_stop.load(Ordering::Relaxed) {
+                notifications.submit(Ok(notify::Event::new(EventKind::Create(
+                    notify::event::CreateKind::File,
+                ))
+                .add_path(PathBuf::from("/project/.lpm/log"))));
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        });
+        let result = ran_rx.recv_timeout(Duration::from_millis(700));
+        stop.store(true, Ordering::Relaxed);
+        let _ = shutdown_tx.send(());
+        producer.join().unwrap();
+        let _ = watcher.join().unwrap();
+        assert!(
+            result.is_ok(),
+            "ignored events prevented the pending rebuild"
+        );
+    }
 
     #[test]
     fn relevant_event_filtering() {
@@ -193,31 +640,6 @@ mod tests {
             &project,
             &["src/**".into()]
         ));
-    }
-
-    #[test]
-    fn debounce_flag_logic() {
-        // Test the debounce state machine logic
-        let debounce = Duration::from_millis(200);
-
-        // Simulate event arrives — debounce_fired starts false (event just arrived)
-        let last_event = Instant::now();
-        let mut debounce_fired = false;
-
-        // Before debounce: should NOT fire
-        assert!(!debounce_fired);
-        assert!(last_event.elapsed() < debounce); // too soon
-
-        // After debounce period: should fire exactly once
-        std::thread::sleep(Duration::from_millis(250));
-        if !debounce_fired && last_event.elapsed() >= debounce {
-            debounce_fired = true;
-        }
-        assert!(debounce_fired);
-
-        // Subsequent checks: already fired, should not fire again
-        let should_fire = !debounce_fired && last_event.elapsed() >= debounce;
-        assert!(!should_fire, "should not fire again after debounce_fired");
     }
 
     // -- watch filters by input globs --

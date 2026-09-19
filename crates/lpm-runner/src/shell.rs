@@ -768,6 +768,22 @@ pub fn spawn_command_capture(
     })
 }
 
+fn styled_output_prefix(prefix: &str, color: &str) -> String {
+    if lpm_common::color::enabled() {
+        format!("\x1b[{color}m[{}]\x1b[0m", sanitize_terminal_inline(prefix))
+    } else {
+        format!("[{}]", sanitize_terminal_inline(prefix))
+    }
+}
+
+/// Replay captured output with the same prefixes as live task output.
+pub fn print_prefixed_output(output: &str, prefix: &str, color: &str) {
+    let prefix = styled_output_prefix(prefix, color);
+    for line in output.lines() {
+        eprintln!("{prefix} {}", sanitize_terminal_inline(line));
+    }
+}
+
 /// Spawn a shell command with prefixed output — each line gets a `[prefix]` tag.
 ///
 /// Prefixes and child lines are sanitized before LPM-owned styling is added.
@@ -798,17 +814,15 @@ pub fn spawn_shell_prefixed(
     let child_stdout = child.stdout.take();
     let child_stderr = child.stderr.take();
 
-    let prefix_out = format!("[{}]", sanitize_terminal_inline(prefix));
+    let prefix_out = styled_output_prefix(prefix, color);
     let prefix_err = prefix_out.clone();
-    let color_out = color.to_string();
-    let color_err = color_out.clone();
 
     // Prefixed stdout reader
     let stdout_handle = std::thread::spawn(move || -> String {
         child_stdout.map_or_else(String::new, |stdout| {
             drain_captured_stream(stdout, |line| {
                 let safe_line = sanitize_terminal_inline(line);
-                eprintln!("\x1b[{}m{}\x1b[0m {}", color_out, prefix_out, safe_line);
+                eprintln!("{prefix_out} {safe_line}");
             })
         })
     });
@@ -818,7 +832,7 @@ pub fn spawn_shell_prefixed(
         child_stderr.map_or_else(String::new, |stderr| {
             drain_captured_stream(stderr, |line| {
                 let safe_line = sanitize_terminal_inline(line);
-                eprintln!("\x1b[{}m{}\x1b[0m {}", color_err, prefix_err, safe_line);
+                eprintln!("{prefix_err} {safe_line}");
             })
         })
     });
