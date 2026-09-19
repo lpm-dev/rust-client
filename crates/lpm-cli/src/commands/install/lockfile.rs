@@ -1687,15 +1687,6 @@ pub(crate) fn requested_range_for_locked_lookup(requested_spec: &str) -> Option<
     }
 }
 
-pub(crate) fn select_locked_package_for_requested_spec<'a>(
-    lockfile: &'a lpm_lockfile::Lockfile,
-    target: &str,
-    requested_spec: &str,
-) -> Option<&'a lpm_lockfile::LockedPackage> {
-    let packages = lockfile.packages.iter().collect::<Vec<_>>();
-    select_locked_package_for_requested_spec_from_rows(&packages, target, requested_spec)
-}
-
 fn select_locked_package_for_requested_spec_from_rows<'a>(
     packages: &[&'a lpm_lockfile::LockedPackage],
     target: &str,

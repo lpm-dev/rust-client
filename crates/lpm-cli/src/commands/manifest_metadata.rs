@@ -433,6 +433,16 @@ fn platform_skipped_package_keys(
         .collect()
 }
 
+pub(crate) fn installed_lockfile_paths(
+    project_dir: &Path,
+    lockfile: &Lockfile,
+) -> Result<BTreeMap<String, PathBuf>, LpmError> {
+    let root_json = read_json_file(&project_dir.join("package.json"))?;
+    let indexes = graph::PackageIndexes::new(&lockfile.packages);
+    let roots = graph::selected_roots(&root_json, lockfile, &indexes);
+    installed_package_paths(project_dir, lockfile, &indexes, &roots)
+}
+
 fn installed_package_paths(
     project_dir: &Path,
     lockfile: &Lockfile,

@@ -408,6 +408,7 @@ pub(super) struct OnlineFetchPhaseInput<'a> {
     pub(super) arc_client: Arc<RegistryClient>,
     pub(super) route_table: RouteTable,
     pub(super) project_dir: &'a Path,
+    pub(super) policy_project_dir: &'a Path,
     pub(super) packages: Vec<InstallPackage>,
     pub(super) packages_for_lockfile: Vec<InstallPackage>,
     pub(super) store: PackageStore,
@@ -555,6 +556,7 @@ pub(super) async fn run_online_fetch_phase(
         arc_client,
         route_table,
         project_dir,
+        policy_project_dir,
         mut packages,
         mut packages_for_lockfile,
         store,
@@ -1236,7 +1238,7 @@ pub(super) async fn run_online_fetch_phase(
     ) {
         crate::security_approval::ensure_project_unlock(
             crate::security_approval::ApprovalScope::ProvenanceIgnoreDrift,
-            project_dir,
+            policy_project_dir,
             json_output,
             crate::security_approval::ApprovalSource::CliFlag,
             "This install waives provenance drift checks for this project.",
@@ -1280,7 +1282,7 @@ pub(super) async fn run_online_fetch_phase(
             || global_config.get_sigstore_verify(),
         );
     crate::security_approval::ensure_runtime_sigstore_posture(
-        project_dir,
+        policy_project_dir,
         json_output,
         verify_policy.enforce,
         runtime_sigstore_source,
@@ -1302,7 +1304,7 @@ pub(super) async fn run_online_fetch_phase(
     ) {
         crate::security_approval::ensure_project_unlock(
             crate::security_approval::ApprovalScope::ProvenanceUnverified,
-            project_dir,
+            policy_project_dir,
             json_output,
             crate::security_approval::ApprovalSource::CliFlag,
             "This install skips Sigstore verification for one or more packages in this project.",
@@ -1345,7 +1347,7 @@ pub(super) async fn run_online_fetch_phase(
         verify_policy.skip = crate::provenance_fetch::SkipPolicy::None;
     }
     let cooldown_policy = lpm_security::SecurityPolicy::with_resolved_min_age(
-        &project_dir.join("package.json"),
+        &policy_project_dir.join("package.json"),
         effective_min_age_secs,
     );
 
@@ -1505,9 +1507,10 @@ pub(super) async fn run_online_fetch_phase(
     )?;
     if !drift_ignore_policy.ignores_all() || verification_scope.verifies_all() || trust_no_downgrade
     {
-        let trusted =
-            lpm_security::SecurityPolicy::from_package_json(&project_dir.join("package.json"))
-                .trusted_dependencies;
+        let trusted = lpm_security::SecurityPolicy::from_package_json(
+            &policy_project_dir.join("package.json"),
+        )
+        .trusted_dependencies;
 
         // Short-circuit the whole gate when there's no rich-form
         // approval to compare against. Projects with only legacy approvals

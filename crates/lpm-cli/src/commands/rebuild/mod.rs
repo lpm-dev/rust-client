@@ -49,7 +49,10 @@ use self::build_cache::{
 };
 #[cfg(test)]
 pub(crate) use self::hints::scriptable_package_rows;
-pub use self::hints::{all_scripted_packages_trusted, show_install_build_hint};
+pub use self::hints::{
+    all_scripted_packages_trusted, all_scripted_packages_trusted_in_context,
+    show_install_build_hint,
+};
 use self::package_dir::prepare_live_package_dir;
 #[cfg(test)]
 use self::sandbox_env::build_sanitized_env;
@@ -179,6 +182,7 @@ pub async fn run(
             effective_policy,
             advisor_approvals,
             true,
+            None,
         ),
     )
     .await
@@ -203,6 +207,7 @@ pub(crate) async fn run_with_report(
         &std::collections::HashSet<crate::triage_advisor_session::AdvisorApprovalKey>,
     >,
     emit_summary: bool,
+    policy_project_dir: Option<&Path>,
 ) -> Result<RebuildRunReport, LpmError> {
     // hold the shared store lock across rebuild —
     // it traverses store package dirs to read package.json, compute
@@ -227,6 +232,7 @@ pub(crate) async fn run_with_report(
             effective_policy,
             advisor_approvals,
             emit_summary,
+            policy_project_dir.unwrap_or(project_dir),
         ),
     )
     .await
@@ -251,6 +257,7 @@ async fn run_under_store_lock(
         &std::collections::HashSet<crate::triage_advisor_session::AdvisorApprovalKey>,
     >,
     emit_summary: bool,
+    policy_project_dir: &Path,
 ) -> Result<RebuildRunReport, LpmError> {
     let cancelled = crate::install_recovery::cancellation_flag();
     crate::security_floor::clear_recorded_suppressions();
@@ -271,7 +278,7 @@ async fn run_under_store_lock(
     // the package.json read is a single pass across all four keys
     // (scriptPolicy, autoBuild, denyAll, trustedScopes).
     let project_config =
-        crate::script_policy_config::ScriptPolicyConfig::try_from_package_json(project_dir)?;
+        crate::script_policy_config::ScriptPolicyConfig::try_from_package_json(policy_project_dir)?;
     if deny_all || project_config.deny_all {
         if json_output {
             let force_floor = crate::commands::config::GlobalConfig::load()
@@ -302,7 +309,7 @@ async fn run_under_store_lock(
     // at the `pkg_json_path.exists()` check below — i.e., lifecycle
     // scripts never executed for virtual-store installs.
     let lpm_root = lpm_common::LpmRoot::from_env()?;
-    let policy = SecurityPolicy::from_package_json(&project_dir.join("package.json"));
+    let policy = SecurityPolicy::from_package_json(&policy_project_dir.join("package.json"));
 
     // Load lockfile to get installed packages with their scripts
     let lockfile = crate::commands::install::workspace_lockfile::read_project(project_dir)
@@ -325,7 +332,7 @@ async fn run_under_store_lock(
         .unwrap_or(false);
 
     crate::security_approval::ensure_project_policy_authorized(
-        project_dir,
+        policy_project_dir,
         json_output,
         crate::security_approval::ApprovalSource::ProjectConfig,
     )?;
@@ -337,7 +344,7 @@ async fn run_under_store_lock(
     // declare `lpm.scripts.{passEnv, readProject, sandboxLimits}`
     // see zero behavior change.
     let requested_capabilities =
-        crate::capability::CapabilitySet::from_project(&project_dir.join("package.json"))
+        crate::capability::CapabilitySet::from_project(&policy_project_dir.join("package.json"))
             .map_err(|e| LpmError::Registry(format!("{e}")))?;
     let user_bound = crate::security_approval::authorized_capability_user_bound();
 
@@ -420,7 +427,7 @@ async fn run_under_store_lock(
             lp.integrity.as_deref(),
             &scripts,
             &policy,
-            project_dir,
+            policy_project_dir,
             effective_policy,
             force_security_floor,
             &requested_capabilities,
@@ -550,7 +557,7 @@ async fn run_under_store_lock(
         requested_packages.dedup();
         let authorized_policy =
             crate::script_policy_config::resolve_script_policy_with_security_for_packages(
-                project_dir,
+                policy_project_dir,
                 Some(ScriptPolicy::Allow),
                 &project_config,
                 json_output,
@@ -863,7 +870,7 @@ async fn run_under_store_lock(
     // is single-sourced and matches `lpm doctor`'s view.
     let (sandbox_options, resolved_sandbox_mode) =
         crate::sandbox_config::resolve_sandbox_mode_from_chain(
-            project_dir,
+            policy_project_dir,
             no_sandbox,
             strict_sandbox,
             json_output,
@@ -1507,6 +1514,7 @@ async fn run_under_store_lock(
                 &home_dir,
                 &script_tmpdir,
                 json_output,
+                policy_project_dir,
             ) {
                 Ok(()) => {
                     if !json_output {

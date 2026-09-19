@@ -267,6 +267,7 @@ pub(super) struct OnlineLifecyclePrepareInput<'a> {
     pub(super) client: &'a lpm_registry::RegistryClient,
     pub(super) route_table: &'a RouteTable,
     pub(super) project_dir: &'a Path,
+    pub(super) policy_project_dir: &'a Path,
     pub(super) packages: &'a [InstallPackage],
     pub(super) materialized: &'a [lpm_linker::MaterializedPackage],
     pub(super) package: &'a lpm_workspace::PackageJson,
@@ -302,6 +303,7 @@ pub(super) async fn run_online_lifecycle_prepare_phase(
         client,
         route_table,
         project_dir,
+        policy_project_dir,
         packages,
         materialized,
         package,
@@ -316,7 +318,8 @@ pub(super) async fn run_online_lifecycle_prepare_phase(
         lpm_root,
     } = input;
 
-    let policy = lpm_security::SecurityPolicy::from_package_json(&project_dir.join("package.json"));
+    let policy =
+        lpm_security::SecurityPolicy::from_package_json(&policy_project_dir.join("package.json"));
     let installed_with_integrity: Vec<(String, String, Option<String>)> = packages
         .iter()
         .map(|p| (p.name.clone(), p.version.clone(), p.integrity.clone()))
@@ -356,15 +359,15 @@ pub(super) async fn run_online_lifecycle_prepare_phase(
     };
 
     let requested_capabilities =
-        crate::capability::CapabilitySet::from_project(&project_dir.join("package.json"))
+        crate::capability::CapabilitySet::from_project(&policy_project_dir.join("package.json"))
             .map_err(|e| LpmError::Registry(format!("{e}")))?;
     let user_bound = crate::security_approval::authorized_capability_user_bound();
 
     let script_policy_cfg =
-        crate::script_policy_config::ScriptPolicyConfig::try_from_package_json(project_dir)?;
+        crate::script_policy_config::ScriptPolicyConfig::try_from_package_json(policy_project_dir)?;
     let config_auto_build = script_policy_cfg.auto_build;
     let effective_policy = crate::script_policy_config::resolve_script_policy_with_security(
-        project_dir,
+        policy_project_dir,
         script_policy_override,
         &script_policy_cfg,
         json_output,
@@ -392,17 +395,19 @@ pub(super) async fn run_online_lifecycle_prepare_phase(
     let force_security_floor = global_config
         .get_bool("force-security-floor")
         .unwrap_or(false);
-    let all_trusted_for_auto_build = crate::commands::rebuild::all_scripted_packages_trusted(
-        lpm_root,
-        &installed_with_integrity,
-        &policy,
-        project_dir,
-        effective_policy,
-        force_security_floor,
-        &requested_capabilities,
-        &user_bound,
-        advisor_session.as_ref().map(|s| s.approvals()),
-    );
+    let all_trusted_for_auto_build =
+        crate::commands::rebuild::all_scripted_packages_trusted_in_context(
+            lpm_root,
+            &installed_with_integrity,
+            &policy,
+            project_dir,
+            policy_project_dir,
+            effective_policy,
+            force_security_floor,
+            &requested_capabilities,
+            &user_bound,
+            advisor_session.as_ref().map(|s| s.approvals()),
+        );
     let auto_build_attempted = should_auto_build(
         auto_build,
         config_auto_build,
@@ -461,6 +466,7 @@ pub(super) async fn run_online_lifecycle_prepare_phase(
 
 pub(super) struct OnlineAutoBuildPhaseInput<'a> {
     pub(super) project_dir: &'a Path,
+    pub(super) policy_project_dir: &'a Path,
     pub(super) packages: &'a [InstallPackage],
     pub(super) link_targets: &'a [LinkTarget],
     pub(super) package_name: Option<&'a str>,
@@ -494,6 +500,7 @@ pub(super) async fn run_online_auto_build_phase(
 ) -> Result<OnlineAutoBuildPhaseResult, LpmError> {
     let OnlineAutoBuildPhaseInput {
         project_dir,
+        policy_project_dir,
         packages,
         link_targets,
         package_name,
@@ -519,7 +526,7 @@ pub(super) async fn run_online_auto_build_phase(
 
     if auto_build_attempted {
         maybe_emit_pre_autobuild_version_diff_cards(
-            project_dir,
+            policy_project_dir,
             store,
             auto_build_attempted,
             effective_policy,
@@ -545,6 +552,7 @@ pub(super) async fn run_online_auto_build_phase(
             effective_policy,
             advisor_session.map(|s| s.approvals()),
             false,
+            Some(policy_project_dir),
         )
         .await
         {

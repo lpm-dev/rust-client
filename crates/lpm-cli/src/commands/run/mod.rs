@@ -1,4 +1,6 @@
 mod cache;
+mod dlx;
+mod dlx_policy;
 mod format;
 mod parallel;
 mod runtime;
@@ -15,9 +17,10 @@ use std::sync::Arc;
 
 use crate::install_ui;
 
+pub use dlx::{DlxOptions, dlx, managed_dlx};
 pub(crate) use runtime::validate_runtime_with_cache;
 pub use runtime::{ensure_detected_runtimes, ensure_runtime, prepare_runtime};
-pub use single::{DlxOptions, dlx, exec, managed_dlx, run, run_file, run_file_watch, run_watch};
+pub use single::{exec, run, run_file, run_file_watch, run_watch};
 pub use workspace::run_workspace;
 
 use parallel::run_tasks_parallel;

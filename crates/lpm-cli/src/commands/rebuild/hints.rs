@@ -319,6 +319,56 @@ pub fn all_scripted_packages_trusted(
         &std::collections::HashSet<crate::triage_advisor_session::AdvisorApprovalKey>,
     >,
 ) -> bool {
+    all_scripted_packages_trusted_in_context(
+        lpm_root,
+        packages,
+        policy,
+        project_dir,
+        project_dir,
+        effective_policy,
+        force_security_floor,
+        requested_capabilities,
+        user_bound,
+        advisor_approvals,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn all_scripted_packages_trusted_in_context(
+    // see
+    // `scriptable_package_rows` for why this is `&LpmRoot` not
+    // `&PackageStore`. Without the v2-aware lookup, the predicate
+    // returned `false` for every v2 install with unbuilt-but-trusted
+    // scripts (silent skip of v2 packages), suppressing the
+    // auto-build path entirely.
+    lpm_root: &lpm_common::LpmRoot,
+    packages: &[(String, String, Option<String>)], // (name, version, integrity)
+    policy: &SecurityPolicy,
+    project_dir: &Path,
+    policy_project_dir: &Path,
+    effective_policy: ScriptPolicy,
+    // Threaded through to
+    // [`evaluate_trust`]. When `true`, every approval is suspended —
+    // so if even one package has scripts, this function returns
+    // `false`, correctly declining the auto-build path under the
+    // kill-switch.
+    force_security_floor: bool,
+    // Threaded through to
+    // [`evaluate_trust`]'s capability gate. Auto-build declines
+    // cleanly when the project's `lpm.scripts.*` widens beyond
+    // the user bound and no matching approval exists.
+    requested_capabilities: &crate::capability::CapabilitySet,
+    user_bound: &crate::capability::UserBound,
+    // Threaded through to [`evaluate_trust`]
+    // so an install's autoBuild predicate sees the same ephemeral
+    // advisor approvals the script-execution path will see. Without
+    // this, a `Some(approvals)` install would still report "not all
+    // scripts trusted" and decline autoBuild entirely — defeating
+    // the whole point of advisor-enhanced triage.
+    advisor_approvals: Option<
+        &std::collections::HashSet<crate::triage_advisor_session::AdvisorApprovalKey>,
+    >,
+) -> bool {
     // Build the
     // virtual-store link-entry index ONCE before the per-package loop, scoped to
     // this project's tree. Same rationale as `scriptable_package_rows`
@@ -370,7 +420,7 @@ pub fn all_scripted_packages_trusted(
             integrity.as_deref(),
             &scripts,
             policy,
-            project_dir,
+            policy_project_dir,
             effective_policy,
             force_security_floor,
             requested_capabilities,

@@ -164,18 +164,23 @@ fn run_clean(
             let mut cleaned: Vec<CleanedEntry> = Vec::new();
             let mut skipped: Vec<SkippedEntry> = Vec::new();
             for (name, dir) in &targets {
-                let mcp_lock = if *name == "mcp" {
+                let runtime_lock = if matches!(*name, "mcp" | "dlx") {
+                    let lock_name = if *name == "mcp" {
+                        ".mcp.lock"
+                    } else {
+                        ".dlx.lock"
+                    };
                     match try_acquire_capability_exclusive_lock(
                         &open_roots.cache,
                         &root.cache_root(),
-                        OsStr::new(".mcp.lock"),
+                        OsStr::new(lock_name),
                     )? {
                         Some(lock) => Some(lock),
-                        None if matches!(category, Some(CacheCategory::Mcp)) => {
-                            return Err(LpmError::Registry(
-                                "MCP cache is in use; stop active MCP server sessions and retry"
-                                    .into(),
-                            ));
+                        None if category.is_some() => {
+                            return Err(LpmError::Registry(format!(
+                                "{} cache is in use; stop active sessions and retry",
+                                name.to_ascii_uppercase()
+                            )));
                         }
                         None => {
                             skipped.push(SkippedEntry {
@@ -194,7 +199,7 @@ fn run_clean(
                 else {
                     continue;
                 };
-                drop(mcp_lock);
+                drop(runtime_lock);
                 cleaned.push(CleanedEntry {
                     category: name,
                     path: dir.clone(),

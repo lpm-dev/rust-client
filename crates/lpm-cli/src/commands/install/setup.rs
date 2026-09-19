@@ -2,6 +2,7 @@ use super::*;
 
 pub(super) struct InstallSetupInput<'a> {
     pub(super) project_dir: &'a Path,
+    pub(super) policy_project_dir: &'a Path,
     pub(super) json_output: bool,
     pub(super) frozen_lockfile: FrozenLockfileMode,
     pub(super) allow_new: bool,
@@ -91,24 +92,25 @@ pub(super) fn prepare_install_setup_context(
         .map_err(|e| LpmError::Registry(format!("failed to read package.json: {e}")))?;
 
     crate::security_approval::ensure_project_policy_authorized(
-        input.project_dir,
+        input.policy_project_dir,
         input.json_output,
         crate::security_approval::ApprovalSource::ProjectConfig,
     )?;
     let npm_firewall_mode = crate::npm_firewall_config::resolve_runtime_mode(
         &global_config,
-        input.project_dir,
+        input.policy_project_dir,
         input.json_output,
     )?;
-    crate::typosquat_guard::guard_manifest_direct_dependencies(
+    crate::typosquat_guard::guard_manifest_direct_dependencies_in_context(
         input.project_dir,
+        input.policy_project_dir,
         &pkg_json_path,
         &pkg,
         input.json_output,
     )?;
 
     let release_age_config = crate::release_age_config::ReleaseAgeResolver::resolve_config(
-        input.project_dir,
+        input.policy_project_dir,
         input.min_release_age_override,
         input.min_release_age_exclude,
         input.json_output,
@@ -117,7 +119,7 @@ pub(super) fn prepare_install_setup_context(
     if input.allow_new && effective_min_age_secs > 0 {
         crate::security_approval::approve_project_runtime_override(
             crate::security_approval::ApprovalScope::CooldownBypass,
-            input.project_dir,
+            input.policy_project_dir,
             input.json_output,
             crate::security_approval::ApprovalSource::CliFlag,
             "This install bypasses the minimum release age for this project.",

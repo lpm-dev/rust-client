@@ -243,6 +243,50 @@ pub(crate) fn prepare_dependency_policy(
     Ok(policy)
 }
 
+pub(crate) fn prepare_dependency_policy_in_context(
+    install_dir: &Path,
+    policy_dir: &Path,
+    cli_no_engine_strict: bool,
+    json_output: bool,
+) -> Result<DependencyEnginePolicy, LpmError> {
+    if install_dir == policy_dir {
+        return prepare_dependency_policy(install_dir, cli_no_engine_strict, json_output);
+    }
+    let root_pkg = resolve_root_package(policy_dir)?
+        .map(|(_, package)| package)
+        .unwrap_or_default();
+    let engine_strict = engine_strict_config::resolve_for_root(cli_no_engine_strict, &root_pkg);
+    let script_path = lpm_runner::bin_path::build_path_with_bins(install_dir)?;
+    Ok(DependencyEnginePolicy::new(
+        install_dir.to_path_buf(),
+        script_path.into(),
+        engine_strict,
+        json_output,
+    ))
+}
+
+pub(crate) fn dependency_policy_for_command(
+    cwd: &Path,
+    policy_dir: &Path,
+    command: &std::process::Command,
+    json_output: bool,
+) -> Result<DependencyEnginePolicy, LpmError> {
+    let root_pkg = resolve_root_package(policy_dir)?
+        .map(|(_, package)| package)
+        .unwrap_or_default();
+    let engine_strict = engine_strict_config::resolve_for_root(false, &root_pkg);
+    let path = command
+        .get_envs()
+        .find_map(|(key, value)| (key == "PATH").then_some(value).flatten())
+        .ok_or_else(|| LpmError::Script("tool command has no execution PATH".into()))?;
+    Ok(DependencyEnginePolicy::new(
+        cwd.to_path_buf(),
+        path.to_os_string(),
+        engine_strict,
+        json_output,
+    ))
+}
+
 /// Run the engine gate for `start_dir`.
 ///
 /// Walks up to the workspace root (or uses `start_dir` for a single-

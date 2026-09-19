@@ -82,8 +82,25 @@ pub(crate) fn guard_explicit_package_specs(
     )
 }
 
+#[cfg(test)]
 pub(crate) fn guard_manifest_direct_dependencies(
     project_dir: &Path,
+    manifest_path: &Path,
+    pkg: &lpm_workspace::PackageJson,
+    json_output: bool,
+) -> Result<(), LpmError> {
+    guard_manifest_direct_dependencies_in_context(
+        project_dir,
+        project_dir,
+        manifest_path,
+        pkg,
+        json_output,
+    )
+}
+
+pub(crate) fn guard_manifest_direct_dependencies_in_context(
+    project_dir: &Path,
+    policy_project_dir: &Path,
     manifest_path: &Path,
     pkg: &lpm_workspace::PackageJson,
     json_output: bool,
@@ -101,12 +118,12 @@ pub(crate) fn guard_manifest_direct_dependencies(
         }
     }
 
-    if typosquat_guard_disabled(project_dir, json_output)? {
+    if typosquat_guard_disabled(policy_project_dir, json_output)? {
         return Ok(());
     }
 
     let mut findings = Vec::new();
-    let policy = TyposquatPolicy::load(project_dir)?;
+    let policy = TyposquatPolicy::load(policy_project_dir)?;
     let locked_direct = locked_direct_names(project_dir);
     for name in &direct_names {
         if locked_direct.contains(name.as_ref()) {
@@ -130,11 +147,11 @@ pub(crate) fn guard_manifest_direct_dependencies(
     }
 
     if can_prompt(json_output, false) {
-        prompt_allow_manifest_findings(project_dir, &findings)?;
+        prompt_allow_manifest_findings(policy_project_dir, &findings)?;
         return Ok(());
     }
 
-    Err(error_context(project_dir, findings, None, false))
+    Err(error_context(policy_project_dir, findings, None, false))
 }
 
 fn registry_name_for_typosquat_analysis<'a>(local_name: &'a str, spec: &str) -> Cow<'a, str> {

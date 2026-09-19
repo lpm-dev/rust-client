@@ -1599,7 +1599,7 @@ pub async fn run_add_packages(
                 &[],
                 true,
                 false,
-                Some(route_table),
+                Some(route_table.into()),
                 lpm_common::LpmRoot::from_env()?,
             )
             .await?;
@@ -2175,7 +2175,7 @@ pub async fn run_install_filtered_add(
                     &[],
                     true,
                     false,
-                    Some(route_table.clone()),
+                    Some(route_table.clone().into()),
                     lpm_root.clone(),
                 );
                 let result = if let Some(capture) = capture.as_ref() {

@@ -86,9 +86,7 @@ use gitignore::*;
 use lifecycle::*;
 use linking::*;
 use lockfile::*;
-pub(crate) use lockfile::{
-    requested_range_for_locked_lookup, select_locked_package_for_requested_spec,
-};
+pub(crate) use lockfile::{requested_range_for_locked_lookup, select_locked_root_package};
 #[cfg(test)]
 pub(crate) use manifest::finalize_packages_in_manifest;
 use manifest::*;
@@ -380,6 +378,29 @@ pub(crate) async fn run_silent_for_audit_fix(
     .await
 }
 
+pub(crate) struct ExpectedInstallRoot {
+    pub(crate) name: String,
+    pub(crate) version: String,
+    pub(crate) source: Option<String>,
+    pub(crate) integrity: Option<String>,
+}
+
+pub(crate) struct InstallCallerContext<'a> {
+    pub(crate) route_table: RouteTable,
+    pub(crate) policy_project_dir: Option<&'a Path>,
+    pub(crate) expected_root: Option<ExpectedInstallRoot>,
+}
+
+impl From<RouteTable> for InstallCallerContext<'_> {
+    fn from(route_table: RouteTable) -> Self {
+        Self {
+            route_table,
+            policy_project_dir: None,
+            expected_root: None,
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_with_options_with_lpm_root(
     client: &RegistryClient,
@@ -418,19 +439,28 @@ pub(crate) async fn run_with_options_with_lpm_root(
     // Install diagnostics remain on stderr, but every stdout-only report
     // and lifecycle hint is suppressed until the child takes over.
     reserve_stdout: bool,
-    preloaded_route_table: Option<RouteTable>,
+    caller_context: Option<InstallCallerContext<'_>>,
     lpm_root: lpm_common::LpmRoot,
 ) -> Result<(), LpmError> {
+    let policy_project_dir = caller_context
+        .as_ref()
+        .and_then(|context| context.policy_project_dir)
+        .unwrap_or(project_dir);
+    let (preloaded_route_table, expected_root) = caller_context
+        .map(|context| (Some(context.route_table), context.expected_root))
+        .unwrap_or_default();
     let transaction_root = lpm_workspace::find_workspace_root(project_dir)
         .map_err(|error| LpmError::Workspace(error.to_string()))?
         .unwrap_or_else(|| project_dir.to_path_buf());
     crate::release_plan::ensure_no_pending_release_transaction(&transaction_root)?;
     validation::validate_project_layout(project_dir)?;
-    let dependency_engine_policy = Arc::new(crate::engine_check::prepare_dependency_policy(
-        project_dir,
-        cli_no_engine_strict,
-        json_output,
-    )?);
+    let dependency_engine_policy =
+        Arc::new(crate::engine_check::prepare_dependency_policy_in_context(
+            project_dir,
+            policy_project_dir,
+            cli_no_engine_strict,
+            json_output,
+        )?);
     // Round 2: hold a shared lock on the store for the
     // entire install pipeline. Multiple concurrent installs share it
     // freely; `lpm cache prune --apply` and `lpm store clean` (which take it
@@ -447,6 +477,8 @@ pub(crate) async fn run_with_options_with_lpm_root(
         assert_send_install_future(run_with_options_under_store_lock(
             client,
             project_dir,
+            policy_project_dir,
+            expected_root.as_ref(),
             json_output,
             offline,
             frozen_lockfile,
@@ -503,6 +535,8 @@ where
 async fn run_with_options_under_store_lock(
     client: &RegistryClient,
     project_dir: &Path,
+    policy_project_dir: &Path,
+    expected_root: Option<&ExpectedInstallRoot>,
     json_output: bool,
     offline: bool,
     frozen_lockfile: FrozenLockfileMode,
@@ -583,6 +617,7 @@ async fn run_with_options_under_store_lock(
         production_dependency_names,
     } = prepare_install_setup_context(InstallSetupInput {
         project_dir,
+        policy_project_dir,
         json_output,
         frozen_lockfile,
         allow_new,
@@ -592,10 +627,22 @@ async fn run_with_options_under_store_lock(
         min_release_age_exclude,
         timing,
     })?;
+    let caller_policy_package = if policy_project_dir != project_dir
+        && policy_project_dir.join("package.json").is_file()
+    {
+        Some(
+            lpm_workspace::read_package_json(&policy_project_dir.join("package.json")).map_err(
+                |error| LpmError::Registry(format!("failed to read caller policy: {error}")),
+            )?,
+        )
+    } else {
+        None
+    };
+    let policy_package = caller_policy_package.as_ref().unwrap_or(&pkg);
     let security_analysis_policy =
         if crate::source_analysis_config::resolve_install_time_source_analysis(
             &global_config,
-            project_dir,
+            policy_project_dir,
             json_output,
         )? {
             lpm_store::SecurityAnalysisPolicy::Enabled
@@ -686,11 +733,12 @@ async fn run_with_options_under_store_lock(
     // schema for this surface yet — callers will learn the additions
     // via `lpm trust diff` once that lands in chunk C).
     if !json_output {
-        let current_snapshot =
-            crate::trust_snapshot::TrustSnapshot::capture_current(pkg.lpm.as_ref().map_or(
+        let current_snapshot = crate::trust_snapshot::TrustSnapshot::capture_current(
+            policy_package.lpm.as_ref().map_or(
                 &lpm_workspace::TrustedDependencies::Legacy(Vec::new()),
                 |l| &l.trusted_dependencies,
-            ));
+            ),
+        );
         let previous_snapshot = crate::trust_snapshot::read_snapshot(project_dir);
         let additions = current_snapshot.diff_additions(previous_snapshot.as_ref());
         if let Some(notice) = crate::trust_snapshot::format_new_bindings_notice(&additions) {
@@ -1066,7 +1114,8 @@ async fn run_with_options_under_store_lock(
     let project_needs_virtual_store_migration =
         store_v2_handle.is_some() && needs_virtual_store_migration(project_dir);
 
-    let experimental_resolver_requested = experimental_resolver::enabled();
+    let experimental_resolver_requested =
+        experimental_resolver::enabled() && policy_project_dir == project_dir;
     let experimental_resolver_script_policy_is_default = if experimental_resolver_requested {
         let script_policy_cfg =
             crate::script_policy_config::ScriptPolicyConfig::try_from_package_json(project_dir)?;
@@ -1082,7 +1131,8 @@ async fn run_with_options_under_store_lock(
         true
     };
 
-    if !workspace_resolution::active()
+    if experimental_resolver_requested
+        && !workspace_resolution::active()
         && !root_versions::active(project_dir)
         && experimental_resolver::should_run(
             experimental_resolver::ExperimentalResolverAdmission {
@@ -1318,11 +1368,30 @@ async fn run_with_options_under_store_lock(
         current_importer_snapshot.workspace_root_peer_providers_fingerprint = Some(fingerprint);
     }
 
+    if let Some(expected) = expected_root {
+        let matches = packages.iter().any(|package| {
+            package.is_direct
+                && package.name == expected.name
+                && package.version == expected.version
+                && expected.source.as_deref() == Some(package.source.as_str())
+                && expected
+                    .integrity
+                    .as_ref()
+                    .is_none_or(|integrity| package.integrity.as_ref() == Some(integrity))
+        });
+        if !matches {
+            return Err(LpmError::Script(format!(
+                "dlx installation of '{}' differs from the project lockfile version, source, or integrity",
+                expected.name
+            )));
+        }
+    }
+
     let registry_warnings = verify_lpm_install_access(&arc_client, &packages, json_output).await?;
 
     let policy_extension_stats = run_policy_extensions(
         &policy_extension_configs,
-        project_dir,
+        policy_project_dir,
         &packages,
         json_output,
     )
@@ -1423,6 +1492,7 @@ async fn run_with_options_under_store_lock(
         arc_client: arc_client.clone(),
         route_table: route_table.clone(),
         project_dir,
+        policy_project_dir,
         packages,
         packages_for_lockfile,
         store: store.clone(),
@@ -1591,9 +1661,10 @@ async fn run_with_options_under_store_lock(
         client: arc_client.as_ref(),
         route_table: &route_table,
         project_dir,
+        policy_project_dir,
         packages: &packages,
         materialized: &link_result.materialized,
-        package: &pkg,
+        package: policy_package,
         store: &store,
         baseline_index,
         used_lockfile,
@@ -1806,6 +1877,7 @@ async fn run_with_options_under_store_lock(
         bin_linked,
     } = run_online_auto_build_phase(OnlineAutoBuildPhaseInput {
         project_dir,
+        policy_project_dir,
         packages: &packages,
         link_targets: &link_targets,
         package_name: pkg.name.as_deref(),
@@ -1996,7 +2068,7 @@ async fn run_with_options_under_store_lock(
         });
     }
 
-    if !reserve_stdout {
+    if !reserve_stdout && policy_project_dir == project_dir {
         maybe_emit_post_install_lifecycle_hint(
             lpm_root,
             &packages,

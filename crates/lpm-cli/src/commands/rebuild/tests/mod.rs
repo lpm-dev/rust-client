@@ -1627,7 +1627,7 @@ fn auto_build_call_site_threads_effective_policy() {
         env!("CARGO_MANIFEST_DIR"),
         "/src/commands/install/lifecycle.rs"
     ));
-    const TRUST_CALL: &str = "crate::commands::rebuild::all_scripted_packages_trusted(";
+    const TRUST_CALL: &str = "crate::commands::rebuild::all_scripted_packages_trusted_in_context(";
     const REBUILD_CALL: &str = "crate::commands::rebuild::run_with_report(";
     const POLICY_ARG: &str = "effective_policy";
 
