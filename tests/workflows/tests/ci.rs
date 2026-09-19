@@ -56,9 +56,9 @@ fn ci_env_github_actions_masks_secret_values_and_emits_github_env_commands() {
     assert_eq!(
         stdout.trim(),
         concat!(
-            "::add-mask::supersecret\n",
-            "echo 'API_KEY=supersecret' >> \"$GITHUB_ENV\"\n",
-            "echo 'PUBLIC_URL=https://example.test' >> \"$GITHUB_ENV\"",
+            "printf '%s\\n' ::add-mask::supersecret\n",
+            "printf '%s\\n' 'API_KEY=supersecret' >> \"$GITHUB_ENV\"\n",
+            "printf '%s\\n' 'PUBLIC_URL=https://example.test' >> \"$GITHUB_ENV\"",
         ),
         "GitHub Actions output must mask secrets before writing deterministic env commands"
     );
