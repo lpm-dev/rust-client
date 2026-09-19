@@ -1756,6 +1756,59 @@ pub async fn store_refresh_backed_session(
     .await
 }
 
+/// Store a rotated access token only while the submitted credential is still current.
+/// Preserve the refresh credential and MFA preferences, and report metadata failures.
+pub async fn store_rotated_access_token_if_current(
+    registry: &str,
+    submitted_bearer: &str,
+    replacement: &str,
+    expires_at: Option<&str>,
+) -> Result<AuthStorageStatus, lpm_common::LpmError> {
+    let parsed_expiry = expires_at
+        .map(chrono::DateTime::parse_from_rfc3339)
+        .transpose()
+        .map_err(|_| lpm_common::LpmError::Registry("invalid token rotation expiry".into()))?;
+    if replacement.trim().is_empty() {
+        return Err(lpm_common::LpmError::Registry(
+            "invalid token rotation credential or expiry".into(),
+        ));
+    }
+    let lock_path = session_lock_path(registry).map_err(lpm_common::LpmError::CredentialStorage)?;
+    lpm_common::paths::with_exclusive_lock_async(lock_path, async {
+        with_credential_store_lock(|| {
+            let current = get_stored_credential_with_backend_unlocked(registry, CredentialKind::Access, || {})?;
+            if current.is_none_or(|credential| credential.token != submitted_bearer) {
+                return Err("local credentials changed during rotation; the newer login or logout was preserved".into());
+            }
+            let refresh = get_stored_credential_with_backend_unlocked(registry, CredentialKind::Refresh, || {})?;
+            if refresh.is_some() && expires_at.is_none() {
+                return Err("a refresh-backed session requires an access-token expiry".into());
+            }
+            read_token_expiries_checked()?;
+            let access_backend = set_credential_with_keychain_writer_unlocked(
+                registry, CredentialKind::Access, replacement,
+                || set_token_in_keychain(registry, replacement),
+            )?;
+            mutate_token_expiries(|expiries| {
+                let entry = expiries.entry(registry.to_owned()).or_default();
+                entry.reminded_7d = false;
+                entry.reminded_1d = false;
+                if refresh.is_some() {
+                    entry.expires.clear();
+                    entry.session_access_expires_at = expires_at.map(str::to_owned);
+                } else {
+                    entry.expires = parsed_expiry.map(|expiry| expiry.date_naive().to_string()).unwrap_or_default();
+                    entry.session_access_expires_at = None;
+                }
+                true
+            })?;
+            Ok(AuthStorageStatus::from_backends(Some(access_backend), refresh.map(|credential| credential.backend)))
+        }).map_err(|error| lpm_common::LpmError::CredentialStorage(format!(
+            "the Registry rotated the token, but local persistence did not complete: {error}. Run `lpm whoami` to check the current session; sign in again if needed"
+        )))
+    }).await
+}
+
 /// Store a refresh token for a registry (keychain first, encrypted file fallback).
 pub fn set_refresh_token(registry: &str, token: &str) -> Result<(), String> {
     set_refresh_token_with_backend(registry, token).map(|_| ())

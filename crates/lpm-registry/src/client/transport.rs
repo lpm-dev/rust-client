@@ -56,11 +56,27 @@ impl RegistryClient {
         command: &'static str,
         operation: &'static str,
     ) -> Result<serde_json::Value, LpmError> {
+        self.post_json_with_otp_recovery_and_bearer(url, body, otp, command, operation)
+            .await
+            .map(|(response, _)| response)
+    }
+
+    /// Return the bearer from the successful attempt, including any automatic refresh.
+    pub async fn post_json_with_otp_recovery_and_bearer(
+        &self,
+        url: &str,
+        body: &serde_json::Value,
+        otp: Option<&str>,
+        command: &'static str,
+        operation: &'static str,
+    ) -> Result<(serde_json::Value, SecretString), LpmError> {
         self.execute_with_recovery(AuthPosture::AuthRequired, || async {
             let mut request = self.http.for_url(url).await?.post(url).json(body);
-            if let Some(bearer) = self.current_bearer(AuthPosture::AuthRequired)? {
-                request = request.bearer_auth(bearer);
-            }
+            let bearer = SecretString::from(
+                self.current_bearer(AuthPosture::AuthRequired)?
+                    .ok_or(LpmError::AuthRequired)?,
+            );
+            request = request.bearer_auth(bearer.expose_secret());
             if let Some(otp) = otp {
                 request = request.header("x-otp", otp);
             }
@@ -89,7 +105,7 @@ impl RegistryClient {
                     .unwrap_or("unknown error");
                 return Err(LpmError::Registry(format!("{operation} failed: {error}")));
             }
-            Ok(parsed)
+            Ok((parsed, bearer))
         })
         .await
     }

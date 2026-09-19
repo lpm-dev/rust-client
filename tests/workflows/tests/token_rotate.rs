@@ -322,6 +322,10 @@ async fn token_rotate_refreshes_rejected_stored_session_and_retries_once() {
         credentials[format!("refresh:{registry_url}")],
         "rotated-refresh-token"
     );
+    assert_eq!(
+        read_expiry_metadata(project.home())[registry_url.as_str()]["session_access_expires_at"],
+        "2032-01-03T04:05:06Z"
+    );
 }
 
 #[tokio::test]
@@ -843,4 +847,225 @@ async fn token_rotate_rejects_ci_token_before_network_or_storage_changes() {
     assert!(!stderr.contains("ci-exchanged-token"));
     assert!(!stderr.contains("oidc-context-token"));
     assert!(!stderr.contains("replacement-must-not-be-stored"));
+}
+
+#[tokio::test]
+async fn token_rotate_accepts_explicit_null_expiry_for_a_legacy_token() {
+    let project = TempProject::empty(r#"{"name":"rotation-legacy"}"#);
+    let mock = MockRegistry::start().await;
+    let registry = mock.url();
+    seed_stored_fallback(&project, &registry);
+    std::fs::write(token_expiry_path(project.home()), serde_json::to_vec(&serde_json::json!({
+        registry.clone(): {"expires":"2032-01-01","reminded_7d":true,"reminded_1d":true,"otp_required":true}
+    })).unwrap()).unwrap();
+    Mock::given(method("POST"))
+        .and(path("/api/registry/-/token/rotate"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(serde_json::json!({"token":"new-legacy-token","expiresAt":null})),
+        )
+        .expect(1)
+        .mount(mock.server())
+        .await;
+    let output = lpm_with_registry(&project, &registry)
+        .args(["token-rotate", "--json"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(result["expires_at"].is_null());
+    assert_eq!(
+        read_credentials(project.home())[&registry],
+        "new-legacy-token"
+    );
+    let expiry = read_expiry_metadata(project.home());
+    assert_eq!(expiry[&registry]["expires"], "");
+    assert_eq!(expiry[&registry]["otp_required"], true);
+    assert!(expiry[&registry]["session_access_expires_at"].is_null());
+}
+
+#[tokio::test]
+async fn token_rotate_preserves_precise_expiry_without_triggering_another_refresh() {
+    let project = TempProject::empty(r#"{"name":"rotation-session"}"#);
+    let mock = MockRegistry::start().await;
+    let registry = mock.url();
+    let expiry = "2032-01-03T04:05:06.123Z";
+    seed_sessions(
+        project.home(),
+        &[SessionSeed {
+            registry_url: &registry,
+            access_token: Some("old-access"),
+            refresh_token: Some("kept-refresh"),
+            session_access_expires_at: Some(expiry),
+        }],
+    );
+    mock.with_token_rotate("old-access", "new-access", expiry)
+        .await;
+    mock.with_authenticated_whoami("new-access", "tester", "test@example.com")
+        .await;
+    let output = lpm_with_registry(&project, &registry)
+        .args(["token-rotate", "--json"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    assert_eq!(
+        read_expiry_metadata(project.home())[&registry]["session_access_expires_at"],
+        expiry
+    );
+    assert_eq!(
+        read_credentials(project.home())[format!("refresh:{registry}")],
+        "kept-refresh"
+    );
+    let whoami = lpm_with_registry(&project, &registry)
+        .args(["whoami", "--json"])
+        .output()
+        .unwrap();
+    assert!(
+        whoami.status.success(),
+        "{}",
+        String::from_utf8_lossy(&whoami.stdout)
+    );
+    assert!(
+        !mock
+            .server()
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .any(|request| request.url.path().ends_with("/refresh"))
+    );
+}
+
+#[tokio::test]
+async fn token_rotate_success_preserves_a_concurrent_login_or_logout() {
+    for logout in [false, true] {
+        let project = TempProject::empty(r#"{"name":"rotation-race"}"#);
+        let mock = MockRegistry::start().await;
+        let registry = mock.url();
+        seed_stored_fallback(&project, &registry);
+        let auth_home = project.home().to_path_buf();
+        let auth_registry = registry.clone();
+        Mock::given(method("POST")).and(path("/api/registry/-/token/rotate"))
+            .respond_with(move |_: &Request| {
+                if logout {
+                    support::auth_state::write_credentials_store(&auth_home, &serde_json::json!({}));
+                } else {
+                    seed_sessions(&auth_home, &[SessionSeed {
+                        registry_url: &auth_registry, access_token: Some("peer-access"), refresh_token: Some("peer-refresh"),
+                        session_access_expires_at: Some("2033-01-03T04:05:06Z"),
+                    }]);
+                }
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({"token":"stale-replacement","expiresAt":"2032-01-03T04:05:06Z"}))
+            }).expect(1).mount(mock.server()).await;
+        let output = lpm_with_registry(&project, &registry)
+            .args(["token-rotate", "--json"])
+            .output()
+            .unwrap();
+        assert!(
+            !output.status.success(),
+            "concurrent state must be preserved"
+        );
+        let credentials = read_credentials(project.home());
+        if logout {
+            assert!(credentials[&registry].is_null());
+        } else {
+            assert_eq!(credentials[&registry], "peer-access");
+            assert_eq!(credentials[format!("refresh:{registry}")], "peer-refresh");
+            assert_eq!(
+                read_expiry_metadata(project.home())[&registry]["session_access_expires_at"],
+                "2033-01-03T04:05:06Z"
+            );
+        }
+        assert!(!String::from_utf8_lossy(&output.stdout).contains("stale-replacement"));
+    }
+}
+
+#[tokio::test]
+async fn token_rotate_reports_metadata_failure_after_a_successful_remote_rotation() {
+    let project = TempProject::empty(r#"{"name":"rotation-storage"}"#);
+    let mock = MockRegistry::start().await;
+    let registry = mock.url();
+    seed_stored_fallback(&project, &registry);
+    let expiry_path = token_expiry_path(project.home());
+    Mock::given(method("POST"))
+        .and(path("/api/registry/-/token/rotate"))
+        .respond_with(move |_: &Request| {
+            std::fs::create_dir(&expiry_path).unwrap();
+            ResponseTemplate::new(200).set_body_json(
+                serde_json::json!({"token":"new-access","expiresAt":"2032-01-03T04:05:06Z"}),
+            )
+        })
+        .expect(1)
+        .mount(mock.server())
+        .await;
+    let output = lpm_with_registry(&project, &registry)
+        .args(["token-rotate", "--json"])
+        .output()
+        .unwrap();
+    assert!(
+        !output.status.success(),
+        "metadata errors must not report successful persistence"
+    );
+    let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(result["error_code"], "credential_storage");
+}
+
+#[tokio::test]
+async fn token_rotate_rejects_null_expiry_for_a_refresh_backed_session() {
+    let project = TempProject::empty(r#"{"name":"rotation-session-null"}"#);
+    let mock = MockRegistry::start().await;
+    let registry = mock.url();
+    seed_sessions(
+        project.home(),
+        &[SessionSeed {
+            registry_url: &registry,
+            access_token: Some("old-access"),
+            refresh_token: Some("kept-refresh"),
+            session_access_expires_at: Some("2032-01-03T04:05:06Z"),
+        }],
+    );
+    let before = read_credentials(project.home());
+    Mock::given(method("POST"))
+        .and(path("/api/registry/-/token/rotate"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(
+                serde_json::json!({"token":"invalid-session-access","expiresAt":null}),
+            ),
+        )
+        .expect(1)
+        .mount(mock.server())
+        .await;
+    let output = lpm_with_registry(&project, &registry)
+        .args(["token-rotate", "--json"])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert_eq!(read_credentials(project.home()), before);
+}
+
+#[tokio::test]
+async fn token_rotate_normalizes_rfc3339_legacy_expiry_reminders() {
+    let project = TempProject::empty(r#"{"name":"rotation-legacy-expiry"}"#);
+    let mock = MockRegistry::start().await;
+    let registry = mock.url();
+    seed_stored_fallback(&project, &registry);
+    mock.with_token_rotate(
+        "stored-fallback-token",
+        "replacement-token",
+        "2032-01-03t04:05:06z",
+    )
+    .await;
+    let output = lpm_with_registry(&project, &registry)
+        .args(["token-rotate", "--json"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    assert_eq!(
+        read_expiry_metadata(project.home())[&registry]["expires"],
+        "2032-01-03"
+    );
 }
