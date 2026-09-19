@@ -2164,3 +2164,680 @@ fn exec_missing_file_under_json_emits_error_envelope_on_stdout() {
         "error must reference the missing file path, got: {envelope}",
     );
 }
+
+#[test]
+fn exec_rejects_incompatible_engines_before_local_binary_file_or_watch_execution() {
+    for args in [
+        vec!["exec", "tool"],
+        vec!["entry.js"],
+        vec!["entry.js", "--watch"],
+    ] {
+        let project = TempProject::empty(
+            r#"{"name":"exec-engine","version":"1.0.0","engines":{"node":">=999"}}"#,
+        );
+        write_fake_local_bin(
+            &project,
+            "tool",
+            "#!/bin/sh\necho wrong > executed.marker\n",
+            "@echo off\r\necho wrong > executed.marker\r\n",
+        );
+        project.write_file(
+            "entry.js",
+            "require('fs').writeFileSync('executed.marker','wrong');",
+        );
+        let output = lpm(&project)
+            .timeout(std::time::Duration::from_secs(8))
+            .args(&args)
+            .output()
+            .unwrap();
+        let diagnostic = String::from_utf8_lossy(&output.stderr);
+        assert!(!output.status.success(), "{args:?}: {diagnostic}");
+        assert!(
+            !project.file_exists("executed.marker"),
+            "{args:?}: command ran despite incompatible engines"
+        );
+        assert!(
+            diagnostic.contains("999")
+                && (diagnostic.contains("engine") || diagnostic.contains("requires Node")),
+            "{diagnostic}"
+        );
+    }
+}
+
+#[test]
+fn exec_runs_compatible_engines_and_warns_for_non_strict_mismatches() {
+    for (required, strict) in [(">=1", true), (">=999", false)] {
+        for args in [vec!["exec", "tool"], vec!["entry.js"]] {
+            let project = TempProject::empty(&serde_json::json!({"name":"exec-engine","version":"1.0.0","engines":{"node":required},"lpm":{"engineStrict":strict}}).to_string());
+            write_fake_local_bin(
+                &project,
+                "tool",
+                "#!/bin/sh\necho executed > executed.marker\n",
+                "@echo off\r\necho executed > executed.marker\r\n",
+            );
+            project.write_file(
+                "entry.js",
+                "require('fs').writeFileSync('executed.marker','executed');",
+            );
+            let output = lpm(&project).args(&args).output().unwrap();
+            let diagnostic = String::from_utf8_lossy(&output.stderr);
+            assert!(
+                output.status.success() && project.file_exists("executed.marker"),
+                "{args:?}: {diagnostic}"
+            );
+            if !strict {
+                assert!(
+                    diagnostic.contains("999"),
+                    "missing engine warning: {diagnostic}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn typescript_aliases_accept_jsonc_trailing_commas() {
+    let project = TempProject::empty(r#"{"name":"jsonc-config","version":"1.0.0"}"#);
+    project.write_file(
+        "entry.ts",
+        "import { value } from '@fixture'; console.log(value);",
+    );
+    project.write_file(
+        "fixtures/value.ts",
+        "export const value: string = 'JSONC_OK';",
+    );
+    project.write_file(
+        "tsconfig.json",
+        r#"{
+        // A supported TypeScript configuration comment.
+        "compilerOptions": {
+            "baseUrl": ".",
+            "paths": {"@fixture": ["fixtures/value.ts",],},
+        },
+    }"#,
+    );
+    let output = lpm(&project).args(["entry.ts"]).output().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("JSONC_OK"));
+}
+
+#[test]
+fn typescript_aliases_preserve_comment_markers_inside_json_strings() {
+    let project = TempProject::empty(r#"{"name":"jsonc-strings","version":"1.0.0"}"#);
+    project.write_file(
+        "entry.ts",
+        "import { value } from '@fixture'; console.log(value);",
+    );
+    project.write_file(
+        "fixtures/value.ts",
+        "export const value: string = 'STRING_OK';",
+    );
+    project.write_file(
+        "tsconfig.json",
+        r#"{"compilerOptions":{"baseUrl":".","paths":{"@fixture":["fixtures//value.ts"]}}}"#,
+    );
+    let output = lpm(&project).args(["entry.ts"]).output().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("STRING_OK"));
+}
+
+#[test]
+fn typescript_alias_resolution_prefers_exact_matches_then_longest_prefix() {
+    for (paths, import) in [
+        (
+            r#"{"@x/*":["wrong/*"],"@x/value":["correct/value.ts"]}"#,
+            "@x/value",
+        ),
+        (
+            r#"{"@/*":["wrong/*"],"@/feature/*":["correct/*"]}"#,
+            "@/feature/value",
+        ),
+    ] {
+        let project = TempProject::empty(r#"{"name":"alias-order","version":"1.0.0"}"#);
+        project.write_file(
+            "entry.ts",
+            &format!("import {{ value }} from '{import}'; console.log(value);"),
+        );
+        project.write_file(
+            "correct/value.ts",
+            "export const value: string = 'SPECIFIC_OK';",
+        );
+        project.write_file(
+            "wrong/value.ts",
+            "export const value: string = 'WRONG_BROAD';",
+        );
+        project.write_file(
+            "wrong/feature/value.ts",
+            "export const value: string = 'WRONG_BROAD';",
+        );
+        project.write_file(
+            "tsconfig.json",
+            &format!(r#"{{"compilerOptions":{{"baseUrl":".","paths":{paths}}}}}"#),
+        );
+        let output = lpm(&project).args(["entry.ts"]).output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(stdout.contains("SPECIFIC_OK"), "{paths}: {stdout}");
+        assert!(!stdout.contains("WRONG_BROAD"));
+    }
+}
+
+#[cfg(unix)]
+struct ExecFixtureProcess {
+    child: std::process::Child,
+    log: PathBuf,
+    identity: String,
+    descendants: Vec<(u32, String)>,
+}
+
+#[cfg(unix)]
+impl ExecFixtureProcess {
+    fn spawn(project: &TempProject, args: &[&str]) -> Self {
+        use std::os::unix::process::CommandExt;
+        project.write_file(".lpm/exec-fixture.log", "");
+        let log = project.path().join(".lpm/exec-fixture.log");
+        let output = std::fs::File::create(&log).unwrap();
+        let mut command = lpm_spawnable(project);
+        command
+            .args(args)
+            .process_group(0)
+            .stdout(output.try_clone().unwrap())
+            .stderr(output);
+        let child = command.spawn().unwrap();
+        let identity = exec_fixture_identity(child.id()).expect("live fixture identity");
+        Self {
+            child,
+            log,
+            identity,
+            descendants: Vec::new(),
+        }
+    }
+
+    fn wait_until(&mut self, ready: impl Fn() -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !ready() {
+            assert!(
+                self.child.try_wait().unwrap().is_none() && Instant::now() < deadline,
+                "exec did not reach the expected state: {}",
+                std::fs::read_to_string(&self.log).unwrap()
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    fn exits_within(&mut self, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        while Instant::now() < deadline {
+            if self.child.try_wait().unwrap().is_some() {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        false
+    }
+
+    fn signal(&self, signal: i32) {
+        // SAFETY: the fixture owns this live child and sends no pointer arguments.
+        assert_eq!(unsafe { libc::kill(self.child.id() as i32, signal) }, 0);
+    }
+}
+
+#[cfg(unix)]
+impl Drop for ExecFixtureProcess {
+    fn drop(&mut self) {
+        if exec_fixture_identity(self.child.id()).as_deref() == Some(&self.identity) {
+            // SAFETY: the live leader still has this fixture's captured identity.
+            unsafe {
+                libc::kill(-(self.child.id() as i32), libc::SIGKILL);
+            }
+        }
+        for (pid, identity) in &self.descendants {
+            if exec_fixture_identity(*pid).as_deref() == Some(identity.as_str()) {
+                // SAFETY: this PID still belongs to a captured fixture descendant.
+                unsafe {
+                    libc::kill(*pid as i32, libc::SIGKILL);
+                }
+            }
+        }
+        let _ = self.child.wait();
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn source_watch_accepts_stop_signals_after_the_finite_child_exits() {
+    for signal in [libc::SIGINT, libc::SIGTERM] {
+        let project = TempProject::empty(r#"{"name":"idle-watch","version":"1.0.0"}"#);
+        project.write_file(
+            "entry.js",
+            "require('fs').writeFileSync('.lpm/ran.txt','yes');",
+        );
+        let mut process = ExecFixtureProcess::spawn(&project, &["entry.js", "--watch"]);
+        let log = process.log.clone();
+        process.wait_until(|| {
+            project.file_exists(".lpm/ran.txt")
+                && std::fs::read_to_string(&log)
+                    .unwrap_or_default()
+                    .contains("completed in")
+        });
+        process.signal(signal);
+        assert!(
+            process.exits_within(Duration::from_secs(3)),
+            "idle watch swallowed signal {signal}"
+        );
+    }
+}
+
+#[cfg(unix)]
+fn exec_fixture_identity(pid: u32) -> Option<String> {
+    let output = std::process::Command::new("ps")
+        .args(["-p", &pid.to_string(), "-o", "lstart=", "-o", "stat="])
+        .output()
+        .ok()?;
+    let text = String::from_utf8(output.stdout).ok()?;
+    let fields: Vec<_> = text.split_whitespace().collect();
+    (fields.len() >= 6 && !fields[5].starts_with('Z')).then(|| fields[..5].join(" "))
+}
+
+#[cfg(unix)]
+#[test]
+fn exec_stop_signals_terminate_local_binary_and_source_file_descendants() {
+    for signal in [libc::SIGINT, libc::SIGTERM] {
+        for args in [
+            vec!["entry.js"],
+            vec!["exec", "tool"],
+            vec!["entry.js", "--watch"],
+        ] {
+            let project = TempProject::empty(r#"{"name":"exec-tree","version":"1.0.0"}"#);
+            project.write_file("entry.js", "const fs=require('fs');const c=require('child_process').spawn(process.execPath,['-e',`setTimeout(()=>process.exit(0),30000);process.send('ready');`],{stdio:['ignore','ignore','ignore','ipc']});c.once('message',()=>{fs.writeFileSync('.lpm/pids.tmp',JSON.stringify([process.pid,c.pid]));fs.renameSync('.lpm/pids.tmp','.lpm/pids.json');});setTimeout(()=>process.exit(0),30000);");
+            write_fake_local_bin(&project, "tool", "#!/bin/sh\nexec node entry.js\n", "");
+            let mut process = ExecFixtureProcess::spawn(&project, &args);
+            process.wait_until(|| {
+                std::fs::read_to_string(project.path().join(".lpm/pids.json"))
+                    .ok()
+                    .and_then(|s| serde_json::from_str::<Vec<u32>>(&s).ok())
+                    .is_some_and(|pids| {
+                        pids.len() == 2 && pids[0] > 0 && pids[1] > 0 && pids[0] != pids[1]
+                    })
+            });
+            let pids: Vec<u32> =
+                serde_json::from_str(&project.read_file(".lpm/pids.json")).unwrap();
+            process.descendants = pids
+                .iter()
+                .map(|pid| (*pid, exec_fixture_identity(*pid).expect("live descendant")))
+                .collect();
+            process.signal(signal);
+            let exited = process.exits_within(Duration::from_secs(5));
+            let descendants_alive = || {
+                process
+                    .descendants
+                    .iter()
+                    .any(|(pid, identity)| exec_fixture_identity(*pid).as_ref() == Some(identity))
+            };
+            let deadline = Instant::now() + Duration::from_secs(3);
+            while descendants_alive() && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            assert!(
+                exited && !descendants_alive(),
+                "{args:?}, signal {signal}: execution left processes alive: {pids:?}"
+            );
+        }
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn source_watch_matches_normalized_literal_entrypoint_paths() {
+    for entry in [
+        "scripts/../entry.js",
+        "scripts/[entry].js",
+        "scripts/unclosed[.js",
+    ] {
+        let project = TempProject::empty(r#"{"name":"literal-watch","version":"1.0.0"}"#);
+        project.write_file("scripts/e.js", "console.log('unrelated');");
+        let source = "require('fs').appendFileSync('.lpm/cycles.txt','run\\n');";
+        project.write_file(entry, source);
+        let count = || {
+            if project.path().join(".lpm/cycles.txt").exists() {
+                project.read_file(".lpm/cycles.txt").lines().count()
+            } else {
+                0
+            }
+        };
+        let mut process = ExecFixtureProcess::spawn(&project, &[entry, "--watch"]);
+        process.wait_until(|| count() >= 1);
+        // FSEvents can deliver queued fixture-creation events after registration.
+        let initial = std::cell::Cell::new(count());
+        let quiet_since = std::cell::Cell::new(Instant::now());
+        process.wait_until(|| {
+            let current = count();
+            if current != initial.get() {
+                initial.set(current);
+                quiet_since.set(Instant::now());
+            }
+            quiet_since.get().elapsed() >= Duration::from_millis(800)
+        });
+        let initial = initial.get();
+        project.write_file("scripts/e.js", "console.log('still unrelated');");
+        std::thread::sleep(Duration::from_millis(800));
+        assert_eq!(count(), initial, "{entry}: unrelated file triggered watch");
+        project.write_file(entry, &format!("{source}\n// changed\n"));
+        process.wait_until(|| count() > initial);
+        std::thread::sleep(Duration::from_millis(800));
+        assert_eq!(
+            count(),
+            initial + 1,
+            "{entry}: entrypoint change did not trigger once"
+        );
+    }
+}
+
+#[test]
+fn exec_delimiter_preserves_child_options_that_match_cli_flags() {
+    let project = TempProject::empty(r#"{"name":"exec-args","version":"1.0.0"}"#);
+    project.write_file("args.cjs", "console.log(JSON.stringify({args:process.argv.slice(2),value:process.env.EXEC_ENV_TEST}));");
+    project.write_file(".env.staging", "EXEC_ENV_TEST=staging\n");
+    write_fake_local_bin(
+        &project,
+        "tool",
+        "#!/bin/sh\nexec node args.cjs \"$@\"\n",
+        "@echo off\r\nnode args.cjs %*\r\n",
+    );
+    for args in [
+        vec![
+            "exec",
+            "--env",
+            "staging",
+            "tool",
+            "--",
+            "--env",
+            "production",
+            "--json",
+        ],
+        vec![
+            "args.cjs",
+            "--env",
+            "staging",
+            "--",
+            "--env",
+            "production",
+            "--json",
+        ],
+    ] {
+        let output = lpm(&project).args(&args).output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!({"args":["--env","production","--json"],"value":"staging"})
+        );
+    }
+}
+
+#[test]
+fn typescript_alias_fallback_stays_within_the_selected_pattern() {
+    for (targets, success) in [
+        (r#"["missing.ts"]"#, false),
+        (r#"["missing.ts","correct/value.ts"]"#, true),
+    ] {
+        let project = TempProject::empty(r#"{"name":"alias-fallback","version":"1.0.0"}"#);
+        project.write_file(
+            "entry.ts",
+            "import {value} from '@x/value'; console.log(value);",
+        );
+        project.write_file(
+            "correct/value.ts",
+            "export const value: string = 'SPECIFIC_OK';",
+        );
+        project.write_file(
+            "wrong/value.ts",
+            "export const value: string = 'WRONG_BROAD';",
+        );
+        project.write_file(
+            "tsconfig.json",
+            &format!(
+                r#"{{"compilerOptions":{{"paths":{{"@x/value":{targets},"@x/*":["wrong/*"]}}}}}}"#
+            ),
+        );
+        let output = lpm(&project).args(["entry.ts"]).output().unwrap();
+        assert_eq!(
+            output.status.success(),
+            success,
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        if success {
+            assert!(String::from_utf8_lossy(&output.stdout).contains("SPECIFIC_OK"));
+        }
+    }
+}
+
+#[cfg(unix)]
+fn assert_bounded_node_probe(file: bool, oversized: bool) {
+    let project = if file {
+        TempProject::empty(r#"{"name":"bounded-probe","version":"1.0.0"}"#)
+    } else {
+        TempProject::empty(r#"{"name":"bounded-probe","version":"1.0.0","engines":{"node":">=1"}}"#)
+    };
+    let body = if oversized {
+        "#!/bin/sh\nif [ \"$1\" = --version ]; then printf v22.18.0; /usr/bin/head -c 1048576 /dev/zero | /usr/bin/tr '\\000' ' '; else echo wrong > executed.marker; fi\n"
+    } else {
+        "#!/bin/sh\nif [ \"$1\" = --version ]; then echo v22.18.0; /bin/sleep 20; else echo wrong > executed.marker; fi\n"
+    };
+    write_fake_local_bin(&project, "node", body, "");
+    write_fake_local_bin(
+        &project,
+        "tool",
+        "#!/bin/sh\necho wrong > executed.marker\n",
+        "",
+    );
+    project.write_file("entry.ts", "console.log('wrong');");
+    let start = Instant::now();
+    let target = if file { "entry.ts" } else { "tool" };
+    let output = lpm(&project)
+        .timeout(Duration::from_secs(7))
+        .arg(target)
+        .output()
+        .unwrap();
+    assert!(
+        start.elapsed() < Duration::from_secs(6),
+        "{target}: version probe exceeded deadline"
+    );
+    assert!(
+        !output.status.success() && !project.file_exists("executed.marker"),
+        "{target}, oversized={oversized}: invalid probe was accepted"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn file_node_version_probe_has_a_deadline() {
+    assert_bounded_node_probe(true, false);
+}
+#[cfg(unix)]
+#[test]
+fn file_node_version_probe_has_a_stdout_limit() {
+    assert_bounded_node_probe(true, true);
+}
+#[cfg(unix)]
+#[test]
+fn engine_node_version_probe_has_a_deadline() {
+    assert_bounded_node_probe(false, false);
+}
+#[cfg(unix)]
+#[test]
+fn engine_node_version_probe_has_a_stdout_limit() {
+    assert_bounded_node_probe(false, true);
+}
+
+#[cfg(unix)]
+#[test]
+fn exec_forwards_stop_signals_before_escalating_unresponsive_descendants() {
+    for signal in [libc::SIGINT, libc::SIGTERM] {
+        let project = TempProject::empty(r#"{"name":"graceful-exec","version":"1.0.0"}"#);
+        project.write_file("entry.js", r#"
+const fs=require('fs');
+const c=require('child_process').spawn(process.execPath,['-e',`process.on('SIGINT',()=>{});process.on('SIGTERM',()=>{});setTimeout(()=>process.exit(0),30000);process.send('ready');`],{stdio:['ignore','ignore','ignore','ipc']});
+for(const signal of ['SIGINT','SIGTERM']) process.on(signal,()=>{fs.writeFileSync('.lpm/cleanup.txt',signal);process.exit(0);});
+c.once('message',()=>{fs.writeFileSync('.lpm/pids.tmp',JSON.stringify([process.pid,c.pid]));fs.renameSync('.lpm/pids.tmp','.lpm/pids.json');});
+setTimeout(()=>process.exit(0),30000);
+"#);
+        let mut process = ExecFixtureProcess::spawn(&project, &["entry.js"]);
+        process.wait_until(|| project.file_exists(".lpm/pids.json"));
+        let pids: Vec<u32> = serde_json::from_str(&project.read_file(".lpm/pids.json")).unwrap();
+        process.descendants = pids
+            .iter()
+            .map(|pid| (*pid, exec_fixture_identity(*pid).unwrap()))
+            .collect();
+        process.signal(signal);
+        assert!(
+            process.exits_within(Duration::from_secs(5)),
+            "exec did not stop"
+        );
+        assert_eq!(
+            project.read_file(".lpm/cleanup.txt"),
+            if signal == libc::SIGINT {
+                "SIGINT"
+            } else {
+                "SIGTERM"
+            }
+        );
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while exec_fixture_identity(pids[1]).as_ref() == Some(&process.descendants[1].1)
+            && Instant::now() < deadline
+        {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_ne!(
+            exec_fixture_identity(pids[1]).as_ref(),
+            Some(&process.descendants[1].1),
+            "unresponsive descendant survived"
+        );
+    }
+}
+
+#[test]
+fn typescript_alias_wildcard_requires_nonoverlapping_prefix_and_suffix() {
+    let project = TempProject::empty(r#"{"name":"alias-overlap","version":"1.0.0"}"#);
+    project.write_file(
+        "entry.ts",
+        "import {value} from '@x/a'; console.log(value);",
+    );
+    project.write_file("correct/a.ts", "export const value: string = 'ALIAS_OK';");
+    project.write_file(
+        "tsconfig.json",
+        r#"{"compilerOptions":{"paths":{"@x/*":["correct/*"],"@x/a*a":["missing/*"]}}}"#,
+    );
+    let output = lpm(&project).arg("entry.ts").output().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("ALIAS_OK"));
+}
+
+#[cfg(unix)]
+#[test]
+fn source_watch_follows_repointed_symlinks_and_their_new_external_target() {
+    let project = TempProject::empty(r#"{"name":"symlink-watch","version":"1.0.0"}"#);
+    let external = tempfile::tempdir().unwrap();
+    let source = "require('fs').appendFileSync(process.cwd()+'/.lpm/cycles.txt','run\\n');";
+    project.write_file("first.js", source);
+    std::fs::write(external.path().join("second.js"), source).unwrap();
+    let entry = project.path().join("entry.js");
+    std::os::unix::fs::symlink(project.path().join("first.js"), &entry).unwrap();
+    let count = || {
+        std::fs::read_to_string(project.path().join(".lpm/cycles.txt"))
+            .unwrap_or_default()
+            .lines()
+            .count()
+    };
+    let mut process = ExecFixtureProcess::spawn(&project, &["entry.js", "--watch"]);
+    process.wait_until(|| count() == 1);
+    std::fs::remove_file(&entry).unwrap();
+    std::os::unix::fs::symlink(external.path().join("second.js"), &entry).unwrap();
+    process.wait_until(|| count() >= 2);
+    std::thread::sleep(Duration::from_millis(400));
+    std::fs::write(
+        external.path().join("second.js"),
+        format!("{source}\n// changed\n"),
+    )
+    .unwrap();
+    process.wait_until(|| count() >= 3);
+    std::thread::sleep(Duration::from_millis(500));
+    assert_eq!(count(), 3);
+}
+
+#[test]
+fn typescript_alias_substitution_preserves_literal_dollar_sequences() {
+    for name in ["$&", "$$", "$`", "$'"] {
+        let project = TempProject::empty(r#"{"name":"literal-alias","version":"1.0.0"}"#);
+        project.write_file(
+            "tsconfig.json",
+            r#"{"compilerOptions":{"paths":{"@x/*":["right/*"]}}}"#,
+        );
+        project.write_file(
+            &format!("right/{name}.ts"),
+            "export const value = 'LITERAL_OK';",
+        );
+        project.write_file(
+            "entry.ts",
+            &format!(
+                "import {{value}} from {}; console.log(value);",
+                serde_json::to_string(&format!("@x/{name}")).unwrap()
+            ),
+        );
+        let output = lpm(&project).arg("entry.ts").output().unwrap();
+        assert!(
+            output.status.success(),
+            "{name}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(String::from_utf8_lossy(&output.stdout).contains("LITERAL_OK"));
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn typescript_alias_targets_ignore_multiple_wildcards() {
+    let project = TempProject::empty(r#"{"name":"invalid-alias-target","version":"1.0.0"}"#);
+    project.write_file(
+        "tsconfig.json",
+        r#"{"compilerOptions":{"paths":{"@x/*":["wrong/*-*.ts","right/*.ts"]}}}"#,
+    );
+    project.write_file("wrong/value-*.ts", "export const value = 'WRONG_TARGET';");
+    project.write_file("right/value.ts", "export const value = 'VALID_TARGET';");
+    project.write_file(
+        "entry.ts",
+        "import {value} from '@x/value'; console.log(value);",
+    );
+    let output = lpm(&project).arg("entry.ts").output().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("VALID_TARGET"),
+        "{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+}

@@ -1,4 +1,4 @@
-//! Cli-binary tier: real-terminal certificate consent and interactive dev hooks.
+//! Cli-binary tier: real-terminal consent, dev hooks, and foreground command input.
 mod common;
 
 #[cfg(all(unix, debug_assertions))]
@@ -203,6 +203,55 @@ fs.writeFileSync('reply.txt',buffer.subarray(0,count));
         assert!(
             visible && status.is_some_and(|status| status.success()),
             "{phase} could not read terminal input: {status:?}\n{transcript}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(project.path().join("reply.txt"))
+                .unwrap()
+                .trim(),
+            "yes"
+        );
+    }
+}
+
+#[cfg(all(unix, debug_assertions))]
+#[test]
+fn exec_files_and_local_tools_can_read_from_the_foreground_terminal() {
+    use std::os::unix::fs::PermissionsExt;
+    for args in [vec!["entry.js"], vec!["exec", "tool"]] {
+        let project = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        std::fs::write(
+            project.path().join("package.json"),
+            r#"{"name":"interactive-exec","version":"1.0.0"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            project.path().join("entry.js"),
+            r#"
+const fs=require('fs');
+fs.writeFileSync('hook.pid',String(process.pid));
+console.log('Exec input:');
+const buffer=Buffer.alloc(32);
+const count=fs.readSync(0,buffer,0,buffer.length,null);
+fs.writeFileSync('reply.txt',buffer.subarray(0,count));
+"#,
+        )
+        .unwrap();
+        let bin = project.path().join("node_modules/.bin/tool");
+        std::fs::create_dir_all(bin.parent().unwrap()).unwrap();
+        std::fs::write(&bin, "#!/bin/sh\nexec node entry.js\n").unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let (visible, status, transcript) = run_dev_tty(
+            project.path(),
+            home.path(),
+            None,
+            &args,
+            &["Exec input:"],
+            b"yes\r",
+        );
+        assert!(
+            visible && status.is_some_and(|status| status.success()),
+            "{args:?}: {status:?}\n{transcript}"
         );
         assert_eq!(
             std::fs::read_to_string(project.path().join("reply.txt"))

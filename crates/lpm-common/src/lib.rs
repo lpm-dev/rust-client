@@ -21,6 +21,7 @@ pub mod package_name;
 pub mod paths;
 pub mod peer;
 pub mod platform;
+pub mod process_output;
 pub mod project_glob;
 pub mod provenance;
 pub mod symlink;

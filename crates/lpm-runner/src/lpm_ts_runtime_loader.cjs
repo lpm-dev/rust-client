@@ -544,7 +544,7 @@ function loadTsconfig(projectDir) {
   const traceStart = TRACE_ENABLED ? process.hrtime.bigint() : 0n;
   try {
     const text = fs.readFileSync(tsconfigPath, "utf8");
-    const parsed = JSON.parse(stripJsonComments(text));
+    const parsed = JSON.parse(normalizeJsonc(text));
     if (TRACE_ENABLED) {
       traceEvent("tsconfig_load", traceStart, { tsconfigPath, found: true });
     }
@@ -557,10 +557,45 @@ function loadTsconfig(projectDir) {
   }
 }
 
-function stripJsonComments(text) {
-  return text
-    .replace(/\/\*[\s\S]*?\*\//g, "")
-    .replace(/(^|[^:])\/\/.*$/gm, "$1");
+function normalizeJsonc(text) {
+  const chars = Array.from(text.replace(/^\uFEFF/, ""));
+  let quoted = false;
+  for (let i = 0; i < chars.length; i += 1) {
+    if (quoted) {
+      if (chars[i] === "\\") i += 1;
+      else if (chars[i] === '"') quoted = false;
+    } else if (chars[i] === '"') {
+      quoted = true;
+    } else if (chars[i] === "/" && chars[i + 1] === "/") {
+      while (i < chars.length && chars[i] !== "\n" && chars[i] !== "\r") {
+        chars[i++] = " ";
+      }
+    } else if (chars[i] === "/" && chars[i + 1] === "*") {
+      chars[i++] = " ";
+      chars[i++] = " ";
+      while (i < chars.length && !(chars[i] === "*" && chars[i + 1] === "/")) {
+        if (chars[i] !== "\n" && chars[i] !== "\r") chars[i] = " ";
+        i += 1;
+      }
+      if (i === chars.length) throw new SyntaxError("Unterminated JSON comment");
+      chars[i++] = " ";
+      chars[i] = " ";
+    }
+  }
+  quoted = false;
+  for (let i = 0; i < chars.length; i += 1) {
+    if (quoted) {
+      if (chars[i] === "\\") i += 1;
+      else if (chars[i] === '"') quoted = false;
+    } else if (chars[i] === '"') {
+      quoted = true;
+    } else if (chars[i] === ",") {
+      let next = i + 1;
+      while (next < chars.length && /\s/.test(chars[next])) next += 1;
+      if (chars[next] === "}" || chars[next] === "]") chars[i] = " ";
+    }
+  }
+  return chars.join("");
 }
 
 function moduleFormat(filename, source) {
@@ -951,22 +986,30 @@ function resolveTsconfigPath(specifier) {
   const baseUrl = typeof compilerOptions.baseUrl === "string" ? compilerOptions.baseUrl : ".";
   const baseDir = path.resolve(PROJECT_DIR, baseUrl);
 
+  let selected;
   for (const [pattern, targets] of Object.entries(paths)) {
     const match = matchPathPattern(pattern, specifier);
-    if (!match) {
-      continue;
+    if (!match) continue;
+    const prefixLength = pattern.indexOf("*");
+    if (prefixLength === -1) {
+      selected = { targets, match, prefixLength };
+      break;
     }
-    const targetList = Array.isArray(targets) ? targets : [targets];
-    for (const target of targetList) {
-      if (typeof target !== "string") {
-        continue;
-      }
-      const substituted = target.includes("*") ? target.replace("*", match.star || "") : target;
-      const resolved = resolveCandidate(path.resolve(baseDir, substituted));
-      if (resolved) {
-        return resolved;
-      }
+    if (!selected || prefixLength > selected.prefixLength) {
+      selected = { targets, match, prefixLength };
     }
+  }
+  if (!selected) return null;
+  const targetList = Array.isArray(selected.targets) ? selected.targets : [selected.targets];
+  for (const target of targetList) {
+    if (typeof target !== "string") continue;
+    const star = target.indexOf("*");
+    if (star !== -1 && target.indexOf("*", star + 1) !== -1) continue;
+    const substituted = star === -1
+      ? target
+      : target.slice(0, star) + (selected.match.star || "") + target.slice(star + 1);
+    const resolved = resolveCandidate(path.resolve(baseDir, substituted));
+    if (resolved) return resolved;
   }
 
   return null;
@@ -979,7 +1022,7 @@ function matchPathPattern(pattern, specifier) {
   }
   const prefix = pattern.slice(0, star);
   const suffix = pattern.slice(star + 1);
-  if (!specifier.startsWith(prefix) || !specifier.endsWith(suffix)) {
+  if (specifier.length < prefix.length + suffix.length || !specifier.startsWith(prefix) || !specifier.endsWith(suffix)) {
     return null;
   }
   return { star: specifier.slice(prefix.length, specifier.length - suffix.length) };

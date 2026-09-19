@@ -12,9 +12,7 @@ use lpm_common::paths::LpmRoot;
 use sha2::{Digest, Sha256};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, ExitStatus, Stdio};
-#[cfg(unix)]
-use std::thread;
+use std::process::{Command, ExitStatus, Stdio};
 
 const SUPPORTED_FILE_TYPES: &str = ".js, .mjs, .cjs, .ts, .tsx, .mts, .cts";
 const LPM_TS_RUNTIME_LOADER_VERSION: &str = "3";
@@ -226,6 +224,15 @@ pub fn exec_file_with_options(
 }
 
 pub fn execute_exec_plan(project_dir: &Path, plan: &ExecPlan) -> Result<(), LpmError> {
+    let signals = crate::execution::ExecutionSignals::new()?;
+    execute_exec_plan_with_signals(project_dir, plan, &signals)
+}
+
+pub fn execute_exec_plan_with_signals(
+    project_dir: &Path,
+    plan: &ExecPlan,
+    signals: &crate::execution::ExecutionSignals,
+) -> Result<(), LpmError> {
     let env_vars = dotenv::load_project_env_with_schema_validation(
         project_dir,
         plan.env_mode.as_deref(),
@@ -249,53 +256,13 @@ pub fn execute_exec_plan(project_dir: &Path, plan: &ExecPlan) -> Result<(), LpmE
     }
     command.env("PATH", &plan.command.path);
 
-    let mut child = command.spawn().map_err(|e| {
-        LpmError::Script(format!(
-            "failed to execute '{}': {e}",
-            plan.command.program.display()
-        ))
-    })?;
-    let status = wait_for_child(&mut child)?;
+    let status = signals.run(&mut command)?;
 
     if !status.success() {
         return Err(LpmError::ExitCode(exit_code_from_status(&status)));
     }
 
     Ok(())
-}
-
-#[cfg(unix)]
-fn wait_for_child(child: &mut Child) -> Result<ExitStatus, LpmError> {
-    use signal_hook::consts::signal::{SIGINT, SIGTERM};
-    use signal_hook::iterator::Signals;
-
-    let pid = child.id() as libc::pid_t;
-    let mut signals = Signals::new([SIGINT, SIGTERM])
-        .map_err(|e| LpmError::Script(format!("failed to install exec signal handlers: {e}")))?;
-    let handle = signals.handle();
-    let forwarder = thread::spawn(move || {
-        for signal in signals.forever() {
-            // SAFETY: `pid` comes from a live child process spawned by this
-            // function. `kill` is best-effort; wait below remains authoritative.
-            unsafe {
-                libc::kill(pid, signal);
-            }
-        }
-    });
-
-    let status = child
-        .wait()
-        .map_err(|e| LpmError::Script(format!("failed to wait for exec child process: {e}")));
-    handle.close();
-    let _ = forwarder.join();
-    status
-}
-
-#[cfg(not(unix))]
-fn wait_for_child(child: &mut Child) -> Result<ExitStatus, LpmError> {
-    child
-        .wait()
-        .map_err(|e| LpmError::Script(format!("failed to wait for exec child process: {e}")))
 }
 
 fn resolve_exec_path(project_dir: &Path, file_path: &str) -> Result<PathBuf, LpmError> {
@@ -755,7 +722,12 @@ fn detect_effective_node_version_with_path(path: &str) -> Option<String> {
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
     shell::strip_inherited_env_hooks(&mut command);
-    let output = command.output().ok()?;
+    let output = lpm_common::process_output::output_capped(
+        &mut command,
+        std::time::Duration::from_secs(2),
+        4096,
+    )
+    .ok()?;
 
     if !output.status.success() {
         return None;

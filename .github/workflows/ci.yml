@@ -547,6 +547,9 @@ jobs:
         run: |
           cargo test --locked -p lpm-task watch::
 
+      - name: Windows bounded runtime probes
+        run: cargo test --locked -p lpm-common --test process_output
+
       - name: Windows proxy named-pipe tests
         run: cargo test --locked -p lpm-proxy named_pipe
 

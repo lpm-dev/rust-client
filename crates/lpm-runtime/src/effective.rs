@@ -359,35 +359,35 @@ fn resolve_selected(selected: &SelectedNode) -> Effective {
 /// Run `node --version` and return the bare version string (no `v`
 /// prefix). Returns `None` when `node` is not on `PATH` or the output
 /// is unparseable.
+fn node_version_output(command: &mut Command) -> Option<std::process::Output> {
+    lpm_common::process_output::output_capped(command, std::time::Duration::from_secs(2), 4096).ok()
+}
+
 fn system_node_version() -> Option<String> {
-    parse_system_node_version(Command::new("node").arg("--version").output().ok()?)
+    parse_system_node_version(node_version_output(Command::new("node").arg("--version"))?)
 }
 
 fn system_node_version_at(executable: &Path) -> Option<String> {
-    parse_system_node_version(Command::new(executable).arg("--version").output().ok()?)
+    parse_system_node_version(node_version_output(
+        Command::new(executable).arg("--version"),
+    )?)
 }
 
 #[cfg(not(windows))]
 fn node_version_on_path(cwd: &Path, _path: &OsStr, executable: Option<&Path>) -> Option<String> {
-    parse_system_node_version(
-        Command::new(executable?)
-            .arg("--version")
-            .current_dir(cwd)
-            .output()
-            .ok()?,
-    )
+    parse_system_node_version(node_version_output(
+        Command::new(executable?).arg("--version").current_dir(cwd),
+    )?)
 }
 
 #[cfg(windows)]
 fn node_version_on_path(cwd: &Path, path: &OsStr, _executable: Option<&Path>) -> Option<String> {
-    parse_system_node_version(
+    parse_system_node_version(node_version_output(
         Command::new("cmd")
             .args(["/D", "/S", "/C", "node --version"])
             .current_dir(cwd)
-            .env("PATH", path)
-            .output()
-            .ok()?,
-    )
+            .env("PATH", path),
+    )?)
 }
 
 fn parse_system_node_version(output: std::process::Output) -> Option<String> {

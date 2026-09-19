@@ -421,10 +421,19 @@ pub fn identity_bound_process_termination_available() -> bool {
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(not(windows))]
 fn terminate_unix_pid_if_process_identity(
     pid: u32,
     expected: &ProcessIdentity,
+) -> Result<(), String> {
+    signal_unix_pid_if_process_identity(pid, expected, 15)
+}
+
+#[cfg(target_os = "linux")]
+fn signal_unix_pid_if_process_identity(
+    pid: u32,
+    expected: &ProcessIdentity,
+    signal: i32,
 ) -> Result<(), String> {
     if protected_pid(pid) || pid == std::process::id() {
         return Err(format!("refusing to terminate protected PID {pid}"));
@@ -435,13 +444,13 @@ fn terminate_unix_pid_if_process_identity(
     signal_linux_process_with(pid, expected, pidfd, process_identity_for_pid, |pidfd| {
         use std::os::fd::AsRawFd as _;
 
-        // SAFETY: `pidfd` remains open for the syscall, SIGTERM needs no
+        // SAFETY: `pidfd` remains open for the syscall; the signal needs no
         // siginfo pointer, and the flags argument must be zero.
         if unsafe {
             libc::syscall(
                 libc::SYS_pidfd_send_signal,
                 pidfd.as_raw_fd(),
-                libc::SIGTERM,
+                signal,
                 std::ptr::null::<libc::siginfo_t>(),
                 0,
             )
@@ -475,15 +484,16 @@ fn signal_linux_process_with<Handle>(
 }
 
 #[cfg(target_os = "macos")]
-fn terminate_unix_pid_if_process_identity(
+fn signal_unix_pid_if_process_identity(
     pid: u32,
     expected: &ProcessIdentity,
+    signal: i32,
 ) -> Result<(), String> {
     if protected_pid(pid) || pid == std::process::id() {
         return Err(format!("refusing to terminate protected PID {pid}"));
     }
 
-    signal_macos_process_with(pid, expected, macos_signal_by_audit_token())
+    signal_macos_process_with(pid, expected, macos_signal_by_audit_token(), signal)
 }
 
 #[cfg(target_os = "macos")]
@@ -501,6 +511,7 @@ fn signal_macos_process_with(
     pid: u32,
     expected: &ProcessIdentity,
     signal_by_audit_token: Option<MacosSignalByAuditToken>,
+    signal: i32,
 ) -> Result<(), String> {
     // A numeric signal could target a reused PID after the identity check.
     let Some(signal_by_audit_token) = signal_by_audit_token else {
@@ -512,7 +523,7 @@ fn signal_macos_process_with(
         .ok_or_else(|| format!("PID {pid} has an invalid captured macOS identity"))?;
     // SAFETY: the symbol has the public libproc signature and the token points
     // to eight initialized 32-bit words for the duration of the call.
-    let error = unsafe { signal_by_audit_token(&raw mut audit_token, libc::SIGTERM) };
+    let error = unsafe { signal_by_audit_token(&raw mut audit_token, signal) };
     if error == 0 {
         Ok(())
     } else {
@@ -554,9 +565,10 @@ fn macos_audit_token(pid: u32, identity: &ProcessIdentity) -> Option<MacosAuditT
 }
 
 #[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
-fn terminate_unix_pid_if_process_identity(
+fn signal_unix_pid_if_process_identity(
     pid: u32,
     _expected: &ProcessIdentity,
+    _signal: i32,
 ) -> Result<(), String> {
     if protected_pid(pid) || pid == std::process::id() {
         return Err(format!("refusing to terminate protected PID {pid}"));
@@ -565,9 +577,10 @@ fn terminate_unix_pid_if_process_identity(
 }
 
 #[cfg(not(any(unix, windows)))]
-fn terminate_unix_pid_if_process_identity(
+fn signal_unix_pid_if_process_identity(
     pid: u32,
     _expected: &ProcessIdentity,
+    _signal: i32,
 ) -> Result<(), String> {
     Err(format!(
         "cannot atomically validate and terminate PID {pid} on this platform"
@@ -981,6 +994,54 @@ pub(crate) fn descendant_process_snapshot_until(
         None
     } else {
         Some(snapshot)
+    }
+}
+
+/// Forward a stop signal, allow cleanup, then stop captured surviving descendants.
+#[cfg(unix)]
+pub(crate) fn stop_child_process_tree(child: &mut Child, signal: i32) -> std::io::Result<()> {
+    let root_pid = child.id();
+    let mut snapshot = descendant_process_snapshot(root_pid);
+    // SAFETY: the Child remains unreaped, so its PID cannot be reused here.
+    unsafe {
+        libc::kill(root_pid as i32, signal);
+    }
+    for (&pid, identity) in &snapshot.identities {
+        if pid != root_pid
+            && let Some(identity) = identity
+        {
+            let _ = signal_unix_pid_if_process_identity(pid, identity, signal);
+        }
+    }
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    let remaining = descendant_process_snapshot(root_pid);
+    snapshot.identities.extend(remaining.identities);
+    snapshot.uncertain_descendants |= remaining.uncertain_descendants;
+    let mut failures = usize::from(snapshot.uncertain_descendants);
+    for (&pid, identity) in &snapshot.identities {
+        if pid == root_pid {
+            continue;
+        }
+        let Some(current) = process_identity_for_pid(pid) else {
+            continue;
+        };
+        if identity.as_ref() != Some(&current) {
+            continue;
+        }
+        if signal_unix_pid_if_process_identity(pid, &current, libc::SIGKILL).is_err()
+            && process_identity_for_pid(pid).as_ref() == Some(&current)
+        {
+            failures += 1;
+        }
+    }
+    let _ = child.kill();
+    child.wait()?;
+    if failures == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::other(format!(
+            "could not safely stop {failures} descendant process(es) of PID {root_pid}"
+        )))
     }
 }
 
@@ -4431,8 +4492,12 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn macos_without_audit_token_signalling_fails_closed() {
-        let result =
-            signal_macos_process_with(20, &ProcessIdentity("macos:9001:7".to_string()), None);
+        let result = signal_macos_process_with(
+            20,
+            &ProcessIdentity("macos:9001:7".to_string()),
+            None,
+            libc::SIGTERM,
+        );
 
         assert_eq!(
             result.unwrap_err(),

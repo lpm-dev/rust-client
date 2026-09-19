@@ -3,7 +3,7 @@ use super::cache::{
     try_cache_store_with_context,
 };
 use super::format::{print_captured_stderr, print_captured_stdout};
-use super::runtime::ensure_runtime;
+use super::runtime::prepare_runtime;
 use crate::install_ui;
 use lpm_common::{LpmError, LpmRoot, ResolutionFailureKind};
 use lpm_runner::bin_path::ManagedRuntimeHint;
@@ -309,7 +309,7 @@ pub async fn exec(
     env_mode: Option<&str>,
     no_env_check: bool,
 ) -> Result<(), LpmError> {
-    let bin_hint = ensure_runtime(project_dir).await?;
+    let bin_hint = prepare_runtime(project_dir, false).await?;
     install_ui::phase_line(crate::install_ui::terminal_line!(
         "Executing {}",
         install_ui::yellow(command_name)
@@ -339,7 +339,7 @@ pub async fn run_file(
     no_env_check: bool,
     plain_node: bool,
 ) -> Result<(), LpmError> {
-    let bin_hint = ensure_runtime(project_dir).await?;
+    let bin_hint = prepare_runtime(project_dir, false).await?;
     let options = exec_options(env_mode, no_env_check, plain_node, bin_hint);
     exec_once(project_dir, file_path, extra_args, &options)
 }
@@ -373,10 +373,11 @@ pub async fn run_file_watch(
     no_env_check: bool,
     plain_node: bool,
 ) -> Result<(), LpmError> {
-    let bin_hint = ensure_runtime(project_dir).await?;
+    let bin_hint = prepare_runtime(project_dir, false).await?;
     let options = exec_options(env_mode, no_env_check, plain_node, bin_hint);
     let plan = lpm_runner::exec::build_exec_plan(project_dir, file_path, extra_args, &options)?;
-    let (watch_dir, input_globs) = exec_watch_scope(project_dir, &plan);
+    let signals = Arc::new(lpm_runner::execution::ExecutionSignals::new()?);
+    let run_signals = Arc::clone(&signals);
 
     install_ui::phase_untrusted(&format!(
         "Watching {} (Ctrl+C to stop)",
@@ -385,10 +386,11 @@ pub async fn run_file_watch(
 
     let dir = project_dir.to_path_buf();
     let file = file_path.to_string();
+    let watched_file = plan.resolved_path.clone();
     let plan_for_watch = plan;
 
-    lpm_task::watch::watch_and_run(
-        &watch_dir,
+    lpm_task::watch::watch_file_and_run(
+        &watched_file,
         Box::new(move || {
             let mut stderr = std::io::stderr();
             if stderr.is_terminal() {
@@ -403,7 +405,11 @@ pub async fn run_file_watch(
             ));
             let start = std::time::Instant::now();
 
-            match lpm_runner::exec::execute_exec_plan(&dir, &plan_for_watch) {
+            match lpm_runner::exec::execute_exec_plan_with_signals(
+                &dir,
+                &plan_for_watch,
+                &run_signals,
+            ) {
                 Ok(()) => {
                     install_ui::done_line(crate::install_ui::terminal_line!(
                         "{} completed in {}. Waiting for changes...",
@@ -421,12 +427,11 @@ pub async fn run_file_watch(
                 }
             }
         }),
-        &input_globs,
-        None,
+        || signals.is_stopped(),
     )
     .map_err(|e| LpmError::Script(format!("watch error: {e}")))?;
 
-    Ok(())
+    signals.check()
 }
 
 fn exec_options(
@@ -442,31 +447,6 @@ fn exec_options(
         plain_node,
         runtime_cache_root: None,
     }
-}
-
-fn exec_watch_scope(
-    project_dir: &Path,
-    plan: &lpm_runner::exec::ExecPlan,
-) -> (std::path::PathBuf, Vec<String>) {
-    if let Ok(relative) = plan.resolved_path.strip_prefix(project_dir) {
-        return (project_dir.to_path_buf(), vec![path_glob_string(relative)]);
-    }
-
-    let watch_dir = plan
-        .resolved_path
-        .parent()
-        .map_or_else(|| project_dir.to_path_buf(), Path::to_path_buf);
-    let input_globs = plan
-        .resolved_path
-        .file_name()
-        .map(|name| vec![name.to_string_lossy().replace('\\', "/")])
-        .unwrap_or_default();
-
-    (watch_dir, input_globs)
-}
-
-fn path_glob_string(path: &Path) -> String {
-    path.to_string_lossy().replace('\\', "/")
 }
 
 #[derive(Clone, Debug)]
