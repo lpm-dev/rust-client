@@ -9,7 +9,7 @@ use crate::cert;
 use lpm_common::LpmError;
 use std::path::Path;
 use std::process::Command;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", all(test, unix)))]
 use std::process::Stdio;
 
 #[cfg(any(target_os = "macos", target_os = "windows"))]
@@ -192,10 +192,19 @@ fn run_privileged_interactive(
         Some(trusted_sudo_executable()?)
     };
     let (program, command_args) = privileged_command_line(effective_uid, sudo, executable, args)?;
-    let status = Command::new(&program)
-        .args(&command_args)
+    run_interactive_trust_command(&program, &command_args, operation)
+}
+
+#[cfg(any(target_os = "linux", all(test, unix)))]
+fn run_interactive_trust_command(
+    program: &str,
+    command_args: &[String],
+    operation: &str,
+) -> Result<(), LpmError> {
+    let status = Command::new(program)
+        .args(command_args)
         .stdin(Stdio::inherit())
-        .stdout(Stdio::inherit())
+        .stdout(Stdio::from(std::io::stderr()))
         .stderr(Stdio::inherit())
         .status()
         .map_err(|error| LpmError::Cert(format!("failed to {operation}: {error}")))?;
@@ -1305,6 +1314,34 @@ fn insert_colons_uppercase(hex: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    #[test]
+    fn interactive_trust_progress_uses_stderr() {
+        const CHILD: &str = "LPM_TRUST_STDIO_TEST_CHILD";
+        const MARKER: &str = "trust-progress-marker";
+        if std::env::var_os(CHILD).is_some() {
+            super::run_interactive_trust_command(
+                "/bin/sh",
+                &["-c".into(), format!("printf {MARKER}")],
+                "emit fixture progress",
+            )
+            .unwrap();
+            return;
+        }
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "trust::tests::interactive_trust_progress_uses_stderr",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        assert!(!String::from_utf8_lossy(&output.stdout).contains(MARKER));
+        assert!(String::from_utf8_lossy(&output.stderr).contains(MARKER));
+    }
+
     use super::*;
 
     #[test]

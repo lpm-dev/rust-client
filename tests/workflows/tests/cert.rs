@@ -382,3 +382,255 @@ fn cert_generate_uses_lpm_json_extra_permitted_dns_for_constrained_chain() {
         "extraPermittedDns should force a leaf + constrained intermediate chain"
     );
 }
+
+fn cert_material_snapshot(
+    project: &TempProject,
+) -> std::collections::BTreeMap<std::path::PathBuf, Vec<u8>> {
+    fn collect(
+        path: &std::path::Path,
+        out: &mut std::collections::BTreeMap<std::path::PathBuf, Vec<u8>>,
+    ) {
+        if !path.exists() {
+            return;
+        }
+        if path.is_dir() {
+            for entry in std::fs::read_dir(path).unwrap() {
+                collect(&entry.unwrap().path(), out);
+            }
+        } else if !path
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .ends_with(".lock")
+        {
+            out.insert(path.to_path_buf(), std::fs::read(path).unwrap());
+        }
+    }
+    let mut files = std::collections::BTreeMap::new();
+    for path in [
+        project.home().join(".lpm/certs"),
+        project.path().join(".lpm/certs"),
+        trust_store_dir(project),
+        audit_dir(project),
+        project.home().join(".lpm/cert-grace.json"),
+    ] {
+        collect(&path, &mut files);
+    }
+    files
+}
+
+#[test]
+fn cert_rejects_inapplicable_flags_without_mutating_material() {
+    let project = TempProject::empty(r#"{"name":"cert-test","version":"1.0.0"}"#);
+    assert_success(
+        &cert_command(&project)
+            .args(["cert", "trust"])
+            .output()
+            .unwrap(),
+        "trust",
+    );
+    assert_success(
+        &cert_command(&project)
+            .args(["cert", "generate"])
+            .output()
+            .unwrap(),
+        "generate",
+    );
+    let before = cert_material_snapshot(&project);
+    for args in [
+        vec!["rotate", "--dry-run"],
+        vec!["trust", "--dry-run"],
+        vec!["uninstall", "--dry-run"],
+        vec!["generate", "--dry-run"],
+        vec!["status", "--dry-run"],
+        vec!["reconcile", "--host", "app.localhost"],
+        vec!["generate", "--project", "."],
+        vec!["status", "--keep-old-trusted", "1"],
+        vec!["trust", "--fail-on-missing"],
+    ] {
+        let output = cert_command(&project)
+            .args(["--json", "cert"])
+            .args(&args)
+            .output()
+            .unwrap();
+        assert!(!output.status.success(), "accepted {args:?}");
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains("only valid"),
+            "{}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        assert_eq!(
+            before,
+            cert_material_snapshot(&project),
+            "mutated for {args:?}"
+        );
+    }
+}
+
+#[test]
+fn cert_status_detects_unusable_project_material_without_repairing_it() {
+    for damage in ["missing key", "wrong key", "stale chain"] {
+        let project = TempProject::empty(r#"{"name":"cert-test","version":"1.0.0"}"#);
+        assert_success(
+            &cert_command(&project)
+                .args(["cert", "trust"])
+                .output()
+                .unwrap(),
+            "trust",
+        );
+        assert_success(
+            &cert_command(&project)
+                .args(["cert", "generate"])
+                .output()
+                .unwrap(),
+            "generate",
+        );
+        let (other_ca, other_key) = lpm_cert::ca::generate_ca().unwrap();
+        match damage {
+            "missing key" => std::fs::remove_file(project_key_path(&project)).unwrap(),
+            "wrong key" => {
+                lpm_cert::write_key_file(&project_key_path(&project), other_key.as_bytes()).unwrap()
+            }
+            _ => std::fs::write(ca_cert_path(&project), other_ca).unwrap(),
+        }
+        let before = cert_material_snapshot(&project);
+        let output = cert_command(&project)
+            .args(["cert", "status", "--json"])
+            .output()
+            .unwrap();
+        assert_success(&output, "status");
+        let value = json_envelope(&output, "status");
+        assert_eq!(value["project"]["valid"], false, "{damage}");
+        assert!(
+            value["project"]["error"]
+                .as_str()
+                .is_some_and(|message| !message.is_empty())
+        );
+        assert_eq!(before, cert_material_snapshot(&project));
+        let output = cert_command(&project)
+            .args(["cert", "status"])
+            .output()
+            .unwrap();
+        assert!(!String::from_utf8_lossy(&output.stdout).contains("HTTPS certificates are ready"));
+        assert!(!String::from_utf8_lossy(&output.stderr).contains("HTTPS certificates are ready"));
+    }
+}
+
+#[test]
+fn cert_reconcile_dry_run_preserves_pending_rotation_and_pair_recovery() {
+    for phase in ["reissuing", "promoted", "pair"] {
+        let project = TempProject::empty(r#"{"name":"cert-test","version":"1.0.0"}"#);
+        assert_success(
+            &cert_command(&project)
+                .args(["cert", "trust"])
+                .output()
+                .unwrap(),
+            "trust",
+        );
+        assert_success(
+            &cert_command(&project)
+                .args(["cert", "generate"])
+                .output()
+                .unwrap(),
+            "generate",
+        );
+        let old_cert = std::fs::read_to_string(ca_cert_path(&project)).unwrap();
+        let old_key = std::fs::read_to_string(ca_key_path(&project)).unwrap();
+        let (new_cert, new_key) = lpm_cert::ca::generate_ca().unwrap();
+        let ca_dir = ca_cert_path(&project).parent().unwrap().to_path_buf();
+        let fingerprint = |pem: &str| {
+            lpm_cert::cert::fingerprint_hex(
+                &lpm_cert::cert::fingerprint_sha256_bytes(pem.as_bytes()).unwrap(),
+            )
+        };
+        if phase == "pair" {
+            let journal = serde_json::json!({ "cert_name":"rootCA.pem", "key_name":"rootCA-key.pem", "cert_pem":new_cert, "key_pem":new_key, "staged_cert_name":".lpm-cert-stagecert", "staged_key_name":".lpm-cert-stagekey" });
+            lpm_cert::write_key_file(
+                &ca_dir.join(".lpm-ca-pair-transaction.json"),
+                &serde_json::to_vec(&journal).unwrap(),
+            )
+            .unwrap();
+        } else {
+            let journal = serde_json::json!({
+                "version":1, "phase":phase, "mode":"hard_cutover",
+                "oldFingerprint":fingerprint(&old_cert), "newFingerprint":fingerprint(&new_cert),
+                "oldCertPem":old_cert, "oldKeyPem":old_key, "newCertPem":new_cert, "newKeyPem":new_key,
+                "leafBackups":[], "reissuedLeaves":[], "skippedMissing":[]
+            });
+            lpm_cert::write_key_file(
+                &ca_dir.join("rootCA.rotation.json"),
+                &serde_json::to_vec(&journal).unwrap(),
+            )
+            .unwrap();
+            if phase == "promoted" {
+                std::fs::write(ca_cert_path(&project), new_cert).unwrap();
+                lpm_cert::write_key_file(&ca_key_path(&project), new_key.as_bytes()).unwrap();
+            }
+        }
+        let before = cert_material_snapshot(&project);
+        let output = cert_command(&project)
+            .args(["cert", "reconcile", "--dry-run", "--json"])
+            .output()
+            .unwrap();
+        assert_success(&output, "reconcile dry-run");
+        assert!(
+            before == cert_material_snapshot(&project),
+            "changed {phase} recovery state"
+        );
+        assert_eq!(
+            json_envelope(&output, "reconcile dry-run")["pending_recovery"],
+            true
+        );
+    }
+}
+
+#[test]
+fn cert_reconcile_dry_run_leaves_an_empty_home_unchanged() {
+    let project = TempProject::empty(r#"{"name":"cert-test","version":"1.0.0"}"#);
+    let output = cert_command(&project)
+        .args(["cert", "reconcile", "--dry-run", "--json"])
+        .output()
+        .unwrap();
+    assert_success(&output, "empty reconcile dry-run");
+    assert!(!ca_cert_path(&project).parent().unwrap().exists());
+    insta::assert_json_snapshot!(
+        "cert_reconcile_json_empty_preview",
+        json_envelope(&output, "empty reconcile dry-run")
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn cert_reconcile_preview_preserves_directory_and_audit_permissions() {
+    use std::os::unix::fs::PermissionsExt;
+    let project = TempProject::empty(r#"{"name":"cert-test","version":"1.0.0"}"#);
+    assert_success(
+        &cert_command(&project)
+            .args(["cert", "trust"])
+            .output()
+            .unwrap(),
+        "trust",
+    );
+    let paths = [
+        (project.home().join(".lpm"), 0o755),
+        (project.home().join(".lpm/certs"), 0o755),
+        (audit_dir(&project), 0o755),
+        (audit_dir(&project).join("cert.jsonl"), 0o644),
+    ];
+    for (path, mode) in &paths {
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(*mode)).unwrap();
+    }
+    let output = cert_command(&project)
+        .args(["cert", "reconcile", "--dry-run", "--json"])
+        .output()
+        .unwrap();
+    assert_success(&output, "reconcile dry-run");
+    for (path, mode) in &paths {
+        assert_eq!(
+            std::fs::metadata(path).unwrap().permissions().mode() & 0o777,
+            *mode,
+            "{}",
+            path.display()
+        );
+    }
+}
