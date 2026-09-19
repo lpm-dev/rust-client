@@ -446,7 +446,7 @@ fn detect_bench_runner_from_package(
             label: "vitest",
             invocation: RunnerInvocation::LocalBin {
                 name: "vitest",
-                base_args: vec!["bench".to_string()],
+                base_args: vec!["bench".to_string(), "--run".to_string()],
             },
         });
     }
@@ -606,14 +606,14 @@ fn execute_local_runner(
 }
 
 fn local_runner_args(name: &str, base_args: &[String], forwarded_args: &[String]) -> Vec<String> {
-    let drop_vitest_run = name == "vitest"
-        && base_args.len() == 1
-        && base_args[0] == "run"
-        && args_imply_watch(forwarded_args);
+    let drop_vitest_run = name == "vitest" && args_imply_watch(forwarded_args);
     let mut args = Vec::with_capacity(base_args.len() + forwarded_args.len());
-    if !drop_vitest_run {
-        args.extend_from_slice(base_args);
-    }
+    args.extend(
+        base_args
+            .iter()
+            .filter(|arg| !drop_vitest_run || !matches!(arg.as_str(), "run" | "--run"))
+            .cloned(),
+    );
     args.extend_from_slice(forwarded_args);
     args
 }
@@ -1840,6 +1840,14 @@ mod tests {
             &["--watch".into(), "; inert".into()],
         );
         assert_eq!(args, vec!["--watch", "; inert"]);
+        assert_eq!(
+            local_runner_args(
+                "vitest",
+                &["bench".into(), "--run".into()],
+                &["--watch".into()]
+            ),
+            vec!["bench", "--watch"]
+        );
     }
 
     #[test]
@@ -1847,6 +1855,14 @@ mod tests {
         assert_eq!(
             local_runner_args("vitest", &["run".into()], &["--reporter=verbose".into()]),
             vec!["run", "--reporter=verbose"]
+        );
+        assert_eq!(
+            local_runner_args(
+                "vitest",
+                &["bench".into(), "--run".into()],
+                &["--watch=false".into()]
+            ),
+            vec!["bench", "--run", "--watch=false"]
         );
     }
 
@@ -2185,7 +2201,7 @@ mod tests {
             runner.invocation,
             RunnerInvocation::LocalBin {
                 name: "vitest",
-                base_args: vec!["bench".into()]
+                base_args: vec!["bench".into(), "--run".into()]
             }
         );
     }
@@ -2218,7 +2234,7 @@ mod tests {
             runner.invocation,
             RunnerInvocation::LocalBin {
                 name: "vitest",
-                base_args: vec!["bench".into()]
+                base_args: vec!["bench".into(), "--run".into()]
             }
         );
     }
