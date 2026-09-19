@@ -166,6 +166,15 @@ fn prepare_single_package_task_plan(
     // test.dependsOn includes "check".
     let levels = lpm_runner::task_graph::task_levels(&all_scripts, tasks, scripts)
         .map_err(LpmError::Script)?;
+    for name in levels.iter().flatten() {
+        if let Some(task) = tasks.get(name)
+            && let Some(dependency) = task.depends_on.iter().find(|dep| dep.starts_with('^'))
+        {
+            return Err(LpmError::Script(format!(
+                "task '{name}' requires workspace dependency '{dependency}'; use --filter or --all to select workspace tasks"
+            )));
+        }
+    }
 
     Ok(SinglePackageTaskPlan {
         config: lpm_config,

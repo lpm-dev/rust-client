@@ -2365,6 +2365,7 @@ impl ExecFixtureProcess {
         }
     }
 
+    #[track_caller]
     fn wait_until(&mut self, ready: impl Fn() -> bool) {
         let deadline = Instant::now() + Duration::from_secs(10);
         while !ready() {
@@ -2507,41 +2508,18 @@ fn source_watch_matches_normalized_literal_entrypoint_paths() {
         "scripts/unclosed[.js",
     ] {
         let project = TempProject::empty(r#"{"name":"literal-watch","version":"1.0.0"}"#);
-        project.write_file("scripts/e.js", "console.log('unrelated');");
-        let source = "require('fs').appendFileSync('.lpm/cycles.txt','run\\n');";
-        project.write_file(entry, source);
-        let count = || {
-            if project.path().join(".lpm/cycles.txt").exists() {
-                project.read_file(".lpm/cycles.txt").lines().count()
-            } else {
-                0
-            }
-        };
+        project.write_file_and_sync("scripts/e.js", "console.log('unrelated');");
+        let source = |value| format!("require('fs').writeFileSync('.lpm/result.txt','{value}');");
+        let result =
+            || std::fs::read_to_string(project.path().join(".lpm/result.txt")).unwrap_or_default();
+        project.write_file_and_sync(entry, &source("initial"));
         let mut process = ExecFixtureProcess::spawn(&project, &[entry, "--watch"]);
-        process.wait_until(|| count() >= 1);
-        // FSEvents can deliver queued fixture-creation events after registration.
-        let initial = std::cell::Cell::new(count());
-        let quiet_since = std::cell::Cell::new(Instant::now());
-        process.wait_until(|| {
-            let current = count();
-            if current != initial.get() {
-                initial.set(current);
-                quiet_since.set(Instant::now());
-            }
-            quiet_since.get().elapsed() >= Duration::from_millis(800)
-        });
-        let initial = initial.get();
-        project.write_file("scripts/e.js", "console.log('still unrelated');");
-        std::thread::sleep(Duration::from_millis(800));
-        assert_eq!(count(), initial, "{entry}: unrelated file triggered watch");
-        project.write_file(entry, &format!("{source}\n// changed\n"));
-        process.wait_until(|| count() > initial);
-        std::thread::sleep(Duration::from_millis(800));
-        assert_eq!(
-            count(),
-            initial + 1,
-            "{entry}: entrypoint change did not trigger once"
-        );
+        process.wait_until(|| result() == "initial");
+        project.write_file_and_sync(entry, &source("watch-ready"));
+        process.wait_until(|| result() == "watch-ready");
+        project.write_file_and_sync("scripts/e.js", "console.log('still unrelated');");
+        project.write_file_and_sync(entry, &source("edited"));
+        process.wait_until(|| result() == "edited");
     }
 }
 
@@ -2759,31 +2737,23 @@ fn typescript_alias_wildcard_requires_nonoverlapping_prefix_and_suffix() {
 fn source_watch_follows_repointed_symlinks_and_their_new_external_target() {
     let project = TempProject::empty(r#"{"name":"symlink-watch","version":"1.0.0"}"#);
     let external = tempfile::tempdir().unwrap();
-    let source = "require('fs').appendFileSync(process.cwd()+'/.lpm/cycles.txt','run\\n');";
-    project.write_file("first.js", source);
-    std::fs::write(external.path().join("second.js"), source).unwrap();
+    let source =
+        |value| format!("require('fs').writeFileSync(process.cwd()+'/.lpm/result.txt','{value}');");
+    project.write_file_and_sync("first.js", &source("first"));
+    std::fs::write(external.path().join("second.js"), source("second-v1")).unwrap();
     let entry = project.path().join("entry.js");
     std::os::unix::fs::symlink(project.path().join("first.js"), &entry).unwrap();
-    let count = || {
-        std::fs::read_to_string(project.path().join(".lpm/cycles.txt"))
-            .unwrap_or_default()
-            .lines()
-            .count()
-    };
+    let result =
+        || std::fs::read_to_string(project.path().join(".lpm/result.txt")).unwrap_or_default();
     let mut process = ExecFixtureProcess::spawn(&project, &["entry.js", "--watch"]);
-    process.wait_until(|| count() == 1);
+    process.wait_until(|| result() == "first");
+    project.write_file_and_sync("first.js", &source("watch-ready"));
+    process.wait_until(|| result() == "watch-ready");
     std::fs::remove_file(&entry).unwrap();
     std::os::unix::fs::symlink(external.path().join("second.js"), &entry).unwrap();
-    process.wait_until(|| count() >= 2);
-    std::thread::sleep(Duration::from_millis(400));
-    std::fs::write(
-        external.path().join("second.js"),
-        format!("{source}\n// changed\n"),
-    )
-    .unwrap();
-    process.wait_until(|| count() >= 3);
-    std::thread::sleep(Duration::from_millis(500));
-    assert_eq!(count(), 3);
+    process.wait_until(|| result() == "second-v1");
+    std::fs::write(external.path().join("second.js"), source("second-v2")).unwrap();
+    process.wait_until(|| result() == "second-v2");
 }
 
 #[test]

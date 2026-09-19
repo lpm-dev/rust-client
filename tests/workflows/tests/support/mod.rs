@@ -269,6 +269,17 @@ impl TempProject {
             .unwrap_or_else(|e| panic!("failed to write {}: {e}", path.display()));
     }
 
+    /// Finish a native watch fixture's disk write before awaiting notifications.
+    pub fn write_file_and_sync(&self, rel_path: &str, content: &str) {
+        self.write_file(rel_path, content);
+        let path = self.path().join(rel_path);
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .and_then(|file| file.sync_all())
+            .unwrap_or_else(|error| panic!("failed to sync {}: {error}", path.display()));
+    }
+
     /// Write a credential-bearing file with owner-only permissions on Unix.
     pub fn write_private_file(&self, rel_path: &str, content: &str) {
         let path = self.dir.path().join(rel_path);
