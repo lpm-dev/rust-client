@@ -156,7 +156,7 @@ elliptic-curve = { version = "0.13", features = ["sec1"] }
 ecdsa = { version = "0.16", features = ["signing", "verifying", "der"] }
 
 # Interactive prompts & terminal UI
-cliclack = "0.3"
+cliclack = "0.5"
 # Encrypted PKCS#8 private-key decryption for mTLS.
 # Pure-Rust (RustCrypto), no OpenSSL transitive dependency.
 # Features: pkcs5 + encryption for the EncryptedPrivateKeyInfo API,
