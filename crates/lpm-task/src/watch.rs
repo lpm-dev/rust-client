@@ -1,5 +1,7 @@
 //! Debounced file watching for finite task runs.
 
+mod reconcile;
+
 use globset::{Glob, GlobBuilder, GlobSet, GlobSetBuilder};
 use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use std::collections::HashSet;
@@ -15,6 +17,8 @@ pub struct WatchFilter {
     root: PathBuf,
     inputs: GlobSet,
     outputs: GlobSet,
+    output_trees: GlobSet,
+    input_prefixes: Vec<PathBuf>,
     all_inputs: bool,
     config_files: bool,
     literal_files: Vec<PathBuf>,
@@ -24,14 +28,27 @@ impl WatchFilter {
     /// Compile globs once, including output directory roots.
     pub fn new(root: &Path, inputs: &[String], outputs: &[String]) -> Result<Self, String> {
         let mut input_builder = GlobSetBuilder::new();
+        let mut input_prefixes = Vec::with_capacity(inputs.len());
         for pattern in inputs {
-            input_builder.add(compile_watch_glob(&normalize_watch_glob(pattern))?);
+            let pattern = normalize_watch_glob(pattern);
+            input_builder.add(compile_watch_glob(&pattern)?);
+            input_prefixes.push(
+                pattern
+                    .split('/')
+                    .take_while(|part| !part.contains(['*', '?', '[']))
+                    .collect(),
+            );
         }
         let mut output_builder = GlobSetBuilder::new();
+        let mut output_trees = GlobSetBuilder::new();
         for pattern in outputs {
             let pattern = normalize_watch_glob(pattern);
             output_builder.add(compile_watch_glob(&pattern)?);
+            if pattern == "**" {
+                output_trees.add(compile_watch_glob("")?);
+            }
             if pattern.ends_with("/**") {
+                output_trees.add(compile_watch_glob(pattern.trim_end_matches("/**"))?);
                 output_builder.add(compile_watch_glob(pattern.trim_end_matches("/**"))?);
             }
         }
@@ -39,6 +56,8 @@ impl WatchFilter {
             root: std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf()),
             inputs: input_builder.build().map_err(|error| error.to_string())?,
             outputs: output_builder.build().map_err(|error| error.to_string())?,
+            output_trees: output_trees.build().map_err(|error| error.to_string())?,
+            input_prefixes,
             all_inputs: inputs.is_empty(),
             config_files: false,
             literal_files: Vec::new(),
@@ -328,7 +347,7 @@ pub fn watch_and_run_until(
     should_stop: impl Fn() -> bool,
 ) -> Result<(), String> {
     let watch_dir = std::fs::canonicalize(watch_dir).map_err(|error| error.to_string())?;
-    let (notifications, receiver) = WatchNotifications::new(filter);
+    let (notifications, receiver) = WatchNotifications::new(filter.clone());
     let state = notifications.state.clone();
     let mut watcher: RecommendedWatcher =
         notify::recommended_watcher(move |event| notifications.submit(event))
@@ -336,7 +355,13 @@ pub fn watch_and_run_until(
     watcher
         .watch(&watch_dir, RecursiveMode::Recursive)
         .map_err(|error| format!("failed to watch directory: {error}"))?;
-    run_watch_loop(receiver, on_change, state, should_stop)
+    run_watch_loop(
+        receiver,
+        on_change,
+        state,
+        cfg!(target_os = "macos").then_some(filter),
+        should_stop,
+    )
 }
 
 /// Watch a literal entrypoint and refresh its symlink targets before each run.
@@ -350,6 +375,7 @@ pub fn watch_file_and_run(
     let (notifications, receiver) = WatchNotifications::new(filter.clone());
     let state = notifications.state.clone();
     let errors = state.clone();
+    let recovery_filter = filter.clone();
     let mut watcher: RecommendedWatcher =
         notify::recommended_watcher(move |event| notifications.submit(event))
             .map_err(|error| format!("failed to create file watcher: {error}"))?;
@@ -369,6 +395,7 @@ pub fn watch_file_and_run(
             on_change();
         }),
         state,
+        cfg!(target_os = "macos").then_some(recovery_filter),
         should_stop,
     )
 }
@@ -402,9 +429,23 @@ fn run_watch_loop(
     receiver: mpsc::Receiver<()>,
     mut on_change: OnChange,
     state: WatchState,
+    recovery: Option<WatchFilterHandle>,
     should_stop: impl Fn() -> bool,
 ) -> Result<(), String> {
+    let stopped = std::cell::Cell::new(false);
+    let should_stop = || {
+        let stop = stopped.get() || should_stop();
+        stopped.set(stop);
+        stop
+    };
     state.start_initial_run()?;
+    if should_stop() {
+        return Ok(());
+    }
+    let mut recovery = recovery.map(reconcile::Recovery::new);
+    if let Some(recovery) = &mut recovery {
+        recovery.before_run(&should_stop);
+    }
     if should_stop() {
         return Ok(());
     }
@@ -413,8 +454,23 @@ fn run_watch_loop(
         if should_stop() {
             return Ok(());
         }
+        if let Some(recovery) = &mut recovery
+            && recovery.poll(&should_stop)
+        {
+            state
+                .0
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .last_relevant = Some(Instant::now());
+        }
         // Clear only immediately before execution, preserving edits made while a task runs.
         if state.take_ready(Instant::now())? {
+            if let Some(recovery) = &mut recovery {
+                recovery.before_run(&should_stop);
+            }
+            if should_stop() {
+                return Ok(());
+            }
             on_change();
             continue;
         }
@@ -678,6 +734,48 @@ mod tests {
     }
 
     #[test]
+    fn missed_native_notifications_still_run_changed_inputs() {
+        let directory = tempfile::tempdir().unwrap();
+        let input = directory.path().join("input.txt");
+        std::fs::write(&input, "initial").unwrap();
+        let filter = WatchFilterHandle::new(
+            WatchFilter::new(directory.path(), &["input.txt".into()], &[]).unwrap(),
+        );
+        let (notifications, receiver) = WatchNotifications::new(filter.clone());
+        let state = notifications.state.clone();
+        let (shutdown_tx, shutdown_rx) = mpsc::channel();
+        let (ran_tx, ran_rx) = mpsc::channel();
+        let watched_input = input.clone();
+        let watcher = std::thread::spawn(move || {
+            run_watch_loop(
+                receiver,
+                Box::new(move || {
+                    ran_tx
+                        .send(std::fs::read_to_string(&watched_input).unwrap())
+                        .unwrap();
+                }),
+                state,
+                Some(filter),
+                || shutdown_rx.try_recv().is_ok(),
+            )
+        });
+        assert_eq!(
+            ran_rx.recv_timeout(Duration::from_secs(3)).unwrap(),
+            "initial"
+        );
+        std::fs::write(&input, "changed").unwrap();
+        let changed = ran_rx.recv_timeout(Duration::from_secs(3));
+        let _ = shutdown_tx.send(());
+        watcher.join().unwrap().unwrap();
+        drop(notifications);
+        assert_eq!(
+            changed.as_deref(),
+            Ok("changed"),
+            "an edit with no native callback was lost"
+        );
+    }
+
+    #[test]
     fn startup_changes_are_retained_for_a_followup_cycle() {
         let filter =
             WatchFilterHandle::new(WatchFilter::new(Path::new("/project"), &[], &[]).unwrap());
@@ -695,6 +793,7 @@ mod tests {
                     let _ = ran_tx.send(());
                 }),
                 notifications.state,
+                None,
                 || shutdown_rx.try_recv().is_ok(),
             )
         });
@@ -742,6 +841,7 @@ mod tests {
                     let _ = ran_tx.send(());
                 }),
                 state,
+                None,
                 || shutdown_rx.try_recv().is_ok(),
             )
         });
