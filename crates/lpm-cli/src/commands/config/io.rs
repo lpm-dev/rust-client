@@ -453,12 +453,11 @@ fn redact_command_arguments(mut values: Vec<serde_json::Value>) -> Vec<serde_jso
             redact_next = false;
             continue;
         }
-        if let Some((flag, _)) = argument.split_once('=')
-            && config_key_is_sensitive(flag)
-        {
-            *value = serde_json::Value::String(format!("{flag}=[REDACTED]"));
-        } else if config_key_is_sensitive(argument.trim_start_matches('-')) {
-            redact_next = true;
+        // Classify complete URLs and headers before splitting assignments: their
+        // credentials can contain '=' and must not survive as part of a flag name.
+        let redacted_url = redact_url_credentials(argument.to_string());
+        if redacted_url != argument {
+            *value = serde_json::Value::String(redacted_url);
         } else if argument
             .split_once(':')
             .is_some_and(|(header, _)| config_key_is_sensitive(header))
@@ -467,11 +466,19 @@ fn redact_command_arguments(mut values: Vec<serde_json::Value>) -> Vec<serde_jso
                 "{}: [REDACTED]",
                 argument.split_once(':').expect("header was present").0
             ));
-        } else {
-            let redacted = redact_url_credentials(argument.to_string());
-            if redacted != argument {
-                *value = serde_json::Value::String(redacted);
+        } else if let Some((flag, assigned)) = argument.split_once('=') {
+            if config_key_is_sensitive(flag) {
+                *value = serde_json::Value::String(format!("{flag}=[REDACTED]"));
+            } else {
+                let redacted = redact_url_credentials(assigned.to_string());
+                if redacted != assigned {
+                    *value = serde_json::Value::String(format!("{flag}={redacted}"));
+                }
             }
+        } else if argument.starts_with('-')
+            && config_key_is_sensitive(argument.trim_start_matches('-'))
+        {
+            redact_next = true;
         }
     }
     values
@@ -625,6 +632,51 @@ pub(super) fn guard_generic_delete_against_force_floor(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn command_redaction_handles_url_values_in_flag_assignments() {
+        assert_eq!(
+            super::redact_config_json_value(
+                "command",
+                serde_json::json!([
+                    "fixture",
+                    "--endpoint=https://user:password@example.com/?token=credential"
+                ])
+            )[1],
+            "--endpoint=https://REDACTED:REDACTED@example.com/?token=REDACTED"
+        );
+    }
+
+    #[test]
+    fn command_redaction_hides_complete_authorization_headers_with_padding() {
+        assert_eq!(
+            super::redact_config_json_value(
+                "command",
+                serde_json::json!(["fixture", "--header", "Authorization: Basic credential=="])
+            )[2],
+            "Authorization: [REDACTED]"
+        );
+    }
+
+    #[test]
+    fn command_redaction_handles_credential_urls_before_flag_detection() {
+        let value = super::redact_config_json_value(
+            "policy.extensions.fixture.command",
+            serde_json::json!([
+                "/usr/bin/fixture",
+                "--endpoint",
+                "https://fixture-user:fixture-password@example.com/feed?token=fixture-token",
+                "--mode",
+                "report"
+            ]),
+        );
+        assert_eq!(
+            value[2],
+            "https://REDACTED:REDACTED@example.com/feed?token=REDACTED"
+        );
+        assert_eq!(value[3], "--mode");
+        assert_eq!(value[4], "report");
+    }
+
     use super::*;
 
     #[test]
