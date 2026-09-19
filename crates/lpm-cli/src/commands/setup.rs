@@ -109,7 +109,10 @@ async fn resolve_lpm_bearer(
     Ok(ResolvedSetupBearer {
         token,
         storage,
-        uses_env_var: source == Some(lpm_auth::TokenSource::EnvVar),
+        uses_env_var: matches!(
+            source,
+            Some(lpm_auth::TokenSource::EnvVar | lpm_auth::TokenSource::CiToken)
+        ),
     })
 }
 
@@ -247,11 +250,7 @@ pub async fn run(
             );
             let pending_content =
                 replace_generated_block(&existing, &pending_generated, registry.auth_scope());
-            lpm_common::write_file_atomic_with_options(
-                &npmrc_path,
-                &pending_content,
-                lpm_common::AtomicWriteOptions::new().unix_mode(0o600),
-            )?;
+            super::npmrc::write_npmrc_if_unchanged(&npmrc_path, &existing, &pending_content)?;
             pending_content
         };
         if let Err(revocation) =
@@ -283,11 +282,10 @@ pub async fn run(
     let source_content = staged_content.as_deref().unwrap_or(&existing);
     let npmrc_content =
         replace_generated_block(source_content, &clean_generated, registry.auth_scope());
-    lpm_common::write_file_atomic_with_options(
-        &npmrc_path,
-        &npmrc_content,
-        lpm_common::AtomicWriteOptions::new().unix_mode(0o600),
-    )?;
+    super::npmrc::write_npmrc_if_unchanged(&npmrc_path, source_content, &npmrc_content)
+        .map_err(|error| LpmError::Script(format!(
+            "{error}; if token retirement completed, the protected file retains recovery state. Rerun `lpm setup ci npmrc` with the same registry"
+        )))?;
 
     if json_output {
         let safe_content = format!(
@@ -299,7 +297,8 @@ pub async fn run(
             "path": npmrc_path.display().to_string(),
             "content": safe_content,
             "uses_env_var": token.uses_env_var,
-            "oidc": use_oidc,
+            "oidc": use_oidc && pending_retirement.is_none(),
+            "recovered": pending_retirement.is_some(),
             "proxy": false,
             "storage_backend": storage_status.backend_json_value(),
             "storage_degraded": storage_status.degraded,
@@ -312,7 +311,9 @@ pub async fn run(
         install_ui::done("Generated .npmrc");
         hint_line(&npmrc_path.display().to_string());
 
-        if use_oidc {
+        if pending_retirement.is_some() {
+            install_ui::phase("Completed pending token retirement using the staged replacement.");
+        } else if use_oidc {
             install_ui::phase("Using OIDC-exchanged token.");
         }
         install_ui::phase(
@@ -379,30 +380,32 @@ fn is_generated_header(line: &str) -> bool {
     line == GENERATED_HEADER || line == LOCAL_GENERATED_HEADER
 }
 
-pub(crate) fn run_ci_platform(platform: CiWorkflowTarget, project_dir: &Path, env_mode: &str) {
-    match platform {
-        CiWorkflowTarget::GithubActions => setup_github_actions(project_dir, env_mode),
-        CiWorkflowTarget::Gitlab => setup_gitlab_ci(env_mode),
-    }
-}
-
-fn setup_github_actions(project_dir: &Path, env_mode: &str) {
-    let vault_id = lpm_vault::vault_id::read_vault_id(project_dir)
-        .unwrap_or_else(|| "<your-vault-id>".to_string());
-    let env_mode = install_ui::field(env_mode);
-    let vault_id = install_ui::field(&vault_id);
-
-    println!();
-    println!("  {} GitHub Actions OIDC Setup", "▸".bold());
-    println!();
-    println!(
-        "  {} Add this to your workflow (.github/workflows/deploy.yml):",
-        "1.".bold()
-    );
-    println!();
-    println!(
-        "  {}",
-        "jobs:
+pub(crate) fn run_ci_platform(
+    platform: CiWorkflowTarget,
+    project_dir: &Path,
+    env_mode: &str,
+    json_output: bool,
+) -> Result<(), LpmError> {
+    lpm_env::resolver::validate_env_name(env_mode).map_err(LpmError::Script)?;
+    let (title, workflow_path, workflow, authorization_command, policy_instruction) = match platform
+    {
+        CiWorkflowTarget::GithubActions => {
+            let manifest = lpm_vault::vault_id::VaultManifestSnapshot::read(project_dir)
+                .map_err(LpmError::Script)?;
+            let vault_id = manifest
+                .vault_id()
+                .map_err(LpmError::Script)?
+                .unwrap_or("<your-vault-id>");
+            if vault_id.contains("${{") {
+                return Err(LpmError::Script(
+                    "lpm.json vault ID cannot contain a GitHub expression".into(),
+                ));
+            }
+            let vault_yaml = serde_json::to_string(vault_id)?;
+            (
+                "GitHub Actions OIDC Setup",
+                ".github/workflows/deploy.yml",
+                "jobs:
     deploy:
       runs-on: ubuntu-latest
       permissions:
@@ -419,68 +422,54 @@ fn setup_github_actions(project_dir: &Path, env_mode: &str) {
             LPM_OIDC_POLICY_ID: ${{ vars.LPM_OIDC_POLICY_ID }}
         - name: Deploy
           run: lpm run deploy"
-            .replace("{ENV}", env_mode.as_ref())
-            .replace("{VAULT_ID}", vault_id.as_ref())
-            .dimmed()
-    );
-    println!();
-    println!("  {} Authorize this repo:", "2.".bold());
-    println!();
-    println!(
-        "  {}",
-        format!(
-            "lpm env oidc allow --provider=github --repo=<owner/repo> \
+                    .replace("{ENV}", env_mode)
+                    .replace("{VAULT_ID}", &vault_yaml),
+                format!(
+                    "lpm env oidc allow --provider=github --repo=<owner/repo> \
              --workflow=.github/workflows/deploy.yml --branch=main --env={env_mode}"
-        )
-        .bold()
-    );
-    println!();
-    println!(
-        "  {} Store the policy ID returned by `lpm env oidc allow` as the {} repository variable.",
-        "3.".bold(),
-        "LPM_OIDC_POLICY_ID".bold(),
-    );
-    println!();
-}
-
-fn setup_gitlab_ci(env_mode: &str) {
-    let env_mode = install_ui::field(env_mode);
-
-    println!();
-    println!("  {} GitLab CI OIDC Setup", "▸".bold());
-    println!();
-    println!("  {} Add this to .gitlab-ci.yml:", "1.".bold());
-    println!();
-    println!(
-        "  {}",
-        "deploy:
+                ),
+                "Store the policy ID returned by `lpm env oidc allow` as the LPM_OIDC_POLICY_ID repository variable.",
+            )
+        }
+        CiWorkflowTarget::Gitlab => (
+            "GitLab CI OIDC Setup",
+            ".gitlab-ci.yml",
+            format!(
+                "deploy:
   id_tokens:
     LPM_OIDC_TOKEN:
       aud: https://lpm.dev
   script:
     - npm install -g @lpm-registry/cli
-    - lpm env pull --oidc --env={ENV} --output=.env
+    - lpm env pull --oidc --env={env_mode} --output=.env
     - lpm run deploy"
-            .replace("{ENV}", env_mode.as_ref())
-            .dimmed()
-    );
-    println!();
-    println!("  {} Authorize this project:", "2.".bold());
-    println!();
-    println!(
-        "  {}",
-        format!(
-            "lpm env oidc allow --provider=gitlab --project-id=<numeric-project-id> --branch=main --env={env_mode}"
-        )
-        .bold()
-    );
-    println!();
-    println!(
-        "  {} Store the policy ID returned by `lpm env oidc allow` as an {} CI/CD variable. Mark it protected only when every allowed ref is protected.",
-        "3.".bold(),
-        "LPM_OIDC_POLICY_ID".bold(),
-    );
-    println!();
+            ),
+            format!(
+                "lpm env oidc allow --provider=gitlab --project-id=<numeric-project-id> --branch=main --env={env_mode}"
+            ),
+            "Store the policy ID returned by `lpm env oidc allow` as an LPM_OIDC_POLICY_ID CI/CD variable. Mark it protected only when every allowed ref is protected.",
+        ),
+    };
+    if json_output {
+        let json = serde_json::json!({
+            "success": true,
+            "platform": platform.canonical_name(),
+            "environment": env_mode,
+            "workflow_path": workflow_path,
+            "workflow": workflow,
+            "authorization_command": authorization_command,
+            "policy_instruction": policy_instruction,
+        });
+        println!("{}", serde_json::to_string_pretty(&json)?);
+    } else {
+        println!("\n  {} {title}\n", "▸".bold());
+        println!("  {} Add this to {workflow_path}:\n", "1.".bold());
+        println!("{}\n", workflow.dimmed());
+        println!("  {} Authorize this project:\n", "2.".bold());
+        println!("  {}\n", authorization_command.bold());
+        println!("  {} {policy_instruction}\n", "3.".bold());
+    }
+    Ok(())
 }
 
 #[cfg(test)]

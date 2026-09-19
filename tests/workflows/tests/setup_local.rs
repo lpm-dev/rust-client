@@ -952,3 +952,56 @@ async fn setup_local_color_output_dims_expiry_label_and_highlights_lifetime() {
         "setup local should dim the expiry label, highlight the lifetime, and keep .npmrc plain, got:\n{stderr:?}",
     );
 }
+
+#[tokio::test]
+async fn setup_local_does_not_overwrite_npmrc_edits_during_replacement() {
+    let project = TempProject::empty(r#"{"name":"setup-concurrent"}"#);
+    let mock = MockRegistry::start().await;
+    let npmrc_path = project.path().join(".npmrc");
+    Mock::given(method("POST"))
+        .and(path("/api/registry/-/token/replace-project"))
+        .respond_with(move |request: &wiremock::Request| {
+            let mut content = std::fs::read_to_string(&npmrc_path).unwrap();
+            content.push_str("fund=false\n");
+            std::fs::write(&npmrc_path, content).unwrap();
+            let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "tokenId": body["tokenId"], "scope":"read", "expiresAt":"2030-01-02T03:04:05Z"
+            }))
+        })
+        .expect(1)
+        .mount(mock.server())
+        .await;
+    let output = lpm_with_registry(&project, &mock.url())
+        .args(["setup", "local"])
+        .output()
+        .unwrap();
+    assert!(
+        !output.status.success(),
+        "concurrent edits must stop finalization"
+    );
+    assert!(project.read_file(".npmrc").contains("fund=false"));
+    assert!(
+        project
+            .read_file(".npmrc")
+            .contains("# LPM pending project token id:")
+    );
+}
+
+#[tokio::test]
+async fn setup_local_rejects_expired_replacement_without_removing_recovery_state() {
+    let project = TempProject::empty(r#"{"name":"setup-expired"}"#);
+    let mock = MockRegistry::start().await;
+    mock.with_npmrc_token_replace(30, "2000-01-01T00:00:00Z", 1)
+        .await;
+    let output = lpm_with_registry(&project, &mock.url())
+        .args(["setup", "local"])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(
+        project
+            .read_file(".npmrc")
+            .contains("# LPM pending project token id:")
+    );
+}

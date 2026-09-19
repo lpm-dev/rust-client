@@ -421,10 +421,11 @@ pub async fn run(
     };
     if replaced.token_id != pending.token_id
         || replaced.scope != "read"
-        || chrono::DateTime::parse_from_rfc3339(&replaced.expires_at).is_err()
+        || !chrono::DateTime::parse_from_rfc3339(&replaced.expires_at)
+            .is_ok_and(|expires| expires > chrono::Utc::now())
     {
         return Err(pending_recovery_error(
-            "invalid project token replacement response: expected the requested read-only token ID and a valid expiry",
+            "invalid project token replacement response: expected the requested read-only token ID and a future expiry",
         ));
     }
     let expires_at = replaced.expires_at;
@@ -436,11 +437,7 @@ pub async fn run(
         pending.token
     );
     let final_content = replace_generated_block(&pending_content, &lpm_config);
-    if let Err(error) = lpm_common::write_file_atomic_with_options(
-        &npmrc_path,
-        &final_content,
-        lpm_common::AtomicWriteOptions::new().unix_mode(0o600),
-    ) {
+    if let Err(error) = write_npmrc_if_unchanged(&npmrc_path, &pending_content, &final_content) {
         return Err(pending_recovery_error(format!(
             "the Registry committed the replacement, but .npmrc could not be finalized: {error}"
         )));
@@ -636,6 +633,33 @@ pub(super) async fn self_revoke_project_token(
         });
     }
     Ok(())
+}
+
+pub(super) fn write_npmrc_if_unchanged(
+    path: &Path,
+    expected: &str,
+    replacement: &str,
+) -> Result<(), LpmError> {
+    let current = match lpm_common::read_text_file_capped_nofollow(
+        path,
+        lpm_common::NPMRC_FILE_SIZE_CAP_BYTES,
+    ) {
+        Ok(current) => current,
+        Err(lpm_common::BoundedReadError::NotFound { .. }) => String::new(),
+        Err(error) => return Err(error.into()),
+    };
+    if current != expected {
+        return Err(LpmError::Script(format!(
+            "{} changed concurrently; refusing to overwrite it",
+            path.display()
+        )));
+    }
+    lpm_common::write_file_atomic_with_options(
+        path,
+        replacement,
+        lpm_common::AtomicWriteOptions::new().unix_mode(0o600),
+    )
+    .map_err(LpmError::Io)
 }
 
 pub(super) fn restore_file_if_unchanged(

@@ -1707,8 +1707,8 @@ async fn async_main() -> Result<()> {
                             &cwd,
                             env.as_deref()
                                 .unwrap_or(commands::setup::DEFAULT_CI_ENVIRONMENT),
-                        );
-                        Ok(())
+                            cli.json,
+                        )
                     }
                 }
             }
