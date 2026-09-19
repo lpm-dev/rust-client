@@ -237,6 +237,13 @@ async fn async_main() -> Result<()> {
         exit_with_lpm_error(&error, cli.json);
     }
 
+    if let Commands::Completions(args) = &command {
+        if let Err(error) = commands::completions::run(args.shell) {
+            exit_with_lpm_error(&error, cli.json);
+        }
+        return Ok(());
+    }
+
     let privileged_helper_result = match &command {
         Commands::InternalHostsFile(args) => Some(commands::hosts::run_internal_hosts_file(
             &args.action,
@@ -3170,13 +3177,7 @@ async fn async_main() -> Result<()> {
         Commands::SelfUpdate(args) => {
             commands::self_update::run(cli.json, args.refresh, args.channel).await
         }
-        Commands::Completions(args) => {
-            let build_args::CompletionsArgs {
-                shell,
-            } = args;
-            commands::completions::run(shell);
-            Ok(())
-        }
+        Commands::Completions(_) => unreachable!("completions returned before startup"),
         Commands::Schema(args) => commands::schema::run(&args.kind, args.out.as_deref()),
         Commands::InternalUpdateCheck => {
             // hidden subcommand — unconditionally refresh the
