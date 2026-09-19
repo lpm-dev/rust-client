@@ -422,6 +422,19 @@ fn confirm_persistent_weakening(
     command_hint: &str,
     message: &str,
 ) -> Result<(), LpmError> {
+    if let Some(grant) = super::unlocks::find_active_global_unlock(ApprovalScope::FloorEdit, &[])? {
+        record_audit_event(
+            AuditRecord::new(
+                "persistent-guarded-attempt",
+                true,
+                vec![scope.as_str().to_string()],
+            )
+            .source(ApprovalSource::ConfigMutation)
+            .unlock_id(grant.id)
+            .detail(message),
+        );
+        return Ok(());
+    }
     if is_automation(json_output) {
         record_persistent_guarded_attempt(scope, false, message);
         return Err(approval_required_error(

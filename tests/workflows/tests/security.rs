@@ -514,3 +514,247 @@ fn security_lock_rejects_empty_package_filter() {
         "unexpected error: {error}"
     );
 }
+
+#[test]
+fn disabling_firewall_preserves_managed_source_analysis() {
+    let project = TempProject::empty(r#"{"name":"managed-source","version":"1.0.0"}"#);
+    let path = project.home().join(".lpm/security-policy.toml");
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(
+        &path,
+        "install-time-source-analysis = true\n[firewall]\nmode = \"enforce\"\n",
+    )
+    .unwrap();
+    let output = lpm(&project)
+        .args(["security", "protect", "disable", "--json"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    assert!(
+        path.exists(),
+        "firewall removal deleted source-analysis protection"
+    );
+    let saved: toml::Value = toml::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+    assert_eq!(saved["install-time-source-analysis"].as_bool(), Some(true));
+    assert!(saved.get("firewall").is_none());
+}
+
+#[test]
+fn managed_security_sections_reject_scalar_and_array_shapes() {
+    for section in ["sandbox", "sigstore"] {
+        for value in ["\"strict\"", "[]", "false"] {
+            let project = TempProject::empty(r#"{"name":"managed-shape","version":"1.0.0"}"#);
+            let path = project.home().join(".lpm/security-policy.toml");
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, format!("{section} = {value}\n")).unwrap();
+            let output = lpm(&project)
+                .args(["security", "status", "--json"])
+                .output()
+                .unwrap();
+            assert!(
+                !output.status.success(),
+                "accepted {section}={value}: {}",
+                String::from_utf8_lossy(&output.stdout)
+            );
+            assert!(
+                json_output(&output, "security status")["error"]
+                    .as_str()
+                    .unwrap()
+                    .contains(section)
+            );
+        }
+    }
+}
+
+#[test]
+fn managed_firewall_status_distinguishes_off_from_active_protection() {
+    for (mode, active) in [("off", false), ("monitor", true), ("enforce", true)] {
+        let project = TempProject::empty(r#"{"name":"managed-status","version":"1.0.0"}"#);
+        let path = project.home().join(".lpm/security-policy.toml");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, format!("[firewall]\nmode = \"{mode}\"\n")).unwrap();
+        let output = lpm(&project)
+            .args(["security", "protect", "status", "--json"])
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        assert_eq!(
+            json_output(&output, "security protect")["protect"]["active"],
+            active,
+            "mode={mode}"
+        );
+    }
+}
+
+#[test]
+fn concurrent_scope_revocations_share_one_transaction_lock() {
+    let project = TempProject::empty(r#"{"name":"scope-lock","version":"1.0.0"}"#);
+    support::write_signed_unlock(&project, &["scripts-allow", "sandbox-none"]);
+    let path = project.home().join(".lpm/security/unlocks.lock");
+    let lock = lpm_common::acquire_exclusive_lock(&path).unwrap();
+    let mut children = Vec::new();
+    for scope in ["scripts-allow", "sandbox-none"] {
+        let marker = project.home().join(format!("waiting-{scope}"));
+        let mut child = support::lpm_spawnable(&project)
+            .env(support::LOCK_CONTENTION_MARKER_ENV, &marker)
+            .args([
+                "security",
+                "lock",
+                scope,
+                "--project",
+                project.path().to_str().unwrap(),
+                "--json",
+            ])
+            .spawn()
+            .unwrap();
+        support::wait_for_lock_contention(&mut child, &marker, &path);
+        children.push(child);
+    }
+    drop(lock);
+    for child in children {
+        let output = child.wait_with_output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+    }
+    let output = lpm(&project)
+        .args(["security", "status", "--json"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    assert!(
+        json_output(&output, "security status")["status"]
+            .get("active_unlocks")
+            .is_none_or(|value| value.as_array().is_some_and(Vec::is_empty))
+    );
+}
+
+#[test]
+fn security_repair_quarantines_inconsistent_audit_history_and_allows_new_events() {
+    for damage in ["truncated", "empty", "missing", "invalid"] {
+        let project = TempProject::empty(r#"{"name":"repair-audit","version":"1.0.0"}"#);
+        let revoke = || {
+            lpm(&project)
+                .args([
+                    "security",
+                    "lock",
+                    "scripts-allow",
+                    "--project",
+                    project.path().to_str().unwrap(),
+                    "--json",
+                ])
+                .output()
+                .unwrap()
+        };
+        for _ in 0..2 {
+            support::write_signed_unlock(&project, &["scripts-allow"]);
+            assert!(revoke().status.success());
+        }
+        let directory = project.home().join(".lpm/security");
+        let path = directory.join("audit.jsonl");
+        let original = std::fs::read_to_string(&path).unwrap();
+        assert!(original.lines().count() >= 2);
+        match damage {
+            "truncated" => {
+                std::fs::write(&path, format!("{}\n", original.lines().next().unwrap())).unwrap()
+            }
+            "empty" => std::fs::write(&path, "").unwrap(),
+            "missing" => std::fs::remove_file(&path).unwrap(),
+            "invalid" => std::fs::write(&path, "{invalid}\n").unwrap(),
+            _ => unreachable!(),
+        }
+        let output = lpm(&project)
+            .args(["security", "repair", "--json"])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        let json = json_output(&output, "security repair");
+        assert_eq!(
+            json["repair"]["quarantined"].as_array().unwrap().len(),
+            if damage == "missing" { 1 } else { 2 },
+            "{damage}: {json}"
+        );
+        for entry in json["repair"]["quarantined"].as_array().unwrap() {
+            assert!(Path::new(entry["quarantine_path"].as_str().unwrap()).exists());
+        }
+        support::write_signed_unlock(&project, &["scripts-allow"]);
+        assert!(revoke().status.success());
+        let head: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(directory.join("audit-head.json")).unwrap())
+                .unwrap();
+        assert_eq!(
+            head["payload"]["entry_count"], 1,
+            "new audit event must be recorded after {damage} repair"
+        );
+    }
+}
+
+fn rewrite_fixture_unlock(project: &TempProject, edit: impl FnOnce(&mut serde_json::Value)) {
+    use hmac::Mac;
+    let path = std::fs::read_dir(project.home().join(".lpm/security/unlocks"))
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    let mut envelope: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    edit(&mut envelope["payload"]);
+    let mut mac = hmac::Hmac::<sha2::Sha256>::new_from_slice(&[42u8; 32]).unwrap();
+    mac.update(&serde_json::to_vec(&envelope["payload"]).unwrap());
+    envelope["signature"] = serde_json::json!(hex::encode(mac.finalize().into_bytes()));
+    std::fs::write(path, serde_json::to_vec(&envelope).unwrap()).unwrap();
+}
+
+#[test]
+fn only_active_global_floor_edit_grants_authorize_persistent_weakening() {
+    for scenario in ["global", "project", "expired", "managed", "forced"] {
+        let project = TempProject::empty(r#"{"name":"floor-edit","version":"1.0.0"}"#);
+        support::write_signed_unlock(&project, &["floor-edit"]);
+        if scenario != "project" {
+            rewrite_fixture_unlock(&project, |payload| {
+                payload["target"] = serde_json::json!("global");
+                payload["project_root"] = serde_json::Value::Null;
+                if scenario == "expired" {
+                    payload["expires_at"] = serde_json::json!(
+                        (chrono::Utc::now() - chrono::Duration::minutes(1)).to_rfc3339()
+                    );
+                }
+            });
+        }
+        if scenario == "managed" {
+            std::fs::write(
+                project.home().join(".lpm/security-policy.toml"),
+                "script-policy = \"deny\"\n",
+            )
+            .unwrap();
+        }
+        if scenario == "forced" {
+            std::fs::write(
+                project.home().join(".lpm/config.toml"),
+                "force-security-floor = true\nscript-policy = \"deny\"\n",
+            )
+            .unwrap();
+        }
+        let output = lpm(&project)
+            .args(["config", "scripts", "--set", "allow", "--json"])
+            .output()
+            .unwrap();
+        assert_eq!(
+            output.status.success(),
+            scenario == "global",
+            "{scenario}: {}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+    }
+}

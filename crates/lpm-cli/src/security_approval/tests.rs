@@ -840,10 +840,10 @@ fn windows_hello_availability_uses_native_prompt_when_available() {
 }
 
 #[test]
-fn windows_hello_availability_falls_back_when_pin_is_not_configured() {
+fn windows_hello_availability_fails_closed_when_pin_is_not_configured() {
     assert_eq!(
         super::native_auth::windows_hello_availability_action(2),
-        super::native_auth::WindowsHelloAvailabilityAction::TerminalFallback(
+        super::native_auth::WindowsHelloAvailabilityAction::FailClosed(
             "Windows Hello or PIN is not configured for this user"
         )
     );
@@ -1603,4 +1603,18 @@ fn audit_log_appends_after_legacy_signed_entries() {
         let content = std::fs::read_to_string(&log_path).unwrap();
         assert!(content.contains(&legacy_hash));
     });
+}
+
+#[test]
+fn unavailable_windows_hello_never_approves_through_terminal_confirmation() {
+    for code in [1, 2] {
+        assert!(matches!(
+            super::native_auth::windows_hello_availability_action(code),
+            super::native_auth::WindowsHelloAvailabilityAction::FailClosed(_)
+        ));
+        assert!(matches!(
+            super::native_auth::windows_hello_verification_action(code),
+            super::native_auth::WindowsHelloVerificationAction::FailClosed(_)
+        ));
+    }
 }

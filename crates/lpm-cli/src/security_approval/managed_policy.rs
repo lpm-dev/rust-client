@@ -39,7 +39,7 @@ fn managed_protection_status(
         .map(|mode| mode.as_str().to_string());
     ManagedProtectionStatus {
         path: path.display().to_string(),
-        active: firewall_mode.is_some(),
+        active: firewall_mode.as_deref().is_some_and(|mode| mode != "off"),
         firewall_mode,
         managed_policy: policy.map(|policy| policy.status),
     }
@@ -230,7 +230,8 @@ fn policy_value_has_enforced_controls(value: &toml::Value) -> bool {
     let Some(table) = value.as_table() else {
         return false;
     };
-    table.contains_key("script-policy")
+    table.contains_key(crate::source_analysis_config::INSTALL_TIME_SOURCE_ANALYSIS_KEY)
+        || table.contains_key("script-policy")
         || table.contains_key("minimum-release-age-secs")
         || table.contains_key(crate::release_age_config::GLOBAL_POLICY_KEY)
         || table.contains_key(crate::commands::config::TYPOSQUAT_GUARD_KEY)
@@ -500,15 +501,6 @@ fn validate_windows_admin_owned_path(path: &Path, expect_dir: bool) -> Result<()
     use windows_sys::Win32::System::SystemServices::ACCESS_ALLOWED_ACE_TYPE;
 
     const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
-    const WRITE_MASK: u32 = 0x1000_0000 // GENERIC_ALL
-        | 0x4000_0000 // GENERIC_WRITE
-        | 0x0001_0000 // DELETE
-        | 0x0004_0000 // WRITE_DAC
-        | 0x0008_0000 // WRITE_OWNER
-        | 0x0000_0002 // FILE_WRITE_DATA / FILE_ADD_FILE
-        | 0x0000_0004 // FILE_APPEND_DATA / FILE_ADD_SUBDIRECTORY
-        | 0x0000_0010 // FILE_WRITE_EA
-        | 0x0000_0100; // FILE_WRITE_ATTRIBUTES
 
     struct LocalAlloc(*mut c_void);
     impl Drop for LocalAlloc {
@@ -657,7 +649,7 @@ fn validate_windows_admin_owned_path(path: &Path, expect_dir: bool) -> Result<()
             continue;
         }
         let allowed = unsafe { &*(ace.cast::<ACCESS_ALLOWED_ACE>()) };
-        if allowed.Mask & WRITE_MASK == 0 {
+        if !windows_policy_access_can_modify(allowed.Mask) {
             continue;
         }
         let sid = std::ptr::addr_of!(allowed.SidStart).cast::<c_void>() as PSID;
@@ -804,7 +796,14 @@ pub(super) fn load_managed_policy() -> Result<Option<ManagedPolicy>, LpmError> {
         })
         .transpose()?;
 
-    let sandbox = table.get("sandbox").and_then(|value| value.as_table());
+    let sandbox = table
+        .get("sandbox")
+        .map(|value| {
+            value
+                .as_table()
+                .ok_or_else(|| managed_policy_error(&path, "must set `[sandbox]` to a TOML table"))
+        })
+        .transpose()?;
     let sandbox_mode = sandbox
         .and_then(|tbl| tbl.get("mode"))
         .map(|value| {
@@ -828,7 +827,14 @@ pub(super) fn load_managed_policy() -> Result<Option<ManagedPolicy>, LpmError> {
         })
         .transpose()?;
 
-    let sigstore = table.get("sigstore").and_then(|value| value.as_table());
+    let sigstore = table
+        .get("sigstore")
+        .map(|value| {
+            value
+                .as_table()
+                .ok_or_else(|| managed_policy_error(&path, "must set `[sigstore]` to a TOML table"))
+        })
+        .transpose()?;
     let sigstore_verify = sigstore
         .and_then(|tbl| tbl.get("verify"))
         .map(|value| {
@@ -940,6 +946,21 @@ pub(super) fn load_managed_policy() -> Result<Option<ManagedPolicy>, LpmError> {
     }))
 }
 
+#[cfg(any(test, all(windows, not(debug_assertions))))]
+fn windows_policy_access_can_modify(mask: u32) -> bool {
+    const WRITE_MASK: u32 = 0x1000_0000 // GENERIC_ALL
+        | 0x4000_0000 // GENERIC_WRITE
+        | 0x0001_0000 // DELETE
+        | 0x0004_0000 // WRITE_DAC
+        | 0x0008_0000 // WRITE_OWNER
+        | 0x0000_0002 // FILE_WRITE_DATA / FILE_ADD_FILE
+        | 0x0000_0004 // FILE_APPEND_DATA / FILE_ADD_SUBDIRECTORY
+        | 0x0000_0010 // FILE_WRITE_EA
+        | 0x0000_0040 // FILE_DELETE_CHILD
+        | 0x0000_0100; // FILE_WRITE_ATTRIBUTES
+    mask & WRITE_MASK != 0
+}
+
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
@@ -968,5 +989,14 @@ mod tests {
             canonical_policy_parent(&default_path, &default_path).unwrap(),
             canonical_real_lpm
         );
+    }
+}
+
+#[cfg(test)]
+mod access_tests {
+    #[test]
+    fn policy_parent_child_deletion_is_a_modifying_permission() {
+        assert!(super::windows_policy_access_can_modify(0x40));
+        assert!(!super::windows_policy_access_can_modify(0x1));
     }
 }

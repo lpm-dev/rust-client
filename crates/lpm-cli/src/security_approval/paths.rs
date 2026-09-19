@@ -41,3 +41,7 @@ pub(super) fn signing_secret_path() -> Result<PathBuf, LpmError> {
 pub(super) fn audit_head_path() -> Result<PathBuf, LpmError> {
     Ok(security_dir()?.join("audit-head.json"))
 }
+
+pub(super) fn unlocks_lock_path() -> Result<PathBuf, LpmError> {
+    Ok(security_dir()?.join("unlocks.lock"))
+}

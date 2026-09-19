@@ -158,7 +158,7 @@ fn ensure_supported_package_filters(
 
 #[derive(Debug, Subcommand)]
 pub enum SecurityCmd {
-    /// Temporarily approve one guarded weakening. Defaults to the global target.
+    /// Temporarily approve one guarded weakening. Use --project for project operations.
     Unlock {
         /// Guarded scope to unlock, or `all` / `default`.
         scope: SecurityScopeSelector,
@@ -167,7 +167,7 @@ pub enum SecurityCmd {
         #[arg(long, value_name = "PATH")]
         project: Option<String>,
 
-        /// Create a machine-global unlock.
+        /// Create an unlock for global operations (including machine floor edits).
         #[arg(long)]
         global: bool,
 
