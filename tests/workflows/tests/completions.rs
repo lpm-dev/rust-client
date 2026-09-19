@@ -80,3 +80,69 @@ fn completions_invalid_shell_is_rejected_by_clap() {
         "unknown shell value must be rejected"
     );
 }
+
+#[test]
+fn completions_hide_internal_commands_and_options_in_every_shell() {
+    let project = TempProject::empty(r#"{"name":"public-completions"}"#);
+    for shell in ["bash", "zsh", "fish", "powershell", "elvish"] {
+        let output = lpm(&project).args(["completions", shell]).output().unwrap();
+        assert!(
+            output.status.success(),
+            "{shell}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let script = String::from_utf8_lossy(&output.stdout);
+        for hidden in [
+            "internal-update-check",
+            "internal-hosts-file",
+            "internal-security-policy",
+            "internal-ts-transform",
+            "__run-file",
+            "self-update-probe-executable",
+            "forwarder-config",
+        ] {
+            assert!(!script.contains(hidden), "{shell} exposed {hidden}");
+        }
+        for visible in ["install", "completions", "token-rotate", "setup"] {
+            assert!(script.contains(visible), "{shell} omitted {visible}");
+        }
+    }
+}
+
+#[test]
+fn completions_ignore_registry_policy_and_keep_raw_scripts_under_json() {
+    let project = TempProject::empty(r#"{"name":"offline-completions"}"#);
+    project.write_file("lpm.json", "not JSON");
+    let normal = lpm(&project).args(["completions", "zsh"]).output().unwrap();
+    let output = lpm(&project)
+        .env("LPM_PROVENANCE_ENFORCE", "warm")
+        .args(["completions", "zsh", "--json", "--verbose"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(output.stdout, normal.stdout);
+    assert!(output.stderr.is_empty());
+}
+
+#[test]
+fn completions_exit_cleanly_when_the_pipe_reader_closes() {
+    let project = TempProject::empty(r#"{"name":"closed-completion-pipe"}"#);
+    let mut child = support::lpm_spawnable(&project)
+        .args(["completions", "bash"])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    drop(child.stdout.take());
+    let output = child.wait_with_output().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.stderr.is_empty());
+}
