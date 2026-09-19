@@ -217,6 +217,9 @@ pub(crate) struct ProxyArgs {
     /// Also bind a HTTPS listener on 127.0.0.1:<PORT>. Valid with `start` and `install`.
     #[arg(long = "tls-port")]
     pub(crate) tls_port: Option<u16>,
+    /// External HTTPS port advertised by an installed forwarder.
+    #[arg(long = "public-tls-port", hide = true)]
+    pub(crate) public_tls_port: Option<u16>,
     /// Root-forwarder runtime config path. Internal service entrypoint.
     #[arg(long = "forwarder-config", hide = true)]
     pub(crate) forwarder_config: Option<std::path::PathBuf>,

@@ -20,10 +20,20 @@ pub(super) fn run_install(
     http_redirect_port: Option<u16>,
     tls_port: Option<u16>,
 ) -> Result<(), LpmError> {
-    let requested_options =
+    let mut requested_options =
         resolve_start_options(project_dir, http_port, http_redirect_port, tls_port)?;
     let listener_flags_explicit =
         http_port.is_some() || http_redirect_port.is_some() || tls_port.is_some();
+    if privileged_ports && !listener_flags_explicit {
+        let config = lpm_runner::lpm_json::read_lpm_json(project_dir).map_err(LpmError::Script)?;
+        let redirect = config
+            .as_ref()
+            .and_then(|config| config.proxy.as_ref())
+            .and_then(|proxy| proxy.http_redirect)
+            .unwrap_or(true);
+        requested_options.tls_port = Some(443);
+        requested_options.http_redirect_port = redirect.then_some(80);
+    }
     let plan = ProxyServicePlan::new(
         project_dir,
         requested_options,
@@ -410,12 +420,14 @@ pub(super) fn privileged_external_options(
     if !listener_flags_explicit {
         if requested_options.tls_port.is_none() && requested_options.http_redirect_port.is_none() {
             return Ok(lpm_proxy::ProxyDaemonOptions {
+                public_tls_port: None,
                 http_port: None,
                 http_redirect_port: Some(80),
                 tls_port: Some(443),
             });
         }
         return Ok(lpm_proxy::ProxyDaemonOptions {
+            public_tls_port: None,
             http_port: None,
             http_redirect_port: requested_options.http_redirect_port.map(|_| 80),
             tls_port: requested_options.tls_port.map(|_| 443),
@@ -423,6 +435,7 @@ pub(super) fn privileged_external_options(
     }
     if requested_options.tls_port.is_none() && requested_options.http_redirect_port.is_none() {
         return Ok(lpm_proxy::ProxyDaemonOptions {
+            public_tls_port: None,
             http_port: None,
             http_redirect_port: Some(80),
             tls_port: Some(443),
@@ -473,6 +486,7 @@ fn privileged_backend_options(
         None
     };
     Ok(lpm_proxy::ProxyDaemonOptions {
+        public_tls_port: external_options.tls_port,
         http_port: None,
         http_redirect_port,
         tls_port,

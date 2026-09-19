@@ -3037,6 +3037,7 @@ async fn async_main() -> Result<()> {
                 http_port,
                 http_redirect_port,
                 tls_port,
+                public_tls_port,
                 forwarder_config,
             } = args;
             let project_dir = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
@@ -3050,6 +3051,7 @@ async fn async_main() -> Result<()> {
                 http_port,
                 http_redirect_port,
                 tls_port,
+                public_tls_port,
                 forwarder_config: forwarder_config.as_deref(),
             })
             .await

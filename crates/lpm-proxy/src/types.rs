@@ -63,6 +63,8 @@ pub struct ProxyDaemonState {
     pub http_redirect_addr: Option<String>,
     #[serde(default)]
     pub tls_addr: Option<String>,
+    #[serde(default, rename = "public_tls_addr")]
+    pub public_tls_addr: Option<String>,
     #[serde(default)]
     pub routes: Vec<RouteStatus>,
 }
@@ -75,12 +77,27 @@ pub struct ProxyStatus {
     pub http_addr: Option<String>,
     pub http_redirect_addr: Option<String>,
     pub tls_addr: Option<String>,
+    #[serde(default, rename = "public_tls_addr")]
+    pub public_tls_addr: Option<String>,
     pub routes: Vec<RouteStatus>,
     pub stale: bool,
     pub state_error: Option<String>,
 }
 
 impl ProxyStatus {
+    pub fn https_port(&self) -> Option<u16> {
+        let address = self
+            .public_tls_addr
+            .as_deref()
+            .or(self.tls_addr.as_deref())?;
+        address
+            .strip_prefix("https://")
+            .unwrap_or(address)
+            .parse::<std::net::SocketAddr>()
+            .ok()
+            .map(|address| address.port())
+    }
+
     pub fn not_running() -> Self {
         Self {
             running: false,
@@ -88,6 +105,7 @@ impl ProxyStatus {
             http_addr: None,
             http_redirect_addr: None,
             tls_addr: None,
+            public_tls_addr: None,
             routes: Vec::new(),
             stale: false,
             state_error: None,
@@ -99,6 +117,7 @@ impl ProxyStatus {
         http_addr: Option<String>,
         http_redirect_addr: Option<String>,
         tls_addr: Option<String>,
+        public_tls_addr: Option<String>,
         state_error: Option<String>,
     ) -> Self {
         Self {
@@ -107,6 +126,7 @@ impl ProxyStatus {
             http_addr,
             http_redirect_addr,
             tls_addr,
+            public_tls_addr,
             routes: Vec::new(),
             stale: true,
             state_error,
@@ -119,6 +139,7 @@ pub struct ProxyDaemonOptions {
     pub http_port: Option<u16>,
     pub http_redirect_port: Option<u16>,
     pub tls_port: Option<u16>,
+    pub public_tls_port: Option<u16>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

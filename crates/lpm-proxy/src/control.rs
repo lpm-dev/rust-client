@@ -5,6 +5,7 @@ pub(crate) struct ProxyListenerAddrs {
     pub(crate) http_addr: Option<String>,
     pub(crate) http_redirect_addr: Option<String>,
     pub(crate) tls_addr: Option<String>,
+    pub(crate) public_tls_addr: Option<String>,
 }
 
 #[derive(Clone)]
@@ -111,9 +112,14 @@ pub async fn serve_control_at_path_with_options(
         None => None,
     };
     let http_redirect_proxy = match (options.http_redirect_port, tls_proxy.as_ref()) {
-        (Some(port), Some(tls_proxy)) => {
-            Some(start_http_redirect(Arc::clone(&registry), port, tls_proxy.port()).await?)
-        }
+        (Some(port), Some(tls_proxy)) => Some(
+            start_http_redirect(
+                Arc::clone(&registry),
+                port,
+                options.public_tls_port.unwrap_or(tls_proxy.port()),
+            )
+            .await?,
+        ),
         (Some(_), None) => {
             return Err(ProxyError::Http(
                 "HTTP redirect listener requires a TLS listener".into(),
@@ -122,6 +128,9 @@ pub async fn serve_control_at_path_with_options(
         (None, _) => None,
     };
     let listener_addrs = ProxyListenerAddrs {
+        public_tls_addr: options
+            .public_tls_port
+            .map(|port| format!("https://127.0.0.1:{port}")),
         http_addr: http_proxy
             .as_ref()
             .map(|handle| format!("http://{}", handle.addr())),
@@ -140,6 +149,7 @@ pub async fn serve_control_at_path_with_options(
             http_addr: listener_addrs.http_addr.clone(),
             http_redirect_addr: listener_addrs.http_redirect_addr.clone(),
             tls_addr: listener_addrs.tls_addr.clone(),
+            public_tls_addr: listener_addrs.public_tls_addr.clone(),
             routes: Vec::new(),
         },
     )?;
@@ -197,9 +207,14 @@ pub async fn serve_control_at_pipe_with_options(
         None => None,
     };
     let http_redirect_proxy = match (options.http_redirect_port, tls_proxy.as_ref()) {
-        (Some(port), Some(tls_proxy)) => {
-            Some(start_http_redirect(Arc::clone(&registry), port, tls_proxy.port()).await?)
-        }
+        (Some(port), Some(tls_proxy)) => Some(
+            start_http_redirect(
+                Arc::clone(&registry),
+                port,
+                options.public_tls_port.unwrap_or(tls_proxy.port()),
+            )
+            .await?,
+        ),
         (Some(_), None) => {
             return Err(ProxyError::Http(
                 "HTTP redirect listener requires a TLS listener".into(),
@@ -208,6 +223,9 @@ pub async fn serve_control_at_pipe_with_options(
         (None, _) => None,
     };
     let listener_addrs = ProxyListenerAddrs {
+        public_tls_addr: options
+            .public_tls_port
+            .map(|port| format!("https://127.0.0.1:{port}")),
         http_addr: http_proxy
             .as_ref()
             .map(|handle| format!("http://{}", handle.addr())),
@@ -226,6 +244,7 @@ pub async fn serve_control_at_pipe_with_options(
             http_addr: listener_addrs.http_addr.clone(),
             http_redirect_addr: listener_addrs.http_redirect_addr.clone(),
             tls_addr: listener_addrs.tls_addr.clone(),
+            public_tls_addr: listener_addrs.public_tls_addr.clone(),
             routes: Vec::new(),
         },
     )?;
@@ -877,6 +896,7 @@ async fn commit_connection_backed_routes(
             http_addr: context.listener_addrs.http_addr.clone(),
             http_redirect_addr: context.listener_addrs.http_redirect_addr.clone(),
             tls_addr: context.listener_addrs.tls_addr.clone(),
+            public_tls_addr: context.listener_addrs.public_tls_addr.clone(),
             routes: published_routes,
         },
     );
@@ -927,6 +947,7 @@ async fn commit_connection_backed_release(
             http_addr: context.listener_addrs.http_addr.clone(),
             http_redirect_addr: context.listener_addrs.http_redirect_addr.clone(),
             tls_addr: context.listener_addrs.tls_addr.clone(),
+            public_tls_addr: context.listener_addrs.public_tls_addr.clone(),
             routes: published_routes,
         },
     );
@@ -1014,6 +1035,7 @@ async fn write_current_state_locked(
             http_addr: listener_addrs.http_addr.clone(),
             http_redirect_addr: listener_addrs.http_redirect_addr.clone(),
             tls_addr: listener_addrs.tls_addr.clone(),
+            public_tls_addr: listener_addrs.public_tls_addr.clone(),
             routes,
         },
     )
@@ -1036,6 +1058,7 @@ pub(crate) async fn handle_request(
                         http_addr: listener_addrs.http_addr,
                         http_redirect_addr: listener_addrs.http_redirect_addr,
                         tls_addr: listener_addrs.tls_addr,
+                        public_tls_addr: listener_addrs.public_tls_addr,
                         routes,
                         stale: false,
                         state_error: None,

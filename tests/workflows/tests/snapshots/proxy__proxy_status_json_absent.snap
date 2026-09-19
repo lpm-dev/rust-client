@@ -1,0 +1,16 @@
+---
+source: tests/workflows/tests/proxy.rs
+expression: value
+---
+{
+  "success": true,
+  "running": false,
+  "pid": null,
+  "httpAddr": null,
+  "httpRedirectAddr": null,
+  "tlsAddr": null,
+  "public_tls_addr": null,
+  "routes": [],
+  "stale": false,
+  "stateError": null
+}

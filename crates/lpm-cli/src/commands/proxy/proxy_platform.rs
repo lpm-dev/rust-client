@@ -21,9 +21,7 @@ pub(super) fn install_proxy_service_platform(spec: &ProxyServiceSpec) -> Result<
     std::fs::write(&plist_path, render_macos_launch_agent_plist(spec)).map_err(LpmError::Io)?;
 
     let target = macos_launchctl_target(spec.label);
-    let _ = Command::new("launchctl")
-        .args(["bootout", &target])
-        .status();
+    run_macos_bootout(Command::new("launchctl").args(["bootout", &target]))?;
     run_checked(
         Command::new("launchctl")
             .arg("bootstrap")
@@ -38,9 +36,7 @@ pub(super) fn install_proxy_service_platform(spec: &ProxyServiceSpec) -> Result<
 #[cfg(target_os = "macos")]
 pub(super) fn uninstall_proxy_service_platform(spec: &ProxyServiceSpec) -> Result<(), LpmError> {
     let target = macos_launchctl_target(spec.label);
-    let _ = Command::new("launchctl")
-        .args(["bootout", &target])
-        .status();
+    uninstall_macos_user_agent(Path::new("launchctl"), &target)?;
     let plist_path = macos_launch_agent_path(spec.label)?;
     if plist_path.exists() {
         std::fs::remove_file(plist_path).map_err(LpmError::Io)?;
@@ -57,17 +53,14 @@ pub(super) fn install_proxy_service_platform(spec: &ProxyServiceSpec) -> Result<
     }
     std::fs::write(&unit_path, render_linux_systemd_unit(spec)).map_err(LpmError::Io)?;
     let unit_name = linux_systemd_unit_name(spec.label);
-    run_checked(Command::new("systemctl").args(["--user", "daemon-reload"]))?;
-    run_checked(Command::new("systemctl").args(["--user", "enable", "--now", &unit_name]))?;
+    install_linux_user_unit(Path::new("systemctl"), &unit_name)?;
     Ok(())
 }
 
 #[cfg(target_os = "linux")]
 pub(super) fn uninstall_proxy_service_platform(spec: &ProxyServiceSpec) -> Result<(), LpmError> {
     let unit_name = linux_systemd_unit_name(spec.label);
-    let _ = Command::new("systemctl")
-        .args(["--user", "disable", "--now", &unit_name])
-        .status();
+    uninstall_linux_user_unit(Path::new("systemctl"), &unit_name)?;
     let unit_path = linux_systemd_user_unit_path(spec.label)?;
     if unit_path.exists() {
         std::fs::remove_file(unit_path).map_err(LpmError::Io)?;
@@ -75,50 +68,24 @@ pub(super) fn uninstall_proxy_service_platform(spec: &ProxyServiceSpec) -> Resul
     if spec.launcher_path.exists() {
         std::fs::remove_file(&spec.launcher_path).map_err(LpmError::Io)?;
     }
-    let _ = Command::new("systemctl")
-        .args(["--user", "daemon-reload"])
-        .status();
+    run_checked(Command::new("systemctl").args(["--user", "daemon-reload"]))?;
     Ok(())
 }
 
 #[cfg(windows)]
 pub(super) fn install_proxy_service_platform(spec: &ProxyServiceSpec) -> Result<(), LpmError> {
     write_windows_launcher(spec)?;
-    run_checked(
-        Command::new("schtasks")
-            .arg("/Create")
-            .arg("/TN")
-            .arg(windows_task_name(spec.label))
-            .arg("/SC")
-            .arg("ONLOGON")
-            .arg("/TR")
-            .arg(quote_windows_task_command(&spec.launcher_path))
-            .arg("/RL")
-            .arg("LIMITED")
-            .arg("/F"),
-    )?;
-    run_checked(
-        Command::new("schtasks")
-            .arg("/Run")
-            .arg("/TN")
-            .arg(windows_task_name(spec.label)),
+    install_windows_user_task(
+        Path::new("schtasks"),
+        windows_task_name(spec.label),
+        &spec.launcher_path,
     )?;
     Ok(())
 }
 
 #[cfg(windows)]
 pub(super) fn uninstall_proxy_service_platform(spec: &ProxyServiceSpec) -> Result<(), LpmError> {
-    let _ = Command::new("schtasks")
-        .arg("/End")
-        .arg("/TN")
-        .arg(windows_task_name(spec.label))
-        .status();
-    let _ = Command::new("schtasks")
-        .arg("/Delete")
-        .arg("/TN")
-        .arg(windows_task_name(spec.label))
-        .arg("/F")
-        .status();
+    uninstall_windows_user_task(Path::new("schtasks"), windows_task_name(spec.label))?;
     if spec.launcher_path.exists() {
         std::fs::remove_file(&spec.launcher_path).map_err(LpmError::Io)?;
     }
@@ -161,13 +128,7 @@ pub(super) fn install_privileged_forwarder_platform(
     )?;
     install_root_file(&config_source, &spec.config_path, "0644")?;
     install_root_file(&unit_source, &spec.service_path, "0644")?;
-    run_checked_inherited(Command::new("sudo").args(["systemctl", "daemon-reload"]))?;
-    run_checked_inherited(Command::new("sudo").args([
-        "systemctl",
-        "enable",
-        "--now",
-        &linux_systemd_unit_name(spec.label),
-    ]))?;
+    install_linux_forwarder_unit(Path::new("sudo"), &linux_systemd_unit_name(spec.label))?;
     let _ = std::fs::remove_file(config_source);
     let _ = std::fs::remove_file(unit_source);
     Ok(())
@@ -178,14 +139,16 @@ pub(super) fn uninstall_privileged_forwarder_platform(
     spec: &PrivilegedForwarderSpec,
 ) -> Result<(), LpmError> {
     reject_removing_foreign_privileged_forwarder(&spec.config_path, spec.config.target_uid)?;
-    let _ = Command::new("sudo")
-        .args([
-            "systemctl",
-            "disable",
-            "--now",
-            &linux_systemd_unit_name(spec.label),
-        ])
-        .status();
+    let unit = linux_systemd_unit_name(spec.label);
+    let state = run_checked_output(Command::new("systemctl").args([
+        "show",
+        "--property=LoadState",
+        "--value",
+        &unit,
+    ]))?;
+    if String::from_utf8_lossy(&state.stdout).trim() != "not-found" {
+        run_checked_inherited(Command::new("sudo").args(["systemctl", "disable", "--now", &unit]))?;
+    }
     run_checked_inherited(
         Command::new("sudo")
             .arg("rm")
@@ -198,9 +161,7 @@ pub(super) fn uninstall_privileged_forwarder_platform(
             .arg("-f")
             .arg(&spec.config_path),
     )?;
-    let _ = Command::new("sudo")
-        .args(["systemctl", "daemon-reload"])
-        .status();
+    run_checked_inherited(Command::new("sudo").args(["systemctl", "daemon-reload"]))?;
     Ok(())
 }
 
@@ -227,9 +188,7 @@ pub(super) fn install_privileged_forwarder_platform(
     install_root_file(&config_source, &spec.config_path, "0644")?;
     install_root_file(&plist_source, &spec.service_path, "0644")?;
     let target = macos_system_launchctl_target(spec.label);
-    let _ = Command::new("sudo")
-        .args(["launchctl", "bootout", &target])
-        .status();
+    run_macos_bootout(Command::new("sudo").args(["launchctl", "bootout", &target]))?;
     run_checked_inherited(
         Command::new("sudo")
             .args(["launchctl", "bootstrap", "system"])
@@ -248,9 +207,7 @@ pub(super) fn uninstall_privileged_forwarder_platform(
 ) -> Result<(), LpmError> {
     reject_removing_foreign_privileged_forwarder(&spec.config_path, spec.config.target_uid)?;
     let target = macos_system_launchctl_target(spec.label);
-    let _ = Command::new("sudo")
-        .args(["launchctl", "bootout", &target])
-        .status();
+    run_macos_bootout(Command::new("sudo").args(["launchctl", "bootout", &target]))?;
     run_checked_inherited(
         Command::new("sudo")
             .arg("rm")
@@ -568,7 +525,7 @@ pub(super) fn windows_task_name(_label: &str) -> &'static str {
     r"\LPM\Proxy"
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, all(test, unix)))]
 pub(super) fn quote_windows_task_command(path: &Path) -> String {
     quote_windows_command(&[path.display().to_string()])
 }
@@ -623,9 +580,16 @@ pub(super) fn quote_windows_arg(arg: &str) -> String {
 }
 
 pub(super) fn run_checked(command: &mut Command) -> Result<(), LpmError> {
-    let output = command.output().map_err(LpmError::Io)?;
+    run_checked_output(command).map(|_| ())
+}
+
+fn run_checked_output(command: &mut Command) -> Result<std::process::Output, LpmError> {
+    let output = command
+        .stdin(std::process::Stdio::inherit())
+        .output()
+        .map_err(LpmError::Io)?;
     if output.status.success() {
-        return Ok(());
+        return Ok(output);
     }
     let stderr = String::from_utf8_lossy(&output.stderr);
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -644,7 +608,10 @@ pub(super) fn run_checked(command: &mut Command) -> Result<(), LpmError> {
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 pub(super) fn run_checked_inherited(command: &mut Command) -> Result<(), LpmError> {
-    let status = command.status().map_err(LpmError::Io)?;
+    let status = command
+        .stdout(std::process::Stdio::from(std::io::stderr()))
+        .status()
+        .map_err(LpmError::Io)?;
     if status.success() {
         return Ok(());
     }
@@ -710,4 +677,268 @@ pub(super) fn systemd_path_value(path: &Path) -> String {
     }
 
     escaped
+}
+
+#[cfg(any(target_os = "linux", all(test, unix)))]
+fn install_linux_forwarder_unit(program: &Path, unit: &str) -> Result<(), LpmError> {
+    run_checked_inherited(Command::new(program).args(["systemctl", "daemon-reload"]))?;
+    run_checked_inherited(Command::new(program).args(["systemctl", "enable", unit]))?;
+    run_checked_inherited(Command::new(program).args(["systemctl", "restart", unit]))?;
+    Ok(())
+}
+
+#[cfg(any(target_os = "linux", all(test, unix)))]
+fn install_linux_user_unit(program: &Path, unit: &str) -> Result<(), LpmError> {
+    run_checked(Command::new(program).args(["--user", "daemon-reload"]))?;
+    run_checked(Command::new(program).args(["--user", "enable", unit]))?;
+    run_checked(Command::new(program).args(["--user", "restart", unit]))?;
+    Ok(())
+}
+
+#[cfg(any(target_os = "linux", all(test, unix)))]
+fn uninstall_linux_user_unit(program: &Path, unit: &str) -> Result<(), LpmError> {
+    let state = run_checked_output(Command::new(program).args([
+        "--user",
+        "show",
+        "--property=LoadState",
+        "--value",
+        unit,
+    ]))?;
+    if String::from_utf8_lossy(&state.stdout).trim() == "not-found" {
+        return Ok(());
+    }
+    run_checked(Command::new(program).args(["--user", "disable", "--now", unit]))
+}
+
+#[cfg(any(target_os = "macos", all(test, unix)))]
+fn uninstall_macos_user_agent(program: &Path, target: &str) -> Result<(), LpmError> {
+    run_macos_bootout(Command::new(program).args(["bootout", target]))
+}
+
+#[cfg(any(windows, all(test, unix)))]
+fn install_windows_user_task(program: &Path, task: &str, launcher: &Path) -> Result<(), LpmError> {
+    if windows_user_task_exists(program, task)? {
+        run_checked(Command::new(program).args(["/End", "/TN", task]))?;
+    }
+    run_checked(
+        Command::new(program)
+            .arg("/Create")
+            .arg("/TN")
+            .arg(task)
+            .arg("/SC")
+            .arg("ONLOGON")
+            .arg("/TR")
+            .arg(quote_windows_task_command(launcher))
+            .arg("/RL")
+            .arg("LIMITED")
+            .arg("/F"),
+    )?;
+    run_checked(Command::new(program).arg("/Run").arg("/TN").arg(task))?;
+    Ok(())
+}
+
+#[cfg(any(windows, all(test, unix)))]
+fn windows_user_task_exists(program: &Path, task: &str) -> Result<bool, LpmError> {
+    let tasks = run_checked_output(Command::new(program).args(["/Query", "/FO", "CSV", "/NH"]))?;
+    Ok(String::from_utf8_lossy(&tasks.stdout).lines().any(|line| {
+        line.split(',').next().is_some_and(|name| {
+            name.trim()
+                .trim_matches('"')
+                .trim_start_matches('\\')
+                .eq_ignore_ascii_case(task.trim_start_matches('\\'))
+        })
+    }))
+}
+
+#[cfg(any(windows, all(test, unix)))]
+fn uninstall_windows_user_task(program: &Path, task: &str) -> Result<(), LpmError> {
+    if !windows_user_task_exists(program, task)? {
+        return Ok(());
+    }
+    run_checked(Command::new(program).args(["/End", "/TN", task]))?;
+    run_checked(Command::new(program).args(["/Delete", "/TN", task, "/F"]))
+}
+
+#[cfg(any(target_os = "macos", all(test, unix)))]
+fn run_macos_bootout(command: &mut Command) -> Result<(), LpmError> {
+    let output = command
+        .stdin(std::process::Stdio::inherit())
+        .output()
+        .map_err(LpmError::Io)?;
+    if output.status.success() || output.status.code() == Some(3) {
+        return Ok(());
+    }
+    Err(LpmError::Script(format!(
+        "`{}` failed with {}: {}",
+        format_command_for_error(command),
+        output.status,
+        String::from_utf8_lossy(&output.stderr).trim()
+    )))
+}
+
+#[cfg(all(test, unix))]
+mod service_execution_tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    fn fixture_program(directory: &Path, script: &str) -> PathBuf {
+        let path = directory.join("manager");
+        std::fs::write(&path, format!("#!/bin/sh\n{script}\n")).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        path
+    }
+
+    #[test]
+    fn linux_reinstall_restarts_the_running_service_with_new_listeners() {
+        let dir = tempfile::tempdir().unwrap();
+        let program = fixture_program(
+            dir.path(),
+            r#"
+case "$*" in
+  *restart*) cp "$0.desired" "$0.running" ;;
+  *enable*) if [ ! -f "$0.running" ]; then cp "$0.desired" "$0.running"; fi ;;
+esac
+exit 0
+"#,
+        );
+        std::fs::write(program.with_extension("running"), "old listeners").unwrap();
+        std::fs::write(program.with_extension("desired"), "new listeners").unwrap();
+        install_linux_user_unit(&program, "dev.lpm.proxy.service").unwrap();
+        assert_eq!(
+            std::fs::read_to_string(program.with_extension("running")).unwrap(),
+            "new listeners"
+        );
+    }
+
+    #[test]
+    fn linux_reinstall_restarts_the_forwarder_with_new_backend_targets() {
+        let dir = tempfile::tempdir().unwrap();
+        let program = fixture_program(
+            dir.path(),
+            r#"
+case "$*" in
+  *restart*) cp "$0.desired" "$0.running" ;;
+  *enable*) if [ ! -f "$0.running" ]; then cp "$0.desired" "$0.running"; fi ;;
+esac
+exit 0
+"#,
+        );
+        std::fs::write(program.with_extension("running"), "9443").unwrap();
+        std::fs::write(program.with_extension("desired"), "9444").unwrap();
+        install_linux_forwarder_unit(&program, "dev.lpm.proxy.forwarder.service").unwrap();
+        assert_eq!(
+            std::fs::read_to_string(program.with_extension("running")).unwrap(),
+            "9444"
+        );
+    }
+
+    #[test]
+    fn windows_reinstall_replaces_the_running_task_with_new_listeners() {
+        let dir = tempfile::tempdir().unwrap();
+        let program = fixture_program(
+            dir.path(),
+            r#"
+case "$1" in
+  /Query) printf '%s\n' '"\LPM\Proxy","Running"' ;;
+  /End) rm -f "$0.running" ;;
+  /Create) cp "$0.desired" "$0.registered" ;;
+  /Run) if [ ! -f "$0.running" ]; then cp "$0.registered" "$0.running"; fi ;;
+esac
+exit 0
+"#,
+        );
+        std::fs::write(program.with_extension("running"), "old listeners").unwrap();
+        std::fs::write(program.with_extension("desired"), "new listeners").unwrap();
+        install_windows_user_task(&program, r"\LPM\Proxy", Path::new("proxy.cmd")).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(program.with_extension("running")).unwrap(),
+            "new listeners"
+        );
+    }
+
+    #[test]
+    fn windows_reinstall_preserves_the_registered_task_when_stop_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let program = fixture_program(
+            dir.path(),
+            r#"
+case "$1" in
+  /Query) printf '%s\n' '"\LPM\Proxy","Running"' ;;
+  /End) echo denied >&2; exit 5 ;;
+  /Create) touch "$0.replaced" ;;
+esac
+exit 0
+"#,
+        );
+        assert!(
+            install_windows_user_task(&program, r"\LPM\Proxy", Path::new("proxy.cmd")).is_err()
+        );
+        assert!(!program.with_extension("replaced").exists());
+    }
+
+    #[test]
+    fn windows_task_lookup_matches_the_complete_task_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let program = fixture_program(
+            dir.path(),
+            r#"
+printf '%s\n' '"\Other\LPM\Proxy","Ready"' '"\LPM\Proxy-old","Ready"' '"\Other","\LPM\Proxy"'
+"#,
+        );
+        assert!(!windows_user_task_exists(&program, r"\LPM\Proxy").unwrap());
+        let program = fixture_program(dir.path(), r#"printf '%s\n' '"\lpm\proxy","Ready"'"#);
+        assert!(windows_user_task_exists(&program, r"\LPM\Proxy").unwrap());
+    }
+
+    #[test]
+    fn uninstall_propagates_service_manager_failures() {
+        let dir = tempfile::tempdir().unwrap();
+        let program = fixture_program(dir.path(), "echo 'manager access denied' >&2; exit 5");
+        assert!(uninstall_macos_user_agent(&program, "gui/501/dev.lpm.proxy").is_err());
+        assert!(uninstall_windows_user_task(&program, r"\LPM\Proxy").is_err());
+        assert!(uninstall_linux_user_unit(&program, "dev.lpm.proxy.service").is_err());
+    }
+
+    #[test]
+    fn absent_services_can_be_uninstalled_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let program = fixture_program(dir.path(), "exit 3");
+        uninstall_macos_user_agent(&program, "gui/501/dev.lpm.proxy").unwrap();
+        let program = fixture_program(dir.path(), "echo not-found; exit 0");
+        uninstall_linux_user_unit(&program, "dev.lpm.proxy.service").unwrap();
+        let program = fixture_program(dir.path(), "exit 0");
+        uninstall_windows_user_task(&program, r"\LPM\Proxy").unwrap();
+    }
+
+    #[test]
+    fn windows_uninstall_keeps_manager_progress_off_stdout() {
+        const CHILD: &str = "LPM_PROXY_MANAGER_STDIO_CHILD";
+        const MARKER: &str = "task-manager-progress";
+        if std::env::var_os(CHILD).is_some() {
+            let dir = tempfile::tempdir().unwrap();
+            let program = fixture_program(
+                dir.path(),
+                &format!(
+                    r#"
+case "$1" in
+  /Query) printf '"\\LPM\\Proxy","Ready"\n' ;;
+  *) echo {MARKER}; printf '%s\n' "$1" >> "$0.calls" ;;
+esac
+exit 0
+"#
+                ),
+            );
+            uninstall_windows_user_task(&program, r"\LPM\Proxy").unwrap();
+            assert_eq!(
+                std::fs::read_to_string(program.with_extension("calls")).unwrap(),
+                "/End\n/Delete\n"
+            );
+            return;
+        }
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "commands::proxy::proxy_platform::service_execution_tests::windows_uninstall_keeps_manager_progress_off_stdout", "--nocapture"])
+            .env(CHILD, "1").output().unwrap();
+        assert!(output.status.success());
+        assert!(!String::from_utf8_lossy(&output.stdout).contains(MARKER));
+    }
 }

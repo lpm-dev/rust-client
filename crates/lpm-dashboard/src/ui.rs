@@ -121,7 +121,7 @@ fn render_sidebar(frame: &mut Frame, app: &DashboardApp, area: Rect) {
                 ),
                 Span::styled(svc.status.label(), Style::default().fg(status_color)),
             ];
-            if let Some(hosts) = service_hosts_label(&svc.hosts) {
+            if let Some(hosts) = service_hosts_label(&svc.hosts, svc.proxy_port) {
                 spans.push(Span::raw(" "));
                 spans.push(Span::styled(hosts, Style::default().fg(Color::Cyan)));
             }
@@ -532,7 +532,7 @@ fn truncate_path(path: &str, max: usize) -> String {
     }
 }
 
-fn service_hosts_label(hosts: &[String]) -> Option<String> {
+fn service_hosts_label(hosts: &[String], port: Option<u16>) -> Option<String> {
     if hosts.is_empty() {
         return None;
     }
@@ -545,6 +545,10 @@ fn service_hosts_label(hosts: &[String]) -> Option<String> {
         }
         label.push_str("https://");
         label.push_str(host);
+        if let Some(port) = port.filter(|port| *port != 443) {
+            use std::fmt::Write as _;
+            let _ = write!(label, ":{port}");
+        }
     }
     Some(label)
 }
@@ -611,13 +615,26 @@ mod tests {
         let hosts = vec!["web.localhost".to_string(), "app.localhost".to_string()];
 
         assert_eq!(
-            service_hosts_label(&hosts),
+            service_hosts_label(&hosts, None),
             Some("https://web.localhost, https://app.localhost".to_string())
         );
     }
 
     #[test]
+    fn service_hosts_label_includes_nonstandard_https_ports() {
+        let hosts = vec!["app.localhost".into()];
+        assert_eq!(
+            service_hosts_label(&hosts, Some(9443)).as_deref(),
+            Some("https://app.localhost:9443")
+        );
+        assert_eq!(
+            service_hosts_label(&hosts, Some(443)).as_deref(),
+            Some("https://app.localhost")
+        );
+    }
+
+    #[test]
     fn service_hosts_label_returns_none_for_service_without_hosts() {
-        assert_eq!(service_hosts_label(&[]), None);
+        assert_eq!(service_hosts_label(&[], None), None);
     }
 }

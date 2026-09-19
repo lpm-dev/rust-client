@@ -74,6 +74,7 @@ fn status(host: &str, upstream_port: u16, lease_id: u64) -> RouteStatus {
 #[cfg(unix)]
 fn forwarder_state(pid: u32, tls_addr: Option<String>) -> ProxyDaemonState {
     ProxyDaemonState {
+        public_tls_addr: None,
         pid,
         endpoint: Some("/tmp/lpm-proxy.sock".to_string()),
         http_addr: None,
@@ -508,6 +509,7 @@ fn read_status_from_path_treats_persisted_state_as_stale_without_ipc() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("proxy.json");
     let state = ProxyDaemonState {
+        public_tls_addr: None,
         pid: 42,
         endpoint: None,
         http_addr: None,
@@ -522,6 +524,7 @@ fn read_status_from_path_treats_persisted_state_as_stale_without_ipc() {
     assert_eq!(
         status,
         ProxyStatus {
+            public_tls_addr: None,
             running: false,
             pid: Some(42),
             http_addr: None,
@@ -562,6 +565,7 @@ fn write_state_file_sets_private_unix_permissions() {
     std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o755)).unwrap();
     let path = root.join("proxy.json");
     let state = ProxyDaemonState {
+        public_tls_addr: None,
         pid: 42,
         endpoint: Some(root.join("proxy.sock").display().to_string()),
         http_addr: None,
@@ -626,6 +630,7 @@ fn proxy_request_round_trips_register_routes() {
 fn proxy_response_round_trips_status() {
     let response = ProxyResponse::Status {
         status: ProxyStatus {
+            public_tls_addr: None,
             running: false,
             pid: None,
             http_addr: None,
@@ -872,6 +877,7 @@ async fn tls_control_daemon_prepares_project_leaf_when_route_registers() {
             &server_socket_path,
             &server_state_path,
             ProxyDaemonOptions {
+                public_tls_port: None,
                 tls_port: Some(0),
                 ..ProxyDaemonOptions::default()
             },

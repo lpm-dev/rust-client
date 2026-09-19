@@ -45,6 +45,7 @@ pub struct ServiceState {
     pub name: String,
     pub port: Option<u16>,
     pub hosts: Vec<String>,
+    pub proxy_port: Option<u16>,
     pub status: ServiceStatus,
     pub logs: LogBuffer,
 }
@@ -202,6 +203,7 @@ mod tests {
             logs.push(format!("line {i}"));
         }
         DashboardApp::new(vec![ServiceState {
+            proxy_port: None,
             name: "test".into(),
             port: Some(3000),
             hosts: Vec::new(),

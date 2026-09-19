@@ -298,20 +298,11 @@ fn proxy_install_privileged_ports_dry_run_reports_forwarder_plan_with_clean_fds(
             .unwrap()
             .contains(&serde_json::json!("--http-redirect-port"))
     );
-    assert!(
-        !json["args"]
-            .as_array()
-            .unwrap()
-            .contains(&serde_json::json!("443")),
-        "user service must bind high backend ports: {json}"
-    );
-    assert!(
-        !json["args"]
-            .as_array()
-            .unwrap()
-            .contains(&serde_json::json!("80")),
-        "user service must bind high backend ports: {json}"
-    );
+    let args = json["args"].as_array().unwrap();
+    for flag in ["--tls-port", "--http-redirect-port"] {
+        let offset = args.iter().position(|arg| arg == flag).unwrap();
+        assert!(args[offset + 1].as_str().unwrap().parse::<u16>().unwrap() >= 1024);
+    }
 
     let forwarder = &json["privilegedForwarder"];
     assert_eq!(forwarder["service"], "dev.lpm.proxy.forwarder");
@@ -997,4 +988,123 @@ fn decode_chunked_body(mut bytes: &[u8]) -> Vec<u8> {
         bytes = bytes.get(size + 2..).unwrap_or_default();
     }
     decoded
+}
+
+#[cfg(unix)]
+#[test]
+fn privileged_service_redirects_to_the_public_https_port() {
+    if running_as_root() {
+        return;
+    }
+    let _guard = proxy_daemon_test_guard();
+    for public_port in [443, 444] {
+        let (project, lpm_home) = isolated_dirs();
+        let public = public_port.to_string();
+        let (status, stdout, stderr) = common::run_lpm_with_env(
+            project.path(),
+            lpm_home.path(),
+            None,
+            &[("LPM_PROXY_SERVICE_DRY_RUN", "1")],
+            &[
+                "--json",
+                "proxy",
+                "install",
+                "--privileged-ports",
+                "--tls-port",
+                &public,
+                "--http-redirect-port",
+                "81",
+            ],
+        );
+        assert!(status.success(), "{stderr}");
+        let plan = common::parse_json_stdout(&stdout);
+        let args: Vec<&str> = plan["args"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|arg| arg.as_str().unwrap())
+            .collect();
+        let mut child = common::lpm_command(project.path(), lpm_home.path(), None, &args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let _cleanup = ProxyDaemonCleanup::new(project.path().into(), lpm_home.path().into());
+        let status = wait_for_proxy_running(project.path(), lpm_home.path(), &mut child);
+        assert_eq!(
+            status["public_tls_addr"],
+            format!("https://127.0.0.1:{public_port}")
+        );
+        assert!(socket_addr_port(&status["tlsAddr"]) >= 1024);
+        let response = tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(lpm_proxy::send_request_to_path(
+                &lpm_home.path().join("proxy.sock"),
+                lpm_proxy::ProxyRequest::Register {
+                    owner_pid: std::process::id(),
+                    routes: vec![lpm_proxy::Route {
+                        host: "app.localhost".into(),
+                        upstream_port: 3000,
+                        project_dir: project.path().into(),
+                        service: None,
+                    }],
+                },
+            ))
+            .unwrap();
+        assert!(matches!(
+            response,
+            lpm_proxy::ProxyResponse::Registered { .. }
+        ));
+        let response = reqwest::blocking::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .unwrap()
+            .get(format!(
+                "{}/login?next=/app",
+                status["httpRedirectAddr"].as_str().unwrap()
+            ))
+            .header("host", "app.localhost")
+            .send()
+            .unwrap();
+        let authority = if public_port == 443 {
+            "app.localhost".into()
+        } else {
+            format!("app.localhost:{public_port}")
+        };
+        assert_eq!(
+            response.headers()["location"],
+            format!("https://{authority}/login?next=/app")
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn privileged_install_respects_redirect_opt_out_without_a_hostname() {
+    if running_as_root() {
+        return;
+    }
+    let (project, lpm_home) = isolated_dirs();
+    std::fs::write(
+        project.path().join("lpm.json"),
+        r#"{"proxy":{"httpRedirect":false}}"#,
+    )
+    .unwrap();
+    let (status, stdout, stderr) = common::run_lpm_with_env(
+        project.path(),
+        lpm_home.path(),
+        None,
+        &[("LPM_PROXY_SERVICE_DRY_RUN", "1")],
+        &["--json", "proxy", "install", "--privileged-ports"],
+    );
+    assert!(status.success(), "{stderr}");
+    let plan = common::parse_json_stdout(&stdout);
+    assert_eq!(
+        plan["privilegedForwarder"]["rules"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
 }

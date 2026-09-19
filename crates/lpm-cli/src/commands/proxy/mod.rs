@@ -27,6 +27,7 @@ pub(crate) struct ProxyRunOptions<'a> {
     pub(crate) http_port: Option<u16>,
     pub(crate) http_redirect_port: Option<u16>,
     pub(crate) tls_port: Option<u16>,
+    pub(crate) public_tls_port: Option<u16>,
     pub(crate) forwarder_config: Option<&'a Path>,
 }
 
@@ -42,8 +43,17 @@ pub async fn run(options: ProxyRunOptions<'_>) -> Result<(), LpmError> {
         http_port,
         http_redirect_port,
         tls_port,
+        public_tls_port,
         forwarder_config,
     } = options;
+    if public_tls_port.is_some()
+        && (action != "start" || tls_port.is_none() || public_tls_port == Some(0))
+    {
+        return Err(LpmError::Script(
+            "`--public-tls-port` requires `proxy start --tls-port` and a nonzero public port"
+                .into(),
+        ));
+    }
     if forwarder_config.is_some() && action != "forwarder" {
         return Err(LpmError::Script(
             "`--forwarder-config` is only valid for the internal proxy forwarder".into(),
@@ -110,6 +120,7 @@ pub async fn run(options: ProxyRunOptions<'_>) -> Result<(), LpmError> {
                 http_port,
                 http_redirect_port,
                 tls_port,
+                public_tls_port,
             )
             .await
         }
@@ -232,8 +243,10 @@ async fn run_start(
     http_port: Option<u16>,
     http_redirect_port: Option<u16>,
     tls_port: Option<u16>,
+    public_tls_port: Option<u16>,
 ) -> Result<(), LpmError> {
-    let options = resolve_start_options(project_dir, http_port, http_redirect_port, tls_port)?;
+    let mut options = resolve_start_options(project_dir, http_port, http_redirect_port, tls_port)?;
+    options.public_tls_port = public_tls_port;
     if detach {
         return run_start_detached(project_dir, json_output, options).await;
     }
@@ -397,7 +410,11 @@ fn clear_standard_handle_inheritance() -> std::io::Result<()> {
 }
 
 pub(super) fn listener_args(options: lpm_proxy::ProxyDaemonOptions) -> Vec<String> {
-    let mut args = Vec::with_capacity(6);
+    let mut args = Vec::with_capacity(8);
+    if let Some(port) = options.public_tls_port {
+        args.push("--public-tls-port".to_string());
+        args.push(port.to_string());
+    }
     if let Some(port) = options.http_port {
         args.push("--http-port".to_string());
         args.push(port.to_string());
@@ -441,6 +458,7 @@ pub(super) fn resolve_start_options(
 ) -> Result<lpm_proxy::ProxyDaemonOptions, LpmError> {
     if http_port.is_some() || http_redirect_port.is_some() || tls_port.is_some() {
         return Ok(lpm_proxy::ProxyDaemonOptions {
+            public_tls_port: None,
             http_port,
             http_redirect_port,
             tls_port,
@@ -466,6 +484,7 @@ fn start_options_from_config(config: &lpm_json::LpmJsonConfig) -> lpm_proxy::Pro
         .then_some(80);
 
     lpm_proxy::ProxyDaemonOptions {
+        public_tls_port: None,
         http_port: None,
         http_redirect_port,
         tls_port,
@@ -520,6 +539,7 @@ fn print_status_json(status: &ProxyStatus) {
             "httpAddr": status.http_addr,
             "httpRedirectAddr": status.http_redirect_addr,
             "tlsAddr": status.tls_addr,
+            "public_tls_addr": status.public_tls_addr,
             "routes": status.routes,
             "stale": status.stale,
             "stateError": status.state_error,
@@ -542,6 +562,9 @@ fn render_status_human(status: &ProxyStatus) {
         }
         if let Some(http_redirect_addr) = &status.http_redirect_addr {
             print_field("redirect", install_ui::url(http_redirect_addr));
+        }
+        if let Some(address) = &status.public_tls_addr {
+            print_field("public https", install_ui::url(address));
         }
         if let Some(tls_addr) = &status.tls_addr {
             print_field("https", install_ui::url(tls_addr));
