@@ -49,6 +49,60 @@ impl ExecutionSignals {
         }
     }
 
+    pub fn capture(&self, command: &mut Command) -> Result<crate::shell::CapturedOutput, LpmError> {
+        self.capture_in_session(
+            command,
+            &mut lpm_common::process_output::CaptureSession::default(),
+        )
+    }
+
+    pub fn capture_in_session(
+        &self,
+        command: &mut Command,
+        session: &mut lpm_common::process_output::CaptureSession,
+    ) -> Result<crate::shell::CapturedOutput, LpmError> {
+        self.check()?;
+        #[cfg(unix)]
+        let mut stopped_descendants = None;
+        let result =
+            session.capture_output(command, lpm_common::TASK_OUTPUT_CAPTURE_BYTES, |_pid| {
+                let signal = self.signal.load(Ordering::Acquire) as i32;
+                if signal == 0 {
+                    return None;
+                }
+                #[cfg(unix)]
+                if stopped_descendants.is_none() {
+                    let snapshot = crate::ports::descendant_process_snapshot(_pid);
+                    snapshot.signal_surviving_descendants(_pid, signal);
+                    stopped_descendants = Some((_pid, snapshot));
+                }
+                Some(signal)
+            });
+        #[cfg(unix)]
+        if let Some((pid, snapshot)) = stopped_descendants {
+            snapshot.signal_surviving_descendants(pid, libc::SIGKILL);
+        }
+        let output = result?;
+        let bounded_text = |bytes: &[u8]| {
+            let mut text = String::new();
+            crate::shell::append_capped_output(&mut text, &String::from_utf8_lossy(bytes));
+            text
+        };
+        let status = output.status;
+        #[cfg(unix)]
+        let status = if self.is_stopped() {
+            use std::os::unix::process::ExitStatusExt;
+            ExitStatus::from_raw(self.signal.load(Ordering::Acquire) as i32)
+        } else {
+            status
+        };
+        Ok(crate::shell::CapturedOutput {
+            status,
+            stdout: bounded_text(&output.stdout),
+            stderr: bounded_text(&output.stderr),
+        })
+    }
+
     /// Preserve the foreground group so interactive children can read stdin.
     pub fn run(&self, command: &mut Command) -> Result<ExitStatus, LpmError> {
         self.check()?;

@@ -9,6 +9,167 @@
 mod support;
 
 #[cfg(unix)]
+fn runner_lifetime_fixture(tool: &str, local: bool, workspace: bool, orphan: bool) -> TempProject {
+    let project = TempProject::empty(
+        r#"{"name":"runner-lifetime","private":true,"workspaces":["packages/*"]}"#,
+    );
+    let directory = if workspace { "packages/member/" } else { "" };
+    let mut manifest = serde_json::json!({"name":"runner-member","version":"1.0.0"});
+    if local {
+        manifest["devDependencies"] = serde_json::json!({"vitest":"4.1.9"});
+        write_unix_executable(
+            &project
+                .path()
+                .join(format!("{directory}node_modules/.bin/vitest")),
+            "#!/bin/sh\nexec node runner.cjs\n",
+        );
+    } else {
+        manifest["scripts"] = serde_json::json!({tool:"node runner.cjs"});
+    }
+    project.write_file(&format!("{directory}package.json"), &manifest.to_string());
+    project.write_file(&format!("{directory}runner.cjs"), &format!(
+        "const fs=require('fs'); const child=require('child_process').spawn(process.execPath,['-e',\"setInterval(()=>require('fs').appendFileSync('heartbeat','x'),20)\"],{{stdio:'inherit'}}); fs.writeFileSync('ready',String(child.pid)); {}",
+        if orphan { "setTimeout(()=>process.exit(7),100);" } else { "setInterval(()=>{},1000);" }
+    ));
+    project
+}
+
+#[cfg(unix)]
+fn run_lifetime_case(tool: &str, local: bool, workspace: bool, json: bool, orphan: bool) {
+    use std::os::unix::process::CommandExt;
+    use std::time::{Duration, Instant};
+    let project = runner_lifetime_fixture(tool, local, workspace, orphan);
+    let directory = if workspace {
+        project.path().join("packages/member")
+    } else {
+        project.path().to_path_buf()
+    };
+    let output_path = project.path().join("output.json");
+    let mut command = lpm_spawnable(&project);
+    if json {
+        command.arg("--json");
+    }
+    command.arg(tool);
+    if workspace {
+        command.arg("--all");
+    }
+    command
+        .process_group(0)
+        .stdout(std::fs::File::create(&output_path).unwrap())
+        .stderr(std::process::Stdio::null());
+    let mut child = command.spawn().unwrap();
+    let group = child.id() as i32;
+    let ready_deadline = Instant::now() + Duration::from_secs(10);
+    while !directory.join("heartbeat").exists() && Instant::now() < ready_deadline {
+        if child.try_wait().unwrap().is_some() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let ready = directory.join("heartbeat").exists();
+    if ready && !orphan {
+        // SAFETY: this PID is the owned fixture child, not its process group.
+        unsafe {
+            libc::kill(group, libc::SIGTERM);
+        }
+    }
+    let deadline = Instant::now() + Duration::from_secs(4);
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break Some(status);
+        }
+        if Instant::now() >= deadline {
+            break None;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    let before = std::fs::read(directory.join("heartbeat")).unwrap_or_default();
+    std::thread::sleep(Duration::from_millis(200));
+    let after = std::fs::read(directory.join("heartbeat")).unwrap_or_default();
+    // SAFETY: this process group contains only the isolated fixture processes.
+    unsafe {
+        libc::kill(-group, libc::SIGKILL);
+    }
+    let _ = child.wait();
+    assert!(ready, "runner did not reach its ready gate");
+    assert!(status.is_some(), "runner capture hung after parent exit");
+    assert_eq!(
+        before, after,
+        "runner descendant remained active after CLI completion"
+    );
+    let code = status.unwrap().code();
+    assert_eq!(
+        code,
+        Some(if orphan {
+            if workspace { 1 } else { 7 }
+        } else {
+            143
+        })
+    );
+    if json {
+        let envelope: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(output_path).unwrap())
+                .expect("one failure envelope");
+        assert_eq!(envelope["success"], false);
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn test_and_bench_stop_signals_stop_runner_descendants() {
+    for tool in ["test", "bench"] {
+        for local in [false, true] {
+            for workspace in [false, true] {
+                for json in [false, true] {
+                    run_lifetime_case(tool, local, workspace, json, false);
+                }
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn test_and_bench_json_completes_when_descendants_inherit_output_pipes() {
+    for tool in ["test", "bench"] {
+        for local in [false, true] {
+            for workspace in [false, true] {
+                run_lifetime_case(tool, local, workspace, true, true);
+            }
+        }
+    }
+}
+
+#[test]
+fn test_and_bench_json_keeps_pre_hook_services_until_the_script_finishes() {
+    for tool in ["test", "bench"] {
+        let pre = format!("pre{tool}");
+        let project = TempProject::empty(
+            &serde_json::json!({
+                "name":"hook-service","version":"1.0.0",
+                "scripts":{pre:"node start.cjs",tool:"node check.cjs"}
+            })
+            .to_string(),
+        );
+        project.write_file("start.cjs", "const c=require('child_process').spawn(process.execPath,['-e',\"setInterval(()=>require('fs').appendFileSync('service-heartbeat','x'),10)\"],{stdio:'ignore'}); c.unref();");
+        project.write_file("check.cjs", "const fs=require('fs');setTimeout(()=>{const a=fs.existsSync('service-heartbeat')?fs.readFileSync('service-heartbeat','utf8'):'';setTimeout(()=>{const b=fs.existsSync('service-heartbeat')?fs.readFileSync('service-heartbeat','utf8'):'';process.exit(b.length>a.length?0:8)},150)},150);");
+        let output = lpm(&project).args(["--json", tool]).output().unwrap();
+        assert!(
+            output.status.success(),
+            "pre-hook service stopped before the main script: {}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        let before = project.read_file("service-heartbeat");
+        std::thread::sleep(std::time::Duration::from_millis(150));
+        assert_eq!(
+            before,
+            project.read_file("service-heartbeat"),
+            "service survived the script sequence"
+        );
+    }
+}
+
+#[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 
 use support::assertions::parse_json_output;
@@ -2372,4 +2533,473 @@ fn fmt_check_flag_is_accepted_alongside_filter() {
         output.status,
         String::from_utf8_lossy(&output.stderr),
     );
+}
+
+#[test]
+fn test_and_bench_json_launch_failures_emit_one_document() {
+    for tool in ["test", "bench"] {
+        let project = TempProject::empty(
+            r#"{"name":"missing-runner","version":"1.0.0","devDependencies":{"vitest":"4.1.9"}}"#,
+        );
+        let output = lpm(&project).args(["--json", tool]).output().unwrap();
+        assert!(!output.status.success());
+        let envelope: serde_json::Value = serde_json::from_slice(&output.stdout)
+            .expect("launch failure must emit one JSON document");
+        assert_eq!(envelope["success"], false);
+        assert!(envelope["members"][0]["exit_code"].is_null());
+        assert!(
+            envelope["members"][0]["error"]
+                .as_str()
+                .is_some_and(|e| e.contains("vitest"))
+        );
+    }
+}
+
+#[test]
+fn test_and_bench_script_fallback_loads_named_environments_and_validates_schema() {
+    for tool in ["test", "bench"] {
+        for json in [false, true] {
+            let project=TempProject::empty(&serde_json::json!({"name":"fallback-env","version":"1.0.0","scripts":{tool:"node capture.cjs"}}).to_string());
+            project.write_file("capture.cjs","require('fs').writeFileSync('captured.txt',process.env.LPM_TB_FIXTURE_VALUE || 'missing');");
+            project.write_file(".env.staging", "LPM_TB_FIXTURE_VALUE=selected\n");
+            project.write_file(
+                "lpm.json",
+                &serde_json::json!({"env":{tool:".env.staging"}}).to_string(),
+            );
+            let mut command = lpm(&project);
+            if json {
+                command.arg("--json");
+            }
+            let output = command.arg(tool).output().unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert_eq!(project.read_file("captured.txt"), "selected");
+            project.write_file(
+                "lpm.json",
+                r#"{"envSchema":{"vars":{"LPM_TB_MISSING_REQUIRED":{"required":true}}}}"#,
+            );
+            std::fs::remove_file(project.path().join("captured.txt")).unwrap();
+            let mut command = lpm(&project);
+            if json {
+                command.arg("--json");
+            }
+            let output = command.arg(tool).output().unwrap();
+            assert!(
+                !output.status.success(),
+                "missing schema input did not stop {tool}"
+            );
+            assert!(!project.file_exists("captured.txt"));
+            if json {
+                let _: serde_json::Value =
+                    serde_json::from_slice(&output.stdout).expect("one setup error envelope");
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn workspace_jest_workers_are_not_watch_mode_and_watch_all_is_gated() {
+    let project = TempProject::empty(
+        r#"{"name":"jest-workspace","private":true,"workspaces":["packages/*"]}"#,
+    );
+    for name in ["a", "b"] {
+        project.write_file(
+            &format!("packages/{name}/package.json"),
+            &serde_json::json!({"name":name,"version":"1.0.0","devDependencies":{"jest":"30.0.0"}})
+                .to_string(),
+        );
+    }
+    write_unix_executable(
+        &project.path().join("node_modules/.bin/jest"),
+        "#!/bin/sh\nprintf '%s\\n' \"$@\" > invoked.args\n",
+    );
+    let workers = lpm(&project)
+        .args(["test", "--all", "--", "-w", "2"])
+        .output()
+        .unwrap();
+    assert!(
+        workers.status.success(),
+        "Jest worker count was rejected: {}",
+        String::from_utf8_lossy(&workers.stderr)
+    );
+    for name in ["a", "b"] {
+        assert_eq!(
+            project.read_file(&format!("packages/{name}/invoked.args")),
+            "-w\n2\n"
+        );
+        std::fs::remove_file(project.path().join(format!("packages/{name}/invoked.args"))).unwrap();
+    }
+    let watch = lpm(&project)
+        .args(["test", "--all", "--", "--watchAll"])
+        .output()
+        .unwrap();
+    assert!(
+        !watch.status.success(),
+        "multiple workspace watchers were launched"
+    );
+    for name in ["a", "b"] {
+        assert!(!project.file_exists(&format!("packages/{name}/invoked.args")));
+    }
+}
+
+#[test]
+fn test_and_bench_script_fallback_runs_hooks_with_npm_lifecycle_context() {
+    for tool in ["test", "bench"] {
+        for json in [false, true] {
+            let pre = format!("pre{tool}");
+            let post = format!("post{tool}");
+            let project = TempProject::empty(&serde_json::json!({"name":"fallback-lifecycle","version":"1.2.3","scripts":{&pre:"node capture.cjs",tool:"node capture.cjs",&post:"node capture.cjs"}}).to_string());
+            project.write_file("capture.cjs", "require('fs').appendFileSync('phases.jsonl',JSON.stringify({event:process.env.npm_lifecycle_event,name:process.env.npm_package_name,version:process.env.npm_package_version,args:process.argv.slice(2)})+'\\n');");
+            let mut command = lpm(&project);
+            if json {
+                command.arg("--json");
+            }
+            let output = command.args([tool, "--", "space value"]).output().unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let rows = project
+                .read_file("phases.jsonl")
+                .lines()
+                .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+                .collect::<Vec<_>>();
+            assert_eq!(rows.len(), 3, "package script hooks did not run");
+            for (index, event) in [pre.as_str(), tool, post.as_str()].iter().enumerate() {
+                assert_eq!(rows[index]["event"], *event);
+                assert_eq!(rows[index]["name"], "fallback-lifecycle");
+                assert_eq!(rows[index]["version"], "1.2.3");
+                assert_eq!(
+                    rows[index]["args"],
+                    if index == 1 {
+                        serde_json::json!(["space value"])
+                    } else {
+                        serde_json::json!([])
+                    }
+                );
+            }
+            if json {
+                let _: serde_json::Value =
+                    serde_json::from_slice(&output.stdout).expect("one JSON document");
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn test_and_bench_inherit_workspace_runtime_pins_without_overriding_member_pins() {
+    for tool in ["test", "bench"] {
+        let project = TempProject::empty(
+            r#"{"name":"runtime-workspace","private":true,"workspaces":["packages/*"]}"#,
+        );
+        project.write_file("lpm.json", r#"{"runtime":{"node":"22.0.0"}}"#);
+        for (name, version) in [("a", None), ("b", Some("24.0.0"))] {
+            project.write_file(&format!("packages/{name}/package.json"), &serde_json::json!({"name":name,"version":"1.0.0","devDependencies":{"vitest":"4.1.9"}}).to_string());
+            if let Some(version) = version {
+                project.write_file(
+                    &format!("packages/{name}/lpm.json"),
+                    &serde_json::json!({"runtime":{"node":version}}).to_string(),
+                );
+            }
+        }
+        for version in ["22.0.0", "24.0.0"] {
+            let directory = project
+                .home()
+                .join(".lpm/runtimes/node")
+                .join(version)
+                .join("bin");
+            write_unix_executable(
+                &directory.join("node"),
+                &format!(
+                    "#!/bin/sh\nif [ \"$1\" = '--version' ]; then echo v{version}; else echo '{version}' > runtime.txt; fi\n"
+                ),
+            );
+        }
+        write_unix_executable(
+            &project.path().join("node_modules/.bin/vitest"),
+            "#!/usr/bin/env node\n",
+        );
+        let output = lpm(&project).args([tool, "--all"]).output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(project.read_file("packages/a/runtime.txt").trim(), "22.0.0");
+        assert_eq!(project.read_file("packages/b/runtime.txt").trim(), "24.0.0");
+    }
+}
+
+#[test]
+fn test_and_bench_preserve_each_script_phase_exit_code() {
+    for tool in ["test", "bench"] {
+        for (prefix, code) in [("", 7), ("pre", 8), ("post", 9)] {
+            for json in [false, true] {
+                let phase = format!("{prefix}{tool}");
+                let mut scripts = serde_json::json!({tool:"node -e \"process.exit(0)\""});
+                scripts[&phase] = serde_json::json!(format!("node -e \"process.exit({code})\""));
+                let project = TempProject::empty(
+                    &serde_json::json!({"name":"phase-status","version":"1.0.0","scripts":scripts})
+                        .to_string(),
+                );
+                let mut command = lpm(&project);
+                if json {
+                    command.arg("--json");
+                }
+                let output = command.arg(tool).output().unwrap();
+                assert_eq!(
+                    output.status.code(),
+                    Some(code),
+                    "{phase} json={json}: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn test_and_bench_json_cancellation_keeps_logs_and_runs_cleanup_handlers() {
+    use std::os::unix::process::CommandExt;
+    use std::time::{Duration, Instant};
+    for tool in ["test", "bench"] {
+        let project=TempProject::empty(&serde_json::json!({"name":"stop-logs","version":"1.0.0","scripts":{format!("pre{tool}"):"node -e \"console.log('PRE_LOG')\"",tool:"node runner.cjs"}}).to_string());
+        project.write_file("runner.cjs","console.log('MAIN_LOG');console.error('ERROR_LOG');process.on('SIGTERM',()=>{require('fs').writeFileSync('cleanup','done');process.exit(0)});require('fs').writeFileSync('ready','ok');setInterval(()=>{},1000);");
+        let output_file = project.path().join("output.json");
+        let mut child = lpm_spawnable(&project)
+            .args(["--json", tool])
+            .process_group(0)
+            .stdout(std::fs::File::create(&output_file).unwrap())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let group = child.id() as i32;
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !project.file_exists("ready") && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        // SAFETY: signal only our owned fixture CLI.
+        unsafe {
+            libc::kill(group, libc::SIGTERM);
+        }
+        let deadline = Instant::now() + Duration::from_secs(4);
+        let status = loop {
+            if let Some(s) = child.try_wait().unwrap() {
+                break Some(s);
+            }
+            if Instant::now() >= deadline {
+                break None;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        // SAFETY: cleanup the isolated fixture group.
+        unsafe {
+            libc::kill(-group, libc::SIGKILL);
+        }
+        let _ = child.wait();
+        assert_eq!(status.and_then(|s| s.code()), Some(143));
+        let envelope: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(output_file).unwrap()).unwrap();
+        let out = envelope["members"][0]["stdout"]
+            .as_str()
+            .unwrap_or_default();
+        let err = envelope["members"][0]["stderr"]
+            .as_str()
+            .unwrap_or_default();
+        assert!(
+            out.contains("PRE_LOG") && out.contains("MAIN_LOG") && err.contains("ERROR_LOG"),
+            "cancelled diagnostics lost: {envelope}"
+        );
+        assert!(
+            project.file_exists("cleanup"),
+            "JSON cancellation skipped the SIGTERM handler"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn test_json_cancellation_stops_detached_descendants() {
+    use std::os::unix::process::CommandExt;
+    use std::time::{Duration, Instant};
+    let project = runner_lifetime_fixture("test", false, false, false);
+    project.write_file("runner.cjs","const fs=require('fs');const c=require('child_process').spawn(process.execPath,['-e',\"setInterval(()=>require('fs').appendFileSync('heartbeat','x'),20)\"],{stdio:'inherit',detached:true});fs.writeFileSync('detached',String(c.pid));setInterval(()=>{},1000);");
+    let mut child = lpm_spawnable(&project)
+        .args(["--json", "test"])
+        .process_group(0)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    let group = child.id() as i32;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !project.file_exists("heartbeat") && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let detached = project.read_file("detached").parse::<i32>().unwrap();
+    // SAFETY: signals target only the recorded fixture CLI.
+    unsafe {
+        libc::kill(group, libc::SIGTERM);
+    }
+    let deadline = Instant::now() + Duration::from_secs(4);
+    while child.try_wait().unwrap().is_none() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let before = project.read_file("heartbeat");
+    std::thread::sleep(Duration::from_millis(150));
+    let after = project.read_file("heartbeat");
+    // SAFETY: both groups belong only to this fixture, including its detached child.
+    unsafe {
+        libc::kill(-detached, libc::SIGKILL);
+        libc::kill(-group, libc::SIGKILL);
+    }
+    let _ = child.wait();
+    assert_eq!(before, after, "detached child survived cancellation");
+}
+
+#[cfg(unix)]
+#[test]
+fn workspace_check_does_not_swallow_stop_signals() {
+    use std::os::unix::process::CommandExt;
+    use std::time::{Duration, Instant};
+    let project =
+        TempProject::empty(r#"{"name":"check-stop","private":true,"workspaces":["packages/*"]}"#);
+    project.write_file(
+        "packages/a/package.json",
+        r#"{"name":"a","version":"1.0.0","devDependencies":{"typescript":"5.0.0"}}"#,
+    );
+    project.write_file("packages/a/tsconfig.json", "{}");
+    write_unix_executable(
+        &project.path().join("node_modules/.bin/tsc"),
+        "#!/bin/sh\necho ready > ready\nsleep 20\n",
+    );
+    let mut child = lpm_spawnable(&project)
+        .args(["check", "--all"])
+        .process_group(0)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    let group = child.id() as i32;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !project.file_exists("packages/a/ready") && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    // SAFETY: signal only the fixture CLI.
+    unsafe {
+        libc::kill(group, libc::SIGTERM);
+    }
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let exited = loop {
+        if child.try_wait().unwrap().is_some() {
+            break true;
+        }
+        if Instant::now() >= deadline {
+            break false;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    // SAFETY: cleanup only the isolated fixture group.
+    unsafe {
+        libc::kill(-group, libc::SIGKILL);
+    }
+    let _ = child.wait();
+    assert!(
+        exited,
+        "test handlers swallowed the unrelated check stop signal"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn workspace_vitest_watch_forms_cannot_bypass_the_single_member_gate() {
+    let project =
+        TempProject::empty(r#"{"name":"vitest-watch","private":true,"workspaces":["packages/*"]}"#);
+    for name in ["a", "b"] {
+        project.write_file(
+            &format!("packages/{name}/package.json"),
+            &serde_json::json!({"name":name,"devDependencies":{"vitest":"4.1.9"}}).to_string(),
+        );
+    }
+    write_unix_executable(
+        &project.path().join("node_modules/.bin/vitest"),
+        "#!/bin/sh\necho ran > ran\n",
+    );
+    for flag in ["--watch=off", "--watch=0", "--watch=FALSE", "-w=true"] {
+        let output = lpm(&project)
+            .args(["test", "--all", "--", flag])
+            .output()
+            .unwrap();
+        assert!(!output.status.success(), "{flag} bypassed watch admission");
+        assert!(!project.file_exists("packages/a/ran"));
+    }
+    for flags in [vec!["--watchAll=false"], vec!["-w", "2"]] {
+        let output = lpm(&project)
+            .args(["test", "--filter", "missing", "--"])
+            .args(flags)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "empty nonwatch selection was rejected"
+        );
+    }
+}
+
+#[test]
+fn test_and_bench_fallback_uses_task_environment_without_task_command() {
+    for tool in ["test", "bench"] {
+        let project=TempProject::empty(&serde_json::json!({"name":"task-env","version":"1.0.0","scripts":{tool:"node read.cjs"}}).to_string());
+        project.write_file(
+            "read.cjs",
+            "require('fs').writeFileSync('value',process.env.LPM_FIXTURE_TEST_VALUE);",
+        );
+        project.write_file(".env.named", "LPM_FIXTURE_TEST_VALUE=script\n");
+        project.write_file(".env.production", "LPM_FIXTURE_TEST_VALUE=task\n");
+        project.write_file("lpm.json",&serde_json::json!({"env":{tool:".env.named"},"tasks":{tool:{"command":"node absent-command.cjs","env":"production"}}}).to_string());
+        let output = lpm(&project).args(["--json", tool]).output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        assert_eq!(project.read_file("value"), "task");
+    }
+}
+
+#[test]
+fn test_and_bench_keep_pre_hook_output_pipes_through_later_phases() {
+    for tool in ["test", "bench"] {
+        let project=TempProject::empty(&serde_json::json!({"name":"late-service-output","version":"1.0.0","scripts":{format!("pre{tool}"):"node start.cjs",tool:"node check.cjs"}}).to_string());
+        project.write_file("start.cjs","const c=require('child_process').spawn(process.execPath,['service.cjs'],{stdio:'inherit'});c.unref();");
+        project.write_file("service.cjs","setInterval(()=>require('fs').appendFileSync('heartbeat','x'),10);setTimeout(()=>{console.log('LATE_SERVICE');console.error('LATE_ERROR')},500);");
+        project.write_file("check.cjs","const fs=require('fs');setTimeout(()=>{const a=fs.readFileSync('heartbeat','utf8');setTimeout(()=>{const b=fs.readFileSync('heartbeat','utf8');process.exit(b.length>a.length?7:8)},200)},600);");
+        let output = lpm(&project).args(["--json", tool]).output().unwrap();
+        assert_eq!(
+            output.status.code(),
+            Some(7),
+            "service died after its inherited pipe was closed: {}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert!(
+            value["members"][0]["stdout"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("LATE_SERVICE")
+        );
+        assert!(
+            value["members"][0]["stderr"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("LATE_ERROR")
+        );
+    }
 }

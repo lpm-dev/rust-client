@@ -346,23 +346,40 @@ async fn run_single_runner(
     } else {
         StdioMode::Inherit
     };
-    let runtime_inventory = lpm_runner::bin_path::ManagedRuntimeInventory::default();
-    let outcome = tokio::task::spawn_blocking(move || {
-        execute_runner(
-            &project_dir,
-            &boundary,
-            &runner,
-            &args,
-            stdio,
-            &runtime_inventory,
-        )
-    })
-    .await
-    .map_err(|error| {
-        LpmError::Script(format!("{0} runner task panicked: {error}", tool.label()))
-    })?;
+    let signals = Arc::new(lpm_runner::execution::ExecutionSignals::new()?);
+    let preparation = async {
+        let root_hint = super::run::ensure_runtime(&boundary).await?;
+        prepare_runner_runtime(&project_dir, &boundary, &root_hint, json_output).await
+    }
+    .await;
+    let outcome = match preparation {
+        Ok(runtime_hint) => tokio::task::spawn_blocking(move || {
+            execute_runner(
+                &project_dir,
+                &boundary,
+                &runner,
+                &args,
+                stdio,
+                &runtime_hint,
+                &signals,
+            )
+        })
+        .await
+        .map_err(|error| {
+            LpmError::Script(format!("{} runner task panicked: {error}", tool.label()))
+        })?,
+        Err(error) => runner_error(error),
+    };
     let elapsed = start.elapsed();
-    let result = outcome.as_result();
+    let result = if json_output {
+        if outcome.success() {
+            Ok(())
+        } else {
+            Err(LpmError::ExitCode(outcome.exit_code.unwrap_or(1)))
+        }
+    } else {
+        outcome.as_result()
+    };
 
     if json_output {
         let success = outcome.success();
@@ -407,10 +424,10 @@ fn detect_test_runner_from_package(
             });
         }
     }
-    if let Some(script) = package.scripts.get("test") {
+    if package.scripts.contains_key("test") {
         return Ok(DetectedRunner {
             label: "scripts.test",
-            invocation: RunnerInvocation::PackageScript(script.clone()),
+            invocation: RunnerInvocation::PackageScript("test".into()),
         });
     }
     Err(LpmError::Script(
@@ -433,15 +450,86 @@ fn detect_bench_runner_from_package(
             },
         });
     }
-    if let Some(script) = package.scripts.get("bench") {
+    if package.scripts.contains_key("bench") {
         return Ok(DetectedRunner {
             label: "scripts.bench",
-            invocation: RunnerInvocation::PackageScript(script.clone()),
+            invocation: RunnerInvocation::PackageScript("bench".into()),
         });
     }
     Err(LpmError::Script(
         "no benchmark runner found. Install vitest or add a 'bench' script to package.json".into(),
     ))
+}
+
+async fn prepare_runner_runtime(
+    project_dir: &Path,
+    boundary: &Path,
+    root_hint: &lpm_runner::bin_path::ManagedRuntimeHint,
+    json_output: bool,
+) -> Result<lpm_runner::bin_path::ManagedRuntimeHint, LpmError> {
+    let hint = if project_dir == boundary {
+        root_hint.clone()
+    } else {
+        let selected = lpm_runtime::detect::detect_runtime_versions(project_dir)?;
+        if selected.is_empty() {
+            root_hint.clone()
+        } else {
+            let runtimes = selected
+                .iter()
+                .map(|entry| entry.runtime)
+                .collect::<Vec<_>>();
+            super::run::ensure_detected_runtimes(selected)
+                .await
+                .inherit_unselected_from(root_hint, &runtimes)
+        }
+    };
+    let requirements =
+        crate::engine_check::resolve_execution_node_engine_requirements(project_dir)?;
+    if !requirements.is_empty() {
+        let path =
+            lpm_runner::bin_path::build_path_with_bins_bounded(project_dir, boundary, &hint)?;
+        let node = lpm_runtime::effective::resolve_node_on_path_with_fingerprint(
+            project_dir,
+            std::ffi::OsStr::new(&path),
+        );
+        for requirement in requirements {
+            crate::engine_check::enforce_resolved_node_requirement_for_run(
+                requirement.required,
+                requirement.engine_strict,
+                requirement.source,
+                node.clone(),
+                json_output,
+            )?;
+        }
+    }
+    Ok(hint)
+}
+
+fn runner_error(error: LpmError) -> ToolOutcome {
+    match error {
+        LpmError::ExitCode(code) => ToolOutcome {
+            exit_code: Some(code),
+            ..Default::default()
+        },
+        LpmError::ScriptPhase {
+            phase,
+            code,
+            stdout,
+            stderr,
+        } => ToolOutcome {
+            exit_code: Some(code),
+            captured: Captured { stdout, stderr },
+            error: if matches!(phase.as_str(), "test" | "bench") {
+                None
+            } else {
+                Some(format!("script '{phase}' failed with exit code {code}"))
+            },
+        },
+        error => ToolOutcome {
+            error: Some(error.to_string()),
+            ..Default::default()
+        },
+    }
 }
 
 fn execute_runner(
@@ -450,35 +538,34 @@ fn execute_runner(
     runner: &DetectedRunner,
     forwarded_args: &[String],
     stdio: StdioMode,
-    runtime_inventory: &lpm_runner::bin_path::ManagedRuntimeInventory,
+    runtime_hint: &lpm_runner::bin_path::ManagedRuntimeHint,
+    signals: &lpm_runner::execution::ExecutionSignals,
 ) -> ToolOutcome {
-    let result = runtime_inventory
-        .resolve_for_project(project_dir)
-        .and_then(|runtime_hint| match &runner.invocation {
-            RunnerInvocation::LocalBin { name, base_args } => execute_local_runner(
-                project_dir,
-                boundary,
-                name,
-                base_args,
-                forwarded_args,
-                stdio,
-                &runtime_hint,
-            ),
-            RunnerInvocation::PackageScript(script) => execute_package_script(
-                project_dir,
-                boundary,
-                script,
-                forwarded_args,
-                stdio,
-                &runtime_hint,
-            ),
-        });
-    result.unwrap_or_else(|error| ToolOutcome {
-        error: Some(error.to_string()),
-        ..Default::default()
-    })
+    let result = signals.check().and_then(|()| match &runner.invocation {
+        RunnerInvocation::LocalBin { name, base_args } => execute_local_runner(
+            project_dir,
+            boundary,
+            name,
+            base_args,
+            forwarded_args,
+            stdio,
+            runtime_hint,
+            signals,
+        ),
+        RunnerInvocation::PackageScript(script) => execute_package_script(
+            project_dir,
+            boundary,
+            script,
+            forwarded_args,
+            stdio,
+            runtime_hint,
+            signals,
+        ),
+    });
+    result.unwrap_or_else(runner_error)
 }
 
+#[expect(clippy::too_many_arguments)]
 fn execute_local_runner(
     project_dir: &Path,
     boundary: &Path,
@@ -487,6 +574,7 @@ fn execute_local_runner(
     forwarded_args: &[String],
     stdio: StdioMode,
     runtime_hint: &lpm_runner::bin_path::ManagedRuntimeHint,
+    signals: &lpm_runner::execution::ExecutionSignals,
 ) -> Result<ToolOutcome, LpmError> {
     let args = local_runner_args(name, base_args, forwarded_args);
 
@@ -502,13 +590,11 @@ fn execute_local_runner(
     let mut outcome = ToolOutcome::default();
     match stdio {
         StdioMode::Inherit => {
-            let status = command.status().map_err(|error| {
-                LpmError::Script(format!("failed to execute '{name}': {error}"))
-            })?;
+            let status = signals.run(&mut command)?;
             outcome.exit_code = Some(lpm_runner::shell::exit_code(&status));
         }
         StdioMode::Capture => {
-            let captured = lpm_runner::shell::spawn_command_capture(command, name)?;
+            let captured = signals.capture(&mut command)?;
             outcome.exit_code = Some(lpm_runner::shell::exit_code(&captured.status));
             outcome.captured = Captured {
                 stdout: captured.stdout,
@@ -539,34 +625,25 @@ fn execute_package_script(
     forwarded_args: &[String],
     stdio: StdioMode,
     runtime_hint: &lpm_runner::bin_path::ManagedRuntimeHint,
+    signals: &lpm_runner::execution::ExecutionSignals,
 ) -> Result<ToolOutcome, LpmError> {
-    let path =
-        lpm_runner::bin_path::build_path_with_bins_bounded(project_dir, boundary, runtime_hint)?;
-    let env_vars = lpm_runner::dotenv::load_env_files(project_dir, None)?;
-    let command =
-        lpm_runner::script::assemble_shell_command(script, forwarded_args, project_dir, &path)?;
-    let shell_command = lpm_runner::shell::ShellCommand {
-        command: &command,
-        cwd: project_dir,
-        path: &path,
-        envs: &env_vars,
-    };
-    let mut outcome = ToolOutcome::default();
-    match stdio {
-        StdioMode::Inherit => {
-            let status = lpm_runner::shell::spawn_shell(&shell_command)?;
-            outcome.exit_code = Some(lpm_runner::shell::exit_code(&status));
-        }
-        StdioMode::Capture => {
-            let captured = lpm_runner::shell::spawn_shell_capture(&shell_command)?;
-            outcome.exit_code = Some(lpm_runner::shell::exit_code(&captured.status));
-            outcome.captured = Captured {
-                stdout: captured.stdout,
-                stderr: captured.stderr,
-            };
-        }
-    }
-    Ok(outcome)
+    let output = lpm_runner::script::run_package_script_bounded(
+        project_dir,
+        boundary,
+        script,
+        forwarded_args,
+        runtime_hint,
+        signals,
+        stdio == StdioMode::Capture,
+    )?;
+    Ok(ToolOutcome {
+        exit_code: Some(0),
+        captured: Captured {
+            stdout: output.stdout,
+            stderr: output.stderr,
+        },
+        error: None,
+    })
 }
 
 // --- Helpers ---
@@ -604,15 +681,14 @@ impl ToolOutcome {
     }
 
     fn as_result(&self) -> Result<(), LpmError> {
-        if let Some(error) = &self.error {
-            return Err(LpmError::Script(error.clone()));
-        }
         match self.exit_code {
-            Some(0) => Ok(()),
-            Some(code) => Err(LpmError::ExitCode(code)),
-            None => Err(LpmError::Script(
-                "tool exited without an exit code".to_string(),
-            )),
+            Some(0) if self.error.is_none() => Ok(()),
+            Some(code) if code != 0 => Err(LpmError::ExitCode(code)),
+            _ => {
+                Err(LpmError::Script(self.error.clone().unwrap_or_else(|| {
+                    "tool exited without an exit code".into()
+                })))
+            }
         }
     }
 
@@ -777,15 +853,26 @@ fn apply_stdio(cmd: &mut Command, stdio: StdioMode) {
 }
 
 /// Returns `true` if the forwarded args contain a watch-mode opt-in.
-fn args_imply_watch(args: &[String]) -> bool {
+fn enabled_watch_option(args: &[String], flags: &[&str]) -> bool {
     args.iter().any(|arg| {
-        if arg == "--watch" || arg == "-w" {
-            return true;
-        }
-        arg.strip_prefix("--watch=").is_some_and(|value| {
-            !matches!(value.to_ascii_lowercase().as_str(), "false" | "0" | "off")
-        })
+        let (key, value) = arg.split_once('=').unwrap_or((arg.as_str(), "true"));
+        flags.contains(&key) && value != "false"
     })
+}
+
+fn args_imply_watch(args: &[String]) -> bool {
+    enabled_watch_option(args, &["--watch", "-w"])
+}
+
+fn runner_implies_watch(runner: &DetectedRunner, args: &[String]) -> bool {
+    if matches!(
+        &runner.invocation,
+        RunnerInvocation::LocalBin { name: "jest", .. }
+    ) {
+        enabled_watch_option(args, &["--watch", "--watchAll"])
+    } else {
+        args_imply_watch(args)
+    }
 }
 
 /// Auto-detect the test runner from package.json devDependencies.
@@ -914,26 +1001,40 @@ pub async fn tool_workspace(
         return Ok(());
     }
 
-    let runner_tasks = RunnerTool::from_label(tool).ok().map(|runner_tool| {
+    let signals = if matches!(tool, "test" | "bench") {
+        Some(Arc::new(lpm_runner::execution::ExecutionSignals::new()?))
+    } else {
+        None
+    };
+    let runner_tasks = if let Some(signals) = &signals {
+        let runner_tool = RunnerTool::from_label(tool)?;
         let boundary = Arc::new(workspace.root.clone());
-        let runtime_inventory = Arc::new(lpm_runner::bin_path::ManagedRuntimeInventory::default());
-        workspace
-            .members
-            .iter()
-            .map(|member| {
-                let runner = match runner_tool {
-                    RunnerTool::Test => detect_test_runner_from_package(&member.package),
-                    RunnerTool::Bench => detect_bench_runner_from_package(&member.package),
-                }
-                .map_err(|error| error.to_string());
-                RunnerTask {
-                    boundary: Arc::clone(&boundary),
-                    runner,
-                    runtime_inventory: Arc::clone(&runtime_inventory),
-                }
-            })
-            .collect::<Vec<_>>()
-    });
+        let root_hint = super::run::ensure_runtime(&workspace.root).await?;
+        let mut tasks = Vec::with_capacity(workspace.members.len());
+        for (index, member) in workspace.members.iter().enumerate() {
+            let runner = match runner_tool {
+                RunnerTool::Test => detect_test_runner_from_package(&member.package),
+                RunnerTool::Bench => detect_bench_runner_from_package(&member.package),
+            }
+            .map_err(|error| error.to_string());
+            let runtime_hint = if target_set.contains(&index) && runner.is_ok() {
+                prepare_runner_runtime(&member.path, &workspace.root, &root_hint, json_output)
+                    .await
+                    .map_err(|error| error.to_string())
+            } else {
+                Ok(lpm_runner::bin_path::ManagedRuntimeHint::Absent)
+            };
+            tasks.push(RunnerTask {
+                boundary: Arc::clone(&boundary),
+                runner,
+                runtime_hint,
+                signals: Arc::clone(signals),
+            });
+        }
+        Some(tasks)
+    } else {
+        None
+    };
 
     // Pre-resolve plugin once at root for lint/fmt — covers the homogeneous
     // cold-cache race where N parallel members would all call ensure_plugin
@@ -1010,6 +1111,10 @@ pub async fn tool_workspace(
         emit_human_summary(tool, total, succeeded, failed, target_set.len(), elapsed);
     }
 
+    if let Some(signals) = &signals {
+        signals.check()?;
+    }
+
     if failed > 0 {
         return Err(LpmError::ExitCode(1));
     }
@@ -1075,7 +1180,8 @@ struct MemberResult {
 struct RunnerTask {
     boundary: Arc<PathBuf>,
     runner: Result<DetectedRunner, String>,
-    runtime_inventory: Arc<lpm_runner::bin_path::ManagedRuntimeInventory>,
+    runtime_hint: Result<lpm_runner::bin_path::ManagedRuntimeHint, String>,
+    signals: Arc<lpm_runner::execution::ExecutionSignals>,
 }
 
 fn member_result(name: String, outcome: ToolOutcome, elapsed: std::time::Duration) -> MemberResult {
@@ -1304,16 +1410,17 @@ async fn run_runner_member(
         };
     };
     let member_dir = member_dir.to_path_buf();
-    tokio::task::spawn_blocking(move || match task.runner {
-        Ok(runner) => execute_runner(
+    tokio::task::spawn_blocking(move || match (task.runner, task.runtime_hint) {
+        (Ok(runner), Ok(runtime_hint)) => execute_runner(
             &member_dir,
             &task.boundary,
             &runner,
             &args,
             stdio,
-            &task.runtime_inventory,
+            &runtime_hint,
+            &task.signals,
         ),
-        Err(error) => ToolOutcome {
+        (Err(error), _) | (_, Err(error)) => ToolOutcome {
             error: Some(error),
             ..Default::default()
         },
@@ -1386,7 +1493,7 @@ pub async fn dispatch_test_or_bench(
     // Resolve workspace target selection up-front when watch is requested,
     // so we can hand off to single-package mode for the one-member case
     // before paying the orchestrator setup cost.
-    if workspace_mode && args_imply_watch(args) {
+    if workspace_mode && enabled_watch_option(args, &["--watch", "-w", "--watchAll"]) {
         let workspace = lpm_workspace::discover_workspace(project_dir)
             .map_err(|e| LpmError::Script(format!("workspace error: {e}")))?
             .ok_or_else(|| {
@@ -1407,28 +1514,44 @@ pub async fn dispatch_test_or_bench(
             affected_ref_for_select.unwrap_or("main"),
         )?;
 
-        match target_set.len() {
-            0 => {
-                return Err(LpmError::Script(format!(
-                    "no workspace member matched the selection — nothing to watch with `lpm {tool} --watch`."
-                )));
-            }
-            1 => {
-                let idx = *target_set.iter().next().expect("len == 1");
-                let member_dir = ws_graph.members[idx].path.clone();
-                return match tool {
-                    "test" => test(&member_dir, args, json_output).await,
-                    "bench" => bench(&member_dir, args, json_output).await,
-                    other => Err(LpmError::Script(format!("unknown runner tool: {other}"))),
+        let watching = (target_set.is_empty()
+            && enabled_watch_option(args, &["--watch", "--watchAll"]))
+            || target_set.iter().any(|index| {
+                let package = &workspace.members[*index].package;
+                let runner = if tool == "test" {
+                    detect_test_runner_from_package(package)
+                } else {
+                    detect_bench_runner_from_package(package)
                 };
-            }
-            n => {
-                return Err(LpmError::Script(format!(
-                    "--watch is not supported when the selection resolves to {n} members for `lpm {tool}` \
+                runner.map_or_else(
+                    |_| args_imply_watch(args),
+                    |runner| runner_implies_watch(&runner, args),
+                )
+            });
+        if watching {
+            match target_set.len() {
+                0 => {
+                    return Err(LpmError::Script(format!(
+                        "no workspace member matched the selection — nothing to watch with `lpm {tool} --watch`."
+                    )));
+                }
+                1 => {
+                    let idx = *target_set.iter().next().expect("len == 1");
+                    let member_dir = ws_graph.members[idx].path.clone();
+                    return match tool {
+                        "test" => test(&member_dir, args, json_output).await,
+                        "bench" => bench(&member_dir, args, json_output).await,
+                        other => Err(LpmError::Script(format!("unknown runner tool: {other}"))),
+                    };
+                }
+                n => {
+                    return Err(LpmError::Script(format!(
+                        "--watch is not supported when the selection resolves to {n} members for `lpm {tool}` \
                      (would start one watcher per member). Narrow the selection so it resolves to exactly \
                      one member, e.g. `lpm {tool} --filter <single-name> --watch`, or run from the member's \
                      directory with `cd <member> && lpm {tool} --watch`."
-                )));
+                    )));
+                }
             }
         }
     }
@@ -1704,7 +1827,7 @@ mod tests {
 
     #[test]
     fn args_imply_watch_rejects_explicit_false_values() {
-        for value in ["--watch=false", "--watch=0", "--watch=off"] {
+        for value in ["--watch=false", "-w=false"] {
             assert!(!args_imply_watch(&[value.into()]));
         }
     }
@@ -2018,7 +2141,7 @@ mod tests {
         assert_eq!(runner.label, "scripts.test");
         assert_eq!(
             runner.invocation,
-            RunnerInvocation::PackageScript("node test.js".into())
+            RunnerInvocation::PackageScript("test".into())
         );
     }
 
@@ -2078,7 +2201,7 @@ mod tests {
         assert_eq!(runner.label, "scripts.bench");
         assert_eq!(
             runner.invocation,
-            RunnerInvocation::PackageScript("node bench.js".into())
+            RunnerInvocation::PackageScript("bench".into())
         );
     }
 

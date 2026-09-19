@@ -593,12 +593,63 @@ fn run_script_with_output(
     bin_hint: &ManagedRuntimeHint,
     mut spawn: impl FnMut(&ShellCommand<'_>) -> Result<shell::CapturedOutput, LpmError>,
 ) -> Result<ScriptOutput, LpmError> {
+    let path = bin_path::build_path_with_bins_pre_resolved(project_dir, bin_hint)?;
+    run_script_with_output_at_path(
+        project_dir,
+        script_name,
+        extra_args,
+        env_mode,
+        &path,
+        &mut spawn,
+    )
+}
+
+/// Run a package script and its hooks within a workspace PATH boundary.
+/// A shared signal scope prevents later hooks from starting after cancellation.
+pub fn run_package_script_bounded(
+    project_dir: &Path,
+    boundary: &Path,
+    script_name: &str,
+    extra_args: &[String],
+    bin_hint: &ManagedRuntimeHint,
+    signals: &crate::execution::ExecutionSignals,
+    capture: bool,
+) -> Result<ScriptOutput, LpmError> {
+    let mut capture_session = lpm_common::process_output::CaptureSession::default();
+    let path = bin_path::build_path_with_bins_bounded(project_dir, boundary, bin_hint)?;
+    run_script_with_output_at_path(project_dir, script_name, extra_args, None, &path, |spec| {
+        let mut command = shell::shell_process(spec.command)?;
+        shell::strip_inherited_env_hooks(&mut command);
+        command
+            .current_dir(spec.cwd)
+            .envs(spec.envs)
+            .env("PATH", spec.path);
+        if capture {
+            signals.capture_in_session(&mut command, &mut capture_session)
+        } else {
+            let status = signals.run(&mut command)?;
+            Ok(shell::CapturedOutput {
+                status,
+                stdout: String::new(),
+                stderr: String::new(),
+            })
+        }
+    })
+}
+
+fn run_script_with_output_at_path(
+    project_dir: &Path,
+    script_name: &str,
+    extra_args: &[String],
+    env_mode: Option<&str>,
+    path: &str,
+    mut spawn: impl FnMut(&ShellCommand<'_>) -> Result<shell::CapturedOutput, LpmError>,
+) -> Result<ScriptOutput, LpmError> {
     let ResolvedScript {
         command,
         scripts,
         context,
     } = resolve_script_command(project_dir, script_name)?;
-    let path = bin_path::build_path_with_bins_pre_resolved(project_dir, bin_hint)?;
     let mut environment = resolve_and_load_env(project_dir, script_name, env_mode)?.vars;
     mark_script_child_env(&mut environment);
     let pre_name = hooks::pre_hook_name(script_name);
@@ -625,18 +676,28 @@ fn run_script_with_output(
         context.apply(&mut environment, phase, declared_command);
         let full_command;
         let command = if phase == script_name {
-            full_command =
-                assemble_shell_command(declared_command, extra_args, project_dir, &path)?;
+            full_command = assemble_shell_command(declared_command, extra_args, project_dir, path)?;
             full_command.as_str()
         } else {
             declared_command
         };
-        let captured = spawn(&ShellCommand {
+        let captured = match spawn(&ShellCommand {
             command,
             cwd: project_dir,
-            path: &path,
+            path,
             envs: &environment,
-        })?;
+        }) {
+            Ok(captured) => captured,
+            Err(LpmError::ExitCode(code)) => {
+                return Err(LpmError::ScriptPhase {
+                    phase: phase.to_string(),
+                    code,
+                    stdout: output.stdout,
+                    stderr: output.stderr,
+                });
+            }
+            Err(error) => return Err(error),
+        };
         shell::append_capped_output(&mut output.stdout, &captured.stdout);
         shell::append_capped_output(&mut output.stderr, &captured.stderr);
         if !captured.status.success() {
@@ -2191,6 +2252,48 @@ mod tests {
     }
 
     // --- run_script_buffered tests ---
+
+    #[cfg(unix)]
+    #[test]
+    fn script_phase_boundary_cancellation_preserves_completed_hook_output() {
+        use std::os::unix::process::ExitStatusExt;
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("package.json"),
+            r#"{"scripts":{"pretest":"pre","test":"main"}}"#,
+        )
+        .unwrap();
+        let mut calls = 0;
+        let result =
+            run_script_with_output_at_path(dir.path(), "test", &[], None, "/usr/bin:/bin", |_| {
+                calls += 1;
+                if calls == 1 {
+                    Ok(shell::CapturedOutput {
+                        status: std::process::ExitStatus::from_raw(0),
+                        stdout: "PRE_LOG\n".into(),
+                        stderr: "PRE_ERROR\n".into(),
+                    })
+                } else {
+                    Err(LpmError::ExitCode(143))
+                }
+            });
+        match result {
+            Err(LpmError::ScriptPhase {
+                code,
+                stdout,
+                stderr,
+                ..
+            }) => {
+                assert_eq!(code, 143);
+                assert_eq!(stdout, "PRE_LOG\n");
+                assert_eq!(stderr, "PRE_ERROR\n");
+            }
+            other => panic!(
+                "phase cancellation lost prior output: {}",
+                other.err().unwrap()
+            ),
+        }
+    }
 
     #[test]
     fn run_script_buffered_captures_without_tee() {
