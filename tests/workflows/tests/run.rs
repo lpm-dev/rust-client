@@ -4937,3 +4937,27 @@ async fn assert_remote_cache_access_messages(upload_only: bool) {
         assert_eq!(project.read_file("dist/value.txt"), "remote-hit");
     }
 }
+
+#[test]
+fn inherited_schema_values_keep_their_cache_env_selection() {
+    let project = TempProject::empty(r#"{"name":"schema-cache-env","version":"1.0.0"}"#);
+    project.write_file("lpm.json",r#"{"tasks":{"build":{"command":"node build.js","cache":true,"outputs":["dist/**"],"cacheEnv":[]}},"envSchema":{"vars":{"APPLICATION_PORT":{"format":"port"}}}}"#);
+    project.write_file("build.js", "const fs=require('fs');fs.mkdirSync('dist',{recursive:true});fs.writeFileSync('dist/result.txt','output');fs.appendFileSync('runs.txt','run\\n');");
+    for port in ["4000", "5000"] {
+        let output = lpm(&project)
+            .env("APPLICATION_PORT", port)
+            .args(["run", "build"])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    assert_eq!(
+        project.read_file("runs.txt").lines().count(),
+        1,
+        "excluded inherited schema value invalidated task cache"
+    );
+}

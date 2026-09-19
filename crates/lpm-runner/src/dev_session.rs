@@ -303,8 +303,16 @@ fn restore_session_record(path: &Path, previous: Option<&[u8]>) -> Result<(), Lp
     Ok(())
 }
 
+#[cfg(unix)]
 fn sync_directory(directory: &Path) -> std::io::Result<()> {
     std::fs::File::open(directory)?.sync_all()
+}
+
+#[cfg(not(unix))]
+fn sync_directory(_directory: &Path) -> std::io::Result<()> {
+    // Windows cannot open directories as files for fsync. The staged record
+    // is already flushed by write_file_atomic, matching its directory policy.
+    Ok(())
 }
 
 fn session_key(project_dir: &Path, service: Option<&str>) -> String {

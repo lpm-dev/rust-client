@@ -285,10 +285,7 @@ pub fn run_script_with_envs(
     print_env_context(&loaded);
     let mut env_vars = loaded.vars;
     for (key, value) in extra_envs {
-        if cfg!(windows) {
-            env_vars.retain(|existing, _| !existing.eq_ignore_ascii_case(key));
-        }
-        env_vars.insert(key.clone(), value.clone());
+        dotenv::insert_project_env(&mut env_vars, key.clone(), value.clone());
     }
     mark_script_child_env(&mut env_vars);
 
@@ -392,31 +389,45 @@ pub fn run_dev_script_with_envs_and_config(
     config: Option<&lpm_json::LpmJsonConfig>,
     endpoint_options: DevScriptEndpointOptions,
 ) -> Result<(), LpmError> {
+    #[cfg(unix)]
+    let _stop_signals = shell::register_stop_signals(&endpoint_options.stop_requested)?;
     let ResolvedScript {
         command: script_cmd,
         scripts,
         context,
-    } = resolve_script_command_with_config(project_dir, "dev", config)?;
+    } = resolve_script_command_with_config(
+        project_dir,
+        "dev",
+        config,
+        ScriptPreference::TaskCommand,
+    )?;
     let path = bin_path::build_path_with_bins_pre_resolved(project_dir, bin_hint)?;
-    let loaded = resolve_and_load_env_with_config(project_dir, "dev", env_mode, config)?;
+    let loaded =
+        resolve_and_load_env_with_schema_validation(project_dir, "dev", env_mode, config, false)?;
     print_env_context(&loaded);
     let mut env_vars = loaded.vars;
     for (key, value) in extra_envs {
-        if cfg!(windows) {
-            env_vars.retain(|existing, _| !existing.eq_ignore_ascii_case(key));
-        }
-        env_vars.insert(key.clone(), value.clone());
+        dotenv::insert_project_env(&mut env_vars, key.clone(), value.clone());
+    }
+    if !should_skip_env_validation() {
+        dotenv::validate_project_env(&mut env_vars, config)?;
     }
     mark_script_child_env(&mut env_vars);
 
     if let Some(pre_cmd) = hooks::find_pre_hook(&scripts, "dev") {
         context.apply(&mut env_vars, "predev", pre_cmd);
-        let status = shell::spawn_shell(&ShellCommand {
-            command: pre_cmd,
-            cwd: project_dir,
-            path: &path,
-            envs: &env_vars,
-        })?;
+        let status = shell::spawn_shell_cancellable(
+            &ShellCommand {
+                command: pre_cmd,
+                cwd: project_dir,
+                path: &path,
+                envs: &env_vars,
+            },
+            &endpoint_options.stop_requested,
+        )?;
+        if endpoint_options.stop_requested.load(Ordering::Acquire) {
+            return Ok(());
+        }
         if !status.success() {
             return Err(script_phase_error(
                 "predev",
@@ -453,12 +464,18 @@ pub fn run_dev_script_with_envs_and_config(
 
     if let Some(post_cmd) = hooks::find_post_hook(&scripts, "dev") {
         context.apply(&mut env_vars, "postdev", post_cmd);
-        let status = shell::spawn_shell(&ShellCommand {
-            command: post_cmd,
-            cwd: project_dir,
-            path: &path,
-            envs: &env_vars,
-        })?;
+        let status = shell::spawn_shell_cancellable(
+            &ShellCommand {
+                command: post_cmd,
+                cwd: project_dir,
+                path: &path,
+                envs: &env_vars,
+            },
+            &endpoint_options.stop_requested,
+        )?;
+        if endpoint_options.stop_requested.load(Ordering::Acquire) {
+            return Ok(());
+        }
         if !status.success() {
             return Err(script_phase_error(
                 "postdev",
@@ -704,10 +721,7 @@ fn run_command_buffered_named(
     let path = bin_path::build_path_with_bins_pre_resolved(project_dir, bin_hint)?;
     let mut env_vars = resolve_and_load_env(project_dir, task_name, env_mode)?.vars;
     for (key, value) in extra_envs {
-        if cfg!(windows) {
-            env_vars.retain(|existing, _| !existing.eq_ignore_ascii_case(key));
-        }
-        env_vars.insert(key.clone(), value.clone());
+        dotenv::insert_project_env(&mut env_vars, key.clone(), value.clone());
     }
     if !task_name.is_empty() {
         NpmScriptContext::load(project_dir, &std::env::current_dir()?)?.apply(
@@ -936,10 +950,7 @@ fn run_command_named_with_envs(
     let path = bin_path::build_path_with_bins_pre_resolved(project_dir, bin_hint)?;
     let mut env_vars = resolve_and_load_env(project_dir, task_name, env_mode)?.vars;
     for (key, value) in extra_envs {
-        if cfg!(windows) {
-            env_vars.retain(|existing, _| !existing.eq_ignore_ascii_case(key));
-        }
-        env_vars.insert(key.clone(), value.clone());
+        dotenv::insert_project_env(&mut env_vars, key.clone(), value.clone());
     }
     if !task_name.is_empty() {
         NpmScriptContext::load(project_dir, &std::env::current_dir()?)?.apply(
@@ -1371,6 +1382,22 @@ fn resolve_and_load_env_with_config(
     explicit_mode: Option<&str>,
     config: Option<&lpm_json::LpmJsonConfig>,
 ) -> Result<LoadedEnv, LpmError> {
+    resolve_and_load_env_with_schema_validation(
+        project_dir,
+        script_name,
+        explicit_mode,
+        config,
+        !should_skip_env_validation(),
+    )
+}
+
+fn resolve_and_load_env_with_schema_validation(
+    project_dir: &Path,
+    script_name: &str,
+    explicit_mode: Option<&str>,
+    config: Option<&lpm_json::LpmJsonConfig>,
+    validate_schema: bool,
+) -> Result<LoadedEnv, LpmError> {
     // Determine the canonical env name via the resolver.
     // Priority: 1. explicit --env flag  2. lpm.json script mapping  3. None
     let (resolved, source) = if let Some(m) = explicit_mode {
@@ -1397,8 +1424,13 @@ fn resolve_and_load_env_with_config(
     };
     let env_name = resolved.as_ref().map(|env| env.canonical.as_str());
     let file_path = resolved.as_ref().and_then(|env| env.file_path.as_deref());
-    let loaded =
-        dotenv::load_project_env_details_with_config(project_dir, env_name, file_path, config)?;
+    let loaded = dotenv::load_project_env_details_with_config_and_schema_validation(
+        project_dir,
+        env_name,
+        file_path,
+        config,
+        validate_schema,
+    )?;
 
     Ok(LoadedEnv {
         vars: loaded.vars,
@@ -1432,9 +1464,26 @@ pub fn load_script_env_with_config(
     Ok(resolve_and_load_env_with_config(project_dir, script_name, explicit_mode, config)?.vars)
 }
 
-/// Resolve only a script command from package.json or lpm.json tasks.
+pub(crate) fn load_script_env_without_schema(
+    project_dir: &Path,
+    script_name: &str,
+    explicit_mode: Option<&str>,
+    config: Option<&lpm_json::LpmJsonConfig>,
+) -> Result<HashMap<String, String>, LpmError> {
+    Ok(resolve_and_load_env_with_schema_validation(
+        project_dir,
+        script_name,
+        explicit_mode,
+        config,
+        false,
+    )?
+    .vars)
+}
+
+/// Resolve a development command, preferring an explicit lpm.json task command.
 pub fn script_command(project_dir: &Path, script_name: &str) -> Result<String, LpmError> {
-    resolve_script_command(project_dir, script_name).map(|resolved| resolved.command)
+    let config = lpm_json::read_lpm_json(project_dir).map_err(LpmError::Script)?;
+    script_command_with_config(project_dir, script_name, config.as_ref())
 }
 
 pub fn script_command_with_config(
@@ -1442,8 +1491,13 @@ pub fn script_command_with_config(
     script_name: &str,
     config: Option<&lpm_json::LpmJsonConfig>,
 ) -> Result<String, LpmError> {
-    resolve_script_command_with_config(project_dir, script_name, config)
-        .map(|resolved| resolved.command)
+    resolve_script_command_with_config(
+        project_dir,
+        script_name,
+        config,
+        ScriptPreference::TaskCommand,
+    )
+    .map(|resolved| resolved.command)
 }
 
 /// Resolve a script command from package.json or lpm.json tasks.
@@ -1459,18 +1513,30 @@ struct ResolvedScript {
     context: NpmScriptContext,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ScriptPreference {
+    PackageScript,
+    TaskCommand,
+}
+
 fn resolve_script_command(
     project_dir: &Path,
     script_name: &str,
 ) -> Result<ResolvedScript, LpmError> {
     let config = lpm_json::read_lpm_json(project_dir).map_err(LpmError::Script)?;
-    resolve_script_command_with_config(project_dir, script_name, config.as_ref())
+    resolve_script_command_with_config(
+        project_dir,
+        script_name,
+        config.as_ref(),
+        ScriptPreference::PackageScript,
+    )
 }
 
 fn resolve_script_command_with_config(
     project_dir: &Path,
     script_name: &str,
     lpm_config: Option<&lpm_json::LpmJsonConfig>,
+    preference: ScriptPreference,
 ) -> Result<ResolvedScript, LpmError> {
     let pkg_json_path = project_dir.join("package.json");
 
@@ -1491,34 +1557,27 @@ fn resolve_script_command_with_config(
         &std::env::current_dir()?,
     );
 
-    if let Some(pkg) = &package
-        && let Some(cmd) = pkg.scripts.get(script_name)
+    let task_command = lpm_config
+        .and_then(|config| config.tasks.get(script_name))
+        .and_then(|task| task.command.as_ref());
+
+    if (preference == ScriptPreference::PackageScript || task_command.is_none())
+        && let Some(pkg) = &package
+        && let Some(command) = pkg.scripts.get(script_name)
     {
         return Ok(ResolvedScript {
-            command: cmd.clone(),
+            command: command.clone(),
             scripts: pkg.scripts.clone(),
             context,
         });
     }
 
-    if let Some(config) = lpm_config {
-        for (task_name, task_config) in &config.tasks {
-            if task_name == script_name
-                && let Some(cmd) = &task_config.command
-            {
-                // Build a scripts map from lpm.json tasks for hook resolution
-                let scripts: HashMap<String, String> = config
-                    .tasks
-                    .iter()
-                    .filter_map(|(k, v)| v.command.as_ref().map(|c| (k.clone(), c.clone())))
-                    .collect();
-                return Ok(ResolvedScript {
-                    command: cmd.clone(),
-                    scripts,
-                    context,
-                });
-            }
-        }
+    if let Some(command) = task_command {
+        return Ok(ResolvedScript {
+            command: command.clone(),
+            scripts: HashMap::new(),
+            context,
+        });
     }
 
     // Neither package.json nor lpm.json had the script

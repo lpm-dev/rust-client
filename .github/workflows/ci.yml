@@ -535,6 +535,14 @@ jobs:
       - name: Windows port backend tests
         run: cargo test --locked -p lpm-runner ports::tests
 
+      - name: Windows environment name tests
+        run: |
+          cargo test --locked -p lpm-runner dotenv::
+
+      - name: Windows dev session persistence tests
+        run: |
+          cargo test --locked -p lpm-runner dev_session::
+
       - name: Windows proxy named-pipe tests
         run: cargo test --locked -p lpm-proxy named_pipe
 
@@ -545,6 +553,9 @@ jobs:
         run: |
           cargo test --locked -p lpm-workflows --test run_runtime workspace_resolves_windows_current_directory_node_before_path
           cargo test --locked -p lpm-workflows --test run_runtime workspace_does_not_reuse_shared_node_shim_version_across_member_cwds
+
+      - name: Windows dev environment workflow tests
+        run: cargo test --locked -p lpm-workflows --test dev dev_schema_
 
       - name: Windows live port kill workflow test
         run: cargo test --locked -p lpm-workflows --test ports ports_kill_range_json_with_yes_terminates_live_listener_process
