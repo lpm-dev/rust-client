@@ -65,7 +65,7 @@ impl ExecutionSignals {
         #[cfg(unix)]
         let mut stopped_descendants = None;
         let result =
-            session.capture_output(command, lpm_common::TASK_OUTPUT_CAPTURE_BYTES, |_pid| {
+            session.capture_output(command, lpm_common::TASK_OUTPUT_CAPTURE_BYTES + 1, |_pid| {
                 let signal = self.signal.load(Ordering::Acquire) as i32;
                 if signal == 0 {
                     return None;
@@ -84,8 +84,22 @@ impl ExecutionSignals {
         }
         let output = result?;
         let bounded_text = |bytes: &[u8]| {
-            let mut text = String::new();
-            crate::shell::append_capped_output(&mut text, &String::from_utf8_lossy(bytes));
+            let limit = lpm_common::TASK_OUTPUT_CAPTURE_BYTES;
+            let mut text = String::from_utf8_lossy(bytes).into_owned();
+            if text.len() > limit {
+                let mut end = limit;
+                while !text.is_char_boundary(end) {
+                    end -= 1;
+                }
+                text.truncate(end);
+                if !text.ends_with('\n') {
+                    text.push('\n');
+                }
+                text.push_str(&format!(
+                    "[output truncated at {} MiB]\n",
+                    limit / (1024 * 1024)
+                ));
+            }
             text
         };
         let status = output.status;
