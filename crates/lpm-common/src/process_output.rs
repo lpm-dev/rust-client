@@ -442,6 +442,7 @@ fn windows_job(child: &Child) -> io::Result<std::os::windows::io::OwnedHandle> {
 
 #[cfg(windows)]
 fn resume(child: &Child) -> io::Result<()> {
+    use std::os::windows::io::AsRawHandle;
     #[link(name = "ntdll")]
     unsafe extern "system" {
         fn NtResumeProcess(handle: windows_sys::Win32::Foundation::HANDLE) -> i32;
