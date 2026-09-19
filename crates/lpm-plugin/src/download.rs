@@ -6,25 +6,13 @@
 //! ## Verification model
 //!
 //! Every downloaded asset is checksum-verified before being installed.
-//! Three sources are tried in order, and one of them MUST succeed unless
-//! the user has explicitly opted into unverified installs:
+//! Verification uses bundled SHA-256, then an upstream checksum sidecar,
+//! then the exact GitHub release asset digest. A known mismatch fails closed.
+//! `LPM_ALLOW_UNVERIFIED_PLUGINS=1` permits missing verification data and records
+//! that override for subsequent reuse checks.
 //!
-//! 1. **Bundled checksum** — SHA-256 baked into the LPM binary at build
-//!    time. Available for the registry's hardcoded `latest_version`.
-//! 2. **Upstream checksum** — SHA-256 fetched from a release sidecar
-//!    (`<asset_url>.sha256`). Both oxlint (via cargo-dist) and biome
-//!    publish these for every released asset, so user-pinned versions
-//!    and `lpm plugin update` pulls reach a verified install.
-//! 3. **Override** — only if `LPM_ALLOW_UNVERIFIED_PLUGINS=1`. Records
-//!    `verification-source: unverified-override` in the sidecar; the
-//!    binary cannot be reused by a process that does not also set the
-//!    override (so the trust downgrade does not silently stick across
-//!    runs).
-//!
-//! Downloads stream the binary through an exclusively created sibling
-//! before atomically replacing the final path. The sidecar is written
-//! atomically AFTER the binary replacement so a half-installed binary is
-//! never paired with a sidecar declaring it valid.
+//! The binary and receipt are prepared in a unique staging directory. Publication
+//! replaces the complete installation while holding the tool operation lock.
 
 use crate::registry::{self, PluginDef};
 use crate::sidecar::{self, Sidecar, VerificationSource};
@@ -135,10 +123,7 @@ pub async fn download_plugin(
         )));
     }
 
-    let bytes = resp
-        .bytes()
-        .await
-        .map_err(|e| LpmError::Network(format!("failed to read {}: {e}", def.name)))?;
+    let bytes = crate::io::read_response(resp, MAX_PLUGIN_DOWNLOAD_SIZE, "plugin download").await?;
 
     validate_download_size(def.name, bytes.len())?;
 
@@ -167,7 +152,7 @@ pub async fn download_plugin(
         }
         VerificationSource::Upstream => {
             tracing::debug!(
-                "plugin {} {} verified against upstream sidecar",
+                "plugin {} {} verified against upstream checksum",
                 def.name,
                 platform_str
             );
@@ -186,9 +171,14 @@ pub async fn download_plugin(
 
     // --- Materialize the binary ---
     let platform_dir = store::plugin_platform_dir(def.name, version, &platform_str)?;
-    std::fs::create_dir_all(&platform_dir)?;
-
-    let bin_path = platform_dir.join(def.binary_name);
+    let version_dir = store::plugin_version_dir(def.name, version)?;
+    std::fs::create_dir_all(&version_dir)?;
+    let staging = tempfile::Builder::new()
+        .prefix(".lpm-plugin-stage-")
+        .tempdir_in(&version_dir)?;
+    let payload = staging.path().join("payload");
+    std::fs::create_dir(&payload)?;
+    let bin_path = payload.join(def.binary_name);
     let binary_sha256 = lpm_common::write_file_atomic_with(
         &bin_path,
         lpm_common::AtomicWriteOptions::new().unix_mode(0o755),
@@ -209,7 +199,7 @@ pub async fn download_plugin(
     )?;
 
     // --- Write sidecar AFTER binary replacement succeeds ---
-    let sidecar_path = store::plugin_sidecar_path(def.name, version, &platform_str)?;
+    let sidecar_path = payload.join(sidecar::SIDECAR_FILE_NAME);
     let sidecar = Sidecar::new(
         def.name,
         version,
@@ -221,14 +211,8 @@ pub async fn download_plugin(
         verification,
     )
     .with_current_binary_snapshot(&bin_path);
-    if let Err(e) = sidecar::write_atomic(&sidecar_path, &sidecar) {
-        // Sidecar write failed but binary is on disk. Roll back the
-        // binary so the next run doesn't see a binary without a
-        // sidecar (which would also be treated as a cache miss, but
-        // leaving stray binaries around is messy).
-        let _ = std::fs::remove_file(&bin_path);
-        return Err(e);
-    }
+    sidecar::write_atomic(&sidecar_path, &sidecar)?;
+    crate::storage::publish(&payload, &platform_dir)?;
 
     // --- Cleanup legacy unscoped binary (only after success) ---
     store::finalize_legacy_cleanup(def.name, version, def.binary_name);
@@ -286,25 +270,10 @@ async fn resolve_verification(
         return Ok(VerificationSource::Bundled);
     }
 
-    // 2. Upstream — fetch `<asset_url>.sha256` and verify.
-    //
-    // M19: surface the trust posture. SHA-256 alone matches integrity
-    // against whatever the upstream release pipeline produced — if
-    // the upstream account is compromised, both the binary AND the
-    // sidecar can be swapped together. Sigstore / cosign / GPG
-    // verification would close that chain; until that's wired in,
-    // an upstream-verified install carries this caveat explicitly.
     let upstream_url = format!("{asset_url}.sha256");
     match fetch_upstream_checksum(client, &upstream_url).await {
         Ok(expected) => {
             verify_checksum(def.name, actual_sha256, &expected)?;
-            tracing::warn!(
-                target: "lpm_plugin::download",
-                plugin = def.name,
-                version = version,
-                platform = platform_str,
-                "plugin verified via upstream `.sha256` sidecar only — no signature/provenance check (M19). Upstream account compromise would substitute binary + sidecar together; trust is anchored on the upstream GitHub release"
-            );
             return Ok(VerificationSource::Upstream);
         }
         Err(e) => {
@@ -314,18 +283,30 @@ async fn resolve_verification(
                 version,
                 platform_str,
             );
-            // Fall through to override check.
         }
     }
 
-    // 3. Override — only if the user explicitly accepted the risk.
+    match crate::versions::release_asset_checksum(def, version, platform_str, asset_url, client)
+        .await
+    {
+        Ok(expected) => {
+            verify_checksum(def.name, actual_sha256, &expected)?;
+            return Ok(VerificationSource::Upstream);
+        }
+        Err(error) => tracing::debug!(
+            "no release asset checksum for {}@{version}: {error}",
+            def.name
+        ),
+    }
+
+    // Missing verification data may be overridden, but a known mismatch never is.
     if allow_override {
         return Ok(VerificationSource::UnverifiedOverride);
     }
 
     Err(LpmError::Plugin(format!(
         "refusing to install {} {} for {}: no bundled checksum and upstream \
-         sidecar {} is unavailable. Update LPM (newer releases ship \
+         sidecar {} and exact release asset digest are unavailable. Update LPM CLI (newer releases ship \
          pinned checksums for newer plugin versions), pin a different \
          version, or set {}=1 to install without verification.",
         def.name, version, platform_str, upstream_url, ALLOW_UNVERIFIED_ENV,
@@ -367,21 +348,13 @@ async fn fetch_upstream_checksum(
         )));
     }
 
-    let body = resp
-        .bytes()
-        .await
-        .map_err(|e| LpmError::Network(format!("failed to read checksum body: {e}")))?;
+    let bytes =
+        crate::io::read_response(resp, MAX_CHECKSUM_BODY_SIZE as usize, "upstream checksum")
+            .await?;
+    let body = std::str::from_utf8(&bytes)
+        .map_err(|error| LpmError::Plugin(format!("invalid checksum text: {error}")))?;
 
-    if body.len() as u64 > MAX_CHECKSUM_BODY_SIZE {
-        return Err(LpmError::Plugin(format!(
-            "upstream checksum body at {sidecar_url} exceeds {MAX_CHECKSUM_BODY_SIZE} bytes"
-        )));
-    }
-
-    let text = std::str::from_utf8(&body)
-        .map_err(|e| LpmError::Plugin(format!("upstream checksum is not UTF-8: {e}")))?;
-
-    parse_sha256_from_checksum_body(text).ok_or_else(|| {
+    parse_sha256_from_checksum_body(body).ok_or_else(|| {
         LpmError::Plugin(format!(
             "could not extract SHA-256 from upstream checksum body at {sidecar_url}"
         ))

@@ -22,13 +22,12 @@
 //!
 //! Every install is checksum-verified against either a SHA-256 bundled
 //! with the LPM binary (for the registry's pinned `latest_version`) or
-//! the upstream sidecar at `<asset_url>.sha256` (for any other version,
-//! including user-pinned and `lpm plugin update` pulls). Reuse from
+//! an upstream sidecar or exact GitHub release asset digest. Reuse from
 //! cache is gated on a sidecar metadata file that re-verifies platform
 //! match, a hot-path file metadata snapshot, and the trust posture of
 //! the current process. If the file snapshot is missing or changed, LPM
 //! falls back to the recorded on-disk binary hash before reuse. Set
-//! `LPM_ALLOW_UNVERIFIED_PLUGINS=1` to skip verification — that flag
+//! `LPM_ALLOW_UNVERIFIED_PLUGINS=1` to permit missing verification data — that flag
 //! must be set on every reuse, by design.
 //!
 //! ## Update flow
@@ -42,8 +41,10 @@
 
 pub mod download;
 pub mod engine;
+mod io;
 pub mod registry;
 pub mod sidecar;
+mod storage;
 pub mod store;
 pub mod versions;
 
@@ -110,42 +111,49 @@ pub async fn ensure_plugin(
     let bin_path = store::plugin_binary_path(def.name, &version, &platform_str, def.binary_name)?;
     let sidecar_path = store::plugin_sidecar_path(def.name, &version, &platform_str)?;
 
-    // First (unlocked) cache check — the steady-state hot path. Most
-    // ensure_plugin calls land here without ever touching the install lock.
-    if !force
-        && let sidecar::ReuseDecision::Hit = sidecar::validate_for_reuse(
-            &sidecar_path,
-            &bin_path,
-            def.name,
-            &version,
-            &platform_str,
-            download::allow_unverified_override(),
+    // Validation can refresh the receipt, so it must not overlap publication.
+    if !force {
+        let decision = lpm_common::with_shared_lock_async(
+            store::plugin_install_lock_path(def.name, &version)?,
+            async {
+                Ok(sidecar::validate_for_reuse(
+                    &sidecar_path,
+                    &bin_path,
+                    def.name,
+                    &version,
+                    &platform_str,
+                    download::allow_unverified_override(),
+                ))
+            },
         )
-    {
-        tracing::debug!("plugin {plugin_name}@{version} ({platform_str}) reused from cache");
-        return Ok(bin_path);
+        .await?;
+        if matches!(decision, sidecar::ReuseDecision::Hit) {
+            return Ok(bin_path);
+        }
     }
 
-    // Cache miss (or forced) — delegate to the shared locked-install
-    // helper. Acquires the per-version install lock, re-validates the
-    // cache (sibling installer may have populated it while we waited),
-    // and only downloads if the second check still misses.
     install_under_lock(def, &version, &platform, plugin_name, force, quiet, None).await
 }
 
-/// Acquire the per-version install lock and run the install body. The
-/// shared entry point used by both [`ensure_plugin`] and [`update_plugin`]
-/// so the post-lock revalidation contract is identical for both — without
-/// this helper, `update_plugin` would re-download a binary that a sibling
-/// `ensure_plugin` had already installed, which on Windows can outright
-/// fail (`download::finalize` uses `rename` onto the real path; renaming
-/// over a binary that's currently open by the parallel installer's verify
-/// step errors out with `OS error 32` / "file in use").
-///
-/// Without the lock, two parallel installers of the same {name, version}
-/// would race on the atomic rename in `download_plugin` and the loser
-/// would see a "binary already exists" / sidecar mismatch error.
+/// Serialize cache replacement with update, removal, and receipt validation.
 async fn install_under_lock(
+    def: &registry::PluginDef,
+    version: &str,
+    platform: &lpm_runtime::platform::Platform,
+    plugin_name: &str,
+    force: bool,
+    quiet: bool,
+    observer: Option<&mut (dyn FnMut(PluginInstallEvent) + Send)>,
+) -> Result<PathBuf, LpmError> {
+    let lock_path = store::plugin_install_lock_path(def.name, version)?;
+    lpm_common::with_exclusive_lock_async(
+        lock_path,
+        install_locked(def, version, platform, plugin_name, force, quiet, observer),
+    )
+    .await
+}
+
+async fn install_locked(
     def: &registry::PluginDef,
     version: &str,
     platform: &lpm_runtime::platform::Platform,
@@ -157,9 +165,8 @@ async fn install_under_lock(
     let platform_str = platform.to_string();
     let bin_path = store::plugin_binary_path(def.name, version, &platform_str, def.binary_name)?;
     let sidecar_path = store::plugin_sidecar_path(def.name, version, &platform_str)?;
-    let lock_path = store::plugin_install_lock_path(def.name, version)?;
 
-    let body = run_install_locked_body(
+    run_install_locked_body(
         def,
         version,
         platform,
@@ -170,8 +177,8 @@ async fn install_under_lock(
         force,
         quiet,
         observer,
-    );
-    lpm_common::with_exclusive_lock_async(lock_path, body).await
+    )
+    .await
 }
 
 /// The locked install body. Re-validates the cache after acquiring the
@@ -208,12 +215,6 @@ async fn run_install_locked_body(
             "plugin {plugin_name}@{version} ({platform_str}) populated by sibling install while we waited"
         );
         return Ok(bin_path.to_path_buf());
-    }
-
-    if force && bin_path.exists() {
-        tracing::debug!("force reinstalling plugin {plugin_name}@{version} ({platform_str})");
-        let _ = std::fs::remove_file(bin_path);
-        let _ = std::fs::remove_file(sidecar_path);
     }
 
     // `quiet` (or the `LPM_PLUGIN_QUIET=1` env var) suppresses ONLY the
@@ -305,7 +306,7 @@ fn emit_verified_checksum_event(
 /// — same effect as a no-op when the binary is already on disk.
 ///
 /// Verification is identical to `ensure_plugin` — bundled checksum if
-/// available, otherwise upstream sidecar, otherwise refuse unless
+/// available, otherwise upstream sidecar or exact release digest, otherwise refuse unless
 /// `LPM_ALLOW_UNVERIFIED_PLUGINS=1`.
 pub async fn update_plugin(plugin_name: &str) -> Result<String, LpmError> {
     update_plugin_with_optional_observer(plugin_name, None).await
@@ -325,14 +326,6 @@ async fn update_plugin_with_optional_observer(
     let def = registry::get_plugin(plugin_name)
         .ok_or_else(|| LpmError::Plugin(format!("unknown plugin: '{plugin_name}'")))?;
 
-    // Per-name update lock around the whole peek → install → approve
-    // sequence. Per-version install locks (used by `ensure_plugin`'s
-    // install branch) are insufficient here because the cache write
-    // happens on the resolved version — two concurrent updates of the
-    // same plugin to different upstream versions could otherwise
-    // interleave their `approve_version` writes and downgrade each
-    // other's resolved version. The per-name scope makes the entire
-    // resolve-and-record atomic for that plugin.
     let lock_path = store::plugin_update_lock_path(def.name)?;
     lpm_common::with_exclusive_lock_async(lock_path, run_update_under_lock(def, observer)).await
 }
@@ -355,21 +348,15 @@ async fn run_update_under_lock(
         }
     };
 
+    let approved = versions::get_latest_version(def).await;
+    let target = if versions::is_newer_semver(&target, &approved) {
+        target
+    } else {
+        approved
+    };
     let platform = lpm_runtime::platform::Platform::current()?;
 
-    // Route through the shared `install_under_lock` so the post-lock
-    // revalidation contract is identical to `ensure_plugin`'s. Without
-    // routing through the same helper, a sibling `ensure_plugin` could
-    // populate the cache for `{def.name, target}` between an inline
-    // pre-check here and the lock acquisition, and `update_plugin`
-    // would re-download wastefully (or, on Windows, fail outright on
-    // the rename when the parallel installer has the binary open).
-    //
-    // `quiet = true` so the locked body's "Downloading..."
-    // banner doesn't fire — `lpm plugin update` is an explicit
-    // user-initiated install and the command's own surface owns the
-    // user-facing progress text.
-    install_under_lock(def, &target, &platform, def.name, false, true, observer).await?;
+    install_locked(def, &target, &platform, def.name, false, true, observer).await?;
 
     // Install succeeded (or the locked body short-circuited on a
     // valid cache hit) — only NOW persist the cache. A download or
@@ -400,24 +387,23 @@ async fn run_update_under_lock(
 /// enough — invoking an untrusted plugin binary from `lpm doctor` (the
 /// primary caller) would undercut the verification model.
 ///
-/// Picking `list_installed_versions().first()` would also be wrong for
-/// two unrelated reasons: (1) it sorts lexicographically (so `1.10.0`
-/// ranks below `1.2.0`), and (2) the alphabetically-first version may
-/// not have a binary for the current platform under the
-/// platform-scoped layout.
 pub fn find_installed_for_current_platform(
     plugin_name: &str,
     binary_name: &str,
 ) -> Option<(String, PathBuf)> {
     let plugins_root = store::plugins_dir().ok()?;
     let platform = lpm_runtime::platform::Platform::current().ok()?.to_string();
-    find_installed_for_current_platform_at(
-        &plugins_root,
-        plugin_name,
-        binary_name,
-        &platform,
-        download::allow_unverified_override(),
-    )
+    lpm_common::with_shared_lock(store::plugin_update_lock_path(plugin_name).ok()?, || {
+        Ok(find_installed_for_current_platform_at(
+            &plugins_root,
+            plugin_name,
+            binary_name,
+            &platform,
+            download::allow_unverified_override(),
+        ))
+    })
+    .ok()
+    .flatten()
 }
 
 /// Path-injected variant of [`find_installed_for_current_platform`] for
@@ -441,16 +427,7 @@ fn find_installed_for_current_platform_at(
         .map(|e| e.file_name().to_string_lossy().to_string())
         .collect();
 
-    // Sort newest-first by best-effort semver.
-    versions.sort_by(|a, b| {
-        if versions::is_newer_semver(a, b) {
-            std::cmp::Ordering::Less
-        } else if versions::is_newer_semver(b, a) {
-            std::cmp::Ordering::Greater
-        } else {
-            std::cmp::Ordering::Equal
-        }
-    });
+    versions.sort_by(|a, b| versions::compare_versions(b, a));
 
     for v in versions {
         let platform_dir = plugin_dir.join(&v).join(platform);
@@ -494,6 +471,11 @@ mod tests {
         let bin = dir.join(binary);
         let bytes = format!("fake {plugin} {version} {platform} bytes");
         std::fs::write(&bin, bytes.as_bytes()).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
 
         let hash = format!("{:x}", Sha256::digest(bytes.as_bytes()));
         let s = sidecar::Sidecar::new(

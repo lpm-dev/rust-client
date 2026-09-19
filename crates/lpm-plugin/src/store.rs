@@ -28,9 +28,9 @@ fn validate_plugin_version(version: &str) -> Result<(), LpmError> {
         return Err(LpmError::Plugin("plugin version must not be empty".into()));
     }
 
-    if version.contains("..") {
+    if version == "." || version.contains("..") {
         return Err(LpmError::Plugin(format!(
-            "plugin version contains forbidden sequence '..': {version}"
+            "plugin version contains a forbidden path component: {version}"
         )));
     }
 
@@ -77,10 +77,19 @@ pub fn plugins_dir() -> Result<PathBuf, LpmError> {
     Ok(root.plugins_root())
 }
 
+fn tool_dir(name: &str) -> Result<PathBuf, LpmError> {
+    crate::storage::validate_name(name)?;
+    let directory = plugins_dir()?.join(name);
+    crate::storage::directory_if_present(&directory)?;
+    Ok(directory)
+}
+
 /// Directory holding all platforms for a given plugin version.
 pub fn plugin_version_dir(name: &str, version: &str) -> Result<PathBuf, LpmError> {
     validate_plugin_version(version)?;
-    Ok(plugins_dir()?.join(name).join(version))
+    let directory = tool_dir(name)?.join(version);
+    crate::storage::directory_if_present(&directory)?;
+    Ok(directory)
 }
 
 /// Directory for a specific plugin version on a specific platform — the
@@ -88,7 +97,9 @@ pub fn plugin_version_dir(name: &str, version: &str) -> Result<PathBuf, LpmError
 pub fn plugin_platform_dir(name: &str, version: &str, platform: &str) -> Result<PathBuf, LpmError> {
     validate_plugin_version(version)?;
     validate_platform(platform)?;
-    Ok(plugins_dir()?.join(name).join(version).join(platform))
+    let directory = plugin_version_dir(name, version)?.join(platform);
+    crate::storage::directory_if_present(&directory)?;
+    Ok(directory)
 }
 
 /// Full path to a plugin's binary on a specific platform.
@@ -106,36 +117,15 @@ pub fn plugin_sidecar_path(name: &str, version: &str, platform: &str) -> Result<
     Ok(plugin_platform_dir(name, version, platform)?.join(crate::sidecar::SIDECAR_FILE_NAME))
 }
 
-/// Path to the per-version install lock for a plugin.
-///
-/// `~/.lpm/plugins/{name}/{version}/.install.lock` — held exclusively
-/// by `ensure_plugin` (and `update_plugin`) around the download +
-/// install branch so two parallel installers of the same `{name,
-/// version}` don't race on the atomic temp-file rename in
-/// `download_plugin`.
-///
-/// Lock scope is `(name, version)` rather than `(name, version,
-/// platform)` because cross-arch parallel installs on the same
-/// `$LPM_HOME` (NFS / cross-arch CI bind mounts) are rare and the
-/// simpler scope avoids a layer of complexity. Same-version installs
-/// across two platforms would just over-serialize, not deadlock.
+/// Stable mutation lock shared by installation, update, and removal.
 pub fn plugin_install_lock_path(name: &str, version: &str) -> Result<PathBuf, LpmError> {
-    Ok(plugin_version_dir(name, version)?.join(".install.lock"))
+    validate_plugin_version(version)?;
+    crate::storage::operation_lock("plugins", name)
 }
 
-/// Path to the per-name update lock for a plugin.
-///
-/// `~/.lpm/plugins/{name}/.update.lock` — held exclusively by
-/// `update_plugin` around its peek → install → approve sequence so two
-/// concurrent `lpm plugin update <name>` invocations can't interleave
-/// their `approve_version` writes to `.version-cache.json` and downgrade
-/// each other's resolved version.
-///
-/// Scope is per-plugin-name rather than per-version because the version
-/// being approved isn't known until after the upstream peek — a
-/// per-version lock can't serialize the cache atomicity.
+/// The same mutation lock used by installation and removal.
 pub fn plugin_update_lock_path(name: &str) -> Result<PathBuf, LpmError> {
-    Ok(plugins_dir()?.join(name).join(".update.lock"))
+    crate::storage::operation_lock("plugins", name)
 }
 
 /// Pre-platform-segment plugin layout that shipped before the platform
@@ -178,45 +168,75 @@ pub fn is_installed(name: &str, version: &str, platform: &str, binary_name: &str
 /// List installed versions of a plugin (across all platforms — the
 /// version directory contains one subdir per platform).
 pub fn list_installed_versions(name: &str) -> Result<Vec<String>, LpmError> {
-    let dir = plugins_dir()?.join(name);
+    let dir = tool_dir(name)?;
     if !dir.exists() {
         return Ok(vec![]);
     }
 
+    let Some(def) = crate::registry::get_plugin(name) else {
+        return Ok(Vec::new());
+    };
     let mut versions = Vec::new();
     for entry in std::fs::read_dir(&dir)? {
         let entry = entry?;
-        if entry.path().is_dir() {
-            versions.push(entry.file_name().to_string_lossy().to_string());
+        let version = entry.file_name().to_string_lossy().into_owned();
+        if !entry.file_type()?.is_dir()
+            || validate_plugin_version(&version).is_err()
+            || version.starts_with('.')
+        {
+            continue;
+        }
+        for platform in std::fs::read_dir(entry.path())? {
+            let platform = platform?;
+            if !platform.file_type()?.is_dir() {
+                continue;
+            }
+            let directory = platform.path();
+            let Ok(receipt) =
+                crate::sidecar::read_sidecar(&directory.join(crate::sidecar::SIDECAR_FILE_NAME))
+            else {
+                continue;
+            };
+            if receipt.schema_version == crate::sidecar::SCHEMA_VERSION
+                && receipt.plugin_name == name
+                && receipt.version == version
+                && receipt.platform == platform.file_name().to_string_lossy()
+                && directory.join(def.binary_name).is_file()
+            {
+                versions.push(version);
+                break;
+            }
         }
     }
-
-    versions.sort();
+    versions.sort_by(|a, b| crate::versions::compare_versions(a, b));
     Ok(versions)
 }
 
 /// Remove a specific plugin version (all platforms).
 pub fn remove_version(name: &str, version: &str) -> Result<bool, LpmError> {
-    let dir = plugin_version_dir(name, version)?;
-    if dir.exists() {
-        std::fs::remove_dir_all(&dir)?;
-        Ok(true)
-    } else {
-        Ok(false)
-    }
+    let lock = plugin_install_lock_path(name, version)?;
+    lpm_common::with_exclusive_lock(lock, || {
+        let directory = plugin_version_dir(name, version)?;
+        if directory.exists() {
+            std::fs::remove_dir_all(directory)?;
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    })
 }
 
-/// Remove all versions of a plugin.
+/// Remove every installed version while holding the stable tool lock.
 pub fn remove_all(name: &str) -> Result<usize, LpmError> {
-    let dir = plugins_dir()?.join(name);
-    if !dir.exists() {
-        return Ok(0);
-    }
-
-    let versions = list_installed_versions(name)?;
-    let count = versions.len();
-    std::fs::remove_dir_all(&dir)?;
-    Ok(count)
+    lpm_common::with_exclusive_lock(plugin_update_lock_path(name)?, || {
+        let directory = tool_dir(name)?;
+        if !directory.exists() {
+            return Ok(0);
+        }
+        let count = list_installed_versions(name)?.len();
+        std::fs::remove_dir_all(directory)?;
+        Ok(count)
+    })
 }
 
 #[cfg(test)]
@@ -309,60 +329,17 @@ mod tests {
     // --- Lock-path helpers ---
 
     #[test]
-    fn install_lock_path_is_per_version() {
-        let lock = plugin_install_lock_path("oxlint", "1.57.0").unwrap();
-        let lock_str = lock.to_string_lossy();
-        assert!(lock_str.ends_with("/.install.lock"), "got: {lock_str}");
-        assert!(
-            lock_str.contains(".lpm/plugins/oxlint/1.57.0/"),
-            "lock must live under the per-version dir, got: {lock_str}"
-        );
-    }
-
-    #[test]
-    fn install_lock_path_differs_per_version() {
-        // Two different versions of the same plugin must yield different
-        // lock paths — that's what allows parallel installs of distinct
-        // versions while same-version installs serialize.
+    fn install_lock_is_shared_across_versions_and_platforms() {
         let a = plugin_install_lock_path("oxlint", "1.57.0").unwrap();
         let b = plugin_install_lock_path("oxlint", "1.58.0").unwrap();
-        assert_ne!(a, b);
-    }
-
-    #[test]
-    fn install_lock_path_does_not_include_platform() {
-        // Per-(name, version) scope, NOT per-(name, version, platform) —
-        // documented design choice. Cross-arch parallel installs on the
-        // same $LPM_HOME just over-serialize, never deadlock.
-        let lock = plugin_install_lock_path("oxlint", "1.57.0").unwrap();
-        let lock_str = lock.to_string_lossy();
-        assert!(
-            !lock_str.contains("darwin-")
-                && !lock_str.contains("linux-")
-                && !lock_str.contains("win-"),
-            "install lock must not include a platform segment, got: {lock_str}"
-        );
+        assert_eq!(a, b);
+        assert!(a.ends_with(".locks/plugins/operations/oxlint.lock"));
     }
 
     #[test]
     fn install_lock_path_rejects_traversal_version() {
         assert!(plugin_install_lock_path("oxlint", "../../etc").is_err());
         assert!(plugin_install_lock_path("oxlint", "").is_err());
-    }
-
-    #[test]
-    fn update_lock_path_is_per_name() {
-        let lock = plugin_update_lock_path("oxlint").unwrap();
-        let lock_str = lock.to_string_lossy();
-        assert!(lock_str.ends_with("/.update.lock"), "got: {lock_str}");
-        assert!(
-            lock_str.contains(".lpm/plugins/oxlint/"),
-            "update lock must live under the per-name dir, got: {lock_str}"
-        );
-        assert!(
-            !lock_str.contains("/1."),
-            "update lock must NOT include a version segment, got: {lock_str}"
-        );
     }
 
     #[test]
@@ -373,14 +350,11 @@ mod tests {
     }
 
     #[test]
-    fn install_and_update_lock_paths_are_distinct() {
-        // The two lock scopes must not collide — `update_plugin` holds the
-        // per-name update lock around the whole sequence, then nests a
-        // per-version install lock around the download. Same lock path
-        // would re-enter and self-deadlock under fd-lock semantics.
-        let install = plugin_install_lock_path("oxlint", "1.57.0").unwrap();
-        let update = plugin_update_lock_path("oxlint").unwrap();
-        assert_ne!(install, update);
+    fn install_and_update_share_the_tool_operation_lock() {
+        assert_eq!(
+            plugin_install_lock_path("oxlint", "1.57.0").unwrap(),
+            plugin_update_lock_path("oxlint").unwrap()
+        );
     }
 
     #[test]
@@ -392,5 +366,47 @@ mod tests {
             !path_str.contains("/tmp"),
             "path should not fall back to /tmp: {path_str}"
         );
+    }
+
+    #[test]
+    fn every_plugin_storage_path_rejects_nonleaf_names() {
+        for name in [
+            "",
+            ".",
+            "..",
+            "../victim",
+            "/tmp/victim",
+            "C:\\victim",
+            "a/b",
+            "a\\b",
+        ] {
+            assert!(plugin_version_dir(name, "1.0.0").is_err(), "{name}");
+            assert!(
+                plugin_platform_dir(name, "1.0.0", "darwin-arm64").is_err(),
+                "{name}"
+            );
+            assert!(plugin_install_lock_path(name, "1.0.0").is_err(), "{name}");
+            assert!(plugin_update_lock_path(name).is_err(), "{name}");
+        }
+    }
+
+    #[test]
+    fn plugin_operation_locks_survive_removal_of_the_install_tree() {
+        let removed = plugins_dir().unwrap().join("oxlint");
+        assert!(
+            !plugin_install_lock_path("oxlint", "1.0.0")
+                .unwrap()
+                .starts_with(&removed)
+        );
+        assert!(
+            !plugin_update_lock_path("oxlint")
+                .unwrap()
+                .starts_with(&removed)
+        );
+    }
+
+    #[test]
+    fn dot_is_not_a_managed_version_directory() {
+        assert!(validate_plugin_version(".").is_err());
     }
 }

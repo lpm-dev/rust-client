@@ -18,13 +18,31 @@ fn engine_root(project: &TempProject) -> std::path::PathBuf {
 }
 
 fn seed_installed_plugin(project: &TempProject, name: &str, version: &str) {
-    std::fs::create_dir_all(
-        plugin_root(project)
-            .join(name)
-            .join(version)
-            .join("darwin-arm64"),
+    use sha2::{Digest, Sha256};
+    let platform = current_engine_platform();
+    let directory = plugin_root(project).join(name).join(version).join(platform);
+    std::fs::create_dir_all(&directory).unwrap();
+    let binary = directory.join(name);
+    let content = b"#!/bin/sh\nexit 0\n";
+    std::fs::write(&binary, content).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let hash = format!("{:x}", Sha256::digest(content));
+    let receipt = lpm_plugin::sidecar::Sidecar::new(
+        name,
+        version,
+        platform,
+        name,
+        "https://example.invalid/tool",
+        &hash,
+        &hash,
+        lpm_plugin::sidecar::VerificationSource::Bundled,
     )
-    .expect("failed to seed installed plugin directory");
+    .with_current_binary_snapshot(&binary);
+    lpm_plugin::sidecar::write_atomic(&directory.join(".lpm-plugin.json"), &receipt).unwrap();
 }
 
 fn plugin_entry<'a>(plugins: &'a [serde_json::Value], name: &str) -> &'a serde_json::Value {
@@ -517,5 +535,349 @@ fn plugin_update_human_zero_installed_uses_slim_warning() {
     assert!(
         !stderr.contains('●') && !stderr.contains('│'),
         "plugin update status output must not use cliclack gutter output, got:\n{stderr}"
+    );
+}
+
+#[test]
+fn plugin_remove_rejects_paths_and_preserves_external_sentinels() {
+    let project = TempProject::empty(r#"{"name":"plugin-paths"}"#);
+    let victim = project.home().join(".lpm/victim");
+    for name in [
+        "../victim".to_string(),
+        victim.to_string_lossy().into_owned(),
+    ] {
+        std::fs::create_dir_all(&victim).unwrap();
+        std::fs::write(victim.join("keep.txt"), "untouched").unwrap();
+        let output = lpm(&project)
+            .args(["plugin", "remove", &name, "--json"])
+            .output()
+            .unwrap();
+        assert!(!output.status.success(), "unsafe name accepted: {name}");
+        assert_eq!(
+            std::fs::read_to_string(victim.join("keep.txt")).unwrap(),
+            "untouched"
+        );
+    }
+}
+
+#[test]
+fn plugin_list_ignores_incomplete_and_staging_directories() {
+    let project = TempProject::empty(r#"{"name":"plugin-incomplete"}"#);
+    for root in [
+        plugin_root(&project).join("oxlint"),
+        engine_root(&project).join("rolldown"),
+    ] {
+        for version in ["1.0.0", "1.1.0", ".stage-incomplete"] {
+            std::fs::create_dir_all(root.join(version)).unwrap();
+        }
+        std::fs::write(root.join("1.1.0/.install.lock"), "").unwrap();
+    }
+    let output = lpm(&project)
+        .args(["plugin", "list", "--json"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let value = support::assertions::parse_json_output(&output.stdout);
+    for name in ["oxlint", "rolldown"] {
+        let row = plugin_entry(value["plugins"].as_array().unwrap(), name);
+        assert_eq!(row["installed"], serde_json::json!([]), "{value}");
+    }
+}
+
+#[test]
+fn plugin_list_orders_installed_versions_semantically() {
+    let project = TempProject::empty(r#"{"name":"plugin-order"}"#);
+    for version in ["1.2.0", "1.10.0", "1.9.0"] {
+        seed_installed_plugin(&project, "oxlint", version);
+    }
+    let output = lpm(&project)
+        .args(["plugin", "list", "--json"])
+        .output()
+        .unwrap();
+    let value = support::assertions::parse_json_output(&output.stdout);
+    assert_eq!(
+        plugin_entry(value["plugins"].as_array().unwrap(), "oxlint")["installed"],
+        serde_json::json!(["1.2.0", "1.9.0", "1.10.0"])
+    );
+}
+
+#[test]
+fn plugin_list_and_outdated_reject_an_ignored_name() {
+    let project = TempProject::empty(r#"{"name":"plugin-names"}"#);
+    for action in ["list", "ls", "outdated"] {
+        let output = lpm(&project)
+            .env("HTTPS_PROXY", "http://127.0.0.1:1")
+            .env("ALL_PROXY", "http://127.0.0.1:1")
+            .env("NO_PROXY", "")
+            .args(["plugin", action, "biome", "--json"])
+            .output()
+            .unwrap();
+        assert!(
+            !output.status.success(),
+            "{action} silently ignored the name"
+        );
+    }
+}
+
+#[tokio::test]
+async fn plugin_outdated_selects_the_highest_stable_nondraft_release() {
+    let project = TempProject::empty(r#"{"name":"plugin-releases"}"#);
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/repos/oxc-project/oxc/releases"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+            {"tag_name":"apps_v9.0.0", "draft":true, "prerelease":false},
+            {"tag_name":"apps_v8.0.0", "draft":false, "prerelease":true},
+            {"tag_name":"apps_v7.0.0-beta.1", "draft":false, "prerelease":false},
+            {"tag_name":"apps_v2.9.0", "draft":false, "prerelease":false},
+            {"tag_name":"apps_v2.10.0", "draft":false, "prerelease":false}
+        ])))
+        .mount(&server)
+        .await;
+    let output = lpm(&project)
+        .env("LPM_PLUGIN_GITHUB_API_BASE", server.uri())
+        .env("LPM_MANAGED_TOOL_NPM_REGISTRY", server.uri())
+        .args(["plugin", "outdated", "--json"])
+        .output()
+        .unwrap();
+    let value = support::assertions::parse_json_output(&output.stdout);
+    assert_eq!(
+        plugin_entry(value["plugins"].as_array().unwrap(), "oxlint")["latest"],
+        "2.10.0",
+        "{value}"
+    );
+}
+
+#[tokio::test]
+async fn plugin_failed_engine_download_removes_its_stage() {
+    let project = TempProject::empty(r#"{"name":"plugin-stage"}"#);
+    let server = MockServer::start().await;
+    mount_rolldown_update_graph(&server).await;
+    Mock::given(method("GET"))
+        .and(path("/rolldown/-/rolldown-1.2.5.tgz"))
+        .respond_with(ResponseTemplate::new(500))
+        .with_priority(1)
+        .mount(&server)
+        .await;
+    let output = lpm(&project)
+        .env("LPM_MANAGED_TOOL_NPM_REGISTRY", server.uri())
+        .args(["plugin", "update", "rolldown", "--json"])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let version = engine_root(&project)
+        .join("rolldown")
+        .join(ROLLDOWN_UPDATE_VERSION);
+    if version.exists() {
+        let stages: Vec<_> = std::fs::read_dir(version)
+            .unwrap()
+            .flatten()
+            .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
+            .collect();
+        assert!(
+            stages.is_empty(),
+            "failed install left staging directories: {stages:?}"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn plugin_failed_forced_download_preserves_the_previous_binary_and_receipt() {
+    let project = TempProject::empty(r#"{"name":"plugin-replace"}"#);
+    let version = lpm_plugin::registry::get_plugin("oxlint")
+        .unwrap()
+        .latest_version;
+    seed_installed_plugin(&project, "oxlint", version);
+    let directory = plugin_root(&project)
+        .join("oxlint")
+        .join(version)
+        .join(current_engine_platform());
+    let binary = std::fs::read(directory.join("oxlint")).unwrap();
+    let receipt = std::fs::read(directory.join(".lpm-plugin.json")).unwrap();
+    let output = lpm(&project)
+        .env("LPM_FORCE_TOOL_INSTALL", "1")
+        .env("HTTPS_PROXY", "http://127.0.0.1:1")
+        .env("ALL_PROXY", "http://127.0.0.1:1")
+        .env("NO_PROXY", "")
+        .args(["lint", "--json"])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert_eq!(std::fs::read(directory.join("oxlint")).unwrap(), binary);
+    assert_eq!(
+        std::fs::read(directory.join(".lpm-plugin.json")).unwrap(),
+        receipt
+    );
+}
+
+fn command_waits_for_tool_installation(
+    project: &TempProject,
+    namespace: &str,
+    name: &str,
+    version: &str,
+    command: &mut std::process::Command,
+) -> bool {
+    let root = project.home().join(".lpm");
+    let legacy = root
+        .join(namespace)
+        .join(name)
+        .join(version)
+        .join(".install.lock");
+    let stable = root
+        .join(".locks")
+        .join(namespace)
+        .join("operations")
+        .join(format!("{name}.lock"));
+    let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let holder = std::thread::spawn(move || {
+        lpm_common::with_exclusive_lock(legacy, || {
+            lpm_common::with_exclusive_lock(stable, || {
+                ready_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+                Ok::<_, lpm_common::LpmError>(())
+            })
+        })
+        .unwrap();
+    });
+    ready_rx
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .unwrap();
+    let mut child = command
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    let blocked = loop {
+        if child.try_wait().unwrap().is_some() {
+            break false;
+        }
+        if std::time::Instant::now() >= deadline {
+            break true;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    };
+    release_tx.send(()).unwrap();
+    holder.join().unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    blocked
+}
+
+#[test]
+fn plugin_removal_waits_for_an_active_installation() {
+    let project = TempProject::empty(r#"{"name":"plugin-remove-lock"}"#);
+    seed_installed_plugin(&project, "oxlint", "1.0.0");
+    let mut command = support::lpm_spawnable(&project);
+    command.args(["plugin", "remove", "oxlint", "--json"]);
+    assert!(command_waits_for_tool_installation(
+        &project,
+        "plugins",
+        "oxlint",
+        "1.0.0",
+        &mut command
+    ));
+}
+
+#[tokio::test]
+async fn plugin_rolldown_update_waits_for_an_active_installation() {
+    let project = TempProject::empty(r#"{"name":"plugin-update-lock"}"#);
+    let server = MockServer::start().await;
+    mount_rolldown_update_graph(&server).await;
+    let mut command = support::lpm_spawnable(&project);
+    command
+        .env("LPM_MANAGED_TOOL_NPM_REGISTRY", server.uri())
+        .args(["plugin", "update", "rolldown", "--json"]);
+    assert!(command_waits_for_tool_installation(
+        &project,
+        "engines",
+        "rolldown",
+        ROLLDOWN_UPDATE_VERSION,
+        &mut command
+    ));
+}
+
+#[cfg(unix)]
+#[test]
+fn plugin_cached_execution_waits_for_installation_before_refreshing_its_receipt() {
+    let project = TempProject::empty(r#"{"name":"plugin-reuse-lock"}"#);
+    let version = lpm_plugin::registry::get_plugin("oxlint")
+        .unwrap()
+        .latest_version;
+    seed_installed_plugin(&project, "oxlint", version);
+    let mut command = support::lpm_spawnable(&project);
+    command.args(["lint", "--json"]);
+    assert!(command_waits_for_tool_installation(
+        &project,
+        "plugins",
+        "oxlint",
+        version,
+        &mut command
+    ));
+}
+
+#[test]
+fn plugin_remove_rejects_dot_versions_without_deleting_other_versions() {
+    let project = TempProject::empty(r#"{"name":"plugin-dot-version"}"#);
+    for (namespace, name) in [("plugins", "oxlint"), ("engines", "rolldown")] {
+        let keep = project
+            .home()
+            .join(".lpm")
+            .join(namespace)
+            .join(name)
+            .join("1.0.0")
+            .join("keep.txt");
+        std::fs::create_dir_all(keep.parent().unwrap()).unwrap();
+        std::fs::write(&keep, "untouched").unwrap();
+        let output = lpm(&project)
+            .args(["plugin", "remove", &format!("{name}@."), "--json"])
+            .output()
+            .unwrap();
+        assert!(!output.status.success());
+        assert_eq!(std::fs::read_to_string(&keep).unwrap(), "untouched");
+    }
+}
+
+#[tokio::test]
+async fn plugin_outdated_checks_later_release_pages_before_selecting_latest() {
+    let project = TempProject::empty(r#"{"name":"plugin-pages"}"#);
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/repos/oxc-project/oxc/releases"))
+        .and(wiremock::matchers::query_param("page", "2"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+            {"tag_name":"apps_v3.0.0", "draft":false, "prerelease":false}
+        ])))
+        .expect(1)
+        .with_priority(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/repos/oxc-project/oxc/releases"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("link", "<https://untrusted.invalid/next>; rel=\"next\"")
+                .set_body_json(serde_json::json!([{ "tag_name":"apps_v2.0.0" }])),
+        )
+        .expect(1)
+        .with_priority(2)
+        .mount(&server)
+        .await;
+    let output = lpm(&project)
+        .env("LPM_PLUGIN_GITHUB_API_BASE", server.uri())
+        .env("LPM_MANAGED_TOOL_NPM_REGISTRY", server.uri())
+        .args(["plugin", "outdated", "--json"])
+        .output()
+        .unwrap();
+    let value = support::assertions::parse_json_output(&output.stdout);
+    assert_eq!(
+        plugin_entry(value["plugins"].as_array().unwrap(), "oxlint")["latest"],
+        "3.0.0"
     );
 }

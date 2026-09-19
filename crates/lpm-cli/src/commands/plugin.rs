@@ -21,6 +21,11 @@ pub async fn run(
     plugin_name: Option<&str>,
     json_output: bool,
 ) -> Result<(), LpmError> {
+    if matches!(action, "list" | "ls" | "outdated") && plugin_name.is_some() {
+        return Err(LpmError::Script(format!(
+            "lpm plugin {action} does not accept a plugin name"
+        )));
+    }
     match action {
         "list" | "ls" => list(json_output).await,
         "outdated" => outdated(json_output).await,
@@ -316,7 +321,7 @@ fn version_is_newer(candidate: &str, current: &str) -> bool {
 /// Remove a plugin (specific version or all versions).
 fn remove(plugin_name: Option<&str>, json_output: bool) -> Result<(), LpmError> {
     let name = plugin_name.ok_or_else(|| {
-        LpmError::Script("missing plugin name. Usage: lpm plugin remove <name> [version]".into())
+        LpmError::Script("missing plugin name. Usage: lpm plugin remove <name>[@version]".into())
     })?;
 
     // Check if name contains @ for specific version: "oxlint@1.57.0"
@@ -334,6 +339,11 @@ fn remove(plugin_name: Option<&str>, json_output: bool) -> Result<(), LpmError> 
 
     if plugin == "rolldown" {
         return remove_engine_plugin(plugin, version, json_output);
+    }
+    if lpm_plugin::registry::get_plugin(plugin).is_none() {
+        return Err(LpmError::Plugin(format!(
+            "unknown managed plugin: {plugin:?}"
+        )));
     }
 
     if let Some(ver) = version {

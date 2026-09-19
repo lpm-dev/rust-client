@@ -271,8 +271,8 @@ const REVIEWED_RAW_ATOMIC_WRITERS: &[(&str, &str)] = &[
         "publishes a package directory staged by the compatibility-island transaction",
     ),
     (
-        "crates/lpm-plugin/src/engine.rs::install_under_lock_at",
-        "publishes an engine directory created under the engine installation lock",
+        "crates/lpm-plugin/src/storage.rs::publish",
+        "publishes a complete managed tool directory with rollback under a stable tool lock",
     ),
     (
         "crates/lpm-registry/src/client/cache.rs::write_metadata_cache_file",

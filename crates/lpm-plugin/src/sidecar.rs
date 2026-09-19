@@ -22,7 +22,7 @@ use std::time::UNIX_EPOCH;
 
 /// Sidecar schema version. Bump when fields change in incompatible ways;
 /// older sidecars are then treated as cache misses (we re-verify).
-const SCHEMA_VERSION: u32 = 1;
+pub(crate) const SCHEMA_VERSION: u32 = 1;
 
 /// Sidecar file name written next to the plugin binary.
 pub const SIDECAR_FILE_NAME: &str = ".lpm-plugin.json";
@@ -367,7 +367,15 @@ pub fn validate_for_reuse(
     }
 
     match std::fs::metadata(binary_path) {
-        Ok(metadata) if metadata.is_file() => {}
+        Ok(metadata) if metadata.is_file() => {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                if metadata.permissions().mode() & 0o111 == 0 {
+                    return ReuseDecision::Miss(MissReason::BinaryMissing);
+                }
+            }
+        }
         _ => return ReuseDecision::Miss(MissReason::BinaryMissing),
     };
 
@@ -425,10 +433,10 @@ fn warn_if_unverified_override(sidecar: &Sidecar, sidecar_path: &Path, unverifie
     }
 }
 
-fn read_sidecar(path: &Path) -> Result<Sidecar, MissReason> {
-    let bytes = match std::fs::read(path) {
+pub(crate) fn read_sidecar(path: &Path) -> Result<Sidecar, MissReason> {
+    let bytes = match lpm_common::read_file_capped(path, lpm_common::STATE_FILE_SIZE_CAP_BYTES) {
         Ok(b) => b,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+        Err(lpm_common::BoundedReadError::NotFound { .. }) => {
             return Err(MissReason::SidecarMissing);
         }
         Err(e) => return Err(MissReason::SidecarMalformed(e.to_string())),
@@ -484,6 +492,11 @@ mod tests {
     fn write_binary(path: &Path, bytes: &[u8]) -> String {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(path, bytes).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
         let mut hasher = Sha256::new();
         hasher.update(bytes);
         format!("{:x}", hasher.finalize())
@@ -917,5 +930,46 @@ mod tests {
             h,
             "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_matching_hash_does_not_make_a_nonexecutable_binary_reusable() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("oxlint");
+        let hash = write_binary(&bin, b"tool bytes");
+        let receipt = make_sidecar_with_snapshot(
+            "oxlint",
+            "1.0.0",
+            "darwin-arm64",
+            &hash,
+            VerificationSource::Bundled,
+            &bin,
+        );
+        let path = dir.path().join(SIDECAR_FILE_NAME);
+        write_atomic(&path, &receipt).unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(matches!(
+            validate_for_reuse(&path, &bin, "oxlint", "1.0.0", "darwin-arm64", false),
+            ReuseDecision::Miss(_)
+        ));
+    }
+
+    #[test]
+    fn oversized_plugin_receipts_are_rejected_before_deserialization() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(SIDECAR_FILE_NAME);
+        let receipt = make_sidecar(
+            "oxlint",
+            "1.0.0",
+            "darwin-arm64",
+            "hash",
+            VerificationSource::Bundled,
+        );
+        let mut bytes = serde_json::to_vec(&receipt).unwrap();
+        bytes.resize(lpm_common::STATE_FILE_SIZE_CAP_BYTES as usize + 1, b' ');
+        std::fs::write(&path, bytes).unwrap();
+        assert!(read_sidecar(&path).is_err());
     }
 }
