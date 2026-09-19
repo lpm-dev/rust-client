@@ -461,6 +461,64 @@ mod tests {
     }
 
     #[test]
+    fn replaced_watch_rules_exclude_old_inputs_and_new_outputs() {
+        let root = Path::new("/project");
+        let filter = WatchFilterHandle::new(
+            WatchFilter::new(root, &["old/**".into()], &[])
+                .unwrap()
+                .with_config_files(),
+        );
+        let (notifications, receiver) = WatchNotifications::new(filter.clone());
+        filter.replace(
+            WatchFilter::new(root, &["new/**".into()], &["new/generated/**".into()])
+                .unwrap()
+                .with_config_files(),
+        );
+        for path in ["old/input.txt", "new/generated", "new/generated/output.txt"] {
+            notifications.submit(Ok(notify::Event::new(EventKind::Modify(
+                notify::event::ModifyKind::Any,
+            ))
+            .add_path(root.join(path))));
+        }
+        assert!(receiver.try_recv().is_err());
+        for path in ["new/input.txt", "lpm.json", "package.json"] {
+            notifications.submit(Ok(notify::Event::new(EventKind::Modify(
+                notify::event::ModifyKind::Any,
+            ))
+            .add_path(root.join(path))));
+            assert!(receiver.try_recv().is_ok(), "{path}");
+        }
+    }
+
+    #[test]
+    fn literal_watch_rules_exclude_siblings_but_accept_rescans() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(directory.path()).unwrap();
+        std::fs::create_dir(root.join("scripts")).unwrap();
+        for entry in [
+            "scripts/../entry.js",
+            "scripts/[entry].js",
+            "scripts/unclosed[.js",
+        ] {
+            let filter = WatchFilter::for_file(&root.join(entry)).unwrap();
+            let event = |path| {
+                notify::Event::new(EventKind::Modify(notify::event::ModifyKind::Any)).add_path(path)
+            };
+            assert!(
+                !filter.matches(&event(root.join("scripts/e.js"))),
+                "{entry}"
+            );
+            assert!(
+                filter.matches(&event(normalize_file_path(&root.join(entry)).unwrap())),
+                "{entry}"
+            );
+            assert!(filter.matches(
+                &notify::Event::new(EventKind::Other).set_flag(notify::event::Flag::Rescan)
+            ));
+        }
+    }
+
+    #[test]
     fn subtree_output_roots_are_excluded_for_untyped_and_rename_events() {
         let filter =
             WatchFilter::new(Path::new("/project"), &[], &["artifacts/*/**".into()]).unwrap();

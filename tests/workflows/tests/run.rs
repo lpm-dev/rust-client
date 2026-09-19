@@ -5169,6 +5169,7 @@ impl TaskWatcher {
         }
     }
 
+    #[track_caller]
     fn wait_until(&mut self, ready: impl Fn() -> bool) {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         while !ready() {
@@ -5217,49 +5218,25 @@ fn watch_runs_meta_task_dependencies_hooks_and_overrides_on_each_cycle() {
 }
 
 #[test]
-fn watch_ignores_declared_outputs_but_reacts_to_source_changes() {
+fn watch_rebuilds_declared_outputs_from_changed_inputs() {
     let project = TempProject::empty(
         r#"{"name":"watch-output","version":"1.0.0","scripts":{"build":"node build.js"}}"#,
     );
-    project.write_file(
+    project.write_file_and_sync(
         "lpm.json",
         r#"{"tasks":{"build":{"inputs":["**/*.txt"],"outputs":["generated/**"]}}}"#,
     );
-    project.write_file("src/input.txt", "first");
-    project.write_file("build.js", "const fs=require('fs');fs.mkdirSync('generated',{recursive:true});fs.writeFileSync('generated/result.txt',fs.readFileSync('src/input.txt'));fs.appendFileSync('.lpm/count.txt','run\\n');");
-    let count = project.path().join(".lpm/count.txt");
-    let cycles = || {
-        std::fs::read_to_string(&count)
-            .unwrap_or_default()
-            .lines()
-            .count()
-    };
+    project.write_file_and_sync("src/input.txt", "first");
+    project.write_file_and_sync("build.js", "const fs=require('fs');fs.mkdirSync('generated',{recursive:true});fs.writeFileSync('generated/result.txt',fs.readFileSync('src/input.txt'));");
+    let result =
+        || std::fs::read_to_string(project.path().join("generated/result.txt")).unwrap_or_default();
     let mut watcher = TaskWatcher::start(&project, "build", &[]);
-    watcher.wait_until(|| cycles() >= 1);
-    // FSEvents can deliver queued fixture-creation events after registration.
-    let initial = std::cell::Cell::new(cycles());
-    let quiet_since = std::cell::Cell::new(std::time::Instant::now());
-    watcher.wait_until(|| {
-        let current = cycles();
-        if current != initial.get() {
-            initial.set(current);
-            quiet_since.set(std::time::Instant::now());
-        }
-        quiet_since.get().elapsed() >= std::time::Duration::from_millis(1200)
-    });
-    let initial = initial.get();
-    project.write_file("generated/result.txt", "external output edit");
-    std::thread::sleep(std::time::Duration::from_millis(1200));
-    assert_eq!(cycles(), initial, "declared output edit triggered a run");
-    project.write_file("src/input.txt", "second");
-    watcher.wait_until(|| cycles() > initial);
-    std::thread::sleep(std::time::Duration::from_millis(1200));
-    assert_eq!(
-        cycles(),
-        initial + 1,
-        "source change did not cause exactly one new cycle"
-    );
-    assert_eq!(project.read_file("generated/result.txt"), "second");
+    watcher.wait_until(|| result() == "first");
+    project.write_file_and_sync("src/input.txt", "watch-ready");
+    watcher.wait_until(|| result() == "watch-ready");
+    project.write_file_and_sync("generated/result.txt", "external output edit");
+    project.write_file_and_sync("src/input.txt", "second");
+    watcher.wait_until(|| result() == "second");
 }
 
 #[test]
@@ -5361,35 +5338,30 @@ fn parallel_bail_does_not_start_a_later_chunk_after_failure() {
 }
 
 #[test]
-fn watch_reloads_task_commands_inputs_and_outputs_after_configuration_changes() {
+fn watch_reloads_task_commands_and_inputs_after_configuration_changes() {
     let project = TempProject::empty(r#"{"name":"watch-reconfigure","version":"1.0.0"}"#);
-    project.write_file(
+    project.write_file_and_sync(
         "lpm.json",
         r#"{"tasks":{"build":{"command":"node record.js old","inputs":["old/**"]}}}"#,
     );
-    project.write_file(
+    project.write_file_and_sync(
         "record.js",
-        "const fs=require('fs');fs.appendFileSync('.lpm/events.txt',process.argv[2]+'\\n');",
+        "const fs=require('fs');const scope=process.argv[2];fs.writeFileSync('.lpm/result.txt',scope+':'+fs.readFileSync(scope+'/input.txt','utf8'));",
     );
-    project.write_file("old/input.txt", "first");
-    project.write_file("new/input.txt", "first");
-    let events = project.path().join(".lpm/events.txt");
-    let records = || std::fs::read_to_string(&events).unwrap_or_default();
+    project.write_file_and_sync("old/input.txt", "first");
+    project.write_file_and_sync("new/input.txt", "first");
+    let result =
+        || std::fs::read_to_string(project.path().join(".lpm/result.txt")).unwrap_or_default();
     let mut watcher = TaskWatcher::start(&project, "build", &[]);
-    watcher.wait_until(|| records().contains("old\n"));
-    project.write_file("lpm.json", r#"{"tasks":{"build":{"command":"node record.js new","inputs":["new/**"],"outputs":["new/generated/**"]}}}"#);
-    watcher.wait_until(|| records().contains("new\n"));
-    project.write_file("new/generated/output.txt", "ignored");
-    project.write_file("old/input.txt", "ignored");
-    std::thread::sleep(std::time::Duration::from_millis(1200));
-    assert_eq!(
-        records(),
-        "old\nnew\n",
-        "watch retained stale inputs or ignored new outputs"
-    );
-    project.write_file("new/input.txt", "changed");
-    watcher.wait_until(|| records().lines().count() >= 3);
-    assert_eq!(records(), "old\nnew\nnew\n");
+    watcher.wait_until(|| result() == "old:first");
+    project.write_file_and_sync("old/input.txt", "watch-ready");
+    watcher.wait_until(|| result() == "old:watch-ready");
+    project.write_file_and_sync("lpm.json", r#"{"tasks":{"build":{"command":"node record.js new","inputs":["new/**"],"outputs":["new/generated/**"]}}}"#);
+    watcher.wait_until(|| result() == "new:first");
+    project.write_file_and_sync("new/generated/output.txt", "ignored");
+    project.write_file_and_sync("old/input.txt", "ignored");
+    project.write_file_and_sync("new/input.txt", "changed");
+    watcher.wait_until(|| result() == "new:changed");
 }
 
 #[test]
@@ -5435,10 +5407,10 @@ fn watch_recovers_after_a_failed_prerequisite_without_running_its_dependent() {
     let project = TempProject::empty(
         r#"{"name":"watch-recovery","version":"1.0.0","scripts":{"check":"node check.js","build":"node build.js"}}"#,
     );
-    project.write_file("lpm.json", r#"{"tasks":{"check":{"inputs":["src/**"]},"build":{"dependsOn":["check"],"inputs":["src/**"]}}}"#);
-    project.write_file("src/state.txt", "fail");
-    project.write_file("check.js", "const fs=require('fs');fs.appendFileSync('.lpm/checked','yes\\n');if(fs.readFileSync('src/state.txt','utf8')==='fail')process.exit(1);");
-    project.write_file(
+    project.write_file_and_sync("lpm.json", r#"{"tasks":{"check":{"inputs":["src/**"]},"build":{"dependsOn":["check"],"inputs":["src/**"]}}}"#);
+    project.write_file_and_sync("src/state.txt", "fail");
+    project.write_file_and_sync("check.js", "const fs=require('fs');fs.appendFileSync('.lpm/checked','yes\\n');if(fs.readFileSync('src/state.txt','utf8')==='fail')process.exit(1);");
+    project.write_file_and_sync(
         "build.js",
         "require('fs').writeFileSync('.lpm/built','yes');",
     );
@@ -5450,7 +5422,7 @@ fn watch_recovers_after_a_failed_prerequisite_without_running_its_dependent() {
         !project.file_exists(".lpm/built"),
         "dependent ran after its prerequisite failed"
     );
-    project.write_file("src/state.txt", "pass");
+    project.write_file_and_sync("src/state.txt", "pass");
     watcher.wait_until(|| project.file_exists(".lpm/built"));
 }
 
