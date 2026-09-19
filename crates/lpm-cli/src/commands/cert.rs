@@ -18,6 +18,23 @@ pub async fn run(
     json_output: bool,
     extras: ExtraArgs,
 ) -> Result<(), LpmError> {
+    for (present, flag, required_action) in [
+        (!extra_hosts.is_empty(), "--host", "generate"),
+        (!extras.extra_projects.is_empty(), "--project", "rotate"),
+        (
+            extras.keep_old_trusted_days.is_some(),
+            "--keep-old-trusted",
+            "rotate",
+        ),
+        (extras.fail_on_missing, "--fail-on-missing", "rotate"),
+        (extras.dry_run, "--dry-run", "reconcile"),
+    ] {
+        if present && action != required_action {
+            return Err(LpmError::Cert(format!(
+                "{flag} is only valid for `lpm cert {required_action}`"
+            )));
+        }
+    }
     match action {
         "status" => run_status(project_dir, json_output),
         "trust" => run_trust(json_output),
@@ -70,6 +87,8 @@ fn run_status(project_dir: &Path, json_output: bool) -> Result<(), LpmError> {
                     "expires": status.project_cert_expires,
                     "hostnames": status.project_cert_hostnames,
                     "needs_renewal": status.project_cert_needs_renewal,
+                    "valid": status.project_cert_valid,
+                    "error": status.project_cert_error,
                 },
                 "permission_drifts": drift_json,
             })
@@ -131,8 +150,17 @@ fn run_status(project_dir: &Path, json_output: bool) -> Result<(), LpmError> {
     if status.project_cert_exists {
         if status.project_cert_needs_renewal {
             print_field("status", install_ui::section("needs renewal"));
+        } else if !status.project_cert_valid {
+            print_field("status", install_ui::red("invalid"));
         } else {
             print_field("status", install_ui::status_ok("valid"));
+        }
+        if let Some(error) = &status.project_cert_error {
+            print_field("error", error);
+            println!(
+                "  {}",
+                install_ui::dim("Run `lpm cert generate` to repair the project certificate.")
+            );
         }
         if !status.project_cert_hostnames.is_empty() {
             print_field("hosts", status.project_cert_hostnames.join(", "));
@@ -151,7 +179,7 @@ fn run_status(project_dir: &Path, json_output: bool) -> Result<(), LpmError> {
     println!();
     if status.ca_exists
         && status.ca_trusted
-        && status.project_cert_exists
+        && status.project_cert_valid
         && !status.project_cert_needs_renewal
     {
         install_ui::done("HTTPS certificates are ready");
@@ -303,6 +331,11 @@ async fn run_reconcile(extras: ExtraArgs, json_output: bool) -> Result<(), LpmEr
     } else {
         install_ui::done("reconcile complete");
     }
+    if result.pending_recovery {
+        install_ui::warn(
+            "interrupted certificate operation needs recovery; run `lpm cert reconcile` without `--dry-run`, then preview again",
+        );
+    }
     print_field("grace_removed", result.grace_removed.len().to_string());
     print_field("grace_pending", result.grace_pending.len().to_string());
     print_field("stale_removed", result.stale_removed.len().to_string());
@@ -334,7 +367,7 @@ fn validate_rotation_runtime_safety(
         return Ok(());
     }
     Err(LpmError::Cert(format!(
-        "refusing hard CA rotation while local TLS is active ({}). Existing processes would keep serving certificates signed by the old CA after it is removed. Stop these `lpm dev` or proxy sessions and retry, or use `--keep-old-trusted-days 1`; restart them before `lpm cert reconcile` removes the old CA",
+        "refusing hard CA rotation while local TLS is active ({}). Existing processes would keep serving certificates signed by the old CA after it is removed. Stop these `lpm dev` or proxy sessions and retry, or use `--keep-old-trusted 1`; restart them before `lpm cert reconcile` removes the old CA",
         active_tls_consumers.join(", ")
     )))
 }
@@ -361,7 +394,7 @@ mod tests {
                 .unwrap_err();
 
         assert!(error.to_string().contains("refusing hard CA rotation"));
-        assert!(error.to_string().contains("keep-old-trusted-days"));
+        assert!(error.to_string().contains("`--keep-old-trusted 1`"));
         assert!(error.to_string().contains("restart"));
     }
 

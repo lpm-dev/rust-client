@@ -71,7 +71,9 @@ impl AuditLog {
                     )));
                 }
             };
-            tighten_audit_directory(&next)?;
+            if create {
+                tighten_audit_directory(&next)?;
+            }
             parent = next;
         }
         let dir = parent;
@@ -138,7 +140,7 @@ impl AuditLog {
             )));
         }
         #[cfg(unix)]
-        {
+        if create || append {
             use std::os::unix::fs::PermissionsExt;
             file.try_clone()
                 .and_then(|file| {

@@ -194,6 +194,10 @@ fn write_rotation_journal(
     ca_dir.write(ROTATION_JOURNAL, &contents, 0o600)
 }
 
+pub(crate) fn has_pending_rotation(ca: &paths::GlobalCaDirectory) -> Result<bool, LpmError> {
+    ca.exists(ROTATION_JOURNAL)
+}
+
 fn read_rotation_journal(
     ca_dir: &paths::GlobalCaDirectory,
 ) -> Result<Option<RotationJournal>, LpmError> {

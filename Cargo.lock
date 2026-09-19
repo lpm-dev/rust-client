@@ -4107,6 +4107,7 @@ dependencies = [
  "hmac",
  "insta",
  "libc",
+ "lpm-cert",
  "lpm-common",
  "lpm-global",
  "lpm-inspect",

@@ -1,6 +1,5 @@
 ---
 source: tests/workflows/tests/cert.rs
-assertion_line: 68
 expression: envelope
 ---
 {
@@ -16,7 +15,9 @@ expression: envelope
     "exists": false,
     "expires": null,
     "hostnames": [],
-    "needs_renewal": false
+    "needs_renewal": false,
+    "valid": false,
+    "error": null
   },
   "permission_drifts": []
 }

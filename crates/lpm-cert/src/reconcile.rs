@@ -33,6 +33,7 @@ use time::format_description::well_known::Rfc3339;
 #[derive(Debug, Default, Clone, Serialize)]
 pub struct ReconcileResult {
     pub success: bool,
+    pub pending_recovery: bool,
     pub grace_removed: Vec<String>,
     pub grace_pending: Vec<rotate::GraceEntry>,
     pub stale_removed: Vec<String>,
@@ -51,6 +52,22 @@ pub struct ReconcileOptions {
 }
 
 pub fn reconcile(opts: ReconcileOptions) -> Result<ReconcileResult, LpmError> {
+    if opts.dry_run {
+        let Some(operation) = paths::CertificateOperation::inspect()? else {
+            return Ok(ReconcileResult {
+                success: true,
+                ..Default::default()
+            });
+        };
+        if operation.has_pending_pair_recovery()? || rotate::has_pending_rotation(&operation.ca)? {
+            return Ok(ReconcileResult {
+                success: true,
+                pending_recovery: true,
+                ..Default::default()
+            });
+        }
+        return reconcile_locked(&operation, opts);
+    }
     let operation = paths::CertificateOperation::begin()?;
     let _recovery_guard = rotate::acquire_pending_recovery_generation(&operation)?;
     rotate::recover_pending_rotation(&operation.ca)?;

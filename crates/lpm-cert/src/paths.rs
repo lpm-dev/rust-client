@@ -288,6 +288,7 @@ pub fn ca_key_path() -> Result<PathBuf, LpmError> {
 pub(crate) struct GlobalCaDirectory {
     path: PathBuf,
     dir: Dir,
+    read_only: bool,
 }
 
 impl GlobalCaDirectory {
@@ -315,7 +316,12 @@ impl GlobalCaDirectory {
     }
 
     pub(crate) fn read(&self, name: &str) -> Result<Vec<u8>, LpmError> {
-        read_bounded_relative_file(&self.dir, name, "global certificate")
+        read_bounded_relative_file_with_permissions(
+            &self.dir,
+            name,
+            "global certificate",
+            !self.read_only,
+        )
     }
 
     pub(crate) fn write(&self, name: &str, contents: &[u8], mode: u32) -> Result<(), LpmError> {
@@ -592,6 +598,40 @@ pub(crate) struct CertificateOperation {
 }
 
 impl CertificateOperation {
+    pub(crate) fn inspect() -> Result<Option<Self>, LpmError> {
+        let root = lpm_common::LpmRoot::from_env()?;
+        let path = std::path::absolute(root.root())?;
+        let Some(parent_path) = path.parent() else {
+            return Err(LpmError::Cert("LPM_HOME has no parent directory".into()));
+        };
+        let parent = match Dir::open_ambient_dir(parent_path, cap_std::ambient_authority()) {
+            Ok(parent) => parent,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error.into()),
+        };
+        let name = path
+            .file_name()
+            .and_then(std::ffi::OsStr::to_str)
+            .ok_or_else(|| LpmError::Cert("LPM_HOME must name a directory".into()))?;
+        let Some(lpm) = inspect_directory(&parent, name)? else {
+            return Ok(None);
+        };
+        let Some(dir) = inspect_directory(&lpm, "certs")? else {
+            return Ok(None);
+        };
+        let ca = GlobalCaDirectory {
+            path: path.join("certs"),
+            dir,
+            read_only: true,
+        };
+        let lock = ca.acquire_operations_lock()?;
+        Ok(Some(Self { ca, _lock: lock }))
+    }
+
+    pub(crate) fn has_pending_pair_recovery(&self) -> Result<bool, LpmError> {
+        self.ca.exists(GLOBAL_PAIR_TRANSACTION)
+    }
+
     pub(crate) fn begin() -> Result<Self, LpmError> {
         let ca = open_global_ca_directory(true)?;
         let lock = ca.acquire_operations_lock()?;
@@ -724,50 +764,13 @@ fn open_global_ca_directory_at_lpm_root(
     Ok(GlobalCaDirectory {
         path: lpm_root_path.join("certs"),
         dir: certs,
+        read_only: false,
     })
 }
 
 /// Directory for project-specific certificates: `{project}/.lpm/certs/`
 pub fn project_cert_dir(project_dir: &Path) -> Result<PathBuf, LpmError> {
     Ok(project_dir.join(".lpm").join("certs"))
-}
-
-/// Resolve and optionally create the project certificate directory without
-/// following repository-controlled links or junctions.
-pub(crate) fn secure_project_cert_dir(
-    project_dir: &Path,
-    create: bool,
-) -> Result<PathBuf, LpmError> {
-    let project_dir = project_dir.canonicalize().map_err(|error| {
-        LpmError::Cert(format!(
-            "failed to resolve project directory {}: {error}",
-            project_dir.display()
-        ))
-    })?;
-    let state_dir = project_dir.join(".lpm");
-    let cert_dir = state_dir.join("certs");
-
-    validate_project_directory_entry(&state_dir, ".lpm")?;
-    if create && !state_dir.exists() {
-        crate::create_dir_secure(&state_dir).map_err(|error| {
-            LpmError::Cert(format!(
-                "failed to create project state directory {}: {error}",
-                state_dir.display()
-            ))
-        })?;
-    }
-    validate_project_directory_entry(&state_dir, ".lpm")?;
-    validate_project_directory_entry(&cert_dir, ".lpm/certs")?;
-    if create && !cert_dir.exists() {
-        crate::create_dir_secure(&cert_dir).map_err(|error| {
-            LpmError::Cert(format!(
-                "failed to create project certificate directory {}: {error}",
-                cert_dir.display()
-            ))
-        })?;
-    }
-    validate_project_directory_entry(&cert_dir, ".lpm/certs")?;
-    Ok(cert_dir)
 }
 
 pub(crate) struct ProjectCertDirectory {
@@ -1127,6 +1130,17 @@ fn read_relative_file(dir: &Dir, name: &str) -> Result<Vec<u8>, LpmError> {
 }
 
 fn read_bounded_relative_file(dir: &Dir, name: &str, label: &str) -> Result<Vec<u8>, LpmError> {
+    read_bounded_relative_file_with_permissions(dir, name, label, true)
+}
+
+fn read_bounded_relative_file_with_permissions(
+    dir: &Dir,
+    name: &str,
+    label: &str,
+    protect: bool,
+) -> Result<Vec<u8>, LpmError> {
+    #[cfg(not(windows))]
+    let _ = protect;
     use cap_fs_ext::{FollowSymlinks, OpenOptionsFollowExt};
 
     let mut options = OpenOptions::new();
@@ -1138,16 +1152,22 @@ fn read_bounded_relative_file(dir: &Dir, name: &str, label: &str) -> Result<Vec<
         use windows_sys::Win32::Foundation::GENERIC_READ;
         use windows_sys::Win32::Storage::FileSystem::{READ_CONTROL, WRITE_DAC};
 
-        options.access_mode(GENERIC_READ | READ_CONTROL | WRITE_DAC);
+        options.access_mode(if protect {
+            GENERIC_READ | READ_CONTROL | WRITE_DAC
+        } else {
+            GENERIC_READ
+        });
     }
     options.follow(FollowSymlinks::No);
     let file = dir
         .open_with(name, &options)
         .map_err(|error| LpmError::Cert(format!("failed to open {label} path {name}: {error}")))?;
     #[cfg(windows)]
-    windows_security::protect_cap_file(&file).map_err(|error| {
-        LpmError::Cert(format!("failed to protect {label} path {name}: {error}"))
-    })?;
+    if protect {
+        windows_security::protect_cap_file(&file).map_err(|error| {
+            LpmError::Cert(format!("failed to protect {label} path {name}: {error}"))
+        })?;
+    }
     let metadata = file.metadata().map_err(|error| {
         LpmError::Cert(format!("failed to inspect {label} path {name}: {error}"))
     })?;
@@ -1218,6 +1238,51 @@ fn reject_linked_global_entry(dir: &Dir, name: &str, path: &Path) -> Result<(), 
             path.join(name).display()
         ))),
     }
+}
+
+fn inspect_directory(parent: &Dir, name: &str) -> Result<Option<Dir>, LpmError> {
+    match open_directory_nofollow(parent, name) {
+        Ok(dir) => {
+            verify_path_identity(parent, name, &dir, name)?;
+            Ok(Some(dir))
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(LpmError::Cert(format!(
+            "failed to inspect certificate directory {name}: {error}"
+        ))),
+    }
+}
+
+pub(crate) fn inspect_project_cert_material(
+    project_dir: &Path,
+) -> Result<Option<ProjectCertMaterial>, LpmError> {
+    let project = Dir::open_ambient_dir(project_dir.canonicalize()?, cap_std::ambient_authority())?;
+    let Some(state) = inspect_directory(&project, ".lpm")? else {
+        return Ok(None);
+    };
+    let Some(certs) = inspect_directory(&state, "certs")? else {
+        return Ok(None);
+    };
+    if !relative_file_exists(&certs, "cert.pem")? {
+        return Ok(None);
+    }
+    let cert = read_bounded_relative_file_with_permissions(
+        &certs,
+        "cert.pem",
+        "project certificate",
+        false,
+    )?;
+    let key = if relative_file_exists(&certs, "key.pem")? {
+        Some(read_bounded_relative_file_with_permissions(
+            &certs,
+            "key.pem",
+            "project key",
+            false,
+        )?)
+    } else {
+        None
+    };
+    Ok(Some(ProjectCertMaterial { cert, key }))
 }
 
 pub(crate) fn open_project_cert_directory(
@@ -1570,22 +1635,6 @@ pub(crate) fn reject_linked_project_cert_file(path: &Path) -> Result<(), LpmErro
         Err(error) => Err(LpmError::Cert(format!(
             "failed to inspect project certificate path {}: {error}",
             path.display()
-        ))),
-    }
-}
-
-fn validate_project_directory_entry(path: &Path, label: &str) -> Result<(), LpmError> {
-    match std::fs::symlink_metadata(path) {
-        Ok(metadata) if lpm_common::is_symlink_or_junction(&metadata) => Err(LpmError::Cert(
-            format!("refusing linked project certificate directory `{label}`"),
-        )),
-        Ok(metadata) if metadata.is_dir() => Ok(()),
-        Ok(_) => Err(LpmError::Cert(format!(
-            "project certificate path `{label}` is not a directory"
-        ))),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(LpmError::Cert(format!(
-            "failed to inspect project certificate directory `{label}`: {error}"
         ))),
     }
 }

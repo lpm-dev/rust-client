@@ -556,6 +556,10 @@ pub struct CertStatus {
     pub project_cert_hostnames: Vec<String>,
     /// Whether the project cert needs renewal (within 30 days of expiry).
     pub project_cert_needs_renewal: bool,
+    /// Whether the project key and chain are usable with the active root.
+    pub project_cert_valid: bool,
+    /// Reason the project material is not usable.
+    pub project_cert_error: Option<String>,
 }
 
 /// One-call setup: ensures CA exists and is trusted, generates project cert if needed,
@@ -864,24 +868,38 @@ pub fn status(project_dir: &Path) -> Result<CertStatus, LpmError> {
         (false, None, None)
     };
 
-    let project_cert_dir = paths::secure_project_cert_dir(project_dir, false)?;
-    let proj_cert_path = project_cert_dir.join("cert.pem");
-    let project_cert_exists = proj_cert_path.exists();
-
+    let material = paths::inspect_project_cert_material(project_dir)?;
+    let project_cert_exists = material.is_some();
     let (project_cert_expires, project_cert_hostnames, project_cert_needs_renewal) =
-        if project_cert_exists {
-            let info = cert::read_cert_info(&proj_cert_path).ok();
-            let needs_renewal = cert::needs_renewal(&proj_cert_path).unwrap_or(true);
+        if let Some(material) = &material {
+            let info = cert::read_cert_info_bytes(&material.cert).ok();
             (
                 info.as_ref().map(|i| i.not_after.clone()),
                 info.as_ref()
                     .map(|i| i.san_entries.clone())
                     .unwrap_or_default(),
-                needs_renewal,
+                cert::needs_renewal_bytes(&material.cert).unwrap_or(true),
             )
         } else {
             (None, vec![], false)
         };
+    let project_cert_error = material.as_ref().and_then(|material| {
+        (|| {
+            let key = material
+                .key
+                .as_deref()
+                .ok_or_else(|| LpmError::Cert("project private key is missing".into()))?;
+            cert::validate_project_key_pair_bytes(&material.cert, key)?;
+            let root = lpm_common::read_file_capped(
+                &ca_cert_path,
+                lpm_common::TLS_MATERIAL_FILE_SIZE_CAP_BYTES,
+            )?;
+            cert::validate_project_server_chain_bytes(&material.cert, &root, &[])
+        })()
+        .err()
+        .map(|error: LpmError| error.to_string())
+    });
+    let project_cert_valid = project_cert_exists && project_cert_error.is_none();
 
     Ok(CertStatus {
         ca_exists,
@@ -892,6 +910,8 @@ pub fn status(project_dir: &Path) -> Result<CertStatus, LpmError> {
         project_cert_expires,
         project_cert_hostnames,
         project_cert_needs_renewal,
+        project_cert_valid,
+        project_cert_error,
     })
 }
 

@@ -1,0 +1,15 @@
+---
+source: tests/workflows/tests/cert.rs
+expression: "json_envelope(&output, \"empty reconcile dry-run\")"
+---
+{
+  "success": true,
+  "pending_recovery": false,
+  "grace_removed": [],
+  "grace_pending": [],
+  "stale_removed": [],
+  "mtime_fallback": [],
+  "reconcile_required_cleared": false,
+  "resolved_old_fingerprints": [],
+  "pending_old_fingerprints": []
+}
