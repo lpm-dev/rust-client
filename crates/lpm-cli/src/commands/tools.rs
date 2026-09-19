@@ -680,6 +680,13 @@ fn effective_tool_version(project_dir: &Path, tool_name: &str) -> Result<Option<
     if local.is_some() {
         return Ok(local);
     }
+    let project_root = lpm_workspace::find_project_root(project_dir);
+    if let Some(root) = project_root.as_deref().filter(|root| *root != project_dir) {
+        let project = read_tool_version(root, tool_name)?;
+        if project.is_some() {
+            return Ok(project);
+        }
+    }
     let boundary = runner_boundary(project_dir)?;
     if boundary != project_dir {
         return read_tool_version(&boundary, tool_name);

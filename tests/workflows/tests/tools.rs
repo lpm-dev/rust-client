@@ -3340,3 +3340,51 @@ fn lint_workspace_reports_bad_member_config_without_skipping_healthy_members() {
     assert!(!project.file_exists("packages/utils/.lint-ok"));
     assert!(project.file_exists("packages/core/.lint-ok"));
 }
+
+#[cfg(unix)]
+#[test]
+fn native_tools_keep_project_pins_when_run_from_nested_directories() {
+    for (command, plugin) in [("lint", "oxlint"), ("fmt", "biome")] {
+        for workspace in [false, true] {
+            let project = TempProject::empty(if workspace {
+                r#"{"name":"root","private":true,"workspaces":["packages/*"]}"#
+            } else {
+                r#"{"name":"single"}"#
+            });
+            let member = if workspace { "packages/member/" } else { "" };
+            project.write_file(
+                "lpm.json",
+                &serde_json::json!({"tools":{plugin:"1.0.0"}}).to_string(),
+            );
+            project.write_file(&format!("{member}package.json"), r#"{"name":"member"}"#);
+            project.write_file(
+                &format!("{member}lpm.json"),
+                &serde_json::json!({"tools":{plugin:"2.0.0"}}).to_string(),
+            );
+            for version in ["1.0.0", "2.0.0", "1.79.0", "2.5.9"] {
+                seed_fake_plugin_script(
+                    &project,
+                    plugin,
+                    version,
+                    &format!("#!/bin/sh\nprintf '{version}' > selected-version\n"),
+                );
+            }
+            project.write_file(&format!("{member}src/input.js"), "");
+            let output = lpm(&project)
+                .current_dir(project.path().join(format!("{member}src")))
+                .arg(command)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert_eq!(
+                project.read_file(&format!("{member}src/selected-version")),
+                "2.0.0",
+                "nested {command} lost its project pin"
+            );
+        }
+    }
+}
