@@ -191,6 +191,8 @@ fn run_declared_service_list(
     json_output: bool,
 ) {
     let port_overrides = ports::read_port_overrides(project_dir);
+    let mut services: Vec<_> = services.iter().collect();
+    services.sort_unstable_by(|left, right| left.0.cmp(right.0));
     if json_output {
         let ports: Vec<serde_json::Value> = services
             .iter()
@@ -242,7 +244,7 @@ fn run_declared_service_list(
         .collect();
 
     if rows.is_empty() {
-        install_ui::warn("No declared service ports");
+        install_ui::warn("No declared or saved service ports");
         return;
     }
 
@@ -273,7 +275,7 @@ fn run_declared_service_list(
     }
     println!();
     install_ui::done_untrusted(&format!(
-        "{} declared service {}",
+        "{} service {}",
         rows.len(),
         if rows.len() == 1 { "port" } else { "ports" }
     ));
@@ -284,12 +286,7 @@ fn service_list_port(
     config: &lpm_json::ServiceConfig,
     port_overrides: &HashMap<String, u16>,
 ) -> Option<u16> {
-    config.port.or_else(|| {
-        config
-            .host
-            .as_ref()
-            .and_then(|_| port_overrides.get(name).copied())
-    })
+    port_overrides.get(name).copied().or(config.port)
 }
 
 fn project_listening_ports(project_dir: &Path) -> Vec<ListeningPort> {
