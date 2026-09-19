@@ -155,9 +155,10 @@ pub async fn fmt(
     check: bool,
     json_output: bool,
 ) -> Result<(), LpmError> {
+    let watch = validate_fmt_args(args, check, json_output)?;
     let start = std::time::Instant::now();
     let version = effective_tool_version(project_dir, "biome")?;
-    let bin = lpm_plugin::ensure_plugin("biome", version.as_deref(), false).await?;
+    let bin = lpm_plugin::ensure_plugin("biome", version.as_deref(), json_output).await?;
 
     if !json_output {
         let version_label = tools_ui::plugin_version_label(&bin, version.as_deref());
@@ -166,10 +167,18 @@ pub async fn fmt(
 
     let biome_args = build_biome_args(args, check);
     let signals = Arc::new(lpm_runner::execution::ExecutionSignals::new()?);
+    let stdio = if json_output {
+        StdioMode::Capture
+    } else {
+        StdioMode::Inherit
+    };
     let outcome =
-        run_tool_binary(&bin, &biome_args, project_dir, StdioMode::Inherit, signals).await?;
-    if outcome.success() && !json_output {
-        if check {
+        run_tool_binary(&bin, &biome_args, project_dir, stdio, Arc::clone(&signals)).await?;
+    if json_output {
+        return finish_single_tool(project_dir, outcome, start.elapsed(), &signals);
+    }
+    if outcome.success() {
+        if check || watch {
             tools_ui::done_fmt_check(start.elapsed());
         } else {
             tools_ui::done_fmt_write_elapsed(start.elapsed());
@@ -204,10 +213,49 @@ fn build_biome_args(args: &[String], check: bool) -> Vec<String> {
     } else {
         biome_args.extend_from_slice(args);
     }
-    if !check {
-        biome_args.push("--write".into());
+    let watch = args
+        .iter()
+        .take_while(|arg| arg.as_str() != "--")
+        .any(|arg| arg == "--watch");
+    if !check && !watch {
+        let position = biome_args
+            .iter()
+            .position(|arg| arg == "--")
+            .unwrap_or(biome_args.len());
+        biome_args.insert(position, "--write".into());
     }
     biome_args
+}
+
+fn validate_fmt_args(args: &[String], check: bool, json_output: bool) -> Result<bool, LpmError> {
+    let mut watch = false;
+    let mut write = false;
+    for arg in args.iter().take_while(|arg| arg.as_str() != "--") {
+        let option = arg.split_once('=').map_or(arg.as_str(), |(name, _)| name);
+        match option {
+            "--watch" => {
+                if arg != "--watch" {
+                    return Err(LpmError::Script(
+                        "Biome's --watch flag does not accept a value".into(),
+                    ));
+                }
+                watch = true;
+            }
+            "--write" | "--fix" => write = true,
+            _ => {}
+        }
+    }
+    if write && (check || watch) {
+        return Err(LpmError::Script(
+            "--check and --watch cannot be combined with Biome's --write or --fix options".into(),
+        ));
+    }
+    if watch && json_output {
+        return Err(LpmError::Script(
+            "--watch cannot be combined with --json for lpm fmt".into(),
+        ));
+    }
+    Ok(watch)
 }
 
 /// Run `lpm check` — delegates to the selected engine with `--noEmit`.
@@ -933,6 +981,7 @@ pub async fn tool_workspace(
     workspace_concurrency: WorkspaceConcurrency,
     json_output: bool,
 ) -> Result<(), LpmError> {
+    let fmt_watch = tool == "fmt" && validate_fmt_args(args, check, json_output)?;
     let workspace = lpm_workspace::discover_workspace(project_dir)
         .map_err(|e| LpmError::Script(format!("workspace error: {e}")))?
         .ok_or_else(|| {
@@ -954,6 +1003,13 @@ pub async fn tool_workspace(
         affected_base.is_some(),
         affected_base.unwrap_or("main"),
     )?;
+
+    if fmt_watch && target_set.len() != 1 {
+        return Err(LpmError::Script(format!(
+            "fmt watch mode requires exactly one selected workspace member (selected {})",
+            target_set.len()
+        )));
+    }
 
     if target_set.is_empty() {
         // `--affected` with no filter is the common "nothing changed since the

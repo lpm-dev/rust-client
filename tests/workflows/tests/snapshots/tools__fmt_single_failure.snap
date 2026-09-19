@@ -1,0 +1,21 @@
+---
+source: tests/workflows/tests/tools.rs
+expression: value
+---
+{
+  "success": false,
+  "packages": 1,
+  "succeeded": 0,
+  "failed": 1,
+  "duration_ms": 0,
+  "members": [
+    {
+      "name": "fmt-json",
+      "success": false,
+      "exit_code": 7,
+      "duration_ms": 0,
+      "stdout": "fmt-diagnostic\n",
+      "stderr": "fmt-error\n"
+    }
+  ]
+}

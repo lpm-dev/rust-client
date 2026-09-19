@@ -3388,3 +3388,181 @@ fn native_tools_keep_project_pins_when_run_from_nested_directories() {
         }
     }
 }
+
+#[cfg(unix)]
+#[test]
+fn fmt_check_rejects_write_flags_before_running_biome() {
+    for flag in ["--write", "--fix", "--write=true", "--fix=true"] {
+        for workspace in [false, true] {
+            let project = TempProject::from_fixture("workspace-monorepo");
+            seed_workspace_tool_pin(&project, "biome", "1.0.0");
+            project.write_file("lpm.json", r#"{"tools":{"biome":"1.0.0"}}"#);
+            seed_fake_plugin_script(
+                &project,
+                "biome",
+                "1.0.0",
+                "#!/bin/sh\necho changed > changed\n",
+            );
+            let mut command = lpm(&project);
+            command.args(["fmt", "--check"]);
+            if workspace {
+                command.arg("--all");
+            }
+            let output = command.args(["--", flag]).output().unwrap();
+            assert!(
+                !output.status.success(),
+                "{flag} allowed check mode to write"
+            );
+            assert!(!project.file_exists("changed"));
+            for member in WORKSPACE_MEMBERS {
+                assert!(!project.file_exists(&format!("{member}/changed")));
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn fmt_watch_omits_implicit_write() {
+    let project = TempProject::from_fixture("workspace-monorepo");
+    seed_workspace_tool_pin(&project, "biome", "1.0.0");
+    project.write_file("lpm.json", r#"{"tools":{"biome":"1.0.0"}}"#);
+    seed_fake_plugin_script(
+        &project,
+        "biome",
+        "1.0.0",
+        "#!/bin/sh\nprintf '%s\\n' \"$@\" > args\n",
+    );
+    let output = lpm(&project)
+        .args(["fmt", "--", "--watch"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    assert_eq!(project.read_file("args"), "format\n--watch\n");
+}
+
+#[cfg(unix)]
+#[test]
+fn fmt_watch_rejects_multiple_members_empty_selections_and_json() {
+    let project = TempProject::from_fixture("workspace-monorepo");
+    seed_workspace_tool_pin(&project, "biome", "1.0.0");
+    project.write_file("lpm.json", r#"{"tools":{"biome":"1.0.0"}}"#);
+    seed_fake_plugin_script(&project, "biome", "1.0.0", "#!/bin/sh\nexit 0\n");
+    for args in [
+        vec!["fmt", "--all", "--", "--watch"],
+        vec!["fmt", "--filter", "missing", "--", "--watch"],
+        vec!["fmt", "--json", "--", "--watch"],
+    ] {
+        let output = lpm(&project).args(args).output().unwrap();
+        assert!(
+            !output.status.success(),
+            "watch admission allowed invalid run"
+        );
+    }
+    let output = lpm(&project)
+        .args(["fmt", "--filter", "@test/utils", "--", "--watch"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+}
+
+#[cfg(unix)]
+#[test]
+fn fmt_watch_rejects_write_flags_and_assigned_values_before_running() {
+    let project = TempProject::empty(r#"{"name":"watch"}"#);
+    project.write_file("lpm.json", r#"{"tools":{"biome":"1.0.0"}}"#);
+    seed_fake_plugin_script(&project, "biome", "1.0.0", "#!/bin/sh\nexit 0\n");
+    for args in [
+        vec!["fmt", "--", "--watch", "--write"],
+        vec!["fmt", "--", "--watch", "--fix"],
+        vec!["fmt", "--", "--watch=false"],
+    ] {
+        let output = lpm(&project).args(args).output().unwrap();
+        assert!(
+            !output.status.success(),
+            "invalid Biome flags reached the formatter"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn fmt_json_captures_one_envelope_and_preserves_the_child_exit_code() {
+    let project = TempProject::empty(r#"{"name":"fmt-json","version":"1.0.0"}"#);
+    project.write_file("lpm.json", r#"{"tools":{"biome":"1.0.0"}}"#);
+    seed_fake_plugin_script(
+        &project,
+        "biome",
+        "1.0.0",
+        "#!/bin/sh\necho fmt-diagnostic\necho fmt-error >&2\nexit 7\n",
+    );
+    let output = lpm(&project)
+        .args(["--json", "fmt", "--check"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(7));
+    let value: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("one JSON envelope");
+    assert_eq!(value["members"][0]["stdout"], "fmt-diagnostic\n");
+    assert_eq!(value["members"][0]["stderr"], "fmt-error\n");
+    insta::assert_json_snapshot!("fmt_single_failure", value, {".duration_ms" => 0,".members[].duration_ms" => 0});
+}
+
+#[cfg(unix)]
+#[test]
+fn fmt_places_implicit_write_before_forwarded_option_separator() {
+    let project = TempProject::empty(r#"{"name":"separator"}"#);
+    project.write_file("lpm.json", r#"{"tools":{"biome":"1.0.0"}}"#);
+    seed_fake_plugin_script(
+        &project,
+        "biome",
+        "1.0.0",
+        "#!/bin/sh\nprintf '%s\\n' \"$@\" > args\n",
+    );
+    let output = lpm(&project)
+        .args(["fmt", "--", "--", "sample.js"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    assert_eq!(
+        project.read_file("args"),
+        "format\n--write\n--\nsample.js\n"
+    );
+    let output = lpm(&project)
+        .args(["fmt", "--check", "--", "--", "--write", "--watch"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    assert_eq!(project.read_file("args"), "format\n--\n--write\n--watch\n");
+}
+
+#[cfg(unix)]
+#[test]
+fn fmt_workspace_watch_validates_root_config_before_using_member_pin() {
+    let project = TempProject::from_fixture("workspace-monorepo");
+    seed_workspace_tool_pin(&project, "biome", "1.0.0");
+    project.write_file("lpm.json", "{ invalid");
+    seed_fake_plugin_script(&project, "biome", "1.0.0", "#!/bin/sh\necho ran > ran\n");
+    let output = lpm(&project)
+        .args(["fmt", "--filter", "@test/utils", "--", "--watch"])
+        .output()
+        .unwrap();
+    assert!(
+        !output.status.success(),
+        "watch skipped malformed root configuration"
+    );
+    assert!(!project.file_exists("packages/utils/ran"));
+}
+
+#[cfg(unix)]
+#[test]
+fn fmt_workspace_watch_keeps_the_workspace_failure_exit_code() {
+    let project = TempProject::from_fixture("workspace-monorepo");
+    seed_workspace_tool_pin(&project, "biome", "1.0.0");
+    seed_fake_plugin_script(&project, "biome", "1.0.0", "#!/bin/sh\nexit 7\n");
+    let output = lpm(&project)
+        .args(["fmt", "--filter", "@test/utils", "--", "--watch"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1));
+}
