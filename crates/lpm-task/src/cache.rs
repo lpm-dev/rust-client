@@ -1231,7 +1231,9 @@ fn restore_remote_artifact_locked_if(
             )));
         };
         if rel.as_os_str().is_empty() {
-            return Ok(std::ops::ControlFlow::<()>::Continue(()));
+            return Err(LpmError::Task(
+                "remote cache artifact contains a bare outputs entry".into(),
+            ));
         }
 
         let header = entry.header().clone();
@@ -1769,7 +1771,7 @@ fn validate_archive_entry_type(
     path: &Path,
     label: &str,
 ) -> Result<(), LpmError> {
-    if !(header_type.is_file() || header_type.is_dir()) {
+    if !header_type.is_file() {
         return Err(LpmError::Task(format!(
             "{label} contains non-regular entry ({:?}): {}",
             header_type,
@@ -1841,6 +1843,9 @@ fn set_dir_permissions_restricted(_path: &Path) -> Result<(), LpmError> {
 }
 
 #[cfg(test)]
+mod output_contract_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use std::fs;
@@ -1891,8 +1896,13 @@ mod tests {
             )
         }
 
-        fn restore(&self, key: &str, project_dir: &Path) -> Result<CacheHit, LpmError> {
-            restore_cache_with_root(&self.root, key, project_dir, &[])
+        fn restore(
+            &self,
+            key: &str,
+            project_dir: &Path,
+            output_globs: &[String],
+        ) -> Result<CacheHit, LpmError> {
+            restore_cache_with_root(&self.root, key, project_dir, output_globs)
         }
 
         fn create_remote(&self, args: RemoteArtifactCreate<'_>) -> Result<(), LpmError> {
@@ -1900,15 +1910,6 @@ mod tests {
         }
 
         fn restore_remote(
-            &self,
-            key: &str,
-            artifact_path: &Path,
-            project_dir: &Path,
-        ) -> Result<CacheHit, LpmError> {
-            restore_remote_artifact_with_root(&self.root, key, artifact_path, project_dir, &[])
-        }
-
-        fn restore_remote_exact(
             &self,
             key: &str,
             artifact_path: &Path,
@@ -2006,7 +2007,9 @@ mod tests {
         assert!(!dir.path().join("dist/index.js").exists());
 
         // Restore
-        let hit = cache.restore(&key, dir.path()).unwrap();
+        let hit = cache
+            .restore(&key, dir.path(), &["dist/**".into()])
+            .unwrap();
         assert_eq!(hit.meta.command, "echo build");
         assert_eq!(hit.meta.duration_ms, 1234);
         assert_eq!(hit.stdout, "build output\n");
@@ -2093,7 +2096,7 @@ mod tests {
         create_archive(project.path(), &["dist/**".into()], &archive).unwrap();
         fs::remove_dir_all(project.path().join("dist")).unwrap();
 
-        restore_archive(&archive, project.path()).unwrap();
+        restore_archive(&archive, project.path(), &["dist/**".into()]).unwrap();
 
         let restored = fs::metadata(output).unwrap().modified().unwrap();
         assert_eq!(
@@ -2135,7 +2138,7 @@ mod tests {
         fs::remove_dir_all(dir.path().join("dist")).unwrap();
 
         let hit = cache
-            .restore_remote(&key, &artifact_path, dir.path())
+            .restore_remote(&key, &artifact_path, dir.path(), &["dist/**".into()])
             .unwrap();
 
         assert_eq!(hit.meta.command, "node build.js");
@@ -2191,7 +2194,7 @@ mod tests {
             "deadbeef",
             verified,
             target.path(),
-            &[],
+            &["dist/**".into()],
         )
         .unwrap();
 
@@ -2360,7 +2363,7 @@ mod tests {
         fs::write(target.path().join("dist/stale.txt"), "stale").unwrap();
 
         cache
-            .restore_remote_exact(&key, &artifact_path, target.path(), &["dist/**".into()])
+            .restore_remote(&key, &artifact_path, target.path(), &["dist/**".into()])
             .unwrap();
 
         assert_eq!(
@@ -2393,7 +2396,7 @@ mod tests {
             .unwrap();
 
         let err = cache
-            .restore_remote("deadbeef", &artifact_path, dir.path())
+            .restore_remote("deadbeef", &artifact_path, dir.path(), &["dist/**".into()])
             .unwrap_err();
         assert!(
             err.to_string().contains("key mismatch"),
@@ -2434,7 +2437,7 @@ mod tests {
         }
 
         let err = cache
-            .restore_remote(&key, &artifact_path, dir.path())
+            .restore_remote(&key, &artifact_path, dir.path(), &["dist/**".into()])
             .unwrap_err();
         assert!(
             err.to_string().contains("unexpected entry"),
@@ -2532,7 +2535,7 @@ mod tests {
         let worker_key = key;
         let worker_alias = alias.clone();
         let worker = std::thread::spawn(move || {
-            restore_cache_with_root(&root, &worker_key, &worker_alias, &[])
+            restore_cache_with_root(&root, &worker_key, &worker_alias, &["dist/**".into()])
         });
 
         barrier.validated.wait();
@@ -2578,7 +2581,7 @@ mod tests {
         let worker_key = key;
         let worker_project = project.clone();
         let worker = std::thread::spawn(move || {
-            restore_cache_with_root(&root, &worker_key, &worker_project, &[])
+            restore_cache_with_root(&root, &worker_key, &worker_project, &["dist/**".into()])
         });
 
         barrier.validated.wait();
@@ -2670,7 +2673,7 @@ mod tests {
         let worker_key = key;
         let worker_target = target.path().to_path_buf();
         let worker = std::thread::spawn(move || {
-            restore_cache_with_root(&root, &worker_key, &worker_target, &[])
+            restore_cache_with_root(&root, &worker_key, &worker_target, &["dist/**".into()])
         });
 
         barrier.validated.wait();
@@ -2834,7 +2837,7 @@ mod tests {
         fs::write(outside.path().join("value.txt"), "outside-original").unwrap();
         symlink(outside.path(), target.path().join("dist")).unwrap();
 
-        let result = cache.restore_remote(&key, &artifact_path, target.path());
+        let result = cache.restore_remote(&key, &artifact_path, target.path(), &["dist/**".into()]);
 
         assert!(result.is_err(), "a symlink destination was accepted");
         assert_eq!(
@@ -2868,7 +2871,12 @@ mod tests {
         fs::create_dir_all(target.path().join("dist")).unwrap();
         fs::write(target.path().join("dist/value.txt"), "original-value").unwrap();
 
-        let result = cache.restore_remote("deadbeef", &artifact_path, target.path());
+        let result = cache.restore_remote(
+            "deadbeef",
+            &artifact_path,
+            target.path(),
+            &["dist/**".into()],
+        );
 
         assert!(result.is_err(), "an artifact without metadata was accepted");
         assert_eq!(
@@ -2905,7 +2913,7 @@ mod tests {
         fs::create_dir_all(target.path().join("dist")).unwrap();
         fs::write(target.path().join("dist/value.txt"), "original-value").unwrap();
 
-        let result = restore_archive(&archive_path, target.path());
+        let result = restore_archive(&archive_path, target.path(), &["dist/**".into()]);
 
         assert!(result.is_err(), "an archive with a symlink was accepted");
         assert_eq!(
@@ -2931,7 +2939,7 @@ mod tests {
             relative: PathBuf::from("dist/value.txt"),
         });
 
-        let result = restore_archive(&archive_path, target.path());
+        let result = restore_archive(&archive_path, target.path(), &["dist/**".into()]);
         *STAGED_FILE_FINALIZE_FAILURE.lock().unwrap() = None;
 
         let error = result.expect_err("an unfinished staged output was applied");
@@ -2962,8 +2970,9 @@ mod tests {
         create_archive(source.path(), &["dist/**".into()], &archive_path).unwrap();
         let target = tempfile::tempdir().unwrap();
 
-        let (result, syncs) =
-            count_restore_durability_syncs(|| restore_archive(&archive_path, target.path()));
+        let (result, syncs) = count_restore_durability_syncs(|| {
+            restore_archive(&archive_path, target.path(), &["dist/**".into()])
+        });
 
         result.unwrap();
         assert!(
@@ -2987,8 +2996,9 @@ mod tests {
         create_archive(source.path(), &["dist/**".into()], &archive_path).unwrap();
         let target = tempfile::tempdir().unwrap();
 
-        let (result, syncs) =
-            count_restore_durability_syncs(|| restore_archive(&archive_path, target.path()));
+        let (result, syncs) = count_restore_durability_syncs(|| {
+            restore_archive(&archive_path, target.path(), &["dist/**".into()])
+        });
 
         result.unwrap();
         assert!(
@@ -3090,7 +3100,7 @@ mod tests {
     }
 
     #[test]
-    fn restore_uses_the_verified_staging_directory_after_its_path_is_replaced() {
+    fn restore_rejects_replacement_of_staging_before_output_glob_validation() {
         use flate2::Compression;
         use flate2::write::GzEncoder;
 
@@ -3122,11 +3132,12 @@ mod tests {
         fs::create_dir(staging_path.join("backups")).unwrap();
         fs::write(staging_path.join("outputs/dist/value.txt"), "attacker").unwrap();
 
-        staged.apply(&[]).unwrap();
-
+        let error = staged.apply(&["dist/**".into()]).unwrap_err();
+        assert!(error.to_string().contains("staged task outputs changed"));
+        assert!(!project.path().join("dist/value.txt").exists());
         assert_eq!(
-            fs::read_to_string(project.path().join("dist/value.txt")).unwrap(),
-            "verified"
+            fs::read_to_string(staging_path.join("outputs/dist/value.txt")).unwrap(),
+            "attacker"
         );
     }
 
@@ -3884,7 +3895,7 @@ mod tests {
         .unwrap();
 
         let project = tempfile::tempdir().unwrap();
-        let error = match cache.restore(&key, project.path()) {
+        let error = match cache.restore(&key, project.path(), &["dist/**".into()]) {
             Err(error) => error,
             Ok(_) => panic!("metadata that declares outputs requires an archive"),
         };
@@ -3929,7 +3940,7 @@ mod tests {
         fs::create_dir(project.path().join("dist")).unwrap();
         fs::write(project.path().join("dist/value.txt"), "original").unwrap();
         let error = cache
-            .restore(&key, project.path())
+            .restore(&key, project.path(), &["dist/**".into()])
             .expect_err("a symlinked local archive must be rejected");
 
         assert!(
@@ -3963,7 +3974,7 @@ mod tests {
         .unwrap();
 
         let project = tempfile::tempdir().unwrap();
-        let error = match cache.restore(&key, project.path()) {
+        let error = match cache.restore(&key, project.path(), &["dist/**".into()]) {
             Err(error) => error,
             Ok(_) => panic!("metadata from a different cache key must be rejected"),
         };
@@ -3995,7 +4006,7 @@ mod tests {
         .unwrap();
 
         let project = tempfile::tempdir().unwrap();
-        let error = match cache.restore(&key, project.path()) {
+        let error = match cache.restore(&key, project.path(), &["dist/**".into()]) {
             Err(error) => error,
             Ok(_) => panic!("an oversized replay log must be rejected"),
         };
@@ -4055,7 +4066,9 @@ mod tests {
         });
 
         let restored = tempfile::tempdir().unwrap();
-        let hit = cache.restore(&key, restored.path()).unwrap();
+        let hit = cache
+            .restore(&key, restored.path(), &["dist/**".into()])
+            .unwrap();
         let producer: usize = hit
             .meta
             .command
@@ -4250,7 +4263,7 @@ mod tests {
             builder.finish().unwrap();
         }
 
-        let result = restore_archive(&archive_path, dir.path());
+        let result = restore_archive(&archive_path, dir.path(), &["dist/**".into()]);
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(
@@ -4289,7 +4302,7 @@ mod tests {
             builder.finish().unwrap();
         }
 
-        let result = restore_archive(&archive_path, dir.path());
+        let result = restore_archive(&archive_path, dir.path(), &["dist/**".into()]);
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(
@@ -4323,7 +4336,7 @@ mod tests {
             builder.finish().unwrap();
         }
 
-        restore_archive(&archive_path, dir.path()).unwrap();
+        restore_archive(&archive_path, dir.path(), &["dist/**".into()]).unwrap();
         assert_eq!(
             fs::read_to_string(dir.path().join("dist/output.js")).unwrap(),
             "hello"
@@ -4356,7 +4369,7 @@ mod tests {
             builder.finish().unwrap();
         }
 
-        let err = restore_archive(&archive_path, dir.path()).unwrap_err();
+        let err = restore_archive(&archive_path, dir.path(), &["dist/**".into()]).unwrap_err();
         let msg = err.to_string();
         assert!(
             msg.contains("non-regular entry"),
@@ -4389,7 +4402,7 @@ mod tests {
             builder.finish().unwrap();
         }
 
-        let err = restore_archive(&archive_path, dir.path()).unwrap_err();
+        let err = restore_archive(&archive_path, dir.path(), &["dist/**".into()]).unwrap_err();
         assert!(err.to_string().contains("non-regular entry"));
     }
 

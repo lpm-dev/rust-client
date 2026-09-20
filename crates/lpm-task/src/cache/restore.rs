@@ -15,13 +15,17 @@ const MAX_RESTORE_JOURNAL_BYTES: u64 = 64 * 1024 * 1024;
 
 /// Restore a cache archive only after all entries pass validation.
 #[cfg(test)]
-pub(super) fn restore_archive(archive_path: &Path, project_dir: &Path) -> Result<(), LpmError> {
+pub(super) fn restore_archive(
+    archive_path: &Path,
+    project_dir: &Path,
+    output_globs: &[String],
+) -> Result<(), LpmError> {
     let root_dir = tempfile::tempdir()?;
     let root = LpmRoot::from_dir(root_dir.path());
     ensure_real_file(archive_path, "task cache archive")?;
     let archive = std::fs::File::open(archive_path)?;
     let staged = stage_cache_archive(&root, archive, project_dir, "task cache archive")?;
-    staged.apply(&[])
+    staged.apply(output_globs)
 }
 
 pub(super) fn restore_archive_with_expected_count_if(
@@ -199,11 +203,6 @@ impl StagedOutputs {
             )));
         }
 
-        if header.entry_type().is_dir() {
-            create_directory_path_nofollow(&self.output, &relative, "staged output")?;
-            return Ok(());
-        }
-
         let (parent, name) = open_or_create_parent_nofollow(
             &self.output,
             &relative,
@@ -302,6 +301,16 @@ impl StagedOutputs {
         validate: impl FnOnce() -> Result<bool, LpmError>,
     ) -> Result<bool, LpmError> {
         let mut this = self;
+        let staging_outputs = this.temp_path.join("outputs");
+        verify_open_directory_path(&this.output, &staging_outputs, "staged task outputs")?;
+        let declared_files = collect_output_files(&staging_outputs, output_globs)?;
+        verify_open_directory_path(&this.output, &staging_outputs, "staged task outputs")?;
+        this.files.sort_unstable();
+        if this.files != declared_files {
+            return Err(LpmError::Task(
+                "task cache archive contains files outside the declared outputs".into(),
+            ));
+        }
         verify_open_directory_path(
             &this.project,
             &this.canonical_project,
@@ -1640,36 +1649,6 @@ fn restore_journal_path_from_bytes(bytes: &[u8]) -> Result<PathBuf, LpmError> {
         .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
         .collect();
     Ok(PathBuf::from(std::ffi::OsString::from_wide(&units)))
-}
-
-fn create_directory_path_nofollow(
-    root: &Dir,
-    relative: &Path,
-    label: &str,
-) -> Result<(), LpmError> {
-    let mut current = root.try_clone()?;
-    for component in relative.components() {
-        let Component::Normal(name) = component else {
-            return Err(LpmError::Task(format!(
-                "invalid task cache {label} path: {}",
-                relative.display()
-            )));
-        };
-        match current.open_dir_nofollow(name) {
-            Ok(next) => current = next,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                current.create_dir(name)?;
-                current = current.open_dir_nofollow(name)?;
-            }
-            Err(error) => {
-                return Err(LpmError::Task(format!(
-                    "task cache {label} path conflicts at {}: {error}",
-                    relative.display()
-                )));
-            }
-        }
-    }
-    Ok(())
 }
 
 pub(super) struct RestoreTransaction {

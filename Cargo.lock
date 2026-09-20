@@ -3471,6 +3471,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "tracing-tracy",
+ "url",
  "urlencoding",
  "wait-timeout",
  "windows",
