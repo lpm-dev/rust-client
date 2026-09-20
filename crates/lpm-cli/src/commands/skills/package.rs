@@ -247,6 +247,16 @@ pub(crate) fn materialization_complete(project_dir: &Path, package_json: &str) -
         .all(|package| package_materialization_complete(project_dir, package))
 }
 
+pub(crate) fn version_is_materialized(project_dir: &Path, name: &str, version: &str) -> bool {
+    let Ok(name) = PackageName::parse(name) else {
+        return false;
+    };
+    let package = name.short();
+    let directory = project_dir.join(".lpm").join("skills").join(&package);
+    materialized_directory_manifest(&directory, &package)
+        .is_some_and(|manifest| manifest.version.as_deref() == Some(version))
+}
+
 fn package_materialization_complete(project_dir: &Path, package: &str) -> bool {
     let directory = project_dir.join(".lpm").join("skills").join(package);
     materialized_directory_manifest(&directory, package).is_some()

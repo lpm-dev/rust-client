@@ -248,11 +248,6 @@ pub(super) async fn run_install_freshness_phase(
     let fast_path_base_eligible = !input.force
         && !root_versions::active(input.project_dir)
         && !input.offline
-        && (input.no_skills
-            || crate::commands::skills::package::materialization_complete(
-                input.project_dir,
-                &pkg_content_for_state,
-            ))
         && input.omit_policy.is_default()
         && !input.strict_peer_dependencies
         && install_state.up_to_date
@@ -306,7 +301,17 @@ pub(super) async fn run_install_freshness_phase(
             }
             filter_dependency_engine_packages(&mut packages, input.dependency_engine_policy)?;
             filter_platform_packages(&mut packages)?;
-            Some(packages)
+            let skills_ready = input.no_skills
+                || selected_package_skills(&packages)?
+                    .iter()
+                    .all(|(name, version)| {
+                        crate::commands::skills::package::version_is_materialized(
+                            input.project_dir,
+                            name,
+                            version,
+                        )
+                    });
+            skills_ready.then_some(packages)
         } else {
             None
         }

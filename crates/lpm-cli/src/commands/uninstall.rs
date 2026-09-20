@@ -69,7 +69,7 @@ pub(crate) fn cleanup_removed_packages(
     direct_versions: &HashMap<String, String>,
 ) -> Result<CleanupReport, LpmError> {
     validate_cleanup_paths(project_dir, removed)?;
-    let pruned = prune_lockfile_to_current_manifest(project_dir)?;
+    let pruned = prune_lockfile_to_current_manifest(project_dir, removed)?;
     let orphaned: Vec<PackageVersion> = pruned
         .removed_packages
         .into_iter()
@@ -84,16 +84,16 @@ pub(crate) fn cleanup_removed_packages(
 
     let node_modules = project_dir.join("node_modules");
     let mut freed_bytes = 0u64;
+    for name in &pruned.removed_skill_packages {
+        freed_bytes = freed_bytes
+            .saturating_add(crate::commands::skills::package::remove(project_dir, name)?);
+        if let Ok(package) = lpm_common::PackageName::parse(name) {
+            crate::editor_skills::remove_editor_skills(project_dir, &package.short());
+        }
+    }
     for name in removed {
         if pruned.retained_roots.contains(name) {
             continue;
-        }
-        if name.starts_with("@lpm.dev/") {
-            freed_bytes = freed_bytes
-                .saturating_add(crate::commands::skills::package::remove(project_dir, name)?);
-            if let Ok(package) = lpm_common::PackageName::parse(name) {
-                crate::editor_skills::remove_editor_skills(project_dir, &package.short());
-            }
         }
         freed_bytes =
             freed_bytes.saturating_add(cleanup_bin_shims_for_package(&node_modules, name)?);
@@ -524,6 +524,10 @@ fn locked_package_versions(project_dir: &Path, packages: &[String]) -> HashMap<S
 }
 
 fn node_modules_package_version(project_dir: &Path, package: &str) -> Option<String> {
+    node_modules_package_field(project_dir, package, "version")
+}
+
+fn node_modules_package_field(project_dir: &Path, package: &str, field: &str) -> Option<String> {
     let manifest_path = project_dir
         .join("node_modules")
         .join(package)
@@ -533,7 +537,7 @@ fn node_modules_package_version(project_dir: &Path, package: &str) -> Option<Str
             .ok()?;
     let manifest: Value = serde_json::from_str(&content).ok()?;
     manifest
-        .get("version")
+        .get(field)
         .and_then(Value::as_str)
         .map(str::to_string)
 }
@@ -542,9 +546,13 @@ fn node_modules_package_version(project_dir: &Path, package: &str) -> Option<Str
 struct LockfilePruneReport {
     removed_packages: Vec<PackageVersion>,
     retained_roots: HashSet<String>,
+    removed_skill_packages: HashSet<String>,
 }
 
-fn prune_lockfile_to_current_manifest(project_dir: &Path) -> Result<LockfilePruneReport, LpmError> {
+fn prune_lockfile_to_current_manifest(
+    project_dir: &Path,
+    removed: &[String],
+) -> Result<LockfilePruneReport, LpmError> {
     let manifest_path = project_dir.join("package.json");
     let manifest_content =
         lpm_common::read_text_file_capped(&manifest_path, lpm_common::CONFIG_FILE_SIZE_CAP_BYTES)?;
@@ -553,9 +561,42 @@ fn prune_lockfile_to_current_manifest(project_dir: &Path) -> Result<LockfilePrun
     let direct_specs = collect_manifest_dependency_specs(&manifest);
     let mut retained_roots = direct_specs.keys().cloned().collect::<HashSet<_>>();
 
-    let Ok(mut lockfile) = workspace_lockfile::read_project(project_dir) else {
+    let lockfile = workspace_lockfile::read_project(project_dir).ok();
+    let retained_skill_packages = direct_specs
+        .iter()
+        .map(|(name, spec)| {
+            lpm_resolver::ranges::parse_npm_alias(spec)
+                .map(|alias| alias.target)
+                .or_else(|| {
+                    spec.starts_with("catalog:")
+                        .then(|| {
+                            lockfile
+                                .as_ref()
+                                .and_then(|lockfile| lockfile.root_aliases.get(name))
+                                .cloned()
+                                .or_else(|| node_modules_package_field(project_dir, name, "name"))
+                        })
+                        .flatten()
+                })
+                .unwrap_or_else(|| name.clone())
+        })
+        .collect::<HashSet<_>>();
+    let removed_skill_packages = removed
+        .iter()
+        .map(|name| {
+            lockfile
+                .as_ref()
+                .and_then(|lockfile| lockfile.root_aliases.get(name))
+                .cloned()
+                .or_else(|| node_modules_package_field(project_dir, name, "name"))
+                .unwrap_or_else(|| name.clone())
+        })
+        .filter(|name| name.starts_with("@lpm.dev/") && !retained_skill_packages.contains(name))
+        .collect::<HashSet<_>>();
+    let Some(mut lockfile) = lockfile else {
         return Ok(LockfilePruneReport {
             retained_roots,
+            removed_skill_packages,
             ..LockfilePruneReport::default()
         });
     };
@@ -579,6 +620,7 @@ fn prune_lockfile_to_current_manifest(project_dir: &Path) -> Result<LockfilePrun
         return Ok(LockfilePruneReport {
             removed_packages,
             retained_roots,
+            removed_skill_packages,
         });
     }
 
@@ -672,6 +714,7 @@ fn prune_lockfile_to_current_manifest(project_dir: &Path) -> Result<LockfilePrun
     Ok(LockfilePruneReport {
         removed_packages,
         retained_roots,
+        removed_skill_packages,
     })
 }
 
@@ -1664,7 +1707,7 @@ mod tests {
             .write_all(&directory.path().join(lpm_lockfile::LOCKFILE_NAME))
             .unwrap();
 
-        prune_lockfile_to_current_manifest(directory.path()).unwrap();
+        prune_lockfile_to_current_manifest(directory.path(), &[]).unwrap();
 
         let pruned = lpm_lockfile::Lockfile::read_for_project(directory.path())
             .unwrap()
