@@ -336,3 +336,107 @@ fn deploy_outside_workspace_context_fails() {
         "deploy outside a workspace must exit non-zero",
     );
 }
+
+#[tokio::test]
+async fn deploy_excludes_registry_credentials_from_members_and_workspace_dependencies() {
+    assert_deploy_excludes_credentials(&[".npmrc", ".netrc", "_netrc"]).await;
+}
+
+#[tokio::test]
+async fn deploy_excludes_mixed_case_registry_credentials() {
+    assert_deploy_excludes_credentials(&[".NpMrC", ".NeTrC", "_NeTrC"]).await;
+}
+
+async fn assert_deploy_excludes_credentials(credential_names: &[&str]) {
+    use support::lpm_with_registry_and_npm;
+    use support::mock_registry::MockRegistry;
+    for allowlist in [false, true] {
+        let project =
+            TempProject::empty(r#"{"name":"root","private":true,"workspaces":["packages/*"]}"#);
+        for member in ["app", "shared"] {
+            let mut manifest =
+                serde_json::json!({"name":member,"version":"1.0.0","main":"index.js"});
+            if member == "app" {
+                manifest["dependencies"] = serde_json::json!({"shared":"workspace:*"});
+            }
+            if allowlist {
+                manifest["files"] = serde_json::json!([
+                    "index.js",
+                    credential_names[0],
+                    credential_names[1],
+                    credential_names[2],
+                    "nested"
+                ]);
+            }
+            project.write_file(
+                &format!("packages/{member}/package.json"),
+                &manifest.to_string(),
+            );
+            project.write_file(
+                &format!("packages/{member}/index.js"),
+                "module.exports = 1;\n",
+            );
+            for name in credential_names {
+                for directory in ["", "nested/"] {
+                    project.write_file(
+                        &format!("packages/{member}/{directory}{name}"),
+                        "private-fixture-credential\n",
+                    );
+                }
+                #[cfg(unix)]
+                {
+                    let linked = project
+                        .path()
+                        .join(format!("packages/{member}/nested/linked/{name}"));
+                    std::fs::create_dir_all(linked.parent().unwrap()).unwrap();
+                    std::os::unix::fs::symlink(
+                        project.path().join(format!("packages/{member}/{name}")),
+                        linked,
+                    )
+                    .unwrap();
+                }
+            }
+        }
+        let registry = MockRegistry::start().await;
+        let out = external_output_dir();
+        let output = lpm_with_registry_and_npm(&project, &registry.url())
+            .args([
+                "deploy",
+                out.path().to_str().unwrap(),
+                "--filter",
+                "app",
+                "--json",
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stderr),
+            String::from_utf8_lossy(&output.stdout)
+        );
+        assert_deployment_has_no_registry_credentials(out.path());
+        assert!(out.path().join("index.js").is_file());
+        assert_eq!(
+            project.read_file(&format!("packages/shared/{}", credential_names[0])),
+            "private-fixture-credential\n"
+        );
+    }
+}
+
+fn assert_deployment_has_no_registry_credentials(directory: &std::path::Path) {
+    for entry in std::fs::read_dir(directory).unwrap() {
+        let entry = entry.unwrap();
+        let name = entry.file_name();
+        assert!(
+            ![".npmrc", ".netrc", "_netrc"]
+                .iter()
+                .any(|denied| name.to_string_lossy().eq_ignore_ascii_case(denied)),
+            "credential leaked: {}",
+            entry.path().display()
+        );
+        if entry.file_type().unwrap().is_dir() {
+            assert_deployment_has_no_registry_credentials(&entry.path());
+        }
+    }
+}
