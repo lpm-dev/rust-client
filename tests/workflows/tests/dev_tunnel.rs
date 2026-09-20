@@ -382,7 +382,7 @@ server.listen(Number(process.env.PORT), "127.0.0.1", () => {
         r#"{
             "services": {
                 "web": {
-                    "command": "node output-server.js"
+                    "command": "node output-server.js", "primary": true
                 }
             }
         }"#,
