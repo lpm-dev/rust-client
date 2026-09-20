@@ -715,3 +715,99 @@ fn add_json_rejects_new_source_package_typosquat_before_fetch() {
     assert_eq!(json["error_code"], "typosquat_suspected");
     assert_eq!(json["error"]["findings"][0]["package"], "axois");
 }
+
+#[tokio::test]
+async fn malformed_typosquat_match_constraints_fail_before_install_mutation() {
+    let mock = MockRegistry::start().await;
+    mock.with_package("axois", "1.0.0", &make_tarball("axois", "1.0.0"))
+        .await;
+    for constraint in [
+        "similar-to = 1",
+        "similar-to = false",
+        "similar-to = []",
+        "similar-to = {}",
+        "similar_to = 1",
+        "similar-to = 1\nsimilar_to = \"axios\"",
+        "similar-to = \"axios\"\nsimilar_to = \"react\"",
+    ] {
+        let project = TempProject::empty(r#"{"name":"policy-host","version":"1.0.0"}"#);
+        enable_typosquat_guard(&project);
+        let manifest = project.read_file("package.json");
+        project.write_file("lpm.toml", &format!("[[policy.typosquat.allow]]\npackage = \"axois\"\nreason = \"fixture\"\n{constraint}\n"));
+        let output = lpm_with_registry(&project, &mock.url())
+            .args(["install", "axois", "--json", "--no-skills"])
+            .output()
+            .unwrap();
+        let value = parse_json_output(&output.stdout);
+        assert!(
+            !output.status.success(),
+            "malformed match broadened approval: {constraint}: {value}"
+        );
+        assert!(
+            value["error"]
+                .as_str()
+                .is_some_and(|s| s.contains("lpm.toml") && s.contains("similar")),
+            "{constraint}: {value}"
+        );
+        assert_eq!(project.read_file("package.json"), manifest);
+        assert!(!project.file_exists("lpm.lock"));
+        assert!(!project.path().join("node_modules").exists());
+    }
+}
+
+#[test]
+fn malformed_typosquat_policy_shapes_and_names_fail_before_resolution() {
+    for configuration in [
+        "policy = 1",
+        "policy = []",
+        "[policy]\ntyposquat = false",
+        "[policy]\ntyposquat = []",
+        "[[policy.typosquat.allow]]\npackage = \"\"\nreason = \"fixture\"",
+        "[[policy.typosquat.allow]]\npackage = \"bad name\"\nreason = \"fixture\"",
+    ] {
+        let project = TempProject::empty(r#"{"name":"policy-host","version":"1.0.0"}"#);
+        enable_typosquat_guard(&project);
+        let manifest = project.read_file("package.json");
+        project.write_file("lpm.toml", configuration);
+        let output = lpm(&project)
+            .args(["install", "axois", "--json"])
+            .output()
+            .unwrap();
+        let value = parse_json_output(&output.stdout);
+        assert!(!output.status.success(), "{configuration}: {value}");
+        assert!(
+            value["error"]
+                .as_str()
+                .is_some_and(|s| s.contains("lpm.toml") && s.contains("policy")),
+            "malformed config did not fail at the policy boundary: {configuration}: {value}"
+        );
+        assert_eq!(project.read_file("package.json"), manifest);
+        assert!(!project.file_exists("lpm.lock"));
+    }
+}
+
+#[tokio::test]
+async fn typosquat_match_aliases_keep_scoped_and_unrestricted_exceptions_distinct() {
+    let mock = MockRegistry::start().await;
+    mock.with_package("axois", "1.0.0", &make_tarball("axois", "1.0.0"))
+        .await;
+    for (constraint, allowed) in [
+        ("", true),
+        ("similar-to = \"axios\"", true),
+        ("similar_to = \"axios\"", true),
+        ("similar-to = \"react\"", false),
+    ] {
+        let project = TempProject::empty(r#"{"name":"policy-host","version":"1.0.0"}"#);
+        enable_typosquat_guard(&project);
+        project.write_file("lpm.toml", &format!("[[policy.typosquat.allow]]\npackage = \"axois\"\nreason = \"fixture\"\n{constraint}\n"));
+        let output = lpm_with_registry(&project, &mock.url())
+            .args(["install", "axois", "--json", "--no-skills"])
+            .output()
+            .unwrap();
+        let value = parse_json_output(&output.stdout);
+        assert_eq!(output.status.success(), allowed, "{constraint}: {value}");
+        if !allowed {
+            assert_eq!(value["error_code"], "typosquat_suspected");
+        }
+    }
+}

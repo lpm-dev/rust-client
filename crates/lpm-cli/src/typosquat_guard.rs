@@ -544,12 +544,20 @@ impl TyposquatPolicy {
             .map_err(|e| LpmError::Registry(format!("failed to parse {}: {e}", path.display())))?;
         let mut policy = Self::default();
 
-        let Some(typosquat) = parsed
-            .get("policy")
-            .and_then(|value| value.get("typosquat"))
-        else {
-            return Ok(policy);
-        };
+        let mut section = &parsed;
+        for key in ["policy", "typosquat"] {
+            let Some(value) = section.get(key) else {
+                return Ok(policy);
+            };
+            if !value.is_table() {
+                return Err(LpmError::Registry(format!(
+                    "{}: `policy.typosquat` sections must be TOML tables",
+                    path.display()
+                )));
+            }
+            section = value;
+        }
+        let typosquat = section;
         let Some(allow) = typosquat.get("allow") else {
             return Ok(policy);
         };
@@ -570,6 +578,12 @@ impl TyposquatPolicy {
                         path.display()
                     ))
                 })?;
+            if validate_package_name(package).is_err() || package.chars().any(char::is_whitespace) {
+                return Err(LpmError::Registry(format!(
+                    "{}: `policy.typosquat.allow.package` must be a nonempty package name",
+                    path.display()
+                )));
+            }
             let reason = entry
                 .get("reason")
                 .and_then(toml::Value::as_str)
@@ -581,11 +595,24 @@ impl TyposquatPolicy {
                     path.display()
                 )));
             }
+            if entry.get("similar-to").is_some() && entry.get("similar_to").is_some() {
+                return Err(LpmError::Registry(format!(
+                    "{}: use only one of `similar-to` or `similar_to` in `policy.typosquat.allow`",
+                    path.display()
+                )));
+            }
             let similar_to = entry
                 .get("similar-to")
                 .or_else(|| entry.get("similar_to"))
-                .and_then(toml::Value::as_str)
-                .map(str::to_string);
+                .map(|value| {
+                    value.as_str().map(str::to_string).ok_or_else(|| {
+                        LpmError::Registry(format!(
+                            "{}: `policy.typosquat.allow.similar-to` must be a string when present",
+                            path.display()
+                        ))
+                    })
+                })
+                .transpose()?;
             policy.allow.push(AllowEntry {
                 package: package.to_string(),
                 similar_to,
