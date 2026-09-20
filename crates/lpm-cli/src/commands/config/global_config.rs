@@ -15,7 +15,11 @@ pub struct GlobalConfig {
 impl GlobalConfig {
     pub(in crate::commands::config) fn from_value(value: toml::Value) -> Result<Self, LpmError> {
         match value {
-            toml::Value::Table(table) => Ok(Self { table }),
+            toml::Value::Table(table) => {
+                let config = Self { table };
+                config.validate_security_controls()?;
+                Ok(config)
+            }
             _ => Err(LpmError::Registry(
                 "config.toml must be a TOML table at the top level".to_string(),
             )),
@@ -59,7 +63,22 @@ impl GlobalConfig {
                 )));
             }
         };
-        Ok(Self { table })
+        let config = Self { table };
+        config.validate_security_controls()?;
+        Ok(config)
+    }
+
+    pub(crate) fn validate_security_controls(&self) -> Result<(), LpmError> {
+        self.get_trust_policy()?;
+        if self.get_value("force-security-floor").is_some()
+            && self.get_bool("force-security-floor").is_none()
+        {
+            return Err(invalid_security_control(
+                "force-security-floor",
+                "a Boolean or true/false, 1/0, yes/no, on/off, enabled/disabled string",
+            ));
+        }
+        Ok(())
     }
 
     /// Construct an empty config — used by in-crate tests that need a
@@ -88,11 +107,7 @@ impl GlobalConfig {
     pub fn get_bool(&self, key: &str) -> Option<bool> {
         match self.table.get(key)? {
             toml::Value::Boolean(b) => Some(*b),
-            toml::Value::String(s) => match s.as_str() {
-                "true" | "1" | "yes" | "on" | "enabled" => Some(true),
-                "false" | "0" | "no" | "off" | "disabled" => Some(false),
-                _ => None,
-            },
+            toml::Value::String(s) => parse_user_bool(s),
             _ => None,
         }
     }
@@ -154,11 +169,17 @@ impl GlobalConfig {
             .map(String::from)
     }
 
-    pub fn get_trust_policy(&self) -> Option<String> {
-        let raw = self.get_str(TRUST_POLICY_KEY)?.to_string();
-        match raw.as_str() {
-            "off" | "no-downgrade" => Some(raw),
-            _ => None,
+    pub fn get_trust_policy(&self) -> Result<Option<lpm_resolver::TrustPolicyMode>, LpmError> {
+        let Some(value) = self.get_value(TRUST_POLICY_KEY) else {
+            return Ok(None);
+        };
+        match value.as_str() {
+            Some("off") => Ok(Some(lpm_resolver::TrustPolicyMode::Off)),
+            Some("no-downgrade") => Ok(Some(lpm_resolver::TrustPolicyMode::NoDowngrade)),
+            _ => Err(invalid_security_control(
+                TRUST_POLICY_KEY,
+                "off or no-downgrade",
+            )),
         }
     }
 
@@ -243,6 +264,22 @@ pub(crate) fn parse_env_bool(value: &str) -> Option<bool> {
     match value.trim().to_ascii_lowercase().as_str() {
         "1" | "true" | "yes" | "on" => Some(true),
         "0" | "false" | "no" | "off" => Some(false),
+        _ => None,
+    }
+}
+
+fn invalid_security_control(key: &str, expected: &str) -> LpmError {
+    let path = LpmRoot::from_env().map_or_else(
+        |_| std::path::PathBuf::from("config.toml"),
+        |root| root.root().join("config.toml"),
+    );
+    LpmError::Registry(format!("{}: `{key}` must be {expected}", path.display()))
+}
+
+pub(crate) fn parse_user_bool(value: &str) -> Option<bool> {
+    match value {
+        "true" | "1" | "yes" | "on" | "enabled" => Some(true),
+        "false" | "0" | "no" | "off" | "disabled" => Some(false),
         _ => None,
     }
 }

@@ -1214,10 +1214,11 @@ async fn sigstore_wizard_set_rejects_looser_value_when_force_floor_enabled() {
 
 #[test]
 fn guard_generic_set_rejects_disabling_force_floor_when_enabled() {
+    let (_dir, _path, _env) = tmp_config();
     let config = global_config("force-security-floor = true\n");
     let err = guard_generic_set_against_force_floor(&config, "force-security-floor", "false")
         .unwrap_err();
-    assert_eq!(err.error_code(), "security_floor");
+    assert_eq!(err.error_code(), "security_approval_required");
 }
 
 #[test]
@@ -1242,10 +1243,11 @@ fn guard_generic_delete_rejects_lowering_release_age_to_default() {
 
 #[test]
 fn guard_generic_delete_rejects_unsetting_force_floor_when_enabled() {
+    let (_dir, _path, _env) = tmp_config();
     let config = global_config("force-security-floor = true\n");
     let err =
         guard_generic_delete_against_force_floor(&config, "force-security-floor").unwrap_err();
-    assert_eq!(err.error_code(), "security_floor");
+    assert_eq!(err.error_code(), "security_approval_required");
 }
 
 #[test]

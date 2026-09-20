@@ -18,10 +18,7 @@ pub(super) fn validate_scalar(key: &str, value: &str) -> Result<(), LpmError> {
         | "audit-after-install"
         | "force-security-floor"
         | "allowNew"
-        | "noSkills" => matches!(
-            value,
-            "true" | "1" | "yes" | "on" | "enabled" | "false" | "0" | "no" | "off" | "disabled"
-        ),
+        | "noSkills" => super::global_config::parse_user_bool(value).is_some(),
         "workspace-concurrency" => {
             crate::workspace_concurrency_config::parse_workspace_concurrency(value).is_ok()
         }

@@ -134,10 +134,9 @@ pub(super) fn prepare_install_setup_context(
         effective_min_age_secs
     };
     let release_age_policy = release_age_config.minimum_release_age_policy;
-    let resolver_trust_policy = match global_config.get_trust_policy().as_deref() {
-        Some("no-downgrade") => lpm_resolver::TrustPolicyMode::NoDowngrade,
-        _ => lpm_resolver::TrustPolicyMode::Off,
-    };
+    let resolver_trust_policy = global_config
+        .get_trust_policy()?
+        .unwrap_or(lpm_resolver::TrustPolicyMode::Off);
     let minimum_release_age_exclude = release_age_config.minimum_release_age_exclude;
 
     let auto_install_peers: bool = pkg

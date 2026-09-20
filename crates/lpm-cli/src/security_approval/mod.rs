@@ -74,6 +74,18 @@ pub use unlocks::{
     unlock_global_scopes_command, unlock_scopes_command,
 };
 
+pub(crate) fn record_force_floor_removed() {
+    audit::record_audit_event(
+        audit::AuditRecord::new(
+            "force-security-floor-changed",
+            true,
+            vec![ApprovalScope::FloorEdit.as_str().to_string()],
+        )
+        .source(ApprovalSource::ConfigMutation)
+        .detail("force-security-floor disabled after configuration commit"),
+    );
+}
+
 const SIGNING_SECRET_BYTES: usize = 32;
 const APPROVED_POSTURE_SCHEMA_VERSION: u32 = 1;
 const UNLOCK_SCHEMA_VERSION: u32 = 1;

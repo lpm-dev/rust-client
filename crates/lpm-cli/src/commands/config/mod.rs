@@ -303,7 +303,10 @@ pub async fn run(
                 GenericSetTarget::Scalar => {}
             }
             values::validate_scalar(key, value)?;
-            let json_value = update_config(&config_path, |config| {
+            let (json_value, floor_weakened) = update_config(&config_path, |config| {
+                let floor_weakened = key == "force-security-floor"
+                    && crate::security_floor::force_security_floor_enabled(config)
+                    && global_config::parse_user_bool(value) == Some(false);
                 guard_generic_set_against_force_floor(config, key, value)?;
                 match key {
                     SCRIPT_POLICY_KEY => {
@@ -445,17 +448,22 @@ pub async fn run(
                 } else {
                     serde_json::Value::String(value.to_string())
                 };
-                Ok((json_value, true))
+                Ok(((json_value, floor_weakened), true))
             })
             .await?;
+            if floor_weakened {
+                crate::security_approval::record_force_floor_removed();
+            }
             announce_generic_set(key, value, json_value, json_output);
         }
         "delete" | "unset" => {
             let key = key.ok_or_else(|| LpmError::Registry("missing key".into()))?;
-            let existed = update_config(&config_path, |config| {
+            let (existed, floor_weakened) = update_config(&config_path, |config| {
                 if config_value_at_path(config.table(), key).is_none() {
-                    return Ok((false, false));
+                    return Ok(((false, false), false));
                 }
+                let floor_weakened = key == "force-security-floor"
+                    && crate::security_floor::force_security_floor_enabled(config);
                 guard_generic_delete_against_force_floor(config, key)?;
                 match key {
                     SCRIPT_POLICY_KEY => {
@@ -523,9 +531,12 @@ pub async fn run(
                     _ => {}
                 }
                 let existed = remove_config_value_at_path(config.table_mut(), key);
-                Ok((existed, existed))
+                Ok(((existed, floor_weakened), existed))
             })
             .await?;
+            if floor_weakened {
+                crate::security_approval::record_force_floor_removed();
+            }
             if json_output {
                 println!(
                     "{}",

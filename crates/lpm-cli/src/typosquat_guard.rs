@@ -226,7 +226,7 @@ fn can_prompt(json_output: bool, yes: bool) -> bool {
 }
 
 fn typosquat_guard_disabled(project_dir: &Path, json_output: bool) -> Result<bool, LpmError> {
-    let global = crate::commands::config::GlobalConfig::load();
+    let global = crate::commands::config::GlobalConfig::load_checked()?;
     if let Some(selection) = global.get_typosquat_guard_mode() {
         crate::security_approval::ensure_runtime_typosquat_guard_config_authorized(
             project_dir,

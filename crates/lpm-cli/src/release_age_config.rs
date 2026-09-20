@@ -277,7 +277,7 @@ impl ReleaseAgeResolver {
         cli_exclude: &[String],
         json_output: bool,
     ) -> Result<ReleaseAgeConfig, LpmError> {
-        let global = crate::commands::config::GlobalConfig::load();
+        let global = crate::commands::config::GlobalConfig::load_checked()?;
         let effective_authorized = crate::security_approval::load_effective_authorized_posture()?;
         let authorized_floor = effective_authorized.posture.minimum_release_age_secs();
         let authorized_policy = effective_authorized.posture.release_age_policy();
@@ -1607,32 +1607,27 @@ minimum-release-age-exclude = ["global-pkg"]
     }
 
     #[test]
-    fn resolve_cli_override_skips_global_errors() {
-        // When the user explicitly passes --min-release-age=<n>, a
-        // broken global config must not block the install. The CLI
-        // flag short-circuits the chain.
+    fn resolve_cli_override_rejects_unreadable_global_security_controls() {
         let project = tempfile::tempdir().unwrap();
         let home = scoped_home_dir();
         write_authorized_min_age(0);
         write_package_json_with_min_age(project.path(), None);
         write_global_config(home.path(), "not valid toml === [[[");
 
-        let result = ReleaseAgeResolver::resolve(project.path(), Some(0), true).unwrap();
-        assert_eq!(result, 0);
+        let error = ReleaseAgeResolver::resolve(project.path(), Some(0), true).unwrap_err();
+        assert!(error.to_string().contains("config parse error"));
     }
 
     #[test]
-    fn resolve_package_json_skips_global_errors() {
-        // Similarly, an explicit `"lpm": { "minimumReleaseAge": N }`
-        // in package.json short-circuits the global layer.
+    fn resolve_project_override_rejects_unreadable_global_security_controls() {
         let project = tempfile::tempdir().unwrap();
         let home = scoped_home_dir();
         write_authorized_min_age(0);
         write_package_json_with_min_age(project.path(), Some(500));
         write_global_config(home.path(), "not valid toml === [[[");
 
-        let result = ReleaseAgeResolver::resolve(project.path(), None, true).unwrap();
-        assert_eq!(result, 500);
+        let error = ReleaseAgeResolver::resolve(project.path(), None, true).unwrap_err();
+        assert!(error.to_string().contains("config parse error"));
     }
 
     #[test]

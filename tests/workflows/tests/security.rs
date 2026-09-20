@@ -758,3 +758,126 @@ fn only_active_global_floor_edit_grants_authorize_persistent_weakening() {
         );
     }
 }
+
+#[test]
+fn only_active_unrestricted_global_floor_edit_grants_can_remove_force_floor() {
+    for scenario in [
+        "global",
+        "missing",
+        "project",
+        "expired",
+        "package-scoped",
+        "default",
+    ] {
+        for action in ["false", "0", "no", "off", "disabled", "unset"] {
+            let project = TempProject::empty(r#"{"name":"forced-floor-edit","version":"1.0.0"}"#);
+            if scenario != "missing" {
+                support::write_signed_unlock(
+                    &project,
+                    if scenario == "default" {
+                        &["scripts-allow"]
+                    } else {
+                        &["floor-edit"]
+                    },
+                );
+                if scenario != "project" {
+                    rewrite_fixture_unlock(&project, |payload| {
+                        payload["target"] = serde_json::json!("global");
+                        payload["project_root"] = serde_json::Value::Null;
+                        if scenario == "expired" {
+                            payload["expires_at"] = serde_json::json!(
+                                (chrono::Utc::now() - chrono::Duration::minutes(1)).to_rfc3339()
+                            );
+                        }
+                        if scenario == "package-scoped" {
+                            payload["packages"] = serde_json::json!(["fixture"]);
+                        }
+                    });
+                }
+            }
+            let path = project.home().join(".lpm/config.toml");
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, "force-security-floor = true\n").unwrap();
+            let args = if action == "unset" {
+                vec!["config", "unset", "force-security-floor", "--json"]
+            } else {
+                vec!["config", "set", "force-security-floor", action, "--json"]
+            };
+            let output = lpm(&project).args(args).output().unwrap();
+            let envelope: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+            assert_eq!(
+                output.status.success(),
+                scenario == "global",
+                "{scenario} {action}: {envelope}"
+            );
+            let audit_path = project.home().join(".lpm/security/audit.jsonl");
+            let changed_events = || {
+                std::fs::read_to_string(&audit_path)
+                    .unwrap_or_default()
+                    .lines()
+                    .filter(|line| {
+                        serde_json::from_str::<serde_json::Value>(line).unwrap()["payload"]["event"]
+                            == "force-security-floor-changed"
+                    })
+                    .count()
+            };
+            assert_eq!(
+                changed_events(),
+                usize::from(scenario == "global"),
+                "{scenario} {action}"
+            );
+            if scenario == "global" {
+                lpm(&project)
+                    .args(["config", "unset", "force-security-floor", "--json"])
+                    .assert()
+                    .success();
+                assert_eq!(
+                    changed_events(),
+                    1,
+                    "no-op mutation recorded another successful weakening"
+                );
+            }
+            if scenario != "global" {
+                assert_eq!(
+                    envelope["error_code"], "security_approval_required",
+                    "{envelope}"
+                );
+                assert_eq!(
+                    std::fs::read_to_string(&path).unwrap(),
+                    "force-security-floor = true\n"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn floor_edit_removes_local_switch_without_weakening_managed_policy() {
+    let project = TempProject::empty(r#"{"name":"managed-floor-edit","version":"1.0.0"}"#);
+    support::write_signed_unlock(&project, &["floor-edit"]);
+    rewrite_fixture_unlock(&project, |payload| {
+        payload["target"] = serde_json::json!("global");
+        payload["project_root"] = serde_json::Value::Null;
+    });
+    std::fs::write(
+        project.home().join(".lpm/config.toml"),
+        "force-security-floor = true\n",
+    )
+    .unwrap();
+    std::fs::write(
+        project.home().join(".lpm/security-policy.toml"),
+        "script-policy = \"deny\"\n",
+    )
+    .unwrap();
+    lpm(&project)
+        .args(["config", "unset", "force-security-floor", "--json"])
+        .assert()
+        .success();
+    let output = lpm(&project)
+        .args(["config", "scripts", "--set", "allow", "--json"])
+        .output()
+        .unwrap();
+    let envelope: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(!output.status.success(), "{envelope}");
+    assert_eq!(envelope["error_code"], "security_floor");
+}

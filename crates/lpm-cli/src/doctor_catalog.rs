@@ -1979,7 +1979,7 @@ pub static POLICY_FORCE_SECURITY_FLOOR: CheckEntry = CheckEntry {
     tier: Tier::Extended,
     description: "The force-security-floor setting suspends approvals and keeps the security floor active.",
     when_fires: "The global force-security-floor configuration is true.",
-    remediation: "Review why the security floor was forced before running `lpm config unset force-security-floor`.",
+    remediation: "Review why the security floor was forced before running `lpm security unlock floor-edit --global`, then `lpm config unset force-security-floor`.",
     possible_severities: &[Severity::Warn],
     auto_fix: None,
 };

@@ -33,6 +33,7 @@ pub(crate) async fn update_config<R>(
     let posture_transaction = crate::security_approval::begin_authorized_posture_transaction()?;
     let mut config = GlobalConfig::from_value(snapshot.parse(path)?)?;
     let (result, storage_changed) = update(&mut config)?;
+    config.validate_security_controls()?;
     let config = config.into_value();
     let config_changed = storage_changed && snapshot.differs_from(&config, path)?;
     if config_changed {
@@ -543,13 +544,9 @@ pub(super) fn guard_generic_set_against_force_floor(
     match key {
         "force-security-floor"
             if crate::security_floor::force_security_floor_enabled(global)
-                && !matches!(value, "true" | "1" | "yes") =>
+                && super::global_config::parse_user_bool(value) == Some(false) =>
         {
-            return Err(crate::security_floor::security_floor_write_error(
-                "force-security-floor",
-                value,
-                "true",
-            ));
+            authorize_force_floor_removal()?;
         }
         SCRIPT_POLICY_KEY => {
             if let Ok(requested) = crate::script_policy_config::ScriptPolicy::parse(value) {
@@ -619,15 +616,21 @@ pub(super) fn guard_generic_delete_against_force_floor(
             },
         )?,
         "force-security-floor" if crate::security_floor::force_security_floor_enabled(global) => {
-            return Err(crate::security_floor::security_floor_write_error(
-                "force-security-floor",
-                "unset",
-                "true",
-            ));
+            authorize_force_floor_removal()?;
         }
         _ => {}
     }
     Ok(())
+}
+
+fn authorize_force_floor_removal() -> Result<(), LpmError> {
+    crate::security_approval::ensure_global_unlock(
+        crate::security_approval::ApprovalScope::FloorEdit,
+        true,
+        crate::security_approval::ApprovalSource::ConfigMutation,
+        "Disabling force-security-floor requires an active global floor-edit grant.",
+        &[],
+    )
 }
 
 #[cfg(test)]
