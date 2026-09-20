@@ -21,6 +21,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 mod cargo_metadata;
 mod download;
 mod probe;
+#[cfg(target_os = "macos")]
+mod validation;
 #[cfg(windows)]
 mod windows_trust;
 
@@ -1088,11 +1090,11 @@ fn render_shell_argument(argument: &OsStr, rendered: &mut String) {
         return;
     }
     rendered.push('\'');
-    for byte in bytes {
-        if *byte == b'\'' {
+    for character in String::from_utf8_lossy(bytes).chars() {
+        if character == '\'' {
             rendered.push_str("'\"'\"'");
         } else {
-            rendered.push(char::from(*byte));
+            rendered.push(character);
         }
     }
     rendered.push('\'');
@@ -2431,19 +2433,16 @@ fn stage_macos_bundle(
         .prefix(".lpm-bundle-update-")
         .tempdir_in(app_parent)
         .map_err(LpmError::Io)?;
-    let status = std::process::Command::new("/usr/bin/ditto")
-        .args([OsStr::new("-x"), OsStr::new("-k")])
-        .arg(archive_path)
-        .arg(staging_root.path())
-        .status()
-        .map_err(|error| {
-            LpmError::SelfUpdate(format!("could not start ditto for app extraction: {error}"))
-        })?;
-    if !status.success() {
-        return Err(LpmError::SelfUpdate(format!(
-            "ditto failed to extract the macOS app archive with status {status}"
-        )));
-    }
+    run_macos_validation_tool(
+        "/usr/bin/ditto",
+        &[
+            OsStr::new("-x"),
+            OsStr::new("-k"),
+            archive_path.as_os_str(),
+            staging_root.path().as_os_str(),
+        ],
+        "macOS app extraction",
+    )?;
     let app_bundle = staging_root.path().join(MACOS_APP_NAME);
     validate_macos_app_bundle(&app_bundle)?;
     let executable = app_bundle.join(MACOS_INTERNAL_EXECUTABLE);
@@ -2579,11 +2578,7 @@ fn run_macos_validation_tool(
     arguments: &[&OsStr],
     description: &str,
 ) -> Result<std::process::Output, LpmError> {
-    let output = std::process::Command::new(program)
-        .args(arguments)
-        .stdin(std::process::Stdio::null())
-        .output()
-        .map_err(|error| LpmError::SelfUpdate(format!("could not start {description}: {error}")))?;
+    let output = validation::run(program, arguments, description, Duration::from_secs(60))?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         return Err(LpmError::SelfUpdate(format!(
@@ -5679,5 +5674,66 @@ bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb  lpm-linux-x64
         // in. If the module is renamed or visibility changes, this
         // catches it before the CLI dispatch path breaks.
         let _ = release_lookup::default_cache_path();
+    }
+    #[cfg(unix)]
+    #[test]
+    fn rendered_update_arguments_round_trip_unicode_and_apostrophes() {
+        let argument = OsString::from("/Users/Zoë's tools/cargo");
+        let plan = render_update_invocation(
+            OsStr::new("/usr/bin/printf"),
+            &[OsString::from("%s"), argument.clone()],
+        )
+        .unwrap();
+        let output = std::process::Command::new("/bin/sh")
+            .args(["-c", &plan])
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        use std::os::unix::ffi::OsStrExt;
+        assert_eq!(output.stdout, argument.as_bytes());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_validation_refuses_excessive_output() {
+        let result = run_macos_validation_tool(
+            "/bin/sh",
+            &[
+                OsStr::new("-c"),
+                OsStr::new("/usr/bin/head -c 2097152 /dev/zero"),
+            ],
+            "noisy validation fixture",
+        );
+        assert!(result.is_err(), "validation output must be bounded");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_validation_does_not_wait_for_inherited_output_after_parent_exit() {
+        let directory = tempfile::tempdir().unwrap();
+        let pid_file = directory.path().join("child-pid");
+        let script = format!("/bin/sleep 5 & echo $! > '{}'; exit 0", pid_file.display());
+        let started = Instant::now();
+        let result = run_macos_validation_tool(
+            "/bin/sh",
+            &[OsStr::new("-c"), OsStr::new(&script)],
+            "detached output fixture",
+        );
+        let elapsed = started.elapsed();
+        if let Ok(pid) = std::fs::read_to_string(pid_file)
+            .unwrap()
+            .trim()
+            .parse::<i32>()
+        {
+            // SAFETY: the PID belongs to the disposable child created by this test.
+            unsafe {
+                libc::kill(pid, libc::SIGKILL);
+            }
+        }
+        result.unwrap();
+        assert!(
+            elapsed < Duration::from_secs(3),
+            "inherited pipe delayed completion: {elapsed:?}"
+        );
     }
 }

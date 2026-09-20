@@ -810,6 +810,7 @@ async fn probe_one(
         if channel.accepts_version(version) {
             let version = version.to_owned();
             cache.set_last_check_for(channel, now);
+            cache.set_last_failure_check_for(channel, 0);
             return Ok(FetchOutcome::NotModified { version });
         }
         cache.set_last_failure_check_for(channel, now);
@@ -2334,5 +2335,47 @@ mod tests {
             }
         })
         .await;
+    }
+    #[tokio::test]
+    async fn not_modified_fallback_clears_failure_cooldown_for_each_channel() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        for channel in [ReleaseChannel::Stable, ReleaseChannel::Nightly] {
+            let npm = MockServer::start().await;
+            let github = MockServer::start().await;
+            Mock::given(method("GET"))
+                .respond_with(ResponseTemplate::new(503))
+                .mount(&npm)
+                .await;
+            Mock::given(method("GET"))
+                .respond_with(ResponseTemplate::new(304))
+                .mount(&github)
+                .await;
+            let _environment = crate::test_env::ScopedEnv::set([
+                (NPM_OVERRIDE_KEY, npm.uri().into()),
+                (GH_OVERRIDE_KEY, github.uri().into()),
+                (NPM_NIGHTLY_OVERRIDE_KEY, npm.uri().into()),
+                (GH_NIGHTLY_OVERRIDE_KEY, github.uri().into()),
+            ]);
+            {
+                let mut cache = UpdateCache::default();
+                let version = if channel == ReleaseChannel::Stable {
+                    "9.9.9"
+                } else {
+                    "9.9.9-nightly.20260920.1.abc1234"
+                };
+                cache.set_latest_for(channel, version.to_string());
+                cache.set_etag_for(channel, Source::GitHub, "cached-release".into());
+                cache.set_last_failure_check_for(channel, 123);
+                let result = probe_release(channel, &mut cache).await.unwrap();
+                assert_eq!(
+                    result,
+                    FetchOutcome::NotModified {
+                        version: version.to_string()
+                    }
+                );
+                assert_eq!(cache.last_failure_check_for(channel), 0);
+            }
+        }
     }
 }
