@@ -74,6 +74,12 @@ pub(super) fn collect_source_pkg_deps(
                        raw: &str|
      -> Result<(), LpmError> {
         let (name, intent) = crate::save_spec::parse_user_save_intent(raw)?;
+        if matches!(intent, crate::save_spec::UserSaveIntent::Workspace(_)) {
+            return Err(LpmError::Registry(format!(
+                "source-package dependencies must use registry specifications, not workspace: selectors: {}",
+                lpm_common::sanitize_terminal_inline(raw)
+            )));
+        }
         if seen.insert(name.clone()) {
             deps.push((name, intent));
         }

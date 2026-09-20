@@ -1,4 +1,4 @@
-//! CLI-binary tier: terminal-backed JSON refusal and configuration-editor cancellation.
+//! CLI-binary tier: terminal-backed JSON refusal and configuration-editor cancellation and source-package selection defaults.
 
 mod common;
 
@@ -86,6 +86,102 @@ mod unix {
                 );
             }
             std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn source_package_optional_select_preserves_unset_and_explicit_defaults() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        for default in [None, Some("b")] {
+            let server = MockServer::start().await;
+            let project = TempDir::new().unwrap();
+            let home = TempDir::new().unwrap();
+            std::fs::write(
+                project.path().join("package.json"),
+                r#"{"name":"host","version":"1.0.0"}"#,
+            )
+            .unwrap();
+            let mut field =
+                serde_json::json!({"type":"select","label":"Select variant","options":["a","b"]});
+            if let Some(default) = default {
+                field["default"] = serde_json::json!(default);
+            }
+            let config = serde_json::json!({
+                "configSchema":{"variant":field},
+                "files":[
+                    {"src":"a.txt","include":"when","condition":{"variant":"a"}},
+                    {"src":"b.txt","include":"when","condition":{"variant":"b"}}
+                ]
+            });
+            let mut tar = tar::Builder::new(flate2::write::GzEncoder::new(
+                Vec::new(),
+                flate2::Compression::default(),
+            ));
+            for (name, bytes) in [
+                (
+                    "package.json",
+                    br#"{"name":"optional-select-source","version":"1.0.0"}"#.to_vec(),
+                ),
+                ("lpm.config.json", serde_json::to_vec(&config).unwrap()),
+                ("a.txt", b"variant a".to_vec()),
+                ("b.txt", b"variant b".to_vec()),
+            ] {
+                let mut header = tar::Header::new_gnu();
+                header.set_size(bytes.len() as u64);
+                header.set_mode(0o644);
+                header.set_cksum();
+                tar.append_data(&mut header, format!("package/{name}"), bytes.as_slice())
+                    .unwrap();
+            }
+            let tarball = tar.into_inner().unwrap().finish().unwrap();
+            let metadata = serde_json::json!({
+                "name":"optional-select-source", "dist-tags":{"latest":"1.0.0"},
+                "versions":{"1.0.0":{"name":"optional-select-source","version":"1.0.0",
+                    "dist":{"tarball":format!("{}/source.tgz",server.uri()),"integrity":common::sri_for(&tarball)}}},
+                "time":{"1.0.0":"2020-01-01T00:00:00.000Z"}
+            });
+            for endpoint in [
+                "/optional-select-source",
+                "/api/registry/optional-select-source",
+            ] {
+                Mock::given(method("GET"))
+                    .and(path(endpoint))
+                    .respond_with(ResponseTemplate::new(200).set_body_json(&metadata))
+                    .mount(&server)
+                    .await;
+            }
+            Mock::given(method("GET"))
+                .and(path("/source.tgz"))
+                .respond_with(ResponseTemplate::new(200).set_body_bytes(tarball))
+                .mount(&server)
+                .await;
+            let command = common::lpm_command(
+                project.path(),
+                home.path(),
+                Some(&server.uri()),
+                &[
+                    "add",
+                    "optional-select-source",
+                    "--path",
+                    "vendor",
+                    "--alias",
+                    "@/vendor",
+                    "--no-install-deps",
+                    "--no-skills",
+                ],
+            );
+            let (status, output) = run_in_terminal(command, &[("Select variant", b"\r")]);
+            assert!(status.success(), "{output}");
+            assert!(
+                project.path().join("vendor/b.txt").exists(),
+                "Enter lost the unset or explicit default: {output}"
+            );
+            assert_eq!(
+                project.path().join("vendor/a.txt").exists(),
+                default.is_none(),
+                "{output}"
+            );
         }
     }
 
