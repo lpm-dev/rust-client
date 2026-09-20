@@ -1070,27 +1070,9 @@ async fn flow_install_g_run_uninstall_g_shim_lifecycle() {
     );
 }
 
-// ─── env push → env pull on a different machine ────────────────────────
-//
-// catches: round-trip encryption — the pulled value matches the pushed
-// value byte-for-byte after device-key wrap/unwrap.
-//
-// SCOPE NOTE: this flow simulates the cross-machine round-trip by using
-// two independent `TempProject` instances (each with its own HOME) and
-// pointing them at the same mocked vault server. A real-world flow
-// involves separate physical devices + a live pairing exchange that
-// transfers the wrapping key from A to B. The flow short-circuits
-// pairing by seeding identical `<HOME>/.lpm/.vault-key` files on both
-// machines — the cryptographic state that pairing produces. The
-// `lpm env pair` single-command test in `env_vault.rs` covers the
-// pairing exchange itself; this flow covers the post-pairing
-// push-then-pull round-trip that single-command tests cannot.
-
-/// Round-trip a secret through `env push` on machine A and `env pull`
-/// on machine B, where both machines share the same mocked vault and
-/// the same wrapping-key state. The pulled plaintext must byte-equal
-/// the pushed plaintext — the load-bearing correctness claim of the
-/// post-pairing sync protocol.
+/// Credentials and a shared legacy key cannot decrypt another device's personal
+/// project. A fixture with the matching origin-scoped personal root can restore it.
+/// This seeds cryptographic state directly; CLI-to-CLI pairing is not supported.
 #[cfg(debug_assertions)]
 #[tokio::test]
 async fn flow_env_push_pull_cross_machine_round_trip() {
@@ -1108,9 +1090,6 @@ async fn flow_env_push_pull_cross_machine_round_trip() {
     mock.with_stateful_personal_sync(VAULT_ID, BEARER, PRINCIPAL_ID)
         .await;
 
-    // Seed both machines with the same paired-session shape that
-    // `lpm env pair` would produce in real use — identical bearer
-    // against the mock origin.
     for project in [&machine_a, &machine_b] {
         seed_sessions(
             project.home(),
@@ -1126,11 +1105,7 @@ async fn flow_env_push_pull_cross_machine_round_trip() {
         project.write_file("lpm.json", &format!(r#"{{"vault":"{VAULT_ID}"}}"#));
     }
 
-    // Identical wrapping-key state — the cryptographic outcome of
-    // pairing in real use. Both `lpm env push` (machine A) and
-    // `lpm env pull` (machine B) call `get_or_create_wrapping_key`
-    // which under `LPM_FORCE_FILE_VAULT=1` (set by `lpm()`) reads
-    // `<HOME>/.lpm/.vault-key` as hex-encoded 32 bytes.
+    // A shared legacy key must not unlock projects created with a personal root.
     let shared_wrapping_key = [0x7Au8; 32];
     let shared_wrapping_key_hex = hex::encode(shared_wrapping_key);
     for project in [&machine_a, &machine_b] {
@@ -1138,8 +1113,6 @@ async fn flow_env_push_pull_cross_machine_round_trip() {
         std::fs::create_dir_all(&lpm_dir).expect("create ~/.lpm");
         let key_path = lpm_dir.join(".vault-key");
         std::fs::write(&key_path, &shared_wrapping_key_hex).expect("seed .vault-key");
-        // `read_wrapping_key_from_file` refuses world-readable keys
-        // (M27). Match the production write-side which chmods 0o600.
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -1172,8 +1145,51 @@ async fn flow_env_push_pull_cross_machine_round_trip() {
         String::from_utf8_lossy(&out_push_a.stderr)
     );
 
-    // Step 2 — machine B: pull from the same vault id. The stateful
-    // mock now returns the blob machine A just POSTed.
+    let personal_roots: Vec<_> = std::fs::read_dir(machine_a.home().join(".lpm"))
+        .unwrap()
+        .map(Result::unwrap)
+        .filter(|entry| {
+            entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".env-personal-root-v2-")
+        })
+        .collect();
+    assert_eq!(personal_roots.len(), 1);
+    let root = &personal_roots[0];
+    support::write_private_file(
+        &machine_b.home().join(".lpm").join(root.file_name()),
+        hex::encode([0x19; 32]).as_bytes(),
+    );
+
+    let unpaired_pull = lpm(&machine_b)
+        .env("LPM_REGISTRY_URL", mock.url())
+        .args(["--json", "env", "pull", "--yes"])
+        .output()
+        .expect("pull without the matching personal root");
+    assert!(!unpaired_pull.status.success());
+    let error: serde_json::Value = serde_json::from_slice(&unpaired_pull.stdout).unwrap();
+    assert!(
+        error["error"]
+            .as_str()
+            .unwrap()
+            .contains("decryption failed")
+    );
+    assert!(
+        !lpm(&machine_b)
+            .args(["env", "get", "API_KEY", "--reveal"])
+            .output()
+            .unwrap()
+            .status
+            .success(),
+        "a failed pull must not install plaintext"
+    );
+
+    support::write_private_file(
+        &machine_b.home().join(".lpm").join(root.file_name()),
+        std::fs::read(root.path()).unwrap(),
+    );
+
     let out_pull_b = lpm(&machine_b)
         .env("LPM_REGISTRY_URL", mock.url())
         .args(["--json", "env", "pull", "--yes"])
@@ -1186,10 +1202,6 @@ async fn flow_env_push_pull_cross_machine_round_trip() {
         String::from_utf8_lossy(&out_pull_b.stderr)
     );
 
-    // Step 3 — machine B reveals the value. The plaintext must
-    // byte-equal what machine A set. This is the load-bearing
-    // round-trip claim: A's encrypt → wire → B's decrypt must be
-    // lossless under identical wrapping-key state.
     let out_get_b = lpm(&machine_b)
         .args(["env", "get", "API_KEY", "--reveal"])
         .output()
