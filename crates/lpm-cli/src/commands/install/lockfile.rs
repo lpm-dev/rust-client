@@ -656,9 +656,8 @@ fn emit_fast_path_lockfile_rewrite_notice(
 fn fast_path_lockfile_rewrite_notice(reasons: FastPathLockfileRewriteReasons) -> Option<String> {
     if reasons.fresh_url_count > 0 && reasons.binary_writeback {
         Some(format!(
-            "Refreshed {} stale tarball URL(s) and wrote lpm.lockb v{} format",
+            "Refreshed {} stale tarball URL(s) and reconciled the binary lockfile companion",
             reasons.fresh_url_count,
-            lpm_lockfile::binary::BINARY_VERSION,
         ))
     } else if reasons.fresh_url_count > 0 {
         Some(format!(
@@ -666,10 +665,7 @@ fn fast_path_lockfile_rewrite_notice(reasons: FastPathLockfileRewriteReasons) ->
             reasons.fresh_url_count,
         ))
     } else if reasons.binary_writeback {
-        Some(format!(
-            "Wrote lpm.lockb v{} format",
-            lpm_lockfile::binary::BINARY_VERSION,
-        ))
+        Some("Reconciled the binary lockfile companion".to_string())
     } else {
         None
     }
@@ -2844,8 +2840,7 @@ fn try_lockfile_fast_path_from_rows(
     package_rows: &[&lpm_lockfile::LockedPackage],
     input: TryLockfileFastPathInput<'_>,
 ) -> Option<LockfileFastPath> {
-    let needs_binary_upgrade = !workspace_lockfile::active()
-        && binary_lockfile_needs_writeback(input.lockfile_path, lockfile);
+    let needs_binary_upgrade = binary_lockfile_needs_writeback(input.lockfile_path, lockfile);
 
     if !lockfile_satisfies_fast_path_with_packages_and_optional_roots(
         lockfile,
@@ -3590,7 +3585,7 @@ mod rewrite_notice_tests {
         })
         .expect("binary writeback should have a notice");
 
-        assert!(notice.contains("Wrote lpm.lockb"));
+        assert!(notice.contains("Reconciled the binary lockfile companion"));
         assert!(
             !notice.contains("Upgraded"),
             "a missing or stale sidecar is not necessarily an old format: {notice}",

@@ -56,11 +56,6 @@ fn write_post_install_hash_with_context(
             security_analysis_policy,
         },
     );
-    // Lockfile writeback has already created a supported sidecar or removed an
-    // unsupported one, so existence records the exact completed install state.
-    let binary_sidecar_required = project_dir
-        .join(lpm_lockfile::BINARY_LOCKFILE_NAME)
-        .exists();
     crate::install_state::write_install_hash_with_known_runtime_state(
         project_dir,
         &hash,
@@ -70,7 +65,9 @@ fn write_post_install_hash_with_context(
         dependency_engine_key,
         crate::install_state::KnownInstallHashRuntimeState {
             node_runtime_fingerprint,
-            binary_sidecar_required,
+            // Successful installs use the TOML-only exact-instance schema.
+            // Frozen installs can preserve an obsolete companion on disk.
+            binary_sidecar_required: false,
             security_analysis_policy,
         },
     )

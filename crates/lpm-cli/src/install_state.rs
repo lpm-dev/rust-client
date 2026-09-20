@@ -1230,18 +1230,27 @@ fn binary_lockfile_sidecar_needs_refresh(
     }
 
     let binary_path = lockfile_path.with_extension("lockb");
+    if matches!(expectation, Some(BinarySidecarExpectation::NotRequired)) {
+        return match std::fs::symlink_metadata(&binary_path) {
+            Ok(_) => true,
+            Err(error) => error.kind() != std::io::ErrorKind::NotFound,
+        };
+    }
     match lpm_lockfile::BinaryLockfileReader::open(&binary_path) {
-        Ok(Some(_)) => binary_lockfile_is_older_than_toml(&lockfile_path, &binary_path),
+        Ok(Some(_)) => {
+            !lockfile_requires_binary_sidecar(&lockfile_path)
+                || binary_lockfile_is_older_than_toml(&lockfile_path, &binary_path)
+        }
         Ok(None) => match expectation {
             Some(BinarySidecarExpectation::Required) => true,
             Some(BinarySidecarExpectation::NotRequired) => false,
-            None => binary_lockfile_absence_requires_refresh(&lockfile_path),
+            None => lockfile_requires_binary_sidecar(&lockfile_path),
         },
         Err(_) => true,
     }
 }
 
-fn binary_lockfile_absence_requires_refresh(lockfile_path: &Path) -> bool {
+fn lockfile_requires_binary_sidecar(lockfile_path: &Path) -> bool {
     let Ok(lockfile) = lpm_lockfile::Lockfile::read_from_file(lockfile_path) else {
         return false;
     };

@@ -406,6 +406,9 @@ impl WorkspaceLockfileCoordinator {
                 .as_ref()
                 .is_some_and(|existing| existing.as_lockfile() == &union)
         {
+            union
+                .remove_obsolete_binary(&path)
+                .map_err(lockfile_error)?;
             return Ok(true);
         }
         union.write_all(&path).map_err(lockfile_error)?;
