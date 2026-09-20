@@ -219,3 +219,85 @@ async fn xcode_registry_scopes_use_the_same_normalized_url() {
     assert_eq!(local["registries"]["lpmdev"]["url"], expected);
     assert_eq!(global["registries"]["lpmdev"]["url"], expected);
 }
+
+#[tokio::test]
+async fn swift_registry_repairs_xcode_user_scope_and_preserves_other_registries() {
+    for existing in [false, true] {
+        let mock = MockRegistry::start().await;
+        let cert = mount_swift_package(&mock).await;
+        let project = TempProject::empty(r#"{"name":"xcode-registry-setup","version":"1.0.0"}"#);
+        write_xcode_project(&project, "", "MyApp");
+        let global_path = swiftpm_home(&project).join("configuration/registries.json");
+        if existing {
+            configure_existing_registry(&project, &mock.url(), &cert);
+            let mut global: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&global_path).unwrap()).unwrap();
+            global["registries"]["acme"] =
+                serde_json::json!({"url":"https://packages.example.com"});
+            std::fs::write(&global_path, serde_json::to_vec(&global).unwrap()).unwrap();
+        }
+        for _ in 0..2 {
+            let mut command = lpm_with_registry(&project, &mock.url());
+            configure_fake_swift(&mut command, &project, &[], 0);
+            command
+                .args(["swift-registry", "--json"])
+                .assert()
+                .success();
+            let global: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&global_path).unwrap()).unwrap();
+            assert_eq!(
+                global["registries"]["lpmdev"]["url"],
+                format!("{}/api/swift-registry", mock.url())
+            );
+            if existing {
+                assert_eq!(
+                    global["registries"]["acme"]["url"],
+                    "https://packages.example.com"
+                );
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn swift_registry_ambiguous_xcode_selection_stops_before_configuration_changes() {
+    let mock = MockRegistry::start().await;
+    mount_swift_package(&mock).await;
+    let project = TempProject::empty(r#"{"name":"ambiguous-xcode-setup","version":"1.0.0"}"#);
+    write_xcode_project(&project, "", "First");
+    write_xcode_project(&project, "", "Second");
+    let capture = project.path().join("swift-commands.log");
+    let mut command = lpm_with_registry(&project, &mock.url());
+    configure_fake_swift(&mut command, &project, &[], 0);
+    configure_fake_swift_command_log(&mut command, &capture);
+    command
+        .args(["swift-registry", "--json"])
+        .assert()
+        .failure();
+    assert!(!capture.exists());
+    assert!(!project.path().join(".swiftpm").exists());
+    assert!(
+        !swiftpm_home(&project)
+            .join("configuration/registries.json")
+            .exists()
+    );
+}
+
+#[tokio::test]
+async fn swift_registry_prefers_local_swift_manifest_over_xcode_global_scope() {
+    let mock = MockRegistry::start().await;
+    mount_swift_package(&mock).await;
+    let project = swift_project();
+    write_xcode_project(&project, "", "MyApp");
+    let mut command = lpm_with_registry(&project, &mock.url());
+    configure_fake_swift(&mut command, &project, &[], 0);
+    command
+        .args(["swift-registry", "--json"])
+        .assert()
+        .success();
+    let global: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(swiftpm_home(&project).join("configuration/registries.json")).unwrap(),
+    )
+    .unwrap();
+    assert!(global["registries"]["lpmdev"].is_null());
+}

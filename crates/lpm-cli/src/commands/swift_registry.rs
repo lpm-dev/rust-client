@@ -328,7 +328,16 @@ async fn run_in_directory(
     let is_https = endpoint.scheme() == "https";
     let swift_registry_url = endpoint.to_string();
     let manifest = crate::swift_manifest::find_package_swift(cwd);
-    let package_dir = manifest.as_deref().and_then(Path::parent).unwrap_or(cwd);
+    let xcode_project = if manifest.is_none() {
+        crate::xcode_project::find_xcodeproj(cwd)?
+    } else {
+        None
+    };
+    let package_dir = manifest
+        .as_deref()
+        .or(xcode_project.as_deref())
+        .and_then(Path::parent)
+        .unwrap_or(cwd);
     preflight_configuration(registry_url, package_dir)?;
 
     if !json_output {
@@ -336,6 +345,9 @@ async fn run_in_directory(
     }
 
     configure_project_scope(package_dir, &endpoint).await?;
+    if xcode_project.is_some() {
+        ensure_xcode_registry_scope(registry_url)?;
+    }
     if !json_output {
         install_ui::done_line(scope_set_message(&swift_registry_url));
     }
