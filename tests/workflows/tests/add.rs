@@ -5169,3 +5169,90 @@ async fn source_checkpoint_without_its_move_recovers_before_the_next_command() {
     assert_eq!(project.read_file(".lpm/added-sources.json"), state);
     assert!(!project.path().join(".lpm/install-recovery").exists());
 }
+
+#[tokio::test]
+async fn add_rejects_package_authored_workspace_dependencies_before_mutation() {
+    let mock = MockRegistry::start().await;
+    let package = "workspace-selector-source";
+    let tarball = make_source_pkg_tarball(
+        package,
+        "1.0.0",
+        json!({
+            "configSchema":{"enabled":{"type":"boolean","default":true}},
+            "files":[{"src":"source.txt"}],
+            "dependencies":{"enabled":{"true":["consumer-local@workspace:*"]}}
+        }),
+        &[("source.txt", b"package source")],
+    );
+    mock.with_package(package, "1.0.0", &tarball).await;
+    for dry_run in [true, false] {
+        let project = TempProject::empty(r#"{"name":"host","version":"1.0.0"}"#);
+        let before = project.read_file("package.json");
+        let mut command = lpm_with_registry(&project, &mock.url());
+        command.args([
+            "add",
+            package,
+            "--path",
+            "vendor",
+            "--yes",
+            "--no-skills",
+            "--no-install-deps",
+            "--json",
+        ]);
+        if dry_run {
+            command.arg("--dry-run");
+        }
+        let output = command.output().unwrap();
+        assert!(
+            !output.status.success(),
+            "package-authored workspace spec accepted: {output:?}"
+        );
+        let error: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert!(
+            error["error"].as_str().unwrap().contains("workspace:"),
+            "{error}"
+        );
+        assert_eq!(project.read_file("package.json"), before);
+        assert!(!project.path().join("vendor").exists());
+    }
+}
+
+#[tokio::test]
+async fn add_rejects_conditional_file_rules_without_conditions_before_mutation() {
+    let mock = MockRegistry::start().await;
+    let package = "missing-condition-source";
+    let tarball = make_source_pkg_tarball(
+        package,
+        "1.0.0",
+        json!({
+            "files":[{"src":"source.txt","include":"when"}]
+        }),
+        &[("source.txt", b"package source")],
+    );
+    mock.with_package(package, "1.0.0", &tarball).await;
+    let project = TempProject::empty(r#"{"name":"host","version":"1.0.0"}"#);
+    let before = project.read_file("package.json");
+    let output = lpm_with_registry(&project, &mock.url())
+        .args([
+            "add",
+            package,
+            "--path",
+            "vendor",
+            "--yes",
+            "--no-skills",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        !output.status.success(),
+        "missing condition was accepted: {output:?}"
+    );
+    let error: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(
+        error["error"].as_str().unwrap().contains("condition"),
+        "{error}"
+    );
+    assert_eq!(project.read_file("package.json"), before);
+    assert!(!project.path().join("vendor").exists());
+}

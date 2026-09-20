@@ -61,7 +61,10 @@
         "additionalProperties": {
           "type": "array",
           "items": {
-            "type": "string"
+            "type": "string",
+            "not": {
+              "pattern": "@workspace:"
+            }
           }
         }
       }
@@ -194,7 +197,26 @@
             "$ref": "#/$defs/configValue"
           }
         }
-      }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "include": {
+                "const": "when"
+              }
+            },
+            "required": [
+              "include"
+            ]
+          },
+          "then": {
+            "required": [
+              "condition"
+            ]
+          }
+        }
+      ]
     }
   }
 }

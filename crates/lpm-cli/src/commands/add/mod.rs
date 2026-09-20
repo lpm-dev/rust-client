@@ -845,7 +845,7 @@ async fn run_locked(
                         }
                         for (i, (value, label_str)) in options.iter().enumerate() {
                             sel = sel.item(value.clone(), crate::prompt::untrusted(label_str), "");
-                            if i == default_idx {
+                            if !optional_unset && i == default_idx {
                                 sel = sel.initial_value(value.clone());
                             }
                         }
