@@ -1046,7 +1046,7 @@ async fn dlx_stop_signal_terminates_the_tool_before_releasing_its_cache_lock() {
     use std::os::unix::process::CommandExt;
     let project = TempProject::empty(r#"{"name":"dlx-stop","version":"1.0.0"}"#);
     let mock = MockRegistry::start().await;
-    mock.with_manifest_package(serde_json::json!({"name":"dlx-stop-tool","version":"1.0.0","bin":{"dlx-stop-tool":"tool.js"}}), &[("tool.js",b"#!/usr/bin/env node\nrequire('fs').writeFileSync(process.argv[2],String(process.pid));setTimeout(()=>{},20000);")]).await;
+    mock.with_manifest_package(serde_json::json!({"name":"dlx-stop-tool","version":"1.0.0","bin":{"dlx-stop-tool":"tool.js"}}), &[("tool.js",b"#!/usr/bin/env node\nconst fs=require('fs'),ready=process.argv[2];fs.writeFileSync(ready+'.tmp',String(process.pid));fs.renameSync(ready+'.tmp',ready);setTimeout(()=>{},20000);")]).await;
     let ready = project.path().join("ready");
     let mut command = support::lpm_spawnable_with_registry(&project, &mock.url());
     command
