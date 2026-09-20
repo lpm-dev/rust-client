@@ -1,0 +1,16 @@
+---
+source: tests/workflows/tests/env_vault.rs
+expression: value
+---
+{
+  "success": true,
+  "status": "disabled",
+  "version": 2,
+  "environment_count": 1,
+  "environments": [
+    "default"
+  ],
+  "warnings": [
+    "The remote update succeeded, but the project revision checkpoint could not be stored. Restore the original project's lpm.json and write access, then pull the latest revision."
+  ]
+}

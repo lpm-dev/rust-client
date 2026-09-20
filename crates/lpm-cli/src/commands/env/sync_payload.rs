@@ -104,6 +104,20 @@ struct RemotePullPayload {
 /// Returns `Ok(Some(config))` on a clean parse and `Ok(None)` when the file is
 /// absent. Syntax, read, and semantic-validation failures are errors because
 /// aliases and schema metadata participate in the pushed payload.
+pub(super) fn personal_sync_checkpoint_warnings(
+    local_key_checkpoint_failed: bool,
+    manifest_result: Result<(), LpmError>,
+) -> Vec<&'static str> {
+    let mut warnings = Vec::new();
+    if local_key_checkpoint_failed {
+        warnings.push("The remote update succeeded, but the local key checkpoint could not be stored. Restore local storage access, then pull the latest project revision.");
+    }
+    if manifest_result.is_err() {
+        warnings.push("The remote update succeeded, but the project revision checkpoint could not be stored. Restore the original project's lpm.json and write access, then pull the latest revision.");
+    }
+    warnings
+}
+
 #[cfg(test)]
 pub(super) fn read_lpm_json_for_push(
     project_dir: &std::path::Path,

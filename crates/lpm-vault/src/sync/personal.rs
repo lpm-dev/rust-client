@@ -7,6 +7,7 @@ use super::http::{
     send_authenticated_sync_request, sync_http_client, sync_request_timeout, url_path_segment,
 };
 use crate::crypto;
+use crate::crypto::personal::{self as personal_crypto, PersonalKeyContext, PersonalKeyEnvelope};
 
 /// Response from push endpoint.
 ///
@@ -24,6 +25,8 @@ use crate::crypto;
 #[derive(Debug, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PushResponse {
+    #[serde(skip)]
+    pub local_key_checkpoint_failed: bool,
     pub version: Option<i32>,
     pub principal_id: Option<String>,
     pub content_key_version: Option<i32>,
@@ -209,6 +212,8 @@ pub struct PersonalPushOptions<'a> {
 #[derive(serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 struct PersonalPushRequest<'a> {
+    #[serde(flatten)]
+    personal_keys: &'a PersonalKeyEnvelope,
     encrypted_blob: &'a str,
     wrapped_key: &'a str,
     crypto_version: i32,
@@ -355,6 +360,25 @@ pub async fn push_raw_with_options(
     secrets_json: &str,
     options: PersonalPushOptions<'_>,
 ) -> Result<PushResponse, SyncError> {
+    push_raw_with_project_rotation(
+        registry_url,
+        auth_token,
+        vault_id,
+        secrets_json,
+        options,
+        false,
+    )
+    .await
+}
+
+pub async fn push_raw_with_project_rotation(
+    registry_url: &str,
+    auth_token: &str,
+    vault_id: &str,
+    secrets_json: &str,
+    options: PersonalPushOptions<'_>,
+    rotate_project_key: bool,
+) -> Result<PushResponse, SyncError> {
     const MAX_FORCE_PUSH_ATTEMPTS: usize = 3;
 
     if options.expected_principal_id.is_some_and(str::is_empty) {
@@ -418,9 +442,57 @@ pub async fn push_raw_with_options(
         let principal_id = stable_principal_id
             .as_deref()
             .ok_or("personal cloud env principal is unavailable")?;
-        let (encrypted_blob, wrapped_key) =
-            crypto::encrypt_vault_for_sync(secrets_json, principal_id, vault_id, target_revision)?;
+        let remote = if base_revision.is_some() && !recreate_missing {
+            let pulled =
+                pull_raw_bound_to_principal(registry_url, auth_token, vault_id, Some(principal_id))
+                    .await?;
+            if Some(pulled.version) != base_revision {
+                if options.force
+                    && attempt + 1 < attempt_limit
+                    && Some(pulled.version) > base_revision
+                {
+                    continue;
+                }
+                return Err(SyncError::http(
+                    reqwest::StatusCode::CONFLICT,
+                    "the personal env project changed during key preparation; pull and retry"
+                        .into(),
+                ));
+            }
+            Some(pulled)
+        } else {
+            None
+        };
+        let origin = personal_crypto::registry_origin(registry_url)?;
+        let prior_envelope = remote
+            .as_ref()
+            .and_then(|pulled| pulled.key_envelope.as_ref());
+        let project = if let Some(envelope) = prior_envelope.filter(|_| !rotate_project_key) {
+            personal_crypto::open_project_key(envelope, registry_url, principal_id, vault_id)?
+        } else {
+            let prior_version = prior_envelope.map_or(
+                personal_crypto::project_key_floor(registry_url, principal_id, vault_id)?,
+                |envelope| envelope.project_key_version,
+            );
+            let project_key_version = prior_version
+                .checked_add(1)
+                .ok_or("personal env project key version overflow")?;
+            personal_crypto::create_project_key(&PersonalKeyContext {
+                registry_origin: &origin,
+                principal_id,
+                vault_id,
+                project_key_version,
+            })?
+        };
+        let (encrypted_blob, wrapped_key) = personal_crypto::encrypt_personal_payload(
+            &project,
+            principal_id,
+            vault_id,
+            target_revision,
+            secrets_json,
+        )?;
         let body = PersonalPushRequest {
+            personal_keys: &project.envelope,
             encrypted_blob: &encrypted_blob,
             wrapped_key: &wrapped_key,
             crypto_version: crypto::CURRENT_CRYPTO_VERSION,
@@ -446,6 +518,9 @@ pub async fn push_raw_with_options(
         .await?
         {
             SyncHttpResponse::Success(result) => {
+                if result.personal_keys.as_ref() != Some(&project.envelope) {
+                    return Err("personal env write response omitted or changed the committed project key binding".into());
+                }
                 if result.version != Some(target_revision) {
                     return Err("vault push committed an unexpected ciphertext revision".into());
                 }
@@ -455,7 +530,14 @@ pub async fn push_raw_with_options(
                     return Err("vault push response is bound to a different principal".into());
                 }
 
+                let local_key_checkpoint_failed = personal_crypto::remember_key_version(
+                    &project.envelope,
+                    principal_id,
+                    vault_id,
+                )
+                .is_err();
                 return Ok(PushResponse {
+                    local_key_checkpoint_failed,
                     version: result.version,
                     principal_id: result.principal_id,
                     content_key_version: result.content_key_version,
@@ -468,6 +550,7 @@ pub async fn push_raw_with_options(
             }
             SyncHttpResponse::Error { status, response } => {
                 let result = PushResponse {
+                    local_key_checkpoint_failed: false,
                     version: response.version,
                     principal_id: response.principal_id,
                     content_key_version: response.content_key_version,
@@ -537,66 +620,19 @@ pub async fn pull_bound_to_principal(
     vault_id: &str,
     expected_principal_id: Option<&str>,
 ) -> Result<(HashMap<String, String>, i32), SyncError> {
-    let client = sync_http_client()?;
-    let url = format!(
-        "{registry_url}/api/vaults/{}/sync",
-        url_path_segment(vault_id)
-    );
-
-    let result = match send_authenticated_sync_request(
-        client
-            .get(&url)
-            .bearer_auth(auth_token)
-            .timeout(sync_request_timeout(std::time::Duration::from_secs(30))),
-        vault_id,
-        SyncScope::Personal,
-        SyncEnvelopePolicy::Pull,
-    )
-    .await?
-    {
-        SyncHttpResponse::Success(result) => result,
-        SyncHttpResponse::Error { status, response } => {
-            let message = response
-                .error
-                .unwrap_or_else(|| format!("server error: {status}"));
-            return Err(SyncError::http(status, message));
-        }
-    };
-
-    validate_expected_principal(&result, expected_principal_id)?;
-    let principal_id = result
-        .principal_id
-        .as_deref()
-        .ok_or("server returned no authenticated principal ID")?;
-    let encrypted_blob = result
-        .encrypted_blob
-        .ok_or("server returned no encrypted data")?;
-    let wrapped_key = result.wrapped_key.ok_or("server returned no wrapped key")?;
-    let version = result
-        .version
-        .ok_or("server returned no authenticated revision")?;
-    let crypto_version = result
-        .crypto_version
-        .ok_or("server returned no authenticated crypto version")?;
-
-    let result = crypto::decrypt_vault_from_sync(
-        &encrypted_blob,
-        &wrapped_key,
-        principal_id,
-        vault_id,
-        version,
-        crypto_version,
-    )?;
-    let secrets = crate::selected_environment::parse(&result, "default")
+    let pulled =
+        pull_raw_bound_to_principal(registry_url, auth_token, vault_id, expected_principal_id)
+            .await?;
+    let secrets = crate::selected_environment::parse(&pulled.raw_json, "default")
         .map_err(|error| format!("failed to parse decrypted secrets: {error}"))?
         .into_selected()
         .unwrap_or_default();
-
-    Ok((secrets, version))
+    Ok((secrets, pulled.version))
 }
 
 #[derive(Debug)]
 pub struct PulledPersonalVault {
+    pub key_envelope: Option<PersonalKeyEnvelope>,
     pub raw_json: String,
     pub version: i32,
     pub principal_id: String,
@@ -705,16 +741,40 @@ async fn pull_raw_authenticated(
         .crypto_version
         .ok_or("server returned no authenticated crypto version")?;
 
-    let result = crypto::decrypt_vault_from_sync(
-        &encrypted_blob,
-        &wrapped_key,
+    let key_envelope = result.personal_keys;
+    personal_crypto::validate_key_floor(
+        key_envelope.as_ref(),
+        registry_url,
         &principal_id,
         vault_id,
-        version,
-        crypto_version,
     )?;
+    let result = if let Some(envelope) = &key_envelope {
+        let project =
+            personal_crypto::open_project_key(envelope, registry_url, &principal_id, vault_id)?;
+        let plaintext = personal_crypto::decrypt_personal_payload(
+            &project,
+            &principal_id,
+            vault_id,
+            version,
+            crypto_version,
+            &encrypted_blob,
+            &wrapped_key,
+        )?;
+        personal_crypto::remember_key_version(envelope, &principal_id, vault_id)?;
+        plaintext
+    } else {
+        crypto::decrypt_vault_from_sync(
+            &encrypted_blob,
+            &wrapped_key,
+            &principal_id,
+            vault_id,
+            version,
+            crypto_version,
+        )?
+    };
 
     Ok(PulledPersonalVault {
+        key_envelope,
         raw_json: result,
         version,
         principal_id,
@@ -802,6 +862,39 @@ mod tests {
     use wiremock::{Mock, MockServer, ResponseTemplate};
     #[cfg(debug_assertions)]
     use wiremock::{Request, Respond};
+
+    #[cfg(debug_assertions)]
+    async fn mount_legacy_payloads(server: &MockServer, vault_id: &str, revisions: &[i32]) {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        struct Payloads {
+            responses: Vec<SignedSyncResponse>,
+            calls: AtomicUsize,
+        }
+        impl Respond for Payloads {
+            fn respond(&self, request: &Request) -> ResponseTemplate {
+                let index = self.calls.fetch_add(1, Ordering::SeqCst);
+                self.responses[index.min(self.responses.len() - 1)].respond(request)
+            }
+        }
+        let responses = revisions.iter().map(|revision| {
+            let (blob, wrapped) = crypto::encrypt_vault_for_sync(
+                r#"{"API_KEY":"fixture"}"#, "personal-test-principal", vault_id, *revision,
+            ).unwrap();
+            signed_sync_ok_response(serde_json::json!({
+                "encryptedBlob": blob, "wrappedKey": wrapped, "version": revision, "cryptoVersion": 3,
+            }), "auth-token", vault_id, TestSyncScope::Personal)
+        }).collect();
+        Mock::given(method("GET"))
+            .and(path(format!("/api/vaults/{vault_id}/sync")))
+            .and(query_param_is_missing("versionOnly"))
+            .respond_with(Payloads {
+                responses,
+                calls: AtomicUsize::new(0),
+            })
+            .expect(revisions.len() as u64)
+            .mount(server)
+            .await;
+    }
 
     #[cfg(debug_assertions)]
     type EnvelopeMutator = fn(&mut serde_json::Value);
@@ -1165,6 +1258,7 @@ mod tests {
         let _guard = env_lock_guard();
         let _isolated = IsolatedVaultKeyEnv::new();
         let server = MockServer::start().await;
+        mount_legacy_payloads(&server, "vault-123", &[3]).await;
         let body = "vault version conflict";
         let (key_id, response_signature) = signature::sign_response_for_test(409, body.as_bytes());
 
@@ -1223,6 +1317,7 @@ mod tests {
         let _guard = env_lock_guard();
         let _isolated = IsolatedVaultKeyEnv::new();
         let server = MockServer::start().await;
+        mount_legacy_payloads(&server, "vault-force", &[7]).await;
         let captured_body = Arc::new(StdMutex::new(None));
 
         Mock::given(method("GET"))
@@ -1375,6 +1470,7 @@ mod tests {
         let _guard = env_lock_guard();
         let _isolated = IsolatedVaultKeyEnv::new();
         let server = MockServer::start().await;
+        mount_legacy_payloads(&server, "vault-force-race", &[5, 6]).await;
         let preflight_calls = Arc::new(AtomicUsize::new(0));
         let push_calls = Arc::new(AtomicUsize::new(0));
         let second_body = Arc::new(StdMutex::new(None));
@@ -1734,6 +1830,7 @@ mod tests {
         let _guard = env_lock_guard();
         let _isolated = IsolatedVaultKeyEnv::new();
         let server = MockServer::start().await;
+        mount_legacy_payloads(&server, "vault-123", &[3]).await;
 
         Mock::given(method("POST"))
             .and(path("/api/vaults/vault-123/sync"))
@@ -1772,6 +1869,7 @@ mod tests {
         let _guard = env_lock_guard();
         let _isolated = IsolatedVaultKeyEnv::new();
         let server = MockServer::start().await;
+        mount_legacy_payloads(&server, "vault-123", &[3]).await;
 
         Mock::given(method("POST"))
             .and(path("/api/vaults/vault-123/sync"))
@@ -1816,6 +1914,7 @@ mod tests {
         let _guard = env_lock_guard();
         let _isolated = IsolatedVaultKeyEnv::new();
         let server = MockServer::start().await;
+        mount_legacy_payloads(&server, "vault-123", &[3]).await;
 
         Mock::given(method("POST"))
             .and(path("/api/vaults/vault-123/sync"))
@@ -2043,6 +2142,7 @@ mod tests {
         let _guard = env_lock_guard();
         let _isolated = IsolatedVaultKeyEnv::new();
         let server = MockServer::start().await;
+        mount_legacy_payloads(&server, "vault-123", &[3]).await;
         let original_timeout = std::env::var_os("LPM_TEST_SYNC_TIMEOUT_MS");
 
         unsafe { std::env::set_var("LPM_TEST_SYNC_TIMEOUT_MS", "50") };
@@ -2142,6 +2242,7 @@ mod tests {
     #[test]
     fn format_push_error_appends_hint_when_present() {
         let response = PushResponse {
+            local_key_checkpoint_failed: false,
             version: None,
             principal_id: None,
             content_key_version: None,
@@ -2165,6 +2266,7 @@ mod tests {
     #[test]
     fn format_push_error_falls_back_to_error_only_when_hint_absent() {
         let response = PushResponse {
+            local_key_checkpoint_failed: false,
             version: None,
             principal_id: None,
             content_key_version: None,
@@ -2182,6 +2284,7 @@ mod tests {
     #[test]
     fn format_push_error_falls_back_to_status_when_error_field_missing() {
         let response = PushResponse {
+            local_key_checkpoint_failed: false,
             version: None,
             principal_id: None,
             content_key_version: None,
@@ -2351,6 +2454,7 @@ mod tests {
         let _guard = env_lock_guard();
         let _isolated = IsolatedVaultKeyEnv::new();
         let server = MockServer::start().await;
+        mount_legacy_payloads(&server, "vault-envelope", &[7]).await;
 
         Mock::given(method("POST"))
             .and(path("/api/vaults/vault-envelope/sync"))

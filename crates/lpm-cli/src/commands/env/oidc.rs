@@ -99,7 +99,7 @@ fn policy_id_from_response(result: &serde_json::Value) -> Result<String, LpmErro
         })
 }
 
-/// `lpm env oidc allow --provider=github --repo=owner/repo --workflow=.github/workflows/deploy.yml --branch=main --env=production [--events=push,workflow_dispatch] [--allow-forks]`
+/// `lpm env oidc allow --allow-server-decryption --provider=github --repo=owner/repo --workflow=.github/workflows/deploy.yml --branch=main --env=production [--events=push,workflow_dispatch] [--allow-forks]`
 pub(super) async fn vars_oidc(
     client: &lpm_registry::RegistryClient,
     args: &[&str],
@@ -108,7 +108,7 @@ pub(super) async fn vars_oidc(
 ) -> Result<(), LpmError> {
     if args.is_empty() {
         return Err(LpmError::Script(
-            "usage: lpm env oidc allow --provider=github --repo=<owner/repo> \
+            "usage: lpm env oidc allow --allow-server-decryption --provider=github --repo=<owner/repo> \
              --workflow=.github/workflows/<file>.yml --branch=<branch> --env=<env> \
              [--events=push,workflow_dispatch] [--allow-forks]"
                 .into(),
@@ -135,7 +135,7 @@ pub(super) async fn vars_oidc(
 
 fn print_oidc_help() {
     println!(
-        "Usage:\n  lpm env oidc allow [OPTIONS]\n  lpm env oidc list [--org=<slug>]\n  lpm env oidc disable --org=<slug>\n\n\
+        "Usage:\n  lpm env oidc allow [OPTIONS]\n  lpm env oidc list [--org=<slug>]\n  lpm env oidc disable [--org=<slug>]\n\n\
          Run `lpm env oidc allow --help` before updating an existing policy."
     );
 }
@@ -143,19 +143,19 @@ fn print_oidc_help() {
 fn print_oidc_allow_help() {
     println!(
         r#"Usage:
-  lpm env oidc allow --provider=github --repo=<owner/repo> [--repository-id=<numeric-id>] --workflow=.github/workflows/<file>.yml --branch=<list> --env=<list> [--events=<list>] [--allow-forks]
+  lpm env oidc allow --allow-server-decryption --provider=github --repo=<owner/repo> [--repository-id=<numeric-id>] --workflow=.github/workflows/<file>.yml --branch=<list> --env=<list> [--events=<list>] [--allow-forks]
 
-  lpm env oidc allow --provider=gitlab --project-id=<numeric-project-id> --branch=<list> --env=<list>
+  lpm env oidc allow --allow-server-decryption --provider=gitlab --project-id=<numeric-project-id> --branch=<list> --env=<list>
 
 The CLI looks up the immutable ID for a public GitHub repository. For a private repository, set GITHUB_TOKEN or GH_TOKEN, or pass --repository-id.
 
-For organization projects, add --org=<slug> and --allow-server-decryption. An owner or admin must first share or pull the project. The server receives only this project's current content key. Key rotation disables CI access until you enable it again. Use `lpm env oidc disable --org=<slug>` to disable decryption and revoke CI credentials.
+All projects require --allow-server-decryption. Personal projects share an independent project key. Run `lpm env oidc disable` to rotate that key and revoke CI access. For organization projects, add --org=<slug>. An owner or admin must first share or pull the project. The server receives only this project's current content key. Key rotation disables CI access until you enable it again. Use `lpm env oidc disable --org=<slug>` to disable decryption and revoke CI credentials.
 
 This command replaces the policy's complete allowlists. Run `lpm env oidc list` first, then supply every branch, environment, workflow, and event that should remain allowed."#
     );
 }
 
-/// `lpm env oidc allow --provider=github --repo=owner/repo --workflow=.github/workflows/deploy.yml --branch=main --env=production`
+/// `lpm env oidc allow --allow-server-decryption --provider=github --repo=owner/repo --workflow=.github/workflows/deploy.yml --branch=main --env=production`
 pub(super) async fn vars_oidc_allow(
     registry_client: &lpm_registry::RegistryClient,
     args: &[&str],
@@ -209,13 +209,8 @@ pub(super) async fn vars_oidc_allow(
         }
     }
 
-    if org.is_some() && !allow_server_decryption {
-        return Err(LpmError::Script("Organization CI access requires --allow-server-decryption. This shares the current project's content key with the server so authorized CI jobs can read its environments.".into()));
-    }
-    if org.is_none() && allow_server_decryption {
-        return Err(LpmError::Script(
-            "--allow-server-decryption requires --org=<slug>".into(),
-        ));
+    if !allow_server_decryption {
+        return Err(LpmError::Script("CI access requires --allow-server-decryption. This shares a key for the current project with the server so authorized CI jobs can read its environments.".into()));
     }
 
     if envs.is_empty() {
@@ -233,7 +228,7 @@ pub(super) async fn vars_oidc_allow(
             }
             let repo = repo.ok_or_else(|| {
                 LpmError::Script(
-                    "missing --repo flag. Usage: lpm env oidc allow --provider=github \
+                    "missing --repo flag. Usage: lpm env oidc allow --allow-server-decryption --provider=github \
                      --repo=owner/repo --workflow=.github/workflows/deploy.yml \
                      --branch=main --env=production"
                         .into(),
@@ -386,7 +381,40 @@ pub(super) async fn vars_oidc_allow(
                     )
                     .map_err(LpmError::Script)?;
                 }
-                create_oidc_policy(&registry_url, &auth_token, &policy_body).await
+                if org.is_some() {
+                    create_oidc_policy(&registry_url, &auth_token, &policy_body).await
+                } else {
+                    let vault_id = policy_body["vaultId"].as_str().unwrap_or_default();
+                    let principal = policy_body["expectedPrincipalId"]
+                        .as_str()
+                        .unwrap_or_default();
+                    super::sync_payload::fresh_personal_mutation_manifest(
+                        project_dir,
+                        vault_id,
+                        &registry_url,
+                        Some(principal),
+                    )
+                    .map_err(LpmError::Script)?;
+                    let mut policy = policy_body.clone();
+                    if let Some(fields) = policy.as_object_mut() {
+                        fields.remove("expectedPrincipalId");
+                    }
+                    lpm_vault::sync::enable_personal_ci(
+                        &registry_url,
+                        &auth_token,
+                        vault_id,
+                        principal,
+                        &policy,
+                    )
+                    .await
+                    .map_err(|error| {
+                        if error.is_unauthorized() {
+                            LpmError::AuthRequired
+                        } else {
+                            LpmError::Script(error.to_string())
+                        }
+                    })
+                }
             }
         })
         .await?;
@@ -401,30 +429,6 @@ pub(super) async fn vars_oidc_allow(
             &expected_principal_id,
         )
         .await?;
-    } else {
-        let wrapping_key = lpm_vault::crypto::get_or_create_wrapping_key().map_err(|error| {
-            oidc_escrow_setup_error("retrieving the local wrapping key", &error)
-        })?;
-        let wrapping_key_hex = hex::encode(wrapping_key);
-        super::auth::execute_sync_with_bearer(registry_client, |registry_url, auth_token| {
-            let vault_id = vault_id.clone();
-            let wrapping_key_hex = wrapping_key_hex.clone();
-            let expected_principal_id = expected_principal_id.clone();
-            async move {
-                lpm_vault::sync::upload_escrow_key(
-                    &registry_url,
-                    &auth_token,
-                    &vault_id,
-                    &wrapping_key_hex,
-                    &expected_principal_id,
-                )
-                .await
-            }
-        })
-        .await
-        .map_err(|error| {
-            oidc_escrow_setup_error("uploading the wrapping key", &error.to_string())
-        })?;
     }
 
     if json_output {
@@ -687,6 +691,11 @@ pub(super) async fn vars_oidc_list(
         let workflows = render_strings(&policy["allowedWorkflows"]);
         let events = render_strings(&policy["allowedEvents"]);
         let forks = policy["allowForks"].as_bool().unwrap_or(false);
+        let status = if policy["disabledAt"].is_null() {
+            "active"
+        } else {
+            "disabled"
+        };
 
         let bb = if branches.is_empty() { "-" } else { &branches };
         let ee = if envs.is_empty() { "-" } else { &envs };
@@ -699,10 +708,11 @@ pub(super) async fn vars_oidc_list(
         println!(
             "{}",
             install_ui::terminal_line!(
-                "  {} {}\n      policy ID: {}\n      branches:  [{}]\n      envs:      [{}]\n      workflows: [{}]\n      events:    [{}]{}",
+                "  {} {}\n      policy ID: {}\n      status:    {}\n      branches:  [{}]\n      envs:      [{}]\n      workflows: [{}]\n      events:    [{}]{}",
                 install_ui::bold(provider),
                 identity,
                 policy_id,
+                status,
                 bb,
                 ee,
                 ww,

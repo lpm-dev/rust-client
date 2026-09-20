@@ -66,8 +66,15 @@ pub(super) async fn disable(
     project_dir: &std::path::Path,
     json_output: bool,
 ) -> Result<(), LpmError> {
-    let org = selector(args)?
-        .ok_or_else(|| LpmError::Script("usage: lpm env oidc disable --org=<slug>".into()))?;
+    let Some(org) = selector(args)? else {
+        return crate::commands::env::rotation::rotate_personal_key(
+            client,
+            project_dir,
+            json_output,
+            true,
+        )
+        .await;
+    };
     let manifest = sync_payload::CloudManifestSnapshot::read(project_dir)?;
     let vault_id = manifest
         .vault

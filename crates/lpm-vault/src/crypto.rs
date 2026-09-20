@@ -23,6 +23,9 @@ use rand::RngCore;
 use sha2::{Digest, Sha256};
 use x25519_dalek::{PublicKey as X25519PublicKey, StaticSecret as X25519Secret};
 
+pub mod personal;
+mod wrapping_store;
+
 /// Keyring service name for the vault wrapping key.
 const VAULT_KEY_SERVICE: &str = "dev.lpm.vault-key";
 
@@ -58,6 +61,32 @@ pub fn get_or_create_wrapping_key() -> Result<[u8; 32], String> {
     crate::storage_transaction::with_vault_transaction(get_or_create_wrapping_key_unlocked)
 }
 
+pub fn read_legacy_wrapping_key() -> Result<Option<[u8; 32]>, String> {
+    crate::storage_transaction::with_vault_transaction(|directory| {
+        if force_file_wrapping_key() {
+            return wrapping_store::read_file(directory, ".vault-key");
+        }
+        #[cfg(target_os = "macos")]
+        {
+            try_read_wrapping_key_from_keyring()
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let fallback = wrapping_store::read_file(directory, ".vault-key")?;
+            match try_read_wrapping_key_from_keyring() {
+                Ok(Some(key)) => {
+                    if fallback.is_some_and(|file| file != key) {
+                        return Err("native and file-fallback env wrapping keys conflict; both were preserved".into());
+                    }
+                    Ok(Some(key))
+                }
+                Ok(None) => Ok(fallback),
+                Err(error) => fallback.map(Some).ok_or(error),
+            }
+        }
+    })
+}
+
 fn get_or_create_wrapping_key_unlocked(
     directory: &crate::storage_transaction::VaultStorageDirectory,
 ) -> Result<[u8; 32], String> {
@@ -79,29 +108,7 @@ fn get_or_create_wrapping_key_unlocked(
 
     #[cfg(not(target_os = "macos"))]
     {
-        match try_read_wrapping_key_from_keyring() {
-            Ok(Some(key)) => return Ok(key),
-            Ok(None) => {}
-            Err(error) => {
-                tracing::warn!(
-                    error = %error,
-                    "system keyring is unavailable; using the owner-only vault-key file fallback"
-                );
-                let mut candidate = [0u8; 32];
-                rand::thread_rng().fill_bytes(&mut candidate);
-                return get_or_create_wrapping_key_file(directory, &candidate);
-            }
-        }
-
-        let mut candidate = [0u8; 32];
-        rand::thread_rng().fill_bytes(&mut candidate);
-        match store_and_read_wrapping_key_from_keyring(&candidate) {
-            Ok(stored) => Ok(stored),
-            Err(error) => {
-                tracing::debug!(%error, "system keyring write unavailable; using owner-only vault-key file");
-                get_or_create_wrapping_key_file(directory, &candidate)
-            }
-        }
+        wrapping_store::load_with_native(directory, ".vault-key", &LegacyWrappingKeyStore)
     }
 }
 
@@ -174,51 +181,23 @@ fn store_wrapping_key_in_keyring(key: &[u8; 32]) -> Result<(), String> {
 }
 
 #[cfg(not(target_os = "macos"))]
-fn store_and_read_wrapping_key_from_keyring(candidate: &[u8; 32]) -> Result<[u8; 32], String> {
-    store_wrapping_key_in_keyring(candidate)?;
-    try_read_wrapping_key_from_keyring()?
-        .ok_or_else(|| "system keyring write succeeded but no wrapping key was readable".to_owned())
-}
+struct LegacyWrappingKeyStore;
 
-/// Read the wrapping key from the file fallback.
-///
-/// On Unix, refuses to surface the key when the file's mode is more
-/// permissive than 0o600 — the write-side already sets 0o600, but a
-/// host that restored the file from a backup or a user who manually
-/// `chmod`-ed it could end up with the key world-readable. Refusing
-/// at read time forces the user to notice and re-chmod (or force a
-/// fresh key by removing the file), rather than silently using a
-/// key any local UID could exfiltrate.
-fn read_wrapping_key_from_file(
-    directory: &crate::storage_transaction::VaultStorageDirectory,
-) -> Result<Option<[u8; 32]>, String> {
-    let Some(data) = directory.read_owner_only_file(".vault-key", "vault wrapping-key file")?
-    else {
-        return Ok(None);
-    };
-    let encoded = std::str::from_utf8(&data)
-        .map_err(|_| "vault wrapping-key file is not valid UTF-8".to_owned())?;
-    decode_wrapping_key(encoded).map(Some)
+#[cfg(not(target_os = "macos"))]
+impl wrapping_store::NativeWrappingKeyStore for LegacyWrappingKeyStore {
+    fn read(&self) -> Result<Option<[u8; 32]>, String> {
+        try_read_wrapping_key_from_keyring()
+    }
+    fn write(&self, candidate: &[u8; 32]) -> Result<(), String> {
+        store_wrapping_key_in_keyring(candidate)
+    }
 }
 
 fn get_or_create_wrapping_key_file(
     directory: &crate::storage_transaction::VaultStorageDirectory,
     candidate: &[u8; 32],
 ) -> Result<[u8; 32], String> {
-    if let Some(existing) = read_wrapping_key_from_file(directory)? {
-        return Ok(existing);
-    }
-    let encoded = hex::encode(candidate);
-    if directory.create_owner_only_file(
-        ".vault-key",
-        encoded.as_bytes(),
-        "vault wrapping-key file",
-    )? {
-        return Ok(*candidate);
-    }
-    read_wrapping_key_from_file(directory)?.ok_or_else(|| {
-        "vault wrapping-key file was created concurrently but could not be read".to_owned()
-    })
+    wrapping_store::get_or_create_file(directory, ".vault-key", candidate)
 }
 
 /// Generate a random 256-bit AES key.
@@ -454,7 +433,8 @@ pub fn unwrap_key(wrapping_key: &[u8; 32], wrapped: &str) -> Result<[u8; 32], St
 /// Returns (encrypted_blob, wrapped_key) — both base64-encoded strings.
 ///
 /// Uses the stored wrapping key (keyring or file), independent of auth token.
-pub fn encrypt_vault_for_sync(
+#[cfg(test)]
+pub(crate) fn encrypt_vault_for_sync(
     secrets_json: &str,
     principal_id: &str,
     vault_id: &str,
@@ -647,6 +627,7 @@ const PAIRING_SAS_INFO: &[u8] = b"lpm-pair-sas-v3";
 /// The same secret stages the public key, derives the displayed SAS, and
 /// wraps the key after the user confirms the SAS.
 pub struct P256PairingKeyExchange {
+    protocol_version: u8,
     ephemeral_secret: p256::SecretKey,
     browser_public: p256::PublicKey,
     browser_public_bytes: Vec<u8>,
@@ -692,6 +673,10 @@ impl P256PairingKeyExchange {
         let (encryption_info, sas_info): (&'static [u8], &'static [u8]) = match protocol_version {
             3 => (PAIRING_ENCRYPTION_INFO, PAIRING_SAS_INFO),
             4 => (b"lpm-dashboard-pair-org-v4", b"lpm-pair-org-sas-v4"),
+            5 => (
+                b"lpm-dashboard-pair-personal-v5",
+                b"lpm-pair-personal-sas-v5",
+            ),
             _ => return Err("unsupported browser pairing protocol".into()),
         };
 
@@ -708,6 +693,7 @@ impl P256PairingKeyExchange {
         let ephemeral_public_key_b64 = BASE64.encode(&ephemeral_public_bytes);
 
         Ok(Self {
+            protocol_version,
             ephemeral_secret,
             browser_public,
             browser_public_bytes,
@@ -732,12 +718,60 @@ impl P256PairingKeyExchange {
 
     /// Wrap the user's key with a key domain-separated from the SAS output.
     pub fn wrap_key(&self, wrapping_key: &[u8; 32]) -> Result<String, String> {
+        if self.protocol_version == 5 {
+            return Err("personal pairing requires a typed key bundle".into());
+        }
+        self.wrap_bytes(wrapping_key)
+    }
+
+    pub fn wrap_personal_bundle(
+        &self,
+        registry_url: &str,
+        principal: &str,
+    ) -> Result<String, String> {
+        use elliptic_curve::zeroize::Zeroizing;
+        if self.protocol_version != 5 {
+            return Err("personal key bundles require pairing protocol 5".into());
+        }
+        let origin = personal::registry_origin(registry_url)?;
+        let root = Zeroizing::new(personal::personal_root_key(&origin, principal, true)?);
+        let legacy = read_legacy_wrapping_key()?.map(Zeroizing::new);
+        let root_hex = Zeroizing::new(hex::encode(*root));
+        let legacy_hex = legacy
+            .as_ref()
+            .map(|key| Zeroizing::new(hex::encode(**key)));
+        #[derive(serde::Serialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Bundle<'a> {
+            bundle_version: u8,
+            personal_key_scheme: i32,
+            personal_registry_origin: &'a str,
+            principal_id: &'a str,
+            root_key_hex: &'a str,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            legacy_wrapping_key_hex: Option<&'a str>,
+        }
+        let bytes = Zeroizing::new(
+            serde_json::to_vec(&Bundle {
+                bundle_version: 1,
+                personal_key_scheme: personal::PERSONAL_KEY_SCHEME,
+                personal_registry_origin: &origin,
+                principal_id: principal,
+                root_key_hex: &root_hex,
+                legacy_wrapping_key_hex: legacy_hex.as_ref().map(|key| key.as_str()),
+            })
+            .map_err(|error| format!("personal pairing bundle: {error}"))?,
+        );
+        self.wrap_bytes(&bytes)
+    }
+
+    fn wrap_bytes(&self, plaintext: &[u8]) -> Result<String, String> {
         let shared_secret = self.shared_secret();
         let hk = Hkdf::<Sha256>::new(Some(&[]), shared_secret.raw_secret_bytes().as_slice());
-        let mut derived_key = [0u8; 32];
-        hk.expand(self.encryption_info, &mut derived_key)
+        let mut derived_key = elliptic_curve::zeroize::Zeroizing::new([0u8; 32]);
+        hk.expand(self.encryption_info, derived_key.as_mut())
             .expect("32-byte HKDF expansion is valid");
-        encrypt(&derived_key, wrapping_key)
+        encrypt(&derived_key, plaintext)
     }
 
     /// Derive the eight-digit SAS from the ECDH secret, pairing code, and
@@ -813,7 +847,7 @@ mod tests {
     /// is what closes the parallel-cascade where one module's tests
     /// would mutate env while another module's tests were mid-flight.
     #[cfg(debug_assertions)]
-    struct IsolatedVaultEnv {
+    pub(super) struct IsolatedVaultEnv {
         _tmp: tempfile::TempDir,
         _guard: std::sync::MutexGuard<'static, ()>,
         prior_home: Option<crate::test_env_lock::HomeEnvSnapshot>,
@@ -822,7 +856,7 @@ mod tests {
 
     #[cfg(debug_assertions)]
     impl IsolatedVaultEnv {
-        fn new() -> Self {
+        pub(super) fn new() -> Self {
             let guard = crate::test_env_lock::acquire_env_lock();
             let tmp = tempfile::tempdir().expect("tempdir for isolated vault env");
             let prior_home = Some(crate::test_env_lock::HomeEnvSnapshot::set(tmp.path()));
@@ -1499,7 +1533,54 @@ mod tests {
         )
         .unwrap();
         assert!(decrypt(&wrapping_key, &personal.wrap_key(&[0x31; 32]).unwrap()).is_err());
-        assert!(P256PairingKeyExchange::new_for_protocol(browser_public, 5).is_err());
+        assert!(P256PairingKeyExchange::new_for_protocol(browser_public, 6).is_err());
+    }
+
+    #[test]
+    fn personal_pairing_bundle_matches_browser_domains_without_creating_legacy_keys() {
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        let _env = IsolatedVaultEnv::new();
+        let browser_public = "BHxVGUyrg6Aqn2QCLhpKWxgxAKl8Fzge710Mk4EjOXaWb+2NIrZXsDeew/kaCDoKLvQ74/ux0Jrp4ZdVoFq98Go=";
+        let secret = URL_SAFE_NO_PAD
+            .decode("5dN15DKUl326VlUkWjxMwcreiXKehsYwgiuPDDbzr0c")
+            .unwrap();
+        let exchange = P256PairingKeyExchange::from_secret_for_protocol(
+            browser_public,
+            p256::SecretKey::from_slice(&secret).unwrap(),
+            5,
+        )
+        .unwrap();
+        assert_eq!(exchange.short_authentication_string("ABC123"), "1430 6816");
+        assert!(exchange.wrap_key(&[0x31; 32]).is_err());
+        let wrapping_key: [u8; 32] =
+            hex::decode("16c6c8f81eb5aac4a7ead1a75aede330ab4183094710aca93b2d628be9c3f063")
+                .unwrap()
+                .try_into()
+                .unwrap();
+        let encrypted = exchange
+            .wrap_personal_bundle("https://lpm.dev/", "user-a")
+            .unwrap();
+        let bundle: serde_json::Value =
+            serde_json::from_slice(&decrypt(&wrapping_key, &encrypted).unwrap()).unwrap();
+        assert_eq!(
+            bundle,
+            serde_json::json!({
+                "bundleVersion": 1,
+                "personalKeyScheme": 2,
+                "personalRegistryOrigin": "https://lpm.dev",
+                "principalId": "user-a",
+                "rootKeyHex": hex::encode(personal::personal_root_key("https://lpm.dev", "user-a", false).unwrap()),
+            })
+        );
+        assert_eq!(read_legacy_wrapping_key().unwrap(), None);
+        let legacy = get_or_create_wrapping_key().unwrap();
+        let encrypted = exchange
+            .wrap_personal_bundle("https://lpm.dev", "user-a")
+            .unwrap();
+        let bundle: serde_json::Value =
+            serde_json::from_slice(&decrypt(&wrapping_key, &encrypted).unwrap()).unwrap();
+        assert_eq!(bundle["legacyWrappingKeyHex"], hex::encode(legacy));
+        assert_ne!(bundle["rootKeyHex"], bundle["legacyWrappingKeyHex"]);
     }
 
     #[test]

@@ -164,7 +164,7 @@ impl From<&str> for SyncError {
 
 pub use audit::{AuditEntry, AuditResponse, get_audit_log};
 pub use ci::{
-    CiPullResponse, OrganizationCiEscrow, ci_pull, disable_org_ci_escrow, upload_escrow_key,
+    CiPullResponse, OrganizationCiEscrow, ci_pull, disable_org_ci_escrow, enable_personal_ci,
 };
 pub use org::{
     OrgPushRequest, PulledOrgVault, list_org_vaults, org_version_preflight_bound_to_principal,
@@ -181,6 +181,7 @@ pub use personal::{
     pull_bound_to_principal, pull_env, pull_env_bound_to_principal, pull_raw, pull_raw_bound,
     pull_raw_bound_to_principal, pull_raw_for_rotation, pull_raw_for_rotation_bound,
     pull_raw_for_rotation_bound_to_principal, push, push_raw, push_raw_with_options,
+    push_raw_with_project_rotation,
 };
 pub use public_key::{
     LocalPublicKeyState, MemberPublicKey, MyPublicKeyState, OrgMemberKeyAccess, PendingPublicKey,
@@ -344,7 +345,7 @@ pub(crate) mod test_support {
                     "vaultId": self.vault_id,
                 }),
             };
-            let data = match operation {
+            let mut data = match operation {
                 "vault.inspect" => serde_json::json!({
                     "revision": revision,
                     "cryptoVersion": crypto_version,
@@ -394,6 +395,20 @@ pub(crate) mod test_support {
                     data
                 }
             };
+            if matches!(self.scope, TestSyncScope::Personal) && operation != "vault.inspect" {
+                let request_body: serde_json::Value =
+                    serde_json::from_slice(&request.body).unwrap_or_default();
+                for field in [
+                    "personalKeyScheme",
+                    "personalRegistryOrigin",
+                    "projectKeyVersion",
+                    "wrappedProjectKey",
+                ] {
+                    if let Some(value) = object.get(field).or_else(|| request_body.get(field)) {
+                        data[field] = value.clone();
+                    }
+                }
+            }
             let mut body = serde_json::json!({
                 "envelopeVersion": 3,
                 "operation": operation,

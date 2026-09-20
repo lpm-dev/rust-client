@@ -175,31 +175,42 @@ pub(super) async fn vars_push(
     )
     .await?;
 
-    if let Some(version) = result.version {
-        let principal_id = result
-            .principal_id
-            .as_deref()
-            .ok_or_else(|| LpmError::Script("sync response omitted the principal ID".into()))?;
-        super::sync_payload::persist_personal_sync_version(
-            &project_dir,
-            &vault_id,
-            version,
-            &registry_url,
-            principal_id,
-        )?;
-    }
-
+    let version = result
+        .version
+        .ok_or_else(|| LpmError::Script("sync response omitted the revision".into()))?;
+    let principal_id = result
+        .principal_id
+        .as_deref()
+        .ok_or_else(|| LpmError::Script("sync response omitted the principal ID".into()))?;
+    let checkpoint_result = super::sync_payload::persist_personal_sync_version(
+        &project_dir,
+        &vault_id,
+        version,
+        &registry_url,
+        principal_id,
+    );
+    let warnings = super::sync_payload::personal_sync_checkpoint_warnings(
+        result.local_key_checkpoint_failed,
+        checkpoint_result,
+    );
     if json_output {
-        super::response::print_json_value(&serde_json::json!({
+        let mut response = serde_json::json!({
             "success": true,
             "status": result.status,
             "version": result.version,
-        }));
+        });
+        if !warnings.is_empty() {
+            response["warnings"] = serde_json::json!(warnings);
+        }
+        super::response::print_json_value(&response);
     } else {
         output::success_line(crate::install_ui::terminal_line!(
-            "vault synced (version {})",
-            install_ui::bold(&result.version.unwrap_or(0).to_string())
+            "env synced (version {})",
+            install_ui::bold(&version.to_string())
         ));
+        for warning in warnings {
+            output::warn(warning);
+        }
     }
     Ok(())
 }

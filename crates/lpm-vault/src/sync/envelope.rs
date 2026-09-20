@@ -1,5 +1,6 @@
 use super::public_key::ValidatedSharingKey;
 use crate::crypto;
+use crate::crypto::personal::PersonalKeyEnvelope;
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use rand::RngCore;
 use serde::de::{MapAccess, SeqAccess, Visitor};
@@ -38,6 +39,7 @@ impl SyncEnvelopePolicy {
 #[derive(Debug)]
 pub(super) struct AuthenticatedSyncResponse {
     pub(super) outcome: String,
+    pub(super) personal_keys: Option<PersonalKeyEnvelope>,
     pub(super) encrypted_blob: Option<String>,
     pub(super) wrapped_key: Option<String>,
     pub(super) version: Option<i32>,
@@ -58,6 +60,7 @@ impl AuthenticatedSyncResponse {
     fn new(outcome: String, binding: ValidatedVaultBinding) -> Self {
         Self {
             outcome,
+            personal_keys: None,
             encrypted_blob: None,
             wrapped_key: None,
             version: None,
@@ -230,6 +233,14 @@ struct ValidatedVaultBinding {
 #[derive(serde::Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct VaultPayloadData {
+    #[serde(default)]
+    personal_key_scheme: OptionalField<i32>,
+    #[serde(default)]
+    personal_registry_origin: OptionalField<String>,
+    #[serde(default)]
+    project_key_version: OptionalField<i32>,
+    #[serde(default)]
+    wrapped_project_key: OptionalField<String>,
     encrypted_blob: String,
     wrapped_key: String,
     revision: i32,
@@ -305,6 +316,14 @@ struct MemberRewrapData {
 #[derive(serde::Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct CommittedData {
+    #[serde(default)]
+    personal_key_scheme: OptionalField<i32>,
+    #[serde(default)]
+    personal_registry_origin: OptionalField<String>,
+    #[serde(default)]
+    project_key_version: OptionalField<i32>,
+    #[serde(default)]
+    wrapped_project_key: OptionalField<String>,
     revision: i32,
     #[serde(default)]
     content_key_version: Option<i32>,
@@ -713,6 +732,13 @@ pub(super) fn parse_vault_response(
         (SyncEnvelopePolicy::Pull, "current") => {
             let data: VaultPayloadData = parse_data(envelope.data)?;
             validate_vault_payload(&data, expected_scope)?;
+            response.personal_keys = parse_personal_keys(
+                expected_scope,
+                &data.personal_key_scheme,
+                &data.personal_registry_origin,
+                &data.project_key_version,
+                &data.wrapped_project_key,
+            )?;
             response.encrypted_blob = Some(data.encrypted_blob);
             response.wrapped_key = Some(data.wrapped_key);
             response.version = Some(data.revision);
@@ -749,6 +775,13 @@ pub(super) fn parse_vault_response(
         }
         (SyncEnvelopePolicy::Write, "committed") => {
             let data: CommittedData = parse_data(envelope.data)?;
+            response.personal_keys = parse_personal_keys(
+                expected_scope,
+                &data.personal_key_scheme,
+                &data.personal_registry_origin,
+                &data.project_key_version,
+                &data.wrapped_project_key,
+            )?;
             validate_revision(data.revision, false, "revision")?;
             validate_crypto_version(data.crypto_version)?;
             if !matches!(data.action.as_str(), "synced" | "shared" | "rotated") {
@@ -984,6 +1017,48 @@ fn validate_vault_binding(
         }
         _ => Err("authenticated sync envelope has a mismatched scope binding".into()),
     }
+}
+
+fn parse_personal_keys(
+    scope: SyncScope<'_>,
+    scheme: &OptionalField<i32>,
+    origin: &OptionalField<String>,
+    version: &OptionalField<i32>,
+    wrapped: &OptionalField<String>,
+) -> Result<Option<PersonalKeyEnvelope>, String> {
+    if matches!(scheme, OptionalField::Absent)
+        && matches!(origin, OptionalField::Absent)
+        && matches!(version, OptionalField::Absent)
+        && matches!(wrapped, OptionalField::Absent)
+    {
+        return Ok(None);
+    }
+    if !matches!(scope, SyncScope::Personal)
+        || scheme.as_value() != Some(&crate::crypto::personal::PERSONAL_KEY_SCHEME)
+    {
+        return Err("invalid personal env key scheme in authenticated response".into());
+    }
+    let origin = origin
+        .as_value()
+        .ok_or("missing personal env registry binding")?;
+    validate_string(origin, 2048, "personal registry origin")?;
+    if crate::crypto::personal::registry_origin(origin)? != *origin {
+        return Err("noncanonical personal env registry origin".into());
+    }
+    let version = *version
+        .as_value()
+        .ok_or("missing personal env project key version")?;
+    validate_revision(version, false, "project key version")?;
+    let wrapped = wrapped
+        .as_value()
+        .ok_or("missing personal env project key envelope")?;
+    validate_string(wrapped, 4096, "wrapped project key")?;
+    Ok(Some(PersonalKeyEnvelope {
+        personal_key_scheme: crate::crypto::personal::PERSONAL_KEY_SCHEME,
+        personal_registry_origin: origin.clone(),
+        project_key_version: version,
+        wrapped_project_key: wrapped.clone(),
+    }))
 }
 
 fn validate_vault_payload(
