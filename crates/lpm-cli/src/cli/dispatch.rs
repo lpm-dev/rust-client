@@ -140,9 +140,9 @@ fn run_async_main() -> Result<()> {
     runtime_builder.thread_stack_size(ASYNC_STACK_BYTES);
     if let Some(cap) = std::env::var("LPM_MAX_BLOCKING_THREADS")
         .ok()
-        .and_then(|s| s.parse::<usize>().ok())
+        .and_then(|s| s.parse::<std::num::NonZeroUsize>().ok())
     {
-        runtime_builder.max_blocking_threads(cap);
+        runtime_builder.max_blocking_threads(cap.get());
     }
     let runtime = runtime_builder
         .build()

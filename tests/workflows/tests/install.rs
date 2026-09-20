@@ -19140,3 +19140,33 @@ fn install_rejects_malformed_runtime_configuration_instead_of_ignoring_it() {
         );
     }
 }
+
+#[tokio::test]
+async fn invalid_signature_environment_preserves_saved_verification() {
+    let mock = MockRegistry::start().await;
+    mount_unsigned_signature_pkg(&mock).await;
+    for raw in ["invalid", "", "  "] {
+        let project = TempProject::empty(
+            r#"{"name":"signature-env","version":"1.0.0","dependencies":{"unsigned-pkg":"1.0.0"}}"#,
+        );
+        project.write_file(".npmrc", &format!("registry={}\n", mock.url()));
+        write_signatures_global_config(&project, true);
+        let out = lpm_with_registry_and_npm(&project, &mock.url())
+            .env("LPM_VERIFY_REGISTRY_SIGNATURES", raw)
+            .args([
+                "install",
+                "--no-security-summary",
+                "--no-skills",
+                "--no-editor-setup",
+            ])
+            .output()
+            .unwrap();
+        assert!(!out.status.success(), "{raw:?}: unsigned package installed");
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains("missing dist.signatures"),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(!project.file_exists("node_modules/unsigned-pkg/package.json"));
+    }
+}

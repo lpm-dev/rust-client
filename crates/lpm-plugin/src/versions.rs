@@ -195,10 +195,11 @@ fn tag_prefix_for_plugin(def: &PluginDef) -> Option<&'static str> {
 /// Returns `None` if neither is set — unauthenticated requests are rate-limited
 /// to 60/hour vs 5000/hour with a token.
 fn github_token() -> Option<String> {
-    std::env::var("GITHUB_TOKEN")
-        .or_else(|_| std::env::var("GH_TOKEN"))
-        .ok()
-        .filter(|t| !t.is_empty())
+    ["GITHUB_TOKEN", "GH_TOKEN"].into_iter().find_map(|name| {
+        std::env::var(name)
+            .ok()
+            .filter(|token| !token.trim().is_empty())
+    })
 }
 
 /// Build a GitHub API request with optional authentication and rate limit handling.
@@ -973,5 +974,47 @@ mod tests {
             .await
             .is_err()
         );
+    }
+    #[test]
+    fn blank_github_token_uses_nonblank_plugin_alias() {
+        let prior_github = std::env::var_os("GITHUB_TOKEN");
+        let prior_gh = std::env::var_os("GH_TOKEN");
+        let mut results = Vec::new();
+        for blank in ["", " \t "] {
+            // SAFETY: nextest isolates this test in its own process; both variables are restored before assertions.
+            unsafe {
+                std::env::set_var("GITHUB_TOKEN", blank);
+                std::env::set_var("GH_TOKEN", "alias-token");
+            }
+            let request = build_github_request(
+                &reqwest::Client::new(),
+                "https://api.github.com/repos/example/tool/releases/latest",
+            )
+            .build()
+            .unwrap();
+            results.push(
+                request
+                    .headers()
+                    .get(reqwest::header::AUTHORIZATION)
+                    .cloned(),
+            );
+        }
+        // SAFETY: restore the environment before assertions can panic.
+        unsafe {
+            match prior_github {
+                Some(value) => std::env::set_var("GITHUB_TOKEN", value),
+                None => std::env::remove_var("GITHUB_TOKEN"),
+            }
+            match prior_gh {
+                Some(value) => std::env::set_var("GH_TOKEN", value),
+                None => std::env::remove_var("GH_TOKEN"),
+            }
+        }
+        for result in results {
+            assert_eq!(
+                result.as_ref().and_then(|value| value.to_str().ok()),
+                Some("Bearer alias-token")
+            );
+        }
     }
 }

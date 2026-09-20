@@ -1193,3 +1193,130 @@ async fn setup_ci_does_not_overwrite_npmrc_edits_during_retirement() {
     assert!(String::from_utf8_lossy(&output.stderr).contains("changed concurrently"));
     assert!(project.read_file(".npmrc").contains("fund=false"));
 }
+
+#[tokio::test]
+async fn blank_oidc_sources_fall_back_to_the_nonblank_legacy_token() {
+    let mock = MockRegistry::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/registry/-/token/oidc"))
+        .and(wiremock::matchers::body_partial_json(
+            serde_json::json!({"token":"legacy-jwt"}),
+        ))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(serde_json::json!({"token":"exchanged-token"})),
+        )
+        .mount(mock.server())
+        .await;
+    for blank in ["", " \t "] {
+        let project = TempProject::empty(r#"{"name":"oidc-env","version":"1.0.0"}"#);
+        lpm_with_registry(&project, &mock.url())
+            .env("LPM_OIDC_TOKEN", blank)
+            .env("ACTIONS_ID_TOKEN_REQUEST_URL", blank)
+            .env("ACTIONS_ID_TOKEN_REQUEST_TOKEN", blank)
+            .env("LPM_GITLAB_OIDC_TOKEN", "legacy-jwt")
+            .args(["setup", "ci", "npmrc", "--oidc"])
+            .assert()
+            .success();
+        assert!(project.read_file(".npmrc").contains("exchanged-token"));
+    }
+}
+
+#[tokio::test]
+async fn github_oidc_request_replaces_audience_and_preserves_other_query_fields() {
+    for suffix in [
+        "",
+        "?request=abc",
+        "?request=abc&audience=old&audience=second",
+    ] {
+        let mock = MockRegistry::start().await;
+        Mock::given(method("GET"))
+            .and(path("/oidc"))
+            .and(wiremock::matchers::header(
+                "authorization",
+                "Bearer runtime-token",
+            ))
+            .and(|request: &wiremock::Request| {
+                request
+                    .url
+                    .query_pairs()
+                    .filter(|(key, _)| key == "audience")
+                    .map(|(_, value)| value.into_owned())
+                    .collect::<Vec<_>>()
+                    == ["https://lpm.dev"]
+            })
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"value":"runtime-jwt"})),
+            )
+            .mount(mock.server())
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/registry/-/token/oidc"))
+            .and(wiremock::matchers::body_partial_json(
+                serde_json::json!({"token":"runtime-jwt"}),
+            ))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"token":"exchanged-token"})),
+            )
+            .mount(mock.server())
+            .await;
+        let project = TempProject::empty(r#"{"name":"oidc-url","version":"1.0.0"}"#);
+        lpm_with_registry(&project, &mock.url())
+            .env(
+                "ACTIONS_ID_TOKEN_REQUEST_URL",
+                format!("{}/oidc{suffix}", mock.url()),
+            )
+            .env("ACTIONS_ID_TOKEN_REQUEST_TOKEN", "runtime-token")
+            .args(["setup", "ci", "npmrc", "--oidc"])
+            .assert()
+            .success();
+        let requests = mock.server().received_requests().await.unwrap();
+        let runtime = requests.iter().find(|r| r.url.path() == "/oidc").unwrap();
+        assert_eq!(
+            runtime
+                .url
+                .query_pairs()
+                .any(|(key, value)| key == "request" && value == "abc"),
+            !suffix.is_empty()
+        );
+    }
+}
+
+#[tokio::test]
+async fn blank_github_oidc_response_stops_before_registry_exchange() {
+    let mock = MockRegistry::start().await;
+    Mock::given(method("GET"))
+        .and(path("/oidc"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"value":"  "})))
+        .mount(mock.server())
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/registry/-/token/oidc"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(serde_json::json!({"token":"exchanged-token"})),
+        )
+        .mount(mock.server())
+        .await;
+    let project = TempProject::empty(r#"{"name":"empty-oidc","version":"1.0.0"}"#);
+    lpm_with_registry(&project, &mock.url())
+        .env(
+            "ACTIONS_ID_TOKEN_REQUEST_URL",
+            format!("{}/oidc?request=abc", mock.url()),
+        )
+        .env("ACTIONS_ID_TOKEN_REQUEST_TOKEN", "runtime-token")
+        .args(["setup", "ci", "npmrc", "--oidc"])
+        .assert()
+        .failure();
+    assert!(!project.file_exists(".npmrc"));
+    assert!(
+        mock.server()
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .all(|r| r.method == "GET")
+    );
+}

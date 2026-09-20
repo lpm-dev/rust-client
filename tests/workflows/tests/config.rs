@@ -2185,7 +2185,7 @@ fn config_list_environment_booleans_match_runtime_spellings() {
             "enabled",
             "signatures",
             serde_json::json!(false),
-            "LPM_VERIFY_REGISTRY_SIGNATURES",
+            "built-in default",
         ),
         (
             "LPM_AUDIT_AFTER_INSTALL",
@@ -2441,6 +2441,60 @@ fn valid_or_absent_security_controls_preserve_empty_install_behavior() {
             .assert()
             .success();
         lpm(&project)
+            .args(["config", "list", "--json"])
+            .assert()
+            .success();
+    }
+}
+
+#[test]
+fn signature_environment_falls_back_only_when_the_boolean_is_invalid() {
+    for (raw, expected, from_env) in [
+        ("invalid", true, false),
+        ("", true, false),
+        ("  ", true, false),
+        ("enabled", true, false),
+        (" TRUE ", true, true),
+        ("off", false, true),
+    ] {
+        let project = TempProject::empty(r#"{"name":"signature-env","version":"1.0.0"}"#);
+        seed_config(&project, "signatures = true\n");
+        let output = lpm(&project)
+            .env("LPM_VERIFY_REGISTRY_SIGNATURES", raw)
+            .args(["config", "list", "--json"])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        let entry = json["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| entry["key"] == "signatures")
+            .unwrap();
+        assert_eq!(entry["value"], expected, "{raw:?}: {entry}");
+        assert_eq!(
+            entry["source"],
+            if from_env {
+                "LPM_VERIFY_REGISTRY_SIGNATURES"
+            } else {
+                "~/.lpm/config.toml"
+            },
+            "{raw:?}: {entry}"
+        );
+    }
+}
+
+#[test]
+fn zero_or_invalid_blocking_thread_cap_does_not_panic() {
+    for raw in ["0", "invalid", "", "-1", "1"] {
+        let project = TempProject::empty(r#"{"name":"runtime-cap","version":"1.0.0"}"#);
+        lpm(&project)
+            .env("LPM_MAX_BLOCKING_THREADS", raw)
             .args(["config", "list", "--json"])
             .assert()
             .success();

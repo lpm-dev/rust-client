@@ -612,12 +612,11 @@ fn add_security_entries(
         GROUP_SECURITY,
     ));
 
-    let signatures_env = std::env::var("LPM_VERIFY_REGISTRY_SIGNATURES").ok();
+    let signatures_env = std::env::var("LPM_VERIFY_REGISTRY_SIGNATURES")
+        .ok()
+        .and_then(|value| super::parse_env_bool(&value));
     let configured_signatures = read_optional_bool(global, "signatures", global_path)?;
-    let signatures = signatures_env.as_deref().map_or_else(
-        || configured_signatures.unwrap_or(false),
-        |value| super::parse_env_bool(value).unwrap_or(false),
-    );
+    let signatures = signatures_env.or(configured_signatures).unwrap_or(false);
     let signatures_source = if signatures_env.is_some() {
         "LPM_VERIFY_REGISTRY_SIGNATURES"
     } else if configured_signatures.is_some() {
