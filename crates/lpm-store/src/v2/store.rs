@@ -2824,7 +2824,10 @@ impl Store {
         let mut verification = crate::v3::FileCasVerification::default();
         let mut expected_sources = std::collections::HashMap::new();
         for (object_dir, _) in self.iter_object_dirs()? {
-            let source_sri = match std::fs::read_to_string(object_dir.join(".integrity")) {
+            let source_sri = match lpm_common::read_text_file_capped_nofollow(
+                &object_dir.join(".integrity"),
+                INTEGRITY_MARKER_SIZE_CAP_BYTES,
+            ) {
                 Ok(source_sri) => source_sri,
                 Err(error) => {
                     verification.issues.push(format!(
