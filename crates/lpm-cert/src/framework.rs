@@ -27,6 +27,13 @@ pub struct CommandPortPlanner {
     scripts: HashMap<String, String>,
 }
 
+/// Whether a command declares a development listener and its optional numeric preference.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub struct CommandPortIntent {
+    pub requires_port: bool,
+    pub preferred_port: Option<u16>,
+}
+
 impl CommandPortPlanner {
     /// Load the project manifest once for all command-port decisions in this directory.
     pub fn load(project_dir: &Path) -> Self {
@@ -60,6 +67,19 @@ impl CommandPortPlanner {
             })
             .unwrap_or_default();
         Self { framework, scripts }
+    }
+
+    /// Distinguish listener commands from generic workers, including nested package scripts.
+    pub fn port_intent(&self, command: &str) -> CommandPortIntent {
+        let analysis = self.analyze_command(command, 0);
+        CommandPortIntent {
+            requires_port: analysis.framework.is_some() || analysis.explicit_port.is_some(),
+            preferred_port: analysis
+                .explicit_port
+                .as_deref()
+                .and_then(|value| value.parse::<u16>().ok())
+                .filter(|port| *port != 0),
+        }
     }
 
     /// Return managed arguments or an actionable conflict from one command analysis.
@@ -585,6 +605,33 @@ mod tests {
             explicit_port_conflict_for_command(tmp.path(), "npm run dev -- --port=4321", 5174,)
                 .is_some()
         );
+    }
+
+    #[test]
+    fn port_intent_distinguishes_workers_frameworks_and_command_preferences() {
+        let planner = CommandPortPlanner::load_with(Path::new("unused"), |_| {
+            Some(
+            r#"{"scripts":{"web":"vite","worker":"node worker.js"},"devDependencies":{"vite":"*"}}"#.into()
+        )
+        });
+        for (command, managed, preferred) in [
+            ("node worker.js", false, None),
+            ("npm run worker", false, None),
+            ("node worker.js -p preview", false, None),
+            ("npm run web", true, None),
+            ("react-scripts start", true, None),
+            ("node server.js --port=$PORT", true, None),
+            ("npm run web -- --port 4321", true, Some(4321)),
+        ] {
+            assert_eq!(
+                planner.port_intent(command),
+                CommandPortIntent {
+                    requires_port: managed,
+                    preferred_port: preferred,
+                },
+                "{command}"
+            );
+        }
     }
 
     #[test]

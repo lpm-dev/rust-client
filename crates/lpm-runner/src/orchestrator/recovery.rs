@@ -15,7 +15,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ExitStatus, Stdio};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -29,7 +29,7 @@ enum ServiceGoal {
 
 #[derive(Debug, Clone, Eq, PartialEq)]
 enum ServicePhase {
-    Ready,
+    Ready(Instant),
     Starting,
     RestartScheduled(Instant),
     WaitingForDependencies(String),
@@ -41,7 +41,6 @@ struct ServiceRuntimeState {
     goal: ServiceGoal,
     phase: ServicePhase,
     restart_attempts: u32,
-    last_failure: Option<Instant>,
     terminal_error: Option<String>,
 }
 
@@ -114,24 +113,23 @@ enum RestartDecision {
 }
 
 impl ServiceRuntimeState {
-    fn initial(ready: bool, spawned: bool, now: Instant) -> Self {
+    fn initial(ready_at: Option<Instant>, spawned: bool, now: Instant) -> Self {
         Self {
             goal: ServiceGoal::Running,
-            phase: if ready {
-                ServicePhase::Ready
+            phase: if let Some(ready_at) = ready_at {
+                ServicePhase::Ready(ready_at)
             } else if spawned {
                 ServicePhase::Starting
             } else {
                 ServicePhase::RestartScheduled(now)
             },
             restart_attempts: 0,
-            last_failure: None,
             terminal_error: None,
         }
     }
 
     fn is_ready(&self) -> bool {
-        self.goal == ServiceGoal::Running && self.phase == ServicePhase::Ready
+        self.goal == ServiceGoal::Running && matches!(self.phase, ServicePhase::Ready(_))
     }
 
     fn has_pending_work(&self) -> bool {
@@ -155,7 +153,7 @@ pub(super) struct RecoveryContext<'a> {
     pub(super) port_map: &'a ServicePortMap,
     pub(super) color_map: &'a HashMap<String, &'static str>,
     pub(super) service_names: &'a [String],
-    pub(super) initial_ready: &'a HashSet<String>,
+    pub(super) initial_ready: &'a HashMap<String, Instant>,
     pub(super) children: &'a Arc<Mutex<Vec<(String, Child)>>>,
     pub(super) shutdown_state: &'a Arc<AtomicU8>,
     pub(super) event_tx: &'a Option<std::sync::mpsc::SyncSender<OrchestratorEvent>>,
@@ -187,7 +185,7 @@ pub(super) fn supervise_services(mut context: RecoveryContext<'_>) -> Result<(),
             (
                 name.clone(),
                 ServiceRuntimeState::initial(
-                    context.initial_ready.contains(name),
+                    context.initial_ready.get(name).copied(),
                     spawned.contains(name),
                     now,
                 ),
@@ -195,6 +193,7 @@ pub(super) fn supervise_services(mut context: RecoveryContext<'_>) -> Result<(),
         })
         .collect();
 
+    let mut pending = PendingRestarts::default();
     loop {
         if context.shutdown_state.load(Ordering::Relaxed) > 0 {
             break;
@@ -205,8 +204,22 @@ pub(super) fn supervise_services(mut context: RecoveryContext<'_>) -> Result<(),
         }
 
         process_commands(&context, &mut states);
+        pending.retain_current(|job| restart_job_is_current(&context, &states, job));
+        let mut index = 0;
+        while index < pending.jobs.len() {
+            if pending.jobs[index]
+                .readiness
+                .as_ref()
+                .is_some_and(|worker| worker.is_finished())
+            {
+                let job = pending.jobs.swap_remove(index);
+                settle_restart_job(&context, &mut states, &mut publication, job)?;
+            } else {
+                index += 1;
+            }
+        }
         resume_waiting_services(&context, &mut states);
-        process_due_restarts(&context, &mut states, &mut publication)?;
+        process_due_restarts(&context, &mut states, &mut pending);
         resume_waiting_services(&context, &mut states);
 
         if states
@@ -218,12 +231,17 @@ pub(super) fn supervise_services(mut context: RecoveryContext<'_>) -> Result<(),
 
         let has_children = !context.children.lock().is_empty();
         let has_pending_work = states.values().any(ServiceRuntimeState::has_pending_work);
-        if !has_children && !has_pending_work {
+        if !has_children && !has_pending_work && pending.jobs.is_empty() {
             break;
         }
 
-        std::thread::sleep(Duration::from_millis(500));
+        std::thread::sleep(Duration::from_millis(if pending.jobs.is_empty() {
+            500
+        } else {
+            50
+        }));
     }
+    drop(pending);
 
     let mut failures: Vec<_> = states
         .iter()
@@ -383,14 +401,11 @@ fn schedule_after_failure(
 }
 
 fn schedule_restart(state: &mut ServiceRuntimeState, now: Instant) -> RestartDecision {
-    if state
-        .last_failure
-        .is_some_and(|last_failure| now.duration_since(last_failure).as_secs() > 60)
+    if matches!(state.phase, ServicePhase::Ready(since) if now.duration_since(since) > Duration::from_secs(60))
     {
         state.restart_attempts = 0;
     }
     state.restart_attempts += 1;
-    state.last_failure = Some(now);
 
     if state.restart_attempts > MAX_RESTART_ATTEMPTS {
         state.goal = ServiceGoal::Failed;
@@ -560,8 +575,9 @@ fn first_unready_dependency_for(
 fn process_due_restarts(
     context: &RecoveryContext<'_>,
     states: &mut HashMap<String, ServiceRuntimeState>,
-    publication: &mut EndpointPublication<'_>,
-) -> Result<(), LpmError> {
+    pending: &mut PendingRestarts,
+) {
+    pending.retain_current(|job| restart_job_is_current(context, states, job));
     let now = Instant::now();
     let due: Vec<String> = context
         .groups
@@ -576,22 +592,21 @@ fn process_due_restarts(
         .cloned()
         .collect();
 
-    process_restart_batch(
+    pending.jobs.extend(start_restart_batch(
         due,
         states,
         restart_is_due,
         |states, name| {
             if context.shutdown_state.load(Ordering::Relaxed) > 0 {
-                return Ok(None);
+                return None;
             }
             if let Some(dependency) = first_unready_dependency(context, states, name) {
                 wait_for_dependency(context, states, name, dependency);
-                return Ok(None);
+                return None;
             }
-            Ok(start_restart_service(context, states, name))
+            start_restart_service(context, states, name)
         },
-        |states, job| settle_restart_job(context, states, publication, job),
-    )
+    ));
 }
 
 fn restart_is_due(states: &HashMap<String, ServiceRuntimeState>, name: &str) -> bool {
@@ -601,25 +616,21 @@ fn restart_is_due(states: &HashMap<String, ServiceRuntimeState>, name: &str) -> 
     })
 }
 
-fn process_restart_batch<State, Job, Error>(
+fn start_restart_batch<State, Job>(
     due: Vec<String>,
     state: &mut State,
     is_current: impl Fn(&State, &str) -> bool,
-    mut start: impl FnMut(&mut State, &str) -> Result<Option<Job>, Error>,
-    mut settle: impl FnMut(&mut State, Job) -> Result<(), Error>,
-) -> Result<(), Error> {
+    mut start: impl FnMut(&mut State, &str) -> Option<Job>,
+) -> Vec<Job> {
     let mut jobs = Vec::with_capacity(due.len());
     for name in due {
         if is_current(state, &name)
-            && let Some(job) = start(state, &name)?
+            && let Some(job) = start(state, &name)
         {
             jobs.push(job);
         }
     }
-    for job in jobs {
-        settle(state, job)?;
-    }
-    Ok(())
+    jobs
 }
 
 fn wait_for_dependency(
@@ -652,7 +663,73 @@ fn waiting_status(dependency: &str) -> ServiceStatus {
 
 struct RestartJob {
     name: String,
-    readiness: std::thread::JoinHandle<Result<InitialServiceReadiness, String>>,
+    child_pid: u32,
+    cancel: Arc<AtomicBool>,
+    readiness: Option<std::thread::JoinHandle<Result<InitialServiceReadiness, String>>>,
+}
+
+impl Drop for RestartJob {
+    fn drop(&mut self) {
+        self.cancel.store(true, Ordering::Release);
+        if let Some(worker) = self.readiness.take() {
+            let _ = worker.join();
+        }
+    }
+}
+
+#[derive(Default)]
+struct PendingRestarts {
+    jobs: Vec<RestartJob>,
+}
+
+impl PendingRestarts {
+    fn retain_current(&mut self, mut is_current: impl FnMut(&RestartJob) -> bool) {
+        for job in &self.jobs {
+            if !is_current(job) {
+                job.cancel.store(true, Ordering::Release);
+            }
+        }
+        self.jobs.retain(|job| !job.cancel.load(Ordering::Acquire));
+    }
+}
+
+impl Drop for PendingRestarts {
+    fn drop(&mut self) {
+        for job in &self.jobs {
+            job.cancel.store(true, Ordering::Release);
+        }
+    }
+}
+
+fn restart_job_is_current(
+    context: &RecoveryContext<'_>,
+    states: &HashMap<String, ServiceRuntimeState>,
+    job: &RestartJob,
+) -> bool {
+    context.shutdown_state.load(Ordering::Relaxed) == 0
+        && states.get(&job.name).is_some_and(|state| {
+            state.goal == ServiceGoal::Running && state.phase == ServicePhase::Starting
+        })
+        && context
+            .children
+            .lock()
+            .iter()
+            .any(|(name, child)| name == &job.name && child.id() == job.child_pid)
+}
+
+fn restart_child_stopped(
+    children: &Arc<Mutex<Vec<(String, Child)>>>,
+    name: &str,
+    pid: u32,
+) -> bool {
+    let mut children = children.lock();
+    let Some((_, child)) = children
+        .iter_mut()
+        .find(|(service, child)| service == name && child.id() == pid)
+    else {
+        return true;
+    };
+    matches!(child.try_wait(), Ok(Some(_)))
 }
 
 fn restart_command_with_managed_port(
@@ -781,6 +858,8 @@ fn start_restart_service(
     let readiness_controller = context.command_controller.cloned();
     let readiness_name = name.to_string();
     let job_name = readiness_name.clone();
+    let cancel = Arc::new(AtomicBool::new(false));
+    let readiness_cancel = Arc::clone(&cancel);
     let readiness = std::thread::spawn(move || {
         let result = wait_for_initial_service_readiness(
             InitialReadinessOptions {
@@ -793,13 +872,13 @@ fn start_restart_service(
                 timeout_secs,
             },
             || {
-                readiness_shutdown.load(Ordering::Relaxed) > 0
+                readiness_cancel.load(Ordering::Acquire)
+                    || readiness_shutdown.load(Ordering::Relaxed) > 0
                     || readiness_controller
                         .as_ref()
                         .is_some_and(|controller| controller.has_pending_service(service_index))
                     || (readiness_requires_running_process
-                        && super::service_exit_status(&readiness_children, &readiness_name)
-                            .is_some())
+                        && restart_child_stopped(&readiness_children, &readiness_name, child_pid))
             },
         );
         endpoint_candidates.deactivate();
@@ -808,7 +887,9 @@ fn start_restart_service(
 
     Some(RestartJob {
         name: job_name,
-        readiness,
+        child_pid,
+        cancel,
+        readiness: Some(readiness),
     })
 }
 
@@ -816,22 +897,34 @@ fn settle_restart_job(
     context: &RecoveryContext<'_>,
     states: &mut HashMap<String, ServiceRuntimeState>,
     publication: &mut EndpointPublication<'_>,
-    job: RestartJob,
+    mut job: RestartJob,
 ) -> Result<(), LpmError> {
-    let name = job.name;
-    let readiness = job.readiness.join().map_err(|_| {
+    process_commands(context, states);
+    if !restart_job_is_current(context, states, &job) {
+        return Ok(());
+    }
+    let worker = job
+        .readiness
+        .take()
+        .ok_or_else(|| LpmError::Script("restart readiness worker is unavailable".into()))?;
+    let readiness = worker.join().map_err(|_| {
         LpmError::Script(format!(
-            "service `{name}` readiness worker panicked during restart"
+            "service `{}` readiness worker panicked during restart",
+            job.name
         ))
     })?;
     process_commands(context, states);
+    if !restart_job_is_current(context, states, &job) {
+        return Ok(());
+    }
+    let name = std::mem::take(&mut job.name);
+    if let Some(status) = take_exited_service(context.children, &name, job.child_pid) {
+        handle_service_exit(context, states, &name, status);
+        return Ok(());
+    }
 
     match readiness {
         Ok(mut readiness) => {
-            if let Some(status) = take_exited_service(context.children, &name) {
-                handle_service_exit(context, states, &name, status);
-                return Ok(());
-            }
             if !states.get(&name).is_some_and(|state| {
                 state.goal == ServiceGoal::Running && state.phase == ServicePhase::Starting
             }) {
@@ -842,7 +935,7 @@ fn settle_restart_job(
             }
             if let Some(state) = states.get_mut(&name) {
                 state.goal = ServiceGoal::Running;
-                state.phase = ServicePhase::Ready;
+                state.phase = ServicePhase::Ready(readiness.ready_at);
                 state.terminal_error = None;
             }
             let timing = ui_readiness_timing(readiness.duration);
@@ -880,11 +973,12 @@ fn settle_restart_job(
 fn take_exited_service(
     children: &Arc<Mutex<Vec<(String, Child)>>>,
     name: &str,
+    pid: u32,
 ) -> Option<ExitStatus> {
     let mut locked = children.lock();
     let position = locked
         .iter()
-        .position(|(service_name, _)| service_name == name)?;
+        .position(|(service_name, child)| service_name == name && child.id() == pid)?;
     let status = locked[position].1.try_wait().ok().flatten()?;
     let (_, child) = locked.remove(position);
     super::cleanup_exited_service_tree(child.id());
@@ -959,7 +1053,6 @@ fn process_commands(
                     if let Some(state) = states.get_mut(name) {
                         state.goal = ServiceGoal::Running;
                         state.restart_attempts = 0;
-                        state.last_failure = None;
                         state.terminal_error = None;
                         state.phase = ServicePhase::Stopped;
                     }
@@ -1049,13 +1142,221 @@ mod tests {
     }
 
     #[test]
+    fn pending_restart_cleanup_cancels_every_worker_before_joining() {
+        let flags: Vec<_> = (0..2).map(|_| Arc::new(AtomicBool::new(false))).collect();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let jobs = flags
+            .iter()
+            .map(|cancel| {
+                let flags = flags.clone();
+                let tx = tx.clone();
+                RestartJob {
+                    name: "fixture".into(),
+                    child_pid: 0,
+                    cancel: Arc::clone(cancel),
+                    readiness: Some(std::thread::spawn(move || {
+                        let deadline = Instant::now() + Duration::from_secs(2);
+                        while !flags.iter().all(|flag| flag.load(Ordering::Acquire))
+                            && Instant::now() < deadline
+                        {
+                            std::thread::sleep(Duration::from_millis(5));
+                        }
+                        tx.send(flags.iter().all(|flag| flag.load(Ordering::Acquire)))
+                            .unwrap();
+                        Err("cancelled".into())
+                    })),
+                }
+            })
+            .collect();
+        drop(PendingRestarts { jobs });
+        assert!(rx.recv().unwrap());
+        assert!(rx.recv().unwrap());
+    }
+
+    #[test]
+    fn obsolete_restart_cleanup_cancels_every_worker_before_joining() {
+        let flags: Vec<_> = (0..2).map(|_| Arc::new(AtomicBool::new(false))).collect();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let jobs = flags
+            .iter()
+            .map(|cancel| {
+                let flags = flags.clone();
+                let tx = tx.clone();
+                RestartJob {
+                    name: "fixture".into(),
+                    child_pid: 0,
+                    cancel: Arc::clone(cancel),
+                    readiness: Some(std::thread::spawn(move || {
+                        let deadline = Instant::now() + Duration::from_secs(2);
+                        while !flags.iter().all(|flag| flag.load(Ordering::Acquire))
+                            && Instant::now() < deadline
+                        {
+                            std::thread::sleep(Duration::from_millis(5));
+                        }
+                        tx.send(flags.iter().all(|flag| flag.load(Ordering::Acquire)))
+                            .unwrap();
+                        Err("cancelled".into())
+                    })),
+                }
+            })
+            .collect();
+        let mut pending = PendingRestarts { jobs };
+        pending.retain_current(|_| false);
+        assert!(rx.recv().unwrap());
+        assert!(rx.recv().unwrap());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn exited_restart_reports_the_exit_status_instead_of_cancelled_readiness() {
+        for code in [0, 7] {
+            let project = tempfile::tempdir().unwrap();
+            let mut child = std::process::Command::new("sh")
+                .args(["-c", &format!("exit {code}")])
+                .spawn()
+                .unwrap();
+            child.wait().unwrap();
+            let pid = child.id();
+            let children = Arc::new(Mutex::new(vec![("worker".into(), child)]));
+            let services = HashMap::from([(
+                "worker".into(),
+                ServiceConfig {
+                    restart: true,
+                    ..Default::default()
+                },
+            )]);
+            let service_names = vec!["worker".into()];
+            let groups = vec![service_names.clone()];
+            let (tx, rx) = std::sync::mpsc::sync_channel(16);
+            let context = RecoveryContext {
+                project_dir: project.path(),
+                active_services: &services,
+                service_cwds: &HashMap::new(),
+                groups: &groups,
+                service_runtime_hints: &HashMap::new(),
+                service_envs: &HashMap::new(),
+                port_map: &ServicePortMap::new(),
+                color_map: &HashMap::new(),
+                service_names: &service_names,
+                initial_ready: &HashMap::new(),
+                children: &children,
+                shutdown_state: &Arc::new(AtomicU8::new(0)),
+                event_tx: &Some(tx),
+                command_controller: None,
+                initial_publication_complete: true,
+                initial_endpoints: ServiceEndpointMap::new(),
+                on_all_ready: None,
+                on_endpoint_changed: None,
+            };
+            let mut states = HashMap::from([(
+                "worker".into(),
+                ServiceRuntimeState::initial(None, true, Instant::now()),
+            )]);
+            let mut publication = EndpointPublication {
+                initial_complete: true,
+                initial_endpoints: ServiceEndpointMap::new(),
+                on_all_ready: None,
+                on_endpoint_changed: None,
+            };
+            let job = RestartJob {
+                name: "worker".into(),
+                child_pid: pid,
+                cancel: Arc::new(AtomicBool::new(false)),
+                readiness: Some(std::thread::spawn(|| Err("readiness cancelled".into()))),
+            };
+            while !job.readiness.as_ref().unwrap().is_finished() {
+                std::thread::yield_now();
+            }
+            settle_restart_job(&context, &mut states, &mut publication, job).unwrap();
+            if code == 0 {
+                assert_eq!(states["worker"].goal, ServiceGoal::Completed);
+                assert!(!states["worker"].has_pending_work());
+            } else {
+                assert_eq!(
+                    states["worker"].terminal_error.as_deref(),
+                    Some("exited with code 7")
+                );
+            }
+            let expected = if code == 0 {
+                ServiceStatus::Stopped
+            } else {
+                ServiceStatus::Crashed(code)
+            };
+            assert!(rx.try_iter().any(|event| matches!(event,
+                OrchestratorEvent::StatusChange { status, .. } if status == expected)));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn obsolete_restart_cannot_remove_a_later_child_with_the_same_service_name() {
+        let mut old = std::process::Command::new("sh")
+            .args(["-c", "exit 0"])
+            .spawn()
+            .unwrap();
+        old.wait().unwrap();
+        let mut current = std::process::Command::new("sh")
+            .args(["-c", "exit 0"])
+            .spawn()
+            .unwrap();
+        current.wait().unwrap();
+        let current_pid = current.id();
+        let children = Arc::new(Mutex::new(vec![("service".into(), current)]));
+        assert!(take_exited_service(&children, "service", old.id()).is_none());
+        assert_eq!(children.lock().len(), 1);
+        assert!(restart_child_stopped(&children, "service", old.id()));
+        assert!(
+            take_exited_service(&children, "service", current_pid)
+                .unwrap()
+                .success()
+        );
+    }
+
+    #[test]
+    fn slow_readiness_and_backoff_do_not_reset_restart_attempts() {
+        let now = Instant::now();
+        let mut state = ServiceRuntimeState {
+            goal: ServiceGoal::Running,
+            phase: ServicePhase::Starting,
+            restart_attempts: 7,
+            terminal_error: None,
+        };
+        assert_eq!(
+            schedule_restart(&mut state, now),
+            RestartDecision::Scheduled {
+                delay_secs: 30,
+                attempt: 8
+            }
+        );
+    }
+
+    #[test]
+    fn retry_budget_resets_only_after_more_than_sixty_seconds_ready() {
+        let now = Instant::now();
+        for (duration, attempt) in [
+            (Duration::from_secs(5), 8),
+            (Duration::from_secs(60), 8),
+            (Duration::from_secs(60) + Duration::from_nanos(1), 1),
+        ] {
+            let mut state = ServiceRuntimeState::initial(Some(now - duration), true, now);
+            state.restart_attempts = 7;
+            assert_eq!(
+                schedule_restart(&mut state, now),
+                RestartDecision::Scheduled {
+                    delay_secs: if attempt == 1 { 1 } else { 30 },
+                    attempt,
+                }
+            );
+        }
+    }
+
+    #[test]
     fn stable_service_resets_restart_attempts_before_scheduling() {
         let now = Instant::now();
         let mut state = ServiceRuntimeState {
             goal: ServiceGoal::Running,
-            phase: ServicePhase::Ready,
+            phase: ServicePhase::Ready(now - Duration::from_secs(61)),
             restart_attempts: 7,
-            last_failure: Some(now - Duration::from_secs(61)),
             terminal_error: None,
         };
 
@@ -1117,9 +1418,8 @@ mod tests {
         let now = Instant::now();
         let mut state = ServiceRuntimeState {
             goal: ServiceGoal::Running,
-            phase: ServicePhase::Ready,
+            phase: ServicePhase::Ready(now),
             restart_attempts: MAX_RESTART_ATTEMPTS,
-            last_failure: Some(now),
             terminal_error: None,
         };
 
@@ -1137,7 +1437,6 @@ mod tests {
             goal: ServiceGoal::StoppedByUser,
             phase: ServicePhase::Stopped,
             restart_attempts: 0,
-            last_failure: None,
             terminal_error: None,
         };
 
@@ -1149,7 +1448,7 @@ mod tests {
         let mut running = HashMap::from([("a".to_string(), true), ("b".to_string(), true)]);
         let mut processed = Vec::new();
 
-        process_restart_batch(
+        let jobs = start_restart_batch(
             vec!["a".to_string(), "b".to_string()],
             &mut running,
             |running, name| running.get(name).copied().unwrap_or(false),
@@ -1158,11 +1457,10 @@ mod tests {
                 if name == "a" {
                     running.insert("b".to_string(), false);
                 }
-                Ok::<Option<()>, ()>(Some(()))
+                Some(())
             },
-            |_, ()| Ok::<(), ()>(()),
-        )
-        .unwrap();
+        );
+        assert_eq!(jobs.len(), 1);
 
         assert_eq!(processed, vec!["a"]);
     }
@@ -1174,20 +1472,17 @@ mod tests {
             0,
         );
 
-        process_restart_batch(
+        let jobs = start_restart_batch(
             vec!["a".to_string(), "b".to_string()],
             &mut state,
             |state, name| state.0.get(name).copied().unwrap_or(false),
             |state, name| {
                 state.1 += 1;
-                Ok::<Option<String>, ()>(Some(name.to_string()))
+                Some(name.to_string())
             },
-            |state, _job| {
-                assert_eq!(state.1, 2, "every readiness job must already be active");
-                Ok::<(), ()>(())
-            },
-        )
-        .unwrap();
+        );
+        assert_eq!(state.1, 2);
+        assert_eq!(jobs, ["a", "b"]);
     }
 
     #[test]
@@ -1200,11 +1495,11 @@ mod tests {
         let states = HashMap::from([
             (
                 "cache".to_string(),
-                ServiceRuntimeState::initial(true, true, now),
+                ServiceRuntimeState::initial(Some(now), true, now),
             ),
             (
                 "db".to_string(),
-                ServiceRuntimeState::initial(false, true, now),
+                ServiceRuntimeState::initial(None, true, now),
             ),
         ]);
 
@@ -1226,7 +1521,7 @@ mod tests {
 
         let deadline = Instant::now() + Duration::from_secs(2);
         let status = loop {
-            if let Some(status) = take_exited_service(&children, "worker") {
+            if let Some(status) = take_exited_service(&children, "worker", root_pid) {
                 break status;
             }
             assert!(Instant::now() < deadline, "root process did not exit");

@@ -9,13 +9,15 @@ use crate::dev_endpoint::DevEndpoint;
 use crate::lpm_json::ServiceConfig;
 use crate::{ports, ready, service_graph};
 use lpm_common::{LocalTarget, LpmError, sanitize_terminal_inline};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
+#[cfg(windows)]
+use std::collections::HashSet;
 use std::path::{Component, Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
 
@@ -206,6 +208,8 @@ pub struct OrchestratorOptions {
     pub on_shutdown_started: Option<crate::ShutdownStartedCallback>,
     /// CLI port override for the primary service.
     pub primary_port: Option<u16>,
+    /// Numeric command port used only when no CLI, saved, or configured preference exists.
+    pub primary_command_port: Option<u16>,
     /// Allocate and verify an endpoint for the configured or implicit primary service.
     pub manage_primary_endpoint: bool,
     /// Public frontend port that child services must not bind.
@@ -494,6 +498,7 @@ fn group_has_exited_service(children: &Arc<Mutex<Vec<(String, Child)>>>, names: 
 }
 
 struct InitialServiceReadiness {
+    ready_at: Instant,
     duration: Option<Duration>,
     endpoint: Option<DevEndpoint>,
 }
@@ -560,12 +565,14 @@ fn wait_for_initial_service_readiness(
             std::thread::sleep(Duration::from_millis(10));
         }
         return Ok(InitialServiceReadiness {
+            ready_at: Instant::now(),
             duration: None,
             endpoint: None,
         });
     }
 
     Ok(InitialServiceReadiness {
+        ready_at: Instant::now(),
         duration: Some(started.elapsed()),
         endpoint,
     })
@@ -588,17 +595,22 @@ fn service_ready_url(config: &ServiceConfig, assigned_port: Option<u16>) -> Opti
         return Some(url.to_string());
     }
 
-    let scheme_end = url.find("://").map(|index| index + 3)?;
+    let Some(scheme_end) = url.find("://").map(|index| index + 3) else {
+        return Some(url.to_string());
+    };
     let authority_end = url[scheme_end..]
-        .find('/')
+        .find(['/', '?', '#'])
         .map_or(url.len(), |index| scheme_end + index);
     let authority = &url[scheme_end..authority_end];
     let port_separator = if authority.starts_with('[') {
         authority.rfind("]:").map(|index| index + 1)
     } else {
         authority.rfind(':')
-    }?;
-    if authority[port_separator + 1..].parse::<u16>().ok()? != configured_port {
+    };
+    let Some(port_separator) = port_separator else {
+        return Some(url.to_string());
+    };
+    if authority[port_separator + 1..].parse::<u16>().ok() != Some(configured_port) {
         return Some(url.to_string());
     }
 
@@ -1141,6 +1153,7 @@ fn assign_service_ports(
     active_services: &HashMap<String, ServiceConfig>,
     port_allocation: &mut ports::PortAllocation,
     primary_port: Option<u16>,
+    primary_command_port: Option<u16>,
     manage_primary_endpoint: bool,
     reserved_frontend_port: Option<u16>,
 ) -> Result<AssignedServicePorts, LpmError> {
@@ -1164,12 +1177,16 @@ fn assign_service_ports(
     for name in service_names {
         let config = &active_services[name];
         let is_primary = primary_service == Some(name.as_str());
+        let needs_managed_port = is_primary || config.host.is_some();
+        if !needs_managed_port && config.port.is_none() {
+            continue;
+        }
         let requested_port = is_primary
             .then_some(primary_port)
             .flatten()
             .or_else(|| port_overrides.get(name).copied())
-            .or(config.port);
-        let needs_managed_port = is_primary || config.host.is_some();
+            .or(config.port)
+            .or_else(|| is_primary.then_some(primary_command_port).flatten());
         let Some(port) =
             requested_port.or_else(|| needs_managed_port.then_some(HOST_ONLY_DEFAULT_PORT_START))
         else {
@@ -1299,6 +1316,7 @@ pub fn run_services_with_config(
         &active_services,
         &mut port_allocation,
         options.primary_port,
+        options.primary_command_port,
         options.manage_primary_endpoint,
         options.reserved_frontend_port,
     )?;
@@ -1311,7 +1329,8 @@ pub fn run_services_with_config(
     }
 
     // Build cross-service env
-    let cross_env = ports::build_cross_service_env(&port_map, options.https);
+    let cross_env =
+        ports::build_cross_service_env(active_services.keys(), &port_map, options.https);
 
     // Load .env files + vault + validate schema (unified loader)
     let dotenv = crate::script::load_script_env_without_schema(
@@ -1420,7 +1439,7 @@ pub fn run_services_with_config(
         // Start services in dependency order
         let mut startup_interrupted = false;
         let mut service_endpoints = ServiceEndpointMap::with_capacity(port_map.len());
-        let mut initial_ready = HashSet::with_capacity(active_services.len());
+        let mut initial_ready = HashMap::with_capacity(active_services.len());
 
         for group in &groups {
             if shutdown_state.load(Ordering::Relaxed) > 0 {
@@ -1599,7 +1618,7 @@ pub fn run_services_with_config(
                             &name,
                             ServiceStatus::Ready,
                         );
-                        initial_ready.insert(name);
+                        initial_ready.insert(name, readiness.ready_at);
                     }
                     Ok(Err(error)) => {
                         if shutdown_state.load(Ordering::Relaxed) > 0 {
@@ -2246,14 +2265,14 @@ fn cleanup_exited_service_tree(root_pid: u32) {
 
 fn terminate_unready_initial_services(
     children: &Arc<Mutex<Vec<(String, Child)>>>,
-    initial_ready: &HashSet<String>,
+    initial_ready: &HashMap<String, Instant>,
 ) {
     let mut unready = {
         let mut locked = children.lock();
         let mut retained = Vec::with_capacity(locked.len());
         let mut unready = Vec::new();
         for mut child in locked.drain(..) {
-            if initial_ready.contains(&child.0) || matches!(child.1.try_wait(), Ok(Some(_))) {
+            if initial_ready.contains_key(&child.0) || matches!(child.1.try_wait(), Ok(Some(_))) {
                 retained.push(child);
             } else {
                 unready.push(child.1);
@@ -2635,6 +2654,30 @@ mod tests {
     }
 
     #[test]
+    fn saved_assignment_does_not_give_a_portless_worker_a_listener() {
+        let home = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let services = HashMap::from([("worker".to_string(), simple_service("node worker.js"))]);
+        let mut allocation = ports::PortAllocation::acquire_for_root_and_lease_dir(
+            lpm_common::LpmRoot::from_dir(home.path().join(".lpm")),
+            home.path().join("port-leases"),
+        )
+        .unwrap();
+        allocation.write_override(project.path(), "worker", 43210);
+        let assigned = assign_service_ports(
+            project.path(),
+            &services,
+            &mut allocation,
+            None,
+            None,
+            false,
+            None,
+        )
+        .unwrap();
+        assert!(assigned.port_map.is_empty());
+    }
+
+    #[test]
     fn empty_services_succeeds() {
         let services = HashMap::new();
         let options = OrchestratorOptions::default();
@@ -2691,6 +2734,44 @@ mod tests {
             service_ready_url(&config, Some(3001)).as_deref(),
             Some("http://127.0.0.1:3001/health?full=1")
         );
+    }
+
+    #[test]
+    fn service_ready_url_preserves_an_independent_default_http_port() {
+        for url in [
+            "http://localhost/health",
+            "http://127.0.0.1/health",
+            "http://[::1]/health",
+        ] {
+            let config = ServiceConfig {
+                port: Some(3000),
+                ready_url: Some(url.into()),
+                ..Default::default()
+            };
+            assert_eq!(service_ready_url(&config, Some(3001)).as_deref(), Some(url));
+        }
+    }
+
+    #[test]
+    fn readiness_url_remapping_preserves_ipv6_and_invalid_explicit_ports() {
+        for (input, output) in [
+            (
+                "http://[::1]:3000/health?deep=1",
+                "http://[::1]:3001/health?deep=1",
+            ),
+            ("http://localhost:bad/health", "http://localhost:bad/health"),
+            ("http://localhost:80/health", "http://localhost:80/health"),
+        ] {
+            let config = ServiceConfig {
+                port: Some(3000),
+                ready_url: Some(input.into()),
+                ..Default::default()
+            };
+            assert_eq!(
+                service_ready_url(&config, Some(3001)).as_deref(),
+                Some(output)
+            );
+        }
     }
 
     #[test]
@@ -2891,9 +2972,16 @@ mod tests {
             dir.path().join("port-leases"),
         )
         .unwrap();
-        let assigned_ports =
-            assign_service_ports(dir.path(), &services, &mut allocation, None, false, None)
-                .unwrap();
+        let assigned_ports = assign_service_ports(
+            dir.path(),
+            &services,
+            &mut allocation,
+            None,
+            None,
+            false,
+            None,
+        )
+        .unwrap();
 
         assert_eq!(assigned_ports.port_map.get("web"), Some(&port));
         assert!(assigned_ports.reassignments.is_empty());
@@ -2920,9 +3008,16 @@ mod tests {
             dir.path().join("port-leases"),
         )
         .unwrap();
-        let assigned_ports =
-            assign_service_ports(dir.path(), &services, &mut allocation, None, false, None)
-                .unwrap();
+        let assigned_ports = assign_service_ports(
+            dir.path(),
+            &services,
+            &mut allocation,
+            None,
+            None,
+            false,
+            None,
+        )
+        .unwrap();
 
         let assigned = assigned_ports.port_map["web"];
         assert_ne!(assigned, port);
@@ -2941,8 +3036,16 @@ mod tests {
             dir.path().join("port-leases"),
         )
         .unwrap();
-        let assigned_ports =
-            assign_service_ports(dir.path(), &services, &mut allocation, None, true, None).unwrap();
+        let assigned_ports = assign_service_ports(
+            dir.path(),
+            &services,
+            &mut allocation,
+            None,
+            None,
+            true,
+            None,
+        )
+        .unwrap();
 
         assert!(assigned_ports.port_map.contains_key("web"));
     }
@@ -2966,8 +3069,16 @@ mod tests {
             dir.path().join("port-leases"),
         )
         .unwrap();
-        let assigned_ports =
-            assign_service_ports(dir.path(), &services, &mut allocation, None, true, None).unwrap();
+        let assigned_ports = assign_service_ports(
+            dir.path(),
+            &services,
+            &mut allocation,
+            None,
+            None,
+            true,
+            None,
+        )
+        .unwrap();
 
         assert!(assigned_ports.port_map.contains_key("web"));
         assert!(!assigned_ports.port_map.contains_key("api"));

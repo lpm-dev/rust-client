@@ -1,3 +1,5 @@
+mod primary_endpoint;
+
 use super::dev_ui;
 use crate::install_ui;
 use lpm_common::color::Painted;
@@ -1764,9 +1766,13 @@ pub async fn run(
                     "multi-service configuration disappeared before startup".to_string(),
                 )
             })?;
-            let primary_service = lpm_runner::service_graph::primary_service_name(&config.services)
-                .map_err(LpmError::Script)?
-                .map(str::to_string);
+            let primary = primary_endpoint::select(
+                project_dir,
+                config,
+                requested_port.is_some() || https || network || tunnel,
+            )?;
+            let primary_command_port = primary.as_ref().and_then(|primary| primary.command_port);
+            let primary_service = primary.map(|primary| primary.name);
             let service_runtime_hints =
                 prepare_service_runtime_hints(project_dir, &config.services, &runtime_hint).await?;
             let dashboard_services = if dashboard {
@@ -1783,27 +1789,34 @@ pub async fn run(
             Ok::<_, LpmError>((
                 config,
                 primary_service,
+                primary_command_port,
                 service_runtime_hints,
                 dashboard_services,
                 hosts_file_lease,
             ))
         }
         .await;
-        let (config, primary_service, service_runtime_hints, dashboard_services, hosts_file_lease) =
-            match preparation {
-                Ok(preparation) => preparation,
-                Err(error) => {
-                    return cleanup_failed_multi_service_preparation(
-                        error,
-                        tunnel_handle,
-                        tunnel_shutdown_boundary.as_ref(),
-                        capture_consumer_handle,
-                        multi_inspector_state,
-                        inspector_handle,
-                    )
-                    .await;
-                }
-            };
+        let (
+            config,
+            primary_service,
+            primary_command_port,
+            service_runtime_hints,
+            dashboard_services,
+            hosts_file_lease,
+        ) = match preparation {
+            Ok(preparation) => preparation,
+            Err(error) => {
+                return cleanup_failed_multi_service_preparation(
+                    error,
+                    tunnel_handle,
+                    tunnel_shutdown_boundary.as_ref(),
+                    capture_consumer_handle,
+                    multi_inspector_state,
+                    inspector_handle,
+                )
+                .await;
+            }
+        };
         let services = &config.services;
         print_startup_banner(&startup, project_dir);
         let open_browser = primary_service.is_some() && should_open_browser(true, no_open, is_ci());
@@ -2166,6 +2179,7 @@ pub async fn run(
             on_all_ready,
             on_endpoint_changed,
             primary_port: requested_port.filter(|_| !https),
+            primary_command_port,
             manage_primary_endpoint,
             reserved_frontend_port: requested_port.filter(|_| https),
         };

@@ -623,7 +623,7 @@ fn multi_service_dev_loads_the_explicit_environment_mode() {
         r#"{
             "services": {
                 "worker": {
-                    "command": "node record-env.js"
+                    "command": "node record-env.js", "primary": true
                 }
             }
         }"#,
@@ -673,7 +673,7 @@ fn multi_service_dev_scrubs_inherited_credentials() {
         r#"{
             "services": {
                 "worker": {
-                    "command": "node record-env.js"
+                    "command": "node record-env.js", "primary": true
                 }
             }
         }"#,
@@ -1514,7 +1514,7 @@ server.listen(Number(process.env.PORT), '127.0.0.1', () => setTimeout(()=>server
 #[test]
 fn dev_service_variables_cannot_reintroduce_runtime_injection_hooks() {
     let project = service_env_project(
-        serde_json::json!({"services":{"worker":{"command":"node record.js","env":{"NODE_OPTIONS":"--require ./hook.cjs","node_options":"blocked","BASH_ENV":"./shell-hook","ORDINARY_VALUE":"service"}}}}),
+        serde_json::json!({"services":{"worker":{"command":"node record.js","primary":true,"env":{"NODE_OPTIONS":"--require ./hook.cjs","node_options":"blocked","BASH_ENV":"./shell-hook","ORDINARY_VALUE":"service"}}}}),
     );
     project.write_file(
         "hook.cjs",
@@ -1544,7 +1544,7 @@ fn dev_service_variables_cannot_reintroduce_runtime_injection_hooks() {
 #[test]
 fn dev_schema_accepts_required_values_from_service_overrides() {
     let project = service_env_project(
-        serde_json::json!({"envSchema":{"vars":{"SERVICE_URL":{"required":true,"format":"url"}}},"services":{"worker":{"command":"node record.js","env":{"SERVICE_URL":"https://example.test"}}}}),
+        serde_json::json!({"envSchema":{"vars":{"SERVICE_URL":{"required":true,"format":"url"}}},"services":{"worker":{"command":"node record.js","primary":true,"env":{"SERVICE_URL":"https://example.test"}}}}),
     );
     let output = lpm(&project)
         .args(["dev", "--no-install", "--no-open", "--no-dashboard"])
@@ -1567,7 +1567,7 @@ fn dev_schema_rejects_invalid_service_overrides_before_spawn() {
         "SERVICE_URL"
     };
     let project = service_env_project(
-        serde_json::json!({"envSchema":{"vars":{"SERVICE_URL":{"required":true,"format":"url"}}},"services":{"worker":{"command":"node record.js","env":{override_key:"invalid"}}}}),
+        serde_json::json!({"envSchema":{"vars":{"SERVICE_URL":{"required":true,"format":"url"}}},"services":{"worker":{"command":"node record.js","primary":true,"env":{override_key:"invalid"}}}}),
     );
     project.write_file(".env", "SERVICE_URL=https://example.test\n");
     let output = lpm(&project)
@@ -1825,7 +1825,7 @@ fn dev_schema_checks_the_managed_port_that_the_single_server_receives() {
 fn dev_restarts_with_the_same_validated_and_filtered_service_environment() {
     let project = service_env_project(serde_json::json!({
         "envSchema":{"vars":{"SERVICE_URL":{"required":true,"format":"url"}}},
-        "services":{"worker":{"command":"node record.js","restart":true,"env":{"NODE_OPTIONS":"--require ./hook.cjs","SERVICE_URL":"https://example.test","ORDINARY_VALUE":"service"}}}
+        "services":{"worker":{"command":"node record.js","primary":true,"restart":true,"env":{"NODE_OPTIONS":"--require ./hook.cjs","SERVICE_URL":"https://example.test","ORDINARY_VALUE":"service"}}}
     }));
     project.write_file(
         "hook.cjs",
@@ -1856,4 +1856,226 @@ server.listen(Number(process.env.PORT),'127.0.0.1',()=>setTimeout(()=>server.clo
         );
     }
     assert!(!project.file_exists("hook.txt"));
+}
+
+#[test]
+fn dev_keeps_a_single_worker_portless() {
+    let project = service_env_project(serde_json::json!({
+        "services": {"worker": {"command":"node worker.js", "readyTimeout":1}}
+    }));
+    project.write_file(
+        "worker.js",
+        r#"
+require('fs').writeFileSync('worker-env.json',JSON.stringify({port:process.env.PORT}));
+setTimeout(()=>{}, 1500);
+"#,
+    );
+    let output = lpm(&project)
+        .env_remove("PORT")
+        .args(["dev", "--no-install", "--no-open", "--no-dashboard"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(project.read_file("worker-env.json"), "{}");
+}
+
+#[test]
+fn dev_gives_portless_workers_the_final_peer_addresses() {
+    let occupied = (43_000..45_000)
+        .find_map(|port| TcpListener::bind(("127.0.0.1", port)).ok())
+        .unwrap();
+    let requested = occupied.local_addr().unwrap().port();
+    let project = service_env_project(serde_json::json!({
+        "services": {
+            "api": {"command":"node api.js", "port":requested, "readyTimeout":5},
+            "worker": {"command":"node worker.js", "dependsOn":["api"]}
+        }
+    }));
+    project.write_file(
+        "api.js",
+        r#"
+const http=require('http');const fs=require('fs');
+const server=http.createServer((req,res)=>res.end('ok'));
+server.listen(Number(process.env.PORT),'127.0.0.1',()=>{
+fs.writeFileSync('api-port.txt',process.env.PORT);
+setTimeout(()=>server.close(),1500);
+});
+"#,
+    );
+    project.write_file("worker.js", r#"
+require('fs').writeFileSync('peer-env.json',JSON.stringify({apiPort:process.env.API_PORT,apiUrl:process.env.API_URL,port:process.env.PORT,selfUrl:process.env.WORKER_URL}));
+setTimeout(()=>{},500);
+"#);
+    let output = lpm(&project)
+        .env_remove("PORT")
+        .env_remove("API_PORT")
+        .env_remove("API_URL")
+        .env_remove("WORKER_URL")
+        .args(["dev", "--no-install", "--no-open", "--no-dashboard"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let assigned = project.read_file("api-port.txt");
+    assert_ne!(assigned, requested.to_string());
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&project.read_file("peer-env.json")).unwrap(),
+        serde_json::json!({"apiPort":assigned,"apiUrl":format!("http://localhost:{assigned}")})
+    );
+}
+
+#[test]
+fn dev_uses_a_single_services_numeric_command_port_as_its_preference() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    drop(listener);
+    let project = service_env_project(
+        serde_json::json!({"services":{"api":{"command":format!("node server.js --port {port}"),"readyTimeout":5}}}),
+    );
+    project.write_file(
+        "server.js",
+        r#"
+const http=require('http');
+require('fs').writeFileSync('port.txt',process.env.PORT ?? 'missing');
+const server=http.createServer((req,res)=>res.end('ok'));
+server.listen(Number(process.argv[3]),'127.0.0.1',()=>setTimeout(()=>server.close(),1000));
+"#,
+    );
+    let output = lpm(&project)
+        .args(["dev", "--no-install", "--no-open", "--no-dashboard"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(project.read_file("port.txt"), port.to_string());
+}
+
+#[test]
+fn dev_slow_restart_readiness_does_not_block_an_independent_recovery() {
+    let a = TcpListener::bind("127.0.0.1:0").unwrap();
+    let b = TcpListener::bind("127.0.0.1:0").unwrap();
+    let a_port = a.local_addr().unwrap().port();
+    let b_port = b.local_addr().unwrap().port();
+    drop((a, b));
+    let project = service_env_project(serde_json::json!({
+        "services": {
+            "a": {"command":format!("node recovering.js a {a_port}"),"readyUrl":format!("http://127.0.0.1:{a_port}/"),"readyTimeout":8,"restart":true},
+            "b": {"command":format!("node recovering.js b {b_port}"),"readyUrl":format!("http://127.0.0.1:{b_port}/"),"readyTimeout":8,"restart":true},
+            "dependent": {"command":"node dependent.js","dependsOn":["b"]}
+        }
+    }));
+    project.write_file("recovering.js", r#"
+const fs=require('fs'),http=require('http');
+const name=process.argv[2],port=Number(process.argv[3]);
+const count=fs.existsSync(name+'-count') ? Number(fs.readFileSync(name+'-count'))+1 : 1;
+fs.writeFileSync(name+'-count',String(count));
+const server=http.createServer((req,res)=>res.end('ok'));
+const start=()=>server.listen(port,'127.0.0.1',()=>{
+  if(count===1){const timer=setInterval(()=>{if(fs.existsSync('crash')){clearInterval(timer);server.close(()=>process.exit(1));}},10);}
+  else {if(name==='b')fs.writeFileSync('b-ready-at',String(Date.now()));const timer=setInterval(()=>{if(fs.existsSync('dependent-recovered')){clearInterval(timer);setTimeout(()=>server.close(),500);}},10);}
+});
+if(count>1 && name==='a'){const timer=setInterval(()=>{if(fs.existsSync('dependent-recovered')){clearInterval(timer);start();}},10);}else start();
+"#);
+    project.write_file("dependent.js", r#"
+const fs=require('fs');
+if(fs.existsSync('crash')){fs.writeFileSync('dependent-recovered',String(Date.now()));setTimeout(()=>{},500);}
+else{setTimeout(()=>fs.writeFileSync('crash','yes'),500);setInterval(()=>{},1000);}
+"#);
+    let output = lpm(&project)
+        .timeout(std::time::Duration::from_secs(30))
+        .args(["dev", "--no-install", "--no-open", "--no-dashboard"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let ready: u64 = project.read_file("b-ready-at").parse().unwrap();
+    let resumed: u64 = project.read_file("dependent-recovered").parse().unwrap();
+    assert!(
+        resumed.saturating_sub(ready) < 5000,
+        "independent recovery waited {}ms behind a slow readiness check\n{}",
+        resumed.saturating_sub(ready),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+#[cfg(unix)]
+fn dev_assigns_a_port_to_a_framework_script_in_the_service_directory() {
+    use std::os::unix::fs::PermissionsExt;
+    let project = service_env_project(
+        serde_json::json!({"services":{"web":{"command":"npm run dev","cwd":"web"}}}),
+    );
+    project.write_file(
+        "web/package.json",
+        r#"{"name":"web","version":"1.0.0","scripts":{"dev":"vite"}}"#,
+    );
+    project.write_file("web/node_modules/.bin/vite",r#"#!/usr/bin/env node
+const fs=require('fs'), http=require('http');
+fs.writeFileSync('framework-port.json',JSON.stringify({port:process.env.PORT,args:process.argv.slice(2)}));
+const server=http.createServer((req,res)=>res.end('ok'));
+server.listen(Number(process.env.PORT),'127.0.0.1',()=>setTimeout(()=>server.close(),1500));
+"#);
+    std::fs::set_permissions(
+        project.path().join("web/node_modules/.bin/vite"),
+        std::fs::Permissions::from_mode(0o755),
+    )
+    .unwrap();
+    let output = lpm(&project)
+        .env_remove("PORT")
+        .args(["dev", "--no-install", "--no-open", "--no-dashboard"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let env: serde_json::Value =
+        serde_json::from_str(&project.read_file("web/framework-port.json")).unwrap();
+    assert!(env["port"].as_str().unwrap().parse::<u16>().unwrap() > 0);
+    assert_eq!(
+        env["args"],
+        serde_json::json!(["--port", env["port"], "--strictPort"])
+    );
+}
+
+#[test]
+#[cfg(unix)]
+fn dev_expands_a_generic_services_managed_command_port() {
+    let project = service_env_project(
+        serde_json::json!({"services":{"api":{"command":"node server.js --port $PORT"}}}),
+    );
+    project.write_file("server.js",r#"
+const fs=require('fs'),http=require('http');
+fs.writeFileSync('managed-port.json',JSON.stringify({port:process.env.PORT,argument:process.argv[3]}));
+const server=http.createServer((req,res)=>res.end('ok'));
+server.listen(Number(process.argv[3]),'127.0.0.1',()=>setTimeout(()=>server.close(),1500));
+"#);
+    let output = lpm(&project)
+        .env_remove("PORT")
+        .args(["dev", "--no-install", "--no-open", "--no-dashboard"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let env: serde_json::Value =
+        serde_json::from_str(&project.read_file("managed-port.json")).unwrap();
+    assert!(env["port"].as_str().unwrap().parse::<u16>().unwrap() > 0);
+    assert_eq!(env["port"], env["argument"]);
 }

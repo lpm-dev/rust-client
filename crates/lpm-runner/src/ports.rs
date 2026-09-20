@@ -2194,15 +2194,16 @@ pub(crate) fn descendant_process_ids_from_pairs(
 /// Example: services "web" (port 3000) and "api" (port 4000)
 /// - web gets: API_URL=http://localhost:4000, API_PORT=4000
 /// - api gets: WEB_URL=http://localhost:3000, WEB_PORT=3000
-pub fn build_cross_service_env(
+pub fn build_cross_service_env<'a>(
+    targets: impl Iterator<Item = &'a String>,
     services: &HashMap<String, u16>,
     https: bool,
 ) -> HashMap<String, HashMap<String, String>> {
     let scheme = if https { "https" } else { "http" };
     let mut result: HashMap<String, HashMap<String, String>> = HashMap::new();
 
-    for name in services.keys() {
-        result.insert(name.clone(), HashMap::new());
+    for name in targets {
+        result.insert(name.clone(), HashMap::with_capacity(services.len() * 2));
     }
 
     for (source_name, &source_port) in services {
@@ -5669,7 +5670,7 @@ tcp4 0 0 127.0.0.1.60000 127.0.0.1.443 ESTABLISHED 1 2 3 4 node:99 00100\n",
         services.insert("web".to_string(), 3000u16);
         services.insert("api".to_string(), 4000u16);
 
-        let env = build_cross_service_env(&services, false);
+        let env = build_cross_service_env(services.keys(), &services, false);
 
         // web should have API_URL and API_PORT
         let web_env = &env["web"];
@@ -5836,7 +5837,7 @@ tcp4 0 0 127.0.0.1.60000 127.0.0.1.443 ESTABLISHED 1 2 3 4 node:99 00100\n",
         services.insert("web".to_string(), 3000u16);
         services.insert("api".to_string(), 4000u16);
 
-        let env = build_cross_service_env(&services, true);
+        let env = build_cross_service_env(services.keys(), &services, true);
         assert_eq!(env["web"].get("API_URL").unwrap(), "https://localhost:4000");
     }
 }
