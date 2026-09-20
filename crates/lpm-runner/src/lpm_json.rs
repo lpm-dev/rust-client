@@ -68,6 +68,10 @@ pub struct LpmJsonConfig {
     /// Dev services for multi-process orchestration.
     /// e.g., `{"web": {"command": "next dev", "port": 3000}}`
     #[serde(default, deserialize_with = "deserialize_unique_services")]
+    #[schemars(extend(
+        "maxProperties" = 256,
+        "propertyNames" = {"type": "string", "pattern": "^[A-Za-z][A-Za-z0-9_-]{0,63}$"}
+    ))]
     pub services: HashMap<String, ServiceConfig>,
 
     /// Dev reverse-proxy configuration for friendly local hostnames.
@@ -465,10 +469,12 @@ pub struct GitlabPublishConfig {
 #[schemars(deny_unknown_fields)]
 pub struct ServiceConfig {
     /// Shell command to run.
+    #[schemars(regex(pattern = r"\S"))]
     pub command: String,
 
     /// Port this service listens on; omitted host-only services get a stable auto-assigned port.
     #[serde(default)]
+    #[schemars(range(min = 1, max = 65535))]
     pub port: Option<u16>,
 
     /// Services that must be ready before this one starts.
@@ -477,6 +483,7 @@ pub struct ServiceConfig {
 
     /// TCP port to check for readiness (defaults to `port` if set).
     #[serde(default, rename = "readyPort")]
+    #[schemars(range(min = 1, max = 65535))]
     pub ready_port: Option<u16>,
 
     /// HTTP URL to poll for readiness (2xx = ready).
@@ -485,6 +492,7 @@ pub struct ServiceConfig {
 
     /// Seconds to wait for readiness (default: 30).
     #[serde(default = "default_ready_timeout", rename = "readyTimeout")]
+    #[schemars(range(min = 1, max = 3600))]
     pub ready_timeout: u64,
 
     /// Extra environment variables for this service.
@@ -815,18 +823,18 @@ pub fn read_lpm_json(project_dir: &Path) -> Result<Option<LpmJsonConfig>, String
 
 /// Parse and validate an `lpm.json` document that was read by the caller.
 pub fn parse_lpm_json(content: &str) -> Result<LpmJsonConfig, String> {
-    let mut config: LpmJsonConfig =
-        serde_json::from_str(content).map_err(|error| match error.classify() {
-            serde_json::error::Category::Syntax | serde_json::error::Category::Eof => {
-                format!("failed to parse lpm.json: {error}")
-            }
-            serde_json::error::Category::Data => {
-                format!("invalid lpm.json data: {error}")
-            }
-            serde_json::error::Category::Io => {
-                format!("failed to read lpm.json: {error}")
-            }
-        })?;
+    let mut config: LpmJsonConfig = serde_json::from_str(lpm_common::strip_utf8_bom_str(content))
+        .map_err(|error| match error.classify() {
+        serde_json::error::Category::Syntax | serde_json::error::Category::Eof => {
+            format!("failed to parse lpm.json: {error}")
+        }
+        serde_json::error::Category::Data => {
+            format!("invalid lpm.json data: {error}")
+        }
+        serde_json::error::Category::Io => {
+            format!("failed to read lpm.json: {error}")
+        }
+    })?;
 
     validate_task_cache_globs(&config)?;
 
@@ -873,9 +881,9 @@ fn validate_dev_services(services: &HashMap<String, ServiceConfig>) -> Result<()
                 ));
             }
         }
-        if service.ready_timeout > MAX_READY_TIMEOUT_SECS {
+        if !(1..=MAX_READY_TIMEOUT_SECS).contains(&service.ready_timeout) {
             return Err(format!(
-                "invalid lpm.json data: services.{name}.readyTimeout must not exceed {MAX_READY_TIMEOUT_SECS} seconds"
+                "invalid lpm.json data: services.{name}.readyTimeout must be between 1 and {MAX_READY_TIMEOUT_SECS} seconds"
             ));
         }
         if let Some(url) = service.ready_url.as_deref() {
@@ -1053,6 +1061,22 @@ pub fn extract_mode_from_env_path(env_path: &str) -> Option<&str> {
 mod tests {
     use super::*;
     use std::fs;
+
+    #[test]
+    fn bom_prefixed_configuration_preserves_service_validation() {
+        let valid =
+            "\u{feff}{\"services\":{\"web\":{\"command\":\"node server.js\",\"readyTimeout\":1}}}";
+        assert_eq!(
+            parse_lpm_json(valid).unwrap().services["web"].ready_timeout,
+            1
+        );
+        let invalid = valid.replace("\"readyTimeout\":1", "\"readyTimeout\":0");
+        assert!(
+            parse_lpm_json(&invalid)
+                .unwrap_err()
+                .contains("readyTimeout")
+        );
+    }
 
     #[test]
     fn generated_schema_contains_documented_env_metadata_fields() {

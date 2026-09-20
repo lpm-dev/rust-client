@@ -2079,3 +2079,30 @@ server.listen(Number(process.argv[3]),'127.0.0.1',()=>setTimeout(()=>server.clos
     assert!(env["port"].as_str().unwrap().parse::<u16>().unwrap() > 0);
     assert_eq!(env["port"], env["argument"]);
 }
+
+#[test]
+fn dev_rejects_zero_readiness_timeout_before_starting_a_service() {
+    let project = TempProject::empty(r#"{"name":"invalid-readiness","version":"1.0.0"}"#);
+    project.write_file(
+        "lpm.json",
+        r#"{"services":{"web":{"command":"node should-not-run.js","readyTimeout":0}}}"#,
+    );
+    project.write_file(
+        "should-not-run.js",
+        "require('fs').writeFileSync('spawned.txt', 'yes');",
+    );
+    let output = lpm(&project)
+        .args(["dev", "--no-install", "--no-open", "--no-dashboard"])
+        .timeout(std::time::Duration::from_secs(15))
+        .output()
+        .unwrap();
+    assert!(
+        !output.status.success(),
+        "zero timeout accepted: {output:?}"
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("readyTimeout"),
+        "{output:?}"
+    );
+    assert!(!project.file_exists("spawned.txt"));
+}

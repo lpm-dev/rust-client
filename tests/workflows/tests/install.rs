@@ -19116,3 +19116,27 @@ async fn install_retries_legacy_pool_roots_after_an_old_registry_rejects_graphs(
     assert_eq!(reports.len(), 4);
     assert_eq!(reports[1].body, reports[3].body);
 }
+
+#[test]
+fn install_rejects_malformed_runtime_configuration_instead_of_ignoring_it() {
+    for config in [
+        "{broken",
+        r#"{"runtime":{"node":22}}"#,
+        r#"{"runtime":true}"#,
+        r#"{"runtime":{"bun":null}}"#,
+    ] {
+        let project = TempProject::empty(r#"{"name":"invalid-runtime","version":"1.0.0"}"#);
+        project.write_file("lpm.json", config);
+        let output = lpm(&project)
+            .args(["install", "--offline", "--json"])
+            .output()
+            .unwrap();
+        assert!(!output.status.success(), "accepted {config}: {output:?}");
+        let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("JSON error");
+        assert_eq!(json["success"], false);
+        assert!(
+            json["error"].as_str().unwrap().contains("lpm.json"),
+            "{json}"
+        );
+    }
+}
