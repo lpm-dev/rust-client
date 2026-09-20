@@ -612,3 +612,252 @@ async fn plus_list_omits_annotation_when_latest_is_prerelease() {
         "pre-release newest must not surface as `(vX available)`:\n{combined}"
     );
 }
+
+#[test]
+fn strict_deps_rejects_undeclared_imports_in_empty_and_offline_installs() {
+    for json in [false, true] {
+        for offline in [false, true] {
+            let project =
+                TempProject::empty(r#"{"name":"strict-app","lpm":{"strictDeps":"strict"}}"#);
+            project.write_file(
+                "src/index.js",
+                "import missing from 'undeclared-dependency';\n",
+            );
+            let mut command = support::lpm(&project);
+            command.args([
+                "install",
+                "--no-security-summary",
+                "--no-skills",
+                "--no-editor-setup",
+            ]);
+            if json {
+                command.arg("--json");
+            }
+            if offline {
+                command.arg("--offline");
+            }
+            let output = command.output().unwrap();
+            assert!(
+                !output.status.success(),
+                "strict install accepted undeclared import (json={json}, offline={offline}): {output:?}"
+            );
+            let diagnostic = if json {
+                let envelope: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+                assert_eq!(envelope["success"], false);
+                envelope["error"].as_str().unwrap().to_owned()
+            } else {
+                String::from_utf8_lossy(&output.stderr).into_owned()
+            };
+            assert!(
+                diagnostic.contains("strictDeps") && diagnostic.contains("undeclared-dependency"),
+                "{diagnostic}"
+            );
+            assert!(
+                !project.file_exists("lpm.lock"),
+                "invalid imports must fail before installation"
+            );
+        }
+    }
+}
+
+#[test]
+fn strict_deps_rejects_unknown_mode_before_install() {
+    let project = TempProject::empty(r#"{"name":"invalid-mode","lpm":{"strictDeps":"strcit"}}"#);
+    let output = support::lpm(&project)
+        .args(["install", "--offline", "--json"])
+        .output()
+        .unwrap();
+    assert!(
+        !output.status.success(),
+        "invalid mode was accepted: {output:?}"
+    );
+    let envelope: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let error = envelope["error"].as_str().unwrap();
+    assert!(
+        error.contains("strictDeps") && error.contains("strict, warn, loose"),
+        "{error}"
+    );
+}
+
+#[tokio::test]
+async fn strict_deps_checks_source_edits_on_warm_and_offline_installs() {
+    let mock = MockRegistry::start().await;
+    mock.with_manifest_package(
+        serde_json::json!({"name":"declared","version":"1.0.0"}),
+        &[],
+    )
+    .await;
+    let project = TempProject::empty(
+        r#"{"name":"strict-app","dependencies":{"declared":"1.0.0"},"lpm":{"strictDeps":"strict"}}"#,
+    );
+    project.write_file("src/index.js", "import value from 'declared';\n");
+    lpm_with_registry(&project, &mock.url())
+        .args([
+            "install",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .assert()
+        .success();
+    let lockfile = project.read_file("lpm.lock");
+    project.write_file(
+        "src/index.js",
+        "import missing from 'undeclared-dependency';\n",
+    );
+    for extra in [&[][..], &["--offline"][..], &["--force"][..]] {
+        let output = lpm_with_registry(&project, &mock.url())
+            .args([
+                "install",
+                "--json",
+                "--no-security-summary",
+                "--no-skills",
+                "--no-editor-setup",
+            ])
+            .args(extra)
+            .output()
+            .unwrap();
+        assert!(
+            !output.status.success(),
+            "strict install skipped changed sources ({extra:?}): {output:?}"
+        );
+        let envelope: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert!(
+            envelope["error"]
+                .as_str()
+                .unwrap()
+                .contains("undeclared-dependency"),
+            "{envelope}"
+        );
+        assert_eq!(project.read_file("lpm.lock"), lockfile);
+    }
+}
+
+#[test]
+fn strict_deps_respects_aliases_builtins_self_imports_and_package_boundaries() {
+    let project = TempProject::empty(r#"{"name":"strict-app","lpm":{"strictDeps":"strict"}}"#);
+    project.write_file(
+        "tsconfig.json",
+        r#"{"compilerOptions":{"paths":{"@/*":["./src/*"]}}}"#,
+    );
+    project.write_file("src/index.ts", "import fs from 'node:fs';\nimport self from 'strict-app/subpath';\nimport aliased from '@/local';\nimport local from './local';\n");
+    project.write_file("src/child/package.json", r#"{"name":"child"}"#);
+    project.write_file(
+        "src/child/index.js",
+        "import missing from 'child-dependency';\n",
+    );
+    support::lpm(&project)
+        .args(["install", "--offline", "--json"])
+        .assert()
+        .success();
+}
+
+#[test]
+fn strict_deps_reports_incomplete_source_analysis() {
+    let project = TempProject::empty(r#"{"name":"strict-app","lpm":{"strictDeps":"strict"}}"#);
+    project.write_file("src/index.js", "import { from 'broken';\n");
+    let output = support::lpm(&project)
+        .args(["install", "--offline", "--json"])
+        .output()
+        .unwrap();
+    assert!(
+        !output.status.success(),
+        "incomplete scan was accepted: {output:?}"
+    );
+    let envelope: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(
+        envelope["error"].as_str().unwrap().contains("strictDeps"),
+        "{envelope}"
+    );
+}
+
+#[tokio::test]
+async fn strict_deps_accepts_every_manifest_dependency_section() {
+    let mock = MockRegistry::start().await;
+    for name in ["direct", "development", "optional", "peer"] {
+        mock.with_manifest_package(serde_json::json!({"name":name,"version":"1.0.0"}), &[])
+            .await;
+    }
+    let project = TempProject::empty(
+        r#"{
+        "name":"strict-app",
+        "dependencies":{"direct":"1.0.0"},
+        "devDependencies":{"development":"1.0.0"},
+        "optionalDependencies":{"optional":"1.0.0"},
+        "peerDependencies":{"peer":"1.0.0"},
+        "lpm":{"strictDeps":"strict"}
+    }"#,
+    );
+    project.write_file("src/index.js", "import a from 'direct';\nimport b from 'development';\nimport c from 'optional';\nimport d from 'peer';\n");
+    lpm_with_registry(&project, &mock.url())
+        .args([
+            "install",
+            "--json",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .assert()
+        .success();
+}
+
+#[test]
+fn strict_deps_checks_filtered_workspace_member_sources() {
+    let project =
+        TempProject::empty(r#"{"name":"root","private":true,"workspaces":["packages/*"]}"#);
+    project.write_file(
+        "packages/app/package.json",
+        r#"{"name":"app","version":"1.0.0","lpm":{"strictDeps":"strict"}}"#,
+    );
+    project.write_file(
+        "packages/app/src/index.js",
+        "import missing from 'member-missing';\n",
+    );
+    let output = support::lpm(&project)
+        .args(["install", "--filter", "app", "--offline", "--json"])
+        .output()
+        .unwrap();
+    assert!(
+        !output.status.success(),
+        "member imports were skipped: {output:?}"
+    );
+    let envelope: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(
+        envelope.to_string().contains("member-missing"),
+        "{envelope}"
+    );
+}
+
+#[tokio::test]
+async fn strict_deps_warns_when_a_declared_peer_is_not_installed() {
+    let mock = MockRegistry::start().await;
+    mock.with_manifest_package(serde_json::json!({"name":"direct","version":"1.0.0"}), &[])
+        .await;
+    let project = TempProject::empty(
+        r#"{
+        "name":"strict-app",
+        "dependencies":{"direct":"1.0.0"},
+        "peerDependencies":{"missing-peer":"1.0.0"},
+        "lpm":{"strictDeps":"strict","autoInstallPeers":false}
+    }"#,
+    );
+    project.write_file("src/index.js", "import missing from 'missing-peer';\n");
+    let output = lpm_with_registry(&project, &mock.url())
+        .args([
+            "install",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "declared peer is an advisory: {output:?}"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("import(s) will fail at runtime") && stderr.contains("missing-peer"),
+        "missing availability warning: {output:?}"
+    );
+}

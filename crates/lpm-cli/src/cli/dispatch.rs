@@ -937,10 +937,7 @@ async fn async_main() -> Result<()> {
             // `--policy` string payload.
             //
             // Loading the config here (rather than inside
-            // `resolve_script_policy`) lets us surface a typo in
-            // `package.json > lpm > scriptPolicy` to the user. Warning
-            // emission is deferred until after resolve so the user sees
-            // the policy that actually took effect.
+            // `resolve_script_policy`) rejects malformed lifecycle controls.
             let script_policy_cfg =
                 script_policy_config::ScriptPolicyConfig::try_from_package_json(&cwd)?;
             // preserve the collapsed CLI override
@@ -962,16 +959,7 @@ async fn async_main() -> Result<()> {
                 "lpm install: effective script-policy = {}",
                 effective_script_policy.as_str()
             );
-            if let Some(invalid) = &script_policy_cfg.policy_parse_error
-                && !cli.json
-            {
-                output::warn(&format!(
-                    "package.json > lpm > scriptPolicy: invalid value '{invalid}' \
-                     (expected one of: deny, allow, triage); this key was \
-                     ignored — effective policy: {}",
-                    effective_script_policy.as_str(),
-                ));
-            }
+
 
             // build the SaveFlags struct from the per-command CLI
             // overrides. clap already enforces mutual exclusion between
@@ -1970,16 +1958,7 @@ async fn async_main() -> Result<()> {
                 "lpm rebuild: effective script-policy = {}",
                 effective.as_str()
             );
-            if let Some(invalid) = &script_policy_cfg.policy_parse_error
-                && !cli.json
-            {
-                output::warn(&format!(
-                    "package.json > lpm > scriptPolicy: invalid value '{invalid}' \
-                     (expected one of: deny, allow, triage); this key was \
-                     ignored — effective policy: {}",
-                    effective.as_str(),
-                ));
-            }
+
             commands::rebuild::run(
                 &cwd,
                 &packages,
@@ -2778,16 +2757,7 @@ async fn async_main() -> Result<()> {
                 "lpm ci: effective script-policy = {}",
                 effective_script_policy.as_str()
             );
-            if let Some(invalid) = &script_policy_cfg.policy_parse_error
-                && !cli.json
-            {
-                output::warn(&format!(
-                    "package.json > lpm > scriptPolicy: invalid value '{invalid}' \
-                     (expected one of: deny, allow, triage); this key was \
-                     ignored — effective policy: {}",
-                    effective_script_policy.as_str(),
-                ));
-            }
+
 
             let cli_linker = linker.map(LinkerCli::into_linker_mode);
             let root_lifecycle = commands::root_lifecycle::RootProjectLifecycle::load(&cwd)?;

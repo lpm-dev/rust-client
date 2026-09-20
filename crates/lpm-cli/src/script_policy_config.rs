@@ -118,12 +118,6 @@ pub struct ScriptPolicyConfig {
     /// value parses to `Some(ScriptPolicy::Deny)` so users can lock
     /// the default against a teammate's global override.
     ///
-    /// **Invalid values**: when `scriptPolicy` is present as a string
-    /// but doesn't parse (typo, wrong case, etc.), this field is
-    /// `None` AND [`Self::policy_parse_error`] holds the offending
-    /// input. Loader callers are expected to surface the error (via
-    /// [`crate::output::warn`] in non-JSON mode) so a shared-repo
-    /// typo doesn't silently produce per-developer policy divergence.
     pub policy: Option<ScriptPolicy>,
     /// `package.json > lpm > scripts.autoBuild`. Defaults to `false`.
     pub auto_build: bool,
@@ -134,17 +128,6 @@ pub struct ScriptPolicyConfig {
     /// `package.json > lpm > scripts.trustedScopes`. Glob patterns
     /// like `@myorg/*` that auto-approve by scope. Defaults to empty.
     pub trusted_scopes: Vec<String>,
-    /// The offending input when `scriptPolicy` was present as a string
-    /// but failed to parse. `None` when `scriptPolicy` was absent,
-    /// non-string, or parsed successfully. Callers surface this to the
-    /// user; the field is not consumed by the precedence resolver (an
-    /// unparseable value remains "unset" for precedence purposes,
-    /// matching the `policy: None` path).
-    ///
-    /// Separated from `policy` so consumers who only care about the
-    /// resolved value can ignore errors, while consumers responsible
-    /// for user-facing output can surface them.
-    pub policy_parse_error: Option<String>,
     /// `package.json > lpm > triageAdvisor`,
     /// if set. The string is stored verbatim (not parsed into a
     /// `Provider` here) so the resolver layer can normalise + warn
@@ -155,14 +138,9 @@ pub struct ScriptPolicyConfig {
 }
 
 impl ScriptPolicyConfig {
-    /// Read from `<project_dir>/package.json`. Missing file or
-    /// unreadable content yields [`Self::default`] (all keys absent or
-    /// at their defaults) — the install pipeline's own missing-manifest
-    /// handling surfaces the real error earlier; here we must return
-    /// something rather than panicking.
     #[cfg(test)]
     pub fn from_package_json(project_dir: &Path) -> Self {
-        Self::try_from_package_json(project_dir).unwrap_or_default()
+        Self::try_from_package_json(project_dir).expect("valid test script configuration")
     }
 
     /// Read project script policy while preserving configuration I/O failures.
@@ -176,70 +154,64 @@ impl ScriptPolicyConfig {
             Err(lpm_common::BoundedReadError::NotFound { .. }) => return Ok(Self::default()),
             Err(error) => return Err(error.into()),
         };
-        let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&content) else {
+        let parsed =
+            serde_json::from_str::<serde_json::Value>(lpm_common::strip_utf8_bom_str(&content))
+                .map_err(|error| {
+                    lpm_common::LpmError::Script(format!("{}: {error}", pkg_json_path.display()))
+                })?;
+        Self::from_package_json_value(&parsed)
+    }
+
+    pub(crate) fn from_package_json_value(
+        parsed: &serde_json::Value,
+    ) -> Result<Self, lpm_common::LpmError> {
+        let Some(lpm) = parsed.get("lpm") else {
             return Ok(Self::default());
         };
-
-        Ok(Self::from_package_json_value(&parsed))
-    }
-
-    pub(crate) fn from_package_json_value(parsed: &serde_json::Value) -> Self {
-        let lpm = parsed.get("lpm");
-        let scripts = lpm.and_then(|l| l.get("scripts"));
-
-        // Policy is the one key where "present but invalid" is
-        // meaningfully different from "absent": a typo in a team-
-        // shared package.json otherwise produces silent per-developer
-        // divergence. Capture the offending input in
-        // `policy_parse_error` so callers can warn.
-        let raw_policy = lpm
-            .and_then(|l| l.get("scriptPolicy"))
-            .and_then(|v| v.as_str());
-        let (policy, policy_parse_error) = match raw_policy {
-            None => (None, None),
-            Some(s) => match ScriptPolicy::parse(s) {
-                Ok(p) => (Some(p), None),
-                Err(e) => (None, Some(e.input)),
-            },
-        };
-
-        let auto_build = scripts
-            .and_then(|s| s.get("autoBuild"))
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false);
-
-        let deny_all = scripts
-            .and_then(|s| s.get("denyAll"))
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false);
-
-        let trusted_scopes = scripts
-            .and_then(|s| s.get("trustedScopes"))
-            .and_then(|v| v.as_array())
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|v| v.as_str().map(String::from))
-                    .collect()
+        let lpm = lpm.as_object().ok_or_else(|| {
+            lpm_common::LpmError::Script("package.json > lpm must be an object".into())
+        })?;
+        let policy = script_config_field::<ScriptPolicy>(lpm, "scriptPolicy", "lpm")?;
+        let scripts = lpm
+            .get("scripts")
+            .map(|value| {
+                value.as_object().ok_or_else(|| {
+                    lpm_common::LpmError::Script(
+                        "package.json > lpm > scripts must be an object".into(),
+                    )
+                })
             })
-            .unwrap_or_default();
-
-        // `package.json > lpm > triageAdvisor`.
-        // Stored as a raw string; the install resolver normalises and
-        // warns once if the slug is unknown.
-        let triage_advisor = lpm
-            .and_then(|l| l.get("triageAdvisor"))
-            .and_then(|v| v.as_str())
-            .map(String::from);
-
-        Self {
+            .transpose()?;
+        let mut config = Self {
             policy,
-            auto_build,
-            deny_all,
-            trusted_scopes,
-            policy_parse_error,
-            triage_advisor,
+            triage_advisor: script_config_field(lpm, "triageAdvisor", "lpm")?,
+            ..Self::default()
+        };
+        if let Some(scripts) = scripts {
+            config.auto_build =
+                script_config_field(scripts, "autoBuild", "lpm > scripts")?.unwrap_or(false);
+            config.deny_all =
+                script_config_field(scripts, "denyAll", "lpm > scripts")?.unwrap_or(false);
+            config.trusted_scopes =
+                script_config_field(scripts, "trustedScopes", "lpm > scripts")?.unwrap_or_default();
         }
+        Ok(config)
     }
+}
+
+fn script_config_field<T: serde::de::DeserializeOwned>(
+    object: &serde_json::Map<String, serde_json::Value>,
+    key: &str,
+    parent: &str,
+) -> Result<Option<T>, lpm_common::LpmError> {
+    object
+        .get(key)
+        .map(|value| {
+            serde_json::from_value(value.clone()).map_err(|error| {
+                lpm_common::LpmError::Script(format!("package.json > {parent} > {key}: {error}"))
+            })
+        })
+        .transpose()
 }
 
 /// Collapse the three clap-layer flags (`--policy=<val>`, `--yolo`,
@@ -306,11 +278,7 @@ pub fn collapse_policy_flags(
 ///
 /// `project_config` is a pre-loaded [`ScriptPolicyConfig`] (see
 /// [`ScriptPolicyConfig::try_from_package_json`]). Taking the loaded
-/// config rather than a path lets the caller inspect
-/// [`ScriptPolicyConfig::policy_parse_error`] and surface the typo via
-/// [`crate::output::warn`] before resolving — so a team-shared
-/// typo in `package.json > lpm > scriptPolicy` doesn't silently
-/// produce per-developer policy divergence.
+/// config rather than a path avoids reading the manifest again during resolution.
 pub fn resolve_script_policy(
     cli_override: Option<ScriptPolicy>,
     project_config: &ScriptPolicyConfig,
@@ -631,51 +599,28 @@ mod tests {
     }
 
     #[test]
-    fn from_package_json_invalid_script_policy_surfaces_parse_error() {
-        // A team-shared `package.json` with a typo in `scriptPolicy` must NOT
-        // silently fall through to per-developer global config.
-        // `policy` stays `None` (precedence falls through), but
-        // `policy_parse_error` carries the offending input so
-        // install.rs / build.rs can warn the user via
-        // `output::warn`.
+    fn from_package_json_invalid_script_policy_fails() {
         let dir = tempdir().unwrap();
         write_pkg_json(dir.path(), r#"{"lpm": {"scriptPolicy": "invalid"}}"#);
-        let cfg = ScriptPolicyConfig::from_package_json(dir.path());
-        assert_eq!(cfg.policy, None);
-        assert_eq!(
-            cfg.policy_parse_error.as_deref(),
-            Some("invalid"),
-            "invalid scriptPolicy value must be captured for user warning"
-        );
+        let error = ScriptPolicyConfig::try_from_package_json(dir.path()).unwrap_err();
+        assert!(error.to_string().contains("scriptPolicy"));
     }
 
     #[test]
-    fn from_package_json_valid_script_policy_has_no_parse_error() {
-        let dir = tempdir().unwrap();
-        write_pkg_json(dir.path(), r#"{"lpm": {"scriptPolicy": "triage"}}"#);
-        let cfg = ScriptPolicyConfig::from_package_json(dir.path());
-        assert_eq!(cfg.policy, Some(ScriptPolicy::Triage));
-        assert_eq!(cfg.policy_parse_error, None);
-    }
-
-    #[test]
-    fn from_package_json_absent_script_policy_has_no_parse_error() {
+    fn from_package_json_absent_script_policy_is_none() {
         let dir = tempdir().unwrap();
         write_pkg_json(dir.path(), r#"{"lpm": {}}"#);
-        let cfg = ScriptPolicyConfig::from_package_json(dir.path());
-        assert_eq!(cfg.policy, None);
         assert_eq!(
-            cfg.policy_parse_error, None,
-            "absence must not look like a parse error"
+            ScriptPolicyConfig::from_package_json(dir.path()).policy,
+            None
         );
     }
 
     #[test]
-    fn from_package_json_malformed_json_returns_defaults() {
+    fn from_package_json_malformed_json_fails() {
         let dir = tempdir().unwrap();
         write_pkg_json(dir.path(), "{not valid json");
-        let cfg = ScriptPolicyConfig::from_package_json(dir.path());
-        assert_eq!(cfg, ScriptPolicyConfig::default());
+        assert!(ScriptPolicyConfig::try_from_package_json(dir.path()).is_err());
     }
 
     #[test]
@@ -687,19 +632,14 @@ mod tests {
     }
 
     #[test]
-    fn from_package_json_ignores_non_string_trusted_scopes() {
-        // Defensive: if someone writes `["ok", 42, null, "fine"]`,
-        // the non-strings are dropped rather than failing the whole load.
+    fn from_package_json_rejects_non_string_trusted_scopes() {
         let dir = tempdir().unwrap();
         write_pkg_json(
             dir.path(),
-            r#"{"lpm": {"scripts": {"trustedScopes": ["@ok/*", 42, null, "@fine/*"]}}}"#,
+            r#"{"lpm":{"scripts":{"trustedScopes":["@ok/*",42,null]}}}"#,
         );
-        let cfg = ScriptPolicyConfig::from_package_json(dir.path());
-        assert_eq!(
-            cfg.trusted_scopes,
-            vec!["@ok/*".to_string(), "@fine/*".to_string()]
-        );
+        let error = ScriptPolicyConfig::try_from_package_json(dir.path()).unwrap_err();
+        assert!(error.to_string().contains("trustedScopes"));
     }
 
     // ── triage_advisor reader ──────────────────────────────
@@ -744,22 +684,21 @@ mod tests {
     }
 
     #[test]
-    fn from_package_json_non_string_triage_advisor_is_none() {
-        // Defensive: a malformed value (array, number, bool, null,
-        // object) must not panic and must not be coerced. The
-        // reader treats it as "key absent" — the install path then
-        // falls through to `~/.lpm/config.toml`.
-        for raw in [
-            r#"{"lpm": {"triageAdvisor": ["claude-cli"]}}"#,
-            r#"{"lpm": {"triageAdvisor": 42}}"#,
-            r#"{"lpm": {"triageAdvisor": true}}"#,
-            r#"{"lpm": {"triageAdvisor": null}}"#,
-            r#"{"lpm": {"triageAdvisor": {"provider": "claude-cli"}}}"#,
+    fn from_package_json_non_string_triage_advisor_fails() {
+        for value in [
+            serde_json::json!(["none"]),
+            serde_json::json!(42),
+            serde_json::json!(true),
+            serde_json::Value::Null,
+            serde_json::json!({"provider":"none"}),
         ] {
             let dir = tempdir().unwrap();
-            write_pkg_json(dir.path(), raw);
-            let cfg = ScriptPolicyConfig::from_package_json(dir.path());
-            assert_eq!(cfg.triage_advisor, None, "raw={raw}");
+            write_pkg_json(
+                dir.path(),
+                &serde_json::json!({"lpm":{"triageAdvisor":value}}).to_string(),
+            );
+            let error = ScriptPolicyConfig::try_from_package_json(dir.path()).unwrap_err();
+            assert!(error.to_string().contains("triageAdvisor"));
         }
     }
 
@@ -836,30 +775,6 @@ mod tests {
         )]);
         let resolved = resolve_script_policy(None, &cfg);
         assert_eq!(resolved, ScriptPolicy::Deny);
-    }
-
-    #[test]
-    fn resolve_ignores_parse_error_uses_fallthrough() {
-        // When package.json has an invalid `scriptPolicy`, the
-        // resolver treats it as "unset" and falls through to global /
-        // default. The error surfacing is a caller concern
-        // (install.rs / build.rs emit `output::warn`). This test pins
-        // the resolver contract: parse-error does NOT block
-        // resolution, just prevents the value from winning.
-        let dir = tempdir().unwrap();
-        write_pkg_json(dir.path(), r#"{"lpm": {"scriptPolicy": "junk"}}"#);
-        let cfg = ScriptPolicyConfig::from_package_json(dir.path());
-        assert!(cfg.policy_parse_error.is_some());
-        let _env = crate::test_env::ScopedEnv::set([(
-            "HOME",
-            std::ffi::OsString::from(dir.path().to_str().unwrap()),
-        )]);
-        let resolved = resolve_script_policy(None, &cfg);
-        assert_eq!(
-            resolved,
-            ScriptPolicy::Deny,
-            "parse-error scriptPolicy falls through to default",
-        );
     }
 
     #[test]

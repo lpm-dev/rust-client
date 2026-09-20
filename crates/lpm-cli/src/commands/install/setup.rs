@@ -91,6 +91,8 @@ pub(super) fn prepare_install_setup_context(
     let pkg = lpm_workspace::read_package_json(&pkg_json_path)
         .map_err(|e| LpmError::Registry(format!("failed to read package.json: {e}")))?;
 
+    super::strict_deps::check(input.project_dir, &pkg)?;
+
     crate::security_approval::ensure_project_policy_authorized(
         input.policy_project_dir,
         input.json_output,

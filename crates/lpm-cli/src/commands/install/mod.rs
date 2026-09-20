@@ -50,6 +50,7 @@ mod setup;
 mod skills;
 mod source_resolution;
 mod state;
+mod strict_deps;
 mod swift;
 mod test_support;
 #[cfg(test)]
