@@ -2793,6 +2793,100 @@ async fn run_remote_cache_miss_uploads_and_later_restores_outputs() {
 }
 
 #[tokio::test]
+async fn run_remote_cache_accepts_http_ipv6_loopback() {
+    let listener = std::net::TcpListener::bind("[::1]:0").unwrap();
+    let registry =
+        MockRegistry::from_server(MockServer::builder().listener(listener).start().await);
+    let state = RemoteCacheState::default();
+    mount_stateful_remote_cache(registry.server(), state.clone()).await;
+    let project = remote_cache_project(registry.server(), "");
+
+    let output = run_build_with_remote_token(&project);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        state.artifact.lock().unwrap().is_some(),
+        "IPv6 loopback cache was not used: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[tokio::test]
+async fn run_remote_cache_rejects_signed_undeclared_outputs_and_runs_the_task() {
+    use base64::Engine as _;
+    use hmac::Mac as _;
+    use sha2::Digest as _;
+    use std::io::Read as _;
+
+    let registry = MockRegistry::start().await;
+    let state = RemoteCacheState::default();
+    mount_stateful_remote_cache(registry.server(), state.clone()).await;
+    let project = remote_cache_project(registry.server(), "");
+    project.write_file("source.txt", "original");
+    let first = run_build_with_remote_token(&project);
+    assert!(first.status.success());
+
+    let artifact = state.artifact.lock().unwrap().take().unwrap();
+    let mut original = tar::Archive::new(flate2::read::GzDecoder::new(artifact.as_slice()));
+    let encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+    let mut modified = tar::Builder::new(encoder);
+    for entry in original.entries().unwrap() {
+        let mut entry = entry.unwrap();
+        let path = entry.path().unwrap().into_owned();
+        let mut bytes = Vec::new();
+        entry.read_to_end(&mut bytes).unwrap();
+        if path == std::path::Path::new(".lpm-cache/meta.json") {
+            let mut meta: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            meta["output_file_count"] =
+                serde_json::json!(meta["output_file_count"].as_u64().unwrap() + 1);
+            bytes = serde_json::to_vec(&meta).unwrap();
+        }
+        let mut header = entry.header().clone();
+        header.set_size(bytes.len() as u64);
+        header.set_cksum();
+        modified
+            .append_data(&mut header, path, bytes.as_slice())
+            .unwrap();
+    }
+    let mut header = tar::Header::new_gnu();
+    header.set_mode(0o644);
+    header.set_mtime(0);
+    header.set_size(6);
+    header.set_cksum();
+    modified
+        .append_data(&mut header, "outputs/source.txt", b"cached".as_slice())
+        .unwrap();
+    let artifact = modified.into_inner().unwrap().finish().unwrap();
+    let mut mac = hmac::Hmac::<sha2::Sha256>::new_from_slice(b"signing-key").unwrap();
+    mac.update(&artifact);
+    *state.tag.lock().unwrap() = Some(format!(
+        "sha256={}",
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(mac.finalize().into_bytes())
+    ));
+    *state.sha.lock().unwrap() = Some(format!("{:x}", sha2::Sha256::digest(&artifact)));
+    *state.artifact.lock().unwrap() = Some(artifact);
+
+    remove_local_task_cache(&project);
+    remove_project_file(&project, "dist");
+    remove_project_file(&project, "executed-marker");
+    let second = run_build_with_remote_token(&project);
+    assert!(
+        second.status.success(),
+        "{}",
+        String::from_utf8_lossy(&second.stderr)
+    );
+    assert_eq!(project.read_file("source.txt"), "original");
+    assert!(
+        project.file_exists("executed-marker"),
+        "an undeclared artifact was treated as a cache hit"
+    );
+    assert_eq!(project.read_file("dist/value.txt"), "remote-hit");
+}
+
+#[tokio::test]
 async fn run_local_cache_hit_does_not_refresh_an_expired_remote_session() {
     let registry = MockRegistry::start().await;
     let state = RemoteCacheState::default();

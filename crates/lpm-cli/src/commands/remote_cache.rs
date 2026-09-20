@@ -928,7 +928,7 @@ fn resolve_base_url(
         reqwest::Url::parse(&with_v8).map_err(|e| format!("invalid remote cache URL: {e}"))?;
     match parsed.scheme() {
         "https" => Ok(with_v8),
-        "http" if parsed.host_str().is_some_and(is_loopback_host) => Ok(with_v8),
+        "http" if parsed.host().is_some_and(is_loopback_host) => Ok(with_v8),
         "http" => Err("remote cache refuses HTTP URLs unless they point at localhost".into()),
         scheme => Err(format!(
             "remote cache URL scheme '{scheme}' is not supported"
@@ -958,8 +958,12 @@ fn registry_origin_for_auth(base_url: &str) -> Option<String> {
     (serialized != "null").then_some(serialized)
 }
 
-fn is_loopback_host(host: &str) -> bool {
-    host == "localhost" || host == "127.0.0.1" || host == "::1"
+fn is_loopback_host(host: url::Host<&str>) -> bool {
+    match host {
+        url::Host::Domain(domain) => domain == "localhost",
+        url::Host::Ipv4(address) => address == std::net::Ipv4Addr::LOCALHOST,
+        url::Host::Ipv6(address) => address == std::net::Ipv6Addr::LOCALHOST,
+    }
 }
 
 fn env_flag(name: &str) -> Option<bool> {
@@ -1184,6 +1188,25 @@ fn warn_once(message: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn http_cache_hosts_allow_only_exact_loopback_addresses_and_localhost() {
+        for host in ["localhost", "127.0.0.1", "[::1]"] {
+            let url = reqwest::Url::parse(&format!("http://{host}:3000/v8")).unwrap();
+            assert!(url.host().is_some_and(is_loopback_host), "rejected {host}");
+        }
+        for host in [
+            "localhost.example.com",
+            "example.com",
+            "127.0.0.2",
+            "0.0.0.0",
+            "[::]",
+            "[::ffff:127.0.0.1]",
+        ] {
+            let url = reqwest::Url::parse(&format!("http://{host}:3000/v8")).unwrap();
+            assert!(!url.host().is_some_and(is_loopback_host), "accepted {host}");
+        }
+    }
 
     #[test]
     fn remote_status_body_accepts_valid_json_at_the_exact_size_limit() {

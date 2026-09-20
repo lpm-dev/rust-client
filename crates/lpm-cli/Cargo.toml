@@ -118,6 +118,7 @@ pathdiff = { workspace = true }
 
 # URL encoding
 urlencoding = "2"
+url = "2"
 
 # Temp directories
 tempfile = "3"
