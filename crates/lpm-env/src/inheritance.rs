@@ -19,7 +19,7 @@
 //! Resolution for `preview`: base (.env) → staging (.env.staging) → preview (no file, inherits all)
 
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 /// Named environment definitions with optional inheritance.
 ///
@@ -84,46 +84,36 @@ impl EnvDefinition {
 /// - A circular inheritance chain is detected
 /// - An `extends` references a non-existent environment
 pub fn resolve_chain(config: &EnvironmentsConfig, env_name: &str) -> Result<Vec<String>, String> {
-    let mut chain = Vec::new();
-    let mut visited = Vec::new();
-    collect_chain(config, env_name, &mut chain, &mut visited)?;
+    let mut path = Vec::new();
+    let mut visited = HashSet::new();
+    let mut current = env_name;
+    loop {
+        if !visited.insert(current) {
+            let names: Vec<&str> = path.iter().map(|(name, _)| *name).collect();
+            return Err(format!(
+                "circular environment inheritance: {} → {current}",
+                names.join(" → ")
+            ));
+        }
+        let definition = config
+            .envs
+            .get(current)
+            .ok_or_else(|| format!("environment '{current}' not found in lpm.json environments"))?;
+        path.push((current, definition));
+        match definition.extends() {
+            Some(parent) => current = parent,
+            None => break,
+        }
+    }
+
+    let mut chain = Vec::with_capacity(path.len());
+    for (name, definition) in path.into_iter().rev() {
+        if let Some(file) = definition.file() {
+            validate_env_file_path(name, file)?;
+            chain.push(file.to_owned());
+        }
+    }
     Ok(chain)
-}
-
-/// Recursively collect the file chain, base-first.
-fn collect_chain(
-    config: &EnvironmentsConfig,
-    env_name: &str,
-    chain: &mut Vec<String>,
-    visited: &mut Vec<String>,
-) -> Result<(), String> {
-    // Cycle detection
-    if visited.contains(&env_name.to_string()) {
-        return Err(format!(
-            "circular environment inheritance: {} → {env_name}",
-            visited.join(" → ")
-        ));
-    }
-
-    let def = config
-        .envs
-        .get(env_name)
-        .ok_or_else(|| format!("environment '{env_name}' not found in lpm.json environments"))?;
-
-    visited.push(env_name.to_string());
-
-    // Recurse into parent first (base-first ordering)
-    if let Some(parent) = def.extends() {
-        collect_chain(config, parent, chain, visited)?;
-    }
-
-    // Add this environment's file (if it has one)
-    if let Some(file) = def.file() {
-        validate_env_file_path(env_name, file)?;
-        chain.push(file.to_string());
-    }
-
-    Ok(())
 }
 
 /// Reject `lpm.json` environment file paths that would escape the
@@ -175,6 +165,33 @@ mod tests {
 
     fn config_from_json(json: &str) -> EnvironmentsConfig {
         serde_json::from_str(json).unwrap()
+    }
+
+    #[test]
+    fn long_inheritance_chains_report_missing_parents_and_cycles() {
+        let mut envs = HashMap::with_capacity(10001);
+        for i in 0..10000 {
+            envs.insert(
+                format!("e{i}"),
+                EnvDefinition::Structured(StructuredEnvDefinition {
+                    extends: Some(format!("e{}", i + 1)),
+                    file: None,
+                }),
+            );
+        }
+        let mut config = EnvironmentsConfig { envs };
+        let error = resolve_chain(&config, "e0").unwrap_err();
+        assert!(error.contains("environment 'e10000' not found"), "{error}");
+        config.envs.insert(
+            "e10000".to_owned(),
+            EnvDefinition::Structured(StructuredEnvDefinition {
+                extends: Some("e9999".to_owned()),
+                file: None,
+            }),
+        );
+        let error = resolve_chain(&config, "e0").unwrap_err();
+        assert!(error.starts_with("circular environment inheritance: e0 → e1"));
+        assert!(error.ends_with("e9999 → e10000 → e9999"));
     }
 
     #[test]

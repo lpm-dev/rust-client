@@ -139,7 +139,7 @@ pub(crate) fn load_project_env_details_with_config_and_schema_validation(
                 tracing::debug!("resolved env chain for '{env_name}': {}", chain.join(" → "));
                 load_env_from_chain(project_dir, &chain)?
             }
-            Err(e) if e.contains("not found") => {
+            Err(_) if !envs_config.envs.contains_key(env_name) => {
                 // An undeclared environment must preserve an explicit file mapping.
                 tracing::debug!(
                     "env '{env_name}' not in environments config, using file mapping or standard loading"

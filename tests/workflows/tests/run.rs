@@ -5588,3 +5588,105 @@ fn shared_upstream_tasks_keep_each_dependent_task_blocked_after_failure() {
         );
     }
 }
+
+#[test]
+fn run_rejects_a_missing_environment_ancestor_before_spawning() {
+    let project = TempProject::empty(r#"{"name":"env-chain","scripts":{"show":"node show.js"}}"#);
+    project.write_file(
+        "lpm.json",
+        r#"{"environments":{"production":{"extends":"missing"}}}"#,
+    );
+    project.write_file(
+        "show.js",
+        "require('fs').writeFileSync('spawned.txt', 'yes');",
+    );
+    let output = lpm(&project)
+        .args(["run", "show", "--env", "production"])
+        .output()
+        .unwrap();
+    assert!(
+        !output.status.success(),
+        "broken inheritance was accepted: {output:?}"
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("environment 'missing' not found"),
+        "{output:?}"
+    );
+    assert!(!project.file_exists("spawned.txt"));
+}
+
+#[test]
+fn run_uses_dotenv_fallback_for_an_undeclared_environment() {
+    let project =
+        TempProject::empty(r#"{"name":"env-fallback","scripts":{"show":"node show.js"}}"#);
+    project.write_file("lpm.json", r#"{"environments":{"base":".env"}}"#);
+    project.write_file(".env.preview", "REFERENCE_ENV_FALLBACK=preview-value");
+    project.write_file(
+        "show.js",
+        "console.log(process.env.REFERENCE_ENV_FALLBACK);",
+    );
+    let output = lpm(&project)
+        .args(["run", "show", "--env", "preview"])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("preview-value"),
+        "{output:?}"
+    );
+}
+
+#[test]
+fn run_resolves_a_long_environment_chain_without_stack_overflow() {
+    let project =
+        TempProject::empty(r#"{"name":"long-env-chain","scripts":{"show":"node show.js"}}"#);
+    let mut environments = serde_json::Map::new();
+    environments.insert("e0".to_owned(), serde_json::json!(".env.base"));
+    for i in 1..100000 {
+        environments.insert(
+            format!("e{i}"),
+            serde_json::json!({"extends":format!("e{}", i-1)}),
+        );
+    }
+    environments.insert(
+        "production".to_owned(),
+        serde_json::json!({"extends":"e99999", "file":".env.production"}),
+    );
+    project.write_file(
+        "lpm.json",
+        &serde_json::json!({"environments":environments}).to_string(),
+    );
+    project.write_file(
+        ".env.base",
+        "REFERENCE_CHAIN_BASE=base\nREFERENCE_CHAIN_OVERRIDE=base",
+    );
+    project.write_file(".env.production", "REFERENCE_CHAIN_OVERRIDE=production");
+    project.write_file(
+        "show.js",
+        "console.log(process.env.REFERENCE_CHAIN_BASE, process.env.REFERENCE_CHAIN_OVERRIDE);",
+    );
+    let output = lpm(&project)
+        .args(["run", "show", "--env", "production"])
+        .timeout(std::time::Duration::from_secs(30))
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("base production"),
+        "{output:?}"
+    );
+}
+
+#[test]
+fn run_reads_tasks_and_environment_policy_from_bom_prefixed_lpm_json() {
+    let project = TempProject::empty(r#"{"name":"bom-project","scripts":{"show":"node show.js"}}"#);
+    project.write_file("lpm.json", "\u{feff}{\"tasks\":{\"show\":{\"env\":\"production\"}},\"environments\":{\"production\":\".env.production\"},\"envSchema\":{\"vars\":{\"BOM_PROJECT_VALUE\":{\"required\":true}}}}");
+    project.write_file(".env.production", "BOM_PROJECT_VALUE=from-bom-config");
+    project.write_file("show.js", "console.log(process.env.BOM_PROJECT_VALUE);");
+    let output = lpm(&project).args(["run", "show"]).output().unwrap();
+    assert!(output.status.success(), "{output:?}");
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("from-bom-config"),
+        "{output:?}"
+    );
+}

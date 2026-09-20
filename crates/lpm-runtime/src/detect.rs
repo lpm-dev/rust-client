@@ -224,42 +224,46 @@ fn detect_from_lpm_json_runtime(
     project_dir: &Path,
     runtime: RuntimeKind,
 ) -> DetectionResult<Option<DetectedRuntimeVersion>> {
-    let path = project_dir.join("lpm.json");
-    let Some(content) = read_optional_runtime_config(&path)? else {
-        return Ok(None);
-    };
-    let Ok(doc) = serde_json::from_str::<serde_json::Value>(&content) else {
-        return Ok(None);
-    };
-    let Some(spec) = doc
-        .get("runtime")
-        .and_then(|config| config.get(runtime.as_str()))
-        .and_then(serde_json::Value::as_str)
-    else {
-        return Ok(None);
-    };
-
-    Ok(Some(detected_lpm_json_runtime(runtime, spec)))
+    let mut specs = read_lpm_json_runtime_map(project_dir)?;
+    Ok(specs
+        .remove(runtime.as_str())
+        .map(|spec| detected_lpm_json_runtime(runtime, &spec)))
 }
 
 fn read_lpm_json_runtime_specs(
     project_dir: &Path,
 ) -> DetectionResult<(Option<String>, Option<String>)> {
+    let mut specs = read_lpm_json_runtime_map(project_dir)?;
+    Ok((specs.remove("node"), specs.remove("bun")))
+}
+
+fn read_lpm_json_runtime_map(project_dir: &Path) -> DetectionResult<HashMap<String, String>> {
+    #[derive(serde::Deserialize)]
+    struct RuntimeConfig {
+        #[serde(default)]
+        runtime: HashMap<String, String>,
+    }
+
     let path = project_dir.join("lpm.json");
     let Some(content) = read_optional_runtime_config(&path)? else {
-        return Ok((None, None));
+        return Ok(HashMap::new());
     };
-    let Ok(doc) = serde_json::from_str::<serde_json::Value>(&content) else {
-        return Ok((None, None));
-    };
-    let runtime = doc.get("runtime");
-    let spec = |kind: RuntimeKind| {
-        runtime
-            .and_then(|config| config.get(kind.as_str()))
-            .and_then(serde_json::Value::as_str)
-            .map(str::to_string)
-    };
-    Ok((spec(RuntimeKind::Node), spec(RuntimeKind::Bun)))
+    let content = lpm_common::strip_utf8_bom_str(&content);
+    if !content.trim_start().starts_with('{') {
+        return Err(BoundedReadError::Io {
+            path,
+            source: std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "lpm.json must contain a JSON object",
+            ),
+        });
+    }
+    serde_json::from_str::<RuntimeConfig>(content)
+        .map(|config| config.runtime)
+        .map_err(|error| BoundedReadError::Io {
+            path,
+            source: std::io::Error::new(std::io::ErrorKind::InvalidData, error),
+        })
 }
 
 /// Parse an .nvmrc or .node-version file content into a version spec.
@@ -324,6 +328,58 @@ fn read_optional_runtime_config(path: &Path) -> DetectionResult<Option<String>> 
 mod tests {
     use super::*;
     use std::fs;
+
+    #[test]
+    fn malformed_runtime_maps_fail_all_detection_paths() {
+        for content in [
+            "{broken",
+            "[]",
+            "null",
+            r#"{"runtime":null}"#,
+            r#"{"runtime":[]}"#,
+            r#"{"runtime":true}"#,
+            r#"{"runtime":{"node":22}}"#,
+            r#"{"runtime":{"bun":false}}"#,
+            r#"{"runtime":{"deno":null}}"#,
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            fs::write(dir.path().join("lpm.json"), content).unwrap();
+            fs::write(dir.path().join(".nvmrc"), "20").unwrap();
+            assert!(
+                detect_node_version(dir.path()).is_err(),
+                "Node accepted {content}"
+            );
+            assert!(
+                detect_bun_version(dir.path()).is_err(),
+                "Bun accepted {content}"
+            );
+            assert!(
+                detect_runtime_versions(dir.path()).is_err(),
+                "combined detection accepted {content}"
+            );
+        }
+    }
+
+    #[test]
+    fn bom_prefixed_runtime_selectors_override_version_files() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("lpm.json"),
+            "\u{feff}{\"runtime\":{\"node\":\"22\",\"bun\":\"1.3.14\",\"deno\":\"2\"}}",
+        )
+        .unwrap();
+        fs::write(dir.path().join(".nvmrc"), "20").unwrap();
+        assert_eq!(detect_node_version(dir.path()).unwrap().unwrap().spec, "22");
+        assert_eq!(
+            detect_bun_version(dir.path()).unwrap().unwrap().spec,
+            "1.3.14"
+        );
+        let versions = detect_runtime_versions(dir.path()).unwrap();
+        assert_eq!(
+            versions.iter().map(|v| v.runtime).collect::<Vec<_>>(),
+            vec![RuntimeKind::Node, RuntimeKind::Bun]
+        );
+    }
 
     #[test]
     fn detect_from_lpm_json_file() {

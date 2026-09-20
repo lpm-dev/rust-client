@@ -458,3 +458,62 @@ fn lpm_json_schema_accepts_valid_sync_authority_metadata() {
         "published schema rejected valid sync authority metadata",
     );
 }
+
+#[test]
+fn service_schema_and_parser_reject_invalid_service_bounds() {
+    let validator = lpm_json_validator();
+    let mut invalid = vec![
+        serde_json::json!({"services":{"web":{"command":"node server.js", "port":0}}}),
+        serde_json::json!({"services":{"web":{"command":"node server.js", "port":65536}}}),
+        serde_json::json!({"services":{"web":{"command":"node server.js", "readyPort":0}}}),
+        serde_json::json!({"services":{"web":{"command":"node server.js", "readyTimeout":0}}}),
+        serde_json::json!({"services":{"web":{"command":"node server.js", "readyTimeout":3601}}}),
+        serde_json::json!({"services":{"web":{"command":" \t\n"}}}),
+        serde_json::json!({"services":{"1web":{"command":"node server.js"}}}),
+        serde_json::json!({"services":{"web.dot":{"command":"node server.js"}}}),
+        serde_json::json!({"services":{"é":{"command":"node server.js"}}}),
+    ];
+    invalid.push(serde_json::json!({"services":{ "a".repeat(65): {"command":"node server.js"}}}));
+    let services: serde_json::Map<String, serde_json::Value> = (0..257)
+        .map(|i| {
+            (
+                format!("s{i}"),
+                serde_json::json!({"command":"node server.js"}),
+            )
+        })
+        .collect();
+    invalid.push(serde_json::json!({"services":services}));
+    for document in invalid {
+        assert!(!validator.is_valid(&document), "schema accepted {document}");
+        assert!(
+            lpm_runner::lpm_json::parse_lpm_json(&document.to_string()).is_err(),
+            "parser accepted {document}"
+        );
+    }
+}
+
+#[test]
+fn service_schema_and_parser_accept_valid_service_bounds() {
+    let validator = lpm_json_validator();
+    for timeout in [1, 30, 3600] {
+        for port in [1, 65535] {
+            let document = serde_json::json!({"services":{"Web_1-test":{"command":" node server.js ","port":port,"readyPort":port,"readyTimeout":timeout}}});
+            assert!(validator.is_valid(&document), "schema rejected {document}");
+            assert!(
+                lpm_runner::lpm_json::parse_lpm_json(&document.to_string()).is_ok(),
+                "parser rejected {document}"
+            );
+        }
+    }
+    let services: serde_json::Map<String, serde_json::Value> = (0..256)
+        .map(|i| {
+            (
+                format!("s{i}"),
+                serde_json::json!({"command":"node server.js"}),
+            )
+        })
+        .collect();
+    let document = serde_json::json!({"services":services});
+    assert!(validator.is_valid(&document));
+    assert!(lpm_runner::lpm_json::parse_lpm_json(&document.to_string()).is_ok());
+}
