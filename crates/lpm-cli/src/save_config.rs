@@ -170,7 +170,7 @@ fn read_save_keys_from_file(path: &Path) -> Result<RawSaveKeys, LpmError> {
 /// the same way. Native `Boolean(b)` is also accepted for users who
 /// hand-edit `lpm.toml` directly. Anything else returns `None` and the
 /// caller surfaces a clear, file-pathed error.
-fn coerce_bool(value: &toml::Value) -> Option<bool> {
+pub(crate) fn coerce_bool(value: &toml::Value) -> Option<bool> {
     match value {
         toml::Value::Boolean(b) => Some(*b),
         toml::Value::String(s) => match s.as_str() {

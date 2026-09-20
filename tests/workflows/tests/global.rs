@@ -16,13 +16,15 @@
 //! - `lpm uninstall -g <pkg>` error path (alias parity)
 //! - `lpm global update --dry-run` on an empty manifest (idempotent)
 
+#[path = "global/concurrency.rs"]
+mod concurrency;
 mod support;
 
 use chrono::{SecondsFormat, Utc};
 use lpm_global::{GlobalManifest, PackageEntry, PackageSource, WalReader, WalRecord};
 use support::mock_registry::{MockRegistry, compute_integrity, make_tarball};
 use support::{TempProject, lpm, lpm_with_registry_and_npm};
-use wiremock::matchers::{header, method, path as wm_path};
+use wiremock::matchers::{method, path as wm_path};
 use wiremock::{Mock, Request, Respond, ResponseTemplate};
 
 #[derive(Clone)]
@@ -67,29 +69,6 @@ impl Respond for RecordDelayedGlobalUpdateMetadataStart {
 }
 
 #[derive(Clone)]
-struct GlobalOutdatedMetadata;
-
-impl Respond for GlobalOutdatedMetadata {
-    fn respond(&self, request: &Request) -> ResponseTemplate {
-        let name = request.url.path().trim_start_matches('/');
-        ResponseTemplate::new(200).set_body_json(serde_json::json!({
-            "name": name,
-            "dist-tags": { "latest": "1.1.0" },
-            "versions": {
-                "1.0.0": { "name": name, "version": "1.0.0" },
-                "1.1.0": { "name": name, "version": "1.1.0" }
-            }
-        }))
-    }
-}
-
-#[derive(Clone)]
-struct RecordDelayedGlobalOutdatedReleaseTimes {
-    starts: std::sync::Arc<std::sync::Mutex<Vec<std::time::Instant>>>,
-    delay: std::time::Duration,
-}
-
-#[derive(Clone)]
 struct RecordDelayedGlobalUpdateTarballStart {
     starts: std::sync::Arc<std::sync::Mutex<Vec<std::time::Instant>>>,
     delay: std::time::Duration,
@@ -105,30 +84,6 @@ impl Respond for RecordDelayedGlobalUpdateTarballStart {
         ResponseTemplate::new(200)
             .set_delay(self.delay)
             .set_body_bytes(self.body.clone())
-    }
-}
-
-impl Respond for RecordDelayedGlobalOutdatedReleaseTimes {
-    fn respond(&self, request: &Request) -> ResponseTemplate {
-        self.starts
-            .lock()
-            .expect("record global-outdated release-time request start")
-            .push(std::time::Instant::now());
-        let name = request.url.path().trim_start_matches('/');
-        ResponseTemplate::new(200)
-            .set_delay(self.delay)
-            .set_body_json(serde_json::json!({
-                "name": name,
-                "dist-tags": { "latest": "1.1.0" },
-                "versions": {
-                    "1.0.0": { "name": name, "version": "1.0.0" },
-                    "1.1.0": { "name": name, "version": "1.1.0" }
-                },
-                "time": {
-                    "1.0.0": "2025-01-01T00:00:00.000Z",
-                    "1.1.0": "2025-01-01T00:00:00.000Z"
-                }
-            }))
     }
 }
 
@@ -626,56 +581,15 @@ async fn global_list_outdated_hydrates_release_times_in_bounded_parallel_waves()
     }
     lpm_global::write_for(&root, &manifest).expect("write parallel outdated manifest fixture");
 
-    let mock = MockRegistry::start().await;
-    Mock::given(method("GET"))
-        .and(wiremock::matchers::path_regex(
-            r"^/parallel-outdated-[0-9]+$",
-        ))
-        .and(header("accept", "application/vnd.npm.install-v1+json"))
-        .respond_with(GlobalOutdatedMetadata)
-        .mount(mock.server())
-        .await;
-    let starts = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-    Mock::given(method("GET"))
-        .and(wiremock::matchers::path_regex(
-            r"^/parallel-outdated-[0-9]+$",
-        ))
-        .and(header("accept", "application/json"))
-        .respond_with(RecordDelayedGlobalOutdatedReleaseTimes {
-            starts: std::sync::Arc::clone(&starts),
-            delay: std::time::Duration::from_millis(250),
-        })
-        .mount(mock.server())
-        .await;
-
-    let output = lpm_with_registry_and_npm(&project, &mock.url())
-        .args(["--json", "global", "list", "--outdated"])
-        .output()
-        .expect("run global outdated with delayed release times");
+    let output = concurrency::check_outdated_hydration(&project, PACKAGE_COUNT).await;
     assert!(
         output.status.success(),
         "parallel outdated check should succeed\nstdout: {}\nstderr: {}",
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr),
     );
-
-    let starts = starts.lock().expect("read global-outdated request starts");
-    assert_eq!(starts.len(), PACKAGE_COUNT);
-    let first = *starts.iter().min().unwrap();
-    let mut offsets = starts
-        .iter()
-        .map(|start| start.duration_since(first))
-        .collect::<Vec<_>>();
-    offsets.sort();
-    assert!(offsets[3] < std::time::Duration::from_millis(150));
-    assert!(
-        offsets[4] >= std::time::Duration::from_millis(200),
-        "more than four release-time requests ran in the first wave: {offsets:?}"
-    );
-    assert!(
-        offsets[7] < std::time::Duration::from_millis(450),
-        "release-time hydration did not refill promptly: {offsets:?}"
-    );
+    let envelope: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(envelope["count_outdated"], PACKAGE_COUNT);
 }
 
 #[tokio::test]

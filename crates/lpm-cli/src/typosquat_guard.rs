@@ -274,7 +274,7 @@ fn typosquat_guard_env_disable_allowed(
     Ok(true)
 }
 
-fn typosquat_guard_disabled_from_env_value(value: Option<&str>) -> bool {
+pub(crate) fn typosquat_guard_disabled_from_env_value(value: Option<&str>) -> bool {
     value.is_some_and(|raw| {
         matches!(
             raw.trim().to_ascii_lowercase().as_str(),

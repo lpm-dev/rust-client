@@ -1,5 +1,4 @@
 use super::prelude::*;
-use super::scripts::persist_script_policy;
 
 const PRIVACY_LINE: &str = "Choosing a cloud advisor sends the package's lifecycle script text for review;      local advisors keep review on this machine.";
 
@@ -32,7 +31,7 @@ pub(in crate::commands::config) async fn run_triage_wizard(
     let current_policy = read_string_value(config_path, SCRIPT_POLICY_KEY)?
         .filter(|value| SCRIPT_POLICY_VALUES.contains(&value.as_str()))
         .unwrap_or_else(|| "deny".to_string());
-    if current_policy != "triage" {
+    let switch_policy = if current_policy != "triage" {
         println!();
         println!(
             "{}",
@@ -42,18 +41,12 @@ pub(in crate::commands::config) async fn run_triage_wizard(
                 install_ui::yellow(&current_policy)
             )
         );
-        let switch = cliclack::confirm(r#"Switch script-policy to "triage" now?"#)
-            .initial_value(false)
-            .interact()
-            .map_err(prompt_err)?;
-        if switch {
-            persist_script_policy(config_path, "triage", json_output).await?;
-            install_ui::done_line(crate::install_ui::terminal_line!(
-                "Done · {} = {}",
-                SCRIPT_POLICY_KEY,
-                install_ui::section("\"triage\"")
-            ));
-        } else {
+        let switch =
+            cliclack::confirm(r#"Switch script-policy to "triage" when this choice is saved?"#)
+                .initial_value(false)
+                .interact()
+                .map_err(prompt_err)?;
+        if !switch {
             println!(
                 "{}",
                 crate::install_ui::terminal_line!(
@@ -62,7 +55,10 @@ pub(in crate::commands::config) async fn run_triage_wizard(
                 )
             );
         }
-    }
+        switch
+    } else {
+        false
+    };
 
     // Detect available providers in parallel. Strict for Ollama
     // (binary + HTTP probe); `which`-style for the CLI providers.
@@ -130,7 +126,30 @@ pub(in crate::commands::config) async fn run_triage_wizard(
         }
     }
 
-    persist_string(config_path, TRIAGE_ADVISOR_KEY, chosen_slug).await?;
+    update_config(config_path, |config| {
+        if switch_policy {
+            let requested = crate::script_policy_config::ScriptPolicy::Triage;
+            crate::security_floor::reject_looser_script_policy_write(config, requested)?;
+            crate::security_approval::authorize_persistent_script_policy(
+                requested,
+                json_output,
+                "lpm config scripts --set triage",
+            )?;
+            config.table_mut().insert(
+                SCRIPT_POLICY_KEY.to_string(),
+                toml::Value::String("triage".to_string()),
+            );
+        }
+        config.table_mut().insert(
+            TRIAGE_ADVISOR_KEY.to_string(),
+            toml::Value::String(chosen_slug.to_string()),
+        );
+        Ok(((), true))
+    })
+    .await?;
+    if switch_policy {
+        announce_set(SCRIPT_POLICY_KEY, "triage", json_output);
+    }
     announce_set(TRIAGE_ADVISOR_KEY, chosen_slug, json_output);
     print_triage_advisor_followup(json_output);
     Ok(())
