@@ -240,13 +240,21 @@ fn run_list(json_output: bool) -> Result<(), LpmError> {
 
     println!("Policy extensions");
     for config in &configs {
+        let displayed = config.to_config_json();
+        let command = displayed["command"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(serde_json::Value::as_str)
+            .collect::<Vec<_>>()
+            .join(" ");
         println!(
             "  {:<24} {:<7} on-error={:<5} timeout={}ms  {}",
             sanitize_for_terminal(config.name()),
             config.mode().as_str(),
             config.on_error().as_str(),
             config.timeout_ms(),
-            sanitize_for_terminal(&config.command().join(" "))
+            sanitize_for_terminal(&command)
         );
     }
     Ok(())
@@ -473,7 +481,10 @@ fn parse_exact_package_candidate(spec: &str) -> Result<(String, String), LpmErro
     } else {
         Version::parse(version)?
     };
-    Ok((name.to_string(), version.to_string()))
+    let version = version.to_string();
+    lpm_lockfile::Lockfile::validate_package_name_and_version(name, &version)
+        .map_err(|error| LpmError::InvalidPackageName(error.to_string()))?;
+    Ok((name.to_string(), version))
 }
 
 fn is_major_minor_version(version: &str) -> bool {

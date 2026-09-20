@@ -319,7 +319,7 @@ pub(super) fn config_value_to_json(value: &toml::Value) -> serde_json::Value {
     serde_json::to_value(value).unwrap_or(serde_json::Value::Null)
 }
 
-pub(super) fn redact_config_json_value(key: &str, value: serde_json::Value) -> serde_json::Value {
+pub(crate) fn redact_config_json_value(key: &str, value: serde_json::Value) -> serde_json::Value {
     if config_key_is_sensitive(key) {
         return serde_json::Value::String("[REDACTED]".to_string());
     }

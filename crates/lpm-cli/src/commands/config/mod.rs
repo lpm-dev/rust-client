@@ -24,12 +24,12 @@ pub(crate) use wizards::{
 };
 
 use effective::EffectiveConfig;
-pub(crate) use io::update_config;
 use io::{
     config_value_at_path, config_value_for_display, config_value_to_json,
     guard_generic_delete_against_force_floor, guard_generic_set_against_force_floor, read_config,
-    redact_config_json_value, remove_config_value_at_path,
+    remove_config_value_at_path,
 };
+pub(crate) use io::{redact_config_json_value, update_config};
 use wizards::{
     FIREWALL_GUIDED_MENU_LABEL, INTEGRITY_GUIDED_MENU_LABEL, INTEGRITY_KEY,
     RELEASE_AGE_GUIDED_MENU_LABEL, RELEASE_AGE_KEY, RELEASE_AGE_POLICY_KEY, SANDBOX_MODE_VALUES,

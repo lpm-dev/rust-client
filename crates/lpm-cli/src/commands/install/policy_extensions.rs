@@ -133,7 +133,9 @@ impl PolicyExtensionConfig {
     pub(crate) fn to_config_json(&self) -> serde_json::Value {
         serde_json::json!({
             "name": &self.name,
-            "command": &self.command,
+            "command": crate::commands::config::redact_config_json_value(
+                "command", serde_json::json!(&self.command)
+            ),
             "mode": self.mode.as_str(),
             "on_error": self.on_error.as_str(),
             "timeout_ms": self.timeout.as_millis(),
