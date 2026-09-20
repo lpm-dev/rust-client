@@ -1495,3 +1495,99 @@ fn env_unknown_action_lists_available_subcommands() {
         "stderr must enumerate available actions, got:\n{stderr}",
     );
 }
+
+#[cfg(unix)]
+#[test]
+fn env_import_and_export_warn_when_gitignore_cannot_be_updated() {
+    use std::os::unix::fs::PermissionsExt as _;
+    for operation in ["import", "export"] {
+        for json in [false, true] {
+            let project = TempProject::empty(r#"{"name":"env-ignore-warning"}"#);
+            lpm(&project)
+                .args(["env", "set", "VALUE=private-fixture-value"])
+                .assert()
+                .success();
+            project.write_file(".gitignore", "existing\n");
+            project.write_file("secrets.env", "VALUE=private-fixture-value\n");
+            let ignore = project.path().join(".gitignore");
+            std::fs::set_permissions(&ignore, std::fs::Permissions::from_mode(0o444)).unwrap();
+            let mut command = lpm(&project);
+            command.args(["env", operation, "secrets.env"]);
+            if json {
+                command.arg("--json");
+            }
+            let output = command.output().unwrap();
+            std::fs::set_permissions(&ignore, std::fs::Permissions::from_mode(0o644)).unwrap();
+            assert!(output.status.success());
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(
+                stderr.contains(".gitignore") && stderr.contains("before committing"),
+                "{operation}: {stderr}"
+            );
+            assert!(!stderr.contains("private-fixture-value"));
+            assert_eq!(project.read_file(".gitignore"), "existing\n");
+            if json {
+                assert_eq!(parse_json_stdout(&output, operation)["success"], true);
+            }
+            if operation == "export" {
+                assert_eq!(
+                    std::fs::metadata(project.path().join("secrets.env"))
+                        .unwrap()
+                        .permissions()
+                        .mode()
+                        & 0o777,
+                    0o600
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn env_export_does_not_append_to_linked_gitignore_targets() {
+    for &hard_link in if cfg!(unix) {
+        &[false, true][..]
+    } else {
+        &[true][..]
+    } {
+        let project = TempProject::empty(r#"{"name":"env-ignore-link"}"#);
+        lpm(&project)
+            .args(["env", "set", "VALUE=private-fixture-value"])
+            .assert()
+            .success();
+        let outside = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(outside.path(), "outside bytes\n").unwrap();
+        let ignore = project.path().join(".gitignore");
+        if hard_link {
+            std::fs::hard_link(outside.path(), &ignore).unwrap();
+        } else {
+            #[cfg(unix)]
+            std::os::unix::fs::symlink(outside.path(), &ignore).unwrap();
+        }
+        let output = lpm(&project)
+            .args(["env", "export", "secrets.env", "--json"])
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        assert_eq!(
+            std::fs::read_to_string(outside.path()).unwrap(),
+            "outside bytes\n"
+        );
+        assert!(String::from_utf8_lossy(&output.stderr).contains(".gitignore"));
+        assert_eq!(parse_json_stdout(&output, "export")["success"], true);
+    }
+}
+
+#[test]
+fn env_init_without_imported_files_does_not_create_gitignore() {
+    let project = TempProject::empty(r#"{"name":"env-init-empty"}"#);
+    project.write_file(
+        "lpm.json",
+        r#"{"environments":{"staging":{"file":".env.staging"}}}"#,
+    );
+    lpm(&project)
+        .args(["env", "init", "--json"])
+        .assert()
+        .success();
+    assert!(!project.path().join(".gitignore").exists());
+}
