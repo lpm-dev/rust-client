@@ -3,6 +3,8 @@
 //! Generates certificates signed by the LPM root CA for use with local dev servers.
 //! Default SANs: localhost, 127.0.0.1, ::1 — plus any user-specified hostnames.
 
+mod root_constraints;
+
 use lpm_common::LpmError;
 use rcgen::{
     BasicConstraints, Certificate, CertificateParams, CidrSubnet, DistinguishedName, DnType,
@@ -245,6 +247,7 @@ pub(crate) fn validate_project_server_chain_bytes(
     }
     validate_certificate_validity(&root, "active root")?;
     validate_ca_usage(&root, "active root", false)?;
+    root_constraints::validate_leaf(&root, &leaf)?;
     if root.issuer() != root.subject() || root.verify_signature(Some(root.public_key())).is_err() {
         return Err(LpmError::Cert(
             "active root certificate is not self-signed".to_string(),
@@ -683,6 +686,7 @@ pub fn generate_project_cert(
     ca_key_pem: &str,
     extra_hostnames: &[String],
 ) -> Result<(String, String), Box<dyn std::error::Error>> {
+    root_constraints::validate_requested_names(ca_cert_pem, extra_hostnames)?;
     let (ca_cert, ca_key_pair) = issuer_from_ca_pem(ca_cert_pem, ca_key_pem)?;
     let params = project_leaf_params(extra_hostnames)?;
     let project_key = KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256)?;
@@ -703,6 +707,7 @@ pub fn generate_project_cert_with_constrained_intermediate(
     extra_hostnames: &[String],
     extra_permitted_dns_subtrees: &[String],
 ) -> Result<(String, String), Box<dyn std::error::Error>> {
+    root_constraints::validate_requested_names(ca_cert_pem, extra_hostnames)?;
     let (ca_cert, ca_key_pair) = issuer_from_ca_pem(ca_cert_pem, ca_key_pem)?;
     let intermediate_key = KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256)?;
     let intermediate_params =
@@ -1544,3 +1549,7 @@ mod tests {
         assert_eq!(fingerprint_hex(&[]), "");
     }
 }
+
+#[cfg(test)]
+#[path = "cert/root_constraints_tests.rs"]
+mod root_constraints_tests;
