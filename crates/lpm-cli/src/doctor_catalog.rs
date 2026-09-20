@@ -394,43 +394,42 @@ pub static AUTH_STORAGE_FALLBACK: CheckEntry = CheckEntry {
 
 pub static VAULT_STORAGE_KEYCHAIN: CheckEntry = CheckEntry {
     code: "vault_storage_keychain",
-    name: "Vault storage backend",
+    name: "Local secret storage",
     category: Category::Auth,
     tier: Tier::Fast,
-    description: "Vault secrets are unlocked via the OS Keychain. The encrypted blob \
-         requires a separate ACL the user controls per-app, so a same-UID \
-         process cannot silently read vault contents.",
-    when_fires: "Running on macOS, where the keyring crate writes secrets into the OS Keychain.",
-    remediation: "No action — keychain-backed storage is the strongest available backend.",
+    description: "macOS Keychain is the selected backend for local secrets. This result \
+         does not probe Keychain access or secret decryption.",
+    when_fires: "Running on macOS with the default local-secret backend selected.",
+    remediation: "No action — informational backend selection. A secret operation reports access or decryption errors.",
     possible_severities: &[Severity::Pass],
     auto_fix: None,
 };
 
 pub static VAULT_STORAGE_NATIVE: CheckEntry = CheckEntry {
     code: "vault_storage_native",
-    name: "Vault storage backend",
+    name: "Local secret storage",
     category: Category::Auth,
     tier: Tier::Fast,
-    description: "Vault blobs are encrypted on disk, and the local vault data key is protected \
-         by the OS secure store: Secret Service-compatible storage on Linux or Credential \
-         Manager on Windows.",
+    description: "A native data key is available, or the OS secure store is the preferred \
+         backend for new local secrets. Read the diagnostic detail to distinguish these states. \
+         This result does not prove that LPM CLI can decrypt every secret.",
     when_fires: "Running on Linux or Windows with no active encrypted-file fallback key, or with \
-         a native vault data key already present.",
-    remediation: "No action — native-protected storage is the recommended backend on this platform.",
+         a native local data key already present.",
+    remediation: "No action — read the detail to distinguish an available native key from a preferred backend.",
     possible_severities: &[Severity::Pass],
     auto_fix: None,
 };
 
 pub static VAULT_STORAGE_NATIVE_WITH_FALLBACK: CheckEntry = CheckEntry {
     code: "vault_storage_native_with_fallback",
-    name: "Vault storage backend",
+    name: "Local secret storage",
     category: Category::Auth,
     tier: Tier::Fast,
-    description: "The vault data key is available from the OS secure store, but the older \
-         on-disk fallback key is still present and can decrypt the same local vault blobs.",
+    description: "The local data key is available from the OS secure store, but the older \
+         on-disk fallback key is still present and can decrypt the same local encrypted secrets.",
     when_fires: "Running on Linux or Windows after native-key promotion could not remove the \
          encrypted-file fallback key.",
-    remediation: "Check ownership and permissions for ~/.lpm, then run a vault command again so \
+    remediation: "Check ownership and permissions for ~/.lpm, then run an `lpm env` command again so \
          LPM CLI can remove ~/.lpm/.vault-fallback-key after verifying the native key.",
     possible_severities: &[Severity::Warn],
     auto_fix: None,
@@ -438,18 +437,18 @@ pub static VAULT_STORAGE_NATIVE_WITH_FALLBACK: CheckEntry = CheckEntry {
 
 pub static VAULT_STORAGE_FALLBACK: CheckEntry = CheckEntry {
     code: "vault_storage_fallback",
-    name: "Vault storage backend",
+    name: "Local secret storage",
     category: Category::Auth,
     tier: Tier::Fast,
-    description: "Vault secrets are encrypted with an on-disk key file (~/.lpm/.vault-fallback-key, \
+    description: "Local secrets are encrypted with an on-disk key file (~/.lpm/.vault-fallback-key, \
          0600) using a random 256-bit key and AES-256-GCM. The fallback path is correct cryptographically, \
-         but any process running as your user can read the key file and decrypt the vault — \
+         but any process running as your user can read the key file and decrypt the local secrets — \
          there is no per-app ACL the way macOS Keychain provides. This is a documented \
          platform limitation, not a bug.",
     when_fires: "Running on Linux or Windows with an active encrypted-file fallback key because \
-         native secure storage was unavailable before the vault was promoted.",
+         native secure storage was unavailable before the data key was promoted.",
     remediation: "Treat the host as the trust boundary: assume any same-UID code-execution \
-         primitive on this machine can read vault secrets. Do not run untrusted lifecycle \
+         primitive on this machine can read local secrets. Do not run untrusted lifecycle \
          scripts in unsandboxed mode. Keep lifecycle scripts sandboxed and unlock or repair the \
          OS secure store so LPM CLI can promote the data key.",
     possible_severities: &[Severity::Warn],
@@ -458,12 +457,12 @@ pub static VAULT_STORAGE_FALLBACK: CheckEntry = CheckEntry {
 
 pub static VAULT_STORAGE_UNAVAILABLE: CheckEntry = CheckEntry {
     code: "vault_storage_unavailable",
-    name: "Vault storage backend",
+    name: "Local secret storage",
     category: Category::Auth,
     tier: Tier::Fast,
-    description: "Encrypted vault files exist locally, but LPM CLI cannot access either the OS-protected \
-         vault data key or the encrypted-file fallback key.",
-    when_fires: "Running on Linux or Windows with local vault blobs present and no usable local \
+    description: "Encrypted local secret files exist locally, but LPM CLI cannot access either the OS-protected \
+         local data key or the encrypted-file fallback key.",
+    when_fires: "Running on Linux or Windows with local encrypted secrets present and no usable local \
          data-key source.",
     remediation: "Unlock Secret Service/Credential Manager, repair the OS secure store, or restore \
          ~/.lpm/.vault-fallback-key from backup if this machine has not been promoted yet.",
@@ -1925,8 +1924,8 @@ pub static SIGSTORE_VERIFY_ENFORCED: CheckEntry = CheckEntry {
     name: "Sigstore verify",
     category: Category::Provenance,
     tier: Tier::Fast,
-    description: "Sigstore provenance verification is fail-closed: a verifier rejection on any \
-         attested package refuses the install / approval.",
+    description: "When verification runs, a rejected attestation stops the install or approval. \
+         This result does not examine verification scope or fetch availability.",
     when_fires: "Resolved enforce-mode is `deny` (the default, or explicitly set via \
          `LPM_PROVENANCE_ENFORCE=deny` or `[sigstore] verify = \"deny\"`).",
     remediation: "No action — informational pass.",
@@ -1945,7 +1944,7 @@ pub static SIGSTORE_VERIFY_WARN_MODE: CheckEntry = CheckEntry {
     when_fires: "Resolved enforce-mode is `warn` (set via `LPM_PROVENANCE_ENFORCE=warn` or \
          `[sigstore] verify = \"warn\"`). A forged bundle would surface as a log line but \
          the install would still proceed.",
-    remediation: "Re-enable fail-closed: unset `LPM_PROVENANCE_ENFORCE` (or set it to `deny`), or \
+    remediation: "Make verifier rejections block the operation: unset `LPM_PROVENANCE_ENFORCE` (or set it to `deny`), or \
          run `lpm config sigstore --set deny`.",
     possible_severities: &[Severity::Warn],
     auto_fix: None,

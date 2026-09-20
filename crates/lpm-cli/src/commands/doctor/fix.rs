@@ -20,7 +20,7 @@ pub(super) struct FixReport {
 
 #[derive(serde::Serialize)]
 pub(super) struct FixFailure {
-    action: &'static str,
+    action: String,
     error: String,
 }
 
@@ -171,9 +171,11 @@ pub(super) async fn apply(
             Ok(Some(summary)) => report.applied.push(summary),
             Ok(None) => {}
             Err(error) => {
-                super::render_autofix_failed(action.label(), &error);
+                let label = planned_action_label(action, check)
+                    .unwrap_or_else(|_| action.label().to_string());
+                super::render_autofix_failed(&label, &error);
                 report.failed.push(FixFailure {
-                    action: action.label(),
+                    action: label,
                     error: error.to_string(),
                 });
             }
