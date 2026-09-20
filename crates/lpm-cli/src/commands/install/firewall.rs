@@ -77,6 +77,22 @@ impl NpmFirewallPreflightClient {
         }
     }
 
+    async fn batch_verdicts(
+        &self,
+        mode: NpmFirewallMode,
+        policy_profile: NpmFirewallPolicyProfile,
+        packages: &[NpmFirewallBatchPackage],
+    ) -> Result<NpmFirewallBatchResponse, LpmError> {
+        self.for_mode(mode)
+            .await?
+            .npm_firewall_batch_verdicts_with_posture_and_policy(
+                packages,
+                mode.auth_posture(),
+                Some(policy_profile),
+            )
+            .await
+    }
+
     async fn for_mode(&self, mode: NpmFirewallMode) -> Result<Arc<RegistryClient>, LpmError> {
         let posture = mode.auth_posture();
         if !mode.is_enabled()
@@ -672,13 +688,8 @@ async fn request_firewall_chunk(
     verdict_packages: Vec<NpmFirewallBatchPackage>,
 ) -> Result<FirewallChunkResult, LpmError> {
     let started = Instant::now();
-    let client = client.for_mode(mode).await?;
     let response = match client
-        .npm_firewall_batch_verdicts_with_posture_and_policy(
-            &verdict_packages,
-            mode.auth_posture(),
-            Some(policy_profile),
-        )
+        .batch_verdicts(mode, policy_profile, &verdict_packages)
         .await
     {
         Ok(response) => response,
@@ -854,16 +865,10 @@ pub(super) async fn request_npm_firewall_preflight(
         return Err(LpmError::Registry(message));
     }
 
-    let client = NpmFirewallPreflightClient::new(client)
-        .for_mode(mode)
-        .await?;
+    let client = NpmFirewallPreflightClient::new(client);
     let started = Instant::now();
     let response = match client
-        .npm_firewall_batch_verdicts_with_posture_and_policy(
-            &verdict_packages,
-            mode.auth_posture(),
-            Some(policy_profile),
-        )
+        .batch_verdicts(mode, policy_profile, &verdict_packages)
         .await
     {
         Ok(response) => response,
