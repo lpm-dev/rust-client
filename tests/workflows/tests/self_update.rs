@@ -6,6 +6,8 @@
 //! branches that don't require network: cache-hit "already on latest"
 //! and the recent-failure backoff path.
 
+#[cfg(unix)]
+mod self_update_maintenance;
 mod support;
 
 #[cfg(unix)]

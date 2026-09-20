@@ -313,20 +313,200 @@ pub(super) fn sanitized_current_path(excluded_root: Option<&Path>) -> Result<OsS
                 "could not resolve the active containment root for PATH filtering".to_string(),
             )
         })?;
-    let entries = std::env::split_paths(&path)
-        .filter(|entry| entry.is_absolute())
-        .filter(|entry| !path_has_node_modules_bin(entry))
-        .filter(|entry| {
-            resolved_excluded_root.as_ref().is_none_or(|root| {
-                resolve_for_containment(entry).is_ok_and(|entry| !entry.starts_with(root))
-            })
-        })
-        .collect::<Vec<_>>();
+    let account_home = super::canonical_account_home()?;
+    let mut entries = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for entry in std::env::split_paths(&path) {
+        if !entry.is_absolute() || path_has_node_modules_bin(&entry) {
+            continue;
+        }
+        let Ok(entry) = std::fs::canonicalize(entry) else {
+            continue;
+        };
+        // Retain the checked target so a directory alias cannot redirect later lookups.
+        if !seen.insert(entry.clone())
+            || path_has_node_modules_bin(&entry)
+            || resolved_excluded_root
+                .as_ref()
+                .is_some_and(|root| entry.starts_with(root))
+            || !trusted_search_directory(&entry, &account_home)
+            || !trusted_search_executables(
+                &entry,
+                &account_home,
+                resolved_excluded_root.as_deref(),
+                if cfg!(windows) {
+                    HelperLinks::Reject
+                } else {
+                    HelperLinks::Trusted
+                },
+            )
+        {
+            continue;
+        }
+        entries.push(entry);
+    }
     std::env::join_paths(entries).map_err(|error| {
         LpmError::SelfUpdate(format!(
             "could not build a sanitized PATH for self-update: {error}"
         ))
     })
+}
+
+// Bound managers still use PATH to find interpreters and helper programs.
+fn trusted_search_directory(path: &Path, account_home: &Path) -> bool {
+    path.is_dir() && trusted_search_ownership(path, account_home)
+}
+
+fn trusted_search_ownership(path: &Path, account_home: &Path) -> bool {
+    if manager_program_location_allowed(path, path, account_home) {
+        return true;
+    }
+    #[cfg(unix)]
+    {
+        let homebrew_root = [
+            "/opt/homebrew",
+            "/usr/local/Homebrew",
+            "/usr/local/bin",
+            "/home/linuxbrew/.linuxbrew",
+        ]
+        .into_iter()
+        .any(|root| path_is_known_within(path, Path::new(root)));
+        if homebrew_root && let Ok(resolved) = std::fs::canonicalize(path) {
+            return trusted_path_chain_has_expected_ownership(path, true, true)
+                && trusted_path_chain_has_expected_ownership(&resolved, false, true);
+        }
+    }
+    false
+}
+
+#[derive(Clone, Copy)]
+enum HelperLinks {
+    Trusted,
+    Reject,
+}
+
+fn trusted_search_executables(
+    directory: &Path,
+    account_home: &Path,
+    excluded_root: Option<&Path>,
+    helper_links: HelperLinks,
+) -> bool {
+    let Ok(entries) = std::fs::read_dir(directory) else {
+        return false;
+    };
+    for entry in entries {
+        let Ok(entry) = entry else {
+            return false;
+        };
+        let path = entry.path();
+        #[cfg(windows)]
+        if !path
+            .extension()
+            .and_then(OsStr::to_str)
+            .is_some_and(|extension| {
+                matches_ignore_ascii_case(extension, &["exe", "cmd", "com", "bat"])
+            })
+        {
+            continue;
+        }
+        let Ok(metadata) = std::fs::symlink_metadata(&path) else {
+            return false;
+        };
+        let metadata = if lpm_common::is_symlink_or_junction(&metadata) {
+            // Windows reparse entries need a no-follow DACL check, which this
+            // updater does not support. Reject them before inspecting targets.
+            if matches!(helper_links, HelperLinks::Reject) {
+                return false;
+            }
+            let Ok(target) = std::fs::metadata(&path) else {
+                return false;
+            };
+            target
+        } else {
+            metadata
+        };
+        if !metadata.is_file() {
+            continue;
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if metadata.permissions().mode() & 0o111 == 0 {
+                continue;
+            }
+        }
+        if !trusted_helper_path(&path, account_home, excluded_root) {
+            return false;
+        }
+    }
+    true
+}
+
+fn trusted_helper_path(path: &Path, account_home: &Path, excluded_root: Option<&Path>) -> bool {
+    use std::path::Component;
+
+    // A trusted final target is insufficient: each link's parent must prevent
+    // another account from redirecting the route used by an interpreter.
+    let mut pending = path.to_path_buf();
+    for _ in 0..40 {
+        let mut resolved = PathBuf::new();
+        let mut components = pending.components();
+        let mut redirected = None;
+        while let Some(component) = components.next() {
+            match component {
+                Component::Prefix(_) | Component::RootDir => {
+                    resolved.push(component);
+                    continue;
+                }
+                Component::CurDir => continue,
+                Component::ParentDir => {
+                    resolved.pop();
+                    continue;
+                }
+                Component::Normal(_) => resolved.push(component),
+            }
+            if path_has_node_modules_bin(&resolved)
+                || excluded_root.is_some_and(|root| path_may_be_within(&resolved, root))
+            {
+                return false;
+            }
+            let Ok(metadata) = std::fs::symlink_metadata(&resolved) else {
+                return false;
+            };
+            if lpm_common::is_symlink_or_junction(&metadata) {
+                let Some(parent) = resolved.parent() else {
+                    return false;
+                };
+                if !trusted_search_directory(parent, account_home) {
+                    return false;
+                }
+                let Ok(target) = std::fs::read_link(&resolved) else {
+                    return false;
+                };
+                let mut target = if target.is_absolute() {
+                    target
+                } else {
+                    parent.join(target)
+                };
+                target.extend(components);
+                redirected = Some(target);
+                break;
+            }
+            if !path_is_known_within(account_home, &resolved)
+                && !trusted_search_ownership(&resolved, account_home)
+            {
+                return false;
+            }
+        }
+        match redirected {
+            Some(target) => pending = target,
+            None => {
+                return !is_project_local_program(&resolved, excluded_root)
+                    && trusted_search_ownership(&resolved, account_home);
+            }
+        }
+    }
+    false
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -405,16 +585,39 @@ impl BoundUpdateCommand {
         current_executable: &Path,
     ) -> Result<Self, LpmError> {
         let mut program = ResolvedProgram::on_path(logical_name, sanitized_path, project_root)?;
-        program.path = std::fs::canonicalize(&program.path).map_err(|error| {
+        let resolved_target = std::fs::canonicalize(&program.path).map_err(|error| {
             LpmError::SelfUpdate(format!(
                 "cannot bind the resolved {logical_name} executable: {error}"
             ))
         })?;
-        if is_project_local_program(&program.path, project_root) {
+        if is_project_local_program(&resolved_target, project_root) {
             return Err(LpmError::SelfUpdate(format!(
                 "cannot bind {logical_name} from a project-local path"
             )));
         }
+        let parent = program.path.parent().ok_or_else(|| {
+            LpmError::SelfUpdate("manager invocation has no parent directory".into())
+        })?;
+        let name = program.path.file_name().ok_or_else(|| {
+            LpmError::SelfUpdate("manager invocation has no executable name".into())
+        })?;
+        let parent = std::fs::canonicalize(parent).map_err(|error| {
+            LpmError::SelfUpdate(format!(
+                "cannot bind the {logical_name} invocation directory: {error}"
+            ))
+        })?;
+        // Normalize directory aliases but retain Cargo's multicall invocation name.
+        // The target identity is checked again before every execution.
+        let metadata = std::fs::symlink_metadata(&program.path).map_err(|error| {
+            LpmError::SelfUpdate(format!(
+                "cannot inspect the {logical_name} invocation: {error}"
+            ))
+        })?;
+        program.path = if lpm_common::is_symlink_or_junction(&metadata) {
+            parent.join(name)
+        } else {
+            resolved_target
+        };
         let program_identity = same_file::Handle::from_path(&program.path).map_err(|error| {
             LpmError::SelfUpdate(format!(
                 "cannot bind the resolved {logical_name} executable identity: {error}"
@@ -1690,7 +1893,8 @@ mod tests {
 
     #[test]
     fn unrecognized_working_directory_does_not_remove_a_global_manager_from_path() {
-        let directory = tempfile::tempdir().unwrap();
+        let directory =
+            tempfile::tempdir_in(super::super::canonical_account_home().unwrap()).unwrap();
         let bin = directory.path().join("bin");
         std::fs::create_dir(&bin).unwrap();
         let _environment = crate::test_env::ScopedEnv::set([(
@@ -2578,5 +2782,262 @@ mod tests {
         killer.join().unwrap();
 
         assert!(elapsed < Duration::from_secs(2), "elapsed {elapsed:?}");
+    }
+    #[cfg(unix)]
+    #[test]
+    fn bound_manager_preserves_multicall_invocation_and_runnable_plan() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+        let account = tempfile::tempdir().unwrap();
+        let account_home = std::fs::canonicalize(account.path()).unwrap();
+        let bin = account_home.join("bin");
+        std::fs::create_dir(&bin).unwrap();
+        let target = bin.join("rustup");
+        std::fs::write(&target, "#!/bin/sh\n[ \"${0##*/}\" = cargo ]\n").unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let manager = bin.join("cargo");
+        symlink(&target, &manager).unwrap();
+        let command = BoundUpdateCommand::bind(
+            "cargo",
+            &[],
+            bin.as_os_str(),
+            None,
+            None,
+            &account_home,
+            &target,
+        )
+        .unwrap();
+        command
+            .run()
+            .expect("Cargo must retain its multicall invocation name");
+        assert_eq!(
+            command.verified_program_utf8().unwrap(),
+            manager.to_str().unwrap()
+        );
+        let plan = command.render_verified_plan().unwrap();
+        assert!(
+            Command::new("/bin/sh")
+                .args(["-c", &plan])
+                .status()
+                .unwrap()
+                .success()
+        );
+        let other = bin.join("replacement");
+        std::fs::write(&other, "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::remove_file(&manager).unwrap();
+        symlink(other, manager).unwrap();
+        assert!(
+            command
+                .run()
+                .unwrap_err()
+                .to_string()
+                .contains("changed after it was bound")
+        );
+    }
+    #[test]
+    fn sanitized_path_binds_directory_aliases_before_they_can_be_retargeted() {
+        let account_home = super::super::canonical_account_home().unwrap();
+        let directory = tempfile::tempdir_in(account_home).unwrap();
+        let trusted = directory.path().join("trusted");
+        let untrusted = directory.path().join("replacement");
+        std::fs::create_dir(&trusted).unwrap();
+        std::fs::create_dir(&untrusted).unwrap();
+        std::fs::write(trusted.join("identity"), "trusted").unwrap();
+        std::fs::write(untrusted.join("identity"), "replacement").unwrap();
+        let alias = directory.path().join("alias");
+        lpm_common::create_dir_symlink_or_junction(&trusted, &alias).unwrap();
+        let sanitized = {
+            let _environment =
+                crate::test_env::ScopedEnv::set([("PATH", alias.as_os_str().to_owned())]);
+            sanitized_current_path(None).unwrap()
+        };
+        lpm_common::remove_path_entry(&alias).unwrap();
+        lpm_common::create_dir_symlink_or_junction(&untrusted, &alias).unwrap();
+        let entries = std::env::split_paths(&sanitized).collect::<Vec<_>>();
+        assert_eq!(entries, vec![std::fs::canonicalize(&trusted).unwrap()]);
+        assert_eq!(
+            std::fs::read_to_string(entries[0].join("identity")).unwrap(),
+            "trusted"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sanitized_path_rejects_helpers_with_mutable_intermediate_symlink_routes() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+        let account_home = super::super::canonical_account_home().unwrap();
+        let directory = tempfile::tempdir_in(account_home).unwrap();
+        let root = std::fs::canonicalize(directory.path()).unwrap();
+        let bin = root.join("bin");
+        let trusted = root.join("trusted");
+        let replacement = root.join("replacement");
+        let shared = root.join("shared");
+        for path in [&bin, &trusted, &replacement, &shared] {
+            std::fs::create_dir(path).unwrap();
+        }
+        std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o777)).unwrap();
+        let marker = root.join("untrusted-helper-ran");
+        for (path, script) in [
+            (trusted.join("node"), "#!/bin/sh\nexit 0\n".to_string()),
+            (
+                replacement.join("node"),
+                format!("#!/bin/sh\nprintf x > '{}'\n", marker.display()),
+            ),
+        ] {
+            std::fs::write(&path, script).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let alias = shared.join("alias");
+        symlink(&trusted, &alias).unwrap();
+        symlink(alias.join("node"), bin.join("node")).unwrap();
+        let sanitized = {
+            let _environment =
+                crate::test_env::ScopedEnv::set([("PATH", bin.as_os_str().to_owned())]);
+            sanitized_current_path(None).unwrap()
+        };
+        std::fs::remove_file(&alias).unwrap();
+        symlink(&replacement, &alias).unwrap();
+        let _ = Command::new("/usr/bin/env")
+            .arg("node")
+            .env("PATH", sanitized)
+            .output()
+            .unwrap();
+        assert!(
+            !marker.exists(),
+            "helper lookup followed a mutable intermediate symlink route"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn helper_path_accepts_trusted_relative_links_and_rejects_cycles() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+        let account = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(account.path()).unwrap();
+        let bin = root.join("bin");
+        let tools = root.join("tools");
+        std::fs::create_dir(&bin).unwrap();
+        std::fs::create_dir(&tools).unwrap();
+        let node = tools.join("node");
+        std::fs::write(&node, "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&node, std::fs::Permissions::from_mode(0o755)).unwrap();
+        symlink("../tools", bin.join("current")).unwrap();
+        symlink("current/node", bin.join("node")).unwrap();
+        assert!(trusted_helper_path(&bin.join("node"), &root, None));
+        assert!(!trusted_helper_path(&bin.join("node"), &root, Some(&tools)));
+        std::fs::remove_file(bin.join("current")).unwrap();
+        symlink("current", bin.join("current")).unwrap();
+        assert!(!trusted_helper_path(&bin.join("node"), &root, None));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sanitized_path_rejects_mutable_components_before_parent_traversal() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+        let account_home = super::super::canonical_account_home().unwrap();
+        let directory = tempfile::tempdir_in(account_home).unwrap();
+        let root = std::fs::canonicalize(directory.path()).unwrap();
+        let bin = root.join("bin");
+        let trusted = root.join("trusted");
+        let shared = root.join("shared");
+        let component = shared.join("component");
+        let replacement = root.join("replacement");
+        for path in [
+            &bin,
+            &trusted,
+            &component,
+            &replacement.join("tree/child"),
+            &replacement.join("trusted"),
+        ] {
+            std::fs::create_dir_all(path).unwrap();
+        }
+        std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o777)).unwrap();
+        let marker = root.join("untrusted-helper-ran");
+        for (path, script) in [
+            (trusted.join("node"), "#!/bin/sh\nexit 0\n".to_string()),
+            (
+                replacement.join("trusted/node"),
+                format!("#!/bin/sh\nprintf x > '{}'\n", marker.display()),
+            ),
+        ] {
+            std::fs::write(&path, script).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        symlink(component.join("../../trusted/node"), bin.join("node")).unwrap();
+        let sanitized = {
+            let _environment =
+                crate::test_env::ScopedEnv::set([("PATH", bin.as_os_str().to_owned())]);
+            sanitized_current_path(None).unwrap()
+        };
+        std::fs::remove_dir(&component).unwrap();
+        symlink(replacement.join("tree/child"), &component).unwrap();
+        let _ = Command::new("/usr/bin/env")
+            .arg("node")
+            .env("PATH", sanitized)
+            .output()
+            .unwrap();
+        assert!(
+            !marker.exists(),
+            "parent traversal followed a replaced directory component"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn helper_route_rejects_project_paths_with_alternate_case_before_parent_traversal() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+        let account = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(account.path()).unwrap();
+        let project = root.join("project");
+        let trusted = root.join("trusted");
+        let bin = root.join("bin");
+        for directory in [&project, &trusted, &bin] {
+            std::fs::create_dir(directory).unwrap();
+        }
+        let node = trusted.join("node");
+        std::fs::write(&node, "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&node, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let alternate = root.join("PrOjEcT");
+        if !alternate.exists() {
+            return; // Case-sensitive filesystems do not provide this alias.
+        }
+        symlink(alternate.join("../trusted/node"), bin.join("node")).unwrap();
+        assert!(!trusted_helper_path(
+            &bin.join("node"),
+            &root,
+            Some(&project)
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn helper_link_rejection_applies_before_following_file_or_directory_targets() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+        let account = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(account.path()).unwrap();
+        let bin = root.join("bin");
+        let target_directory = root.join("tools");
+        std::fs::create_dir(&bin).unwrap();
+        std::fs::create_dir(&target_directory).unwrap();
+        let target = target_directory.join("node");
+        std::fs::write(&target, "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o755)).unwrap();
+        for destination in [&target, &target_directory] {
+            let alias = bin.join("node.exe");
+            symlink(destination, &alias).unwrap();
+            assert!(!trusted_search_executables(
+                &bin,
+                &root,
+                None,
+                HelperLinks::Reject
+            ));
+            std::fs::remove_file(alias).unwrap();
+        }
+        std::fs::copy(target, bin.join("node.exe")).unwrap();
+        assert!(trusted_search_executables(
+            &bin,
+            &root,
+            None,
+            HelperLinks::Reject
+        ));
     }
 }
