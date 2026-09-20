@@ -170,10 +170,8 @@ pub(crate) struct DoctorArgs {
 
 #[derive(Args)]
 pub(crate) struct McpArgs {
-    /// Action: setup, serve, remove, status.
-    pub(crate) action: String,
-    /// Server name (for setup/remove).
-    pub(crate) name: Option<String>,
+    #[command(subcommand)]
+    pub(crate) action: commands::mcp::McpAction,
 }
 
 #[derive(Args)]

@@ -360,8 +360,7 @@ async fn async_main() -> Result<()> {
         lpm_auth::SessionManager::new(session_registry_url.to_string(), explicit_flag_token);
     let session_manager = auth_storage_notice::attach(session_manager, cli.json);
     let session = std::sync::Arc::new(session_manager);
-    let unattended_mcp_serve =
-        matches!(&command, Commands::Mcp(args) if args.action.as_str() == "serve");
+    let unattended_mcp_serve = matches!(&command, Commands::Mcp(args) if matches!(args.action, commands::mcp::McpAction::Serve));
 
     let mut client = lpm_registry::RegistryClient::new()
         .with_base_url(session_registry_url.to_string())
@@ -2018,11 +2017,7 @@ async fn async_main() -> Result<()> {
             commands::swift_registry::run(&session, registry_url, cli.json, force).await
         },
         Commands::Mcp(args) => {
-            let security_args::McpArgs {
-                action,
-                name,
-            } = args;
-            commands::mcp::run(&client, &action, name.as_deref(), cli.json).await
+            commands::mcp::run(&client, args.action, cli.json).await
         },
         Commands::Use(args) => {
             let lifecycle_args::UseArgs {
