@@ -183,6 +183,6 @@ fn forward_script_output_to_stderr(output: &str) -> Result<(), LpmError> {
         return Ok(());
     }
     std::io::stderr()
-        .write_all(output.as_bytes())
+        .write_all(lpm_common::sanitize_terminal_multiline(output).as_bytes())
         .map_err(LpmError::Io)
 }
