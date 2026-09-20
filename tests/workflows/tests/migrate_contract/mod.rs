@@ -915,3 +915,527 @@ fn migration_resolves_bun_dependencies_from_their_nearest_package_location() {
         &[toml::Value::String("child@1.0.0".into())]
     );
 }
+
+#[test]
+fn migration_preview_counts_workspace_union_once_and_applies_exclusions() {
+    let project = TempProject::empty(
+        r#"{"name":"root","private":true,"workspaces":["packages/*","packages/a","!packages/excluded"]}"#,
+    );
+    project.write_file(
+        "pnpm-workspace.yaml",
+        "packages:\n  - 'apps/*'\n  - 'packages/*'\n",
+    );
+    for (path, name) in [
+        ("packages/a", "a"),
+        ("packages/excluded", "excluded"),
+        ("apps/web", "web"),
+    ] {
+        project.write_file(
+            &format!("{path}/package.json"),
+            &json!({"name":name,"version":"1.0.0"}).to_string(),
+        );
+    }
+    project.write_file(
+        "package-lock.json",
+        r#"{"lockfileVersion":3,"packages":{}}"#,
+    );
+    let output = lpm(&project)
+        .args(["migrate", "--dry-run", "--json"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["workspace_members"], 2);
+    assert!(!project.file_exists("lpm.lock"));
+    assert!(!project.file_exists(".lpm"));
+    assert!(!project.file_exists(".lpm-migrate-manifest.json"));
+}
+
+#[tokio::test]
+async fn migration_installs_workspace_members_once_and_restores_their_previous_locks() {
+    use crate::support::lpm_with_registry_and_npm;
+    use crate::support::mock_registry::{MockRegistry, make_tarball};
+    let project = TempProject::empty(
+        r#"{"name":"root","version":"1.0.0","private":true,"workspaces":["packages/*"],"dependencies":{"root-dep":"1.0.0"},"scripts":{"postinstall":"echo root >> order.txt"}}"#,
+    );
+    project.write_file("packages/core/package.json", r#"{"name":"core","version":"1.0.0","scripts":{"postinstall":"echo core >> ../../order.txt"}}"#);
+    project.write_file("packages/app/package.json", r#"{"name":"app","version":"1.0.0","dependencies":{"core":"workspace:*","member-dep":"1.0.0"},"scripts":{"postinstall":"echo app >> ../../order.txt"}}"#);
+    project.write_file(
+        "package-lock.json",
+        r#"{"lockfileVersion":3,"packages":{}}"#,
+    );
+    lpm_lockfile::Lockfile::new()
+        .write_all(&project.path().join("packages/core/lpm.lock"))
+        .unwrap();
+    let old_lock = std::fs::read(project.path().join("packages/core/lpm.lock")).unwrap();
+    let old_binary = std::fs::read(project.path().join("packages/core/lpm.lockb")).ok();
+    let registry = MockRegistry::start().await;
+    for name in ["root-dep", "member-dep"] {
+        registry
+            .with_package(name, "1.0.0", &make_tarball(name, "1.0.0"))
+            .await;
+    }
+    let output = lpm_with_registry_and_npm(&project, &registry.url())
+        .env("CI", "1")
+        .args([
+            "migrate",
+            "--skip-verify",
+            "--no-npmrc",
+            "--no-ci",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stderr),
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["success"], true);
+    assert_eq!(report["workspace_members"], 2);
+    assert!(project.file_exists("packages/app/node_modules/member-dep/package.json"));
+    assert!(project.file_exists("node_modules/root-dep/package.json"));
+    assert_eq!(
+        project.read_file("order.txt").lines().collect::<Vec<_>>(),
+        ["core", "app", "root"]
+    );
+    assert!(!project.file_exists("packages/core/lpm.lock"));
+    assert!(!project.file_exists("packages/core/lpm.lockb"));
+    lpm(&project)
+        .args(["migrate", "--rollback"])
+        .assert()
+        .success();
+    assert_eq!(
+        std::fs::read(project.path().join("packages/core/lpm.lock")).unwrap(),
+        old_lock
+    );
+    assert_eq!(
+        std::fs::read(project.path().join("packages/core/lpm.lockb")).ok(),
+        old_binary
+    );
+}
+
+#[test]
+fn migration_workspace_member_failure_prevents_root_lifecycle_and_keeps_recovery() {
+    let project = TempProject::empty(
+        r#"{"name":"root","private":true,"workspaces":["packages/*"],"scripts":{"postinstall":"echo root > root-ran"}}"#,
+    );
+    project.write_file(
+        "packages/failing/package.json",
+        r#"{"name":"failing","version":"1.0.0","scripts":{"postinstall":"exit 1"}}"#,
+    );
+    project.write_file(
+        "package-lock.json",
+        r#"{"lockfileVersion":3,"packages":{}}"#,
+    );
+    let output = lpm(&project)
+        .args([
+            "migrate",
+            "--skip-verify",
+            "--no-npmrc",
+            "--no-ci",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["success"], false);
+    assert!(!project.file_exists("root-ran"));
+    assert!(project.file_exists(".lpm-migrate-manifest.json"));
+}
+
+#[test]
+fn migration_ci_hint_can_be_run_after_success() {
+    let project = TempProject::empty(r#"{"name":"ci-hint","version":"1.0.0"}"#);
+    project.write_file(
+        "package-lock.json",
+        r#"{"lockfileVersion":3,"packages":{}}"#,
+    );
+    project.write_file(".github/workflows/existing.yml", "name: CI\n");
+    let output = lpm(&project)
+        .args(["migrate", "--skip-verify", "--no-npmrc"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("lpm migrate --force --ci"), "{stderr}");
+    lpm(&project)
+        .args(["migrate", "--force", "--ci"])
+        .assert()
+        .success();
+    assert!(project.file_exists(".github/workflows/ci.lpm.yml"));
+    lpm(&project)
+        .args(["migrate", "--rollback"])
+        .assert()
+        .success();
+    assert!(!project.file_exists(".github/workflows/ci.lpm.yml"));
+    assert!(!project.file_exists("lpm.lock"));
+}
+
+#[test]
+fn migration_rejects_workspace_members_before_mutation() {
+    for flags in [vec![], vec!["--dry-run"], vec!["--no-install"]] {
+        let project =
+            TempProject::empty(r#"{"name":"root","private":true,"workspaces":["packages/*"]}"#);
+        project.write_file(
+            "packages/app/package.json",
+            r#"{"name":"app","version":"1.0.0"}"#,
+        );
+        project.write_file(
+            "packages/app/package-lock.json",
+            r#"{"lockfileVersion":3,"packages":{}}"#,
+        );
+        let output = lpm(&project)
+            .current_dir(project.path().join("packages/app"))
+            .args([
+                "migrate",
+                "--skip-verify",
+                "--no-npmrc",
+                "--no-ci",
+                "--json",
+            ])
+            .args(flags)
+            .output()
+            .unwrap();
+        assert!(
+            !output.status.success(),
+            "member conversion must require the workspace root"
+        );
+        let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert!(
+            report["error"].as_str().unwrap().contains("workspace root"),
+            "{report}"
+        );
+        for file in [
+            "lpm.lock",
+            "packages/app/lpm.lock",
+            ".lpm",
+            "packages/app/.lpm",
+            ".lpm-migrate-manifest.json",
+            "packages/app/.lpm-migrate-manifest.json",
+            "packages/app/package-lock.json.backup",
+        ] {
+            assert!(!project.file_exists(file), "unexpected mutation: {file}");
+        }
+    }
+}
+
+#[test]
+fn migration_rollback_inside_a_member_retains_local_recovery() {
+    let project =
+        TempProject::empty(r#"{"name":"root","private":true,"workspaces":["packages/*"]}"#);
+    project.write_file(
+        "packages/app/package.json",
+        r#"{"name":"app","version":"1.0.0"}"#,
+    );
+    project.write_file("packages/app/lpm.lock", "new lock bytes");
+    project.write_file("packages/app/lpm.lock.backup", "original lock bytes");
+    project.write_file("packages/app/.lpm-migrate-manifest.json", r#"{"version":2,"backups":[{"original":"lpm.lock","backup":"lpm.lock.backup"}],"created":[]}"#);
+    lpm(&project)
+        .current_dir(project.path().join("packages/app"))
+        .args(["migrate", "--rollback"])
+        .assert()
+        .success();
+    assert_eq!(
+        project.read_file("packages/app/lpm.lock"),
+        "original lock bytes"
+    );
+    assert!(!project.file_exists("lpm.lock"));
+}
+
+#[test]
+fn migration_snapshots_members_added_while_waiting_for_the_workspace_lock() {
+    use crate::support::{LOCK_CONTENTION_MARKER_ENV, lpm_spawnable, wait_for_lock_contention};
+    let project =
+        TempProject::empty(r#"{"name":"root","private":true,"workspaces":["packages/*"]}"#);
+    project.write_file(
+        "packages/core/package.json",
+        r#"{"name":"core","version":"1.0.0"}"#,
+    );
+    project.write_file(
+        "package-lock.json",
+        r#"{"lockfileVersion":3,"packages":{}}"#,
+    );
+    let lock_path = lpm_common::project_install_lock(project.path());
+    let transaction_lock = lpm_common::acquire_exclusive_lock(&lock_path).unwrap();
+    let marker = project.home().join("migration-lock-contention");
+    let mut command = lpm_spawnable(&project);
+    command.env(LOCK_CONTENTION_MARKER_ENV, &marker).args([
+        "migrate",
+        "--skip-verify",
+        "--no-npmrc",
+        "--no-ci",
+        "--json",
+    ]);
+    let mut child = command.spawn().unwrap();
+    wait_for_lock_contention(&mut child, &marker, &lock_path);
+    project.write_file(
+        "packages/added/package.json",
+        r#"{"name":"added","version":"1.0.0"}"#,
+    );
+    lpm_lockfile::Lockfile::new()
+        .write_all(&project.path().join("packages/added/lpm.lock"))
+        .unwrap();
+    let original = std::fs::read(project.path().join("packages/added/lpm.lock")).unwrap();
+    let binary = std::fs::read(project.path().join("packages/added/lpm.lockb")).ok();
+    let converted_before_lock = project.file_exists("lpm.lock");
+    drop(transaction_lock);
+    let output = child.wait_with_output().unwrap();
+    assert!(
+        !converted_before_lock,
+        "migration converted before acquiring its install lock"
+    );
+    assert!(
+        output.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stderr),
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["workspace_members"], 2);
+    assert!(!project.file_exists("packages/added/lpm.lock"));
+    lpm(&project)
+        .args(["migrate", "--rollback"])
+        .assert()
+        .success();
+    assert_eq!(
+        std::fs::read(project.path().join("packages/added/lpm.lock")).unwrap(),
+        original
+    );
+    assert_eq!(
+        std::fs::read(project.path().join("packages/added/lpm.lockb")).ok(),
+        binary
+    );
+}
+
+#[test]
+fn migration_standalone_postinstall_can_run_rebuild() {
+    let project = TempProject::empty(
+        r#"{"name":"standalone-hook","version":"1.0.0","scripts":{"postinstall":"node hook.cjs"}}"#,
+    );
+    project.write_file(
+        "package-lock.json",
+        r#"{"lockfileVersion":3,"packages":{}}"#,
+    );
+    project.write_file("hook.cjs", r#"
+const { execFileSync } = require('node:child_process');
+execFileSync(process.env.FIXTURE_LPM_BINARY, ['rebuild', '--dry-run'], { timeout: 4000, stdio: 'pipe' });
+require('node:fs').writeFileSync('hook-complete', 'ok');
+"#);
+    lpm(&project)
+        .env("FIXTURE_LPM_BINARY", assert_cmd::cargo::cargo_bin("lpm-rs"))
+        .args([
+            "migrate",
+            "--skip-verify",
+            "--no-npmrc",
+            "--no-ci",
+            "--json",
+        ])
+        .assert()
+        .success();
+    assert_eq!(project.read_file("hook-complete"), "ok");
+}
+
+#[test]
+fn workspace_lifecycle_commands_report_parent_lock_conflicts_without_waiting() {
+    for command in ["install", "migrate"] {
+        for (owner, phase, json_output) in [
+            ("root", "pnpm:devPreinstall", false),
+            ("root", "postinstall", true),
+            ("member", "pnpm:devPreinstall", true),
+            ("member", "postinstall", false),
+        ] {
+            let mut root =
+                json!({"name":"root","version":"1.0.0","private":true,"workspaces":["packages/*"]});
+            let project = TempProject::empty(&root.to_string());
+            let other = TempProject::empty(r#"{"name":"other","version":"1.0.0"}"#);
+            let mut member = json!({"name":"app","version":"1.0.0"});
+            if owner == "root" {
+                root["scripts"] = json!({phase: "node hook.cjs"});
+            } else {
+                member["scripts"] = json!({phase: "node ../../hook.cjs"});
+            }
+            project.write_file("package.json", &root.to_string());
+            project.write_file("packages/app/package.json", &member.to_string());
+            project.write_file(
+                "package-lock.json",
+                r#"{"lockfileVersion":3,"packages":{}}"#,
+            );
+            project.write_file("hook.cjs", r#"
+const { spawnSync } = require('node:child_process');
+const assert = require('node:assert/strict');
+for (const args of [['rebuild', '--dry-run'], ['version', 'patch', '--dry-run'], ['version', 'patch', '--no-git-tag-version']]) {
+  const result = spawnSync(process.env.FIXTURE_LPM_BINARY, args, { timeout: 4000, encoding: 'utf8' });
+  assert.ifError(result.error);
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr + result.stdout, /parent installation/);
+}
+const help = spawnSync(process.env.FIXTURE_LPM_BINARY, ['--help'], { timeout: 4000 });
+assert.ifError(help.error);
+assert.equal(help.status, 0);
+const other = spawnSync(process.env.FIXTURE_LPM_BINARY, ['version', 'patch', '--no-git-tag-version'], { cwd: process.env.FIXTURE_OTHER_PROJECT, timeout: 4000 });
+assert.ifError(other.error);
+assert.equal(other.status, 0);
+require('node:fs').writeFileSync('hook-complete', 'ok');
+"#);
+            let mut invocation = lpm(&project);
+            invocation.env("FIXTURE_LPM_BINARY", assert_cmd::cargo::cargo_bin("lpm-rs"));
+            invocation.env("FIXTURE_OTHER_PROJECT", other.path());
+            if json_output {
+                invocation.arg("--json");
+            }
+            if command == "install" {
+                invocation.args([
+                    "install",
+                    "--no-skills",
+                    "--no-editor-setup",
+                    "--no-security-summary",
+                    "--no-audit-after-install",
+                ]);
+            } else {
+                invocation.args(["migrate", "--skip-verify", "--no-npmrc", "--no-ci"]);
+            }
+            invocation.assert().success();
+            let marker = if owner == "root" {
+                "hook-complete"
+            } else {
+                "packages/app/hook-complete"
+            };
+            assert_eq!(project.read_file(marker), "ok");
+            lpm(&project)
+                .args(["rebuild", "--dry-run"])
+                .assert()
+                .success();
+        }
+    }
+}
+
+#[test]
+fn inherited_lifecycle_lock_context_allows_commands_after_parent_release() {
+    let project = TempProject::empty(r#"{"name":"released-parent","version":"1.0.0"}"#);
+    lpm(&project)
+        .args([
+            "install",
+            "--no-skills",
+            "--no-editor-setup",
+            "--no-security-summary",
+            "--no-audit-after-install",
+        ])
+        .assert()
+        .success();
+    let parent =
+        lpm_common::acquire_exclusive_lock(lpm_common::project_install_lock(project.path()))
+            .unwrap();
+    let (key, value) = lpm_common::parent_install_lock_environment(project.path()).unwrap();
+    drop(parent);
+    for args in [
+        vec!["rebuild", "--dry-run"],
+        vec!["version", "patch", "--dry-run"],
+        vec!["version", "patch", "--no-git-tag-version"],
+    ] {
+        lpm(&project)
+            .env(&key, &value)
+            .args(args)
+            .assert()
+            .success();
+    }
+}
+
+#[test]
+fn nested_workspace_lifecycle_preserves_ancestor_install_lock_context() {
+    let outer = TempProject::empty(
+        r#"{"name":"outer","version":"1.0.0","private":true,"workspaces":["packages/*"]}"#,
+    );
+    outer.write_file(
+        "packages/app/package.json",
+        r#"{"name":"outer-app","version":"1.0.0","scripts":{"postinstall":"node ../../hook.cjs"}}"#,
+    );
+    let inner = TempProject::empty(
+        r#"{"name":"inner","version":"1.0.0","private":true,"workspaces":["packages/*"]}"#,
+    );
+    inner.write_file(
+        "packages/app/package.json",
+        r#"{"name":"inner-app","version":"1.0.0","scripts":{"postinstall":"node ../../hook.cjs"}}"#,
+    );
+    outer.write_file("hook.cjs", r#"
+require('node:child_process').execFileSync(process.env.FIXTURE_LPM_BINARY,
+ ['install', '--no-skills', '--no-editor-setup', '--no-security-summary', '--no-audit-after-install'],
+ { cwd: process.env.FIXTURE_INNER_PROJECT, timeout: 10000, stdio: 'pipe' });
+"#);
+    inner.write_file("hook.cjs", r#"
+const assert = require('node:assert/strict');
+const result = require('node:child_process').spawnSync(process.env.FIXTURE_LPM_BINARY,
+ ['rebuild', '--dry-run'], { cwd: process.env.FIXTURE_OUTER_PROJECT, timeout: 4000, encoding: 'utf8' });
+assert.ifError(result.error);
+assert.notEqual(result.status, 0);
+assert.match(result.stderr + result.stdout, /parent installation/);
+require('node:fs').writeFileSync('ancestor-checked', 'ok');
+"#);
+    lpm(&outer)
+        .env("FIXTURE_LPM_BINARY", assert_cmd::cargo::cargo_bin("lpm-rs"))
+        .env("FIXTURE_INNER_PROJECT", inner.path())
+        .env("FIXTURE_OUTER_PROJECT", outer.path())
+        .args([
+            "install",
+            "--no-skills",
+            "--no-editor-setup",
+            "--no-security-summary",
+            "--no-audit-after-install",
+        ])
+        .assert()
+        .success();
+    assert_eq!(inner.read_file("packages/app/ancestor-checked"), "ok");
+}
+
+#[test]
+fn migration_rejects_workspace_removal_while_waiting_before_conversion() {
+    use crate::support::{LOCK_CONTENTION_MARKER_ENV, lpm_spawnable, wait_for_lock_contention};
+    let project =
+        TempProject::empty(r#"{"name":"root","version":"1.0.0","workspaces":["packages/*"]}"#);
+    project.write_file(
+        "packages/app/package.json",
+        r#"{"name":"app","version":"1.0.0"}"#,
+    );
+    project.write_file(
+        "package-lock.json",
+        r#"{"lockfileVersion":3,"packages":{}}"#,
+    );
+    let lock_path = lpm_common::project_install_lock(project.path());
+    let held = lpm_common::acquire_exclusive_lock(&lock_path).unwrap();
+    let marker = project.home().join("migration-topology-contention");
+    let mut cmd = lpm_spawnable(&project);
+    cmd.env(LOCK_CONTENTION_MARKER_ENV, &marker).args([
+        "migrate",
+        "--skip-verify",
+        "--no-npmrc",
+        "--no-ci",
+        "--json",
+    ]);
+    let mut child = cmd.spawn().unwrap();
+    wait_for_lock_contention(&mut child, &marker, &lock_path);
+    project.write_file("package.json", r#"{"name":"root","version":"1.0.0"}"#);
+    drop(held);
+    let output = child.wait_with_output().unwrap();
+    assert!(
+        !output.status.success(),
+        "migration must reject a changed workspace before conversion"
+    );
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(
+        report["error"]
+            .as_str()
+            .unwrap()
+            .contains("workspace configuration changed"),
+        "{report}"
+    );
+    assert!(!project.file_exists("lpm.lock"));
+    assert!(!project.file_exists(".lpm-migrate-manifest.json"));
+    assert!(!project.file_exists("package-lock.json.backup"));
+}

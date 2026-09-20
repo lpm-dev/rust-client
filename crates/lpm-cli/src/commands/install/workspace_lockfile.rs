@@ -434,7 +434,19 @@ tokio::task_local! {
     static ACTIVE_PROJECT_INSTALL_ROOT: PathBuf;
 }
 
-pub(super) async fn with_project_install_lock<F, T>(
+pub(crate) fn active_install_root() -> Option<PathBuf> {
+    ACTIVE_TARGET
+        .try_with(|target| target.coordinator.root.clone())
+        .ok()
+        .or_else(|| ACTIVE_PROJECT_INSTALL_ROOT.try_with(Clone::clone).ok())
+        .or_else(|| {
+            ACTIVE_TRANSACTION
+                .try_with(|transaction| transaction.root.clone())
+                .ok()
+        })
+}
+
+pub(crate) async fn with_project_install_lock<F, T>(
     project_root: &Path,
     future: F,
 ) -> Result<T, LpmError>

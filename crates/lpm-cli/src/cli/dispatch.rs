@@ -1068,6 +1068,7 @@ async fn async_main() -> Result<()> {
                             fail_if_no_match,
                             commands::install::RecursiveInstallOptions {
                                 json_output: cli.json,
+                                emit_summary: true,
                                 offline,
                                 frozen_lockfile: frozen_lockfile_mode,
                                 force,

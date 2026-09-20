@@ -318,7 +318,7 @@ pub fn migrate(project_dir: &Path) -> Result<MigrateResult, LpmError> {
     }
 
     // Detect workspace members
-    let workspace_members = detect_workspace_members(project_dir);
+    let workspace_members = detect_workspace_members(project_dir)?;
 
     // Normalize to LPM lockfile
     let (lockfile, skipped) = normalize::to_lockfile(packages);
@@ -373,51 +373,12 @@ fn read_dep_sets(
 }
 
 /// Detect how many workspace members exist in the project.
-fn detect_workspace_members(project_dir: &Path) -> usize {
-    // Check package.json "workspaces" field (npm/yarn/bun)
-    if let Ok(content) = lpm_common::read_text_file_capped(
-        &project_dir.join("package.json"),
-        lpm_common::CONFIG_FILE_SIZE_CAP_BYTES,
-    ) && let Ok(json) = serde_json::from_str::<serde_json::Value>(&content)
-        && let Some(workspaces) = json.get("workspaces")
-    {
-        // "workspaces": ["packages/*", "apps/*"]
-        if let Some(arr) = workspaces.as_array() {
-            return count_workspace_globs(project_dir, arr);
-        }
-        // "workspaces": { "packages": ["packages/*"] }
-        if let Some(obj) = workspaces.as_object()
-            && let Some(arr) = obj.get("packages").and_then(|p| p.as_array())
-        {
-            return count_workspace_globs(project_dir, arr);
-        }
-    }
-
-    // Check pnpm-workspace.yaml
-    if let Ok(content) = lpm_common::read_text_file_capped(
-        &project_dir.join("pnpm-workspace.yaml"),
-        lpm_common::CONFIG_FILE_SIZE_CAP_BYTES,
-    ) && let Ok(yaml) = serde_yaml::from_str::<serde_json::Value>(&content)
-        && let Some(arr) = yaml.get("packages").and_then(|p| p.as_array())
-    {
-        return count_workspace_globs(project_dir, arr);
-    }
-
-    0
-}
-
-/// Count workspace members by expanding glob patterns.
-fn count_workspace_globs(project_dir: &Path, patterns: &[serde_json::Value]) -> usize {
-    let mut count = 0;
-    for pattern in patterns {
-        if let Some(glob_str) = pattern.as_str() {
-            let full_pattern = project_dir.join(glob_str).join("package.json");
-            if let Ok(paths) = glob::glob(full_pattern.to_str().unwrap_or("")) {
-                count += paths.filter_map(|p| p.ok()).count();
-            }
-        }
-    }
-    count
+fn detect_workspace_members(project_dir: &Path) -> Result<usize, LpmError> {
+    let workspace = lpm_workspace::discover_workspace(project_dir)
+        .map_err(|error| LpmError::Workspace(error.to_string()))?;
+    Ok(workspace
+        .filter(|workspace| workspace.root == project_dir)
+        .map_or(0, |workspace| workspace.members.len()))
 }
 
 #[cfg(test)]
@@ -447,7 +408,7 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(detect_workspace_members(dir.path()), 2);
+        assert_eq!(detect_workspace_members(dir.path()).unwrap(), 2);
     }
 
     #[test]
@@ -466,7 +427,7 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(detect_workspace_members(dir.path()), 1);
+        assert_eq!(detect_workspace_members(dir.path()).unwrap(), 1);
     }
 
     #[test]
@@ -478,7 +439,7 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(detect_workspace_members(dir.path()), 0);
+        assert_eq!(detect_workspace_members(dir.path()).unwrap(), 0);
     }
 
     #[test]
@@ -496,7 +457,7 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(detect_workspace_members(dir.path()), 1);
+        assert_eq!(detect_workspace_members(dir.path()).unwrap(), 1);
     }
 
     #[test]

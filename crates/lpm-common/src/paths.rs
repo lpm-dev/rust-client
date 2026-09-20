@@ -847,6 +847,66 @@ fn probe_queue_empty(rw: &mut fd_lock::RwLock<std::fs::File>) -> Result<bool, Lp
     }
 }
 
+const PARENT_INSTALL_LOCKS_ENV: &str = "LPM_INTERNAL_PARENT_INSTALL_LOCKS";
+
+fn inherited_install_locks() -> Vec<Vec<u8>> {
+    std::env::var(PARENT_INSTALL_LOCKS_ENV)
+        .ok()
+        .and_then(|value| serde_json::from_str(&value).ok())
+        .unwrap_or_default()
+}
+
+/// Preserve ancestor install locks when launching a lifecycle subprocess.
+/// This context requests nonblocking acquisition; it never bypasses locking.
+pub fn parent_install_lock_environment(project_root: &Path) -> Result<(String, String), LpmError> {
+    let lock = project_install_lock(project_root).canonicalize()?;
+    let identity = lock.as_os_str().as_encoded_bytes().to_vec();
+    let mut locks = inherited_install_locks();
+    if !locks.contains(&identity) {
+        locks.push(identity);
+    }
+    Ok((
+        PARENT_INSTALL_LOCKS_ENV.to_string(),
+        serde_json::to_string(&locks)?,
+    ))
+}
+
+fn inherits_install_lock(path: &Path) -> bool {
+    let locks = inherited_install_locks();
+    if locks.is_empty() {
+        return false;
+    }
+    path.canonicalize().is_ok_and(|path| {
+        locks
+            .iter()
+            .any(|lock| lock == path.as_os_str().as_encoded_bytes())
+    })
+}
+
+fn lifecycle_lock_conflict() -> LpmError {
+    LpmError::Script(
+        "this lifecycle command conflicts with its parent installation; run it after installation completes".into(),
+    )
+}
+
+fn try_acquire_shared_from_source(
+    source: &impl LockFileSource,
+) -> Result<Option<SharedLockHandle>, LpmError> {
+    let mut queue = fd_lock::RwLock::new(source.open(LockFileComponent::WriterQueue)?);
+    if !probe_queue_empty(&mut queue)? {
+        return Ok(None);
+    }
+    let mut intent = fd_lock::RwLock::new(source.open(LockFileComponent::WriterIntent)?);
+    if !try_acquire(&mut intent, LockMode::Shared)? {
+        return Ok(None);
+    }
+    let mut data = fd_lock::RwLock::new(source.open(LockFileComponent::Data)?);
+    if !try_acquire(&mut data, LockMode::Shared)? {
+        return Ok(None);
+    }
+    Ok(Some(SharedLockHandle { _data: data }))
+}
+
 /// Acquire a shared lock under the writer-preference turnstile.
 ///
 /// 1. Probe the writer-queue baton. If any writer is queued (probe
@@ -862,6 +922,9 @@ fn acquire_shared_from_source(
     source: &impl LockFileSource,
     on_first_wait: impl FnOnce() + Send + 'static,
 ) -> Result<SharedLockHandle, LpmError> {
+    if inherits_install_lock(source.display_path()) {
+        return try_acquire_shared_from_source(source)?.ok_or_else(lifecycle_lock_conflict);
+    }
     let mut on_first_wait = Some(Box::new(on_first_wait) as Box<dyn FnOnce() + Send>);
     let mut on_first_contention = test_lock_contention_callback(source.display_path());
     let start = std::time::Instant::now();
@@ -932,6 +995,9 @@ fn acquire_exclusive_from_source(
     source: &impl LockFileSource,
     on_first_wait: impl FnOnce() + Send + 'static,
 ) -> Result<ExclusiveLockHandle, LpmError> {
+    if inherits_install_lock(source.display_path()) {
+        return try_acquire_exclusive_from_source(source)?.ok_or_else(lifecycle_lock_conflict);
+    }
     let mut on_first_contention = test_lock_contention_callback(source.display_path());
 
     // take queue-shared. Multiple writers can each hold this

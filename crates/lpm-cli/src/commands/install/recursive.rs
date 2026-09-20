@@ -56,6 +56,7 @@ impl AutomaticWorkspaceInstallPolicy {
 
 pub(crate) struct RecursiveInstallOptions {
     pub(crate) json_output: bool,
+    pub(crate) emit_summary: bool,
     pub(crate) offline: bool,
     pub(crate) frozen_lockfile: FrozenLockfileMode,
     pub(crate) force: bool,
@@ -170,14 +171,16 @@ pub(crate) async fn run_recursive_workspace_install(
                     "no workspace packages matched the filter (--fail-if-no-match)".into(),
                 ));
             }
-            emit_workspace_install_report(
-                &workspace.root,
-                &[],
-                options.json_output,
-                options.timing,
-                timing_detail_mode,
-                0,
-            );
+            if options.emit_summary {
+                emit_workspace_install_report(
+                    &workspace.root,
+                    &[],
+                    options.json_output,
+                    options.timing,
+                    timing_detail_mode,
+                    0,
+                );
+            }
             return Ok(());
         }
 
@@ -530,14 +533,16 @@ pub(crate) async fn run_recursive_workspace_install(
             workspace_lockfile::remove_member_lockfiles(&legacy_importers);
         }
 
-        emit_workspace_install_report(
-            &workspace_root,
-            &outcomes,
-            options.json_output,
-            options.timing,
-            timing_detail_mode,
-            duration_ms(started.elapsed()),
-        );
+        if options.emit_summary {
+            emit_workspace_install_report(
+                &workspace_root,
+                &outcomes,
+                options.json_output,
+                options.timing,
+                timing_detail_mode,
+                duration_ms(started.elapsed()),
+            );
+        }
         Ok(())
     })
     .await

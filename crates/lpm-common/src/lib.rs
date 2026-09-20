@@ -70,12 +70,12 @@ pub use paths::{
     SingleFileSharedLockHandle, acquire_exclusive_lock, acquire_single_file_exclusive_lock,
     acquire_single_file_exclusive_lock_from_file, acquire_single_file_shared_lock,
     acquire_single_file_shared_lock_from_file, as_extended_path, check_install_path_budget,
-    is_local_fs, project_install_lock, project_publish_lock, try_acquire_capability_exclusive_lock,
-    try_acquire_exclusive_lock, try_acquire_single_file_exclusive_lock_from_file,
-    try_with_exclusive_lock, with_capability_exclusive_lock, with_exclusive_lock,
-    with_exclusive_lock_async, with_project_exclusive_lock, with_project_exclusive_lock_async,
-    with_project_shared_lock, with_project_shared_lock_async, with_shared_lock,
-    with_shared_lock_async,
+    is_local_fs, parent_install_lock_environment, project_install_lock, project_publish_lock,
+    try_acquire_capability_exclusive_lock, try_acquire_exclusive_lock,
+    try_acquire_single_file_exclusive_lock_from_file, try_with_exclusive_lock,
+    with_capability_exclusive_lock, with_exclusive_lock, with_exclusive_lock_async,
+    with_project_exclusive_lock, with_project_exclusive_lock_async, with_project_shared_lock,
+    with_project_shared_lock_async, with_shared_lock, with_shared_lock_async,
 };
 pub use peer::PeerEdge;
 pub use project_glob::{rooted_project_glob, validate_project_glob};

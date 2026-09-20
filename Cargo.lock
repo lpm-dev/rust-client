@@ -3687,11 +3687,11 @@ version = "0.78.0"
 dependencies = [
  "cap-fs-ext",
  "cap-std",
- "glob",
  "libc",
  "lpm-common",
  "lpm-lockfile",
  "lpm-semver",
+ "lpm-workspace",
  "serde",
  "serde_json",
  "serde_json_lenient",
