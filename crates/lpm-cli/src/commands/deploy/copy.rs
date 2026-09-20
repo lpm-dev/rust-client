@@ -16,6 +16,7 @@ use super::paths::canonicalize_or_partial;
 /// - **Secrets** (CRITICAL security boundary): `.env*` files contain
 ///   credentials and must NEVER ride along into a deploy output. Even a
 ///   developer-only `.env.local` is a footgun if it leaks into a Docker image.
+///   Registry credential files are excluded even when explicitly selected.
 /// - **Version control**: `.git`, `.svn`, `.hg` — the deploy output is not
 ///   a repo and shouldn't carry git history.
 /// - **OS / editor cruft**: `.DS_Store`, `Thumbs.db`, swap files.
@@ -25,6 +26,10 @@ const DEPLOY_DENY_BASENAMES: &[&str] = &[
     ".lpm",
     "lpm.lock",
     "lpm.lockb",
+    // Registry credentials
+    ".npmrc",
+    ".netrc",
+    "_netrc",
     // Version control
     ".git",
     ".gitignore",
@@ -104,7 +109,7 @@ fn copy_member_source_recursive(
         if basename.as_encoded_bytes().starts_with(b".env")
             || DEPLOY_DENY_BASENAMES
                 .iter()
-                .any(|denied| *denied == basename_str.as_ref())
+                .any(|denied| denied.eq_ignore_ascii_case(basename_str.as_ref()))
         {
             stats.files_skipped += 1;
             continue;
