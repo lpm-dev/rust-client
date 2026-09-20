@@ -5331,3 +5331,30 @@ fn reuse_removes_unrecorded_package_slots() {
         assert!(!extra.exists());
     }
 }
+
+#[test]
+fn v3_verification_bounds_integrity_marker_reads() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::at_v3(dir.path());
+    let tarball = build_test_tarball(&[(
+        "package.json",
+        b"{\"name\":\"marker\",\"version\":\"1.0.0\"}",
+    )]);
+    let (object, sri, _) = store.extract_object_from_bytes(&tarball, None).unwrap();
+    std::fs::write(
+        object.join(".integrity"),
+        format!(
+            "{sri}{}",
+            " ".repeat(INTEGRITY_MARKER_SIZE_CAP_BYTES as usize)
+        ),
+    )
+    .unwrap();
+    let verification = store.verify_file_cas(false).unwrap().unwrap();
+    assert!(
+        verification
+            .issues
+            .iter()
+            .any(|issue| issue.contains("failed to read source integrity")),
+        "{verification:?}"
+    );
+}

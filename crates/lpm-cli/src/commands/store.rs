@@ -1,4 +1,5 @@
 mod lockfile_verification;
+mod maintenance;
 
 use crate::install_ui;
 use lpm_common::color::Painted;
@@ -48,9 +49,12 @@ pub async fn run(action: StoreCmd, json_output: bool) -> Result<(), LpmError> {
     let root = LpmRoot::from_env()?;
 
     match action {
-        StoreCmd::Verify { deep, fix } => with_shared_lock(root.store_lock(), || {
-            run_verify(&root, &store, deep, fix, json_output)
-        }),
+        StoreCmd::Verify { deep, fix } => {
+            maintenance::ensure_directory(&root.store_root())?;
+            with_shared_lock(root.store_lock(), || {
+                run_verify(&root, &store, deep, fix, json_output)
+            })
+        }
         StoreCmd::Path => {
             let path = store.root().display().to_string();
             if json_output {
@@ -66,7 +70,10 @@ pub async fn run(action: StoreCmd, json_output: bool) -> Result<(), LpmError> {
             }
             Ok(())
         }
-        StoreCmd::Clean => with_exclusive_lock(root.store_lock(), || run_clean(&root, json_output)),
+        StoreCmd::Clean => {
+            maintenance::ensure_directory(&root.store_root())?;
+            with_exclusive_lock(root.store_lock(), || run_clean(&root, json_output))
+        }
     }
 }
 
@@ -90,9 +97,9 @@ fn run_clean(root: &LpmRoot, json_output: bool) -> Result<(), LpmError> {
     let v2 = root.store_root().join("v2");
     let v3 = root.store_root().join("v3");
 
-    let v1_existed = v1.exists();
-    let v2_existed = v2.exists();
-    let v3_existed = v3.exists();
+    let v1_existed = maintenance::entry_exists(&v1)?;
+    let v2_existed = maintenance::entry_exists(&v2)?;
+    let v3_existed = maintenance::entry_exists(&v3)?;
 
     if !v1_existed && !v2_existed && !v3_existed {
         if json_output {
@@ -107,29 +114,29 @@ fn run_clean(root: &LpmRoot, json_output: bool) -> Result<(), LpmError> {
     }
 
     let v1_bytes = if v1_existed {
-        crate::commands::cache::dir_size(&v1).unwrap_or(0)
+        maintenance::removed_size(&v1)
     } else {
         0
     };
     let v2_bytes = if v2_existed {
-        crate::commands::cache::dir_size(&v2).unwrap_or(0)
+        maintenance::removed_size(&v2)
     } else {
         0
     };
     let v3_bytes = if v3_existed {
-        crate::commands::cache::dir_size(&v3).unwrap_or(0)
+        maintenance::removed_size(&v3)
     } else {
         0
     };
 
     if v1_existed {
-        std::fs::remove_dir_all(&v1)?;
+        lpm_common::remove_path_entry(&v1)?;
     }
     if v2_existed {
-        std::fs::remove_dir_all(&v2)?;
+        lpm_common::remove_path_entry(&v2)?;
     }
     if v3_existed {
-        std::fs::remove_dir_all(&v3)?;
+        lpm_common::remove_path_entry(&v3)?;
     }
 
     let bytes_before = v1_bytes + v2_bytes + v3_bytes;
@@ -248,6 +255,7 @@ fn run_verify(
     json_output: bool,
 ) -> Result<(), LpmError> {
     let deep = deep || fix;
+    maintenance::verify_roots(&lpm_root.store_root())?;
     let mut packages: Vec<StoreVerifyEntry> = list_v1_verify_entries(store)?;
     let (v2_entries, mut sidecar_issues) = list_v2_verify_entries(lpm_root)?;
     let (v3_entries, mut v3_sidecar_issues) =
@@ -392,66 +400,57 @@ fn run_verify(
             }
         }
 
-        // Check 1: directory exists
-        if !dir.exists() {
-            corrupted.push(format!("{safe_name}@{safe_version} — directory missing"));
+        if let Err(error) = maintenance::verify_directory_chain(&lpm_root.store_root(), dir) {
+            corrupted.push(format!("{safe_name}@{safe_version} — {error}"));
             continue;
         }
-
-        // Check 2: package.json exists
         let pkg_json_path = dir.join("package.json");
-        if !pkg_json_path.exists() {
-            corrupted.push(format!("{safe_name}@{safe_version} — missing package.json"));
-            continue;
-        }
-
-        // Check 3: directory is non-empty (has at least package.json + something else,
-        // or at minimum package.json itself)
-        let file_count = match std::fs::read_dir(dir) {
-            Ok(entries) => entries.count(),
-            Err(e) => {
+        match std::fs::symlink_metadata(&pkg_json_path) {
+            Ok(metadata)
+                if metadata.is_file()
+                    && !lpm_common::is_symlink_or_junction(&metadata)
+                    && metadata.len() > 0 => {}
+            Ok(_) => {
                 corrupted.push(format!(
-                    "{safe_name}@{safe_version} — unreadable directory: {}",
-                    sanitize_for_terminal(&e.to_string())
+                    "{safe_name}@{safe_version} — package.json must be a nonempty regular file"
                 ));
                 continue;
             }
-        };
-
-        if file_count == 0 {
-            corrupted.push(format!("{safe_name}@{safe_version} — empty directory"));
-            continue;
+            Err(error) => {
+                corrupted.push(format!(
+                    "{safe_name}@{safe_version} — missing or unreadable package.json: {}",
+                    sanitize_for_terminal(&error.to_string())
+                ));
+                continue;
+            }
         }
 
         // Deep mode: parse package.json, validate name/version fields,
         // and verify integrity hash against lockfile.
         if deep {
-            match lpm_common::read_text_file_capped(
+            match lpm_common::read_text_file_capped_nofollow(
                 &pkg_json_path,
                 lpm_common::CONFIG_FILE_SIZE_CAP_BYTES,
             ) {
                 Ok(content) => {
                     match serde_json::from_str::<serde_json::Value>(&content) {
                         Ok(pkg) => {
-                            // Validate name matches
-                            if let Some(declared_name) = pkg.get("name").and_then(|v| v.as_str())
-                                && declared_name != name
-                            {
-                                corrupted.push(format!(
-                                    "{safe_name}@{safe_version} — package.json name mismatch: declared '{}'",
-                                    sanitize_for_terminal(declared_name)
-                                ));
+                            if !pkg.is_object() {
+                                corrupted.push(format!("{safe_name}@{safe_version} — package.json must contain an object"));
                                 continue;
                             }
-                            // Validate version matches
-                            if let Some(declared_version) =
-                                pkg.get("version").and_then(|v| v.as_str())
-                                && declared_version != version
-                            {
-                                corrupted.push(format!(
-                                    "{safe_name}@{safe_version} — package.json version mismatch: declared '{}'",
-                                    sanitize_for_terminal(declared_version)
-                                ));
+                            let mut invalid_identity = false;
+                            for (field, expected) in [("name", name), ("version", version)] {
+                                if let Some(value) = pkg.get(field)
+                                    && value.as_str() != Some(expected.as_str())
+                                {
+                                    corrupted.push(format!(
+                                        "{safe_name}@{safe_version} — package.json {field} mismatch: expected '{}'", sanitize_for_terminal(expected)
+                                    ));
+                                    invalid_identity = true;
+                                }
+                            }
+                            if invalid_identity {
                                 continue;
                             }
                         }
@@ -858,7 +857,8 @@ fn list_v1_verify_entries(store: &PackageStore) -> Result<Vec<StoreVerifyEntry>,
     for entry in std::fs::read_dir(&store_dir)? {
         let entry = entry?;
         let path = entry.path();
-        if !path.is_dir() {
+        let metadata = std::fs::symlink_metadata(&path)?;
+        if !metadata.is_dir() && !lpm_common::is_symlink_or_junction(&metadata) {
             continue;
         }
 
@@ -967,6 +967,12 @@ fn list_virtual_object_paths(
 ) -> Result<HashSet<(lpm_store::StoreVersion, String)>, LpmError> {
     let store_v2 = lpm_store::v2::Store::from_lpm_root_for_version(lpm_root, store_version);
     let mut object_paths = HashSet::new();
+    maintenance::verify_object_directories(
+        &lpm_root
+            .store_root()
+            .join(store_version.to_string())
+            .join("objects"),
+    )?;
     for (_, segment) in store_v2.iter_object_dirs()? {
         object_paths.insert((store_version, format!("objects/{segment}")));
     }
@@ -992,7 +998,7 @@ fn write_security_cache_for_verify(
     safe_name: &str,
     safe_version: &str,
 ) -> Result<(), String> {
-    lpm_security::behavioral::write_cached_analysis(dir, fresh).map_err(|e| {
+    lpm_security::behavioral::write_cached_analysis_atomic(dir, fresh).map_err(|e| {
         format!(
             "{safe_name}@{safe_version} — failed to write .lpm-security.json: {}",
             sanitize_for_terminal(&e.to_string())
@@ -1121,10 +1127,10 @@ mod tests {
     #[test]
     fn verify_deep_without_fix_does_not_mutate_cache() {
         let dir = tempfile::tempdir().unwrap();
-        let store = PackageStore::at(dir.path());
+        let store = PackageStore::at(dir.path().join("store"));
 
         // Create a package with a source file (so analysis can detect something)
-        let pkg_dir = dir.path().join("v1").join("test-pkg@1.0.0");
+        let pkg_dir = dir.path().join("store").join("v1").join("test-pkg@1.0.0");
         std::fs::create_dir_all(&pkg_dir).unwrap();
         std::fs::write(
             pkg_dir.join("package.json"),
@@ -1150,10 +1156,10 @@ mod tests {
     #[test]
     fn verify_deep_with_fix_rewrites_stale_cache() {
         let dir = tempfile::tempdir().unwrap();
-        let store = PackageStore::at(dir.path());
+        let store = PackageStore::at(dir.path().join("store"));
 
         // Create a package with a source file that triggers eval detection
-        let pkg_dir = dir.path().join("v1").join("test-pkg@1.0.0");
+        let pkg_dir = dir.path().join("store").join("v1").join("test-pkg@1.0.0");
         std::fs::create_dir_all(&pkg_dir).unwrap();
         std::fs::write(
             pkg_dir.join("package.json"),
@@ -1179,10 +1185,10 @@ mod tests {
     #[test]
     fn verify_deep_no_fix_reports_missing_cache() {
         let dir = tempfile::tempdir().unwrap();
-        let store = PackageStore::at(dir.path());
+        let store = PackageStore::at(dir.path().join("store"));
 
         // Create a package WITHOUT any security cache
-        let pkg_dir = dir.path().join("v1").join("test-pkg@1.0.0");
+        let pkg_dir = dir.path().join("store").join("v1").join("test-pkg@1.0.0");
         std::fs::create_dir_all(&pkg_dir).unwrap();
         std::fs::write(
             pkg_dir.join("package.json"),
@@ -1201,10 +1207,10 @@ mod tests {
     #[test]
     fn verify_deep_fix_creates_missing_cache() {
         let dir = tempfile::tempdir().unwrap();
-        let store = PackageStore::at(dir.path());
+        let store = PackageStore::at(dir.path().join("store"));
 
         // Create a package WITHOUT any security cache
-        let pkg_dir = dir.path().join("v1").join("test-pkg@1.0.0");
+        let pkg_dir = dir.path().join("store").join("v1").join("test-pkg@1.0.0");
         std::fs::create_dir_all(&pkg_dir).unwrap();
         std::fs::write(
             pkg_dir.join("package.json"),

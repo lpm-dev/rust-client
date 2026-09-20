@@ -3,6 +3,8 @@
 //! Covers the v1 store layout (`<HOME>/.lpm/store/v1/<safe>@<ver>/`) with
 //! valid, empty, and corrupted entries. No registry, no network.
 
+#[path = "store_maintenance/mod.rs"]
+mod store_maintenance;
 mod support;
 
 use base64::Engine as _;
