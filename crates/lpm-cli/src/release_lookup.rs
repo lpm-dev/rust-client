@@ -581,10 +581,11 @@ fn jitter_seconds(seed: u64, ttl: Duration) -> u64 {
 /// absent so `unset GITHUB_TOKEN; export GITHUB_TOKEN=""` doesn't poison
 /// the request with a bogus header.
 fn github_token() -> Option<String> {
-    std::env::var("GITHUB_TOKEN")
-        .or_else(|_| std::env::var("GH_TOKEN"))
-        .ok()
-        .filter(|t| !t.is_empty())
+    ["GITHUB_TOKEN", "GH_TOKEN"].into_iter().find_map(|name| {
+        std::env::var(name)
+            .ok()
+            .filter(|token| !token.trim().is_empty())
+    })
 }
 
 fn github_token_for_url(url: &str) -> Option<String> {
@@ -2376,6 +2377,20 @@ mod tests {
                 );
                 assert_eq!(cache.last_failure_check_for(channel), 0);
             }
+        }
+    }
+    #[test]
+    fn blank_github_token_uses_nonblank_release_alias() {
+        for blank in ["", " \t "] {
+            let _env = crate::test_env::ScopedEnv::set([
+                ("GITHUB_TOKEN", blank.into()),
+                ("GH_TOKEN", "alias-token".into()),
+            ]);
+            assert_eq!(
+                github_token_for_url("https://api.github.com/repos/lpm-dev/rust-client/releases"),
+                Some("alias-token".into())
+            );
+            assert_eq!(github_token_for_url("https://example.test/releases"), None);
         }
     }
 }

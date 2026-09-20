@@ -467,10 +467,9 @@ pub(super) fn registry_signature_verification_enabled(
 ) -> bool {
     std::env::var(ENV_VERIFY_REGISTRY_SIGNATURES)
         .ok()
-        .map_or_else(
-            || global_config.get_bool("signatures").unwrap_or(false),
-            |value| parse_bool_env_value(&value, false),
-        )
+        .and_then(|value| crate::commands::config::parse_env_bool(&value))
+        .or_else(|| global_config.get_bool("signatures"))
+        .unwrap_or(false)
 }
 
 impl FetchBreakdown {

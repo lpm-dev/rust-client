@@ -111,18 +111,9 @@ pub struct NpmTrustedPublishJwt {
 /// body and exhausting the CI runner.
 const GITHUB_OIDC_MAX_BODY_BYTES: u64 = 64 * 1024;
 
-/// Validate that `ACTIONS_ID_TOKEN_REQUEST_URL` points at a real GitHub
-/// Actions runtime endpoint before the bearer is sent. The canonical
-/// host shape is `<random-id>.actions.githubusercontent.com`; GitHub
-/// Enterprise Server installations use `*.<ghes-host>` paths but still
-/// over HTTPS. Loopback hosts are accepted so the workflow tests can
-/// target a local mock without opening the env-poisoning hole the
-/// finding describes.
-///
-/// Rejection is a hard error rather than a fallback because — unlike
-/// the version-probe gate (`release_lookup.rs`) — there is no safe
-/// default URL to fall back to: a wrong URL just means "no OIDC".
-fn validate_github_runtime_url(url: &str) -> Result<(), LpmError> {
+/// Require HTTPS or HTTP loopback before sending the runtime bearer.
+/// Custom HTTPS hosts remain supported for GitHub Enterprise Server.
+fn validate_github_runtime_url(url: &str) -> Result<reqwest::Url, LpmError> {
     let parsed = reqwest::Url::parse(url).map_err(|e| {
         LpmError::Registry(format!(
             "ACTIONS_ID_TOKEN_REQUEST_URL is not a parseable URL: {e}"
@@ -135,23 +126,17 @@ fn validate_github_runtime_url(url: &str) -> Result<(), LpmError> {
         if host.ends_with(".actions.githubusercontent.com")
             || host == "actions.githubusercontent.com"
         {
-            return Ok(());
+            return Ok(parsed);
         }
-        // GHES installations rewrite the runtime URL to point at the
-        // appliance host. We can't enumerate every operator-chosen
-        // GHES hostname, so we accept any HTTPS host that is NOT a
-        // public free-mail / known-impersonation domain. The combined
-        // posture (HTTPS + warn-on-non-canonical) shrinks the abuse
-        // window while keeping GHES functional.
         tracing::warn!(
             host = host,
             "ACTIONS_ID_TOKEN_REQUEST_URL host is not *.actions.githubusercontent.com — \
              accepting under HTTPS for GitHub Enterprise compatibility; confirm this is your GHES appliance",
         );
-        return Ok(());
+        return Ok(parsed);
     }
     if scheme == "http" && parsed.host_str().is_some_and(url_host_is_loopback) {
-        return Ok(());
+        return Ok(parsed);
     }
     Err(LpmError::Registry(format!(
         "ACTIONS_ID_TOKEN_REQUEST_URL refused: only https:// (any host) or http:// (loopback only) is accepted, got scheme={scheme} host={host}",
@@ -176,8 +161,7 @@ fn url_host_is_loopback(host: &str) -> bool {
 /// Fetch a fresh JWT from the GitHub Actions runtime with the requested audience.
 ///
 /// Reads `ACTIONS_ID_TOKEN_REQUEST_URL` + `ACTIONS_ID_TOKEN_REQUEST_TOKEN`,
-/// validates the URL host/scheme so a poisoned CI env can't steer the
-/// bearer to an attacker host, then hits the runtime endpoint with
+/// requires HTTPS or HTTP loopback, then requests the runtime endpoint with
 /// redirects disabled, an explicit timeout, and a capped response body.
 async fn fetch_github_runtime_jwt(audience: &str) -> Result<String, LpmError> {
     let request_url = std::env::var("ACTIONS_ID_TOKEN_REQUEST_URL").map_err(|_| {
@@ -186,7 +170,7 @@ async fn fetch_github_runtime_jwt(audience: &str) -> Result<String, LpmError> {
                 .into(),
         )
     })?;
-    validate_github_runtime_url(&request_url)?;
+    let mut url = validate_github_runtime_url(&request_url)?;
     let request_token = std::env::var("ACTIONS_ID_TOKEN_REQUEST_TOKEN").map_err(|_| {
         LpmError::Registry(
             "ACTIONS_ID_TOKEN_REQUEST_TOKEN not set. Add `permissions: id-token: write` to your workflow."
@@ -194,14 +178,22 @@ async fn fetch_github_runtime_jwt(audience: &str) -> Result<String, LpmError> {
         )
     })?;
 
-    let url = format!("{request_url}&audience={audience}");
+    let parameters: Vec<(String, String)> = url
+        .query_pairs()
+        .filter(|(key, _)| key != "audience")
+        .map(|(key, value)| (key.into_owned(), value.into_owned()))
+        .collect();
+    url.query_pairs_mut()
+        .clear()
+        .extend_pairs(parameters)
+        .append_pair("audience", audience);
     let client = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .timeout(std::time::Duration::from_secs(15))
         .build()
         .map_err(|e| LpmError::Registry(format!("GitHub OIDC client build failed: {e}")))?;
     let response = client
-        .get(&url)
+        .get(url)
         .bearer_auth(&request_token)
         .send()
         .await
@@ -243,31 +235,33 @@ async fn fetch_github_runtime_jwt(audience: &str) -> Result<String, LpmError> {
 
     body.get("value")
         .and_then(|v| v.as_str())
-        .map(|s| s.to_string())
+        .filter(|value| !value.trim().is_empty())
+        .map(str::to_owned)
         .ok_or_else(|| LpmError::Registry("GitHub OIDC response missing 'value' field".into()))
 }
 
-fn github_runtime_signal_present() -> bool {
-    std::env::var("ACTIONS_ID_TOKEN_REQUEST_URL").is_ok()
-        && std::env::var("ACTIONS_ID_TOKEN_REQUEST_TOKEN").is_ok()
+fn nonblank_env(name: &str) -> Option<String> {
+    std::env::var(name)
+        .ok()
+        .filter(|value| !value.trim().is_empty())
 }
 
-/// Diagnose a half-configured GitHub Actions runtime — exactly one of the two
-/// runtime vars set. Returns a hint string when the asymmetry is present, or
-/// `None` when the signal is fully present, fully absent, or the lone present
-/// var is empty (which can't be distinguished from "not set" via `is_ok`,
-/// but is unusual enough that the generic message is fine).
+fn github_runtime_signal_present() -> bool {
+    nonblank_env("ACTIONS_ID_TOKEN_REQUEST_URL").is_some()
+        && nonblank_env("ACTIONS_ID_TOKEN_REQUEST_TOKEN").is_some()
+}
+
 fn github_partial_runtime_hint() -> Option<&'static str> {
-    let url = std::env::var("ACTIONS_ID_TOKEN_REQUEST_URL").is_ok();
-    let token = std::env::var("ACTIONS_ID_TOKEN_REQUEST_TOKEN").is_ok();
+    let url = nonblank_env("ACTIONS_ID_TOKEN_REQUEST_URL").is_some();
+    let token = nonblank_env("ACTIONS_ID_TOKEN_REQUEST_TOKEN").is_some();
     match (url, token) {
         (true, false) => Some(
-            "Detected ACTIONS_ID_TOKEN_REQUEST_URL but ACTIONS_ID_TOKEN_REQUEST_TOKEN is missing — \
-             the GitHub Actions runtime needs both. Add `permissions: id-token: write` to the job.",
+            "Detected ACTIONS_ID_TOKEN_REQUEST_URL but ACTIONS_ID_TOKEN_REQUEST_TOKEN is missing or blank. \
+             Add `permissions: id-token: write` to the job.",
         ),
         (false, true) => Some(
-            "Detected ACTIONS_ID_TOKEN_REQUEST_TOKEN but ACTIONS_ID_TOKEN_REQUEST_URL is missing — \
-             the GitHub Actions runtime needs both. Add `permissions: id-token: write` to the job.",
+            "Detected ACTIONS_ID_TOKEN_REQUEST_TOKEN but ACTIONS_ID_TOKEN_REQUEST_URL is missing or blank. \
+             Add `permissions: id-token: write` to the job.",
         ),
         _ => None,
     }
@@ -280,14 +274,11 @@ fn github_partial_runtime_hint() -> Option<&'static str> {
 pub const NPM_TRUSTED_PUBLISH_AUDIENCE: &str = "npm:registry.npmjs.org";
 
 pub fn npm_trusted_publish_jwt_available() -> bool {
-    std::env::var("NPM_ID_TOKEN").is_ok_and(|token| !token.trim().is_empty())
-        || github_runtime_signal_present()
+    nonblank_env("NPM_ID_TOKEN").is_some() || github_runtime_signal_present()
 }
 
 pub async fn resolve_npm_trusted_publish_jwt() -> Result<NpmTrustedPublishJwt, LpmError> {
-    if let Ok(token) = std::env::var("NPM_ID_TOKEN")
-        && !token.trim().is_empty()
-    {
+    if let Some(token) = nonblank_env("NPM_ID_TOKEN") {
         return Ok(NpmTrustedPublishJwt {
             token,
             source: NpmTrustedPublishJwtSource::EnvNpmIdToken,
@@ -316,13 +307,13 @@ pub async fn resolve_npm_trusted_publish_jwt() -> Result<NpmTrustedPublishJwt, L
 /// Cheap synchronous gate: does the environment carry any signal we could use
 /// to attempt registry-side OIDC exchange?
 ///
-/// True if `LPM_OIDC_TOKEN`, the GitHub Actions runtime vars, or the legacy
-/// `LPM_GITLAB_OIDC_TOKEN` is present. Lets callers skip the exchange entirely
+/// True if `LPM_OIDC_TOKEN`, both GitHub Actions runtime vars, or the legacy
+/// `LPM_GITLAB_OIDC_TOKEN` is nonblank. Lets callers skip the exchange entirely
 /// when there is nothing to try.
 pub fn registry_exchange_jwt_available() -> bool {
-    std::env::var("LPM_OIDC_TOKEN").is_ok()
+    nonblank_env("LPM_OIDC_TOKEN").is_some()
         || github_runtime_signal_present()
-        || std::env::var("LPM_GITLAB_OIDC_TOKEN").is_ok()
+        || nonblank_env("LPM_GITLAB_OIDC_TOKEN").is_some()
 }
 
 /// Resolve a JWT for registry-side OIDC exchange (audience `https://lpm.dev`).
@@ -337,13 +328,13 @@ pub fn registry_exchange_jwt_available() -> bool {
 /// GitHub's env vars but supply their own JWT can opt out of the runtime fetch
 /// by setting `LPM_OIDC_TOKEN` explicitly.
 pub async fn resolve_registry_exchange_jwt() -> Result<String, LpmError> {
-    if let Ok(token) = std::env::var("LPM_OIDC_TOKEN") {
+    if let Some(token) = nonblank_env("LPM_OIDC_TOKEN") {
         return Ok(token);
     }
     if github_runtime_signal_present() {
         return fetch_github_runtime_jwt("https://lpm.dev").await;
     }
-    if let Ok(token) = std::env::var("LPM_GITLAB_OIDC_TOKEN") {
+    if let Some(token) = nonblank_env("LPM_GITLAB_OIDC_TOKEN") {
         return Ok(token);
     }
     let base = "no OIDC signal found for registry exchange. Set LPM_OIDC_TOKEN \
@@ -594,10 +585,10 @@ pub async fn resolve_provenance_jwt() -> Result<(CiEnvironment, String), LpmErro
         let jwt = fetch_github_runtime_jwt("sigstore").await?;
         return Ok((CiEnvironment::GitHubActions, jwt));
     }
-    if let Ok(jwt) = std::env::var("SIGSTORE_ID_TOKEN") {
+    if let Some(jwt) = nonblank_env("SIGSTORE_ID_TOKEN") {
         return Ok((CiEnvironment::GitLabCI, jwt));
     }
-    if let Ok(jwt) = std::env::var("LPM_GITLAB_OIDC_TOKEN") {
+    if let Some(jwt) = nonblank_env("LPM_GITLAB_OIDC_TOKEN") {
         return Ok((CiEnvironment::GitLabCI, jwt));
     }
     let base = "--provenance requires a CI environment with a Sigstore-audience OIDC token. \
@@ -1157,5 +1148,33 @@ mod tests {
         assert!(validate_github_runtime_url("file:///etc/passwd").is_err());
         assert!(validate_github_runtime_url("javascript:alert(1)").is_err());
         assert!(validate_github_runtime_url("not a url").is_err());
+    }
+    #[tokio::test]
+    async fn blank_oidc_tokens_do_not_mask_valid_sources() {
+        for blank in ["", " \t "] {
+            let _env = scoped(&[
+                ("LPM_OIDC_TOKEN", blank),
+                ("SIGSTORE_ID_TOKEN", blank),
+                ("ACTIONS_ID_TOKEN_REQUEST_URL", blank),
+                ("ACTIONS_ID_TOKEN_REQUEST_TOKEN", blank),
+                ("LPM_GITLAB_OIDC_TOKEN", "legacy-jwt"),
+            ]);
+            assert!(registry_exchange_jwt_available());
+            assert!(!npm_trusted_publish_jwt_available());
+            assert_eq!(resolve_registry_exchange_jwt().await.unwrap(), "legacy-jwt");
+            assert_eq!(resolve_provenance_jwt().await.unwrap().1, "legacy-jwt");
+        }
+    }
+
+    #[test]
+    fn blank_oidc_environment_does_not_report_available_credentials() {
+        let _env = scoped(&[
+            ("LPM_OIDC_TOKEN", " "),
+            ("LPM_GITLAB_OIDC_TOKEN", ""),
+            ("ACTIONS_ID_TOKEN_REQUEST_URL", ""),
+            ("ACTIONS_ID_TOKEN_REQUEST_TOKEN", " "),
+        ]);
+        assert!(!registry_exchange_jwt_available());
+        assert!(!npm_trusted_publish_jwt_available());
     }
 }
