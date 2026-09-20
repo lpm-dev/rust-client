@@ -512,6 +512,7 @@ fn quarantine_security_state_file(
 }
 
 pub fn repair_security_state() -> Result<SecurityRepairReport, LpmError> {
+    let _lock = lpm_common::acquire_exclusive_lock(super::paths::unlocks_lock_path()?)?;
     lpm_common::with_exclusive_lock(audit_lock_path()?, repair_security_state_locked)
 }
 
@@ -534,10 +535,30 @@ fn repair_security_state_locked() -> Result<SecurityRepairReport, LpmError> {
                     quarantined.push(quarantine_security_state_file(&path, reason)?);
                 }
             }
-            if let Some(path) = audit_log_path
-                && let Some(reason) = audit_log_unverified_reason(&path, &secret)?
+            let mut audit_reason = audit_log_path
+                .as_deref()
+                .map(|path| audit_log_unverified_reason(path, &secret))
+                .transpose()?
+                .flatten();
+            let head_path = audit_head_path()?;
+            let log_path = super::paths::audit_log_path()?;
+            if audit_reason.is_none()
+                && let Some(head) = read_signed_json::<AuditHead>(&head_path)?
             {
-                quarantined.push(quarantine_security_state_file(&path, reason)?);
+                let (tail, count) = super::audit::read_audit_log_tail(&log_path)?;
+                if head.last_entry_hash != tail.as_deref().unwrap_or_default()
+                    || head.entry_count != count
+                {
+                    audit_reason =
+                        Some("audit log does not match the signed audit head".to_string());
+                }
+            }
+            if let Some(reason) = audit_reason {
+                for path in [&log_path, &head_path] {
+                    if path.try_exists()? {
+                        quarantined.push(quarantine_security_state_file(path, &reason)?);
+                    }
+                }
             }
         }
         Err(SigningSecretReadError::Missing) => {

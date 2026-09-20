@@ -24,11 +24,55 @@ fn request_platform_approval(prompt: &str) -> Result<bool, LpmError> {
 
 #[cfg(target_os = "linux")]
 fn request_platform_approval(_prompt: &str) -> Result<bool, LpmError> {
-    run_native_auth_command({
-        let mut command = std::process::Command::new("pkexec");
-        command.arg("/bin/true");
-        command
-    })
+    run_native_auth_command(linux_native_auth_command()?)
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn linux_native_auth_command() -> Result<std::process::Command, LpmError> {
+    const BACKENDS: &[&str] = &[
+        "/usr/bin/pkexec",
+        "/bin/pkexec",
+        "/run/wrappers/bin/pkexec",
+        "/run/current-system/sw/bin/pkexec",
+    ];
+    let program = BACKENDS.iter().find(|path| trusted_native_auth_program(std::path::Path::new(path)))
+        .ok_or_else(|| LpmError::Registry("native security approval requires an administrator-owned polkit pkexec executable in a system directory".into()))?;
+    let mut command = std::process::Command::new(program);
+    command.arg("/bin/true");
+    Ok(command)
+}
+
+#[cfg(any(target_os = "linux", all(test, unix)))]
+fn trusted_native_auth_program(path: &std::path::Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    let Ok(canonical) = std::fs::canonicalize(path) else {
+        return false;
+    };
+    let Ok(metadata) = std::fs::metadata(&canonical) else {
+        return false;
+    };
+    if !metadata.is_file()
+        || metadata.uid() != 0
+        || metadata.mode() & 0o022 != 0
+        || metadata.mode() & 0o111 == 0
+    {
+        return false;
+    }
+    [path.parent(), canonical.parent()]
+        .into_iter()
+        .flatten()
+        .all(|parent| {
+            parent.ancestors().all(|dir| {
+                std::fs::metadata(dir).is_ok_and(|metadata| {
+                    metadata.is_dir() && metadata.uid() == 0 && metadata.mode() & 0o022 == 0
+                })
+            })
+        })
+}
+
+#[cfg(all(test, not(unix)))]
+fn trusted_native_auth_program(_path: &std::path::Path) -> bool {
+    false
 }
 
 #[cfg(target_os = "windows")]
@@ -36,9 +80,6 @@ fn request_platform_approval(prompt: &str) -> Result<bool, LpmError> {
     match request_windows_hello_approval(prompt)? {
         WindowsHelloVerificationAction::Approved => Ok(true),
         WindowsHelloVerificationAction::Denied => Ok(false),
-        WindowsHelloVerificationAction::TerminalFallback(reason) => {
-            request_windows_terminal_fallback(prompt, reason)
-        }
         WindowsHelloVerificationAction::FailClosed(reason) => {
             Err(windows_hello_unavailable_error(reason))
         }
@@ -86,9 +127,6 @@ fn request_windows_hello_approval(
         })?;
     match windows_hello_availability_action(availability.0) {
         WindowsHelloAvailabilityAction::UseWindowsHello => {}
-        WindowsHelloAvailabilityAction::TerminalFallback(reason) => {
-            return Ok(WindowsHelloVerificationAction::TerminalFallback(reason));
-        }
         WindowsHelloAvailabilityAction::FailClosed(reason) => {
             return Ok(WindowsHelloVerificationAction::FailClosed(reason));
         }
@@ -168,29 +206,10 @@ impl Drop for WindowsRuntimeApartment {
     }
 }
 
-#[cfg(target_os = "windows")]
-fn request_windows_terminal_fallback(prompt: &str, reason: &str) -> Result<bool, LpmError> {
-    use std::io::IsTerminal;
-
-    if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
-        return Err(LpmError::Registry(format!(
-            "native Windows security approval is unavailable: {reason}; run this command in an interactive terminal or configure Windows Hello or PIN"
-        )));
-    }
-
-    crate::output::warn(&format!(
-        "Windows Hello security approval is unavailable: {reason}. Falling back to terminal confirmation."
-    ));
-    cliclack::confirm(crate::prompt::untrusted(prompt))
-        .interact()
-        .map_err(crate::prompt::prompt_err)
-}
-
 #[cfg(any(target_os = "windows", test))]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum WindowsHelloAvailabilityAction {
     UseWindowsHello,
-    TerminalFallback(&'static str),
     FailClosed(&'static str),
 }
 
@@ -198,10 +217,10 @@ pub(super) enum WindowsHelloAvailabilityAction {
 pub(super) fn windows_hello_availability_action(code: i32) -> WindowsHelloAvailabilityAction {
     match code {
         0 => WindowsHelloAvailabilityAction::UseWindowsHello,
-        1 => WindowsHelloAvailabilityAction::TerminalFallback(
+        1 => WindowsHelloAvailabilityAction::FailClosed(
             "Windows Hello or PIN is not available on this device",
         ),
-        2 => WindowsHelloAvailabilityAction::TerminalFallback(
+        2 => WindowsHelloAvailabilityAction::FailClosed(
             "Windows Hello or PIN is not configured for this user",
         ),
         3 => WindowsHelloAvailabilityAction::FailClosed(
@@ -221,7 +240,6 @@ pub(super) fn windows_hello_availability_action(code: i32) -> WindowsHelloAvaila
 pub(super) enum WindowsHelloVerificationAction {
     Approved,
     Denied,
-    TerminalFallback(&'static str),
     FailClosed(&'static str),
 }
 
@@ -229,10 +247,10 @@ pub(super) enum WindowsHelloVerificationAction {
 pub(super) fn windows_hello_verification_action(code: i32) -> WindowsHelloVerificationAction {
     match code {
         0 => WindowsHelloVerificationAction::Approved,
-        1 => WindowsHelloVerificationAction::TerminalFallback(
+        1 => WindowsHelloVerificationAction::FailClosed(
             "Windows Hello or PIN is not available on this device",
         ),
-        2 => WindowsHelloVerificationAction::TerminalFallback(
+        2 => WindowsHelloVerificationAction::FailClosed(
             "Windows Hello or PIN is not configured for this user",
         ),
         3 => WindowsHelloVerificationAction::FailClosed(
@@ -332,4 +350,31 @@ pub(super) fn macos_local_auth_reason(prompt: &str) -> String {
     reason.extend(first.to_lowercase());
     reason.push_str(chars.as_str());
     reason
+}
+
+#[cfg(test)]
+mod backend_tests {
+    #[test]
+    fn linux_native_approval_never_resolves_an_executable_from_caller_path() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(
+            directory.path().join("pkexec"),
+            "fake authentication backend",
+        )
+        .unwrap();
+        let _env = crate::test_env::ScopedEnv::update([(
+            "PATH",
+            Some(directory.path().as_os_str().to_owned()),
+        )]);
+        if let Ok(command) = super::linux_native_auth_command() {
+            assert!(
+                std::path::Path::new(command.get_program()).is_absolute(),
+                "native approval must not search the caller's PATH"
+            );
+            assert_ne!(
+                std::path::Path::new(command.get_program()).parent(),
+                Some(directory.path())
+            );
+        }
+    }
 }

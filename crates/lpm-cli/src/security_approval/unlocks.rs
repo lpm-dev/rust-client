@@ -69,6 +69,7 @@ pub(super) fn create_global_unlock_grant(
 }
 
 pub(super) fn persist_unlock_grant(grant: &UnlockGrant) -> Result<(), LpmError> {
+    let _lock = lpm_common::acquire_exclusive_lock(super::paths::unlocks_lock_path()?)?;
     let path = unlocks_dir()?.join(format!("{}.json", grant.id));
     write_signed_json(&path, grant)
 }
@@ -102,6 +103,7 @@ fn read_active_unlock_entries() -> Result<Vec<StoredUnlockGrant>, LpmError> {
 }
 
 pub(super) fn read_active_unlocks() -> Result<Vec<UnlockGrant>, LpmError> {
+    let _lock = lpm_common::acquire_exclusive_lock(super::paths::unlocks_lock_path()?)?;
     Ok(read_active_unlock_entries()?
         .into_iter()
         .map(|entry| entry.grant)
@@ -171,6 +173,7 @@ fn revoke_unlocks(
     }
 
     let requested_packages = normalized_packages(packages);
+    let _lock = lpm_common::acquire_exclusive_lock(super::paths::unlocks_lock_path()?)?;
     let project_root = project_root.map(canonical_project_root);
     let mut revocations = Vec::new();
 
@@ -328,7 +331,7 @@ pub fn has_active_project_unlock(
     Ok(find_active_project_unlock(scope, project_dir, min_release_age_secs, packages)?.is_some())
 }
 
-fn find_active_global_unlock(
+pub(super) fn find_active_global_unlock(
     scope: ApprovalScope,
     packages: &[String],
 ) -> Result<Option<UnlockGrant>, LpmError> {
