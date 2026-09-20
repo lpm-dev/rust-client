@@ -1443,6 +1443,79 @@ async fn uninstall_removes_the_package_owned_skill_directory() {
 }
 
 #[tokio::test]
+async fn uninstall_removes_package_guidance_after_the_final_alias() {
+    assert_alias_skill_cleanup(false, false).await;
+}
+
+#[tokio::test]
+async fn uninstall_preserves_package_guidance_needed_by_a_remaining_alias() {
+    assert_alias_skill_cleanup(true, false).await;
+}
+
+#[tokio::test]
+async fn uninstall_preserves_package_guidance_needed_by_a_catalog_alias() {
+    assert_alias_skill_cleanup(true, true).await;
+}
+
+async fn assert_alias_skill_cleanup(canonical_dependency: bool, catalog_alias: bool) {
+    let mut manifest = serde_json::json!({
+        "name":"skill-cleanup","version":"1.0.0",
+        "dependencies":{"package-alias":"npm:@lpm.dev/owner.package@1.0.0"}
+    });
+    if canonical_dependency {
+        manifest["dependencies"]["@lpm.dev/owner.package"] = "1.0.0".into();
+    }
+    if catalog_alias {
+        manifest["dependencies"]["package-alias"] = "catalog:".into();
+        manifest["catalogs"] =
+            serde_json::json!({"default":{"package-alias":"npm:@lpm.dev/owner.package@1.0.0"}});
+    }
+    let project = TempProject::empty(&manifest.to_string());
+    let registry = MockRegistry::start().await;
+    registry
+        .with_package(
+            "@lpm.dev/owner.package",
+            "1.0.0",
+            &make_tarball("@lpm.dev/owner.package", "1.0.0"),
+        )
+        .await;
+    registry
+        .with_package_skills_for_version(
+            "owner.package",
+            "1.0.0",
+            vec![package_skill(
+                "guide",
+                "Use the matching package release",
+                "Follow this release's supported API.",
+            )],
+        )
+        .await;
+    lpm_with_registry(&project, &registry.url())
+        .arg("install")
+        .assert()
+        .success();
+    assert!(project.file_exists(".lpm/skills/owner.package/guide.md"));
+    if canonical_dependency {
+        lpm_with_registry(&project, &registry.url())
+            .args(["uninstall", "@lpm.dev/owner.package"])
+            .assert()
+            .success();
+        assert!(
+            project.file_exists(".lpm/skills/owner.package/guide.md"),
+            "a remaining alias still owns package guidance"
+        );
+    }
+    lpm_with_registry(&project, &registry.url())
+        .args(["uninstall", "package-alias"])
+        .assert()
+        .success();
+    assert!(
+        !project.path().join(".lpm/skills/owner.package").exists(),
+        "the final alias must remove its intact owned guidance"
+    );
+}
+
+#[tokio::test]
 async fn clean_followed_by_a_warm_install_restores_package_skills() {
     let project = TempProject::empty(
         r#"{
@@ -1490,6 +1563,186 @@ async fn clean_followed_by_a_warm_install_restores_package_skills() {
         String::from_utf8_lossy(&warm.stderr)
     );
     assert!(project.file_exists(".lpm/skills/owner.package/guide.md"));
+}
+
+#[tokio::test]
+async fn warm_install_refreshes_package_skills_after_a_no_skills_upgrade() {
+    assert_warm_install_refreshes_package_skills(false, false).await;
+}
+
+#[tokio::test]
+async fn explicit_skills_install_refreshes_guidance_for_an_aliased_dependency() {
+    assert_warm_install_refreshes_package_skills(true, false).await;
+}
+
+#[tokio::test]
+async fn warm_install_refreshes_package_skills_in_a_workspace_member() {
+    assert_warm_install_refreshes_package_skills(false, true).await;
+}
+
+async fn assert_warm_install_refreshes_package_skills(aliased: bool, workspace_member: bool) {
+    let name = "@lpm.dev/owner.package";
+    let manifest = |version: &str| {
+        let (local_name, specifier) = if aliased {
+            ("guide-package", format!("npm:{name}@{version}"))
+        } else {
+            (name, version.to_string())
+        };
+        serde_json::json!({
+            "name": "skills-freshness",
+            "version": "1.0.0",
+            "dependencies": {local_name: specifier},
+        })
+        .to_string()
+    };
+    let project = TempProject::empty(&manifest("1.0.0"));
+    let project_dir = if workspace_member {
+        project.write_file(
+            "package.json",
+            r#"{"name":"workspace","private":true,"workspaces":["packages/*"]}"#,
+        );
+        project.write_file("packages/member/package.json", &manifest("1.0.0"));
+        project.path().join("packages/member")
+    } else {
+        project.path().to_path_buf()
+    };
+    let skills_dir = project_dir.join(".lpm/skills/owner.package");
+    let registry = MockRegistry::start().await;
+    registry
+        .mount_full_package_metadata_routes(
+            name,
+            "2.0.0",
+            &[
+                (
+                    "1.0.0",
+                    serde_json::json!({}),
+                    Some(make_tarball(name, "1.0.0")),
+                ),
+                (
+                    "2.0.0",
+                    serde_json::json!({}),
+                    Some(make_tarball(name, "2.0.0")),
+                ),
+            ],
+        )
+        .await;
+    for (version, skill_name) in [("1.0.0", "old-guide"), ("2.0.0", "current-guide")] {
+        registry
+            .with_package_skills_for_version_expected(
+                "owner.package",
+                version,
+                vec![package_skill(
+                    skill_name,
+                    "Use the matching package release",
+                    "Follow this release's supported API.",
+                )],
+                if aliased { 2 } else { 1 },
+            )
+            .await;
+    }
+    lpm_with_registry(&project, &registry.url())
+        .current_dir(&project_dir)
+        .arg("install")
+        .assert()
+        .success();
+    assert!(skills_dir.join("old-guide.md").exists());
+    std::fs::write(project_dir.join("package.json"), manifest("2.0.0")).unwrap();
+    lpm_with_registry(&project, &registry.url())
+        .current_dir(&project_dir)
+        .args(["install", "--no-skills"])
+        .assert()
+        .success();
+    assert!(skills_dir.join("old-guide.md").exists());
+
+    let mut command = lpm_with_registry(&project, &registry.url());
+    command.current_dir(&project_dir).arg("install");
+    if aliased {
+        command.arg("--skills");
+    }
+    command.assert().success();
+
+    assert!(
+        skills_dir.join("current-guide.md").exists(),
+        "warm install must catch up to the selected dependency version"
+    );
+    assert!(!skills_dir.join("old-guide.md").exists());
+    let manifest: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(skills_dir.join(".lpm-package-skills.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(manifest["version"], "2.0.0");
+    if aliased {
+        lpm_with_registry(&project, &registry.url())
+            .args(["skills", "add", "@lpm.dev/owner.package@1.0.0", "--yes"])
+            .assert()
+            .success();
+        assert!(skills_dir.join("old-guide.md").exists());
+        lpm_with_registry(&project, &registry.url())
+            .arg("install")
+            .assert()
+            .success();
+        assert!(skills_dir.join("current-guide.md").exists());
+        assert!(!skills_dir.join("old-guide.md").exists());
+    }
+}
+
+#[tokio::test]
+async fn aliases_at_multiple_versions_share_the_highest_selected_package_skill_set() {
+    let name = "@lpm.dev/owner.package";
+    let project = TempProject::empty(
+        r#"{
+        "name":"skills-alias-versions","version":"1.9.0",
+        "dependencies":{
+            "old-package":"npm:@lpm.dev/owner.package@1.9.0",
+            "new-package":"npm:@lpm.dev/owner.package@1.10.0"
+        }
+    }"#,
+    );
+    let registry = MockRegistry::start().await;
+    registry
+        .mount_full_package_metadata_routes(
+            name,
+            "1.10.0",
+            &[
+                (
+                    "1.9.0",
+                    serde_json::json!({}),
+                    Some(make_tarball(name, "1.9.0")),
+                ),
+                (
+                    "1.10.0",
+                    serde_json::json!({}),
+                    Some(make_tarball(name, "1.10.0")),
+                ),
+            ],
+        )
+        .await;
+    registry
+        .with_package_skills_for_version_expected("owner.package", "1.9.0", vec![], 0)
+        .await;
+    registry
+        .with_package_skills_for_version(
+            "owner.package",
+            "1.10.0",
+            vec![package_skill(
+                "current-guide",
+                "Use the matching package release",
+                "Follow this release's supported API.",
+            )],
+        )
+        .await;
+    for _ in 0..2 {
+        lpm_with_registry(&project, &registry.url())
+            .args(["install", "--skills"])
+            .assert()
+            .success();
+        let manifest: serde_json::Value = serde_json::from_str(
+            &project.read_file(".lpm/skills/owner.package/.lpm-package-skills.json"),
+        )
+        .unwrap();
+        assert_eq!(manifest["version"], "1.10.0");
+        assert!(project.file_exists(".lpm/skills/owner.package/current-guide.md"));
+    }
 }
 
 #[tokio::test]
