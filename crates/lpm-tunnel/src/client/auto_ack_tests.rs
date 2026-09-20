@@ -17,7 +17,11 @@ async fn failed_forward(
         body: "e30=".into(),
     };
     let (response, _) = forward_http_request(
-        reqwest::Client::builder().no_proxy().build().unwrap(),
+        reqwest::Client::builder()
+            .no_proxy()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .unwrap(),
         lpm_common::LocalTarget::loopback(lpm_common::LocalScheme::Http, port),
         request,
         true,
