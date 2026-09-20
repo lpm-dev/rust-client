@@ -10,6 +10,85 @@ fn registry_command(project: &TempProject, registry: &MockRegistry) -> assert_cm
     command
 }
 
+#[tokio::test]
+async fn captured_root_hook_output_is_sanitized_without_changing_json_or_exit_status() {
+    for phase in ["pnpm:devPreinstall", "postinstall"] {
+        for code in [0, 42] {
+            let project = TempProject::empty(
+                &serde_json::json!({
+                    "name": "captured-hook", "version": "1.0.0",
+                    "scripts": {phase: format!("node output.cjs {code}")}
+                })
+                .to_string(),
+            );
+            project.write_file(
+                "output.cjs",
+                r#"
+process.stdout.write('out\x1b[31m\x1b]0;hidden-title\x07\r\nnext\tcell\rend\n');
+process.stderr.write('err\u009b2J\bfin café\n');
+process.exitCode=Number(process.argv[2]);
+"#,
+            );
+            let registry = MockRegistry::start().await;
+            let output = registry_command(&project, &registry)
+                .args([
+                    "install",
+                    "--json",
+                    "--color=never",
+                    "--no-skills",
+                    "--no-editor-setup",
+                    "--no-security-summary",
+                ])
+                .output()
+                .unwrap();
+            assert_eq!(output.status.code(), Some(code));
+            let payload: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+            assert_eq!(payload["success"], code == 0);
+            if code != 0 {
+                assert_eq!(payload["phase"], phase);
+                assert_eq!(payload["exit_code"], code);
+            }
+            let stderr = String::from_utf8(output.stderr).unwrap();
+            assert!(
+                !stderr.contains('\u{1b}'),
+                "captured escape command: {stderr:?}"
+            );
+            assert!(stderr.contains("out\nnext\tcell?end\n"), "{stderr:?}");
+            assert!(stderr.contains("err?fin café\n"), "{stderr:?}");
+            assert!(!stderr.contains("hidden-title"));
+            assert!(!stderr.contains(['\r', '\u{9b}', '\u{8}']));
+        }
+    }
+}
+
+#[tokio::test]
+async fn inherited_root_hook_output_retains_direct_child_terminal_control() {
+    let project = TempProject::empty(
+        r#"{"name":"direct-hook","version":"1.0.0","scripts":{"postinstall":"node output.cjs"}}"#,
+    );
+    project.write_file(
+        "output.cjs",
+        r#"process.stdout.write('direct\x1b[31mchild\x1b[0m\n');"#,
+    );
+    let registry = MockRegistry::start().await;
+    let output = registry_command(&project, &registry)
+        .args([
+            "install",
+            "--color=never",
+            "--no-skills",
+            "--no-editor-setup",
+            "--no-security-summary",
+        ])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    assert!(
+        String::from_utf8(output.stdout)
+            .unwrap()
+            .contains("direct\u{1b}[31mchild\u{1b}[0m")
+    );
+}
+
 const PHASE_SCRIPT: &str = r#"const fs=require('fs');
 const keys=['npm_lifecycle_event','npm_lifecycle_script','npm_package_name','npm_package_version','npm_package_json','INIT_CWD'];
 const context=Object.fromEntries(keys.map(k=>[k,process.env[k]]));
