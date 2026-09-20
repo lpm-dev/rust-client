@@ -648,6 +648,7 @@ pub(super) fn command_allows_background_update(command: &Commands) -> bool {
     match command {
         Commands::Install(args) => !args.offline,
         Commands::Ci(args) => !args.offline,
+        Commands::Doctor(_) => false,
         _ => true,
     }
 }
@@ -770,6 +771,22 @@ mod tests {
             !should_suppress_update_banner(false),
             "any other command → show banner"
         );
+    }
+
+    #[test]
+    fn doctor_never_starts_background_update_requests() {
+        for args in [
+            vec!["lpm", "doctor"],
+            vec!["lpm", "doctor", "list"],
+            vec!["lpm", "doctor", "sandbox-setup"],
+            vec!["lpm", "doctor", "--all"],
+        ] {
+            let cli = Cli::try_parse_from(&args).unwrap();
+            assert!(
+                !command_allows_background_update(cli.command.as_ref().unwrap()),
+                "{args:?}"
+            );
+        }
     }
 
     #[test]

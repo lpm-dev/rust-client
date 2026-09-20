@@ -277,10 +277,9 @@ pub(super) fn probe_sandbox_backend_with_global(
         }) => Check::warn(
             &doctor_catalog::SANDBOX_UNSUPPORTED_PLATFORM,
             &format!(
-                "unavailable on {platform} — {remediation}. Lifecycle scripts under \
-                 `script-policy = \"triage\"` or `\"allow\"`, and any `lpm rebuild` \
-                 invocation, run without filesystem containment on this platform — \
-                 sandbox enforcement isn't supported here yet."
+                "unavailable on {platform} — {remediation}. Scripts that require sandbox \
+                 containment stop on this platform. Use a supported host or an approved \
+                 change to sandbox configuration."
             ),
         ),
         Err(SandboxError::KernelTooOld {

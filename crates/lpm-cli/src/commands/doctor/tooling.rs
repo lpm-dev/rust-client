@@ -1,8 +1,20 @@
 use std::io::Read;
+#[cfg(unix)]
+use std::os::fd::AsRawFd as PipeHandle;
+#[cfg(windows)]
+use std::os::windows::io::AsRawHandle as PipeHandle;
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 use std::thread::JoinHandle;
+#[cfg(not(any(unix, windows)))]
+trait PipeHandle {}
+#[cfg(not(any(unix, windows)))]
+impl<T> PipeHandle for T {}
 use std::time::Duration;
 
 use crate::doctor_catalog;
@@ -16,18 +28,78 @@ pub(super) struct InstalledDoctorPlugin {
     binary: PathBuf,
 }
 
-pub(super) fn discover_installed_plugins() -> Vec<InstalledDoctorPlugin> {
-    lpm_plugin::registry::list_plugins()
-        .iter()
-        .filter_map(|definition| {
+pub(super) fn discover_installed_plugins(
+    project: &Path,
+) -> (Vec<InstalledDoctorPlugin>, Vec<Check>) {
+    let mut plugins = Vec::new();
+    let mut checks = Vec::new();
+    for definition in lpm_plugin::registry::list_plugins() {
+        let pin = match crate::commands::tools::effective_tool_version(project, definition.name) {
+            Ok(pin) => pin,
+            Err(error) => {
+                checks.push(Check::warn(
+                    &doctor_catalog::PLUGIN_PIN_UNAVAILABLE,
+                    &error.to_string(),
+                ));
+                continue;
+            }
+        };
+        let installed = if let Some(version) = pin {
+            match pinned_plugin_binary(definition, &version) {
+                Ok(Some(binary)) => Some((version, binary)),
+                result => {
+                    let detail = match result {
+                        Err(error) => error.to_string(),
+                        _ => "not installed or its verification receipt is invalid".into(),
+                    };
+                    checks.push(Check::warn(&doctor_catalog::PLUGIN_PIN_UNAVAILABLE,
+                        &format!("{}@{version}: {detail}; run the tool command to install the pinned version", definition.name)));
+                    None
+                }
+            }
+        } else {
             lpm_plugin::find_installed_for_current_platform(definition.name, definition.binary_name)
-                .map(|(version, binary)| InstalledDoctorPlugin {
-                    definition,
+        };
+        if let Some((version, binary)) = installed {
+            plugins.push(InstalledDoctorPlugin {
+                definition,
+                version,
+                binary,
+            });
+        }
+    }
+    (plugins, checks)
+}
+
+fn pinned_plugin_binary(
+    definition: &lpm_plugin::registry::PluginDef,
+    version: &str,
+) -> Result<Option<PathBuf>, lpm_common::LpmError> {
+    let platform = lpm_runtime::platform::Platform::current()?.to_string();
+    let binary = lpm_plugin::store::plugin_binary_path(
+        definition.name,
+        version,
+        &platform,
+        definition.binary_name,
+    )?;
+    let receipt = lpm_plugin::store::plugin_sidecar_path(definition.name, version, &platform)?;
+    lpm_common::with_shared_lock(
+        lpm_plugin::store::plugin_update_lock_path(definition.name)?,
+        || {
+            let valid = matches!(
+                lpm_plugin::sidecar::validate_for_reuse(
+                    &receipt,
+                    &binary,
+                    definition.name,
                     version,
-                    binary,
-                })
-        })
-        .collect()
+                    &platform,
+                    lpm_plugin::download::allow_unverified_override()
+                ),
+                lpm_plugin::sidecar::ReuseDecision::Hit
+            );
+            Ok(valid.then_some(binary))
+        },
+    )
 }
 
 pub(in crate::commands) fn run_tool_with_timeout(
@@ -79,20 +151,47 @@ pub(super) fn wait_with_timeout(
     mut child: std::process::Child,
     timeout: Duration,
 ) -> Result<std::process::Output, ChildWaitError> {
-    let stdout_reader = child.stdout.take().map(spawn_tail_reader);
-    let stderr_reader = child.stderr.take().map(spawn_tail_reader);
-
-    let status = match crate::commands::rebuild::process_tree::wait_with_timeout(child, &timeout) {
-        Ok(status) => status,
-        Err(error) if error.starts_with("timeout after ") => {
-            join_tail_reader(stdout_reader);
-            join_tail_reader(stderr_reader);
-            return Err(ChildWaitError::Timeout);
+    let finished = Arc::new(AtomicBool::new(false));
+    let stdout_reader = child
+        .stdout
+        .take()
+        .map(|pipe| spawn_tail_reader(pipe, Arc::clone(&finished)))
+        .transpose();
+    let stdout_reader = match stdout_reader {
+        Ok(reader) => reader,
+        Err(error) => {
+            crate::commands::rebuild::process_tree::kill_process_tree(&mut child);
+            let _ = child.wait();
+            return Err(ChildWaitError::Wait(error.to_string()));
         }
+    };
+    let stderr_reader = child
+        .stderr
+        .take()
+        .map(|pipe| spawn_tail_reader(pipe, Arc::clone(&finished)))
+        .transpose();
+    let stderr_reader = match stderr_reader {
+        Ok(reader) => reader,
+        Err(error) => {
+            crate::commands::rebuild::process_tree::kill_process_tree(&mut child);
+            let _ = child.wait();
+            finished.store(true, Ordering::Release);
+            join_tail_reader(stdout_reader);
+            return Err(ChildWaitError::Wait(error.to_string()));
+        }
+    };
+    let status = crate::commands::rebuild::process_tree::wait_with_timeout(child, &timeout);
+    finished.store(true, Ordering::Release);
+    let status = match status {
+        Ok(status) => status,
         Err(error) => {
             join_tail_reader(stdout_reader);
             join_tail_reader(stderr_reader);
-            return Err(ChildWaitError::Wait(error));
+            return Err(if error.starts_with("timeout after ") {
+                ChildWaitError::Timeout
+            } else {
+                ChildWaitError::Wait(error)
+            });
         }
     };
 
@@ -109,19 +208,34 @@ pub(super) enum ChildWaitError {
     Wait(String),
 }
 
-fn spawn_tail_reader(mut reader: impl Read + Send + 'static) -> JoinHandle<Vec<u8>> {
-    std::thread::spawn(move || {
-        let mut tail = TailBuffer::new();
-        let mut chunk = [0u8; 16 * 1024];
-        loop {
-            match reader.read(&mut chunk) {
-                Ok(0) => return tail.into_vec(),
-                Ok(read) => tail.push(&chunk[..read]),
-                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
-                Err(_) => return tail.into_vec(),
+fn spawn_tail_reader(
+    mut reader: impl Read + PipeHandle + Send + 'static,
+    finished: Arc<AtomicBool>,
+) -> std::io::Result<JoinHandle<Vec<u8>>> {
+    lpm_common::process_output::prepare_reader(&reader)?;
+    std::thread::Builder::new()
+        .name("lpm-doctor-output".into())
+        .spawn(move || {
+            let mut tail = TailBuffer::new();
+            let mut chunk = [0u8; 16 * 1024];
+            let mut finished_at = None;
+            loop {
+                if finished.load(Ordering::Acquire) {
+                    let at = finished_at.get_or_insert_with(std::time::Instant::now);
+                    if at.elapsed() >= Duration::from_millis(250) {
+                        return tail.into_vec();
+                    }
+                }
+                match lpm_common::process_output::read_available(&mut reader, &mut chunk) {
+                    Ok(Some(0)) => return tail.into_vec(),
+                    Ok(Some(read)) => tail.push(&chunk[..read]),
+                    Ok(None) if finished_at.is_some() => return tail.into_vec(),
+                    Ok(None) => std::thread::sleep(Duration::from_millis(2)),
+                    Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                    Err(_) => return tail.into_vec(),
+                }
             }
-        }
-    })
+        })
 }
 
 fn join_tail_reader(reader: Option<JoinHandle<Vec<u8>>>) -> Vec<u8> {
@@ -228,7 +342,7 @@ fn run_lint_check_with_binary(bin: &Path, project_dir: &Path) -> Check {
     }
 }
 
-/// Run biome format --check silently (30s timeout).
+/// Run biome format in check mode silently (30s timeout).
 pub(super) fn run_fmt_check(
     project_dir: &Path,
     plugins: &[InstalledDoctorPlugin],
@@ -240,11 +354,10 @@ pub(super) fn run_fmt_check(
 }
 
 fn run_fmt_check_with_binary(bin: &Path, project_dir: &Path) -> Check {
-    let output =
-        match run_tool_output_with_timeout(bin, &["format", "--check", "."], project_dir, None) {
-            Ok(output) => output,
-            Err(error) => return Check::warn(&doctor_catalog::FMT_PROBE_FAILED, &error),
-        };
+    let output = match run_tool_output_with_timeout(bin, &["format", "."], project_dir, None) {
+        Ok(output) => output,
+        Err(error) => return Check::warn(&doctor_catalog::FMT_PROBE_FAILED, &error),
+    };
     let code = output.status.code().unwrap_or(1);
 
     if code == 0 {
@@ -444,6 +557,31 @@ pub(super) async fn check_plugins(plugins: &[InstalledDoctorPlugin]) -> Vec<Chec
 mod tests {
     use super::*;
     use std::time::Instant;
+
+    #[cfg(unix)]
+    #[test]
+    fn detached_descendant_cannot_hold_probe_output_open() {
+        let tmp = tempfile::tempdir().unwrap();
+        let marker = tmp.path().join("detached-pid");
+        let mut cmd = Command::new("python3");
+        cmd.args(["-c", "import os,sys,time; p=os.fork(); (os.setsid(),open(sys.argv[1],'w').write(str(os.getpid())),time.sleep(5)) if p==0 else time.sleep(0.1)"])
+            .arg(&marker).stdout(Stdio::piped()).stderr(Stdio::piped());
+        let child = lpm_sandbox::spawn_tracked_command(&mut cmd).unwrap();
+        let start = std::time::Instant::now();
+        let result = wait_with_timeout(child, Duration::from_millis(500));
+        let elapsed = start.elapsed();
+        if let Ok(pid) = std::fs::read_to_string(marker) {
+            // SAFETY: the pid belongs to this isolated test fixture.
+            unsafe {
+                libc::kill(pid.parse().unwrap(), libc::SIGKILL);
+            }
+        }
+        assert!(result.is_ok(), "{result:?}");
+        assert!(
+            elapsed < Duration::from_secs(3),
+            "pipe readers exceeded deadline: {elapsed:?}"
+        );
+    }
 
     #[test]
     fn wait_with_timeout_drains_full_stdout_and_stderr_pipes_before_child_exit() {

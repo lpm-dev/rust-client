@@ -594,7 +594,7 @@ fn doctor_all_fix_keeps_formatter_output_out_of_the_json_document() {
     seed_minimal_lockfile(&project);
     let marker = project.path().join("format-applied");
     let formatter = format!(
-        "#!/bin/sh\nif [ \"$2\" = \"--check\" ]; then\n  if [ -f \"{}\" ]; then exit 0; fi\n  echo 'Formatter would have printed fixture.js' >&2\n  exit 1\nfi\necho 'formatter stdout must stay captured'\nprintf 'applied' > \"{}\"\n",
+        "#!/bin/sh\nif [ \"$2\" = \"--check\" ]; then exit 2; fi\nif [ \"$3\" != \"--write\" ]; then\n  if [ -f \"{}\" ]; then exit 0; fi\n  echo 'Formatter would have printed fixture.js' >&2\n  exit 1\nfi\necho 'formatter stdout must stay captured'\nprintf 'applied' > \"{}\"\n",
         marker.display(),
         marker.display()
     );
@@ -751,4 +751,98 @@ fn workspace_member_doctor_uses_its_projection_and_repairs_root_lockfile_hygiene
     assert!(!app_dir.join("lpm.lock").exists());
     assert!(!app_dir.join("lpm.lockb").exists());
     assert!(!app_dir.join(".gitattributes").exists());
+}
+
+#[test]
+#[cfg(unix)]
+fn doctor_checks_pinned_tool_versions_including_workspace_root_pins() {
+    for workspace in [false, true] {
+        let project = TempProject::empty(
+            r#"{"name":"doctor-pins","version":"1.0.0","workspaces":["packages/*"]}"#,
+        );
+        project.write_file(
+            "lpm.json",
+            r#"{"tools":{"biome":"2.5.8","oxlint":"1.0.0"}}"#,
+        );
+        project.write_file(
+            "packages/app/package.json",
+            r#"{"name":"app","version":"1.0.0"}"#,
+        );
+        for (tool, pinned, newer) in [("biome", "2.5.8", "2.5.9"), ("oxlint", "1.0.0", "1.0.1")] {
+            seed_verified_plugin_with_binary(&project, tool, pinned, b"#!/bin/sh\nexit 0\n");
+            seed_verified_plugin_with_binary(
+                &project,
+                tool,
+                newer,
+                b"#!/bin/sh\necho 'newer version must not run' >&2\nexit 2\n",
+            );
+        }
+        let cwd = if workspace {
+            project.path().join("packages/app")
+        } else {
+            project.path().to_path_buf()
+        };
+        let output = lpm_doctor_offline(&project)
+            .current_dir(cwd)
+            .env("LPM_PLUGIN_GITHUB_API_BASE", "http://127.0.0.1:1")
+            .args(["--json", "doctor", "--all"])
+            .output()
+            .unwrap();
+        let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        let checks = report["checks"].as_array().unwrap();
+        for code in ["fmt_clean", "lint_clean"] {
+            assert!(
+                checks.iter().any(|row| row["code"] == code),
+                "workspace={workspace}: {report}"
+            );
+        }
+    }
+}
+
+#[test]
+#[cfg(unix)]
+fn doctor_human_summary_reports_failed_repairs() {
+    let project = TempProject::empty(r#"{"name":"doctor-fix-failure","version":"1.0.0"}"#);
+    seed_healthy_hoisted_install(&project);
+    seed_minimal_lockfile(&project);
+    project.write_file(".gitattributes", "lpm.lockb binary\n");
+    seed_verified_plugin_with_binary(&project, "biome", "2.5.9", b"#!/bin/sh\nif [ \"$3\" = \"--write\" ]; then echo 'failed repair' >&2; exit 9; fi\necho 'Formatter would have printed fixture.js' >&2\nexit 1\n");
+    let output = lpm_doctor_offline(&project)
+        .env("LPM_PLUGIN_GITHUB_API_BASE", "http://127.0.0.1:1")
+        .args(["doctor", "--all", "--yes"])
+        .output()
+        .unwrap();
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!output.status.success(), "repair must fail: {text}");
+    assert!(text.contains("fix(es) failed"), "{text}");
+    assert!(!text.contains("no auto-fixable issues found"), "{text}");
+}
+
+#[test]
+#[cfg(unix)]
+fn doctor_does_not_substitute_an_installed_tool_for_an_unavailable_pin() {
+    let project = TempProject::empty(r#"{"name":"doctor-pins","version":"1.0.0"}"#);
+    project.write_file("lpm.json", r#"{"tools":{"biome":"2.5.8"}}"#);
+    seed_verified_plugin_with_binary(&project, "biome", "2.5.9", b"#!/bin/sh\nexit 0\n");
+    let output = lpm_doctor_offline(&project)
+        .env("LPM_PLUGIN_GITHUB_API_BASE", "http://127.0.0.1:1")
+        .args(["doctor", "--all", "--json"])
+        .output()
+        .unwrap();
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let checks = report["checks"].as_array().unwrap();
+    assert!(
+        checks
+            .iter()
+            .any(|row| row["code"] == "plugin_pin_unavailable"),
+        "{report}"
+    );
+    assert!(
+        !checks.iter().any(|row| row["code"] == "fmt_clean"),
+        "{report}"
+    );
 }

@@ -1097,6 +1097,46 @@ pub(crate) fn ensure_runtime_npm_firewall_config_authorized_with_effective(
     )
 }
 
+/// Inspect a proposed project Sigstore posture without prompting or changing signed state.
+pub(crate) fn check_runtime_sigstore_posture(
+    project_dir: &Path,
+    requested: EnforceMode,
+) -> Result<(), LpmError> {
+    let effective = load_effective_authorized_posture()?;
+    if !crate::security_floor::sigstore_loosens(requested, effective.posture.sigstore_verify()) {
+        return Ok(());
+    }
+    if let Some(error) =
+        managed_policy_blocks_scope(&effective, ApprovalScope::ProvenanceUnverified)
+    {
+        return Err(error);
+    }
+    // Diagnostics must not prune expired grants or create an unlock lock file.
+    let dir = unlocks_dir()?;
+    let root = canonical_project_root(project_dir);
+    if dir.try_exists()? {
+        let now = Utc::now();
+        for entry in std::fs::read_dir(dir)? {
+            let path = entry?.path();
+            if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
+                continue;
+            }
+            if let Some(grant) = read_signed_json::<UnlockGrant>(&path)?
+                && grant.expires_at > now
+                && grant.target == UnlockTargetKind::Project
+                && grant.project_root.as_deref() == Some(root.as_str())
+                && grant.scopes.contains(&ApprovalScope::ProvenanceUnverified)
+                && unlock_grant_covers_packages(&grant, &[])
+            {
+                return Ok(());
+            }
+        }
+    }
+    Err(LpmError::SecurityFloor(
+        "the requested Sigstore mode needs approval; restore the approved mode or run `lpm security unlock provenance-unverified --project . --ttl 10m`".into()
+    ))
+}
+
 pub fn ensure_runtime_sigstore_posture(
     project_dir: &Path,
     json_output: bool,

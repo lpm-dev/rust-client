@@ -117,3 +117,72 @@ fn doctor_reports_type_errors_for_schema_derived_fields() {
         );
     }
 }
+
+#[test]
+fn doctor_reports_invalid_linker_sources_without_losing_other_checks() {
+    for source in ["env", "global", "package"] {
+        let project = TempProject::empty(r#"{"name":"doctor-config","version":"1.0.0"}"#);
+        let mut command = lpm(&project);
+        match source {
+            "env" => {
+                command.env("LPM_LINKER", "invalid");
+            }
+            "global" => {
+                std::fs::create_dir_all(project.home().join(".lpm")).unwrap();
+                std::fs::write(
+                    project.home().join(".lpm/config.toml"),
+                    "linker = \"invalid\"\n",
+                )
+                .unwrap();
+            }
+            _ => project.write_file(
+                "package.json",
+                r#"{"name":"doctor-config","version":"1.0.0","lpm":{"linker":"invalid"}}"#,
+            ),
+        }
+        let output = command.args(["doctor", "--json"]).output().unwrap();
+        let json = parse_json_output(&output.stdout);
+        let checks = json["checks"].as_array().expect("complete doctor report");
+        assert!(
+            checks
+                .iter()
+                .any(|row| row["code"] == "linker_config_invalid" && row["severity"] == "fail"),
+            "{source}: {json}"
+        );
+        assert!(
+            checks
+                .iter()
+                .any(|row| row["code"] == "package_json_present"),
+            "{json}"
+        );
+    }
+}
+
+#[test]
+fn doctor_reports_unreadable_runtime_pins_without_discarding_report() {
+    for filename in [".nvmrc", ".node-version"] {
+        for shape in ["directory", "invalid-utf8", "oversized"] {
+            let project = TempProject::empty(r#"{"name":"doctor-config","version":"1.0.0"}"#);
+            let pin = project.path().join(filename);
+            match shape {
+                "directory" => std::fs::create_dir(pin).unwrap(),
+                "invalid-utf8" => std::fs::write(pin, [0xff, 0xfe]).unwrap(),
+                _ => std::fs::write(
+                    pin,
+                    vec![b'2'; lpm_common::CONFIG_FILE_SIZE_CAP_BYTES as usize + 1],
+                )
+                .unwrap(),
+            }
+            let output = lpm(&project).args(["doctor", "--json"]).output().unwrap();
+            let json = parse_json_output(&output.stdout);
+            let checks = json["checks"].as_array().expect("complete doctor report");
+            assert!(
+                checks
+                    .iter()
+                    .any(|row| row["code"] == "node_config_invalid" && row["severity"] == "fail"),
+                "{filename}/{shape}: {json}"
+            );
+            assert!(checks.len() > 5, "remaining checks must run: {json}");
+        }
+    }
+}

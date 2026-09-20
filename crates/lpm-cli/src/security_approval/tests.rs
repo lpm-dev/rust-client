@@ -1618,3 +1618,47 @@ fn unavailable_windows_hello_never_approves_through_terminal_confirmation() {
         ));
     }
 }
+
+#[test]
+fn diagnostic_sigstore_posture_honors_unlocks_and_managed_policy_without_mutation() {
+    let temp = tempdir().unwrap();
+    let project = temp.path().join("project");
+    std::fs::create_dir_all(&project).unwrap();
+    with_test_env(temp.path(), || {
+        assert!(check_runtime_sigstore_posture(&project, EnforceMode::Off).is_err());
+        assert!(!super::paths::unlocks_lock_path().unwrap().exists());
+        assert!(!audit_log_path().unwrap().exists());
+        let mut expired = create_unlock_grant(
+            ApprovalScope::ProvenanceUnverified,
+            &project,
+            DEFAULT_UNLOCK_TTL_SECS,
+            None,
+            &[],
+        );
+        expired.expires_at = Utc::now() - chrono::Duration::seconds(1);
+        persist_unlock_grant(&expired).unwrap();
+        let expired_path = unlocks_dir().unwrap().join(format!("{}.json", expired.id));
+        assert!(check_runtime_sigstore_posture(&project, EnforceMode::Off).is_err());
+        assert!(
+            expired_path.exists(),
+            "diagnostics must retain expired grants"
+        );
+        let active = create_unlock_grant(
+            ApprovalScope::ProvenanceUnverified,
+            &project,
+            DEFAULT_UNLOCK_TTL_SECS,
+            None,
+            &[],
+        );
+        persist_unlock_grant(&active).unwrap();
+        assert!(check_runtime_sigstore_posture(&project, EnforceMode::Off).is_ok());
+        write_managed_policy(temp.path(), "[sigstore]\nverify = \"deny\"\n");
+        let error = check_runtime_sigstore_posture(&project, EnforceMode::Off).unwrap_err();
+        assert!(
+            error.to_string().contains("managed security policy"),
+            "{error}"
+        );
+        assert!(expired_path.exists());
+        assert!(!audit_log_path().unwrap().exists());
+    });
+}

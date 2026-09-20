@@ -1008,8 +1008,8 @@ pub static NODE_ENGINE_COMPATIBLE: CheckEntry = CheckEntry {
     name: "Node.js engine compatibility",
     category: Category::Runtime,
     tier: Tier::Fast,
-    description: "The first Node on script PATH satisfies package.json > engines.node.",
-    when_fires: "A Node engine constraint is declared and the Node resolved from script PATH satisfies it.",
+    description: "The selected managed or trusted system Node satisfies package.json > engines.node.",
+    when_fires: "A Node engine constraint is declared and the selected managed or trusted system Node satisfies it.",
     remediation: "No action — informational pass.",
     possible_severities: &[Severity::Pass],
     auto_fix: None,
@@ -1020,8 +1020,8 @@ pub static NODE_ENGINE_MISMATCH: CheckEntry = CheckEntry {
     name: "Node.js engine compatibility",
     category: Category::Runtime,
     tier: Tier::Fast,
-    description: "The first Node on script PATH does not satisfy package.json > engines.node.",
-    when_fires: "A Node engine constraint is declared and the Node resolved from script PATH violates it.",
+    description: "The selected managed or trusted system Node does not satisfy package.json > engines.node.",
+    when_fires: "A Node engine constraint is declared and the selected managed or trusted system Node violates it.",
     remediation: "Select a compatible runtime, relax engines.node, or disable engine strictness in project or user configuration.",
     possible_severities: &[Severity::Fail, Severity::Warn],
     auto_fix: None,
@@ -1045,7 +1045,7 @@ pub static NODE_PINNED_UNMET: CheckEntry = CheckEntry {
     category: Category::Runtime,
     tier: Tier::Fast,
     description: "Project pins a Node version but no matching managed install is selected.",
-    when_fires: "Pin found, but no managed install matches; the first Node on script PATH may differ in patch / minor.",
+    when_fires: "Pin found, but no managed install matches; the trusted system Node may differ in patch / minor.",
     remediation: "Run `lpm use node@<version>` to install and pin the managed version.",
     possible_severities: &[Severity::Warn],
     auto_fix: Some(DoctorFix::InstallNodeSpec),
@@ -1056,8 +1056,8 @@ pub static NODE_MISSING_PINNED: CheckEntry = CheckEntry {
     name: "Node.js",
     category: Category::Runtime,
     tier: Tier::Fast,
-    description: "Project pins a Node version and script PATH cannot resolve Node.",
-    when_fires: "Pin found; no Node is reachable through the constructed script PATH.",
+    description: "Project pins a Node version and trusted system PATH cannot resolve Node.",
+    when_fires: "Pin found; no Node is reachable through the trusted system PATH.",
     remediation: "Run `lpm use node@<version>` to install the pinned version.",
     possible_severities: &[Severity::Fail],
     auto_fix: Some(DoctorFix::InstallNodeSpec),
@@ -1068,8 +1068,8 @@ pub static NODE_SYSTEM_UNPINNED: CheckEntry = CheckEntry {
     name: "Node.js",
     category: Category::Runtime,
     tier: Tier::Fast,
-    description: "No Node version is pinned; a Node was found on script PATH.",
-    when_fires: "Project does not declare `runtime.node`, `.nvmrc`, or `.node-version`, and script PATH resolves Node.",
+    description: "No Node version is pinned; a Node was found on trusted system PATH.",
+    when_fires: "Project does not declare `runtime.node`, `.nvmrc`, or `.node-version`, and trusted system PATH resolves Node.",
     remediation: "Optional: pin a Node version via `lpm.json > runtime.node` for reproducibility.",
     possible_severities: &[Severity::Pass],
     auto_fix: None,
@@ -1080,8 +1080,8 @@ pub static NODE_MISSING_UNPINNED: CheckEntry = CheckEntry {
     name: "Node.js",
     category: Category::Runtime,
     tier: Tier::Fast,
-    description: "No Node version is pinned and script PATH cannot resolve Node.",
-    when_fires: "No Node is reachable through the constructed script PATH.",
+    description: "No Node version is pinned and trusted system PATH cannot resolve Node.",
+    when_fires: "No Node is reachable through the trusted system PATH.",
     remediation: "Install Node via `lpm use node@22` (or your preferred version).",
     possible_severities: &[Severity::Fail],
     auto_fix: Some(DoctorFix::InstallNode22),
@@ -1377,7 +1377,7 @@ pub static FMT_CLEAN: CheckEntry = CheckEntry {
     category: Category::CodeQuality,
     tier: Tier::Extended,
     description: "Biome reports the project formatting is clean.",
-    when_fires: "`biome format --check` exited cleanly.",
+    when_fires: "`biome format .` exited cleanly.",
     remediation: "No action — informational pass.",
     possible_severities: &[Severity::Pass],
     auto_fix: None,
@@ -1389,7 +1389,7 @@ pub static FMT_UNFORMATTED: CheckEntry = CheckEntry {
     category: Category::CodeQuality,
     tier: Tier::Extended,
     description: "Biome found files that need reformatting.",
-    when_fires: "`biome format --check` exited non-zero with formatting issues.",
+    when_fires: "`biome format .` exited non-zero with formatting issues.",
     remediation: "Run `lpm fmt` to apply formatting.",
     possible_severities: &[Severity::Warn],
     auto_fix: Some(DoctorFix::FormatProject),
@@ -1881,7 +1881,7 @@ pub static SANDBOX_KERNEL_TOO_OLD: CheckEntry = CheckEntry {
     tier: Tier::Extended,
     description: "Linux kernel is too old to support Landlock at the strict floor (V4 / kernel 6.7+).",
     when_fires: "User has opted into strict mode (via `--strict-sandbox` / `--paranoid` / `[sandbox] mode = \"strict\"` / `LPM_STRICT_SANDBOX=1`) but the host kernel cannot support V4. refuses to run lifecycle scripts under strict on kernels below this floor unless the user has explicitly opted into the degraded posture.",
-    remediation: "Pick one: (1) `[sandbox] allow-degraded = true` in `~/.lpm/config.toml` or `./lpm.toml` for the V1 filesystem-only fallback (no outbound network containment); (2) `lpm config sandbox --set default` to drop back to the recommended default posture (filesystem + env containment, network allowed); (3) add the package to `package.json > lpm > trustedDependencies` to skip the sandbox for that dependency; (4) `lpm install --no-sandbox` for a one-shot escape (or `lpm config sandbox --set none` to persist); (5) upgrade the host kernel to 6.7+.",
+    remediation: "Pick one: (1) `[sandbox] allow-degraded = true` in `~/.lpm/config.toml` or `./lpm.toml` for the V1 filesystem-only fallback (no outbound network containment); (2) `lpm config sandbox --set default` to drop back to the recommended default posture (filesystem + env containment, network allowed); (3) `lpm install --no-sandbox` for a one-shot escape (or `lpm config sandbox --set none` to persist); (4) upgrade the host kernel to 6.7+.",
     possible_severities: &[Severity::Warn],
     auto_fix: None,
 };
@@ -1893,7 +1893,7 @@ pub static SANDBOX_UNSUPPORTED_PLATFORM: CheckEntry = CheckEntry {
     tier: Tier::Extended,
     description: "No supported sandbox backend exists for this platform.",
     when_fires: "Running on a host where neither Seatbelt nor Landlock is available.",
-    remediation: "Lifecycle scripts will not be sandboxed on this platform — review with `lpm approve-scripts`.",
+    remediation: "Scripts that require sandbox containment stop. Use a supported host or an approved change to sandbox configuration.",
     possible_severities: &[Severity::Warn],
     auto_fix: None,
 };
@@ -1978,9 +1978,9 @@ pub static POLICY_FORCE_SECURITY_FLOOR: CheckEntry = CheckEntry {
     name: "Script policy",
     category: Category::Sandbox,
     tier: Tier::Extended,
-    description: "An override is in effect that lowers the default script-policy floor.",
-    when_fires: "User opted into a less-strict policy via flag, env, or config.",
-    remediation: "Review the override and confirm it matches the project's threat model.",
+    description: "The force-security-floor setting suspends approvals and keeps the security floor active.",
+    when_fires: "The global force-security-floor configuration is true.",
+    remediation: "Review why the security floor was forced before running `lpm config unset force-security-floor`.",
     possible_severities: &[Severity::Warn],
     auto_fix: None,
 };
@@ -2153,7 +2153,9 @@ pub static CLI_CATALOG: &[&CheckEntry] = &[
     &PACKAGE_JSON_PRESENT,
     &PACKAGE_JSON_MISSING,
     &PACKAGE_JSON_INVALID,
+    &LINKER_CONFIG_INVALID,
     &LINKER_MODE_RESOLVED,
+    &NODE_CONFIG_INVALID,
     &NODE_MODULES_ISOLATED_HEALTHY,
     &NODE_MODULES_HOISTED_HEALTHY,
     &NODE_MODULES_VIRTUAL_HEALTHY,
@@ -2231,6 +2233,7 @@ pub static CLI_CATALOG: &[&CheckEntry] = &[
     &TYPESCRIPT_MISSING_FOR_TSCONFIG,
     &TYPESCRIPT_UNAVAILABLE,
     // Plugin
+    &PLUGIN_PIN_UNAVAILABLE,
     &PLUGIN_UP_TO_DATE,
     &PLUGIN_UPDATE_AVAILABLE,
     &PLUGIN_UPDATE_CHECK_FAILED,
@@ -2269,6 +2272,7 @@ pub static CLI_CATALOG: &[&CheckEntry] = &[
     &SANDBOX_PROBE_FAILED,
     &POLICY_FORCE_SECURITY_FLOOR,
     // Sigstore provenance posture
+    &SIGSTORE_CONFIG_APPROVAL_REQUIRED,
     &SIGSTORE_VERIFY_ENFORCED,
     &SIGSTORE_VERIFY_WARN_MODE,
     &SIGSTORE_VERIFY_DISABLED,
@@ -2332,6 +2336,54 @@ pub fn all_entries() -> Vec<InventoryRow> {
     rows.shrink_to_fit();
     rows
 }
+
+pub static LINKER_CONFIG_INVALID: CheckEntry = CheckEntry {
+    code: "linker_config_invalid",
+    name: "Linker mode",
+    category: Category::ProjectState,
+    tier: Tier::Fast,
+    description: "A linker configuration value is invalid.",
+    when_fires: "A linker setting from the environment, global configuration, or package manifest is invalid.",
+    remediation: "Repair the configuration source named in the detail.",
+    possible_severities: &[Severity::Fail],
+    auto_fix: None,
+};
+
+pub static NODE_CONFIG_INVALID: CheckEntry = CheckEntry {
+    code: "node_config_invalid",
+    name: "Node.js",
+    category: Category::Runtime,
+    tier: Tier::Fast,
+    description: "The configured Node.js pin cannot be read.",
+    when_fires: "A Node.js pin file is unreadable, oversized, not a file, or invalid UTF-8.",
+    remediation: "Repair the pin file, then rerun lpm doctor.",
+    possible_severities: &[Severity::Fail],
+    auto_fix: None,
+};
+
+pub static PLUGIN_PIN_UNAVAILABLE: CheckEntry = CheckEntry {
+    code: "plugin_pin_unavailable",
+    name: "Plugin",
+    category: Category::Plugin,
+    tier: Tier::Extended,
+    description: "A pinned tool is not available for local diagnostics.",
+    when_fires: "The tool pin is invalid, uninstalled, or lacks a valid verification receipt.",
+    remediation: "Repair the tools configuration or run the tool command to install the pinned version.",
+    possible_severities: &[Severity::Warn],
+    auto_fix: None,
+};
+
+pub static SIGSTORE_CONFIG_APPROVAL_REQUIRED: CheckEntry = CheckEntry {
+    code: "sigstore_config_approval_required",
+    name: "Sigstore verify",
+    category: Category::Provenance,
+    tier: Tier::Fast,
+    description: "The requested Sigstore mode cannot be authorized.",
+    when_fires: "The override needs a project unlock, violates managed policy, or approval state cannot be read.",
+    remediation: "Restore the approved mode or follow the approval guidance in the detail.",
+    possible_severities: &[Severity::Fail],
+    auto_fix: None,
+};
 
 #[cfg(test)]
 mod tests {
