@@ -301,18 +301,29 @@ impl Lockfile {
         if binary::binary_format_supports(self) {
             binary::write_binary(self, &binary_path)?;
         } else {
-            match std::fs::remove_file(&binary_path) {
-                Ok(()) => tracing::debug!(
-                    path = %binary_path.display(),
-                    "removed obsolete binary lockfile for TOML-only graph"
-                ),
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(error) => {
-                    return Err(LockfileError::Io(format!(
-                        "failed to remove obsolete binary lockfile {}: {error}",
-                        binary_path.display()
-                    )));
-                }
+            self.remove_obsolete_binary(toml_path)?;
+        }
+        Ok(())
+    }
+
+    /// Remove an obsolete companion without rewriting authoritative TOML or
+    /// following a companion symlink. Legacy representable graphs keep it.
+    pub fn remove_obsolete_binary(&self, toml_path: &Path) -> Result<(), LockfileError> {
+        if binary::binary_format_supports(self) {
+            return Ok(());
+        }
+        let binary_path = toml_path.with_extension("lockb");
+        match std::fs::remove_file(&binary_path) {
+            Ok(()) => tracing::debug!(
+                path = %binary_path.display(),
+                "removed obsolete binary lockfile for TOML-only graph"
+            ),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(LockfileError::Io(format!(
+                    "failed to remove obsolete binary lockfile {}: {error}",
+                    binary_path.display()
+                )));
             }
         }
         Ok(())

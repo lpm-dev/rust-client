@@ -20,6 +20,120 @@ use wiremock::matchers::{header, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 #[tokio::test]
+async fn unchanged_install_removes_obsolete_binary_without_changing_toml() {
+    assert_install_removes_obsolete_binary(false).await;
+}
+
+#[tokio::test]
+async fn unchanged_workspace_install_removes_obsolete_binary_without_changing_toml() {
+    assert_install_removes_obsolete_binary(true).await;
+}
+
+async fn assert_install_removes_obsolete_binary(workspace: bool) {
+    let mock = MockRegistry::start().await;
+    mock.with_package("ms", "2.1.3", &make_tarball("ms", "2.1.3"))
+        .await;
+    let manifest = if workspace {
+        r#"{"name":"consumer","version":"1.0.0","workspaces":["packages/*"],"dependencies":{"ms":"2.1.3"}}"#
+    } else {
+        r#"{"name":"consumer","version":"1.0.0","dependencies":{"ms":"2.1.3"}}"#
+    };
+    let project = TempProject::empty(manifest);
+    if workspace {
+        project.write_file(
+            "packages/app/package.json",
+            r#"{"name":"app","version":"1.0.0","dependencies":{"ms":"2.1.3"}}"#,
+        );
+    }
+    project.write_file(".npmrc", &format!("registry={}/\n", mock.url()));
+    let mut args = vec![
+        "install",
+        "--no-frozen-lockfile",
+        "--no-skills",
+        "--no-editor-setup",
+        "--no-security-summary",
+    ];
+    if workspace {
+        args.push("--recursive");
+    }
+    lpm_with_registry(&project, &mock.url())
+        .args(&args)
+        .assert()
+        .success();
+    let original = std::fs::read(project.path().join("lpm.lock")).unwrap();
+    let mut legacy = lpm_lockfile::Lockfile::new();
+    legacy.metadata.lockfile_version = lpm_lockfile::LOCKFILE_VERSION_WITH_STRUCTURED_PEERS;
+    let binary = lpm_lockfile::binary::to_binary(&legacy).unwrap();
+    for (warm, expectation) in [
+        (false, "required"),
+        (false, "missing"),
+        (true, "not-required"),
+    ] {
+        let path = project.path().join("lpm.lockb");
+        std::fs::write(&path, &binary).unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(2))
+            .unwrap();
+        let frozen_args: Vec<_> = args
+            .iter()
+            .copied()
+            .map(|arg| {
+                if arg == "--no-frozen-lockfile" {
+                    "--frozen-lockfile"
+                } else {
+                    arg
+                }
+            })
+            .collect();
+        lpm_with_registry(&project, &mock.url())
+            .args(&frozen_args)
+            .assert()
+            .success();
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            binary,
+            "frozen installs preserve legacy bytes"
+        );
+        for directory in if workspace {
+            vec![
+                project.path().to_path_buf(),
+                project.path().join("packages/app"),
+            ]
+        } else {
+            vec![project.path().to_path_buf()]
+        } {
+            let hash_path = directory.join(".lpm/install-hash");
+            let hash = std::fs::read_to_string(&hash_path).unwrap();
+            let metadata = if expectation == "missing" {
+                String::new()
+            } else {
+                format!("b:{expectation}\n")
+            };
+            std::fs::write(hash_path, hash.replace("b:not-required\n", &metadata)).unwrap();
+        }
+        if warm {
+            std::fs::remove_dir_all(project.path().join("node_modules")).unwrap();
+        }
+        lpm_with_registry(&project, &mock.url())
+            .args(&args)
+            .assert()
+            .success();
+        assert!(
+            !path.exists(),
+            "obsolete binary survived install (workspace={workspace}, warm={warm})"
+        );
+        assert_eq!(
+            std::fs::read(project.path().join("lpm.lock")).unwrap(),
+            original,
+            "binary cleanup must preserve the authoritative graph"
+        );
+    }
+}
+
+#[tokio::test]
 async fn global_alias_without_a_collision_runs_and_is_removed_with_its_package() {
     let mock = MockRegistry::start().await;
     let tarball = make_tarball_from_pkg_json(

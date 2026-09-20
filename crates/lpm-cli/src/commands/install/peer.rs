@@ -262,11 +262,14 @@ pub(super) fn binary_lockfile_needs_writeback(
     lockfile_path: &Path,
     lockfile: &lpm_lockfile::Lockfile,
 ) -> bool {
+    let binary_path = lockfile_path.with_extension("lockb");
     if !lpm_lockfile::binary::binary_format_supports(lockfile) {
-        return false;
+        return match std::fs::symlink_metadata(&binary_path) {
+            Ok(_) => true,
+            Err(error) => error.kind() != std::io::ErrorKind::NotFound,
+        };
     }
 
-    let binary_path = lockfile_path.with_extension("lockb");
     if binary_lockfile_is_older_than_toml(lockfile_path, &binary_path) {
         return true;
     }
