@@ -305,7 +305,11 @@ async fn run_inner(
             )
         })
     });
-    let installed_plugins = all.then(|| std::sync::Arc::new(discover_installed_plugins()));
+    let installed_plugins = all.then(|| {
+        let (plugins, plugin_checks) = discover_installed_plugins(project_dir);
+        checks.extend(plugin_checks);
+        std::sync::Arc::new(plugins)
+    });
     let lint_task = installed_plugins.as_ref().map(|plugins| {
         let project = project_dir.to_path_buf();
         let plugins = std::sync::Arc::clone(plugins);
@@ -393,30 +397,25 @@ async fn run_inner(
     };
     let package_manifest_valid = package_manifest.is_some();
 
-    // 4.5. Resolved linker mode + source — surfaces "why is my linker
-    // mode X?" so users running `lpm doctor` after the workspace-aware
-    // default flip can see whether the result came from an explicit
-    // override or auto-detection. Skipped silently when there's no
-    // readable package.json (no manifest → no resolution to report);
-    // the resolution-error path emits a fail anyway via the install
-    // pipeline. Best-effort: any I/O / parse failure here downgrades
-    // to a quiet skip rather than failing doctor.
-    if let Some(pkg_parsed) = package_manifest.as_ref()
-        && let Ok((mode, source)) = crate::linker_config::resolve_effective_linker_with_source(
+    if let Some(pkg_parsed) = package_manifest.as_ref() {
+        match crate::linker_config::resolve_effective_linker_with_source(
             None,
             pkg_parsed,
             &global_config,
             project_dir,
-        )
-    {
-        let mode_str = match mode {
-            lpm_linker::LinkerMode::Isolated => "isolated",
-            lpm_linker::LinkerMode::Hoisted => "hoisted",
-        };
-        checks.push(Check::pass(
-            &doctor_catalog::LINKER_MODE_RESOLVED,
-            &format!("{mode_str} (source: {})", source.as_str()),
-        ));
+        ) {
+            Ok((mode, source)) => {
+                let mode = match mode {
+                    lpm_linker::LinkerMode::Isolated => "isolated",
+                    lpm_linker::LinkerMode::Hoisted => "hoisted",
+                };
+                checks.push(Check::pass(
+                    &doctor_catalog::LINKER_MODE_RESOLVED,
+                    &format!("{mode} (source: {})", source.as_str()),
+                ));
+            }
+            Err(error) => checks.push(Check::fail(&doctor_catalog::LINKER_CONFIG_INVALID, &error)),
+        }
     }
 
     // 5. node_modules intact?
@@ -646,10 +645,19 @@ async fn run_inner(
     // === Runtime ===
 
     // 8. Node.js version
-    let detected = lpm_runtime::detect::detect_node_version_with_lpm_json_spec(
+    let detected = match lpm_runtime::detect::detect_node_version_with_lpm_json_spec(
         project_dir,
         diagnostic_lpm_json.node_spec(),
-    )?;
+    ) {
+        Ok(detected) => detected,
+        Err(error) => {
+            checks.push(Check::fail(
+                &doctor_catalog::NODE_CONFIG_INVALID,
+                &error.to_string(),
+            ));
+            None
+        }
+    };
     let managed_versions = lpm_runtime::node::list_installed().unwrap_or_default();
     let matched_managed_node = detected.as_ref().and_then(|detected| {
         lpm_runtime::node::find_matching_installed(&detected.spec, &managed_versions)
@@ -938,6 +946,9 @@ async fn run_inner(
     // operator who flipped the knob once and forgot doesn't fly
     // blind. Fast-tier: one config-file read, no network.
     checks.push(check_sigstore_verify_posture(&global_config));
+    if let Some(check) = self::sigstore::check_sigstore_authorization(project_dir, &global_config) {
+        checks.push(check);
+    }
 
     // === — Script policy + sandbox (Extended) ===
     //

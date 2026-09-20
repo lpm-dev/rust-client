@@ -376,7 +376,8 @@ impl Drop for Probe {
 }
 
 #[cfg(unix)]
-fn prepare_reader(reader: &impl std::os::fd::AsRawFd) -> io::Result<()> {
+/// Prepare an owned subprocess pipe for reads that do not block.
+pub fn prepare_reader(reader: &impl std::os::fd::AsRawFd) -> io::Result<()> {
     let fd = reader.as_raw_fd();
     // SAFETY: the pipe descriptor remains owned by reader; only its flags change.
     unsafe {
@@ -389,12 +390,15 @@ fn prepare_reader(reader: &impl std::os::fd::AsRawFd) -> io::Result<()> {
 }
 
 #[cfg(not(unix))]
-fn prepare_reader<T>(_reader: &T) -> io::Result<()> {
+/// Prepare an owned subprocess pipe for reads that do not block.
+pub fn prepare_reader<T>(_reader: &T) -> io::Result<()> {
     Ok(())
 }
 
 #[cfg(unix)]
-fn read_available(
+/// Read available pipe bytes; return `None` when more bytes are not ready.
+/// Call `prepare_reader` before the first read.
+pub fn read_available(
     reader: &mut (impl Read + std::os::fd::AsRawFd),
     buffer: &mut [u8],
 ) -> io::Result<Option<usize>> {
@@ -405,7 +409,9 @@ fn read_available(
 }
 
 #[cfg(windows)]
-fn read_available(
+/// Read available pipe bytes; return `None` when more bytes are not ready.
+/// Call `prepare_reader` before the first read.
+pub fn read_available(
     reader: &mut (impl Read + std::os::windows::io::AsRawHandle),
     buffer: &mut [u8],
 ) -> io::Result<Option<usize>> {
@@ -439,7 +445,9 @@ fn read_available(
 }
 
 #[cfg(not(any(unix, windows)))]
-fn read_available<T>(_reader: &mut T, _buffer: &mut [u8]) -> io::Result<Option<usize>> {
+/// Read available pipe bytes; return `None` when more bytes are not ready.
+/// Call `prepare_reader` before the first read.
+pub fn read_available<T>(_reader: &mut T, _buffer: &mut [u8]) -> io::Result<Option<usize>> {
     Err(io::Error::new(
         io::ErrorKind::Unsupported,
         "bounded probes are unavailable",

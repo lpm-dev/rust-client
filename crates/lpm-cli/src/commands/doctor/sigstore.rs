@@ -23,7 +23,7 @@ pub(super) fn check_sigstore_verify_posture(cfg: &crate::commands::config::Globa
             &doctor_catalog::SIGSTORE_VERIFY_WARN_MODE,
             &format!(
                 "warn (source: {source_label}) — verifier rejections only log; \
-                 install still proceeds. {}",
+                 install proceeds only when security approvals and managed policy permit this mode. {}",
                 source.re_enable_hint(),
             ),
         ),
@@ -31,11 +31,29 @@ pub(super) fn check_sigstore_verify_posture(cfg: &crate::commands::config::Globa
             &doctor_catalog::SIGSTORE_VERIFY_DISABLED,
             &format!(
                 "off (source: {source_label}) — every Sigstore attestation will be \
-                 IGNORED. {}",
+                 IGNORED only when security approvals and managed policy permit this mode. {}",
                 source.re_enable_hint(),
             ),
         ),
     }
+}
+
+pub(super) fn check_sigstore_authorization(
+    project: &std::path::Path,
+    cfg: &crate::commands::config::GlobalConfig,
+) -> Option<Check> {
+    let (mode, _) = crate::provenance_fetch::EnforceMode::resolve_from_chain(
+        std::env::var("LPM_PROVENANCE_ENFORCE").ok().as_deref(),
+        || cfg.get_sigstore_verify(),
+    );
+    crate::security_approval::check_runtime_sigstore_posture(project, mode)
+        .err()
+        .map(|error| {
+            Check::fail(
+                &doctor_catalog::SIGSTORE_CONFIG_APPROVAL_REQUIRED,
+                &error.to_string(),
+            )
+        })
 }
 
 #[cfg(all(test, unix))]

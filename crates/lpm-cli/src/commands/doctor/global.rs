@@ -450,14 +450,6 @@ fn check_global_shim_targets(
     manifest: &lpm_global::GlobalManifest,
 ) -> Check {
     let bin_dir = root.bin_dir();
-    if !bin_dir.exists() {
-        // No bin dir → nothing to verify. The orphaned-shim check
-        // already passes in this state; we just match it.
-        return Check::pass(
-            &doctor_catalog::GLOBAL_SHIM_TARGETS_HEALTHY,
-            "bin dir does not exist yet",
-        );
-    }
 
     let mut mismatches = IssuePreview::default();
     let mut expectation_count = 0usize;
@@ -569,12 +561,6 @@ fn check_global_shim_targets(
     manifest: &lpm_global::GlobalManifest,
 ) -> Check {
     let bin_dir = root.bin_dir();
-    if !bin_dir.exists() {
-        return Check::pass(
-            &doctor_catalog::GLOBAL_SHIM_TARGETS_HEALTHY,
-            "bin dir does not exist yet",
-        );
-    }
 
     let mut mismatches = IssuePreview::default();
     let mut expectation_count = 0usize;
@@ -920,6 +906,20 @@ mod tests {
 
         assert!(matches!(check.severity, Severity::Warn));
         assert!(check.detail.contains("bin-a.cmd"), "{}", check.detail);
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn missing_bin_directory_reports_manifest_owned_shims() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = LpmRoot::from_dir(tmp.path());
+        let mut manifest = GlobalManifest::default();
+        manifest
+            .packages
+            .insert("pkg".into(), pkg_entry("installs/pkg@1.0.0"));
+        let check = check_global_shim_targets(&root, &manifest);
+        assert_eq!(check.code(), "global_shim_targets_stale");
+        assert!(check.detail.contains("bin-a"), "{}", check.detail);
     }
 
     /// The shim-target verifier passes when every owned shim points at

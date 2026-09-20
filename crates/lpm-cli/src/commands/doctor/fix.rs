@@ -181,7 +181,7 @@ pub(super) async fn apply(
     }
 
     if !json_output {
-        render_summary(&report.applied);
+        render_summary(&report.applied, &report.failed);
     }
     report
 }
@@ -277,9 +277,14 @@ fn phase_untrusted(json_output: bool, message: &str) {
     }
 }
 
-fn render_summary(fixes_applied: &[String]) {
+fn render_summary(fixes_applied: &[String], fixes_failed: &[FixFailure]) {
+    if !fixes_failed.is_empty() {
+        install_ui::warn_untrusted(&format!("{} fix(es) failed", fixes_failed.len()));
+    }
     if fixes_applied.is_empty() {
-        install_ui::phase("no auto-fixable issues found");
+        if fixes_failed.is_empty() {
+            install_ui::phase("no auto-fixable issues found");
+        }
         return;
     }
     install_ui::done_untrusted(&format!(
@@ -287,11 +292,7 @@ fn render_summary(fixes_applied: &[String]) {
         fixes_applied.len(),
         fixes_applied.join(", ")
     ));
-    install_ui::detail_line(crate::install_ui::terminal_line!(
-        "  {} Run {} to verify fixes.",
-        install_ui::dim("hint"),
-        install_ui::yellow("lpm doctor")
-    ));
+    install_ui::detail("Rechecking the selected diagnostics.");
 }
 
 fn prune_store() -> Result<String, LpmError> {

@@ -209,3 +209,19 @@ fn doctor_env_var_overrides_config_when_resolving_sigstore_posture() {
         "row detail must name the env source (not config); got: {detail}",
     );
 }
+
+#[test]
+fn doctor_reports_unapproved_sigstore_override_without_writing_approval_state() {
+    let project = TempProject::empty(r#"{"name":"doctor-sigstore","version":"1.0.0"}"#);
+    let output = support::lpm(&project)
+        .env("LPM_PROVENANCE_ENFORCE", "off")
+        .args(["doctor", "--json"])
+        .output()
+        .unwrap();
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(
+        find_check(&report, "sigstore_config_approval_required").is_some(),
+        "{report}"
+    );
+    assert!(!project.home().join(".lpm/security/audit.jsonl").exists());
+}

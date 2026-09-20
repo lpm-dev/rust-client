@@ -7,6 +7,7 @@
 //! approval, or must fail closed for automation.
 
 mod approval;
+pub(crate) use approval::check_runtime_sigstore_posture;
 mod audit;
 mod helpers;
 mod managed_policy;

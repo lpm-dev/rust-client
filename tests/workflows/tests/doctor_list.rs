@@ -501,3 +501,27 @@ fn every_runtime_emitted_code_is_in_the_catalog() {
         "runtime emitted code(s) not in the catalog: {unregistered:?}"
     );
 }
+
+#[test]
+fn doctor_catalog_describes_security_floor_and_required_containment() {
+    let project = support::TempProject::empty(r#"{"name":"doctor-catalog","version":"1.0.0"}"#);
+    let output = support::lpm(&project)
+        .args(["doctor", "list", "--json"])
+        .output()
+        .unwrap();
+    let text = String::from_utf8(output.stdout).unwrap();
+    assert!(!text.contains("Lifecycle scripts will not be sandboxed on this platform"));
+    assert!(!text.contains("trustedDependencies` to skip the sandbox"));
+}
+
+#[test]
+fn doctor_catalog_does_not_suggest_unsupported_sandbox_bypasses() {
+    let project = support::TempProject::empty(r#"{"name":"doctor-catalog","version":"1.0.0"}"#);
+    let output = support::lpm(&project)
+        .args(["doctor", "list", "--json"])
+        .output()
+        .unwrap();
+    let text = String::from_utf8(output.stdout).unwrap();
+    assert!(!text.contains("Lifecycle scripts will not be sandboxed on this platform"));
+    assert!(!text.contains("trustedDependencies` to skip the sandbox"));
+}
