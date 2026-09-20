@@ -26,6 +26,7 @@
 
 pub mod crypto;
 mod fallback;
+mod gitignore;
 mod selected_environment;
 pub mod signature;
 pub mod sync;
@@ -42,7 +43,7 @@ mod macos_keychain;
 #[cfg(test)]
 pub(crate) mod test_env_lock;
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 pub type SecretMap = HashMap<String, String>;
@@ -1573,61 +1574,11 @@ fn add_to_gitignore(project_dir: &Path, file_path: &Path) {
 }
 
 fn add_paths_to_gitignore<'a>(project_dir: &Path, file_paths: impl IntoIterator<Item = &'a Path>) {
-    let gitignore_path = project_dir.join(".gitignore");
-    let existing = match lpm_common::read_text_file_capped(
-        &gitignore_path,
-        lpm_common::CONFIG_FILE_SIZE_CAP_BYTES,
-    ) {
-        Ok(existing) => existing,
-        Err(lpm_common::BoundedReadError::NotFound { .. }) => String::new(),
-        Err(error) => {
-            tracing::warn!(path = %gitignore_path.display(), %error, "failed to inspect .gitignore");
-            return;
-        }
-    };
-
-    let existing_entries = existing.lines().map(str::trim).collect::<HashSet<_>>();
-    let mut pending_entries = Vec::new();
-    let mut pending_set = HashSet::new();
-    for file_path in file_paths {
-        let relative = file_path.strip_prefix(project_dir).map_or_else(
-            |_| file_path.display().to_string(),
-            |path| path.display().to_string(),
+    if let Err(error) = gitignore::add_paths(project_dir, file_paths) {
+        tracing::warn!(
+            error = %lpm_common::sanitize_terminal_inline(&error.to_string()),
+            "could not update .gitignore; add secret file paths before committing",
         );
-        if existing_entries.contains(relative.as_str())
-            || existing_entries.contains(format!("/{relative}").as_str())
-            || !pending_set.insert(relative.clone())
-        {
-            continue;
-        }
-        pending_entries.push(relative);
-    }
-    if pending_entries.is_empty() {
-        return;
-    }
-
-    let required_capacity = pending_entries
-        .iter()
-        .fold(1usize, |size, entry| size.saturating_add(entry.len() + 1));
-    let mut addition = String::with_capacity(required_capacity);
-    if !existing.ends_with('\n') && !existing.is_empty() {
-        addition.push('\n');
-    }
-    for entry in pending_entries {
-        addition.push_str(&entry);
-        addition.push('\n');
-    }
-
-    if let Err(e) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&gitignore_path)
-        .and_then(|mut f| {
-            use std::io::Write;
-            f.write_all(addition.as_bytes())
-        })
-    {
-        tracing::debug!("failed to update .gitignore: {e}");
     }
 }
 
