@@ -126,7 +126,7 @@ pub(super) struct DryRunSummary<'a> {
 
 pub(super) fn print_dry_run_summary(summary: &DryRunSummary<'_>) {
     install_ui::detail("");
-    install_ui::phase("Dry run — no changes will be made");
+    install_ui::phase("Dry run — no package upload");
     publish_detail(
         "package",
         install_ui::yellow(&format!("{}@{}", summary.name, summary.version)),
