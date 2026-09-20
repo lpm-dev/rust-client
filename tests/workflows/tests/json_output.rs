@@ -617,3 +617,33 @@ fn install_envelope_provenance_block_shape_pinned_across_all_verified_states() {
 
     insta::assert_json_snapshot!("install_json_envelope_provenance_verified_states", envelope);
 }
+
+#[test]
+fn missing_command_in_json_mode_emits_a_usage_envelope() {
+    let project = TempProject::empty(r#"{"name":"usage-fixture","version":"1.0.0"}"#);
+    let output = lpm(&project).arg("--json").output().unwrap();
+    assert_eq!(output.status.code(), Some(2));
+    let envelope = parse_json_output(&output.stdout);
+    assert_eq!(envelope["success"], false);
+    assert_eq!(envelope["error_code"], "usage");
+    assert_eq!(envelope["kind"], "missing_subcommand");
+    insta::assert_json_snapshot!("missing_command_json_usage", envelope);
+}
+
+#[test]
+fn help_and_version_requests_remain_display_output_in_json_mode() {
+    let project = TempProject::empty(r#"{"name":"usage-fixture","version":"1.0.0"}"#);
+    for args in [
+        vec!["--json", "--help"],
+        vec!["--json", "-V"],
+        vec!["--json", "-v"],
+    ] {
+        let output = lpm(&project).args(&args).output().unwrap();
+        assert!(output.status.success(), "{args:?}: {output:?}");
+        assert!(!output.stdout.is_empty(), "{args:?}");
+        assert!(serde_json::from_slice::<serde_json::Value>(&output.stdout).is_err());
+    }
+    let output = lpm(&project).output().unwrap();
+    assert_eq!(output.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&output.stdout).contains("Usage:"));
+}

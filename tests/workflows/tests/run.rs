@@ -5690,3 +5690,26 @@ fn run_reads_tasks_and_environment_policy_from_bom_prefixed_lpm_json() {
         "{output:?}"
     );
 }
+
+#[test]
+fn two_hundred_fifty_six_failed_tasks_never_report_process_success() {
+    let scripts = (0..256)
+        .map(|index| (format!("fail-{index}"), serde_json::json!("exit 1")))
+        .collect::<serde_json::Map<_, _>>();
+    let names: Vec<_> = scripts.keys().cloned().collect();
+    let project = TempProject::empty(
+        &serde_json::json!({"name":"aggregate-failures","scripts":scripts}).to_string(),
+    );
+    let output = lpm(&project)
+        .args(["run", "--json", "--no-bail", "--no-cache"])
+        .args(&names)
+        .output()
+        .unwrap();
+    let payload: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(payload["failed"], 256);
+    assert_eq!(
+        output.status.code(),
+        Some(255),
+        "256 failures must not wrap to success"
+    );
+}
