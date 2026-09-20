@@ -1810,3 +1810,6 @@ fn tunnel_filtered_detail_and_short_equals_flags_select_the_requested_capture() 
         assert_eq!(detail["id"], "stripe", "{args:?}");
     }
 }
+
+#[path = "dev_tunnel/auto_ack.rs"]
+mod auto_ack;

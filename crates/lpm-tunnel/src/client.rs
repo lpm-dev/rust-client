@@ -152,8 +152,23 @@ impl std::fmt::Debug for TunnelTokenProvider {
 /// Captured webhook plus reservations for its queued request and response bodies.
 pub struct CapturedWebhookEvent {
     pub webhook: Arc<CapturedWebhook>,
+    persistence: Option<tokio::sync::oneshot::Sender<Result<(), String>>>,
     _response_memory_permit: Option<Arc<tokio::sync::OwnedSemaphorePermit>>,
     _request_memory_permit: Option<Arc<tokio::sync::OwnedSemaphorePermit>>,
+}
+
+impl CapturedWebhookEvent {
+    /// Whether the response must wait for durable replay storage.
+    pub fn requires_persistence(&self) -> bool {
+        self.persistence.is_some()
+    }
+
+    /// Report the result only after the capture transaction commits.
+    pub fn complete_persistence(mut self, result: Result<(), String>) {
+        if let Some(receipt) = self.persistence.take() {
+            let _ = receipt.send(result);
+        }
+    }
 }
 
 struct ActiveHttpForward {
@@ -1301,7 +1316,7 @@ async fn forward_http_request(
     };
     let mut stream_end = None;
     let mut capture_incomplete = false;
-    let (response, memory_permit) = match proxy::forward_request_with_memory_budget(
+    let (mut response, memory_permit) = match proxy::forward_request_with_memory_budget(
         &http_client,
         &local_target,
         &server_msg,
@@ -1325,7 +1340,7 @@ async fn forward_http_request(
             };
             let response = if auto_ack {
                 was_auto_acked = true;
-                tracing::info!("auto-ack: returning 200 OK (server down)");
+                tracing::debug!("auto-ack: waiting for durable replay storage");
                 proxy::auto_ack_response(id)
             } else {
                 proxy::bad_gateway_response(id)
@@ -1379,11 +1394,34 @@ async fn forward_http_request(
             captured.signature_diagnostic =
                 webhook_signature::diagnose_signature_failure(&captured, &env_vars);
         }
-        let _ = tx.try_send(CapturedWebhookEvent {
+        let (receipt_tx, receipt_rx) = if was_auto_acked {
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            (Some(tx), Some(rx))
+        } else {
+            (None, None)
+        };
+        let event = CapturedWebhookEvent {
             webhook: Arc::new(captured),
+            persistence: receipt_tx,
             _response_memory_permit: memory_permit.clone(),
             _request_memory_permit: request_memory_permit,
-        });
+        };
+        let queued = tx.try_send(event).is_ok();
+        if let Some(receipt_rx) = receipt_rx {
+            let persisted = queued
+                && matches!(
+                    tokio::time::timeout(std::time::Duration::from_secs(10), receipt_rx).await,
+                    Ok(Ok(Ok(())))
+                );
+            if !persisted {
+                tracing::warn!(
+                    "auto-ack capture was not confirmed; returning a retryable response"
+                );
+                response = proxy::service_unavailable_response(id);
+            }
+        }
+    } else if was_auto_acked && let ServerMessage::HttpRequest { ref id, .. } = server_msg {
+        response = proxy::service_unavailable_response(id);
     }
 
     (stream_end.unwrap_or(response), memory_permit)
@@ -2102,11 +2140,8 @@ async fn try_connect_with_token(
                                 {
                                     Ok(permit) => permit,
                                     Err(_) => {
-                                        let response = if options.auto_ack {
-                                            proxy::auto_ack_response(id)
-                                        } else {
-                                            proxy::service_unavailable_response(id)
-                                        };
+                                        // Overload must not bypass the bounded durable-capture path.
+                                        let response = proxy::service_unavailable_response(id);
                                         let json = match serde_json::to_string(&response) {
                                             Ok(json) => json,
                                             Err(error) => {
@@ -2121,47 +2156,6 @@ async fn try_connect_with_token(
                                                 "failed to send busy response to relay: {error}"
                                             );
                                             break;
-                                        }
-                                        if options.auto_ack
-                                            && let Some(ref webhook_tx) = options.webhook_tx
-                                            && let ServerMessage::HttpRequest {
-                                                id,
-                                                method,
-                                                url,
-                                                headers,
-                                                body,
-                                            } = &server_msg
-                                        {
-                                            let request_body = base64::Engine::decode(
-                                                &base64::engine::general_purpose::STANDARD,
-                                                body,
-                                            )
-                                            .unwrap_or_default();
-                                            let (response_status, response_headers, response_body) =
-                                                extract_response_data(&response);
-                                            let mut captured = CapturedWebhook {
-                                                id: id.clone(),
-                                                timestamp: chrono::Utc::now().to_rfc3339(),
-                                                method: method.clone(),
-                                                path: url.clone(),
-                                                request_headers: headers.clone(),
-                                                request_body,
-                                                response_status,
-                                                response_headers,
-                                                response_body,
-                                                duration_ms: 0,
-                                                provider: webhook::detect_provider(url, headers),
-                                                summary: String::new(),
-                                                signature_diagnostic: None,
-                                                auto_acked: true,
-                                                response_body_incomplete: false,
-                                            };
-                                            captured.summary = webhook::summarize_webhook(&captured);
-                                            let _ = webhook_tx.try_send(CapturedWebhookEvent {
-                                                webhook: Arc::new(captured),
-                                                _response_memory_permit: None,
-                                                _request_memory_permit: Some(request_memory_permit),
-                                            });
                                         }
                                         continue;
                                     }
@@ -4304,7 +4298,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn saturated_auto_ack_tunnel_returns_success_without_forwarding_the_excess_request() {
+    async fn saturated_auto_ack_tunnel_returns_retryable_error_without_forwarding() {
         use std::sync::atomic::{AtomicUsize, Ordering};
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -4414,17 +4408,16 @@ mod tests {
             tokio::spawn(async move { try_connect(&options, &|_| Ok(()), &|_, _| {}).await });
 
         let status = relay.await.unwrap();
-        let captured = tokio::time::timeout(std::time::Duration::from_secs(1), webhook_rx.recv())
-            .await
-            .expect("saturated auto-ack request was not captured")
-            .expect("webhook capture channel closed");
+        let captured = webhook_rx.try_recv();
         release_requests.notify_waiters();
         client.abort();
         local_server.abort();
 
-        assert_eq!(status, Some(200));
-        assert_eq!(captured.webhook.id, "excess");
-        assert!(captured.webhook.auto_acked);
+        assert_eq!(status, Some(503));
+        assert!(
+            captured.is_err(),
+            "an unprocessed overload must not be acknowledged"
+        );
         assert_eq!(
             active_requests.load(Ordering::SeqCst),
             MAX_CONCURRENT_HTTP_FORWARDS
@@ -5036,3 +5029,7 @@ mod tests {
         assert!(error.to_string().contains("timed out"));
     }
 }
+
+#[cfg(test)]
+#[path = "client/auto_ack_tests.rs"]
+mod auto_ack_tests;
