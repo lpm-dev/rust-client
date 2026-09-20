@@ -724,8 +724,9 @@ fn ensure_https_locked(
         !extra_hostnames.is_empty() || !extra_permitted_dns_subtrees.is_empty();
 
     let existing_project_pair = project_cert_dir.read_optional_pair()?;
-    let needs_reissue_chain_mismatch = existing_project_pair.as_ref().is_some_and(|material| {
-        !cert::project_cert_chains_to_root_bytes(&material.cert, &root.cert_pem).unwrap_or(false)
+    let needs_reissue_invalid_chain = existing_project_pair.as_ref().is_some_and(|material| {
+        cert::validate_project_server_chain_bytes(&material.cert, &root.cert_pem, extra_hostnames)
+            .is_err()
     });
     let needs_reissue_key_mismatch = existing_project_pair.as_ref().is_some_and(|material| {
         material
@@ -748,7 +749,7 @@ fn ensure_https_locked(
         });
 
     let cert_freshly_generated = if existing_project_pair.is_none()
-        || needs_reissue_chain_mismatch
+        || needs_reissue_invalid_chain
         || needs_reissue_key_mismatch
         || needs_reissue_for_project_intermediate
         || needs_reissue_for_project_constraints
@@ -759,9 +760,9 @@ fn ensure_https_locked(
             !cert::covers_requested_hostnames_bytes(&material.cert, extra_hostnames)
                 .unwrap_or(false)
         }) {
-        if needs_reissue_chain_mismatch {
+        if needs_reissue_invalid_chain {
             tracing::info!(
-                "project leaf at {} no longer chains to the active CA; re-issuing",
+                "project leaf at {} does not satisfy the active CA policy; re-issuing",
                 proj_cert_path.display()
             );
         } else if needs_reissue_key_mismatch {
@@ -837,6 +838,7 @@ fn ensure_https_locked(
 
     let (cert_pem, key_pem) = project_cert_dir.read_pair()?;
     cert::validate_project_key_pair_bytes(&cert_pem, &key_pem)?;
+    cert::validate_project_server_chain_bytes(&cert_pem, &root.cert_pem, extra_hostnames)?;
     let runtime_lease = operation.acquire_runtime_lease(&root.cert_pem)?;
 
     Ok(HttpsSetup {

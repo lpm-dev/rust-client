@@ -646,6 +646,74 @@ fn reconcile_keeps_grace_entry_when_time_in_future() {
     assert_eq!(result.grace_pending.len(), 1);
 }
 
+fn seed_chain_outside_constrained_root(project_dir: &Path) {
+    use rcgen::{CidrSubnet, GeneralSubtree, NameConstraints};
+    let key = KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
+    let mut params = CertificateParams::default();
+    params.is_ca = IsCa::Ca(BasicConstraints::Constrained(1));
+    params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
+    let unrestricted = params.clone().self_signed(&key).unwrap();
+    let (chain, leaf_key) = cert::generate_project_cert_with_constrained_intermediate(
+        &unrestricted.pem(),
+        &key.serialize_pem(),
+        &["app.internal".into()],
+        &[],
+    )
+    .unwrap();
+    params.name_constraints = Some(NameConstraints {
+        permitted_subtrees: vec![
+            GeneralSubtree::DnsName("localhost".into()),
+            GeneralSubtree::IpAddress("127.0.0.1/32".parse::<CidrSubnet>().unwrap()),
+            GeneralSubtree::IpAddress("::1/128".parse::<CidrSubnet>().unwrap()),
+        ],
+        excluded_subtrees: vec![],
+    });
+    let root = params.self_signed(&key).unwrap();
+    let root_path = paths::ca_cert_path().unwrap();
+    lpm_cert::create_dir_secure(root_path.parent().unwrap()).unwrap();
+    std::fs::write(&root_path, root.pem()).unwrap();
+    lpm_cert::write_key_file(
+        &paths::ca_key_path().unwrap(),
+        key.serialize_pem().as_bytes(),
+    )
+    .unwrap();
+    trust::install_ca(&root_path).unwrap();
+    let project_certs = project_dir.join(".lpm/certs");
+    lpm_cert::create_dir_secure(&project_certs).unwrap();
+    std::fs::write(project_certs.join("cert.pem"), chain).unwrap();
+    lpm_cert::write_key_file(&project_certs.join("key.pem"), leaf_key.as_bytes()).unwrap();
+}
+
+#[test]
+fn ensure_https_refuses_existing_chain_with_requested_name_outside_root() {
+    let (home, _guard) = setup_home();
+    let project = home.path().join("project");
+    seed_chain_outside_constrained_root(&project);
+    let result = lpm_cert::ensure_https(&project, &["app.internal".into()]);
+    assert!(
+        result.is_err(),
+        "setup published a chain outside the root's policy"
+    );
+}
+
+#[test]
+fn ensure_https_reissues_existing_chain_with_unrequested_name_outside_root() {
+    let (home, _guard) = setup_home();
+    let project = home.path().join("project");
+    seed_chain_outside_constrained_root(&project);
+    let setup = lpm_cert::ensure_https(&project, &[]).unwrap();
+    assert!(
+        setup.cert_freshly_generated,
+        "setup reused an out-of-policy SAN"
+    );
+    cert::validate_project_server_chain(
+        Path::new(&setup.cert_path),
+        &paths::ca_cert_path().unwrap(),
+        &[],
+    )
+    .unwrap();
+}
+
 #[test]
 fn ensure_https_reissues_leaf_when_chain_breaks() {
     let (tmp, _g) = setup_home();
