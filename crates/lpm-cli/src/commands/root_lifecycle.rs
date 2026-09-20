@@ -150,14 +150,18 @@ impl RootProjectLifecycle {
         &self,
         project_dir: &Path,
         script: &RootLifecycleScript,
-    ) -> Result<[(String, String); 6], LpmError> {
+    ) -> Result<Vec<(String, String)>, LpmError> {
         let context = lpm_runner::npm_context::NpmScriptContext::new(
             self.package_name.as_deref(),
             self.package_version.as_deref(),
             project_dir,
             &std::env::current_dir()?,
         );
-        Ok(context.envs(script.phase, &script.command))
+        let mut envs = context.envs(script.phase, &script.command).to_vec();
+        if let Some(root) = super::install::workspace_lockfile::active_install_root() {
+            envs.push(lpm_common::parent_install_lock_environment(&root)?);
+        }
+        Ok(envs)
     }
 }
 

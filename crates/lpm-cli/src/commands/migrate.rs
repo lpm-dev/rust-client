@@ -39,11 +39,135 @@ pub async fn run(
         return run_rollback(cwd, json);
     }
 
-    // Check package.json exists
-    let pkg_json_path = cwd.join("package.json");
-    if !pkg_json_path.exists() {
+    let workspace = migration_workspace(cwd)?;
+    let migration = migrate_and_install(
+        client,
+        cwd,
+        MigrationInstallOptions {
+            no_npmrc,
+            no_install,
+            dry_run,
+            force,
+            json,
+            workspace_root: workspace.is_some(),
+        },
+    );
+    let migrated = if dry_run || workspace.is_none() {
+        migration.await?
+    } else {
+        super::install::workspace_lockfile::with_project_install_lock(cwd, migration).await?
+    };
+    let Some((result, mut migration_backup)) = migrated else {
+        return Ok(());
+    };
+    let lockb_path = cwd.join("lpm.lockb");
+
+    // Step N: Verify build+test (optional)
+    if !skip_verify {
+        run_verification(cwd, json, client.session().cloned()).await?;
+    }
+
+    // CI template (optional)
+    if !no_ci {
+        if ci {
+            // --ci flag: actually generate the template file
+            generate_ci_template(cwd, json, &mut migration_backup)?;
+        } else if let Some(platform) = lpm_migrate::ci::detect_ci_platform(cwd)
+            && !json
+        {
+            eprintln!(
+                "\n  {} Detected {} CI — run {} to repeat migration and generate a workflow template",
+                "info".blue().bold(),
+                platform,
+                "lpm migrate --force --ci".bold(),
+            );
+        }
+    }
+
+    if !json {
+        install_ui::done("Converted lockfile");
+        render_written_file(LOCKFILE_NAME);
+        if lockb_path.exists() {
+            render_written_file("lpm.lockb");
+        }
+    }
+
+    // Write final manifest (includes all backed-up and newly created files).
+    // Backups are intentionally NOT cleaned up — they remain on disk so
+    // `lpm migrate --rollback` can undo the migration after success.
+    migration_backup.write_manifest(cwd)?;
+
+    // Summary
+    if json {
+        let output = serde_json::json!({
+            "success": true,
+            "source": format!("{}", result.source.kind),
+            "source_version": result.source.version,
+            "package_count": result.package_count,
+            "integrity_count": result.integrity_count,
+            "skipped_count": result.skipped.len(),
+            "warning_count": result.warnings.len(),
+            "workspace_members": result.workspace_members,
+        });
+        println!("{}", serde_json::to_string_pretty(&output)?);
+    } else {
+        if !result.skipped.is_empty() {
+            install_ui::skipped_untrusted(&format!(
+                "{} packages skipped (unsupported dependency protocols)",
+                result.skipped.len()
+            ));
+        }
+        install_ui::done("Done · migration completed successfully");
+    }
+
+    Ok(())
+}
+
+fn migration_workspace(cwd: &Path) -> Result<Option<lpm_workspace::Workspace>, LpmError> {
+    if !cwd.join("package.json").exists() {
         return Err(LpmError::Script(
             "no package.json found in the current directory".to_string(),
+        ));
+    }
+    let workspace = lpm_workspace::discover_workspace(cwd)
+        .map_err(|error| LpmError::Workspace(error.to_string()))?;
+    if let Some(workspace) = &workspace
+        && workspace.root != cwd
+    {
+        return Err(LpmError::Script(format!(
+            "run lpm migrate from the workspace root: {}",
+            workspace.root.display(),
+        )));
+    }
+    Ok(workspace)
+}
+
+struct MigrationInstallOptions {
+    no_npmrc: bool,
+    no_install: bool,
+    dry_run: bool,
+    force: bool,
+    json: bool,
+    workspace_root: bool,
+}
+
+async fn migrate_and_install(
+    client: &RegistryClient,
+    cwd: &Path,
+    options: MigrationInstallOptions,
+) -> Result<Option<(lpm_migrate::MigrateResult, MigrationBackup)>, LpmError> {
+    let MigrationInstallOptions {
+        no_npmrc,
+        no_install,
+        dry_run,
+        force,
+        json,
+        workspace_root,
+    } = options;
+    let workspace = migration_workspace(cwd)?;
+    if workspace.is_some() != workspace_root {
+        return Err(LpmError::Script(
+            "workspace configuration changed while migration waited; retry the command".into(),
         ));
     }
 
@@ -194,14 +318,28 @@ pub async fn run(
             }
             eprintln!("  {} No files written.", "dry-run".cyan().bold());
         }
-        return Ok(());
+        return Ok(None);
     }
 
     let mut migration_backup = MigrationBackup::for_project(cwd)?;
 
     let lockb_path = cwd.join("lpm.lockb");
     let gitattributes_path = cwd.join(".gitattributes");
-    let mut backup_paths = Vec::with_capacity(5 + patches_plan.to_apply.len());
+    let member_lock_paths: Vec<_> = workspace
+        .as_ref()
+        .filter(|_| !no_install)
+        .into_iter()
+        .flat_map(|workspace| &workspace.members)
+        .flat_map(|member| {
+            [
+                member.path.join(LOCKFILE_NAME),
+                member.path.join("lpm.lockb"),
+            ]
+        })
+        .collect();
+    let mut backup_paths =
+        Vec::with_capacity(5 + patches_plan.to_apply.len() + member_lock_paths.len());
+    backup_paths.extend(member_lock_paths.iter().map(|path| path.as_path()));
     backup_paths.extend([
         result.source.path.as_path(),
         lockfile_path.as_path(),
@@ -331,53 +469,98 @@ pub async fn run(
             ));
         }
 
-        super::root_lifecycle::RootProjectLifecycle::load(cwd)?.run_dev_preinstall(cwd, json)?;
+        let install_result = if workspace.is_some() {
+            super::install::run_recursive_workspace_install(
+                client,
+                cwd,
+                &[],
+                &[],
+                &[],
+                &[],
+                false,
+                super::install::RecursiveInstallOptions {
+                    json_output: json,
+                    emit_summary: false,
+                    offline: false,
+                    frozen_lockfile: super::install::FrozenLockfileMode::Never,
+                    force: false,
+                    allow_new: false,
+                    strict_integrity: false,
+                    no_engine_strict: false,
+                    strict_peer_dependencies_override: None,
+                    linker_override: None,
+                    lpm_skills_preference: crate::lpm_skills_config::LpmSkillsPreference::Disabled,
+                    no_editor_setup: true,
+                    no_security_summary: true,
+                    auto_build: false,
+                    script_policy_override: None,
+                    advisor_override: None,
+                    min_release_age_override: None,
+                    min_release_age_exclude: Vec::new(),
+                    drift_ignore_policy: crate::provenance_fetch::DriftIgnorePolicy::default(),
+                    verify_policy: crate::provenance_fetch::VerifyPolicy::resolve_no_cli(),
+                    omit_policy: super::install::InstallOmitPolicy::default(),
+                    strict_sandbox: false,
+                    no_sandbox: false,
+                    verbose: false,
+                    audit_after_install: false,
+                    timing: false,
+                    workspace_concurrency: None,
+                },
+            )
+            .await
+        } else {
+            super::root_lifecycle::RootProjectLifecycle::load(cwd)?
+                .run_dev_preinstall(cwd, json)?;
 
-        match super::install::run_with_options_with_lpm_root(
-            client,
-            cwd,
-            json,
-            false, // not offline — need to download tarballs
-            super::install::FrozenLockfileMode::Never,
-            false, // force
-            false, // allow_new
-            false, // strict_integrity
-            false, // no_engine_strict
-            None,  // strict_peer_dependencies_override
-            None,  // linker_override
-            crate::lpm_skills_config::LpmSkillsPreference::Disabled,
-            true,  // no_editor_setup — skip editor setup during migration
-            true,  // no_security_summary — migration already showed warnings
-            false, // auto_build
-            None,  // target_set: migrate is single-project
-            None,  // direct_versions_out: migrate does not finalize placeholders
-            None,  // requested_add_count: migrate is not an add-path install
-            None,  // script_policy_override: `lpm migrate` does not expose policy flags
-            None,  // advisor_override: `lpm migrate` does not expose `--advisor`
-            None,  // min_release_age_override: `lpm migrate` uses the chain
-            &[],
-            crate::provenance_fetch::DriftIgnorePolicy::default(), // drift-ignore: `lpm migrate` enforces drift
-            crate::provenance_fetch::VerifyPolicy::resolve_no_cli(), // verify-policy: `lpm migrate` honors env + config posture chain
-            crate::commands::install::InstallOmitPolicy::default(),
-            // `lpm migrate` does not surface its
-            // own sandbox-mode flags. The env / config / default
-            // chain inside `rebuild::run` still applies.
-            false, // strict_sandbox
-            false, // no_sandbox
-            false, // verbose: internal pipeline, no user-facing Done footer
-            false, // audit_after_install: internal pipeline never runs audit
-            false, // timing: migrate does not expose install's --timing flag
-            &[],
-            !json,
-            json,
-            None,
-            lpm_common::LpmRoot::from_env()?,
-        )
-        .await
-        {
+            super::install::run_with_options_with_lpm_root(
+                client,
+                cwd,
+                json,
+                false, // not offline — need to download tarballs
+                super::install::FrozenLockfileMode::Never,
+                false, // force
+                false, // allow_new
+                false, // strict_integrity
+                false, // no_engine_strict
+                None,  // strict_peer_dependencies_override
+                None,  // linker_override
+                crate::lpm_skills_config::LpmSkillsPreference::Disabled,
+                true,  // no_editor_setup — skip editor setup during migration
+                true,  // no_security_summary — migration already showed warnings
+                false, // auto_build
+                None,  // target_set: migrate is single-project
+                None,  // direct_versions_out: migrate does not finalize placeholders
+                None,  // requested_add_count: migrate is not an add-path install
+                None,  // script_policy_override: `lpm migrate` does not expose policy flags
+                None,  // advisor_override: `lpm migrate` does not expose `--advisor`
+                None,  // min_release_age_override: `lpm migrate` uses the chain
+                &[],
+                crate::provenance_fetch::DriftIgnorePolicy::default(), // drift-ignore: `lpm migrate` enforces drift
+                crate::provenance_fetch::VerifyPolicy::resolve_no_cli(), // verify-policy: `lpm migrate` honors env + config posture chain
+                crate::commands::install::InstallOmitPolicy::default(),
+                // `lpm migrate` does not surface its
+                // own sandbox-mode flags. The env / config / default
+                // chain inside `rebuild::run` still applies.
+                false, // strict_sandbox
+                false, // no_sandbox
+                false, // verbose: internal pipeline, no user-facing Done footer
+                false, // audit_after_install: internal pipeline never runs audit
+                false, // timing: migrate does not expose install's --timing flag
+                &[],
+                !json,
+                json,
+                None,
+                lpm_common::LpmRoot::from_env()?,
+            )
+            .await
+        };
+        match install_result {
             Ok(()) => {
-                super::root_lifecycle::RootProjectLifecycle::load(cwd)?
-                    .run_after_successful_install(cwd, json)?;
+                if workspace.is_none() {
+                    super::root_lifecycle::RootProjectLifecycle::load(cwd)?
+                        .run_after_successful_install(cwd, json)?;
+                }
             }
             Err(e) => {
                 if !json {
@@ -394,65 +577,7 @@ pub async fn run(
         }
     }
 
-    // Step N: Verify build+test (optional)
-    if !skip_verify {
-        run_verification(cwd, json, client.session().cloned()).await?;
-    }
-
-    // CI template (optional)
-    if !no_ci {
-        if ci {
-            // --ci flag: actually generate the template file
-            generate_ci_template(cwd, json, &mut migration_backup)?;
-        } else if let Some(platform) = lpm_migrate::ci::detect_ci_platform(cwd)
-            && !json
-        {
-            eprintln!(
-                "\n  {} Detected {} CI — run {} to generate a workflow template",
-                "info".blue().bold(),
-                platform,
-                "lpm migrate --ci".bold(),
-            );
-        }
-    }
-
-    if !json {
-        install_ui::done("Converted lockfile");
-        render_written_file(LOCKFILE_NAME);
-        if lockb_path.exists() {
-            render_written_file("lpm.lockb");
-        }
-    }
-
-    // Write final manifest (includes all backed-up and newly created files).
-    // Backups are intentionally NOT cleaned up — they remain on disk so
-    // `lpm migrate --rollback` can undo the migration after success.
-    migration_backup.write_manifest(cwd)?;
-
-    // Summary
-    if json {
-        let output = serde_json::json!({
-            "success": true,
-            "source": format!("{}", result.source.kind),
-            "source_version": result.source.version,
-            "package_count": result.package_count,
-            "integrity_count": result.integrity_count,
-            "skipped_count": result.skipped.len(),
-            "warning_count": result.warnings.len(),
-            "workspace_members": result.workspace_members,
-        });
-        println!("{}", serde_json::to_string_pretty(&output)?);
-    } else {
-        if !result.skipped.is_empty() {
-            install_ui::skipped_untrusted(&format!(
-                "{} packages skipped (unsupported dependency protocols)",
-                result.skipped.len()
-            ));
-        }
-        install_ui::done("Done · migration completed successfully");
-    }
-
-    Ok(())
+    Ok(Some((result, migration_backup)))
 }
 
 fn render_detected_source(result: &lpm_migrate::MigrateResult, dry_run: bool) {
