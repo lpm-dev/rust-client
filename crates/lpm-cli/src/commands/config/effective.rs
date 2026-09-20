@@ -76,12 +76,7 @@ impl EffectiveConfig {
         let script_config =
             crate::script_policy_config::ScriptPolicyConfig::from_package_json_value(
                 &package_json_value,
-            );
-        if let Some(invalid) = script_config.policy_parse_error.as_deref() {
-            return Err(LpmError::Registry(format!(
-                "invalid package.json > lpm > scriptPolicy value `{invalid}`"
-            )));
-        }
+            )?;
         let posture = crate::security_approval::load_effective_authorized_posture()?;
         let workspace_root = lpm_workspace::find_workspace_root(&project_dir)
             .map_err(|error| LpmError::Workspace(error.to_string()))?;

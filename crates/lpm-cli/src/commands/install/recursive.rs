@@ -186,6 +186,7 @@ pub(crate) async fn run_recursive_workspace_install(
 
         validation::validate_project_layout(&workspace.root)?;
         for target in &targets {
+            crate::script_policy_config::ScriptPolicyConfig::try_from_package_json(&target.path)?;
             if target.path != workspace.root {
                 validation::validate_project_layout(&target.path)?;
             }
@@ -663,6 +664,7 @@ async fn run_workspace_target_install(
     workspace_freshness_cache: Arc<crate::workspace_discovery_cache::WorkspaceFreshnessCache>,
     root_provider_fingerprint: Option<Arc<str>>,
 ) -> Result<TargetTaskResult, LpmError> {
+    crate::script_policy_config::ScriptPolicyConfig::try_from_package_json(&plan.path)?;
     plan.lifecycle
         .run_dev_preinstall(&plan.path, options.json_output)?;
     if plan.lifecycle.has_dev_preinstall() {

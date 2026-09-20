@@ -801,3 +801,171 @@ async fn install_yolo_is_accepted_at_parse_time() {
         );
     }
 }
+
+#[test]
+fn malformed_project_script_controls_fail_before_lifecycle_execution() {
+    let cases = [
+        (serde_json::json!({"scriptPolicy":"DENY"}), "scriptPolicy"),
+        (serde_json::json!({"scriptPolicy":true}), "scriptPolicy"),
+        (serde_json::json!({"scriptPolicy":null}), "scriptPolicy"),
+        (serde_json::json!({"scripts":{"denyAll":"true"}}), "denyAll"),
+        (serde_json::json!({"scripts":{"denyAll":null}}), "denyAll"),
+        (
+            serde_json::json!({"scripts":{"autoBuild":"false"}}),
+            "autoBuild",
+        ),
+        (
+            serde_json::json!({"scripts":{"trustedScopes":["@local/*",false]}}),
+            "trustedScopes",
+        ),
+        (serde_json::json!({"scripts":false}), "scripts"),
+    ];
+    let mut accepted = Vec::new();
+    for (config, field) in cases {
+        for mode in ["install", "rebuild", "ci"] {
+            let project = TempProject::empty(r#"{"name":"malformed-policy"}"#);
+            support::lpm(&project)
+                .args(["install", "--offline", "--json"])
+                .assert()
+                .success();
+            project.write_file(
+                "package.json",
+                &serde_json::json!({
+                    "name":"malformed-policy", "lpm": config,
+                    "scripts":{"preinstall":"node marker.js"}
+                })
+                .to_string(),
+            );
+            project.write_file(
+                "marker.js",
+                "require('fs').writeFileSync('lifecycle-ran', 'yes');\n",
+            );
+            write_signed_unlock(&project, &["scripts-allow", "sandbox-none"]);
+            let output = support::lpm(&project)
+                .args([mode, "--json", "--policy=allow", "--no-sandbox"])
+                .output()
+                .unwrap();
+            let envelope: serde_json::Value = serde_json::from_slice(&output.stdout)
+                .unwrap_or_else(|_| panic!("invalid envelope: {output:?}"));
+            if output.status.success()
+                || !envelope["error"]
+                    .as_str()
+                    .is_some_and(|error| error.contains(field))
+                || project.file_exists("lifecycle-ran")
+            {
+                accepted.push(format!("{mode} {config}: {envelope}"));
+            }
+        }
+    }
+    assert!(
+        accepted.is_empty(),
+        "malformed controls did not stop execution:\n{}",
+        accepted.join("\n")
+    );
+}
+
+#[test]
+fn malformed_advisor_configuration_does_not_fall_back_to_user_advisor() {
+    for value in [
+        serde_json::json!(false),
+        serde_json::Value::Null,
+        serde_json::json!(["none"]),
+        serde_json::json!({"provider":"none"}),
+    ] {
+        let project = TempProject::empty(
+            &serde_json::json!({"name":"bad-advisor","lpm":{"triageAdvisor":value}}).to_string(),
+        );
+        let output = support::lpm(&project)
+            .args(["install", "--offline", "--json"])
+            .output()
+            .unwrap();
+        assert!(
+            !output.status.success(),
+            "malformed advisor accepted: {value}: {output:?}"
+        );
+        let envelope: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert!(
+            envelope["error"]
+                .as_str()
+                .unwrap()
+                .contains("triageAdvisor"),
+            "{envelope}"
+        );
+    }
+}
+
+#[test]
+fn recursive_install_checks_all_member_policies_before_any_hook() {
+    let project =
+        TempProject::empty(r#"{"name":"root","private":true,"workspaces":["packages/*"]}"#);
+    for (name, lpm_config) in [
+        ("a-valid", serde_json::json!({})),
+        ("z-invalid", serde_json::json!({"scriptPolicy":"DENY"})),
+    ] {
+        project.write_file(
+            &format!("packages/{name}/package.json"),
+            &serde_json::json!({
+                "name":name,"version":"1.0.0","lpm":lpm_config,
+                "scripts":{"pnpm:devPreinstall":"node marker.js"}
+            })
+            .to_string(),
+        );
+        project.write_file(
+            &format!("packages/{name}/marker.js"),
+            "require('fs').writeFileSync('preinstall-ran', 'yes');\n",
+        );
+    }
+    let output = support::lpm(&project)
+        .args(["install", "-r", "--offline", "--json"])
+        .output()
+        .unwrap();
+    assert!(
+        !output.status.success(),
+        "malformed member accepted: {output:?}"
+    );
+    for name in ["a-valid", "z-invalid"] {
+        assert!(
+            !project.file_exists(&format!("packages/{name}/preinstall-ran")),
+            "{name} ran before all members were checked: {output:?}"
+        );
+    }
+    let envelope: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(envelope.to_string().contains("scriptPolicy"), "{envelope}");
+}
+
+#[test]
+fn install_rechecks_script_policy_after_dev_preinstall_changes_manifest() {
+    let project = TempProject::empty(
+        r#"{"name":"policy-change","scripts":{"pnpm:devPreinstall":"node change.js"}}"#,
+    );
+    project.write_file("change.js", "const fs = require('fs'); const p = JSON.parse(fs.readFileSync('package.json')); p.lpm = {scripts: {denyAll: 'true'}}; fs.writeFileSync('package.json', JSON.stringify(p));\n");
+    let output = support::lpm(&project)
+        .args(["install", "--offline", "--json"])
+        .output()
+        .unwrap();
+    assert!(
+        !output.status.success(),
+        "changed policy accepted: {output:?}"
+    );
+    let envelope: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(
+        envelope["error"].as_str().unwrap().contains("denyAll"),
+        "{envelope}"
+    );
+    assert!(!project.file_exists("lpm.lock"));
+}
+
+#[tokio::test]
+async fn bom_prefixed_manifest_preserves_script_denial() {
+    let mock = MockRegistry::start().await;
+    mount_marker_scripted_pkg(&mock, "scripted-package").await;
+    let project = TempProject::empty(
+        "\u{feff}{\"name\":\"bom-policy\",\"dependencies\":{\"scripted-package\":\"1.0.0\"},\"lpm\":{\"scripts\":{\"denyAll\":true}}}",
+    );
+    write_signed_unlock(&project, &["scripts-allow", "sandbox-none"]);
+    lpm_with_registry(&project, &mock.url())
+        .args(["install", "--json", "--policy=allow", "--no-sandbox"])
+        .assert()
+        .success();
+    assert!(!project.file_exists("node_modules/scripted-package/postinstall-marker.txt"));
+}
