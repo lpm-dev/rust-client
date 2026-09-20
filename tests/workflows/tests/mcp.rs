@@ -11,6 +11,116 @@ use support::mock_registry::{MockRegistry, compute_integrity, make_tarball_from_
 use support::{TempProject, lpm, lpm_with_registry};
 
 const MCP_PACKAGE_SPEC: &str = "@lpm-registry/mcp-server@latest";
+
+#[test]
+fn mcp_invalid_syntax_reports_usage_errors() {
+    let project = TempProject::empty(r#"{"name":"mcp-usage"}"#);
+    for args in [
+        vec!["mcp", "remove"],
+        vec!["mcp", "status", "unexpected"],
+        vec!["mcp", "invalid"],
+        vec!["mcp", "serve", "unexpected"],
+    ] {
+        for json in [false, true] {
+            let mut command = lpm(&project);
+            command.args(&args);
+            if json {
+                command.arg("--json");
+            }
+            let output = command.output().unwrap();
+            assert_eq!(output.status.code(), Some(2), "{args:?}: {output:?}");
+            if json {
+                let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+                assert_eq!(result["error_code"], "usage");
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn mcp_setup_pins_the_launcher_before_project_path_lookup() {
+    use std::os::unix::fs::PermissionsExt;
+    let project = TempProject::empty(r#"{"name":"mcp-launcher"}"#);
+    std::fs::write(project.home().join(".claude.json"), "{}").unwrap();
+    project.write_file("lpm", "#!/bin/sh\nprintf hijacked > intercepted\nexit 91\n");
+    std::fs::set_permissions(
+        project.path().join("lpm"),
+        std::fs::Permissions::from_mode(0o755),
+    )
+    .unwrap();
+    let setup = lpm(&project).args(["mcp", "setup"]).output().unwrap();
+    assert!(setup.status.success(), "{setup:?}");
+    let config: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(project.home().join(".claude.json")).unwrap())
+            .unwrap();
+    let server = &config["mcpServers"]["lpm-registry"];
+    let mut paths = vec![project.path().to_path_buf()];
+    paths.extend(std::env::split_paths(
+        &std::env::var_os("PATH").unwrap_or_default(),
+    ));
+    let result = std::process::Command::new(server["command"].as_str().unwrap())
+        .args(["mcp", "serve", "--help"])
+        .current_dir(project.path())
+        .env("PATH", std::env::join_paths(paths).unwrap())
+        .output()
+        .unwrap();
+    assert!(
+        !project.path().join("intercepted").exists(),
+        "configured launcher resolved a project executable"
+    );
+    assert!(result.status.success(), "{result:?}");
+    assert!(std::path::Path::new(server["command"].as_str().unwrap()).is_absolute());
+    assert_eq!(server["env"]["LPM_CLI_PATH"], server["command"]);
+}
+
+#[cfg(unix)]
+#[test]
+fn mcp_mutations_preserve_linked_editor_configs() {
+    for action in ["setup", "remove"] {
+        let project = TempProject::empty(r#"{"name":"mcp-linked"}"#);
+        let original = r#"{"mcpServers":{"lpm-registry":{"command":"old"}}}"#;
+        let target = project.path().join("shared.json");
+        std::fs::write(&target, original).unwrap();
+        let config = project.home().join(".claude.json");
+        std::os::unix::fs::symlink(&target, &config).unwrap();
+        let output = lpm(&project)
+            .args(["mcp", action, "lpm-registry", "--json"])
+            .output()
+            .unwrap();
+        assert!(
+            !output.status.success(),
+            "linked config must be rejected: {output:?}"
+        );
+        assert!(
+            std::fs::symlink_metadata(&config)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(std::fs::read_to_string(target).unwrap(), original);
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn mcp_rejects_relative_home_without_editing_project_configs() {
+    let project = TempProject::empty(r#"{"name":"mcp-home"}"#);
+    project.write_file(".claude.json", "{}");
+    let output = lpm(&project)
+        .env("HOME", ".")
+        .args(["mcp", "setup", "--json"])
+        .output()
+        .unwrap();
+    assert!(
+        !output.status.success(),
+        "relative HOME must be rejected: {output:?}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(project.path().join(".claude.json")).unwrap(),
+        "{}"
+    );
+}
 const HOSTILE_SERVER_NAME: &str =
     "safe\nFORGED\rrewritten\u{8}\u{1b}]52;c;AAAA\u{7}\u{0090}hidden\u{009c}end";
 
@@ -281,7 +391,7 @@ fn mcp_remove_without_name_fails_with_helpful_message() {
 
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("specify server name") || stderr.contains("name"),
+        stderr.contains("<NAME>"),
         "stderr must guide the user, got:\n{stderr}",
     );
 }
@@ -451,9 +561,13 @@ fn mcp_setup_writes_the_published_package_to_both_container_shapes_idempotently(
         serde_json::from_slice(&std::fs::read(&claude_path).unwrap()).unwrap();
     let vscode: serde_json::Value =
         serde_json::from_slice(&std::fs::read(&vscode_path).unwrap()).unwrap();
+    let executable = assert_cmd::cargo::cargo_bin("lpm-rs")
+        .canonicalize()
+        .unwrap();
     let expected = serde_json::json!({
-        "command": "lpm",
-        "args": ["mcp", "serve"]
+        "command": executable,
+        "args": ["mcp", "serve"],
+        "env": { "LPM_CLI_PATH": executable }
     });
 
     assert_eq!(claude["mcpServers"]["lpm-registry"], expected);
@@ -484,7 +598,10 @@ fn mcp_setup_json_reports_the_same_published_package_policy_as_the_written_confi
     let stdout = String::from_utf8_lossy(&output.stdout);
     let envelope: serde_json::Value = serde_json::from_str(&stdout)
         .unwrap_or_else(|error| panic!("stdout must be one JSON document: {error}\n{stdout}"));
-    insta::assert_json_snapshot!(envelope, @r###"
+    insta::assert_json_snapshot!(envelope, {
+        ".command" => "[LPM_PATH]",
+        ".env.LPM_CLI_PATH" => "[LPM_PATH]",
+    }, @r###"
     {
       "success": true,
       "server": "lpm-registry",
@@ -494,11 +611,14 @@ fn mcp_setup_json_reports_the_same_published_package_policy_as_the_written_confi
       "package": "@lpm-registry/mcp-server",
       "package_spec": "@lpm-registry/mcp-server@latest",
       "version_policy": "latest-security-eligible",
-      "command": "lpm",
+      "command": "[LPM_PATH]",
       "args": [
         "mcp",
         "serve"
-      ]
+      ],
+      "env": {
+        "LPM_CLI_PATH": "[LPM_PATH]"
+      }
     }
     "###);
 
@@ -788,7 +908,7 @@ async fn mcp_serve_uses_the_last_verified_runtime_during_a_registry_outage() {
 // ─── unknown action ───────────────────────────────────────────────────
 
 #[test]
-fn mcp_unknown_action_lists_valid_subcommands() {
+fn mcp_unknown_action_reports_usage_and_points_to_help() {
     let project = TempProject::empty(r#"{"name":"mcp","version":"1.0.0"}"#);
 
     let output = lpm(&project)
@@ -803,11 +923,8 @@ fn mcp_unknown_action_lists_valid_subcommands() {
 
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("setup")
-            && stderr.contains("remove")
-            && stderr.contains("status")
-            && stderr.contains("serve"),
-        "stderr must enumerate valid actions, got:\n{stderr}",
+        stderr.contains("usage lpm mcp") && stderr.contains("--help"),
+        "stderr must show usage and the help option, got:\n{stderr}",
     );
 }
 

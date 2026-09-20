@@ -9,26 +9,28 @@ const MCP_PACKAGE: &str = "@lpm-registry/mcp-server";
 const MCP_PACKAGE_SPEC: &str = "@lpm-registry/mcp-server@latest";
 const MCP_VERSION_POLICY: &str = "latest-security-eligible";
 
-/// MCP server management: setup, serve, remove, status.
+#[derive(clap::Subcommand)]
+pub(crate) enum McpAction {
+    /// Configure the Registry server in existing editor configurations.
+    Setup { name: Option<String> },
+    /// Run the managed stdio server for an MCP client.
+    Serve,
+    /// Remove a named server from existing editor configurations.
+    Remove { name: String },
+    /// List configured servers for supported editors.
+    Status,
+}
+
 pub async fn run(
     client: &RegistryClient,
-    action: &str,
-    server_name: Option<&str>,
+    action: McpAction,
     json_output: bool,
 ) -> Result<(), LpmError> {
     match action {
-        "setup" => setup(server_name, json_output).await,
-        "serve" => serve(client, server_name, json_output).await,
-        "remove" => {
-            let name = server_name.ok_or_else(|| {
-                LpmError::Registry("specify server name: lpm mcp remove <name>".into())
-            })?;
-            remove(name, json_output).await
-        }
-        "status" => status(json_output).await,
-        _ => Err(LpmError::Registry(format!(
-            "unknown mcp action: {action}. Use: setup, serve, remove, status"
-        ))),
+        McpAction::Setup { name } => setup(name.as_deref(), json_output).await,
+        McpAction::Serve => serve(client, json_output).await,
+        McpAction::Remove { name } => remove(&name, json_output).await,
+        McpAction::Status => status(json_output).await,
     }
 }
 
@@ -61,8 +63,12 @@ impl EditorSetupResult {
     }
 }
 
-fn get_editors() -> Vec<EditorConfig> {
-    let home = dirs::home_dir().unwrap_or_default();
+fn get_editors() -> Result<Vec<EditorConfig>, LpmError> {
+    let home = dirs::home_dir()
+        .filter(|path| path.is_absolute())
+        .ok_or_else(|| {
+            LpmError::Registry("MCP configuration requires an absolute home directory".into())
+        })?;
 
     #[allow(unused_mut)] // Mutated on macOS via cfg-gated .push() calls below
     let mut editors = vec![
@@ -127,14 +133,20 @@ fn get_editors() -> Vec<EditorConfig> {
         });
     }
 
-    editors
+    Ok(editors)
 }
 
-fn default_server_config() -> Value {
-    serde_json::json!({
-        "command": "lpm",
+fn default_server_config() -> Result<Value, LpmError> {
+    let executable = std::env::current_exe()?;
+    let command = executable
+        .to_str()
+        .ok_or_else(|| LpmError::Registry("MCP launcher path must contain valid UTF-8".into()))?;
+    // Editors and delegated tools must not resolve a project-controlled PATH entry.
+    Ok(serde_json::json!({
+        "command": command,
         "args": ["mcp", "serve"],
-    })
+        "env": { "LPM_CLI_PATH": command },
+    }))
 }
 
 fn require_stdio_transport(stdin_is_terminal: bool, json_output: bool) -> Result<(), LpmError> {
@@ -153,16 +165,7 @@ fn require_stdio_transport(stdin_is_terminal: bool, json_output: bool) -> Result
     Ok(())
 }
 
-async fn serve(
-    client: &RegistryClient,
-    server_name: Option<&str>,
-    json_output: bool,
-) -> Result<(), LpmError> {
-    if server_name.is_some() {
-        return Err(LpmError::Registry(
-            "`lpm mcp serve` does not accept a server name".into(),
-        ));
-    }
+async fn serve(client: &RegistryClient, json_output: bool) -> Result<(), LpmError> {
     require_stdio_transport(std::io::stdin().is_terminal(), json_output)?;
     let workspace = std::env::current_dir().map_err(LpmError::Io)?;
     let anonymous_client = client.clone_anonymous();
@@ -186,7 +189,23 @@ fn load_config(path: &Path) -> Result<Value, LpmError> {
     })
 }
 
+fn existing_writable_config(path: &Path) -> Result<bool, LpmError> {
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error.into()),
+    };
+    if lpm_common::is_symlink_or_junction(&metadata) || !metadata.is_file() {
+        return Err(LpmError::Registry(format!(
+            "MCP config at {} must be a regular file, not a symlink or directory junction",
+            path.display()
+        )));
+    }
+    Ok(true)
+}
+
 fn write_config(path: &Path, config: &Value) -> Result<(), LpmError> {
+    existing_writable_config(path)?;
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -267,7 +286,7 @@ fn setup_editors(
 
     for editor in editors {
         let path = match &editor.global_path {
-            Some(path) if path.exists() => path,
+            Some(path) if existing_writable_config(path)? => path,
             _ => {
                 results.push(EditorSetupResult {
                     name: editor.name,
@@ -297,7 +316,7 @@ fn remove_from_editors(
 
     for editor in editors {
         let path = match &editor.global_path {
-            Some(path) if path.exists() => path,
+            Some(path) if existing_writable_config(path)? => path,
             _ => continue,
         };
 
@@ -339,11 +358,12 @@ fn status_for_editors(editors: &[EditorConfig]) -> Result<Vec<Value>, LpmError> 
 
 async fn setup(server_name: Option<&str>, json_output: bool) -> Result<(), LpmError> {
     let name = server_name.unwrap_or("lpm-registry");
-    let editors = get_editors();
+    let editors = get_editors()?;
     if !json_output {
         install_ui::phase("Configuring MCP servers for supported editors");
     }
-    let setup_results = setup_editors(&editors, name, &default_server_config())?;
+    let server_config = default_server_config()?;
+    let setup_results = setup_editors(&editors, name, &server_config)?;
     let configured: Vec<&'static str> = setup_results
         .iter()
         .filter_map(|result| result.configured_name())
@@ -366,8 +386,9 @@ async fn setup(server_name: Option<&str>, json_output: bool) -> Result<(), LpmEr
                 "package": MCP_PACKAGE,
                 "package_spec": MCP_PACKAGE_SPEC,
                 "version_policy": MCP_VERSION_POLICY,
-                "command": "lpm",
-                "args": ["mcp", "serve"],
+                "command": server_config["command"],
+                "args": server_config["args"],
+                "env": server_config["env"],
             }))
             .unwrap()
         );
@@ -412,7 +433,7 @@ async fn setup(server_name: Option<&str>, json_output: bool) -> Result<(), LpmEr
 }
 
 async fn remove(name: &str, json_output: bool) -> Result<(), LpmError> {
-    let editors = get_editors();
+    let editors = get_editors()?;
     let removed_from = remove_from_editors(&editors, name)?;
 
     if json_output {
@@ -457,7 +478,7 @@ async fn remove(name: &str, json_output: bool) -> Result<(), LpmError> {
 }
 
 async fn status(json_output: bool) -> Result<(), LpmError> {
-    let editors = get_editors();
+    let editors = get_editors()?;
     let results = status_for_editors(&editors)?;
 
     if json_output {
@@ -562,7 +583,7 @@ mod tests {
         ];
 
         let setup_results =
-            setup_editors(&editors, "lpm-registry", &default_server_config()).unwrap();
+            setup_editors(&editors, "lpm-registry", &default_server_config().unwrap()).unwrap();
         let configured: Vec<_> = setup_results
             .iter()
             .filter_map(|result| result.configured_name())
@@ -649,7 +670,8 @@ mod tests {
         let original = std::fs::read_to_string(&path).unwrap();
         let editors = vec![test_editor("Claude", path.clone(), "mcpServers")];
 
-        let error = setup_editors(&editors, "lpm-registry", &default_server_config()).unwrap_err();
+        let error =
+            setup_editors(&editors, "lpm-registry", &default_server_config().unwrap()).unwrap_err();
 
         assert!(
             error.to_string().contains("failed to parse MCP config"),
@@ -671,7 +693,7 @@ mod tests {
             .join("config.json");
         let editors = vec![test_editor("Cursor", nested_path.clone(), "mcpServers")];
 
-        let results = setup_editors(&editors, "lpm-registry", &default_server_config())
+        let results = setup_editors(&editors, "lpm-registry", &default_server_config().unwrap())
             .expect("missing config must be reported, not treated as fatal");
 
         assert_eq!(
@@ -698,7 +720,7 @@ mod tests {
             .join("config.json");
         let config = serde_json::json!({
             "mcpServers": {
-                "lpm-registry": default_server_config()
+                "lpm-registry": default_server_config().unwrap()
             }
         });
 
@@ -722,11 +744,14 @@ mod tests {
                 }
             }
         });
-        let new_config = default_server_config();
+        let new_config = default_server_config().unwrap();
 
         add_server_to_config(&mut config, "mcpServers", "lpm-registry", &new_config).unwrap();
 
-        assert_eq!(config["mcpServers"]["lpm-registry"]["command"], "lpm");
+        assert_eq!(
+            config["mcpServers"]["lpm-registry"]["command"],
+            std::env::current_exe().unwrap().to_str().unwrap()
+        );
         assert_eq!(
             config["mcpServers"]["lpm-registry"]["args"],
             serde_json::json!(["mcp", "serve"])
@@ -851,7 +876,8 @@ mod tests {
             server_key: "mcpServers",
         }];
 
-        let results = setup_editors(&editors, "lpm-registry", &default_server_config()).unwrap();
+        let results =
+            setup_editors(&editors, "lpm-registry", &default_server_config().unwrap()).unwrap();
 
         assert_eq!(
             results,
@@ -895,14 +921,11 @@ mod tests {
 
     #[test]
     fn default_server_config_uses_the_isolated_lpm_launcher() {
-        let cfg = default_server_config();
-        assert_eq!(
-            cfg,
-            serde_json::json!({
-                "command": "lpm",
-                "args": ["mcp", "serve"]
-            })
-        );
+        let cfg = default_server_config().unwrap();
+        let executable = std::env::current_exe().unwrap();
+        assert_eq!(cfg["command"], executable.to_str().unwrap());
+        assert_eq!(cfg["env"]["LPM_CLI_PATH"], cfg["command"]);
+        assert_eq!(cfg["args"], serde_json::json!(["mcp", "serve"]));
     }
 
     #[test]
