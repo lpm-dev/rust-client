@@ -737,6 +737,7 @@ async fn post_org_update(
         SyncHttpResponse::Success(result) => result,
         SyncHttpResponse::Error { status, response } => {
             let result = PushResponse {
+                local_key_checkpoint_failed: false,
                 version: response.version,
                 principal_id: response.principal_id,
                 content_key_version: response.content_key_version,
@@ -763,6 +764,7 @@ async fn post_org_update(
     }
 
     Ok(PushResponse {
+        local_key_checkpoint_failed: false,
         version: result.version,
         principal_id: result.principal_id,
         content_key_version: result.content_key_version,

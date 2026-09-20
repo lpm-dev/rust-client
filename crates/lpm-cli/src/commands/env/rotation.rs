@@ -18,6 +18,15 @@ pub(super) async fn env_rotate_key(
         .await;
     }
 
+    rotate_personal_key(client, project_dir, json_output, false).await
+}
+
+pub(super) async fn rotate_personal_key(
+    client: &lpm_registry::RegistryClient,
+    project_dir: &std::path::Path,
+    json_output: bool,
+    revoke_ci: bool,
+) -> Result<(), LpmError> {
     let manifest = super::sync_payload::CloudManifestSnapshot::read(project_dir)?;
     let vault_id = manifest
         .vault
@@ -77,7 +86,7 @@ pub(super) async fn env_rotate_key(
                     &registry_url,
                     expected_principal_id.as_deref(),
                 )?;
-                let result = lpm_vault::sync::push_raw_with_options(
+                let result = lpm_vault::sync::push_raw_with_project_rotation(
                     &registry_url,
                     &auth_token,
                     &vault_id,
@@ -88,6 +97,7 @@ pub(super) async fn env_rotate_key(
                         force: false,
                         metadata: None,
                     },
+                    revoke_ci,
                 )
                 .await?;
                 if result.principal_id.as_deref() != Some(pulled_principal_id.as_str()) {
@@ -103,22 +113,34 @@ pub(super) async fn env_rotate_key(
     let version = result
         .version
         .ok_or_else(|| LpmError::Script("rotation response omitted the new version".into()))?;
-    super::sync_payload::persist_personal_sync_version(
+    let checkpoint_result = super::sync_payload::persist_personal_sync_version(
         &project_dir,
         &vault_id,
         version,
         &registry_url,
         &pulled_principal_id,
-    )?;
+    );
+    let warnings = super::sync_payload::personal_sync_checkpoint_warnings(
+        result.local_key_checkpoint_failed,
+        checkpoint_result,
+    );
 
     if json_output {
-        super::response::print_json_value(&serde_json::json!({
+        let mut response = serde_json::json!({
             "success": true,
-            "status": "rotated",
+            "status": if revoke_ci { "disabled" } else { "rotated" },
             "version": version,
             "environment_count": environment_names.len(),
             "environments": environment_names,
-        }));
+        });
+        if !warnings.is_empty() {
+            response["warnings"] = serde_json::json!(warnings);
+        }
+        super::response::print_json_value(&response);
+    } else if revoke_ci {
+        output::info(
+            "Personal CI decryption disabled; the project key was rotated and CI credentials were revoked",
+        );
     } else {
         output::success_line(crate::install_ui::terminal_line!(
             "encryption key rotated (version {}, preserved {} environment{})",
@@ -132,6 +154,11 @@ pub(super) async fn env_rotate_key(
         ));
         if !environment_names.is_empty() {
             output::info(&format!("preserved: {}", environment_names.join(", ")));
+        }
+    }
+    if !json_output {
+        for warning in warnings {
+            output::warn(warning);
         }
     }
     Ok(())

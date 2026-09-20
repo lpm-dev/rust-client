@@ -250,16 +250,22 @@ pub(super) async fn env_pair(
     }
 
     output::info("fetching pairing session...");
-    let expected_principal_id =
+    let (expected_principal_id, expected_origin) =
         super::auth::execute_sync_with_bearer(client, |registry_url, auth_token| async move {
-            lpm_vault::sync::get_my_public_key_state(&registry_url, &auth_token).await
+            let state =
+                lpm_vault::sync::get_my_public_key_state(&registry_url, &auth_token).await?;
+            let origin = lpm_vault::crypto::personal::registry_origin(&registry_url)?;
+            Ok((state.principal_id, origin))
         })
-        .await?
-        .principal_id;
+        .await?;
 
     let session = super::auth::execute_sync_with_bearer(client, |registry_url, auth_token| {
+        let expected_origin = expected_origin.clone();
         let code = parsed.code.clone();
-        async move { lpm_vault::sync::get_pairing_session(&registry_url, &auth_token, &code).await }
+        async move {
+            require_pairing_origin(&registry_url, &expected_origin)?;
+            lpm_vault::sync::get_pairing_session(&registry_url, &auth_token, &code).await
+        }
     })
     .await?;
 
@@ -283,10 +289,12 @@ pub(super) async fn env_pair(
     .map_err(LpmError::Script)?;
     let ephemeral = exchange.ephemeral_public_key_b64().to_string();
     super::auth::execute_sync_with_bearer(client, |registry_url, auth_token| {
+        let expected_origin = expected_origin.clone();
         let code = parsed.code.clone();
         let expected_principal_id = expected_principal_id.clone();
         let ephemeral = ephemeral.clone();
         async move {
+            require_pairing_origin(&registry_url, &expected_origin)?;
             lpm_vault::sync::stage_pairing(
                 &registry_url,
                 &auth_token,
@@ -311,8 +319,9 @@ pub(super) async fn env_pair(
     print_pair_confirmation(&view);
     confirm_pairing(&parsed)?;
 
-    let mut wrapping_key = if protocol_version == 4 {
-        super::auth::execute_sync_with_bearer(client, |registry_url, auth_token| {
+    let encrypted = match protocol_version {
+        4 => {
+            let mut wrapping_key = super::auth::execute_sync_with_bearer(client, |registry_url, auth_token| {
             let expected_principal_id = expected_principal_id.clone();
             async move {
                 let current = lpm_vault::sync::get_my_public_key_state(&registry_url, &auth_token).await?;
@@ -326,19 +335,29 @@ pub(super) async fn env_pair(
                 }
                 Ok(local.private_key)
             }
-        }).await?
-    } else {
-        lpm_vault::crypto::get_or_create_wrapping_key().map_err(LpmError::Script)?
+        }).await?;
+
+            let encrypted = exchange.wrap_key(&wrapping_key);
+            wrapping_key.fill(0);
+            encrypted.map_err(LpmError::Script)?
+        }
+        5 => exchange
+            .wrap_personal_bundle(&expected_origin, &expected_principal_id)
+            .map_err(LpmError::Script)?,
+        _ => {
+            return Err(LpmError::Script(
+                "refresh the dashboard before pairing this browser".into(),
+            ));
+        }
     };
-    let encrypted = exchange.wrap_key(&wrapping_key);
-    wrapping_key.fill(0);
-    let encrypted = encrypted.map_err(LpmError::Script)?;
     super::auth::execute_sync_with_bearer(client, |registry_url, auth_token| {
+        let expected_origin = expected_origin.clone();
         let code = parsed.code.clone();
         let expected_principal_id = expected_principal_id.clone();
         let encrypted = encrypted.clone();
         let ephemeral = ephemeral.clone();
         async move {
+            require_pairing_origin(&registry_url, &expected_origin)?;
             lpm_vault::sync::approve_pairing(
                 &registry_url,
                 &auth_token,
@@ -368,6 +387,16 @@ pub(super) async fn env_pair(
             "The dashboard can now decrypt your env secrets.".dimmed()
         );
         println!();
+    }
+    Ok(())
+}
+
+fn require_pairing_origin(
+    registry_url: &str,
+    expected: &str,
+) -> Result<(), lpm_vault::sync::SyncError> {
+    if lpm_vault::crypto::personal::registry_origin(registry_url)? != expected {
+        return Err("the active registry changed during browser pairing".into());
     }
     Ok(())
 }

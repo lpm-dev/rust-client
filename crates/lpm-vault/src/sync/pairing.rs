@@ -37,9 +37,9 @@ pub async fn get_pairing_session(
     }
 
     let session: PairingSession = read_capped_json(response).await?;
-    if !matches!(session.protocol_version, 3 | 4) {
+    if !matches!(session.protocol_version, 4 | 5) {
         return Err(format!(
-            "pairing protocol 3 or 4 is required; server returned protocol {}",
+            "pairing protocol 4 or 5 is required; server returned protocol {}",
             session.protocol_version
         )
         .into());
@@ -179,7 +179,7 @@ mod tests {
             .and(header("authorization", "Bearer auth-token"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "status": "pending",
-                "protocolVersion": 3,
+                "protocolVersion": 5,
                 "browserPublicKey": "browser-key"
             })))
             .expect(1)
@@ -191,7 +191,7 @@ mod tests {
             .expect("pairing session should parse");
 
         assert_eq!(result.status, "pending");
-        assert_eq!(result.protocol_version, 3);
+        assert_eq!(result.protocol_version, 5);
         assert_eq!(result.browser_public_key.as_deref(), Some("browser-key"));
     }
 
@@ -203,6 +203,14 @@ mod tests {
                 serde_json::json!({
                     "status": "pending",
                     "protocolVersion": 2,
+                    "browserPublicKey": "browser-key"
+                }),
+            ),
+            (
+                "retired",
+                serde_json::json!({
+                    "status": "pending",
+                    "protocolVersion": 3,
                     "browserPublicKey": "browser-key"
                 }),
             ),
@@ -226,7 +234,7 @@ mod tests {
 
             let error = result.err().expect("retired pairing protocol must fail");
             if case == "retired" {
-                assert!(error.to_string().contains("pairing protocol 3"));
+                assert!(error.to_string().contains("pairing protocol 4 or 5"));
             } else {
                 assert!(error.to_string().contains("protocolVersion"));
             }
@@ -279,7 +287,7 @@ mod tests {
             &PairingRequest {
                 code: "ABC123",
                 expected_principal_id: "user-123",
-                protocol_version: 3,
+                protocol_version: 5,
             },
             "wrapped-key",
             "ephemeral-key",
@@ -313,7 +321,7 @@ mod tests {
             &PairingRequest {
                 code: "ABC123",
                 expected_principal_id: "user-123",
-                protocol_version: 3,
+                protocol_version: 5,
             },
             "ephemeral-key",
         )
@@ -366,7 +374,7 @@ mod tests {
                     }
 
                     let body = if handled_requests == 0 {
-                        r#"{"status":"pending","protocolVersion":3,"browserPublicKey":"browser-key"}"#
+                        r#"{"status":"pending","protocolVersion":5,"browserPublicKey":"browser-key"}"#
                     } else {
                         "{}"
                     };
@@ -393,7 +401,7 @@ mod tests {
             &PairingRequest {
                 code: "ABC123",
                 expected_principal_id: "user-123",
-                protocol_version: 3,
+                protocol_version: 5,
             },
             "ephemeral-key",
         )
@@ -405,7 +413,7 @@ mod tests {
             &PairingRequest {
                 code: "ABC123",
                 expected_principal_id: "user-123",
-                protocol_version: 3,
+                protocol_version: 5,
             },
             "wrapped-key",
             "ephemeral-key",

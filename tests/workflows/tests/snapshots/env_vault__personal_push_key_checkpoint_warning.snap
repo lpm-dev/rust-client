@@ -1,0 +1,12 @@
+---
+source: tests/workflows/tests/env_vault.rs
+expression: value
+---
+{
+  "success": true,
+  "status": "rotated",
+  "version": 2,
+  "warnings": [
+    "The remote update succeeded, but the local key checkpoint could not be stored. Restore local storage access, then pull the latest project revision."
+  ]
+}

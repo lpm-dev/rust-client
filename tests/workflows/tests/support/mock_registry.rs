@@ -89,7 +89,7 @@ impl Respond for SignedSyncResponse {
                 "vaultId": self.vault_id,
             }),
         };
-        let data = match operation {
+        let mut data = match operation {
             "vault.inspect" => serde_json::json!({
                 "revision": revision,
                 "cryptoVersion": crypto_version,
@@ -137,6 +137,20 @@ impl Respond for SignedSyncResponse {
                 data
             }
         };
+        if matches!(self.scope, TestSyncScope::Personal) && operation != "vault.inspect" {
+            let posted: serde_json::Value =
+                serde_json::from_slice(&request.body).unwrap_or_default();
+            for field in [
+                "personalKeyScheme",
+                "personalRegistryOrigin",
+                "projectKeyVersion",
+                "wrappedProjectKey",
+            ] {
+                if let Some(value) = object.get(field).or_else(|| posted.get(field)) {
+                    data[field] = value.clone();
+                }
+            }
+        }
         let body = serde_json::to_string(&serde_json::json!({
             "envelopeVersion": 3,
             "operation": operation,
@@ -1401,7 +1415,7 @@ impl MockRegistry {
             .and(header("authorization", format!("Bearer {bearer_token}")))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "status": "pending",
-                "protocolVersion": 3,
+                "protocolVersion": 5,
                 "browserPublicKey": browser_public_key,
             })))
             .expect(1)
@@ -1426,7 +1440,7 @@ impl MockRegistry {
             .and(header("authorization", format!("Bearer {bearer_token}")))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "status": "pending",
-                "protocolVersion": 3,
+                "protocolVersion": 5,
                 "browserPublicKey": browser_public_key,
             })))
             .expect(expected_calls)
@@ -1450,7 +1464,7 @@ impl MockRegistry {
     ) -> &Self {
         let mut body = serde_json::json!({
             "status": "pending",
-            "protocolVersion": 3,
+            "protocolVersion": 5,
             "browserPublicKey": browser_public_key,
         });
         if let Some(label) = device_label {
@@ -1482,7 +1496,7 @@ impl MockRegistry {
     ) -> &Self {
         let mut body = serde_json::json!({
             "status": status,
-            "protocolVersion": 3,
+            "protocolVersion": 5,
         });
         if let Some(browser_public_key) = browser_public_key {
             body["browserPublicKey"] = serde_json::Value::String(browser_public_key.to_string());
@@ -1864,7 +1878,7 @@ impl MockRegistry {
             .and(header("authorization", format!("Bearer {bearer_token}")))
             .and(query_param_is_missing("versionOnly"))
             .respond_with(pull_response)
-            .expect(1)
+            .expect(1..=2)
             .mount(&self.server)
             .await;
 
@@ -2021,7 +2035,7 @@ impl MockRegistry {
         events: &[&str],
     ) -> &Self {
         let mut mock = Mock::given(method("POST"))
-            .and(path("/api/vault/oidc/policies"))
+            .and(path("/api/vault/oidc/escrow"))
             .and(header("authorization", format!("Bearer {bearer_token}")))
             .and(body_string_contains(format!("\"vaultId\":\"{vault_id}\"")))
             .and(body_string_contains(format!("\"subject\":\"repo:{repo}\"")))
@@ -2066,7 +2080,7 @@ impl MockRegistry {
         envs: &[&str],
     ) -> &Self {
         let mut mock = Mock::given(method("POST"))
-            .and(path("/api/vault/oidc/policies"))
+            .and(path("/api/vault/oidc/escrow"))
             .and(header("authorization", format!("Bearer {bearer_token}")))
             .and(body_string_contains(format!("\"vaultId\":\"{vault_id}\"")))
             .and(body_string_contains("\"provider\":\"gitlab\""))

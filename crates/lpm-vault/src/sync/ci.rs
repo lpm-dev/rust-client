@@ -55,49 +55,72 @@ pub async fn ci_pull(
     Ok((vars, env_name))
 }
 
-/// Upload the wrapping key to the server for CI escrow.
-/// Called during `lpm env oidc allow` to enable server-side decryption.
-pub async fn upload_escrow_key(
+/// Enable a complete personal CI policy with only its authenticated project key.
+pub async fn enable_personal_ci(
     registry_url: &str,
     auth_token: &str,
     vault_id: &str,
-    wrapping_key_hex: &str,
     expected_principal_id: &str,
-) -> Result<(), SyncError> {
-    let client = sync_http_client()?;
-    let url = format!("{registry_url}/api/vault/oidc/escrow");
-
-    let body = serde_json::json!({
-        "vaultId": vault_id,
-        "wrappingKeyHex": wrapping_key_hex,
-        "expectedPrincipalId": expected_principal_id,
-    });
-
-    let response = client
-        .post(&url)
+    policy: &serde_json::Value,
+) -> Result<serde_json::Value, SyncError> {
+    let pulled = super::personal::pull_raw_bound_to_principal(
+        registry_url,
+        auth_token,
+        vault_id,
+        Some(expected_principal_id),
+    )
+    .await?;
+    let envelope = pulled
+        .key_envelope
+        .ok_or("push this personal env project with the current CLI before enabling CI access")?;
+    let project = crate::crypto::personal::open_project_key(
+        &envelope,
+        registry_url,
+        expected_principal_id,
+        vault_id,
+    )?;
+    let project_key_hex = elliptic_curve::zeroize::Zeroizing::new(hex::encode(project.key));
+    #[derive(serde::Serialize)]
+    #[serde(rename_all = "camelCase")]
+    struct Activation<'a> {
+        vault_id: &'a str,
+        expected_principal_id: &'a str,
+        expected_version: i32,
+        #[serde(flatten)]
+        keys: &'a crate::crypto::personal::PersonalKeyEnvelope,
+        project_key_hex: &'a str,
+        allow_server_decryption: bool,
+        policy: &'a serde_json::Value,
+    }
+    let body = Activation {
+        vault_id,
+        expected_principal_id,
+        expected_version: pulled.version,
+        keys: &envelope,
+        project_key_hex: &project_key_hex,
+        allow_server_decryption: true,
+        policy,
+    };
+    let response = sync_http_client()?
+        .post(format!("{registry_url}/api/vault/oidc/escrow"))
         .bearer_auth(auth_token)
         .json(&body)
-        .timeout(std::time::Duration::from_secs(15))
+        .timeout(std::time::Duration::from_secs(30))
         .send()
         .await
         .map_err(super::http::network_error)?;
-
-    if !response.status().is_success() {
-        let status = response.status();
-        let body = read_capped_error_text(response).await;
-        // Try to extract error message from JSON
-        if let Ok(json) = serde_json::from_str::<serde_json::Value>(&body)
-            && let Some(err) = json["error"].as_str()
-        {
-            return Err(SyncError::http(status, err.to_string()));
-        }
+    let status = response.status();
+    let result: serde_json::Value = read_capped_json(response).await?;
+    if !status.is_success() {
         return Err(SyncError::http(
             status,
-            format!("escrow upload failed: {body}"),
+            result["error"]
+                .as_str()
+                .unwrap_or("personal CI activation failed")
+                .to_owned(),
         ));
     }
-
-    Ok(())
+    Ok(result)
 }
 
 /// An authenticated organization content key prepared for explicit CI decryption.
@@ -183,27 +206,205 @@ async fn send_org_escrow_request<T: serde::Serialize + ?Sized>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use wiremock::matchers::{body_json, header, method, path, query_param};
+    use wiremock::matchers::{header, method, path, query_param};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
+    #[cfg(debug_assertions)]
+    async fn personal_ci_fixture(
+        server: &MockServer,
+        legacy: bool,
+    ) -> Option<crate::crypto::personal::PersonalProjectKey> {
+        use crate::crypto::{self, personal};
+        use crate::sync::test_support::{TestSyncScope, signed_sync_ok_response};
+        let principal = "personal-test-principal";
+        let vault = "project-ci";
+        let (project, blob, wrapped) = if legacy {
+            let (blob, wrapped) =
+                crypto::encrypt_vault_for_sync(r#"{"API_KEY":"fixture"}"#, principal, vault, 7)
+                    .unwrap();
+            (None, blob, wrapped)
+        } else {
+            let project = personal::create_project_key(&personal::PersonalKeyContext {
+                registry_origin: &server.uri(),
+                principal_id: principal,
+                vault_id: vault,
+                project_key_version: 1,
+            })
+            .unwrap();
+            let (blob, wrapped) = personal::encrypt_personal_payload(
+                &project,
+                principal,
+                vault,
+                7,
+                r#"{"API_KEY":"fixture"}"#,
+            )
+            .unwrap();
+            (Some(project), blob, wrapped)
+        };
+        let mut body = serde_json::json!({ "encryptedBlob": blob, "wrappedKey": wrapped, "version": 7, "cryptoVersion": 3 });
+        if let Some(project) = &project {
+            body.as_object_mut().unwrap().extend(
+                serde_json::to_value(&project.envelope)
+                    .unwrap()
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            );
+        }
+        Mock::given(method("GET"))
+            .and(path("/api/vaults/project-ci/sync"))
+            .respond_with(signed_sync_ok_response(
+                body,
+                "auth-token",
+                vault,
+                TestSyncScope::Personal,
+            ))
+            .expect(1)
+            .mount(server)
+            .await;
+        project
+    }
+
+    #[cfg(debug_assertions)]
     #[tokio::test]
-    async fn escrow_upload_carries_the_captured_personal_principal() {
+    #[expect(
+        clippy::await_holding_lock,
+        reason = "the shared process-environment lock isolates current-thread tests"
+    )]
+    async fn personal_ci_activation_sends_only_the_project_key_and_captured_policy() {
+        use crate::sync::test_support::{IsolatedVaultKeyEnv, env_lock_guard};
+        let _guard = env_lock_guard();
+        let _isolated = IsolatedVaultKeyEnv::new();
         let server = MockServer::start().await;
+        let project = personal_ci_fixture(&server, false).await.unwrap();
+        let policy = serde_json::json!({"vaultId":"project-ci", "provider":"github", "subject":"repo:owner/repo", "repositoryId":"123", "allowedBranches":["main"], "allowedEnvironments":["production"], "allowedWorkflows":[".github/workflows/ci.yml"], "allowedEvents":["push"], "allowForks":false});
         Mock::given(method("POST"))
             .and(path("/api/vault/oidc/escrow"))
-            .and(body_json(serde_json::json!({
-                "vaultId": "vault-123",
-                "wrappingKeyHex": "aa",
-                "expectedPrincipalId": "account-1",
-            })))
-            .respond_with(ResponseTemplate::new(200))
+            .and(header("authorization", "Bearer auth-token"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"policyId":"policy-id"})),
+            )
             .expect(1)
             .mount(&server)
             .await;
+        let result = enable_personal_ci(
+            &server.uri(),
+            "auth-token",
+            "project-ci",
+            "personal-test-principal",
+            &policy,
+        )
+        .await
+        .unwrap();
+        assert_eq!(result["policyId"], "policy-id");
+        let requests = server.received_requests().await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&requests[1].body).unwrap();
+        let mut expected = serde_json::to_value(&project.envelope).unwrap();
+        expected.as_object_mut().unwrap().extend(serde_json::json!({
+            "vaultId":"project-ci", "expectedPrincipalId":"personal-test-principal", "expectedVersion":7,
+            "projectKeyHex":hex::encode(project.key), "allowServerDecryption":true, "policy":policy,
+        }).as_object().unwrap().clone());
+        assert_eq!(body, expected);
+        let root = crate::crypto::personal::personal_root_key(
+            &server.uri(),
+            "personal-test-principal",
+            false,
+        )
+        .unwrap();
+        assert_ne!(project.key, root);
+        assert!(crate::crypto::read_legacy_wrapping_key().unwrap().is_none());
+    }
 
-        upload_escrow_key(&server.uri(), "session", "vault-123", "aa", "account-1")
-            .await
-            .expect("escrow upload should preserve the captured principal");
+    #[cfg(debug_assertions)]
+    #[tokio::test]
+    #[expect(
+        clippy::await_holding_lock,
+        reason = "the shared process-environment lock isolates current-thread tests"
+    )]
+    async fn personal_ci_activation_refuses_legacy_envelopes_without_uploading_a_key() {
+        use crate::sync::test_support::{IsolatedVaultKeyEnv, env_lock_guard};
+        let _guard = env_lock_guard();
+        let _isolated = IsolatedVaultKeyEnv::new();
+        let server = MockServer::start().await;
+        personal_ci_fixture(&server, true).await;
+        let error = enable_personal_ci(
+            &server.uri(),
+            "auth-token",
+            "project-ci",
+            "personal-test-principal",
+            &serde_json::json!({}),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("push this personal env project"),
+            "{error}"
+        );
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
+    }
+
+    #[cfg(debug_assertions)]
+    #[tokio::test]
+    #[expect(
+        clippy::await_holding_lock,
+        reason = "the shared process-environment lock isolates current-thread tests"
+    )]
+    async fn personal_ci_activation_refuses_a_changed_principal_before_upload() {
+        use crate::sync::test_support::{IsolatedVaultKeyEnv, env_lock_guard};
+        let _guard = env_lock_guard();
+        let _isolated = IsolatedVaultKeyEnv::new();
+        let server = MockServer::start().await;
+        personal_ci_fixture(&server, false).await;
+        let error = enable_personal_ci(
+            &server.uri(),
+            "auth-token",
+            "project-ci",
+            "other-principal",
+            &serde_json::json!({}),
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("different account"), "{error}");
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
+    }
+
+    #[cfg(debug_assertions)]
+    #[tokio::test]
+    #[expect(
+        clippy::await_holding_lock,
+        reason = "the shared process-environment lock isolates current-thread tests"
+    )]
+    async fn personal_ci_activation_propagates_a_concurrent_revision_conflict() {
+        use crate::sync::test_support::{IsolatedVaultKeyEnv, env_lock_guard};
+        let _guard = env_lock_guard();
+        let _isolated = IsolatedVaultKeyEnv::new();
+        let server = MockServer::start().await;
+        personal_ci_fixture(&server, false).await;
+        Mock::given(method("POST"))
+            .and(path("/api/vault/oidc/escrow"))
+            .respond_with(
+                ResponseTemplate::new(409)
+                    .set_body_json(serde_json::json!({"error":"project changed; pull and retry"})),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let error = enable_personal_ci(
+            &server.uri(),
+            "auth-token",
+            "project-ci",
+            "personal-test-principal",
+            &serde_json::json!({}),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("project changed; pull and retry"),
+            "{error}"
+        );
     }
 
     #[tokio::test]

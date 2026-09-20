@@ -22,6 +22,167 @@ use support::{TempProject, lpm, write_private_file};
 use wiremock::matchers::{header, method, path, query_param};
 use wiremock::{Mock, Request, Respond, ResponseTemplate};
 
+async fn mount_personal_ci_project(
+    project: &TempProject,
+    mock: &MockRegistry,
+    vault_id: &str,
+    token: &str,
+) {
+    let origin = mock.url();
+    let principal = "account-1";
+    let mut hash = Sha256::new();
+    hash.update(b"lpm-env-personal-root-v2\0");
+    hash.update((origin.len() as u32).to_be_bytes());
+    hash.update(origin.as_bytes());
+    hash.update((principal.len() as u32).to_be_bytes());
+    hash.update(principal.as_bytes());
+    let root = [0x51; 32];
+    std::fs::create_dir_all(project.home().join(".lpm")).unwrap();
+    write_private_file(
+        &project.home().join(".lpm").join(format!(
+            ".env-personal-root-v2-{}",
+            hex::encode(hash.finalize())
+        )),
+        hex::encode(root).as_bytes(),
+    );
+    let context = lpm_vault::crypto::personal::PersonalKeyContext {
+        registry_origin: &origin,
+        principal_id: principal,
+        vault_id,
+        project_key_version: 1,
+    };
+    let project_key = [0x62; 32];
+    let keys = lpm_vault::crypto::personal::PersonalKeyEnvelope {
+        personal_key_scheme: 2,
+        personal_registry_origin: origin.clone(),
+        project_key_version: 1,
+        wrapped_project_key: {
+            let mut bytes = project_key.to_vec();
+            let nonce = [0x73; 12];
+            Aes256Gcm::new_from_slice(&root)
+                .unwrap()
+                .encrypt_in_place(
+                    GenericArray::from_slice(&nonce),
+                    &lpm_vault::crypto::personal::key_associated_data(&context, None).unwrap(),
+                    &mut bytes,
+                )
+                .unwrap();
+            format!("{}:{}", BASE64.encode(nonce), BASE64.encode(bytes))
+        },
+    };
+    let project_key = lpm_vault::crypto::personal::PersonalProjectKey {
+        key: project_key,
+        envelope: keys,
+    };
+    let (blob, wrapped) = lpm_vault::crypto::personal::encrypt_personal_payload(
+        &project_key,
+        principal,
+        vault_id,
+        1,
+        r#"{"environments":{"default":{"TOKEN":"fixture"}}}"#,
+    )
+    .unwrap();
+    let mut body = serde_json::to_value(&project_key.envelope).unwrap();
+    body.as_object_mut().unwrap().extend(serde_json::json!({"encryptedBlob":blob,"wrappedKey":wrapped,"version":1,"cryptoVersion":3}).as_object().unwrap().clone());
+    Mock::given(method("GET"))
+        .and(path(format!("/api/vaults/{vault_id}/sync")))
+        .respond_with(signed_sync_response(
+            body,
+            token,
+            vault_id,
+            TestSyncScope::Personal,
+        ))
+        .mount(mock.server())
+        .await;
+}
+
+#[tokio::test]
+async fn env_oidc_personal_activation_refreshes_after_authoritative_unauthorized() {
+    for rejected_step in ["pull", "activation"] {
+        let project = TempProject::empty(r#"{"name":"personal-ci-refresh"}"#);
+        let mock = MockRegistry::start().await;
+        let vault_id = "personal-ci-refresh";
+        write_personal_bound_manifest(&project, &mock.url(), vault_id);
+        seed_sessions(
+            project.home(),
+            &[SessionSeed {
+                registry_url: &mock.url(),
+                access_token: Some("cached-access"),
+                refresh_token: Some("refresh-token"),
+                session_access_expires_at: Some("2030-01-01T00:00:00Z"),
+            }],
+        );
+        mount_personal_ci_project(&project, &mock, vault_id, "fresh-access").await;
+        mock.with_refresh_expected(
+            "refresh-token",
+            "fresh-access",
+            "rotated-refresh",
+            "2030-02-01T00:00:00Z",
+            1,
+        )
+        .await;
+        let (verb, endpoint) = if rejected_step == "pull" {
+            ("GET", format!("/api/vaults/{vault_id}/sync"))
+        } else {
+            ("POST", "/api/vault/oidc/escrow".into())
+        };
+        Mock::given(method(verb))
+            .and(path(endpoint))
+            .and(header("authorization", "Bearer cached-access"))
+            .respond_with(
+                ResponseTemplate::new(401)
+                    .set_body_json(serde_json::json!({"error":"session expired"})),
+            )
+            .with_priority(1)
+            .expect(1)
+            .mount(mock.server())
+            .await;
+        mock.with_oidc_policy_create(
+            "fresh-access",
+            vault_id,
+            "owner/repo",
+            "123",
+            &["main"],
+            &["production"],
+            &[".github/workflows/ci.yml"],
+            &["push"],
+        )
+        .await;
+        let output = lpm(&project)
+            .env("LPM_REGISTRY_URL", mock.url())
+            .args([
+                "--json",
+                "env",
+                "oidc",
+                "allow",
+                "--allow-server-decryption",
+                "--repo=owner/repo",
+                "--repository-id=123",
+                "--branch=main",
+                "--env=production",
+                "--workflow=.github/workflows/ci.yml",
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{rejected_step} failed: {} {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            parse_clean_json_stdout(&output)["policyId"],
+            TEST_OIDC_POLICY_ID
+        );
+        let requests = mock.server().received_requests().await.unwrap();
+        assert!(
+            requests
+                .iter()
+                .all(|request| request.url.path() != "/api/vault/oidc/policies")
+        );
+    }
+}
+
 #[tokio::test]
 async fn env_remote_actions_reject_unintended_scope_before_network_access() {
     let cases: &[&[&str]] = &[
@@ -98,6 +259,7 @@ fn env_oidc_allow_without_a_personal_binding_does_not_create_a_vault_manifest() 
             "env",
             "oidc",
             "allow",
+            "--allow-server-decryption",
             "--provider=github",
             "--repo=acme/repo",
             "--repository-id=987654321",
@@ -1199,8 +1361,8 @@ async fn env_pair_uppercases_code_and_approves_browser_pairing() {
         "expected pairing success output, got combined output: {combined_output}"
     );
     assert!(
-        project.home().join(".lpm").join(".vault-key").exists(),
-        "workflow vault pairing should use the file-backed wrapping key in isolated HOME"
+        !project.home().join(".lpm").join(".vault-key").exists(),
+        "personal pairing must not create the legacy account-global key"
     );
 }
 
@@ -1995,8 +2157,8 @@ async fn env_pair_then_logout_revoke_revokes_pairings_and_blocks_future_pairing_
         String::from_utf8_lossy(&pair.stderr),
     );
     assert!(
-        project.home().join(".lpm").join(".vault-key").exists(),
-        "pair should materialize the local wrapping key file in isolated HOME"
+        !project.home().join(".lpm").join(".vault-key").exists(),
+        "pairing must not create the retired account-global wrapping key"
     );
 
     let logout = lpm(&project)
@@ -2947,7 +3109,14 @@ async fn env_oidc_allow_missing_repo_emits_json_error() {
 
     let output = lpm(&project)
         .env("LPM_REGISTRY_URL", mock.url())
-        .args(["--json", "env", "oidc", "allow", "--env=preview"])
+        .args([
+            "--json",
+            "env",
+            "oidc",
+            "allow",
+            "--allow-server-decryption",
+            "--env=preview",
+        ])
         .output()
         .expect("failed to run oidc allow JSON error test");
 
@@ -2991,6 +3160,7 @@ async fn env_oidc_allow_missing_workflow_flag_errors_loudly() {
             "env",
             "oidc",
             "allow",
+            "--allow-server-decryption",
             "--repo=acme/repo",
             "--branch=main",
             "--env=production",
@@ -3036,6 +3206,7 @@ async fn env_oidc_allow_rejects_workflow_in_subdirectory() {
             "env",
             "oidc",
             "allow",
+            "--allow-server-decryption",
             "--repo=acme/repo",
             "--workflow=.github/workflows/nested/deploy.yml",
             "--branch=main",
@@ -3530,6 +3701,7 @@ async fn env_oidc_allow_then_list_shows_policy_and_escrow_success() {
         }],
     );
 
+    mount_personal_ci_project(&project, &mock, "vault-policy-123", "session-access-token").await;
     mock.with_oidc_policy_create(
         "session-access-token",
         "vault-policy-123",
@@ -3541,8 +3713,6 @@ async fn env_oidc_allow_then_list_shows_policy_and_escrow_success() {
         &["push"],
     )
     .await;
-    mock.with_escrow_upload_success("session-access-token", "vault-policy-123")
-        .await;
     mock.with_oidc_policy_list(
         "session-access-token",
         "vault-policy-123",
@@ -3565,6 +3735,7 @@ async fn env_oidc_allow_then_list_shows_policy_and_escrow_success() {
             "env",
             "oidc",
             "allow",
+            "--allow-server-decryption",
             "--provider=github",
             "--repo=acme/repo",
             "--repository-id=987654321",
@@ -3636,6 +3807,13 @@ async fn env_oidc_allow_discovers_public_github_repository_id() {
         .expect(1)
         .mount(mock.server())
         .await;
+    mount_personal_ci_project(
+        &project,
+        &mock,
+        "vault-policy-discovery",
+        "session-access-token",
+    )
+    .await;
     mock.with_oidc_policy_create(
         "session-access-token",
         "vault-policy-discovery",
@@ -3647,8 +3825,6 @@ async fn env_oidc_allow_discovers_public_github_repository_id() {
         &["push"],
     )
     .await;
-    mock.with_escrow_upload_success("session-access-token", "vault-policy-discovery")
-        .await;
 
     let output = lpm(&project)
         .env("LPM_REGISTRY_URL", mock.url())
@@ -3658,6 +3834,7 @@ async fn env_oidc_allow_discovers_public_github_repository_id() {
             "env",
             "oidc",
             "allow",
+            "--allow-server-decryption",
             "--provider=github",
             "--repo=acme/repo",
             "--branch=main",
@@ -3689,6 +3866,7 @@ async fn env_oidc_allow_gitlab_uses_numeric_project_subject_without_github_field
             session_access_expires_at: Some("2030-01-01T00:00:00Z"),
         }],
     );
+    mount_personal_ci_project(&project, &mock, "vault-gitlab-123", "session-access-token").await;
     mock.with_gitlab_oidc_policy_create(
         "session-access-token",
         "vault-gitlab-123",
@@ -3697,8 +3875,6 @@ async fn env_oidc_allow_gitlab_uses_numeric_project_subject_without_github_field
         &["production"],
     )
     .await;
-    mock.with_escrow_upload_success("session-access-token", "vault-gitlab-123")
-        .await;
 
     let output = lpm(&project)
         .env("LPM_REGISTRY_URL", mock.url())
@@ -3706,6 +3882,7 @@ async fn env_oidc_allow_gitlab_uses_numeric_project_subject_without_github_field
             "env",
             "oidc",
             "allow",
+            "--allow-server-decryption",
             "--provider=gitlab",
             "--project-id=12345",
             "--branch=main",
@@ -3757,6 +3934,7 @@ async fn env_oidc_allow_gitlab_rejects_github_only_flags_before_network() {
                 "env",
                 "oidc",
                 "allow",
+                "--allow-server-decryption",
                 "--provider=gitlab",
                 "--project-id=12345",
                 "--env=production",
@@ -3792,6 +3970,7 @@ async fn env_oidc_allow_github_rejects_empty_repository_segments_before_network(
                 "env",
                 "oidc",
                 "allow",
+                "--allow-server-decryption",
                 &format!("--repo={repo}"),
                 "--workflow=.github/workflows/deploy.yml",
                 "--env=production",
@@ -3820,6 +3999,7 @@ async fn env_oidc_allow_github_rejects_malformed_repository_ids_before_network()
                 "env",
                 "oidc",
                 "allow",
+                "--allow-server-decryption",
                 "--provider=github",
                 "--repo=owner/repository",
                 &format!("--repository-id={repository_id}"),
@@ -3908,6 +4088,19 @@ async fn env_push_uses_bound_checkpoint_without_a_version_preflight() {
         .mount(mock.server())
         .await;
 
+    write_private_file(
+        &project.home().join(".lpm/.vault-key"),
+        hex::encode([0x81; 32]),
+    );
+    mock.with_personal_pull_keys(
+        vault_id,
+        "session-access-token",
+        serde_json::json!({"environments":{"default":{}}}),
+        &[0x81; 32],
+        &[0x82; 32],
+        7,
+    )
+    .await;
     let manifest_read_log = project.path().join("manifest-reads.log");
 
     let mut command = lpm(&project);
@@ -4055,6 +4248,147 @@ async fn env_force_push_recreates_a_deleted_bound_vault_above_its_checkpoint() {
     assert_eq!(body["recreateMissing"], true);
 }
 
+struct CheckpointFailingCommitResponse {
+    manifest: std::path::PathBuf,
+    home: std::path::PathBuf,
+    fail_key_checkpoint: bool,
+    response: SignedSyncResponse,
+}
+
+impl Respond for CheckpointFailingCommitResponse {
+    fn respond(&self, request: &Request) -> ResponseTemplate {
+        if self.fail_key_checkpoint {
+            let floor = std::fs::read_dir(self.home.join(".lpm"))
+                .unwrap()
+                .map(Result::unwrap)
+                .find(|entry| {
+                    entry
+                        .file_name()
+                        .to_string_lossy()
+                        .starts_with(".env-project-key-floor-")
+                })
+                .expect("the authenticated pull stored its key checkpoint")
+                .path();
+            std::fs::remove_file(&floor).unwrap();
+            std::fs::create_dir(floor).unwrap();
+        } else {
+            std::fs::write(&self.manifest, r#"{"vault":"replacement-project"}"#).unwrap();
+        }
+        self.response.respond(request)
+    }
+}
+
+async fn personal_rotation_retains_commit_after_checkpoint_failure(fail_key_checkpoint: bool) {
+    for operation in ["rotate-key", "disable", "push"] {
+        let disable = operation == "disable";
+        let project = TempProject::empty(r#"{"name":"committed-rotation"}"#);
+        let mock = MockRegistry::start().await;
+        let vault_id = "committed-personal-rotation";
+        write_personal_bound_manifest(&project, &mock.url(), vault_id);
+        seed_sessions(
+            project.home(),
+            &[SessionSeed {
+                registry_url: &mock.url(),
+                access_token: Some("rotation-token"),
+                refresh_token: Some("rotation-refresh"),
+                session_access_expires_at: Some("2030-01-01T00:00:00Z"),
+            }],
+        );
+        if operation == "push" {
+            let output = lpm(&project)
+                .args(["env", "set", "TOKEN=local-fixture"])
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "seed local values");
+        }
+        mount_personal_ci_project(&project, &mock, vault_id, "rotation-token").await;
+        Mock::given(method("POST"))
+            .and(path(format!("/api/vaults/{vault_id}/sync")))
+            .respond_with(CheckpointFailingCommitResponse {
+                manifest: project.path().join("lpm.json"),
+                home: project.home().to_path_buf(),
+                fail_key_checkpoint,
+                response: signed_sync_response(
+                    serde_json::json!({"version":2,"status":"rotated"}),
+                    "rotation-token",
+                    vault_id,
+                    TestSyncScope::Personal,
+                ),
+            })
+            .expect(1)
+            .mount(mock.server())
+            .await;
+        let mut command = lpm(&project);
+        command
+            .env("LPM_REGISTRY_URL", mock.url())
+            .args(["--json", "env"]);
+        if disable {
+            command.args(["oidc", "disable"]);
+        } else {
+            command.arg(operation);
+        }
+        let output = command.output().unwrap();
+        assert!(
+            output.status.success(),
+            "acknowledged remote write must remain successful: {}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        let value = parse_clean_json_stdout(&output);
+        assert_eq!(value["success"], true);
+        assert_eq!(
+            value["status"],
+            if disable { "disabled" } else { "rotated" }
+        );
+        assert_eq!(value["version"], 2);
+        assert_eq!(value["warnings"].as_array().unwrap().len(), 1);
+        assert!(
+            value["warnings"][0]
+                .as_str()
+                .unwrap()
+                .contains("checkpoint")
+        );
+        assert!(!String::from_utf8_lossy(&output.stdout).contains("fixture"));
+        insta::assert_json_snapshot!(
+            format!(
+                "personal_{operation}_{}_checkpoint_warning",
+                if fail_key_checkpoint {
+                    "key"
+                } else {
+                    "manifest"
+                }
+            ),
+            value
+        );
+        let requests = mock.server().received_requests().await.unwrap();
+        let posted = requests
+            .iter()
+            .find(|request| request.method.as_str() == "POST")
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&posted.body).unwrap();
+        assert_eq!(body["projectKeyVersion"], if disable { 2 } else { 1 });
+        if !fail_key_checkpoint {
+            let manifest: serde_json::Value = serde_json::from_str(
+                &std::fs::read_to_string(project.path().join("lpm.json")).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(
+                manifest["vault"], "replacement-project",
+                "do not overwrite a changed project"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn env_personal_rotation_preserves_success_when_key_checkpoint_write_fails() {
+    personal_rotation_retains_commit_after_checkpoint_failure(true).await;
+}
+
+#[tokio::test]
+async fn env_personal_rotation_preserves_success_when_manifest_checkpoint_write_fails() {
+    personal_rotation_retains_commit_after_checkpoint_failure(false).await;
+}
+
 #[tokio::test]
 async fn env_rotate_key_preserves_complete_named_remote_payload_with_cas() {
     let project = TempProject::empty(r#"{"name":"rotate-key","version":"1.0.0"}"#);
@@ -4162,25 +4496,62 @@ async fn env_rotate_key_preserves_complete_named_remote_payload_with_cas() {
     );
     assert!(body.get("force").is_none());
 
-    let wrapped_key = body["wrappedKey"].as_str().expect("wrapped key");
-    let rotated_data_key = lpm_vault::crypto::unwrap_key(&original_wrapping_key, wrapped_key)
-        .expect("unwrap data key");
-    assert_ne!(
-        rotated_data_key, original_data_key,
-        "rotation must encrypt the complete payload under a fresh data key"
+    assert_eq!(body["personalKeyScheme"], 2);
+    let root_file = std::fs::read_dir(project.home().join(".lpm"))
+        .unwrap()
+        .map(Result::unwrap)
+        .find(|entry| {
+            entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".env-personal-root-v2-")
+        })
+        .unwrap()
+        .path();
+    let root: [u8; 32] = hex::decode(std::fs::read_to_string(root_file).unwrap())
+        .unwrap()
+        .try_into()
+        .unwrap();
+    let origin = mock.url();
+    let key_context = lpm_vault::crypto::personal::PersonalKeyContext {
+        registry_origin: &origin,
+        principal_id: "account-1",
+        vault_id: "vault-rotate-123",
+        project_key_version: 1,
+    };
+    let unwrap = |key: &[u8; 32], encoded: &str, aad: &[u8]| {
+        let (nonce, ciphertext) = encoded.split_once(':').unwrap();
+        let nonce = BASE64.decode(nonce).unwrap();
+        let mut bytes = BASE64.decode(ciphertext).unwrap();
+        Aes256Gcm::new_from_slice(key)
+            .unwrap()
+            .decrypt_in_place(GenericArray::from_slice(&nonce), aad, &mut bytes)
+            .unwrap();
+        <[u8; 32]>::try_from(bytes).unwrap()
+    };
+    let project_key = unwrap(
+        &root,
+        body["wrappedProjectKey"].as_str().unwrap(),
+        &lpm_vault::crypto::personal::key_associated_data(&key_context, None).unwrap(),
     );
-    let rotated_plaintext = lpm_vault::crypto::decrypt_vault_payload(
+    let rotated_data_key = unwrap(
+        &project_key,
+        body["wrappedKey"].as_str().unwrap(),
+        &lpm_vault::crypto::personal::key_associated_data(&key_context, Some(8)).unwrap(),
+    );
+    assert_ne!(root, original_wrapping_key);
+    assert_ne!(rotated_data_key, original_data_key);
+    let plaintext = lpm_vault::crypto::decrypt_vault_payload(
         &rotated_data_key,
-        body["encryptedBlob"].as_str().expect("encrypted blob"),
+        body["encryptedBlob"].as_str().unwrap(),
         lpm_vault::crypto::VaultScope::Personal,
         "account-1",
         "vault-rotate-123",
         8,
-        lpm_vault::crypto::CURRENT_CRYPTO_VERSION,
+        3,
     )
-    .expect("decrypt rotated payload");
-    let rotated_payload: serde_json::Value =
-        serde_json::from_slice(&rotated_plaintext).expect("parse rotated payload");
+    .unwrap();
+    let rotated_payload: serde_json::Value = serde_json::from_slice(&plaintext).unwrap();
     assert_eq!(
         rotated_payload, authoritative_payload,
         "rotation must preserve environments, aliases, inheritance, and schema metadata exactly"
@@ -4792,6 +5163,13 @@ async fn env_oidc_allow_emits_json_response() {
         }],
     );
 
+    mount_personal_ci_project(
+        &project,
+        &mock,
+        "vault-policy-json-123",
+        "session-access-token",
+    )
+    .await;
     mock.with_oidc_policy_create(
         "session-access-token",
         "vault-policy-json-123",
@@ -4803,8 +5181,6 @@ async fn env_oidc_allow_emits_json_response() {
         &["push"],
     )
     .await;
-    mock.with_escrow_upload_success("session-access-token", "vault-policy-json-123")
-        .await;
 
     let output = lpm(&project)
         .env("LPM_REGISTRY_URL", mock.url())
@@ -4813,6 +5189,7 @@ async fn env_oidc_allow_emits_json_response() {
             "env",
             "oidc",
             "allow",
+            "--allow-server-decryption",
             "--provider=github",
             "--repo=acme/repo",
             "--repository-id=987654321",
@@ -4838,7 +5215,7 @@ async fn env_oidc_allow_emits_json_response() {
 }
 
 #[tokio::test]
-async fn env_oidc_allow_rejects_missing_or_malformed_policy_id_before_escrow() {
+async fn env_oidc_allow_rejects_missing_or_malformed_policy_id_in_activation_response() {
     for (label, response) in [
         (
             "missing",
@@ -4872,15 +5249,22 @@ async fn env_oidc_allow_rejects_missing_or_malformed_policy_id_before_escrow() {
             }],
         );
 
+        mount_personal_ci_project(
+            &project,
+            &mock,
+            "vault-policy-invalid-id",
+            "session-access-token",
+        )
+        .await;
         Mock::given(method("POST"))
-            .and(path("/api/vault/oidc/policies"))
+            .and(path("/api/vault/oidc/escrow"))
             .and(header("authorization", "Bearer session-access-token"))
             .respond_with(ResponseTemplate::new(200).set_body_json(response))
             .expect(1)
             .mount(mock.server())
             .await;
         Mock::given(method("POST"))
-            .and(path("/api/vault/oidc/escrow"))
+            .and(path("/api/vault/oidc/policies"))
             .respond_with(ResponseTemplate::new(500))
             .expect(0)
             .mount(mock.server())
@@ -4892,6 +5276,7 @@ async fn env_oidc_allow_rejects_missing_or_malformed_policy_id_before_escrow() {
                 "env",
                 "oidc",
                 "allow",
+                "--allow-server-decryption",
                 "--provider=github",
                 "--repo=acme/repo",
                 "--repository-id=987654321",
@@ -5078,6 +5463,7 @@ async fn env_oidc_list_human_output_renders_new_fields() {
                 "allowedWorkflows": [".github/workflows/deploy.yml"],
                 "allowedEvents": ["push", "release"],
                 "allowForks": false,
+                "disabledAt": "2026-09-20T00:00:00Z",
             }
         ]),
     )
@@ -5094,6 +5480,10 @@ async fn env_oidc_list_human_output_renders_new_fields() {
         "{}\n{}",
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr),
+    );
+    assert!(
+        combined.contains("status:    disabled"),
+        "disabled policy status missing: {combined}"
     );
     assert!(
         combined.contains(".github/workflows/deploy.yml"),
@@ -5131,17 +5521,7 @@ async fn env_oidc_allow_fails_when_escrow_upload_fails() {
         }],
     );
 
-    mock.with_oidc_policy_create(
-        "session-access-token",
-        "vault-policy-456",
-        "acme/repo",
-        "987654321",
-        &["main"],
-        &["preview"],
-        &[".github/workflows/deploy.yml"],
-        &["push"],
-    )
-    .await;
+    mount_personal_ci_project(&project, &mock, "vault-policy-456", "session-access-token").await;
     mock.with_escrow_upload_failure(
         "session-access-token",
         "vault-policy-456",
@@ -5155,6 +5535,7 @@ async fn env_oidc_allow_fails_when_escrow_upload_fails() {
             "env",
             "oidc",
             "allow",
+            "--allow-server-decryption",
             "--provider=github",
             "--repo=acme/repo",
             "--repository-id=987654321",
@@ -5179,11 +5560,8 @@ async fn env_oidc_allow_fails_when_escrow_upload_fails() {
         "policy success must not be reported before escrow completes: {combined_output}",
     );
     assert!(
-        combined_output.contains("policy may already have been created")
-            && combined_output.contains("CI pulls are not ready")
-            && combined_output.contains("escrow backend unavailable")
-            && combined_output.contains("rerun the same `lpm env oidc allow` command"),
-        "expected partial-completion and safe-rerun guidance, got: {combined_output}",
+        combined_output.contains("escrow backend unavailable"),
+        "expected atomic activation failure, got: {combined_output}",
     );
 }
 
@@ -5204,15 +5582,11 @@ async fn env_oidc_allow_json_escrow_failure_emits_one_error_document() {
         }],
     );
 
-    mock.with_oidc_policy_create(
-        "session-access-token",
+    mount_personal_ci_project(
+        &project,
+        &mock,
         "vault-policy-json-failure",
-        "acme/repo",
-        "987654321",
-        &["main"],
-        &["preview"],
-        &[".github/workflows/deploy.yml"],
-        &["push"],
+        "session-access-token",
     )
     .await;
     mock.with_escrow_upload_failure(
@@ -5229,6 +5603,7 @@ async fn env_oidc_allow_json_escrow_failure_emits_one_error_document() {
             "env",
             "oidc",
             "allow",
+            "--allow-server-decryption",
             "--provider=github",
             "--repo=acme/repo",
             "--repository-id=987654321",
@@ -5250,7 +5625,7 @@ async fn env_oidc_allow_json_escrow_failure_emits_one_error_document() {
     assert!(
         json["error"]
             .as_str()
-            .is_some_and(|error| error.contains("CI pulls are not ready")),
+            .is_some_and(|error| error.contains("escrow backend unavailable")),
         "expected escrow failure in global JSON error envelope, got: {json}",
     );
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -5261,7 +5636,7 @@ async fn env_oidc_allow_json_escrow_failure_emits_one_error_document() {
 }
 
 #[tokio::test]
-async fn env_oidc_allow_fails_when_wrapping_key_retrieval_fails() {
+async fn env_oidc_allow_refuses_a_project_when_the_device_root_is_missing() {
     let project =
         TempProject::empty(r#"{"name":"vault-oidc-wrapping-key-failure-test","version":"1.0.0"}"#);
     let mock = MockRegistry::start().await;
@@ -5277,18 +5652,24 @@ async fn env_oidc_allow_fails_when_wrapping_key_retrieval_fails() {
         }],
     );
 
-    mock.with_oidc_policy_create(
-        "session-access-token",
+    mount_personal_ci_project(
+        &project,
+        &mock,
         "vault-policy-key-failure",
-        "acme/repo",
-        "987654321",
-        &["main"],
-        &["preview"],
-        &[".github/workflows/deploy.yml"],
-        &["push"],
+        "session-access-token",
     )
     .await;
 
+    for entry in std::fs::read_dir(project.home().join(".lpm")).unwrap() {
+        let entry = entry.unwrap();
+        if entry
+            .file_name()
+            .to_string_lossy()
+            .starts_with(".env-personal-root-v2-")
+        {
+            std::fs::remove_file(entry.path()).unwrap();
+        }
+    }
     let output = lpm(&project)
         .env("LPM_REGISTRY_URL", mock.url())
         .env(
@@ -5299,6 +5680,7 @@ async fn env_oidc_allow_fails_when_wrapping_key_retrieval_fails() {
             "env",
             "oidc",
             "allow",
+            "--allow-server-decryption",
             "--provider=github",
             "--repo=acme/repo",
             "--repository-id=987654321",
@@ -5323,9 +5705,7 @@ async fn env_oidc_allow_fails_when_wrapping_key_retrieval_fails() {
         "policy success must not be reported before escrow completes: {combined_output}",
     );
     assert!(
-        combined_output.contains("policy may already have been created")
-            && combined_output.contains("CI pulls are not ready")
-            && combined_output.contains("wrapping key storage unavailable"),
+        combined_output.contains("no personal env root key"),
         "expected wrapping-key failure guidance, got: {combined_output}",
     );
 }
@@ -5347,6 +5727,13 @@ async fn env_oidc_allow_and_list_on_refresh_backed_session_then_logout_all_revok
         1,
     )
     .await;
+    mount_personal_ci_project(
+        &project,
+        &mock,
+        "vault-policy-refresh-logout-all-123",
+        "access-from-refresh",
+    )
+    .await;
     mock.with_oidc_policy_create(
         "access-from-refresh",
         "vault-policy-refresh-logout-all-123",
@@ -5358,8 +5745,6 @@ async fn env_oidc_allow_and_list_on_refresh_backed_session_then_logout_all_revok
         &["push"],
     )
     .await;
-    mock.with_escrow_upload_success("access-from-refresh", "vault-policy-refresh-logout-all-123")
-        .await;
     mock.with_oidc_policy_list(
         "access-from-refresh",
         "vault-policy-refresh-logout-all-123",
@@ -5397,6 +5782,7 @@ async fn env_oidc_allow_and_list_on_refresh_backed_session_then_logout_all_revok
             "env",
             "oidc",
             "allow",
+            "--allow-server-decryption",
             "--provider=github",
             "--repo=acme/repo",
             "--repository-id=987654321",
@@ -5509,15 +5895,11 @@ async fn env_oidc_allow_escrow_failure_on_refresh_backed_session_then_logout_rev
         1,
     )
     .await;
-    mock.with_oidc_policy_create(
-        "access-from-refresh",
+    mount_personal_ci_project(
+        &project,
+        &mock,
         "vault-policy-refresh-escrow-logout-123",
-        "acme/repo",
-        "987654321",
-        &["main"],
-        &["preview"],
-        &[".github/workflows/deploy.yml"],
-        &["push"],
+        "access-from-refresh",
     )
     .await;
     mock.with_escrow_upload_failure(
@@ -5563,6 +5945,7 @@ async fn env_oidc_allow_escrow_failure_on_refresh_backed_session_then_logout_rev
             "env",
             "oidc",
             "allow",
+            "--allow-server-decryption",
             "--provider=github",
             "--repo=acme/repo",
             "--repository-id=987654321",
@@ -5585,7 +5968,7 @@ async fn env_oidc_allow_escrow_failure_on_refresh_backed_session_then_logout_rev
         String::from_utf8_lossy(&allow.stderr)
     );
     assert!(!allow_output.contains("OIDC policy set: github"));
-    assert!(allow_output.contains("CI pulls are not ready"));
+    assert!(allow_output.contains("escrow backend unavailable"));
     assert!(allow_output.contains("escrow backend unavailable"));
 
     let credentials_after_refresh = read_credentials(project.home());
@@ -5678,15 +6061,11 @@ async fn env_oidc_allow_escrow_failure_on_refresh_backed_session_then_logout_all
         1,
     )
     .await;
-    mock.with_oidc_policy_create(
-        "access-from-refresh",
+    mount_personal_ci_project(
+        &project,
+        &mock,
         "vault-policy-refresh-escrow-logout-all-123",
-        "acme/repo",
-        "987654321",
-        &["main"],
-        &["preview"],
-        &[".github/workflows/deploy.yml"],
-        &["push"],
+        "access-from-refresh",
     )
     .await;
     mock.with_escrow_upload_failure(
@@ -5732,6 +6111,7 @@ async fn env_oidc_allow_escrow_failure_on_refresh_backed_session_then_logout_all
             "env",
             "oidc",
             "allow",
+            "--allow-server-decryption",
             "--provider=github",
             "--repo=acme/repo",
             "--repository-id=987654321",
@@ -5754,7 +6134,7 @@ async fn env_oidc_allow_escrow_failure_on_refresh_backed_session_then_logout_all
         String::from_utf8_lossy(&allow.stderr)
     );
     assert!(!allow_output.contains("OIDC policy set: github"));
-    assert!(allow_output.contains("CI pulls are not ready"));
+    assert!(allow_output.contains("escrow backend unavailable"));
     assert!(allow_output.contains("escrow backend unavailable"));
 
     let list = lpm(&project)
@@ -5835,6 +6215,13 @@ async fn env_oidc_allow_canonicalizes_env_aliases_before_storing_policy() {
         }],
     );
 
+    mount_personal_ci_project(
+        &project,
+        &mock,
+        "vault-policy-canonical-123",
+        "session-access-token",
+    )
+    .await;
     mock.with_oidc_policy_create(
         "session-access-token",
         "vault-policy-canonical-123",
@@ -5846,8 +6233,6 @@ async fn env_oidc_allow_canonicalizes_env_aliases_before_storing_policy() {
         &["push"],
     )
     .await;
-    mock.with_escrow_upload_success("session-access-token", "vault-policy-canonical-123")
-        .await;
 
     let output = lpm(&project)
         .env("LPM_REGISTRY_URL", mock.url())
@@ -5855,6 +6240,7 @@ async fn env_oidc_allow_canonicalizes_env_aliases_before_storing_policy() {
             "env",
             "oidc",
             "allow",
+            "--allow-server-decryption",
             "--provider=github",
             "--repo=acme/repo",
             "--repository-id=987654321",
