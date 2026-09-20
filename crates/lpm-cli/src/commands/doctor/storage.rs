@@ -4,9 +4,10 @@ use super::check::Check;
 
 pub(super) fn vault_storage_check(backend: lpm_vault::VaultStorageBackend) -> Check {
     match backend {
-        lpm_vault::VaultStorageBackend::MacosKeychain => {
-            Check::pass(&doctor_catalog::VAULT_STORAGE_KEYCHAIN, "macOS Keychain")
-        }
+        lpm_vault::VaultStorageBackend::MacosKeychain => Check::pass(
+            &doctor_catalog::VAULT_STORAGE_KEYCHAIN,
+            "macOS Keychain selected; access not probed",
+        ),
         lpm_vault::VaultStorageBackend::NativeProtected => Check::pass(
             &doctor_catalog::VAULT_STORAGE_NATIVE,
             "native-protected data key",
@@ -17,7 +18,7 @@ pub(super) fn vault_storage_check(backend: lpm_vault::VaultStorageBackend) -> Ch
         ),
         lpm_vault::VaultStorageBackend::NativePreferred => Check::pass(
             &doctor_catalog::VAULT_STORAGE_NATIVE,
-            "native secure store preferred for new vault data",
+            "native secure store preferred for new local secrets; access not established",
         ),
         lpm_vault::VaultStorageBackend::FileFallback => Check::warn(
             &doctor_catalog::VAULT_STORAGE_FALLBACK,

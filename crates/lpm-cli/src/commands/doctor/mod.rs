@@ -1107,7 +1107,21 @@ async fn run_inner(
         }
         println!();
 
-        if failed == 0 && warned == 0 {
+        if fix_failed {
+            let repair_count = fix_report.failed.len();
+            let repair_word = if repair_count == 1 {
+                "repair"
+            } else {
+                "repairs"
+            };
+            println!(
+                "  {} doctor found {}; {} failed {}",
+                "✗".red(),
+                format_doctor_issue_summary_colored(failed, warned),
+                install_ui::red(&repair_count.to_string()),
+                repair_word,
+            );
+        } else if failed == 0 && warned == 0 {
             println!(
                 "  {} All {} checks passed",
                 "✓".green(),

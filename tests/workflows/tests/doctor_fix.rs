@@ -820,6 +820,76 @@ fn doctor_human_summary_reports_failed_repairs() {
     assert!(!output.status.success(), "repair must fail: {text}");
     assert!(text.contains("fix(es) failed"), "{text}");
     assert!(!text.contains("no auto-fixable issues found"), "{text}");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let final_summary = stdout
+        .lines()
+        .rev()
+        .find(|line| line.contains("doctor found"))
+        .expect("final diagnostic summary");
+    assert!(final_summary.contains("1 failed repair"), "{stdout}");
+}
+
+#[tokio::test]
+#[cfg(unix)]
+async fn doctor_failed_plugin_repairs_identify_each_target() {
+    let project = TempProject::empty(r#"{"name":"doctor-plugin-failures","version":"1.0.0"}"#);
+    seed_healthy_hoisted_install(&project);
+    seed_minimal_lockfile(&project);
+    project.write_file(".gitattributes", "lpm.lockb binary\n");
+    let server = MockServer::start().await;
+    for (name, version, route, tag) in [
+        (
+            "biome",
+            "2.5.9",
+            "/repos/biomejs/biome/releases",
+            "@biomejs/biome@99.0.0",
+        ),
+        (
+            "oxlint",
+            "1.79.0",
+            "/repos/oxc-project/oxc/releases",
+            "apps_v99.0.0",
+        ),
+    ] {
+        seed_verified_plugin_with_binary(&project, name, version, b"#!/bin/sh\nexit 0\n");
+        let lock_path = project
+            .home()
+            .join(format!(".lpm/.locks/plugins/operations/{name}.lock"));
+        Mock::given(method("GET"))
+            .and(path(route))
+            .respond_with(move |_request: &wiremock::Request| {
+                // Discovery completed before the update lookup. Fail the repair's lock acquisition.
+                if lock_path.is_file() {
+                    std::fs::remove_file(&lock_path).unwrap();
+                }
+                std::fs::create_dir_all(&lock_path).unwrap();
+                ResponseTemplate::new(200).set_body_json(serde_json::json!([{"tag_name": tag}]))
+            })
+            .expect(1)
+            .mount(&server)
+            .await;
+    }
+    let mut command = lpm_doctor_offline(&project);
+    support::configure_fake_node(&mut command, &project, "22.0.0");
+    let output = command
+        .env("LPM_PLUGIN_GITHUB_API_BASE", server.uri())
+        .args(["--json", "doctor", "--all", "--yes"])
+        .output()
+        .unwrap();
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(!output.status.success());
+    let actions: Vec<_> = report["fixes_failed"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|failure| failure["action"].as_str().unwrap())
+        .collect();
+    assert!(actions.contains(&"lpm plugin update biome"), "{report:#}");
+    assert!(actions.contains(&"lpm plugin update oxlint"), "{report:#}");
+    assert!(
+        !actions.iter().any(|action| action.contains("<name>")),
+        "{report:#}"
+    );
 }
 
 #[test]

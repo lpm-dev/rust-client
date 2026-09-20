@@ -16,6 +16,57 @@ use std::collections::{BTreeMap, HashSet};
 use support::assertions::parse_json_output;
 use support::{TempProject, lpm, lpm_with_registry};
 
+#[test]
+fn doctor_catalog_limits_sigstore_deny_to_verification_rejections() {
+    let project = TempProject::empty(r#"{"name":"doctor-posture","version":"1.0.0"}"#);
+    let output = lpm(&project)
+        .args(["doctor", "list", "--json"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let json = parse_json_output(&output.stdout);
+    let entries = json["entries"].as_array().unwrap();
+    let enforced = entries
+        .iter()
+        .find(|entry| entry["code"] == "sigstore_verify_enforced")
+        .unwrap();
+    let description = enforced["description"].as_str().unwrap();
+    assert!(!description.contains("fail-closed"), "{description}");
+    assert!(
+        description.contains("scope") && description.contains("availability"),
+        "{description}"
+    );
+    let warn = entries
+        .iter()
+        .find(|entry| entry["code"] == "sigstore_verify_warn_mode")
+        .unwrap();
+    let remediation = warn["remediation"].as_str().unwrap();
+    assert!(!remediation.contains("fail-closed"), "{remediation}");
+    assert!(remediation.contains("verifier rejections"), "{remediation}");
+}
+
+#[test]
+fn doctor_catalog_distinguishes_selected_secret_storage_from_access() {
+    let project = TempProject::empty(r#"{"name":"doctor-storage","version":"1.0.0"}"#);
+    let output = lpm(&project)
+        .args(["doctor", "list", "--json"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let json = parse_json_output(&output.stdout);
+    let entries = json["entries"].as_array().unwrap();
+    for code in ["vault_storage_keychain", "vault_storage_native"] {
+        let entry = entries.iter().find(|entry| entry["code"] == code).unwrap();
+        assert_eq!(entry["check"], "Local secret storage");
+        let description = entry["description"].as_str().unwrap();
+        assert!(description.contains("does not"), "{entry}");
+        assert!(
+            description.contains("selected") || description.contains("preferred"),
+            "{entry}"
+        );
+    }
+}
+
 fn read_catalog_codes() -> HashSet<String> {
     let project = TempProject::empty(r#"{"name":"x","version":"1.0.0"}"#);
     let output = lpm(&project)
