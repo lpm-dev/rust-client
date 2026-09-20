@@ -1617,9 +1617,7 @@ pub async fn run(
         capture_consumer_handle = Some(tokio::spawn(async move {
             while let Some(captured) = webhook_rx.recv().await {
                 let webhook = Arc::clone(&captured.webhook);
-                inspector_state_for_consumer
-                    .push_shared(Arc::clone(&webhook))
-                    .await;
+                inspector_state_for_consumer.push_captured(captured).await;
 
                 // Forward to dashboard if active
                 if let Some(ref tx) = dashboard_webhook_tx {

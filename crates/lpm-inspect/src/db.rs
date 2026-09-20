@@ -192,6 +192,27 @@ impl InspectorDb {
         }
     }
 
+    pub(crate) async fn insert_durable_request(
+        &self,
+        webhook: Arc<CapturedWebhook>,
+        session_id: Option<String>,
+    ) -> Result<(), String> {
+        let connection = Arc::clone(&self.control_conn);
+        tokio::task::spawn_blocking(move || {
+            let mut connection = connection
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let transaction = connection
+                .transaction()
+                .map_err(|error| error.to_string())?;
+            insert_request_row(&transaction, &webhook, session_id.as_deref())
+                .map_err(|error| error.to_string())?;
+            transaction.commit().map_err(|error| error.to_string())
+        })
+        .await
+        .map_err(|error| format!("capture persistence task failed: {error}"))?
+    }
+
     #[cfg(test)]
     fn queued_capture_bytes(&self) -> usize {
         self.queued_capture_bytes.load(Ordering::Relaxed)
@@ -752,7 +773,7 @@ fn open_control_connection(path: &Path) -> Result<Connection, rusqlite::Error> {
     let connection = Connection::open(path)?;
     connection.execute_batch(
         "PRAGMA journal_mode=WAL;
-         PRAGMA synchronous=NORMAL;
+         PRAGMA synchronous=FULL;
          PRAGMA foreign_keys=ON;
          PRAGMA busy_timeout=5000;",
     )?;
@@ -1277,7 +1298,7 @@ mod tests {
         assert_eq!(retained, ("retained".into(), false));
     }
 
-    fn make_webhook(id: &str, status: u16) -> CapturedWebhook {
+    pub(super) fn make_webhook(id: &str, status: u16) -> CapturedWebhook {
         CapturedWebhook {
             id: id.to_string(),
             timestamp: "2026-04-06T12:00:00Z".to_string(),
@@ -1921,3 +1942,7 @@ mod tests {
         assert!(error.to_string().contains("database"));
     }
 }
+
+#[cfg(test)]
+#[path = "db/durable_tests.rs"]
+mod durable_tests;

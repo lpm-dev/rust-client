@@ -243,8 +243,8 @@ pub(crate) struct TunnelArgs {
     #[arg(long)]
     pub(crate) tunnel_auth: bool,
 
-    /// Auto-acknowledge webhooks when the local server is down.
-    /// Returns 200 OK to prevent provider retries and endpoint deactivation.
+    /// Save webhooks for replay when local forwarding fails.
+    /// Returns 200 only after durable capture; storage failure or overload returns 503.
     #[arg(long)]
     pub(crate) auto_ack: bool,
 

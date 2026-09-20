@@ -269,6 +269,10 @@ impl InspectorState {
             db.insert_shared_request(Arc::clone(&webhook), session_id.clone());
         }
 
+        self.publish_capture(webhook, session_id).await;
+    }
+
+    async fn publish_capture(&self, webhook: Arc<CapturedWebhook>, session_id: Option<String>) {
         // Broadcast to SSE subscribers (best-effort — if no subscribers, this is a no-op).
         // If the channel is full, lagged subscribers will get an error on next recv.
         let _ = self
@@ -281,6 +285,34 @@ impl InspectorState {
         // Store in ring buffer (evicts oldest if at capacity).
         let mut buf = self.inner.buffer.write().await;
         buf.push_shared(webhook);
+    }
+
+    /// Consume a tunnel capture and confirm durable storage when acknowledgment requires it.
+    pub async fn push_captured(&self, captured: lpm_tunnel::client::CapturedWebhookEvent) {
+        if !captured.requires_persistence() {
+            self.push_shared(Arc::clone(&captured.webhook)).await;
+            return;
+        }
+        let session_id = self
+            .inner
+            .session_id
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        let result = match &self.inner.db {
+            Some(db) => {
+                db.insert_durable_request(Arc::clone(&captured.webhook), session_id.clone())
+                    .await
+            }
+            None => Err("inspector database is unavailable".to_owned()),
+        };
+        if result.is_ok() {
+            self.publish_capture(Arc::clone(&captured.webhook), session_id)
+                .await;
+        } else if let Err(error) = &result {
+            tracing::warn!("auto-ack capture persistence failed: {error}");
+        }
+        captured.complete_persistence(result);
     }
 
     /// Get all requests currently in the buffer (oldest first).

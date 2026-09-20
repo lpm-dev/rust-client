@@ -516,7 +516,7 @@ pub(crate) async fn run_start(
             if print_request_stream {
                 print_tunnel_request(&webhook);
             }
-            inspector_state_consumer.push_shared(webhook).await;
+            inspector_state_consumer.push_captured(captured).await;
         }
     });
 
@@ -622,7 +622,10 @@ pub(crate) async fn run_start(
                 tunnel_detail("session", &session.session_id);
                 tunnel_detail("local", &local_target_url);
                 if auto_ack {
-                    tunnel_detail("auto-ack", "on (200 OK returned when server is down)");
+                    tunnel_detail(
+                        "auto-ack",
+                        "on (200 OK after durable capture on forwarding failure)",
+                    );
                 }
                 if let Some(ref auth) = tunnel_auth_display {
                     tunnel_detail(
