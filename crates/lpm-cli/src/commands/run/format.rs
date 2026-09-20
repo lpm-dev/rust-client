@@ -81,7 +81,9 @@ impl TaskRunReport {
         if failure_count == 0 {
             Ok(())
         } else {
-            Err(LpmError::ExitCode(failure_count as i32))
+            Err(LpmError::ExitCode(
+                failure_count.min(u8::MAX as usize) as i32
+            ))
         }
     }
 }

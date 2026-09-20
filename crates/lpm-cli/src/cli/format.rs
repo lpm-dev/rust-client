@@ -64,6 +64,13 @@ where
 }
 
 pub(super) fn post_parse_error(cli: &Cli) -> Option<clap::Error> {
+    if cli.command.is_none() && cli.json && !cli.version_flag {
+        return Some(Cli::command().error(
+            clap::error::ErrorKind::MissingSubcommand,
+            "a command is required",
+        ));
+    }
+
     if let Some(Commands::Login(args)) = &cli.command
         && args.save_env_token
         && args.token.is_some()
