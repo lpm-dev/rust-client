@@ -44,17 +44,17 @@ fn check_force_security_floor(
 
     let detail = match suspended_count {
         None => "enabled — no `package.json` in current directory, so suspended-approval \
-             count is not available. Run `lpm config unset force-security-floor` to reactivate \
+             count is not available. Run `lpm security unlock floor-edit --global`, then `lpm config unset force-security-floor` to reactivate \
              approvals (any loosening CLI flags are also currently suppressed)."
             .to_string(),
         Some(0) => "enabled — the current project has no approvals in \
              `package.json > lpm > trustedDependencies` to suspend. Run \
-             `lpm config unset force-security-floor` to remove the kill-switch."
+             `lpm security unlock floor-edit --global`, then `lpm config unset force-security-floor` to remove the kill-switch."
             .to_string(),
         Some(n) => format!(
             "enabled — {n} approval(s) in `package.json > lpm > trustedDependencies` \
              are currently suspended (scripts for these packages will NOT run until \
-             the kill-switch is unset). Run `lpm config unset force-security-floor` \
+             the kill-switch is unset). Run `lpm security unlock floor-edit --global`, then `lpm config unset force-security-floor` \
              to reactivate all {n} approval(s) without re-review."
         ),
     };

@@ -336,7 +336,7 @@ pub(crate) fn resolve_script_policy_with_security_for_packages(
     json_output: bool,
     packages: &[String],
 ) -> Result<ScriptPolicy, lpm_common::LpmError> {
-    let global = GlobalConfig::load();
+    let global = GlobalConfig::load_checked()?;
     let user = global
         .get_str("script-policy")
         .and_then(|s| ScriptPolicy::parse(s).ok());

@@ -2332,3 +2332,117 @@ fn config_list_honors_only_matching_project_script_unlocks() {
         }
     }
 }
+
+#[test]
+fn invalid_user_trust_policy_fails_empty_install_and_effective_report() {
+    for value in ["\"no-downgrad\"", "true", "1", "[]", "{}"] {
+        let project = TempProject::empty(r#"{"name":"trust-policy-input","version":"1.0.0"}"#);
+        seed_config(&project, &format!("trust-policy = {value}\n"));
+        for args in [
+            vec!["install", "--offline", "--json"],
+            vec!["config", "list", "--json"],
+        ] {
+            let output = lpm(&project).args(&args).output().unwrap();
+            let envelope = assertions::parse_json_output(&output.stdout);
+            assert!(
+                !output.status.success(),
+                "invalid trust policy accepted by {args:?}: {value}: {envelope}"
+            );
+            let error = envelope["error"].as_str().unwrap();
+            assert!(
+                error.contains("trust-policy") && error.contains("config.toml"),
+                "{envelope}"
+            );
+        }
+        assert!(!project.path().join("node_modules").exists());
+    }
+}
+
+#[test]
+fn malformed_force_floor_fails_install_and_config_mutations() {
+    for value in ["\"treu\"", "1", "[]", "{}"] {
+        let project = TempProject::empty(r#"{"name":"floor-input","version":"1.0.0"}"#);
+        let configuration = format!("force-security-floor = {value}\n");
+        seed_config(&project, &configuration);
+        for args in [
+            vec!["install", "--offline", "--json"],
+            vec!["config", "list", "--json"],
+            vec!["config", "set", "save-prefix", "~", "--json"],
+        ] {
+            let output = lpm(&project).args(&args).output().unwrap();
+            let envelope = assertions::parse_json_output(&output.stdout);
+            assert!(
+                !output.status.success(),
+                "malformed floor accepted by {args:?}: {value}: {envelope}"
+            );
+            assert!(
+                envelope["error"].as_str().is_some_and(
+                    |s| s.contains("force-security-floor") && s.contains("config.toml")
+                ),
+                "{envelope}"
+            );
+            assert_eq!(
+                std::fs::read_to_string(config_path(&project)).unwrap(),
+                configuration
+            );
+        }
+    }
+}
+
+#[test]
+fn malformed_force_floor_fails_direct_rebuild_even_with_deny_all() {
+    let project = TempProject::empty(r#"{"name":"floor-rebuild","version":"1.0.0"}"#);
+    seed_config(&project, "force-security-floor = \"treu\"\n");
+    let output = lpm(&project)
+        .args(["rebuild", "--deny-all", "--json"])
+        .output()
+        .unwrap();
+    let envelope = assertions::parse_json_output(&output.stdout);
+    assert!(
+        !output.status.success(),
+        "malformed force floor accepted: {envelope}"
+    );
+    assert!(
+        envelope["error"]
+            .as_str()
+            .is_some_and(|s| s.contains("force-security-floor")),
+        "{envelope}"
+    );
+}
+
+#[test]
+fn true_force_floor_aliases_do_not_require_weakening_approval() {
+    for alias in ["true", "1", "yes", "on", "enabled"] {
+        let project = TempProject::empty(r#"{"name":"floor-alias","version":"1.0.0"}"#);
+        seed_config(&project, "force-security-floor = true\n");
+        let output = lpm(&project)
+            .args(["config", "set", "force-security-floor", alias, "--json"])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "true alias {alias} rejected: {}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+    }
+}
+
+#[test]
+fn valid_or_absent_security_controls_preserve_empty_install_behavior() {
+    for configuration in [
+        "",
+        "trust-policy = \"off\"\nforce-security-floor = false\n",
+        "trust-policy = \"no-downgrade\"\nforce-security-floor = \"disabled\"\n",
+    ] {
+        let project = TempProject::empty(r#"{"name":"security-defaults","version":"1.0.0"}"#);
+        seed_config(&project, configuration);
+        lpm(&project)
+            .args(["install", "--offline", "--json"])
+            .assert()
+            .success();
+        lpm(&project)
+            .args(["config", "list", "--json"])
+            .assert()
+            .success();
+    }
+}

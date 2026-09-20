@@ -259,6 +259,7 @@ async fn run_under_store_lock(
     emit_summary: bool,
     policy_project_dir: &Path,
 ) -> Result<RebuildRunReport, LpmError> {
+    let global_config = crate::commands::config::GlobalConfig::load_checked()?;
     let cancelled = crate::install_recovery::cancellation_flag();
     crate::security_floor::clear_recorded_suppressions();
     // Defense-in-depth on the sandbox flag pair. The CLI boundary
@@ -281,7 +282,7 @@ async fn run_under_store_lock(
         crate::script_policy_config::ScriptPolicyConfig::try_from_package_json(policy_project_dir)?;
     if deny_all || project_config.deny_all {
         if json_output {
-            let force_floor = crate::commands::config::GlobalConfig::load()
+            let force_floor = global_config
                 .get_bool("force-security-floor")
                 .unwrap_or(false);
             let mut report = if dry_run {
@@ -326,7 +327,6 @@ async fn run_under_store_lock(
     // match becomes [`TrustReason::SuspendedByForceFloor`]); the
     // summary below emits a single warning if any approvals were
     // suspended so the user can discover the flag is active.
-    let global_config = crate::commands::config::GlobalConfig::load();
     let force_security_floor = global_config
         .get_bool("force-security-floor")
         .unwrap_or(false);
@@ -509,7 +509,7 @@ async fn run_under_store_lock(
             install_ui::warn_untrusted(&format!(
                 "{suspended_count} approval(s) suspended by \
                  `force-security-floor = true` in ~/.lpm/config.toml. \
-                 Run `lpm config unset force-security-floor` to reactivate."
+                 Run `lpm security unlock floor-edit --global`, then `lpm config unset force-security-floor` to reactivate."
             ));
         }
     }
