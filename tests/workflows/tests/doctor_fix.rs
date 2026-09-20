@@ -846,3 +846,173 @@ fn doctor_does_not_substitute_an_installed_tool_for_an_unavailable_pin() {
         "{report}"
     );
 }
+
+#[cfg(unix)]
+fn doctor_report_after_manifest_repair(
+    member_a: &str,
+    member_b: &str,
+    changed_path: &str,
+    replacement: &str,
+    formatter_exit: u8,
+) -> serde_json::Value {
+    let project = TempProject::empty(
+        r#"{"name":"doctor-refresh","version":"1.0.0","private":true,"workspaces":["packages/*"]}"#,
+    );
+    project.write_file("packages/a/package.json", member_a);
+    project.write_file("packages/b/package.json", member_b);
+    project.write_file(".gitattributes", "lpm.lockb binary\n");
+    project.write_file("lpm.json", r#"{"tools":{"biome":"2.5.9"}}"#);
+    seed_healthy_hoisted_install(&project);
+    seed_minimal_lockfile(&project);
+    let formatter = format!(
+        "#!/bin/sh\nif [ \"$2\" = \"--check\" ]; then exit 2; fi\nif [ \"$3\" != \"--write\" ]; then\n  if [ -f format-applied ]; then exit 0; fi\n  exit 1\nfi\nprintf '%s\\n' '{replacement}' > '{changed_path}'\nprintf 'applied' > format-applied\nexit {formatter_exit}\n"
+    );
+    seed_verified_plugin_with_binary(&project, "biome", "2.5.9", formatter.as_bytes());
+    let mut command = lpm_doctor_offline(&project);
+    support::configure_fake_node(&mut command, &project, "22.0.0");
+    let output = command
+        .env("LPM_PLUGIN_GITHUB_API_BASE", "http://127.0.0.1:1")
+        .args(["--json", "doctor", "--all", "--fix", "--yes"])
+        .output()
+        .unwrap();
+    let report: serde_json::Value =
+        serde_json::from_slice(&output.stdout).unwrap_or_else(|error| {
+            panic!(
+                "invalid doctor report: {error}; stdout={}; stderr={}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            )
+        });
+    assert!(project.file_exists("format-applied"), "{report:#}");
+    assert_eq!(project.read_file(changed_path).trim(), replacement);
+    assert_eq!(
+        report["fixes_applied"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|action| action == "lpm fmt"),
+        formatter_exit == 0,
+        "{report:#}"
+    );
+    if formatter_exit == 0 {
+        assert_eq!(report["fixes_failed"], serde_json::json!([]));
+    } else {
+        assert!(!output.status.success());
+        assert!(
+            report["fixes_failed"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|failure| failure["action"] == "lpm fmt"),
+            "{report:#}"
+        );
+    }
+    assert!(
+        report["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|check| check["code"] == "fmt_clean")
+    );
+    report
+}
+
+#[test]
+#[cfg(unix)]
+fn doctor_repairs_refresh_workspace_member_dependencies_before_the_final_report() {
+    let report = doctor_report_after_manifest_repair(
+        r#"{"name":"a","version":"1.0.0","dependencies":{"b":"workspace:*"}}"#,
+        r#"{"name":"b","version":"1.0.0","dependencies":{"a":"workspace:*"}}"#,
+        "packages/b/package.json",
+        r#"{"name":"b","version":"1.0.0"}"#,
+        0,
+    );
+    let checks = report["checks"].as_array().unwrap();
+    assert!(
+        checks
+            .iter()
+            .any(|check| check["code"] == "workspace_acyclic"),
+        "{report:#}"
+    );
+    assert!(
+        !checks
+            .iter()
+            .any(|check| check["code"] == "workspace_cycle"),
+        "{report:#}"
+    );
+}
+
+#[test]
+#[cfg(unix)]
+fn doctor_repairs_refresh_the_root_manifest_before_the_final_report() {
+    let report = doctor_report_after_manifest_repair(
+        r#"{"name":"a","version":"1.0.0"}"#,
+        r#"{"name":"b","version":"1.0.0"}"#,
+        "package.json",
+        r#"{"name":"doctor-refresh","version":"1.0.0","private":true,"workspaces":["packages/*"],"dependencies":{"added":"1.0.0"}}"#,
+        0,
+    );
+    let checks = report["checks"].as_array().unwrap();
+    assert!(
+        checks
+            .iter()
+            .any(|check| check["code"] == "deps_sync_drift"),
+        "{report:#}"
+    );
+    assert!(
+        !checks
+            .iter()
+            .any(|check| check["code"] == "deps_sync_clean"),
+        "{report:#}"
+    );
+}
+
+#[test]
+#[cfg(unix)]
+fn doctor_repairs_rediscover_a_workspace_after_an_initial_discovery_error() {
+    let report = doctor_report_after_manifest_repair(
+        r#"{"name":"duplicate","version":"1.0.0"}"#,
+        r#"{"name":"duplicate","version":"1.0.0"}"#,
+        "packages/b/package.json",
+        r#"{"name":"b","version":"1.0.0"}"#,
+        0,
+    );
+    let checks = report["checks"].as_array().unwrap();
+    assert!(
+        checks
+            .iter()
+            .any(|check| check["code"] == "workspace_acyclic"),
+        "{report:#}"
+    );
+    assert!(
+        !checks
+            .iter()
+            .any(|check| check["code"] == "workspace_discovery_failed"),
+        "{report:#}"
+    );
+}
+
+#[test]
+#[cfg(unix)]
+fn doctor_failed_repairs_refresh_manifests_and_retain_the_failed_action() {
+    let report = doctor_report_after_manifest_repair(
+        r#"{"name":"a","version":"1.0.0","dependencies":{"b":"workspace:*"}}"#,
+        r#"{"name":"b","version":"1.0.0","dependencies":{"a":"workspace:*"}}"#,
+        "packages/b/package.json",
+        r#"{"name":"b","version":"1.0.0"}"#,
+        1,
+    );
+    let checks = report["checks"].as_array().unwrap();
+    assert!(
+        checks
+            .iter()
+            .any(|check| check["code"] == "workspace_acyclic"),
+        "{report:#}"
+    );
+    assert!(
+        !checks
+            .iter()
+            .any(|check| check["code"] == "workspace_cycle"),
+        "{report:#}"
+    );
+}

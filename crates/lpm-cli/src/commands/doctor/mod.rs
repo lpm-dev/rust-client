@@ -217,7 +217,7 @@ pub fn list(
 ///
 /// - **Fast (default `lpm doctor`):** local-only "why is this project
 ///   broken right now?" pass. Zero network calls. Zero subprocess
-///   spawns except `node --version` (2s-bounded) for runtime detection.
+///   spawns except bounded `node --version` and `bun --version` probes.
 ///   Covers global store accessibility, `package.json`, linker mode,
 ///   `node_modules` layout, lockfile health, deps sync, local
 ///   `file:` / `link:` source paths, `lpm.json` validity, Node
@@ -241,27 +241,40 @@ pub async fn run(
     fix: bool,
     yes: bool,
 ) -> Result<(), LpmError> {
-    let (workspace, workspace_discovery_error) =
-        match lpm_workspace::discover_workspace(project_dir) {
-            Ok(workspace) => (workspace.map(std::sync::Arc::new), None),
-            Err(error) => (None, Some(error.to_string())),
-        };
-    crate::workspace_discovery_cache::scope_discovery(
-        project_dir,
-        workspace,
-        run_inner(
-            client,
-            registry_url,
+    let mut fix_report = None;
+    loop {
+        let (workspace, workspace_discovery_error) =
+            match lpm_workspace::discover_workspace(project_dir) {
+                Ok(workspace) => (workspace.map(std::sync::Arc::new), None),
+                Err(error) => (None, Some(error.to_string())),
+            };
+        let apply_fixes = fix && fix_report.is_none();
+        let outcome = crate::workspace_discovery_cache::scope_discovery(
             project_dir,
-            json_output,
-            all,
-            fix,
-            yes,
-            None,
-            workspace_discovery_error.as_deref(),
-        ),
-    )
-    .await
+            workspace,
+            run_inner(
+                client,
+                registry_url,
+                project_dir,
+                json_output,
+                all,
+                apply_fixes,
+                yes,
+                fix_report.take(),
+                workspace_discovery_error.as_deref(),
+            ),
+        )
+        .await?;
+        match outcome {
+            DiagnosticPass::Complete => return Ok(()),
+            DiagnosticPass::Recheck(report) => fix_report = Some(report),
+        }
+    }
+}
+
+enum DiagnosticPass {
+    Complete,
+    Recheck(self::fix::FixReport),
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -275,7 +288,7 @@ async fn run_inner(
     yes: bool,
     fix_report: Option<self::fix::FixReport>,
     workspace_discovery_error: Option<&str>,
-) -> Result<(), LpmError> {
+) -> Result<DiagnosticPass, LpmError> {
     let mut checks: Vec<Check> = Vec::new();
     let loaded_global_config = crate::commands::config::GlobalConfig::load_checked();
     let global_config_error = loaded_global_config.as_ref().err().map(ToString::to_string);
@@ -972,18 +985,7 @@ async fn run_inner(
 
     if fix && self::fix::confirm_before_apply(&checks, json_output, yes)? {
         let report = self::fix::apply(&checks, client, project_dir, json_output).await;
-        return Box::pin(run_inner(
-            client,
-            registry_url,
-            project_dir,
-            json_output,
-            all,
-            false,
-            true,
-            Some(report),
-            workspace_discovery_error,
-        ))
-        .await;
+        return Ok(DiagnosticPass::Recheck(report));
     }
     let fix_report = fix_report.unwrap_or_default();
     let fix_failed = !fix_report.failed.is_empty();
@@ -1140,7 +1142,7 @@ async fn run_inner(
         return Err(LpmError::ExitCode(1));
     }
 
-    Ok(())
+    Ok(DiagnosticPass::Complete)
 }
 
 fn check_store_accessibility() -> Result<String, String> {
