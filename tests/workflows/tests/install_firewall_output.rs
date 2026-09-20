@@ -174,3 +174,56 @@ async fn firewall_headings_use_plural_packages_for_multiple_verdicts() {
         }
     }
 }
+
+#[tokio::test]
+async fn firewall_monitor_continues_after_oidc_exchange_failure_but_enforce_stops() {
+    for status in [401, 503] {
+        for mode in ["monitor", "enforce"] {
+            let mock = MockRegistry::start().await;
+            mock.with_package(
+                "firewall-oidc",
+                "1.0.0",
+                &make_tarball("firewall-oidc", "1.0.0"),
+            )
+            .await;
+            Mock::given(method("POST"))
+                .and(path("/api/registry/-/token/oidc"))
+                .respond_with(
+                    ResponseTemplate::new(status).set_body_json(serde_json::json!({
+                        "error": "OIDC exchange unavailable"
+                    })),
+                )
+                .expect(1)
+                .mount(mock.server())
+                .await;
+            let project =
+                TempProject::empty(r#"{"name":"firewall-oidc-consumer","version":"1.0.0"}"#);
+            write_npm_firewall_global_config(&project, mode);
+            let output = lpm_with_registry(&project, &mock.url())
+                .env("LPM_OIDC_TOKEN", "unusable-ci-assertion")
+                .args([
+                    "install",
+                    "firewall-oidc@1.0.0",
+                    "--no-skills",
+                    "--no-editor-setup",
+                ])
+                .output()
+                .unwrap();
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert_eq!(
+                output.status.success(),
+                mode == "monitor",
+                "{mode}/{status}: {stderr}"
+            );
+            assert_eq!(
+                project
+                    .path()
+                    .join("node_modules/firewall-oidc/package.json")
+                    .is_file(),
+                mode == "monitor",
+                "{mode}/{status}: {stderr}",
+            );
+            assert!(stderr.contains("OIDC"), "{stderr}");
+        }
+    }
+}

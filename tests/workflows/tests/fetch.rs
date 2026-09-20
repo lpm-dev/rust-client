@@ -1013,3 +1013,47 @@ async fn fetch_downloads_shared_contextual_artifact_once_and_reports_each_instan
         1
     );
 }
+
+#[tokio::test]
+async fn fetch_firewall_monitor_continues_after_oidc_exchange_failure_but_enforce_stops() {
+    for status in [401, 503] {
+        for mode in ["monitor", "enforce"] {
+            let mock = MockRegistry::start().await;
+            mount_ms(&mock).await;
+            let lockfile = seed_lockfile(&mock).await;
+            let project = project_with_lockfile(&lockfile);
+            rewrite_lockfile_registry_sources_to_public_npm(&project);
+            write_npm_firewall_global_config(&project, mode);
+            Mock::given(method("POST"))
+                .and(path("/api/registry/-/token/oidc"))
+                .respond_with(
+                    ResponseTemplate::new(status).set_body_json(serde_json::json!({
+                        "error": "OIDC exchange unavailable"
+                    })),
+                )
+                .expect(1)
+                .mount(mock.server())
+                .await;
+            let before = mock.tarball_request_count("ms", "2.1.3").await;
+            let output = lpm_with_registry(&project, &mock.url())
+                .env("LPM_OIDC_TOKEN", "unusable-ci-assertion")
+                .arg("fetch")
+                .output()
+                .unwrap();
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert_eq!(
+                output.status.success(),
+                mode == "monitor",
+                "{mode}/{status}: {stderr}"
+            );
+            assert_eq!(
+                package_object_dir(&project, "ms", "2.1.3").is_dir(),
+                mode == "monitor"
+            );
+            if mode == "enforce" {
+                assert_eq!(mock.tarball_request_count("ms", "2.1.3").await, before);
+            }
+            assert!(stderr.contains("OIDC"), "{stderr}");
+        }
+    }
+}
