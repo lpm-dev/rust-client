@@ -402,6 +402,10 @@ async fn publish_dry_run_executes_publish_lifecycle_scripts_in_npm_order() {
         project.read_file("lifecycle.log"),
         "prepublishOnly\nprepack\nprepare\npostpack\npublish\npostpublish\n",
     );
+    assert!(
+        !String::from_utf8_lossy(&output.stderr).contains("no changes will be made"),
+        "dry-run must not promise unchanged files after executing lifecycle scripts",
+    );
 }
 
 #[tokio::test]

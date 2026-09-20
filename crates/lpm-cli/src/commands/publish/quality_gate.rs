@@ -51,17 +51,17 @@ mod tests {
     }
 
     #[test]
-    fn score_immediately_below_80_fails_the_default_threshold() {
+    fn score_immediately_below_80_fails_an_explicit_threshold_of_80() {
         assert!(enforce_minimum_score(&result(79), 80).is_err());
     }
 
     #[test]
-    fn score_at_80_passes_the_default_threshold() {
+    fn score_at_80_passes_an_explicit_threshold_of_80() {
         enforce_minimum_score(&result(80), 80).unwrap();
     }
 
     #[test]
-    fn score_immediately_above_80_passes_the_default_threshold() {
+    fn score_immediately_above_80_passes_an_explicit_threshold_of_80() {
         enforce_minimum_score(&result(81), 80).unwrap();
     }
 }
