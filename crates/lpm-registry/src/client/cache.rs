@@ -1,5 +1,9 @@
 use super::*;
 
+mod write_buffer;
+
+use write_buffer::{BufferLimit, MetadataCacheBuffer};
+
 pub(super) const METADATA_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(300);
 
 /// Max bytes accepted from a single on-disk metadata cache entry.
@@ -15,6 +19,8 @@ pub(super) const METADATA_CACHE_FILE_CAP: u64 = 100 * 1024 * 1024;
 const METADATA_CACHE_ETAG_LINE_CAP: u64 = 8 * 1024;
 const METADATA_CACHE_FRESHNESS_LINE_CAP: u64 = 20;
 pub(super) const MAX_PENDING_METADATA_CACHE_BYTES: usize = 128 * 1024 * 1024;
+// MessagePack reserves 0xc1, so older readers treat JSON fallback entries as misses.
+const METADATA_CACHE_JSON_MARKER: u8 = 0xc1;
 
 /// Magic header for the manifest cache file format. Replaces the
 /// per-payload HMAC-SHA256 that used to run on every write. The cache
@@ -60,11 +66,9 @@ pub(super) fn ensure_private_metadata_cache_dir(path: &std::path::Path) -> std::
 
 fn write_metadata_cache_file(
     path: &std::path::Path,
-    content: &[u8],
+    content: &MetadataCacheBuffer,
     fresh_for: std::time::Duration,
 ) -> std::io::Result<()> {
-    use std::io::Write as _;
-
     let parent = path.parent().ok_or_else(|| {
         std::io::Error::new(std::io::ErrorKind::InvalidInput, "cache path has no parent")
     })?;
@@ -79,7 +83,7 @@ fn write_metadata_cache_file(
     }
     match options.open(path) {
         Ok(mut file) => {
-            file.write_all(content)?;
+            content.write_to(&mut file)?;
             set_metadata_cache_file_expiry(&file, fresh_for)?;
             return Ok(());
         }
@@ -88,7 +92,7 @@ fn write_metadata_cache_file(
     }
 
     let mut file = tempfile::NamedTempFile::new_in(parent)?;
-    file.write_all(content)?;
+    content.write_to(&mut file)?;
     set_metadata_cache_file_expiry(file.as_file(), fresh_for)?;
     file.persist(path).map(|_| ()).map_err(|error| error.error)
 }
@@ -738,7 +742,7 @@ impl RegistryClient {
         file: std::fs::File,
         file_metadata: &std::fs::Metadata,
     ) -> Option<(T, Option<String>, std::time::Duration)> {
-        use std::io::Read as _;
+        use std::io::{BufRead as _, Read as _};
 
         if file_metadata.len() > METADATA_CACHE_FILE_CAP {
             tracing::warn!(
@@ -760,7 +764,12 @@ impl RegistryClient {
         }
         let (fresh_for, etag) = read_metadata_cache_header(&mut reader)?;
 
-        let value: T = rmp_serde::decode::from_read(&mut reader).ok()?;
+        let value: T = if reader.fill_buf().ok()?.first() == Some(&METADATA_CACHE_JSON_MARKER) {
+            reader.consume(1);
+            serde_json::from_reader(&mut reader).ok()?
+        } else {
+            rmp_serde::decode::from_read(&mut reader).ok()?
+        };
         Some((value, etag, fresh_for))
     }
 
@@ -935,6 +944,7 @@ impl RegistryClient {
         etag: Option<&str>,
         directive: MetadataCacheDirective,
     ) -> Option<std::time::Duration> {
+        use std::io::Write as _;
         use std::sync::atomic::Ordering;
 
         let fresh_for = match directive.local_freshness() {
@@ -963,23 +973,55 @@ impl RegistryClient {
             .unwrap_or("");
         let freshness = fresh_for.as_secs().to_string();
         let prefix_len = METADATA_CACHE_MAGIC.len() + freshness.len() + 1 + etag_str.len() + 1;
-        let mut content = Vec::with_capacity(prefix_len + 4096);
-        content.extend_from_slice(METADATA_CACHE_MAGIC);
-        content.extend_from_slice(freshness.as_bytes());
-        content.push(b'\n');
-        content.extend_from_slice(etag_str.as_bytes());
-        content.push(b'\n');
-
+        let new_buffer = || {
+            MetadataCacheBuffer::new(
+                &self.pending_cache_write_bytes,
+                &[
+                    METADATA_CACHE_MAGIC,
+                    freshness.as_bytes(),
+                    b"\n",
+                    etag_str.as_bytes(),
+                    b"\n",
+                ],
+            )
+        };
+        let skip_exhausted = |limit| match limit {
+            BufferLimit::Budget => {
+                self.metadata_cache_mutation(&path)
+                    .revision
+                    .fetch_add(1, Ordering::AcqRel);
+                tracing::debug!(
+                    "skipping best-effort metadata cache write because the allocation budget is full"
+                );
+                Some(fresh_for)
+            }
+            BufferLimit::FileSize => None,
+        };
+        let mut content = match new_buffer() {
+            Ok(content) => content,
+            Err(limit) => return skip_exhausted(limit),
+        };
         if let Err(messagepack_error) = rmp_serde::encode::write_named(&mut content, metadata) {
-            content.truncate(prefix_len);
+            if let Some(limit) = content.exhausted() {
+                return skip_exhausted(limit);
+            }
+            drop(content);
+            content = match new_buffer() {
+                Ok(content) => content,
+                Err(limit) => return skip_exhausted(limit),
+            };
+            content.write_all(&[METADATA_CACHE_JSON_MARKER]).ok()?;
             if let Err(json_error) = serde_json::to_writer(&mut content, metadata) {
+                if let Some(limit) = content.exhausted() {
+                    return skip_exhausted(limit);
+                }
                 tracing::warn!(
                     "metadata cache serialization failed for {key}: MessagePack: {messagepack_error}; JSON: {json_error}"
                 );
                 return None;
             }
         }
-        if content.len() == prefix_len || content.len() as u64 > METADATA_CACHE_FILE_CAP {
+        if content.len() == prefix_len {
             return None;
         }
 
@@ -1000,19 +1042,8 @@ impl RegistryClient {
             return Some(fresh_for);
         }
 
-        let Some(reservation) = reserve_pending_metadata_cache_bytes(
-            &self.pending_cache_write_bytes,
-            content.capacity(),
-        ) else {
-            tracing::debug!(
-                bytes = content.capacity(),
-                "skipping best-effort metadata cache write because the queued-byte budget is full"
-            );
-            return Some(fresh_for);
-        };
         let handle = runtime_handle.unwrap();
         let join = handle.spawn_blocking(move || {
-            let _reservation = reservation;
             let _operation = mutation
                 .operation
                 .lock()
@@ -1097,6 +1128,80 @@ impl RegistryClient {
 #[cfg(test)]
 mod pending_write_budget_tests {
     use super::*;
+
+    #[tokio::test]
+    async fn exhausted_cache_budget_skips_serialization_before_allocating_a_buffer() {
+        struct CountSerialization(std::sync::atomic::AtomicUsize);
+        impl serde::Serialize for CountSerialization {
+            fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+                self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                serializer.serialize_str("metadata")
+            }
+        }
+        let cache_dir = tempfile::tempdir().unwrap();
+        let mut client = RegistryClient::new().with_cache_dir(Some(cache_dir.path().into()));
+        client.pending_cache_write_bytes = Arc::new(tokio::sync::Semaphore::new(1024));
+        let metadata = CountSerialization(std::sync::atomic::AtomicUsize::new(0));
+
+        client.write_metadata_cache("no-admission", &metadata, None);
+        client.flush_pending_cache_writes().await;
+
+        assert_eq!(metadata.0.load(std::sync::atomic::Ordering::Relaxed), 0);
+        assert!(!client.cache_path("no-admission").unwrap().exists());
+        assert_eq!(client.pending_cache_write_bytes.available_permits(), 1024);
+    }
+
+    #[tokio::test]
+    async fn cache_buffer_growth_exhaustion_does_not_retry_json_serialization() {
+        struct LargeSerialization(std::sync::atomic::AtomicUsize);
+        impl serde::Serialize for LargeSerialization {
+            fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+                self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                serializer.serialize_bytes(&[0x5a; 8192])
+            }
+        }
+        let cache_dir = tempfile::tempdir().unwrap();
+        let mut client = RegistryClient::new().with_cache_dir(Some(cache_dir.path().into()));
+        client.pending_cache_write_bytes = Arc::new(tokio::sync::Semaphore::new(8192));
+        let metadata = LargeSerialization(std::sync::atomic::AtomicUsize::new(0));
+
+        client.write_metadata_cache("growth-denied", &metadata, None);
+        client.flush_pending_cache_writes().await;
+
+        assert_eq!(metadata.0.load(std::sync::atomic::Ordering::Relaxed), 1);
+        assert!(!client.cache_path("growth-denied").unwrap().exists());
+        assert_eq!(client.pending_cache_write_bytes.available_permits(), 8192);
+    }
+
+    #[tokio::test]
+    async fn genuine_messagepack_failure_preserves_json_cache_fallback() {
+        struct JsonOnly;
+        impl serde::Serialize for JsonOnly {
+            fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+                if !serializer.is_human_readable() {
+                    return Err(serde::ser::Error::custom(
+                        "requires a human-readable format",
+                    ));
+                }
+                serializer.serialize_str("json fallback")
+            }
+        }
+        let cache_dir = tempfile::tempdir().unwrap();
+        let client = RegistryClient::new().with_cache_dir(Some(cache_dir.path().into()));
+
+        client.write_metadata_cache("json-fallback", &JsonOnly, Some("\"v1\""));
+        client.flush_pending_cache_writes().await;
+
+        let (value, etag) = client
+            .read_metadata_cache_as::<String>("json-fallback")
+            .unwrap();
+        assert_eq!(value, "json fallback");
+        assert_eq!(etag.as_deref(), Some("\"v1\""));
+        assert_eq!(
+            client.pending_cache_write_bytes.available_permits(),
+            MAX_PENDING_METADATA_CACHE_BYTES
+        );
+    }
 
     #[tokio::test]
     async fn queued_metadata_cache_write_budget_covers_spare_buffer_capacity() {
