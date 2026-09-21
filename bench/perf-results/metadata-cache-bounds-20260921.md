@@ -77,6 +77,7 @@ Six order permutations plus two opposite orders gave every binary pair four runs
 
 The exact original binary no longer reproduced its historical 1919.5 ms median in this run.
 Current #862 was faster than the original in four of eight rounds.
+All 24 replay installs selected identical packages and versions, with matching reported peer, override, patch, and blocked-script metadata.
 These results do not establish a source regression from the intervening corrections.
 They also do not establish the cause of the historical timing change.
 The original and current traces retain identical request counts and graph-work counts. The extra hydration corrections do not activate for T3.
