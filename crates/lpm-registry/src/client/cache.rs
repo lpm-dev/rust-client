@@ -636,11 +636,11 @@ impl RegistryClient {
     /// Returns `(PackageMetadata, Option<etag>)`. The ETag (if present) can be
     /// sent as `If-None-Match` on the next request to enable 304 responses.
     ///
-    /// Cache format (v5): `LPM-MD-V6\n{freshness_seconds}\n{ETag}\n{binary_data}`
+    /// Cache format (v6): `LPM-MD-V6\n{freshness_seconds}\n{ETag}\n{payload}`
     /// - Bytes 0..MAGIC.len(): magic header (ends in `\n`)
     /// - After magic, up to next `\n`: local freshness in seconds
     /// - Next line: ETag string (empty if absent)
-    /// - Remainder: named MessagePack-serialized PackageMetadata
+    /// - Remainder: named MessagePack, or `0xc1` followed by JSON after an encoding failure
     ///
     /// Old cache files written in the `HMAC\nETag\ndata` format fail the
     /// magic check and are silently treated as misses — the next fetch
