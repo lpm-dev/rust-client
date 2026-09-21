@@ -1058,6 +1058,10 @@ async fn run_with_options_under_store_lock(
         || Arc::new(Semaphore::new(max_concurrent_downloads())),
         |coordinator| coordinator.fetch_semaphore(),
     );
+    let v2_streaming_lane = workspace_materialization.as_ref().map_or_else(
+        || Arc::new(V2StreamingLane::default()),
+        |coordinator| coordinator.v2_streaming_lane(),
+    );
     let fetch_extract_limiter = workspace_materialization.as_ref().map_or_else(
         || configured_fetch_extract_limiter(requested_v2_mode),
         |coordinator| coordinator.fetch_extract_limiter(requested_v2_mode),
@@ -1308,6 +1312,7 @@ async fn run_with_options_under_store_lock(
         store_v2_handle: store_v2_handle.clone(),
         fetch_semaphore: fetch_semaphore.clone(),
         fetch_extract_limiter: fetch_extract_limiter.clone(),
+        v2_streaming_lane: v2_streaming_lane.clone(),
         fetch_coord: fetch_coord.clone(),
         gate_stats: gate_stats.clone(),
         npm_firewall_mode,
@@ -1500,6 +1505,7 @@ async fn run_with_options_under_store_lock(
         store_v2_handle: store_v2_handle.clone(),
         fetch_semaphore,
         fetch_extract_limiter,
+        v2_streaming_lane,
         fetch_coord,
         install_accounting,
         speculation_join,
