@@ -1,11 +1,9 @@
-use std::io::{self, IoSlice, Write};
+use std::io::{self, Write};
 use std::sync::Arc;
 
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use super::{METADATA_CACHE_FILE_CAP, reserve_pending_metadata_cache_bytes};
-
-const CHUNK_BYTES: usize = 64 * 1024;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum BufferLimit {
@@ -14,13 +12,10 @@ pub(super) enum BufferLimit {
 }
 
 pub(super) struct MetadataCacheBuffer {
-    first: Vec<u8>,
-    chunks: Vec<Vec<u8>>,
+    bytes: Vec<u8>,
     budget: Arc<Semaphore>,
     reservation: OwnedSemaphorePermit,
     file_limit: usize,
-    payload_capacity: usize,
-    len: usize,
     exhausted: Option<BufferLimit>,
 }
 
@@ -43,25 +38,22 @@ impl MetadataCacheBuffer {
         let capacity = len.saturating_add(4096).min(file_limit);
         let reservation =
             reserve_pending_metadata_cache_bytes(budget, capacity).ok_or(BufferLimit::Budget)?;
-        let mut first = Vec::with_capacity(capacity);
+        let mut bytes = Vec::with_capacity(capacity);
         for part in prefix {
-            first.extend_from_slice(part);
+            bytes.extend_from_slice(part);
         }
         Ok(Self {
-            first,
-            chunks: Vec::new(),
+            bytes,
             budget: Arc::clone(budget),
             reservation,
             file_limit,
-            payload_capacity: capacity,
-            len,
             exhausted: None,
         })
     }
 
     #[inline]
     pub(super) fn len(&self) -> usize {
-        self.len
+        self.bytes.len()
     }
 
     pub(super) fn exhausted(&self) -> Option<BufferLimit> {
@@ -76,100 +68,55 @@ impl MetadataCacheBuffer {
         })
     }
 
-    fn add_chunk(&mut self) -> io::Result<()> {
-        let tail_capacity = self.chunks.last().unwrap_or(&self.first).capacity();
-        let capacity = tail_capacity
-            .saturating_mul(2)
-            .min(CHUNK_BYTES)
-            .min(self.file_limit - self.payload_capacity);
-        if capacity == 0 {
+    fn reserve_for(&mut self, additional: usize) -> io::Result<()> {
+        let Some(required) = self.bytes.len().checked_add(additional) else {
+            return Err(self.reject(BufferLimit::FileSize));
+        };
+        if required > self.file_limit {
             return Err(self.reject(BufferLimit::FileSize));
         }
-        let directory_capacity = if self.chunks.len() == self.chunks.capacity() {
-            self.chunks.capacity().saturating_mul(2).max(4)
-        } else {
-            0
-        };
-        let allocation = capacity + directory_capacity * std::mem::size_of::<Vec<u8>>();
-        let Some(reservation) = reserve_pending_metadata_cache_bytes(&self.budget, allocation)
-        else {
+        let previous_capacity = self.bytes.capacity();
+        let capacity = previous_capacity
+            .saturating_mul(2)
+            .max(required)
+            .min(self.file_limit);
+        // Reallocation can retain the old allocation until the copy finishes.
+        let Some(reservation) = reserve_pending_metadata_cache_bytes(&self.budget, capacity) else {
             return Err(self.reject(BufferLimit::Budget));
         };
         self.reservation.merge(reservation);
-        if directory_capacity != 0 {
-            let previous_bytes = self.chunks.capacity() * std::mem::size_of::<Vec<u8>>();
-            self.chunks
-                .reserve_exact(directory_capacity - self.chunks.len());
-            drop(self.reservation.split(previous_bytes));
-        }
-        self.chunks.push(Vec::with_capacity(capacity));
-        self.payload_capacity += capacity;
+        self.bytes.reserve_exact(capacity - self.bytes.len());
+        drop(self.reservation.split(previous_capacity));
         Ok(())
     }
 
-    fn write_across_chunks(&mut self, mut bytes: &[u8]) -> io::Result<usize> {
-        let written = bytes.len();
-        if self
-            .len
-            .checked_add(written)
-            .is_none_or(|size| size > self.file_limit)
-        {
-            return Err(self.reject(BufferLimit::FileSize));
+    #[inline]
+    fn append(&mut self, bytes: &[u8]) -> io::Result<()> {
+        if let Some(limit) = self.exhausted {
+            return Err(self.reject(limit));
         }
-        while !bytes.is_empty() {
-            let tail = self.chunks.last().unwrap_or(&self.first);
-            if tail.len() == tail.capacity() {
-                self.add_chunk()?;
-            }
-            let tail = self.chunks.last_mut().unwrap_or(&mut self.first);
-            let count = bytes.len().min(tail.capacity() - tail.len());
-            tail.extend_from_slice(&bytes[..count]);
-            self.len += count;
-            bytes = &bytes[count..];
+        if bytes.len() > self.bytes.capacity() - self.bytes.len() {
+            self.reserve_for(bytes.len())?;
         }
-        Ok(written)
+        self.bytes.extend_from_slice(bytes);
+        Ok(())
     }
 
     pub(super) fn write_to(&self, writer: &mut impl Write) -> io::Result<()> {
-        let mut chunks = std::iter::once(self.first.as_slice())
-            .chain(self.chunks.iter().map(Vec::as_slice))
-            .filter(|chunk| !chunk.is_empty());
-        loop {
-            let mut slices: [IoSlice<'_>; 64] = std::array::from_fn(|_| IoSlice::new(&[]));
-            let mut count = 0;
-            for (slot, chunk) in slices.iter_mut().zip(chunks.by_ref()) {
-                *slot = IoSlice::new(chunk);
-                count += 1;
-            }
-            if count == 0 {
-                return Ok(());
-            }
-            let mut remaining = &mut slices[..count];
-            while !remaining.is_empty() {
-                match writer.write_vectored(remaining) {
-                    Ok(0) => return Err(io::ErrorKind::WriteZero.into()),
-                    Ok(written) => IoSlice::advance_slices(&mut remaining, written),
-                    Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
-                    Err(error) => return Err(error),
-                }
-            }
-        }
+        writer.write_all(&self.bytes)
     }
 }
 
 impl Write for MetadataCacheBuffer {
     #[inline]
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-        if let Some(limit) = self.exhausted {
-            return Err(self.reject(limit));
-        }
-        let tail = self.chunks.last_mut().unwrap_or(&mut self.first);
-        if bytes.len() <= tail.capacity() - tail.len() {
-            tail.extend_from_slice(bytes);
-            self.len += bytes.len();
-            return Ok(bytes.len());
-        }
-        self.write_across_chunks(bytes)
+        self.append(bytes)?;
+        Ok(bytes.len())
+    }
+
+    #[inline]
+    fn write_all(&mut self, bytes: &[u8]) -> io::Result<()> {
+        self.append(bytes)
     }
 
     fn flush(&mut self) -> io::Result<()> {
@@ -182,23 +129,16 @@ mod tests {
     use super::*;
 
     #[test]
-    fn chunk_allocations_and_directory_stay_reserved_until_the_buffer_is_dropped() {
+    fn buffer_capacity_stays_reserved_until_the_buffer_is_dropped() {
         let budget = Arc::new(Semaphore::new(2 * 1024 * 1024));
         let mut buffer =
             MetadataCacheBuffer::with_limit(&budget, &[b"header"], 1024 * 1024).unwrap();
-        let payload = vec![0x5a; 3 * CHUNK_BYTES];
+        let payload = vec![0x5a; 192 * 1024];
         buffer.write_all(&payload).unwrap();
-        assert!(
-            buffer
-                .chunks
-                .iter()
-                .all(|chunk| chunk.capacity() <= CHUNK_BYTES)
+        assert_eq!(
+            budget.available_permits(),
+            2 * 1024 * 1024 - buffer.bytes.capacity()
         );
-        let charged = buffer.first.capacity()
-            + buffer.chunks.iter().map(Vec::capacity).sum::<usize>()
-            + buffer.chunks.capacity() * std::mem::size_of::<Vec<u8>>();
-        assert_eq!(budget.available_permits(), 2 * 1024 * 1024 - charged);
-        assert!(buffer.payload_capacity - buffer.len() < CHUNK_BYTES);
         let mut actual = Vec::new();
         buffer.write_to(&mut actual).unwrap();
         assert_eq!(&actual[..6], b"header");
@@ -208,16 +148,30 @@ mod tests {
     }
 
     #[test]
-    fn growth_budget_exhaustion_allocates_no_extra_chunk_and_releases_all_permits() {
+    fn growth_requires_budget_for_both_old_and_new_allocations() {
         let budget = Arc::new(Semaphore::new(8192));
-        let mut buffer = MetadataCacheBuffer::new(&budget, &[b"header"]).unwrap();
-        let charged = budget.available_permits();
-        assert!(buffer.write_all(&[0x5a; 8192]).is_err());
+        let mut buffer = MetadataCacheBuffer::with_limit(&budget, &[], 8192).unwrap();
+        buffer.write_all(&[0x5a; 4096]).unwrap();
+        assert_eq!(budget.available_permits(), 4096);
+        assert!(buffer.write_all(&[0x5a]).is_err());
         assert_eq!(buffer.exhausted(), Some(BufferLimit::Budget));
-        assert!(buffer.chunks.is_empty());
-        assert_eq!(budget.available_permits(), charged);
+        assert_eq!(buffer.len(), 4096);
+        assert_eq!(buffer.bytes.capacity(), 4096);
+        assert_eq!(budget.available_permits(), 4096);
+        assert!(buffer.write_all(&[]).is_err());
         drop(buffer);
         assert_eq!(budget.available_permits(), 8192);
+    }
+
+    #[test]
+    fn successful_growth_releases_the_old_allocation_reservation() {
+        let budget = Arc::new(Semaphore::new(12288));
+        let mut buffer = MetadataCacheBuffer::with_limit(&budget, &[], 8192).unwrap();
+        buffer.write_all(&[0x5a; 4097]).unwrap();
+        assert_eq!(buffer.bytes.capacity(), 8192);
+        assert_eq!(budget.available_permits(), 4096);
+        drop(buffer);
+        assert_eq!(budget.available_permits(), 12288);
     }
 
     #[test]
@@ -232,32 +186,36 @@ mod tests {
     }
 
     #[test]
-    fn vectored_output_handles_interruptions_and_short_writes_across_batches() {
+    fn growth_and_small_writes_stop_at_a_non_power_of_two_file_limit() {
+        let budget = Arc::new(Semaphore::new(16384));
+        let mut buffer = MetadataCacheBuffer::with_limit(&budget, &[], 5003).unwrap();
+        for _ in 0..5003 {
+            buffer.write_all(b"a").unwrap();
+        }
+        assert_eq!(buffer.len(), 5003);
+        assert_eq!(buffer.bytes.capacity(), 5003);
+        assert!(buffer.write_all(b"b").is_err());
+        assert_eq!(buffer.exhausted(), Some(BufferLimit::FileSize));
+        assert_eq!(buffer.len(), 5003);
+    }
+
+    #[test]
+    fn output_handles_interruptions_and_short_writes() {
         struct ShortWriter {
             bytes: Vec<u8>,
             interrupted: bool,
-            crossed_boundary: bool,
+            calls: usize,
         }
         impl Write for ShortWriter {
-            fn write(&mut self, _bytes: &[u8]) -> io::Result<usize> {
-                panic!("expected vectored output");
-            }
-            fn write_vectored(&mut self, slices: &[IoSlice<'_>]) -> io::Result<usize> {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                self.calls += 1;
                 if !self.interrupted {
                     self.interrupted = true;
                     return Err(io::ErrorKind::Interrupted.into());
                 }
-                let mut written = 0;
-                for (index, slice) in slices.iter().enumerate() {
-                    let count = slice.len().min(8191 - written);
-                    self.bytes.extend_from_slice(&slice[..count]);
-                    self.crossed_boundary |= index > 0 && count > 0;
-                    written += count;
-                    if written == 8191 {
-                        break;
-                    }
-                }
-                Ok(written)
+                let count = bytes.len().min(8191);
+                self.bytes.extend_from_slice(&bytes[..count]);
+                Ok(count)
             }
             fn flush(&mut self) -> io::Result<()> {
                 Ok(())
@@ -266,15 +224,15 @@ mod tests {
         let budget = Arc::new(Semaphore::new(8 * 1024 * 1024));
         let mut buffer =
             MetadataCacheBuffer::with_limit(&budget, &[b"header"], 6 * 1024 * 1024).unwrap();
-        let bytes = vec![0x5a; 65 * CHUNK_BYTES];
+        let bytes = vec![0x5a; 65 * 64 * 1024];
         buffer.write_all(&bytes).unwrap();
         let mut writer = ShortWriter {
             bytes: Vec::new(),
             interrupted: false,
-            crossed_boundary: false,
+            calls: 0,
         };
         buffer.write_to(&mut writer).unwrap();
-        assert!(writer.crossed_boundary);
+        assert!(writer.calls > 2);
         assert_eq!(&writer.bytes[..6], b"header");
         assert_eq!(&writer.bytes[6..], bytes);
     }
