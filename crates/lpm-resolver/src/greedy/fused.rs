@@ -2752,7 +2752,7 @@ pub async fn resolve_greedy_fused_with_cache_options_policy_and_selected_events_
                         // direct dep), so the serial fetch here is
                         // bounded by the count of unmet-peer canonicals
                         // — usually 0–3.
-                        let fetched = fetch_metadata_for_resolver_with_trace_detail(
+                        let fetched = match fetch_metadata_for_resolver_with_trace_detail(
                             &client,
                             &route_table,
                             &canonical,
@@ -2760,7 +2760,22 @@ pub async fn resolve_greedy_fused_with_cache_options_policy_and_selected_events_
                             false,
                             trace_metadata_fetches,
                         )
-                        .await?;
+                        .await
+                        {
+                            Ok(fetched) => fetched,
+                            Err(error) => {
+                                if matches!(error, ResolveError::PackageNotFound { .. })
+                                    && let Some(workspace) =
+                                        crate::provider::activate_workspace_fallback(
+                                            &shared_cache,
+                                            &canonical,
+                                        )
+                                {
+                                    return Ok(workspace);
+                                }
+                                return Err(error);
+                            }
+                        };
                         publish_direct_base_fact(
                             shared_fact_cache.as_ref(),
                             &route_table,

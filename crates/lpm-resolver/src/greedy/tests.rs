@@ -7239,3 +7239,85 @@ async fn exact_alias_metadata_hydrates_history_for_an_older_required_peer() {
         std::collections::BTreeSet::from(["1.0.0".into(), "2.0.0".into()])
     );
 }
+
+async fn resolve_peer_from_seeded_workspace(
+    registry_status: u16,
+) -> Result<crate::ResolveResult, ResolveError> {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    let mut consumer = version_document_json("consumer", "1.0.0", &[]);
+    consumer["peerDependencies"] = serde_json::json!({"local-peer": "^1"});
+    Mock::given(method("GET"))
+        .and(path("/consumer/1.0.0"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(consumer))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/local-peer"))
+        .respond_with(
+            ResponseTemplate::new(registry_status).set_body_json(metadata_json_version(
+                "local-peer",
+                "1.1.0",
+                &[],
+            )),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    let cache: SharedCache = Arc::default();
+    let mut workspace = mk_info(&["1.0.0"], &[]);
+    workspace.versions_complete = false;
+    workspace
+        .workspace_versions
+        .insert(NpmVersion::parse("1.0.0").unwrap());
+    cache.insert(CanonicalKey::npm("local-peer"), Arc::new(workspace));
+    resolve_greedy_fused_with_cache_options_and_policy(
+        Arc::new(
+            RegistryClient::new()
+                .with_npm_registry_url(server.uri())
+                .with_cache_dir(None),
+        ),
+        HashMap::from([("consumer".into(), "1.0.0".into())]),
+        OverrideSet::empty(),
+        RouteTable::from_mode_only(RouteMode::Direct),
+        8,
+        None,
+        cache,
+        true,
+        true,
+        ResolverPolicy::default(),
+    )
+    .await
+}
+
+#[tokio::test]
+async fn peer_history_hydration_uses_workspace_fallback_when_the_registry_returns_not_found() {
+    let result = resolve_peer_from_seeded_workspace(404).await.unwrap();
+    assert!(
+        result
+            .packages
+            .iter()
+            .any(|package| package.package.canonical_name() == "local-peer"
+                && package.version.to_string() == "1.0.0")
+    );
+}
+
+#[tokio::test]
+async fn peer_history_hydration_prefers_published_metadata_over_workspace_facts() {
+    let result = resolve_peer_from_seeded_workspace(200).await.unwrap();
+    assert!(
+        result
+            .packages
+            .iter()
+            .any(|package| package.package.canonical_name() == "local-peer"
+                && package.version.to_string() == "1.1.0")
+    );
+}
+
+#[tokio::test]
+async fn peer_history_hydration_does_not_hide_registry_access_errors_with_workspace_facts() {
+    assert!(resolve_peer_from_seeded_workspace(403).await.is_err());
+}
