@@ -129,7 +129,7 @@ Merge requires separate user approval.
 
 ## Finding ledger
 
-There are 20 recorded reports and experiments, representing 18 canonical findings: 11 verified and fixed, seven rejected, zero externally blocked, zero pending.
+There are 22 recorded reports and experiments, representing 20 canonical findings: 13 verified and fixed, seven rejected, zero externally blocked, zero pending.
 `H1` duplicates `M1`/`M2`. The memory researcher's `M3` duplicates `ML-V5`.
 Repeated exact-plus-range fallback reports map to `ML-V2`.
 
@@ -156,5 +156,13 @@ Rejected rows require no resolving commit. No separate finding PRs were created.
 | ML-V5 | Both researchers | Correctness | `greedy/fused.rs`: failed fallback poisoned later requests | Malformed first response remained cached despite a healthy later response | `failed_packument_fallback_does_not_poison_later_exact_requests` | Verified | `1f28499c0` | Open concept PR; merge unapproved |
 | ML-V6 | Metadata researcher | Performance | `provider/cache.rs`: overlapping snapshots rebuilt shared histories and scanned equal sets quadratically | Sharing regression failed. merge probe improved 53.49%. process RSS unchanged | Sharing, changed facts, tags, release times, and provenance tests | Verified | `1f28499c0` | Open concept PR; merge unapproved |
 | ML-V7 | Metadata researcher and primary | Correctness | `greedy/fused.rs`: exact documents and partial cache hits hid override targets | Cold and cached exact2.0→override1.0 tests both selected2.0 before hydration | `exact_metadata_requests_preserve_override_targets_outside_the_requested_version`; `partial_exact_cache_hydrates_history_before_selecting_an_override` | Verified | `4f703c4c1` | Open concept PR; merge unapproved |
+| ML-V8 | Metadata researcher | Correctness | `greedy/fused.rs`: cached exact documents hid older required peers | Alias pinned to shared2 plus consumer peer^1 raised PeerConflict despite available shared1 | `exact_alias_metadata_hydrates_history_for_an_older_required_peer` | Verified | `bd07bde4c` | Open concept PR; merge unapproved |
+| ML-V9 | Metadata researcher | Performance | `install/fetch.rs`: speculation chose the highest version instead of a satisfying latest tag | Full history latest2.1 plus version2.9 selected2.9 before the fix | `speculative_picker_prefers_a_satisfying_latest_over_a_higher_version` | Verified | `bd07bde4c` | Open concept PR; merge unapproved |
 
 The override correction predates this stack (introduced by the exact-document path in #638). It is included on this owning metadata branch so every later member inherits it. The benchmark datasets above remain measurements of their recorded binaries; this correction only requires extra history for override-targeted packages. Both regressions pass after the fix.
+
+
+
+The peer and speculative-selection corrections also predate this stack. Each test failed before its fix. Peer resolution now hydrates incomplete history, and speculation follows the resolver's satisfying-latest preference. Recorded benchmarks above retain their original binary identities; the subsequent extraction/cache report measures the corrected ancestry.
+
+Cache follow-up review corrected the earlier R4 reader assessment: the production writer had a JSON fallback that the production reader could not decode. The separate bounded-cache concept adds an unambiguous format marker and reader coverage; it does not replace ordinary MessagePack entries with JSON.
