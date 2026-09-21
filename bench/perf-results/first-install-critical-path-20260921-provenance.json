@@ -1,0 +1,72 @@
+{
+  "runner": "bench/scripts/run-install-readiness.mjs",
+  "runner_sha256": "4b80a74fe327234fb3c24e4e79af53c7130bcc7cc378b03c4f7ae8194a608c91",
+  "driver": "run-canonical-bench.py (local orchestration)",
+  "driver_sha256": "144e1782ad13fc41c89a9575a4e501647cc5a98cb88c416ed7673ad3afd2c509",
+  "node": "v26.5.0",
+  "bun": "1.4.2",
+  "order": "No --lpm-compare; all4 entries in reference order, balanced across8samples with everyposition twice and everypair4timeseachway.",
+  "candidate_source": {
+    "base": "d33294587cd3c854edb8d8f265522438d664e82b",
+    "files": {
+      "Cargo.toml": "539e78a3c1b704aa34f0df9ae66d09f9515d8a308cda8f1fec58c70d6fb92bc8",
+      "crates/lpm-cli/src/commands/install/fetch.rs": "a99feb36cdb3de031478a71773aee070784fd881e6d695be7d7242765f97a634",
+      "crates/lpm-cli/src/commands/install/lifecycle.rs": "32d1f89c618ce2e53d2e048c75f47a62b320690045e4a57ca6f48cb3e21a0a34",
+      "crates/lpm-cli/src/commands/install/resolve/online.rs": "640a189bb76f53752f603ab053b80cab111c46192c89fa53c576deccbf6eb098",
+      "crates/lpm-cli/src/commands/install/tests/fetch.rs": "2f220d9cca9c57b6c46632a221ab0eb9a6ce48b34f9b7f70164fda28db393e62",
+      "crates/lpm-cli/src/commands/install/timing.rs": "fdc82a90f693af41b3253cef31d3335ba07defa5503f4924e79fda0e8e5f6356",
+      "crates/lpm-extractor/src/lib.rs": "049c185a13f2a935276657663bde038c34f256f0208d999f424dea2c679f5fd4",
+      "crates/lpm-registry/src/client/body.rs": "ba8c45641e3a8dea127d68e266984cea5556a252f41c85842a7d06920e8dbddd",
+      "crates/lpm-registry/src/client/cache.rs": "4f1cef4aa4dae5456d1d40ced3cd4eb6ac799578ed946baf3f4bb8043b395d4b",
+      "crates/lpm-registry/src/client/config.rs": "d64f714a9b99cbc41c47ee056252824bbbff9e8aa6652e09b3418fd13c5f3214",
+      "crates/lpm-registry/src/client/history_cache.rs": "536e8127c047eba07a7da3abf2e1445a60b7a953c38ff3ef1527e0d0db6abcff",
+      "crates/lpm-registry/src/client/metadata.rs": "82295a3e9e6ea02321bf10c5b3af20ecd8366e473310fc2f055ff75f131b28a8",
+      "crates/lpm-registry/src/client/metadata/preferred.rs": "3a493d3ecd1f252094f5bb84eb4cf56689cec0dfd63762ff631129b4a715a04e",
+      "crates/lpm-registry/src/client/metadata/version_selection.rs": "4a5e797004ed1fc88fe096192506043d0d36cd33bc8081be3a93cc3051e2430c",
+      "crates/lpm-registry/src/client/mod.rs": "49dd60d3f77af6a76d8f6e902a8fb380ff5e1abc4688472f3b89eb1d84e7cdf5",
+      "crates/lpm-registry/src/client/state.rs": "c63736d3407733ff4169370f03ef79278d76380ab2123cc355f6c33f8da547a1",
+      "crates/lpm-registry/src/client/tests/history_reuse.rs": "a06abb880a15c361ae8ff8bd500b46eb4e1354366cf7941e95ff331bc1658a8b",
+      "crates/lpm-registry/src/client/tests/metadata.rs": "09116953d3e573c6fee08433379af6597adf50299a12df123d550821c1d6555f",
+      "crates/lpm-registry/src/client/tests/mod.rs": "32e00ccbf527d6dbe26621515b44510feeac0ae6edefd822f712a9afb675c327",
+      "crates/lpm-registry/src/timing.rs": "29606c3256691747d79eb90fc0ffe6fb32a1f82f5e95193e9e7dd99e83b74237",
+      "crates/lpm-registry/src/types.rs": "a0d90531662162e610019370bc013c4fd234a3e258ba6b28d55914e622301c10",
+      "crates/lpm-registry/src/types/version_metadata.rs": "f0b1a8b31d8bd8bbbe1884cb51dc9b032873bd75bdd2f335aef8fcdf98c5e7e7",
+      "crates/lpm-resolver/src/greedy/fused.rs": "285721621050736aec64594091840e3056a261af45e2214e42c72e1a317ef339",
+      "crates/lpm-resolver/src/greedy/manifest.rs": "db5afe91ec117659377b8dc9f5d488500002f48bd66c28953a1cd09be04a2485",
+      "crates/lpm-resolver/src/greedy/tests.rs": "b6b67ef78e1eade5b8f703eb9c8121465a9f494a51d87028a0595cb8da202e0d",
+      "crates/lpm-resolver/src/provider/cache.rs": "5927c0d612e0d2ce40387935d3bd5ec336ce54b3c774f6301992d51460571a0c",
+      "crates/lpm-resolver/src/provider/manifest_core.rs": "c62c3596e165b2d67081fdd40ccde2401fc7e3d1d00be977c1d734525eb796c2",
+      "crates/lpm-resolver/src/provider/parse.rs": "d6b8b21ba90b2719996ac27fdba17c2e5d59817f69bf5b54eef0479ed2848651",
+      "crates/lpm-resolver/src/provider/tests.rs": "7733a61c89b15f1ebad7df22b9761dbeaefeaa4e92b1d5cf35c0230aa6590160",
+      "crates/lpm-store/src/extraction.rs": "9eb1bb33e0b1f117539362202af2b49e6c6e2f0856613018966a091c580994d8",
+      "crates/lpm-store/src/v2/store.rs": "36556989c1572831bc06126a1e7a504162e09fef2fe8630845bc00275d265ac1",
+      "crates/lpm-store/src/v2/store/tests.rs": "83c0c110faf42c725581cf516197b53407021206d7320ca2c45754ff5b8807b6",
+      "tests/workflows/tests/install_metadata.rs": "cae1fef9d0fb64e4b3c3d5df8b141b8461cf47637a08e270854f8d7fb5b8d5be",
+      "tests/workflows/tests/install_speculation.rs": "07842443b5350114d080cebdb2c582ba0aceb3266b93c3138032e776dd4bb974"
+    },
+    "binary_sha256": "50ef0537cbf7582f245f60d86272e6220209a8af91dd912e3242376d5798a87d",
+    "changes": "Canonical bounded raw history reuse, failed-attempt accounting fixes, earlier V3 and extraction changes. Deadline experiment removed.",
+    "later_source_changes": "Only SpeculativeStats.to_json renamed to into_json for Clippy, plus benchmark runner changes; binary corresponds to preserved source archive before these nonbehavioral CLI naming and harness edits."
+  },
+  "binaries": {
+    "baseline": {
+      "sha256": "503eafb3396065787edf4e8f4a0c39bc7b03f132d86e606d9ee708b9fb67f75e",
+      "source": "8c2cc97384a148b289a1099c4de27a5b4421615d",
+      "parent_equivalence": "Cargo.toml, Cargo.lock, and crates match d33294587cd3c854edb8d8f265522438d664e82b"
+    },
+    "previous": {
+      "sha256": "1b6ba741f27c210cca2751d66abf8c99d796c68870b855cfbdb7f31971677e6c",
+      "source": "Preserved intermediate implementation. Body-deadline diagnostic disabled."
+    },
+    "candidate": {
+      "sha256": "50ef0537cbf7582f245f60d86272e6220209a8af91dd912e3242376d5798a87d",
+      "source": "candidate_source files in this document"
+    }
+  },
+  "wall_method": "process.hrtime around spawnSync. /usr/bin/time -l supplies maximum RSS.",
+  "raw_sha256": {
+    "canonical-scored/rows.json": "49c4337dcf0ec5c6b6b35427336abad9308f542aafceea531957cf17f6c0ac47",
+    "canonical-guard-scored/rows.json": "fb3df6581082e10548de4f055a9a1eb5126742cc905266eb2f723718ed5fceae"
+  },
+  "guard_driver_sha256": "4b8cb012b238078b03b33ef763617527e2cf1abae3c236a85965bd2d73f63300"
+}
