@@ -100,7 +100,10 @@ All 16 final readiness T3 traces matched that same graph.
 Its SHA-256 is `e59db409cad0da216fb25ae2f235a6e8305d7f19332a17b8ef0905d9724b55c4` for sorted JSON name/version pairs.
 The canonical-name duplicate counter includes different requested versions. it does not prove duplicate HTTP requests.
 Release-age processing, firewall, source scanning, and policy extensions recorded zero elapsed milliseconds.
-The separate mandatory blocked-set lookup still consumed time.
+The separate blocked-script metadata enrichment still consumed 39 ms in the original trace.
+It makes a best-effort registry lookup for publication dates and behavior tags used by `approve-scripts`.
+The default lifecycle-script policy is `deny`. The four disabled settings do not control this enrichment.
+Lookup failures do not fail the install. This is not a malware-blocklist or firewall check.
 
 The 64-slot trial reduced cumulative semaphore waiting from roughly 17.7 seconds to 2.1 seconds in diagnostic runs.
 Those totals overlap across requests. They are not elapsed install time.
