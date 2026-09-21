@@ -4748,6 +4748,59 @@ async fn fusion_broad_range_after_an_exact_document_refetches_the_packument() {
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn fusion_exact_versions_share_one_packument_when_version_endpoints_are_missing() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    for version in ["1.0.0", "2.0.0"] {
+        Mock::given(method("GET"))
+            .and(path(format!("/shared-fallback/{version}")))
+            .respond_with(ResponseTemplate::new(404))
+            .expect(1)
+            .mount(&server)
+            .await;
+    }
+    Mock::given(method("GET"))
+        .and(path("/shared-fallback"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("Cache-Control", "no-store")
+                .set_body_json(serde_json::json!({
+                    "name": "shared-fallback",
+                    "versions": {
+                        "1.0.0": version_document_json("shared-fallback", "1.0.0", &[]),
+                        "2.0.0": version_document_json("shared-fallback", "2.0.0", &[])
+                    }
+                })),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let result = resolve_greedy_fused(
+        Arc::new(
+            RegistryClient::new()
+                .with_npm_registry_url(server.uri())
+                .with_cache_dir(None),
+        ),
+        HashMap::from([
+            ("one".to_string(), "npm:shared-fallback@1.0.0".to_string()),
+            ("two".to_string(), "npm:shared-fallback@2.0.0".to_string()),
+        ]),
+        OverrideSet::empty(),
+        RouteTable::from_mode_only(RouteMode::Direct),
+        2,
+        None,
+        true,
+    )
+    .await
+    .unwrap();
+    assert_eq!(result.packages.len(), 2);
+    server.verify().await;
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn fusion_multiple_exact_versions_merge_without_fetching_a_packument() {
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -5153,6 +5206,135 @@ async fn resolve_overlapping_range_with_parent_delay(
         })
         .map(|(_, version)| version.clone())
         .expect("range parent should retain its shared-child edge")
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn fusion_fetches_distinct_exact_versions_concurrently() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let registry_url = format!("http://{}", listener.local_addr().unwrap());
+    let release = Arc::new(tokio::sync::Notify::new());
+    let gate = Arc::clone(&release);
+    let (requested_tx, mut requested_rx) = tokio::sync::mpsc::channel(4);
+    let server = tokio::spawn(async move {
+        let mut requests = tokio::task::JoinSet::new();
+        for _ in 0..2 {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let gate = Arc::clone(&gate);
+            let tx = requested_tx.clone();
+            requests.spawn(async move {
+                let mut request = Vec::new();
+                loop {
+                    let byte = socket.read_u8().await.unwrap();
+                    request.push(byte);
+                    if request.ends_with(b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                let request = String::from_utf8(request).unwrap();
+                let path = request.split_whitespace().nth(1).unwrap();
+                let version = path.strip_prefix("/shared-exact/").unwrap().to_owned();
+                tx.send(version.clone()).await.unwrap();
+                if version == "1.0.0" {
+                    gate.notified().await;
+                }
+                let body = serde_json::json!({
+                    "name": "shared-exact", "version": version,
+                    "dist": {"tarball": format!("https://example.invalid/shared-{version}.tgz"), "integrity": "sha512-shared"}
+                }).to_string();
+                let response = format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+                socket.write_all(response.as_bytes()).await.unwrap();
+            });
+        }
+        while let Some(result) = requests.join_next().await {
+            result.unwrap();
+        }
+    });
+    let resolver = tokio::spawn(resolve_greedy_fused(
+        Arc::new(
+            RegistryClient::new()
+                .with_npm_registry_url(registry_url)
+                .with_cache_dir(None),
+        ),
+        HashMap::from([
+            ("a-first".to_string(), "npm:shared-exact@1.0.0".to_string()),
+            ("b-second".to_string(), "npm:shared-exact@2.0.0".to_string()),
+            (
+                "c-duplicate".to_string(),
+                "npm:shared-exact@2.0.0".to_string(),
+            ),
+        ]),
+        OverrideSet::empty(),
+        RouteTable::from_mode_only(RouteMode::Direct),
+        2,
+        None,
+        true,
+    ));
+    let first = requested_rx.recv().await.unwrap();
+    let second = tokio::time::timeout(Duration::from_secs(1), requested_rx.recv()).await;
+    release.notify_one();
+    let result = resolver.await.unwrap().unwrap();
+    server.await.unwrap();
+
+    assert!(
+        second.is_ok(),
+        "a second exact version must start while the first response is gated"
+    );
+    let requested: std::collections::BTreeSet<_> = [first, second.unwrap().unwrap()].into();
+    assert_eq!(requested, ["1.0.0".to_string(), "2.0.0".to_string()].into());
+    assert_eq!(
+        result.packages.len(),
+        2,
+        "aliases must share identical versions"
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn fusion_dispatches_ready_tarball_metadata_before_earlier_slow_metadata() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    for (name, delay) in [("a-slow", 200), ("b-ready", 0)] {
+        Mock::given(method("GET"))
+            .and(path(format!("/{name}")))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(metadata_json(name, &[]))
+                    .set_delay(Duration::from_millis(delay)),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+    }
+    let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+    let result = resolve_greedy_fused(
+        Arc::new(
+            RegistryClient::new()
+                .with_npm_registry_url(server.uri())
+                .with_cache_dir(None),
+        ),
+        HashMap::from([
+            ("a-slow".to_string(), "*".to_string()),
+            ("b-ready".to_string(), "*".to_string()),
+        ]),
+        OverrideSet::empty(),
+        RouteTable::from_mode_only(RouteMode::Direct),
+        2,
+        Some(tx),
+        true,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(rx.recv().await.unwrap().0, "b-ready");
+    assert_eq!(rx.recv().await.unwrap().0, "a-slow");
+    assert!(
+        rx.recv().await.is_none(),
+        "committing metadata must not repeat speculation"
+    );
+    assert_eq!(result.packages.len(), 2);
 }
 
 #[tokio::test(flavor = "current_thread")]
