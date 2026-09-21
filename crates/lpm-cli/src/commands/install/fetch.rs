@@ -56,6 +56,7 @@ const ENV_V2_STREAMING_EXTRACT_WEIGHT: &str = "LPM_V2_STREAMING_EXTRACT_WEIGHT";
 pub(super) const DEFAULT_BOUNDED_FETCH_EXTRACT_PERMITS: usize = 4;
 const DEFAULT_LARGE_V2_STREAMING_EXTRACT_WEIGHT: usize = 3;
 pub(super) const LARGE_V2_STREAMING_OBJECT_BYTES: u64 = 64 * 1024 * 1024;
+const SPECULATIVE_FILE_STREAMING_MIN_BYTES: u64 = 8 * 1024 * 1024;
 pub(super) const V2_STREAMING_SUPPLEMENTAL_PERMIT_LEASE: std::time::Duration =
     std::time::Duration::from_secs(2);
 
@@ -2553,6 +2554,20 @@ fn verify_local_packages_match_resolution(
 mod tests {
     use super::*;
 
+    #[test]
+    fn speculative_file_streaming_starts_at_eight_mib_unpacked() {
+        assert!(!speculative_file_needs_streaming(None));
+        assert!(!speculative_file_needs_streaming(
+            std::num::NonZeroU64::new(SPECULATIVE_FILE_STREAMING_MIN_BYTES - 1)
+        ));
+        assert!(speculative_file_needs_streaming(std::num::NonZeroU64::new(
+            SPECULATIVE_FILE_STREAMING_MIN_BYTES
+        )));
+        assert!(speculative_file_needs_streaming(std::num::NonZeroU64::new(
+            u64::MAX
+        )));
+    }
+
     #[tokio::test]
     async fn cancelled_speculative_waiter_retains_capacity_and_lock_until_extraction_ends() {
         let capacity = Arc::new(Semaphore::new(4));
@@ -2591,6 +2606,32 @@ mod tests {
             "blocking extraction must retain its package lock after cancellation"
         );
         assert_eq!(capacity.available_permits(), 4);
+    }
+
+    #[tokio::test]
+    async fn cancelled_file_extraction_retains_capacity_until_worker_finishes() {
+        let capacity = Arc::new(Semaphore::new(1));
+        let permit = capacity.clone().acquire_owned().await.unwrap();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+        let task = tokio::spawn(run_blocking_extract(Some(permit), move || {
+            started_tx.send(()).unwrap();
+            let _ = resume_rx.recv();
+            Ok(())
+        }));
+        started_rx.await.unwrap();
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        let retained = capacity.available_permits() == 0;
+        resume_tx.send(()).unwrap();
+        let _permit = tokio::time::timeout(std::time::Duration::from_secs(2), capacity.acquire())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            retained,
+            "blocking file extraction must retain its capacity"
+        );
     }
 
     #[test]
@@ -3558,7 +3599,19 @@ pub(super) async fn speculative_download_and_store(
         let extract_permit = acquire_fetch_extract_permit(fetch_extract_limiter).await?;
         let v2_clone = v2.clone();
         let expected_integrity = integrity.map(str::to_string);
+        let stream_file =
+            v2.supports_streamed_object_ingest() && speculative_file_needs_streaming(unpacked_size);
         run_speculative_blocking_extract(key_guard, extract_permit, move || {
+            if stream_file {
+                let file = std::fs::File::open(downloaded.file.path())?;
+                return v2_clone
+                    .extract_object_from_stream(
+                        std::io::BufReader::new(file),
+                        expected_integrity.as_deref(),
+                        lpm_registry::MAX_COMPRESSED_TARBALL_SIZE,
+                    )
+                    .map(|_| ());
+            }
             v2_clone
                 .extract_object_from_file_with_fresh_integrity(
                     downloaded.file.path(),
@@ -3602,6 +3655,10 @@ pub(super) async fn speculative_download_and_store(
     Ok(SpeculativeFetchOutcome::Stored)
 }
 
+fn speculative_file_needs_streaming(unpacked_size: Option<std::num::NonZeroU64>) -> bool {
+    unpacked_size.is_some_and(|size| size.get() >= SPECULATIVE_FILE_STREAMING_MIN_BYTES)
+}
+
 async fn run_speculative_blocking_extract<F>(
     key_guard: tokio::sync::OwnedMutexGuard<()>,
     extract_permit: Option<tokio::sync::OwnedSemaphorePermit>,
@@ -3610,13 +3667,27 @@ async fn run_speculative_blocking_extract<F>(
 where
     F: FnOnce() -> Result<(), LpmError> + Send + 'static,
 {
-    tokio::task::spawn_blocking(move || {
+    run_blocking_extract(extract_permit, move || {
         let _key_guard = key_guard;
+        extract()
+    })
+    .await
+}
+
+async fn run_blocking_extract<T, F>(
+    extract_permit: Option<tokio::sync::OwnedSemaphorePermit>,
+    extract: F,
+) -> Result<T, LpmError>
+where
+    T: Send + 'static,
+    F: FnOnce() -> Result<T, LpmError> + Send + 'static,
+{
+    tokio::task::spawn_blocking(move || {
         let _extract_permit = extract_permit;
         extract()
     })
     .await
-    .map_err(|error| LpmError::Registry(format!("speculative extraction task: {error}")))?
+    .map_err(|error| LpmError::Registry(format!("file extraction task: {error}")))?
 }
 
 pub(super) struct ResolvedRegistryTarballUrl {
@@ -3880,7 +3951,7 @@ async fn store_downloaded_registry_tarball(
 > {
     drop(permit);
     let extract_permit_wait_start = std::time::Instant::now();
-    let _extract_permit = acquire_fetch_extract_permit(fetch_extract_limiter).await?;
+    let extract_permit = acquire_fetch_extract_permit(fetch_extract_limiter).await?;
     let extract_permit_wait_ms = extract_permit_wait_start.elapsed().as_millis();
     let integrity = p.integrity.clone();
     let name = p.name.clone();
@@ -3888,7 +3959,7 @@ async fn store_downloaded_registry_tarball(
     let store = store.clone();
     let store_v2 = store_v2.cloned();
     let ((stage, fresh_object, result_sri), integrity_ms) =
-        tokio::task::spawn_blocking(move || {
+        run_blocking_extract(extract_permit, move || {
             let computed_sri = downloaded.sri.clone();
             if let Some(store_v2) = store_v2 {
                 let (object, sri, timings, integrity_ms) = store_v2
@@ -3922,10 +3993,7 @@ async fn store_downloaded_registry_tarball(
             )?;
             Ok::<_, LpmError>(((stage, None, computed_sri), integrity_ms))
         })
-        .await
-        .map_err(|error| {
-            LpmError::Registry(format!("file-backed extract task panicked: {error}"))
-        })??;
+        .await?;
 
     let mut timings = TaskTimings::from_stage(
         queue_wait_ms,

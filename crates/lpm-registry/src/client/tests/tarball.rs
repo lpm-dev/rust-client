@@ -534,6 +534,62 @@ async fn file_spools_share_an_aggregate_compressed_size_budget() {
 }
 
 #[tokio::test]
+async fn cancelled_file_consumer_retains_spool_budget_until_worker_finishes() {
+    use super::super::tarball::CompressedTarballSpoolBudget;
+
+    let budget = CompressedTarballSpoolBudget::new(4);
+    let reservation = budget.reserve(Some(4), 4).await.unwrap();
+    let downloaded = DownloadedTarball::new(
+        tempfile::NamedTempFile::new().unwrap(),
+        "sha512-fixture".into(),
+        "sha512-fixture".into(),
+        4,
+        reservation,
+    )
+    .unwrap();
+    let path = downloaded.file.path().to_path_buf();
+    let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+    let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+    let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+    let task = tokio::spawn(async move {
+        let downloaded = downloaded;
+        tokio::task::spawn_blocking(move || {
+            started_tx.send(()).unwrap();
+            let _ = resume_rx.recv();
+            assert!(downloaded.file.path().exists());
+            let _ = done_tx.send(());
+        })
+        .await
+        .unwrap();
+    });
+    started_rx.await.unwrap();
+    task.abort();
+    assert!(task.await.unwrap_err().is_cancelled());
+    assert!(path.exists());
+    let early_reservation = tokio::time::timeout(
+        std::time::Duration::from_millis(100),
+        budget.reserve(Some(4), 4),
+    )
+    .await;
+    let retained = early_reservation.is_err();
+    drop(early_reservation);
+    resume_tx.send(()).unwrap();
+    done_rx.await.unwrap();
+    let _reservation = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        budget.reserve(Some(4), 4),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(
+        retained,
+        "the worker's temporary file must retain its spool budget"
+    );
+    assert!(!path.exists());
+}
+
+#[tokio::test]
 async fn file_spool_rejects_retention_larger_than_its_reservation() {
     use super::super::tarball::CompressedTarballSpoolBudget;
 

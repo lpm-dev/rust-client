@@ -525,14 +525,14 @@ impl RegistryClient {
         &self,
         url: &str,
     ) -> Result<(Vec<u8>, String), LpmError> {
-        let downloaded = self.download_tarball_to_file(url).await?;
+        let mut downloaded = self.download_tarball_to_file(url).await?;
         let data = std::fs::read(downloaded.file.path()).map_err(|e| {
             LpmError::Io(std::io::Error::new(
                 e.kind(),
                 format!("failed to read downloaded tarball: {e}"),
             ))
         })?;
-        Ok((data, downloaded.sri))
+        Ok((data, std::mem::take(&mut downloaded.sri)))
     }
 
     /// Download a tarball from an arbitrary URL and verify its content
@@ -619,16 +619,14 @@ async fn verify_downloaded_tarball_integrity(
     use lpm_common::integrity::Integrity;
 
     let expected = Integrity::parse(expected_integrity)?;
-    let path = downloaded.file.path().to_path_buf();
-    let expected_for_verification = expected.clone();
-    tokio::task::spawn_blocking(move || expected_for_verification.verify_file(&path))
-        .await
-        .map_err(|error| {
-            LpmError::Registry(format!("tarball integrity task panicked: {error}"))
-        })??;
-    let mut downloaded = downloaded;
-    downloaded.sri = expected.to_string();
-    Ok(downloaded)
+    tokio::task::spawn_blocking(move || {
+        expected.verify_file(downloaded.file.path())?;
+        let mut downloaded = downloaded;
+        downloaded.sri = expected.to_string();
+        Ok(downloaded)
+    })
+    .await
+    .map_err(|error| LpmError::Registry(format!("tarball integrity task panicked: {error}")))?
 }
 
 pub(super) fn write_tarball_chunk(
@@ -650,4 +648,72 @@ pub(super) fn flush_tarball_file(writer: &mut impl std::io::Write) -> Result<(),
             format!("failed to flush tarball temp file: {e}"),
         ))
     })
+}
+
+#[cfg(all(test, unix))]
+mod file_ownership_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn cancelled_integrity_verifier_retains_spool_until_file_read_finishes() {
+        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::fs::OpenOptionsExt;
+
+        use lpm_common::integrity::{HashAlgorithm, Integrity};
+
+        let budget = CompressedTarballSpoolBudget::new(4);
+        let reservation = budget.reserve(Some(4), 4).await.unwrap();
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let path = file.path().to_path_buf();
+        std::fs::remove_file(&path).unwrap();
+        let c_path = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+        // The FIFO holds the real verifier inside its file read until cancellation.
+        assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0);
+        let downloaded =
+            DownloadedTarball::new(file, String::new(), String::new(), 4, reservation).unwrap();
+        let expected = Integrity::from_bytes(HashAlgorithm::Sha256, b"data").to_string();
+        let task = tokio::spawn(async move {
+            verify_downloaded_tarball_integrity(downloaded, &expected).await
+        });
+        let mut writer = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                match std::fs::OpenOptions::new()
+                    .write(true)
+                    .custom_flags(libc::O_NONBLOCK)
+                    .open(&path)
+                {
+                    Ok(writer) => break writer,
+                    Err(error) if error.raw_os_error() == Some(libc::ENXIO) => {
+                        tokio::task::yield_now().await;
+                    }
+                    Err(error) => panic!("opening verifier FIFO: {error}"),
+                }
+            }
+        })
+        .await
+        .unwrap();
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        let early_reservation = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            budget.reserve(Some(4), 4),
+        )
+        .await;
+        let retained = early_reservation.is_err();
+        drop(early_reservation);
+        std::io::Write::write_all(&mut writer, b"data").unwrap();
+        drop(writer);
+        let _reservation = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            budget.reserve(Some(4), 4),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(
+            retained,
+            "the blocking verifier must retain its spool budget"
+        );
+        assert!(!path.exists());
+    }
 }

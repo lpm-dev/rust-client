@@ -1826,12 +1826,24 @@ async fn speculative_v3_object_spools_when_offered_a_streaming_lane() {
     assert_large_speculation_streams(SpeculationStreamMode::V3, false).await;
 }
 
+#[tokio::test]
+async fn medium_speculation_spools_then_streams_with_canonical_sha512_integrity() {
+    assert_large_speculation_streams(SpeculationStreamMode::Medium, false).await;
+}
+
+#[tokio::test]
+async fn medium_speculation_integrity_mismatch_releases_capacity_and_staging() {
+    assert_large_speculation_streams(SpeculationStreamMode::MediumMismatch, false).await;
+}
+
 #[derive(Clone, Copy)]
 enum SpeculationStreamMode {
     Enabled,
     Claimed,
     Disabled,
     V3,
+    Medium,
+    MediumMismatch,
 }
 
 async fn assert_large_speculation_streams(mode: SpeculationStreamMode, cancel: bool) {
@@ -1887,15 +1899,26 @@ async fn assert_large_speculation_streams(mode: SpeculationStreamMode, cancel: b
     let coord = Arc::new(FetchCoordinator::default());
     let key = registry_install_pkg_key("test-tarball-pkg", "1.0.0", &route, client.as_ref());
     let key_lock = coord.lock_for(key).await;
-    let expected_integrity = integrity.clone();
+    let medium = matches!(
+        mode,
+        SpeculationStreamMode::Medium | SpeculationStreamMode::MediumMismatch
+    );
+    let mismatch = matches!(mode, SpeculationStreamMode::MediumMismatch);
+    let expected_integrity = if mismatch {
+        Integrity::from_bytes(HashAlgorithm::Sha256, b"different archive").to_string()
+    } else if medium {
+        Integrity::from_bytes(HashAlgorithm::Sha256, &build_test_tarball()).to_string()
+    } else {
+        integrity.clone()
+    };
     let download_slots = Arc::clone(&downloads);
     let fetch = tokio::spawn(async move {
         let lane = V2StreamingLane::default();
         if matches!(mode, SpeculationStreamMode::Claimed) {
             assert!(lane.try_claim());
         }
-        let lane = (!matches!(mode, SpeculationStreamMode::Disabled)).then_some(&lane);
-        speculative_download_and_store(
+        let offered_lane = (!matches!(mode, SpeculationStreamMode::Disabled)).then_some(&lane);
+        let result = speculative_download_and_store(
             &client,
             &route,
             &store,
@@ -1907,12 +1930,23 @@ async fn assert_large_speculation_streams(mode: SpeculationStreamMode, cancel: b
             "1.0.0",
             &format!("http://{address}/large.tgz"),
             Some(&expected_integrity),
-            std::num::NonZeroU64::new(LARGE_V2_STREAMING_OBJECT_BYTES),
-            lane,
+            std::num::NonZeroU64::new(if medium {
+                16 * 1024 * 1024
+            } else {
+                LARGE_V2_STREAMING_OBJECT_BYTES
+            }),
+            offered_lane,
             &limiter,
             ManagedInstallAccounting,
         )
-        .await
+        .await;
+        if medium {
+            assert!(
+                lane.try_claim(),
+                "medium files must leave the live lane free"
+            );
+        }
+        result
     });
     tokio::time::timeout(std::time::Duration::from_secs(2), body_started.notified())
         .await
@@ -1953,15 +1987,28 @@ async fn assert_large_speculation_streams(mode: SpeculationStreamMode, cancel: b
         let outcome = tokio::time::timeout(std::time::Duration::from_secs(5), fetch)
             .await
             .unwrap()
-            .unwrap()
             .unwrap();
-        assert_eq!(outcome, SpeculativeFetchOutcome::Stored);
-        assert!(
-            inspect_store
-                .reusable_object_dir(&integrity)
-                .unwrap()
-                .is_some()
-        );
+        if mismatch {
+            assert!(matches!(outcome, Err(LpmError::IntegrityMismatch { .. })));
+            assert!(
+                inspect_store
+                    .reusable_object_dir(&integrity)
+                    .unwrap()
+                    .is_none()
+            );
+            let objects_root = store_path.join("objects");
+            assert!(
+                !objects_root.exists() || std::fs::read_dir(objects_root).unwrap().next().is_none()
+            );
+        } else {
+            assert_eq!(outcome.unwrap(), SpeculativeFetchOutcome::Stored);
+            assert!(
+                inspect_store
+                    .reusable_object_dir(&integrity)
+                    .unwrap()
+                    .is_some()
+            );
+        }
         assert_eq!(capacity.available_permits(), 4);
         assert_eq!(downloads.available_permits(), 1);
     }
