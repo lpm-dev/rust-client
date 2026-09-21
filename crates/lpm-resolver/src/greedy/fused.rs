@@ -2733,7 +2733,8 @@ pub async fn resolve_greedy_fused_with_cache_options_policy_and_selected_events_
                             &shared_cache,
                             shared_fact_cache.as_ref(),
                             &canonical,
-                        ) {
+                        ) && info_arc.versions_complete
+                        {
                             return ensure_policy_metadata_for_cached_manifest(
                                 &canonical,
                                 info_arc,

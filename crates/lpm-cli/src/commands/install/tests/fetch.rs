@@ -1891,3 +1891,31 @@ async fn tarball_url_install_handles_301_redirect() {
     // final-body content.
     assert!(store.has_tarball(&computed_sri));
 }
+
+#[test]
+fn speculative_picker_prefers_a_satisfying_latest_over_a_higher_version() {
+    let metadata = SpeculativePackageMetadata::from(registry_metadata(serde_json::json!({
+        "name": "fixture",
+        "dist-tags": {"latest": "2.1.0"},
+        "versions": {
+            "2.1.0": {"name": "fixture", "version": "2.1.0", "dist": {"tarball": "https://registry.example/2.1.0.tgz"}},
+            "2.9.0": {"name": "fixture", "version": "2.9.0", "dist": {"tarball": "https://registry.example/2.9.0.tgz"}}
+        }
+    })));
+    assert_eq!(
+        pick_speculative_version(&metadata, "^2"),
+        Some((
+            "2.1.0".into(),
+            "https://registry.example/2.1.0.tgz".into(),
+            None
+        ))
+    );
+    assert_eq!(
+        pick_speculative_version(&metadata, "^2.8"),
+        Some((
+            "2.9.0".into(),
+            "https://registry.example/2.9.0.tgz".into(),
+            None
+        ))
+    );
+}

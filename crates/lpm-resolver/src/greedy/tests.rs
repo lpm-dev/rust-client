@@ -7176,3 +7176,66 @@ async fn partial_exact_cache_hydrates_history_before_selecting_an_override() {
     assert_eq!(result.packages[0].version.to_string(), "1.0.0");
     assert_eq!(result.applied_overrides.len(), 1);
 }
+
+#[tokio::test]
+async fn exact_alias_metadata_hydrates_history_for_an_older_required_peer() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    let mut consumer = version_document_json("consumer", "1.0.0", &[]);
+    consumer["peerDependencies"] = serde_json::json!({"shared": "^1"});
+    for (endpoint, document) in [
+        ("/consumer/1.0.0", consumer),
+        (
+            "/shared/2.0.0",
+            version_document_json("shared", "2.0.0", &[]),
+        ),
+    ] {
+        Mock::given(method("GET"))
+            .and(path(endpoint))
+            .respond_with(ResponseTemplate::new(200).set_body_json(document))
+            .expect(1)
+            .mount(&server)
+            .await;
+    }
+    let mut history = metadata_json_version("shared", "2.0.0", &[]);
+    history["versions"]["1.0.0"] = version_document_json("shared", "1.0.0", &[]);
+    Mock::given(method("GET"))
+        .and(path("/shared"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(history))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let result = resolve_greedy_fused_with_cache_options_and_policy(
+        Arc::new(
+            RegistryClient::new()
+                .with_npm_registry_url(server.uri())
+                .with_cache_dir(None),
+        ),
+        HashMap::from([
+            ("pinned".into(), "npm:shared@2.0.0".into()),
+            ("consumer".into(), "1.0.0".into()),
+        ]),
+        OverrideSet::empty(),
+        RouteTable::from_mode_only(RouteMode::Direct),
+        8,
+        None,
+        Arc::default(),
+        true,
+        true,
+        ResolverPolicy::default(),
+    )
+    .await
+    .expect("the complete history contains the required older peer");
+    let versions: std::collections::BTreeSet<_> = result
+        .packages
+        .iter()
+        .filter(|package| package.package.canonical_name() == "shared")
+        .map(|package| package.version.to_string())
+        .collect();
+    assert_eq!(
+        versions,
+        std::collections::BTreeSet::from(["1.0.0".into(), "2.0.0".into()])
+    );
+}
