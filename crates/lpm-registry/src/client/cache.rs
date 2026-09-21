@@ -20,7 +20,7 @@ const METADATA_CACHE_ETAG_LINE_CAP: u64 = 8 * 1024;
 const METADATA_CACHE_FRESHNESS_LINE_CAP: u64 = 20;
 pub(super) const MAX_PENDING_METADATA_CACHE_BYTES: usize = 128 * 1024 * 1024;
 // MessagePack reserves 0xc1, so older readers treat JSON fallback entries as misses.
-const METADATA_CACHE_JSON_MARKER: u8 = 0xc1;
+pub(super) const METADATA_CACHE_JSON_MARKER: u8 = 0xc1;
 
 /// Magic header for the manifest cache file format. Replaces the
 /// per-payload HMAC-SHA256 that used to run on every write. The cache
@@ -962,6 +962,8 @@ impl RegistryClient {
             }
         };
         let path = self.cache_path(key)?;
+        let mutation = self.metadata_cache_mutation(&path);
+        let revision = mutation.revision.fetch_add(1, Ordering::AcqRel) + 1;
 
         let etag_str = etag
             .filter(|etag| etag.len() as u64 <= METADATA_CACHE_ETAG_LINE_CAP)
@@ -987,9 +989,6 @@ impl RegistryClient {
         };
         let skip_exhausted = |limit| match limit {
             BufferLimit::Budget => {
-                self.metadata_cache_mutation(&path)
-                    .revision
-                    .fetch_add(1, Ordering::AcqRel);
                 tracing::debug!(
                     "skipping best-effort metadata cache write because the allocation budget is full"
                 );
@@ -1026,8 +1025,6 @@ impl RegistryClient {
         }
 
         let key_owned = key.to_string();
-        let mutation = self.metadata_cache_mutation(&path);
-        let revision = mutation.revision.fetch_add(1, Ordering::AcqRel) + 1;
         let runtime_handle = tokio::runtime::Handle::try_current();
         if self.synchronous_cache_writes || runtime_handle.is_err() {
             let _operation = mutation
@@ -1129,6 +1126,136 @@ impl RegistryClient {
 mod pending_write_budget_tests {
     use super::*;
 
+    struct PausedSerialization {
+        started: std::sync::mpsc::SyncSender<()>,
+        resume: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
+        value: serde_json::Value,
+    }
+
+    impl serde::Serialize for PausedSerialization {
+        fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+            self.started.send(()).unwrap();
+            self.resume.lock().unwrap().recv().unwrap();
+            self.value.serialize(serializer)
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn newer_cache_mutations_win_over_an_older_paused_serializer() {
+        for action in ["invalidate", "no-store", "replace"] {
+            let cache_dir = tempfile::tempdir().unwrap();
+            let client =
+                Arc::new(RegistryClient::new().with_cache_dir(Some(cache_dir.path().into())));
+            let (started, observed) = std::sync::mpsc::sync_channel(1);
+            let (resume, resumed) = std::sync::mpsc::sync_channel(1);
+            let old_client = client.clone();
+            let older = tokio::task::spawn_blocking(move || {
+                old_client.write_metadata_cache(
+                    "ordered",
+                    &PausedSerialization {
+                        started,
+                        resume: std::sync::Mutex::new(resumed),
+                        value: serde_json::json!({"name":"older"}),
+                    },
+                    None,
+                );
+            });
+            observed
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .unwrap();
+            match action {
+                "invalidate" => client.invalidate_metadata_cache_key("ordered"),
+                "no-store" => {
+                    client.write_metadata_cache_with_directive(
+                        "ordered",
+                        &serde_json::json!({"name":"newer"}),
+                        None,
+                        MetadataCacheDirective::NoStore,
+                    );
+                }
+                _ => client.write_metadata_cache(
+                    "ordered",
+                    &serde_json::json!({"name":"newer"}),
+                    None,
+                ),
+            }
+            resume.send(()).unwrap();
+            older.await.unwrap();
+            client.flush_pending_cache_writes().await;
+            if action == "replace" {
+                let (value, _) = client
+                    .read_metadata_cache_as::<serde_json::Value>("ordered")
+                    .unwrap();
+                assert_eq!(value["name"], "newer");
+            } else {
+                assert!(
+                    !client.cache_path("ordered").unwrap().exists(),
+                    "{action} was overwritten by older serialization"
+                );
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn older_serialization_budget_failure_cannot_cancel_a_newer_queued_write() {
+        let cache_dir = tempfile::tempdir().unwrap();
+        let mut client = RegistryClient::new().with_cache_dir(Some(cache_dir.path().into()));
+        client.pending_cache_write_bytes = Arc::new(tokio::sync::Semaphore::new(12_000));
+        let client = Arc::new(client);
+        let (started, observed) = std::sync::mpsc::sync_channel(1);
+        let (resume, resumed) = std::sync::mpsc::sync_channel(1);
+        let (finished, completed) = std::sync::mpsc::sync_channel(1);
+        let old_client = client.clone();
+        let older = tokio::task::spawn_blocking(move || {
+            old_client.write_metadata_cache(
+                "ordered",
+                &PausedSerialization {
+                    started,
+                    resume: std::sync::Mutex::new(resumed),
+                    value: serde_json::json!({"name":"older", "payload":"x".repeat(8192)}),
+                },
+                None,
+            );
+            finished.send(()).unwrap();
+        });
+        observed
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        let mutation = client.metadata_cache_mutation(&client.cache_path("ordered").unwrap());
+        {
+            let _operation = mutation.operation.lock().unwrap();
+            client.write_metadata_cache("ordered", &serde_json::json!({"name":"newer"}), None);
+            resume.send(()).unwrap();
+            completed
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .unwrap();
+        }
+        older.await.unwrap();
+        client.flush_pending_cache_writes().await;
+        let (value, _) = client
+            .read_metadata_cache_as::<serde_json::Value>("ordered")
+            .unwrap();
+        assert_eq!(value["name"], "newer");
+        assert_eq!(client.pending_cache_write_bytes.available_permits(), 12_000);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn newer_admission_failure_supersedes_an_older_queued_write() {
+        let cache_dir = tempfile::tempdir().unwrap();
+        let mut client = RegistryClient::new().with_cache_dir(Some(cache_dir.path().into()));
+        client.pending_cache_write_bytes = Arc::new(tokio::sync::Semaphore::new(5000));
+        let path = client.cache_path("ordered").unwrap();
+        let mutation = client.metadata_cache_mutation(&path);
+        {
+            let _operation = mutation.operation.lock().unwrap();
+            client.write_metadata_cache("ordered", &serde_json::json!({"name":"older"}), None);
+            client.write_metadata_cache("ordered", &serde_json::json!({"name":"newer"}), None);
+        }
+        client.flush_pending_cache_writes().await;
+        assert!(!path.exists());
+        assert_eq!(client.pending_cache_write_bytes.available_permits(), 5000);
+    }
+
     #[tokio::test]
     async fn exhausted_cache_budget_skips_serialization_before_allocating_a_buffer() {
         struct CountSerialization(std::sync::atomic::AtomicUsize);
@@ -1196,11 +1323,53 @@ mod pending_write_budget_tests {
             .read_metadata_cache_as::<String>("json-fallback")
             .unwrap();
         assert_eq!(value, "json fallback");
+        let raw = client.read_cache_content("json-fallback").unwrap().data;
+        assert_eq!(raw.first(), Some(&METADATA_CACHE_JSON_MARKER));
+        assert_eq!(
+            RegistryClient::deserialize_cached_metadata_as::<String>(&raw),
+            Some(value.clone())
+        );
+        let (stale, _, _) = RegistryClient::read_stale_metadata_cache_path_as::<String>(
+            &client.cache_path("json-fallback").unwrap(),
+        )
+        .unwrap();
+        assert_eq!(stale, value);
         assert_eq!(etag.as_deref(), Some("\"v1\""));
         assert_eq!(
             client.pending_cache_write_bytes.available_permits(),
             MAX_PENDING_METADATA_CACHE_BYTES
         );
+    }
+
+    #[test]
+    fn malformed_tagged_json_cache_payloads_are_misses() {
+        let cache_dir = tempfile::tempdir().unwrap();
+        let client = RegistryClient::new().with_cache_dir(Some(cache_dir.path().into()));
+        let path = client.cache_path("malformed").unwrap();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        for payload in [b"".as_slice(), b"{", b"null trailing"] {
+            let mut contents = METADATA_CACHE_MAGIC.to_vec();
+            contents.extend_from_slice(b"300\n\n");
+            contents.push(METADATA_CACHE_JSON_MARKER);
+            contents.extend_from_slice(payload);
+            std::fs::write(&path, contents).unwrap();
+            filetime::set_file_mtime(
+                &path,
+                filetime::FileTime::from_system_time(
+                    std::time::SystemTime::now() + METADATA_CACHE_TTL,
+                ),
+            )
+            .unwrap();
+            assert!(
+                client
+                    .read_metadata_cache_as::<serde_json::Value>("malformed")
+                    .is_none()
+            );
+            assert!(
+                RegistryClient::read_stale_metadata_cache_path_as::<serde_json::Value>(&path)
+                    .is_none()
+            );
+        }
     }
 
     #[tokio::test]

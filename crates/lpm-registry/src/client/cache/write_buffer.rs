@@ -225,16 +225,28 @@ mod tests {
         struct ShortWriter {
             bytes: Vec<u8>,
             interrupted: bool,
+            crossed_boundary: bool,
         }
         impl Write for ShortWriter {
-            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            fn write(&mut self, _bytes: &[u8]) -> io::Result<usize> {
+                panic!("expected vectored output");
+            }
+            fn write_vectored(&mut self, slices: &[IoSlice<'_>]) -> io::Result<usize> {
                 if !self.interrupted {
                     self.interrupted = true;
                     return Err(io::ErrorKind::Interrupted.into());
                 }
-                let count = bytes.len().min(1023);
-                self.bytes.extend_from_slice(&bytes[..count]);
-                Ok(count)
+                let mut written = 0;
+                for (index, slice) in slices.iter().enumerate() {
+                    let count = slice.len().min(8191 - written);
+                    self.bytes.extend_from_slice(&slice[..count]);
+                    self.crossed_boundary |= index > 0 && count > 0;
+                    written += count;
+                    if written == 8191 {
+                        break;
+                    }
+                }
+                Ok(written)
             }
             fn flush(&mut self) -> io::Result<()> {
                 Ok(())
@@ -248,8 +260,10 @@ mod tests {
         let mut writer = ShortWriter {
             bytes: Vec::new(),
             interrupted: false,
+            crossed_boundary: false,
         };
         buffer.write_to(&mut writer).unwrap();
+        assert!(writer.crossed_boundary);
         assert_eq!(&writer.bytes[..6], b"header");
         assert_eq!(&writer.bytes[6..], bytes);
     }
