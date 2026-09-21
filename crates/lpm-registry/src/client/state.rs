@@ -268,6 +268,12 @@ pub struct DownloadedTarball {
     _spool_reservation: CompressedTarballSpoolReservation,
 }
 
+// A Drop implementation prevents disjoint closure capture from separating the
+// temporary file from its budget when a blocking consumer outlives its waiter.
+impl Drop for DownloadedTarball {
+    fn drop(&mut self) {}
+}
+
 impl DownloadedTarball {
     /// Build a file-backed archive while retaining its aggregate spool budget.
     pub fn new(
