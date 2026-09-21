@@ -1,0 +1,679 @@
+{
+  "scored_installs": 128,
+  "errors": 0,
+  "preliminary_installs": 16,
+  "order": [
+    {
+      "fixture": "native-sharp",
+      "mode": "cold",
+      "positions": {
+        "lpm-baseline": {
+          "1": 2,
+          "4": 2,
+          "3": 2,
+          "2": 2
+        },
+        "lpm-candidate": {
+          "2": 2,
+          "1": 2,
+          "4": 2,
+          "3": 2
+        },
+        "lpm-workers2": {
+          "3": 2,
+          "2": 2,
+          "1": 2,
+          "4": 2
+        },
+        "bun": {
+          "4": 2,
+          "3": 2,
+          "2": 2,
+          "1": 2
+        }
+      },
+      "pair_first_counts": {
+        "lpm-baseline / lpm-candidate": 4,
+        "lpm-baseline / lpm-workers2": 4,
+        "lpm-baseline / bun": 4,
+        "lpm-candidate / lpm-workers2": 4,
+        "lpm-candidate / bun": 4,
+        "lpm-workers2 / bun": 4
+      }
+    },
+    {
+      "fixture": "native-sharp",
+      "mode": "ci-cold",
+      "positions": {
+        "lpm-baseline": {
+          "1": 2,
+          "4": 2,
+          "3": 2,
+          "2": 2
+        },
+        "lpm-candidate": {
+          "2": 2,
+          "1": 2,
+          "4": 2,
+          "3": 2
+        },
+        "lpm-workers2": {
+          "3": 2,
+          "2": 2,
+          "1": 2,
+          "4": 2
+        },
+        "bun": {
+          "4": 2,
+          "3": 2,
+          "2": 2,
+          "1": 2
+        }
+      },
+      "pair_first_counts": {
+        "lpm-baseline / lpm-candidate": 4,
+        "lpm-baseline / lpm-workers2": 4,
+        "lpm-baseline / bun": 4,
+        "lpm-candidate / lpm-workers2": 4,
+        "lpm-candidate / bun": 4,
+        "lpm-workers2 / bun": 4
+      }
+    },
+    {
+      "fixture": "nest",
+      "mode": "cold",
+      "positions": {
+        "lpm-baseline": {
+          "1": 2,
+          "4": 2,
+          "3": 2,
+          "2": 2
+        },
+        "lpm-candidate": {
+          "2": 2,
+          "1": 2,
+          "4": 2,
+          "3": 2
+        },
+        "lpm-workers2": {
+          "3": 2,
+          "2": 2,
+          "1": 2,
+          "4": 2
+        },
+        "bun": {
+          "4": 2,
+          "3": 2,
+          "2": 2,
+          "1": 2
+        }
+      },
+      "pair_first_counts": {
+        "lpm-baseline / lpm-candidate": 4,
+        "lpm-baseline / lpm-workers2": 4,
+        "lpm-baseline / bun": 4,
+        "lpm-candidate / lpm-workers2": 4,
+        "lpm-candidate / bun": 4,
+        "lpm-workers2 / bun": 4
+      }
+    },
+    {
+      "fixture": "nest",
+      "mode": "ci-cold",
+      "positions": {
+        "lpm-baseline": {
+          "1": 2,
+          "4": 2,
+          "3": 2,
+          "2": 2
+        },
+        "lpm-candidate": {
+          "2": 2,
+          "1": 2,
+          "4": 2,
+          "3": 2
+        },
+        "lpm-workers2": {
+          "3": 2,
+          "2": 2,
+          "1": 2,
+          "4": 2
+        },
+        "bun": {
+          "4": 2,
+          "3": 2,
+          "2": 2,
+          "1": 2
+        }
+      },
+      "pair_first_counts": {
+        "lpm-baseline / lpm-candidate": 4,
+        "lpm-baseline / lpm-workers2": 4,
+        "lpm-baseline / bun": 4,
+        "lpm-candidate / lpm-workers2": 4,
+        "lpm-candidate / bun": 4,
+        "lpm-workers2 / bun": 4
+      }
+    }
+  ],
+  "pairs": [
+    {
+      "fixture": "native-sharp",
+      "mode": "cold",
+      "comparison": "lpm-baseline",
+      "wall_paired_median_delta_ms": -7.0,
+      "rss_paired_median_delta_mib": -13.578125,
+      "wall_candidate_wins": 6,
+      "rss_candidate_wins": 8
+    },
+    {
+      "fixture": "native-sharp",
+      "mode": "cold",
+      "comparison": "lpm-workers2",
+      "wall_paired_median_delta_ms": -16.0,
+      "rss_paired_median_delta_mib": 1.453125,
+      "wall_candidate_wins": 7,
+      "rss_candidate_wins": 3
+    },
+    {
+      "fixture": "native-sharp",
+      "mode": "ci-cold",
+      "comparison": "lpm-baseline",
+      "wall_paired_median_delta_ms": 0.5,
+      "rss_paired_median_delta_mib": -4.2109375,
+      "wall_candidate_wins": 3,
+      "rss_candidate_wins": 8
+    },
+    {
+      "fixture": "native-sharp",
+      "mode": "ci-cold",
+      "comparison": "lpm-workers2",
+      "wall_paired_median_delta_ms": 0.5,
+      "rss_paired_median_delta_mib": -0.6015625,
+      "wall_candidate_wins": 3,
+      "rss_candidate_wins": 5
+    },
+    {
+      "fixture": "nest",
+      "mode": "cold",
+      "comparison": "lpm-baseline",
+      "wall_paired_median_delta_ms": -16.5,
+      "rss_paired_median_delta_mib": -5.3828125,
+      "wall_candidate_wins": 6,
+      "rss_candidate_wins": 5
+    },
+    {
+      "fixture": "nest",
+      "mode": "cold",
+      "comparison": "lpm-workers2",
+      "wall_paired_median_delta_ms": -7.5,
+      "rss_paired_median_delta_mib": -1.71875,
+      "wall_candidate_wins": 5,
+      "rss_candidate_wins": 6
+    },
+    {
+      "fixture": "nest",
+      "mode": "ci-cold",
+      "comparison": "lpm-baseline",
+      "wall_paired_median_delta_ms": 3.5,
+      "rss_paired_median_delta_mib": -7.5078125,
+      "wall_candidate_wins": 2,
+      "rss_candidate_wins": 8
+    },
+    {
+      "fixture": "nest",
+      "mode": "ci-cold",
+      "comparison": "lpm-workers2",
+      "wall_paired_median_delta_ms": 4.5,
+      "rss_paired_median_delta_mib": 0.3984375,
+      "wall_candidate_wins": 2,
+      "rss_candidate_wins": 1
+    }
+  ],
+  "locks": [
+    {
+      "fixture": "native-sharp",
+      "sample": 1,
+      "three_lpm_locks_byte_identical": true,
+      "sha256": "a3443f79de995ae4137e83bc8f75214e8edc0e77bcf37590256736df00b5c94a"
+    },
+    {
+      "fixture": "native-sharp",
+      "sample": 2,
+      "three_lpm_locks_byte_identical": true,
+      "sha256": "a3443f79de995ae4137e83bc8f75214e8edc0e77bcf37590256736df00b5c94a"
+    },
+    {
+      "fixture": "native-sharp",
+      "sample": 3,
+      "three_lpm_locks_byte_identical": true,
+      "sha256": "a3443f79de995ae4137e83bc8f75214e8edc0e77bcf37590256736df00b5c94a"
+    },
+    {
+      "fixture": "native-sharp",
+      "sample": 4,
+      "three_lpm_locks_byte_identical": true,
+      "sha256": "a3443f79de995ae4137e83bc8f75214e8edc0e77bcf37590256736df00b5c94a"
+    },
+    {
+      "fixture": "native-sharp",
+      "sample": 5,
+      "three_lpm_locks_byte_identical": true,
+      "sha256": "a3443f79de995ae4137e83bc8f75214e8edc0e77bcf37590256736df00b5c94a"
+    },
+    {
+      "fixture": "native-sharp",
+      "sample": 6,
+      "three_lpm_locks_byte_identical": true,
+      "sha256": "a3443f79de995ae4137e83bc8f75214e8edc0e77bcf37590256736df00b5c94a"
+    },
+    {
+      "fixture": "native-sharp",
+      "sample": 7,
+      "three_lpm_locks_byte_identical": true,
+      "sha256": "a3443f79de995ae4137e83bc8f75214e8edc0e77bcf37590256736df00b5c94a"
+    },
+    {
+      "fixture": "native-sharp",
+      "sample": 8,
+      "three_lpm_locks_byte_identical": true,
+      "sha256": "a3443f79de995ae4137e83bc8f75214e8edc0e77bcf37590256736df00b5c94a"
+    },
+    {
+      "fixture": "nest",
+      "sample": 1,
+      "three_lpm_locks_byte_identical": true,
+      "sha256": "e4301fb934532e0b80b60069b72797b7332831b5e38202f55f21d1b719d4126c"
+    },
+    {
+      "fixture": "nest",
+      "sample": 2,
+      "three_lpm_locks_byte_identical": true,
+      "sha256": "e4301fb934532e0b80b60069b72797b7332831b5e38202f55f21d1b719d4126c"
+    },
+    {
+      "fixture": "nest",
+      "sample": 3,
+      "three_lpm_locks_byte_identical": true,
+      "sha256": "e4301fb934532e0b80b60069b72797b7332831b5e38202f55f21d1b719d4126c"
+    },
+    {
+      "fixture": "nest",
+      "sample": 4,
+      "three_lpm_locks_byte_identical": true,
+      "sha256": "e4301fb934532e0b80b60069b72797b7332831b5e38202f55f21d1b719d4126c"
+    },
+    {
+      "fixture": "nest",
+      "sample": 5,
+      "three_lpm_locks_byte_identical": true,
+      "sha256": "e4301fb934532e0b80b60069b72797b7332831b5e38202f55f21d1b719d4126c"
+    },
+    {
+      "fixture": "nest",
+      "sample": 6,
+      "three_lpm_locks_byte_identical": true,
+      "sha256": "e4301fb934532e0b80b60069b72797b7332831b5e38202f55f21d1b719d4126c"
+    },
+    {
+      "fixture": "nest",
+      "sample": 7,
+      "three_lpm_locks_byte_identical": true,
+      "sha256": "e4301fb934532e0b80b60069b72797b7332831b5e38202f55f21d1b719d4126c"
+    },
+    {
+      "fixture": "nest",
+      "sample": 8,
+      "three_lpm_locks_byte_identical": true,
+      "sha256": "e4301fb934532e0b80b60069b72797b7332831b5e38202f55f21d1b719d4126c"
+    }
+  ],
+  "artifacts": [
+    {
+      "fixture": "native-sharp",
+      "sample": 1,
+      "lpm_manifest_identities": 11,
+      "critical_artifacts": 2,
+      "three_lpm_inventories_equal": true,
+      "bun_critical_artifacts_equal": true,
+      "critical": [
+        {
+          "name": "@img/sharp-darwin-arm64",
+          "version": "0.33.5",
+          "path": "lib/sharp-darwin-arm64.node",
+          "sha256": "72f7425d4d14c7934b793a2b386768a41ea361dbe5a249305f09dbc575e0707a"
+        },
+        {
+          "name": "@img/sharp-libvips-darwin-arm64",
+          "version": "1.0.4",
+          "path": "lib/libvips-cpp.42.dylib",
+          "sha256": "7bff6d21e3f547a7ecaf61bbe359d43e17241280e15ce4e3d153dbe07b9c4769"
+        }
+      ]
+    },
+    {
+      "fixture": "native-sharp",
+      "sample": 2,
+      "lpm_manifest_identities": 11,
+      "critical_artifacts": 2,
+      "three_lpm_inventories_equal": true,
+      "bun_critical_artifacts_equal": true,
+      "critical": [
+        {
+          "name": "@img/sharp-darwin-arm64",
+          "version": "0.33.5",
+          "path": "lib/sharp-darwin-arm64.node",
+          "sha256": "72f7425d4d14c7934b793a2b386768a41ea361dbe5a249305f09dbc575e0707a"
+        },
+        {
+          "name": "@img/sharp-libvips-darwin-arm64",
+          "version": "1.0.4",
+          "path": "lib/libvips-cpp.42.dylib",
+          "sha256": "7bff6d21e3f547a7ecaf61bbe359d43e17241280e15ce4e3d153dbe07b9c4769"
+        }
+      ]
+    },
+    {
+      "fixture": "native-sharp",
+      "sample": 3,
+      "lpm_manifest_identities": 11,
+      "critical_artifacts": 2,
+      "three_lpm_inventories_equal": true,
+      "bun_critical_artifacts_equal": true,
+      "critical": [
+        {
+          "name": "@img/sharp-darwin-arm64",
+          "version": "0.33.5",
+          "path": "lib/sharp-darwin-arm64.node",
+          "sha256": "72f7425d4d14c7934b793a2b386768a41ea361dbe5a249305f09dbc575e0707a"
+        },
+        {
+          "name": "@img/sharp-libvips-darwin-arm64",
+          "version": "1.0.4",
+          "path": "lib/libvips-cpp.42.dylib",
+          "sha256": "7bff6d21e3f547a7ecaf61bbe359d43e17241280e15ce4e3d153dbe07b9c4769"
+        }
+      ]
+    },
+    {
+      "fixture": "native-sharp",
+      "sample": 4,
+      "lpm_manifest_identities": 11,
+      "critical_artifacts": 2,
+      "three_lpm_inventories_equal": true,
+      "bun_critical_artifacts_equal": true,
+      "critical": [
+        {
+          "name": "@img/sharp-darwin-arm64",
+          "version": "0.33.5",
+          "path": "lib/sharp-darwin-arm64.node",
+          "sha256": "72f7425d4d14c7934b793a2b386768a41ea361dbe5a249305f09dbc575e0707a"
+        },
+        {
+          "name": "@img/sharp-libvips-darwin-arm64",
+          "version": "1.0.4",
+          "path": "lib/libvips-cpp.42.dylib",
+          "sha256": "7bff6d21e3f547a7ecaf61bbe359d43e17241280e15ce4e3d153dbe07b9c4769"
+        }
+      ]
+    },
+    {
+      "fixture": "native-sharp",
+      "sample": 5,
+      "lpm_manifest_identities": 11,
+      "critical_artifacts": 2,
+      "three_lpm_inventories_equal": true,
+      "bun_critical_artifacts_equal": true,
+      "critical": [
+        {
+          "name": "@img/sharp-darwin-arm64",
+          "version": "0.33.5",
+          "path": "lib/sharp-darwin-arm64.node",
+          "sha256": "72f7425d4d14c7934b793a2b386768a41ea361dbe5a249305f09dbc575e0707a"
+        },
+        {
+          "name": "@img/sharp-libvips-darwin-arm64",
+          "version": "1.0.4",
+          "path": "lib/libvips-cpp.42.dylib",
+          "sha256": "7bff6d21e3f547a7ecaf61bbe359d43e17241280e15ce4e3d153dbe07b9c4769"
+        }
+      ]
+    },
+    {
+      "fixture": "native-sharp",
+      "sample": 6,
+      "lpm_manifest_identities": 11,
+      "critical_artifacts": 2,
+      "three_lpm_inventories_equal": true,
+      "bun_critical_artifacts_equal": true,
+      "critical": [
+        {
+          "name": "@img/sharp-darwin-arm64",
+          "version": "0.33.5",
+          "path": "lib/sharp-darwin-arm64.node",
+          "sha256": "72f7425d4d14c7934b793a2b386768a41ea361dbe5a249305f09dbc575e0707a"
+        },
+        {
+          "name": "@img/sharp-libvips-darwin-arm64",
+          "version": "1.0.4",
+          "path": "lib/libvips-cpp.42.dylib",
+          "sha256": "7bff6d21e3f547a7ecaf61bbe359d43e17241280e15ce4e3d153dbe07b9c4769"
+        }
+      ]
+    },
+    {
+      "fixture": "native-sharp",
+      "sample": 7,
+      "lpm_manifest_identities": 11,
+      "critical_artifacts": 2,
+      "three_lpm_inventories_equal": true,
+      "bun_critical_artifacts_equal": true,
+      "critical": [
+        {
+          "name": "@img/sharp-darwin-arm64",
+          "version": "0.33.5",
+          "path": "lib/sharp-darwin-arm64.node",
+          "sha256": "72f7425d4d14c7934b793a2b386768a41ea361dbe5a249305f09dbc575e0707a"
+        },
+        {
+          "name": "@img/sharp-libvips-darwin-arm64",
+          "version": "1.0.4",
+          "path": "lib/libvips-cpp.42.dylib",
+          "sha256": "7bff6d21e3f547a7ecaf61bbe359d43e17241280e15ce4e3d153dbe07b9c4769"
+        }
+      ]
+    },
+    {
+      "fixture": "native-sharp",
+      "sample": 8,
+      "lpm_manifest_identities": 11,
+      "critical_artifacts": 2,
+      "three_lpm_inventories_equal": true,
+      "bun_critical_artifacts_equal": true,
+      "critical": [
+        {
+          "name": "@img/sharp-darwin-arm64",
+          "version": "0.33.5",
+          "path": "lib/sharp-darwin-arm64.node",
+          "sha256": "72f7425d4d14c7934b793a2b386768a41ea361dbe5a249305f09dbc575e0707a"
+        },
+        {
+          "name": "@img/sharp-libvips-darwin-arm64",
+          "version": "1.0.4",
+          "path": "lib/libvips-cpp.42.dylib",
+          "sha256": "7bff6d21e3f547a7ecaf61bbe359d43e17241280e15ce4e3d153dbe07b9c4769"
+        }
+      ]
+    },
+    {
+      "fixture": "nest",
+      "sample": 1,
+      "lpm_manifest_identities": 33,
+      "critical_artifacts": 0,
+      "three_lpm_inventories_equal": true,
+      "bun_critical_artifacts_equal": true,
+      "critical": []
+    },
+    {
+      "fixture": "nest",
+      "sample": 2,
+      "lpm_manifest_identities": 33,
+      "critical_artifacts": 0,
+      "three_lpm_inventories_equal": true,
+      "bun_critical_artifacts_equal": true,
+      "critical": []
+    },
+    {
+      "fixture": "nest",
+      "sample": 3,
+      "lpm_manifest_identities": 33,
+      "critical_artifacts": 0,
+      "three_lpm_inventories_equal": true,
+      "bun_critical_artifacts_equal": true,
+      "critical": []
+    },
+    {
+      "fixture": "nest",
+      "sample": 4,
+      "lpm_manifest_identities": 33,
+      "critical_artifacts": 0,
+      "three_lpm_inventories_equal": true,
+      "bun_critical_artifacts_equal": true,
+      "critical": []
+    },
+    {
+      "fixture": "nest",
+      "sample": 5,
+      "lpm_manifest_identities": 33,
+      "critical_artifacts": 0,
+      "three_lpm_inventories_equal": true,
+      "bun_critical_artifacts_equal": true,
+      "critical": []
+    },
+    {
+      "fixture": "nest",
+      "sample": 6,
+      "lpm_manifest_identities": 33,
+      "critical_artifacts": 0,
+      "three_lpm_inventories_equal": true,
+      "bun_critical_artifacts_equal": true,
+      "critical": []
+    },
+    {
+      "fixture": "nest",
+      "sample": 7,
+      "lpm_manifest_identities": 33,
+      "critical_artifacts": 0,
+      "three_lpm_inventories_equal": true,
+      "bun_critical_artifacts_equal": true,
+      "critical": []
+    },
+    {
+      "fixture": "nest",
+      "sample": 8,
+      "lpm_manifest_identities": 33,
+      "critical_artifacts": 0,
+      "three_lpm_inventories_equal": true,
+      "bun_critical_artifacts_equal": true,
+      "critical": []
+    }
+  ],
+  "bun_lock_differences": [
+    {
+      "fixture": "native-sharp",
+      "sample": 1,
+      "lpm_only": [],
+      "bun_only": []
+    },
+    {
+      "fixture": "native-sharp",
+      "sample": 2,
+      "lpm_only": [],
+      "bun_only": []
+    },
+    {
+      "fixture": "native-sharp",
+      "sample": 3,
+      "lpm_only": [],
+      "bun_only": []
+    },
+    {
+      "fixture": "native-sharp",
+      "sample": 4,
+      "lpm_only": [],
+      "bun_only": []
+    },
+    {
+      "fixture": "native-sharp",
+      "sample": 5,
+      "lpm_only": [],
+      "bun_only": []
+    },
+    {
+      "fixture": "native-sharp",
+      "sample": 6,
+      "lpm_only": [],
+      "bun_only": []
+    },
+    {
+      "fixture": "native-sharp",
+      "sample": 7,
+      "lpm_only": [],
+      "bun_only": []
+    },
+    {
+      "fixture": "native-sharp",
+      "sample": 8,
+      "lpm_only": [],
+      "bun_only": []
+    },
+    {
+      "fixture": "nest",
+      "sample": 1,
+      "lpm_only": [],
+      "bun_only": []
+    },
+    {
+      "fixture": "nest",
+      "sample": 2,
+      "lpm_only": [],
+      "bun_only": []
+    },
+    {
+      "fixture": "nest",
+      "sample": 3,
+      "lpm_only": [],
+      "bun_only": []
+    },
+    {
+      "fixture": "nest",
+      "sample": 4,
+      "lpm_only": [],
+      "bun_only": []
+    },
+    {
+      "fixture": "nest",
+      "sample": 5,
+      "lpm_only": [],
+      "bun_only": []
+    },
+    {
+      "fixture": "nest",
+      "sample": 6,
+      "lpm_only": [],
+      "bun_only": []
+    },
+    {
+      "fixture": "nest",
+      "sample": 7,
+      "lpm_only": [],
+      "bun_only": []
+    },
+    {
+      "fixture": "nest",
+      "sample": 8,
+      "lpm_only": [],
+      "bun_only": []
+    }
+  ]
+}

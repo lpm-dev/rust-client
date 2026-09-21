@@ -1,0 +1,2271 @@
+{
+  "scored_installs": 512,
+  "errors": 0,
+  "preliminary_installs": 64,
+  "order": [
+    {
+      "fixture": "t3",
+      "mode": "cold",
+      "positions": {
+        "lpm-baseline": {
+          "1": 2,
+          "4": 2,
+          "3": 2,
+          "2": 2
+        },
+        "lpm-candidate": {
+          "2": 2,
+          "1": 2,
+          "4": 2,
+          "3": 2
+        },
+        "lpm-workers2": {
+          "3": 2,
+          "2": 2,
+          "1": 2,
+          "4": 2
+        },
+        "bun": {
+          "4": 2,
+          "3": 2,
+          "2": 2,
+          "1": 2
+        }
+      },
+      "pair_first_counts": {
+        "lpm-baseline / lpm-candidate": 4,
+        "lpm-baseline / lpm-workers2": 4,
+        "lpm-baseline / bun": 4,
+        "lpm-candidate / lpm-workers2": 4,
+        "lpm-candidate / bun": 4,
+        "lpm-workers2 / bun": 4
+      }
+    },
+    {
+      "fixture": "t3",
+      "mode": "ci-cold",
+      "positions": {
+        "lpm-baseline": {
+          "1": 2,
+          "4": 2,
+          "3": 2,
+          "2": 2
+        },
+        "lpm-candidate": {
+          "2": 2,
+          "1": 2,
+          "4": 2,
+          "3": 2
+        },
+        "lpm-workers2": {
+          "3": 2,
+          "2": 2,
+          "1": 2,
+          "4": 2
+        },
+        "bun": {
+          "4": 2,
+          "3": 2,
+          "2": 2,
+          "1": 2
+        }
+      },
+      "pair_first_counts": {
+        "lpm-baseline / lpm-candidate": 4,
+        "lpm-baseline / lpm-workers2": 4,
+        "lpm-baseline / bun": 4,
+        "lpm-candidate / lpm-workers2": 4,
+        "lpm-candidate / bun": 4,
+        "lpm-workers2 / bun": 4
+      }
+    },
+    {
+      "fixture": "t3",
+      "mode": "warm",
+      "positions": {
+        "lpm-baseline": {
+          "1": 2,
+          "4": 2,
+          "3": 2,
+          "2": 2
+        },
+        "lpm-candidate": {
+          "2": 2,
+          "1": 2,
+          "4": 2,
+          "3": 2
+        },
+        "lpm-workers2": {
+          "3": 2,
+          "2": 2,
+          "1": 2,
+          "4": 2
+        },
+        "bun": {
+          "4": 2,
+          "3": 2,
+          "2": 2,
+          "1": 2
+        }
+      },
+      "pair_first_counts": {
+        "lpm-baseline / lpm-candidate": 4,
+        "lpm-baseline / lpm-workers2": 4,
+        "lpm-baseline / bun": 4,
+        "lpm-candidate / lpm-workers2": 4,
+        "lpm-candidate / bun": 4,
+        "lpm-workers2 / bun": 4
+      }
+    },
+    {
+      "fixture": "t3",
+      "mode": "up-to-date",
+      "positions": {
+        "lpm-baseline": {
+          "1": 2,
+          "4": 2,
+          "3": 2,
+          "2": 2
+        },
+        "lpm-candidate": {
+          "2": 2,
+          "1": 2,
+          "4": 2,
+          "3": 2
+        },
+        "lpm-workers2": {
+          "3": 2,
+          "2": 2,
+          "1": 2,
+          "4": 2
+        },
+        "bun": {
+          "4": 2,
+          "3": 2,
+          "2": 2,
+          "1": 2
+        }
+      },
+      "pair_first_counts": {
+        "lpm-baseline / lpm-candidate": 4,
+        "lpm-baseline / lpm-workers2": 4,
+        "lpm-baseline / bun": 4,
+        "lpm-candidate / lpm-workers2": 4,
+        "lpm-candidate / bun": 4,
+        "lpm-workers2 / bun": 4
+      }
+    },
+    {
+      "fixture": "vite-react",
+      "mode": "cold",
+      "positions": {
+        "lpm-baseline": {
+          "1": 2,
+          "4": 2,
+          "3": 2,
+          "2": 2
+        },
+        "lpm-candidate": {
+          "2": 2,
+          "1": 2,
+          "4": 2,
+          "3": 2
+        },
+        "lpm-workers2": {
+          "3": 2,
+          "2": 2,
+          "1": 2,
+          "4": 2
+        },
+        "bun": {
+          "4": 2,
+          "3": 2,
+          "2": 2,
+          "1": 2
+        }
+      },
+      "pair_first_counts": {
+        "lpm-baseline / lpm-candidate": 4,
+        "lpm-baseline / lpm-workers2": 4,
+        "lpm-baseline / bun": 4,
+        "lpm-candidate / lpm-workers2": 4,
+        "lpm-candidate / bun": 4,
+        "lpm-workers2 / bun": 4
+      }
+    },
+    {
+      "fixture": "vite-react",
+      "mode": "ci-cold",
+      "positions": {
+        "lpm-baseline": {
+          "1": 2,
+          "4": 2,
+          "3": 2,
+          "2": 2
+        },
+        "lpm-candidate": {
+          "2": 2,
+          "1": 2,
+          "4": 2,
+          "3": 2
+        },
+        "lpm-workers2": {
+          "3": 2,
+          "2": 2,
+          "1": 2,
+          "4": 2
+        },
+        "bun": {
+          "4": 2,
+          "3": 2,
+          "2": 2,
+          "1": 2
+        }
+      },
+      "pair_first_counts": {
+        "lpm-baseline / lpm-candidate": 4,
+        "lpm-baseline / lpm-workers2": 4,
+        "lpm-baseline / bun": 4,
+        "lpm-candidate / lpm-workers2": 4,
+        "lpm-candidate / bun": 4,
+        "lpm-workers2 / bun": 4
+      }
+    },
+    {
+      "fixture": "vite-react",
+      "mode": "warm",
+      "positions": {
+        "lpm-baseline": {
+          "1": 2,
+          "4": 2,
+          "3": 2,
+          "2": 2
+        },
+        "lpm-candidate": {
+          "2": 2,
+          "1": 2,
+          "4": 2,
+          "3": 2
+        },
+        "lpm-workers2": {
+          "3": 2,
+          "2": 2,
+          "1": 2,
+          "4": 2
+        },
+        "bun": {
+          "4": 2,
+          "3": 2,
+          "2": 2,
+          "1": 2
+        }
+      },
+      "pair_first_counts": {
+        "lpm-baseline / lpm-candidate": 4,
+        "lpm-baseline / lpm-workers2": 4,
+        "lpm-baseline / bun": 4,
+        "lpm-candidate / lpm-workers2": 4,
+        "lpm-candidate / bun": 4,
+        "lpm-workers2 / bun": 4
+      }
+    },
+    {
+      "fixture": "vite-react",
+      "mode": "up-to-date",
+      "positions": {
+        "lpm-baseline": {
+          "1": 2,
+          "4": 2,
+          "3": 2,
+          "2": 2
+        },
+        "lpm-candidate": {
+          "2": 2,
+          "1": 2,
+          "4": 2,
+          "3": 2
+        },
+        "lpm-workers2": {
+          "3": 2,
+          "2": 2,
+          "1": 2,
+          "4": 2
+        },
+        "bun": {
+          "4": 2,
+          "3": 2,
+          "2": 2,
+          "1": 2
+        }
+      },
+      "pair_first_counts": {
+        "lpm-baseline / lpm-candidate": 4,
+        "lpm-baseline / lpm-workers2": 4,
+        "lpm-baseline / bun": 4,
+        "lpm-candidate / lpm-workers2": 4,
+        "lpm-candidate / bun": 4,
+        "lpm-workers2 / bun": 4
+      }
+    },
+    {
+      "fixture": "native-sharp",
+      "mode": "cold",
+      "positions": {
+        "lpm-baseline": {
+          "1": 2,
+          "4": 2,
+          "3": 2,
+          "2": 2
+        },
+        "lpm-candidate": {
+          "2": 2,
+          "1": 2,
+          "4": 2,
+          "3": 2
+        },
+        "lpm-workers2": {
+          "3": 2,
+          "2": 2,
+          "1": 2,
+          "4": 2
+        },
+        "bun": {
+          "4": 2,
+          "3": 2,
+          "2": 2,
+          "1": 2
+        }
+      },
+      "pair_first_counts": {
+        "lpm-baseline / lpm-candidate": 4,
+        "lpm-baseline / lpm-workers2": 4,
+        "lpm-baseline / bun": 4,
+        "lpm-candidate / lpm-workers2": 4,
+        "lpm-candidate / bun": 4,
+        "lpm-workers2 / bun": 4
+      }
+    },
+    {
+      "fixture": "native-sharp",
+      "mode": "ci-cold",
+      "positions": {
+        "lpm-baseline": {
+          "1": 2,
+          "4": 2,
+          "3": 2,
+          "2": 2
+        },
+        "lpm-candidate": {
+          "2": 2,
+          "1": 2,
+          "4": 2,
+          "3": 2
+        },
+        "lpm-workers2": {
+          "3": 2,
+          "2": 2,
+          "1": 2,
+          "4": 2
+        },
+        "bun": {
+          "4": 2,
+          "3": 2,
+          "2": 2,
+          "1": 2
+        }
+      },
+      "pair_first_counts": {
+        "lpm-baseline / lpm-candidate": 4,
+        "lpm-baseline / lpm-workers2": 4,
+        "lpm-baseline / bun": 4,
+        "lpm-candidate / lpm-workers2": 4,
+        "lpm-candidate / bun": 4,
+        "lpm-workers2 / bun": 4
+      }
+    },
+    {
+      "fixture": "native-sharp",
+      "mode": "warm",
+      "positions": {
+        "lpm-baseline": {
+          "1": 2,
+          "4": 2,
+          "3": 2,
+          "2": 2
+        },
+        "lpm-candidate": {
+          "2": 2,
+          "1": 2,
+          "4": 2,
+          "3": 2
+        },
+        "lpm-workers2": {
+          "3": 2,
+          "2": 2,
+          "1": 2,
+          "4": 2
+        },
+        "bun": {
+          "4": 2,
+          "3": 2,
+          "2": 2,
+          "1": 2
+        }
+      },
+      "pair_first_counts": {
+        "lpm-baseline / lpm-candidate": 4,
+        "lpm-baseline / lpm-workers2": 4,
+        "lpm-baseline / bun": 4,
+        "lpm-candidate / lpm-workers2": 4,
+        "lpm-candidate / bun": 4,
+        "lpm-workers2 / bun": 4
+      }
+    },
+    {
+      "fixture": "native-sharp",
+      "mode": "up-to-date",
+      "positions": {
+        "lpm-baseline": {
+          "1": 2,
+          "4": 2,
+          "3": 2,
+          "2": 2
+        },
+        "lpm-candidate": {
+          "2": 2,
+          "1": 2,
+          "4": 2,
+          "3": 2
+        },
+        "lpm-workers2": {
+          "3": 2,
+          "2": 2,
+          "1": 2,
+          "4": 2
+        },
+        "bun": {
+          "4": 2,
+          "3": 2,
+          "2": 2,
+          "1": 2
+        }
+      },
+      "pair_first_counts": {
+        "lpm-baseline / lpm-candidate": 4,
+        "lpm-baseline / lpm-workers2": 4,
+        "lpm-baseline / bun": 4,
+        "lpm-candidate / lpm-workers2": 4,
+        "lpm-candidate / bun": 4,
+        "lpm-workers2 / bun": 4
+      }
+    },
+    {
+      "fixture": "nest",
+      "mode": "cold",
+      "positions": {
+        "lpm-baseline": {
+          "1": 2,
+          "4": 2,
+          "3": 2,
+          "2": 2
+        },
+        "lpm-candidate": {
+          "2": 2,
+          "1": 2,
+          "4": 2,
+          "3": 2
+        },
+        "lpm-workers2": {
+          "3": 2,
+          "2": 2,
+          "1": 2,
+          "4": 2
+        },
+        "bun": {
+          "4": 2,
+          "3": 2,
+          "2": 2,
+          "1": 2
+        }
+      },
+      "pair_first_counts": {
+        "lpm-baseline / lpm-candidate": 4,
+        "lpm-baseline / lpm-workers2": 4,
+        "lpm-baseline / bun": 4,
+        "lpm-candidate / lpm-workers2": 4,
+        "lpm-candidate / bun": 4,
+        "lpm-workers2 / bun": 4
+      }
+    },
+    {
+      "fixture": "nest",
+      "mode": "ci-cold",
+      "positions": {
+        "lpm-baseline": {
+          "1": 2,
+          "4": 2,
+          "3": 2,
+          "2": 2
+        },
+        "lpm-candidate": {
+          "2": 2,
+          "1": 2,
+          "4": 2,
+          "3": 2
+        },
+        "lpm-workers2": {
+          "3": 2,
+          "2": 2,
+          "1": 2,
+          "4": 2
+        },
+        "bun": {
+          "4": 2,
+          "3": 2,
+          "2": 2,
+          "1": 2
+        }
+      },
+      "pair_first_counts": {
+        "lpm-baseline / lpm-candidate": 4,
+        "lpm-baseline / lpm-workers2": 4,
+        "lpm-baseline / bun": 4,
+        "lpm-candidate / lpm-workers2": 4,
+        "lpm-candidate / bun": 4,
+        "lpm-workers2 / bun": 4
+      }
+    },
+    {
+      "fixture": "nest",
+      "mode": "warm",
+      "positions": {
+        "lpm-baseline": {
+          "1": 2,
+          "4": 2,
+          "3": 2,
+          "2": 2
+        },
+        "lpm-candidate": {
+          "2": 2,
+          "1": 2,
+          "4": 2,
+          "3": 2
+        },
+        "lpm-workers2": {
+          "3": 2,
+          "2": 2,
+          "1": 2,
+          "4": 2
+        },
+        "bun": {
+          "4": 2,
+          "3": 2,
+          "2": 2,
+          "1": 2
+        }
+      },
+      "pair_first_counts": {
+        "lpm-baseline / lpm-candidate": 4,
+        "lpm-baseline / lpm-workers2": 4,
+        "lpm-baseline / bun": 4,
+        "lpm-candidate / lpm-workers2": 4,
+        "lpm-candidate / bun": 4,
+        "lpm-workers2 / bun": 4
+      }
+    },
+    {
+      "fixture": "nest",
+      "mode": "up-to-date",
+      "positions": {
+        "lpm-baseline": {
+          "1": 2,
+          "4": 2,
+          "3": 2,
+          "2": 2
+        },
+        "lpm-candidate": {
+          "2": 2,
+          "1": 2,
+          "4": 2,
+          "3": 2
+        },
+        "lpm-workers2": {
+          "3": 2,
+          "2": 2,
+          "1": 2,
+          "4": 2
+        },
+        "bun": {
+          "4": 2,
+          "3": 2,
+          "2": 2,
+          "1": 2
+        }
+      },
+      "pair_first_counts": {
+        "lpm-baseline / lpm-candidate": 4,
+        "lpm-baseline / lpm-workers2": 4,
+        "lpm-baseline / bun": 4,
+        "lpm-candidate / lpm-workers2": 4,
+        "lpm-candidate / bun": 4,
+        "lpm-workers2 / bun": 4
+      }
+    }
+  ],
+  "pairs": [
+    {
+      "fixture": "t3",
+      "mode": "cold",
+      "comparison": "lpm-baseline",
+      "wall_paired_median_delta_ms": -2.0,
+      "rss_paired_median_delta_mib": -96.828125,
+      "wall_candidate_wins": 4,
+      "rss_candidate_wins": 8
+    },
+    {
+      "fixture": "t3",
+      "mode": "cold",
+      "comparison": "lpm-workers2",
+      "wall_paired_median_delta_ms": -77.0,
+      "rss_paired_median_delta_mib": -4.0,
+      "wall_candidate_wins": 5,
+      "rss_candidate_wins": 5
+    },
+    {
+      "fixture": "t3",
+      "mode": "ci-cold",
+      "comparison": "lpm-baseline",
+      "wall_paired_median_delta_ms": -14.0,
+      "rss_paired_median_delta_mib": -19.0078125,
+      "wall_candidate_wins": 5,
+      "rss_candidate_wins": 5
+    },
+    {
+      "fixture": "t3",
+      "mode": "ci-cold",
+      "comparison": "lpm-workers2",
+      "wall_paired_median_delta_ms": -22.0,
+      "rss_paired_median_delta_mib": -2.859375,
+      "wall_candidate_wins": 5,
+      "rss_candidate_wins": 5
+    },
+    {
+      "fixture": "t3",
+      "mode": "warm",
+      "comparison": "lpm-baseline",
+      "wall_paired_median_delta_ms": -1.5,
+      "rss_paired_median_delta_mib": -2.0546875,
+      "wall_candidate_wins": 6,
+      "rss_candidate_wins": 8
+    },
+    {
+      "fixture": "t3",
+      "mode": "warm",
+      "comparison": "lpm-workers2",
+      "wall_paired_median_delta_ms": -3.5,
+      "rss_paired_median_delta_mib": -0.234375,
+      "wall_candidate_wins": 6,
+      "rss_candidate_wins": 5
+    },
+    {
+      "fixture": "t3",
+      "mode": "up-to-date",
+      "comparison": "lpm-baseline",
+      "wall_paired_median_delta_ms": -1.5,
+      "rss_paired_median_delta_mib": -1.1171875,
+      "wall_candidate_wins": 5,
+      "rss_candidate_wins": 8
+    },
+    {
+      "fixture": "t3",
+      "mode": "up-to-date",
+      "comparison": "lpm-workers2",
+      "wall_paired_median_delta_ms": 0.0,
+      "rss_paired_median_delta_mib": 0.359375,
+      "wall_candidate_wins": 3,
+      "rss_candidate_wins": 0
+    },
+    {
+      "fixture": "vite-react",
+      "mode": "cold",
+      "comparison": "lpm-baseline",
+      "wall_paired_median_delta_ms": -37.5,
+      "rss_paired_median_delta_mib": -82.9609375,
+      "wall_candidate_wins": 5,
+      "rss_candidate_wins": 8
+    },
+    {
+      "fixture": "vite-react",
+      "mode": "cold",
+      "comparison": "lpm-workers2",
+      "wall_paired_median_delta_ms": -36.0,
+      "rss_paired_median_delta_mib": -15.375,
+      "wall_candidate_wins": 6,
+      "rss_candidate_wins": 7
+    },
+    {
+      "fixture": "vite-react",
+      "mode": "ci-cold",
+      "comparison": "lpm-baseline",
+      "wall_paired_median_delta_ms": 3.5,
+      "rss_paired_median_delta_mib": -17.9609375,
+      "wall_candidate_wins": 3,
+      "rss_candidate_wins": 8
+    },
+    {
+      "fixture": "vite-react",
+      "mode": "ci-cold",
+      "comparison": "lpm-workers2",
+      "wall_paired_median_delta_ms": 0.0,
+      "rss_paired_median_delta_mib": 0.546875,
+      "wall_candidate_wins": 4,
+      "rss_candidate_wins": 2
+    },
+    {
+      "fixture": "vite-react",
+      "mode": "warm",
+      "comparison": "lpm-baseline",
+      "wall_paired_median_delta_ms": 1.0,
+      "rss_paired_median_delta_mib": -0.40625,
+      "wall_candidate_wins": 3,
+      "rss_candidate_wins": 6
+    },
+    {
+      "fixture": "vite-react",
+      "mode": "warm",
+      "comparison": "lpm-workers2",
+      "wall_paired_median_delta_ms": 2.0,
+      "rss_paired_median_delta_mib": -0.21875,
+      "wall_candidate_wins": 3,
+      "rss_candidate_wins": 5
+    },
+    {
+      "fixture": "vite-react",
+      "mode": "up-to-date",
+      "comparison": "lpm-baseline",
+      "wall_paired_median_delta_ms": -2.0,
+      "rss_paired_median_delta_mib": -1.21875,
+      "wall_candidate_wins": 5,
+      "rss_candidate_wins": 8
+    },
+    {
+      "fixture": "vite-react",
+      "mode": "up-to-date",
+      "comparison": "lpm-workers2",
+      "wall_paired_median_delta_ms": -0.5,
+      "rss_paired_median_delta_mib": -0.0625,
+      "wall_candidate_wins": 4,
+      "rss_candidate_wins": 8
+    },
+    {
+      "fixture": "native-sharp",
+      "mode": "cold",
+      "comparison": "lpm-baseline",
+      "wall_paired_median_delta_ms": -12.5,
+      "rss_paired_median_delta_mib": -12.1953125,
+      "wall_candidate_wins": 5,
+      "rss_candidate_wins": 8
+    },
+    {
+      "fixture": "native-sharp",
+      "mode": "cold",
+      "comparison": "lpm-workers2",
+      "wall_paired_median_delta_ms": -3.5,
+      "rss_paired_median_delta_mib": 0.328125,
+      "wall_candidate_wins": 5,
+      "rss_candidate_wins": 3
+    },
+    {
+      "fixture": "native-sharp",
+      "mode": "ci-cold",
+      "comparison": "lpm-baseline",
+      "wall_paired_median_delta_ms": 0.0,
+      "rss_paired_median_delta_mib": -4.609375,
+      "wall_candidate_wins": 4,
+      "rss_candidate_wins": 8
+    },
+    {
+      "fixture": "native-sharp",
+      "mode": "ci-cold",
+      "comparison": "lpm-workers2",
+      "wall_paired_median_delta_ms": -0.5,
+      "rss_paired_median_delta_mib": -0.125,
+      "wall_candidate_wins": 4,
+      "rss_candidate_wins": 5
+    },
+    {
+      "fixture": "native-sharp",
+      "mode": "warm",
+      "comparison": "lpm-baseline",
+      "wall_paired_median_delta_ms": -2.5,
+      "rss_paired_median_delta_mib": -1.1796875,
+      "wall_candidate_wins": 5,
+      "rss_candidate_wins": 8
+    },
+    {
+      "fixture": "native-sharp",
+      "mode": "warm",
+      "comparison": "lpm-workers2",
+      "wall_paired_median_delta_ms": -0.5,
+      "rss_paired_median_delta_mib": 0.0625,
+      "wall_candidate_wins": 4,
+      "rss_candidate_wins": 1
+    },
+    {
+      "fixture": "native-sharp",
+      "mode": "up-to-date",
+      "comparison": "lpm-baseline",
+      "wall_paired_median_delta_ms": 0.5,
+      "rss_paired_median_delta_mib": -1.09375,
+      "wall_candidate_wins": 3,
+      "rss_candidate_wins": 8
+    },
+    {
+      "fixture": "native-sharp",
+      "mode": "up-to-date",
+      "comparison": "lpm-workers2",
+      "wall_paired_median_delta_ms": 0.5,
+      "rss_paired_median_delta_mib": -0.0078125,
+      "wall_candidate_wins": 2,
+      "rss_candidate_wins": 4
+    },
+    {
+      "fixture": "nest",
+      "mode": "cold",
+      "comparison": "lpm-baseline",
+      "wall_paired_median_delta_ms": -8.5,
+      "rss_paired_median_delta_mib": -11.8046875,
+      "wall_candidate_wins": 5,
+      "rss_candidate_wins": 7
+    },
+    {
+      "fixture": "nest",
+      "mode": "cold",
+      "comparison": "lpm-workers2",
+      "wall_paired_median_delta_ms": 16.0,
+      "rss_paired_median_delta_mib": -5.921875,
+      "wall_candidate_wins": 3,
+      "rss_candidate_wins": 6
+    },
+    {
+      "fixture": "nest",
+      "mode": "ci-cold",
+      "comparison": "lpm-baseline",
+      "wall_paired_median_delta_ms": -6.5,
+      "rss_paired_median_delta_mib": -7.234375,
+      "wall_candidate_wins": 4,
+      "rss_candidate_wins": 8
+    },
+    {
+      "fixture": "nest",
+      "mode": "ci-cold",
+      "comparison": "lpm-workers2",
+      "wall_paired_median_delta_ms": -1.0,
+      "rss_paired_median_delta_mib": -0.03125,
+      "wall_candidate_wins": 4,
+      "rss_candidate_wins": 4
+    },
+    {
+      "fixture": "nest",
+      "mode": "warm",
+      "comparison": "lpm-baseline",
+      "wall_paired_median_delta_ms": -1.0,
+      "rss_paired_median_delta_mib": -1.9140625,
+      "wall_candidate_wins": 5,
+      "rss_candidate_wins": 7
+    },
+    {
+      "fixture": "nest",
+      "mode": "warm",
+      "comparison": "lpm-workers2",
+      "wall_paired_median_delta_ms": -1.0,
+      "rss_paired_median_delta_mib": -0.2265625,
+      "wall_candidate_wins": 4,
+      "rss_candidate_wins": 6
+    },
+    {
+      "fixture": "nest",
+      "mode": "up-to-date",
+      "comparison": "lpm-baseline",
+      "wall_paired_median_delta_ms": 0.0,
+      "rss_paired_median_delta_mib": -1.03125,
+      "wall_candidate_wins": 3,
+      "rss_candidate_wins": 8
+    },
+    {
+      "fixture": "nest",
+      "mode": "up-to-date",
+      "comparison": "lpm-workers2",
+      "wall_paired_median_delta_ms": 0.0,
+      "rss_paired_median_delta_mib": -0.015625,
+      "wall_candidate_wins": 2,
+      "rss_candidate_wins": 5
+    }
+  ],
+  "locks": [
+    {
+      "fixture": "t3",
+      "sample": 1,
+      "three_lpm_locks_byte_identical": true,
+      "sha256": "57d02d5ece2af5504e51c9b93d57508831b18ed266751c83c04cc110e0dffee2"
+    },
+    {
+      "fixture": "t3",
+      "sample": 2,
+      "three_lpm_locks_byte_identical": true,
+      "sha256": "57d02d5ece2af5504e51c9b93d57508831b18ed266751c83c04cc110e0dffee2"
+    },
+    {
+      "fixture": "t3",
+      "sample": 3,
+      "three_lpm_locks_byte_identical": true,
+      "sha256": "57d02d5ece2af5504e51c9b93d57508831b18ed266751c83c04cc110e0dffee2"
+    },
+    {
+      "fixture": "t3",
+      "sample": 4,
+      "three_lpm_locks_byte_identical": true,
+      "sha256": "57d02d5ece2af5504e51c9b93d57508831b18ed266751c83c04cc110e0dffee2"
+    },
+    {
+      "fixture": "t3",
+      "sample": 5,
+      "three_lpm_locks_byte_identical": true,
+      "sha256": "57d02d5ece2af5504e51c9b93d57508831b18ed266751c83c04cc110e0dffee2"
+    },
+    {
+      "fixture": "t3",
+      "sample": 6,
+      "three_lpm_locks_byte_identical": true,
+      "sha256": "57d02d5ece2af5504e51c9b93d57508831b18ed266751c83c04cc110e0dffee2"
+    },
+    {
+      "fixture": "t3",
+      "sample": 7,
+      "three_lpm_locks_byte_identical": true,
+      "sha256": "57d02d5ece2af5504e51c9b93d57508831b18ed266751c83c04cc110e0dffee2"
+    },
+    {
+      "fixture": "t3",
+      "sample": 8,
+      "three_lpm_locks_byte_identical": true,
+      "sha256": "57d02d5ece2af5504e51c9b93d57508831b18ed266751c83c04cc110e0dffee2"
+    },
+    {
+      "fixture": "vite-react",
+      "sample": 1,
+      "three_lpm_locks_byte_identical": true,
+      "sha256": "1c1adaeffe71f7f6fcaef4b79ded38a6c697781d2295b4b78f32975fc6e0f215"
+    },
+    {
+      "fixture": "vite-react",
+      "sample": 2,
+      "three_lpm_locks_byte_identical": true,
+      "sha256": "1c1adaeffe71f7f6fcaef4b79ded38a6c697781d2295b4b78f32975fc6e0f215"
+    },
+    {
+      "fixture": "vite-react",
+      "sample": 3,
+      "three_lpm_locks_byte_identical": true,
+      "sha256": "1c1adaeffe71f7f6fcaef4b79ded38a6c697781d2295b4b78f32975fc6e0f215"
+    },
+    {
+      "fixture": "vite-react",
+      "sample": 4,
+      "three_lpm_locks_byte_identical": true,
+      "sha256": "1c1adaeffe71f7f6fcaef4b79ded38a6c697781d2295b4b78f32975fc6e0f215"
+    },
+    {
+      "fixture": "vite-react",
+      "sample": 5,
+      "three_lpm_locks_byte_identical": true,
+      "sha256": "1c1adaeffe71f7f6fcaef4b79ded38a6c697781d2295b4b78f32975fc6e0f215"
+    },
+    {
+      "fixture": "vite-react",
+      "sample": 6,
+      "three_lpm_locks_byte_identical": true,
+      "sha256": "1c1adaeffe71f7f6fcaef4b79ded38a6c697781d2295b4b78f32975fc6e0f215"
+    },
+    {
+      "fixture": "vite-react",
+      "sample": 7,
+      "three_lpm_locks_byte_identical": true,
+      "sha256": "1c1adaeffe71f7f6fcaef4b79ded38a6c697781d2295b4b78f32975fc6e0f215"
+    },
+    {
+      "fixture": "vite-react",
+      "sample": 8,
+      "three_lpm_locks_byte_identical": true,
+      "sha256": "1c1adaeffe71f7f6fcaef4b79ded38a6c697781d2295b4b78f32975fc6e0f215"
+    },
+    {
+      "fixture": "native-sharp",
+      "sample": 1,
+      "three_lpm_locks_byte_identical": true,
+      "sha256": "a3443f79de995ae4137e83bc8f75214e8edc0e77bcf37590256736df00b5c94a"
+    },
+    {
+      "fixture": "native-sharp",
+      "sample": 2,
+      "three_lpm_locks_byte_identical": true,
+      "sha256": "a3443f79de995ae4137e83bc8f75214e8edc0e77bcf37590256736df00b5c94a"
+    },
+    {
+      "fixture": "native-sharp",
+      "sample": 3,
+      "three_lpm_locks_byte_identical": true,
+      "sha256": "a3443f79de995ae4137e83bc8f75214e8edc0e77bcf37590256736df00b5c94a"
+    },
+    {
+      "fixture": "native-sharp",
+      "sample": 4,
+      "three_lpm_locks_byte_identical": true,
+      "sha256": "a3443f79de995ae4137e83bc8f75214e8edc0e77bcf37590256736df00b5c94a"
+    },
+    {
+      "fixture": "native-sharp",
+      "sample": 5,
+      "three_lpm_locks_byte_identical": true,
+      "sha256": "a3443f79de995ae4137e83bc8f75214e8edc0e77bcf37590256736df00b5c94a"
+    },
+    {
+      "fixture": "native-sharp",
+      "sample": 6,
+      "three_lpm_locks_byte_identical": true,
+      "sha256": "a3443f79de995ae4137e83bc8f75214e8edc0e77bcf37590256736df00b5c94a"
+    },
+    {
+      "fixture": "native-sharp",
+      "sample": 7,
+      "three_lpm_locks_byte_identical": true,
+      "sha256": "a3443f79de995ae4137e83bc8f75214e8edc0e77bcf37590256736df00b5c94a"
+    },
+    {
+      "fixture": "native-sharp",
+      "sample": 8,
+      "three_lpm_locks_byte_identical": true,
+      "sha256": "a3443f79de995ae4137e83bc8f75214e8edc0e77bcf37590256736df00b5c94a"
+    },
+    {
+      "fixture": "nest",
+      "sample": 1,
+      "three_lpm_locks_byte_identical": true,
+      "sha256": "e4301fb934532e0b80b60069b72797b7332831b5e38202f55f21d1b719d4126c"
+    },
+    {
+      "fixture": "nest",
+      "sample": 2,
+      "three_lpm_locks_byte_identical": true,
+      "sha256": "e4301fb934532e0b80b60069b72797b7332831b5e38202f55f21d1b719d4126c"
+    },
+    {
+      "fixture": "nest",
+      "sample": 3,
+      "three_lpm_locks_byte_identical": true,
+      "sha256": "e4301fb934532e0b80b60069b72797b7332831b5e38202f55f21d1b719d4126c"
+    },
+    {
+      "fixture": "nest",
+      "sample": 4,
+      "three_lpm_locks_byte_identical": true,
+      "sha256": "e4301fb934532e0b80b60069b72797b7332831b5e38202f55f21d1b719d4126c"
+    },
+    {
+      "fixture": "nest",
+      "sample": 5,
+      "three_lpm_locks_byte_identical": true,
+      "sha256": "e4301fb934532e0b80b60069b72797b7332831b5e38202f55f21d1b719d4126c"
+    },
+    {
+      "fixture": "nest",
+      "sample": 6,
+      "three_lpm_locks_byte_identical": true,
+      "sha256": "e4301fb934532e0b80b60069b72797b7332831b5e38202f55f21d1b719d4126c"
+    },
+    {
+      "fixture": "nest",
+      "sample": 7,
+      "three_lpm_locks_byte_identical": true,
+      "sha256": "e4301fb934532e0b80b60069b72797b7332831b5e38202f55f21d1b719d4126c"
+    },
+    {
+      "fixture": "nest",
+      "sample": 8,
+      "three_lpm_locks_byte_identical": true,
+      "sha256": "e4301fb934532e0b80b60069b72797b7332831b5e38202f55f21d1b719d4126c"
+    }
+  ],
+  "artifacts": [
+    {
+      "fixture": "t3",
+      "sample": 1,
+      "lpm_manifest_identities": 95,
+      "critical_artifacts": 8,
+      "three_lpm_inventories_equal": true,
+      "bun_critical_artifacts_equal": true,
+      "critical": [
+        {
+          "name": "@biomejs/cli-darwin-arm64",
+          "version": "1.9.4",
+          "path": "biome",
+          "sha256": "c68f2cbe09e9485426a749353a155b1d22c130c6ccdadc7772d603eb247b9a9d"
+        },
+        {
+          "name": "@esbuild/darwin-arm64",
+          "version": "0.18.20",
+          "path": "bin/esbuild",
+          "sha256": "df6f20944f1ccd20eaad71f9b5e7263702e0179e3623b7f608379814e98736b3"
+        },
+        {
+          "name": "@esbuild/darwin-arm64",
+          "version": "0.19.12",
+          "path": "bin/esbuild",
+          "sha256": "bf7eb728d2680f93d3c9cad33dce5b0cb0c70c44eee1c151a8f808d3f1719a05"
+        },
+        {
+          "name": "@esbuild/darwin-arm64",
+          "version": "0.25.12",
+          "path": "bin/esbuild",
+          "sha256": "3e030ee2aa86ad3c33e5e95ae0e53bb03de40e0da35c9b1180a67de4a497cae5"
+        },
+        {
+          "name": "@img/sharp-darwin-arm64",
+          "version": "0.35.4",
+          "path": "lib/sharp-darwin-arm64-0.35.4.node",
+          "sha256": "389121ae6516bd89e92fa81b68d94b09e0b084cc53d57919e2140a73d9e3ca4c"
+        },
+        {
+          "name": "@img/sharp-libvips-darwin-arm64",
+          "version": "1.3.3",
+          "path": "lib/libvips-cpp.8.18.6.dylib",
+          "sha256": "bba7a98f1c4b10f4c31f92e12264e5d41a7ab484b864feae535ac8919c548d01"
+        },
+        {
+          "name": "@next/swc-darwin-arm64",
+          "version": "16.3.5",
+          "path": "next-swc.darwin-arm64.node",
+          "sha256": "4a04cb257f0ad3b8b4b7baa562a09e93ee21975e80980ac5e2c9f03b2a3c1fe8"
+        },
+        {
+          "name": "next",
+          "version": "16.3.5",
+          "path": "dist/server/next-server.js",
+          "sha256": "10cf10253de1a5c5542c78696ec5bdfe9bf00436b670d3ec64b6f27ae0ac4e0c"
+        }
+      ]
+    },
+    {
+      "fixture": "t3",
+      "sample": 2,
+      "lpm_manifest_identities": 95,
+      "critical_artifacts": 8,
+      "three_lpm_inventories_equal": true,
+      "bun_critical_artifacts_equal": true,
+      "critical": [
+        {
+          "name": "@biomejs/cli-darwin-arm64",
+          "version": "1.9.4",
+          "path": "biome",
+          "sha256": "c68f2cbe09e9485426a749353a155b1d22c130c6ccdadc7772d603eb247b9a9d"
+        },
+        {
+          "name": "@esbuild/darwin-arm64",
+          "version": "0.18.20",
+          "path": "bin/esbuild",
+          "sha256": "df6f20944f1ccd20eaad71f9b5e7263702e0179e3623b7f608379814e98736b3"
+        },
+        {
+          "name": "@esbuild/darwin-arm64",
+          "version": "0.19.12",
+          "path": "bin/esbuild",
+          "sha256": "bf7eb728d2680f93d3c9cad33dce5b0cb0c70c44eee1c151a8f808d3f1719a05"
+        },
+        {
+          "name": "@esbuild/darwin-arm64",
+          "version": "0.25.12",
+          "path": "bin/esbuild",
+          "sha256": "3e030ee2aa86ad3c33e5e95ae0e53bb03de40e0da35c9b1180a67de4a497cae5"
+        },
+        {
+          "name": "@img/sharp-darwin-arm64",
+          "version": "0.35.4",
+          "path": "lib/sharp-darwin-arm64-0.35.4.node",
+          "sha256": "389121ae6516bd89e92fa81b68d94b09e0b084cc53d57919e2140a73d9e3ca4c"
+        },
+        {
+          "name": "@img/sharp-libvips-darwin-arm64",
+          "version": "1.3.3",
+          "path": "lib/libvips-cpp.8.18.6.dylib",
+          "sha256": "bba7a98f1c4b10f4c31f92e12264e5d41a7ab484b864feae535ac8919c548d01"
+        },
+        {
+          "name": "@next/swc-darwin-arm64",
+          "version": "16.3.5",
+          "path": "next-swc.darwin-arm64.node",
+          "sha256": "4a04cb257f0ad3b8b4b7baa562a09e93ee21975e80980ac5e2c9f03b2a3c1fe8"
+        },
+        {
+          "name": "next",
+          "version": "16.3.5",
+          "path": "dist/server/next-server.js",
+          "sha256": "10cf10253de1a5c5542c78696ec5bdfe9bf00436b670d3ec64b6f27ae0ac4e0c"
+        }
+      ]
+    },
+    {
+      "fixture": "t3",
+      "sample": 3,
+      "lpm_manifest_identities": 95,
+      "critical_artifacts": 8,
+      "three_lpm_inventories_equal": true,
+      "bun_critical_artifacts_equal": true,
+      "critical": [
+        {
+          "name": "@biomejs/cli-darwin-arm64",
+          "version": "1.9.4",
+          "path": "biome",
+          "sha256": "c68f2cbe09e9485426a749353a155b1d22c130c6ccdadc7772d603eb247b9a9d"
+        },
+        {
+          "name": "@esbuild/darwin-arm64",
+          "version": "0.18.20",
+          "path": "bin/esbuild",
+          "sha256": "df6f20944f1ccd20eaad71f9b5e7263702e0179e3623b7f608379814e98736b3"
+        },
+        {
+          "name": "@esbuild/darwin-arm64",
+          "version": "0.19.12",
+          "path": "bin/esbuild",
+          "sha256": "bf7eb728d2680f93d3c9cad33dce5b0cb0c70c44eee1c151a8f808d3f1719a05"
+        },
+        {
+          "name": "@esbuild/darwin-arm64",
+          "version": "0.25.12",
+          "path": "bin/esbuild",
+          "sha256": "3e030ee2aa86ad3c33e5e95ae0e53bb03de40e0da35c9b1180a67de4a497cae5"
+        },
+        {
+          "name": "@img/sharp-darwin-arm64",
+          "version": "0.35.4",
+          "path": "lib/sharp-darwin-arm64-0.35.4.node",
+          "sha256": "389121ae6516bd89e92fa81b68d94b09e0b084cc53d57919e2140a73d9e3ca4c"
+        },
+        {
+          "name": "@img/sharp-libvips-darwin-arm64",
+          "version": "1.3.3",
+          "path": "lib/libvips-cpp.8.18.6.dylib",
+          "sha256": "bba7a98f1c4b10f4c31f92e12264e5d41a7ab484b864feae535ac8919c548d01"
+        },
+        {
+          "name": "@next/swc-darwin-arm64",
+          "version": "16.3.5",
+          "path": "next-swc.darwin-arm64.node",
+          "sha256": "4a04cb257f0ad3b8b4b7baa562a09e93ee21975e80980ac5e2c9f03b2a3c1fe8"
+        },
+        {
+          "name": "next",
+          "version": "16.3.5",
+          "path": "dist/server/next-server.js",
+          "sha256": "10cf10253de1a5c5542c78696ec5bdfe9bf00436b670d3ec64b6f27ae0ac4e0c"
+        }
+      ]
+    },
+    {
+      "fixture": "t3",
+      "sample": 4,
+      "lpm_manifest_identities": 95,
+      "critical_artifacts": 8,
+      "three_lpm_inventories_equal": true,
+      "bun_critical_artifacts_equal": true,
+      "critical": [
+        {
+          "name": "@biomejs/cli-darwin-arm64",
+          "version": "1.9.4",
+          "path": "biome",
+          "sha256": "c68f2cbe09e9485426a749353a155b1d22c130c6ccdadc7772d603eb247b9a9d"
+        },
+        {
+          "name": "@esbuild/darwin-arm64",
+          "version": "0.18.20",
+          "path": "bin/esbuild",
+          "sha256": "df6f20944f1ccd20eaad71f9b5e7263702e0179e3623b7f608379814e98736b3"
+        },
+        {
+          "name": "@esbuild/darwin-arm64",
+          "version": "0.19.12",
+          "path": "bin/esbuild",
+          "sha256": "bf7eb728d2680f93d3c9cad33dce5b0cb0c70c44eee1c151a8f808d3f1719a05"
+        },
+        {
+          "name": "@esbuild/darwin-arm64",
+          "version": "0.25.12",
+          "path": "bin/esbuild",
+          "sha256": "3e030ee2aa86ad3c33e5e95ae0e53bb03de40e0da35c9b1180a67de4a497cae5"
+        },
+        {
+          "name": "@img/sharp-darwin-arm64",
+          "version": "0.35.4",
+          "path": "lib/sharp-darwin-arm64-0.35.4.node",
+          "sha256": "389121ae6516bd89e92fa81b68d94b09e0b084cc53d57919e2140a73d9e3ca4c"
+        },
+        {
+          "name": "@img/sharp-libvips-darwin-arm64",
+          "version": "1.3.3",
+          "path": "lib/libvips-cpp.8.18.6.dylib",
+          "sha256": "bba7a98f1c4b10f4c31f92e12264e5d41a7ab484b864feae535ac8919c548d01"
+        },
+        {
+          "name": "@next/swc-darwin-arm64",
+          "version": "16.3.5",
+          "path": "next-swc.darwin-arm64.node",
+          "sha256": "4a04cb257f0ad3b8b4b7baa562a09e93ee21975e80980ac5e2c9f03b2a3c1fe8"
+        },
+        {
+          "name": "next",
+          "version": "16.3.5",
+          "path": "dist/server/next-server.js",
+          "sha256": "10cf10253de1a5c5542c78696ec5bdfe9bf00436b670d3ec64b6f27ae0ac4e0c"
+        }
+      ]
+    },
+    {
+      "fixture": "t3",
+      "sample": 5,
+      "lpm_manifest_identities": 95,
+      "critical_artifacts": 8,
+      "three_lpm_inventories_equal": true,
+      "bun_critical_artifacts_equal": true,
+      "critical": [
+        {
+          "name": "@biomejs/cli-darwin-arm64",
+          "version": "1.9.4",
+          "path": "biome",
+          "sha256": "c68f2cbe09e9485426a749353a155b1d22c130c6ccdadc7772d603eb247b9a9d"
+        },
+        {
+          "name": "@esbuild/darwin-arm64",
+          "version": "0.18.20",
+          "path": "bin/esbuild",
+          "sha256": "df6f20944f1ccd20eaad71f9b5e7263702e0179e3623b7f608379814e98736b3"
+        },
+        {
+          "name": "@esbuild/darwin-arm64",
+          "version": "0.19.12",
+          "path": "bin/esbuild",
+          "sha256": "bf7eb728d2680f93d3c9cad33dce5b0cb0c70c44eee1c151a8f808d3f1719a05"
+        },
+        {
+          "name": "@esbuild/darwin-arm64",
+          "version": "0.25.12",
+          "path": "bin/esbuild",
+          "sha256": "3e030ee2aa86ad3c33e5e95ae0e53bb03de40e0da35c9b1180a67de4a497cae5"
+        },
+        {
+          "name": "@img/sharp-darwin-arm64",
+          "version": "0.35.4",
+          "path": "lib/sharp-darwin-arm64-0.35.4.node",
+          "sha256": "389121ae6516bd89e92fa81b68d94b09e0b084cc53d57919e2140a73d9e3ca4c"
+        },
+        {
+          "name": "@img/sharp-libvips-darwin-arm64",
+          "version": "1.3.3",
+          "path": "lib/libvips-cpp.8.18.6.dylib",
+          "sha256": "bba7a98f1c4b10f4c31f92e12264e5d41a7ab484b864feae535ac8919c548d01"
+        },
+        {
+          "name": "@next/swc-darwin-arm64",
+          "version": "16.3.5",
+          "path": "next-swc.darwin-arm64.node",
+          "sha256": "4a04cb257f0ad3b8b4b7baa562a09e93ee21975e80980ac5e2c9f03b2a3c1fe8"
+        },
+        {
+          "name": "next",
+          "version": "16.3.5",
+          "path": "dist/server/next-server.js",
+          "sha256": "10cf10253de1a5c5542c78696ec5bdfe9bf00436b670d3ec64b6f27ae0ac4e0c"
+        }
+      ]
+    },
+    {
+      "fixture": "t3",
+      "sample": 6,
+      "lpm_manifest_identities": 95,
+      "critical_artifacts": 8,
+      "three_lpm_inventories_equal": true,
+      "bun_critical_artifacts_equal": true,
+      "critical": [
+        {
+          "name": "@biomejs/cli-darwin-arm64",
+          "version": "1.9.4",
+          "path": "biome",
+          "sha256": "c68f2cbe09e9485426a749353a155b1d22c130c6ccdadc7772d603eb247b9a9d"
+        },
+        {
+          "name": "@esbuild/darwin-arm64",
+          "version": "0.18.20",
+          "path": "bin/esbuild",
+          "sha256": "df6f20944f1ccd20eaad71f9b5e7263702e0179e3623b7f608379814e98736b3"
+        },
+        {
+          "name": "@esbuild/darwin-arm64",
+          "version": "0.19.12",
+          "path": "bin/esbuild",
+          "sha256": "bf7eb728d2680f93d3c9cad33dce5b0cb0c70c44eee1c151a8f808d3f1719a05"
+        },
+        {
+          "name": "@esbuild/darwin-arm64",
+          "version": "0.25.12",
+          "path": "bin/esbuild",
+          "sha256": "3e030ee2aa86ad3c33e5e95ae0e53bb03de40e0da35c9b1180a67de4a497cae5"
+        },
+        {
+          "name": "@img/sharp-darwin-arm64",
+          "version": "0.35.4",
+          "path": "lib/sharp-darwin-arm64-0.35.4.node",
+          "sha256": "389121ae6516bd89e92fa81b68d94b09e0b084cc53d57919e2140a73d9e3ca4c"
+        },
+        {
+          "name": "@img/sharp-libvips-darwin-arm64",
+          "version": "1.3.3",
+          "path": "lib/libvips-cpp.8.18.6.dylib",
+          "sha256": "bba7a98f1c4b10f4c31f92e12264e5d41a7ab484b864feae535ac8919c548d01"
+        },
+        {
+          "name": "@next/swc-darwin-arm64",
+          "version": "16.3.5",
+          "path": "next-swc.darwin-arm64.node",
+          "sha256": "4a04cb257f0ad3b8b4b7baa562a09e93ee21975e80980ac5e2c9f03b2a3c1fe8"
+        },
+        {
+          "name": "next",
+          "version": "16.3.5",
+          "path": "dist/server/next-server.js",
+          "sha256": "10cf10253de1a5c5542c78696ec5bdfe9bf00436b670d3ec64b6f27ae0ac4e0c"
+        }
+      ]
+    },
+    {
+      "fixture": "t3",
+      "sample": 7,
+      "lpm_manifest_identities": 95,
+      "critical_artifacts": 8,
+      "three_lpm_inventories_equal": true,
+      "bun_critical_artifacts_equal": true,
+      "critical": [
+        {
+          "name": "@biomejs/cli-darwin-arm64",
+          "version": "1.9.4",
+          "path": "biome",
+          "sha256": "c68f2cbe09e9485426a749353a155b1d22c130c6ccdadc7772d603eb247b9a9d"
+        },
+        {
+          "name": "@esbuild/darwin-arm64",
+          "version": "0.18.20",
+          "path": "bin/esbuild",
+          "sha256": "df6f20944f1ccd20eaad71f9b5e7263702e0179e3623b7f608379814e98736b3"
+        },
+        {
+          "name": "@esbuild/darwin-arm64",
+          "version": "0.19.12",
+          "path": "bin/esbuild",
+          "sha256": "bf7eb728d2680f93d3c9cad33dce5b0cb0c70c44eee1c151a8f808d3f1719a05"
+        },
+        {
+          "name": "@esbuild/darwin-arm64",
+          "version": "0.25.12",
+          "path": "bin/esbuild",
+          "sha256": "3e030ee2aa86ad3c33e5e95ae0e53bb03de40e0da35c9b1180a67de4a497cae5"
+        },
+        {
+          "name": "@img/sharp-darwin-arm64",
+          "version": "0.35.4",
+          "path": "lib/sharp-darwin-arm64-0.35.4.node",
+          "sha256": "389121ae6516bd89e92fa81b68d94b09e0b084cc53d57919e2140a73d9e3ca4c"
+        },
+        {
+          "name": "@img/sharp-libvips-darwin-arm64",
+          "version": "1.3.3",
+          "path": "lib/libvips-cpp.8.18.6.dylib",
+          "sha256": "bba7a98f1c4b10f4c31f92e12264e5d41a7ab484b864feae535ac8919c548d01"
+        },
+        {
+          "name": "@next/swc-darwin-arm64",
+          "version": "16.3.5",
+          "path": "next-swc.darwin-arm64.node",
+          "sha256": "4a04cb257f0ad3b8b4b7baa562a09e93ee21975e80980ac5e2c9f03b2a3c1fe8"
+        },
+        {
+          "name": "next",
+          "version": "16.3.5",
+          "path": "dist/server/next-server.js",
+          "sha256": "10cf10253de1a5c5542c78696ec5bdfe9bf00436b670d3ec64b6f27ae0ac4e0c"
+        }
+      ]
+    },
+    {
+      "fixture": "t3",
+      "sample": 8,
+      "lpm_manifest_identities": 95,
+      "critical_artifacts": 8,
+      "three_lpm_inventories_equal": true,
+      "bun_critical_artifacts_equal": true,
+      "critical": [
+        {
+          "name": "@biomejs/cli-darwin-arm64",
+          "version": "1.9.4",
+          "path": "biome",
+          "sha256": "c68f2cbe09e9485426a749353a155b1d22c130c6ccdadc7772d603eb247b9a9d"
+        },
+        {
+          "name": "@esbuild/darwin-arm64",
+          "version": "0.18.20",
+          "path": "bin/esbuild",
+          "sha256": "df6f20944f1ccd20eaad71f9b5e7263702e0179e3623b7f608379814e98736b3"
+        },
+        {
+          "name": "@esbuild/darwin-arm64",
+          "version": "0.19.12",
+          "path": "bin/esbuild",
+          "sha256": "bf7eb728d2680f93d3c9cad33dce5b0cb0c70c44eee1c151a8f808d3f1719a05"
+        },
+        {
+          "name": "@esbuild/darwin-arm64",
+          "version": "0.25.12",
+          "path": "bin/esbuild",
+          "sha256": "3e030ee2aa86ad3c33e5e95ae0e53bb03de40e0da35c9b1180a67de4a497cae5"
+        },
+        {
+          "name": "@img/sharp-darwin-arm64",
+          "version": "0.35.4",
+          "path": "lib/sharp-darwin-arm64-0.35.4.node",
+          "sha256": "389121ae6516bd89e92fa81b68d94b09e0b084cc53d57919e2140a73d9e3ca4c"
+        },
+        {
+          "name": "@img/sharp-libvips-darwin-arm64",
+          "version": "1.3.3",
+          "path": "lib/libvips-cpp.8.18.6.dylib",
+          "sha256": "bba7a98f1c4b10f4c31f92e12264e5d41a7ab484b864feae535ac8919c548d01"
+        },
+        {
+          "name": "@next/swc-darwin-arm64",
+          "version": "16.3.5",
+          "path": "next-swc.darwin-arm64.node",
+          "sha256": "4a04cb257f0ad3b8b4b7baa562a09e93ee21975e80980ac5e2c9f03b2a3c1fe8"
+        },
+        {
+          "name": "next",
+          "version": "16.3.5",
+          "path": "dist/server/next-server.js",
+          "sha256": "10cf10253de1a5c5542c78696ec5bdfe9bf00436b670d3ec64b6f27ae0ac4e0c"
+        }
+      ]
+    },
+    {
+      "fixture": "vite-react",
+      "sample": 1,
+      "lpm_manifest_identities": 63,
+      "critical_artifacts": 1,
+      "three_lpm_inventories_equal": true,
+      "bun_critical_artifacts_equal": true,
+      "critical": [
+        {
+          "name": "@esbuild/darwin-arm64",
+          "version": "0.21.5",
+          "path": "bin/esbuild",
+          "sha256": "b81b084018b48549fced4d72ac6a9d820aec907aff4ec546aef4a8703fee8dcc"
+        }
+      ]
+    },
+    {
+      "fixture": "vite-react",
+      "sample": 2,
+      "lpm_manifest_identities": 63,
+      "critical_artifacts": 1,
+      "three_lpm_inventories_equal": true,
+      "bun_critical_artifacts_equal": true,
+      "critical": [
+        {
+          "name": "@esbuild/darwin-arm64",
+          "version": "0.21.5",
+          "path": "bin/esbuild",
+          "sha256": "b81b084018b48549fced4d72ac6a9d820aec907aff4ec546aef4a8703fee8dcc"
+        }
+      ]
+    },
+    {
+      "fixture": "vite-react",
+      "sample": 3,
+      "lpm_manifest_identities": 63,
+      "critical_artifacts": 1,
+      "three_lpm_inventories_equal": true,
+      "bun_critical_artifacts_equal": true,
+      "critical": [
+        {
+          "name": "@esbuild/darwin-arm64",
+          "version": "0.21.5",
+          "path": "bin/esbuild",
+          "sha256": "b81b084018b48549fced4d72ac6a9d820aec907aff4ec546aef4a8703fee8dcc"
+        }
+      ]
+    },
+    {
+      "fixture": "vite-react",
+      "sample": 4,
+      "lpm_manifest_identities": 63,
+      "critical_artifacts": 1,
+      "three_lpm_inventories_equal": true,
+      "bun_critical_artifacts_equal": true,
+      "critical": [
+        {
+          "name": "@esbuild/darwin-arm64",
+          "version": "0.21.5",
+          "path": "bin/esbuild",
+          "sha256": "b81b084018b48549fced4d72ac6a9d820aec907aff4ec546aef4a8703fee8dcc"
+        }
+      ]
+    },
+    {
+      "fixture": "vite-react",
+      "sample": 5,
+      "lpm_manifest_identities": 63,
+      "critical_artifacts": 1,
+      "three_lpm_inventories_equal": true,
+      "bun_critical_artifacts_equal": true,
+      "critical": [
+        {
+          "name": "@esbuild/darwin-arm64",
+          "version": "0.21.5",
+          "path": "bin/esbuild",
+          "sha256": "b81b084018b48549fced4d72ac6a9d820aec907aff4ec546aef4a8703fee8dcc"
+        }
+      ]
+    },
+    {
+      "fixture": "vite-react",
+      "sample": 6,
+      "lpm_manifest_identities": 63,
+      "critical_artifacts": 1,
+      "three_lpm_inventories_equal": true,
+      "bun_critical_artifacts_equal": true,
+      "critical": [
+        {
+          "name": "@esbuild/darwin-arm64",
+          "version": "0.21.5",
+          "path": "bin/esbuild",
+          "sha256": "b81b084018b48549fced4d72ac6a9d820aec907aff4ec546aef4a8703fee8dcc"
+        }
+      ]
+    },
+    {
+      "fixture": "vite-react",
+      "sample": 7,
+      "lpm_manifest_identities": 63,
+      "critical_artifacts": 1,
+      "three_lpm_inventories_equal": true,
+      "bun_critical_artifacts_equal": true,
+      "critical": [
+        {
+          "name": "@esbuild/darwin-arm64",
+          "version": "0.21.5",
+          "path": "bin/esbuild",
+          "sha256": "b81b084018b48549fced4d72ac6a9d820aec907aff4ec546aef4a8703fee8dcc"
+        }
+      ]
+    },
+    {
+      "fixture": "vite-react",
+      "sample": 8,
+      "lpm_manifest_identities": 63,
+      "critical_artifacts": 1,
+      "three_lpm_inventories_equal": true,
+      "bun_critical_artifacts_equal": true,
+      "critical": [
+        {
+          "name": "@esbuild/darwin-arm64",
+          "version": "0.21.5",
+          "path": "bin/esbuild",
+          "sha256": "b81b084018b48549fced4d72ac6a9d820aec907aff4ec546aef4a8703fee8dcc"
+        }
+      ]
+    },
+    {
+      "fixture": "native-sharp",
+      "sample": 1,
+      "lpm_manifest_identities": 11,
+      "critical_artifacts": 2,
+      "three_lpm_inventories_equal": true,
+      "bun_critical_artifacts_equal": true,
+      "critical": [
+        {
+          "name": "@img/sharp-darwin-arm64",
+          "version": "0.33.5",
+          "path": "lib/sharp-darwin-arm64.node",
+          "sha256": "72f7425d4d14c7934b793a2b386768a41ea361dbe5a249305f09dbc575e0707a"
+        },
+        {
+          "name": "@img/sharp-libvips-darwin-arm64",
+          "version": "1.0.4",
+          "path": "lib/libvips-cpp.42.dylib",
+          "sha256": "7bff6d21e3f547a7ecaf61bbe359d43e17241280e15ce4e3d153dbe07b9c4769"
+        }
+      ]
+    },
+    {
+      "fixture": "native-sharp",
+      "sample": 2,
+      "lpm_manifest_identities": 11,
+      "critical_artifacts": 2,
+      "three_lpm_inventories_equal": true,
+      "bun_critical_artifacts_equal": true,
+      "critical": [
+        {
+          "name": "@img/sharp-darwin-arm64",
+          "version": "0.33.5",
+          "path": "lib/sharp-darwin-arm64.node",
+          "sha256": "72f7425d4d14c7934b793a2b386768a41ea361dbe5a249305f09dbc575e0707a"
+        },
+        {
+          "name": "@img/sharp-libvips-darwin-arm64",
+          "version": "1.0.4",
+          "path": "lib/libvips-cpp.42.dylib",
+          "sha256": "7bff6d21e3f547a7ecaf61bbe359d43e17241280e15ce4e3d153dbe07b9c4769"
+        }
+      ]
+    },
+    {
+      "fixture": "native-sharp",
+      "sample": 3,
+      "lpm_manifest_identities": 11,
+      "critical_artifacts": 2,
+      "three_lpm_inventories_equal": true,
+      "bun_critical_artifacts_equal": true,
+      "critical": [
+        {
+          "name": "@img/sharp-darwin-arm64",
+          "version": "0.33.5",
+          "path": "lib/sharp-darwin-arm64.node",
+          "sha256": "72f7425d4d14c7934b793a2b386768a41ea361dbe5a249305f09dbc575e0707a"
+        },
+        {
+          "name": "@img/sharp-libvips-darwin-arm64",
+          "version": "1.0.4",
+          "path": "lib/libvips-cpp.42.dylib",
+          "sha256": "7bff6d21e3f547a7ecaf61bbe359d43e17241280e15ce4e3d153dbe07b9c4769"
+        }
+      ]
+    },
+    {
+      "fixture": "native-sharp",
+      "sample": 4,
+      "lpm_manifest_identities": 11,
+      "critical_artifacts": 2,
+      "three_lpm_inventories_equal": true,
+      "bun_critical_artifacts_equal": true,
+      "critical": [
+        {
+          "name": "@img/sharp-darwin-arm64",
+          "version": "0.33.5",
+          "path": "lib/sharp-darwin-arm64.node",
+          "sha256": "72f7425d4d14c7934b793a2b386768a41ea361dbe5a249305f09dbc575e0707a"
+        },
+        {
+          "name": "@img/sharp-libvips-darwin-arm64",
+          "version": "1.0.4",
+          "path": "lib/libvips-cpp.42.dylib",
+          "sha256": "7bff6d21e3f547a7ecaf61bbe359d43e17241280e15ce4e3d153dbe07b9c4769"
+        }
+      ]
+    },
+    {
+      "fixture": "native-sharp",
+      "sample": 5,
+      "lpm_manifest_identities": 11,
+      "critical_artifacts": 2,
+      "three_lpm_inventories_equal": true,
+      "bun_critical_artifacts_equal": true,
+      "critical": [
+        {
+          "name": "@img/sharp-darwin-arm64",
+          "version": "0.33.5",
+          "path": "lib/sharp-darwin-arm64.node",
+          "sha256": "72f7425d4d14c7934b793a2b386768a41ea361dbe5a249305f09dbc575e0707a"
+        },
+        {
+          "name": "@img/sharp-libvips-darwin-arm64",
+          "version": "1.0.4",
+          "path": "lib/libvips-cpp.42.dylib",
+          "sha256": "7bff6d21e3f547a7ecaf61bbe359d43e17241280e15ce4e3d153dbe07b9c4769"
+        }
+      ]
+    },
+    {
+      "fixture": "native-sharp",
+      "sample": 6,
+      "lpm_manifest_identities": 11,
+      "critical_artifacts": 2,
+      "three_lpm_inventories_equal": true,
+      "bun_critical_artifacts_equal": true,
+      "critical": [
+        {
+          "name": "@img/sharp-darwin-arm64",
+          "version": "0.33.5",
+          "path": "lib/sharp-darwin-arm64.node",
+          "sha256": "72f7425d4d14c7934b793a2b386768a41ea361dbe5a249305f09dbc575e0707a"
+        },
+        {
+          "name": "@img/sharp-libvips-darwin-arm64",
+          "version": "1.0.4",
+          "path": "lib/libvips-cpp.42.dylib",
+          "sha256": "7bff6d21e3f547a7ecaf61bbe359d43e17241280e15ce4e3d153dbe07b9c4769"
+        }
+      ]
+    },
+    {
+      "fixture": "native-sharp",
+      "sample": 7,
+      "lpm_manifest_identities": 11,
+      "critical_artifacts": 2,
+      "three_lpm_inventories_equal": true,
+      "bun_critical_artifacts_equal": true,
+      "critical": [
+        {
+          "name": "@img/sharp-darwin-arm64",
+          "version": "0.33.5",
+          "path": "lib/sharp-darwin-arm64.node",
+          "sha256": "72f7425d4d14c7934b793a2b386768a41ea361dbe5a249305f09dbc575e0707a"
+        },
+        {
+          "name": "@img/sharp-libvips-darwin-arm64",
+          "version": "1.0.4",
+          "path": "lib/libvips-cpp.42.dylib",
+          "sha256": "7bff6d21e3f547a7ecaf61bbe359d43e17241280e15ce4e3d153dbe07b9c4769"
+        }
+      ]
+    },
+    {
+      "fixture": "native-sharp",
+      "sample": 8,
+      "lpm_manifest_identities": 11,
+      "critical_artifacts": 2,
+      "three_lpm_inventories_equal": true,
+      "bun_critical_artifacts_equal": true,
+      "critical": [
+        {
+          "name": "@img/sharp-darwin-arm64",
+          "version": "0.33.5",
+          "path": "lib/sharp-darwin-arm64.node",
+          "sha256": "72f7425d4d14c7934b793a2b386768a41ea361dbe5a249305f09dbc575e0707a"
+        },
+        {
+          "name": "@img/sharp-libvips-darwin-arm64",
+          "version": "1.0.4",
+          "path": "lib/libvips-cpp.42.dylib",
+          "sha256": "7bff6d21e3f547a7ecaf61bbe359d43e17241280e15ce4e3d153dbe07b9c4769"
+        }
+      ]
+    },
+    {
+      "fixture": "nest",
+      "sample": 1,
+      "lpm_manifest_identities": 33,
+      "critical_artifacts": 0,
+      "three_lpm_inventories_equal": true,
+      "bun_critical_artifacts_equal": true,
+      "critical": []
+    },
+    {
+      "fixture": "nest",
+      "sample": 2,
+      "lpm_manifest_identities": 33,
+      "critical_artifacts": 0,
+      "three_lpm_inventories_equal": true,
+      "bun_critical_artifacts_equal": true,
+      "critical": []
+    },
+    {
+      "fixture": "nest",
+      "sample": 3,
+      "lpm_manifest_identities": 33,
+      "critical_artifacts": 0,
+      "three_lpm_inventories_equal": true,
+      "bun_critical_artifacts_equal": true,
+      "critical": []
+    },
+    {
+      "fixture": "nest",
+      "sample": 4,
+      "lpm_manifest_identities": 33,
+      "critical_artifacts": 0,
+      "three_lpm_inventories_equal": true,
+      "bun_critical_artifacts_equal": true,
+      "critical": []
+    },
+    {
+      "fixture": "nest",
+      "sample": 5,
+      "lpm_manifest_identities": 33,
+      "critical_artifacts": 0,
+      "three_lpm_inventories_equal": true,
+      "bun_critical_artifacts_equal": true,
+      "critical": []
+    },
+    {
+      "fixture": "nest",
+      "sample": 6,
+      "lpm_manifest_identities": 33,
+      "critical_artifacts": 0,
+      "three_lpm_inventories_equal": true,
+      "bun_critical_artifacts_equal": true,
+      "critical": []
+    },
+    {
+      "fixture": "nest",
+      "sample": 7,
+      "lpm_manifest_identities": 33,
+      "critical_artifacts": 0,
+      "three_lpm_inventories_equal": true,
+      "bun_critical_artifacts_equal": true,
+      "critical": []
+    },
+    {
+      "fixture": "nest",
+      "sample": 8,
+      "lpm_manifest_identities": 33,
+      "critical_artifacts": 0,
+      "three_lpm_inventories_equal": true,
+      "bun_critical_artifacts_equal": true,
+      "critical": []
+    }
+  ],
+  "bun_lock_differences": [
+    {
+      "fixture": "t3",
+      "sample": 1,
+      "lpm_only": [],
+      "bun_only": [
+        [
+          "@emnapi/core@1.11.3",
+          "sha512-zLpS5asjEb7lq8jYLq37N6XKaE41DIexlY1rF/z4/tIl3wo13Sqm28fRyfIsKZD+NZ8mM5RoKkpW/rBcuoSZSg=="
+        ],
+        [
+          "@emnapi/wasi-threads@1.2.3",
+          "sha512-ELEBe8PsLvvJ6QMr0zLt8ffvOHW/dc1m3CEzNMg7aJUv3bMaoDtw2TXyDAwkYBuroxxuHEwhRTLJSe5sya547g=="
+        ],
+        [
+          "@napi-rs/wasm-runtime@1.2.4",
+          "sha512-AJxoUD2/15ESHbvpcyjU274nsAPLuOtPHCk0vKJM5pj//Fg/B1FXNWjPnXTT9PymCYYiHo4zPj0ZomXBKhoy7g=="
+        ],
+        [
+          "@tybys/wasm-util@0.10.4",
+          "sha512-W3c4gRigFS0T/Ma4qIYF3GDAc5AQdHb1yL5znJT1Zv1YaD9Kitx656wBjvr19qbiosmZT8lWDM5BEMynUqX65A=="
+        ]
+      ]
+    },
+    {
+      "fixture": "t3",
+      "sample": 2,
+      "lpm_only": [],
+      "bun_only": [
+        [
+          "@emnapi/core@1.11.3",
+          "sha512-zLpS5asjEb7lq8jYLq37N6XKaE41DIexlY1rF/z4/tIl3wo13Sqm28fRyfIsKZD+NZ8mM5RoKkpW/rBcuoSZSg=="
+        ],
+        [
+          "@emnapi/wasi-threads@1.2.3",
+          "sha512-ELEBe8PsLvvJ6QMr0zLt8ffvOHW/dc1m3CEzNMg7aJUv3bMaoDtw2TXyDAwkYBuroxxuHEwhRTLJSe5sya547g=="
+        ],
+        [
+          "@napi-rs/wasm-runtime@1.2.4",
+          "sha512-AJxoUD2/15ESHbvpcyjU274nsAPLuOtPHCk0vKJM5pj//Fg/B1FXNWjPnXTT9PymCYYiHo4zPj0ZomXBKhoy7g=="
+        ],
+        [
+          "@tybys/wasm-util@0.10.4",
+          "sha512-W3c4gRigFS0T/Ma4qIYF3GDAc5AQdHb1yL5znJT1Zv1YaD9Kitx656wBjvr19qbiosmZT8lWDM5BEMynUqX65A=="
+        ]
+      ]
+    },
+    {
+      "fixture": "t3",
+      "sample": 3,
+      "lpm_only": [],
+      "bun_only": [
+        [
+          "@emnapi/core@1.11.3",
+          "sha512-zLpS5asjEb7lq8jYLq37N6XKaE41DIexlY1rF/z4/tIl3wo13Sqm28fRyfIsKZD+NZ8mM5RoKkpW/rBcuoSZSg=="
+        ],
+        [
+          "@emnapi/wasi-threads@1.2.3",
+          "sha512-ELEBe8PsLvvJ6QMr0zLt8ffvOHW/dc1m3CEzNMg7aJUv3bMaoDtw2TXyDAwkYBuroxxuHEwhRTLJSe5sya547g=="
+        ],
+        [
+          "@napi-rs/wasm-runtime@1.2.4",
+          "sha512-AJxoUD2/15ESHbvpcyjU274nsAPLuOtPHCk0vKJM5pj//Fg/B1FXNWjPnXTT9PymCYYiHo4zPj0ZomXBKhoy7g=="
+        ],
+        [
+          "@tybys/wasm-util@0.10.4",
+          "sha512-W3c4gRigFS0T/Ma4qIYF3GDAc5AQdHb1yL5znJT1Zv1YaD9Kitx656wBjvr19qbiosmZT8lWDM5BEMynUqX65A=="
+        ]
+      ]
+    },
+    {
+      "fixture": "t3",
+      "sample": 4,
+      "lpm_only": [],
+      "bun_only": [
+        [
+          "@emnapi/core@1.11.3",
+          "sha512-zLpS5asjEb7lq8jYLq37N6XKaE41DIexlY1rF/z4/tIl3wo13Sqm28fRyfIsKZD+NZ8mM5RoKkpW/rBcuoSZSg=="
+        ],
+        [
+          "@emnapi/wasi-threads@1.2.3",
+          "sha512-ELEBe8PsLvvJ6QMr0zLt8ffvOHW/dc1m3CEzNMg7aJUv3bMaoDtw2TXyDAwkYBuroxxuHEwhRTLJSe5sya547g=="
+        ],
+        [
+          "@napi-rs/wasm-runtime@1.2.4",
+          "sha512-AJxoUD2/15ESHbvpcyjU274nsAPLuOtPHCk0vKJM5pj//Fg/B1FXNWjPnXTT9PymCYYiHo4zPj0ZomXBKhoy7g=="
+        ],
+        [
+          "@tybys/wasm-util@0.10.4",
+          "sha512-W3c4gRigFS0T/Ma4qIYF3GDAc5AQdHb1yL5znJT1Zv1YaD9Kitx656wBjvr19qbiosmZT8lWDM5BEMynUqX65A=="
+        ]
+      ]
+    },
+    {
+      "fixture": "t3",
+      "sample": 5,
+      "lpm_only": [],
+      "bun_only": [
+        [
+          "@emnapi/core@1.11.3",
+          "sha512-zLpS5asjEb7lq8jYLq37N6XKaE41DIexlY1rF/z4/tIl3wo13Sqm28fRyfIsKZD+NZ8mM5RoKkpW/rBcuoSZSg=="
+        ],
+        [
+          "@emnapi/wasi-threads@1.2.3",
+          "sha512-ELEBe8PsLvvJ6QMr0zLt8ffvOHW/dc1m3CEzNMg7aJUv3bMaoDtw2TXyDAwkYBuroxxuHEwhRTLJSe5sya547g=="
+        ],
+        [
+          "@napi-rs/wasm-runtime@1.2.4",
+          "sha512-AJxoUD2/15ESHbvpcyjU274nsAPLuOtPHCk0vKJM5pj//Fg/B1FXNWjPnXTT9PymCYYiHo4zPj0ZomXBKhoy7g=="
+        ],
+        [
+          "@tybys/wasm-util@0.10.4",
+          "sha512-W3c4gRigFS0T/Ma4qIYF3GDAc5AQdHb1yL5znJT1Zv1YaD9Kitx656wBjvr19qbiosmZT8lWDM5BEMynUqX65A=="
+        ]
+      ]
+    },
+    {
+      "fixture": "t3",
+      "sample": 6,
+      "lpm_only": [],
+      "bun_only": [
+        [
+          "@emnapi/core@1.11.3",
+          "sha512-zLpS5asjEb7lq8jYLq37N6XKaE41DIexlY1rF/z4/tIl3wo13Sqm28fRyfIsKZD+NZ8mM5RoKkpW/rBcuoSZSg=="
+        ],
+        [
+          "@emnapi/wasi-threads@1.2.3",
+          "sha512-ELEBe8PsLvvJ6QMr0zLt8ffvOHW/dc1m3CEzNMg7aJUv3bMaoDtw2TXyDAwkYBuroxxuHEwhRTLJSe5sya547g=="
+        ],
+        [
+          "@napi-rs/wasm-runtime@1.2.4",
+          "sha512-AJxoUD2/15ESHbvpcyjU274nsAPLuOtPHCk0vKJM5pj//Fg/B1FXNWjPnXTT9PymCYYiHo4zPj0ZomXBKhoy7g=="
+        ],
+        [
+          "@tybys/wasm-util@0.10.4",
+          "sha512-W3c4gRigFS0T/Ma4qIYF3GDAc5AQdHb1yL5znJT1Zv1YaD9Kitx656wBjvr19qbiosmZT8lWDM5BEMynUqX65A=="
+        ]
+      ]
+    },
+    {
+      "fixture": "t3",
+      "sample": 7,
+      "lpm_only": [],
+      "bun_only": [
+        [
+          "@emnapi/core@1.11.3",
+          "sha512-zLpS5asjEb7lq8jYLq37N6XKaE41DIexlY1rF/z4/tIl3wo13Sqm28fRyfIsKZD+NZ8mM5RoKkpW/rBcuoSZSg=="
+        ],
+        [
+          "@emnapi/wasi-threads@1.2.3",
+          "sha512-ELEBe8PsLvvJ6QMr0zLt8ffvOHW/dc1m3CEzNMg7aJUv3bMaoDtw2TXyDAwkYBuroxxuHEwhRTLJSe5sya547g=="
+        ],
+        [
+          "@napi-rs/wasm-runtime@1.2.4",
+          "sha512-AJxoUD2/15ESHbvpcyjU274nsAPLuOtPHCk0vKJM5pj//Fg/B1FXNWjPnXTT9PymCYYiHo4zPj0ZomXBKhoy7g=="
+        ],
+        [
+          "@tybys/wasm-util@0.10.4",
+          "sha512-W3c4gRigFS0T/Ma4qIYF3GDAc5AQdHb1yL5znJT1Zv1YaD9Kitx656wBjvr19qbiosmZT8lWDM5BEMynUqX65A=="
+        ]
+      ]
+    },
+    {
+      "fixture": "t3",
+      "sample": 8,
+      "lpm_only": [],
+      "bun_only": [
+        [
+          "@emnapi/core@1.11.3",
+          "sha512-zLpS5asjEb7lq8jYLq37N6XKaE41DIexlY1rF/z4/tIl3wo13Sqm28fRyfIsKZD+NZ8mM5RoKkpW/rBcuoSZSg=="
+        ],
+        [
+          "@emnapi/wasi-threads@1.2.3",
+          "sha512-ELEBe8PsLvvJ6QMr0zLt8ffvOHW/dc1m3CEzNMg7aJUv3bMaoDtw2TXyDAwkYBuroxxuHEwhRTLJSe5sya547g=="
+        ],
+        [
+          "@napi-rs/wasm-runtime@1.2.4",
+          "sha512-AJxoUD2/15ESHbvpcyjU274nsAPLuOtPHCk0vKJM5pj//Fg/B1FXNWjPnXTT9PymCYYiHo4zPj0ZomXBKhoy7g=="
+        ],
+        [
+          "@tybys/wasm-util@0.10.4",
+          "sha512-W3c4gRigFS0T/Ma4qIYF3GDAc5AQdHb1yL5znJT1Zv1YaD9Kitx656wBjvr19qbiosmZT8lWDM5BEMynUqX65A=="
+        ]
+      ]
+    },
+    {
+      "fixture": "vite-react",
+      "sample": 1,
+      "lpm_only": [],
+      "bun_only": []
+    },
+    {
+      "fixture": "vite-react",
+      "sample": 2,
+      "lpm_only": [],
+      "bun_only": []
+    },
+    {
+      "fixture": "vite-react",
+      "sample": 3,
+      "lpm_only": [],
+      "bun_only": []
+    },
+    {
+      "fixture": "vite-react",
+      "sample": 4,
+      "lpm_only": [],
+      "bun_only": []
+    },
+    {
+      "fixture": "vite-react",
+      "sample": 5,
+      "lpm_only": [],
+      "bun_only": []
+    },
+    {
+      "fixture": "vite-react",
+      "sample": 6,
+      "lpm_only": [],
+      "bun_only": []
+    },
+    {
+      "fixture": "vite-react",
+      "sample": 7,
+      "lpm_only": [],
+      "bun_only": []
+    },
+    {
+      "fixture": "vite-react",
+      "sample": 8,
+      "lpm_only": [],
+      "bun_only": []
+    },
+    {
+      "fixture": "native-sharp",
+      "sample": 1,
+      "lpm_only": [],
+      "bun_only": []
+    },
+    {
+      "fixture": "native-sharp",
+      "sample": 2,
+      "lpm_only": [],
+      "bun_only": []
+    },
+    {
+      "fixture": "native-sharp",
+      "sample": 3,
+      "lpm_only": [],
+      "bun_only": []
+    },
+    {
+      "fixture": "native-sharp",
+      "sample": 4,
+      "lpm_only": [],
+      "bun_only": []
+    },
+    {
+      "fixture": "native-sharp",
+      "sample": 5,
+      "lpm_only": [],
+      "bun_only": []
+    },
+    {
+      "fixture": "native-sharp",
+      "sample": 6,
+      "lpm_only": [],
+      "bun_only": []
+    },
+    {
+      "fixture": "native-sharp",
+      "sample": 7,
+      "lpm_only": [],
+      "bun_only": []
+    },
+    {
+      "fixture": "native-sharp",
+      "sample": 8,
+      "lpm_only": [],
+      "bun_only": []
+    },
+    {
+      "fixture": "nest",
+      "sample": 1,
+      "lpm_only": [],
+      "bun_only": []
+    },
+    {
+      "fixture": "nest",
+      "sample": 2,
+      "lpm_only": [],
+      "bun_only": []
+    },
+    {
+      "fixture": "nest",
+      "sample": 3,
+      "lpm_only": [],
+      "bun_only": []
+    },
+    {
+      "fixture": "nest",
+      "sample": 4,
+      "lpm_only": [],
+      "bun_only": []
+    },
+    {
+      "fixture": "nest",
+      "sample": 5,
+      "lpm_only": [],
+      "bun_only": []
+    },
+    {
+      "fixture": "nest",
+      "sample": 6,
+      "lpm_only": [],
+      "bun_only": []
+    },
+    {
+      "fixture": "nest",
+      "sample": 7,
+      "lpm_only": [],
+      "bun_only": []
+    },
+    {
+      "fixture": "nest",
+      "sample": 8,
+      "lpm_only": [],
+      "bun_only": []
+    }
+  ]
+}
