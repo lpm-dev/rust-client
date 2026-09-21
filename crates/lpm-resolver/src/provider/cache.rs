@@ -1,3 +1,4 @@
+use super::manifest_core::ManifestVersion;
 use super::prelude::*;
 use super::types::{CachedAvailableVersions, CachedRange};
 
@@ -64,14 +65,18 @@ pub(crate) fn merge_cached_package_info(
     let mut workspace_versions = existing.workspace_versions.clone();
     workspace_versions.extend(incoming.workspace_versions.iter().cloned());
 
-    let incoming_adds_versions = incoming
-        .versions
-        .iter()
-        .any(|version| !existing.versions.contains(version));
-    let existing_adds_versions = existing
-        .versions
-        .iter()
-        .any(|version| !incoming.versions.contains(version));
+    let incoming_adds_versions = incoming.versions.iter().any(|version| {
+        existing
+            .versions
+            .binary_search_by(|candidate| version.cmp(candidate))
+            .is_err()
+    });
+    let existing_adds_versions = existing.versions.iter().any(|version| {
+        incoming
+            .versions
+            .binary_search_by(|candidate| version.cmp(candidate))
+            .is_err()
+    });
     let versions_complete =
         incoming.versions_complete || (existing.versions_complete && !incoming_adds_versions);
     let trust_metadata_complete = (existing.trust_metadata_complete
@@ -80,6 +85,38 @@ pub(crate) fn merge_cached_package_info(
     let platform_metadata_complete = (existing.platform_metadata_complete
         && (incoming.platform_metadata_complete || !incoming_adds_versions))
         || (incoming.platform_metadata_complete && !existing_adds_versions);
+
+    if !incoming_adds_versions
+        && incoming
+            .modified
+            .as_ref()
+            .is_none_or(|value| existing.modified.as_ref() == Some(value))
+        && incoming
+            .latest_version
+            .as_ref()
+            .is_none_or(|value| existing.latest_version.as_ref() == Some(value))
+        && incoming
+            .dist_tags()
+            .iter()
+            .all(|(tag, version)| existing.dist_tags().get(tag) == Some(version))
+        && incoming.versions.iter().all(|version| {
+            let current = existing.manifest_version_owned_for(version);
+            let updated = merge_manifest_version(
+                current.as_ref(),
+                incoming.manifest_version_owned_for(version),
+                existing.workspace_versions.contains(version),
+            );
+            current == updated
+        })
+    {
+        let mut merged = existing.clone();
+        merged.covered_ranges = covered_ranges;
+        merged.workspace_versions = workspace_versions;
+        merged.versions_complete = versions_complete;
+        merged.trust_metadata_complete = trust_metadata_complete;
+        merged.platform_metadata_complete = platform_metadata_complete;
+        return merged;
+    }
 
     let modified = incoming
         .modified
@@ -115,44 +152,49 @@ pub(crate) fn merge_cached_package_info(
     for version in versions {
         let existing_manifest = existing.manifest_version_owned_for(&version);
         let incoming_manifest = incoming.manifest_version_owned_for(&version);
-        let manifest = if existing.workspace_versions.contains(&version) {
-            existing_manifest
-        } else {
-            match (existing_manifest, incoming_manifest) {
-                (Some(existing_manifest), Some(mut incoming_manifest)) => {
-                    if incoming_manifest.dependencies.is_empty() {
-                        incoming_manifest
-                            .dependencies
-                            .clone_from(&existing_manifest.dependencies);
-                    }
-                    if incoming_manifest.peer_dependencies.is_empty() {
-                        incoming_manifest
-                            .peer_dependencies
-                            .clone_from(&existing_manifest.peer_dependencies);
-                    }
-                    if incoming_manifest.node_engine.is_none() {
-                        incoming_manifest
-                            .node_engine
-                            .clone_from(&existing_manifest.node_engine);
-                    }
-                    if incoming_manifest.platform.is_none() {
-                        incoming_manifest
-                            .platform
-                            .clone_from(&existing_manifest.platform);
-                    }
-                    incoming_manifest.dist =
-                        merge_cached_dist_info(&existing_manifest.dist, &incoming_manifest.dist);
-                    Some(incoming_manifest)
-                }
-                (Some(existing_manifest), None) => Some(existing_manifest),
-                (None, incoming_manifest) => incoming_manifest,
-            }
-        };
+        let manifest =
+            if existing.workspace_versions.contains(&version) || incoming_manifest.is_none() {
+                existing_manifest
+            } else {
+                merge_manifest_version(existing_manifest.as_ref(), incoming_manifest, false)
+            };
         if let Some(manifest) = manifest {
             builder.push(manifest);
         }
     }
     builder.finish()
+}
+
+fn merge_manifest_version(
+    existing: Option<&ManifestVersion>,
+    incoming: Option<ManifestVersion>,
+    preserve_existing: bool,
+) -> Option<ManifestVersion> {
+    if preserve_existing {
+        return existing.cloned();
+    }
+    match (existing, incoming) {
+        (Some(existing), Some(mut incoming)) => {
+            if incoming.dependencies.is_empty() {
+                incoming.dependencies.clone_from(&existing.dependencies);
+            }
+            if incoming.peer_dependencies.is_empty() {
+                incoming
+                    .peer_dependencies
+                    .clone_from(&existing.peer_dependencies);
+            }
+            if incoming.node_engine.is_none() {
+                incoming.node_engine.clone_from(&existing.node_engine);
+            }
+            if incoming.platform.is_none() {
+                incoming.platform.clone_from(&existing.platform);
+            }
+            incoming.dist = merge_cached_dist_info(&existing.dist, &incoming.dist);
+            Some(incoming)
+        }
+        (Some(existing), None) => Some(existing.clone()),
+        (None, incoming) => incoming,
+    }
 }
 
 fn merge_cached_dist_info(existing: &CachedDistInfo, incoming: &CachedDistInfo) -> CachedDistInfo {
@@ -593,5 +635,106 @@ impl LpmDependencyProvider {
             root_aliases,
             root_dependencies,
         )
+    }
+}
+
+#[cfg(test)]
+mod merge_tests {
+    use super::*;
+
+    fn history() -> lpm_registry::PackageMetadata {
+        serde_json::from_value(serde_json::json!({
+            "name": "shared",
+            "dist-tags": {"latest": "3.0.0"},
+            "versions": {
+                "1.0.0": {"name": "shared", "version": "1.0.0"},
+                "2.0.0": {"name": "shared", "version": "2.0.0", "dependencies": {"child": "^1"},
+                    "dist": {"tarball": "https://example.invalid/old.tgz", "integrity": "sha512-old"}},
+                "3.0.0": {"name": "shared", "version": "3.0.0"}
+            }
+        })).unwrap()
+    }
+
+    #[test]
+    fn equivalent_partial_and_full_snapshots_keep_the_shared_version_history() {
+        let full = parse_owned_metadata_to_cache_info(history());
+        let mut partial_raw = history();
+        partial_raw.versions.retain(|version, _| version == "2.0.0");
+        partial_raw.dist_tags.clear();
+        let mut partial = parse_owned_partial_metadata_to_cache_info(partial_raw);
+        partial.covered_ranges.insert("2.0.0".into());
+
+        let merged_partial = merge_cached_package_info(&full, &partial);
+        assert!(Arc::ptr_eq(&full.versions, &merged_partial.versions));
+        assert!(merged_partial.covered_ranges.contains("2.0.0"));
+        let merged_full = merge_cached_package_info(&merged_partial, &full);
+        assert!(Arc::ptr_eq(&full.versions, &merged_full.versions));
+        assert_eq!(
+            merged_full.manifest_versions_owned(),
+            full.manifest_versions_owned()
+        );
+    }
+
+    #[test]
+    fn partial_snapshots_preserve_changed_dependencies_distribution_and_platform() {
+        let full = parse_owned_metadata_to_cache_info(history());
+        let partial_raw = serde_json::from_value(serde_json::json!({
+            "name": "shared", "versions": {"2.0.0": {
+                "name": "shared", "version": "2.0.0", "dependencies": {"child": "^2"},
+                "os": ["linux"], "cpu": ["x64"], "libc": ["musl"],
+                "dist": {"tarball": "https://example.invalid/new.tgz", "integrity": "sha512-new"}
+            }}
+        }))
+        .unwrap();
+        let partial = parse_owned_partial_metadata_to_cache_info(partial_raw);
+        let merged = merge_cached_package_info(&full, &partial);
+
+        assert_eq!(
+            merged.tarball_url("2.0.0"),
+            Some("https://example.invalid/new.tgz")
+        );
+        assert_eq!(merged.integrity("2.0.0"), Some("sha512-new"));
+        assert_eq!(merged.dependency("2.0.0", "child").unwrap().range, "^2");
+        assert_eq!(merged.platform("2.0.0").unwrap().libc, ["musl"]);
+        assert_eq!(merged.versions.len(), 3);
+    }
+
+    #[test]
+    fn equivalent_manifests_preserve_updated_coverage_and_provenance_flags() {
+        let full = parse_owned_metadata_to_cache_info(history());
+        let mut incoming = full.clone();
+        incoming.versions_complete = false;
+        incoming.platform_metadata_complete = true;
+        incoming.trust_metadata_complete = true;
+        incoming.covered_ranges.insert("^2".into());
+
+        let merged = merge_cached_package_info(&full, &incoming);
+
+        assert!(Arc::ptr_eq(&full.versions, &merged.versions));
+        assert!(merged.versions_complete);
+        assert!(merged.platform_metadata_complete);
+        assert!(merged.trust_metadata_complete);
+        assert!(merged.covered_ranges.contains("^2"));
+    }
+
+    #[test]
+    fn later_snapshots_preserve_updated_tags_and_release_times() {
+        let full = parse_owned_metadata_to_cache_info(history());
+        let mut incoming_raw = history();
+        incoming_raw.modified = Some("2026-01-02T00:00:00Z".into());
+        incoming_raw.dist_tags.insert("beta".into(), "2.0.0".into());
+        incoming_raw
+            .time
+            .insert("2.0.0".into(), "2026-01-01T00:00:00Z".into());
+        let incoming = parse_owned_partial_metadata_to_cache_info(incoming_raw);
+
+        let merged = merge_cached_package_info(&full, &incoming);
+
+        assert_eq!(merged.modified.as_deref(), Some("2026-01-02T00:00:00Z"));
+        assert_eq!(
+            merged.dist_tag_version("beta").unwrap().to_string(),
+            "2.0.0"
+        );
+        assert_eq!(merged.published_at("2.0.0"), Some("2026-01-01T00:00:00Z"));
     }
 }

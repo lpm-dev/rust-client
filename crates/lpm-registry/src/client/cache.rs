@@ -1000,11 +1000,12 @@ impl RegistryClient {
             return Some(fresh_for);
         }
 
-        let Some(reservation) =
-            reserve_pending_metadata_cache_bytes(&self.pending_cache_write_bytes, content.len())
-        else {
+        let Some(reservation) = reserve_pending_metadata_cache_bytes(
+            &self.pending_cache_write_bytes,
+            content.capacity(),
+        ) else {
             tracing::debug!(
-                bytes = content.len(),
+                bytes = content.capacity(),
                 "skipping best-effort metadata cache write because the queued-byte budget is full"
             );
             return Some(fresh_for);
@@ -1096,6 +1097,23 @@ impl RegistryClient {
 #[cfg(test)]
 mod pending_write_budget_tests {
     use super::*;
+
+    #[tokio::test]
+    async fn queued_metadata_cache_write_budget_covers_spare_buffer_capacity() {
+        let cache_dir = tempfile::tempdir().unwrap();
+        let mut client = RegistryClient::new().with_cache_dir(Some(cache_dir.path().to_path_buf()));
+        client.pending_cache_write_bytes = Arc::new(tokio::sync::Semaphore::new(1024));
+        let key = "small-metadata-large-allocation";
+
+        client.write_metadata_cache(key, &serde_json::json!({ "name": "small" }), None);
+        client.flush_pending_cache_writes().await;
+
+        assert!(
+            !client.cache_path(key).unwrap().exists(),
+            "the 4 KiB serialization buffer must not fit a 1 KiB pending allocation budget"
+        );
+        assert_eq!(client.pending_cache_write_bytes.available_permits(), 1024);
+    }
 
     #[test]
     fn queued_metadata_cache_writes_cannot_exceed_the_byte_budget() {

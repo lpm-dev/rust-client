@@ -3158,6 +3158,17 @@ pub(super) fn spawn_speculation_dispatcher(
                     return;
                 };
 
+                if !meta.info.versions_complete
+                    && lpm_resolver::NpmRange::parse_registry_spec(&range)
+                        .map_or(true, |parsed| meta.info.needs_metadata_for_range(&parsed))
+                {
+                    parked
+                        .entry(name)
+                        .or_default()
+                        .push((range, depth, is_root));
+                    return;
+                }
+
                 let Some((version, url, integrity)) = pick_speculative_version(meta, &range) else {
                     // Range didn't match any arrived version — count it so we
                     // can tell "dispatcher worked but range was too tight"
@@ -3300,7 +3311,14 @@ pub(super) fn spawn_speculation_dispatcher(
 
             match rx.recv().await {
                 Some((name, meta)) => {
-                    metadata.insert(name.clone(), meta);
+                    match metadata.entry(name.clone()) {
+                        std::collections::hash_map::Entry::Occupied(mut entry) => {
+                            entry.get_mut().merge_snapshot(meta);
+                        }
+                        std::collections::hash_map::Entry::Vacant(entry) => {
+                            entry.insert(meta);
+                        }
+                    }
                     // the roots-ready signal is owned by
                     // the walker now — the dispatcher is a pure
                     // consumer of `(name, SpeculativePackageMetadata)` frames.

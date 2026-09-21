@@ -156,10 +156,10 @@ pub struct VersionMetadata {
     pub ecosystem: Option<String>,
 
     #[serde(default, rename = "_swiftMeta")]
-    pub swift_meta: Option<SwiftMeta>,
+    pub swift_meta: Option<Box<SwiftMeta>>,
 
     #[serde(default, rename = "_npmUser")]
-    pub npm_user: Option<NpmUserMetadata>,
+    pub npm_user: Option<Box<NpmUserMetadata>>,
 
     // Security metadata for post-install warnings
     #[serde(default, rename = "_behavioralTags")]
@@ -1676,6 +1676,62 @@ impl From<DistInfo> for BlockedSetDist {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn absent_ecosystem_metadata_uses_only_two_pointers_per_version() {
+        let metadata = VersionMetadata::default();
+        assert_eq!(
+            std::mem::size_of_val(&metadata.swift_meta) + std::mem::size_of_val(&metadata.npm_user),
+            2 * std::mem::size_of::<usize>(),
+            "absent metadata must not embed large payloads in every historical version; version size: {}",
+            std::mem::size_of::<VersionMetadata>()
+        );
+    }
+
+    #[test]
+    fn ecosystem_and_publisher_metadata_roundtrip_through_json_and_named_messagepack() {
+        let input = serde_json::json!({
+            "name": "mixed-metadata",
+            "version": "1.0.0",
+            "_swiftMeta": {
+                "products": [{"name": "Kit", "type": "library", "targets": ["Core"]}],
+                "platforms": [{"platformName": "macos", "version": "13.0"}],
+                "requiredCapabilities": ["network"],
+                "manifestSet": {
+                    "schemaVersion": 1,
+                    "manifests": [{"filename": "Package.swift", "toolsVersion": "5.9"}]
+                }
+            },
+            "_npmUser": {"trustedPublisher": {"id": "publisher"}, "approver": true}
+        });
+        let metadata: VersionMetadata = serde_json::from_value(input.clone()).unwrap();
+        let encoded = rmp_serde::to_vec_named(&metadata).unwrap();
+        let restored: VersionMetadata = rmp_serde::from_slice(&encoded).unwrap();
+        let output = serde_json::to_value(&restored).unwrap();
+
+        assert_eq!(output["_npmUser"], input["_npmUser"]);
+        assert_eq!(
+            output["_swiftMeta"]["products"],
+            input["_swiftMeta"]["products"]
+        );
+        assert_eq!(
+            output["_swiftMeta"]["platforms"],
+            input["_swiftMeta"]["platforms"]
+        );
+        assert_eq!(
+            output["_swiftMeta"]["requiredCapabilities"],
+            input["_swiftMeta"]["requiredCapabilities"]
+        );
+        let swift = restored.swift_meta.as_ref().unwrap();
+        assert_eq!(
+            swift.manifest_set.as_ref().unwrap().manifests[0].tools_version,
+            "5.9"
+        );
+        let publisher = restored.npm_user.as_ref().unwrap();
+        assert!(publisher.has_trusted_publisher());
+        assert!(publisher.has_approver());
+        assert_eq!(restored.swift_library_product().unwrap().name, "Kit");
+    }
 
     #[test]
     fn blocked_set_projection_preserves_distribution_identity_in_json_and_cache() {
