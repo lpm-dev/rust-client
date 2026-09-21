@@ -1,5 +1,8 @@
 use miette::Result;
 
+mod runtime;
+use runtime::run_async_main;
+
 use crate::{
     auth, auth_storage_notice, color_policy, commands, engine_check, install_state,
     lpm_skills_config, output, privilege, provenance_fetch, release_age_config, save_spec,
@@ -119,42 +122,7 @@ pub(crate) fn run() -> Result<()> {
         }
     }
 
-    // ── Normal async path ───────────────────────────────────────────
-    // `LPM_MAX_BLOCKING_THREADS=<N>` is an opt-in diagnostic hook for
-    // A/B benching the tokio blocking-pool size without a rebuild.
-    // Paired bench runs on `bench/fixture-large` found no measurable
-    // wall-clock effect from capping the pool, so default behavior
-    // preserves tokio's unbounded blocking pool.
-    // The install pipeline is one very large future. Recursive installs move
-    // each target pipeline onto a runtime worker, while standalone installs
-    // are polled by the thread driving `block_on`. Give both thread classes
-    // the same explicit budget so debug frames and large workspaces cannot
-    // overflow Tokio's 2 MiB default worker stack.
     run_async_main()
-}
-
-fn run_async_main() -> Result<()> {
-    const ASYNC_STACK_BYTES: usize = 64 * 1024 * 1024;
-    let mut runtime_builder = tokio::runtime::Builder::new_multi_thread();
-    runtime_builder.enable_all();
-    runtime_builder.thread_stack_size(ASYNC_STACK_BYTES);
-    if let Some(cap) = std::env::var("LPM_MAX_BLOCKING_THREADS")
-        .ok()
-        .and_then(|s| s.parse::<std::num::NonZeroUsize>().ok())
-    {
-        runtime_builder.max_blocking_threads(cap.get());
-    }
-    let runtime = runtime_builder
-        .build()
-        .expect("failed to create tokio runtime");
-
-    std::thread::Builder::new()
-        .name("lpm-async-main".into())
-        .stack_size(ASYNC_STACK_BYTES)
-        .spawn(move || runtime.block_on(async_main()))
-        .expect("failed to spawn async main thread")
-        .join()
-        .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
 }
 
 enum FastLaneAdmission {
@@ -197,9 +165,7 @@ fn lockfile_contains_lpm_package(project_dir: &std::path::Path) -> bool {
     })
 }
 
-async fn async_main() -> Result<()> {
-    let cli = parse_cli_or_exit();
-
+async fn async_main(cli: Cli) -> Result<()> {
     // Color policy is already initialized at the top of `fn main()` via
     // the argv pre-scan. Re-run init here so any difference between the
     // pre-scan's flag detection and clap's parsed value (e.g., the user

@@ -130,6 +130,32 @@ async fn interrupted_install_ctrl_c_restores_the_manifest_before_exit() {
     assert!(!project.path().join(".lpm/install-recovery").exists());
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn interrupted_bare_install_can_retry_without_changing_the_manifest() {
+    let original = r#"{"name":"standalone-recovery","version":"1.0.0","dependencies":{"recovery-pkg":"1.0.0"}}"#;
+    let project = TempProject::empty(original);
+    let (mock, tarball) = interrupt_project_install(&project, &[], true).await;
+    assert_eq!(project.read_file("package.json"), original);
+    assert!(!project.path().join(".lpm/install-hash").exists());
+
+    mock.server().reset().await;
+    mock.with_package("recovery-pkg", "1.0.0", &tarball).await;
+    lpm_with_registry(&project, &mock.url())
+        .env("LPM_INTERNAL_TEST_NPM_REGISTRY_URL", mock.url())
+        .args(install_args_with(&[]))
+        .assert()
+        .success();
+    assert_eq!(project.read_file("package.json"), original);
+    assert!(
+        project
+            .path()
+            .join("node_modules/recovery-pkg/index.js")
+            .is_file()
+    );
+    assert!(project.path().join(".lpm/install-hash").is_file());
+}
+
 #[tokio::test]
 async fn interrupted_install_kill_retry_recovers_the_original_save_intent() {
     let (project, mock, tarball, _original) = interrupt_new_dependency_install(false).await;
@@ -1439,6 +1465,36 @@ async fn install_with_metadata_404_fails_immediately_without_retry() {
         unique.len(),
         "a non-retryable metadata request was repeated: {metadata_paths:?}"
     );
+}
+
+#[tokio::test]
+async fn bare_install_with_missing_metadata_fails_without_committing_state() {
+    let mock = MockRegistry::start().await;
+    mock.with_batch_metadata(vec![]).await;
+    let original =
+        r#"{"name":"standalone-missing","version":"1.0.0","dependencies":{"missing-pkg":"1.0.0"}}"#;
+    let project = TempProject::empty(original);
+    let output = lpm_with_registry(&project, &mock.url())
+        .env("LPM_INTERNAL_TEST_NPM_REGISTRY_URL", mock.url())
+        .args(install_args_with(&[]))
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(!String::from_utf8_lossy(&output.stderr).contains("panicked at"));
+    assert_eq!(project.read_file("package.json"), original);
+    assert!(!project.path().join(".lpm/install-hash").exists());
+    assert!(!project.path().join("lpm.lock").exists());
+    let requests = mock.server().received_requests().await.unwrap();
+    let metadata_paths: Vec<_> = requests
+        .iter()
+        .filter(|request| {
+            request.method.as_str() == "GET" && request.url.path().contains("missing-pkg")
+        })
+        .map(|request| request.url.path())
+        .collect();
+    assert!(!metadata_paths.is_empty());
+    let unique: std::collections::HashSet<_> = metadata_paths.iter().copied().collect();
+    assert_eq!(metadata_paths.len(), unique.len());
 }
 
 /// **C.1 — tarball 503 → 200 succeeds after retry.**

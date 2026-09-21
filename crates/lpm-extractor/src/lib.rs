@@ -1195,9 +1195,11 @@ where
     }
 }
 
+type CompressedTail<R> = std::io::Chain<std::io::Cursor<[u8; 1]>, R>;
+
 enum CompressedInput<R> {
     Buffered(Vec<u8>),
-    Stream(std::io::Chain<ReleasingPrefix<Vec<u8>>, R>),
+    Stream(std::io::Chain<ReleasingPrefix<Vec<u8>>, CompressedTail<R>>),
 }
 
 struct ReleasingPrefix<T>(std::io::Cursor<T>);
@@ -1232,13 +1234,15 @@ fn read_compressed_input<R: std::io::Read>(
     loop {
         let buffered_len = compressed.len() as u64;
         if buffered_len >= max_buffered_size {
-            let read = reader.read(&mut chunk).map_err(LpmError::Io)?;
+            // Appending the overflow probe would double a full prefix's allocation.
+            let mut probe = [0; 1];
+            let read = reader.read(&mut probe).map_err(LpmError::Io)?;
             if read == 0 {
                 return Ok(CompressedInput::Buffered(compressed));
             }
-            compressed.extend_from_slice(&chunk[..read]);
             return Ok(CompressedInput::Stream(
-                ReleasingPrefix(std::io::Cursor::new(compressed)).chain(reader),
+                ReleasingPrefix(std::io::Cursor::new(compressed))
+                    .chain(std::io::Cursor::new(probe).chain(reader)),
             ));
         }
 
@@ -1246,6 +1250,12 @@ fn read_compressed_input<R: std::io::Read>(
         let read = reader.read(&mut chunk[..remaining]).map_err(LpmError::Io)?;
         if read == 0 {
             return Ok(CompressedInput::Buffered(compressed));
+        }
+        let capacity_limit = usize::try_from(max_buffered_size).unwrap_or(usize::MAX);
+        if compressed.capacity() - compressed.len() < read
+            && compressed.capacity().saturating_mul(2) > capacity_limit
+        {
+            compressed.reserve_exact(capacity_limit - compressed.len());
         }
         compressed.extend_from_slice(&chunk[..read]);
     }
@@ -2203,6 +2213,94 @@ mod tests {
     }
 
     #[test]
+    fn streaming_fallback_prefix_capacity_does_not_double_at_buffered_limit() {
+        let limit = 256 * 1024;
+        let source = std::io::repeat(1).take(limit + 1);
+        let CompressedInput::Stream(mut reader) = read_compressed_input(source, limit).unwrap()
+        else {
+            panic!("input must exceed the buffered threshold");
+        };
+        let prefix = reader.get_ref().0.get_ref();
+        assert!(prefix.capacity() <= limit as usize);
+        let mut output = Vec::new();
+        reader.read_to_end(&mut output).unwrap();
+        assert_eq!(output, vec![1; limit as usize + 1]);
+    }
+
+    #[test]
+    fn compressed_input_at_buffered_limit_stays_buffered() {
+        let source = vec![7; 256 * 1024];
+        let CompressedInput::Buffered(buffer) =
+            read_compressed_input(source.as_slice(), source.len() as u64).unwrap()
+        else {
+            panic!("input at the threshold must remain buffered");
+        };
+        assert_eq!(buffer, source);
+    }
+
+    #[test]
+    fn compressed_input_capacity_respects_non_power_of_two_limits() {
+        let limit = 96 * 1024;
+        let CompressedInput::Buffered(buffer) =
+            read_compressed_input(std::io::repeat(1).take(limit), limit).unwrap()
+        else {
+            panic!("input at the threshold must remain buffered");
+        };
+        assert!(buffer.capacity() <= limit as usize);
+    }
+
+    #[test]
+    fn compressed_input_preserves_bytes_across_overflow_boundaries() {
+        let source: Vec<u8> = (0..200_000).map(|i| (i % 251) as u8).collect();
+        for limit in [0, 1, 65_536, 131_072] {
+            let CompressedInput::Stream(mut reader) =
+                read_compressed_input(source.as_slice(), limit).unwrap()
+            else {
+                panic!("input must exceed the buffered threshold");
+            };
+            let mut output = Vec::new();
+            reader.read_to_end(&mut output).unwrap();
+            assert_eq!(output, source, "buffer limit {limit}");
+        }
+    }
+
+    #[test]
+    fn compressed_input_keeps_empty_input_buffered_at_zero_limit() {
+        let CompressedInput::Buffered(buffer) = read_compressed_input(std::io::empty(), 0).unwrap()
+        else {
+            panic!("empty input must remain buffered");
+        };
+        assert!(buffer.is_empty());
+        assert_eq!(buffer.capacity(), 0);
+    }
+
+    #[test]
+    fn compressed_input_propagates_errors_before_during_and_after_overflow_probe() {
+        struct FailedReader;
+        impl Read for FailedReader {
+            fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::other("input failed"))
+            }
+        }
+
+        for length in [3, 4] {
+            let source = std::io::repeat(1).take(length).chain(FailedReader);
+            assert!(matches!(
+                read_compressed_input(source, 4),
+                Err(LpmError::Io(error)) if error.to_string() == "input failed"
+            ));
+        }
+        let source = std::io::repeat(1).take(5).chain(FailedReader);
+        let CompressedInput::Stream(mut reader) = read_compressed_input(source, 4).unwrap() else {
+            panic!("input must exceed the buffered threshold");
+        };
+        let mut output = Vec::new();
+        let error = reader.read_to_end(&mut output).unwrap_err();
+        assert_eq!(error.to_string(), "input failed");
+        assert_eq!(output, vec![1; 5]);
+    }
+
+    #[test]
     fn streaming_fallback_releases_replayed_prefix_before_reading_the_tail() {
         struct ShortReads<R>(R);
         impl<R: Read> Read for ShortReads<R> {
@@ -2218,15 +2316,15 @@ mod tests {
             panic!("input must exceed the buffered threshold");
         };
         assert_eq!(reader.read(&mut []).unwrap(), 0);
-        assert_eq!(reader.get_ref().0.get_ref().len(), 5);
-        let mut prefix = [0; 5];
+        assert_eq!(reader.get_ref().0.get_ref().len(), 4);
+        let mut prefix = [0; 4];
         reader.read_exact(&mut prefix).unwrap();
-        assert_eq!(&prefix, b"prefi");
+        assert_eq!(&prefix, b"pref");
         assert_eq!(reader.get_ref().0.get_ref().capacity(), 0);
-        assert_eq!(reader.get_ref().1.0, &source[5..]);
+        assert_eq!(reader.get_ref().1.get_ref().1.0, &source[5..]);
         let mut tail = Vec::new();
         reader.read_to_end(&mut tail).unwrap();
-        assert_eq!(tail, source[5..]);
+        assert_eq!(tail, source[4..]);
     }
 
     #[test]
