@@ -1688,5 +1688,6 @@
     "packages": 95,
     "sorted_name_version_json_sha256": "e59db409cad0da216fb25ae2f235a6e8305d7f19332a17b8ef0905d9724b55c4"
   },
-  "sharp_repeat_note": "Live network repeat: the attempted replay captured zero requests because the registry override is debug-only. No controlled-replay claim."
+  "sharp_repeat_note": "Live network repeat: the attempted replay captured zero requests because the registry override is debug-only. No controlled-replay claim.",
+  "override_correction": {"source_commit": "4f703c4c131c4a425a20d6eef7f0ff759729d843", "finding": "ML-V7", "introduced_by": "b8562c6aa (#638)", "red_result": "Both cold and preseeded partial cases select2.0.0 despite override1.0.0", "green_result": "69 override tests pass; both added tests select1.0.0 with one history request and one override trace", "measured_binaries_unchanged": true}
 }

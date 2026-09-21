@@ -129,11 +129,11 @@ Merge requires separate user approval.
 
 ## Finding ledger
 
-There are 19 recorded reports and experiments, representing 17 canonical findings: 10 verified and fixed, seven rejected, zero externally blocked, zero pending.
+There are 20 recorded reports and experiments, representing 18 canonical findings: 11 verified and fixed, seven rejected, zero externally blocked, zero pending.
 `H1` duplicates `M1`/`M2`. The memory researcher's `M3` duplicates `ML-V5`.
 Repeated exact-plus-range fallback reports map to `ML-V2`.
 
-All verified rows use source commit `1f28499c04c924ca100300f89895136d42d542df`. Their PR state is the concept branch submitted with this report. current CI status belongs to the PR checks.
+The original verified rows use source commit `1f28499c04c924ca100300f89895136d42d542df`. Their PR state is the concept branch submitted with this report. current CI status belongs to the PR checks.
 Rejected rows require no resolving commit. No separate finding PRs were created.
 
 | ID | Source | Category | Location and claim | Evidence | Coverage | Disposition | Commit | PR status |
@@ -155,3 +155,6 @@ Rejected rows require no resolving commit. No separate finding PRs were created.
 | ML-R5 | Primary and metadata researcher | Performance | Change exact-document Accept header for CDN caching | Scoped URLs returned 406. fallback remained dynamic | Recorded repeated HTTP probes | Rejected | — | Not applicable |
 | ML-V5 | Both researchers | Correctness | `greedy/fused.rs`: failed fallback poisoned later requests | Malformed first response remained cached despite a healthy later response | `failed_packument_fallback_does_not_poison_later_exact_requests` | Verified | `1f28499c0` | Open concept PR; merge unapproved |
 | ML-V6 | Metadata researcher | Performance | `provider/cache.rs`: overlapping snapshots rebuilt shared histories and scanned equal sets quadratically | Sharing regression failed. merge probe improved 53.49%. process RSS unchanged | Sharing, changed facts, tags, release times, and provenance tests | Verified | `1f28499c0` | Open concept PR; merge unapproved |
+| ML-V7 | Metadata researcher and primary | Correctness | `greedy/fused.rs`: exact documents and partial cache hits hid override targets | Cold and cached exact2.0→override1.0 tests both selected2.0 before hydration | `exact_metadata_requests_preserve_override_targets_outside_the_requested_version`; `partial_exact_cache_hydrates_history_before_selecting_an_override` | Verified | `4f703c4c1` | Open concept PR; merge unapproved |
+
+The override correction predates this stack (introduced by the exact-document path in #638). It is included on this owning metadata branch so every later member inherits it. The benchmark datasets above remain measurements of their recorded binaries; this correction only requires extra history for override-targeted packages. Both regressions pass after the fix.
