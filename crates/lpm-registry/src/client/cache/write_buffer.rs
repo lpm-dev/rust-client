@@ -107,6 +107,29 @@ impl MetadataCacheBuffer {
         Ok(())
     }
 
+    fn write_across_chunks(&mut self, mut bytes: &[u8]) -> io::Result<usize> {
+        let written = bytes.len();
+        if self
+            .len
+            .checked_add(written)
+            .is_none_or(|size| size > self.file_limit)
+        {
+            return Err(self.reject(BufferLimit::FileSize));
+        }
+        while !bytes.is_empty() {
+            let tail = self.chunks.last().unwrap_or(&self.first);
+            if tail.len() == tail.capacity() {
+                self.add_chunk()?;
+            }
+            let tail = self.chunks.last_mut().unwrap_or(&mut self.first);
+            let count = bytes.len().min(tail.capacity() - tail.len());
+            tail.extend_from_slice(&bytes[..count]);
+            self.len += count;
+            bytes = &bytes[count..];
+        }
+        Ok(written)
+    }
+
     pub(super) fn write_to(&self, writer: &mut impl Write) -> io::Result<()> {
         let mut chunks = std::iter::once(self.first.as_slice())
             .chain(self.chunks.iter().map(Vec::as_slice))
@@ -135,30 +158,18 @@ impl MetadataCacheBuffer {
 }
 
 impl Write for MetadataCacheBuffer {
-    fn write(&mut self, mut bytes: &[u8]) -> io::Result<usize> {
+    #[inline]
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
         if let Some(limit) = self.exhausted {
             return Err(self.reject(limit));
         }
-        let written = bytes.len();
-        if self
-            .len
-            .checked_add(written)
-            .is_none_or(|size| size > self.file_limit)
-        {
-            return Err(self.reject(BufferLimit::FileSize));
+        let tail = self.chunks.last_mut().unwrap_or(&mut self.first);
+        if bytes.len() <= tail.capacity() - tail.len() {
+            tail.extend_from_slice(bytes);
+            self.len += bytes.len();
+            return Ok(bytes.len());
         }
-        while !bytes.is_empty() {
-            let tail = self.chunks.last().unwrap_or(&self.first);
-            if tail.len() == tail.capacity() {
-                self.add_chunk()?;
-            }
-            let tail = self.chunks.last_mut().unwrap_or(&mut self.first);
-            let count = bytes.len().min(tail.capacity() - tail.len());
-            tail.extend_from_slice(&bytes[..count]);
-            self.len += count;
-            bytes = &bytes[count..];
-        }
-        Ok(written)
+        self.write_across_chunks(bytes)
     }
 
     fn flush(&mut self) -> io::Result<()> {
