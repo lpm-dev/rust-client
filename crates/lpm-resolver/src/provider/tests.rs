@@ -687,6 +687,40 @@ fn owned_and_borrowed_metadata_projection_have_the_same_contract() {
 }
 
 #[test]
+fn metadata_projection_preserves_optional_alias_precedence_and_local_name_flags() {
+    let metadata: lpm_registry::PackageMetadata = serde_json::from_value(serde_json::json!({
+        "name": "projection", "versions": {"1.0.0": {
+            "name": "projection", "version": "1.0.0",
+            "dependencies": {"alias": "npm:old@^1", "fallback": "^1", "regular": "^3", "../bad": "*"},
+            "optionalDependencies": {"alias": "npm:new@^2", "fallback": "npm:../bad@^2"},
+            "bundleDependencies": ["alias", "new", "../bad"],
+            "peerDependencies": {"alias": "*", "peer": "npm:real-peer@^4"},
+            "peerDependenciesMeta": {"peer": {"optional": true}}
+        }}
+    })).unwrap();
+    let info = parse_owned_metadata_to_cache_info(metadata);
+    let alias = info.dependency("1.0.0", "alias").unwrap();
+    assert_eq!(alias.range, "^2");
+    assert_eq!(alias.alias, Some("new"));
+    assert!(alias.optional);
+    assert!(alias.bundled);
+    let fallback = info.dependency("1.0.0", "fallback").unwrap();
+    assert_eq!(fallback.range, "^1");
+    assert!(!fallback.optional);
+    assert!(info.dependency("1.0.0", "../bad").is_none());
+    assert!(info.peer_dependency("1.0.0", "alias").is_none());
+    let peer = info.peer_dependency("1.0.0", "peer").unwrap();
+    assert_eq!(peer.alias, Some("real-peer"));
+    assert!(peer.optional);
+    let names: Vec<_> = info
+        .dependencies("1.0.0")
+        .unwrap()
+        .map(|dep| dep.name)
+        .collect();
+    assert_eq!(names, ["alias", "fallback", "regular"]);
+}
+
+#[test]
 fn parse_metadata_keeps_dependency_cache_sparse_for_empty_versions() {
     let meta = metadata_with_versions(
         "sparse-deps",

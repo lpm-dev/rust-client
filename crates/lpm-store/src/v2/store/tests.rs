@@ -2193,6 +2193,192 @@ fn streamed_object_accepts_declared_integrity_algorithms_and_uses_sha512_identit
 }
 
 #[test]
+fn known_sha512_stream_preserves_declared_algorithms_and_trailing_byte_identity() {
+    let mut tarball = build_test_tarball(&[("package.json", b"{}")]);
+    tarball.extend_from_slice(b"trailing bytes are part of the downloaded identity");
+    let canonical = crate::compute_sri_hash(&tarball);
+    for algorithm in [
+        None,
+        Some(HashAlgorithm::Sha512),
+        Some(HashAlgorithm::Sha256),
+        Some(HashAlgorithm::Sha1),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::at(dir.path());
+        let declared =
+            algorithm.map(|algorithm| Integrity::from_bytes(algorithm, &tarball).to_string());
+        let (object, sri, _) = store
+            .extract_object_from_stream_with_known_sha512(
+                tarball.as_slice(),
+                &canonical,
+                declared.as_deref(),
+                tarball.len() as u64,
+            )
+            .unwrap();
+        assert_eq!(sri, canonical);
+        assert_eq!(object.source_sri, canonical);
+        assert_eq!(
+            std::fs::read(object.path.join("package.json")).unwrap(),
+            b"{}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(object.path.join(".integrity")).unwrap(),
+            canonical
+        );
+    }
+}
+
+#[test]
+fn known_sha512_stream_rejects_declared_mismatches_for_every_algorithm() {
+    let tarball = build_test_tarball(&[("package.json", b"{}")]);
+    let canonical = crate::compute_sri_hash(&tarball);
+    for algorithm in [
+        HashAlgorithm::Sha512,
+        HashAlgorithm::Sha256,
+        HashAlgorithm::Sha1,
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::at(dir.path());
+        let wrong = Integrity::from_bytes(algorithm, b"wrong bytes").to_string();
+        let error = store
+            .extract_object_from_stream_with_known_sha512(
+                tarball.as_slice(),
+                &canonical,
+                Some(&wrong),
+                tarball.len() as u64,
+            )
+            .unwrap_err();
+        assert!(matches!(error, LpmError::IntegrityMismatch { .. }));
+        assert!(
+            std::fs::read_dir(store.paths().objects_root())
+                .unwrap()
+                .next()
+                .is_none()
+        );
+    }
+}
+
+#[test]
+fn known_sha512_stream_rejects_invalid_or_non_sha512_canonical_identities() {
+    let tarball = build_test_tarball(&[("package.json", b"{}")]);
+    for invalid in [
+        "not-an-integrity".to_owned(),
+        "sha512-eA==".to_owned(),
+        crate::compute_sri_hash_sha256(&tarball),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::at(dir.path());
+        assert!(
+            store
+                .extract_object_from_stream_with_known_sha512(
+                    tarball.as_slice(),
+                    &invalid,
+                    None,
+                    tarball.len() as u64,
+                )
+                .is_err()
+        );
+        assert!(
+            std::fs::read_dir(store.paths().objects_root())
+                .unwrap()
+                .next()
+                .is_none()
+        );
+    }
+}
+
+#[test]
+fn known_sha512_stream_enforces_size_after_the_gzip_member() {
+    let mut tarball = build_test_tarball(&[("package.json", b"{}")]);
+    let limit = tarball.len() as u64;
+    tarball.extend_from_slice(b"over limit");
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::at(dir.path());
+    let canonical = crate::compute_sri_hash(&tarball);
+    let error = store
+        .extract_object_from_stream_with_known_sha512(tarball.as_slice(), &canonical, None, limit)
+        .unwrap_err();
+    assert!(error.to_string().contains("maximum compressed size"));
+    assert!(
+        std::fs::read_dir(store.paths().objects_root())
+            .unwrap()
+            .next()
+            .is_none()
+    );
+}
+
+#[test]
+fn known_sha512_stream_propagates_reader_errors_without_publishing() {
+    let tarball = build_test_tarball(&[("package.json", b"{}")]);
+    let canonical = crate::compute_sri_hash(&tarball);
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::at(dir.path());
+    let error = store
+        .extract_object_from_stream_with_known_sha512(
+            ErrorAtEofReader {
+                cursor: std::io::Cursor::new(tarball),
+            },
+            &canonical,
+            None,
+            u64::MAX,
+        )
+        .unwrap_err();
+    assert!(error.to_string().contains("injected response-body failure"));
+    assert!(
+        std::fs::read_dir(store.paths().objects_root())
+            .unwrap()
+            .next()
+            .is_none()
+    );
+}
+
+#[test]
+fn known_sha512_stream_rejects_the_v3_store() {
+    let tarball = build_test_tarball(&[("package.json", b"{}")]);
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::at_v3(dir.path());
+    let error = store
+        .extract_object_from_stream_with_known_sha512(
+            tarball.as_slice(),
+            &crate::compute_sri_hash(&tarball),
+            None,
+            u64::MAX,
+        )
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("unavailable for the v3 file CAS")
+    );
+    assert!(!store.paths().objects_root().exists());
+}
+
+#[test]
+fn known_sha512_stream_rejects_truncated_archives_without_publishing() {
+    let mut tarball = build_test_tarball(&[("package.json", b"{}")]);
+    tarball.truncate(tarball.len() - 4);
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::at(dir.path());
+    let canonical = crate::compute_sri_hash(&tarball);
+    assert!(
+        store
+            .extract_object_from_stream_with_known_sha512(
+                tarball.as_slice(),
+                &canonical,
+                None,
+                tarball.len() as u64,
+            )
+            .is_err()
+    );
+    assert!(
+        std::fs::read_dir(store.paths().objects_root())
+            .unwrap()
+            .next()
+            .is_none()
+    );
+}
+
+#[test]
 fn streamed_object_trust_on_first_use_returns_canonical_sha512_identity() {
     let dir = tempfile::tempdir().unwrap();
     let store = Store::at(dir.path());
@@ -2411,36 +2597,39 @@ fn streamed_object_reader_error_removes_private_staging() {
 
 #[test]
 fn streamed_object_is_not_published_before_eof_verification() {
-    let dir = tempfile::tempdir().unwrap();
-    let store = Store::at(dir.path());
-    let tarball = build_test_tarball(&[(
-        "package.json",
-        b"{\"name\":\"streamed-eof\",\"version\":\"1.0.0\"}",
-    )]);
-    let expected_sri = crate::compute_sri_hash(&tarball);
-    let object_dir = store.paths().object_dir(&expected_sri).unwrap();
-    let arrived = Arc::new(std::sync::Barrier::new(2));
-    let resume = Arc::new(std::sync::Barrier::new(2));
-    let worker_arrived = Arc::clone(&arrived);
-    let worker_resume = Arc::clone(&resume);
-    let worker = std::thread::spawn(move || {
-        store.extract_object_from_stream(
-            EofGateReader {
-                cursor: std::io::Cursor::new(tarball),
-                arrived: worker_arrived,
-                resume: worker_resume,
-                released: false,
-            },
-            Some(&expected_sri),
-            u64::MAX,
-        )
-    });
+    for known in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::at(dir.path());
+        let tarball = build_test_tarball(&[(
+            "package.json",
+            b"{\"name\":\"streamed-eof\",\"version\":\"1.0.0\"}",
+        )]);
+        let expected_sri = crate::compute_sri_hash(&tarball);
+        let object_dir = store.paths().object_dir(&expected_sri).unwrap();
+        let arrived = Arc::new(std::sync::Barrier::new(2));
+        let resume = Arc::new(std::sync::Barrier::new(2));
+        let worker_arrived = Arc::clone(&arrived);
+        let worker_resume = Arc::clone(&resume);
+        let worker = std::thread::spawn(move || {
+            store.extract_object_from_stream_with_identity(
+                EofGateReader {
+                    cursor: std::io::Cursor::new(tarball),
+                    arrived: worker_arrived,
+                    resume: worker_resume,
+                    released: false,
+                },
+                known.then_some(expected_sri.as_str()),
+                Some(&expected_sri),
+                u64::MAX,
+            )
+        });
 
-    arrived.wait();
-    assert!(!object_dir.exists());
-    resume.wait();
-    let (object, _, _) = worker.join().unwrap().unwrap();
-    assert_eq!(object.path, object_dir);
+        arrived.wait();
+        assert!(!object_dir.exists());
+        resume.wait();
+        let (object, _, _) = worker.join().unwrap().unwrap();
+        assert_eq!(object.path, object_dir);
+    }
 }
 
 #[test]

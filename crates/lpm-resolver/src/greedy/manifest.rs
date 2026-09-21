@@ -316,6 +316,87 @@ pub(super) async fn fetch_metadata_for_resolver_with_timings(
     Ok((fetched, timings))
 }
 
+pub(super) async fn fetch_preferred_metadata_for_resolver(
+    client: &RegistryClient,
+    route_table: &RouteTable,
+    canonical: &CanonicalKey,
+    policy: &ResolverPolicy,
+    include_speculation: bool,
+    trace_metadata_fetches: bool,
+    range: NpmRange,
+) -> FetchResult {
+    let CanonicalKey::Npm { name } = canonical else {
+        return fetch_metadata_for_resolver_with_trace_detail(
+            client,
+            route_table,
+            canonical,
+            policy,
+            include_speculation,
+            trace_metadata_fetches,
+        )
+        .await;
+    };
+    let started = Instant::now();
+    let candidate_range = range.clone();
+    let (raw, versions_complete) = client
+        .get_npm_preferred_metadata_direct_with_timings(name, move |version| {
+            NpmVersion::parse(version).is_ok_and(|version| candidate_range.satisfies(&version))
+        })
+        .await
+        .map_err(|error| metadata_fetch_error(canonical, error))?;
+    let raw_fetch_ms = started.elapsed().as_millis();
+    let version_count = raw.metadata.versions.len() as u64;
+    let latest_version = latest_version_from_metadata(&raw.metadata);
+    let dist_tags = raw.metadata.dist_tags.clone();
+    let parse_start = Instant::now();
+    let mut info = if versions_complete {
+        parse_owned_metadata_to_cache_info(raw.metadata)
+    } else {
+        parse_owned_partial_metadata_to_cache_info(raw.metadata)
+    };
+    let parse_ms = parse_start.elapsed().as_millis();
+    if info.needs_platform_metadata() {
+        fetch_platform_metadata(
+            client,
+            route_table,
+            canonical,
+            &mut info,
+            trace_metadata_fetches,
+        )
+        .await?;
+    }
+    if !versions_complete {
+        info.preferred_latest = info.latest_version.clone();
+    }
+    let mut fetched =
+        fetched_metadata_from_info(latest_version, dist_tags, info, include_speculation);
+    fetched.shared_fact = Some(Arc::clone(&fetched.info));
+    if trace_metadata_fetches {
+        lpm_registry::timing::record_metadata_fetch_detail(
+            lpm_registry::timing::MetadataFetchDetailRecord {
+                package: name.clone(),
+                route: "npm_direct",
+                total_ms: started.elapsed().as_millis(),
+                raw_fetch_ms,
+                cache_read_ms: raw.timings.cache_read_ms,
+                validator_read_ms: raw.timings.validator_read_ms,
+                http_ms: raw.timings.http_ms,
+                body_read_ms: raw.timings.body_read_ms,
+                json_decode_ms: raw.timings.json_decode_ms,
+                cache_after_304_ms: raw.timings.cache_after_304_ms,
+                cache_write_dispatch_ms: raw.timings.cache_write_dispatch_ms,
+                cache_info_parse_ms: parse_ms,
+                body_bytes: raw.timings.body_bytes,
+                version_count,
+                cache_hit: raw.timings.cache_hit,
+                not_modified: raw.timings.not_modified,
+                ..Default::default()
+            },
+        );
+    }
+    Ok(fetched)
+}
+
 pub(super) async fn fetch_exact_metadata_for_resolver_with_timings(
     client: &RegistryClient,
     route_table: &RouteTable,
@@ -324,6 +405,40 @@ pub(super) async fn fetch_exact_metadata_for_resolver_with_timings(
     policy: &ResolverPolicy,
     include_speculation: bool,
 ) -> Result<(FetchedMetadata, ExperimentalMetadataFetchTimings), ResolveError> {
+    fetch_exact_metadata_with_source(
+        client,
+        route_table,
+        canonical,
+        version,
+        policy,
+        ExactMetadataFetchOptions {
+            include_speculation,
+            prefer_history: false,
+            trace_metadata_fetches: false,
+        },
+    )
+    .await
+}
+
+struct ExactMetadataFetchOptions {
+    include_speculation: bool,
+    prefer_history: bool,
+    trace_metadata_fetches: bool,
+}
+
+async fn fetch_exact_metadata_with_source(
+    client: &RegistryClient,
+    route_table: &RouteTable,
+    canonical: &CanonicalKey,
+    version: &str,
+    policy: &ResolverPolicy,
+    options: ExactMetadataFetchOptions,
+) -> Result<(FetchedMetadata, ExperimentalMetadataFetchTimings), ResolveError> {
+    let ExactMetadataFetchOptions {
+        include_speculation,
+        prefer_history,
+        trace_metadata_fetches,
+    } = options;
     let CanonicalKey::Npm { name } = canonical else {
         return fetch_metadata_for_resolver_with_timings(
             client,
@@ -355,14 +470,45 @@ pub(super) async fn fetch_exact_metadata_for_resolver_with_timings(
         ..ExperimentalMetadataFetchTimings::default()
     };
     let raw_start = Instant::now();
-    let raw = client
-        .get_npm_version_metadata_direct_with_timings(name, version)
-        .await
-        .map_err(|e| ResolveError::DependencyFetch {
+    let raw = if prefer_history {
+        client
+            .get_npm_version_from_history_attempt(name, version)
+            .await
+    } else {
+        client
+            .get_npm_version_metadata_direct_attempt(name, version)
+            .await
+    }
+    .map_err(|failure| {
+        if trace_metadata_fetches {
+            let failed = failure.timings;
+            lpm_registry::timing::record_metadata_fetch_detail(
+                lpm_registry::timing::MetadataFetchDetailRecord {
+                    package: name.clone(),
+                    route: "npm_direct_version_doc",
+                    total_ms: total_start.elapsed().as_millis(),
+                    raw_fetch_ms: raw_start.elapsed().as_millis(),
+                    cache_read_ms: failed.cache_read_ms,
+                    validator_read_ms: failed.validator_read_ms,
+                    http_ms: failed.http_ms,
+                    body_read_ms: failed.body_read_ms,
+                    json_decode_ms: failed.json_decode_ms,
+                    cache_after_304_ms: failed.cache_after_304_ms,
+                    cache_write_dispatch_ms: failed.cache_write_dispatch_ms,
+                    body_bytes: failed.body_bytes,
+                    ..Default::default()
+                },
+            );
+        }
+        ResolveError::DependencyFetch {
             package: canonical.to_string(),
             version: version.to_string(),
-            detail: e.to_string(),
-        })?;
+            detail: failure.error.to_string(),
+        }
+    })?;
+    if raw.timings.selected_from_history {
+        timings.route = "npm_direct_selected_history";
+    }
     timings.raw_fetch_ms = raw_start.elapsed().as_millis();
     timings.version_count = raw.metadata.versions.len() as u64;
     timings.cache_hit = raw.timings.cache_hit;
@@ -434,13 +580,17 @@ pub(super) async fn try_fetch_exact_metadata_for_resolver(
     trace_metadata_fetches: bool,
 ) -> ExactMetadataFetchOutcome {
     lpm_registry::timing::record_exact_document_attempt();
-    match fetch_exact_metadata_for_resolver_with_timings(
+    match fetch_exact_metadata_with_source(
         client,
         route_table,
         canonical,
         version,
         policy,
-        include_speculation,
+        ExactMetadataFetchOptions {
+            include_speculation,
+            prefer_history: true,
+            trace_metadata_fetches,
+        },
     )
     .await
     {

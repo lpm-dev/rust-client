@@ -1685,6 +1685,39 @@ impl Store {
         expected_integrity: Option<&str>,
         max_compressed_size: u64,
     ) -> Result<(ExtractedObject, String, StageTimings), LpmError> {
+        self.extract_object_from_stream_with_identity(
+            reader,
+            None,
+            expected_integrity,
+            max_compressed_size,
+        )
+    }
+
+    /// Stream an exclusively owned tarball whose SHA-512 was computed during download.
+    /// The caller must ensure the reader contains exactly those unchanged bytes.
+    /// Declared integrity, compressed size, and archive contents are still validated.
+    pub fn extract_object_from_stream_with_known_sha512(
+        &self,
+        reader: impl std::io::Read,
+        canonical_sri: &str,
+        expected_integrity: Option<&str>,
+        max_compressed_size: u64,
+    ) -> Result<(ExtractedObject, String, StageTimings), LpmError> {
+        self.extract_object_from_stream_with_identity(
+            reader,
+            Some(canonical_sri),
+            expected_integrity,
+            max_compressed_size,
+        )
+    }
+
+    fn extract_object_from_stream_with_identity(
+        &self,
+        reader: impl std::io::Read,
+        canonical_sri: Option<&str>,
+        expected_integrity: Option<&str>,
+        max_compressed_size: u64,
+    ) -> Result<(ExtractedObject, String, StageTimings), LpmError> {
         if !self.supports_streamed_object_ingest() {
             return Err(LpmError::Store(
                 "streamed object ingest is unavailable for the v3 file CAS".into(),
@@ -1694,8 +1727,10 @@ impl Store {
         let staging = self.create_stream_object_staging_dir()?;
         let tmp_dir = &staging.path;
         let size_limited = SizeLimitedReader::new(reader, max_compressed_size);
-        let mut hashing_reader =
-            HashingReader::for_expected_integrity(size_limited, expected_integrity)?;
+        let mut hashing_reader = match canonical_sri {
+            Some(sri) => HashingReader::with_known_sha512(size_limited, sri, expected_integrity)?,
+            None => HashingReader::for_expected_integrity(size_limited, expected_integrity)?,
+        };
         let (streamed_integrities, prepared_cas, timings, computed_sri) = self
             .extract_input_into_staging(
                 TarballInput::Streaming {

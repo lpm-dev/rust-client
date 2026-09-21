@@ -432,7 +432,7 @@ pub(super) fn emit_online_install_report(input: OnlineInstallReportInput<'_>) {
         // root is already in the store before the metadata RPC
         // starts, or on the lockfile-fast-path. Field shape
         // documented on `SpeculativeStats`.
-                       "speculative": spec_stats.to_json(),
+                       "speculative": spec_stats.into_json(),
                    },
                    "warnings": registry_warnings,
                    "errors": [],

@@ -3,9 +3,9 @@ use super::manifest::{
     ExactMetadataFetchOutcome, FetchResult, FetchedMetadata, MetadataFetchCompletion,
     MetadataFetchKey, cached_manifest_from_importer_or_facts, complete_metadata_fetch,
     ensure_policy_metadata_for_cached_manifest, exact_metadata_fast_path_eligible,
-    fetch_metadata_for_resolver_with_trace_detail, parse_cached_metadata_for_resolver,
-    parse_fetched_metadata, parse_partial_fetched_metadata, publish_direct_base_fact,
-    try_fetch_exact_metadata_for_resolver,
+    fetch_metadata_for_resolver_with_trace_detail, fetch_preferred_metadata_for_resolver,
+    parse_cached_metadata_for_resolver, parse_fetched_metadata, parse_partial_fetched_metadata,
+    publish_direct_base_fact, try_fetch_exact_metadata_for_resolver,
 };
 use super::peer::{drain_peer_requirements_one_pass, pick_peer_prefetch_candidates};
 use super::prelude::*;
@@ -17,6 +17,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 const EXACT_DOCUMENT_CONCURRENCY_MULTIPLIER: usize = 4;
+const MAX_SELECTED_HISTORY_CONCURRENCY: usize = 32;
 
 /// Command-scoped permit pool shared by importer-local resolver passes.
 #[derive(Clone)]
@@ -33,7 +34,7 @@ impl SharedMetadataConcurrency {
         let limit = limit.clamp(1, crate::MAX_NPM_FANOUT);
         let exact_document_limit = limit
             .saturating_mul(EXACT_DOCUMENT_CONCURRENCY_MULTIPLIER)
-            .min(crate::MAX_NPM_FANOUT);
+            .min(MAX_SELECTED_HISTORY_CONCURRENCY);
         Self {
             semaphore: Arc::new(tokio::sync::Semaphore::new(limit)),
             exact_document_semaphore: Arc::new(tokio::sync::Semaphore::new(exact_document_limit)),
@@ -82,7 +83,10 @@ mod shared_metadata_concurrency_tests {
         let concurrency = SharedMetadataConcurrency::new(usize::MAX);
 
         assert_eq!(concurrency.limit(), crate::MAX_NPM_FANOUT);
-        assert_eq!(concurrency.exact_document_limit(), crate::MAX_NPM_FANOUT);
+        assert_eq!(
+            concurrency.exact_document_limit(),
+            MAX_SELECTED_HISTORY_CONCURRENCY
+        );
     }
 
     #[test]
@@ -662,6 +666,7 @@ struct PendingMetadataFetch {
     route_table: RouteTable,
     policy: ResolverPolicy,
     exact_version: Option<String>,
+    preferred_range: Option<NpmRange>,
     include_speculation: bool,
     trace_metadata_fetches: bool,
     telemetry: Arc<MetadataFetchTelemetry>,
@@ -718,6 +723,23 @@ impl MetadataFetchScheduler {
         exact_version: Option<String>,
         include_speculation: bool,
     ) {
+        self.enqueue_preferred(
+            dispatch,
+            canonical,
+            exact_version,
+            include_speculation,
+            None,
+        );
+    }
+
+    fn enqueue_preferred(
+        &mut self,
+        dispatch: &MetadataFetchDispatch<'_>,
+        canonical: CanonicalKey,
+        exact_version: Option<String>,
+        include_speculation: bool,
+        preferred_range: Option<NpmRange>,
+    ) {
         let client = dispatch.client.clone();
         let route_table = dispatch.route_table.clone();
         let policy = dispatch.policy.clone();
@@ -745,6 +767,7 @@ impl MetadataFetchScheduler {
             route_table,
             policy,
             exact_version,
+            preferred_range,
             include_speculation,
             trace_metadata_fetches: dispatch.trace_metadata_fetches,
             telemetry: Arc::clone(dispatch.telemetry),
@@ -864,6 +887,18 @@ impl MetadataFetchScheduler {
                         result
                     }
                 }
+            } else if let Some(range) = pending.preferred_range {
+                let _permit = permit;
+                fetch_preferred_metadata_for_resolver(
+                    &pending.client,
+                    &pending.route_table,
+                    &pending.canonical,
+                    &pending.policy,
+                    pending.include_speculation,
+                    pending.trace_metadata_fetches,
+                    range,
+                )
+                .await
             } else {
                 let _permit = permit;
                 if pending.exact_version.is_some()
@@ -1017,6 +1052,7 @@ mod metadata_fetch_scheduler_tests {
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
         let server = MockServer::start().await;
+        crate::greedy::tests::reject_selected_histories(&server).await;
         Mock::given(method("GET"))
             .and(path_regex(r"/recovering/\d\.0\.0$"))
             .respond_with(ResponseTemplate::new(404))
@@ -1162,6 +1198,7 @@ mod metadata_fetch_scheduler_tests {
 
         for shared_package in [false, true] {
             let server = MockServer::start().await;
+            crate::greedy::tests::reject_selected_histories(&server).await;
             Mock::given(method("GET"))
                 .and(path_regex(r"/bounded-[^/]+/1\.0\.[0-9]+$"))
                 .respond_with(ResponseTemplate::new(404))
@@ -1202,7 +1239,7 @@ mod metadata_fetch_scheduler_tests {
             }
             tokio::time::timeout(Duration::from_secs(2), async {
                 loop {
-                    if server.received_requests().await.unwrap().len() == 8
+                    if server.received_requests().await.unwrap().len() == 16
                         && telemetry.active.load(Ordering::Relaxed) == 0
                     {
                         break;
@@ -1229,6 +1266,7 @@ mod metadata_fetch_scheduler_tests {
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
         let server = MockServer::start().await;
+        crate::greedy::tests::reject_selected_histories(&server).await;
         Mock::given(method("GET"))
             .and(path("/fallback/1.0.0"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
@@ -2061,7 +2099,12 @@ pub async fn resolve_greedy_fused_with_cache_options_policy_and_selected_events_
                     && state
                         .overrides
                         .may_match_package(&edge.canonical.to_string());
-                if info_arc.needs_metadata_for_range(&edge.range) || override_needs_history {
+                let preferred_covers_range = state.overrides.is_empty()
+                    && exact_metadata_fast_path_eligible(&route_table, &edge.canonical, &policy)
+                    && info_arc.preferred_latest_satisfies(&edge.range);
+                if (info_arc.needs_metadata_for_range(&edge.range) && !preferred_covers_range)
+                    || override_needs_history
+                {
                     let canonical = edge.canonical.clone();
                     let exact_version = edge
                         .range
@@ -2247,6 +2290,11 @@ pub async fn resolve_greedy_fused_with_cache_options_policy_and_selected_events_
                     counted_metadata_edge_misses.insert(request.clone());
                 }
             }
+            let preferred_range = (exact_version.is_none()
+                && state.overrides.is_empty()
+                && exact_metadata_fast_path_eligible(&route_table, &canonical, &policy)
+                && edge.range.dist_tag().is_none_or(|tag| tag == "latest"))
+            .then(|| edge.range.clone());
             parked.entry(request).or_default().push(edge);
             if new_fetch {
                 let include_speculation = spec_tx.is_some();
@@ -2269,12 +2317,12 @@ pub async fn resolve_greedy_fused_with_cache_options_policy_and_selected_events_
                         worker_batch_candidates.push((canonical, name));
                     }
                 } else {
-                    spawn_metadata_fetch_job(
-                        &mut metadata_jobs,
+                    metadata_jobs.enqueue_preferred(
                         &metadata_dispatch,
                         canonical,
                         exact_version,
                         include_speculation,
+                        preferred_range,
                     );
                     dispatcher_rpc_count += 1;
                 }

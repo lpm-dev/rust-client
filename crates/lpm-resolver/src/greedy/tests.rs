@@ -4353,6 +4353,17 @@ async fn fusion_terminates_on_empty_deps() {
     assert_eq!(result.stage_timing.parked_max_depth, 0);
 }
 
+pub(super) async fn reject_selected_histories(server: &wiremock::MockServer) {
+    use wiremock::matchers::{header, method, path_regex};
+    wiremock::Mock::given(method("GET"))
+        .and(path_regex(r"^/[^/]+$"))
+        .and(header("accept", "application/json"))
+        .respond_with(wiremock::ResponseTemplate::new(404))
+        .with_priority(1)
+        .mount(server)
+        .await;
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn fusion_exact_npm_range_fetches_only_the_version_document() {
     use wiremock::matchers::{header, method, path};
@@ -4444,6 +4455,7 @@ async fn fusion_invalid_exact_version_document_falls_back_to_the_packument() {
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     let server = MockServer::start().await;
+    reject_selected_histories(&server).await;
     Mock::given(method("GET"))
         .and(path("/fallback-root/1.2.3"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
@@ -4582,6 +4594,7 @@ async fn fusion_exact_document_without_distribution_falls_back_to_the_packument(
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     let server = MockServer::start().await;
+    reject_selected_histories(&server).await;
     Mock::given(method("GET"))
         .and(path("/missing-dist/1.2.3"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
@@ -4690,6 +4703,7 @@ async fn fusion_broad_range_after_an_exact_document_refetches_the_packument() {
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     let server = MockServer::start().await;
+    reject_selected_histories(&server).await;
     Mock::given(method("GET"))
         .and(path("/shared-range/1.0.0"))
         .respond_with(
@@ -4753,6 +4767,7 @@ async fn fusion_exact_versions_share_one_packument_when_version_endpoints_are_mi
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     let server = MockServer::start().await;
+    reject_selected_histories(&server).await;
     for version in ["1.0.0", "2.0.0"] {
         Mock::given(method("GET"))
             .and(path(format!("/shared-fallback/{version}")))
@@ -5126,6 +5141,7 @@ async fn resolve_overlapping_range_with_parent_delay(
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     let server = MockServer::start().await;
+    reject_selected_histories(&server).await;
     for (name, dependency_range, delay_ms) in [
         ("exact-parent", "1.0.0", exact_parent_delay_ms),
         ("range-parent", "^1.0.0", range_parent_delay_ms),
@@ -5219,7 +5235,7 @@ async fn fusion_fetches_distinct_exact_versions_concurrently() {
     let (requested_tx, mut requested_rx) = tokio::sync::mpsc::channel(4);
     let server = tokio::spawn(async move {
         let mut requests = tokio::task::JoinSet::new();
-        for _ in 0..2 {
+        for _ in 0..4 {
             let (mut socket, _) = listener.accept().await.unwrap();
             let gate = Arc::clone(&gate);
             let tx = requested_tx.clone();
@@ -5234,6 +5250,10 @@ async fn fusion_fetches_distinct_exact_versions_concurrently() {
                 }
                 let request = String::from_utf8(request).unwrap();
                 let path = request.split_whitespace().nth(1).unwrap();
+                if path == "/shared-exact" {
+                    socket.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await.unwrap();
+                    return;
+                }
                 let version = path.strip_prefix("/shared-exact/").unwrap().to_owned();
                 tx.send(version.clone()).await.unwrap();
                 if version == "1.0.0" {
@@ -5353,7 +5373,7 @@ async fn resolve_direct_and_transitive_overlap_with_seeded_cache(
     seed_parent: bool,
     seed_shared: bool,
 ) -> String {
-    use wiremock::matchers::{method, path};
+    use wiremock::matchers::{header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     let server = MockServer::start().await;
@@ -5386,12 +5406,15 @@ async fn resolve_direct_and_transitive_overlap_with_seeded_cache(
         .expect(u64::from(!seed_parent))
         .mount(&server)
         .await;
-    Mock::given(method("GET"))
-        .and(path("/shared-child"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(shared_metadata.clone()))
-        .expect(u64::from(!seed_shared))
-        .mount(&server)
-        .await;
+    for accept in ["application/json", "application/vnd.npm.install-v1+json"] {
+        Mock::given(method("GET"))
+            .and(path("/shared-child"))
+            .and(header("accept", accept))
+            .respond_with(ResponseTemplate::new(200).set_body_json(shared_metadata.clone()))
+            .expect(u64::from(!seed_shared))
+            .mount(&server)
+            .await;
+    }
 
     let shared_cache: SharedCache = Arc::new(dashmap::DashMap::new());
     if seed_parent {
@@ -5480,6 +5503,7 @@ async fn resolve_deep_required_and_shallow_optional_overlap(
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     let server = MockServer::start().await;
+    reject_selected_histories(&server).await;
     let required_parent = metadata_json("a-required-parent", &[("middle", "*")]);
     let optional_parent = metadata_json("b-optional-parent", &[("shared-child", "^1.1.1")]);
     let middle = metadata_json("middle", &[("shared-child", "~1.1.1")]);
@@ -5520,10 +5544,15 @@ async fn resolve_deep_required_and_shallow_optional_overlap(
         ("middle", middle.clone(), required_chain_seeded),
         ("shared-child", shared_child.clone(), fully_seeded),
     ] {
+        let requests = if name == "shared-child" && !fully_seeded {
+            2
+        } else {
+            u64::from(!seeded)
+        };
         Mock::given(method("GET"))
             .and(path(format!("/{name}")))
             .respond_with(ResponseTemplate::new(200).set_body_json(metadata))
-            .expect(u64::from(!seeded))
+            .expect(requests)
             .mount(&server)
             .await;
     }
@@ -7183,6 +7212,7 @@ async fn exact_alias_metadata_hydrates_history_for_an_older_required_peer() {
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     let server = MockServer::start().await;
+    reject_selected_histories(&server).await;
     let mut consumer = version_document_json("consumer", "1.0.0", &[]);
     consumer["peerDependencies"] = serde_json::json!({"shared": "^1"});
     for (endpoint, document) in [
@@ -7320,4 +7350,168 @@ async fn peer_history_hydration_prefers_published_metadata_over_workspace_facts(
 #[tokio::test]
 async fn peer_history_hydration_does_not_hide_registry_access_errors_with_workspace_facts() {
     assert!(resolve_peer_from_seeded_workspace(403).await.is_err());
+}
+
+#[tokio::test]
+async fn fusion_preferred_latest_covers_distinct_matching_ranges_without_history() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+    let server = MockServer::start().await;
+    let child = serde_json::json!({"name":"a-child","dist-tags":{"latest":"1.1.0"},"versions":{
+        "1.0.0":{"name":"a-child","version":"1.0.0"},
+        "1.1.0":{"name":"a-child","version":"1.1.0"},
+        "1.2.0":{"name":"a-child","version":"1.2.0"}
+    }});
+    for (name, body) in [
+        ("a-child", child),
+        (
+            "z-parent",
+            metadata_json("z-parent", &[("a-child", ">=1.0.0")]),
+        ),
+    ] {
+        Mock::given(method("GET"))
+            .and(path(format!("/{name}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(body))
+            .expect(1)
+            .mount(&server)
+            .await;
+    }
+    let result = resolve_greedy_fused(
+        Arc::new(
+            RegistryClient::new()
+                .with_npm_registry_url(server.uri())
+                .with_cache_dir(None),
+        ),
+        HashMap::from([
+            ("a-child".to_owned(), "^1.0.0".to_owned()),
+            ("z-parent".to_owned(), "*".to_owned()),
+        ]),
+        OverrideSet::empty(),
+        RouteTable::from_mode_only(RouteMode::Direct),
+        8,
+        None,
+        true,
+    )
+    .await
+    .unwrap();
+    let child = result
+        .packages
+        .iter()
+        .find(|p| p.package.canonical_name() == "a-child")
+        .unwrap();
+    assert_eq!(child.version.to_string(), "1.1.0");
+    assert_eq!(result.packages.len(), 2);
+    server.verify().await;
+}
+
+#[tokio::test]
+async fn fusion_preferred_history_is_completed_when_an_importer_enables_release_age() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+    let server = MockServer::start().await;
+    let history = serde_json::json!({
+        "name":"shared", "modified":"2025-01-03T00:00:00Z",
+        "dist-tags":{"latest":"1.1.0"},
+        "versions":{
+            "1.0.0":{"name":"shared","version":"1.0.0"},
+            "1.1.0":{"name":"shared","version":"1.1.0"}
+        },
+        "time":{"1.0.0":"2025-01-01T00:00:00Z","1.1.0":"2025-01-03T00:00:00Z"}
+    });
+    Mock::given(method("GET"))
+        .and(path("/shared"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(history))
+        .mount(&server)
+        .await;
+    let client = Arc::new(
+        RegistryClient::new()
+            .with_npm_registry_url(server.uri())
+            .with_cache_dir(None),
+    );
+    let cache: SharedCache = Arc::new(dashmap::DashMap::new());
+    for (policy, expected) in [
+        (ResolverPolicy::default(), "1.1.0"),
+        (
+            ResolverPolicy::with_cutoff_unix(86_400, 1_735_776_000, Default::default()),
+            "1.0.0",
+        ),
+    ] {
+        let result = resolve_greedy_fused_with_cache_options_and_policy(
+            Arc::clone(&client),
+            HashMap::from([("shared".to_owned(), "*".to_owned())]),
+            OverrideSet::empty(),
+            RouteTable::from_mode_only(RouteMode::Direct),
+            8,
+            None,
+            Arc::clone(&cache),
+            true,
+            true,
+            policy,
+        )
+        .await
+        .expect("each importer must consider every version allowed by its policy");
+        assert_eq!(result.packages[0].version.to_string(), expected);
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn trace_metadata_keeps_failed_exact_attempts_before_packument_recovery() {
+    use wiremock::matchers::{header, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+    let _timing_guard = crate::metadata_fetch_detail_test_lock().lock().await;
+    lpm_registry::timing::reset_metadata_detail();
+    let server = MockServer::start().await;
+    let broken_history = b"{broken history";
+    let broken_exact = b"{broken version";
+    let complete = serde_json::to_vec(&metadata_json("failed-exact-trace", &[])).unwrap();
+    Mock::given(method("GET"))
+        .and(path("/failed-exact-trace"))
+        .and(header("accept", "application/json"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(broken_history.to_vec()))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/failed-exact-trace/1.0.0"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(broken_exact.to_vec()))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/failed-exact-trace"))
+        .and(header("accept", "application/vnd.npm.install-v1+json"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(complete.clone()))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let client = RegistryClient::new()
+        .with_npm_registry_url(server.uri())
+        .with_cache_dir(None);
+    let routes = RouteTable::from_mode_only(RouteMode::Direct);
+    let canonical = CanonicalKey::npm("failed-exact-trace");
+    let policy = ResolverPolicy::default();
+    assert!(matches!(
+        try_fetch_exact_metadata_for_resolver(
+            &client, &routes, &canonical, "1.0.0", &policy, false, true
+        )
+        .await,
+        ExactMetadataFetchOutcome::Fallback
+    ));
+    let fetched = fetch_metadata_for_resolver_with_trace_detail(
+        &client, &routes, &canonical, &policy, false, true,
+    )
+    .await
+    .unwrap();
+    assert_eq!(fetched.info.versions.len(), 1);
+    let snapshot = lpm_registry::timing::snapshot_metadata_fetch_detail();
+    assert_eq!(
+        snapshot.calls, 2,
+        "failed selected lookup and successful packument must each be recorded"
+    );
+    assert_eq!(
+        snapshot.body_bytes_sum as usize,
+        broken_history.len() + broken_exact.len() + complete.len()
+    );
+    assert_eq!(snapshot.route_npm_direct_count, 1);
+    lpm_registry::timing::reset_metadata_detail();
 }

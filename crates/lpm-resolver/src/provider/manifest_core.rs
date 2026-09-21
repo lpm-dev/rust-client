@@ -64,6 +64,7 @@ pub struct CachedPackageInfo {
     pub workspace_versions: HashSet<NpmVersion>,
     pub platform_metadata_complete: bool,
     pub latest_version: Option<NpmVersion>,
+    pub(crate) preferred_latest: Option<NpmVersion>,
     pub versions: Arc<[NpmVersion]>,
     dist_tags: Arc<HashMap<String, NpmVersion>>,
     core: Arc<ManifestCore>,
@@ -449,6 +450,7 @@ impl CachedPackageInfo {
             workspace_versions: HashSet::new(),
             platform_metadata_complete: false,
             latest_version: None,
+            preferred_latest: None,
             versions: Arc::from([]),
             dist_tags: Arc::new(HashMap::new()),
             core: Arc::new(ManifestCore::empty()),
@@ -877,6 +879,19 @@ impl CachedPackageInfo {
             .collect()
     }
 
+    /// Returns whether the retained authoritative latest manifest satisfies this
+    /// range. Callers must separately enforce release-age and trust policies.
+    #[inline]
+    pub fn preferred_latest_satisfies(&self, range: &NpmRange) -> bool {
+        self.workspace_versions.is_empty()
+            && range.dist_tag().is_none_or(|tag| tag == "latest")
+            && self.preferred_latest.as_ref().is_some_and(|latest| {
+                self.latest_version.as_ref() == Some(latest)
+                    && self.versions.contains(latest)
+                    && self.range_satisfies(range, latest)
+            })
+    }
+
     pub fn needs_metadata_for_range(&self, range: &NpmRange) -> bool {
         if self.versions_complete {
             return false;
@@ -1105,6 +1120,7 @@ impl ManifestCacheBuilder {
             workspace_versions: self.workspace_versions,
             platform_metadata_complete: self.platform_metadata_complete,
             latest_version: self.latest_version,
+            preferred_latest: None,
             versions: Arc::from(versions),
             dist_tags: Arc::new(self.dist_tags),
             core: Arc::new(ManifestCore {

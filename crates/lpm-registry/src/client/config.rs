@@ -414,6 +414,7 @@ impl RegistryClient {
                 super::cache::MAX_PENDING_METADATA_CACHE_BYTES,
             )),
             metadata_cache_mutations: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            history_cache: Arc::new(super::history_cache::HistoryCache::default()),
             metadata_memory_cache: None,
             release_time_memory_cache: None,
             metadata_route_overrides: None,
@@ -546,6 +547,7 @@ impl RegistryClient {
         {
             tracing::warn!("failed to secure metadata cache directory: {error}");
         }
+        self.history_cache = Arc::new(super::history_cache::HistoryCache::default());
         self.cache_dir = dir;
         self
     }
@@ -748,6 +750,7 @@ impl RegistryClient {
             tls_material_budget,
             per_origin_identity_certs,
         });
+        self.history_cache = Arc::new(super::history_cache::HistoryCache::default());
         self.http = http;
         self.worker_metadata_http3_client = Arc::new(tokio::sync::Mutex::new(None));
         Ok(self)
@@ -897,6 +900,7 @@ impl RegistryClient {
             pending_cache_writes: Arc::clone(&self.pending_cache_writes),
             pending_cache_write_bytes: Arc::clone(&self.pending_cache_write_bytes),
             metadata_cache_mutations: Arc::clone(&self.metadata_cache_mutations),
+            history_cache: Arc::clone(&self.history_cache),
             metadata_memory_cache: self.metadata_memory_cache.as_ref().map(Arc::clone),
             release_time_memory_cache: self.release_time_memory_cache.as_ref().map(Arc::clone),
             metadata_route_overrides: self.metadata_route_overrides.as_ref().map(Arc::clone),

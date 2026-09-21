@@ -92,31 +92,98 @@ pub(super) async fn parse_capped_metadata_with_timing_limit<
     cap: usize,
     context: &str,
 ) -> Result<(T, MetadataBodyTimings), LpmError> {
+    parse_capped_metadata_with_timing_using(response, cap, context, |buf| {
+        serde_json::from_slice(buf)
+    })
+    .await
+}
+
+pub(super) async fn parse_capped_metadata_with_timing_using<T, F>(
+    response: reqwest::Response,
+    cap: usize,
+    context: &str,
+    parse: F,
+) -> Result<(T, MetadataBodyTimings), LpmError>
+where
+    T: Send + 'static,
+    F: FnOnce(&[u8]) -> Result<T, serde_json::Error> + Send + 'static,
+{
+    let (result, timings) = parse_capped_metadata_attempt(response, cap, context, parse).await;
+    result.map(|parsed| (parsed, timings))
+}
+
+pub(super) async fn parse_capped_metadata_attempt<T, F>(
+    response: reqwest::Response,
+    cap: usize,
+    context: &str,
+    parse: F,
+) -> (Result<T, LpmError>, MetadataBodyTimings)
+where
+    T: Send + 'static,
+    F: FnOnce(&[u8]) -> Result<T, serde_json::Error> + Send + 'static,
+{
+    parse_capped_metadata_owned_attempt(response, cap, context, move |bytes| {
+        parse(lpm_common::strip_utf8_bom_bytes(&bytes))
+    })
+    .await
+}
+
+pub(super) async fn parse_capped_metadata_owned_attempt<T, F>(
+    response: reqwest::Response,
+    cap: usize,
+    context: &str,
+    parse: F,
+) -> (Result<T, LpmError>, MetadataBodyTimings)
+where
+    T: Send + 'static,
+    F: FnOnce(Vec<u8>) -> Result<T, serde_json::Error> + Send + 'static,
+{
     let body_start = std::time::Instant::now();
-    let buf = read_capped_body(response, cap, context).await?;
+    let mut buf = Vec::new();
+    let read = async {
+        lpm_http::read_body_capped_into(response, cap, &mut buf)
+            .await
+            .map_err(|error| LpmError::Registry(format!("{context}: {error}")))
+    };
+    let read = read.await;
     let mut timings = MetadataBodyTimings {
         body_read_ms: body_start.elapsed().as_millis(),
         body_bytes: buf.len() as u64,
         ..MetadataBodyTimings::default()
     };
-
+    if let Err(error) = read {
+        return (Err(error), timings);
+    }
     if buf.len() < BLOCKING_METADATA_PARSE_THRESHOLD {
         let parse_start = std::time::Instant::now();
-        let parsed = parse_metadata_buffer(&buf, context)?;
+        let parsed = parse(buf).map_err(|error| {
+            LpmError::Registry(format!("{context}: failed to parse JSON: {error}"))
+        });
         timings.json_parse_ms = parse_start.elapsed().as_millis();
-        return Ok((parsed, timings));
+        return (parsed, timings);
     }
 
     let context_owned = context.to_string();
-    let (parsed, json_parse_ms) = tokio::task::spawn_blocking(move || {
+    let result = tokio::task::spawn_blocking(move || {
         let parse_start = std::time::Instant::now();
-        let parsed = parse_metadata_buffer(&buf, &context_owned);
+        let parsed = parse(buf).map_err(|error| {
+            LpmError::Registry(format!("{context_owned}: failed to parse JSON: {error}"))
+        });
         (parsed, parse_start.elapsed().as_millis())
     })
-    .await
-    .map_err(|e| LpmError::Registry(format!("{context}: JSON parse task failed: {e}")))?;
-    timings.json_parse_ms = json_parse_ms;
-    Ok((parsed?, timings))
+    .await;
+    match result {
+        Ok((parsed, json_parse_ms)) => {
+            timings.json_parse_ms = json_parse_ms;
+            (parsed, timings)
+        }
+        Err(error) => (
+            Err(LpmError::Registry(format!(
+                "{context}: JSON parse task failed: {error}"
+            ))),
+            timings,
+        ),
+    }
 }
 
 fn parse_metadata_buffer<T: serde::de::DeserializeOwned>(

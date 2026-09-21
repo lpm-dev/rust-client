@@ -296,6 +296,8 @@ impl DownloadedTarball {
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct PackageMetadataFetchTimings {
+    /// The selected version came from the full-history representation.
+    pub selected_from_history: bool,
     pub cache_hit: bool,
     pub not_modified: bool,
     pub cache_age_seconds: Option<u64>,
@@ -307,6 +309,28 @@ pub struct PackageMetadataFetchTimings {
     pub cache_after_304_ms: u128,
     pub cache_write_dispatch_ms: u128,
     pub body_bytes: u64,
+}
+
+impl PackageMetadataFetchTimings {
+    pub(super) fn add_attempt(&mut self, earlier: &Self) {
+        self.cache_read_ms += earlier.cache_read_ms;
+        self.validator_read_ms += earlier.validator_read_ms;
+        self.http_ms += earlier.http_ms;
+        self.body_read_ms += earlier.body_read_ms;
+        self.json_decode_ms += earlier.json_decode_ms;
+        self.cache_after_304_ms += earlier.cache_after_304_ms;
+        self.cache_write_dispatch_ms += earlier.cache_write_dispatch_ms;
+        self.body_bytes += earlier.body_bytes;
+    }
+}
+
+/// Failure together with the measured work from all attempted metadata sources.
+#[derive(Debug, thiserror::Error)]
+#[error("{error}")]
+pub struct PackageMetadataFetchError {
+    #[source]
+    pub error: LpmError,
+    pub timings: PackageMetadataFetchTimings,
 }
 
 #[derive(Debug)]
@@ -396,6 +420,7 @@ pub struct RegistryClient {
     /// workspace installs enable it on client clones so independent
     /// importer resolvers can reuse one parsed registry response without
     /// sharing resolver state.
+    pub(super) history_cache: Arc<super::history_cache::HistoryCache>,
     pub(super) metadata_memory_cache: Option<MetadataMemoryCache>,
     pub(super) release_time_memory_cache: Option<ReleaseTimeMemoryCache>,
     pub(super) metadata_route_overrides: Option<MetadataRouteOverrides>,

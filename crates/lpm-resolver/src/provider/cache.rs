@@ -115,6 +115,7 @@ pub(crate) fn merge_cached_package_info(
         merged.versions_complete = versions_complete;
         merged.trust_metadata_complete = trust_metadata_complete;
         merged.platform_metadata_complete = platform_metadata_complete;
+        merged.preferred_latest = merged_preferred_latest(existing, incoming, &merged);
         return merged;
     }
 
@@ -162,7 +163,25 @@ pub(crate) fn merge_cached_package_info(
             builder.push(manifest);
         }
     }
-    builder.finish()
+    let mut merged = builder.finish();
+    merged.preferred_latest = merged_preferred_latest(existing, incoming, &merged);
+    merged
+}
+
+fn merged_preferred_latest(
+    existing: &CachedPackageInfo,
+    incoming: &CachedPackageInfo,
+    merged: &CachedPackageInfo,
+) -> Option<NpmVersion> {
+    if !merged.workspace_versions.is_empty() || merged.versions_complete {
+        return None;
+    }
+    incoming
+        .preferred_latest
+        .as_ref()
+        .or(existing.preferred_latest.as_ref())
+        .filter(|latest| Some(*latest) == merged.latest_version.as_ref())
+        .cloned()
 }
 
 fn merge_manifest_version(
@@ -736,5 +755,69 @@ mod merge_tests {
             "2.0.0"
         );
         assert_eq!(merged.published_at("2.0.0"), Some("2026-01-01T00:00:00Z"));
+    }
+}
+
+#[cfg(test)]
+mod preferred_provenance_tests {
+    use super::*;
+
+    fn partial(latest: &str) -> CachedPackageInfo {
+        let metadata = serde_json::from_value(serde_json::json!({
+            "name":"pkg", "dist-tags":{"latest":latest}, "versions":{
+                "1.0.0":{"name":"pkg","version":"1.0.0"},
+                "2.0.0":{"name":"pkg","version":"2.0.0"}
+            }
+        }))
+        .unwrap();
+        super::super::parse::parse_owned_partial_metadata_to_cache_info(metadata)
+    }
+
+    #[test]
+    fn generic_partial_metadata_has_no_preferred_provenance() {
+        let info = partial("1.0.0");
+        assert!(info.preferred_latest.is_none());
+        assert!(info.needs_metadata_for_range(&NpmRange::parse("*").unwrap()));
+    }
+
+    #[test]
+    fn preferred_range_proof_rejects_unknown_tags_stale_identity_and_workspace_data() {
+        let range = NpmRange::parse("^1").unwrap();
+        let mut info = partial("1.0.0");
+        assert!(!info.preferred_latest_satisfies(&range));
+        info.preferred_latest = info.latest_version.clone();
+        assert!(info.preferred_latest_satisfies(&range));
+        assert!(info.needs_metadata_for_range(&range));
+        assert!(!info.preferred_latest_satisfies(&NpmRange::parse("^2").unwrap()));
+        assert!(!info.preferred_latest_satisfies(&NpmRange::parse_registry_spec("beta").unwrap()));
+        let mut workspace = info.clone();
+        workspace
+            .workspace_versions
+            .insert(NpmVersion::parse("1.0.0").unwrap());
+        assert!(!workspace.preferred_latest_satisfies(&range));
+        let mut stale = info.clone();
+        stale.latest_version = Some(NpmVersion::parse("2.0.0").unwrap());
+        assert!(!stale.preferred_latest_satisfies(&range));
+        info.versions = Arc::from([NpmVersion::parse("2.0.0").unwrap()]);
+        assert!(!info.preferred_latest_satisfies(&range));
+    }
+
+    #[test]
+    fn merge_preserves_preferred_provenance_only_for_the_current_registry_latest() {
+        let mut original = partial("1.0.0");
+        original.preferred_latest = original.latest_version.clone();
+        let unchanged = merge_cached_package_info(&original, &partial("1.0.0"));
+        assert_eq!(unchanged.preferred_latest, original.preferred_latest);
+        let changed = merge_cached_package_info(&original, &partial("2.0.0"));
+        assert!(changed.preferred_latest.is_none());
+        let mut workspace = partial("1.0.0");
+        workspace
+            .workspace_versions
+            .insert(NpmVersion::parse("1.0.0").unwrap());
+        assert!(
+            merge_cached_package_info(&original, &workspace)
+                .preferred_latest
+                .is_none()
+        );
     }
 }

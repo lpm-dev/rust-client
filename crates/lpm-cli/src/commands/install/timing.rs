@@ -281,8 +281,9 @@ pub(super) struct FetchBreakdown {
 /// starts. Surfaced in `timing.fetch_breakdown.speculative` so
 /// benchmarks can attribute the wall-clock delta to actual speculation
 /// outcomes.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Default)]
 pub(super) struct SpeculativeStats {
+    pub(super) work: SpeculativeWork,
     /// wall-clock of the walker's metadata-producer window,
     /// measured inside the walker task from `BfsWalker::run()` entry
     /// to its return (see `WalkerSummary::walker_wall_ms`). Reported
@@ -347,7 +348,7 @@ pub(super) struct SpeculativeStats {
 }
 
 impl SpeculativeStats {
-    pub(super) fn to_json(self) -> serde_json::Value {
+    pub(super) fn into_json(self) -> serde_json::Value {
         serde_json::json!({
             "streaming_batch_ms": self.streaming_batch_ms,
             "dispatched": self.dispatched,
@@ -364,19 +365,137 @@ impl SpeculativeStats {
             "consumed_by_fetch": self.consumed_by_fetch,
             "duplicated_with_fetch": self.duplicated_with_fetch,
             "wasted": self.wasted,
+            "work": self.work.to_json(),
         })
     }
 }
 
-#[derive(Clone, Default)]
+#[derive(Debug, Clone, Default)]
+pub(super) struct SpeculativeWork {
+    breakdown: FetchBreakdown,
+    slow_packages: SlowPackageTimings,
+    timeline: Vec<SpeculativeTaskInterval>,
+}
+
+#[derive(Debug, Clone)]
+struct SpeculativeTaskInterval {
+    package: String,
+    start_ms: u128,
+    finish_ms: u128,
+}
+
+impl SpeculativeWork {
+    fn record(
+        &mut self,
+        package: Option<&str>,
+        timings: TaskTimings,
+        start_ms: u128,
+        finish_ms: u128,
+    ) {
+        self.breakdown.record(timings);
+        let Some(package) = package else {
+            return;
+        };
+        self.slow_packages.record_fetch(package, timings);
+        self.timeline.push(SpeculativeTaskInterval {
+            package: package.to_owned(),
+            start_ms,
+            finish_ms,
+        });
+        self.timeline.sort_unstable_by(|a, b| {
+            b.finish_ms
+                .saturating_sub(b.start_ms)
+                .cmp(&a.finish_ms.saturating_sub(a.start_ms))
+                .then_with(|| a.package.cmp(&b.package))
+        });
+        self.timeline.truncate(10);
+    }
+
+    fn to_json(&self) -> serde_json::Value {
+        let mut json = self.breakdown.to_json();
+        json["scope"] = serde_json::json!("speculative_tasks");
+        json["work_is_cumulative"] = serde_json::json!(true);
+        json["slow_packages"] = self.slow_packages.to_json();
+        json["timeline_origin"] = serde_json::json!("speculation_tracker_created");
+        json["timeline"] = serde_json::Value::Array(
+            self.timeline
+                .iter()
+                .map(|entry| {
+                    serde_json::json!({
+                        "package": entry.package,
+                        "start_ms": entry.start_ms,
+                        "finish_ms": entry.finish_ms,
+                        "wall_ms": entry.finish_ms.saturating_sub(entry.start_ms),
+                    })
+                })
+                .collect(),
+        );
+        json
+    }
+}
+
+#[derive(Clone)]
 pub(super) struct SpeculativeKeyTracker {
     completed_keys: std::sync::Arc<dashmap::DashSet<String>>,
     failed_keys: std::sync::Arc<dashmap::DashSet<String>>,
     consumed_keys: std::sync::Arc<dashmap::DashSet<String>>,
     duplicated_keys: std::sync::Arc<dashmap::DashSet<String>>,
+    trace: bool,
+    started_at: std::sync::Arc<std::time::Instant>,
+    work: std::sync::Arc<std::sync::Mutex<SpeculativeWork>>,
+}
+
+impl Default for SpeculativeKeyTracker {
+    fn default() -> Self {
+        Self::new(TimingDetailMode::Off)
+    }
 }
 
 impl SpeculativeKeyTracker {
+    pub(super) fn new(mode: TimingDetailMode) -> Self {
+        Self {
+            trace: mode.trace(),
+            completed_keys: Default::default(),
+            failed_keys: Default::default(),
+            consumed_keys: Default::default(),
+            duplicated_keys: Default::default(),
+            started_at: std::sync::Arc::new(std::time::Instant::now()),
+            work: Default::default(),
+        }
+    }
+}
+
+impl SpeculativeKeyTracker {
+    pub(super) fn elapsed_ms(&self) -> u128 {
+        self.started_at.elapsed().as_millis()
+    }
+
+    pub(super) fn record_stored(
+        &self,
+        key: String,
+        name: &str,
+        version: &str,
+        timings: TaskTimings,
+        start_ms: u128,
+    ) {
+        if self.completed_keys.insert(key) {
+            let package = self.trace.then(|| format!("{name}@{version}"));
+            self.work
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .record(package.as_deref(), timings, start_ms, self.elapsed_ms());
+        }
+    }
+
+    pub(super) fn take_work(&self) -> SpeculativeWork {
+        std::mem::take(
+            &mut *self
+                .work
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        )
+    }
+
     pub(super) fn record_completed(&self, key: String) {
         self.completed_keys.insert(key);
     }
@@ -427,7 +546,7 @@ impl SpeculativeKeyTracker {
 /// speculation doesn't ask for manifests the worker won't send.
 pub(super) const SPECULATION_MAX_DEPTH: u32 = 5;
 pub(super) const DEFAULT_FUSION_NPM_FANOUT: usize = lpm_resolver::DEFAULT_NPM_FANOUT;
-pub(super) const DEFAULT_FUSION_OVERLAP_NPM_FANOUT: usize = 8;
+pub(super) const DEFAULT_FUSION_OVERLAP_NPM_FANOUT: usize = 16;
 pub(super) const MAX_NPM_FANOUT: usize = lpm_resolver::MAX_NPM_FANOUT;
 pub(super) const DEFAULT_FUSION_SPECULATION_PERMITS: usize = DEFAULT_MAX_CONCURRENT_DOWNLOADS;
 pub(super) const ENV_FUSION_SPECULATION_PERMITS: &str = "LPM_FUSION_SPECULATION_PERMITS";
@@ -1320,6 +1439,7 @@ pub(super) fn metadata_fetch_detail_json_from_snapshot(
         "routes": {
             "npm_direct": snapshot.route_npm_direct_count,
             "npm_direct_version_document": snapshot.route_npm_direct_version_document_count,
+            "npm_direct_selected_history": snapshot.route_npm_direct_selected_history_count,
             "lpm_worker": snapshot.route_lpm_worker_count,
             "custom": snapshot.route_custom_count,
             "lpm": snapshot.route_lpm_count,
@@ -1751,12 +1871,12 @@ mod tests {
 
     #[test]
     fn default_fusion_npm_fanout_uses_overlap_scheduling_cap_when_overlap_enabled() {
-        assert_eq!(default_fusion_npm_fanout(true, 0), 8);
+        assert_eq!(default_fusion_npm_fanout(true, 0), 16);
     }
 
     #[test]
     fn default_fusion_npm_fanout_uses_overlap_scheduling_cap_with_release_age() {
-        assert_eq!(default_fusion_npm_fanout(true, 86_400), 8);
+        assert_eq!(default_fusion_npm_fanout(true, 86_400), 16);
     }
 
     #[test]
@@ -2463,6 +2583,71 @@ mod tests {
     }
 
     #[test]
+    fn speculative_work_counts_completed_extraction_once_without_counting_store_hits() {
+        let tracker = SpeculativeKeyTracker::new(TimingDetailMode::Trace);
+        tracker.record_completed("cached".into());
+        let timings = TaskTimings {
+            download_ms: 7,
+            extract_ms: 11,
+            file_count: 3,
+            ..Default::default()
+        };
+        tracker.record_stored("stored".into(), "pkg", "1.0.0", timings, 0);
+        tracker.record_stored("stored".into(), "pkg", "1.0.0", timings, 0);
+        let work = tracker.take_work().to_json();
+        assert_eq!(work["task_count"], 1);
+        assert_eq!(work["download"]["sum_ms"], 7);
+        assert_eq!(work["extract"]["sum_ms"], 11);
+        assert_eq!(
+            work["slow_packages"]["fetch_tasks"]["by_total"][0]["file_count"],
+            3
+        );
+        assert_eq!(tracker.take_work().to_json()["task_count"], 0);
+        assert_eq!(tracker.completed_count(), 2);
+    }
+
+    #[test]
+    fn speculative_work_without_trace_retains_totals_without_package_details() {
+        let tracker = SpeculativeKeyTracker::default();
+        tracker.record_stored(
+            "stored".into(),
+            "pkg",
+            "1.0.0",
+            TaskTimings {
+                download_ms: 7,
+                ..Default::default()
+            },
+            0,
+        );
+        let work = tracker.take_work().to_json();
+        assert_eq!(work["task_count"], 1);
+        assert_eq!(work["download"]["sum_ms"], 7);
+        assert_eq!(work["timeline"], serde_json::json!([]));
+        assert_eq!(
+            work["slow_packages"]["fetch_tasks"]["by_total"],
+            serde_json::json!([])
+        );
+    }
+
+    #[test]
+    fn speculative_timeline_records_elapsed_intervals_separately_from_cumulative_work() {
+        let mut work = SpeculativeWork::default();
+        let timings = TaskTimings {
+            extract_ms: 20,
+            ..Default::default()
+        }
+        .with_streaming_pipeline(4, 12, 23);
+        work.record(Some("pkg@1.0.0"), timings, 5, 40);
+        let json = work.to_json();
+        assert_eq!(json["task_sum_ms"], 27);
+        assert_eq!(json["extract"]["sum_ms"], 20);
+        assert_eq!(json["pipeline_wall"]["sum_ms"], 23);
+        assert_eq!(json["timeline"][0]["start_ms"], 5);
+        assert_eq!(json["timeline"][0]["finish_ms"], 40);
+        assert_eq!(json["timeline"][0]["wall_ms"], 35);
+    }
+
+    #[test]
     fn speculative_stats_json_reports_usefulness_counters() {
         let stats = SpeculativeStats {
             completed_before_fetch: 3,
@@ -2473,7 +2658,7 @@ mod tests {
             ..SpeculativeStats::default()
         };
 
-        let json = stats.to_json();
+        let json = stats.into_json();
 
         assert_eq!(json["completed_before_fetch"], 3);
         assert_eq!(json["consumed_by_fetch"], 2);

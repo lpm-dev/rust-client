@@ -25,6 +25,7 @@ mod body;
 mod cache;
 mod config;
 mod firewall;
+mod history_cache;
 mod http;
 mod install_accounting;
 mod manifest;
@@ -55,7 +56,8 @@ pub use self::manifest::ManifestVersionMetadata;
 pub use self::metadata::BatchMetadataEntryStream;
 pub use self::state::{
     CompressedTarballSpoolReservation, DownloadedTarball, FanOutStats, HttpClients,
-    PackageMetadataFetchTimings, RegistryClient, TimedPackageMetadata, TimedReleaseTimeMetadata,
+    PackageMetadataFetchError, PackageMetadataFetchTimings, RegistryClient, TimedPackageMetadata,
+    TimedReleaseTimeMetadata,
 };
 pub use self::tarball::{
     MAX_COMPRESSED_TARBALL_SIZE, MAX_COMPRESSED_TARBALL_SPOOL_BYTES,
@@ -72,7 +74,7 @@ use self::auth::{
 use self::body::{
     MAX_METADATA_BYTES, MAX_VERSION_METADATA_BYTES, elapsed_millis, forbidden_error_from_body,
     parse_capped_api_json_with_timing, parse_capped_metadata, parse_capped_metadata_with_timing,
-    parse_capped_metadata_with_timing_limit, read_capped_error_text,
+    read_capped_error_text,
 };
 use self::cache::MetadataCacheDirective;
 use self::http::{CONNECT_TIMEOUT, READ_TIMEOUT, build_per_origin_http_client};
