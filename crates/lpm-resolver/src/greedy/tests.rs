@@ -7110,3 +7110,69 @@ async fn fusion_propagates_required_fetch_failure() {
         Ok(_) => panic!("required dep with broken client must fail, not succeed"),
     }
 }
+
+async fn resolve_exact_root_with_override_and_partial_cache(seed_cache: bool) -> ResolveResult {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/override-root/2.0.0"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(version_document_json(
+                "override-root",
+                "2.0.0",
+                &[],
+            )),
+        )
+        .expect(0)
+        .mount(&server)
+        .await;
+    let mut history = metadata_json_version("override-root", "2.0.0", &[]);
+    history["versions"]["1.0.0"] = version_document_json("override-root", "1.0.0", &[]);
+    Mock::given(method("GET"))
+        .and(path("/override-root"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(history))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let cache: SharedCache = Arc::default();
+    if seed_cache {
+        let mut partial = crate::provider::parse_owned_partial_metadata_to_cache_info(
+            serde_json::from_value(metadata_json_version("override-root", "2.0.0", &[])).unwrap(),
+        );
+        partial.latest_version = None;
+        cache.insert(CanonicalKey::npm("override-root"), Arc::new(partial));
+    }
+    resolve_greedy_fused_with_cache_options_and_policy(
+        Arc::new(
+            RegistryClient::new()
+                .with_npm_registry_url(server.uri())
+                .with_cache_dir(None),
+        ),
+        HashMap::from([("override-root".into(), "2.0.0".into())]),
+        override_set("override-root", "1.0.0"),
+        RouteTable::from_mode_only(RouteMode::Direct),
+        8,
+        None,
+        cache,
+        true,
+        true,
+        ResolverPolicy::default(),
+    )
+    .await
+    .unwrap()
+}
+
+#[tokio::test]
+async fn exact_metadata_requests_preserve_override_targets_outside_the_requested_version() {
+    let result = resolve_exact_root_with_override_and_partial_cache(false).await;
+    assert_eq!(result.packages[0].version.to_string(), "1.0.0");
+    assert_eq!(result.applied_overrides.len(), 1);
+}
+
+#[tokio::test]
+async fn partial_exact_cache_hydrates_history_before_selecting_an_override() {
+    let result = resolve_exact_root_with_override_and_partial_cache(true).await;
+    assert_eq!(result.packages[0].version.to_string(), "1.0.0");
+    assert_eq!(result.applied_overrides.len(), 1);
+}

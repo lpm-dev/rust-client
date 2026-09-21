@@ -2056,11 +2056,17 @@ pub async fn resolve_greedy_fused_with_cache_options_policy_and_selected_events_
                 shared_fact_cache.as_ref(),
                 &edge.canonical,
             ) {
-                if info_arc.needs_metadata_for_range(&edge.range) {
+                let override_needs_history = !info_arc.versions_complete
+                    && !state.overrides.is_empty()
+                    && state
+                        .overrides
+                        .may_match_package(&edge.canonical.to_string());
+                if info_arc.needs_metadata_for_range(&edge.range) || override_needs_history {
                     let canonical = edge.canonical.clone();
                     let exact_version = edge
                         .range
                         .exact_version()
+                        .filter(|_| !override_needs_history)
                         .map(|version| version.to_string());
                     let request = MetadataFetchKey::for_request(
                         canonical.clone(),
@@ -2220,6 +2226,10 @@ pub async fn resolve_greedy_fused_with_cache_options_policy_and_selected_events_
             let exact_version = edge
                 .range
                 .exact_version()
+                .filter(|_| {
+                    state.overrides.is_empty()
+                        || !state.overrides.may_match_package(&canonical.to_string())
+                })
                 .map(|version| version.to_string());
             let request = MetadataFetchKey::for_request(
                 canonical.clone(),
