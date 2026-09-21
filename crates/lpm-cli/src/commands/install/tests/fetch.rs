@@ -2294,3 +2294,31 @@ async fn tarball_url_install_handles_301_redirect() {
     // final-body content.
     assert!(store.has_tarball(&computed_sri));
 }
+
+#[tokio::test]
+async fn speculation_dispatches_a_satisfying_latest_from_partial_metadata() {
+    let mut snapshot = speculation_snapshot("shared", &["2.0.0"], true, serde_json::json!({}));
+    snapshot.dist_tags.insert("latest".into(), "2.0.0".into());
+    Arc::make_mut(&mut snapshot.info).latest_version =
+        Some(lpm_resolver::NpmVersion::parse("2.0.0").unwrap());
+    let dispatched = count_dispatched_speculative_frames(
+        HashMap::from([("shared".to_string(), "^2".to_string())]),
+        vec![("shared", snapshot)],
+    )
+    .await;
+    assert_eq!(dispatched, 1);
+}
+
+#[test]
+fn speculation_prefers_latest_after_merging_a_newer_exact_document() {
+    let mut snapshot = speculation_snapshot("shared", &["2.9.0"], true, serde_json::json!({}));
+    let mut latest = speculation_snapshot("shared", &["2.1.0"], true, serde_json::json!({}));
+    latest.dist_tags.insert("latest".into(), "2.1.0".into());
+    Arc::make_mut(&mut latest.info).latest_version =
+        Some(lpm_resolver::NpmVersion::parse("2.1.0").unwrap());
+    snapshot.merge_snapshot(latest);
+    assert_eq!(
+        pick_speculative_version(&snapshot, "^2").unwrap().0,
+        "2.1.0"
+    );
+}

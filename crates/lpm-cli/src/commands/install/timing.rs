@@ -1320,6 +1320,7 @@ pub(super) fn metadata_fetch_detail_json_from_snapshot(
         "routes": {
             "npm_direct": snapshot.route_npm_direct_count,
             "npm_direct_version_document": snapshot.route_npm_direct_version_document_count,
+            "npm_direct_latest_document": snapshot.route_npm_direct_latest_document_count,
             "lpm_worker": snapshot.route_lpm_worker_count,
             "custom": snapshot.route_custom_count,
             "lpm": snapshot.route_lpm_count,

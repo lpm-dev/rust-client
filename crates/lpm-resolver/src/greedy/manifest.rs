@@ -139,28 +139,30 @@ pub(super) type FetchResult = Result<FetchedMetadata, ResolveError>;
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(super) struct MetadataFetchKey {
     pub(super) canonical: CanonicalKey,
-    pub(super) exact_version: Option<String>,
+    pub(super) version_selector: Option<String>,
 }
 
 impl MetadataFetchKey {
     pub(super) fn packument(canonical: CanonicalKey) -> Self {
         Self {
             canonical,
-            exact_version: None,
+            version_selector: None,
         }
     }
 
     pub(super) fn for_request(
         canonical: CanonicalKey,
-        exact_version: Option<String>,
+        version_selector: Option<String>,
         route_table: &RouteTable,
         policy: &ResolverPolicy,
     ) -> Self {
-        let exact_version = exact_version
-            .filter(|_| exact_metadata_fast_path_eligible(route_table, &canonical, policy));
+        let version_selector = version_selector.filter(|selector| {
+            exact_metadata_fast_path_eligible(route_table, &canonical, policy)
+                && (selector != "latest" || !policy.release_age_active())
+        });
         Self {
             canonical,
-            exact_version,
+            version_selector,
         }
     }
 }
@@ -316,7 +318,7 @@ pub(super) async fn fetch_metadata_for_resolver_with_timings(
     Ok((fetched, timings))
 }
 
-pub(super) async fn fetch_exact_metadata_for_resolver_with_timings(
+pub(super) async fn fetch_version_document_for_resolver_with_timings(
     client: &RegistryClient,
     route_table: &RouteTable,
     canonical: &CanonicalKey,
@@ -351,23 +353,58 @@ pub(super) async fn fetch_exact_metadata_for_resolver_with_timings(
     let total_start = Instant::now();
     let mut timings = ExperimentalMetadataFetchTimings {
         package: canonical.to_string(),
-        route: "npm_direct_version_doc",
+        route: if version == "latest" {
+            "npm_direct_latest_doc"
+        } else {
+            "npm_direct_version_doc"
+        },
         ..ExperimentalMetadataFetchTimings::default()
     };
     let raw_start = Instant::now();
-    let raw = client
-        .get_npm_version_metadata_direct_with_timings(name, version)
-        .await
-        .map_err(|e| ResolveError::DependencyFetch {
-            package: canonical.to_string(),
-            version: version.to_string(),
-            detail: e.to_string(),
-        })?;
+    if version == "latest" {
+        let cached = client.cached_npm_metadata_direct(name).await;
+        timings.cache_read_ms = raw_start.elapsed().as_millis();
+        let parse_start = Instant::now();
+        if let Some(metadata) = cached
+            && let Some(fetched) = parse_cached_metadata_for_resolver(
+                &metadata,
+                canonical,
+                policy,
+                include_speculation,
+            )
+        {
+            timings.route = "npm_direct";
+            timings.cache_hit = true;
+            timings.version_count = metadata.versions.len() as u64;
+            timings.cache_info_parse_ms = parse_start.elapsed().as_millis();
+            timings.raw_fetch_ms = timings.cache_read_ms;
+            timings.total_ms = total_start.elapsed().as_millis();
+            lpm_registry::timing::record_metadata_request(name);
+            lpm_registry::timing::record_metadata_cache_hit();
+            return Ok((fetched, timings));
+        }
+    }
+    let raw = if version == "latest" {
+        client
+            .get_npm_latest_metadata_direct_with_timings(name)
+            .await
+    } else {
+        client
+            .get_npm_version_metadata_direct_with_timings(name, version)
+            .await
+    }
+    .map_err(|e| ResolveError::DependencyFetch {
+        package: canonical.to_string(),
+        version: version.to_string(),
+        detail: e.to_string(),
+    })?;
     timings.raw_fetch_ms = raw_start.elapsed().as_millis();
     timings.version_count = raw.metadata.versions.len() as u64;
     timings.cache_hit = raw.timings.cache_hit;
     timings.not_modified = raw.timings.not_modified;
-    timings.cache_read_ms = raw.timings.cache_read_ms;
+    timings.cache_read_ms = timings
+        .cache_read_ms
+        .saturating_add(raw.timings.cache_read_ms);
     timings.validator_read_ms = raw.timings.validator_read_ms;
     timings.http_ms = raw.timings.http_ms;
     timings.body_read_ms = raw.timings.body_read_ms;
@@ -380,8 +417,10 @@ pub(super) async fn fetch_exact_metadata_for_resolver_with_timings(
     let dist_tags = raw.metadata.dist_tags.clone();
     let mut info = parse_owned_partial_metadata_to_cache_info(raw.metadata);
     info.platform_metadata_complete = true;
-    info.covered_ranges.insert(version.to_string());
-    info.covered_ranges.insert(format!("={version}"));
+    if version != "latest" {
+        info.covered_ranges.insert(version.to_string());
+        info.covered_ranges.insert(format!("={version}"));
+    }
     timings.cache_info_parse_ms = parse_start.elapsed().as_millis();
     if info.needs_supplemental_metadata(canonical, policy) {
         let policy_start = Instant::now();
@@ -398,7 +437,9 @@ pub(super) async fn fetch_exact_metadata_for_resolver_with_timings(
         return Ok((fetched, timings));
     }
 
-    let mut fetched = fetched_metadata_from_info(None, dist_tags, info, include_speculation);
+    let latest_version = info.latest_version.clone();
+    let mut fetched =
+        fetched_metadata_from_info(latest_version, dist_tags, info, include_speculation);
     fetched.shared_fact = Some(Arc::clone(&fetched.info));
     timings.total_ms = total_start.elapsed().as_millis();
     Ok((fetched, timings))
@@ -419,12 +460,12 @@ pub(super) fn exact_metadata_fast_path_eligible(
         && !policy.release_age_applies_to_package(canonical)
 }
 
-pub(super) enum ExactMetadataFetchOutcome {
+pub(super) enum VersionDocumentFetchOutcome {
     Hit(FetchedMetadata),
     Fallback,
 }
 
-pub(super) async fn try_fetch_exact_metadata_for_resolver(
+pub(super) async fn try_fetch_version_document_for_resolver(
     client: &RegistryClient,
     route_table: &RouteTable,
     canonical: &CanonicalKey,
@@ -432,9 +473,11 @@ pub(super) async fn try_fetch_exact_metadata_for_resolver(
     policy: &ResolverPolicy,
     include_speculation: bool,
     trace_metadata_fetches: bool,
-) -> ExactMetadataFetchOutcome {
-    lpm_registry::timing::record_exact_document_attempt();
-    match fetch_exact_metadata_for_resolver_with_timings(
+) -> VersionDocumentFetchOutcome {
+    if version != "latest" {
+        lpm_registry::timing::record_exact_document_attempt();
+    }
+    match fetch_version_document_for_resolver_with_timings(
         client,
         route_table,
         canonical,
@@ -445,35 +488,52 @@ pub(super) async fn try_fetch_exact_metadata_for_resolver(
     .await
     {
         Ok((fetched, timings)) => {
+            let candidate = if version == "latest" {
+                fetched
+                    .info
+                    .latest_version
+                    .as_ref()
+                    .map(ToString::to_string)
+            } else {
+                Some(version.to_string())
+            };
             let exact_candidate_is_installable = fetched.info.versions_complete
-                || (fetched.info.tarball_url(version).is_some()
-                    && fetched.info.integrity(version).is_some());
+                || candidate.is_some_and(|candidate| {
+                    fetched.info.tarball_url(&candidate).is_some()
+                        && fetched.info.integrity(&candidate).is_some()
+                });
             if trace_metadata_fetches {
                 lpm_registry::timing::record_metadata_fetch_detail(metadata_fetch_detail_record(
                     timings,
                 ));
             }
             if exact_candidate_is_installable {
-                lpm_registry::timing::record_exact_document_hit();
-                return ExactMetadataFetchOutcome::Hit(fetched);
+                if version != "latest" {
+                    lpm_registry::timing::record_exact_document_hit();
+                }
+                return VersionDocumentFetchOutcome::Hit(fetched);
             }
-            lpm_registry::timing::record_exact_document_fallback(
-                lpm_registry::timing::ExactDocumentFallbackReason::IncompleteDistribution,
-            );
+            if version != "latest" {
+                lpm_registry::timing::record_exact_document_fallback(
+                    lpm_registry::timing::ExactDocumentFallbackReason::IncompleteDistribution,
+                );
+            }
             tracing::debug!(
                 "npm version document for {canonical}@{version} omitted install distribution fields; falling back to the packument"
             );
         }
         Err(error) => {
-            lpm_registry::timing::record_exact_document_fallback(
-                lpm_registry::timing::ExactDocumentFallbackReason::FetchError,
-            );
+            if version != "latest" {
+                lpm_registry::timing::record_exact_document_fallback(
+                    lpm_registry::timing::ExactDocumentFallbackReason::FetchError,
+                );
+            }
             tracing::debug!(
                 "npm version document fetch for {canonical}@{version} failed: {error}; falling back to the packument"
             );
         }
     }
-    ExactMetadataFetchOutcome::Fallback
+    VersionDocumentFetchOutcome::Fallback
 }
 
 pub(super) async fn fetch_metadata_for_resolver_with_trace_detail(

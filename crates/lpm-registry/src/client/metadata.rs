@@ -482,6 +482,10 @@ impl RegistryClient {
         self.metadata_cache_key_for_origin("npm-direct", &self.npm_registry_url, name, None)
     }
 
+    pub(super) fn npm_direct_latest_metadata_cache_key(&self, name: &str) -> String {
+        self.metadata_cache_key_for_origin("npm-direct-latest", &self.npm_registry_url, name, None)
+    }
+
     pub(super) fn npm_direct_version_metadata_cache_key(
         &self,
         name: &str,
@@ -1929,8 +1933,42 @@ impl RegistryClient {
         name: &str,
         version: &str,
     ) -> Result<TimedPackageMetadata, LpmError> {
+        self.get_npm_document_metadata_direct_with_timings(
+            name,
+            VersionDocumentSelector::Exact(version),
+        )
+        .await
+    }
+
+    /// Read a fresh direct-npm history from disk without issuing a request.
+    pub async fn cached_npm_metadata_direct(&self, name: &str) -> Option<PackageMetadata> {
+        let key = self.npm_direct_metadata_cache_key(name);
+        let (metadata, _) = self.read_metadata_cache_async(&key).await?;
+        batch_metadata_entry_matches_name(name, &metadata).then_some(metadata)
+    }
+
+    /// Fetch the current latest version without loading its package history.
+    pub async fn get_npm_latest_metadata_direct_with_timings(
+        &self,
+        name: &str,
+    ) -> Result<TimedPackageMetadata, LpmError> {
+        self.get_npm_document_metadata_direct_with_timings(name, VersionDocumentSelector::Latest)
+            .await
+    }
+
+    async fn get_npm_document_metadata_direct_with_timings(
+        &self,
+        name: &str,
+        selector: VersionDocumentSelector<'_>,
+    ) -> Result<TimedPackageMetadata, LpmError> {
         crate::timing::record_metadata_request(name);
-        let cache_key = self.npm_direct_version_metadata_cache_key(name, version);
+        let version = selector.as_str();
+        let cache_key = match selector {
+            VersionDocumentSelector::Exact(version) => {
+                self.npm_direct_version_metadata_cache_key(name, version)
+            }
+            VersionDocumentSelector::Latest => self.npm_direct_latest_metadata_cache_key(name),
+        };
         let mut timings = PackageMetadataFetchTimings::default();
 
         let cache_read_start = std::time::Instant::now();
@@ -1938,7 +1976,7 @@ impl RegistryClient {
             && batch_metadata_entry_matches_name(name, &cached)
         {
             timings.cache_read_ms = cache_read_start.elapsed().as_millis();
-            if package_metadata_matches_version_doc(name, version, &cached) {
+            if selector.matches(name, &cached) {
                 timings.cache_hit = true;
                 crate::timing::record_metadata_cache_hit();
                 tracing::debug!("metadata cache hit (direct version): npm:{name}@{version}");
@@ -1957,7 +1995,7 @@ impl RegistryClient {
         let _flight = metadata_fetch_flight_guard(&cache_key).await;
         let coalesced_read_start = std::time::Instant::now();
         if let Some((cached, _etag)) = self.read_metadata_cache_async(&cache_key).await
-            && package_metadata_matches_version_doc(name, version, &cached)
+            && selector.matches(name, &cached)
         {
             timings.cache_read_ms = timings
                 .cache_read_ms
@@ -2013,7 +2051,7 @@ impl RegistryClient {
                     &cache_key,
                     &response,
                     cache_validator.as_ref(),
-                    |metadata| package_metadata_matches_version_doc(name, version, metadata),
+                    |metadata| selector.matches(name, metadata),
                 )
                 .await
             {
@@ -2060,7 +2098,7 @@ impl RegistryClient {
         timings.body_read_ms = body_timings.body_read_ms;
         timings.json_decode_ms = body_timings.json_parse_ms;
         timings.body_bytes = body_timings.body_bytes;
-        let metadata = match package_metadata_from_version_doc(name, version, version_metadata) {
+        let metadata = match selector.into_metadata(name, version_metadata) {
             Ok(metadata) => metadata,
             Err(e) => return finish!(Err(e)),
         };
@@ -3998,4 +4036,50 @@ fn package_metadata_matches_version_doc(
         .versions
         .get(expected_version)
         .is_some_and(|version| version.name == expected_name && version.version == expected_version)
+}
+
+#[derive(Clone, Copy)]
+enum VersionDocumentSelector<'a> {
+    Exact(&'a str),
+    Latest,
+}
+
+impl<'a> VersionDocumentSelector<'a> {
+    fn as_str(self) -> &'a str {
+        match self {
+            Self::Exact(version) => version,
+            Self::Latest => "latest",
+        }
+    }
+
+    fn matches(self, name: &str, metadata: &PackageMetadata) -> bool {
+        match self {
+            Self::Exact(version) => package_metadata_matches_version_doc(name, version, metadata),
+            Self::Latest => metadata.dist_tags.get("latest").is_some_and(|version| {
+                lpm_semver::Version::parse(version).is_ok()
+                    && package_metadata_matches_version_doc(name, version, metadata)
+            }),
+        }
+    }
+
+    fn into_metadata(
+        self,
+        name: &str,
+        document: VersionMetadata,
+    ) -> Result<PackageMetadata, LpmError> {
+        match self {
+            Self::Exact(version) => package_metadata_from_version_doc(name, version, document),
+            Self::Latest => {
+                let version = document.version.clone();
+                if lpm_semver::Version::parse(&version).is_err() {
+                    return Err(LpmError::Registry(format!(
+                        "npm latest metadata returned invalid version {version} for {name}"
+                    )));
+                }
+                let mut metadata = package_metadata_from_version_doc(name, &version, document)?;
+                metadata.dist_tags.insert("latest".into(), version);
+                Ok(metadata)
+            }
+        }
+    }
 }

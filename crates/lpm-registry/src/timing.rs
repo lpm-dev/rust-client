@@ -568,6 +568,7 @@ struct MetadataFetchDetailCounters {
     version_count_sum: AtomicU64,
     route_npm_direct_count: AtomicU64,
     route_npm_direct_version_document_count: AtomicU64,
+    route_npm_direct_latest_document_count: AtomicU64,
     route_lpm_worker_count: AtomicU64,
     route_custom_count: AtomicU64,
     route_lpm_count: AtomicU64,
@@ -632,6 +633,8 @@ impl MetadataFetchDetailCounters {
         self.version_count_sum.store(0, Ordering::Relaxed);
         self.route_npm_direct_count.store(0, Ordering::Relaxed);
         self.route_npm_direct_version_document_count
+            .store(0, Ordering::Relaxed);
+        self.route_npm_direct_latest_document_count
             .store(0, Ordering::Relaxed);
         self.route_lpm_worker_count.store(0, Ordering::Relaxed);
         self.route_custom_count.store(0, Ordering::Relaxed);
@@ -729,6 +732,7 @@ impl MetadataFetchDetailCounters {
         match record.route {
             "npm_direct" => &self.route_npm_direct_count,
             "npm_direct_version_doc" => &self.route_npm_direct_version_document_count,
+            "npm_direct_latest_doc" => &self.route_npm_direct_latest_document_count,
             "lpm_worker" => &self.route_lpm_worker_count,
             "custom" => &self.route_custom_count,
             "lpm" => &self.route_lpm_count,
@@ -929,6 +933,9 @@ impl MetadataFetchDetailCounters {
             route_npm_direct_version_document_count: self
                 .route_npm_direct_version_document_count
                 .load(Ordering::Relaxed),
+            route_npm_direct_latest_document_count: self
+                .route_npm_direct_latest_document_count
+                .load(Ordering::Relaxed),
             route_lpm_worker_count: self.route_lpm_worker_count.load(Ordering::Relaxed),
             route_custom_count: self.route_custom_count.load(Ordering::Relaxed),
             route_lpm_count: self.route_lpm_count.load(Ordering::Relaxed),
@@ -1059,6 +1066,7 @@ pub struct MetadataFetchDetailSnapshot {
     pub version_count_sum: u64,
     pub route_npm_direct_count: u64,
     pub route_npm_direct_version_document_count: u64,
+    pub route_npm_direct_latest_document_count: u64,
     pub route_lpm_worker_count: u64,
     pub route_custom_count: u64,
     pub route_lpm_count: u64,

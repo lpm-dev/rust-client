@@ -279,7 +279,7 @@ pub async fn experimental_fetch_exact_cached_package_info_with_policy_and_timing
     version: &str,
     policy: &ResolverPolicy,
 ) -> Result<(Arc<CachedPackageInfo>, ExperimentalMetadataFetchTimings), ResolveError> {
-    manifest::fetch_exact_metadata_for_resolver_with_timings(
+    manifest::fetch_version_document_for_resolver_with_timings(
         client,
         route_table,
         canonical,

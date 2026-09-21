@@ -2940,11 +2940,9 @@ mod tests {
 /// `(version, tarball_url, integrity)` tuple so the caller can dispatch
 /// a speculative download without waiting for PubGrub.
 ///
-/// This is the lightweight analog of what PubGrub does in the conflict-
-/// free case: pick the newest range-satisfying version. Mismatches with
-/// PubGrub's final pick (~5% of real-world trees, higher in workspaces
-/// with tight peer constraints) produce a wasted tarball in the store
-/// — cheap to absorb, GC reclaims later.
+/// A satisfying latest tag has the same preference as in the greedy resolver.
+/// Otherwise this picks the newest matching version; peer and policy constraints
+/// can still make the authoritative selection differ.
 ///
 /// npm dist-tags (e.g. `range = "latest"`) resolve via `dist-tags` first,
 /// short-circuiting range parsing. Invalid ranges return `None` and the
@@ -2967,9 +2965,17 @@ pub(super) fn pick_speculative_version(
     let range = lpm_resolver::NpmRange::parse(range_str).ok()?;
     let version = meta
         .info
-        .versions
-        .iter()
-        .find(|version| range.satisfies(version))?;
+        .latest_version
+        .as_ref()
+        .filter(|version| {
+            meta.info.versions.contains(version) && meta.info.range_satisfies(&range, version)
+        })
+        .or_else(|| {
+            meta.info
+                .versions
+                .iter()
+                .find(|version| meta.info.range_satisfies(&range, version))
+        })?;
     let v_str = version.to_string();
     let url = meta.info.tarball_url(&v_str)?.to_owned();
     let integrity = meta.info.integrity(&v_str).map(str::to_owned);
@@ -3230,8 +3236,10 @@ pub(super) fn spawn_speculation_dispatcher(
                 };
 
                 if !meta.info.versions_complete
-                    && lpm_resolver::NpmRange::parse_registry_spec(&range)
-                        .map_or(true, |parsed| meta.info.needs_metadata_for_range(&parsed))
+                    && lpm_resolver::NpmRange::parse_registry_spec(&range).map_or(true, |parsed| {
+                        meta.info.needs_metadata_for_range(&parsed)
+                            && !meta.info.has_installable_latest_for_range(&parsed)
+                    })
                 {
                     parked
                         .entry(name)

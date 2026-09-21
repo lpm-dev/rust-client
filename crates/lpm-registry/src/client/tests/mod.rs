@@ -58,6 +58,7 @@ mod firewall;
 mod http_tls;
 mod install_accounting;
 mod metadata;
+mod metadata_latest;
 mod tarball;
 mod transport;
 mod url_gate;

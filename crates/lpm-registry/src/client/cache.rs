@@ -554,6 +554,8 @@ impl RegistryClient {
                 self.invalidate_metadata_cache_key(&key);
             }
         } else {
+            let latest_key = self.npm_direct_latest_metadata_cache_key(package_name);
+            self.invalidate_metadata_cache_key(&latest_key);
             let direct_key = self.npm_direct_metadata_cache_key(package_name);
             self.invalidate_metadata_cache_key(&direct_key);
             if let Ok(worker_key) = self.npm_worker_metadata_cache_key(package_name) {

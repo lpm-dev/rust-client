@@ -1,3 +1,5 @@
+mod latest;
+
 use super::deps::*;
 use super::edge::*;
 use super::fused::*;
@@ -4398,16 +4400,16 @@ async fn fusion_exact_npm_range_fetches_only_the_version_document() {
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn fusion_broad_npm_range_keeps_using_the_packument() {
+async fn fusion_broad_npm_range_fetches_only_the_latest_document() {
     use wiremock::matchers::{header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     let server = MockServer::start().await;
     Mock::given(method("GET"))
-        .and(path("/broad-root"))
-        .and(header("accept", "application/vnd.npm.install-v1+json"))
+        .and(path("/broad-root/latest"))
+        .and(header("accept", "application/json"))
         .respond_with(
-            ResponseTemplate::new(200).set_body_json(metadata_json_version(
+            ResponseTemplate::new(200).set_body_json(version_document_json(
                 "broad-root",
                 "1.2.3",
                 &[],
@@ -4432,7 +4434,7 @@ async fn fusion_broad_npm_range_keeps_using_the_packument() {
         true,
     )
     .await
-    .expect("a broad npm range should continue to resolve from a packument");
+    .expect("a satisfying latest document should avoid the packument");
 
     assert_eq!(result.packages[0].version.to_string(), "1.2.3");
     server.verify().await;
@@ -4910,17 +4912,19 @@ async fn fusion_inflight_high_water_never_exceeds_metadata_fanout() {
     let mut deps = HashMap::with_capacity(PACKAGE_COUNT);
     for index in 0..PACKAGE_COUNT {
         let name = format!("fanout-{index}");
+        let mut metadata = metadata_json(&name, &[]);
+        metadata["dist-tags"]["stable"] = serde_json::json!("1.0.0");
         Mock::given(method("GET"))
             .and(path(format!("/{name}")))
             .respond_with(
                 ResponseTemplate::new(200)
                     .set_delay(std::time::Duration::from_millis(50))
-                    .set_body_json(metadata_json(&name, &[])),
+                    .set_body_json(metadata),
             )
             .expect(1)
             .mount(&server)
             .await;
-        deps.insert(name, "^1.0.0".to_string());
+        deps.insert(name, "stable".to_string());
     }
 
     let client = Arc::new(

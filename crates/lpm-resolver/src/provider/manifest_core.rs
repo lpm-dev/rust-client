@@ -877,6 +877,18 @@ impl CachedPackageInfo {
             .collect()
     }
 
+    /// Proves the preferred latest candidate is present and installable for this range.
+    /// Callers must separately rule out policy or override selection requiring history.
+    pub fn has_installable_latest_for_range(&self, range: &NpmRange) -> bool {
+        self.latest_version.as_ref().is_some_and(|latest| {
+            if !self.versions.contains(latest) || !self.range_satisfies(range, latest) {
+                return false;
+            }
+            let version = latest.to_string();
+            self.tarball_url(&version).is_some() && self.integrity(&version).is_some()
+        })
+    }
+
     pub fn needs_metadata_for_range(&self, range: &NpmRange) -> bool {
         if self.versions_complete {
             return false;

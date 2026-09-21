@@ -1,11 +1,11 @@
 use super::edge::process_edge_with_preferred;
 use super::manifest::{
-    ExactMetadataFetchOutcome, FetchResult, FetchedMetadata, MetadataFetchCompletion,
-    MetadataFetchKey, cached_manifest_from_importer_or_facts, complete_metadata_fetch,
+    FetchResult, FetchedMetadata, MetadataFetchCompletion, MetadataFetchKey,
+    VersionDocumentFetchOutcome, cached_manifest_from_importer_or_facts, complete_metadata_fetch,
     ensure_policy_metadata_for_cached_manifest, exact_metadata_fast_path_eligible,
     fetch_metadata_for_resolver_with_trace_detail, parse_cached_metadata_for_resolver,
     parse_fetched_metadata, parse_partial_fetched_metadata, publish_direct_base_fact,
-    try_fetch_exact_metadata_for_resolver,
+    try_fetch_version_document_for_resolver,
 };
 use super::peer::{drain_peer_requirements_one_pass, pick_peer_prefetch_candidates};
 use super::prelude::*;
@@ -356,9 +356,9 @@ impl OrderedMetadataFetches {
     fn coalesce_request(&self, mut request: MetadataFetchKey) -> MetadataFetchKey {
         if let Some(requests) = self.inflight_requests.get(&request.canonical)
             && let Some(first) = requests.first()
-            && (request.exact_version.is_none() || first.is_none())
+            && (request.version_selector.is_none() || first.is_none())
         {
-            request.exact_version = first.clone();
+            request.version_selector = first.clone();
         }
         request
     }
@@ -377,7 +377,7 @@ impl OrderedMetadataFetches {
         self.inflight_requests
             .entry(request.canonical.clone())
             .or_default()
-            .insert(request.exact_version.clone());
+            .insert(request.version_selector.clone());
         Ok(true)
     }
 
@@ -461,7 +461,7 @@ impl OrderedMetadataFetches {
             let sequence = self.sequences.remove(&request);
             debug_assert_eq!(sequence, Some(self.next_commit_sequence));
             if let Some(requests) = self.inflight_requests.get_mut(&canonical) {
-                requests.remove(&request.exact_version);
+                requests.remove(&request.version_selector);
                 if requests.is_empty() {
                     self.inflight_requests.remove(&canonical);
                     self.inflight.remove(&canonical);
@@ -661,7 +661,7 @@ struct PendingMetadataFetch {
     client: Arc<RegistryClient>,
     route_table: RouteTable,
     policy: ResolverPolicy,
-    exact_version: Option<String>,
+    version_selector: Option<String>,
     include_speculation: bool,
     trace_metadata_fetches: bool,
     telemetry: Arc<MetadataFetchTelemetry>,
@@ -715,7 +715,7 @@ impl MetadataFetchScheduler {
         &mut self,
         dispatch: &MetadataFetchDispatch<'_>,
         canonical: CanonicalKey,
-        exact_version: Option<String>,
+        version_selector: Option<String>,
         include_speculation: bool,
     ) {
         let client = dispatch.client.clone();
@@ -733,7 +733,7 @@ impl MetadataFetchScheduler {
             )
         {
             self.ready.push_back((
-                MetadataFetchKey::for_request(canonical, exact_version, &route_table, &policy),
+                MetadataFetchKey::for_request(canonical, version_selector, &route_table, &policy),
                 Ok(fetched),
             ));
             return;
@@ -744,13 +744,13 @@ impl MetadataFetchScheduler {
             client,
             route_table,
             policy,
-            exact_version,
+            version_selector,
             include_speculation,
             trace_metadata_fetches: dispatch.trace_metadata_fetches,
             telemetry: Arc::clone(dispatch.telemetry),
             queued_at: Instant::now(),
         };
-        let exact_document_lane = pending.exact_version.is_some()
+        let exact_document_lane = pending.version_selector.is_some()
             && exact_metadata_fast_path_eligible(
                 &pending.route_table,
                 &pending.canonical,
@@ -786,7 +786,7 @@ impl MetadataFetchScheduler {
                 .telemetry
                 .record_wait_duration(pending.queued_at.elapsed());
         }
-        let exact_document_lane = pending.exact_version.is_some()
+        let exact_document_lane = pending.version_selector.is_some()
             && exact_metadata_fast_path_eligible(
                 &pending.route_table,
                 &pending.canonical,
@@ -798,10 +798,10 @@ impl MetadataFetchScheduler {
             let active_fetch = pending.telemetry.enter();
             let result = if exact_document_lane {
                 let version = pending
-                    .exact_version
+                    .version_selector
                     .as_deref()
-                    .expect("exact-document lane requires an exact version");
-                match try_fetch_exact_metadata_for_resolver(
+                    .expect("version-document lane requires a selector");
+                match try_fetch_version_document_for_resolver(
                     &pending.client,
                     &pending.route_table,
                     &pending.canonical,
@@ -812,11 +812,11 @@ impl MetadataFetchScheduler {
                 )
                 .await
                 {
-                    ExactMetadataFetchOutcome::Hit(fetched) => {
+                    VersionDocumentFetchOutcome::Hit(fetched) => {
                         drop(permit);
                         Ok(fetched)
                     }
-                    ExactMetadataFetchOutcome::Fallback => {
+                    VersionDocumentFetchOutcome::Fallback => {
                         drop(active_fetch);
                         let mut exact_permit = Some(permit);
                         let fallback = fallback_metadata.package(&pending.canonical);
@@ -866,7 +866,7 @@ impl MetadataFetchScheduler {
                 }
             } else {
                 let _permit = permit;
-                if pending.exact_version.is_some()
+                if pending.version_selector.is_some()
                     && matches!(
                         &pending.canonical,
                         CanonicalKey::Npm { name }
@@ -895,7 +895,7 @@ impl MetadataFetchScheduler {
             (
                 MetadataFetchKey::for_request(
                     pending.canonical,
-                    pending.exact_version,
+                    pending.version_selector,
                     &pending.route_table,
                     &pending.policy,
                 ),
@@ -1312,10 +1312,10 @@ fn spawn_metadata_fetch_job(
     metadata_jobs: &mut MetadataFetchScheduler,
     dispatch: &MetadataFetchDispatch<'_>,
     canonical: CanonicalKey,
-    exact_version: Option<String>,
+    version_selector: Option<String>,
     include_speculation: bool,
 ) {
-    metadata_jobs.enqueue(dispatch, canonical, exact_version, include_speculation);
+    metadata_jobs.enqueue(dispatch, canonical, version_selector, include_speculation);
 }
 
 fn release_age_names_from_root_deps(
@@ -2061,16 +2061,23 @@ pub async fn resolve_greedy_fused_with_cache_options_policy_and_selected_events_
                     && state
                         .overrides
                         .may_match_package(&edge.canonical.to_string());
-                if info_arc.needs_metadata_for_range(&edge.range) || override_needs_history {
+                let latest_allowed = state.overrides.is_empty()
+                    && !policy.release_age_active()
+                    && exact_metadata_fast_path_eligible(&route_table, &edge.canonical, &policy);
+                if override_needs_history
+                    || (info_arc.needs_metadata_for_range(&edge.range)
+                        && !(latest_allowed
+                            && info_arc.has_installable_latest_for_range(&edge.range)))
+                {
                     let canonical = edge.canonical.clone();
-                    let exact_version = edge
+                    let version_selector = edge
                         .range
                         .exact_version()
                         .filter(|_| !override_needs_history)
                         .map(|version| version.to_string());
                     let request = MetadataFetchKey::for_request(
                         canonical.clone(),
-                        exact_version.clone(),
+                        version_selector.clone(),
                         &route_table,
                         &policy,
                     );
@@ -2113,7 +2120,7 @@ pub async fn resolve_greedy_fused_with_cache_options_policy_and_selected_events_
                             &mut metadata_jobs,
                             &metadata_dispatch,
                             canonical,
-                            exact_version,
+                            version_selector,
                             spec_tx.is_some(),
                         );
                         dispatcher_rpc_count += 1;
@@ -2223,17 +2230,24 @@ pub async fn resolve_greedy_fused_with_cache_options_policy_and_selected_events_
             // drain are grouped into one batch below; direct/custom
             // routes keep the existing per-package fetch path.
             let canonical = edge.canonical.clone();
-            let exact_version = edge
+            let version_selector = edge
                 .range
                 .exact_version()
                 .filter(|_| {
                     state.overrides.is_empty()
                         || !state.overrides.may_match_package(&canonical.to_string())
                 })
-                .map(|version| version.to_string());
+                .map(|version| version.to_string())
+                .or_else(|| {
+                    (state.overrides.is_empty()
+                        && !policy.release_age_active()
+                        && edge.range.dist_tag().is_none_or(|tag| tag == "latest")
+                        && exact_metadata_fast_path_eligible(&route_table, &canonical, &policy))
+                    .then(|| "latest".to_string())
+                });
             let request = MetadataFetchKey::for_request(
                 canonical.clone(),
-                exact_version.clone(),
+                version_selector.clone(),
                 &route_table,
                 &policy,
             );
@@ -2273,7 +2287,7 @@ pub async fn resolve_greedy_fused_with_cache_options_policy_and_selected_events_
                         &mut metadata_jobs,
                         &metadata_dispatch,
                         canonical,
-                        exact_version,
+                        version_selector,
                         include_speculation,
                     );
                     dispatcher_rpc_count += 1;
@@ -2733,7 +2747,8 @@ pub async fn resolve_greedy_fused_with_cache_options_policy_and_selected_events_
                             &shared_cache,
                             shared_fact_cache.as_ref(),
                             &canonical,
-                        ) {
+                        ) && info_arc.versions_complete
+                        {
                             return ensure_policy_metadata_for_cached_manifest(
                                 &canonical,
                                 info_arc,
