@@ -2096,42 +2096,9 @@ jobs:
           fi
 
       - name: Verify published wrapper install
-        run: |
-          set -euo pipefail
-          version="${{ needs.release-metadata.outputs.version }}"
-          deadline=$((SECONDS + 300))
-          attempt=0
-          prefix=
-          cache=
-          cleanup_attempt() {
-            if [ -n "$prefix" ]; then rm -rf "$prefix"; fi
-            if [ -n "$cache" ]; then rm -rf "$cache"; fi
-            prefix=
-            cache=
-          }
-          trap cleanup_attempt EXIT
-          while [ "$SECONDS" -lt "$deadline" ]; do
-            attempt=$((attempt + 1))
-            prefix=$(mktemp -d)
-            cache=$(mktemp -d)
-            if npm install -g --prefix "$prefix" --cache "$cache" --prefer-online --no-audit --no-fund \
-                 "@lpm-registry/cli@${version}" &&
-               test "$("$prefix/bin/lpm" --version)" = "lpm $version" &&
-               "$prefix/bin/lpx" --help >/dev/null &&
-               test "$(npm view @lpm-registry/cli dist-tags.latest --cache "$cache" --prefer-online)" = "$version"; then
-              cleanup_attempt
-              exit 0
-            fi
-            cleanup_attempt
-            backoff=$((5 * (1 << (attempt - 1))))
-            if [ "$backoff" -gt 30 ]; then backoff=30; fi
-            remaining=$((deadline - SECONDS))
-            if [ "$remaining" -le 0 ]; then break; fi
-            if [ "$backoff" -gt "$remaining" ]; then backoff=$remaining; fi
-            sleep "$backoff"
-          done
-          echo "::error::Published wrapper was not installable after the 300-second propagation window."
-          exit 1
+        env:
+          VERSION: ${{ needs.release-metadata.outputs.version }}
+        run: bash scripts/ci/verify-published-wrapper.sh "$VERSION" latest
 
   finalize-promotion-release:
     name: Create stable tag and publish verified release
@@ -2591,7 +2558,7 @@ jobs:
       needs.release-metadata.outputs.mode == 'npm-publish-only' &&
       needs.publish-npm-platform.result == 'success'))
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 25
     permissions:
       contents: read
       id-token: write
@@ -2717,66 +2684,8 @@ jobs:
 
       - name: Verify published wrapper from npm
         run: |
-          set -euo pipefail
-          VERSION=$(jq -r '.version' npm-release-packages/release-packages.json)
-          REGISTRY_PROPAGATION_TIMEOUT_SECONDS=300
-          deadline=$((SECONDS + REGISTRY_PROPAGATION_TIMEOUT_SECONDS))
-          attempt=0
-          install_verified=0
-
-          PREFIX=
-          NPM_CACHE=
-          cleanup_attempt() {
-            if [ -n "$PREFIX" ]; then
-              rm -rf "$PREFIX"
-            fi
-            if [ -n "$NPM_CACHE" ]; then
-              rm -rf "$NPM_CACHE"
-            fi
-            PREFIX=
-            NPM_CACHE=
-          }
-          trap cleanup_attempt EXIT
-
-          while [ "$SECONDS" -lt "$deadline" ]; do
-            attempt=$((attempt + 1))
-            PREFIX=$(mktemp -d)
-            NPM_CACHE=$(mktemp -d)
-            : >/tmp/lpm-wrapper-smoke.log
-            if npx npm@11.12.1 install -g --prefix "$PREFIX" \
-                 --cache "$NPM_CACHE" --prefer-online --no-audit --no-fund \
-                 "@lpm-registry/cli@${VERSION}" &&
-               INSTALLED_VERSION=$("$PREFIX/bin/lpm" --version 2>/tmp/lpm-wrapper-smoke.log) &&
-               test "$INSTALLED_VERSION" = "lpm $VERSION" &&
-               "$PREFIX/bin/lpx" --help >/dev/null 2>>/tmp/lpm-wrapper-smoke.log &&
-               TAGGED_VERSION=$(npx npm@11.12.1 view \
-                 "@lpm-registry/cli" "dist-tags.${NPM_TAG}" \
-                 --cache "$NPM_CACHE" --prefer-online) &&
-               test "$TAGGED_VERSION" = "$VERSION"; then
-              install_verified=1
-              cleanup_attempt
-              break
-            fi
-
-            cleanup_attempt
-            BACKOFF_SECONDS=$((5 * (1 << (attempt - 1))))
-            if [ "$BACKOFF_SECONDS" -gt 30 ]; then
-              BACKOFF_SECONDS=30
-            fi
-            remaining=$((deadline - SECONDS))
-            if [ "$remaining" -le 0 ]; then
-              break
-            fi
-            if [ "$BACKOFF_SECONDS" -gt "$remaining" ]; then
-              BACKOFF_SECONDS=$remaining
-            fi
-            sleep "$BACKOFF_SECONDS"
-          done
-          if [ "$install_verified" -ne 1 ]; then
-            echo "::error::published wrapper install/launch failed after ${REGISTRY_PROPAGATION_TIMEOUT_SECONDS}s registry-propagation window"
-            cat /tmp/lpm-wrapper-smoke.log 2>/dev/null || true
-            exit 1
-          fi
+          VERSION=$(jq -er '.version' npm-release-packages/release-packages.json)
+          bash scripts/ci/verify-published-wrapper.sh "$VERSION" "$NPM_TAG"
 
   update-homebrew:
     name: Update Homebrew Formula
