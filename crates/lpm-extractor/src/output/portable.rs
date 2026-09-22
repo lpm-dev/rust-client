@@ -363,6 +363,12 @@ mod tests {
         pending.commit();
         let identity = output.accepted_file_identity(path).unwrap();
         assert!(identity == written_identity);
+        output
+            .prepare_parent(
+                Path::new("root-file"),
+                &mut PathLedgerBudget::new(usize::MAX),
+            )
+            .unwrap();
         std::fs::rename(root.join("lib"), root.join("moved")).unwrap();
         std::fs::create_dir(root.join("lib")).unwrap();
         std::fs::write(root.join(path), b"keep").unwrap();
@@ -381,6 +387,25 @@ mod tests {
             .and_then(|()| output.validate());
         assert!(result.is_err());
         assert!(!root.join("lib/second").exists());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn cached_parent_handle_prevents_directory_replacement_until_eviction() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let mut output = OutputTree::new(root.clone(), root.clone()).unwrap();
+        let mut budget = PathLedgerBudget::new(usize::MAX);
+        output
+            .prepare_parent(Path::new("lib/file"), &mut budget)
+            .unwrap();
+        let error = std::fs::rename(root.join("lib"), root.join("moved")).unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(32));
+        output
+            .prepare_parent(Path::new("root-file"), &mut budget)
+            .unwrap();
+        std::fs::rename(root.join("lib"), root.join("moved")).unwrap();
+        assert!(output.validate().is_err());
     }
 
     #[test]
