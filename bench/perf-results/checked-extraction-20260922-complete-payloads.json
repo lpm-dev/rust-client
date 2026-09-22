@@ -1,0 +1,159 @@
+[
+  {
+    "fixture": "t3",
+    "sample": 1,
+    "all_payload_hashes_equal": true,
+    "all_package_directories_equal": true,
+    "managers": {
+      "lpm-baseline": {
+        "packages": 95,
+        "regular_files": 17846,
+        "payload_bytes": 441695827,
+        "directories": 1273,
+        "inventory_sha256": "61beec38a3b9499ebd539c9e662fd60660694e5f048e90d41d3e12b91a096fa6"
+      },
+      "lpm-candidate": {
+        "packages": 95,
+        "regular_files": 17846,
+        "payload_bytes": 441695827,
+        "directories": 1273,
+        "inventory_sha256": "61beec38a3b9499ebd539c9e662fd60660694e5f048e90d41d3e12b91a096fa6"
+      },
+      "bun": {
+        "packages": 95,
+        "regular_files": 17846,
+        "payload_bytes": 441695827,
+        "directories": 1273,
+        "inventory_sha256": "61beec38a3b9499ebd539c9e662fd60660694e5f048e90d41d3e12b91a096fa6"
+      }
+    },
+    "bin_mode_differences": [
+      {
+        "package": "@biomejs/biome",
+        "version": "1.9.4",
+        "path": "bin/biome",
+        "lpm": "0o644",
+        "bun": "0o755"
+      },
+      {
+        "package": "baseline-browser-mapping",
+        "version": "2.11.25",
+        "path": "dist/cli.cjs",
+        "lpm": "0o644",
+        "bun": "0o755"
+      },
+      {
+        "package": "gel",
+        "version": "2.2.1",
+        "path": "dist/cli.mjs",
+        "lpm": "0o644",
+        "bun": "0o755"
+      }
+    ]
+  },
+  {
+    "fixture": "vite-react",
+    "sample": 1,
+    "all_payload_hashes_equal": true,
+    "all_package_directories_equal": true,
+    "managers": {
+      "lpm-baseline": {
+        "packages": 63,
+        "regular_files": 2222,
+        "payload_bytes": 35011496,
+        "directories": 135,
+        "inventory_sha256": "51fb7963bc1f8a0db2df4ac49cacaff04c00644dac5fb1bbaa6d6267b7d60f52"
+      },
+      "lpm-candidate": {
+        "packages": 63,
+        "regular_files": 2222,
+        "payload_bytes": 35011496,
+        "directories": 135,
+        "inventory_sha256": "51fb7963bc1f8a0db2df4ac49cacaff04c00644dac5fb1bbaa6d6267b7d60f52"
+      },
+      "bun": {
+        "packages": 63,
+        "regular_files": 2222,
+        "payload_bytes": 35011496,
+        "directories": 135,
+        "inventory_sha256": "51fb7963bc1f8a0db2df4ac49cacaff04c00644dac5fb1bbaa6d6267b7d60f52"
+      }
+    },
+    "bin_mode_differences": [
+      {
+        "package": "json5",
+        "version": "2.2.3",
+        "path": "lib/cli.js",
+        "lpm": "0o644",
+        "bun": "0o755"
+      },
+      {
+        "package": "baseline-browser-mapping",
+        "version": "2.11.25",
+        "path": "dist/cli.cjs",
+        "lpm": "0o644",
+        "bun": "0o755"
+      }
+    ]
+  },
+  {
+    "fixture": "native-sharp",
+    "sample": 1,
+    "all_payload_hashes_equal": true,
+    "all_package_directories_equal": true,
+    "managers": {
+      "lpm-baseline": {
+        "packages": 11,
+        "regular_files": 130,
+        "payload_bytes": 16562326,
+        "directories": 13,
+        "inventory_sha256": "b5db4243fe713bd082e182d534d6ce852d7068e1fa236864a6a359e5ace3d98f"
+      },
+      "lpm-candidate": {
+        "packages": 11,
+        "regular_files": 130,
+        "payload_bytes": 16562326,
+        "directories": 13,
+        "inventory_sha256": "b5db4243fe713bd082e182d534d6ce852d7068e1fa236864a6a359e5ace3d98f"
+      },
+      "bun": {
+        "packages": 11,
+        "regular_files": 130,
+        "payload_bytes": 16562326,
+        "directories": 13,
+        "inventory_sha256": "b5db4243fe713bd082e182d534d6ce852d7068e1fa236864a6a359e5ace3d98f"
+      }
+    },
+    "bin_mode_differences": []
+  },
+  {
+    "fixture": "nest",
+    "sample": 1,
+    "all_payload_hashes_equal": true,
+    "all_package_directories_equal": true,
+    "managers": {
+      "lpm-baseline": {
+        "packages": 33,
+        "regular_files": 3376,
+        "payload_bytes": 7831945,
+        "directories": 180,
+        "inventory_sha256": "1937aa7183c674181a3068fd671b19eb0fb1f5a248fc81ac2f65fa20ae7131ad"
+      },
+      "lpm-candidate": {
+        "packages": 33,
+        "regular_files": 3376,
+        "payload_bytes": 7831945,
+        "directories": 180,
+        "inventory_sha256": "1937aa7183c674181a3068fd671b19eb0fb1f5a248fc81ac2f65fa20ae7131ad"
+      },
+      "bun": {
+        "packages": 33,
+        "regular_files": 3376,
+        "payload_bytes": 7831945,
+        "directories": 180,
+        "inventory_sha256": "1937aa7183c674181a3068fd671b19eb0fb1f5a248fc81ac2f65fa20ae7131ad"
+      }
+    },
+    "bin_mode_differences": []
+  }
+]

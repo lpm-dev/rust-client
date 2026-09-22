@@ -9,7 +9,7 @@
     "disposition": "Rejected",
     "coverage": "Frozen archive A/B plus full installs",
     "commit": "623320e0f56d774bae6d1b3bcf481ba8fb6f1cd8",
-    "pr_status": "Ready for review submission; CI status is tracked on the current PR head"
+    "pr_status": "Open in PR867; CI status is tracked on the current head"
   },
   {
     "id": "EX-02",
@@ -21,7 +21,7 @@
     "disposition": "Verified",
     "coverage": "extract_does_not_follow_a_parent_replaced_after_an_inspection; output::portable::tests::replaced_parent_cannot_redirect_a_later_write_or_rollback",
     "commit": "c87697dd3f1d9a4c8b32c888013afd50c087963a",
-    "pr_status": "Ready for review submission; CI status is tracked on the current PR head"
+    "pr_status": "Open in PR867; CI status is tracked on the current head"
   },
   {
     "id": "EX-03",
@@ -33,7 +33,7 @@
     "disposition": "Verified",
     "coverage": "extraction_rollback_does_not_follow_a_replaced_parent",
     "commit": "c87697dd3f1d9a4c8b32c888013afd50c087963a",
-    "pr_status": "Ready for review submission; CI status is tracked on the current PR head"
+    "pr_status": "Open in PR867; CI status is tracked on the current head"
   },
   {
     "id": "EX-04",
@@ -45,7 +45,7 @@
     "disposition": "Verified",
     "coverage": "extraction_rejects_a_parent_replaced_with_a_real_directory; revisiting_an_evicted_parent_rejects_a_different_directory",
     "commit": "c87697dd3f1d9a4c8b32c888013afd50c087963a",
-    "pr_status": "Ready for review submission; CI status is tracked on the current PR head"
+    "pr_status": "Open in PR867; CI status is tracked on the current head"
   },
   {
     "id": "EX-05",
@@ -57,7 +57,7 @@
     "disposition": "Verified",
     "coverage": "extraction_chmod_does_not_follow_a_leaf_replaced_while_reading",
     "commit": "c87697dd3f1d9a4c8b32c888013afd50c087963a",
-    "pr_status": "Ready for review submission; CI status is tracked on the current PR head"
+    "pr_status": "Open in PR867; CI status is tracked on the current head"
   },
   {
     "id": "EX-06",
@@ -69,7 +69,7 @@
     "disposition": "Verified",
     "coverage": "extraction_removes_a_partial_file_after_a_reader_error",
     "commit": "c87697dd3f1d9a4c8b32c888013afd50c087963a",
-    "pr_status": "Ready for review submission; CI status is tracked on the current PR head"
+    "pr_status": "Open in PR867; CI status is tracked on the current head"
   },
   {
     "id": "EX-07",
@@ -81,7 +81,7 @@
     "disposition": "Verified",
     "coverage": "same_size_leaf_replacement_prevents_inspector_callback; extraction_chmod_does_not_follow_a_leaf_replaced_while_reading",
     "commit": "c87697dd3f1d9a4c8b32c888013afd50c087963a",
-    "pr_status": "Ready for review submission; CI status is tracked on the current PR head"
+    "pr_status": "Open in PR867; CI status is tracked on the current head"
   },
   {
     "id": "EX-08",
@@ -93,7 +93,7 @@
     "disposition": "Verified",
     "coverage": "output::portable::tests::replaced_parent_cannot_redirect_a_later_write_or_rollback",
     "commit": "c87697dd3f1d9a4c8b32c888013afd50c087963a",
-    "pr_status": "Ready for review submission; CI status is tracked on the current PR head"
+    "pr_status": "Open in PR867; CI status is tracked on the current head"
   },
   {
     "id": "EX-09",
@@ -105,7 +105,7 @@
     "disposition": "Verified",
     "coverage": "output::portable::tests::partial_cleanup_preserves_a_replacement_leaf",
     "commit": "c87697dd3f1d9a4c8b32c888013afd50c087963a",
-    "pr_status": "Ready for review submission; CI status is tracked on the current PR head"
+    "pr_status": "Open in PR867; CI status is tracked on the current head"
   },
   {
     "id": "EX-10",
@@ -117,7 +117,7 @@
     "disposition": "Rejected",
     "coverage": "crates/lpm-extractor/src/tests/output_tests.rs; output/portable.rs tests; retained test logs",
     "commit": "623320e0f56d774bae6d1b3bcf481ba8fb6f1cd8",
-    "pr_status": "Ready for review submission; CI status is tracked on the current PR head"
+    "pr_status": "Open in PR867; CI status is tracked on the current head"
   },
   {
     "id": "EX-11",
@@ -129,7 +129,7 @@
     "disposition": "Verified",
     "coverage": "retargeted_root_symlink_prevents_inspector_callback",
     "commit": "c87697dd3f1d9a4c8b32c888013afd50c087963a",
-    "pr_status": "Ready for review submission; CI status is tracked on the current PR head"
+    "pr_status": "Open in PR867; CI status is tracked on the current head"
   },
   {
     "id": "EX-12",
@@ -141,7 +141,7 @@
     "disposition": "Verified",
     "coverage": "rollback_preserves_a_completed_leaf_replaced_by_a_later_reader; rollback_preserves_a_leaf_replaced_before_digest_only_entry_acceptance; rollback_removes_an_accepted_inspector_hardlink_without_removing_cached_bytes",
     "commit": "c87697dd3f1d9a4c8b32c888013afd50c087963a",
-    "pr_status": "Ready for review submission; CI status is tracked on the current PR head"
+    "pr_status": "Open in PR867; CI status is tracked on the current head"
   },
   {
     "id": "EX-13",
@@ -153,7 +153,7 @@
     "disposition": "Verified",
     "coverage": "Duplicate record synchronization and rollback tests; final-micro/rows.json; install-scored/rows.json",
     "commit": "c87697dd3f1d9a4c8b32c888013afd50c087963a",
-    "pr_status": "Ready for review submission; CI status is tracked on the current PR head"
+    "pr_status": "Open in PR867; CI status is tracked on the current head"
   },
   {
     "id": "EX-14",
@@ -165,7 +165,7 @@
     "disposition": "Verified",
     "coverage": "Directory replacement regression tests; stage-breakdown.json",
     "commit": "c87697dd3f1d9a4c8b32c888013afd50c087963a",
-    "pr_status": "Ready for review submission; CI status is tracked on the current PR head"
+    "pr_status": "Open in PR867; CI status is tracked on the current head"
   },
   {
     "id": "EX-15",
@@ -177,7 +177,7 @@
     "disposition": "Verified",
     "coverage": "Extractor92tests; final-micro/rows.json",
     "commit": "c87697dd3f1d9a4c8b32c888013afd50c087963a",
-    "pr_status": "Ready for review submission; CI status is tracked on the current PR head"
+    "pr_status": "Open in PR867; CI status is tracked on the current head"
   },
   {
     "id": "EX-16",
@@ -189,7 +189,7 @@
     "disposition": "Rejected",
     "coverage": "Controlled extraction probe and relevant regression tests",
     "commit": "623320e0f56d774bae6d1b3bcf481ba8fb6f1cd8",
-    "pr_status": "Ready for review submission; CI status is tracked on the current PR head"
+    "pr_status": "Open in PR867; CI status is tracked on the current head"
   },
   {
     "id": "EX-17",
@@ -201,7 +201,7 @@
     "disposition": "Rejected",
     "coverage": "exclusive-micro/rows.json",
     "commit": "623320e0f56d774bae6d1b3bcf481ba8fb6f1cd8",
-    "pr_status": "Ready for review submission; CI status is tracked on the current PR head"
+    "pr_status": "Open in PR867; CI status is tracked on the current head"
   },
   {
     "id": "EX-18",
@@ -213,7 +213,7 @@
     "disposition": "Verified",
     "coverage": "run-final-micro.py; run-linux-micro.py; final-micro/rows.json",
     "commit": "623320e0f56d774bae6d1b3bcf481ba8fb6f1cd8",
-    "pr_status": "Ready for review submission; CI status is tracked on the current PR head"
+    "pr_status": "Open in PR867; CI status is tracked on the current head"
   },
   {
     "id": "EX-19",
@@ -225,7 +225,7 @@
     "disposition": "Verified",
     "coverage": "known_parent_reopen_uses_kernel_confinement_when_available; known_parent_reopen_rejects_symlink_components; confined_open_falls_back_only_for_unavailable_capabilities; Linux controlled extraction rows",
     "commit": "c87697dd3f1d9a4c8b32c888013afd50c087963a",
-    "pr_status": "Ready for review submission; CI status is tracked on the current PR head"
+    "pr_status": "Open in PR867; CI status is tracked on the current head"
   },
   {
     "id": "EX-20",
@@ -237,7 +237,7 @@
     "disposition": "Rejected",
     "coverage": "output::portable::tests; Windows filesystem crate CI",
     "commit": "623320e0f56d774bae6d1b3bcf481ba8fb6f1cd8",
-    "pr_status": "Ready for review submission; CI status is tracked on the current PR head"
+    "pr_status": "Open in PR867; CI status is tracked on the current head"
   },
   {
     "id": "EX-21",
@@ -249,6 +249,18 @@
     "disposition": "Verified",
     "coverage": "Locked fuzz workspace metadata check",
     "commit": "c87697dd3f1d9a4c8b32c888013afd50c087963a",
-    "pr_status": "Ready for review submission; CI status is tracked on the current PR head"
+    "pr_status": "Open in PR867; CI status is tracked on the current head"
+  },
+  {
+    "id": "EX-22",
+    "source": "Windows CI; primary and Daybreak follow-up review",
+    "category": "correctness",
+    "location": "output/portable.rs replaced_parent_cannot_redirect_a_later_write_or_rollback",
+    "claim": "The test assumes a live checked directory handle permits renaming on Windows.",
+    "evidence": "Windows CI failed at the setup rename with error32. cap-primitives deliberately excludes FILE_SHARE_DELETE for directory handles. Eviction permits the rename while retaining the recorded identity. The common test preserves rollback and later-write assertions; a Windows-specific test pins the sharing contract. Two portable tests pass on macOS after correction.",
+    "disposition": "Verified",
+    "coverage": "cached_parent_handle_prevents_directory_replacement_until_eviction; replaced_parent_cannot_redirect_a_later_write_or_rollback; Windows filesystem CI",
+    "commit": "0a2a4fcab06cc3f21c52ae3a6a38a6a7ac8c7b77",
+    "pr_status": "Open in PR867; CI status is tracked on the current head"
   }
 ]

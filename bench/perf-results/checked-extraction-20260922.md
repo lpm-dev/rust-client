@@ -40,6 +40,8 @@ The smaller fixtures have mixed first-install results. Their CI-cold medians are
 All 144 installs succeeded. The 24 LPM lockfile pairs are byte-identical.
 The LPM manifest inventories match, and critical native artifacts match Bun.
 The artifact check covers Next, SWC, Sharp, esbuild, and Biome where present.
+After CI-cold, full payload inventories in sample1 of each fixture also match all three managers.
+The complete check compares every regular file size and SHA256, plus package directory paths.
 Bun retains four additional WASM-only package names in the portable lockfile comparison.
 One Bun T3 first-install sample took 118,089 ms. The report retains this sample and makes no tail-latency claim.
 
@@ -89,9 +91,11 @@ Local checks passed: workspace build, formatting, and workspace Clippy with warn
 The test gates passed 6,697 library tests, 5,263 CLI unit tests, 116 CLI integration tests, and 479 relevant workflow tests.
 Extractor tests passed 92 cases on macOS and 95 on native Linux. Store tests passed 21 targeted cases.
 The portable replacement tests also run in Windows CI. Windows runtime validation remains a PR check.
+The initial Windows gate rejected a test setup rename because the cached directory handle correctly prevents replacement.
+The corrected tests cover this protection and identity checks after handle eviction.
 
-The findings ledger contains 21 entries: 16 resolved, 5 rejected with evidence, 0 externally blocked, and 0 pending.
-The resolved entries comprise 11 correctness findings and 5 performance or measurement findings.
+The findings ledger contains 22 entries: 17 resolved, 5 rejected with evidence, 0 externally blocked, and 0 pending.
+The resolved entries comprise 12 correctness findings and 5 performance or measurement findings.
 The rejected entries include unsupported causal diagnoses. Rejection does not prove every proposed mechanism impossible.
 
 This concept depends on the streaming store paths and extraction records in the existing install stack.
