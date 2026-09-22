@@ -1453,28 +1453,45 @@ impl Store {
             source_analysis_enabled
                 && lpm_security::behavioral::PackageAnalyzer::should_buffer_source(path, size)
         };
-        let extract_result = match &mut tarball_input {
-            TarballInput::Bytes(bytes) => lpm_extractor::extract_tarball_with_entry_digests(
-                bytes,
-                tmp_dir,
-                buffer_predicate,
-                inspect_entry,
-            ),
-            TarballInput::File(reader) => {
-                lpm_extractor::extract_tarball_from_reader_hybrid_with_entry_digests(
-                    reader,
-                    tmp_dir,
-                    buffer_predicate,
-                    inspect_entry,
-                )
+        let extract_result = if !source_analysis_enabled && registry_cas_ingest.is_none() {
+            match &mut tarball_input {
+                TarballInput::Bytes(bytes) => {
+                    lpm_extractor::extract_tarball_digests(bytes, tmp_dir)
+                }
+                TarballInput::File(reader) => {
+                    lpm_extractor::extract_tarball_from_reader_hybrid_digests(reader, tmp_dir)
+                }
+                TarballInput::Streaming { reader, .. } => {
+                    lpm_extractor::extract_tarball_from_reader_streaming_digests(
+                        &mut **reader,
+                        tmp_dir,
+                    )
+                }
             }
-            TarballInput::Streaming { reader, .. } => {
-                lpm_extractor::extract_tarball_from_reader_streaming_with_entry_digests(
-                    &mut **reader,
+        } else {
+            match &mut tarball_input {
+                TarballInput::Bytes(bytes) => lpm_extractor::extract_tarball_with_entry_digests(
+                    bytes,
                     tmp_dir,
                     buffer_predicate,
                     inspect_entry,
-                )
+                ),
+                TarballInput::File(reader) => {
+                    lpm_extractor::extract_tarball_from_reader_hybrid_with_entry_digests(
+                        reader,
+                        tmp_dir,
+                        buffer_predicate,
+                        inspect_entry,
+                    )
+                }
+                TarballInput::Streaming { reader, .. } => {
+                    lpm_extractor::extract_tarball_from_reader_streaming_with_entry_digests(
+                        &mut **reader,
+                        tmp_dir,
+                        buffer_predicate,
+                        inspect_entry,
+                    )
+                }
             }
         };
         let extracted_files = extract_result?;

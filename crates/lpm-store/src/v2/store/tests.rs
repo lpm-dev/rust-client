@@ -2194,67 +2194,77 @@ fn streamed_object_accepts_declared_integrity_algorithms_and_uses_sha512_identit
 
 #[test]
 fn known_sha512_stream_preserves_declared_algorithms_and_trailing_byte_identity() {
-    let mut tarball = build_test_tarball(&[("package.json", b"{}")]);
-    tarball.extend_from_slice(b"trailing bytes are part of the downloaded identity");
-    let canonical = crate::compute_sri_hash(&tarball);
-    for algorithm in [
-        None,
-        Some(HashAlgorithm::Sha512),
-        Some(HashAlgorithm::Sha256),
-        Some(HashAlgorithm::Sha1),
+    for policy in [
+        SecurityAnalysisPolicy::Enabled,
+        SecurityAnalysisPolicy::Disabled,
     ] {
-        let dir = tempfile::tempdir().unwrap();
-        let store = Store::at(dir.path());
-        let declared =
-            algorithm.map(|algorithm| Integrity::from_bytes(algorithm, &tarball).to_string());
-        let (object, sri, _) = store
-            .extract_object_from_stream_with_known_sha512(
-                tarball.as_slice(),
-                &canonical,
-                declared.as_deref(),
-                tarball.len() as u64,
-            )
-            .unwrap();
-        assert_eq!(sri, canonical);
-        assert_eq!(object.source_sri, canonical);
-        assert_eq!(
-            std::fs::read(object.path.join("package.json")).unwrap(),
-            b"{}"
-        );
-        assert_eq!(
-            std::fs::read_to_string(object.path.join(".integrity")).unwrap(),
-            canonical
-        );
+        let mut tarball = build_test_tarball(&[("package.json", b"{}")]);
+        tarball.extend_from_slice(b"trailing bytes are part of the downloaded identity");
+        let canonical = crate::compute_sri_hash(&tarball);
+        for algorithm in [
+            None,
+            Some(HashAlgorithm::Sha512),
+            Some(HashAlgorithm::Sha256),
+            Some(HashAlgorithm::Sha1),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let store = Store::at_with_policies(dir.path(), ObjectIntegrityPolicy::Source, policy);
+            let declared =
+                algorithm.map(|algorithm| Integrity::from_bytes(algorithm, &tarball).to_string());
+            let (object, sri, _) = store
+                .extract_object_from_stream_with_known_sha512(
+                    tarball.as_slice(),
+                    &canonical,
+                    declared.as_deref(),
+                    tarball.len() as u64,
+                )
+                .unwrap();
+            assert_eq!(sri, canonical);
+            assert_eq!(object.source_sri, canonical);
+            assert_eq!(
+                std::fs::read(object.path.join("package.json")).unwrap(),
+                b"{}"
+            );
+            assert_eq!(
+                std::fs::read_to_string(object.path.join(".integrity")).unwrap(),
+                canonical
+            );
+        }
     }
 }
 
 #[test]
 fn known_sha512_stream_rejects_declared_mismatches_for_every_algorithm() {
-    let tarball = build_test_tarball(&[("package.json", b"{}")]);
-    let canonical = crate::compute_sri_hash(&tarball);
-    for algorithm in [
-        HashAlgorithm::Sha512,
-        HashAlgorithm::Sha256,
-        HashAlgorithm::Sha1,
+    for policy in [
+        SecurityAnalysisPolicy::Enabled,
+        SecurityAnalysisPolicy::Disabled,
     ] {
-        let dir = tempfile::tempdir().unwrap();
-        let store = Store::at(dir.path());
-        let wrong = Integrity::from_bytes(algorithm, b"wrong bytes").to_string();
-        let error = store
-            .extract_object_from_stream_with_known_sha512(
-                tarball.as_slice(),
-                &canonical,
-                Some(&wrong),
-                tarball.len() as u64,
-            )
-            .unwrap_err();
-        assert!(matches!(error, LpmError::IntegrityMismatch { .. }));
-        assert!(
-            std::fs::read_dir(store.paths().objects_root())
-                .unwrap()
-                .next()
-                .is_none()
-        );
+        let tarball = build_test_tarball(&[("package.json", b"{}")]);
+        let canonical = crate::compute_sri_hash(&tarball);
+        for algorithm in [
+            HashAlgorithm::Sha512,
+            HashAlgorithm::Sha256,
+            HashAlgorithm::Sha1,
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let store = Store::at_with_policies(dir.path(), ObjectIntegrityPolicy::Source, policy);
+            let wrong = Integrity::from_bytes(algorithm, b"wrong bytes").to_string();
+            let error = store
+                .extract_object_from_stream_with_known_sha512(
+                    tarball.as_slice(),
+                    &canonical,
+                    Some(&wrong),
+                    tarball.len() as u64,
+                )
+                .unwrap_err();
+            assert!(matches!(error, LpmError::IntegrityMismatch { .. }));
+            assert!(
+                std::fs::read_dir(store.paths().objects_root())
+                    .unwrap()
+                    .next()
+                    .is_none()
+            );
+        }
     }
 }
 
@@ -2398,53 +2408,63 @@ fn streamed_object_trust_on_first_use_returns_canonical_sha512_identity() {
 
 #[test]
 fn streamed_object_integrity_mismatch_removes_private_staging() {
-    let dir = tempfile::tempdir().unwrap();
-    let store = Store::at(dir.path());
-    let tarball = build_test_tarball(&[(
-        "package.json",
-        b"{\"name\":\"streamed-mismatch\",\"version\":\"1.0.0\"}",
-    )]);
-    let wrong_integrity = crate::compute_sri_hash(b"different compressed bytes");
+    for policy in [
+        SecurityAnalysisPolicy::Enabled,
+        SecurityAnalysisPolicy::Disabled,
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::at_with_policies(dir.path(), ObjectIntegrityPolicy::Source, policy);
+        let tarball = build_test_tarball(&[(
+            "package.json",
+            b"{\"name\":\"streamed-mismatch\",\"version\":\"1.0.0\"}",
+        )]);
+        let wrong_integrity = crate::compute_sri_hash(b"different compressed bytes");
 
-    let error = store
-        .extract_object_from_stream(
-            std::io::Cursor::new(&tarball),
-            Some(&wrong_integrity),
-            tarball.len() as u64,
-        )
-        .unwrap_err();
+        let error = store
+            .extract_object_from_stream(
+                std::io::Cursor::new(&tarball),
+                Some(&wrong_integrity),
+                tarball.len() as u64,
+            )
+            .unwrap_err();
 
-    assert!(matches!(error, LpmError::IntegrityMismatch { .. }));
-    assert!(
-        std::fs::read_dir(store.paths().objects_root())
-            .unwrap()
-            .next()
-            .is_none(),
-        "an integrity failure must leave no visible object or private staging directory"
-    );
+        assert!(matches!(error, LpmError::IntegrityMismatch { .. }));
+        assert!(
+            std::fs::read_dir(store.paths().objects_root())
+                .unwrap()
+                .next()
+                .is_none(),
+            "an integrity failure must leave no visible object or private staging directory"
+        );
+    }
 }
 
 #[test]
 fn streamed_object_hash_includes_bytes_after_the_gzip_member() {
-    let dir = tempfile::tempdir().unwrap();
-    let store = Store::at(dir.path());
-    let mut tarball = build_test_tarball(&[(
-        "package.json",
-        b"{\"name\":\"streamed-trailing\",\"version\":\"1.0.0\"}",
-    )]);
-    tarball.extend_from_slice(b"integrity-covered-trailing-bytes");
-    let expected_sri = crate::compute_sri_hash(&tarball);
+    for policy in [
+        SecurityAnalysisPolicy::Enabled,
+        SecurityAnalysisPolicy::Disabled,
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::at_with_policies(dir.path(), ObjectIntegrityPolicy::Source, policy);
+        let mut tarball = build_test_tarball(&[(
+            "package.json",
+            b"{\"name\":\"streamed-trailing\",\"version\":\"1.0.0\"}",
+        )]);
+        tarball.extend_from_slice(b"integrity-covered-trailing-bytes");
+        let expected_sri = crate::compute_sri_hash(&tarball);
 
-    let (object, sri, _) = store
-        .extract_object_from_stream(
-            std::io::Cursor::new(&tarball),
-            Some(&expected_sri),
-            tarball.len() as u64,
-        )
-        .unwrap();
+        let (object, sri, _) = store
+            .extract_object_from_stream(
+                std::io::Cursor::new(&tarball),
+                Some(&expected_sri),
+                tarball.len() as u64,
+            )
+            .unwrap();
 
-    assert_eq!(sri, expected_sri);
-    assert_eq!(object.source_sri, expected_sri);
+        assert_eq!(sri, expected_sri);
+        assert_eq!(object.source_sri, expected_sri);
+    }
 }
 
 #[test]
@@ -2772,6 +2792,51 @@ fn v3_registry_ingest_uses_last_duplicate_tar_member() {
             .iter()
             .any(|content| content == b"module.exports = 'last';\n")
     );
+    assert!(
+        store
+            .verify_file_cas(true)
+            .unwrap()
+            .unwrap()
+            .issues
+            .is_empty()
+    );
+}
+
+#[test]
+fn v3_duplicate_after_cached_blob_replacement_preserves_cached_bytes_with_scanning_disabled() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::at_v3_with_policies(
+        dir.path(),
+        ObjectIntegrityPolicy::Source,
+        SecurityAnalysisPolicy::Disabled,
+    );
+    let first = build_test_tarball(&[
+        ("package.json", br#"{"name":"cached","version":"1.0.0"}"#),
+        ("lib/shared.js", b"first"),
+    ]);
+    let (cached, _, _) = store.extract_object_from_bytes(&first, None).unwrap();
+    let duplicate = build_test_tarball(&[
+        ("package.json", br#"{"name":"duplicate","version":"1.0.0"}"#),
+        ("lib/shared.js", b"first"),
+        ("lib/shared.js", b"last"),
+    ]);
+    let (object, _, _) = store.extract_object_from_bytes(&duplicate, None).unwrap();
+    assert_eq!(
+        std::fs::read(cached.join("lib/shared.js")).unwrap(),
+        b"first"
+    );
+    assert_eq!(
+        std::fs::read(object.join("lib/shared.js")).unwrap(),
+        b"last"
+    );
+    assert!(!object.join(".lpm-security.json").exists());
+    let contents = v3_blob_files(dir.path())
+        .into_iter()
+        .map(std::fs::read)
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert!(contents.iter().any(|bytes| bytes == b"first"));
+    assert!(contents.iter().any(|bytes| bytes == b"last"));
     assert!(
         store
             .verify_file_cas(true)
@@ -4408,6 +4473,59 @@ fn disabled_source_analysis_skips_fresh_v2_cache_creation() {
 
     assert!(!path.join(".lpm-security.json").exists());
     assert!(path.join(".integrity").exists());
+}
+
+#[test]
+fn v2_input_paths_preserve_source_analysis_policy_and_extracted_content() {
+    let tarball = build_test_tarball(&[
+        (
+            "package.json",
+            br#"{"name":"inspect-policy","version":"1.0.0"}"#,
+        ),
+        ("index.js", b"eval('code')"),
+    ]);
+    let sri = crate::compute_sri_hash(&tarball);
+    for policy in [
+        SecurityAnalysisPolicy::Disabled,
+        SecurityAnalysisPolicy::Enabled,
+    ] {
+        for input in 0..3 {
+            let dir = tempfile::tempdir().unwrap();
+            let store = Store::at_with_policies(
+                dir.path().join("store"),
+                ObjectIntegrityPolicy::Source,
+                policy,
+            );
+            let object = match input {
+                0 => store.extract_object_from_bytes(&tarball, None).unwrap().0,
+                1 => {
+                    let archive = dir.path().join("archive.tgz");
+                    std::fs::write(&archive, &tarball).unwrap();
+                    store.extract_object_from_file(&archive, &sri).unwrap().0
+                }
+                _ => {
+                    store
+                        .extract_object_from_stream(
+                            std::io::Cursor::new(&tarball),
+                            Some(&sri),
+                            tarball.len() as u64,
+                        )
+                        .unwrap()
+                        .0
+                        .path
+                }
+            };
+            assert_eq!(
+                std::fs::read(object.join("index.js")).unwrap(),
+                b"eval('code')"
+            );
+            let analysis = lpm_security::behavioral::read_cached_analysis(&object);
+            assert_eq!(analysis.is_some(), policy.is_enabled());
+            if let Some(analysis) = analysis {
+                assert!(analysis.source.eval);
+            }
+        }
+    }
 }
 
 #[test]

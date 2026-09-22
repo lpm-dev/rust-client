@@ -750,10 +750,13 @@ name = "lpm-extractor"
 version = "0.78.0"
 dependencies = [
  "blake3",
+ "cap-fs-ext",
+ "cap-std",
  "flate2",
  "libc",
  "libdeflater",
  "lpm-common",
+ "rustix",
  "tar",
  "thiserror 2.0.18",
  "tracing",
@@ -775,6 +778,7 @@ version = "0.78.0"
 dependencies = [
  "hex",
  "lpm-common",
+ "lpm-workspace",
  "memmap2",
  "node-semver",
  "serde",
@@ -789,12 +793,16 @@ dependencies = [
 name = "lpm-migrate"
 version = "0.78.0"
 dependencies = [
- "glob",
+ "cap-fs-ext",
+ "cap-std",
  "libc",
  "lpm-common",
  "lpm-lockfile",
+ "lpm-semver",
+ "lpm-workspace",
  "serde",
  "serde_json",
+ "serde_json_lenient",
  "serde_yaml",
  "tempfile",
  "tracing",
@@ -808,6 +816,23 @@ dependencies = [
  "node-semver",
  "serde",
  "thiserror 2.0.18",
+]
+
+[[package]]
+name = "lpm-workspace"
+version = "0.78.0"
+dependencies = [
+ "cap-fs-ext",
+ "cap-std",
+ "glob",
+ "lpm-common",
+ "lpm-semver",
+ "same-file",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+ "thiserror 2.0.18",
+ "tracing",
 ]
 
 [[package]]
@@ -1077,6 +1102,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9774ba4a74de5f7b1c1451ed6cd5285a32eddb5cccb8cc655a4e50009e06477f"
 
 [[package]]
+name = "same-file"
+version = "1.0.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "93fc1dc3aaa9bfed95e02e6eadabb4baf7e3078b0bd1b4d7b6b0b68378900502"
+dependencies = [
+ "winapi-util",
+]
+
+[[package]]
 name = "scopeguard"
 version = "1.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1124,6 +1158,18 @@ dependencies = [
  "serde",
  "serde_core",
  "zmij",
+]
+
+[[package]]
+name = "serde_json_lenient"
+version = "0.2.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0e033097bf0d2b59a62b42c18ebbb797503839b26afdda2c4e1415cb6c813540"
+dependencies = [
+ "itoa",
+ "memchr",
+ "ryu",
+ "serde",
 ]
 
 [[package]]
@@ -1608,6 +1654,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7acbf7616c27b194bbb550bf77ed0c2c3e5b7fd1260a93082b95fb7f47959b92"
 dependencies = [
  "unicode-ident",
+]
+
+[[package]]
+name = "winapi-util"
+version = "0.1.11"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
+dependencies = [
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
