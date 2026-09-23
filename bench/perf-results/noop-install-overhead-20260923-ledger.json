@@ -9,7 +9,7 @@
     "disposition": "Verified",
     "coverage": "unchanged_install_probes_once_and_rejects_changed_shim_output;engine_free_installs_do_not_execute_node;install workflow gates",
     "commit": "d89d9ed1a",
-    "pr_status": "Unpublished"
+    "pr_status": "Open: https://github.com/lpm-dev/rust-client/pull/873"
   },
   {
     "id": "NOOP-2",
@@ -21,6 +21,6 @@
     "disposition": "Verified",
     "coverage": "67 install-state unit tests; workspace and install workflows",
     "commit": "d89d9ed1a",
-    "pr_status": "Unpublished"
+    "pr_status": "Open: https://github.com/lpm-dev/rust-client/pull/873"
   }
 ]

@@ -64,8 +64,8 @@ No subagents contributed findings in this round. The primary agent recorded thes
 
 | ID | Source | Category | Location | Claim | Evidence | Disposition | Coverage | Commit | PR status |
 |---|---|---|---|---|---|---|---|---|---|
-| NOOP-1 | Primary | Performance | `commands/install/state.rs`, `engine_check.rs` | Live Node probing serializes with lockfile replay | Two overlap-only cohorts improve both medians by 2 ms | Verified | Shim output, probe count, root engines, engine-free install | `d89d9ed1a` | Unpublished |
-| NOOP-2 | Primary | Performance | `install_state.rs` | Sidecar checks repeat authoritative lockfile path selection | Both freshness branches already selected that path. Independent comparison improves medians by another 1–2 ms | Verified | Install-state suite and workspace workflows | `d89d9ed1a` | Unpublished |
+| NOOP-1 | Primary | Performance | `commands/install/state.rs`, `engine_check.rs` | Live Node probing serializes with lockfile replay | Two overlap-only cohorts improve both medians by 2 ms | Verified | Shim output, probe count, root engines, engine-free install | `d89d9ed1a` | [PR873](https://github.com/lpm-dev/rust-client/pull/873), open |
+| NOOP-2 | Primary | Performance | `install_state.rs` | Sidecar checks repeat authoritative lockfile path selection | Both freshness branches already selected that path. Independent comparison improves medians by another 1–2 ms | Verified | Install-state suite and workspace workflows | `d89d9ed1a` | [PR873](https://github.com/lpm-dev/rust-client/pull/873), open |
 
 Caching a version from executable metadata alone was rejected. The shim experiment preserved executable metadata while its reported version changed.
 The candidate correctly rejected the incompatible version. This rejected proposal is not an unresolved code defect.
