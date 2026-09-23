@@ -579,28 +579,18 @@ test("Windows artifact recovery validates the source run before selecting its ar
   assert.match(recovery, /shell: bash/);
 });
 
-test("published wrapper verification tolerates five minutes of registry propagation", () => {
+test("all npm release paths share bounded published-wrapper verification with job headroom", () => {
   const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../../..");
-  const releaseWorkflow = fs
-    .readFileSync(path.join(repoRoot, ".github/workflows/release.yml"), "utf8")
+  const workflow = fs.readFileSync(path.join(repoRoot, ".github/workflows/release.yml"), "utf8")
     .replaceAll("\r\n", "\n");
-  const start = releaseWorkflow.indexOf("\n  publish-npm-wrapper:\n");
-  const end = releaseWorkflow.indexOf("\n  update-homebrew:\n", start + 1);
-
-  assert.notEqual(start, -1, "missing publish-npm-wrapper job");
-  assert.notEqual(end, -1, "missing update-homebrew job after publish-npm-wrapper");
-
-  const wrapperJob = releaseWorkflow.slice(start, end);
-  assert.match(wrapperJob, /REGISTRY_PROPAGATION_TIMEOUT_SECONDS=300/);
-  assert.match(
-    wrapperJob,
-    /deadline=\$\(\(SECONDS \+ REGISTRY_PROPAGATION_TIMEOUT_SECONDS\)\)/,
-  );
-  assert.match(wrapperJob, /NPM_CACHE=\$\(mktemp -d\)/);
-  assert.match(wrapperJob, /--cache "\$NPM_CACHE" --prefer-online/);
-  assert.match(wrapperJob, /BACKOFF_SECONDS=\$\(\(5 \* \(1 << \(attempt - 1\)\)\)\)/);
-  assert.match(wrapperJob, /if \[ "\$BACKOFF_SECONDS" -gt 30 \]; then/);
-  assert.doesNotMatch(wrapperJob, /for attempt in 1 2 3 4 5/);
+  for (const [job, nextJob] of [
+    ["publish-npm-wrapper", "update-homebrew"],
+    ["publish-promotion-platform", "finalize-promotion-release"],
+  ]) {
+    const source = releaseJobSource(workflow, job, nextJob);
+    assert.match(source, /bash scripts\/ci\/verify-published-wrapper\.sh "\$VERSION"/);
+    assert.ok(releaseJobTimeout(workflow, job, nextJob) >= 25);
+  }
 });
 
 test("Windows npm invocation runs npm CLI through Node without a command shell", () => {
