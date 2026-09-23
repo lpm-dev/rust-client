@@ -7,8 +7,8 @@ pub(super) fn write_post_install_hash(
     security_analysis_policy: lpm_store::SecurityAnalysisPolicy,
     dependency_engine_policy: &crate::engine_check::DependencyEnginePolicy,
 ) {
-    let lock = workspace_lockfile::active_lockfile_content(project_dir);
-    let dependency_engine_key = dependency_engine_policy.freshness_key(&lock);
+    let lock = workspace_lockfile::active_lockfile_snapshot(project_dir);
+    let dependency_engine_key = dependency_engine_policy.freshness_key(&lock.content);
     let node_runtime_fingerprint = match dependency_engine_key.as_str() {
         "none" | "legacy" => None,
         _ => dependency_engine_policy.resolved_node_runtime_fingerprint(),
@@ -20,6 +20,7 @@ pub(super) fn write_post_install_hash(
         security_analysis_policy,
         &dependency_engine_key,
         node_runtime_fingerprint,
+        &lock,
     ) {
         tracing::warn!(
             "failed to write `.lpm/install-hash` after install ({e}) — \
@@ -35,18 +36,18 @@ fn write_post_install_hash_with_context(
     security_analysis_policy: lpm_store::SecurityAnalysisPolicy,
     dependency_engine_key: &str,
     node_runtime_fingerprint: Option<&str>,
+    lock: &workspace_lockfile::ActiveLockfileSnapshot,
 ) -> std::io::Result<()> {
     let pkg = lpm_common::read_text_file_capped(
         &project_dir.join("package.json"),
         lpm_common::CONFIG_FILE_SIZE_CAP_BYTES,
     )
     .unwrap_or_default();
-    let lock = workspace_lockfile::active_lockfile_content(project_dir);
     let file_link_bytes = crate::install_state::collect_file_link_manifest_bytes(project_dir, &pkg);
     let platform = lpm_store::v2::PlatformTuple::current();
     let hash = crate::install_state::compute_install_hash_v10(
         &pkg,
-        &lock,
+        &lock.content,
         &file_link_bytes,
         linker_mode,
         object_integrity_policy,
@@ -64,6 +65,7 @@ fn write_post_install_hash_with_context(
         &platform,
         dependency_engine_key,
         crate::install_state::KnownInstallHashRuntimeState {
+            lockfile_path: &lock.path,
             node_runtime_fingerprint,
             // Successful installs use the TOML-only exact-instance schema.
             // Frozen installs can preserve an obsolete companion on disk.
@@ -147,6 +149,7 @@ pub(super) fn refresh_post_install_hash_after_manifest_finalize(
         security_analysis_policy,
         dependency_engine_key,
         node_runtime_fingerprint,
+        &workspace_lockfile::active_lockfile_snapshot(project_dir),
     )
     .map_err(|e| {
         LpmError::Registry(format!(
@@ -216,6 +219,23 @@ fn validated_lockfile_deps_for_freshness<'a>(
 pub(super) async fn run_install_freshness_phase(
     input: InstallFreshnessInput<'_>,
 ) -> Result<InstallFreshnessResult, LpmError> {
+    let cleanup_catalogs_in_pipeline = input.requested_add_count.is_none();
+    if input.force
+        || root_versions::active(input.project_dir)
+        || input.offline
+        || !input.omit_policy.is_default()
+        || input.strict_peer_dependencies
+        || workspace_resolution::root_provider_snapshot_required()
+        || !input.project_dir.join("node_modules").exists()
+        || !input.project_dir.join(".lpm/install-hash").exists()
+    {
+        // This caller only needs freshness; the general checker also computes a hash for dev.
+        return Ok(InstallFreshnessResult {
+            setup_install_state_ms: 0,
+            cleanup_catalogs_in_pipeline,
+            completed: false,
+        });
+    }
     let pkg_content_for_state = lpm_common::read_text_file_capped(
         input.pkg_json_path,
         lpm_common::CONFIG_FILE_SIZE_CAP_BYTES,
@@ -244,16 +264,7 @@ pub(super) async fn run_install_freshness_phase(
             input.project_dir,
             input.compatibility_bin_names,
         );
-    let cleanup_catalogs_in_pipeline = input.requested_add_count.is_none();
-    let fast_path_base_eligible = !input.force
-        && !root_versions::active(input.project_dir)
-        && !input.offline
-        && input.omit_policy.is_default()
-        && !input.strict_peer_dependencies
-        && install_state.up_to_date
-        && compatibility_bins_ready
-        // Coordinated members need the root's graph even when its files are fresh.
-        && !workspace_resolution::root_provider_snapshot_required();
+    let fast_path_base_eligible = install_state.up_to_date && compatibility_bins_ready;
     let fast_path_packages = if fast_path_base_eligible {
         let gate_stats = GateStats::default();
         let workspace = crate::workspace_discovery_cache::active_workspace(input.project_dir);

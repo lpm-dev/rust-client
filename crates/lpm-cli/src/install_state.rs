@@ -1361,6 +1361,7 @@ pub(crate) fn write_install_hash_with_integrity_platform_and_dependency_engine(
         platform,
         dependency_engine_key,
         InstallHashWriteMetadata {
+            lockfile_path: None,
             node_runtime_fingerprint,
             binary_sidecar_expectation,
             security_analysis_policy:
@@ -1370,6 +1371,7 @@ pub(crate) fn write_install_hash_with_integrity_platform_and_dependency_engine(
 }
 
 pub(crate) struct KnownInstallHashRuntimeState<'a> {
+    pub(crate) lockfile_path: &'a Path,
     pub(crate) node_runtime_fingerprint: Option<&'a str>,
     pub(crate) binary_sidecar_required: bool,
     pub(crate) security_analysis_policy: SecurityAnalysisPolicy,
@@ -1397,6 +1399,7 @@ pub(crate) fn write_install_hash_with_known_runtime_state(
         platform,
         dependency_engine_key,
         InstallHashWriteMetadata {
+            lockfile_path: Some(runtime_state.lockfile_path),
             node_runtime_fingerprint: runtime_state.node_runtime_fingerprint,
             binary_sidecar_expectation: Some(expectation),
             security_analysis_policy: runtime_state.security_analysis_policy,
@@ -1405,6 +1408,7 @@ pub(crate) fn write_install_hash_with_known_runtime_state(
 }
 
 struct InstallHashWriteMetadata<'a> {
+    lockfile_path: Option<&'a Path>,
     node_runtime_fingerprint: Option<&'a str>,
     binary_sidecar_expectation: Option<BinarySidecarExpectation>,
     security_analysis_policy: SecurityAnalysisPolicy,
@@ -1429,9 +1433,15 @@ fn write_install_hash_with_metadata(
         ));
     }
     let pkg_ns = mtime_ns(&project_dir.join("package.json")).unwrap_or(0);
-    let lock_ns =
-        mtime_ns(&crate::commands::install::workspace_lockfile::active_lockfile_path(project_dir))
-            .unwrap_or(0);
+    let lock_path = metadata.lockfile_path.map_or_else(
+        || {
+            std::borrow::Cow::Owned(
+                crate::commands::install::workspace_lockfile::active_lockfile_path(project_dir),
+            )
+        },
+        std::borrow::Cow::Borrowed,
+    );
+    let lock_ns = mtime_ns(&lock_path).unwrap_or(0);
 
     let hash_dir = project_dir.join(".lpm");
     std::fs::create_dir_all(&hash_dir)?;

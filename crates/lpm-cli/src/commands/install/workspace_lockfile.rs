@@ -1084,6 +1084,40 @@ pub(crate) fn active_lockfile_content(project_dir: &Path) -> Arc<str> {
         })
 }
 
+pub(super) struct ActiveLockfileSnapshot {
+    pub(super) path: PathBuf,
+    pub(super) content: Arc<str>,
+}
+
+pub(super) fn active_lockfile_snapshot(project_dir: &Path) -> ActiveLockfileSnapshot {
+    if let Ok(snapshot) = ACTIVE_TARGET.try_with(|target| ActiveLockfileSnapshot {
+        path: target.coordinator.root.join(lpm_lockfile::LOCKFILE_NAME),
+        content: target
+            .coordinator
+            .projection_content(&target.importer)
+            .unwrap_or_default(),
+    }) {
+        return snapshot;
+    }
+    let transaction_path = ACTIVE_TRANSACTION
+        .try_with(|transaction| transaction.root.join(lpm_lockfile::LOCKFILE_NAME))
+        .ok();
+    let project = lpm_lockfile::Lockfile::read_for_project(project_dir);
+    let path = transaction_path.unwrap_or_else(|| {
+        project.as_ref().map_or_else(
+            |_| project_dir.join(lpm_lockfile::LOCKFILE_NAME),
+            |project| project.path.clone(),
+        )
+    });
+    let content = project
+        .and_then(|project| project.lockfile.to_toml())
+        .unwrap_or_default();
+    ActiveLockfileSnapshot {
+        path,
+        content: Arc::from(content),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1152,6 +1186,152 @@ mod tests {
         let coordinator =
             WorkspaceLockfileCoordinator::new(directory.path(), &[]).expect("load workspace union");
         (directory, coordinator)
+    }
+
+    #[test]
+    fn lockfile_snapshot_refreshes_standalone_content_after_rewrite() {
+        let (directory, _coordinator) = coordinator_with_existing_projection();
+        let first = active_lockfile_snapshot(directory.path());
+        let mut replacement = lpm_lockfile::Lockfile::new();
+        add_exact_root(
+            &mut replacement,
+            "replacement",
+            "2.0.0",
+            exact_package("replacement", "2.0.0", "root/replacement"),
+        );
+        replacement.write_to_file(&first.path).unwrap();
+
+        let next = active_lockfile_snapshot(directory.path());
+        assert_eq!(next.path, first.path);
+        assert_ne!(next.content, first.content);
+        assert_eq!(
+            lpm_lockfile::Lockfile::from_toml(&next.content)
+                .unwrap()
+                .packages[0]
+                .name,
+            "replacement"
+        );
+    }
+
+    #[tokio::test]
+    async fn lockfile_snapshot_uses_staged_workspace_projection_and_root_path() {
+        let (directory, coordinator) = coordinator_with_existing_projection();
+        let mut staged = lpm_lockfile::Lockfile::new();
+        add_exact_root(
+            &mut staged,
+            "replacement",
+            "2.0.0",
+            exact_package("replacement", "2.0.0", "root/replacement"),
+        );
+        coordinator.stage(".", staged.clone());
+        let snapshot = scope(Arc::new(coordinator), Arc::from("."), async {
+            active_lockfile_snapshot(&directory.path().join("member"))
+        })
+        .await;
+
+        assert_eq!(
+            snapshot.path,
+            directory.path().join(lpm_lockfile::LOCKFILE_NAME)
+        );
+        assert_eq!(
+            lpm_lockfile::Lockfile::from_toml(&snapshot.content).unwrap(),
+            staged
+        );
+    }
+
+    #[tokio::test]
+    async fn lockfile_snapshot_uses_transaction_path_with_fresh_project_content() {
+        let (directory, _) = coordinator_with_existing_projection();
+        let (transaction_root, coordinator) = coordinator_with_existing_projection();
+        let expected = active_lockfile_content(directory.path());
+        let snapshot = ACTIVE_TRANSACTION
+            .scope(
+                WorkspaceLockfileTransaction {
+                    root: transaction_root.path().to_path_buf(),
+                    coordinator: Arc::new(coordinator),
+                    manifest_transactions: Mutex::new(Vec::new()),
+                },
+                async { active_lockfile_snapshot(directory.path()) },
+            )
+            .await;
+        assert_eq!(snapshot.content, expected);
+        assert_eq!(
+            snapshot.path,
+            transaction_root.path().join(lpm_lockfile::LOCKFILE_NAME)
+        );
+    }
+
+    #[tokio::test]
+    async fn lockfile_snapshot_target_takes_precedence_over_transaction() {
+        let (target_root, target) = coordinator_with_existing_projection();
+        let (transaction_root, transaction) = coordinator_with_existing_projection();
+        let snapshot = ACTIVE_TRANSACTION
+            .scope(
+                WorkspaceLockfileTransaction {
+                    root: transaction_root.path().to_path_buf(),
+                    coordinator: Arc::new(transaction),
+                    manifest_transactions: Mutex::new(Vec::new()),
+                },
+                scope(Arc::new(target), Arc::from("."), async {
+                    active_lockfile_snapshot(transaction_root.path())
+                }),
+            )
+            .await;
+        assert_eq!(
+            snapshot.path,
+            target_root.path().join(lpm_lockfile::LOCKFILE_NAME)
+        );
+        assert_eq!(
+            snapshot.content,
+            active_lockfile_content(target_root.path())
+        );
+    }
+
+    #[test]
+    fn lockfile_snapshot_uses_owning_workspace_path_and_member_projection() {
+        let directory = tempfile::tempdir().unwrap();
+        let member = directory.path().join("packages/app");
+        std::fs::create_dir_all(&member).unwrap();
+        let mut projection = lpm_lockfile::Lockfile::new();
+        add_exact_root(
+            &mut projection,
+            "member-dep",
+            "1.0.0",
+            exact_package("member-dep", "1.0.0", "root/member-dep"),
+        );
+        let mut union = lpm_lockfile::Lockfile::new();
+        union
+            .absorb_importer("packages/app", projection.clone())
+            .unwrap();
+        let path = directory.path().join(lpm_lockfile::LOCKFILE_NAME);
+        union.write_to_file(&path).unwrap();
+        let snapshot = active_lockfile_snapshot(&member);
+        assert_eq!(snapshot.path, path);
+        assert_eq!(
+            lpm_lockfile::Lockfile::from_toml(&snapshot.content).unwrap(),
+            projection
+        );
+    }
+
+    #[test]
+    fn lockfile_snapshot_missing_lock_uses_empty_content_and_project_path() {
+        let directory = tempfile::tempdir().unwrap();
+        let snapshot = active_lockfile_snapshot(directory.path());
+        assert!(snapshot.content.is_empty());
+        assert_eq!(
+            snapshot.path,
+            directory.path().join(lpm_lockfile::LOCKFILE_NAME)
+        );
+    }
+
+    #[test]
+    fn lockfile_snapshot_malformed_lock_uses_empty_content_and_project_path() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join(lpm_lockfile::LOCKFILE_NAME);
+        std::fs::write(&path, "invalid = [").unwrap();
+        let snapshot = active_lockfile_snapshot(directory.path());
+        assert!(snapshot.content.is_empty());
+        assert_eq!(snapshot.path, path);
     }
 
     #[test]
