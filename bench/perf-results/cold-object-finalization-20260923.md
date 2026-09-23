@@ -190,7 +190,7 @@ It also tracks four trust controls identified during the Nest replay design revi
 The latter failed its regression before the fix. Every freeze and phase transition now requires a successful response before an install starts.
 All six Nest proxy tests pass. Daybreak's final review confirms all four trust controls and the control-response fix.
 
-Finding totals: 11 received, 11 verified and fixed, 0 rejected, 0 externally blocked, and 0 pending.
+Finding totals: 12 received, 12 verified and fixed, 0 rejected, 0 externally blocked, and 0 pending.
 
 ## Stack and reproduction
 
@@ -216,3 +216,26 @@ The ephemeral CA private keys were removed after each run. The parent process an
 
 The adjacent `-rows.jsonl`, `-summary.json`, `-provenance.json`, and `-ledger.json` files retain compact evidence for review.
 They include all 1,800 scored rows, including the failed Bun sample. Raw source-file hashes identify the complete local artifacts.
+
+## Replay capacity correction
+
+A later T3 investigation reproduced a transport defect in this Node replay harness.
+Node counts queued response data against its default 10 MB HTTP/2 session budget.
+A large tarball can exhaust that budget and reject a metadata stream before the request handler sees it.
+Thus, zero handler rejections or missing fixtures cannot prove that every transport request succeeded.
+
+The regression test pauses a 12 MiB tarball and requests a small document on the same session.
+The original configuration fails with `NGHTTP2_ENHANCE_YOUR_CALM`.
+The corrected configuration permits the small response before the large stream resumes.
+The test also checks both response bodies and zero upstream requests.
+
+The proxy now permits 1024 MB of session credit and 256 concurrent streams.
+This credit limit does not allocate that memory in advance.
+All seven proxy tests pass, and the lint job includes them.
+Commit `d5e5ee5bb` contains this correction.
+The production LPM binary does not change.
+
+The original cohorts remain intact.
+The later T3 cohorts with artificial retry backoffs are excluded from optimization claims.
+New T3 replay diagnostics require zero backoffs as well as input and output parity.
+The child-lookahead report records the corrected comparisons and their limits.

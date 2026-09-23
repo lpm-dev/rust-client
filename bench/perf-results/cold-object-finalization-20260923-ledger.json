@@ -132,6 +132,18 @@
       "coverage": "runner stops when registry control rejects fixture validation",
       "commit": "fe6e6bb655c1f740537301d1f938be0fd7883e97",
       "pr_status": "Resolved in the cold-object-finalization concept branch; see its pull request for current CI status."
+    },
+    {
+      "id": "PROXY-6",
+      "source": "cache_correctness_review and primary",
+      "category": "Correctness",
+      "location": "bench/scripts/cold-object-finalization-replay/replay-proxy.mjs: HTTP/2 session configuration",
+      "claim": "A queued large tarball exhausts default Node session credit and rejects concurrent metadata streams before the request handler sees them.",
+      "evidence": "A paused12MiB tarball makes the concurrent small GET fail with NGHTTP2_ENHANCE_YOUR_CALM under the original default. The same test succeeds after the capacity correction and verifies both response bodies. This reproduces artificial backoffs observed in a later T3 replay.",
+      "disposition": "Verified",
+      "coverage": "queued large tarball does not reject a concurrent metadata stream; all7 proxy tests; CI lint helper gate",
+      "commit": "d5e5ee5bb",
+      "pr_status": "Resolved on PR875, which introduced the replay harness. Downstream stack CI must use rebased heads."
     }
   ],
   "reviews": [
@@ -179,8 +191,8 @@
     }
   ],
   "totals": {
-    "received": 11,
-    "verified_and_fixed": 11,
+    "received": 12,
+    "verified_and_fixed": 12,
     "rejected": 0,
     "externally_blocked": 0,
     "pending": 0
