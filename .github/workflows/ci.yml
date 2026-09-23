@@ -456,6 +456,41 @@ jobs:
       - name: Audit-scale workflow fixtures
         run: cargo nextest run --locked -P audit -p lpm-workflows --test install_realworld --run-ignored only --no-fail-fast --status-level slow --final-status-level fail
 
+  osv-live:
+    name: Live OSV API contracts
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    if: github.event_name == 'workflow_dispatch' || github.event_name == 'schedule'
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+
+      - name: Cache cargo
+        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-osv-live-${{ env.RUST_TOOLCHAIN }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-osv-live-${{ env.RUST_TOOLCHAIN }}-
+
+      - name: Install Linux keyring build deps
+        run: bash scripts/ci/install-apt-packages.sh pkg-config libdbus-1-dev
+
+      - name: Install nextest
+        uses: taiki-e/install-action@9c6953334daacc48e55a35db9a19c771f79ffa9d # nextest
+
+      - name: Build CLI
+        run: cargo build --locked -p lpm-cli --bin lpm-rs
+
+      - name: Verify production OSV batch queries and advisory hydration
+        run: cargo nextest run --locked -p lpm-workflows --test osv_live --run-ignored only --no-fail-fast --status-level slow --final-status-level fail
+
   fuzz-smoke:
     name: Fuzz smoke
     runs-on: ubuntu-latest

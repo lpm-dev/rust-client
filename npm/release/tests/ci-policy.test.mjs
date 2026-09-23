@@ -6,6 +6,17 @@ import { fileURLToPath } from "node:url";
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../../..");
 
+test("live OSV contracts run separately on scheduled and manual CI", () => {
+  const workflow = fs.readFileSync(path.join(repoRoot, ".github/workflows/ci.yml"), "utf8")
+    .replaceAll("\r\n", "\n");
+  const job = workflow.match(/^  osv-live:\n([\s\S]*?)(?=^  [a-z][\w-]*:)/m)?.[1];
+  assert.ok(job, "missing separate live OSV job");
+  assert.match(job, /if: github\.event_name == 'workflow_dispatch' \|\| github\.event_name == 'schedule'/);
+  assert.match(job, /cargo build --locked -p lpm-cli --bin lpm-rs/);
+  assert.match(job, /cargo nextest run --locked -p lpm-workflows --test osv_live --run-ignored only/);
+  assert.doesNotMatch(job, /continue-on-error|LPM_OSV_URL/);
+});
+
 test("CI runs for pull requests targeting main and native stack branches", () => {
   const workflow = fs
     .readFileSync(path.join(repoRoot, ".github/workflows/ci.yml"), "utf8")

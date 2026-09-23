@@ -1168,6 +1168,47 @@ async fn audit_osv_outage_exits_nonzero_without_clean_summary() {
 }
 
 #[tokio::test]
+async fn audit_osv_timeout_reports_an_incomplete_scan() {
+    let project = TempProject::empty(
+        r#"{"name":"osv-timeout","version":"1.0.0","dependencies":{"clean-pkg":"1.0.0"}}"#,
+    );
+    project.write_file(
+        "node_modules/clean-pkg/package.json",
+        r#"{"name":"clean-pkg","version":"1.0.0","license":"MIT"}"#,
+    );
+    project.write_file("node_modules/clean-pkg/index.js", "module.exports = {};\n");
+    let mock = MockRegistry::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/querybatch"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(serde_json::json!({"results": [{"vulns": []}]}))
+                .set_delay(std::time::Duration::from_secs(11)),
+        )
+        .expect(1)
+        .mount(mock.server())
+        .await;
+
+    let output = lpm_with_registry(&project, &mock.url())
+        .env("LPM_OSV_URL", format!("{}/v1/querybatch", mock.url()))
+        .args(["--json", "audit", "--fail-on", "vuln"])
+        .timeout(std::time::Duration::from_secs(30))
+        .output()
+        .expect("run audit with a delayed OSV response");
+
+    assert_eq!(output.status.code(), Some(1));
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["success"], false, "{report}");
+    assert_eq!(report["osv_degraded"], true, "{report}");
+    assert!(
+        report["osv_degraded_reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("OSV API error:")),
+        "a timeout must not become a clean vulnerability scan: {report}",
+    );
+}
+
+#[tokio::test]
 async fn audit_rejects_osv_batch_response_with_missing_result_slots() {
     let project = TempProject::empty(
         r#"{"name":"osv-cardinality","version":"1.0.0","dependencies":{"clean-pkg":"1.0.0"}}"#,
