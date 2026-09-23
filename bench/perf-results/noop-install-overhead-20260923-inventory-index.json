@@ -1,0 +1,82 @@
+[
+  {
+    "cohort": "overlap-100",
+    "state": "up-to-date",
+    "variants": [
+      "candidate",
+      "baseline",
+      "bun"
+    ],
+    "checked": 300,
+    "package_count": 95,
+    "lockfile_sha256": "1b56a6dbefcc8674099aba70690532b1bc8b4798909fc1e5e89d4a2732b95457",
+    "inventory_sha256": "3ff9dc1e8ecdd94810ccbe6ac3f2f8b00e60233a536abee571d42254ad6eaa90"
+  },
+  {
+    "cohort": "overlap-100",
+    "state": "installed-cache-gone",
+    "variants": [
+      "candidate",
+      "baseline",
+      "bun"
+    ],
+    "checked": 300,
+    "package_count": 95,
+    "lockfile_sha256": "1b56a6dbefcc8674099aba70690532b1bc8b4798909fc1e5e89d4a2732b95457",
+    "inventory_sha256": "3ff9dc1e8ecdd94810ccbe6ac3f2f8b00e60233a536abee571d42254ad6eaa90"
+  },
+  {
+    "cohort": "path-reuse-100",
+    "state": "up-to-date",
+    "variants": [
+      "candidate",
+      "baseline",
+      "bun"
+    ],
+    "checked": 300,
+    "package_count": 95,
+    "lockfile_sha256": "1b56a6dbefcc8674099aba70690532b1bc8b4798909fc1e5e89d4a2732b95457",
+    "inventory_sha256": "3ff9dc1e8ecdd94810ccbe6ac3f2f8b00e60233a536abee571d42254ad6eaa90"
+  },
+  {
+    "cohort": "path-reuse-100",
+    "state": "installed-cache-gone",
+    "variants": [
+      "candidate",
+      "baseline",
+      "bun"
+    ],
+    "checked": 300,
+    "package_count": 95,
+    "lockfile_sha256": "1b56a6dbefcc8674099aba70690532b1bc8b4798909fc1e5e89d4a2732b95457",
+    "inventory_sha256": "3ff9dc1e8ecdd94810ccbe6ac3f2f8b00e60233a536abee571d42254ad6eaa90"
+  },
+  {
+    "cohort": "path-reuse-confirm-100",
+    "state": "up-to-date",
+    "variants": [
+      "candidate",
+      "baseline",
+      "bun",
+      "overlap"
+    ],
+    "checked": 400,
+    "package_count": 95,
+    "lockfile_sha256": "1b56a6dbefcc8674099aba70690532b1bc8b4798909fc1e5e89d4a2732b95457",
+    "inventory_sha256": "3ff9dc1e8ecdd94810ccbe6ac3f2f8b00e60233a536abee571d42254ad6eaa90"
+  },
+  {
+    "cohort": "path-reuse-confirm-100",
+    "state": "installed-cache-gone",
+    "variants": [
+      "candidate",
+      "baseline",
+      "bun",
+      "overlap"
+    ],
+    "checked": 400,
+    "package_count": 95,
+    "lockfile_sha256": "1b56a6dbefcc8674099aba70690532b1bc8b4798909fc1e5e89d4a2732b95457",
+    "inventory_sha256": "3ff9dc1e8ecdd94810ccbe6ac3f2f8b00e60233a536abee571d42254ad6eaa90"
+  }
+]

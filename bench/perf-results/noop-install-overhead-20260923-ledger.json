@@ -1,0 +1,26 @@
+[
+  {
+    "id": "NOOP-1",
+    "source": "Primary",
+    "category": "performance",
+    "location": "crates/lpm-cli/src/commands/install/state.rs;crates/lpm-cli/src/engine_check.rs",
+    "claim": "Live runtime probing serializes with lockfile replay.",
+    "evidence": "The overlap-only binary improves both no-op medians by 2 ms in two 100-sample cohorts. Live shim checks remain required.",
+    "disposition": "Verified",
+    "coverage": "unchanged_install_probes_once_and_rejects_changed_shim_output;engine_free_installs_do_not_execute_node;install workflow gates",
+    "commit": "d89d9ed1a",
+    "pr_status": "Unpublished"
+  },
+  {
+    "id": "NOOP-2",
+    "source": "Primary",
+    "category": "performance",
+    "location": "crates/lpm-cli/src/install_state.rs",
+    "claim": "Sidecar validation repeats authoritative lockfile path selection and parsing.",
+    "evidence": "Both freshness branches already selected the path. Adding path reuse improves medians by 1\u20132 ms over overlap alone in the same 100-sample confirmation.",
+    "disposition": "Verified",
+    "coverage": "67 install-state unit tests; workspace and install workflows",
+    "commit": "d89d9ed1a",
+    "pr_status": "Unpublished"
+  }
+]
