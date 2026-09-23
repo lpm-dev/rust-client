@@ -1,0 +1,128 @@
+{
+  "t3": {
+    "inventories": {
+      "baseline": [
+        "3ff9dc1e8ecdd94810ccbe6ac3f2f8b00e60233a536abee571d42254ad6eaa90"
+      ],
+      "candidate": [
+        "3ff9dc1e8ecdd94810ccbe6ac3f2f8b00e60233a536abee571d42254ad6eaa90"
+      ],
+      "bun": [
+        "3ff9dc1e8ecdd94810ccbe6ac3f2f8b00e60233a536abee571d42254ad6eaa90"
+      ]
+    },
+    "lockfiles": {
+      "baseline": [
+        "1b56a6dbefcc8674099aba70690532b1bc8b4798909fc1e5e89d4a2732b95457"
+      ],
+      "candidate": [
+        "1b56a6dbefcc8674099aba70690532b1bc8b4798909fc1e5e89d4a2732b95457"
+      ]
+    }
+  },
+  "vite-react": {
+    "inventories": {
+      "baseline": [
+        "139f51d27287c25b0718e4eb3d8b7dd6840c1965ea6b8966cf7db42779597485"
+      ],
+      "candidate": [
+        "139f51d27287c25b0718e4eb3d8b7dd6840c1965ea6b8966cf7db42779597485"
+      ],
+      "bun": [
+        "139f51d27287c25b0718e4eb3d8b7dd6840c1965ea6b8966cf7db42779597485"
+      ]
+    },
+    "lockfiles": {
+      "baseline": [
+        "e8618962f392f169f55b89ac23b9b60975e796ec9a5a9da8d667e23780c58fae"
+      ],
+      "candidate": [
+        "e8618962f392f169f55b89ac23b9b60975e796ec9a5a9da8d667e23780c58fae"
+      ]
+    }
+  },
+  "native-sharp": {
+    "inventories": {
+      "baseline": [
+        "aab74198bfcf01972dcdc7374eef3027f5a0ca9f5d6075437d39556a532b15ec"
+      ],
+      "candidate": [
+        "aab74198bfcf01972dcdc7374eef3027f5a0ca9f5d6075437d39556a532b15ec"
+      ],
+      "bun": [
+        "aab74198bfcf01972dcdc7374eef3027f5a0ca9f5d6075437d39556a532b15ec"
+      ]
+    },
+    "lockfiles": {
+      "baseline": [
+        "a3443f79de995ae4137e83bc8f75214e8edc0e77bcf37590256736df00b5c94a"
+      ],
+      "candidate": [
+        "a3443f79de995ae4137e83bc8f75214e8edc0e77bcf37590256736df00b5c94a"
+      ]
+    }
+  },
+  "nest": {
+    "inventories": {
+      "baseline": [
+        "d50abd2e876680c4b7ce73ec07718d2fb8f2016b190846d21863e4b746fd5656"
+      ],
+      "candidate": [
+        "d50abd2e876680c4b7ce73ec07718d2fb8f2016b190846d21863e4b746fd5656"
+      ],
+      "bun": [
+        "d50abd2e876680c4b7ce73ec07718d2fb8f2016b190846d21863e4b746fd5656"
+      ]
+    },
+    "lockfiles": {
+      "baseline": [
+        "e4301fb934532e0b80b60069b72797b7332831b5e38202f55f21d1b719d4126c"
+      ],
+      "candidate": [
+        "e4301fb934532e0b80b60069b72797b7332831b5e38202f55f21d1b719d4126c"
+      ]
+    }
+  },
+  "confirm-t3": {
+    "inventories": {
+      "baseline": [
+        "ac99f5a535a4cb5665a8a5bff3f3969580c8ffb5d7af50a4910459d7f619072a"
+      ],
+      "candidate": [
+        "ac99f5a535a4cb5665a8a5bff3f3969580c8ffb5d7af50a4910459d7f619072a"
+      ],
+      "bun": [
+        "ac99f5a535a4cb5665a8a5bff3f3969580c8ffb5d7af50a4910459d7f619072a"
+      ]
+    },
+    "lockfiles": {
+      "baseline": [
+        "1b56a6dbefcc8674099aba70690532b1bc8b4798909fc1e5e89d4a2732b95457"
+      ],
+      "candidate": [
+        "1b56a6dbefcc8674099aba70690532b1bc8b4798909fc1e5e89d4a2732b95457"
+      ]
+    }
+  },
+  "confirm-native-sharp": {
+    "inventories": {
+      "baseline": [
+        "adbf30aca830e5286da24100389a2756ecaf1868293407a8eaff445c1592b520"
+      ],
+      "candidate": [
+        "adbf30aca830e5286da24100389a2756ecaf1868293407a8eaff445c1592b520"
+      ],
+      "bun": [
+        "adbf30aca830e5286da24100389a2756ecaf1868293407a8eaff445c1592b520"
+      ]
+    },
+    "lockfiles": {
+      "baseline": [
+        "a3443f79de995ae4137e83bc8f75214e8edc0e77bcf37590256736df00b5c94a"
+      ],
+      "candidate": [
+        "a3443f79de995ae4137e83bc8f75214e8edc0e77bcf37590256736df00b5c94a"
+      ]
+    }
+  }
+}

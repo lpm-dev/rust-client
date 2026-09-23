@@ -1,0 +1,49 @@
+{
+  "concept": "Resolver cache allocation",
+  "parent_pr": 873,
+  "native_stack": 863,
+  "dependency": "Uses the preferred-metadata API from earlier stack members. Placement after the independent no-op concept follows the requested cumulative stack.",
+  "totals": {
+    "received": 1,
+    "verified_and_fixed": 1,
+    "rejected": 0,
+    "externally_blocked": 0,
+    "pending": 0
+  },
+  "findings": [
+    {
+      "id": "CACHE-ALLOC-1",
+      "source": "Primary",
+      "category": "Performance",
+      "location": [
+        "crates/lpm-registry/src/client/metadata/preferred.rs",
+        "crates/lpm-registry/src/types/version_metadata.rs",
+        "crates/lpm-resolver/src/greedy/manifest.rs"
+      ],
+      "claim": "Fresh metadata cache reads allocate development dependencies discarded by resolver projection.",
+      "evidence": "Production-decoder micro: 38.564 to 24.608 ms, 64.773 to 33.016 MiB. Two 100-sample T3 install cohorts save 7.5\u20138.5 ms and 24\u201326 MiB.",
+      "disposition": "Verified",
+      "coverage": [
+        "resolver_cache_projection_omits_only_development_dependencies",
+        "resolver_cache_reads_preserve_complete_metadata_for_other_consumers",
+        "resolver_cache_revalidation_keeps_development_dependencies_in_persisted_records",
+        "resolver_cache_refetches_truncated_or_mismatched_records",
+        "Four-fixture warm-cache benchmarks and cold controls"
+      ],
+      "commit": "6009247f8",
+      "pr_status": "Ready for review in native stack #863"
+    }
+  ],
+  "reviews": [
+    {
+      "source": "cache_correctness_review",
+      "findings": 0,
+      "scope": "Final metadata source, projection, fallbacks, corrupted caches and 304 persistence"
+    },
+    {
+      "source": "cache_trust_review",
+      "findings": 0,
+      "scope": "Metadata trust fields, full consumer behavior and cache persistence"
+    }
+  ]
+}
