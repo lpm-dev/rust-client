@@ -269,6 +269,18 @@ fn hash_object_tree_dir(
     stats: Option<&mut ObjectTreeStats>,
 ) -> Result<(), LpmError> {
     let mut relative = Vec::new();
+    let mut bulk_buffer = if cfg!(target_os = "macos")
+        && matches!(
+            content_hasher.as_deref(),
+            Some(TreeContentHasher::EntryDigest {
+                source: EntryDigestSource::Extraction(_),
+                ..
+            })
+        ) {
+        vec![0; 64 * 1024]
+    } else {
+        Vec::new()
+    };
     hash_object_tree_dir_inner(
         root,
         dir,
@@ -276,17 +288,11 @@ fn hash_object_tree_dir(
         content_hasher,
         metadata_hasher,
         stats,
+        &mut bulk_buffer,
     )
 }
 
-fn hash_object_tree_dir_inner(
-    root: &Path,
-    dir: &Path,
-    relative: &mut Vec<u8>,
-    mut content_hasher: Option<&mut TreeContentHasher<'_>>,
-    metadata_hasher: &mut Sha256,
-    mut stats: Option<&mut ObjectTreeStats>,
-) -> Result<(), LpmError> {
+fn read_object_tree_entries(root: &Path, dir: &Path) -> Result<Vec<ObjectTreeEntry>, LpmError> {
     let mut entries = Vec::new();
     // Unix DirEntry values keep the directory handle alive; store owned names
     // before recursing so deep warm-cache validation stays below RLIMIT_NOFILE.
@@ -311,29 +317,87 @@ fn hash_object_tree_dir_inner(
                 dir.join(&file_name).display()
             ))
         })?;
-        entries.push(ObjectTreeEntry {
-            file_name,
-            metadata,
-        });
+        entries.push(ObjectTreeEntry::from_metadata(file_name, &metadata));
     }
-    entries.sort_by(|a, b| a.file_name.cmp(&b.file_name));
+    entries.sort_by(|a, b| a.name.cmp(&b.name));
+
+    Ok(entries)
+}
+
+#[cfg(all(test, target_os = "macos"))]
+thread_local! {
+    static BULK_FINALIZATION_DIRECTORIES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+fn read_object_tree_entries_for_walk(
+    root: &Path,
+    dir: &Path,
+    bulk_buffer: &mut Vec<u8>,
+) -> Result<Vec<ObjectTreeEntry>, LpmError> {
+    #[cfg(target_os = "macos")]
+    if !bulk_buffer.is_empty() {
+        match read_bulk_metadata_entries(dir, bulk_buffer) {
+            Ok(mut entries) => {
+                entries.retain(|entry| !is_object_metadata_sidecar_name(root, dir, &entry.name));
+                for entry in &mut entries {
+                    if entry.kind == ObjectTreeEntryKind::Symlink {
+                        refresh_bulk_symlink_metadata(dir, entry)?;
+                    }
+                }
+                #[cfg(test)]
+                BULK_FINALIZATION_DIRECTORIES.with(|count| count.set(count.get() + 1));
+                return Ok(entries);
+            }
+            Err(error) => {
+                bulk_buffer.clear();
+                tracing::trace!(target = %dir.display(), "bulk metadata unavailable for object finalization: {error}");
+            }
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    let _ = bulk_buffer;
+    read_object_tree_entries(root, dir)
+}
+
+#[cfg(target_os = "macos")]
+fn refresh_bulk_symlink_metadata(dir: &Path, entry: &mut ObjectTreeEntry) -> Result<(), LpmError> {
+    let path = dir.join(&entry.name);
+    let metadata = std::fs::symlink_metadata(&path).map_err(|error| {
+        LpmError::Store(format!(
+            "failed to stat virtual-store object tree entry {}: {error}",
+            path.display()
+        ))
+    })?;
+    *entry = ObjectTreeEntry::from_metadata(std::mem::take(&mut entry.name), &metadata);
+    Ok(())
+}
+
+fn hash_object_tree_dir_inner(
+    root: &Path,
+    dir: &Path,
+    relative: &mut Vec<u8>,
+    mut content_hasher: Option<&mut TreeContentHasher<'_>>,
+    metadata_hasher: &mut Sha256,
+    mut stats: Option<&mut ObjectTreeStats>,
+    bulk_buffer: &mut Vec<u8>,
+) -> Result<(), LpmError> {
+    let entries = read_object_tree_entries_for_walk(root, dir, bulk_buffer)?;
 
     let mut path = dir.to_path_buf();
     for entry in entries {
-        let entry_name = entry.file_name;
+        let entry_name = &entry.name;
         let relative_len = relative.len();
         if relative_len != 0 {
             relative.push(b'/');
         }
-        push_os_str_bytes(relative, &entry_name);
-        let metadata = entry.metadata;
-        let file_type = metadata.file_type();
+        push_os_str_bytes(relative, entry_name);
+        let metadata = &entry;
         let mut path_pushed = false;
-        let result = if is_symlink_or_junction(&metadata) {
+        let result = if metadata.kind == ObjectTreeEntryKind::Symlink {
             if let Some(stats) = stats.as_deref_mut() {
                 stats.symlink_count = stats.symlink_count.saturating_add(1);
             }
-            path.push(&entry_name);
+            path.push(entry_name);
             path_pushed = true;
             let target = std::fs::read_link(&path).map_err(|e| {
                 LpmError::Store(format!(
@@ -344,26 +408,26 @@ fn hash_object_tree_dir_inner(
             let mut target_bytes = Vec::new();
             push_os_str_bytes(&mut target_bytes, target.as_os_str());
             if let Some(hasher) = content_hasher.as_deref_mut() {
-                hasher.hash_symlink(relative.as_slice(), &metadata, &target_bytes);
+                hasher.hash_symlink(relative.as_slice(), metadata, &target_bytes);
             }
             hash_tree_metadata_record(
                 metadata_hasher,
                 b"symlink",
                 relative.as_slice(),
-                &metadata,
+                metadata,
                 &target_bytes,
             );
             Ok(())
-        } else if file_type.is_dir() {
+        } else if metadata.kind == ObjectTreeEntryKind::Directory {
             if let Some(stats) = stats.as_deref_mut() {
                 stats.dir_count = stats.dir_count.saturating_add(1);
             }
-            path.push(&entry_name);
+            path.push(entry_name);
             path_pushed = true;
             if let Some(hasher) = content_hasher.as_deref_mut() {
-                hasher.hash_directory(relative.as_slice(), &metadata);
+                hasher.hash_directory(relative.as_slice(), metadata);
             }
-            hash_tree_metadata_record(metadata_hasher, b"dir", relative.as_slice(), &metadata, &[]);
+            hash_tree_metadata_record(metadata_hasher, b"dir", relative.as_slice(), metadata, &[]);
             hash_object_tree_dir_inner(
                 root,
                 &path,
@@ -371,21 +435,16 @@ fn hash_object_tree_dir_inner(
                 content_hasher.as_deref_mut(),
                 metadata_hasher,
                 stats.as_deref_mut(),
+                bulk_buffer,
             )
-        } else if file_type.is_file() {
+        } else if metadata.kind == ObjectTreeEntryKind::File {
             if let Some(stats) = stats.as_deref_mut() {
                 stats.file_count = stats.file_count.saturating_add(1);
-                stats.unpacked_bytes = stats.unpacked_bytes.saturating_add(metadata.len());
+                stats.unpacked_bytes = stats.unpacked_bytes.saturating_add(metadata.len);
             }
-            hash_tree_metadata_record(
-                metadata_hasher,
-                b"file",
-                relative.as_slice(),
-                &metadata,
-                &[],
-            );
+            hash_tree_metadata_record(metadata_hasher, b"file", relative.as_slice(), metadata, &[]);
             if let Some(hasher) = content_hasher.as_deref_mut() {
-                path.push(&entry_name);
+                path.push(entry_name);
                 path_pushed = true;
                 let materialized_relative = path.strip_prefix(root).map_err(|error| {
                     LpmError::Store(format!(
@@ -393,11 +452,11 @@ fn hash_object_tree_dir_inner(
                         path.display()
                     ))
                 })?;
-                hasher.hash_file(relative.as_slice(), materialized_relative, &path, &metadata)?;
+                hasher.hash_file(relative.as_slice(), materialized_relative, &path, metadata)?;
             }
             Ok(())
         } else {
-            path.push(&entry_name);
+            path.push(entry_name);
             path_pushed = true;
             Err(LpmError::Store(format!(
                 "unsupported virtual-store object entry type at {}",
@@ -444,7 +503,7 @@ fn hash_tree_metadata_dir_bulk(
         path.push(&entry.name);
 
         let result = match entry.kind {
-            MacosEntryKind::Directory => {
+            ObjectTreeEntryKind::Directory => {
                 hash_tree_metadata_fields(
                     hasher,
                     b"dir",
@@ -457,7 +516,7 @@ fn hash_tree_metadata_dir_bulk(
                 );
                 hash_tree_metadata_dir_bulk(root, &path, relative, hasher, buffer)
             }
-            MacosEntryKind::File => {
+            ObjectTreeEntryKind::File => {
                 hash_tree_metadata_fields(
                     hasher,
                     b"file",
@@ -470,7 +529,7 @@ fn hash_tree_metadata_dir_bulk(
                 );
                 Ok(())
             }
-            MacosEntryKind::Symlink => {
+            ObjectTreeEntryKind::Symlink => {
                 let target = std::fs::read_link(&path).map_err(|error| {
                     LpmError::Store(format!(
                         "failed to read virtual-store object symlink {}: {error}",
@@ -491,7 +550,7 @@ fn hash_tree_metadata_dir_bulk(
                 );
                 Ok(())
             }
-            MacosEntryKind::Unsupported => Err(LpmError::Store(format!(
+            ObjectTreeEntryKind::Unsupported => Err(LpmError::Store(format!(
                 "unsupported virtual-store object entry type at {}",
                 path.display()
             ))),
@@ -503,9 +562,8 @@ fn hash_tree_metadata_dir_bulk(
     Ok(())
 }
 
-#[cfg(target_os = "macos")]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum MacosEntryKind {
+enum ObjectTreeEntryKind {
     File,
     Directory,
     Symlink,
@@ -513,20 +571,10 @@ enum MacosEntryKind {
 }
 
 #[cfg(target_os = "macos")]
-struct MacosMetadataEntry {
-    name: OsString,
-    kind: MacosEntryKind,
-    mode: u32,
-    len: u64,
-    modified_time_nanos: i128,
-    change_time_nanos: i128,
-}
-
-#[cfg(target_os = "macos")]
 fn read_bulk_metadata_entries(
     dir: &Path,
     buffer: &mut [u8],
-) -> Result<Vec<MacosMetadataEntry>, LpmError> {
+) -> Result<Vec<ObjectTreeEntry>, LpmError> {
     use std::os::fd::AsRawFd;
 
     let directory = std::fs::File::open(dir).map_err(|error| {
@@ -605,7 +653,7 @@ fn parse_bulk_metadata_entry(
     buffer: &[u8],
     offset: &mut usize,
     group_end: usize,
-) -> Result<MacosMetadataEntry, LpmError> {
+) -> Result<ObjectTreeEntry, LpmError> {
     const REQUIRED_COMMON_ATTRIBUTES: u32 = libc::ATTR_CMN_NAME
         | libc::ATTR_CMN_OBJTYPE
         | libc::ATTR_CMN_MODTIME
@@ -664,10 +712,10 @@ fn parse_bulk_metadata_entry(
         & 0o7777;
 
     let kind = match object_type {
-        1 => MacosEntryKind::File,
-        2 => MacosEntryKind::Directory,
-        5 => MacosEntryKind::Symlink,
-        _ => MacosEntryKind::Unsupported,
+        1 => ObjectTreeEntryKind::File,
+        2 => ObjectTreeEntryKind::Directory,
+        5 => ObjectTreeEntryKind::Symlink,
+        _ => ObjectTreeEntryKind::Unsupported,
     };
     let directory_len = if returned_directory & libc::ATTR_DIR_DATALENGTH != 0 {
         Some(
@@ -688,10 +736,10 @@ fn parse_bulk_metadata_entry(
         None
     };
     let len = match kind {
-        MacosEntryKind::Directory => directory_len,
-        MacosEntryKind::File => file_len,
-        MacosEntryKind::Symlink => Some(0),
-        MacosEntryKind::Unsupported => Some(file_len.or(directory_len).unwrap_or_default()),
+        ObjectTreeEntryKind::Directory => directory_len,
+        ObjectTreeEntryKind::File => file_len,
+        ObjectTreeEntryKind::Symlink => Some(0),
+        ObjectTreeEntryKind::Unsupported => Some(file_len.or(directory_len).unwrap_or_default()),
     }
     .ok_or_else(|| {
         LpmError::Store(format!(
@@ -700,7 +748,7 @@ fn parse_bulk_metadata_entry(
         ))
     })?;
 
-    Ok(MacosMetadataEntry {
+    Ok(ObjectTreeEntry {
         name,
         kind,
         mode,
@@ -753,8 +801,34 @@ fn read_bulk_timespec_nanos(buffer: &[u8], offset: &mut usize, end: usize) -> Op
 }
 
 struct ObjectTreeEntry {
-    file_name: OsString,
-    metadata: std::fs::Metadata,
+    name: OsString,
+    kind: ObjectTreeEntryKind,
+    mode: u32,
+    len: u64,
+    modified_time_nanos: i128,
+    change_time_nanos: i128,
+}
+
+impl ObjectTreeEntry {
+    fn from_metadata(name: OsString, metadata: &std::fs::Metadata) -> Self {
+        let kind = if is_symlink_or_junction(metadata) {
+            ObjectTreeEntryKind::Symlink
+        } else if metadata.is_dir() {
+            ObjectTreeEntryKind::Directory
+        } else if metadata.is_file() {
+            ObjectTreeEntryKind::File
+        } else {
+            ObjectTreeEntryKind::Unsupported
+        };
+        Self {
+            name,
+            kind,
+            mode: object_entry_mode(metadata),
+            len: metadata.len(),
+            modified_time_nanos: modified_time_nanos(metadata),
+            change_time_nanos: change_time_nanos(metadata),
+        }
+    }
 }
 
 enum EntryDigestSource<'a> {
@@ -789,7 +863,7 @@ impl<'a> TreeContentHasher<'a> {
         Self::EntryDigest { root, source }
     }
 
-    fn hash_symlink(&mut self, relative: &[u8], metadata: &std::fs::Metadata, target: &[u8]) {
+    fn hash_symlink(&mut self, relative: &[u8], metadata: &ObjectTreeEntry, target: &[u8]) {
         match self {
             Self::Sequential(hasher) => {
                 hash_object_tree_record(hasher, b"symlink", relative, target);
@@ -800,7 +874,7 @@ impl<'a> TreeContentHasher<'a> {
                     root,
                     b"symlink",
                     relative,
-                    object_entry_mode(metadata),
+                    metadata.mode,
                     target.len() as u64,
                     Some(&digest),
                 );
@@ -808,20 +882,15 @@ impl<'a> TreeContentHasher<'a> {
         }
     }
 
-    fn hash_directory(&mut self, relative: &[u8], metadata: &std::fs::Metadata) {
+    fn hash_directory(&mut self, relative: &[u8], metadata: &ObjectTreeEntry) {
         match self {
             Self::Sequential(hasher) => {
-                let mode = object_entry_mode(metadata).to_le_bytes();
+                let mode = metadata.mode.to_le_bytes();
                 hash_object_tree_record(hasher, b"dir", relative, &mode);
             }
-            Self::EntryDigest { root, .. } => hash_entry_digest_record(
-                root,
-                b"dir",
-                relative,
-                object_entry_mode(metadata),
-                0,
-                None,
-            ),
+            Self::EntryDigest { root, .. } => {
+                hash_entry_digest_record(root, b"dir", relative, metadata.mode, 0, None)
+            }
         }
     }
 
@@ -830,7 +899,7 @@ impl<'a> TreeContentHasher<'a> {
         relative: &[u8],
         materialized_relative: &Path,
         path: &Path,
-        metadata: &std::fs::Metadata,
+        metadata: &ObjectTreeEntry,
     ) -> Result<(), LpmError> {
         match self {
             Self::Sequential(hasher) => hash_object_file(hasher, relative, path, metadata),
@@ -850,8 +919,8 @@ impl<'a> TreeContentHasher<'a> {
                     root,
                     b"file",
                     relative,
-                    object_entry_mode(metadata),
-                    metadata.len(),
+                    metadata.mode,
+                    metadata.len,
                     Some(&digest),
                 );
                 Ok(())
@@ -914,17 +983,17 @@ fn hash_tree_metadata_record(
     hasher: &mut Sha256,
     kind: &[u8],
     relative: &[u8],
-    metadata: &std::fs::Metadata,
+    metadata: &ObjectTreeEntry,
     payload: &[u8],
 ) {
     hash_tree_metadata_fields(
         hasher,
         kind,
         relative,
-        object_entry_mode(metadata),
-        metadata.len(),
-        modified_time_nanos(metadata),
-        change_time_nanos(metadata),
+        metadata.mode,
+        metadata.len,
+        metadata.modified_time_nanos,
+        metadata.change_time_nanos,
         payload,
     );
 }
@@ -977,13 +1046,13 @@ fn hash_object_file(
     hasher: &mut Sha256,
     relative: &[u8],
     path: &Path,
-    metadata: &std::fs::Metadata,
+    metadata: &ObjectTreeEntry,
 ) -> Result<(), LpmError> {
     hasher.update(b"file\0");
     hasher.update(relative);
     hasher.update(b"\0");
-    hasher.update(object_entry_mode(metadata).to_le_bytes());
-    hasher.update(metadata.len().to_le_bytes());
+    hasher.update(metadata.mode.to_le_bytes());
+    hasher.update(metadata.len.to_le_bytes());
     let file = std::fs::File::open(path).map_err(|e| {
         LpmError::Store(format!(
             "failed to open virtual-store object file {} for integrity hashing: {e}",
@@ -1273,5 +1342,246 @@ mod tests {
         .unwrap();
 
         assert_eq!(streamed.content, recomputed.content);
+    }
+
+    #[cfg(target_os = "macos")]
+    fn finish_with_bulk_walk(
+        root: &Path,
+        files: Vec<ExtractedFileDigest>,
+        directories: usize,
+    ) -> Result<TreeIntegrities, LpmError> {
+        let before = BULK_FINALIZATION_DIRECTORIES.with(std::cell::Cell::get);
+        let result = StreamedTreeBuilder::from_extraction(files).finish(root);
+        let after = BULK_FINALIZATION_DIRECTORIES.with(std::cell::Cell::get);
+        assert_eq!(
+            after - before,
+            directories,
+            "finalization must use bulk metadata for every expected directory"
+        );
+        result
+    }
+    #[cfg(target_os = "macos")]
+    fn assert_integrities_match(actual: &TreeIntegrities, expected: &TreeIntegrities) {
+        assert_eq!(actual.content, expected.content);
+        assert_eq!(actual.metadata, expected.metadata);
+        assert_eq!(actual.content_schema, expected.content_schema);
+        assert_eq!(actual.stats.file_count, expected.stats.file_count);
+        assert_eq!(actual.stats.dir_count, expected.stats.dir_count);
+        assert_eq!(actual.stats.symlink_count, expected.stats.symlink_count);
+        assert_eq!(actual.stats.unpacked_bytes, expected.stats.unpacked_bytes);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn bulk_finalization_preserves_digests_and_statistics_for_mixed_tree_entries() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("nested/empty")).unwrap();
+        let unicode_path = PathBuf::from("nested/file-π");
+        std::fs::write(root.join(&unicode_path), b"unicode").unwrap();
+        std::fs::write(root.join("run"), b"executable").unwrap();
+        std::fs::set_permissions(root.join("run"), std::fs::Permissions::from_mode(0o751)).unwrap();
+        std::fs::hard_link(root.join("run"), root.join("nested/hardlinked")).unwrap();
+        std::fs::write(root.join(OBJECT_INTEGRITY_FILENAME), b"excluded").unwrap();
+        std::fs::write(
+            root.join("nested").join(OBJECT_INTEGRITY_FILENAME),
+            b"included",
+        )
+        .unwrap();
+        std::os::unix::fs::symlink("run", root.join("link")).unwrap();
+        std::os::unix::fs::symlink("missing", root.join("dangling")).unwrap();
+        let mut files = vec![
+            fixture_file("run", b"old bytes"),
+            fixture_file("run", b"executable"),
+            fixture_file("nested/hardlinked", b"executable"),
+            fixture_file(OBJECT_INTEGRITY_FILENAME, b"excluded"),
+            fixture_file("nested/.lpm-object-integrity", b"included"),
+        ];
+        files.push(ExtractedFileDigest {
+            relative_path: unicode_path,
+            blake3_digest: *blake3::hash(b"unicode").as_bytes(),
+        });
+        let actual = finish_with_bulk_walk(root, files, 3).unwrap();
+        let expected =
+            compute_object_tree_integrities_for_schema(root, TreeContentSchema::EntryDigestV2)
+                .unwrap();
+        assert_integrities_match(&actual, &expected);
+        assert_eq!(actual.stats.file_count, 4);
+        assert_eq!(actual.stats.dir_count, 2);
+        assert_eq!(actual.stats.symlink_count, 2);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn failed_bulk_collection_disables_retries_without_replaying_consumed_digests() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let mut files = Vec::new();
+        for name in ["a", "b", "c"] {
+            std::fs::create_dir(root.join(name)).unwrap();
+            let relative = format!("{name}/file");
+            std::fs::write(root.join(&relative), name.as_bytes()).unwrap();
+            files.push(fixture_file(&relative, name.as_bytes()));
+        }
+        let expected =
+            compute_object_tree_integrities_for_schema(root, TreeContentSchema::EntryDigestV2)
+                .unwrap();
+        let mut digests = StreamedTreeBuilder::from_extraction(files).file_digests;
+        let mut content = TreeContentHasher::entry_digest_from_extraction(&mut digests);
+        let mut metadata = Sha256::new();
+        let mut stats = ObjectTreeStats::default();
+        let mut bulk_buffer = vec![0; 64 * 1024];
+        for entry in read_object_tree_entries(root, root).unwrap() {
+            let path = root.join(&entry.name);
+            let mut relative = relative_path_bytes(root, &path).unwrap();
+            content.hash_directory(&relative, &entry);
+            hash_tree_metadata_record(&mut metadata, b"dir", &relative, &entry, &[]);
+            stats.dir_count += 1;
+            if entry.name == "b" {
+                bulk_buffer.truncate(1);
+            }
+            hash_object_tree_dir_inner(
+                root,
+                &path,
+                &mut relative,
+                Some(&mut content),
+                &mut metadata,
+                Some(&mut stats),
+                &mut bulk_buffer,
+            )
+            .unwrap();
+            if entry.name == "a" {
+                assert!(!bulk_buffer.is_empty());
+                if let TreeContentHasher::EntryDigest {
+                    source: EntryDigestSource::Extraction(remaining),
+                    ..
+                } = &content
+                {
+                    assert!(!remaining.contains_key(Path::new("a/file")));
+                    assert_eq!(remaining.len(), 2);
+                } else {
+                    panic!("expected extraction digests");
+                }
+            } else {
+                assert!(bulk_buffer.is_empty());
+            }
+        }
+        let actual = TreeIntegrities {
+            content: content.finish().unwrap(),
+            metadata: format!("sha256-{}", hex::encode(metadata.finalize())),
+            stats,
+            content_schema: TreeContentSchema::EntryDigestV2,
+        };
+        assert_integrities_match(&actual, &expected);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn bulk_fallback_rejects_missing_and_unmatched_extraction_digests() {
+        for extra in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::write(dir.path().join("file"), b"bytes").unwrap();
+            let files = if extra {
+                vec![
+                    fixture_file("file", b"bytes"),
+                    fixture_file("absent", b"extra"),
+                ]
+            } else {
+                vec![]
+            };
+            let mut digests = StreamedTreeBuilder::from_extraction(files).file_digests;
+            let mut content = TreeContentHasher::entry_digest_from_extraction(&mut digests);
+            let mut metadata = Sha256::new();
+            let mut stats = ObjectTreeStats::default();
+            let mut buffer = vec![0];
+            let walked = hash_object_tree_dir_inner(
+                dir.path(),
+                dir.path(),
+                &mut Vec::new(),
+                Some(&mut content),
+                &mut metadata,
+                Some(&mut stats),
+                &mut buffer,
+            );
+            assert!(buffer.is_empty());
+            let error = if extra {
+                walked.unwrap();
+                content.finish().unwrap_err()
+            } else {
+                walked.unwrap_err()
+            };
+            assert!(error.to_string().contains(if extra {
+                "without materialized files"
+            } else {
+                "omitted a file digest"
+            }));
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn bulk_symlink_refresh_errors_identify_the_affected_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut entry = ObjectTreeEntry {
+            name: "missing-link".into(),
+            kind: ObjectTreeEntryKind::Symlink,
+            mode: 0,
+            len: 0,
+            modified_time_nanos: 0,
+            change_time_nanos: 0,
+        };
+        let error = refresh_bulk_symlink_metadata(dir.path(), &mut entry)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("failed to stat virtual-store object tree entry"));
+        assert!(error.contains(&dir.path().join("missing-link").display().to_string()));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn bulk_finalization_rejects_unsupported_filesystem_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let _listener = std::os::unix::net::UnixListener::bind(dir.path().join("socket")).unwrap();
+        let error = finish_with_bulk_walk(dir.path(), vec![], 1)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("unsupported virtual-store object entry type"));
+        assert!(error.contains("socket"));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn bulk_finalization_hashes_symlink_bytes_without_observing_target_mutations() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        let external = tempfile::tempdir().unwrap();
+        let target = external.path().join("target");
+        std::fs::write(&target, b"before").unwrap();
+        let link = root.path().join("link");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let before = finish_with_bulk_walk(root.path(), vec![], 1).unwrap();
+        std::fs::write(&target, b"after with different length").unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o751)).unwrap();
+        let after = finish_with_bulk_walk(root.path(), vec![], 1).unwrap();
+        assert_integrities_match(&after, &before);
+        std::fs::remove_file(&link).unwrap();
+        std::os::unix::fs::symlink(external.path().join("different-target"), &link).unwrap();
+        let replaced = finish_with_bulk_walk(root.path(), vec![], 1).unwrap();
+        assert_ne!(replaced.content, before.content);
+        assert_ne!(replaced.metadata, before.metadata);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn normalized_object_entry_preserves_non_utf8_name_bytes() {
+        use std::os::unix::ffi::OsStringExt;
+        let dir = tempfile::tempdir().unwrap();
+        let metadata = std::fs::symlink_metadata(dir.path()).unwrap();
+        let name = OsString::from_vec(b"file-\xff".to_vec());
+        let entry = ObjectTreeEntry::from_metadata(name, &metadata);
+        let mut encoded = Vec::new();
+        push_os_str_bytes(&mut encoded, &entry.name);
+        assert_eq!(encoded, b"file-\xff");
     }
 }
