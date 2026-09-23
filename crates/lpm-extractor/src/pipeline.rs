@@ -34,12 +34,13 @@ impl Read for DecodedReader {
             if let Some(bytes) = self.current.take() {
                 let _ = self.recycle.send(bytes);
             }
-            match {
+            let message = {
                 let _wait =
                     tracing::trace_span!(target: "lpm_install_timeline", "decoded_buffer_wait")
                         .entered();
                 self.ready.recv()
-            } {
+            };
+            match message {
                 Ok(Message::Bytes(bytes, length)) => {
                     self.current = Some(bytes);
                     self.offset = 0;
