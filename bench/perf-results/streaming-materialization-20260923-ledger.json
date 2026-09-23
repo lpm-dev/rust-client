@@ -17,7 +17,7 @@
       "disposition": "Verified",
       "coverage": "Frozen extraction; four-fixture installs; pipeline tests",
       "commit": "df373bb317c035f869e0321e8695db249518e651",
-      "pr_status": "Ready for publication on codex/streaming-materialization, dependent on PR867"
+      "pr_status": "Open, ready for review: https://github.com/lpm-dev/rust-client/pull/869 (native stack 863)"
     },
     {
       "id": "PIPE-02",
@@ -29,7 +29,7 @@
       "disposition": "Verified",
       "coverage": "Short-read/duplicate-digest tests; frozen archive parity; four-fixture installs",
       "commit": "df373bb317c035f869e0321e8695db249518e651",
-      "pr_status": "Ready for publication on codex/streaming-materialization, dependent on PR867"
+      "pr_status": "Open, ready for review: https://github.com/lpm-dev/rust-client/pull/869 (native stack 863)"
     },
     {
       "id": "PIPE-03",
@@ -41,7 +41,7 @@
       "disposition": "Verified",
       "coverage": "cancelled_tarball_stream_keeps_returning_eof_after_its_error; early_tar_failure_cancels_pending_pipeline_input_and_releases_capacity",
       "commit": "df373bb317c035f869e0321e8695db249518e651",
-      "pr_status": "Ready for publication on codex/streaming-materialization, dependent on PR867"
+      "pr_status": "Open, ready for review: https://github.com/lpm-dev/rust-client/pull/869 (native stack 863)"
     },
     {
       "id": "PIPE-04",
@@ -53,7 +53,7 @@
       "disposition": "Verified",
       "coverage": "known_sha512_stream_rejects_invalid_or_non_sha512_canonical_identities; store crate suite",
       "commit": "df373bb317c035f869e0321e8695db249518e651",
-      "pr_status": "Ready for publication on codex/streaming-materialization, dependent on PR867"
+      "pr_status": "Open, ready for review: https://github.com/lpm-dev/rust-client/pull/869 (native stack 863)"
     }
   ],
   "research_reconciliation": {
