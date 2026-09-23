@@ -1,6 +1,5 @@
 use std::{
     collections::BTreeMap,
-    fs::OpenOptions,
     io::{BufWriter, Write},
     path::PathBuf,
     sync::{Arc, Mutex, OnceLock},
@@ -41,6 +40,7 @@ struct State {
     next_id: u64,
     open_spans: usize,
     dropped_records: usize,
+    dropped_correlations: usize,
     limit: usize,
     frozen: bool,
 }
@@ -93,6 +93,7 @@ struct Artifact {
     cutoff_us: u64,
     open_spans: usize,
     dropped_records: usize,
+    dropped_correlations: usize,
     record_limit: usize,
     records: Vec<Record>,
 }
@@ -107,6 +108,7 @@ impl Capture {
                 next_id: 1,
                 open_spans: 0,
                 dropped_records: 0,
+                dropped_correlations: 0,
                 limit,
                 frozen: false,
             }),
@@ -143,32 +145,42 @@ impl Capture {
             cutoff_us,
             open_spans: state.open_spans,
             dropped_records: state.dropped_records,
+            dropped_correlations: state.dropped_correlations,
             record_limit: state.limit,
             records: std::mem::take(&mut state.records),
         })
     }
 
     fn export(&self, artifact: &Artifact) -> std::io::Result<()> {
+        self.export_with(|writer| {
+            serde_json::to_writer(writer, artifact).map_err(std::io::Error::from)
+        })
+    }
+
+    fn export_with(
+        &self,
+        write: impl FnOnce(&mut dyn Write) -> std::io::Result<()>,
+    ) -> std::io::Result<()> {
         std::fs::create_dir_all(&self.directory)?;
+        let mut file = tempfile::Builder::new()
+            .prefix(".lpm-install-timeline-")
+            .tempfile_in(&self.directory)?;
+        {
+            let mut writer = BufWriter::new(file.as_file_mut());
+            write(&mut writer)?;
+            writer.flush()?;
+        }
         for attempt in 0..100 {
             let path = self
                 .directory
                 .join(format!("install-{}-{attempt}.json", std::process::id()));
-            let mut options = OpenOptions::new();
-            options.write(true).create_new(true);
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::OpenOptionsExt as _;
-                options.mode(0o600);
+            match file.persist_noclobber(path) {
+                Ok(_) => return Ok(()),
+                Err(error) if error.error.kind() == std::io::ErrorKind::AlreadyExists => {
+                    file = error.file;
+                }
+                Err(error) => return Err(error.error),
             }
-            let file = match options.open(path) {
-                Ok(file) => file,
-                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
-                Err(error) => return Err(error),
-            };
-            let mut writer = BufWriter::new(file);
-            serde_json::to_writer(&mut writer, artifact)?;
-            return writer.flush();
         }
         Err(std::io::Error::new(
             std::io::ErrorKind::AlreadyExists,
@@ -255,6 +267,10 @@ where
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if state.frozen {
+            return;
+        }
+        if event.metadata().name() == "metadata_correlation_dropped" {
+            state.dropped_correlations += 1;
             return;
         }
         state.push(Record {
@@ -429,6 +445,20 @@ mod tests {
     }
 
     #[test]
+    fn skipped_correlations_remain_counted_after_the_record_budget_is_full() {
+        let capture = capture(0);
+        let subscriber = tracing_subscriber::registry().with(TimelineLayer(Arc::clone(&capture)));
+        tracing::subscriber::with_default(subscriber, || {
+            for _ in 0..3 {
+                tracing::event!(name: "metadata_correlation_dropped", target: "lpm_install_timeline", tracing::Level::TRACE, {});
+            }
+        });
+        let artifact = capture.freeze("success").unwrap();
+        assert_eq!(artifact.dropped_correlations, 3);
+        assert!(artifact.records.is_empty());
+    }
+
+    #[test]
     fn field_allowlist_excludes_strings_and_arbitrary_numeric_fields() {
         let capture = capture(10);
         let subscriber = tracing_subscriber::registry().with(TimelineLayer(Arc::clone(&capture)));
@@ -473,6 +503,42 @@ mod tests {
             tracing::trace!(target: "lpm_install_timeline", bytes = { evaluated.set(true); 1u64 });
         });
         assert!(!evaluated.get());
+    }
+
+    #[test]
+    fn failed_export_leaves_no_partial_artifact_or_temporary_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let capture = Capture::new(dir.path().to_owned(), 2);
+        let result = capture.export_with(|writer| {
+            writer.write_all(b"{partial")?;
+            writer.flush()?;
+            Err(std::io::Error::other("injected export failure"))
+        });
+        assert!(result.is_err());
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn export_is_private_and_does_not_follow_a_preplanted_symlink() {
+        use std::os::unix::fs::{PermissionsExt as _, symlink};
+        let dir = tempfile::tempdir().unwrap();
+        let other = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(other.path(), b"unchanged").unwrap();
+        let first = dir
+            .path()
+            .join(format!("install-{}-0.json", std::process::id()));
+        symlink(other.path(), &first).unwrap();
+        let capture = Capture::new(dir.path().to_owned(), 2);
+        capture.export(&capture.freeze("success").unwrap()).unwrap();
+        assert_eq!(std::fs::read(other.path()).unwrap(), b"unchanged");
+        let next = dir
+            .path()
+            .join(format!("install-{}-1.json", std::process::id()));
+        assert_eq!(
+            std::fs::metadata(next).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
     }
 
     #[test]

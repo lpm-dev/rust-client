@@ -263,6 +263,7 @@ struct FusedTreeProvider<'a> {
 }
 
 type MetadataTimeline = std::sync::Mutex<AHashMap<MetadataFetchKey, tracing::Span>>;
+const MAX_METADATA_TIMELINE_REQUESTS: usize = 1024;
 
 struct MetadataFetchDispatch<'a> {
     timeline: Option<&'a MetadataTimeline>,
@@ -385,12 +386,15 @@ impl OrderedMetadataFetches {
             .checked_add(1)
             .ok_or_else(|| ResolveError::Internal("metadata dispatch sequence overflow".into()))?;
         if let Some(timeline) = &self.timeline {
-            let span =
-                tracing::trace_span!(target: "lpm_install_timeline", "resolver_metadata", sequence);
-            timeline
+            let mut timeline = timeline
                 .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .insert(request.clone(), span);
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if timeline.len() < MAX_METADATA_TIMELINE_REQUESTS {
+                let span = tracing::trace_span!(target: "lpm_install_timeline", "resolver_metadata", sequence);
+                timeline.insert(request.clone(), span);
+            } else {
+                tracing::event!(name: "metadata_correlation_dropped", target: "lpm_install_timeline", tracing::Level::TRACE, {});
+            }
         }
         self.sequences.insert(request.clone(), sequence);
         self.inflight.insert(request.canonical.clone());
@@ -3263,6 +3267,32 @@ mod range_aware_worker_batch_tests {
                 ("shared".to_string(), "^1.0.0".to_string()),
                 ("shared".to_string(), "^2.0.0".to_string()),
             ]
+        );
+    }
+}
+
+#[cfg(test)]
+mod metadata_timeline_bound_tests {
+    use super::*;
+
+    #[test]
+    fn stalled_ordered_commit_does_not_unbound_metadata_correlations() {
+        let timeline = Arc::new(MetadataTimeline::default());
+        let mut ordered = OrderedMetadataFetches::with_capacity(0);
+        ordered.timeline = Some(Arc::clone(&timeline));
+        for index in 0..MAX_METADATA_TIMELINE_REQUESTS * 2 {
+            let key = CanonicalKey::npm(&format!("timeline-{index}"));
+            assert!(ordered.start(&key).unwrap());
+        }
+        assert_eq!(
+            ordered.next_dispatch_sequence as usize,
+            MAX_METADATA_TIMELINE_REQUESTS * 2
+        );
+        assert_eq!(ordered.sequences.len(), MAX_METADATA_TIMELINE_REQUESTS * 2);
+        assert_eq!(ordered.next_commit_sequence, 0);
+        assert_eq!(
+            timeline.lock().unwrap().len(),
+            MAX_METADATA_TIMELINE_REQUESTS
         );
     }
 }
