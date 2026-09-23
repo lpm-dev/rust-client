@@ -31,7 +31,7 @@
         "Four-fixture warm-cache benchmarks and cold controls"
       ],
       "commit": "6009247f8",
-      "pr_status": "Ready for review in native stack #863"
+      "pr_status": "Open: https://github.com/lpm-dev/rust-client/pull/874"
     }
   ],
   "reviews": [
