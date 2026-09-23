@@ -99,6 +99,11 @@ enum TarballInput<'a> {
         reader: &'a mut dyn StreamingIntegrityReader,
         expected_integrity: Option<&'a str>,
     },
+    PipelinedStreaming {
+        reader: &'a mut (dyn StreamingIntegrityReader + Send),
+        expected_integrity: Option<&'a str>,
+        cancel_input: &'a dyn Fn(),
+    },
 }
 
 struct RemoveStagingOnDrop(PathBuf);
@@ -1467,6 +1472,15 @@ impl Store {
                         tmp_dir,
                     )
                 }
+                TarballInput::PipelinedStreaming {
+                    reader,
+                    cancel_input,
+                    ..
+                } => lpm_extractor::extract_tarball_from_reader_pipelined_digests(
+                    &mut **reader,
+                    tmp_dir,
+                    cancel_input,
+                ),
             }
         } else {
             match &mut tarball_input {
@@ -1492,6 +1506,14 @@ impl Store {
                         inspect_entry,
                     )
                 }
+                TarballInput::PipelinedStreaming { reader, .. } => {
+                    lpm_extractor::extract_tarball_from_reader_streaming_with_entry_digests(
+                        &mut **reader,
+                        tmp_dir,
+                        buffer_predicate,
+                        inspect_entry,
+                    )
+                }
             }
         };
         let extracted_files = extract_result?;
@@ -1503,6 +1525,16 @@ impl Store {
             TarballInput::Streaming {
                 reader,
                 expected_integrity,
+            } => {
+                std::io::copy(&mut **reader, &mut std::io::sink()).map_err(LpmError::Io)?;
+                let sha512 = reader.canonical_sha512_sri();
+                Self::verify_streamed_integrity(*expected_integrity, &**reader)?;
+                Some(sha512)
+            }
+            TarballInput::PipelinedStreaming {
+                reader,
+                expected_integrity,
+                ..
             } => {
                 std::io::copy(&mut **reader, &mut std::io::sink()).map_err(LpmError::Io)?;
                 let sha512 = reader.canonical_sha512_sri();
@@ -1710,6 +1742,31 @@ impl Store {
         )
     }
 
+    /// Stream a large archive with gzip decoding ahead of file extraction.
+    ///
+    /// Input cancellation must unblock a pending read if extraction fails. When
+    /// source inspection is enabled, extraction retains the sequential callback path.
+    pub fn extract_object_from_pipelined_stream(
+        &self,
+        reader: impl std::io::Read + Send,
+        expected_integrity: Option<&str>,
+        max_compressed_size: u64,
+        cancel_input: impl Fn(),
+    ) -> Result<(ExtractedObject, String, StageTimings), LpmError> {
+        let staging = self.prepare_streaming_staging()?;
+        let size_limited = SizeLimitedReader::new(reader, max_compressed_size);
+        let mut hashing_reader =
+            HashingReader::for_expected_integrity(size_limited, expected_integrity)?;
+        self.extract_streaming_input(
+            staging,
+            TarballInput::PipelinedStreaming {
+                reader: &mut hashing_reader,
+                expected_integrity,
+                cancel_input: &cancel_input,
+            },
+        )
+    }
+
     /// Stream an exclusively owned tarball whose SHA-512 was computed during download.
     /// The caller must ensure the reader contains exactly those unchanged bytes.
     /// Declared integrity, compressed size, and archive contents are still validated.
@@ -1735,28 +1792,38 @@ impl Store {
         expected_integrity: Option<&str>,
         max_compressed_size: u64,
     ) -> Result<(ExtractedObject, String, StageTimings), LpmError> {
-        if !self.supports_streamed_object_ingest() {
-            return Err(LpmError::Store(
-                "streamed object ingest is unavailable for the v3 file CAS".into(),
-            ));
-        }
-
-        let staging = self.create_stream_object_staging_dir()?;
-        let tmp_dir = &staging.path;
+        let staging = self.prepare_streaming_staging()?;
         let size_limited = SizeLimitedReader::new(reader, max_compressed_size);
         let mut hashing_reader = match canonical_sri {
             Some(sri) => HashingReader::with_known_sha512(size_limited, sri, expected_integrity)?,
             None => HashingReader::for_expected_integrity(size_limited, expected_integrity)?,
         };
-        let (streamed_integrities, prepared_cas, timings, computed_sri) = self
-            .extract_input_into_staging(
-                TarballInput::Streaming {
-                    reader: &mut hashing_reader,
-                    expected_integrity,
-                },
-                tmp_dir,
-                None,
-            )?;
+        self.extract_streaming_input(
+            staging,
+            TarballInput::Streaming {
+                reader: &mut hashing_reader,
+                expected_integrity,
+            },
+        )
+    }
+
+    fn prepare_streaming_staging(&self) -> Result<StreamStagingGuard, LpmError> {
+        if !self.supports_streamed_object_ingest() {
+            return Err(LpmError::Store(
+                "streamed object ingest is unavailable for the v3 file CAS".into(),
+            ));
+        }
+        self.create_stream_object_staging_dir()
+    }
+
+    fn extract_streaming_input(
+        &self,
+        staging: StreamStagingGuard,
+        input: TarballInput<'_>,
+    ) -> Result<(ExtractedObject, String, StageTimings), LpmError> {
+        let tmp_dir = &staging.path;
+        let (streamed_integrities, prepared_cas, timings, computed_sri) =
+            self.extract_input_into_staging(input, tmp_dir, None)?;
         let computed_sri = computed_sri.ok_or_else(|| {
             LpmError::Store("streamed object ingest did not compute a canonical SRI".into())
         })?;

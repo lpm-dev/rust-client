@@ -10,6 +10,7 @@
 //! flate2's streaming `GzDecoder` so peak allocation stays bounded.
 
 mod output;
+mod pipeline;
 
 use flate2::read::GzDecoder;
 use lpm_common::{Integrity, LpmError};
@@ -1072,6 +1073,19 @@ pub fn extract_tarball_from_reader_streaming_digests(
     )
 }
 
+/// Decode gzip ahead of file extraction using at most 768 KiB of queued buffers.
+///
+/// The reader moves to a scoped worker. On extraction failure or unwinding,
+/// `cancel_input` must unblock any pending read before that worker can join.
+/// File-backed readers can use an empty cancellation callback.
+pub fn extract_tarball_from_reader_pipelined_digests(
+    reader: impl Read + Send,
+    target_dir: &Path,
+    cancel_input: impl FnOnce(),
+) -> Result<Vec<ExtractedFileDigest>, LpmError> {
+    pipeline::extract(reader, target_dir, DEFAULT_EXTRACTION_LIMITS, cancel_input)
+}
+
 /// Digest-enabled file-backed extraction that buffers only small archives and
 /// has no per-file callback.
 pub fn extract_tarball_from_reader_hybrid_digests(
@@ -1450,6 +1464,7 @@ where
     let mut extracted_files = Vec::with_capacity(64);
     let mut accepted_identities = Vec::with_capacity(64);
     let mut total_size: u64 = 0;
+    let mut copy_buffer = [0_u8; 64 * 1024];
 
     std::fs::create_dir_all(target_dir)?;
     let extraction_root = target_dir.canonicalize().map_err(LpmError::Io)?;
@@ -1507,7 +1522,13 @@ where
                     pending.file.write_all(bytes).map_err(LpmError::Io)?;
                     compute_blake3.then(|| *blake3::hash(bytes).as_bytes())
                 } else {
-                    stream_entry_to_disk(&mut entry, &mut pending.file, compute_blake3)?
+                    stream_entry_to_disk(
+                        &mut entry,
+                        &mut pending.file,
+                        compute_blake3,
+                        size,
+                        &mut copy_buffer,
+                    )?
                 };
                 #[cfg(unix)]
                 if exec_bits != 0 {
@@ -1586,6 +1607,8 @@ fn stream_entry_to_disk(
     entry: &mut impl Read,
     file: &mut std::fs::File,
     compute_blake3: bool,
+    mut remaining: u64,
+    buffer: &mut [u8],
 ) -> Result<Option<[u8; 32]>, LpmError> {
     use std::io::Write;
     if !compute_blake3 {
@@ -1593,14 +1616,13 @@ fn stream_entry_to_disk(
         return Ok(None);
     }
     let mut hasher = blake3::Hasher::new();
-    let mut buffer = [0_u8; 64 * 1024];
-    loop {
-        let read = entry.read(&mut buffer).map_err(LpmError::Io)?;
-        if read == 0 {
-            break;
-        }
-        file.write_all(&buffer[..read]).map_err(LpmError::Io)?;
-        hasher.update(&buffer[..read]);
+    while remaining > 0 {
+        let count = remaining.min(buffer.len() as u64) as usize;
+        let chunk = &mut buffer[..count];
+        entry.read_exact(chunk).map_err(LpmError::Io)?;
+        file.write_all(chunk).map_err(LpmError::Io)?;
+        hasher.update(chunk);
+        remaining -= count as u64;
     }
     Ok(Some(*hasher.finalize().as_bytes()))
 }
@@ -1942,7 +1964,7 @@ mod tests {
     }
 
     /// Create a test .tgz with multiple files inside `package/`.
-    fn create_test_tarball_with_entries(entries: &[(&str, &[u8])]) -> Vec<u8> {
+    pub(super) fn create_test_tarball_with_entries(entries: &[(&str, &[u8])]) -> Vec<u8> {
         let mut tar_data = Vec::new();
         {
             let mut builder = tar::Builder::new(&mut tar_data);
