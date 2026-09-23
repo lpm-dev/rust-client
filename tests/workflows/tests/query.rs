@@ -15,9 +15,16 @@ mod query_contract;
 mod support;
 
 use support::mock_registry::MockRegistry;
-use support::{TempProject, VALID_TEST_INTEGRITY, lpm};
+use support::{TempProject, VALID_TEST_INTEGRITY};
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, ResponseTemplate};
+
+fn lpm(project: &TempProject) -> assert_cmd::Command {
+    let mut command = support::lpm(project);
+    // Tests that need vulnerability data must explicitly supply a local OSV mock.
+    command.env("LPM_OSV_URL", "http://127.0.0.1:1/v1/querybatch");
+    command
+}
 
 fn integrity_for(seed: &[u8]) -> String {
     use base64::Engine as _;
@@ -497,8 +504,8 @@ fn query_does_not_trust_a_store_sidecar_that_is_not_bound_to_current_source() {
 }
 
 #[cfg(unix)]
-#[test]
-fn query_uses_instance_qualified_analysis_for_same_sri_lpm_packages() {
+#[tokio::test]
+async fn query_uses_instance_qualified_analysis_for_same_sri_lpm_packages() {
     use std::collections::BTreeMap;
     use std::os::unix::fs::symlink;
 
@@ -572,14 +579,19 @@ fn query_uses_instance_qualified_analysis_for_same_sri_lpm_packages() {
     symlink(&package_a, project.path().join("node_modules/source-a")).unwrap();
     symlink(&package_b, project.path().join("node_modules/source-b")).unwrap();
 
+    let mock = MockRegistry::start().await;
+    mock.with_osv_querybatch(vec![vec![]]).await;
+    let osv_url = format!("{}/v1/querybatch", mock.url());
     let output = lpm(&project)
+        .env("LPM_OSV_URL", &osv_url)
         .env("LPM_STORE_VERSION", "v2")
         .args(["--json", "query", ":eval,:child-process", "--verbose"])
         .output()
         .unwrap();
     assert!(
         output.status.success(),
-        "{}",
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
     let matches: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
@@ -603,13 +615,15 @@ fn query_uses_instance_qualified_analysis_for_same_sri_lpm_packages() {
     assert_eq!(observed, vec![(false, true), (true, false)]);
 
     let root_eval = lpm(&project)
+        .env("LPM_OSV_URL", &osv_url)
         .env("LPM_STORE_VERSION", "v2")
         .args(["--json", "query", ":root > :eval", "--verbose"])
         .output()
         .unwrap();
     assert!(
         root_eval.status.success(),
-        "{}",
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&root_eval.stdout),
         String::from_utf8_lossy(&root_eval.stderr)
     );
     let root_matches: serde_json::Value = serde_json::from_slice(&root_eval.stdout).unwrap();
@@ -635,11 +649,12 @@ fn query_uses_instance_qualified_analysis_for_same_sri_lpm_packages() {
     );
     assert!(mermaid.contains(&id_a.to_string()[..12]), "{mermaid}");
     assert!(mermaid.contains(&id_b.to_string()[..12]), "{mermaid}");
+    assert_eq!(mock.server().received_requests().await.unwrap().len(), 2);
 }
 
 #[cfg(unix)]
-#[test]
-fn workspace_root_selector_uses_the_owning_root_exact_instances_from_member_directories() {
+#[tokio::test]
+async fn workspace_root_selector_uses_the_owning_root_exact_instances_from_member_directories() {
     use std::collections::BTreeMap;
     use std::os::unix::fs::symlink;
 
@@ -720,11 +735,15 @@ fn workspace_root_selector_uses_the_owning_root_exact_instances_from_member_dire
     )
     .unwrap();
 
+    let mock = MockRegistry::start().await;
+    mock.with_osv_querybatch(vec![vec![]]).await;
+    let osv_url = format!("{}/v1/querybatch", mock.url());
     for current_dir in [
         project.path().join("packages/app"),
         project.path().join("packages/app/src/nested"),
     ] {
         let output = lpm(&project)
+            .env("LPM_OSV_URL", &osv_url)
             .current_dir(current_dir)
             .env("LPM_STORE_VERSION", "v2")
             .args(["--json", "query", ":workspace-root > :eval", "--verbose"])
@@ -732,7 +751,8 @@ fn workspace_root_selector_uses_the_owning_root_exact_instances_from_member_dire
             .unwrap();
         assert!(
             output.status.success(),
-            "{}",
+            "stdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         );
         let matches: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
@@ -740,6 +760,7 @@ fn workspace_root_selector_uses_the_owning_root_exact_instances_from_member_dire
         assert_eq!(matches[0]["instanceId"], root_id.to_string());
         assert_eq!(matches[0]["analysis"]["source"]["eval"], true);
     }
+    assert_eq!(mock.server().received_requests().await.unwrap().len(), 2);
 }
 
 // ─── basic selector ───────────────────────────────────────────────────
@@ -848,22 +869,26 @@ fn query_eval_json_carries_matched_array() {
 
 // ─── --count ──────────────────────────────────────────────────────────
 
-#[test]
-fn query_count_mode_emits_tag_counts_grouped_by_severity() {
+#[tokio::test]
+async fn query_count_mode_emits_behavioral_and_vulnerability_counts() {
     let project = TempProject::empty(
         r#"{"name":"q","version":"1.0.0","dependencies":{"eval-pkg":"^1.0.0","clean-pkg":"^1.0.0"}}"#,
     );
     seed_pkg_with_source(&project, "eval-pkg", "1.0.0", SRC_EVAL);
     seed_pkg_with_source(&project, "clean-pkg", "1.0.0", SRC_CLEAN);
 
+    let mock = MockRegistry::start().await;
+    mock.with_osv_querybatch(vec![vec![], vec![]]).await;
     let output = lpm(&project)
+        .env("LPM_OSV_URL", format!("{}/v1/querybatch", mock.url()))
         .args(["--json", "query", "--count"])
         .output()
         .expect("failed to run lpm query --count --json");
 
     assert!(
         output.status.success(),
-        "query --count --json must succeed\nstderr: {}",
+        "query --count --json must succeed\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr),
     );
 
@@ -871,11 +896,10 @@ fn query_count_mode_emits_tag_counts_grouped_by_severity() {
     let envelope: serde_json::Value = serde_json::from_str(&stdout)
         .unwrap_or_else(|e| panic!("query --count --json must be valid JSON: {e}\n---\n{stdout}"));
 
-    let json_str = envelope.to_string();
-    assert!(
-        json_str.contains("\"eval\""),
-        "count output must mention the eval tag, got:\n{json_str}",
-    );
+    assert_eq!(envelope["eval"], 1, "{envelope}");
+    assert_eq!(envelope["vulnerable"], 0, "{envelope}");
+    assert_eq!(envelope["total"], 2, "{envelope}");
+    assert_eq!(mock.server().received_requests().await.unwrap().len(), 1);
 }
 
 // ─── --assert-none ─────────────────────────────────────────────────────
@@ -1119,6 +1143,40 @@ async fn query_vulnerability_assertion_fails_when_osv_returns_an_error_status() 
     assert!(
         !output.status.success(),
         "a vulnerability assertion must fail closed on OSV status errors"
+    );
+}
+
+#[tokio::test]
+async fn query_vulnerability_assertion_fails_when_osv_times_out() {
+    let project = project_for_vulnerability_source_failure();
+    let mock = MockRegistry::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/querybatch"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(serde_json::json!({"results": [{"vulns": []}]}))
+                .set_delay(std::time::Duration::from_secs(11)),
+        )
+        .expect(1)
+        .mount(mock.server())
+        .await;
+
+    let output = lpm(&project)
+        .env("LPM_OSV_URL", format!("{}/v1/querybatch", mock.url()))
+        .args(["--json", "query", ":vulnerable", "--assert-none"])
+        .timeout(std::time::Duration::from_secs(30))
+        .output()
+        .expect("run query with a delayed OSV response");
+
+    assert_eq!(output.status.code(), Some(1));
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["success"], false, "{report}");
+    assert_eq!(report["error_code"], "network", "{report}");
+    assert!(
+        report["error"]
+            .as_str()
+            .is_some_and(|error| error.contains("OSV API error:")),
+        "a timeout must not become a clean vulnerability assertion: {report}",
     );
 }
 

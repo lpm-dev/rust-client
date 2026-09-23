@@ -206,7 +206,8 @@ async fn query_deprecation_uses_the_configured_registry_without_lpm_disclosure()
         .unwrap()
         .remove("deprecated");
     lpm_registry.with_batch_metadata(vec![stale]).await;
-    let output = support::lpm_with_registry(&project, &lpm_registry.url())
+    let output = lpm(&project)
+        .args(["--registry", &lpm_registry.url(), "--insecure"])
         .args(["query", ":deprecated", "--json"])
         .output()
         .unwrap();
