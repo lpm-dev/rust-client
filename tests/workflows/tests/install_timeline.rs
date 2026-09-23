@@ -304,3 +304,152 @@ async fn metadata_timeline_correlates_retries_blocking_parse_and_ordered_commit(
         assert!(finished < observed && observed < committed);
     }
 }
+
+async fn assert_overlap_fetch_ancestry(route: &str) {
+    let workspace = route == "workspace";
+    use wiremock::{
+        Mock, ResponseTemplate,
+        matchers::{method, path},
+    };
+
+    let registry = MockRegistry::start().await;
+    let mut dependencies = serde_json::Map::new();
+    for index in 0..if matches!(route, "policy" | "experimental") {
+        1
+    } else {
+        8
+    } {
+        let name = format!("timeline-overlap-{index}");
+        let tarball = make_tarball(&name, "1.0.0");
+        registry.with_package(&name, "1.0.0", &tarball).await;
+        Mock::given(method("GET"))
+            .and(path(MockRegistry::tarball_path(&name, "1.0.0")))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_bytes(tarball)
+                    .set_delay(std::time::Duration::from_millis(100)),
+            )
+            .with_priority(1)
+            .mount(registry.server())
+            .await;
+        dependencies.insert(name, serde_json::json!("1.0.0"));
+    }
+    let manifest = serde_json::json!({"name":"timeline-overlap","version":"1.0.0","private":true,"dependencies":dependencies});
+    let project = TempProject::empty(&manifest.to_string());
+    if workspace {
+        project.write_file("package.json", &serde_json::json!({"name":"timeline-workspace","version":"1.0.0","private":true,"workspaces":["packages/*"]}).to_string());
+        project.write_file("packages/member/package.json", &manifest.to_string());
+    }
+    if !matches!(route, "workspace" | "experimental") {
+        project.write_file(".npmrc", &format!("registry={}/\n", registry.url()));
+    }
+    if route == "policy" {
+        let config = serde_json::json!({"policy":{"extensions":{"timeline":{"command":[assert_cmd::cargo::cargo_bin("workflows-policy-extension").display().to_string(), "--action", "allow", "--name", "timeline-overlap-0", "--version", "1.0.0"],"mode":"enforce"}}}});
+        std::fs::create_dir_all(project.home().join(".lpm")).unwrap();
+        std::fs::write(
+            project.home().join(".lpm/config.toml"),
+            toml::to_string(&config).unwrap(),
+        )
+        .unwrap();
+    }
+    let directory = project.path().join("timeline");
+    let mut command = lpm_with_registry(&project, &registry.url());
+    command
+        .env("LPM_INSTALL_TIMELINE_DIR", &directory)
+        .env("LPM_FETCH_OVERLAP_MIN_SELECTED", "1")
+        .env("LPM_FUSION_SPECULATION_PERMITS", "1")
+        .env("LPM_TIMING_DETAIL", "1")
+        .args([
+            "--json",
+            "install",
+            "--timing",
+            "--no-frozen-lockfile",
+            "--no-skills",
+            "--no-editor-setup",
+            "--no-security-summary",
+        ]);
+    if workspace {
+        command
+            .env("LPM_INTERNAL_TEST_NPM_REGISTRY_URL", registry.url())
+            .arg("--recursive");
+    }
+    if route == "experimental" {
+        command
+            .env("LPM_INTERNAL_TEST_NPM_REGISTRY_URL", registry.url())
+            .env("LPM_EXPERIMENTAL_INSTALLER_SPIKE", "1")
+            .env("LPM_INSTALLER_SPIKE_BENCHMARK_ONLY", "1")
+            .env("LPM_INSTALLER_SPIKE_GRAPH", "resolve-worklist")
+            .env("LPM_INSTALLER_SPIKE_PARITY", "deny");
+    }
+    let output = command.output().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let files = artifacts(&directory);
+    assert_eq!(files.len(), 1);
+    let records = files[0]["records"].as_array().unwrap();
+    let spans: std::collections::HashMap<u64, &serde_json::Value> = records
+        .iter()
+        .filter(|r| r["kind"] == "span_open")
+        .map(|r| (r["id"].as_u64().unwrap(), r))
+        .collect();
+    let fetches: Vec<_> = spans
+        .values()
+        .filter(|r| r["name"] == "tarball_fetch")
+        .collect();
+    assert!(
+        !fetches.is_empty(),
+        "fixture must exercise authoritative overlap fetches"
+    );
+    let expected_marker = match route {
+        "normal" => "selected_fetch_dispatch",
+        "workspace" => "workspace_fetch_task",
+        "policy" => "package_fetch_dispatch",
+        "experimental" => "resolver_fetch_task",
+        _ => panic!("unknown fixture route"),
+    };
+    let mut route_exercised = false;
+    for fetch in fetches {
+        let mut current = Some(fetch["id"].as_u64().unwrap());
+        let mut reached_install = false;
+        while let Some(id) = current {
+            let span = spans[&id];
+            route_exercised |= span["name"] == expected_marker;
+            if span["name"] == "install_pipeline" {
+                reached_install = true;
+                break;
+            }
+            current = span["parent"].as_u64();
+        }
+        assert!(
+            reached_install,
+            "overlap fetch lacks install ancestry: {fetch}"
+        );
+    }
+    assert!(
+        route_exercised,
+        "fixture did not fetch through {expected_marker}"
+    );
+}
+
+#[tokio::test]
+async fn overlapping_resolution_fetches_retain_install_timeline_ancestry() {
+    assert_overlap_fetch_ancestry("normal").await;
+}
+
+#[tokio::test]
+async fn workspace_shared_fetches_retain_install_timeline_ancestry() {
+    assert_overlap_fetch_ancestry("workspace").await;
+}
+
+#[tokio::test]
+async fn post_policy_fetches_retain_install_timeline_ancestry() {
+    assert_overlap_fetch_ancestry("policy").await;
+}
+
+#[tokio::test]
+async fn experimental_fetches_retain_install_timeline_ancestry() {
+    assert_overlap_fetch_ancestry("experimental").await;
+}

@@ -2,6 +2,7 @@ use super::super::*;
 use super::ExperimentalResolverStats;
 use super::PackageIdentity;
 use super::graph::{PackageDraft, package_should_materialize};
+use tracing::Instrument as _;
 
 pub(super) type FetchHandle = tokio::task::JoinHandle<Result<FetchOutcome, LpmError>>;
 
@@ -198,7 +199,7 @@ pub(super) fn maybe_spawn_fetch(
     stats.fetch_dispatched += 1;
     let store = store.clone();
     let project_dir = project_dir.to_path_buf();
-    let handle = tokio::spawn(async move {
+    let task = async move {
         if is_local_source_package(&package) {
             if package.store_has_source_aware(&store, &project_dir) {
                 return Ok(FetchOutcome {
@@ -262,7 +263,11 @@ pub(super) fn maybe_spawn_fetch(
             timings: Some(timings),
             cached: false,
         })
-    });
+    };
+    let handle =
+        tokio::spawn(task.instrument(
+            tracing::trace_span!(target: "lpm_install_timeline", "resolver_fetch_task"),
+        ));
     fetch_handles.insert(insert_key, handle);
 }
 
