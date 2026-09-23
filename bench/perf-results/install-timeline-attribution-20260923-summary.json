@@ -1,0 +1,4704 @@
+{
+  "cohorts": {
+    "timeline-nest-frozen/scored": {
+      "first-install//baseline": {
+        "wall_ms": {
+          "n": 36,
+          "median": 243.0,
+          "p95": 250,
+          "min": 232,
+          "max": 258
+        },
+        "rss_mib": {
+          "n": 36,
+          "median": 76.3359375,
+          "p95": 82.390625,
+          "min": 71.0625,
+          "max": 82.6875
+        },
+        "successful": 36,
+        "rows": 36
+      },
+      "first-install//disabled": {
+        "wall_ms": {
+          "n": 36,
+          "median": 242.0,
+          "p95": 259,
+          "min": 234,
+          "max": 261
+        },
+        "rss_mib": {
+          "n": 36,
+          "median": 76.7421875,
+          "p95": 79.546875,
+          "min": 70.90625,
+          "max": 80.375
+        },
+        "successful": 36,
+        "rows": 36
+      },
+      "first-install//enabled": {
+        "wall_ms": {
+          "n": 36,
+          "median": 241.0,
+          "p95": 250,
+          "min": 235,
+          "max": 251
+        },
+        "rss_mib": {
+          "n": 36,
+          "median": 77.359375,
+          "p95": 80.40625,
+          "min": 72.6875,
+          "max": 82.265625
+        },
+        "successful": 36,
+        "rows": 36
+      }
+    },
+    "timeline-vite-frozen/scored": {
+      "first-install//baseline": {
+        "wall_ms": {
+          "n": 36,
+          "median": 250.5,
+          "p95": 262,
+          "min": 242,
+          "max": 270
+        },
+        "rss_mib": {
+          "n": 36,
+          "median": 184.171875,
+          "p95": 201.21875,
+          "min": 168.890625,
+          "max": 202.3125
+        },
+        "successful": 36,
+        "rows": 36
+      },
+      "first-install//disabled": {
+        "wall_ms": {
+          "n": 36,
+          "median": 252.5,
+          "p95": 264,
+          "min": 241,
+          "max": 271
+        },
+        "rss_mib": {
+          "n": 36,
+          "median": 186.9921875,
+          "p95": 200.34375,
+          "min": 170.109375,
+          "max": 203.75
+        },
+        "successful": 36,
+        "rows": 36
+      },
+      "first-install//enabled": {
+        "wall_ms": {
+          "n": 36,
+          "median": 253.0,
+          "p95": 269,
+          "min": 240,
+          "max": 272
+        },
+        "rss_mib": {
+          "n": 36,
+          "median": 187.296875,
+          "p95": 201.5,
+          "min": 173.921875,
+          "max": 207.9375
+        },
+        "successful": 36,
+        "rows": 36
+      }
+    },
+    "timeline-live-nest": {
+      "first-install//enabled": {
+        "wall_ms": {
+          "n": 36,
+          "median": 333.0,
+          "p95": 474,
+          "min": 306,
+          "max": 533
+        },
+        "rss_mib": {
+          "n": 36,
+          "median": 102.125,
+          "p95": 111.78125,
+          "min": 91.34375,
+          "max": 112.625
+        },
+        "successful": 36,
+        "rows": 36
+      }
+    },
+    "timeline-live-t3": {
+      "ci-cold-cache//enabled": {
+        "wall_ms": {
+          "n": 2,
+          "median": 1515.0,
+          "p95": 1519,
+          "min": 1511,
+          "max": 1519
+        },
+        "rss_mib": {
+          "n": 2,
+          "median": 227.0859375,
+          "p95": 233.625,
+          "min": 220.546875,
+          "max": 233.625
+        },
+        "successful": 2,
+        "rows": 2
+      }
+    },
+    "timeline-sharp-frozen/scored": {
+      "first-install//baseline": {
+        "wall_ms": {
+          "n": 36,
+          "median": 105.0,
+          "p95": 115,
+          "min": 98,
+          "max": 120
+        },
+        "rss_mib": {
+          "n": 36,
+          "median": 56.7890625,
+          "p95": 59.640625,
+          "min": 53.609375,
+          "max": 60.421875
+        },
+        "successful": 36,
+        "rows": 36
+      },
+      "first-install//disabled": {
+        "wall_ms": {
+          "n": 36,
+          "median": 105.0,
+          "p95": 115,
+          "min": 100,
+          "max": 178
+        },
+        "rss_mib": {
+          "n": 36,
+          "median": 57.28125,
+          "p95": 62.75,
+          "min": 54.109375,
+          "max": 63.671875
+        },
+        "successful": 36,
+        "rows": 36
+      },
+      "first-install//enabled": {
+        "wall_ms": {
+          "n": 36,
+          "median": 105.5,
+          "p95": 113,
+          "min": 100,
+          "max": 117
+        },
+        "rss_mib": {
+          "n": 36,
+          "median": 56.53125,
+          "p95": 64.046875,
+          "min": 54.234375,
+          "max": 64.28125
+        },
+        "successful": 36,
+        "rows": 36
+      }
+    },
+    "timeline-live-sharp-confirmation": {
+      "first-install//baseline": {
+        "wall_ms": {
+          "n": 36,
+          "median": 282.5,
+          "p95": 759,
+          "min": 244,
+          "max": 769
+        },
+        "rss_mib": {
+          "n": 36,
+          "median": 57.90625,
+          "p95": 62.78125,
+          "min": 52.640625,
+          "max": 63.125
+        },
+        "successful": 36,
+        "rows": 36
+      },
+      "first-install//disabled": {
+        "wall_ms": {
+          "n": 36,
+          "median": 299.0,
+          "p95": 504,
+          "min": 247,
+          "max": 559
+        },
+        "rss_mib": {
+          "n": 36,
+          "median": 60.5703125,
+          "p95": 66.078125,
+          "min": 56.203125,
+          "max": 67.171875
+        },
+        "successful": 36,
+        "rows": 36
+      },
+      "first-install//bun": {
+        "wall_ms": {
+          "n": 36,
+          "median": 228.0,
+          "p95": 357,
+          "min": 189,
+          "max": 1751
+        },
+        "rss_mib": {
+          "n": 36,
+          "median": 21.2421875,
+          "p95": 23.328125,
+          "min": 20.109375,
+          "max": 24.09375
+        },
+        "successful": 36,
+        "rows": 36
+      }
+    },
+    "timeline-readiness-warmup": {
+      "vite-react/cold/baseline": {
+        "wall_ms": {
+          "n": 1,
+          "median": 710,
+          "p95": 710,
+          "min": 710,
+          "max": 710
+        },
+        "rss_mib": {
+          "n": 1,
+          "median": 205.875,
+          "p95": 205.875,
+          "min": 205.875,
+          "max": 205.875
+        },
+        "successful": 1,
+        "rows": 1
+      },
+      "vite-react/warm/baseline": {
+        "wall_ms": {
+          "n": 1,
+          "median": 59,
+          "p95": 59,
+          "min": 59,
+          "max": 59
+        },
+        "rss_mib": {
+          "n": 1,
+          "median": 43.25,
+          "p95": 43.25,
+          "min": 43.25,
+          "max": 43.25
+        },
+        "successful": 1,
+        "rows": 1
+      },
+      "vite-react/up-to-date/baseline": {
+        "wall_ms": {
+          "n": 1,
+          "median": 32,
+          "p95": 32,
+          "min": 32,
+          "max": 32
+        },
+        "rss_mib": {
+          "n": 1,
+          "median": 23.375,
+          "p95": 23.375,
+          "min": 23.375,
+          "max": 23.375
+        },
+        "successful": 1,
+        "rows": 1
+      },
+      "vite-react/cold/candidate": {
+        "wall_ms": {
+          "n": 1,
+          "median": 653,
+          "p95": 653,
+          "min": 653,
+          "max": 653
+        },
+        "rss_mib": {
+          "n": 1,
+          "median": 204.609375,
+          "p95": 204.609375,
+          "min": 204.609375,
+          "max": 204.609375
+        },
+        "successful": 1,
+        "rows": 1
+      },
+      "vite-react/warm/candidate": {
+        "wall_ms": {
+          "n": 1,
+          "median": 59,
+          "p95": 59,
+          "min": 59,
+          "max": 59
+        },
+        "rss_mib": {
+          "n": 1,
+          "median": 48.203125,
+          "p95": 48.203125,
+          "min": 48.203125,
+          "max": 48.203125
+        },
+        "successful": 1,
+        "rows": 1
+      },
+      "vite-react/up-to-date/candidate": {
+        "wall_ms": {
+          "n": 1,
+          "median": 28,
+          "p95": 28,
+          "min": 28,
+          "max": 28
+        },
+        "rss_mib": {
+          "n": 1,
+          "median": 23.625,
+          "p95": 23.625,
+          "min": 23.625,
+          "max": 23.625
+        },
+        "successful": 1,
+        "rows": 1
+      },
+      "vite-react/cold/bun": {
+        "wall_ms": {
+          "n": 1,
+          "median": 587,
+          "p95": 587,
+          "min": 587,
+          "max": 587
+        },
+        "rss_mib": {
+          "n": 1,
+          "median": 124.15625,
+          "p95": 124.15625,
+          "min": 124.15625,
+          "max": 124.15625
+        },
+        "successful": 1,
+        "rows": 1
+      },
+      "vite-react/warm/bun": {
+        "wall_ms": {
+          "n": 1,
+          "median": 27,
+          "p95": 27,
+          "min": 27,
+          "max": 27
+        },
+        "rss_mib": {
+          "n": 1,
+          "median": 6.734375,
+          "p95": 6.734375,
+          "min": 6.734375,
+          "max": 6.734375
+        },
+        "successful": 1,
+        "rows": 1
+      },
+      "vite-react/up-to-date/bun": {
+        "wall_ms": {
+          "n": 1,
+          "median": 15,
+          "p95": 15,
+          "min": 15,
+          "max": 15
+        },
+        "rss_mib": {
+          "n": 1,
+          "median": 6.765625,
+          "p95": 6.765625,
+          "min": 6.765625,
+          "max": 6.765625
+        },
+        "successful": 1,
+        "rows": 1
+      },
+      "native-sharp/cold/baseline": {
+        "wall_ms": {
+          "n": 1,
+          "median": 352,
+          "p95": 352,
+          "min": 352,
+          "max": 352
+        },
+        "rss_mib": {
+          "n": 1,
+          "median": 55.5,
+          "p95": 55.5,
+          "min": 55.5,
+          "max": 55.5
+        },
+        "successful": 1,
+        "rows": 1
+      },
+      "native-sharp/warm/baseline": {
+        "wall_ms": {
+          "n": 1,
+          "median": 44,
+          "p95": 44,
+          "min": 44,
+          "max": 44
+        },
+        "rss_mib": {
+          "n": 1,
+          "median": 33.234375,
+          "p95": 33.234375,
+          "min": 33.234375,
+          "max": 33.234375
+        },
+        "successful": 1,
+        "rows": 1
+      },
+      "native-sharp/up-to-date/baseline": {
+        "wall_ms": {
+          "n": 1,
+          "median": 31,
+          "p95": 31,
+          "min": 31,
+          "max": 31
+        },
+        "rss_mib": {
+          "n": 1,
+          "median": 21.953125,
+          "p95": 21.953125,
+          "min": 21.953125,
+          "max": 21.953125
+        },
+        "successful": 1,
+        "rows": 1
+      },
+      "native-sharp/cold/candidate": {
+        "wall_ms": {
+          "n": 1,
+          "median": 365,
+          "p95": 365,
+          "min": 365,
+          "max": 365
+        },
+        "rss_mib": {
+          "n": 1,
+          "median": 63.390625,
+          "p95": 63.390625,
+          "min": 63.390625,
+          "max": 63.390625
+        },
+        "successful": 1,
+        "rows": 1
+      },
+      "native-sharp/warm/candidate": {
+        "wall_ms": {
+          "n": 1,
+          "median": 42,
+          "p95": 42,
+          "min": 42,
+          "max": 42
+        },
+        "rss_mib": {
+          "n": 1,
+          "median": 33.765625,
+          "p95": 33.765625,
+          "min": 33.765625,
+          "max": 33.765625
+        },
+        "successful": 1,
+        "rows": 1
+      },
+      "native-sharp/up-to-date/candidate": {
+        "wall_ms": {
+          "n": 1,
+          "median": 28,
+          "p95": 28,
+          "min": 28,
+          "max": 28
+        },
+        "rss_mib": {
+          "n": 1,
+          "median": 22.046875,
+          "p95": 22.046875,
+          "min": 22.046875,
+          "max": 22.046875
+        },
+        "successful": 1,
+        "rows": 1
+      },
+      "native-sharp/cold/bun": {
+        "wall_ms": {
+          "n": 1,
+          "median": 190,
+          "p95": 190,
+          "min": 190,
+          "max": 190
+        },
+        "rss_mib": {
+          "n": 1,
+          "median": 21.734375,
+          "p95": 21.734375,
+          "min": 21.734375,
+          "max": 21.734375
+        },
+        "successful": 1,
+        "rows": 1
+      },
+      "native-sharp/warm/bun": {
+        "wall_ms": {
+          "n": 1,
+          "median": 10,
+          "p95": 10,
+          "min": 10,
+          "max": 10
+        },
+        "rss_mib": {
+          "n": 1,
+          "median": 6.34375,
+          "p95": 6.34375,
+          "min": 6.34375,
+          "max": 6.34375
+        },
+        "successful": 1,
+        "rows": 1
+      },
+      "native-sharp/up-to-date/bun": {
+        "wall_ms": {
+          "n": 1,
+          "median": 9,
+          "p95": 9,
+          "min": 9,
+          "max": 9
+        },
+        "rss_mib": {
+          "n": 1,
+          "median": 6.328125,
+          "p95": 6.328125,
+          "min": 6.328125,
+          "max": 6.328125
+        },
+        "successful": 1,
+        "rows": 1
+      },
+      "nest/cold/baseline": {
+        "wall_ms": {
+          "n": 1,
+          "median": 338,
+          "p95": 338,
+          "min": 338,
+          "max": 338
+        },
+        "rss_mib": {
+          "n": 1,
+          "median": 99.796875,
+          "p95": 99.796875,
+          "min": 99.796875,
+          "max": 99.796875
+        },
+        "successful": 1,
+        "rows": 1
+      },
+      "nest/warm/baseline": {
+        "wall_ms": {
+          "n": 1,
+          "median": 52,
+          "p95": 52,
+          "min": 52,
+          "max": 52
+        },
+        "rss_mib": {
+          "n": 1,
+          "median": 37.421875,
+          "p95": 37.421875,
+          "min": 37.421875,
+          "max": 37.421875
+        },
+        "successful": 1,
+        "rows": 1
+      },
+      "nest/up-to-date/baseline": {
+        "wall_ms": {
+          "n": 1,
+          "median": 33,
+          "p95": 33,
+          "min": 33,
+          "max": 33
+        },
+        "rss_mib": {
+          "n": 1,
+          "median": 21.953125,
+          "p95": 21.953125,
+          "min": 21.953125,
+          "max": 21.953125
+        },
+        "successful": 1,
+        "rows": 1
+      },
+      "nest/cold/candidate": {
+        "wall_ms": {
+          "n": 1,
+          "median": 332,
+          "p95": 332,
+          "min": 332,
+          "max": 332
+        },
+        "rss_mib": {
+          "n": 1,
+          "median": 104.140625,
+          "p95": 104.140625,
+          "min": 104.140625,
+          "max": 104.140625
+        },
+        "successful": 1,
+        "rows": 1
+      },
+      "nest/warm/candidate": {
+        "wall_ms": {
+          "n": 1,
+          "median": 51,
+          "p95": 51,
+          "min": 51,
+          "max": 51
+        },
+        "rss_mib": {
+          "n": 1,
+          "median": 38.609375,
+          "p95": 38.609375,
+          "min": 38.609375,
+          "max": 38.609375
+        },
+        "successful": 1,
+        "rows": 1
+      },
+      "nest/up-to-date/candidate": {
+        "wall_ms": {
+          "n": 1,
+          "median": 31,
+          "p95": 31,
+          "min": 31,
+          "max": 31
+        },
+        "rss_mib": {
+          "n": 1,
+          "median": 22.03125,
+          "p95": 22.03125,
+          "min": 22.03125,
+          "max": 22.03125
+        },
+        "successful": 1,
+        "rows": 1
+      },
+      "nest/cold/bun": {
+        "wall_ms": {
+          "n": 1,
+          "median": 283,
+          "p95": 283,
+          "min": 283,
+          "max": 283
+        },
+        "rss_mib": {
+          "n": 1,
+          "median": 35.53125,
+          "p95": 35.53125,
+          "min": 35.53125,
+          "max": 35.53125
+        },
+        "successful": 1,
+        "rows": 1
+      },
+      "nest/warm/bun": {
+        "wall_ms": {
+          "n": 1,
+          "median": 32,
+          "p95": 32,
+          "min": 32,
+          "max": 32
+        },
+        "rss_mib": {
+          "n": 1,
+          "median": 6.359375,
+          "p95": 6.359375,
+          "min": 6.359375,
+          "max": 6.359375
+        },
+        "successful": 1,
+        "rows": 1
+      },
+      "nest/up-to-date/bun": {
+        "wall_ms": {
+          "n": 1,
+          "median": 12,
+          "p95": 12,
+          "min": 12,
+          "max": 12
+        },
+        "rss_mib": {
+          "n": 1,
+          "median": 6.359375,
+          "p95": 6.359375,
+          "min": 6.359375,
+          "max": 6.359375
+        },
+        "successful": 1,
+        "rows": 1
+      },
+      "t3/cold/baseline": {
+        "wall_ms": {
+          "n": 1,
+          "median": 2065,
+          "p95": 2065,
+          "min": 2065,
+          "max": 2065
+        },
+        "rss_mib": {
+          "n": 1,
+          "median": 335.78125,
+          "p95": 335.78125,
+          "min": 335.78125,
+          "max": 335.78125
+        },
+        "successful": 1,
+        "rows": 1
+      },
+      "t3/warm/baseline": {
+        "wall_ms": {
+          "n": 1,
+          "median": 101,
+          "p95": 101,
+          "min": 101,
+          "max": 101
+        },
+        "rss_mib": {
+          "n": 1,
+          "median": 53.0625,
+          "p95": 53.0625,
+          "min": 53.0625,
+          "max": 53.0625
+        },
+        "successful": 1,
+        "rows": 1
+      },
+      "t3/up-to-date/baseline": {
+        "wall_ms": {
+          "n": 1,
+          "median": 34,
+          "p95": 34,
+          "min": 34,
+          "max": 34
+        },
+        "rss_mib": {
+          "n": 1,
+          "median": 25.125,
+          "p95": 25.125,
+          "min": 25.125,
+          "max": 25.125
+        },
+        "successful": 1,
+        "rows": 1
+      },
+      "t3/cold/candidate": {
+        "wall_ms": {
+          "n": 1,
+          "median": 1912,
+          "p95": 1912,
+          "min": 1912,
+          "max": 1912
+        },
+        "rss_mib": {
+          "n": 1,
+          "median": 329.59375,
+          "p95": 329.59375,
+          "min": 329.59375,
+          "max": 329.59375
+        },
+        "successful": 1,
+        "rows": 1
+      },
+      "t3/warm/candidate": {
+        "wall_ms": {
+          "n": 1,
+          "median": 103,
+          "p95": 103,
+          "min": 103,
+          "max": 103
+        },
+        "rss_mib": {
+          "n": 1,
+          "median": 55.546875,
+          "p95": 55.546875,
+          "min": 55.546875,
+          "max": 55.546875
+        },
+        "successful": 1,
+        "rows": 1
+      },
+      "t3/up-to-date/candidate": {
+        "wall_ms": {
+          "n": 1,
+          "median": 34,
+          "p95": 34,
+          "min": 34,
+          "max": 34
+        },
+        "rss_mib": {
+          "n": 1,
+          "median": 25.25,
+          "p95": 25.25,
+          "min": 25.25,
+          "max": 25.25
+        },
+        "successful": 1,
+        "rows": 1
+      },
+      "t3/cold/bun": {
+        "wall_ms": {
+          "n": 1,
+          "median": 1619,
+          "p95": 1619,
+          "min": 1619,
+          "max": 1619
+        },
+        "rss_mib": {
+          "n": 1,
+          "median": 370.828125,
+          "p95": 370.828125,
+          "min": 370.828125,
+          "max": 370.828125
+        },
+        "successful": 1,
+        "rows": 1
+      },
+      "t3/warm/bun": {
+        "wall_ms": {
+          "n": 1,
+          "median": 183,
+          "p95": 183,
+          "min": 183,
+          "max": 183
+        },
+        "rss_mib": {
+          "n": 1,
+          "median": 7.234375,
+          "p95": 7.234375,
+          "min": 7.234375,
+          "max": 7.234375
+        },
+        "successful": 1,
+        "rows": 1
+      },
+      "t3/up-to-date/bun": {
+        "wall_ms": {
+          "n": 1,
+          "median": 21,
+          "p95": 21,
+          "min": 21,
+          "max": 21
+        },
+        "rss_mib": {
+          "n": 1,
+          "median": 7.859375,
+          "p95": 7.859375,
+          "min": 7.859375,
+          "max": 7.859375
+        },
+        "successful": 1,
+        "rows": 1
+      }
+    },
+    "timeline-readiness-scored": {
+      "vite-react/cold/baseline": {
+        "wall_ms": {
+          "n": 12,
+          "median": 680.5,
+          "p95": 960,
+          "min": 548,
+          "max": 960
+        },
+        "rss_mib": {
+          "n": 12,
+          "median": 204.5625,
+          "p95": 220.921875,
+          "min": 193.296875,
+          "max": 220.921875
+        },
+        "successful": 12,
+        "rows": 12
+      },
+      "vite-react/warm/baseline": {
+        "wall_ms": {
+          "n": 12,
+          "median": 59.0,
+          "p95": 63,
+          "min": 55,
+          "max": 63
+        },
+        "rss_mib": {
+          "n": 12,
+          "median": 44.7734375,
+          "p95": 46.578125,
+          "min": 43.796875,
+          "max": 46.578125
+        },
+        "successful": 12,
+        "rows": 12
+      },
+      "vite-react/up-to-date/baseline": {
+        "wall_ms": {
+          "n": 12,
+          "median": 30.5,
+          "p95": 34,
+          "min": 28,
+          "max": 34
+        },
+        "rss_mib": {
+          "n": 12,
+          "median": 23.375,
+          "p95": 23.390625,
+          "min": 23.328125,
+          "max": 23.390625
+        },
+        "successful": 12,
+        "rows": 12
+      },
+      "vite-react/cold/candidate": {
+        "wall_ms": {
+          "n": 12,
+          "median": 654.5,
+          "p95": 1036,
+          "min": 602,
+          "max": 1036
+        },
+        "rss_mib": {
+          "n": 12,
+          "median": 209.125,
+          "p95": 226.046875,
+          "min": 188.890625,
+          "max": 226.046875
+        },
+        "successful": 12,
+        "rows": 12
+      },
+      "vite-react/warm/candidate": {
+        "wall_ms": {
+          "n": 12,
+          "median": 60.0,
+          "p95": 63,
+          "min": 55,
+          "max": 63
+        },
+        "rss_mib": {
+          "n": 12,
+          "median": 45.25,
+          "p95": 52.75,
+          "min": 43.40625,
+          "max": 52.75
+        },
+        "successful": 12,
+        "rows": 12
+      },
+      "vite-react/up-to-date/candidate": {
+        "wall_ms": {
+          "n": 12,
+          "median": 29.0,
+          "p95": 33,
+          "min": 28,
+          "max": 33
+        },
+        "rss_mib": {
+          "n": 12,
+          "median": 23.625,
+          "p95": 23.625,
+          "min": 23.578125,
+          "max": 23.625
+        },
+        "successful": 12,
+        "rows": 12
+      },
+      "vite-react/cold/bun": {
+        "wall_ms": {
+          "n": 12,
+          "median": 493.0,
+          "p95": 599,
+          "min": 354,
+          "max": 599
+        },
+        "rss_mib": {
+          "n": 12,
+          "median": 141.3515625,
+          "p95": 147.5625,
+          "min": 124.28125,
+          "max": 147.5625
+        },
+        "successful": 12,
+        "rows": 12
+      },
+      "vite-react/warm/bun": {
+        "wall_ms": {
+          "n": 12,
+          "median": 30.0,
+          "p95": 33,
+          "min": 27,
+          "max": 33
+        },
+        "rss_mib": {
+          "n": 12,
+          "median": 6.734375,
+          "p95": 6.75,
+          "min": 6.734375,
+          "max": 6.75
+        },
+        "successful": 12,
+        "rows": 12
+      },
+      "vite-react/up-to-date/bun": {
+        "wall_ms": {
+          "n": 12,
+          "median": 15.5,
+          "p95": 18,
+          "min": 15,
+          "max": 18
+        },
+        "rss_mib": {
+          "n": 12,
+          "median": 6.765625,
+          "p95": 6.78125,
+          "min": 6.75,
+          "max": 6.78125
+        },
+        "successful": 12,
+        "rows": 12
+      },
+      "native-sharp/cold/baseline": {
+        "wall_ms": {
+          "n": 12,
+          "median": 277.5,
+          "p95": 434,
+          "min": 251,
+          "max": 434
+        },
+        "rss_mib": {
+          "n": 12,
+          "median": 60.546875,
+          "p95": 66.96875,
+          "min": 55.5,
+          "max": 66.96875
+        },
+        "successful": 12,
+        "rows": 12
+      },
+      "native-sharp/warm/baseline": {
+        "wall_ms": {
+          "n": 12,
+          "median": 41.0,
+          "p95": 44,
+          "min": 37,
+          "max": 44
+        },
+        "rss_mib": {
+          "n": 12,
+          "median": 33.03125,
+          "p95": 33.25,
+          "min": 32.703125,
+          "max": 33.25
+        },
+        "successful": 12,
+        "rows": 12
+      },
+      "native-sharp/up-to-date/baseline": {
+        "wall_ms": {
+          "n": 12,
+          "median": 29.5,
+          "p95": 32,
+          "min": 27,
+          "max": 32
+        },
+        "rss_mib": {
+          "n": 12,
+          "median": 21.953125,
+          "p95": 21.984375,
+          "min": 21.9375,
+          "max": 21.984375
+        },
+        "successful": 12,
+        "rows": 12
+      },
+      "native-sharp/cold/candidate": {
+        "wall_ms": {
+          "n": 12,
+          "median": 306.5,
+          "p95": 684,
+          "min": 245,
+          "max": 684
+        },
+        "rss_mib": {
+          "n": 12,
+          "median": 61.7265625,
+          "p95": 66.640625,
+          "min": 57.359375,
+          "max": 66.640625
+        },
+        "successful": 12,
+        "rows": 12
+      },
+      "native-sharp/warm/candidate": {
+        "wall_ms": {
+          "n": 12,
+          "median": 39.5,
+          "p95": 45,
+          "min": 37,
+          "max": 45
+        },
+        "rss_mib": {
+          "n": 12,
+          "median": 33.7578125,
+          "p95": 33.828125,
+          "min": 32.890625,
+          "max": 33.828125
+        },
+        "successful": 12,
+        "rows": 12
+      },
+      "native-sharp/up-to-date/candidate": {
+        "wall_ms": {
+          "n": 12,
+          "median": 28.0,
+          "p95": 32,
+          "min": 26,
+          "max": 32
+        },
+        "rss_mib": {
+          "n": 12,
+          "median": 22.046875,
+          "p95": 22.0625,
+          "min": 22.03125,
+          "max": 22.0625
+        },
+        "successful": 12,
+        "rows": 12
+      },
+      "native-sharp/cold/bun": {
+        "wall_ms": {
+          "n": 12,
+          "median": 242.0,
+          "p95": 326,
+          "min": 207,
+          "max": 326
+        },
+        "rss_mib": {
+          "n": 12,
+          "median": 21.5703125,
+          "p95": 24.1875,
+          "min": 19.96875,
+          "max": 24.1875
+        },
+        "successful": 12,
+        "rows": 12
+      },
+      "native-sharp/warm/bun": {
+        "wall_ms": {
+          "n": 12,
+          "median": 9.5,
+          "p95": 11,
+          "min": 8,
+          "max": 11
+        },
+        "rss_mib": {
+          "n": 12,
+          "median": 6.34375,
+          "p95": 6.34375,
+          "min": 6.328125,
+          "max": 6.34375
+        },
+        "successful": 12,
+        "rows": 12
+      },
+      "native-sharp/up-to-date/bun": {
+        "wall_ms": {
+          "n": 12,
+          "median": 8.0,
+          "p95": 10,
+          "min": 7,
+          "max": 10
+        },
+        "rss_mib": {
+          "n": 12,
+          "median": 6.328125,
+          "p95": 6.34375,
+          "min": 6.3125,
+          "max": 6.34375
+        },
+        "successful": 12,
+        "rows": 12
+      },
+      "nest/cold/baseline": {
+        "wall_ms": {
+          "n": 12,
+          "median": 370.0,
+          "p95": 540,
+          "min": 315,
+          "max": 540
+        },
+        "rss_mib": {
+          "n": 12,
+          "median": 101.59375,
+          "p95": 111.578125,
+          "min": 92.265625,
+          "max": 111.578125
+        },
+        "successful": 12,
+        "rows": 12
+      },
+      "nest/warm/baseline": {
+        "wall_ms": {
+          "n": 12,
+          "median": 50.0,
+          "p95": 53,
+          "min": 46,
+          "max": 53
+        },
+        "rss_mib": {
+          "n": 12,
+          "median": 39.0703125,
+          "p95": 40.765625,
+          "min": 37.6875,
+          "max": 40.765625
+        },
+        "successful": 12,
+        "rows": 12
+      },
+      "nest/up-to-date/baseline": {
+        "wall_ms": {
+          "n": 12,
+          "median": 29.5,
+          "p95": 35,
+          "min": 27,
+          "max": 35
+        },
+        "rss_mib": {
+          "n": 12,
+          "median": 21.9375,
+          "p95": 21.953125,
+          "min": 21.921875,
+          "max": 21.953125
+        },
+        "successful": 12,
+        "rows": 12
+      },
+      "nest/cold/candidate": {
+        "wall_ms": {
+          "n": 12,
+          "median": 334.0,
+          "p95": 621,
+          "min": 314,
+          "max": 621
+        },
+        "rss_mib": {
+          "n": 12,
+          "median": 108.0078125,
+          "p95": 115.84375,
+          "min": 98.0625,
+          "max": 115.84375
+        },
+        "successful": 12,
+        "rows": 12
+      },
+      "nest/warm/candidate": {
+        "wall_ms": {
+          "n": 12,
+          "median": 50.0,
+          "p95": 54,
+          "min": 47,
+          "max": 54
+        },
+        "rss_mib": {
+          "n": 12,
+          "median": 39.7109375,
+          "p95": 41.484375,
+          "min": 38.25,
+          "max": 41.484375
+        },
+        "successful": 12,
+        "rows": 12
+      },
+      "nest/up-to-date/candidate": {
+        "wall_ms": {
+          "n": 12,
+          "median": 28.5,
+          "p95": 32,
+          "min": 27,
+          "max": 32
+        },
+        "rss_mib": {
+          "n": 12,
+          "median": 22.03125,
+          "p95": 22.03125,
+          "min": 22.015625,
+          "max": 22.03125
+        },
+        "successful": 12,
+        "rows": 12
+      },
+      "nest/cold/bun": {
+        "wall_ms": {
+          "n": 12,
+          "median": 304.5,
+          "p95": 106186,
+          "min": 260,
+          "max": 106186
+        },
+        "rss_mib": {
+          "n": 12,
+          "median": 37.28125,
+          "p95": 40.265625,
+          "min": 34.78125,
+          "max": 40.265625
+        },
+        "successful": 12,
+        "rows": 12
+      },
+      "nest/warm/bun": {
+        "wall_ms": {
+          "n": 12,
+          "median": 32.0,
+          "p95": 33,
+          "min": 28,
+          "max": 33
+        },
+        "rss_mib": {
+          "n": 12,
+          "median": 6.359375,
+          "p95": 6.359375,
+          "min": 6.359375,
+          "max": 6.359375
+        },
+        "successful": 12,
+        "rows": 12
+      },
+      "nest/up-to-date/bun": {
+        "wall_ms": {
+          "n": 12,
+          "median": 11.0,
+          "p95": 12,
+          "min": 10,
+          "max": 12
+        },
+        "rss_mib": {
+          "n": 12,
+          "median": 6.359375,
+          "p95": 6.359375,
+          "min": 6.359375,
+          "max": 6.359375
+        },
+        "successful": 12,
+        "rows": 12
+      },
+      "t3/cold/baseline": {
+        "wall_ms": {
+          "n": 12,
+          "median": 1943.0,
+          "p95": 1998,
+          "min": 1806,
+          "max": 1998
+        },
+        "rss_mib": {
+          "n": 12,
+          "median": 332.6484375,
+          "p95": 348.484375,
+          "min": 309.8125,
+          "max": 348.484375
+        },
+        "successful": 12,
+        "rows": 12
+      },
+      "t3/warm/baseline": {
+        "wall_ms": {
+          "n": 12,
+          "median": 102.0,
+          "p95": 105,
+          "min": 95,
+          "max": 105
+        },
+        "rss_mib": {
+          "n": 12,
+          "median": 52.671875,
+          "p95": 55.03125,
+          "min": 50.453125,
+          "max": 55.03125
+        },
+        "successful": 12,
+        "rows": 12
+      },
+      "t3/up-to-date/baseline": {
+        "wall_ms": {
+          "n": 12,
+          "median": 32.5,
+          "p95": 34,
+          "min": 29,
+          "max": 34
+        },
+        "rss_mib": {
+          "n": 12,
+          "median": 25.171875,
+          "p95": 25.1875,
+          "min": 25.078125,
+          "max": 25.1875
+        },
+        "successful": 12,
+        "rows": 12
+      },
+      "t3/cold/candidate": {
+        "wall_ms": {
+          "n": 12,
+          "median": 1946.5,
+          "p95": 2115,
+          "min": 1799,
+          "max": 2115
+        },
+        "rss_mib": {
+          "n": 12,
+          "median": 334.2734375,
+          "p95": 376.484375,
+          "min": 307.703125,
+          "max": 376.484375
+        },
+        "successful": 12,
+        "rows": 12
+      },
+      "t3/warm/candidate": {
+        "wall_ms": {
+          "n": 12,
+          "median": 101.0,
+          "p95": 104,
+          "min": 98,
+          "max": 104
+        },
+        "rss_mib": {
+          "n": 12,
+          "median": 53.5859375,
+          "p95": 59.640625,
+          "min": 52.484375,
+          "max": 59.640625
+        },
+        "successful": 12,
+        "rows": 12
+      },
+      "t3/up-to-date/candidate": {
+        "wall_ms": {
+          "n": 12,
+          "median": 32.5,
+          "p95": 34,
+          "min": 29,
+          "max": 34
+        },
+        "rss_mib": {
+          "n": 12,
+          "median": 25.2734375,
+          "p95": 25.328125,
+          "min": 25.21875,
+          "max": 25.328125
+        },
+        "successful": 12,
+        "rows": 12
+      },
+      "t3/cold/bun": {
+        "wall_ms": {
+          "n": 12,
+          "median": 1720.0,
+          "p95": 1936,
+          "min": 1618,
+          "max": 1936
+        },
+        "rss_mib": {
+          "n": 12,
+          "median": 380.875,
+          "p95": 400.875,
+          "min": 360.859375,
+          "max": 400.875
+        },
+        "successful": 12,
+        "rows": 12
+      },
+      "t3/warm/bun": {
+        "wall_ms": {
+          "n": 12,
+          "median": 185.0,
+          "p95": 192,
+          "min": 176,
+          "max": 192
+        },
+        "rss_mib": {
+          "n": 12,
+          "median": 7.234375,
+          "p95": 7.25,
+          "min": 7.234375,
+          "max": 7.25
+        },
+        "successful": 12,
+        "rows": 12
+      },
+      "t3/up-to-date/bun": {
+        "wall_ms": {
+          "n": 12,
+          "median": 21.0,
+          "p95": 23,
+          "min": 20,
+          "max": 23
+        },
+        "rss_mib": {
+          "n": 12,
+          "median": 7.859375,
+          "p95": 7.875,
+          "min": 7.859375,
+          "max": 7.875
+        },
+        "successful": 12,
+        "rows": 12
+      }
+    },
+    "timeline-nest-final/scored": {
+      "first-install//baseline": {
+        "wall_ms": {
+          "n": 36,
+          "median": 239.0,
+          "p95": 251,
+          "min": 234,
+          "max": 253
+        },
+        "rss_mib": {
+          "n": 36,
+          "median": 76.078125,
+          "p95": 80.953125,
+          "min": 72.390625,
+          "max": 83.109375
+        },
+        "successful": 36,
+        "rows": 36
+      },
+      "first-install//disabled": {
+        "wall_ms": {
+          "n": 36,
+          "median": 240.0,
+          "p95": 259,
+          "min": 234,
+          "max": 276
+        },
+        "rss_mib": {
+          "n": 36,
+          "median": 78.1171875,
+          "p95": 83.03125,
+          "min": 71.859375,
+          "max": 85.484375
+        },
+        "successful": 36,
+        "rows": 36
+      },
+      "first-install//enabled": {
+        "wall_ms": {
+          "n": 36,
+          "median": 240.0,
+          "p95": 249,
+          "min": 235,
+          "max": 249
+        },
+        "rss_mib": {
+          "n": 36,
+          "median": 77.9609375,
+          "p95": 81.765625,
+          "min": 73.625,
+          "max": 86.796875
+        },
+        "successful": 36,
+        "rows": 36
+      }
+    },
+    "timeline-vite-final/scored": {
+      "first-install//baseline": {
+        "wall_ms": {
+          "n": 36,
+          "median": 251.0,
+          "p95": 283,
+          "min": 241,
+          "max": 308
+        },
+        "rss_mib": {
+          "n": 36,
+          "median": 183.671875,
+          "p95": 197.9375,
+          "min": 168.828125,
+          "max": 198.46875
+        },
+        "successful": 36,
+        "rows": 36
+      },
+      "first-install//disabled": {
+        "wall_ms": {
+          "n": 36,
+          "median": 248.5,
+          "p95": 298,
+          "min": 240,
+          "max": 312
+        },
+        "rss_mib": {
+          "n": 36,
+          "median": 188.28125,
+          "p95": 196.765625,
+          "min": 170.140625,
+          "max": 199.109375
+        },
+        "successful": 36,
+        "rows": 36
+      },
+      "first-install//enabled": {
+        "wall_ms": {
+          "n": 36,
+          "median": 255.5,
+          "p95": 280,
+          "min": 243,
+          "max": 291
+        },
+        "rss_mib": {
+          "n": 36,
+          "median": 187.609375,
+          "p95": 200.65625,
+          "min": 175.34375,
+          "max": 205.0
+        },
+        "successful": 36,
+        "rows": 36
+      }
+    },
+    "timeline-sharp-final/scored": {
+      "first-install//baseline": {
+        "wall_ms": {
+          "n": 36,
+          "median": 113.0,
+          "p95": 117,
+          "min": 110,
+          "max": 120
+        },
+        "rss_mib": {
+          "n": 36,
+          "median": 56.578125,
+          "p95": 59.328125,
+          "min": 53.21875,
+          "max": 61.34375
+        },
+        "successful": 36,
+        "rows": 36
+      },
+      "first-install//disabled": {
+        "wall_ms": {
+          "n": 36,
+          "median": 113.0,
+          "p95": 123,
+          "min": 109,
+          "max": 130
+        },
+        "rss_mib": {
+          "n": 36,
+          "median": 56.359375,
+          "p95": 59.578125,
+          "min": 53.0,
+          "max": 61.96875
+        },
+        "successful": 36,
+        "rows": 36
+      },
+      "first-install//enabled": {
+        "wall_ms": {
+          "n": 36,
+          "median": 114.5,
+          "p95": 122,
+          "min": 111,
+          "max": 123
+        },
+        "rss_mib": {
+          "n": 36,
+          "median": 57.203125,
+          "p95": 60.8125,
+          "min": 54.125,
+          "max": 60.921875
+        },
+        "successful": 36,
+        "rows": 36
+      }
+    },
+    "timeline-live-nest-final": {
+      "first-install//enabled": {
+        "wall_ms": {
+          "n": 36,
+          "median": 322.5,
+          "p95": 465,
+          "min": 301,
+          "max": 471
+        },
+        "rss_mib": {
+          "n": 36,
+          "median": 101.75,
+          "p95": 109.984375,
+          "min": 93.046875,
+          "max": 122.59375
+        },
+        "successful": 36,
+        "rows": 36
+      }
+    },
+    "timeline-live-t3-final": {
+      "ci-cold-cache//enabled": {
+        "wall_ms": {
+          "n": 2,
+          "median": 1636.5,
+          "p95": 1723,
+          "min": 1550,
+          "max": 1723
+        },
+        "rss_mib": {
+          "n": 2,
+          "median": 230.9765625,
+          "p95": 237.953125,
+          "min": 224.0,
+          "max": 237.953125
+        },
+        "successful": 2,
+        "rows": 2
+      }
+    },
+    "timeline-readiness-warmup-final": {
+      "vite-react/cold/baseline": {
+        "wall_ms": {
+          "n": 1,
+          "median": 790,
+          "p95": 790,
+          "min": 790,
+          "max": 790
+        },
+        "rss_mib": {
+          "n": 1,
+          "median": 215.53125,
+          "p95": 215.53125,
+          "min": 215.53125,
+          "max": 215.53125
+        },
+        "successful": 1,
+        "rows": 1
+      },
+      "vite-react/warm/baseline": {
+        "wall_ms": {
+          "n": 1,
+          "median": 60,
+          "p95": 60,
+          "min": 60,
+          "max": 60
+        },
+        "rss_mib": {
+          "n": 1,
+          "median": 45.546875,
+          "p95": 45.546875,
+          "min": 45.546875,
+          "max": 45.546875
+        },
+        "successful": 1,
+        "rows": 1
+      },
+      "vite-react/up-to-date/baseline": {
+        "wall_ms": {
+          "n": 1,
+          "median": 32,
+          "p95": 32,
+          "min": 32,
+          "max": 32
+        },
+        "rss_mib": {
+          "n": 1,
+          "median": 23.359375,
+          "p95": 23.359375,
+          "min": 23.359375,
+          "max": 23.359375
+        },
+        "successful": 1,
+        "rows": 1
+      },
+      "vite-react/cold/candidate": {
+        "wall_ms": {
+          "n": 1,
+          "median": 797,
+          "p95": 797,
+          "min": 797,
+          "max": 797
+        },
+        "rss_mib": {
+          "n": 1,
+          "median": 226.375,
+          "p95": 226.375,
+          "min": 226.375,
+          "max": 226.375
+        },
+        "successful": 1,
+        "rows": 1
+      },
+      "vite-react/warm/candidate": {
+        "wall_ms": {
+          "n": 1,
+          "median": 59,
+          "p95": 59,
+          "min": 59,
+          "max": 59
+        },
+        "rss_mib": {
+          "n": 1,
+          "median": 45.5625,
+          "p95": 45.5625,
+          "min": 45.5625,
+          "max": 45.5625
+        },
+        "successful": 1,
+        "rows": 1
+      },
+      "vite-react/up-to-date/candidate": {
+        "wall_ms": {
+          "n": 1,
+          "median": 28,
+          "p95": 28,
+          "min": 28,
+          "max": 28
+        },
+        "rss_mib": {
+          "n": 1,
+          "median": 23.78125,
+          "p95": 23.78125,
+          "min": 23.78125,
+          "max": 23.78125
+        },
+        "successful": 1,
+        "rows": 1
+      },
+      "vite-react/cold/bun": {
+        "wall_ms": {
+          "n": 1,
+          "median": 425,
+          "p95": 425,
+          "min": 425,
+          "max": 425
+        },
+        "rss_mib": {
+          "n": 1,
+          "median": 143.203125,
+          "p95": 143.203125,
+          "min": 143.203125,
+          "max": 143.203125
+        },
+        "successful": 1,
+        "rows": 1
+      },
+      "vite-react/warm/bun": {
+        "wall_ms": {
+          "n": 1,
+          "median": 28,
+          "p95": 28,
+          "min": 28,
+          "max": 28
+        },
+        "rss_mib": {
+          "n": 1,
+          "median": 6.734375,
+          "p95": 6.734375,
+          "min": 6.734375,
+          "max": 6.734375
+        },
+        "successful": 1,
+        "rows": 1
+      },
+      "vite-react/up-to-date/bun": {
+        "wall_ms": {
+          "n": 1,
+          "median": 16,
+          "p95": 16,
+          "min": 16,
+          "max": 16
+        },
+        "rss_mib": {
+          "n": 1,
+          "median": 6.765625,
+          "p95": 6.765625,
+          "min": 6.765625,
+          "max": 6.765625
+        },
+        "successful": 1,
+        "rows": 1
+      },
+      "native-sharp/cold/baseline": {
+        "wall_ms": {
+          "n": 1,
+          "median": 343,
+          "p95": 343,
+          "min": 343,
+          "max": 343
+        },
+        "rss_mib": {
+          "n": 1,
+          "median": 59.5,
+          "p95": 59.5,
+          "min": 59.5,
+          "max": 59.5
+        },
+        "successful": 1,
+        "rows": 1
+      },
+      "native-sharp/warm/baseline": {
+        "wall_ms": {
+          "n": 1,
+          "median": 42,
+          "p95": 42,
+          "min": 42,
+          "max": 42
+        },
+        "rss_mib": {
+          "n": 1,
+          "median": 32.953125,
+          "p95": 32.953125,
+          "min": 32.953125,
+          "max": 32.953125
+        },
+        "successful": 1,
+        "rows": 1
+      },
+      "native-sharp/up-to-date/baseline": {
+        "wall_ms": {
+          "n": 1,
+          "median": 32,
+          "p95": 32,
+          "min": 32,
+          "max": 32
+        },
+        "rss_mib": {
+          "n": 1,
+          "median": 21.9375,
+          "p95": 21.9375,
+          "min": 21.9375,
+          "max": 21.9375
+        },
+        "successful": 1,
+        "rows": 1
+      },
+      "native-sharp/cold/candidate": {
+        "wall_ms": {
+          "n": 1,
+          "median": 303,
+          "p95": 303,
+          "min": 303,
+          "max": 303
+        },
+        "rss_mib": {
+          "n": 1,
+          "median": 59.59375,
+          "p95": 59.59375,
+          "min": 59.59375,
+          "max": 59.59375
+        },
+        "successful": 1,
+        "rows": 1
+      },
+      "native-sharp/warm/candidate": {
+        "wall_ms": {
+          "n": 1,
+          "median": 41,
+          "p95": 41,
+          "min": 41,
+          "max": 41
+        },
+        "rss_mib": {
+          "n": 1,
+          "median": 33.71875,
+          "p95": 33.71875,
+          "min": 33.71875,
+          "max": 33.71875
+        },
+        "successful": 1,
+        "rows": 1
+      },
+      "native-sharp/up-to-date/candidate": {
+        "wall_ms": {
+          "n": 1,
+          "median": 28,
+          "p95": 28,
+          "min": 28,
+          "max": 28
+        },
+        "rss_mib": {
+          "n": 1,
+          "median": 22.1875,
+          "p95": 22.1875,
+          "min": 22.1875,
+          "max": 22.1875
+        },
+        "successful": 1,
+        "rows": 1
+      },
+      "native-sharp/cold/bun": {
+        "wall_ms": {
+          "n": 1,
+          "median": 211,
+          "p95": 211,
+          "min": 211,
+          "max": 211
+        },
+        "rss_mib": {
+          "n": 1,
+          "median": 21.109375,
+          "p95": 21.109375,
+          "min": 21.109375,
+          "max": 21.109375
+        },
+        "successful": 1,
+        "rows": 1
+      },
+      "native-sharp/warm/bun": {
+        "wall_ms": {
+          "n": 1,
+          "median": 9,
+          "p95": 9,
+          "min": 9,
+          "max": 9
+        },
+        "rss_mib": {
+          "n": 1,
+          "median": 6.34375,
+          "p95": 6.34375,
+          "min": 6.34375,
+          "max": 6.34375
+        },
+        "successful": 1,
+        "rows": 1
+      },
+      "native-sharp/up-to-date/bun": {
+        "wall_ms": {
+          "n": 1,
+          "median": 9,
+          "p95": 9,
+          "min": 9,
+          "max": 9
+        },
+        "rss_mib": {
+          "n": 1,
+          "median": 6.3125,
+          "p95": 6.3125,
+          "min": 6.3125,
+          "max": 6.3125
+        },
+        "successful": 1,
+        "rows": 1
+      },
+      "nest/cold/baseline": {
+        "wall_ms": {
+          "n": 1,
+          "median": 444,
+          "p95": 444,
+          "min": 444,
+          "max": 444
+        },
+        "rss_mib": {
+          "n": 1,
+          "median": 101.90625,
+          "p95": 101.90625,
+          "min": 101.90625,
+          "max": 101.90625
+        },
+        "successful": 1,
+        "rows": 1
+      },
+      "nest/warm/baseline": {
+        "wall_ms": {
+          "n": 1,
+          "median": 56,
+          "p95": 56,
+          "min": 56,
+          "max": 56
+        },
+        "rss_mib": {
+          "n": 1,
+          "median": 41.3125,
+          "p95": 41.3125,
+          "min": 41.3125,
+          "max": 41.3125
+        },
+        "successful": 1,
+        "rows": 1
+      },
+      "nest/up-to-date/baseline": {
+        "wall_ms": {
+          "n": 1,
+          "median": 31,
+          "p95": 31,
+          "min": 31,
+          "max": 31
+        },
+        "rss_mib": {
+          "n": 1,
+          "median": 22.0,
+          "p95": 22.0,
+          "min": 22.0,
+          "max": 22.0
+        },
+        "successful": 1,
+        "rows": 1
+      },
+      "nest/cold/candidate": {
+        "wall_ms": {
+          "n": 1,
+          "median": 724,
+          "p95": 724,
+          "min": 724,
+          "max": 724
+        },
+        "rss_mib": {
+          "n": 1,
+          "median": 97.796875,
+          "p95": 97.796875,
+          "min": 97.796875,
+          "max": 97.796875
+        },
+        "successful": 1,
+        "rows": 1
+      },
+      "nest/warm/candidate": {
+        "wall_ms": {
+          "n": 1,
+          "median": 50,
+          "p95": 50,
+          "min": 50,
+          "max": 50
+        },
+        "rss_mib": {
+          "n": 1,
+          "median": 40.3125,
+          "p95": 40.3125,
+          "min": 40.3125,
+          "max": 40.3125
+        },
+        "successful": 1,
+        "rows": 1
+      },
+      "nest/up-to-date/candidate": {
+        "wall_ms": {
+          "n": 1,
+          "median": 27,
+          "p95": 27,
+          "min": 27,
+          "max": 27
+        },
+        "rss_mib": {
+          "n": 1,
+          "median": 22.15625,
+          "p95": 22.15625,
+          "min": 22.15625,
+          "max": 22.15625
+        },
+        "successful": 1,
+        "rows": 1
+      },
+      "nest/cold/bun": {
+        "wall_ms": {
+          "n": 1,
+          "median": 273,
+          "p95": 273,
+          "min": 273,
+          "max": 273
+        },
+        "rss_mib": {
+          "n": 1,
+          "median": 38.984375,
+          "p95": 38.984375,
+          "min": 38.984375,
+          "max": 38.984375
+        },
+        "successful": 1,
+        "rows": 1
+      },
+      "nest/warm/bun": {
+        "wall_ms": {
+          "n": 1,
+          "median": 32,
+          "p95": 32,
+          "min": 32,
+          "max": 32
+        },
+        "rss_mib": {
+          "n": 1,
+          "median": 6.359375,
+          "p95": 6.359375,
+          "min": 6.359375,
+          "max": 6.359375
+        },
+        "successful": 1,
+        "rows": 1
+      },
+      "nest/up-to-date/bun": {
+        "wall_ms": {
+          "n": 1,
+          "median": 11,
+          "p95": 11,
+          "min": 11,
+          "max": 11
+        },
+        "rss_mib": {
+          "n": 1,
+          "median": 6.359375,
+          "p95": 6.359375,
+          "min": 6.359375,
+          "max": 6.359375
+        },
+        "successful": 1,
+        "rows": 1
+      },
+      "t3/cold/baseline": {
+        "wall_ms": {
+          "n": 1,
+          "median": 1953,
+          "p95": 1953,
+          "min": 1953,
+          "max": 1953
+        },
+        "rss_mib": {
+          "n": 1,
+          "median": 330.671875,
+          "p95": 330.671875,
+          "min": 330.671875,
+          "max": 330.671875
+        },
+        "successful": 1,
+        "rows": 1
+      },
+      "t3/warm/baseline": {
+        "wall_ms": {
+          "n": 1,
+          "median": 100,
+          "p95": 100,
+          "min": 100,
+          "max": 100
+        },
+        "rss_mib": {
+          "n": 1,
+          "median": 55.59375,
+          "p95": 55.59375,
+          "min": 55.59375,
+          "max": 55.59375
+        },
+        "successful": 1,
+        "rows": 1
+      },
+      "t3/up-to-date/baseline": {
+        "wall_ms": {
+          "n": 1,
+          "median": 34,
+          "p95": 34,
+          "min": 34,
+          "max": 34
+        },
+        "rss_mib": {
+          "n": 1,
+          "median": 25.125,
+          "p95": 25.125,
+          "min": 25.125,
+          "max": 25.125
+        },
+        "successful": 1,
+        "rows": 1
+      },
+      "t3/cold/candidate": {
+        "wall_ms": {
+          "n": 1,
+          "median": 1956,
+          "p95": 1956,
+          "min": 1956,
+          "max": 1956
+        },
+        "rss_mib": {
+          "n": 1,
+          "median": 377.90625,
+          "p95": 377.90625,
+          "min": 377.90625,
+          "max": 377.90625
+        },
+        "successful": 1,
+        "rows": 1
+      },
+      "t3/warm/candidate": {
+        "wall_ms": {
+          "n": 1,
+          "median": 102,
+          "p95": 102,
+          "min": 102,
+          "max": 102
+        },
+        "rss_mib": {
+          "n": 1,
+          "median": 52.34375,
+          "p95": 52.34375,
+          "min": 52.34375,
+          "max": 52.34375
+        },
+        "successful": 1,
+        "rows": 1
+      },
+      "t3/up-to-date/candidate": {
+        "wall_ms": {
+          "n": 1,
+          "median": 34,
+          "p95": 34,
+          "min": 34,
+          "max": 34
+        },
+        "rss_mib": {
+          "n": 1,
+          "median": 25.421875,
+          "p95": 25.421875,
+          "min": 25.421875,
+          "max": 25.421875
+        },
+        "successful": 1,
+        "rows": 1
+      },
+      "t3/cold/bun": {
+        "wall_ms": {
+          "n": 1,
+          "median": 1818,
+          "p95": 1818,
+          "min": 1818,
+          "max": 1818
+        },
+        "rss_mib": {
+          "n": 1,
+          "median": 374.96875,
+          "p95": 374.96875,
+          "min": 374.96875,
+          "max": 374.96875
+        },
+        "successful": 1,
+        "rows": 1
+      },
+      "t3/warm/bun": {
+        "wall_ms": {
+          "n": 1,
+          "median": 186,
+          "p95": 186,
+          "min": 186,
+          "max": 186
+        },
+        "rss_mib": {
+          "n": 1,
+          "median": 7.234375,
+          "p95": 7.234375,
+          "min": 7.234375,
+          "max": 7.234375
+        },
+        "successful": 1,
+        "rows": 1
+      },
+      "t3/up-to-date/bun": {
+        "wall_ms": {
+          "n": 1,
+          "median": 22,
+          "p95": 22,
+          "min": 22,
+          "max": 22
+        },
+        "rss_mib": {
+          "n": 1,
+          "median": 7.859375,
+          "p95": 7.859375,
+          "min": 7.859375,
+          "max": 7.859375
+        },
+        "successful": 1,
+        "rows": 1
+      }
+    },
+    "timeline-readiness-scored-final": {
+      "vite-react/cold/baseline": {
+        "wall_ms": {
+          "n": 12,
+          "median": 622.5,
+          "p95": 969,
+          "min": 558,
+          "max": 969
+        },
+        "rss_mib": {
+          "n": 12,
+          "median": 204.5546875,
+          "p95": 218.203125,
+          "min": 182.375,
+          "max": 218.203125
+        },
+        "successful": 12,
+        "rows": 12
+      },
+      "vite-react/warm/baseline": {
+        "wall_ms": {
+          "n": 12,
+          "median": 51.5,
+          "p95": 53,
+          "min": 50,
+          "max": 53
+        },
+        "rss_mib": {
+          "n": 12,
+          "median": 45.9921875,
+          "p95": 48.765625,
+          "min": 42.609375,
+          "max": 48.765625
+        },
+        "successful": 12,
+        "rows": 12
+      },
+      "vite-react/up-to-date/baseline": {
+        "wall_ms": {
+          "n": 12,
+          "median": 23.0,
+          "p95": 26,
+          "min": 22,
+          "max": 26
+        },
+        "rss_mib": {
+          "n": 12,
+          "median": 23.390625,
+          "p95": 23.40625,
+          "min": 23.359375,
+          "max": 23.40625
+        },
+        "successful": 12,
+        "rows": 12
+      },
+      "vite-react/cold/candidate": {
+        "wall_ms": {
+          "n": 12,
+          "median": 635.5,
+          "p95": 932,
+          "min": 562,
+          "max": 932
+        },
+        "rss_mib": {
+          "n": 12,
+          "median": 215.5546875,
+          "p95": 226.40625,
+          "min": 194.296875,
+          "max": 226.40625
+        },
+        "successful": 12,
+        "rows": 12
+      },
+      "vite-react/warm/candidate": {
+        "wall_ms": {
+          "n": 12,
+          "median": 51.0,
+          "p95": 54,
+          "min": 49,
+          "max": 54
+        },
+        "rss_mib": {
+          "n": 12,
+          "median": 45.6328125,
+          "p95": 52.53125,
+          "min": 43.90625,
+          "max": 52.53125
+        },
+        "successful": 12,
+        "rows": 12
+      },
+      "vite-react/up-to-date/candidate": {
+        "wall_ms": {
+          "n": 12,
+          "median": 23.0,
+          "p95": 28,
+          "min": 21,
+          "max": 28
+        },
+        "rss_mib": {
+          "n": 12,
+          "median": 23.71875,
+          "p95": 23.734375,
+          "min": 23.703125,
+          "max": 23.734375
+        },
+        "successful": 12,
+        "rows": 12
+      },
+      "vite-react/cold/bun": {
+        "wall_ms": {
+          "n": 12,
+          "median": 410.0,
+          "p95": 4928,
+          "min": 388,
+          "max": 4928
+        },
+        "rss_mib": {
+          "n": 12,
+          "median": 135.15625,
+          "p95": 142.921875,
+          "min": 124.359375,
+          "max": 142.921875
+        },
+        "successful": 12,
+        "rows": 12
+      },
+      "vite-react/warm/bun": {
+        "wall_ms": {
+          "n": 12,
+          "median": 29.0,
+          "p95": 32,
+          "min": 26,
+          "max": 32
+        },
+        "rss_mib": {
+          "n": 12,
+          "median": 6.734375,
+          "p95": 6.75,
+          "min": 6.734375,
+          "max": 6.75
+        },
+        "successful": 12,
+        "rows": 12
+      },
+      "vite-react/up-to-date/bun": {
+        "wall_ms": {
+          "n": 12,
+          "median": 15.5,
+          "p95": 17,
+          "min": 15,
+          "max": 17
+        },
+        "rss_mib": {
+          "n": 12,
+          "median": 6.765625,
+          "p95": 6.78125,
+          "min": 6.765625,
+          "max": 6.78125
+        },
+        "successful": 12,
+        "rows": 12
+      },
+      "native-sharp/cold/baseline": {
+        "wall_ms": {
+          "n": 12,
+          "median": 287.0,
+          "p95": 439,
+          "min": 250,
+          "max": 439
+        },
+        "rss_mib": {
+          "n": 12,
+          "median": 58.8515625,
+          "p95": 67.75,
+          "min": 56.4375,
+          "max": 67.75
+        },
+        "successful": 12,
+        "rows": 12
+      },
+      "native-sharp/warm/baseline": {
+        "wall_ms": {
+          "n": 12,
+          "median": 32.0,
+          "p95": 34,
+          "min": 30,
+          "max": 34
+        },
+        "rss_mib": {
+          "n": 12,
+          "median": 33.2265625,
+          "p95": 33.328125,
+          "min": 32.96875,
+          "max": 33.328125
+        },
+        "successful": 12,
+        "rows": 12
+      },
+      "native-sharp/up-to-date/baseline": {
+        "wall_ms": {
+          "n": 12,
+          "median": 22.0,
+          "p95": 24,
+          "min": 20,
+          "max": 24
+        },
+        "rss_mib": {
+          "n": 12,
+          "median": 21.9921875,
+          "p95": 22.046875,
+          "min": 21.96875,
+          "max": 22.046875
+        },
+        "successful": 12,
+        "rows": 12
+      },
+      "native-sharp/cold/candidate": {
+        "wall_ms": {
+          "n": 12,
+          "median": 329.0,
+          "p95": 530,
+          "min": 246,
+          "max": 530
+        },
+        "rss_mib": {
+          "n": 12,
+          "median": 60.78125,
+          "p95": 67.625,
+          "min": 58.3125,
+          "max": 67.625
+        },
+        "successful": 12,
+        "rows": 12
+      },
+      "native-sharp/warm/candidate": {
+        "wall_ms": {
+          "n": 12,
+          "median": 32.0,
+          "p95": 38,
+          "min": 31,
+          "max": 38
+        },
+        "rss_mib": {
+          "n": 12,
+          "median": 33.703125,
+          "p95": 33.859375,
+          "min": 33.34375,
+          "max": 33.859375
+        },
+        "successful": 12,
+        "rows": 12
+      },
+      "native-sharp/up-to-date/candidate": {
+        "wall_ms": {
+          "n": 12,
+          "median": 22.0,
+          "p95": 26,
+          "min": 21,
+          "max": 26
+        },
+        "rss_mib": {
+          "n": 12,
+          "median": 22.1875,
+          "p95": 22.203125,
+          "min": 22.171875,
+          "max": 22.203125
+        },
+        "successful": 12,
+        "rows": 12
+      },
+      "native-sharp/cold/bun": {
+        "wall_ms": {
+          "n": 12,
+          "median": 224.0,
+          "p95": 332,
+          "min": 201,
+          "max": 332
+        },
+        "rss_mib": {
+          "n": 12,
+          "median": 21.421875,
+          "p95": 23.203125,
+          "min": 20.65625,
+          "max": 23.203125
+        },
+        "successful": 12,
+        "rows": 12
+      },
+      "native-sharp/warm/bun": {
+        "wall_ms": {
+          "n": 12,
+          "median": 9.0,
+          "p95": 12,
+          "min": 8,
+          "max": 12
+        },
+        "rss_mib": {
+          "n": 12,
+          "median": 6.34375,
+          "p95": 6.34375,
+          "min": 6.34375,
+          "max": 6.34375
+        },
+        "successful": 12,
+        "rows": 12
+      },
+      "native-sharp/up-to-date/bun": {
+        "wall_ms": {
+          "n": 12,
+          "median": 7.0,
+          "p95": 8,
+          "min": 7,
+          "max": 8
+        },
+        "rss_mib": {
+          "n": 12,
+          "median": 6.328125,
+          "p95": 6.34375,
+          "min": 6.3125,
+          "max": 6.34375
+        },
+        "successful": 12,
+        "rows": 12
+      },
+      "nest/cold/baseline": {
+        "wall_ms": {
+          "n": 12,
+          "median": 330.0,
+          "p95": 443,
+          "min": 306,
+          "max": 443
+        },
+        "rss_mib": {
+          "n": 12,
+          "median": 100.875,
+          "p95": 107.0,
+          "min": 91.078125,
+          "max": 107.0
+        },
+        "successful": 12,
+        "rows": 12
+      },
+      "nest/warm/baseline": {
+        "wall_ms": {
+          "n": 12,
+          "median": 41.0,
+          "p95": 47,
+          "min": 40,
+          "max": 47
+        },
+        "rss_mib": {
+          "n": 12,
+          "median": 38.90625,
+          "p95": 40.34375,
+          "min": 37.59375,
+          "max": 40.34375
+        },
+        "successful": 12,
+        "rows": 12
+      },
+      "nest/up-to-date/baseline": {
+        "wall_ms": {
+          "n": 12,
+          "median": 22.0,
+          "p95": 25,
+          "min": 21,
+          "max": 25
+        },
+        "rss_mib": {
+          "n": 12,
+          "median": 22.0,
+          "p95": 22.03125,
+          "min": 21.984375,
+          "max": 22.03125
+        },
+        "successful": 12,
+        "rows": 12
+      },
+      "nest/cold/candidate": {
+        "wall_ms": {
+          "n": 12,
+          "median": 359.5,
+          "p95": 521,
+          "min": 314,
+          "max": 521
+        },
+        "rss_mib": {
+          "n": 12,
+          "median": 105.359375,
+          "p95": 115.890625,
+          "min": 94.890625,
+          "max": 115.890625
+        },
+        "successful": 12,
+        "rows": 12
+      },
+      "nest/warm/candidate": {
+        "wall_ms": {
+          "n": 12,
+          "median": 41.5,
+          "p95": 45,
+          "min": 40,
+          "max": 45
+        },
+        "rss_mib": {
+          "n": 12,
+          "median": 39.8046875,
+          "p95": 42.703125,
+          "min": 38.296875,
+          "max": 42.703125
+        },
+        "successful": 12,
+        "rows": 12
+      },
+      "nest/up-to-date/candidate": {
+        "wall_ms": {
+          "n": 12,
+          "median": 22.0,
+          "p95": 24,
+          "min": 21,
+          "max": 24
+        },
+        "rss_mib": {
+          "n": 12,
+          "median": 22.171875,
+          "p95": 22.171875,
+          "min": 22.140625,
+          "max": 22.171875
+        },
+        "successful": 12,
+        "rows": 12
+      },
+      "nest/cold/bun": {
+        "wall_ms": {
+          "n": 12,
+          "median": 312.0,
+          "p95": 561,
+          "min": 257,
+          "max": 561
+        },
+        "rss_mib": {
+          "n": 12,
+          "median": 37.5234375,
+          "p95": 39.96875,
+          "min": 34.578125,
+          "max": 39.96875
+        },
+        "successful": 12,
+        "rows": 12
+      },
+      "nest/warm/bun": {
+        "wall_ms": {
+          "n": 12,
+          "median": 31.0,
+          "p95": 37,
+          "min": 28,
+          "max": 37
+        },
+        "rss_mib": {
+          "n": 12,
+          "median": 6.359375,
+          "p95": 6.375,
+          "min": 6.359375,
+          "max": 6.375
+        },
+        "successful": 12,
+        "rows": 12
+      },
+      "nest/up-to-date/bun": {
+        "wall_ms": {
+          "n": 12,
+          "median": 10.5,
+          "p95": 14,
+          "min": 10,
+          "max": 14
+        },
+        "rss_mib": {
+          "n": 12,
+          "median": 6.359375,
+          "p95": 6.375,
+          "min": 6.359375,
+          "max": 6.375
+        },
+        "successful": 12,
+        "rows": 12
+      },
+      "t3/cold/baseline": {
+        "wall_ms": {
+          "n": 12,
+          "median": 1943.0,
+          "p95": 2078,
+          "min": 1847,
+          "max": 2078
+        },
+        "rss_mib": {
+          "n": 12,
+          "median": 329.515625,
+          "p95": 369.625,
+          "min": 310.015625,
+          "max": 369.625
+        },
+        "successful": 12,
+        "rows": 12
+      },
+      "t3/warm/baseline": {
+        "wall_ms": {
+          "n": 12,
+          "median": 91.5,
+          "p95": 104,
+          "min": 90,
+          "max": 104
+        },
+        "rss_mib": {
+          "n": 12,
+          "median": 53.1640625,
+          "p95": 60.0,
+          "min": 51.15625,
+          "max": 60.0
+        },
+        "successful": 12,
+        "rows": 12
+      },
+      "t3/up-to-date/baseline": {
+        "wall_ms": {
+          "n": 12,
+          "median": 24.0,
+          "p95": 27,
+          "min": 23,
+          "max": 27
+        },
+        "rss_mib": {
+          "n": 12,
+          "median": 25.0625,
+          "p95": 25.09375,
+          "min": 25.015625,
+          "max": 25.09375
+        },
+        "successful": 12,
+        "rows": 12
+      },
+      "t3/cold/candidate": {
+        "wall_ms": {
+          "n": 12,
+          "median": 1929.5,
+          "p95": 2193,
+          "min": 1781,
+          "max": 2193
+        },
+        "rss_mib": {
+          "n": 12,
+          "median": 335.6328125,
+          "p95": 345.421875,
+          "min": 323.890625,
+          "max": 345.421875
+        },
+        "successful": 12,
+        "rows": 12
+      },
+      "t3/warm/candidate": {
+        "wall_ms": {
+          "n": 12,
+          "median": 91.0,
+          "p95": 96,
+          "min": 90,
+          "max": 96
+        },
+        "rss_mib": {
+          "n": 12,
+          "median": 54.015625,
+          "p95": 58.15625,
+          "min": 49.84375,
+          "max": 58.15625
+        },
+        "successful": 12,
+        "rows": 12
+      },
+      "t3/up-to-date/candidate": {
+        "wall_ms": {
+          "n": 12,
+          "median": 24.0,
+          "p95": 25,
+          "min": 24,
+          "max": 25
+        },
+        "rss_mib": {
+          "n": 12,
+          "median": 25.453125,
+          "p95": 25.46875,
+          "min": 25.421875,
+          "max": 25.46875
+        },
+        "successful": 12,
+        "rows": 12
+      },
+      "t3/cold/bun": {
+        "wall_ms": {
+          "n": 12,
+          "median": 1751.5,
+          "p95": 1960,
+          "min": 1641,
+          "max": 1960
+        },
+        "rss_mib": {
+          "n": 12,
+          "median": 380.3984375,
+          "p95": 405.0625,
+          "min": 335.71875,
+          "max": 405.0625
+        },
+        "successful": 12,
+        "rows": 12
+      },
+      "t3/warm/bun": {
+        "wall_ms": {
+          "n": 12,
+          "median": 182.5,
+          "p95": 205,
+          "min": 167,
+          "max": 205
+        },
+        "rss_mib": {
+          "n": 12,
+          "median": 7.234375,
+          "p95": 7.25,
+          "min": 7.234375,
+          "max": 7.25
+        },
+        "successful": 12,
+        "rows": 12
+      },
+      "t3/up-to-date/bun": {
+        "wall_ms": {
+          "n": 12,
+          "median": 21.0,
+          "p95": 22,
+          "min": 20,
+          "max": 22
+        },
+        "rss_mib": {
+          "n": 12,
+          "median": 7.859375,
+          "p95": 7.875,
+          "min": 7.859375,
+          "max": 7.875
+        },
+        "successful": 12,
+        "rows": 12
+      }
+    },
+    "timeline-readiness-same-binary": {
+      "vite-react/cold/baseline": {
+        "wall_ms": {
+          "n": 12,
+          "median": 669.5,
+          "p95": 766,
+          "min": 568,
+          "max": 766
+        },
+        "rss_mib": {
+          "n": 12,
+          "median": 216.9375,
+          "p95": 240.75,
+          "min": 188.46875,
+          "max": 240.75
+        },
+        "successful": 12,
+        "rows": 12
+      },
+      "vite-react/warm/baseline": {
+        "wall_ms": {
+          "n": 12,
+          "median": 52.0,
+          "p95": 67,
+          "min": 49,
+          "max": 67
+        },
+        "rss_mib": {
+          "n": 12,
+          "median": 45.421875,
+          "p95": 49.4375,
+          "min": 42.515625,
+          "max": 49.4375
+        },
+        "successful": 12,
+        "rows": 12
+      },
+      "vite-react/up-to-date/baseline": {
+        "wall_ms": {
+          "n": 12,
+          "median": 23.0,
+          "p95": 27,
+          "min": 22,
+          "max": 27
+        },
+        "rss_mib": {
+          "n": 12,
+          "median": 23.390625,
+          "p95": 23.40625,
+          "min": 23.34375,
+          "max": 23.40625
+        },
+        "successful": 12,
+        "rows": 12
+      },
+      "vite-react/cold/candidate": {
+        "wall_ms": {
+          "n": 12,
+          "median": 715.5,
+          "p95": 857,
+          "min": 578,
+          "max": 857
+        },
+        "rss_mib": {
+          "n": 12,
+          "median": 200.3828125,
+          "p95": 219.0625,
+          "min": 188.65625,
+          "max": 219.0625
+        },
+        "successful": 12,
+        "rows": 12
+      },
+      "vite-react/warm/candidate": {
+        "wall_ms": {
+          "n": 12,
+          "median": 51.0,
+          "p95": 54,
+          "min": 50,
+          "max": 54
+        },
+        "rss_mib": {
+          "n": 12,
+          "median": 45.5078125,
+          "p95": 51.1875,
+          "min": 43.234375,
+          "max": 51.1875
+        },
+        "successful": 12,
+        "rows": 12
+      },
+      "vite-react/up-to-date/candidate": {
+        "wall_ms": {
+          "n": 12,
+          "median": 23.0,
+          "p95": 29,
+          "min": 22,
+          "max": 29
+        },
+        "rss_mib": {
+          "n": 12,
+          "median": 23.3828125,
+          "p95": 23.390625,
+          "min": 23.328125,
+          "max": 23.390625
+        },
+        "successful": 12,
+        "rows": 12
+      },
+      "vite-react/cold/bun": {
+        "wall_ms": {
+          "n": 12,
+          "median": 468.5,
+          "p95": 522,
+          "min": 381,
+          "max": 522
+        },
+        "rss_mib": {
+          "n": 12,
+          "median": 136.2734375,
+          "p95": 151.703125,
+          "min": 128.21875,
+          "max": 151.703125
+        },
+        "successful": 12,
+        "rows": 12
+      },
+      "vite-react/warm/bun": {
+        "wall_ms": {
+          "n": 12,
+          "median": 29.5,
+          "p95": 31,
+          "min": 27,
+          "max": 31
+        },
+        "rss_mib": {
+          "n": 12,
+          "median": 6.734375,
+          "p95": 6.75,
+          "min": 6.71875,
+          "max": 6.75
+        },
+        "successful": 12,
+        "rows": 12
+      },
+      "vite-react/up-to-date/bun": {
+        "wall_ms": {
+          "n": 12,
+          "median": 15.0,
+          "p95": 16,
+          "min": 14,
+          "max": 16
+        },
+        "rss_mib": {
+          "n": 12,
+          "median": 6.765625,
+          "p95": 6.78125,
+          "min": 6.765625,
+          "max": 6.78125
+        },
+        "successful": 12,
+        "rows": 12
+      },
+      "native-sharp/cold/baseline": {
+        "wall_ms": {
+          "n": 12,
+          "median": 288.0,
+          "p95": 573,
+          "min": 256,
+          "max": 573
+        },
+        "rss_mib": {
+          "n": 12,
+          "median": 62.75,
+          "p95": 69.234375,
+          "min": 56.84375,
+          "max": 69.234375
+        },
+        "successful": 12,
+        "rows": 12
+      },
+      "native-sharp/warm/baseline": {
+        "wall_ms": {
+          "n": 12,
+          "median": 33.0,
+          "p95": 43,
+          "min": 32,
+          "max": 43
+        },
+        "rss_mib": {
+          "n": 12,
+          "median": 33.25,
+          "p95": 33.328125,
+          "min": 32.5,
+          "max": 33.328125
+        },
+        "successful": 12,
+        "rows": 12
+      },
+      "native-sharp/up-to-date/baseline": {
+        "wall_ms": {
+          "n": 12,
+          "median": 22.0,
+          "p95": 27,
+          "min": 21,
+          "max": 27
+        },
+        "rss_mib": {
+          "n": 12,
+          "median": 21.9921875,
+          "p95": 22.046875,
+          "min": 21.96875,
+          "max": 22.046875
+        },
+        "successful": 12,
+        "rows": 12
+      },
+      "native-sharp/cold/candidate": {
+        "wall_ms": {
+          "n": 12,
+          "median": 325.0,
+          "p95": 397,
+          "min": 251,
+          "max": 397
+        },
+        "rss_mib": {
+          "n": 12,
+          "median": 61.84375,
+          "p95": 64.875,
+          "min": 56.75,
+          "max": 64.875
+        },
+        "successful": 12,
+        "rows": 12
+      },
+      "native-sharp/warm/candidate": {
+        "wall_ms": {
+          "n": 12,
+          "median": 33.0,
+          "p95": 34,
+          "min": 31,
+          "max": 34
+        },
+        "rss_mib": {
+          "n": 12,
+          "median": 33.2109375,
+          "p95": 33.28125,
+          "min": 32.703125,
+          "max": 33.28125
+        },
+        "successful": 12,
+        "rows": 12
+      },
+      "native-sharp/up-to-date/candidate": {
+        "wall_ms": {
+          "n": 12,
+          "median": 22.0,
+          "p95": 24,
+          "min": 21,
+          "max": 24
+        },
+        "rss_mib": {
+          "n": 12,
+          "median": 21.984375,
+          "p95": 22.015625,
+          "min": 21.9375,
+          "max": 22.015625
+        },
+        "successful": 12,
+        "rows": 12
+      },
+      "native-sharp/cold/bun": {
+        "wall_ms": {
+          "n": 12,
+          "median": 257.0,
+          "p95": 306,
+          "min": 208,
+          "max": 306
+        },
+        "rss_mib": {
+          "n": 12,
+          "median": 21.296875,
+          "p95": 22.046875,
+          "min": 20.359375,
+          "max": 22.046875
+        },
+        "successful": 12,
+        "rows": 12
+      },
+      "native-sharp/warm/bun": {
+        "wall_ms": {
+          "n": 12,
+          "median": 9.5,
+          "p95": 16,
+          "min": 8,
+          "max": 16
+        },
+        "rss_mib": {
+          "n": 12,
+          "median": 6.34375,
+          "p95": 6.359375,
+          "min": 6.328125,
+          "max": 6.359375
+        },
+        "successful": 12,
+        "rows": 12
+      },
+      "native-sharp/up-to-date/bun": {
+        "wall_ms": {
+          "n": 12,
+          "median": 7.0,
+          "p95": 10,
+          "min": 7,
+          "max": 10
+        },
+        "rss_mib": {
+          "n": 12,
+          "median": 6.328125,
+          "p95": 6.34375,
+          "min": 6.3125,
+          "max": 6.34375
+        },
+        "successful": 12,
+        "rows": 12
+      },
+      "nest/cold/baseline": {
+        "wall_ms": {
+          "n": 12,
+          "median": 346.5,
+          "p95": 404,
+          "min": 313,
+          "max": 404
+        },
+        "rss_mib": {
+          "n": 12,
+          "median": 103.9765625,
+          "p95": 113.25,
+          "min": 94.390625,
+          "max": 113.25
+        },
+        "successful": 12,
+        "rows": 12
+      },
+      "nest/warm/baseline": {
+        "wall_ms": {
+          "n": 12,
+          "median": 42.5,
+          "p95": 47,
+          "min": 39,
+          "max": 47
+        },
+        "rss_mib": {
+          "n": 12,
+          "median": 39.15625,
+          "p95": 40.078125,
+          "min": 37.65625,
+          "max": 40.078125
+        },
+        "successful": 12,
+        "rows": 12
+      },
+      "nest/up-to-date/baseline": {
+        "wall_ms": {
+          "n": 12,
+          "median": 22.0,
+          "p95": 29,
+          "min": 21,
+          "max": 29
+        },
+        "rss_mib": {
+          "n": 12,
+          "median": 22.0,
+          "p95": 22.046875,
+          "min": 21.9375,
+          "max": 22.046875
+        },
+        "successful": 12,
+        "rows": 12
+      },
+      "nest/cold/candidate": {
+        "wall_ms": {
+          "n": 12,
+          "median": 397.0,
+          "p95": 708,
+          "min": 331,
+          "max": 708
+        },
+        "rss_mib": {
+          "n": 12,
+          "median": 104.109375,
+          "p95": 111.671875,
+          "min": 94.484375,
+          "max": 111.671875
+        },
+        "successful": 12,
+        "rows": 12
+      },
+      "nest/warm/candidate": {
+        "wall_ms": {
+          "n": 12,
+          "median": 42.0,
+          "p95": 47,
+          "min": 39,
+          "max": 47
+        },
+        "rss_mib": {
+          "n": 12,
+          "median": 38.6875,
+          "p95": 39.96875,
+          "min": 37.515625,
+          "max": 39.96875
+        },
+        "successful": 12,
+        "rows": 12
+      },
+      "nest/up-to-date/candidate": {
+        "wall_ms": {
+          "n": 12,
+          "median": 22.0,
+          "p95": 23,
+          "min": 21,
+          "max": 23
+        },
+        "rss_mib": {
+          "n": 12,
+          "median": 21.9921875,
+          "p95": 22.03125,
+          "min": 21.9375,
+          "max": 22.03125
+        },
+        "successful": 12,
+        "rows": 12
+      },
+      "nest/cold/bun": {
+        "wall_ms": {
+          "n": 12,
+          "median": 294.0,
+          "p95": 543,
+          "min": 254,
+          "max": 543
+        },
+        "rss_mib": {
+          "n": 12,
+          "median": 37.4921875,
+          "p95": 38.515625,
+          "min": 35.8125,
+          "max": 38.515625
+        },
+        "successful": 12,
+        "rows": 12
+      },
+      "nest/warm/bun": {
+        "wall_ms": {
+          "n": 12,
+          "median": 30.5,
+          "p95": 76,
+          "min": 28,
+          "max": 76
+        },
+        "rss_mib": {
+          "n": 12,
+          "median": 6.359375,
+          "p95": 6.375,
+          "min": 6.359375,
+          "max": 6.375
+        },
+        "successful": 12,
+        "rows": 12
+      },
+      "nest/up-to-date/bun": {
+        "wall_ms": {
+          "n": 12,
+          "median": 11.0,
+          "p95": 18,
+          "min": 10,
+          "max": 18
+        },
+        "rss_mib": {
+          "n": 12,
+          "median": 6.359375,
+          "p95": 6.359375,
+          "min": 6.359375,
+          "max": 6.359375
+        },
+        "successful": 12,
+        "rows": 12
+      },
+      "t3/cold/baseline": {
+        "wall_ms": {
+          "n": 12,
+          "median": 1966.0,
+          "p95": 2448,
+          "min": 1857,
+          "max": 2448
+        },
+        "rss_mib": {
+          "n": 12,
+          "median": 316.9765625,
+          "p95": 347.015625,
+          "min": 302.9375,
+          "max": 347.015625
+        },
+        "successful": 12,
+        "rows": 12
+      },
+      "t3/warm/baseline": {
+        "wall_ms": {
+          "n": 12,
+          "median": 92.0,
+          "p95": 100,
+          "min": 89,
+          "max": 100
+        },
+        "rss_mib": {
+          "n": 12,
+          "median": 52.3671875,
+          "p95": 54.1875,
+          "min": 49.59375,
+          "max": 54.1875
+        },
+        "successful": 12,
+        "rows": 12
+      },
+      "t3/up-to-date/baseline": {
+        "wall_ms": {
+          "n": 12,
+          "median": 24.0,
+          "p95": 25,
+          "min": 23,
+          "max": 25
+        },
+        "rss_mib": {
+          "n": 12,
+          "median": 25.0546875,
+          "p95": 25.109375,
+          "min": 25.015625,
+          "max": 25.109375
+        },
+        "successful": 12,
+        "rows": 12
+      },
+      "t3/cold/candidate": {
+        "wall_ms": {
+          "n": 12,
+          "median": 1951.5,
+          "p95": 2197,
+          "min": 1845,
+          "max": 2197
+        },
+        "rss_mib": {
+          "n": 12,
+          "median": 330.40625,
+          "p95": 360.703125,
+          "min": 305.046875,
+          "max": 360.703125
+        },
+        "successful": 12,
+        "rows": 12
+      },
+      "t3/warm/candidate": {
+        "wall_ms": {
+          "n": 12,
+          "median": 92.0,
+          "p95": 102,
+          "min": 90,
+          "max": 102
+        },
+        "rss_mib": {
+          "n": 12,
+          "median": 52.390625,
+          "p95": 56.09375,
+          "min": 50.6875,
+          "max": 56.09375
+        },
+        "successful": 12,
+        "rows": 12
+      },
+      "t3/up-to-date/candidate": {
+        "wall_ms": {
+          "n": 12,
+          "median": 24.0,
+          "p95": 26,
+          "min": 24,
+          "max": 26
+        },
+        "rss_mib": {
+          "n": 12,
+          "median": 25.0625,
+          "p95": 25.109375,
+          "min": 25.015625,
+          "max": 25.109375
+        },
+        "successful": 12,
+        "rows": 12
+      },
+      "t3/cold/bun": {
+        "wall_ms": {
+          "n": 12,
+          "median": 1772.0,
+          "p95": 2005,
+          "min": 1632,
+          "max": 2005
+        },
+        "rss_mib": {
+          "n": 12,
+          "median": 391.015625,
+          "p95": 405.875,
+          "min": 354.625,
+          "max": 405.875
+        },
+        "successful": 12,
+        "rows": 12
+      },
+      "t3/warm/bun": {
+        "wall_ms": {
+          "n": 12,
+          "median": 179.0,
+          "p95": 192,
+          "min": 170,
+          "max": 192
+        },
+        "rss_mib": {
+          "n": 12,
+          "median": 7.234375,
+          "p95": 7.25,
+          "min": 7.21875,
+          "max": 7.25
+        },
+        "successful": 12,
+        "rows": 12
+      },
+      "t3/up-to-date/bun": {
+        "wall_ms": {
+          "n": 12,
+          "median": 21.0,
+          "p95": 23,
+          "min": 20,
+          "max": 23
+        },
+        "rss_mib": {
+          "n": 12,
+          "median": 7.859375,
+          "p95": 7.875,
+          "min": 7.84375,
+          "max": 7.875
+        },
+        "successful": 12,
+        "rows": 12
+      }
+    },
+    "timeline-readiness-reversed-labels": {
+      "vite-react/cold/baseline": {
+        "wall_ms": {
+          "n": 12,
+          "median": 670.5,
+          "p95": 1015,
+          "min": 585,
+          "max": 1015
+        },
+        "rss_mib": {
+          "n": 12,
+          "median": 215.5390625,
+          "p95": 238.90625,
+          "min": 182.5625,
+          "max": 238.90625
+        },
+        "successful": 12,
+        "rows": 12
+      },
+      "vite-react/warm/baseline": {
+        "wall_ms": {
+          "n": 12,
+          "median": 53.0,
+          "p95": 60,
+          "min": 49,
+          "max": 60
+        },
+        "rss_mib": {
+          "n": 12,
+          "median": 45.71875,
+          "p95": 47.53125,
+          "min": 44.609375,
+          "max": 47.53125
+        },
+        "successful": 12,
+        "rows": 12
+      },
+      "vite-react/up-to-date/baseline": {
+        "wall_ms": {
+          "n": 12,
+          "median": 24.0,
+          "p95": 25,
+          "min": 23,
+          "max": 25
+        },
+        "rss_mib": {
+          "n": 12,
+          "median": 23.71875,
+          "p95": 23.734375,
+          "min": 23.6875,
+          "max": 23.734375
+        },
+        "successful": 12,
+        "rows": 12
+      },
+      "vite-react/cold/candidate": {
+        "wall_ms": {
+          "n": 12,
+          "median": 622.5,
+          "p95": 930,
+          "min": 559,
+          "max": 930
+        },
+        "rss_mib": {
+          "n": 12,
+          "median": 211.5625,
+          "p95": 231.578125,
+          "min": 191.28125,
+          "max": 231.578125
+        },
+        "successful": 12,
+        "rows": 12
+      },
+      "vite-react/warm/candidate": {
+        "wall_ms": {
+          "n": 12,
+          "median": 52.0,
+          "p95": 56,
+          "min": 50,
+          "max": 56
+        },
+        "rss_mib": {
+          "n": 12,
+          "median": 45.5625,
+          "p95": 50.4375,
+          "min": 44.515625,
+          "max": 50.4375
+        },
+        "successful": 12,
+        "rows": 12
+      },
+      "vite-react/up-to-date/candidate": {
+        "wall_ms": {
+          "n": 12,
+          "median": 23.0,
+          "p95": 53,
+          "min": 22,
+          "max": 53
+        },
+        "rss_mib": {
+          "n": 12,
+          "median": 23.390625,
+          "p95": 23.40625,
+          "min": 23.359375,
+          "max": 23.40625
+        },
+        "successful": 12,
+        "rows": 12
+      },
+      "vite-react/cold/bun": {
+        "wall_ms": {
+          "n": 12,
+          "median": 447.5,
+          "p95": 533,
+          "min": 352,
+          "max": 533
+        },
+        "rss_mib": {
+          "n": 12,
+          "median": 132.625,
+          "p95": 158.0625,
+          "min": 121.5625,
+          "max": 158.0625
+        },
+        "successful": 12,
+        "rows": 12
+      },
+      "vite-react/warm/bun": {
+        "wall_ms": {
+          "n": 12,
+          "median": 30.0,
+          "p95": 32,
+          "min": 27,
+          "max": 32
+        },
+        "rss_mib": {
+          "n": 12,
+          "median": 6.734375,
+          "p95": 6.734375,
+          "min": 6.71875,
+          "max": 6.734375
+        },
+        "successful": 12,
+        "rows": 12
+      },
+      "vite-react/up-to-date/bun": {
+        "wall_ms": {
+          "n": 12,
+          "median": 16.0,
+          "p95": 26,
+          "min": 15,
+          "max": 26
+        },
+        "rss_mib": {
+          "n": 12,
+          "median": 6.765625,
+          "p95": 6.78125,
+          "min": 6.765625,
+          "max": 6.78125
+        },
+        "successful": 12,
+        "rows": 12
+      },
+      "native-sharp/cold/baseline": {
+        "wall_ms": {
+          "n": 12,
+          "median": 279.5,
+          "p95": 422,
+          "min": 246,
+          "max": 422
+        },
+        "rss_mib": {
+          "n": 12,
+          "median": 61.6640625,
+          "p95": 67.53125,
+          "min": 57.9375,
+          "max": 67.53125
+        },
+        "successful": 12,
+        "rows": 12
+      },
+      "native-sharp/warm/baseline": {
+        "wall_ms": {
+          "n": 12,
+          "median": 35.5,
+          "p95": 40,
+          "min": 33,
+          "max": 40
+        },
+        "rss_mib": {
+          "n": 12,
+          "median": 33.53125,
+          "p95": 33.84375,
+          "min": 32.875,
+          "max": 33.84375
+        },
+        "successful": 12,
+        "rows": 12
+      },
+      "native-sharp/up-to-date/baseline": {
+        "wall_ms": {
+          "n": 12,
+          "median": 23.0,
+          "p95": 27,
+          "min": 22,
+          "max": 27
+        },
+        "rss_mib": {
+          "n": 12,
+          "median": 22.1875,
+          "p95": 22.203125,
+          "min": 22.1875,
+          "max": 22.203125
+        },
+        "successful": 12,
+        "rows": 12
+      },
+      "native-sharp/cold/candidate": {
+        "wall_ms": {
+          "n": 12,
+          "median": 334.5,
+          "p95": 708,
+          "min": 270,
+          "max": 708
+        },
+        "rss_mib": {
+          "n": 12,
+          "median": 61.0703125,
+          "p95": 66.109375,
+          "min": 53.6875,
+          "max": 66.109375
+        },
+        "successful": 12,
+        "rows": 12
+      },
+      "native-sharp/warm/candidate": {
+        "wall_ms": {
+          "n": 12,
+          "median": 33.0,
+          "p95": 38,
+          "min": 33,
+          "max": 38
+        },
+        "rss_mib": {
+          "n": 12,
+          "median": 33.234375,
+          "p95": 33.328125,
+          "min": 32.625,
+          "max": 33.328125
+        },
+        "successful": 12,
+        "rows": 12
+      },
+      "native-sharp/up-to-date/candidate": {
+        "wall_ms": {
+          "n": 12,
+          "median": 23.0,
+          "p95": 29,
+          "min": 22,
+          "max": 29
+        },
+        "rss_mib": {
+          "n": 12,
+          "median": 21.984375,
+          "p95": 22.046875,
+          "min": 21.96875,
+          "max": 22.046875
+        },
+        "successful": 12,
+        "rows": 12
+      },
+      "native-sharp/cold/bun": {
+        "wall_ms": {
+          "n": 12,
+          "median": 255.0,
+          "p95": 429,
+          "min": 196,
+          "max": 429
+        },
+        "rss_mib": {
+          "n": 12,
+          "median": 21.1875,
+          "p95": 22.8125,
+          "min": 20.265625,
+          "max": 22.8125
+        },
+        "successful": 12,
+        "rows": 12
+      },
+      "native-sharp/warm/bun": {
+        "wall_ms": {
+          "n": 12,
+          "median": 9.0,
+          "p95": 15,
+          "min": 8,
+          "max": 15
+        },
+        "rss_mib": {
+          "n": 12,
+          "median": 6.34375,
+          "p95": 6.359375,
+          "min": 6.34375,
+          "max": 6.359375
+        },
+        "successful": 12,
+        "rows": 12
+      },
+      "native-sharp/up-to-date/bun": {
+        "wall_ms": {
+          "n": 12,
+          "median": 7.5,
+          "p95": 11,
+          "min": 7,
+          "max": 11
+        },
+        "rss_mib": {
+          "n": 12,
+          "median": 6.328125,
+          "p95": 6.34375,
+          "min": 6.328125,
+          "max": 6.34375
+        },
+        "successful": 12,
+        "rows": 12
+      },
+      "nest/cold/baseline": {
+        "wall_ms": {
+          "n": 12,
+          "median": 347.5,
+          "p95": 472,
+          "min": 333,
+          "max": 472
+        },
+        "rss_mib": {
+          "n": 12,
+          "median": 104.1875,
+          "p95": 115.5625,
+          "min": 95.015625,
+          "max": 115.5625
+        },
+        "successful": 12,
+        "rows": 12
+      },
+      "nest/warm/baseline": {
+        "wall_ms": {
+          "n": 12,
+          "median": 42.5,
+          "p95": 71,
+          "min": 41,
+          "max": 71
+        },
+        "rss_mib": {
+          "n": 12,
+          "median": 39.7734375,
+          "p95": 41.078125,
+          "min": 38.03125,
+          "max": 41.078125
+        },
+        "successful": 12,
+        "rows": 12
+      },
+      "nest/up-to-date/baseline": {
+        "wall_ms": {
+          "n": 12,
+          "median": 23.0,
+          "p95": 26,
+          "min": 22,
+          "max": 26
+        },
+        "rss_mib": {
+          "n": 12,
+          "median": 22.15625,
+          "p95": 22.171875,
+          "min": 22.125,
+          "max": 22.171875
+        },
+        "successful": 12,
+        "rows": 12
+      },
+      "nest/cold/candidate": {
+        "wall_ms": {
+          "n": 12,
+          "median": 340.0,
+          "p95": 645,
+          "min": 313,
+          "max": 645
+        },
+        "rss_mib": {
+          "n": 12,
+          "median": 107.8203125,
+          "p95": 115.203125,
+          "min": 98.1875,
+          "max": 115.203125
+        },
+        "successful": 12,
+        "rows": 12
+      },
+      "nest/warm/candidate": {
+        "wall_ms": {
+          "n": 12,
+          "median": 42.0,
+          "p95": 51,
+          "min": 41,
+          "max": 51
+        },
+        "rss_mib": {
+          "n": 12,
+          "median": 38.7265625,
+          "p95": 40.390625,
+          "min": 37.53125,
+          "max": 40.390625
+        },
+        "successful": 12,
+        "rows": 12
+      },
+      "nest/up-to-date/candidate": {
+        "wall_ms": {
+          "n": 12,
+          "median": 22.0,
+          "p95": 28,
+          "min": 22,
+          "max": 28
+        },
+        "rss_mib": {
+          "n": 12,
+          "median": 21.9921875,
+          "p95": 22.03125,
+          "min": 21.9375,
+          "max": 22.03125
+        },
+        "successful": 12,
+        "rows": 12
+      },
+      "nest/cold/bun": {
+        "wall_ms": {
+          "n": 12,
+          "median": 320.0,
+          "p95": 638,
+          "min": 272,
+          "max": 638
+        },
+        "rss_mib": {
+          "n": 12,
+          "median": 38.0546875,
+          "p95": 40.875,
+          "min": 35.546875,
+          "max": 40.875
+        },
+        "successful": 12,
+        "rows": 12
+      },
+      "nest/warm/bun": {
+        "wall_ms": {
+          "n": 12,
+          "median": 31.5,
+          "p95": 35,
+          "min": 30,
+          "max": 35
+        },
+        "rss_mib": {
+          "n": 12,
+          "median": 6.359375,
+          "p95": 6.375,
+          "min": 6.359375,
+          "max": 6.375
+        },
+        "successful": 12,
+        "rows": 12
+      },
+      "nest/up-to-date/bun": {
+        "wall_ms": {
+          "n": 12,
+          "median": 11.0,
+          "p95": 13,
+          "min": 10,
+          "max": 13
+        },
+        "rss_mib": {
+          "n": 12,
+          "median": 6.359375,
+          "p95": 6.375,
+          "min": 6.34375,
+          "max": 6.375
+        },
+        "successful": 12,
+        "rows": 12
+      },
+      "t3/cold/baseline": {
+        "wall_ms": {
+          "n": 12,
+          "median": 1971.5,
+          "p95": 2097,
+          "min": 1838,
+          "max": 2097
+        },
+        "rss_mib": {
+          "n": 12,
+          "median": 328.53125,
+          "p95": 352.984375,
+          "min": 297.625,
+          "max": 352.984375
+        },
+        "successful": 12,
+        "rows": 12
+      },
+      "t3/warm/baseline": {
+        "wall_ms": {
+          "n": 12,
+          "median": 92.0,
+          "p95": 95,
+          "min": 92,
+          "max": 95
+        },
+        "rss_mib": {
+          "n": 12,
+          "median": 52.671875,
+          "p95": 54.625,
+          "min": 49.984375,
+          "max": 54.625
+        },
+        "successful": 12,
+        "rows": 12
+      },
+      "t3/up-to-date/baseline": {
+        "wall_ms": {
+          "n": 12,
+          "median": 25.0,
+          "p95": 32,
+          "min": 24,
+          "max": 32
+        },
+        "rss_mib": {
+          "n": 12,
+          "median": 25.484375,
+          "p95": 25.546875,
+          "min": 25.4375,
+          "max": 25.546875
+        },
+        "successful": 12,
+        "rows": 12
+      },
+      "t3/cold/candidate": {
+        "wall_ms": {
+          "n": 12,
+          "median": 1886.0,
+          "p95": 2731,
+          "min": 1854,
+          "max": 2731
+        },
+        "rss_mib": {
+          "n": 12,
+          "median": 326.7265625,
+          "p95": 344.828125,
+          "min": 290.96875,
+          "max": 344.828125
+        },
+        "successful": 12,
+        "rows": 12
+      },
+      "t3/warm/candidate": {
+        "wall_ms": {
+          "n": 12,
+          "median": 92.0,
+          "p95": 98,
+          "min": 90,
+          "max": 98
+        },
+        "rss_mib": {
+          "n": 12,
+          "median": 52.6796875,
+          "p95": 53.1875,
+          "min": 50.171875,
+          "max": 53.1875
+        },
+        "successful": 12,
+        "rows": 12
+      },
+      "t3/up-to-date/candidate": {
+        "wall_ms": {
+          "n": 12,
+          "median": 25.0,
+          "p95": 125,
+          "min": 24,
+          "max": 125
+        },
+        "rss_mib": {
+          "n": 12,
+          "median": 25.078125,
+          "p95": 25.140625,
+          "min": 25.03125,
+          "max": 25.140625
+        },
+        "successful": 12,
+        "rows": 12
+      },
+      "t3/cold/bun": {
+        "wall_ms": {
+          "n": 12,
+          "median": 1811.0,
+          "p95": 1946,
+          "min": 1666,
+          "max": 1946
+        },
+        "rss_mib": {
+          "n": 12,
+          "median": 396.578125,
+          "p95": 414.6875,
+          "min": 360.1875,
+          "max": 414.6875
+        },
+        "successful": 12,
+        "rows": 12
+      },
+      "t3/warm/bun": {
+        "wall_ms": {
+          "n": 12,
+          "median": 186.0,
+          "p95": 199,
+          "min": 176,
+          "max": 199
+        },
+        "rss_mib": {
+          "n": 12,
+          "median": 7.234375,
+          "p95": 7.265625,
+          "min": 7.234375,
+          "max": 7.265625
+        },
+        "successful": 12,
+        "rows": 12
+      },
+      "t3/up-to-date/bun": {
+        "wall_ms": {
+          "n": 12,
+          "median": 22.0,
+          "p95": 29,
+          "min": 21,
+          "max": 29
+        },
+        "rss_mib": {
+          "n": 12,
+          "median": 7.859375,
+          "p95": 7.875,
+          "min": 7.859375,
+          "max": 7.875
+        },
+        "successful": 12,
+        "rows": 12
+      }
+    }
+  },
+  "parity": {
+    "timeline-nest-frozen/scored": {
+      "lpm.lock": {
+        "unique": 1,
+        "sha256_counts": {
+          "e4301fb934532e0b80b60069b72797b7332831b5e38202f55f21d1b719d4126c": 108
+        }
+      },
+      "selected-packages.json": {
+        "unique": 1,
+        "sha256_counts": {
+          "5a695435c264cb3156ec2fe190ba977acb42eed418cfb13de525a8d77c45234c": 108
+        }
+      },
+      "object-content-digests.json": {
+        "unique": 1,
+        "sha256_counts": {
+          "8f1f1c473605c89a8244e82c3eeee3850dd3acb67a3cce363c440978ffdf03e6": 108
+        }
+      }
+    },
+    "timeline-vite-frozen/scored": {
+      "lpm.lock": {
+        "unique": 1,
+        "sha256_counts": {
+          "e8618962f392f169f55b89ac23b9b60975e796ec9a5a9da8d667e23780c58fae": 108
+        }
+      },
+      "selected-packages.json": {
+        "unique": 1,
+        "sha256_counts": {
+          "a8ac0f90977a886fbddd0fedc085f6ff9c4e23ee51765be70228fd95d57c0326": 108
+        }
+      },
+      "object-content-digests.json": {
+        "unique": 1,
+        "sha256_counts": {
+          "08cafddcb9215832b78e1fc5e34a487756ffccfe461edb62a5a05b290eeb5de0": 108
+        }
+      }
+    },
+    "timeline-sharp-frozen/scored": {
+      "lpm.lock": {
+        "unique": 1,
+        "sha256_counts": {
+          "a3443f79de995ae4137e83bc8f75214e8edc0e77bcf37590256736df00b5c94a": 108
+        }
+      },
+      "selected-packages.json": {
+        "unique": 1,
+        "sha256_counts": {
+          "adbf30aca830e5286da24100389a2756ecaf1868293407a8eaff445c1592b520": 108
+        }
+      },
+      "object-content-digests.json": {
+        "unique": 1,
+        "sha256_counts": {
+          "d2f405aa33e8133fe7e27490799fe2ae1a69b459bc6199bbd267a1c27c8811a3": 108
+        }
+      }
+    },
+    "timeline-nest-final/scored": {
+      "lpm.lock": {
+        "unique": 1,
+        "sha256_counts": {
+          "e4301fb934532e0b80b60069b72797b7332831b5e38202f55f21d1b719d4126c": 108
+        }
+      },
+      "selected-packages.json": {
+        "unique": 1,
+        "sha256_counts": {
+          "5a695435c264cb3156ec2fe190ba977acb42eed418cfb13de525a8d77c45234c": 108
+        }
+      },
+      "object-content-digests.json": {
+        "unique": 1,
+        "sha256_counts": {
+          "8f1f1c473605c89a8244e82c3eeee3850dd3acb67a3cce363c440978ffdf03e6": 108
+        }
+      }
+    },
+    "timeline-vite-final/scored": {
+      "lpm.lock": {
+        "unique": 1,
+        "sha256_counts": {
+          "e8618962f392f169f55b89ac23b9b60975e796ec9a5a9da8d667e23780c58fae": 108
+        }
+      },
+      "selected-packages.json": {
+        "unique": 1,
+        "sha256_counts": {
+          "a8ac0f90977a886fbddd0fedc085f6ff9c4e23ee51765be70228fd95d57c0326": 108
+        }
+      },
+      "object-content-digests.json": {
+        "unique": 1,
+        "sha256_counts": {
+          "08cafddcb9215832b78e1fc5e34a487756ffccfe461edb62a5a05b290eeb5de0": 108
+        }
+      }
+    },
+    "timeline-sharp-final/scored": {
+      "lpm.lock": {
+        "unique": 1,
+        "sha256_counts": {
+          "a3443f79de995ae4137e83bc8f75214e8edc0e77bcf37590256736df00b5c94a": 108
+        }
+      },
+      "selected-packages.json": {
+        "unique": 1,
+        "sha256_counts": {
+          "adbf30aca830e5286da24100389a2756ecaf1868293407a8eaff445c1592b520": 108
+        }
+      },
+      "object-content-digests.json": {
+        "unique": 1,
+        "sha256_counts": {
+          "d2f405aa33e8133fe7e27490799fe2ae1a69b459bc6199bbd267a1c27c8811a3": 108
+        }
+      }
+    }
+  },
+  "paired": {
+    "timeline-nest-frozen/scored/baseline:disabled": {
+      "wall_delta_ms": {
+        "n": 36,
+        "median": 1.0,
+        "p95": 11,
+        "min": -15,
+        "max": 29
+      },
+      "rss_delta_mib": {
+        "n": 36,
+        "median": 0.1015625,
+        "p95": 5.046875,
+        "min": -5.65625,
+        "max": 8.078125
+      },
+      "candidate_faster": 14
+    },
+    "timeline-nest-frozen/scored/disabled:enabled": {
+      "wall_delta_ms": {
+        "n": 36,
+        "median": -1.0,
+        "p95": 8,
+        "min": -22,
+        "max": 10
+      },
+      "rss_delta_mib": {
+        "n": 36,
+        "median": 0.6875,
+        "p95": 5.859375,
+        "min": -5.234375,
+        "max": 5.96875
+      },
+      "candidate_faster": 19
+    },
+    "timeline-vite-frozen/scored/baseline:disabled": {
+      "wall_delta_ms": {
+        "n": 36,
+        "median": 2.5,
+        "p95": 13,
+        "min": -13,
+        "max": 25
+      },
+      "rss_delta_mib": {
+        "n": 36,
+        "median": 2.0625,
+        "p95": 23.375,
+        "min": -14.875,
+        "max": 24.25
+      },
+      "candidate_faster": 14
+    },
+    "timeline-vite-frozen/scored/disabled:enabled": {
+      "wall_delta_ms": {
+        "n": 36,
+        "median": 1.5,
+        "p95": 25,
+        "min": -18,
+        "max": 25
+      },
+      "rss_delta_mib": {
+        "n": 36,
+        "median": -1.234375,
+        "p95": 15.984375,
+        "min": -19.96875,
+        "max": 21.625
+      },
+      "candidate_faster": 16
+    },
+    "timeline-sharp-frozen/scored/baseline:disabled": {
+      "wall_delta_ms": {
+        "n": 36,
+        "median": 0.0,
+        "p95": 15,
+        "min": -20,
+        "max": 73
+      },
+      "rss_delta_mib": {
+        "n": 36,
+        "median": 0.9921875,
+        "p95": 5.0,
+        "min": -4.140625,
+        "max": 7.703125
+      },
+      "candidate_faster": 15
+    },
+    "timeline-sharp-frozen/scored/disabled:enabled": {
+      "wall_delta_ms": {
+        "n": 36,
+        "median": 0.0,
+        "p95": 9,
+        "min": -73,
+        "max": 10
+      },
+      "rss_delta_mib": {
+        "n": 36,
+        "median": -0.3515625,
+        "p95": 6.0,
+        "min": -9.0,
+        "max": 9.640625
+      },
+      "candidate_faster": 17
+    },
+    "timeline-nest-final/scored/baseline:disabled": {
+      "wall_delta_ms": {
+        "n": 36,
+        "median": 2.5,
+        "p95": 22,
+        "min": -14,
+        "max": 26
+      },
+      "rss_delta_mib": {
+        "n": 36,
+        "median": 1.921875,
+        "p95": 6.171875,
+        "min": -6.78125,
+        "max": 11.390625
+      },
+      "candidate_faster": 13
+    },
+    "timeline-nest-final/scored/disabled:enabled": {
+      "wall_delta_ms": {
+        "n": 36,
+        "median": -1.5,
+        "p95": 12,
+        "min": -40,
+        "max": 12
+      },
+      "rss_delta_mib": {
+        "n": 36,
+        "median": 0.0625,
+        "p95": 6.328125,
+        "min": -6.71875,
+        "max": 14.40625
+      },
+      "candidate_faster": 21
+    },
+    "timeline-vite-final/scored/baseline:disabled": {
+      "wall_delta_ms": {
+        "n": 36,
+        "median": -1.0,
+        "p95": 50,
+        "min": -54,
+        "max": 57
+      },
+      "rss_delta_mib": {
+        "n": 36,
+        "median": 3.109375,
+        "p95": 23.75,
+        "min": -16.265625,
+        "max": 28.078125
+      },
+      "candidate_faster": 19
+    },
+    "timeline-vite-final/scored/disabled:enabled": {
+      "wall_delta_ms": {
+        "n": 36,
+        "median": 5.5,
+        "p95": 20,
+        "min": -55,
+        "max": 32
+      },
+      "rss_delta_mib": {
+        "n": 36,
+        "median": 1.8125,
+        "p95": 15.0625,
+        "min": -17.84375,
+        "max": 18.609375
+      },
+      "candidate_faster": 10
+    },
+    "timeline-sharp-final/scored/baseline:disabled": {
+      "wall_delta_ms": {
+        "n": 36,
+        "median": 0.5,
+        "p95": 11,
+        "min": -6,
+        "max": 17
+      },
+      "rss_delta_mib": {
+        "n": 36,
+        "median": -0.0625,
+        "p95": 3.4375,
+        "min": -4.328125,
+        "max": 4.921875
+      },
+      "candidate_faster": 12
+    },
+    "timeline-sharp-final/scored/disabled:enabled": {
+      "wall_delta_ms": {
+        "n": 36,
+        "median": 1.0,
+        "p95": 6,
+        "min": -15,
+        "max": 6
+      },
+      "rss_delta_mib": {
+        "n": 36,
+        "median": 0.6875,
+        "p95": 5.421875,
+        "min": -5.328125,
+        "max": 5.65625
+      },
+      "candidate_faster": 11
+    }
+  }
+}
