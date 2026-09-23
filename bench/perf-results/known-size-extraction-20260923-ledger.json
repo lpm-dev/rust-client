@@ -1,0 +1,68 @@
+{
+  "findings": [
+    {
+      "id": "MEM-9",
+      "source": "cache_trust_review",
+      "category": "performance",
+      "location": "crates/lpm-store/src/v2/store.rs and store/tests.rs",
+      "claim": "Known-large regular tarball files allocate an avoidable 8 MiB prefix",
+      "evidence": "Source traces and release DHAT support prefix lifetime; review confirms missing assertions",
+      "disposition": "Verified",
+      "coverage": "360 store tests; fast local gates; SWC micro24; T3 CI-cold24+24; readiness4fixtures12; frozen Vite36",
+      "commit": "8f46810f3",
+      "pr_status": "Ready for publication"
+    },
+    {
+      "id": "MEM-10",
+      "source": "daybreak_cold_finalization_review",
+      "category": "coverage",
+      "location": "crates/lpm-store/src/v2/store.rs and store/tests.rs",
+      "claim": "Source-analysis parity test did not assert actual findings and oversized-source fallback",
+      "evidence": "Source traces and release DHAT support prefix lifetime; review confirms missing assertions",
+      "disposition": "Verified",
+      "coverage": "360 store tests; fast local gates; SWC micro24; T3 CI-cold24+24; readiness4fixtures12; frozen Vite36",
+      "commit": "8f46810f3",
+      "pr_status": "Ready for publication"
+    },
+    {
+      "id": "MEM-11",
+      "source": "daybreak_cold_finalization_review",
+      "category": "coverage",
+      "location": "crates/lpm-store/src/v2/store.rs and store/tests.rs",
+      "claim": "Large-file V3 callback consumer lacked regression coverage",
+      "evidence": "Source traces and release DHAT support prefix lifetime; review confirms missing assertions",
+      "disposition": "Verified",
+      "coverage": "360 store tests; fast local gates; SWC micro24; T3 CI-cold24+24; readiness4fixtures12; frozen Vite36",
+      "commit": "8f46810f3",
+      "pr_status": "Ready for publication"
+    }
+  ],
+  "observations": {
+    "MEM-01": "Locked CI-cold metadata RPC counters are zero; not a production defect.",
+    "MEM-02": "Decoded buffers are retained through extraction; canonical measured observation MEM-07.",
+    "MEM-03": "Next uses 768 KiB pipelined buffers; not whole archive allocation.",
+    "MEM-04": "Path ledgers cannot by themselves explain the RSS gap.",
+    "MEM-05": "Tree digest paths move into finalization map; no duplicate strings found.",
+    "MEM-06": "Thread-cap diagnostics16/32 show no convincing RSS win; no policy adopted.",
+    "MEM-07": "34.07 MiB decoded data at DHAT global peak; necessary ownership, no leak established.",
+    "MEM-08": "Rayon contributes zero at the measured DHAT peak; remaining allocations alone do not justify a runtime change."
+  },
+  "research_observations": [
+    {
+      "id": "MEM-OBS-09",
+      "source": "cache_trust_review",
+      "source_alias": "MEM-10 follow-up report (not coverage finding MEM-10)",
+      "claim": "Direct streaming likely uses about 128 additional underlying file reads for SWC compared with its former 8MiB prefix preload",
+      "evidence": "flate2 read::GzDecoder uses32KiB requests; hybrid prefix reads64KiB; actual syscall counts not measured",
+      "conclusion": "Optimization hypothesis only. Scored micro pairs split12/12 and median paired difference0.795ms, so a consistent wall regression is not established"
+    },
+    {
+      "id": "MEM-OBS-10",
+      "source": "cache_trust_review",
+      "source_alias": "MEM-11 follow-up report (not coverage finding MEM-11)",
+      "claim": "Frozen Vite capture does not exercise the new known-large streaming route",
+      "evidence": "63 original archives; largest4080074bytes, below8MiB cutoff",
+      "conclusion": "Constrains attribution but does not explain the live Vite regression; added handle metadata check still executes"
+    }
+  ]
+}
