@@ -185,10 +185,18 @@ The trace proves that a completed result waits. It does not connect that result 
 Changing commit order also changes error order and the graph mutation schedule.
 Current exact-target selection prevents the older "first compatible version wins" explanation from justifying every ordering barrier.
 
-A controlled next experiment uses slow root `a` and fast root `b`, with child `c` only under `b`.
-Pinned responses and server request times can show whether delaying `a` postpones the request for `c`.
-If that cost is material, bounded metadata prefetch can be evaluated while graph mutation remains ordered.
-That is an experiment proposal, not an established speedup.
+A separate controlled fixture uses pinned roots `a` and `b`, with pinned child `c` only under `b`.
+The local server changes only the delay before sending `a` metadata: 0, 150, or 300 ms.
+Four rounds alternate binary order and delay order. Both binaries complete all 24 installs with identical lockfile bytes.
+With no injected delay, the `c` request follows the `b` response by 0.3–2.6 ms.
+A 150 ms delay increases that interval to 151–162 ms. A 300 ms delay increases it to 302–311 ms.
+In all 16 delayed runs, `b` responds before `a`, and `c` is requested only after `a` responds.
+This controlled intervention confirms a dependency-discovery delay behind the ordered metadata barrier.
+It does not quantify production savings or justify removing deterministic graph-commit order.
+A bounded next candidate is metadata prefetch from completed results while graph mutation remains ordered.
+That optimization still needs policy, platform, error-order, request-budget, graph-parity, and RSS checks.
+The adjacent `-ordering.tar.gz` retains the exact driver, server timestamps, plans, outputs, lockfiles, and 12 diagnostic traces.
+This separate diagnostic ran after the scored comparisons and changed neither binary.
 
 ## Earlier validation cohorts
 
