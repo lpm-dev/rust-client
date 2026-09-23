@@ -22,7 +22,7 @@ use crate::detect;
 use crate::node;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
-use std::ffi::OsStr;
+use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -67,15 +67,18 @@ struct PathNodeIdentity {
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 enum PathNodeCacheContext {
-    WorkingDirectory(PathBuf),
+    Script {
+        working_directory: PathBuf,
+        search_path: OsString,
+    },
     LpmManaged,
 }
 
 /// Reuses Node version probes within the same script execution context.
 ///
 /// Executables in LPM's managed Node store are context-independent and may be
-/// reused across working directories. Other executables are cached per cwd so
-/// version-manager shims can select different runtimes for different projects.
+/// reused across working directories. Other executables are cached per cwd and
+/// PATH because shims can select runtimes through project files or helper executables.
 #[derive(Debug, Default)]
 pub struct PathNodeVersionCache {
     resolutions: HashMap<PathNodeIdentity, PathNodeResolution>,
@@ -125,7 +128,7 @@ impl PathNodeVersionCache {
         let executable_before = node_executable_in_path(cwd, path);
         let identity_before = executable_before
             .as_deref()
-            .and_then(|executable| path_node_identity(executable, cwd, managed_node_root));
+            .and_then(|executable| path_node_identity(executable, cwd, path, managed_node_root));
         if let Some(cached) = identity_before
             .as_ref()
             .and_then(|identity| self.resolutions.get(identity))
@@ -136,7 +139,7 @@ impl PathNodeVersionCache {
         let version = node_version_on_path(cwd, path, executable_before.as_deref());
         let identity_after = node_executable_in_path(cwd, path)
             .as_deref()
-            .and_then(|executable| path_node_identity(executable, cwd, managed_node_root));
+            .and_then(|executable| path_node_identity(executable, cwd, path, managed_node_root));
         let stable_identity =
             identity_before.filter(|before| Some(before) == identity_after.as_ref());
         let resolution = PathNodeResolution {
@@ -374,9 +377,12 @@ fn system_node_version_at(executable: &Path) -> Option<String> {
 }
 
 #[cfg(not(windows))]
-fn node_version_on_path(cwd: &Path, _path: &OsStr, executable: Option<&Path>) -> Option<String> {
+fn node_version_on_path(cwd: &Path, path: &OsStr, executable: Option<&Path>) -> Option<String> {
     parse_system_node_version(node_version_output(
-        Command::new(executable?).arg("--version").current_dir(cwd),
+        Command::new(executable?)
+            .arg("--version")
+            .current_dir(cwd)
+            .env("PATH", path),
     )?)
 }
 
@@ -489,6 +495,7 @@ fn executable_fingerprint(kind: &[u8], executable: &Path) -> Option<String> {
 fn path_node_identity(
     executable: &Path,
     cwd: &Path,
+    path: &OsStr,
     managed_node_root: Option<&Path>,
 ) -> Option<PathNodeIdentity> {
     let canonical_executable = executable.canonicalize().ok()?;
@@ -497,7 +504,10 @@ fn path_node_identity(
     let context = if managed_node_root.is_some_and(|root| canonical_executable.starts_with(root)) {
         PathNodeCacheContext::LpmManaged
     } else {
-        PathNodeCacheContext::WorkingDirectory(cwd.canonicalize().ok()?)
+        PathNodeCacheContext::Script {
+            working_directory: cwd.canonicalize().ok()?,
+            search_path: path.to_os_string(),
+        }
     };
     Some(PathNodeIdentity {
         canonical_executable,
@@ -733,6 +743,96 @@ mod tests {
         assert_eq!(
             resolution.runtime_fingerprint(),
             probe_node_fingerprint_on_path(first_dir.path(), &path).as_deref()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn explicit_path_node_shim_resolves_helpers_from_the_supplied_path() {
+        let shim_dir = tempfile::tempdir().unwrap();
+        let helper_dir = tempfile::tempdir().unwrap();
+        let helper_name = format!(
+            "lpm-node-version-helper-{}",
+            helper_dir.path().file_name().unwrap().to_string_lossy()
+        );
+        write_test_executable(
+            &helper_dir.path().join(&helper_name),
+            b"#!/bin/sh\nprintf 'v22.0.0\\n'\n",
+        );
+        write_test_executable(
+            &test_node_path(shim_dir.path()),
+            format!("#!/bin/sh\nexec {helper_name}\n").as_bytes(),
+        );
+        let path = std::env::join_paths([shim_dir.path(), helper_dir.path()]).unwrap();
+
+        let resolution = resolve_node_on_path_with_fingerprint(shim_dir.path(), &path);
+
+        assert_eq!(resolution.version(), Some("22.0.0"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn node_version_cache_reprobes_when_helper_search_path_changes() {
+        let shim_dir = tempfile::tempdir().unwrap();
+        let first_helper_dir = tempfile::tempdir().unwrap();
+        let second_helper_dir = tempfile::tempdir().unwrap();
+        let helper_name = format!(
+            "lpm-node-cache-helper-{}",
+            shim_dir.path().file_name().unwrap().to_string_lossy()
+        );
+        write_test_executable(
+            &test_node_path(shim_dir.path()),
+            format!("#!/bin/sh\nexec {helper_name}\n").as_bytes(),
+        );
+        write_test_executable(
+            &first_helper_dir.path().join(&helper_name),
+            b"#!/bin/sh\necho v18.0.0\n",
+        );
+        write_test_executable(
+            &second_helper_dir.path().join(&helper_name),
+            b"#!/bin/sh\necho v22.0.0\n",
+        );
+        let mut cache = PathNodeVersionCache::default();
+        for (helper, expected) in [
+            (first_helper_dir.path(), "18.0.0"),
+            (second_helper_dir.path(), "22.0.0"),
+        ] {
+            let path = std::env::join_paths([shim_dir.path(), helper]).unwrap();
+            assert_eq!(
+                cache.resolve(shim_dir.path(), &path).version(),
+                Some(expected)
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn node_version_cache_reprobes_a_missing_helper_after_path_changes() {
+        let shim_dir = tempfile::tempdir().unwrap();
+        let helper_dir = tempfile::tempdir().unwrap();
+        let helper_name = format!(
+            "lpm-node-cache-helper-{}",
+            helper_dir.path().file_name().unwrap().to_string_lossy()
+        );
+        write_test_executable(
+            &test_node_path(shim_dir.path()),
+            format!("#!/bin/sh\nexec {helper_name}\n").as_bytes(),
+        );
+        write_test_executable(
+            &helper_dir.path().join(&helper_name),
+            b"#!/bin/sh\necho v22.0.0\n",
+        );
+        let mut cache = PathNodeVersionCache::default();
+        let missing_path = std::env::join_paths([shim_dir.path()]).unwrap();
+        assert_eq!(
+            cache.resolve(shim_dir.path(), &missing_path).version(),
+            None
+        );
+
+        let complete_path = std::env::join_paths([shim_dir.path(), helper_dir.path()]).unwrap();
+        assert_eq!(
+            cache.resolve(shim_dir.path(), &complete_path).version(),
+            Some("22.0.0")
         );
     }
 
