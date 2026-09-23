@@ -1,3 +1,5 @@
+mod resolver_cache;
+
 use super::*;
 use serde::de::{DeserializeSeed, Error, MapAccess, Visitor};
 use serde_json::value::RawValue;
@@ -172,9 +174,75 @@ impl RegistryClient {
         )
     }
 
+    async fn read_preferred_cache_for_use<const RESOLVER: bool>(
+        &self,
+        key: &str,
+    ) -> Option<crate::client::state::MetadataCacheEntry<PreferredMetadata>> {
+        if !RESOLVER {
+            return self.read_metadata_cache_entry_as_async(key).await;
+        }
+        #[derive(serde::Deserialize)]
+        struct ResolverPreferred {
+            metadata: resolver_cache::ResolverMetadata,
+            versions_complete: bool,
+        }
+        let cached = self
+            .read_metadata_cache_entry_as_async::<ResolverPreferred>(key)
+            .await?;
+        Some(crate::client::state::MetadataCacheEntry {
+            value: PreferredMetadata {
+                metadata: cached.value.metadata.0,
+                versions_complete: cached.value.versions_complete,
+            },
+            etag: cached.etag,
+            remaining_freshness: cached.remaining_freshness,
+        })
+    }
+
+    async fn read_complete_cache_for_use<const RESOLVER: bool>(
+        &self,
+        key: &str,
+    ) -> Option<(PackageMetadata, Option<String>)> {
+        if !RESOLVER {
+            return self.read_metadata_cache_async(key).await;
+        }
+        let cached = self
+            .read_metadata_cache_as_async::<resolver_cache::ResolverMetadata>(key)
+            .await?;
+        Some((cached.0.0, cached.1))
+    }
+
     /// Return preferred manifests with explicit completeness, or complete history when the
     /// preference cannot satisfy the caller. Complete-history consumers use the ordinary API.
     pub async fn get_npm_preferred_metadata_direct_with_timings<F>(
+        &self,
+        name: &str,
+        accepts: F,
+    ) -> Result<(TimedPackageMetadata, bool), LpmError>
+    where
+        F: Fn(&str) -> bool + Send + 'static,
+    {
+        self.get_npm_preferred_metadata_with_cache_fields::<_, false>(name, accepts)
+            .await
+    }
+
+    /// Return preferred metadata for dependency resolution.
+    /// Cached results can omit development dependencies. The completeness flag
+    /// describes version coverage, not field coverage. Callers that consume
+    /// development dependencies must use the full-metadata API.
+    pub async fn get_npm_preferred_metadata_for_resolution_with_timings<F>(
+        &self,
+        name: &str,
+        accepts: F,
+    ) -> Result<(TimedPackageMetadata, bool), LpmError>
+    where
+        F: Fn(&str) -> bool + Send + 'static,
+    {
+        self.get_npm_preferred_metadata_with_cache_fields::<_, true>(name, accepts)
+            .await
+    }
+
+    async fn get_npm_preferred_metadata_with_cache_fields<F, const RESOLVER: bool>(
         &self,
         name: &str,
         accepts: F,
@@ -187,7 +255,7 @@ impl RegistryClient {
         crate::timing::record_metadata_request(name);
         let read_start = std::time::Instant::now();
         if let Some(cached) = self
-            .read_metadata_cache_entry_as_async::<PreferredMetadata>(&cache_key)
+            .read_preferred_cache_for_use::<RESOLVER>(&cache_key)
             .await
             && cached.value.is_valid(name)
         {
@@ -210,7 +278,9 @@ impl RegistryClient {
             return Ok((complete, true));
         }
         let complete_key = self.npm_direct_metadata_cache_key(name);
-        if let Some(cached) = self.read_metadata_cache_async(&complete_key).await
+        if let Some(cached) = self
+            .read_complete_cache_for_use::<RESOLVER>(&complete_key)
+            .await
             && batch_metadata_entry_matches_name(name, &cached.0)
         {
             timings.cache_read_ms = read_start.elapsed().as_millis();
@@ -229,7 +299,7 @@ impl RegistryClient {
         let _flight = metadata_fetch_flight_guard(&cache_key).await;
         let coalesced_start = std::time::Instant::now();
         if let Some(cached) = self
-            .read_metadata_cache_entry_as_async::<PreferredMetadata>(&cache_key)
+            .read_preferred_cache_for_use::<RESOLVER>(&cache_key)
             .await
             && cached.value.is_valid(name)
             && cached.value.covers(&accepts)
@@ -244,7 +314,9 @@ impl RegistryClient {
                 cached.value.versions_complete,
             ));
         }
-        if let Some(cached) = self.read_metadata_cache_async(&complete_key).await
+        if let Some(cached) = self
+            .read_complete_cache_for_use::<RESOLVER>(&complete_key)
+            .await
             && batch_metadata_entry_matches_name(name, &cached.0)
         {
             timings.cache_hit = true;
@@ -367,6 +439,201 @@ impl RegistryClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn resolver_cache_reads_preserve_complete_metadata_for_other_consumers() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        for complete in [false, true] {
+            let server = MockServer::start().await;
+            let mut body = history();
+            for version in body["versions"].as_object_mut().unwrap().values_mut() {
+                version["devDependencies"] = serde_json::json!({"build-tool": "^1.0.0"});
+                version["engines"] = serde_json::json!({"node": ">=20"});
+                version["scripts"] = serde_json::json!({"install": "node build.js"});
+            }
+            Mock::given(method("GET"))
+                .and(path("/pkg"))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_json(body)
+                        .insert_header("Cache-Control", "max-age=300"),
+                )
+                .expect(1)
+                .mount(&server)
+                .await;
+            let cache = tempfile::tempdir().unwrap();
+            let client = preferred_test_client(&server, cache.path()).await;
+            let (original, original_complete) = client
+                .get_npm_preferred_metadata_direct_with_timings("pkg", move |_| !complete)
+                .await
+                .unwrap();
+            assert_eq!(original_complete, complete);
+            let (projected, projected_complete) = client
+                .get_npm_preferred_metadata_for_resolution_with_timings("pkg", move |_| !complete)
+                .await
+                .unwrap();
+            assert!(projected.timings.cache_hit);
+            assert_eq!(projected_complete, complete);
+            let mut expected = original.metadata.clone();
+            for version in expected.versions.values_mut() {
+                version.dev_dependencies.clear();
+            }
+            assert_eq!(
+                serde_json::to_value(projected.metadata).unwrap(),
+                serde_json::to_value(expected).unwrap()
+            );
+            let (full, full_complete) = client
+                .get_npm_preferred_metadata_direct_with_timings("pkg", move |_| !complete)
+                .await
+                .unwrap();
+            assert!(full.timings.cache_hit);
+            assert_eq!(full_complete, complete);
+            assert_eq!(
+                serde_json::to_value(full.metadata).unwrap(),
+                serde_json::to_value(original.metadata).unwrap()
+            );
+            server.verify().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn resolver_cache_revalidation_keeps_development_dependencies_in_persisted_records() {
+        use wiremock::matchers::{header, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        let cache = tempfile::tempdir().unwrap();
+        let client = preferred_test_client(&server, cache.path()).await;
+        let mut body = history();
+        body["versions"]["2.0.0"]["devDependencies"] = serde_json::json!({"build-tool": "^1.0.0"});
+        let initial = Mock::given(method("GET"))
+            .and(path("/pkg"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(body)
+                    .insert_header("Cache-Control", "max-age=300")
+                    .insert_header("ETag", "\"initial\""),
+            )
+            .expect(1)
+            .mount_as_scoped(&server)
+            .await;
+        client
+            .get_npm_preferred_metadata_for_resolution_with_timings("pkg", |_| true)
+            .await
+            .unwrap();
+        drop(initial);
+        let key = client.npm_preferred_metadata_cache_key("pkg");
+        let cache_path = client.cache_path(&key).unwrap();
+        filetime::set_file_mtime(&cache_path, filetime::FileTime::from_unix_time(1, 0)).unwrap();
+        Mock::given(method("GET"))
+            .and(path("/pkg"))
+            .and(header("If-None-Match", "\"initial\""))
+            .respond_with(
+                ResponseTemplate::new(304)
+                    .insert_header("Cache-Control", "max-age=120")
+                    .insert_header("ETag", "\"updated\""),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let (revalidated, _) = client
+            .get_npm_preferred_metadata_for_resolution_with_timings("pkg", |_| true)
+            .await
+            .unwrap();
+        assert!(revalidated.timings.not_modified);
+        assert!(!revalidated.timings.cache_hit);
+        let (projected, _) = client
+            .get_npm_preferred_metadata_for_resolution_with_timings("pkg", |_| true)
+            .await
+            .unwrap();
+        assert!(projected.timings.cache_hit);
+        assert!(
+            projected.metadata.versions["2.0.0"]
+                .dev_dependencies
+                .is_empty()
+        );
+        let (full, _) = client
+            .get_npm_preferred_metadata_direct_with_timings("pkg", |_| true)
+            .await
+            .unwrap();
+        assert!(full.timings.cache_hit);
+        assert_eq!(
+            full.metadata.versions["2.0.0"].dev_dependencies["build-tool"],
+            "^1.0.0"
+        );
+    }
+
+    #[tokio::test]
+    async fn resolver_cache_refetches_truncated_or_mismatched_records() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        for complete in [false, true] {
+            for truncated in [false, true] {
+                let server = MockServer::start().await;
+                Mock::given(method("GET"))
+                    .and(path("/pkg"))
+                    .respond_with(
+                        ResponseTemplate::new(200)
+                            .set_body_json(history())
+                            .insert_header("Cache-Control", "max-age=300"),
+                    )
+                    .expect(2)
+                    .mount(&server)
+                    .await;
+                let cache = tempfile::tempdir().unwrap();
+                let client = preferred_test_client(&server, cache.path()).await;
+                let (mut original, _) = client
+                    .get_npm_preferred_metadata_direct_with_timings("pkg", move |_| !complete)
+                    .await
+                    .unwrap();
+                let key = if complete {
+                    client.npm_direct_metadata_cache_key("pkg")
+                } else {
+                    client.npm_preferred_metadata_cache_key("pkg")
+                };
+                let cache_path = client.cache_path(&key).unwrap();
+                let expiry = std::fs::metadata(&cache_path).unwrap().modified().unwrap();
+                let mut bytes = std::fs::read(&cache_path).unwrap();
+                if truncated {
+                    bytes.truncate(bytes.len() / 2);
+                } else {
+                    original.metadata.name = "other".to_owned();
+                    let body_offset = bytes
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, byte)| **byte == b'\n')
+                        .nth(2)
+                        .unwrap()
+                        .0
+                        + 1;
+                    bytes.truncate(body_offset);
+                    let payload = if complete {
+                        rmp_serde::to_vec_named(&original.metadata).unwrap()
+                    } else {
+                        rmp_serde::to_vec_named(&PreferredMetadata {
+                            metadata: original.metadata,
+                            versions_complete: false,
+                        })
+                        .unwrap()
+                    };
+                    bytes.extend(payload);
+                }
+                std::fs::write(&cache_path, bytes).unwrap();
+                filetime::set_file_mtime(&cache_path, filetime::FileTime::from_system_time(expiry))
+                    .unwrap();
+                let (refetched, actual_complete) = client
+                    .get_npm_preferred_metadata_for_resolution_with_timings("pkg", move |_| {
+                        !complete
+                    })
+                    .await
+                    .unwrap();
+                assert!(!refetched.timings.cache_hit);
+                assert_eq!(refetched.metadata.name, "pkg");
+                assert_eq!(actual_complete, complete);
+                server.verify().await;
+            }
+        }
+    }
 
     #[test]
     fn preferred_projection_preserves_latest_preference_and_newest_stable_summary() {
