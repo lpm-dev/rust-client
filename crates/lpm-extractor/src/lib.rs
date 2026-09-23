@@ -479,7 +479,7 @@ const MAX_BUFFERED_COMPRESSED_SIZE: u64 = 500 * 1024 * 1024;
 /// Small npm archives keep the libdeflate fast path. Larger archives fall
 /// back to streaming decompression without retaining their full compressed
 /// body in memory.
-const MAX_HYBRID_BUFFERED_COMPRESSED_SIZE: u64 = 8 * 1024 * 1024;
+pub const MAX_HYBRID_BUFFERED_COMPRESSED_SIZE: u64 = 8 * 1024 * 1024;
 
 /// Maximum decompressed output held by the buffered libdeflate path.
 const MAX_BUFFERED_DECOMPRESSED_SIZE: usize = 256 * 1024 * 1024;

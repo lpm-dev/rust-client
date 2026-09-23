@@ -92,6 +92,12 @@ struct FileCasFinishContext<'a> {
     validation_batch: Option<&'a ReusableObjectValidationBatch>,
 }
 
+fn file_exceeds_hybrid_buffer(reader: &std::io::BufReader<std::fs::File>) -> bool {
+    reader.get_ref().metadata().is_ok_and(|metadata| {
+        metadata.is_file() && metadata.len() > lpm_extractor::MAX_HYBRID_BUFFERED_COMPRESSED_SIZE
+    })
+}
+
 enum TarballInput<'a> {
     Bytes(&'a [u8]),
     File(std::io::BufReader<std::fs::File>),
@@ -1458,10 +1464,14 @@ impl Store {
             source_analysis_enabled
                 && lpm_security::behavioral::PackageAnalyzer::should_buffer_source(path, size)
         };
+        let stream_file = matches!(&tarball_input, TarballInput::File(reader) if file_exceeds_hybrid_buffer(reader));
         let extract_result = if !source_analysis_enabled && registry_cas_ingest.is_none() {
             match &mut tarball_input {
                 TarballInput::Bytes(bytes) => {
                     lpm_extractor::extract_tarball_digests(bytes, tmp_dir)
+                }
+                TarballInput::File(reader) if stream_file => {
+                    lpm_extractor::extract_tarball_from_reader_streaming_digests(reader, tmp_dir)
                 }
                 TarballInput::File(reader) => {
                     lpm_extractor::extract_tarball_from_reader_hybrid_digests(reader, tmp_dir)
@@ -1490,6 +1500,14 @@ impl Store {
                     buffer_predicate,
                     inspect_entry,
                 ),
+                TarballInput::File(reader) if stream_file => {
+                    lpm_extractor::extract_tarball_from_reader_streaming_with_entry_digests(
+                        reader,
+                        tmp_dir,
+                        buffer_predicate,
+                        inspect_entry,
+                    )
+                }
                 TarballInput::File(reader) => {
                     lpm_extractor::extract_tarball_from_reader_hybrid_with_entry_digests(
                         reader,
