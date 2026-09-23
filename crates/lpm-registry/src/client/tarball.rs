@@ -190,6 +190,12 @@ impl RegistryClient {
     /// caller to drain via `.bytes_stream()`. Mirrors
     /// `download_tarball_streaming` shape exactly except for the auth
     /// pathway.
+    #[tracing::instrument(
+        target = "lpm_install_timeline",
+        level = "trace",
+        name = "tarball_headers",
+        skip_all
+    )]
     pub async fn download_tarball_streaming_with_auth(
         &self,
         url: &str,
@@ -212,6 +218,12 @@ impl RegistryClient {
     }
 
     /// Drain an already-authenticated tarball response into the bounded temp-file spool.
+    #[tracing::instrument(
+        target = "lpm_install_timeline",
+        level = "trace",
+        name = "tarball_spool",
+        skip_all
+    )]
     pub async fn spool_tarball_response_to_file(
         &self,
         response: reqwest::Response,

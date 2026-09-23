@@ -713,6 +713,12 @@ impl RegistryClient {
             .await
     }
 
+    #[tracing::instrument(
+        target = "lpm_install_timeline",
+        level = "trace",
+        name = "http_request",
+        skip_all
+    )]
     pub(super) async fn send_request_with_retry_and_npmrc_auth(
         &self,
         request: reqwest::Request,
@@ -726,6 +732,7 @@ impl RegistryClient {
         let can_reselect_redirect_clients = request.try_clone().is_some();
 
         for attempt in 0..=MAX_RETRIES {
+            tracing::event!(name: "request_attempt", target: "lpm_install_timeline", tracing::Level::TRACE, attempt = attempt as u64);
             let req = request.try_clone().ok_or_else(|| {
                 LpmError::Network("request body cannot be retried (not cloneable)".into())
             })?;
@@ -768,6 +775,7 @@ impl RegistryClient {
             match response {
                 Ok(response) => {
                     let status = response.status().as_u16();
+                    tracing::event!(name: "headers_observed", target: "lpm_install_timeline", tracing::Level::TRACE, attempt = attempt as u64, status = u64::from(status));
 
                     match status {
                         200..=299 | 304 => return Ok(response),
@@ -794,7 +802,9 @@ impl RegistryClient {
                                 // too — see the sibling site in publish-path.
                                 let delay = backoff_override()
                                     .unwrap_or_else(|| Duration::from_secs(retry_after));
+                                tracing::event!(name: "backoff_start", target: "lpm_install_timeline", tracing::Level::TRACE, attempt = attempt as u64);
                                 tokio::time::sleep(delay).await;
+                                tracing::event!(name: "backoff_end", target: "lpm_install_timeline", tracing::Level::TRACE, attempt = attempt as u64);
                                 continue;
                             }
                         }
@@ -808,7 +818,9 @@ impl RegistryClient {
                             });
                             if attempt < MAX_RETRIES {
                                 let delay = backoff_delay(attempt);
+                                tracing::event!(name: "backoff_start", target: "lpm_install_timeline", tracing::Level::TRACE, attempt = attempt as u64);
                                 tokio::time::sleep(delay).await;
+                                tracing::event!(name: "backoff_end", target: "lpm_install_timeline", tracing::Level::TRACE, attempt = attempt as u64);
                                 continue;
                             }
                         }
@@ -824,11 +836,14 @@ impl RegistryClient {
                     }
                 }
                 Err(error) => {
+                    tracing::event!(name: "request_failed", target: "lpm_install_timeline", tracing::Level::TRACE, attempt = attempt as u64);
                     // Network-level errors (DNS, connection refused, timeout) are retryable
                     last_error = Some(error);
                     if attempt < MAX_RETRIES {
                         let delay = backoff_delay(attempt);
+                        tracing::event!(name: "backoff_start", target: "lpm_install_timeline", tracing::Level::TRACE, attempt = attempt as u64);
                         tokio::time::sleep(delay).await;
+                        tracing::event!(name: "backoff_end", target: "lpm_install_timeline", tracing::Level::TRACE, attempt = attempt as u64);
                         continue;
                     }
                 }

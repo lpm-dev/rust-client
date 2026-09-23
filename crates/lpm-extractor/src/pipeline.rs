@@ -34,7 +34,12 @@ impl Read for DecodedReader {
             if let Some(bytes) = self.current.take() {
                 let _ = self.recycle.send(bytes);
             }
-            match self.ready.recv() {
+            match {
+                let _wait =
+                    tracing::trace_span!(target: "lpm_install_timeline", "decoded_buffer_wait")
+                        .entered();
+                self.ready.recv()
+            } {
                 Ok(Message::Bytes(bytes, length)) => {
                     self.current = Some(bytes);
                     self.offset = 0;
@@ -116,9 +121,11 @@ fn with_decoder<T>(
                 .send(vec![0; BUFFER_SIZE])
                 .map_err(|_| LpmError::Io(io::Error::other("gzip buffer pool disconnected")))?;
         }
+        let decoder_span = tracing::trace_span!(target: "lpm_install_timeline", "pipeline_decoder");
         let worker = std::thread::Builder::new()
             .name("lpm-gzip".into())
             .spawn_scoped(scope, move || {
+                let _entered = decoder_span.enter();
                 decode(reader, limits, ready_tx, recycle_rx);
             })?;
         let decoded = DecodedReader {
@@ -149,7 +156,9 @@ fn decode(
     recycle: Receiver<Vec<u8>>,
 ) {
     let mut decoder = DecompressedLimitReader::new(
-        GzDecoder::new(reader),
+        super::timeline::TimelineReader::decoded(GzDecoder::new(
+            super::timeline::TimelineReader::input(reader),
+        )),
         limits.max_decompressed_stream_size(),
     );
     while let Ok(mut bytes) = recycle.recv() {

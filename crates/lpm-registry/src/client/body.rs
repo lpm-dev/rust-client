@@ -128,6 +128,12 @@ where
     .await
 }
 
+#[tracing::instrument(
+    target = "lpm_install_timeline",
+    level = "trace",
+    name = "metadata_body",
+    skip_all
+)]
 pub(super) async fn parse_capped_metadata_owned_attempt<T, F>(
     response: reqwest::Response,
     cap: usize,
@@ -146,6 +152,7 @@ where
             .map_err(|error| LpmError::Registry(format!("{context}: {error}")))
     };
     let read = read.await;
+    tracing::event!(name: "body_end", target: "lpm_install_timeline", tracing::Level::TRACE, bytes = buf.len() as u64, success = read.is_ok());
     let mut timings = MetadataBodyTimings {
         body_read_ms: body_start.elapsed().as_millis(),
         body_bytes: buf.len() as u64,
@@ -155,23 +162,35 @@ where
         return (Err(error), timings);
     }
     if buf.len() < BLOCKING_METADATA_PARSE_THRESHOLD {
+        let span = tracing::trace_span!(target: "lpm_install_timeline", "metadata_parse", blocking = false);
+        let _entered = span.enter();
+        tracing::event!(name: "work_start", target: "lpm_install_timeline", tracing::Level::TRACE, {});
         let parse_start = std::time::Instant::now();
         let parsed = parse(buf).map_err(|error| {
             LpmError::Registry(format!("{context}: failed to parse JSON: {error}"))
         });
         timings.json_parse_ms = parse_start.elapsed().as_millis();
+        tracing::event!(name: "work_end", target: "lpm_install_timeline", tracing::Level::TRACE, success = parsed.is_ok());
         return (parsed, timings);
     }
 
     let context_owned = context.to_string();
+    let span =
+        tracing::trace_span!(target: "lpm_install_timeline", "metadata_parse", blocking = true);
+    tracing::event!(name: "enqueue", target: "lpm_install_timeline", parent: &span, tracing::Level::TRACE, {});
+    let worker_span = span.clone();
     let result = tokio::task::spawn_blocking(move || {
+        let _entered = worker_span.enter();
+        tracing::event!(name: "work_start", target: "lpm_install_timeline", tracing::Level::TRACE, {});
         let parse_start = std::time::Instant::now();
         let parsed = parse(buf).map_err(|error| {
             LpmError::Registry(format!("{context_owned}: failed to parse JSON: {error}"))
         });
+        tracing::event!(name: "work_end", target: "lpm_install_timeline", tracing::Level::TRACE, success = parsed.is_ok());
         (parsed, parse_start.elapsed().as_millis())
     })
     .await;
+    tracing::event!(name: "await_resume", target: "lpm_install_timeline", parent: &span, tracing::Level::TRACE, success = result.is_ok());
     match result {
         Ok((parsed, json_parse_ms)) => {
             timings.json_parse_ms = json_parse_ms;

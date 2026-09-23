@@ -46,6 +46,7 @@ rpassword = { workspace = true }
 libc = "0.2"
 
 [dev-dependencies]
+tracing-subscriber = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 tempfile = "3"
 wiremock = "0.6"
