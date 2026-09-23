@@ -9,7 +9,7 @@
     "disposition": "Verified",
     "coverage": "missing_install_artifacts_do_not_bypass_frozen_lockfile_validation; install/workspace/engine/freshness workflow suites",
     "commit": "2d5e773d8546fa6fd77bcd738961f5055341ac52",
-    "pr_status": "Ready for review; unpublished at artifact capture"
+    "pr_status": "Open and ready for review: https://github.com/lpm-dev/rust-client/pull/872"
   },
   {
     "id": "CIL-02",
@@ -21,7 +21,7 @@
     "disposition": "Rejected",
     "coverage": "Source trace of install_state.rs and cli/dispatch.rs; six-state plan records CI=1.",
     "commit": null,
-    "pr_status": "Ready for review; unpublished at artifact capture"
+    "pr_status": "Open and ready for review: https://github.com/lpm-dev/rust-client/pull/872"
   },
   {
     "id": "CIL-03",
@@ -33,7 +33,7 @@
     "disposition": "Verified",
     "coverage": "cached_link_tests; cached_reinstall_keeps_package_bytes_and_force_refetches_each_registry_package; install/workspace/local/archive workflows",
     "commit": "2d5e773d8546fa6fd77bcd738961f5055341ac52",
-    "pr_status": "Ready for review; unpublished at artifact capture"
+    "pr_status": "Open and ready for review: https://github.com/lpm-dev/rust-client/pull/872"
   },
   {
     "id": "CIL-04",
@@ -45,7 +45,7 @@
     "disposition": "Rejected",
     "coverage": "Source-path review and separate baseline/warm diagnostic JSON; see research reconciliation.",
     "commit": null,
-    "pr_status": "Ready for review; unpublished at artifact capture"
+    "pr_status": "Open and ready for review: https://github.com/lpm-dev/rust-client/pull/872"
   },
   {
     "id": "CIL-05",
@@ -57,7 +57,7 @@
     "disposition": "Rejected",
     "coverage": "Source-path review and separate baseline/warm diagnostic JSON; see research reconciliation.",
     "commit": null,
-    "pr_status": "Ready for review; unpublished at artifact capture"
+    "pr_status": "Open and ready for review: https://github.com/lpm-dev/rust-client/pull/872"
   },
   {
     "id": "CIL-06",
@@ -69,7 +69,7 @@
     "disposition": "Rejected",
     "coverage": "Source-path review and separate baseline/warm diagnostic JSON; see research reconciliation.",
     "commit": null,
-    "pr_status": "Ready for review; unpublished at artifact capture"
+    "pr_status": "Open and ready for review: https://github.com/lpm-dev/rust-client/pull/872"
   },
   {
     "id": "CIL-07",
@@ -81,7 +81,7 @@
     "disposition": "Rejected",
     "coverage": "Source-path review and separate baseline/warm diagnostic JSON; see research reconciliation.",
     "commit": null,
-    "pr_status": "Ready for review; unpublished at artifact capture"
+    "pr_status": "Open and ready for review: https://github.com/lpm-dev/rust-client/pull/872"
   },
   {
     "id": "CIL-08",
@@ -93,7 +93,7 @@
     "disposition": "Rejected",
     "coverage": "Source-path review and separate baseline/warm diagnostic JSON; see research reconciliation.",
     "commit": null,
-    "pr_status": "Ready for review; unpublished at artifact capture"
+    "pr_status": "Open and ready for review: https://github.com/lpm-dev/rust-client/pull/872"
   },
   {
     "id": "CIL-09",
@@ -105,7 +105,7 @@
     "disposition": "Verified",
     "coverage": "lockfile_snapshot_* unit tests; install/workspace/freshness/engine workflow suites",
     "commit": "2d5e773d8546fa6fd77bcd738961f5055341ac52",
-    "pr_status": "Ready for review; unpublished at artifact capture"
+    "pr_status": "Open and ready for review: https://github.com/lpm-dev/rust-client/pull/872"
   },
   {
     "id": "CIL-10",
@@ -117,7 +117,7 @@
     "disposition": "Verified",
     "coverage": "Independent raw-data calculations, harness source comparison, and report review; no production behavior changed.",
     "commit": "1e0ea752fc0146e8b4a38a8a23addd9dd2472c3b",
-    "pr_status": "Ready for review; unpublished at artifact capture"
+    "pr_status": "Open and ready for review: https://github.com/lpm-dev/rust-client/pull/872"
   },
   {
     "id": "CIL-11",
@@ -129,7 +129,7 @@
     "disposition": "Verified",
     "coverage": "Independent raw-data calculations, harness source comparison, and report review; no production behavior changed.",
     "commit": "1e0ea752fc0146e8b4a38a8a23addd9dd2472c3b",
-    "pr_status": "Ready for review; unpublished at artifact capture"
+    "pr_status": "Open and ready for review: https://github.com/lpm-dev/rust-client/pull/872"
   },
   {
     "id": "CIL-12",
@@ -141,7 +141,7 @@
     "disposition": "Verified",
     "coverage": "Independent raw-data calculations, harness source comparison, and report review; no production behavior changed.",
     "commit": "1e0ea752fc0146e8b4a38a8a23addd9dd2472c3b",
-    "pr_status": "Ready for review; unpublished at artifact capture"
+    "pr_status": "Open and ready for review: https://github.com/lpm-dev/rust-client/pull/872"
   },
   {
     "id": "CIL-13",
@@ -153,7 +153,7 @@
     "disposition": "Verified",
     "coverage": "Independent raw-data calculations, harness source comparison, and report review; no production behavior changed.",
     "commit": "1e0ea752fc0146e8b4a38a8a23addd9dd2472c3b",
-    "pr_status": "Ready for review; unpublished at artifact capture"
+    "pr_status": "Open and ready for review: https://github.com/lpm-dev/rust-client/pull/872"
   },
   {
     "id": "CIL-14",
@@ -165,6 +165,6 @@
     "disposition": "Verified",
     "coverage": "Independent raw-data calculations, harness source comparison, and report review; no production behavior changed.",
     "commit": "1e0ea752fc0146e8b4a38a8a23addd9dd2472c3b",
-    "pr_status": "Ready for review; unpublished at artifact capture"
+    "pr_status": "Open and ready for review: https://github.com/lpm-dev/rust-client/pull/872"
   }
 ]
