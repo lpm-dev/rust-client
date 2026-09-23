@@ -228,8 +228,8 @@ This timeline concept contains 21 of those findings: 20 fixed and one rejected. 
 The rejected finding proposed a Windows user-only ACL guarantee that the documented contract does not make.
 
 The adjacent `-ledger.json` records evidence, regression coverage, duplicate reports, and resolving commits.
-The adjacent `-rows.jsonl`, `-summary.json`, and `-provenance.json` retain all cohorts, methods, binary hashes, and gate verdicts.
+The adjacent `-rows.jsonl.gz`, `-summary.json`, and `-provenance.json` retain all cohorts, methods, binary hashes, and gate verdicts.
 The `-traces.jsonl.gz` archive retains all 292 scored traces, including the earlier incomplete-ancestry Vite captures.
 The `-tools.tar.gz` archive contains the exact experiment scripts and failing/passing measurement regressions.
 Absolute paths in those scripts identify this run. Relocation requires path changes and the locally preserved registry captures.
-The `-startup.json` artifact retains the separate no-op measurements.
+The `-startup.json.gz` artifact retains the separate no-op measurements.
