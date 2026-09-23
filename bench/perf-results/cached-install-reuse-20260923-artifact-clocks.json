@@ -1,0 +1,77 @@
+{
+  "baseline": {
+    "plan_mtime": 1790127279.162477,
+    "last_scored_artifact_mtime": 1790127906.2082047,
+    "elapsed_seconds": 627.0457277297974
+  },
+  "warm": {
+    "plan_mtime": 1790127230.5470514,
+    "last_scored_artifact_mtime": 1790127263.8466985,
+    "elapsed_seconds": 33.299647092819214
+  },
+  "scheduling-exploration": {
+    "plan_mtime": 1790128511.2002182,
+    "last_scored_artifact_mtime": 1790128555.4562502,
+    "elapsed_seconds": 44.25603199005127
+  },
+  "scheduling-width-check": {
+    "plan_mtime": 1790128598.247713,
+    "last_scored_artifact_mtime": 1790128644.7736495,
+    "elapsed_seconds": 46.52593636512756
+  },
+  "reuse-exploration": {
+    "plan_mtime": 1790130334.3608203,
+    "last_scored_artifact_mtime": 1790130359.2699668,
+    "elapsed_seconds": 24.909146547317505
+  },
+  "warm-100": {
+    "plan_mtime": 1790130379.1822524,
+    "last_scored_artifact_mtime": 1790130672.4140694,
+    "elapsed_seconds": 293.2318170070648
+  },
+  "confirm-fresh-100": {
+    "plan_mtime": 1790130702.6435573,
+    "last_scored_artifact_mtime": 1790130840.7250087,
+    "elapsed_seconds": 138.08145141601562
+  },
+  "confirm-ci-100": {
+    "plan_mtime": 1790130869.5044994,
+    "last_scored_artifact_mtime": 1790131002.4771552,
+    "elapsed_seconds": 132.97265577316284
+  },
+  "noop-100": {
+    "plan_mtime": 1790131019.6436584,
+    "last_scored_artifact_mtime": 1790131086.632342,
+    "elapsed_seconds": 66.98868370056152
+  },
+  "warm-control-vite-react": {
+    "plan_mtime": 1790131107.1757555,
+    "last_scored_artifact_mtime": 1790131129.4046776,
+    "elapsed_seconds": 22.228922128677368
+  },
+  "warm-control-native-sharp": {
+    "plan_mtime": 1790131131.6606314,
+    "last_scored_artifact_mtime": 1790131143.0706334,
+    "elapsed_seconds": 11.410001993179321
+  },
+  "warm-control-nest": {
+    "plan_mtime": 1790131143.7634137,
+    "last_scored_artifact_mtime": 1790131165.6816423,
+    "elapsed_seconds": 21.91822862625122
+  },
+  "ci-cold-100": {
+    "plan_mtime": 1790131784.1695278,
+    "last_scored_artifact_mtime": 1790132800.217651,
+    "elapsed_seconds": 1016.0481231212616
+  },
+  "warm-shared-100": {
+    "plan_mtime": 1790134054.2022898,
+    "last_scored_artifact_mtime": 1790134333.839025,
+    "elapsed_seconds": 279.63673520088196
+  },
+  "ci-cold-shared-100": {
+    "plan_mtime": 1790134353.6726756,
+    "last_scored_artifact_mtime": 1790135520.7586744,
+    "elapsed_seconds": 1167.0859987735748
+  }
+}

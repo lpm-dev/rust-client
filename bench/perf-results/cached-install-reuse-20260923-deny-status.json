@@ -1,0 +1,14 @@
+{
+  "command": [
+    "cargo",
+    "deny",
+    "--all-features",
+    "check",
+    "--hide-inclusion-graph",
+    "advisories",
+    "bans",
+    "licenses"
+  ],
+  "exit_code": 0,
+  "seconds": 0.7265281677246094
+}

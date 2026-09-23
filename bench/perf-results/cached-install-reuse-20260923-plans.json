@@ -1,0 +1,1030 @@
+{
+  "baseline": {
+    "created_at": "2026-09-23T01:34:39.127Z",
+    "samples": 12,
+    "timing_samples": 3,
+    "managers": [
+      "lpm",
+      "bun"
+    ],
+    "scenarios": [
+      {
+        "id": "first-install",
+        "title": "First install, ever",
+        "state": "no cache \u00b7 no lockfile \u00b7 no node_modules"
+      },
+      {
+        "id": "fresh-checkout-warm-cache",
+        "title": "Fresh checkout, warm cache",
+        "state": "no lockfile \u00b7 warm dependency cache \u00b7 no node_modules"
+      },
+      {
+        "id": "ci-cold-cache",
+        "title": "CI without a cache",
+        "state": "lockfile \u00b7 cold dependency cache \u00b7 no node_modules"
+      },
+      {
+        "id": "ci-warm-cache",
+        "title": "CI with a warm cache",
+        "state": "lockfile \u00b7 warm dependency cache \u00b7 no node_modules"
+      },
+      {
+        "id": "installed-cache-gone",
+        "title": "node_modules there, cache gone",
+        "state": "lockfile \u00b7 node_modules present \u00b7 cold dependency cache"
+      },
+      {
+        "id": "up-to-date",
+        "title": "Everything already up to date",
+        "state": "lockfile \u00b7 warm dependency cache \u00b7 node_modules present"
+      }
+    ],
+    "fixture": {
+      "directory": "<repo>/bench/audit-fixtures/t3-install",
+      "upstream_url": "https://github.com/oven-sh/bun/tree/main/bench/install",
+      "upstream_commit": "9dd73746c7b51b6450bb675ce2abcf86a0ae076f",
+      "package_json_sha256": "fa994042232e39e73fd1c4436c5e90974b47c4656e9c4a742c3988c6097b9871",
+      "package_json": {
+        "name": "installbench",
+        "version": "0.1.0",
+        "private": true,
+        "type": "module",
+        "scripts": {
+          "build": "next build",
+          "check": "biome check .",
+          "check:unsafe": "biome check --write --unsafe .",
+          "check:write": "biome check --write .",
+          "db:generate": "drizzle-kit generate",
+          "db:migrate": "drizzle-kit migrate",
+          "db:push": "drizzle-kit push",
+          "db:studio": "drizzle-kit studio",
+          "dev": "next dev --turbo",
+          "preview": "next build && next start",
+          "start": "next start",
+          "typecheck": "tsc --noEmit"
+        },
+        "dependencies": {
+          "@auth/drizzle-adapter": "^1.7.2",
+          "@t3-oss/env-nextjs": "^0.12.0",
+          "@tanstack/react-query": "^5.69.0",
+          "@trpc/client": "^11.0.0",
+          "@trpc/react-query": "^11.0.0",
+          "@trpc/server": "^11.0.0",
+          "drizzle-orm": "^0.41.0",
+          "esbuild": "^0.25.11",
+          "next": "^16.1.0",
+          "next-auth": "5.0.0-beta.30",
+          "postgres": "^3.4.4",
+          "react": "^19.2.3",
+          "react-dom": "^19.2.3",
+          "server-only": "^0.0.1",
+          "superjson": "^2.2.1",
+          "zod": "^3.24.2"
+        },
+        "devDependencies": {
+          "@biomejs/biome": "1.9.4",
+          "@tailwindcss/postcss": "^4.0.15",
+          "@types/node": "^20.14.10",
+          "@types/react": "^19.0.0",
+          "@types/react-dom": "^19.0.0",
+          "drizzle-kit": "^0.30.5",
+          "postcss": "^8.5.3",
+          "tailwindcss": "^4.0.15",
+          "typescript": "^5.8.2"
+        },
+        "ct3aMetadata": {
+          "initVersion": "7.39.3"
+        }
+      }
+    },
+    "lpm": {
+      "binary": "<scratch>/lpm-baseline",
+      "binary_sha256": "b3283b8338ae6b05c35310808741f8c00fa58962631acc963a247f3a7770b041",
+      "version": "lpm 0.78.0"
+    },
+    "bun": {
+      "binary": "/Users/tolga/.bun/bin/bun",
+      "version": "1.4.2"
+    },
+    "node": "v26.5.0",
+    "platform": "darwin-arm64",
+    "os_release": "27.0.0",
+    "cpu": "Apple M5 Pro",
+    "total_memory_bytes": 51539607552,
+    "timeout_ms": 600000,
+    "timing_scope": "scored wall/RSS samples omit timing instrumentation; separate LPM-only diagnostics use --timing with trace detail",
+    "script_policy": "install scripts disabled for both managers",
+    "state_mapping": {
+      "lpm_cache": "LPM_HOME/cache (ephemeral metadata)",
+      "lpm_store": "LPM_HOME/store (content store backing V2 node_modules symlinks)",
+      "installed_cache_gone": "clear LPM_HOME/cache but preserve LPM_HOME/store for LPM"
+    }
+  },
+  "warm": {
+    "created_at": "2026-09-23T01:33:50.048Z",
+    "samples": 1,
+    "timing_samples": 1,
+    "managers": [
+      "lpm",
+      "bun"
+    ],
+    "scenarios": [
+      {
+        "id": "first-install",
+        "title": "First install, ever",
+        "state": "no cache \u00b7 no lockfile \u00b7 no node_modules"
+      },
+      {
+        "id": "fresh-checkout-warm-cache",
+        "title": "Fresh checkout, warm cache",
+        "state": "no lockfile \u00b7 warm dependency cache \u00b7 no node_modules"
+      },
+      {
+        "id": "ci-cold-cache",
+        "title": "CI without a cache",
+        "state": "lockfile \u00b7 cold dependency cache \u00b7 no node_modules"
+      },
+      {
+        "id": "ci-warm-cache",
+        "title": "CI with a warm cache",
+        "state": "lockfile \u00b7 warm dependency cache \u00b7 no node_modules"
+      },
+      {
+        "id": "installed-cache-gone",
+        "title": "node_modules there, cache gone",
+        "state": "lockfile \u00b7 node_modules present \u00b7 cold dependency cache"
+      },
+      {
+        "id": "up-to-date",
+        "title": "Everything already up to date",
+        "state": "lockfile \u00b7 warm dependency cache \u00b7 node_modules present"
+      }
+    ],
+    "fixture": {
+      "directory": "<repo>/bench/audit-fixtures/t3-install",
+      "upstream_url": "https://github.com/oven-sh/bun/tree/main/bench/install",
+      "upstream_commit": "9dd73746c7b51b6450bb675ce2abcf86a0ae076f",
+      "package_json_sha256": "fa994042232e39e73fd1c4436c5e90974b47c4656e9c4a742c3988c6097b9871",
+      "package_json": {
+        "name": "installbench",
+        "version": "0.1.0",
+        "private": true,
+        "type": "module",
+        "scripts": {
+          "build": "next build",
+          "check": "biome check .",
+          "check:unsafe": "biome check --write --unsafe .",
+          "check:write": "biome check --write .",
+          "db:generate": "drizzle-kit generate",
+          "db:migrate": "drizzle-kit migrate",
+          "db:push": "drizzle-kit push",
+          "db:studio": "drizzle-kit studio",
+          "dev": "next dev --turbo",
+          "preview": "next build && next start",
+          "start": "next start",
+          "typecheck": "tsc --noEmit"
+        },
+        "dependencies": {
+          "@auth/drizzle-adapter": "^1.7.2",
+          "@t3-oss/env-nextjs": "^0.12.0",
+          "@tanstack/react-query": "^5.69.0",
+          "@trpc/client": "^11.0.0",
+          "@trpc/react-query": "^11.0.0",
+          "@trpc/server": "^11.0.0",
+          "drizzle-orm": "^0.41.0",
+          "esbuild": "^0.25.11",
+          "next": "^16.1.0",
+          "next-auth": "5.0.0-beta.30",
+          "postgres": "^3.4.4",
+          "react": "^19.2.3",
+          "react-dom": "^19.2.3",
+          "server-only": "^0.0.1",
+          "superjson": "^2.2.1",
+          "zod": "^3.24.2"
+        },
+        "devDependencies": {
+          "@biomejs/biome": "1.9.4",
+          "@tailwindcss/postcss": "^4.0.15",
+          "@types/node": "^20.14.10",
+          "@types/react": "^19.0.0",
+          "@types/react-dom": "^19.0.0",
+          "drizzle-kit": "^0.30.5",
+          "postcss": "^8.5.3",
+          "tailwindcss": "^4.0.15",
+          "typescript": "^5.8.2"
+        },
+        "ct3aMetadata": {
+          "initVersion": "7.39.3"
+        }
+      }
+    },
+    "lpm": {
+      "binary": "<scratch>/lpm-baseline",
+      "binary_sha256": "b3283b8338ae6b05c35310808741f8c00fa58962631acc963a247f3a7770b041",
+      "version": "lpm 0.78.0"
+    },
+    "bun": {
+      "binary": "/Users/tolga/.bun/bin/bun",
+      "version": "1.4.2"
+    },
+    "node": "v26.5.0",
+    "platform": "darwin-arm64",
+    "os_release": "27.0.0",
+    "cpu": "Apple M5 Pro",
+    "total_memory_bytes": 51539607552,
+    "timeout_ms": 600000,
+    "timing_scope": "scored wall/RSS samples omit timing instrumentation; separate LPM-only diagnostics use --timing with trace detail",
+    "script_policy": "install scripts disabled for both managers",
+    "state_mapping": {
+      "lpm_cache": "LPM_HOME/cache (ephemeral metadata)",
+      "lpm_store": "LPM_HOME/store (content store backing V2 node_modules symlinks)",
+      "installed_cache_gone": "clear LPM_HOME/cache but preserve LPM_HOME/store for LPM"
+    }
+  },
+  "scheduling-exploration": {
+    "output": "<scratch>/scheduling-exploration",
+    "samples": 24,
+    "diagnostics": 3,
+    "states": [
+      "fresh-checkout-warm-cache",
+      "ci-warm-cache"
+    ],
+    "variants": [
+      {
+        "id": "baseline",
+        "manager": "lpm",
+        "binary": "<scratch>/lpm-baseline",
+        "sha256": "b3283b8338ae6b05c35310808741f8c00fa58962631acc963a247f3a7770b041"
+      },
+      {
+        "id": "scheduled",
+        "manager": "lpm",
+        "binary": "<scratch>/lpm-candidate-scheduling",
+        "sha256": "abfcec7142b148ea501f960e22a2d0771d133f0f2c503cae2e1485f986541e9e"
+      },
+      {
+        "id": "scheduled-4",
+        "manager": "lpm",
+        "binary": "<scratch>/lpm-candidate-scheduling",
+        "env": {
+          "LPM_V2_LINK_TASKS": "4"
+        },
+        "sha256": "abfcec7142b148ea501f960e22a2d0771d133f0f2c503cae2e1485f986541e9e"
+      },
+      {
+        "id": "scheduled-8",
+        "manager": "lpm",
+        "binary": "<scratch>/lpm-candidate-scheduling",
+        "env": {
+          "LPM_V2_LINK_TASKS": "8"
+        },
+        "sha256": "abfcec7142b148ea501f960e22a2d0771d133f0f2c503cae2e1485f986541e9e"
+      }
+    ],
+    "fixture_sha256": "fa994042232e39e73fd1c4436c5e90974b47c4656e9c4a742c3988c6097b9871",
+    "node": "v24.19.0",
+    "platform": "darwin",
+    "method": "Separate roots seeded and warmed twice; reset state outside measurement; rotating variant/scenario order; every scored install retained; no timing instrumentation on scored installs; inventories and lockfiles retained; no repeated seed downloads."
+  },
+  "scheduling-width-check": {
+    "output": "<scratch>/scheduling-width-check",
+    "samples": 24,
+    "diagnostics": 3,
+    "states": [
+      "fresh-checkout-warm-cache",
+      "ci-warm-cache"
+    ],
+    "variants": [
+      {
+        "id": "baseline",
+        "manager": "lpm",
+        "binary": "<scratch>/lpm-baseline",
+        "sha256": "b3283b8338ae6b05c35310808741f8c00fa58962631acc963a247f3a7770b041"
+      },
+      {
+        "id": "baseline-4",
+        "manager": "lpm",
+        "binary": "<scratch>/lpm-baseline",
+        "env": {
+          "LPM_V2_LINK_TASKS": "4"
+        },
+        "sha256": "b3283b8338ae6b05c35310808741f8c00fa58962631acc963a247f3a7770b041"
+      },
+      {
+        "id": "baseline-8",
+        "manager": "lpm",
+        "binary": "<scratch>/lpm-baseline",
+        "env": {
+          "LPM_V2_LINK_TASKS": "8"
+        },
+        "sha256": "b3283b8338ae6b05c35310808741f8c00fa58962631acc963a247f3a7770b041"
+      },
+      {
+        "id": "scheduled-4",
+        "manager": "lpm",
+        "binary": "<scratch>/lpm-candidate-scheduling",
+        "env": {
+          "LPM_V2_LINK_TASKS": "4"
+        },
+        "sha256": "abfcec7142b148ea501f960e22a2d0771d133f0f2c503cae2e1485f986541e9e"
+      }
+    ],
+    "fixture_sha256": "fa994042232e39e73fd1c4436c5e90974b47c4656e9c4a742c3988c6097b9871",
+    "node": "v26.5.0",
+    "platform": "darwin",
+    "method": "Separate roots seeded and warmed twice; reset state outside measurement; rotating variant/scenario order; every scored install retained; no timing instrumentation on scored installs; inventories and lockfiles retained; no repeated seed downloads."
+  },
+  "reuse-exploration": {
+    "output": "<scratch>/reuse-exploration",
+    "samples": 12,
+    "diagnostics": 3,
+    "states": [
+      "fresh-checkout-warm-cache",
+      "ci-warm-cache"
+    ],
+    "variants": [
+      {
+        "id": "baseline",
+        "manager": "lpm",
+        "binary": "<scratch>/lpm-baseline",
+        "sha256": "b3283b8338ae6b05c35310808741f8c00fa58962631acc963a247f3a7770b041"
+      },
+      {
+        "id": "candidate",
+        "manager": "lpm",
+        "binary": "<scratch>/lpm-candidate-reuse",
+        "sha256": "85d3b9973d1b17f66b6936b3d18e129f3da3caed613082473d8f0a86520b4301"
+      },
+      {
+        "id": "scheduling",
+        "manager": "lpm",
+        "binary": "<scratch>/lpm-candidate-scheduling",
+        "env": {
+          "LPM_V2_LINK_TASKS": "4"
+        },
+        "sha256": "abfcec7142b148ea501f960e22a2d0771d133f0f2c503cae2e1485f986541e9e"
+      }
+    ],
+    "fixture_sha256": "fa994042232e39e73fd1c4436c5e90974b47c4656e9c4a742c3988c6097b9871",
+    "node": "v26.5.0",
+    "platform": "darwin",
+    "method": "Separate roots seeded and warmed twice; reset state outside measurement; rotating variant/scenario order; every scored install retained; no timing instrumentation on scored installs; inventories and lockfiles retained; no repeated seed downloads."
+  },
+  "warm-100": {
+    "output": "<scratch>/warm-100",
+    "samples": 100,
+    "diagnostics": 3,
+    "states": [
+      "fresh-checkout-warm-cache",
+      "ci-warm-cache"
+    ],
+    "variants": [
+      {
+        "id": "baseline",
+        "manager": "lpm",
+        "binary": "<scratch>/lpm-baseline",
+        "sha256": "b3283b8338ae6b05c35310808741f8c00fa58962631acc963a247f3a7770b041"
+      },
+      {
+        "id": "candidate",
+        "manager": "lpm",
+        "binary": "<scratch>/lpm-candidate-reuse",
+        "sha256": "85d3b9973d1b17f66b6936b3d18e129f3da3caed613082473d8f0a86520b4301"
+      },
+      {
+        "id": "bun",
+        "manager": "bun"
+      }
+    ],
+    "fixture_sha256": "fa994042232e39e73fd1c4436c5e90974b47c4656e9c4a742c3988c6097b9871",
+    "node": "v26.5.0",
+    "platform": "darwin",
+    "method": "Separate roots seeded and warmed twice; reset state outside measurement; rotating variant/scenario order; every scored install retained; no timing instrumentation on scored installs; inventories and lockfiles retained; no repeated seed downloads."
+  },
+  "confirm-fresh-100": {
+    "output": "<scratch>/confirm-fresh-100",
+    "samples": 100,
+    "diagnostics": 3,
+    "states": [
+      "fresh-checkout-warm-cache"
+    ],
+    "variants": [
+      {
+        "id": "baseline",
+        "manager": "lpm",
+        "binary": "<scratch>/lpm-baseline",
+        "sha256": "b3283b8338ae6b05c35310808741f8c00fa58962631acc963a247f3a7770b041"
+      },
+      {
+        "id": "candidate",
+        "manager": "lpm",
+        "binary": "<scratch>/lpm-candidate-reuse",
+        "sha256": "85d3b9973d1b17f66b6936b3d18e129f3da3caed613082473d8f0a86520b4301"
+      },
+      {
+        "id": "bun",
+        "manager": "bun"
+      }
+    ],
+    "fixture_sha256": "fa994042232e39e73fd1c4436c5e90974b47c4656e9c4a742c3988c6097b9871",
+    "node": "v26.5.0",
+    "platform": "darwin",
+    "method": "Separate roots seeded and warmed twice; reset state outside measurement; rotating variant/scenario order; every scored install retained; no timing instrumentation on scored installs; inventories and lockfiles retained; no repeated seed downloads."
+  },
+  "confirm-ci-100": {
+    "output": "<scratch>/confirm-ci-100",
+    "samples": 100,
+    "diagnostics": 3,
+    "states": [
+      "ci-warm-cache"
+    ],
+    "variants": [
+      {
+        "id": "baseline",
+        "manager": "lpm",
+        "binary": "<scratch>/lpm-baseline",
+        "sha256": "b3283b8338ae6b05c35310808741f8c00fa58962631acc963a247f3a7770b041"
+      },
+      {
+        "id": "candidate",
+        "manager": "lpm",
+        "binary": "<scratch>/lpm-candidate-reuse",
+        "sha256": "85d3b9973d1b17f66b6936b3d18e129f3da3caed613082473d8f0a86520b4301"
+      },
+      {
+        "id": "bun",
+        "manager": "bun"
+      }
+    ],
+    "fixture_sha256": "fa994042232e39e73fd1c4436c5e90974b47c4656e9c4a742c3988c6097b9871",
+    "node": "v26.5.0",
+    "platform": "darwin",
+    "method": "Separate roots seeded and warmed twice; reset state outside measurement; rotating variant/scenario order; every scored install retained; no timing instrumentation on scored installs; inventories and lockfiles retained; no repeated seed downloads."
+  },
+  "noop-100": {
+    "output": "<scratch>/noop-100",
+    "samples": 100,
+    "diagnostics": 3,
+    "states": [
+      "installed-cache-gone",
+      "up-to-date"
+    ],
+    "variants": [
+      {
+        "id": "baseline",
+        "manager": "lpm",
+        "binary": "<scratch>/lpm-baseline",
+        "sha256": "b3283b8338ae6b05c35310808741f8c00fa58962631acc963a247f3a7770b041"
+      },
+      {
+        "id": "candidate",
+        "manager": "lpm",
+        "binary": "<scratch>/lpm-candidate-reuse",
+        "sha256": "85d3b9973d1b17f66b6936b3d18e129f3da3caed613082473d8f0a86520b4301"
+      },
+      {
+        "id": "bun",
+        "manager": "bun"
+      }
+    ],
+    "fixture_sha256": "fa994042232e39e73fd1c4436c5e90974b47c4656e9c4a742c3988c6097b9871",
+    "harness_sha256": "e38178ce29e9eb26b65ede9a01a0fefe92bace4a5a11cd7ffb57ca13e6b19f36",
+    "node": "v26.5.0",
+    "platform": "darwin",
+    "method": "Separate roots seeded and warmed twice; reset state outside measurement; rotating variant/scenario order; every scored install retained; no timing instrumentation on scored installs; inventories and lockfiles retained; no repeated seed downloads."
+  },
+  "warm-control-vite-react": {
+    "output": "<scratch>/warm-control-vite-react",
+    "samples": 24,
+    "diagnostics": 3,
+    "states": [
+      "fresh-checkout-warm-cache",
+      "ci-warm-cache"
+    ],
+    "variants": [
+      {
+        "id": "baseline",
+        "manager": "lpm",
+        "binary": "<scratch>/lpm-baseline",
+        "sha256": "b3283b8338ae6b05c35310808741f8c00fa58962631acc963a247f3a7770b041"
+      },
+      {
+        "id": "candidate",
+        "manager": "lpm",
+        "binary": "<scratch>/lpm-candidate-reuse",
+        "sha256": "85d3b9973d1b17f66b6936b3d18e129f3da3caed613082473d8f0a86520b4301"
+      },
+      {
+        "id": "bun",
+        "manager": "bun"
+      }
+    ],
+    "fixture": "bench/audit-fixtures/peer-heavy/vite-react",
+    "verifyModule": "vite/package.json",
+    "fixture_sha256": "11fe6a1100ebbf799500403a91748fde9991c745ebc182be088138a8e0b0f573",
+    "harness_sha256": "e38178ce29e9eb26b65ede9a01a0fefe92bace4a5a11cd7ffb57ca13e6b19f36",
+    "node": "v26.5.0",
+    "platform": "darwin",
+    "method": "Separate roots seeded and warmed twice; reset state outside measurement; rotating variant/scenario order; every scored install retained; no timing instrumentation on scored installs; inventories and lockfiles retained; no repeated seed downloads."
+  },
+  "warm-control-native-sharp": {
+    "output": "<scratch>/warm-control-native-sharp",
+    "samples": 24,
+    "diagnostics": 3,
+    "states": [
+      "fresh-checkout-warm-cache",
+      "ci-warm-cache"
+    ],
+    "variants": [
+      {
+        "id": "baseline",
+        "manager": "lpm",
+        "binary": "<scratch>/lpm-baseline",
+        "sha256": "b3283b8338ae6b05c35310808741f8c00fa58962631acc963a247f3a7770b041"
+      },
+      {
+        "id": "candidate",
+        "manager": "lpm",
+        "binary": "<scratch>/lpm-candidate-reuse",
+        "sha256": "85d3b9973d1b17f66b6936b3d18e129f3da3caed613082473d8f0a86520b4301"
+      },
+      {
+        "id": "bun",
+        "manager": "bun"
+      }
+    ],
+    "fixture": "bench/audit-fixtures/native/sharp-image",
+    "verifyModule": "sharp/package.json",
+    "fixture_sha256": "22aa2132be98340ec5b54a4d27077b52d8d69a755b2af449ea93152f5b187c74",
+    "harness_sha256": "e38178ce29e9eb26b65ede9a01a0fefe92bace4a5a11cd7ffb57ca13e6b19f36",
+    "node": "v26.5.0",
+    "platform": "darwin",
+    "method": "Separate roots seeded and warmed twice; reset state outside measurement; rotating variant/scenario order; every scored install retained; no timing instrumentation on scored installs; inventories and lockfiles retained; no repeated seed downloads."
+  },
+  "warm-control-nest": {
+    "output": "<scratch>/warm-control-nest",
+    "samples": 24,
+    "diagnostics": 3,
+    "states": [
+      "fresh-checkout-warm-cache",
+      "ci-warm-cache"
+    ],
+    "variants": [
+      {
+        "id": "baseline",
+        "manager": "lpm",
+        "binary": "<scratch>/lpm-baseline",
+        "sha256": "b3283b8338ae6b05c35310808741f8c00fa58962631acc963a247f3a7770b041"
+      },
+      {
+        "id": "candidate",
+        "manager": "lpm",
+        "binary": "<scratch>/lpm-candidate-reuse",
+        "sha256": "85d3b9973d1b17f66b6936b3d18e129f3da3caed613082473d8f0a86520b4301"
+      },
+      {
+        "id": "bun",
+        "manager": "bun"
+      }
+    ],
+    "fixture": "bench/audit-fixtures/peer-heavy/nestjs-deep",
+    "verifyModule": "@nestjs/core/package.json",
+    "fixture_sha256": "5467ac14709e75494a0bf06fc2e1232968ade51101e82e06529585eb0389e9d8",
+    "harness_sha256": "e38178ce29e9eb26b65ede9a01a0fefe92bace4a5a11cd7ffb57ca13e6b19f36",
+    "node": "v26.5.0",
+    "platform": "darwin",
+    "method": "Separate roots seeded and warmed twice; reset state outside measurement; rotating variant/scenario order; every scored install retained; no timing instrumentation on scored installs; inventories and lockfiles retained; no repeated seed downloads."
+  },
+  "controls-warm": {
+    "samples": 1,
+    "fixtures": [
+      {
+        "name": "vite-react",
+        "kind": "path",
+        "path": "bench/audit-fixtures/peer-heavy/vite-react",
+        "absolute_path": "<repo>/bench/audit-fixtures/peer-heavy/vite-react"
+      },
+      {
+        "name": "native-sharp",
+        "kind": "path",
+        "path": "bench/audit-fixtures/native/sharp-image",
+        "absolute_path": "<repo>/bench/audit-fixtures/native/sharp-image"
+      },
+      {
+        "name": "nest",
+        "kind": "path",
+        "path": "bench/audit-fixtures/peer-heavy/nestjs-deep",
+        "absolute_path": "<repo>/bench/audit-fixtures/peer-heavy/nestjs-deep"
+      },
+      {
+        "name": "t3",
+        "kind": "path",
+        "path": "bench/audit-fixtures/t3-install",
+        "absolute_path": "<repo>/bench/audit-fixtures/t3-install"
+      }
+    ],
+    "managers": [
+      "lpm",
+      "bun"
+    ],
+    "modes": [
+      "cold",
+      "ci-cold",
+      "warm",
+      "up-to-date"
+    ],
+    "lpm_routes": [
+      "direct"
+    ],
+    "lpm_firewall_modes": [
+      "off"
+    ],
+    "lpm_binaries": [
+      {
+        "name": "baseline",
+        "path": "<scratch>/lpm-baseline"
+      },
+      {
+        "name": "candidate",
+        "path": "<scratch>/lpm-candidate-reuse"
+      }
+    ],
+    "lpm_cells": [
+      {
+        "name": "current",
+        "env": {}
+      }
+    ],
+    "lpm_typosquat_guard": "default",
+    "script_policy": "ignore",
+    "timeout_ms": 600000,
+    "output_dir": "<scratch>/controls-warm",
+    "run_specs": [
+      "lpm-baseline",
+      "lpm-candidate",
+      "bun"
+    ]
+  },
+  "controls-scored": {
+    "samples": 12,
+    "fixtures": [
+      {
+        "name": "vite-react",
+        "kind": "path",
+        "path": "bench/audit-fixtures/peer-heavy/vite-react",
+        "absolute_path": "<repo>/bench/audit-fixtures/peer-heavy/vite-react"
+      },
+      {
+        "name": "native-sharp",
+        "kind": "path",
+        "path": "bench/audit-fixtures/native/sharp-image",
+        "absolute_path": "<repo>/bench/audit-fixtures/native/sharp-image"
+      },
+      {
+        "name": "nest",
+        "kind": "path",
+        "path": "bench/audit-fixtures/peer-heavy/nestjs-deep",
+        "absolute_path": "<repo>/bench/audit-fixtures/peer-heavy/nestjs-deep"
+      },
+      {
+        "name": "t3",
+        "kind": "path",
+        "path": "bench/audit-fixtures/t3-install",
+        "absolute_path": "<repo>/bench/audit-fixtures/t3-install"
+      }
+    ],
+    "managers": [
+      "lpm",
+      "bun"
+    ],
+    "modes": [
+      "cold",
+      "ci-cold"
+    ],
+    "lpm_routes": [
+      "direct"
+    ],
+    "lpm_firewall_modes": [
+      "off"
+    ],
+    "lpm_binaries": [
+      {
+        "name": "baseline",
+        "path": "<scratch>/lpm-baseline"
+      },
+      {
+        "name": "candidate",
+        "path": "<scratch>/lpm-candidate-reuse"
+      }
+    ],
+    "lpm_cells": [
+      {
+        "name": "current",
+        "env": {}
+      }
+    ],
+    "lpm_typosquat_guard": "default",
+    "script_policy": "ignore",
+    "timeout_ms": 600000,
+    "output_dir": "<scratch>/controls-scored",
+    "run_specs": [
+      "lpm-baseline",
+      "lpm-candidate",
+      "bun"
+    ]
+  },
+  "ci-cold-100": {
+    "output": "<scratch>/ci-cold-100",
+    "samples": 100,
+    "diagnostics": 3,
+    "states": [
+      "ci-cold-cache"
+    ],
+    "variants": [
+      {
+        "id": "baseline",
+        "manager": "lpm",
+        "binary": "<scratch>/lpm-baseline",
+        "sha256": "b3283b8338ae6b05c35310808741f8c00fa58962631acc963a247f3a7770b041"
+      },
+      {
+        "id": "candidate",
+        "manager": "lpm",
+        "binary": "<scratch>/lpm-candidate-reuse",
+        "sha256": "85d3b9973d1b17f66b6936b3d18e129f3da3caed613082473d8f0a86520b4301"
+      },
+      {
+        "id": "bun",
+        "manager": "bun"
+      }
+    ],
+    "fixture_sha256": "fa994042232e39e73fd1c4436c5e90974b47c4656e9c4a742c3988c6097b9871",
+    "harness_sha256": "e38178ce29e9eb26b65ede9a01a0fefe92bace4a5a11cd7ffb57ca13e6b19f36",
+    "node": "v26.5.0",
+    "platform": "darwin",
+    "method": "Separate roots seeded and warmed twice; reset state outside measurement; rotating variant/scenario order; every scored install retained; no timing instrumentation on scored installs; inventories and lockfiles retained; no repeated seed downloads."
+  },
+  "followup-nest-warm": {
+    "samples": 1,
+    "fixtures": [
+      {
+        "name": "nest",
+        "kind": "path",
+        "path": "bench/audit-fixtures/peer-heavy/nestjs-deep",
+        "absolute_path": "<repo>/bench/audit-fixtures/peer-heavy/nestjs-deep"
+      }
+    ],
+    "managers": [
+      "lpm",
+      "bun"
+    ],
+    "modes": [
+      "cold"
+    ],
+    "lpm_routes": [
+      "direct"
+    ],
+    "lpm_firewall_modes": [
+      "off"
+    ],
+    "lpm_binaries": [
+      {
+        "name": "baseline",
+        "path": "<scratch>/lpm-baseline"
+      },
+      {
+        "name": "candidate",
+        "path": "<scratch>/lpm-candidate-reuse"
+      }
+    ],
+    "lpm_cells": [
+      {
+        "name": "current",
+        "env": {}
+      }
+    ],
+    "lpm_typosquat_guard": "default",
+    "script_policy": "ignore",
+    "timeout_ms": 600000,
+    "output_dir": "<scratch>/followup-nest-warm",
+    "run_specs": [
+      "lpm-baseline",
+      "lpm-candidate",
+      "bun"
+    ]
+  },
+  "followup-nest-scored": {
+    "samples": 24,
+    "fixtures": [
+      {
+        "name": "nest",
+        "kind": "path",
+        "path": "bench/audit-fixtures/peer-heavy/nestjs-deep",
+        "absolute_path": "<repo>/bench/audit-fixtures/peer-heavy/nestjs-deep"
+      }
+    ],
+    "managers": [
+      "lpm",
+      "bun"
+    ],
+    "modes": [
+      "cold"
+    ],
+    "lpm_routes": [
+      "direct"
+    ],
+    "lpm_firewall_modes": [
+      "off"
+    ],
+    "lpm_binaries": [
+      {
+        "name": "baseline",
+        "path": "<scratch>/lpm-baseline"
+      },
+      {
+        "name": "candidate",
+        "path": "<scratch>/lpm-candidate-reuse"
+      }
+    ],
+    "lpm_cells": [
+      {
+        "name": "current",
+        "env": {}
+      }
+    ],
+    "lpm_typosquat_guard": "default",
+    "script_policy": "ignore",
+    "timeout_ms": 600000,
+    "output_dir": "<scratch>/followup-nest-scored",
+    "run_specs": [
+      "lpm-baseline",
+      "lpm-candidate",
+      "bun"
+    ]
+  },
+  "followup-native-sharp-warm": {
+    "samples": 1,
+    "fixtures": [
+      {
+        "name": "native-sharp",
+        "kind": "path",
+        "path": "bench/audit-fixtures/native/sharp-image",
+        "absolute_path": "<repo>/bench/audit-fixtures/native/sharp-image"
+      }
+    ],
+    "managers": [
+      "lpm",
+      "bun"
+    ],
+    "modes": [
+      "ci-cold"
+    ],
+    "lpm_routes": [
+      "direct"
+    ],
+    "lpm_firewall_modes": [
+      "off"
+    ],
+    "lpm_binaries": [
+      {
+        "name": "baseline",
+        "path": "<scratch>/lpm-baseline"
+      },
+      {
+        "name": "candidate",
+        "path": "<scratch>/lpm-candidate-reuse"
+      }
+    ],
+    "lpm_cells": [
+      {
+        "name": "current",
+        "env": {}
+      }
+    ],
+    "lpm_typosquat_guard": "default",
+    "script_policy": "ignore",
+    "timeout_ms": 600000,
+    "output_dir": "<scratch>/followup-native-sharp-warm",
+    "run_specs": [
+      "lpm-baseline",
+      "lpm-candidate",
+      "bun"
+    ]
+  },
+  "followup-native-sharp-scored": {
+    "samples": 24,
+    "fixtures": [
+      {
+        "name": "native-sharp",
+        "kind": "path",
+        "path": "bench/audit-fixtures/native/sharp-image",
+        "absolute_path": "<repo>/bench/audit-fixtures/native/sharp-image"
+      }
+    ],
+    "managers": [
+      "lpm",
+      "bun"
+    ],
+    "modes": [
+      "ci-cold"
+    ],
+    "lpm_routes": [
+      "direct"
+    ],
+    "lpm_firewall_modes": [
+      "off"
+    ],
+    "lpm_binaries": [
+      {
+        "name": "baseline",
+        "path": "<scratch>/lpm-baseline"
+      },
+      {
+        "name": "candidate",
+        "path": "<scratch>/lpm-candidate-reuse"
+      }
+    ],
+    "lpm_cells": [
+      {
+        "name": "current",
+        "env": {}
+      }
+    ],
+    "lpm_typosquat_guard": "default",
+    "script_policy": "ignore",
+    "timeout_ms": 600000,
+    "output_dir": "<scratch>/followup-native-sharp-scored",
+    "run_specs": [
+      "lpm-baseline",
+      "lpm-candidate",
+      "bun"
+    ]
+  },
+  "warm-shared-100": {
+    "output": "<scratch>/warm-shared-100",
+    "samples": 100,
+    "diagnostics": 3,
+    "states": [
+      "fresh-checkout-warm-cache",
+      "ci-warm-cache"
+    ],
+    "variants": [
+      {
+        "id": "baseline",
+        "manager": "lpm",
+        "binary": "<scratch>/lpm-baseline",
+        "sha256": "b3283b8338ae6b05c35310808741f8c00fa58962631acc963a247f3a7770b041"
+      },
+      {
+        "id": "candidate",
+        "manager": "lpm",
+        "binary": "<scratch>/lpm-candidate-reuse",
+        "sha256": "85d3b9973d1b17f66b6936b3d18e129f3da3caed613082473d8f0a86520b4301"
+      },
+      {
+        "id": "bun",
+        "manager": "bun"
+      }
+    ],
+    "sharedLpmRoot": true,
+    "balancedOrders": true,
+    "fixture_sha256": "fa994042232e39e73fd1c4436c5e90974b47c4656e9c4a742c3988c6097b9871",
+    "harness_sha256": "62ca350a6d0158aa12d66f4e7357994387e7d1a1225d4344022a90b64f6755d2",
+    "node": "v26.5.0",
+    "platform": "darwin",
+    "method": "Shared physical LPM root per state; separate Bun root. All forward/reverse rotations balance pair direction. Seeded and warmed twice; reset state outside measurement; rotating variant/scenario order; every scored install retained; no timing instrumentation on scored installs; inventories and lockfiles retained; no repeated seed downloads."
+  },
+  "ci-cold-shared-100": {
+    "output": "<scratch>/ci-cold-shared-100",
+    "samples": 100,
+    "diagnostics": 3,
+    "states": [
+      "ci-cold-cache"
+    ],
+    "variants": [
+      {
+        "id": "baseline",
+        "manager": "lpm",
+        "binary": "<scratch>/lpm-baseline",
+        "sha256": "b3283b8338ae6b05c35310808741f8c00fa58962631acc963a247f3a7770b041"
+      },
+      {
+        "id": "candidate",
+        "manager": "lpm",
+        "binary": "<scratch>/lpm-candidate-reuse",
+        "sha256": "85d3b9973d1b17f66b6936b3d18e129f3da3caed613082473d8f0a86520b4301"
+      },
+      {
+        "id": "bun",
+        "manager": "bun"
+      }
+    ],
+    "sharedLpmRoot": true,
+    "balancedOrders": true,
+    "fixture_sha256": "fa994042232e39e73fd1c4436c5e90974b47c4656e9c4a742c3988c6097b9871",
+    "harness_sha256": "62ca350a6d0158aa12d66f4e7357994387e7d1a1225d4344022a90b64f6755d2",
+    "node": "v26.5.0",
+    "platform": "darwin",
+    "method": "Shared physical LPM root per state; separate Bun root. All forward/reverse rotations balance pair direction. Seeded and warmed twice; reset state outside measurement; rotating variant/scenario order; every scored install retained; no timing instrumentation on scored installs; inventories and lockfiles retained; no repeated seed downloads."
+  }
+}

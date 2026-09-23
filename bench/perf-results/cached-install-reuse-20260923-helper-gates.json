@@ -1,0 +1,145 @@
+[
+  {
+    "command": [
+      "sh",
+      "tests/install-sh/run.sh"
+    ],
+    "returncode": 0
+  },
+  {
+    "command": [
+      "node",
+      "bench/scripts/run-install-readiness.mjs",
+      "--self-test"
+    ],
+    "returncode": 0
+  },
+  {
+    "command": [
+      "node",
+      "bench/scripts/run-t3-install-six-states.mjs",
+      "--self-test"
+    ],
+    "returncode": 0
+  },
+  {
+    "command": [
+      "node",
+      "bench/scripts/run-runtime-readiness.mjs",
+      "--self-test"
+    ],
+    "returncode": 0
+  },
+  {
+    "command": [
+      "bash",
+      "scripts/ci/test-install-apt-packages.sh"
+    ],
+    "returncode": 0
+  },
+  {
+    "command": [
+      "bash",
+      "scripts/ci/test-macos-keychain-search-list.sh"
+    ],
+    "returncode": 0
+  },
+  {
+    "command": [
+      "bash",
+      "bench/test-audit-install-args.sh"
+    ],
+    "returncode": 0
+  },
+  {
+    "command": [
+      "python3",
+      "bench/source-analysis/test_corpus.py"
+    ],
+    "returncode": 0
+  },
+  {
+    "command": [
+      "python3",
+      "bench/test_audit_install_timeout.py"
+    ],
+    "returncode": 0
+  },
+  {
+    "command": [
+      "python3",
+      "bench/audit-fixtures/test_classify_result.py"
+    ],
+    "returncode": 0
+  },
+  {
+    "command": [
+      "bash",
+      "bench/test-local-install.sh"
+    ],
+    "returncode": 0
+  },
+  {
+    "command": [
+      "bash",
+      "bench/test-live-metadata-route.sh"
+    ],
+    "returncode": 0
+  },
+  {
+    "command": [
+      "bash",
+      "bench/test-run-readme.sh"
+    ],
+    "returncode": 0
+  },
+  {
+    "command": [
+      "bash",
+      "scripts/ci/test-with-hermetic-workflow-cli.sh"
+    ],
+    "returncode": 0
+  },
+  {
+    "command": [
+      "npm",
+      "--prefix",
+      "npm/cli",
+      "test"
+    ],
+    "returncode": 0
+  },
+  {
+    "command": [
+      "npm",
+      "--prefix",
+      "npm/cli",
+      "run",
+      "pack:check"
+    ],
+    "returncode": 0
+  },
+  {
+    "command": [
+      "node",
+      "--test",
+      "<repo>/npm/release/tests/verify-published-package.test.mjs",
+      "<repo>/npm/release/tests/nightly-version.test.mjs",
+      "<repo>/npm/release/tests/nightly-release-state.test.mjs",
+      "<repo>/npm/release/tests/release-policy.test.mjs",
+      "<repo>/npm/release/tests/validate-release-candidate-source.test.mjs",
+      "<repo>/npm/release/tests/verify-packages.test.mjs",
+      "<repo>/npm/release/tests/rust-toolchain-policy.test.mjs",
+      "<repo>/npm/release/tests/release-hardening-policy.test.mjs",
+      "<repo>/npm/release/tests/acceptance-artifact-policy.test.mjs",
+      "<repo>/npm/release/tests/release-api-contract.test.mjs",
+      "<repo>/npm/release/tests/ci-policy.test.mjs",
+      "<repo>/npm/release/tests/linux-glibc-compatibility.test.mjs",
+      "<repo>/npm/release/tests/validate-recovery-source.test.mjs",
+      "<repo>/npm/release/tests/stable-release-policy.test.mjs",
+      "<repo>/npm/release/tests/release-artifacts.test.mjs",
+      "<repo>/npm/release/tests/release-candidate.test.mjs"
+    ],
+    "returncode": 0
+  }
+]
