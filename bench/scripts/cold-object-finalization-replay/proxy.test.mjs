@@ -127,3 +127,60 @@ test('startup rejects coordinated fixture replacement against the pinned capture
     await assert.rejects(async () => { unexpected = await createReplayProxy({ ...tls, directory, expectedManifestSha256 }); }, /pinned capture manifest mismatch/);
   } finally { await unexpected?.close(); tls.close(); fs.rmSync(root, { recursive: true }); }
 });
+
+test('queued large tarball does not reject a concurrent metadata stream', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'lpm-proxy-capacity-'));
+  const tls = benchmarkTls(root);
+  const directory = path.join(root, 'fixtures'); fs.mkdirSync(directory);
+  const hash = value => crypto.createHash('sha256').update(value).digest('hex');
+  for (const [target, body, json] of [
+    ['/large.tgz', Buffer.alloc(12 * 1024 * 1024, 1), false],
+    ['/small', Buffer.from('{"name":"small"}'), true],
+  ]) {
+    const request = ['GET', target, '*/*'];
+    const base = path.join(directory, hash(JSON.stringify(request)));
+    fs.writeFileSync(base + '.body', body);
+    fs.writeFileSync(base + '.json', JSON.stringify({ request, status: 200,
+      content_type: json ? 'application/json' : 'application/octet-stream', json,
+      bytes: body.length, sha256: hash(body), headers: {} }));
+  }
+  let proxy, session;
+  try {
+    proxy = await createReplayProxy({ ...tls, directory }); proxy.freeze();
+    const socket = await new Promise((resolve, reject) => {
+      const req = http.request(proxy.url, { method: 'CONNECT', path: 'registry.npmjs.org:443' });
+      req.on('connect', (response, socket) => response.statusCode === 200 ? resolve(socket) : reject(new Error('CONNECT rejected')));
+      req.on('error', reject); req.end();
+    });
+    session = http2.connect('https://registry.npmjs.org', { settings: { initialWindowSize: 16 * 1024 },
+      createConnection: () => tlsClient.connect({ socket, servername: 'registry.npmjs.org',
+        ca: fs.readFileSync(tls.ca), ALPNProtocols: ['h2'] }) });
+    session.on('error', () => {});
+    await new Promise((resolve, reject) => { session.once('connect', resolve); session.once('error', reject); });
+    session.setLocalWindowSize(32 * 1024 * 1024);
+    const large = session.request({ ':path': '/large.tgz', accept: '*/*' });
+    large.on('error', () => {}); large.pause();
+    await new Promise((resolve, reject) => {
+      large.once('response', headers => headers[':status'] === 200 ? resolve() : reject(new Error('large response failed')));
+      large.once('error', reject); large.end();
+    });
+    const metadata = await new Promise((resolve, reject) => {
+      const req = session.request({ ':path': '/small', accept: '*/*' }, { signal: AbortSignal.timeout(5000) });
+      let status; const chunks = [];
+      req.on('response', headers => { status = headers[':status']; });
+      req.on('data', chunk => chunks.push(chunk)); req.on('error', reject);
+      req.on('end', () => resolve({ status, body: Buffer.concat(chunks).toString() })); req.end();
+    });
+    assert.deepEqual(metadata, { status: 200, body: '{"name":"small"}' });
+    assert.equal(large.readableEnded, false);
+    const largeDigest = await new Promise((resolve, reject) => {
+      const digest = crypto.createHash('sha256');
+      large.on('data', chunk => digest.update(chunk));
+      large.on('end', () => resolve(digest.digest('hex'))); large.once('error', reject); large.resume();
+    });
+    assert.equal(largeDigest, hash(Buffer.alloc(12 * 1024 * 1024, 1)));
+    assert.equal(proxy.status().upstreamRequests, 0);
+    assert.deepEqual(proxy.status().misses, []);
+    assert.deepEqual(proxy.status().rejected, []);
+  } finally { session?.destroy(); await proxy?.close(); tls.close(); fs.rmSync(root, { recursive: true, force: true }); }
+});

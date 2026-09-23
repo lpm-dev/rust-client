@@ -119,7 +119,9 @@ export async function createReplayProxy({ directory, key, cert, expectedManifest
     return { frozen, phase, upstreamRequests, fixtures: entries.size, events, misses, rejected, captures };
   }
 
-  const tlsServer = http2.createSecureServer({ key, cert, allowHTTP1: true });
+  // Queued tarball bodies count toward session credit even when a stream is flow-controlled.
+  const tlsServer = http2.createSecureServer({ key, cert, allowHTTP1: true,
+    maxSessionMemory: 1024, settings: { maxConcurrentStreams: 256 } });
   tlsServer.on('secureConnection', socket => {
     if (socket.servername !== 'registry.npmjs.org') {
       rejected.push({ phase, reason: 'unexpected SNI' });

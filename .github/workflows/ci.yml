@@ -137,6 +137,9 @@ jobs:
       - name: Install readiness bench helper tests
         run: node bench/scripts/run-install-readiness.mjs --self-test
 
+      - name: Frozen registry replay helper tests
+        run: node --test bench/scripts/cold-object-finalization-replay/proxy.test.mjs
+
       - name: T3 six-state install bench helper tests
         run: node bench/scripts/run-t3-install-six-states.mjs --self-test
 
