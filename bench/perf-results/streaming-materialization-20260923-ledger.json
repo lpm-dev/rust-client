@@ -1,0 +1,85 @@
+{
+  "totals": {
+    "received": 4,
+    "verified_and_fixed": 4,
+    "rejected": 0,
+    "externally_blocked": 0,
+    "pending": 0
+  },
+  "findings": [
+    {
+      "id": "PIPE-01",
+      "source": "async_runtime_scheduling; primary",
+      "category": "performance",
+      "location": "crates/lpm-extractor/src/lib.rs:extract_streaming_gzip_tarball; pipeline.rs",
+      "claim": "Sequential gzip decoding delays filesystem extraction on the Next critical path.",
+      "evidence": "Frozen Next 16.3.6 extraction median: baseline 791.261 ms, pipelined 636.1305 ms (six balanced samples each). T3 cold 1978 to 1872.5 ms; CI-cold 1642.5 to 1580.5 ms. Full payload parity passed. Live peak RSS rises; report preserves this tradeoff.",
+      "disposition": "Verified",
+      "coverage": "Frozen extraction; four-fixture installs; pipeline tests",
+      "commit": "df373bb317c035f869e0321e8695db249518e651",
+      "pr_status": "Ready for publication on codex/streaming-materialization, dependent on PR867"
+    },
+    {
+      "id": "PIPE-02",
+      "source": "async_runtime_scheduling; primary",
+      "category": "performance",
+      "location": "crates/lpm-extractor/src/lib.rs:stream_entry_to_disk",
+      "claim": "Per-file copy buffers and fragmented reads cause avoidable writes/hash updates.",
+      "evidence": "One 64 KiB buffer replaces per-file initialization; read_exact coalesces fragmented reads. Frozen Next baseline 791.261 ms versus final serial 763.792 ms. No isolated end-to-end claim.",
+      "disposition": "Verified",
+      "coverage": "Short-read/duplicate-digest tests; frozen archive parity; four-fixture installs",
+      "commit": "df373bb317c035f869e0321e8695db249518e651",
+      "pr_status": "Ready for publication on codex/streaming-materialization, dependent on PR867"
+    },
+    {
+      "id": "PIPE-03",
+      "source": "primary actual paused-HTTP regression test",
+      "category": "correctness",
+      "location": "crates/lpm-cli/src/commands/install/fetch.rs:cancellable_tarball_stream",
+      "claim": "A repeated read after cancelled-stream EOF can panic the decode worker.",
+      "evidence": "The pre-fix EOF regression failed with Unfold must not be polled after Ready(None). Fused stream passes repeated EOF and stalled HTTP cancellation regressions, plus all 26 fetch tests.",
+      "disposition": "Verified",
+      "coverage": "cancelled_tarball_stream_keeps_returning_eof_after_its_error; early_tar_failure_cancels_pending_pipeline_input_and_releases_capacity",
+      "commit": "df373bb317c035f869e0321e8695db249518e651",
+      "pr_status": "Ready for publication on codex/streaming-materialization, dependent on PR867"
+    },
+    {
+      "id": "PIPE-04",
+      "source": "primary full library gate",
+      "category": "correctness",
+      "location": "crates/lpm-store/src/v2/store.rs:prepare_streaming_staging",
+      "claim": "Refactoring stream setup moved integrity parsing before staging creation, changing invalid-identity cleanup behavior.",
+      "evidence": "Existing known_sha512_stream_rejects_invalid_or_non_sha512_canonical_identities failed because objects_root was absent. Restored staging-before-hashing order passes that test and all 348 store tests.",
+      "disposition": "Verified",
+      "coverage": "known_sha512_stream_rejects_invalid_or_non_sha512_canonical_identities; store crate suite",
+      "commit": "df373bb317c035f869e0321e8695db249518e651",
+      "pr_status": "Ready for publication on codex/streaming-materialization, dependent on PR867"
+    }
+  ],
+  "research_reconciliation": {
+    "scope": "Bounded decode-ahead extraction. Prior diagnostics resolved attribution; unmeasured alternative mechanisms are research hypotheses, not verified defects.",
+    "original_async_research": {
+      "NS1": "Resolved through separate input-read timers; old stream_body_wall semantics preserved. Input intervals include scheduler/bridge waiting.",
+      "NS2": "Worker queue/resume delays measured below1ms for Next in scored samples; no evidence they are the main bottleneck.",
+      "NS3": "Decoder and hash boundaries instrumented; nested counters are not summed as independent wall costs. Both drains preserved.",
+      "NS4": "Decode-ahead implemented as PIPE-01; reused/coalesced scratch as PIPE-02. Compressed buffering is not added on top without proving additive value.",
+      "NS5": "Spool scheduling remains an unproven cause. No standalone diagnosis from elapsed HTTP timings; no code change justified by these observations."
+    },
+    "original_link_research": {
+      "LF01": "Measured actual destination metadata scan about30ms; preserved because fresh source identity cannot substitute for cloned destination metadata.",
+      "LF02": "Next critical snapshot write measured0.22\u20130.23ms. Across95concurrent tasks the summed elapsed time was740ms cold versus20ms CI-cold; these intervals include scheduling/contention and are not additive wall time. A separate contention experiment is needed before attributing that difference to atomic-rename overhead; no isolated win established.",
+      "LF03": "Next critical sidecar cleanup measured0.16\u20130.20ms. Summed across95tasks:41ms cold/19ms CI-cold, overlapping other work; not independently attributable to redundant exists probes.",
+      "LF04": "Root-link entire phase about1ms from earlier trace; excluded from decoded-extraction concept.",
+      "LF05": "Resolved measurement blind spot by recording all95link scopes with nanoseconds.113dependency symlinks sum20.9ms cold/8.6ms CI-cold; Next ten symlinks take~0.47ms. Overlapping sums are not wall duration."
+    },
+    "followup_link_research": {
+      "O_EXCL": "Already rejected by prior EX-17 frozen measurements; no repeat or production change.",
+      "parent_cache": "LRU simulation removes3437 of8148 reopen misses at32handles. Still an unmeasured separate optimization hypothesis; adds handle/callback semantics. No claim of verified improvement.",
+      "larger_copy_chunks": "Lower write-call estimate is a hypothesis; prototype only coalesces existing64KiB chunks. Actual measured gain attributed separately.",
+      "early_entry_type_filter": "Rejected for this archive: every Next entry is a regular file.",
+      "Bun_source": "Local checkout identifies1.4.0; measured Bun version requires explicit provenance. Source comparisons not attributed to measured Bun version."
+    },
+    "security_research": "All reuse constraints preserved: complete directory/type/metadata checks, actual destination state, same-name layout hashing, V3 CAS validation. Actual production review reported zero concrete findings. Cancellation/drop/join checked, with ordinary failure, producer panic, consumer panic and stalled HTTP tests.",
+    "measurement_limitations": "Diagnostic microprobe binary overwritten before preservation; original command/hash and instrumentation source remain. CLI diagnostic and all actual optimization baselines/candidates preserved. No performance comparison conflates old live-registry cohorts."
+  }
+}
