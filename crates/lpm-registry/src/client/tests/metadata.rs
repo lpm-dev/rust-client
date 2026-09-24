@@ -2491,6 +2491,267 @@ async fn command_scoped_metadata_cache_keeps_direct_registry_origins_isolated() 
 }
 
 #[tokio::test]
+async fn selected_history_falls_back_for_missing_or_mismatched_version_identity() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    for history in [
+        serde_json::json!({"name": "selected", "versions": {}}),
+        serde_json::json!({"name": "wrong", "versions": {"1.0.0": {"name": "selected", "version": "1.0.0"}}}),
+        serde_json::json!({"name": "selected", "versions": {"1.0.0": {"name": "wrong", "version": "1.0.0"}}}),
+        serde_json::json!({"name": "selected", "versions": {"1.0.0": {"name": "selected", "version": "2.0.0"}}}),
+    ] {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/selected"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(history))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/selected/1.0.0"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "name": "selected", "version": "1.0.0", "libc": ["musl"]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client = RegistryClient::new()
+            .with_npm_registry_url(server.uri())
+            .with_cache_dir(None);
+        let selected = client
+            .get_npm_version_from_history_with_timings("selected", "1.0.0")
+            .await
+            .unwrap();
+        assert!(!selected.timings.selected_from_history);
+        assert_eq!(selected.metadata.versions["1.0.0"].libc, vec!["musl"]);
+        server.verify().await;
+    }
+}
+
+#[tokio::test]
+async fn selected_history_no_store_fetches_again_without_a_validator() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/selected"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("Cache-Control", "no-store")
+                .insert_header("ETag", "\"history\"")
+                .set_body_json(serde_json::json!({"name": "selected", "versions": {
+                    "1.0.0": {"name": "selected", "version": "1.0.0"}
+                }})),
+        )
+        .expect(2)
+        .mount(&server)
+        .await;
+    let cache = tempfile::tempdir().unwrap();
+    let client = RegistryClient::new()
+        .with_npm_registry_url(server.uri())
+        .with_cache_dir(Some(cache.path().to_path_buf()))
+        .with_synchronous_cache_writes(true);
+    for _ in 0..2 {
+        let selected = client
+            .get_npm_version_from_history_with_timings("selected", "1.0.0")
+            .await
+            .unwrap();
+        assert!(!selected.timings.cache_hit);
+    }
+    for request in server.received_requests().await.unwrap() {
+        assert!(!request.headers.contains_key("if-none-match"));
+    }
+    assert!(
+        client
+            .read_cache_validator(&client.npm_selected_history_cache_key("selected", "1.0.0"))
+            .is_none()
+    );
+    server.verify().await;
+}
+
+#[tokio::test]
+async fn selected_history_unusable_304_reports_the_unconditional_response() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    let calls = AtomicUsize::new(0);
+    Mock::given(method("GET"))
+        .and(path("/selected"))
+        .respond_with(move |_: &wiremock::Request| {
+            if calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                ResponseTemplate::new(304)
+            } else {
+                ResponseTemplate::new(200).set_body_json(
+                    serde_json::json!({"name": "selected", "versions": {
+                        "1.0.0": {"name": "selected", "version": "1.0.0"}
+                    }}),
+                )
+            }
+        })
+        .expect(2)
+        .mount(&server)
+        .await;
+    let client = RegistryClient::new()
+        .with_npm_registry_url(server.uri())
+        .with_cache_dir(None);
+    let selected = client
+        .get_npm_version_from_history_with_timings("selected", "1.0.0")
+        .await
+        .unwrap();
+    assert!(selected.timings.selected_from_history);
+    assert!(
+        !selected.timings.not_modified,
+        "fresh 200 body must not be counted as cache revalidation"
+    );
+    assert!(selected.timings.body_bytes > 0);
+    server.verify().await;
+}
+
+#[tokio::test]
+async fn selected_history_caches_only_the_requested_version_and_invalidates_it() {
+    use wiremock::matchers::{header, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    let history = serde_json::json!({
+        "name": "selected", "dist-tags": {"latest": "2.0.0"},
+        "versions": {
+            "1.0.0": {"name": "selected", "version": "1.0.0", "libc": ["glibc"], "bundleDependencies": ["vendored"], "bundledDependencies": ["ignored-alias"],
+                "dist": {"tarball": "https://example.invalid/selected.tgz", "integrity": "sha512-selected"}},
+            "2.0.0": {"name": "selected", "version": "2.0.0"}
+        }
+    });
+    Mock::given(method("GET"))
+        .and(path("/selected"))
+        .and(header("accept", "application/json"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(history)
+                .insert_header("Cache-Control", "max-age=300"),
+        )
+        .expect(2)
+        .mount(&server)
+        .await;
+    let cache = tempfile::tempdir().unwrap();
+    let client = RegistryClient::new()
+        .with_npm_registry_url(server.uri())
+        .with_cache_dir(Some(cache.path().to_path_buf()))
+        .with_synchronous_cache_writes(true);
+
+    let first = client
+        .get_npm_version_from_history_with_timings("selected", "1.0.0")
+        .await
+        .unwrap();
+    let cached = client
+        .get_npm_version_from_history_with_timings("selected", "1.0.0")
+        .await
+        .unwrap();
+    assert!(first.timings.selected_from_history);
+    assert!(cached.timings.cache_hit);
+    assert_eq!(cached.metadata.versions.len(), 1);
+    assert_eq!(cached.metadata.versions["1.0.0"].libc, vec!["glibc"]);
+    assert_eq!(
+        cached.metadata.versions["1.0.0"].bundle_dependencies,
+        vec!["vendored"]
+    );
+    assert!(cached.metadata.dist_tags.is_empty());
+    assert!(cached.metadata.time.is_empty());
+    assert!(
+        client
+            .read_metadata_cache(&client.npm_direct_metadata_cache_key("selected"))
+            .is_none()
+    );
+    client.invalidate_npm_version_metadata_cache("selected", "1.0.0");
+    let refreshed = client
+        .get_npm_version_from_history_with_timings("selected", "1.0.0")
+        .await
+        .unwrap();
+    assert!(!refreshed.timings.cache_hit);
+    server.verify().await;
+}
+
+#[tokio::test]
+async fn selected_history_reuses_a_valid_legacy_document_without_sending_its_validator() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/legacy/1.0.0"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(serde_json::json!({
+                    "name": "legacy", "version": "1.0.0"
+                }))
+                .insert_header("ETag", "\"version-endpoint\"")
+                .insert_header("Cache-Control", "max-age=300"),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/legacy"))
+        .respond_with(ResponseTemplate::new(500))
+        .expect(0)
+        .mount(&server)
+        .await;
+    let cache = tempfile::tempdir().unwrap();
+    let client = RegistryClient::new()
+        .with_npm_registry_url(server.uri())
+        .with_cache_dir(Some(cache.path().to_path_buf()))
+        .with_synchronous_cache_writes(true);
+    client
+        .get_npm_version_metadata_direct_with_timings("legacy", "1.0.0")
+        .await
+        .unwrap();
+    let selected = client
+        .get_npm_version_from_history_with_timings("legacy", "1.0.0")
+        .await
+        .unwrap();
+    assert!(selected.timings.cache_hit);
+    assert!(!selected.timings.selected_from_history);
+    server.verify().await;
+}
+
+#[tokio::test]
+async fn selected_history_falls_back_when_the_declared_body_exceeds_its_bound() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/large-history"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_bytes(vec![b' '; MAX_VERSION_METADATA_BYTES + 1]),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/large-history/1.0.0"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "name": "large-history", "version": "1.0.0"
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let client = RegistryClient::new()
+        .with_npm_registry_url(server.uri())
+        .with_cache_dir(None);
+    let selected = client
+        .get_npm_version_from_history_with_timings("large-history", "1.0.0")
+        .await
+        .unwrap();
+    assert!(!selected.timings.selected_from_history);
+    assert_eq!(selected.metadata.versions.len(), 1);
+    server.verify().await;
+}
+
+#[tokio::test]
 async fn get_npm_version_metadata_direct_fetches_and_caches_version_document() {
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -3373,4 +3634,308 @@ async fn forced_metadata_refetch_preserves_a_healthy_session() {
         .await
         .unwrap();
     assert!(metadata.version("1.0.0").is_some());
+}
+
+#[tokio::test]
+async fn selected_history_fallback_keeps_failed_attempt_bytes_and_http_time() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+    let server = MockServer::start().await;
+    let broken = br#"{"name":"pkg","versions":invalid}"#;
+    let exact = br#"{"name":"pkg","version":"1.0.0"}"#;
+    Mock::given(method("GET"))
+        .and(path("/pkg"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_bytes(broken.to_vec())
+                .set_delay(std::time::Duration::from_millis(50)),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/pkg/1.0.0"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(exact.to_vec()))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let client = RegistryClient::new()
+        .with_npm_registry_url(server.uri())
+        .with_cache_dir(None);
+    let fetched = client
+        .get_npm_version_from_history_with_timings("pkg", "1.0.0")
+        .await
+        .unwrap();
+    assert_eq!(
+        fetched.timings.body_bytes as usize,
+        broken.len() + exact.len()
+    );
+    assert!(fetched.timings.http_ms >= 50);
+    assert!(!fetched.timings.selected_from_history);
+    assert!(fetched.metadata.versions.contains_key("1.0.0"));
+}
+
+#[tokio::test]
+async fn blocked_enrichment_reuses_validated_selected_history_without_another_request() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    let mut history: serde_json::Value =
+        serde_json::from_str(&test_metadata_json_version("selected", "1.0.0")).unwrap();
+    history["versions"]["1.0.0"]["_behavioralTags"] = serde_json::json!({"network":true});
+    Mock::given(method("GET"))
+        .and(path("/selected"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(history)
+                .insert_header("Cache-Control", "max-age=300"),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    let cache = tempfile::tempdir().unwrap();
+    let client = RegistryClient::new()
+        .with_npm_registry_url(server.uri())
+        .with_cache_dir(Some(cache.path().to_path_buf()))
+        .with_synchronous_cache_writes(true);
+    let selected = client
+        .get_npm_version_from_history_with_timings("selected", "1.0.0")
+        .await
+        .unwrap();
+    assert_eq!(selected.metadata.time.len(), 1);
+    let blocked = client
+        .get_npm_blocked_set_meta_for_version("selected", "1.0.0", crate::UpstreamRoute::NpmDirect)
+        .await
+        .unwrap();
+    assert_eq!(blocked.time["1.0.0"], "2025-01-01T00:00:00.000Z");
+    assert_eq!(blocked.versions.len(), 1);
+    assert_eq!(
+        blocked.versions["1.0.0"]
+            .dist
+            .as_ref()
+            .unwrap()
+            .integrity_or_shasum()
+            .as_deref(),
+        Some("sha512-test")
+    );
+    assert!(
+        blocked.versions["1.0.0"]
+            .behavioral_tags
+            .as_ref()
+            .unwrap()
+            .active_tag_names()
+            .contains(&"network")
+    );
+    server.verify().await;
+}
+
+#[tokio::test]
+async fn blocked_enrichment_rejects_incomplete_wrong_identity_and_invalidated_selected_caches() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    for case in [
+        "time",
+        "name",
+        "manifest-name",
+        "version",
+        "invalidated",
+        "no-store",
+        "origin",
+        "tls",
+    ] {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/selected"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(test_metadata_json_version("selected", "1.0.0")),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let cache = tempfile::tempdir().unwrap();
+        let client = RegistryClient::new()
+            .with_npm_registry_url(server.uri())
+            .with_cache_dir(Some(cache.path().to_path_buf()))
+            .with_synchronous_cache_writes(true);
+        let mut metadata: PackageMetadata =
+            serde_json::from_str(&test_metadata_json_version("selected", "1.0.0")).unwrap();
+        match case {
+            "time" => metadata.time.clear(),
+            "name" => metadata.name = "wrong".into(),
+            "manifest-name" => metadata.versions.get_mut("1.0.0").unwrap().name = "wrong".into(),
+            "version" => metadata.versions.get_mut("1.0.0").unwrap().version = "2.0.0".into(),
+            _ => {}
+        }
+        let writer = match case {
+            "origin" => client
+                .clone_with_config()
+                .with_npm_registry_url("https://other.invalid"),
+            "tls" => {
+                let identity =
+                    rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+                let cert = cache.path().join("client-cert.pem");
+                let key = cache.path().join("client-key.pem");
+                std::fs::write(&cert, identity.cert.pem()).unwrap();
+                std::fs::write(&key, identity.key_pair.serialize_pem()).unwrap();
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o600)).unwrap();
+                }
+                let tagged = |path| crate::npmrc::TaggedPath {
+                    path,
+                    source: "test".into(),
+                    line: 1,
+                    source_dir: None,
+                };
+                client
+                    .clone_with_config()
+                    .with_tls_overrides(&TlsOverrides {
+                        identity_certfile: Some(tagged(cert)),
+                        identity_keyfile: Some(tagged(key)),
+                        ..Default::default()
+                    })
+                    .unwrap()
+            }
+            _ => client.clone_with_config(),
+        };
+        let key = writer.npm_selected_history_cache_key("selected", "1.0.0");
+        writer.write_metadata_cache(&key, &metadata, None);
+        if case == "invalidated" {
+            client.invalidate_npm_version_metadata_cache("selected", "1.0.0");
+        } else if case == "no-store" {
+            writer.write_metadata_cache_with_directive(
+                &key,
+                &metadata,
+                None,
+                MetadataCacheDirective::NoStore,
+            );
+        }
+        let blocked = client
+            .get_npm_blocked_set_meta_for_version(
+                "selected",
+                "1.0.0",
+                crate::UpstreamRoute::NpmDirect,
+            )
+            .await
+            .unwrap();
+        assert_eq!(blocked.time["1.0.0"], "2025-01-01T00:00:00.000Z", "{case}");
+        assert_eq!(server.received_requests().await.unwrap().len(), 1, "{case}");
+        server.verify().await;
+    }
+}
+
+#[tokio::test]
+async fn blocked_enrichment_batch_preserves_selected_bindings_and_shares_fallback() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+    let server = MockServer::start().await;
+    let cache = tempfile::tempdir().unwrap();
+    let client = RegistryClient::new()
+        .with_npm_registry_url(server.uri())
+        .with_cache_dir(Some(cache.path().to_path_buf()))
+        .with_synchronous_cache_writes(true);
+    let selected: PackageMetadata = serde_json::from_value(serde_json::json!({
+        "name":"pkg", "time":{"1.0.0":"selected-time"}, "versions":{"1.0.0":{
+            "name":"pkg", "version":"1.0.0", "dist":{"integrity":"sha512-selected"},
+            "_behavioralTags":{"network":true}
+        }}
+    }))
+    .unwrap();
+    client.write_metadata_cache(
+        &client.npm_selected_history_cache_key("pkg", "1.0.0"),
+        &selected,
+        None,
+    );
+    Mock::given(method("GET"))
+        .and(path("/pkg"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "name":"pkg", "time":{"1.0.0":"fallback-time", "2.0.0":"second", "3.0.0":"third"},
+            "versions":{
+                "1.0.0":{"name":"pkg","version":"1.0.0","dist":{"integrity":"sha512-other"}},
+                "2.0.0":{"name":"pkg","version":"2.0.0","dist":{"integrity":"sha512-second"}},
+                "3.0.0":{"name":"pkg","version":"3.0.0","dist":{"integrity":"sha512-third"}},
+                "4.0.0":{"name":"pkg","version":"4.0.0"}
+            }
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let metadata = client
+        .get_npm_blocked_set_meta_for_versions(
+            "pkg",
+            &["1.0.0", "2.0.0", "3.0.0", "3.0.0", "missing"],
+            crate::UpstreamRoute::NpmDirect,
+        )
+        .await
+        .unwrap();
+    assert_eq!(metadata.versions.len(), 3);
+    assert_eq!(metadata.time.len(), 3);
+    assert_eq!(metadata.time["1.0.0"], "selected-time");
+    assert_eq!(metadata.time["2.0.0"], "second");
+    assert_eq!(metadata.time["3.0.0"], "third");
+    assert_eq!(
+        metadata.versions["1.0.0"]
+            .dist
+            .as_ref()
+            .unwrap()
+            .integrity_or_shasum()
+            .as_deref(),
+        Some("sha512-selected")
+    );
+    assert!(
+        metadata.versions["1.0.0"]
+            .behavioral_tags
+            .as_ref()
+            .unwrap()
+            .active_tag_names()
+            .contains(&"network")
+    );
+    server.verify().await;
+}
+
+#[tokio::test]
+async fn selected_history_counts_http_wait_for_failed_retry_after_unusable_304() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+    let server = MockServer::start().await;
+    let calls = AtomicUsize::new(0);
+    Mock::given(method("GET"))
+        .and(path("/retry-timing"))
+        .respond_with(move |_: &wiremock::Request| {
+            if calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                ResponseTemplate::new(304)
+            } else {
+                ResponseTemplate::new(400).set_delay(std::time::Duration::from_millis(60))
+            }
+        })
+        .expect(2)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/retry-timing/1.0.0"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(serde_json::json!({"name":"retry-timing","version":"1.0.0"})),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    let client = RegistryClient::new()
+        .with_npm_registry_url(server.uri())
+        .with_cache_dir(None);
+    let fetched = client
+        .get_npm_version_from_history_with_timings("retry-timing", "1.0.0")
+        .await
+        .unwrap();
+    assert!(
+        fetched.timings.http_ms >= 60,
+        "failed retry HTTP wait was lost: {:?}",
+        fetched.timings
+    );
+    assert!(!fetched.timings.not_modified);
 }

@@ -277,6 +277,62 @@ async fn count_dispatched_speculative_frames(
 }
 
 #[tokio::test]
+async fn speculation_dispatches_projected_latest_metadata_without_claiming_complete_history() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+    let registry = MockServer::start().await;
+    for (name, dependencies) in [
+        ("parent", serde_json::json!({"child":"^1"})),
+        ("child", serde_json::json!({})),
+    ] {
+        Mock::given(method("GET")).and(path(format!("/{name}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "name":name, "dist-tags":{"latest":"1.0.0"},
+                "versions":{"1.0.0":{"name":name,"version":"1.0.0","dependencies":dependencies,
+                    "dist":{"tarball":format!("https://example.invalid/{name}.tgz"),"integrity":"sha512-test"}}}
+            }))).expect(1).mount(&registry).await;
+    }
+    let dependencies = HashMap::from([("parent".to_owned(), "^1".to_owned())]);
+    let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+    lpm_resolver::resolve_greedy_fused(
+        Arc::new(
+            RegistryClient::new()
+                .with_npm_registry_url(registry.uri())
+                .with_cache_dir(None),
+        ),
+        dependencies.clone(),
+        lpm_resolver::OverrideSet::empty(),
+        RouteTable::from_mode_only(lpm_registry::RouteMode::Direct),
+        8,
+        Some(tx),
+        true,
+    )
+    .await
+    .unwrap();
+    let mut frames = Vec::new();
+    while let Some(frame) = rx.recv().await {
+        frames.push(frame);
+    }
+    assert_eq!(frames.len(), 2);
+    for (_, frame) in &frames {
+        assert!(!frame.info.versions_complete);
+        assert!(
+            frame
+                .info
+                .needs_metadata_for_range(&lpm_resolver::NpmRange::parse("^1").unwrap())
+        );
+    }
+    let borrowed = frames
+        .iter()
+        .map(|(name, frame)| (name.as_str(), frame.clone()))
+        .collect();
+    assert_eq!(
+        count_dispatched_speculative_frames(dependencies, borrowed).await,
+        2
+    );
+}
+
+#[tokio::test]
 async fn speculation_dispatches_optional_dependencies_when_their_metadata_arrives() {
     let parent = SpeculativePackageMetadata::from(registry_metadata(serde_json::json!({
         "name": "parent",
@@ -1789,7 +1845,8 @@ async fn speculative_v2_download_extracts_object() {
     )
     .await
     .expect("speculative virtual-store download must succeed");
-    assert_eq!(outcome, SpeculativeFetchOutcome::Stored);
+    assert_eq!(outcome.0, SpeculativeFetchOutcome::Stored);
+    assert!(outcome.1.file_count > 0);
 
     assert!(
         store_v2
@@ -2001,7 +2058,9 @@ async fn assert_large_speculation_streams(mode: SpeculationStreamMode, cancel: b
                 !objects_root.exists() || std::fs::read_dir(objects_root).unwrap().next().is_none()
             );
         } else {
-            assert_eq!(outcome.unwrap(), SpeculativeFetchOutcome::Stored);
+            let (outcome, timings) = outcome.unwrap();
+            assert_eq!(outcome, SpeculativeFetchOutcome::Stored);
+            assert!(timings.file_count > 0);
             assert!(
                 inspect_store
                     .reusable_object_dir(&integrity)

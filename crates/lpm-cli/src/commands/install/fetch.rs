@@ -2479,6 +2479,7 @@ pub(super) async fn run_online_fetch_phase(
     spec_stats.duplicated_with_fetch = spec_tracker.duplicated_count();
     spec_stats.failed = spec_tracker.failed_count();
     spec_stats.wasted = spec_tracker.wasted_count(&final_graph_keys);
+    spec_stats.work = spec_tracker.take_work();
 
     // Fetch / cache-hit counters are recorded into `fetch_ms` etc. and
     // surfaced via the verbose footer and JSON envelope. The default
@@ -3225,8 +3226,10 @@ pub(super) fn spawn_speculation_dispatcher(
                 };
 
                 if !meta.info.versions_complete
-                    && lpm_resolver::NpmRange::parse_registry_spec(&range)
-                        .map_or(true, |parsed| meta.info.needs_metadata_for_range(&parsed))
+                    && lpm_resolver::NpmRange::parse_registry_spec(&range).map_or(true, |parsed| {
+                        meta.info.needs_metadata_for_range(&parsed)
+                            && !meta.info.preferred_latest_satisfies(&parsed)
+                    })
                 {
                     parked
                         .entry(name)
@@ -3324,6 +3327,7 @@ pub(super) fn spawn_speculation_dispatcher(
                 let failed_task = failed_c.clone();
                 let skipped_no_permit_task = skipped_no_permit_c.clone();
                 let spec_tracker_task = spec_tracker_spec.clone();
+                let dispatched_at_ms = spec_tracker_task.elapsed_ms();
                 let store_v2_task = store_v2_spec.clone();
                 let fetch_extract_limiter_task = fetch_extract_limiter_spec.clone();
                 let install_accounting_task = install_accounting_spec;
@@ -3350,15 +3354,21 @@ pub(super) fn spawn_speculation_dispatcher(
                     )
                     .await
                     {
-                        Ok(SpeculativeFetchOutcome::Stored) => {
+                        Ok((SpeculativeFetchOutcome::Stored, timings)) => {
+                            completed_task.fetch_add(1, Relaxed);
+                            spec_tracker_task.record_stored(
+                                package_key,
+                                &name,
+                                &version,
+                                timings,
+                                dispatched_at_ms,
+                            );
+                        }
+                        Ok((SpeculativeFetchOutcome::AlreadyPresent, _)) => {
                             completed_task.fetch_add(1, Relaxed);
                             spec_tracker_task.record_completed(package_key);
                         }
-                        Ok(SpeculativeFetchOutcome::AlreadyPresent) => {
-                            completed_task.fetch_add(1, Relaxed);
-                            spec_tracker_task.record_completed(package_key);
-                        }
-                        Ok(SpeculativeFetchOutcome::SkippedNoPermit) => {
+                        Ok((SpeculativeFetchOutcome::SkippedNoPermit, _)) => {
                             skipped_no_permit_task.fetch_add(1, Relaxed);
                         }
                         Err(e) => {
@@ -3469,7 +3479,7 @@ pub(super) fn spawn_speculation_dispatcher(
 
 /// One speculative download into the active store,
 /// identical to `fetch_and_store_streaming` but without the
-/// `InstallPackage`-shaped plumbing or `TaskTimings` accounting. Errors
+/// `InstallPackage`-shaped plumbing. Errors
 /// are swallowed by the dispatcher (best-effort speculation); the real
 /// fetch loop remains the authority.
 #[allow(clippy::too_many_arguments)]
@@ -3492,7 +3502,7 @@ pub(super) async fn speculative_download_and_store(
     streaming_lane: Option<&V2StreamingLane>,
     fetch_extract_limiter: &FetchExtractLimiter,
     install_accounting: ManagedInstallAccounting,
-) -> Result<SpeculativeFetchOutcome, LpmError> {
+) -> Result<(SpeculativeFetchOutcome, TaskTimings), LpmError> {
     use futures::stream::TryStreamExt;
     use tokio_util::io::{StreamReader, SyncIoBridge};
 
@@ -3506,6 +3516,7 @@ pub(super) async fn speculative_download_and_store(
     // package to a private mirror. Tarball-URL packages have a
     // different source_id and naturally don't share locks with
     // speculation — that's correct (speculation never targets them).
+    let queue_start = std::time::Instant::now();
     let speculation_key = registry_install_pkg_key(name, version, route_table, client.as_ref());
     let key_lock = coord.lock_for(speculation_key).await;
     let key_guard = key_lock.lock_owned().await;
@@ -3526,14 +3537,20 @@ pub(super) async fn speculative_download_and_store(
         store.has_package(name, version)
     };
     if already_present {
-        return Ok(SpeculativeFetchOutcome::AlreadyPresent);
+        return Ok((
+            SpeculativeFetchOutcome::AlreadyPresent,
+            TaskTimings::default(),
+        ));
     }
 
     let _speculation_permit = match speculation_semaphore {
         Some(limiter) => match limiter.try_acquire() {
             Ok(permit) => Some(permit),
             Err(tokio::sync::TryAcquireError::NoPermits) => {
-                return Ok(SpeculativeFetchOutcome::SkippedNoPermit);
+                return Ok((
+                    SpeculativeFetchOutcome::SkippedNoPermit,
+                    TaskTimings::default(),
+                ));
             }
             Err(tokio::sync::TryAcquireError::Closed) => {
                 return Err(LpmError::Registry(
@@ -3550,13 +3567,18 @@ pub(super) async fn speculative_download_and_store(
     let permit = match semaphore.clone().try_acquire_owned() {
         Ok(permit) => permit,
         Err(tokio::sync::TryAcquireError::NoPermits) => {
-            return Ok(SpeculativeFetchOutcome::SkippedNoPermit);
+            return Ok((
+                SpeculativeFetchOutcome::SkippedNoPermit,
+                TaskTimings::default(),
+            ));
         }
         Err(tokio::sync::TryAcquireError::Closed) => {
             return Err(LpmError::Registry("spec semaphore closed".into()));
         }
     };
 
+    let queue_wait_ms = queue_start.elapsed().as_millis();
+    let download_start = std::time::Instant::now();
     if let Some(v2) = store_v2 {
         let streaming_lane = streaming_lane.filter(|_| {
             v2.supports_streamed_object_ingest()
@@ -3574,7 +3596,7 @@ pub(super) async fn speculative_download_and_store(
                 .await?;
             if lane.try_claim() {
                 tracing::debug!(package = name, version, "streaming speculative tarball");
-                extract_v2_registry_response(V2StreamInput {
+                let (_, timings, _) = extract_v2_registry_response(V2StreamInput {
                     response,
                     store_v2: v2,
                     expected_integrity: integrity,
@@ -3582,12 +3604,12 @@ pub(super) async fn speculative_download_and_store(
                     permit,
                     fetch_extract_limiter,
                     key_guard: Some(key_guard),
-                    queue_wait_ms: 0,
+                    queue_wait_ms,
                     url_lookup_ms: 0,
-                    download_headers_ms: 0,
+                    download_headers_ms: download_start.elapsed().as_millis(),
                 })
                 .await?;
-                return Ok(SpeculativeFetchOutcome::Stored);
+                return Ok((SpeculativeFetchOutcome::Stored, timings));
             }
             client.spool_tarball_response_to_file(response).await?
         } else {
@@ -3595,33 +3617,48 @@ pub(super) async fn speculative_download_and_store(
                 .download_tarball_routed_managed(route_table, name, url, install_accounting)
                 .await?
         };
+        let download_ms = download_start.elapsed().as_millis();
         drop(permit);
+        let extract_wait_start = std::time::Instant::now();
         let extract_permit = acquire_fetch_extract_permit(fetch_extract_limiter).await?;
+        let extract_permit_wait_ms = extract_wait_start.elapsed().as_millis();
         let v2_clone = v2.clone();
         let expected_integrity = integrity.map(str::to_string);
         let stream_file =
             v2.supports_streamed_object_ingest() && speculative_file_needs_streaming(unpacked_size);
-        run_speculative_blocking_extract(key_guard, extract_permit, move || {
-            if stream_file {
-                let file = std::fs::File::open(downloaded.file.path())?;
-                return v2_clone
-                    .extract_object_from_stream(
-                        std::io::BufReader::new(file),
+        let (stage, integrity_ms) =
+            run_speculative_blocking_extract(key_guard, extract_permit, move || {
+                if stream_file {
+                    let file = downloaded.file.reopen()?;
+                    return v2_clone
+                        .extract_object_from_stream_with_known_sha512(
+                            std::io::BufReader::new(file),
+                            &downloaded.sha512_sri,
+                            expected_integrity.as_deref(),
+                            lpm_registry::MAX_COMPRESSED_TARBALL_SIZE,
+                        )
+                        .map(|(_, _, stage)| (stage, 0));
+                }
+                v2_clone
+                    .extract_object_from_file_with_fresh_integrity_timed(
+                        downloaded.file.path(),
+                        &downloaded.sha512_sri,
                         expected_integrity.as_deref(),
-                        lpm_registry::MAX_COMPRESSED_TARBALL_SIZE,
                     )
-                    .map(|_| ());
-            }
-            v2_clone
-                .extract_object_from_file_with_fresh_integrity(
-                    downloaded.file.path(),
-                    &downloaded.sha512_sri,
-                    expected_integrity.as_deref(),
-                )
-                .map(|_| ())
-        })
-        .await?;
-        return Ok(SpeculativeFetchOutcome::Stored);
+                    .map(|(_, _, stage, integrity_ms)| (stage, integrity_ms))
+            })
+            .await?;
+        return Ok((
+            SpeculativeFetchOutcome::Stored,
+            TaskTimings::from_stage(
+                queue_wait_ms,
+                0,
+                download_ms,
+                integrity_ms,
+                extract_permit_wait_ms,
+                stage,
+            ),
+        ));
     }
 
     // Keep speculative downloads on the auth-aware route so custom registries
@@ -3629,6 +3666,7 @@ pub(super) async fn speculative_download_and_store(
     let response = client
         .download_tarball_streaming_routed_managed(route_table, name, url, install_accounting)
         .await?;
+    let download_headers_ms = download_start.elapsed().as_millis();
 
     // v1 path: streaming straight to the per-`(name, version)` slot.
     let byte_stream = response.bytes_stream().map_err(std::io::Error::other);
@@ -3638,8 +3676,11 @@ pub(super) async fn speculative_download_and_store(
     let integrity_c = integrity.map(|s| s.to_string());
     let store_owned = store.clone();
 
+    let extract_wait_start = std::time::Instant::now();
     let extract_permit = acquire_fetch_extract_permit(fetch_extract_limiter).await?;
-    run_speculative_blocking_extract(key_guard, extract_permit, move || {
+    let extract_permit_wait_ms = extract_wait_start.elapsed().as_millis();
+    let pipeline_start = std::time::Instant::now();
+    let stage = run_speculative_blocking_extract(key_guard, extract_permit, move || {
         let sync_reader = SyncIoBridge::new(async_reader);
         store_owned
             .stream_and_store_package(
@@ -3649,23 +3690,28 @@ pub(super) async fn speculative_download_and_store(
                 integrity_c.as_deref(),
                 lpm_registry::MAX_COMPRESSED_TARBALL_SIZE,
             )
-            .map(|_| ())
+            .map(|(_, _, stage)| stage)
     })
     .await?;
-    Ok(SpeculativeFetchOutcome::Stored)
+    Ok((
+        SpeculativeFetchOutcome::Stored,
+        TaskTimings::from_stage(queue_wait_ms, 0, 0, 0, extract_permit_wait_ms, stage)
+            .with_streaming_pipeline(download_headers_ms, 0, pipeline_start.elapsed().as_millis()),
+    ))
 }
 
 fn speculative_file_needs_streaming(unpacked_size: Option<std::num::NonZeroU64>) -> bool {
     unpacked_size.is_some_and(|size| size.get() >= SPECULATIVE_FILE_STREAMING_MIN_BYTES)
 }
 
-async fn run_speculative_blocking_extract<F>(
+async fn run_speculative_blocking_extract<T, F>(
     key_guard: tokio::sync::OwnedMutexGuard<()>,
     extract_permit: Option<tokio::sync::OwnedSemaphorePermit>,
     extract: F,
-) -> Result<(), LpmError>
+) -> Result<T, LpmError>
 where
-    F: FnOnce() -> Result<(), LpmError> + Send + 'static,
+    T: Send + 'static,
+    F: FnOnce() -> Result<T, LpmError> + Send + 'static,
 {
     run_blocking_extract(extract_permit, move || {
         let _key_guard = key_guard;

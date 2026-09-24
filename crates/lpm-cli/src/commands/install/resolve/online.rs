@@ -192,7 +192,7 @@ pub(in crate::commands::install) async fn run_online_resolution_phase(
         )?;
     }
 
-    let spec_tracker = SpeculativeKeyTracker::default();
+    let spec_tracker = SpeculativeKeyTracker::new(TimingDetailMode::from_env());
     let fetch_coord: Arc<FetchCoordinator> = fetch_coord;
     let mut speculation_join: Option<SpeculationJoin> = None;
     let mut fetch_overlap_join: Option<FetchOverlapJoin> = None;

@@ -606,9 +606,8 @@ fn decompress_gzip_libdeflate_with_limits_and_budget<'a>(
         isize_hint
     };
 
-    // The reservation includes the compressed input and stays attached to the
-    // decoded buffer through tar walking. The grow path replaces it only after
-    // dropping the smaller output allocation.
+    // Keep input and output reserved together until decoding succeeds. An owned
+    // input can then be dropped and its share released before tar walking.
     let mut budget = extract_budget.acquire(capacity.saturating_add(compressed.len()) as u64);
     let mut decompressor = libdeflater::Decompressor::new();
     loop {
@@ -715,6 +714,22 @@ impl AllocBudget {
 struct AllocBudgetGuard<'a> {
     budget: &'a AllocBudget,
     bytes: u64,
+}
+
+impl AllocBudgetGuard<'_> {
+    fn shrink_to(&mut self, bytes: u64) {
+        let retained = bytes.min(self.bytes);
+        let released = self.bytes - retained;
+        if released == 0 {
+            return;
+        }
+        let mut available = self.budget.lock_available();
+        *available = available
+            .saturating_add(released)
+            .min(PARALLEL_EXTRACT_BUDGET_BYTES);
+        self.bytes = retained;
+        self.budget.cv.notify_all();
+    }
 }
 
 impl Drop for AllocBudgetGuard<'_> {
@@ -1082,9 +1097,10 @@ where
     // from the original reader by the fallback decoder.
     match read_compressed_input(reader, limits.max_buffered_compressed_size)? {
         CompressedInput::Buffered(compressed) => extract_buffered_gzip_tarball(
-            &compressed,
+            std::borrow::Cow::Owned(compressed),
             target_dir,
             limits,
+            &EXTRACT_BUDGET,
             compute_blake3,
             buffer_predicate,
             inspector,
@@ -1126,9 +1142,10 @@ where
     }
 
     extract_buffered_gzip_tarball(
-        data,
+        std::borrow::Cow::Borrowed(data),
         target_dir,
         limits,
+        &EXTRACT_BUDGET,
         compute_blake3,
         buffer_predicate,
         inspector,
@@ -1136,9 +1153,10 @@ where
 }
 
 fn extract_buffered_gzip_tarball<P, I, E>(
-    compressed: &[u8],
+    compressed: std::borrow::Cow<'_, [u8]>,
     target_dir: &Path,
     limits: ExtractionLimits,
+    budget: &AllocBudget,
     compute_blake3: bool,
     buffer_predicate: P,
     inspector: I,
@@ -1148,18 +1166,26 @@ where
     I: FnMut(EntryInfo<'_>),
     E: ExtractionRecord,
 {
-    match decompress_gzip_libdeflate_with_limits(compressed, limits)? {
-        BufferedGzipDecode::Decoded(decompressed) => extract_tar_archive_with_inspector(
-            std::io::Cursor::new(decompressed),
-            target_dir,
-            limits,
-            compute_blake3,
-            buffer_predicate,
-            inspector,
-            |_| Ok(()),
-        ),
+    match decompress_gzip_libdeflate_with_limits_and_budget(&compressed, limits, budget)? {
+        BufferedGzipDecode::Decoded(mut decompressed) => {
+            if matches!(compressed, std::borrow::Cow::Owned(_)) {
+                drop(compressed);
+                decompressed
+                    ._budget
+                    .shrink_to(decompressed.data.capacity() as u64);
+            }
+            extract_tar_archive_with_inspector(
+                std::io::Cursor::new(decompressed),
+                target_dir,
+                limits,
+                compute_blake3,
+                buffer_predicate,
+                inspector,
+                |_| Ok(()),
+            )
+        }
         BufferedGzipDecode::NeedsStreaming => extract_streaming_gzip_tarball(
-            std::io::Cursor::new(compressed),
+            ReleasingPrefix(std::io::Cursor::new(compressed)),
             target_dir,
             limits,
             compute_blake3,
@@ -1171,7 +1197,26 @@ where
 
 enum CompressedInput<R> {
     Buffered(Vec<u8>),
-    Stream(std::io::Chain<std::io::Cursor<Vec<u8>>, R>),
+    Stream(std::io::Chain<ReleasingPrefix<Vec<u8>>, R>),
+}
+
+struct ReleasingPrefix<T>(std::io::Cursor<T>);
+
+impl<T: AsRef<[u8]> + Default> Read for ReleasingPrefix<T> {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        let read = self.0.read(buffer)?;
+        if self.0.position() >= self.0.get_ref().as_ref().len() as u64 {
+            self.0 = std::io::Cursor::new(T::default());
+        }
+        Ok(read)
+    }
+}
+
+#[cfg(test)]
+impl<T> ReleasingPrefix<T> {
+    fn get_ref(&self) -> &T {
+        self.0.get_ref()
+    }
 }
 
 fn read_compressed_input<R: std::io::Read>(
@@ -1193,7 +1238,7 @@ fn read_compressed_input<R: std::io::Read>(
             }
             compressed.extend_from_slice(&chunk[..read]);
             return Ok(CompressedInput::Stream(
-                std::io::Cursor::new(compressed).chain(reader),
+                ReleasingPrefix(std::io::Cursor::new(compressed)).chain(reader),
             ));
         }
 
@@ -2155,6 +2200,124 @@ mod tests {
             max_file_count: 1000,
             max_path_ledger_bytes: MAX_PATH_LEDGER_BYTES,
         }
+    }
+
+    #[test]
+    fn streaming_fallback_releases_replayed_prefix_before_reading_the_tail() {
+        struct ShortReads<R>(R);
+        impl<R: Read> Read for ShortReads<R> {
+            fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+                let length = buffer.len().min(1);
+                self.0.read(&mut buffer[..length])
+            }
+        }
+        let source = b"prefix-and-tail";
+        let CompressedInput::Stream(mut reader) =
+            read_compressed_input(ShortReads(source.as_slice()), 4).unwrap()
+        else {
+            panic!("input must exceed the buffered threshold");
+        };
+        assert_eq!(reader.read(&mut []).unwrap(), 0);
+        assert_eq!(reader.get_ref().0.get_ref().len(), 5);
+        let mut prefix = [0; 5];
+        reader.read_exact(&mut prefix).unwrap();
+        assert_eq!(&prefix, b"prefi");
+        assert_eq!(reader.get_ref().0.get_ref().capacity(), 0);
+        assert_eq!(reader.get_ref().1.0, &source[5..]);
+        let mut tail = Vec::new();
+        reader.read_to_end(&mut tail).unwrap();
+        assert_eq!(tail, source[5..]);
+    }
+
+    #[test]
+    fn streaming_fallback_releases_owned_complete_input_after_its_last_read() {
+        let input: std::borrow::Cow<'_, [u8]> = std::borrow::Cow::Owned(vec![1, 2, 3]);
+        let mut reader = ReleasingPrefix(std::io::Cursor::new(input));
+        assert_eq!(reader.read(&mut []).unwrap(), 0);
+        assert!(matches!(reader.get_ref(), std::borrow::Cow::Owned(_)));
+        let mut output = [0; 3];
+        reader.read_exact(&mut output).unwrap();
+        assert_eq!(output, [1, 2, 3]);
+        assert!(reader.get_ref().is_empty());
+        if let std::borrow::Cow::Owned(bytes) = reader.get_ref() {
+            assert_eq!(bytes.capacity(), 0);
+        }
+    }
+
+    #[test]
+    fn owned_buffered_input_releases_its_reservation_before_tar_walking() {
+        let tgz = create_test_tarball("payload.bin", b"contents");
+        let output_size = decompress_gzip_libdeflate(&tgz).unwrap().len() as u64;
+        let budget = AllocBudget {
+            available: std::sync::Mutex::new(PARALLEL_EXTRACT_BUDGET_BYTES),
+            cv: std::sync::Condvar::new(),
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let mut inspected = false;
+        let files: Vec<PathBuf> = extract_buffered_gzip_tarball(
+            std::borrow::Cow::Owned(tgz),
+            dir.path(),
+            DEFAULT_EXTRACTION_LIMITS,
+            &budget,
+            false,
+            |_, _| false,
+            |_| {
+                inspected = true;
+                assert_eq!(
+                    *budget.lock_available(),
+                    PARALLEL_EXTRACT_BUDGET_BYTES - output_size
+                );
+            },
+        )
+        .unwrap();
+        assert!(inspected);
+        assert_eq!(files, [PathBuf::from("payload.bin")]);
+        assert_eq!(*budget.lock_available(), PARALLEL_EXTRACT_BUDGET_BYTES);
+    }
+
+    #[test]
+    fn borrowed_buffered_input_keeps_its_reservation_during_tar_walking() {
+        let tgz = create_test_tarball("payload.bin", b"contents");
+        let output_size = decompress_gzip_libdeflate(&tgz).unwrap().len() as u64;
+        let budget = AllocBudget {
+            available: std::sync::Mutex::new(PARALLEL_EXTRACT_BUDGET_BYTES),
+            cv: std::sync::Condvar::new(),
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let mut inspected = false;
+        let _: Vec<PathBuf> = extract_buffered_gzip_tarball(
+            std::borrow::Cow::Borrowed(&tgz),
+            dir.path(),
+            DEFAULT_EXTRACTION_LIMITS,
+            &budget,
+            false,
+            |_, _| false,
+            |_| {
+                inspected = true;
+                assert_eq!(
+                    *budget.lock_available(),
+                    PARALLEL_EXTRACT_BUDGET_BYTES - output_size - tgz.len() as u64
+                );
+            },
+        )
+        .unwrap();
+        assert!(inspected);
+        assert_eq!(*budget.lock_available(), PARALLEL_EXTRACT_BUDGET_BYTES);
+    }
+
+    #[test]
+    fn shrinking_allocation_reservation_preserves_ownership_until_drop() {
+        let budget = AllocBudget {
+            available: std::sync::Mutex::new(PARALLEL_EXTRACT_BUDGET_BYTES),
+            cv: std::sync::Condvar::new(),
+        };
+        let mut reservation = budget.acquire(100);
+        reservation.shrink_to(40);
+        assert_eq!(*budget.lock_available(), PARALLEL_EXTRACT_BUDGET_BYTES - 40);
+        reservation.shrink_to(80);
+        assert_eq!(*budget.lock_available(), PARALLEL_EXTRACT_BUDGET_BYTES - 40);
+        drop(reservation);
+        assert_eq!(*budget.lock_available(), PARALLEL_EXTRACT_BUDGET_BYTES);
     }
 
     #[test]

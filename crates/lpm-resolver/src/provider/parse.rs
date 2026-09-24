@@ -147,13 +147,6 @@ struct ProjectedVersion {
     dist: CachedDistInfo,
 }
 
-struct ProjectedDependency {
-    range: String,
-    alias: Option<String>,
-    optional: bool,
-    bundled: bool,
-}
-
 fn project_borrowed_version(
     version: &str,
     metadata: &lpm_registry::VersionMetadata,
@@ -294,83 +287,53 @@ fn parse_projected_metadata(
             continue;
         }
         if let Ok(version) = NpmVersion::parse(&ver_str) {
-            let mut dependencies = HashMap::with_capacity(
-                projected.dependencies.len() + projected.optional_dependencies.len(),
+            let mut regular_dependencies = projected.dependencies;
+            let bundled_names: HashSet<&str> = projected
+                .bundle_dependencies
+                .iter()
+                .map(String::as_str)
+                .filter(|name| {
+                    is_valid_dep_name(name)
+                        && (regular_dependencies.contains_key(*name)
+                            || projected.optional_dependencies.contains_key(*name))
+                })
+                .collect();
+            let mut dependencies = Vec::with_capacity(
+                regular_dependencies.len() + projected.optional_dependencies.len(),
+            );
+            let parse_dependency = |name: String, raw_range: String, optional: bool| {
+                if !is_valid_dep_name(&name) {
+                    tracing::debug!("skipping invalid dep name: {name:?}");
+                    return None;
+                }
+                let (range, alias) = split_alias(raw_range);
+                if alias
+                    .as_ref()
+                    .is_some_and(|target| !is_valid_dep_name(target))
+                {
+                    tracing::debug!("skipping alias dep {name:?}: invalid target {alias:?}");
+                    return None;
+                }
+                Some(ManifestDependency {
+                    bundled: bundled_names.contains(name.as_str()),
+                    name,
+                    range,
+                    alias,
+                    optional,
+                })
+            };
+            for (name, range) in projected.optional_dependencies {
+                if let Some(dependency) = parse_dependency(name, range, true) {
+                    regular_dependencies.remove(&dependency.name);
+                    dependencies.push(dependency);
+                }
+            }
+            dependencies.extend(
+                regular_dependencies
+                    .into_iter()
+                    .filter_map(|(name, range)| parse_dependency(name, range, false)),
             );
 
-            for (dep_name, dep_range) in projected.dependencies {
-                if !is_valid_dep_name(&dep_name) {
-                    tracing::debug!("skipping invalid dep name: {dep_name:?}");
-                    continue;
-                }
-                let (inner_range, target) = split_alias(dep_range);
-                let alias = if let Some(target) = target {
-                    if !is_valid_dep_name(&target) {
-                        tracing::debug!(
-                            "skipping alias dep {dep_name:?}: invalid target name {target:?}"
-                        );
-                        continue;
-                    }
-                    Some(target)
-                } else {
-                    None
-                };
-                dependencies.insert(
-                    dep_name,
-                    ProjectedDependency {
-                        range: inner_range,
-                        alias,
-                        optional: false,
-                        bundled: false,
-                    },
-                );
-            }
-
-            for (dep_name, dep_range) in projected.optional_dependencies {
-                if !is_valid_dep_name(&dep_name) {
-                    tracing::debug!("skipping invalid optional dep name: {dep_name:?}");
-                    continue;
-                }
-                let (inner_range, target) = split_alias(dep_range);
-                let alias = if let Some(target) = target {
-                    if !is_valid_dep_name(&target) {
-                        tracing::debug!(
-                            "skipping optional alias dep {dep_name:?}: invalid target name {target:?}"
-                        );
-                        continue;
-                    }
-                    Some(target)
-                } else {
-                    None
-                };
-                dependencies.insert(
-                    dep_name,
-                    ProjectedDependency {
-                        range: inner_range,
-                        alias,
-                        optional: true,
-                        bundled: false,
-                    },
-                );
-            }
-
-            for name in projected.bundle_dependencies {
-                if !is_valid_dep_name(&name) {
-                    tracing::debug!("skipping invalid bundleDependency name: {name:?}");
-                    continue;
-                }
-                if let Some(dependency) = dependencies.get_mut(&name) {
-                    dependency.bundled = true;
-                }
-            }
-
-            let optional_peers = projected
-                .peer_dependencies_meta
-                .into_iter()
-                .filter_map(|(name, metadata)| {
-                    (metadata.optional && is_valid_dep_name(&name)).then_some(name)
-                })
-                .collect::<HashSet<_>>();
             let mut peer_dependencies = Vec::with_capacity(projected.peer_dependencies.len());
             for (peer_name, peer_range) in projected.peer_dependencies {
                 if !is_valid_dep_name(&peer_name) {
@@ -390,7 +353,10 @@ fn parse_projected_metadata(
                     None
                 };
                 peer_dependencies.push(ManifestPeerDependency {
-                    optional: optional_peers.contains(&peer_name),
+                    optional: projected
+                        .peer_dependencies_meta
+                        .get(&peer_name)
+                        .is_some_and(|metadata| metadata.optional),
                     name: peer_name,
                     range,
                     alias,
@@ -410,16 +376,7 @@ fn parse_projected_metadata(
             });
             builder.push(ManifestVersion {
                 version,
-                dependencies: dependencies
-                    .into_iter()
-                    .map(|(name, dependency)| ManifestDependency {
-                        name,
-                        range: dependency.range,
-                        alias: dependency.alias,
-                        optional: dependency.optional,
-                        bundled: dependency.bundled,
-                    })
-                    .collect(),
+                dependencies,
                 peer_dependencies,
                 node_engine: projected.node_engine,
                 platform,

@@ -1000,6 +1000,31 @@ pub(super) fn blocked_set_metadata_from_previous_state(
     metadata
 }
 
+fn blocked_metadata_for_versions(
+    mut full: lpm_registry::PackageMetadata,
+    versions: &[&str],
+) -> lpm_registry::types::BlockedSetPackageMeta {
+    let mut selected = lpm_registry::types::BlockedSetPackageMeta {
+        time: HashMap::with_capacity(versions.len()),
+        versions: HashMap::with_capacity(versions.len()),
+    };
+    for &version in versions {
+        if let Some(manifest) = full.versions.remove(version) {
+            selected.versions.insert(
+                version.to_owned(),
+                lpm_registry::types::BlockedSetVersionMeta {
+                    behavioral_tags: manifest.behavioral_tags,
+                    dist: manifest.dist.map(Into::into),
+                },
+            );
+            if let Some(time) = full.time.remove(version) {
+                selected.time.insert(version.to_owned(), time);
+            }
+        }
+    }
+    selected
+}
+
 /// Never returns an error: metadata enrichment is best-effort and
 /// must not fail an otherwise-successful install. Any fetch error
 /// is recorded as "no entry for this package" and the install
@@ -1050,53 +1075,49 @@ pub(super) async fn build_blocked_set_metadata(
         }
     }
 
+    let mut groups: HashMap<(&str, bool), Vec<&str>> =
+        HashMap::with_capacity(metadata_packages.len());
+    for package in &metadata_packages {
+        groups
+            .entry((&package.name, package.is_lpm))
+            .or_default()
+            .push(&package.version);
+    }
     let meta_ns = std::sync::atomic::AtomicU64::new(0);
     let meta_ns_ref = &meta_ns;
-    let entry_futures = metadata_packages.iter().map(|&p| async move {
-        // Grab the full PackageMetadata for `time[version]` (→
-        // `published_at`) and `versions[version]._behavioralTags` (→
-        // `behavioral_tags_hash` + `behavioral_tags`). Errors are
-        // swallowed per the graceful-degradation contract above.
-        let meta_start = std::time::Instant::now();
-        // `get_npm_blocked_set_meta` deserializes only `time` + `_behavioralTags`
-        // on cache hits, avoiding the full `PackageMetadata` allocation cost.
-        let meta: Option<lpm_registry::types::BlockedSetPackageMeta> = if p.is_lpm {
-            match lpm_common::PackageName::parse(&p.name) {
-                Ok(pkg_name) => client
-                    .get_package_metadata(&pkg_name)
+    let metadata_futures = groups
+        .into_iter()
+        .map(|((name, is_lpm), versions)| async move {
+            let meta_start = std::time::Instant::now();
+            let meta: Option<lpm_registry::types::BlockedSetPackageMeta> = if is_lpm {
+                match lpm_common::PackageName::parse(name) {
+                    Ok(pkg_name) => client
+                        .get_package_metadata(&pkg_name)
+                        .await
+                        .ok()
+                        .map(|full| blocked_metadata_for_versions(full, &versions)),
+                    Err(_) => None,
+                }
+            } else {
+                let route = route_table.route_for_package(name);
+                client
+                    .get_npm_blocked_set_meta_for_versions(name, &versions, route)
                     .await
-                    .ok()
-                    .map(|full| lpm_registry::types::BlockedSetPackageMeta {
-                        time: full.time,
-                        versions: full
-                            .versions
-                            .into_iter()
-                            .map(|(k, v)| {
-                                (
-                                    k,
-                                    lpm_registry::types::BlockedSetVersionMeta {
-                                        behavioral_tags: v.behavioral_tags,
-                                        dist: v.dist.map(Into::into),
-                                    },
-                                )
-                            })
-                            .collect(),
-                    }),
-                Err(_) => None,
-            }
-        } else {
-            // follow-up: route via RouteTable so
-            // blocked-set metadata capture for custom-registry
-            // packages doesn't fall through to public npm.
-            let route = route_table.route_for_package(&p.name);
-            client.get_npm_blocked_set_meta(&p.name, route).await
-        };
-        meta_ns_ref.fetch_add(
-            meta_start.elapsed().as_nanos() as u64,
-            std::sync::atomic::Ordering::Relaxed,
-        );
-
-        let meta = meta?;
+            };
+            meta_ns_ref.fetch_add(
+                meta_start.elapsed().as_nanos() as u64,
+                std::sync::atomic::Ordering::Relaxed,
+            );
+            ((name, is_lpm), meta)
+        });
+    let metadata_by_source: HashMap<_, _> = futures::future::join_all(metadata_futures)
+        .await
+        .into_iter()
+        .collect();
+    let entries = metadata_packages.iter().filter_map(|&p| {
+        let meta = metadata_by_source
+            .get(&(p.name.as_str(), p.is_lpm))?
+            .as_ref()?;
         let version_meta = meta.versions.get(&p.version)?;
         let expected_integrity = p.integrity.as_deref()?;
         let dist = version_meta.dist.as_ref()?;
@@ -1150,15 +1171,7 @@ pub(super) async fn build_blocked_set_metadata(
         }
     });
 
-    // Sequential insert into `out` after the concurrent fetches land.
-    // Order is deterministic because `join_all` preserves the input order
-    // and the downstream `BlockedSetMetadata` is keyed by (name, version)
-    // — identical output to the serial loop.
-    for (name, version, integrity, e) in futures::future::join_all(entry_futures)
-        .await
-        .into_iter()
-        .flatten()
-    {
+    for (name, version, integrity, e) in entries {
         out.insert(name, version, integrity, e);
     }
 
@@ -1184,3 +1197,42 @@ pub(super) fn package_requires_blocked_set_metadata(
 }
 
 // is_install_up_to_date() moved to crate::install_state::check_install_state()
+
+#[cfg(test)]
+mod metadata_projection_tests {
+    use super::blocked_metadata_for_versions;
+
+    #[test]
+    fn blocked_metadata_projection_retains_only_requested_versions_and_their_bindings() {
+        let full: lpm_registry::PackageMetadata = serde_json::from_value(serde_json::json!({
+        "name":"pkg", "time":{"1.0.0":"one","2.0.0":"two","3.0.0":"three"},
+        "versions":{
+            "1.0.0":{"name":"pkg","version":"1.0.0","dist":{"integrity":"sha512-one"},"_behavioralTags":{"network":true}},
+            "2.0.0":{"name":"pkg","version":"2.0.0","dist":{"integrity":"sha512-two"}},
+            "3.0.0":{"name":"pkg","version":"3.0.0"}
+        }
+    })).unwrap();
+        let selected = blocked_metadata_for_versions(full, &["1.0.0", "2.0.0", "2.0.0", "missing"]);
+        assert_eq!(selected.versions.len(), 2);
+        assert_eq!(selected.time.len(), 2);
+        assert_eq!(selected.time["1.0.0"], "one");
+        assert_eq!(selected.time["2.0.0"], "two");
+        assert_eq!(
+            selected.versions["1.0.0"]
+                .dist
+                .as_ref()
+                .unwrap()
+                .integrity_or_shasum()
+                .as_deref(),
+            Some("sha512-one")
+        );
+        assert!(
+            selected.versions["1.0.0"]
+                .behavioral_tags
+                .as_ref()
+                .unwrap()
+                .active_tag_names()
+                .contains(&"network")
+        );
+    }
+}

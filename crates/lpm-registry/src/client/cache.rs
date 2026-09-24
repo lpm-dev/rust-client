@@ -16,7 +16,7 @@ pub(super) const METADATA_CACHE_TTL: std::time::Duration = std::time::Duration::
 /// cache entries continue to decode after a transport-limit reduction, while
 /// pathological files collapse to a cache miss before any decode work happens.
 pub(super) const METADATA_CACHE_FILE_CAP: u64 = 100 * 1024 * 1024;
-const METADATA_CACHE_ETAG_LINE_CAP: u64 = 8 * 1024;
+pub(super) const METADATA_CACHE_ETAG_LINE_CAP: u64 = 8 * 1024;
 const METADATA_CACHE_FRESHNESS_LINE_CAP: u64 = 20;
 pub(super) const MAX_PENDING_METADATA_CACHE_BYTES: usize = 128 * 1024 * 1024;
 // MessagePack reserves 0xc1, so older readers treat JSON fallback entries as misses.
@@ -553,6 +553,7 @@ impl RegistryClient {
     /// cannot invalidate those entries. Callers on the custom-registry
     /// path MUST use [`Self::invalidate_custom_metadata_cache`] instead.
     pub fn invalidate_metadata_cache(&self, package_name: &str) {
+        self.history_cache.invalidate();
         if package_name.starts_with("@lpm.dev/") {
             if let Ok(key) = self.lpm_metadata_cache_key(package_name) {
                 self.invalidate_metadata_cache_key(&key);
@@ -560,6 +561,9 @@ impl RegistryClient {
         } else {
             let direct_key = self.npm_direct_metadata_cache_key(package_name);
             self.invalidate_metadata_cache_key(&direct_key);
+            self.invalidate_metadata_cache_key(
+                &self.npm_preferred_metadata_cache_key(package_name),
+            );
             if let Ok(worker_key) = self.npm_worker_metadata_cache_key(package_name) {
                 self.invalidate_metadata_cache_key(&worker_key);
             }
@@ -574,8 +578,11 @@ impl RegistryClient {
     /// version that failed and clears this cache alongside the package-level
     /// metadata cache.
     pub fn invalidate_npm_version_metadata_cache(&self, package_name: &str, version: &str) {
+        self.history_cache.invalidate();
         let cache_key = self.npm_direct_version_metadata_cache_key(package_name, version);
         self.invalidate_metadata_cache_key(&cache_key);
+        let selected_key = self.npm_selected_history_cache_key(package_name, version);
+        self.invalidate_metadata_cache_key(&selected_key);
         tracing::debug!("invalidated npm version metadata cache for {package_name}@{version}");
     }
 
@@ -695,6 +702,7 @@ impl RegistryClient {
     /// content (~68 KB × N packages on every blocked-set capture call). Old caches
     /// in JSON or positional-array msgpack format trigger a cache miss here (returns
     /// `None`) and are rewritten in named-format msgpack on the next fetch.
+    #[cfg(test)]
     pub(super) fn read_metadata_cache_as<T: serde::de::DeserializeOwned>(
         &self,
         key: &str,
@@ -703,6 +711,7 @@ impl RegistryClient {
         Self::read_metadata_cache_path_as(&path)
     }
 
+    #[cfg(test)]
     pub(super) fn read_metadata_cache_path_as<T: serde::de::DeserializeOwned>(
         path: &std::path::Path,
     ) -> Option<(T, Option<String>)> {

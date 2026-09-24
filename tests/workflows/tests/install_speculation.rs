@@ -34,7 +34,9 @@ async fn install_fetches_optional_tarball_while_other_metadata_is_pending() {
         .and(path(MockRegistry::tarball_path("native", "1.0.0")))
         .respond_with(move |_: &Request| {
             fetched.store(true, Ordering::SeqCst);
-            ResponseTemplate::new(200).set_body_bytes(native_tarball.clone())
+            ResponseTemplate::new(200)
+                .set_body_bytes(native_tarball.clone())
+                .set_delay(std::time::Duration::from_millis(20))
         })
         .with_priority(1)
         .mount(registry.server())
@@ -73,8 +75,10 @@ async fn install_fetches_optional_tarball_while_other_metadata_is_pending() {
     project.write_file(".npmrc", &format!("registry={}/\n", registry.url()));
     let output = lpm_with_registry(&project, &registry.url())
         .env("LPM_GREEDY_FUSION", "1")
+        .env("LPM_TIMING_DETAIL", "trace")
         .env("LPM_RETRY_BACKOFF_MS_OVERRIDE", "500")
         .args([
+            "--json",
             "install",
             "--no-security-summary",
             "--no-skills",
@@ -101,4 +105,15 @@ async fn install_fetches_optional_tarball_while_other_metadata_is_pending() {
         1,
         "the authoritative fetch must reuse the speculative tarball"
     );
+    let envelope: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let work = &envelope["timing"]["speculative"]["work"];
+    assert!(
+        work["task_count"].as_u64().is_some_and(|count| count > 0),
+        "{work}"
+    );
+    let tasks = work["slow_packages"]["fetch_tasks"]["by_total"]
+        .as_array()
+        .expect("speculative work must retain per-package stage timings");
+    assert!(tasks.iter().any(|task| task["package"] == "native@1.0.0"
+        && task["file_count"].as_u64().is_some_and(|count| count > 0)));
 }

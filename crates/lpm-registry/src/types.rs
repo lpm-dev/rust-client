@@ -2,6 +2,8 @@
 //!
 //! Strongly typed structs matching the JSON responses from every endpoint.
 
+mod version_metadata;
+
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
 use std::collections::HashMap;
@@ -67,6 +69,7 @@ pub struct PackageMetadata {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(try_from = "version_metadata::VersionMetadataWire")]
 pub struct VersionMetadata {
     pub name: String,
     pub version: String,
@@ -107,8 +110,8 @@ pub struct VersionMetadata {
 
     /// Names this version vendors inside its published tarball's
     /// `node_modules/` dir. npm's spec accepts both `bundleDependencies`
-    /// and `bundledDependencies` spellings; both deserialize into this
-    /// field. Consumers skip enqueuing these names as separate installs —
+    /// and `bundledDependencies` spellings. When both occur, the canonical
+    /// `bundleDependencies` field takes precedence. Consumers skip these names —
     /// they're already provided by the parent's tarball.
     #[serde(
         default,
@@ -2184,6 +2187,56 @@ mod tests {
                 .map(|meta| meta.optional),
             Some(true)
         );
+    }
+
+    #[test]
+    fn bundle_alias_and_existing_positional_messagepack_remain_readable() {
+        let alias: VersionMetadata = serde_json::from_str(
+            r#"{"name":"pkg","version":"1.0.0","bundledDependencies":["vendored"]}"#,
+        )
+        .unwrap();
+        assert_eq!(alias.bundle_dependencies, vec!["vendored"]);
+        let original = VersionMetadata {
+            publication_status: Some("published".into()),
+            deprecated: Some(serde_json::json!("old")),
+            scripts: Some(HashMap::from([("install".into(), "node build.js".into())])),
+            has_install_script: Some(true),
+            optional_dependencies: HashMap::from([("native".into(), "^1".into())]),
+            os: vec!["darwin".into()],
+            ..alias
+        };
+        let decoded: VersionMetadata =
+            rmp_serde::from_slice(&rmp_serde::to_vec(&original).unwrap()).unwrap();
+        assert_eq!(
+            serde_json::to_value(decoded).unwrap(),
+            serde_json::to_value(original).unwrap()
+        );
+    }
+
+    #[test]
+    fn canonical_bundle_dependencies_take_precedence_over_alias_in_both_orders() {
+        for (canonical, alias, expected) in [
+            (r#"["primary"]"#, r#"["alias"]"#, vec!["primary"]),
+            ("[]", r#"["alias"]"#, vec![]),
+            ("null", r#"["alias"]"#, vec![]),
+            ("false", r#"["alias"]"#, vec![]),
+            (r#"["primary"]"#, r#"{"malformed":true}"#, vec!["primary"]),
+        ] {
+            for fields in [
+                format!(r#""bundleDependencies":{canonical},"bundledDependencies":{alias}"#),
+                format!(r#""bundledDependencies":{alias},"bundleDependencies":{canonical}"#),
+            ] {
+                let document = format!(r#"{{"name":"pkg","version":"1.0.0",{fields}}}"#);
+                let version: VersionMetadata = serde_json::from_str(&document).unwrap();
+                assert_eq!(version.bundle_dependencies, expected, "{document}");
+                let packument = format!(r#"{{"name":"pkg","versions":{{"1.0.0":{document}}}}}"#);
+                let full: PackageMetadata = serde_json::from_str(&packument).unwrap();
+                assert_eq!(full.versions["1.0.0"].bundle_dependencies, expected);
+                let cache: VersionMetadata =
+                    rmp_serde::from_slice(&rmp_serde::to_vec_named(&version).unwrap()).unwrap();
+                assert_eq!(cache.bundle_dependencies, expected);
+            }
+        }
     }
 
     #[test]

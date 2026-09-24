@@ -600,12 +600,27 @@ fn ensure_matching_stored_integrity(
     )))
 }
 
+#[derive(Clone)]
+enum CanonicalSha512 {
+    Computing(Sha512),
+    Known([u8; 64]),
+}
+
+impl CanonicalSha512 {
+    fn finalize(self) -> [u8; 64] {
+        match self {
+            Self::Computing(hasher) => hasher.finalize().into(),
+            Self::Known(digest) => digest,
+        }
+    }
+}
+
 /// Transparent `Read` wrapper that computes the canonical SHA-512 tarball
 /// identity inline with extraction. The declared-integrity constructor adds
 /// SHA-256 or SHA-1 only when the declaration requires it.
 pub(crate) struct HashingReader<R> {
     inner: R,
-    sha512: Sha512,
+    sha512: CanonicalSha512,
     sha256: Option<sha2::Sha256>,
     sha1: Option<Sha1>,
     bytes: u64,
@@ -622,7 +637,7 @@ impl<R: std::io::Read> HashingReader<R> {
         use sha2::Digest;
         Self {
             inner,
-            sha512: Sha512::new(),
+            sha512: CanonicalSha512::Computing(Sha512::new()),
             sha256: Some(sha2::Sha256::new()),
             sha1: Some(Sha1::new()),
             bytes: 0,
@@ -639,12 +654,31 @@ impl<R: std::io::Read> HashingReader<R> {
             .map(|integrity| integrity.algorithm);
         Ok(Self {
             inner,
-            sha512: Sha512::new(),
+            sha512: CanonicalSha512::Computing(Sha512::new()),
             sha256: matches!(expected_algorithm, Some(HashAlgorithm::Sha256))
                 .then(sha2::Sha256::new),
             sha1: matches!(expected_algorithm, Some(HashAlgorithm::Sha1)).then(Sha1::new),
             bytes: 0,
         })
+    }
+
+    pub(crate) fn with_known_sha512(
+        inner: R,
+        canonical_sri: &str,
+        expected_integrity: Option<&str>,
+    ) -> Result<Self, LpmError> {
+        let canonical = Integrity::parse(canonical_sri)?;
+        if canonical.algorithm != HashAlgorithm::Sha512 {
+            return Err(LpmError::Store(
+                "known tarball identity must use SHA-512".into(),
+            ));
+        }
+        let digest: [u8; 64] = canonical.hash.try_into().map_err(|_| {
+            LpmError::Store("known tarball SHA-512 identity must contain 64 bytes".into())
+        })?;
+        let mut reader = Self::for_expected_integrity(inner, expected_integrity)?;
+        reader.sha512 = CanonicalSha512::Known(digest);
+        Ok(reader)
     }
 
     /// Finalize all hashers and return `(sha512_sri, sha256_sri, sha1_sri, total_bytes)`.
@@ -729,7 +763,9 @@ impl<R: std::io::Read> std::io::Read for HashingReader<R> {
         use sha2::Digest;
         let n = self.inner.read(buf)?;
         if n > 0 {
-            self.sha512.update(&buf[..n]);
+            if let CanonicalSha512::Computing(hasher) = &mut self.sha512 {
+                hasher.update(&buf[..n]);
+            }
             if let Some(hasher) = &mut self.sha256 {
                 hasher.update(&buf[..n]);
             }
@@ -1098,6 +1134,22 @@ mod tests {
         assert!(sha512_sri.starts_with("sha512-"));
         assert!(sha256_sri.starts_with("sha256-"));
         assert!(sha1_sri.starts_with("sha1-"));
+    }
+
+    #[test]
+    fn known_sha512_reader_reuses_the_digest_without_rehashing_stream_bytes() {
+        let bytes = b"already downloaded and hashed";
+        let canonical = compute_sri_hash(bytes);
+        let expected = compute_sri_hash_sha256(bytes);
+        let mut reader =
+            HashingReader::with_known_sha512(bytes.as_slice(), &canonical, Some(&expected))
+                .unwrap();
+        std::io::copy(&mut reader, &mut std::io::sink()).unwrap();
+        assert!(matches!(reader.sha512, CanonicalSha512::Known(_)));
+        assert_eq!(reader.canonical_sha512_sri(), canonical);
+        assert_eq!(reader.integrity_sri(HashAlgorithm::Sha256), Some(expected));
+        assert!(reader.sha1.is_none());
+        assert_eq!(reader.bytes, bytes.len() as u64);
     }
 
     #[test]

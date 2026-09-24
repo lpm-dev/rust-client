@@ -167,8 +167,8 @@ const dryRun = Boolean(args.dryRun);
 validateManagers(managers);
 validateScriptPolicy(scriptPolicy);
 validateLpmTyposquatGuard(lpmTyposquatGuard);
-if (modes.includes('ci-cold') && managers.some((manager) => manager !== 'lpm')) {
-  throw new Error('--modes ci-cold currently supports only the lpm manager');
+if (modes.includes('ci-cold') && managers.some((manager) => !['lpm', 'bun'].includes(manager))) {
+  throw new Error('--modes ci-cold supports only lpm and bun');
 }
 if (lpmComparison && !managers.includes('lpm')) {
   throw new Error('--lpm-compare requires lpm in --managers');
@@ -241,7 +241,7 @@ for (let sample = 1; sample <= samples; sample += 1) {
       }
     }
     const referenceSpecs = runSpecs.filter((spec) => !pairedSpecIds.has(spec.id));
-    for (const spec of rotated(referenceSpecs, sample - 1)) {
+    for (const spec of balancedReferenceOrder(referenceSpecs, sample)) {
       const rowSet = runInstallSpec({ sample, fixture, spec, modes });
       rows.push(...rowSet);
     }
@@ -350,7 +350,13 @@ function runInstallSpec({ sample, fixture, spec, modes }) {
     if (shouldMeasureCiCold) {
       if (installedOk) {
         cleanProjectForWarm(projectDir);
-        cleanLpmDependencyState(lpmHome);
+        if (spec.manager === 'bun') {
+          removeTree(env.BUN_INSTALL_CACHE_DIR);
+          assert.equal(fs.existsSync(env.BUN_INSTALL_CACHE_DIR), false);
+          assert.equal(fs.existsSync(path.join(projectDir, 'bun.lock')) || fs.existsSync(path.join(projectDir, 'bun.lockb')), true);
+        } else {
+          cleanLpmDependencyState(lpmHome);
+        }
         const row = measureInstall({
           sample,
           fixture,
@@ -2120,6 +2126,13 @@ function splitOnce(value, delimiter) {
   return [value.slice(0, index), value.slice(index + delimiter.length)];
 }
 
+function balancedReferenceOrder(specs, sample) {
+  const order = rotated(specs, sample - 1);
+  return specs.length > 0 && Math.floor((sample - 1) / specs.length) % 2 === 1
+    ? order.reverse()
+    : order;
+}
+
 function rotated(values, offset) {
   if (values.length <= 1) {
     return values;
@@ -2352,6 +2365,16 @@ function isWarningLikeLine(line) {
 }
 
 function runSelfTests() {
+  for (const count of [2, 3, 4]) {
+    const specs = Array.from({length: count}, (_, index) => index);
+    const orders = Array.from({length: count * 2}, (_, sample) => balancedReferenceOrder(specs, sample + 1));
+    for (const x of specs) {
+      for (const position of specs) assert.equal(orders.filter(order => order[position] === x).length, 2);
+      for (const y of specs.filter(y => y !== x)) assert.equal(orders.filter(order => order.indexOf(x) < order.indexOf(y)).length, count);
+    }
+  }
+  assert.deepEqual(balancedReferenceOrder([], 1), []);
+
   assert.deepEqual(parseModes('cold,ci-cold,warm,up-to-date'), [
     'cold',
     'ci-cold',

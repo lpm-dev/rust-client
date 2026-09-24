@@ -55,6 +55,7 @@ mod api;
 mod body;
 mod cache;
 mod firewall;
+mod history_reuse;
 mod http_tls;
 mod install_accounting;
 mod metadata;

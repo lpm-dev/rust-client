@@ -1,5 +1,8 @@
 use super::*;
 
+mod preferred;
+mod version_selection;
+
 #[derive(Clone, Copy, Eq, PartialEq)]
 enum MetadataCachePolicy {
     UseFresh,
@@ -487,16 +490,19 @@ impl RegistryClient {
         name: &str,
         version: &str,
     ) -> String {
+        self.npm_version_metadata_cache_key("npm-direct-version", name, version)
+    }
+
+    pub(super) fn npm_selected_history_cache_key(&self, name: &str, version: &str) -> String {
+        self.npm_version_metadata_cache_key("npm-direct-selected-full", name, version)
+    }
+
+    fn npm_version_metadata_cache_key(&self, namespace: &str, name: &str, version: &str) -> String {
         let mut document = String::with_capacity(name.len() + version.len() + 1);
         document.push_str(name);
         document.push('@');
         document.push_str(version);
-        self.metadata_cache_key_for_origin(
-            "npm-direct-version",
-            &self.npm_registry_url,
-            &document,
-            None,
-        )
+        self.metadata_cache_key_for_origin(namespace, &self.npm_registry_url, &document, None)
     }
 
     pub(super) fn npm_worker_full_metadata_cache_key(
@@ -1929,150 +1935,398 @@ impl RegistryClient {
         name: &str,
         version: &str,
     ) -> Result<TimedPackageMetadata, LpmError> {
-        crate::timing::record_metadata_request(name);
-        let cache_key = self.npm_direct_version_metadata_cache_key(name, version);
-        let mut timings = PackageMetadataFetchTimings::default();
+        self.get_npm_version_metadata_direct_attempt(name, version)
+            .await
+            .map_err(|failure| failure.error)
+    }
 
-        let cache_read_start = std::time::Instant::now();
-        if let Some((cached, _etag)) = self.read_metadata_cache_async(&cache_key).await
-            && batch_metadata_entry_matches_name(name, &cached)
-        {
+    /// Fetch an exact manifest while retaining measured work when it fails.
+    pub async fn get_npm_version_metadata_direct_attempt(
+        &self,
+        name: &str,
+        version: &str,
+    ) -> Result<TimedPackageMetadata, Box<PackageMetadataFetchError>> {
+        let (result, timings) = self
+            .get_npm_selected_version_with_timings(name, version, false)
+            .await;
+        result.map_err(|error| Box::new(PackageMetadataFetchError { error, timings }))
+    }
+
+    /// Select one authoritative version from a capped, full npm package history.
+    /// Falls back to the version endpoint when the history is unavailable or too large.
+    pub async fn get_npm_version_from_history_with_timings(
+        &self,
+        name: &str,
+        version: &str,
+    ) -> Result<TimedPackageMetadata, LpmError> {
+        self.get_npm_version_from_history_attempt(name, version)
+            .await
+            .map_err(|failure| failure.error)
+    }
+
+    /// Select a full-history manifest with exact fallback and cumulative failure timings.
+    pub async fn get_npm_version_from_history_attempt(
+        &self,
+        name: &str,
+        version: &str,
+    ) -> Result<TimedPackageMetadata, Box<PackageMetadataFetchError>> {
+        let (result, failed_timings) = self
+            .get_npm_selected_version_with_timings(name, version, true)
+            .await;
+        match result {
+            Ok(metadata) => Ok(metadata),
+            Err(error) => {
+                tracing::debug!("selected npm history for {name}@{version} unavailable: {error}");
+                match self
+                    .get_npm_version_metadata_direct_attempt(name, version)
+                    .await
+                {
+                    Ok(mut fallback) => {
+                        fallback.timings.add_attempt(&failed_timings);
+                        Ok(fallback)
+                    }
+                    Err(mut failure) => {
+                        failure.timings.add_attempt(&failed_timings);
+                        Err(failure)
+                    }
+                }
+            }
+        }
+    }
+
+    async fn get_npm_selected_version_with_timings(
+        &self,
+        name: &str,
+        version: &str,
+        from_history: bool,
+    ) -> (
+        Result<TimedPackageMetadata, LpmError>,
+        PackageMetadataFetchTimings,
+    ) {
+        crate::timing::record_metadata_request(name);
+        let cache_key = if from_history {
+            self.npm_selected_history_cache_key(name, version)
+        } else {
+            self.npm_direct_version_metadata_cache_key(name, version)
+        };
+        let mut timings = PackageMetadataFetchTimings {
+            selected_from_history: from_history,
+            ..PackageMetadataFetchTimings::default()
+        };
+
+        let result = async {
+            let cache_read_start = std::time::Instant::now();
+            if let Some((cached, _etag)) = self.read_metadata_cache_async(&cache_key).await
+                && batch_metadata_entry_matches_name(name, &cached)
+            {
+                timings.cache_read_ms = cache_read_start.elapsed().as_millis();
+                if package_metadata_matches_version_doc(name, version, &cached) {
+                    timings.cache_hit = true;
+                    crate::timing::record_metadata_cache_hit();
+                    tracing::debug!("metadata cache hit (direct version): npm:{name}@{version}");
+                    return Ok(TimedPackageMetadata {
+                        metadata: cached,
+                        timings,
+                    });
+                }
+                tracing::debug!(
+                    "metadata cache mismatch (direct version): npm:{name}@{version}; refetching"
+                );
+            }
+            if from_history {
+                let legacy_key = self.npm_direct_version_metadata_cache_key(name, version);
+                if let Some((cached, _)) = self.read_metadata_cache_async(&legacy_key).await
+                    && package_metadata_matches_version_doc(name, version, &cached)
+                {
+                    timings.cache_read_ms = cache_read_start.elapsed().as_millis();
+                    timings.cache_hit = true;
+                    timings.selected_from_history = false;
+                    crate::timing::record_metadata_cache_hit();
+                    return Ok(TimedPackageMetadata {
+                        metadata: cached,
+                        timings,
+                    });
+                }
+            }
             timings.cache_read_ms = cache_read_start.elapsed().as_millis();
-            if package_metadata_matches_version_doc(name, version, &cached) {
+            crate::timing::record_metadata_cache_miss();
+
+            let _flight = metadata_fetch_flight_guard(&cache_key).await;
+            let coalesced_read_start = std::time::Instant::now();
+            if let Some((cached, _etag)) = self.read_metadata_cache_async(&cache_key).await
+                && package_metadata_matches_version_doc(name, version, &cached)
+            {
+                timings.cache_read_ms = timings
+                    .cache_read_ms
+                    .saturating_add(coalesced_read_start.elapsed().as_millis());
                 timings.cache_hit = true;
-                crate::timing::record_metadata_cache_hit();
-                tracing::debug!("metadata cache hit (direct version): npm:{name}@{version}");
+                tracing::debug!(
+                    "metadata cache hit (direct version, coalesced): npm:{name}@{version}"
+                );
                 return Ok(TimedPackageMetadata {
                     metadata: cached,
                     timings,
                 });
             }
-            tracing::debug!(
-                "metadata cache mismatch (direct version): npm:{name}@{version}; refetching"
-            );
-        }
-        timings.cache_read_ms = cache_read_start.elapsed().as_millis();
-        crate::timing::record_metadata_cache_miss();
-
-        let _flight = metadata_fetch_flight_guard(&cache_key).await;
-        let coalesced_read_start = std::time::Instant::now();
-        if let Some((cached, _etag)) = self.read_metadata_cache_async(&cache_key).await
-            && package_metadata_matches_version_doc(name, version, &cached)
-        {
             timings.cache_read_ms = timings
                 .cache_read_ms
                 .saturating_add(coalesced_read_start.elapsed().as_millis());
-            timings.cache_hit = true;
-            tracing::debug!("metadata cache hit (direct version, coalesced): npm:{name}@{version}");
-            return Ok(TimedPackageMetadata {
-                metadata: cached,
-                timings,
-            });
-        }
-        timings.cache_read_ms = timings
-            .cache_read_ms
-            .saturating_add(coalesced_read_start.elapsed().as_millis());
 
-        let rpc_start = std::time::Instant::now();
-        macro_rules! finish {
-            ($expr:expr) => {{
-                let r = $expr;
-                crate::timing::record_rpc(rpc_start.elapsed());
-                r
-            }};
-        }
+            let validator_start = std::time::Instant::now();
+            let cache_validator = self.read_cache_validator(&cache_key);
+            timings.validator_read_ms = validator_start.elapsed().as_millis();
 
-        let validator_start = std::time::Instant::now();
-        let cache_validator = self.read_cache_validator(&cache_key);
-        timings.validator_read_ms = validator_start.elapsed().as_millis();
-
-        let npm_url = format!("{}/{}/{}", self.npm_registry_url, name, version);
-        tracing::debug!("fetching {name}@{version} direct from npm registry");
-        let req = self
-            .http
-            .for_url(&npm_url)
-            .await?
-            .get(&npm_url)
-            .header("Accept", "application/json");
-        let req = Self::apply_cached_etag(req, cache_validator.as_ref());
-        let http_start = std::time::Instant::now();
-        let mut response = match self.send_package_metadata_request(req).await {
-            Ok(r) => {
-                timings.http_ms = timings
-                    .http_ms
-                    .saturating_add(http_start.elapsed().as_millis());
-                r
-            }
-            Err(e) => return finish!(Err(e)),
-        };
-        if response.status() == reqwest::StatusCode::NOT_MODIFIED {
-            timings.not_modified = true;
-            let cache_304_start = std::time::Instant::now();
-            if let Some(cached) = self
-                .cached_metadata_after_304(
-                    &cache_key,
-                    &response,
-                    cache_validator.as_ref(),
-                    |metadata| package_metadata_matches_version_doc(name, version, metadata),
+            let history_key = (from_history
+                && cache_validator.is_none()
+                && (self.cache_dir.is_some() || self.metadata_memory_cache.is_some()))
+            .then(|| {
+                self.metadata_cache_key_for_origin(
+                    "npm-direct-raw-full",
+                    &self.npm_registry_url,
+                    name,
+                    None,
                 )
+            });
+            let mut history_flight = match history_key.as_deref() {
+                Some(key) => self.history_cache.flight(key).await,
+                None => None,
+            };
+            let history_lookup_active = history_key.is_some();
+            let (history_generation, reused_history) = match history_key.as_deref() {
+                Some(key) => self.history_cache.lookup(key),
+                _ => (0, None),
+            };
+            if let Some(history) = reused_history {
+                drop(history_flight.take());
+                let selected_name = name.to_owned();
+                let selected_version = version.to_owned();
+                let body = Arc::clone(&history.body);
+                let (selected, parse_ms) = tokio::task::spawn_blocking(move || {
+                    let start = std::time::Instant::now();
+                    let selected = version_selection::parse_selected_version(
+                        lpm_common::strip_utf8_bom_bytes(body.bytes()),
+                        &selected_name,
+                        &selected_version,
+                    );
+                    (selected, start.elapsed().as_millis())
+                })
                 .await
-            {
-                timings.cache_after_304_ms = cache_304_start.elapsed().as_millis();
-                tracing::debug!(
-                    "metadata cache revalidated (direct version 304): npm:{name}@{version}"
-                );
-                return finish!(Ok(TimedPackageMetadata {
-                    metadata: cached.value,
-                    timings,
-                }));
+                .map_err(|error| {
+                    LpmError::Registry(format!("history projection task failed: {error}"))
+                })?;
+                timings.json_decode_ms = parse_ms;
+                let selected = selected.map_err(|error| {
+                    LpmError::Registry(format!("history projection failed: {error}"))
+                })?;
+                let mut metadata =
+                    package_metadata_from_version_doc(name, version, selected.manifest)?;
+                if let Some(published_at) = selected.published_at {
+                    metadata.time.insert(version.to_owned(), published_at);
+                }
+                let write_start = std::time::Instant::now();
+                self.history_cache.with_generation(history_generation, || {
+                    self.write_metadata_cache_with_directive(
+                        &cache_key,
+                        &metadata,
+                        history.etag.as_deref(),
+                        MetadataCacheDirective::Store {
+                            fresh_for: history
+                                .expires_at
+                                .saturating_duration_since(std::time::Instant::now()),
+                        },
+                    );
+                });
+                timings.cache_write_dispatch_ms = write_start.elapsed().as_millis();
+                timings.cache_hit = true;
+                crate::timing::record_metadata_cache_hit();
+                return Ok(TimedPackageMetadata { metadata, timings });
             }
-            timings.cache_after_304_ms = cache_304_start.elapsed().as_millis();
+
+            if history_flight.as_ref().is_some_and(|flight| !flight.first) {
+                drop(history_flight.take());
+            }
+
+            let rpc_start = std::time::Instant::now();
+            macro_rules! finish {
+                ($expr:expr) => {{
+                    let r = $expr;
+                    crate::timing::record_rpc(rpc_start.elapsed());
+                    r
+                }};
+            }
+
+            let npm_url = if from_history {
+                format!("{}/{}", self.npm_registry_url, name)
+            } else {
+                format!("{}/{}/{}", self.npm_registry_url, name, version)
+            };
+            tracing::debug!("fetching {name}@{version} direct from npm registry");
             let req = self
                 .http
                 .for_url(&npm_url)
                 .await?
                 .get(&npm_url)
                 .header("Accept", "application/json");
-            let retry_http_start = std::time::Instant::now();
-            response = match self.send_package_metadata_request(req).await {
+            let req = Self::apply_cached_etag(req, cache_validator.as_ref());
+            let http_start = std::time::Instant::now();
+            let mut response = match self.send_package_metadata_request(req).await {
                 Ok(r) => {
                     timings.http_ms = timings
                         .http_ms
-                        .saturating_add(retry_http_start.elapsed().as_millis());
+                        .saturating_add(http_start.elapsed().as_millis());
                     r
                 }
-                Err(e) => return finish!(Err(e)),
+                Err(e) => {
+                    timings.http_ms += http_start.elapsed().as_millis();
+                    return finish!(Err(e));
+                }
             };
-        }
-        let etag = Self::response_etag(&response);
-        let cache_directive = Self::metadata_cache_directive(response.headers());
-        let (version_metadata, body_timings) =
-            match parse_capped_metadata_with_timing_limit::<VersionMetadata>(
-                response,
-                MAX_VERSION_METADATA_BYTES,
-                &format!("get_npm_version_metadata_direct {name}@{version}"),
-            )
-            .await
-            {
+            if from_history && cache_validator.is_some() {
+                self.history_cache.invalidate();
+            }
+            if response.status() == reqwest::StatusCode::NOT_MODIFIED {
+                timings.not_modified = true;
+                let cache_304_start = std::time::Instant::now();
+                if let Some(cached) = self
+                    .cached_metadata_after_304(
+                        &cache_key,
+                        &response,
+                        cache_validator.as_ref(),
+                        |metadata| package_metadata_matches_version_doc(name, version, metadata),
+                    )
+                    .await
+                {
+                    timings.cache_after_304_ms = cache_304_start.elapsed().as_millis();
+                    tracing::debug!(
+                        "metadata cache revalidated (direct version 304): npm:{name}@{version}"
+                    );
+                    return finish!(Ok(TimedPackageMetadata {
+                        metadata: cached.value,
+                        timings,
+                    }));
+                }
+                timings.cache_after_304_ms = cache_304_start.elapsed().as_millis();
+                timings.not_modified = false;
+                let req = self
+                    .http
+                    .for_url(&npm_url)
+                    .await?
+                    .get(&npm_url)
+                    .header("Accept", "application/json");
+                let retry_http_start = std::time::Instant::now();
+                response = match self.send_package_metadata_request(req).await {
+                    Ok(r) => {
+                        timings.http_ms = timings
+                            .http_ms
+                            .saturating_add(retry_http_start.elapsed().as_millis());
+                        r
+                    }
+                    Err(e) => {
+                        timings.http_ms += retry_http_start.elapsed().as_millis();
+                        return finish!(Err(e));
+                    }
+                };
+            }
+            let etag = Self::response_etag(&response);
+            let cache_directive = Self::metadata_cache_directive(response.headers());
+            let history_expiry = cache_directive
+                .local_freshness()
+                .filter(|fresh_for| !fresh_for.is_zero())
+                .map(|fresh_for| std::time::Instant::now() + fresh_for);
+            let context = format!("get_npm_selected_version {name}@{version}");
+            let parsed = if from_history {
+                let selected_name = name.to_owned();
+                let selected_version = version.to_owned();
+                let history_cache = (history_flight.is_some() && history_expiry.is_some())
+                    .then(|| Arc::clone(&self.history_cache));
+                super::body::parse_capped_metadata_owned_attempt(
+                    response,
+                    MAX_VERSION_METADATA_BYTES,
+                    &context,
+                    move |bytes| {
+                        let selected = version_selection::parse_selected_version(
+                            lpm_common::strip_utf8_bom_bytes(&bytes),
+                            &selected_name,
+                            &selected_version,
+                        )?;
+                        let retained = history_cache.and_then(|cache| cache.retain(bytes));
+                        Ok((selected, retained))
+                    },
+                )
+                .await
+            } else {
+                super::body::parse_capped_metadata_attempt(
+                    response,
+                    MAX_VERSION_METADATA_BYTES,
+                    &context,
+                    |bytes| {
+                        serde_json::from_slice::<VersionMetadata>(bytes).map(|manifest| {
+                            (
+                                version_selection::SelectedVersion {
+                                    manifest,
+                                    published_at: None,
+                                },
+                                None,
+                            )
+                        })
+                    },
+                )
+                .await
+            };
+            let (parsed, body_timings) = parsed;
+            timings.body_read_ms = body_timings.body_read_ms;
+            timings.json_decode_ms = body_timings.json_parse_ms;
+            timings.body_bytes = body_timings.body_bytes;
+            let (version_metadata, retained_history) = match parsed {
                 Ok(parsed) => parsed,
-                Err(e) => return finish!(Err(e)),
+                Err(error) => return finish!(Err(error)),
             };
-        timings.body_read_ms = body_timings.body_read_ms;
-        timings.json_decode_ms = body_timings.json_parse_ms;
-        timings.body_bytes = body_timings.body_bytes;
-        let metadata = match package_metadata_from_version_doc(name, version, version_metadata) {
-            Ok(metadata) => metadata,
-            Err(e) => return finish!(Err(e)),
-        };
-        let cache_write_start = std::time::Instant::now();
-        self.write_metadata_cache_with_directive(
-            &cache_key,
-            &metadata,
-            etag.as_deref(),
-            cache_directive,
-        );
-        timings.cache_write_dispatch_ms = cache_write_start.elapsed().as_millis();
-        finish!(Ok(TimedPackageMetadata { metadata, timings }))
+            let mut metadata =
+                match package_metadata_from_version_doc(name, version, version_metadata.manifest) {
+                    Ok(metadata) => metadata,
+                    Err(e) => return finish!(Err(e)),
+                };
+            if let Some(published_at) = version_metadata.published_at {
+                metadata.time.insert(version.to_owned(), published_at);
+            }
+            if let (Some(key), Some(body), Some(expires_at)) =
+                (history_key, retained_history, history_expiry)
+            {
+                self.history_cache.insert(
+                    key,
+                    history_generation,
+                    super::history_cache::HistoryEntry {
+                        body,
+                        expires_at,
+                        etag: etag
+                            .as_ref()
+                            .filter(|etag| {
+                                etag.len() <= super::cache::METADATA_CACHE_ETAG_LINE_CAP as usize
+                            })
+                            .cloned(),
+                    },
+                );
+            }
+            let cache_write_start = std::time::Instant::now();
+            let publish = || {
+                self.write_metadata_cache_with_directive(
+                    &cache_key,
+                    &metadata,
+                    etag.as_deref(),
+                    cache_directive,
+                );
+            };
+            if history_lookup_active {
+                self.history_cache
+                    .with_generation(history_generation, publish);
+            } else {
+                publish();
+            }
+            timings.cache_write_dispatch_ms = cache_write_start.elapsed().as_millis();
+            finish!(Ok(TimedPackageMetadata { metadata, timings }))
+        }
+        .await;
+        (result, timings)
     }
 
     /// Fetch a full npm packument through the proxy/direct fallback chain.
@@ -3171,6 +3425,74 @@ impl RegistryClient {
         finish!(Ok(metadata))
     }
 
+    /// Reuse validated exact-version history for blocked-script enrichment,
+    /// falling back to routed metadata when its publication time is unavailable.
+    pub async fn get_npm_blocked_set_meta_for_version(
+        &self,
+        name: &str,
+        version: &str,
+        route: crate::UpstreamRoute,
+    ) -> Option<crate::types::BlockedSetPackageMeta> {
+        self.get_npm_blocked_set_meta_for_versions(name, &[version], route)
+            .await
+    }
+
+    /// Enrich requested versions with one shared fallback, preserving validated
+    /// selected-cache bindings when other versions require complete metadata.
+    pub async fn get_npm_blocked_set_meta_for_versions(
+        &self,
+        name: &str,
+        versions: &[&str],
+        route: crate::UpstreamRoute,
+    ) -> Option<crate::types::BlockedSetPackageMeta> {
+        let mut result = crate::types::BlockedSetPackageMeta {
+            time: HashMap::with_capacity(versions.len()),
+            versions: HashMap::with_capacity(versions.len()),
+        };
+        let mut missing = std::collections::HashSet::with_capacity(versions.len());
+        for &version in versions {
+            if result.versions.contains_key(version) || missing.contains(version) {
+                continue;
+            }
+            if matches!(route, crate::UpstreamRoute::NpmDirect)
+                && let Some((mut metadata, _)) = self
+                    .read_metadata_cache_async(&self.npm_selected_history_cache_key(name, version))
+                    .await
+                && package_metadata_matches_version_doc(name, version, &metadata)
+                && metadata.time.contains_key(version)
+            {
+                crate::timing::record_metadata_request(name);
+                crate::timing::record_metadata_cache_hit();
+                let manifest = metadata.versions.remove(version)?;
+                if let Some(time) = metadata.time.remove(version) {
+                    result.time.insert(version.to_owned(), time);
+                }
+                result.versions.insert(
+                    version.to_owned(),
+                    crate::types::BlockedSetVersionMeta {
+                        behavioral_tags: manifest.behavioral_tags,
+                        dist: manifest.dist.map(Into::into),
+                    },
+                );
+            } else {
+                missing.insert(version);
+            }
+        }
+        if !missing.is_empty()
+            && let Some(mut fallback) = self.get_npm_blocked_set_meta(name, route).await
+        {
+            for version in missing {
+                if let Some(manifest) = fallback.versions.remove(version) {
+                    result.versions.insert(version.to_owned(), manifest);
+                    if let Some(time) = fallback.time.remove(version) {
+                        result.time.insert(version.to_owned(), time);
+                    }
+                }
+            }
+        }
+        (!result.versions.is_empty()).then_some(result)
+    }
+
     /// Fetch only the fields required for install-time blocked-set metadata
     /// capture: `time[version]` (→ `published_at`) and
     /// `versions[v]._behavioralTags` (→ `behavioral_tags{,_hash}`).
@@ -3201,8 +3523,9 @@ impl RegistryClient {
             crate::UpstreamRoute::Custom { .. } => None,
         };
         if let Some(cache_key) = cache_key
-            && let Some((meta, _)) =
-                self.read_metadata_cache_as::<crate::types::BlockedSetPackageMeta>(&cache_key)
+            && let Some((meta, _)) = self
+                .read_metadata_cache_as_async::<crate::types::BlockedSetPackageMeta>(&cache_key)
+                .await
         {
             crate::timing::record_metadata_cache_hit();
             tracing::debug!("blocked-set meta cache hit (minimal): {name}");
