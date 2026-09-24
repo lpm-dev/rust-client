@@ -1,0 +1,346 @@
+{
+  "description": "Isolated standalone post-install lockfile reads/serialization. Baseline performs three reads and two serializations; candidate performs one of each. Both verify identical content and path before timing. Same project path, three warm rounds, twenty scored alternating pairs, 25 operations per process. This isolates lockfile work; it does not model engine checks, hashing, linking, or install wall time.",
+  "build_command": [
+    "rustc",
+    "+1.94.0",
+    "--edition=2024",
+    "-C",
+    "opt-level=3",
+    "-D",
+    "warnings",
+    "-L",
+    "dependency=/tmp/lpm-cache-release-target-1940/release/deps",
+    "--extern",
+    "lpm_lockfile=/tmp/lpm-cache-release-target-1940/release/deps/liblpm_lockfile-ff3d50b7994bb222.rlib",
+    "<scratch>/lock-snapshot-probe.rs",
+    "-o",
+    "<scratch>/lock-snapshot-probe"
+  ],
+  "source_sha256": "1a882ab2db272b986dd0a2d69bdb0a77446d3e238bda225cea4e02cc08425928",
+  "binary_sha256": "be18b819b2583bc19abdfd0f9b79457bc96b2c79529ebd4eca2faa45e730a5af",
+  "lockfile_sha256": "1b56a6dbefcc8674099aba70690532b1bc8b4798909fc1e5e89d4a2732b95457",
+  "rows": [
+    {
+      "phase": "warm",
+      "round": 1,
+      "variant": "baseline",
+      "iterations": 25,
+      "ns_per_operation": 9399876.68
+    },
+    {
+      "phase": "warm",
+      "round": 1,
+      "variant": "candidate",
+      "iterations": 25,
+      "ns_per_operation": 3581183.32
+    },
+    {
+      "phase": "warm",
+      "round": 2,
+      "variant": "candidate",
+      "iterations": 25,
+      "ns_per_operation": 3719510.0
+    },
+    {
+      "phase": "warm",
+      "round": 2,
+      "variant": "baseline",
+      "iterations": 25,
+      "ns_per_operation": 8976451.68
+    },
+    {
+      "phase": "warm",
+      "round": 3,
+      "variant": "baseline",
+      "iterations": 25,
+      "ns_per_operation": 9126526.68
+    },
+    {
+      "phase": "warm",
+      "round": 3,
+      "variant": "candidate",
+      "iterations": 25,
+      "ns_per_operation": 3619838.32
+    },
+    {
+      "phase": "scored",
+      "round": 1,
+      "variant": "baseline",
+      "iterations": 25,
+      "ns_per_operation": 8921498.32
+    },
+    {
+      "phase": "scored",
+      "round": 1,
+      "variant": "candidate",
+      "iterations": 25,
+      "ns_per_operation": 3655451.64
+    },
+    {
+      "phase": "scored",
+      "round": 2,
+      "variant": "candidate",
+      "iterations": 25,
+      "ns_per_operation": 3611793.36
+    },
+    {
+      "phase": "scored",
+      "round": 2,
+      "variant": "baseline",
+      "iterations": 25,
+      "ns_per_operation": 9071891.68
+    },
+    {
+      "phase": "scored",
+      "round": 3,
+      "variant": "baseline",
+      "iterations": 25,
+      "ns_per_operation": 8963665.0
+    },
+    {
+      "phase": "scored",
+      "round": 3,
+      "variant": "candidate",
+      "iterations": 25,
+      "ns_per_operation": 3772838.32
+    },
+    {
+      "phase": "scored",
+      "round": 4,
+      "variant": "candidate",
+      "iterations": 25,
+      "ns_per_operation": 3661026.64
+    },
+    {
+      "phase": "scored",
+      "round": 4,
+      "variant": "baseline",
+      "iterations": 25,
+      "ns_per_operation": 9101580.0
+    },
+    {
+      "phase": "scored",
+      "round": 5,
+      "variant": "baseline",
+      "iterations": 25,
+      "ns_per_operation": 9087525.0
+    },
+    {
+      "phase": "scored",
+      "round": 5,
+      "variant": "candidate",
+      "iterations": 25,
+      "ns_per_operation": 3715056.68
+    },
+    {
+      "phase": "scored",
+      "round": 6,
+      "variant": "candidate",
+      "iterations": 25,
+      "ns_per_operation": 3634428.32
+    },
+    {
+      "phase": "scored",
+      "round": 6,
+      "variant": "baseline",
+      "iterations": 25,
+      "ns_per_operation": 9124960.0
+    },
+    {
+      "phase": "scored",
+      "round": 7,
+      "variant": "baseline",
+      "iterations": 25,
+      "ns_per_operation": 8874438.32
+    },
+    {
+      "phase": "scored",
+      "round": 7,
+      "variant": "candidate",
+      "iterations": 25,
+      "ns_per_operation": 3651278.32
+    },
+    {
+      "phase": "scored",
+      "round": 8,
+      "variant": "candidate",
+      "iterations": 25,
+      "ns_per_operation": 3687808.32
+    },
+    {
+      "phase": "scored",
+      "round": 8,
+      "variant": "baseline",
+      "iterations": 25,
+      "ns_per_operation": 9000225.0
+    },
+    {
+      "phase": "scored",
+      "round": 9,
+      "variant": "baseline",
+      "iterations": 25,
+      "ns_per_operation": 8937641.68
+    },
+    {
+      "phase": "scored",
+      "round": 9,
+      "variant": "candidate",
+      "iterations": 25,
+      "ns_per_operation": 3736166.64
+    },
+    {
+      "phase": "scored",
+      "round": 10,
+      "variant": "candidate",
+      "iterations": 25,
+      "ns_per_operation": 3685548.32
+    },
+    {
+      "phase": "scored",
+      "round": 10,
+      "variant": "baseline",
+      "iterations": 25,
+      "ns_per_operation": 9063383.32
+    },
+    {
+      "phase": "scored",
+      "round": 11,
+      "variant": "baseline",
+      "iterations": 25,
+      "ns_per_operation": 9029461.68
+    },
+    {
+      "phase": "scored",
+      "round": 11,
+      "variant": "candidate",
+      "iterations": 25,
+      "ns_per_operation": 3663720.0
+    },
+    {
+      "phase": "scored",
+      "round": 12,
+      "variant": "candidate",
+      "iterations": 25,
+      "ns_per_operation": 3633268.36
+    },
+    {
+      "phase": "scored",
+      "round": 12,
+      "variant": "baseline",
+      "iterations": 25,
+      "ns_per_operation": 9064446.64
+    },
+    {
+      "phase": "scored",
+      "round": 13,
+      "variant": "baseline",
+      "iterations": 25,
+      "ns_per_operation": 9047708.32
+    },
+    {
+      "phase": "scored",
+      "round": 13,
+      "variant": "candidate",
+      "iterations": 25,
+      "ns_per_operation": 3609203.36
+    },
+    {
+      "phase": "scored",
+      "round": 14,
+      "variant": "candidate",
+      "iterations": 25,
+      "ns_per_operation": 3663866.64
+    },
+    {
+      "phase": "scored",
+      "round": 14,
+      "variant": "baseline",
+      "iterations": 25,
+      "ns_per_operation": 8985053.32
+    },
+    {
+      "phase": "scored",
+      "round": 15,
+      "variant": "baseline",
+      "iterations": 25,
+      "ns_per_operation": 9284898.32
+    },
+    {
+      "phase": "scored",
+      "round": 15,
+      "variant": "candidate",
+      "iterations": 25,
+      "ns_per_operation": 3669670.0
+    },
+    {
+      "phase": "scored",
+      "round": 16,
+      "variant": "candidate",
+      "iterations": 25,
+      "ns_per_operation": 3703221.68
+    },
+    {
+      "phase": "scored",
+      "round": 16,
+      "variant": "baseline",
+      "iterations": 25,
+      "ns_per_operation": 9098170.0
+    },
+    {
+      "phase": "scored",
+      "round": 17,
+      "variant": "baseline",
+      "iterations": 25,
+      "ns_per_operation": 8918405.0
+    },
+    {
+      "phase": "scored",
+      "round": 17,
+      "variant": "candidate",
+      "iterations": 25,
+      "ns_per_operation": 3644546.64
+    },
+    {
+      "phase": "scored",
+      "round": 18,
+      "variant": "candidate",
+      "iterations": 25,
+      "ns_per_operation": 3665676.64
+    },
+    {
+      "phase": "scored",
+      "round": 18,
+      "variant": "baseline",
+      "iterations": 25,
+      "ns_per_operation": 8977643.36
+    },
+    {
+      "phase": "scored",
+      "round": 19,
+      "variant": "baseline",
+      "iterations": 25,
+      "ns_per_operation": 9008211.68
+    },
+    {
+      "phase": "scored",
+      "round": 19,
+      "variant": "candidate",
+      "iterations": 25,
+      "ns_per_operation": 3630725.0
+    },
+    {
+      "phase": "scored",
+      "round": 20,
+      "variant": "candidate",
+      "iterations": 25,
+      "ns_per_operation": 3724703.32
+    },
+    {
+      "phase": "scored",
+      "round": 20,
+      "variant": "baseline",
+      "iterations": 25,
+      "ns_per_operation": 8948540.0
+    }
+  ]
+}

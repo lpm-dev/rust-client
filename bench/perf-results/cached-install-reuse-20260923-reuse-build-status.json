@@ -1,0 +1,78 @@
+[
+  {
+    "name": "unit",
+    "returncode": 0,
+    "seconds": 39.53390383720398,
+    "command": [
+      "cargo",
+      "+1.94.0",
+      "test",
+      "--locked",
+      "-p",
+      "lpm-cli",
+      "--bin",
+      "lpm-rs",
+      "commands::install",
+      "--",
+      "--test-threads=1"
+    ],
+    "target": "/tmp/lpm-cache-gate-target-1940"
+  },
+  {
+    "name": "debug",
+    "returncode": 0,
+    "seconds": 18.825974941253662,
+    "command": [
+      "cargo",
+      "+1.94.0",
+      "build",
+      "--locked",
+      "-p",
+      "lpm-cli"
+    ],
+    "target": "/tmp/lpm-cache-gate-target-1940"
+  },
+  {
+    "name": "workflows",
+    "returncode": 0,
+    "seconds": 2.9331612586975098,
+    "command": [
+      "cargo",
+      "+1.94.0",
+      "nextest",
+      "run",
+      "--locked",
+      "-p",
+      "lpm-workflows",
+      "--test",
+      "install_cached_entries",
+      "--test",
+      "install",
+      "--test",
+      "workspace_install",
+      "-E",
+      "binary(install_cached_entries) or test(frozen_strict_install_revalidates_dependency_engine_from_lockfile) or test(warm_install_revalidates_dependency_engine_when_effective_node_changes) or test(shared_registry_rows) or test(recursive_workspace_materialization) or test(frozen_replay_rejects_local_manifest_mutation_before_materialization)",
+      "--no-fail-fast",
+      "--status-level",
+      "slow",
+      "--final-status-level",
+      "fail"
+    ],
+    "target": "/tmp/lpm-cache-gate-target-1940"
+  },
+  {
+    "name": "release",
+    "returncode": 0,
+    "seconds": 443.93851017951965,
+    "command": [
+      "cargo",
+      "+1.94.0",
+      "build",
+      "--release",
+      "--locked",
+      "-p",
+      "lpm-cli"
+    ],
+    "target": "/tmp/lpm-cache-release-target-1940"
+  }
+]

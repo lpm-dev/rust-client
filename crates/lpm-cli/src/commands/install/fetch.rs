@@ -941,6 +941,7 @@ pub(super) async fn run_online_fetch_phase(
 
     let mut to_download = Vec::new();
     let mut cached = 0usize;
+    let mut cached_link_jobs = CachedLinkJobs::new(v2_reusable_prevalidation.hit_count);
     let cache_classify_start = Instant::now();
     let fetch_detail_timing_enabled = timing_detail_mode.enabled();
 
@@ -981,6 +982,19 @@ pub(super) async fn run_online_fetch_phase(
         // Local archives are materialized before this loop on fresh and locked
         // installs, including --force; they have no remote URL to fetch.
         if v2_mode && (is_local_source || is_local_archive) {
+            let link_dispatch_start = timing_detail_start(fetch_detail_timing_enabled);
+            fetch_stage_timings.link_dispatch_count += spawn_cached_v2_link_tasks(
+                &mut cached_link_jobs,
+                &mut v2_event_link_handles,
+                v2_plan.as_ref(),
+                store_v2_handle.as_ref(),
+                &v2_link_task_semaphore,
+                &workspace_coordinator,
+            )?;
+            record_timing_detail_ms(
+                &mut fetch_stage_timings.cache_classify_link_dispatch_ms,
+                link_dispatch_start,
+            );
             let classification_start = timing_detail_start(fetch_detail_timing_enabled);
             cached += 1;
             if v2_event_driven
@@ -1042,38 +1056,14 @@ pub(super) async fn run_online_fetch_phase(
             let classification_start = timing_detail_start(fetch_detail_timing_enabled);
             cached += 1;
             spec_tracker.mark_consumed_if_completed(&package_key);
-            // The v2 object is already populated, so the link entry's
-            // clonefile pass can run on the blocking pool in parallel with
-            // sibling fetches. Awaited at the link stage below.
             if v2_event_driven
-                && let Some(plan) = v2_plan.as_ref()
                 && let Some(target) = p
                     .instance_id
                     .and_then(|instance_id| v2_target_by_instance.get(&instance_id))
-                    .cloned()
             {
-                let link_dispatch_start = timing_detail_start(fetch_detail_timing_enabled);
-                let mut target = (*target).clone();
+                let mut target = (**target).clone();
                 target.verified_object_integrity = Some(reusable_object.object_integrity.clone());
-                let plan_arc = std::sync::Arc::clone(plan);
-                let store_arc = std::sync::Arc::clone(
-                    store_v2_handle
-                        .as_ref()
-                        .expect("v2_event_driven implies virtual-store store"),
-                );
-                let handle = spawn_v2_link_task(
-                    plan_arc,
-                    Arc::new(target),
-                    store_arc,
-                    Arc::clone(&v2_link_task_semaphore),
-                    workspace_coordinator.clone(),
-                )?;
-                fetch_stage_timings.link_dispatch_count += u64::from(handle.dispatched());
-                v2_event_link_handles.push(handle);
-                record_timing_detail_ms(
-                    &mut fetch_stage_timings.cache_classify_link_dispatch_ms,
-                    link_dispatch_start,
-                );
+                cached_link_jobs.push(p.unpacked_size, Arc::new(target));
             }
             record_timing_detail_ms(
                 &mut fetch_stage_timings.cache_classify_v2_reusable_hit_ms,
@@ -1111,6 +1101,19 @@ pub(super) async fn run_online_fetch_phase(
             && let Ok(v1_pkg_dir) = p.store_path_or_err(&store, project_dir, None)
         {
             let classification_start = timing_detail_start(fetch_detail_timing_enabled);
+            let link_dispatch_start = timing_detail_start(fetch_detail_timing_enabled);
+            fetch_stage_timings.link_dispatch_count += spawn_cached_v2_link_tasks(
+                &mut cached_link_jobs,
+                &mut v2_event_link_handles,
+                v2_plan.as_ref(),
+                store_v2_handle.as_ref(),
+                &v2_link_task_semaphore,
+                &workspace_coordinator,
+            )?;
+            record_timing_detail_ms(
+                &mut fetch_stage_timings.cache_classify_link_dispatch_ms,
+                link_dispatch_start,
+            );
             match v2_store.populate_object_from_v1(&v1_pkg_dir, sri) {
                 Ok(_) => {
                     fetch_stage_timings.v1_to_v2_translate_count += 1;
@@ -1224,6 +1227,30 @@ pub(super) async fn run_online_fetch_phase(
             );
         }
     }
+    // Bound metadata contention only when every job is a cached registry entry.
+    let cached_link_semaphore = if !packages.is_empty()
+        && cached_link_jobs.len() == packages.len()
+        && workspace_coordinator.is_none()
+    {
+        Arc::new(Semaphore::new(v2_cached_link_task_concurrency(
+            packages.len(),
+        )))
+    } else {
+        Arc::clone(&v2_link_task_semaphore)
+    };
+    let link_dispatch_start = timing_detail_start(fetch_detail_timing_enabled);
+    fetch_stage_timings.link_dispatch_count += spawn_cached_v2_link_tasks(
+        &mut cached_link_jobs,
+        &mut v2_event_link_handles,
+        v2_plan.as_ref(),
+        store_v2_handle.as_ref(),
+        &cached_link_semaphore,
+        &workspace_coordinator,
+    )?;
+    record_timing_detail_ms(
+        &mut fetch_stage_timings.cache_classify_link_dispatch_ms,
+        link_dispatch_start,
+    );
     fetch_stage_timings.cache_classify_ms = cache_classify_start.elapsed().as_millis();
 
     let policy_gate_start = Instant::now();

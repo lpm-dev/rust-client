@@ -17,6 +17,19 @@ fn v2_cache_check_concurrency(candidate_count: usize) -> usize {
 }
 
 pub(super) fn v2_link_task_concurrency(target_count: usize) -> usize {
+    v2_link_task_concurrency_with_limit(target_count, V2_LINK_TASK_MAX_CONCURRENCY)
+}
+
+pub(super) fn v2_cached_link_task_concurrency(target_count: usize) -> usize {
+    let limit = if cfg!(target_os = "macos") {
+        4
+    } else {
+        V2_LINK_TASK_MAX_CONCURRENCY
+    };
+    v2_link_task_concurrency_with_limit(target_count, limit)
+}
+
+fn v2_link_task_concurrency_with_limit(target_count: usize, limit: usize) -> usize {
     if let Some(configured) = std::env::var(ENV_V2_LINK_TASKS)
         .ok()
         .and_then(|value| value.trim().parse::<usize>().ok())
@@ -27,9 +40,7 @@ pub(super) fn v2_link_task_concurrency(target_count: usize) -> usize {
     let parallelism = std::thread::available_parallelism()
         .map(|threads| threads.get())
         .unwrap_or(4);
-    parallelism
-        .clamp(1, V2_LINK_TASK_MAX_CONCURRENCY)
-        .min(target_count.max(1))
+    parallelism.clamp(1, limit).min(target_count.max(1))
 }
 
 pub(super) struct V2ReusablePrevalidation {
@@ -149,6 +160,70 @@ pub(super) fn spawn_v2_link_task(
     })))
 }
 
+pub(super) struct CachedLinkJobs<T> {
+    jobs: Vec<(usize, Option<std::num::NonZeroU64>, T)>,
+}
+
+impl<T> CachedLinkJobs<T> {
+    pub(super) fn new(capacity: usize) -> Self {
+        Self {
+            jobs: Vec::with_capacity(capacity),
+        }
+    }
+
+    pub(super) fn push(&mut self, size: Option<std::num::NonZeroU64>, target: T) {
+        self.jobs.push((self.jobs.len(), size, target));
+    }
+
+    pub(super) fn len(&self) -> usize {
+        self.jobs.len()
+    }
+
+    fn dispatch<H, E>(&mut self, mut spawn: impl FnMut(T) -> Result<H, E>) -> Result<Vec<H>, E> {
+        self.jobs
+            .sort_unstable_by_key(|(ordinal, size, _)| (std::cmp::Reverse(*size), *ordinal));
+        let mut handles = Vec::with_capacity(self.jobs.len());
+        for (ordinal, _, target) in self.jobs.drain(..) {
+            handles.push((ordinal, spawn(target)?));
+        }
+        // Scheduling must not change materialized-result or error-reporting order.
+        handles.sort_unstable_by_key(|(ordinal, _)| *ordinal);
+        Ok(handles.into_iter().map(|(_, handle)| handle).collect())
+    }
+}
+
+pub(super) fn spawn_cached_v2_link_tasks(
+    jobs: &mut CachedLinkJobs<Arc<lpm_linker::v2::V2Target>>,
+    handles: &mut Vec<V2LinkHandle>,
+    plan: Option<&Arc<lpm_linker::v2::LinkPlanV2>>,
+    store: Option<&Arc<lpm_store::v2::Store>>,
+    semaphore: &Arc<Semaphore>,
+    workspace_coordinator: &Option<
+        Arc<workspace_materialization::WorkspaceMaterializationCoordinator>,
+    >,
+) -> Result<u64, LpmError> {
+    if jobs.jobs.is_empty() {
+        return Ok(0);
+    }
+    let (Some(plan), Some(store)) = (plan, store) else {
+        return Err(LpmError::Registry(
+            "cached link tasks require a virtual store plan".into(),
+        ));
+    };
+    let batch = jobs.dispatch(|target| {
+        spawn_v2_link_task(
+            Arc::clone(plan),
+            target,
+            Arc::clone(store),
+            Arc::clone(semaphore),
+            workspace_coordinator.clone(),
+        )
+    })?;
+    let dispatched = batch.iter().filter(|handle| handle.dispatched()).count();
+    handles.extend(batch);
+    Ok(dispatched as u64)
+}
+
 pub(super) async fn prevalidate_v2_reusable_objects(
     packages: &[InstallPackage],
     store_v2: Arc<lpm_store::v2::Store>,
@@ -218,4 +293,89 @@ pub(super) async fn prevalidate_v2_reusable_objects(
         concurrency,
         validation_timings,
     })
+}
+
+#[cfg(test)]
+mod cached_link_tests {
+    use super::{CachedLinkJobs, v2_cached_link_task_concurrency, v2_link_task_concurrency};
+    use std::num::NonZeroU64;
+
+    #[test]
+    fn fully_cached_link_width_keeps_explicit_overrides() {
+        let _env = crate::test_env::ScopedEnv::set([("LPM_V2_LINK_TASKS", "9".into())]);
+        assert_eq!(v2_cached_link_task_concurrency(100), 9);
+        assert_eq!(v2_cached_link_task_concurrency(2), 2);
+        assert_eq!(v2_link_task_concurrency(100), 9);
+    }
+
+    #[test]
+    fn fully_cached_link_width_bounds_macos_metadata_contention() {
+        let _env = crate::test_env::ScopedEnv::update([("LPM_V2_LINK_TASKS", None)]);
+        let expected = if cfg!(target_os = "macos") {
+            v2_link_task_concurrency(100).min(4)
+        } else {
+            v2_link_task_concurrency(100)
+        };
+        assert_eq!(v2_cached_link_task_concurrency(100), expected);
+        assert_eq!(v2_cached_link_task_concurrency(0), 1);
+    }
+
+    #[test]
+    fn large_cached_entries_are_submitted_first_without_reordering_results() {
+        let mut jobs = CachedLinkJobs::new(5);
+        for (size, target) in [
+            (None, "unknown-a"),
+            (Some(2), "small"),
+            (Some(9), "large-a"),
+            (Some(9), "large-b"),
+            (None, "unknown-b"),
+        ] {
+            jobs.push(size.and_then(NonZeroU64::new), target);
+        }
+        let mut started = Vec::new();
+        let results = jobs
+            .dispatch::<_, ()>(|target| {
+                started.push(target);
+                Ok(format!("result:{target}"))
+            })
+            .unwrap();
+        assert_eq!(
+            started,
+            ["large-a", "large-b", "small", "unknown-a", "unknown-b"]
+        );
+        assert_eq!(
+            results,
+            [
+                "result:unknown-a",
+                "result:small",
+                "result:large-a",
+                "result:large-b",
+                "result:unknown-b"
+            ]
+        );
+        assert!(jobs.jobs.is_empty());
+    }
+
+    #[test]
+    fn cached_dispatch_failure_keeps_the_failing_target_identity() {
+        let mut jobs = CachedLinkJobs::new(2);
+        jobs.push(NonZeroU64::new(1), "small");
+        jobs.push(NonZeroU64::new(9), "large");
+        let result = jobs.dispatch::<(), _>(Err);
+        assert_eq!(result, Err("large"));
+        assert!(jobs.jobs.is_empty());
+    }
+
+    #[test]
+    fn separate_cached_batches_preserve_their_result_order() {
+        let mut jobs = CachedLinkJobs::new(2);
+        let mut results = Vec::new();
+        for batch in [[(1, "a"), (9, "b")], [(2, "c"), (8, "d")]] {
+            for (size, target) in batch {
+                jobs.push(NonZeroU64::new(size), target);
+            }
+            results.extend(jobs.dispatch::<_, ()>(Ok).unwrap());
+        }
+        assert_eq!(results, ["a", "b", "c", "d"]);
+    }
 }

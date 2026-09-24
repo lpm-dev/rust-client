@@ -1,0 +1,146 @@
+[
+  {
+    "name": "clippy",
+    "returncode": 0,
+    "seconds": 30.227662086486816,
+    "command": [
+      "cargo",
+      "clippy",
+      "--workspace",
+      "--all-targets",
+      "--locked",
+      "--",
+      "-D",
+      "warnings"
+    ]
+  },
+  {
+    "name": "fmt",
+    "returncode": 0,
+    "seconds": 5.977204084396362,
+    "command": [
+      "cargo",
+      "fmt",
+      "--check"
+    ]
+  },
+  {
+    "name": "workspace-build",
+    "returncode": 0,
+    "seconds": 62.52246308326721,
+    "command": [
+      "cargo",
+      "build",
+      "--workspace",
+      "--locked"
+    ]
+  },
+  {
+    "name": "libraries",
+    "returncode": 0,
+    "seconds": 171.2278368473053,
+    "command": [
+      "cargo",
+      "nextest",
+      "run",
+      "--locked",
+      "--workspace",
+      "--exclude",
+      "lpm-workflows",
+      "--exclude",
+      "lpm-cli",
+      "--no-fail-fast",
+      "--status-level",
+      "slow",
+      "--final-status-level",
+      "fail"
+    ]
+  },
+  {
+    "name": "cli-unit",
+    "returncode": 0,
+    "seconds": 116.27777290344238,
+    "command": [
+      "cargo",
+      "test",
+      "--locked",
+      "-p",
+      "lpm-cli",
+      "--bin",
+      "lpm-rs",
+      "--",
+      "--test-threads=1"
+    ]
+  },
+  {
+    "name": "cli-surface",
+    "returncode": 0,
+    "seconds": 67.85456109046936,
+    "command": [
+      "cargo",
+      "nextest",
+      "run",
+      "--locked",
+      "-p",
+      "lpm-cli",
+      "-E",
+      "not binary_id(/bin\\/lpm-rs/)",
+      "--no-fail-fast",
+      "--status-level",
+      "slow",
+      "--final-status-level",
+      "fail"
+    ]
+  },
+  {
+    "name": "install-workflows",
+    "returncode": 0,
+    "seconds": 91.03367495536804,
+    "command": [
+      "scripts/ci/with-hermetic-workflow-cli.sh",
+      "cargo",
+      "nextest",
+      "run",
+      "--locked",
+      "-p",
+      "lpm-workflows",
+      "--test",
+      "install_cached_entries",
+      "--test",
+      "pnpm_compat_peer",
+      "--test",
+      "add",
+      "--test",
+      "upgrade",
+      "--test",
+      "install",
+      "--test",
+      "install_metadata",
+      "--test",
+      "install_speculation",
+      "--test",
+      "install_local_tarball",
+      "--test",
+      "lifecycle_containment",
+      "--test",
+      "native_build_cache",
+      "--test",
+      "registry_credentials",
+      "--test",
+      "health",
+      "--test",
+      "workspace_install",
+      "--test",
+      "ci",
+      "--test",
+      "json_output",
+      "--test",
+      "install_concurrency",
+      "--no-fail-fast",
+      "--status-level",
+      "slow",
+      "--final-status-level",
+      "fail"
+    ]
+  }
+]

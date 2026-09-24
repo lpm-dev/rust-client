@@ -1,0 +1,46 @@
+{
+  "parent": "120a7e9c828bb11d6fa38445ac2c2a7234dee4cf",
+  "source_commit": "2d5e773d8546fa6fd77bcd738961f5055341ac52",
+  "source_sha256": {
+    "crates/lpm-cli/src/commands/install/concurrency.rs": "db9ce6ae6b83d7dbe335452996254434fbdc79b61ca7a9b5f63373014fd163ba",
+    "crates/lpm-cli/src/commands/install/fetch.rs": "59668f4b866aa78b53093ece04c909ffd7a04280273b72eccf7bc0572c92a3af",
+    "crates/lpm-cli/src/commands/install/state.rs": "0cd719a2b721569be632e1d818f075a2b1cf070cb385064cb10b3fff93ff101c",
+    "crates/lpm-cli/src/commands/install/workspace_lockfile.rs": "cda117e2a90b3de4913c70de971cb8096e6af398e89c793d32914b3ef836c193",
+    "crates/lpm-cli/src/install_state.rs": "c88b824e01c03383f2f3df9493dbceccd6aeca254b3ca09d1bcd18212119d246",
+    "tests/workflows/tests/install_cached_entries.rs": "d400c2f86b7aa54e1323678185112f466665a1f52106e26e4eef4e5623fa23d9"
+  },
+  "binary_sha256": {
+    "lpm-candidate-reuse": "85d3b9973d1b17f66b6936b3d18e129f3da3caed613082473d8f0a86520b4301",
+    "lpm-baseline": "b3283b8338ae6b05c35310808741f8c00fa58962631acc963a247f3a7770b041",
+    "lpm-candidate-scheduling": "abfcec7142b148ea501f960e22a2d0771d133f0f2c503cae2e1485f986541e9e"
+  },
+  "bun": "1.4.2",
+  "toolchain": "1.94.0",
+  "host_os": "27.0",
+  "cpu": "Apple M5 Pro",
+  "memory_bytes": 51539607552,
+  "artifact_sha256": {
+    "cached-install-reuse-20260923-inventories.json": "41e49619ed4bb998d7f81ee558234e4eedadfc95fcfbd921a0aab7a177feea65",
+    "cached-install-reuse-20260923-reuse-build-status.json": "0702f093f67ee14f1f37fba81574f340b194b80a39749a5f7e428c08623a6690",
+    "cached-install-reuse-20260923-inventory-index.json": "60b094f77b7a6615a107c5ae973093a05a027c20f83c779bcf5ef1082c29b78c",
+    "cached-install-reuse-20260923-deny-status.json": "029a8ba3d7999999073775d65c515ffacd14baef3fcaada76bd6d8078195afaa",
+    "cached-install-reuse-20260923-helper-gates.json": "40d5ef34f7246423f85ba488c60079015161a2cfa12659bfa91c7eba096b123f",
+    "cached-install-reuse-20260923-lockfiles.json": "aa859d986af6e6e1f912aae268775b44d77f8f1b2b904934c64be1a7b635aa3e",
+    "cached-install-reuse-20260923-lock-snapshot-micro.json": "3a51897fb7433faba750f45a7dac9823e35ba008e3a5f40dddaf1c0760185f20",
+    "cached-install-reuse-20260923-artifact-clocks.json": "c8c7cd15fa8dafa70072b65e2c627b26dc859ea00da19fb07063c3ec89fd8c5e",
+    "cached-install-reuse-20260923-samples.jsonl": "016393ffc8cfa9f90a71717db0c528b0d1e6050a97bcadab99dbf7694c5a7a21",
+    "cached-install-reuse-20260923-lockfile-index.json": "27035977bc292554a6c1afb2696d3c60c46889a0dcc39d3014e4a1cc84260fa5",
+    "cached-install-reuse-20260923-gates.json": "6f516c5dbc0b2caa0605ea3e7213f5c03f2b2dca876adb09a44d2c0123f631bc",
+    "cached-install-reuse-20260923-diagnostics.jsonl": "2431773d09c235c7171eea30aa85e30e990fdfd7a42f95f368b1b9b8d416f2b1",
+    "cached-install-reuse-20260923-followups-status.json": "2f85db9b1ef2148d3f7f3626c740e79d6c3b5d077367dba4575b163363b83e34",
+    "cached-install-reuse-20260923-sources.json": "3d13eb85648b1b821a2eaac35e4bf4518a444fda2ec67ed6d9081099ac3efad8",
+    "cached-install-reuse-20260923-summary.json": "c23ea75d25f40fa9d48e7235abe94f64ef2e0109949940948b0eac893cd08878",
+    "cached-install-reuse-20260923-ledger.json": "95d59b5d10c7155e8e46557dc5ab62877c3b9a65895c3166c86f1c0452051519",
+    "cached-install-reuse-20260923-plans.json": "85741462de33fdcb4549b5ddf5e01858b54abce5bcfbc38028603111d372bb2e"
+  },
+  "report_commit": "1e0ea752fc0146e8b4a38a8a23addd9dd2472c3b",
+  "source_bundle_note": "Source strings preserve algorithms. Personal local roots are replaced with the documented placeholders; both original and public hashes are recorded.",
+  "gate_note": "Build, Clippy and tests completed before scored benchmarks. No production changes followed the preserved release build; later changes added tests and relocated the test module.",
+  "measurement_note": "No builds, tests or profiling ran concurrently with scored cohorts. The lockfile microbenchmark ran after all install cohorts completed.",
+  "inventory_note": "Repeated collectors exclude project self-links. Earlier six-state data retains installbench@0.1.0; remove only that identity for normalized comparison. The readiness controls retain final-mode inventories, not one per measured mode."
+}
