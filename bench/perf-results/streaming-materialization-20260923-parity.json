@@ -1,0 +1,397 @@
+{
+  "full_warm_payloads": [
+    {
+      "fixture": "t3",
+      "sample": 1,
+      "all_payload_hashes_equal": true,
+      "all_package_directories_equal": true,
+      "managers": {
+        "lpm-baseline": {
+          "packages": 95,
+          "regular_files": 17846,
+          "payload_bytes": 441695827,
+          "directories": 1273,
+          "inventory_sha256": "61beec38a3b9499ebd539c9e662fd60660694e5f048e90d41d3e12b91a096fa6"
+        },
+        "lpm-candidate": {
+          "packages": 95,
+          "regular_files": 17846,
+          "payload_bytes": 441695827,
+          "directories": 1273,
+          "inventory_sha256": "61beec38a3b9499ebd539c9e662fd60660694e5f048e90d41d3e12b91a096fa6"
+        },
+        "bun": {
+          "packages": 95,
+          "regular_files": 17846,
+          "payload_bytes": 441695827,
+          "directories": 1273,
+          "inventory_sha256": "61beec38a3b9499ebd539c9e662fd60660694e5f048e90d41d3e12b91a096fa6"
+        }
+      },
+      "bin_mode_differences": [
+        {
+          "package": "@biomejs/biome",
+          "version": "1.9.4",
+          "path": "bin/biome",
+          "lpm": "0o644",
+          "bun": "0o755"
+        },
+        {
+          "package": "baseline-browser-mapping",
+          "version": "2.11.25",
+          "path": "dist/cli.cjs",
+          "lpm": "0o644",
+          "bun": "0o755"
+        },
+        {
+          "package": "gel",
+          "version": "2.2.1",
+          "path": "dist/cli.mjs",
+          "lpm": "0o644",
+          "bun": "0o755"
+        }
+      ]
+    },
+    {
+      "fixture": "vite-react",
+      "sample": 1,
+      "all_payload_hashes_equal": true,
+      "all_package_directories_equal": true,
+      "managers": {
+        "lpm-baseline": {
+          "packages": 63,
+          "regular_files": 2222,
+          "payload_bytes": 35011496,
+          "directories": 135,
+          "inventory_sha256": "51fb7963bc1f8a0db2df4ac49cacaff04c00644dac5fb1bbaa6d6267b7d60f52"
+        },
+        "lpm-candidate": {
+          "packages": 63,
+          "regular_files": 2222,
+          "payload_bytes": 35011496,
+          "directories": 135,
+          "inventory_sha256": "51fb7963bc1f8a0db2df4ac49cacaff04c00644dac5fb1bbaa6d6267b7d60f52"
+        },
+        "bun": {
+          "packages": 63,
+          "regular_files": 2222,
+          "payload_bytes": 35011496,
+          "directories": 135,
+          "inventory_sha256": "51fb7963bc1f8a0db2df4ac49cacaff04c00644dac5fb1bbaa6d6267b7d60f52"
+        }
+      },
+      "bin_mode_differences": [
+        {
+          "package": "json5",
+          "version": "2.2.3",
+          "path": "lib/cli.js",
+          "lpm": "0o644",
+          "bun": "0o755"
+        },
+        {
+          "package": "baseline-browser-mapping",
+          "version": "2.11.25",
+          "path": "dist/cli.cjs",
+          "lpm": "0o644",
+          "bun": "0o755"
+        }
+      ]
+    },
+    {
+      "fixture": "native-sharp",
+      "sample": 1,
+      "all_payload_hashes_equal": true,
+      "all_package_directories_equal": true,
+      "managers": {
+        "lpm-baseline": {
+          "packages": 11,
+          "regular_files": 130,
+          "payload_bytes": 16562326,
+          "directories": 13,
+          "inventory_sha256": "b5db4243fe713bd082e182d534d6ce852d7068e1fa236864a6a359e5ace3d98f"
+        },
+        "lpm-candidate": {
+          "packages": 11,
+          "regular_files": 130,
+          "payload_bytes": 16562326,
+          "directories": 13,
+          "inventory_sha256": "b5db4243fe713bd082e182d534d6ce852d7068e1fa236864a6a359e5ace3d98f"
+        },
+        "bun": {
+          "packages": 11,
+          "regular_files": 130,
+          "payload_bytes": 16562326,
+          "directories": 13,
+          "inventory_sha256": "b5db4243fe713bd082e182d534d6ce852d7068e1fa236864a6a359e5ace3d98f"
+        }
+      },
+      "bin_mode_differences": []
+    },
+    {
+      "fixture": "nest",
+      "sample": 1,
+      "all_payload_hashes_equal": true,
+      "all_package_directories_equal": true,
+      "managers": {
+        "lpm-baseline": {
+          "packages": 33,
+          "regular_files": 3376,
+          "payload_bytes": 7831945,
+          "directories": 180,
+          "inventory_sha256": "1937aa7183c674181a3068fd671b19eb0fb1f5a248fc81ac2f65fa20ae7131ad"
+        },
+        "lpm-candidate": {
+          "packages": 33,
+          "regular_files": 3376,
+          "payload_bytes": 7831945,
+          "directories": 180,
+          "inventory_sha256": "1937aa7183c674181a3068fd671b19eb0fb1f5a248fc81ac2f65fa20ae7131ad"
+        },
+        "bun": {
+          "packages": 33,
+          "regular_files": 3376,
+          "payload_bytes": 7831945,
+          "directories": 180,
+          "inventory_sha256": "1937aa7183c674181a3068fd671b19eb0fb1f5a248fc81ac2f65fa20ae7131ad"
+        }
+      },
+      "bin_mode_differences": []
+    }
+  ],
+  "main_installed_versions": [
+    {
+      "fixture": "t3",
+      "samples": 18,
+      "packages": 95,
+      "installed": [
+        "@alloc/quick-lru@5.3.0",
+        "@auth/core@0.41.0",
+        "@auth/core@0.41.3",
+        "@auth/drizzle-adapter@1.11.3",
+        "@biomejs/biome@1.9.4",
+        "@biomejs/cli-darwin-arm64@1.9.4",
+        "@drizzle-team/brocli@0.10.2",
+        "@esbuild-kit/core-utils@3.3.2",
+        "@esbuild-kit/esm-loader@2.6.5",
+        "@esbuild/darwin-arm64@0.18.20",
+        "@esbuild/darwin-arm64@0.19.12",
+        "@esbuild/darwin-arm64@0.25.12",
+        "@img/colour@1.1.0",
+        "@img/sharp-darwin-arm64@0.35.4",
+        "@img/sharp-libvips-darwin-arm64@1.3.3",
+        "@jridgewell/gen-mapping@0.3.13",
+        "@jridgewell/remapping@2.3.5",
+        "@jridgewell/resolve-uri@3.1.2",
+        "@jridgewell/sourcemap-codec@1.6.0",
+        "@jridgewell/trace-mapping@0.3.31",
+        "@next/env@16.3.6",
+        "@next/swc-darwin-arm64@16.3.6",
+        "@panva/hkdf@1.2.1",
+        "@petamoriken/float16@3.9.3",
+        "@swc/helpers@0.5.23",
+        "@t3-oss/env-core@0.12.0",
+        "@t3-oss/env-nextjs@0.12.0",
+        "@tailwindcss/node@4.3.3",
+        "@tailwindcss/oxide-darwin-arm64@4.3.3",
+        "@tailwindcss/oxide@4.3.3",
+        "@tailwindcss/postcss@4.3.3",
+        "@tanstack/query-core@5.103.2",
+        "@tanstack/react-query@5.103.2",
+        "@trpc/client@11.19.0",
+        "@trpc/react-query@11.19.0",
+        "@trpc/server@11.19.0",
+        "@types/node@20.19.43",
+        "@types/react-dom@19.3.0",
+        "@types/react@19.3.0",
+        "baseline-browser-mapping@2.11.25",
+        "buffer-from@1.1.2",
+        "caniuse-lite@1.0.30001810",
+        "client-only@0.0.1",
+        "copy-anything@4.1.1",
+        "csstype@3.2.3",
+        "debug@4.4.3",
+        "detect-libc@2.1.2",
+        "drizzle-kit@0.30.6",
+        "drizzle-orm@0.41.0",
+        "enhanced-resolve@5.25.1",
+        "env-paths@3.0.0",
+        "esbuild-register@3.6.0",
+        "esbuild@0.18.20",
+        "esbuild@0.19.12",
+        "esbuild@0.25.12",
+        "gel@2.2.1",
+        "get-tsconfig@4.14.3",
+        "graceful-fs@4.2.11",
+        "isexe@3.1.5",
+        "jiti@2.7.0",
+        "jose@6.2.12",
+        "lightningcss-darwin-arm64@1.32.0",
+        "lightningcss@1.32.0",
+        "magic-string@0.30.21",
+        "ms@2.1.3",
+        "nanoid@3.3.19",
+        "next-auth@5.0.0-beta.30",
+        "next@16.3.6",
+        "oauth4webapi@3.8.8",
+        "picocolors@1.1.1",
+        "postcss@8.5.23",
+        "postcss@8.5.28",
+        "postgres@3.4.9",
+        "preact-render-to-string@6.5.11",
+        "preact@10.24.3",
+        "react-dom@19.3.0",
+        "react@19.3.0",
+        "resolve-pkg-maps@1.0.0",
+        "scheduler@0.28.0",
+        "semver@7.8.5",
+        "server-only@0.0.1",
+        "sharp@0.35.4",
+        "shell-quote@1.10.0",
+        "source-map-js@1.2.1",
+        "source-map-support@0.5.21",
+        "source-map@0.6.1",
+        "styled-jsx@5.1.6",
+        "superjson@2.2.6",
+        "tailwindcss@4.3.3",
+        "tapable@2.3.3",
+        "tslib@2.8.1",
+        "typescript@5.9.3",
+        "undici-types@6.21.0",
+        "which@4.0.0",
+        "zod@3.25.76"
+      ]
+    },
+    {
+      "fixture": "vite-react",
+      "samples": 18,
+      "packages": 63,
+      "installed": [
+        "@babel/code-frame@7.29.7",
+        "@babel/compat-data@7.29.7",
+        "@babel/core@7.29.7",
+        "@babel/generator@7.29.8",
+        "@babel/helper-compilation-targets@7.29.7",
+        "@babel/helper-globals@7.29.7",
+        "@babel/helper-module-imports@7.29.7",
+        "@babel/helper-module-transforms@7.29.7",
+        "@babel/helper-plugin-utils@7.29.7",
+        "@babel/helper-string-parser@7.29.7",
+        "@babel/helper-validator-identifier@7.29.7",
+        "@babel/helper-validator-option@7.29.7",
+        "@babel/helpers@7.29.7",
+        "@babel/parser@7.29.9",
+        "@babel/plugin-transform-react-jsx-self@7.29.7",
+        "@babel/plugin-transform-react-jsx-source@7.29.7",
+        "@babel/template@7.29.7",
+        "@babel/traverse@7.29.8",
+        "@babel/types@7.29.8",
+        "@esbuild/darwin-arm64@0.21.5",
+        "@jridgewell/gen-mapping@0.3.13",
+        "@jridgewell/remapping@2.3.5",
+        "@jridgewell/resolve-uri@3.1.2",
+        "@jridgewell/sourcemap-codec@1.6.0",
+        "@jridgewell/trace-mapping@0.3.31",
+        "@rolldown/pluginutils@1.0.0-beta.27",
+        "@rollup/rollup-darwin-arm64@4.63.4",
+        "@types/babel__core@7.20.5",
+        "@types/babel__generator@7.27.0",
+        "@types/babel__template@7.4.4",
+        "@types/babel__traverse@7.28.0",
+        "@types/estree@1.0.9",
+        "@vitejs/plugin-react@4.7.0",
+        "baseline-browser-mapping@2.11.25",
+        "browserslist@4.29.0",
+        "caniuse-lite@1.0.30001810",
+        "convert-source-map@2.0.0",
+        "debug@4.4.3",
+        "electron-to-chromium@1.5.435",
+        "esbuild@0.21.5",
+        "escalade@3.2.0",
+        "fsevents@2.3.3",
+        "gensync@1.0.0-beta.2",
+        "js-tokens@4.0.0",
+        "jsesc@3.1.0",
+        "json5@2.2.3",
+        "loose-envify@1.4.0",
+        "lru-cache@5.1.1",
+        "ms@2.1.3",
+        "nanoid@3.3.19",
+        "node-releases@2.0.56",
+        "picocolors@1.1.1",
+        "postcss@8.5.28",
+        "react-dom@18.3.1",
+        "react-refresh@0.17.0",
+        "react@18.3.1",
+        "rollup@4.63.4",
+        "scheduler@0.23.2",
+        "semver@6.3.1",
+        "source-map-js@1.2.1",
+        "update-browserslist-db@1.3.3",
+        "vite@5.4.21",
+        "yallist@3.1.1"
+      ]
+    },
+    {
+      "fixture": "native-sharp",
+      "samples": 18,
+      "packages": 11,
+      "installed": [
+        "@img/sharp-darwin-arm64@0.33.5",
+        "@img/sharp-libvips-darwin-arm64@1.0.4",
+        "color-convert@2.0.1",
+        "color-name@1.1.4",
+        "color-string@1.9.1",
+        "color@4.2.3",
+        "detect-libc@2.1.2",
+        "is-arrayish@0.3.4",
+        "semver@7.8.5",
+        "sharp@0.33.5",
+        "simple-swizzle@0.2.4"
+      ]
+    },
+    {
+      "fixture": "nest",
+      "samples": 18,
+      "packages": 33,
+      "installed": [
+        "@borewit/text-codec@0.2.2",
+        "@lukeed/csprng@1.1.0",
+        "@nestjs/common@10.4.22",
+        "@nestjs/core@10.4.22",
+        "@nuxtjs/opencollective@0.3.2",
+        "@tokenizer/inflate@0.2.7",
+        "@tokenizer/token@0.3.0",
+        "ansi-styles@4.3.0",
+        "chalk@4.1.2",
+        "color-convert@2.0.1",
+        "color-name@1.1.4",
+        "consola@2.15.3",
+        "debug@4.4.3",
+        "fast-safe-stringify@2.1.1",
+        "fflate@0.8.3",
+        "file-type@20.4.1",
+        "has-flag@4.0.0",
+        "ieee754@1.2.1",
+        "iterare@1.2.1",
+        "ms@2.1.3",
+        "node-fetch@2.7.0",
+        "path-to-regexp@3.3.0",
+        "reflect-metadata@0.2.2",
+        "rxjs@7.8.2",
+        "strtok3@10.3.5",
+        "supports-color@7.2.0",
+        "token-types@6.1.2",
+        "tr46@0.0.3",
+        "tslib@2.8.1",
+        "uid@2.0.2",
+        "uint8array-extras@1.5.0",
+        "webidl-conversions@3.0.1",
+        "whatwg-url@5.0.0"
+      ]
+    }
+  ],
+  "sharp_followup": {
+    "inventories": 36,
+    "all_equal_to_main": true
+  }
+}

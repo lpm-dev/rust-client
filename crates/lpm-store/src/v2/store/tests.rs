@@ -5665,3 +5665,225 @@ fn v3_verification_bounds_integrity_marker_reads() {
         "{verification:?}"
     );
 }
+
+#[test]
+fn pipelined_object_integrity_mismatch_removes_private_staging() {
+    for policy in [
+        SecurityAnalysisPolicy::Enabled,
+        SecurityAnalysisPolicy::Disabled,
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::at_with_policies(dir.path(), ObjectIntegrityPolicy::Source, policy);
+        let tarball = build_test_tarball(&[(
+            "package.json",
+            b"{\"name\":\"streamed-mismatch\",\"version\":\"1.0.0\"}",
+        )]);
+        let wrong_integrity = crate::compute_sri_hash(b"different compressed bytes");
+
+        let error = store
+            .extract_object_from_pipelined_stream(
+                std::io::Cursor::new(&tarball),
+                Some(&wrong_integrity),
+                tarball.len() as u64,
+                || {},
+            )
+            .unwrap_err();
+
+        assert!(matches!(error, LpmError::IntegrityMismatch { .. }));
+        assert!(
+            std::fs::read_dir(store.paths().objects_root())
+                .unwrap()
+                .next()
+                .is_none(),
+            "an integrity failure must leave no visible object or private staging directory"
+        );
+    }
+}
+
+#[test]
+fn pipelined_object_hash_includes_bytes_after_the_gzip_member() {
+    for policy in [
+        SecurityAnalysisPolicy::Enabled,
+        SecurityAnalysisPolicy::Disabled,
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::at_with_policies(dir.path(), ObjectIntegrityPolicy::Source, policy);
+        let mut tarball = build_test_tarball(&[(
+            "package.json",
+            b"{\"name\":\"streamed-trailing\",\"version\":\"1.0.0\"}",
+        )]);
+        tarball.extend_from_slice(b"integrity-covered-trailing-bytes");
+        let expected_sri = crate::compute_sri_hash(&tarball);
+
+        let (object, sri, _) = store
+            .extract_object_from_pipelined_stream(
+                std::io::Cursor::new(&tarball),
+                Some(&expected_sri),
+                tarball.len() as u64,
+                || {},
+            )
+            .unwrap();
+
+        assert_eq!(sri, expected_sri);
+        assert_eq!(object.source_sri, expected_sri);
+    }
+}
+
+#[test]
+fn pipelined_object_enforces_compressed_size_without_content_length() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::at_with_policies(
+        dir.path(),
+        ObjectIntegrityPolicy::Source,
+        SecurityAnalysisPolicy::Disabled,
+    );
+    let tarball = build_test_tarball(&[(
+        "package.json",
+        b"{\"name\":\"streamed-limit\",\"version\":\"1.0.0\"}",
+    )]);
+
+    let error = store
+        .extract_object_from_pipelined_stream(
+            std::io::Cursor::new(&tarball),
+            None,
+            (tarball.len() - 1) as u64,
+            || {},
+        )
+        .unwrap_err();
+
+    assert!(error.to_string().contains("maximum compressed size"));
+    assert!(
+        std::fs::read_dir(store.paths().objects_root())
+            .unwrap()
+            .next()
+            .is_none()
+    );
+}
+
+#[test]
+fn pipelined_object_accepts_chunked_input_and_rejects_truncation_without_staging_leaks() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::at_with_policies(
+        dir.path(),
+        ObjectIntegrityPolicy::Source,
+        SecurityAnalysisPolicy::Disabled,
+    );
+    let tarball = build_test_tarball(&[(
+        "package.json",
+        b"{\"name\":\"streamed-chunks\",\"version\":\"1.0.0\"}",
+    )]);
+    let expected_sri = crate::compute_sri_hash(&tarball);
+
+    let (_, sri, _) = store
+        .extract_object_from_pipelined_stream(
+            ChunkedReader {
+                cursor: std::io::Cursor::new(tarball.clone()),
+                max_chunk: 7,
+            },
+            Some(&expected_sri),
+            tarball.len() as u64,
+            || {},
+        )
+        .unwrap();
+    assert_eq!(sri, expected_sri);
+
+    let truncated_dir = tempfile::tempdir().unwrap();
+    let truncated_store = Store::at_with_policies(
+        truncated_dir.path(),
+        ObjectIntegrityPolicy::Source,
+        SecurityAnalysisPolicy::Disabled,
+    );
+    let truncated = tarball[..tarball.len() / 2].to_vec();
+    let error = truncated_store
+        .extract_object_from_pipelined_stream(
+            ChunkedReader {
+                cursor: std::io::Cursor::new(truncated),
+                max_chunk: 5,
+            },
+            Some(&expected_sri),
+            tarball.len() as u64,
+            || {},
+        )
+        .unwrap_err();
+
+    assert!(!error.to_string().is_empty());
+    assert!(
+        std::fs::read_dir(truncated_store.paths().objects_root())
+            .unwrap()
+            .next()
+            .is_none()
+    );
+}
+
+#[test]
+fn pipelined_object_reader_error_removes_private_staging() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::at_with_policies(
+        dir.path(),
+        ObjectIntegrityPolicy::Source,
+        SecurityAnalysisPolicy::Disabled,
+    );
+    let tarball = build_test_tarball(&[(
+        "package.json",
+        b"{\"name\":\"streamed-error\",\"version\":\"1.0.0\"}",
+    )]);
+
+    let error = store
+        .extract_object_from_pipelined_stream(
+            ErrorAtEofReader {
+                cursor: std::io::Cursor::new(tarball.clone()),
+            },
+            Some(&crate::compute_sri_hash(&tarball)),
+            tarball.len() as u64,
+            || {},
+        )
+        .unwrap_err();
+
+    assert!(error.to_string().contains("injected response-body failure"));
+    assert!(
+        std::fs::read_dir(store.paths().objects_root())
+            .unwrap()
+            .next()
+            .is_none()
+    );
+}
+#[test]
+fn pipelined_object_reuse_still_requires_successful_raw_eof() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::at_with_policies(
+        dir.path(),
+        ObjectIntegrityPolicy::Source,
+        SecurityAnalysisPolicy::Disabled,
+    );
+    let tarball = build_test_tarball(&[("package.json", b"{}")]);
+    let expected_sri = crate::compute_sri_hash(&tarball);
+    let (object, _, _) = store
+        .extract_object_from_pipelined_stream(
+            tarball.as_slice(),
+            Some(&expected_sri),
+            u64::MAX,
+            || {},
+        )
+        .unwrap();
+    let result = store.extract_object_from_pipelined_stream(
+        ErrorAtEofReader {
+            cursor: std::io::Cursor::new(tarball),
+        },
+        Some(&expected_sri),
+        u64::MAX,
+        || {},
+    );
+    assert!(
+        result
+            .unwrap_err()
+            .to_string()
+            .contains("injected response-body failure")
+    );
+    assert!(object.path.join("package.json").exists());
+    assert_eq!(
+        std::fs::read_dir(store.paths().objects_root())
+            .unwrap()
+            .count(),
+        1
+    );
+}

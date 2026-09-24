@@ -1,0 +1,309 @@
+{
+  "rust_toolchain": "1.94.0",
+  "workspace": [
+    {
+      "name": "workspace-build",
+      "returncode": 0,
+      "seconds": 23.719441890716553,
+      "command": [
+        "cargo",
+        "build",
+        "--workspace",
+        "--locked"
+      ]
+    },
+    {
+      "name": "libraries",
+      "returncode": 0,
+      "seconds": 56.676000118255615,
+      "command": [
+        "cargo",
+        "nextest",
+        "run",
+        "--locked",
+        "--workspace",
+        "--exclude",
+        "lpm-workflows",
+        "--exclude",
+        "lpm-cli",
+        "--no-fail-fast",
+        "--status-level",
+        "slow",
+        "--final-status-level",
+        "fail"
+      ]
+    },
+    {
+      "name": "cli-unit",
+      "returncode": 0,
+      "seconds": 101.75053286552429,
+      "command": [
+        "cargo",
+        "test",
+        "--locked",
+        "-p",
+        "lpm-cli",
+        "--bin",
+        "lpm-rs",
+        "--",
+        "--test-threads=1"
+      ]
+    },
+    {
+      "name": "cli-surface",
+      "returncode": 0,
+      "seconds": 62.67868995666504,
+      "command": [
+        "cargo",
+        "nextest",
+        "run",
+        "--locked",
+        "-p",
+        "lpm-cli",
+        "-E",
+        "not binary_id(/bin\\/lpm-rs/)",
+        "--no-fail-fast",
+        "--status-level",
+        "slow",
+        "--final-status-level",
+        "fail"
+      ]
+    },
+    {
+      "name": "install-workflows",
+      "returncode": 0,
+      "seconds": 84.480712890625,
+      "command": [
+        "scripts/ci/with-hermetic-workflow-cli.sh",
+        "cargo",
+        "nextest",
+        "run",
+        "--locked",
+        "-p",
+        "lpm-workflows",
+        "--test",
+        "install",
+        "--test",
+        "install_metadata",
+        "--test",
+        "install_speculation",
+        "--test",
+        "install_local_tarball",
+        "--test",
+        "lifecycle_containment",
+        "--test",
+        "native_build_cache",
+        "--test",
+        "registry_credentials",
+        "--test",
+        "health",
+        "--test",
+        "workspace_install",
+        "--test",
+        "ci",
+        "--test",
+        "json_output",
+        "--test",
+        "install_concurrency",
+        "--no-fail-fast",
+        "--status-level",
+        "slow",
+        "--final-status-level",
+        "fail"
+      ]
+    }
+  ],
+  "fixed_targeted": [
+    {
+      "name": "fmt",
+      "rc": 0,
+      "seconds": 6.117963075637817
+    },
+    {
+      "name": "staging-order",
+      "rc": 0,
+      "seconds": 3.3714568614959717
+    },
+    {
+      "name": "store-all",
+      "rc": 0,
+      "seconds": 3.9624719619750977
+    },
+    {
+      "name": "clippy-fixed",
+      "rc": 0,
+      "seconds": 43.57246398925781
+    }
+  ],
+  "helpers": [
+    {
+      "command": [
+        "sh",
+        "tests/install-sh/run.sh"
+      ],
+      "returncode": 0
+    },
+    {
+      "command": [
+        "node",
+        "bench/scripts/run-install-readiness.mjs",
+        "--self-test"
+      ],
+      "returncode": 0
+    },
+    {
+      "command": [
+        "node",
+        "bench/scripts/run-t3-install-six-states.mjs",
+        "--self-test"
+      ],
+      "returncode": 0
+    },
+    {
+      "command": [
+        "node",
+        "bench/scripts/run-runtime-readiness.mjs",
+        "--self-test"
+      ],
+      "returncode": 0
+    },
+    {
+      "command": [
+        "bash",
+        "scripts/ci/test-install-apt-packages.sh"
+      ],
+      "returncode": 0
+    },
+    {
+      "command": [
+        "bash",
+        "scripts/ci/test-macos-keychain-search-list.sh"
+      ],
+      "returncode": 0
+    },
+    {
+      "command": [
+        "bash",
+        "bench/test-audit-install-args.sh"
+      ],
+      "returncode": 0
+    },
+    {
+      "command": [
+        "python3",
+        "bench/source-analysis/test_corpus.py"
+      ],
+      "returncode": 0
+    },
+    {
+      "command": [
+        "python3",
+        "bench/test_audit_install_timeout.py"
+      ],
+      "returncode": 0
+    },
+    {
+      "command": [
+        "python3",
+        "bench/audit-fixtures/test_classify_result.py"
+      ],
+      "returncode": 0
+    },
+    {
+      "command": [
+        "bash",
+        "bench/test-local-install.sh"
+      ],
+      "returncode": 0
+    },
+    {
+      "command": [
+        "bash",
+        "bench/test-live-metadata-route.sh"
+      ],
+      "returncode": 0
+    },
+    {
+      "command": [
+        "bash",
+        "bench/test-run-readme.sh"
+      ],
+      "returncode": 0
+    },
+    {
+      "command": [
+        "bash",
+        "scripts/ci/test-with-hermetic-workflow-cli.sh"
+      ],
+      "returncode": 0
+    },
+    {
+      "command": [
+        "npm",
+        "--prefix",
+        "npm/cli",
+        "test"
+      ],
+      "returncode": 0
+    },
+    {
+      "command": [
+        "npm",
+        "--prefix",
+        "npm/cli",
+        "run",
+        "pack:check"
+      ],
+      "returncode": 0
+    },
+    {
+      "command": [
+        "node",
+        "--test",
+        "<repo>/npm/release/tests/verify-published-package.test.mjs",
+        "<repo>/npm/release/tests/nightly-version.test.mjs",
+        "<repo>/npm/release/tests/nightly-release-state.test.mjs",
+        "<repo>/npm/release/tests/release-policy.test.mjs",
+        "<repo>/npm/release/tests/validate-release-candidate-source.test.mjs",
+        "<repo>/npm/release/tests/verify-packages.test.mjs",
+        "<repo>/npm/release/tests/rust-toolchain-policy.test.mjs",
+        "<repo>/npm/release/tests/release-hardening-policy.test.mjs",
+        "<repo>/npm/release/tests/acceptance-artifact-policy.test.mjs",
+        "<repo>/npm/release/tests/release-api-contract.test.mjs",
+        "<repo>/npm/release/tests/ci-policy.test.mjs",
+        "<repo>/npm/release/tests/linux-glibc-compatibility.test.mjs",
+        "<repo>/npm/release/tests/validate-recovery-source.test.mjs",
+        "<repo>/npm/release/tests/stable-release-policy.test.mjs",
+        "<repo>/npm/release/tests/release-artifacts.test.mjs",
+        "<repo>/npm/release/tests/release-candidate.test.mjs"
+      ],
+      "returncode": 0
+    }
+  ],
+  "release": [
+    {
+      "name": "candidate-release",
+      "rc": 0,
+      "seconds": 485.65750098228455,
+      "command": [
+        "cargo",
+        "build",
+        "--release",
+        "--locked",
+        "-p",
+        "lpm-cli"
+      ],
+      "target": "/tmp/lpm-cache-release-target-1940"
+    }
+  ],
+  "passed": {
+    "extractor": 100,
+    "store": 348,
+    "fetch_targeted": 26,
+    "workspace_libraries": 6711,
+    "cli_unit": 5266,
+    "cli_surface": 116,
+    "install_workflows": 479
+  },
+  "warnings": 0
+}

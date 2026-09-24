@@ -328,6 +328,10 @@ fn configured_v2_streaming_extract_weight(
     }
 }
 
+fn use_pipelined_extraction(unpacked_size: Option<std::num::NonZeroU64>) -> bool {
+    unpacked_size.is_some_and(|size| size.get() >= 8 * 1024 * 1024)
+}
+
 fn v2_streaming_extract_weight(unpacked_size: Option<std::num::NonZeroU64>) -> usize {
     let explicit_weight = std::env::var(ENV_V2_STREAMING_EXTRACT_WEIGHT).ok();
     configured_v2_streaming_extract_weight(explicit_weight.as_deref(), unpacked_size)
@@ -2684,6 +2688,17 @@ mod tests {
     }
 
     #[test]
+    fn pipelined_extraction_requires_known_large_unpacked_size() {
+        assert!(!use_pipelined_extraction(None));
+        assert!(!use_pipelined_extraction(std::num::NonZeroU64::new(
+            8 * 1024 * 1024 - 1
+        )));
+        assert!(use_pipelined_extraction(std::num::NonZeroU64::new(
+            8 * 1024 * 1024
+        )));
+    }
+
+    #[test]
     fn v2_streaming_extract_weight_is_three_only_for_large_objects_by_default() {
         assert_eq!(configured_v2_streaming_extract_weight(None, None), 1);
         assert_eq!(
@@ -2892,6 +2907,120 @@ mod tests {
         assert!(hold_ms >= 40);
         drop(admission.base_permit);
         assert_eq!(semaphore.available_permits(), 4);
+    }
+
+    #[tokio::test]
+    async fn cancelled_tarball_stream_keeps_returning_eof_after_its_error() {
+        use futures::StreamExt;
+        let cancellation = tokio_util::sync::CancellationToken::new();
+        cancellation.cancel();
+        let stream = cancellable_tarball_stream(
+            futures::stream::pending::<std::io::Result<Vec<u8>>>(),
+            cancellation,
+        );
+        tokio::pin!(stream);
+        assert_eq!(
+            stream.next().await.unwrap().unwrap_err().kind(),
+            std::io::ErrorKind::Interrupted
+        );
+        assert!(stream.next().await.is_none());
+        assert!(stream.next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn early_tar_failure_cancels_pending_pipeline_input_and_releases_capacity() {
+        use std::io::Write;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let mut header = tar::Header::new_gnu();
+        header.set_size(1);
+        header.set_mode(0o644);
+        let path = b"package/../outside.txt";
+        header.as_mut_bytes()[..path.len()].copy_from_slice(path);
+        header.set_cksum();
+        let mut decoded = vec![0_u8; 256 * 1024];
+        decoded[..512].copy_from_slice(header.as_bytes());
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        encoder.write_all(&decoded).unwrap();
+        encoder.flush().unwrap();
+        let prefix = encoder.get_ref().clone();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let resume = Arc::new(tokio::sync::Notify::new());
+        let server_resume = Arc::clone(&resume);
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request_byte = [0_u8; 1];
+            socket.read_exact(&mut request_byte).await.unwrap();
+            socket
+                .write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        prefix.len() + 1024,
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+            socket.write_all(&prefix).await.unwrap();
+            server_resume.notified().await;
+        });
+        let response = reqwest::Client::new()
+            .get(format!("http://{address}/archive.tgz"))
+            .send()
+            .await
+            .unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let store = lpm_store::v2::Store::at_with_policies(
+            root.path(),
+            lpm_store::v2::ObjectIntegrityPolicy::Source,
+            lpm_store::SecurityAnalysisPolicy::Disabled,
+        );
+        let downloads = Arc::new(tokio::sync::Semaphore::new(1));
+        let permit = Arc::clone(&downloads).acquire_owned().await.unwrap();
+        let extracts = Arc::new(tokio::sync::Semaphore::new(4));
+        let limiter = Some(fetch_extract_limiter_with_semaphore(
+            Arc::clone(&extracts),
+            4,
+        ));
+        let key = Arc::new(tokio::sync::Mutex::new(()));
+        let key_guard = Arc::clone(&key).lock_owned().await;
+        let extraction = extract_v2_registry_response(V2StreamInput {
+            response,
+            store_v2: &store,
+            expected_integrity: None,
+            unpacked_size: std::num::NonZeroU64::new(LARGE_V2_STREAMING_OBJECT_BYTES),
+            permit,
+            fetch_extract_limiter: &limiter,
+            key_guard: Some(key_guard),
+            queue_wait_ms: 0,
+            url_lookup_ms: 0,
+            download_headers_ms: 0,
+        });
+        tokio::pin!(extraction);
+        let completed =
+            tokio::time::timeout(std::time::Duration::from_secs(3), &mut extraction).await;
+        resume.notify_one();
+        server.await.unwrap();
+        let result = match completed {
+            Ok(result) => result,
+            Err(_) => {
+                let _ = extraction.await;
+                panic!(
+                    "tar rejection waited for the stalled server instead of cancelling its input"
+                );
+            }
+        };
+        assert!(result.unwrap_err().to_string().contains("traversal"));
+        assert_eq!(downloads.available_permits(), 1);
+        assert_eq!(extracts.available_permits(), 4);
+        assert!(key.try_lock().is_ok());
+        assert!(
+            std::fs::read_dir(store.paths().objects_root())
+                .unwrap()
+                .next()
+                .is_none()
+        );
     }
 
     #[tokio::test]
@@ -4398,10 +4527,43 @@ struct V2StreamInput<'a> {
     download_headers_ms: u128,
 }
 
+fn cancellable_tarball_stream<T, E>(
+    stream: impl futures::Stream<Item = Result<T, E>>,
+    cancellation: tokio_util::sync::CancellationToken,
+) -> impl futures::Stream<Item = std::io::Result<T>>
+where
+    E: std::error::Error + Send + Sync + 'static,
+{
+    use futures::StreamExt;
+    let response_stream = Box::pin(stream);
+    futures::stream::unfold(
+        (response_stream, cancellation, false),
+        |(mut stream, cancellation, finished)| async move {
+            if finished {
+                return None;
+            }
+            tokio::select! {
+                biased;
+                _ = cancellation.cancelled() => Some((
+                    Err(std::io::Error::new(
+                        std::io::ErrorKind::Interrupted,
+                        "streamed tarball download cancelled",
+                    )),
+                    (stream, cancellation, true),
+                )),
+                chunk = stream.next() => chunk.map(|chunk| (
+                    chunk.map_err(std::io::Error::other),
+                    (stream, cancellation, false),
+                )),
+            }
+        },
+    )
+    .fuse()
+}
+
 async fn extract_v2_registry_response(
     input: V2StreamInput<'_>,
 ) -> Result<(String, TaskTimings, lpm_store::v2::ExtractedObject), LpmError> {
-    use futures::StreamExt;
     use tokio_util::io::{StreamReader, SyncIoBridge};
 
     let V2StreamInput {
@@ -4433,29 +4595,8 @@ async fn extract_v2_registry_response(
     let download_elapsed_ms = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let cancellation = tokio_util::sync::CancellationToken::new();
     let cancellation_guard = cancellation.clone().drop_guard();
-    let response_stream = Box::pin(response.bytes_stream());
-    let cancellable_stream = futures::stream::unfold(
-        (response_stream, cancellation, false),
-        |(mut stream, cancellation, finished)| async move {
-            if finished {
-                return None;
-            }
-            tokio::select! {
-                biased;
-                _ = cancellation.cancelled() => Some((
-                    Err(std::io::Error::new(
-                        std::io::ErrorKind::Interrupted,
-                        "streamed tarball download cancelled",
-                    )),
-                    (stream, cancellation, true),
-                )),
-                chunk = stream.next() => chunk.map(|chunk| (
-                    chunk.map_err(std::io::Error::other),
-                    (stream, cancellation, false),
-                )),
-            }
-        },
-    );
+    let cancel_decoder_input = cancellation.clone();
+    let cancellable_stream = cancellable_tarball_stream(response.bytes_stream(), cancellation);
     let async_reader = StreamReader::new(Box::pin(cancellable_stream));
     let store_v2 = store_v2.clone();
     let expected_integrity = expected_integrity.map(str::to_owned);
@@ -4465,11 +4606,20 @@ async fn extract_v2_registry_response(
         let _extract_permit = base_permit;
         let sync_reader = SyncIoBridge::new(async_reader);
         let reader = StreamBodyPermitReader::new(sync_reader, permit, download_elapsed_for_reader);
-        store_v2.extract_object_from_stream(
-            reader,
-            expected_integrity.as_deref(),
-            lpm_registry::MAX_COMPRESSED_TARBALL_SIZE,
-        )
+        if use_pipelined_extraction(unpacked_size) {
+            store_v2.extract_object_from_pipelined_stream(
+                reader,
+                expected_integrity.as_deref(),
+                lpm_registry::MAX_COMPRESSED_TARBALL_SIZE,
+                || cancel_decoder_input.cancel(),
+            )
+        } else {
+            store_v2.extract_object_from_stream(
+                reader,
+                expected_integrity.as_deref(),
+                lpm_registry::MAX_COMPRESSED_TARBALL_SIZE,
+            )
+        }
     });
     let (joined, supplemental_lease_expired, supplemental_hold_ms) =
         await_v2_streaming_extract_task(

@@ -1,0 +1,177 @@
+{
+  "rows": [
+    {
+      "round": 0,
+      "counted": false,
+      "variant": "baseline",
+      "elapsed_us": 814286,
+      "files": 8531,
+      "max_rss_bytes": 10960896
+    },
+    {
+      "round": 0,
+      "counted": false,
+      "variant": "serial",
+      "elapsed_us": 783388,
+      "files": 8531,
+      "max_rss_bytes": 11108352
+    },
+    {
+      "round": 0,
+      "counted": false,
+      "variant": "pipelined",
+      "elapsed_us": 640789,
+      "files": 8531,
+      "max_rss_bytes": 11894784
+    },
+    {
+      "round": 1,
+      "counted": true,
+      "variant": "baseline",
+      "elapsed_us": 784960,
+      "files": 8531,
+      "max_rss_bytes": 10960896
+    },
+    {
+      "round": 1,
+      "counted": true,
+      "variant": "serial",
+      "elapsed_us": 770576,
+      "files": 8531,
+      "max_rss_bytes": 11091968
+    },
+    {
+      "round": 1,
+      "counted": true,
+      "variant": "pipelined",
+      "elapsed_us": 636226,
+      "files": 8531,
+      "max_rss_bytes": 11894784
+    },
+    {
+      "round": 2,
+      "counted": true,
+      "variant": "baseline",
+      "elapsed_us": 811503,
+      "files": 8531,
+      "max_rss_bytes": 10977280
+    },
+    {
+      "round": 2,
+      "counted": true,
+      "variant": "pipelined",
+      "elapsed_us": 631966,
+      "files": 8531,
+      "max_rss_bytes": 11894784
+    },
+    {
+      "round": 2,
+      "counted": true,
+      "variant": "serial",
+      "elapsed_us": 757339,
+      "files": 8531,
+      "max_rss_bytes": 11108352
+    },
+    {
+      "round": 3,
+      "counted": true,
+      "variant": "serial",
+      "elapsed_us": 763886,
+      "files": 8531,
+      "max_rss_bytes": 11108352
+    },
+    {
+      "round": 3,
+      "counted": true,
+      "variant": "baseline",
+      "elapsed_us": 789692,
+      "files": 8531,
+      "max_rss_bytes": 10944512
+    },
+    {
+      "round": 3,
+      "counted": true,
+      "variant": "pipelined",
+      "elapsed_us": 621332,
+      "files": 8531,
+      "max_rss_bytes": 11894784
+    },
+    {
+      "round": 4,
+      "counted": true,
+      "variant": "serial",
+      "elapsed_us": 793495,
+      "files": 8531,
+      "max_rss_bytes": 11108352
+    },
+    {
+      "round": 4,
+      "counted": true,
+      "variant": "pipelined",
+      "elapsed_us": 636433,
+      "files": 8531,
+      "max_rss_bytes": 11911168
+    },
+    {
+      "round": 4,
+      "counted": true,
+      "variant": "baseline",
+      "elapsed_us": 801739,
+      "files": 8531,
+      "max_rss_bytes": 10960896
+    },
+    {
+      "round": 5,
+      "counted": true,
+      "variant": "pipelined",
+      "elapsed_us": 649812,
+      "files": 8531,
+      "max_rss_bytes": 11894784
+    },
+    {
+      "round": 5,
+      "counted": true,
+      "variant": "baseline",
+      "elapsed_us": 792830,
+      "files": 8531,
+      "max_rss_bytes": 10960896
+    },
+    {
+      "round": 5,
+      "counted": true,
+      "variant": "serial",
+      "elapsed_us": 763698,
+      "files": 8531,
+      "max_rss_bytes": 11124736
+    },
+    {
+      "round": 6,
+      "counted": true,
+      "variant": "pipelined",
+      "elapsed_us": 636035,
+      "files": 8531,
+      "max_rss_bytes": 11894784
+    },
+    {
+      "round": 6,
+      "counted": true,
+      "variant": "serial",
+      "elapsed_us": 747861,
+      "files": 8531,
+      "max_rss_bytes": 11108352
+    },
+    {
+      "round": 6,
+      "counted": true,
+      "variant": "baseline",
+      "elapsed_us": 772888,
+      "files": 8531,
+      "max_rss_bytes": 10960896
+    }
+  ],
+  "manifest_sha256": {
+    "baseline": "dffbedae531c71fb31d107d1e1908217fa08662844bdcdba76fc166d2e631480",
+    "serial": "dffbedae531c71fb31d107d1e1908217fa08662844bdcdba76fc166d2e631480",
+    "pipelined": "dffbedae531c71fb31d107d1e1908217fa08662844bdcdba76fc166d2e631480"
+  }
+}
