@@ -6,6 +6,74 @@ enum Preference {
     Latest(Box<VersionMetadata>),
 }
 
+/// How one known preference answers a ranged request.
+enum Selection {
+    Ready(Box<Selected>),
+    CompleteHistory,
+    History,
+}
+
+struct Selected {
+    metadata: PackageMetadata,
+    versions_complete: bool,
+    platform_metadata_complete: bool,
+}
+
+impl Selected {
+    fn with_timings(self, timings: PackageMetadataFetchTimings) -> TimedPreferredMetadata {
+        TimedPreferredMetadata {
+            fetched: TimedPackageMetadata {
+                metadata: self.metadata,
+                timings,
+            },
+            versions_complete: self.versions_complete,
+            platform_metadata_complete: self.platform_metadata_complete,
+        }
+    }
+}
+
+fn select_preference(
+    name: &str,
+    preference: Preference,
+    accepts: &impl Fn(&str) -> bool,
+) -> Selection {
+    match preference {
+        Preference::History(selected) if selected.covers(accepts) => {
+            Selection::Ready(Box::new(Selected {
+                metadata: selected.metadata,
+                versions_complete: selected.versions_complete,
+                platform_metadata_complete: false,
+            }))
+        }
+        Preference::History(_) => Selection::CompleteHistory,
+        Preference::Latest(manifest) if accepts(&manifest.version) => {
+            let version = manifest.version.clone();
+            match package_metadata_from_version_doc(name, &version, *manifest) {
+                Ok(mut metadata) => {
+                    metadata.dist_tags.insert("latest".to_owned(), version);
+                    Selection::Ready(Box::new(Selected {
+                        metadata,
+                        versions_complete: false,
+                        platform_metadata_complete: true,
+                    }))
+                }
+                Err(_) => Selection::History,
+            }
+        }
+        Preference::Latest(_) => Selection::History,
+    }
+}
+
+fn history_result(
+    (fetched, versions_complete): (TimedPackageMetadata, bool),
+) -> TimedPreferredMetadata {
+    TimedPreferredMetadata {
+        fetched,
+        versions_complete,
+        platform_metadata_complete: false,
+    }
+}
+
 fn valid_latest(name: &str, manifest: &VersionMetadata) -> bool {
     if manifest.name != name || lpm_semver::Version::parse(&manifest.version).is_err() {
         return false;
@@ -31,59 +99,115 @@ impl RegistryClient {
         self.metadata_cache_key_for_origin("npm-direct-latest", &self.npm_registry_url, name, None)
     }
 
-    /// Prefer a full latest-version document when it satisfies the range.
-    /// Fresh history caches take precedence; partial documents never populate
-    /// complete-history caches or provide publication-time authority.
+    /// Resolve a ranged request from the smallest document that can answer it.
+    ///
+    /// Fresh history caches take precedence over cached latest documents. Without a
+    /// usable cache, the latest document and the preferred history are requested
+    /// together: a latest version inside the range answers the request and cancels
+    /// the history transfer, while any other outcome continues with the history
+    /// already in flight, so a miss never adds a sequential round trip. Partial
+    /// documents never populate complete-history caches or provide
+    /// publication-time authority.
+    #[tracing::instrument(
+        target = "lpm_install_timeline",
+        level = "trace",
+        name = "preferred_metadata",
+        skip_all
+    )]
     pub async fn get_npm_preferred_resolution_metadata_with_timings<F>(
         &self,
         name: &str,
         accepts: F,
     ) -> Result<TimedPreferredMetadata, LpmError>
     where
-        F: Fn(&str) -> bool + Send + 'static,
+        F: Fn(&str) -> bool + Send + Sync + 'static,
     {
         crate::timing::record_metadata_request(name);
         let mut timings = PackageMetadataFetchTimings::default();
-        let preference = self.fetch_latest_preference(name, &mut timings).await;
-        let force_complete = match preference {
-            Ok(Preference::History(selected)) if selected.covers(&accepts) => {
-                return Ok(TimedPreferredMetadata {
-                    fetched: TimedPackageMetadata {
-                        metadata: selected.metadata,
-                        timings,
-                    },
-                    versions_complete: selected.versions_complete,
-                    platform_metadata_complete: false,
-                });
+        let latest_key = self.npm_latest_metadata_cache_key(name);
+        let started = std::time::Instant::now();
+        let cached = self.read_preference_cache(name, &latest_key).await;
+        timings.cache_read_ms += started.elapsed().as_millis();
+        match cached.map(|preference| select_preference(name, preference, &accepts)) {
+            Some(Selection::Ready(selected)) => {
+                timings.cache_hit = true;
+                crate::timing::record_metadata_cache_hit();
+                Ok(selected.with_timings(timings))
             }
-            Ok(Preference::History(_)) => true,
-            Ok(Preference::Latest(manifest)) if accepts(&manifest.version) => {
-                let version = manifest.version.clone();
-                let mut metadata = package_metadata_from_version_doc(name, &version, *manifest)?;
-                metadata.dist_tags.insert("latest".to_owned(), version);
-                return Ok(TimedPreferredMetadata {
-                    fetched: TimedPackageMetadata { metadata, timings },
-                    versions_complete: false,
-                    platform_metadata_complete: true,
-                });
+            Some(Selection::CompleteHistory) => {
+                let mut fetched = self.get_npm_metadata_direct_with_timings(name).await?;
+                self.invalidate_metadata_cache_key(&self.npm_preferred_metadata_cache_key(name));
+                fetched.timings.add_attempt(&timings);
+                Ok(history_result((fetched, true)))
             }
-            Ok(Preference::Latest(_)) | Err(_) => false,
+            Some(Selection::History) => {
+                crate::timing::record_metadata_cache_miss();
+                self.fetch_npm_preferred_history::<_, true>(name, accepts, timings)
+                    .await
+                    .map(history_result)
+            }
+            None => {
+                crate::timing::record_metadata_cache_miss();
+                self.race_latest_and_history(name, &latest_key, accepts, timings)
+                    .await
+            }
+        }
+    }
+
+    async fn race_latest_and_history<F>(
+        &self,
+        name: &str,
+        latest_key: &str,
+        accepts: F,
+        timings: PackageMetadataFetchTimings,
+    ) -> Result<TimedPreferredMetadata, LpmError>
+    where
+        F: Fn(&str) -> bool + Send + Sync + 'static,
+    {
+        let accepts = Arc::new(accepts);
+        let history_accepts = Arc::clone(&accepts);
+        let history = self.fetch_npm_preferred_history::<_, true>(
+            name,
+            move |version: &str| history_accepts(version),
+            PackageMetadataFetchTimings::default(),
+        );
+        let latest = self.fetch_latest_leg(name, latest_key);
+        tokio::pin!(history, latest);
+        // Poll the latest leg first: a request queued behind another request's
+        // history flight then answers from the shared latest document before it
+        // sends a history request of its own.
+        let (latest_result, latest_timings) = tokio::select! {
+            biased;
+            latest_outcome = &mut latest => latest_outcome,
+            history_outcome = &mut history => {
+                let history_error = match history_outcome {
+                    Ok((mut fetched, versions_complete)) => {
+                        fetched.timings.add_attempt(&timings);
+                        return Ok(history_result((fetched, versions_complete)));
+                    }
+                    Err(error) => error,
+                };
+                let (latest_result, mut latest_timings) = latest.await;
+                latest_timings.add_attempt(&timings);
+                return match latest_result
+                    .map(|preference| select_preference(name, preference, &*accepts))
+                {
+                    Ok(Selection::Ready(selected)) => Ok(selected.with_timings(latest_timings)),
+                    _ => Err(history_error),
+                };
+            }
         };
-        // The latest flight ends before entering either history flight.
-        let (mut fetched, versions_complete) = if force_complete {
-            let fetched = self.get_npm_metadata_direct_with_timings(name).await?;
-            self.invalidate_metadata_cache_key(&self.npm_preferred_metadata_cache_key(name));
-            (fetched, true)
-        } else {
-            self.get_npm_preferred_metadata_with_cache_fields::<_, true>(name, accepts)
-                .await?
-        };
+        if let Ok(preference) = latest_result
+            && let Selection::Ready(selected) = select_preference(name, preference, &*accepts)
+        {
+            let mut answer = latest_timings;
+            answer.add_attempt(&timings);
+            return Ok(selected.with_timings(answer));
+        }
+        let (mut fetched, versions_complete) = history.await?;
+        fetched.timings.add_concurrent_attempt(&latest_timings);
         fetched.timings.add_attempt(&timings);
-        Ok(TimedPreferredMetadata {
-            fetched,
-            versions_complete,
-            platform_metadata_complete: false,
-        })
+        Ok(history_result((fetched, versions_complete)))
     }
 
     async fn read_preference_cache(&self, name: &str, latest_key: &str) -> Option<Preference> {
@@ -129,36 +253,32 @@ impl RegistryClient {
         valid_latest(name, &cached.value).then_some(Preference::Latest(Box::new(cached.value)))
     }
 
-    async fn fetch_latest_preference(
+    /// Fetch the latest document after the caller found no usable cache. The flight
+    /// re-checks every preference cache so concurrent requests share one response.
+    async fn fetch_latest_leg(
         &self,
         name: &str,
-        timings: &mut PackageMetadataFetchTimings,
-    ) -> Result<Preference, LpmError> {
-        let key = self.npm_latest_metadata_cache_key(name);
+        key: &str,
+    ) -> (Result<Preference, LpmError>, PackageMetadataFetchTimings) {
+        let mut timings = PackageMetadataFetchTimings::default();
+        let _flight = self.history_cache.flight(key).await;
+        let (generation, _) = self.history_cache.lookup(key);
         let started = std::time::Instant::now();
-        let cached = self.read_preference_cache(name, &key).await;
+        let cached = self.read_preference_cache(name, key).await;
         timings.cache_read_ms += started.elapsed().as_millis();
         if let Some(cached) = cached {
             timings.cache_hit = true;
-            crate::timing::record_metadata_cache_hit();
-            return Ok(cached);
-        }
-        crate::timing::record_metadata_cache_miss();
-        let _flight = self.history_cache.flight(&key).await;
-        let (generation, _) = self.history_cache.lookup(&key);
-        let started = std::time::Instant::now();
-        let cached = self.read_preference_cache(name, &key).await;
-        timings.cache_read_ms += started.elapsed().as_millis();
-        if let Some(cached) = cached {
-            timings.cache_hit = true;
-            return Ok(cached);
+            return (Ok(cached), timings);
         }
         let rpc_start = std::time::Instant::now();
         let result = self
-            .fetch_latest_document(name, &key, generation, timings)
+            .fetch_latest_document(name, key, generation, &mut timings)
             .await;
         crate::timing::record_rpc(rpc_start.elapsed());
-        result.map(|manifest| Preference::Latest(Box::new(manifest)))
+        (
+            result.map(|manifest| Preference::Latest(Box::new(manifest))),
+            timings,
+        )
     }
 
     async fn fetch_latest_document(

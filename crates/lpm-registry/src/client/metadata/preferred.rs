@@ -241,7 +241,7 @@ impl RegistryClient {
         accepts: F,
     ) -> Result<(TimedPackageMetadata, bool), LpmError>
     where
-        F: Fn(&str) -> bool + Send + 'static,
+        F: Fn(&str) -> bool + Send + Sync + 'static,
     {
         let result = self
             .get_npm_preferred_resolution_metadata_with_timings(name, accepts)
@@ -309,6 +309,23 @@ impl RegistryClient {
         }
         timings.cache_read_ms = read_start.elapsed().as_millis();
         crate::timing::record_metadata_cache_miss();
+        self.fetch_npm_preferred_history::<_, RESOLVER>(name, accepts, timings)
+            .await
+    }
+
+    /// Fetch preferred history after the caller has recorded the request and its cache miss.
+    /// The flight re-checks both history caches so concurrent callers share one response.
+    async fn fetch_npm_preferred_history<F, const RESOLVER: bool>(
+        &self,
+        name: &str,
+        accepts: F,
+        mut timings: PackageMetadataFetchTimings,
+    ) -> Result<(TimedPackageMetadata, bool), LpmError>
+    where
+        F: Fn(&str) -> bool + Send + 'static,
+    {
+        let cache_key = self.npm_preferred_metadata_cache_key(name);
+        let complete_key = self.npm_direct_metadata_cache_key(name);
         let _flight = metadata_fetch_flight_guard(&cache_key).await;
         let coalesced_start = std::time::Instant::now();
         if let Some(cached) = self

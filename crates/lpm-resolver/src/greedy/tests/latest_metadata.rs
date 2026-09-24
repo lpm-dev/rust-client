@@ -21,10 +21,15 @@ async fn fusion_latest_document_covers_matching_ranges_and_full_platform_fields(
             .expect(1)
             .mount(&server)
             .await;
+        // History raced against the latest document never answers in time.
         Mock::given(method("GET"))
             .and(path(format!("/{name}")))
-            .respond_with(ResponseTemplate::new(500))
-            .expect(0)
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({}))
+                    .set_delay(std::time::Duration::from_secs(30)),
+            )
+            .expect(..=1)
             .mount(&server)
             .await;
     }
@@ -84,10 +89,11 @@ async fn latest_alias_metadata_hydrates_history_for_an_older_required_peer() {
     }
     let mut history = metadata_json_version("shared", "2.0.0", &[]);
     history["versions"]["1.0.0"] = version_document_json("shared", "1.0.0", &[]);
+    // Peer hydration needs history even when the raced history was abandoned.
     Mock::given(method("GET"))
         .and(path("/shared"))
         .respond_with(ResponseTemplate::new(200).set_body_json(history))
-        .expect(1)
+        .expect(1..=2)
         .mount(&server)
         .await;
     let result = resolve_greedy_fused_with_cache_options_and_policy(

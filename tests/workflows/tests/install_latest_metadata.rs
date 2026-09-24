@@ -6,7 +6,7 @@ use wiremock::matchers::{header, method, path};
 use wiremock::{Mock, ResponseTemplate};
 
 #[tokio::test]
-async fn ranged_install_uses_latest_document_without_fetching_package_history() {
+async fn ranged_install_answers_from_latest_document_without_waiting_for_history() {
     install_latest(false).await;
 }
 
@@ -41,6 +41,19 @@ async fn install_latest(scripted: bool) {
         .respond_with(ResponseTemplate::new(200).set_body_json(&metadata["versions"]["1.1.0"]))
         .mount(registry.server())
         .await;
+    // The history raced against the latest document trails it; later
+    // history reads, such as publication times, are answered immediately.
+    Mock::given(method("GET"))
+        .and(path("/latest-package"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(&metadata)
+                .set_delay(std::time::Duration::from_secs(2)),
+        )
+        .up_to_n_times(1)
+        .with_priority(1)
+        .mount(registry.server())
+        .await;
     registry
         .with_package_metadata("latest-package", "1.1.0", &tarball, metadata)
         .await;
@@ -65,16 +78,17 @@ async fn install_latest(scripted: bool) {
     assert!(lock.contains("name = \"latest-package\""));
     assert!(lock.contains("version = \"1.1.0\""));
     let requests = registry.server().received_requests().await.unwrap();
-    let metadata_paths: Vec<_> = requests
-        .iter()
-        .map(|request| request.url.path())
-        .filter(|path| matches!(*path, "/latest-package" | "/latest-package/latest"))
-        .collect();
+    let count = |endpoint: &str| {
+        requests
+            .iter()
+            .filter(|request| request.url.path() == endpoint)
+            .count()
+    };
+    let (latest_requests, history_requests) =
+        (count("/latest-package/latest"), count("/latest-package"));
+    assert_eq!(latest_requests, 1);
     if scripted {
-        assert_eq!(
-            metadata_paths,
-            ["/latest-package/latest", "/latest-package"]
-        );
+        assert!((1..=2).contains(&history_requests), "{history_requests}");
         let state: serde_json::Value =
             serde_json::from_str(&project.read_file(".lpm/build-state.json")).unwrap();
         let blocked = state["blocked_packages"].as_array().unwrap();
@@ -82,7 +96,7 @@ async fn install_latest(scripted: bool) {
         assert_eq!(blocked[0]["name"], "latest-package");
         assert_eq!(blocked[0]["published_at"], "2025-01-01T00:00:00Z");
     } else {
-        assert_eq!(metadata_paths, ["/latest-package/latest"]);
+        assert!(history_requests <= 1, "{history_requests}");
         let rendered = format!(
             "{}{}",
             String::from_utf8_lossy(&output.get_output().stdout),
@@ -132,9 +146,11 @@ async fn optional_latest_keeps_portable_platform_metadata_without_fetching_paylo
             .any(|request| request.url.path().contains("/-/"))
     );
     assert!(
-        !requests
+        requests
             .iter()
-            .any(|request| request.url.path() == "/optional-latest")
+            .filter(|request| request.url.path() == "/optional-latest")
+            .count()
+            <= 1
     );
     registry.server().verify().await;
 }

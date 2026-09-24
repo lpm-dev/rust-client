@@ -1,7 +1,62 @@
 use super::tests::{history, preferred_test_client};
 use super::*;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use wiremock::matchers::{header, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
+
+/// Longer than any test deadline, so a request that waits for it fails the deadline.
+const STALLED: Duration = Duration::from_secs(30);
+const DEADLINE: Duration = Duration::from_secs(10);
+
+async fn within_deadline<T>(future: impl std::future::Future<Output = T>) -> T {
+    tokio::time::timeout(DEADLINE, future)
+        .await
+        .expect("resolution waited for a stalled response")
+}
+
+/// Serve history only after the returned gate opens, so a latest document
+/// answers the race deterministically.
+async fn mount_gated_history(server: &MockServer, body: &serde_json::Value) -> Arc<AtomicBool> {
+    let stalled = Arc::new(AtomicBool::new(true));
+    let gate = Arc::clone(&stalled);
+    let body = body.clone();
+    Mock::given(method("GET"))
+        .and(path("/pkg"))
+        .respond_with(move |_: &wiremock::Request| {
+            let response = ResponseTemplate::new(200).set_body_json(&body);
+            if gate.load(Ordering::SeqCst) {
+                response.set_delay(STALLED)
+            } else {
+                response
+            }
+        })
+        .mount(server)
+        .await;
+    stalled
+}
+
+/// Serve history after the latest document, so a rejected latest document is
+/// observed before history answers.
+async fn mount_trailing_history(server: &MockServer, body: &serde_json::Value) {
+    Mock::given(method("GET"))
+        .and(path("/pkg"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(body)
+                .set_delay(Duration::from_millis(100)),
+        )
+        .mount(server)
+        .await;
+}
+
+/// Count `(latest, history)` requests; raced requests can arrive in either order.
+async fn request_counts(server: &MockServer) -> (usize, usize) {
+    let paths = request_paths(server).await;
+    let latest = paths.iter().filter(|path| *path == "/pkg/latest").count();
+    let history = paths.iter().filter(|path| *path == "/pkg").count();
+    assert_eq!(latest + history, paths.len(), "{paths:?}");
+    (latest, history)
+}
 
 fn downloadable_history(server: &MockServer) -> serde_json::Value {
     let mut body = history();
@@ -33,7 +88,7 @@ async fn request_paths(server: &MockServer) -> Vec<String> {
 }
 
 #[tokio::test]
-async fn resolver_preference_fetches_latest_without_history() {
+async fn resolver_preference_answers_from_latest_without_waiting_for_history() {
     let server = MockServer::start().await;
     let mut body = history();
     let latest = &mut body["versions"]["2.0.0"];
@@ -56,26 +111,23 @@ async fn resolver_preference_fetches_latest_without_history() {
         .respond_with(ResponseTemplate::new(200).set_body_json(latest.clone()))
         .mount(&server)
         .await;
-    Mock::given(method("GET"))
-        .and(path("/pkg"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(body))
-        .mount(&server)
-        .await;
+    mount_gated_history(&server, &body).await;
     let cache = tempfile::tempdir().unwrap();
     let client = preferred_test_client(&server, cache.path()).await;
-    let (selected, complete) = client
-        .get_npm_preferred_metadata_for_resolution_with_timings("pkg", |v| v == "2.0.0")
-        .await
-        .unwrap();
+    let (selected, complete) = within_deadline(
+        client.get_npm_preferred_metadata_for_resolution_with_timings("pkg", |v| v == "2.0.0"),
+    )
+    .await
+    .unwrap();
     assert!(!complete);
     assert_eq!(selected.metadata.versions.len(), 1);
     assert_eq!(
         serde_json::to_value(&selected.metadata.versions["2.0.0"]).unwrap(),
         serde_json::to_value(expected).unwrap()
     );
-    let requests = server.received_requests().await.unwrap();
-    let paths: Vec<_> = requests.iter().map(|request| request.url.path()).collect();
-    assert_eq!(paths, ["/pkg/latest"]);
+    let (latest, history) = request_counts(&server).await;
+    assert_eq!(latest, 1);
+    assert!(history <= 1);
 }
 
 #[tokio::test]
@@ -123,7 +175,7 @@ async fn invalid_latest_documents_fall_back_to_history() {
             .respond_with(response)
             .mount(&server)
             .await;
-        mount_history(&server, &body).await;
+        mount_trailing_history(&server, &body).await;
         let cache = tempfile::tempdir().unwrap();
         let client = preferred_test_client(&server, cache.path()).await;
         let (result, _) = client
@@ -131,11 +183,7 @@ async fn invalid_latest_documents_fall_back_to_history() {
             .await
             .unwrap();
         assert!(result.metadata.versions.contains_key("2.0.0"), "{case}");
-        assert_eq!(
-            request_paths(&server).await,
-            ["/pkg/latest", "/pkg"],
-            "{case}"
-        );
+        assert_eq!(request_counts(&server).await, (1, 1), "{case}");
     }
 }
 
@@ -148,7 +196,7 @@ async fn latest_outside_the_range_falls_back_to_complete_history() {
         .respond_with(ResponseTemplate::new(200).set_body_json(&body["versions"]["2.0.0"]))
         .mount(&server)
         .await;
-    mount_history(&server, &body).await;
+    mount_trailing_history(&server, &body).await;
     let cache = tempfile::tempdir().unwrap();
     let client = preferred_test_client(&server, cache.path()).await;
     let (result, complete) = client
@@ -157,7 +205,7 @@ async fn latest_outside_the_range_falls_back_to_complete_history() {
         .unwrap();
     assert!(complete);
     assert!(result.metadata.versions.contains_key("1.0.0"));
-    assert_eq!(request_paths(&server).await, ["/pkg/latest", "/pkg"]);
+    assert_eq!(request_counts(&server).await, (1, 1));
 }
 
 #[tokio::test]
@@ -201,18 +249,22 @@ async fn latest_cache_does_not_satisfy_complete_history_consumers() {
         .respond_with(ResponseTemplate::new(200).set_body_json(&body["versions"]["2.0.0"]))
         .mount(&server)
         .await;
-    mount_history(&server, &body).await;
+    let history_stalled = mount_gated_history(&server, &body).await;
     let cache = tempfile::tempdir().unwrap();
     let client = preferred_test_client(&server, cache.path()).await;
-    let (selected, complete) = client
-        .get_npm_preferred_metadata_for_resolution_with_timings("pkg", |_| true)
-        .await
-        .unwrap();
+    let (selected, complete) = within_deadline(
+        client.get_npm_preferred_metadata_for_resolution_with_timings("pkg", |_| true),
+    )
+    .await
+    .unwrap();
     assert!(!complete);
     assert_eq!(selected.metadata.versions.len(), 1);
+    history_stalled.store(false, Ordering::SeqCst);
     let full = client.get_npm_metadata_direct("pkg").await.unwrap();
     assert_eq!(full.versions.len(), 2);
-    assert_eq!(request_paths(&server).await, ["/pkg/latest", "/pkg"]);
+    let (latest, history) = request_counts(&server).await;
+    assert_eq!(latest, 1);
+    assert!((1..=2).contains(&history));
 }
 
 #[tokio::test]
@@ -229,16 +281,23 @@ async fn concurrent_latest_requests_share_one_document() {
         )
         .mount(&server)
         .await;
-    mount_history(&server, &body).await;
+    mount_gated_history(&server, &body).await;
     let cache = tempfile::tempdir().unwrap();
     let client = preferred_test_client(&server, cache.path()).await;
-    let (first, second) = tokio::join!(
-        client.get_npm_preferred_metadata_for_resolution_with_timings("pkg", |_| true),
-        client.get_npm_preferred_metadata_for_resolution_with_timings("pkg", |v| v == "2.0.0")
-    );
+    let (first, second) = within_deadline(async {
+        tokio::join!(
+            client.get_npm_preferred_metadata_for_resolution_with_timings("pkg", |_| true),
+            client.get_npm_preferred_metadata_for_resolution_with_timings("pkg", |v| v == "2.0.0")
+        )
+    })
+    .await;
     assert!(!first.unwrap().1);
     assert!(!second.unwrap().1);
-    assert_eq!(request_paths(&server).await, ["/pkg/latest"]);
+    // A caller queued behind the shared history flight can start a history
+    // request before it reads the shared latest document; it abandons that transfer.
+    let (latest, history) = request_counts(&server).await;
+    assert_eq!(latest, 1);
+    assert!(history <= 2);
 }
 
 #[tokio::test]
@@ -254,21 +313,24 @@ async fn package_cache_invalidation_refetches_the_latest_document() {
         )
         .mount(&server)
         .await;
-    mount_history(&server, &body).await;
+    mount_gated_history(&server, &body).await;
     let cache = tempfile::tempdir().unwrap();
     let client = preferred_test_client(&server, cache.path()).await;
     for invalidate in [false, false, true] {
         if invalidate {
             client.invalidate_metadata_cache("pkg");
         }
-        let (result, complete) = client
-            .get_npm_preferred_metadata_for_resolution_with_timings("pkg", |_| true)
-            .await
-            .unwrap();
+        let (result, complete) = within_deadline(
+            client.get_npm_preferred_metadata_for_resolution_with_timings("pkg", |_| true),
+        )
+        .await
+        .unwrap();
         assert!(!complete);
         assert!(result.metadata.versions.contains_key("2.0.0"));
     }
-    assert_eq!(request_paths(&server).await, ["/pkg/latest", "/pkg/latest"]);
+    let (latest, history) = request_counts(&server).await;
+    assert_eq!(latest, 2);
+    assert!(history <= 2);
 }
 
 #[tokio::test]
@@ -284,17 +346,20 @@ async fn latest_no_store_responses_are_not_reused() {
         )
         .mount(&server)
         .await;
-    mount_history(&server, &body).await;
+    mount_gated_history(&server, &body).await;
     let cache = tempfile::tempdir().unwrap();
     let client = preferred_test_client(&server, cache.path()).await;
     for _ in 0..2 {
-        let (result, _) = client
-            .get_npm_preferred_metadata_for_resolution_with_timings("pkg", |_| true)
-            .await
-            .unwrap();
+        let (result, _) = within_deadline(
+            client.get_npm_preferred_metadata_for_resolution_with_timings("pkg", |_| true),
+        )
+        .await
+        .unwrap();
         assert!(!result.timings.cache_hit);
     }
-    assert_eq!(request_paths(&server).await, ["/pkg/latest", "/pkg/latest"]);
+    let (latest, history) = request_counts(&server).await;
+    assert_eq!(latest, 2);
+    assert!(history <= 2);
 }
 
 #[tokio::test]
@@ -309,7 +374,7 @@ async fn latest_failed_parse_bytes_are_counted_when_history_recovers() {
         )
         .mount(&server)
         .await;
-    mount_history(&server, &body).await;
+    mount_trailing_history(&server, &body).await;
     let cache = tempfile::tempdir().unwrap();
     let client = preferred_test_client(&server, cache.path()).await;
     let (result, _) = client
@@ -320,7 +385,7 @@ async fn latest_failed_parse_bytes_are_counted_when_history_recovers() {
         result.timings.body_bytes as usize,
         malformed.len() + serde_json::to_vec(&body).unwrap().len()
     );
-    assert_eq!(request_paths(&server).await, ["/pkg/latest", "/pkg"]);
+    assert_eq!(request_counts(&server).await, (1, 1));
 }
 
 #[tokio::test]
@@ -342,6 +407,7 @@ async fn latest_document_is_reused_while_disk_publication_is_pending() {
         )
         .mount(&server)
         .await;
+    mount_gated_history(&server, &body).await;
     let cache = tempfile::tempdir().unwrap();
     let client = preferred_test_client(&server, cache.path())
         .await
@@ -368,7 +434,9 @@ async fn latest_document_is_reused_while_disk_publication_is_pending() {
         assert!(result.0.metadata.versions.contains_key("2.0.0"));
     }
     drop(publication);
-    assert_eq!(request_paths(&server).await, ["/pkg/latest"]);
+    let (latest, history) = request_counts(&server).await;
+    assert_eq!(latest, 1);
+    assert!(history <= 1);
 }
 
 #[tokio::test]
@@ -386,13 +454,23 @@ async fn latest_response_started_before_invalidation_cannot_repopulate_the_cache
         let (started, observed) = tokio::sync::oneshot::channel();
         let (release, released) = tokio::sync::oneshot::channel();
         let serving = tokio::spawn(async move {
-            let (mut connection, _) = listener.accept().await.unwrap();
-            let mut request = Vec::with_capacity(1024);
-            while !request.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
-                assert!(request.len() < 16 * 1024);
-                assert_ne!(connection.read_buf(&mut request).await.unwrap(), 0);
-            }
-            assert!(request.starts_with(b"GET /pkg/latest "));
+            // Raced history requests stay unanswered until the client abandons them.
+            let mut stalled_history = Vec::new();
+            let mut connection = loop {
+                let (mut connection, _) = listener.accept().await.unwrap();
+                let mut request = Vec::with_capacity(1024);
+                while !request.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
+                    assert!(request.len() < 16 * 1024);
+                    if connection.read_buf(&mut request).await.unwrap() == 0 {
+                        break;
+                    }
+                }
+                if request.starts_with(b"GET /pkg/latest ") {
+                    break connection;
+                }
+                assert!(request.is_empty() || request.starts_with(b"GET /pkg "));
+                stalled_history.push(connection);
+            };
             started.send(()).unwrap();
             if released.await.is_err() {
                 return;
@@ -560,14 +638,18 @@ async fn latest_cache_is_isolated_between_registry_origins() {
             .respond_with(ResponseTemplate::new(200).set_body_json(&body["versions"][version]))
             .mount(server)
             .await;
+        mount_gated_history(server, &body).await;
         let client = preferred_test_client(server, cache.path()).await;
-        let result = client
-            .get_npm_preferred_resolution_metadata_with_timings("pkg", |_| true)
-            .await
-            .unwrap();
+        let result = within_deadline(
+            client.get_npm_preferred_resolution_metadata_with_timings("pkg", |_| true),
+        )
+        .await
+        .unwrap();
         assert!(!result.fetched.timings.cache_hit);
         assert!(result.fetched.metadata.versions.contains_key(version));
-        assert_eq!(request_paths(server).await, ["/pkg/latest"]);
+        let (latest, history) = request_counts(server).await;
+        assert_eq!(latest, 1);
+        assert!(history <= 1);
     }
 }
 
@@ -580,17 +662,21 @@ async fn latest_command_reuse_does_not_require_a_disk_cache() {
         .respond_with(ResponseTemplate::new(200).set_body_json(&body["versions"]["2.0.0"]))
         .mount(&server)
         .await;
+    mount_gated_history(&server, &body).await;
     let client = RegistryClient::new()
         .with_npm_registry_url(server.uri())
         .with_cache_dir(None);
     for expected_hit in [false, true] {
-        let result = client
-            .get_npm_preferred_resolution_metadata_with_timings("pkg", |_| true)
-            .await
-            .unwrap();
+        let result = within_deadline(
+            client.get_npm_preferred_resolution_metadata_with_timings("pkg", |_| true),
+        )
+        .await
+        .unwrap();
         assert_eq!(result.fetched.timings.cache_hit, expected_hit);
     }
-    assert_eq!(request_paths(&server).await, ["/pkg/latest"]);
+    let (latest, history) = request_counts(&server).await;
+    assert_eq!(latest, 1);
+    assert!(history <= 1);
 }
 
 #[tokio::test]
@@ -602,31 +688,29 @@ async fn different_ranges_share_latest_then_fall_back_to_history() {
         .respond_with(ResponseTemplate::new(200).set_body_json(&body["versions"]["2.0.0"]))
         .mount(&server)
         .await;
-    mount_history(&server, &body).await;
+    mount_trailing_history(&server, &body).await;
     let cache = tempfile::tempdir().unwrap();
     let client = preferred_test_client(&server, cache.path()).await;
     let (latest, older) = tokio::join!(
         client.get_npm_preferred_resolution_metadata_with_timings("pkg", |v| v == "2.0.0"),
         client.get_npm_preferred_resolution_metadata_with_timings("pkg", |v| v == "1.0.0"),
     );
-    assert!(
-        latest
-            .unwrap()
-            .fetched
-            .metadata
-            .versions
-            .contains_key("2.0.0")
-    );
+    let latest = latest.unwrap();
+    assert!(!latest.versions_complete);
+    assert!(latest.fetched.metadata.versions.contains_key("2.0.0"));
     let older = older.unwrap();
     assert!(older.versions_complete);
     assert!(older.fetched.metadata.versions.contains_key("1.0.0"));
-    assert_eq!(request_paths(&server).await, ["/pkg/latest", "/pkg"]);
+    let (latest_requests, history_requests) = request_counts(&server).await;
+    assert_eq!(latest_requests, 1);
+    assert!((1..=2).contains(&history_requests));
 }
 
 #[tokio::test]
 async fn latest_without_integrity_accepts_a_valid_shasum() {
     let server = MockServer::start().await;
-    let mut body = downloadable_history(&server)["versions"]["2.0.0"].clone();
+    let history = downloadable_history(&server);
+    let mut body = history["versions"]["2.0.0"].clone();
     body["dist"].as_object_mut().unwrap().remove("integrity");
     body["dist"]["shasum"] = serde_json::json!("a".repeat(40));
     Mock::given(method("GET"))
@@ -634,14 +718,17 @@ async fn latest_without_integrity_accepts_a_valid_shasum() {
         .respond_with(ResponseTemplate::new(200).set_body_json(body))
         .mount(&server)
         .await;
+    mount_gated_history(&server, &history).await;
     let cache = tempfile::tempdir().unwrap();
     let client = preferred_test_client(&server, cache.path()).await;
-    let result = client
-        .get_npm_preferred_resolution_metadata_with_timings("pkg", |_| true)
-        .await
-        .unwrap();
+    let result =
+        within_deadline(client.get_npm_preferred_resolution_metadata_with_timings("pkg", |_| true))
+            .await
+            .unwrap();
     assert!(result.platform_metadata_complete);
-    assert_eq!(request_paths(&server).await, ["/pkg/latest"]);
+    let (latest, history) = request_counts(&server).await;
+    assert_eq!(latest, 1);
+    assert!(history <= 1);
 }
 
 #[tokio::test]
@@ -654,13 +741,15 @@ async fn a_fresh_complete_history_precedes_an_older_latest_memory_entry() {
         .mount(&server)
         .await;
     body["dist-tags"]["latest"] = serde_json::json!("1.0.0");
-    mount_history(&server, &body).await;
+    let history_stalled = mount_gated_history(&server, &body).await;
     let cache = tempfile::tempdir().unwrap();
     let client = preferred_test_client(&server, cache.path()).await;
-    client
-        .get_npm_preferred_resolution_metadata_with_timings("pkg", |_| true)
-        .await
-        .unwrap();
+    let first =
+        within_deadline(client.get_npm_preferred_resolution_metadata_with_timings("pkg", |_| true))
+            .await
+            .unwrap();
+    assert!(!first.versions_complete);
+    history_stalled.store(false, Ordering::SeqCst);
     client.get_npm_metadata_direct("pkg").await.unwrap();
     let result = client
         .get_npm_preferred_resolution_metadata_with_timings("pkg", |_| true)
@@ -668,7 +757,9 @@ async fn a_fresh_complete_history_precedes_an_older_latest_memory_entry() {
         .unwrap();
     assert!(result.versions_complete);
     assert_eq!(result.fetched.metadata.dist_tags["latest"], "1.0.0");
-    assert_eq!(request_paths(&server).await, ["/pkg/latest", "/pkg"]);
+    let (latest, history) = request_counts(&server).await;
+    assert_eq!(latest, 1);
+    assert!((1..=2).contains(&history));
 }
 
 #[tokio::test]
@@ -685,16 +776,20 @@ async fn latest_zero_freshness_is_not_reused_in_memory() {
             )
             .mount(&server)
             .await;
+        mount_gated_history(&server, &body).await;
         let cache = tempfile::tempdir().unwrap();
         let client = preferred_test_client(&server, cache.path()).await;
         for _ in 0..2 {
-            let result = client
-                .get_npm_preferred_resolution_metadata_with_timings("pkg", |_| true)
-                .await
-                .unwrap();
+            let result = within_deadline(
+                client.get_npm_preferred_resolution_metadata_with_timings("pkg", |_| true),
+            )
+            .await
+            .unwrap();
             assert!(!result.fetched.timings.cache_hit);
         }
-        assert_eq!(request_paths(&server).await, ["/pkg/latest", "/pkg/latest"]);
+        let (latest, history) = request_counts(&server).await;
+        assert_eq!(latest, 2, "{policy}");
+        assert!(history <= 2, "{policy}");
     }
 }
 
@@ -740,7 +835,6 @@ async fn latest_revalidation_does_not_override_uncacheable_directives() {
 
 #[tokio::test]
 async fn small_latest_documents_fit_the_remaining_history_budget_without_http_buffer_slack() {
-    use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
     let fixture_server = MockServer::start().await;
@@ -752,15 +846,25 @@ async fn small_latest_documents_fit_the_remaining_history_budget_without_http_bu
     let requests = Arc::new(AtomicUsize::new(0));
     let seen = Arc::clone(&requests);
     let server = tokio::spawn(async move {
+        // Raced history requests stay unanswered until the client abandons them.
+        let mut stalled_history = Vec::new();
         loop {
             let (socket, _) = listener.accept().await.unwrap();
             let mut socket = BufReader::new(socket);
+            let mut request_line = String::new();
             let mut line = String::new();
             loop {
                 line.clear();
                 if socket.read_line(&mut line).await.unwrap() == 0 || line == "\r\n" {
                     break;
                 }
+                if request_line.is_empty() {
+                    request_line.clone_from(&line);
+                }
+            }
+            if !request_line.starts_with("GET /pkg/latest ") {
+                stalled_history.push(socket);
+                continue;
             }
             seen.fetch_add(1, Ordering::SeqCst);
             let response = format!(
@@ -810,6 +914,7 @@ async fn latest_retention_limits_allow_safe_refetch_without_disk_caching() {
             .respond_with(ResponseTemplate::new(200).set_body_json(body))
             .mount(&server)
             .await;
+        mount_gated_history(&server, &downloadable_history(&server)).await;
         let client = RegistryClient::new()
             .with_npm_registry_url(server.uri())
             .with_cache_dir(None);
@@ -821,10 +926,11 @@ async fn latest_retention_limits_allow_safe_refetch_without_disk_caching() {
             Vec::new()
         };
         for _ in 0..2 {
-            let result = client
-                .get_npm_preferred_resolution_metadata_with_timings("pkg", |_| true)
-                .await
-                .unwrap();
+            let result = within_deadline(
+                client.get_npm_preferred_resolution_metadata_with_timings("pkg", |_| true),
+            )
+            .await
+            .unwrap();
             assert!(result.fetched.metadata.versions.contains_key("2.0.0"));
             assert!(
                 client
@@ -834,7 +940,9 @@ async fn latest_retention_limits_allow_safe_refetch_without_disk_caching() {
                     .is_none()
             );
         }
-        assert_eq!(request_paths(&server).await, ["/pkg/latest", "/pkg/latest"]);
+        let (latest, history) = request_counts(&server).await;
+        assert_eq!(latest, 2, "{exhaust_budget}");
+        assert!(history <= 2, "{exhaust_budget}");
     }
 }
 
@@ -886,4 +994,137 @@ async fn invalidated_latest_revalidation_cannot_modify_newer_cache_data() {
         );
         assert_eq!(cached.value.version, "2.0.0");
     }
+}
+
+#[tokio::test]
+async fn latest_miss_continues_with_history_already_in_flight() {
+    let transfer = Duration::from_millis(400);
+    let server = MockServer::start().await;
+    let body = downloadable_history(&server);
+    Mock::given(method("GET"))
+        .and(path("/pkg/latest"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(&body["versions"]["2.0.0"])
+                .set_delay(transfer),
+        )
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/pkg"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(&body)
+                .set_delay(transfer),
+        )
+        .mount(&server)
+        .await;
+    let cache = tempfile::tempdir().unwrap();
+    let client = preferred_test_client(&server, cache.path()).await;
+    let started = std::time::Instant::now();
+    let result = client
+        .get_npm_preferred_resolution_metadata_with_timings("pkg", |v| v == "1.0.0")
+        .await
+        .unwrap();
+    let elapsed = started.elapsed();
+    assert!(result.versions_complete);
+    assert!(result.fetched.metadata.versions.contains_key("1.0.0"));
+    // Sequential documents would need two full transfers.
+    assert!(elapsed < transfer * 7 / 4, "{elapsed:?}");
+    assert!(
+        result.fetched.timings.http_ms < (transfer * 7 / 4).as_millis(),
+        "overlapping transfers must not be reported as consecutive"
+    );
+    assert_eq!(request_counts(&server).await, (1, 1));
+}
+
+#[tokio::test]
+async fn history_answers_without_waiting_for_a_stalled_latest_document() {
+    let server = MockServer::start().await;
+    let body = downloadable_history(&server);
+    Mock::given(method("GET"))
+        .and(path("/pkg/latest"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(&body["versions"]["2.0.0"])
+                .set_delay(STALLED),
+        )
+        .mount(&server)
+        .await;
+    mount_history(&server, &body).await;
+    let cache = tempfile::tempdir().unwrap();
+    let client = preferred_test_client(&server, cache.path()).await;
+    for (accepts_latest, versions_complete) in [(false, true), (true, false)] {
+        client.invalidate_metadata_cache("pkg");
+        let result = within_deadline(
+            client.get_npm_preferred_resolution_metadata_with_timings("pkg", move |v| {
+                v == "1.0.0" || (accepts_latest && v == "2.0.0")
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.versions_complete, versions_complete);
+        assert!(!result.platform_metadata_complete);
+    }
+}
+
+#[tokio::test]
+async fn latest_document_answers_when_history_fails_first() {
+    let server = MockServer::start().await;
+    let body = downloadable_history(&server);
+    Mock::given(method("GET"))
+        .and(path("/pkg/latest"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(&body["versions"]["2.0.0"])
+                .set_delay(Duration::from_millis(100)),
+        )
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/pkg"))
+        .respond_with(ResponseTemplate::new(404))
+        .mount(&server)
+        .await;
+    let cache = tempfile::tempdir().unwrap();
+    let client = preferred_test_client(&server, cache.path()).await;
+    let result = client
+        .get_npm_preferred_resolution_metadata_with_timings("pkg", |_| true)
+        .await
+        .unwrap();
+    assert!(result.platform_metadata_complete);
+    assert!(!result.versions_complete);
+    assert!(result.fetched.metadata.versions.contains_key("2.0.0"));
+    assert_eq!(request_counts(&server).await, (1, 1));
+}
+
+#[tokio::test]
+async fn history_failure_is_reported_when_latest_is_outside_the_range() {
+    let server = MockServer::start().await;
+    let body = downloadable_history(&server);
+    Mock::given(method("GET"))
+        .and(path("/pkg/latest"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(&body["versions"]["2.0.0"])
+                .set_delay(Duration::from_millis(100)),
+        )
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/pkg"))
+        .respond_with(ResponseTemplate::new(404))
+        .mount(&server)
+        .await;
+    let cache = tempfile::tempdir().unwrap();
+    let client = preferred_test_client(&server, cache.path()).await;
+    let error = client
+        .get_npm_preferred_resolution_metadata_with_timings("pkg", |v| v == "1.0.0")
+        .await
+        .unwrap_err();
+    let expected = client
+        .get_npm_preferred_metadata_direct_with_timings("pkg", |v| v == "1.0.0")
+        .await
+        .unwrap_err();
+    assert_eq!(error.to_string(), expected.to_string());
 }
