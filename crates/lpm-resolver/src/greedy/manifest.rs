@@ -126,6 +126,7 @@ async fn direct_fetch(
     Ok(fetched.info)
 }
 
+#[derive(Clone)]
 pub(super) struct FetchedMetadata {
     pub(super) speculation: Option<SpeculativePackageMetadata>,
     pub(super) info: Arc<CachedPackageInfo>,
@@ -134,6 +135,35 @@ pub(super) struct FetchedMetadata {
 }
 
 pub(super) type FetchResult = Result<FetchedMetadata, ResolveError>;
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(super) struct MetadataFetchKey {
+    pub(super) canonical: CanonicalKey,
+    pub(super) exact_version: Option<String>,
+}
+
+impl MetadataFetchKey {
+    pub(super) fn packument(canonical: CanonicalKey) -> Self {
+        Self {
+            canonical,
+            exact_version: None,
+        }
+    }
+
+    pub(super) fn for_request(
+        canonical: CanonicalKey,
+        exact_version: Option<String>,
+        route_table: &RouteTable,
+        policy: &ResolverPolicy,
+    ) -> Self {
+        let exact_version = exact_version
+            .filter(|_| exact_metadata_fast_path_eligible(route_table, &canonical, policy));
+        Self {
+            canonical,
+            exact_version,
+        }
+    }
+}
 
 pub(super) fn parse_cached_metadata_for_resolver(
     metadata: &lpm_registry::PackageMetadata,
@@ -1020,11 +1050,11 @@ pub(super) struct MetadataFetchCompletion<'a> {
     pub(super) shared_cache: &'a SharedCache,
     pub(super) shared_fact_cache: Option<&'a SharedCache>,
     pub(super) route_table: &'a RouteTable,
-    pub(super) counted_metadata_edge_misses: Option<&'a mut AHashSet<CanonicalKey>>,
+    pub(super) counted_metadata_edge_misses: Option<&'a mut AHashSet<MetadataFetchKey>>,
     pub(super) trace_metadata_fetches: bool,
     pub(super) spec_tx: Option<&'a tokio::sync::mpsc::Sender<(String, SpeculativePackageMetadata)>>,
     pub(super) tarball_dispatched_count: &'a mut u64,
-    pub(super) parked: &'a mut AHashMap<CanonicalKey, Vec<Edge>>,
+    pub(super) parked: &'a mut AHashMap<MetadataFetchKey, Vec<Edge>>,
     pub(super) state: &'a mut ResolveState,
     pub(super) pending_root_constraints: &'a mut PendingRootConstraints,
 }
@@ -1072,14 +1102,15 @@ pub(super) fn publish_direct_base_fact(
 }
 
 pub(super) fn complete_metadata_fetch(
-    canonical: CanonicalKey,
+    request: MetadataFetchKey,
     result: FetchResult,
     completion: &mut MetadataFetchCompletion<'_>,
 ) -> Result<bool, ResolveError> {
     let count_latest_for_miss = match completion.counted_metadata_edge_misses.as_mut() {
-        Some(misses) => misses.remove(&canonical),
+        Some(misses) => misses.remove(&request),
         None => false,
     };
+    let canonical = request.canonical.clone();
     match result {
         Ok(fetched) => {
             let FetchedMetadata {
@@ -1104,7 +1135,7 @@ pub(super) fn complete_metadata_fetch(
                 canonical.clone(),
                 info,
             );
-            if let Some(mut edges) = completion.parked.remove(&canonical) {
+            if let Some(mut edges) = completion.parked.remove(&request) {
                 if count_latest_for_miss && let Some(edge) = edges.first() {
                     completion
                         .state
@@ -1132,7 +1163,7 @@ pub(super) fn complete_metadata_fetch(
             if matches!(error, ResolveError::PackageNotFound { .. })
                 && activate_workspace_fallback(completion.shared_cache, &canonical).is_some() =>
         {
-            if let Some(mut edges) = completion.parked.remove(&canonical) {
+            if let Some(mut edges) = completion.parked.remove(&request) {
                 edges.sort_by(|left, right| {
                     (left.parent, left.local_name.as_str())
                         .cmp(&(right.parent, right.local_name.as_str()))
@@ -1144,7 +1175,7 @@ pub(super) fn complete_metadata_fetch(
             Ok(true)
         }
         Err(error) => {
-            if let Some(edges) = completion.parked.remove(&canonical) {
+            if let Some(edges) = completion.parked.remove(&request) {
                 for edge in edges {
                     propagate_fetch_error(&edge, &error, completion.state)?;
                     completion

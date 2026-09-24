@@ -1,7 +1,7 @@
 use super::edge::process_edge_with_preferred;
 use super::manifest::{
     ExactMetadataFetchOutcome, FetchResult, FetchedMetadata, MetadataFetchCompletion,
-    cached_manifest_from_importer_or_facts, complete_metadata_fetch,
+    MetadataFetchKey, cached_manifest_from_importer_or_facts, complete_metadata_fetch,
     ensure_policy_metadata_for_cached_manifest, exact_metadata_fast_path_eligible,
     fetch_metadata_for_resolver_with_trace_detail, parse_cached_metadata_for_resolver,
     parse_fetched_metadata, parse_partial_fetched_metadata, publish_direct_base_fact,
@@ -13,7 +13,7 @@ use super::state::{PendingRootConstraints, ResolveState, selected_package_cardin
 use super::tree_policy::{TreeManifestProvider, preferred_tree_compatible_version};
 use super::types::{Edge, PeerRequirement};
 use crate::resolve::SelectedPackageEvent;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 const EXACT_DOCUMENT_CONCURRENCY_MULTIPLIER: usize = 4;
@@ -323,8 +323,9 @@ where
 struct OrderedMetadataFetches {
     inflight: AHashSet<CanonicalKey>,
     committed: AHashSet<CanonicalKey>,
-    sequences: AHashMap<CanonicalKey, u64>,
-    ready: BTreeMap<u64, (CanonicalKey, FetchResult, MetadataCompletionSource)>,
+    sequences: AHashMap<MetadataFetchKey, u64>,
+    inflight_requests: AHashMap<CanonicalKey, BTreeSet<Option<String>>>,
+    ready: BTreeMap<u64, (MetadataFetchKey, FetchResult, MetadataCompletionSource)>,
     next_dispatch_sequence: u64,
     next_commit_sequence: u64,
 }
@@ -341,6 +342,7 @@ impl OrderedMetadataFetches {
             inflight: AHashSet::with_capacity(capacity),
             committed: AHashSet::with_capacity(capacity),
             sequences: AHashMap::with_capacity(capacity),
+            inflight_requests: AHashMap::with_capacity(capacity),
             ready: BTreeMap::new(),
             next_dispatch_sequence: 0,
             next_commit_sequence: 0,
@@ -348,7 +350,21 @@ impl OrderedMetadataFetches {
     }
 
     fn start(&mut self, canonical: &CanonicalKey) -> Result<bool, ResolveError> {
-        if !self.inflight.insert(canonical.clone()) {
+        self.start_request(&MetadataFetchKey::packument(canonical.clone()))
+    }
+
+    fn coalesce_request(&self, mut request: MetadataFetchKey) -> MetadataFetchKey {
+        if let Some(requests) = self.inflight_requests.get(&request.canonical)
+            && let Some(first) = requests.first()
+            && (request.exact_version.is_none() || first.is_none())
+        {
+            request.exact_version = first.clone();
+        }
+        request
+    }
+
+    fn start_request(&mut self, request: &MetadataFetchKey) -> Result<bool, ResolveError> {
+        if self.sequences.contains_key(request) {
             return Ok(false);
         }
         let sequence = self.next_dispatch_sequence;
@@ -356,8 +372,12 @@ impl OrderedMetadataFetches {
             .next_dispatch_sequence
             .checked_add(1)
             .ok_or_else(|| ResolveError::Internal("metadata dispatch sequence overflow".into()))?;
-        let previous = self.sequences.insert(canonical.clone(), sequence);
-        debug_assert!(previous.is_none());
+        self.sequences.insert(request.clone(), sequence);
+        self.inflight.insert(request.canonical.clone());
+        self.inflight_requests
+            .entry(request.canonical.clone())
+            .or_default()
+            .insert(request.exact_version.clone());
         Ok(true)
     }
 
@@ -366,16 +386,20 @@ impl OrderedMetadataFetches {
         canonical: CanonicalKey,
         result: FetchResult,
     ) -> Result<Option<FetchResult>, ResolveError> {
-        self.queue_if_tracked_from(canonical, result, MetadataCompletionSource::Fetched)
+        self.queue_if_tracked_from(
+            MetadataFetchKey::packument(canonical),
+            result,
+            MetadataCompletionSource::Fetched,
+        )
     }
 
     fn queue_if_tracked_from(
         &mut self,
-        canonical: CanonicalKey,
+        request: MetadataFetchKey,
         result: FetchResult,
         source: MetadataCompletionSource,
     ) -> Result<Option<FetchResult>, ResolveError> {
-        let Some(sequence) = self.sequences.get(&canonical).copied() else {
+        let Some(sequence) = self.sequences.get(&request).copied() else {
             return Ok(Some(result));
         };
         if let Some((_, _, existing_source)) = self.ready.get(&sequence) {
@@ -383,26 +407,30 @@ impl OrderedMetadataFetches {
                 return Ok(None);
             }
             if source == MetadataCompletionSource::Cached {
-                self.ready.insert(sequence, (canonical, result, source));
+                self.ready.insert(sequence, (request, result, source));
                 return Ok(None);
             }
             return Err(ResolveError::Internal(format!(
-                "duplicate metadata completion for {canonical}"
+                "duplicate metadata completion for {request:?}"
             )));
         }
-        self.ready.insert(sequence, (canonical, result, source));
+        self.ready.insert(sequence, (request, result, source));
         Ok(None)
     }
 
     fn queue_tracked(
         &mut self,
-        canonical: CanonicalKey,
+        request: MetadataFetchKey,
         result: FetchResult,
     ) -> Result<(), ResolveError> {
-        match self.queue_if_tracked(canonical.clone(), result)? {
+        match self.queue_if_tracked_from(
+            request.clone(),
+            result,
+            MetadataCompletionSource::Fetched,
+        )? {
             None => Ok(()),
             Some(_) => Err(ResolveError::Internal(format!(
-                "metadata completion without a dispatch sequence for {canonical}"
+                "metadata completion without a dispatch sequence for {request:?}"
             ))),
         }
     }
@@ -413,7 +441,7 @@ impl OrderedMetadataFetches {
         result: FetchResult,
     ) -> Result<(), ResolveError> {
         match self.queue_if_tracked_from(
-            canonical.clone(),
+            MetadataFetchKey::packument(canonical.clone()),
             result,
             MetadataCompletionSource::Cached,
         )? {
@@ -428,16 +456,22 @@ impl OrderedMetadataFetches {
         &mut self,
         completion: &mut MetadataFetchCompletion<'_>,
     ) -> Result<(), ResolveError> {
-        while let Some((canonical, result, _)) = self.ready.remove(&self.next_commit_sequence) {
-            let sequence = self.sequences.remove(&canonical);
+        while let Some((request, result, _)) = self.ready.remove(&self.next_commit_sequence) {
+            let canonical = request.canonical.clone();
+            let sequence = self.sequences.remove(&request);
             debug_assert_eq!(sequence, Some(self.next_commit_sequence));
-            let removed = self.inflight.remove(&canonical);
-            debug_assert!(removed);
+            if let Some(requests) = self.inflight_requests.get_mut(&canonical) {
+                requests.remove(&request.exact_version);
+                if requests.is_empty() {
+                    self.inflight_requests.remove(&canonical);
+                    self.inflight.remove(&canonical);
+                }
+            }
             self.next_commit_sequence =
                 self.next_commit_sequence.checked_add(1).ok_or_else(|| {
                     ResolveError::Internal("metadata commit sequence overflow".into())
                 })?;
-            let succeeded = complete_metadata_fetch(canonical.clone(), result, completion)?;
+            let succeeded = complete_metadata_fetch(request, result, completion)?;
             if succeeded {
                 self.committed.insert(canonical);
             }
@@ -454,7 +488,7 @@ impl OrderedMetadataFetches {
     }
 
     fn len(&self) -> usize {
-        self.inflight.len()
+        self.sequences.len()
     }
 
     fn is_empty(&self) -> bool {
@@ -637,10 +671,28 @@ struct PendingMetadataFetch {
 struct MetadataFetchScheduler {
     semaphore: Arc<tokio::sync::Semaphore>,
     exact_document_semaphore: Arc<tokio::sync::Semaphore>,
-    jobs: tokio::task::JoinSet<(CanonicalKey, FetchResult)>,
+    jobs: tokio::task::JoinSet<(MetadataFetchKey, FetchResult)>,
     pending: VecDeque<PendingMetadataFetch>,
     pending_exact_documents: VecDeque<PendingMetadataFetch>,
-    ready: VecDeque<(CanonicalKey, FetchResult)>,
+    ready: VecDeque<(MetadataFetchKey, FetchResult)>,
+    fallback_metadata: Arc<FallbackMetadata>,
+}
+
+#[derive(Default)]
+struct FallbackMetadata {
+    packages: std::sync::Mutex<AHashMap<CanonicalKey, Arc<tokio::sync::OnceCell<FetchedMetadata>>>>,
+}
+
+impl FallbackMetadata {
+    fn package(&self, canonical: &CanonicalKey) -> Arc<tokio::sync::OnceCell<FetchedMetadata>> {
+        Arc::clone(
+            self.packages
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .entry(canonical.clone())
+                .or_default(),
+        )
+    }
 }
 
 impl MetadataFetchScheduler {
@@ -655,6 +707,7 @@ impl MetadataFetchScheduler {
             pending: VecDeque::new(),
             pending_exact_documents: VecDeque::new(),
             ready: VecDeque::new(),
+            fallback_metadata: Arc::default(),
         }
     }
 
@@ -679,7 +732,10 @@ impl MetadataFetchScheduler {
                 include_speculation,
             )
         {
-            self.ready.push_back((canonical, Ok(fetched)));
+            self.ready.push_back((
+                MetadataFetchKey::for_request(canonical, exact_version, &route_table, &policy),
+                Ok(fetched),
+            ));
             return;
         }
 
@@ -737,8 +793,9 @@ impl MetadataFetchScheduler {
                 &pending.policy,
             );
         let metadata_semaphore = Arc::clone(&self.semaphore);
+        let fallback_metadata = Arc::clone(&self.fallback_metadata);
         self.jobs.spawn(async move {
-            let _active_fetch = pending.telemetry.enter();
+            let active_fetch = pending.telemetry.enter();
             let result = if exact_document_lane {
                 let version = pending
                     .exact_version
@@ -760,37 +817,51 @@ impl MetadataFetchScheduler {
                         Ok(fetched)
                     }
                     ExactMetadataFetchOutcome::Fallback => {
-                        let fallback_permit =
-                            match Arc::clone(&metadata_semaphore).try_acquire_owned() {
-                                Ok(permit) => permit,
-                                Err(tokio::sync::TryAcquireError::NoPermits) => {
-                                    pending
-                                        .telemetry
-                                        .semaphore_wait_count
-                                        .fetch_add(1, Ordering::Relaxed);
-                                    let wait_start = Instant::now();
-                                    let permit = Arc::clone(&metadata_semaphore)
-                                        .acquire_owned()
-                                        .await
-                                        .expect("metadata semaphore must outlive the resolver");
-                                    pending.telemetry.record_wait_duration(wait_start.elapsed());
-                                    permit
-                                }
-                                Err(tokio::sync::TryAcquireError::Closed) => {
-                                    panic!("metadata semaphore must outlive the resolver")
-                                }
-                            };
-                        drop(permit);
-                        let _fallback_permit = fallback_permit;
-                        fetch_metadata_for_resolver_with_trace_detail(
-                            &pending.client,
-                            &pending.route_table,
-                            &pending.canonical,
-                            &pending.policy,
-                            pending.include_speculation,
-                            pending.trace_metadata_fetches,
-                        )
-                        .await
+                        drop(active_fetch);
+                        let mut exact_permit = Some(permit);
+                        let fallback = fallback_metadata.package(&pending.canonical);
+                        let result = fallback
+                            .get_or_try_init(|| async {
+                                let fallback_permit = match Arc::clone(&metadata_semaphore)
+                                    .try_acquire_owned()
+                                {
+                                    Ok(permit) => permit,
+                                    Err(tokio::sync::TryAcquireError::NoPermits) => {
+                                        pending
+                                            .telemetry
+                                            .semaphore_wait_count
+                                            .fetch_add(1, Ordering::Relaxed);
+                                        let wait_start = Instant::now();
+                                        let permit = Arc::clone(&metadata_semaphore)
+                                            .acquire_owned()
+                                            .await
+                                            .expect("metadata semaphore must outlive the resolver");
+                                        pending
+                                            .telemetry
+                                            .record_wait_duration(wait_start.elapsed());
+                                        permit
+                                    }
+                                    Err(tokio::sync::TryAcquireError::Closed) => {
+                                        panic!("metadata semaphore must outlive the resolver")
+                                    }
+                                };
+                                drop(exact_permit.take());
+                                let _fallback_permit = fallback_permit;
+                                let _active_fetch = pending.telemetry.enter();
+                                fetch_metadata_for_resolver_with_trace_detail(
+                                    &pending.client,
+                                    &pending.route_table,
+                                    &pending.canonical,
+                                    &pending.policy,
+                                    pending.include_speculation,
+                                    pending.trace_metadata_fetches,
+                                )
+                                .await
+                            })
+                            .await
+                            .cloned();
+                        drop(exact_permit);
+                        result
                     }
                 }
             } else {
@@ -821,7 +892,15 @@ impl MetadataFetchScheduler {
                 )
                 .await
             };
-            (pending.canonical, result)
+            (
+                MetadataFetchKey::for_request(
+                    pending.canonical,
+                    pending.exact_version,
+                    &pending.route_table,
+                    &pending.policy,
+                ),
+                result,
+            )
         });
     }
 
@@ -855,7 +934,7 @@ impl MetadataFetchScheduler {
 
     async fn join_next(
         &mut self,
-    ) -> Option<Result<(CanonicalKey, FetchResult), tokio::task::JoinError>> {
+    ) -> Option<Result<(MetadataFetchKey, FetchResult), tokio::task::JoinError>> {
         if let Some(ready) = self.ready.pop_front() {
             return Some(Ok(ready));
         }
@@ -933,6 +1012,84 @@ mod metadata_fetch_scheduler_tests {
     use super::*;
 
     #[tokio::test(flavor = "current_thread")]
+    async fn failed_packument_fallback_does_not_poison_later_exact_requests() {
+        use wiremock::matchers::{method, path, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path_regex(r"/recovering/\d\.0\.0$"))
+            .respond_with(ResponseTemplate::new(404))
+            .expect(2)
+            .mount(&server)
+            .await;
+        let calls = Arc::new(AtomicU64::new(0));
+        let response_calls = Arc::clone(&calls);
+        Mock::given(method("GET"))
+            .and(path("/recovering"))
+            .respond_with(move |_: &wiremock::Request| {
+                if response_calls.fetch_add(1, Ordering::Relaxed) == 0 {
+                    ResponseTemplate::new(200).set_body_string("{")
+                } else {
+                    ResponseTemplate::new(200)
+                        .insert_header("Cache-Control", "no-store")
+                        .set_body_json(serde_json::json!({
+                            "name": "recovering",
+                            "versions": {"2.0.0": {
+                                "name": "recovering", "version": "2.0.0",
+                                "dist": {"tarball": "https://example.invalid/recovering.tgz", "integrity": "sha512-test"}
+                            }}
+                        }))
+                }
+            })
+            .expect(2)
+            .mount(&server)
+            .await;
+        let client = Arc::new(
+            RegistryClient::new()
+                .with_npm_registry_url(server.uri())
+                .with_cache_dir(None),
+        );
+        let telemetry = Arc::new(MetadataFetchTelemetry::default());
+        let route_table = RouteTable::from_mode_only(RouteMode::Direct);
+        let policy = ResolverPolicy::default();
+        let dispatch = MetadataFetchDispatch {
+            telemetry: &telemetry,
+            client: &client,
+            route_table: &route_table,
+            policy: &policy,
+            trace_metadata_fetches: false,
+        };
+        let mut scheduler = MetadataFetchScheduler::new(
+            Arc::new(tokio::sync::Semaphore::new(1)),
+            Arc::new(tokio::sync::Semaphore::new(4)),
+        );
+        scheduler.enqueue(
+            &dispatch,
+            CanonicalKey::npm("recovering"),
+            Some("1.0.0".into()),
+            false,
+        );
+        let (_, first) = scheduler.join_next().await.unwrap().unwrap();
+        assert!(first.is_err());
+
+        scheduler.enqueue(
+            &dispatch,
+            CanonicalKey::npm("recovering"),
+            Some("2.0.0".into()),
+            false,
+        );
+        let (_, second) = scheduler.join_next().await.unwrap().unwrap();
+        assert!(
+            second.is_ok(),
+            "a later request must retry a failed fallback: {:?}",
+            second.err()
+        );
+        assert_eq!(calls.load(Ordering::Relaxed), 2);
+        server.verify().await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn ten_thousand_requests_create_only_bounded_tokio_tasks() {
         let semaphore = Arc::new(tokio::sync::Semaphore::new(4));
         let telemetry = Arc::new(MetadataFetchTelemetry::default());
@@ -996,6 +1153,74 @@ mod metadata_fetch_scheduler_tests {
         assert_eq!(scheduler.spawned_len(), 10);
         assert_eq!(scheduler.queued_len(), 10);
         scheduler.jobs.abort_all();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn exact_document_fallback_waiters_keep_task_admission_bounded() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        for shared_package in [false, true] {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path_regex(r"/bounded-[^/]+/1\.0\.[0-9]+$"))
+                .respond_with(ResponseTemplate::new(404))
+                .mount(&server)
+                .await;
+            let metadata_semaphore = Arc::new(tokio::sync::Semaphore::new(1));
+            let exact_semaphore = Arc::new(tokio::sync::Semaphore::new(8));
+            let _held = metadata_semaphore.acquire().await.unwrap();
+            let telemetry = Arc::new(MetadataFetchTelemetry::default());
+            let client = Arc::new(
+                RegistryClient::new()
+                    .with_npm_registry_url(server.uri())
+                    .with_cache_dir(None),
+            );
+            let route_table = RouteTable::from_mode_only(lpm_registry::RouteMode::Direct);
+            let policy = ResolverPolicy::default();
+            let dispatch = MetadataFetchDispatch {
+                telemetry: &telemetry,
+                client: &client,
+                route_table: &route_table,
+                policy: &policy,
+                trace_metadata_fetches: false,
+            };
+            let mut scheduler =
+                MetadataFetchScheduler::new(Arc::clone(&metadata_semaphore), exact_semaphore);
+            for index in 0..100 {
+                let name = if shared_package {
+                    "bounded-shared".to_string()
+                } else {
+                    format!("bounded-{index}")
+                };
+                scheduler.enqueue(
+                    &dispatch,
+                    CanonicalKey::npm(&name),
+                    Some(format!("1.0.{index}")),
+                    false,
+                );
+            }
+            tokio::time::timeout(Duration::from_secs(2), async {
+                loop {
+                    if server.received_requests().await.unwrap().len() == 8
+                        && telemetry.active.load(Ordering::Relaxed) == 0
+                    {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("all exact requests must reach fallback waiting");
+            scheduler.fill_available();
+            assert_eq!(
+                scheduler.spawned_len(),
+                8,
+                "fallback waiters must retain admission permits"
+            );
+            assert_eq!(scheduler.queued_len(), 92);
+            scheduler.jobs.abort_all();
+        }
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -1209,12 +1434,12 @@ fn push_covered_range(package_specs: &mut Vec<(String, String)>, name: &str, ran
 
 fn worker_package_specs_from_parked_edges(
     candidates: &[(CanonicalKey, String)],
-    parked: &AHashMap<CanonicalKey, Vec<Edge>>,
+    parked: &AHashMap<MetadataFetchKey, Vec<Edge>>,
 ) -> Vec<(String, String)> {
     let mut seen = AHashSet::with_capacity(candidates.len());
     let mut specs = Vec::with_capacity(candidates.len());
     for (canonical, name) in candidates {
-        let Some(edges) = parked.get(canonical) else {
+        let Some(edges) = parked.get(&MetadataFetchKey::packument(canonical.clone())) else {
             continue;
         };
         for edge in edges {
@@ -1618,7 +1843,7 @@ pub async fn resolve_greedy_fused_with_cache_options_policy_and_selected_events_
     // track simultaneously" without threading a dependency-count estimate
     // through. Slight over-allocation is cheaper than rehashing.
     let mut ordered_metadata = OrderedMetadataFetches::with_capacity(npm_fanout);
-    let mut parked: AHashMap<CanonicalKey, Vec<Edge>> = AHashMap::with_capacity(npm_fanout);
+    let mut parked: AHashMap<MetadataFetchKey, Vec<Edge>> = AHashMap::with_capacity(npm_fanout);
     let mut counted_metadata_edge_misses =
         trace_metadata_fetches.then(|| AHashSet::with_capacity(npm_fanout));
     let mut metadata_jobs =
@@ -1831,13 +2056,26 @@ pub async fn resolve_greedy_fused_with_cache_options_policy_and_selected_events_
                 shared_fact_cache.as_ref(),
                 &edge.canonical,
             ) {
-                if info_arc.needs_metadata_for_range(&edge.range) {
+                let override_needs_history = !info_arc.versions_complete
+                    && !state.overrides.is_empty()
+                    && state
+                        .overrides
+                        .may_match_package(&edge.canonical.to_string());
+                if info_arc.needs_metadata_for_range(&edge.range) || override_needs_history {
                     let canonical = edge.canonical.clone();
                     let exact_version = edge
                         .range
                         .exact_version()
+                        .filter(|_| !override_needs_history)
                         .map(|version| version.to_string());
-                    let new_fetch = ordered_metadata.start(&canonical)?;
+                    let request = MetadataFetchKey::for_request(
+                        canonical.clone(),
+                        exact_version.clone(),
+                        &route_table,
+                        &policy,
+                    );
+                    let request = ordered_metadata.coalesce_request(request);
+                    let new_fetch = ordered_metadata.start_request(&request)?;
                     if new_fetch && trace_metadata_fetches {
                         state.work_stats.record_metadata_edge_miss(
                             &canonical,
@@ -1847,10 +2085,10 @@ pub async fn resolve_greedy_fused_with_cache_options_policy_and_selected_events_
                         if let Some(counted_metadata_edge_misses) =
                             counted_metadata_edge_misses.as_mut()
                         {
-                            counted_metadata_edge_misses.insert(canonical.clone());
+                            counted_metadata_edge_misses.insert(request.clone());
                         }
                     }
-                    parked.entry(canonical.clone()).or_default().push(edge);
+                    parked.entry(request).or_default().push(edge);
                     let worker_name = match &canonical {
                         CanonicalKey::Npm { name }
                             if range_aware_worker_batch
@@ -1900,8 +2138,9 @@ pub async fn resolve_greedy_fused_with_cache_options_policy_and_selected_events_
                     }
                     let info_arc = info_result?;
                     let canonical = edge.canonical.clone();
-                    let new_completion = ordered_metadata.start(&canonical)?;
-                    parked.entry(canonical.clone()).or_default().push(edge);
+                    let request = MetadataFetchKey::packument(canonical.clone());
+                    let new_completion = ordered_metadata.start_request(&request)?;
+                    parked.entry(request).or_default().push(edge);
                     if new_completion {
                         ordered_metadata.queue_cached_tracked(
                             canonical,
@@ -1987,17 +2226,28 @@ pub async fn resolve_greedy_fused_with_cache_options_policy_and_selected_events_
             let exact_version = edge
                 .range
                 .exact_version()
+                .filter(|_| {
+                    state.overrides.is_empty()
+                        || !state.overrides.may_match_package(&canonical.to_string())
+                })
                 .map(|version| version.to_string());
-            let new_fetch = ordered_metadata.start(&canonical)?;
+            let request = MetadataFetchKey::for_request(
+                canonical.clone(),
+                exact_version.clone(),
+                &route_table,
+                &policy,
+            );
+            let request = ordered_metadata.coalesce_request(request);
+            let new_fetch = ordered_metadata.start_request(&request)?;
             if new_fetch && trace_metadata_fetches {
                 state
                     .work_stats
                     .record_metadata_edge_miss(&canonical, &edge.range, &route_table);
                 if let Some(counted_metadata_edge_misses) = counted_metadata_edge_misses.as_mut() {
-                    counted_metadata_edge_misses.insert(canonical.clone());
+                    counted_metadata_edge_misses.insert(request.clone());
                 }
             }
-            parked.entry(canonical.clone()).or_default().push(edge);
+            parked.entry(request).or_default().push(edge);
             if new_fetch {
                 let include_speculation = spec_tx.is_some();
                 let worker_name = match &canonical {
@@ -2160,7 +2410,11 @@ pub async fn resolve_greedy_fused_with_cache_options_policy_and_selected_events_
                                     state: &mut state,
                                     pending_root_constraints: &mut pending_root_constraints,
                                 };
-                                complete_metadata_fetch(canonical, result, &mut completion)?;
+                                complete_metadata_fetch(
+                                    MetadataFetchKey::packument(canonical),
+                                    result,
+                                    &mut completion,
+                                )?;
                             }
                         }
 
@@ -2320,7 +2574,11 @@ pub async fn resolve_greedy_fused_with_cache_options_policy_and_selected_events_
                                     state: &mut state,
                                     pending_root_constraints: &mut pending_root_constraints,
                                 };
-                                complete_metadata_fetch(canonical, result, &mut completion)?;
+                                complete_metadata_fetch(
+                                    MetadataFetchKey::packument(canonical),
+                                    result,
+                                    &mut completion,
+                                )?;
                             }
                             let mut completion = MetadataFetchCompletion {
                                 shared_cache: &shared_cache,
@@ -2475,7 +2733,8 @@ pub async fn resolve_greedy_fused_with_cache_options_policy_and_selected_events_
                             &shared_cache,
                             shared_fact_cache.as_ref(),
                             &canonical,
-                        ) {
+                        ) && info_arc.versions_complete
+                        {
                             return ensure_policy_metadata_for_cached_manifest(
                                 &canonical,
                                 info_arc,
@@ -2493,7 +2752,7 @@ pub async fn resolve_greedy_fused_with_cache_options_policy_and_selected_events_
                         // direct dep), so the serial fetch here is
                         // bounded by the count of unmet-peer canonicals
                         // — usually 0–3.
-                        let fetched = fetch_metadata_for_resolver_with_trace_detail(
+                        let fetched = match fetch_metadata_for_resolver_with_trace_detail(
                             &client,
                             &route_table,
                             &canonical,
@@ -2501,7 +2760,22 @@ pub async fn resolve_greedy_fused_with_cache_options_policy_and_selected_events_
                             false,
                             trace_metadata_fetches,
                         )
-                        .await?;
+                        .await
+                        {
+                            Ok(fetched) => fetched,
+                            Err(error) => {
+                                if matches!(error, ResolveError::PackageNotFound { .. })
+                                    && let Some(workspace) =
+                                        crate::provider::activate_workspace_fallback(
+                                            &shared_cache,
+                                            &canonical,
+                                        )
+                                {
+                                    return Ok(workspace);
+                                }
+                                return Err(error);
+                            }
+                        };
                         publish_direct_base_fact(
                             shared_fact_cache.as_ref(),
                             &route_table,
@@ -2546,9 +2820,23 @@ pub async fn resolve_greedy_fused_with_cache_options_policy_and_selected_events_
         )
         .await
         {
-            let (canonical, result) = joined
+            let (request, mut result) = joined
                 .map_err(|e| ResolveError::Internal(format!("metadata join failure: {e}")))?;
-            ordered_metadata.queue_tracked(canonical, result)?;
+            // Tarball speculation does not select graph nodes, so it can start
+            // while earlier metadata requests still await deterministic commit.
+            if let Ok(fetched) = &mut result
+                && let (Some(tx), Some(speculation)) =
+                    (spec_tx.as_ref(), fetched.speculation.take())
+            {
+                match tx.try_send((request.canonical.to_string(), speculation)) {
+                    Ok(()) => tarball_dispatched_count += 1,
+                    Err(tokio::sync::mpsc::error::TrySendError::Full((_, speculation))) => {
+                        fetched.speculation = Some(speculation);
+                    }
+                    Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {}
+                }
+            }
+            ordered_metadata.queue_tracked(request, result)?;
             let mut completion = MetadataFetchCompletion {
                 shared_cache: &shared_cache,
                 shared_fact_cache: shared_fact_cache.as_ref(),
@@ -2817,7 +3105,7 @@ mod range_aware_worker_batch_tests {
         let canonical = CanonicalKey::npm("shared");
         let mut parked = AHashMap::new();
         parked.insert(
-            canonical.clone(),
+            MetadataFetchKey::packument(canonical.clone()),
             vec![
                 Edge {
                     parent: 0,

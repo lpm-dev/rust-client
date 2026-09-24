@@ -207,6 +207,191 @@ fn speculative_dependency_enqueue_rewrites_aliases_and_skips_optional_deps() {
     assert_eq!(actual, expected);
 }
 
+fn speculation_snapshot(
+    name: &str,
+    versions: &[&str],
+    partial: bool,
+    dependencies: serde_json::Value,
+) -> SpeculativePackageMetadata {
+    let versions = versions.iter().map(|version| ((*version).to_string(), serde_json::json!({
+        "name": name, "version": version, "dependencies": dependencies,
+        "dist": {"tarball": format!("https://example.invalid/{name}-{version}.tgz"), "integrity": "sha512-test"}
+    }))).collect::<serde_json::Map<_, _>>();
+    let mut snapshot = SpeculativePackageMetadata::from(registry_metadata(serde_json::json!({
+        "name": name, "versions": versions
+    })));
+    Arc::make_mut(&mut snapshot.info).versions_complete = !partial;
+    snapshot
+}
+
+async fn count_dispatched_speculative_frames(
+    dependencies: HashMap<String, String>,
+    frames: Vec<(&str, SpeculativePackageMetadata)>,
+) -> u64 {
+    let store_root = tempfile::tempdir().unwrap();
+    let (tx, rx) = tokio::sync::mpsc::channel(8);
+    let (dispatcher, counters) = spawn_speculation_dispatcher(
+        rx,
+        Arc::new(RegistryClient::new().with_cache_dir(None)),
+        RouteTable::from_mode_only(lpm_registry::RouteMode::Direct),
+        PackageStore::at(store_root.path()),
+        Arc::new(Semaphore::new(1)),
+        Some(Arc::new(Semaphore::new(0))),
+        Arc::new(FetchCoordinator::default()),
+        dependencies,
+        SpeculativeKeyTracker::default(),
+        None,
+        None,
+        ManagedInstallAccounting,
+    );
+    for (name, metadata) in frames {
+        tx.send((name.to_string(), metadata)).await.unwrap();
+    }
+    drop(tx);
+    dispatcher.await.unwrap();
+    counters
+        .dispatched
+        .load(std::sync::atomic::Ordering::Relaxed)
+}
+
+#[tokio::test]
+async fn speculation_preserves_history_when_a_partial_snapshot_arrives_later() {
+    let dispatched = count_dispatched_speculative_frames(
+        HashMap::from([
+            ("shared".to_string(), "1.0.0".to_string()),
+            ("parent".to_string(), "1.0.0".to_string()),
+        ]),
+        vec![
+            (
+                "shared",
+                speculation_snapshot("shared", &["1.0.0", "2.0.0"], false, serde_json::json!({})),
+            ),
+            (
+                "shared",
+                speculation_snapshot("shared", &["1.0.0"], true, serde_json::json!({})),
+            ),
+            (
+                "parent",
+                speculation_snapshot(
+                    "parent",
+                    &["1.0.0"],
+                    false,
+                    serde_json::json!({"shared": "2.0.0"}),
+                ),
+            ),
+        ],
+    )
+    .await;
+    assert_eq!(
+        dispatched, 3,
+        "late partial metadata must not erase an undispatched version"
+    );
+}
+
+#[tokio::test]
+async fn speculation_waits_for_an_exact_version_missing_from_a_partial_snapshot() {
+    let dispatched = count_dispatched_speculative_frames(
+        HashMap::from([("shared".to_string(), "2.0.0".to_string())]),
+        vec![
+            (
+                "shared",
+                speculation_snapshot("shared", &["1.0.0"], true, serde_json::json!({})),
+            ),
+            (
+                "shared",
+                speculation_snapshot("shared", &["2.0.0"], true, serde_json::json!({})),
+            ),
+        ],
+    )
+    .await;
+    assert_eq!(
+        dispatched, 1,
+        "an uncovered version must stay parked until its metadata arrives"
+    );
+}
+
+#[tokio::test]
+async fn speculation_preserves_disjoint_partial_versions_for_later_dependencies() {
+    let dispatched = count_dispatched_speculative_frames(
+        HashMap::from([("parent".to_string(), "1.0.0".to_string())]),
+        vec![
+            (
+                "shared",
+                speculation_snapshot("shared", &["1.0.0"], true, serde_json::json!({})),
+            ),
+            (
+                "shared",
+                speculation_snapshot("shared", &["2.0.0"], true, serde_json::json!({})),
+            ),
+            (
+                "parent",
+                speculation_snapshot(
+                    "parent",
+                    &["1.0.0"],
+                    false,
+                    serde_json::json!({"first": "npm:shared@1.0.0", "second": "npm:shared@2.0.0"}),
+                ),
+            ),
+        ],
+    )
+    .await;
+    assert_eq!(dispatched, 3);
+}
+
+#[tokio::test]
+async fn speculation_retries_an_uncovered_range_when_complete_metadata_arrives() {
+    let dispatched = count_dispatched_speculative_frames(
+        HashMap::from([("shared".to_string(), "^2.0.0".to_string())]),
+        vec![
+            (
+                "shared",
+                speculation_snapshot("shared", &["1.0.0"], true, serde_json::json!({})),
+            ),
+            (
+                "shared",
+                speculation_snapshot("shared", &["1.0.0", "2.0.0"], false, serde_json::json!({})),
+            ),
+        ],
+    )
+    .await;
+    assert_eq!(dispatched, 1);
+}
+
+#[tokio::test]
+async fn speculation_does_not_dispatch_versions_outside_a_complete_history() {
+    let dispatched = count_dispatched_speculative_frames(
+        HashMap::from([("shared".to_string(), "3.0.0".to_string())]),
+        vec![(
+            "shared",
+            speculation_snapshot("shared", &["1.0.0", "2.0.0"], false, serde_json::json!({})),
+        )],
+    )
+    .await;
+    assert_eq!(dispatched, 0);
+}
+
+#[tokio::test]
+async fn speculation_dispatches_a_covered_dist_tag_from_partial_metadata() {
+    let mut snapshot = SpeculativePackageMetadata::from(registry_metadata(serde_json::json!({
+        "name": "shared",
+        "dist-tags": {"beta": "2.0.0-beta.1"},
+        "versions": {"2.0.0-beta.1": {
+            "name": "shared", "version": "2.0.0-beta.1",
+            "dist": {"tarball": "https://example.invalid/shared.tgz", "integrity": "sha512-test"}
+        }}
+    })));
+    Arc::make_mut(&mut snapshot.info).versions_complete = false;
+    Arc::make_mut(&mut snapshot.info)
+        .covered_ranges
+        .insert("beta".to_string());
+    let dispatched = count_dispatched_speculative_frames(
+        HashMap::from([("shared".to_string(), "beta".to_string())]),
+        vec![("shared", snapshot)],
+    )
+    .await;
+    assert_eq!(dispatched, 1);
+}
+
 #[tokio::test]
 async fn managed_lpm_stale_url_retry_preserves_the_accounting_marker() {
     use lpm_common::integrity::{HashAlgorithm, Integrity};
@@ -1705,4 +1890,32 @@ async fn tarball_url_install_handles_301_redirect() {
     // Tarball lands in CAS keyed by the computed SRI of the
     // final-body content.
     assert!(store.has_tarball(&computed_sri));
+}
+
+#[test]
+fn speculative_picker_prefers_a_satisfying_latest_over_a_higher_version() {
+    let metadata = SpeculativePackageMetadata::from(registry_metadata(serde_json::json!({
+        "name": "fixture",
+        "dist-tags": {"latest": "2.1.0"},
+        "versions": {
+            "2.1.0": {"name": "fixture", "version": "2.1.0", "dist": {"tarball": "https://registry.example/2.1.0.tgz"}},
+            "2.9.0": {"name": "fixture", "version": "2.9.0", "dist": {"tarball": "https://registry.example/2.9.0.tgz"}}
+        }
+    })));
+    assert_eq!(
+        pick_speculative_version(&metadata, "^2"),
+        Some((
+            "2.1.0".into(),
+            "https://registry.example/2.1.0.tgz".into(),
+            None
+        ))
+    );
+    assert_eq!(
+        pick_speculative_version(&metadata, "^2.8"),
+        Some((
+            "2.9.0".into(),
+            "https://registry.example/2.9.0.tgz".into(),
+            None
+        ))
+    );
 }

@@ -1,5 +1,6 @@
 use crate::provider::{
-    CachedPackageInfo, parse_metadata_to_cache_info, parse_owned_metadata_to_cache_info,
+    CachedPackageInfo, merge_cached_package_info, parse_metadata_to_cache_info,
+    parse_owned_metadata_to_cache_info,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -16,6 +17,25 @@ impl SpeculativePackageMetadata {
         info: Arc<CachedPackageInfo>,
     ) -> Self {
         Self { dist_tags, info }
+    }
+
+    /// Retains known versions when a partial metadata snapshot arrives.
+    pub fn merge_snapshot(&mut self, incoming: Self) {
+        self.dist_tags.extend(incoming.dist_tags);
+        if Arc::ptr_eq(&self.info, &incoming.info) {
+            return;
+        }
+        if incoming.info.versions_complete {
+            self.info = incoming.info;
+        } else if !self.info.versions_complete
+            || incoming
+                .info
+                .versions
+                .iter()
+                .any(|version| !self.info.versions.contains(version))
+        {
+            self.info = Arc::new(merge_cached_package_info(&self.info, &incoming.info));
+        }
     }
 }
 

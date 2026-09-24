@@ -117,6 +117,5 @@ mod prelude {
     pub(super) use version_ranges::Ranges;
 }
 
-#[cfg(feature = "bench-internals")]
 pub(crate) use cache::merge_cached_package_info;
 pub(crate) use cache::{activate_workspace_fallback, insert_or_merge_cached_package_info};

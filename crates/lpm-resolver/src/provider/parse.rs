@@ -434,14 +434,14 @@ fn parse_projected_metadata(
 fn detect_trust_evidence(ver_meta: &lpm_registry::VersionMetadata) -> Option<TrustEvidence> {
     if ver_meta
         .npm_user
-        .as_ref()
+        .as_deref()
         .is_some_and(lpm_registry::NpmUserMetadata::has_approver)
     {
         return Some(TrustEvidence::StagedPublish);
     }
     if ver_meta
         .npm_user
-        .as_ref()
+        .as_deref()
         .is_some_and(lpm_registry::NpmUserMetadata::has_trusted_publisher)
     {
         return Some(TrustEvidence::TrustedPublisher);
