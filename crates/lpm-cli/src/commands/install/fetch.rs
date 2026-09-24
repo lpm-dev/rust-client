@@ -3953,8 +3953,8 @@ pub(super) async fn speculative_download_and_store(
                 if stream_file {
                     let file = downloaded.file.reopen()?;
                     return v2_clone
-                        .extract_object_from_stream_with_known_sha512(
-                            std::io::BufReader::new(file),
+                        .extract_object_from_file_with_known_sha512(
+                            file,
                             &downloaded.sha512_sri,
                             expected_integrity.as_deref(),
                             lpm_registry::MAX_COMPRESSED_TARBALL_SIZE,

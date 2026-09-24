@@ -9,9 +9,17 @@
 //! flate2/zlib-rs on the npm size distribution). Oversized inputs fall back to
 //! flate2's streaming `GzDecoder` so peak allocation stays bounded.
 
+#[cfg_attr(
+    all(test, unix),
+    expect(
+        clippy::duplicate_mod,
+        reason = "Run the same rollback contract tests against both output backends."
+    )
+)]
 mod output;
 mod pipeline;
 mod timeline;
+mod writers;
 
 use flate2::read::GzDecoder;
 use lpm_common::{Integrity, LpmError};
@@ -1392,7 +1400,7 @@ where
     );
     // Tar headers and small files otherwise re-enter inflate for each short read.
     let buffered = std::io::BufReader::with_capacity(64 * 1024, limited);
-    extract_tar_archive_with_inspector(
+    extract_tar_archive_with_writers(
         buffered,
         target_dir,
         limits,
@@ -1405,6 +1413,7 @@ where
                 .map(|_| ())
                 .map_err(LpmError::Io)
         },
+        writers::WriterSetup::Disabled,
     )
 }
 
@@ -1453,19 +1462,13 @@ impl<R: std::io::Read> std::io::Read for DecompressedLimitReader<R> {
     clippy::too_many_arguments,
     reason = "The decode paths forward independent limits, hashing, and inspection controls."
 )]
-#[tracing::instrument(
-    target = "lpm_install_timeline",
-    level = "trace",
-    name = "tar_materialization",
-    skip_all
-)]
 fn extract_tar_archive_with_inspector<R, P, I, D, E>(
     reader: R,
     target_dir: &Path,
     limits: ExtractionLimits,
     compute_blake3: bool,
     buffer_predicate: P,
-    mut inspector: I,
+    inspector: I,
     inspection_mode: InspectionMode,
     drain_after_entries: D,
 ) -> Result<Vec<E>, LpmError>
@@ -1476,6 +1479,51 @@ where
     D: FnOnce(R) -> Result<(), LpmError>,
     E: ExtractionRecord,
 {
+    extract_tar_archive_with_writers(
+        reader,
+        target_dir,
+        limits,
+        compute_blake3,
+        buffer_predicate,
+        inspector,
+        inspection_mode,
+        drain_after_entries,
+        writers::WriterSetup::configured(),
+    )
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Extraction forwards independent limits, inspection and writer controls."
+)]
+#[tracing::instrument(
+    target = "lpm_install_timeline",
+    level = "trace",
+    name = "tar_materialization",
+    skip_all
+)]
+fn extract_tar_archive_with_writers<R, P, I, D, E>(
+    reader: R,
+    target_dir: &Path,
+    limits: ExtractionLimits,
+    compute_blake3: bool,
+    buffer_predicate: P,
+    mut inspector: I,
+    inspection_mode: InspectionMode,
+    drain_after_entries: D,
+    mut writer_setup: writers::WriterSetup,
+) -> Result<Vec<E>, LpmError>
+where
+    R: std::io::Read,
+    P: Fn(&Path, u64) -> bool,
+    I: for<'a> FnMut(EntryInfo<'a>),
+    D: FnOnce(R) -> Result<(), LpmError>,
+    E: ExtractionRecord,
+{
+    if matches!(inspection_mode, InspectionMode::WithCallback) {
+        writer_setup = writers::WriterSetup::Disabled;
+    }
+    let mut parallel = None::<(writers::WriterPool, writers::PendingEntries)>;
     let mut extracted_files = Vec::with_capacity(64);
     let mut accepted_identities = Vec::with_capacity(64);
     let mut total_size: u64 = 0;
@@ -1517,12 +1565,58 @@ where
             output.prepare_parent(&relative_path, &mut path_ledger_budget)?;
 
             if entry.header().entry_type().is_file() {
-                let path_match = seen_archive_paths.classify(&relative_path, &extracted_files)?;
+                let path_match = seen_archive_paths.classify(
+                    &relative_path,
+                    &extracted_files,
+                    parallel.as_ref().map(|(_, pending)| pending),
+                )?;
                 let duplicate_path = matches!(path_match, ArchivePathMatch::ExactDuplicate { .. });
+                if !duplicate_path
+                    && size <= writers::MAX_ENTRY_BYTES as u64
+                    && parallel.is_none()
+                    && let Some(pool) = writer_setup.start_if_ready(extracted_files.len())
+                {
+                    let pending = writers::PendingEntries::new(&pool);
+                    parallel = Some((pool, pending));
+                }
+
                 if !duplicate_path || E::RETAIN_DUPLICATE_PATHS {
                     path_ledger_budget.reserve(&relative_path)?;
                 }
                 let exec_bits = entry.header().mode().unwrap_or(0o644) & 0o111;
+
+                if let Some((pool, pending)) = &mut parallel {
+                    if duplicate_path || size > writers::MAX_ENTRY_BYTES as u64 {
+                        pending.drain(pool, &mut extracted_files, &mut accepted_identities)?;
+                    } else {
+                        let length = usize::try_from(size).map_err(|_| {
+                            std::io::Error::other("tarball entry exceeds address space")
+                        })?;
+                        if !pending.has_capacity(length) {
+                            pending.drain(pool, &mut extracted_files, &mut accepted_identities)?;
+                        }
+                        let mut bytes = vec![0; length];
+                        if !pending.has_capacity(bytes.capacity()) {
+                            pending.drain(pool, &mut extracted_files, &mut accepted_identities)?;
+                        }
+                        entry.read_exact(&mut bytes)?;
+                        let capacity = bytes.capacity();
+                        let output_file = output.create_file(&relative_path, false)?;
+                        pool.submit(writers::Job {
+                            sequence: pending.len(),
+                            output: output_file,
+                            bytes,
+                            exec_bits,
+                            compute_blake3,
+                        })?;
+                        let record_index = extracted_files.len() + pending.len();
+                        pending.push(relative_path, capacity);
+                        if let ArchivePathMatch::New { folded_hash } = path_match {
+                            seen_archive_paths.record_new(folded_hash, record_index);
+                        }
+                        return Ok(ControlFlow::<()>::Continue(()));
+                    }
+                }
 
                 let buffered_bytes = if buffer_predicate(&relative_path, size) {
                     let mut buf = Vec::with_capacity(size as usize);
@@ -1607,7 +1701,15 @@ where
         },
     );
 
-    let result = visit_result
+    let writers_result = if let Some((pool, mut pending)) = parallel {
+        let drained = pending.drain(&pool, &mut extracted_files, &mut accepted_identities);
+        let joined = pool.finish();
+        drained.and(joined)
+    } else {
+        Ok(())
+    };
+    let result = writers_result
+        .and(visit_result)
         .and_then(|(inner, _)| drain_after_entries(inner))
         .and_then(|()| output.validate());
     if let Err(error) = result {
@@ -1741,7 +1843,7 @@ where
             if entry.header().entry_type().is_file()
                 && let Some(stripped) = sanitize_entry_path(entry.path())?
             {
-                let path_match = seen_archive_paths.classify(&stripped, &files)?;
+                let path_match = seen_archive_paths.classify(&stripped, &files, None)?;
                 path_ledger_budget.reserve(&stripped)?;
                 let record_index = files.len();
                 files.push(stripped);
@@ -1876,18 +1978,37 @@ impl CaseFoldPathIndex {
         &self,
         relative_path: &Path,
         records: &[E],
+        pending: Option<&writers::PendingEntries>,
     ) -> Result<ArchivePathMatch, LpmError> {
         let folded_path = case_fold_path_key(relative_path);
         let folded_hash = self.hash_builder.hash_one(folded_path.as_bytes());
-        self.classify_with_hash(relative_path, records, &folded_path, folded_hash)
+        self.classify_with_hash_and_pending(
+            relative_path,
+            records,
+            &folded_path,
+            folded_hash,
+            pending,
+        )
     }
 
+    #[cfg(test)]
     fn classify_with_hash<E: ExtractionRecord>(
         &self,
         relative_path: &Path,
         records: &[E],
         folded_path: &str,
         folded_hash: u64,
+    ) -> Result<ArchivePathMatch, LpmError> {
+        self.classify_with_hash_and_pending(relative_path, records, folded_path, folded_hash, None)
+    }
+
+    fn classify_with_hash_and_pending<E: ExtractionRecord>(
+        &self,
+        relative_path: &Path,
+        records: &[E],
+        folded_path: &str,
+        folded_hash: u64,
+        pending: Option<&writers::PendingEntries>,
     ) -> Result<ArchivePathMatch, LpmError> {
         let Some(bucket) = self.buckets.get(&folded_hash) else {
             return Ok(ArchivePathMatch::New { folded_hash });
@@ -1896,8 +2017,9 @@ impl CaseFoldPathIndex {
         for &record_index in bucket.indices() {
             let existing_path = records
                 .get(record_index)
-                .ok_or_else(|| LpmError::Registry("invalid archive path ledger index".into()))?
-                .relative_path();
+                .map(ExtractionRecord::relative_path)
+                .or_else(|| pending?.path(record_index.checked_sub(records.len())?))
+                .ok_or_else(|| LpmError::Registry("invalid archive path ledger index".into()))?;
             if existing_path == relative_path {
                 return Ok(ArchivePathMatch::ExactDuplicate { record_index });
             }
@@ -1969,6 +2091,8 @@ fn is_reserved_windows_port_name(upper: &str, prefix: &str) -> bool {
 #[cfg(test)]
 mod tests {
     mod output_tests;
+    mod parallel_writers;
+    mod public_writer_activation;
 
     use super::*;
     use flate2::Compression;
