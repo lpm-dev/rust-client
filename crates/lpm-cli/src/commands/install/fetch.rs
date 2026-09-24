@@ -2642,6 +2642,13 @@ mod tests {
         let _guard = tokio::time::timeout(std::time::Duration::from_secs(2), package_lock.lock())
             .await
             .unwrap();
+        // The outer worker releases capacity after the inner closure releases the lock.
+        let released_capacity =
+            tokio::time::timeout(std::time::Duration::from_secs(2), capacity.acquire_many(4))
+                .await
+                .expect("blocking extraction must release all capacity after completion")
+                .unwrap();
+        drop(released_capacity);
         assert!(
             capacity_retained,
             "blocking extraction must retain its capacity after cancellation"

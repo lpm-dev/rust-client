@@ -10,7 +10,7 @@ const POLICY_PACKAGE: &str = "policy-pkg";
 const POLICY_VERSION: &str = "1.0.0";
 
 #[tokio::test]
-async fn install_policy_extension_enforce_blocks_package_candidate_before_linking() {
+async fn install_policy_extension_enforce_blocks_package_candidate_before_download_or_linking() {
     let mock = MockRegistry::start().await;
     mount_policy_package(&mock).await;
     let project = TempProject::empty(&format!(
@@ -70,6 +70,15 @@ async fn install_policy_extension_enforce_blocks_package_candidate_before_linkin
     assert!(
         !project.file_exists("node_modules/policy-pkg/package.json"),
         "blocked package must not be linked"
+    );
+    assert!(
+        mock.server()
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .all(|request| !request.url.path().ends_with(".tgz")),
+        "blocked package must not be downloaded"
     );
 }
 
