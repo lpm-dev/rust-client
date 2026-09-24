@@ -558,11 +558,9 @@ async fn plus_list_omits_annotation_when_already_on_latest() {
 }
 
 #[tokio::test]
-async fn plus_list_omits_annotation_when_latest_is_prerelease() {
+async fn plus_list_omits_annotation_for_an_untagged_prerelease() {
     let mock = MockRegistry::start().await;
 
-    // Newest version in the registry is a pre-release. Stable users
-    // shouldn't be nagged toward it.
     let pkg_stable = serde_json::json!({ "name": "react", "version": "1.0.0" });
     let pkg_pre = serde_json::json!({ "name": "react", "version": "2.0.0-rc.1" });
     let tar_stable = make_tarball_from_pkg_json(pkg_stable, &[]);
@@ -609,7 +607,7 @@ async fn plus_list_omits_annotation_when_latest_is_prerelease() {
     );
     assert!(
         !combined.contains("available)"),
-        "pre-release newest must not surface as `(vX available)`:\n{combined}"
+        "untagged prerelease must not surface as `(vX available)`:\n{combined}"
     );
 }
 

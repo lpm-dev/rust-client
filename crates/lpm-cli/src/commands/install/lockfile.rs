@@ -3175,6 +3175,41 @@ pub(super) fn root_resolutions_for_lockfile(
     resolutions
 }
 
+/// Read install hints from latest tags already present in the resolver cache.
+/// Exact-version documents carry no latest tag and do not produce a hint.
+pub(super) fn build_latest_versions(
+    cache: &HashMap<lpm_resolver::CanonicalKey, std::sync::Arc<lpm_resolver::CachedPackageInfo>>,
+) -> HashMap<String, String> {
+    let mut out = HashMap::with_capacity(cache.len());
+    for (key, info) in cache {
+        let Some(latest) = &info.latest_version_hint else {
+            continue;
+        };
+        let name = match key {
+            lpm_resolver::CanonicalKey::Root => continue,
+            lpm_resolver::CanonicalKey::Lpm { owner, name } => format!("@lpm.dev/{owner}.{name}"),
+            lpm_resolver::CanonicalKey::Npm { name } => name.clone(),
+        };
+        out.insert(name, latest.to_string());
+    }
+    out
+}
+
+#[derive(Clone, Copy)]
+pub(super) struct RegistrySourceContext<'a> {
+    route_table: &'a RouteTable,
+    registry_client: &'a RegistryClient,
+}
+
+impl<'a> RegistrySourceContext<'a> {
+    pub(super) fn new(route_table: &'a RouteTable, registry_client: &'a RegistryClient) -> Self {
+        Self {
+            route_table,
+            registry_client,
+        }
+    }
+}
+
 /// Convert resolver output to InstallPackage list.
 ///
 /// — the `root_aliases` map (from the resolver's
@@ -3200,48 +3235,6 @@ pub(super) fn root_resolutions_for_lockfile(
 /// user didn't opt into. They DO get root-link entries so the
 /// linker exposes them at the canonical module-resolution path.
 ///
-/// Compute a `canonical_name → highest-stable-version` map from the
-/// resolver's metadata cache. Used by the post-install `+` list to
-/// annotate direct deps with `(vX.Y.Z available)` when the registry
-/// has a newer stable release than the resolver picked.
-///
-/// "Stable" excludes pre-releases (anything carrying a `-alpha` /
-/// `-beta` / `-rc` / etc. tag in the semver). `versions` is sorted
-/// descending in [`lpm_resolver::CachedPackageInfo`], so we scan from
-/// the top and pick the first stable. Returns no entry when the cache
-/// has no stable version at all (rare — usually a private one-off pkg).
-pub(super) fn build_latest_stable_versions(
-    cache: &HashMap<lpm_resolver::CanonicalKey, std::sync::Arc<lpm_resolver::CachedPackageInfo>>,
-) -> HashMap<String, String> {
-    let mut out = HashMap::with_capacity(cache.len());
-    for (key, info) in cache {
-        let name = match key {
-            lpm_resolver::CanonicalKey::Root => continue,
-            lpm_resolver::CanonicalKey::Lpm { owner, name } => format!("@lpm.dev/{owner}.{name}"),
-            lpm_resolver::CanonicalKey::Npm { name } => name.clone(),
-        };
-        if let Some(latest) = info.versions.iter().find(|v| !v.is_prerelease()) {
-            out.insert(name, latest.to_string());
-        }
-    }
-    out
-}
-
-#[derive(Clone, Copy)]
-pub(super) struct RegistrySourceContext<'a> {
-    route_table: &'a RouteTable,
-    registry_client: &'a RegistryClient,
-}
-
-impl<'a> RegistrySourceContext<'a> {
-    pub(super) fn new(route_table: &'a RouteTable, registry_client: &'a RegistryClient) -> Self {
-        Self {
-            route_table,
-            registry_client,
-        }
-    }
-}
-
 pub(super) fn resolved_to_install_packages(
     resolved: &[ResolvedPackage],
     deps: &HashMap<String, String>,

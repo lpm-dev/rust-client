@@ -74,7 +74,7 @@ pub(super) struct OnlineInstallReportInput<'a> {
     pub(super) v2_link_task_timings: V2LinkTaskTimings,
     pub(super) slow_package_timings: &'a SlowPackageTimings,
     pub(super) pre_install_direct_versions: &'a HashMap<String, String>,
-    pub(super) latest_stable_versions: &'a HashMap<String, String>,
+    pub(super) latest_versions: &'a HashMap<String, String>,
     pub(super) is_add_invocation: bool,
     pub(super) verbose: bool,
 }
@@ -146,7 +146,7 @@ pub(super) fn emit_online_install_report(input: OnlineInstallReportInput<'_>) {
         v2_link_task_timings,
         slow_package_timings,
         pre_install_direct_versions,
-        latest_stable_versions,
+        latest_versions,
         is_add_invocation,
         verbose,
     } = input;
@@ -784,13 +784,7 @@ pub(super) fn emit_online_install_report(input: OnlineInstallReportInput<'_>) {
         if !changed_direct.is_empty() {
             eprintln!();
             for (name, version) in &changed_direct {
-                // Annotate with `(vX.Y.Z available)` when the
-                // resolver's metadata cache has a stable release newer
-                // than the version we just installed. Suppressed for:
-                // * lockfile fast-path (no cache → empty map),
-                // * non-registry sources (filtered out of `cache`),
-                // * unparseable / equal / older latest versions.
-                let hint = latest_stable_versions.get(name).and_then(|latest| {
+                let hint = latest_versions.get(name).and_then(|latest| {
                     let installed = lpm_semver::Version::parse(version).ok()?;
                     let candidate = lpm_semver::Version::parse(latest).ok()?;
                     (candidate > installed).then(|| format!("(v{latest} available)"))

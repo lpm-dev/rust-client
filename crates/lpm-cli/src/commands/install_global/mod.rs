@@ -355,6 +355,7 @@ mod tests {
             distribution_mode: None,
             package_type: None,
             latest_version: Some(latest),
+            latest_hint: Default::default(),
             ecosystem: None,
         }
     }

@@ -104,6 +104,7 @@ fn test_metadata(name: &str) -> PackageMetadata {
         distribution_mode: None,
         package_type: None,
         latest_version: Some("1.0.0".to_string()),
+        latest_hint: Default::default(),
         ecosystem: None,
     }
 }

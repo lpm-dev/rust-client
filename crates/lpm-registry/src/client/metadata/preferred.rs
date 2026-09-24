@@ -158,6 +158,7 @@ fn parse_preferred(
             distribution_mode: None,
             package_type: None,
             latest_version: None,
+            latest_hint: Default::default(),
             ecosystem: None,
         },
         versions_complete: false,

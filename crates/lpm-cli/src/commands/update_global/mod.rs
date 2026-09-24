@@ -631,6 +631,7 @@ fn compact_metadata_for_version(
         distribution_mode: metadata.distribution_mode.clone(),
         package_type: metadata.package_type.clone(),
         latest_version: Some(version.to_string()),
+        latest_hint: Default::default(),
         ecosystem: metadata.ecosystem.clone(),
     })
 }
