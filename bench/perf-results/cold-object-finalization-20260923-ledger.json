@@ -1,0 +1,200 @@
+{
+  "concept": "Cold object finalization metadata",
+  "findings": [
+    {
+      "id": "COLD-LOCAL-01",
+      "source": "cold_local_cost_research",
+      "category": "Performance",
+      "location": "crates/lpm-store/src/v2/tree_hash.rs: StreamedTreeBuilder::finish",
+      "claim": "Extraction finalization stats each entry despite already having content digests.",
+      "evidence": "Next has 8,531 files and 696 directories. Prototype median 32.992 \u2192 21.636 ms with exact digest/statistics parity. Final CLI diagnostics: 31.5 \u2192 25 ms frozen; 35 \u2192 27.5 ms live. All 120 frozen LPM content-digest maps agree. Paired full-CLI median saving of 10 ms remains noisy; no established p95/RSS benefit.",
+      "disposition": "Verified",
+      "coverage": "355 store tests; 120 full-CLI lockfile and content-digest maps; 180 package inventories; 60 balanced frozen rounds; separate finalization diagnostics",
+      "commit": "fd41ed34a4d8904f544ab466562719f0f0552831",
+      "pr_status": "Resolved in the cold-object-finalization concept branch; see its pull request for current CI status."
+    },
+    {
+      "id": "COLD-LOCAL-02",
+      "source": "cold_local_cost_research",
+      "category": "Performance",
+      "location": "Unshipped prototype read_object_tree_entries_for_walk fallback",
+      "claim": "A failed bulk attempt repeats in later directories on unsupported filesystems.",
+      "evidence": "Initial prototype did not disable the shared bulk buffer after failure.",
+      "disposition": "Verified",
+      "coverage": "failed_bulk_collection_disables_retries_without_replaying_consumed_digests",
+      "commit": "fd41ed34a4d8904f544ab466562719f0f0552831",
+      "pr_status": "Resolved in the cold-object-finalization concept branch; see its pull request for current CI status."
+    },
+    {
+      "id": "COLD-LOCAL-03",
+      "source": "cold_local_cost_research",
+      "category": "Correctness",
+      "location": "Unshipped prototype symlink metadata refresh",
+      "claim": "The error omits the failing operation and path.",
+      "evidence": "Initial prototype converted the OS error directly without the portable walker context.",
+      "disposition": "Verified",
+      "coverage": "bulk_symlink_refresh_errors_identify_the_affected_path",
+      "commit": "fd41ed34a4d8904f544ab466562719f0f0552831",
+      "pr_status": "Resolved in the cold-object-finalization concept branch; see its pull request for current CI status."
+    },
+    {
+      "id": "COLD-LOCAL-04",
+      "source": "daybreak_cold_finalization_review",
+      "category": "Correctness",
+      "location": "Prepared bulk-finalization regression tests",
+      "claim": "Parity tests can pass via silent portable fallback without exercising bulk metadata.",
+      "evidence": "The production walker falls back on a bulk error. The original prepared tests checked only final digests. A forced-fallback mutation now makes the instrumented parity test fail.",
+      "disposition": "Verified",
+      "coverage": "Test-only thread-local successful-directory counter and forced-fallback mutation",
+      "commit": "fd41ed34a4d8904f544ab466562719f0f0552831",
+      "pr_status": "Resolved in the cold-object-finalization concept branch; see its pull request for current CI status."
+    },
+    {
+      "id": "BM-1",
+      "source": "cache_correctness_review",
+      "category": "Correctness",
+      "location": "Cold benchmark run-replay.py: Handler.do_GET",
+      "claim": "A response spanning a control update is labeled with its completion phase instead of arrival phase.",
+      "evidence": "Both deterministic loopback tests failed before the fix and passed after capturing request_phase at GET entry. Original scored source is retained.",
+      "disposition": "Verified",
+      "coverage": "test_response_keeps_phase_from_request_arrival; test_frozen_miss_keeps_phase_from_request_arrival",
+      "commit": "fe6e6bb655c1f740537301d1f938be0fd7883e97",
+      "pr_status": "Resolved in the cold-object-finalization concept branch; see its pull request for current CI status."
+    },
+    {
+      "id": "REPORT-1",
+      "source": "cache_trust_review",
+      "category": "Correctness",
+      "location": "Cold finalization benchmark report: frozen-cohort interpretation",
+      "claim": "Draft wording said balanced pairs reduce timing drift, although ordering can only limit drift-related bias.",
+      "evidence": "All managers exhibit the shared shift; balanced execution does not change the environment. Revised wording limits the claim to bias reduction.",
+      "disposition": "Verified",
+      "coverage": "Read-only measurement review and primary comparison against the retained paired rows",
+      "commit": "fe6e6bb655c1f740537301d1f938be0fd7883e97",
+      "pr_status": "Resolved in the cold-object-finalization concept branch; see its pull request for current CI status."
+    },
+    {
+      "id": "PROXY-1",
+      "source": "daybreak_cold_finalization_review",
+      "category": "Security",
+      "location": "Nest replay benchmark runner.mjs: managerEnv",
+      "claim": "Design control: Inherited proxy or bypass variables can defeat replay isolation.",
+      "evidence": "Primary verified controls and regression coverage; final Daybreak review confirms closure for the scoring configuration. Frozen preflight had zero upstream fetches, misses, or rejections, preserving 34 npm-direct HTTP/2 metadata requests.",
+      "disposition": "Verified",
+      "coverage": "Explicit proxy/no-proxy values and clean environment; child-environment regression test",
+      "commit": "fe6e6bb655c1f740537301d1f938be0fd7883e97",
+      "pr_status": "Resolved in the cold-object-finalization concept branch; see its pull request for current CI status."
+    },
+    {
+      "id": "PROXY-2",
+      "source": "daybreak_cold_finalization_review",
+      "category": "Security",
+      "location": "Nest replay benchmark runner.mjs: managerEnv/createFreshRoot; replay-proxy.mjs: request/CONNECT guards",
+      "claim": "Design control: Layered configuration or inherited credentials can reach the replay server.",
+      "evidence": "Primary verified controls and regression coverage; final Daybreak review confirms closure for the scoring configuration. Frozen preflight had zero upstream fetches, misses, or rejections, preserving 34 npm-direct HTTP/2 metadata requests.",
+      "disposition": "Verified",
+      "coverage": "Isolated HOME/userconfig; credential environment test; inbound credential rejection tests",
+      "commit": "fe6e6bb655c1f740537301d1f938be0fd7883e97",
+      "pr_status": "Resolved in the cold-object-finalization concept branch; see its pull request for current CI status."
+    },
+    {
+      "id": "PROXY-3",
+      "source": "daybreak_cold_finalization_review",
+      "category": "Security",
+      "location": "Nest replay benchmark replay-proxy.mjs: verifyEntry/freeze; run.mjs: verifyArchives",
+      "claim": "Design control: Tarball SRI alone does not protect captured metadata.",
+      "evidence": "Primary verified controls and regression coverage; final Daybreak review confirms closure for the scoring configuration. Frozen preflight had zero upstream fetches, misses, or rejections, preserving 34 npm-direct HTTP/2 metadata requests. The coordinated-replacement test failed before the externally pinned manifest check and passed after. Capture manifest SHA-256: 74ad0a8958da205f4361bd5e82405e7ad93c9043d8aafe84dc4fba7f66ddfe9d.",
+      "disposition": "Verified",
+      "coverage": "Read-only capture manifest; body and metadata checks before every run; mutation regression; archive SRI validation",
+      "commit": "fe6e6bb655c1f740537301d1f938be0fd7883e97",
+      "pr_status": "Resolved in the cold-object-finalization concept branch; see its pull request for current CI status."
+    },
+    {
+      "id": "PROXY-4",
+      "source": "daybreak_cold_finalization_review",
+      "category": "Security",
+      "location": "Nest replay benchmark replay-proxy.mjs: CONNECT/secureConnection/requestKey",
+      "claim": "Design control: CONNECT alone does not constrain TLS SNI and inner HTTP authority.",
+      "evidence": "Primary verified controls and regression coverage; final Daybreak review confirms closure for the scoring configuration. Frozen preflight had zero upstream fetches, misses, or rejections, preserving 34 npm-direct HTTP/2 metadata requests.",
+      "disposition": "Verified",
+      "coverage": "Exact origin/SNI/Host guards; only GET; authority confusion and HTTP/2 rejection tests",
+      "commit": "fe6e6bb655c1f740537301d1f938be0fd7883e97",
+      "pr_status": "Resolved in the cold-object-finalization concept branch; see its pull request for current CI status."
+    },
+    {
+      "id": "PROXY-5",
+      "source": "Primary audit",
+      "category": "Correctness",
+      "location": "Nest replay runner.mjs: freeze and phase transitions",
+      "claim": "Runner ignored rejected control responses and could start timing after failed fixture validation.",
+      "evidence": "Deterministic HTTP 400 regression failed before the fix and passed after requiring response.ok before every scored or diagnostic subprocess. Daybreak independently confirmed closure.",
+      "disposition": "Verified",
+      "coverage": "runner stops when registry control rejects fixture validation",
+      "commit": "fe6e6bb655c1f740537301d1f938be0fd7883e97",
+      "pr_status": "Resolved in the cold-object-finalization concept branch; see its pull request for current CI status."
+    },
+    {
+      "id": "PROXY-6",
+      "source": "cache_correctness_review and primary",
+      "category": "Correctness",
+      "location": "bench/scripts/cold-object-finalization-replay/replay-proxy.mjs: HTTP/2 session configuration",
+      "claim": "A queued large tarball exhausts default Node session credit and rejects concurrent metadata streams before the request handler sees them.",
+      "evidence": "A paused12MiB tarball makes the concurrent small GET fail with NGHTTP2_ENHANCE_YOUR_CALM under the original default. The same test succeeds after the capacity correction and verifies both response bodies. This reproduces artificial backoffs observed in a later T3 replay.",
+      "disposition": "Verified",
+      "coverage": "queued large tarball does not reject a concurrent metadata stream; all7 proxy tests; CI lint helper gate",
+      "commit": "d5e5ee5bb",
+      "pr_status": "Resolved on PR875, which introduced the replay harness. Downstream stack CI must use rebased heads."
+    }
+  ],
+  "reviews": [
+    {
+      "source": "cache_correctness_review",
+      "findings": 0
+    },
+    {
+      "source": "cache_trust_review",
+      "findings": 0
+    },
+    {
+      "source": "daybreak_cold_finalization_review",
+      "model": "gpt-daybreak-blue-latest",
+      "findings": 0
+    },
+    {
+      "source": "daybreak_cold_finalization_review",
+      "scope": "Final applied diff and strengthened tests",
+      "findings": 0
+    },
+    {
+      "source": "cache_correctness_review",
+      "scope": "Frozen benchmark handler and regression test",
+      "findings": 1,
+      "remaining_findings": 0
+    },
+    {
+      "source": "cache_trust_review",
+      "scope": "Frozen replay timing interpretation",
+      "findings": 0,
+      "note": "Identified shared timing drift, requiring a narrower causal claim; no new measurement defect."
+    },
+    {
+      "source": "cache_trust_review",
+      "scope": "Report wording and measurement claims",
+      "findings": 1,
+      "remaining_findings": 0
+    },
+    {
+      "source": "daybreak_cold_finalization_review",
+      "scope": "Final Node HTTP/2 Nest replay controls and regressions",
+      "findings": 4,
+      "remaining_findings": 0
+    }
+  ],
+  "totals": {
+    "received": 12,
+    "verified_and_fixed": 12,
+    "rejected": 0,
+    "externally_blocked": 0,
+    "pending": 0
+  }
+}
