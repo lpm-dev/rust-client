@@ -533,6 +533,12 @@ where
 /// in a private fn so the outer wrapper can hold the store-lock
 /// handle for its full duration via `with_shared_lock_async`.
 #[allow(clippy::too_many_arguments)]
+#[tracing::instrument(
+    target = "lpm_install_timeline",
+    level = "trace",
+    name = "install_pipeline",
+    skip_all
+)]
 async fn run_with_options_under_store_lock(
     client: &RegistryClient,
     project_dir: &Path,

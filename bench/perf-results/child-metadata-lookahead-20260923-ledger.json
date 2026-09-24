@@ -1,0 +1,183 @@
+{
+  "findings": [
+    {
+      "id": "CP-A1",
+      "source": "cache_correctness_review",
+      "category": "performance",
+      "claim": "warm cache waits for speculative HTTP",
+      "evidence": "red-cache-hit.log",
+      "disposition": "Verified",
+      "coverage": "cached_exact_demand_does_not_wait_for_hanging_lookahead",
+      "commit": "65ebad8bbc6ffb3287238792a19c72e0672666d7",
+      "pr_status": "Prototype withdrawn from compiled source; evidence recorded in PR877",
+      "location": "crates/lpm-registry/src/client/metadata.rs: selected/legacy cache lookup before adoption",
+      "resolution_status": "Reproduced and corrected in the unshipped prototype, then removed with the entire optimization after the live gate found no repeatable gain"
+    },
+    {
+      "id": "CP-A2",
+      "source": "cache_correctness_review",
+      "category": "performance",
+      "claim": "allowance not shared across all importer passes",
+      "evidence": "red-registry.log",
+      "disposition": "Verified",
+      "coverage": "registry_clones_share_one_lookahead_admission",
+      "commit": "65ebad8bbc6ffb3287238792a19c72e0672666d7",
+      "pr_status": "Prototype withdrawn from compiled source; evidence recorded in PR877",
+      "location": "crates/lpm-registry/src/client/config.rs and state.rs: shared lifetime allowance",
+      "resolution_status": "Reproduced and corrected in the unshipped prototype, then removed with the entire optimization after the live gate found no repeatable gain"
+    },
+    {
+      "id": "CP-A3",
+      "source": "cache_correctness_review",
+      "category": "performance",
+      "claim": "rejected/discarded work and adoption timing omitted",
+      "evidence": "red-rpc.log",
+      "disposition": "Verified",
+      "coverage": "rejected_lookahead_records_its_http_wait; rejected_projection_records_original_bytes_and_parse_work",
+      "commit": "65ebad8bbc6ffb3287238792a19c72e0672666d7",
+      "pr_status": "Prototype withdrawn from compiled source; evidence recorded in PR877",
+      "location": "crates/lpm-registry/src/client/metadata/prefetch.rs: attempt accounting and staged result Drop",
+      "resolution_status": "Reproduced and corrected in the unshipped prototype, then removed with the entire optimization after the live gate found no repeatable gain"
+    },
+    {
+      "id": "PREF-P1",
+      "source": "cache_trust_review",
+      "category": "performance",
+      "claim": "duplicate CP-A1 plus duplicated exact-lane permit",
+      "evidence": "red-cache-hit.log; red-active-permit.log; resolver-final-targeted.log",
+      "disposition": "Verified",
+      "coverage": "cached_exact_demand_does_not_wait_for_hanging_lookahead; lookahead_counts_active_work_and_transfers_its_existing_permit",
+      "commit": "65ebad8bbc6ffb3287238792a19c72e0672666d7",
+      "pr_status": "Prototype withdrawn from compiled source; evidence recorded in PR877",
+      "location": "crates/lpm-resolver/src/greedy/fused.rs and fused/lookahead.rs: cache bypass and lease transfer",
+      "resolution_status": "Reproduced and corrected in the unshipped prototype, then removed with the entire optimization after the live gate found no repeatable gain",
+      "duplicate_of": [
+        "CP-A1",
+        "PREF-M2"
+      ]
+    },
+    {
+      "id": "PREF-P2",
+      "source": "cache_trust_review",
+      "category": "performance",
+      "claim": "adoption drops reusable full history",
+      "evidence": "red-registry.log",
+      "disposition": "Verified",
+      "coverage": "adopted_lookahead_history_serves_another_exact_version_without_http",
+      "commit": "65ebad8bbc6ffb3287238792a19c72e0672666d7",
+      "pr_status": "Prototype withdrawn from compiled source; evidence recorded in PR877",
+      "location": "crates/lpm-registry/src/client/metadata/prefetch.rs: adopted raw-history retention",
+      "resolution_status": "Reproduced and corrected in the unshipped prototype, then removed with the entire optimization after the live gate found no repeatable gain"
+    },
+    {
+      "id": "PREF-M1",
+      "source": "cache_trust_review",
+      "category": "performance",
+      "claim": "duplicate CP-A3 timing omissions",
+      "evidence": "red-rpc.log; red-cache-history-attribution.log; registry-final-targeted.log",
+      "disposition": "Verified",
+      "coverage": "rejected_lookahead_records_its_http_wait; rejected_projection_records_original_bytes_and_parse_work",
+      "commit": "65ebad8bbc6ffb3287238792a19c72e0672666d7",
+      "pr_status": "Prototype withdrawn from compiled source; evidence recorded in PR877",
+      "location": "crates/lpm-registry/src/client/metadata/prefetch.rs: rejected speculation accounting",
+      "resolution_status": "Reproduced and corrected in the unshipped prototype, then removed with the entire optimization after the live gate found no repeatable gain",
+      "duplicate_of": [
+        "CP-A3"
+      ]
+    },
+    {
+      "id": "PREF-M2",
+      "source": "cache_trust_review",
+      "category": "performance",
+      "claim": "active telemetry excludes lookahead",
+      "evidence": "red-active.log; red-active-permit.log; resolver-final-targeted.log",
+      "disposition": "Verified",
+      "coverage": "lookahead_counts_active_work_and_transfers_its_existing_permit; dropping_unused_lookahead_restores_its_permit_and_active_count",
+      "commit": "65ebad8bbc6ffb3287238792a19c72e0672666d7",
+      "pr_status": "Prototype withdrawn from compiled source; evidence recorded in PR877",
+      "location": "crates/lpm-resolver/src/greedy/fused/lookahead.rs: active telemetry lease",
+      "resolution_status": "Reproduced and corrected in the unshipped prototype, then removed with the entire optimization after the live gate found no repeatable gain"
+    },
+    {
+      "id": "PREF-M3",
+      "source": "cache_trust_review",
+      "category": "performance",
+      "claim": "timeline drops retained capacity",
+      "evidence": "red-retained.log",
+      "disposition": "Verified",
+      "coverage": "retained_bytes numeric-field allowlist regression in install_timeline.rs",
+      "commit": "65ebad8bbc6ffb3287238792a19c72e0672666d7",
+      "pr_status": "Prototype withdrawn from compiled source; evidence recorded in PR877",
+      "location": "crates/lpm-cli/src/cli/install_timeline.rs: numeric-field allowlist",
+      "resolution_status": "Reproduced and corrected in the unshipped prototype, then removed with the entire optimization after the live gate found no repeatable gain"
+    },
+    {
+      "id": "CP-A4",
+      "source": "cache_correctness_review",
+      "category": "performance",
+      "location": "crates/lpm-registry/src/client/metadata.rs: get_npm_selected_version_with_timings",
+      "claim": "fresh raw history waits behind staged HTTP",
+      "evidence": "red-cache-history-attribution.log: timeout before fix; green-cache-history-attribution.log: cache hit without awaiting pending task",
+      "disposition": "Verified",
+      "coverage": "cached_history_demand_does_not_wait_for_hanging_lookahead",
+      "commit": "65ebad8bbc6ffb3287238792a19c72e0672666d7",
+      "pr_status": "Prototype withdrawn from compiled source; evidence recorded in PR877",
+      "resolution_status": "Reproduced and corrected in the unshipped prototype, then removed with the entire optimization after the live gate found no repeatable gain"
+    },
+    {
+      "id": "CP-H1",
+      "source": "cache_correctness_review (primary trace investigation)",
+      "category": "performance",
+      "location": "bench/scripts/cold-object-finalization-replay/replay-proxy.mjs:createReplayProxy HTTP/2 session configuration",
+      "claim": "Replay HTTP/2 session budget triggers pre-header retries when large tarballs overlap metadata requests, distorting T3 performance",
+      "evidence": "T3 preflight91/92baseline and104/89candidate retry backoffs; all200headers. Raised server budget: zero in4diagnostics; identical280request/responsehash pairs for baseline diagnostic0. Node26.5.0 default10MB includes queued outbound data.; red-proxy-capacity.log now reproduces NGHTTP2_ENHANCE_YOUR_CALM with a paused12MiB response; green-proxy-capacity.log succeeds with corrected capacity.",
+      "disposition": "Verified",
+      "coverage": "queued large tarball does not reject a concurrent metadata stream; frozen diagnostic backoff guard",
+      "commit": "d5e5ee5bb",
+      "pr_status": "Fixed in PR875; regression test runs in CI",
+      "resolution_status": "Reproduced and fixed in the owning replay-harness concept"
+    },
+    {
+      "id": "CP-P3",
+      "source": "primary",
+      "category": "performance",
+      "location": "crates/lpm-resolver/src/greedy/fused/lookahead.rs:prefetch_child",
+      "claim": "Ineligible lookahead advances authoritative dispatch",
+      "evidence": "red-ineligible-scheduling.log reproduces queued ordinary task spawning before candidate eligibility is established; responsibility for Vite timing regression remains unproven; guard-tests.log; guard-workflows.log",
+      "disposition": "Verified",
+      "coverage": "ineligible_lookahead_does_not_advance_authoritative_dispatch",
+      "commit": "65ebad8bbc6ffb3287238792a19c72e0672666d7",
+      "pr_status": "Prototype withdrawn from compiled source; evidence recorded in PR877",
+      "resolution_status": "Reproduced and corrected in the unshipped prototype, then removed with the entire optimization after the live gate found no repeatable gain"
+    },
+    {
+      "id": "CP-P4",
+      "source": "primary",
+      "category": "correctness",
+      "location": "crates/lpm-registry/src/client/metadata/prefetch.rs:rejected_projection_records_original_bytes_and_parse_work",
+      "claim": "Scoped tracing assertion misses event when another test registers shared callsite without subscriber",
+      "evidence": "Two parallel-suite failures; isolated success; tracing-core single-dispatch registration uses thread default; second live dispatcher restores parallel capture",
+      "disposition": "Verified",
+      "coverage": "guard-coverage-registry-final.log (17 tests pass)",
+      "commit": "65ebad8bbc6ffb3287238792a19c72e0672666d7",
+      "pr_status": "Prototype withdrawn from compiled source; evidence recorded in PR877",
+      "resolution_status": "Reproduced and corrected in the unshipped prototype, then removed with the entire optimization after the live gate found no repeatable gain"
+    }
+  ],
+  "design_constraints": "17 preimplementation constraints, not current defects; tracked in reviewer messages.",
+  "parent": "d53ddb1d81125c0bcc0ffbfabb95da063c98369f",
+  "actual_report_count": 12,
+  "canonical_finding_count": 10,
+  "totals": {
+    "received_reports": 12,
+    "canonical_findings": 10,
+    "duplicate_reports": 2,
+    "verified_and_resolved_reports": 12,
+    "retained_harness_fixes": 1,
+    "prototype_reports_resolved_then_withdrawn": 11,
+    "rejected": 0,
+    "externally_blocked": 0,
+    "pending": 0
+  },
+  "counting_note": "These are investigation findings, not twelve shipped product fixes. Eleven reports concern the unshipped experiment, including two duplicates. Their fixes and tests remain in the source archive. The only retained code fix is the replay harness."
+}

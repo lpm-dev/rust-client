@@ -732,6 +732,12 @@ impl RegistryClient {
             .await
     }
 
+    #[tracing::instrument(
+        target = "lpm_install_timeline",
+        level = "trace",
+        name = "metadata_request",
+        skip_all
+    )]
     pub(super) async fn send_package_metadata_request_with_npmrc_auth(
         &self,
         request_builder: reqwest::RequestBuilder,
@@ -759,6 +765,7 @@ impl RegistryClient {
                 let Some(fallback_request) = fallback_request else {
                     return Err(error);
                 };
+                tracing::event!(name: "transport_fallback", target: "lpm_install_timeline", tracing::Level::TRACE, {});
                 tracing::debug!("Worker metadata HTTP/3 failed; retrying with default transport");
                 self.send_request_with_retry_and_npmrc_auth(fallback_request, None, auth)
                     .await?

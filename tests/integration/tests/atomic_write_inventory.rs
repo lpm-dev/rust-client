@@ -159,6 +159,10 @@ fn reviewed_raw_atomic_writer(key: &str) -> bool {
 
 const REVIEWED_RAW_ATOMIC_WRITERS: &[(&str, &str)] = &[
     (
+        "crates/lpm-cli/src/cli/install_timeline.rs::export_with",
+        "serializes and flushes an exclusively created same-directory NamedTempFile, then publishes with persist_noclobber without replacing an existing destination",
+    ),
+    (
         "crates/lpm-runner/src/local_domains.rs::backup_hosts_file_once_with",
         "streams and syncs an exclusive NamedTempFile, then publishes with persist_noclobber to preserve the first backup and avoid following destination links",
     ),

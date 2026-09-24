@@ -1,5 +1,6 @@
 use indicatif::{ProgressBar, ProgressStyle};
 use tokio::sync::Mutex as AsyncMutex;
+use tracing::Instrument as _;
 
 use super::*;
 
@@ -2085,99 +2086,178 @@ pub(super) async fn run_online_fetch_phase(
             let fetch_extract_limiter_c = fetch_extract_limiter.clone();
             let v2_streaming_lane_c = Arc::clone(&v2_streaming_lane);
 
-            handles.push(tokio::spawn(async move {
-                // v2-shaped link handle. Mutually exclusive with `LinkHandle`
-                // at runtime: under v2_mode,
-                // `event_link` is false (so `LinkHandle` is always None);
-                // under !v2_mode, `v2_plan_arc` is None (so this is
-                // always None).
-                type FetchTaskResult = (
-                    String,
-                    Option<String>,
-                    String,
-                    TaskTimings,
-                    Option<LinkHandle>,
-                    Option<V2LinkHandle>,
-                    Option<String>,
-                );
+            let fetch_span =
+                tracing::trace_span!(target: "lpm_install_timeline", "authoritative_fetch_task");
+            handles.push(tokio::spawn(
+                async move {
+                    // v2-shaped link handle. Mutually exclusive with `LinkHandle`
+                    // at runtime: under v2_mode,
+                    // `event_link` is false (so `LinkHandle` is always None);
+                    // under !v2_mode, `v2_plan_arc` is None (so this is
+                    // always None).
+                    type FetchTaskResult = (
+                        String,
+                        Option<String>,
+                        String,
+                        TaskTimings,
+                        Option<LinkHandle>,
+                        Option<V2LinkHandle>,
+                        Option<String>,
+                    );
 
-                // timing: spawn→key-lock→permit captures the full time this
-                // task sat queued. It also covers the FetchCoordinator wait:
-                // if a speculation is mid-fetch for the same `(name, ver)`,
-                // we wait on the per-key lock and short-circuit via the
-                // store-hit check below.
-                let queue_start = std::time::Instant::now();
-                let package_display =
-                    trace_slow_packages.then(|| format!("{}@{}", p.name, p.version));
-                let package_key = install_pkg_key(&p);
+                    // timing: spawn→key-lock→permit captures the full time this
+                    // task sat queued. It also covers the FetchCoordinator wait:
+                    // if a speculation is mid-fetch for the same `(name, ver)`,
+                    // we wait on the per-key lock and short-circuit via the
+                    // store-hit check below.
+                    let queue_start = std::time::Instant::now();
+                    let package_display =
+                        trace_slow_packages.then(|| format!("{}@{}", p.name, p.version));
+                    let package_key = install_pkg_key(&p);
 
-                //: per-key fetch coordination. Acquired BEFORE
-                // the download permit — if a sibling (speculation) is
-                // already fetching this key, we wait here without consuming
-                // a permit. On wake, `has_package` is true and we skip the
-                // real fetch entirely (zero bandwidth, zero CPU).
-                let mut key_guard = Some(match reserved_key_guard {
-                    Some(guard) => guard,
-                    None => coord.lock_for(package_key.clone()).await.lock_owned().await,
-                });
+                    //: per-key fetch coordination. Acquired BEFORE
+                    // the download permit — if a sibling (speculation) is
+                    // already fetching this key, we wait here without consuming
+                    // a permit. On wake, `has_package` is true and we skip the
+                    // real fetch entirely (zero bandwidth, zero CPU).
+                    let mut key_guard = Some(match reserved_key_guard {
+                        Some(guard) => guard,
+                        None => coord.lock_for(package_key.clone()).await.lock_owned().await,
+                    });
 
-                // Spawn the per-pkg link task once the tarball is in the
-                // store. Used in both the sibling-skip path and the normal
-                // fetch path — in either case the package is materialized
-                // by the time we call `link_one_package`.
-                //
-                // The closure takes an optional sri_override so the post-fetch
-                // path can pass the freshly-computed SRI before it
-                // reaches `p.integrity`. Source-aware store_path
-                // routes Source::Tarball to the integrity-keyed CAS,
-                // never to the registry-keyed path.
-                let spawn_link = |p: &InstallPackage,
-                                  sri_override: Option<&str>|
-                 -> Result<Option<LinkHandle>, LpmError> {
-                    if !event_link {
-                        return Ok(None);
-                    }
-                    // (reviewed): store_path_or_err
-                    // surfaces the missing-SRI invariant violation
-                    // as a typed error with full package context
-                    // instead of panicking. Reachable only on a
-                    // malformed lockfile that bypassed the
-                    // writer guard — should never fire in practice.
-                    let store_path =
-                        p.store_path_or_err(&store_ref, &project_dir_buf, sri_override)?;
-                    let target = LinkTarget {
-                        name: p.name.clone(),
-                        version: p.version.clone(),
-                        store_path,
-                        dependencies: link_dependencies_for_package(p, &source_index_for_pkg)?,
-                        aliases: p.aliases.clone(),
-                        is_direct: p.is_direct,
-                        root_link_names: p.root_link_names.clone(),
-                        wrapper_id: p.wrapper_id_for_source(),
-                        materialization: p.materialization_for_source(),
-                        peers: p.peers.clone(),
-                        patch_fingerprint: patch_fingerprint_for_pkg.clone(),
+                    // Spawn the per-pkg link task once the tarball is in the
+                    // store. Used in both the sibling-skip path and the normal
+                    // fetch path — in either case the package is materialized
+                    // by the time we call `link_one_package`.
+                    //
+                    // The closure takes an optional sri_override so the post-fetch
+                    // path can pass the freshly-computed SRI before it
+                    // reaches `p.integrity`. Source-aware store_path
+                    // routes Source::Tarball to the integrity-keyed CAS,
+                    // never to the registry-keyed path.
+                    let spawn_link = |p: &InstallPackage,
+                                      sri_override: Option<&str>|
+                     -> Result<Option<LinkHandle>, LpmError> {
+                        if !event_link {
+                            return Ok(None);
+                        }
+                        // (reviewed): store_path_or_err
+                        // surfaces the missing-SRI invariant violation
+                        // as a typed error with full package context
+                        // instead of panicking. Reachable only on a
+                        // malformed lockfile that bypassed the
+                        // writer guard — should never fire in practice.
+                        let store_path =
+                            p.store_path_or_err(&store_ref, &project_dir_buf, sri_override)?;
+                        let target = LinkTarget {
+                            name: p.name.clone(),
+                            version: p.version.clone(),
+                            store_path,
+                            dependencies: link_dependencies_for_package(p, &source_index_for_pkg)?,
+                            aliases: p.aliases.clone(),
+                            is_direct: p.is_direct,
+                            root_link_names: p.root_link_names.clone(),
+                            wrapper_id: p.wrapper_id_for_source(),
+                            materialization: p.materialization_for_source(),
+                            peers: p.peers.clone(),
+                            patch_fingerprint: patch_fingerprint_for_pkg.clone(),
+                        };
+                        let pd = project_dir_buf.clone();
+                        Ok(Some(tokio::task::spawn_blocking(move || {
+                            lpm_linker::link_one_package(&pd, &target, force_flag)
+                        })))
                     };
-                    let pd = project_dir_buf.clone();
-                    Ok(Some(tokio::task::spawn_blocking(move || {
-                        lpm_linker::link_one_package(&pd, &target, force_flag)
-                    })))
-                };
 
-                if !force_flag
-                    && let (Some(store_v2), Some(expected_sri)) =
-                        (store_v2_ref.as_ref(), p.integrity.clone())
-                {
-                    let sri_for_result = expected_sri.clone();
-                    let store_v2_check = std::sync::Arc::clone(store_v2);
-                    let reusable_object = tokio::task::spawn_blocking(move || {
-                        store_v2_check.reusable_object(&expected_sri)
-                    })
-                    .await
-                    .map_err(|e| {
-                        LpmError::Registry(format!("virtual-store cache check task panicked: {e}"))
-                    })??;
-                    if let Some(reusable_object) = reusable_object {
+                    if !force_flag
+                        && let (Some(store_v2), Some(expected_sri)) =
+                            (store_v2_ref.as_ref(), p.integrity.clone())
+                    {
+                        let sri_for_result = expected_sri.clone();
+                        let store_v2_check = std::sync::Arc::clone(store_v2);
+                        let reusable_object = tokio::task::spawn_blocking(move || {
+                            store_v2_check.reusable_object(&expected_sri)
+                        })
+                        .await
+                        .map_err(|e| {
+                            LpmError::Registry(format!(
+                                "virtual-store cache check task panicked: {e}"
+                            ))
+                        })??;
+                        if let Some(reusable_object) = reusable_object {
+                            let v2_link_h: Option<V2LinkHandle> =
+                                if let (Some(plan), Some(target), Some(store_v2)) = (
+                                    v2_plan_arc.as_ref(),
+                                    v2_target_for_pkg.as_ref(),
+                                    store_v2_ref.as_ref(),
+                                ) {
+                                    let plan_c = std::sync::Arc::clone(plan);
+                                    let mut target_c = (**target).clone();
+                                    target_c.verified_object_integrity =
+                                        Some(reusable_object.object_integrity);
+                                    let store_c = std::sync::Arc::clone(store_v2);
+                                    Some(spawn_v2_link_task(
+                                        plan_c,
+                                        Arc::new(target_c),
+                                        store_c,
+                                        Arc::clone(&v2_link_task_semaphore_c),
+                                        workspace_coordinator_c.clone(),
+                                    )?)
+                                } else {
+                                    None
+                                };
+                            overall.inc(1);
+                            spec_tracker_c.mark_consumed_if_completed(&package_key);
+                            return Ok::<FetchTaskResult, LpmError>((
+                                package_key,
+                                package_display,
+                                sri_for_result,
+                                TaskTimings {
+                                    queue_wait_ms: queue_start.elapsed().as_millis(),
+                                    ..Default::default()
+                                },
+                                None,
+                                v2_link_h,
+                                None,
+                            ));
+                        }
+                    }
+
+                    // Only honour the store-hit short-circuit when not in
+                    // `--force` mode. `--force` is the "re-verify
+                    // integrity against registry" path: the user explicitly
+                    // wants every tarball re-downloaded and re-hashed, even if
+                    // the store already has a valid copy. Without this gate, a
+                    // sibling task (or a prior install) making the store hot
+                    // would neuter `--force`.
+                    //
+                    // Source-aware existence check: a registry-CAS hit must NOT
+                    // satisfy a Source::Tarball pkg with the same
+                    // (name, version).
+                    let store_path_pre_fetch = (!force_flag)
+                        .then(|| p.store_path_source_aware(&store_ref, &project_dir_buf, None))
+                        .flatten();
+                    if !force_flag
+                        && p.store_has_source_aware(&store_ref, &project_dir_buf)
+                        && let Some(existing_path) = store_path_pre_fetch
+                    {
+                        // A sibling completed the fetch while we waited on the
+                        // key lock. Use the stored SRI for lockfile output;
+                        // task_timings stays at defaults (no download work done
+                        // on THIS task's critical path — the sibling's timings
+                        // covered it). `None` for `final_url` here
+                        // because THIS task didn't hit the registry — the
+                        // sibling's task already reported the URL it used
+                        // (via its own return value) and will be folded into
+                        // the writeback aggregator. Reporting `None` avoids
+                        // double-counting a divergence or conflicting on the
+                        // URL value.
+                        let sri =
+                            lpm_store::read_stored_integrity(&existing_path).unwrap_or_default();
+                        let link_h = spawn_link(&p, None)?;
+                        // The v2 object dir was populated by the sibling's fetch
+                        // task. The per-key fetch lock above ensures we observe
+                        // the post-extract state, so dispatch the v2 link entry in
+                        // the same shape as the post-fetch path below.
                         let v2_link_h: Option<V2LinkHandle> =
                             if let (Some(plan), Some(target), Some(store_v2)) = (
                                 v2_plan_arc.as_ref(),
@@ -2185,13 +2265,11 @@ pub(super) async fn run_online_fetch_phase(
                                 store_v2_ref.as_ref(),
                             ) {
                                 let plan_c = std::sync::Arc::clone(plan);
-                                let mut target_c = (**target).clone();
-                                target_c.verified_object_integrity =
-                                    Some(reusable_object.object_integrity);
+                                let target_c = target.clone();
                                 let store_c = std::sync::Arc::clone(store_v2);
                                 Some(spawn_v2_link_task(
                                     plan_c,
-                                    Arc::new(target_c),
+                                    target_c,
                                     store_c,
                                     Arc::clone(&v2_link_task_semaphore_c),
                                     workspace_coordinator_c.clone(),
@@ -2204,53 +2282,110 @@ pub(super) async fn run_online_fetch_phase(
                         return Ok::<FetchTaskResult, LpmError>((
                             package_key,
                             package_display,
-                            sri_for_result,
+                            sri,
                             TaskTimings {
                                 queue_wait_ms: queue_start.elapsed().as_millis(),
                                 ..Default::default()
                             },
-                            None,
+                            link_h,
                             v2_link_h,
                             None,
                         ));
                     }
-                }
 
-                // Only honour the store-hit short-circuit when not in
-                // `--force` mode. `--force` is the "re-verify
-                // integrity against registry" path: the user explicitly
-                // wants every tarball re-downloaded and re-hashed, even if
-                // the store already has a valid copy. Without this gate, a
-                // sibling task (or a prior install) making the store hot
-                // would neuter `--force`.
-                //
-                // Source-aware existence check: a registry-CAS hit must NOT
-                // satisfy a Source::Tarball pkg with the same
-                // (name, version).
-                let store_path_pre_fetch = (!force_flag)
-                    .then(|| p.store_path_source_aware(&store_ref, &project_dir_buf, None))
-                    .flatten();
-                if !force_flag
-                    && p.store_has_source_aware(&store_ref, &project_dir_buf)
-                    && let Some(existing_path) = store_path_pre_fetch
-                {
-                    // A sibling completed the fetch while we waited on the
-                    // key lock. Use the stored SRI for lockfile output;
-                    // task_timings stays at defaults (no download work done
-                    // on THIS task's critical path — the sibling's timings
-                    // covered it). `None` for `final_url` here
-                    // because THIS task didn't hit the registry — the
-                    // sibling's task already reported the URL it used
-                    // (via its own return value) and will be folded into
-                    // the writeback aggregator. Reporting `None` avoids
-                    // double-counting a divergence or conflicting on the
-                    // URL value.
-                    let sri = lpm_store::read_stored_integrity(&existing_path).unwrap_or_default();
-                    let link_h = spawn_link(&p, None)?;
-                    // The v2 object dir was populated by the sibling's fetch
-                    // task. The per-key fetch lock above ensures we observe
-                    // the post-extract state, so dispatch the v2 link entry in
-                    // the same shape as the post-fetch path below.
+                    // W6a — `acquire_owned` so the permit can be
+                    // *moved* into the fetch fn and dropped between
+                    // download and extract. The fn drops it as soon as
+                    // bytes are on the heap (streaming) or on temp disk
+                    // (legacy), letting the next download start while this
+                    // task continues with extract on the blocking pool.
+                    let permit = sem
+                        .clone()
+                        .acquire_owned()
+                        .await
+                        .map_err(|_| LpmError::Registry("download semaphore closed".into()))?;
+                    let queue_wait_ms = queue_start.elapsed().as_millis();
+
+                    overall.set_message(
+                        lpm_common::sanitize_terminal_inline(&format!("{}@{}", p.name, p.version))
+                            .into_owned(),
+                    );
+
+                    // — Source::Tarball install packages
+                    // bypass the registry-routed legacy/streaming paths
+                    // entirely. The URL is the source identity; the
+                    // store path is content-addressable by integrity.
+                    let is_tarball_source = matches!(
+                        p.source_kind(),
+                        Ok(lpm_lockfile::Source::Tarball { .. })
+                            | Ok(lpm_lockfile::Source::Git { .. })
+                    );
+                    let store_v2_arg = store_v2_ref.as_deref();
+                    let (computed_sri, task_timings, final_url, fresh_object) = if is_tarball_source
+                    {
+                        fetch_and_store_tarball_url(
+                            &client,
+                            &store_ref,
+                            store_v2_arg,
+                            &p,
+                            queue_wait_ms,
+                            permit,
+                            &fetch_extract_limiter_c,
+                        )
+                        .await?
+                    } else if streaming_fetch {
+                        fetch_and_store_streaming(
+                            &client,
+                            &route_table_c,
+                            &store_ref,
+                            store_v2_arg,
+                            &p,
+                            queue_wait_ms,
+                            ArtifactSelection::from_used_lockfile(used_lockfile),
+                            &gate_stats_c,
+                            permit,
+                            &fetch_extract_limiter_c,
+                            install_accounting,
+                            if is_v2_streaming_candidate {
+                                V2StreamingEligibility::CriticalCandidate(
+                                    v2_streaming_lane_c.as_ref(),
+                                )
+                            } else {
+                                V2StreamingEligibility::Disabled
+                            },
+                            key_guard.take(),
+                        )
+                        .await?
+                    } else {
+                        fetch_and_store_legacy(
+                            &client,
+                            &route_table_c,
+                            &store_ref,
+                            store_v2_arg,
+                            &p,
+                            queue_wait_ms,
+                            ArtifactSelection::from_used_lockfile(used_lockfile),
+                            &gate_stats_c,
+                            permit,
+                            &fetch_extract_limiter_c,
+                            install_accounting,
+                        )
+                        .await?
+                    };
+                    // Spawn per-pkg link immediately; the package is
+                    // now materialized. Runs on the blocking pool in parallel
+                    // with sibling fetch tasks still downloading.
+                    //
+                    // Pass the freshly-computed SRI as override so Source::Tarball
+                    // packages link from the integrity-keyed CAS path
+                    // (the freshly-stored content), not the legacy
+                    // registry slot. Registry sources ignore the override.
+                    let link_h = spawn_link(&p, Some(&computed_sri))?;
+
+                    // Dispatch v2 link entry materialization on the blocking pool now that the
+                    // tarball is extracted into `objects/<sri>/`. Runs in
+                    // parallel with sibling fetch tasks still downloading
+                    // and (importantly) cuts the post-fetch link-stage tail.
                     let v2_link_h: Option<V2LinkHandle> =
                         if let (Some(plan), Some(target), Some(store_v2)) = (
                             v2_plan_arc.as_ref(),
@@ -2258,159 +2393,37 @@ pub(super) async fn run_online_fetch_phase(
                             store_v2_ref.as_ref(),
                         ) {
                             let plan_c = std::sync::Arc::clone(plan);
-                            let target_c = target.clone();
+                            let mut target_c = (**target).clone();
+                            if let Some(object) = fresh_object {
+                                target_c.source_sri = computed_sri.clone();
+                                target_c.fresh_object = Some(object);
+                            }
                             let store_c = std::sync::Arc::clone(store_v2);
                             Some(spawn_v2_link_task(
                                 plan_c,
-                                target_c,
+                                Arc::new(target_c),
                                 store_c,
                                 Arc::clone(&v2_link_task_semaphore_c),
-                                workspace_coordinator_c.clone(),
+                                workspace_coordinator_c,
                             )?)
                         } else {
                             None
                         };
+
                     overall.inc(1);
-                    spec_tracker_c.mark_consumed_if_completed(&package_key);
-                    return Ok::<FetchTaskResult, LpmError>((
+                    spec_tracker_c.mark_duplicated_if_failed(&package_key);
+                    Ok::<FetchTaskResult, LpmError>((
                         package_key,
                         package_display,
-                        sri,
-                        TaskTimings {
-                            queue_wait_ms: queue_start.elapsed().as_millis(),
-                            ..Default::default()
-                        },
+                        computed_sri,
+                        task_timings,
                         link_h,
                         v2_link_h,
-                        None,
-                    ));
+                        Some(final_url),
+                    ))
                 }
-
-                // W6a — `acquire_owned` so the permit can be
-                // *moved* into the fetch fn and dropped between
-                // download and extract. The fn drops it as soon as
-                // bytes are on the heap (streaming) or on temp disk
-                // (legacy), letting the next download start while this
-                // task continues with extract on the blocking pool.
-                let permit = sem
-                    .clone()
-                    .acquire_owned()
-                    .await
-                    .map_err(|_| LpmError::Registry("download semaphore closed".into()))?;
-                let queue_wait_ms = queue_start.elapsed().as_millis();
-
-                overall.set_message(
-                    lpm_common::sanitize_terminal_inline(&format!("{}@{}", p.name, p.version))
-                        .into_owned(),
-                );
-
-                // — Source::Tarball install packages
-                // bypass the registry-routed legacy/streaming paths
-                // entirely. The URL is the source identity; the
-                // store path is content-addressable by integrity.
-                let is_tarball_source = matches!(
-                    p.source_kind(),
-                    Ok(lpm_lockfile::Source::Tarball { .. }) | Ok(lpm_lockfile::Source::Git { .. })
-                );
-                let store_v2_arg = store_v2_ref.as_deref();
-                let (computed_sri, task_timings, final_url, fresh_object) = if is_tarball_source {
-                    fetch_and_store_tarball_url(
-                        &client,
-                        &store_ref,
-                        store_v2_arg,
-                        &p,
-                        queue_wait_ms,
-                        permit,
-                        &fetch_extract_limiter_c,
-                    )
-                    .await?
-                } else if streaming_fetch {
-                    fetch_and_store_streaming(
-                        &client,
-                        &route_table_c,
-                        &store_ref,
-                        store_v2_arg,
-                        &p,
-                        queue_wait_ms,
-                        ArtifactSelection::from_used_lockfile(used_lockfile),
-                        &gate_stats_c,
-                        permit,
-                        &fetch_extract_limiter_c,
-                        install_accounting,
-                        if is_v2_streaming_candidate {
-                            V2StreamingEligibility::CriticalCandidate(v2_streaming_lane_c.as_ref())
-                        } else {
-                            V2StreamingEligibility::Disabled
-                        },
-                        key_guard.take(),
-                    )
-                    .await?
-                } else {
-                    fetch_and_store_legacy(
-                        &client,
-                        &route_table_c,
-                        &store_ref,
-                        store_v2_arg,
-                        &p,
-                        queue_wait_ms,
-                        ArtifactSelection::from_used_lockfile(used_lockfile),
-                        &gate_stats_c,
-                        permit,
-                        &fetch_extract_limiter_c,
-                        install_accounting,
-                    )
-                    .await?
-                };
-                // Spawn per-pkg link immediately; the package is
-                // now materialized. Runs on the blocking pool in parallel
-                // with sibling fetch tasks still downloading.
-                //
-                // Pass the freshly-computed SRI as override so Source::Tarball
-                // packages link from the integrity-keyed CAS path
-                // (the freshly-stored content), not the legacy
-                // registry slot. Registry sources ignore the override.
-                let link_h = spawn_link(&p, Some(&computed_sri))?;
-
-                // Dispatch v2 link entry materialization on the blocking pool now that the
-                // tarball is extracted into `objects/<sri>/`. Runs in
-                // parallel with sibling fetch tasks still downloading
-                // and (importantly) cuts the post-fetch link-stage tail.
-                let v2_link_h: Option<V2LinkHandle> =
-                    if let (Some(plan), Some(target), Some(store_v2)) = (
-                        v2_plan_arc.as_ref(),
-                        v2_target_for_pkg.as_ref(),
-                        store_v2_ref.as_ref(),
-                    ) {
-                        let plan_c = std::sync::Arc::clone(plan);
-                        let mut target_c = (**target).clone();
-                        if let Some(object) = fresh_object {
-                            target_c.source_sri = computed_sri.clone();
-                            target_c.fresh_object = Some(object);
-                        }
-                        let store_c = std::sync::Arc::clone(store_v2);
-                        Some(spawn_v2_link_task(
-                            plan_c,
-                            Arc::new(target_c),
-                            store_c,
-                            Arc::clone(&v2_link_task_semaphore_c),
-                            workspace_coordinator_c,
-                        )?)
-                    } else {
-                        None
-                    };
-
-                overall.inc(1);
-                spec_tracker_c.mark_duplicated_if_failed(&package_key);
-                Ok::<FetchTaskResult, LpmError>((
-                    package_key,
-                    package_display,
-                    computed_sri,
-                    task_timings,
-                    link_h,
-                    v2_link_h,
-                    Some(final_url),
-                ))
-            }));
+                .instrument(fetch_span),
+            ));
         }
 
         // Collect computed integrity hashes and fold per-task timings into
@@ -3336,6 +3349,8 @@ pub(super) fn spawn_speculation_dispatcher(
     let skipped_auth_c = skipped_auth.clone();
 
     let mut rx = rx;
+    let dispatch_span =
+        tracing::trace_span!(target: "lpm_install_timeline", "speculation_dispatch");
     let handle = tokio::spawn(async move {
         // Work queue items: (package_name, range_string, depth, is_root).
         // Depth is 1 for roots, N+1 for each transitive hop. Capped at
@@ -3536,7 +3551,7 @@ pub(super) fn spawn_speculation_dispatcher(
                         }
                     }
                     task_ms_task.fetch_add(task_start.elapsed().as_millis() as u64, Relaxed);
-                }));
+                }.in_current_span()));
             };
 
         // Main interleave loop: drain the work queue, then wait for the
@@ -3609,7 +3624,7 @@ pub(super) fn spawn_speculation_dispatcher(
         // `has_package` check. Losing a race to the real loop is fine:
         // the store's atomic-rename protects against corruption.
         futures::future::join_all(spec_tasks).await;
-    });
+    }.instrument(dispatch_span));
 
     // caller owns the tx side of the mpsc channel and the
     // walker task; we return the dispatcher's `JoinHandle` +
@@ -3639,6 +3654,12 @@ pub(super) fn spawn_speculation_dispatcher(
 /// are swallowed by the dispatcher (best-effort speculation); the real
 /// fetch loop remains the authority.
 #[allow(clippy::too_many_arguments)]
+#[tracing::instrument(
+    target = "lpm_install_timeline",
+    level = "trace",
+    name = "speculative_tarball",
+    skip_all
+)]
 pub(super) async fn speculative_download_and_store(
     client: &Arc<RegistryClient>,
     route_table: &RouteTable,
@@ -3884,12 +3905,20 @@ where
     T: Send + 'static,
     F: FnOnce() -> Result<T, LpmError> + Send + 'static,
 {
-    tokio::task::spawn_blocking(move || {
+    let span = tracing::trace_span!(target: "lpm_install_timeline", "file_extract");
+    tracing::event!(name: "enqueue", target: "lpm_install_timeline", parent: &span, tracing::Level::TRACE, {});
+    let worker_span = span.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        let _entered = worker_span.enter();
+        tracing::event!(name: "work_start", target: "lpm_install_timeline", tracing::Level::TRACE, {});
         let _extract_permit = extract_permit;
-        extract()
+        let result = extract();
+        tracing::event!(name: "work_end", target: "lpm_install_timeline", tracing::Level::TRACE, success = result.is_ok());
+        result
     })
-    .await
-    .map_err(|error| LpmError::Registry(format!("file extraction task: {error}")))?
+    .await;
+    tracing::event!(name: "await_resume", target: "lpm_install_timeline", parent: &span, tracing::Level::TRACE, success = result.is_ok());
+    result.map_err(|error| LpmError::Registry(format!("file extraction task: {error}")))?
 }
 
 pub(super) struct ResolvedRegistryTarballUrl {
@@ -4449,6 +4478,12 @@ pub(super) async fn fetch_and_store_legacy(
 /// Returns `(computed_sri, task_timings, final_url)` matching the
 /// other fetch paths' shape so the install loop can aggregate the
 /// three uniformly.
+#[tracing::instrument(
+    target = "lpm_install_timeline",
+    level = "trace",
+    name = "url_tarball",
+    skip_all
+)]
 pub(super) async fn fetch_and_store_tarball_url(
     client: &Arc<RegistryClient>,
     store: &PackageStore,
@@ -4503,8 +4538,14 @@ pub(super) async fn fetch_and_store_tarball_url(
     let store = store.clone();
     let store_v2 = store_v2.cloned();
     let expected_integrity = p.integrity.clone();
-    let (stage, fresh_object, result_sri) =
+    let span = tracing::trace_span!(target: "lpm_install_timeline", "url_extract");
+    let worker_span = span.clone();
+    tracing::event!(name: "enqueue", target: "lpm_install_timeline", parent: &span, tracing::Level::TRACE, {});
+    let joined =
         tokio::task::spawn_blocking(move || -> Result<_, LpmError> {
+            let _entered = worker_span.enter();
+            tracing::event!(name: "work_start", target: "lpm_install_timeline", tracing::Level::TRACE, {});
+            let result = (|| {
             if let Some(store_v2) = store_v2 {
                 let (object, sri, stage) = store_v2.extract_object_from_file_with_fresh_integrity(
                     downloaded.file.path(),
@@ -4525,8 +4566,12 @@ pub(super) async fn fetch_and_store_tarball_url(
                     downloaded.sri.clone(),
                 ))
             }
-        })
-        .await
+            })();
+            tracing::event!(name: "work_end", target: "lpm_install_timeline", tracing::Level::TRACE, success = result.is_ok());
+            result
+        }).await;
+    tracing::event!(name: "await_resume", target: "lpm_install_timeline", parent: &span, tracing::Level::TRACE, success = joined.is_ok());
+    let (stage, fresh_object, result_sri) = joined
         .map_err(|error| LpmError::Registry(format!("tarball extract task panicked: {error}")))??;
 
     let timings = TaskTimings::from_stage(
@@ -4588,6 +4633,12 @@ where
     .fuse()
 }
 
+#[tracing::instrument(
+    target = "lpm_install_timeline",
+    level = "trace",
+    name = "stream_extract",
+    skip_all
+)]
 async fn extract_v2_registry_response(
     input: V2StreamInput<'_>,
 ) -> Result<(String, TaskTimings, lpm_store::v2::ExtractedObject), LpmError> {
@@ -4605,6 +4656,7 @@ async fn extract_v2_registry_response(
         url_lookup_ms,
         download_headers_ms,
     } = input;
+    tracing::event!(name: "admission_start", target: "lpm_install_timeline", tracing::Level::TRACE, {});
     let admission = acquire_v2_streaming_extract_admission(
         fetch_extract_limiter,
         v2_streaming_extract_weight(unpacked_size),
@@ -4618,6 +4670,7 @@ async fn extract_v2_registry_response(
         wait_ms: extract_permit_wait_ms,
     } = admission;
 
+    tracing::event!(name: "admission_end", target: "lpm_install_timeline", tracing::Level::TRACE, weight = acquired_weight as u64);
     let pipeline_start = std::time::Instant::now();
     let download_elapsed_ms = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let cancellation = tokio_util::sync::CancellationToken::new();
@@ -4628,12 +4681,16 @@ async fn extract_v2_registry_response(
     let store_v2 = store_v2.clone();
     let expected_integrity = expected_integrity.map(str::to_owned);
     let download_elapsed_for_reader = Arc::clone(&download_elapsed_ms);
+    let worker_span = tracing::Span::current();
+    tracing::event!(name: "enqueue", target: "lpm_install_timeline", tracing::Level::TRACE, {});
     let joined = tokio::task::spawn_blocking(move || {
+        let _entered = worker_span.enter();
+        tracing::event!(name: "work_start", target: "lpm_install_timeline", tracing::Level::TRACE, {});
         let _key_guard = key_guard;
         let _extract_permit = base_permit;
         let sync_reader = SyncIoBridge::new(async_reader);
         let reader = StreamBodyPermitReader::new(sync_reader, permit, download_elapsed_for_reader);
-        if use_pipelined_extraction(unpacked_size) {
+        let result = if use_pipelined_extraction(unpacked_size) {
             store_v2.extract_object_from_pipelined_stream(
                 reader,
                 expected_integrity.as_deref(),
@@ -4646,7 +4703,9 @@ async fn extract_v2_registry_response(
                 expected_integrity.as_deref(),
                 lpm_registry::MAX_COMPRESSED_TARBALL_SIZE,
             )
-        }
+        };
+        tracing::event!(name: "work_end", target: "lpm_install_timeline", tracing::Level::TRACE, success = result.is_ok());
+        result
     });
     let (joined, supplemental_lease_expired, supplemental_hold_ms) =
         await_v2_streaming_extract_task(
@@ -4655,6 +4714,7 @@ async fn extract_v2_registry_response(
             V2_STREAMING_SUPPLEMENTAL_PERMIT_LEASE,
         )
         .await;
+    tracing::event!(name: "await_resume", target: "lpm_install_timeline", tracing::Level::TRACE, success = joined.is_ok());
     let joined = joined.map_err(|error| {
         LpmError::Registry(format!("streaming object extract task panicked: {error}"))
     });
@@ -4690,6 +4750,12 @@ async fn extract_v2_registry_response(
 /// expose the whole pipeline and response-body consumption wall times without
 /// adding either overlapping measurement to the per-task stage sum.
 #[allow(clippy::too_many_arguments)] // design-level: install-fetch orchestration takes the full surface
+#[tracing::instrument(
+    target = "lpm_install_timeline",
+    level = "trace",
+    name = "tarball_fetch",
+    skip_all
+)]
 pub(super) async fn fetch_and_store_streaming(
     client: &Arc<RegistryClient>,
     route_table: &RouteTable,
@@ -4921,9 +4987,14 @@ pub(super) async fn fetch_and_store_streaming(
     // Everything below runs on the blocking pool — frees the tokio async
     // workers to keep driving network reads. No download permit is held.
     let extract_start = std::time::Instant::now();
-    let (computed_sri, stage) = tokio::task::spawn_blocking(move || {
+    let span = tracing::trace_span!(target: "lpm_install_timeline", "v1_extract");
+    let worker_span = span.clone();
+    tracing::event!(name: "enqueue", target: "lpm_install_timeline", parent: &span, tracing::Level::TRACE, {});
+    let joined = tokio::task::spawn_blocking(move || {
+        let _entered = worker_span.enter();
+        tracing::event!(name: "work_start", target: "lpm_install_timeline", tracing::Level::TRACE, {});
         let cursor = std::io::Cursor::new(body);
-        store_owned
+        let result = store_owned
             .stream_and_store_package(
                 &name,
                 &version,
@@ -4931,10 +5002,13 @@ pub(super) async fn fetch_and_store_streaming(
                 expected_integrity.as_deref(),
                 lpm_registry::MAX_COMPRESSED_TARBALL_SIZE,
             )
-            .map(|(_path, sri, timings)| (sri, timings))
-    })
-    .await
-    .map_err(|e| LpmError::Registry(format!("streaming extract task panicked: {e}")))??;
+            .map(|(_path, sri, timings)| (sri, timings));
+        tracing::event!(name: "work_end", target: "lpm_install_timeline", tracing::Level::TRACE, success = result.is_ok());
+        result
+    }).await;
+    tracing::event!(name: "await_resume", target: "lpm_install_timeline", parent: &span, tracing::Level::TRACE, success = joined.is_ok());
+    let (computed_sri, stage) = joined
+        .map_err(|e| LpmError::Registry(format!("streaming extract task panicked: {e}")))??;
     let pipeline_ms = extract_start.elapsed().as_millis();
 
     // `pipeline_ms` is the spawn_blocking wall-clock; we prefer the

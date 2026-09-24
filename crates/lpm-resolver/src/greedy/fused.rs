@@ -15,6 +15,7 @@ use super::types::{Edge, PeerRequirement};
 use crate::resolve::SelectedPackageEvent;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use tracing::Instrument as _;
 
 const EXACT_DOCUMENT_CONCURRENCY_MULTIPLIER: usize = 4;
 const MAX_SELECTED_HISTORY_CONCURRENCY: usize = 32;
@@ -153,6 +154,7 @@ mod shared_metadata_concurrency_tests {
         let route_table = RouteTable::from_mode_only(lpm_registry::RouteMode::Direct);
         let policy = ResolverPolicy::default();
         let dispatch = MetadataFetchDispatch {
+            timeline: None,
             telemetry: &telemetry,
             client: &client,
             route_table: &route_table,
@@ -214,6 +216,7 @@ mod shared_metadata_concurrency_tests {
         let route_table = RouteTable::from_mode_only(lpm_registry::RouteMode::Proxy);
         let policy = ResolverPolicy::default();
         let dispatch = MetadataFetchDispatch {
+            timeline: None,
             telemetry: &telemetry,
             client: &client,
             route_table: &route_table,
@@ -259,7 +262,11 @@ struct FusedTreeProvider<'a> {
     trace_metadata_fetches: bool,
 }
 
+type MetadataTimeline = std::sync::Mutex<AHashMap<MetadataFetchKey, tracing::Span>>;
+const MAX_METADATA_TIMELINE_REQUESTS: usize = 1024;
+
 struct MetadataFetchDispatch<'a> {
+    timeline: Option<&'a MetadataTimeline>,
     telemetry: &'a Arc<MetadataFetchTelemetry>,
     client: &'a Arc<RegistryClient>,
     route_table: &'a RouteTable,
@@ -325,6 +332,7 @@ where
 }
 
 struct OrderedMetadataFetches {
+    timeline: Option<Arc<MetadataTimeline>>,
     inflight: AHashSet<CanonicalKey>,
     committed: AHashSet<CanonicalKey>,
     sequences: AHashMap<MetadataFetchKey, u64>,
@@ -343,6 +351,7 @@ enum MetadataCompletionSource {
 impl OrderedMetadataFetches {
     fn with_capacity(capacity: usize) -> Self {
         Self {
+            timeline: None,
             inflight: AHashSet::with_capacity(capacity),
             committed: AHashSet::with_capacity(capacity),
             sequences: AHashMap::with_capacity(capacity),
@@ -376,6 +385,17 @@ impl OrderedMetadataFetches {
             .next_dispatch_sequence
             .checked_add(1)
             .ok_or_else(|| ResolveError::Internal("metadata dispatch sequence overflow".into()))?;
+        if let Some(timeline) = &self.timeline {
+            let mut timeline = timeline
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if timeline.len() < MAX_METADATA_TIMELINE_REQUESTS {
+                let span = tracing::trace_span!(target: "lpm_install_timeline", "resolver_metadata", sequence);
+                timeline.insert(request.clone(), span);
+            } else {
+                tracing::event!(name: "metadata_correlation_dropped", target: "lpm_install_timeline", tracing::Level::TRACE, {});
+            }
+        }
         self.sequences.insert(request.clone(), sequence);
         self.inflight.insert(request.canonical.clone());
         self.inflight_requests
@@ -406,6 +426,14 @@ impl OrderedMetadataFetches {
         let Some(sequence) = self.sequences.get(&request).copied() else {
             return Ok(Some(result));
         };
+        if let Some(timeline) = &self.timeline {
+            let guard = timeline
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(span) = guard.get(&request) {
+                tracing::event!(name: "resolver_observed", target: "lpm_install_timeline", parent: span, tracing::Level::TRACE, cached = source == MetadataCompletionSource::Cached);
+            }
+        }
         if let Some((_, _, existing_source)) = self.ready.get(&sequence) {
             if *existing_source == MetadataCompletionSource::Cached {
                 return Ok(None);
@@ -475,7 +503,20 @@ impl OrderedMetadataFetches {
                 self.next_commit_sequence.checked_add(1).ok_or_else(|| {
                     ResolveError::Internal("metadata commit sequence overflow".into())
                 })?;
-            let succeeded = complete_metadata_fetch(request, result, completion)?;
+            let span = self
+                .timeline
+                .as_ref()
+                .and_then(|timeline| {
+                    timeline
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .remove(&request)
+                })
+                .unwrap_or_else(tracing::Span::none);
+            tracing::event!(name: "graph_commit_start", target: "lpm_install_timeline", parent: &span, tracing::Level::TRACE, {});
+            let completed = complete_metadata_fetch(request, result, completion);
+            tracing::event!(name: "graph_commit_end", target: "lpm_install_timeline", parent: &span, tracing::Level::TRACE, success = completed.is_ok());
+            let succeeded = completed?;
             if succeeded {
                 self.committed.insert(canonical);
             }
@@ -661,6 +702,7 @@ impl TreeManifestProvider for FusedTreeProvider<'_> {
 }
 
 struct PendingMetadataFetch {
+    timeline: tracing::Span,
     canonical: CanonicalKey,
     client: Arc<RegistryClient>,
     route_table: RouteTable,
@@ -740,6 +782,23 @@ impl MetadataFetchScheduler {
         include_speculation: bool,
         preferred_range: Option<NpmRange>,
     ) {
+        let timeline = dispatch
+            .timeline
+            .and_then(|timeline| {
+                let key = MetadataFetchKey::for_request(
+                    canonical.clone(),
+                    exact_version.clone(),
+                    dispatch.route_table,
+                    dispatch.policy,
+                );
+                timeline
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .get(&key)
+                    .cloned()
+            })
+            .unwrap_or_else(tracing::Span::none);
+        tracing::event!(name: "metadata_enqueued", target: "lpm_install_timeline", parent: &timeline, tracing::Level::TRACE, {});
         let client = dispatch.client.clone();
         let route_table = dispatch.route_table.clone();
         let policy = dispatch.policy.clone();
@@ -754,6 +813,7 @@ impl MetadataFetchScheduler {
                 include_speculation,
             )
         {
+            tracing::event!(name: "metadata_memory_hit", target: "lpm_install_timeline", parent: &timeline, tracing::Level::TRACE, {});
             self.ready.push_back((
                 MetadataFetchKey::for_request(canonical, exact_version, &route_table, &policy),
                 Ok(fetched),
@@ -762,6 +822,7 @@ impl MetadataFetchScheduler {
         }
 
         let pending = PendingMetadataFetch {
+            timeline,
             canonical,
             client,
             route_table,
@@ -817,7 +878,9 @@ impl MetadataFetchScheduler {
             );
         let metadata_semaphore = Arc::clone(&self.semaphore);
         let fallback_metadata = Arc::clone(&self.fallback_metadata);
+        let timeline = pending.timeline.clone();
         self.jobs.spawn(async move {
+            tracing::event!(name: "metadata_task_start", target: "lpm_install_timeline", tracing::Level::TRACE, {});
             let active_fetch = pending.telemetry.enter();
             let result = if exact_document_lane {
                 let version = pending
@@ -927,6 +990,7 @@ impl MetadataFetchScheduler {
                 )
                 .await
             };
+            tracing::event!(name: "metadata_task_finished", target: "lpm_install_timeline", tracing::Level::TRACE, success = result.is_ok());
             (
                 MetadataFetchKey::for_request(
                     pending.canonical,
@@ -936,7 +1000,7 @@ impl MetadataFetchScheduler {
                 ),
                 result,
             )
-        });
+        }.instrument(timeline));
     }
 
     fn fill_available(&mut self) {
@@ -1090,6 +1154,7 @@ mod metadata_fetch_scheduler_tests {
         let route_table = RouteTable::from_mode_only(RouteMode::Direct);
         let policy = ResolverPolicy::default();
         let dispatch = MetadataFetchDispatch {
+            timeline: None,
             telemetry: &telemetry,
             client: &client,
             route_table: &route_table,
@@ -1137,6 +1202,7 @@ mod metadata_fetch_scheduler_tests {
         let route_table = RouteTable::from_mode_only(lpm_registry::RouteMode::Direct);
         let policy = ResolverPolicy::default();
         let dispatch = MetadataFetchDispatch {
+            timeline: None,
             telemetry: &telemetry,
             client: &client,
             route_table: &route_table,
@@ -1163,6 +1229,7 @@ mod metadata_fetch_scheduler_tests {
         let route_table = RouteTable::from_mode_only(lpm_registry::RouteMode::Direct);
         let policy = ResolverPolicy::default();
         let dispatch = MetadataFetchDispatch {
+            timeline: None,
             telemetry: &telemetry,
             client: &client,
             route_table: &route_table,
@@ -1216,6 +1283,7 @@ mod metadata_fetch_scheduler_tests {
             let route_table = RouteTable::from_mode_only(lpm_registry::RouteMode::Direct);
             let policy = ResolverPolicy::default();
             let dispatch = MetadataFetchDispatch {
+                timeline: None,
                 telemetry: &telemetry,
                 client: &client,
                 route_table: &route_table,
@@ -1313,6 +1381,7 @@ mod metadata_fetch_scheduler_tests {
         let route_table = RouteTable::from_mode_only(lpm_registry::RouteMode::Direct);
         let policy = ResolverPolicy::default();
         let dispatch = MetadataFetchDispatch {
+            timeline: None,
             telemetry: &telemetry,
             client: &client,
             route_table: &route_table,
@@ -1779,6 +1848,12 @@ pub async fn resolve_greedy_fused_with_cache_options_policy_and_selected_events(
     level = "debug",
     fields(n_deps = root_dependencies.dependencies.len(), npm_fanout)
 )]
+#[tracing::instrument(
+    target = "lpm_install_timeline",
+    level = "trace",
+    name = "resolver",
+    skip_all
+)]
 pub async fn resolve_greedy_fused_with_cache_options_policy_and_selected_events_roots(
     client: Arc<RegistryClient>,
     root_dependencies: crate::resolve::RootDependencies,
@@ -1849,7 +1924,10 @@ pub async fn resolve_greedy_fused_with_cache_options_policy_and_selected_events_
     let metadata_sem = metadata_concurrency.semaphore();
     let exact_document_sem = metadata_concurrency.exact_document_semaphore();
     let metadata_fetch_telemetry = Arc::new(MetadataFetchTelemetry::default());
+    let timeline = tracing::enabled!(target: "lpm_install_timeline", tracing::Level::TRACE)
+        .then(|| Arc::new(MetadataTimeline::default()));
     let metadata_dispatch = MetadataFetchDispatch {
+        timeline: timeline.as_deref(),
         telemetry: &metadata_fetch_telemetry,
         client: &client,
         route_table: &route_table,
@@ -1881,6 +1959,7 @@ pub async fn resolve_greedy_fused_with_cache_options_policy_and_selected_events_
     // track simultaneously" without threading a dependency-count estimate
     // through. Slight over-allocation is cheaper than rehashing.
     let mut ordered_metadata = OrderedMetadataFetches::with_capacity(npm_fanout);
+    ordered_metadata.timeline = timeline.clone();
     let mut parked: AHashMap<MetadataFetchKey, Vec<Edge>> = AHashMap::with_capacity(npm_fanout);
     let mut counted_metadata_edge_misses =
         trace_metadata_fetches.then(|| AHashSet::with_capacity(npm_fanout));
@@ -3188,6 +3267,32 @@ mod range_aware_worker_batch_tests {
                 ("shared".to_string(), "^1.0.0".to_string()),
                 ("shared".to_string(), "^2.0.0".to_string()),
             ]
+        );
+    }
+}
+
+#[cfg(test)]
+mod metadata_timeline_bound_tests {
+    use super::*;
+
+    #[test]
+    fn stalled_ordered_commit_does_not_unbound_metadata_correlations() {
+        let timeline = Arc::new(MetadataTimeline::default());
+        let mut ordered = OrderedMetadataFetches::with_capacity(0);
+        ordered.timeline = Some(Arc::clone(&timeline));
+        for index in 0..MAX_METADATA_TIMELINE_REQUESTS * 2 {
+            let key = CanonicalKey::npm(&format!("timeline-{index}"));
+            assert!(ordered.start(&key).unwrap());
+        }
+        assert_eq!(
+            ordered.next_dispatch_sequence as usize,
+            MAX_METADATA_TIMELINE_REQUESTS * 2
+        );
+        assert_eq!(ordered.sequences.len(), MAX_METADATA_TIMELINE_REQUESTS * 2);
+        assert_eq!(ordered.next_commit_sequence, 0);
+        assert_eq!(
+            timeline.lock().unwrap().len(),
+            MAX_METADATA_TIMELINE_REQUESTS
         );
     }
 }

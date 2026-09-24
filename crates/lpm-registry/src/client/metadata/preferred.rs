@@ -242,6 +242,12 @@ impl RegistryClient {
             .await
     }
 
+    #[tracing::instrument(
+        target = "lpm_install_timeline",
+        level = "trace",
+        name = "preferred_metadata",
+        skip_all
+    )]
     async fn get_npm_preferred_metadata_with_cache_fields<F, const RESOLVER: bool>(
         &self,
         name: &str,

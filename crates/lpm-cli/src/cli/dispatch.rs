@@ -245,6 +245,8 @@ async fn async_main(cli: Cli) -> Result<()> {
         std::process::exit(0);
     }
 
+    let _timeline_export = super::install_timeline::ExportGuard;
+
     // Set up tracing based on verbosity. Tracing is pinned to stderr so
     // stdout stays reserved for command output and `--json` remains a
     // single parseable document.
@@ -257,11 +259,19 @@ async fn async_main(cli: Cli) -> Result<()> {
     // fmt layer so install-pipeline spans land in the Tracy GUI without
     // changing the stderr logging contract.
     {
-        use tracing_subscriber::layer::SubscriberExt as _;
+        use tracing_subscriber::layer::{Layer as _, SubscriberExt as _};
         use tracing_subscriber::util::SubscriberInitExt as _;
 
         let env_filter =
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| filter.into());
+        let diagnostic_filter = tracing_subscriber::filter::filter_fn(|metadata| {
+            metadata.target() == super::install_timeline::TARGET
+        });
+        let ordinary_filter = tracing_subscriber::filter::filter_fn(|metadata| {
+            metadata.target() != super::install_timeline::TARGET
+        });
+        let timeline = super::install_timeline::start(&command)
+            .map(|layer| layer.with_filter(diagnostic_filter));
         let fmt_layer = tracing_subscriber::fmt::layer()
             .with_writer(std::io::stderr)
             .with_target(false)
@@ -269,14 +279,20 @@ async fn async_main(cli: Cli) -> Result<()> {
             .without_time();
 
         #[cfg(feature = "tracy")]
-        let registry = tracing_subscriber::registry()
-            .with(env_filter)
-            .with(fmt_layer)
-            .with(tracing_tracy::TracyLayer::default());
+        let registry = tracing_subscriber::registry().with(
+            tracing_tracy::TracyLayer::default()
+                .with_filter(env_filter.clone())
+                .with_filter(ordinary_filter.clone()),
+        );
         #[cfg(not(feature = "tracy"))]
-        let registry = tracing_subscriber::registry()
-            .with(env_filter)
-            .with(fmt_layer);
+        let registry = tracing_subscriber::registry();
+        let registry = registry
+            .with(
+                fmt_layer
+                    .with_filter(env_filter)
+                    .with_filter(ordinary_filter),
+            )
+            .with(timeline);
 
         registry.init();
     }
@@ -3131,6 +3147,8 @@ async fn async_main(cli: Cli) -> Result<()> {
     }
     }
     .await;
+
+    super::install_timeline::finish(if result.is_ok() { "success" } else { "error" });
 
     // Update check: show notice from previous check (instant, no network).
     //

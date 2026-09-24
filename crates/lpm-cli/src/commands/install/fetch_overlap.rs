@@ -1,4 +1,5 @@
 use super::*;
+use tracing::Instrument as _;
 
 const ENV_FETCH_OVERLAP: &str = "LPM_FETCH_OVERLAP";
 const ENV_FETCH_OVERLAP_MIN_SELECTED: &str = "LPM_FETCH_OVERLAP_MIN_SELECTED";
@@ -89,6 +90,7 @@ enum WorkspaceFetchState {
 }
 
 struct WorkspaceFetchRequest {
+    timeline: tracing::Span,
     package: InstallPackage,
     context: Arc<WorkspaceFetchRequestContext>,
     completion: tokio::sync::oneshot::Sender<WorkspaceFetchCompletion>,
@@ -113,6 +115,7 @@ impl WorkspaceFetchOverlapHub {
     ) -> tokio::sync::oneshot::Receiver<WorkspaceFetchCompletion> {
         let (completion, rx) = tokio::sync::oneshot::channel();
         let request = WorkspaceFetchRequest {
+            timeline: tracing::trace_span!(target: "lpm_install_timeline", "workspace_fetch_task"),
             package,
             context,
             completion,
@@ -177,7 +180,7 @@ async fn run_workspace_fetch_overlap_hub(
                             context.install_accounting,
                             context.streaming_fetch,
                             ArtifactSelection::FreshResolution,
-                        ));
+                        ).instrument(request.timeline));
                         identities_by_task.insert(abort_handle.id(), identity_for_task);
                         states.insert(
                             identity,
@@ -351,7 +354,7 @@ pub(super) fn spawn_fetch_overlap_dispatcher(
     streaming_fetch: bool,
     min_selected: usize,
 ) -> FetchOverlapJoin {
-    let handle = tokio::spawn(async move {
+    let task = async move {
         let mut seen = HashSet::new();
         let mut buffered = Vec::new();
         let mut tasks = tokio::task::JoinSet::new();
@@ -432,7 +435,10 @@ pub(super) fn spawn_fetch_overlap_dispatcher(
         }
 
         FetchOverlapDrain { outcomes, stats }
-    });
+    };
+    let handle = tokio::spawn(task.instrument(
+        tracing::trace_span!(target: "lpm_install_timeline", "selected_fetch_dispatch"),
+    ));
 
     FetchOverlapJoin {
         handle: Some(handle),
@@ -471,7 +477,7 @@ pub(super) fn spawn_workspace_fetch_overlap_dispatcher(
         install_accounting,
         streaming_fetch,
     });
-    let handle = tokio::spawn(async move {
+    let task = async move {
         let mut seen = HashSet::new();
         let mut completions = VecDeque::new();
         let mut outcomes = Vec::new();
@@ -530,7 +536,10 @@ pub(super) fn spawn_workspace_fetch_overlap_dispatcher(
         }
 
         FetchOverlapDrain { outcomes, stats }
-    });
+    };
+    let handle = tokio::spawn(task.instrument(
+        tracing::trace_span!(target: "lpm_install_timeline", "workspace_fetch_dispatch"),
+    ));
 
     FetchOverlapJoin {
         handle: Some(handle),
@@ -590,7 +599,7 @@ pub(super) fn spawn_fetch_overlap_for_packages(
     streaming_fetch: bool,
     artifact_selection: ArtifactSelection,
 ) -> FetchOverlapJoin {
-    let handle = tokio::spawn(async move {
+    let task = async move {
         let mut seen = HashSet::with_capacity(packages.len());
         let mut tasks = tokio::task::JoinSet::new();
         let mut outcomes = Vec::new();
@@ -628,7 +637,10 @@ pub(super) fn spawn_fetch_overlap_for_packages(
         }
 
         FetchOverlapDrain { outcomes, stats }
-    });
+    };
+    let handle = tokio::spawn(task.instrument(
+        tracing::trace_span!(target: "lpm_install_timeline", "package_fetch_dispatch"),
+    ));
 
     FetchOverlapJoin {
         handle: Some(handle),
@@ -712,21 +724,24 @@ fn dispatch_install_package(
         return;
     }
     stats.dispatched_count = stats.dispatched_count.saturating_add(1);
-    tasks.spawn(fetch_selected_package(
-        package,
-        client.clone(),
-        route_table.clone(),
-        store.clone(),
-        store_v2_handle.clone(),
-        fetch_semaphore.clone(),
-        fetch_coord.clone(),
-        project_dir.to_path_buf(),
-        gate_stats.clone(),
-        fetch_extract_limiter.clone(),
-        install_accounting,
-        streaming_fetch,
-        artifact_selection,
-    ));
+    tasks.spawn(
+        fetch_selected_package(
+            package,
+            client.clone(),
+            route_table.clone(),
+            store.clone(),
+            store_v2_handle.clone(),
+            fetch_semaphore.clone(),
+            fetch_coord.clone(),
+            project_dir.to_path_buf(),
+            gate_stats.clone(),
+            fetch_extract_limiter.clone(),
+            install_accounting,
+            streaming_fetch,
+            artifact_selection,
+        )
+        .instrument(tracing::trace_span!(target: "lpm_install_timeline", "overlap_fetch_task")),
+    );
 }
 
 fn record_overlap_task(

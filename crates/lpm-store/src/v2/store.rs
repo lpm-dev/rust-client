@@ -1391,6 +1391,12 @@ impl Store {
         })
     }
 
+    #[tracing::instrument(
+        target = "lpm_install_timeline",
+        level = "trace",
+        name = "extract_staging",
+        skip_all
+    )]
     fn extract_input_into_staging(
         &self,
         mut tarball_input: TarballInput<'_>,
@@ -1563,13 +1569,16 @@ impl Store {
         };
         timings.extract_ms = extract_start.elapsed().as_millis();
 
+        tracing::event!(name: "finalize_admission_start", target: "lpm_install_timeline", tracing::Level::TRACE, {});
         let finalize_permit_wait_start = std::time::Instant::now();
         let finalize_permit = v2_finalize_limiter().map(|limiter| limiter.acquire());
         timings.finalize_permit_wait_ms = finalize_permit_wait_start.elapsed().as_millis();
+        tracing::event!(name: "tree_walk_start", target: "lpm_install_timeline", tracing::Level::TRACE, {});
         let tree_integrity_start = std::time::Instant::now();
         let streamed_integrities =
             StreamedTreeBuilder::from_extraction(extracted_files).finish(tmp_dir);
         timings.finalize_tree_integrity_ms = tree_integrity_start.elapsed().as_millis();
+        tracing::event!(name: "tree_walk_end", target: "lpm_install_timeline", tracing::Level::TRACE, success = streamed_integrities.is_ok());
         drop(finalize_permit);
         let streamed_integrities = streamed_integrities?;
 
@@ -1631,6 +1640,12 @@ impl Store {
     }
 
     #[allow(clippy::too_many_arguments)]
+    #[tracing::instrument(
+        target = "lpm_install_timeline",
+        level = "trace",
+        name = "publish_object",
+        skip_all
+    )]
     fn publish_staged_object(
         &self,
         tmp_dir: &Path,
@@ -1643,6 +1658,7 @@ impl Store {
     ) -> Result<(ExtractedObject, StageTimings), LpmError> {
         let early_finalize_ms = timings.finalize_tree_integrity_ms;
         let finalize_start = std::time::Instant::now();
+        tracing::event!(name: "sidecars_start", target: "lpm_install_timeline", tracing::Level::TRACE, {});
         let object_integrity_start = std::time::Instant::now();
         let integrities = write_object_integrity_for_policy_with_tree(
             tmp_dir,
@@ -1653,6 +1669,7 @@ impl Store {
         timings.finalize_tree_integrity_ms = timings
             .finalize_tree_integrity_ms
             .saturating_add(object_integrity_start.elapsed().as_millis());
+        tracing::event!(name: "sidecars_end", target: "lpm_install_timeline", tracing::Level::TRACE, {});
         let stats = integrities.stats;
         timings.file_count = stats.file_count;
         timings.dir_count = stats.dir_count;
@@ -1661,20 +1678,24 @@ impl Store {
         let object_integrity =
             FreshObjectIntegrity::new(VerifiedObjectIntegrity::new(integrities.content));
 
+        tracing::event!(name: "sri_write_start", target: "lpm_install_timeline", tracing::Level::TRACE, {});
         let integrity_write_start = std::time::Instant::now();
         std::fs::write(tmp_dir.join(".integrity"), sri).map_err(|error| {
             LpmError::Store(format!("failed to write virtual-store .integrity: {error}"))
         })?;
         timings.finalize_integrity_write_ms = integrity_write_start.elapsed().as_millis();
+        tracing::event!(name: "sri_write_end", target: "lpm_install_timeline", tracing::Level::TRACE, {});
 
         #[cfg(test)]
         if let Some((arrived, resume)) = &self.object_publish_barriers {
             arrived.wait();
             resume.wait();
         }
+        tracing::event!(name: "rename_start", target: "lpm_install_timeline", tracing::Level::TRACE, {});
         let rename_start = std::time::Instant::now();
         let rename_result = std::fs::rename(tmp_dir, &object_dir);
         timings.finalize_rename_ms = rename_start.elapsed().as_millis();
+        tracing::event!(name: "rename_end", target: "lpm_install_timeline", tracing::Level::TRACE, success = rename_result.is_ok());
         let result = match rename_result {
             Ok(()) => {
                 if matches!(
@@ -1699,6 +1720,7 @@ impl Store {
                 })
             }
             Err(error) => {
+                tracing::event!(name: "collision_recovery_start", target: "lpm_install_timeline", tracing::Level::TRACE, {});
                 let collision_start = std::time::Instant::now();
                 let object_dir = finish_object_rename_after_collision(
                     tmp_dir,
@@ -1709,6 +1731,7 @@ impl Store {
                     policy,
                 )?;
                 timings.finalize_collision_recovery_ms = collision_start.elapsed().as_millis();
+                tracing::event!(name: "collision_recovery_end", target: "lpm_install_timeline", tracing::Level::TRACE, {});
                 let mut object_integrity = object_integrity_or_remove(
                     &object_dir,
                     "after virtual-store extract collision",

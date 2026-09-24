@@ -171,6 +171,7 @@ fn exit_with_clap_error(error: clap::Error, json_output: bool, help_hint: Option
 }
 
 pub(super) fn exit_with_lpm_error(error: &lpm_common::LpmError, json_output: bool) -> ! {
+    super::install_timeline::finish("error");
     if json_output && !matches!(error, lpm_common::LpmError::ExitCode(_)) {
         print_json_error(error);
     } else if !json_output && !matches!(error, lpm_common::LpmError::ExitCode(_)) {

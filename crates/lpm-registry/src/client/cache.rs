@@ -684,10 +684,18 @@ impl RegistryClient {
         key: &str,
     ) -> Option<MetadataCacheEntry<T>> {
         let path = self.cache_path(key)?;
-        tokio::task::spawn_blocking(move || Self::read_metadata_cache_path_entry_as::<T>(&path))
-            .await
-            .ok()
-            .flatten()
+        let span = tracing::trace_span!(target: "lpm_install_timeline", "metadata_cache_read");
+        tracing::event!(name: "enqueue", target: "lpm_install_timeline", parent: &span, tracing::Level::TRACE, {});
+        let worker_span = span.clone();
+        let result = tokio::task::spawn_blocking(move || {
+            let _entered = worker_span.enter();
+            tracing::event!(name: "work_start", target: "lpm_install_timeline", tracing::Level::TRACE, {});
+            let result = Self::read_metadata_cache_path_entry_as::<T>(&path);
+            tracing::event!(name: "work_end", target: "lpm_install_timeline", tracing::Level::TRACE, cached = result.is_some());
+            result
+        }).await;
+        tracing::event!(name: "await_resume", target: "lpm_install_timeline", parent: &span, tracing::Level::TRACE, success = result.is_ok());
+        result.ok().flatten()
     }
 
     /// Generic variant of [`Self::read_metadata_cache`]: deserializes the cached
@@ -1009,6 +1017,9 @@ impl RegistryClient {
             Ok(content) => content,
             Err(limit) => return skip_exhausted(limit),
         };
+        let serialization =
+            tracing::trace_span!(target: "lpm_install_timeline", "metadata_cache_serialization")
+                .entered();
         if let Err(messagepack_error) = rmp_serde::encode::write_named(&mut content, metadata) {
             if let Some(limit) = content.exhausted() {
                 return skip_exhausted(limit);
@@ -1033,6 +1044,8 @@ impl RegistryClient {
             return None;
         }
 
+        tracing::event!(name: "serialized", target: "lpm_install_timeline", tracing::Level::TRACE, bytes = content.len() as u64);
+        drop(serialization);
         let key_owned = key.to_string();
         let runtime_handle = tokio::runtime::Handle::try_current();
         if self.synchronous_cache_writes || runtime_handle.is_err() {
@@ -1049,7 +1062,11 @@ impl RegistryClient {
         }
 
         let handle = runtime_handle.unwrap();
+        let span = tracing::trace_span!(target: "lpm_install_timeline", "metadata_cache_write");
+        tracing::event!(name: "enqueue", target: "lpm_install_timeline", parent: &span, tracing::Level::TRACE, {});
         let join = handle.spawn_blocking(move || {
+            let _entered = span.enter();
+            tracing::event!(name: "work_start", target: "lpm_install_timeline", tracing::Level::TRACE, {});
             let _operation = mutation
                 .operation
                 .lock()
@@ -1059,6 +1076,7 @@ impl RegistryClient {
             {
                 tracing::warn!("failed to write metadata cache for {key_owned}: {e}");
             }
+            tracing::event!(name: "work_end", target: "lpm_install_timeline", tracing::Level::TRACE, {});
         });
         if let Ok(mut pending) = self.pending_cache_writes.lock() {
             pending.push(join);
@@ -1912,4 +1930,84 @@ pub(super) fn parse_cached_metadata_blob(
         etag,
         &after_freshness[etag_end + 1..],
     ))
+}
+
+#[cfg(test)]
+mod timeline_tests {
+    use super::*;
+    use tracing_subscriber::layer::SubscriberExt as _;
+
+    struct TraceRecords(Arc<std::sync::Mutex<Vec<(&'static str, &'static str)>>>);
+
+    impl<S: tracing::Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>>
+        tracing_subscriber::Layer<S> for TraceRecords
+    {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            if event.metadata().target() == "lpm_install_timeline" {
+                self.0
+                    .lock()
+                    .unwrap()
+                    .push(("event", event.metadata().name()));
+            }
+        }
+        fn on_new_span(
+            &self,
+            attrs: &tracing::span::Attributes<'_>,
+            _: &tracing::Id,
+            _: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            if attrs.metadata().target() == "lpm_install_timeline" {
+                self.0
+                    .lock()
+                    .unwrap()
+                    .push(("open", attrs.metadata().name()));
+            }
+        }
+        fn on_close(&self, id: tracing::Id, ctx: tracing_subscriber::layer::Context<'_, S>) {
+            if let Some(span) = ctx.span(&id)
+                && span.metadata().target() == "lpm_install_timeline"
+            {
+                self.0
+                    .lock()
+                    .unwrap()
+                    .push(("close", span.metadata().name()));
+            }
+        }
+    }
+
+    #[test]
+    fn cache_serialization_budget_skip_finishes_its_trace_operation() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut client = RegistryClient::new().with_cache_dir(Some(dir.path().to_owned()));
+        client.pending_cache_write_bytes = Arc::new(tokio::sync::Semaphore::new(8192));
+        let records = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::registry().with(TraceRecords(Arc::clone(&records)));
+        tracing::subscriber::with_default(subscriber, || {
+            client.write_metadata_cache(
+                "skip",
+                &serde_json::json!({"payload": "x".repeat(8192)}),
+                None,
+            );
+        });
+        assert!(!client.cache_path("skip").unwrap().exists());
+        let records = records.lock().unwrap();
+        if records.contains(&("event", "cache_serialize_start")) {
+            assert!(
+                records.contains(&("event", "cache_serialize_end")),
+                "{records:?}"
+            );
+        }
+        assert!(
+            records.contains(&("open", "metadata_cache_serialization")),
+            "{records:?}"
+        );
+        assert!(
+            records.contains(&("close", "metadata_cache_serialization")),
+            "{records:?}"
+        );
+    }
 }

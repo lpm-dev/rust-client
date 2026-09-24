@@ -1,0 +1,652 @@
+{
+  "t3-transport-pilot": {
+    "source": "/tmp/lpm-metadata-lookahead/t3-transport-pilot/runs/rows.json",
+    "sha256": "a7db4d4e85f752922c883ae6f0a322f64008316efb0147f9265b25cbeda5cbd3",
+    "plan": {
+      "output": "/tmp/lpm-metadata-lookahead/t3-transport-pilot/runs",
+      "samples": 12,
+      "diagnostics": 2,
+      "states": [
+        "first-install"
+      ],
+      "variants": [
+        {
+          "id": "baseline",
+          "manager": "lpm",
+          "binary": "/tmp/lpm-next-install-costs/lpm-timeline",
+          "sha256": "cb7faaad32c197be418588b2d8c9134933a53187d8d062e6d64f26a4c08e512a"
+        },
+        {
+          "id": "candidate",
+          "manager": "lpm",
+          "binary": "/tmp/lpm-metadata-lookahead/lpm-lookahead",
+          "sha256": "66e52aa9b43e785b1bb26b5edc97d6e442ce51293540db9343d129a79e8d705b"
+        },
+        {
+          "id": "bun",
+          "manager": "bun",
+          "binary": "/Users/tolga/.bun/bin/bun",
+          "sha256": "35d20dd0263e5c950194434b925454fdfa9ba6e4467da960410fa05b08a7a5b5"
+        }
+      ],
+      "balancedOrders": true,
+      "sharedLpmRoot": true,
+      "keepWork": true,
+      "fixture": "/Users/tolga/.codex/worktrees/install-overhead/rust-client/bench/audit-fixtures/t3-install",
+      "verifyModule": "next/package.json",
+      "registry": "http://127.0.0.1:65206",
+      "ca": "/tmp/lpm-metadata-lookahead/t3-transport-pilot/tls-5t4V3T/ca.pem",
+      "expectedManifestSha256": "342a7c02aa21a0b004f6ade0947f315d11d366d67fe42309fcf4a7def3eaf42e",
+      "diagnosticTimelineRoot": "/tmp/lpm-metadata-lookahead/t3-transport-pilot/traces",
+      "fixture_sha256": "fa994042232e39e73fd1c4436c5e90974b47c4656e9c4a742c3988c6097b9871",
+      "harness_sha256": "f9d3272ed7750d71f59264347718388b1a472511d01d076f6227af1456fd9c6c",
+      "node": "v26.5.0",
+      "platform": "darwin",
+      "method": "Shared physical LPM root per state; separate Bun root. All forward/reverse rotations balance pair direction. Seeded and warmed twice; reset state outside measurement; rotating variant/scenario order; every scored install retained; no phase-timing flags on scored installs; opt-in timeline capture only for explicitly marked variants; inventories and lockfiles retained; no repeated seed downloads."
+    }
+  },
+  "vite-control": {
+    "source": "/tmp/lpm-metadata-lookahead/vite-control/runs/rows.json",
+    "sha256": "6921d7b7909d76f1d83ecdb5283b394da11445cd8b7f6b9a1d96c85fadf31247",
+    "plan": {
+      "output": "/tmp/lpm-metadata-lookahead/vite-control/runs",
+      "samples": 12,
+      "diagnostics": 2,
+      "states": [
+        "first-install"
+      ],
+      "variants": [
+        {
+          "id": "baseline",
+          "manager": "lpm",
+          "binary": "/tmp/lpm-next-install-costs/lpm-timeline",
+          "sha256": "cb7faaad32c197be418588b2d8c9134933a53187d8d062e6d64f26a4c08e512a"
+        },
+        {
+          "id": "candidate",
+          "manager": "lpm",
+          "binary": "/tmp/lpm-metadata-lookahead/lpm-lookahead",
+          "sha256": "66e52aa9b43e785b1bb26b5edc97d6e442ce51293540db9343d129a79e8d705b"
+        },
+        {
+          "id": "bun",
+          "manager": "bun",
+          "binary": "/Users/tolga/.bun/bin/bun",
+          "sha256": "35d20dd0263e5c950194434b925454fdfa9ba6e4467da960410fa05b08a7a5b5"
+        }
+      ],
+      "balancedOrders": true,
+      "sharedLpmRoot": true,
+      "keepWork": true,
+      "fixture": "/Users/tolga/.codex/worktrees/install-overhead/rust-client/bench/audit-fixtures/peer-heavy/vite-react",
+      "verifyModule": "react/package.json",
+      "registry": "http://127.0.0.1:52162",
+      "ca": "/tmp/lpm-metadata-lookahead/vite-control/tls-crYrpk/ca.pem",
+      "expectedManifestSha256": "252acdaf27917b70e48c58e116cbbaa7bb2445f61f5dcf47172d96ba6e8b4dcf",
+      "diagnosticTimelineRoot": "/tmp/lpm-metadata-lookahead/vite-control/traces",
+      "fixture_sha256": "11fe6a1100ebbf799500403a91748fde9991c745ebc182be088138a8e0b0f573",
+      "harness_sha256": "f9d3272ed7750d71f59264347718388b1a472511d01d076f6227af1456fd9c6c",
+      "node": "v26.5.0",
+      "platform": "darwin",
+      "method": "Shared physical LPM root per state; separate Bun root. All forward/reverse rotations balance pair direction. Seeded and warmed twice; reset state outside measurement; rotating variant/scenario order; every scored install retained; no phase-timing flags on scored installs; opt-in timeline capture only for explicitly marked variants; inventories and lockfiles retained; no repeated seed downloads."
+    }
+  },
+  "sharp-complete-control": {
+    "source": "/tmp/lpm-metadata-lookahead/sharp-complete-control/runs/rows.json",
+    "sha256": "696cd0df21b4945aded4f4eb76c27e09fc84876c259e93aa73f14116e2329174",
+    "plan": {
+      "output": "/tmp/lpm-metadata-lookahead/sharp-complete-control/runs",
+      "samples": 12,
+      "diagnostics": 2,
+      "states": [
+        "first-install"
+      ],
+      "variants": [
+        {
+          "id": "baseline",
+          "manager": "lpm",
+          "binary": "/tmp/lpm-next-install-costs/lpm-timeline",
+          "sha256": "cb7faaad32c197be418588b2d8c9134933a53187d8d062e6d64f26a4c08e512a"
+        },
+        {
+          "id": "candidate",
+          "manager": "lpm",
+          "binary": "/tmp/lpm-metadata-lookahead/lpm-lookahead",
+          "sha256": "66e52aa9b43e785b1bb26b5edc97d6e442ce51293540db9343d129a79e8d705b"
+        },
+        {
+          "id": "bun",
+          "manager": "bun",
+          "binary": "/Users/tolga/.bun/bin/bun",
+          "sha256": "35d20dd0263e5c950194434b925454fdfa9ba6e4467da960410fa05b08a7a5b5"
+        }
+      ],
+      "balancedOrders": true,
+      "sharedLpmRoot": true,
+      "keepWork": true,
+      "fixture": "/Users/tolga/.codex/worktrees/install-overhead/rust-client/bench/audit-fixtures/native/sharp-image",
+      "verifyModule": "sharp/package.json",
+      "registry": "http://127.0.0.1:54656",
+      "ca": "/tmp/lpm-metadata-lookahead/sharp-complete-control/tls-UxDl1Z/ca.pem",
+      "expectedManifestSha256": "95dbdd031da8b0f356061829cdb158426ad186d723992d37970b9271e7bcf2d5",
+      "diagnosticTimelineRoot": "/tmp/lpm-metadata-lookahead/sharp-complete-control/traces",
+      "fixture_sha256": "22aa2132be98340ec5b54a4d27077b52d8d69a755b2af449ea93152f5b187c74",
+      "harness_sha256": "f9d3272ed7750d71f59264347718388b1a472511d01d076f6227af1456fd9c6c",
+      "node": "v26.5.0",
+      "platform": "darwin",
+      "method": "Shared physical LPM root per state; separate Bun root. All forward/reverse rotations balance pair direction. Seeded and warmed twice; reset state outside measurement; rotating variant/scenario order; every scored install retained; no phase-timing flags on scored installs; opt-in timeline capture only for explicitly marked variants; inventories and lockfiles retained; no repeated seed downloads."
+    }
+  },
+  "nest-complete-control": {
+    "source": "/tmp/lpm-metadata-lookahead/nest-complete-control/runs/rows.json",
+    "sha256": "8335b9d06eb0cad0392cc278ccf471d45270097375546abcd04a5059046a103c",
+    "plan": {
+      "output": "/tmp/lpm-metadata-lookahead/nest-complete-control/runs",
+      "samples": 12,
+      "diagnostics": 2,
+      "states": [
+        "first-install"
+      ],
+      "variants": [
+        {
+          "id": "baseline",
+          "manager": "lpm",
+          "binary": "/tmp/lpm-next-install-costs/lpm-timeline",
+          "sha256": "cb7faaad32c197be418588b2d8c9134933a53187d8d062e6d64f26a4c08e512a"
+        },
+        {
+          "id": "candidate",
+          "manager": "lpm",
+          "binary": "/tmp/lpm-metadata-lookahead/lpm-lookahead",
+          "sha256": "66e52aa9b43e785b1bb26b5edc97d6e442ce51293540db9343d129a79e8d705b"
+        },
+        {
+          "id": "bun",
+          "manager": "bun",
+          "binary": "/Users/tolga/.bun/bin/bun",
+          "sha256": "35d20dd0263e5c950194434b925454fdfa9ba6e4467da960410fa05b08a7a5b5"
+        }
+      ],
+      "balancedOrders": true,
+      "sharedLpmRoot": true,
+      "keepWork": true,
+      "fixture": "/Users/tolga/.codex/worktrees/install-overhead/rust-client/bench/audit-fixtures/peer-heavy/nestjs-deep",
+      "verifyModule": "@nestjs/core/package.json",
+      "registry": "http://127.0.0.1:55538",
+      "ca": "/tmp/lpm-metadata-lookahead/nest-complete-control/tls-Ayqrzf/ca.pem",
+      "expectedManifestSha256": "74ad0a8958da205f4361bd5e82405e7ad93c9043d8aafe84dc4fba7f66ddfe9d",
+      "diagnosticTimelineRoot": "/tmp/lpm-metadata-lookahead/nest-complete-control/traces",
+      "fixture_sha256": "5467ac14709e75494a0bf06fc2e1232968ade51101e82e06529585eb0389e9d8",
+      "harness_sha256": "f9d3272ed7750d71f59264347718388b1a472511d01d076f6227af1456fd9c6c",
+      "node": "v26.5.0",
+      "platform": "darwin",
+      "method": "Shared physical LPM root per state; separate Bun root. All forward/reverse rotations balance pair direction. Seeded and warmed twice; reset state outside measurement; rotating variant/scenario order; every scored install retained; no phase-timing flags on scored installs; opt-in timeline capture only for explicitly marked variants; inventories and lockfiles retained; no repeated seed downloads."
+    }
+  },
+  "t3-guard-confirm": {
+    "source": "/tmp/lpm-metadata-lookahead/t3-guard-confirm/runs/rows.json",
+    "sha256": "ae7a9de4766cabd214c6c010c394cfb918f49fae2237c3109705eed9698d855a",
+    "plan": {
+      "output": "/tmp/lpm-metadata-lookahead/t3-guard-confirm/runs",
+      "samples": 24,
+      "diagnostics": 2,
+      "states": [
+        "first-install"
+      ],
+      "variants": [
+        {
+          "id": "baseline",
+          "manager": "lpm",
+          "binary": "/tmp/lpm-next-install-costs/lpm-timeline",
+          "sha256": "cb7faaad32c197be418588b2d8c9134933a53187d8d062e6d64f26a4c08e512a"
+        },
+        {
+          "id": "candidate",
+          "manager": "lpm",
+          "binary": "/tmp/lpm-metadata-lookahead/lpm-lookahead-guard",
+          "sha256": "90e09a2ae9afdfe61030d53b72675a9576baa7da95a083292c58b97efe4583d5"
+        },
+        {
+          "id": "bun",
+          "manager": "bun",
+          "binary": "/Users/tolga/.bun/bin/bun",
+          "sha256": "35d20dd0263e5c950194434b925454fdfa9ba6e4467da960410fa05b08a7a5b5"
+        }
+      ],
+      "balancedOrders": true,
+      "sharedLpmRoot": true,
+      "keepWork": true,
+      "fixture": "/Users/tolga/.codex/worktrees/install-overhead/rust-client/bench/audit-fixtures/t3-install",
+      "verifyModule": "next/package.json",
+      "registry": "http://127.0.0.1:61055",
+      "ca": "/tmp/lpm-metadata-lookahead/t3-guard-confirm/tls-nkaXhg/ca.pem",
+      "expectedManifestSha256": "342a7c02aa21a0b004f6ade0947f315d11d366d67fe42309fcf4a7def3eaf42e",
+      "diagnosticTimelineRoot": "/tmp/lpm-metadata-lookahead/t3-guard-confirm/traces",
+      "fixture_sha256": "fa994042232e39e73fd1c4436c5e90974b47c4656e9c4a742c3988c6097b9871",
+      "harness_sha256": "f9d3272ed7750d71f59264347718388b1a472511d01d076f6227af1456fd9c6c",
+      "node": "v26.5.0",
+      "platform": "darwin",
+      "method": "Shared physical LPM root per state; separate Bun root. All forward/reverse rotations balance pair direction. Seeded and warmed twice; reset state outside measurement; rotating variant/scenario order; every scored install retained; no phase-timing flags on scored installs; opt-in timeline capture only for explicitly marked variants; inventories and lockfiles retained; no repeated seed downloads."
+    }
+  },
+  "vite-guard-confirm": {
+    "source": "/tmp/lpm-metadata-lookahead/vite-guard-confirm/runs/rows.json",
+    "sha256": "0f037ce50bbee5fcd0d98aecaeda87da8e79c263ba90732edb4945571c0e58b5",
+    "plan": {
+      "output": "/tmp/lpm-metadata-lookahead/vite-guard-confirm/runs",
+      "samples": 24,
+      "diagnostics": 2,
+      "states": [
+        "first-install"
+      ],
+      "variants": [
+        {
+          "id": "baseline",
+          "manager": "lpm",
+          "binary": "/tmp/lpm-next-install-costs/lpm-timeline",
+          "sha256": "cb7faaad32c197be418588b2d8c9134933a53187d8d062e6d64f26a4c08e512a"
+        },
+        {
+          "id": "candidate",
+          "manager": "lpm",
+          "binary": "/tmp/lpm-metadata-lookahead/lpm-lookahead-guard",
+          "sha256": "90e09a2ae9afdfe61030d53b72675a9576baa7da95a083292c58b97efe4583d5"
+        },
+        {
+          "id": "bun",
+          "manager": "bun",
+          "binary": "/Users/tolga/.bun/bin/bun",
+          "sha256": "35d20dd0263e5c950194434b925454fdfa9ba6e4467da960410fa05b08a7a5b5"
+        }
+      ],
+      "balancedOrders": true,
+      "sharedLpmRoot": true,
+      "keepWork": true,
+      "fixture": "/Users/tolga/.codex/worktrees/install-overhead/rust-client/bench/audit-fixtures/peer-heavy/vite-react",
+      "verifyModule": "react/package.json",
+      "registry": "http://127.0.0.1:57130",
+      "ca": "/tmp/lpm-metadata-lookahead/vite-guard-confirm/tls-C0gzci/ca.pem",
+      "expectedManifestSha256": "252acdaf27917b70e48c58e116cbbaa7bb2445f61f5dcf47172d96ba6e8b4dcf",
+      "diagnosticTimelineRoot": "/tmp/lpm-metadata-lookahead/vite-guard-confirm/traces",
+      "fixture_sha256": "11fe6a1100ebbf799500403a91748fde9991c745ebc182be088138a8e0b0f573",
+      "harness_sha256": "f9d3272ed7750d71f59264347718388b1a472511d01d076f6227af1456fd9c6c",
+      "node": "v26.5.0",
+      "platform": "darwin",
+      "method": "Shared physical LPM root per state; separate Bun root. All forward/reverse rotations balance pair direction. Seeded and warmed twice; reset state outside measurement; rotating variant/scenario order; every scored install retained; no phase-timing flags on scored installs; opt-in timeline capture only for explicitly marked variants; inventories and lockfiles retained; no repeated seed downloads."
+    }
+  },
+  "sharp-guard-confirm": {
+    "source": "/tmp/lpm-metadata-lookahead/sharp-guard-confirm/runs/rows.json",
+    "sha256": "2a4d3c073f4094efdcb4d9056f5d6950141348100eab98001f0e4abf5ed11450",
+    "plan": {
+      "output": "/tmp/lpm-metadata-lookahead/sharp-guard-confirm/runs",
+      "samples": 12,
+      "diagnostics": 2,
+      "states": [
+        "first-install"
+      ],
+      "variants": [
+        {
+          "id": "baseline",
+          "manager": "lpm",
+          "binary": "/tmp/lpm-next-install-costs/lpm-timeline",
+          "sha256": "cb7faaad32c197be418588b2d8c9134933a53187d8d062e6d64f26a4c08e512a"
+        },
+        {
+          "id": "candidate",
+          "manager": "lpm",
+          "binary": "/tmp/lpm-metadata-lookahead/lpm-lookahead-guard",
+          "sha256": "90e09a2ae9afdfe61030d53b72675a9576baa7da95a083292c58b97efe4583d5"
+        },
+        {
+          "id": "bun",
+          "manager": "bun",
+          "binary": "/Users/tolga/.bun/bin/bun",
+          "sha256": "35d20dd0263e5c950194434b925454fdfa9ba6e4467da960410fa05b08a7a5b5"
+        }
+      ],
+      "balancedOrders": true,
+      "sharedLpmRoot": true,
+      "keepWork": true,
+      "fixture": "/Users/tolga/.codex/worktrees/install-overhead/rust-client/bench/audit-fixtures/native/sharp-image",
+      "verifyModule": "sharp/package.json",
+      "registry": "http://127.0.0.1:50418",
+      "ca": "/tmp/lpm-metadata-lookahead/sharp-guard-confirm/tls-QNWAYO/ca.pem",
+      "expectedManifestSha256": "95dbdd031da8b0f356061829cdb158426ad186d723992d37970b9271e7bcf2d5",
+      "diagnosticTimelineRoot": "/tmp/lpm-metadata-lookahead/sharp-guard-confirm/traces",
+      "fixture_sha256": "22aa2132be98340ec5b54a4d27077b52d8d69a755b2af449ea93152f5b187c74",
+      "harness_sha256": "f9d3272ed7750d71f59264347718388b1a472511d01d076f6227af1456fd9c6c",
+      "node": "v26.5.0",
+      "platform": "darwin",
+      "method": "Shared physical LPM root per state; separate Bun root. All forward/reverse rotations balance pair direction. Seeded and warmed twice; reset state outside measurement; rotating variant/scenario order; every scored install retained; no phase-timing flags on scored installs; opt-in timeline capture only for explicitly marked variants; inventories and lockfiles retained; no repeated seed downloads."
+    }
+  },
+  "nest-guard-confirm": {
+    "source": "/tmp/lpm-metadata-lookahead/nest-guard-confirm/runs/rows.json",
+    "sha256": "a4f1b14532eaa330eb5190ca75f57245f3791b7d386c5d082e55da99cdcd1133",
+    "plan": {
+      "output": "/tmp/lpm-metadata-lookahead/nest-guard-confirm/runs",
+      "samples": 12,
+      "diagnostics": 2,
+      "states": [
+        "first-install"
+      ],
+      "variants": [
+        {
+          "id": "baseline",
+          "manager": "lpm",
+          "binary": "/tmp/lpm-next-install-costs/lpm-timeline",
+          "sha256": "cb7faaad32c197be418588b2d8c9134933a53187d8d062e6d64f26a4c08e512a"
+        },
+        {
+          "id": "candidate",
+          "manager": "lpm",
+          "binary": "/tmp/lpm-metadata-lookahead/lpm-lookahead-guard",
+          "sha256": "90e09a2ae9afdfe61030d53b72675a9576baa7da95a083292c58b97efe4583d5"
+        },
+        {
+          "id": "bun",
+          "manager": "bun",
+          "binary": "/Users/tolga/.bun/bin/bun",
+          "sha256": "35d20dd0263e5c950194434b925454fdfa9ba6e4467da960410fa05b08a7a5b5"
+        }
+      ],
+      "balancedOrders": true,
+      "sharedLpmRoot": true,
+      "keepWork": true,
+      "fixture": "/Users/tolga/.codex/worktrees/install-overhead/rust-client/bench/audit-fixtures/peer-heavy/nestjs-deep",
+      "verifyModule": "@nestjs/core/package.json",
+      "registry": "http://127.0.0.1:51309",
+      "ca": "/tmp/lpm-metadata-lookahead/nest-guard-confirm/tls-tpNJBl/ca.pem",
+      "expectedManifestSha256": "74ad0a8958da205f4361bd5e82405e7ad93c9043d8aafe84dc4fba7f66ddfe9d",
+      "diagnosticTimelineRoot": "/tmp/lpm-metadata-lookahead/nest-guard-confirm/traces",
+      "fixture_sha256": "5467ac14709e75494a0bf06fc2e1232968ade51101e82e06529585eb0389e9d8",
+      "harness_sha256": "f9d3272ed7750d71f59264347718388b1a472511d01d076f6227af1456fd9c6c",
+      "node": "v26.5.0",
+      "platform": "darwin",
+      "method": "Shared physical LPM root per state; separate Bun root. All forward/reverse rotations balance pair direction. Seeded and warmed twice; reset state outside measurement; rotating variant/scenario order; every scored install retained; no phase-timing flags on scored installs; opt-in timeline capture only for explicitly marked variants; inventories and lockfiles retained; no repeated seed downloads."
+    }
+  },
+  "live-warm": {
+    "source": "/tmp/lpm-metadata-lookahead/live-first-install-warm/rows.json",
+    "sha256": "48fb70323e90f075f78bd12ff46487381103d19e7c979b4e40cb6dee8d2ab014"
+  },
+  "live-scored": {
+    "source": "/tmp/lpm-metadata-lookahead/live-first-install-scored/rows.json",
+    "sha256": "cc93d8b92ebfe8254c39a7b4972775e0e15396319eae9b020201848a19faa702"
+  },
+  "candidate": {
+    "parent": "d53ddb1d81125c0bcc0ffbfabb95da063c98369f",
+    "binary": "/tmp/lpm-metadata-lookahead/lpm-lookahead-guard",
+    "sha256": "90e09a2ae9afdfe61030d53b72675a9576baa7da95a083292c58b97efe4583d5",
+    "build_seconds": 469.58070492744446,
+    "patch": "lookahead-guard.patch",
+    "new_files": "lookahead-guard-new-files.tar.gz",
+    "post_build_source_verification": "Tracked Rust diff unchanged; both new Rust modules unchanged before cfg(test); only unit coverage and replay test/config added after build."
+  },
+  "fixed_sample_plan": {
+    "candidate": "lpm-lookahead-guard",
+    "baseline": "/tmp/lpm-next-install-costs/lpm-timeline",
+    "frozen": [
+      {
+        "fixture": "vite",
+        "stage": "guard-confirm",
+        "samples_per_variant": 24
+      },
+      {
+        "fixture": "t3",
+        "stage": "guard-confirm",
+        "samples_per_variant": 24
+      },
+      {
+        "fixture": "sharp",
+        "stage": "guard-confirm",
+        "samples_per_variant": 12
+      },
+      {
+        "fixture": "nest",
+        "stage": "guard-confirm",
+        "samples_per_variant": 12
+      }
+    ],
+    "live": {
+      "samples_per_variant": 12,
+      "unscored_warmup_rounds": 2,
+      "fixtures": [
+        "vite-react",
+        "native-sharp",
+        "nest",
+        "t3"
+      ]
+    },
+    "method": "Fixed counts chosen before results; six-order permutations; two deterministic successful warm gates; no builds/tests during scoring; independent output parity; retain all samples and failures. Previous cohorts kept separate. Frozen corrected HTTP2 capacity applies to all variants.",
+    "decision": "A useful repeatable end-to-end benefit must survive real fixtures and controls before optimization PR. A synthetic overlap win is not sufficient. Investigate meaningful control regressions rather than selecting favorable cohorts."
+  },
+  "withdrawal": {
+    "parent": "d53ddb1d81125c0bcc0ffbfabb95da063c98369f",
+    "reason": "No repeatable end-to-end production benefit; live T3 median1978.5\u21921974.5ms and interpolatedp952212.6\u21922311.65ms. Controlled overlap remains valid; frozen gain does not establish a live gain.",
+    "tracked_files": [
+      "crates/lpm-cli/src/cli/install_timeline.rs",
+      "crates/lpm-registry/src/client/body.rs",
+      "crates/lpm-registry/src/client/config.rs",
+      "crates/lpm-registry/src/client/history_cache.rs",
+      "crates/lpm-registry/src/client/metadata.rs",
+      "crates/lpm-registry/src/client/mod.rs",
+      "crates/lpm-registry/src/client/state.rs",
+      "crates/lpm-resolver/src/greedy/fused.rs",
+      "crates/lpm-resolver/src/greedy/manifest.rs",
+      "crates/lpm-resolver/src/greedy/tests.rs",
+      "tests/workflows/tests/install_metadata.rs"
+    ],
+    "new_files": [
+      "crates/lpm-registry/src/client/metadata/prefetch.rs",
+      "crates/lpm-resolver/src/greedy/fused/lookahead.rs"
+    ],
+    "patch_sha256": "9dccb2b695f925e380690975dc113f127d1298c4e985be35e404c6c251af8364",
+    "candidate_binary": "lpm-lookahead-guard",
+    "candidate_sha256": "90e09a2ae9afdfe61030d53b72675a9576baa7da95a083292c58b97efe4583d5"
+  },
+  "baseline_sha256": "cb7faaad32c197be418588b2d8c9134933a53187d8d062e6d64f26a4c08e512a",
+  "archive_note": "Prototype source is unshipped. Apply its patch and add its new files to parent d53ddb1d81125c0bcc0ffbfabb95da063c98369f. The tested guard binary differs from archived source only by later cfg(test) coverage.",
+  "retained_unscored_or_interrupted": [
+    "t3-pilot",
+    "t3-bounded-pilot",
+    "sharp-control",
+    "causal-final-1",
+    "nest-pilot"
+  ],
+  "all_raw_row_sources": [
+    {
+      "path": "/tmp/lpm-metadata-lookahead/causal-final-1/rows.json",
+      "bytes": 110476,
+      "sha256": "0b99f36e12c89f0179de13f50c217840f4c5695515566db820950ff58e9c7334",
+      "rows": 56
+    },
+    {
+      "path": "/tmp/lpm-metadata-lookahead/causal-prototype-1/rows.json",
+      "bytes": 110479,
+      "sha256": "7eb00c780c89cc3e7da487e8da94286fc776d79d878f81e907aaa020b584f548",
+      "rows": 56
+    },
+    {
+      "path": "/tmp/lpm-metadata-lookahead/live-first-install-scored/rows.json",
+      "bytes": 746876,
+      "sha256": "cc93d8b92ebfe8254c39a7b4972775e0e15396319eae9b020201848a19faa702",
+      "rows": 144
+    },
+    {
+      "path": "/tmp/lpm-metadata-lookahead/live-first-install-warm/rows.json",
+      "bytes": 122871,
+      "sha256": "48fb70323e90f075f78bd12ff46487381103d19e7c979b4e40cb6dee8d2ab014",
+      "rows": 24
+    },
+    {
+      "path": "/tmp/lpm-metadata-lookahead/nest-complete-control/runs/rows.json",
+      "bytes": 48156,
+      "sha256": "8335b9d06eb0cad0392cc278ccf471d45270097375546abcd04a5059046a103c",
+      "rows": 36
+    },
+    {
+      "path": "/tmp/lpm-metadata-lookahead/nest-guard-confirm/runs/rows.json",
+      "bytes": 48156,
+      "sha256": "a4f1b14532eaa330eb5190ca75f57245f3791b7d386c5d082e55da99cdcd1133",
+      "rows": 36
+    },
+    {
+      "path": "/tmp/lpm-metadata-lookahead/nest-pilot/runs/rows.json",
+      "bytes": 48156,
+      "sha256": "291d658e9e306f7641fe7508f8e31744fba168ecb841c2d1a624d64ee5a8742a",
+      "rows": 36
+    },
+    {
+      "path": "/tmp/lpm-metadata-lookahead/nest-preflight/runs/rows.json",
+      "bytes": 3,
+      "sha256": "37517e5f3dc66819f61f5a7bb8ace1921282415f10551d2defa5c3eb0985b570",
+      "rows": 0
+    },
+    {
+      "path": "/tmp/lpm-metadata-lookahead/sharp-complete-control/runs/rows.json",
+      "bytes": 45945,
+      "sha256": "696cd0df21b4945aded4f4eb76c27e09fc84876c259e93aa73f14116e2329174",
+      "rows": 36
+    },
+    {
+      "path": "/tmp/lpm-metadata-lookahead/sharp-guard-confirm/runs/rows.json",
+      "bytes": 45957,
+      "sha256": "2a4d3c073f4094efdcb4d9056f5d6950141348100eab98001f0e4abf5ed11450",
+      "rows": 36
+    },
+    {
+      "path": "/tmp/lpm-metadata-lookahead/t3-bounded-pilot/runs/rows.partial.json",
+      "bytes": 17161,
+      "sha256": "8468cb37ef7c239f8da556adc4b208885fec7c133127e9da62a7eddb6c271d27",
+      "rows": 12
+    },
+    {
+      "path": "/tmp/lpm-metadata-lookahead/t3-guard-confirm/runs/rows.json",
+      "bytes": 102984,
+      "sha256": "ae7a9de4766cabd214c6c010c394cfb918f49fae2237c3109705eed9698d855a",
+      "rows": 72
+    },
+    {
+      "path": "/tmp/lpm-metadata-lookahead/t3-pilot/runs/rows.partial.json",
+      "bytes": 17161,
+      "sha256": "944241ca83e317ff036a3833b8edc7314eb1a5600ea9d132dbc7f7ad0ef6592c",
+      "rows": 12
+    },
+    {
+      "path": "/tmp/lpm-metadata-lookahead/t3-preflight/runs/rows.json",
+      "bytes": 3,
+      "sha256": "37517e5f3dc66819f61f5a7bb8ace1921282415f10551d2defa5c3eb0985b570",
+      "rows": 0
+    },
+    {
+      "path": "/tmp/lpm-metadata-lookahead/t3-transport-pilot/runs/rows.json",
+      "bytes": 51493,
+      "sha256": "a7db4d4e85f752922c883ae6f0a322f64008316efb0147f9265b25cbeda5cbd3",
+      "rows": 36
+    },
+    {
+      "path": "/tmp/lpm-metadata-lookahead/t3-transport-preflight/runs/rows.json",
+      "bytes": 3,
+      "sha256": "37517e5f3dc66819f61f5a7bb8ace1921282415f10551d2defa5c3eb0985b570",
+      "rows": 0
+    },
+    {
+      "path": "/tmp/lpm-metadata-lookahead/vite-control/runs/rows.json",
+      "bytes": 47676,
+      "sha256": "6921d7b7909d76f1d83ecdb5283b394da11445cd8b7f6b9a1d96c85fadf31247",
+      "rows": 36
+    },
+    {
+      "path": "/tmp/lpm-metadata-lookahead/vite-guard-confirm/runs/rows.json",
+      "bytes": 95376,
+      "sha256": "0f037ce50bbee5fcd0d98aecaeda87da8e79c263ba90732edb4945571c0e58b5",
+      "rows": 72
+    }
+  ],
+  "controlled_overlap": [
+    {
+      "delayA": 0,
+      "variants": {
+        "baseline": {
+          "medianMs": 201.02743750000002,
+          "medianRssMiB": 34.375,
+          "metadataRequests": [
+            3,
+            3,
+            3,
+            3,
+            3,
+            3,
+            3,
+            3,
+            3,
+            3,
+            3,
+            3
+          ]
+        },
+        "candidate": {
+          "medianMs": 199.954583,
+          "medianRssMiB": 34.5,
+          "metadataRequests": [
+            3,
+            3,
+            3,
+            3,
+            3,
+            3,
+            3,
+            3,
+            3,
+            3,
+            3,
+            3
+          ]
+        }
+      }
+    },
+    {
+      "delayA": 150,
+      "variants": {
+        "baseline": {
+          "medianMs": 351.2251045,
+          "medianRssMiB": 34.1796875,
+          "metadataRequests": [
+            3,
+            3,
+            3,
+            3,
+            3,
+            3,
+            3,
+            3,
+            3,
+            3,
+            3,
+            3
+          ]
+        },
+        "candidate": {
+          "medianMs": 198.486854,
+          "medianRssMiB": 34.6328125,
+          "metadataRequests": [
+            3,
+            3,
+            3,
+            3,
+            3,
+            3,
+            3,
+            3,
+            3,
+            3,
+            3,
+            3
+          ]
+        }
+      }
+    }
+  ]
+}

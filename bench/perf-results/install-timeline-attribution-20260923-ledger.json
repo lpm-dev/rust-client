@@ -1,0 +1,340 @@
+{
+  "findings": [
+    {
+      "id": "TL-1",
+      "source": "cache_correctness_review",
+      "category": "performance diagnostics",
+      "location": "install, resolver, registry, extractor, store",
+      "claim": "Common origin and complete bounded task timeline",
+      "evidence": "Source review confirms existing aggregate timers cannot express this boundary.",
+      "disposition": "Verified",
+      "coverage": "New timeline collector and workflow tests",
+      "commit": "24c0329374704916cfe8cd274f8f594064fab212",
+      "pr_status": "Open with the install timeline concept PR; current CI is recorded on GitHub"
+    },
+    {
+      "id": "TL-2",
+      "source": "cache_correctness_review",
+      "category": "performance diagnostics",
+      "location": "install, resolver, registry, extractor, store",
+      "claim": "Preserve request attempt and fallback boundaries",
+      "evidence": "Source review confirms existing aggregate timers cannot express this boundary.",
+      "disposition": "Verified",
+      "coverage": "New timeline collector and workflow tests",
+      "commit": "24c0329374704916cfe8cd274f8f594064fab212",
+      "pr_status": "Open with the install timeline concept PR; current CI is recorded on GitHub"
+    },
+    {
+      "id": "TL-3",
+      "source": "cache_correctness_review",
+      "category": "performance diagnostics",
+      "location": "install, resolver, registry, extractor, store",
+      "claim": "Separate blocking queue, work, and resume",
+      "evidence": "Source review confirms existing aggregate timers cannot express this boundary.",
+      "disposition": "Verified",
+      "coverage": "New timeline collector and workflow tests",
+      "commit": "24c0329374704916cfe8cd274f8f594064fab212",
+      "pr_status": "Open with the install timeline concept PR; current CI is recorded on GitHub"
+    },
+    {
+      "id": "TL-4",
+      "source": "cache_correctness_review",
+      "category": "performance diagnostics",
+      "location": "install, resolver, registry, extractor, store",
+      "claim": "Separate tree walking from sidecar publication",
+      "evidence": "Source review confirms existing aggregate timers cannot express this boundary.",
+      "disposition": "Verified",
+      "coverage": "New timeline collector and workflow tests",
+      "commit": "24c0329374704916cfe8cd274f8f594064fab212",
+      "pr_status": "Open with the install timeline concept PR; current CI is recorded on GitHub"
+    },
+    {
+      "id": "TL-5",
+      "source": "cache_correctness_review",
+      "category": "performance diagnostics",
+      "location": "install, resolver, registry, extractor, store",
+      "claim": "Separate metadata task completion from ordered graph commit",
+      "evidence": "Source review confirms existing aggregate timers cannot express this boundary.",
+      "disposition": "Verified",
+      "coverage": "New timeline collector and workflow tests",
+      "commit": "24c0329374704916cfe8cd274f8f594064fab212",
+      "pr_status": "Open with the install timeline concept PR; current CI is recorded on GitHub"
+    },
+    {
+      "id": "TL-C1",
+      "source": "cache_correctness_review",
+      "category": "correctness",
+      "location": "crates/lpm-cli/src/cli/install_timeline.rs and dispatch.rs",
+      "claim": "Freeze cutoff precedes concurrently retained events",
+      "evidence": "timeline-unit-red.log reproduces failure before fix",
+      "disposition": "Verified",
+      "coverage": "Regression written and reproduced; collector 12 and final CLI 5290 pass",
+      "commit": "24c0329374704916cfe8cd274f8f594064fab212",
+      "pr_status": "Open with the install timeline concept PR; current CI is recorded on GitHub"
+    },
+    {
+      "id": "TL-C2",
+      "source": "cache_correctness_review",
+      "category": "correctness",
+      "location": "crates/lpm-cli/src/cli/install_timeline.rs and dispatch.rs",
+      "claim": "Explicit filtered parent replaced by unrelated current parent",
+      "evidence": "timeline-unit-red.log reproduces failure before fix",
+      "disposition": "Verified",
+      "coverage": "Regression written and reproduced; collector 12 and final CLI 5290 pass",
+      "commit": "24c0329374704916cfe8cd274f8f594064fab212",
+      "pr_status": "Open with the install timeline concept PR; current CI is recorded on GitHub"
+    },
+    {
+      "id": "TL-C3",
+      "source": "cache_correctness_review",
+      "category": "correctness",
+      "location": "crates/lpm-cli/src/cli/install_timeline.rs and dispatch.rs",
+      "claim": "Global install startup early return skips export",
+      "evidence": "timeline-workflow-red-current-binary.log reproduces failure before fix",
+      "disposition": "Verified",
+      "coverage": "Regression written and reproduced; collector 12 and final CLI 5290 pass",
+      "commit": "24c0329374704916cfe8cd274f8f594064fab212",
+      "pr_status": "Open with the install timeline concept PR; current CI is recorded on GitHub"
+    },
+    {
+      "id": "MEM-9",
+      "source": "cache_trust_review",
+      "category": "performance",
+      "location": "crates/lpm-store/src/v2/store.rs and store/tests.rs",
+      "claim": "Known-large regular tarball files allocate an avoidable 8 MiB prefix",
+      "evidence": "Source traces and release DHAT support prefix lifetime; review confirms missing assertions",
+      "disposition": "Verified",
+      "coverage": "360 store tests; fast local gates; SWC micro24; T3 CI-cold24+24; readiness4fixtures12; frozen Vite36",
+      "commit": "8f46810f3",
+      "pr_status": "PR876 open; current CI is recorded on GitHub"
+    },
+    {
+      "id": "MEM-10",
+      "source": "daybreak_cold_finalization_review",
+      "category": "correctness",
+      "location": "crates/lpm-store/src/v2/store.rs and store/tests.rs",
+      "claim": "Source-analysis parity test did not assert actual findings and oversized-source fallback",
+      "evidence": "Source traces and release DHAT support prefix lifetime; review confirms missing assertions",
+      "disposition": "Verified",
+      "coverage": "360 store tests; fast local gates; SWC micro24; T3 CI-cold24+24; readiness4fixtures12; frozen Vite36",
+      "commit": "8f46810f3",
+      "pr_status": "PR876 open; current CI is recorded on GitHub"
+    },
+    {
+      "id": "MEM-11",
+      "source": "daybreak_cold_finalization_review",
+      "category": "correctness",
+      "location": "crates/lpm-store/src/v2/store.rs and store/tests.rs",
+      "claim": "Large-file V3 callback consumer lacked regression coverage",
+      "evidence": "Source traces and release DHAT support prefix lifetime; review confirms missing assertions",
+      "disposition": "Verified",
+      "coverage": "360 store tests; fast local gates; SWC micro24; T3 CI-cold24+24; readiness4fixtures12; frozen Vite36",
+      "commit": "8f46810f3",
+      "pr_status": "PR876 open; current CI is recorded on GitHub"
+    },
+    {
+      "id": "TL-H1",
+      "source": "cache_correctness_review",
+      "category": "correctness",
+      "location": "fetch.rs, fetch_overlap.rs, resolve/fetch_schedule.rs, store.rs, cache.rs",
+      "claim": "Async/blocking tarball spawns lose install ancestry",
+      "evidence": "timeline-ancestry-red.log: unparented fetches=1; Vite controlled traces reproduced12\u201323 rootless fetch spans in all36 enabled samples; timeline-overlap-red-3.log reproduces all4 additional routes",
+      "disposition": "Verified",
+      "coverage": "Final route-specific workflow regressions: normal overlap, shared workspace, post-policy package list, and experimental resolver; timeline-overlap-green-2.log9passed",
+      "commit": "3f717a981",
+      "pr_status": "Open with the install timeline concept PR; current CI is recorded on GitHub",
+      "duplicate_reports": [
+        {
+          "source": "cache_correctness_review",
+          "report": "Additional overlapping-fetch spawn routes identified from scored Vite traces",
+          "canonical": "TL-H1"
+        }
+      ]
+    },
+    {
+      "id": "TL-H2",
+      "source": "cache_correctness_review",
+      "category": "correctness",
+      "location": "fetch.rs, store.rs, cache.rs",
+      "claim": "Link entry emits an unmatched rename start",
+      "evidence": "timeline-ancestry-red.log: rename starts=2, ends=1",
+      "disposition": "Verified",
+      "coverage": "Regression reproduced before fix; final workflow gate: 749 passed across 22 targets",
+      "commit": "24c0329374704916cfe8cd274f8f594064fab212",
+      "pr_status": "Open with the install timeline concept PR; current CI is recorded on GitHub"
+    },
+    {
+      "id": "TL-H3",
+      "source": "cache_correctness_review",
+      "category": "correctness",
+      "location": "fetch.rs, store.rs, cache.rs",
+      "claim": "Cache budget skip leaves an unmatched serialization start",
+      "evidence": "timeline-serialization-red-2.log: retained only cache_serialize_start",
+      "disposition": "Verified",
+      "coverage": "Regression reproduced before fix; final workflow gate: 749 passed across 22 targets",
+      "commit": "24c0329374704916cfe8cd274f8f594064fab212",
+      "pr_status": "Open with the install timeline concept PR; current CI is recorded on GitHub"
+    },
+    {
+      "id": "TL-C4",
+      "source": "primary",
+      "category": "correctness",
+      "location": "crates/lpm-extractor/src/timeline.rs and crates/lpm-cli/src/cli/install_timeline.rs",
+      "claim": "Per-chunk completion events exhaust the bounded timeline before common T3 finalization",
+      "evidence": "Live unscored debug T3 recorded 50000 events and dropped 236; deterministic streaming regression dropped 687 of 3087 events with a 2400-record budget before fix",
+      "disposition": "Verified",
+      "coverage": "streaming_read_activity_leaves_room_for_finalization; timeline-capacity-red-2.log (687 dropped); timeline-capacity-green.log (9 passed)",
+      "commit": "24c0329374704916cfe8cd274f8f594064fab212",
+      "pr_status": "Open with the install timeline concept PR; current CI is recorded on GitHub"
+    },
+    {
+      "id": "TL-S1",
+      "source": "daybreak_cold_finalization_review",
+      "category": "correctness",
+      "location": "install_timeline.rs and greedy/fused.rs",
+      "claim": "Resolver correlation map exceeded the record budget independently",
+      "evidence": "timeline-correlation-red.log:2048 retained with1024 expected",
+      "disposition": "Verified",
+      "coverage": "timeline-correlation-green.log; skipped_correlations_remain_counted_after_the_record_budget_is_full",
+      "commit": "305e9310f43f63ee87c4019acdba79132ace9e57",
+      "pr_status": "Open with the install timeline concept PR; current CI is recorded on GitHub"
+    },
+    {
+      "id": "TL-S2",
+      "source": "daybreak_cold_finalization_review",
+      "category": "correctness",
+      "location": "install_timeline.rs and greedy/fused.rs",
+      "claim": "Failed export left partial JSON at a final artifact filename",
+      "evidence": "timeline-export-red.log:one partial artifact after injected write failure",
+      "disposition": "Verified",
+      "coverage": "failed_export_leaves_no_partial_artifact_or_temporary_file; private permissions and preplanted symlink test",
+      "commit": "305e9310f43f63ee87c4019acdba79132ace9e57",
+      "pr_status": "Open with the install timeline concept PR; current CI is recorded on GitHub"
+    },
+    {
+      "id": "TL-S3",
+      "source": "daybreak_cold_finalization_review",
+      "category": "security",
+      "location": "install_timeline.rs artifact permissions",
+      "claim": "Windows inherits directory ACL instead of guaranteeing Unix0600 semantics",
+      "evidence": "Existing contract explicitly limited0600 to Unix. Diagnostic output uses a caller-selected directory and exports no identifiers/credentials. No Windows user-only access guarantee exists. Documentation now names inherited ACL behavior explicitly.",
+      "disposition": "Rejected",
+      "coverage": "Unix0600 and preplanted symlink regression; explicit Windows ACL contract in report",
+      "commit": null,
+      "pr_status": "Open with the install timeline concept PR; current CI is recorded on GitHub"
+    },
+    {
+      "id": "TL-T1",
+      "source": "primary final gate",
+      "category": "correctness",
+      "location": "tests/integration/tests/atomic_write_inventory.rs",
+      "claim": "Timeline exporter missing from reviewed atomic-publication inventory",
+      "evidence": "gate-resumed-libraries.log fails on export_with; timeline-inventory-green.log passes after reviewed registration",
+      "disposition": "Verified",
+      "coverage": "production_atomic_rewrites_use_exclusive_temporary_files",
+      "commit": "2d7e3a819",
+      "pr_status": "Open with the install timeline concept PR; current CI is recorded on GitHub"
+    },
+    {
+      "id": "TL-M1",
+      "source": "cache_correctness_review",
+      "category": "performance",
+      "location": "run-timeline-benchmarks.py",
+      "claim": "Measurement driver swallowed nonzero readiness verdicts when installs succeeded",
+      "evidence": "timeline-driver-red.log reproduces rc1 returning normally; timeline-driver-green.log verifies rc0/1/2 handling",
+      "disposition": "Verified",
+      "coverage": "check-timeline-driver.py; all return codes preserved; nonzero stops scoring driver",
+      "commit": "63386bf3ce82984de7e6733ea6e66ae1ba794d72",
+      "pr_status": "Open with the install timeline concept PR; current CI is recorded on GitHub"
+    },
+    {
+      "id": "TL-M2",
+      "source": "cache_correctness_review",
+      "category": "performance",
+      "location": "analyze-timelines.py",
+      "claim": "Inline metadata parsing counted as blocking worker execution",
+      "evidence": "timeline-analysis-red.log and timeline-analysis-green.log",
+      "disposition": "Verified",
+      "coverage": "Synthetic inline and blocking metadata parse spans",
+      "commit": "63386bf3ce82984de7e6733ea6e66ae1ba794d72",
+      "pr_status": "Open with the install timeline concept PR; current CI is recorded on GitHub"
+    },
+    {
+      "id": "TL-M3",
+      "source": "cache_correctness_review",
+      "category": "performance",
+      "location": "analyze-timelines.py",
+      "claim": "Lost records allowed apparently complete span attribution",
+      "evidence": "timeline-censoring-red.log and timeline-censoring-green.log; former T3 trace contains seven missing closes despite open_spans=0; timeline-analysis-chain-red.log reproduces an indirectly orphaned fetch marked eligible",
+      "disposition": "Verified",
+      "coverage": "Loss disables interval attribution; explicit censored-span counts and observed duration lower bounds; full parent chain must reach install_pipeline (chain-red/chain-green logs)",
+      "commit": "63386bf3ce82984de7e6733ea6e66ae1ba794d72",
+      "pr_status": "Open with the install timeline concept PR; current CI is recorded on GitHub",
+      "duplicate_reports": [
+        {
+          "source": "cache_trust_review",
+          "report": "Distinguish nearest-rank report percentiles from interpolated gate percentiles; retain observed overhead and failed controls. No new numerical defect.",
+          "canonical": "TL-M3"
+        }
+      ]
+    },
+    {
+      "id": "TL-M4",
+      "source": "cache_correctness_review",
+      "category": "performance",
+      "location": "run-timeline-{nest,vite}-frozen.mjs",
+      "claim": "Fresh capture preparation hashed the wrong manifest directory",
+      "evidence": "timeline-capture-path-red.log and timeline-capture-path-green.log",
+      "disposition": "Verified",
+      "coverage": "Both capture helpers pin the same source directory used by their replay proxy",
+      "commit": "63386bf3ce82984de7e6733ea6e66ae1ba794d72",
+      "pr_status": "Open with the install timeline concept PR; current CI is recorded on GitHub"
+    },
+    {
+      "id": "TL-M5",
+      "source": "primary measurement validation",
+      "category": "performance",
+      "location": "run-timeline-{nest,vite,sharp}-frozen.mjs",
+      "claim": "Fresh replay preparation assumed the output directory already existed",
+      "evidence": "timeline-capture-root-red.log: ENOENT in TLS mkdtemp; fresh Sharp preparation succeeds after creating the parent",
+      "disposition": "Verified",
+      "coverage": "Actual fresh Sharp capture preparation with absent output directory; all 11 archives match SRI",
+      "commit": "63386bf3ce82984de7e6733ea6e66ae1ba794d72",
+      "pr_status": "Open with the install timeline concept PR; current CI is recorded on GitHub"
+    }
+  ],
+  "observations": {
+    "MEM-01": "Locked CI-cold metadata RPC counters are zero; not a production defect.",
+    "MEM-02": "Decoded buffers are retained through extraction; canonical measured observation MEM-07.",
+    "MEM-03": "Next uses 768 KiB pipelined buffers; not whole archive allocation.",
+    "MEM-04": "Path ledgers cannot by themselves explain the RSS gap.",
+    "MEM-05": "Tree digest paths move into finalization map; no duplicate strings found.",
+    "MEM-06": "Thread-cap diagnostics16/32 show no convincing RSS win; no policy adopted.",
+    "MEM-07": "34.07 MiB decoded data at DHAT global peak; necessary ownership, no leak established.",
+    "MEM-08": "Rayon contributes zero at the measured DHAT peak; remaining allocations alone do not justify a runtime change."
+  },
+  "research_observations": [
+    {
+      "id": "MEM-OBS-09",
+      "source": "cache_trust_review",
+      "source_alias": "MEM-10 follow-up report (not coverage finding MEM-10)",
+      "claim": "Direct streaming likely uses about 128 additional underlying file reads for SWC compared with its former 8MiB prefix preload",
+      "evidence": "flate2 read::GzDecoder uses32KiB requests; hybrid prefix reads64KiB; actual syscall counts not measured",
+      "conclusion": "Optimization hypothesis only. Scored micro pairs split12/12 and median paired difference0.795ms, so a consistent wall regression is not established"
+    },
+    {
+      "id": "MEM-OBS-10",
+      "source": "cache_trust_review",
+      "source_alias": "MEM-11 follow-up report (not coverage finding MEM-11)",
+      "claim": "Frozen Vite capture does not exercise the new known-large streaming route",
+      "evidence": "63 original archives; largest4080074bytes, below8MiB cutoff",
+      "conclusion": "Constrains attribution but does not explain the live Vite regression; added handle metadata check still executes"
+    }
+  ],
+  "totals": {
+    "Verified": 23,
+    "Rejected": 1,
+    "Blocked": 0,
+    "Pending": 0
+  }
+}

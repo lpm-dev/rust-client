@@ -1,0 +1,2008 @@
+{
+  "binary": {
+    "sha256": "cb7faaad32c197be418588b2d8c9134933a53187d8d062e6d64f26a4c08e512a",
+    "commit": "3f717a981b6e792cab4be3c134c0103ccfbaa573",
+    "parent": "6a1b158987a890102ef3b814864fcd427715edef"
+  },
+  "pre_overlap_binary": {
+    "sha256": "2049777b368098404b7d15abab47e2200180a3cb9b208926818b5c064c15eac3",
+    "commit": "2d7e3a819682605a08d41969fc53d1cc25f43712",
+    "parent": "6a1b158987a890102ef3b814864fcd427715edef"
+  },
+  "baseline_sha256": "332844f48cda8726d682a613009d906bc0ba430f01704f595c26b139523094f0",
+  "rust": "1.94.0",
+  "platform": "macOS arm64",
+  "raw_root": "/tmp/lpm-next-install-costs",
+  "cohorts": {
+    "timeline-nest-frozen/scored": {
+      "rows": 108,
+      "rows_sha256": "74577669de25af2af0d175476d4efbcd5f04543a86842a75243bd4c5f564bcf3",
+      "plan": {
+        "output": "/tmp/lpm-next-install-costs/timeline-nest-frozen/scored",
+        "samples": 36,
+        "diagnostics": 4,
+        "states": [
+          "first-install"
+        ],
+        "variants": [
+          {
+            "id": "baseline",
+            "manager": "lpm",
+            "binary": "/tmp/lpm-next-install-costs/lpm-known-size",
+            "sha256": "332844f48cda8726d682a613009d906bc0ba430f01704f595c26b139523094f0"
+          },
+          {
+            "id": "disabled",
+            "manager": "lpm",
+            "binary": "/tmp/lpm-next-install-costs/lpm-timeline",
+            "sha256": "2049777b368098404b7d15abab47e2200180a3cb9b208926818b5c064c15eac3"
+          },
+          {
+            "id": "enabled",
+            "manager": "lpm",
+            "binary": "/tmp/lpm-next-install-costs/lpm-timeline",
+            "env": {
+              "LPM_INSTALL_TIMELINE_DIR": "/tmp/lpm-next-install-costs/timeline-nest-frozen/traces"
+            },
+            "sha256": "2049777b368098404b7d15abab47e2200180a3cb9b208926818b5c064c15eac3"
+          }
+        ],
+        "balancedOrders": true,
+        "sharedLpmRoot": true,
+        "keepWork": true,
+        "fixture": "/Users/tolga/.codex/worktrees/install-overhead/rust-client/bench/audit-fixtures/peer-heavy/nestjs-deep",
+        "verifyModule": "@nestjs/core/package.json",
+        "registry": "http://127.0.0.1:63395",
+        "ca": "/tmp/lpm-next-install-costs/timeline-nest-frozen/tls-XL2fOf/ca.pem",
+        "fixture_sha256": "5467ac14709e75494a0bf06fc2e1232968ade51101e82e06529585eb0389e9d8",
+        "harness_sha256": "df3006dd111fe1f4be464543ca954c39d0b0e7bfb53f421fa309c0fa0088f13b",
+        "node": "v26.5.0",
+        "platform": "darwin",
+        "method": "Shared physical LPM root per state; separate Bun root. All forward/reverse rotations balance pair direction. Seeded and warmed twice; reset state outside measurement; rotating variant/scenario order; every scored install retained; no phase-timing flags on scored installs; opt-in timeline capture only for explicitly marked variants; inventories and lockfiles retained; no repeated seed downloads."
+      }
+    },
+    "timeline-vite-frozen/scored": {
+      "rows": 108,
+      "rows_sha256": "94ea55953f8bc8c550aa6632136008c3b5eb03ff083a5d0cd33178046c6eda03",
+      "plan": {
+        "output": "/tmp/lpm-next-install-costs/timeline-vite-frozen/scored",
+        "samples": 36,
+        "diagnostics": 4,
+        "states": [
+          "first-install"
+        ],
+        "variants": [
+          {
+            "id": "baseline",
+            "manager": "lpm",
+            "binary": "/tmp/lpm-next-install-costs/lpm-known-size",
+            "sha256": "332844f48cda8726d682a613009d906bc0ba430f01704f595c26b139523094f0"
+          },
+          {
+            "id": "disabled",
+            "manager": "lpm",
+            "binary": "/tmp/lpm-next-install-costs/lpm-timeline",
+            "sha256": "2049777b368098404b7d15abab47e2200180a3cb9b208926818b5c064c15eac3"
+          },
+          {
+            "id": "enabled",
+            "manager": "lpm",
+            "binary": "/tmp/lpm-next-install-costs/lpm-timeline",
+            "env": {
+              "LPM_INSTALL_TIMELINE_DIR": "/tmp/lpm-next-install-costs/timeline-vite-frozen/traces"
+            },
+            "sha256": "2049777b368098404b7d15abab47e2200180a3cb9b208926818b5c064c15eac3"
+          }
+        ],
+        "balancedOrders": true,
+        "sharedLpmRoot": true,
+        "keepWork": true,
+        "fixture": "/Users/tolga/.codex/worktrees/install-overhead/rust-client/bench/audit-fixtures/peer-heavy/vite-react",
+        "verifyModule": "react/package.json",
+        "registry": "http://127.0.0.1:64435",
+        "ca": "/tmp/lpm-next-install-costs/timeline-vite-frozen/tls-IilFls/ca.pem",
+        "fixture_sha256": "11fe6a1100ebbf799500403a91748fde9991c745ebc182be088138a8e0b0f573",
+        "harness_sha256": "df3006dd111fe1f4be464543ca954c39d0b0e7bfb53f421fa309c0fa0088f13b",
+        "node": "v26.5.0",
+        "platform": "darwin",
+        "method": "Shared physical LPM root per state; separate Bun root. All forward/reverse rotations balance pair direction. Seeded and warmed twice; reset state outside measurement; rotating variant/scenario order; every scored install retained; no phase-timing flags on scored installs; opt-in timeline capture only for explicitly marked variants; inventories and lockfiles retained; no repeated seed downloads."
+      }
+    },
+    "timeline-live-nest": {
+      "rows": 36,
+      "rows_sha256": "ec799d889d8aaad1636edabd2387c71203cfc58dc613175cae54687d7e2bcaa0",
+      "plan": {
+        "output": "/tmp/lpm-next-install-costs/timeline-live-nest",
+        "samples": 36,
+        "diagnostics": 0,
+        "states": [
+          "first-install"
+        ],
+        "variants": [
+          {
+            "id": "enabled",
+            "manager": "lpm",
+            "binary": "/tmp/lpm-next-install-costs/lpm-timeline",
+            "env": {
+              "LPM_INSTALL_TIMELINE_DIR": "per-run"
+            },
+            "sha256": "2049777b368098404b7d15abab47e2200180a3cb9b208926818b5c064c15eac3"
+          }
+        ],
+        "balancedOrders": true,
+        "sharedLpmRoot": true,
+        "keepWork": true,
+        "fixture": "/Users/tolga/.codex/worktrees/install-overhead/rust-client/bench/audit-fixtures/peer-heavy/nestjs-deep",
+        "verifyModule": "@nestjs/core/package.json",
+        "fixture_sha256": "5467ac14709e75494a0bf06fc2e1232968ade51101e82e06529585eb0389e9d8",
+        "harness_sha256": "1842e1092d98b06d861cc20b9bacd87628c616c63124882233a1d4785f08f600",
+        "node": "v26.5.0",
+        "platform": "darwin",
+        "method": "Shared physical LPM root per state; separate Bun root. All forward/reverse rotations balance pair direction. Seeded and warmed twice; reset state outside measurement; rotating variant/scenario order; every scored install retained; no phase-timing flags on scored installs; opt-in timeline capture only for explicitly marked variants; inventories and lockfiles retained; no repeated seed downloads."
+      }
+    },
+    "timeline-live-t3": {
+      "rows": 2,
+      "rows_sha256": "4f3be8b34d761652a730c7ce3d65fde7117881fa1e28732417c7d28a60f5eb89",
+      "plan": {
+        "output": "/tmp/lpm-next-install-costs/timeline-live-t3",
+        "samples": 2,
+        "diagnostics": 0,
+        "states": [
+          "ci-cold-cache"
+        ],
+        "variants": [
+          {
+            "id": "enabled",
+            "manager": "lpm",
+            "binary": "/tmp/lpm-next-install-costs/lpm-timeline",
+            "env": {
+              "LPM_INSTALL_TIMELINE_DIR": "per-run"
+            },
+            "sha256": "2049777b368098404b7d15abab47e2200180a3cb9b208926818b5c064c15eac3"
+          }
+        ],
+        "balancedOrders": true,
+        "sharedLpmRoot": true,
+        "keepWork": true,
+        "fixture": "/Users/tolga/.codex/worktrees/install-overhead/rust-client/bench/audit-fixtures/t3-install",
+        "verifyModule": "next/package.json",
+        "fixture_sha256": "fa994042232e39e73fd1c4436c5e90974b47c4656e9c4a742c3988c6097b9871",
+        "harness_sha256": "1842e1092d98b06d861cc20b9bacd87628c616c63124882233a1d4785f08f600",
+        "node": "v26.5.0",
+        "platform": "darwin",
+        "method": "Shared physical LPM root per state; separate Bun root. All forward/reverse rotations balance pair direction. Seeded and warmed twice; reset state outside measurement; rotating variant/scenario order; every scored install retained; no phase-timing flags on scored installs; opt-in timeline capture only for explicitly marked variants; inventories and lockfiles retained; no repeated seed downloads."
+      }
+    },
+    "timeline-sharp-frozen/scored": {
+      "rows": 108,
+      "rows_sha256": "8f58de9399c907d56ae51ca0f3cbb8d4ca3163dc3d8058fc7880819d045d207e",
+      "plan": {
+        "output": "/tmp/lpm-next-install-costs/timeline-sharp-frozen/scored",
+        "samples": 36,
+        "diagnostics": 4,
+        "states": [
+          "first-install"
+        ],
+        "variants": [
+          {
+            "id": "baseline",
+            "manager": "lpm",
+            "binary": "/tmp/lpm-next-install-costs/lpm-known-size",
+            "sha256": "332844f48cda8726d682a613009d906bc0ba430f01704f595c26b139523094f0"
+          },
+          {
+            "id": "disabled",
+            "manager": "lpm",
+            "binary": "/tmp/lpm-next-install-costs/lpm-timeline",
+            "sha256": "2049777b368098404b7d15abab47e2200180a3cb9b208926818b5c064c15eac3"
+          },
+          {
+            "id": "enabled",
+            "manager": "lpm",
+            "binary": "/tmp/lpm-next-install-costs/lpm-timeline",
+            "env": {
+              "LPM_INSTALL_TIMELINE_DIR": "/tmp/lpm-next-install-costs/timeline-sharp-frozen/traces"
+            },
+            "sha256": "2049777b368098404b7d15abab47e2200180a3cb9b208926818b5c064c15eac3"
+          }
+        ],
+        "balancedOrders": true,
+        "sharedLpmRoot": true,
+        "keepWork": true,
+        "fixture": "/Users/tolga/.codex/worktrees/install-overhead/rust-client/bench/audit-fixtures/native/sharp-image",
+        "verifyModule": "sharp/package.json",
+        "registry": "http://127.0.0.1:59099",
+        "ca": "/tmp/lpm-next-install-costs/timeline-sharp-frozen/tls-sFVOUP/ca.pem",
+        "fixture_sha256": "22aa2132be98340ec5b54a4d27077b52d8d69a755b2af449ea93152f5b187c74",
+        "harness_sha256": "df3006dd111fe1f4be464543ca954c39d0b0e7bfb53f421fa309c0fa0088f13b",
+        "node": "v24.19.0",
+        "platform": "darwin",
+        "method": "Shared physical LPM root per state; separate Bun root. All forward/reverse rotations balance pair direction. Seeded and warmed twice; reset state outside measurement; rotating variant/scenario order; every scored install retained; no phase-timing flags on scored installs; opt-in timeline capture only for explicitly marked variants; inventories and lockfiles retained; no repeated seed downloads."
+      }
+    },
+    "timeline-live-sharp-confirmation": {
+      "rows": 108,
+      "rows_sha256": "74d7698c36faca385639710f77347d1415571f9a70fed342ceb80ca955f97125",
+      "plan": {
+        "output": "/tmp/lpm-next-install-costs/timeline-live-sharp-confirmation",
+        "samples": 36,
+        "diagnostics": 0,
+        "states": [
+          "first-install"
+        ],
+        "variants": [
+          {
+            "id": "baseline",
+            "manager": "lpm",
+            "binary": "/tmp/lpm-next-install-costs/lpm-known-size",
+            "sha256": "332844f48cda8726d682a613009d906bc0ba430f01704f595c26b139523094f0"
+          },
+          {
+            "id": "disabled",
+            "manager": "lpm",
+            "binary": "/tmp/lpm-next-install-costs/lpm-timeline",
+            "sha256": "2049777b368098404b7d15abab47e2200180a3cb9b208926818b5c064c15eac3"
+          },
+          {
+            "id": "bun",
+            "manager": "bun",
+            "binary": "/Users/tolga/.bun/bin/bun",
+            "sha256": "35d20dd0263e5c950194434b925454fdfa9ba6e4467da960410fa05b08a7a5b5"
+          }
+        ],
+        "balancedOrders": true,
+        "sharedLpmRoot": true,
+        "keepWork": true,
+        "fixture": "/Users/tolga/.codex/worktrees/install-overhead/rust-client/bench/audit-fixtures/native/sharp-image",
+        "verifyModule": "sharp/package.json",
+        "fixture_sha256": "22aa2132be98340ec5b54a4d27077b52d8d69a755b2af449ea93152f5b187c74",
+        "harness_sha256": "1842e1092d98b06d861cc20b9bacd87628c616c63124882233a1d4785f08f600",
+        "node": "v24.19.0",
+        "platform": "darwin",
+        "method": "Shared physical LPM root per state; separate Bun root. All forward/reverse rotations balance pair direction. Seeded and warmed twice; reset state outside measurement; rotating variant/scenario order; every scored install retained; no phase-timing flags on scored installs; opt-in timeline capture only for explicitly marked variants; inventories and lockfiles retained; no repeated seed downloads."
+      }
+    },
+    "timeline-readiness-warmup": {
+      "rows": 36,
+      "rows_sha256": "10f2c0449a55f6ce5654eb3a6a9547dd36333e063fc948ec140217b32b7896e0",
+      "plan": {
+        "samples": 1,
+        "fixtures": [
+          {
+            "name": "vite-react",
+            "kind": "path",
+            "path": "bench/audit-fixtures/peer-heavy/vite-react",
+            "absolute_path": "/Users/tolga/.codex/worktrees/install-overhead/rust-client/bench/audit-fixtures/peer-heavy/vite-react"
+          },
+          {
+            "name": "native-sharp",
+            "kind": "path",
+            "path": "bench/audit-fixtures/native/sharp-image",
+            "absolute_path": "/Users/tolga/.codex/worktrees/install-overhead/rust-client/bench/audit-fixtures/native/sharp-image"
+          },
+          {
+            "name": "nest",
+            "kind": "path",
+            "path": "bench/audit-fixtures/peer-heavy/nestjs-deep",
+            "absolute_path": "/Users/tolga/.codex/worktrees/install-overhead/rust-client/bench/audit-fixtures/peer-heavy/nestjs-deep"
+          },
+          {
+            "name": "t3",
+            "kind": "path",
+            "path": "bench/audit-fixtures/t3-install",
+            "absolute_path": "/Users/tolga/.codex/worktrees/install-overhead/rust-client/bench/audit-fixtures/t3-install"
+          }
+        ],
+        "managers": [
+          "lpm",
+          "bun"
+        ],
+        "modes": [
+          "cold",
+          "warm",
+          "up-to-date"
+        ],
+        "lpm_routes": [
+          "direct"
+        ],
+        "lpm_firewall_modes": [
+          "off"
+        ],
+        "lpm_binaries": [
+          {
+            "name": "baseline",
+            "path": "/tmp/lpm-next-install-costs/lpm-known-size"
+          },
+          {
+            "name": "candidate",
+            "path": "/tmp/lpm-next-install-costs/lpm-timeline"
+          }
+        ],
+        "lpm_cells": [
+          {
+            "name": "current",
+            "env": {}
+          }
+        ],
+        "lpm_comparison": {
+          "baseline": "baseline",
+          "candidate": "candidate",
+          "thresholds": {
+            "wall_ms": {
+              "median_pct": 5,
+              "p95_pct": 10,
+              "median_abs": 20,
+              "p95_abs": 50
+            },
+            "max_rss_bytes": {
+              "median_pct": 5,
+              "p95_pct": 10,
+              "median_abs": 16777216,
+              "p95_abs": 33554432
+            }
+          }
+        },
+        "lpm_typosquat_guard": "default",
+        "script_policy": "ignore",
+        "timeout_ms": 600000,
+        "output_dir": "/tmp/lpm-next-install-costs/timeline-readiness-warmup",
+        "run_specs": [
+          "lpm-baseline",
+          "lpm-candidate",
+          "bun"
+        ]
+      }
+    },
+    "timeline-readiness-scored": {
+      "rows": 432,
+      "rows_sha256": "31dccfc94c2c2d8020763f41317339176ec56bac68a69477745ba18fa30e8f38",
+      "plan": {
+        "samples": 12,
+        "fixtures": [
+          {
+            "name": "vite-react",
+            "kind": "path",
+            "path": "bench/audit-fixtures/peer-heavy/vite-react",
+            "absolute_path": "/Users/tolga/.codex/worktrees/install-overhead/rust-client/bench/audit-fixtures/peer-heavy/vite-react"
+          },
+          {
+            "name": "native-sharp",
+            "kind": "path",
+            "path": "bench/audit-fixtures/native/sharp-image",
+            "absolute_path": "/Users/tolga/.codex/worktrees/install-overhead/rust-client/bench/audit-fixtures/native/sharp-image"
+          },
+          {
+            "name": "nest",
+            "kind": "path",
+            "path": "bench/audit-fixtures/peer-heavy/nestjs-deep",
+            "absolute_path": "/Users/tolga/.codex/worktrees/install-overhead/rust-client/bench/audit-fixtures/peer-heavy/nestjs-deep"
+          },
+          {
+            "name": "t3",
+            "kind": "path",
+            "path": "bench/audit-fixtures/t3-install",
+            "absolute_path": "/Users/tolga/.codex/worktrees/install-overhead/rust-client/bench/audit-fixtures/t3-install"
+          }
+        ],
+        "managers": [
+          "lpm",
+          "bun"
+        ],
+        "modes": [
+          "cold",
+          "warm",
+          "up-to-date"
+        ],
+        "lpm_routes": [
+          "direct"
+        ],
+        "lpm_firewall_modes": [
+          "off"
+        ],
+        "lpm_binaries": [
+          {
+            "name": "baseline",
+            "path": "/tmp/lpm-next-install-costs/lpm-known-size"
+          },
+          {
+            "name": "candidate",
+            "path": "/tmp/lpm-next-install-costs/lpm-timeline"
+          }
+        ],
+        "lpm_cells": [
+          {
+            "name": "current",
+            "env": {}
+          }
+        ],
+        "lpm_comparison": {
+          "baseline": "baseline",
+          "candidate": "candidate",
+          "thresholds": {
+            "wall_ms": {
+              "median_pct": 5,
+              "p95_pct": 10,
+              "median_abs": 20,
+              "p95_abs": 50
+            },
+            "max_rss_bytes": {
+              "median_pct": 5,
+              "p95_pct": 10,
+              "median_abs": 16777216,
+              "p95_abs": 33554432
+            }
+          }
+        },
+        "lpm_typosquat_guard": "default",
+        "script_policy": "ignore",
+        "timeout_ms": 600000,
+        "output_dir": "/tmp/lpm-next-install-costs/timeline-readiness-scored",
+        "run_specs": [
+          "lpm-baseline",
+          "lpm-candidate",
+          "bun"
+        ]
+      }
+    },
+    "timeline-nest-final/scored": {
+      "rows": 108,
+      "rows_sha256": "87588b2a1fe28913c9260fb87f1b12d685c12153a24ed381e4454f0258ef7de9",
+      "plan": {
+        "output": "/tmp/lpm-next-install-costs/timeline-nest-final/scored",
+        "samples": 36,
+        "diagnostics": 4,
+        "states": [
+          "first-install"
+        ],
+        "variants": [
+          {
+            "id": "baseline",
+            "manager": "lpm",
+            "binary": "/tmp/lpm-next-install-costs/lpm-known-size",
+            "sha256": "332844f48cda8726d682a613009d906bc0ba430f01704f595c26b139523094f0"
+          },
+          {
+            "id": "disabled",
+            "manager": "lpm",
+            "binary": "/tmp/lpm-next-install-costs/lpm-timeline",
+            "sha256": "cb7faaad32c197be418588b2d8c9134933a53187d8d062e6d64f26a4c08e512a"
+          },
+          {
+            "id": "enabled",
+            "manager": "lpm",
+            "binary": "/tmp/lpm-next-install-costs/lpm-timeline",
+            "env": {
+              "LPM_INSTALL_TIMELINE_DIR": "/tmp/lpm-next-install-costs/timeline-nest-final/traces"
+            },
+            "sha256": "cb7faaad32c197be418588b2d8c9134933a53187d8d062e6d64f26a4c08e512a"
+          }
+        ],
+        "balancedOrders": true,
+        "sharedLpmRoot": true,
+        "keepWork": true,
+        "fixture": "/Users/tolga/.codex/worktrees/install-overhead/rust-client/bench/audit-fixtures/peer-heavy/nestjs-deep",
+        "verifyModule": "@nestjs/core/package.json",
+        "registry": "http://127.0.0.1:52292",
+        "ca": "/tmp/lpm-next-install-costs/timeline-nest-final/tls-UK7P7d/ca.pem",
+        "fixture_sha256": "5467ac14709e75494a0bf06fc2e1232968ade51101e82e06529585eb0389e9d8",
+        "harness_sha256": "df3006dd111fe1f4be464543ca954c39d0b0e7bfb53f421fa309c0fa0088f13b",
+        "node": "v26.5.0",
+        "platform": "darwin",
+        "method": "Shared physical LPM root per state; separate Bun root. All forward/reverse rotations balance pair direction. Seeded and warmed twice; reset state outside measurement; rotating variant/scenario order; every scored install retained; no phase-timing flags on scored installs; opt-in timeline capture only for explicitly marked variants; inventories and lockfiles retained; no repeated seed downloads."
+      }
+    },
+    "timeline-vite-final/scored": {
+      "rows": 108,
+      "rows_sha256": "e842141373dc42d8ec17690ea2a453cc094b6abd09eb207851898aefa90e4f62",
+      "plan": {
+        "output": "/tmp/lpm-next-install-costs/timeline-vite-final/scored",
+        "samples": 36,
+        "diagnostics": 4,
+        "states": [
+          "first-install"
+        ],
+        "variants": [
+          {
+            "id": "baseline",
+            "manager": "lpm",
+            "binary": "/tmp/lpm-next-install-costs/lpm-known-size",
+            "sha256": "332844f48cda8726d682a613009d906bc0ba430f01704f595c26b139523094f0"
+          },
+          {
+            "id": "disabled",
+            "manager": "lpm",
+            "binary": "/tmp/lpm-next-install-costs/lpm-timeline",
+            "sha256": "cb7faaad32c197be418588b2d8c9134933a53187d8d062e6d64f26a4c08e512a"
+          },
+          {
+            "id": "enabled",
+            "manager": "lpm",
+            "binary": "/tmp/lpm-next-install-costs/lpm-timeline",
+            "env": {
+              "LPM_INSTALL_TIMELINE_DIR": "/tmp/lpm-next-install-costs/timeline-vite-final/traces"
+            },
+            "sha256": "cb7faaad32c197be418588b2d8c9134933a53187d8d062e6d64f26a4c08e512a"
+          }
+        ],
+        "balancedOrders": true,
+        "sharedLpmRoot": true,
+        "keepWork": true,
+        "fixture": "/Users/tolga/.codex/worktrees/install-overhead/rust-client/bench/audit-fixtures/peer-heavy/vite-react",
+        "verifyModule": "react/package.json",
+        "registry": "http://127.0.0.1:53338",
+        "ca": "/tmp/lpm-next-install-costs/timeline-vite-final/tls-mNmy1m/ca.pem",
+        "fixture_sha256": "11fe6a1100ebbf799500403a91748fde9991c745ebc182be088138a8e0b0f573",
+        "harness_sha256": "df3006dd111fe1f4be464543ca954c39d0b0e7bfb53f421fa309c0fa0088f13b",
+        "node": "v26.5.0",
+        "platform": "darwin",
+        "method": "Shared physical LPM root per state; separate Bun root. All forward/reverse rotations balance pair direction. Seeded and warmed twice; reset state outside measurement; rotating variant/scenario order; every scored install retained; no phase-timing flags on scored installs; opt-in timeline capture only for explicitly marked variants; inventories and lockfiles retained; no repeated seed downloads."
+      }
+    },
+    "timeline-sharp-final/scored": {
+      "rows": 108,
+      "rows_sha256": "db9669fa302a1b0719852ccb48f72b89d64feadb74088d0a24bf0c5cdc987572",
+      "plan": {
+        "output": "/tmp/lpm-next-install-costs/timeline-sharp-final/scored",
+        "samples": 36,
+        "diagnostics": 4,
+        "states": [
+          "first-install"
+        ],
+        "variants": [
+          {
+            "id": "baseline",
+            "manager": "lpm",
+            "binary": "/tmp/lpm-next-install-costs/lpm-known-size",
+            "sha256": "332844f48cda8726d682a613009d906bc0ba430f01704f595c26b139523094f0"
+          },
+          {
+            "id": "disabled",
+            "manager": "lpm",
+            "binary": "/tmp/lpm-next-install-costs/lpm-timeline",
+            "sha256": "cb7faaad32c197be418588b2d8c9134933a53187d8d062e6d64f26a4c08e512a"
+          },
+          {
+            "id": "enabled",
+            "manager": "lpm",
+            "binary": "/tmp/lpm-next-install-costs/lpm-timeline",
+            "env": {
+              "LPM_INSTALL_TIMELINE_DIR": "/tmp/lpm-next-install-costs/timeline-sharp-final/traces"
+            },
+            "sha256": "cb7faaad32c197be418588b2d8c9134933a53187d8d062e6d64f26a4c08e512a"
+          }
+        ],
+        "balancedOrders": true,
+        "sharedLpmRoot": true,
+        "keepWork": true,
+        "fixture": "/Users/tolga/.codex/worktrees/install-overhead/rust-client/bench/audit-fixtures/native/sharp-image",
+        "verifyModule": "sharp/package.json",
+        "registry": "http://127.0.0.1:54404",
+        "ca": "/tmp/lpm-next-install-costs/timeline-sharp-final/tls-LOgpsv/ca.pem",
+        "fixture_sha256": "22aa2132be98340ec5b54a4d27077b52d8d69a755b2af449ea93152f5b187c74",
+        "harness_sha256": "df3006dd111fe1f4be464543ca954c39d0b0e7bfb53f421fa309c0fa0088f13b",
+        "node": "v26.5.0",
+        "platform": "darwin",
+        "method": "Shared physical LPM root per state; separate Bun root. All forward/reverse rotations balance pair direction. Seeded and warmed twice; reset state outside measurement; rotating variant/scenario order; every scored install retained; no phase-timing flags on scored installs; opt-in timeline capture only for explicitly marked variants; inventories and lockfiles retained; no repeated seed downloads."
+      }
+    },
+    "timeline-live-nest-final": {
+      "rows": 36,
+      "rows_sha256": "092bf9d6ae3f1ee9ff75ef075902feffd9b4cf06def89577f5939879528d22c4",
+      "plan": {
+        "output": "/tmp/lpm-next-install-costs/timeline-live-nest-final",
+        "samples": 36,
+        "diagnostics": 0,
+        "states": [
+          "first-install"
+        ],
+        "variants": [
+          {
+            "id": "enabled",
+            "manager": "lpm",
+            "binary": "/tmp/lpm-next-install-costs/lpm-timeline",
+            "env": {
+              "LPM_INSTALL_TIMELINE_DIR": "per-run"
+            },
+            "sha256": "cb7faaad32c197be418588b2d8c9134933a53187d8d062e6d64f26a4c08e512a"
+          }
+        ],
+        "balancedOrders": true,
+        "sharedLpmRoot": true,
+        "keepWork": true,
+        "fixture": "/Users/tolga/.codex/worktrees/install-overhead/rust-client/bench/audit-fixtures/peer-heavy/nestjs-deep",
+        "verifyModule": "@nestjs/core/package.json",
+        "fixture_sha256": "5467ac14709e75494a0bf06fc2e1232968ade51101e82e06529585eb0389e9d8",
+        "harness_sha256": "1842e1092d98b06d861cc20b9bacd87628c616c63124882233a1d4785f08f600",
+        "node": "v26.5.0",
+        "platform": "darwin",
+        "method": "Shared physical LPM root per state; separate Bun root. All forward/reverse rotations balance pair direction. Seeded and warmed twice; reset state outside measurement; rotating variant/scenario order; every scored install retained; no phase-timing flags on scored installs; opt-in timeline capture only for explicitly marked variants; inventories and lockfiles retained; no repeated seed downloads."
+      }
+    },
+    "timeline-live-t3-final": {
+      "rows": 2,
+      "rows_sha256": "aace4f97a0707e1fecb18b313e30ba23cb3892817579a9c520a7a18ef51ec8f1",
+      "plan": {
+        "output": "/tmp/lpm-next-install-costs/timeline-live-t3-final",
+        "samples": 2,
+        "diagnostics": 0,
+        "states": [
+          "ci-cold-cache"
+        ],
+        "variants": [
+          {
+            "id": "enabled",
+            "manager": "lpm",
+            "binary": "/tmp/lpm-next-install-costs/lpm-timeline",
+            "env": {
+              "LPM_INSTALL_TIMELINE_DIR": "per-run"
+            },
+            "sha256": "cb7faaad32c197be418588b2d8c9134933a53187d8d062e6d64f26a4c08e512a"
+          }
+        ],
+        "balancedOrders": true,
+        "sharedLpmRoot": true,
+        "keepWork": true,
+        "fixture": "/Users/tolga/.codex/worktrees/install-overhead/rust-client/bench/audit-fixtures/t3-install",
+        "verifyModule": "next/package.json",
+        "fixture_sha256": "fa994042232e39e73fd1c4436c5e90974b47c4656e9c4a742c3988c6097b9871",
+        "harness_sha256": "1842e1092d98b06d861cc20b9bacd87628c616c63124882233a1d4785f08f600",
+        "node": "v26.5.0",
+        "platform": "darwin",
+        "method": "Shared physical LPM root per state; separate Bun root. All forward/reverse rotations balance pair direction. Seeded and warmed twice; reset state outside measurement; rotating variant/scenario order; every scored install retained; no phase-timing flags on scored installs; opt-in timeline capture only for explicitly marked variants; inventories and lockfiles retained; no repeated seed downloads."
+      }
+    },
+    "timeline-readiness-warmup-final": {
+      "rows": 36,
+      "rows_sha256": "b78d75730f5584ee81a8e488b5e7a455ba1de373352ef499ee5ac3a15abf0d63",
+      "plan": {
+        "samples": 1,
+        "fixtures": [
+          {
+            "name": "vite-react",
+            "kind": "path",
+            "path": "bench/audit-fixtures/peer-heavy/vite-react",
+            "absolute_path": "/Users/tolga/.codex/worktrees/install-overhead/rust-client/bench/audit-fixtures/peer-heavy/vite-react"
+          },
+          {
+            "name": "native-sharp",
+            "kind": "path",
+            "path": "bench/audit-fixtures/native/sharp-image",
+            "absolute_path": "/Users/tolga/.codex/worktrees/install-overhead/rust-client/bench/audit-fixtures/native/sharp-image"
+          },
+          {
+            "name": "nest",
+            "kind": "path",
+            "path": "bench/audit-fixtures/peer-heavy/nestjs-deep",
+            "absolute_path": "/Users/tolga/.codex/worktrees/install-overhead/rust-client/bench/audit-fixtures/peer-heavy/nestjs-deep"
+          },
+          {
+            "name": "t3",
+            "kind": "path",
+            "path": "bench/audit-fixtures/t3-install",
+            "absolute_path": "/Users/tolga/.codex/worktrees/install-overhead/rust-client/bench/audit-fixtures/t3-install"
+          }
+        ],
+        "managers": [
+          "lpm",
+          "bun"
+        ],
+        "modes": [
+          "cold",
+          "warm",
+          "up-to-date"
+        ],
+        "lpm_routes": [
+          "direct"
+        ],
+        "lpm_firewall_modes": [
+          "off"
+        ],
+        "lpm_binaries": [
+          {
+            "name": "baseline",
+            "path": "/tmp/lpm-next-install-costs/lpm-known-size"
+          },
+          {
+            "name": "candidate",
+            "path": "/tmp/lpm-next-install-costs/lpm-timeline"
+          }
+        ],
+        "lpm_cells": [
+          {
+            "name": "current",
+            "env": {}
+          }
+        ],
+        "lpm_comparison": {
+          "baseline": "baseline",
+          "candidate": "candidate",
+          "thresholds": {
+            "wall_ms": {
+              "median_pct": 5,
+              "p95_pct": 10,
+              "median_abs": 20,
+              "p95_abs": 50
+            },
+            "max_rss_bytes": {
+              "median_pct": 5,
+              "p95_pct": 10,
+              "median_abs": 16777216,
+              "p95_abs": 33554432
+            }
+          }
+        },
+        "lpm_typosquat_guard": "default",
+        "script_policy": "ignore",
+        "timeout_ms": 600000,
+        "output_dir": "/tmp/lpm-next-install-costs/timeline-readiness-warmup-final",
+        "run_specs": [
+          "lpm-baseline",
+          "lpm-candidate",
+          "bun"
+        ]
+      }
+    },
+    "timeline-readiness-scored-final": {
+      "rows": 432,
+      "rows_sha256": "9e56a80a44cc8ae674ccb5ea497cce23c570fcee427e2322ac851a20e0f2c479",
+      "plan": {
+        "samples": 12,
+        "fixtures": [
+          {
+            "name": "vite-react",
+            "kind": "path",
+            "path": "bench/audit-fixtures/peer-heavy/vite-react",
+            "absolute_path": "/Users/tolga/.codex/worktrees/install-overhead/rust-client/bench/audit-fixtures/peer-heavy/vite-react"
+          },
+          {
+            "name": "native-sharp",
+            "kind": "path",
+            "path": "bench/audit-fixtures/native/sharp-image",
+            "absolute_path": "/Users/tolga/.codex/worktrees/install-overhead/rust-client/bench/audit-fixtures/native/sharp-image"
+          },
+          {
+            "name": "nest",
+            "kind": "path",
+            "path": "bench/audit-fixtures/peer-heavy/nestjs-deep",
+            "absolute_path": "/Users/tolga/.codex/worktrees/install-overhead/rust-client/bench/audit-fixtures/peer-heavy/nestjs-deep"
+          },
+          {
+            "name": "t3",
+            "kind": "path",
+            "path": "bench/audit-fixtures/t3-install",
+            "absolute_path": "/Users/tolga/.codex/worktrees/install-overhead/rust-client/bench/audit-fixtures/t3-install"
+          }
+        ],
+        "managers": [
+          "lpm",
+          "bun"
+        ],
+        "modes": [
+          "cold",
+          "warm",
+          "up-to-date"
+        ],
+        "lpm_routes": [
+          "direct"
+        ],
+        "lpm_firewall_modes": [
+          "off"
+        ],
+        "lpm_binaries": [
+          {
+            "name": "baseline",
+            "path": "/tmp/lpm-next-install-costs/lpm-known-size"
+          },
+          {
+            "name": "candidate",
+            "path": "/tmp/lpm-next-install-costs/lpm-timeline"
+          }
+        ],
+        "lpm_cells": [
+          {
+            "name": "current",
+            "env": {}
+          }
+        ],
+        "lpm_comparison": {
+          "baseline": "baseline",
+          "candidate": "candidate",
+          "thresholds": {
+            "wall_ms": {
+              "median_pct": 5,
+              "p95_pct": 10,
+              "median_abs": 20,
+              "p95_abs": 50
+            },
+            "max_rss_bytes": {
+              "median_pct": 5,
+              "p95_pct": 10,
+              "median_abs": 16777216,
+              "p95_abs": 33554432
+            }
+          }
+        },
+        "lpm_typosquat_guard": "default",
+        "script_policy": "ignore",
+        "timeout_ms": 600000,
+        "output_dir": "/tmp/lpm-next-install-costs/timeline-readiness-scored-final",
+        "run_specs": [
+          "lpm-baseline",
+          "lpm-candidate",
+          "bun"
+        ]
+      }
+    },
+    "timeline-readiness-same-binary": {
+      "rows": 432,
+      "rows_sha256": "22568b283e3e8e5946e7e84107c1dfb7f513d880aae627e5c1301b438745a621",
+      "plan": {
+        "samples": 12,
+        "fixtures": [
+          {
+            "name": "vite-react",
+            "kind": "path",
+            "path": "bench/audit-fixtures/peer-heavy/vite-react",
+            "absolute_path": "/Users/tolga/.codex/worktrees/install-overhead/rust-client/bench/audit-fixtures/peer-heavy/vite-react"
+          },
+          {
+            "name": "native-sharp",
+            "kind": "path",
+            "path": "bench/audit-fixtures/native/sharp-image",
+            "absolute_path": "/Users/tolga/.codex/worktrees/install-overhead/rust-client/bench/audit-fixtures/native/sharp-image"
+          },
+          {
+            "name": "nest",
+            "kind": "path",
+            "path": "bench/audit-fixtures/peer-heavy/nestjs-deep",
+            "absolute_path": "/Users/tolga/.codex/worktrees/install-overhead/rust-client/bench/audit-fixtures/peer-heavy/nestjs-deep"
+          },
+          {
+            "name": "t3",
+            "kind": "path",
+            "path": "bench/audit-fixtures/t3-install",
+            "absolute_path": "/Users/tolga/.codex/worktrees/install-overhead/rust-client/bench/audit-fixtures/t3-install"
+          }
+        ],
+        "managers": [
+          "lpm",
+          "bun"
+        ],
+        "modes": [
+          "cold",
+          "warm",
+          "up-to-date"
+        ],
+        "lpm_routes": [
+          "direct"
+        ],
+        "lpm_firewall_modes": [
+          "off"
+        ],
+        "lpm_binaries": [
+          {
+            "name": "baseline",
+            "path": "/tmp/lpm-next-install-costs/lpm-known-size"
+          },
+          {
+            "name": "candidate",
+            "path": "/tmp/lpm-next-install-costs/lpm-known-size"
+          }
+        ],
+        "lpm_cells": [
+          {
+            "name": "current",
+            "env": {}
+          }
+        ],
+        "lpm_comparison": {
+          "baseline": "baseline",
+          "candidate": "candidate",
+          "thresholds": {
+            "wall_ms": {
+              "median_pct": 5,
+              "p95_pct": 10,
+              "median_abs": 20,
+              "p95_abs": 50
+            },
+            "max_rss_bytes": {
+              "median_pct": 5,
+              "p95_pct": 10,
+              "median_abs": 16777216,
+              "p95_abs": 33554432
+            }
+          }
+        },
+        "lpm_typosquat_guard": "default",
+        "script_policy": "ignore",
+        "timeout_ms": 600000,
+        "output_dir": "/tmp/lpm-next-install-costs/timeline-readiness-same-binary",
+        "run_specs": [
+          "lpm-baseline",
+          "lpm-candidate",
+          "bun"
+        ]
+      }
+    },
+    "timeline-readiness-reversed-labels": {
+      "rows": 432,
+      "rows_sha256": "758de3335b4ec2eff43bd1ad88ecdcbad701b2984632fac74ef9bb567c89215c",
+      "plan": {
+        "samples": 12,
+        "fixtures": [
+          {
+            "name": "vite-react",
+            "kind": "path",
+            "path": "bench/audit-fixtures/peer-heavy/vite-react",
+            "absolute_path": "/Users/tolga/.codex/worktrees/install-overhead/rust-client/bench/audit-fixtures/peer-heavy/vite-react"
+          },
+          {
+            "name": "native-sharp",
+            "kind": "path",
+            "path": "bench/audit-fixtures/native/sharp-image",
+            "absolute_path": "/Users/tolga/.codex/worktrees/install-overhead/rust-client/bench/audit-fixtures/native/sharp-image"
+          },
+          {
+            "name": "nest",
+            "kind": "path",
+            "path": "bench/audit-fixtures/peer-heavy/nestjs-deep",
+            "absolute_path": "/Users/tolga/.codex/worktrees/install-overhead/rust-client/bench/audit-fixtures/peer-heavy/nestjs-deep"
+          },
+          {
+            "name": "t3",
+            "kind": "path",
+            "path": "bench/audit-fixtures/t3-install",
+            "absolute_path": "/Users/tolga/.codex/worktrees/install-overhead/rust-client/bench/audit-fixtures/t3-install"
+          }
+        ],
+        "managers": [
+          "lpm",
+          "bun"
+        ],
+        "modes": [
+          "cold",
+          "warm",
+          "up-to-date"
+        ],
+        "lpm_routes": [
+          "direct"
+        ],
+        "lpm_firewall_modes": [
+          "off"
+        ],
+        "lpm_binaries": [
+          {
+            "name": "baseline",
+            "path": "/tmp/lpm-next-install-costs/lpm-timeline"
+          },
+          {
+            "name": "candidate",
+            "path": "/tmp/lpm-next-install-costs/lpm-known-size"
+          }
+        ],
+        "lpm_cells": [
+          {
+            "name": "current",
+            "env": {}
+          }
+        ],
+        "lpm_comparison": {
+          "baseline": "baseline",
+          "candidate": "candidate",
+          "thresholds": {
+            "wall_ms": {
+              "median_pct": 5,
+              "p95_pct": 10,
+              "median_abs": 20,
+              "p95_abs": 50
+            },
+            "max_rss_bytes": {
+              "median_pct": 5,
+              "p95_pct": 10,
+              "median_abs": 16777216,
+              "p95_abs": 33554432
+            }
+          }
+        },
+        "lpm_typosquat_guard": "default",
+        "script_policy": "ignore",
+        "timeout_ms": 600000,
+        "output_dir": "/tmp/lpm-next-install-costs/timeline-readiness-reversed-labels",
+        "run_specs": [
+          "lpm-baseline",
+          "lpm-candidate",
+          "bun"
+        ]
+      }
+    }
+  },
+  "gates": [
+    {
+      "name": "tracy-check",
+      "returncode": 0,
+      "seconds": 19.558967113494873,
+      "command": [
+        "cargo",
+        "check",
+        "--locked",
+        "-p",
+        "lpm-cli",
+        "--features",
+        "tracy"
+      ]
+    },
+    {
+      "name": "format",
+      "returncode": 0,
+      "seconds": 6.3698320388793945,
+      "command": [
+        "cargo",
+        "fmt",
+        "--all"
+      ]
+    },
+    {
+      "name": "clippy",
+      "returncode": 101,
+      "seconds": 6.053431987762451,
+      "command": [
+        "cargo",
+        "clippy",
+        "--workspace",
+        "--all-targets",
+        "--locked",
+        "--",
+        "-D",
+        "warnings"
+      ]
+    },
+    {
+      "name": "clippy",
+      "returncode": 0,
+      "seconds": 51.399553060531616,
+      "command": [
+        "cargo",
+        "clippy",
+        "--workspace",
+        "--all-targets",
+        "--locked",
+        "--",
+        "-D",
+        "warnings"
+      ]
+    },
+    {
+      "name": "fmt",
+      "returncode": 0,
+      "seconds": 6.5085461139678955,
+      "command": [
+        "cargo",
+        "fmt",
+        "--check"
+      ]
+    },
+    {
+      "name": "workspace-build",
+      "returncode": 0,
+      "seconds": 28.3787260055542,
+      "command": [
+        "cargo",
+        "build",
+        "--workspace",
+        "--locked"
+      ]
+    },
+    {
+      "name": "libraries",
+      "returncode": 100,
+      "seconds": 113.99381303787231,
+      "command": [
+        "cargo",
+        "nextest",
+        "run",
+        "--locked",
+        "--workspace",
+        "--exclude",
+        "lpm-workflows",
+        "--exclude",
+        "lpm-cli",
+        "--no-fail-fast",
+        "--status-level",
+        "slow",
+        "--final-status-level",
+        "fail"
+      ]
+    },
+    {
+      "name": "clippy",
+      "returncode": 0,
+      "seconds": 1.2667310237884521,
+      "command": [
+        "cargo",
+        "clippy",
+        "--workspace",
+        "--all-targets",
+        "--locked",
+        "--",
+        "-D",
+        "warnings"
+      ]
+    },
+    {
+      "name": "fmt",
+      "returncode": 0,
+      "seconds": 6.501780986785889,
+      "command": [
+        "cargo",
+        "fmt",
+        "--check"
+      ]
+    },
+    {
+      "name": "workspace-build",
+      "returncode": 0,
+      "seconds": 0.42013001441955566,
+      "command": [
+        "cargo",
+        "build",
+        "--workspace",
+        "--locked"
+      ]
+    },
+    {
+      "name": "libraries",
+      "returncode": 0,
+      "seconds": 53.9673228263855,
+      "command": [
+        "cargo",
+        "nextest",
+        "run",
+        "--locked",
+        "--workspace",
+        "--exclude",
+        "lpm-workflows",
+        "--exclude",
+        "lpm-cli",
+        "--no-fail-fast",
+        "--status-level",
+        "slow",
+        "--final-status-level",
+        "fail"
+      ]
+    },
+    {
+      "name": "cli-unit",
+      "returncode": 0,
+      "seconds": 106.77051591873169,
+      "command": [
+        "cargo",
+        "test",
+        "--locked",
+        "-p",
+        "lpm-cli",
+        "--bin",
+        "lpm-rs",
+        "--",
+        "--test-threads=1"
+      ]
+    },
+    {
+      "name": "cli-surface",
+      "returncode": 0,
+      "seconds": 43.6194748878479,
+      "command": [
+        "cargo",
+        "nextest",
+        "run",
+        "--locked",
+        "-p",
+        "lpm-cli",
+        "-E",
+        "not binary_id(/bin\\/lpm-rs/)",
+        "--no-fail-fast",
+        "--status-level",
+        "slow",
+        "--final-status-level",
+        "fail"
+      ]
+    },
+    {
+      "name": "install-workflows",
+      "returncode": 0,
+      "seconds": 76.68229794502258,
+      "command": [
+        "scripts/ci/with-hermetic-workflow-cli.sh",
+        "cargo",
+        "nextest",
+        "run",
+        "--locked",
+        "-p",
+        "lpm-workflows",
+        "--test",
+        "install_timeline",
+        "--test",
+        "install_freshness",
+        "--test",
+        "install_cached_entries",
+        "--test",
+        "pnpm_compat_peer",
+        "--test",
+        "add",
+        "--test",
+        "upgrade",
+        "--test",
+        "install",
+        "--test",
+        "install_metadata",
+        "--test",
+        "install_speculation",
+        "--test",
+        "install_local_tarball",
+        "--test",
+        "lifecycle_containment",
+        "--test",
+        "native_build_cache",
+        "--test",
+        "registry_credentials",
+        "--test",
+        "health",
+        "--test",
+        "workspace_install",
+        "--test",
+        "ci",
+        "--test",
+        "json_output",
+        "--test",
+        "install_concurrency",
+        "--test",
+        "store",
+        "--test",
+        "install_node_modules",
+        "--test",
+        "install_patches",
+        "--no-fail-fast",
+        "--status-level",
+        "slow",
+        "--final-status-level",
+        "fail"
+      ]
+    },
+    {
+      "name": "clippy",
+      "returncode": 0,
+      "seconds": 32.57129383087158,
+      "command": [
+        "cargo",
+        "clippy",
+        "--workspace",
+        "--all-targets",
+        "--locked",
+        "--",
+        "-D",
+        "warnings"
+      ]
+    },
+    {
+      "name": "fmt",
+      "returncode": 0,
+      "seconds": 6.812058925628662,
+      "command": [
+        "cargo",
+        "fmt",
+        "--check"
+      ]
+    },
+    {
+      "name": "workspace-build",
+      "returncode": 0,
+      "seconds": 27.045852184295654,
+      "command": [
+        "cargo",
+        "build",
+        "--workspace",
+        "--locked"
+      ]
+    },
+    {
+      "name": "libraries",
+      "returncode": 0,
+      "seconds": 43.167969703674316,
+      "command": [
+        "cargo",
+        "nextest",
+        "run",
+        "--locked",
+        "--workspace",
+        "--exclude",
+        "lpm-workflows",
+        "--exclude",
+        "lpm-cli",
+        "--no-fail-fast",
+        "--status-level",
+        "slow",
+        "--final-status-level",
+        "fail"
+      ]
+    },
+    {
+      "name": "cli-unit",
+      "returncode": 0,
+      "seconds": 97.51517295837402,
+      "command": [
+        "cargo",
+        "test",
+        "--locked",
+        "-p",
+        "lpm-cli",
+        "--bin",
+        "lpm-rs",
+        "--",
+        "--test-threads=1"
+      ]
+    },
+    {
+      "name": "cli-surface",
+      "returncode": 0,
+      "seconds": 46.805785179138184,
+      "command": [
+        "cargo",
+        "nextest",
+        "run",
+        "--locked",
+        "-p",
+        "lpm-cli",
+        "-E",
+        "not binary_id(/bin\\/lpm-rs/)",
+        "--no-fail-fast",
+        "--status-level",
+        "slow",
+        "--final-status-level",
+        "fail"
+      ]
+    },
+    {
+      "name": "install-workflows",
+      "returncode": 0,
+      "seconds": 45.775437116622925,
+      "command": [
+        "scripts/ci/with-hermetic-workflow-cli.sh",
+        "cargo",
+        "nextest",
+        "run",
+        "--locked",
+        "-p",
+        "lpm-workflows",
+        "--test",
+        "policy_extensions",
+        "--test",
+        "install_timeline",
+        "--test",
+        "install_freshness",
+        "--test",
+        "install_cached_entries",
+        "--test",
+        "pnpm_compat_peer",
+        "--test",
+        "add",
+        "--test",
+        "upgrade",
+        "--test",
+        "install",
+        "--test",
+        "install_metadata",
+        "--test",
+        "install_speculation",
+        "--test",
+        "install_local_tarball",
+        "--test",
+        "lifecycle_containment",
+        "--test",
+        "native_build_cache",
+        "--test",
+        "registry_credentials",
+        "--test",
+        "health",
+        "--test",
+        "workspace_install",
+        "--test",
+        "ci",
+        "--test",
+        "json_output",
+        "--test",
+        "install_concurrency",
+        "--test",
+        "store",
+        "--test",
+        "install_node_modules",
+        "--test",
+        "install_patches",
+        "--no-fail-fast",
+        "--status-level",
+        "slow",
+        "--final-status-level",
+        "fail"
+      ]
+    }
+  ],
+  "helper_gates": [
+    {
+      "command": [
+        "sh",
+        "tests/install-sh/run.sh"
+      ],
+      "returncode": 0
+    },
+    {
+      "command": [
+        "node",
+        "bench/scripts/run-install-readiness.mjs",
+        "--self-test"
+      ],
+      "returncode": 0
+    },
+    {
+      "command": [
+        "node",
+        "bench/scripts/run-t3-install-six-states.mjs",
+        "--self-test"
+      ],
+      "returncode": 0
+    },
+    {
+      "command": [
+        "node",
+        "bench/scripts/run-runtime-readiness.mjs",
+        "--self-test"
+      ],
+      "returncode": 0
+    },
+    {
+      "command": [
+        "bash",
+        "scripts/ci/test-install-apt-packages.sh"
+      ],
+      "returncode": 0
+    },
+    {
+      "command": [
+        "bash",
+        "scripts/ci/test-macos-keychain-search-list.sh"
+      ],
+      "returncode": 0
+    },
+    {
+      "command": [
+        "bash",
+        "bench/test-audit-install-args.sh"
+      ],
+      "returncode": 0
+    },
+    {
+      "command": [
+        "python3",
+        "bench/source-analysis/test_corpus.py"
+      ],
+      "returncode": 0
+    },
+    {
+      "command": [
+        "python3",
+        "bench/test_audit_install_timeout.py"
+      ],
+      "returncode": 0
+    },
+    {
+      "command": [
+        "python3",
+        "bench/audit-fixtures/test_classify_result.py"
+      ],
+      "returncode": 0
+    },
+    {
+      "command": [
+        "bash",
+        "bench/test-local-install.sh"
+      ],
+      "returncode": 0
+    },
+    {
+      "command": [
+        "bash",
+        "bench/test-live-metadata-route.sh"
+      ],
+      "returncode": 0
+    },
+    {
+      "command": [
+        "bash",
+        "bench/test-run-readme.sh"
+      ],
+      "returncode": 0
+    },
+    {
+      "command": [
+        "bash",
+        "scripts/ci/test-with-hermetic-workflow-cli.sh"
+      ],
+      "returncode": 0
+    },
+    {
+      "command": [
+        "npm",
+        "--prefix",
+        "npm/cli",
+        "test"
+      ],
+      "returncode": 0
+    },
+    {
+      "command": [
+        "npm",
+        "--prefix",
+        "npm/cli",
+        "run",
+        "pack:check"
+      ],
+      "returncode": 0
+    },
+    {
+      "command": [
+        "node",
+        "--test",
+        "/Users/tolga/.codex/worktrees/install-overhead/rust-client/npm/release/tests/verify-published-package.test.mjs",
+        "/Users/tolga/.codex/worktrees/install-overhead/rust-client/npm/release/tests/nightly-version.test.mjs",
+        "/Users/tolga/.codex/worktrees/install-overhead/rust-client/npm/release/tests/nightly-release-state.test.mjs",
+        "/Users/tolga/.codex/worktrees/install-overhead/rust-client/npm/release/tests/release-policy.test.mjs",
+        "/Users/tolga/.codex/worktrees/install-overhead/rust-client/npm/release/tests/validate-release-candidate-source.test.mjs",
+        "/Users/tolga/.codex/worktrees/install-overhead/rust-client/npm/release/tests/verify-packages.test.mjs",
+        "/Users/tolga/.codex/worktrees/install-overhead/rust-client/npm/release/tests/rust-toolchain-policy.test.mjs",
+        "/Users/tolga/.codex/worktrees/install-overhead/rust-client/npm/release/tests/release-hardening-policy.test.mjs",
+        "/Users/tolga/.codex/worktrees/install-overhead/rust-client/npm/release/tests/acceptance-artifact-policy.test.mjs",
+        "/Users/tolga/.codex/worktrees/install-overhead/rust-client/npm/release/tests/release-api-contract.test.mjs",
+        "/Users/tolga/.codex/worktrees/install-overhead/rust-client/npm/release/tests/ci-policy.test.mjs",
+        "/Users/tolga/.codex/worktrees/install-overhead/rust-client/npm/release/tests/linux-glibc-compatibility.test.mjs",
+        "/Users/tolga/.codex/worktrees/install-overhead/rust-client/npm/release/tests/validate-recovery-source.test.mjs",
+        "/Users/tolga/.codex/worktrees/install-overhead/rust-client/npm/release/tests/stable-release-policy.test.mjs",
+        "/Users/tolga/.codex/worktrees/install-overhead/rust-client/npm/release/tests/release-artifacts.test.mjs",
+        "/Users/tolga/.codex/worktrees/install-overhead/rust-client/npm/release/tests/release-candidate.test.mjs"
+      ],
+      "returncode": 0
+    }
+  ],
+  "benchmark_status": [
+    {
+      "name": "frozen-nest",
+      "command": [
+        "node",
+        "/tmp/lpm-next-install-costs/run-timeline-nest-frozen.mjs"
+      ],
+      "returncode": 0,
+      "seconds": 71.1555609703064
+    },
+    {
+      "name": "frozen-vite",
+      "command": [
+        "node",
+        "/tmp/lpm-next-install-costs/run-timeline-vite-frozen.mjs"
+      ],
+      "returncode": 0,
+      "seconds": 74.47924518585205
+    },
+    {
+      "name": "live-nest",
+      "command": [
+        "node",
+        "/tmp/lpm-next-install-costs/timeline-live-runner.mjs",
+        "/tmp/lpm-next-install-costs/timeline-live-nest-config.json"
+      ],
+      "returncode": 0,
+      "seconds": 25.17552423477173
+    },
+    {
+      "name": "live-t3",
+      "command": [
+        "node",
+        "/tmp/lpm-next-install-costs/timeline-live-runner.mjs",
+        "/tmp/lpm-next-install-costs/timeline-live-t3-config.json"
+      ],
+      "returncode": 0,
+      "seconds": 14.459686040878296
+    },
+    {
+      "name": "readiness-warmup",
+      "command": [
+        "node",
+        "bench/scripts/run-install-readiness.mjs",
+        "--fixtures",
+        "vite-react,native-sharp,nest,t3=/Users/tolga/.codex/worktrees/install-overhead/rust-client/bench/audit-fixtures/t3-install",
+        "--managers",
+        "lpm,bun",
+        "--lpm-routes",
+        "direct",
+        "--lpm-firewall-modes",
+        "off",
+        "--lpm-binary",
+        "baseline=/tmp/lpm-next-install-costs/lpm-known-size",
+        "--lpm-binary",
+        "candidate=/tmp/lpm-next-install-costs/lpm-timeline",
+        "--lpm-compare",
+        "baseline:candidate",
+        "--allow-inconclusive",
+        "--modes",
+        "cold,warm,up-to-date",
+        "--samples",
+        "1",
+        "--output",
+        "/tmp/lpm-next-install-costs/timeline-readiness-warmup"
+      ],
+      "returncode": 0,
+      "seconds": 17.878061056137085
+    },
+    {
+      "name": "readiness-scored",
+      "command": [
+        "node",
+        "bench/scripts/run-install-readiness.mjs",
+        "--fixtures",
+        "vite-react,native-sharp,nest,t3=/Users/tolga/.codex/worktrees/install-overhead/rust-client/bench/audit-fixtures/t3-install",
+        "--managers",
+        "lpm,bun",
+        "--lpm-routes",
+        "direct",
+        "--lpm-firewall-modes",
+        "off",
+        "--lpm-binary",
+        "baseline=/tmp/lpm-next-install-costs/lpm-known-size",
+        "--lpm-binary",
+        "candidate=/tmp/lpm-next-install-costs/lpm-timeline",
+        "--lpm-compare",
+        "baseline:candidate",
+        "--allow-inconclusive",
+        "--modes",
+        "cold,warm,up-to-date",
+        "--samples",
+        "12",
+        "--output",
+        "/tmp/lpm-next-install-costs/timeline-readiness-scored"
+      ],
+      "returncode": 1,
+      "seconds": 318.1773519515991
+    }
+  ],
+  "final_benchmark_status": [
+    {
+      "name": "frozen-nest",
+      "command": [
+        "node",
+        "/tmp/lpm-next-install-costs/run-timeline-nest-final.mjs"
+      ],
+      "returncode": 0,
+      "seconds": 70.44415521621704
+    },
+    {
+      "name": "frozen-vite",
+      "command": [
+        "node",
+        "/tmp/lpm-next-install-costs/run-timeline-vite-final.mjs"
+      ],
+      "returncode": 0,
+      "seconds": 74.37877893447876
+    },
+    {
+      "name": "frozen-sharp",
+      "command": [
+        "node",
+        "/tmp/lpm-next-install-costs/run-timeline-sharp-final.mjs"
+      ],
+      "returncode": 0,
+      "seconds": 22.823175191879272
+    },
+    {
+      "name": "live-nest",
+      "command": [
+        "node",
+        "/tmp/lpm-next-install-costs/timeline-live-runner.mjs",
+        "/tmp/lpm-next-install-costs/timeline-live-nest-final-config.json"
+      ],
+      "returncode": 0,
+      "seconds": 25.01715612411499
+    },
+    {
+      "name": "live-t3",
+      "command": [
+        "node",
+        "/tmp/lpm-next-install-costs/timeline-live-runner.mjs",
+        "/tmp/lpm-next-install-costs/timeline-live-t3-final-config.json"
+      ],
+      "returncode": 0,
+      "seconds": 14.913965225219727
+    },
+    {
+      "name": "readiness-warmup",
+      "command": [
+        "node",
+        "bench/scripts/run-install-readiness.mjs",
+        "--fixtures",
+        "vite-react,native-sharp,nest,t3=/Users/tolga/.codex/worktrees/install-overhead/rust-client/bench/audit-fixtures/t3-install",
+        "--managers",
+        "lpm,bun",
+        "--lpm-routes",
+        "direct",
+        "--lpm-firewall-modes",
+        "off",
+        "--lpm-binary",
+        "baseline=/tmp/lpm-next-install-costs/lpm-known-size",
+        "--lpm-binary",
+        "candidate=/tmp/lpm-next-install-costs/lpm-timeline",
+        "--lpm-compare",
+        "baseline:candidate",
+        "--allow-inconclusive",
+        "--modes",
+        "cold,warm,up-to-date",
+        "--samples",
+        "1",
+        "--output",
+        "/tmp/lpm-next-install-costs/timeline-readiness-warmup-final"
+      ],
+      "returncode": 1,
+      "seconds": 18.404435873031616
+    },
+    {
+      "name": "readiness-scored",
+      "command": [
+        "node",
+        "bench/scripts/run-install-readiness.mjs",
+        "--fixtures",
+        "vite-react,native-sharp,nest,t3=/Users/tolga/.codex/worktrees/install-overhead/rust-client/bench/audit-fixtures/t3-install",
+        "--managers",
+        "lpm,bun",
+        "--lpm-routes",
+        "direct",
+        "--lpm-firewall-modes",
+        "off",
+        "--lpm-binary",
+        "baseline=/tmp/lpm-next-install-costs/lpm-known-size",
+        "--lpm-binary",
+        "candidate=/tmp/lpm-next-install-costs/lpm-timeline",
+        "--lpm-compare",
+        "baseline:candidate",
+        "--allow-inconclusive",
+        "--modes",
+        "cold,warm,up-to-date",
+        "--samples",
+        "12",
+        "--output",
+        "/tmp/lpm-next-install-costs/timeline-readiness-scored-final"
+      ],
+      "returncode": 1,
+      "seconds": 216.15322399139404,
+      "resume_reason": "The preserved one-round warmup failed its performance comparison with 36 successful installs. Run the originally planned 12-round cohort to evaluate repetition; no verdict is overridden."
+    }
+  ],
+  "scored_traces": 292,
+  "order_controls": {
+    "same-binary": {
+      "name": "same-binary",
+      "command": [
+        "node",
+        "bench/scripts/run-install-readiness.mjs",
+        "--fixtures",
+        "vite-react,native-sharp,nest,t3=/Users/tolga/.codex/worktrees/install-overhead/rust-client/bench/audit-fixtures/t3-install",
+        "--managers",
+        "lpm,bun",
+        "--lpm-routes",
+        "direct",
+        "--lpm-firewall-modes",
+        "off",
+        "--lpm-binary",
+        "baseline=/tmp/lpm-next-install-costs/lpm-known-size",
+        "--lpm-binary",
+        "candidate=/tmp/lpm-next-install-costs/lpm-known-size",
+        "--lpm-compare",
+        "baseline:candidate",
+        "--allow-inconclusive",
+        "--modes",
+        "cold,warm,up-to-date",
+        "--samples",
+        "12",
+        "--output",
+        "/tmp/lpm-next-install-costs/timeline-readiness-same-binary"
+      ],
+      "binaries": {
+        "baseline": {
+          "path": "/tmp/lpm-next-install-costs/lpm-known-size",
+          "sha256": "332844f48cda8726d682a613009d906bc0ba430f01704f595c26b139523094f0"
+        },
+        "candidate": {
+          "path": "/tmp/lpm-next-install-costs/lpm-known-size",
+          "sha256": "332844f48cda8726d682a613009d906bc0ba430f01704f595c26b139523094f0"
+        }
+      },
+      "reason": "Diagnose the repeated live Sharp difference with identical binaries, then exchange binary labels while preserving the preselected 12-round four-fixture matrix and execution order.",
+      "returncode": 1,
+      "seconds": 213.44083976745605
+    },
+    "reversed-labels": {
+      "name": "reversed-labels",
+      "command": [
+        "node",
+        "bench/scripts/run-install-readiness.mjs",
+        "--fixtures",
+        "vite-react,native-sharp,nest,t3=/Users/tolga/.codex/worktrees/install-overhead/rust-client/bench/audit-fixtures/t3-install",
+        "--managers",
+        "lpm,bun",
+        "--lpm-routes",
+        "direct",
+        "--lpm-firewall-modes",
+        "off",
+        "--lpm-binary",
+        "baseline=/tmp/lpm-next-install-costs/lpm-timeline",
+        "--lpm-binary",
+        "candidate=/tmp/lpm-next-install-costs/lpm-known-size",
+        "--lpm-compare",
+        "baseline:candidate",
+        "--allow-inconclusive",
+        "--modes",
+        "cold,warm,up-to-date",
+        "--samples",
+        "12",
+        "--output",
+        "/tmp/lpm-next-install-costs/timeline-readiness-reversed-labels"
+      ],
+      "binaries": {
+        "baseline": {
+          "path": "/tmp/lpm-next-install-costs/lpm-timeline",
+          "sha256": "cb7faaad32c197be418588b2d8c9134933a53187d8d062e6d64f26a4c08e512a"
+        },
+        "candidate": {
+          "path": "/tmp/lpm-next-install-costs/lpm-known-size",
+          "sha256": "332844f48cda8726d682a613009d906bc0ba430f01704f595c26b139523094f0"
+        }
+      },
+      "reason": "Diagnose the repeated live Sharp difference with identical binaries, then exchange binary labels while preserving the preselected 12-round four-fixture matrix and execution order.",
+      "returncode": 1,
+      "seconds": 216.12364077568054
+    }
+  },
+  "sharp_controls": [
+    {
+      "name": "sharp-prepare",
+      "command": [
+        "node",
+        "/tmp/lpm-next-install-costs/run-timeline-sharp-frozen.mjs",
+        "--prepare"
+      ],
+      "returncode": 0,
+      "seconds": 1.7595558166503906
+    },
+    {
+      "name": "sharp-frozen",
+      "command": [
+        "node",
+        "/tmp/lpm-next-install-costs/run-timeline-sharp-frozen.mjs"
+      ],
+      "returncode": 0,
+      "seconds": 20.779939651489258
+    },
+    {
+      "name": "sharp-live-confirmation",
+      "command": [
+        "node",
+        "/tmp/lpm-next-install-costs/timeline-live-runner.mjs",
+        "/tmp/lpm-next-install-costs/timeline-live-sharp-confirmation-config.json"
+      ],
+      "returncode": 0,
+      "seconds": 41.41664171218872
+    }
+  ],
+  "measurement_scripts_sha256": {
+    "run-timeline-benchmarks.py": "351c66b5092bbe617dc0745a8354a2fdde7360fd6ce7f7e5887dcc3781c24389",
+    "run-timeline-nest-frozen.mjs": "8a4ef4753909f1e6cef72562f8cfeab63ced6ea762d3aad77eb83d096be89709",
+    "run-timeline-vite-frozen.mjs": "452104df72d48b67e7641bab9226f53be86ffcd7fcee19d3a4a17f1bcde4c87d",
+    "run-timeline-sharp-frozen.mjs": "849181f6ce6c07be90f4fff7efd197c93d5874ef7948122938071d2755e9e6bf",
+    "run-timeline-sharp-controls.py": "053709404f387b63a21eed200d41bb17f75737545d90876713c35241dcd43924",
+    "timeline-live-sharp-confirmation-config.json": "7d4ebc5eb8a8c1a92658b7179cc8e6f3148e9c3edd0c6b084807e147b2a5aea6",
+    "timeline-replay-runner.mjs": "df3006dd111fe1f4be464543ca954c39d0b0e7bfb53f421fa309c0fa0088f13b",
+    "timeline-live-runner.mjs": "1842e1092d98b06d861cc20b9bacd87628c616c63124882233a1d4785f08f600",
+    "timeline-live-nest-config.json": "6471033448e658158c98f42ab2cf02bd3dc9a8d83bbd37587cf71583cdb85e3f",
+    "timeline-live-t3-config.json": "1f04fbc3e229994fab5063550aabeeac93f1f9a3c29ebae57b012a6309f62593",
+    "analyze-timelines.py": "79200e3d67cb9c78d79c4679a2a8f9d1cd206bf55dfa77fc26498324a2dcd50f",
+    "summarize-timeline-results.py": "5441209b05e462c7cf3d61819fab31b81c9dd4a91101f9b8a08c923a77700eb3",
+    "check-timeline-driver.py": "acb040e08a452acdd71fa47385972534c9c18b32a5e9de17ba70bf650b536b4c",
+    "check-timeline-analysis.py": "ac7cc2ea4f2860e2bb432a6f57113c78c5f0a43bd661fda8706a74760dccdb04",
+    "check-timeline-capture-path.py": "40102524622c712ef2220e099026599159ae588ea0ba6c7cc9fc4f26d819b47e",
+    "run-timeline-final-benchmarks.py": "463403f5164385a44a429d442f82e71090068e46c39f04c515415da785df4166",
+    "run-timeline-final-scored.py": "8a0aef4b2a08be7b8dd36bc82bb2eda83fcb41905056311bba7a1d9bdc6f8e70",
+    "run-timeline-order-control.py": "376e0301ef107b25a55aa5a2c726e674963a2845d41292ec8df68136157cf889",
+    "run-timeline-nest-final.mjs": "d89290e6141e40c3d098a6a7bb73086b869a193f2486d275f9dccc91655654e2",
+    "run-timeline-vite-final.mjs": "c97852ad570d1faeda1add187ac088fbe17e39a587f2170456bf59236699f361",
+    "run-timeline-sharp-final.mjs": "3ecd12d0e013b4e5f6bae7a4a5d5d68ec8b68de275339671b2bda56fad1e7a14",
+    "timeline-live-nest-final-config.json": "ea5030de737ab123c97d1e59fa1d9f6b27b9bdbdc24301b21c2e14f9aa6668bc",
+    "timeline-live-t3-final-config.json": "0bbb693aff8d3646552576315260910c1d3eef67948e43887318b495600d44b4"
+  },
+  "timeline-nest-frozen": {
+    "status": {
+      "code": 0,
+      "frozen": true,
+      "phase": "diagnostic-enabled-3",
+      "upstreamRequests": 0,
+      "fixtures": 100,
+      "misses": [],
+      "rejected": [],
+      "captures": []
+    },
+    "status_sha256": "a67a8eda58f56046673d45a15b8fe2676953700357ef0af0dd7532de7a32e9bc",
+    "parity_sha256": "458c775af2cd85a136f7e58449f78faeeac7a402796acdf7ae7165e0debedc9c"
+  },
+  "timeline-vite-frozen": {
+    "status": {
+      "code": 0,
+      "frozen": true,
+      "phase": "diagnostic-enabled-3",
+      "upstreamRequests": 0,
+      "fixtures": 283,
+      "misses": [],
+      "rejected": [],
+      "captures": []
+    },
+    "status_sha256": "c3b5ca5ea3186c020dbb82f62cc6353b91b70965a5860f573a74be832245f89b",
+    "parity_sha256": "3a89dea61b2503e968b8e776387fe3e9502dc6f06011b6c868d522e9db675fca"
+  },
+  "timeline-sharp-frozen": {
+    "status": {
+      "code": 0,
+      "frozen": true,
+      "phase": "diagnostic-enabled-3",
+      "upstreamRequests": 0,
+      "fixtures": 41,
+      "misses": [],
+      "rejected": [],
+      "captures": []
+    },
+    "status_sha256": "99a75be9706cb6f1f2477a6ca538181351c8c3d3fc8e59ced5d98d231008a39e",
+    "parity_sha256": "cb85ec517c77c887b071d79edf85c2679943f02526ea181d6c89f6226e34134a"
+  },
+  "timeline-nest-final": {
+    "status": {
+      "code": 0,
+      "frozen": true,
+      "phase": "diagnostic-enabled-3",
+      "upstreamRequests": 0,
+      "fixtures": 100,
+      "misses": [],
+      "rejected": [],
+      "captures": []
+    },
+    "status_sha256": "c740ec9201ac4b457032efdb2526cc17d9835e920159bde2a2ace10a30777168",
+    "parity_sha256": "458c775af2cd85a136f7e58449f78faeeac7a402796acdf7ae7165e0debedc9c"
+  },
+  "timeline-vite-final": {
+    "status": {
+      "code": 0,
+      "frozen": true,
+      "phase": "diagnostic-enabled-3",
+      "upstreamRequests": 0,
+      "fixtures": 283,
+      "misses": [],
+      "rejected": [],
+      "captures": []
+    },
+    "status_sha256": "cc6b307b557fb75c096e90bc693ae2f5e257fa7dbde9331d91ccfd5b9a463023",
+    "parity_sha256": "3a89dea61b2503e968b8e776387fe3e9502dc6f06011b6c868d522e9db675fca"
+  },
+  "timeline-sharp-final": {
+    "status": {
+      "code": 0,
+      "frozen": true,
+      "phase": "diagnostic-enabled-3",
+      "upstreamRequests": 0,
+      "fixtures": 41,
+      "misses": [],
+      "rejected": [],
+      "captures": []
+    },
+    "status_sha256": "6f8818a2afc2992aa0caeef01a15e6e4428b83a99e2f9b73072b6c069c77718c",
+    "parity_sha256": "cb85ec517c77c887b071d79edf85c2679943f02526ea181d6c89f6226e34134a"
+  }
+}

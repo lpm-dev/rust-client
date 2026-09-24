@@ -11,6 +11,7 @@
 
 mod output;
 mod pipeline;
+mod timeline;
 
 use flate2::read::GzDecoder;
 use lpm_common::{Integrity, LpmError};
@@ -1267,7 +1268,12 @@ where
     I: for<'a> FnMut(EntryInfo<'a>),
     E: ExtractionRecord,
 {
-    match decompress_gzip_libdeflate_with_limits_and_budget(&compressed, limits, budget)? {
+    let decoded = {
+        let _entered =
+            tracing::trace_span!(target: "lpm_install_timeline", "buffered_decode").entered();
+        decompress_gzip_libdeflate_with_limits_and_budget(&compressed, limits, budget)
+    }?;
+    match decoded {
         BufferedGzipDecode::Decoded(mut decompressed) => {
             if matches!(compressed, std::borrow::Cow::Owned(_)) {
                 drop(compressed);
@@ -1379,8 +1385,11 @@ where
     I: for<'a> FnMut(EntryInfo<'a>),
     E: ExtractionRecord,
 {
-    let decoder = GzDecoder::new(reader);
-    let limited = DecompressedLimitReader::new(decoder, limits.max_decompressed_stream_size());
+    let decoder = GzDecoder::new(timeline::TimelineReader::input(reader));
+    let limited = DecompressedLimitReader::new(
+        timeline::TimelineReader::decoded(decoder),
+        limits.max_decompressed_stream_size(),
+    );
     // Tar headers and small files otherwise re-enter inflate for each short read.
     let buffered = std::io::BufReader::with_capacity(64 * 1024, limited);
     extract_tar_archive_with_inspector(
@@ -1443,6 +1452,12 @@ impl<R: std::io::Read> std::io::Read for DecompressedLimitReader<R> {
 #[expect(
     clippy::too_many_arguments,
     reason = "The decode paths forward independent limits, hashing, and inspection controls."
+)]
+#[tracing::instrument(
+    target = "lpm_install_timeline",
+    level = "trace",
+    name = "tar_materialization",
+    skip_all
 )]
 fn extract_tar_archive_with_inspector<R, P, I, D, E>(
     reader: R,
@@ -1691,8 +1706,11 @@ fn list_tarball_contents_streaming<R: std::io::Read>(
     reader: R,
     limits: ExtractionLimits,
 ) -> Result<Vec<PathBuf>, LpmError> {
-    let decoder = GzDecoder::new(reader);
-    let limited = DecompressedLimitReader::new(decoder, limits.max_decompressed_stream_size());
+    let decoder = GzDecoder::new(timeline::TimelineReader::input(reader));
+    let limited = DecompressedLimitReader::new(
+        timeline::TimelineReader::decoded(decoder),
+        limits.max_decompressed_stream_size(),
+    );
     list_tar_archive_contents(limited, limits, |mut reader| {
         std::io::copy(&mut reader, &mut std::io::sink())
             .map(|_| ())
