@@ -41,6 +41,7 @@ mod package;
 mod patches;
 mod peer;
 pub(crate) mod policy_extensions;
+mod ready_file_admission;
 mod recursive;
 mod report_capture;
 mod reporting;

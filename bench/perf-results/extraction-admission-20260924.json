@@ -1,0 +1,449 @@
+{
+  "method": {
+    "samples_per_variant_per_state": 24,
+    "variants": [
+      "same release binary, scheduler disabled",
+      "same release binary, scheduler enabled",
+      "Bun 1.4.2"
+    ],
+    "order": "Balanced forward and reverse variant order; two warm gates",
+    "registry": "Immutable local HTTPS replay of captured npm responses; no upstream requests while scoring",
+    "node": "26.5.0 (runtime and library pinned)",
+    "percentile": "Nearest-rank observed p95; 24 samples do not establish p99",
+    "measurement": "External wall time and peak RSS; separate unscored timeline runs",
+    "interference": "No concurrent builds, tests, other install runs, or profiling during scored cohorts",
+    "parity_limit": "Package inventories, lockfile bytes and LPM object-content sidecar maps match. Sidecar parity is not independent full filesystem byte hashing.",
+    "platform": "macOS, Apple Silicon (M5 Pro), APFS",
+    "final_source_relationship": "Measured opt-in source and final source differ only in the default selector (enabled unless explicitly set to 0) and an added workspace cancellation test. The enabled scheduler algorithm is identical."
+  },
+  "binary_sha256": "b14f9cc1fbbb962ac92bc2921fdd10689709912226576697b1366e925fb27f87",
+  "parent_commit": "c26e170ca36287080f7f9eb024ba05519b0cde92",
+  "controls": {
+    "extract_permits": 4,
+    "streaming_weight": 3,
+    "download_permits": 24,
+    "link_tasks": 16,
+    "serial_link": false
+  },
+  "cohorts": [
+    {
+      "fixture": "t3-install",
+      "states": [
+        "ci-cold-cache"
+      ],
+      "summaries": [
+        {
+          "state": "ci-cold-cache",
+          "variant": "baseline",
+          "n": 24,
+          "median_ms": 1567.953813,
+          "p95_ms": 1822.317584,
+          "rss_median_mib": 204.4375,
+          "rss_p95_mib": 224.15625
+        },
+        {
+          "state": "ci-cold-cache",
+          "variant": "ready",
+          "n": 24,
+          "median_ms": 1514.9727505,
+          "p95_ms": 1616.564292,
+          "rss_median_mib": 208.203125,
+          "rss_p95_mib": 240.296875
+        },
+        {
+          "state": "ci-cold-cache",
+          "variant": "bun",
+          "n": 24,
+          "median_ms": 1410.6091040000001,
+          "p95_ms": 1569.742458,
+          "rss_median_mib": 232.875,
+          "rss_p95_mib": 257.15625
+        }
+      ],
+      "paired": {
+        "ci-cold-cache:ready": {
+          "median_delta_ms": -70.16322950000006,
+          "improved_pairs": 19
+        },
+        "ci-cold-cache:bun": {
+          "median_delta_ms": -135.81212549999998,
+          "improved_pairs": 23
+        }
+      },
+      "parity": [
+        {
+          "state": "ci-cold-cache",
+          "package_inventory_sha256": "6f46f4206fd354d547f1deabde2735833e7e8882148e6311118ef1490463cc81",
+          "lpm_lock_sha256": "551214d8128f9b40db2aa72d8159355b9dcfca52f9f167bdc5479a55b0f0be3a",
+          "lpm_content_digest_sha256": "624627d29bfeedde73b044ac8e2365d4f4c24337f9fb6dfec02aa1812a3e4a2c",
+          "complete_samples": 72
+        }
+      ],
+      "registry": {
+        "upstream_requests": 0,
+        "responses": 533
+      }
+    },
+    {
+      "fixture": "t3-install",
+      "states": [
+        "first-install"
+      ],
+      "summaries": [
+        {
+          "state": "first-install",
+          "variant": "baseline",
+          "n": 24,
+          "median_ms": 1730.2837295,
+          "p95_ms": 2213.80275,
+          "rss_median_mib": 341.65625,
+          "rss_p95_mib": 373.0
+        },
+        {
+          "state": "first-install",
+          "variant": "ready",
+          "n": 24,
+          "median_ms": 1653.1891660000001,
+          "p95_ms": 1922.074167,
+          "rss_median_mib": 342.7421875,
+          "rss_p95_mib": 373.03125
+        },
+        {
+          "state": "first-install",
+          "variant": "bun",
+          "n": 24,
+          "median_ms": 1510.173896,
+          "p95_ms": 1910.8685,
+          "rss_median_mib": 467.859375,
+          "rss_p95_mib": 485.09375
+        }
+      ],
+      "paired": {
+        "first-install:ready": {
+          "median_delta_ms": -181.35695900000007,
+          "improved_pairs": 16
+        },
+        "first-install:bun": {
+          "median_delta_ms": -239.262875,
+          "improved_pairs": 16
+        }
+      },
+      "parity": [
+        {
+          "state": "first-install",
+          "package_inventory_sha256": "6f46f4206fd354d547f1deabde2735833e7e8882148e6311118ef1490463cc81",
+          "lpm_lock_sha256": "551214d8128f9b40db2aa72d8159355b9dcfca52f9f167bdc5479a55b0f0be3a",
+          "lpm_content_digest_sha256": "624627d29bfeedde73b044ac8e2365d4f4c24337f9fb6dfec02aa1812a3e4a2c",
+          "complete_samples": 72
+        }
+      ],
+      "registry": {
+        "upstream_requests": 0,
+        "responses": 533
+      }
+    },
+    {
+      "fixture": "peer-heavy/vite-react",
+      "states": [
+        "first-install",
+        "ci-cold-cache"
+      ],
+      "summaries": [
+        {
+          "state": "first-install",
+          "variant": "baseline",
+          "n": 24,
+          "median_ms": 304.0153125,
+          "p95_ms": 371.266667,
+          "rss_median_mib": 191.46875,
+          "rss_p95_mib": 203.75
+        },
+        {
+          "state": "first-install",
+          "variant": "ready",
+          "n": 24,
+          "median_ms": 309.305708,
+          "p95_ms": 341.40275,
+          "rss_median_mib": 189.890625,
+          "rss_p95_mib": 202.34375
+        },
+        {
+          "state": "first-install",
+          "variant": "bun",
+          "n": 24,
+          "median_ms": 227.754583,
+          "p95_ms": 254.392875,
+          "rss_median_mib": 143.6953125,
+          "rss_p95_mib": 148.734375
+        },
+        {
+          "state": "ci-cold-cache",
+          "variant": "baseline",
+          "n": 24,
+          "median_ms": 281.5610835,
+          "p95_ms": 332.701083,
+          "rss_median_mib": 88.4453125,
+          "rss_p95_mib": 98.6875
+        },
+        {
+          "state": "ci-cold-cache",
+          "variant": "ready",
+          "n": 24,
+          "median_ms": 272.846521,
+          "p95_ms": 305.53175,
+          "rss_median_mib": 88.7265625,
+          "rss_p95_mib": 95.40625
+        },
+        {
+          "state": "ci-cold-cache",
+          "variant": "bun",
+          "n": 24,
+          "median_ms": 191.15560399999998,
+          "p95_ms": 224.836167,
+          "rss_median_mib": 57.15625,
+          "rss_p95_mib": 59.84375
+        }
+      ],
+      "paired": {
+        "first-install:ready": {
+          "median_delta_ms": -1.0370005000000049,
+          "improved_pairs": 15
+        },
+        "first-install:bun": {
+          "median_delta_ms": -89.80260400000002,
+          "improved_pairs": 24
+        },
+        "ci-cold-cache:ready": {
+          "median_delta_ms": -6.5779999999999745,
+          "improved_pairs": 14
+        },
+        "ci-cold-cache:bun": {
+          "median_delta_ms": -87.28041649999999,
+          "improved_pairs": 23
+        }
+      },
+      "parity": [
+        {
+          "state": "first-install",
+          "package_inventory_sha256": "738f9998eb6bce82f5274689f5354eab2a82a720dd276694556fa246d055a71f",
+          "lpm_lock_sha256": "fc8873c9b5475a31ccb43f4d9ef4a616fdaf323eb6264180b979d725c4a75f22",
+          "lpm_content_digest_sha256": "91d4ae7cb1c9f5cc7371ce635ecfece9f5d3aaa129e379db6abc43bdcca1e25e",
+          "complete_samples": 72
+        },
+        {
+          "state": "ci-cold-cache",
+          "package_inventory_sha256": "738f9998eb6bce82f5274689f5354eab2a82a720dd276694556fa246d055a71f",
+          "lpm_lock_sha256": "fc8873c9b5475a31ccb43f4d9ef4a616fdaf323eb6264180b979d725c4a75f22",
+          "lpm_content_digest_sha256": "91d4ae7cb1c9f5cc7371ce635ecfece9f5d3aaa129e379db6abc43bdcca1e25e",
+          "complete_samples": 72
+        }
+      ],
+      "registry": {
+        "upstream_requests": 0,
+        "responses": 342
+      }
+    },
+    {
+      "fixture": "native/sharp-image",
+      "states": [
+        "first-install",
+        "ci-cold-cache"
+      ],
+      "summaries": [
+        {
+          "state": "first-install",
+          "variant": "baseline",
+          "n": 24,
+          "median_ms": 123.94125,
+          "p95_ms": 131.166834,
+          "rss_median_mib": 57.6328125,
+          "rss_p95_mib": 60.828125
+        },
+        {
+          "state": "first-install",
+          "variant": "ready",
+          "n": 24,
+          "median_ms": 126.1530415,
+          "p95_ms": 129.472542,
+          "rss_median_mib": 57.9765625,
+          "rss_p95_mib": 61.734375
+        },
+        {
+          "state": "first-install",
+          "variant": "bun",
+          "n": 24,
+          "median_ms": 67.6728755,
+          "p95_ms": 71.964625,
+          "rss_median_mib": 38.7578125,
+          "rss_p95_mib": 39.984375
+        },
+        {
+          "state": "ci-cold-cache",
+          "variant": "baseline",
+          "n": 24,
+          "median_ms": 81.56662449999999,
+          "p95_ms": 84.845959,
+          "rss_median_mib": 46.265625,
+          "rss_p95_mib": 47.625
+        },
+        {
+          "state": "ci-cold-cache",
+          "variant": "ready",
+          "n": 24,
+          "median_ms": 81.754125,
+          "p95_ms": 86.494209,
+          "rss_median_mib": 46.5,
+          "rss_p95_mib": 47.796875
+        },
+        {
+          "state": "ci-cold-cache",
+          "variant": "bun",
+          "n": 24,
+          "median_ms": 54.262521,
+          "p95_ms": 61.561084,
+          "rss_median_mib": 30.8203125,
+          "rss_p95_mib": 33.1875
+        }
+      ],
+      "paired": {
+        "first-install:ready": {
+          "median_delta_ms": -0.3598545000000044,
+          "improved_pairs": 13
+        },
+        "first-install:bun": {
+          "median_delta_ms": -56.341562499999995,
+          "improved_pairs": 24
+        },
+        "ci-cold-cache:ready": {
+          "median_delta_ms": 0.09587450000000786,
+          "improved_pairs": 9
+        },
+        "ci-cold-cache:bun": {
+          "median_delta_ms": -27.896625,
+          "improved_pairs": 24
+        }
+      },
+      "parity": [
+        {
+          "state": "first-install",
+          "package_inventory_sha256": "adbf30aca830e5286da24100389a2756ecaf1868293407a8eaff445c1592b520",
+          "lpm_lock_sha256": "a3443f79de995ae4137e83bc8f75214e8edc0e77bcf37590256736df00b5c94a",
+          "lpm_content_digest_sha256": "d2f405aa33e8133fe7e27490799fe2ae1a69b459bc6199bbd267a1c27c8811a3",
+          "complete_samples": 72
+        },
+        {
+          "state": "ci-cold-cache",
+          "package_inventory_sha256": "adbf30aca830e5286da24100389a2756ecaf1868293407a8eaff445c1592b520",
+          "lpm_lock_sha256": "a3443f79de995ae4137e83bc8f75214e8edc0e77bcf37590256736df00b5c94a",
+          "lpm_content_digest_sha256": "d2f405aa33e8133fe7e27490799fe2ae1a69b459bc6199bbd267a1c27c8811a3",
+          "complete_samples": 72
+        }
+      ],
+      "registry": {
+        "upstream_requests": 0,
+        "responses": 84
+      }
+    },
+    {
+      "fixture": "peer-heavy/nestjs-deep",
+      "states": [
+        "first-install",
+        "ci-cold-cache"
+      ],
+      "summaries": [
+        {
+          "state": "first-install",
+          "variant": "baseline",
+          "n": 24,
+          "median_ms": 336.1216045,
+          "p95_ms": 355.568167,
+          "rss_median_mib": 77.1484375,
+          "rss_p95_mib": 83.75
+        },
+        {
+          "state": "first-install",
+          "variant": "ready",
+          "n": 24,
+          "median_ms": 338.010521,
+          "p95_ms": 353.0675,
+          "rss_median_mib": 77.734375,
+          "rss_p95_mib": 81.75
+        },
+        {
+          "state": "first-install",
+          "variant": "bun",
+          "n": 24,
+          "median_ms": 228.963146,
+          "p95_ms": 296.850208,
+          "rss_median_mib": 43.46875,
+          "rss_p95_mib": 44.46875
+        },
+        {
+          "state": "ci-cold-cache",
+          "variant": "baseline",
+          "n": 24,
+          "median_ms": 324.333979,
+          "p95_ms": 381.780375,
+          "rss_median_mib": 51.953125,
+          "rss_p95_mib": 59.359375
+        },
+        {
+          "state": "ci-cold-cache",
+          "variant": "ready",
+          "n": 24,
+          "median_ms": 322.54291650000005,
+          "p95_ms": 340.146584,
+          "rss_median_mib": 52.4765625,
+          "rss_p95_mib": 57.921875
+        },
+        {
+          "state": "ci-cold-cache",
+          "variant": "bun",
+          "n": 24,
+          "median_ms": 231.212292,
+          "p95_ms": 287.531292,
+          "rss_median_mib": 28.671875,
+          "rss_p95_mib": 29.484375
+        }
+      ],
+      "paired": {
+        "first-install:ready": {
+          "median_delta_ms": -2.02162450000003,
+          "improved_pairs": 13
+        },
+        "first-install:bun": {
+          "median_delta_ms": -73.604896,
+          "improved_pairs": 24
+        },
+        "ci-cold-cache:ready": {
+          "median_delta_ms": -5.086771499999969,
+          "improved_pairs": 14
+        },
+        "ci-cold-cache:bun": {
+          "median_delta_ms": -75.4608745,
+          "improved_pairs": 23
+        }
+      },
+      "parity": [
+        {
+          "state": "first-install",
+          "package_inventory_sha256": "5a695435c264cb3156ec2fe190ba977acb42eed418cfb13de525a8d77c45234c",
+          "lpm_lock_sha256": "e4301fb934532e0b80b60069b72797b7332831b5e38202f55f21d1b719d4126c",
+          "lpm_content_digest_sha256": "8f1f1c473605c89a8244e82c3eeee3850dd3acb67a3cce363c440978ffdf03e6",
+          "complete_samples": 72
+        },
+        {
+          "state": "ci-cold-cache",
+          "package_inventory_sha256": "5a695435c264cb3156ec2fe190ba977acb42eed418cfb13de525a8d77c45234c",
+          "lpm_lock_sha256": "e4301fb934532e0b80b60069b72797b7332831b5e38202f55f21d1b719d4126c",
+          "lpm_content_digest_sha256": "8f1f1c473605c89a8244e82c3eeee3850dd3acb67a3cce363c440978ffdf03e6",
+          "complete_samples": 72
+        }
+      ],
+      "registry": {
+        "upstream_requests": 0,
+        "responses": 126
+      }
+    }
+  ]
+}

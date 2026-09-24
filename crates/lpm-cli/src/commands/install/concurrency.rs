@@ -1,5 +1,6 @@
 use futures::StreamExt;
 use lpm_linker::MaterializedPackage;
+use tracing::Instrument as _;
 
 use super::*;
 
@@ -139,25 +140,32 @@ pub(super) fn spawn_v2_link_task(
             .dispatch_link(plan, target, store)
             .map(V2LinkHandle::Workspace);
     }
+    let span = tracing::trace_span!(target: "lpm_install_timeline", "v2_link_task");
     Ok(V2LinkHandle::Task(tokio::spawn(async move {
+        tracing::event!(name: "admission_start", target: "lpm_install_timeline", tracing::Level::TRACE, {});
         let _permit = semaphore
             .acquire_owned()
             .await
             .map_err(|_| LpmError::Registry("virtual-store link semaphore closed".into()))?;
+        tracing::event!(name: "admission_end", target: "lpm_install_timeline", tracing::Level::TRACE, {});
         let start = Instant::now();
+        let worker_span = tracing::Span::current();
+        tracing::event!(name: "enqueue", target: "lpm_install_timeline", tracing::Level::TRACE, {});
         tokio::task::spawn_blocking(move || {
-            let (materialized, freshly_populated, timings) =
-                lpm_linker::v2::link_v2_one_with_timings(&plan, &target, &store)?;
-            Ok(V2LinkTaskResult {
+            let _entered = worker_span.enter();
+            tracing::event!(name: "work_start", target: "lpm_install_timeline", tracing::Level::TRACE, {});
+            let result = lpm_linker::v2::link_v2_one_with_timings(&plan, &target, &store).map(|(materialized, freshly_populated, timings)| V2LinkTaskResult {
                 materialized,
                 freshly_populated,
                 ms: start.elapsed().as_millis(),
                 timings,
-            })
+            });
+            tracing::event!(name: "work_end", target: "lpm_install_timeline", tracing::Level::TRACE, success = result.is_ok());
+            result
         })
         .await
         .map_err(|e| LpmError::Registry(format!("virtual-store link task panicked: {e}")))?
-    })))
+    }.instrument(span))))
 }
 
 pub(super) struct CachedLinkJobs<T> {

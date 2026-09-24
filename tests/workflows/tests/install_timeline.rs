@@ -13,6 +13,51 @@ fn artifacts(directory: &std::path::Path) -> Vec<serde_json::Value> {
         .collect()
 }
 
+fn assert_link_materialization_timeline(records: &[serde_json::Value]) {
+    let task = records
+        .iter()
+        .find(|record| record["name"] == "v2_link_task")
+        .expect("link task must expose admission and blocking-worker timing");
+    let events: Vec<_> = records
+        .iter()
+        .filter(|record| record["kind"] == "event" && record["parent"] == task["id"])
+        .map(|record| record["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        events,
+        [
+            "admission_start",
+            "admission_end",
+            "enqueue",
+            "work_start",
+            "work_end"
+        ]
+    );
+    let link = records
+        .iter()
+        .find(|record| record["name"] == "link_one" && record["parent"] == task["id"])
+        .expect("link work must retain its task ancestry");
+    let materialize = records
+        .iter()
+        .find(|record| record["name"] == "link_materialize" && record["parent"] == link["id"])
+        .expect("materialization must expose its wall-time span");
+    assert!(
+        records
+            .iter()
+            .any(|record| record["kind"] == "span_close" && record["id"] == materialize["id"])
+    );
+    #[cfg(target_os = "macos")]
+    {
+        let clone = records
+            .iter()
+            .find(|record| record["name"] == "clonefile" && record["parent"] == materialize["id"])
+            .expect("macOS materialization must expose the clone attempt");
+        assert!(records.iter().any(|record| record["name"] == "clone_result"
+            && record["parent"] == clone["id"]
+            && record["fields"]["success"].as_u64().is_some()));
+    }
+}
+
 #[test]
 fn global_install_startup_error_still_exports_an_incomplete_timeline() {
     let project = TempProject::empty(r#"{"name":"timeline","version":"1.0.0"}"#);
@@ -70,6 +115,7 @@ async fn successful_install_exports_numeric_timeline_separately_from_json_stdout
     let trace = &files[0];
     assert_eq!(trace["outcome"], "success");
     let records = trace["records"].as_array().unwrap();
+    assert_link_materialization_timeline(records);
     assert!(records.iter().any(|r| r["name"] == "metadata_body"));
     assert!(records.iter().any(|r| r["name"] == "tree_walk_end"));
     assert!(
@@ -355,6 +401,12 @@ async fn assert_install_fetch_ancestry(route: &str) {
     }
     let directory = project.path().join("timeline");
     let mut command = lpm_with_registry(&project, &registry.url());
+    if route == "ready-files" {
+        command.env("LPM_INTERNAL_READY_FILE_ADMISSION", "1");
+    }
+    if route == "serial" {
+        command.env("LPM_SERIAL_LINK", "1");
+    }
     if route == "policy-foreground" {
         command.env("LPM_FETCH_OVERLAP", "0");
     }
@@ -394,6 +446,27 @@ async fn assert_install_fetch_ancestry(route: &str) {
     let files = artifacts(&directory);
     assert_eq!(files.len(), 1);
     let records = files[0]["records"].as_array().unwrap();
+    if route == "ready-files" {
+        assert!(
+            records
+                .iter()
+                .any(|record| record["name"] == "ready_file_admission")
+        );
+    }
+    if route == "serial" {
+        assert!(
+            !records
+                .iter()
+                .any(|record| record["name"] == "v2_link_task")
+        );
+        assert!(
+            records
+                .iter()
+                .any(|record| record["name"] == "link_materialize")
+        );
+    } else {
+        assert_link_materialization_timeline(records);
+    }
     let spans: std::collections::HashMap<u64, &serde_json::Value> = records
         .iter()
         .filter(|r| r["kind"] == "span_open")
@@ -419,7 +492,7 @@ async fn assert_install_fetch_ancestry(route: &str) {
         "fixture must exercise authoritative fetches"
     );
     let expected_marker = match route {
-        "normal" => "selected_fetch_dispatch",
+        "normal" | "serial" | "ready-files" => "selected_fetch_dispatch",
         "workspace" => "workspace_fetch_task",
         // Either the dispatcher or foreground fetch can acquire the package lock first.
         "policy" | "policy-foreground" => "install_pipeline",
@@ -450,6 +523,16 @@ async fn assert_install_fetch_ancestry(route: &str) {
 #[tokio::test]
 async fn overlapping_resolution_fetches_retain_install_timeline_ancestry() {
     assert_install_fetch_ancestry("normal").await;
+}
+
+#[tokio::test]
+async fn serial_linking_exports_materialization_without_async_link_tasks() {
+    assert_install_fetch_ancestry("serial").await;
+}
+
+#[tokio::test]
+async fn ready_file_admission_keeps_selected_fetch_and_link_ancestry() {
+    assert_install_fetch_ancestry("ready-files").await;
 }
 
 #[tokio::test]

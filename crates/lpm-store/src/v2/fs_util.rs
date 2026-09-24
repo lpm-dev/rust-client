@@ -160,6 +160,12 @@ pub(crate) fn materialize_into(src: &Path, dst: &Path) -> Result<(), LpmError> {
     materialize_into_inner(src, src, dst, allow_source_symlinks)
 }
 
+#[tracing::instrument(
+    target = "lpm_install_timeline",
+    level = "trace",
+    name = "link_materialize",
+    skip_all
+)]
 pub(crate) fn materialize_into_with_integrity(
     src: &Path,
     dst: &Path,
@@ -496,11 +502,14 @@ fn try_clonefile(src: &Path, dst: &Path) -> bool {
         return false;
     };
 
+    let _span = tracing::trace_span!(target: "lpm_install_timeline", "clonefile").entered();
+
     // SAFETY: clonefile takes two NUL-terminated C strings and a flags
     // word. Both pointers are valid for the duration of the call (the
     // CStrings outlive it), and we pass `0` for flags (no special
     // behavior). Returns 0 on success, -1 on failure.
     let result = unsafe { libc::clonefile(src_c.as_ptr(), dst_c.as_ptr(), 0) };
+    tracing::event!(name: "clone_result", target: "lpm_install_timeline", tracing::Level::TRACE, success = result == 0);
     if result == 0 {
         tracing::debug!(
             src = %src.display(),
