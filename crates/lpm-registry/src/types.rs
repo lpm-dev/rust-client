@@ -4,6 +4,8 @@
 
 mod version_metadata;
 
+pub(crate) use version_metadata::deserialize_version_without_dev_dependencies;
+
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
 use std::collections::HashMap;

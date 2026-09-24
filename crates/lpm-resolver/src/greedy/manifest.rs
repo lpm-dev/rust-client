@@ -339,7 +339,7 @@ pub(super) async fn fetch_preferred_metadata_for_resolver(
     let started = Instant::now();
     let candidate_range = range.clone();
     let (raw, versions_complete) = client
-        .get_npm_preferred_metadata_direct_with_timings(name, move |version| {
+        .get_npm_preferred_metadata_for_resolution_with_timings(name, move |version| {
             NpmVersion::parse(version).is_ok_and(|version| candidate_range.satisfies(&version))
         })
         .await

@@ -1,0 +1,4505 @@
+{
+  "baseline_commit": "59f88d1d9a1f3aed63d93aea082a1ce430938737",
+  "binary_sha256": {
+    "baseline": "09de81fe489b8a66356fa8d8c66d26d301efd2ea5367b5b7ef336767a1cd94f6",
+    "candidate": "ea00dac613f4f1e16ffcc96e12a0062f1331cd562e0a212306b31cc8b47f1493"
+  },
+  "cohorts": {
+    "warm-t3": {
+      "output": "/tmp/lpm-resolver-cache-allocation/warm-t3",
+      "samples": 100,
+      "diagnostics": 3,
+      "states": [
+        "fresh-checkout-warm-cache"
+      ],
+      "variants": [
+        {
+          "id": "baseline",
+          "manager": "lpm",
+          "binary": "/tmp/lpm-resolver-cache-allocation/lpm-baseline",
+          "sha256": "09de81fe489b8a66356fa8d8c66d26d301efd2ea5367b5b7ef336767a1cd94f6"
+        },
+        {
+          "id": "candidate",
+          "manager": "lpm",
+          "binary": "/tmp/lpm-resolver-cache-allocation/lpm-candidate",
+          "sha256": "ea00dac613f4f1e16ffcc96e12a0062f1331cd562e0a212306b31cc8b47f1493"
+        },
+        {
+          "id": "bun",
+          "manager": "bun"
+        }
+      ],
+      "balancedOrders": true,
+      "sharedLpmRoot": true,
+      "keepWork": true,
+      "fixture_sha256": "fa994042232e39e73fd1c4436c5e90974b47c4656e9c4a742c3988c6097b9871",
+      "harness_sha256": "62ca350a6d0158aa12d66f4e7357994387e7d1a1225d4344022a90b64f6755d2",
+      "node": "v26.5.0",
+      "platform": "darwin",
+      "method": "Shared physical LPM root per state; separate Bun root. All forward/reverse rotations balance pair direction. Seeded and warmed twice; reset state outside measurement; rotating variant/scenario order; every scored install retained; no timing instrumentation on scored installs; inventories and lockfiles retained; no repeated seed downloads."
+    },
+    "warm-vite-react": {
+      "output": "/tmp/lpm-resolver-cache-allocation/warm-vite-react",
+      "samples": 36,
+      "diagnostics": 3,
+      "states": [
+        "fresh-checkout-warm-cache"
+      ],
+      "variants": [
+        {
+          "id": "baseline",
+          "manager": "lpm",
+          "binary": "/tmp/lpm-resolver-cache-allocation/lpm-baseline",
+          "sha256": "09de81fe489b8a66356fa8d8c66d26d301efd2ea5367b5b7ef336767a1cd94f6"
+        },
+        {
+          "id": "candidate",
+          "manager": "lpm",
+          "binary": "/tmp/lpm-resolver-cache-allocation/lpm-candidate",
+          "sha256": "ea00dac613f4f1e16ffcc96e12a0062f1331cd562e0a212306b31cc8b47f1493"
+        },
+        {
+          "id": "bun",
+          "manager": "bun"
+        }
+      ],
+      "fixture": "bench/audit-fixtures/peer-heavy/vite-react",
+      "verifyModule": "vite/package.json",
+      "balancedOrders": true,
+      "sharedLpmRoot": true,
+      "keepWork": true,
+      "fixture_sha256": "11fe6a1100ebbf799500403a91748fde9991c745ebc182be088138a8e0b0f573",
+      "harness_sha256": "62ca350a6d0158aa12d66f4e7357994387e7d1a1225d4344022a90b64f6755d2",
+      "node": "v26.5.0",
+      "platform": "darwin",
+      "method": "Shared physical LPM root per state; separate Bun root. All forward/reverse rotations balance pair direction. Seeded and warmed twice; reset state outside measurement; rotating variant/scenario order; every scored install retained; no timing instrumentation on scored installs; inventories and lockfiles retained; no repeated seed downloads."
+    },
+    "warm-native-sharp": {
+      "output": "/tmp/lpm-resolver-cache-allocation/warm-native-sharp",
+      "samples": 36,
+      "diagnostics": 3,
+      "states": [
+        "fresh-checkout-warm-cache"
+      ],
+      "variants": [
+        {
+          "id": "baseline",
+          "manager": "lpm",
+          "binary": "/tmp/lpm-resolver-cache-allocation/lpm-baseline",
+          "sha256": "09de81fe489b8a66356fa8d8c66d26d301efd2ea5367b5b7ef336767a1cd94f6"
+        },
+        {
+          "id": "candidate",
+          "manager": "lpm",
+          "binary": "/tmp/lpm-resolver-cache-allocation/lpm-candidate",
+          "sha256": "ea00dac613f4f1e16ffcc96e12a0062f1331cd562e0a212306b31cc8b47f1493"
+        },
+        {
+          "id": "bun",
+          "manager": "bun"
+        }
+      ],
+      "fixture": "bench/audit-fixtures/native/sharp-image",
+      "verifyModule": "sharp/package.json",
+      "balancedOrders": true,
+      "sharedLpmRoot": true,
+      "keepWork": true,
+      "fixture_sha256": "22aa2132be98340ec5b54a4d27077b52d8d69a755b2af449ea93152f5b187c74",
+      "harness_sha256": "62ca350a6d0158aa12d66f4e7357994387e7d1a1225d4344022a90b64f6755d2",
+      "node": "v26.5.0",
+      "platform": "darwin",
+      "method": "Shared physical LPM root per state; separate Bun root. All forward/reverse rotations balance pair direction. Seeded and warmed twice; reset state outside measurement; rotating variant/scenario order; every scored install retained; no timing instrumentation on scored installs; inventories and lockfiles retained; no repeated seed downloads."
+    },
+    "warm-nest": {
+      "output": "/tmp/lpm-resolver-cache-allocation/warm-nest",
+      "samples": 36,
+      "diagnostics": 3,
+      "states": [
+        "fresh-checkout-warm-cache"
+      ],
+      "variants": [
+        {
+          "id": "baseline",
+          "manager": "lpm",
+          "binary": "/tmp/lpm-resolver-cache-allocation/lpm-baseline",
+          "sha256": "09de81fe489b8a66356fa8d8c66d26d301efd2ea5367b5b7ef336767a1cd94f6"
+        },
+        {
+          "id": "candidate",
+          "manager": "lpm",
+          "binary": "/tmp/lpm-resolver-cache-allocation/lpm-candidate",
+          "sha256": "ea00dac613f4f1e16ffcc96e12a0062f1331cd562e0a212306b31cc8b47f1493"
+        },
+        {
+          "id": "bun",
+          "manager": "bun"
+        }
+      ],
+      "fixture": "bench/audit-fixtures/peer-heavy/nestjs-deep",
+      "verifyModule": "@nestjs/core/package.json",
+      "balancedOrders": true,
+      "sharedLpmRoot": true,
+      "keepWork": true,
+      "fixture_sha256": "5467ac14709e75494a0bf06fc2e1232968ade51101e82e06529585eb0389e9d8",
+      "harness_sha256": "62ca350a6d0158aa12d66f4e7357994387e7d1a1225d4344022a90b64f6755d2",
+      "node": "v26.5.0",
+      "platform": "darwin",
+      "method": "Shared physical LPM root per state; separate Bun root. All forward/reverse rotations balance pair direction. Seeded and warmed twice; reset state outside measurement; rotating variant/scenario order; every scored install retained; no timing instrumentation on scored installs; inventories and lockfiles retained; no repeated seed downloads."
+    },
+    "confirm-t3": {
+      "output": "/tmp/lpm-resolver-cache-allocation/confirm-t3",
+      "samples": 100,
+      "diagnostics": 3,
+      "states": [
+        "fresh-checkout-warm-cache"
+      ],
+      "variants": [
+        {
+          "id": "baseline",
+          "manager": "lpm",
+          "binary": "/tmp/lpm-resolver-cache-allocation/lpm-baseline",
+          "sha256": "09de81fe489b8a66356fa8d8c66d26d301efd2ea5367b5b7ef336767a1cd94f6"
+        },
+        {
+          "id": "candidate",
+          "manager": "lpm",
+          "binary": "/tmp/lpm-resolver-cache-allocation/lpm-candidate",
+          "sha256": "ea00dac613f4f1e16ffcc96e12a0062f1331cd562e0a212306b31cc8b47f1493"
+        },
+        {
+          "id": "bun",
+          "manager": "bun"
+        }
+      ],
+      "balancedOrders": true,
+      "sharedLpmRoot": true,
+      "keepWork": true,
+      "fixture_sha256": "fa994042232e39e73fd1c4436c5e90974b47c4656e9c4a742c3988c6097b9871",
+      "harness_sha256": "62ca350a6d0158aa12d66f4e7357994387e7d1a1225d4344022a90b64f6755d2",
+      "node": "v26.5.0",
+      "platform": "darwin",
+      "method": "Shared physical LPM root per state; separate Bun root. All forward/reverse rotations balance pair direction. Seeded and warmed twice; reset state outside measurement; rotating variant/scenario order; every scored install retained; no timing instrumentation on scored installs; inventories and lockfiles retained; no repeated seed downloads."
+    },
+    "confirm-native-sharp": {
+      "output": "/tmp/lpm-resolver-cache-allocation/confirm-native-sharp",
+      "samples": 100,
+      "diagnostics": 3,
+      "states": [
+        "fresh-checkout-warm-cache"
+      ],
+      "variants": [
+        {
+          "id": "baseline",
+          "manager": "lpm",
+          "binary": "/tmp/lpm-resolver-cache-allocation/lpm-baseline",
+          "sha256": "09de81fe489b8a66356fa8d8c66d26d301efd2ea5367b5b7ef336767a1cd94f6"
+        },
+        {
+          "id": "candidate",
+          "manager": "lpm",
+          "binary": "/tmp/lpm-resolver-cache-allocation/lpm-candidate",
+          "sha256": "ea00dac613f4f1e16ffcc96e12a0062f1331cd562e0a212306b31cc8b47f1493"
+        },
+        {
+          "id": "bun",
+          "manager": "bun"
+        }
+      ],
+      "fixture": "bench/audit-fixtures/native/sharp-image",
+      "verifyModule": "sharp/package.json",
+      "balancedOrders": true,
+      "sharedLpmRoot": true,
+      "keepWork": true,
+      "fixture_sha256": "22aa2132be98340ec5b54a4d27077b52d8d69a755b2af449ea93152f5b187c74",
+      "harness_sha256": "62ca350a6d0158aa12d66f4e7357994387e7d1a1225d4344022a90b64f6755d2",
+      "node": "v26.5.0",
+      "platform": "darwin",
+      "method": "Shared physical LPM root per state; separate Bun root. All forward/reverse rotations balance pair direction. Seeded and warmed twice; reset state outside measurement; rotating variant/scenario order; every scored install retained; no timing instrumentation on scored installs; inventories and lockfiles retained; no repeated seed downloads."
+    }
+  },
+  "micro": {
+    "files": [
+      {
+        "path": "/tmp/lpm-noop-overhead/baseline-profile/work/up-to-date-baseline/lpm-home/cache/metadata/728bb5a31a0275f9",
+        "sha256": "c3e64b9e53a265f1a5690573ea85fd0b8fa53d81826a03697501eaad200fdbe4"
+      },
+      {
+        "path": "/tmp/lpm-noop-overhead/baseline-profile/work/up-to-date-baseline/lpm-home/cache/metadata/af2ddef1a3b7d272",
+        "sha256": "2ccfd99b8b2328121a5a27b66d04b6627edcfbf41c34e25b0227e7e39d555ab6"
+      },
+      {
+        "path": "/tmp/lpm-noop-overhead/baseline-profile/work/up-to-date-baseline/lpm-home/cache/metadata/4dccd0afb991c885",
+        "sha256": "0c4a3b8a9bd88bcb05a922e43a7bf79930a3dc365f0c8829f8418e093b74e241"
+      },
+      {
+        "path": "/tmp/lpm-noop-overhead/baseline-profile/work/up-to-date-baseline/lpm-home/cache/metadata/1fd03747b7cc74a0",
+        "sha256": "64f54cdf9e14de18e7094776a81624df9cad0f4a6181809bf9029d800a7f0588"
+      },
+      {
+        "path": "/tmp/lpm-noop-overhead/baseline-profile/work/up-to-date-baseline/lpm-home/cache/metadata/8c09be571bf92b0d",
+        "sha256": "fa7610900196b25cbbc1cd53ce8ab02d929f2ca8dd26b308ffe160f9c22b3ae1"
+      }
+    ],
+    "rows": [
+      {
+        "mode": "projected",
+        "rounds": 10,
+        "versions": 8287,
+        "elapsed_ms": 256.581709,
+        "sample": 1,
+        "order": [
+          "projected",
+          "full"
+        ],
+        "rss_bytes": 38109184,
+        "time_output": "        0.26 real         0.23 user         0.01 sys\n            38109184  maximum resident set size\n                   0  average shared memory size\n                   0  average unshared data size\n                   0  average unshared stack size\n                2540  page reclaims\n                   0  page faults\n                   0  swaps\n                   0  block input operations\n                   0  block output operations\n                   0  messages sent\n                   0  messages received\n                   0  signals received\n                   0  voluntary context switches\n                  78  involuntary context switches\n          4870544427  instructions retired\n          1117601821  cycles elapsed\n            33948152  peak memory footprint\n"
+      },
+      {
+        "mode": "full",
+        "rounds": 10,
+        "versions": 8287,
+        "elapsed_ms": 390.189625,
+        "sample": 1,
+        "order": [
+          "projected",
+          "full"
+        ],
+        "rss_bytes": 67944448,
+        "time_output": "        0.39 real         0.36 user         0.02 sys\n            67944448  maximum resident set size\n                   0  average shared memory size\n                   0  average unshared data size\n                   0  average unshared stack size\n                4361  page reclaims\n                   0  page faults\n                   0  swaps\n                   0  block input operations\n                   0  block output operations\n                   0  messages sent\n                   0  messages received\n                   0  signals received\n                   0  voluntary context switches\n                 110  involuntary context switches\n          7558636141  instructions retired\n          1714522901  cycles elapsed\n            63570424  peak memory footprint\n"
+      },
+      {
+        "mode": "full",
+        "rounds": 10,
+        "versions": 8287,
+        "elapsed_ms": 389.74674999999996,
+        "sample": 2,
+        "order": [
+          "full",
+          "projected"
+        ],
+        "rss_bytes": 67862528,
+        "time_output": "        0.39 real         0.36 user         0.02 sys\n            67862528  maximum resident set size\n                   0  average shared memory size\n                   0  average unshared data size\n                   0  average unshared stack size\n                4356  page reclaims\n                   0  page faults\n                   0  swaps\n                   0  block input operations\n                   0  block output operations\n                   0  messages sent\n                   0  messages received\n                   0  signals received\n                   0  voluntary context switches\n                 128  involuntary context switches\n          7556295756  instructions retired\n          1717737233  cycles elapsed\n            63570424  peak memory footprint\n"
+      },
+      {
+        "mode": "projected",
+        "rounds": 10,
+        "versions": 8287,
+        "elapsed_ms": 244.181458,
+        "sample": 2,
+        "order": [
+          "full",
+          "projected"
+        ],
+        "rss_bytes": 34635776,
+        "time_output": "        0.24 real         0.22 user         0.01 sys\n            34635776  maximum resident set size\n                   0  average shared memory size\n                   0  average unshared data size\n                   0  average unshared stack size\n                2328  page reclaims\n                   0  page faults\n                   0  swaps\n                   0  block input operations\n                   0  block output operations\n                   0  messages sent\n                   0  messages received\n                   0  signals received\n                   0  voluntary context switches\n                  53  involuntary context switches\n          4873203264  instructions retired\n          1083013817  cycles elapsed\n            30458336  peak memory footprint\n"
+      },
+      {
+        "mode": "projected",
+        "rounds": 10,
+        "versions": 8287,
+        "elapsed_ms": 246.03625000000002,
+        "sample": 3,
+        "order": [
+          "projected",
+          "full"
+        ],
+        "rss_bytes": 34570240,
+        "time_output": "        0.25 real         0.23 user         0.01 sys\n            34570240  maximum resident set size\n                   0  average shared memory size\n                   0  average unshared data size\n                   0  average unshared stack size\n                2324  page reclaims\n                   0  page faults\n                   0  swaps\n                   0  block input operations\n                   0  block output operations\n                   0  messages sent\n                   0  messages received\n                   0  signals received\n                   0  voluntary context switches\n                  43  involuntary context switches\n          4870516538  instructions retired\n          1078871627  cycles elapsed\n            30392800  peak memory footprint\n"
+      },
+      {
+        "mode": "full",
+        "rounds": 10,
+        "versions": 8287,
+        "elapsed_ms": 386.313083,
+        "sample": 3,
+        "order": [
+          "projected",
+          "full"
+        ],
+        "rss_bytes": 67928064,
+        "time_output": "        0.39 real         0.36 user         0.02 sys\n            67928064  maximum resident set size\n                   0  average shared memory size\n                   0  average unshared data size\n                   0  average unshared stack size\n                4361  page reclaims\n                   0  page faults\n                   0  swaps\n                   0  block input operations\n                   0  block output operations\n                   0  messages sent\n                   0  messages received\n                   0  signals received\n                   0  voluntary context switches\n                  70  involuntary context switches\n          7553572951  instructions retired\n          1705016724  cycles elapsed\n            63570424  peak memory footprint\n"
+      },
+      {
+        "mode": "full",
+        "rounds": 10,
+        "versions": 8287,
+        "elapsed_ms": 387.486833,
+        "sample": 4,
+        "order": [
+          "full",
+          "projected"
+        ],
+        "rss_bytes": 67928064,
+        "time_output": "        0.39 real         0.36 user         0.02 sys\n            67928064  maximum resident set size\n                   0  average shared memory size\n                   0  average unshared data size\n                   0  average unshared stack size\n                4361  page reclaims\n                   0  page faults\n                   0  swaps\n                   0  block input operations\n                   0  block output operations\n                   0  messages sent\n                   0  messages received\n                   0  signals received\n                   0  voluntary context switches\n                 107  involuntary context switches\n          7553947197  instructions retired\n          1710806085  cycles elapsed\n            63554040  peak memory footprint\n"
+      },
+      {
+        "mode": "projected",
+        "rounds": 10,
+        "versions": 8287,
+        "elapsed_ms": 242.402708,
+        "sample": 4,
+        "order": [
+          "full",
+          "projected"
+        ],
+        "rss_bytes": 34603008,
+        "time_output": "        0.24 real         0.22 user         0.01 sys\n            34603008  maximum resident set size\n                   0  average shared memory size\n                   0  average unshared data size\n                   0  average unshared stack size\n                2327  page reclaims\n                   0  page faults\n                   0  swaps\n                   0  block input operations\n                   0  block output operations\n                   0  messages sent\n                   0  messages received\n                   0  signals received\n                   0  voluntary context switches\n                  34  involuntary context switches\n          4871395578  instructions retired\n          1075175644  cycles elapsed\n            30425568  peak memory footprint\n"
+      },
+      {
+        "mode": "projected",
+        "rounds": 10,
+        "versions": 8287,
+        "elapsed_ms": 242.581875,
+        "sample": 5,
+        "order": [
+          "projected",
+          "full"
+        ],
+        "rss_bytes": 34635776,
+        "time_output": "        0.24 real         0.22 user         0.01 sys\n            34635776  maximum resident set size\n                   0  average shared memory size\n                   0  average unshared data size\n                   0  average unshared stack size\n                2329  page reclaims\n                   0  page faults\n                   0  swaps\n                   0  block input operations\n                   0  block output operations\n                   0  messages sent\n                   0  messages received\n                   0  signals received\n                   0  voluntary context switches\n                  29  involuntary context switches\n          4870267669  instructions retired\n          1077681965  cycles elapsed\n            30458336  peak memory footprint\n"
+      },
+      {
+        "mode": "full",
+        "rounds": 10,
+        "versions": 8287,
+        "elapsed_ms": 390.168208,
+        "sample": 5,
+        "order": [
+          "projected",
+          "full"
+        ],
+        "rss_bytes": 67928064,
+        "time_output": "        0.39 real         0.36 user         0.02 sys\n            67928064  maximum resident set size\n                   0  average shared memory size\n                   0  average unshared data size\n                   0  average unshared stack size\n                4361  page reclaims\n                   0  page faults\n                   0  swaps\n                   0  block input operations\n                   0  block output operations\n                   0  messages sent\n                   0  messages received\n                   0  signals received\n                   0  voluntary context switches\n                  72  involuntary context switches\n          7550389382  instructions retired\n          1705901714  cycles elapsed\n            63570424  peak memory footprint\n"
+      },
+      {
+        "mode": "full",
+        "rounds": 10,
+        "versions": 8287,
+        "elapsed_ms": 376.286209,
+        "sample": 6,
+        "order": [
+          "full",
+          "projected"
+        ],
+        "rss_bytes": 67911680,
+        "time_output": "        0.38 real         0.35 user         0.02 sys\n            67911680  maximum resident set size\n                   0  average shared memory size\n                   0  average unshared data size\n                   0  average unshared stack size\n                4360  page reclaims\n                   0  page faults\n                   0  swaps\n                   0  block input operations\n                   0  block output operations\n                   0  messages sent\n                   0  messages received\n                   0  signals received\n                   0  voluntary context switches\n                  46  involuntary context switches\n          7548005587  instructions retired\n          1663661644  cycles elapsed\n            63554064  peak memory footprint\n"
+      },
+      {
+        "mode": "projected",
+        "rounds": 10,
+        "versions": 8287,
+        "elapsed_ms": 246.58645800000002,
+        "sample": 6,
+        "order": [
+          "full",
+          "projected"
+        ],
+        "rss_bytes": 34619392,
+        "time_output": "        0.25 real         0.23 user         0.01 sys\n            34619392  maximum resident set size\n                   0  average shared memory size\n                   0  average unshared data size\n                   0  average unshared stack size\n                2328  page reclaims\n                   0  page faults\n                   0  swaps\n                   0  block input operations\n                   0  block output operations\n                   0  messages sent\n                   0  messages received\n                   0  signals received\n                   0  voluntary context switches\n                  32  involuntary context switches\n          4867268815  instructions retired\n          1086682886  cycles elapsed\n            30441952  peak memory footprint\n"
+      },
+      {
+        "mode": "projected",
+        "rounds": 10,
+        "versions": 8287,
+        "elapsed_ms": 239.1515,
+        "sample": 7,
+        "order": [
+          "projected",
+          "full"
+        ],
+        "rss_bytes": 34603008,
+        "time_output": "        0.24 real         0.22 user         0.01 sys\n            34603008  maximum resident set size\n                   0  average shared memory size\n                   0  average unshared data size\n                   0  average unshared stack size\n                2327  page reclaims\n                   0  page faults\n                   0  swaps\n                   0  block input operations\n                   0  block output operations\n                   0  messages sent\n                   0  messages received\n                   0  signals received\n                   0  voluntary context switches\n                  34  involuntary context switches\n          4867614334  instructions retired\n          1063767982  cycles elapsed\n            30425568  peak memory footprint\n"
+      },
+      {
+        "mode": "full",
+        "rounds": 10,
+        "versions": 8287,
+        "elapsed_ms": 374.5135,
+        "sample": 7,
+        "order": [
+          "projected",
+          "full"
+        ],
+        "rss_bytes": 67895296,
+        "time_output": "        0.37 real         0.35 user         0.02 sys\n            67895296  maximum resident set size\n                   0  average shared memory size\n                   0  average unshared data size\n                   0  average unshared stack size\n                4358  page reclaims\n                   0  page faults\n                   0  swaps\n                   0  block input operations\n                   0  block output operations\n                   0  messages sent\n                   0  messages received\n                   0  signals received\n                   0  voluntary context switches\n                  46  involuntary context switches\n          7542641701  instructions retired\n          1659130152  cycles elapsed\n            63554064  peak memory footprint\n"
+      },
+      {
+        "mode": "full",
+        "rounds": 10,
+        "versions": 8287,
+        "elapsed_ms": 401.944084,
+        "sample": 8,
+        "order": [
+          "full",
+          "projected"
+        ],
+        "rss_bytes": 67944448,
+        "time_output": "        0.40 real         0.38 user         0.02 sys\n            67944448  maximum resident set size\n                   0  average shared memory size\n                   0  average unshared data size\n                   0  average unshared stack size\n                4362  page reclaims\n                   0  page faults\n                   0  swaps\n                   0  block input operations\n                   0  block output operations\n                   0  messages sent\n                   0  messages received\n                   0  signals received\n                   0  voluntary context switches\n                 112  involuntary context switches\n          7547429586  instructions retired\n          1771019786  cycles elapsed\n            63586808  peak memory footprint\n"
+      },
+      {
+        "mode": "projected",
+        "rounds": 10,
+        "versions": 8287,
+        "elapsed_ms": 246.330917,
+        "sample": 8,
+        "order": [
+          "full",
+          "projected"
+        ],
+        "rss_bytes": 34701312,
+        "time_output": "        0.25 real         0.23 user         0.01 sys\n            34701312  maximum resident set size\n                   0  average shared memory size\n                   0  average unshared data size\n                   0  average unshared stack size\n                2333  page reclaims\n                   0  page faults\n                   0  swaps\n                   0  block input operations\n                   0  block output operations\n                   0  messages sent\n                   0  messages received\n                   0  signals received\n                   0  voluntary context switches\n                  85  involuntary context switches\n          4868288152  instructions retired\n          1087500398  cycles elapsed\n            30523872  peak memory footprint\n"
+      },
+      {
+        "mode": "projected",
+        "rounds": 10,
+        "versions": 8287,
+        "elapsed_ms": 245.40395800000002,
+        "sample": 9,
+        "order": [
+          "projected",
+          "full"
+        ],
+        "rss_bytes": 34586624,
+        "time_output": "        0.24 real         0.22 user         0.01 sys\n            34586624  maximum resident set size\n                   0  average shared memory size\n                   0  average unshared data size\n                   0  average unshared stack size\n                2325  page reclaims\n                   0  page faults\n                   0  swaps\n                   0  block input operations\n                   0  block output operations\n                   0  messages sent\n                   0  messages received\n                   0  signals received\n                   0  voluntary context switches\n                  41  involuntary context switches\n          4867318508  instructions retired\n          1088608424  cycles elapsed\n            30409184  peak memory footprint\n"
+      },
+      {
+        "mode": "full",
+        "rounds": 10,
+        "versions": 8287,
+        "elapsed_ms": 380.391542,
+        "sample": 9,
+        "order": [
+          "projected",
+          "full"
+        ],
+        "rss_bytes": 67911680,
+        "time_output": "        0.38 real         0.36 user         0.02 sys\n            67911680  maximum resident set size\n                   0  average shared memory size\n                   0  average unshared data size\n                   0  average unshared stack size\n                4359  page reclaims\n                   0  page faults\n                   0  swaps\n                   0  block input operations\n                   0  block output operations\n                   0  messages sent\n                   0  messages received\n                   0  signals received\n                   0  voluntary context switches\n                  42  involuntary context switches\n          7549674875  instructions retired\n          1679401603  cycles elapsed\n            63570424  peak memory footprint\n"
+      },
+      {
+        "mode": "full",
+        "rounds": 10,
+        "versions": 8287,
+        "elapsed_ms": 383.23137499999996,
+        "sample": 10,
+        "order": [
+          "full",
+          "projected"
+        ],
+        "rss_bytes": 67862528,
+        "time_output": "        0.38 real         0.36 user         0.02 sys\n            67862528  maximum resident set size\n                   0  average shared memory size\n                   0  average unshared data size\n                   0  average unshared stack size\n                4357  page reclaims\n                   0  page faults\n                   0  swaps\n                   0  block input operations\n                   0  block output operations\n                   0  messages sent\n                   0  messages received\n                   0  signals received\n                   0  voluntary context switches\n                  49  involuntary context switches\n          7555325563  instructions retired\n          1698019123  cycles elapsed\n            63554040  peak memory footprint\n"
+      },
+      {
+        "mode": "projected",
+        "rounds": 10,
+        "versions": 8287,
+        "elapsed_ms": 246.70045900000002,
+        "sample": 10,
+        "order": [
+          "full",
+          "projected"
+        ],
+        "rss_bytes": 34603008,
+        "time_output": "        0.25 real         0.23 user         0.01 sys\n            34603008  maximum resident set size\n                   0  average shared memory size\n                   0  average unshared data size\n                   0  average unshared stack size\n                2326  page reclaims\n                   0  page faults\n                   0  swaps\n                   0  block input operations\n                   0  block output operations\n                   0  messages sent\n                   0  messages received\n                   0  signals received\n                   0  voluntary context switches\n                  33  involuntary context switches\n          4867087511  instructions retired\n          1095076454  cycles elapsed\n            30425568  peak memory footprint\n"
+      },
+      {
+        "mode": "projected",
+        "rounds": 10,
+        "versions": 8287,
+        "elapsed_ms": 246.155708,
+        "sample": 11,
+        "order": [
+          "projected",
+          "full"
+        ],
+        "rss_bytes": 34619392,
+        "time_output": "        0.24 real         0.23 user         0.01 sys\n            34619392  maximum resident set size\n                   0  average shared memory size\n                   0  average unshared data size\n                   0  average unshared stack size\n                2328  page reclaims\n                   0  page faults\n                   0  swaps\n                   0  block input operations\n                   0  block output operations\n                   0  messages sent\n                   0  messages received\n                   0  signals received\n                   0  voluntary context switches\n                  33  involuntary context switches\n          4867721576  instructions retired\n          1092484636  cycles elapsed\n            30441952  peak memory footprint\n"
+      },
+      {
+        "mode": "full",
+        "rounds": 10,
+        "versions": 8287,
+        "elapsed_ms": 380.54170799999997,
+        "sample": 11,
+        "order": [
+          "projected",
+          "full"
+        ],
+        "rss_bytes": 67846144,
+        "time_output": "        0.38 real         0.36 user         0.02 sys\n            67846144  maximum resident set size\n                   0  average shared memory size\n                   0  average unshared data size\n                   0  average unshared stack size\n                4355  page reclaims\n                   0  page faults\n                   0  swaps\n                   0  block input operations\n                   0  block output operations\n                   0  messages sent\n                   0  messages received\n                   0  signals received\n                   0  voluntary context switches\n                  50  involuntary context switches\n          7546320639  instructions retired\n          1674494559  cycles elapsed\n            63554040  peak memory footprint\n"
+      },
+      {
+        "mode": "full",
+        "rounds": 10,
+        "versions": 8287,
+        "elapsed_ms": 384.26016699999997,
+        "sample": 12,
+        "order": [
+          "full",
+          "projected"
+        ],
+        "rss_bytes": 67928064,
+        "time_output": "        0.38 real         0.36 user         0.02 sys\n            67928064  maximum resident set size\n                   0  average shared memory size\n                   0  average unshared data size\n                   0  average unshared stack size\n                4360  page reclaims\n                   0  page faults\n                   0  swaps\n                   0  block input operations\n                   0  block output operations\n                   0  messages sent\n                   0  messages received\n                   0  signals received\n                   0  voluntary context switches\n                  54  involuntary context switches\n          7546046880  instructions retired\n          1689500406  cycles elapsed\n            63554040  peak memory footprint\n"
+      },
+      {
+        "mode": "projected",
+        "rounds": 10,
+        "versions": 8287,
+        "elapsed_ms": 246.11675,
+        "sample": 12,
+        "order": [
+          "full",
+          "projected"
+        ],
+        "rss_bytes": 34570240,
+        "time_output": "        0.25 real         0.23 user         0.01 sys\n            34570240  maximum resident set size\n                   0  average shared memory size\n                   0  average unshared data size\n                   0  average unshared stack size\n                2325  page reclaims\n                   0  page faults\n                   0  swaps\n                   0  block input operations\n                   0  block output operations\n                   0  messages sent\n                   0  messages received\n                   0  signals received\n                   0  voluntary context switches\n                  48  involuntary context switches\n          4867275843  instructions retired\n          1085370249  cycles elapsed\n            30392800  peak memory footprint\n"
+      },
+      {
+        "mode": "projected",
+        "rounds": 10,
+        "versions": 8287,
+        "elapsed_ms": 245.63579199999998,
+        "sample": 13,
+        "order": [
+          "projected",
+          "full"
+        ],
+        "rss_bytes": 34537472,
+        "time_output": "        0.24 real         0.23 user         0.01 sys\n            34537472  maximum resident set size\n                   0  average shared memory size\n                   0  average unshared data size\n                   0  average unshared stack size\n                2322  page reclaims\n                   0  page faults\n                   0  swaps\n                   0  block input operations\n                   0  block output operations\n                   0  messages sent\n                   0  messages received\n                   0  signals received\n                   0  voluntary context switches\n                  57  involuntary context switches\n          4867527451  instructions retired\n          1076170379  cycles elapsed\n            30360032  peak memory footprint\n"
+      },
+      {
+        "mode": "full",
+        "rounds": 10,
+        "versions": 8287,
+        "elapsed_ms": 386.112625,
+        "sample": 13,
+        "order": [
+          "projected",
+          "full"
+        ],
+        "rss_bytes": 67878912,
+        "time_output": "        0.39 real         0.36 user         0.02 sys\n            67878912  maximum resident set size\n                   0  average shared memory size\n                   0  average unshared data size\n                   0  average unshared stack size\n                4357  page reclaims\n                   0  page faults\n                   0  swaps\n                   0  block input operations\n                   0  block output operations\n                   0  messages sent\n                   0  messages received\n                   0  signals received\n                   0  voluntary context switches\n                  57  involuntary context switches\n          7543694845  instructions retired\n          1698232373  cycles elapsed\n            63521296  peak memory footprint\n"
+      },
+      {
+        "mode": "full",
+        "rounds": 10,
+        "versions": 8287,
+        "elapsed_ms": 394.270375,
+        "sample": 14,
+        "order": [
+          "full",
+          "projected"
+        ],
+        "rss_bytes": 68091904,
+        "time_output": "        0.39 real         0.37 user         0.02 sys\n            68091904  maximum resident set size\n                   0  average shared memory size\n                   0  average unshared data size\n                   0  average unshared stack size\n                4371  page reclaims\n                   0  page faults\n                   0  swaps\n                   0  block input operations\n                   0  block output operations\n                   0  messages sent\n                   0  messages received\n                   0  signals received\n                   0  voluntary context switches\n                 268  involuntary context switches\n          7549210395  instructions retired\n          1695255202  cycles elapsed\n            63635984  peak memory footprint\n"
+      },
+      {
+        "mode": "projected",
+        "rounds": 10,
+        "versions": 8287,
+        "elapsed_ms": 243.672958,
+        "sample": 14,
+        "order": [
+          "full",
+          "projected"
+        ],
+        "rss_bytes": 34570240,
+        "time_output": "        0.24 real         0.22 user         0.01 sys\n            34570240  maximum resident set size\n                   0  average shared memory size\n                   0  average unshared data size\n                   0  average unshared stack size\n                2324  page reclaims\n                   0  page faults\n                   0  swaps\n                   0  block input operations\n                   0  block output operations\n                   0  messages sent\n                   0  messages received\n                   0  signals received\n                   0  voluntary context switches\n                  72  involuntary context switches\n          4868180071  instructions retired\n          1069222556  cycles elapsed\n            30392800  peak memory footprint\n"
+      },
+      {
+        "mode": "projected",
+        "rounds": 10,
+        "versions": 8287,
+        "elapsed_ms": 240.52262499999998,
+        "sample": 15,
+        "order": [
+          "projected",
+          "full"
+        ],
+        "rss_bytes": 34603008,
+        "time_output": "        0.24 real         0.22 user         0.01 sys\n            34603008  maximum resident set size\n                   0  average shared memory size\n                   0  average unshared data size\n                   0  average unshared stack size\n                2327  page reclaims\n                   0  page faults\n                   0  swaps\n                   0  block input operations\n                   0  block output operations\n                   0  messages sent\n                   0  messages received\n                   0  signals received\n                   0  voluntary context switches\n                  60  involuntary context switches\n          4867639524  instructions retired\n          1066894798  cycles elapsed\n            30425568  peak memory footprint\n"
+      },
+      {
+        "mode": "full",
+        "rounds": 10,
+        "versions": 8287,
+        "elapsed_ms": 385.17345800000004,
+        "sample": 15,
+        "order": [
+          "projected",
+          "full"
+        ],
+        "rss_bytes": 67862528,
+        "time_output": "        0.38 real         0.36 user         0.02 sys\n            67862528  maximum resident set size\n                   0  average shared memory size\n                   0  average unshared data size\n                   0  average unshared stack size\n                4357  page reclaims\n                   0  page faults\n                   0  swaps\n                   0  block input operations\n                   0  block output operations\n                   0  messages sent\n                   0  messages received\n                   0  signals received\n                   0  voluntary context switches\n                  65  involuntary context switches\n          7543231854  instructions retired\n          1725394538  cycles elapsed\n            63554040  peak memory footprint\n"
+      },
+      {
+        "mode": "full",
+        "rounds": 10,
+        "versions": 8287,
+        "elapsed_ms": 380.619125,
+        "sample": 16,
+        "order": [
+          "full",
+          "projected"
+        ],
+        "rss_bytes": 67878912,
+        "time_output": "        0.38 real         0.35 user         0.02 sys\n            67878912  maximum resident set size\n                   0  average shared memory size\n                   0  average unshared data size\n                   0  average unshared stack size\n                4357  page reclaims\n                   0  page faults\n                   0  swaps\n                   0  block input operations\n                   0  block output operations\n                   0  messages sent\n                   0  messages received\n                   0  signals received\n                   0  voluntary context switches\n                  57  involuntary context switches\n          7549127326  instructions retired\n          1689270770  cycles elapsed\n            63570448  peak memory footprint\n"
+      },
+      {
+        "mode": "projected",
+        "rounds": 10,
+        "versions": 8287,
+        "elapsed_ms": 242.506292,
+        "sample": 16,
+        "order": [
+          "full",
+          "projected"
+        ],
+        "rss_bytes": 34635776,
+        "time_output": "        0.24 real         0.22 user         0.01 sys\n            34635776  maximum resident set size\n                   0  average shared memory size\n                   0  average unshared data size\n                   0  average unshared stack size\n                2329  page reclaims\n                   0  page faults\n                   0  swaps\n                   0  block input operations\n                   0  block output operations\n                   0  messages sent\n                   0  messages received\n                   0  signals received\n                   0  voluntary context switches\n                  43  involuntary context switches\n          4867640989  instructions retired\n          1072358893  cycles elapsed\n            30458336  peak memory footprint\n"
+      },
+      {
+        "mode": "projected",
+        "rounds": 10,
+        "versions": 8287,
+        "elapsed_ms": 290.92887499999995,
+        "sample": 17,
+        "order": [
+          "projected",
+          "full"
+        ],
+        "rss_bytes": 37076992,
+        "time_output": "        0.29 real         0.24 user         0.02 sys\n            37076992  maximum resident set size\n                   0  average shared memory size\n                   0  average unshared data size\n                   0  average unshared stack size\n                2477  page reclaims\n                   0  page faults\n                   0  swaps\n                   0  block input operations\n                   0  block output operations\n                   0  messages sent\n                   0  messages received\n                   0  signals received\n                   0  voluntary context switches\n                1915  involuntary context switches\n          4890117119  instructions retired\n          1179190137  cycles elapsed\n            32915960  peak memory footprint\n"
+      },
+      {
+        "mode": "full",
+        "rounds": 10,
+        "versions": 8287,
+        "elapsed_ms": 442.934375,
+        "sample": 17,
+        "order": [
+          "projected",
+          "full"
+        ],
+        "rss_bytes": 69320704,
+        "time_output": "        0.44 real         0.39 user         0.03 sys\n            69320704  maximum resident set size\n                   0  average shared memory size\n                   0  average unshared data size\n                   0  average unshared stack size\n                4446  page reclaims\n                   0  page faults\n                   0  swaps\n                   0  block input operations\n                   0  block output operations\n                   0  messages sent\n                   0  messages received\n                   0  signals received\n                   0  voluntary context switches\n                1611  involuntary context switches\n          7566502807  instructions retired\n          1828849198  cycles elapsed\n            63652368  peak memory footprint\n"
+      },
+      {
+        "mode": "full",
+        "rounds": 10,
+        "versions": 8287,
+        "elapsed_ms": 413.631875,
+        "sample": 18,
+        "order": [
+          "full",
+          "projected"
+        ],
+        "rss_bytes": 70254592,
+        "time_output": "        0.41 real         0.38 user         0.03 sys\n            70254592  maximum resident set size\n                   0  average shared memory size\n                   0  average unshared data size\n                   0  average unshared stack size\n                4502  page reclaims\n                   0  page faults\n                   0  swaps\n                   0  block input operations\n                   0  block output operations\n                   0  messages sent\n                   0  messages received\n                   0  signals received\n                   0  voluntary context switches\n                 554  involuntary context switches\n          7563526287  instructions retired\n          1763456859  cycles elapsed\n            63570424  peak memory footprint\n"
+      },
+      {
+        "mode": "projected",
+        "rounds": 10,
+        "versions": 8287,
+        "elapsed_ms": 248.869708,
+        "sample": 18,
+        "order": [
+          "full",
+          "projected"
+        ],
+        "rss_bytes": 34684928,
+        "time_output": "        0.25 real         0.23 user         0.01 sys\n            34684928  maximum resident set size\n                   0  average shared memory size\n                   0  average unshared data size\n                   0  average unshared stack size\n                2331  page reclaims\n                   0  page faults\n                   0  swaps\n                   0  block input operations\n                   0  block output operations\n                   0  messages sent\n                   0  messages received\n                   0  signals received\n                   0  voluntary context switches\n                 154  involuntary context switches\n          4869115695  instructions retired\n          1083923324  cycles elapsed\n            30507488  peak memory footprint\n"
+      },
+      {
+        "mode": "projected",
+        "rounds": 10,
+        "versions": 8287,
+        "elapsed_ms": 247.98475,
+        "sample": 19,
+        "order": [
+          "projected",
+          "full"
+        ],
+        "rss_bytes": 35848192,
+        "time_output": "        0.25 real         0.23 user         0.01 sys\n            35848192  maximum resident set size\n                   0  average shared memory size\n                   0  average unshared data size\n                   0  average unshared stack size\n                2402  page reclaims\n                   0  page faults\n                   0  swaps\n                   0  block input operations\n                   0  block output operations\n                   0  messages sent\n                   0  messages received\n                   0  signals received\n                   0  voluntary context switches\n                 124  involuntary context switches\n          4868449352  instructions retired\n          1083268028  cycles elapsed\n            31670752  peak memory footprint\n"
+      },
+      {
+        "mode": "full",
+        "rounds": 10,
+        "versions": 8287,
+        "elapsed_ms": 376.82291699999996,
+        "sample": 19,
+        "order": [
+          "projected",
+          "full"
+        ],
+        "rss_bytes": 67895296,
+        "time_output": "        0.38 real         0.35 user         0.02 sys\n            67895296  maximum resident set size\n                   0  average shared memory size\n                   0  average unshared data size\n                   0  average unshared stack size\n                4358  page reclaims\n                   0  page faults\n                   0  swaps\n                   0  block input operations\n                   0  block output operations\n                   0  messages sent\n                   0  messages received\n                   0  signals received\n                   0  voluntary context switches\n                  57  involuntary context switches\n          7546605833  instructions retired\n          1672159976  cycles elapsed\n            63554064  peak memory footprint\n"
+      },
+      {
+        "mode": "full",
+        "rounds": 10,
+        "versions": 8287,
+        "elapsed_ms": 380.74229199999996,
+        "sample": 20,
+        "order": [
+          "full",
+          "projected"
+        ],
+        "rss_bytes": 67928064,
+        "time_output": "        0.38 real         0.35 user         0.02 sys\n            67928064  maximum resident set size\n                   0  average shared memory size\n                   0  average unshared data size\n                   0  average unshared stack size\n                4360  page reclaims\n                   0  page faults\n                   0  swaps\n                   0  block input operations\n                   0  block output operations\n                   0  messages sent\n                   0  messages received\n                   0  signals received\n                   0  voluntary context switches\n                  59  involuntary context switches\n          7550164843  instructions retired\n          1693035728  cycles elapsed\n            63570424  peak memory footprint\n"
+      },
+      {
+        "mode": "projected",
+        "rounds": 10,
+        "versions": 8287,
+        "elapsed_ms": 248.820917,
+        "sample": 20,
+        "order": [
+          "full",
+          "projected"
+        ],
+        "rss_bytes": 34619392,
+        "time_output": "        0.25 real         0.23 user         0.01 sys\n            34619392  maximum resident set size\n                   0  average shared memory size\n                   0  average unshared data size\n                   0  average unshared stack size\n                2328  page reclaims\n                   0  page faults\n                   0  swaps\n                   0  block input operations\n                   0  block output operations\n                   0  messages sent\n                   0  messages received\n                   0  signals received\n                   0  voluntary context switches\n                  41  involuntary context switches\n          4870093525  instructions retired\n          1094997995  cycles elapsed\n            30441952  peak memory footprint\n"
+      }
+    ],
+    "summary": {
+      "full": {
+        "ms_per_decode": 38.56430415,
+        "rss_mib": 64.7734375
+      },
+      "projected": {
+        "ms_per_decode": 24.60765,
+        "rss_mib": 33.015625
+      }
+    },
+    "parity": "projection parity passed\n"
+  },
+  "diagnostics": {
+    "warm-t3/artifacts/timing/fresh-checkout-warm-cache/baseline/0/stdout.json": {
+      "purposes": [
+        {
+          "scope": "install_process",
+          "purpose": "resolve",
+          "rpc_ms": 0,
+          "rpc_count": 0,
+          "cache_hit_count": 221,
+          "cache_miss_count": 0,
+          "request_count": 221,
+          "unique_package_count": 174,
+          "duplicate_request_count": 47,
+          "top_duplicate_packages": [
+            {
+              "package": "@esbuild/android-arm",
+              "request_count": 3,
+              "duplicate_count": 2
+            },
+            {
+              "package": "@esbuild/android-arm64",
+              "request_count": 3,
+              "duplicate_count": 2
+            },
+            {
+              "package": "@esbuild/android-x64",
+              "request_count": 3,
+              "duplicate_count": 2
+            },
+            {
+              "package": "@esbuild/darwin-arm64",
+              "request_count": 3,
+              "duplicate_count": 2
+            },
+            {
+              "package": "@esbuild/darwin-x64",
+              "request_count": 3,
+              "duplicate_count": 2
+            },
+            {
+              "package": "@esbuild/freebsd-arm64",
+              "request_count": 3,
+              "duplicate_count": 2
+            },
+            {
+              "package": "@esbuild/freebsd-x64",
+              "request_count": 3,
+              "duplicate_count": 2
+            },
+            {
+              "package": "@esbuild/linux-arm",
+              "request_count": 3,
+              "duplicate_count": 2
+            },
+            {
+              "package": "@esbuild/linux-arm64",
+              "request_count": 3,
+              "duplicate_count": 2
+            },
+            {
+              "package": "@esbuild/linux-ia32",
+              "request_count": 3,
+              "duplicate_count": 2
+            }
+          ]
+        },
+        {
+          "scope": "install_process",
+          "purpose": "blocked_set",
+          "rpc_ms": 0,
+          "rpc_count": 0,
+          "cache_hit_count": 2,
+          "cache_miss_count": 0,
+          "request_count": 2,
+          "unique_package_count": 2,
+          "duplicate_request_count": 0,
+          "top_duplicate_packages": []
+        },
+        {
+          "scope": "install_process",
+          "purpose": "signature_hydration",
+          "rpc_ms": 0,
+          "rpc_count": 0,
+          "cache_hit_count": 0,
+          "cache_miss_count": 0,
+          "request_count": 0,
+          "unique_package_count": 0,
+          "duplicate_request_count": 0,
+          "top_duplicate_packages": []
+        },
+        {
+          "scope": "install_process",
+          "purpose": "platform_hydration",
+          "rpc_ms": 0,
+          "rpc_count": 0,
+          "cache_hit_count": 0,
+          "cache_miss_count": 0,
+          "request_count": 0,
+          "unique_package_count": 0,
+          "duplicate_request_count": 0,
+          "top_duplicate_packages": []
+        },
+        {
+          "scope": "install_process",
+          "purpose": "provenance_drift",
+          "rpc_ms": 0,
+          "rpc_count": 0,
+          "cache_hit_count": 0,
+          "cache_miss_count": 0,
+          "request_count": 0,
+          "unique_package_count": 0,
+          "duplicate_request_count": 0,
+          "top_duplicate_packages": []
+        },
+        {
+          "scope": "install_process",
+          "purpose": "tarball_url_lookup",
+          "rpc_ms": 0,
+          "rpc_count": 0,
+          "cache_hit_count": 0,
+          "cache_miss_count": 0,
+          "request_count": 0,
+          "unique_package_count": 0,
+          "duplicate_request_count": 0,
+          "top_duplicate_packages": []
+        }
+      ],
+      "resolve_ms": 34
+    },
+    "warm-t3/artifacts/timing/fresh-checkout-warm-cache/baseline/1/stdout.json": {
+      "purposes": [
+        {
+          "scope": "install_process",
+          "purpose": "resolve",
+          "rpc_ms": 0,
+          "rpc_count": 0,
+          "cache_hit_count": 221,
+          "cache_miss_count": 0,
+          "request_count": 221,
+          "unique_package_count": 174,
+          "duplicate_request_count": 47,
+          "top_duplicate_packages": [
+            {
+              "package": "@esbuild/android-arm",
+              "request_count": 3,
+              "duplicate_count": 2
+            },
+            {
+              "package": "@esbuild/android-arm64",
+              "request_count": 3,
+              "duplicate_count": 2
+            },
+            {
+              "package": "@esbuild/android-x64",
+              "request_count": 3,
+              "duplicate_count": 2
+            },
+            {
+              "package": "@esbuild/darwin-arm64",
+              "request_count": 3,
+              "duplicate_count": 2
+            },
+            {
+              "package": "@esbuild/darwin-x64",
+              "request_count": 3,
+              "duplicate_count": 2
+            },
+            {
+              "package": "@esbuild/freebsd-arm64",
+              "request_count": 3,
+              "duplicate_count": 2
+            },
+            {
+              "package": "@esbuild/freebsd-x64",
+              "request_count": 3,
+              "duplicate_count": 2
+            },
+            {
+              "package": "@esbuild/linux-arm",
+              "request_count": 3,
+              "duplicate_count": 2
+            },
+            {
+              "package": "@esbuild/linux-arm64",
+              "request_count": 3,
+              "duplicate_count": 2
+            },
+            {
+              "package": "@esbuild/linux-ia32",
+              "request_count": 3,
+              "duplicate_count": 2
+            }
+          ]
+        },
+        {
+          "scope": "install_process",
+          "purpose": "blocked_set",
+          "rpc_ms": 0,
+          "rpc_count": 0,
+          "cache_hit_count": 2,
+          "cache_miss_count": 0,
+          "request_count": 2,
+          "unique_package_count": 2,
+          "duplicate_request_count": 0,
+          "top_duplicate_packages": []
+        },
+        {
+          "scope": "install_process",
+          "purpose": "signature_hydration",
+          "rpc_ms": 0,
+          "rpc_count": 0,
+          "cache_hit_count": 0,
+          "cache_miss_count": 0,
+          "request_count": 0,
+          "unique_package_count": 0,
+          "duplicate_request_count": 0,
+          "top_duplicate_packages": []
+        },
+        {
+          "scope": "install_process",
+          "purpose": "platform_hydration",
+          "rpc_ms": 0,
+          "rpc_count": 0,
+          "cache_hit_count": 0,
+          "cache_miss_count": 0,
+          "request_count": 0,
+          "unique_package_count": 0,
+          "duplicate_request_count": 0,
+          "top_duplicate_packages": []
+        },
+        {
+          "scope": "install_process",
+          "purpose": "provenance_drift",
+          "rpc_ms": 0,
+          "rpc_count": 0,
+          "cache_hit_count": 0,
+          "cache_miss_count": 0,
+          "request_count": 0,
+          "unique_package_count": 0,
+          "duplicate_request_count": 0,
+          "top_duplicate_packages": []
+        },
+        {
+          "scope": "install_process",
+          "purpose": "tarball_url_lookup",
+          "rpc_ms": 0,
+          "rpc_count": 0,
+          "cache_hit_count": 0,
+          "cache_miss_count": 0,
+          "request_count": 0,
+          "unique_package_count": 0,
+          "duplicate_request_count": 0,
+          "top_duplicate_packages": []
+        }
+      ],
+      "resolve_ms": 35
+    },
+    "warm-t3/artifacts/timing/fresh-checkout-warm-cache/baseline/2/stdout.json": {
+      "purposes": [
+        {
+          "scope": "install_process",
+          "purpose": "resolve",
+          "rpc_ms": 0,
+          "rpc_count": 0,
+          "cache_hit_count": 221,
+          "cache_miss_count": 0,
+          "request_count": 221,
+          "unique_package_count": 174,
+          "duplicate_request_count": 47,
+          "top_duplicate_packages": [
+            {
+              "package": "@esbuild/android-arm",
+              "request_count": 3,
+              "duplicate_count": 2
+            },
+            {
+              "package": "@esbuild/android-arm64",
+              "request_count": 3,
+              "duplicate_count": 2
+            },
+            {
+              "package": "@esbuild/android-x64",
+              "request_count": 3,
+              "duplicate_count": 2
+            },
+            {
+              "package": "@esbuild/darwin-arm64",
+              "request_count": 3,
+              "duplicate_count": 2
+            },
+            {
+              "package": "@esbuild/darwin-x64",
+              "request_count": 3,
+              "duplicate_count": 2
+            },
+            {
+              "package": "@esbuild/freebsd-arm64",
+              "request_count": 3,
+              "duplicate_count": 2
+            },
+            {
+              "package": "@esbuild/freebsd-x64",
+              "request_count": 3,
+              "duplicate_count": 2
+            },
+            {
+              "package": "@esbuild/linux-arm",
+              "request_count": 3,
+              "duplicate_count": 2
+            },
+            {
+              "package": "@esbuild/linux-arm64",
+              "request_count": 3,
+              "duplicate_count": 2
+            },
+            {
+              "package": "@esbuild/linux-ia32",
+              "request_count": 3,
+              "duplicate_count": 2
+            }
+          ]
+        },
+        {
+          "scope": "install_process",
+          "purpose": "blocked_set",
+          "rpc_ms": 0,
+          "rpc_count": 0,
+          "cache_hit_count": 2,
+          "cache_miss_count": 0,
+          "request_count": 2,
+          "unique_package_count": 2,
+          "duplicate_request_count": 0,
+          "top_duplicate_packages": []
+        },
+        {
+          "scope": "install_process",
+          "purpose": "signature_hydration",
+          "rpc_ms": 0,
+          "rpc_count": 0,
+          "cache_hit_count": 0,
+          "cache_miss_count": 0,
+          "request_count": 0,
+          "unique_package_count": 0,
+          "duplicate_request_count": 0,
+          "top_duplicate_packages": []
+        },
+        {
+          "scope": "install_process",
+          "purpose": "platform_hydration",
+          "rpc_ms": 0,
+          "rpc_count": 0,
+          "cache_hit_count": 0,
+          "cache_miss_count": 0,
+          "request_count": 0,
+          "unique_package_count": 0,
+          "duplicate_request_count": 0,
+          "top_duplicate_packages": []
+        },
+        {
+          "scope": "install_process",
+          "purpose": "provenance_drift",
+          "rpc_ms": 0,
+          "rpc_count": 0,
+          "cache_hit_count": 0,
+          "cache_miss_count": 0,
+          "request_count": 0,
+          "unique_package_count": 0,
+          "duplicate_request_count": 0,
+          "top_duplicate_packages": []
+        },
+        {
+          "scope": "install_process",
+          "purpose": "tarball_url_lookup",
+          "rpc_ms": 0,
+          "rpc_count": 0,
+          "cache_hit_count": 0,
+          "cache_miss_count": 0,
+          "request_count": 0,
+          "unique_package_count": 0,
+          "duplicate_request_count": 0,
+          "top_duplicate_packages": []
+        }
+      ],
+      "resolve_ms": 32
+    },
+    "warm-t3/artifacts/timing/fresh-checkout-warm-cache/candidate/0/stdout.json": {
+      "purposes": [
+        {
+          "scope": "install_process",
+          "purpose": "resolve",
+          "rpc_ms": 0,
+          "rpc_count": 0,
+          "cache_hit_count": 221,
+          "cache_miss_count": 0,
+          "request_count": 221,
+          "unique_package_count": 174,
+          "duplicate_request_count": 47,
+          "top_duplicate_packages": [
+            {
+              "package": "@esbuild/android-arm",
+              "request_count": 3,
+              "duplicate_count": 2
+            },
+            {
+              "package": "@esbuild/android-arm64",
+              "request_count": 3,
+              "duplicate_count": 2
+            },
+            {
+              "package": "@esbuild/android-x64",
+              "request_count": 3,
+              "duplicate_count": 2
+            },
+            {
+              "package": "@esbuild/darwin-arm64",
+              "request_count": 3,
+              "duplicate_count": 2
+            },
+            {
+              "package": "@esbuild/darwin-x64",
+              "request_count": 3,
+              "duplicate_count": 2
+            },
+            {
+              "package": "@esbuild/freebsd-arm64",
+              "request_count": 3,
+              "duplicate_count": 2
+            },
+            {
+              "package": "@esbuild/freebsd-x64",
+              "request_count": 3,
+              "duplicate_count": 2
+            },
+            {
+              "package": "@esbuild/linux-arm",
+              "request_count": 3,
+              "duplicate_count": 2
+            },
+            {
+              "package": "@esbuild/linux-arm64",
+              "request_count": 3,
+              "duplicate_count": 2
+            },
+            {
+              "package": "@esbuild/linux-ia32",
+              "request_count": 3,
+              "duplicate_count": 2
+            }
+          ]
+        },
+        {
+          "scope": "install_process",
+          "purpose": "blocked_set",
+          "rpc_ms": 0,
+          "rpc_count": 0,
+          "cache_hit_count": 2,
+          "cache_miss_count": 0,
+          "request_count": 2,
+          "unique_package_count": 2,
+          "duplicate_request_count": 0,
+          "top_duplicate_packages": []
+        },
+        {
+          "scope": "install_process",
+          "purpose": "signature_hydration",
+          "rpc_ms": 0,
+          "rpc_count": 0,
+          "cache_hit_count": 0,
+          "cache_miss_count": 0,
+          "request_count": 0,
+          "unique_package_count": 0,
+          "duplicate_request_count": 0,
+          "top_duplicate_packages": []
+        },
+        {
+          "scope": "install_process",
+          "purpose": "platform_hydration",
+          "rpc_ms": 0,
+          "rpc_count": 0,
+          "cache_hit_count": 0,
+          "cache_miss_count": 0,
+          "request_count": 0,
+          "unique_package_count": 0,
+          "duplicate_request_count": 0,
+          "top_duplicate_packages": []
+        },
+        {
+          "scope": "install_process",
+          "purpose": "provenance_drift",
+          "rpc_ms": 0,
+          "rpc_count": 0,
+          "cache_hit_count": 0,
+          "cache_miss_count": 0,
+          "request_count": 0,
+          "unique_package_count": 0,
+          "duplicate_request_count": 0,
+          "top_duplicate_packages": []
+        },
+        {
+          "scope": "install_process",
+          "purpose": "tarball_url_lookup",
+          "rpc_ms": 0,
+          "rpc_count": 0,
+          "cache_hit_count": 0,
+          "cache_miss_count": 0,
+          "request_count": 0,
+          "unique_package_count": 0,
+          "duplicate_request_count": 0,
+          "top_duplicate_packages": []
+        }
+      ],
+      "resolve_ms": 28
+    },
+    "warm-t3/artifacts/timing/fresh-checkout-warm-cache/candidate/1/stdout.json": {
+      "purposes": [
+        {
+          "scope": "install_process",
+          "purpose": "resolve",
+          "rpc_ms": 0,
+          "rpc_count": 0,
+          "cache_hit_count": 221,
+          "cache_miss_count": 0,
+          "request_count": 221,
+          "unique_package_count": 174,
+          "duplicate_request_count": 47,
+          "top_duplicate_packages": [
+            {
+              "package": "@esbuild/android-arm",
+              "request_count": 3,
+              "duplicate_count": 2
+            },
+            {
+              "package": "@esbuild/android-arm64",
+              "request_count": 3,
+              "duplicate_count": 2
+            },
+            {
+              "package": "@esbuild/android-x64",
+              "request_count": 3,
+              "duplicate_count": 2
+            },
+            {
+              "package": "@esbuild/darwin-arm64",
+              "request_count": 3,
+              "duplicate_count": 2
+            },
+            {
+              "package": "@esbuild/darwin-x64",
+              "request_count": 3,
+              "duplicate_count": 2
+            },
+            {
+              "package": "@esbuild/freebsd-arm64",
+              "request_count": 3,
+              "duplicate_count": 2
+            },
+            {
+              "package": "@esbuild/freebsd-x64",
+              "request_count": 3,
+              "duplicate_count": 2
+            },
+            {
+              "package": "@esbuild/linux-arm",
+              "request_count": 3,
+              "duplicate_count": 2
+            },
+            {
+              "package": "@esbuild/linux-arm64",
+              "request_count": 3,
+              "duplicate_count": 2
+            },
+            {
+              "package": "@esbuild/linux-ia32",
+              "request_count": 3,
+              "duplicate_count": 2
+            }
+          ]
+        },
+        {
+          "scope": "install_process",
+          "purpose": "blocked_set",
+          "rpc_ms": 0,
+          "rpc_count": 0,
+          "cache_hit_count": 2,
+          "cache_miss_count": 0,
+          "request_count": 2,
+          "unique_package_count": 2,
+          "duplicate_request_count": 0,
+          "top_duplicate_packages": []
+        },
+        {
+          "scope": "install_process",
+          "purpose": "signature_hydration",
+          "rpc_ms": 0,
+          "rpc_count": 0,
+          "cache_hit_count": 0,
+          "cache_miss_count": 0,
+          "request_count": 0,
+          "unique_package_count": 0,
+          "duplicate_request_count": 0,
+          "top_duplicate_packages": []
+        },
+        {
+          "scope": "install_process",
+          "purpose": "platform_hydration",
+          "rpc_ms": 0,
+          "rpc_count": 0,
+          "cache_hit_count": 0,
+          "cache_miss_count": 0,
+          "request_count": 0,
+          "unique_package_count": 0,
+          "duplicate_request_count": 0,
+          "top_duplicate_packages": []
+        },
+        {
+          "scope": "install_process",
+          "purpose": "provenance_drift",
+          "rpc_ms": 0,
+          "rpc_count": 0,
+          "cache_hit_count": 0,
+          "cache_miss_count": 0,
+          "request_count": 0,
+          "unique_package_count": 0,
+          "duplicate_request_count": 0,
+          "top_duplicate_packages": []
+        },
+        {
+          "scope": "install_process",
+          "purpose": "tarball_url_lookup",
+          "rpc_ms": 0,
+          "rpc_count": 0,
+          "cache_hit_count": 0,
+          "cache_miss_count": 0,
+          "request_count": 0,
+          "unique_package_count": 0,
+          "duplicate_request_count": 0,
+          "top_duplicate_packages": []
+        }
+      ],
+      "resolve_ms": 28
+    },
+    "warm-t3/artifacts/timing/fresh-checkout-warm-cache/candidate/2/stdout.json": {
+      "purposes": [
+        {
+          "scope": "install_process",
+          "purpose": "resolve",
+          "rpc_ms": 0,
+          "rpc_count": 0,
+          "cache_hit_count": 221,
+          "cache_miss_count": 0,
+          "request_count": 221,
+          "unique_package_count": 174,
+          "duplicate_request_count": 47,
+          "top_duplicate_packages": [
+            {
+              "package": "@esbuild/android-arm",
+              "request_count": 3,
+              "duplicate_count": 2
+            },
+            {
+              "package": "@esbuild/android-arm64",
+              "request_count": 3,
+              "duplicate_count": 2
+            },
+            {
+              "package": "@esbuild/android-x64",
+              "request_count": 3,
+              "duplicate_count": 2
+            },
+            {
+              "package": "@esbuild/darwin-arm64",
+              "request_count": 3,
+              "duplicate_count": 2
+            },
+            {
+              "package": "@esbuild/darwin-x64",
+              "request_count": 3,
+              "duplicate_count": 2
+            },
+            {
+              "package": "@esbuild/freebsd-arm64",
+              "request_count": 3,
+              "duplicate_count": 2
+            },
+            {
+              "package": "@esbuild/freebsd-x64",
+              "request_count": 3,
+              "duplicate_count": 2
+            },
+            {
+              "package": "@esbuild/linux-arm",
+              "request_count": 3,
+              "duplicate_count": 2
+            },
+            {
+              "package": "@esbuild/linux-arm64",
+              "request_count": 3,
+              "duplicate_count": 2
+            },
+            {
+              "package": "@esbuild/linux-ia32",
+              "request_count": 3,
+              "duplicate_count": 2
+            }
+          ]
+        },
+        {
+          "scope": "install_process",
+          "purpose": "blocked_set",
+          "rpc_ms": 0,
+          "rpc_count": 0,
+          "cache_hit_count": 2,
+          "cache_miss_count": 0,
+          "request_count": 2,
+          "unique_package_count": 2,
+          "duplicate_request_count": 0,
+          "top_duplicate_packages": []
+        },
+        {
+          "scope": "install_process",
+          "purpose": "signature_hydration",
+          "rpc_ms": 0,
+          "rpc_count": 0,
+          "cache_hit_count": 0,
+          "cache_miss_count": 0,
+          "request_count": 0,
+          "unique_package_count": 0,
+          "duplicate_request_count": 0,
+          "top_duplicate_packages": []
+        },
+        {
+          "scope": "install_process",
+          "purpose": "platform_hydration",
+          "rpc_ms": 0,
+          "rpc_count": 0,
+          "cache_hit_count": 0,
+          "cache_miss_count": 0,
+          "request_count": 0,
+          "unique_package_count": 0,
+          "duplicate_request_count": 0,
+          "top_duplicate_packages": []
+        },
+        {
+          "scope": "install_process",
+          "purpose": "provenance_drift",
+          "rpc_ms": 0,
+          "rpc_count": 0,
+          "cache_hit_count": 0,
+          "cache_miss_count": 0,
+          "request_count": 0,
+          "unique_package_count": 0,
+          "duplicate_request_count": 0,
+          "top_duplicate_packages": []
+        },
+        {
+          "scope": "install_process",
+          "purpose": "tarball_url_lookup",
+          "rpc_ms": 0,
+          "rpc_count": 0,
+          "cache_hit_count": 0,
+          "cache_miss_count": 0,
+          "request_count": 0,
+          "unique_package_count": 0,
+          "duplicate_request_count": 0,
+          "top_duplicate_packages": []
+        }
+      ],
+      "resolve_ms": 28
+    },
+    "warm-vite-react/artifacts/timing/fresh-checkout-warm-cache/baseline/0/stdout.json": {
+      "purposes": [
+        {
+          "scope": "install_process",
+          "purpose": "resolve",
+          "rpc_ms": 0,
+          "rpc_count": 0,
+          "cache_hit_count": 110,
+          "cache_miss_count": 0,
+          "request_count": 110,
+          "unique_package_count": 110,
+          "duplicate_request_count": 0,
+          "top_duplicate_packages": []
+        },
+        {
+          "scope": "install_process",
+          "purpose": "blocked_set",
+          "rpc_ms": 0,
+          "rpc_count": 0,
+          "cache_hit_count": 1,
+          "cache_miss_count": 0,
+          "request_count": 1,
+          "unique_package_count": 1,
+          "duplicate_request_count": 0,
+          "top_duplicate_packages": []
+        },
+        {
+          "scope": "install_process",
+          "purpose": "signature_hydration",
+          "rpc_ms": 0,
+          "rpc_count": 0,
+          "cache_hit_count": 0,
+          "cache_miss_count": 0,
+          "request_count": 0,
+          "unique_package_count": 0,
+          "duplicate_request_count": 0,
+          "top_duplicate_packages": []
+        },
+        {
+          "scope": "install_process",
+          "purpose": "platform_hydration",
+          "rpc_ms": 0,
+          "rpc_count": 0,
+          "cache_hit_count": 0,
+          "cache_miss_count": 0,
+          "request_count": 0,
+          "unique_package_count": 0,
+          "duplicate_request_count": 0,
+          "top_duplicate_packages": []
+        },
+        {
+          "scope": "install_process",
+          "purpose": "provenance_drift",
+          "rpc_ms": 0,
+          "rpc_count": 0,
+          "cache_hit_count": 0,
+          "cache_miss_count": 0,
+          "request_count": 0,
+          "unique_package_count": 0,
+          "duplicate_request_count": 0,
+          "top_duplicate_packages": []
+        },
+        {
+          "scope": "install_process",
+          "purpose": "tarball_url_lookup",
+          "rpc_ms": 0,
+          "rpc_count": 0,
+          "cache_hit_count": 0,
+          "cache_miss_count": 0,
+          "request_count": 0,
+          "unique_package_count": 0,
+          "duplicate_request_count": 0,
+          "top_duplicate_packages": []
+        }
+      ],
+      "resolve_ms": 26
+    },
+    "warm-vite-react/artifacts/timing/fresh-checkout-warm-cache/baseline/1/stdout.json": {
+      "purposes": [
+        {
+          "scope": "install_process",
+          "purpose": "resolve",
+          "rpc_ms": 0,
+          "rpc_count": 0,
+          "cache_hit_count": 110,
+          "cache_miss_count": 0,
+          "request_count": 110,
+          "unique_package_count": 110,
+          "duplicate_request_count": 0,
+          "top_duplicate_packages": []
+        },
+        {
+          "scope": "install_process",
+          "purpose": "blocked_set",
+          "rpc_ms": 0,
+          "rpc_count": 0,
+          "cache_hit_count": 1,
+          "cache_miss_count": 0,
+          "request_count": 1,
+          "unique_package_count": 1,
+          "duplicate_request_count": 0,
+          "top_duplicate_packages": []
+        },
+        {
+          "scope": "install_process",
+          "purpose": "signature_hydration",
+          "rpc_ms": 0,
+          "rpc_count": 0,
+          "cache_hit_count": 0,
+          "cache_miss_count": 0,
+          "request_count": 0,
+          "unique_package_count": 0,
+          "duplicate_request_count": 0,
+          "top_duplicate_packages": []
+        },
+        {
+          "scope": "install_process",
+          "purpose": "platform_hydration",
+          "rpc_ms": 0,
+          "rpc_count": 0,
+          "cache_hit_count": 0,
+          "cache_miss_count": 0,
+          "request_count": 0,
+          "unique_package_count": 0,
+          "duplicate_request_count": 0,
+          "top_duplicate_packages": []
+        },
+        {
+          "scope": "install_process",
+          "purpose": "provenance_drift",
+          "rpc_ms": 0,
+          "rpc_count": 0,
+          "cache_hit_count": 0,
+          "cache_miss_count": 0,
+          "request_count": 0,
+          "unique_package_count": 0,
+          "duplicate_request_count": 0,
+          "top_duplicate_packages": []
+        },
+        {
+          "scope": "install_process",
+          "purpose": "tarball_url_lookup",
+          "rpc_ms": 0,
+          "rpc_count": 0,
+          "cache_hit_count": 0,
+          "cache_miss_count": 0,
+          "request_count": 0,
+          "unique_package_count": 0,
+          "duplicate_request_count": 0,
+          "top_duplicate_packages": []
+        }
+      ],
+      "resolve_ms": 25
+    },
+    "warm-vite-react/artifacts/timing/fresh-checkout-warm-cache/baseline/2/stdout.json": {
+      "purposes": [
+        {
+          "scope": "install_process",
+          "purpose": "resolve",
+          "rpc_ms": 0,
+          "rpc_count": 0,
+          "cache_hit_count": 110,
+          "cache_miss_count": 0,
+          "request_count": 110,
+          "unique_package_count": 110,
+          "duplicate_request_count": 0,
+          "top_duplicate_packages": []
+        },
+        {
+          "scope": "install_process",
+          "purpose": "blocked_set",
+          "rpc_ms": 0,
+          "rpc_count": 0,
+          "cache_hit_count": 1,
+          "cache_miss_count": 0,
+          "request_count": 1,
+          "unique_package_count": 1,
+          "duplicate_request_count": 0,
+          "top_duplicate_packages": []
+        },
+        {
+          "scope": "install_process",
+          "purpose": "signature_hydration",
+          "rpc_ms": 0,
+          "rpc_count": 0,
+          "cache_hit_count": 0,
+          "cache_miss_count": 0,
+          "request_count": 0,
+          "unique_package_count": 0,
+          "duplicate_request_count": 0,
+          "top_duplicate_packages": []
+        },
+        {
+          "scope": "install_process",
+          "purpose": "platform_hydration",
+          "rpc_ms": 0,
+          "rpc_count": 0,
+          "cache_hit_count": 0,
+          "cache_miss_count": 0,
+          "request_count": 0,
+          "unique_package_count": 0,
+          "duplicate_request_count": 0,
+          "top_duplicate_packages": []
+        },
+        {
+          "scope": "install_process",
+          "purpose": "provenance_drift",
+          "rpc_ms": 0,
+          "rpc_count": 0,
+          "cache_hit_count": 0,
+          "cache_miss_count": 0,
+          "request_count": 0,
+          "unique_package_count": 0,
+          "duplicate_request_count": 0,
+          "top_duplicate_packages": []
+        },
+        {
+          "scope": "install_process",
+          "purpose": "tarball_url_lookup",
+          "rpc_ms": 0,
+          "rpc_count": 0,
+          "cache_hit_count": 0,
+          "cache_miss_count": 0,
+          "request_count": 0,
+          "unique_package_count": 0,
+          "duplicate_request_count": 0,
+          "top_duplicate_packages": []
+        }
+      ],
+      "resolve_ms": 24
+    },
+    "warm-vite-react/artifacts/timing/fresh-checkout-warm-cache/candidate/0/stdout.json": {
+      "purposes": [
+        {
+          "scope": "install_process",
+          "purpose": "resolve",
+          "rpc_ms": 0,
+          "rpc_count": 0,
+          "cache_hit_count": 110,
+          "cache_miss_count": 0,
+          "request_count": 110,
+          "unique_package_count": 110,
+          "duplicate_request_count": 0,
+          "top_duplicate_packages": []
+        },
+        {
+          "scope": "install_process",
+          "purpose": "blocked_set",
+          "rpc_ms": 0,
+          "rpc_count": 0,
+          "cache_hit_count": 1,
+          "cache_miss_count": 0,
+          "request_count": 1,
+          "unique_package_count": 1,
+          "duplicate_request_count": 0,
+          "top_duplicate_packages": []
+        },
+        {
+          "scope": "install_process",
+          "purpose": "signature_hydration",
+          "rpc_ms": 0,
+          "rpc_count": 0,
+          "cache_hit_count": 0,
+          "cache_miss_count": 0,
+          "request_count": 0,
+          "unique_package_count": 0,
+          "duplicate_request_count": 0,
+          "top_duplicate_packages": []
+        },
+        {
+          "scope": "install_process",
+          "purpose": "platform_hydration",
+          "rpc_ms": 0,
+          "rpc_count": 0,
+          "cache_hit_count": 0,
+          "cache_miss_count": 0,
+          "request_count": 0,
+          "unique_package_count": 0,
+          "duplicate_request_count": 0,
+          "top_duplicate_packages": []
+        },
+        {
+          "scope": "install_process",
+          "purpose": "provenance_drift",
+          "rpc_ms": 0,
+          "rpc_count": 0,
+          "cache_hit_count": 0,
+          "cache_miss_count": 0,
+          "request_count": 0,
+          "unique_package_count": 0,
+          "duplicate_request_count": 0,
+          "top_duplicate_packages": []
+        },
+        {
+          "scope": "install_process",
+          "purpose": "tarball_url_lookup",
+          "rpc_ms": 0,
+          "rpc_count": 0,
+          "cache_hit_count": 0,
+          "cache_miss_count": 0,
+          "request_count": 0,
+          "unique_package_count": 0,
+          "duplicate_request_count": 0,
+          "top_duplicate_packages": []
+        }
+      ],
+      "resolve_ms": 25
+    },
+    "warm-vite-react/artifacts/timing/fresh-checkout-warm-cache/candidate/1/stdout.json": {
+      "purposes": [
+        {
+          "scope": "install_process",
+          "purpose": "resolve",
+          "rpc_ms": 0,
+          "rpc_count": 0,
+          "cache_hit_count": 110,
+          "cache_miss_count": 0,
+          "request_count": 110,
+          "unique_package_count": 110,
+          "duplicate_request_count": 0,
+          "top_duplicate_packages": []
+        },
+        {
+          "scope": "install_process",
+          "purpose": "blocked_set",
+          "rpc_ms": 0,
+          "rpc_count": 0,
+          "cache_hit_count": 1,
+          "cache_miss_count": 0,
+          "request_count": 1,
+          "unique_package_count": 1,
+          "duplicate_request_count": 0,
+          "top_duplicate_packages": []
+        },
+        {
+          "scope": "install_process",
+          "purpose": "signature_hydration",
+          "rpc_ms": 0,
+          "rpc_count": 0,
+          "cache_hit_count": 0,
+          "cache_miss_count": 0,
+          "request_count": 0,
+          "unique_package_count": 0,
+          "duplicate_request_count": 0,
+          "top_duplicate_packages": []
+        },
+        {
+          "scope": "install_process",
+          "purpose": "platform_hydration",
+          "rpc_ms": 0,
+          "rpc_count": 0,
+          "cache_hit_count": 0,
+          "cache_miss_count": 0,
+          "request_count": 0,
+          "unique_package_count": 0,
+          "duplicate_request_count": 0,
+          "top_duplicate_packages": []
+        },
+        {
+          "scope": "install_process",
+          "purpose": "provenance_drift",
+          "rpc_ms": 0,
+          "rpc_count": 0,
+          "cache_hit_count": 0,
+          "cache_miss_count": 0,
+          "request_count": 0,
+          "unique_package_count": 0,
+          "duplicate_request_count": 0,
+          "top_duplicate_packages": []
+        },
+        {
+          "scope": "install_process",
+          "purpose": "tarball_url_lookup",
+          "rpc_ms": 0,
+          "rpc_count": 0,
+          "cache_hit_count": 0,
+          "cache_miss_count": 0,
+          "request_count": 0,
+          "unique_package_count": 0,
+          "duplicate_request_count": 0,
+          "top_duplicate_packages": []
+        }
+      ],
+      "resolve_ms": 25
+    },
+    "warm-vite-react/artifacts/timing/fresh-checkout-warm-cache/candidate/2/stdout.json": {
+      "purposes": [
+        {
+          "scope": "install_process",
+          "purpose": "resolve",
+          "rpc_ms": 0,
+          "rpc_count": 0,
+          "cache_hit_count": 110,
+          "cache_miss_count": 0,
+          "request_count": 110,
+          "unique_package_count": 110,
+          "duplicate_request_count": 0,
+          "top_duplicate_packages": []
+        },
+        {
+          "scope": "install_process",
+          "purpose": "blocked_set",
+          "rpc_ms": 0,
+          "rpc_count": 0,
+          "cache_hit_count": 1,
+          "cache_miss_count": 0,
+          "request_count": 1,
+          "unique_package_count": 1,
+          "duplicate_request_count": 0,
+          "top_duplicate_packages": []
+        },
+        {
+          "scope": "install_process",
+          "purpose": "signature_hydration",
+          "rpc_ms": 0,
+          "rpc_count": 0,
+          "cache_hit_count": 0,
+          "cache_miss_count": 0,
+          "request_count": 0,
+          "unique_package_count": 0,
+          "duplicate_request_count": 0,
+          "top_duplicate_packages": []
+        },
+        {
+          "scope": "install_process",
+          "purpose": "platform_hydration",
+          "rpc_ms": 0,
+          "rpc_count": 0,
+          "cache_hit_count": 0,
+          "cache_miss_count": 0,
+          "request_count": 0,
+          "unique_package_count": 0,
+          "duplicate_request_count": 0,
+          "top_duplicate_packages": []
+        },
+        {
+          "scope": "install_process",
+          "purpose": "provenance_drift",
+          "rpc_ms": 0,
+          "rpc_count": 0,
+          "cache_hit_count": 0,
+          "cache_miss_count": 0,
+          "request_count": 0,
+          "unique_package_count": 0,
+          "duplicate_request_count": 0,
+          "top_duplicate_packages": []
+        },
+        {
+          "scope": "install_process",
+          "purpose": "tarball_url_lookup",
+          "rpc_ms": 0,
+          "rpc_count": 0,
+          "cache_hit_count": 0,
+          "cache_miss_count": 0,
+          "request_count": 0,
+          "unique_package_count": 0,
+          "duplicate_request_count": 0,
+          "top_duplicate_packages": []
+        }
+      ],
+      "resolve_ms": 23
+    },
+    "warm-native-sharp/artifacts/timing/fresh-checkout-warm-cache/baseline/0/stdout.json": {
+      "purposes": [
+        {
+          "scope": "install_process",
+          "purpose": "resolve",
+          "rpc_ms": 0,
+          "rpc_count": 0,
+          "cache_hit_count": 30,
+          "cache_miss_count": 0,
+          "request_count": 30,
+          "unique_package_count": 30,
+          "duplicate_request_count": 0,
+          "top_duplicate_packages": []
+        },
+        {
+          "scope": "install_process",
+          "purpose": "blocked_set",
+          "rpc_ms": 0,
+          "rpc_count": 0,
+          "cache_hit_count": 1,
+          "cache_miss_count": 0,
+          "request_count": 1,
+          "unique_package_count": 1,
+          "duplicate_request_count": 0,
+          "top_duplicate_packages": []
+        },
+        {
+          "scope": "install_process",
+          "purpose": "signature_hydration",
+          "rpc_ms": 0,
+          "rpc_count": 0,
+          "cache_hit_count": 0,
+          "cache_miss_count": 0,
+          "request_count": 0,
+          "unique_package_count": 0,
+          "duplicate_request_count": 0,
+          "top_duplicate_packages": []
+        },
+        {
+          "scope": "install_process",
+          "purpose": "platform_hydration",
+          "rpc_ms": 0,
+          "rpc_count": 0,
+          "cache_hit_count": 0,
+          "cache_miss_count": 0,
+          "request_count": 0,
+          "unique_package_count": 0,
+          "duplicate_request_count": 0,
+          "top_duplicate_packages": []
+        },
+        {
+          "scope": "install_process",
+          "purpose": "provenance_drift",
+          "rpc_ms": 0,
+          "rpc_count": 0,
+          "cache_hit_count": 0,
+          "cache_miss_count": 0,
+          "request_count": 0,
+          "unique_package_count": 0,
+          "duplicate_request_count": 0,
+          "top_duplicate_packages": []
+        },
+        {
+          "scope": "install_process",
+          "purpose": "tarball_url_lookup",
+          "rpc_ms": 0,
+          "rpc_count": 0,
+          "cache_hit_count": 0,
+          "cache_miss_count": 0,
+          "request_count": 0,
+          "unique_package_count": 0,
+          "duplicate_request_count": 0,
+          "top_duplicate_packages": []
+        }
+      ],
+      "resolve_ms": 2
+    },
+    "warm-native-sharp/artifacts/timing/fresh-checkout-warm-cache/baseline/1/stdout.json": {
+      "purposes": [
+        {
+          "scope": "install_process",
+          "purpose": "resolve",
+          "rpc_ms": 0,
+          "rpc_count": 0,
+          "cache_hit_count": 30,
+          "cache_miss_count": 0,
+          "request_count": 30,
+          "unique_package_count": 30,
+          "duplicate_request_count": 0,
+          "top_duplicate_packages": []
+        },
+        {
+          "scope": "install_process",
+          "purpose": "blocked_set",
+          "rpc_ms": 0,
+          "rpc_count": 0,
+          "cache_hit_count": 1,
+          "cache_miss_count": 0,
+          "request_count": 1,
+          "unique_package_count": 1,
+          "duplicate_request_count": 0,
+          "top_duplicate_packages": []
+        },
+        {
+          "scope": "install_process",
+          "purpose": "signature_hydration",
+          "rpc_ms": 0,
+          "rpc_count": 0,
+          "cache_hit_count": 0,
+          "cache_miss_count": 0,
+          "request_count": 0,
+          "unique_package_count": 0,
+          "duplicate_request_count": 0,
+          "top_duplicate_packages": []
+        },
+        {
+          "scope": "install_process",
+          "purpose": "platform_hydration",
+          "rpc_ms": 0,
+          "rpc_count": 0,
+          "cache_hit_count": 0,
+          "cache_miss_count": 0,
+          "request_count": 0,
+          "unique_package_count": 0,
+          "duplicate_request_count": 0,
+          "top_duplicate_packages": []
+        },
+        {
+          "scope": "install_process",
+          "purpose": "provenance_drift",
+          "rpc_ms": 0,
+          "rpc_count": 0,
+          "cache_hit_count": 0,
+          "cache_miss_count": 0,
+          "request_count": 0,
+          "unique_package_count": 0,
+          "duplicate_request_count": 0,
+          "top_duplicate_packages": []
+        },
+        {
+          "scope": "install_process",
+          "purpose": "tarball_url_lookup",
+          "rpc_ms": 0,
+          "rpc_count": 0,
+          "cache_hit_count": 0,
+          "cache_miss_count": 0,
+          "request_count": 0,
+          "unique_package_count": 0,
+          "duplicate_request_count": 0,
+          "top_duplicate_packages": []
+        }
+      ],
+      "resolve_ms": 2
+    },
+    "warm-native-sharp/artifacts/timing/fresh-checkout-warm-cache/baseline/2/stdout.json": {
+      "purposes": [
+        {
+          "scope": "install_process",
+          "purpose": "resolve",
+          "rpc_ms": 0,
+          "rpc_count": 0,
+          "cache_hit_count": 30,
+          "cache_miss_count": 0,
+          "request_count": 30,
+          "unique_package_count": 30,
+          "duplicate_request_count": 0,
+          "top_duplicate_packages": []
+        },
+        {
+          "scope": "install_process",
+          "purpose": "blocked_set",
+          "rpc_ms": 0,
+          "rpc_count": 0,
+          "cache_hit_count": 1,
+          "cache_miss_count": 0,
+          "request_count": 1,
+          "unique_package_count": 1,
+          "duplicate_request_count": 0,
+          "top_duplicate_packages": []
+        },
+        {
+          "scope": "install_process",
+          "purpose": "signature_hydration",
+          "rpc_ms": 0,
+          "rpc_count": 0,
+          "cache_hit_count": 0,
+          "cache_miss_count": 0,
+          "request_count": 0,
+          "unique_package_count": 0,
+          "duplicate_request_count": 0,
+          "top_duplicate_packages": []
+        },
+        {
+          "scope": "install_process",
+          "purpose": "platform_hydration",
+          "rpc_ms": 0,
+          "rpc_count": 0,
+          "cache_hit_count": 0,
+          "cache_miss_count": 0,
+          "request_count": 0,
+          "unique_package_count": 0,
+          "duplicate_request_count": 0,
+          "top_duplicate_packages": []
+        },
+        {
+          "scope": "install_process",
+          "purpose": "provenance_drift",
+          "rpc_ms": 0,
+          "rpc_count": 0,
+          "cache_hit_count": 0,
+          "cache_miss_count": 0,
+          "request_count": 0,
+          "unique_package_count": 0,
+          "duplicate_request_count": 0,
+          "top_duplicate_packages": []
+        },
+        {
+          "scope": "install_process",
+          "purpose": "tarball_url_lookup",
+          "rpc_ms": 0,
+          "rpc_count": 0,
+          "cache_hit_count": 0,
+          "cache_miss_count": 0,
+          "request_count": 0,
+          "unique_package_count": 0,
+          "duplicate_request_count": 0,
+          "top_duplicate_packages": []
+        }
+      ],
+      "resolve_ms": 2
+    },
+    "warm-native-sharp/artifacts/timing/fresh-checkout-warm-cache/candidate/0/stdout.json": {
+      "purposes": [
+        {
+          "scope": "install_process",
+          "purpose": "resolve",
+          "rpc_ms": 0,
+          "rpc_count": 0,
+          "cache_hit_count": 30,
+          "cache_miss_count": 0,
+          "request_count": 30,
+          "unique_package_count": 30,
+          "duplicate_request_count": 0,
+          "top_duplicate_packages": []
+        },
+        {
+          "scope": "install_process",
+          "purpose": "blocked_set",
+          "rpc_ms": 0,
+          "rpc_count": 0,
+          "cache_hit_count": 1,
+          "cache_miss_count": 0,
+          "request_count": 1,
+          "unique_package_count": 1,
+          "duplicate_request_count": 0,
+          "top_duplicate_packages": []
+        },
+        {
+          "scope": "install_process",
+          "purpose": "signature_hydration",
+          "rpc_ms": 0,
+          "rpc_count": 0,
+          "cache_hit_count": 0,
+          "cache_miss_count": 0,
+          "request_count": 0,
+          "unique_package_count": 0,
+          "duplicate_request_count": 0,
+          "top_duplicate_packages": []
+        },
+        {
+          "scope": "install_process",
+          "purpose": "platform_hydration",
+          "rpc_ms": 0,
+          "rpc_count": 0,
+          "cache_hit_count": 0,
+          "cache_miss_count": 0,
+          "request_count": 0,
+          "unique_package_count": 0,
+          "duplicate_request_count": 0,
+          "top_duplicate_packages": []
+        },
+        {
+          "scope": "install_process",
+          "purpose": "provenance_drift",
+          "rpc_ms": 0,
+          "rpc_count": 0,
+          "cache_hit_count": 0,
+          "cache_miss_count": 0,
+          "request_count": 0,
+          "unique_package_count": 0,
+          "duplicate_request_count": 0,
+          "top_duplicate_packages": []
+        },
+        {
+          "scope": "install_process",
+          "purpose": "tarball_url_lookup",
+          "rpc_ms": 0,
+          "rpc_count": 0,
+          "cache_hit_count": 0,
+          "cache_miss_count": 0,
+          "request_count": 0,
+          "unique_package_count": 0,
+          "duplicate_request_count": 0,
+          "top_duplicate_packages": []
+        }
+      ],
+      "resolve_ms": 3
+    },
+    "warm-native-sharp/artifacts/timing/fresh-checkout-warm-cache/candidate/1/stdout.json": {
+      "purposes": [
+        {
+          "scope": "install_process",
+          "purpose": "resolve",
+          "rpc_ms": 0,
+          "rpc_count": 0,
+          "cache_hit_count": 30,
+          "cache_miss_count": 0,
+          "request_count": 30,
+          "unique_package_count": 30,
+          "duplicate_request_count": 0,
+          "top_duplicate_packages": []
+        },
+        {
+          "scope": "install_process",
+          "purpose": "blocked_set",
+          "rpc_ms": 0,
+          "rpc_count": 0,
+          "cache_hit_count": 1,
+          "cache_miss_count": 0,
+          "request_count": 1,
+          "unique_package_count": 1,
+          "duplicate_request_count": 0,
+          "top_duplicate_packages": []
+        },
+        {
+          "scope": "install_process",
+          "purpose": "signature_hydration",
+          "rpc_ms": 0,
+          "rpc_count": 0,
+          "cache_hit_count": 0,
+          "cache_miss_count": 0,
+          "request_count": 0,
+          "unique_package_count": 0,
+          "duplicate_request_count": 0,
+          "top_duplicate_packages": []
+        },
+        {
+          "scope": "install_process",
+          "purpose": "platform_hydration",
+          "rpc_ms": 0,
+          "rpc_count": 0,
+          "cache_hit_count": 0,
+          "cache_miss_count": 0,
+          "request_count": 0,
+          "unique_package_count": 0,
+          "duplicate_request_count": 0,
+          "top_duplicate_packages": []
+        },
+        {
+          "scope": "install_process",
+          "purpose": "provenance_drift",
+          "rpc_ms": 0,
+          "rpc_count": 0,
+          "cache_hit_count": 0,
+          "cache_miss_count": 0,
+          "request_count": 0,
+          "unique_package_count": 0,
+          "duplicate_request_count": 0,
+          "top_duplicate_packages": []
+        },
+        {
+          "scope": "install_process",
+          "purpose": "tarball_url_lookup",
+          "rpc_ms": 0,
+          "rpc_count": 0,
+          "cache_hit_count": 0,
+          "cache_miss_count": 0,
+          "request_count": 0,
+          "unique_package_count": 0,
+          "duplicate_request_count": 0,
+          "top_duplicate_packages": []
+        }
+      ],
+      "resolve_ms": 2
+    },
+    "warm-native-sharp/artifacts/timing/fresh-checkout-warm-cache/candidate/2/stdout.json": {
+      "purposes": [
+        {
+          "scope": "install_process",
+          "purpose": "resolve",
+          "rpc_ms": 0,
+          "rpc_count": 0,
+          "cache_hit_count": 30,
+          "cache_miss_count": 0,
+          "request_count": 30,
+          "unique_package_count": 30,
+          "duplicate_request_count": 0,
+          "top_duplicate_packages": []
+        },
+        {
+          "scope": "install_process",
+          "purpose": "blocked_set",
+          "rpc_ms": 0,
+          "rpc_count": 0,
+          "cache_hit_count": 1,
+          "cache_miss_count": 0,
+          "request_count": 1,
+          "unique_package_count": 1,
+          "duplicate_request_count": 0,
+          "top_duplicate_packages": []
+        },
+        {
+          "scope": "install_process",
+          "purpose": "signature_hydration",
+          "rpc_ms": 0,
+          "rpc_count": 0,
+          "cache_hit_count": 0,
+          "cache_miss_count": 0,
+          "request_count": 0,
+          "unique_package_count": 0,
+          "duplicate_request_count": 0,
+          "top_duplicate_packages": []
+        },
+        {
+          "scope": "install_process",
+          "purpose": "platform_hydration",
+          "rpc_ms": 0,
+          "rpc_count": 0,
+          "cache_hit_count": 0,
+          "cache_miss_count": 0,
+          "request_count": 0,
+          "unique_package_count": 0,
+          "duplicate_request_count": 0,
+          "top_duplicate_packages": []
+        },
+        {
+          "scope": "install_process",
+          "purpose": "provenance_drift",
+          "rpc_ms": 0,
+          "rpc_count": 0,
+          "cache_hit_count": 0,
+          "cache_miss_count": 0,
+          "request_count": 0,
+          "unique_package_count": 0,
+          "duplicate_request_count": 0,
+          "top_duplicate_packages": []
+        },
+        {
+          "scope": "install_process",
+          "purpose": "tarball_url_lookup",
+          "rpc_ms": 0,
+          "rpc_count": 0,
+          "cache_hit_count": 0,
+          "cache_miss_count": 0,
+          "request_count": 0,
+          "unique_package_count": 0,
+          "duplicate_request_count": 0,
+          "top_duplicate_packages": []
+        }
+      ],
+      "resolve_ms": 2
+    },
+    "warm-nest/artifacts/timing/fresh-checkout-warm-cache/baseline/0/stdout.json": {
+      "purposes": [
+        {
+          "scope": "install_process",
+          "purpose": "resolve",
+          "rpc_ms": 0,
+          "rpc_count": 0,
+          "cache_hit_count": 34,
+          "cache_miss_count": 0,
+          "request_count": 34,
+          "unique_package_count": 33,
+          "duplicate_request_count": 1,
+          "top_duplicate_packages": [
+            {
+              "package": "tslib",
+              "request_count": 2,
+              "duplicate_count": 1
+            }
+          ]
+        },
+        {
+          "scope": "install_process",
+          "purpose": "blocked_set",
+          "rpc_ms": 0,
+          "rpc_count": 0,
+          "cache_hit_count": 1,
+          "cache_miss_count": 0,
+          "request_count": 1,
+          "unique_package_count": 1,
+          "duplicate_request_count": 0,
+          "top_duplicate_packages": []
+        },
+        {
+          "scope": "install_process",
+          "purpose": "signature_hydration",
+          "rpc_ms": 0,
+          "rpc_count": 0,
+          "cache_hit_count": 0,
+          "cache_miss_count": 0,
+          "request_count": 0,
+          "unique_package_count": 0,
+          "duplicate_request_count": 0,
+          "top_duplicate_packages": []
+        },
+        {
+          "scope": "install_process",
+          "purpose": "platform_hydration",
+          "rpc_ms": 0,
+          "rpc_count": 0,
+          "cache_hit_count": 0,
+          "cache_miss_count": 0,
+          "request_count": 0,
+          "unique_package_count": 0,
+          "duplicate_request_count": 0,
+          "top_duplicate_packages": []
+        },
+        {
+          "scope": "install_process",
+          "purpose": "provenance_drift",
+          "rpc_ms": 0,
+          "rpc_count": 0,
+          "cache_hit_count": 0,
+          "cache_miss_count": 0,
+          "request_count": 0,
+          "unique_package_count": 0,
+          "duplicate_request_count": 0,
+          "top_duplicate_packages": []
+        },
+        {
+          "scope": "install_process",
+          "purpose": "tarball_url_lookup",
+          "rpc_ms": 0,
+          "rpc_count": 0,
+          "cache_hit_count": 0,
+          "cache_miss_count": 0,
+          "request_count": 0,
+          "unique_package_count": 0,
+          "duplicate_request_count": 0,
+          "top_duplicate_packages": []
+        }
+      ],
+      "resolve_ms": 3
+    },
+    "warm-nest/artifacts/timing/fresh-checkout-warm-cache/baseline/1/stdout.json": {
+      "purposes": [
+        {
+          "scope": "install_process",
+          "purpose": "resolve",
+          "rpc_ms": 0,
+          "rpc_count": 0,
+          "cache_hit_count": 34,
+          "cache_miss_count": 0,
+          "request_count": 34,
+          "unique_package_count": 33,
+          "duplicate_request_count": 1,
+          "top_duplicate_packages": [
+            {
+              "package": "tslib",
+              "request_count": 2,
+              "duplicate_count": 1
+            }
+          ]
+        },
+        {
+          "scope": "install_process",
+          "purpose": "blocked_set",
+          "rpc_ms": 0,
+          "rpc_count": 0,
+          "cache_hit_count": 1,
+          "cache_miss_count": 0,
+          "request_count": 1,
+          "unique_package_count": 1,
+          "duplicate_request_count": 0,
+          "top_duplicate_packages": []
+        },
+        {
+          "scope": "install_process",
+          "purpose": "signature_hydration",
+          "rpc_ms": 0,
+          "rpc_count": 0,
+          "cache_hit_count": 0,
+          "cache_miss_count": 0,
+          "request_count": 0,
+          "unique_package_count": 0,
+          "duplicate_request_count": 0,
+          "top_duplicate_packages": []
+        },
+        {
+          "scope": "install_process",
+          "purpose": "platform_hydration",
+          "rpc_ms": 0,
+          "rpc_count": 0,
+          "cache_hit_count": 0,
+          "cache_miss_count": 0,
+          "request_count": 0,
+          "unique_package_count": 0,
+          "duplicate_request_count": 0,
+          "top_duplicate_packages": []
+        },
+        {
+          "scope": "install_process",
+          "purpose": "provenance_drift",
+          "rpc_ms": 0,
+          "rpc_count": 0,
+          "cache_hit_count": 0,
+          "cache_miss_count": 0,
+          "request_count": 0,
+          "unique_package_count": 0,
+          "duplicate_request_count": 0,
+          "top_duplicate_packages": []
+        },
+        {
+          "scope": "install_process",
+          "purpose": "tarball_url_lookup",
+          "rpc_ms": 0,
+          "rpc_count": 0,
+          "cache_hit_count": 0,
+          "cache_miss_count": 0,
+          "request_count": 0,
+          "unique_package_count": 0,
+          "duplicate_request_count": 0,
+          "top_duplicate_packages": []
+        }
+      ],
+      "resolve_ms": 3
+    },
+    "warm-nest/artifacts/timing/fresh-checkout-warm-cache/baseline/2/stdout.json": {
+      "purposes": [
+        {
+          "scope": "install_process",
+          "purpose": "resolve",
+          "rpc_ms": 0,
+          "rpc_count": 0,
+          "cache_hit_count": 34,
+          "cache_miss_count": 0,
+          "request_count": 34,
+          "unique_package_count": 33,
+          "duplicate_request_count": 1,
+          "top_duplicate_packages": [
+            {
+              "package": "tslib",
+              "request_count": 2,
+              "duplicate_count": 1
+            }
+          ]
+        },
+        {
+          "scope": "install_process",
+          "purpose": "blocked_set",
+          "rpc_ms": 0,
+          "rpc_count": 0,
+          "cache_hit_count": 1,
+          "cache_miss_count": 0,
+          "request_count": 1,
+          "unique_package_count": 1,
+          "duplicate_request_count": 0,
+          "top_duplicate_packages": []
+        },
+        {
+          "scope": "install_process",
+          "purpose": "signature_hydration",
+          "rpc_ms": 0,
+          "rpc_count": 0,
+          "cache_hit_count": 0,
+          "cache_miss_count": 0,
+          "request_count": 0,
+          "unique_package_count": 0,
+          "duplicate_request_count": 0,
+          "top_duplicate_packages": []
+        },
+        {
+          "scope": "install_process",
+          "purpose": "platform_hydration",
+          "rpc_ms": 0,
+          "rpc_count": 0,
+          "cache_hit_count": 0,
+          "cache_miss_count": 0,
+          "request_count": 0,
+          "unique_package_count": 0,
+          "duplicate_request_count": 0,
+          "top_duplicate_packages": []
+        },
+        {
+          "scope": "install_process",
+          "purpose": "provenance_drift",
+          "rpc_ms": 0,
+          "rpc_count": 0,
+          "cache_hit_count": 0,
+          "cache_miss_count": 0,
+          "request_count": 0,
+          "unique_package_count": 0,
+          "duplicate_request_count": 0,
+          "top_duplicate_packages": []
+        },
+        {
+          "scope": "install_process",
+          "purpose": "tarball_url_lookup",
+          "rpc_ms": 0,
+          "rpc_count": 0,
+          "cache_hit_count": 0,
+          "cache_miss_count": 0,
+          "request_count": 0,
+          "unique_package_count": 0,
+          "duplicate_request_count": 0,
+          "top_duplicate_packages": []
+        }
+      ],
+      "resolve_ms": 3
+    },
+    "warm-nest/artifacts/timing/fresh-checkout-warm-cache/candidate/0/stdout.json": {
+      "purposes": [
+        {
+          "scope": "install_process",
+          "purpose": "resolve",
+          "rpc_ms": 0,
+          "rpc_count": 0,
+          "cache_hit_count": 34,
+          "cache_miss_count": 0,
+          "request_count": 34,
+          "unique_package_count": 33,
+          "duplicate_request_count": 1,
+          "top_duplicate_packages": [
+            {
+              "package": "tslib",
+              "request_count": 2,
+              "duplicate_count": 1
+            }
+          ]
+        },
+        {
+          "scope": "install_process",
+          "purpose": "blocked_set",
+          "rpc_ms": 0,
+          "rpc_count": 0,
+          "cache_hit_count": 1,
+          "cache_miss_count": 0,
+          "request_count": 1,
+          "unique_package_count": 1,
+          "duplicate_request_count": 0,
+          "top_duplicate_packages": []
+        },
+        {
+          "scope": "install_process",
+          "purpose": "signature_hydration",
+          "rpc_ms": 0,
+          "rpc_count": 0,
+          "cache_hit_count": 0,
+          "cache_miss_count": 0,
+          "request_count": 0,
+          "unique_package_count": 0,
+          "duplicate_request_count": 0,
+          "top_duplicate_packages": []
+        },
+        {
+          "scope": "install_process",
+          "purpose": "platform_hydration",
+          "rpc_ms": 0,
+          "rpc_count": 0,
+          "cache_hit_count": 0,
+          "cache_miss_count": 0,
+          "request_count": 0,
+          "unique_package_count": 0,
+          "duplicate_request_count": 0,
+          "top_duplicate_packages": []
+        },
+        {
+          "scope": "install_process",
+          "purpose": "provenance_drift",
+          "rpc_ms": 0,
+          "rpc_count": 0,
+          "cache_hit_count": 0,
+          "cache_miss_count": 0,
+          "request_count": 0,
+          "unique_package_count": 0,
+          "duplicate_request_count": 0,
+          "top_duplicate_packages": []
+        },
+        {
+          "scope": "install_process",
+          "purpose": "tarball_url_lookup",
+          "rpc_ms": 0,
+          "rpc_count": 0,
+          "cache_hit_count": 0,
+          "cache_miss_count": 0,
+          "request_count": 0,
+          "unique_package_count": 0,
+          "duplicate_request_count": 0,
+          "top_duplicate_packages": []
+        }
+      ],
+      "resolve_ms": 3
+    },
+    "warm-nest/artifacts/timing/fresh-checkout-warm-cache/candidate/1/stdout.json": {
+      "purposes": [
+        {
+          "scope": "install_process",
+          "purpose": "resolve",
+          "rpc_ms": 0,
+          "rpc_count": 0,
+          "cache_hit_count": 34,
+          "cache_miss_count": 0,
+          "request_count": 34,
+          "unique_package_count": 33,
+          "duplicate_request_count": 1,
+          "top_duplicate_packages": [
+            {
+              "package": "tslib",
+              "request_count": 2,
+              "duplicate_count": 1
+            }
+          ]
+        },
+        {
+          "scope": "install_process",
+          "purpose": "blocked_set",
+          "rpc_ms": 0,
+          "rpc_count": 0,
+          "cache_hit_count": 1,
+          "cache_miss_count": 0,
+          "request_count": 1,
+          "unique_package_count": 1,
+          "duplicate_request_count": 0,
+          "top_duplicate_packages": []
+        },
+        {
+          "scope": "install_process",
+          "purpose": "signature_hydration",
+          "rpc_ms": 0,
+          "rpc_count": 0,
+          "cache_hit_count": 0,
+          "cache_miss_count": 0,
+          "request_count": 0,
+          "unique_package_count": 0,
+          "duplicate_request_count": 0,
+          "top_duplicate_packages": []
+        },
+        {
+          "scope": "install_process",
+          "purpose": "platform_hydration",
+          "rpc_ms": 0,
+          "rpc_count": 0,
+          "cache_hit_count": 0,
+          "cache_miss_count": 0,
+          "request_count": 0,
+          "unique_package_count": 0,
+          "duplicate_request_count": 0,
+          "top_duplicate_packages": []
+        },
+        {
+          "scope": "install_process",
+          "purpose": "provenance_drift",
+          "rpc_ms": 0,
+          "rpc_count": 0,
+          "cache_hit_count": 0,
+          "cache_miss_count": 0,
+          "request_count": 0,
+          "unique_package_count": 0,
+          "duplicate_request_count": 0,
+          "top_duplicate_packages": []
+        },
+        {
+          "scope": "install_process",
+          "purpose": "tarball_url_lookup",
+          "rpc_ms": 0,
+          "rpc_count": 0,
+          "cache_hit_count": 0,
+          "cache_miss_count": 0,
+          "request_count": 0,
+          "unique_package_count": 0,
+          "duplicate_request_count": 0,
+          "top_duplicate_packages": []
+        }
+      ],
+      "resolve_ms": 3
+    },
+    "warm-nest/artifacts/timing/fresh-checkout-warm-cache/candidate/2/stdout.json": {
+      "purposes": [
+        {
+          "scope": "install_process",
+          "purpose": "resolve",
+          "rpc_ms": 0,
+          "rpc_count": 0,
+          "cache_hit_count": 34,
+          "cache_miss_count": 0,
+          "request_count": 34,
+          "unique_package_count": 33,
+          "duplicate_request_count": 1,
+          "top_duplicate_packages": [
+            {
+              "package": "tslib",
+              "request_count": 2,
+              "duplicate_count": 1
+            }
+          ]
+        },
+        {
+          "scope": "install_process",
+          "purpose": "blocked_set",
+          "rpc_ms": 0,
+          "rpc_count": 0,
+          "cache_hit_count": 1,
+          "cache_miss_count": 0,
+          "request_count": 1,
+          "unique_package_count": 1,
+          "duplicate_request_count": 0,
+          "top_duplicate_packages": []
+        },
+        {
+          "scope": "install_process",
+          "purpose": "signature_hydration",
+          "rpc_ms": 0,
+          "rpc_count": 0,
+          "cache_hit_count": 0,
+          "cache_miss_count": 0,
+          "request_count": 0,
+          "unique_package_count": 0,
+          "duplicate_request_count": 0,
+          "top_duplicate_packages": []
+        },
+        {
+          "scope": "install_process",
+          "purpose": "platform_hydration",
+          "rpc_ms": 0,
+          "rpc_count": 0,
+          "cache_hit_count": 0,
+          "cache_miss_count": 0,
+          "request_count": 0,
+          "unique_package_count": 0,
+          "duplicate_request_count": 0,
+          "top_duplicate_packages": []
+        },
+        {
+          "scope": "install_process",
+          "purpose": "provenance_drift",
+          "rpc_ms": 0,
+          "rpc_count": 0,
+          "cache_hit_count": 0,
+          "cache_miss_count": 0,
+          "request_count": 0,
+          "unique_package_count": 0,
+          "duplicate_request_count": 0,
+          "top_duplicate_packages": []
+        },
+        {
+          "scope": "install_process",
+          "purpose": "tarball_url_lookup",
+          "rpc_ms": 0,
+          "rpc_count": 0,
+          "cache_hit_count": 0,
+          "cache_miss_count": 0,
+          "request_count": 0,
+          "unique_package_count": 0,
+          "duplicate_request_count": 0,
+          "top_duplicate_packages": []
+        }
+      ],
+      "resolve_ms": 3
+    },
+    "confirm-t3/artifacts/timing/fresh-checkout-warm-cache/baseline/0/stdout.json": {
+      "purposes": [
+        {
+          "scope": "install_process",
+          "purpose": "resolve",
+          "rpc_ms": 0,
+          "rpc_count": 0,
+          "cache_hit_count": 221,
+          "cache_miss_count": 0,
+          "request_count": 221,
+          "unique_package_count": 174,
+          "duplicate_request_count": 47,
+          "top_duplicate_packages": [
+            {
+              "package": "@esbuild/android-arm",
+              "request_count": 3,
+              "duplicate_count": 2
+            },
+            {
+              "package": "@esbuild/android-arm64",
+              "request_count": 3,
+              "duplicate_count": 2
+            },
+            {
+              "package": "@esbuild/android-x64",
+              "request_count": 3,
+              "duplicate_count": 2
+            },
+            {
+              "package": "@esbuild/darwin-arm64",
+              "request_count": 3,
+              "duplicate_count": 2
+            },
+            {
+              "package": "@esbuild/darwin-x64",
+              "request_count": 3,
+              "duplicate_count": 2
+            },
+            {
+              "package": "@esbuild/freebsd-arm64",
+              "request_count": 3,
+              "duplicate_count": 2
+            },
+            {
+              "package": "@esbuild/freebsd-x64",
+              "request_count": 3,
+              "duplicate_count": 2
+            },
+            {
+              "package": "@esbuild/linux-arm",
+              "request_count": 3,
+              "duplicate_count": 2
+            },
+            {
+              "package": "@esbuild/linux-arm64",
+              "request_count": 3,
+              "duplicate_count": 2
+            },
+            {
+              "package": "@esbuild/linux-ia32",
+              "request_count": 3,
+              "duplicate_count": 2
+            }
+          ]
+        },
+        {
+          "scope": "install_process",
+          "purpose": "blocked_set",
+          "rpc_ms": 0,
+          "rpc_count": 0,
+          "cache_hit_count": 2,
+          "cache_miss_count": 0,
+          "request_count": 2,
+          "unique_package_count": 2,
+          "duplicate_request_count": 0,
+          "top_duplicate_packages": []
+        },
+        {
+          "scope": "install_process",
+          "purpose": "signature_hydration",
+          "rpc_ms": 0,
+          "rpc_count": 0,
+          "cache_hit_count": 0,
+          "cache_miss_count": 0,
+          "request_count": 0,
+          "unique_package_count": 0,
+          "duplicate_request_count": 0,
+          "top_duplicate_packages": []
+        },
+        {
+          "scope": "install_process",
+          "purpose": "platform_hydration",
+          "rpc_ms": 0,
+          "rpc_count": 0,
+          "cache_hit_count": 0,
+          "cache_miss_count": 0,
+          "request_count": 0,
+          "unique_package_count": 0,
+          "duplicate_request_count": 0,
+          "top_duplicate_packages": []
+        },
+        {
+          "scope": "install_process",
+          "purpose": "provenance_drift",
+          "rpc_ms": 0,
+          "rpc_count": 0,
+          "cache_hit_count": 0,
+          "cache_miss_count": 0,
+          "request_count": 0,
+          "unique_package_count": 0,
+          "duplicate_request_count": 0,
+          "top_duplicate_packages": []
+        },
+        {
+          "scope": "install_process",
+          "purpose": "tarball_url_lookup",
+          "rpc_ms": 0,
+          "rpc_count": 0,
+          "cache_hit_count": 0,
+          "cache_miss_count": 0,
+          "request_count": 0,
+          "unique_package_count": 0,
+          "duplicate_request_count": 0,
+          "top_duplicate_packages": []
+        }
+      ],
+      "resolve_ms": 32
+    },
+    "confirm-t3/artifacts/timing/fresh-checkout-warm-cache/baseline/1/stdout.json": {
+      "purposes": [
+        {
+          "scope": "install_process",
+          "purpose": "resolve",
+          "rpc_ms": 0,
+          "rpc_count": 0,
+          "cache_hit_count": 221,
+          "cache_miss_count": 0,
+          "request_count": 221,
+          "unique_package_count": 174,
+          "duplicate_request_count": 47,
+          "top_duplicate_packages": [
+            {
+              "package": "@esbuild/android-arm",
+              "request_count": 3,
+              "duplicate_count": 2
+            },
+            {
+              "package": "@esbuild/android-arm64",
+              "request_count": 3,
+              "duplicate_count": 2
+            },
+            {
+              "package": "@esbuild/android-x64",
+              "request_count": 3,
+              "duplicate_count": 2
+            },
+            {
+              "package": "@esbuild/darwin-arm64",
+              "request_count": 3,
+              "duplicate_count": 2
+            },
+            {
+              "package": "@esbuild/darwin-x64",
+              "request_count": 3,
+              "duplicate_count": 2
+            },
+            {
+              "package": "@esbuild/freebsd-arm64",
+              "request_count": 3,
+              "duplicate_count": 2
+            },
+            {
+              "package": "@esbuild/freebsd-x64",
+              "request_count": 3,
+              "duplicate_count": 2
+            },
+            {
+              "package": "@esbuild/linux-arm",
+              "request_count": 3,
+              "duplicate_count": 2
+            },
+            {
+              "package": "@esbuild/linux-arm64",
+              "request_count": 3,
+              "duplicate_count": 2
+            },
+            {
+              "package": "@esbuild/linux-ia32",
+              "request_count": 3,
+              "duplicate_count": 2
+            }
+          ]
+        },
+        {
+          "scope": "install_process",
+          "purpose": "blocked_set",
+          "rpc_ms": 0,
+          "rpc_count": 0,
+          "cache_hit_count": 2,
+          "cache_miss_count": 0,
+          "request_count": 2,
+          "unique_package_count": 2,
+          "duplicate_request_count": 0,
+          "top_duplicate_packages": []
+        },
+        {
+          "scope": "install_process",
+          "purpose": "signature_hydration",
+          "rpc_ms": 0,
+          "rpc_count": 0,
+          "cache_hit_count": 0,
+          "cache_miss_count": 0,
+          "request_count": 0,
+          "unique_package_count": 0,
+          "duplicate_request_count": 0,
+          "top_duplicate_packages": []
+        },
+        {
+          "scope": "install_process",
+          "purpose": "platform_hydration",
+          "rpc_ms": 0,
+          "rpc_count": 0,
+          "cache_hit_count": 0,
+          "cache_miss_count": 0,
+          "request_count": 0,
+          "unique_package_count": 0,
+          "duplicate_request_count": 0,
+          "top_duplicate_packages": []
+        },
+        {
+          "scope": "install_process",
+          "purpose": "provenance_drift",
+          "rpc_ms": 0,
+          "rpc_count": 0,
+          "cache_hit_count": 0,
+          "cache_miss_count": 0,
+          "request_count": 0,
+          "unique_package_count": 0,
+          "duplicate_request_count": 0,
+          "top_duplicate_packages": []
+        },
+        {
+          "scope": "install_process",
+          "purpose": "tarball_url_lookup",
+          "rpc_ms": 0,
+          "rpc_count": 0,
+          "cache_hit_count": 0,
+          "cache_miss_count": 0,
+          "request_count": 0,
+          "unique_package_count": 0,
+          "duplicate_request_count": 0,
+          "top_duplicate_packages": []
+        }
+      ],
+      "resolve_ms": 31
+    },
+    "confirm-t3/artifacts/timing/fresh-checkout-warm-cache/baseline/2/stdout.json": {
+      "purposes": [
+        {
+          "scope": "install_process",
+          "purpose": "resolve",
+          "rpc_ms": 0,
+          "rpc_count": 0,
+          "cache_hit_count": 221,
+          "cache_miss_count": 0,
+          "request_count": 221,
+          "unique_package_count": 174,
+          "duplicate_request_count": 47,
+          "top_duplicate_packages": [
+            {
+              "package": "@esbuild/android-arm",
+              "request_count": 3,
+              "duplicate_count": 2
+            },
+            {
+              "package": "@esbuild/android-arm64",
+              "request_count": 3,
+              "duplicate_count": 2
+            },
+            {
+              "package": "@esbuild/android-x64",
+              "request_count": 3,
+              "duplicate_count": 2
+            },
+            {
+              "package": "@esbuild/darwin-arm64",
+              "request_count": 3,
+              "duplicate_count": 2
+            },
+            {
+              "package": "@esbuild/darwin-x64",
+              "request_count": 3,
+              "duplicate_count": 2
+            },
+            {
+              "package": "@esbuild/freebsd-arm64",
+              "request_count": 3,
+              "duplicate_count": 2
+            },
+            {
+              "package": "@esbuild/freebsd-x64",
+              "request_count": 3,
+              "duplicate_count": 2
+            },
+            {
+              "package": "@esbuild/linux-arm",
+              "request_count": 3,
+              "duplicate_count": 2
+            },
+            {
+              "package": "@esbuild/linux-arm64",
+              "request_count": 3,
+              "duplicate_count": 2
+            },
+            {
+              "package": "@esbuild/linux-ia32",
+              "request_count": 3,
+              "duplicate_count": 2
+            }
+          ]
+        },
+        {
+          "scope": "install_process",
+          "purpose": "blocked_set",
+          "rpc_ms": 0,
+          "rpc_count": 0,
+          "cache_hit_count": 2,
+          "cache_miss_count": 0,
+          "request_count": 2,
+          "unique_package_count": 2,
+          "duplicate_request_count": 0,
+          "top_duplicate_packages": []
+        },
+        {
+          "scope": "install_process",
+          "purpose": "signature_hydration",
+          "rpc_ms": 0,
+          "rpc_count": 0,
+          "cache_hit_count": 0,
+          "cache_miss_count": 0,
+          "request_count": 0,
+          "unique_package_count": 0,
+          "duplicate_request_count": 0,
+          "top_duplicate_packages": []
+        },
+        {
+          "scope": "install_process",
+          "purpose": "platform_hydration",
+          "rpc_ms": 0,
+          "rpc_count": 0,
+          "cache_hit_count": 0,
+          "cache_miss_count": 0,
+          "request_count": 0,
+          "unique_package_count": 0,
+          "duplicate_request_count": 0,
+          "top_duplicate_packages": []
+        },
+        {
+          "scope": "install_process",
+          "purpose": "provenance_drift",
+          "rpc_ms": 0,
+          "rpc_count": 0,
+          "cache_hit_count": 0,
+          "cache_miss_count": 0,
+          "request_count": 0,
+          "unique_package_count": 0,
+          "duplicate_request_count": 0,
+          "top_duplicate_packages": []
+        },
+        {
+          "scope": "install_process",
+          "purpose": "tarball_url_lookup",
+          "rpc_ms": 0,
+          "rpc_count": 0,
+          "cache_hit_count": 0,
+          "cache_miss_count": 0,
+          "request_count": 0,
+          "unique_package_count": 0,
+          "duplicate_request_count": 0,
+          "top_duplicate_packages": []
+        }
+      ],
+      "resolve_ms": 32
+    },
+    "confirm-t3/artifacts/timing/fresh-checkout-warm-cache/candidate/0/stdout.json": {
+      "purposes": [
+        {
+          "scope": "install_process",
+          "purpose": "resolve",
+          "rpc_ms": 0,
+          "rpc_count": 0,
+          "cache_hit_count": 221,
+          "cache_miss_count": 0,
+          "request_count": 221,
+          "unique_package_count": 174,
+          "duplicate_request_count": 47,
+          "top_duplicate_packages": [
+            {
+              "package": "@esbuild/android-arm",
+              "request_count": 3,
+              "duplicate_count": 2
+            },
+            {
+              "package": "@esbuild/android-arm64",
+              "request_count": 3,
+              "duplicate_count": 2
+            },
+            {
+              "package": "@esbuild/android-x64",
+              "request_count": 3,
+              "duplicate_count": 2
+            },
+            {
+              "package": "@esbuild/darwin-arm64",
+              "request_count": 3,
+              "duplicate_count": 2
+            },
+            {
+              "package": "@esbuild/darwin-x64",
+              "request_count": 3,
+              "duplicate_count": 2
+            },
+            {
+              "package": "@esbuild/freebsd-arm64",
+              "request_count": 3,
+              "duplicate_count": 2
+            },
+            {
+              "package": "@esbuild/freebsd-x64",
+              "request_count": 3,
+              "duplicate_count": 2
+            },
+            {
+              "package": "@esbuild/linux-arm",
+              "request_count": 3,
+              "duplicate_count": 2
+            },
+            {
+              "package": "@esbuild/linux-arm64",
+              "request_count": 3,
+              "duplicate_count": 2
+            },
+            {
+              "package": "@esbuild/linux-ia32",
+              "request_count": 3,
+              "duplicate_count": 2
+            }
+          ]
+        },
+        {
+          "scope": "install_process",
+          "purpose": "blocked_set",
+          "rpc_ms": 0,
+          "rpc_count": 0,
+          "cache_hit_count": 2,
+          "cache_miss_count": 0,
+          "request_count": 2,
+          "unique_package_count": 2,
+          "duplicate_request_count": 0,
+          "top_duplicate_packages": []
+        },
+        {
+          "scope": "install_process",
+          "purpose": "signature_hydration",
+          "rpc_ms": 0,
+          "rpc_count": 0,
+          "cache_hit_count": 0,
+          "cache_miss_count": 0,
+          "request_count": 0,
+          "unique_package_count": 0,
+          "duplicate_request_count": 0,
+          "top_duplicate_packages": []
+        },
+        {
+          "scope": "install_process",
+          "purpose": "platform_hydration",
+          "rpc_ms": 0,
+          "rpc_count": 0,
+          "cache_hit_count": 0,
+          "cache_miss_count": 0,
+          "request_count": 0,
+          "unique_package_count": 0,
+          "duplicate_request_count": 0,
+          "top_duplicate_packages": []
+        },
+        {
+          "scope": "install_process",
+          "purpose": "provenance_drift",
+          "rpc_ms": 0,
+          "rpc_count": 0,
+          "cache_hit_count": 0,
+          "cache_miss_count": 0,
+          "request_count": 0,
+          "unique_package_count": 0,
+          "duplicate_request_count": 0,
+          "top_duplicate_packages": []
+        },
+        {
+          "scope": "install_process",
+          "purpose": "tarball_url_lookup",
+          "rpc_ms": 0,
+          "rpc_count": 0,
+          "cache_hit_count": 0,
+          "cache_miss_count": 0,
+          "request_count": 0,
+          "unique_package_count": 0,
+          "duplicate_request_count": 0,
+          "top_duplicate_packages": []
+        }
+      ],
+      "resolve_ms": 25
+    },
+    "confirm-t3/artifacts/timing/fresh-checkout-warm-cache/candidate/1/stdout.json": {
+      "purposes": [
+        {
+          "scope": "install_process",
+          "purpose": "resolve",
+          "rpc_ms": 0,
+          "rpc_count": 0,
+          "cache_hit_count": 221,
+          "cache_miss_count": 0,
+          "request_count": 221,
+          "unique_package_count": 174,
+          "duplicate_request_count": 47,
+          "top_duplicate_packages": [
+            {
+              "package": "@esbuild/android-arm",
+              "request_count": 3,
+              "duplicate_count": 2
+            },
+            {
+              "package": "@esbuild/android-arm64",
+              "request_count": 3,
+              "duplicate_count": 2
+            },
+            {
+              "package": "@esbuild/android-x64",
+              "request_count": 3,
+              "duplicate_count": 2
+            },
+            {
+              "package": "@esbuild/darwin-arm64",
+              "request_count": 3,
+              "duplicate_count": 2
+            },
+            {
+              "package": "@esbuild/darwin-x64",
+              "request_count": 3,
+              "duplicate_count": 2
+            },
+            {
+              "package": "@esbuild/freebsd-arm64",
+              "request_count": 3,
+              "duplicate_count": 2
+            },
+            {
+              "package": "@esbuild/freebsd-x64",
+              "request_count": 3,
+              "duplicate_count": 2
+            },
+            {
+              "package": "@esbuild/linux-arm",
+              "request_count": 3,
+              "duplicate_count": 2
+            },
+            {
+              "package": "@esbuild/linux-arm64",
+              "request_count": 3,
+              "duplicate_count": 2
+            },
+            {
+              "package": "@esbuild/linux-ia32",
+              "request_count": 3,
+              "duplicate_count": 2
+            }
+          ]
+        },
+        {
+          "scope": "install_process",
+          "purpose": "blocked_set",
+          "rpc_ms": 0,
+          "rpc_count": 0,
+          "cache_hit_count": 2,
+          "cache_miss_count": 0,
+          "request_count": 2,
+          "unique_package_count": 2,
+          "duplicate_request_count": 0,
+          "top_duplicate_packages": []
+        },
+        {
+          "scope": "install_process",
+          "purpose": "signature_hydration",
+          "rpc_ms": 0,
+          "rpc_count": 0,
+          "cache_hit_count": 0,
+          "cache_miss_count": 0,
+          "request_count": 0,
+          "unique_package_count": 0,
+          "duplicate_request_count": 0,
+          "top_duplicate_packages": []
+        },
+        {
+          "scope": "install_process",
+          "purpose": "platform_hydration",
+          "rpc_ms": 0,
+          "rpc_count": 0,
+          "cache_hit_count": 0,
+          "cache_miss_count": 0,
+          "request_count": 0,
+          "unique_package_count": 0,
+          "duplicate_request_count": 0,
+          "top_duplicate_packages": []
+        },
+        {
+          "scope": "install_process",
+          "purpose": "provenance_drift",
+          "rpc_ms": 0,
+          "rpc_count": 0,
+          "cache_hit_count": 0,
+          "cache_miss_count": 0,
+          "request_count": 0,
+          "unique_package_count": 0,
+          "duplicate_request_count": 0,
+          "top_duplicate_packages": []
+        },
+        {
+          "scope": "install_process",
+          "purpose": "tarball_url_lookup",
+          "rpc_ms": 0,
+          "rpc_count": 0,
+          "cache_hit_count": 0,
+          "cache_miss_count": 0,
+          "request_count": 0,
+          "unique_package_count": 0,
+          "duplicate_request_count": 0,
+          "top_duplicate_packages": []
+        }
+      ],
+      "resolve_ms": 27
+    },
+    "confirm-t3/artifacts/timing/fresh-checkout-warm-cache/candidate/2/stdout.json": {
+      "purposes": [
+        {
+          "scope": "install_process",
+          "purpose": "resolve",
+          "rpc_ms": 0,
+          "rpc_count": 0,
+          "cache_hit_count": 221,
+          "cache_miss_count": 0,
+          "request_count": 221,
+          "unique_package_count": 174,
+          "duplicate_request_count": 47,
+          "top_duplicate_packages": [
+            {
+              "package": "@esbuild/android-arm",
+              "request_count": 3,
+              "duplicate_count": 2
+            },
+            {
+              "package": "@esbuild/android-arm64",
+              "request_count": 3,
+              "duplicate_count": 2
+            },
+            {
+              "package": "@esbuild/android-x64",
+              "request_count": 3,
+              "duplicate_count": 2
+            },
+            {
+              "package": "@esbuild/darwin-arm64",
+              "request_count": 3,
+              "duplicate_count": 2
+            },
+            {
+              "package": "@esbuild/darwin-x64",
+              "request_count": 3,
+              "duplicate_count": 2
+            },
+            {
+              "package": "@esbuild/freebsd-arm64",
+              "request_count": 3,
+              "duplicate_count": 2
+            },
+            {
+              "package": "@esbuild/freebsd-x64",
+              "request_count": 3,
+              "duplicate_count": 2
+            },
+            {
+              "package": "@esbuild/linux-arm",
+              "request_count": 3,
+              "duplicate_count": 2
+            },
+            {
+              "package": "@esbuild/linux-arm64",
+              "request_count": 3,
+              "duplicate_count": 2
+            },
+            {
+              "package": "@esbuild/linux-ia32",
+              "request_count": 3,
+              "duplicate_count": 2
+            }
+          ]
+        },
+        {
+          "scope": "install_process",
+          "purpose": "blocked_set",
+          "rpc_ms": 0,
+          "rpc_count": 0,
+          "cache_hit_count": 2,
+          "cache_miss_count": 0,
+          "request_count": 2,
+          "unique_package_count": 2,
+          "duplicate_request_count": 0,
+          "top_duplicate_packages": []
+        },
+        {
+          "scope": "install_process",
+          "purpose": "signature_hydration",
+          "rpc_ms": 0,
+          "rpc_count": 0,
+          "cache_hit_count": 0,
+          "cache_miss_count": 0,
+          "request_count": 0,
+          "unique_package_count": 0,
+          "duplicate_request_count": 0,
+          "top_duplicate_packages": []
+        },
+        {
+          "scope": "install_process",
+          "purpose": "platform_hydration",
+          "rpc_ms": 0,
+          "rpc_count": 0,
+          "cache_hit_count": 0,
+          "cache_miss_count": 0,
+          "request_count": 0,
+          "unique_package_count": 0,
+          "duplicate_request_count": 0,
+          "top_duplicate_packages": []
+        },
+        {
+          "scope": "install_process",
+          "purpose": "provenance_drift",
+          "rpc_ms": 0,
+          "rpc_count": 0,
+          "cache_hit_count": 0,
+          "cache_miss_count": 0,
+          "request_count": 0,
+          "unique_package_count": 0,
+          "duplicate_request_count": 0,
+          "top_duplicate_packages": []
+        },
+        {
+          "scope": "install_process",
+          "purpose": "tarball_url_lookup",
+          "rpc_ms": 0,
+          "rpc_count": 0,
+          "cache_hit_count": 0,
+          "cache_miss_count": 0,
+          "request_count": 0,
+          "unique_package_count": 0,
+          "duplicate_request_count": 0,
+          "top_duplicate_packages": []
+        }
+      ],
+      "resolve_ms": 28
+    },
+    "confirm-native-sharp/artifacts/timing/fresh-checkout-warm-cache/baseline/0/stdout.json": {
+      "purposes": [
+        {
+          "scope": "install_process",
+          "purpose": "resolve",
+          "rpc_ms": 0,
+          "rpc_count": 0,
+          "cache_hit_count": 30,
+          "cache_miss_count": 0,
+          "request_count": 30,
+          "unique_package_count": 30,
+          "duplicate_request_count": 0,
+          "top_duplicate_packages": []
+        },
+        {
+          "scope": "install_process",
+          "purpose": "blocked_set",
+          "rpc_ms": 0,
+          "rpc_count": 0,
+          "cache_hit_count": 1,
+          "cache_miss_count": 0,
+          "request_count": 1,
+          "unique_package_count": 1,
+          "duplicate_request_count": 0,
+          "top_duplicate_packages": []
+        },
+        {
+          "scope": "install_process",
+          "purpose": "signature_hydration",
+          "rpc_ms": 0,
+          "rpc_count": 0,
+          "cache_hit_count": 0,
+          "cache_miss_count": 0,
+          "request_count": 0,
+          "unique_package_count": 0,
+          "duplicate_request_count": 0,
+          "top_duplicate_packages": []
+        },
+        {
+          "scope": "install_process",
+          "purpose": "platform_hydration",
+          "rpc_ms": 0,
+          "rpc_count": 0,
+          "cache_hit_count": 0,
+          "cache_miss_count": 0,
+          "request_count": 0,
+          "unique_package_count": 0,
+          "duplicate_request_count": 0,
+          "top_duplicate_packages": []
+        },
+        {
+          "scope": "install_process",
+          "purpose": "provenance_drift",
+          "rpc_ms": 0,
+          "rpc_count": 0,
+          "cache_hit_count": 0,
+          "cache_miss_count": 0,
+          "request_count": 0,
+          "unique_package_count": 0,
+          "duplicate_request_count": 0,
+          "top_duplicate_packages": []
+        },
+        {
+          "scope": "install_process",
+          "purpose": "tarball_url_lookup",
+          "rpc_ms": 0,
+          "rpc_count": 0,
+          "cache_hit_count": 0,
+          "cache_miss_count": 0,
+          "request_count": 0,
+          "unique_package_count": 0,
+          "duplicate_request_count": 0,
+          "top_duplicate_packages": []
+        }
+      ],
+      "resolve_ms": 2
+    },
+    "confirm-native-sharp/artifacts/timing/fresh-checkout-warm-cache/baseline/1/stdout.json": {
+      "purposes": [
+        {
+          "scope": "install_process",
+          "purpose": "resolve",
+          "rpc_ms": 0,
+          "rpc_count": 0,
+          "cache_hit_count": 30,
+          "cache_miss_count": 0,
+          "request_count": 30,
+          "unique_package_count": 30,
+          "duplicate_request_count": 0,
+          "top_duplicate_packages": []
+        },
+        {
+          "scope": "install_process",
+          "purpose": "blocked_set",
+          "rpc_ms": 0,
+          "rpc_count": 0,
+          "cache_hit_count": 1,
+          "cache_miss_count": 0,
+          "request_count": 1,
+          "unique_package_count": 1,
+          "duplicate_request_count": 0,
+          "top_duplicate_packages": []
+        },
+        {
+          "scope": "install_process",
+          "purpose": "signature_hydration",
+          "rpc_ms": 0,
+          "rpc_count": 0,
+          "cache_hit_count": 0,
+          "cache_miss_count": 0,
+          "request_count": 0,
+          "unique_package_count": 0,
+          "duplicate_request_count": 0,
+          "top_duplicate_packages": []
+        },
+        {
+          "scope": "install_process",
+          "purpose": "platform_hydration",
+          "rpc_ms": 0,
+          "rpc_count": 0,
+          "cache_hit_count": 0,
+          "cache_miss_count": 0,
+          "request_count": 0,
+          "unique_package_count": 0,
+          "duplicate_request_count": 0,
+          "top_duplicate_packages": []
+        },
+        {
+          "scope": "install_process",
+          "purpose": "provenance_drift",
+          "rpc_ms": 0,
+          "rpc_count": 0,
+          "cache_hit_count": 0,
+          "cache_miss_count": 0,
+          "request_count": 0,
+          "unique_package_count": 0,
+          "duplicate_request_count": 0,
+          "top_duplicate_packages": []
+        },
+        {
+          "scope": "install_process",
+          "purpose": "tarball_url_lookup",
+          "rpc_ms": 0,
+          "rpc_count": 0,
+          "cache_hit_count": 0,
+          "cache_miss_count": 0,
+          "request_count": 0,
+          "unique_package_count": 0,
+          "duplicate_request_count": 0,
+          "top_duplicate_packages": []
+        }
+      ],
+      "resolve_ms": 2
+    },
+    "confirm-native-sharp/artifacts/timing/fresh-checkout-warm-cache/baseline/2/stdout.json": {
+      "purposes": [
+        {
+          "scope": "install_process",
+          "purpose": "resolve",
+          "rpc_ms": 0,
+          "rpc_count": 0,
+          "cache_hit_count": 30,
+          "cache_miss_count": 0,
+          "request_count": 30,
+          "unique_package_count": 30,
+          "duplicate_request_count": 0,
+          "top_duplicate_packages": []
+        },
+        {
+          "scope": "install_process",
+          "purpose": "blocked_set",
+          "rpc_ms": 0,
+          "rpc_count": 0,
+          "cache_hit_count": 1,
+          "cache_miss_count": 0,
+          "request_count": 1,
+          "unique_package_count": 1,
+          "duplicate_request_count": 0,
+          "top_duplicate_packages": []
+        },
+        {
+          "scope": "install_process",
+          "purpose": "signature_hydration",
+          "rpc_ms": 0,
+          "rpc_count": 0,
+          "cache_hit_count": 0,
+          "cache_miss_count": 0,
+          "request_count": 0,
+          "unique_package_count": 0,
+          "duplicate_request_count": 0,
+          "top_duplicate_packages": []
+        },
+        {
+          "scope": "install_process",
+          "purpose": "platform_hydration",
+          "rpc_ms": 0,
+          "rpc_count": 0,
+          "cache_hit_count": 0,
+          "cache_miss_count": 0,
+          "request_count": 0,
+          "unique_package_count": 0,
+          "duplicate_request_count": 0,
+          "top_duplicate_packages": []
+        },
+        {
+          "scope": "install_process",
+          "purpose": "provenance_drift",
+          "rpc_ms": 0,
+          "rpc_count": 0,
+          "cache_hit_count": 0,
+          "cache_miss_count": 0,
+          "request_count": 0,
+          "unique_package_count": 0,
+          "duplicate_request_count": 0,
+          "top_duplicate_packages": []
+        },
+        {
+          "scope": "install_process",
+          "purpose": "tarball_url_lookup",
+          "rpc_ms": 0,
+          "rpc_count": 0,
+          "cache_hit_count": 0,
+          "cache_miss_count": 0,
+          "request_count": 0,
+          "unique_package_count": 0,
+          "duplicate_request_count": 0,
+          "top_duplicate_packages": []
+        }
+      ],
+      "resolve_ms": 2
+    },
+    "confirm-native-sharp/artifacts/timing/fresh-checkout-warm-cache/candidate/0/stdout.json": {
+      "purposes": [
+        {
+          "scope": "install_process",
+          "purpose": "resolve",
+          "rpc_ms": 0,
+          "rpc_count": 0,
+          "cache_hit_count": 30,
+          "cache_miss_count": 0,
+          "request_count": 30,
+          "unique_package_count": 30,
+          "duplicate_request_count": 0,
+          "top_duplicate_packages": []
+        },
+        {
+          "scope": "install_process",
+          "purpose": "blocked_set",
+          "rpc_ms": 0,
+          "rpc_count": 0,
+          "cache_hit_count": 1,
+          "cache_miss_count": 0,
+          "request_count": 1,
+          "unique_package_count": 1,
+          "duplicate_request_count": 0,
+          "top_duplicate_packages": []
+        },
+        {
+          "scope": "install_process",
+          "purpose": "signature_hydration",
+          "rpc_ms": 0,
+          "rpc_count": 0,
+          "cache_hit_count": 0,
+          "cache_miss_count": 0,
+          "request_count": 0,
+          "unique_package_count": 0,
+          "duplicate_request_count": 0,
+          "top_duplicate_packages": []
+        },
+        {
+          "scope": "install_process",
+          "purpose": "platform_hydration",
+          "rpc_ms": 0,
+          "rpc_count": 0,
+          "cache_hit_count": 0,
+          "cache_miss_count": 0,
+          "request_count": 0,
+          "unique_package_count": 0,
+          "duplicate_request_count": 0,
+          "top_duplicate_packages": []
+        },
+        {
+          "scope": "install_process",
+          "purpose": "provenance_drift",
+          "rpc_ms": 0,
+          "rpc_count": 0,
+          "cache_hit_count": 0,
+          "cache_miss_count": 0,
+          "request_count": 0,
+          "unique_package_count": 0,
+          "duplicate_request_count": 0,
+          "top_duplicate_packages": []
+        },
+        {
+          "scope": "install_process",
+          "purpose": "tarball_url_lookup",
+          "rpc_ms": 0,
+          "rpc_count": 0,
+          "cache_hit_count": 0,
+          "cache_miss_count": 0,
+          "request_count": 0,
+          "unique_package_count": 0,
+          "duplicate_request_count": 0,
+          "top_duplicate_packages": []
+        }
+      ],
+      "resolve_ms": 2
+    },
+    "confirm-native-sharp/artifacts/timing/fresh-checkout-warm-cache/candidate/1/stdout.json": {
+      "purposes": [
+        {
+          "scope": "install_process",
+          "purpose": "resolve",
+          "rpc_ms": 0,
+          "rpc_count": 0,
+          "cache_hit_count": 30,
+          "cache_miss_count": 0,
+          "request_count": 30,
+          "unique_package_count": 30,
+          "duplicate_request_count": 0,
+          "top_duplicate_packages": []
+        },
+        {
+          "scope": "install_process",
+          "purpose": "blocked_set",
+          "rpc_ms": 0,
+          "rpc_count": 0,
+          "cache_hit_count": 1,
+          "cache_miss_count": 0,
+          "request_count": 1,
+          "unique_package_count": 1,
+          "duplicate_request_count": 0,
+          "top_duplicate_packages": []
+        },
+        {
+          "scope": "install_process",
+          "purpose": "signature_hydration",
+          "rpc_ms": 0,
+          "rpc_count": 0,
+          "cache_hit_count": 0,
+          "cache_miss_count": 0,
+          "request_count": 0,
+          "unique_package_count": 0,
+          "duplicate_request_count": 0,
+          "top_duplicate_packages": []
+        },
+        {
+          "scope": "install_process",
+          "purpose": "platform_hydration",
+          "rpc_ms": 0,
+          "rpc_count": 0,
+          "cache_hit_count": 0,
+          "cache_miss_count": 0,
+          "request_count": 0,
+          "unique_package_count": 0,
+          "duplicate_request_count": 0,
+          "top_duplicate_packages": []
+        },
+        {
+          "scope": "install_process",
+          "purpose": "provenance_drift",
+          "rpc_ms": 0,
+          "rpc_count": 0,
+          "cache_hit_count": 0,
+          "cache_miss_count": 0,
+          "request_count": 0,
+          "unique_package_count": 0,
+          "duplicate_request_count": 0,
+          "top_duplicate_packages": []
+        },
+        {
+          "scope": "install_process",
+          "purpose": "tarball_url_lookup",
+          "rpc_ms": 0,
+          "rpc_count": 0,
+          "cache_hit_count": 0,
+          "cache_miss_count": 0,
+          "request_count": 0,
+          "unique_package_count": 0,
+          "duplicate_request_count": 0,
+          "top_duplicate_packages": []
+        }
+      ],
+      "resolve_ms": 2
+    },
+    "confirm-native-sharp/artifacts/timing/fresh-checkout-warm-cache/candidate/2/stdout.json": {
+      "purposes": [
+        {
+          "scope": "install_process",
+          "purpose": "resolve",
+          "rpc_ms": 0,
+          "rpc_count": 0,
+          "cache_hit_count": 30,
+          "cache_miss_count": 0,
+          "request_count": 30,
+          "unique_package_count": 30,
+          "duplicate_request_count": 0,
+          "top_duplicate_packages": []
+        },
+        {
+          "scope": "install_process",
+          "purpose": "blocked_set",
+          "rpc_ms": 0,
+          "rpc_count": 0,
+          "cache_hit_count": 1,
+          "cache_miss_count": 0,
+          "request_count": 1,
+          "unique_package_count": 1,
+          "duplicate_request_count": 0,
+          "top_duplicate_packages": []
+        },
+        {
+          "scope": "install_process",
+          "purpose": "signature_hydration",
+          "rpc_ms": 0,
+          "rpc_count": 0,
+          "cache_hit_count": 0,
+          "cache_miss_count": 0,
+          "request_count": 0,
+          "unique_package_count": 0,
+          "duplicate_request_count": 0,
+          "top_duplicate_packages": []
+        },
+        {
+          "scope": "install_process",
+          "purpose": "platform_hydration",
+          "rpc_ms": 0,
+          "rpc_count": 0,
+          "cache_hit_count": 0,
+          "cache_miss_count": 0,
+          "request_count": 0,
+          "unique_package_count": 0,
+          "duplicate_request_count": 0,
+          "top_duplicate_packages": []
+        },
+        {
+          "scope": "install_process",
+          "purpose": "provenance_drift",
+          "rpc_ms": 0,
+          "rpc_count": 0,
+          "cache_hit_count": 0,
+          "cache_miss_count": 0,
+          "request_count": 0,
+          "unique_package_count": 0,
+          "duplicate_request_count": 0,
+          "top_duplicate_packages": []
+        },
+        {
+          "scope": "install_process",
+          "purpose": "tarball_url_lookup",
+          "rpc_ms": 0,
+          "rpc_count": 0,
+          "cache_hit_count": 0,
+          "cache_miss_count": 0,
+          "request_count": 0,
+          "unique_package_count": 0,
+          "duplicate_request_count": 0,
+          "top_duplicate_packages": []
+        }
+      ],
+      "resolve_ms": 2
+    }
+  },
+  "source_commit": "6009247f8",
+  "gates": [
+    {
+      "name": "format",
+      "returncode": 0,
+      "seconds": 6.343479156494141,
+      "command": [
+        "cargo",
+        "fmt",
+        "--all"
+      ]
+    },
+    {
+      "name": "clippy",
+      "returncode": 0,
+      "seconds": 148.91018199920654,
+      "command": [
+        "cargo",
+        "clippy",
+        "--workspace",
+        "--all-targets",
+        "--locked",
+        "--",
+        "-D",
+        "warnings"
+      ]
+    },
+    {
+      "name": "fmt",
+      "returncode": 0,
+      "seconds": 6.68509316444397,
+      "command": [
+        "cargo",
+        "fmt",
+        "--check"
+      ]
+    },
+    {
+      "name": "workspace-build",
+      "returncode": 0,
+      "seconds": 82.6006429195404,
+      "command": [
+        "cargo",
+        "build",
+        "--workspace",
+        "--locked"
+      ]
+    },
+    {
+      "name": "libraries",
+      "returncode": 0,
+      "seconds": 230.78838801383972,
+      "command": [
+        "cargo",
+        "nextest",
+        "run",
+        "--locked",
+        "--workspace",
+        "--exclude",
+        "lpm-workflows",
+        "--exclude",
+        "lpm-cli",
+        "--no-fail-fast",
+        "--status-level",
+        "slow",
+        "--final-status-level",
+        "fail"
+      ]
+    },
+    {
+      "name": "cli-unit",
+      "returncode": 0,
+      "seconds": 164.4915030002594,
+      "command": [
+        "cargo",
+        "test",
+        "--locked",
+        "-p",
+        "lpm-cli",
+        "--bin",
+        "lpm-rs",
+        "--",
+        "--test-threads=1"
+      ]
+    },
+    {
+      "name": "cli-surface",
+      "returncode": 0,
+      "seconds": 71.65010118484497,
+      "command": [
+        "cargo",
+        "nextest",
+        "run",
+        "--locked",
+        "-p",
+        "lpm-cli",
+        "-E",
+        "not binary_id(/bin\\/lpm-rs/)",
+        "--no-fail-fast",
+        "--status-level",
+        "slow",
+        "--final-status-level",
+        "fail"
+      ]
+    },
+    {
+      "name": "install-workflows",
+      "returncode": 0,
+      "seconds": 107.90431833267212,
+      "command": [
+        "scripts/ci/with-hermetic-workflow-cli.sh",
+        "cargo",
+        "nextest",
+        "run",
+        "--locked",
+        "-p",
+        "lpm-workflows",
+        "--test",
+        "install_freshness",
+        "--test",
+        "install_cached_entries",
+        "--test",
+        "pnpm_compat_peer",
+        "--test",
+        "add",
+        "--test",
+        "upgrade",
+        "--test",
+        "install",
+        "--test",
+        "install_metadata",
+        "--test",
+        "install_speculation",
+        "--test",
+        "install_local_tarball",
+        "--test",
+        "lifecycle_containment",
+        "--test",
+        "native_build_cache",
+        "--test",
+        "registry_credentials",
+        "--test",
+        "health",
+        "--test",
+        "workspace_install",
+        "--test",
+        "ci",
+        "--test",
+        "json_output",
+        "--test",
+        "install_concurrency",
+        "--no-fail-fast",
+        "--status-level",
+        "slow",
+        "--final-status-level",
+        "fail"
+      ]
+    }
+  ],
+  "helper_gates": [
+    {
+      "command": [
+        "sh",
+        "tests/install-sh/run.sh"
+      ],
+      "returncode": 0
+    },
+    {
+      "command": [
+        "node",
+        "bench/scripts/run-install-readiness.mjs",
+        "--self-test"
+      ],
+      "returncode": 0
+    },
+    {
+      "command": [
+        "node",
+        "bench/scripts/run-t3-install-six-states.mjs",
+        "--self-test"
+      ],
+      "returncode": 0
+    },
+    {
+      "command": [
+        "node",
+        "bench/scripts/run-runtime-readiness.mjs",
+        "--self-test"
+      ],
+      "returncode": 0
+    },
+    {
+      "command": [
+        "bash",
+        "scripts/ci/test-install-apt-packages.sh"
+      ],
+      "returncode": 0
+    },
+    {
+      "command": [
+        "bash",
+        "scripts/ci/test-macos-keychain-search-list.sh"
+      ],
+      "returncode": 0
+    },
+    {
+      "command": [
+        "bash",
+        "bench/test-audit-install-args.sh"
+      ],
+      "returncode": 0
+    },
+    {
+      "command": [
+        "python3",
+        "bench/source-analysis/test_corpus.py"
+      ],
+      "returncode": 0
+    },
+    {
+      "command": [
+        "python3",
+        "bench/test_audit_install_timeout.py"
+      ],
+      "returncode": 0
+    },
+    {
+      "command": [
+        "python3",
+        "bench/audit-fixtures/test_classify_result.py"
+      ],
+      "returncode": 0
+    },
+    {
+      "command": [
+        "bash",
+        "bench/test-local-install.sh"
+      ],
+      "returncode": 0
+    },
+    {
+      "command": [
+        "bash",
+        "bench/test-live-metadata-route.sh"
+      ],
+      "returncode": 0
+    },
+    {
+      "command": [
+        "bash",
+        "bench/test-run-readme.sh"
+      ],
+      "returncode": 0
+    },
+    {
+      "command": [
+        "bash",
+        "scripts/ci/test-with-hermetic-workflow-cli.sh"
+      ],
+      "returncode": 0
+    },
+    {
+      "command": [
+        "npm",
+        "--prefix",
+        "npm/cli",
+        "test"
+      ],
+      "returncode": 0
+    },
+    {
+      "command": [
+        "npm",
+        "--prefix",
+        "npm/cli",
+        "run",
+        "pack:check"
+      ],
+      "returncode": 0
+    },
+    {
+      "command": [
+        "node",
+        "--test",
+        "/Users/tolga/.codex/worktrees/install-overhead/rust-client/npm/release/tests/verify-published-package.test.mjs",
+        "/Users/tolga/.codex/worktrees/install-overhead/rust-client/npm/release/tests/nightly-version.test.mjs",
+        "/Users/tolga/.codex/worktrees/install-overhead/rust-client/npm/release/tests/nightly-release-state.test.mjs",
+        "/Users/tolga/.codex/worktrees/install-overhead/rust-client/npm/release/tests/release-policy.test.mjs",
+        "/Users/tolga/.codex/worktrees/install-overhead/rust-client/npm/release/tests/validate-release-candidate-source.test.mjs",
+        "/Users/tolga/.codex/worktrees/install-overhead/rust-client/npm/release/tests/verify-packages.test.mjs",
+        "/Users/tolga/.codex/worktrees/install-overhead/rust-client/npm/release/tests/rust-toolchain-policy.test.mjs",
+        "/Users/tolga/.codex/worktrees/install-overhead/rust-client/npm/release/tests/release-hardening-policy.test.mjs",
+        "/Users/tolga/.codex/worktrees/install-overhead/rust-client/npm/release/tests/acceptance-artifact-policy.test.mjs",
+        "/Users/tolga/.codex/worktrees/install-overhead/rust-client/npm/release/tests/release-api-contract.test.mjs",
+        "/Users/tolga/.codex/worktrees/install-overhead/rust-client/npm/release/tests/ci-policy.test.mjs",
+        "/Users/tolga/.codex/worktrees/install-overhead/rust-client/npm/release/tests/linux-glibc-compatibility.test.mjs",
+        "/Users/tolga/.codex/worktrees/install-overhead/rust-client/npm/release/tests/validate-recovery-source.test.mjs",
+        "/Users/tolga/.codex/worktrees/install-overhead/rust-client/npm/release/tests/stable-release-policy.test.mjs",
+        "/Users/tolga/.codex/worktrees/install-overhead/rust-client/npm/release/tests/release-artifacts.test.mjs",
+        "/Users/tolga/.codex/worktrees/install-overhead/rust-client/npm/release/tests/release-candidate.test.mjs"
+      ],
+      "returncode": 0
+    }
+  ],
+  "dependency_policy": "Passed, existing duplicate-dependency warnings"
+}

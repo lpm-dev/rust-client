@@ -1,7 +1,7 @@
 use super::*;
 
 #[derive(Deserialize)]
-pub(super) struct VersionMetadataWire {
+pub(super) struct VersionMetadataWire<const OMIT_DEV: bool = false> {
     name: String,
     version: String,
 
@@ -21,7 +21,11 @@ pub(super) struct VersionMetadataWire {
     #[serde(default)]
     dependencies: HashMap<String, String>,
 
-    #[serde(default, rename = "devDependencies")]
+    #[serde(
+        default,
+        rename = "devDependencies",
+        deserialize_with = "deserialize_dev_dependencies::<_, OMIT_DEV>"
+    )]
     dev_dependencies: HashMap<String, String>,
 
     #[serde(default, rename = "peerDependencies")]
@@ -115,10 +119,10 @@ where
     serde_json::Value::deserialize(deserializer).map(Some)
 }
 
-impl TryFrom<VersionMetadataWire> for VersionMetadata {
+impl<const OMIT_DEV: bool> TryFrom<VersionMetadataWire<OMIT_DEV>> for VersionMetadata {
     type Error = serde_json::Error;
 
-    fn try_from(wire: VersionMetadataWire) -> Result<Self, Self::Error> {
+    fn try_from(wire: VersionMetadataWire<OMIT_DEV>) -> Result<Self, Self::Error> {
         let bundle_dependencies = wire
             .bundle_dependencies
             .or(wire.bundled_dependencies)
@@ -156,4 +160,23 @@ impl TryFrom<VersionMetadataWire> for VersionMetadata {
             vulnerabilities: wire.vulnerabilities,
         })
     }
+}
+
+fn deserialize_dev_dependencies<'de, D: serde::Deserializer<'de>, const OMIT_DEV: bool>(
+    deserializer: D,
+) -> Result<HashMap<String, String>, D::Error> {
+    if OMIT_DEV {
+        serde::de::IgnoredAny::deserialize(deserializer)?;
+        Ok(HashMap::new())
+    } else {
+        HashMap::deserialize(deserializer)
+    }
+}
+
+pub(crate) fn deserialize_version_without_dev_dependencies<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<VersionMetadata, D::Error> {
+    VersionMetadataWire::<true>::deserialize(deserializer)?
+        .try_into()
+        .map_err(serde::de::Error::custom)
 }
