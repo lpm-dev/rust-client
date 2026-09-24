@@ -1,0 +1,439 @@
+{
+  "concept": "Node version probes preserve supplied PATH context",
+  "base": "d878519b7",
+  "source_commit": "352eb733077e043536e65f69ce176a9d4ffed139",
+  "dependency": "Independent main-based fix. Does not depend on the install-performance stack.",
+  "toolchain": "1.94.0",
+  "findings": [
+    {
+      "id": "RUNTIME-01",
+      "source": "async_runtime_scheduling",
+      "category": "correctness",
+      "location": "crates/lpm-runtime/src/effective.rs:node_version_on_path",
+      "claim": "Unix selects Node from script PATH but executes it with inherited PATH; helper-based shims can report incorrect/unavailable version.",
+      "evidence": "Primary reproduced None instead of Some(\"22.0.0\") before the fix. Supplying the child PATH passes the regression. Runtime targeted suite: 128 tests, crate build, and all-target Clippy passed. Independent final review reported no new defect.",
+      "disposition": "Verified",
+      "coverage": "explicit_path_node_shim_resolves_helpers_from_the_supplied_path",
+      "commit": "352eb733077e043536e65f69ce176a9d4ffed139",
+      "pr_status": "Ready for review; publication pending"
+    },
+    {
+      "id": "RUNTIME-02",
+      "source": "async_runtime_scheduling",
+      "category": "performance",
+      "location": "crates/lpm-common/src/process_output.rs:output_capped",
+      "claim": "Fixed2ms polling adds detection latency to version probes.",
+      "evidence": "Repeated 2 ms sleeps overlap necessary child runtime. No completion-detection measurement attributes removable cost or tail delay. Existing no-op traces isolate no polling cost; changing process-tree handling without a measured benefit is unjustified.",
+      "disposition": "Rejected",
+      "coverage": null,
+      "commit": null,
+      "pr_status": "Ready for review; publication pending"
+    },
+    {
+      "id": "RUNTIME-03",
+      "source": "async_runtime_scheduling follow-up review",
+      "category": "correctness",
+      "location": "crates/lpm-runtime/src/effective.rs:PathNodeVersionCache::resolve",
+      "claim": "Cache identity omits supplied PATH; unchanged helper-based shim can reuse another search path version or failure.",
+      "evidence": "Primary proved both regressions before changing cache identity: cached 18.0.0 survived a helper PATH change, and cached None survived adding a helper directory. Both pass with the exact supplied PATH in the non-managed cache context. Runtime targeted suite: 128 tests, crate build, and all-target Clippy passed.",
+      "disposition": "Verified",
+      "coverage": "node_version_cache_reprobes_when_helper_search_path_changes; node_version_cache_reprobes_a_missing_helper_after_path_changes",
+      "commit": "352eb733077e043536e65f69ce176a9d4ffed139",
+      "pr_status": "Ready for review; publication pending"
+    }
+  ],
+  "totals": {
+    "received": 3,
+    "verified_and_fixed": 2,
+    "rejected": 1,
+    "blocked": 0,
+    "pending": 0
+  },
+  "validation": {
+    "runtime-gates": [
+      {
+        "name": "clippy",
+        "returncode": 0,
+        "seconds": 91.11408591270447,
+        "command": [
+          "cargo",
+          "clippy",
+          "--workspace",
+          "--all-targets",
+          "--locked",
+          "--",
+          "-D",
+          "warnings"
+        ]
+      },
+      {
+        "name": "fmt",
+        "returncode": 0,
+        "seconds": 6.336341142654419,
+        "command": [
+          "cargo",
+          "fmt",
+          "--check"
+        ]
+      },
+      {
+        "name": "workspace-build",
+        "returncode": 0,
+        "seconds": 64.04937100410461,
+        "command": [
+          "cargo",
+          "build",
+          "--workspace",
+          "--locked"
+        ]
+      },
+      {
+        "name": "libraries",
+        "returncode": 0,
+        "seconds": 129.45155501365662,
+        "command": [
+          "cargo",
+          "nextest",
+          "run",
+          "--locked",
+          "--workspace",
+          "--exclude",
+          "lpm-workflows",
+          "--exclude",
+          "lpm-cli",
+          "--no-fail-fast",
+          "--status-level",
+          "slow",
+          "--final-status-level",
+          "fail"
+        ]
+      },
+      {
+        "name": "cli-unit",
+        "returncode": 0,
+        "seconds": 126.47176861763,
+        "command": [
+          "cargo",
+          "test",
+          "--locked",
+          "-p",
+          "lpm-cli",
+          "--bin",
+          "lpm-rs",
+          "--",
+          "--test-threads=1"
+        ]
+      },
+      {
+        "name": "cli-surface",
+        "returncode": 0,
+        "seconds": 71.06564402580261,
+        "command": [
+          "cargo",
+          "nextest",
+          "run",
+          "--locked",
+          "-p",
+          "lpm-cli",
+          "-E",
+          "not binary_id(/bin\\/lpm-rs/)",
+          "--no-fail-fast",
+          "--status-level",
+          "slow",
+          "--final-status-level",
+          "fail"
+        ]
+      },
+      {
+        "name": "runtime-workflows",
+        "returncode": 0,
+        "seconds": 92.02815294265747,
+        "command": [
+          "scripts/ci/with-hermetic-workflow-cli.sh",
+          "cargo",
+          "nextest",
+          "run",
+          "--locked",
+          "-p",
+          "lpm-workflows",
+          "--test",
+          "run",
+          "--test",
+          "exec",
+          "--test",
+          "run_runtime",
+          "--test",
+          "install",
+          "--test",
+          "workspace_install",
+          "--test",
+          "ci",
+          "--no-fail-fast",
+          "--status-level",
+          "slow",
+          "--final-status-level",
+          "fail"
+        ]
+      }
+    ],
+    "runtime-helper-gates": [
+      {
+        "command": [
+          "sh",
+          "tests/install-sh/run.sh"
+        ],
+        "returncode": 0
+      },
+      {
+        "command": [
+          "node",
+          "bench/scripts/run-install-readiness.mjs",
+          "--self-test"
+        ],
+        "returncode": 0
+      },
+      {
+        "command": [
+          "node",
+          "bench/scripts/run-t3-install-six-states.mjs",
+          "--self-test"
+        ],
+        "returncode": 0
+      },
+      {
+        "command": [
+          "node",
+          "bench/scripts/run-runtime-readiness.mjs",
+          "--self-test"
+        ],
+        "returncode": 0
+      },
+      {
+        "command": [
+          "bash",
+          "scripts/ci/test-install-apt-packages.sh"
+        ],
+        "returncode": 0
+      },
+      {
+        "command": [
+          "bash",
+          "scripts/ci/test-macos-keychain-search-list.sh"
+        ],
+        "returncode": 0
+      },
+      {
+        "command": [
+          "bash",
+          "bench/test-audit-install-args.sh"
+        ],
+        "returncode": 0
+      },
+      {
+        "command": [
+          "python3",
+          "bench/source-analysis/test_corpus.py"
+        ],
+        "returncode": 0
+      },
+      {
+        "command": [
+          "python3",
+          "bench/test_audit_install_timeout.py"
+        ],
+        "returncode": 0
+      },
+      {
+        "command": [
+          "python3",
+          "bench/audit-fixtures/test_classify_result.py"
+        ],
+        "returncode": 0
+      },
+      {
+        "command": [
+          "bash",
+          "bench/test-local-install.sh"
+        ],
+        "returncode": 0
+      },
+      {
+        "command": [
+          "bash",
+          "bench/test-live-metadata-route.sh"
+        ],
+        "returncode": 0
+      },
+      {
+        "command": [
+          "bash",
+          "bench/test-run-readme.sh"
+        ],
+        "returncode": 0
+      },
+      {
+        "command": [
+          "bash",
+          "scripts/ci/test-with-hermetic-workflow-cli.sh"
+        ],
+        "returncode": 0
+      },
+      {
+        "command": [
+          "npm",
+          "--prefix",
+          "npm/cli",
+          "test"
+        ],
+        "returncode": 0
+      },
+      {
+        "command": [
+          "npm",
+          "--prefix",
+          "npm/cli",
+          "run",
+          "pack:check"
+        ],
+        "returncode": 0
+      },
+      {
+        "command": [
+          "node",
+          "--test",
+          "<repo>/npm/release/tests/published-wrapper-smoke.test.mjs",
+          "<repo>/npm/release/tests/verify-published-package.test.mjs",
+          "<repo>/npm/release/tests/nightly-version.test.mjs",
+          "<repo>/npm/release/tests/nightly-release-state.test.mjs",
+          "<repo>/npm/release/tests/release-policy.test.mjs",
+          "<repo>/npm/release/tests/validate-release-candidate-source.test.mjs",
+          "<repo>/npm/release/tests/verify-packages.test.mjs",
+          "<repo>/npm/release/tests/rust-toolchain-policy.test.mjs",
+          "<repo>/npm/release/tests/release-hardening-policy.test.mjs",
+          "<repo>/npm/release/tests/acceptance-artifact-policy.test.mjs",
+          "<repo>/npm/release/tests/release-api-contract.test.mjs",
+          "<repo>/npm/release/tests/ci-policy.test.mjs",
+          "<repo>/npm/release/tests/linux-glibc-compatibility.test.mjs",
+          "<repo>/npm/release/tests/validate-recovery-source.test.mjs",
+          "<repo>/npm/release/tests/stable-release-policy.test.mjs",
+          "<repo>/npm/release/tests/release-artifacts.test.mjs",
+          "<repo>/npm/release/tests/release-candidate.test.mjs"
+        ],
+        "returncode": 0
+      }
+    ],
+    "runtime-deny-status": {
+      "command": [
+        "cargo",
+        "deny",
+        "--all-features",
+        "check",
+        "--hide-inclusion-graph",
+        "advisories",
+        "bans",
+        "licenses"
+      ],
+      "exit_code": 0
+    },
+    "runtime-context-targeted-status": [
+      {
+        "name": "unit",
+        "command": [
+          "cargo",
+          "+1.94.0",
+          "test",
+          "--locked",
+          "-p",
+          "lpm-runtime",
+          "--lib"
+        ],
+        "exit_code": 0,
+        "seconds": 2.3847768306732178
+      },
+      {
+        "name": "build",
+        "command": [
+          "cargo",
+          "+1.94.0",
+          "build",
+          "--locked",
+          "-p",
+          "lpm-runtime"
+        ],
+        "exit_code": 0,
+        "seconds": 1.0698943138122559
+      },
+      {
+        "name": "clippy",
+        "command": [
+          "cargo",
+          "+1.94.0",
+          "clippy",
+          "--locked",
+          "-p",
+          "lpm-runtime",
+          "--all-targets",
+          "--",
+          "-D",
+          "warnings"
+        ],
+        "exit_code": 0,
+        "seconds": 0.9078819751739502
+      }
+    ],
+    "runtime-repro-status": {
+      "command": [
+        "cargo",
+        "+1.94.0",
+        "test",
+        "--locked",
+        "-p",
+        "lpm-runtime",
+        "explicit_path_node_shim_resolves_helpers_from_the_supplied_path",
+        "--"
+      ],
+      "exit_code": 101
+    },
+    "runtime-cache-repro-status": {
+      "command": [
+        "cargo",
+        "+1.94.0",
+        "test",
+        "--locked",
+        "-p",
+        "lpm-runtime",
+        "node_version_cache_reprobes",
+        "--",
+        "--nocapture"
+      ],
+      "exit_code": 101
+    },
+    "install_smoke": {
+      "command": "node bench/scripts/run-install-readiness.mjs --fixtures native-sharp --managers lpm --lpm-routes direct --lpm-firewall-modes off --lpm-binary runtime=/tmp/lpm-cache-gate-target-1940/debug/lpm-rs --modes cold,ci-cold,warm,up-to-date --samples 1 --allow-inconclusive",
+      "purpose": "Functional smoke with debug CLI. Timings are not performance evidence.",
+      "modes": [
+        {
+          "mode": "cold",
+          "exit_code": 0,
+          "package_count": 11
+        },
+        {
+          "mode": "ci-cold",
+          "exit_code": 0,
+          "package_count": 11
+        },
+        {
+          "mode": "warm",
+          "exit_code": 0,
+          "package_count": 11
+        },
+        {
+          "mode": "up-to-date",
+          "exit_code": 0,
+          "package_count": null
+        }
+      ]
+    }
+  },
+  "review": "Independent final source review found no new concrete defect."
+}
