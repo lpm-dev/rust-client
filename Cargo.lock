@@ -3555,11 +3555,14 @@ name = "lpm-extractor"
 version = "0.78.0"
 dependencies = [
  "blake3",
+ "cap-fs-ext",
+ "cap-std",
  "criterion",
  "flate2",
  "libc",
  "libdeflater",
  "lpm-common",
+ "rustix",
  "tar",
  "tempfile",
  "thiserror 2.0.18",

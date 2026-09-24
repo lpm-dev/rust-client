@@ -1,0 +1,50 @@
+{
+  "baseline_head": "9103f95671e63bffb625262333fd52b49bfb08f6",
+  "baseline_sha256": "b921075ff265c835d64480ce9d9c4431c6d9efae81d9daa0672ae0247c3de9a3",
+  "platform": "macOS-27.0-arm64-arm-64bit-Mach-O",
+  "architecture": "arm64",
+  "bun_version": "1.4.2",
+  "rust_version": "rustc 1.94.0 (4a4ef493e 2026-03-02)",
+  "benchmark": {
+    "scored_samples": 6,
+    "fixtures": [
+      "vite-react",
+      "native-sharp",
+      "nest",
+      "t3"
+    ],
+    "modes": [
+      "cold",
+      "ci-cold"
+    ],
+    "variants": [
+      "baseline",
+      "candidate",
+      "bun"
+    ],
+    "separate_warm_gate": true,
+    "order": "six balanced three-spec orders; existing runner without --lpm-compare",
+    "registry": "live registry; compare resolved locks and installed artifacts after all samples",
+    "removed_samples": 0
+  },
+  "candidate_sha256": "79fade589f01c4956bfced04746477f8442a933bb09b8a32ca4d0baf45ce9df1",
+  "candidate_build_seconds": 494.9489779472351,
+  "candidate_build_command": [
+    "cargo",
+    "build",
+    "--release",
+    "--locked",
+    "-p",
+    "lpm-cli"
+  ],
+  "archive_sha256": "84c644fa9e7dc0091357ec8f7dada685fe2e98e20a4dd6bded7e469ae3d81f7f",
+  "probe_sha256": {
+    "probe-digests": "8f089000d7aca7e8bde7954d43370d386bb54d083aba214fe634f163ba429581",
+    "probe-inspector": "ef283ce88d8ffb4ae977f815f3c0316faeffa1a709706263f7cd793ec22eca8e",
+    "probe-exclusive": "060d15c1d60c586eee1c7e4504929a2a5343adc09562ed4900e36f7509764bfb",
+    "probe-stages": "bc7495b16777651eda5053c8f27e0c46c9e9315dea9ab77df391d6bfc6825a3e"
+  },
+  "post_benchmark_changes": "Linux-only openat2 implementation and tests; documentation and formatting. No macOS runtime changes.",
+  "linux": "Native arm64 Linux filesystem in OrbStack; system allocator for both variants; Rust1.94.0. Separate warm round and six alternating pairs for openat2.",
+  "discarded_experiment": "The preliminary Linux openat2 build refreshed unrelated dependency versions. Only the repeat with unchanged dependency versions is included."
+}
