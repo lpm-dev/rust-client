@@ -1,0 +1,2940 @@
+{
+  "small_spool": [
+    {
+      "round": 0,
+      "counted": false,
+      "variant": "file",
+      "elapsed_us": 658372,
+      "max_rss_bytes": 27967488
+    },
+    {
+      "round": 0,
+      "counted": false,
+      "variant": "bytes",
+      "elapsed_us": 637317,
+      "max_rss_bytes": 27672576
+    },
+    {
+      "round": 1,
+      "counted": true,
+      "variant": "bytes",
+      "elapsed_us": 631350,
+      "max_rss_bytes": 27688960
+    },
+    {
+      "round": 1,
+      "counted": true,
+      "variant": "file",
+      "elapsed_us": 641838,
+      "max_rss_bytes": 27983872
+    },
+    {
+      "round": 2,
+      "counted": true,
+      "variant": "file",
+      "elapsed_us": 666908,
+      "max_rss_bytes": 27983872
+    },
+    {
+      "round": 2,
+      "counted": true,
+      "variant": "bytes",
+      "elapsed_us": 623138,
+      "max_rss_bytes": 27688960
+    },
+    {
+      "round": 3,
+      "counted": true,
+      "variant": "bytes",
+      "elapsed_us": 616913,
+      "max_rss_bytes": 27688960
+    },
+    {
+      "round": 3,
+      "counted": true,
+      "variant": "file",
+      "elapsed_us": 687840,
+      "max_rss_bytes": 27983872
+    },
+    {
+      "round": 4,
+      "counted": true,
+      "variant": "file",
+      "elapsed_us": 662308,
+      "max_rss_bytes": 27967488
+    },
+    {
+      "round": 4,
+      "counted": true,
+      "variant": "bytes",
+      "elapsed_us": 649196,
+      "max_rss_bytes": 27672576
+    },
+    {
+      "round": 5,
+      "counted": true,
+      "variant": "bytes",
+      "elapsed_us": 603492,
+      "max_rss_bytes": 27672576
+    },
+    {
+      "round": 5,
+      "counted": true,
+      "variant": "file",
+      "elapsed_us": 652340,
+      "max_rss_bytes": 27983872
+    },
+    {
+      "round": 6,
+      "counted": true,
+      "variant": "file",
+      "elapsed_us": 640705,
+      "max_rss_bytes": 27967488
+    },
+    {
+      "round": 6,
+      "counted": true,
+      "variant": "bytes",
+      "elapsed_us": 592879,
+      "max_rss_bytes": 27688960
+    },
+    {
+      "round": 7,
+      "counted": true,
+      "variant": "bytes",
+      "elapsed_us": 591263,
+      "max_rss_bytes": 27672576
+    },
+    {
+      "round": 7,
+      "counted": true,
+      "variant": "file",
+      "elapsed_us": 646692,
+      "max_rss_bytes": 27983872
+    },
+    {
+      "round": 8,
+      "counted": true,
+      "variant": "file",
+      "elapsed_us": 648011,
+      "max_rss_bytes": 27967488
+    },
+    {
+      "round": 8,
+      "counted": true,
+      "variant": "bytes",
+      "elapsed_us": 601120,
+      "max_rss_bytes": 27688960
+    }
+  ],
+  "path_depth": [
+    {
+      "round": 0,
+      "counted": false,
+      "variant": "shallow",
+      "path_length": 55,
+      "files": 8531,
+      "elapsed_us": 837413,
+      "max_rss_bytes": 9977856
+    },
+    {
+      "round": 0,
+      "counted": false,
+      "variant": "deep",
+      "path_length": 633,
+      "files": 8531,
+      "elapsed_us": 913385,
+      "max_rss_bytes": 10190848
+    },
+    {
+      "round": 1,
+      "counted": true,
+      "variant": "deep",
+      "path_length": 633,
+      "files": 8531,
+      "elapsed_us": 921131,
+      "max_rss_bytes": 10207232
+    },
+    {
+      "round": 1,
+      "counted": true,
+      "variant": "shallow",
+      "path_length": 55,
+      "files": 8531,
+      "elapsed_us": 765754,
+      "max_rss_bytes": 9977856
+    },
+    {
+      "round": 2,
+      "counted": true,
+      "variant": "shallow",
+      "path_length": 55,
+      "files": 8531,
+      "elapsed_us": 773965,
+      "max_rss_bytes": 9994240
+    },
+    {
+      "round": 2,
+      "counted": true,
+      "variant": "deep",
+      "path_length": 633,
+      "files": 8531,
+      "elapsed_us": 916476,
+      "max_rss_bytes": 10190848
+    },
+    {
+      "round": 3,
+      "counted": true,
+      "variant": "deep",
+      "path_length": 633,
+      "files": 8531,
+      "elapsed_us": 930953,
+      "max_rss_bytes": 10190848
+    },
+    {
+      "round": 3,
+      "counted": true,
+      "variant": "shallow",
+      "path_length": 55,
+      "files": 8531,
+      "elapsed_us": 774469,
+      "max_rss_bytes": 9977856
+    },
+    {
+      "round": 4,
+      "counted": true,
+      "variant": "shallow",
+      "path_length": 55,
+      "files": 8531,
+      "elapsed_us": 777725,
+      "max_rss_bytes": 9977856
+    },
+    {
+      "round": 4,
+      "counted": true,
+      "variant": "deep",
+      "path_length": 633,
+      "files": 8531,
+      "elapsed_us": 941568,
+      "max_rss_bytes": 10207232
+    },
+    {
+      "round": 5,
+      "counted": true,
+      "variant": "deep",
+      "path_length": 633,
+      "files": 8531,
+      "elapsed_us": 946447,
+      "max_rss_bytes": 10190848
+    },
+    {
+      "round": 5,
+      "counted": true,
+      "variant": "shallow",
+      "path_length": 55,
+      "files": 8531,
+      "elapsed_us": 777063,
+      "max_rss_bytes": 9977856
+    },
+    {
+      "round": 6,
+      "counted": true,
+      "variant": "shallow",
+      "path_length": 55,
+      "files": 8531,
+      "elapsed_us": 782296,
+      "max_rss_bytes": 9977856
+    },
+    {
+      "round": 6,
+      "counted": true,
+      "variant": "deep",
+      "path_length": 633,
+      "files": 8531,
+      "elapsed_us": 911020,
+      "max_rss_bytes": 10190848
+    },
+    {
+      "round": 7,
+      "counted": true,
+      "variant": "deep",
+      "path_length": 633,
+      "files": 8531,
+      "elapsed_us": 910215,
+      "max_rss_bytes": 10190848
+    },
+    {
+      "round": 7,
+      "counted": true,
+      "variant": "shallow",
+      "path_length": 55,
+      "files": 8531,
+      "elapsed_us": 775399,
+      "max_rss_bytes": 9977856
+    },
+    {
+      "round": 8,
+      "counted": true,
+      "variant": "shallow",
+      "path_length": 55,
+      "files": 8531,
+      "elapsed_us": 781316,
+      "max_rss_bytes": 9977856
+    },
+    {
+      "round": 8,
+      "counted": true,
+      "variant": "deep",
+      "path_length": 633,
+      "files": 8531,
+      "elapsed_us": 912333,
+      "max_rss_bytes": 10190848
+    }
+  ],
+  "h2_windows": [
+    {
+      "round": 0,
+      "counted": false,
+      "variant": "default",
+      "elapsed_us": 556654,
+      "max_rss_bytes": 94797824,
+      "requests": [
+        {
+          "name": "rxjs",
+          "decoded_bytes": 388450,
+          "blake3": "a73b69b2c3bcc12afc8bb48df764d5961e7334ed19131b210ef3920dc3b2be66",
+          "headers_us": 380227,
+          "first_us": 380752,
+          "done_us": 383997
+        },
+        {
+          "name": "@babel/core",
+          "decoded_bytes": 426222,
+          "blake3": "9778cdb1c1ae54b698162379e56c586c2333309622f670a0059b99c047d46018",
+          "headers_us": 383605,
+          "first_us": 383972,
+          "done_us": 386753
+        },
+        {
+          "name": "esbuild",
+          "decoded_bytes": 889133,
+          "blake3": "3c9b410f5c4ab0af5c368f8532a5a455f7e0848c606bb7e728e99cb88f0cb380",
+          "headers_us": 390063,
+          "first_us": 390437,
+          "done_us": 396236
+        },
+        {
+          "name": "@types/react",
+          "decoded_bytes": 666086,
+          "blake3": "3b2caebd0c7f84cab99cd8ac88387a9d4b05e5beef1df1c6d5a18857c24c85ef",
+          "headers_us": 392677,
+          "first_us": 392836,
+          "done_us": 396948
+        },
+        {
+          "name": "vite",
+          "decoded_bytes": 2307868,
+          "blake3": "4ece7c1c4c44bb2f08706665dac09b8e743d3e7a275c7f4716d2af96d272e614",
+          "headers_us": 400982,
+          "first_us": 401847,
+          "done_us": 406945
+        },
+        {
+          "name": "@types/node",
+          "decoded_bytes": 2327706,
+          "blake3": "ea8638cd591f36722d1d09bb002856d24d2bf72675394cee05c808ff8c751bfd",
+          "headers_us": 405302,
+          "first_us": 405968,
+          "done_us": 429386
+        },
+        {
+          "name": "typescript",
+          "decoded_bytes": 8696694,
+          "blake3": "f982749637372e84b661c47dde2d87eb118ef6c1fcae81ae97df2ed25857b3d3",
+          "headers_us": 429225,
+          "first_us": 429367,
+          "done_us": 478334
+        },
+        {
+          "name": "next",
+          "decoded_bytes": 25557776,
+          "blake3": "8b0ade096405a69afd22b7c714fd3960f7009b5945051f81e3f57fab8ae34fb9",
+          "headers_us": 434664,
+          "first_us": 435199,
+          "done_us": 542650
+        }
+      ]
+    },
+    {
+      "round": 0,
+      "counted": false,
+      "variant": "large",
+      "elapsed_us": 236333,
+      "max_rss_bytes": 93667328,
+      "requests": [
+        {
+          "name": "rxjs",
+          "decoded_bytes": 388450,
+          "blake3": "a73b69b2c3bcc12afc8bb48df764d5961e7334ed19131b210ef3920dc3b2be66",
+          "headers_us": 43521,
+          "first_us": 43894,
+          "done_us": 46968
+        },
+        {
+          "name": "@babel/core",
+          "decoded_bytes": 426222,
+          "blake3": "9778cdb1c1ae54b698162379e56c586c2333309622f670a0059b99c047d46018",
+          "headers_us": 48860,
+          "first_us": 49659,
+          "done_us": 50995
+        },
+        {
+          "name": "esbuild",
+          "decoded_bytes": 889133,
+          "blake3": "3c9b410f5c4ab0af5c368f8532a5a455f7e0848c606bb7e728e99cb88f0cb380",
+          "headers_us": 51539,
+          "first_us": 51668,
+          "done_us": 55616
+        },
+        {
+          "name": "@types/react",
+          "decoded_bytes": 666086,
+          "blake3": "3b2caebd0c7f84cab99cd8ac88387a9d4b05e5beef1df1c6d5a18857c24c85ef",
+          "headers_us": 61520,
+          "first_us": 61777,
+          "done_us": 64543
+        },
+        {
+          "name": "vite",
+          "decoded_bytes": 2307868,
+          "blake3": "4ece7c1c4c44bb2f08706665dac09b8e743d3e7a275c7f4716d2af96d272e614",
+          "headers_us": 64439,
+          "first_us": 64556,
+          "done_us": 68847
+        },
+        {
+          "name": "@types/node",
+          "decoded_bytes": 2327706,
+          "blake3": "ea8638cd591f36722d1d09bb002856d24d2bf72675394cee05c808ff8c751bfd",
+          "headers_us": 80789,
+          "first_us": 81129,
+          "done_us": 97788
+        },
+        {
+          "name": "typescript",
+          "decoded_bytes": 8696694,
+          "blake3": "f982749637372e84b661c47dde2d87eb118ef6c1fcae81ae97df2ed25857b3d3",
+          "headers_us": 103325,
+          "first_us": 103558,
+          "done_us": 159181
+        },
+        {
+          "name": "next",
+          "decoded_bytes": 25557776,
+          "blake3": "8b0ade096405a69afd22b7c714fd3960f7009b5945051f81e3f57fab8ae34fb9",
+          "headers_us": 42991,
+          "first_us": 43325,
+          "done_us": 222390
+        }
+      ]
+    },
+    {
+      "round": 1,
+      "counted": true,
+      "variant": "large",
+      "elapsed_us": 222142,
+      "max_rss_bytes": 104579072,
+      "requests": [
+        {
+          "name": "rxjs",
+          "decoded_bytes": 388450,
+          "blake3": "a73b69b2c3bcc12afc8bb48df764d5961e7334ed19131b210ef3920dc3b2be66",
+          "headers_us": 43153,
+          "first_us": 43245,
+          "done_us": 44512
+        },
+        {
+          "name": "@babel/core",
+          "decoded_bytes": 426222,
+          "blake3": "9778cdb1c1ae54b698162379e56c586c2333309622f670a0059b99c047d46018",
+          "headers_us": 46842,
+          "first_us": 47585,
+          "done_us": 48616
+        },
+        {
+          "name": "esbuild",
+          "decoded_bytes": 889133,
+          "blake3": "3c9b410f5c4ab0af5c368f8532a5a455f7e0848c606bb7e728e99cb88f0cb380",
+          "headers_us": 39241,
+          "first_us": 39355,
+          "done_us": 54768
+        },
+        {
+          "name": "@types/react",
+          "decoded_bytes": 666086,
+          "blake3": "3b2caebd0c7f84cab99cd8ac88387a9d4b05e5beef1df1c6d5a18857c24c85ef",
+          "headers_us": 55289,
+          "first_us": 55634,
+          "done_us": 57884
+        },
+        {
+          "name": "vite",
+          "decoded_bytes": 2307868,
+          "blake3": "4ece7c1c4c44bb2f08706665dac09b8e743d3e7a275c7f4716d2af96d272e614",
+          "headers_us": 57935,
+          "first_us": 58156,
+          "done_us": 61897
+        },
+        {
+          "name": "@types/node",
+          "decoded_bytes": 2327706,
+          "blake3": "ea8638cd591f36722d1d09bb002856d24d2bf72675394cee05c808ff8c751bfd",
+          "headers_us": 63009,
+          "first_us": 63298,
+          "done_us": 104201
+        },
+        {
+          "name": "typescript",
+          "decoded_bytes": 8696694,
+          "blake3": "f982749637372e84b661c47dde2d87eb118ef6c1fcae81ae97df2ed25857b3d3",
+          "headers_us": 87496,
+          "first_us": 87807,
+          "done_us": 139583
+        },
+        {
+          "name": "next",
+          "decoded_bytes": 25557776,
+          "blake3": "8b0ade096405a69afd22b7c714fd3960f7009b5945051f81e3f57fab8ae34fb9",
+          "headers_us": 83413,
+          "first_us": 83540,
+          "done_us": 208694
+        }
+      ]
+    },
+    {
+      "round": 1,
+      "counted": true,
+      "variant": "default",
+      "elapsed_us": 245295,
+      "max_rss_bytes": 98025472,
+      "requests": [
+        {
+          "name": "rxjs",
+          "decoded_bytes": 388450,
+          "blake3": "a73b69b2c3bcc12afc8bb48df764d5961e7334ed19131b210ef3920dc3b2be66",
+          "headers_us": 39676,
+          "first_us": 39906,
+          "done_us": 43357
+        },
+        {
+          "name": "@babel/core",
+          "decoded_bytes": 426222,
+          "blake3": "9778cdb1c1ae54b698162379e56c586c2333309622f670a0059b99c047d46018",
+          "headers_us": 50786,
+          "first_us": 51166,
+          "done_us": 52867
+        },
+        {
+          "name": "@types/react",
+          "decoded_bytes": 666086,
+          "blake3": "3b2caebd0c7f84cab99cd8ac88387a9d4b05e5beef1df1c6d5a18857c24c85ef",
+          "headers_us": 53246,
+          "first_us": 53518,
+          "done_us": 61431
+        },
+        {
+          "name": "esbuild",
+          "decoded_bytes": 889133,
+          "blake3": "3c9b410f5c4ab0af5c368f8532a5a455f7e0848c606bb7e728e99cb88f0cb380",
+          "headers_us": 55648,
+          "first_us": 56064,
+          "done_us": 61829
+        },
+        {
+          "name": "vite",
+          "decoded_bytes": 2307868,
+          "blake3": "4ece7c1c4c44bb2f08706665dac09b8e743d3e7a275c7f4716d2af96d272e614",
+          "headers_us": 63142,
+          "first_us": 63810,
+          "done_us": 67784
+        },
+        {
+          "name": "@types/node",
+          "decoded_bytes": 2327706,
+          "blake3": "ea8638cd591f36722d1d09bb002856d24d2bf72675394cee05c808ff8c751bfd",
+          "headers_us": 76703,
+          "first_us": 76904,
+          "done_us": 101301
+        },
+        {
+          "name": "typescript",
+          "decoded_bytes": 8696694,
+          "blake3": "f982749637372e84b661c47dde2d87eb118ef6c1fcae81ae97df2ed25857b3d3",
+          "headers_us": 90627,
+          "first_us": 91048,
+          "done_us": 133841
+        },
+        {
+          "name": "next",
+          "decoded_bytes": 25557776,
+          "blake3": "8b0ade096405a69afd22b7c714fd3960f7009b5945051f81e3f57fab8ae34fb9",
+          "headers_us": 100207,
+          "first_us": 100462,
+          "done_us": 232261
+        }
+      ]
+    },
+    {
+      "round": 2,
+      "counted": true,
+      "variant": "default",
+      "elapsed_us": 218268,
+      "max_rss_bytes": 100368384,
+      "requests": [
+        {
+          "name": "rxjs",
+          "decoded_bytes": 388450,
+          "blake3": "a73b69b2c3bcc12afc8bb48df764d5961e7334ed19131b210ef3920dc3b2be66",
+          "headers_us": 42913,
+          "first_us": 43168,
+          "done_us": 46237
+        },
+        {
+          "name": "@babel/core",
+          "decoded_bytes": 426222,
+          "blake3": "9778cdb1c1ae54b698162379e56c586c2333309622f670a0059b99c047d46018",
+          "headers_us": 47578,
+          "first_us": 48098,
+          "done_us": 49581
+        },
+        {
+          "name": "esbuild",
+          "decoded_bytes": 889133,
+          "blake3": "3c9b410f5c4ab0af5c368f8532a5a455f7e0848c606bb7e728e99cb88f0cb380",
+          "headers_us": 53565,
+          "first_us": 53826,
+          "done_us": 57969
+        },
+        {
+          "name": "@types/react",
+          "decoded_bytes": 666086,
+          "blake3": "3b2caebd0c7f84cab99cd8ac88387a9d4b05e5beef1df1c6d5a18857c24c85ef",
+          "headers_us": 57637,
+          "first_us": 57900,
+          "done_us": 60464
+        },
+        {
+          "name": "vite",
+          "decoded_bytes": 2307868,
+          "blake3": "4ece7c1c4c44bb2f08706665dac09b8e743d3e7a275c7f4716d2af96d272e614",
+          "headers_us": 60410,
+          "first_us": 60607,
+          "done_us": 64273
+        },
+        {
+          "name": "@types/node",
+          "decoded_bytes": 2327706,
+          "blake3": "ea8638cd591f36722d1d09bb002856d24d2bf72675394cee05c808ff8c751bfd",
+          "headers_us": 71214,
+          "first_us": 71695,
+          "done_us": 91268
+        },
+        {
+          "name": "typescript",
+          "decoded_bytes": 8696694,
+          "blake3": "f982749637372e84b661c47dde2d87eb118ef6c1fcae81ae97df2ed25857b3d3",
+          "headers_us": 84372,
+          "first_us": 84618,
+          "done_us": 134318
+        },
+        {
+          "name": "next",
+          "decoded_bytes": 25557776,
+          "blake3": "8b0ade096405a69afd22b7c714fd3960f7009b5945051f81e3f57fab8ae34fb9",
+          "headers_us": 77991,
+          "first_us": 78347,
+          "done_us": 206221
+        }
+      ]
+    },
+    {
+      "round": 2,
+      "counted": true,
+      "variant": "large",
+      "elapsed_us": 210064,
+      "max_rss_bytes": 102563840,
+      "requests": [
+        {
+          "name": "rxjs",
+          "decoded_bytes": 388450,
+          "blake3": "a73b69b2c3bcc12afc8bb48df764d5961e7334ed19131b210ef3920dc3b2be66",
+          "headers_us": 38944,
+          "first_us": 39203,
+          "done_us": 40121
+        },
+        {
+          "name": "@babel/core",
+          "decoded_bytes": 426222,
+          "blake3": "9778cdb1c1ae54b698162379e56c586c2333309622f670a0059b99c047d46018",
+          "headers_us": 44720,
+          "first_us": 45201,
+          "done_us": 46577
+        },
+        {
+          "name": "esbuild",
+          "decoded_bytes": 889133,
+          "blake3": "3c9b410f5c4ab0af5c368f8532a5a455f7e0848c606bb7e728e99cb88f0cb380",
+          "headers_us": 46854,
+          "first_us": 47346,
+          "done_us": 52078
+        },
+        {
+          "name": "@types/react",
+          "decoded_bytes": 666086,
+          "blake3": "3b2caebd0c7f84cab99cd8ac88387a9d4b05e5beef1df1c6d5a18857c24c85ef",
+          "headers_us": 53875,
+          "first_us": 54108,
+          "done_us": 56604
+        },
+        {
+          "name": "vite",
+          "decoded_bytes": 2307868,
+          "blake3": "4ece7c1c4c44bb2f08706665dac09b8e743d3e7a275c7f4716d2af96d272e614",
+          "headers_us": 34865,
+          "first_us": 35047,
+          "done_us": 61105
+        },
+        {
+          "name": "@types/node",
+          "decoded_bytes": 2327706,
+          "blake3": "ea8638cd591f36722d1d09bb002856d24d2bf72675394cee05c808ff8c751bfd",
+          "headers_us": 73519,
+          "first_us": 73887,
+          "done_us": 97283
+        },
+        {
+          "name": "typescript",
+          "decoded_bytes": 8696694,
+          "blake3": "f982749637372e84b661c47dde2d87eb118ef6c1fcae81ae97df2ed25857b3d3",
+          "headers_us": 97192,
+          "first_us": 97420,
+          "done_us": 158870
+        },
+        {
+          "name": "next",
+          "decoded_bytes": 25557776,
+          "blake3": "8b0ade096405a69afd22b7c714fd3960f7009b5945051f81e3f57fab8ae34fb9",
+          "headers_us": 85984,
+          "first_us": 86529,
+          "done_us": 197750
+        }
+      ]
+    },
+    {
+      "round": 3,
+      "counted": true,
+      "variant": "large",
+      "elapsed_us": 205471,
+      "max_rss_bytes": 91291648,
+      "requests": [
+        {
+          "name": "rxjs",
+          "decoded_bytes": 388450,
+          "blake3": "a73b69b2c3bcc12afc8bb48df764d5961e7334ed19131b210ef3920dc3b2be66",
+          "headers_us": 43860,
+          "first_us": 44098,
+          "done_us": 47605
+        },
+        {
+          "name": "@babel/core",
+          "decoded_bytes": 426222,
+          "blake3": "9778cdb1c1ae54b698162379e56c586c2333309622f670a0059b99c047d46018",
+          "headers_us": 47546,
+          "first_us": 47642,
+          "done_us": 50810
+        },
+        {
+          "name": "esbuild",
+          "decoded_bytes": 889133,
+          "blake3": "3c9b410f5c4ab0af5c368f8532a5a455f7e0848c606bb7e728e99cb88f0cb380",
+          "headers_us": 50809,
+          "first_us": 51042,
+          "done_us": 57033
+        },
+        {
+          "name": "@types/react",
+          "decoded_bytes": 666086,
+          "blake3": "3b2caebd0c7f84cab99cd8ac88387a9d4b05e5beef1df1c6d5a18857c24c85ef",
+          "headers_us": 53223,
+          "first_us": 54266,
+          "done_us": 57393
+        },
+        {
+          "name": "vite",
+          "decoded_bytes": 2307868,
+          "blake3": "4ece7c1c4c44bb2f08706665dac09b8e743d3e7a275c7f4716d2af96d272e614",
+          "headers_us": 63155,
+          "first_us": 63597,
+          "done_us": 67099
+        },
+        {
+          "name": "@types/node",
+          "decoded_bytes": 2327706,
+          "blake3": "ea8638cd591f36722d1d09bb002856d24d2bf72675394cee05c808ff8c751bfd",
+          "headers_us": 66583,
+          "first_us": 66984,
+          "done_us": 81986
+        },
+        {
+          "name": "typescript",
+          "decoded_bytes": 8696694,
+          "blake3": "f982749637372e84b661c47dde2d87eb118ef6c1fcae81ae97df2ed25857b3d3",
+          "headers_us": 70578,
+          "first_us": 70840,
+          "done_us": 127847
+        },
+        {
+          "name": "next",
+          "decoded_bytes": 25557776,
+          "blake3": "8b0ade096405a69afd22b7c714fd3960f7009b5945051f81e3f57fab8ae34fb9",
+          "headers_us": 82071,
+          "first_us": 82162,
+          "done_us": 192833
+        }
+      ]
+    },
+    {
+      "round": 3,
+      "counted": true,
+      "variant": "default",
+      "elapsed_us": 242416,
+      "max_rss_bytes": 97763328,
+      "requests": [
+        {
+          "name": "rxjs",
+          "decoded_bytes": 388450,
+          "blake3": "a73b69b2c3bcc12afc8bb48df764d5961e7334ed19131b210ef3920dc3b2be66",
+          "headers_us": 43100,
+          "first_us": 43260,
+          "done_us": 46591
+        },
+        {
+          "name": "@babel/core",
+          "decoded_bytes": 426222,
+          "blake3": "9778cdb1c1ae54b698162379e56c586c2333309622f670a0059b99c047d46018",
+          "headers_us": 46539,
+          "first_us": 46758,
+          "done_us": 50406
+        },
+        {
+          "name": "esbuild",
+          "decoded_bytes": 889133,
+          "blake3": "3c9b410f5c4ab0af5c368f8532a5a455f7e0848c606bb7e728e99cb88f0cb380",
+          "headers_us": 50325,
+          "first_us": 50464,
+          "done_us": 55154
+        },
+        {
+          "name": "@types/react",
+          "decoded_bytes": 666086,
+          "blake3": "3b2caebd0c7f84cab99cd8ac88387a9d4b05e5beef1df1c6d5a18857c24c85ef",
+          "headers_us": 54019,
+          "first_us": 54229,
+          "done_us": 56819
+        },
+        {
+          "name": "vite",
+          "decoded_bytes": 2307868,
+          "blake3": "4ece7c1c4c44bb2f08706665dac09b8e743d3e7a275c7f4716d2af96d272e614",
+          "headers_us": 67104,
+          "first_us": 67673,
+          "done_us": 70989
+        },
+        {
+          "name": "@types/node",
+          "decoded_bytes": 2327706,
+          "blake3": "ea8638cd591f36722d1d09bb002856d24d2bf72675394cee05c808ff8c751bfd",
+          "headers_us": 97150,
+          "first_us": 97477,
+          "done_us": 107139
+        },
+        {
+          "name": "typescript",
+          "decoded_bytes": 8696694,
+          "blake3": "f982749637372e84b661c47dde2d87eb118ef6c1fcae81ae97df2ed25857b3d3",
+          "headers_us": 84436,
+          "first_us": 84853,
+          "done_us": 156769
+        },
+        {
+          "name": "next",
+          "decoded_bytes": 25557776,
+          "blake3": "8b0ade096405a69afd22b7c714fd3960f7009b5945051f81e3f57fab8ae34fb9",
+          "headers_us": 86657,
+          "first_us": 86927,
+          "done_us": 229460
+        }
+      ]
+    },
+    {
+      "round": 4,
+      "counted": true,
+      "variant": "default",
+      "elapsed_us": 218931,
+      "max_rss_bytes": 84377600,
+      "requests": [
+        {
+          "name": "rxjs",
+          "decoded_bytes": 388450,
+          "blake3": "a73b69b2c3bcc12afc8bb48df764d5961e7334ed19131b210ef3920dc3b2be66",
+          "headers_us": 40886,
+          "first_us": 41086,
+          "done_us": 44231
+        },
+        {
+          "name": "@babel/core",
+          "decoded_bytes": 426222,
+          "blake3": "9778cdb1c1ae54b698162379e56c586c2333309622f670a0059b99c047d46018",
+          "headers_us": 48801,
+          "first_us": 49539,
+          "done_us": 52007
+        },
+        {
+          "name": "esbuild",
+          "decoded_bytes": 889133,
+          "blake3": "3c9b410f5c4ab0af5c368f8532a5a455f7e0848c606bb7e728e99cb88f0cb380",
+          "headers_us": 44675,
+          "first_us": 45136,
+          "done_us": 52227
+        },
+        {
+          "name": "@types/react",
+          "decoded_bytes": 666086,
+          "blake3": "3b2caebd0c7f84cab99cd8ac88387a9d4b05e5beef1df1c6d5a18857c24c85ef",
+          "headers_us": 53089,
+          "first_us": 53785,
+          "done_us": 56348
+        },
+        {
+          "name": "vite",
+          "decoded_bytes": 2307868,
+          "blake3": "4ece7c1c4c44bb2f08706665dac09b8e743d3e7a275c7f4716d2af96d272e614",
+          "headers_us": 61243,
+          "first_us": 61596,
+          "done_us": 65318
+        },
+        {
+          "name": "@types/node",
+          "decoded_bytes": 2327706,
+          "blake3": "ea8638cd591f36722d1d09bb002856d24d2bf72675394cee05c808ff8c751bfd",
+          "headers_us": 71874,
+          "first_us": 72105,
+          "done_us": 88379
+        },
+        {
+          "name": "typescript",
+          "decoded_bytes": 8696694,
+          "blake3": "f982749637372e84b661c47dde2d87eb118ef6c1fcae81ae97df2ed25857b3d3",
+          "headers_us": 80571,
+          "first_us": 81093,
+          "done_us": 135957
+        },
+        {
+          "name": "next",
+          "decoded_bytes": 25557776,
+          "blake3": "8b0ade096405a69afd22b7c714fd3960f7009b5945051f81e3f57fab8ae34fb9",
+          "headers_us": 95384,
+          "first_us": 95816,
+          "done_us": 207065
+        }
+      ]
+    },
+    {
+      "round": 4,
+      "counted": true,
+      "variant": "large",
+      "elapsed_us": 193885,
+      "max_rss_bytes": 96419840,
+      "requests": [
+        {
+          "name": "rxjs",
+          "decoded_bytes": 388450,
+          "blake3": "a73b69b2c3bcc12afc8bb48df764d5961e7334ed19131b210ef3920dc3b2be66",
+          "headers_us": 41165,
+          "first_us": 41409,
+          "done_us": 44591
+        },
+        {
+          "name": "@babel/core",
+          "decoded_bytes": 426222,
+          "blake3": "9778cdb1c1ae54b698162379e56c586c2333309622f670a0059b99c047d46018",
+          "headers_us": 48588,
+          "first_us": 48971,
+          "done_us": 50321
+        },
+        {
+          "name": "@types/react",
+          "decoded_bytes": 666086,
+          "blake3": "3b2caebd0c7f84cab99cd8ac88387a9d4b05e5beef1df1c6d5a18857c24c85ef",
+          "headers_us": 51963,
+          "first_us": 52410,
+          "done_us": 56355
+        },
+        {
+          "name": "esbuild",
+          "decoded_bytes": 889133,
+          "blake3": "3c9b410f5c4ab0af5c368f8532a5a455f7e0848c606bb7e728e99cb88f0cb380",
+          "headers_us": 56257,
+          "first_us": 56425,
+          "done_us": 59337
+        },
+        {
+          "name": "vite",
+          "decoded_bytes": 2307868,
+          "blake3": "4ece7c1c4c44bb2f08706665dac09b8e743d3e7a275c7f4716d2af96d272e614",
+          "headers_us": 66433,
+          "first_us": 66835,
+          "done_us": 70316
+        },
+        {
+          "name": "@types/node",
+          "decoded_bytes": 2327706,
+          "blake3": "ea8638cd591f36722d1d09bb002856d24d2bf72675394cee05c808ff8c751bfd",
+          "headers_us": 75661,
+          "first_us": 75911,
+          "done_us": 95831
+        },
+        {
+          "name": "typescript",
+          "decoded_bytes": 8696694,
+          "blake3": "f982749637372e84b661c47dde2d87eb118ef6c1fcae81ae97df2ed25857b3d3",
+          "headers_us": 97731,
+          "first_us": 98037,
+          "done_us": 155490
+        },
+        {
+          "name": "next",
+          "decoded_bytes": 25557776,
+          "blake3": "8b0ade096405a69afd22b7c714fd3960f7009b5945051f81e3f57fab8ae34fb9",
+          "headers_us": 84655,
+          "first_us": 85186,
+          "done_us": 182059
+        }
+      ]
+    },
+    {
+      "round": 5,
+      "counted": true,
+      "variant": "large",
+      "elapsed_us": 214735,
+      "max_rss_bytes": 94126080,
+      "requests": [
+        {
+          "name": "rxjs",
+          "decoded_bytes": 388450,
+          "blake3": "a73b69b2c3bcc12afc8bb48df764d5961e7334ed19131b210ef3920dc3b2be66",
+          "headers_us": 39981,
+          "first_us": 40170,
+          "done_us": 43291
+        },
+        {
+          "name": "@babel/core",
+          "decoded_bytes": 426222,
+          "blake3": "9778cdb1c1ae54b698162379e56c586c2333309622f670a0059b99c047d46018",
+          "headers_us": 43521,
+          "first_us": 43801,
+          "done_us": 46736
+        },
+        {
+          "name": "esbuild",
+          "decoded_bytes": 889133,
+          "blake3": "3c9b410f5c4ab0af5c368f8532a5a455f7e0848c606bb7e728e99cb88f0cb380",
+          "headers_us": 49857,
+          "first_us": 50112,
+          "done_us": 54860
+        },
+        {
+          "name": "@types/react",
+          "decoded_bytes": 666086,
+          "blake3": "3b2caebd0c7f84cab99cd8ac88387a9d4b05e5beef1df1c6d5a18857c24c85ef",
+          "headers_us": 52485,
+          "first_us": 53844,
+          "done_us": 56405
+        },
+        {
+          "name": "vite",
+          "decoded_bytes": 2307868,
+          "blake3": "4ece7c1c4c44bb2f08706665dac09b8e743d3e7a275c7f4716d2af96d272e614",
+          "headers_us": 57092,
+          "first_us": 57352,
+          "done_us": 60890
+        },
+        {
+          "name": "@types/node",
+          "decoded_bytes": 2327706,
+          "blake3": "ea8638cd591f36722d1d09bb002856d24d2bf72675394cee05c808ff8c751bfd",
+          "headers_us": 67439,
+          "first_us": 67846,
+          "done_us": 88263
+        },
+        {
+          "name": "typescript",
+          "decoded_bytes": 8696694,
+          "blake3": "f982749637372e84b661c47dde2d87eb118ef6c1fcae81ae97df2ed25857b3d3",
+          "headers_us": 92022,
+          "first_us": 92237,
+          "done_us": 123786
+        },
+        {
+          "name": "next",
+          "decoded_bytes": 25557776,
+          "blake3": "8b0ade096405a69afd22b7c714fd3960f7009b5945051f81e3f57fab8ae34fb9",
+          "headers_us": 88343,
+          "first_us": 88436,
+          "done_us": 201822
+        }
+      ]
+    },
+    {
+      "round": 5,
+      "counted": true,
+      "variant": "default",
+      "elapsed_us": 234383,
+      "max_rss_bytes": 105332736,
+      "requests": [
+        {
+          "name": "rxjs",
+          "decoded_bytes": 388450,
+          "blake3": "a73b69b2c3bcc12afc8bb48df764d5961e7334ed19131b210ef3920dc3b2be66",
+          "headers_us": 48362,
+          "first_us": 48554,
+          "done_us": 49495
+        },
+        {
+          "name": "@babel/core",
+          "decoded_bytes": 426222,
+          "blake3": "9778cdb1c1ae54b698162379e56c586c2333309622f670a0059b99c047d46018",
+          "headers_us": 50164,
+          "first_us": 50582,
+          "done_us": 52649
+        },
+        {
+          "name": "vite",
+          "decoded_bytes": 2307868,
+          "blake3": "4ece7c1c4c44bb2f08706665dac09b8e743d3e7a275c7f4716d2af96d272e614",
+          "headers_us": 36604,
+          "first_us": 36845,
+          "done_us": 62167
+        },
+        {
+          "name": "@types/react",
+          "decoded_bytes": 666086,
+          "blake3": "3b2caebd0c7f84cab99cd8ac88387a9d4b05e5beef1df1c6d5a18857c24c85ef",
+          "headers_us": 58958,
+          "first_us": 60820,
+          "done_us": 65098
+        },
+        {
+          "name": "esbuild",
+          "decoded_bytes": 889133,
+          "blake3": "3c9b410f5c4ab0af5c368f8532a5a455f7e0848c606bb7e728e99cb88f0cb380",
+          "headers_us": 58991,
+          "first_us": 59387,
+          "done_us": 65041
+        },
+        {
+          "name": "@types/node",
+          "decoded_bytes": 2327706,
+          "blake3": "ea8638cd591f36722d1d09bb002856d24d2bf72675394cee05c808ff8c751bfd",
+          "headers_us": 84510,
+          "first_us": 85092,
+          "done_us": 102438
+        },
+        {
+          "name": "typescript",
+          "decoded_bytes": 8696694,
+          "blake3": "f982749637372e84b661c47dde2d87eb118ef6c1fcae81ae97df2ed25857b3d3",
+          "headers_us": 77522,
+          "first_us": 77876,
+          "done_us": 125521
+        },
+        {
+          "name": "next",
+          "decoded_bytes": 25557776,
+          "blake3": "8b0ade096405a69afd22b7c714fd3960f7009b5945051f81e3f57fab8ae34fb9",
+          "headers_us": 95036,
+          "first_us": 95240,
+          "done_us": 220723
+        }
+      ]
+    },
+    {
+      "round": 6,
+      "counted": true,
+      "variant": "default",
+      "elapsed_us": 237048,
+      "max_rss_bytes": 100941824,
+      "requests": [
+        {
+          "name": "rxjs",
+          "decoded_bytes": 388450,
+          "blake3": "a73b69b2c3bcc12afc8bb48df764d5961e7334ed19131b210ef3920dc3b2be66",
+          "headers_us": 44372,
+          "first_us": 44646,
+          "done_us": 47903
+        },
+        {
+          "name": "@babel/core",
+          "decoded_bytes": 426222,
+          "blake3": "9778cdb1c1ae54b698162379e56c586c2333309622f670a0059b99c047d46018",
+          "headers_us": 52384,
+          "first_us": 52903,
+          "done_us": 54427
+        },
+        {
+          "name": "esbuild",
+          "decoded_bytes": 889133,
+          "blake3": "3c9b410f5c4ab0af5c368f8532a5a455f7e0848c606bb7e728e99cb88f0cb380",
+          "headers_us": 54815,
+          "first_us": 54947,
+          "done_us": 62964
+        },
+        {
+          "name": "@types/react",
+          "decoded_bytes": 666086,
+          "blake3": "3b2caebd0c7f84cab99cd8ac88387a9d4b05e5beef1df1c6d5a18857c24c85ef",
+          "headers_us": 57291,
+          "first_us": 57462,
+          "done_us": 63128
+        },
+        {
+          "name": "vite",
+          "decoded_bytes": 2307868,
+          "blake3": "4ece7c1c4c44bb2f08706665dac09b8e743d3e7a275c7f4716d2af96d272e614",
+          "headers_us": 63570,
+          "first_us": 63631,
+          "done_us": 67117
+        },
+        {
+          "name": "@types/node",
+          "decoded_bytes": 2327706,
+          "blake3": "ea8638cd591f36722d1d09bb002856d24d2bf72675394cee05c808ff8c751bfd",
+          "headers_us": 78372,
+          "first_us": 78850,
+          "done_us": 97724
+        },
+        {
+          "name": "typescript",
+          "decoded_bytes": 8696694,
+          "blake3": "f982749637372e84b661c47dde2d87eb118ef6c1fcae81ae97df2ed25857b3d3",
+          "headers_us": 87099,
+          "first_us": 87705,
+          "done_us": 149056
+        },
+        {
+          "name": "next",
+          "decoded_bytes": 25557776,
+          "blake3": "8b0ade096405a69afd22b7c714fd3960f7009b5945051f81e3f57fab8ae34fb9",
+          "headers_us": 121131,
+          "first_us": 121513,
+          "done_us": 223757
+        }
+      ]
+    },
+    {
+      "round": 6,
+      "counted": true,
+      "variant": "large",
+      "elapsed_us": 219749,
+      "max_rss_bytes": 93765632,
+      "requests": [
+        {
+          "name": "rxjs",
+          "decoded_bytes": 388450,
+          "blake3": "a73b69b2c3bcc12afc8bb48df764d5961e7334ed19131b210ef3920dc3b2be66",
+          "headers_us": 41751,
+          "first_us": 41970,
+          "done_us": 45284
+        },
+        {
+          "name": "@babel/core",
+          "decoded_bytes": 426222,
+          "blake3": "9778cdb1c1ae54b698162379e56c586c2333309622f670a0059b99c047d46018",
+          "headers_us": 47431,
+          "first_us": 47841,
+          "done_us": 49107
+        },
+        {
+          "name": "esbuild",
+          "decoded_bytes": 889133,
+          "blake3": "3c9b410f5c4ab0af5c368f8532a5a455f7e0848c606bb7e728e99cb88f0cb380",
+          "headers_us": 50989,
+          "first_us": 51357,
+          "done_us": 55619
+        },
+        {
+          "name": "@types/react",
+          "decoded_bytes": 666086,
+          "blake3": "3b2caebd0c7f84cab99cd8ac88387a9d4b05e5beef1df1c6d5a18857c24c85ef",
+          "headers_us": 55350,
+          "first_us": 55567,
+          "done_us": 58363
+        },
+        {
+          "name": "vite",
+          "decoded_bytes": 2307868,
+          "blake3": "4ece7c1c4c44bb2f08706665dac09b8e743d3e7a275c7f4716d2af96d272e614",
+          "headers_us": 59392,
+          "first_us": 59782,
+          "done_us": 63309
+        },
+        {
+          "name": "@types/node",
+          "decoded_bytes": 2327706,
+          "blake3": "ea8638cd591f36722d1d09bb002856d24d2bf72675394cee05c808ff8c751bfd",
+          "headers_us": 71016,
+          "first_us": 71295,
+          "done_us": 91720
+        },
+        {
+          "name": "typescript",
+          "decoded_bytes": 8696694,
+          "blake3": "f982749637372e84b661c47dde2d87eb118ef6c1fcae81ae97df2ed25857b3d3",
+          "headers_us": 81908,
+          "first_us": 82467,
+          "done_us": 132524
+        },
+        {
+          "name": "next",
+          "decoded_bytes": 25557776,
+          "blake3": "8b0ade096405a69afd22b7c714fd3960f7009b5945051f81e3f57fab8ae34fb9",
+          "headers_us": 104046,
+          "first_us": 104413,
+          "done_us": 206614
+        }
+      ]
+    },
+    {
+      "round": 7,
+      "counted": true,
+      "variant": "large",
+      "elapsed_us": 229621,
+      "max_rss_bytes": 107151360,
+      "requests": [
+        {
+          "name": "rxjs",
+          "decoded_bytes": 388450,
+          "blake3": "a73b69b2c3bcc12afc8bb48df764d5961e7334ed19131b210ef3920dc3b2be66",
+          "headers_us": 42106,
+          "first_us": 42260,
+          "done_us": 45697
+        },
+        {
+          "name": "@babel/core",
+          "decoded_bytes": 426222,
+          "blake3": "9778cdb1c1ae54b698162379e56c586c2333309622f670a0059b99c047d46018",
+          "headers_us": 46273,
+          "first_us": 46783,
+          "done_us": 48712
+        },
+        {
+          "name": "esbuild",
+          "decoded_bytes": 889133,
+          "blake3": "3c9b410f5c4ab0af5c368f8532a5a455f7e0848c606bb7e728e99cb88f0cb380",
+          "headers_us": 48675,
+          "first_us": 48832,
+          "done_us": 53993
+        },
+        {
+          "name": "@types/react",
+          "decoded_bytes": 666086,
+          "blake3": "3b2caebd0c7f84cab99cd8ac88387a9d4b05e5beef1df1c6d5a18857c24c85ef",
+          "headers_us": 58790,
+          "first_us": 59194,
+          "done_us": 61670
+        },
+        {
+          "name": "vite",
+          "decoded_bytes": 2307868,
+          "blake3": "4ece7c1c4c44bb2f08706665dac09b8e743d3e7a275c7f4716d2af96d272e614",
+          "headers_us": 61689,
+          "first_us": 61836,
+          "done_us": 65392
+        },
+        {
+          "name": "@types/node",
+          "decoded_bytes": 2327706,
+          "blake3": "ea8638cd591f36722d1d09bb002856d24d2bf72675394cee05c808ff8c751bfd",
+          "headers_us": 78084,
+          "first_us": 78652,
+          "done_us": 102414
+        },
+        {
+          "name": "typescript",
+          "decoded_bytes": 8696694,
+          "blake3": "f982749637372e84b661c47dde2d87eb118ef6c1fcae81ae97df2ed25857b3d3",
+          "headers_us": 82481,
+          "first_us": 82778,
+          "done_us": 140682
+        },
+        {
+          "name": "next",
+          "decoded_bytes": 25557776,
+          "blake3": "8b0ade096405a69afd22b7c714fd3960f7009b5945051f81e3f57fab8ae34fb9",
+          "headers_us": 102420,
+          "first_us": 102547,
+          "done_us": 216287
+        }
+      ]
+    },
+    {
+      "round": 7,
+      "counted": true,
+      "variant": "default",
+      "elapsed_us": 229130,
+      "max_rss_bytes": 105234432,
+      "requests": [
+        {
+          "name": "rxjs",
+          "decoded_bytes": 388450,
+          "blake3": "a73b69b2c3bcc12afc8bb48df764d5961e7334ed19131b210ef3920dc3b2be66",
+          "headers_us": 46466,
+          "first_us": 46601,
+          "done_us": 50678
+        },
+        {
+          "name": "@babel/core",
+          "decoded_bytes": 426222,
+          "blake3": "9778cdb1c1ae54b698162379e56c586c2333309622f670a0059b99c047d46018",
+          "headers_us": 50563,
+          "first_us": 50653,
+          "done_us": 56053
+        },
+        {
+          "name": "esbuild",
+          "decoded_bytes": 889133,
+          "blake3": "3c9b410f5c4ab0af5c368f8532a5a455f7e0848c606bb7e728e99cb88f0cb380",
+          "headers_us": 51591,
+          "first_us": 54434,
+          "done_us": 59272
+        },
+        {
+          "name": "@types/react",
+          "decoded_bytes": 666086,
+          "blake3": "3b2caebd0c7f84cab99cd8ac88387a9d4b05e5beef1df1c6d5a18857c24c85ef",
+          "headers_us": 62093,
+          "first_us": 62538,
+          "done_us": 65166
+        },
+        {
+          "name": "vite",
+          "decoded_bytes": 2307868,
+          "blake3": "4ece7c1c4c44bb2f08706665dac09b8e743d3e7a275c7f4716d2af96d272e614",
+          "headers_us": 65111,
+          "first_us": 65656,
+          "done_us": 69038
+        },
+        {
+          "name": "@types/node",
+          "decoded_bytes": 2327706,
+          "blake3": "ea8638cd591f36722d1d09bb002856d24d2bf72675394cee05c808ff8c751bfd",
+          "headers_us": 101839,
+          "first_us": 102044,
+          "done_us": 123935
+        },
+        {
+          "name": "typescript",
+          "decoded_bytes": 8696694,
+          "blake3": "f982749637372e84b661c47dde2d87eb118ef6c1fcae81ae97df2ed25857b3d3",
+          "headers_us": 96858,
+          "first_us": 97256,
+          "done_us": 153552
+        },
+        {
+          "name": "next",
+          "decoded_bytes": 25557776,
+          "blake3": "8b0ade096405a69afd22b7c714fd3960f7009b5945051f81e3f57fab8ae34fb9",
+          "headers_us": 104532,
+          "first_us": 105083,
+          "done_us": 216268
+        }
+      ]
+    },
+    {
+      "round": 8,
+      "counted": true,
+      "variant": "default",
+      "elapsed_us": 204557,
+      "max_rss_bytes": 120176640,
+      "requests": [
+        {
+          "name": "rxjs",
+          "decoded_bytes": 388450,
+          "blake3": "a73b69b2c3bcc12afc8bb48df764d5961e7334ed19131b210ef3920dc3b2be66",
+          "headers_us": 40894,
+          "first_us": 41057,
+          "done_us": 44203
+        },
+        {
+          "name": "@babel/core",
+          "decoded_bytes": 426222,
+          "blake3": "9778cdb1c1ae54b698162379e56c586c2333309622f670a0059b99c047d46018",
+          "headers_us": 49293,
+          "first_us": 49793,
+          "done_us": 50957
+        },
+        {
+          "name": "@types/react",
+          "decoded_bytes": 666086,
+          "blake3": "3b2caebd0c7f84cab99cd8ac88387a9d4b05e5beef1df1c6d5a18857c24c85ef",
+          "headers_us": 51228,
+          "first_us": 51461,
+          "done_us": 58944
+        },
+        {
+          "name": "esbuild",
+          "decoded_bytes": 889133,
+          "blake3": "3c9b410f5c4ab0af5c368f8532a5a455f7e0848c606bb7e728e99cb88f0cb380",
+          "headers_us": 53734,
+          "first_us": 53948,
+          "done_us": 59806
+        },
+        {
+          "name": "vite",
+          "decoded_bytes": 2307868,
+          "blake3": "4ece7c1c4c44bb2f08706665dac09b8e743d3e7a275c7f4716d2af96d272e614",
+          "headers_us": 74574,
+          "first_us": 74830,
+          "done_us": 78271
+        },
+        {
+          "name": "@types/node",
+          "decoded_bytes": 2327706,
+          "blake3": "ea8638cd591f36722d1d09bb002856d24d2bf72675394cee05c808ff8c751bfd",
+          "headers_us": 67379,
+          "first_us": 67993,
+          "done_us": 96590
+        },
+        {
+          "name": "typescript",
+          "decoded_bytes": 8696694,
+          "blake3": "f982749637372e84b661c47dde2d87eb118ef6c1fcae81ae97df2ed25857b3d3",
+          "headers_us": 89903,
+          "first_us": 89985,
+          "done_us": 136748
+        },
+        {
+          "name": "next",
+          "decoded_bytes": 25557776,
+          "blake3": "8b0ade096405a69afd22b7c714fd3960f7009b5945051f81e3f57fab8ae34fb9",
+          "headers_us": 83058,
+          "first_us": 83541,
+          "done_us": 192055
+        }
+      ]
+    },
+    {
+      "round": 8,
+      "counted": true,
+      "variant": "large",
+      "elapsed_us": 212451,
+      "max_rss_bytes": 98041856,
+      "requests": [
+        {
+          "name": "rxjs",
+          "decoded_bytes": 388450,
+          "blake3": "a73b69b2c3bcc12afc8bb48df764d5961e7334ed19131b210ef3920dc3b2be66",
+          "headers_us": 39989,
+          "first_us": 40340,
+          "done_us": 43662
+        },
+        {
+          "name": "@babel/core",
+          "decoded_bytes": 426222,
+          "blake3": "9778cdb1c1ae54b698162379e56c586c2333309622f670a0059b99c047d46018",
+          "headers_us": 47150,
+          "first_us": 47625,
+          "done_us": 48432
+        },
+        {
+          "name": "esbuild",
+          "decoded_bytes": 889133,
+          "blake3": "3c9b410f5c4ab0af5c368f8532a5a455f7e0848c606bb7e728e99cb88f0cb380",
+          "headers_us": 49732,
+          "first_us": 50103,
+          "done_us": 53188
+        },
+        {
+          "name": "@types/react",
+          "decoded_bytes": 666086,
+          "blake3": "3b2caebd0c7f84cab99cd8ac88387a9d4b05e5beef1df1c6d5a18857c24c85ef",
+          "headers_us": 53939,
+          "first_us": 54257,
+          "done_us": 56850
+        },
+        {
+          "name": "vite",
+          "decoded_bytes": 2307868,
+          "blake3": "4ece7c1c4c44bb2f08706665dac09b8e743d3e7a275c7f4716d2af96d272e614",
+          "headers_us": 57944,
+          "first_us": 58228,
+          "done_us": 61722
+        },
+        {
+          "name": "@types/node",
+          "decoded_bytes": 2327706,
+          "blake3": "ea8638cd591f36722d1d09bb002856d24d2bf72675394cee05c808ff8c751bfd",
+          "headers_us": 74810,
+          "first_us": 75330,
+          "done_us": 97004
+        },
+        {
+          "name": "typescript",
+          "decoded_bytes": 8696694,
+          "blake3": "f982749637372e84b661c47dde2d87eb118ef6c1fcae81ae97df2ed25857b3d3",
+          "headers_us": 43716,
+          "first_us": 43788,
+          "done_us": 127647
+        },
+        {
+          "name": "next",
+          "decoded_bytes": 25557776,
+          "blake3": "8b0ade096405a69afd22b7c714fd3960f7009b5945051f81e3f57fab8ae34fb9",
+          "headers_us": 86428,
+          "first_us": 86627,
+          "done_us": 199180
+        }
+      ]
+    }
+  ],
+  "workspace_broad_cap": [
+    {
+      "round": 0,
+      "counted": false,
+      "shared": false,
+      "variant": "baseline",
+      "mode": "cold",
+      "wall_ms": 1024.2784580041189,
+      "max_rss_bytes": 44171264
+    },
+    {
+      "round": 0,
+      "counted": false,
+      "shared": false,
+      "variant": "baseline",
+      "mode": "up-to-date",
+      "wall_ms": 102.13379199558403,
+      "max_rss_bytes": 40583168
+    },
+    {
+      "round": 0,
+      "counted": false,
+      "shared": false,
+      "variant": "candidate",
+      "mode": "cold",
+      "wall_ms": 1479.2297079984564,
+      "max_rss_bytes": 41435136
+    },
+    {
+      "round": 0,
+      "counted": false,
+      "shared": false,
+      "variant": "candidate",
+      "mode": "up-to-date",
+      "wall_ms": 109.03604200575501,
+      "max_rss_bytes": 37683200
+    },
+    {
+      "round": 0,
+      "counted": false,
+      "shared": true,
+      "variant": "baseline",
+      "mode": "cold",
+      "wall_ms": 1469.37833398988,
+      "max_rss_bytes": 51347456
+    },
+    {
+      "round": 0,
+      "counted": false,
+      "shared": true,
+      "variant": "baseline",
+      "mode": "up-to-date",
+      "wall_ms": 103.8751250016503,
+      "max_rss_bytes": 43646976
+    },
+    {
+      "round": 0,
+      "counted": false,
+      "shared": true,
+      "variant": "candidate",
+      "mode": "cold",
+      "wall_ms": 1432.0709589956095,
+      "max_rss_bytes": 49856512
+    },
+    {
+      "round": 0,
+      "counted": false,
+      "shared": true,
+      "variant": "candidate",
+      "mode": "up-to-date",
+      "wall_ms": 109.95308301062323,
+      "max_rss_bytes": 40665088
+    },
+    {
+      "round": 1,
+      "counted": true,
+      "shared": false,
+      "variant": "candidate",
+      "mode": "cold",
+      "wall_ms": 1019.2275419976795,
+      "max_rss_bytes": 41304064
+    },
+    {
+      "round": 1,
+      "counted": true,
+      "shared": false,
+      "variant": "candidate",
+      "mode": "up-to-date",
+      "wall_ms": 109.5423750084592,
+      "max_rss_bytes": 36814848
+    },
+    {
+      "round": 1,
+      "counted": true,
+      "shared": false,
+      "variant": "baseline",
+      "mode": "cold",
+      "wall_ms": 976.074541991693,
+      "max_rss_bytes": 45596672
+    },
+    {
+      "round": 1,
+      "counted": true,
+      "shared": false,
+      "variant": "baseline",
+      "mode": "up-to-date",
+      "wall_ms": 98.64820800430607,
+      "max_rss_bytes": 41287680
+    },
+    {
+      "round": 1,
+      "counted": true,
+      "shared": true,
+      "variant": "candidate",
+      "mode": "cold",
+      "wall_ms": 1434.2733750090702,
+      "max_rss_bytes": 49774592
+    },
+    {
+      "round": 1,
+      "counted": true,
+      "shared": true,
+      "variant": "candidate",
+      "mode": "up-to-date",
+      "wall_ms": 109.25120899628382,
+      "max_rss_bytes": 41189376
+    },
+    {
+      "round": 1,
+      "counted": true,
+      "shared": true,
+      "variant": "baseline",
+      "mode": "cold",
+      "wall_ms": 1430.2261249977164,
+      "max_rss_bytes": 49889280
+    },
+    {
+      "round": 1,
+      "counted": true,
+      "shared": true,
+      "variant": "baseline",
+      "mode": "up-to-date",
+      "wall_ms": 105.2753750118427,
+      "max_rss_bytes": 43876352
+    },
+    {
+      "round": 2,
+      "counted": true,
+      "shared": false,
+      "variant": "baseline",
+      "mode": "cold",
+      "wall_ms": 941.9023340014974,
+      "max_rss_bytes": 44957696
+    },
+    {
+      "round": 2,
+      "counted": true,
+      "shared": false,
+      "variant": "baseline",
+      "mode": "up-to-date",
+      "wall_ms": 105.70612500305288,
+      "max_rss_bytes": 40648704
+    },
+    {
+      "round": 2,
+      "counted": true,
+      "shared": false,
+      "variant": "candidate",
+      "mode": "cold",
+      "wall_ms": 1010.2897920005489,
+      "max_rss_bytes": 41287680
+    },
+    {
+      "round": 2,
+      "counted": true,
+      "shared": false,
+      "variant": "candidate",
+      "mode": "up-to-date",
+      "wall_ms": 115.30600000696722,
+      "max_rss_bytes": 37060608
+    },
+    {
+      "round": 2,
+      "counted": true,
+      "shared": true,
+      "variant": "baseline",
+      "mode": "cold",
+      "wall_ms": 1508.9692500041565,
+      "max_rss_bytes": 53231616
+    },
+    {
+      "round": 2,
+      "counted": true,
+      "shared": true,
+      "variant": "baseline",
+      "mode": "up-to-date",
+      "wall_ms": 103.15324999100994,
+      "max_rss_bytes": 43401216
+    },
+    {
+      "round": 2,
+      "counted": true,
+      "shared": true,
+      "variant": "candidate",
+      "mode": "cold",
+      "wall_ms": 1413.5295000014594,
+      "max_rss_bytes": 48234496
+    },
+    {
+      "round": 2,
+      "counted": true,
+      "shared": true,
+      "variant": "candidate",
+      "mode": "up-to-date",
+      "wall_ms": 109.3053329968825,
+      "max_rss_bytes": 41140224
+    },
+    {
+      "round": 3,
+      "counted": true,
+      "shared": false,
+      "variant": "candidate",
+      "mode": "cold",
+      "wall_ms": 1016.5712910093134,
+      "max_rss_bytes": 39419904
+    },
+    {
+      "round": 3,
+      "counted": true,
+      "shared": false,
+      "variant": "candidate",
+      "mode": "up-to-date",
+      "wall_ms": 117.39579199638683,
+      "max_rss_bytes": 37257216
+    },
+    {
+      "round": 3,
+      "counted": true,
+      "shared": false,
+      "variant": "baseline",
+      "mode": "cold",
+      "wall_ms": 922.9547079885378,
+      "max_rss_bytes": 44990464
+    },
+    {
+      "round": 3,
+      "counted": true,
+      "shared": false,
+      "variant": "baseline",
+      "mode": "up-to-date",
+      "wall_ms": 101.57349999644794,
+      "max_rss_bytes": 41517056
+    },
+    {
+      "round": 3,
+      "counted": true,
+      "shared": true,
+      "variant": "candidate",
+      "mode": "cold",
+      "wall_ms": 1435.0983750045998,
+      "max_rss_bytes": 47890432
+    },
+    {
+      "round": 3,
+      "counted": true,
+      "shared": true,
+      "variant": "candidate",
+      "mode": "up-to-date",
+      "wall_ms": 112.7239589986857,
+      "max_rss_bytes": 40288256
+    },
+    {
+      "round": 3,
+      "counted": true,
+      "shared": true,
+      "variant": "baseline",
+      "mode": "cold",
+      "wall_ms": 1422.3157079977682,
+      "max_rss_bytes": 53968896
+    },
+    {
+      "round": 3,
+      "counted": true,
+      "shared": true,
+      "variant": "baseline",
+      "mode": "up-to-date",
+      "wall_ms": 104.84412500227336,
+      "max_rss_bytes": 43843584
+    },
+    {
+      "round": 4,
+      "counted": true,
+      "shared": false,
+      "variant": "baseline",
+      "mode": "cold",
+      "wall_ms": 1046.9065829965984,
+      "max_rss_bytes": 46694400
+    },
+    {
+      "round": 4,
+      "counted": true,
+      "shared": false,
+      "variant": "baseline",
+      "mode": "up-to-date",
+      "wall_ms": 163.63708399876487,
+      "max_rss_bytes": 40189952
+    },
+    {
+      "round": 4,
+      "counted": true,
+      "shared": false,
+      "variant": "candidate",
+      "mode": "cold",
+      "wall_ms": 1025.470917011262,
+      "max_rss_bytes": 41353216
+    },
+    {
+      "round": 4,
+      "counted": true,
+      "shared": false,
+      "variant": "candidate",
+      "mode": "up-to-date",
+      "wall_ms": 109.31966599309817,
+      "max_rss_bytes": 37552128
+    },
+    {
+      "round": 4,
+      "counted": true,
+      "shared": true,
+      "variant": "baseline",
+      "mode": "cold",
+      "wall_ms": 1433.1704159994842,
+      "max_rss_bytes": 54018048
+    },
+    {
+      "round": 4,
+      "counted": true,
+      "shared": true,
+      "variant": "baseline",
+      "mode": "up-to-date",
+      "wall_ms": 211.2508330028504,
+      "max_rss_bytes": 44171264
+    },
+    {
+      "round": 4,
+      "counted": true,
+      "shared": true,
+      "variant": "candidate",
+      "mode": "cold",
+      "wall_ms": 1494.2670829914277,
+      "max_rss_bytes": 49479680
+    },
+    {
+      "round": 4,
+      "counted": true,
+      "shared": true,
+      "variant": "candidate",
+      "mode": "up-to-date",
+      "wall_ms": 114.410542009864,
+      "max_rss_bytes": 41238528
+    },
+    {
+      "round": 5,
+      "counted": true,
+      "shared": false,
+      "variant": "candidate",
+      "mode": "cold",
+      "wall_ms": 998.6583339923527,
+      "max_rss_bytes": 41680896
+    },
+    {
+      "round": 5,
+      "counted": true,
+      "shared": false,
+      "variant": "candidate",
+      "mode": "up-to-date",
+      "wall_ms": 107.49604100419674,
+      "max_rss_bytes": 37322752
+    },
+    {
+      "round": 5,
+      "counted": true,
+      "shared": false,
+      "variant": "baseline",
+      "mode": "cold",
+      "wall_ms": 933.300374992541,
+      "max_rss_bytes": 45170688
+    },
+    {
+      "round": 5,
+      "counted": true,
+      "shared": false,
+      "variant": "baseline",
+      "mode": "up-to-date",
+      "wall_ms": 100.91683300561272,
+      "max_rss_bytes": 40763392
+    },
+    {
+      "round": 5,
+      "counted": true,
+      "shared": true,
+      "variant": "candidate",
+      "mode": "cold",
+      "wall_ms": 1462.8032500040717,
+      "max_rss_bytes": 49741824
+    },
+    {
+      "round": 5,
+      "counted": true,
+      "shared": true,
+      "variant": "candidate",
+      "mode": "up-to-date",
+      "wall_ms": 109.10579199844506,
+      "max_rss_bytes": 41107456
+    },
+    {
+      "round": 5,
+      "counted": true,
+      "shared": true,
+      "variant": "baseline",
+      "mode": "cold",
+      "wall_ms": 1435.9927089972189,
+      "max_rss_bytes": 54771712
+    },
+    {
+      "round": 5,
+      "counted": true,
+      "shared": true,
+      "variant": "baseline",
+      "mode": "up-to-date",
+      "wall_ms": 102.78779099462554,
+      "max_rss_bytes": 44105728
+    },
+    {
+      "round": 6,
+      "counted": true,
+      "shared": false,
+      "variant": "baseline",
+      "mode": "cold",
+      "wall_ms": 970.0042919866974,
+      "max_rss_bytes": 44187648
+    },
+    {
+      "round": 6,
+      "counted": true,
+      "shared": false,
+      "variant": "baseline",
+      "mode": "up-to-date",
+      "wall_ms": 102.72904200246558,
+      "max_rss_bytes": 40091648
+    },
+    {
+      "round": 6,
+      "counted": true,
+      "shared": false,
+      "variant": "candidate",
+      "mode": "cold",
+      "wall_ms": 1022.6873750070808,
+      "max_rss_bytes": 41385984
+    },
+    {
+      "round": 6,
+      "counted": true,
+      "shared": false,
+      "variant": "candidate",
+      "mode": "up-to-date",
+      "wall_ms": 108.28120799851604,
+      "max_rss_bytes": 37240832
+    },
+    {
+      "round": 6,
+      "counted": true,
+      "shared": true,
+      "variant": "baseline",
+      "mode": "cold",
+      "wall_ms": 1395.826499996474,
+      "max_rss_bytes": 53592064
+    },
+    {
+      "round": 6,
+      "counted": true,
+      "shared": true,
+      "variant": "baseline",
+      "mode": "up-to-date",
+      "wall_ms": 102.47262500342913,
+      "max_rss_bytes": 44220416
+    },
+    {
+      "round": 6,
+      "counted": true,
+      "shared": true,
+      "variant": "candidate",
+      "mode": "cold",
+      "wall_ms": 1406.2842089915648,
+      "max_rss_bytes": 49823744
+    },
+    {
+      "round": 6,
+      "counted": true,
+      "shared": true,
+      "variant": "candidate",
+      "mode": "up-to-date",
+      "wall_ms": 109.0470000053756,
+      "max_rss_bytes": 40960000
+    },
+    {
+      "round": 7,
+      "counted": true,
+      "shared": false,
+      "variant": "candidate",
+      "mode": "cold",
+      "wall_ms": 1010.6858340004692,
+      "max_rss_bytes": 41435136
+    },
+    {
+      "round": 7,
+      "counted": true,
+      "shared": false,
+      "variant": "candidate",
+      "mode": "up-to-date",
+      "wall_ms": 110.43591699854005,
+      "max_rss_bytes": 37568512
+    },
+    {
+      "round": 7,
+      "counted": true,
+      "shared": false,
+      "variant": "baseline",
+      "mode": "cold",
+      "wall_ms": 944.9113330047112,
+      "max_rss_bytes": 45514752
+    },
+    {
+      "round": 7,
+      "counted": true,
+      "shared": false,
+      "variant": "baseline",
+      "mode": "up-to-date",
+      "wall_ms": 101.33045799739193,
+      "max_rss_bytes": 40288256
+    },
+    {
+      "round": 7,
+      "counted": true,
+      "shared": true,
+      "variant": "candidate",
+      "mode": "cold",
+      "wall_ms": 1418.8630409917096,
+      "max_rss_bytes": 47874048
+    },
+    {
+      "round": 7,
+      "counted": true,
+      "shared": true,
+      "variant": "candidate",
+      "mode": "up-to-date",
+      "wall_ms": 108.90004200336989,
+      "max_rss_bytes": 40927232
+    },
+    {
+      "round": 7,
+      "counted": true,
+      "shared": true,
+      "variant": "baseline",
+      "mode": "cold",
+      "wall_ms": 1440.2655419980874,
+      "max_rss_bytes": 53772288
+    },
+    {
+      "round": 7,
+      "counted": true,
+      "shared": true,
+      "variant": "baseline",
+      "mode": "up-to-date",
+      "wall_ms": 101.6176659904886,
+      "max_rss_bytes": 44253184
+    },
+    {
+      "round": 8,
+      "counted": true,
+      "shared": false,
+      "variant": "baseline",
+      "mode": "cold",
+      "wall_ms": 979.6154579962604,
+      "max_rss_bytes": 45596672
+    },
+    {
+      "round": 8,
+      "counted": true,
+      "shared": false,
+      "variant": "baseline",
+      "mode": "up-to-date",
+      "wall_ms": 100.86537500319537,
+      "max_rss_bytes": 41533440
+    },
+    {
+      "round": 8,
+      "counted": true,
+      "shared": false,
+      "variant": "candidate",
+      "mode": "cold",
+      "wall_ms": 1016.2222080107313,
+      "max_rss_bytes": 41369600
+    },
+    {
+      "round": 8,
+      "counted": true,
+      "shared": false,
+      "variant": "candidate",
+      "mode": "up-to-date",
+      "wall_ms": 109.17045800306369,
+      "max_rss_bytes": 37617664
+    },
+    {
+      "round": 8,
+      "counted": true,
+      "shared": true,
+      "variant": "baseline",
+      "mode": "cold",
+      "wall_ms": 1416.084291995503,
+      "max_rss_bytes": 54493184
+    },
+    {
+      "round": 8,
+      "counted": true,
+      "shared": true,
+      "variant": "baseline",
+      "mode": "up-to-date",
+      "wall_ms": 102.37545800919179,
+      "max_rss_bytes": 44449792
+    },
+    {
+      "round": 8,
+      "counted": true,
+      "shared": true,
+      "variant": "candidate",
+      "mode": "cold",
+      "wall_ms": 1438.6462500115158,
+      "max_rss_bytes": 50036736
+    },
+    {
+      "round": 8,
+      "counted": true,
+      "shared": true,
+      "variant": "candidate",
+      "mode": "up-to-date",
+      "wall_ms": 117.29570900206454,
+      "max_rss_bytes": 41123840
+    }
+  ],
+  "workspace_final": [
+    {
+      "round": 0,
+      "counted": false,
+      "shared": false,
+      "variant": "baseline",
+      "mode": "cold",
+      "wall_ms": 998.1527920026565,
+      "max_rss_bytes": 44367872
+    },
+    {
+      "round": 0,
+      "counted": false,
+      "shared": false,
+      "variant": "baseline",
+      "mode": "up-to-date",
+      "wall_ms": 101.4898749999702,
+      "max_rss_bytes": 40730624
+    },
+    {
+      "round": 0,
+      "counted": false,
+      "shared": false,
+      "variant": "candidate",
+      "mode": "cold",
+      "wall_ms": 1268.2217499968829,
+      "max_rss_bytes": 44466176
+    },
+    {
+      "round": 0,
+      "counted": false,
+      "shared": false,
+      "variant": "candidate",
+      "mode": "up-to-date",
+      "wall_ms": 150.84754199779127,
+      "max_rss_bytes": 40271872
+    },
+    {
+      "round": 0,
+      "counted": false,
+      "shared": true,
+      "variant": "baseline",
+      "mode": "cold",
+      "wall_ms": 1407.389209009125,
+      "max_rss_bytes": 52641792
+    },
+    {
+      "round": 0,
+      "counted": false,
+      "shared": true,
+      "variant": "baseline",
+      "mode": "up-to-date",
+      "wall_ms": 100.02008300216403,
+      "max_rss_bytes": 43728896
+    },
+    {
+      "round": 0,
+      "counted": false,
+      "shared": true,
+      "variant": "candidate",
+      "mode": "cold",
+      "wall_ms": 1381.3446249987464,
+      "max_rss_bytes": 51314688
+    },
+    {
+      "round": 0,
+      "counted": false,
+      "shared": true,
+      "variant": "candidate",
+      "mode": "up-to-date",
+      "wall_ms": 102.32745800749399,
+      "max_rss_bytes": 44810240
+    },
+    {
+      "round": 1,
+      "counted": true,
+      "shared": false,
+      "variant": "candidate",
+      "mode": "cold",
+      "wall_ms": 915.8272919885349,
+      "max_rss_bytes": 43892736
+    },
+    {
+      "round": 1,
+      "counted": true,
+      "shared": false,
+      "variant": "candidate",
+      "mode": "up-to-date",
+      "wall_ms": 98.06200000457466,
+      "max_rss_bytes": 41222144
+    },
+    {
+      "round": 1,
+      "counted": true,
+      "shared": false,
+      "variant": "baseline",
+      "mode": "cold",
+      "wall_ms": 907.2815839899704,
+      "max_rss_bytes": 44679168
+    },
+    {
+      "round": 1,
+      "counted": true,
+      "shared": false,
+      "variant": "baseline",
+      "mode": "up-to-date",
+      "wall_ms": 99.25337499589659,
+      "max_rss_bytes": 40714240
+    },
+    {
+      "round": 1,
+      "counted": true,
+      "shared": true,
+      "variant": "candidate",
+      "mode": "cold",
+      "wall_ms": 1379.3284999992466,
+      "max_rss_bytes": 53837824
+    },
+    {
+      "round": 1,
+      "counted": true,
+      "shared": true,
+      "variant": "candidate",
+      "mode": "up-to-date",
+      "wall_ms": 101.54466600215528,
+      "max_rss_bytes": 44630016
+    },
+    {
+      "round": 1,
+      "counted": true,
+      "shared": true,
+      "variant": "baseline",
+      "mode": "cold",
+      "wall_ms": 1383.2246669917367,
+      "max_rss_bytes": 50741248
+    },
+    {
+      "round": 1,
+      "counted": true,
+      "shared": true,
+      "variant": "baseline",
+      "mode": "up-to-date",
+      "wall_ms": 99.88458300358616,
+      "max_rss_bytes": 44335104
+    },
+    {
+      "round": 2,
+      "counted": true,
+      "shared": false,
+      "variant": "baseline",
+      "mode": "cold",
+      "wall_ms": 908.8018330076011,
+      "max_rss_bytes": 44531712
+    },
+    {
+      "round": 2,
+      "counted": true,
+      "shared": false,
+      "variant": "baseline",
+      "mode": "up-to-date",
+      "wall_ms": 159.17154200724326,
+      "max_rss_bytes": 40173568
+    },
+    {
+      "round": 2,
+      "counted": true,
+      "shared": false,
+      "variant": "candidate",
+      "mode": "cold",
+      "wall_ms": 966.7584580020048,
+      "max_rss_bytes": 44531712
+    },
+    {
+      "round": 2,
+      "counted": true,
+      "shared": false,
+      "variant": "candidate",
+      "mode": "up-to-date",
+      "wall_ms": 101.42491599253844,
+      "max_rss_bytes": 41336832
+    },
+    {
+      "round": 2,
+      "counted": true,
+      "shared": true,
+      "variant": "baseline",
+      "mode": "cold",
+      "wall_ms": 1385.713041992858,
+      "max_rss_bytes": 53526528
+    },
+    {
+      "round": 2,
+      "counted": true,
+      "shared": true,
+      "variant": "baseline",
+      "mode": "up-to-date",
+      "wall_ms": 99.8300420033047,
+      "max_rss_bytes": 44335104
+    },
+    {
+      "round": 2,
+      "counted": true,
+      "shared": true,
+      "variant": "candidate",
+      "mode": "cold",
+      "wall_ms": 1394.62837499741,
+      "max_rss_bytes": 53477376
+    },
+    {
+      "round": 2,
+      "counted": true,
+      "shared": true,
+      "variant": "candidate",
+      "mode": "up-to-date",
+      "wall_ms": 99.88904200145043,
+      "max_rss_bytes": 43991040
+    },
+    {
+      "round": 3,
+      "counted": true,
+      "shared": false,
+      "variant": "candidate",
+      "mode": "cold",
+      "wall_ms": 978.0360000004293,
+      "max_rss_bytes": 44711936
+    },
+    {
+      "round": 3,
+      "counted": true,
+      "shared": false,
+      "variant": "candidate",
+      "mode": "up-to-date",
+      "wall_ms": 103.56412499095313,
+      "max_rss_bytes": 41746432
+    },
+    {
+      "round": 3,
+      "counted": true,
+      "shared": false,
+      "variant": "baseline",
+      "mode": "cold",
+      "wall_ms": 983.7447090103524,
+      "max_rss_bytes": 44744704
+    },
+    {
+      "round": 3,
+      "counted": true,
+      "shared": false,
+      "variant": "baseline",
+      "mode": "up-to-date",
+      "wall_ms": 99.06283300369978,
+      "max_rss_bytes": 40779776
+    },
+    {
+      "round": 3,
+      "counted": true,
+      "shared": true,
+      "variant": "candidate",
+      "mode": "cold",
+      "wall_ms": 1398.018084000796,
+      "max_rss_bytes": 54853632
+    },
+    {
+      "round": 3,
+      "counted": true,
+      "shared": true,
+      "variant": "candidate",
+      "mode": "up-to-date",
+      "wall_ms": 99.79837499849964,
+      "max_rss_bytes": 44597248
+    },
+    {
+      "round": 3,
+      "counted": true,
+      "shared": true,
+      "variant": "baseline",
+      "mode": "cold",
+      "wall_ms": 1400.437874995987,
+      "max_rss_bytes": 52477952
+    },
+    {
+      "round": 3,
+      "counted": true,
+      "shared": true,
+      "variant": "baseline",
+      "mode": "up-to-date",
+      "wall_ms": 99.8318339989055,
+      "max_rss_bytes": 43876352
+    },
+    {
+      "round": 4,
+      "counted": true,
+      "shared": false,
+      "variant": "baseline",
+      "mode": "cold",
+      "wall_ms": 938.4612910071155,
+      "max_rss_bytes": 44744704
+    },
+    {
+      "round": 4,
+      "counted": true,
+      "shared": false,
+      "variant": "baseline",
+      "mode": "up-to-date",
+      "wall_ms": 100.85474999505095,
+      "max_rss_bytes": 41123840
+    },
+    {
+      "round": 4,
+      "counted": true,
+      "shared": false,
+      "variant": "candidate",
+      "mode": "cold",
+      "wall_ms": 1003.384042007383,
+      "max_rss_bytes": 44417024
+    },
+    {
+      "round": 4,
+      "counted": true,
+      "shared": false,
+      "variant": "candidate",
+      "mode": "up-to-date",
+      "wall_ms": 102.74175000085961,
+      "max_rss_bytes": 41631744
+    },
+    {
+      "round": 4,
+      "counted": true,
+      "shared": true,
+      "variant": "baseline",
+      "mode": "cold",
+      "wall_ms": 1433.1555840035435,
+      "max_rss_bytes": 52396032
+    },
+    {
+      "round": 4,
+      "counted": true,
+      "shared": true,
+      "variant": "baseline",
+      "mode": "up-to-date",
+      "wall_ms": 100.73299999930896,
+      "max_rss_bytes": 44384256
+    },
+    {
+      "round": 4,
+      "counted": true,
+      "shared": true,
+      "variant": "candidate",
+      "mode": "cold",
+      "wall_ms": 1398.3497500012163,
+      "max_rss_bytes": 53526528
+    },
+    {
+      "round": 4,
+      "counted": true,
+      "shared": true,
+      "variant": "candidate",
+      "mode": "up-to-date",
+      "wall_ms": 99.07079199911095,
+      "max_rss_bytes": 44007424
+    },
+    {
+      "round": 5,
+      "counted": true,
+      "shared": false,
+      "variant": "candidate",
+      "mode": "cold",
+      "wall_ms": 999.8449590057135,
+      "max_rss_bytes": 44892160
+    },
+    {
+      "round": 5,
+      "counted": true,
+      "shared": false,
+      "variant": "candidate",
+      "mode": "up-to-date",
+      "wall_ms": 155.3238749911543,
+      "max_rss_bytes": 40517632
+    },
+    {
+      "round": 5,
+      "counted": true,
+      "shared": false,
+      "variant": "baseline",
+      "mode": "cold",
+      "wall_ms": 1017.9925830016145,
+      "max_rss_bytes": 44875776
+    },
+    {
+      "round": 5,
+      "counted": true,
+      "shared": false,
+      "variant": "baseline",
+      "mode": "up-to-date",
+      "wall_ms": 157.60004200274125,
+      "max_rss_bytes": 39993344
+    },
+    {
+      "round": 5,
+      "counted": true,
+      "shared": true,
+      "variant": "candidate",
+      "mode": "cold",
+      "wall_ms": 1549.1571669990662,
+      "max_rss_bytes": 53411840
+    },
+    {
+      "round": 5,
+      "counted": true,
+      "shared": true,
+      "variant": "candidate",
+      "mode": "up-to-date",
+      "wall_ms": 103.60041599778924,
+      "max_rss_bytes": 44122112
+    },
+    {
+      "round": 5,
+      "counted": true,
+      "shared": true,
+      "variant": "baseline",
+      "mode": "cold",
+      "wall_ms": 1406.194624985801,
+      "max_rss_bytes": 54034432
+    },
+    {
+      "round": 5,
+      "counted": true,
+      "shared": true,
+      "variant": "baseline",
+      "mode": "up-to-date",
+      "wall_ms": 103.19395900296513,
+      "max_rss_bytes": 43892736
+    },
+    {
+      "round": 6,
+      "counted": true,
+      "shared": false,
+      "variant": "baseline",
+      "mode": "cold",
+      "wall_ms": 920.383791992208,
+      "max_rss_bytes": 44941312
+    },
+    {
+      "round": 6,
+      "counted": true,
+      "shared": false,
+      "variant": "baseline",
+      "mode": "up-to-date",
+      "wall_ms": 111.82491600629874,
+      "max_rss_bytes": 40960000
+    },
+    {
+      "round": 6,
+      "counted": true,
+      "shared": false,
+      "variant": "candidate",
+      "mode": "cold",
+      "wall_ms": 899.5145420049084,
+      "max_rss_bytes": 44367872
+    },
+    {
+      "round": 6,
+      "counted": true,
+      "shared": false,
+      "variant": "candidate",
+      "mode": "up-to-date",
+      "wall_ms": 100.37741699488834,
+      "max_rss_bytes": 41533440
+    },
+    {
+      "round": 6,
+      "counted": true,
+      "shared": true,
+      "variant": "baseline",
+      "mode": "cold",
+      "wall_ms": 1410.0446670054225,
+      "max_rss_bytes": 53805056
+    },
+    {
+      "round": 6,
+      "counted": true,
+      "shared": true,
+      "variant": "baseline",
+      "mode": "up-to-date",
+      "wall_ms": 102.2182500018971,
+      "max_rss_bytes": 44236800
+    },
+    {
+      "round": 6,
+      "counted": true,
+      "shared": true,
+      "variant": "candidate",
+      "mode": "cold",
+      "wall_ms": 1417.3192089947406,
+      "max_rss_bytes": 54542336
+    },
+    {
+      "round": 6,
+      "counted": true,
+      "shared": true,
+      "variant": "candidate",
+      "mode": "up-to-date",
+      "wall_ms": 102.00933300075121,
+      "max_rss_bytes": 44728320
+    },
+    {
+      "round": 7,
+      "counted": true,
+      "shared": false,
+      "variant": "candidate",
+      "mode": "cold",
+      "wall_ms": 915.8422920008888,
+      "max_rss_bytes": 44564480
+    },
+    {
+      "round": 7,
+      "counted": true,
+      "shared": false,
+      "variant": "candidate",
+      "mode": "up-to-date",
+      "wall_ms": 100.52550000546034,
+      "max_rss_bytes": 41320448
+    },
+    {
+      "round": 7,
+      "counted": true,
+      "shared": false,
+      "variant": "baseline",
+      "mode": "cold",
+      "wall_ms": 936.876082996605,
+      "max_rss_bytes": 44466176
+    },
+    {
+      "round": 7,
+      "counted": true,
+      "shared": false,
+      "variant": "baseline",
+      "mode": "up-to-date",
+      "wall_ms": 181.29024999507237,
+      "max_rss_bytes": 41467904
+    },
+    {
+      "round": 7,
+      "counted": true,
+      "shared": true,
+      "variant": "candidate",
+      "mode": "cold",
+      "wall_ms": 1415.256041000248,
+      "max_rss_bytes": 53641216
+    },
+    {
+      "round": 7,
+      "counted": true,
+      "shared": true,
+      "variant": "candidate",
+      "mode": "up-to-date",
+      "wall_ms": 100.77087499666959,
+      "max_rss_bytes": 44548096
+    },
+    {
+      "round": 7,
+      "counted": true,
+      "shared": true,
+      "variant": "baseline",
+      "mode": "cold",
+      "wall_ms": 1461.2714579998283,
+      "max_rss_bytes": 53919744
+    },
+    {
+      "round": 7,
+      "counted": true,
+      "shared": true,
+      "variant": "baseline",
+      "mode": "up-to-date",
+      "wall_ms": 105.21449999941979,
+      "max_rss_bytes": 44613632
+    },
+    {
+      "round": 8,
+      "counted": true,
+      "shared": false,
+      "variant": "baseline",
+      "mode": "cold",
+      "wall_ms": 1040.712292000535,
+      "max_rss_bytes": 44826624
+    },
+    {
+      "round": 8,
+      "counted": true,
+      "shared": false,
+      "variant": "baseline",
+      "mode": "up-to-date",
+      "wall_ms": 99.79929200198967,
+      "max_rss_bytes": 40763392
+    },
+    {
+      "round": 8,
+      "counted": true,
+      "shared": false,
+      "variant": "candidate",
+      "mode": "cold",
+      "wall_ms": 1028.420874994481,
+      "max_rss_bytes": 44777472
+    },
+    {
+      "round": 8,
+      "counted": true,
+      "shared": false,
+      "variant": "candidate",
+      "mode": "up-to-date",
+      "wall_ms": 100.65954099991359,
+      "max_rss_bytes": 41959424
+    },
+    {
+      "round": 8,
+      "counted": true,
+      "shared": true,
+      "variant": "baseline",
+      "mode": "cold",
+      "wall_ms": 1400.2227919991128,
+      "max_rss_bytes": 54132736
+    },
+    {
+      "round": 8,
+      "counted": true,
+      "shared": true,
+      "variant": "baseline",
+      "mode": "up-to-date",
+      "wall_ms": 102.32570799416862,
+      "max_rss_bytes": 44548096
+    },
+    {
+      "round": 8,
+      "counted": true,
+      "shared": true,
+      "variant": "candidate",
+      "mode": "cold",
+      "wall_ms": 1418.6403330095345,
+      "max_rss_bytes": 54165504
+    },
+    {
+      "round": 8,
+      "counted": true,
+      "shared": true,
+      "variant": "candidate",
+      "mode": "up-to-date",
+      "wall_ms": 99.90245899825823,
+      "max_rss_bytes": 44482560
+    }
+  ],
+  "baseline_index": [
+    {
+      "fixture": "t3",
+      "n": 20,
+      "median_us": 3741.5,
+      "min_us": 3495,
+      "max_us": 4246
+    },
+    {
+      "fixture": "vite-react",
+      "n": 20,
+      "median_us": 2183.5,
+      "min_us": 2083,
+      "max_us": 2367
+    },
+    {
+      "fixture": "native-sharp",
+      "n": 20,
+      "median_us": 447.0,
+      "min_us": 429,
+      "max_us": 537
+    },
+    {
+      "fixture": "nest",
+      "n": 20,
+      "median_us": 1176.0,
+      "min_us": 1130,
+      "max_us": 1298
+    }
+  ]
+}

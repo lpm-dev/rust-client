@@ -1,0 +1,324 @@
+[
+  {
+    "name": "clippy",
+    "returncode": 0,
+    "seconds": 15.466909885406494,
+    "command": [
+      "cargo",
+      "clippy",
+      "--workspace",
+      "--all-targets",
+      "--locked",
+      "--",
+      "-D",
+      "warnings"
+    ]
+  },
+  {
+    "name": "format",
+    "returncode": 0,
+    "seconds": 6.68790602684021,
+    "command": [
+      "cargo",
+      "fmt",
+      "--check"
+    ]
+  },
+  {
+    "name": "workspace-build",
+    "returncode": 0,
+    "seconds": 24.731700897216797,
+    "command": [
+      "cargo",
+      "build",
+      "--workspace",
+      "--locked"
+    ]
+  },
+  {
+    "name": "libraries",
+    "returncode": 0,
+    "seconds": 47.07191300392151,
+    "command": [
+      "cargo",
+      "nextest",
+      "run",
+      "--locked",
+      "--workspace",
+      "--exclude",
+      "lpm-workflows",
+      "--exclude",
+      "lpm-cli",
+      "--no-fail-fast",
+      "--status-level",
+      "slow",
+      "--final-status-level",
+      "fail"
+    ]
+  },
+  {
+    "name": "cli-unit",
+    "returncode": 0,
+    "seconds": 77.424391746521,
+    "command": [
+      "cargo",
+      "test",
+      "--locked",
+      "-p",
+      "lpm-cli",
+      "--bin",
+      "lpm-rs",
+      "--",
+      "--test-threads=1"
+    ]
+  },
+  {
+    "name": "cli-surface",
+    "returncode": 0,
+    "seconds": 41.00127911567688,
+    "command": [
+      "cargo",
+      "nextest",
+      "run",
+      "--locked",
+      "-p",
+      "lpm-cli",
+      "-E",
+      "not binary_id(/bin\\/lpm-rs/)",
+      "--no-fail-fast",
+      "--status-level",
+      "slow",
+      "--final-status-level",
+      "fail"
+    ]
+  },
+  {
+    "name": "install-workflows",
+    "returncode": 0,
+    "seconds": 51.63197994232178,
+    "command": [
+      "scripts/ci/with-hermetic-workflow-cli.sh",
+      "cargo",
+      "nextest",
+      "run",
+      "--locked",
+      "-p",
+      "lpm-workflows",
+      "--test",
+      "install",
+      "--test",
+      "install_metadata",
+      "--test",
+      "install_speculation",
+      "--test",
+      "install_local_tarball",
+      "--test",
+      "lifecycle_containment",
+      "--test",
+      "native_build_cache",
+      "--test",
+      "registry_credentials",
+      "--test",
+      "health",
+      "--test",
+      "workspace_install",
+      "--test",
+      "ci",
+      "--test",
+      "json_output",
+      "--test",
+      "install_concurrency",
+      "--no-fail-fast",
+      "--status-level",
+      "slow",
+      "--final-status-level",
+      "fail"
+    ]
+  },
+  {
+    "name": "standalone-cancellation-and-failure",
+    "returncode": 0,
+    "command": [
+      "cargo",
+      "+1.94.0",
+      "nextest",
+      "run",
+      "--locked",
+      "-p",
+      "lpm-workflows",
+      "--test",
+      "install_concurrency",
+      "-E",
+      "test(interrupted_bare_install_can_retry_without_changing_the_manifest) | test(bare_install_with_missing_metadata_fails_without_committing_state)"
+    ],
+    "tests_passed": 2
+  },
+  {
+    "name": "final-workflow-clippy",
+    "returncode": 0,
+    "command": [
+      "cargo",
+      "+1.94.0",
+      "clippy",
+      "--workspace",
+      "--all-targets",
+      "--locked",
+      "--",
+      "-D",
+      "warnings"
+    ]
+  },
+  {
+    "name": "final-format",
+    "returncode": 0,
+    "command": [
+      "cargo",
+      "+1.94.0",
+      "fmt",
+      "--check"
+    ]
+  },
+  {
+    "command": [
+      "sh",
+      "tests/install-sh/run.sh"
+    ],
+    "returncode": 0
+  },
+  {
+    "command": [
+      "node",
+      "bench/scripts/run-install-readiness.mjs",
+      "--self-test"
+    ],
+    "returncode": 0
+  },
+  {
+    "command": [
+      "node",
+      "bench/scripts/run-t3-install-six-states.mjs",
+      "--self-test"
+    ],
+    "returncode": 0
+  },
+  {
+    "command": [
+      "node",
+      "bench/scripts/run-runtime-readiness.mjs",
+      "--self-test"
+    ],
+    "returncode": 0
+  },
+  {
+    "command": [
+      "bash",
+      "scripts/ci/test-install-apt-packages.sh"
+    ],
+    "returncode": 0
+  },
+  {
+    "command": [
+      "bash",
+      "scripts/ci/test-macos-keychain-search-list.sh"
+    ],
+    "returncode": 0
+  },
+  {
+    "command": [
+      "bash",
+      "bench/test-audit-install-args.sh"
+    ],
+    "returncode": 0
+  },
+  {
+    "command": [
+      "python3",
+      "bench/source-analysis/test_corpus.py"
+    ],
+    "returncode": 0
+  },
+  {
+    "command": [
+      "python3",
+      "bench/test_audit_install_timeout.py"
+    ],
+    "returncode": 0
+  },
+  {
+    "command": [
+      "python3",
+      "bench/audit-fixtures/test_classify_result.py"
+    ],
+    "returncode": 0
+  },
+  {
+    "command": [
+      "bash",
+      "bench/test-local-install.sh"
+    ],
+    "returncode": 0
+  },
+  {
+    "command": [
+      "bash",
+      "bench/test-live-metadata-route.sh"
+    ],
+    "returncode": 0
+  },
+  {
+    "command": [
+      "bash",
+      "bench/test-run-readme.sh"
+    ],
+    "returncode": 0
+  },
+  {
+    "command": [
+      "bash",
+      "scripts/ci/test-with-hermetic-workflow-cli.sh"
+    ],
+    "returncode": 0
+  },
+  {
+    "command": [
+      "npm",
+      "--prefix",
+      "npm/cli",
+      "test"
+    ],
+    "returncode": 0
+  },
+  {
+    "command": [
+      "npm",
+      "--prefix",
+      "npm/cli",
+      "run",
+      "pack:check"
+    ],
+    "returncode": 0
+  },
+  {
+    "command": [
+      "node",
+      "--test",
+      "npm/release/tests/verify-published-package.test.mjs",
+      "npm/release/tests/nightly-version.test.mjs",
+      "npm/release/tests/nightly-release-state.test.mjs",
+      "npm/release/tests/release-policy.test.mjs",
+      "npm/release/tests/validate-release-candidate-source.test.mjs",
+      "npm/release/tests/verify-packages.test.mjs",
+      "npm/release/tests/rust-toolchain-policy.test.mjs",
+      "npm/release/tests/release-hardening-policy.test.mjs",
+      "npm/release/tests/acceptance-artifact-policy.test.mjs",
+      "npm/release/tests/release-api-contract.test.mjs",
+      "npm/release/tests/ci-policy.test.mjs",
+      "npm/release/tests/linux-glibc-compatibility.test.mjs",
+      "npm/release/tests/validate-recovery-source.test.mjs",
+      "npm/release/tests/stable-release-policy.test.mjs",
+      "npm/release/tests/release-artifacts.test.mjs",
+      "npm/release/tests/release-candidate.test.mjs"
+    ],
+    "returncode": 0
+  }
+]

@@ -1,0 +1,89 @@
+{
+  "parent_pr": 865,
+  "parent_commit": "5443ff8c5c3d34e12d40967c2c6c28b67cd11250",
+  "candidate": {
+    "parent": "5443ff8c5c3d34e12d40967c2c6c28b67cd11250",
+    "binary_sha256": "b921075ff265c835d64480ce9d9c4431c6d9efae81d9daa0672ae0247c3de9a3",
+    "files": {
+      "crates/lpm-cli/src/cli/dispatch.rs": "8f6b071b597797096d3f9729291200a227c120ff04869acd6dd4fb30ff249954",
+      "crates/lpm-cli/src/cli/dispatch/runtime.rs": "5df2e1b63adac542dea3d55c7567aff5810629c8cac3f35844802d4a666c331b",
+      "crates/lpm-extractor/src/lib.rs": "e9bdfbe851305c193c4c44f6e51af7c56cd094f2ae1db35c095521d25d1ded4c"
+    },
+    "source_note": "Final release build from the exact source passing the local gates.",
+    "source_commit": "03003c3025397593b07315784edcfcfd4e28487b",
+    "test_files": {
+      "tests/workflows/tests/install_concurrency.rs": "a1675593200e9abd5f0cbde37f63c2b308730af7d12684f75cdd26eae6de707e"
+    }
+  },
+  "baseline": {
+    "parent": "5443ff8c5c3d34e12d40967c2c6c28b67cd11250",
+    "binary": "lpm-baseline",
+    "sha256": "50ef0537cbf7582f245f60d86272e6220209a8af91dd912e3242376d5798a87d",
+    "source_note": "PR865 candidate preserved before to_json->into_json naming-only change. Exact source hashes in parent perf report."
+  },
+  "host": {
+    "model": "Apple M5 Pro",
+    "logical_cpus": 18,
+    "memory_gib": 48,
+    "os": "macOS 27.0 (26A428)",
+    "architecture": "arm64"
+  },
+  "toolchain": "1.94.0",
+  "node": "26.5.0",
+  "bun": "1.4.2",
+  "runner": "bench/scripts/run-install-readiness.mjs",
+  "runner_sha256": "4b80a74fe327234fb3c24e4e79af53c7130bcc7cc378b03c4f7ae8194a608c91",
+  "order": "Four entries, eight samples. Each position twice; each pair in each relative order four times.",
+  "wall_method": "process.hrtime around spawnSync; equivalent shell wrappers for all LPM entries",
+  "rss_method": "/usr/bin/time -l",
+  "registry": "https://registry.npmjs.org (live)",
+  "scripts_policy": "blocked",
+  "profiles_are_unscored": true,
+  "binaries_preserved": true,
+  "concurrent_builds_tests_or_probes": false,
+  "drivers": {
+    "run-final-bench.py": "2bdfbb5b2086be2d3771c65ecf79042053a72f05f3a021b39c58503785e5059c",
+    "run-guard-bench.py": "27dcfa6d54498bdcf08094ff372300af6c5626fc5b858aec3c6c1506ae2df4d5",
+    "run-worker-probe.py": "3af4300d8ca575eda95e51e37b9dcbe34f15f4ff1cadcacea21da3239ce45591",
+    "run-workspace-final.py": "ef6f964e8aeaa7702e5931c9653b8450af3f27b701fd9ef4c3a55674500f6267",
+    "run-h2-window-probe.py": "dca61fcec836b1c473ba3a0045b2837ba187ac14b4d8c7ee227f0a0e68ba4122",
+    "run-small-spool-probe.py": "58fecc080a875205d796e4aca11fdfe834d1aba8f927e9af52b07547f9e48803",
+    "run-path-depth-probe.py": "db2cb968eff5892b6e52d24d1c52ef3b37457069c2178a884d40715556262b8f",
+    "validate-final.py": "87b726b278223b847f7cc9cb48e7234e93272da33f3c379eb9dea15fdd65f2b6",
+    "validate-guard.py": "64c27f9e2cf152861e9f8360f0a358310aee4162f84315ead416a99aa5418398"
+  },
+  "raw_sha256": {
+    "final-scored/rows.json": "fba46a360d48e86f66ffe79b957447052111d40cdf900aded6f81444d0a47281",
+    "final-warm/rows.json": "5e7fa89ceb1d12259c67f2aa13c1d3df509a77e9fb3ed1eb4ff31acfa23fd1f6",
+    "guard-scored/rows.json": "ec742a82d94752e362ab2c56ef69680e6f9a15f35be4f05719f199f4b61a20b9",
+    "guard-warm/rows.json": "6b3b9c6c5530358926254dc9d5fd2b0bdb9e01a8b6ecb40b838426512a920df5",
+    "worker-scored/rows.json": "c8f9ec40db522288d6f655e9ee008d54ffbbc2b2ae690aef6d2f8413e8ca6aa3"
+  },
+  "lpm_wrappers": {
+    "baseline": "exec lpm-baseline \"$@\"",
+    "candidate": "exec lpm-candidate \"$@\"",
+    "workers2": "export TOKIO_WORKER_THREADS=2; exec lpm-baseline \"$@\""
+  },
+  "benchmark_arguments": [
+    "--fixtures",
+    "vite-react,native-sharp,nest,t3=bench/audit-fixtures/t3-install",
+    "--managers",
+    "lpm,bun",
+    "--modes",
+    "cold,ci-cold,warm,up-to-date",
+    "--samples",
+    "8",
+    "--lpm-routes",
+    "direct",
+    "--lpm-firewall-modes",
+    "off",
+    "--lpm-binary",
+    "baseline=run-baseline",
+    "--lpm-binary",
+    "candidate=run-candidate",
+    "--lpm-binary",
+    "workers2=lpm-parent-workers2",
+    "--keep-projects",
+    "--allow-inconclusive"
+  ]
+}
