@@ -5887,3 +5887,169 @@ fn pipelined_object_reuse_still_requires_successful_raw_eof() {
         1
     );
 }
+
+#[test]
+fn opened_regular_files_stream_only_above_the_hybrid_buffer_limit() {
+    let file = tempfile::tempfile().unwrap();
+    let reader = std::io::BufReader::new(file);
+    for size in [
+        0,
+        lpm_extractor::MAX_HYBRID_BUFFERED_COMPRESSED_SIZE - 1,
+        lpm_extractor::MAX_HYBRID_BUFFERED_COMPRESSED_SIZE,
+        lpm_extractor::MAX_HYBRID_BUFFERED_COMPRESSED_SIZE + 1,
+    ] {
+        reader.get_ref().set_len(size).unwrap();
+        assert_eq!(
+            file_exceeds_hybrid_buffer(&reader),
+            size > lpm_extractor::MAX_HYBRID_BUFFERED_COMPRESSED_SIZE
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn nonregular_file_handles_retain_the_hybrid_reader() {
+    let (socket, _peer) = std::os::unix::net::UnixStream::pair().unwrap();
+    let fd: std::os::fd::OwnedFd = socket.into();
+    let reader = std::io::BufReader::new(std::fs::File::from(fd));
+    assert!(!file_exceeds_hybrid_buffer(&reader));
+}
+
+fn large_uncompressed_tarball() -> Vec<u8> {
+    use std::io::Write as _;
+    let gzip = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::none());
+    let mut builder = tar::Builder::new(gzip);
+    let payload = vec![0x5a; lpm_extractor::MAX_HYBRID_BUFFERED_COMPRESSED_SIZE as usize + 1024];
+    for (path, bytes, mode) in [
+        (
+            "package/package.json",
+            br#"{"name":"large-file","version":"1.0.0"}"#.as_slice(),
+            0o644,
+        ),
+        ("package/exec.js", b"eval('large-file')".as_slice(), 0o755),
+        ("package/oversized.js", payload.as_slice(), 0o644),
+    ] {
+        let mut header = tar::Header::new_gnu();
+        header.set_size(bytes.len() as u64);
+        header.set_mode(mode);
+        header.set_cksum();
+        builder.append_data(&mut header, path, bytes).unwrap();
+    }
+    let mut encoder = builder.into_inner().unwrap();
+    encoder.flush().unwrap();
+    let bytes = encoder.finish().unwrap();
+    assert!(bytes.len() as u64 > lpm_extractor::MAX_HYBRID_BUFFERED_COMPRESSED_SIZE);
+    bytes
+}
+
+#[test]
+fn large_file_streaming_preserves_both_inspection_modes_and_fresh_identity() {
+    let tarball = large_uncompressed_tarball();
+    let sri = crate::compute_sri_hash(&tarball);
+    for policy in [
+        SecurityAnalysisPolicy::Disabled,
+        SecurityAnalysisPolicy::Enabled,
+    ] {
+        for fresh in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let archive = directory.path().join("archive.tgz");
+            std::fs::write(&archive, &tarball).unwrap();
+            let store = Store::at_with_policies(
+                directory.path().join("store"),
+                ObjectIntegrityPolicy::Source,
+                policy,
+            );
+            let object = if fresh {
+                let (object, canonical, _) = store
+                    .extract_object_from_file_with_fresh_integrity(&archive, &sri, Some(&sri))
+                    .unwrap();
+                assert_eq!(object.source_sri, sri);
+                assert_eq!(canonical, sri);
+                object.path
+            } else {
+                store.extract_object_from_file(&archive, &sri).unwrap().0
+            };
+            assert_eq!(
+                std::fs::read(object.join("exec.js")).unwrap(),
+                b"eval('large-file')"
+            );
+            assert_eq!(
+                std::fs::metadata(object.join("oversized.js"))
+                    .unwrap()
+                    .len(),
+                lpm_extractor::MAX_HYBRID_BUFFERED_COMPRESSED_SIZE + 1024
+            );
+            assert_eq!(
+                std::fs::read_to_string(object.join(".integrity")).unwrap(),
+                sri
+            );
+            assert_eq!(
+                object.join(".lpm-security.json").is_file(),
+                policy.is_enabled()
+            );
+            if policy.is_enabled() {
+                let analysis = lpm_security::behavioral::read_cached_analysis(&object).unwrap();
+                assert!(analysis.source.eval);
+                assert_eq!(analysis.meta.oversized_source_files.len(), 1);
+            }
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt as _;
+                assert_ne!(
+                    std::fs::metadata(object.join("exec.js"))
+                        .unwrap()
+                        .permissions()
+                        .mode()
+                        & 0o111,
+                    0
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn large_file_with_truncated_gzip_trailer_is_not_published() {
+    let mut tarball = large_uncompressed_tarball();
+    tarball.truncate(tarball.len() - 4);
+    let sri = crate::compute_sri_hash(&tarball);
+    let directory = tempfile::tempdir().unwrap();
+    let archive = directory.path().join("archive.tgz");
+    std::fs::write(&archive, &tarball).unwrap();
+    let store = Store::at(directory.path().join("store"));
+    assert!(store.extract_object_from_file(&archive, &sri).is_err());
+    assert!(!store.paths().object_dir(&sri).unwrap().exists());
+}
+
+#[test]
+fn large_file_streaming_preserves_file_cas_ingestion_and_reuse() {
+    let tarball = large_uncompressed_tarball();
+    let sri = crate::compute_sri_hash(&tarball);
+    let directory = tempfile::tempdir().unwrap();
+    let archive = directory.path().join("archive.tgz");
+    std::fs::write(&archive, &tarball).unwrap();
+    let store = Store::at_v3(directory.path().join("store"));
+    let (object, canonical, _) = store
+        .extract_object_from_file_with_fresh_integrity(&archive, &sri, Some(&sri))
+        .unwrap();
+    assert_eq!(canonical, sri);
+    assert!(
+        store
+            .verify_file_cas(true)
+            .unwrap()
+            .unwrap()
+            .issues
+            .is_empty()
+    );
+    assert!(
+        store
+            .reusable_object_with_timings(&sri)
+            .unwrap()
+            .0
+            .is_some()
+    );
+    assert_eq!(
+        std::fs::read(object.path.join("exec.js")).unwrap(),
+        b"eval('large-file')"
+    );
+}

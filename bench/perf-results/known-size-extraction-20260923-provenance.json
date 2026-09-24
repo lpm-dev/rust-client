@@ -1,0 +1,1012 @@
+{
+  "parent": {
+    "baseline_commit": "2718e5e67ef68025596c10816d3937ff1372b179",
+    "baseline_source_commit": "fd41ed34a4d8904f544ab466562719f0f0552831",
+    "baseline_sha256": "e47c97a0e3df43fa188d750b984e1facf88a9f7699ceb3bae2cb8e03967bf1ae",
+    "approved_order": [
+      "no-op",
+      "memory",
+      "cold-tail attribution"
+    ]
+  },
+  "source_commit": "8f46810f3",
+  "binaries": {
+    "lpm-baseline": "e47c97a0e3df43fa188d750b984e1facf88a9f7699ceb3bae2cb8e03967bf1ae",
+    "lpm-known-size": "332844f48cda8726d682a613009d906bc0ba430f01704f595c26b139523094f0",
+    "micro-baseline": "93dae6571d332bebbcebf26c5e7da999b80b2e147795d2dcce6245f1ba2a1c10",
+    "micro-known-size": "6bccdcdcb4cc52f480d547175d32143475d969ce71173131d53e4dc1bf5fc26a"
+  },
+  "gates": [
+    {
+      "name": "format",
+      "returncode": 0,
+      "seconds": 6.2415149211883545,
+      "command": [
+        "cargo",
+        "fmt",
+        "--all"
+      ]
+    },
+    {
+      "name": "clippy",
+      "returncode": 0,
+      "seconds": 81.62085914611816,
+      "command": [
+        "cargo",
+        "clippy",
+        "--workspace",
+        "--all-targets",
+        "--locked",
+        "--",
+        "-D",
+        "warnings"
+      ]
+    },
+    {
+      "name": "fmt",
+      "returncode": 0,
+      "seconds": 6.555098056793213,
+      "command": [
+        "cargo",
+        "fmt",
+        "--check"
+      ]
+    },
+    {
+      "name": "workspace-build",
+      "returncode": 0,
+      "seconds": 37.67328095436096,
+      "command": [
+        "cargo",
+        "build",
+        "--workspace",
+        "--locked"
+      ]
+    },
+    {
+      "name": "libraries",
+      "returncode": 0,
+      "seconds": 66.72147107124329,
+      "command": [
+        "cargo",
+        "nextest",
+        "run",
+        "--locked",
+        "--workspace",
+        "--exclude",
+        "lpm-workflows",
+        "--exclude",
+        "lpm-cli",
+        "--no-fail-fast",
+        "--status-level",
+        "slow",
+        "--final-status-level",
+        "fail"
+      ]
+    },
+    {
+      "name": "cli-unit",
+      "returncode": 101,
+      "seconds": 103.12065386772156,
+      "command": [
+        "cargo",
+        "test",
+        "--locked",
+        "-p",
+        "lpm-cli",
+        "--bin",
+        "lpm-rs",
+        "--",
+        "--test-threads=1"
+      ]
+    },
+    {
+      "name": "cli-unit",
+      "returncode": 0,
+      "seconds": 54.30084013938904,
+      "command": [
+        "cargo",
+        "test",
+        "--locked",
+        "-p",
+        "lpm-cli",
+        "--bin",
+        "lpm-rs",
+        "--",
+        "--test-threads=1"
+      ]
+    },
+    {
+      "name": "cli-surface",
+      "returncode": 0,
+      "seconds": 36.75941300392151,
+      "command": [
+        "cargo",
+        "nextest",
+        "run",
+        "--locked",
+        "-p",
+        "lpm-cli",
+        "-E",
+        "not binary_id(/bin\\/lpm-rs/)",
+        "--no-fail-fast",
+        "--status-level",
+        "slow",
+        "--final-status-level",
+        "fail"
+      ]
+    },
+    {
+      "name": "install-workflows",
+      "returncode": 0,
+      "seconds": 69.98918294906616,
+      "command": [
+        "scripts/ci/with-hermetic-workflow-cli.sh",
+        "cargo",
+        "nextest",
+        "run",
+        "--locked",
+        "-p",
+        "lpm-workflows",
+        "--test",
+        "install_freshness",
+        "--test",
+        "install_cached_entries",
+        "--test",
+        "pnpm_compat_peer",
+        "--test",
+        "add",
+        "--test",
+        "upgrade",
+        "--test",
+        "install",
+        "--test",
+        "install_metadata",
+        "--test",
+        "install_speculation",
+        "--test",
+        "install_local_tarball",
+        "--test",
+        "lifecycle_containment",
+        "--test",
+        "native_build_cache",
+        "--test",
+        "registry_credentials",
+        "--test",
+        "health",
+        "--test",
+        "workspace_install",
+        "--test",
+        "ci",
+        "--test",
+        "json_output",
+        "--test",
+        "install_concurrency",
+        "--test",
+        "store",
+        "--test",
+        "install_node_modules",
+        "--test",
+        "install_patches",
+        "--no-fail-fast",
+        "--status-level",
+        "slow",
+        "--final-status-level",
+        "fail"
+      ]
+    }
+  ],
+  "helpers": [
+    {
+      "command": [
+        "sh",
+        "tests/install-sh/run.sh"
+      ],
+      "returncode": 0
+    },
+    {
+      "command": [
+        "node",
+        "bench/scripts/run-install-readiness.mjs",
+        "--self-test"
+      ],
+      "returncode": 0
+    },
+    {
+      "command": [
+        "node",
+        "bench/scripts/run-t3-install-six-states.mjs",
+        "--self-test"
+      ],
+      "returncode": 0
+    },
+    {
+      "command": [
+        "node",
+        "bench/scripts/run-runtime-readiness.mjs",
+        "--self-test"
+      ],
+      "returncode": 0
+    },
+    {
+      "command": [
+        "bash",
+        "scripts/ci/test-install-apt-packages.sh"
+      ],
+      "returncode": 0
+    },
+    {
+      "command": [
+        "bash",
+        "scripts/ci/test-macos-keychain-search-list.sh"
+      ],
+      "returncode": 0
+    },
+    {
+      "command": [
+        "bash",
+        "bench/test-audit-install-args.sh"
+      ],
+      "returncode": 0
+    },
+    {
+      "command": [
+        "python3",
+        "bench/source-analysis/test_corpus.py"
+      ],
+      "returncode": 0
+    },
+    {
+      "command": [
+        "python3",
+        "bench/test_audit_install_timeout.py"
+      ],
+      "returncode": 0
+    },
+    {
+      "command": [
+        "python3",
+        "bench/audit-fixtures/test_classify_result.py"
+      ],
+      "returncode": 0
+    },
+    {
+      "command": [
+        "bash",
+        "bench/test-local-install.sh"
+      ],
+      "returncode": 0
+    },
+    {
+      "command": [
+        "bash",
+        "bench/test-live-metadata-route.sh"
+      ],
+      "returncode": 0
+    },
+    {
+      "command": [
+        "bash",
+        "bench/test-run-readme.sh"
+      ],
+      "returncode": 0
+    },
+    {
+      "command": [
+        "bash",
+        "scripts/ci/test-with-hermetic-workflow-cli.sh"
+      ],
+      "returncode": 0
+    },
+    {
+      "command": [
+        "npm",
+        "--prefix",
+        "npm/cli",
+        "test"
+      ],
+      "returncode": 0
+    },
+    {
+      "command": [
+        "npm",
+        "--prefix",
+        "npm/cli",
+        "run",
+        "pack:check"
+      ],
+      "returncode": 0
+    },
+    {
+      "command": [
+        "node",
+        "--test",
+        "/tmp/lpm-known-size-source/npm/release/tests/verify-published-package.test.mjs",
+        "/tmp/lpm-known-size-source/npm/release/tests/nightly-version.test.mjs",
+        "/tmp/lpm-known-size-source/npm/release/tests/nightly-release-state.test.mjs",
+        "/tmp/lpm-known-size-source/npm/release/tests/release-policy.test.mjs",
+        "/tmp/lpm-known-size-source/npm/release/tests/validate-release-candidate-source.test.mjs",
+        "/tmp/lpm-known-size-source/npm/release/tests/verify-packages.test.mjs",
+        "/tmp/lpm-known-size-source/npm/release/tests/rust-toolchain-policy.test.mjs",
+        "/tmp/lpm-known-size-source/npm/release/tests/release-hardening-policy.test.mjs",
+        "/tmp/lpm-known-size-source/npm/release/tests/acceptance-artifact-policy.test.mjs",
+        "/tmp/lpm-known-size-source/npm/release/tests/release-api-contract.test.mjs",
+        "/tmp/lpm-known-size-source/npm/release/tests/ci-policy.test.mjs",
+        "/tmp/lpm-known-size-source/npm/release/tests/linux-glibc-compatibility.test.mjs",
+        "/tmp/lpm-known-size-source/npm/release/tests/validate-recovery-source.test.mjs",
+        "/tmp/lpm-known-size-source/npm/release/tests/stable-release-policy.test.mjs",
+        "/tmp/lpm-known-size-source/npm/release/tests/release-artifacts.test.mjs",
+        "/tmp/lpm-known-size-source/npm/release/tests/release-candidate.test.mjs"
+      ],
+      "returncode": 0
+    }
+  ],
+  "frozen_parity": [
+    {
+      "request": [
+        "GET",
+        "/@babel/code-frame/-/code-frame-7.29.7.tgz",
+        "*/*"
+      ],
+      "integrity": "sha512-Aup7aUOfpbAUg2ROOJN6Iw5f9DMBlzu0mIkm/malLQFN/YQgO48wCj0Kxa3sEHJvPVFg7siR+qRInwXd2qhQKw==",
+      "sha256": "fa8b176fa0b5d1d72b41ad33443f1f4f75933157a45010dffb51719f40c19c67",
+      "bytes": 10384
+    },
+    {
+      "request": [
+        "GET",
+        "/@babel/compat-data/-/compat-data-7.29.7.tgz",
+        "*/*"
+      ],
+      "integrity": "sha512-locTkQyKvwIEgBzVrn8693ebc97F2U8ZHjbXwDXJ5Fn2TCpNwTlKcaKLkdHop5c/icOFE7qt7Q9JC5hnKNa6Gg==",
+      "sha256": "0cf63b5ed704654bdc7574be035883b2eb3f8872c795a6b8dbb690cb7a3d54b9",
+      "bytes": 6658
+    },
+    {
+      "request": [
+        "GET",
+        "/@babel/core/-/core-7.29.7.tgz",
+        "*/*"
+      ],
+      "integrity": "sha512-RgHBCvtjbOK2gXSNBNIkNoEc9qoVEtau3hj8gEqKQuL3HZAibKarWFEI3Lfm6EYKkLalOh8eSrj9b+ch9H/VBA==",
+      "sha256": "46dd458b3d2bc29daa0e9e01f13b399ab544a8013f27ac6c51b56b831c8a0ed3",
+      "bytes": 192830
+    },
+    {
+      "request": [
+        "GET",
+        "/@babel/generator/-/generator-7.29.8.tgz",
+        "*/*"
+      ],
+      "integrity": "sha512-gZbepsdh3WDtgZKWL+vTPh71LSBrm/Y4/QDZBVCcYfmeTEEuoOYwlSy+G1StfJg+/Zy550u/3TATbm7qDbbMtg==",
+      "sha256": "b5ced4fd7c23a580549182676c43c03a8731b9625e66270f443ab27cd21b502d",
+      "bytes": 113664
+    },
+    {
+      "request": [
+        "GET",
+        "/@babel/helper-compilation-targets/-/helper-compilation-targets-7.29.7.tgz",
+        "*/*"
+      ],
+      "integrity": "sha512-wem6WaBj4NaVYVdNhLPPVacES6ZJ+KBBfSkTMD3YZxbP3rm3Di85tJU5ljaUNhaOynt+Aj0xruhYuzQBt8n71g==",
+      "sha256": "5b5446f3d32b10ba38cb308af5f65e76afcddaacd7b817e71055a6de6ab934e0",
+      "bytes": 14864
+    },
+    {
+      "request": [
+        "GET",
+        "/@babel/helper-globals/-/helper-globals-7.29.7.tgz",
+        "*/*"
+      ],
+      "integrity": "sha512-3nQVUAtvkKH9zahfWgw96Jc/uFOmjACE1kQz82E2lqWmHBgjzbNlsC22nuQTfahmWeQtTq5nQ/4Nnd2A1wj4zA==",
+      "sha256": "94fb962c489aae2c4e5581f1494721083dc76dddd7c703314dd4d7ff965d2a3f",
+      "bytes": 6839
+    },
+    {
+      "request": [
+        "GET",
+        "/@babel/helper-module-imports/-/helper-module-imports-7.29.7.tgz",
+        "*/*"
+      ],
+      "integrity": "sha512-ejHwrQQYcm9xnTivShn2IDOlIzInN34AXskvq9QicvCtEzq1Vzclu/tKF8Jq1Cg8JG2GL6/EmjgsCT7lXepE3g==",
+      "sha256": "4bdf46cf597b875ce16770f151159ca34f96c20ba3c112dc8d7f6c6d6cce770c",
+      "bytes": 14064
+    },
+    {
+      "request": [
+        "GET",
+        "/@babel/helper-module-transforms/-/helper-module-transforms-7.29.7.tgz",
+        "*/*"
+      ],
+      "integrity": "sha512-UPUVSyXbOh627KiCIGQSgwWzGeBKLkaJ9PJEdrngIwMSzxLR4jS4+f1f1jb7VzBbg8nFLaYotvVPFCTqdrmTAg==",
+      "sha256": "dbb3b9b10b0a2828f5af58a6317685b1a150464c6bd54995069c526aba45e6e4",
+      "bytes": 37783
+    },
+    {
+      "request": [
+        "GET",
+        "/@babel/helper-plugin-utils/-/helper-plugin-utils-7.29.7.tgz",
+        "*/*"
+      ],
+      "integrity": "sha512-G7sHYigPY17oO5SYWnfD/0MTBwVR781S/JI643e/JhUYgVgWE/61SoW3NH9KWUKyKq5LVh3npif99Wkt6j86Jw==",
+      "sha256": "00824ca9e3a146e73a071849b085668ae2012b7fff58056442ab9d33d1e357e8",
+      "bytes": 4424
+    },
+    {
+      "request": [
+        "GET",
+        "/@babel/helper-string-parser/-/helper-string-parser-7.29.7.tgz",
+        "*/*"
+      ],
+      "integrity": "sha512-Pb5ijPrZ89GDH8223L4UP8i6QApWxs04RbPQJTeWDV0/keR2E36MeKnyr6LYmUUvqRRI+Iv87SuF1W6ErINzYw==",
+      "sha256": "124565ecd300d7187973060ba6b1d1c4f296e55f0489ddfd6af794f516fed127",
+      "bytes": 8383
+    },
+    {
+      "request": [
+        "GET",
+        "/@babel/helper-validator-identifier/-/helper-validator-identifier-7.29.7.tgz",
+        "*/*"
+      ],
+      "integrity": "sha512-qehxGkRj55h/ff8EMaJ+cYhyaKlHIxqYDn682wQD7RNp9UujOQsHog2uS0r2vzr4pW+sXf90NeeayjcNaX3fFg==",
+      "sha256": "7a31904bc45f1bb232d5e5dd797d12296f4a27fb4bf0f6d517827700f997dc1f",
+      "bytes": 14245
+    },
+    {
+      "request": [
+        "GET",
+        "/@babel/helper-validator-option/-/helper-validator-option-7.29.7.tgz",
+        "*/*"
+      ],
+      "integrity": "sha512-N9ZErrD+yW5geCDtBqnOoxmR8+tNKiGuxKlDpuJxfsqpa2dFcexaziGAE/qoHLiDDreVNMupxGmSoNlyvsA3gw==",
+      "sha256": "e32d8ff2cc0455c5210f92f0844d2cb6e1d61b83ee17d7b328fe410f9021e4cd",
+      "bytes": 4384
+    },
+    {
+      "request": [
+        "GET",
+        "/@babel/helpers/-/helpers-7.29.7.tgz",
+        "*/*"
+      ],
+      "integrity": "sha512-1k2lAGRMfHTcwuNYcCNUmaUffmQv8KWMfh2iJUUeRlwlwH4FdNG7mfPI10NPfLHJFThE4Tyr4mv7kTNZOiPuBg==",
+      "sha256": "87dcd8372e8f2d0225de852c9f810c23712616cc2681556f8f4292535b7e42c6",
+      "bytes": 188848
+    },
+    {
+      "request": [
+        "GET",
+        "/@babel/parser/-/parser-7.29.9.tgz",
+        "*/*"
+      ],
+      "integrity": "sha512-CjXrNHTnvqBVqHgdBysY3vk2T8tpJHb5/RMeHJBTyVa9xgugCB0CJTx/3oO8RV2QRQP391RWpB7D6hLjm8V9uA==",
+      "sha256": "8f3b9fbc531e0c08e2c329cf1ff57bbe121e2d10061b65a05614a25b2255cc43",
+      "bytes": 439123
+    },
+    {
+      "request": [
+        "GET",
+        "/@babel/plugin-transform-react-jsx-self/-/plugin-transform-react-jsx-self-7.29.7.tgz",
+        "*/*"
+      ],
+      "integrity": "sha512-TL0hMc9xzy86VD31nUiwzd5otRAcyEPcsegCxolO0PvcXuH1v0kECe/UIznYFihpkvU5wg/jk4v0TTEFfm53fw==",
+      "sha256": "fdbe8ac6d7d22e28bd2f013496c233de0906a261cc7e1a7b3eee9bb5fcc70bf0",
+      "bytes": 3689
+    },
+    {
+      "request": [
+        "GET",
+        "/@babel/plugin-transform-react-jsx-source/-/plugin-transform-react-jsx-source-7.29.7.tgz",
+        "*/*"
+      ],
+      "integrity": "sha512-06IyK09H3wi4cGbhDBwp5gUGo0IKtnYa8tyTiephirPCK6fbobVGiXMMI5zLQ4aKEYP3wZ3ArU44o+8KMrSG/Q==",
+      "sha256": "8afa100bf1bafc073813b589980414576b20c66bf3598af229d30b92183fa1a9",
+      "bytes": 3751
+    },
+    {
+      "request": [
+        "GET",
+        "/@babel/template/-/template-7.29.7.tgz",
+        "*/*"
+      ],
+      "integrity": "sha512-puq+Gf35oI24FeN11LkoUQFqv9uwNeWpxXZi/Ji3rRIoKAzKnxRaZ+Gkj0vKS9ZCiTESfng1N9LyOyXvo+m+Gg==",
+      "sha256": "5e0ee28d5536e986cf5ff2da0f096fb84810d9136c2a64c6c78a6b495a0e7764",
+      "bytes": 18157
+    },
+    {
+      "request": [
+        "GET",
+        "/@babel/traverse/-/traverse-7.29.8.tgz",
+        "*/*"
+      ],
+      "integrity": "sha512-I5z7H3bf/41ktsNVLtpN0wAa336HkqIHQ5BuPLEhTkt1jVSyZpeNKIzTgEWmlxjdg81R0IgUCcaE+Ok3NvrfZg==",
+      "sha256": "cf16861f356fd766361ba4d85d5462b6320e0e59f05cb55c762d8f5dff83e234",
+      "bytes": 168479
+    },
+    {
+      "request": [
+        "GET",
+        "/@babel/types/-/types-7.29.8.tgz",
+        "*/*"
+      ],
+      "integrity": "sha512-Vj1jF3cPfxg7OAfoI7QnVKLoILlm2JF9pnVHrX8qx7AHMiYWT+NDAA7jChlNgRS4WTLc/fD1lXLmPixluj+3Gg==",
+      "sha256": "514a4ed09355fe1417f03e89c5a5f518745e2eb75a4069d25b55a3e7298069de",
+      "bytes": 301854
+    },
+    {
+      "request": [
+        "GET",
+        "/@esbuild/darwin-arm64/-/darwin-arm64-0.21.5.tgz",
+        "*/*"
+      ],
+      "integrity": "sha512-DwqXqZyuk5AiWWf3UfLiRDJ5EDd49zg6O9wclZ7kUMv2WRFr4HKjXp/5t8JZ11QbQfUS6/cRCKGwYhtNAY88kQ==",
+      "sha256": "4145466ca315b652cb2548bfe9ee705a888fb95d39107a664ef82a7afb2db5ca",
+      "bytes": 4080074
+    },
+    {
+      "request": [
+        "GET",
+        "/@jridgewell/gen-mapping/-/gen-mapping-0.3.13.tgz",
+        "*/*"
+      ],
+      "integrity": "sha512-2kkt/7niJ6MgEPxF0bYdQ6etZaA+fQvDcLKckhy1yIQOzaoKjBBjSj63/aLVjYE3qhRt5dvM+uUyfCg6UKCBbA==",
+      "sha256": "bc16f658c1f6d63e0c8738ab881d03f49f1955d8f853cdcb8f7d315cf62f0082",
+      "bytes": 17972
+    },
+    {
+      "request": [
+        "GET",
+        "/@jridgewell/remapping/-/remapping-2.3.5.tgz",
+        "*/*"
+      ],
+      "integrity": "sha512-LI9u/+laYG4Ds1TDKSJW2YPrIlcVYOwi2fUC6xB43lueCjgxV4lffOCZCtYFiH6TNOX+tQKXx97T4IKHbhyHEQ==",
+      "sha256": "70b16782a39ad16672e47c33473559a25bff9640214df91cb9dd153005d71a02",
+      "bytes": 14624
+    },
+    {
+      "request": [
+        "GET",
+        "/@jridgewell/resolve-uri/-/resolve-uri-3.1.2.tgz",
+        "*/*"
+      ],
+      "integrity": "sha512-bRISgCIjP20/tbWSPWMEi54QVPRZExkuD9lJL+UIxUKtwVJA8wW1Trb1jMs1RFXo1CBTNZ/5hpC9QvmKWdopKw==",
+      "sha256": "db52f9f62558baab13353dd39e3200750fc33e6a129a575b46226f493776e230",
+      "bytes": 9622
+    },
+    {
+      "request": [
+        "GET",
+        "/@jridgewell/sourcemap-codec/-/sourcemap-codec-1.6.0.tgz",
+        "*/*"
+      ],
+      "integrity": "sha512-T7jf+5zgsZHwNJ4lvQ7/aezbyk0nNX+zJVWpmHA7VYsEx7a7qr5Rg5IbtJFqkgze5Y2sruq1RUY8Q837Od7iFw==",
+      "sha256": "f30a35f6af8c347d01b8ff2f8662272f7d986cf21b916704d86c249a90b97e25",
+      "bytes": 18401
+    },
+    {
+      "request": [
+        "GET",
+        "/@jridgewell/trace-mapping/-/trace-mapping-0.3.31.tgz",
+        "*/*"
+      ],
+      "integrity": "sha512-zzNR+SdQSDJzc8joaeP8QQoCQr8NuYx2dIIytl1QeBEZHJ9uW6hebsrYgbz8hJwUQao3TWCMtmfV8Nu1twOLAw==",
+      "sha256": "c64c71a119630d5abe8246889edf334b2ca9ddad094e20d623332956b1453ccf",
+      "bytes": 30747
+    },
+    {
+      "request": [
+        "GET",
+        "/@rolldown/pluginutils/-/pluginutils-1.0.0-beta.27.tgz",
+        "*/*"
+      ],
+      "integrity": "sha512-+d0F4MKMCbeVUJwG96uQ4SgAznZNSq93I3V+9NHA4OpvqG8mRCpGdKmK8l/dl02h2CCDHwW2FqilnTyDcAnqjA==",
+      "sha256": "9ec82a8e4971899006c14628083dbfd6e00dd5e6b4776a3df2e5a8ef1eab1507",
+      "bytes": 4296
+    },
+    {
+      "request": [
+        "GET",
+        "/@rollup/rollup-darwin-arm64/-/rollup-darwin-arm64-4.63.4.tgz",
+        "*/*"
+      ],
+      "integrity": "sha512-xfSrj9MHnWK9GaSqT9U0ImHtH/N8WZlHLx4cZHiuLcqs640hvZ3hLPd5UR2AZS57FaE8HrRUSpltbZdWRxHiDA==",
+      "sha256": "b560bcb87427cad382b67682346a77d63b539aaf14977b3a4cacae7bc08ec479",
+      "bytes": 840836
+    },
+    {
+      "request": [
+        "GET",
+        "/@types/babel__core/-/babel__core-7.20.5.tgz",
+        "*/*"
+      ],
+      "integrity": "sha512-qoQprZvz5wQFJwMDqeseRXWv3rqMvhgpbXFfVyWhbx9X47POIA6i/+dXefEmZKoAgOaTdaIgNSMqMIU61yRyzA==",
+      "sha256": "1865223be6b834c44abf5ebedafb1707019b4941be8021469980c7ef4c2e1155",
+      "bytes": 9704
+    },
+    {
+      "request": [
+        "GET",
+        "/@types/babel__generator/-/babel__generator-7.27.0.tgz",
+        "*/*"
+      ],
+      "integrity": "sha512-ufFd2Xi92OAVPYsy+P4n7/U7e68fex0+Ee8gSG9KX7eo084CWiQ4sdxktvdl0bOPupXtVJPY19zk6EwWqUQ8lg==",
+      "sha256": "755508f0bb974706739e5cf3a94f546c5c8c149dbcd407c599f36cdd89056f9d",
+      "bytes": 4068
+    },
+    {
+      "request": [
+        "GET",
+        "/@types/babel__template/-/babel__template-7.4.4.tgz",
+        "*/*"
+      ],
+      "integrity": "sha512-h/NUaSyG5EyxBIp8YRxo4RMe2/qQgvyowRwVMzhYhBCONbW8PUsg4lkFMrhgZhUe5z3L3MiLDuvyJ/CaPa2A8A==",
+      "sha256": "a67c2c19e0281996d2f7ddcc41f561abff796ed1cb07276ebad6982dbb67a7c1",
+      "bytes": 2677
+    },
+    {
+      "request": [
+        "GET",
+        "/@types/babel__traverse/-/babel__traverse-7.28.0.tgz",
+        "*/*"
+      ],
+      "integrity": "sha512-8PvcXf70gTDZBgt9ptxJ8elBeBjcLOAcOtoO/mPJjtji1+CdGbHgm77om1GrsPxsiE+uXIpNSK64UYaIwQXd4Q==",
+      "sha256": "2cc7973029fb3b69f77cf55b42be307ff34f63a68e55a173872a9712253fbc90",
+      "bytes": 15915
+    },
+    {
+      "request": [
+        "GET",
+        "/@types/estree/-/estree-1.0.9.tgz",
+        "*/*"
+      ],
+      "integrity": "sha512-GhdPgy1el4/ImP05X05Uw4cw2/M93BCUmnEvWZNStlCzEKME4Fkk+YpoA5OiHNQmoS7Cafb8Xa3Pya8m1Qrzeg==",
+      "sha256": "ec8f3c0dfb21497db5a3480c45a6cf6f9b18d3b337b2ea4d03e3ef2a9c2bb358",
+      "bytes": 5930
+    },
+    {
+      "request": [
+        "GET",
+        "/@vitejs/plugin-react/-/plugin-react-4.7.0.tgz",
+        "*/*"
+      ],
+      "integrity": "sha512-gUu9hwfWvvEDBBmgtAowQCojwZmJ5mcLn3aufeCsitijs3+f2NsrPtlAWIR6OPiqljl96GVCUbLe0HyqIpVaoA==",
+      "sha256": "fcc029f7bc311b6f69c64c8e2185db6ae6cd60af64806d94f7b617e3eeffe32a",
+      "bytes": 15961
+    },
+    {
+      "request": [
+        "GET",
+        "/baseline-browser-mapping/-/baseline-browser-mapping-2.11.25.tgz",
+        "*/*"
+      ],
+      "integrity": "sha512-gMmEShwwq7FJqMwvfRwvCl00v4kN+KOfJqXn+f4nrufak5gNHJOksd/60Dvjuz7sI8Y5WiSFBa8FEYr+zoyqCw==",
+      "sha256": "210d31df7ef5cb5a734e94d9860ab5d78da0eaff8aa061a8fca8aeba2bb26c50",
+      "bytes": 41665
+    },
+    {
+      "request": [
+        "GET",
+        "/browserslist/-/browserslist-4.29.0.tgz",
+        "*/*"
+      ],
+      "integrity": "sha512-3GSvyjvDI4Dur1Meg2BekJquu5uF+9R9a1+5M1Mde192eZoXbeXjzgOsgqPS2V8D5wrrip0gR5Hf/GhWQ9ZzaA==",
+      "sha256": "004cfd29e260cf949725b5238a259b53ba75554b256ce9ac6d42fc1c5f913bfe",
+      "bytes": 18707
+    },
+    {
+      "request": [
+        "GET",
+        "/caniuse-lite/-/caniuse-lite-1.0.30001810.tgz",
+        "*/*"
+      ],
+      "integrity": "sha512-TITQPUkaz+aVk5GL6NhOdwk1aEaNTSDPsGFWrTuhKGtjTF70jL/Oht2W4c6rXUe5fu7Ie19VIahAXHIIiWWNeg==",
+      "sha256": "90358545393506a7f65ea1b2778ce68638114c327e441a463a705e26b58a85df",
+      "bytes": 323010
+    },
+    {
+      "request": [
+        "GET",
+        "/convert-source-map/-/convert-source-map-2.0.0.tgz",
+        "*/*"
+      ],
+      "integrity": "sha512-Kvp459HrV2FEJ1CAsi1Ku+MY3kasH19TFykTz2xWmMeq6bk2NU3XXvfJ+Q61m0xktWwt+1HSYf3JZsTms3aRJg==",
+      "sha256": "17f7253ec7e4e09f68371192fded2b5241a5cf85e610e5059b1d49e878fe1898",
+      "bytes": 4952
+    },
+    {
+      "request": [
+        "GET",
+        "/debug/-/debug-4.4.3.tgz",
+        "*/*"
+      ],
+      "integrity": "sha512-RGwwWnwQvkVfavKVt22FGLw+xYSdzARwm0ru6DhTVA3umU5hZc28V3kO4stgYryrTlLpuvgI9GiijltAjNbcqA==",
+      "sha256": "89c1ac9c946ee8905a875837114528e97eeae35e03be3190584b2216af43e4a7",
+      "bytes": 13449
+    },
+    {
+      "request": [
+        "GET",
+        "/electron-to-chromium/-/electron-to-chromium-1.5.438.tgz",
+        "*/*"
+      ],
+      "integrity": "sha512-AN9xMU1hJiT65LkCUPL1DZm5TCbOPb2Qsm5pYwFLEXp6/qj9SdT4yMiqs7Qqstwvkn1zF7l36SRGt+s6XcJ0FA==",
+      "sha256": "27c8a7922ea29457073b73d619b5d14b825d13b7d52272f210098cc099a28135",
+      "bytes": 35473
+    },
+    {
+      "request": [
+        "GET",
+        "/esbuild/-/esbuild-0.21.5.tgz",
+        "*/*"
+      ],
+      "integrity": "sha512-mg3OPMV4hXywwpoDxu3Qda5xCKQi+vCTZq8S9J/EpkhB2HzKXq4SNFZE3+NK93JYxc8VMSep+lOUSC/RVKaBqw==",
+      "sha256": "0f60f3d3dc5efa299e3464d29b6a7dc51d1dff665fe7b036aa95021ce6fd827a",
+      "bytes": 30513
+    },
+    {
+      "request": [
+        "GET",
+        "/escalade/-/escalade-3.2.0.tgz",
+        "*/*"
+      ],
+      "integrity": "sha512-WUj2qlxaQtO4g6Pq5c29GTcWGDyd8itL8zTlipgECz3JesAiiOKotd8JU6otB3PACgG6xkJUyVhboMS+bje/jA==",
+      "sha256": "ba2755afc0e6c6705326711fd218ebe107a527eccbd6485155fde98ed000bee7",
+      "bytes": 4483
+    },
+    {
+      "request": [
+        "GET",
+        "/fsevents/-/fsevents-2.3.3.tgz",
+        "*/*"
+      ],
+      "integrity": "sha512-5xoDfX+fL7faATnagmWPpbFtwh/R77WmMMqqHGS65C3vvB0YHrgF+B1YmZ3441tMj5n63k0212XNoJwzlhffQw==",
+      "sha256": "c77e7a5d5ff31dd7acea7c44d4a0455e0528cdacbd24a8cb6c82b66d239b587e",
+      "bytes": 22808
+    },
+    {
+      "request": [
+        "GET",
+        "/gensync/-/gensync-1.0.0-beta.2.tgz",
+        "*/*"
+      ],
+      "integrity": "sha512-3hN7NaskYvMDLQY55gnW3NQ+mesEAepTqlg+VEbj7zzqEMBVNhzcGYYeqFo/TlYz6eQiFcp1HcsCZO+nGgS8zg==",
+      "sha256": "df9f92ef26a35d4f92cb8a73415dfea8dadaf294a03e60e4d176df82f38d17c9",
+      "bytes": 7442
+    },
+    {
+      "request": [
+        "GET",
+        "/js-tokens/-/js-tokens-4.0.0.tgz",
+        "*/*"
+      ],
+      "integrity": "sha512-RdJUflcE3cUzKiMqQgsCu06FPu9UdIJO0beYbPhHN4k6apgJtifcoCtT9bcxOpYBtpD2kCM6Sbzg4CausW/PKQ==",
+      "sha256": "d884c7a2d8adb5568c1272d92b4f9c62707f4226cf9e7b22e7b957c7361e3c53",
+      "bytes": 6542
+    },
+    {
+      "request": [
+        "GET",
+        "/jsesc/-/jsesc-3.1.0.tgz",
+        "*/*"
+      ],
+      "integrity": "sha512-/sM3dO2FOzXjKQhJuo0Q173wf2KOo8t4I8vHy6lF9poUp7bKT0/NHE8fPX23PwfhnykfqnC2xRxOnVw5XuGIaA==",
+      "sha256": "0c712225ccca9a70bf83f2ac2f52a268c858c7df3b3df196f1623239d80d3c09",
+      "bytes": 10038
+    },
+    {
+      "request": [
+        "GET",
+        "/json5/-/json5-2.2.3.tgz",
+        "*/*"
+      ],
+      "integrity": "sha512-XmOWe7eyHYH14cLdVPoyg+GOH3rYX++KpzrylJwSW98t3Nk+U8XOl8FWKOgwtzdb8lXGf6zYwDUzeHMWfxasyg==",
+      "sha256": "08afb33db600d11fc89b98fac4054f19d5d3e0fe527063116150e1ecc2d2377b",
+      "bytes": 50318
+    },
+    {
+      "request": [
+        "GET",
+        "/loose-envify/-/loose-envify-1.4.0.tgz",
+        "*/*"
+      ],
+      "integrity": "sha512-lyuxPGr/Wfhrlem2CL/UcnUc1zcqKAImBDzukY7Y5F/yQiNdko6+fRLevlw1HgMySw7f611UIY408EtxRSoK3Q==",
+      "sha256": "1218830a93538a4f730d530138e945ea6a65b45e099ee7a9ea538a05141babdc",
+      "bytes": 2842
+    },
+    {
+      "request": [
+        "GET",
+        "/lru-cache/-/lru-cache-5.1.1.tgz",
+        "*/*"
+      ],
+      "integrity": "sha512-KpNARQA3Iwv+jTA0utUVVbrh+Jlrr1Fv0e56GGzAFOXN7dk/FviaDW8LHmK52DlcH4WP2n6gI8vN1aesBFgo9w==",
+      "sha256": "b11e78819544a6606e3317647a5593c102ea38d3c5afae62cd63f9c2c369485a",
+      "bytes": 5824
+    },
+    {
+      "request": [
+        "GET",
+        "/ms/-/ms-2.1.3.tgz",
+        "*/*"
+      ],
+      "integrity": "sha512-6FlzubTLZG3J2a/NVCAleEhjzq5oxgHyaCU9yYXvcLsvoVaHJq/s5xXI6/XXP6tz7R9xAOtHnSO/tXtF3WRTlA==",
+      "sha256": "f6616e15e530ed552f9daa2d3ce71963947c6bc7c98c9b64fd3e673fd02622c6",
+      "bytes": 2967
+    },
+    {
+      "request": [
+        "GET",
+        "/nanoid/-/nanoid-3.3.19.tgz",
+        "*/*"
+      ],
+      "integrity": "sha512-Y2tUNy4ouw6tq5oDSKeQYGOyhkUBhNOcGV/02KC+6kd9eDGqdZd++mjMiIDilrBYvjEnCYvVtsuHCuP+okSfug==",
+      "sha256": "4e371b71e3d5081fa0052356d5c1904e7a60e049864c26f0724cfd32dc303849",
+      "bytes": 5694
+    },
+    {
+      "request": [
+        "GET",
+        "/node-releases/-/node-releases-2.0.57.tgz",
+        "*/*"
+      ],
+      "integrity": "sha512-kQK9LGGFiHtrWiNhZtA7Qbw17AQz+dmsEKODRIVTXA9+e5MS/2gZEBhYJt13GrAz5/IOZKddH/0Z3TP/Zgo+yw==",
+      "sha256": "3e9f5e0ee1b0a00ce6272e0a7f2d7937fd71ef886080812250aafdf02dcf6d18",
+      "bytes": 6087
+    },
+    {
+      "request": [
+        "GET",
+        "/picocolors/-/picocolors-1.1.1.tgz",
+        "*/*"
+      ],
+      "integrity": "sha512-xceH2snhtb5M9liqDsmEw56le376mTZkEX/jEb/RxNFyegNul7eNslCXP9FDj/Lcu0X8KEyMceP2ntpaHrDEVA==",
+      "sha256": "d3aedb2807967b7eb37fd11b03b7e3701e725af79c650d0812ff7213f8f882d9",
+      "bytes": 2625
+    },
+    {
+      "request": [
+        "GET",
+        "/postcss/-/postcss-8.5.28.tgz",
+        "*/*"
+      ],
+      "integrity": "sha512-RRuzqDtt5Y9h3quz5hWhK+TPnsmVs6WwSU6LkJMeY4HstUEDuYTG8UJSdawMRzmzAtV+KEoG8N3Qg2qLy5vM/A==",
+      "sha256": "f63d6d9bce28989cd083add85af717c0264e44323d35c909ae99ac934e9641a6",
+      "bytes": 52195
+    },
+    {
+      "request": [
+        "GET",
+        "/react-dom/-/react-dom-18.3.1.tgz",
+        "*/*"
+      ],
+      "integrity": "sha512-5m4nQKp+rZRb09LNH59GM4BxTh9251/ylbKIbpe7TpGxfJ+9kv6BLkLBXIjjspbgbnIBNqlI23tRnTWT0snUIw==",
+      "sha256": "031d4427a99f2f3f6cac18bbbf308594a67e4f47d10f4896fdec446505b040e0",
+      "bytes": 1089001
+    },
+    {
+      "request": [
+        "GET",
+        "/react-refresh/-/react-refresh-0.17.0.tgz",
+        "*/*"
+      ],
+      "integrity": "sha512-z6F7K9bV85EfseRCp2bzrpyQ0Gkw1uLoCel9XBVWPg/TjRj94SkJzUTGfOa4bs7iJvBWtQG0Wq7wnI0syw3EBQ==",
+      "sha256": "40aa26f7cbb282b754ac0cdc7c5b6a1a1170c9cd74d61f863b8644397afec09f",
+      "bytes": 9998
+    },
+    {
+      "request": [
+        "GET",
+        "/react/-/react-18.3.1.tgz",
+        "*/*"
+      ],
+      "integrity": "sha512-wS+hAgJShR0KhEvPJArfuPVN1+Hz1t0Y6n5jLrGQbkb4urgPE/0Rve+1kMB1v/oWgHgm4WIcV+i7F2pTVj+2iQ==",
+      "sha256": "8d9bed01a672e7eaf387942d781ad47c6a43089a30a0306060f9fd5ac7870347",
+      "bytes": 81751
+    },
+    {
+      "request": [
+        "GET",
+        "/rollup/-/rollup-4.63.4.tgz",
+        "*/*"
+      ],
+      "integrity": "sha512-4U0liVayNIoLp3GFl1FcI8561WepLnZ1rqfraGh7S9B3Ur5F9S283y8Futii7RUU2C/97tOBmBy7nYvhoiOpbQ==",
+      "sha256": "aac827efcca56aaacbfc4f24fb4ba9df85a654417250627cd5f9616694f6ef51",
+      "bytes": 584554
+    },
+    {
+      "request": [
+        "GET",
+        "/scheduler/-/scheduler-0.23.2.tgz",
+        "*/*"
+      ],
+      "integrity": "sha512-UOShsPwz7NrMUqhR6t0hWjFduvOzbtv7toDH1/hIrfRNIDBnnBWd0CwJTGvTpngVlmwGCdP9/Zl/tVrDqcuYzQ==",
+      "sha256": "e4f1d8fe63a9ab93ef66c92b0ad1af9c1326adbf7f1bd5e9053cac0fee6f26ae",
+      "bytes": 17726
+    },
+    {
+      "request": [
+        "GET",
+        "/semver/-/semver-6.3.1.tgz",
+        "*/*"
+      ],
+      "integrity": "sha512-BR7VvDCVHO+q2xBEWskxS6DJE1qRnb7DxzUrogb71CWoSficBxYsiAGd+Kl0mmq/MprG9yArRkyrQxTO6XjMzA==",
+      "sha256": "3c9b042a38e099cbd00a9bd792042aefb62a70b3f0f1ba1a3cbddf07e5eb1230",
+      "bytes": 19093
+    },
+    {
+      "request": [
+        "GET",
+        "/source-map-js/-/source-map-js-1.2.1.tgz",
+        "*/*"
+      ],
+      "integrity": "sha512-UXWMKhLOwVKb728IUtQPXxfYU+usdybtUrK/8uGE8CQMvrhOpwvzDBwj0QhSL7MQc7vIsISBG8VQ8+IDQxpfQA==",
+      "sha256": "f126a6f9fca487a43219d8cb8c3a955279187a966119d548eb5cd47e999d4853",
+      "bytes": 35340
+    },
+    {
+      "request": [
+        "GET",
+        "/update-browserslist-db/-/update-browserslist-db-1.3.3.tgz",
+        "*/*"
+      ],
+      "integrity": "sha512-pJ2sYawQS0R/WI928Gj5GlPhTGzbMelq0+4INtSYNDV9ErKJcX6xjGWkoG/VnB3dpUm00zALaqkrUD77pO5TDQ==",
+      "sha256": "5e345675666e58e36e8c8385e442a18e7815e36ab6b6470835f12a61a80fec6b",
+      "bytes": 7349
+    },
+    {
+      "request": [
+        "GET",
+        "/vite/-/vite-5.4.21.tgz",
+        "*/*"
+      ],
+      "integrity": "sha512-o5a9xKjbtuhY6Bi5S3+HvbRERmouabWbyUcpXXUA1u+GNUKoROi9byOJ8M0nHbHYHkYICiMlqxkg1KkYmm25Sw==",
+      "sha256": "1974803337cb6a1a86a6fdcf45a05ff0555220140d5ca70a58306f9f9b895af6",
+      "bytes": 760049
+    },
+    {
+      "request": [
+        "GET",
+        "/yallist/-/yallist-3.1.1.tgz",
+        "*/*"
+      ],
+      "integrity": "sha512-a4UGQaWPH59mOXUYnAG2ewncQS4i4F43Tv3JoAM+s2VDAmS9NsK8GpDMLrCHPksFT7h3K6TOoUNn2pb7RoXx4g==",
+      "sha256": "50f14ae6cfe8360cb2259ba3e93305e069036f13251d69d3cbee9e1d4775ca04",
+      "bytes": 4496
+    }
+  ],
+  "frozen_anchor": {
+    "sha256": "252acdaf27917b70e48c58e116cbbaa7bb2445f61f5dcf47172d96ba6e8b4dcf",
+    "source": "Completed HTTPS capture; all bodies and tarball SRI verified"
+  },
+  "parity": [
+    {
+      "cohort": "known-size-ci-cold",
+      "artifact": "lpm.lock",
+      "count": 48,
+      "unique_hashes": 1
+    },
+    {
+      "cohort": "known-size-ci-cold",
+      "artifact": "selected-packages.json",
+      "count": 48,
+      "unique_hashes": 1
+    },
+    {
+      "cohort": "memory-vite-frozen/scored",
+      "artifact": "lpm.lock",
+      "count": 72,
+      "unique_hashes": 1
+    },
+    {
+      "cohort": "memory-vite-frozen/scored",
+      "artifact": "selected-packages.json",
+      "count": 72,
+      "unique_hashes": 1
+    },
+    {
+      "cohort": "memory-vite-frozen/scored",
+      "artifact": "object-content-digests.json",
+      "count": 72,
+      "unique_hashes": 1
+    }
+  ]
+}
