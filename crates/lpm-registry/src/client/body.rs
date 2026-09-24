@@ -11,7 +11,7 @@ const _: () = assert!(MAX_METADATA_BYTES <= 64 * 1024 * 1024);
 /// history. Keep their widened concurrency lane under a tighter memory cap.
 pub(super) const MAX_VERSION_METADATA_BYTES: usize = 4 * 1024 * 1024;
 // Keep small responses inline; large packuments can monopolize an async worker.
-const BLOCKING_METADATA_PARSE_THRESHOLD: usize = 64 * 1024;
+pub(super) const BLOCKING_METADATA_PARSE_THRESHOLD: usize = 64 * 1024;
 
 /// Hard cap for non-metadata API responses (whoami, token check,
 /// quality/skills, tunnel domain ops, publish ack, error bodies).

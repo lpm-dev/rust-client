@@ -587,6 +587,7 @@ impl RegistryClient {
             self.invalidate_metadata_cache_key(
                 &self.npm_preferred_metadata_cache_key(package_name),
             );
+            self.invalidate_metadata_cache_key(&self.npm_latest_metadata_cache_key(package_name));
             if let Ok(worker_key) = self.npm_worker_metadata_cache_key(package_name) {
                 self.invalidate_metadata_cache_key(&worker_key);
             }
@@ -606,6 +607,7 @@ impl RegistryClient {
         self.invalidate_metadata_cache_key(&cache_key);
         let selected_key = self.npm_selected_history_cache_key(package_name, version);
         self.invalidate_metadata_cache_key(&selected_key);
+        self.invalidate_metadata_cache_key(&self.npm_latest_metadata_cache_key(package_name));
         tracing::debug!("invalidated npm version metadata cache for {package_name}@{version}");
     }
 

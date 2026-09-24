@@ -339,6 +339,16 @@ pub struct TimedPackageMetadata {
     pub timings: PackageMetadataFetchTimings,
 }
 
+/// Resolver metadata with independent version and platform-field coverage.
+#[derive(Debug)]
+pub struct TimedPreferredMetadata {
+    pub fetched: TimedPackageMetadata,
+    /// False when only manifests selected by a preference are available.
+    pub versions_complete: bool,
+    /// True when every retained manifest came from a full version document.
+    pub platform_metadata_complete: bool,
+}
+
 #[derive(Debug)]
 pub struct TimedReleaseTimeMetadata {
     pub metadata: ReleaseTimeMetadata,

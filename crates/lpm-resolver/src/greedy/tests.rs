@@ -1,3 +1,5 @@
+mod latest_metadata;
+
 use super::deps::*;
 use super::edge::*;
 use super::fused::*;
@@ -7418,6 +7420,17 @@ async fn fusion_preferred_history_is_completed_when_an_importer_enables_release_
         },
         "time":{"1.0.0":"2025-01-01T00:00:00Z","1.1.0":"2025-01-03T00:00:00Z"}
     });
+    let mut latest = history["versions"]["1.1.0"].clone();
+    latest["dist"] = serde_json::json!({
+        "tarball": format!("{}/shared.tgz", server.uri()),
+        "integrity": format!("sha512-{}==", "A".repeat(86)),
+    });
+    Mock::given(method("GET"))
+        .and(path("/shared/latest"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(latest))
+        .expect(1)
+        .mount(&server)
+        .await;
     Mock::given(method("GET"))
         .and(path("/shared"))
         .respond_with(ResponseTemplate::new(200).set_body_json(history))
@@ -7452,6 +7465,15 @@ async fn fusion_preferred_history_is_completed_when_an_importer_enables_release_
         .expect("each importer must consider every version allowed by its policy");
         assert_eq!(result.packages[0].version.to_string(), expected);
     }
+    assert!(
+        server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .any(|r| r.url.path() == "/shared")
+    );
+    server.verify().await;
 }
 
 #[tokio::test(flavor = "current_thread")]

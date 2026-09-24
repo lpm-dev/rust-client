@@ -1,4 +1,8 @@
+mod latest;
 mod resolver_cache;
+
+#[cfg(test)]
+mod latest_tests;
 
 use super::*;
 use serde::de::{DeserializeSeed, Error, MapAccess, Visitor};
@@ -239,8 +243,10 @@ impl RegistryClient {
     where
         F: Fn(&str) -> bool + Send + 'static,
     {
-        self.get_npm_preferred_metadata_with_cache_fields::<_, true>(name, accepts)
-            .await
+        let result = self
+            .get_npm_preferred_resolution_metadata_with_timings(name, accepts)
+            .await?;
+        Ok((result.fetched, result.versions_complete))
     }
 
     #[tracing::instrument(
@@ -693,7 +699,7 @@ mod tests {
         assert!(parsed.versions_complete);
         assert!(parsed.metadata.versions.is_empty());
     }
-    async fn preferred_test_client(
+    pub(super) async fn preferred_test_client(
         server: &wiremock::MockServer,
         cache: &std::path::Path,
     ) -> RegistryClient {
@@ -703,7 +709,7 @@ mod tests {
             .with_synchronous_cache_writes(true)
     }
 
-    fn history() -> serde_json::Value {
+    pub(super) fn history() -> serde_json::Value {
         serde_json::json!({"name":"pkg","dist-tags":{"latest":"2.0.0"},"versions":{
             "1.0.0":{"name":"pkg","version":"1.0.0"},
             "2.0.0":{"name":"pkg","version":"2.0.0"}

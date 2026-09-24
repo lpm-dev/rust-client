@@ -872,6 +872,22 @@ impl RegistryClient {
         T: serde::de::DeserializeOwned + serde::Serialize + Send + 'static,
         F: FnOnce(&T) -> bool,
     {
+        self.cached_metadata_after_304_at_generation(cache_key, response, validator, is_valid, None)
+            .await
+    }
+
+    async fn cached_metadata_after_304_at_generation<T, F>(
+        &self,
+        cache_key: &str,
+        response: &reqwest::Response,
+        validator: Option<&CacheValidator>,
+        is_valid: F,
+        generation: Option<u64>,
+    ) -> Option<MetadataCacheEntry<T>>
+    where
+        T: serde::de::DeserializeOwned + serde::Serialize + Send + 'static,
+        F: FnOnce(&T) -> bool,
+    {
         let validator_etag = validator?.etag.as_deref()?;
         let path = self.cache_path(cache_key)?;
         let (value, cached_etag, cached_fresh_for) = tokio::task::spawn_blocking(move || {
@@ -884,7 +900,12 @@ impl RegistryClient {
             return None;
         }
         if !is_valid(&value) {
-            self.invalidate_metadata_cache_key(cache_key);
+            let invalidate = || self.invalidate_metadata_cache_key(cache_key);
+            if let Some(generation) = generation {
+                self.history_cache.with_generation(generation, invalidate);
+            } else {
+                invalidate();
+            }
             return None;
         }
         let directive = match Self::metadata_cache_directive(response.headers()) {
@@ -901,12 +922,25 @@ impl RegistryClient {
                 if fresh_for == cached_fresh_for
                     && effective_etag == cached_etag.as_deref()
         );
-        let remaining_freshness = if can_refresh_in_place {
-            self.refresh_metadata_cache_freshness(cache_key, cached_fresh_for)
+        let mut remaining_freshness = Duration::ZERO;
+        let mut publish = || {
+            remaining_freshness = if can_refresh_in_place {
+                self.refresh_metadata_cache_freshness(cache_key, cached_fresh_for)
+            } else {
+                self.write_metadata_cache_with_directive(
+                    cache_key,
+                    &value,
+                    effective_etag,
+                    directive,
+                )
+            }
+            .unwrap_or_default();
+        };
+        if let Some(generation) = generation {
+            self.history_cache.with_generation(generation, publish);
         } else {
-            self.write_metadata_cache_with_directive(cache_key, &value, effective_etag, directive)
+            publish();
         }
-        .unwrap_or_default();
         Some(MetadataCacheEntry {
             value,
             etag: response_etag.or(cached_etag),
