@@ -114,12 +114,7 @@ impl RegistryClient {
 
         let response = self.send_lpm_tarball_with_recovery(url, None).await?;
 
-        let bytes = response
-            .bytes()
-            .await
-            .map_err(|e| LpmError::Network(format!("failed to read tarball bytes: {e}")))?;
-
-        Ok(bytes.to_vec())
+        read_buffered_tarball_response(response, MAX_COMPRESSED_TARBALL_SIZE as usize).await
     }
 
     /// Download a tarball to a temp file, computing SHA-512 as chunks arrive.
@@ -622,6 +617,27 @@ impl RegistryClient {
         let downloaded = self.download_tarball_to_file(url).await?;
         verify_downloaded_tarball_integrity(downloaded, expected_integrity).await
     }
+}
+
+pub(super) async fn read_buffered_tarball_response(
+    response: reqwest::Response,
+    max_compressed_size: usize,
+) -> Result<Vec<u8>, LpmError> {
+    lpm_http::read_body_capped(response, max_compressed_size)
+        .await
+        .map_err(|error| match error {
+            lpm_http::ResponseBodyError::DeclaredTooLarge { declared, cap } => {
+                LpmError::Registry(format!(
+                    "tarball Content-Length ({declared} bytes) exceeds maximum compressed size ({cap} bytes)"
+                ))
+            }
+            lpm_http::ResponseBodyError::StreamedTooLarge { cap } => LpmError::Registry(format!(
+                "tarball exceeds maximum compressed size ({cap} bytes)"
+            )),
+            lpm_http::ResponseBodyError::Read(error) => {
+                LpmError::Network(format!("failed to read tarball bytes: {error}"))
+            }
+        })
 }
 
 async fn verify_downloaded_tarball_integrity(

@@ -54,7 +54,7 @@ clap = { workspace = true, features = ["string"] }
 clap_complete = { workspace = true }
 cvss = { workspace = true }
 tokio = { workspace = true }
-tokio-util = { workspace = true }
+tokio-util = { workspace = true, features = ["rt"] }
 reqwest = { workspace = true }
 axum = { workspace = true }
 serde = { workspace = true, features = ["rc"] }

@@ -82,15 +82,14 @@ impl HttpClients {
         Some(format!("TLS overrides active: {}", parts.join("; ")))
     }
 
-    /// Test helper whose logical pools share the supplied client's
-    /// underlying connection pool.
+    /// Use the supplied general client and a shared redirect-disabled test pool.
     #[cfg(test)]
     pub(super) fn from_default_client(default: reqwest::Client) -> Arc<Self> {
         let manual_redirect = lpm_http::client_builder()
             .redirect(reqwest::redirect::Policy::none())
             .build()
             .expect("build redirect-disabled test client");
-        Self::from_default_clients(default.clone(), default, manual_redirect)
+        Self::from_default_clients(default, manual_redirect.clone(), manual_redirect)
     }
 
     /// Build an `HttpClients` with separate general and policy metadata
@@ -523,6 +522,19 @@ impl lpm_http::ReplayableHttpClientProvider for HttpClients {
         url: &reqwest::Url,
     ) -> impl std::future::Future<Output = Result<reqwest::Client, Self::Error>> + Send {
         self.for_manual_redirect_url(url.as_str())
+    }
+}
+
+pub(super) struct PolicyMetadataClientProvider<'a>(pub(super) &'a HttpClients);
+
+impl lpm_http::ReplayableHttpClientProvider for PolicyMetadataClientProvider<'_> {
+    type Error = LpmError;
+
+    fn client_for_url(
+        &self,
+        url: &reqwest::Url,
+    ) -> impl std::future::Future<Output = Result<reqwest::Client, Self::Error>> + Send {
+        self.0.for_policy_metadata_url(url.as_str())
     }
 }
 

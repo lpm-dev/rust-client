@@ -209,7 +209,7 @@ impl RegistryClient {
             &roots,
             identity.clone(),
             HttpTransportMode::Default,
-            HttpRedirectMode::Automatic,
+            HttpRedirectMode::Manual,
         )?;
         let manual_redirect = Self::build_http_client_with_prepared_tls_identity_and_transport(
             connect_timeout,
@@ -376,7 +376,13 @@ impl RegistryClient {
             }
         }
         let default_client = Self::build_http_client(CONNECT_TIMEOUT, READ_TIMEOUT);
-        let policy_metadata_client = Self::build_http_client(CONNECT_TIMEOUT, READ_TIMEOUT);
+        let policy_metadata_client = Self::build_manual_redirect_http_client_with_tls_and_identity(
+            CONNECT_TIMEOUT,
+            READ_TIMEOUT,
+            &TlsOverrides::default(),
+            None,
+        )
+        .expect("default TLS config never fails to build");
         let manual_redirect_client = Self::build_manual_redirect_http_client_with_tls_and_identity(
             CONNECT_TIMEOUT,
             READ_TIMEOUT,
