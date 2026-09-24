@@ -936,6 +936,124 @@ mod tests {
     }
 
     #[test]
+    fn package_dispatch_download_retains_install_timeline_ancestry() {
+        use lpm_common::integrity::{HashAlgorithm, Integrity};
+        use tracing_subscriber::{Layer, layer::SubscriberExt, registry::LookupSpan};
+        use wiremock::{
+            Mock, MockServer, ResponseTemplate,
+            matchers::{method, path},
+        };
+
+        #[derive(Clone, Default)]
+        struct FetchAncestry(Arc<std::sync::Mutex<Vec<Vec<&'static str>>>>);
+
+        impl<S> Layer<S> for FetchAncestry
+        where
+            S: tracing::Subscriber + for<'a> LookupSpan<'a>,
+        {
+            fn on_new_span(
+                &self,
+                attrs: &tracing::span::Attributes<'_>,
+                id: &tracing::Id,
+                context: tracing_subscriber::layer::Context<'_, S>,
+            ) {
+                if attrs.metadata().name() == "tarball_fetch" {
+                    let ancestry = context
+                        .span(id)
+                        .unwrap()
+                        .scope()
+                        .from_root()
+                        .map(|span| span.name())
+                        .collect();
+                    self.0.lock().unwrap().push(ancestry);
+                }
+            }
+        }
+
+        let ancestry = FetchAncestry::default();
+        let subscriber = tracing_subscriber::registry().with(ancestry.clone());
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        tracing::subscriber::with_default(subscriber, || {
+            runtime.block_on(async {
+                let manifest = br#"{"name":"shared-package","version":"1.0.0"}"#;
+                let encoder =
+                    flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+                let mut archive = tar::Builder::new(encoder);
+                let mut header = tar::Header::new_gnu();
+                header.set_size(manifest.len() as u64);
+                header.set_mode(0o644);
+                header.set_cksum();
+                archive
+                    .append_data(&mut header, "package/package.json", &manifest[..])
+                    .unwrap();
+                let body = archive.into_inner().unwrap().finish().unwrap();
+                let integrity = Integrity::from_bytes(HashAlgorithm::Sha512, &body).to_string();
+                let server = MockServer::start().await;
+                Mock::given(method("GET"))
+                    .and(path("/shared-package.tgz"))
+                    .respond_with(ResponseTemplate::new(200).set_body_bytes(body))
+                    .expect(1)
+                    .mount(&server)
+                    .await;
+                let directory = tempfile::tempdir().unwrap();
+                let client = Arc::new(
+                    RegistryClient::new()
+                        .with_npm_registry_url(server.uri())
+                        .with_cache_dir(None),
+                );
+                let package = workspace_fetch_package(
+                    &integrity,
+                    &format!("{}/shared-package.tgz", server.uri()),
+                );
+                let store = PackageStore::at(directory.path().join("store"));
+                let store_v2 =
+                    Arc::new(lpm_store::v2::Store::at(directory.path().join("store-v2")));
+                let drain = async {
+                    spawn_fetch_overlap_for_packages(
+                        vec![package],
+                        client,
+                        RouteTable::from_mode_only(lpm_registry::RouteMode::Direct),
+                        store,
+                        Some(store_v2),
+                        Arc::new(Semaphore::new(1)),
+                        Arc::new(FetchCoordinator::default()),
+                        directory.path().to_path_buf(),
+                        Arc::new(GateStats::default()),
+                        None,
+                        ManagedInstallAccounting,
+                        true,
+                        ArtifactSelection::FreshResolution,
+                    )
+                    .drain()
+                    .await
+                }
+                .instrument(
+                    tracing::trace_span!(target: "lpm_install_timeline", "install_pipeline"),
+                );
+                let result = tokio::time::timeout(std::time::Duration::from_secs(5), drain)
+                    .await
+                    .expect("package dispatcher must finish")
+                    .unwrap();
+                assert_eq!(result.stats.completed_count, 1);
+                assert_eq!(result.stats.failed_count, 0);
+                assert_eq!(result.outcomes.len(), 1);
+            })
+        });
+        assert_eq!(
+            *ancestry.0.lock().unwrap(),
+            vec![vec![
+                "install_pipeline",
+                "package_fetch_dispatch",
+                "overlap_fetch_task",
+                "tarball_fetch"
+            ]]
+        );
+    }
+
+    #[test]
     fn fetch_overlap_defaults_on_for_fresh_fusion_installs() {
         assert!(fetch_overlap_enabled_from_value(true, false, false, None));
     }

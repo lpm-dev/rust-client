@@ -305,8 +305,9 @@ async fn metadata_timeline_correlates_retries_blocking_parse_and_ordered_commit(
     }
 }
 
-async fn assert_overlap_fetch_ancestry(route: &str) {
+async fn assert_install_fetch_ancestry(route: &str) {
     let workspace = route == "workspace";
+    let policy = matches!(route, "policy" | "policy-foreground");
     use wiremock::{
         Mock, ResponseTemplate,
         matchers::{method, path},
@@ -314,7 +315,7 @@ async fn assert_overlap_fetch_ancestry(route: &str) {
 
     let registry = MockRegistry::start().await;
     let mut dependencies = serde_json::Map::new();
-    for index in 0..if matches!(route, "policy" | "experimental") {
+    for index in 0..if policy || route == "experimental" {
         1
     } else {
         8
@@ -343,7 +344,7 @@ async fn assert_overlap_fetch_ancestry(route: &str) {
     if !matches!(route, "workspace" | "experimental") {
         project.write_file(".npmrc", &format!("registry={}/\n", registry.url()));
     }
-    if route == "policy" {
+    if policy {
         let config = serde_json::json!({"policy":{"extensions":{"timeline":{"command":[assert_cmd::cargo::cargo_bin("workflows-policy-extension").display().to_string(), "--action", "allow", "--name", "timeline-overlap-0", "--version", "1.0.0"],"mode":"enforce"}}}});
         std::fs::create_dir_all(project.home().join(".lpm")).unwrap();
         std::fs::write(
@@ -354,6 +355,9 @@ async fn assert_overlap_fetch_ancestry(route: &str) {
     }
     let directory = project.path().join("timeline");
     let mut command = lpm_with_registry(&project, &registry.url());
+    if route == "policy-foreground" {
+        command.env("LPM_FETCH_OVERLAP", "0");
+    }
     command
         .env("LPM_INSTALL_TIMELINE_DIR", &directory)
         .env("LPM_FETCH_OVERLAP_MIN_SELECTED", "1")
@@ -395,18 +399,30 @@ async fn assert_overlap_fetch_ancestry(route: &str) {
         .filter(|r| r["kind"] == "span_open")
         .map(|r| (r["id"].as_u64().unwrap(), r))
         .collect();
+    if policy {
+        let stdout: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(stdout["timing"]["policy_extensions"]["ran_count"], 1);
+        assert!(!spans.values().any(|r| r["name"] == "speculative_tarball"));
+        assert_eq!(
+            spans
+                .values()
+                .any(|r| r["name"] == "package_fetch_dispatch"),
+            route == "policy",
+        );
+    }
     let fetches: Vec<_> = spans
         .values()
         .filter(|r| r["name"] == "tarball_fetch")
         .collect();
     assert!(
         !fetches.is_empty(),
-        "fixture must exercise authoritative overlap fetches"
+        "fixture must exercise authoritative fetches"
     );
     let expected_marker = match route {
         "normal" => "selected_fetch_dispatch",
         "workspace" => "workspace_fetch_task",
-        "policy" => "package_fetch_dispatch",
+        // Either the dispatcher or foreground fetch can acquire the package lock first.
+        "policy" | "policy-foreground" => "install_pipeline",
         "experimental" => "resolver_fetch_task",
         _ => panic!("unknown fixture route"),
     };
@@ -423,10 +439,7 @@ async fn assert_overlap_fetch_ancestry(route: &str) {
             }
             current = span["parent"].as_u64();
         }
-        assert!(
-            reached_install,
-            "overlap fetch lacks install ancestry: {fetch}"
-        );
+        assert!(reached_install, "fetch lacks install ancestry: {fetch}");
     }
     assert!(
         route_exercised,
@@ -436,20 +449,25 @@ async fn assert_overlap_fetch_ancestry(route: &str) {
 
 #[tokio::test]
 async fn overlapping_resolution_fetches_retain_install_timeline_ancestry() {
-    assert_overlap_fetch_ancestry("normal").await;
+    assert_install_fetch_ancestry("normal").await;
 }
 
 #[tokio::test]
 async fn workspace_shared_fetches_retain_install_timeline_ancestry() {
-    assert_overlap_fetch_ancestry("workspace").await;
+    assert_install_fetch_ancestry("workspace").await;
 }
 
 #[tokio::test]
 async fn post_policy_fetches_retain_install_timeline_ancestry() {
-    assert_overlap_fetch_ancestry("policy").await;
+    assert_install_fetch_ancestry("policy").await;
+}
+
+#[tokio::test]
+async fn post_policy_foreground_fetches_retain_install_timeline_ancestry() {
+    assert_install_fetch_ancestry("policy-foreground").await;
 }
 
 #[tokio::test]
 async fn experimental_fetches_retain_install_timeline_ancestry() {
-    assert_overlap_fetch_ancestry("experimental").await;
+    assert_install_fetch_ancestry("experimental").await;
 }
