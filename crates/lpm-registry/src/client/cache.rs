@@ -252,6 +252,29 @@ impl RegistryClient {
         cached
     }
 
+    /// Read fresh routed metadata without issuing a network request.
+    /// Exact-version documents are excluded because they do not establish tag state.
+    pub async fn cached_package_metadata(
+        &self,
+        name: &str,
+        route: &crate::UpstreamRoute,
+    ) -> Option<Arc<PackageMetadata>> {
+        if let Some(metadata) = self.npm_metadata_memory_cache(name, route) {
+            return Some(metadata);
+        }
+        let key = self.routed_metadata_storage_cache_key(name, route)?;
+        let (metadata, _) = self.read_metadata_cache_async(&key).await?;
+        if metadata.name != name
+            || metadata
+                .versions
+                .values()
+                .any(|version| version.name != name)
+        {
+            return None;
+        }
+        Some(Arc::new(metadata))
+    }
+
     /// Seed one immutable, already-validated packument for later resolver use.
     pub fn seed_metadata_for_command(
         &self,
@@ -1795,6 +1818,48 @@ mod command_metadata_seed_tests {
             }))
             .expect("valid package metadata"),
         )
+    }
+
+    #[tokio::test]
+    async fn cached_metadata_is_fresh_route_scoped_and_identity_checked() {
+        let directory = tempfile::tempdir().unwrap();
+        let client = RegistryClient::new().with_cache_dir(Some(directory.path().into()));
+        let route = crate::UpstreamRoute::NpmDirect;
+        let name = "cached-peer-provider";
+        let key = client
+            .routed_metadata_storage_cache_key(name, &route)
+            .unwrap();
+        client.write_metadata_cache(&key, package_metadata(name).as_ref(), None);
+        client.flush_pending_cache_writes().await;
+        assert_eq!(
+            client
+                .cached_package_metadata(name, &route)
+                .await
+                .unwrap()
+                .latest_version_tag(),
+            Some("1.0.0")
+        );
+        assert!(
+            client
+                .cached_package_metadata(name, &crate::UpstreamRoute::LpmWorker)
+                .await
+                .is_none()
+        );
+
+        client.write_metadata_cache(&key, package_metadata("different-package").as_ref(), None);
+        client.flush_pending_cache_writes().await;
+        assert!(client.cached_package_metadata(name, &route).await.is_none());
+
+        client.write_metadata_cache_with_directive(
+            &key,
+            package_metadata(name).as_ref(),
+            None,
+            MetadataCacheDirective::Store {
+                fresh_for: std::time::Duration::ZERO,
+            },
+        );
+        client.flush_pending_cache_writes().await;
+        assert!(client.cached_package_metadata(name, &route).await.is_none());
     }
 
     #[test]

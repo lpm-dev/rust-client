@@ -462,7 +462,7 @@ pub(super) async fn run_online_link_phase(
 /// Offline/shared path: link packages from store, write lockfile, print output.
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn run_link_and_finish(
-    _client: &RegistryClient,
+    client: &RegistryClient,
     project_dir: &Path,
     _deps: &HashMap<String, String>,
     pkg: &lpm_workspace::PackageJson,
@@ -497,6 +497,8 @@ pub(super) async fn run_link_and_finish(
     compatibility_bin_names: &[String],
     store_version: lpm_store::StoreVersion,
     emit_install_report: bool,
+    strict_peer_dependencies: bool,
+    route_table: &RouteTable,
 ) -> Result<(), LpmError> {
     crate::security_floor::clear_recorded_suppressions();
     let force_security_floor = crate::security_floor::force_security_floor_enabled(global_config);
@@ -507,6 +509,21 @@ pub(super) async fn run_link_and_finish(
     }
     dedupe_install_packages_by_identity(&mut packages)?;
     validate_store_graph_compatibility(&packages, store_version)?;
+    if strict_peer_dependencies {
+        enforce_replayed_peer_dependencies(
+            &packages,
+            pkg,
+            PeerReplayContext {
+                client,
+                route_table,
+                offline: true,
+                project_dir,
+                lpm_root,
+                store_version,
+            },
+        )
+        .await?;
+    }
     let store = PackageStore::from_root(lpm_root);
 
     // Mirror of the online-arm
