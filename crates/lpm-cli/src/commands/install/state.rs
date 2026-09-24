@@ -266,66 +266,82 @@ pub(super) async fn run_install_freshness_phase(
         );
     let fast_path_base_eligible = install_state.up_to_date && compatibility_bins_ready;
     let fast_path_packages = if fast_path_base_eligible {
-        let gate_stats = GateStats::default();
-        let workspace = crate::workspace_discovery_cache::active_workspace(input.project_dir);
-        let fast = validated_lockfile_deps_for_freshness(input.project_dir, input.manifest_deps)
-            .and_then(|(lockfile_deps, workspace_deps_filtered)| {
-                if workspace_deps_filtered
-                    && lockfile_deps.is_empty()
-                    && workspace_lockfile::exists(input.lockfile_path)
-                {
-                    return Some(Vec::new());
-                }
-                let route_table = RouteTable::from_env_and_filesystem(input.project_dir).ok()?;
-                try_lockfile_fast_path_with_optional_roots(TryLockfileFastPathInput {
-                    lockfile_path: input.lockfile_path,
-                    deps: &lockfile_deps,
-                    optional_root_names: input.root_optional_dependency_names,
-                    catalog_resolutions: &[],
-                    workspace: workspace.as_deref(),
-                    route_table: &route_table,
-                    client: input.client,
-                    gate_stats: &gate_stats,
-                    accept_unsafe_sources: false,
-                })
-                .and_then(|fast| {
-                    let locked = fast.lockfile.importers.get(".").and_then(|importer| {
-                        importer
-                            .workspace_root_peer_providers_fingerprint
-                            .as_deref()
-                    });
-                    let expected = crate::workspace_discovery_cache::
+        std::thread::scope(|scope| -> Result<_, LpmError> {
+            let _runtime_probe = if !matches!(dependency_engine_key.as_str(), "none" | "legacy")
+                && !input.dependency_engine_policy.node_resolution_is_ready()
+            {
+                std::thread::Builder::new()
+                    .name("lpm-node-probe".to_owned())
+                    .spawn_scoped(scope, || {
+                        input.dependency_engine_policy.constrained_freshness_key()
+                    })
+                    .ok()
+            } else {
+                None
+            };
+            let gate_stats = GateStats::default();
+            let workspace = crate::workspace_discovery_cache::active_workspace(input.project_dir);
+            let fast =
+                validated_lockfile_deps_for_freshness(input.project_dir, input.manifest_deps)
+                    .and_then(|(lockfile_deps, workspace_deps_filtered)| {
+                        if workspace_deps_filtered
+                            && lockfile_deps.is_empty()
+                            && workspace_lockfile::exists(input.lockfile_path)
+                        {
+                            return Some(Vec::new());
+                        }
+                        let route_table =
+                            RouteTable::from_env_and_filesystem(input.project_dir).ok()?;
+                        try_lockfile_fast_path_with_optional_roots(TryLockfileFastPathInput {
+                            lockfile_path: input.lockfile_path,
+                            deps: &lockfile_deps,
+                            optional_root_names: input.root_optional_dependency_names,
+                            catalog_resolutions: &[],
+                            workspace: workspace.as_deref(),
+                            route_table: &route_table,
+                            client: input.client,
+                            gate_stats: &gate_stats,
+                            accept_unsafe_sources: false,
+                        })
+                        .and_then(|fast| {
+                            let locked = fast.lockfile.importers.get(".").and_then(|importer| {
+                                importer
+                                    .workspace_root_peer_providers_fingerprint
+                                    .as_deref()
+                            });
+                            let expected = crate::workspace_discovery_cache::
                         root_provider_fingerprint_for_locked_member(input.project_dir, locked);
-                    if expected.as_deref().map(AsRef::as_ref) == locked {
-                        Some(fast.packages)
-                    } else {
-                        None
-                    }
-                })
-            });
-        if let Some(mut packages) = fast {
-            if input.omit_policy.dev {
-                filter_dev_packages(&mut packages, input.production_dependency_names);
-            }
-            if input.omit_policy.optional {
-                filter_optional_packages(&mut packages, input.root_optional_dependency_names);
-            }
-            filter_dependency_engine_packages(&mut packages, input.dependency_engine_policy)?;
-            filter_platform_packages(&mut packages)?;
-            let skills_ready = input.no_skills
-                || selected_package_skills(&packages)?
-                    .iter()
-                    .all(|(name, version)| {
-                        crate::commands::skills::package::version_is_materialized(
-                            input.project_dir,
-                            name,
-                            version,
-                        )
+                            if expected.as_deref().map(AsRef::as_ref) == locked {
+                                Some(fast.packages)
+                            } else {
+                                None
+                            }
+                        })
                     });
-            skills_ready.then_some(packages)
-        } else {
-            None
-        }
+            if let Some(mut packages) = fast {
+                if input.omit_policy.dev {
+                    filter_dev_packages(&mut packages, input.production_dependency_names);
+                }
+                if input.omit_policy.optional {
+                    filter_optional_packages(&mut packages, input.root_optional_dependency_names);
+                }
+                filter_dependency_engine_packages(&mut packages, input.dependency_engine_policy)?;
+                filter_platform_packages(&mut packages)?;
+                let skills_ready = input.no_skills
+                    || selected_package_skills(&packages)?
+                        .iter()
+                        .all(|(name, version)| {
+                            crate::commands::skills::package::version_is_materialized(
+                                input.project_dir,
+                                name,
+                                version,
+                            )
+                        });
+                Ok(skills_ready.then_some(packages))
+            } else {
+                Ok(None)
+            }
+        })?
     } else {
         None
     };

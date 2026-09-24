@@ -978,7 +978,7 @@ pub(crate) fn check_install_state_with_linker_integrity_dependency_engine_and_se
     }
 
     if binary_lockfile_sidecar_needs_refresh(
-        project_dir,
+        &lock_path,
         binary_sidecar_expectation(&cached_hash_file),
     ) {
         return InstallState {
@@ -1151,15 +1151,14 @@ fn try_mtime_fast_path(
     let pkg_ns = mtime_ns(&project_dir.join("package.json"))?;
     // lpm.lock may be absent on a never-installed fast-lane entry; 0
     // sentinel lines up with the writer's convention.
-    let lock_ns =
-        mtime_ns(&crate::commands::install::workspace_lockfile::active_lockfile_path(project_dir))
-            .unwrap_or(0);
+    let lock_path = crate::commands::install::workspace_lockfile::active_lockfile_path(project_dir);
+    let lock_ns = mtime_ns(&lock_path).unwrap_or(0);
 
     if pkg_ns != stored_pkg_ns || lock_ns != stored_lock_ns {
         return None;
     }
 
-    if binary_lockfile_sidecar_needs_refresh(project_dir, binary_sidecar_expectation(&content)) {
+    if binary_lockfile_sidecar_needs_refresh(&lock_path, binary_sidecar_expectation(&content)) {
         return None;
     }
 
@@ -1220,11 +1219,9 @@ fn binary_sidecar_expectation(content: &str) -> Option<BinarySidecarExpectation>
 }
 
 fn binary_lockfile_sidecar_needs_refresh(
-    project_dir: &Path,
+    lockfile_path: &Path,
     expectation: Option<BinarySidecarExpectation>,
 ) -> bool {
-    let lockfile_path =
-        crate::commands::install::workspace_lockfile::active_lockfile_path(project_dir);
     if !lockfile_path.exists() {
         return false;
     }
@@ -1238,13 +1235,13 @@ fn binary_lockfile_sidecar_needs_refresh(
     }
     match lpm_lockfile::BinaryLockfileReader::open(&binary_path) {
         Ok(Some(_)) => {
-            !lockfile_requires_binary_sidecar(&lockfile_path)
-                || binary_lockfile_is_older_than_toml(&lockfile_path, &binary_path)
+            !lockfile_requires_binary_sidecar(lockfile_path)
+                || binary_lockfile_is_older_than_toml(lockfile_path, &binary_path)
         }
         Ok(None) => match expectation {
             Some(BinarySidecarExpectation::Required) => true,
             Some(BinarySidecarExpectation::NotRequired) => false,
-            None => lockfile_requires_binary_sidecar(&lockfile_path),
+            None => lockfile_requires_binary_sidecar(lockfile_path),
         },
         Err(_) => true,
     }

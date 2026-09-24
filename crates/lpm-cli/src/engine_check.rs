@@ -192,6 +192,10 @@ impl DependencyEnginePolicy {
         format!("{}:{version}", u8::from(self.engine_strict))
     }
 
+    pub(crate) fn node_resolution_is_ready(&self) -> bool {
+        self.effective_node.get().is_some()
+    }
+
     pub(crate) fn probe_node_runtime_fingerprint(&self) -> Option<String> {
         probe_node_fingerprint_on_path(&self.script_cwd, &self.script_path)
     }
