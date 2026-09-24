@@ -1,0 +1,33 @@
+{
+  "output": "/absolute/path/to/results/t3",
+  "fixture": "bench/audit-fixtures/t3-install",
+  "verifyModule": "next/package.json",
+  "samples": 100,
+  "diagnostics": 0,
+  "states": [
+    "installed-cache-gone",
+    "up-to-date"
+  ],
+  "keepWork": true,
+  "balancedOrders": true,
+  "sharedLpmRoot": true,
+  "bareInstall": true,
+  "bunBinary": "/absolute/path/to/bun",
+  "variants": [
+    {
+      "id": "baseline",
+      "manager": "lpm",
+      "binary": "/absolute/path/to/lpm-baseline"
+    },
+    {
+      "id": "candidate",
+      "manager": "lpm",
+      "binary": "/absolute/path/to/lpm-candidate",
+      "expectCompactNoop": true
+    },
+    {
+      "id": "bun",
+      "manager": "bun"
+    }
+  ]
+}

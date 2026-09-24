@@ -2,6 +2,9 @@ use super::*;
 use std::fs::File;
 use std::io::Read;
 
+mod replay;
+pub(super) use replay::{PeerReplayContext, enforce_replayed_peer_dependencies};
+
 const AUTO_ISOLATED_PEER_CONFLICTS_NEEDLE: &[u8] = b"auto-isolated-peer-conflicts = true";
 const AUTO_ISOLATED_PEER_CONFLICTS_NEEDLE_LEN: usize = AUTO_ISOLATED_PEER_CONFLICTS_NEEDLE.len();
 const LOCKFILE_PEER_CONFLICT_SCAN_CHUNK_SIZE: usize = 64 * 1024;
