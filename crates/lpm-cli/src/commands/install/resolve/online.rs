@@ -20,6 +20,7 @@ pub(in crate::commands::install) struct OnlineResolutionPhaseInput<'a> {
     pub(in crate::commands::install) store_v2_handle: Option<Arc<lpm_store::v2::Store>>,
     pub(in crate::commands::install) fetch_semaphore: Arc<Semaphore>,
     pub(in crate::commands::install) fetch_extract_limiter: FetchExtractLimiter,
+    pub(in crate::commands::install) v2_streaming_lane: Arc<V2StreamingLane>,
     pub(in crate::commands::install) fetch_coord: Arc<FetchCoordinator>,
     pub(in crate::commands::install) gate_stats: Arc<GateStats>,
     pub(in crate::commands::install) npm_firewall_mode: crate::npm_firewall_config::NpmFirewallMode,
@@ -102,6 +103,7 @@ pub(in crate::commands::install) async fn run_online_resolution_phase(
         store_v2_handle,
         fetch_semaphore,
         fetch_extract_limiter,
+        v2_streaming_lane,
         fetch_coord,
         gate_stats,
         npm_firewall_mode,
@@ -314,6 +316,8 @@ pub(in crate::commands::install) async fn run_online_resolution_phase(
                         } else {
                             speculation_deps
                         },
+                        dependency_engine_policy.clone(),
+                        streaming_fetch.then(|| v2_streaming_lane.clone()),
                         spec_tracker.clone(),
                         store_v2_handle.clone(),
                         fetch_extract_limiter.clone(),
@@ -528,6 +532,8 @@ pub(in crate::commands::install) async fn run_online_resolution_phase(
                         } else {
                             speculation_deps
                         },
+                        dependency_engine_policy.clone(),
+                        streaming_fetch.then(|| v2_streaming_lane.clone()),
                         spec_tracker.clone(),
                         store_v2_handle.clone(),
                         fetch_extract_limiter.clone(),

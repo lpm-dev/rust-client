@@ -990,19 +990,20 @@ pub(super) async fn pre_resolve_non_registry_deps_with_optional_registry_roots(
 
     for (local_name, raw_spec, url, reference) in git_specs {
         let resolved = resolve_github_source(&url, reference.as_deref()).await?;
-        let downloaded = match download_github_archive_to_file(&resolved.archive_url, None).await {
-            Ok(downloaded) => downloaded,
-            Err(error) if inherited_optional_registry_roots.contains(&local_name) => {
-                tracing::warn!(
-                    dependency = %local_name,
-                    source = %resolved.locked_source,
-                    error = %error,
-                    "skipping unavailable optional GitHub dependency"
-                );
-                continue;
-            }
-            Err(error) => return Err(error),
-        };
+        let mut downloaded =
+            match download_github_archive_to_file(&resolved.archive_url, None).await {
+                Ok(downloaded) => downloaded,
+                Err(error) if inherited_optional_registry_roots.contains(&local_name) => {
+                    tracing::warn!(
+                        dependency = %local_name,
+                        source = %resolved.locked_source,
+                        error = %error,
+                        "skipping unavailable optional GitHub dependency"
+                    );
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
         let store_v2 = store_v2.cloned();
         let store = store.clone();
         let (package_dir, integrity) =
@@ -1020,7 +1021,7 @@ pub(super) async fn pre_resolve_non_registry_deps_with_optional_registry_roots(
                         &downloaded.sri,
                         downloaded.file.path(),
                     )?;
-                    Ok((package_dir, downloaded.sri))
+                    Ok((package_dir, std::mem::take(&mut downloaded.sri)))
                 }
             })
             .await

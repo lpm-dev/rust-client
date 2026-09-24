@@ -32,7 +32,7 @@ pub(super) struct V2StreamingLane {
 }
 
 impl V2StreamingLane {
-    fn try_claim(&self) -> bool {
+    pub(super) fn try_claim(&self) -> bool {
         self.claimed
             .compare_exchange(
                 false,
@@ -56,6 +56,7 @@ const ENV_V2_STREAMING_EXTRACT_WEIGHT: &str = "LPM_V2_STREAMING_EXTRACT_WEIGHT";
 pub(super) const DEFAULT_BOUNDED_FETCH_EXTRACT_PERMITS: usize = 4;
 const DEFAULT_LARGE_V2_STREAMING_EXTRACT_WEIGHT: usize = 3;
 pub(super) const LARGE_V2_STREAMING_OBJECT_BYTES: u64 = 64 * 1024 * 1024;
+const SPECULATIVE_FILE_STREAMING_MIN_BYTES: u64 = 8 * 1024 * 1024;
 pub(super) const V2_STREAMING_SUPPLEMENTAL_PERMIT_LEASE: std::time::Duration =
     std::time::Duration::from_secs(2);
 
@@ -415,6 +416,7 @@ pub(super) struct OnlineFetchPhaseInput<'a> {
     pub(super) store_v2_handle: Option<Arc<lpm_store::v2::Store>>,
     pub(super) fetch_semaphore: Arc<Semaphore>,
     pub(super) fetch_extract_limiter: FetchExtractLimiter,
+    pub(super) v2_streaming_lane: Arc<V2StreamingLane>,
     pub(super) fetch_coord: Arc<FetchCoordinator>,
     pub(super) install_accounting: ManagedInstallAccounting,
     pub(super) speculation_join: Option<SpeculationJoin>,
@@ -563,6 +565,7 @@ pub(super) async fn run_online_fetch_phase(
         store_v2_handle,
         fetch_semaphore,
         fetch_extract_limiter,
+        v2_streaming_lane,
         fetch_coord,
         install_accounting,
         mut speculation_join,
@@ -605,10 +608,6 @@ pub(super) async fn run_online_fetch_phase(
     let mut fetch_stage_timings = FetchStageTimings::default();
     let v2_link_task_timings = V2LinkTaskTimings::default();
     let workspace_coordinator = workspace_materialization::current();
-    let v2_streaming_lane = workspace_coordinator.as_ref().map_or_else(
-        || Arc::new(V2StreamingLane::default()),
-        |coordinator| coordinator.v2_streaming_lane(),
-    );
     if !force
         && let (Some(coordinator), Some(store_v2)) =
             (workspace_coordinator.as_ref(), store_v2_handle.as_ref())
@@ -2556,6 +2555,86 @@ mod tests {
     use super::*;
 
     #[test]
+    fn speculative_file_streaming_starts_at_eight_mib_unpacked() {
+        assert!(!speculative_file_needs_streaming(None));
+        assert!(!speculative_file_needs_streaming(
+            std::num::NonZeroU64::new(SPECULATIVE_FILE_STREAMING_MIN_BYTES - 1)
+        ));
+        assert!(speculative_file_needs_streaming(std::num::NonZeroU64::new(
+            SPECULATIVE_FILE_STREAMING_MIN_BYTES
+        )));
+        assert!(speculative_file_needs_streaming(std::num::NonZeroU64::new(
+            u64::MAX
+        )));
+    }
+
+    #[tokio::test]
+    async fn cancelled_speculative_waiter_retains_capacity_and_lock_until_extraction_ends() {
+        let capacity = Arc::new(Semaphore::new(4));
+        let permit = capacity.clone().acquire_many_owned(3).await.unwrap();
+        let package_lock = Arc::new(AsyncMutex::new(()));
+        let key_guard = package_lock.clone().lock_owned().await;
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(run_speculative_blocking_extract(
+            key_guard,
+            Some(permit),
+            move || {
+                started_tx.send(()).unwrap();
+                let _ = resume_rx.recv();
+                let _ = done_tx.send(());
+                Ok(())
+            },
+        ));
+        started_rx.await.unwrap();
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        let capacity_retained = capacity.available_permits() == 1;
+        let lock_retained = package_lock.try_lock().is_err();
+        resume_tx.send(()).unwrap();
+        done_rx.await.unwrap();
+        let _guard = tokio::time::timeout(std::time::Duration::from_secs(2), package_lock.lock())
+            .await
+            .unwrap();
+        assert!(
+            capacity_retained,
+            "blocking extraction must retain its capacity after cancellation"
+        );
+        assert!(
+            lock_retained,
+            "blocking extraction must retain its package lock after cancellation"
+        );
+        assert_eq!(capacity.available_permits(), 4);
+    }
+
+    #[tokio::test]
+    async fn cancelled_file_extraction_retains_capacity_until_worker_finishes() {
+        let capacity = Arc::new(Semaphore::new(1));
+        let permit = capacity.clone().acquire_owned().await.unwrap();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+        let task = tokio::spawn(run_blocking_extract(Some(permit), move || {
+            started_tx.send(()).unwrap();
+            let _ = resume_rx.recv();
+            Ok(())
+        }));
+        started_rx.await.unwrap();
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        let retained = capacity.available_permits() == 0;
+        resume_tx.send(()).unwrap();
+        let _permit = tokio::time::timeout(std::time::Duration::from_secs(2), capacity.acquire())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            retained,
+            "blocking file extraction must retain its capacity"
+        );
+    }
+
+    #[test]
     fn parse_fetch_extract_permits_accepts_only_positive_integers() {
         assert_eq!(parse_fetch_extract_permits("4"), Some(4));
         assert_eq!(parse_fetch_extract_permits(" 2 "), Some(2));
@@ -2892,7 +2971,7 @@ pub(super) fn pick_speculative_version(
     Some((v_str, url, integrity))
 }
 
-pub(super) fn push_regular_speculative_dependencies(
+pub(super) fn push_speculative_dependencies(
     meta: &SpeculativePackageMetadata,
     version: &str,
     next_depth: u32,
@@ -2902,7 +2981,7 @@ pub(super) fn push_regular_speculative_dependencies(
         return;
     };
     for dependency in dependencies {
-        if dependency.optional {
+        if dependency.bundled {
             continue;
         }
         let target_name = dependency.alias.unwrap_or(dependency.name);
@@ -3044,13 +3123,7 @@ pub(super) struct DispatcherCounters {
     pub(super) skipped_auth: Arc<std::sync::atomic::AtomicU64>,
 }
 
-/// spawn the speculation dispatcher as a standalone task.
-/// Consumes `(name, SpeculativePackageMetadata)` frames from `rx` (fed by the
-/// walker) and issues tarball prefetches against the work queue + root
-/// range set. Extraction is refactor-only vs pre-49
-/// `run_deep_batch_with_speculation` — the dispatcher body is
-/// unchanged except that the `roots_ready_tx` logic is gone (walker
-/// fires roots-ready now; the dispatcher is just a pure consumer).
+/// Starts best-effort tarball fetches as resolver metadata becomes available.
 #[allow(clippy::too_many_arguments)] // design-level: dispatcher takes the full per-install state
 pub(super) fn spawn_speculation_dispatcher(
     rx: tokio::sync::mpsc::Receiver<(String, SpeculativePackageMetadata)>,
@@ -3061,12 +3134,10 @@ pub(super) fn spawn_speculation_dispatcher(
     speculation_semaphore: Option<Arc<Semaphore>>,
     coord: Arc<FetchCoordinator>,
     deps: HashMap<String, String>,
+    dependency_engine_policy: Arc<crate::engine_check::DependencyEnginePolicy>,
+    v2_streaming_lane: Option<Arc<V2StreamingLane>>,
     spec_tracker: SpeculativeKeyTracker,
-    // Under v2 mode, the dispatcher routes downloaded files through the
-    // content-addressed object store instead of v1's per-`(name, version)` slot.
-    // `None` keeps the legacy v1 path
-    // for callers running with the env var unset (and for the migration-
-    // window code paths that still write v1 alongside).
+    // None selects the explicit V1 fallback.
     store_v2: Option<Arc<lpm_store::v2::Store>>,
     fetch_extract_limiter: FetchExtractLimiter,
     install_accounting: ManagedInstallAccounting,
@@ -3109,10 +3180,6 @@ pub(super) fn spawn_speculation_dispatcher(
 
     let mut rx = rx;
     let handle = tokio::spawn(async move {
-        // V2 speculation spools compressed bytes under the process-wide byte
-        // budget before the idempotent object extraction. V1 streams directly
-        // into its per-package store slot.
-
         // Work queue items: (package_name, range_string, depth, is_root).
         // Depth is 1 for roots, N+1 for each transitive hop. Capped at
         // SPECULATION_MAX_DEPTH.
@@ -3130,7 +3197,11 @@ pub(super) fn spawn_speculation_dispatcher(
 
         // Seed roots.
         for (name, range) in &deps_for_spec {
-            work_queue.push((name.clone(), range.clone(), 1, true));
+            let (name, range) = lpm_resolver::ranges::parse_npm_alias(range).map_or_else(
+                || (name.clone(), range.clone()),
+                |alias| (alias.target, alias.range),
+            );
+            work_queue.push((name, range, 1, true));
         }
 
         // Process-one-item helper. Inlined so it can mutate the
@@ -3172,6 +3243,22 @@ pub(super) fn spawn_speculation_dispatcher(
                     return;
                 };
 
+                if meta.info.platform_is_compatible(&version) == Some(false) {
+                    return;
+                }
+                if !dependency_engine_policy
+                    .allows_dependency_materialization(meta.info.node_engine(&version))
+                {
+                    return;
+                }
+                if meta.info.needs_platform_metadata() {
+                    parked
+                        .entry(name)
+                        .or_default()
+                        .push((range, depth, is_root));
+                    return;
+                }
+
                 let key = format!("{name}@{version}");
                 if !already_dispatched.insert(key) {
                     return;
@@ -3211,12 +3298,8 @@ pub(super) fn spawn_speculation_dispatcher(
                     transitive_c.fetch_add(1, Relaxed);
                 }
 
-                // Expand transitive deps onto the work queue (bounded by
-                // SPECULATION_MAX_DEPTH). Speculation follows regular deps
-                // only; optional deps are left to the authoritative fetch
-                // path, matching the previous raw-manifest payload.
                 if depth < SPECULATION_MAX_DEPTH {
-                    push_regular_speculative_dependencies(meta, &version, depth + 1, work_queue);
+                    push_speculative_dependencies(meta, &version, depth + 1, work_queue);
                 }
 
                 // Skip tarball speculation for auth-bearing custom
@@ -3244,6 +3327,8 @@ pub(super) fn spawn_speculation_dispatcher(
                 let store_v2_task = store_v2_spec.clone();
                 let fetch_extract_limiter_task = fetch_extract_limiter_spec.clone();
                 let install_accounting_task = install_accounting_spec;
+                let unpacked_size = meta.info.unpacked_size(&version);
+                let streaming_lane = v2_streaming_lane.clone();
                 spec_tasks.push(tokio::spawn(async move {
                     let task_start = std::time::Instant::now();
                     match speculative_download_and_store(
@@ -3258,6 +3343,8 @@ pub(super) fn spawn_speculation_dispatcher(
                         &version,
                         &url,
                         integrity.as_deref(),
+                        unpacked_size,
+                        streaming_lane.as_deref(),
                         &fetch_extract_limiter_task,
                         install_accounting_task,
                     )
@@ -3401,6 +3488,8 @@ pub(super) async fn speculative_download_and_store(
     version: &str,
     url: &str,
     integrity: Option<&str>,
+    unpacked_size: Option<std::num::NonZeroU64>,
+    streaming_lane: Option<&V2StreamingLane>,
     fetch_extract_limiter: &FetchExtractLimiter,
     install_accounting: ManagedInstallAccounting,
 ) -> Result<SpeculativeFetchOutcome, LpmError> {
@@ -3419,7 +3508,7 @@ pub(super) async fn speculative_download_and_store(
     // speculation — that's correct (speculation never targets them).
     let speculation_key = registry_install_pkg_key(name, version, route_table, client.as_ref());
     let key_lock = coord.lock_for(speculation_key).await;
-    let _key_guard = key_lock.lock().await;
+    let key_guard = key_lock.lock_owned().await;
 
     // — store-hit short-circuit, layout-aware. Under v2
     // mode the SRI determines the object dir; if the SRI is
@@ -3469,14 +3558,60 @@ pub(super) async fn speculative_download_and_store(
     };
 
     if let Some(v2) = store_v2 {
-        let downloaded = client
-            .download_tarball_routed_managed(route_table, name, url, install_accounting)
-            .await?;
+        let streaming_lane = streaming_lane.filter(|_| {
+            v2.supports_streamed_object_ingest()
+                && integrity.is_some()
+                && unpacked_size.is_some_and(|size| size.get() >= LARGE_V2_STREAMING_OBJECT_BYTES)
+        });
+        let downloaded = if let Some(lane) = streaming_lane {
+            let response = client
+                .download_tarball_streaming_routed_managed(
+                    route_table,
+                    name,
+                    url,
+                    install_accounting,
+                )
+                .await?;
+            if lane.try_claim() {
+                tracing::debug!(package = name, version, "streaming speculative tarball");
+                extract_v2_registry_response(V2StreamInput {
+                    response,
+                    store_v2: v2,
+                    expected_integrity: integrity,
+                    unpacked_size,
+                    permit,
+                    fetch_extract_limiter,
+                    key_guard: Some(key_guard),
+                    queue_wait_ms: 0,
+                    url_lookup_ms: 0,
+                    download_headers_ms: 0,
+                })
+                .await?;
+                return Ok(SpeculativeFetchOutcome::Stored);
+            }
+            client.spool_tarball_response_to_file(response).await?
+        } else {
+            client
+                .download_tarball_routed_managed(route_table, name, url, install_accounting)
+                .await?
+        };
         drop(permit);
-        let _extract_permit = acquire_fetch_extract_permit(fetch_extract_limiter).await?;
+        let extract_permit = acquire_fetch_extract_permit(fetch_extract_limiter).await?;
         let v2_clone = v2.clone();
         let expected_integrity = integrity.map(str::to_string);
-        tokio::task::spawn_blocking(move || {
+        let stream_file =
+            v2.supports_streamed_object_ingest() && speculative_file_needs_streaming(unpacked_size);
+        run_speculative_blocking_extract(key_guard, extract_permit, move || {
+            if stream_file {
+                let file = std::fs::File::open(downloaded.file.path())?;
+                return v2_clone
+                    .extract_object_from_stream(
+                        std::io::BufReader::new(file),
+                        expected_integrity.as_deref(),
+                        lpm_registry::MAX_COMPRESSED_TARBALL_SIZE,
+                    )
+                    .map(|_| ());
+            }
             v2_clone
                 .extract_object_from_file_with_fresh_integrity(
                     downloaded.file.path(),
@@ -3485,8 +3620,7 @@ pub(super) async fn speculative_download_and_store(
                 )
                 .map(|_| ())
         })
-        .await
-        .map_err(|e| LpmError::Registry(format!("spec virtual-store blocking task: {e}")))??;
+        .await?;
         return Ok(SpeculativeFetchOutcome::Stored);
     }
 
@@ -3504,8 +3638,8 @@ pub(super) async fn speculative_download_and_store(
     let integrity_c = integrity.map(|s| s.to_string());
     let store_owned = store.clone();
 
-    let _extract_permit = acquire_fetch_extract_permit(fetch_extract_limiter).await?;
-    tokio::task::spawn_blocking(move || {
+    let extract_permit = acquire_fetch_extract_permit(fetch_extract_limiter).await?;
+    run_speculative_blocking_extract(key_guard, extract_permit, move || {
         let sync_reader = SyncIoBridge::new(async_reader);
         store_owned
             .stream_and_store_package(
@@ -3517,9 +3651,43 @@ pub(super) async fn speculative_download_and_store(
             )
             .map(|_| ())
     })
-    .await
-    .map_err(|e| LpmError::Registry(format!("spec blocking task: {e}")))??;
+    .await?;
     Ok(SpeculativeFetchOutcome::Stored)
+}
+
+fn speculative_file_needs_streaming(unpacked_size: Option<std::num::NonZeroU64>) -> bool {
+    unpacked_size.is_some_and(|size| size.get() >= SPECULATIVE_FILE_STREAMING_MIN_BYTES)
+}
+
+async fn run_speculative_blocking_extract<F>(
+    key_guard: tokio::sync::OwnedMutexGuard<()>,
+    extract_permit: Option<tokio::sync::OwnedSemaphorePermit>,
+    extract: F,
+) -> Result<(), LpmError>
+where
+    F: FnOnce() -> Result<(), LpmError> + Send + 'static,
+{
+    run_blocking_extract(extract_permit, move || {
+        let _key_guard = key_guard;
+        extract()
+    })
+    .await
+}
+
+async fn run_blocking_extract<T, F>(
+    extract_permit: Option<tokio::sync::OwnedSemaphorePermit>,
+    extract: F,
+) -> Result<T, LpmError>
+where
+    T: Send + 'static,
+    F: FnOnce() -> Result<T, LpmError> + Send + 'static,
+{
+    tokio::task::spawn_blocking(move || {
+        let _extract_permit = extract_permit;
+        extract()
+    })
+    .await
+    .map_err(|error| LpmError::Registry(format!("file extraction task: {error}")))?
 }
 
 pub(super) struct ResolvedRegistryTarballUrl {
@@ -3783,7 +3951,7 @@ async fn store_downloaded_registry_tarball(
 > {
     drop(permit);
     let extract_permit_wait_start = std::time::Instant::now();
-    let _extract_permit = acquire_fetch_extract_permit(fetch_extract_limiter).await?;
+    let extract_permit = acquire_fetch_extract_permit(fetch_extract_limiter).await?;
     let extract_permit_wait_ms = extract_permit_wait_start.elapsed().as_millis();
     let integrity = p.integrity.clone();
     let name = p.name.clone();
@@ -3791,7 +3959,7 @@ async fn store_downloaded_registry_tarball(
     let store = store.clone();
     let store_v2 = store_v2.cloned();
     let ((stage, fresh_object, result_sri), integrity_ms) =
-        tokio::task::spawn_blocking(move || {
+        run_blocking_extract(extract_permit, move || {
             let computed_sri = downloaded.sri.clone();
             if let Some(store_v2) = store_v2 {
                 let (object, sri, timings, integrity_ms) = store_v2
@@ -3825,10 +3993,7 @@ async fn store_downloaded_registry_tarball(
             )?;
             Ok::<_, LpmError>(((stage, None, computed_sri), integrity_ms))
         })
-        .await
-        .map_err(|error| {
-            LpmError::Registry(format!("file-backed extract task panicked: {error}"))
-        })??;
+        .await?;
 
     let mut timings = TaskTimings::from_stage(
         queue_wait_ms,
@@ -4174,6 +4339,126 @@ pub(super) async fn fetch_and_store_tarball_url(
     Ok((result_sri, timings, url.to_string(), fresh_object))
 }
 
+struct V2StreamInput<'a> {
+    response: reqwest::Response,
+    store_v2: &'a lpm_store::v2::Store,
+    expected_integrity: Option<&'a str>,
+    unpacked_size: Option<std::num::NonZeroU64>,
+    permit: tokio::sync::OwnedSemaphorePermit,
+    fetch_extract_limiter: &'a FetchExtractLimiter,
+    key_guard: Option<tokio::sync::OwnedMutexGuard<()>>,
+    queue_wait_ms: u128,
+    url_lookup_ms: u128,
+    download_headers_ms: u128,
+}
+
+async fn extract_v2_registry_response(
+    input: V2StreamInput<'_>,
+) -> Result<(String, TaskTimings, lpm_store::v2::ExtractedObject), LpmError> {
+    use futures::StreamExt;
+    use tokio_util::io::{StreamReader, SyncIoBridge};
+
+    let V2StreamInput {
+        response,
+        store_v2,
+        expected_integrity,
+        unpacked_size,
+        permit,
+        fetch_extract_limiter,
+        key_guard,
+        queue_wait_ms,
+        url_lookup_ms,
+        download_headers_ms,
+    } = input;
+    let admission = acquire_v2_streaming_extract_admission(
+        fetch_extract_limiter,
+        v2_streaming_extract_weight(unpacked_size),
+    )
+    .await?;
+    let V2StreamingExtractAdmission {
+        base_permit,
+        mut supplemental_permit,
+        requested_weight,
+        acquired_weight,
+        wait_ms: extract_permit_wait_ms,
+    } = admission;
+
+    let pipeline_start = std::time::Instant::now();
+    let download_elapsed_ms = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let cancellation = tokio_util::sync::CancellationToken::new();
+    let cancellation_guard = cancellation.clone().drop_guard();
+    let response_stream = Box::pin(response.bytes_stream());
+    let cancellable_stream = futures::stream::unfold(
+        (response_stream, cancellation, false),
+        |(mut stream, cancellation, finished)| async move {
+            if finished {
+                return None;
+            }
+            tokio::select! {
+                biased;
+                _ = cancellation.cancelled() => Some((
+                    Err(std::io::Error::new(
+                        std::io::ErrorKind::Interrupted,
+                        "streamed tarball download cancelled",
+                    )),
+                    (stream, cancellation, true),
+                )),
+                chunk = stream.next() => chunk.map(|chunk| (
+                    chunk.map_err(std::io::Error::other),
+                    (stream, cancellation, false),
+                )),
+            }
+        },
+    );
+    let async_reader = StreamReader::new(Box::pin(cancellable_stream));
+    let store_v2 = store_v2.clone();
+    let expected_integrity = expected_integrity.map(str::to_owned);
+    let download_elapsed_for_reader = Arc::clone(&download_elapsed_ms);
+    let joined = tokio::task::spawn_blocking(move || {
+        let _key_guard = key_guard;
+        let _extract_permit = base_permit;
+        let sync_reader = SyncIoBridge::new(async_reader);
+        let reader = StreamBodyPermitReader::new(sync_reader, permit, download_elapsed_for_reader);
+        store_v2.extract_object_from_stream(
+            reader,
+            expected_integrity.as_deref(),
+            lpm_registry::MAX_COMPRESSED_TARBALL_SIZE,
+        )
+    });
+    let (joined, supplemental_lease_expired, supplemental_hold_ms) =
+        await_v2_streaming_extract_task(
+            joined,
+            supplemental_permit.take(),
+            V2_STREAMING_SUPPLEMENTAL_PERMIT_LEASE,
+        )
+        .await;
+    let joined = joined.map_err(|error| {
+        LpmError::Registry(format!("streaming object extract task panicked: {error}"))
+    });
+    let _ = cancellation_guard.disarm();
+    let (object, computed_sri, stage) = joined??;
+    let pipeline_wall_ms = pipeline_start.elapsed().as_millis();
+    let stream_body_wall_ms =
+        u128::from(download_elapsed_ms.load(std::sync::atomic::Ordering::Relaxed));
+    let timings = TaskTimings::from_stage(
+        queue_wait_ms,
+        url_lookup_ms,
+        0,
+        0,
+        extract_permit_wait_ms,
+        stage,
+    )
+    .with_streaming_pipeline(download_headers_ms, stream_body_wall_ms, pipeline_wall_ms)
+    .with_streaming_admission(
+        u64::try_from(requested_weight).unwrap_or(u64::MAX),
+        u64::try_from(acquired_weight).unwrap_or(u64::MAX),
+        unpacked_size,
+        supplemental_hold_ms,
+        supplemental_lease_expired,
+    );
+    Ok((computed_sri, timings, object))
+}
+
 /// Streaming fetch path. V1 can consume a buffered response body; one bounded
 /// V2 critical candidate flows directly from reqwest into the object extractor
 /// through `StreamReader` + `SyncIoBridge`. Other V2 fetches use the file spool.
@@ -4359,9 +4644,6 @@ pub(super) async fn fetch_and_store_streaming(
     };
 
     if let Some(store_v2) = store_v2 {
-        use futures::StreamExt;
-        use tokio_util::io::{StreamReader, SyncIoBridge};
-
         let lane = v2_streaming_lane
             .expect("V2 streamed-object ingest requires an explicit critical lane");
         if !lane.try_claim() {
@@ -4380,93 +4662,19 @@ pub(super) async fn fetch_and_store_streaming(
             )
             .await;
         }
-        let admission = acquire_v2_streaming_extract_admission(
+        let (computed_sri, timings, object) = extract_v2_registry_response(V2StreamInput {
+            response,
+            store_v2,
+            expected_integrity: p.integrity.as_deref(),
+            unpacked_size: p.unpacked_size,
+            permit,
             fetch_extract_limiter,
-            v2_streaming_extract_weight(p.unpacked_size),
-        )
-        .await?;
-        let V2StreamingExtractAdmission {
-            base_permit,
-            mut supplemental_permit,
-            requested_weight,
-            acquired_weight,
-            wait_ms: extract_permit_wait_ms,
-        } = admission;
-
-        let pipeline_start = std::time::Instant::now();
-        let download_elapsed_ms = Arc::new(std::sync::atomic::AtomicU64::new(0));
-        let cancellation = tokio_util::sync::CancellationToken::new();
-        let cancellation_guard = cancellation.clone().drop_guard();
-        let response_stream = Box::pin(response.bytes_stream());
-        let cancellable_stream = futures::stream::unfold(
-            (response_stream, cancellation, false),
-            |(mut stream, cancellation, finished)| async move {
-                if finished {
-                    return None;
-                }
-                tokio::select! {
-                    biased;
-                    _ = cancellation.cancelled() => Some((
-                        Err(std::io::Error::new(
-                            std::io::ErrorKind::Interrupted,
-                            "streamed tarball download cancelled",
-                        )),
-                        (stream, cancellation, true),
-                    )),
-                    chunk = stream.next() => chunk.map(|chunk| (
-                        chunk.map_err(std::io::Error::other),
-                        (stream, cancellation, false),
-                    )),
-                }
-            },
-        );
-        let async_reader = StreamReader::new(Box::pin(cancellable_stream));
-        let store_v2 = store_v2.clone();
-        let expected_integrity = p.integrity.clone();
-        let download_elapsed_for_reader = Arc::clone(&download_elapsed_ms);
-        let joined = tokio::task::spawn_blocking(move || {
-            let _key_guard = key_guard;
-            let _extract_permit = base_permit;
-            let sync_reader = SyncIoBridge::new(async_reader);
-            let reader =
-                StreamBodyPermitReader::new(sync_reader, permit, download_elapsed_for_reader);
-            store_v2.extract_object_from_stream(
-                reader,
-                expected_integrity.as_deref(),
-                lpm_registry::MAX_COMPRESSED_TARBALL_SIZE,
-            )
-        });
-        let (joined, supplemental_lease_expired, supplemental_hold_ms) =
-            await_v2_streaming_extract_task(
-                joined,
-                supplemental_permit.take(),
-                V2_STREAMING_SUPPLEMENTAL_PERMIT_LEASE,
-            )
-            .await;
-        let joined = joined.map_err(|error| {
-            LpmError::Registry(format!("streaming object extract task panicked: {error}"))
-        });
-        let _ = cancellation_guard.disarm();
-        let (object, computed_sri, stage) = joined??;
-        let pipeline_wall_ms = pipeline_start.elapsed().as_millis();
-        let stream_body_wall_ms =
-            u128::from(download_elapsed_ms.load(std::sync::atomic::Ordering::Relaxed));
-        let timings = TaskTimings::from_stage(
+            key_guard,
             queue_wait_ms,
             url_lookup_ms,
-            0,
-            0,
-            extract_permit_wait_ms,
-            stage,
-        )
-        .with_streaming_pipeline(download_headers_ms, stream_body_wall_ms, pipeline_wall_ms)
-        .with_streaming_admission(
-            u64::try_from(requested_weight).unwrap_or(u64::MAX),
-            u64::try_from(acquired_weight).unwrap_or(u64::MAX),
-            p.unpacked_size,
-            supplemental_hold_ms,
-            supplemental_lease_expired,
-        );
+            download_headers_ms,
+        })
+        .await?;
         return Ok((computed_sri, timings, final_url, Some(object)));
     }
 

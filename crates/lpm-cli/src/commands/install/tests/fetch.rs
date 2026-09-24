@@ -171,7 +171,7 @@ fn speculative_picker_uses_slim_metadata_for_dist_tags_and_transitive_deps() {
 }
 
 #[test]
-fn speculative_dependency_enqueue_rewrites_aliases_and_skips_optional_deps() {
+fn speculative_dependency_enqueue_rewrites_aliases_and_includes_optional_deps() {
     let slim = SpeculativePackageMetadata::from(registry_metadata(serde_json::json!({
         "name": "fixture",
         "dist-tags": {
@@ -197,14 +197,32 @@ fn speculative_dependency_enqueue_rewrites_aliases_and_skips_optional_deps() {
     })));
     let mut queue = Vec::new();
 
-    push_regular_speculative_dependencies(&slim, "1.0.0", 2, &mut queue);
+    push_speculative_dependencies(&slim, "1.0.0", 2, &mut queue);
 
     let actual: std::collections::BTreeSet<_> = queue.into_iter().collect();
     let expected = std::collections::BTreeSet::from([
         ("alias-target".to_string(), "^2.0.0".to_string(), 2, false),
         ("plain".to_string(), "^1.0.0".to_string(), 2, false),
+        ("optional-only".to_string(), "^3.0.0".to_string(), 2, false),
     ]);
     assert_eq!(actual, expected);
+}
+
+#[test]
+fn speculative_dependency_enqueue_skips_bundled_packages() {
+    let slim = SpeculativePackageMetadata::from(registry_metadata(serde_json::json!({
+        "name": "parent",
+        "versions": {"1.0.0": {
+            "name": "parent", "version": "1.0.0",
+            "dependencies": {"bundled": "1.0.0"}, "bundleDependencies": ["bundled"]
+        }}
+    })));
+    let mut queue = Vec::new();
+    push_speculative_dependencies(&slim, "1.0.0", 2, &mut queue);
+    assert!(
+        queue.is_empty(),
+        "bundled dependency bytes already belong to the parent tarball"
+    );
 }
 
 fn speculation_snapshot(
@@ -239,6 +257,10 @@ async fn count_dispatched_speculative_frames(
         Some(Arc::new(Semaphore::new(0))),
         Arc::new(FetchCoordinator::default()),
         dependencies,
+        Arc::new(
+            crate::engine_check::prepare_dependency_policy(store_root.path(), true, true).unwrap(),
+        ),
+        None,
         SpeculativeKeyTracker::default(),
         None,
         None,
@@ -252,6 +274,165 @@ async fn count_dispatched_speculative_frames(
     counters
         .dispatched
         .load(std::sync::atomic::Ordering::Relaxed)
+}
+
+#[tokio::test]
+async fn speculation_dispatches_optional_dependencies_when_their_metadata_arrives() {
+    let parent = SpeculativePackageMetadata::from(registry_metadata(serde_json::json!({
+        "name": "parent",
+        "versions": {"1.0.0": {
+            "name": "parent", "version": "1.0.0",
+            "optionalDependencies": {"native": "1.0.0"},
+            "dist": {"tarball": "https://example.invalid/parent.tgz", "integrity": "sha512-test"}
+        }}
+    })));
+    let dispatched = count_dispatched_speculative_frames(
+        HashMap::from([("parent".to_string(), "1.0.0".to_string())]),
+        vec![
+            ("parent", parent),
+            (
+                "native",
+                speculation_snapshot("native", &["1.0.0"], true, serde_json::json!({})),
+            ),
+        ],
+    )
+    .await;
+
+    assert_eq!(
+        dispatched, 2,
+        "optional tarballs must overlap resolution too"
+    );
+}
+
+#[tokio::test]
+async fn speculation_does_not_dispatch_platform_incompatible_packages() {
+    let incompatible = SpeculativePackageMetadata::from(registry_metadata(serde_json::json!({
+        "name": "native",
+        "versions": {"1.0.0": {
+            "name": "native", "version": "1.0.0", "os": ["unsupported-test-platform"],
+            "dist": {"tarball": "https://example.invalid/native.tgz", "integrity": "sha512-test"}
+        }}
+    })));
+    let dispatched = count_dispatched_speculative_frames(
+        HashMap::from([("native".to_string(), "1.0.0".to_string())]),
+        vec![("native", incompatible)],
+    )
+    .await;
+
+    assert_eq!(
+        dispatched, 0,
+        "platform rejection must precede tarball dispatch"
+    );
+}
+
+#[tokio::test]
+async fn speculation_resolves_scoped_npm_alias_roots() {
+    let dispatched = count_dispatched_speculative_frames(
+        HashMap::from([(
+            "local-native".to_string(),
+            "npm:@scope/native@1.0.0".to_string(),
+        )]),
+        vec![(
+            "@scope/native",
+            speculation_snapshot("@scope/native", &["1.0.0"], true, serde_json::json!({})),
+        )],
+    )
+    .await;
+
+    assert_eq!(
+        dispatched, 1,
+        "root aliases must wait on the canonical package name"
+    );
+}
+
+#[tokio::test]
+async fn speculation_waits_for_missing_libc_metadata() {
+    let incomplete = SpeculativePackageMetadata::from(registry_metadata(serde_json::json!({
+        "name": "native",
+        "versions": {"1.0.0": {
+            "name": "native", "version": "1.0.0", "cpu": ["x64", "arm64", "arm"],
+            "dist": {"tarball": "https://example.invalid/native.tgz", "integrity": "sha512-test"}
+        }}
+    })));
+    assert!(incomplete.info.needs_platform_metadata());
+    let dispatched = count_dispatched_speculative_frames(
+        HashMap::from([("native".to_string(), "1.0.0".to_string())]),
+        vec![("native", incomplete)],
+    )
+    .await;
+
+    assert_eq!(
+        dispatched, 0,
+        "abbreviated metadata must not guess missing libc restrictions"
+    );
+}
+
+#[tokio::test]
+async fn speculation_does_not_expand_an_incompatible_parent_or_select_an_older_version() {
+    let parent = SpeculativePackageMetadata::from(registry_metadata(serde_json::json!({
+        "name": "parent",
+        "versions": {
+            "1.0.0": {
+                "name": "parent", "version": "1.0.0",
+                "dist": {"tarball": "https://example.invalid/old.tgz", "integrity": "sha512-test"}
+            },
+            "1.1.0": {
+                "name": "parent", "version": "1.1.0", "os": ["unsupported-test-platform"],
+                "dependencies": {"child": "1.0.0"},
+                "dist": {"tarball": "https://example.invalid/new.tgz", "integrity": "sha512-test"}
+            }
+        }
+    })));
+    let dispatched = count_dispatched_speculative_frames(
+        HashMap::from([("parent".to_string(), "^1.0.0".to_string())]),
+        vec![
+            (
+                "child",
+                speculation_snapshot("child", &["1.0.0"], true, serde_json::json!({})),
+            ),
+            ("parent", parent),
+        ],
+    )
+    .await;
+
+    assert_eq!(dispatched, 0);
+}
+
+#[tokio::test]
+async fn speculation_resumes_when_complete_platform_metadata_arrives() {
+    let incomplete = SpeculativePackageMetadata::from(registry_metadata(serde_json::json!({
+        "name": "native",
+        "versions": {"1.0.0": {
+            "name": "native", "version": "1.0.0", "cpu": ["x64", "arm64", "arm"],
+            "dist": {"tarball": "https://example.invalid/native.tgz", "integrity": "sha512-test"}
+        }}
+    })));
+    let mut complete = speculation_snapshot("native", &["1.0.0"], false, serde_json::json!({}));
+    Arc::make_mut(&mut complete.info).platform_metadata_complete = true;
+    let dispatched = count_dispatched_speculative_frames(
+        HashMap::from([("native".to_string(), "1.0.0".to_string())]),
+        vec![("native", incomplete), ("native", complete)],
+    )
+    .await;
+
+    assert_eq!(dispatched, 1);
+}
+
+#[tokio::test]
+async fn speculation_coalesces_alias_and_canonical_roots_for_the_same_version() {
+    let dispatched = count_dispatched_speculative_frames(
+        HashMap::from([
+            ("local".to_string(), "npm:native@1.0.0".to_string()),
+            ("native".to_string(), "npm:native@1.0.0".to_string()),
+        ]),
+        vec![(
+            "native",
+            speculation_snapshot("native", &["1.0.0"], true, serde_json::json!({})),
+        )],
+    )
+    .await;
+
+    assert_eq!(dispatched, 1);
 }
 
 #[tokio::test]
@@ -1601,6 +1782,8 @@ async fn speculative_v2_download_extracts_object() {
         "1.0.0",
         &url,
         Some(&expected_sri),
+        None,
+        None,
         &None,
         ManagedInstallAccounting,
     )
@@ -1616,6 +1799,226 @@ async fn speculative_v2_download_extracts_object() {
         "speculation must populate the virtual-store object store"
     );
     assert_eq!(semaphore.available_permits(), 1);
+}
+
+#[tokio::test]
+async fn large_speculation_starts_extraction_before_the_response_body_finishes() {
+    assert_large_speculation_streams(SpeculationStreamMode::Enabled, false).await;
+}
+
+#[tokio::test]
+async fn cancelling_large_speculation_releases_capacity_after_stream_cleanup() {
+    assert_large_speculation_streams(SpeculationStreamMode::Enabled, true).await;
+}
+
+#[tokio::test]
+async fn speculative_stream_lane_loser_spools_the_same_response() {
+    assert_large_speculation_streams(SpeculationStreamMode::Claimed, false).await;
+}
+
+#[tokio::test]
+async fn speculation_spools_when_streaming_is_disabled() {
+    assert_large_speculation_streams(SpeculationStreamMode::Disabled, false).await;
+}
+
+#[tokio::test]
+async fn speculative_v3_object_spools_when_offered_a_streaming_lane() {
+    assert_large_speculation_streams(SpeculationStreamMode::V3, false).await;
+}
+
+#[tokio::test]
+async fn medium_speculation_spools_then_streams_with_canonical_sha512_integrity() {
+    assert_large_speculation_streams(SpeculationStreamMode::Medium, false).await;
+}
+
+#[tokio::test]
+async fn medium_speculation_integrity_mismatch_releases_capacity_and_staging() {
+    assert_large_speculation_streams(SpeculationStreamMode::MediumMismatch, false).await;
+}
+
+#[derive(Clone, Copy)]
+enum SpeculationStreamMode {
+    Enabled,
+    Claimed,
+    Disabled,
+    V3,
+    Medium,
+    MediumMismatch,
+}
+
+async fn assert_large_speculation_streams(mode: SpeculationStreamMode, cancel: bool) {
+    use lpm_common::integrity::{HashAlgorithm, Integrity};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    let body = build_test_tarball();
+    let integrity = Integrity::from_bytes(HashAlgorithm::Sha512, &body).to_string();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let body_started = Arc::new(tokio::sync::Notify::new());
+    let server_resume = Arc::new(tokio::sync::Notify::new());
+    let started = Arc::clone(&body_started);
+    let resume = Arc::clone(&server_resume);
+    let server = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let mut request = [0u8; 4096];
+        let _ = socket.read(&mut request).await;
+        socket
+            .write_all(
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+        let split = body.len() / 2;
+        socket.write_all(&body[..split]).await.unwrap();
+        started.notify_one();
+        resume.notified().await;
+        let _ = socket.write_all(&body[split..]).await;
+    });
+    let root = tempfile::tempdir().unwrap();
+    let store = PackageStore::at(root.path());
+    let store_path = root.path().join("objects-store");
+    let store_v2 = if matches!(mode, SpeculationStreamMode::V3) {
+        lpm_store::v2::Store::at_v3(&store_path)
+    } else {
+        lpm_store::v2::Store::at(&store_path)
+    };
+    let inspect_store = store_v2.clone();
+    let client = Arc::new(RegistryClient::new().with_npm_registry_url(format!("http://{address}")));
+    let route = RouteTable::from_mode_only(lpm_registry::RouteMode::Direct);
+    let downloads = Arc::new(Semaphore::new(1));
+    let capacity = Arc::new(Semaphore::new(4));
+    let limiter = Some(fetch_extract_limiter_with_semaphore(
+        Arc::clone(&capacity),
+        4,
+    ));
+    let coord = Arc::new(FetchCoordinator::default());
+    let key = registry_install_pkg_key("test-tarball-pkg", "1.0.0", &route, client.as_ref());
+    let key_lock = coord.lock_for(key).await;
+    let medium = matches!(
+        mode,
+        SpeculationStreamMode::Medium | SpeculationStreamMode::MediumMismatch
+    );
+    let mismatch = matches!(mode, SpeculationStreamMode::MediumMismatch);
+    let expected_integrity = if mismatch {
+        Integrity::from_bytes(HashAlgorithm::Sha256, b"different archive").to_string()
+    } else if medium {
+        Integrity::from_bytes(HashAlgorithm::Sha256, &build_test_tarball()).to_string()
+    } else {
+        integrity.clone()
+    };
+    let download_slots = Arc::clone(&downloads);
+    let fetch = tokio::spawn(async move {
+        let lane = V2StreamingLane::default();
+        if matches!(mode, SpeculationStreamMode::Claimed) {
+            assert!(lane.try_claim());
+        }
+        let offered_lane = (!matches!(mode, SpeculationStreamMode::Disabled)).then_some(&lane);
+        let result = speculative_download_and_store(
+            &client,
+            &route,
+            &store,
+            Some(&store_v2),
+            &download_slots,
+            None,
+            &coord,
+            "test-tarball-pkg",
+            "1.0.0",
+            &format!("http://{address}/large.tgz"),
+            Some(&expected_integrity),
+            std::num::NonZeroU64::new(if medium {
+                16 * 1024 * 1024
+            } else {
+                LARGE_V2_STREAMING_OBJECT_BYTES
+            }),
+            offered_lane,
+            &limiter,
+            ManagedInstallAccounting,
+        )
+        .await;
+        if medium {
+            assert!(
+                lane.try_claim(),
+                "medium files must leave the live lane free"
+            );
+        }
+        result
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(2), body_started.notified())
+        .await
+        .unwrap();
+    let starts_before_eof = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        while capacity.available_permits() == 4 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .is_ok();
+    assert!(
+        inspect_store
+            .reusable_object_dir(&integrity)
+            .unwrap()
+            .is_none()
+    );
+    if cancel {
+        fetch.abort();
+        assert!(fetch.await.unwrap_err().is_cancelled());
+        let _guard = tokio::time::timeout(std::time::Duration::from_secs(2), key_lock.lock())
+            .await
+            .expect("cancelled extraction must release the package lock after cleanup");
+        assert_eq!(capacity.available_permits(), 4);
+        assert_eq!(downloads.available_permits(), 1);
+        let objects_root = store_path.join("objects");
+        assert!(
+            !objects_root.exists() || std::fs::read_dir(objects_root).unwrap().next().is_none()
+        );
+        assert!(
+            inspect_store
+                .reusable_object_dir(&integrity)
+                .unwrap()
+                .is_none()
+        );
+    } else {
+        server_resume.notify_one();
+        let outcome = tokio::time::timeout(std::time::Duration::from_secs(5), fetch)
+            .await
+            .unwrap()
+            .unwrap();
+        if mismatch {
+            assert!(matches!(outcome, Err(LpmError::IntegrityMismatch { .. })));
+            assert!(
+                inspect_store
+                    .reusable_object_dir(&integrity)
+                    .unwrap()
+                    .is_none()
+            );
+            let objects_root = store_path.join("objects");
+            assert!(
+                !objects_root.exists() || std::fs::read_dir(objects_root).unwrap().next().is_none()
+            );
+        } else {
+            assert_eq!(outcome.unwrap(), SpeculativeFetchOutcome::Stored);
+            assert!(
+                inspect_store
+                    .reusable_object_dir(&integrity)
+                    .unwrap()
+                    .is_some()
+            );
+        }
+        assert_eq!(capacity.available_permits(), 4);
+        assert_eq!(downloads.available_permits(), 1);
+    }
+    server_resume.notify_one();
+    server.await.unwrap();
+    assert_eq!(
+        starts_before_eof,
+        matches!(mode, SpeculationStreamMode::Enabled),
+        "only an eligible lane winner may begin extraction before download EOF"
+    );
 }
 
 #[test]
