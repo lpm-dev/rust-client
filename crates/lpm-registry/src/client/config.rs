@@ -74,6 +74,9 @@ impl RegistryClient {
     pub(super) fn deserialize_cached_metadata_as<T: serde::de::DeserializeOwned>(
         data: &[u8],
     ) -> Option<T> {
+        if let Some(json) = data.strip_prefix(&[super::cache::METADATA_CACHE_JSON_MARKER]) {
+            return serde_json::from_slice(json).ok();
+        }
         rmp_serde::from_slice(data)
             .or_else(|_| serde_json::from_slice(data))
             .ok()
