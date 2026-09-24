@@ -10,6 +10,20 @@ import tlsClient from 'node:tls';
 import vm from 'node:vm';
 import { validateAuthority, requestKey, createReplayProxy } from './replay-proxy.mjs';
 import { benchmarkTls } from './tls.mjs';
+import { runPhase } from './phase.mjs';
+
+test('request phases distinguish each scenario, variant, sample, and diagnostic', () => {
+  const phases = [];
+  for (const kind of ['sample', 'diagnostic']) {
+    for (const scenario of ['first-install', 'ci-cold-cache', 'ci-warm-cache']) {
+      for (const variant of ['baseline', 'candidate', 'bun']) {
+        for (const index of [1, 2]) phases.push(runPhase(kind, scenario, variant, index));
+      }
+    }
+  }
+  assert.equal(new Set(phases).size, phases.length);
+  assert(phases.filter(phase => phase.startsWith('sample-')).length === 18);
+});
 
 test('CONNECT accepts only the npm registry TLS authority', () => {
   validateAuthority('registry.npmjs.org:443', true);

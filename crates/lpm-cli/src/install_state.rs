@@ -11,22 +11,14 @@ use std::time::UNIX_EPOCH;
 use lpm_store::SecurityAnalysisPolicy;
 use lpm_store::v2::{ObjectIntegrityPolicy, PlatformTuple};
 
-/// Atomically write a small state file with owner-only perms (0o600 on Unix).
-///
-/// `install-hash` is the freshness short-circuit `lpm dev` and the
-/// install fast lane consult to decide whether to re-link. On shared
-/// hosts a default-umask (0o644) write lets any local uid forge or
-/// truncate the file and either trigger a re-install loop or coerce
-/// the fast lane to short-circuit a stale tree as fresh. Atomic
-/// rename + 0o600 closes both shapes; on non-Unix the rename is
-/// still atomic but the perms knob is a no-op.
+/// Atomically publish rebuildable install state with owner-only Unix permissions.
+/// Missing or invalid state requires validation again; recovery records retain
+/// their separate durability guarantees.
 fn write_state_file_owner_only(path: &Path, content: &[u8]) -> std::io::Result<()> {
     lpm_common::write_file_atomic_with_options(
         path,
         content,
-        lpm_common::AtomicWriteOptions::new()
-            .unix_mode(0o600)
-            .sync_file(),
+        lpm_common::AtomicWriteOptions::new().unix_mode(0o600),
     )
 }
 
@@ -2355,6 +2347,103 @@ mod tests {
         write_install_hash(p, "second", lpm_linker::LinkerMode::Hoisted).unwrap();
         let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600, "rewrite must restore 0o600, got {:#o}", mode);
+    }
+
+    #[test]
+    fn state_publication_replaces_complete_content_without_leaving_temporary_files() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("install-hash");
+        write_state_file_owner_only(&path, b"previous complete state").unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"previous complete state");
+        let replacement = vec![b'x'; 8192];
+        write_state_file_owner_only(&path, &replacement).unwrap();
+        assert_eq!(fs::read(&path).unwrap(), replacement);
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn state_publication_replaces_the_file_without_mutating_open_readers() {
+        use std::io::Read;
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("install-hash");
+        write_state_file_owner_only(&path, b"previous complete state").unwrap();
+        let mut previous = fs::File::open(&path).unwrap();
+        let replacement = vec![b'x'; 8192];
+        write_state_file_owner_only(&path, &replacement).unwrap();
+        let mut retained = Vec::new();
+        previous.read_to_end(&mut retained).unwrap();
+        assert_eq!(retained, b"previous complete state");
+        assert_eq!(fs::read(&path).unwrap(), replacement);
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn absent_or_invalid_state_cache_requires_install_validation() {
+        let dir = setup_up_to_date_project_v2();
+        let project = dir.path();
+        let _home = scoped_home_for(project);
+        assert!(check_install_state(project).up_to_date);
+        let path = project.join(".lpm/install-hash");
+        let saved = fs::read(&path).unwrap();
+        for content in [b"".as_slice(), b"\xff", &saved[..8]] {
+            write_state_file_owner_only(&path, content).unwrap();
+            assert!(!check_install_state(project).up_to_date);
+        }
+        fs::remove_file(path).unwrap();
+        assert!(!check_install_state(project).up_to_date);
+    }
+
+    #[test]
+    fn local_source_sentinel_is_published_empty_and_removed_when_unneeded() {
+        let dir = TempDir::new().unwrap();
+        let project = dir.path();
+        fs::write(
+            project.join("package.json"),
+            r#"{"dependencies":{"local":"file:../local"}}"#,
+        )
+        .unwrap();
+        fs::write(project.join("lpm.lock"), "").unwrap();
+        write_install_hash(project, "hash", lpm_linker::LinkerMode::Isolated).unwrap();
+        let sentinel = project.join(".lpm/has-local-sources");
+        assert_eq!(fs::read(&sentinel).unwrap(), b"");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(&sentinel).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+        fs::write(project.join("package.json"), r#"{"dependencies":{}}"#).unwrap();
+        write_install_hash(project, "hash", lpm_linker::LinkerMode::Isolated).unwrap();
+        assert!(!sentinel.exists());
+    }
+
+    #[test]
+    fn unchanged_runtime_fingerprint_does_not_republish_the_state_file() {
+        let dir = TempDir::new().unwrap();
+        let project = dir.path();
+        fs::create_dir(project.join(".lpm")).unwrap();
+        let path = project.join(".lpm/install-hash");
+        let fingerprint = "a".repeat(64);
+        let original = format!("hash\ne:1:22.0.0\nn:{fingerprint}\n");
+        write_state_file_owner_only(&path, original.as_bytes()).unwrap();
+        let old = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1234);
+        fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
+        assert!(
+            !refresh_install_hash_node_runtime_fingerprint(project, "1:22.0.0", Some(&fingerprint))
+                .unwrap()
+        );
+        assert_eq!(fs::metadata(&path).unwrap().modified().unwrap(), old);
+        assert_eq!(fs::read_to_string(&path).unwrap(), original);
+        assert!(!refresh_install_hash_node_runtime_fingerprint(project, "1:23.0.0", None).unwrap());
+        assert_eq!(fs::metadata(&path).unwrap().modified().unwrap(), old);
     }
 
     #[test]
