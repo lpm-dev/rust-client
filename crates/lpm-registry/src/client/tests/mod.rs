@@ -308,7 +308,7 @@ fn cached(client: reqwest::Client) -> CachedClient {
     CachedClient {
         policy_metadata_client: client.clone(),
         client,
-        manual_redirect_client,
+        request_lanes: std::sync::Arc::from([manual_redirect_client]),
         identity_fp: None,
     }
 }
