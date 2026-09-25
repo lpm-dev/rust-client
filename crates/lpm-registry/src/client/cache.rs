@@ -1612,6 +1612,7 @@ mod metadata_cache_schema_tests {
             distribution_mode: _,
             package_type: _,
             latest_version: _,
+            latest_hint: _,
             ecosystem: _,
         } = metadata;
     }

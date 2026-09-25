@@ -1355,7 +1355,7 @@ async fn run_with_options_under_store_lock(
         resolve_ms,
         used_lockfile,
         platform_skipped,
-        latest_stable_versions,
+        latest_versions,
         applied_overrides,
         peer_conflicts,
         peer_warnings,
@@ -2090,7 +2090,7 @@ async fn run_with_options_under_store_lock(
             v2_link_task_timings,
             slow_package_timings: &slow_package_timings,
             pre_install_direct_versions: &pre_install_direct_versions,
-            latest_stable_versions: &latest_stable_versions,
+            latest_versions: &latest_versions,
             is_add_invocation,
             verbose,
         });

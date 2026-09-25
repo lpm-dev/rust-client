@@ -63,6 +63,9 @@ fn parse_metadata_to_cache_info_inner(
     platform_metadata_complete: bool,
 ) -> CachedPackageInfo {
     let version_count = metadata.versions.len();
+    let latest_version_hint = metadata
+        .latest_version_hint()
+        .and_then(|version| NpmVersion::parse(version).ok());
     let latest_version = metadata
         .latest_version_tag()
         .and_then(|version| NpmVersion::parse(version).ok());
@@ -79,7 +82,7 @@ fn parse_metadata_to_cache_info_inner(
         .versions
         .iter()
         .map(|(version, metadata)| project_borrowed_version(version, metadata));
-    parse_projected_metadata(
+    let mut info = parse_projected_metadata(
         metadata.modified.clone(),
         latest_version,
         dist_tags,
@@ -89,7 +92,9 @@ fn parse_metadata_to_cache_info_inner(
         trust_metadata_complete,
         versions_complete,
         platform_metadata_complete,
-    )
+    );
+    info.latest_version_hint = latest_version_hint;
+    info
 }
 
 fn parse_owned_metadata_to_cache_info_inner(
@@ -98,6 +103,9 @@ fn parse_owned_metadata_to_cache_info_inner(
     versions_complete: bool,
     platform_metadata_complete: bool,
 ) -> CachedPackageInfo {
+    let latest_version_hint = metadata
+        .latest_version_hint()
+        .and_then(|version| NpmVersion::parse(version).ok());
     let latest_version = metadata
         .latest_version_tag()
         .and_then(|version| NpmVersion::parse(version).ok());
@@ -120,7 +128,7 @@ fn parse_owned_metadata_to_cache_info_inner(
     let projected_versions = versions
         .into_iter()
         .map(|(version, metadata)| project_owned_version(version, metadata));
-    parse_projected_metadata(
+    let mut info = parse_projected_metadata(
         modified,
         latest_version,
         dist_tags,
@@ -130,7 +138,9 @@ fn parse_owned_metadata_to_cache_info_inner(
         trust_metadata_complete,
         versions_complete,
         platform_metadata_complete,
-    )
+    );
+    info.latest_version_hint = latest_version_hint;
+    info
 }
 
 struct ProjectedVersion {

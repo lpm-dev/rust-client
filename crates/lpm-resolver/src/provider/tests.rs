@@ -2473,3 +2473,26 @@ fn cache_refresh_from_shared_walker_recomputes_available_versions() {
     );
     assert_eq!(provider.available_versions(&pkg).len(), 2);
 }
+
+#[test]
+fn metadata_parsers_keep_merged_selection_separate_from_latest_hints() {
+    for hint in [None, Some("2.0.0"), Some("2.0.0-beta.1")] {
+        let mut metadata: lpm_registry::PackageMetadata = serde_json::from_value(serde_json::json!({
+            "name":"hint-package","dist-tags":{"latest":"3.0.0"},
+            "versions":{"1.0.0":{"name":"hint-package","version":"1.0.0"},"3.0.0":{"name":"hint-package","version":"3.0.0"}}
+        })).unwrap();
+        metadata.latest_hint = lpm_registry::LatestVersionHint::Merged(hint.map(str::to_owned));
+        let borrowed = super::parse::parse_metadata_to_cache_info(&metadata);
+        let owned = super::parse::parse_owned_metadata_to_cache_info(metadata);
+        for info in [&borrowed, &owned] {
+            assert_eq!(
+                info.latest_version,
+                Some(NpmVersion::parse("3.0.0").unwrap())
+            );
+            assert_eq!(
+                info.latest_version_hint,
+                hint.map(|v| NpmVersion::parse(v).unwrap())
+            );
+        }
+    }
+}

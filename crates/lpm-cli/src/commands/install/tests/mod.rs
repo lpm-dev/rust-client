@@ -171,6 +171,7 @@ fn make_metadata(versions: &[&str], latest: &str) -> lpm_registry::PackageMetada
         distribution_mode: None,
         package_type: None,
         latest_version: Some(latest.to_string()),
+        latest_hint: Default::default(),
         ecosystem: Some("swift".to_string()),
     }
 }

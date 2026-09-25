@@ -60,6 +60,11 @@ pub(crate) fn merge_cached_package_info(
     existing: &CachedPackageInfo,
     incoming: &CachedPackageInfo,
 ) -> CachedPackageInfo {
+    let latest_version_hint = if incoming.latest_version.is_some() {
+        incoming.latest_version_hint.clone()
+    } else {
+        existing.latest_version_hint.clone()
+    };
     let mut covered_ranges = existing.covered_ranges.clone();
     covered_ranges.extend(incoming.covered_ranges.iter().cloned());
     let mut workspace_versions = existing.workspace_versions.clone();
@@ -115,6 +120,7 @@ pub(crate) fn merge_cached_package_info(
         merged.versions_complete = versions_complete;
         merged.trust_metadata_complete = trust_metadata_complete;
         merged.platform_metadata_complete = platform_metadata_complete;
+        merged.latest_version_hint = latest_version_hint;
         merged.preferred_latest = merged_preferred_latest(existing, incoming, &merged);
         return merged;
     }
@@ -164,6 +170,7 @@ pub(crate) fn merge_cached_package_info(
         }
     }
     let mut merged = builder.finish();
+    merged.latest_version_hint = latest_version_hint;
     merged.preferred_latest = merged_preferred_latest(existing, incoming, &merged);
     merged
 }
@@ -771,6 +778,59 @@ mod preferred_provenance_tests {
         }))
         .unwrap();
         super::super::parse::parse_owned_partial_metadata_to_cache_info(metadata)
+    }
+
+    #[test]
+    fn equivalent_cache_facts_update_latest_hint_authority() {
+        let advertised = partial("2.0.0");
+        let mut synthesized = advertised.clone();
+        synthesized.latest_version_hint = None;
+        let merged = merge_cached_package_info(&advertised, &synthesized);
+        assert!(Arc::ptr_eq(&advertised.versions, &merged.versions));
+        assert!(merged.latest_version_hint.is_none());
+        let restored = merge_cached_package_info(&synthesized, &advertised);
+        assert_eq!(restored.latest_version_hint, advertised.latest_version_hint);
+    }
+
+    #[test]
+    fn rebuilt_cache_facts_take_hint_from_the_selected_latest_source() {
+        let advertised = partial("1.0.0");
+        let mut synthesized = partial("2.0.0");
+        synthesized.latest_version_hint = None;
+        let merged = merge_cached_package_info(&advertised, &synthesized);
+        assert_eq!(merged.latest_version, synthesized.latest_version);
+        assert!(merged.latest_version_hint.is_none());
+        let mut exact = partial("1.0.0");
+        exact.latest_version = None;
+        exact.latest_version_hint = None;
+        exact.modified = Some("2026-01-01T00:00:00Z".into());
+        let merged = merge_cached_package_info(&advertised, &exact);
+        assert_eq!(merged.latest_version_hint, advertised.latest_version_hint);
+    }
+
+    #[test]
+    fn shared_manifest_cores_and_reconstruction_keep_latest_hints() {
+        let mut advertised = partial("1.0.0");
+        let mut synthesized = advertised.clone();
+        synthesized.latest_version_hint = None;
+        assert!(advertised.share_manifest_core_from_if_equivalent(&synthesized));
+        assert_eq!(
+            advertised.latest_version_hint,
+            Some(NpmVersion::parse("1.0.0").unwrap())
+        );
+        assert!(
+            synthesized.update_manifest_version("1.0.0", |manifest| manifest.node_engine =
+                Some(">=22".into()))
+        );
+        assert!(synthesized.latest_version_hint.is_none());
+        assert!(
+            advertised.update_manifest_version("1.0.0", |manifest| manifest.node_engine =
+                Some(">=22".into()))
+        );
+        assert_eq!(
+            advertised.latest_version_hint,
+            Some(NpmVersion::parse("1.0.0").unwrap())
+        );
     }
 
     #[test]
