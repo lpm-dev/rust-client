@@ -289,7 +289,7 @@ impl FetchOverlapJoin {
 
     pub(super) async fn drain(mut self) -> Result<FetchOverlapDrain, LpmError> {
         let start = Instant::now();
-        let handle = self.handle.take().ok_or_else(|| {
+        let handle = self.handle.as_mut().ok_or_else(|| {
             LpmError::Registry("fetch overlap dispatcher was already drained".into())
         })?;
         let mut drain = handle
@@ -907,6 +907,33 @@ async fn fetch_selected_package(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn cancelling_fetch_overlap_drain_aborts_its_pending_task() {
+        let cancelled = tokio_util::sync::CancellationToken::new();
+        let guard = cancelled.clone().drop_guard();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let handle = tokio::spawn(async move {
+            let _guard = guard;
+            let _ = started_tx.send(());
+            futures::future::pending().await
+        });
+        let abort = handle.abort_handle();
+        let join = FetchOverlapJoin {
+            handle: Some(handle),
+            workspace_shared: false,
+        };
+        started_rx.await.unwrap();
+        let mut drain = Box::pin(join.drain());
+        assert!(futures::poll!(drain.as_mut()).is_pending());
+        drop(drain);
+        let stopped =
+            tokio::time::timeout(std::time::Duration::from_secs(1), cancelled.cancelled())
+                .await
+                .is_ok();
+        abort.abort();
+        assert!(stopped, "cancelling drain must retain abort ownership");
+    }
 
     fn workspace_fetch_package(integrity: &str, tarball_url: &str) -> InstallPackage {
         InstallPackage {

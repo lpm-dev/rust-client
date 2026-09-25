@@ -515,6 +515,8 @@ pub(in crate::commands::install) async fn run_online_resolution_phase(
                         )
                     };
 
+                    let walker_handle = tokio_util::task::AbortOnDropHandle::new(walker_handle);
+
                     let (dispatcher_handle, dispatcher_counters) = spawn_speculation_dispatcher(
                         spec_rx,
                         arc_client.clone(),

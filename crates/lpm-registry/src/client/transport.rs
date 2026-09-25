@@ -713,18 +713,37 @@ impl RegistryClient {
             .await
     }
 
-    #[tracing::instrument(
-        target = "lpm_install_timeline",
-        level = "trace",
-        name = "http_request",
-        skip_all
-    )]
     pub(super) async fn send_request_with_retry_and_npmrc_auth(
         &self,
         request: reqwest::Request,
         client_override: Option<reqwest::Client>,
         auth: Option<&crate::npmrc::RegistryAuth>,
     ) -> Result<reqwest::Response, LpmError> {
+        self.send_request_with_retry_and_client_provider(
+            request,
+            client_override,
+            auth,
+            self.http.as_ref(),
+        )
+        .await
+    }
+
+    #[tracing::instrument(
+        target = "lpm_install_timeline",
+        level = "trace",
+        name = "http_request",
+        skip_all
+    )]
+    pub(super) async fn send_request_with_retry_and_client_provider<P>(
+        &self,
+        request: reqwest::Request,
+        client_override: Option<reqwest::Client>,
+        auth: Option<&crate::npmrc::RegistryAuth>,
+        provider: &P,
+    ) -> Result<reqwest::Response, LpmError>
+    where
+        P: lpm_http::ReplayableHttpClientProvider<Error = LpmError> + Sync,
+    {
         self.validate_base_url()?;
         self.validate_request_url(request.url())?;
 
@@ -750,7 +769,7 @@ impl RegistryClient {
                     &authorization_allowed as &(dyn Fn(&reqwest::Url) -> bool + Send + Sync)
                 });
                 match lpm_http::send_with_replayable_redirects_and_authorization_scope(
-                    self.http.as_ref(),
+                    provider,
                     req,
                     None,
                     authorization_scope,
