@@ -818,10 +818,10 @@ pub(in crate::commands::install) async fn metadata_for_package(
     let canonical = lpm_resolver::CanonicalKey::from_dep_name(&name);
     let version_doc_policy_eligible = !resolver_policy.release_age_applies_to_package(&canonical)
         && !resolver_policy.requires_trust_history();
-    let version_doc_eligible = matches!(
-        route_table.route_for_package(&name),
-        lpm_registry::UpstreamRoute::NpmDirect
-    ) && matches!(context.range_shape, MetadataRangeShape::Exact)
+    let version_doc_eligible = client
+        .public_npm_access(&route_table.route_for_package(&name))
+        .is_some()
+        && matches!(context.range_shape, MetadataRangeShape::Exact)
         && version_doc_policy_eligible;
     context.version_doc_eligible = version_doc_eligible;
     metadata_stats.record_range_call(&context);

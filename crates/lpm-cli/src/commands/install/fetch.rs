@@ -3583,9 +3583,9 @@ pub(super) fn spawn_speculation_dispatcher(
                     client_spec.as_ref(),
                 );
 
-                let skip_auth_bearing_custom_speculation = matches!(
-                    route_table_spec.route_for_package(&name),
-                    UpstreamRoute::Custom { auth: Some(_), .. }
+                let skip_private_registry_speculation = credentialed_private_registry(
+                    &route_table_spec.route_for_package(&name),
+                    &client_spec,
                 );
 
                 let already_present = if let (Some(store_v2), Some(sri)) =
@@ -3615,12 +3615,9 @@ pub(super) fn spawn_speculation_dispatcher(
                     push_speculative_dependencies(meta, &version, depth + 1, work_queue);
                 }
 
-                // Skip tarball speculation for auth-bearing custom
-                // registries. The real fetch loop already owns
-                // correctness and user-facing failures; speculative
-                // requests here only duplicate authenticated traffic
-                // against private mirrors.
-                if skip_auth_bearing_custom_speculation {
+                // The real fetch loop already owns correctness and
+                // user-facing failures for private registries.
+                if skip_private_registry_speculation {
                     skipped_auth_c.fetch_add(1, Relaxed);
                     return;
                 }
@@ -4261,6 +4258,18 @@ pub(super) async fn resolve_tarball_url(
     Ok(ResolvedRegistryTarballUrl { url })
 }
 
+/// Whether `route` carries a credential to a registry other than the public
+/// npm registry. Speculative and early tarball requests to such a private
+/// mirror would only duplicate authenticated traffic, so installs leave those
+/// downloads to the authoritative fetch.
+pub(super) fn credentialed_private_registry(
+    route: &UpstreamRoute,
+    client: &RegistryClient,
+) -> bool {
+    matches!(route, UpstreamRoute::Custom { auth: Some(_), .. })
+        && client.public_npm_access(route).is_none()
+}
+
 /// Invalidate metadata through the package's configured route so custom
 /// registries use their own cache namespace and authentication context.
 pub(super) fn invalidate_metadata_routed(
@@ -4269,15 +4278,11 @@ pub(super) fn invalidate_metadata_routed(
     name: &str,
     version: &str,
 ) {
-    match route_table.route_for_package(name) {
-        UpstreamRoute::Custom { target, auth } => {
-            client.invalidate_custom_metadata_cache(&target.base_url, name, auth.as_deref());
-        }
-        _ => {
-            client.invalidate_metadata_cache(name);
-            client.invalidate_npm_version_metadata_cache(name, version);
-        }
-    }
+    client.invalidate_routed_metadata_cache(
+        &route_table.route_for_package(name),
+        name,
+        Some(version),
+    );
 }
 
 fn sanitized_source_identity(package: &InstallPackage) -> String {

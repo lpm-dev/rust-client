@@ -128,3 +128,86 @@ async fn latest_alias_metadata_hydrates_history_for_an_older_required_peer() {
         std::collections::BTreeSet::from(["1.0.0".into(), "2.0.0".into()])
     );
 }
+
+#[tokio::test]
+async fn authenticated_public_npm_routes_use_the_direct_npm_documents() {
+    use wiremock::matchers::{header, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    const ABBREVIATED: &str = "application/vnd.npm.install-v1+json";
+    let server = MockServer::start().await;
+    let authorized = || header("authorization", "Bearer npm-token");
+    let mut latest = version_document_json("ranged", "1.4.0", &[]);
+    latest["dist"]["integrity"] = serde_json::json!(format!("sha512-{}==", "A".repeat(86)));
+    Mock::given(method("GET"))
+        .and(path("/ranged/latest"))
+        .and(authorized())
+        .respond_with(ResponseTemplate::new(200).set_body_json(latest))
+        .expect(1)
+        .mount(&server)
+        .await;
+    // History raced against the latest document never answers in time.
+    Mock::given(method("GET"))
+        .and(path("/ranged"))
+        .and(authorized())
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(serde_json::json!({}))
+                .set_delay(std::time::Duration::from_secs(30)),
+        )
+        .expect(..=1)
+        .mount(&server)
+        .await;
+    // Exact pins select their manifest from full history.
+    Mock::given(method("GET"))
+        .and(path("/pinned"))
+        .and(header("accept", "application/json"))
+        .and(authorized())
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(metadata_json_version("pinned", "1.2.3", &[])),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/pinned"))
+        .and(header("accept", ABBREVIATED))
+        .respond_with(ResponseTemplate::new(500))
+        .expect(0)
+        .mount(&server)
+        .await;
+    let address = server.address();
+    let npmrc = lpm_registry::NpmrcConfig::parse(
+        &format!(
+            "registry={}/\n//{}:{}/:_authToken=npm-token\n",
+            server.uri(),
+            address.ip(),
+            address.port()
+        ),
+        "test",
+        &|_| None,
+    );
+
+    let result = resolve_greedy_fused(
+        Arc::new(
+            RegistryClient::new()
+                .with_npm_registry_url(server.uri())
+                .with_cache_dir(None),
+        ),
+        HashMap::from([
+            ("ranged".to_owned(), "^1.0.0".to_owned()),
+            ("pinned".to_owned(), "1.2.3".to_owned()),
+        ]),
+        OverrideSet::empty(),
+        RouteTable::new(RouteMode::Direct, npmrc).expect("valid npmrc"),
+        8,
+        None,
+        true,
+    )
+    .await
+    .expect("authenticated public npm metadata resolves");
+
+    assert_eq!(result.packages.len(), 2);
+    assert!(!result.cache[&CanonicalKey::npm("ranged")].versions_complete);
+    server.verify().await;
+}

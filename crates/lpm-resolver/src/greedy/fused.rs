@@ -5,7 +5,7 @@ use super::manifest::{
     ensure_policy_metadata_for_cached_manifest, exact_metadata_fast_path_eligible,
     fetch_metadata_for_resolver_with_trace_detail, fetch_preferred_metadata_for_resolver,
     parse_cached_metadata_for_resolver, parse_fetched_metadata, parse_partial_fetched_metadata,
-    publish_direct_base_fact, try_fetch_exact_metadata_for_resolver,
+    publish_direct_base_fact, reads_public_npm, try_fetch_exact_metadata_for_resolver,
 };
 use super::peer::{drain_peer_requirements_one_pass, pick_peer_prefetch_candidates};
 use super::prelude::*;
@@ -788,6 +788,7 @@ impl MetadataFetchScheduler {
                 let key = MetadataFetchKey::for_request(
                     canonical.clone(),
                     exact_version.clone(),
+                    dispatch.client,
                     dispatch.route_table,
                     dispatch.policy,
                 );
@@ -815,7 +816,13 @@ impl MetadataFetchScheduler {
         {
             tracing::event!(name: "metadata_memory_hit", target: "lpm_install_timeline", parent: &timeline, tracing::Level::TRACE, {});
             self.ready.push_back((
-                MetadataFetchKey::for_request(canonical, exact_version, &route_table, &policy),
+                MetadataFetchKey::for_request(
+                    canonical,
+                    exact_version,
+                    &client,
+                    &route_table,
+                    &policy,
+                ),
                 Ok(fetched),
             ));
             return;
@@ -836,6 +843,7 @@ impl MetadataFetchScheduler {
         };
         let exact_document_lane = pending.exact_version.is_some()
             && exact_metadata_fast_path_eligible(
+                &pending.client,
                 &pending.route_table,
                 &pending.canonical,
                 &pending.policy,
@@ -872,6 +880,7 @@ impl MetadataFetchScheduler {
         }
         let exact_document_lane = pending.exact_version.is_some()
             && exact_metadata_fast_path_eligible(
+                &pending.client,
                 &pending.route_table,
                 &pending.canonical,
                 &pending.policy,
@@ -965,14 +974,7 @@ impl MetadataFetchScheduler {
             } else {
                 let _permit = permit;
                 if pending.exact_version.is_some()
-                    && matches!(
-                        &pending.canonical,
-                        CanonicalKey::Npm { name }
-                            if matches!(
-                                pending.route_table.route_for_package(name),
-                                UpstreamRoute::NpmDirect
-                            )
-                    )
+                    && reads_public_npm(&pending.client, &pending.route_table, &pending.canonical)
                     && (pending.policy.requires_trust_history()
                         || pending
                             .policy
@@ -995,6 +997,7 @@ impl MetadataFetchScheduler {
                 MetadataFetchKey::for_request(
                     pending.canonical,
                     pending.exact_version,
+                    &pending.client,
                     &pending.route_table,
                     &pending.policy,
                 ),
@@ -2179,7 +2182,12 @@ pub async fn resolve_greedy_fused_with_cache_options_policy_and_selected_events_
                         .overrides
                         .may_match_package(&edge.canonical.to_string());
                 let preferred_covers_range = state.overrides.is_empty()
-                    && exact_metadata_fast_path_eligible(&route_table, &edge.canonical, &policy)
+                    && exact_metadata_fast_path_eligible(
+                        &client,
+                        &route_table,
+                        &edge.canonical,
+                        &policy,
+                    )
                     && info_arc.preferred_latest_satisfies(&edge.range);
                 if (info_arc.needs_metadata_for_range(&edge.range) && !preferred_covers_range)
                     || override_needs_history
@@ -2193,6 +2201,7 @@ pub async fn resolve_greedy_fused_with_cache_options_policy_and_selected_events_
                     let request = MetadataFetchKey::for_request(
                         canonical.clone(),
                         exact_version.clone(),
+                        &client,
                         &route_table,
                         &policy,
                     );
@@ -2200,9 +2209,8 @@ pub async fn resolve_greedy_fused_with_cache_options_policy_and_selected_events_
                     let new_fetch = ordered_metadata.start_request(&request)?;
                     if new_fetch && trace_metadata_fetches {
                         state.work_stats.record_metadata_edge_miss(
-                            &canonical,
                             &edge.range,
-                            &route_table,
+                            reads_public_npm(&client, &route_table, &canonical),
                         );
                         if let Some(counted_metadata_edge_misses) =
                             counted_metadata_edge_misses.as_mut()
@@ -2277,6 +2285,7 @@ pub async fn resolve_greedy_fused_with_cache_options_policy_and_selected_events_
                             shared_cache: &shared_cache,
                             shared_fact_cache: shared_fact_cache.as_ref(),
                             route_table: &route_table,
+                            client: &client,
                             counted_metadata_edge_misses: counted_metadata_edge_misses.as_mut(),
                             trace_metadata_fetches,
                             spec_tx: spec_tx.as_ref(),
@@ -2356,22 +2365,24 @@ pub async fn resolve_greedy_fused_with_cache_options_policy_and_selected_events_
             let request = MetadataFetchKey::for_request(
                 canonical.clone(),
                 exact_version.clone(),
+                &client,
                 &route_table,
                 &policy,
             );
             let request = ordered_metadata.coalesce_request(request);
             let new_fetch = ordered_metadata.start_request(&request)?;
             if new_fetch && trace_metadata_fetches {
-                state
-                    .work_stats
-                    .record_metadata_edge_miss(&canonical, &edge.range, &route_table);
+                state.work_stats.record_metadata_edge_miss(
+                    &edge.range,
+                    reads_public_npm(&client, &route_table, &canonical),
+                );
                 if let Some(counted_metadata_edge_misses) = counted_metadata_edge_misses.as_mut() {
                     counted_metadata_edge_misses.insert(request.clone());
                 }
             }
             let preferred_range = (exact_version.is_none()
                 && state.overrides.is_empty()
-                && exact_metadata_fast_path_eligible(&route_table, &canonical, &policy)
+                && exact_metadata_fast_path_eligible(&client, &route_table, &canonical, &policy)
                 && edge.range.dist_tag().is_none_or(|tag| tag == "latest"))
             .then(|| edge.range.clone());
             parked.entry(request).or_default().push(edge);
@@ -2528,6 +2539,7 @@ pub async fn resolve_greedy_fused_with_cache_options_policy_and_selected_events_
                                     shared_cache: &shared_cache,
                                     shared_fact_cache: shared_fact_cache.as_ref(),
                                     route_table: &route_table,
+                                    client: &client,
                                     counted_metadata_edge_misses: counted_metadata_edge_misses
                                         .as_mut(),
                                     trace_metadata_fetches,
@@ -2562,6 +2574,7 @@ pub async fn resolve_greedy_fused_with_cache_options_policy_and_selected_events_
                             shared_cache: &shared_cache,
                             shared_fact_cache: shared_fact_cache.as_ref(),
                             route_table: &route_table,
+                            client: &client,
                             counted_metadata_edge_misses: counted_metadata_edge_misses.as_mut(),
                             trace_metadata_fetches,
                             spec_tx: spec_tx.as_ref(),
@@ -2692,6 +2705,7 @@ pub async fn resolve_greedy_fused_with_cache_options_policy_and_selected_events_
                                     shared_cache: &shared_cache,
                                     shared_fact_cache: shared_fact_cache.as_ref(),
                                     route_table: &route_table,
+                                    client: &client,
                                     counted_metadata_edge_misses: counted_metadata_edge_misses
                                         .as_mut(),
                                     trace_metadata_fetches,
@@ -2711,6 +2725,7 @@ pub async fn resolve_greedy_fused_with_cache_options_policy_and_selected_events_
                                 shared_cache: &shared_cache,
                                 shared_fact_cache: shared_fact_cache.as_ref(),
                                 route_table: &route_table,
+                                client: &client,
                                 counted_metadata_edge_misses: counted_metadata_edge_misses.as_mut(),
                                 trace_metadata_fetches,
                                 spec_tx: spec_tx.as_ref(),
@@ -2968,6 +2983,7 @@ pub async fn resolve_greedy_fused_with_cache_options_policy_and_selected_events_
                 shared_cache: &shared_cache,
                 shared_fact_cache: shared_fact_cache.as_ref(),
                 route_table: &route_table,
+                client: &client,
                 counted_metadata_edge_misses: counted_metadata_edge_misses.as_mut(),
                 trace_metadata_fetches,
                 spec_tx: spec_tx.as_ref(),

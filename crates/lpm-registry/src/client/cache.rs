@@ -186,7 +186,8 @@ impl RegistryClient {
 
         match route {
             crate::UpstreamRoute::NpmDirect => {
-                let cache_key = self.npm_direct_metadata_cache_key(name);
+                let cache_key =
+                    self.npm_direct_metadata_cache_key(name, PublicNpmAccess::ANONYMOUS);
                 self.direct_metadata_memory_cache_key(&cache_key)
             }
             crate::UpstreamRoute::LpmWorker => {
@@ -199,6 +200,10 @@ impl RegistryClient {
                 key
             }
             crate::UpstreamRoute::Custom { target, .. } => {
+                if let Some(access) = self.public_npm_access(route) {
+                    let cache_key = self.npm_direct_metadata_cache_key(name, access);
+                    return self.direct_metadata_memory_cache_key(&cache_key);
+                }
                 let mut key = String::with_capacity(target.base_url.len() + name.len() + 24);
                 write!(key, "custom:{}:", target.base_url.len())
                     .expect("writing registry length to a String cannot fail");
@@ -386,12 +391,17 @@ impl RegistryClient {
         route: &crate::UpstreamRoute,
     ) -> Option<String> {
         match route {
-            crate::UpstreamRoute::NpmDirect => Some(self.npm_direct_metadata_cache_key(name)),
+            crate::UpstreamRoute::NpmDirect => {
+                Some(self.npm_direct_metadata_cache_key(name, PublicNpmAccess::ANONYMOUS))
+            }
             crate::UpstreamRoute::LpmWorker if name.starts_with("@lpm.dev/") => {
                 self.lpm_metadata_cache_key(name).ok()
             }
             crate::UpstreamRoute::LpmWorker => self.npm_worker_metadata_cache_key(name).ok(),
             crate::UpstreamRoute::Custom { target, auth } => {
+                if let Some(access) = self.public_npm_access(route) {
+                    return Some(self.npm_direct_metadata_cache_key(name, access));
+                }
                 let destination =
                     RequestDestination::parse(&format!("{}/{name}", target.base_url)).ok()?;
                 let url = destination.as_str();
@@ -582,17 +592,65 @@ impl RegistryClient {
                 self.invalidate_metadata_cache_key(&key);
             }
         } else {
-            let direct_key = self.npm_direct_metadata_cache_key(package_name);
-            self.invalidate_metadata_cache_key(&direct_key);
-            self.invalidate_metadata_cache_key(
-                &self.npm_preferred_metadata_cache_key(package_name),
-            );
-            self.invalidate_metadata_cache_key(&self.npm_latest_metadata_cache_key(package_name));
+            self.invalidate_public_npm_metadata(package_name, PublicNpmAccess::ANONYMOUS);
             if let Ok(worker_key) = self.npm_worker_metadata_cache_key(package_name) {
                 self.invalidate_metadata_cache_key(&worker_key);
             }
         }
         tracing::debug!("invalidated metadata cache for {package_name}");
+    }
+
+    fn invalidate_public_npm_metadata(&self, package_name: &str, access: PublicNpmAccess<'_>) {
+        for key in [
+            self.npm_direct_metadata_cache_key(package_name, access),
+            self.npm_preferred_metadata_cache_key(package_name, access),
+            self.npm_latest_metadata_cache_key(package_name, access),
+        ] {
+            self.invalidate_metadata_cache_key(&key);
+        }
+    }
+
+    fn invalidate_public_npm_version_metadata(
+        &self,
+        package_name: &str,
+        version: &str,
+        access: PublicNpmAccess<'_>,
+    ) {
+        for key in [
+            self.npm_direct_version_metadata_cache_key(package_name, version, access),
+            self.npm_selected_history_cache_key(package_name, version, access),
+            self.npm_latest_metadata_cache_key(package_name, access),
+        ] {
+            self.invalidate_metadata_cache_key(&key);
+        }
+    }
+
+    /// Invalidate what `route` cached for `package_name`, including the
+    /// exact-version documents for `version` when one is given.
+    pub fn invalidate_routed_metadata_cache(
+        &self,
+        route: &crate::UpstreamRoute,
+        package_name: &str,
+        version: Option<&str>,
+    ) {
+        match route {
+            crate::UpstreamRoute::Custom { target, auth } => {
+                self.invalidate_custom_metadata_cache(
+                    &target.base_url,
+                    package_name,
+                    auth.as_deref(),
+                );
+                if let (Some(version), Some(access)) = (version, self.public_npm_access(route)) {
+                    self.invalidate_public_npm_version_metadata(package_name, version, access);
+                }
+            }
+            crate::UpstreamRoute::NpmDirect | crate::UpstreamRoute::LpmWorker => {
+                self.invalidate_metadata_cache(package_name);
+                if let Some(version) = version {
+                    self.invalidate_npm_version_metadata_cache(package_name, version);
+                }
+            }
+        }
     }
 
     /// Invalidate a direct-npm exact-version metadata document.
@@ -603,11 +661,11 @@ impl RegistryClient {
     /// metadata cache.
     pub fn invalidate_npm_version_metadata_cache(&self, package_name: &str, version: &str) {
         self.history_cache.invalidate();
-        let cache_key = self.npm_direct_version_metadata_cache_key(package_name, version);
-        self.invalidate_metadata_cache_key(&cache_key);
-        let selected_key = self.npm_selected_history_cache_key(package_name, version);
-        self.invalidate_metadata_cache_key(&selected_key);
-        self.invalidate_metadata_cache_key(&self.npm_latest_metadata_cache_key(package_name));
+        self.invalidate_public_npm_version_metadata(
+            package_name,
+            version,
+            PublicNpmAccess::ANONYMOUS,
+        );
         tracing::debug!("invalidated npm version metadata cache for {package_name}@{version}");
     }
 
@@ -624,6 +682,11 @@ impl RegistryClient {
         name: &str,
         auth: Option<&crate::npmrc::RegistryAuth>,
     ) {
+        if self.is_npm_registry(base_url) {
+            self.history_cache.invalidate();
+            self.invalidate_public_npm_metadata(name, PublicNpmAccess::with_auth(auth));
+            return;
+        }
         let Ok(destination) = RequestDestination::parse(&format!("{base_url}/{name}")) else {
             return;
         };
@@ -1902,7 +1965,7 @@ mod command_metadata_seed_tests {
             .clone_with_metadata_memory_cache();
         let package = "no-store-command-seed";
         let metadata = package_metadata(package);
-        let cache_key = client.npm_direct_metadata_cache_key(package);
+        let cache_key = client.npm_direct_metadata_cache_key(package, PublicNpmAccess::ANONYMOUS);
 
         client.write_metadata_cache_with_directive(
             &cache_key,
@@ -1929,7 +1992,7 @@ mod command_metadata_seed_tests {
             .clone_with_metadata_memory_cache();
         let package = "no-cache-command-seed";
         let metadata = package_metadata(package);
-        let cache_key = client.npm_direct_metadata_cache_key(package);
+        let cache_key = client.npm_direct_metadata_cache_key(package, PublicNpmAccess::ANONYMOUS);
 
         client.write_metadata_cache_with_directive(
             &cache_key,

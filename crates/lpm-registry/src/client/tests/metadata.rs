@@ -279,7 +279,9 @@ async fn npm_proxy_miss_falls_back_to_direct_npm_registry() {
     assert_eq!(result.unwrap().name, npm_name);
 
     let cached = client
-        .read_cache_content(&client.npm_direct_metadata_cache_key(npm_name))
+        .read_cache_content(
+            &client.npm_direct_metadata_cache_key(npm_name, PublicNpmAccess::ANONYMOUS),
+        )
         .expect("direct fallback result should be cached in the direct namespace");
     let metadata = RegistryClient::deserialize_cached_metadata(&cached.data)
         .expect("cached fallback metadata should deserialize");
@@ -1826,7 +1828,9 @@ async fn direct_npm_metadata_rejects_a_response_for_another_package_without_cach
     ));
     assert!(
         client
-            .read_metadata_cache(&client.npm_direct_metadata_cache_key(requested))
+            .read_metadata_cache(
+                &client.npm_direct_metadata_cache_key(requested, PublicNpmAccess::ANONYMOUS)
+            )
             .is_none()
     );
 }
@@ -2566,7 +2570,11 @@ async fn selected_history_no_store_fetches_again_without_a_validator() {
     }
     assert!(
         client
-            .read_cache_validator(&client.npm_selected_history_cache_key("selected", "1.0.0"))
+            .read_cache_validator(&client.npm_selected_history_cache_key(
+                "selected",
+                "1.0.0",
+                PublicNpmAccess::ANONYMOUS
+            ))
             .is_none()
     );
     server.verify().await;
@@ -2663,7 +2671,9 @@ async fn selected_history_caches_only_the_requested_version_and_invalidates_it()
     assert!(cached.metadata.time.is_empty());
     assert!(
         client
-            .read_metadata_cache(&client.npm_direct_metadata_cache_key("selected"))
+            .read_metadata_cache(
+                &client.npm_direct_metadata_cache_key("selected", PublicNpmAccess::ANONYMOUS)
+            )
             .is_none()
     );
     client.invalidate_npm_version_metadata_cache("selected", "1.0.0");
@@ -2807,7 +2817,11 @@ async fn get_npm_version_metadata_direct_fetches_and_caches_version_document() {
     );
     assert!(
         client
-            .read_metadata_cache(&client.npm_direct_version_metadata_cache_key(pkg, version))
+            .read_metadata_cache(&client.npm_direct_version_metadata_cache_key(
+                pkg,
+                version,
+                PublicNpmAccess::ANONYMOUS
+            ))
             .is_some(),
         "version document should use a cache key separate from npm:{pkg}"
     );
@@ -2951,7 +2965,7 @@ async fn get_npm_version_metadata_direct_refetches_wrong_cached_version_document
         .with_synchronous_cache_writes(true);
     client.cache_dir = Some(tmp.path().to_path_buf());
     client.write_metadata_cache(
-        &client.npm_direct_version_metadata_cache_key(pkg, version),
+        &client.npm_direct_version_metadata_cache_key(pkg, version, PublicNpmAccess::ANONYMOUS),
         &test_metadata("some-other-package"),
         None,
     );
@@ -3803,7 +3817,8 @@ async fn blocked_enrichment_rejects_incomplete_wrong_identity_and_invalidated_se
             }
             _ => client.clone_with_config(),
         };
-        let key = writer.npm_selected_history_cache_key("selected", "1.0.0");
+        let key =
+            writer.npm_selected_history_cache_key("selected", "1.0.0", PublicNpmAccess::ANONYMOUS);
         writer.write_metadata_cache(&key, &metadata, None);
         if case == "invalidated" {
             client.invalidate_npm_version_metadata_cache("selected", "1.0.0");
@@ -3847,7 +3862,7 @@ async fn blocked_enrichment_batch_preserves_selected_bindings_and_shares_fallbac
     }))
     .unwrap();
     client.write_metadata_cache(
-        &client.npm_selected_history_cache_key("pkg", "1.0.0"),
+        &client.npm_selected_history_cache_key("pkg", "1.0.0", PublicNpmAccess::ANONYMOUS),
         &selected,
         None,
     );

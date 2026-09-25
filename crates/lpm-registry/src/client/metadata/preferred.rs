@@ -170,13 +170,12 @@ fn parse_preferred(
 }
 
 impl RegistryClient {
-    pub(in crate::client) fn npm_preferred_metadata_cache_key(&self, name: &str) -> String {
-        self.metadata_cache_key_for_origin(
-            "npm-direct-preferred",
-            &self.npm_registry_url,
-            name,
-            None,
-        )
+    pub(in crate::client) fn npm_preferred_metadata_cache_key(
+        &self,
+        name: &str,
+        access: PublicNpmAccess<'_>,
+    ) -> String {
+        self.npm_access_cache_key("npm-direct-preferred", name, access)
     }
 
     async fn read_preferred_cache_for_use<const RESOLVER: bool>(
@@ -244,7 +243,11 @@ impl RegistryClient {
         F: Fn(&str) -> bool + Send + Sync + 'static,
     {
         let result = self
-            .get_npm_preferred_resolution_metadata_with_timings(name, accepts)
+            .get_npm_preferred_resolution_metadata_with_timings(
+                name,
+                PublicNpmAccess::ANONYMOUS,
+                accepts,
+            )
             .await?;
         Ok((result.fetched, result.versions_complete))
     }
@@ -263,7 +266,8 @@ impl RegistryClient {
     where
         F: Fn(&str) -> bool + Send + 'static,
     {
-        let cache_key = self.npm_preferred_metadata_cache_key(name);
+        let access = PublicNpmAccess::ANONYMOUS;
+        let cache_key = self.npm_preferred_metadata_cache_key(name, access);
         let mut timings = PackageMetadataFetchTimings::default();
         crate::timing::record_metadata_request(name);
         let read_start = std::time::Instant::now();
@@ -285,12 +289,14 @@ impl RegistryClient {
                 ));
             }
             let cache_read_ms = read_start.elapsed().as_millis();
-            let mut complete = self.get_npm_metadata_direct_with_timings(name).await?;
+            let mut complete = self
+                .get_npm_metadata_direct_inner(name, MetadataCachePolicy::UseFresh, access)
+                .await?;
             complete.timings.cache_read_ms += cache_read_ms;
             self.invalidate_metadata_cache_key(&cache_key);
             return Ok((complete, true));
         }
-        let complete_key = self.npm_direct_metadata_cache_key(name);
+        let complete_key = self.npm_direct_metadata_cache_key(name, access);
         if let Some(cached) = self
             .read_complete_cache_for_use::<RESOLVER>(&complete_key)
             .await
@@ -309,7 +315,7 @@ impl RegistryClient {
         }
         timings.cache_read_ms = read_start.elapsed().as_millis();
         crate::timing::record_metadata_cache_miss();
-        self.fetch_npm_preferred_history::<_, RESOLVER>(name, accepts, timings)
+        self.fetch_npm_preferred_history::<_, RESOLVER>(name, access, accepts, timings)
             .await
     }
 
@@ -318,14 +324,15 @@ impl RegistryClient {
     async fn fetch_npm_preferred_history<F, const RESOLVER: bool>(
         &self,
         name: &str,
+        access: PublicNpmAccess<'_>,
         accepts: F,
         mut timings: PackageMetadataFetchTimings,
     ) -> Result<(TimedPackageMetadata, bool), LpmError>
     where
         F: Fn(&str) -> bool + Send + 'static,
     {
-        let cache_key = self.npm_preferred_metadata_cache_key(name);
-        let complete_key = self.npm_direct_metadata_cache_key(name);
+        let cache_key = self.npm_preferred_metadata_cache_key(name, access);
+        let complete_key = self.npm_direct_metadata_cache_key(name, access);
         let _flight = metadata_fetch_flight_guard(&cache_key).await;
         let coalesced_start = std::time::Instant::now();
         if let Some(cached) = self
@@ -367,14 +374,13 @@ impl RegistryClient {
         let rpc_start = std::time::Instant::now();
         let result = async {
             let request = self
-                .http
-                .for_url(&url)
-                .await?
-                .get(&url)
-                .header("Accept", "application/vnd.npm.install-v1+json");
+                .npm_registry_get(&url, "application/vnd.npm.install-v1+json", access)
+                .await?;
             let request = Self::apply_cached_etag(request, validator.as_ref());
             let http_start = std::time::Instant::now();
-            let mut response = self.send_package_metadata_request(request).await?;
+            let mut response = self
+                .send_package_metadata_request_with_npmrc_auth(request, access.auth())
+                .await?;
             timings.http_ms = http_start.elapsed().as_millis();
             if response.status() == reqwest::StatusCode::NOT_MODIFIED {
                 let cache_start = std::time::Instant::now();
@@ -404,13 +410,12 @@ impl RegistryClient {
                 }
                 timings.cache_after_304_ms = cache_start.elapsed().as_millis();
                 let request = self
-                    .http
-                    .for_url(&url)
-                    .await?
-                    .get(&url)
-                    .header("Accept", "application/vnd.npm.install-v1+json");
+                    .npm_registry_get(&url, "application/vnd.npm.install-v1+json", access)
+                    .await?;
                 let http_start = std::time::Instant::now();
-                response = self.send_package_metadata_request(request).await?;
+                response = self
+                    .send_package_metadata_request_with_npmrc_auth(request, access.auth())
+                    .await?;
                 timings.http_ms += http_start.elapsed().as_millis();
             }
             let etag = Self::response_etag(&response);
@@ -552,7 +557,7 @@ mod tests {
             .await
             .unwrap();
         drop(initial);
-        let key = client.npm_preferred_metadata_cache_key("pkg");
+        let key = client.npm_preferred_metadata_cache_key("pkg", PublicNpmAccess::ANONYMOUS);
         let cache_path = client.cache_path(&key).unwrap();
         filetime::set_file_mtime(&cache_path, filetime::FileTime::from_unix_time(1, 0)).unwrap();
         Mock::given(method("GET"))
@@ -617,9 +622,9 @@ mod tests {
                     .await
                     .unwrap();
                 let key = if complete {
-                    client.npm_direct_metadata_cache_key("pkg")
+                    client.npm_direct_metadata_cache_key("pkg", PublicNpmAccess::ANONYMOUS)
                 } else {
-                    client.npm_preferred_metadata_cache_key("pkg")
+                    client.npm_preferred_metadata_cache_key("pkg", PublicNpmAccess::ANONYMOUS)
                 };
                 let cache_path = client.cache_path(&key).unwrap();
                 let expiry = std::fs::metadata(&cache_path).unwrap().modified().unwrap();
@@ -776,7 +781,7 @@ mod tests {
             .await;
         let cache = tempfile::tempdir().unwrap();
         let client = preferred_test_client(&server, cache.path()).await;
-        let key = client.npm_preferred_metadata_cache_key("pkg");
+        let key = client.npm_preferred_metadata_cache_key("pkg", PublicNpmAccess::ANONYMOUS);
         let selected = parse_preferred(history().to_string().as_bytes(), "pkg", &|_| true).unwrap();
         client.write_metadata_cache_with_directive(
             &key,
@@ -795,7 +800,9 @@ mod tests {
         assert!(client.read_cache_validator(&key).is_none());
         assert!(
             client
-                .read_cache_validator(&client.npm_direct_metadata_cache_key("pkg"))
+                .read_cache_validator(
+                    &client.npm_direct_metadata_cache_key("pkg", PublicNpmAccess::ANONYMOUS)
+                )
                 .is_none()
         );
         client
