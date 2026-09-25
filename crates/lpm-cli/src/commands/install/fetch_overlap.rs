@@ -1003,7 +1003,7 @@ mod tests {
             .enable_all()
             .build()
             .unwrap();
-        tracing::subscriber::with_default(subscriber, || {
+        crate::test_tracing::with_default(subscriber, || {
             runtime.block_on(async {
                 let manifest = br#"{"name":"shared-package","version":"1.0.0"}"#;
                 let encoder =
