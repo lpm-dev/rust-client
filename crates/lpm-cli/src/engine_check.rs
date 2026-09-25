@@ -35,7 +35,8 @@ use crate::engine_strict_config;
 use crate::output;
 use lpm_common::LpmError;
 use lpm_runtime::effective::{
-    PathNodeResolution, probe_node_fingerprint_on_path, resolve_node_on_path_with_fingerprint,
+    ObservedNodeVersion, PathNodeResolution, probe_node_fingerprint_on_path,
+    resolve_node_on_path_with_observed,
 };
 use lpm_workspace::{PackageJson, read_package_json};
 use std::collections::HashMap;
@@ -63,6 +64,7 @@ pub(crate) struct DependencyEnginePolicy {
     json_output: bool,
     script_cwd: PathBuf,
     script_path: OsString,
+    observed_node: Option<ObservedNodeVersion>,
     effective_node: OnceLock<PathNodeResolution>,
 }
 
@@ -78,8 +80,16 @@ impl DependencyEnginePolicy {
             json_output,
             script_cwd,
             script_path,
+            observed_node: None,
             effective_node: OnceLock::new(),
         }
+    }
+
+    /// Reuse a version from an earlier install while the Node binary's
+    /// fingerprint is unchanged.
+    fn with_observed_node(mut self, observed_node: Option<ObservedNodeVersion>) -> Self {
+        self.observed_node = observed_node;
+        self
     }
 
     fn with_resolved_node(
@@ -92,6 +102,7 @@ impl DependencyEnginePolicy {
             json_output,
             script_cwd: PathBuf::new(),
             script_path: OsString::new(),
+            observed_node: None,
             effective_node: OnceLock::from(effective_node),
         }
     }
@@ -102,7 +113,11 @@ impl DependencyEnginePolicy {
 
     fn effective_node_resolution(&self) -> &PathNodeResolution {
         self.effective_node.get_or_init(|| {
-            resolve_node_on_path_with_fingerprint(&self.script_cwd, &self.script_path)
+            resolve_node_on_path_with_observed(
+                &self.script_cwd,
+                &self.script_path,
+                self.observed_node.as_ref(),
+            )
         })
     }
 
@@ -197,7 +212,10 @@ impl DependencyEnginePolicy {
     }
 
     pub(crate) fn probe_node_runtime_fingerprint(&self) -> Option<String> {
-        probe_node_fingerprint_on_path(&self.script_cwd, &self.script_path)
+        match self.effective_node.get() {
+            Some(resolution) => resolution.runtime_fingerprint().map(str::to_owned),
+            None => probe_node_fingerprint_on_path(&self.script_cwd, &self.script_path),
+        }
     }
 
     pub(crate) fn resolved_node_runtime_fingerprint(&self) -> Option<&str> {
@@ -231,6 +249,17 @@ pub(crate) fn prepare_dependency_policy(
     cli_no_engine_strict: bool,
     json_output: bool,
 ) -> Result<DependencyEnginePolicy, LpmError> {
+    prepare_dependency_policy_with_observed_node(start_dir, cli_no_engine_strict, json_output, None)
+}
+
+/// Prepare the policy like [`prepare_dependency_policy`], reusing
+/// `observed_node` in place of a Node probe while its fingerprint matches.
+pub(crate) fn prepare_dependency_policy_with_observed_node(
+    start_dir: &Path,
+    cli_no_engine_strict: bool,
+    json_output: bool,
+    observed_node: Option<ObservedNodeVersion>,
+) -> Result<DependencyEnginePolicy, LpmError> {
     let Some((root_dir, root_pkg)) = resolve_root_package(start_dir)? else {
         return Ok(DependencyEnginePolicy::new(
             start_dir.to_path_buf(),
@@ -242,7 +271,8 @@ pub(crate) fn prepare_dependency_policy(
     let engine_strict = engine_strict_config::resolve_for_root(cli_no_engine_strict, &root_pkg);
     let script_path = lpm_runner::bin_path::build_path_with_bins(&root_dir)?;
     let policy =
-        DependencyEnginePolicy::new(root_dir, script_path.into(), engine_strict, json_output);
+        DependencyEnginePolicy::new(root_dir, script_path.into(), engine_strict, json_output)
+            .with_observed_node(observed_node);
     enforce_root_with_policy(&root_pkg, &policy)?;
     Ok(policy)
 }
@@ -252,9 +282,15 @@ pub(crate) fn prepare_dependency_policy_in_context(
     policy_dir: &Path,
     cli_no_engine_strict: bool,
     json_output: bool,
+    observed_node: Option<ObservedNodeVersion>,
 ) -> Result<DependencyEnginePolicy, LpmError> {
     if install_dir == policy_dir {
-        return prepare_dependency_policy(install_dir, cli_no_engine_strict, json_output);
+        return prepare_dependency_policy_with_observed_node(
+            install_dir,
+            cli_no_engine_strict,
+            json_output,
+            observed_node,
+        );
     }
     let root_pkg = resolve_root_package(policy_dir)?
         .map(|(_, package)| package)
@@ -266,7 +302,8 @@ pub(crate) fn prepare_dependency_policy_in_context(
         script_path.into(),
         engine_strict,
         json_output,
-    ))
+    )
+    .with_observed_node(observed_node))
 }
 
 pub(crate) fn dependency_policy_for_command(
@@ -987,5 +1024,47 @@ mod tests {
         let policy = DependencyEnginePolicy::new(PathBuf::new(), OsString::new(), true, true);
 
         assert!(!policy.can_reuse_constrained_freshness_key("1:unknown"));
+    }
+
+    /// A sparse file that passes the Node binary checks but cannot run.
+    #[cfg(unix)]
+    fn write_unrunnable_node_binary(path: &Path) {
+        use std::io::Write;
+        use std::os::unix::fs::PermissionsExt;
+
+        let mut file = fs::File::create(path).unwrap();
+        file.write_all(&[0x7f, b'E', b'L', b'F']).unwrap();
+        file.set_len(16 * 1024 * 1024).unwrap();
+        fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recorded_version_of_an_unchanged_node_binary_replaces_the_probe() {
+        let bin = tempdir().unwrap();
+        write_unrunnable_node_binary(&bin.path().join("node"));
+        let path = bin.path().as_os_str().to_os_string();
+        let observed = ObservedNodeVersion::new(
+            probe_node_fingerprint_on_path(bin.path(), &path).unwrap(),
+            "20.11.0",
+        );
+        let probing =
+            DependencyEnginePolicy::new(bin.path().to_path_buf(), path.clone(), true, true);
+        assert!(
+            probing
+                .check_node_requirement(">=20 <21", "test".to_string())
+                .is_err(),
+            "the unrunnable binary must not satisfy the engine when probed"
+        );
+
+        let reusing = DependencyEnginePolicy::new(bin.path().to_path_buf(), path, true, true)
+            .with_observed_node(Some(observed));
+
+        assert!(
+            reusing
+                .check_node_requirement(">=20 <21", "test".to_string())
+                .is_ok()
+        );
+        assert_eq!(reusing.constrained_freshness_key(), "1:20.11.0");
     }
 }

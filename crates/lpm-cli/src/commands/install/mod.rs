@@ -457,12 +457,17 @@ pub(crate) async fn run_with_options_with_lpm_root(
         .unwrap_or_else(|| project_dir.to_path_buf());
     crate::release_plan::ensure_no_pending_release_transaction(&transaction_root)?;
     validation::validate_project_layout(project_dir)?;
+    // `--force` probes Node again, so a reinstall can always refresh the version.
+    let observed_node = (!force)
+        .then(|| state::observed_node_from_install_state(project_dir))
+        .flatten();
     let dependency_engine_policy =
         Arc::new(crate::engine_check::prepare_dependency_policy_in_context(
             project_dir,
             policy_project_dir,
             cli_no_engine_strict,
             json_output,
+            observed_node,
         )?);
     // Round 2: hold a shared lock on the store for the
     // entire install pipeline. Multiple concurrent installs share it
