@@ -7,6 +7,7 @@ use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, RawFd};
 use std::os::unix::{ffi::OsStrExt, fs::MetadataExt};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 #[derive(Clone, Copy, Eq, PartialEq)]
 pub(crate) struct Identity {
@@ -34,14 +35,14 @@ struct DirectoryRecord {
 struct Parent {
     path: PathBuf,
     name: CString,
-    file: File,
+    file: Arc<File>,
     identity: Identity,
 }
 
 pub(crate) struct OutputTree {
     root_path: PathBuf,
     visible_root_path: PathBuf,
-    root: File,
+    root: Arc<File>,
     root_identity: Identity,
     directories: HashMap<PathBuf, DirectoryRecord>,
     parent: Option<Parent>,
@@ -54,7 +55,7 @@ impl OutputTree {
         Ok(Self {
             root_path,
             visible_root_path,
-            root,
+            root: Arc::new(root),
             root_identity,
             directories: HashMap::with_capacity(64),
             parent: None,
@@ -89,7 +90,7 @@ impl OutputTree {
             self.parent = Some(Parent {
                 path: parent.to_path_buf(),
                 name,
-                file: directory,
+                file: Arc::new(directory),
                 identity,
             });
             return Ok(());
@@ -135,7 +136,7 @@ impl OutputTree {
             self.parent = Some(Parent {
                 path: prefix,
                 name: c_path(parent)?,
-                file,
+                file: Arc::new(file),
                 identity,
             });
         }
@@ -146,7 +147,7 @@ impl OutputTree {
         &self,
         path: &Path,
         duplicate: bool,
-    ) -> Result<PendingFile<'_>, LpmError> {
+    ) -> Result<PendingFile, LpmError> {
         let directory = self
             .parent
             .as_ref()
@@ -176,7 +177,7 @@ impl OutputTree {
         let file = open_at(base, &name, flags, 0o666).map_err(|error| path_error(error, path))?;
         Ok(PendingFile {
             file,
-            directory,
+            directory: Arc::clone(directory),
             name,
             committed: false,
         })
@@ -312,13 +313,13 @@ impl OutputTree {
     }
 }
 
-pub(crate) struct PendingFile<'a> {
+pub(crate) struct PendingFile {
     pub(crate) file: File,
-    directory: &'a File,
+    directory: Arc<File>,
     name: CString,
     committed: bool,
 }
-impl PendingFile<'_> {
+impl PendingFile {
     pub(crate) fn identity(&self) -> Result<Identity, LpmError> {
         Ok(Identity::from_metadata(&self.file.metadata()?))
     }
@@ -334,11 +335,18 @@ impl PendingFile<'_> {
         }
         Ok(())
     }
+    pub(crate) fn complete(self) -> Result<CompletedFile, LpmError> {
+        let identity = self.identity()?;
+        Ok(CompletedFile {
+            pending: self,
+            identity,
+        })
+    }
     pub(crate) fn commit(mut self) {
         self.committed = true;
     }
 }
-impl Drop for PendingFile<'_> {
+impl Drop for PendingFile {
     fn drop(&mut self) {
         if !self.committed
             && let Ok(written) = self.file.metadata()
@@ -359,6 +367,31 @@ fn invalid_path(_: std::ffi::NulError) -> io::Error {
 fn c_path(path: &Path) -> io::Result<CString> {
     CString::new(path.as_os_str().as_bytes()).map_err(invalid_path)
 }
+pub(crate) struct CompletedFile {
+    // Pin the original file identity until ordered acceptance or rollback.
+    pending: PendingFile,
+    identity: Identity,
+}
+
+impl CompletedFile {
+    pub(crate) fn commit(self) -> Result<Identity, LpmError> {
+        let current = stat_at(self.pending.directory.as_raw_fd(), &self.pending.name)?;
+        if current.st_mode & libc::S_IFMT != libc::S_IFREG
+            || self.identity != Identity::from_stat(&current)
+        {
+            return Err(LpmError::Registry(
+                "tarball output file changed before acceptance".into(),
+            ));
+        }
+        self.pending.commit();
+        Ok(self.identity)
+    }
+}
+
+#[cfg(test)]
+#[path = "completed_tests.rs"]
+mod completed_tests;
+
 fn changed_directory(path: &Path) -> LpmError {
     LpmError::Registry(format!(
         "tarball extraction directory changed: {}",
