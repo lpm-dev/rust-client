@@ -267,6 +267,7 @@ fn http_clients_eager_hit_overrides_default() {
         global_identity: None,
         tls_material_budget: Arc::new(TlsMaterialBudget::new(0).expect("zero TLS budget")),
         per_origin_identity_certs: HashMap::new(),
+        next_request_lane: std::sync::atomic::AtomicUsize::new(0),
     });
     let mut client = RegistryClient::new();
     client.http = http;
@@ -383,7 +384,7 @@ async fn manual_redirect_dispatch_reselects_the_client_for_each_origin() {
         CachedClient {
             client: reqwest::Client::new(),
             policy_metadata_client: reqwest::Client::new(),
-            manual_redirect_client,
+            request_lanes: std::sync::Arc::from([manual_redirect_client]),
             identity_fp: None,
         }
     }
@@ -427,6 +428,7 @@ async fn manual_redirect_dispatch_reselects_the_client_for_each_origin() {
         global_identity: None,
         tls_material_budget: Arc::new(TlsMaterialBudget::new(0).expect("zero TLS budget")),
         per_origin_identity_certs: HashMap::new(),
+        next_request_lane: std::sync::atomic::AtomicUsize::new(0),
     };
     let request = reqwest::Request::new(
         reqwest::Method::GET,
@@ -462,7 +464,7 @@ async fn retry_transport_reselects_origin_specific_clients_across_redirects() {
         CachedClient {
             client: automatic.clone(),
             policy_metadata_client: automatic,
-            manual_redirect_client: manual,
+            request_lanes: std::sync::Arc::from([manual]),
             identity_fp: None,
         }
     }
@@ -506,6 +508,7 @@ async fn retry_transport_reselects_origin_specific_clients_across_redirects() {
         global_identity: None,
         tls_material_budget: Arc::new(TlsMaterialBudget::new(0).expect("zero TLS budget")),
         per_origin_identity_certs: HashMap::new(),
+        next_request_lane: std::sync::atomic::AtomicUsize::new(0),
     });
     let mut client = RegistryClient::new();
     client.http = http;
@@ -546,6 +549,7 @@ fn http_clients_eager_portless_scope_excludes_explicit_non_default_ports() {
         global_identity: None,
         tls_material_budget: Arc::new(TlsMaterialBudget::new(0).expect("zero TLS budget")),
         per_origin_identity_certs: HashMap::new(),
+        next_request_lane: std::sync::atomic::AtomicUsize::new(0),
     });
     let mut client = RegistryClient::new();
     client.http = http;
@@ -599,6 +603,7 @@ async fn http_clients_lazy_builds_and_memoizes() {
         global_identity: None,
         tls_material_budget: Arc::new(TlsMaterialBudget::new(0).expect("zero TLS budget")),
         per_origin_identity_certs: HashMap::new(),
+        next_request_lane: std::sync::atomic::AtomicUsize::new(0),
     });
     // First call must build + insert.
     let c1 = http.for_url("https://lazy.internal/pkg").await.expect("ok");
@@ -652,6 +657,7 @@ async fn unrelated_origins_bypass_a_busy_lazy_tls_builder() {
         global_identity: None,
         tls_material_budget: Arc::new(TlsMaterialBudget::new(0).expect("zero TLS budget")),
         per_origin_identity_certs: HashMap::new(),
+        next_request_lane: std::sync::atomic::AtomicUsize::new(0),
     });
     let blocked_clients = Arc::clone(&clients);
     let blocked_origin = configured_origin.clone();
@@ -688,6 +694,7 @@ async fn http_clients_no_per_origin_tls_falls_through_to_default() {
         global_identity: None,
         tls_material_budget: Arc::new(TlsMaterialBudget::new(0).expect("zero TLS budget")),
         per_origin_identity_certs: HashMap::new(),
+        next_request_lane: std::sync::atomic::AtomicUsize::new(0),
     });
     let _ = http
         .for_url("https://anywhere.example/foo")
@@ -735,6 +742,7 @@ async fn http_clients_per_origin_certfile_xor_is_fatal_at_build() {
         lazy: lazy_cells(&tls),
         built_client_sets: std::sync::atomic::AtomicUsize::new(0),
         per_origin_identity_certs: lazy_identity_certs(&tls),
+        next_request_lane: std::sync::atomic::AtomicUsize::new(0),
         tls_overrides: Arc::new(tls),
         passphrase: Arc::new(crate::tls_identity::EnvThenTtyPassphrase::new()),
         global_identity: None,
@@ -790,6 +798,7 @@ async fn http_clients_unreached_half_config_does_not_break_unrelated_lookup() {
         lazy: lazy_cells(&tls),
         built_client_sets: std::sync::atomic::AtomicUsize::new(0),
         per_origin_identity_certs: lazy_identity_certs(&tls),
+        next_request_lane: std::sync::atomic::AtomicUsize::new(0),
         tls_overrides: Arc::new(tls),
         passphrase: Arc::new(crate::tls_identity::EnvThenTtyPassphrase::new()),
         global_identity: None,
@@ -1432,4 +1441,53 @@ async fn cross_host_redirect_strips_authorization_header() {
     // explicitly so the failure mode is loud and immediate.
     server_a.verify().await;
     server_b.verify().await;
+}
+
+#[tokio::test]
+async fn registry_requests_rotate_across_request_lane_connections() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let connections = Arc::new(AtomicUsize::new(0));
+    let accepted = Arc::clone(&connections);
+    tokio::spawn(async move {
+        loop {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            accepted.fetch_add(1, Ordering::SeqCst);
+            tokio::spawn(async move {
+                let mut request = [0_u8; 4096];
+                // Each small request arrives in one read on this keep-alive connection.
+                while socket.read(&mut request).await.is_ok_and(|read| read > 0) {
+                    if socket
+                        .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\n{}")
+                        .await
+                        .is_err()
+                    {
+                        return;
+                    }
+                }
+            });
+        }
+    });
+    let lanes = request_lane_count(None);
+    assert!(lanes > 1);
+    let http = RegistryClient::new().http;
+    let url = format!("http://{address}/pkg");
+
+    for _ in 0..2 * lanes {
+        let response = http
+            .for_manual_redirect_url(&url)
+            .await
+            .unwrap()
+            .get(&url)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.bytes().await.unwrap().as_ref(), b"{}");
+    }
+
+    assert_eq!(connections.load(Ordering::SeqCst), lanes);
+    assert_eq!(request_lane_count(Some("h1-pool")), 1);
 }

@@ -86,15 +86,9 @@ impl RegistryClient {
     /// connect-phase cap + per-read idle cap, no whole-request wall-clock
     /// timeout.
     ///
-    /// Factored out of `new()` so tests can construct clients with short
-    /// timeouts against a local fake server, keeping prod defaults
-    /// uniform and easy to update in one place.
-    ///
-    /// `LPM_HTTP=h1-pool` builds the client with `http1_only()` + a
-    /// 64-connection idle pool + TCP keepalive. Benchmarks showed this is
-    /// statistically significantly slower than HTTP/2 default (h1-pool-64:
-    /// −11.5%, h1-pool-256: −8.9% on n=30 cold installs). Kept as an
-    /// opt-in for network-regime debugging without rewriting this branch.
+    /// Lets tests construct clients with short timeouts against a local
+    /// fake server through the production builder.
+    #[cfg(test)]
     pub(super) fn build_http_client(
         connect_timeout: Duration,
         read_timeout: Duration,
@@ -118,6 +112,7 @@ impl RegistryClient {
     /// passing the parse-time marker check) surfaces as
     /// `LpmError::Cert(...)` with the contributing source/line so the
     /// user can find the offending `.npmrc` line.
+    #[cfg(test)]
     pub(super) fn build_http_client_with_tls(
         connect_timeout: Duration,
         read_timeout: Duration,
@@ -154,6 +149,7 @@ impl RegistryClient {
     /// overrides global) before calling here. The wrapping
     /// `build_http_client_with_tls` handles the global-identity case
     /// inline so prior call sites continue to work.
+    #[cfg(test)]
     pub(super) fn build_http_client_with_tls_and_identity(
         connect_timeout: Duration,
         read_timeout: Duration,
@@ -170,57 +166,31 @@ impl RegistryClient {
         )
     }
 
-    pub(super) fn build_manual_redirect_http_client_with_tls_and_identity(
-        connect_timeout: Duration,
-        read_timeout: Duration,
-        tls: &TlsOverrides,
-        identity: Option<reqwest::Identity>,
-    ) -> Result<reqwest::Client, LpmError> {
-        Self::build_http_client_with_tls_identity_and_transport(
-            connect_timeout,
-            read_timeout,
-            tls,
-            identity,
-            HttpTransportMode::Default,
-            HttpRedirectMode::Manual,
-        )
-    }
-
     pub(super) fn build_http_client_set_with_tls_and_identity(
         connect_timeout: Duration,
         read_timeout: Duration,
         tls: &TlsOverrides,
         identity: Option<reqwest::Identity>,
-    ) -> Result<(reqwest::Client, reqwest::Client, reqwest::Client), LpmError> {
+    ) -> Result<HttpClientSet, LpmError> {
         let roots = Self::prepare_tls_roots(tls)?;
-        let client = Self::build_http_client_with_prepared_tls_identity_and_transport(
-            connect_timeout,
-            read_timeout,
-            tls,
-            &roots,
-            identity.clone(),
-            HttpTransportMode::Default,
-            HttpRedirectMode::Automatic,
-        )?;
-        let policy_metadata = Self::build_http_client_with_prepared_tls_identity_and_transport(
-            connect_timeout,
-            read_timeout,
-            tls,
-            &roots,
-            identity.clone(),
-            HttpTransportMode::Default,
-            HttpRedirectMode::Manual,
-        )?;
-        let manual_redirect = Self::build_http_client_with_prepared_tls_identity_and_transport(
-            connect_timeout,
-            read_timeout,
-            tls,
-            &roots,
-            identity,
-            HttpTransportMode::Default,
-            HttpRedirectMode::Manual,
-        )?;
-        Ok((client, policy_metadata, manual_redirect))
+        let build = |redirect| {
+            Self::build_http_client_with_prepared_tls_identity_and_transport(
+                connect_timeout,
+                read_timeout,
+                tls,
+                &roots,
+                identity.clone(),
+                HttpTransportMode::Default,
+                redirect,
+            )
+        };
+        Ok(HttpClientSet {
+            client: build(HttpRedirectMode::Automatic)?,
+            policy_metadata_client: build(HttpRedirectMode::Manual)?,
+            request_lanes: (0..request_lane_count(std::env::var("LPM_HTTP").ok().as_deref()))
+                .map(|_| build(HttpRedirectMode::Manual))
+                .collect::<Result<_, _>>()?,
+        })
     }
 
     fn prepare_tls_roots(tls: &TlsOverrides) -> Result<PreparedTlsRoots, LpmError> {
@@ -242,6 +212,7 @@ impl RegistryClient {
         })
     }
 
+    #[cfg(any(test, feature = "experimental-http3"))]
     fn build_http_client_with_tls_identity_and_transport(
         connect_timeout: Duration,
         read_timeout: Duration,
@@ -281,6 +252,8 @@ impl RegistryClient {
         if transport == HttpTransportMode::WorkerMetadataHttp3 {
             b = Self::apply_http3_prior_knowledge(b);
         } else if std::env::var("LPM_HTTP").as_deref() == Ok("h1-pool") {
+            // Opt-in for network-regime debugging; cold installs measured
+            // slower than HTTP/2 on low-latency links.
             b = b
                 .http1_only()
                 .pool_max_idle_per_host(64)
@@ -375,25 +348,14 @@ impl RegistryClient {
                 break;
             }
         }
-        let default_client = Self::build_http_client(CONNECT_TIMEOUT, READ_TIMEOUT);
-        let policy_metadata_client = Self::build_manual_redirect_http_client_with_tls_and_identity(
-            CONNECT_TIMEOUT,
-            READ_TIMEOUT,
-            &TlsOverrides::default(),
-            None,
-        )
-        .expect("default TLS config never fails to build");
-        let manual_redirect_client = Self::build_manual_redirect_http_client_with_tls_and_identity(
-            CONNECT_TIMEOUT,
-            READ_TIMEOUT,
-            &TlsOverrides::default(),
-            None,
-        )
-        .expect("default TLS config never fails to build");
-        let http = HttpClients::from_default_clients(
-            default_client,
-            policy_metadata_client,
-            manual_redirect_client,
+        let http = HttpClients::from_default_client_set(
+            Self::build_http_client_set_with_tls_and_identity(
+                CONNECT_TIMEOUT,
+                READ_TIMEOUT,
+                &TlsOverrides::default(),
+                None,
+            )
+            .expect("default TLS config never fails to build"),
         );
 
         // Initialize metadata cache at ~/.lpm/cache/metadata/ via LpmRoot.
@@ -680,19 +642,13 @@ impl RegistryClient {
             .as_ref()
             .map(|l| cert_pem_fingerprint(&l.cert_pem));
         let default_identity = global_loaded.as_ref().map(|l| l.identity.clone());
-        let (default_reqwest_client, policy_metadata_client, manual_redirect_client) =
-            Self::build_http_client_set_with_tls_and_identity(
-                CONNECT_TIMEOUT,
-                READ_TIMEOUT,
-                tls,
-                default_identity,
-            )?;
-        let default_cached = CachedClient {
-            client: default_reqwest_client,
-            policy_metadata_client,
-            manual_redirect_client,
-            identity_fp: default_identity_fp,
-        };
+        let default_cached = Self::build_http_client_set_with_tls_and_identity(
+            CONNECT_TIMEOUT,
+            READ_TIMEOUT,
+            tls,
+            default_identity,
+        )?
+        .cached(default_identity_fp);
         let eager_tls_origin_count = eager_origins
             .iter()
             .filter(|origin| {
@@ -755,6 +711,7 @@ impl RegistryClient {
             global_identity: global_loaded,
             tls_material_budget,
             per_origin_identity_certs,
+            next_request_lane: std::sync::atomic::AtomicUsize::new(0),
         });
         self.history_cache = Arc::new(super::history_cache::HistoryCache::default());
         self.http = http;

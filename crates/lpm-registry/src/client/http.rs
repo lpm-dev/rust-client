@@ -4,7 +4,42 @@ use super::*;
 enum ClientPool {
     General,
     PolicyMetadata,
-    ManualRedirect,
+    ManualRedirect(usize),
+}
+
+/// Connections per origin that carry registry requests in turn.
+///
+/// One HTTP/2 connection moves at most its flow-control window and the
+/// kernel's TCP receive buffer per round trip, and every metadata response
+/// queues behind tarball data sharing it. Spreading requests over several
+/// connections lifts that ceiling for the whole install.
+const REQUEST_LANES: usize = 8;
+
+/// HTTP/1.1 pools already open a connection per concurrent request.
+pub(super) fn request_lane_count(lpm_http: Option<&str>) -> usize {
+    if lpm_http == Some("h1-pool") {
+        1
+    } else {
+        REQUEST_LANES
+    }
+}
+
+/// The clients built for one TLS configuration.
+pub(super) struct HttpClientSet {
+    pub(super) client: reqwest::Client,
+    pub(super) policy_metadata_client: reqwest::Client,
+    pub(super) request_lanes: Arc<[reqwest::Client]>,
+}
+
+impl HttpClientSet {
+    pub(super) fn cached(self, identity_fp: Option<Arc<str>>) -> CachedClient {
+        CachedClient {
+            client: self.client,
+            policy_metadata_client: self.policy_metadata_client,
+            request_lanes: self.request_lanes,
+            identity_fp,
+        }
+    }
 }
 
 /// Maximum time to establish a TCP + TLS connection.
@@ -92,20 +127,24 @@ impl HttpClients {
         Self::from_default_clients(default, manual_redirect.clone(), manual_redirect)
     }
 
-    /// Build an `HttpClients` with separate general and policy metadata
-    /// connection pools and empty eager/lazy maps.
+    /// Build an `HttpClients` with one request lane and empty eager/lazy maps.
+    #[cfg(test)]
     pub(super) fn from_default_clients(
         default: reqwest::Client,
         policy_metadata: reqwest::Client,
         manual_redirect: reqwest::Client,
     ) -> Arc<Self> {
+        Self::from_default_client_set(HttpClientSet {
+            client: default,
+            policy_metadata_client: policy_metadata,
+            request_lanes: Arc::from([manual_redirect]),
+        })
+    }
+
+    /// Build an `HttpClients` around one client set with empty eager/lazy maps.
+    pub(super) fn from_default_client_set(clients: HttpClientSet) -> Arc<Self> {
         Arc::new(Self {
-            default: CachedClient {
-                client: default,
-                policy_metadata_client: policy_metadata,
-                manual_redirect_client: manual_redirect,
-                identity_fp: None,
-            },
+            default: clients.cached(None),
             eager: HashMap::new(),
             lazy: HashMap::new(),
             built_client_sets: std::sync::atomic::AtomicUsize::new(0),
@@ -114,6 +153,7 @@ impl HttpClients {
             global_identity: None,
             tls_material_budget: Arc::new(TlsMaterialBudget::new(0).expect("zero TLS budget")),
             per_origin_identity_certs: HashMap::new(),
+            next_request_lane: std::sync::atomic::AtomicUsize::new(0),
         })
     }
 
@@ -250,8 +290,13 @@ impl HttpClients {
     }
 
     /// Resolve a redirect-disabled client for one explicit redirect hop.
+    /// Successive requests rotate across the origin's request lanes.
     pub async fn for_manual_redirect_url(&self, url: &str) -> Result<reqwest::Client, LpmError> {
-        self.for_url_pool(url, ClientPool::ManualRedirect).await
+        let lane = self
+            .next_request_lane
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.for_url_pool(url, ClientPool::ManualRedirect(lane))
+            .await
     }
 
     async fn for_url_pool(&self, url: &str, pool: ClientPool) -> Result<reqwest::Client, LpmError> {
@@ -262,11 +307,7 @@ impl HttpClients {
     }
 
     fn select_pool_client(&self, cached: &CachedClient, pool: ClientPool) -> reqwest::Client {
-        match pool {
-            ClientPool::General => cached.client.clone(),
-            ClientPool::PolicyMetadata => cached.policy_metadata_client.clone(),
-            ClientPool::ManualRedirect => cached.manual_redirect_client.clone(),
-        }
+        select_pool(cached, pool)
     }
 
     async fn for_origin_pool(
@@ -274,11 +315,7 @@ impl HttpClients {
         origin: &OriginKey,
         pool: ClientPool,
     ) -> Result<reqwest::Client, LpmError> {
-        let select = |cached: &CachedClient| match pool {
-            ClientPool::General => cached.client.clone(),
-            ClientPool::PolicyMetadata => cached.policy_metadata_client.clone(),
-            ClientPool::ManualRedirect => cached.manual_redirect_client.clone(),
-        };
+        let select = |cached: &CachedClient| select_pool(cached, pool);
         if let Some(c) = self.eager.get(origin) {
             return Ok(select(c));
         }
@@ -340,6 +377,16 @@ impl HttpClients {
         match cached {
             Ok(cached) => Ok(select(cached)),
             Err(error) => Err(LpmError::Cert(error.to_string())),
+        }
+    }
+}
+
+fn select_pool(cached: &CachedClient, pool: ClientPool) -> reqwest::Client {
+    match pool {
+        ClientPool::General => cached.client.clone(),
+        ClientPool::PolicyMetadata => cached.policy_metadata_client.clone(),
+        ClientPool::ManualRedirect(lane) => {
+            cached.request_lanes[lane % cached.request_lanes.len()].clone()
         }
     }
 }
@@ -498,7 +545,7 @@ pub(super) fn build_per_origin_http_client(
         &synthetic,
         identity,
     );
-    let (client, policy_metadata_client, manual_redirect_client) = match clients {
+    let clients = match clients {
         Ok(clients) => clients,
         Err(error) => {
             material_budget.release(reserved_bytes);
@@ -506,12 +553,7 @@ pub(super) fn build_per_origin_http_client(
         }
     };
     drop(source_material_reservations);
-    Ok(CachedClient {
-        client,
-        policy_metadata_client,
-        manual_redirect_client,
-        identity_fp,
-    })
+    Ok(clients.cached(identity_fp))
 }
 
 impl lpm_http::ReplayableHttpClientProvider for HttpClients {

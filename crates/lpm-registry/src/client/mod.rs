@@ -7,8 +7,10 @@
 #[cfg(test)]
 use crate::npmrc::TaggedPath;
 use crate::npmrc::{OriginKey, OriginTlsOverrides, TaggedRoot, TlsOverrides};
+#[cfg(any(test, feature = "experimental-http3"))]
+use crate::tls_identity::load_identity;
 use crate::tls_identity::{
-    EnvThenTtyPassphrase, LoadedIdentity, PassphraseProvider, load_identity,
+    EnvThenTtyPassphrase, LoadedIdentity, PassphraseProvider,
     load_identity_with_material_and_reservation,
 };
 use crate::types::*;
@@ -79,7 +81,9 @@ use self::body::{
     read_capped_error_text,
 };
 use self::cache::MetadataCacheDirective;
-use self::http::{CONNECT_TIMEOUT, READ_TIMEOUT, build_per_origin_http_client};
+use self::http::{
+    CONNECT_TIMEOUT, HttpClientSet, READ_TIMEOUT, build_per_origin_http_client, request_lane_count,
+};
 #[cfg(test)]
 use self::state::CacheContent;
 use self::state::{
