@@ -247,21 +247,20 @@ async fn install_dlx_target(
     ));
 
     let route_table = caller_routes.cloned();
-    client.invalidate_metadata_cache(&target.package_name);
-    if let Some(expected) = &target.expected_identity {
-        client.invalidate_npm_version_metadata_cache(&target.package_name, &expected.version);
-    }
+    let expected_version = target
+        .expected_identity
+        .as_ref()
+        .map(|expected| expected.version.as_str());
+    client.invalidate_routed_metadata_cache(
+        &lpm_registry::UpstreamRoute::NpmDirect,
+        &target.package_name,
+        expected_version,
+    );
     if let Some(routes) = &route_table
-        && let lpm_registry::UpstreamRoute::Custom {
-            target: registry,
-            auth,
-        } = routes.route_for_package(&target.package_name)
+        && let route @ lpm_registry::UpstreamRoute::Custom { .. } =
+            routes.route_for_package(&target.package_name)
     {
-        client.invalidate_custom_metadata_cache(
-            registry.base_url.as_ref(),
-            &target.package_name,
-            auth.as_deref(),
-        );
+        client.invalidate_routed_metadata_cache(&route, &target.package_name, expected_version);
     }
 
     crate::commands::install::run_with_options_with_lpm_root(

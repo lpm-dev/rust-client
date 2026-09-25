@@ -719,7 +719,10 @@ fn dispatch_install_package(
     if !seen.insert(key) {
         return;
     }
-    if fetch_overlap_should_skip_auth(&package.name, route_table) {
+    if super::fetch::credentialed_private_registry(
+        &route_table.route_for_package(&package.name),
+        client,
+    ) {
         stats.skipped_auth_count = stats.skipped_auth_count.saturating_add(1);
         return;
     }
@@ -768,13 +771,6 @@ fn record_overlap_task(
         }
         None => {}
     }
-}
-
-fn fetch_overlap_should_skip_auth(name: &str, route_table: &RouteTable) -> bool {
-    matches!(
-        route_table.route_for_package(name),
-        UpstreamRoute::Custom { auth: Some(_), .. }
-    )
 }
 
 fn install_package_from_selected_event(
@@ -1003,7 +999,7 @@ mod tests {
             .enable_all()
             .build()
             .unwrap();
-        tracing::subscriber::with_default(subscriber, || {
+        crate::test_tracing::with_default(subscriber, || {
             runtime.block_on(async {
                 let manifest = br#"{"name":"shared-package","version":"1.0.0"}"#;
                 let encoder =

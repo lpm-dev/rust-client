@@ -153,11 +153,12 @@ impl MetadataFetchKey {
     pub(super) fn for_request(
         canonical: CanonicalKey,
         exact_version: Option<String>,
+        client: &RegistryClient,
         route_table: &RouteTable,
         policy: &ResolverPolicy,
     ) -> Self {
         let exact_version = exact_version
-            .filter(|_| exact_metadata_fast_path_eligible(route_table, &canonical, policy));
+            .filter(|_| exact_metadata_fast_path_eligible(client, route_table, &canonical, policy));
         Self {
             canonical,
             exact_version,
@@ -325,7 +326,14 @@ pub(super) async fn fetch_preferred_metadata_for_resolver(
     trace_metadata_fetches: bool,
     range: NpmRange,
 ) -> FetchResult {
-    let CanonicalKey::Npm { name } = canonical else {
+    let route = match canonical {
+        CanonicalKey::Npm { name } => Some((name, route_table.route_for_package(name))),
+        _ => None,
+    };
+    let Some((name, access)) = route
+        .as_ref()
+        .and_then(|(name, route)| Some((*name, client.public_npm_access(route)?)))
+    else {
         return fetch_metadata_for_resolver_with_trace_detail(
             client,
             route_table,
@@ -339,7 +347,7 @@ pub(super) async fn fetch_preferred_metadata_for_resolver(
     let started = Instant::now();
     let candidate_range = range.clone();
     let preferred = client
-        .get_npm_preferred_resolution_metadata_with_timings(name, move |version| {
+        .get_npm_preferred_resolution_metadata_with_timings(name, access, move |version| {
             NpmVersion::parse(version).is_ok_and(|version| candidate_range.satisfies(&version))
         })
         .await
@@ -443,7 +451,14 @@ async fn fetch_exact_metadata_with_source(
         prefer_history,
         trace_metadata_fetches,
     } = options;
-    let CanonicalKey::Npm { name } = canonical else {
+    let route = match canonical {
+        CanonicalKey::Npm { name } => Some((name, route_table.route_for_package(name))),
+        _ => None,
+    };
+    let Some((name, access)) = route
+        .as_ref()
+        .and_then(|(name, route)| Some((*name, client.public_npm_access(route)?)))
+    else {
         return fetch_metadata_for_resolver_with_timings(
             client,
             route_table,
@@ -453,19 +468,6 @@ async fn fetch_exact_metadata_with_source(
         )
         .await;
     };
-    if !matches!(
-        route_table.route_for_package(name),
-        UpstreamRoute::NpmDirect
-    ) {
-        return fetch_metadata_for_resolver_with_timings(
-            client,
-            route_table,
-            canonical,
-            policy,
-            include_speculation,
-        )
-        .await;
-    }
 
     let total_start = Instant::now();
     let mut timings = ExperimentalMetadataFetchTimings {
@@ -476,11 +478,11 @@ async fn fetch_exact_metadata_with_source(
     let raw_start = Instant::now();
     let raw = if prefer_history {
         client
-            .get_npm_version_from_history_attempt(name, version)
+            .get_npm_version_from_history_attempt(name, version, access)
             .await
     } else {
         client
-            .get_npm_version_metadata_direct_attempt(name, version)
+            .get_npm_version_metadata_direct_attempt(name, version, access)
             .await
     }
     .map_err(|failure| {
@@ -554,19 +556,30 @@ async fn fetch_exact_metadata_with_source(
     Ok((fetched, timings))
 }
 
-pub(super) fn exact_metadata_fast_path_eligible(
+/// Whether `canonical` is read from the public npm registry, anonymously or
+/// with the credential `.npmrc` scopes to it.
+pub(super) fn reads_public_npm(
+    client: &RegistryClient,
     route_table: &RouteTable,
     canonical: &CanonicalKey,
-    policy: &ResolverPolicy,
 ) -> bool {
     let CanonicalKey::Npm { name } = canonical else {
         return false;
     };
-    matches!(
-        route_table.route_for_package(name),
-        UpstreamRoute::NpmDirect
-    ) && !policy.requires_trust_history()
+    client
+        .public_npm_access(&route_table.route_for_package(name))
+        .is_some()
+}
+
+pub(super) fn exact_metadata_fast_path_eligible(
+    client: &RegistryClient,
+    route_table: &RouteTable,
+    canonical: &CanonicalKey,
+    policy: &ResolverPolicy,
+) -> bool {
+    !policy.requires_trust_history()
         && !policy.release_age_applies_to_package(canonical)
+        && reads_public_npm(client, route_table, canonical)
 }
 
 pub(super) enum ExactMetadataFetchOutcome {
@@ -1204,6 +1217,7 @@ pub(super) struct MetadataFetchCompletion<'a> {
     pub(super) shared_cache: &'a SharedCache,
     pub(super) shared_fact_cache: Option<&'a SharedCache>,
     pub(super) route_table: &'a RouteTable,
+    pub(super) client: &'a RegistryClient,
     pub(super) counted_metadata_edge_misses: Option<&'a mut AHashSet<MetadataFetchKey>>,
     pub(super) trace_metadata_fetches: bool,
     pub(super) spec_tx: Option<&'a tokio::sync::mpsc::Sender<(String, SpeculativePackageMetadata)>>,
@@ -1299,7 +1313,11 @@ pub(super) fn complete_metadata_fetch(
                             range: &edge.range,
                             info: &info,
                             latest_version: latest_version.as_ref(),
-                            route_table: completion.route_table,
+                            public_npm: reads_public_npm(
+                                completion.client,
+                                completion.route_table,
+                                &canonical,
+                            ),
                             policy: &completion.state.policy,
                             compare_policy_pick: completion.trace_metadata_fetches,
                         });

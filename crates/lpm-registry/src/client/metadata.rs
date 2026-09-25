@@ -453,7 +453,7 @@ impl RegistryClient {
         Self::metadata_cache_key_for_principal(namespace, registry_url, &principal, name)
     }
 
-    fn metadata_cache_key_for_principal(
+    pub(super) fn metadata_cache_key_for_principal(
         namespace: &str,
         registry_url: &str,
         principal: &str,
@@ -489,28 +489,44 @@ impl RegistryClient {
         ))
     }
 
-    pub(super) fn npm_direct_metadata_cache_key(&self, name: &str) -> String {
-        self.metadata_cache_key_for_origin("npm-direct", &self.npm_registry_url, name, None)
+    pub(super) fn npm_direct_metadata_cache_key(
+        &self,
+        name: &str,
+        access: PublicNpmAccess<'_>,
+    ) -> String {
+        self.npm_access_cache_key("npm-direct", name, access)
     }
 
     pub(super) fn npm_direct_version_metadata_cache_key(
         &self,
         name: &str,
         version: &str,
+        access: PublicNpmAccess<'_>,
     ) -> String {
-        self.npm_version_metadata_cache_key("npm-direct-version", name, version)
+        self.npm_version_metadata_cache_key("npm-direct-version", name, version, access)
     }
 
-    pub(super) fn npm_selected_history_cache_key(&self, name: &str, version: &str) -> String {
-        self.npm_version_metadata_cache_key("npm-direct-selected-full", name, version)
+    pub(super) fn npm_selected_history_cache_key(
+        &self,
+        name: &str,
+        version: &str,
+        access: PublicNpmAccess<'_>,
+    ) -> String {
+        self.npm_version_metadata_cache_key("npm-direct-selected-full", name, version, access)
     }
 
-    fn npm_version_metadata_cache_key(&self, namespace: &str, name: &str, version: &str) -> String {
+    fn npm_version_metadata_cache_key(
+        &self,
+        namespace: &str,
+        name: &str,
+        version: &str,
+        access: PublicNpmAccess<'_>,
+    ) -> String {
         let mut document = String::with_capacity(name.len() + version.len() + 1);
         document.push_str(name);
         document.push('@');
         document.push_str(version);
-        self.metadata_cache_key_for_origin(namespace, &self.npm_registry_url, &document, None)
+        self.npm_access_cache_key(namespace, &document, access)
     }
 
     pub(super) fn npm_worker_full_metadata_cache_key(
@@ -1694,7 +1710,7 @@ impl RegistryClient {
 
         // Tier 3: Fall back to public npm registry (no auth needed)
         // Use abbreviated packument to reduce payload by 50-90%
-        let direct_cache_key = self.npm_direct_metadata_cache_key(name);
+        let direct_cache_key = self.npm_direct_metadata_cache_key(name, PublicNpmAccess::ANONYMOUS);
         if let Some((cached, _etag)) = self.read_metadata_cache_async(&direct_cache_key).await
             && batch_metadata_entry_matches_name(name, &cached)
         {
@@ -1784,8 +1800,12 @@ impl RegistryClient {
         &self,
         name: &str,
     ) -> Result<TimedPackageMetadata, LpmError> {
-        self.get_npm_metadata_direct_inner(name, MetadataCachePolicy::UseFresh)
-            .await
+        self.get_npm_metadata_direct_inner(
+            name,
+            MetadataCachePolicy::UseFresh,
+            PublicNpmAccess::ANONYMOUS,
+        )
+        .await
     }
 
     /// Revalidate direct npm metadata regardless of the normal install TTL.
@@ -1793,17 +1813,22 @@ impl RegistryClient {
         &self,
         name: &str,
     ) -> Result<TimedPackageMetadata, LpmError> {
-        self.get_npm_metadata_direct_inner(name, MetadataCachePolicy::Revalidate)
-            .await
+        self.get_npm_metadata_direct_inner(
+            name,
+            MetadataCachePolicy::Revalidate,
+            PublicNpmAccess::ANONYMOUS,
+        )
+        .await
     }
 
     async fn get_npm_metadata_direct_inner(
         &self,
         name: &str,
         cache_policy: MetadataCachePolicy,
+        access: PublicNpmAccess<'_>,
     ) -> Result<TimedPackageMetadata, LpmError> {
         crate::timing::record_metadata_request(name);
-        let cache_key = self.npm_direct_metadata_cache_key(name);
+        let cache_key = self.npm_direct_metadata_cache_key(name, access);
         let memory_cache_key = self.direct_metadata_memory_cache_key(&cache_key);
         let mut timings = PackageMetadataFetchTimings::default();
 
@@ -1902,14 +1927,14 @@ impl RegistryClient {
         let npm_url = format!("{}/{}", self.npm_registry_url, name);
         tracing::debug!("fetching {name} direct from npm registry");
         let req = self
-            .http
-            .for_url(&npm_url)
-            .await?
-            .get(&npm_url)
-            .header("Accept", "application/vnd.npm.install-v1+json");
+            .npm_registry_get(&npm_url, "application/vnd.npm.install-v1+json", access)
+            .await?;
         let req = Self::apply_cached_etag(req, cache_validator.as_ref());
         let http_start = std::time::Instant::now();
-        let mut response = match self.send_package_metadata_request(req).await {
+        let mut response = match self
+            .send_package_metadata_request_with_npmrc_auth(req, access.auth())
+            .await
+        {
             Ok(r) => {
                 timings.http_ms = timings
                     .http_ms
@@ -1947,13 +1972,13 @@ impl RegistryClient {
             timings.cache_after_304_ms = cache_304_start.elapsed().as_millis();
             timings.not_modified = false;
             let req = self
-                .http
-                .for_url(&npm_url)
-                .await?
-                .get(&npm_url)
-                .header("Accept", "application/vnd.npm.install-v1+json");
+                .npm_registry_get(&npm_url, "application/vnd.npm.install-v1+json", access)
+                .await?;
             let retry_http_start = std::time::Instant::now();
-            response = match self.send_package_metadata_request(req).await {
+            response = match self
+                .send_package_metadata_request_with_npmrc_auth(req, access.auth())
+                .await
+            {
                 Ok(r) => {
                     timings.http_ms = timings
                         .http_ms
@@ -2005,7 +2030,7 @@ impl RegistryClient {
         name: &str,
         version: &str,
     ) -> Result<TimedPackageMetadata, LpmError> {
-        self.get_npm_version_metadata_direct_attempt(name, version)
+        self.get_npm_version_metadata_direct_attempt(name, version, PublicNpmAccess::ANONYMOUS)
             .await
             .map_err(|failure| failure.error)
     }
@@ -2015,9 +2040,10 @@ impl RegistryClient {
         &self,
         name: &str,
         version: &str,
+        access: PublicNpmAccess<'_>,
     ) -> Result<TimedPackageMetadata, Box<PackageMetadataFetchError>> {
         let (result, timings) = self
-            .get_npm_selected_version_with_timings(name, version, false)
+            .get_npm_selected_version_with_timings(name, version, false, access)
             .await;
         result.map_err(|error| Box::new(PackageMetadataFetchError { error, timings }))
     }
@@ -2029,7 +2055,7 @@ impl RegistryClient {
         name: &str,
         version: &str,
     ) -> Result<TimedPackageMetadata, LpmError> {
-        self.get_npm_version_from_history_attempt(name, version)
+        self.get_npm_version_from_history_attempt(name, version, PublicNpmAccess::ANONYMOUS)
             .await
             .map_err(|failure| failure.error)
     }
@@ -2039,16 +2065,17 @@ impl RegistryClient {
         &self,
         name: &str,
         version: &str,
+        access: PublicNpmAccess<'_>,
     ) -> Result<TimedPackageMetadata, Box<PackageMetadataFetchError>> {
         let (result, failed_timings) = self
-            .get_npm_selected_version_with_timings(name, version, true)
+            .get_npm_selected_version_with_timings(name, version, true, access)
             .await;
         match result {
             Ok(metadata) => Ok(metadata),
             Err(error) => {
                 tracing::debug!("selected npm history for {name}@{version} unavailable: {error}");
                 match self
-                    .get_npm_version_metadata_direct_attempt(name, version)
+                    .get_npm_version_metadata_direct_attempt(name, version, access)
                     .await
                 {
                     Ok(mut fallback) => {
@@ -2069,15 +2096,16 @@ impl RegistryClient {
         name: &str,
         version: &str,
         from_history: bool,
+        access: PublicNpmAccess<'_>,
     ) -> (
         Result<TimedPackageMetadata, LpmError>,
         PackageMetadataFetchTimings,
     ) {
         crate::timing::record_metadata_request(name);
         let cache_key = if from_history {
-            self.npm_selected_history_cache_key(name, version)
+            self.npm_selected_history_cache_key(name, version, access)
         } else {
-            self.npm_direct_version_metadata_cache_key(name, version)
+            self.npm_direct_version_metadata_cache_key(name, version, access)
         };
         let mut timings = PackageMetadataFetchTimings {
             selected_from_history: from_history,
@@ -2104,7 +2132,7 @@ impl RegistryClient {
                 );
             }
             if from_history {
-                let legacy_key = self.npm_direct_version_metadata_cache_key(name, version);
+                let legacy_key = self.npm_direct_version_metadata_cache_key(name, version, access);
                 if let Some((cached, _)) = self.read_metadata_cache_async(&legacy_key).await
                     && package_metadata_matches_version_doc(name, version, &cached)
                 {
@@ -2149,14 +2177,7 @@ impl RegistryClient {
             let history_key = (from_history
                 && cache_validator.is_none()
                 && (self.cache_dir.is_some() || self.metadata_memory_cache.is_some()))
-            .then(|| {
-                self.metadata_cache_key_for_origin(
-                    "npm-direct-raw-full",
-                    &self.npm_registry_url,
-                    name,
-                    None,
-                )
-            });
+            .then(|| self.npm_access_cache_key("npm-direct-raw-full", name, access));
             let mut history_flight = match history_key.as_deref() {
                 Some(key) => self.history_cache.flight(key).await,
                 None => None,
@@ -2232,14 +2253,14 @@ impl RegistryClient {
             };
             tracing::debug!("fetching {name}@{version} direct from npm registry");
             let req = self
-                .http
-                .for_url(&npm_url)
-                .await?
-                .get(&npm_url)
-                .header("Accept", "application/json");
+                .npm_registry_get(&npm_url, "application/json", access)
+                .await?;
             let req = Self::apply_cached_etag(req, cache_validator.as_ref());
             let http_start = std::time::Instant::now();
-            let mut response = match self.send_package_metadata_request(req).await {
+            let mut response = match self
+                .send_package_metadata_request_with_npmrc_auth(req, access.auth())
+                .await
+            {
                 Ok(r) => {
                     timings.http_ms = timings
                         .http_ms
@@ -2278,13 +2299,13 @@ impl RegistryClient {
                 timings.cache_after_304_ms = cache_304_start.elapsed().as_millis();
                 timings.not_modified = false;
                 let req = self
-                    .http
-                    .for_url(&npm_url)
-                    .await?
-                    .get(&npm_url)
-                    .header("Accept", "application/json");
+                    .npm_registry_get(&npm_url, "application/json", access)
+                    .await?;
                 let retry_http_start = std::time::Instant::now();
-                response = match self.send_package_metadata_request(req).await {
+                response = match self
+                    .send_package_metadata_request_with_npmrc_auth(req, access.auth())
+                    .await
+                {
                     Ok(r) => {
                         timings.http_ms = timings
                             .http_ms
@@ -3176,7 +3197,8 @@ impl RegistryClient {
                     timings,
                 });
             }
-            let abbreviated_cache_key = self.npm_direct_metadata_cache_key(name);
+            let abbreviated_cache_key =
+                self.npm_direct_metadata_cache_key(name, PublicNpmAccess::ANONYMOUS);
             if let Some(cached) = self
                 .cached_release_times_from_metadata_cache(name, &abbreviated_cache_key)
                 .await
@@ -3520,13 +3542,16 @@ impl RegistryClient {
             versions: HashMap::with_capacity(versions.len()),
         };
         let mut missing = std::collections::HashSet::with_capacity(versions.len());
+        let access = self.public_npm_access(&route);
         for &version in versions {
             if result.versions.contains_key(version) || missing.contains(version) {
                 continue;
             }
-            if matches!(route, crate::UpstreamRoute::NpmDirect)
+            if let Some(access) = access
                 && let Some((mut metadata, _)) = self
-                    .read_metadata_cache_async(&self.npm_selected_history_cache_key(name, version))
+                    .read_metadata_cache_async(
+                        &self.npm_selected_history_cache_key(name, version, access),
+                    )
                     .await
                 && package_metadata_matches_version_doc(name, version, &metadata)
                 && metadata.time.contains_key(version)
@@ -3577,8 +3602,8 @@ impl RegistryClient {
     /// fetch + cache write), then projects the result down to the minimal type
     /// without a second deserialization pass.
     ///
-    /// **Custom routes** (`UpstreamRoute::Custom`) use a principal-fingerprint
-    /// cache key that is computed inside [`get_npm_metadata_from`] and is not
+    /// **Custom routes** to other registries use a principal-fingerprint cache
+    /// key that is computed inside [`get_npm_metadata_from`] and is not
     /// reproducible here — those routes skip the fast path and go straight to
     /// the full fetch + projection.
     pub async fn get_npm_blocked_set_meta(
@@ -3587,10 +3612,12 @@ impl RegistryClient {
         route: crate::UpstreamRoute,
     ) -> Option<crate::types::BlockedSetPackageMeta> {
         crate::timing::record_metadata_request(name);
-        let cache_key = match &route {
-            crate::UpstreamRoute::LpmWorker => self.npm_worker_metadata_cache_key(name).ok(),
-            crate::UpstreamRoute::NpmDirect => Some(self.npm_direct_metadata_cache_key(name)),
-            crate::UpstreamRoute::Custom { .. } => None,
+        let cache_key = match (&route, self.public_npm_access(&route)) {
+            (_, Some(access)) => Some(self.npm_direct_metadata_cache_key(name, access)),
+            (crate::UpstreamRoute::LpmWorker, None) => {
+                self.npm_worker_metadata_cache_key(name).ok()
+            }
+            (_, None) => None,
         };
         if let Some(cache_key) = cache_key
             && let Some((meta, _)) = self
@@ -3693,6 +3720,11 @@ impl RegistryClient {
         auth: Option<&crate::npmrc::RegistryAuth>,
         cache_policy: MetadataCachePolicy,
     ) -> Result<TimedPackageMetadata, LpmError> {
+        if self.is_npm_registry(base_url) {
+            return self
+                .get_npm_metadata_direct_inner(name, cache_policy, PublicNpmAccess::with_auth(auth))
+                .await;
+        }
         crate::timing::record_metadata_request(name);
         let destination = RequestDestination::parse(&format!("{base_url}/{name}"))?;
         let url = destination.as_str();

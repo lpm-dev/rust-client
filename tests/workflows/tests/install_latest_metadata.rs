@@ -154,3 +154,109 @@ async fn optional_latest_keeps_portable_platform_metadata_without_fetching_paylo
     );
     registry.server().verify().await;
 }
+
+#[tokio::test]
+async fn credentialed_npm_registry_install_uses_the_direct_npm_documents() {
+    const ABBREVIATED: &str = "application/vnd.npm.install-v1+json";
+    let registry = MockRegistry::start().await;
+    let ranged_tarball =
+        make_tarball_from_pkg_json(serde_json::json!({"name":"ranged","version":"1.1.0"}), &[]);
+    let ranged = registry.package_metadata("ranged", "1.1.0", &ranged_tarball);
+    Mock::given(method("GET"))
+        .and(path("/ranged/latest"))
+        .and(header("Accept", "application/json"))
+        .and(header("Authorization", "Bearer npm-token"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(&ranged["versions"]["1.1.0"]))
+        .expect(1)
+        .mount(registry.server())
+        .await;
+    // The history raced against the latest document trails it.
+    Mock::given(method("GET"))
+        .and(path("/ranged"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(&ranged)
+                .set_delay(std::time::Duration::from_secs(2)),
+        )
+        .up_to_n_times(1)
+        .with_priority(1)
+        .mount(registry.server())
+        .await;
+    registry
+        .with_package_metadata("ranged", "1.1.0", &ranged_tarball, ranged)
+        .await;
+
+    let manifest = serde_json::json!({
+        "name": "pinned",
+        "version": "1.2.3",
+        "scripts": {"install": "node -e \"process.exit(37)\""}
+    });
+    let pinned_tarball = make_tarball_from_pkg_json(manifest.clone(), &[]);
+    let mut pinned = registry.package_metadata("pinned", "1.2.3", &pinned_tarball);
+    pinned["versions"]["1.2.3"]["scripts"] = manifest["scripts"].clone();
+    pinned["time"]["1.2.3"] = serde_json::json!("2025-01-01T00:00:00Z");
+    // Exact pins and their publication times come from selected history.
+    Mock::given(method("GET"))
+        .and(path("/pinned"))
+        .and(header("Accept", ABBREVIATED))
+        .respond_with(ResponseTemplate::new(500))
+        .with_priority(1)
+        .expect(0)
+        .mount(registry.server())
+        .await;
+    registry
+        .with_package_metadata("pinned", "1.2.3", &pinned_tarball, pinned)
+        .await;
+
+    let project = TempProject::empty(
+        r#"{"name":"credentialed-install","version":"1.0.0","dependencies":{"pinned":"1.2.3","ranged":"^1.0.0"}}"#,
+    );
+    let address = registry.server().address();
+    project.write_private_file(
+        ".npmrc",
+        &format!(
+            "registry={}/\n//{}:{}/:_authToken=npm-token\n",
+            registry.url(),
+            address.ip(),
+            address.port()
+        ),
+    );
+    lpm_with_registry_and_npm(&project, &registry.url())
+        .args([
+            "install",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .assert()
+        .success();
+
+    for (name, version) in [("pinned", "1.2.3"), ("ranged", "1.1.0")] {
+        let installed: serde_json::Value =
+            serde_json::from_str(&project.read_file(&format!("node_modules/{name}/package.json")))
+                .unwrap();
+        assert_eq!(installed["version"], version);
+    }
+    let state: serde_json::Value =
+        serde_json::from_str(&project.read_file(".lpm/build-state.json")).unwrap();
+    let blocked = state["blocked_packages"].as_array().unwrap();
+    assert_eq!(blocked.len(), 1);
+    assert_eq!(blocked[0]["name"], "pinned");
+    assert_eq!(blocked[0]["published_at"], "2025-01-01T00:00:00Z");
+    let requests = registry.server().received_requests().await.unwrap();
+    for request in requests
+        .iter()
+        .filter(|request| !request.url.path().starts_with("/api/"))
+    {
+        assert_eq!(
+            request
+                .headers
+                .get("authorization")
+                .map(|value| value.to_str().unwrap()),
+            Some("Bearer npm-token"),
+            "{}",
+            request.url
+        );
+    }
+    registry.server().verify().await;
+}
