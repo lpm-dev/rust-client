@@ -13,6 +13,34 @@ pub(super) struct HistoryBody {
     _permit: OwnedSemaphorePermit,
 }
 
+#[derive(Default)]
+struct HistoryBuffer(Vec<u8>);
+
+impl std::io::Write for HistoryBuffer {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        let length = self.0.len().saturating_add(bytes.len());
+        if length > MAX_HISTORY_ENTRY_BYTES {
+            return Err(std::io::Error::other(
+                "history entry exceeds retention limit",
+            ));
+        }
+        if length > self.0.capacity() {
+            let capacity = length
+                .next_power_of_two()
+                .clamp(1024, MAX_HISTORY_ENTRY_BYTES);
+            self.0
+                .try_reserve_exact(capacity - self.0.len())
+                .map_err(std::io::Error::other)?;
+        }
+        self.0.extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
 impl HistoryBody {
     pub(super) fn bytes(&self) -> &[u8] {
         &self.bytes
@@ -102,6 +130,26 @@ impl HistoryCache {
         }))
     }
 
+    pub(super) fn retain_json(&self, value: &impl serde::Serialize) -> Option<Arc<HistoryBody>> {
+        let mut buffer = HistoryBuffer::default();
+        serde_json::to_writer(&mut buffer, value).ok()?;
+        self.retain(buffer.0)
+    }
+
+    pub(super) fn retain_compact(&self, bytes: Vec<u8>) -> Option<Arc<HistoryBody>> {
+        let length = bytes.len();
+        if length > MAX_HISTORY_ENTRY_BYTES {
+            return None;
+        }
+        let permit = Arc::clone(&self.budget)
+            .try_acquire_many_owned(length as u32)
+            .ok()?;
+        Some(Arc::new(HistoryBody {
+            bytes: bytes.into_boxed_slice().into_vec(),
+            _permit: permit,
+        }))
+    }
+
     pub(super) fn insert(&self, key: String, generation: u64, entry: HistoryEntry) {
         let mut state = self
             .state
@@ -147,6 +195,31 @@ impl HistoryCache {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn compact_retention_charges_only_the_retained_allocation_and_releases_it() {
+        let cache = HistoryCache::default();
+        let mut bytes = Vec::with_capacity(64 * 1024);
+        bytes.extend_from_slice(b"small document");
+        let length = bytes.len();
+        let body = cache.retain_compact(bytes).unwrap();
+        assert_eq!(body.bytes(), b"small document");
+        assert_eq!(body.bytes.capacity(), length);
+        assert_eq!(cache.budget.available_permits(), MAX_HISTORY_BYTES - length);
+        drop(body);
+        assert_eq!(cache.budget.available_permits(), MAX_HISTORY_BYTES);
+    }
+
+    #[test]
+    fn compact_retention_rejects_oversized_documents_without_taking_budget() {
+        let cache = HistoryCache::default();
+        assert!(
+            cache
+                .retain_compact(vec![0; MAX_HISTORY_ENTRY_BYTES + 1])
+                .is_none()
+        );
+        assert_eq!(cache.budget.available_permits(), MAX_HISTORY_BYTES);
+    }
 
     fn entry(body: Arc<HistoryBody>) -> HistoryEntry {
         HistoryEntry {
@@ -223,6 +296,20 @@ mod tests {
         assert_eq!(cache.budget.available_permits(), 0);
         drop(retained);
         assert_eq!(cache.budget.available_permits(), MAX_HISTORY_BYTES);
+    }
+
+    #[test]
+    fn serialized_history_retention_rejects_oversized_values() {
+        let cache = HistoryCache::default();
+        assert!(
+            cache
+                .retain_json(&"x".repeat(MAX_HISTORY_ENTRY_BYTES))
+                .is_none()
+        );
+        assert_eq!(cache.budget.available_permits(), MAX_HISTORY_BYTES);
+        let body = cache.retain_json(&"small").unwrap();
+        assert_eq!(body.bytes(), br#""small""#);
+        assert!(cache.budget.available_permits() < MAX_HISTORY_BYTES);
     }
 
     #[tokio::test]

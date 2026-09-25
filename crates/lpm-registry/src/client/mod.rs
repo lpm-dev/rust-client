@@ -57,7 +57,7 @@ pub use self::metadata::BatchMetadataEntryStream;
 pub use self::state::{
     CompressedTarballSpoolReservation, DownloadedTarball, FanOutStats, HttpClients,
     PackageMetadataFetchError, PackageMetadataFetchTimings, RegistryClient, TimedPackageMetadata,
-    TimedReleaseTimeMetadata,
+    TimedPreferredMetadata, TimedReleaseTimeMetadata,
 };
 pub use self::tarball::{
     MAX_COMPRESSED_TARBALL_SIZE, MAX_COMPRESSED_TARBALL_SPOOL_BYTES,
