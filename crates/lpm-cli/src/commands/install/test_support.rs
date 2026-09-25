@@ -1,3 +1,33 @@
+#[cfg(test)]
+pub(super) struct BlockingExtractGate {
+    pub(super) started: std::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+    pub(super) resume: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
+    pub(super) finished: std::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+}
+
+#[cfg(test)]
+pub(super) struct BlockingExtractGuard(std::sync::Arc<BlockingExtractGate>);
+
+#[cfg(test)]
+impl BlockingExtractGate {
+    pub(super) fn enter(self: std::sync::Arc<Self>) -> BlockingExtractGuard {
+        if let Some(started) = self.started.lock().unwrap().take() {
+            let _ = started.send(());
+        }
+        let _ = self.resume.lock().unwrap().recv();
+        BlockingExtractGuard(self)
+    }
+}
+
+#[cfg(test)]
+impl Drop for BlockingExtractGuard {
+    fn drop(&mut self) {
+        if let Some(finished) = self.0.finished.lock().unwrap().take() {
+            let _ = finished.send(());
+        }
+    }
+}
+
 /// Test-only deterministic-panic injection hook.
 ///
 /// In debug builds only, when `LPM_TEST_PANIC_AT` matches the stage
