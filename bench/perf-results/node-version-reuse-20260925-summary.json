@@ -1,0 +1,121 @@
+{
+ "baseline": "#890 head 9912045e3, release build",
+ "machine": "Apple M-series Mac, macOS, Node 24.19.0 as a real binary (~/.n/bin/node), Bun from performance-archive/20260924",
+ "method": "Projects installed once from the live registry, copied per variant; commands run through identical wrapper scripts; hyperfine -N; medians and nearest-rank p95 in milliseconds; background browser load present",
+ "installs": {
+  "native-sharp-up-to-date": {
+   "baseline-pipeline": {
+    "median_ms": 24.6,
+    "p95_ms": 31.2,
+    "runs": 40
+   },
+   "change-pipeline": {
+    "median_ms": 10.68,
+    "p95_ms": 14.92,
+    "runs": 40
+   },
+   "baseline-lane": {
+    "median_ms": 19.34,
+    "p95_ms": 19.82,
+    "runs": 40
+   },
+   "change-lane": {
+    "median_ms": 6.46,
+    "p95_ms": 7.01,
+    "runs": 40
+   },
+   "bun": {
+    "median_ms": 5.22,
+    "p95_ms": 6.39,
+    "runs": 40
+   }
+  },
+  "t3-ci-warm-paired": {
+   "baseline_median_ms": 84.44,
+   "change_median_ms": 85.28,
+   "paired_median_delta_ms": 0.75,
+   "change_faster_rounds": 23
+  },
+  "t3-installed-cache-gone": {
+   "baseline": {
+    "median_ms": 25.59,
+    "p95_ms": 30.33,
+    "runs": 30
+   },
+   "change": {
+    "median_ms": 13.72,
+    "p95_ms": 15.39,
+    "runs": 30
+   }
+  },
+  "t3-node-modules-removed": {
+   "baseline": {
+    "median_ms": 82.38,
+    "p95_ms": 101.52,
+    "runs": 30
+   },
+   "change": {
+    "median_ms": 75.95,
+    "p95_ms": 87.94,
+    "runs": 30
+   }
+  },
+  "t3-up-to-date": {
+   "baseline-pipeline": {
+    "median_ms": 25.22,
+    "p95_ms": 26.32,
+    "runs": 40
+   },
+   "change-pipeline": {
+    "median_ms": 14.6,
+    "p95_ms": 19.57,
+    "runs": 40
+   },
+   "baseline-lane": {
+    "median_ms": 21.4,
+    "p95_ms": 22.29,
+    "runs": 40
+   },
+   "change-lane": {
+    "median_ms": 8.41,
+    "p95_ms": 9.37,
+    "runs": 40
+   },
+   "bun": {
+    "median_ms": 9.91,
+    "p95_ms": 10.81,
+    "runs": 40
+   }
+  }
+ },
+ "profile_up_to_date_t3": {
+  "installs_sampled": 60,
+  "sample_rate_hz": 10000,
+  "engine_filter_wait_on_node_probe_ms_per_install": 9.75
+ },
+ "node_stub_ab_up_to_date_t3_ms": {
+  "real_node": 22.1,
+  "native_stub": 13.8
+ },
+ "node_version_process_ms": 10.5,
+ "probe_wait_microbenchmark": {
+  "probes_per_variant": 200,
+  "real_node_median_ms": {
+   "polling": 12.78,
+   "event_driven": 10.63
+  },
+  "native_stub_median_ms": {
+   "polling": 2.67,
+   "event_driven": 1.24
+  }
+ },
+ "fingerprint_cost_t3_us": {
+  "median": 201,
+  "p90": 248
+ },
+ "ci_warm_internal_total_ms": {
+  "baseline": 61.5,
+  "change": 60.5,
+  "runs": 24
+ }
+}

@@ -20,6 +20,7 @@
 
 use crate::detect;
 use crate::node;
+use crate::node_identity::{ScriptNodeIdentity, script_node_identity};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::ffi::{OsStr, OsString};
@@ -58,10 +59,26 @@ pub struct PathNodeResolution {
     executable: Option<PathBuf>,
 }
 
+/// Node version that an earlier probe reported for a runtime fingerprint.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ObservedNodeVersion {
+    runtime_fingerprint: String,
+    version: String,
+}
+
+impl ObservedNodeVersion {
+    /// Pair a bare version with the fingerprint it was observed under.
+    pub fn new(runtime_fingerprint: impl Into<String>, version: impl Into<String>) -> Self {
+        Self {
+            runtime_fingerprint: runtime_fingerprint.into(),
+            version: version.into(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct PathNodeIdentity {
-    canonical_executable: PathBuf,
-    runtime_fingerprint: String,
+    script: ScriptNodeIdentity,
     context: PathNodeCacheContext,
 }
 
@@ -121,6 +138,20 @@ impl PathNodeVersionCache {
     /// only when the canonical executable, metadata fingerprint, and execution
     /// context match.
     pub fn resolve(&mut self, cwd: &Path, path: &OsStr) -> PathNodeResolution {
+        self.resolve_with_observed(cwd, path, None)
+    }
+
+    /// Resolve like [`Self::resolve`], reusing `observed` instead of probing
+    /// when a real Node binary still has the fingerprint it was observed under.
+    ///
+    /// Launchers are always probed: a shim can select another version through
+    /// inputs that its fingerprint does not cover.
+    pub fn resolve_with_observed(
+        &mut self,
+        cwd: &Path,
+        path: &OsStr,
+        observed: Option<&ObservedNodeVersion>,
+    ) -> PathNodeResolution {
         if self.managed_node_root.is_none() {
             self.managed_node_root = managed_node_root();
         }
@@ -135,6 +166,19 @@ impl PathNodeVersionCache {
         {
             return cached.clone();
         }
+        if let (Some(identity), Some(observed)) = (identity_before.as_ref(), observed)
+            && identity.script.node_binary
+            && identity.script.fingerprint == observed.runtime_fingerprint
+        {
+            let resolution = PathNodeResolution {
+                version: Some(observed.version.clone()),
+                runtime_fingerprint: Some(observed.runtime_fingerprint.clone()),
+                executable: executable_before,
+            };
+            self.resolutions
+                .insert(identity.clone(), resolution.clone());
+            return resolution;
+        }
 
         let version = node_version_on_path(cwd, path, executable_before.as_deref());
         let identity_after = node_executable_in_path(cwd, path)
@@ -146,7 +190,7 @@ impl PathNodeVersionCache {
             version,
             runtime_fingerprint: stable_identity
                 .as_ref()
-                .map(|identity| identity.runtime_fingerprint.clone()),
+                .map(|identity| identity.script.fingerprint.clone()),
             executable: executable_before,
         };
         if let Some(identity) = stable_identity {
@@ -236,10 +280,21 @@ pub fn resolve_node_on_path_with_fingerprint(cwd: &Path, path: &OsStr) -> PathNo
     PathNodeVersionCache::default().resolve(cwd, path)
 }
 
+/// Resolve like [`resolve_node_on_path_with_fingerprint`], reusing `observed`
+/// for an unchanged Node binary. See [`PathNodeVersionCache::resolve_with_observed`].
+pub fn resolve_node_on_path_with_observed(
+    cwd: &Path,
+    path: &OsStr,
+    observed: Option<&ObservedNodeVersion>,
+) -> PathNodeResolution {
+    PathNodeVersionCache::default().resolve_with_observed(cwd, path, observed)
+}
+
 /// Fingerprint the Node executable selected by a script's cwd and `PATH`.
 pub fn probe_node_fingerprint_on_path(cwd: &Path, path: &OsStr) -> Option<String> {
-    let executable = runtime_executable_in_path(cwd, path, detect::RuntimeKind::Node)?;
-    executable_fingerprint(b"script-path\0", &executable)
+    let executable = node_executable_in_path(cwd, path)?;
+    script_node_identity(&executable, cwd, path, managed_node_root().as_deref())
+        .map(|identity| identity.fingerprint)
 }
 
 /// Fingerprint a Node or Bun executable selected by a script's cwd and `PATH`.
@@ -498,22 +553,17 @@ fn path_node_identity(
     path: &OsStr,
     managed_node_root: Option<&Path>,
 ) -> Option<PathNodeIdentity> {
-    let canonical_executable = executable.canonicalize().ok()?;
-    let runtime_fingerprint =
-        executable_fingerprint_from_canonical(b"script-path\0", &canonical_executable)?;
-    let context = if managed_node_root.is_some_and(|root| canonical_executable.starts_with(root)) {
-        PathNodeCacheContext::LpmManaged
-    } else {
-        PathNodeCacheContext::Script {
-            working_directory: cwd.canonicalize().ok()?,
-            search_path: path.to_os_string(),
-        }
-    };
-    Some(PathNodeIdentity {
-        canonical_executable,
-        runtime_fingerprint,
-        context,
-    })
+    let script = script_node_identity(executable, cwd, path, managed_node_root)?;
+    let context =
+        if managed_node_root.is_some_and(|root| script.canonical_executable.starts_with(root)) {
+            PathNodeCacheContext::LpmManaged
+        } else {
+            PathNodeCacheContext::Script {
+                working_directory: cwd.canonicalize().ok()?,
+                search_path: path.to_os_string(),
+            }
+        };
+    Some(PathNodeIdentity { script, context })
 }
 
 fn managed_node_root() -> Option<PathBuf> {
@@ -534,7 +584,12 @@ fn executable_fingerprint_from_canonical(kind: &[u8], canonical: &Path) -> Optio
     hasher.update(b"lpm-node-runtime-fingerprint-v1\0");
     hasher.update(kind);
     hash_os_string(&mut hasher, canonical.as_os_str());
+    update_with_file_metadata(&mut hasher, &metadata);
+    Some(format!("{:x}", hasher.finalize()))
+}
 
+/// Hash the metadata that changes when a file is replaced or rewritten.
+pub(crate) fn update_with_file_metadata(hasher: &mut Sha256, metadata: &std::fs::Metadata) {
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
@@ -566,8 +621,6 @@ fn executable_fingerprint_from_canonical(kind: &[u8], canonical: &Path) -> Optio
             hasher.update(elapsed.as_nanos().to_le_bytes());
         }
     }
-
-    Some(format!("{:x}", hasher.finalize()))
 }
 
 #[cfg(unix)]
@@ -857,6 +910,65 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
 
         assert!(node_executable_in_path(dir.path(), dir.path().as_os_str()).is_none());
+    }
+
+    #[test]
+    fn observed_version_replaces_the_probe_for_an_unchanged_node_binary() {
+        let dir = tempfile::tempdir().unwrap();
+        let node = test_node_path(dir.path());
+        crate::node_identity::write_unrunnable_node_binary(&node);
+        let path = std::env::join_paths([dir.path()]).unwrap();
+        let fingerprint = probe_node_fingerprint_on_path(dir.path(), &path).unwrap();
+        let observed = ObservedNodeVersion::new(fingerprint.clone(), "22.1.0");
+
+        let reused = resolve_node_on_path_with_observed(dir.path(), &path, Some(&observed));
+        assert_eq!(reused.version(), Some("22.1.0"));
+        assert_eq!(reused.runtime_fingerprint(), Some(fingerprint.as_str()));
+        assert_eq!(
+            resolve_node_on_path_with_fingerprint(dir.path(), &path).version(),
+            None,
+            "the unrunnable binary must not produce a version when probed"
+        );
+    }
+
+    #[test]
+    fn observed_version_is_ignored_once_the_node_binary_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        let node = test_node_path(dir.path());
+        crate::node_identity::write_unrunnable_node_binary(&node);
+        let path = std::env::join_paths([dir.path()]).unwrap();
+        let observed = ObservedNodeVersion::new(
+            probe_node_fingerprint_on_path(dir.path(), &path).unwrap(),
+            "22.1.0",
+        );
+        fs::remove_file(&node).unwrap();
+        crate::node_identity::write_unrunnable_node_binary(&node);
+        fs::File::options()
+            .write(true)
+            .open(&node)
+            .unwrap()
+            .set_len(32 * 1024 * 1024)
+            .unwrap();
+
+        let resolution = resolve_node_on_path_with_observed(dir.path(), &path, Some(&observed));
+
+        assert_eq!(resolution.version(), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn launchers_are_probed_despite_a_matching_observed_version() {
+        let dir = tempfile::tempdir().unwrap();
+        write_test_executable(&test_node_path(dir.path()), b"#!/bin/sh\necho v18.0.0\n");
+        let path = std::env::join_paths([dir.path()]).unwrap();
+        let observed = ObservedNodeVersion::new(
+            probe_node_fingerprint_on_path(dir.path(), &path).unwrap(),
+            "22.1.0",
+        );
+
+        let resolution = resolve_node_on_path_with_observed(dir.path(), &path, Some(&observed));
+
+        assert_eq!(resolution.version(), Some("18.0.0"));
     }
 
     #[test]

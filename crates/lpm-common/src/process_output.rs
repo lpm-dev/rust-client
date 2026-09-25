@@ -28,8 +28,10 @@ pub fn output_capped(
     let mut stdout = Vec::with_capacity(stdout_limit.min(4096));
     let mut buffer = [0_u8; 4096];
     let mut eof = false;
+    let mut exit_poll = Duration::from_micros(50);
     loop {
-        if started.elapsed() >= timeout {
+        let remaining = timeout.saturating_sub(started.elapsed());
+        if remaining.is_zero() {
             return Err(io::Error::new(io::ErrorKind::TimedOut, "probe timed out"));
         }
         if !eof {
@@ -45,12 +47,15 @@ pub fn output_capped(
                     stdout.extend_from_slice(&buffer[..count]);
                     continue;
                 }
-                Ok(None) => {}
+                Ok(None) => {
+                    probe.wait_for_output(&reader, remaining)?;
+                    continue;
+                }
                 Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
                 Err(error) => return Err(error),
             }
         }
-        if eof && probe.exited()? {
+        if probe.exited()? {
             probe.terminate_tree();
             let status = probe.child.wait()?;
             probe.reaped = true;
@@ -60,7 +65,12 @@ pub fn output_capped(
                 stderr: Vec::new(),
             });
         }
-        std::thread::sleep(Duration::from_millis(2));
+        // Stdout closes during process exit, just before the status is ready.
+        #[cfg(windows)]
+        probe.wait_for_exit(exit_poll.min(remaining))?;
+        #[cfg(not(windows))]
+        std::thread::sleep(exit_poll.min(remaining));
+        exit_poll = (exit_poll * 2).min(Duration::from_millis(2));
     }
 }
 
@@ -284,6 +294,59 @@ impl Probe {
 
     fn exited(&mut self) -> io::Result<bool> {
         Ok(self.status()?.is_some())
+    }
+
+    /// Block until `reader` has bytes or end of file, or `timeout` passes.
+    #[cfg(unix)]
+    fn wait_for_output(
+        &self,
+        reader: &impl std::os::fd::AsRawFd,
+        timeout: Duration,
+    ) -> io::Result<()> {
+        let mut descriptor = libc::pollfd {
+            fd: reader.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let milliseconds = i32::try_from(timeout.as_micros().div_ceil(1000)).unwrap_or(i32::MAX);
+        // SAFETY: the owned pipe stays open for the call, and poll writes only `revents`.
+        if unsafe { libc::poll(&mut descriptor, 1, milliseconds) } < 0 {
+            let error = io::Error::last_os_error();
+            if error.kind() != io::ErrorKind::Interrupted {
+                return Err(error);
+            }
+        }
+        Ok(())
+    }
+
+    /// Anonymous pipes have no readiness wait on Windows, so wake on process
+    /// exit and otherwise re-check the pipe after a short interval.
+    #[cfg(windows)]
+    fn wait_for_output<T>(&self, _reader: &T, timeout: Duration) -> io::Result<()> {
+        self.wait_for_exit(timeout.min(Duration::from_millis(2)))
+    }
+
+    #[cfg(not(any(unix, windows)))]
+    fn wait_for_output<T>(&self, _reader: &T, _timeout: Duration) -> io::Result<()> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "bounded probes are unavailable",
+        ))
+    }
+
+    #[cfg(windows)]
+    fn wait_for_exit(&self, timeout: Duration) -> io::Result<()> {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::Foundation::WAIT_FAILED;
+        use windows_sys::Win32::System::Threading::{INFINITE, WaitForSingleObject};
+        let milliseconds = u32::try_from(timeout.as_micros().div_ceil(1000))
+            .unwrap_or(INFINITE - 1)
+            .min(INFINITE - 1);
+        // SAFETY: Child owns the process handle for the duration of the wait.
+        if unsafe { WaitForSingleObject(self.child.as_raw_handle(), milliseconds) } == WAIT_FAILED {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
     }
 
     #[cfg(unix)]
