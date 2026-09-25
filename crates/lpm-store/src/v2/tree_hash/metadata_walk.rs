@@ -319,6 +319,14 @@ mod tests {
         Ok(format!("sha256-{}", hex::encode(hasher.finalize())))
     }
 
+    /// NTFS updates the copy of a directory's timestamps in its parent's index
+    /// only after the directory is next opened, so the first walk of a freshly
+    /// written tree can read older times than later walks. Materialization
+    /// stats each directory after filling it; test trees are walked once.
+    fn settle(root: &Path) {
+        sequential_portable(root).unwrap();
+    }
+
     /// A tree wide enough to start helper threads, with nested files and symlinks.
     fn wide_tree() -> tempfile::TempDir {
         let root = tempfile::tempdir().unwrap();
@@ -336,6 +344,7 @@ mod tests {
             #[cfg(unix)]
             std::os::unix::fs::symlink("leaf-0/file-0.js", branch_dir.join("entry.js")).unwrap();
         }
+        settle(root.path());
         root
     }
 
@@ -355,6 +364,7 @@ mod tests {
         let tree = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(tree.path().join("lib/nested")).unwrap();
         std::fs::write(tree.path().join("lib/nested/index.js"), b"x").unwrap();
+        settle(tree.path());
         let (parallel, helpers) =
             tree_metadata_integrity_with_helpers(tree.path(), MetadataReader::Portable).unwrap();
         assert_eq!(helpers, 0);
