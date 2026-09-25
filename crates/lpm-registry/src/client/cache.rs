@@ -2053,6 +2053,10 @@ mod timeline_tests {
         let mut client = RegistryClient::new().with_cache_dir(Some(dir.path().to_owned()));
         client.pending_cache_write_bytes = Arc::new(tokio::sync::Semaphore::new(8192));
         let records = Arc::new(std::sync::Mutex::new(Vec::new()));
+        // A second dispatcher prevents tracing's single-subscriber cache from
+        // registering shared callsites through another test's empty dispatcher.
+        let _other_dispatcher =
+            tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default());
         let subscriber = tracing_subscriber::registry().with(TraceRecords(Arc::clone(&records)));
         tracing::subscriber::with_default(subscriber, || {
             client.write_metadata_cache(

@@ -1191,15 +1191,18 @@ fn find_best_version_unprofiled_does_not_record_policy_checks() {
     let policy = ResolverPolicy::new(0, crate::policy::TrustPolicyMode::NoDowngrade);
     let range = NpmRange::parse("1.1.0").unwrap();
 
-    crate::profile::reset_all();
-
+    let before = crate::profile::thread_policy_check_count();
     assert!(matches!(
         find_best_version_with_policy_unprofiled(&CanonicalKey::Root, &info, &range, &policy),
         VersionPick::BlockedByTrustPolicy { .. }
     ));
-    let policy_summary = crate::profile::policy_summary();
-    assert_eq!(policy_summary.release_age.checked_count, 0);
-    assert_eq!(policy_summary.trust_policy.checked_count, 0);
+    assert_eq!(crate::profile::thread_policy_check_count(), before);
+
+    assert!(matches!(
+        find_best_version_with_policy(&CanonicalKey::Root, &info, &range, &policy),
+        VersionPick::BlockedByTrustPolicy { .. }
+    ));
+    assert!(crate::profile::thread_policy_check_count() > before);
 }
 
 #[test]
