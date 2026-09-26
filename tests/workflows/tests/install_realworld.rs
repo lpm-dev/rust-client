@@ -112,11 +112,6 @@ fn budget_gate_enabled() -> bool {
 /// runs entirely in the parent process and doesn't allocate much).
 fn run_install(project: &TempProject) -> Output {
     lpm(project)
-        // LPM_NPM_ROUTE=proxy is the test-harness default; clearing
-        // it lets the project's .npmrc steer the registry choice
-        // (Verdaccio in this case). Same as the existing real-registry
-        // smoke tests.
-        .env_remove("LPM_NPM_ROUTE")
         .env_remove("LPM_TOKEN")
         .args([
             "install",
@@ -172,7 +167,6 @@ fn run_install_under_time(project: &TempProject) -> (Output, Option<u64>) {
     // `time`-wrapped command. This keeps the two helpers in sync
     // through `apply_lpm_env`, even though we bypass it structurally.
     let mut env_source = support::lpm_spawnable(project);
-    env_source.env_remove("LPM_NPM_ROUTE");
     env_source.env_remove("LPM_TOKEN");
     // `get_envs` yields (OsStr, Option<&OsStr>); None means "remove",
     // Some means "set". Apply both correctly.

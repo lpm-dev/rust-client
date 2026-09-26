@@ -567,7 +567,6 @@ async fn dlx_uses_the_callers_authenticated_registry_from_a_subdirectory() {
         ),
     );
     let output = lpm(&project)
-        .env_remove("LPM_NPM_ROUTE")
         .env_remove("LPM_TOKEN")
         .current_dir(project.path().join("src/nested"))
         .args(["dlx", name])
@@ -931,7 +930,6 @@ async fn dlx_checks_locked_integrity_before_dependency_scripts_can_run() {
         support::VALID_TEST_INTEGRITY,
     );
     let output = lpm_with_registry(&project, &mock.url())
-        .env_remove("LPM_NPM_ROUTE")
         .args(["dlx", "dlx-script-identity-tool"])
         .output()
         .unwrap();
@@ -972,14 +970,12 @@ async fn dlx_preserves_locked_registry_source_even_for_identical_tarballs() {
     }
     project.write_file(".npmrc", &format!("registry={}/\n", first.url()));
     let installed = lpm_with_registry(&project, &first.url())
-        .env_remove("LPM_NPM_ROUTE")
         .args(["install"])
         .output()
         .unwrap();
     assert_dlx_success(&installed);
     project.write_file(".npmrc", &format!("registry={}/\n", second.url()));
     let output = lpm_with_registry(&project, &second.url())
-        .env_remove("LPM_NPM_ROUTE")
         .args(["dlx", "dlx-source-tool"])
         .output()
         .unwrap();
@@ -995,8 +991,7 @@ async fn dlx_enforces_dependency_engines_outside_a_project() {
     let mock = MockRegistry::start().await;
     project.write_file(".npmrc", &format!("registry={}/\n", mock.url()));
     mock.with_manifest_package(serde_json::json!({"name":"dlx-engines-tool","version":"1.0.0","engines":{"node":">=9999.0.0"},"bin":{"dlx-engines-tool":"tool.js"}}), &[("tool.js",b"#!/usr/bin/env node\nconsole.log('UNEXPECTED_EXECUTION');")]).await;
-    let output = support::lpm_with_registry_and_npm(&project, &mock.url())
-        .env("LPM_NPM_ROUTE", "direct")
+    let output = support::lpm_with_registry(&project, &mock.url())
         .args(["dlx", "dlx-engines-tool"])
         .output()
         .unwrap();
@@ -1025,7 +1020,6 @@ async fn dlx_json_keeps_install_script_output_off_stdout() {
         ("build.js",b"console.log('INSTALL_SCRIPT_RAN');"),
     ]).await;
     let output = lpm_with_registry(&project, &mock.url())
-        .env_remove("LPM_NPM_ROUTE")
         .args(["--json", "dlx", "dlx-json-script-tool"])
         .output()
         .unwrap();
@@ -1099,8 +1093,7 @@ async fn dlx_rejects_packages_without_a_usable_executable_before_cache_promotion
             manifest["bin"] = serde_json::json!({"tool":"missing.js"});
         }
         mock.with_manifest_package(manifest, &[]).await;
-        let output = support::lpm_with_registry_and_npm(&project, &mock.url())
-            .env("LPM_NPM_ROUTE", "direct")
+        let output = support::lpm_with_registry(&project, &mock.url())
             .args(["dlx", "dlx-no-bin-tool"])
             .timeout(Duration::from_secs(8))
             .output()
@@ -1129,8 +1122,7 @@ async fn dlx_refresh_preserves_the_previous_executable_when_the_replacement_has_
         &iso8601_n_secs_ago(72 * 3600),
     )
     .await;
-    let first = support::lpm_with_registry_and_npm(&project, &mock.url())
-        .env("LPM_NPM_ROUTE", "direct")
+    let first = support::lpm_with_registry(&project, &mock.url())
         .args(["dlx", "dlx-refresh-bin-tool"])
         .output()
         .unwrap();
@@ -1146,8 +1138,7 @@ async fn dlx_refresh_preserves_the_previous_executable_when_the_replacement_has_
         &[],
     )
     .await;
-    let output = support::lpm_with_registry_and_npm(&project, &mock.url())
-        .env("LPM_NPM_ROUTE", "direct")
+    let output = support::lpm_with_registry(&project, &mock.url())
         .args(["dlx", "--refresh", "dlx-refresh-bin-tool"])
         .timeout(Duration::from_secs(8))
         .output()
@@ -1184,8 +1175,7 @@ async fn dlx_checks_engines_against_the_callers_node_before_first_execution() {
     write_dlx_node_probe(&project.path().join("node_modules/.bin"), "0.1.0");
     let mock = MockRegistry::start().await;
     mock.with_manifest_package(serde_json::json!({"name":"dlx-caller-engine-tool","version":"1.0.0","engines":{"node":">=20"},"bin":{"tool":"tool.js"}}), &[("tool.js", b"#!/usr/bin/env node\nconsole.log('TOOL_RAN');")]).await;
-    let output = support::lpm_with_registry_and_npm(&project, &mock.url())
-        .env("LPM_NPM_ROUTE", "direct")
+    let output = support::lpm_with_registry(&project, &mock.url())
         .args(["dlx", "dlx-caller-engine-tool"])
         .output()
         .unwrap();
@@ -1214,8 +1204,7 @@ async fn dlx_rechecks_dependency_engines_when_a_warm_cache_uses_another_node() {
     for (index, directory) in paths.iter().enumerate() {
         let mut entries = vec![directory.clone()];
         entries.extend(std::env::split_paths(&std::env::var_os("PATH").unwrap()));
-        let output = support::lpm_with_registry_and_npm(&project, &mock.url())
-            .env("LPM_NPM_ROUTE", "direct")
+        let output = support::lpm_with_registry(&project, &mock.url())
             .env("PATH", std::env::join_paths(entries).unwrap())
             .args(["dlx", "dlx-warm-engine-tool"])
             .output()
@@ -1369,8 +1358,7 @@ async fn dlx_engine_checks_distinguish_installed_and_skipped_optional_dependenci
             write_dlx_node_probe(&directory, version);
             let mut entries = vec![directory];
             entries.extend(std::env::split_paths(&std::env::var_os("PATH").unwrap()));
-            let output = support::lpm_with_registry_and_npm(&project, &mock.url())
-                .env("LPM_NPM_ROUTE", "direct")
+            let output = support::lpm_with_registry(&project, &mock.url())
                 .env("PATH", std::env::join_paths(entries).unwrap())
                 .args(["dlx", "dlx-optional-engine-tool"])
                 .output()

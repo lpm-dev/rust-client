@@ -375,6 +375,7 @@ impl RegistryClient {
             http,
             base_url: DEFAULT_REGISTRY_URL.to_string(),
             npm_registry_url: NPM_REGISTRY_URL.to_string(),
+            npm_transport_url: None,
             token: None,
             cache_dir,
             pending_cache_writes: Arc::new(std::sync::Mutex::new(Vec::new())),
@@ -494,6 +495,16 @@ impl RegistryClient {
     pub fn with_npm_registry_url(mut self, url: impl Into<String>) -> Self {
         self.npm_registry_url = url.into();
         self.npm_registry_url_origin = Self::url_origin(&self.npm_registry_url);
+        self
+    }
+
+    /// Serve requests addressed to the npm registry from `url`.
+    ///
+    /// Unlike [`Self::with_npm_registry_url`], the npm registry keeps its
+    /// identity: lockfile sources, routing and cache keys still name it, and
+    /// only the connection goes to `url`.
+    pub fn with_npm_transport_url(mut self, url: impl Into<String>) -> Self {
+        self.npm_transport_url = Some(url.into());
         self
     }
 
@@ -856,6 +867,7 @@ impl RegistryClient {
             http: self.http.clone(), // Arc clone — shares connection pool
             base_url: self.base_url.clone(),
             npm_registry_url: self.npm_registry_url.clone(),
+            npm_transport_url: self.npm_transport_url.clone(),
             token: self.token.clone(),
             cache_dir: self.cache_dir.clone(),
             // Share the pending-writes tracker so flush() drains writes

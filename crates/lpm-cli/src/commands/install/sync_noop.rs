@@ -86,9 +86,6 @@ pub(crate) fn is_up_to_date(
     {
         return Ok(false);
     }
-    if std::env::var_os("LPM_INTERNAL_TEST_NPM_REGISTRY_URL").is_some() {
-        return Ok(false);
-    }
     let routes = lpm_registry::RouteTable::from_env_and_filesystem(project_dir)
         .map_err(|error| LpmError::Registry(format!("npmrc: {error}")))?;
     for package in &project_lockfile.lockfile.packages {

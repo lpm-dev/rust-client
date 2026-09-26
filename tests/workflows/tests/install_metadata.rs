@@ -2,7 +2,7 @@
 mod support;
 
 use support::mock_registry::{MockRegistry, compute_integrity, make_tarball_from_pkg_json};
-use support::{TempProject, lpm_with_registry_and_npm};
+use support::{TempProject, lpm_with_registry};
 
 #[tokio::test]
 async fn install_enriches_three_scripted_versions_from_one_cached_history() {
@@ -29,8 +29,7 @@ async fn install_enriches_three_scripted_versions_from_one_cached_history() {
     let project = TempProject::empty(
         r#"{"name":"consumer","version":"1.0.0","dependencies":{"one":"npm:scripted@^1","two":"npm:scripted@^2","three":"npm:scripted@^3"}}"#,
     );
-    let output = lpm_with_registry_and_npm(&project, &mock.url())
-        .env("LPM_NPM_ROUTE", "direct")
+    let output = lpm_with_registry(&project, &mock.url())
         .env("LPM_TIMING_DETAIL", "trace")
         .args([
             "--json",

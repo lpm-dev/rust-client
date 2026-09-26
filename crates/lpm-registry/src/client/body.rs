@@ -67,6 +67,8 @@ pub(super) struct MetadataBodyTimings {
     pub(super) body_read_ms: u128,
     pub(super) json_parse_ms: u128,
     pub(super) body_bytes: u64,
+    /// The body was larger than the cap the caller read it with.
+    pub(super) cap_exceeded: bool,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -146,18 +148,19 @@ where
 {
     let body_start = std::time::Instant::now();
     let mut buf = Vec::new();
-    let read = async {
-        lpm_http::read_body_capped_into(response, cap, &mut buf)
-            .await
-            .map_err(|error| LpmError::Registry(format!("{context}: {error}")))
-    };
-    let read = read.await;
+    let read = lpm_http::read_body_capped_into(response, cap, &mut buf).await;
     tracing::event!(name: "body_end", target: "lpm_install_timeline", tracing::Level::TRACE, bytes = buf.len() as u64, success = read.is_ok());
     let mut timings = MetadataBodyTimings {
         body_read_ms: body_start.elapsed().as_millis(),
         body_bytes: buf.len() as u64,
+        cap_exceeded: matches!(
+            read,
+            Err(lpm_http::ResponseBodyError::DeclaredTooLarge { .. }
+                | lpm_http::ResponseBodyError::StreamedTooLarge { .. })
+        ),
         ..MetadataBodyTimings::default()
     };
+    let read = read.map_err(|error| LpmError::Registry(format!("{context}: {error}")));
     if let Err(error) = read {
         return (Err(error), timings);
     }

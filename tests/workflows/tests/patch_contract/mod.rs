@@ -200,6 +200,9 @@ async fn install_rejects_patch_source_drift_even_with_old_baseline_cached() {
     for file in ["lpm.lock", "lpm.lockb"] {
         let _ = std::fs::remove_file(project.path().join(file));
     }
+    // Both mocks serve the npm registry, so drop the metadata the first one
+    // served; the store keeps the old baseline.
+    let _ = std::fs::remove_dir_all(project.cache_dir().join("metadata"));
     let out = install_output(&project, &replacement.url(), &["--force"]);
     assert!(
         !out.status.success(),

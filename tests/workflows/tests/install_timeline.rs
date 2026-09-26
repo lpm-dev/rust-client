@@ -425,13 +425,10 @@ async fn assert_install_fetch_ancestry(route: &str) {
             "--no-security-summary",
         ]);
     if workspace {
-        command
-            .env("LPM_INTERNAL_TEST_NPM_REGISTRY_URL", registry.url())
-            .arg("--recursive");
+        command.arg("--recursive");
     }
     if route == "experimental" {
         command
-            .env("LPM_INTERNAL_TEST_NPM_REGISTRY_URL", registry.url())
             .env("LPM_EXPERIMENTAL_INSTALLER_SPIKE", "1")
             .env("LPM_INSTALLER_SPIKE_BENCHMARK_ONLY", "1")
             .env("LPM_INSTALLER_SPIKE_GRAPH", "resolve-worklist")

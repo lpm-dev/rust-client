@@ -440,6 +440,40 @@ fn highest_metadata_version(
         .map(|(_, version)| version.clone())
 }
 
+/// A package whose full history exceeded the size cap for selecting one
+/// version from it. Exact lookups then read the version document directly.
+#[derive(serde::Serialize, serde::Deserialize)]
+pub(super) struct OversizedHistory {
+    pub(super) cap: u64,
+    pub(super) observed_at_unix: u64,
+}
+
+/// Histories almost never shrink, so the marker outlives the metadata cache's
+/// freshness window. A weekly retry bounds one written for a history that did.
+const OVERSIZED_HISTORY_RETRY_AFTER: Duration = Duration::from_secs(7 * 24 * 60 * 60);
+
+impl OversizedHistory {
+    fn observed_now() -> Self {
+        Self {
+            cap: MAX_VERSION_METADATA_BYTES as u64,
+            observed_at_unix: unix_now_secs(),
+        }
+    }
+
+    /// A history over a cap at least as large as today's is still over it.
+    fn applies(&self) -> bool {
+        self.cap >= MAX_VERSION_METADATA_BYTES as u64
+            && unix_now_secs().saturating_sub(self.observed_at_unix)
+                < OVERSIZED_HISTORY_RETRY_AFTER.as_secs()
+    }
+}
+
+fn unix_now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_secs())
+}
+
 impl RegistryClient {
     fn metadata_cache_key_for_origin(
         &self,
@@ -2144,6 +2178,49 @@ impl RegistryClient {
             .map_err(|failure| failure.error)
     }
 
+    /// Whether this package's full history is known to exceed the size cap for
+    /// selecting one version from it, in this command or a recent one.
+    async fn history_known_oversized(&self, name: &str, access: PublicNpmAccess<'_>) -> bool {
+        let history_key = self.npm_access_cache_key("npm-direct-raw-full", name, access);
+        if self.history_cache.is_oversized(&history_key) {
+            return true;
+        }
+        let Some(path) = self.cache_path(&self.npm_oversized_history_cache_key(name, access))
+        else {
+            return false;
+        };
+        let known = tokio::task::spawn_blocking(move || {
+            Self::read_stale_metadata_cache_path_as::<OversizedHistory>(&path)
+        })
+        .await
+        .ok()
+        .flatten()
+        .is_some_and(|(marker, _, _)| marker.applies());
+        if known {
+            self.history_cache.mark_oversized(&history_key);
+        }
+        known
+    }
+
+    fn remember_oversized_history(&self, name: &str, access: PublicNpmAccess<'_>) {
+        self.history_cache
+            .mark_oversized(&self.npm_access_cache_key("npm-direct-raw-full", name, access));
+        self.write_metadata_cache_with_directive(
+            &self.npm_oversized_history_cache_key(name, access),
+            &OversizedHistory::observed_now(),
+            None,
+            MetadataCacheDirective::Unspecified,
+        );
+    }
+
+    pub(super) fn npm_oversized_history_cache_key(
+        &self,
+        name: &str,
+        access: PublicNpmAccess<'_>,
+    ) -> String {
+        self.npm_access_cache_key("npm-direct-history-oversized", name, access)
+    }
+
     /// Select a full-history manifest with exact fallback and cumulative failure timings.
     pub async fn get_npm_version_from_history_attempt(
         &self,
@@ -2320,6 +2397,12 @@ impl RegistryClient {
             if history_flight.as_ref().is_some_and(|flight| !flight.first) {
                 drop(history_flight.take());
             }
+            if from_history && self.history_known_oversized(name, access).await {
+                crate::timing::record_oversized_history_skip();
+                return Err(LpmError::Registry(format!(
+                    "npm history for {name} exceeds the exact-version size cap"
+                )));
+            }
 
             let rpc_start = std::time::Instant::now();
             macro_rules! finish {
@@ -2454,7 +2537,13 @@ impl RegistryClient {
             timings.body_bytes = body_timings.body_bytes;
             let (version_metadata, retained_history) = match parsed {
                 Ok(parsed) => parsed,
-                Err(error) => return finish!(Err(error)),
+                Err(error) => {
+                    if from_history && body_timings.cap_exceeded {
+                        crate::timing::record_oversized_history();
+                        self.remember_oversized_history(name, access);
+                    }
+                    return finish!(Err(error));
+                }
             };
             let mut metadata =
                 match package_metadata_from_version_doc(name, version, version_metadata.manifest) {

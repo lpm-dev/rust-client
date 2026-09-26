@@ -716,6 +716,7 @@ fn project_peer_context(
         }
 
         let mut synthesized = Vec::new();
+        let mut unfetched_ranges = Vec::new();
         let mut canonical_names = missing.keys().cloned().collect::<Vec<_>>();
         canonical_names.sort();
         for canonical in canonical_names {
@@ -727,19 +728,30 @@ fn project_peer_context(
             if required_requirements.is_empty() {
                 continue;
             }
-            let Some((version, unsatisfied)) = select_union_peer_candidate(
+            let (version, unsatisfied) = match select_union_peer_candidate(
                 &canonical,
                 &required_requirements,
                 &union.cache,
                 context.policy,
-            ) else {
-                tracing::debug!(
-                    importer_index,
-                    peer = canonical,
-                    reason = "no-ambient-peer-candidate",
-                    "workspace union importer requires isolated resolution"
-                );
-                return Ok(PeerProjectionOutcome::RequiresIsolatedResolution);
+            ) {
+                UnionPeerCandidate::Selected {
+                    version,
+                    unsatisfied,
+                } => (version, unsatisfied),
+                UnionPeerCandidate::NeedsVersions(ranges) => {
+                    unfetched_ranges
+                        .extend(ranges.into_iter().map(|range| (canonical.clone(), range)));
+                    continue;
+                }
+                UnionPeerCandidate::Unavailable => {
+                    tracing::debug!(
+                        importer_index,
+                        peer = canonical,
+                        reason = "no-ambient-peer-candidate",
+                        "workspace union importer requires isolated resolution"
+                    );
+                    return Ok(PeerProjectionOutcome::RequiresIsolatedResolution);
+                }
             };
             synthesized.push(((canonical.clone(), version.clone()), true));
             if !unsatisfied.is_empty() {
@@ -755,6 +767,9 @@ fn project_peer_context(
                         .collect(),
                 });
             }
+        }
+        if !unfetched_ranges.is_empty() {
+            return Ok(PeerProjectionOutcome::NeedsAmbientPeers(unfetched_ranges));
         }
         if synthesized.is_empty() {
             normalize_peer_bindings(&mut bindings);
@@ -906,14 +921,37 @@ fn newest_included_provider(
         .map(|(version, target)| (version.to_string(), target))
 }
 
+enum UnionPeerCandidate<'a> {
+    Selected {
+        version: String,
+        unsatisfied: Vec<&'a PeerRequirement>,
+    },
+    /// The union holds only some of the package's versions, such as the one
+    /// another importer pinned. Resolving these ranges fetches the rest.
+    NeedsVersions(Vec<String>),
+    Unavailable,
+}
+
 fn select_union_peer_candidate<'a>(
     canonical: &str,
     requirements: &[&'a PeerRequirement],
     cache: &HashMap<CanonicalKey, Arc<CachedPackageInfo>>,
     policy: &ResolverPolicy,
-) -> Option<(String, Vec<&'a PeerRequirement>)> {
+) -> UnionPeerCandidate<'a> {
     let canonical_key = CanonicalKey::from_dep_name(canonical);
-    let info = cache.get(&canonical_key)?;
+    let Some(info) = cache.get(&canonical_key) else {
+        return UnionPeerCandidate::Unavailable;
+    };
+    let mut unfetched_ranges = requirements
+        .iter()
+        .filter(|requirement| info.needs_metadata_for_range(&requirement.2))
+        .map(|requirement| requirement.2.raw().to_owned())
+        .collect::<Vec<_>>();
+    if !unfetched_ranges.is_empty() {
+        unfetched_ranges.sort_unstable();
+        unfetched_ranges.dedup();
+        return UnionPeerCandidate::NeedsVersions(unfetched_ranges);
+    }
     let mut best = None::<(crate::NpmVersion, usize, Vec<usize>)>;
     let preferred_latest = info.latest_version.as_ref().filter(|latest| {
         requirements
@@ -952,15 +990,16 @@ fn select_union_peer_candidate<'a>(
             best = Some((candidate.clone(), hits, misses));
         }
     }
-    best.map(|(version, _, misses)| {
-        (
-            version.to_string(),
-            misses
+    match best {
+        Some((version, _, misses)) => UnionPeerCandidate::Selected {
+            version: version.to_string(),
+            unsatisfied: misses
                 .into_iter()
                 .map(|index| requirements[index])
                 .collect(),
-        )
-    })
+        },
+        None => UnionPeerCandidate::Unavailable,
+    }
 }
 
 fn normalize_peer_bindings(
@@ -984,37 +1023,38 @@ mod tests {
         &'a [DependencyFixture<'a>],
     );
 
+    fn manifest(
+        (version, dependencies, peers): &PackageFixture<'_>,
+    ) -> crate::provider::ManifestVersion {
+        crate::provider::ManifestVersion {
+            version: crate::NpmVersion::parse(version).unwrap(),
+            dependencies: dependencies
+                .iter()
+                .map(|(name, range)| crate::provider::ManifestDependency {
+                    name: (*name).to_owned(),
+                    range: (*range).to_owned(),
+                    alias: None,
+                    optional: false,
+                    bundled: false,
+                })
+                .collect(),
+            peer_dependencies: peers
+                .iter()
+                .map(|(name, range)| crate::provider::ManifestPeerDependency {
+                    name: (*name).to_owned(),
+                    range: (*range).to_owned(),
+                    alias: None,
+                    optional: false,
+                })
+                .collect(),
+            node_engine: None,
+            platform: None,
+            dist: CachedDistInfo::default(),
+        }
+    }
+
     fn cached_package(versions: &[PackageFixture<'_>]) -> Arc<CachedPackageInfo> {
-        let manifests = versions
-            .iter()
-            .map(
-                |(version, dependencies, peers)| crate::provider::ManifestVersion {
-                    version: crate::NpmVersion::parse(version).unwrap(),
-                    dependencies: dependencies
-                        .iter()
-                        .map(|(name, range)| crate::provider::ManifestDependency {
-                            name: (*name).to_owned(),
-                            range: (*range).to_owned(),
-                            alias: None,
-                            optional: false,
-                            bundled: false,
-                        })
-                        .collect(),
-                    peer_dependencies: peers
-                        .iter()
-                        .map(|(name, range)| crate::provider::ManifestPeerDependency {
-                            name: (*name).to_owned(),
-                            range: (*range).to_owned(),
-                            alias: None,
-                            optional: false,
-                        })
-                        .collect(),
-                    node_engine: None,
-                    platform: None,
-                    dist: CachedDistInfo::default(),
-                },
-            )
-            .collect::<Vec<_>>();
+        let manifests = versions.iter().map(manifest).collect::<Vec<_>>();
         let latest_version = manifests.first().map(|manifest| manifest.version.clone());
         Arc::new(CachedPackageInfo::from_manifest_versions(
             None,
@@ -1060,12 +1100,29 @@ mod tests {
         policies: Vec<ResolverPolicy>,
         overrides: OverrideSet,
     ) -> WorkspaceResolveOutcome {
+        resolve_roots_with_client(
+            RegistryClient::new().with_cache_dir(None),
+            roots,
+            cache_entries,
+            policies,
+            overrides,
+        )
+        .await
+    }
+
+    async fn resolve_roots_with_client(
+        client: RegistryClient,
+        roots: Vec<RootDependencies>,
+        cache_entries: Vec<(&str, Arc<CachedPackageInfo>)>,
+        policies: Vec<ResolverPolicy>,
+        overrides: OverrideSet,
+    ) -> WorkspaceResolveOutcome {
         let cache: SharedCache = Arc::new(dashmap::DashMap::new());
         for (name, info) in cache_entries {
             cache.insert(CanonicalKey::from_dep_name(name), info);
         }
         resolve_greedy_fused_workspace_with_cache_options_and_policy(
-            Arc::new(RegistryClient::new().with_cache_dir(None)),
+            Arc::new(client),
             roots,
             overrides,
             RouteTable::from_mode_only(lpm_registry::RouteMode::Direct),
@@ -1444,6 +1501,100 @@ mod tests {
         assert!(second.packages.iter().any(|package| {
             package.package.canonical_name() == "runtime" && package.version.to_string() == "2.0.0"
         }));
+    }
+
+    fn partial_package(versions: &[PackageFixture<'_>]) -> Arc<CachedPackageInfo> {
+        let covered_ranges = versions
+            .iter()
+            .flat_map(|(version, _, _)| [(*version).to_owned(), format!("={version}")])
+            .collect();
+        Arc::new(CachedPackageInfo::from_manifest_versions(
+            None,
+            true,
+            false,
+            covered_ranges,
+            HashSet::new(),
+            true,
+            None,
+            versions.iter().map(manifest).collect(),
+        ))
+    }
+
+    async fn npm_registry_with_runtime_history() -> wiremock::MockServer {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let version = |version: &str| {
+            serde_json::json!({
+                "name": "runtime",
+                "version": version,
+                "dist": {
+                    "tarball": format!("https://example.invalid/runtime-{version}.tgz"),
+                    "integrity": format!("sha512-runtime-{version}")
+                },
+                "dependencies": {}
+            })
+        };
+        Mock::given(method("GET"))
+            .and(path("/runtime"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "name": "runtime",
+                "dist-tags": { "latest": "2.0.0" },
+                "versions": { "1.0.0": version("1.0.0"), "2.0.0": version("2.0.0") }
+            })))
+            .mount(&server)
+            .await;
+        server
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn union_ambient_peer_is_chosen_from_the_whole_history_when_another_importer_pinned_it() {
+        let server = npm_registry_with_runtime_history().await;
+        let roots = vec![
+            RootDependencies::required(HashMap::from([
+                ("consumer".to_string(), "1.0.0".to_string()),
+                ("runtime".to_string(), "1.0.0".to_string()),
+            ])),
+            RootDependencies::required(HashMap::from([(
+                "consumer".to_string(),
+                "1.0.0".to_string(),
+            )])),
+        ];
+        let policies = vec![ResolverPolicy::default(); roots.len()];
+        let outcome = resolve_roots_with_client(
+            RegistryClient::new()
+                .with_npm_registry_url(server.uri())
+                .with_cache_dir(None),
+            roots,
+            vec![
+                (
+                    "consumer",
+                    cached_package(&[("1.0.0", &[], &[("runtime", "*")])]),
+                ),
+                ("runtime", partial_package(&[("1.0.0", &[], &[])])),
+            ],
+            policies,
+            OverrideSet::empty(),
+        )
+        .await;
+
+        let WorkspaceResolveOutcome::Projected { results, .. } = outcome else {
+            panic!("the ambient peer should stay inside the union traversal")
+        };
+        let runtime_versions = results
+            .iter()
+            .map(|result| {
+                let result = result.as_ref().expect("each importer should project");
+                result
+                    .packages
+                    .iter()
+                    .filter(|package| package.package.canonical_name() == "runtime")
+                    .map(|package| package.version.to_string())
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(runtime_versions, vec![vec!["1.0.0"], vec!["2.0.0"]]);
     }
 
     #[tokio::test(flavor = "current_thread")]
