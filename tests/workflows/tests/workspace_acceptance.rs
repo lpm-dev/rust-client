@@ -6,7 +6,7 @@ use serde_json::{Value, json};
 use std::path::Path;
 use std::process::Output;
 use support::mock_registry::{MockRegistry, compute_integrity, make_tarball_from_pkg_json};
-use support::{TempProject, lpm_with_registry_and_npm};
+use support::{TempProject, lpm_with_registry};
 
 const FLAGS: &[&str] = &[
     "--no-security-summary",
@@ -117,7 +117,7 @@ fn install(
     step: &str,
     args: &[&str],
 ) -> Output {
-    let output = lpm_with_registry_and_npm(project, &mock.url())
+    let output = lpm_with_registry(project, &mock.url())
         .arg("install")
         .args(FLAGS)
         .args(args)
@@ -481,7 +481,7 @@ async fn ci_environment_rejects_manifest_drift_and_preserves_lockfile() {
         serde_json::from_str(&project.read_file("packages/app/package.json")).unwrap();
     member["dependencies"]["runtime-core"] = "2.0.0".into();
     project.write_file("packages/app/package.json", &member.to_string());
-    let output = lpm_with_registry_and_npm(&project, &mock.url())
+    let output = lpm_with_registry(&project, &mock.url())
         .arg("install")
         .args(FLAGS)
         .env("CI", "true")

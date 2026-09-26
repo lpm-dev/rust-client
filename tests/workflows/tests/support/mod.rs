@@ -181,6 +181,10 @@ pub struct TempProject {
     dir: TempDir,
     /// Isolated HOME directory
     home: TempDir,
+    /// The mock that serves registry.npmjs.org for this project: the one it
+    /// last targeted. Plain commands use it too, as every command on a
+    /// machine reaches the same npm registry.
+    npm_registry: std::sync::Mutex<Option<String>>,
 }
 
 impl TempProject {
@@ -202,7 +206,11 @@ impl TempProject {
         // Recursively copy the fixture into the temp directory
         copy_dir_recursive(&fixture_src, dir.path());
 
-        TempProject { dir, home }
+        TempProject {
+            dir,
+            home,
+            npm_registry: std::sync::Mutex::default(),
+        }
     }
 
     /// Create an empty project with just a package.json.
@@ -213,7 +221,11 @@ impl TempProject {
         std::fs::write(dir.path().join("package.json"), package_json)
             .expect("failed to write package.json");
 
-        TempProject { dir, home }
+        TempProject {
+            dir,
+            home,
+            npm_registry: std::sync::Mutex::default(),
+        }
     }
 
     /// Keep filesystem-denial fixtures outside the system temporary directory.
@@ -224,12 +236,31 @@ impl TempProject {
             .expect("create project outside system temp");
         let home = TempDir::new().expect("create isolated home");
         std::fs::write(dir.path().join("package.json"), package_json).unwrap();
-        TempProject { dir, home }
+        TempProject {
+            dir,
+            home,
+            npm_registry: std::sync::Mutex::default(),
+        }
     }
 
     /// Path to the project directory.
     pub fn path(&self) -> &Path {
         self.dir.path()
+    }
+
+    fn use_npm_registry(&self, registry_url: &str) {
+        *self
+            .npm_registry
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(registry_url.to_owned());
+    }
+
+    fn npm_registry(&self) -> String {
+        self.npm_registry
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+            .unwrap_or_else(|| UNREACHABLE_NPM_REGISTRY_URL.to_owned())
     }
 
     /// Path to the isolated HOME directory.
@@ -720,6 +751,9 @@ impl LpmEnvSink for std::process::Command {
 
 /// Apply the full workflow-tier env-isolation set to a command builder.
 ///
+/// A local address that refuses connections, standing in for registry.npmjs.org.
+const UNREACHABLE_NPM_REGISTRY_URL: &str = "http://127.0.0.1:9";
+
 /// Shared by [`lpm`] and [`lpm_spawnable`] so the two helpers can't
 /// drift. Every env knob below was added to fix a specific test-isolation
 /// hole — keep the comments when editing this function.
@@ -841,14 +875,16 @@ fn apply_lpm_env<S: LpmEnvSink>(cmd: &mut S, project: &TempProject) {
     // Disable update check (would make network calls)
     cmd.set_env("LPM_NO_UPDATE_CHECK", OsStr::new("1"));
 
-    // The shipped Direct route defaults hit `registry.npmjs.org`
-    // for npm packages. Workflow tests use a single mock server at the
-    // `--registry` base URL that serves `/api/registry/{name}` (LPM
-    // proxy path) and don't have a separate npm mock. Force Proxy mode
-    // so the mock's proxy-tier mounts serve all metadata fetches.
-    // Individual tests that want to exercise Direct routing can
-    // override this env.
-    cmd.set_env("LPM_NPM_ROUTE", OsStr::new("proxy"));
+    // Workflow tests use the shipped npm route. Requests addressed to
+    // registry.npmjs.org go to the mock the project last targeted, or else to
+    // a closed local port, so no test reaches the real registry. Lockfiles
+    // and routing still name registry.npmjs.org. Tests of the parked proxy
+    // route set `LPM_NPM_ROUTE=proxy` themselves.
+    cmd.remove_env("LPM_NPM_ROUTE");
+    cmd.set_env(
+        "LPM_INTERNAL_TEST_NPM_REGISTRY_URL",
+        OsStr::new(&project.npm_registry()),
+    );
 
     // on Windows, the install pipeline's sandbox
     // factory probes `current_exe().parent()` for
@@ -894,8 +930,10 @@ pub fn lpm_v1(project: &TempProject) -> assert_cmd::Command {
     cmd
 }
 
-/// Build a store-v1 rollback command pre-configured to use a mock registry.
+/// Build a store-v1 rollback command that sends LPM registry and
+/// registry.npmjs.org requests to the mock.
 pub fn lpm_v1_with_registry(project: &TempProject, registry_url: &str) -> assert_cmd::Command {
+    project.use_npm_registry(registry_url);
     let mut cmd = lpm_v1(project);
     cmd.args(["--registry", registry_url, "--insecure"]);
     cmd
@@ -997,16 +1035,13 @@ fn locate_test_sandbox_helper() -> Option<PathBuf> {
     candidate.exists().then_some(candidate)
 }
 
-/// Build an `lpm` command pre-configured to use a mock registry.
+/// Build an `lpm` command that sends LPM registry and registry.npmjs.org
+/// requests to the mock. Later plain commands for the project reach npm
+/// through the mock too.
 pub fn lpm_with_registry(project: &TempProject, registry_url: &str) -> assert_cmd::Command {
+    project.use_npm_registry(registry_url);
     let mut cmd = lpm(project);
     cmd.args(["--registry", registry_url, "--insecure"]);
-    cmd
-}
-
-pub fn lpm_with_registry_and_npm(project: &TempProject, registry_url: &str) -> assert_cmd::Command {
-    let mut cmd = lpm_with_registry(project, registry_url);
-    cmd.env("LPM_INTERNAL_TEST_NPM_REGISTRY_URL", registry_url);
     cmd
 }
 
@@ -1091,6 +1126,7 @@ pub fn lpm_spawnable_with_registry(
     project: &TempProject,
     registry_url: &str,
 ) -> std::process::Command {
+    project.use_npm_registry(registry_url);
     let mut cmd = lpm_spawnable(project);
     cmd.args(["--registry", registry_url, "--insecure"]);
     cmd

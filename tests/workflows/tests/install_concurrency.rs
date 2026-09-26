@@ -69,7 +69,6 @@ async fn interrupt_project_install(
     )
     .await;
     let mut child = lpm_spawnable_with_registry(project, &mock.url())
-        .env("LPM_INTERNAL_TEST_NPM_REGISTRY_URL", mock.url())
         .args(install_args_with(specs))
         .spawn()
         .unwrap();
@@ -142,7 +141,6 @@ async fn interrupted_bare_install_can_retry_without_changing_the_manifest() {
     mock.server().reset().await;
     mock.with_package("recovery-pkg", "1.0.0", &tarball).await;
     lpm_with_registry(&project, &mock.url())
-        .env("LPM_INTERNAL_TEST_NPM_REGISTRY_URL", mock.url())
         .args(install_args_with(&[]))
         .assert()
         .success();
@@ -162,7 +160,6 @@ async fn interrupted_install_kill_retry_recovers_the_original_save_intent() {
     mock.server().reset().await;
     mock.with_package("recovery-pkg", "1.0.0", &tarball).await;
     lpm_with_registry(&project, &mock.url())
-        .env("LPM_INTERNAL_TEST_NPM_REGISTRY_URL", mock.url())
         .args(install_args_with(&["recovery-pkg"]))
         .assert()
         .success();
@@ -188,7 +185,6 @@ async fn interrupted_install_recovery_preserves_later_edits_and_keeps_the_backup
     let edited = "{\"name\":\"user-edited-project\",\"version\":\"2.0.0\"}";
     project.write_file("package.json", edited);
     let output = lpm_with_registry(&project, &mock.url())
-        .env("LPM_INTERNAL_TEST_NPM_REGISTRY_URL", mock.url())
         .args(install_args_with(&["recovery-pkg"]))
         .output()
         .unwrap();
@@ -226,7 +222,6 @@ async fn interrupted_install_bare_retry_preserves_an_intentional_wildcard() {
     mock.server().reset().await;
     mock.with_package("recovery-pkg", "1.0.0", &tarball).await;
     lpm_with_registry(&project, &mock.url())
-        .env("LPM_INTERNAL_TEST_NPM_REGISTRY_URL", mock.url())
         .args(install_args_with(&[]))
         .assert()
         .success();
@@ -257,7 +252,6 @@ async fn interrupted_install_workspace_retry_recovers_every_selected_manifest() 
     mock.server().reset().await;
     mock.with_package("recovery-pkg", "1.0.0", &tarball).await;
     lpm_with_registry(&project, &mock.url())
-        .env("LPM_INTERNAL_TEST_NPM_REGISTRY_URL", mock.url())
         .args(install_args_with(&specs))
         .assert()
         .success();
@@ -288,7 +282,6 @@ async fn interrupted_install_recovery_discards_an_uncommitted_journal_temporary(
     mock.server().reset().await;
     mock.with_package("recovery-pkg", "1.0.0", &tarball).await;
     lpm_with_registry(&project, &mock.url())
-        .env("LPM_INTERNAL_TEST_NPM_REGISTRY_URL", mock.url())
         .args(install_args_with(&["recovery-pkg"]))
         .assert()
         .success();
@@ -311,7 +304,6 @@ async fn interrupted_install_committed_cleanup_preserves_the_completed_manifest(
     mock.server().reset().await;
     mock.with_package("recovery-pkg", "1.0.0", &tarball).await;
     lpm_with_registry(&project, &mock.url())
-        .env("LPM_INTERNAL_TEST_NPM_REGISTRY_URL", mock.url())
         .args(install_args_with(&["recovery-pkg"]))
         .assert()
         .success();
@@ -320,7 +312,6 @@ async fn interrupted_install_committed_cleanup_preserves_the_completed_manifest(
     std::fs::write(directory.join(name), bytes).unwrap();
     std::fs::write(directory.join("committed"), "1\n").unwrap();
     lpm_with_registry(&project, &mock.url())
-        .env("LPM_INTERNAL_TEST_NPM_REGISTRY_URL", mock.url())
         .args(install_args_with(&[]))
         .assert()
         .success();
@@ -340,7 +331,6 @@ async fn interrupted_install_malformed_backup_stops_without_changing_the_manifes
         .unwrap();
     std::fs::write(record.path(), "{incomplete").unwrap();
     lpm_with_registry(&project, &mock.url())
-        .env("LPM_INTERNAL_TEST_NPM_REGISTRY_URL", mock.url())
         .args(install_args_with(&["recovery-pkg"]))
         .assert()
         .failure();
@@ -1436,7 +1426,6 @@ async fn install_with_metadata_404_fails_immediately_without_retry() {
     let project = TempProject::empty(r#"{"name":"miss-test","version":"1.0.0"}"#);
 
     let output = lpm_with_registry(&project, &mock.url())
-        .env("LPM_INTERNAL_TEST_NPM_REGISTRY_URL", mock.url())
         .args(install_args_with(&["missing-pkg@1.0.0"]))
         .output()
         .expect("run install");
@@ -1448,23 +1437,36 @@ async fn install_with_metadata_404_fails_immediately_without_retry() {
     );
 
     let requests = mock.server().received_requests().await.unwrap();
-    let metadata_paths: Vec<_> = requests
+    let metadata_requests = missing_package_metadata_requests(&requests);
+    assert!(
+        !metadata_requests.is_empty(),
+        "the install never requested package metadata"
+    );
+    let unique: std::collections::HashSet<_> = metadata_requests.iter().collect();
+    assert_eq!(
+        metadata_requests.len(),
+        unique.len(),
+        "a non-retryable metadata request was repeated: {metadata_requests:?}"
+    );
+}
+
+/// Each metadata request for `missing-pkg` as (path, Accept): the npm route
+/// reads the package's history, version and abbreviated documents.
+fn missing_package_metadata_requests(requests: &[wiremock::Request]) -> Vec<(String, String)> {
+    requests
         .iter()
         .filter(|request| {
             request.method.as_str() == "GET" && request.url.path().contains("missing-pkg")
         })
-        .map(|request| request.url.path())
-        .collect();
-    assert!(
-        !metadata_paths.is_empty(),
-        "the install never requested package metadata"
-    );
-    let unique: std::collections::HashSet<_> = metadata_paths.iter().copied().collect();
-    assert_eq!(
-        metadata_paths.len(),
-        unique.len(),
-        "a non-retryable metadata request was repeated: {metadata_paths:?}"
-    );
+        .map(|request| {
+            let accept = request
+                .headers
+                .get("accept")
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or_default();
+            (request.url.path().to_owned(), accept.to_owned())
+        })
+        .collect()
 }
 
 #[tokio::test]
@@ -1475,7 +1477,6 @@ async fn bare_install_with_missing_metadata_fails_without_committing_state() {
         r#"{"name":"standalone-missing","version":"1.0.0","dependencies":{"missing-pkg":"1.0.0"}}"#;
     let project = TempProject::empty(original);
     let output = lpm_with_registry(&project, &mock.url())
-        .env("LPM_INTERNAL_TEST_NPM_REGISTRY_URL", mock.url())
         .args(install_args_with(&[]))
         .output()
         .unwrap();
@@ -1485,16 +1486,14 @@ async fn bare_install_with_missing_metadata_fails_without_committing_state() {
     assert!(!project.path().join(".lpm/install-hash").exists());
     assert!(!project.path().join("lpm.lock").exists());
     let requests = mock.server().received_requests().await.unwrap();
-    let metadata_paths: Vec<_> = requests
-        .iter()
-        .filter(|request| {
-            request.method.as_str() == "GET" && request.url.path().contains("missing-pkg")
-        })
-        .map(|request| request.url.path())
-        .collect();
-    assert!(!metadata_paths.is_empty());
-    let unique: std::collections::HashSet<_> = metadata_paths.iter().copied().collect();
-    assert_eq!(metadata_paths.len(), unique.len());
+    let metadata_requests = missing_package_metadata_requests(&requests);
+    assert!(!metadata_requests.is_empty());
+    let unique: std::collections::HashSet<_> = metadata_requests.iter().collect();
+    assert_eq!(
+        metadata_requests.len(),
+        unique.len(),
+        "{metadata_requests:?}"
+    );
 }
 
 /// **C.1 — tarball 503 → 200 succeeds after retry.**

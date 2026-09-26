@@ -21,7 +21,6 @@ fn project() -> TempProject {
 fn command(project: &TempProject, registry: &MockRegistry) -> assert_cmd::Command {
     let mut command = lpm_with_registry(project, &registry.url());
     command
-        .env_remove("LPM_NPM_ROUTE")
         .env("NPM_CONFIG_USERCONFIG", project.home().join(".npmrc"))
         .env(
             "NPM_CONFIG_GLOBALCONFIG",

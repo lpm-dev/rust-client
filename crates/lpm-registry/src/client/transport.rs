@@ -135,9 +135,10 @@ impl RegistryClient {
         request: reqwest::RequestBuilder,
     ) -> Result<reqwest::Response, LpmError> {
         self.validate_base_url()?;
-        let request = request
+        let mut request = request
             .build()
             .map_err(|error| LpmError::Network(format!("failed to build request: {error}")))?;
+        self.route_to_npm_transport(&mut request);
         self.http
             .for_url(request.url().as_str())
             .await?
@@ -746,6 +747,8 @@ impl RegistryClient {
     where
         P: lpm_http::ReplayableHttpClientProvider<Error = LpmError> + Sync,
     {
+        let mut request = request;
+        self.route_to_npm_transport(&mut request);
         self.validate_base_url()?;
         self.validate_request_url(request.url())?;
 
@@ -877,6 +880,23 @@ impl RegistryClient {
         }
 
         Err(last_error.unwrap_or_else(|| LpmError::Network("request failed after retries".into())))
+    }
+
+    fn route_to_npm_transport(&self, request: &mut reqwest::Request) {
+        if let Some(url) = self.npm_transport_url_for(request.url()) {
+            *request.url_mut() = url;
+        }
+    }
+
+    fn npm_transport_url_for(&self, url: &reqwest::Url) -> Option<reqwest::Url> {
+        let transport = self.npm_transport_url.as_deref()?;
+        let rest = url
+            .as_str()
+            .strip_prefix(self.npm_registry_url.trim_end_matches('/'))?;
+        if !(rest.is_empty() || rest.starts_with(['/', '?'])) {
+            return None;
+        }
+        reqwest::Url::parse(&format!("{}{rest}", transport.trim_end_matches('/'))).ok()
     }
 }
 

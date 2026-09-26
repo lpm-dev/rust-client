@@ -14,12 +14,8 @@
 //!
 //! ## Why a separate file
 //!
-//! This is the only `.npmrc`-driven test in the workflow tier today.
-//! It needs the npm-direct route (the `lpm-workflows` default forces
-//! `LPM_NPM_ROUTE=proxy` for harness-uniformity reasons), so the test
-//! explicitly removes that env override and lets `.npmrc` drive
-//! routing. Putting it in its own file documents the divergence
-//! cleanly rather than burying the override in `install.rs`.
+//! This file holds the `.npmrc`-driven routing tests, where `.npmrc`
+//! rather than the harness chooses each package's registry.
 
 mod support;
 
@@ -154,7 +150,6 @@ async fn npmrc_authenticated_install_attaches_bearer_on_every_registry_request()
     // credential flowing into the install. If a session bearer leaked
     // in, the auth assertion below could pass for the wrong reason.
     let out = lpm(&project)
-        .env_remove("LPM_NPM_ROUTE")
         .env_remove("LPM_TOKEN")
         .args(["install"])
         .output()

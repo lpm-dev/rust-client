@@ -63,7 +63,7 @@ async fn check_latest_declaration(alias: bool, catalog: bool) {
         .unwrap();
     let server = MockServer::start().await;
     mount_contract_metadata(&server, name, "1.5.0", "2.0.0").await;
-    let out = lpm_with_registry_and_npm(&project, &server.uri())
+    let out = lpm_with_registry(&project, &server.uri())
         .args(["outdated", "--json"])
         .output()
         .unwrap();
@@ -106,7 +106,7 @@ async fn check_newer_wanted(current: &str, next: &str) {
     write_minimal_lockfile(&project, name, current);
     let server = MockServer::start().await;
     mount_contract_metadata(&server, name, "1.9.0", next).await;
-    let out = lpm_with_registry_and_npm(&project, &server.uri())
+    let out = lpm_with_registry(&project, &server.uri())
         .args(["outdated", "--json"])
         .output()
         .unwrap();
@@ -159,7 +159,7 @@ async fn check_revalidation(route: &str) {
     for latest in ["1.0.0", "1.5.0"] {
         server.reset().await;
         mount_contract_metadata(&server, name, latest, "2.0.0").await;
-        let out = lpm_with_registry_and_npm(&project, &server.uri())
+        let out = lpm_with_registry(&project, &server.uri())
             .env(
                 "LPM_NPM_ROUTE",
                 if route == "public" { "direct" } else { "proxy" },

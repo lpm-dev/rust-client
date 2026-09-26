@@ -13,8 +13,7 @@ use support::mock_registry::{
 };
 use support::{
     TempProject, configure_fake_node, lpm, lpm_spawnable, lpm_v1, lpm_v1_with_registry,
-    lpm_with_registry, lpm_with_registry_and_npm, project_bin_path, write_repeated_file,
-    write_signed_unlock,
+    lpm_with_registry, project_bin_path, write_repeated_file, write_signed_unlock,
 };
 use wiremock::matchers::{header, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -3403,8 +3402,7 @@ async fn fresh_checkouts_resolve_from_stored_metadata_projections() {
         r#"{"name":"projection-install","version":"1.0.0","dependencies":{"projected-dep":"^1.0.0"}}"#,
     );
     let install = || -> (serde_json::Value, String) {
-        let output = lpm_with_registry_and_npm(&project, &mock.url())
-            .env("LPM_NPM_ROUTE", "direct")
+        let output = lpm_with_registry(&project, &mock.url())
             .env("LPM_TIMING_DETAIL", "trace")
             .args([
                 "install",
@@ -5590,7 +5588,6 @@ async fn install_offline_firewall_monitor_relinks_and_reports_offline_skip_json(
     let project = warm_public_npm_lockfile_project_for_offline_firewall("monitor").await;
 
     let output = lpm_with_registry(&project, "http://127.0.0.1:1")
-        .env("LPM_NPM_ROUTE", "direct")
         .args([
             "install",
             "--offline",
@@ -5718,7 +5715,6 @@ async fn install_offline_firewall_enforce_fails_closed_before_linking() {
     let project = warm_public_npm_lockfile_project_for_offline_firewall("enforce").await;
 
     let output = lpm_with_registry(&project, "http://127.0.0.1:1")
-        .env("LPM_NPM_ROUTE", "direct")
         .args([
             "install",
             "--offline",
@@ -6753,7 +6749,6 @@ async fn install_without_harness_overrides_uses_shipped_v2_layout() {
 
     let output = lpm_with_registry(&project, &mock.url())
         .env_remove("LPM_STORE_VERSION")
-        .env_remove("LPM_NPM_ROUTE")
         .args([
             "install",
             "--no-security-summary",
@@ -7291,7 +7286,7 @@ async fn install_hides_info_only_behavioral_metadata_by_default() {
         .assert()
         .success();
 
-    let output = lpm_with_registry_and_npm(&project, &mock.url())
+    let output = lpm_with_registry(&project, &mock.url())
         .args(["install", "--no-skills", "--no-editor-setup"])
         .output()
         .expect("run install with Info behavioral metadata");
@@ -7319,7 +7314,7 @@ async fn verbose_install_shows_info_metadata_with_matching_query_hint() {
         .assert()
         .success();
 
-    let output = lpm_with_registry_and_npm(&project, &mock.url())
+    let output = lpm_with_registry(&project, &mock.url())
         .args(["--verbose", "install", "--no-skills", "--no-editor-setup"])
         .output()
         .expect("run verbose install with Info behavioral metadata");
@@ -12035,13 +12030,30 @@ async fn credentialed_registry_overlap_install(
 ) -> (serde_json::Value, Vec<wiremock::Request>) {
     let mock = MockRegistry::start().await;
     let tarball = make_tarball("private-pkg", "1.0.0");
-    mock.with_package("private-pkg", "1.0.0", &tarball).await;
-
-    let registry_url = mock.url();
-    let registry_host = registry_url
+    let (npmrc_registry, tarball_path) = if registry_is_npm {
+        let mut metadata = mock.package_metadata("private-pkg", "1.0.0", &tarball);
+        let tarball_url = mock
+            .with_npm_registry_tarball("private-pkg", "1.0.0", &tarball)
+            .await;
+        let tarball_path = reqwest::Url::parse(&tarball_url)
+            .expect("npm tarball URL must parse")
+            .path()
+            .to_owned();
+        metadata["versions"]["1.0.0"]["dist"]["tarball"] = tarball_url.into();
+        mock.with_package_metadata("private-pkg", "1.0.0", &tarball, metadata)
+            .await;
+        (lpm_common::NPM_REGISTRY_URL.to_owned(), tarball_path)
+    } else {
+        mock.with_package("private-pkg", "1.0.0", &tarball).await;
+        (
+            mock.url(),
+            MockRegistry::tarball_path("private-pkg", "1.0.0"),
+        )
+    };
+    let registry_host = npmrc_registry
         .strip_prefix("http://")
-        .or_else(|| registry_url.strip_prefix("https://"))
-        .expect("mock registry URL must include a scheme");
+        .or_else(|| npmrc_registry.strip_prefix("https://"))
+        .expect("registry URL must include a scheme");
     let project = TempProject::empty(
         r#"{
         "name": "auth-overlap",
@@ -12052,16 +12064,11 @@ async fn credentialed_registry_overlap_install(
     project.write_private_file(
         ".npmrc",
         &format!(
-            "registry={registry_url}/\n//{registry_host}/:_authToken=test-token\nalways-auth=true\n"
+            "registry={npmrc_registry}/\n//{registry_host}/:_authToken=test-token\nalways-auth=true\n"
         ),
     );
 
-    let mut command = if registry_is_npm {
-        lpm_with_registry_and_npm(&project, &registry_url)
-    } else {
-        lpm_with_registry(&project, &registry_url)
-    };
-    let output = command
+    let output = lpm_with_registry(&project, &mock.url())
         .env("LPM_STORE_VERSION", "v2")
         .env("LPM_TIMING_DETAIL", "1")
         .env("LPM_FETCH_OVERLAP_MIN_SELECTED", "1")
@@ -12090,7 +12097,6 @@ async fn credentialed_registry_overlap_install(
             .is_some_and(|count| count >= 1),
         "forced overlap admission should observe the selected package; got {envelope:#}"
     );
-    let tarball_path = MockRegistry::tarball_path("private-pkg", "1.0.0");
     let tarball_requests = mock
         .server()
         .received_requests()
@@ -16018,7 +16024,6 @@ async fn recursive_fresh_resolution_matches_metadata_cache_warm_resolution() {
     let cold_output = lpm_with_registry(&project, &mock.url())
         .env("LPM_STORE_VERSION", "v2")
         .env("LPM_WORKSPACE_CONCURRENCY", "1")
-        .env_remove("LPM_NPM_ROUTE")
         .args([
             "--json",
             "install",
@@ -16072,7 +16077,6 @@ async fn recursive_fresh_resolution_matches_metadata_cache_warm_resolution() {
     let warm_output = lpm_with_registry(&project, &mock.url())
         .env("LPM_STORE_VERSION", "v2")
         .env("LPM_WORKSPACE_CONCURRENCY", "1")
-        .env_remove("LPM_NPM_ROUTE")
         .args([
             "install",
             "--policy",
@@ -16111,8 +16115,10 @@ async fn legacy_metadata_cache_schema_cannot_change_install_lockfile() {
         )
     }
 
+    // The planted entry uses the proxy route's cache key.
     fn install(project: &TempProject, registry_url: &str) -> std::process::Output {
         lpm_with_registry(project, registry_url)
+            .env("LPM_NPM_ROUTE", "proxy")
             .args([
                 "install",
                 "--policy",
@@ -16246,6 +16252,12 @@ async fn legacy_metadata_cache_schema_cannot_change_install_lockfile() {
 
 #[tokio::test]
 async fn forced_resolution_preserves_prior_unpacked_size_for_same_registry_artifact() {
+    for route in ["direct", "proxy"] {
+        assert_forced_resolution_preserves_prior_unpacked_size(route).await;
+    }
+}
+
+async fn assert_forced_resolution_preserves_prior_unpacked_size(route: &str) {
     use std::sync::{
         Arc,
         atomic::{AtomicUsize, Ordering},
@@ -16284,7 +16296,10 @@ async fn forced_resolution_preserves_prior_unpacked_size_for_same_registry_artif
     let response_index = Arc::new(AtomicUsize::new(0));
     let response_index_for_request = Arc::clone(&response_index);
     Mock::given(method("GET"))
-        .and(path(format!("/api/registry/{package_name}")))
+        .and(path(match route {
+            "proxy" => format!("/api/registry/{package_name}"),
+            _ => format!("/{package_name}"),
+        }))
         .respond_with(move |_request: &wiremock::Request| {
             let body = if response_index_for_request.fetch_add(1, Ordering::SeqCst) == 0 {
                 &metadata_with_size
@@ -16316,6 +16331,7 @@ async fn forced_resolution_preserves_prior_unpacked_size_for_same_registry_artif
 }"#,
     );
     let first = lpm_with_registry(&project, &mock.url())
+        .env("LPM_NPM_ROUTE", route)
         .args([
             "install",
             "--policy",
@@ -16328,12 +16344,13 @@ async fn forced_resolution_preserves_prior_unpacked_size_for_same_registry_artif
         .expect("run initial unpacked-size install");
     assert!(
         first.status.success(),
-        "initial unpacked-size install failed\nstdout:\n{}\nstderr:\n{}",
+        "initial unpacked-size install failed on the {route} route\nstdout:\n{}\nstderr:\n{}",
         String::from_utf8_lossy(&first.stdout),
         String::from_utf8_lossy(&first.stderr)
     );
 
     let second = lpm_with_registry(&project, &mock.url())
+        .env("LPM_NPM_ROUTE", route)
         .args([
             "install",
             "--force",
@@ -16347,7 +16364,7 @@ async fn forced_resolution_preserves_prior_unpacked_size_for_same_registry_artif
         .expect("run forced unpacked-size install");
     assert!(
         second.status.success(),
-        "forced unpacked-size install failed\nstdout:\n{}\nstderr:\n{}",
+        "forced unpacked-size install failed on the {route} route\nstdout:\n{}\nstderr:\n{}",
         String::from_utf8_lossy(&second.stdout),
         String::from_utf8_lossy(&second.stderr)
     );
@@ -16362,7 +16379,8 @@ async fn forced_resolution_preserves_prior_unpacked_size_for_same_registry_artif
         .expect("stable artifact must be present in the lockfile");
     assert_eq!(
         package.unpacked_size.map(std::num::NonZeroU64::get),
-        Some(unpacked_size)
+        Some(unpacked_size),
+        "{route} route",
     );
 }
 
@@ -17648,7 +17666,7 @@ async fn install_does_not_verify_registry_signatures_by_default() {
     project.write_file(".npmrc", &format!("registry={}\n", mock.url()));
     mount_unsigned_signature_pkg(&mock).await;
 
-    let out = lpm_with_registry_and_npm(&project, &mock.url())
+    let out = lpm_with_registry(&project, &mock.url())
         .args([
             "install",
             "--no-security-summary",
@@ -17676,7 +17694,7 @@ async fn install_config_signatures_true_blocks_unsigned_registry_package() {
     write_signatures_global_config(&project, true);
     mount_unsigned_signature_pkg(&mock).await;
 
-    let out = lpm_with_registry_and_npm(&project, &mock.url())
+    let out = lpm_with_registry(&project, &mock.url())
         .args([
             "install",
             "--no-security-summary",
@@ -17713,7 +17731,7 @@ async fn install_config_signatures_true_blocks_malformed_registry_signature() {
     write_signatures_global_config(&project, true);
     mount_malformed_signature_pkg(&mock).await;
 
-    let out = lpm_with_registry_and_npm(&project, &mock.url())
+    let out = lpm_with_registry(&project, &mock.url())
         .args([
             "install",
             "--no-security-summary",
@@ -17750,7 +17768,7 @@ async fn install_config_signatures_true_blocks_mismatched_registry_signature() {
     write_signatures_global_config(&project, true);
     mount_mismatched_signature_pkg(&mock).await;
 
-    let out = lpm_with_registry_and_npm(&project, &mock.url())
+    let out = lpm_with_registry(&project, &mock.url())
         .args([
             "install",
             "--no-security-summary",
@@ -17788,7 +17806,7 @@ async fn install_config_signatures_true_accepts_signed_registry_package() {
     write_signatures_global_config(&project, true);
     mount_signed_signature_pkg(&mock).await;
 
-    let out = lpm_with_registry_and_npm(&project, &mock.url())
+    let out = lpm_with_registry(&project, &mock.url())
         .args([
             "install",
             "--no-security-summary",
@@ -17821,7 +17839,7 @@ async fn install_config_signatures_true_persists_registry_signature_metadata_in_
     write_signatures_global_config(&project, true);
     mount_signed_signature_pkg(&mock).await;
 
-    let out = lpm_with_registry_and_npm(&project, &mock.url())
+    let out = lpm_with_registry(&project, &mock.url())
         .args([
             "install",
             "--no-security-summary",
@@ -18118,7 +18136,6 @@ async fn install_strict_release_age_hydrates_platform_metadata_for_mature_option
     }
 
     let output = lpm_with_registry(&project, &mock.url())
-        .env_remove("LPM_NPM_ROUTE")
         .env("LPM_TIMING_DETAIL", "basic")
         .args([
             "--json",
@@ -19274,7 +19291,7 @@ async fn install_reports_exact_pool_graph_and_retries_it_on_an_unchanged_project
     }
     let project = TempProject::empty(&serde_json::json!({"name": "pool-graph-consumer", "version": "1.0.0", "dependencies": {a: "1.0.0"}}).to_string());
     for _ in 0..2 {
-        let output = lpm_with_registry_and_npm(&project, &mock.url())
+        let output = lpm_with_registry(&project, &mock.url())
             .env("LPM_TOKEN", "pool-graph-fixture")
             .args([
                 "install",
@@ -19415,7 +19432,7 @@ async fn invalid_signature_environment_preserves_saved_verification() {
         );
         project.write_file(".npmrc", &format!("registry={}\n", mock.url()));
         write_signatures_global_config(&project, true);
-        let out = lpm_with_registry_and_npm(&project, &mock.url())
+        let out = lpm_with_registry(&project, &mock.url())
             .env("LPM_VERIFY_REGISTRY_SIGNATURES", raw)
             .args([
                 "install",

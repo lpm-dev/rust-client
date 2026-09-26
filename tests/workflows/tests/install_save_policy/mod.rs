@@ -34,7 +34,7 @@ async fn conflicting_requests_fail_before_manifest_or_registry_changes() {
         let registry = versions().await;
         let manifest = "{\"name\":\"consumer\",\"version\":\"1.0.0\"}\n";
         let project = TempProject::empty(manifest);
-        let output = lpm_with_registry_and_npm(&project, &registry.url())
+        let output = lpm_with_registry(&project, &registry.url())
             .env("LPM_TYPOSQUAT_GUARD", "0")
             .args([
                 "install",
@@ -78,7 +78,7 @@ async fn conflicting_requests_do_not_initialize_a_project() {
     let registry = versions().await;
     let project = TempProject::empty("{\"name\":\"consumer\"}");
     std::fs::remove_file(project.path().join("package.json")).unwrap();
-    let output = lpm_with_registry_and_npm(&project, &registry.url())
+    let output = lpm_with_registry(&project, &registry.url())
         .env("LPM_TYPOSQUAT_GUARD", "0")
         .args([
             "install",
@@ -113,7 +113,7 @@ async fn conflicting_filtered_requests_preserve_all_workspace_manifests() {
     let member = "{\"name\":\"app\",\"version\":\"1.0.0\"}";
     let project = TempProject::empty(root);
     project.write_file("packages/app/package.json", member);
-    let output = lpm_with_registry_and_npm(&project, &registry.url())
+    let output = lpm_with_registry(&project, &registry.url())
         .env("LPM_TYPOSQUAT_GUARD", "0")
         .args([
             "install",
@@ -158,7 +158,7 @@ async fn identical_requests_install_one_dependency_with_the_requested_policy() {
         (["save-fixture@latest", "save-fixture@latest"], "^2.0.0"),
     ] {
         let project = TempProject::empty("{\"name\":\"consumer\"}");
-        lpm_with_registry_and_npm(&project, &registry.url())
+        lpm_with_registry(&project, &registry.url())
             .env("LPM_TYPOSQUAT_GUARD", "0")
             .args([
                 "install",
@@ -207,7 +207,7 @@ async fn source_shaped_registry_tags_cannot_replace_requested_package_sources() 
     }
     let manifest = "{\"name\":\"consumer\"}";
     let project = TempProject::empty(manifest);
-    let output = lpm_with_registry_and_npm(&project, &registry.url())
+    let output = lpm_with_registry(&project, &registry.url())
         .env("LPM_TYPOSQUAT_GUARD", "0")
         .args([
             "install",
@@ -260,7 +260,7 @@ async fn automatic_catalog_modes_preserve_local_dependency_sources() {
                     "packages/shared/package.json",
                     r#"{"name":"shared","version":"1.0.0"}"#,
                 );
-                let output = lpm_with_registry_and_npm(&project, &registry.url())
+                let output = lpm_with_registry(&project, &registry.url())
                     .env("LPM_TYPOSQUAT_GUARD", "0")
                     .args([
                         "install",
@@ -319,7 +319,7 @@ async fn forced_catalog_rejects_local_source_conversion_before_registry_access()
         "packages/shared/package.json",
         r#"{"name":"shared","version":"1.0.0"}"#,
     );
-    let output = lpm_with_registry_and_npm(&project, &registry.url())
+    let output = lpm_with_registry(&project, &registry.url())
         .env("LPM_TYPOSQUAT_GUARD", "0")
         .args([
             "install",
@@ -369,7 +369,7 @@ async fn automatic_catalog_modes_preserve_existing_alias_sources() {
             })
             .to_string(),
         );
-        lpm_with_registry_and_npm(&project, &registry.url())
+        lpm_with_registry(&project, &registry.url())
             .env("LPM_TYPOSQUAT_GUARD", "0")
             .args([
                 "install",
@@ -425,7 +425,7 @@ async fn automatic_catalog_modes_preserve_key_relative_jsr_sources() {
             .to_string(),
         );
         project.write_file(".npmrc", &format!("@jsr:registry={}\n", registry.url()));
-        lpm_with_registry_and_npm(&project, &registry.url())
+        lpm_with_registry(&project, &registry.url())
             .env("LPM_TYPOSQUAT_GUARD", "0")
             .args([
                 "install",
@@ -477,7 +477,7 @@ async fn bare_reinstall_save_flags_preserve_source_dependencies() {
                 "packages/shared/package.json",
                 r#"{"name":"shared","version":"1.0.0"}"#,
             );
-            lpm_with_registry_and_npm(&project, &registry.url())
+            lpm_with_registry(&project, &registry.url())
                 .env("LPM_TYPOSQUAT_GUARD", "0")
                 .args([
                     "install",
@@ -546,7 +546,7 @@ async fn lpm_scoped_workspace_requests_do_not_fetch_ecosystem_metadata() {
             } else {
                 "@lpm.dev/acme.shared@workspace:*"
             };
-            lpm_with_registry_and_npm(&project, &registry.url())
+            lpm_with_registry(&project, &registry.url())
                 .env("LPM_TYPOSQUAT_GUARD", "0")
                 .args([
                     "install",
@@ -611,7 +611,7 @@ async fn path_shaped_registry_tags_cannot_replace_requested_sources() {
         }
         let manifest = r#"{"name":"consumer"}"#;
         let project = TempProject::empty(manifest);
-        let output = lpm_with_registry_and_npm(&project, &registry.url())
+        let output = lpm_with_registry(&project, &registry.url())
             .env("LPM_TYPOSQUAT_GUARD", "0")
             .args([
                 "install",
@@ -659,7 +659,7 @@ async fn mixed_local_and_swift_targets_fail_before_manifest_changes() {
     project.write_file("packages/app/package.json", &member);
     project.write_file("packages/other/package.json", other);
 
-    let output = lpm_with_registry_and_npm(&project, &registry.url())
+    let output = lpm_with_registry(&project, &registry.url())
         .env("LPM_TYPOSQUAT_GUARD", "0")
         .args([
             "install",
@@ -704,7 +704,7 @@ async fn catalog_backed_aliases_survive_reinstall_and_save_flags() {
                 })
                 .to_string(),
             );
-            let mut command = lpm_with_registry_and_npm(&project, &registry.url());
+            let mut command = lpm_with_registry(&project, &registry.url());
             command.env("LPM_TYPOSQUAT_GUARD", "0").args([
                 "install",
                 "local-alias",
@@ -726,7 +726,7 @@ async fn catalog_backed_aliases_survive_reinstall_and_save_flags() {
                 serde_json::from_str(&project.read_file("node_modules/local-alias/package.json"))
                     .unwrap();
             assert_eq!(installed["name"], "real-package");
-            lpm_with_registry_and_npm(&project, &registry.url())
+            lpm_with_registry(&project, &registry.url())
                 .args([
                     "install",
                     "--frozen-lockfile",

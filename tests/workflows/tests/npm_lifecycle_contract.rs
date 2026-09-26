@@ -2,10 +2,10 @@
 mod support;
 
 use support::mock_registry::MockRegistry;
-use support::{TempProject, lpm, lpm_with_registry_and_npm};
+use support::{TempProject, lpm, lpm_with_registry};
 
 fn registry_command(project: &TempProject, registry: &MockRegistry) -> assert_cmd::Command {
-    let mut command = lpm_with_registry_and_npm(project, &registry.url());
+    let mut command = lpm_with_registry(project, &registry.url());
     command.env("LPM_STORE_VERSION", "v2");
     command
 }

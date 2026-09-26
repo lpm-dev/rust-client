@@ -1,5 +1,5 @@
 use super::*;
-use support::lpm_with_registry_and_npm;
+use support::lpm_with_registry;
 
 async fn mount_metadata(
     mock: &MockRegistry,
@@ -30,7 +30,7 @@ async fn conflicting_duplicate_roots_fail_before_registry_requests() {
         serde_json::json!({}),
     )
     .await;
-    let output = lpm_with_registry_and_npm(&project, &mock.url())
+    let output = lpm_with_registry(&project, &mock.url())
         .args(["resolve", "pkg@^2", "pkg@^1", "--json"])
         .output()
         .unwrap();
@@ -57,7 +57,7 @@ async fn identical_duplicate_roots_coalesce_bare_and_wildcard_specs() {
         serde_json::json!({}),
     )
     .await;
-    let output = lpm_with_registry_and_npm(&project, &mock.url())
+    let output = lpm_with_registry(&project, &mock.url())
         .args(["resolve", "pkg", "pkg@*", "--json"])
         .output()
         .unwrap();
@@ -82,7 +82,7 @@ async fn versioned_root_alias_keeps_its_local_name_and_exact_target() {
         serde_json::json!({}),
     )
     .await;
-    let output = lpm_with_registry_and_npm(&project, &mock.url())
+    let output = lpm_with_registry(&project, &mock.url())
         .args(["resolve", "local@npm:pkg@^1"])
         .output()
         .unwrap();
@@ -120,7 +120,7 @@ async fn resolve_json_preserves_roots_aliases_and_exact_edges_without_installing
         serde_json::json!({}),
     )
     .await;
-    let output = lpm_with_registry_and_npm(&project, &mock.url())
+    let output = lpm_with_registry(&project, &mock.url())
         .args(["resolve", "pkg", "--json"])
         .output()
         .unwrap();
@@ -164,7 +164,7 @@ async fn optional_peer_is_quiet_when_absent_but_reported_when_present_and_incomp
             serde_json::json!({}),
         )
         .await;
-        let mut command = lpm_with_registry_and_npm(&project, &mock.url());
+        let mut command = lpm_with_registry(&project, &mock.url());
         command.args(["resolve", "plugin", "--json"]);
         if present {
             command.arg("host");
@@ -209,7 +209,7 @@ async fn shared_dependency_dag_is_expanded_once_in_human_output() {
             .await;
         }
     }
-    let output = lpm_with_registry_and_npm(&project, &mock.url())
+    let output = lpm_with_registry(&project, &mock.url())
         .args(["resolve", "a0", "b0"])
         .output()
         .unwrap();
@@ -247,7 +247,7 @@ async fn root_alias_configures_tls_for_its_target_instead_of_the_local_scope() {
         ),
     )
     .unwrap();
-    let output = lpm_with_registry_and_npm(&project, &mock.url())
+    let output = lpm_with_registry(&project, &mock.url())
         .args(["resolve", "@unused/alias@npm:pkg", "--json"])
         .output()
         .unwrap();
@@ -279,7 +279,7 @@ async fn resolve_human_output_reports_optional_peer_version_mismatch() {
         serde_json::json!({}),
     )
     .await;
-    let output = lpm_with_registry_and_npm(&project, &mock.url())
+    let output = lpm_with_registry(&project, &mock.url())
         .args(["resolve", "plugin", "host"])
         .output()
         .unwrap();
@@ -308,7 +308,7 @@ async fn pubgrub_reports_missing_required_peer_without_changing_exit_status() {
         serde_json::json!({}),
     )
     .await;
-    let output = lpm_with_registry_and_npm(&project, &mock.url())
+    let output = lpm_with_registry(&project, &mock.url())
         .env("LPM_RESOLVER", "pubgrub")
         .args(["resolve", "plugin", "--json"])
         .output()
@@ -336,7 +336,7 @@ async fn canonical_json_names_do_not_include_pubgrub_root_alias_context() {
     )
     .await;
     project.write_file(".npmrc", &format!("registry={}\n", mock.url()));
-    let output = lpm_with_registry_and_npm(&project, &mock.url())
+    let output = lpm_with_registry(&project, &mock.url())
         .env("LPM_RESOLVER", "pubgrub")
         .args(["resolve", "local@npm:pkg", "--json"])
         .output()
@@ -381,7 +381,7 @@ async fn resolve_reports_best_effort_peer_conflicts_and_exact_peer_targets() {
         ],
     )
     .await;
-    let output = lpm_with_registry_and_npm(&project, &mock.url())
+    let output = lpm_with_registry(&project, &mock.url())
         .args(["resolve", "consumer-a", "consumer-b", "--json"])
         .output()
         .unwrap();
@@ -430,7 +430,7 @@ async fn resolve_preserves_fatal_peer_conflict_error_details() {
         serde_json::json!({}),
     )
     .await;
-    let output = lpm_with_registry_and_npm(&project, &mock.url())
+    let output = lpm_with_registry(&project, &mock.url())
         .args(["resolve", "plugin", "--json"])
         .output()
         .unwrap();
@@ -455,7 +455,7 @@ async fn resolve_roots_preserve_argument_order_and_coalesce_scoped_duplicates() 
         )
         .await;
     }
-    let output = lpm_with_registry_and_npm(&project, &mock.url())
+    let output = lpm_with_registry(&project, &mock.url())
         .args([
             "resolve",
             "@scope/second",
@@ -499,7 +499,7 @@ async fn wildcard_prerelease_selection_follows_the_active_resolver() {
     .await;
     for (mode, expected) in [("greedy-fusion", "1.0.0"), ("pubgrub", "2.0.0-beta.1")] {
         let project = TempProject::empty(r#"{"name":"root","version":"1.0.0"}"#);
-        let output = lpm_with_registry_and_npm(&project, &mock.url())
+        let output = lpm_with_registry(&project, &mock.url())
             .env("LPM_RESOLVER", mode)
             .args(["resolve", "pkg", "--json"])
             .output()

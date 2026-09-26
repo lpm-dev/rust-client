@@ -246,7 +246,7 @@ async fn deep_verify_does_not_bind_an_unrelated_v1_coordinate_to_a_virtual_insta
         v2_sri_and_segment(b"other-registry").0,
     )
     .unwrap();
-    let output = support::lpm_with_registry_and_npm(&project, &registry.url())
+    let output = support::lpm_with_registry(&project, &registry.url())
         .env("LPM_STORE_VERSION", "v2")
         .args(["install", "--no-security-summary"])
         .output()
@@ -381,7 +381,7 @@ async fn deep_verify_follows_scoped_dependency_and_peer_links() {
             }
             let project = TempProject::empty(&manifest.to_string());
             write_archive(&project.path().join("b.tgz"), "archive");
-            let output = support::lpm_with_registry_and_npm(&project, &registry.url())
+            let output = support::lpm_with_registry(&project, &registry.url())
                 .env("LPM_STORE_VERSION", version)
                 .args(["install", "--no-security-summary"])
                 .output()

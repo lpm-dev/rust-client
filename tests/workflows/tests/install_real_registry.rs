@@ -15,7 +15,6 @@ use tempfile::TempDir;
 
 fn run_install(project: &TempProject) -> Output {
     lpm(project)
-        .env_remove("LPM_NPM_ROUTE")
         .env_remove("LPM_TOKEN")
         .args([
             "install",

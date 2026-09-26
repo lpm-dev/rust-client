@@ -55,7 +55,7 @@ async fn targeted_upgrade_preserves_unselected_locked_root() {
     let mock = MockRegistry::start().await;
     mount_versions(&mock, a, "1.1.0", &["1.0.0", "1.1.0"]).await;
     mount_versions(&mock, b, "1.2.0", &["1.0.0", "1.2.0"]).await;
-    let out = lpm_with_registry_and_npm(&project, &mock.url())
+    let out = lpm_with_registry(&project, &mock.url())
         .args(["upgrade", a, "-y", "--json"])
         .output()
         .unwrap();
@@ -97,7 +97,7 @@ async fn alias_snapshot(resolver: &str) {
     );
     let mock = MockRegistry::start().await;
     mount_versions(&mock, package, "2.0.0", &["1.0.0", "1.1.0", "2.0.0"]).await;
-    let out = lpm_with_registry_and_npm(&project, &mock.url())
+    let out = lpm_with_registry(&project, &mock.url())
         .env("LPM_RESOLVER", resolver)
         .args(["upgrade", "zzz", "-y", "--json"])
         .output()
@@ -137,7 +137,7 @@ async fn upgrade_rejects_catalog_target_without_replacing_protocol() {
     let before = project.read_file("package.json");
     let mock = MockRegistry::start().await;
     mount_versions(&mock, name, "2.0.0", &["1.0.0", "2.0.0"]).await;
-    let out = lpm_with_registry_and_npm(&project, &mock.url())
+    let out = lpm_with_registry(&project, &mock.url())
         .args(["upgrade", name, "-y", "--major", "--dry-run", "--json"])
         .output()
         .unwrap();
@@ -162,7 +162,7 @@ async fn upgrade_respects_rolled_back_latest_tag() {
     seed_pinned_dep(&project, name, "^1.0.0", "1.0.0");
     let mock = MockRegistry::start().await;
     mount_versions(&mock, name, "1.1.0", &["1.0.0", "1.1.0", "1.2.0"]).await;
-    let out = lpm_with_registry_and_npm(&project, &mock.url())
+    let out = lpm_with_registry(&project, &mock.url())
         .args(["upgrade", "-y", "--dry-run", "--json"])
         .output()
         .unwrap();
@@ -180,7 +180,7 @@ async fn upgrade_does_not_downgrade_a_stored_tag() {
     seed_pinned_dep(&project, name, "latest", "2.0.0");
     let mock = MockRegistry::start().await;
     mount_versions(&mock, name, "1.9.0", &["1.9.0", "2.0.0"]).await;
-    let out = lpm_with_registry_and_npm(&project, &mock.url())
+    let out = lpm_with_registry(&project, &mock.url())
         .args(["upgrade", "-y", "--dry-run", "--json"])
         .output()
         .unwrap();
@@ -220,7 +220,7 @@ async fn upgrade_preview_reports_npm_lifecycle_signals() {
             &[],
         )
         .await;
-        let out = lpm_with_registry_and_npm(&project, &mock.url())
+        let out = lpm_with_registry(&project, &mock.url())
             .args(["upgrade", "-y", "--dry-run", "--json"])
             .output()
             .unwrap();
@@ -257,7 +257,7 @@ async fn upgrade_uses_effective_dependency_section_only() {
             &["1.0.0", "1.1.0", "2.0.0", "2.1.0", "3.0.0", "3.1.0"],
         )
         .await;
-        let out = lpm_with_registry_and_npm(&project, &mock.url())
+        let out = lpm_with_registry(&project, &mock.url())
             .args(["upgrade", "-y", "--json", "--dry-run"])
             .output()
             .unwrap();
@@ -283,7 +283,7 @@ async fn upgrade_applies_selected_tag_without_replaying_old_lock() {
     seed_pinned_dep(&project, name, "latest", "1.0.0");
     let mock = MockRegistry::start().await;
     mount_versions(&mock, name, "1.1.0", &["1.0.0", "1.1.0"]).await;
-    let out = lpm_with_registry_and_npm(&project, &mock.url())
+    let out = lpm_with_registry(&project, &mock.url())
         .args(["upgrade", "-y", "--json"])
         .output()
         .unwrap();
@@ -316,7 +316,7 @@ async fn targeted_upgrade_preserves_unselected_catalog_alias() {
     let mock = MockRegistry::start().await;
     mount_versions(&mock, selected, "1.1.0", &["1.0.0", "1.1.0"]).await;
     mount_versions(&mock, canonical, "1.2.0", &["1.0.0", "1.2.0"]).await;
-    let out = lpm_with_registry_and_npm(&project, &mock.url())
+    let out = lpm_with_registry(&project, &mock.url())
         .args(["upgrade", selected, "-y", "--json"])
         .output()
         .unwrap();
@@ -342,7 +342,7 @@ async fn upgrade_rejects_a_missing_stored_tag() {
         vec!["upgrade", "-y", "--json", "--dry-run"],
         vec!["upgrade", "-y", "--json"],
     ] {
-        let out = lpm_with_registry_and_npm(&project, &mock.url())
+        let out = lpm_with_registry(&project, &mock.url())
             .args(flags)
             .output()
             .unwrap();
@@ -418,7 +418,7 @@ async fn targeted_upgrade_honors_a_changed_unselected_tag() {
             versions.insert(version.to_string(), serde_json::json!({"name": tagged, "version": version, "dist": {"tarball": mock.tarball_url(tagged, version), "integrity": compute_integrity(tarball)}}));
         }
         mock.with_package_metadata_and_tarballs(tagged, serde_json::json!({"name": tagged, "dist-tags": {"latest": "2.0.0", "next": "2.0.0"}, "versions": versions, "time": {"1.0.0": "2025-01-01T00:00:00.000Z", "2.0.0": "2025-01-01T00:00:00.000Z"}}), &tarballs).await;
-        let out = lpm_with_registry_and_npm(&project, &mock.url())
+        let out = lpm_with_registry(&project, &mock.url())
             .args(["upgrade", selected, "-y", "--json"])
             .output()
             .unwrap();
@@ -466,7 +466,7 @@ async fn targeted_upgrade_keeps_planned_integrity_when_other_roots_need_metadata
         .expect(1)
         .mount(mock.server())
         .await;
-    let out = lpm_with_registry_and_npm(&project, &mock.url())
+    let out = lpm_with_registry(&project, &mock.url())
         .args(["upgrade", selected, "-y", "--json"])
         .output()
         .unwrap();
@@ -510,7 +510,7 @@ async fn targeted_upgrade_does_not_pin_a_previous_local_source() {
     let mock = MockRegistry::start().await;
     mount_versions(&mock, selected, "1.1.0", &["1.0.0", "1.1.0"]).await;
     mount_versions(&mock, other, "1.2.0", &["1.2.0"]).await;
-    let out = lpm_with_registry_and_npm(&project, &mock.url())
+    let out = lpm_with_registry(&project, &mock.url())
         .args(["upgrade", selected, "-y", "--json"])
         .output()
         .unwrap();
@@ -557,7 +557,7 @@ async fn upgrade_pubgrub_alias_preserves_canonical_parent_path_override() {
     )
     .await;
     mount_versions(&mock, child, "1.2.0", &["1.1.0", "1.2.0"]).await;
-    let out = lpm_with_registry_and_npm(&project, &mock.url())
+    let out = lpm_with_registry(&project, &mock.url())
         .env("LPM_RESOLVER", "pubgrub")
         .args(["upgrade", "alias", "-y", "--json"])
         .output()

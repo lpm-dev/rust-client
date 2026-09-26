@@ -3032,9 +3032,21 @@ async fn warm_recursive_replay_preserves_each_importers_root_links_and_bin_shims
 #[tokio::test]
 async fn recursive_install_with_conflicting_member_specs_keeps_both_correct() {
     let mock = MockRegistry::start().await;
-    mount_registry_packages(
-        &mock,
-        &[("contested-dep", "1.0.0"), ("contested-dep", "2.0.0")],
+    mock.with_full_package_metadata(
+        "contested-dep",
+        "2.0.0",
+        &[
+            (
+                "1.0.0",
+                serde_json::json!({}),
+                Some(make_tarball("contested-dep", "1.0.0")),
+            ),
+            (
+                "2.0.0",
+                serde_json::json!({}),
+                Some(make_tarball("contested-dep", "2.0.0")),
+            ),
+        ],
     )
     .await;
 
