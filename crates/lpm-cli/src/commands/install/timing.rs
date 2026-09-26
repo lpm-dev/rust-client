@@ -1319,6 +1319,15 @@ impl SlowPackageTimings {
     }
 }
 
+/// Lockfile parses this process has performed and avoided so far.
+pub(super) fn lockfile_parse_detail_json() -> serde_json::Value {
+    let stats = lpm_lockfile::parse_cache_stats();
+    serde_json::json!({
+        "parse_count": stats.parses,
+        "reuse_count": stats.reuses,
+    })
+}
+
 pub(super) fn setup_only_timing_detail_json(
     mode: TimingDetailMode,
     setup_total_ms: u128,
@@ -1334,6 +1343,7 @@ pub(super) fn setup_only_timing_detail_json(
                 install_state_ms.saturating_add(route_table_ms),
             ),
         },
+        "lockfile": lockfile_parse_detail_json(),
         "metadata": metadata_detail_json_from_snapshots(&metadata, mode),
         "resolve": resolve_detail_json(
             0,

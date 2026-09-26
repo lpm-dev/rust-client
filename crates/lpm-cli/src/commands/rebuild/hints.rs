@@ -285,55 +285,6 @@ pub fn show_install_build_hint(
 /// whether to skip the auto-build step entirely), matching the
 /// previous semantics.
 #[allow(clippy::too_many_arguments)]
-pub fn all_scripted_packages_trusted(
-    // see
-    // `scriptable_package_rows` for why this is `&LpmRoot` not
-    // `&PackageStore`. Without the v2-aware lookup, the predicate
-    // returned `false` for every v2 install with unbuilt-but-trusted
-    // scripts (silent skip of v2 packages), suppressing the
-    // auto-build path entirely.
-    lpm_root: &lpm_common::LpmRoot,
-    packages: &[(String, String, Option<String>)], // (name, version, integrity)
-    policy: &SecurityPolicy,
-    project_dir: &Path,
-    effective_policy: ScriptPolicy,
-    // Threaded through to
-    // [`evaluate_trust`]. When `true`, every approval is suspended —
-    // so if even one package has scripts, this function returns
-    // `false`, correctly declining the auto-build path under the
-    // kill-switch.
-    force_security_floor: bool,
-    // Threaded through to
-    // [`evaluate_trust`]'s capability gate. Auto-build declines
-    // cleanly when the project's `lpm.scripts.*` widens beyond
-    // the user bound and no matching approval exists.
-    requested_capabilities: &crate::capability::CapabilitySet,
-    user_bound: &crate::capability::UserBound,
-    // Threaded through to [`evaluate_trust`]
-    // so an install's autoBuild predicate sees the same ephemeral
-    // advisor approvals the script-execution path will see. Without
-    // this, a `Some(approvals)` install would still report "not all
-    // scripts trusted" and decline autoBuild entirely — defeating
-    // the whole point of advisor-enhanced triage.
-    advisor_approvals: Option<
-        &std::collections::HashSet<crate::triage_advisor_session::AdvisorApprovalKey>,
-    >,
-) -> bool {
-    all_scripted_packages_trusted_in_context(
-        lpm_root,
-        packages,
-        policy,
-        project_dir,
-        project_dir,
-        effective_policy,
-        force_security_floor,
-        requested_capabilities,
-        user_bound,
-        advisor_approvals,
-    )
-}
-
-#[allow(clippy::too_many_arguments)]
 pub fn all_scripted_packages_trusted_in_context(
     // see
     // `scriptable_package_rows` for why this is `&LpmRoot` not
@@ -368,14 +319,22 @@ pub fn all_scripted_packages_trusted_in_context(
     advisor_approvals: Option<
         &std::collections::HashSet<crate::triage_advisor_session::AdvisorApprovalKey>,
     >,
+    // The caller's index of this project's installed tree, when it has one.
+    baseline_index: Option<&V2BaselineIndex>,
 ) -> bool {
-    // Build the
-    // virtual-store link-entry index ONCE before the per-package loop, scoped to
-    // this project's tree. Same rationale as `scriptable_package_rows`
+    // Index the virtual-store link entries once before the per-package loop,
+    // scoped to this project's tree. Same rationale as `scriptable_package_rows`
     // — install-time auto-build predicate checks every lockfile entry,
     // and the global walk could otherwise return a sibling project's
     // link entry under same-coordinate same-coord coexistence.
-    let baseline_index = V2BaselineIndex::for_project(project_dir, lpm_root);
+    let built_index;
+    let baseline_index = match baseline_index {
+        Some(index) => index,
+        None => {
+            built_index = V2BaselineIndex::for_project(project_dir, lpm_root);
+            &built_index
+        }
+    };
 
     let mut has_any_unbuilt = false;
 
@@ -383,7 +342,7 @@ pub fn all_scripted_packages_trusted_in_context(
         // v2-aware lookup, routed through the invocation-local index. Same
         // silent-skip semantics as the main loop; see
         // [`package_baseline_dir`] doc.
-        let pkg_dir = match package_baseline_dir_indexed(&baseline_index, lpm_root, name, version) {
+        let pkg_dir = match package_baseline_dir_indexed(baseline_index, lpm_root, name, version) {
             Some(p) => p,
             None => continue,
         };
