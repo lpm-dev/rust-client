@@ -3392,6 +3392,66 @@ async fn warm_installs_parse_the_lockfile_and_index_the_store_once() {
 }
 
 #[tokio::test]
+async fn fresh_checkouts_resolve_from_stored_metadata_projections() {
+    let mock = MockRegistry::start().await;
+    mock.with_manifest_package(
+        serde_json::json!({"name": "projected-dep", "version": "1.2.0"}),
+        &[],
+    )
+    .await;
+    let project = TempProject::empty(
+        r#"{"name":"projection-install","version":"1.0.0","dependencies":{"projected-dep":"^1.0.0"}}"#,
+    );
+    let install = || -> (serde_json::Value, String) {
+        let output = lpm_with_registry_and_npm(&project, &mock.url())
+            .env("LPM_NPM_ROUTE", "direct")
+            .env("LPM_TIMING_DETAIL", "trace")
+            .args([
+                "install",
+                "--json",
+                "--no-security-summary",
+                "--no-skills",
+                "--no-editor-setup",
+            ])
+            .output()
+            .expect("failed to run lpm install --json");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success(),
+            "install --json failed:\nstdout: {stdout}\nstderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let envelope: serde_json::Value =
+            serde_json::from_str(&stdout).expect("install --json must emit parseable JSON");
+        let lockfile = std::fs::read_to_string(project.path().join("lpm.lock")).unwrap();
+        (
+            envelope["timing"]["detail"]["resolve"]["metadata_fetch"].clone(),
+            lockfile,
+        )
+    };
+
+    let (first, first_lockfile) = install();
+    assert_eq!(first["routes"]["npm_direct"], 1, "{first:#}");
+    assert_eq!(
+        first["projection_hit_count"], 0,
+        "a cold install has no stored projections: {first:#}"
+    );
+    for generated in ["node_modules", ".lpm"] {
+        std::fs::remove_dir_all(project.path().join(generated)).unwrap();
+    }
+    for lockfile in ["lpm.lock", "lpm.lockb"] {
+        let _ = std::fs::remove_file(project.path().join(lockfile));
+    }
+
+    let (checkout, checkout_lockfile) = install();
+    assert_eq!(
+        checkout["projection_hit_count"], 1,
+        "a fresh checkout decoded the cached history instead of its projection: {checkout:#}"
+    );
+    assert_eq!(checkout_lockfile, first_lockfile);
+}
+
+#[tokio::test]
 async fn install_json_timing_detail_env_exposes_install_substage_probes() {
     let mock = MockRegistry::start().await;
     mount_ms_2_1_3(&mock).await;

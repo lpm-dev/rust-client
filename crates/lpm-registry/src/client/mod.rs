@@ -32,6 +32,7 @@ mod http;
 mod install_accounting;
 mod manifest;
 mod metadata;
+mod projection;
 mod public_npm;
 mod state;
 mod tarball;
@@ -57,11 +58,12 @@ pub use self::install_accounting::{
 };
 pub use self::manifest::ManifestVersionMetadata;
 pub use self::metadata::BatchMetadataEntryStream;
+pub use self::projection::{MetadataProjection, NoProjection, ProjectionSlot, ResolutionMetadata};
 pub use self::public_npm::PublicNpmAccess;
 pub use self::state::{
     CompressedTarballSpoolReservation, DownloadedTarball, FanOutStats, HttpClients,
     PackageMetadataFetchError, PackageMetadataFetchTimings, RegistryClient, TimedPackageMetadata,
-    TimedPreferredMetadata, TimedReleaseTimeMetadata,
+    TimedPreferredMetadata, TimedPreferredResolution, TimedReleaseTimeMetadata,
 };
 pub use self::tarball::{
     MAX_COMPRESSED_TARBALL_SIZE, MAX_COMPRESSED_TARBALL_SPOOL_BYTES,
@@ -80,10 +82,11 @@ use self::body::{
     parse_capped_api_json_with_timing, parse_capped_metadata, parse_capped_metadata_with_timing,
     read_capped_error_text,
 };
-use self::cache::MetadataCacheDirective;
+use self::cache::{CachedResolution, MetadataCacheDirective};
 use self::http::{
     CONNECT_TIMEOUT, HttpClientSet, READ_TIMEOUT, build_per_origin_http_client, request_lane_count,
 };
+use self::projection::{ProjectionFacts, ProjectionSource};
 #[cfg(test)]
 use self::state::CacheContent;
 use self::state::{

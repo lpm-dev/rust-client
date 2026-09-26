@@ -1,47 +1,45 @@
 use super::*;
 use crate::TimedPreferredMetadata;
 
-enum Preference {
-    History(Box<PreferredMetadata>),
+enum Preference<P> {
+    History(Box<CachedHistory<P>>),
     Latest(Box<VersionMetadata>),
 }
 
 /// How one known preference answers a ranged request.
-enum Selection {
-    Ready(Box<Selected>),
+enum Selection<P> {
+    Ready(Box<Selected<P>>),
     CompleteHistory,
     History,
 }
 
-struct Selected {
-    metadata: PackageMetadata,
+struct Selected<P> {
+    metadata: ResolutionMetadata<P>,
     versions_complete: bool,
     platform_metadata_complete: bool,
 }
 
-impl Selected {
-    fn with_timings(self, timings: PackageMetadataFetchTimings) -> TimedPreferredMetadata {
-        TimedPreferredMetadata {
-            fetched: TimedPackageMetadata {
-                metadata: self.metadata,
-                timings,
-            },
+impl<P> Selected<P> {
+    fn with_timings(self, timings: PackageMetadataFetchTimings) -> TimedPreferredResolution<P> {
+        TimedPreferredResolution {
+            metadata: self.metadata,
+            timings,
             versions_complete: self.versions_complete,
             platform_metadata_complete: self.platform_metadata_complete,
         }
     }
 }
 
-fn select_preference(
+fn select_preference<P: MetadataProjection>(
     name: &str,
-    preference: Preference,
+    preference: Preference<P>,
     accepts: &impl Fn(&str) -> bool,
-) -> Selection {
+) -> Selection<P> {
     match preference {
         Preference::History(selected) if selected.covers(accepts) => {
             Selection::Ready(Box::new(Selected {
+                versions_complete: selected.versions_complete(),
                 metadata: selected.metadata,
-                versions_complete: selected.versions_complete,
                 platform_metadata_complete: false,
             }))
         }
@@ -52,7 +50,10 @@ fn select_preference(
                 Ok(mut metadata) => {
                     metadata.dist_tags.insert("latest".to_owned(), version);
                     Selection::Ready(Box::new(Selected {
-                        metadata,
+                        metadata: ResolutionMetadata::Document {
+                            metadata: Box::new(metadata),
+                            projection: None,
+                        },
                         versions_complete: false,
                         platform_metadata_complete: true,
                     }))
@@ -61,16 +62,6 @@ fn select_preference(
             }
         }
         Preference::Latest(_) => Selection::History,
-    }
-}
-
-fn history_result(
-    (fetched, versions_complete): (TimedPackageMetadata, bool),
-) -> TimedPreferredMetadata {
-    TimedPreferredMetadata {
-        fetched,
-        versions_complete,
-        platform_metadata_complete: false,
     }
 }
 
@@ -112,12 +103,6 @@ impl RegistryClient {
     /// already in flight, so a miss never adds a sequential round trip. Partial
     /// documents never populate complete-history caches or provide
     /// publication-time authority.
-    #[tracing::instrument(
-        target = "lpm_install_timeline",
-        level = "trace",
-        name = "preferred_metadata",
-        skip_all
-    )]
     pub async fn get_npm_preferred_resolution_metadata_with_timings<F>(
         &self,
         name: &str,
@@ -125,6 +110,30 @@ impl RegistryClient {
         accepts: F,
     ) -> Result<TimedPreferredMetadata, LpmError>
     where
+        F: Fn(&str) -> bool + Send + Sync + 'static,
+    {
+        self.get_npm_preferred_resolution_with_timings::<NoProjection, _>(name, access, accepts)
+            .await
+            .map(TimedPreferredMetadata::from)
+    }
+
+    /// Like [`Self::get_npm_preferred_resolution_metadata_with_timings`], but a
+    /// cached history answers with its stored projection `P` when one is bound,
+    /// and a document that has none carries the slot for storing it.
+    #[tracing::instrument(
+        target = "lpm_install_timeline",
+        level = "trace",
+        name = "preferred_metadata",
+        skip_all
+    )]
+    pub async fn get_npm_preferred_resolution_with_timings<P, F>(
+        &self,
+        name: &str,
+        access: PublicNpmAccess<'_>,
+        accepts: F,
+    ) -> Result<TimedPreferredResolution<P>, LpmError>
+    where
+        P: MetadataProjection,
         F: Fn(&str) -> bool + Send + Sync + 'static,
     {
         crate::timing::record_metadata_request(name);
@@ -147,13 +156,20 @@ impl RegistryClient {
                     &self.npm_preferred_metadata_cache_key(name, access),
                 );
                 fetched.timings.add_attempt(&timings);
-                Ok(history_result((fetched, true)))
+                Ok(TimedPreferredResolution {
+                    metadata: ResolutionMetadata::Document {
+                        metadata: Box::new(fetched.metadata),
+                        projection: None,
+                    },
+                    timings: fetched.timings,
+                    versions_complete: true,
+                    platform_metadata_complete: false,
+                })
             }
             Some(Selection::History) => {
                 crate::timing::record_metadata_cache_miss();
-                self.fetch_npm_preferred_history::<_, true>(name, access, accepts, timings)
+                self.fetch_npm_preferred_history::<_, true, P>(name, access, accepts, timings)
                     .await
-                    .map(history_result)
             }
             None => {
                 crate::timing::record_metadata_cache_miss();
@@ -163,20 +179,21 @@ impl RegistryClient {
         }
     }
 
-    async fn race_latest_and_history<F>(
+    async fn race_latest_and_history<P, F>(
         &self,
         name: &str,
         access: PublicNpmAccess<'_>,
         latest_key: &str,
         accepts: F,
         timings: PackageMetadataFetchTimings,
-    ) -> Result<TimedPreferredMetadata, LpmError>
+    ) -> Result<TimedPreferredResolution<P>, LpmError>
     where
+        P: MetadataProjection,
         F: Fn(&str) -> bool + Send + Sync + 'static,
     {
         let accepts = Arc::new(accepts);
         let history_accepts = Arc::clone(&accepts);
-        let history = self.fetch_npm_preferred_history::<_, true>(
+        let history = self.fetch_npm_preferred_history::<_, true, P>(
             name,
             access,
             move |version: &str| history_accepts(version),
@@ -192,9 +209,9 @@ impl RegistryClient {
             latest_outcome = &mut latest => latest_outcome,
             history_outcome = &mut history => {
                 let history_error = match history_outcome {
-                    Ok((mut fetched, versions_complete)) => {
+                    Ok(mut fetched) => {
                         fetched.timings.add_attempt(&timings);
-                        return Ok(history_result((fetched, versions_complete)));
+                        return Ok(fetched);
                     }
                     Err(error) => error,
                 };
@@ -215,32 +232,31 @@ impl RegistryClient {
             answer.add_attempt(&timings);
             return Ok(selected.with_timings(answer));
         }
-        let (mut fetched, versions_complete) = history.await?;
+        let mut fetched = history.await?;
         fetched.timings.add_concurrent_attempt(&latest_timings);
         fetched.timings.add_attempt(&timings);
-        Ok(history_result((fetched, versions_complete)))
+        Ok(fetched)
     }
 
-    async fn read_preference_cache(
+    async fn read_preference_cache<P: MetadataProjection>(
         &self,
         name: &str,
         access: PublicNpmAccess<'_>,
         latest_key: &str,
-    ) -> Option<Preference> {
+    ) -> Option<Preference<P>> {
         let key = self.npm_preferred_metadata_cache_key(name, access);
-        if let Some(cached) = self.read_preferred_cache_for_use::<true>(&key).await
-            && cached.value.is_valid(name)
+        if let Some(cached) = self
+            .read_preferred_cache_for_use::<true, P>(name, &key)
+            .await
         {
-            return Some(Preference::History(Box::new(cached.value)));
+            return Some(Preference::History(Box::new(cached)));
         }
         let key = self.npm_direct_metadata_cache_key(name, access);
-        if let Some((metadata, _)) = self.read_complete_cache_for_use::<true>(&key).await
-            && batch_metadata_entry_matches_name(name, &metadata)
+        if let Some(cached) = self
+            .read_complete_cache_for_use::<true, P>(name, &key)
+            .await
         {
-            return Some(Preference::History(Box::new(PreferredMetadata {
-                metadata,
-                versions_complete: true,
-            })));
+            return Some(Preference::History(Box::new(cached)));
         }
         if let Some(cached) = self.history_cache.lookup(latest_key).1 {
             let body = Arc::clone(&cached.body);
@@ -271,12 +287,12 @@ impl RegistryClient {
 
     /// Fetch the latest document after the caller found no usable cache. The flight
     /// re-checks every preference cache so concurrent requests share one response.
-    async fn fetch_latest_leg(
+    async fn fetch_latest_leg<P: MetadataProjection>(
         &self,
         name: &str,
         access: PublicNpmAccess<'_>,
         key: &str,
-    ) -> (Result<Preference, LpmError>, PackageMetadataFetchTimings) {
+    ) -> (Result<Preference<P>, LpmError>, PackageMetadataFetchTimings) {
         let mut timings = PackageMetadataFetchTimings::default();
         let _flight = self.history_cache.flight(key).await;
         let (generation, _) = self.history_cache.lookup(key);

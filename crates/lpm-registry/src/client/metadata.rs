@@ -964,6 +964,90 @@ impl RegistryClient {
         })
     }
 
+    /// Revalidate a cached document, or the stored projection bound to it,
+    /// after a 304. A projection answers only when the entry can be refreshed
+    /// in place; rewriting the entry needs the document.
+    pub(super) async fn cached_resolution_after_304<T, P>(
+        &self,
+        cache_key: &str,
+        response: &reqwest::Response,
+        validator: Option<&CacheValidator>,
+        document_is_valid: impl FnOnce(&T) -> bool,
+        projection_is_valid: impl FnOnce(&ProjectionFacts) -> bool,
+    ) -> Option<MetadataCacheEntry<CachedResolution<T, P>>>
+    where
+        T: serde::de::DeserializeOwned + serde::Serialize + Send + 'static,
+        P: MetadataProjection,
+    {
+        let validator_etag = validator?.etag.as_deref()?;
+        let stale = self
+            .read_stale_metadata_cache_resolution_async::<T, P>(cache_key)
+            .await?;
+        let cached_etag = stale.header.etag;
+        let cached_fresh_for = stale.header.fresh_for;
+        if cached_etag.as_deref() != Some(validator_etag) {
+            return None;
+        }
+        let valid = match &stale.value {
+            CachedResolution::Document { value, .. } => document_is_valid(value),
+            CachedResolution::Projected { facts, .. } => projection_is_valid(facts),
+        };
+        if !valid {
+            self.invalidate_metadata_cache_key(cache_key);
+            return None;
+        }
+        let directive = match Self::metadata_cache_directive(response.headers()) {
+            MetadataCacheDirective::Unspecified => MetadataCacheDirective::Store {
+                fresh_for: cached_fresh_for,
+            },
+            directive => directive,
+        };
+        let response_etag = Self::response_etag(response);
+        let effective_etag = response_etag.as_deref().or(cached_etag.as_deref());
+        let can_refresh_in_place = matches!(
+            directive,
+            MetadataCacheDirective::Store { fresh_for }
+                if fresh_for == cached_fresh_for
+                    && effective_etag == cached_etag.as_deref()
+        );
+        if can_refresh_in_place {
+            let remaining_freshness = self
+                .refresh_metadata_cache_freshness(cache_key, cached_fresh_for)
+                .unwrap_or_default();
+            return Some(MetadataCacheEntry {
+                value: stale.value,
+                etag: response_etag.or(cached_etag),
+                remaining_freshness,
+            });
+        }
+        let document = match stale.value {
+            CachedResolution::Document { value, .. } => value,
+            CachedResolution::Projected { .. } => {
+                let path = self.cache_path(cache_key)?;
+                let (value, etag, _) = tokio::task::spawn_blocking(move || {
+                    Self::read_stale_metadata_cache_path_as::<T>(&path)
+                })
+                .await
+                .ok()
+                .flatten()?;
+                if etag != cached_etag {
+                    return None;
+                }
+                value
+            }
+        };
+        let written =
+            self.write_metadata_cache_entry(cache_key, &document, effective_etag, directive);
+        Some(MetadataCacheEntry {
+            value: CachedResolution::Document {
+                value: document,
+                source: written.as_ref().and_then(|write| write.source.clone()),
+            },
+            etag: response_etag.or(cached_etag),
+            remaining_freshness: written.map(|write| write.fresh_for).unwrap_or_default(),
+        })
+    }
+
     async fn cached_metadata_after_304<F>(
         &self,
         cache_key: &str,

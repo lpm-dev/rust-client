@@ -9,6 +9,10 @@ use crate::package::CanonicalKey;
 use crate::policy::{ResolverPolicy, TrustEvidence, parse_npm_time_unix};
 use crate::ranges::NpmRange;
 
+mod codec;
+
+pub(crate) use codec::ManifestProjection;
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct CachedDistInfo {
     pub tarball_url: Option<String>,
