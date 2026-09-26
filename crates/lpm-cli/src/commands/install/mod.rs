@@ -1453,6 +1453,7 @@ async fn run_with_options_under_store_lock(
             install_accounting,
             streaming_fetch,
             ArtifactSelection::from_used_lockfile(used_lockfile),
+            streaming_fetch.then(|| v2_streaming_lane.clone()),
         ));
     }
 

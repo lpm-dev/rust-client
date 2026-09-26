@@ -168,6 +168,7 @@ async fn run_workspace_fetch_overlap_hub(
                         let identity_for_task = identity.clone();
                         let abort_handle = tasks.spawn(fetch_selected_package(
                             package,
+                            None,
                             context.client.clone(),
                             context.route_table.clone(),
                             shared_pool.store.clone(),
@@ -327,6 +328,15 @@ fn fetch_overlap_enabled_from_value(
         && !force
         && !omit_dev
         && raw.is_none_or(|value| parse_bool_env_value(value, true))
+}
+
+/// Whether a lockfile install may download packages before its fetch phase.
+pub(super) fn lockfile_fetch_overlap_enabled(force: bool) -> bool {
+    !force
+        && std::env::var(ENV_FETCH_OVERLAP)
+            .ok()
+            .as_deref()
+            .is_none_or(|value| parse_bool_env_value(value, true))
 }
 
 pub(super) fn fetch_overlap_min_selected() -> usize {
@@ -583,6 +593,33 @@ fn record_workspace_fetch_completion(
     }
 }
 
+/// Whether the virtual store holds `package`'s object. The fetch phase
+/// validates stored objects before reuse, so the overlap leaves them to it.
+fn object_already_stored(
+    package: &InstallPackage,
+    store_v2: Option<&lpm_store::v2::Store>,
+) -> bool {
+    let (Some(store_v2), Some(integrity)) = (store_v2, package.integrity.as_deref()) else {
+        return false;
+    };
+    store_v2
+        .paths()
+        .object_dir(integrity)
+        .is_ok_and(|object_dir| object_dir.exists())
+}
+
+/// Whether the install's streamed package, its largest download, has no
+/// engine requirement, so an overlap of such packages downloads it; otherwise
+/// the fetch phase keeps the streaming lane for it.
+pub(super) fn streaming_candidate_is_unconstrained(packages: &[InstallPackage]) -> bool {
+    super::resolve::streaming_candidate(
+        packages
+            .iter()
+            .filter(|package| package_platform_compatible(package)),
+    )
+    .is_some_and(|package| package.node_engine.is_none())
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(super) fn spawn_fetch_overlap_for_packages(
     packages: Vec<InstallPackage>,
@@ -598,7 +635,22 @@ pub(super) fn spawn_fetch_overlap_for_packages(
     install_accounting: ManagedInstallAccounting,
     streaming_fetch: bool,
     artifact_selection: ArtifactSelection,
+    streaming_lane: Option<Arc<super::fetch::V2StreamingLane>>,
 ) -> FetchOverlapJoin {
+    let mut packages = packages;
+    // The package the fetch phase would stream starts first, and streams.
+    let streamed_key = streaming_lane.as_ref().and_then(|_| {
+        super::resolve::streaming_candidate(
+            packages
+                .iter()
+                .filter(|package| package_platform_compatible(package)),
+        )
+        .map(install_pkg_key)
+    });
+    let mut streaming_lane = streamed_key.as_ref().and(streaming_lane);
+    if let Some(key) = &streamed_key {
+        super::resolve::promote_fetch_candidate(&mut packages, key);
+    }
     let task = async move {
         let mut seen = HashSet::with_capacity(packages.len());
         let mut tasks = tokio::task::JoinSet::new();
@@ -607,13 +659,23 @@ pub(super) fn spawn_fetch_overlap_for_packages(
         let task_limit = fetch_overlap_queue_capacity(fetch_semaphore.available_permits());
 
         for package in packages {
+            let package_lane = streaming_lane.take();
+            stats.selected_count = stats.selected_count.saturating_add(1);
+            if !package_platform_compatible(&package) {
+                stats.skipped_platform_count = stats.skipped_platform_count.saturating_add(1);
+                continue;
+            }
+            if object_already_stored(&package, store_v2_handle.as_deref()) {
+                stats.cache_hit_count = stats.cache_hit_count.saturating_add(1);
+                continue;
+            }
             if tasks.len() >= task_limit {
                 let joined = tasks.join_next().await;
                 record_overlap_task(joined, &mut stats, &mut outcomes);
             }
-            stats.selected_count = stats.selected_count.saturating_add(1);
             dispatch_install_package(
                 package,
+                package_lane,
                 &route_table,
                 &client,
                 &store,
@@ -680,6 +742,7 @@ fn dispatch_selected_event(
     }
     dispatch_install_package(
         package,
+        None,
         route_table,
         client,
         store,
@@ -701,6 +764,7 @@ fn dispatch_selected_event(
 #[allow(clippy::too_many_arguments)]
 fn dispatch_install_package(
     package: InstallPackage,
+    streaming_lane: Option<Arc<super::fetch::V2StreamingLane>>,
     route_table: &RouteTable,
     client: &Arc<RegistryClient>,
     store: &PackageStore,
@@ -732,6 +796,7 @@ fn dispatch_install_package(
     tasks.spawn(
         fetch_selected_package(
             package,
+            streaming_lane,
             client.clone(),
             route_table.clone(),
             store.clone(),
@@ -810,6 +875,7 @@ fn install_package_from_selected_event(
 #[allow(clippy::too_many_arguments)]
 async fn fetch_selected_package(
     package: InstallPackage,
+    streaming_lane: Option<Arc<super::fetch::V2StreamingLane>>,
     client: Arc<RegistryClient>,
     route_table: RouteTable,
     store: PackageStore,
@@ -857,7 +923,10 @@ async fn fetch_selected_package(
                 permit,
                 &fetch_extract_limiter,
                 install_accounting,
-                V2StreamingEligibility::Disabled,
+                streaming_lane.as_deref().map_or(
+                    V2StreamingEligibility::Disabled,
+                    V2StreamingEligibility::CriticalCandidate,
+                ),
                 None,
             )
             .await?
@@ -1051,6 +1120,7 @@ mod tests {
                         ManagedInstallAccounting,
                         true,
                         ArtifactSelection::FreshResolution,
+                        None,
                     )
                     .drain()
                     .await
@@ -1076,6 +1146,165 @@ mod tests {
                 "tarball_fetch"
             ]]
         );
+    }
+
+    #[tokio::test]
+    async fn fetch_overlap_streams_its_largest_package() {
+        use lpm_common::integrity::{HashAlgorithm, Integrity};
+        use wiremock::{
+            Mock, MockServer, ResponseTemplate,
+            matchers::{method, path},
+        };
+
+        let server = MockServer::start().await;
+        let mut packages = Vec::new();
+        for (name, unpacked_size) in [("small-package", 16), ("large-package", 1 << 20)] {
+            let manifest = format!(r#"{{"name":"{name}","version":"1.0.0"}}"#);
+            let encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+            let mut archive = tar::Builder::new(encoder);
+            let mut header = tar::Header::new_gnu();
+            header.set_size(manifest.len() as u64);
+            header.set_mode(0o644);
+            header.set_cksum();
+            archive
+                .append_data(&mut header, "package/package.json", manifest.as_bytes())
+                .unwrap();
+            let body = archive.into_inner().unwrap().finish().unwrap();
+            let integrity = Integrity::from_bytes(HashAlgorithm::Sha512, &body).to_string();
+            Mock::given(method("GET"))
+                .and(path(format!("/{name}.tgz")))
+                .respond_with(ResponseTemplate::new(200).set_body_bytes(body))
+                .expect(1)
+                .mount(&server)
+                .await;
+            let mut package =
+                workspace_fetch_package(&integrity, &format!("{}/{name}.tgz", server.uri()));
+            package.name = name.to_string();
+            package.unpacked_size = std::num::NonZeroU64::new(unpacked_size);
+            packages.push(package);
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let client = Arc::new(
+            RegistryClient::new()
+                .with_npm_registry_url(server.uri())
+                .with_cache_dir(None),
+        );
+        let lane = Arc::new(super::super::fetch::V2StreamingLane::default());
+
+        let result = spawn_fetch_overlap_for_packages(
+            packages,
+            client,
+            RouteTable::from_mode_only(lpm_registry::RouteMode::Direct),
+            PackageStore::at(directory.path().join("store")),
+            Some(Arc::new(lpm_store::v2::Store::at(
+                directory.path().join("store-v2"),
+            ))),
+            Arc::new(Semaphore::new(4)),
+            Arc::new(FetchCoordinator::default()),
+            directory.path().to_path_buf(),
+            Arc::new(GateStats::default()),
+            None,
+            ManagedInstallAccounting,
+            true,
+            ArtifactSelection::FreshResolution,
+            Some(Arc::clone(&lane)),
+        )
+        .drain()
+        .await
+        .unwrap();
+
+        assert_eq!(result.stats.completed_count, 2);
+        assert_eq!(result.stats.failed_count, 0);
+        assert!(!lane.try_claim(), "the overlap streams a package");
+    }
+
+    #[tokio::test]
+    async fn fetch_overlap_leaves_stored_and_foreign_packages_alone() {
+        use wiremock::{Mock, MockServer, ResponseTemplate, matchers::method};
+
+        let manifest = br#"{"name":"stored-package","version":"1.0.0"}"#;
+        let encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        let mut archive = tar::Builder::new(encoder);
+        let mut header = tar::Header::new_gnu();
+        header.set_size(manifest.len() as u64);
+        header.set_mode(0o644);
+        header.set_cksum();
+        archive
+            .append_data(&mut header, "package/package.json", &manifest[..])
+            .unwrap();
+        let body = archive.into_inner().unwrap().finish().unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let store_v2 = Arc::new(lpm_store::v2::Store::at(directory.path().join("store-v2")));
+        let (_, integrity, _) = store_v2.extract_object_from_bytes(&body, None).unwrap();
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&server)
+            .await;
+        let stored = workspace_fetch_package(&integrity, &format!("{}/stored.tgz", server.uri()));
+        let mut foreign =
+            workspace_fetch_package("sha512-foreign", &format!("{}/foreign.tgz", server.uri()));
+        foreign.name = "foreign-package".to_string();
+        foreign.platform = Some(lpm_resolver::PlatformMeta {
+            os: vec!["aix".to_string()],
+            ..Default::default()
+        });
+
+        let result = spawn_fetch_overlap_for_packages(
+            vec![stored, foreign],
+            Arc::new(
+                RegistryClient::new()
+                    .with_npm_registry_url(server.uri())
+                    .with_cache_dir(None),
+            ),
+            RouteTable::from_mode_only(lpm_registry::RouteMode::Direct),
+            PackageStore::at(directory.path().join("store")),
+            Some(store_v2),
+            Arc::new(Semaphore::new(4)),
+            Arc::new(FetchCoordinator::default()),
+            directory.path().to_path_buf(),
+            Arc::new(GateStats::default()),
+            None,
+            ManagedInstallAccounting,
+            true,
+            ArtifactSelection::FreshResolution,
+            None,
+        )
+        .drain()
+        .await
+        .unwrap();
+
+        assert_eq!(result.stats.cache_hit_count, 1);
+        assert_eq!(result.stats.skipped_platform_count, 1);
+        assert_eq!(result.stats.dispatched_count, 0);
+    }
+
+    #[test]
+    fn the_streamed_package_decides_whether_an_unconstrained_overlap_streams() {
+        let sized = |name: &str, size: u64, engine: Option<&str>| {
+            let mut package = workspace_fetch_package("sha512-test", "https://example.invalid");
+            package.name = name.to_string();
+            package.unpacked_size = std::num::NonZeroU64::new(size);
+            package.node_engine = engine.map(str::to_string);
+            package
+        };
+        let mut foreign = sized("foreign-binary", 1 << 30, None);
+        foreign.platform = Some(lpm_resolver::PlatformMeta {
+            os: vec!["aix".to_string()],
+            ..Default::default()
+        });
+
+        assert!(streaming_candidate_is_unconstrained(&[
+            sized("library", 1 << 20, None),
+            sized("small-engine", 16, Some(">=18")),
+            foreign.clone(),
+        ]));
+        assert!(!streaming_candidate_is_unconstrained(&[
+            sized("library", 1 << 20, None),
+            sized("engine-binary", 1 << 24, Some(">=18")),
+            foreign,
+        ]));
     }
 
     #[test]

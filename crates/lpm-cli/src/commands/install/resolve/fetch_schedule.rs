@@ -43,6 +43,26 @@ fn streaming_candidate_order(a: &InstallPackage, b: &InstallPackage) -> std::cmp
         .then_with(|| a.source.cmp(&b.source))
 }
 
+fn is_streaming_candidate(package: &InstallPackage) -> bool {
+    package.unpacked_size.is_some()
+        && package.integrity.is_some()
+        && matches!(
+            package.source_kind(),
+            Ok(lpm_lockfile::Source::Registry { .. })
+        )
+}
+
+/// The package a fetch streams into the virtual store: its largest registry
+/// tarball with a known size and integrity.
+pub(in crate::commands::install) fn streaming_candidate<'a>(
+    packages: impl IntoIterator<Item = &'a InstallPackage>,
+) -> Option<&'a InstallPackage> {
+    packages
+        .into_iter()
+        .filter(|package| is_streaming_candidate(package))
+        .min_by(|a, b| streaming_candidate_order(a, b))
+}
+
 pub(in crate::commands::install) async fn reserve_v2_streaming_candidate(
     packages: &[InstallPackage],
     coordinator: &FetchCoordinator,
@@ -50,12 +70,7 @@ pub(in crate::commands::install) async fn reserve_v2_streaming_candidate(
     let mut locks = coordinator.locks.lock().await;
     let mut selected: Option<(&InstallPackage, String, tokio::sync::OwnedMutexGuard<()>)> = None;
     for package in packages {
-        if package.unpacked_size.is_none()
-            || package.integrity.is_none()
-            || !matches!(
-                package.source_kind(),
-                Ok(lpm_lockfile::Source::Registry { .. })
-            )
+        if !is_streaming_candidate(package)
             || selected
                 .as_ref()
                 .is_some_and(|(current, _, _)| !streaming_candidate_order(package, current).is_lt())
@@ -430,6 +445,34 @@ mod tests {
             )
             .await
             .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn streaming_candidate_selection_matches_the_reserved_candidate() {
+        let unknown = package("unknown", None);
+        let mut unverified = package("unverified", Some(1 << 30));
+        unverified.integrity = None;
+        let mut tarball = package("tarball", Some(1 << 30));
+        tarball.source = "tarball+https://example.invalid/tarball.tgz".to_string();
+        let large = package("large", Some(7_319_407));
+        let packages = [
+            unknown,
+            unverified,
+            tarball,
+            package("small", Some(611)),
+            large.clone(),
+        ];
+
+        let (reserved, _guard) =
+            reserve_v2_streaming_candidate(&packages, &FetchCoordinator::default())
+                .await
+                .unwrap();
+
+        assert_eq!(reserved, install_pkg_key(&large));
+        assert_eq!(
+            streaming_candidate(&packages).map(install_pkg_key),
+            Some(reserved)
         );
     }
 

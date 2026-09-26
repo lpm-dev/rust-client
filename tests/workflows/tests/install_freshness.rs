@@ -1140,6 +1140,84 @@ async fn lockfile_install_downloads_while_node_is_probed() {
 }
 
 #[tokio::test]
+async fn lockfile_install_with_optional_engines_downloads_while_node_is_probed() {
+    let mock = MockRegistry::start().await;
+    let plain = serde_json::json!({"name": "plain-dep", "version": "1.0.0"});
+    let optional_lib = serde_json::json!({"name": "optional-lib", "version": "1.0.0"});
+    mock.with_manifest_package(plain.clone(), &[]).await;
+    mock.with_manifest_package(optional_lib.clone(), &[]).await;
+    mock.with_manifest_package(
+        serde_json::json!({
+            "name": "optional-engine", "version": "1.0.0", "engines": {"node": ">=20 <21"}
+        }),
+        &[],
+    )
+    .await;
+    let arrivals = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    for (name, manifest) in [("plain-dep", plain), ("optional-lib", optional_lib)] {
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(MockRegistry::tarball_path(
+                name, "1.0.0",
+            )))
+            .respond_with(ArrivalRecorder {
+                body: make_tarball_from_pkg_json(manifest, &[]),
+                arrivals: std::sync::Arc::clone(&arrivals),
+                delay: std::time::Duration::ZERO,
+            })
+            .with_priority(1)
+            .mount(mock.server())
+            .await;
+    }
+    let project = TempProject::empty(
+        r#"{"name":"consumer","dependencies":{"plain-dep":"1.0.0"},"optionalDependencies":{"optional-engine":"1.0.0","optional-lib":"1.0.0"}}"#,
+    );
+    write_node_shim(&project);
+    install(&project, &mock.url()).assert().success();
+
+    let probe_finished = project.path().join("probe-finished");
+    std::fs::write(
+        project.home().join("node-shim-bin/node"),
+        format!(
+            "#!/bin/sh\nsleep 1\n: > '{}'\n/bin/cat '{}'\n",
+            probe_finished.display(),
+            project.path().join("node-version").display(),
+        ),
+    )
+    .unwrap();
+    for state in [
+        project.path().join("node_modules"),
+        project.path().join(".lpm"),
+        project.store_dir(),
+        project.cache_dir(),
+    ] {
+        let _ = std::fs::remove_dir_all(state);
+    }
+    arrivals.lock().unwrap().clear();
+
+    install(&project, &mock.url()).assert().success();
+
+    assert!(
+        project
+            .path()
+            .join("node_modules/optional-engine/package.json")
+            .exists(),
+        "Node 20 satisfies the optional dependency's engines"
+    );
+    let finished = std::fs::metadata(&probe_finished)
+        .expect("the reinstall probes Node")
+        .modified()
+        .unwrap();
+    let arrivals = arrivals.lock().unwrap().clone();
+    assert_eq!(arrivals.len(), 2, "the reinstall downloads both tarballs");
+    let last = *arrivals.iter().max().unwrap();
+    assert!(
+        last < finished,
+        "a tarball download waited {:?} for the Node probe",
+        last.duration_since(finished).unwrap_or_default()
+    );
+}
+
+#[tokio::test]
 async fn strict_engine_mismatch_fails_without_waiting_for_downloads() {
     let mock = MockRegistry::start().await;
     let manifest = serde_json::json!({
