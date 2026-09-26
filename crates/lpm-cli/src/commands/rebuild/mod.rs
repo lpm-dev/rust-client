@@ -49,10 +49,7 @@ use self::build_cache::{
 };
 #[cfg(test)]
 pub(crate) use self::hints::scriptable_package_rows;
-pub use self::hints::{
-    all_scripted_packages_trusted, all_scripted_packages_trusted_in_context,
-    show_install_build_hint,
-};
+pub use self::hints::{all_scripted_packages_trusted_in_context, show_install_build_hint};
 use self::package_dir::prepare_live_package_dir;
 #[cfg(test)]
 use self::sandbox_env::build_sanitized_env;

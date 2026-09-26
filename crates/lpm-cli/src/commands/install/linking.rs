@@ -644,6 +644,7 @@ pub(super) async fn run_link_and_finish(
         baseline_index.as_ref(),
     )?;
 
+    let mut baseline_index = baseline_index;
     if !applied_patches.is_empty() && store_version.uses_virtual_store() {
         let store_v2 = lpm_store::v2::Store::from_lpm_root_for_version_with_object_integrity_policy(
             lpm_root,
@@ -659,6 +660,11 @@ pub(super) async fn run_link_and_finish(
             compatibility_bin_names,
             None,
         )?;
+        // Refreshed links can replace the entries the index recorded.
+        baseline_index = Some(lpm_store::V2BaselineIndex::for_project(
+            project_dir,
+            lpm_root,
+        ));
     }
 
     let policy = lpm_security::SecurityPolicy::from_package_json(&project_dir.join("package.json"));
@@ -688,17 +694,20 @@ pub(super) async fn run_link_and_finish(
         crate::capability::CapabilitySet::from_project(&project_dir.join("package.json"))
             .map_err(|e| LpmError::Registry(format!("{e}")))?;
     let offline_user_bound = crate::security_approval::authorized_capability_user_bound();
-    let all_trusted_for_auto_build = crate::commands::rebuild::all_scripted_packages_trusted(
-        lpm_root,
-        &installed_with_integrity,
-        &policy,
-        project_dir,
-        effective_policy,
-        force_security_floor,
-        &offline_requested_capabilities,
-        &offline_user_bound,
-        None,
-    );
+    let all_trusted_for_auto_build =
+        crate::commands::rebuild::all_scripted_packages_trusted_in_context(
+            lpm_root,
+            &installed_with_integrity,
+            &policy,
+            project_dir,
+            project_dir,
+            effective_policy,
+            force_security_floor,
+            &offline_requested_capabilities,
+            &offline_user_bound,
+            None,
+            baseline_index.as_ref(),
+        );
     let auto_build_attempted = should_auto_build(
         auto_build,
         script_policy_cfg.auto_build,

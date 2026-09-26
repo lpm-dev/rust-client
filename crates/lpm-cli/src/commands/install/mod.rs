@@ -1669,6 +1669,7 @@ async fn run_with_options_under_store_lock(
         baseline_index.as_ref(),
     )?;
 
+    let mut baseline_index = baseline_index;
     if !applied_patches.is_empty()
         && let Some(store_v2) = store_v2_handle.as_deref()
     {
@@ -1681,6 +1682,11 @@ async fn run_with_options_under_store_lock(
             compatibility_bin_names,
             v2_plan.as_deref(),
         )?;
+        // Refreshed links can replace the entries the index recorded.
+        baseline_index = Some(lpm_store::V2BaselineIndex::for_project(
+            project_dir,
+            lpm_root,
+        ));
     }
 
     let OnlineLifecyclePrepareResult {

@@ -1,4 +1,5 @@
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use crate::{
     LOCKFILE_NAME, LOCKFILE_VERSION, Lockfile, LockfileError, TOML_LOCKFILE_SIZE_CAP_BYTES,
@@ -154,8 +155,24 @@ impl Lockfile {
         toml::to_string_pretty(self).map_err(|e| LockfileError::Serialize(e.to_string()))
     }
 
-    /// Deserialize from TOML string.
+    /// Deserialize and validate a TOML lockfile.
+    ///
+    /// Text identical to an earlier parse in this process reuses that result.
     pub fn from_toml(input: &str) -> Result<Self, LockfileError> {
+        Self::from_toml_shared(input).map(Arc::unwrap_or_clone)
+    }
+
+    /// Like [`Self::from_toml`], sharing the parsed value instead of cloning it.
+    pub fn from_toml_shared(input: &str) -> Result<Arc<Self>, LockfileError> {
+        crate::parse_cache::parse_shared(input)
+    }
+
+    /// Read and validate the authoritative TOML lockfile, sharing the parsed value.
+    pub fn read_shared(toml_path: &Path) -> Result<Arc<Self>, LockfileError> {
+        Self::from_toml_shared(&read_authoritative_toml(toml_path)?)
+    }
+
+    pub(crate) fn parse_uncached(input: &str) -> Result<Self, LockfileError> {
         let lockfile: Lockfile = toml::from_str(input)
             .map_err(|error| LockfileError::Deserialize(error.message().to_string()))?;
 

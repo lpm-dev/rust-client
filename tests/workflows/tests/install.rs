@@ -3338,6 +3338,60 @@ async fn install_json_timing_env_exposes_waterfall_without_detail() {
 }
 
 #[tokio::test]
+async fn warm_installs_parse_the_lockfile_and_index_the_store_once() {
+    let mock = MockRegistry::start().await;
+    mount_ms_2_1_3(&mock).await;
+    let project = TempProject::empty(
+        r#"{"name":"parse-once-install","version":"1.0.0","dependencies":{"ms":"^2.1.3"}}"#,
+    );
+    let install_detail = || -> serde_json::Value {
+        let output = lpm_with_registry(&project, &mock.url())
+            .env("LPM_TIMING_DETAIL", "1")
+            .args([
+                "install",
+                "--json",
+                "--no-security-summary",
+                "--no-skills",
+                "--no-editor-setup",
+            ])
+            .output()
+            .expect("failed to run lpm install --json");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success(),
+            "install --json failed:\nstdout: {stdout}\nstderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let envelope: serde_json::Value =
+            serde_json::from_str(&stdout).expect("install --json must emit parseable JSON");
+        envelope["timing"]["detail"].clone()
+    };
+    install_detail();
+
+    let up_to_date = install_detail();
+    assert_eq!(
+        up_to_date["lockfile"]["parse_count"], 1,
+        "an up-to-date install parsed lpm.lock more than once: {up_to_date:#}"
+    );
+
+    std::fs::remove_dir_all(project.path().join("node_modules")).unwrap();
+    std::fs::remove_dir_all(project.path().join(".lpm")).unwrap();
+    let warm = install_detail();
+    assert_eq!(
+        warm["lockfile"]["parse_count"], 1,
+        "a warm install parsed lpm.lock more than once: {warm:#}"
+    );
+    assert!(
+        warm["lockfile"]["reuse_count"].as_u64().unwrap_or_default() > 0,
+        "a warm install must read lpm.lock from several phases: {warm:#}"
+    );
+    assert_eq!(
+        warm["tail"]["baseline_index_build_count"], 1,
+        "a warm install indexed the installed tree more than once: {warm:#}"
+    );
+}
+
+#[tokio::test]
 async fn install_json_timing_detail_env_exposes_install_substage_probes() {
     let mock = MockRegistry::start().await;
     mount_ms_2_1_3(&mock).await;
