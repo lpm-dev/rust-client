@@ -1560,6 +1560,7 @@ fn recursive_install_preserves_member_trust_approval_gates() {
 use support::lpm_with_registry;
 use support::mock_registry::{
     MockRegistry, compute_integrity, make_tarball, make_tarball_from_pkg_json,
+    make_tarball_with_files,
 };
 
 async fn mount_registry_packages(mock: &MockRegistry, packages: &[(&str, &str)]) {
@@ -2034,6 +2035,122 @@ async fn recursive_install_writes_one_root_lockfile_with_importer_projections() 
     assert!(
         web_lock.contains("shared-dep") && web_lock.contains("web-only-dep"),
         "web lockfile must record both of its direct dependencies: {web_lock}",
+    );
+}
+
+#[tokio::test]
+async fn recursive_reinstall_from_a_custom_lpm_registry_finishes_with_current_members() {
+    let mock = MockRegistry::start().await;
+    mount_registry_packages(
+        &mock,
+        &[
+            ("@lpm.dev/acme.root-dep", "1.0.0"),
+            ("@lpm.dev/acme.member-dep", "1.0.0"),
+        ],
+    )
+    .await;
+    let project = TempProject::empty(
+        r#"{
+  "name": "custom-registry-reinstall",
+  "version": "1.0.0",
+  "private": true,
+  "workspaces": ["packages/*"],
+  "dependencies": { "@lpm.dev/acme.root-dep": "^1.0.0" }
+}"#,
+    );
+    project.write_file(
+        "packages/core/package.json",
+        r#"{
+  "name": "@fixture/core",
+  "version": "1.0.0",
+  "private": true,
+  "dependencies": { "@lpm.dev/acme.member-dep": "^1.0.0" }
+}"#,
+    );
+    let install = || {
+        lpm_with_registry(&project, &mock.url())
+            .arg("install")
+            .arg("--recursive")
+            .args(INSTALL_FLAGS)
+            .timeout(std::time::Duration::from_secs(60))
+            .output()
+            .expect("run recursive install")
+    };
+    assert_install_succeeded(&install(), "initial recursive install should succeed");
+
+    assert_install_succeeded(
+        &install(),
+        "a recursive reinstall must finish while its members are already current",
+    );
+    assert!(
+        project
+            .path()
+            .join("node_modules/@lpm.dev/acme.root-dep")
+            .exists()
+    );
+}
+
+#[tokio::test]
+async fn recursive_reinstall_of_a_patched_root_finishes_with_current_members() {
+    let mock = MockRegistry::start().await;
+    let root_tarball = make_tarball_with_files(
+        "root-dep",
+        "1.0.0",
+        &[("patched.js", b"module.exports = 'original'\n")],
+    );
+    mock.with_package("root-dep", "1.0.0", &root_tarball).await;
+    mock.with_package("member-dep", "1.0.0", &make_tarball("member-dep", "1.0.0"))
+        .await;
+    let project = TempProject::empty(&format!(
+        r#"{{
+  "name": "patched-root-reinstall",
+  "version": "1.0.0",
+  "private": true,
+  "workspaces": ["packages/*"],
+  "dependencies": {{ "root-dep": "^1.0.0" }},
+  "lpm": {{
+    "patchedDependencies": {{
+      "root-dep@1.0.0": {{
+        "path": "patches/root-dep@1.0.0.patch",
+        "originalIntegrity": "{}"
+      }}
+    }}
+  }}
+}}"#,
+        compute_integrity(&root_tarball),
+    ));
+    project.write_file(
+        "patches/root-dep@1.0.0.patch",
+        "--- a/patched.js\n+++ b/patched.js\n@@ -1 +1 @@\n-module.exports = 'original'\n+module.exports = 'patched'\n",
+    );
+    project.write_file(
+        "packages/core/package.json",
+        r#"{
+  "name": "@fixture/core",
+  "version": "1.0.0",
+  "private": true,
+  "dependencies": { "member-dep": "^1.0.0" }
+}"#,
+    );
+    let install = || {
+        lpm_with_registry(&project, &mock.url())
+            .arg("install")
+            .arg("--recursive")
+            .args(INSTALL_FLAGS)
+            .timeout(std::time::Duration::from_secs(60))
+            .output()
+            .expect("run recursive install")
+    };
+    assert_install_succeeded(&install(), "initial recursive install should succeed");
+
+    assert_install_succeeded(
+        &install(),
+        "a patched workspace must reinstall while its members are already current",
+    );
+    assert_eq!(
+        std::fs::read_to_string(project.path().join("node_modules/root-dep/patched.js"))
+            .expect("read the patched root dependency"),
+        "module.exports = 'patched'\n",
     );
 }
 

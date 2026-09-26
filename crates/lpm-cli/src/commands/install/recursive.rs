@@ -216,6 +216,7 @@ pub(crate) async fn run_recursive_workspace_install(
             .map(Arc::<str>::from);
         let targets_need_materialization = workspace_targets_need_materialization(&targets);
         let lockfile_replay_ready = workspace_targets_are_lockfile_replay_ready(
+            client,
             &workspace,
             &targets,
             &options,
@@ -928,6 +929,7 @@ fn package_has_registry_resolution_roots(
 }
 
 fn workspace_targets_are_lockfile_replay_ready(
+    client: &RegistryClient,
     workspace: &lpm_workspace::Workspace,
     targets: &[WorkspaceInstallTarget],
     options: &RecursiveInstallOptions,
@@ -966,35 +968,46 @@ fn workspace_targets_are_lockfile_replay_ready(
         packages_by_path.insert(member.path.as_path(), &member.package);
     }
 
+    let context = ReplayReadinessContext {
+        client,
+        workspace,
+        global_auto_install_peers,
+        root_provider_fingerprint,
+    };
     targets.iter().all(|target| {
         let Some(package) = packages_by_path.get(target.path.as_path()).copied() else {
             return false;
         };
         lockfile_coordinator
             .with_projection_packages(&target.importer, |lockfile, packages| {
-                target_lockfile_is_replay_ready(
-                    workspace,
-                    &target.path,
-                    package,
-                    &lockfile,
-                    packages,
-                    global_auto_install_peers,
-                    root_provider_fingerprint,
-                )
+                target_lockfile_is_replay_ready(context, &target.path, package, &lockfile, packages)
             })
             .unwrap_or(false)
     })
 }
 
+/// Replay-readiness inputs shared by every target of one recursive install.
+#[derive(Clone, Copy)]
+struct ReplayReadinessContext<'a> {
+    client: &'a RegistryClient,
+    workspace: &'a lpm_workspace::Workspace,
+    global_auto_install_peers: Option<bool>,
+    root_provider_fingerprint: Option<&'a str>,
+}
+
 fn target_lockfile_is_replay_ready(
-    workspace: &lpm_workspace::Workspace,
+    context: ReplayReadinessContext<'_>,
     project_dir: &Path,
     package: &lpm_workspace::PackageJson,
     lockfile: &lpm_lockfile::Lockfile,
     packages: &[&lpm_lockfile::LockedPackage],
-    global_auto_install_peers: Option<bool>,
-    root_provider_fingerprint: Option<&str>,
 ) -> bool {
+    let ReplayReadinessContext {
+        client,
+        workspace,
+        global_auto_install_peers,
+        root_provider_fingerprint,
+    } = context;
     if package
         .lpm
         .as_ref()
@@ -1065,7 +1078,6 @@ fn target_lockfile_is_replay_ready(
     let Ok(route_table) = RouteTable::from_env_and_filesystem(project_dir) else {
         return false;
     };
-    let client = RegistryClient::new();
     super::lockfile::lockfile_satisfies_fast_path_with_packages(
         lockfile,
         packages,
@@ -1074,7 +1086,7 @@ fn target_lockfile_is_replay_ready(
             deps: &deps,
             catalog_resolutions: &catalog_resolutions,
             workspace: Some(workspace),
-            registry_source: RegistrySourceContext::new(&route_table, &client),
+            registry_source: RegistrySourceContext::new(&route_table, client),
             policy: super::lockfile::LockfileReplayPolicy {
                 accept_unsafe_sources: false,
                 emit_warnings: false,
@@ -2026,18 +2038,26 @@ mod tests {
         let directory = tempfile::tempdir().expect("create workspace temp directory");
         let package = replay_ready_package();
         let workspace = replay_ready_workspace(directory.path(), package.clone());
-        write_replay_ready_lockfile(directory.path(), &package, "^4.16.0");
+        write_replay_ready_lockfile(
+            directory.path(),
+            &package,
+            "^4.16.0",
+            lpm_common::NPM_REGISTRY_URL,
+        );
         let lockfile = read_replay_ready_lockfile(directory.path());
         let packages = lockfile.packages.iter().collect::<Vec<_>>();
 
         assert!(!target_lockfile_is_replay_ready(
-            &workspace,
+            ReplayReadinessContext {
+                client: &RegistryClient::new(),
+                workspace: &workspace,
+                global_auto_install_peers: None,
+                root_provider_fingerprint: None,
+            },
             directory.path(),
             &package,
             &lockfile,
             &packages,
-            None,
-            None,
         ));
     }
 
@@ -2046,19 +2066,70 @@ mod tests {
         let directory = tempfile::tempdir().expect("create workspace temp directory");
         let package = replay_ready_package();
         let workspace = replay_ready_workspace(directory.path(), package.clone());
-        write_replay_ready_lockfile(directory.path(), &package, "^4.17.0");
+        write_replay_ready_lockfile(
+            directory.path(),
+            &package,
+            "^4.17.0",
+            lpm_common::NPM_REGISTRY_URL,
+        );
         let lockfile = read_replay_ready_lockfile(directory.path());
         let packages = lockfile.packages.iter().collect::<Vec<_>>();
 
         assert!(target_lockfile_is_replay_ready(
-            &workspace,
+            ReplayReadinessContext {
+                client: &RegistryClient::new(),
+                workspace: &workspace,
+                global_auto_install_peers: None,
+                root_provider_fingerprint: None,
+            },
             directory.path(),
             &package,
             &lockfile,
             &packages,
-            None,
-            None,
         ));
+    }
+
+    #[test]
+    fn recursive_workspace_replay_readiness_matches_sources_against_the_command_registry() {
+        let directory = tempfile::tempdir().expect("create workspace temp directory");
+        let empty_npmrc = directory.path().join("empty.npmrc");
+        std::fs::write(&empty_npmrc, "").expect("write empty npmrc");
+        let _env = crate::test_env::ScopedEnv::update([
+            (
+                "NPM_CONFIG_USERCONFIG",
+                Some(empty_npmrc.clone().into_os_string()),
+            ),
+            (
+                "NPM_CONFIG_GLOBALCONFIG",
+                Some(empty_npmrc.into_os_string()),
+            ),
+            ("LPM_NPM_ROUTE", None),
+        ]);
+        let package = replay_ready_package();
+        let workspace = replay_ready_workspace(directory.path(), package.clone());
+        let mirror = "https://npm-mirror.example";
+        write_replay_ready_lockfile(directory.path(), &package, "^4.17.0", mirror);
+        let lockfile = read_replay_ready_lockfile(directory.path());
+        let packages = lockfile.packages.iter().collect::<Vec<_>>();
+        let replay_ready = |client: &RegistryClient| {
+            target_lockfile_is_replay_ready(
+                ReplayReadinessContext {
+                    client,
+                    workspace: &workspace,
+                    global_auto_install_peers: None,
+                    root_provider_fingerprint: None,
+                },
+                directory.path(),
+                &package,
+                &lockfile,
+                &packages,
+            )
+        };
+
+        assert!(replay_ready(
+            &RegistryClient::new().with_npm_registry_url(mirror.to_string())
+        ));
+        assert!(!replay_ready(&RegistryClient::new()));
     }
 
     #[test]
@@ -2066,7 +2137,12 @@ mod tests {
         let directory = tempfile::tempdir().expect("create workspace temp directory");
         let package = replay_ready_package();
         let workspace = replay_ready_workspace(directory.path(), package.clone());
-        write_replay_ready_lockfile(directory.path(), &package, "^4.17.0");
+        write_replay_ready_lockfile(
+            directory.path(),
+            &package,
+            "^4.17.0",
+            lpm_common::NPM_REGISTRY_URL,
+        );
         let coordinator =
             workspace_lockfile::WorkspaceLockfileCoordinator::new(directory.path(), &[])
                 .expect("preload workspace lockfile");
@@ -2078,13 +2154,16 @@ mod tests {
         let packages = preloaded.packages.iter().collect::<Vec<_>>();
 
         assert!(target_lockfile_is_replay_ready(
-            &workspace,
+            ReplayReadinessContext {
+                client: &RegistryClient::new(),
+                workspace: &workspace,
+                global_auto_install_peers: None,
+                root_provider_fingerprint: None,
+            },
             directory.path(),
             &package,
             &preloaded,
             &packages,
-            None,
-            None,
         ));
     }
 
@@ -2229,9 +2308,11 @@ mod tests {
         project_dir: &Path,
         package: &lpm_workspace::PackageJson,
         importer_spec: &str,
+        registry_url: &str,
     ) {
         let mut lockfile = lpm_lockfile::Lockfile::new();
-        let source = "registry+https://registry.npmjs.org";
+        let source = format!("registry+{registry_url}");
+        let source = source.as_str();
         let instance_id =
             lpm_common::PackageInstanceId::derive("lodash", "4.17.21", source, "root/lodash");
         let mut importer = validation::importer_snapshot_for_current_manifest(
