@@ -1004,7 +1004,7 @@ async fn prepare_service_runtime_hints(
 ) -> Result<HashMap<String, lpm_runner::bin_path::ManagedRuntimeHint>, LpmError> {
     let mut hints = HashMap::with_capacity(services.len());
     let mut hints_by_directory = HashMap::with_capacity(services.len());
-    let mut node_versions = lpm_runtime::effective::PathNodeVersionCache::default();
+    let mut node_versions = crate::engine_check::path_node_versions();
     let project_root = project_dir.canonicalize().map_err(|error| {
         LpmError::Script(format!(
             "resolve dev project directory {}: {error}",
@@ -1431,10 +1431,8 @@ pub async fn run(
     let https_setup: Option<DevCertSetup> = https_result?;
     let script_path =
         lpm_runner::bin_path::build_path_with_bins_pre_resolved(project_dir, &runtime_hint)?;
-    let effective_node = lpm_runtime::effective::resolve_node_on_path_with_fingerprint(
-        project_dir,
-        std::ffi::OsStr::new(&script_path),
-    );
+    let effective_node = crate::engine_check::path_node_versions()
+        .resolve(project_dir, std::ffi::OsStr::new(&script_path));
     if let Some(requirement) =
         crate::engine_check::resolve_root_node_engine_requirement(project_dir)?
     {

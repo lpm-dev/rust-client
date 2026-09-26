@@ -100,6 +100,96 @@ enum PathNodeCacheContext {
 pub struct PathNodeVersionCache {
     resolutions: HashMap<PathNodeIdentity, PathNodeResolution>,
     managed_node_root: Option<PathBuf>,
+    recorded: Option<RecordedNodeVersions>,
+    recordings: Vec<std::thread::JoinHandle<()>>,
+}
+
+impl Drop for PathNodeVersionCache {
+    fn drop(&mut self) {
+        // Records are written in the background, off the command's critical
+        // path; they finish before the resolutions that produced them are
+        // forgotten.
+        for recording in self.recordings.drain(..) {
+            let _ = recording.join();
+        }
+    }
+}
+
+/// Versions that real Node binaries reported, stored by fingerprint so that
+/// later commands, in any project, can skip `node --version` for the same
+/// binary.
+///
+/// Launchers are never recorded: a shim can report another version without
+/// its fingerprint changing.
+#[derive(Debug, Clone)]
+pub struct RecordedNodeVersions {
+    directory: PathBuf,
+    reuse: bool,
+}
+
+const MAX_RECORDED_VERSION_BYTES: u64 = 256;
+
+impl RecordedNodeVersions {
+    /// Reuse and record versions under `directory`.
+    pub fn at(directory: impl Into<PathBuf>) -> Self {
+        Self {
+            directory: directory.into(),
+            reuse: true,
+        }
+    }
+
+    /// Record probes without reusing earlier results, so each probe
+    /// refreshes the version recorded for its binary.
+    pub fn refreshing(mut self) -> Self {
+        self.reuse = false;
+        self
+    }
+
+    fn version(&self, fingerprint: &str) -> Option<String> {
+        if !self.reuse {
+            return None;
+        }
+        let recorded = lpm_common::read_text_file_capped_nofollow(
+            &self.path(fingerprint)?,
+            MAX_RECORDED_VERSION_BYTES,
+        )
+        .ok()?;
+        let version = recorded.trim();
+        lpm_semver::Version::parse(version).ok()?;
+        Some(version.to_string())
+    }
+
+    fn record(&self, fingerprint: &str, version: &str) -> Option<std::thread::JoinHandle<()>> {
+        let path = self.path(fingerprint)?;
+        lpm_semver::Version::parse(version).ok()?;
+        let directory = self.directory.clone();
+        let contents = format!("{version}\n");
+        // A version that cannot be recorded only costs a later probe.
+        std::thread::Builder::new()
+            .name("lpm-node-version-record".into())
+            .spawn(move || {
+                let _ = create_private_directory(&directory)
+                    .and_then(|()| lpm_common::write_file_atomic(&path, contents));
+            })
+            .ok()
+    }
+
+    fn path(&self, fingerprint: &str) -> Option<PathBuf> {
+        (fingerprint.len() == 64 && fingerprint.bytes().all(|byte| byte.is_ascii_hexdigit()))
+            .then(|| self.directory.join(fingerprint))
+    }
+}
+
+fn create_private_directory(directory: &Path) -> std::io::Result<()> {
+    let mut builder = std::fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+
+        builder.mode(0o700);
+    }
+    builder.create(directory)
 }
 
 impl EffectiveNodeResolution {
@@ -132,6 +222,16 @@ impl PathNodeResolution {
 }
 
 impl PathNodeVersionCache {
+    /// Reuse and record the versions of real Node binaries in `recorded`.
+    pub fn with_recorded_versions(recorded: RecordedNodeVersions) -> Self {
+        Self {
+            resolutions: HashMap::new(),
+            managed_node_root: None,
+            recorded: Some(recorded),
+            recordings: Vec::new(),
+        }
+    }
+
     /// Resolve Node from `path` as observed by a script running in `cwd`.
     ///
     /// Relative `PATH` entries are anchored to `cwd`. Version probes are reused
@@ -179,6 +279,19 @@ impl PathNodeVersionCache {
                 .insert(identity.clone(), resolution.clone());
             return resolution;
         }
+        if let (Some(identity), Some(recorded)) = (identity_before.as_ref(), self.recorded.as_ref())
+            && identity.script.node_binary
+            && let Some(version) = recorded.version(&identity.script.fingerprint)
+        {
+            let resolution = PathNodeResolution {
+                version: Some(version),
+                runtime_fingerprint: Some(identity.script.fingerprint.clone()),
+                executable: executable_before,
+            };
+            self.resolutions
+                .insert(identity.clone(), resolution.clone());
+            return resolution;
+        }
 
         let version = node_version_on_path(cwd, path, executable_before.as_deref());
         let identity_after = node_executable_in_path(cwd, path)
@@ -194,6 +307,13 @@ impl PathNodeVersionCache {
             executable: executable_before,
         };
         if let Some(identity) = stable_identity {
+            if identity.script.node_binary
+                && let (Some(recorded), Some(version)) =
+                    (self.recorded.as_ref(), resolution.version.as_deref())
+                && let Some(recording) = recorded.record(&identity.script.fingerprint, version)
+            {
+                self.recordings.push(recording);
+            }
             self.resolutions.insert(identity, resolution.clone());
         }
         resolution
@@ -969,6 +1089,107 @@ mod tests {
         let resolution = resolve_node_on_path_with_observed(dir.path(), &path, Some(&observed));
 
         assert_eq!(resolution.version(), Some("18.0.0"));
+    }
+
+    fn record_version(records: &Path, fingerprint: &str, contents: &str) {
+        fs::create_dir_all(records).unwrap();
+        fs::write(records.join(fingerprint), contents).unwrap();
+    }
+
+    #[test]
+    fn a_version_recorded_for_an_unchanged_node_binary_replaces_the_probe() {
+        let dir = tempfile::tempdir().unwrap();
+        crate::node_identity::write_unrunnable_node_binary(&test_node_path(dir.path()));
+        let path = std::env::join_paths([dir.path()]).unwrap();
+        let fingerprint = probe_node_fingerprint_on_path(dir.path(), &path).unwrap();
+        let records = dir.path().join("node-versions");
+        record_version(&records, &fingerprint, "22.1.0\n");
+
+        let reused =
+            PathNodeVersionCache::with_recorded_versions(RecordedNodeVersions::at(&records))
+                .resolve(dir.path(), &path);
+        let refreshed = PathNodeVersionCache::with_recorded_versions(
+            RecordedNodeVersions::at(&records).refreshing(),
+        )
+        .resolve(dir.path(), &path);
+
+        assert_eq!(reused.version(), Some("22.1.0"));
+        assert_eq!(reused.runtime_fingerprint(), Some(fingerprint.as_str()));
+        assert_eq!(
+            refreshed.version(),
+            None,
+            "a refreshing record must probe the unrunnable binary"
+        );
+    }
+
+    #[test]
+    fn a_recorded_version_is_ignored_once_the_node_binary_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        let node = test_node_path(dir.path());
+        crate::node_identity::write_unrunnable_node_binary(&node);
+        let path = std::env::join_paths([dir.path()]).unwrap();
+        let records = dir.path().join("node-versions");
+        record_version(
+            &records,
+            &probe_node_fingerprint_on_path(dir.path(), &path).unwrap(),
+            "22.1.0\n",
+        );
+        fs::remove_file(&node).unwrap();
+        crate::node_identity::write_unrunnable_node_binary(&node);
+        fs::File::options()
+            .write(true)
+            .open(&node)
+            .unwrap()
+            .set_len(32 * 1024 * 1024)
+            .unwrap();
+
+        let resolution =
+            PathNodeVersionCache::with_recorded_versions(RecordedNodeVersions::at(&records))
+                .resolve(dir.path(), &path);
+
+        assert_eq!(resolution.version(), None);
+    }
+
+    #[test]
+    fn a_malformed_recorded_version_is_ignored() {
+        let dir = tempfile::tempdir().unwrap();
+        crate::node_identity::write_unrunnable_node_binary(&test_node_path(dir.path()));
+        let path = std::env::join_paths([dir.path()]).unwrap();
+        let records = dir.path().join("node-versions");
+        record_version(
+            &records,
+            &probe_node_fingerprint_on_path(dir.path(), &path).unwrap(),
+            "not a version\n",
+        );
+
+        let resolution =
+            PathNodeVersionCache::with_recorded_versions(RecordedNodeVersions::at(&records))
+                .resolve(dir.path(), &path);
+
+        assert_eq!(resolution.version(), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn launchers_are_neither_reused_nor_recorded() {
+        let dir = tempfile::tempdir().unwrap();
+        write_test_executable(&test_node_path(dir.path()), b"#!/bin/sh\necho v18.0.0\n");
+        let path = std::env::join_paths([dir.path()]).unwrap();
+        let fingerprint = probe_node_fingerprint_on_path(dir.path(), &path).unwrap();
+        let records = dir.path().join("node-versions");
+        record_version(&records, &fingerprint, "22.1.0\n");
+
+        let resolution =
+            PathNodeVersionCache::with_recorded_versions(RecordedNodeVersions::at(&records))
+                .resolve(dir.path(), &path);
+
+        assert_eq!(resolution.version(), Some("18.0.0"));
+        assert_eq!(
+            fs::read_to_string(records.join(&fingerprint)).unwrap(),
+            "22.1.0\n",
+            "a launcher's probe must not be recorded"
+        );
+        assert_eq!(fs::read_dir(&records).unwrap().count(), 1);
     }
 
     #[test]

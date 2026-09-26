@@ -45,10 +45,8 @@ pub fn validate_runtime(
         return Ok(());
     }
     let script_path = lpm_runner::bin_path::build_path_with_bins_pre_resolved(project_dir, hint)?;
-    let effective_node = lpm_runtime::effective::resolve_node_on_path_with_fingerprint(
-        project_dir,
-        std::ffi::OsStr::new(&script_path),
-    );
+    let effective_node = crate::engine_check::path_node_versions()
+        .resolve(project_dir, std::ffi::OsStr::new(&script_path));
     for requirement in requirements {
         crate::engine_check::enforce_resolved_node_requirement_for_run(
             requirement.required,

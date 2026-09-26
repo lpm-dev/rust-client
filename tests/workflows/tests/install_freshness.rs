@@ -577,6 +577,65 @@ async fn unchanged_installs_reuse_the_recorded_version_of_an_unchanged_node_bina
 }
 
 #[tokio::test]
+async fn new_checkouts_reuse_the_version_recorded_for_an_unchanged_node_binary() {
+    let mock = MockRegistry::start().await;
+    mock.with_manifest_package(
+        serde_json::json!({
+            "name": "engine-dep", "version": "1.0.0", "engines": {"node": ">=20 <21"}
+        }),
+        &[],
+    )
+    .await;
+    let project =
+        TempProject::empty(r#"{"name":"consumer","dependencies":{"engine-dep":"1.0.0"}}"#);
+    let check_out_again = || {
+        for state in [
+            project.path().join("node_modules"),
+            project.path().join(".lpm"),
+        ] {
+            std::fs::remove_dir_all(state).unwrap();
+        }
+    };
+    write_node_shim(&project);
+    as_node_binary(&project, install(&project, &mock.url()))
+        .assert()
+        .success();
+    assert_eq!(probe_count(&project), 1);
+
+    check_out_again();
+    as_node_binary(&project, install(&project, &mock.url()))
+        .assert()
+        .success();
+    assert_eq!(probe_count(&project), 1, "a new checkout probed Node again");
+
+    as_node_binary(&project, install(&project, &mock.url()))
+        .arg("--force")
+        .assert()
+        .success();
+    assert_eq!(
+        probe_count(&project),
+        2,
+        "--force reused a recorded version"
+    );
+    check_out_again();
+    as_node_binary(&project, install(&project, &mock.url()))
+        .assert()
+        .success();
+    assert_eq!(probe_count(&project), 2, "--force did not record its probe");
+
+    replace_node_binary(&project);
+    check_out_again();
+    as_node_binary(&project, install(&project, &mock.url()))
+        .assert()
+        .success();
+    assert_eq!(
+        probe_count(&project),
+        3,
+        "a replaced Node binary was not probed"
+    );
+}
+
+#[tokio::test]
 async fn engine_free_installs_do_not_execute_node() {
     let mock = MockRegistry::start().await;
     mock.with_manifest_package(

@@ -167,6 +167,13 @@ impl LpmRoot {
         self.cache_metadata().join("attestations")
     }
 
+    /// Versions recorded per Node binary, so later commands can skip
+    /// `node --version`. Nested under `cache/metadata` so `lpm cache clean
+    /// metadata` removes them without a new cache category.
+    pub fn cache_node_versions(&self) -> PathBuf {
+        self.cache_metadata().join("node-versions")
+    }
+
     pub fn cache_tasks(&self) -> PathBuf {
         self.cache_root().join("tasks")
     }
