@@ -169,6 +169,92 @@ fn parse_preferred(
     })
 }
 
+/// A package history read from the preferred or complete cache.
+pub(super) struct CachedHistory<P> {
+    pub(super) metadata: ResolutionMetadata<P>,
+    facts: ProjectionFacts,
+}
+
+impl<P: MetadataProjection> CachedHistory<P> {
+    fn document(
+        metadata: PackageMetadata,
+        versions_complete: bool,
+        source: Option<ProjectionSource>,
+    ) -> Self {
+        let facts = ProjectionFacts {
+            versions_complete,
+            latest: metadata.dist_tags.get("latest").cloned(),
+        };
+        let projection = source.and_then(|source| source.slot::<P>(facts.clone()));
+        Self {
+            metadata: ResolutionMetadata::Document {
+                metadata: Box::new(metadata),
+                projection,
+            },
+            facts,
+        }
+    }
+
+    fn projected(value: P, facts: ProjectionFacts) -> Self {
+        Self {
+            metadata: ResolutionMetadata::Projected(value),
+            facts,
+        }
+    }
+
+    fn from_preferred(resolution: CachedResolution<PreferredMetadata, P>) -> Self {
+        match resolution {
+            CachedResolution::Document { value, source } => {
+                Self::document(value.metadata, value.versions_complete, source)
+            }
+            CachedResolution::Projected { value, facts } => Self::projected(value, facts),
+        }
+    }
+
+    fn from_complete(resolution: CachedResolution<PackageMetadata, P>) -> Self {
+        match resolution {
+            CachedResolution::Document { value, source } => Self::document(value, true, source),
+            CachedResolution::Projected { value, facts } => Self::projected(value, facts),
+        }
+    }
+
+    pub(super) fn covers(&self, accepts: &impl Fn(&str) -> bool) -> bool {
+        self.facts.covers(accepts)
+    }
+
+    pub(super) fn versions_complete(&self) -> bool {
+        self.facts.versions_complete
+    }
+
+    pub(super) fn with_timings(
+        self,
+        timings: PackageMetadataFetchTimings,
+    ) -> TimedPreferredResolution<P> {
+        TimedPreferredResolution {
+            metadata: self.metadata,
+            timings,
+            versions_complete: self.facts.versions_complete,
+            platform_metadata_complete: false,
+        }
+    }
+}
+
+impl ProjectionFacts {
+    /// Whether the history can answer a range: complete histories answer any
+    /// range, partial ones only a range that accepts their latest version.
+    fn covers(&self, accepts: &impl Fn(&str) -> bool) -> bool {
+        self.versions_complete || self.latest.as_deref().is_some_and(accepts)
+    }
+}
+
+fn into_document_result(
+    resolution: TimedPreferredResolution<NoProjection>,
+) -> (TimedPackageMetadata, bool) {
+    let versions_complete = resolution.versions_complete;
+    let preferred = TimedPreferredMetadata::from(resolution);
+    (preferred.fetched, versions_complete)
+}
+
 impl RegistryClient {
     pub(in crate::client) fn npm_preferred_metadata_cache_key(
         &self,
@@ -178,42 +264,75 @@ impl RegistryClient {
         self.npm_access_cache_key("npm-direct-preferred", name, access)
     }
 
-    async fn read_preferred_cache_for_use<const RESOLVER: bool>(
+    /// Read a valid preferred history. Resolver reads omit development
+    /// dependencies and return the stored projection `P` when one is bound.
+    pub(super) async fn read_preferred_cache_for_use<
+        const RESOLVER: bool,
+        P: MetadataProjection,
+    >(
         &self,
+        name: &str,
         key: &str,
-    ) -> Option<crate::client::state::MetadataCacheEntry<PreferredMetadata>> {
+    ) -> Option<CachedHistory<P>> {
         if !RESOLVER {
-            return self.read_metadata_cache_entry_as_async(key).await;
+            let cached = self
+                .read_metadata_cache_entry_as_async::<PreferredMetadata>(key)
+                .await?;
+            return cached.value.is_valid(name).then(|| {
+                CachedHistory::document(cached.value.metadata, cached.value.versions_complete, None)
+            });
         }
         #[derive(serde::Deserialize)]
         struct ResolverPreferred {
             metadata: resolver_cache::ResolverMetadata,
             versions_complete: bool,
         }
-        let cached = self
-            .read_metadata_cache_entry_as_async::<ResolverPreferred>(key)
-            .await?;
-        Some(crate::client::state::MetadataCacheEntry {
-            value: PreferredMetadata {
-                metadata: cached.value.metadata.0,
-                versions_complete: cached.value.versions_complete,
-            },
-            etag: cached.etag,
-            remaining_freshness: cached.remaining_freshness,
-        })
+        match self
+            .read_metadata_cache_resolution_async::<ResolverPreferred, P>(key)
+            .await?
+            .value
+        {
+            CachedResolution::Projected { value, facts } => {
+                Some(CachedHistory::projected(value, facts))
+            }
+            CachedResolution::Document { value, source } => {
+                let preferred = PreferredMetadata {
+                    metadata: value.metadata.0,
+                    versions_complete: value.versions_complete,
+                };
+                preferred.is_valid(name).then(|| {
+                    CachedHistory::document(preferred.metadata, preferred.versions_complete, source)
+                })
+            }
+        }
     }
 
-    async fn read_complete_cache_for_use<const RESOLVER: bool>(
+    /// Read a complete history whose identity matches `name`. Resolver reads
+    /// omit development dependencies and return the stored projection `P` when
+    /// one is bound.
+    pub(super) async fn read_complete_cache_for_use<const RESOLVER: bool, P: MetadataProjection>(
         &self,
+        name: &str,
         key: &str,
-    ) -> Option<(PackageMetadata, Option<String>)> {
+    ) -> Option<CachedHistory<P>> {
         if !RESOLVER {
-            return self.read_metadata_cache_async(key).await;
+            let (metadata, _) = self.read_metadata_cache_async(key).await?;
+            return batch_metadata_entry_matches_name(name, &metadata)
+                .then(|| CachedHistory::document(metadata, true, None));
         }
-        let cached = self
-            .read_metadata_cache_as_async::<resolver_cache::ResolverMetadata>(key)
-            .await?;
-        Some((cached.0.0, cached.1))
+        match self
+            .read_metadata_cache_resolution_async::<resolver_cache::ResolverMetadata, P>(key)
+            .await?
+            .value
+        {
+            CachedResolution::Projected { value, facts } => {
+                Some(CachedHistory::projected(value, facts))
+            }
+            CachedResolution::Document { value, source } => {
+                batch_metadata_entry_matches_name(name, &value.0)
+                    .then(|| CachedHistory::document(value.0, true, source))
+            }
+        }
     }
 
     /// Return preferred manifests with explicit completeness, or complete history when the
@@ -226,7 +345,7 @@ impl RegistryClient {
     where
         F: Fn(&str) -> bool + Send + 'static,
     {
-        self.get_npm_preferred_metadata_with_cache_fields::<_, false>(name, accepts)
+        self.get_npm_preferred_metadata_with_cache_fields(name, accepts)
             .await
     }
 
@@ -258,7 +377,7 @@ impl RegistryClient {
         name = "preferred_metadata",
         skip_all
     )]
-    async fn get_npm_preferred_metadata_with_cache_fields<F, const RESOLVER: bool>(
+    async fn get_npm_preferred_metadata_with_cache_fields<F>(
         &self,
         name: &str,
         accepts: F,
@@ -272,21 +391,14 @@ impl RegistryClient {
         crate::timing::record_metadata_request(name);
         let read_start = std::time::Instant::now();
         if let Some(cached) = self
-            .read_preferred_cache_for_use::<RESOLVER>(&cache_key)
+            .read_preferred_cache_for_use::<false, NoProjection>(name, &cache_key)
             .await
-            && cached.value.is_valid(name)
         {
-            if cached.value.covers(&accepts) {
+            if cached.covers(&accepts) {
                 timings.cache_read_ms = read_start.elapsed().as_millis();
                 timings.cache_hit = true;
                 crate::timing::record_metadata_cache_hit();
-                return Ok((
-                    TimedPackageMetadata {
-                        metadata: cached.value.metadata,
-                        timings,
-                    },
-                    cached.value.versions_complete,
-                ));
+                return Ok(into_document_result(cached.with_timings(timings)));
             }
             let cache_read_ms = read_start.elapsed().as_millis();
             let mut complete = self
@@ -298,77 +410,63 @@ impl RegistryClient {
         }
         let complete_key = self.npm_direct_metadata_cache_key(name, access);
         if let Some(cached) = self
-            .read_complete_cache_for_use::<RESOLVER>(&complete_key)
+            .read_complete_cache_for_use::<false, NoProjection>(name, &complete_key)
             .await
-            && batch_metadata_entry_matches_name(name, &cached.0)
         {
             timings.cache_read_ms = read_start.elapsed().as_millis();
             timings.cache_hit = true;
             crate::timing::record_metadata_cache_hit();
-            return Ok((
-                TimedPackageMetadata {
-                    metadata: cached.0,
-                    timings,
-                },
-                true,
-            ));
+            return Ok(into_document_result(cached.with_timings(timings)));
         }
         timings.cache_read_ms = read_start.elapsed().as_millis();
         crate::timing::record_metadata_cache_miss();
-        self.fetch_npm_preferred_history::<_, RESOLVER>(name, access, accepts, timings)
+        self.fetch_npm_preferred_history::<_, false, NoProjection>(name, access, accepts, timings)
             .await
+            .map(into_document_result)
     }
 
     /// Fetch preferred history after the caller has recorded the request and its cache miss.
     /// The flight re-checks both history caches so concurrent callers share one response.
-    async fn fetch_npm_preferred_history<F, const RESOLVER: bool>(
+    pub(super) async fn fetch_npm_preferred_history<F, const RESOLVER: bool, P>(
         &self,
         name: &str,
         access: PublicNpmAccess<'_>,
         accepts: F,
         mut timings: PackageMetadataFetchTimings,
-    ) -> Result<(TimedPackageMetadata, bool), LpmError>
+    ) -> Result<TimedPreferredResolution<P>, LpmError>
     where
         F: Fn(&str) -> bool + Send + 'static,
+        P: MetadataProjection,
     {
         let cache_key = self.npm_preferred_metadata_cache_key(name, access);
         let complete_key = self.npm_direct_metadata_cache_key(name, access);
         let _flight = metadata_fetch_flight_guard(&cache_key).await;
         let coalesced_start = std::time::Instant::now();
         if let Some(cached) = self
-            .read_preferred_cache_for_use::<RESOLVER>(&cache_key)
+            .read_preferred_cache_for_use::<RESOLVER, P>(name, &cache_key)
             .await
-            && cached.value.is_valid(name)
-            && cached.value.covers(&accepts)
+            && cached.covers(&accepts)
         {
             timings.cache_hit = true;
             timings.cache_read_ms += coalesced_start.elapsed().as_millis();
-            return Ok((
-                TimedPackageMetadata {
-                    metadata: cached.value.metadata,
-                    timings,
-                },
-                cached.value.versions_complete,
-            ));
+            return Ok(cached.with_timings(timings));
         }
         if let Some(cached) = self
-            .read_complete_cache_for_use::<RESOLVER>(&complete_key)
+            .read_complete_cache_for_use::<RESOLVER, P>(name, &complete_key)
             .await
-            && batch_metadata_entry_matches_name(name, &cached.0)
         {
             timings.cache_hit = true;
             timings.cache_read_ms += coalesced_start.elapsed().as_millis();
-            return Ok((
-                TimedPackageMetadata {
-                    metadata: cached.0,
-                    timings,
-                },
-                true,
-            ));
+            return Ok(cached.with_timings(timings));
         }
         timings.cache_read_ms += coalesced_start.elapsed().as_millis();
         let validator_start = std::time::Instant::now();
-        let validator = self.read_cache_validator(&cache_key);
+        // Both entries hold selections of the same response, so a stale
+        // complete history is revalidated when no preferred selection exists.
+        let (validator, revalidates_complete) = match self.read_cache_validator(&cache_key) {
+            Some(validator) => (Some(validator), false),
+            None => (self.read_cache_validator(&complete_key), true),
+        };
         timings.validator_read_ms = validator_start.elapsed().as_millis();
         let url = format!("{}/{name}", self.npm_registry_url);
         let rpc_start = std::time::Instant::now();
@@ -384,29 +482,40 @@ impl RegistryClient {
             timings.http_ms = http_start.elapsed().as_millis();
             if response.status() == reqwest::StatusCode::NOT_MODIFIED {
                 let cache_start = std::time::Instant::now();
-                if let Some(cached) = self
-                    .cached_metadata_after_304_as::<PreferredMetadata, _>(
+                let revalidated = if revalidates_complete {
+                    self.cached_resolution_after_304::<PackageMetadata, P>(
+                        &complete_key,
+                        &response,
+                        validator.as_ref(),
+                        |metadata| batch_metadata_entry_matches_name(name, metadata),
+                        |facts| facts.versions_complete,
+                    )
+                    .await
+                    .map(|cached| CachedHistory::from_complete(cached.value))
+                } else {
+                    self.cached_resolution_after_304::<PreferredMetadata, P>(
                         &cache_key,
                         &response,
                         validator.as_ref(),
                         |cached| cached.is_valid(name) && cached.covers(&accepts),
+                        |facts| facts.covers(&accepts),
                     )
                     .await
-                {
+                    .map(|cached| CachedHistory::from_preferred(cached.value))
+                };
+                if let Some(cached) = revalidated {
                     timings.not_modified = true;
                     timings.cache_after_304_ms = cache_start.elapsed().as_millis();
                     if Self::metadata_cache_directive(response.headers())
                         == super::super::cache::MetadataCacheDirective::NoStore
                     {
-                        self.invalidate_metadata_cache_key(&complete_key);
+                        self.invalidate_metadata_cache_key(if revalidates_complete {
+                            &cache_key
+                        } else {
+                            &complete_key
+                        });
                     }
-                    return Ok((
-                        TimedPackageMetadata {
-                            metadata: cached.value.metadata,
-                            timings,
-                        },
-                        cached.value.versions_complete,
-                    ));
+                    return Ok(cached.with_timings(timings));
                 }
                 timings.cache_after_304_ms = cache_start.elapsed().as_millis();
                 let request = self
@@ -432,7 +541,7 @@ impl RegistryClient {
             timings.json_decode_ms = body.json_parse_ms;
             timings.body_bytes = body.body_bytes;
             let write_start = std::time::Instant::now();
-            if directive == super::super::cache::MetadataCacheDirective::NoStore {
+            let written = if directive == super::super::cache::MetadataCacheDirective::NoStore {
                 self.write_metadata_cache_with_directive(&cache_key, &selected, None, directive);
                 self.write_metadata_cache_with_directive(
                     &complete_key,
@@ -440,30 +549,25 @@ impl RegistryClient {
                     None,
                     directive,
                 );
+                None
             } else if selected.versions_complete {
                 self.invalidate_metadata_cache_key(&cache_key);
-                self.write_metadata_cache_with_directive(
+                self.write_metadata_cache_entry(
                     &complete_key,
                     &selected.metadata,
                     etag.as_deref(),
                     directive,
-                );
+                )
             } else {
-                self.write_metadata_cache_with_directive(
-                    &cache_key,
-                    &selected,
-                    etag.as_deref(),
-                    directive,
-                );
-            }
+                self.write_metadata_cache_entry(&cache_key, &selected, etag.as_deref(), directive)
+            };
             timings.cache_write_dispatch_ms = write_start.elapsed().as_millis();
-            Ok((
-                TimedPackageMetadata {
-                    metadata: selected.metadata,
-                    timings,
-                },
+            Ok(CachedHistory::<P>::document(
+                selected.metadata,
                 selected.versions_complete,
-            ))
+                written.and_then(|write| write.source),
+            )
+            .with_timings(timings))
         }
         .await;
         crate::timing::record_rpc(rpc_start.elapsed());

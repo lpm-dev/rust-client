@@ -1196,3 +1196,65 @@ async fn history_failure_is_reported_when_latest_is_outside_the_range() {
         .unwrap_err();
     assert_eq!(error.to_string(), expected.to_string());
 }
+
+#[tokio::test]
+async fn a_stale_complete_history_is_revalidated_with_its_etag() {
+    let server = MockServer::start().await;
+    let cache = tempfile::tempdir().unwrap();
+    let client = preferred_test_client(&server, cache.path()).await;
+    Mock::given(method("GET"))
+        .and(path("/pkg/latest"))
+        .respond_with(ResponseTemplate::new(404))
+        .mount(&server)
+        .await;
+    let initial = Mock::given(method("GET"))
+        .and(path("/pkg"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(history())
+                .insert_header("Cache-Control", "max-age=300")
+                .insert_header("ETag", "\"complete\""),
+        )
+        .expect(1)
+        .mount_as_scoped(&server)
+        .await;
+    let (_, complete) = client
+        .get_npm_preferred_metadata_for_resolution_with_timings("pkg", |version| version == "1.0.0")
+        .await
+        .unwrap();
+    assert!(complete);
+    drop(initial);
+    let key = client.npm_direct_metadata_cache_key("pkg", PublicNpmAccess::ANONYMOUS);
+    filetime::set_file_mtime(
+        client.cache_path(&key).unwrap(),
+        filetime::FileTime::from_unix_time(1, 0),
+    )
+    .unwrap();
+    Mock::given(method("GET"))
+        .and(path("/pkg"))
+        .and(header("If-None-Match", "\"complete\""))
+        .respond_with(
+            ResponseTemplate::new(304)
+                .insert_header("Cache-Control", "max-age=300")
+                .insert_header("ETag", "\"complete\""),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let (revalidated, complete) = client
+        .get_npm_preferred_metadata_for_resolution_with_timings("pkg", |version| version == "1.0.0")
+        .await
+        .unwrap();
+
+    assert!(complete);
+    assert!(revalidated.timings.not_modified);
+    assert_eq!(revalidated.timings.body_bytes, 0);
+    assert_eq!(revalidated.metadata.versions.len(), 2);
+    let (fresh, _) = client
+        .get_npm_preferred_metadata_for_resolution_with_timings("pkg", |version| version == "1.0.0")
+        .await
+        .unwrap();
+    assert!(fresh.timings.cache_hit);
+    server.verify().await;
+}

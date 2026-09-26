@@ -3560,7 +3560,7 @@ pub(super) fn spawn_speculation_dispatcher(
                     return;
                 }
                 if !dependency_engine_policy
-                    .allows_dependency_materialization(meta.info.node_engine(&version))
+                    .allows_dependency_materialization_on_runtime(meta.info.node_engine(&version))
                 {
                     return;
                 }
