@@ -1383,6 +1383,7 @@ async fn run_with_options_under_store_lock(
         wf_resolve_end_ms,
         auto_isolated_peer_conflicts,
         linker_mode,
+        deferred_engine_check,
     } = online_resolution?;
     if let Some(fingerprint) = workspace_root_peer_providers_fingerprint {
         current_importer_snapshot.workspace_root_peer_providers_fingerprint = Some(fingerprint);
@@ -1484,30 +1485,7 @@ async fn run_with_options_under_store_lock(
         0
     };
 
-    let OnlineFetchPhaseResult {
-        packages,
-        packages_for_lockfile,
-        link_targets,
-        event_driven_link,
-        event_link_handles,
-        v2_mode,
-        v2_event_driven,
-        v2_plan,
-        mut v2_event_link_handles,
-        mut v2_link_task_timings,
-        fetch_ms,
-        waterfall_start_ms: wf_fetch_start_ms,
-        waterfall_end_ms: wf_fetch_end_ms,
-        fetch_stage_timings,
-        cached,
-        downloaded,
-        fetch_breakdown,
-        walker_summary_final,
-        spec_stats,
-        install_provenance_status_map,
-        verified_provenance_for_lockfile,
-        fresh_urls,
-    } = run_online_fetch_phase(OnlineFetchPhaseInput {
+    let fetch_phase = run_online_fetch_phase(OnlineFetchPhaseInput {
         start,
         arc_client: arc_client.clone(),
         route_table: route_table.clone(),
@@ -1550,8 +1528,41 @@ async fn run_with_options_under_store_lock(
         slow_package_timings: &mut slow_package_timings,
         linker_mode,
         compatibility_bin_names,
-    })
-    .await?;
+    });
+    let OnlineFetchPhaseResult {
+        packages,
+        packages_for_lockfile,
+        link_targets,
+        event_driven_link,
+        event_link_handles,
+        v2_mode,
+        v2_event_driven,
+        v2_plan,
+        mut v2_event_link_handles,
+        mut v2_link_task_timings,
+        fetch_ms,
+        waterfall_start_ms: wf_fetch_start_ms,
+        waterfall_end_ms: wf_fetch_end_ms,
+        fetch_stage_timings,
+        cached,
+        downloaded,
+        fetch_breakdown,
+        walker_summary_final,
+        spec_stats,
+        install_provenance_status_map,
+        verified_provenance_for_lockfile,
+        fresh_urls,
+    } = match deferred_engine_check {
+        // A mismatch fails the install without waiting for the downloads.
+        Some(check) => {
+            let (engine_warnings, fetched) = tokio::try_join!(check.verdict(), fetch_phase)?;
+            for warning in &engine_warnings {
+                dependency_engine_policy.warn(warning);
+            }
+            fetched
+        }
+        None => fetch_phase.await?,
+    };
 
     if used_lockfile && strict_peer_dependencies {
         enforce_replayed_peer_dependencies(

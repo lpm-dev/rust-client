@@ -59,6 +59,12 @@ pub(crate) struct NodeEngineRequirement {
     pub(crate) source: String,
 }
 
+pub(crate) enum DependencyEngineDecision {
+    Keep,
+    KeepWithWarning(String),
+    Skip(String),
+}
+
 pub(crate) struct DependencyEnginePolicy {
     engine_strict: bool,
     json_output: bool,
@@ -155,28 +161,53 @@ impl DependencyEnginePolicy {
         required: &str,
         optional: bool,
     ) -> Result<bool, LpmError> {
+        match self.decide_dependency(package_name, package_version, required, optional)? {
+            DependencyEngineDecision::Keep => Ok(true),
+            DependencyEngineDecision::KeepWithWarning(warning) => {
+                self.warn(&warning);
+                Ok(true)
+            }
+            DependencyEngineDecision::Skip(warning) => {
+                self.warn(&warning);
+                Ok(false)
+            }
+        }
+    }
+
+    /// Decide one dependency's `engines.node` requirement without reporting it.
+    pub(crate) fn decide_dependency(
+        &self,
+        package_name: &str,
+        package_version: &str,
+        required: &str,
+        optional: bool,
+    ) -> Result<DependencyEngineDecision, LpmError> {
         let source = format!("{package_name}@{package_version} > engines.node");
         let Err(mismatch) = self.check_node_requirement(required, source) else {
-            return Ok(true);
+            return Ok(DependencyEngineDecision::Keep);
         };
-
         if !self.engine_strict {
-            if !self.json_output {
-                output::warn(&format!(
-                    "{package_name}@{package_version}: {mismatch} (engine-strict disabled, ignoring)"
-                ));
-            }
-            return Ok(true);
+            return Ok(DependencyEngineDecision::KeepWithWarning(format!(
+                "{package_name}@{package_version}: {mismatch} (engine-strict disabled, ignoring)"
+            )));
         }
         if optional {
-            if !self.json_output {
-                output::warn(&format!(
-                    "skipping optional {package_name}@{package_version}: {mismatch}"
-                ));
-            }
-            return Ok(false);
+            return Ok(DependencyEngineDecision::Skip(format!(
+                "skipping optional {package_name}@{package_version}: {mismatch}"
+            )));
         }
         Err(mismatch.into_error("node"))
+    }
+
+    /// Whether a mismatch can remove an optional dependency from the install.
+    pub(crate) fn skips_optional_mismatches(&self) -> bool {
+        self.engine_strict
+    }
+
+    pub(crate) fn warn(&self, warning: &str) {
+        if !self.json_output {
+            output::warn(warning);
+        }
     }
 
     pub(crate) fn allows_dependency_materialization(&self, required: Option<&str>) -> bool {

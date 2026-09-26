@@ -79,6 +79,8 @@ pub(in crate::commands::install) struct OnlineResolutionPhaseResult {
     pub(in crate::commands::install) wf_resolve_end_ms: u128,
     pub(in crate::commands::install) auto_isolated_peer_conflicts: bool,
     pub(in crate::commands::install) linker_mode: lpm_linker::LinkerMode,
+    /// Must finish before the install changes the project.
+    pub(in crate::commands::install) deferred_engine_check: Option<DeferredEngineCheck>,
 }
 
 pub(in crate::commands::install) async fn run_online_resolution_phase(
@@ -680,7 +682,13 @@ pub(in crate::commands::install) async fn run_online_resolution_phase(
             &ambient_peer_installs_for_lockfile,
         );
     }
-    filter_dependency_engine_packages(&mut packages, dependency_engine_policy.as_ref())?;
+    let engine_check_timing =
+        dependency_engine_check_timing(&packages, &dependency_engine_policy, requested_v2_mode);
+    let deferred_engine_check = filter_or_defer_dependency_engine_packages(
+        &mut packages,
+        &dependency_engine_policy,
+        engine_check_timing,
+    )?;
     platform_skipped += filter_platform_packages(&mut packages)?;
     retain_peer_issues_for_packages(&mut peer_warnings, &mut peer_conflicts, &packages);
 
@@ -776,5 +784,6 @@ pub(in crate::commands::install) async fn run_online_resolution_phase(
         wf_resolve_end_ms,
         auto_isolated_peer_conflicts,
         linker_mode,
+        deferred_engine_check,
     })
 }
