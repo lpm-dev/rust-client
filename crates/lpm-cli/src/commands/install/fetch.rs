@@ -378,10 +378,6 @@ fn configured_v2_streaming_extract_weight(
     }
 }
 
-fn use_pipelined_extraction(unpacked_size: Option<std::num::NonZeroU64>) -> bool {
-    unpacked_size.is_some_and(|size| size.get() >= 8 * 1024 * 1024)
-}
-
 fn v2_streaming_extract_weight(unpacked_size: Option<std::num::NonZeroU64>) -> usize {
     let explicit_weight = std::env::var(ENV_V2_STREAMING_EXTRACT_WEIGHT).ok();
     configured_v2_streaming_extract_weight(explicit_weight.as_deref(), unpacked_size)
@@ -2896,17 +2892,6 @@ mod tests {
     }
 
     #[test]
-    fn pipelined_extraction_requires_known_large_unpacked_size() {
-        assert!(!use_pipelined_extraction(None));
-        assert!(!use_pipelined_extraction(std::num::NonZeroU64::new(
-            8 * 1024 * 1024 - 1
-        )));
-        assert!(use_pipelined_extraction(std::num::NonZeroU64::new(
-            8 * 1024 * 1024
-        )));
-    }
-
-    #[test]
     fn v2_streaming_extract_weight_is_three_only_for_large_objects_by_default() {
         assert_eq!(configured_v2_streaming_extract_weight(None, None), 1);
         assert_eq!(
@@ -4876,20 +4861,14 @@ async fn extract_v2_registry_response(
         let _extract_permit = base_permit;
         let sync_reader = SyncIoBridge::new(async_reader);
         let reader = StreamBodyPermitReader::new(sync_reader, permit, download_elapsed_for_reader);
-        let result = if use_pipelined_extraction(unpacked_size) {
-            store_v2.extract_object_from_pipelined_stream(
-                reader,
-                expected_integrity.as_deref(),
-                lpm_registry::MAX_COMPRESSED_TARBALL_SIZE,
-                || cancel_decoder_input.cancel(),
-            )
-        } else {
-            store_v2.extract_object_from_stream(
-                reader,
-                expected_integrity.as_deref(),
-                lpm_registry::MAX_COMPRESSED_TARBALL_SIZE,
-            )
-        };
+        // The streamed package is the install's largest, so it gets the
+        // parallel file writers whatever its size.
+        let result = store_v2.extract_object_from_pipelined_stream(
+            reader,
+            expected_integrity.as_deref(),
+            lpm_registry::MAX_COMPRESSED_TARBALL_SIZE,
+            || cancel_decoder_input.cancel(),
+        );
         tracing::event!(name: "work_end", target: "lpm_install_timeline", tracing::Level::TRACE, success = result.is_ok());
         result
     });
