@@ -1,0 +1,125 @@
+{
+ "baseline": "#891 head 35e7ac097, release build",
+ "method": "CI set; projects installed once from the live registry and copied per variant; alternating paired runs; wall-clock medians and nearest-rank p95 in ms; internal_median_ms from --timing total_ms; background browser load present",
+ "lockfile_unit_costs_t3_206kb_us": {
+  "read": 36,
+  "compare": 6,
+  "parse_and_validate": 1523,
+  "clone": 32,
+  "to_toml": 1435
+ },
+ "parse_counts_t3": {
+  "up_to_date": {
+   "before": {
+    "parses": 2
+   },
+   "after": {
+    "parses": 1,
+    "reuses": 1
+   }
+  },
+  "warm": {
+   "before": {
+    "parses": 5
+   },
+   "after": {
+    "parses": 1,
+    "reuses": 4
+   }
+  }
+ },
+ "baseline_index_builds_warm": {
+  "before": 2,
+  "after": 1
+ },
+ "states": {
+  "t3/up-to-date": {
+   "baseline": {
+    "wall_median_ms": 13.09,
+    "wall_p95_ms": 13.67,
+    "internal_median_ms": 4.0
+   },
+   "change": {
+    "wall_median_ms": 11.73,
+    "wall_p95_ms": 12.56,
+    "internal_median_ms": 3.0
+   },
+   "paired_wall_median_delta_ms": -1.42,
+   "change_faster_rounds": 40,
+   "rounds": 40
+  },
+  "t3/package-cache-removed": {
+   "baseline": {
+    "wall_median_ms": 13.32,
+    "wall_p95_ms": 13.96,
+    "internal_median_ms": 4.0
+   },
+   "change": {
+    "wall_median_ms": 11.85,
+    "wall_p95_ms": 12.3,
+    "internal_median_ms": 3.0
+   },
+   "paired_wall_median_delta_ms": -1.47,
+   "change_faster_rounds": 40,
+   "rounds": 40
+  },
+  "t3/node-modules-removed": {
+   "baseline": {
+    "wall_median_ms": 65.0,
+    "wall_p95_ms": 67.78,
+    "internal_median_ms": 50.0
+   },
+   "change": {
+    "wall_median_ms": 54.14,
+    "wall_p95_ms": 60.69,
+    "internal_median_ms": 40.0
+   },
+   "paired_wall_median_delta_ms": -10.72,
+   "change_faster_rounds": 29,
+   "rounds": 30
+  },
+  "t3/ci-warm": {
+   "baseline": {
+    "wall_median_ms": 78.26,
+    "wall_p95_ms": 84.58,
+    "internal_median_ms": 62.0
+   },
+   "change": {
+    "wall_median_ms": 67.51,
+    "wall_p95_ms": 71.39,
+    "internal_median_ms": 53.5
+   },
+   "paired_wall_median_delta_ms": -10.57,
+   "change_faster_rounds": 30,
+   "rounds": 30
+  },
+  "vite-react/ci-warm": {
+   "baseline": {
+    "wall_median_ms": 45.81,
+    "wall_p95_ms": 48.99,
+    "internal_median_ms": 33.0
+   },
+   "change": {
+    "wall_median_ms": 40.57,
+    "wall_p95_ms": 41.74,
+    "internal_median_ms": 28.0
+   },
+   "paired_wall_median_delta_ms": -5.28,
+   "change_faster_rounds": 29,
+   "rounds": 30
+  },
+  "t3/fresh-checkout": {
+   "baseline": {
+    "wall_median_ms": 86.99,
+    "internal_median_ms": 70.5
+   },
+   "change": {
+    "wall_median_ms": 84.16,
+    "internal_median_ms": 67.5
+   },
+   "paired_wall_median_delta_ms": -4.03,
+   "change_faster_rounds": 22,
+   "rounds": 24
+  }
+ }
+}
