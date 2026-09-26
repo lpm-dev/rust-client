@@ -1,0 +1,569 @@
+{
+  "base": "c398505e1 (#894, release build)",
+  "machine": "Apple Silicon, 18 cores; live registry.npmjs.org",
+  "seed_first_install": {
+    "oversized_history_count": 10,
+    "exact_document_body_bytes": 41965784,
+    "total_ms": 943
+  },
+  "expired_cache": {
+    "base": {
+      "runs": 12,
+      "total_median_ms": 787.0,
+      "total_p95_ms": 1156,
+      "resolve_median_ms": 722.5,
+      "resolve_p95_ms": 1083
+    },
+    "change": {
+      "runs": 12,
+      "total_median_ms": 619.0,
+      "total_p95_ms": 981,
+      "resolve_median_ms": 555.0,
+      "resolve_p95_ms": 915
+    },
+    "paired": {
+      "total_median_ms": -161.0,
+      "resolve_median_ms": -173.5,
+      "change_faster": 11,
+      "pairs": 12
+    },
+    "raw": {
+      "base": [
+        {
+          "wall_ms": 823.2,
+          "resolve_ms": 746,
+          "total_ms": 804,
+          "304": "211",
+          "body": "41965784",
+          "proj": "0",
+          "exact_body": "41965784",
+          "oversized": "None",
+          "skipped": "None"
+        },
+        {
+          "wall_ms": 724.5,
+          "resolve_ms": 642,
+          "total_ms": 706,
+          "304": "211",
+          "body": "41965784",
+          "proj": "0",
+          "exact_body": "41965784",
+          "oversized": "None",
+          "skipped": "None"
+        },
+        {
+          "wall_ms": 795.2,
+          "resolve_ms": 718,
+          "total_ms": 775,
+          "304": "211",
+          "body": "41965784",
+          "proj": "0",
+          "exact_body": "41965784",
+          "oversized": "None",
+          "skipped": "None"
+        },
+        {
+          "wall_ms": 819.2,
+          "resolve_ms": 727,
+          "total_ms": 799,
+          "304": "211",
+          "body": "41965784",
+          "proj": "0",
+          "exact_body": "41965784",
+          "oversized": "None",
+          "skipped": "None"
+        },
+        {
+          "wall_ms": 732.0,
+          "resolve_ms": 650,
+          "total_ms": 713,
+          "304": "211",
+          "body": "41965784",
+          "proj": "0",
+          "exact_body": "41965784",
+          "oversized": "None",
+          "skipped": "None"
+        },
+        {
+          "wall_ms": 787.9,
+          "resolve_ms": 699,
+          "total_ms": 769,
+          "304": "211",
+          "body": "41965784",
+          "proj": "0",
+          "exact_body": "41965784",
+          "oversized": "None",
+          "skipped": "None"
+        },
+        {
+          "wall_ms": 889.6,
+          "resolve_ms": 800,
+          "total_ms": 870,
+          "304": "211",
+          "body": "41965784",
+          "proj": "0",
+          "exact_body": "41965784",
+          "oversized": "None",
+          "skipped": "None"
+        },
+        {
+          "wall_ms": 971.2,
+          "resolve_ms": 879,
+          "total_ms": 952,
+          "304": "211",
+          "body": "41965784",
+          "proj": "0",
+          "exact_body": "41965784",
+          "oversized": "None",
+          "skipped": "None"
+        },
+        {
+          "wall_ms": 773.0,
+          "resolve_ms": 682,
+          "total_ms": 753,
+          "304": "211",
+          "body": "41965784",
+          "proj": "0",
+          "exact_body": "41965784",
+          "oversized": "None",
+          "skipped": "None"
+        },
+        {
+          "wall_ms": 850.3,
+          "resolve_ms": 763,
+          "total_ms": 831,
+          "304": "211",
+          "body": "41965784",
+          "proj": "0",
+          "exact_body": "41965784",
+          "oversized": "None",
+          "skipped": "None"
+        },
+        {
+          "wall_ms": 1175.1,
+          "resolve_ms": 1083,
+          "total_ms": 1156,
+          "304": "211",
+          "body": "41965784",
+          "proj": "0",
+          "exact_body": "41965784",
+          "oversized": "None",
+          "skipped": "None"
+        },
+        {
+          "wall_ms": 769.4,
+          "resolve_ms": 678,
+          "total_ms": 749,
+          "304": "211",
+          "body": "41965784",
+          "proj": "0",
+          "exact_body": "41965784",
+          "oversized": "None",
+          "skipped": "None"
+        }
+      ],
+      "change": [
+        {
+          "wall_ms": 659.1,
+          "resolve_ms": 564,
+          "total_ms": 640,
+          "304": "211",
+          "body": "22744",
+          "proj": "0",
+          "exact_body": "22744",
+          "oversized": "0",
+          "skipped": "10"
+        },
+        {
+          "wall_ms": 601.5,
+          "resolve_ms": 513,
+          "total_ms": 582,
+          "304": "211",
+          "body": "22744",
+          "proj": "0",
+          "exact_body": "22744",
+          "oversized": "0",
+          "skipped": "10"
+        },
+        {
+          "wall_ms": 636.3,
+          "resolve_ms": 553,
+          "total_ms": 617,
+          "304": "211",
+          "body": "22744",
+          "proj": "0",
+          "exact_body": "22744",
+          "oversized": "0",
+          "skipped": "10"
+        },
+        {
+          "wall_ms": 1000.0,
+          "resolve_ms": 915,
+          "total_ms": 981,
+          "304": "211",
+          "body": "22744",
+          "proj": "0",
+          "exact_body": "22744",
+          "oversized": "0",
+          "skipped": "10"
+        },
+        {
+          "wall_ms": 727.8,
+          "resolve_ms": 633,
+          "total_ms": 708,
+          "304": "211",
+          "body": "22744",
+          "proj": "0",
+          "exact_body": "22744",
+          "oversized": "0",
+          "skipped": "10"
+        },
+        {
+          "wall_ms": 571.5,
+          "resolve_ms": 480,
+          "total_ms": 552,
+          "304": "211",
+          "body": "22744",
+          "proj": "0",
+          "exact_body": "22744",
+          "oversized": "0",
+          "skipped": "10"
+        },
+        {
+          "wall_ms": 642.3,
+          "resolve_ms": 558,
+          "total_ms": 623,
+          "304": "211",
+          "body": "22744",
+          "proj": "0",
+          "exact_body": "22744",
+          "oversized": "0",
+          "skipped": "10"
+        },
+        {
+          "wall_ms": 640.8,
+          "resolve_ms": 557,
+          "total_ms": 621,
+          "304": "211",
+          "body": "22744",
+          "proj": "0",
+          "exact_body": "22744",
+          "oversized": "0",
+          "skipped": "10"
+        },
+        {
+          "wall_ms": 534.0,
+          "resolve_ms": 446,
+          "total_ms": 515,
+          "304": "211",
+          "body": "22744",
+          "proj": "0",
+          "exact_body": "22744",
+          "oversized": "0",
+          "skipped": "10"
+        },
+        {
+          "wall_ms": 710.6,
+          "resolve_ms": 634,
+          "total_ms": 692,
+          "304": "211",
+          "body": "22744",
+          "proj": "0",
+          "exact_body": "22744",
+          "oversized": "0",
+          "skipped": "10"
+        },
+        {
+          "wall_ms": 516.2,
+          "resolve_ms": 434,
+          "total_ms": 498,
+          "304": "211",
+          "body": "22744",
+          "proj": "0",
+          "exact_body": "22744",
+          "oversized": "0",
+          "skipped": "10"
+        },
+        {
+          "wall_ms": 624.9,
+          "resolve_ms": 537,
+          "total_ms": 606,
+          "304": "211",
+          "body": "22744",
+          "proj": "0",
+          "exact_body": "22744",
+          "oversized": "0",
+          "skipped": "10"
+        }
+      ]
+    }
+  },
+  "expired_cache_registry_changed_mid_run": {
+    "base": {
+      "runs": 8,
+      "total_median_ms": 837.0,
+      "total_p95_ms": 1017,
+      "resolve_median_ms": 764.5,
+      "resolve_p95_ms": 938
+    },
+    "change": {
+      "runs": 8,
+      "total_median_ms": 786.0,
+      "total_p95_ms": 1163,
+      "resolve_median_ms": 719.0,
+      "resolve_p95_ms": 1094
+    },
+    "paired": {
+      "total_median_ms": -63.0,
+      "resolve_median_ms": -56.5,
+      "change_faster": 5,
+      "pairs": 8
+    },
+    "raw": {
+      "base": [
+        {
+          "wall_ms": 881.5,
+          "resolve_ms": 735,
+          "total_ms": 827,
+          "304": "202",
+          "body": "43697761",
+          "proj": "0",
+          "exact_body": "41965784",
+          "oversized": "None",
+          "skipped": "None"
+        },
+        {
+          "wall_ms": 866.1,
+          "resolve_ms": 773,
+          "total_ms": 847,
+          "304": "202",
+          "body": "43676511",
+          "proj": "0",
+          "exact_body": "41965784",
+          "oversized": "None",
+          "skipped": "None"
+        },
+        {
+          "wall_ms": 822.7,
+          "resolve_ms": 737,
+          "total_ms": 801,
+          "304": "201",
+          "body": "43655745",
+          "proj": "0",
+          "exact_body": "41965784",
+          "oversized": "None",
+          "skipped": "None"
+        },
+        {
+          "wall_ms": 869.9,
+          "resolve_ms": 778,
+          "total_ms": 850,
+          "304": "202",
+          "body": "43499457",
+          "proj": "0",
+          "exact_body": "41965784",
+          "oversized": "None",
+          "skipped": "None"
+        },
+        {
+          "wall_ms": 840.8,
+          "resolve_ms": 748,
+          "total_ms": 821,
+          "304": "201",
+          "body": "43555093",
+          "proj": "0",
+          "exact_body": "41965784",
+          "oversized": "None",
+          "skipped": "None"
+        },
+        {
+          "wall_ms": 919.1,
+          "resolve_ms": 828,
+          "total_ms": 899,
+          "304": "203",
+          "body": "80629855",
+          "proj": "0",
+          "exact_body": "41965784",
+          "oversized": "None",
+          "skipped": "None"
+        },
+        {
+          "wall_ms": 1041.0,
+          "resolve_ms": 938,
+          "total_ms": 1017,
+          "304": "203",
+          "body": "80629855",
+          "proj": "0",
+          "exact_body": "41965784",
+          "oversized": "None",
+          "skipped": "None"
+        },
+        {
+          "wall_ms": 843.2,
+          "resolve_ms": 756,
+          "total_ms": 822,
+          "304": "203",
+          "body": "80629855",
+          "proj": "0",
+          "exact_body": "41965784",
+          "oversized": "None",
+          "skipped": "None"
+        }
+      ],
+      "change": [
+        {
+          "wall_ms": 743.9,
+          "resolve_ms": 654,
+          "total_ms": 724,
+          "304": "203",
+          "body": "1412587",
+          "proj": "0",
+          "exact_body": "22744",
+          "oversized": "0",
+          "skipped": "10"
+        },
+        {
+          "wall_ms": 517.7,
+          "resolve_ms": 435,
+          "total_ms": 499,
+          "304": "203",
+          "body": "1905495",
+          "proj": "0",
+          "exact_body": "22744",
+          "oversized": "0",
+          "skipped": "10"
+        },
+        {
+          "wall_ms": 797.8,
+          "resolve_ms": 705,
+          "total_ms": 778,
+          "304": "202",
+          "body": "1419566",
+          "proj": "0",
+          "exact_body": "22744",
+          "oversized": "0",
+          "skipped": "10"
+        },
+        {
+          "wall_ms": 1043.8,
+          "resolve_ms": 959,
+          "total_ms": 1024,
+          "304": "203",
+          "body": "1421961",
+          "proj": "0",
+          "exact_body": "22744",
+          "oversized": "0",
+          "skipped": "10"
+        },
+        {
+          "wall_ms": 728.2,
+          "resolve_ms": 641,
+          "total_ms": 706,
+          "304": "203",
+          "body": "38686815",
+          "proj": "0",
+          "exact_body": "22744",
+          "oversized": "0",
+          "skipped": "10"
+        },
+        {
+          "wall_ms": 1182.9,
+          "resolve_ms": 1094,
+          "total_ms": 1163,
+          "304": "203",
+          "body": "38686815",
+          "proj": "0",
+          "exact_body": "22744",
+          "oversized": "0",
+          "skipped": "10"
+        },
+        {
+          "wall_ms": 813.9,
+          "resolve_ms": 733,
+          "total_ms": 794,
+          "304": "203",
+          "body": "38686815",
+          "proj": "0",
+          "exact_body": "22744",
+          "oversized": "0",
+          "skipped": "10"
+        },
+        {
+          "wall_ms": 1097.1,
+          "resolve_ms": 1017,
+          "total_ms": 1077,
+          "304": "203",
+          "body": "38686815",
+          "proj": "0",
+          "exact_body": "22744",
+          "oversized": "0",
+          "skipped": "10"
+        }
+      ]
+    }
+  },
+  "cold_metadata_round_1": {
+    "base": {
+      "runs": 6,
+      "total_median_ms": 958.0,
+      "total_p95_ms": 1233,
+      "resolve_median_ms": 888.5,
+      "resolve_p95_ms": 1179
+    },
+    "change": {
+      "runs": 6,
+      "total_median_ms": 1009.5,
+      "total_p95_ms": 1239,
+      "resolve_median_ms": 937.5,
+      "resolve_p95_ms": 1169
+    },
+    "paired": {
+      "total_median_ms": 48.0,
+      "resolve_median_ms": 45.5,
+      "change_faster": 3,
+      "pairs": 6
+    }
+  },
+  "cold_metadata_round_2": {
+    "base": {
+      "runs": 10,
+      "resolve_median_ms": 860.0,
+      "total_median_ms": 929.0,
+      "resolve_ms_sorted": [
+        745,
+        773,
+        793,
+        795,
+        854,
+        866,
+        874,
+        995,
+        1154,
+        1290
+      ]
+    },
+    "change": {
+      "runs": 10,
+      "resolve_median_ms": 795.0,
+      "total_median_ms": 863.5,
+      "resolve_ms_sorted": [
+        760,
+        760,
+        766,
+        771,
+        788,
+        802,
+        823,
+        857,
+        883,
+        915
+      ]
+    },
+    "paired": {
+      "resolve_median_ms": -57.5,
+      "total_median_ms": -57.0,
+      "change_faster": 8,
+      "pairs": 10
+    }
+  }
+}
