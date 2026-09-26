@@ -1305,6 +1305,7 @@ async fn run_with_options_under_store_lock(
         .await;
     }
 
+    let _signing_secret = crate::build_state::SigningSecretPreparation::start();
     let fetch_coord: Arc<FetchCoordinator> = FetchCoordinator::process_global();
 
     let online_resolution = run_online_resolution_phase(OnlineResolutionPhaseInput {

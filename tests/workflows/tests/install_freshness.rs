@@ -1060,6 +1060,7 @@ async fn bare_install_keeps_compact_noop_after_semantically_unchanged_edits() {
 struct ArrivalRecorder {
     body: Vec<u8>,
     arrivals: std::sync::Arc<std::sync::Mutex<Vec<std::time::SystemTime>>>,
+    delay: std::time::Duration,
 }
 
 impl wiremock::Respond for ArrivalRecorder {
@@ -1068,7 +1069,9 @@ impl wiremock::Respond for ArrivalRecorder {
             .lock()
             .unwrap()
             .push(std::time::SystemTime::now());
-        wiremock::ResponseTemplate::new(200).set_body_bytes(self.body.clone())
+        wiremock::ResponseTemplate::new(200)
+            .set_body_bytes(self.body.clone())
+            .set_delay(self.delay)
     }
 }
 
@@ -1088,6 +1091,7 @@ async fn lockfile_install_downloads_while_node_is_probed() {
         .respond_with(ArrivalRecorder {
             body: make_tarball_from_pkg_json(manifest, &[]),
             arrivals: std::sync::Arc::clone(&arrivals),
+            delay: std::time::Duration::ZERO,
         })
         .with_priority(1)
         .mount(mock.server())
@@ -1260,3 +1264,45 @@ async fn strict_engine_mismatch_on_the_legacy_store_fails_before_linking() {
     );
 }
 
+#[tokio::test]
+async fn first_install_creates_the_signing_secret_while_it_downloads() {
+    let mock = MockRegistry::start().await;
+    let manifest = serde_json::json!({"name": "plain-dep", "version": "1.0.0"});
+    mock.with_manifest_package(manifest.clone(), &[]).await;
+    let delay = std::time::Duration::from_secs(1);
+    let arrivals = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    wiremock::Mock::given(wiremock::matchers::method("GET"))
+        .and(wiremock::matchers::path(MockRegistry::tarball_path(
+            "plain-dep",
+            "1.0.0",
+        )))
+        .respond_with(ArrivalRecorder {
+            body: make_tarball_from_pkg_json(manifest, &[]),
+            arrivals: std::sync::Arc::clone(&arrivals),
+            delay,
+        })
+        .with_priority(1)
+        .mount(mock.server())
+        .await;
+    let project = TempProject::empty(r#"{"name":"consumer","dependencies":{"plain-dep":"1.0.0"}}"#);
+    let secret = project.home().join(".lpm/security/build-state-secret.hex");
+    let _ = std::fs::remove_file(&secret);
+
+    install(&project, &mock.url()).assert().success();
+
+    let created = std::fs::metadata(&secret)
+        .expect("the install signs its build state")
+        .modified()
+        .unwrap();
+    let served = *arrivals
+        .lock()
+        .unwrap()
+        .first()
+        .expect("the install downloads the tarball")
+        + delay;
+    assert!(
+        created < served,
+        "the signing secret was created {:?} after the download finished",
+        created.duration_since(served).unwrap_or_default()
+    );
+}
