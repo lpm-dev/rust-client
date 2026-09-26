@@ -71,7 +71,7 @@ pub(super) fn ensure_private_metadata_cache_dir(path: &std::path::Path) -> std::
 fn write_metadata_cache_file(
     path: &std::path::Path,
     content: &MetadataCacheBuffer,
-    fresh_for: std::time::Duration,
+    expires_at: std::time::SystemTime,
 ) -> std::io::Result<()> {
     let parent = path.parent().ok_or_else(|| {
         std::io::Error::new(std::io::ErrorKind::InvalidInput, "cache path has no parent")
@@ -88,7 +88,7 @@ fn write_metadata_cache_file(
     match options.open(path) {
         Ok(mut file) => {
             content.write_to(&mut file)?;
-            set_metadata_cache_file_expiry(&file, fresh_for)?;
+            set_metadata_cache_file_expiry(&file, expires_at)?;
             return Ok(());
         }
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
@@ -97,16 +97,14 @@ fn write_metadata_cache_file(
 
     let mut file = tempfile::NamedTempFile::new_in(parent)?;
     content.write_to(&mut file)?;
-    set_metadata_cache_file_expiry(file.as_file(), fresh_for)?;
+    set_metadata_cache_file_expiry(file.as_file(), expires_at)?;
     file.persist(path).map(|_| ()).map_err(|error| error.error)
 }
 
 fn set_metadata_cache_file_expiry(
     file: &std::fs::File,
-    fresh_for: std::time::Duration,
+    expires_at: std::time::SystemTime,
 ) -> std::io::Result<()> {
-    let now = std::time::SystemTime::now();
-    let expires_at = now.checked_add(fresh_for).unwrap_or(now);
     filetime::set_file_handle_times(
         file,
         None,
@@ -645,7 +643,10 @@ impl RegistryClient {
         }
     }
 
-    fn metadata_cache_mutation(&self, path: &std::path::Path) -> Arc<MetadataCacheMutation> {
+    pub(super) fn metadata_cache_mutation(
+        &self,
+        path: &std::path::Path,
+    ) -> Arc<MetadataCacheMutation> {
         let mut mutations = self
             .metadata_cache_mutations
             .lock()
@@ -1203,6 +1204,9 @@ impl RegistryClient {
                 return None;
             }
         };
+        // Freshness counts from the response, however long the write waits.
+        let now = std::time::SystemTime::now();
+        let expires_at = now.checked_add(fresh_for).unwrap_or(now);
         let path = self.cache_path(key)?;
         let mutation = self.metadata_cache_mutation(&path);
         let revision = mutation.revision.fetch_add(1, Ordering::AcqRel) + 1;
@@ -1297,7 +1301,7 @@ impl RegistryClient {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             if mutation.revision.load(Ordering::Acquire) == revision
-                && let Err(e) = write_metadata_cache_file(&path, &content, fresh_for)
+                && let Err(e) = write_metadata_cache_file(&path, &content, expires_at)
             {
                 tracing::warn!("failed to write metadata cache for {key_owned}: {e}");
             }
@@ -1315,7 +1319,7 @@ impl RegistryClient {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             if mutation.revision.load(Ordering::Acquire) == revision
-                && let Err(e) = write_metadata_cache_file(&path, &content, fresh_for)
+                && let Err(e) = write_metadata_cache_file(&path, &content, expires_at)
             {
                 tracing::warn!("failed to write metadata cache for {key_owned}: {e}");
             }
