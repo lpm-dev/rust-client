@@ -127,35 +127,23 @@ impl OutputTree {
         path: &Path,
         duplicate: bool,
     ) -> Result<PendingFile, LpmError> {
+        let file = self.new_file(path)?;
+        if duplicate {
+            file.replace()
+        } else {
+            file.create()
+        }
+    }
+
+    /// Resolve `path` in the prepared parent without touching the filesystem,
+    /// so another thread can create the file.
+    pub(crate) fn new_file(&self, path: &Path) -> Result<NewFile, LpmError> {
         let directory = self.parent.as_ref().map_or(&self.root, |p| &p.directory);
         let name = path.file_name().ok_or_else(|| changed_directory(path))?;
-        if duplicate {
-            let metadata = directory.symlink_metadata(name)?;
-            if !metadata.is_file() {
-                return Err(LpmError::Registry(format!(
-                    "non-file path blocks duplicate tarball entry: {}",
-                    path.display()
-                )));
-            }
-            directory.remove_file(name)?;
-        }
-
-        let mut options = OpenOptions::new();
-        options.write(true).follow(FollowSymlinks::No);
-        if duplicate {
-            options.create_new(true);
-        } else {
-            options.create(true).truncate(true);
-        }
-        let file = directory
-            .open_with(name, &options)
-            .map_err(|error| path_error(error, path))?
-            .into_std();
-        Ok(PendingFile {
-            file,
+        Ok(NewFile {
             directory: Arc::clone(directory),
             name: PathBuf::from(name),
-            committed: false,
+            path: path.to_path_buf(),
         })
     }
 
@@ -271,6 +259,58 @@ impl OutputTree {
                 }
             }
         }
+    }
+}
+
+/// A regular file to create in a verified extraction directory.
+pub(crate) struct NewFile {
+    directory: Arc<Dir>,
+    name: PathBuf,
+    path: PathBuf,
+}
+
+impl NewFile {
+    /// Create or truncate the file without following a symlink at its name.
+    pub(crate) fn create(self) -> Result<PendingFile, LpmError> {
+        let mut options = OpenOptions::new();
+        options
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .follow(FollowSymlinks::No);
+        self.open(&options)
+    }
+
+    /// Remove the regular file an earlier entry wrote at this name, then create it.
+    fn replace(self) -> Result<PendingFile, LpmError> {
+        let metadata = self.directory.symlink_metadata(&self.name)?;
+        if !metadata.is_file() {
+            return Err(LpmError::Registry(format!(
+                "non-file path blocks duplicate tarball entry: {}",
+                self.path.display()
+            )));
+        }
+        self.directory.remove_file(&self.name)?;
+        let mut options = OpenOptions::new();
+        options
+            .write(true)
+            .create_new(true)
+            .follow(FollowSymlinks::No);
+        self.open(&options)
+    }
+
+    fn open(self, options: &OpenOptions) -> Result<PendingFile, LpmError> {
+        let file = self
+            .directory
+            .open_with(&self.name, options)
+            .map_err(|error| path_error(error, &self.path))?
+            .into_std();
+        Ok(PendingFile {
+            file,
+            directory: self.directory,
+            name: self.name,
+            committed: false,
+        })
     }
 }
 

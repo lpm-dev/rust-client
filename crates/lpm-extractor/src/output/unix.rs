@@ -148,38 +148,26 @@ impl OutputTree {
         path: &Path,
         duplicate: bool,
     ) -> Result<PendingFile, LpmError> {
+        let file = self.new_file(path)?;
+        if duplicate {
+            file.replace()
+        } else {
+            file.create()
+        }
+    }
+
+    /// Resolve `path` in the prepared parent without touching the filesystem,
+    /// so another thread can create the file.
+    pub(crate) fn new_file(&self, path: &Path) -> Result<NewFile, LpmError> {
         let directory = self
             .parent
             .as_ref()
             .map_or(&self.root, |parent| &parent.file);
         let leaf = path.file_name().ok_or_else(|| changed_directory(path))?;
-        let name = CString::new(leaf.as_bytes()).map_err(invalid_path)?;
-        let base = directory.as_raw_fd();
-        if duplicate {
-            let metadata = stat_at(base, &name)?;
-            if metadata.st_mode & libc::S_IFMT != libc::S_IFREG {
-                return Err(LpmError::Registry(format!(
-                    "non-file path blocks duplicate tarball entry: {}",
-                    path.display()
-                )));
-            }
-            unlink(base, &name, 0)?;
-        }
-        let flags = libc::O_WRONLY
-            | libc::O_CREAT
-            | libc::O_CLOEXEC
-            | libc::O_NOFOLLOW
-            | if duplicate {
-                libc::O_EXCL
-            } else {
-                libc::O_TRUNC
-            };
-        let file = open_at(base, &name, flags, 0o666).map_err(|error| path_error(error, path))?;
-        Ok(PendingFile {
-            file,
+        Ok(NewFile {
             directory: Arc::clone(directory),
-            name,
-            committed: false,
+            name: CString::new(leaf.as_bytes()).map_err(invalid_path)?,
+            path: path.to_path_buf(),
         })
     }
 
@@ -310,6 +298,46 @@ impl OutputTree {
                 }
             }
         }
+    }
+}
+
+/// A regular file to create in a verified extraction directory.
+pub(crate) struct NewFile {
+    directory: Arc<File>,
+    name: CString,
+    path: PathBuf,
+}
+
+impl NewFile {
+    /// Create or truncate the file without following a symlink at its name.
+    pub(crate) fn create(self) -> Result<PendingFile, LpmError> {
+        self.open(libc::O_TRUNC)
+    }
+
+    /// Remove the regular file an earlier entry wrote at this name, then create it.
+    fn replace(self) -> Result<PendingFile, LpmError> {
+        let base = self.directory.as_raw_fd();
+        let metadata = stat_at(base, &self.name)?;
+        if metadata.st_mode & libc::S_IFMT != libc::S_IFREG {
+            return Err(LpmError::Registry(format!(
+                "non-file path blocks duplicate tarball entry: {}",
+                self.path.display()
+            )));
+        }
+        unlink(base, &self.name, 0)?;
+        self.open(libc::O_EXCL)
+    }
+
+    fn open(self, mode_flag: i32) -> Result<PendingFile, LpmError> {
+        let flags = libc::O_WRONLY | libc::O_CREAT | libc::O_CLOEXEC | libc::O_NOFOLLOW | mode_flag;
+        let file = open_at(self.directory.as_raw_fd(), &self.name, flags, 0o666)
+            .map_err(|error| path_error(error, &self.path))?;
+        Ok(PendingFile {
+            file,
+            directory: self.directory,
+            name: self.name,
+            committed: false,
+        })
     }
 }
 
