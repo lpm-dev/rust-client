@@ -358,6 +358,20 @@ pub fn record_exact_document_hit() {
         .fetch_add(1, Ordering::Relaxed);
 }
 
+/// A lookup found the package's full history over the exact-version size cap.
+pub fn record_oversized_history() {
+    metadata_fetch_detail()
+        .exact_document_oversized_history_count
+        .fetch_add(1, Ordering::Relaxed);
+}
+
+/// A lookup skipped a full history already known to be over the size cap.
+pub fn record_oversized_history_skip() {
+    metadata_fetch_detail()
+        .exact_document_oversized_history_skip_count
+        .fetch_add(1, Ordering::Relaxed);
+}
+
 pub fn record_exact_document_policy_bypass() {
     metadata_fetch_detail()
         .exact_document_policy_bypass_count
@@ -605,6 +619,8 @@ struct MetadataFetchDetailCounters {
     exact_document_attempt_count: AtomicU64,
     exact_document_hit_count: AtomicU64,
     exact_document_policy_bypass_count: AtomicU64,
+    exact_document_oversized_history_count: AtomicU64,
+    exact_document_oversized_history_skip_count: AtomicU64,
     exact_document_fetch_error_count: AtomicU64,
     exact_document_incomplete_distribution_count: AtomicU64,
     exact_document_body_bytes_sum: AtomicU64,
@@ -686,6 +702,10 @@ impl MetadataFetchDetailCounters {
             .store(0, Ordering::Relaxed);
         self.exact_document_hit_count.store(0, Ordering::Relaxed);
         self.exact_document_policy_bypass_count
+            .store(0, Ordering::Relaxed);
+        self.exact_document_oversized_history_count
+            .store(0, Ordering::Relaxed);
+        self.exact_document_oversized_history_skip_count
             .store(0, Ordering::Relaxed);
         self.exact_document_fetch_error_count
             .store(0, Ordering::Relaxed);
@@ -1010,6 +1030,12 @@ impl MetadataFetchDetailCounters {
                 policy_bypass_count: self
                     .exact_document_policy_bypass_count
                     .load(Ordering::Relaxed),
+                oversized_history_count: self
+                    .exact_document_oversized_history_count
+                    .load(Ordering::Relaxed),
+                oversized_history_skip_count: self
+                    .exact_document_oversized_history_skip_count
+                    .load(Ordering::Relaxed),
                 fetch_error_fallback_count: self
                     .exact_document_fetch_error_count
                     .load(Ordering::Relaxed),
@@ -1091,6 +1117,10 @@ pub struct ExactDocumentSnapshot {
     pub attempt_count: u64,
     pub hit_count: u64,
     pub policy_bypass_count: u64,
+    /// Full histories found over the size cap for selecting one version.
+    pub oversized_history_count: u64,
+    /// Lookups that skipped a history already known to be over that cap.
+    pub oversized_history_skip_count: u64,
     pub fetch_error_fallback_count: u64,
     pub incomplete_distribution_fallback_count: u64,
     pub body_bytes_sum: u64,

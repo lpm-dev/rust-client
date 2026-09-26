@@ -1,3 +1,4 @@
+use super::super::metadata::OversizedHistory;
 use super::*;
 use wiremock::matchers::{header, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -392,6 +393,133 @@ async fn conditional_no_store_response_invalidates_reusable_canonical_history() 
             fetch(&client, "3.0.0").await.timings.body_bytes > 0,
             "no-store response must remove reusable earlier canonical bytes"
         );
+        server.verify().await;
+    }
+}
+
+fn exact_document(version: &str) -> serde_json::Value {
+    serde_json::json!({
+        "name": "shared-history",
+        "version": version,
+        "dist": {"integrity": format!("sha512-{version}")}
+    })
+}
+
+fn history_client(server: &MockServer, cache: &std::path::Path) -> RegistryClient {
+    RegistryClient::new()
+        .with_npm_registry_url(server.uri())
+        .with_cache_dir(Some(cache.into()))
+        .with_synchronous_cache_writes(true)
+}
+
+async fn mount_exact_documents(server: &MockServer, versions: &[(&str, u64)]) {
+    for (version, expected) in versions {
+        Mock::given(method("GET"))
+            .and(path(format!("/shared-history/{version}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(exact_document(version)))
+            .expect(*expected)
+            .mount(server)
+            .await;
+    }
+}
+
+#[tokio::test]
+async fn only_an_oversized_history_is_skipped_by_later_lookups() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/shared-history"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("not a package history"))
+        .expect(2)
+        .mount(&server)
+        .await;
+    mount_exact_documents(&server, &[("1.0.0", 1), ("2.0.0", 1)]).await;
+    let cache = tempfile::tempdir().unwrap();
+    let client = history_client(&server, cache.path());
+
+    for version in ["1.0.0", "2.0.0"] {
+        let fetched = fetch(&client, version).await;
+        assert!(!fetched.timings.selected_from_history, "{version}");
+        assert!(fetched.metadata.versions.contains_key(version), "{version}");
+    }
+    server.verify().await;
+}
+
+fn oversized_history() -> serde_json::Value {
+    let mut history = history();
+    history["readme"] = serde_json::Value::String("x".repeat(MAX_VERSION_METADATA_BYTES));
+    history
+}
+
+async fn mount_oversized_history(server: &MockServer, expected: u64) {
+    Mock::given(method("GET"))
+        .and(path("/shared-history"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(oversized_history())
+                .insert_header("Cache-Control", "max-age=300"),
+        )
+        .expect(expected)
+        .mount(server)
+        .await;
+}
+
+#[tokio::test]
+async fn an_oversized_history_is_read_once_and_later_versions_use_their_documents() {
+    let server = MockServer::start().await;
+    mount_oversized_history(&server, 1).await;
+    mount_exact_documents(&server, &[("1.0.0", 1), ("2.0.0", 1), ("3.0.0", 1)]).await;
+    let cache = tempfile::tempdir().unwrap();
+    let client = history_client(&server, cache.path());
+
+    for version in ["1.0.0", "2.0.0"] {
+        let fetched = fetch(&client, version).await;
+        assert!(!fetched.timings.selected_from_history, "{version}");
+        assert!(fetched.metadata.versions.contains_key(version), "{version}");
+    }
+    let later_command = history_client(&server, cache.path());
+    let fetched = fetch(&later_command, "3.0.0").await;
+    assert!(fetched.metadata.versions.contains_key("3.0.0"));
+
+    server.verify().await;
+}
+
+#[tokio::test]
+async fn an_oversized_history_is_read_again_after_a_week_or_a_larger_cap() {
+    let week = 7 * 24 * 60 * 60;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    for marker in [
+        OversizedHistory {
+            cap: MAX_VERSION_METADATA_BYTES as u64,
+            observed_at_unix: now - week - 60,
+        },
+        OversizedHistory {
+            cap: MAX_VERSION_METADATA_BYTES as u64 / 2,
+            observed_at_unix: now,
+        },
+    ] {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/shared-history"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(history()))
+            .expect(1)
+            .mount(&server)
+            .await;
+        mount_exact_documents(&server, &[("1.0.0", 0)]).await;
+        let cache = tempfile::tempdir().unwrap();
+        let client = history_client(&server, cache.path());
+        client.write_metadata_cache_with_directive(
+            &client.npm_oversized_history_cache_key("shared-history", PublicNpmAccess::ANONYMOUS),
+            &marker,
+            None,
+            MetadataCacheDirective::Unspecified,
+        );
+
+        let fetched = fetch(&client, "1.0.0").await;
+
+        assert!(fetched.timings.selected_from_history);
         server.verify().await;
     }
 }

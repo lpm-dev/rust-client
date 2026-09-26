@@ -1,4 +1,5 @@
 use super::*;
+use std::collections::HashSet;
 use std::sync::{Mutex, Weak};
 use std::time::Instant;
 use tokio::sync::{OwnedMutexGuard, OwnedSemaphorePermit, Semaphore};
@@ -7,6 +8,7 @@ const MAX_HISTORY_BYTES: usize = 8 * 1024 * 1024;
 const MAX_HISTORY_ENTRY_BYTES: usize = 512 * 1024;
 const MAX_HISTORY_ENTRIES: usize = 128;
 const MAX_HISTORY_FLIGHTS: usize = 256;
+const MAX_OVERSIZED_HISTORIES: usize = 4096;
 
 pub(super) struct HistoryBody {
     bytes: Vec<u8>,
@@ -58,6 +60,7 @@ struct HistoryState {
     generation: u64,
     entries: HashMap<String, Arc<HistoryEntry>>,
     flights: HashMap<String, Weak<tokio::sync::Mutex<()>>>,
+    oversized: HashSet<String>,
 }
 
 pub(super) struct HistoryCache {
@@ -178,6 +181,27 @@ impl HistoryCache {
         if state.generation == generation {
             publish();
         }
+    }
+
+    /// Remember that a history exceeded the exact-version size cap, so later
+    /// lookups in this command skip it. Invalidation keeps this: a history's
+    /// size does not depend on the recovered entries.
+    pub(super) fn mark_oversized(&self, key: &str) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state.oversized.len() < MAX_OVERSIZED_HISTORIES {
+            state.oversized.insert(key.to_owned());
+        }
+    }
+
+    pub(super) fn is_oversized(&self, key: &str) -> bool {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .oversized
+            .contains(key)
     }
 
     pub(super) fn invalidate(&self) {
